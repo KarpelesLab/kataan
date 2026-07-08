@@ -1708,6 +1708,74 @@ pub enum GenericOp {
         /// Index into the per-site key/IC table.
         site: u16,
     },
+    /// `reg[dst] = reg[a] <op> reg[b]` for `-`/`*`/`/`/`%` (`op` is a `GA_*` code).
+    /// `Sub`/`Mul`/`Div` take an inline both-numbers SSE fast path; `Mod` (and any
+    /// non-number operand) calls `jit_helper_arith`.
+    Arith {
+        /// Destination register.
+        dst: u8,
+        /// Left operand register.
+        a: u8,
+        /// Right operand register.
+        b: u8,
+        /// The `GA_*` operation discriminant.
+        op: u8,
+    },
+    /// `reg[dst] = reg[a] < reg[b]` — relational `<` (also backs `>`/`<=`/`>=` after
+    /// the compiler's operand swap / `Not`). Both-numbers inline; else
+    /// `jit_helper_lt`.
+    Lt {
+        /// Destination register.
+        dst: u8,
+        /// Left operand register.
+        a: u8,
+        /// Right operand register.
+        b: u8,
+    },
+    /// `reg[dst] = reg[a] === reg[b]` — strict equality (also backs `!==` after a
+    /// `Not`). Both-numbers inline; else `jit_helper_strict_eq` (never throws).
+    StrictEq {
+        /// Destination register.
+        dst: u8,
+        /// Left operand register.
+        a: u8,
+        /// Right operand register.
+        b: u8,
+    },
+    /// `reg[dst] = reg[a] <op> reg[b]` for `Op::ValueBin` (`**`, bitwise, shifts,
+    /// loose `==`/`!=`; `op` is a `VB_*` code). Loose `==`/`!=` take an inline
+    /// both-numbers fast path; everything else calls `jit_helper_value_bin`.
+    ValueBin {
+        /// Destination register.
+        dst: u8,
+        /// Left operand register.
+        a: u8,
+        /// Right operand register.
+        b: u8,
+        /// The `VB_*` operation discriminant.
+        op: u8,
+    },
+    /// `reg[dst] = !truthy(reg[a])` — logical not. Inlines the number/boolean
+    /// truthiness test; else calls `jit_helper_truthy`.
+    Not {
+        /// Destination register.
+        dst: u8,
+        /// Source register.
+        a: u8,
+    },
+    /// `pc = target` — unconditional branch to op index `target`.
+    Jump {
+        /// Target op index (into the lowered op stream).
+        target: usize,
+    },
+    /// `if !truthy(reg[cond]) { pc = target }` — conditional branch. Inlines the
+    /// number/boolean truthiness test; else calls `jit_helper_truthy`.
+    JumpIfFalse {
+        /// Register holding the condition value.
+        cond: u8,
+        /// Target op index taken when the condition is falsy.
+        target: usize,
+    },
     /// `return reg[src]`.
     Ret {
         /// Register holding the return value.
@@ -1716,15 +1784,18 @@ pub enum GenericOp {
 }
 
 /// Lowers a `nbvm::FnProto` to the generic-tier IR **iff** every op is one this
-/// tier can currently emit: constant loads, `Move`, `Return`, and the general
-/// `+` (`Op::AddValue`). Any other op — including the numeric-narrowed `Op::Add`,
-/// which the Int/Float tiers already claim and which carries a
-/// throw-on-non-number contract this tier must not silently widen — yields
-/// `None`, so only trivially-generic functions compile here for now. Reuses the
-/// Int/Float tiers' def-use safety check (a register may be read only after it
-/// is written; params count as written) so the native frame can never diverge
-/// from the interpreter by reading an unmodeled slot (`this`, a capture, a TDZ
-/// binding).
+/// tier can currently emit: constant loads, `Move`, `Return`, the general `+`
+/// (`Op::AddValue`), property get/set, the value-form arithmetic
+/// (`Op::Sub`/`Mul`/`Div`/`Mod`), the comparisons (`Op::Lt`/`StrictEq`/`ValueBin`
+/// and `Op::Not`), and control flow (`Op::Jump`/`JumpIfFalse`, forward and
+/// backward). Any other op — including the numeric-narrowed `Op::Add`, which the
+/// Int/Float tiers already claim and which carries a throw-on-non-number contract
+/// this tier must not silently widen — yields `None`. Reuses the Int/Float tiers'
+/// def-use safety check (a register may be read only after it is written; params
+/// count as written) so the native frame can never diverge from the interpreter
+/// by reading an unmodeled slot (`this`, a capture, a TDZ binding). Branch targets
+/// are nbvm op indices; the lowered stream prepends one `Arg` per parameter, so
+/// every target shifts by `n_params` (as in [`lower_nbvm_with`]).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 #[must_use]
 pub fn lower_nbvm_generic(
@@ -1780,6 +1851,66 @@ pub fn lower_nbvm_generic(
                 written[*dst as usize] = true;
                 GenericOp::Move { dst: d, src: s }
             }
+            // Value-form arithmetic `-`/`*`/`/`/`%` (the interpreter's `Op::Sub`
+            // etc. are already the generic ToPrimitive forms — there is no numeric
+            // `Op::Sub` — so, unlike `+`, the generic tier owns all of these).
+            Op::Sub { dst, a, b }
+            | Op::Mul { dst, a, b }
+            | Op::Div { dst, a, b }
+            | Op::Mod { dst, a, b } => {
+                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                let op = match op {
+                    Op::Sub { .. } => crate::nbvm::GA_SUB,
+                    Op::Mul { .. } => crate::nbvm::GA_MUL,
+                    Op::Div { .. } => crate::nbvm::GA_DIV,
+                    _ => crate::nbvm::GA_MOD,
+                };
+                GenericOp::Arith { dst: d, a, b, op }
+            }
+            // Relational `<` (also `>`/`<=`/`>=` after the compiler's swap/`Not`).
+            Op::Lt { dst, a, b } => {
+                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                GenericOp::Lt { dst: d, a, b }
+            }
+            // Strict equality `===` (also `!==` after a `Not`).
+            Op::StrictEq { dst, a, b } => {
+                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                GenericOp::StrictEq { dst: d, a, b }
+            }
+            // `**`, bitwise, shifts, and loose `==`/`!=` — the `Op::ValueBin` family.
+            Op::ValueBin { dst, op, a, b } => {
+                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                GenericOp::ValueBin {
+                    dst: d,
+                    a,
+                    b,
+                    op: *op,
+                }
+            }
+            // Logical not (truthiness) — backs the negated `<=`/`>=`/`!==` forms.
+            Op::Not { dst, a } => {
+                let a = read(&written, *a)?;
+                let d = reg8(*dst)?;
+                written[*dst as usize] = true;
+                GenericOp::Not { dst: d, a }
+            }
+            // Control flow: targets are nbvm op indices; shift by `n_params` for the
+            // prepended `Arg` prefix (see the fn doc + `lower_nbvm_with`).
+            Op::Jump { target } => GenericOp::Jump {
+                target: target.checked_add(proto.n_params)?,
+            },
+            Op::JumpIfFalse { cond, target } => GenericOp::JumpIfFalse {
+                cond: read(&written, *cond)?,
+                target: target.checked_add(proto.n_params)?,
+            },
             // A plain `obj.key` read: the receiver register must already be written
             // (params count as written), the key a static string. Computed / super /
             // optional / private property access lowers to *other* ops (`GetElem`,
@@ -1816,9 +1947,18 @@ pub fn lower_nbvm_generic(
         };
         out.push(lowered);
     }
-    // Straight-line only: the last op must be a `Ret` (the op set has no jumps).
+    // Must terminate: the last op returns, so control never falls off the end of
+    // the emitted code (branches may loop, but the program end is a `Ret`).
     if !matches!(out.last(), Some(GenericOp::Ret { .. })) {
         return None;
+    }
+    // Every branch target must land on a real op in the lowered stream.
+    for op in &out {
+        if let GenericOp::Jump { target } | GenericOp::JumpIfFalse { target, .. } = op
+            && *target >= out.len()
+        {
+            return None;
+        }
     }
     Some((out, keys))
 }
@@ -1866,7 +2006,30 @@ pub struct GenericHelpers {
     pub get: JitGetPropHelper,
     /// The property-set helper (`jit_helper_set_prop`).
     pub set: JitSetPropHelper,
+    /// The `-`/`*`/`/`/`%` helper (`jit_helper_arith`), dispatched by a `GA_*`
+    /// discriminant passed as the fourth argument.
+    pub arith: JitBinHelper,
+    /// The `Op::ValueBin` helper (`jit_helper_value_bin`) — `**`, bitwise, shifts,
+    /// loose `==`/`!=`; dispatched by a `VB_*` discriminant.
+    pub value_bin: JitBinHelper,
+    /// The relational `<` helper (`jit_helper_lt`).
+    pub lt: JitAddHelper,
+    /// The strict-equality `===` helper (`jit_helper_strict_eq`) — never throws.
+    pub strict_eq: JitAddHelper,
+    /// The truthiness helper (`jit_helper_truthy`), returning `0`/`1` — never throws.
+    pub truthy: JitTruthyHelper,
 }
+
+/// The runtime-helper ABI for a discriminated binary op: `(ctx, a, b, op) -> NanBox
+/// bits` (or the throw sentinel). `op` selects the concrete operation (a `GA_*` or
+/// `VB_*` code). Used by both the arithmetic (`jit_helper_arith`) and the
+/// `Op::ValueBin` (`jit_helper_value_bin`) slow paths.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub type JitBinHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64, u64) -> u64;
+
+/// The runtime-helper ABI for a truthiness test: `(ctx, v) -> 0 | 1`. Never throws.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub type JitTruthyHelper = extern "C" fn(*mut core::ffi::c_void, u64) -> u64;
 
 /// The runtime-helper ABI for a property **get** (`JIT_DESIGN.md` Pass 2):
 /// `(ctx, obj, key_ptr, key_len, cache) -> NanBox bits` (or the throw sentinel).
@@ -2777,6 +2940,88 @@ impl X64Assembler {
     pub fn ucomisd_xmm0_xmm0(&mut self) {
         self.code.extend_from_slice(&[0x66, 0x0f, 0x2e, 0xc0]);
     }
+
+    /// `mov rcx, rax` — copy the accumulator into the scratch register.
+    pub fn mov_rcx_rax(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0x89, 0xc1]);
+    }
+
+    /// `and rcx, r11` — mask `rcx` by the value held in `r11` (generic-tier
+    /// `is_number` tag test, keeping the original value in `rax`).
+    pub fn and_rcx_r11(&mut self) {
+        self.code.extend_from_slice(&[0x4c, 0x21, 0xd9]);
+    }
+
+    /// `cmp rcx, r11`.
+    pub fn cmp_rcx_r11(&mut self) {
+        self.code.extend_from_slice(&[0x4c, 0x39, 0xd9]);
+    }
+
+    /// `add rax, r11` — add the value in `r11` (used to box a native `0`/`1` boolean
+    /// into a `NanBox` by adding the `TAG_FALSE` base: `TAG_FALSE + 0/1`).
+    pub fn add_rax_r11(&mut self) {
+        self.code.extend_from_slice(&[0x4c, 0x01, 0xd8]);
+    }
+
+    /// `setne al; movzx rax, al` — `rax = (zero flag clear) ? 1 : 0` after a
+    /// `test`/`cmp`/`ucomisd` (for `ucomisd`, this is 0 for a `+0`/`-0`/NaN operand).
+    pub fn setne_rax(&mut self) {
+        self.code.extend_from_slice(&[0x0f, 0x95, 0xc0]); // setne al
+        self.code.extend_from_slice(&[0x48, 0x0f, 0xb6, 0xc0]); // movzx rax, al
+    }
+
+    /// Emits code computing the JS truthiness of the `NanBox` in frame slot `disp`
+    /// into `rax` as `0`/`1`. Inlines the two common cases — a number (truthy iff
+    /// nonzero and not NaN) and a boolean (`tag_true`/`tag_false`) — and falls back
+    /// to `jit_helper_truthy(ctx, v)` (the interpreter's `ToBoolean`) for anything
+    /// else. Clobbers `rax`/`rcx`/`r11`/`xmm0`/`xmm1`; `ctx` must be pinned in `r15`
+    /// (the generic-tier invariant), and `qnan` is the quiet-NaN tag mask.
+    pub fn emit_truthy(
+        &mut self,
+        disp: i32,
+        truthy_helper: u64,
+        qnan: u64,
+        tag_true: u64,
+        tag_false: u64,
+    ) {
+        let numl = self.new_label();
+        let set1 = self.new_label();
+        let set0 = self.new_label();
+        let have = self.new_label();
+        // is_number(v) == (v & QNAN) != QNAN — test on a copy, keeping v in rax.
+        self.load_rax(disp);
+        self.movabs_r11(qnan as i64);
+        self.mov_rcx_rax();
+        self.and_rcx_r11();
+        self.cmp_rcx_r11();
+        self.jne(numl); // a number → numeric truthiness
+        // boolean? compare the raw word against the two boolean tags.
+        self.movabs_r11(tag_true as i64);
+        self.cmp_rax_r11();
+        self.je(set1);
+        self.movabs_r11(tag_false as i64);
+        self.cmp_rax_r11();
+        self.je(set0);
+        // otherwise: jit_helper_truthy(ctx, v) → 0/1 (runs ToBoolean; never throws).
+        self.mov_rdi_r15();
+        self.load_argreg(1, disp);
+        self.movabs_rax(truthy_helper as i64);
+        self.call_rax();
+        self.jmp(have);
+        // number path: truthy iff the f64 is ordered and != 0 (NaN and ±0 → falsy).
+        self.bind(numl);
+        self.movsd_xmm0_mem(disp);
+        self.zero_xmm1();
+        self.ucomisd_xmm0_xmm1();
+        self.setne_rax();
+        self.jmp(have);
+        self.bind(set1);
+        self.movabs_rax(1);
+        self.jmp(have);
+        self.bind(set0);
+        self.zero_rax();
+        self.bind(have);
+    }
 }
 
 /// Whether the JIT can emit and run native code on this target.
@@ -3390,18 +3635,21 @@ impl JitFunction {
         Self::from_code(&a.finish())
     }
 
-    /// Compiles a straight-line [`GenericOp`] program (the **generic NanBox
-    /// tier**, `JIT_DESIGN.md` Pass 1) to an
+    /// Compiles a [`GenericOp`] program (the **generic NanBox tier**,
+    /// `JIT_DESIGN.md` Passes 1–3) to an
     /// `extern "C" fn(ctx: *mut c_void, args: *const u64, n: usize) -> u64`.
     ///
-    /// The entry pins `ctx` in the callee-saved `r15`, homes each of `n_regs`
-    /// NanBox registers in an rbp-relative slot, and for a generic `Add` emits an
-    /// inline both-numbers fast path (tag-test the NaN-box bits, `addsd`, rebox)
-    /// plus a System-V slow-path `call` to `add_helper` (the runtime `+`). A
-    /// helper that throws returns the [`NanBox::jit_throw_bits`] sentinel, on
-    /// which this jumps to an epilogue that returns the sentinel unchanged so the
-    /// caller reads `ctx.jit_pending`. Returns `None` on the unavailable target
-    /// or a malformed program.
+    /// The entry pins `ctx` in the callee-saved `r15` and homes each of `n_regs`
+    /// NanBox registers in an rbp-relative slot. Value ops (`Add`, `Arith` for
+    /// `-`/`*`/`/`/`%`, the comparisons `Lt`/`StrictEq`/`ValueBin`) emit an inline
+    /// both-numbers fast path (tag-test the NaN-box bits, an SSE op / `ucomisd`,
+    /// rebox) plus a System-V slow-path `call` to the matching runtime helper;
+    /// `Not`/`JumpIfFalse` inline a number/boolean truthiness test with a
+    /// `jit_helper_truthy` fallback. Control flow (`Jump`/`JumpIfFalse`, forward
+    /// and backward) uses one label per op. A helper that throws returns the
+    /// [`NanBox::jit_throw_bits`] sentinel, on which this jumps to an epilogue that
+    /// returns the sentinel unchanged so the caller reads `ctx.jit_pending`.
+    /// Returns `None` on the unavailable target or a malformed program.
     #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
     #[must_use]
     pub fn compile_generic(
@@ -3418,11 +3666,20 @@ impl JitFunction {
         let add_helper = helpers.add as usize as u64;
         let get_helper = helpers.get as usize as u64;
         let set_helper = helpers.set as usize as u64;
+        let arith_helper = helpers.arith as usize as u64;
+        let value_bin_helper = helpers.value_bin as usize as u64;
+        let lt_helper = helpers.lt as usize as u64;
+        let strict_eq_helper = helpers.strict_eq as usize as u64;
+        let truthy_helper = helpers.truthy as usize as u64;
         // `is_number(bits) == (bits & QNAN) != QNAN`.
         const QNAN: u64 = 0x7ffc_0000_0000_0000;
         // The canonical quiet NaN a `NanBox` normalizes every NaN to, so a NaN sum
         // reboxes bit-identically to the interpreter's `NanBox::number`.
         let canonical_nan = NanBox::number(f64::NAN).to_bits();
+        // Boolean tag words. A native `0`/`1` boxes to a `NanBox` boolean by adding
+        // `tag_false` (`tag_false + 0 = false`, `tag_false + 1 = true`).
+        let tag_false = NanBox::boolean(false).to_bits();
+        let tag_true = NanBox::boolean(true).to_bits();
         // Register slot `r` at `[rbp - (r+2)*8]`: `[rbp-8]` holds the saved r15,
         // the register file lives below it.
         let disp = |r: u8| -((i32::from(r) + 2) * 8);
@@ -3431,6 +3688,9 @@ impl JitFunction {
         // restores alignment).
         let frame = (((n_regs as u32) * 8 + 15) & !15) + 8;
         let mut a = X64Assembler::new();
+        // One label per op so any op can be a branch target; bound just before that
+        // op's code is emitted (control flow: `Jump`/`JumpIfFalse` target them).
+        let labels: Vec<Label> = (0..ops.len()).map(|_| a.new_label()).collect();
         let throw_exit = a.new_label();
         a.generic_prologue(frame);
         a.mov_r15_rdi(); // pin ctx in r15 (args ptr stays in rsi for the Arg loads)
@@ -3440,8 +3700,19 @@ impl JitFunction {
             a.store_rax(disp(u8::try_from(r).ok()?));
         }
         let ok = |r: u8| (r as usize) < n_regs;
+        // After a helper `call`, `rax` holds the result or the throw sentinel; the
+        // sentinel jumps to the shared throw exit (the caller then reads the pending
+        // exception). Emitted after every throwing helper call.
+        macro_rules! throw_check {
+            () => {{
+                a.movabs_r11(NanBox::jit_throw_bits() as i64);
+                a.cmp_rax_r11();
+                a.je(throw_exit);
+            }};
+        }
         let mut has_ret = false;
-        for op in ops {
+        for (op_idx, op) in ops.iter().enumerate() {
+            a.bind(labels[op_idx]);
             match *op {
                 GenericOp::Arg { dst, index } => {
                     if !ok(dst) || index as usize >= n_params {
@@ -3549,9 +3820,202 @@ impl JitFunction {
                     a.movabs_rax(set_helper as i64);
                     a.call_rax();
                     // Result (undefined) is discarded; only the throw sentinel matters.
-                    a.movabs_r11(NanBox::jit_throw_bits() as i64);
+                    throw_check!();
+                }
+                GenericOp::Arith {
+                    dst,
+                    a: ra,
+                    b: rb,
+                    op,
+                } => {
+                    if !ok(dst) || !ok(ra) || !ok(rb) {
+                        return None;
+                    }
+                    // Sub/Mul/Div take an inline both-numbers SSE fast path; Mod
+                    // (no single SSE instruction) and any non-number operand call
+                    // `jit_helper_arith(ctx, a, b, op)`.
+                    let fbin = match op {
+                        crate::nbvm::GA_SUB => Some(FBinOp::Sub),
+                        crate::nbvm::GA_MUL => Some(FBinOp::Mul),
+                        crate::nbvm::GA_DIV => Some(FBinOp::Div),
+                        _ => None, // GA_MOD
+                    };
+                    let done = a.new_label();
+                    let slow = a.new_label();
+                    if let Some(fb) = fbin {
+                        let nan_fix = a.new_label();
+                        a.movabs_r11(QNAN as i64);
+                        a.load_rax(disp(ra));
+                        a.and_rax_r11();
+                        a.cmp_rax_r11();
+                        a.je(slow);
+                        a.load_rax(disp(rb));
+                        a.and_rax_r11();
+                        a.cmp_rax_r11();
+                        a.je(slow);
+                        // Both numbers: a `NanBox` number stores the f64 bits directly.
+                        a.movsd_xmm0_mem(disp(ra));
+                        a.fbin_xmm0_mem(fb, disp(rb));
+                        // Canonicalize a NaN result before reboxing.
+                        a.ucomisd_xmm0_xmm0();
+                        a.jp(nan_fix);
+                        a.movsd_mem_xmm0(disp(dst));
+                        a.jmp(done);
+                        a.bind(nan_fix);
+                        a.movabs_rax(canonical_nan as i64);
+                        a.store_rax(disp(dst));
+                        a.jmp(done);
+                    }
+                    // Slow path (also the whole of Mod): the runtime arithmetic helper.
+                    a.bind(slow);
+                    a.mov_rdi_r15();
+                    a.load_argreg(1, disp(ra)); // rsi = a
+                    a.load_argreg(2, disp(rb)); // rdx = b
+                    a.movabs_argreg(3, i64::from(op)); // rcx = op discriminant
+                    a.movabs_rax(arith_helper as i64);
+                    a.call_rax();
+                    throw_check!();
+                    a.store_rax(disp(dst));
+                    a.bind(done);
+                }
+                GenericOp::Lt { dst, a: ra, b: rb } => {
+                    if !ok(dst) || !ok(ra) || !ok(rb) {
+                        return None;
+                    }
+                    let slow = a.new_label();
+                    let done = a.new_label();
+                    a.movabs_r11(QNAN as i64);
+                    a.load_rax(disp(ra));
+                    a.and_rax_r11();
                     a.cmp_rax_r11();
-                    a.je(throw_exit);
+                    a.je(slow);
+                    a.load_rax(disp(rb));
+                    a.and_rax_r11();
+                    a.cmp_rax_r11();
+                    a.je(slow);
+                    // `a < b` == `b > a` (ordered). `ucomisd xmm0=[rb], mem=[ra]` +
+                    // `seta` yields (b > a and ordered) ? 1 : 0 — false for a NaN
+                    // operand, matching JS relational comparison.
+                    a.movsd_xmm0_mem(disp(rb));
+                    a.ucomisd_xmm0_mem(disp(ra));
+                    a.seta_rax();
+                    a.movabs_r11(tag_false as i64);
+                    a.add_rax_r11(); // box the native 0/1 as a boolean
+                    a.store_rax(disp(dst));
+                    a.jmp(done);
+                    a.bind(slow);
+                    a.mov_rdi_r15();
+                    a.load_argreg(1, disp(ra));
+                    a.load_argreg(2, disp(rb));
+                    a.movabs_rax(lt_helper as i64);
+                    a.call_rax();
+                    throw_check!();
+                    a.store_rax(disp(dst));
+                    a.bind(done);
+                }
+                GenericOp::StrictEq { dst, a: ra, b: rb } => {
+                    if !ok(dst) || !ok(ra) || !ok(rb) {
+                        return None;
+                    }
+                    let slow = a.new_label();
+                    let done = a.new_label();
+                    a.movabs_r11(QNAN as i64);
+                    a.load_rax(disp(ra));
+                    a.and_rax_r11();
+                    a.cmp_rax_r11();
+                    a.je(slow);
+                    a.load_rax(disp(rb));
+                    a.and_rax_r11();
+                    a.cmp_rax_r11();
+                    a.je(slow);
+                    // Both numbers: ordered equality (+0 === -0 true, NaN === NaN false).
+                    a.movsd_xmm0_mem(disp(ra));
+                    a.ucomisd_xmm0_mem(disp(rb));
+                    a.ordered_equal_rax();
+                    a.movabs_r11(tag_false as i64);
+                    a.add_rax_r11();
+                    a.store_rax(disp(dst));
+                    a.jmp(done);
+                    a.bind(slow);
+                    // `jit_helper_strict_eq` never throws → no sentinel check needed.
+                    a.mov_rdi_r15();
+                    a.load_argreg(1, disp(ra));
+                    a.load_argreg(2, disp(rb));
+                    a.movabs_rax(strict_eq_helper as i64);
+                    a.call_rax();
+                    a.store_rax(disp(dst));
+                    a.bind(done);
+                }
+                GenericOp::ValueBin {
+                    dst,
+                    a: ra,
+                    b: rb,
+                    op,
+                } => {
+                    if !ok(dst) || !ok(ra) || !ok(rb) {
+                        return None;
+                    }
+                    // Only loose `==`/`!=` get an inline both-numbers fast path
+                    // (numeric equality); `**`/bitwise/shifts always take the helper.
+                    let is_loose =
+                        op == crate::nbvm::VB_LOOSE_EQ || op == crate::nbvm::VB_LOOSE_NEQ;
+                    let done = a.new_label();
+                    let slow = a.new_label();
+                    if is_loose {
+                        a.movabs_r11(QNAN as i64);
+                        a.load_rax(disp(ra));
+                        a.and_rax_r11();
+                        a.cmp_rax_r11();
+                        a.je(slow);
+                        a.load_rax(disp(rb));
+                        a.and_rax_r11();
+                        a.cmp_rax_r11();
+                        a.je(slow);
+                        a.movsd_xmm0_mem(disp(ra));
+                        a.ucomisd_xmm0_mem(disp(rb));
+                        a.ordered_equal_rax(); // (a == b, ordered) ? 1 : 0
+                        if op == crate::nbvm::VB_LOOSE_NEQ {
+                            a.xor_rax_imm(1); // `!=` negates
+                        }
+                        a.movabs_r11(tag_false as i64);
+                        a.add_rax_r11();
+                        a.store_rax(disp(dst));
+                        a.jmp(done);
+                    }
+                    a.bind(slow);
+                    a.mov_rdi_r15();
+                    a.load_argreg(1, disp(ra));
+                    a.load_argreg(2, disp(rb));
+                    a.movabs_argreg(3, i64::from(op)); // rcx = VB_* discriminant
+                    a.movabs_rax(value_bin_helper as i64);
+                    a.call_rax();
+                    throw_check!();
+                    a.store_rax(disp(dst));
+                    a.bind(done);
+                }
+                GenericOp::Not { dst, a: ra } => {
+                    if !ok(dst) || !ok(ra) {
+                        return None;
+                    }
+                    a.emit_truthy(disp(ra), truthy_helper, QNAN, tag_true, tag_false);
+                    a.xor_rax_imm(1); // logical not of the 0/1 truthiness
+                    a.movabs_r11(tag_false as i64);
+                    a.add_rax_r11(); // box as a boolean
+                    a.store_rax(disp(dst));
+                }
+                GenericOp::Jump { target } => {
+                    if target >= ops.len() {
+                        return None;
+                    }
+                    a.jmp(labels[target]);
+                }
+                GenericOp::JumpIfFalse { cond, target } => {
+                    if !ok(cond) || target >= ops.len() {
+                        return None;
+                    }
+                    a.emit_truthy(disp(cond), truthy_helper, QNAN, tag_true, tag_false);
+                    a.test_rax_rax();
+                    a.je(labels[target]); // falsy (truthy == 0) → take the branch
                 }
                 GenericOp::Ret { src } => {
                     if !ok(src) {
@@ -3560,8 +4024,8 @@ impl JitFunction {
                     a.load_rax(disp(src));
                     a.generic_epilogue();
                     has_ret = true;
-                    // Do NOT break: this tier is straight-line, but keep the shape
-                    // uniform with the other compilers (later ops may be targets).
+                    // Do NOT break: a later op may be a branch target (a `Ret` in the
+                    // middle of the stream, e.g. an early `return` in one arm).
                 }
             }
         }

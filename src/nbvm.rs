@@ -265,7 +265,20 @@ pub(crate) const VB_SHR: u8 = 5;
 pub(crate) const VB_USHR: u8 = 6;
 /// `Op::ValueBin` op code for loose `==` (exposed for the JIT's integer lowering).
 pub(crate) const VB_LOOSE_EQ: u8 = 7;
-const VB_LOOSE_NEQ: u8 = 8;
+/// `Op::ValueBin` op code for loose `!=` (exposed for the JIT's value lowering).
+pub(crate) const VB_LOOSE_NEQ: u8 = 8;
+
+// Discriminants for the numeric binary value-ops (`-`,`*`,`/`,`%`) shared by the
+// interpreter (`Op::Sub`/`Mul`/`Div`/`Mod`) and the generic-JIT helper
+// ([`jit_helper_arith`]), so the two tiers dispatch off one code path (`vm_arith`).
+/// `-` (subtraction).
+pub(crate) const GA_SUB: u8 = 0;
+/// `*` (multiplication).
+pub(crate) const GA_MUL: u8 = 1;
+/// `/` (division).
+pub(crate) const GA_DIV: u8 = 2;
+/// `%` (remainder).
+pub(crate) const GA_MOD: u8 = 3;
 
 // Native built-in ids for `Op::CallNative`.
 const NB_CONSOLE_LOG: u16 = 0;
@@ -932,6 +945,103 @@ fn vm_add(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanB
     Ok(ctx.realm.add(x, y))
 }
 
+/// The interpreter's real `-`/`*`/`/`/`%` operators (`Op::Sub`/`Mul`/`Div`/`Mod`),
+/// factored out so the bytecode VM **and** the generic-JIT runtime helper
+/// ([`jit_helper_arith`]) share one code path and can never diverge: ToPrimitive
+/// (number hint) on each operand — honoring a user `valueOf`/`toString` — then a
+/// Symbol-coercion guard, then the realm's numeric op. `op` is one of the `GA_*`
+/// discriminants. A user side effect runs exactly once per evaluation.
+fn vm_arith(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    a: NanBox,
+    b: NanBox,
+    op: u8,
+) -> Result<NanBox, VmError> {
+    let x = to_primitive(ctx, funcs, a, true);
+    let y = to_primitive(ctx, funcs, b, true);
+    if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_NUM_ERR) {
+        return Err(VmError::Thrown(e));
+    }
+    Ok(match op {
+        GA_SUB => ctx.realm.sub(x, y),
+        GA_MUL => ctx.realm.mul(x, y),
+        GA_DIV => ctx.realm.div(x, y),
+        _ => ctx.realm.rem(x, y),
+    })
+}
+
+/// The interpreter's real relational `<` (`Op::Lt`'s semantics), factored out so
+/// the bytecode VM **and** the generic-JIT runtime helper ([`jit_helper_lt`])
+/// share one code path: ToPrimitive (number hint) each operand, a Symbol-coercion
+/// guard, then `Realm::less_than` (string-vs-string ordering or numeric less-than).
+/// `>`, `<=`, `>=` are compiled to `Op::Lt` (with operand swap and/or `Op::Not`),
+/// so this single primitive backs all four relational operators. Returns a boolean
+/// `NanBox`.
+fn vm_lt(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanBox, VmError> {
+    let x = to_primitive(ctx, funcs, a, true);
+    let y = to_primitive(ctx, funcs, b, true);
+    if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_NUM_ERR) {
+        return Err(VmError::Thrown(e));
+    }
+    Ok(ctx.realm.less_than(x, y))
+}
+
+/// Strict equality `===` (`Op::StrictEq`'s semantics), factored out for the
+/// generic-JIT helper ([`jit_helper_strict_eq`]). Never throws and applies no
+/// coercion — strings compare by value, objects by identity, numbers numerically
+/// (NaN ≠ NaN, +0 === -0). `!==` is this followed by `Op::Not`.
+fn vm_strict_eq(realm: &Realm, a: NanBox, b: NanBox) -> NanBox {
+    NanBox::boolean(realm.strict_equals(a, b))
+}
+
+/// The interpreter's real `Op::ValueBin` (`**`, bitwise `&`/`|`/`^`, shifts
+/// `<<`/`>>`/`>>>`, and loose `==`/`!=`), factored out so the bytecode VM **and**
+/// the generic-JIT runtime helper ([`jit_helper_value_bin`]) share one code path.
+/// Loose equality applies ToPrimitive-then-compare (`[] == 0` is `true`); the
+/// numeric ops ToPrimitive (number hint) each operand — honoring a user `valueOf`
+/// — then the realm's `std`-gated math. `op` is a `VB_*` discriminant.
+#[cfg_attr(not(feature = "std"), allow(unused_variables))]
+fn vm_value_bin(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    a: NanBox,
+    b: NanBox,
+    op: u8,
+) -> Result<NanBox, VmError> {
+    match op {
+        VB_LOOSE_EQ | VB_LOOSE_NEQ => {
+            // `obj == primitive` converts the object with ToPrimitive (toString)
+            // before comparing, so e.g. `[] == 0` is true.
+            let (xc, yc) = loose_eq_coerce(ctx.realm, a, b);
+            let r = ctx.realm.loose_equals(xc, yc);
+            Ok(NanBox::boolean(if op == VB_LOOSE_EQ { r } else { !r }))
+        }
+        // `**`/bitwise/shifts are numeric: ToPrimitive each operand (honoring a user
+        // `valueOf`) before the realm's `std`-gated math.
+        #[cfg(feature = "std")]
+        _ => {
+            let xn = to_primitive(ctx, funcs, a, true);
+            let yn = to_primitive(ctx, funcs, b, true);
+            if let Some(e) = symbol_coercion_error(ctx.realm, xn, yn, SYM_NUM_ERR) {
+                return Err(VmError::Thrown(e));
+            }
+            Ok(match op {
+                VB_POW => ctx.realm.pow(xn, yn),
+                VB_BIT_AND => ctx.realm.bit_and(xn, yn),
+                VB_BIT_OR => ctx.realm.bit_or(xn, yn),
+                VB_BIT_XOR => ctx.realm.bit_xor(xn, yn),
+                VB_SHL => ctx.realm.shl(xn, yn),
+                VB_SHR => ctx.realm.shr(xn, yn),
+                VB_USHR => ctx.realm.ushr(xn, yn),
+                _ => NanBox::number(f64::NAN),
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        _ => Ok(NanBox::number(f64::NAN)),
+    }
+}
+
 /// The interpreter's real property **get** for a static string key
 /// (`Op::GetProp`'s semantics), factored out so the bytecode VM **and** the
 /// generic-JIT runtime helper ([`jit_helper_get_prop`]) share one code path and
@@ -1285,7 +1395,130 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         add: jit_helper_add,
         get: jit_helper_get_prop,
         set: jit_helper_set_prop,
+        arith: jit_helper_arith,
+        value_bin: jit_helper_value_bin,
+        lt: jit_helper_lt,
+        strict_eq: jit_helper_strict_eq,
+        truthy: jit_helper_truthy,
     }
+}
+
+/// Turns a helper `Result` into a raw generic-JIT return word: the value's `NanBox`
+/// bits on success, or — on a thrown/faulting error — the value stashed in
+/// `ctx.jit_pending` and the reserved throw sentinel returned (mirrors the tail of
+/// [`jit_helper_add`]). A non-throw fault is surfaced as a thrown generic error, as
+/// it cannot travel through a `NanBox`.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn jit_finish(ctx: &mut Ctx, r: Result<NanBox, VmError>) -> u64 {
+    match r {
+        Ok(v) => v.to_bits(),
+        Err(VmError::Thrown(val)) => {
+            ctx.jit_pending = Some(val);
+            NanBox::jit_throw_bits()
+        }
+        Err(_) => {
+            let e = make_error(ctx.realm, "Error", "JIT bin fault");
+            ctx.jit_pending = Some(e);
+            NanBox::jit_throw_bits()
+        }
+    }
+}
+
+/// Generic-JIT slow path for `-`/`*`/`/`/`%` (`GA_*` discriminant in `op`): runs the
+/// shared [`vm_arith`]. See [`jit_helper_add`] for the reentrancy/safety contract.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_arith(
+    ctx: *mut core::ffi::c_void,
+    a: u64,
+    b: u64,
+    op: u64,
+) -> u64 {
+    // SAFETY: single-threaded reentrancy — as `jit_helper_add`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    // SAFETY: `jit_funcs` outlives this call (borrowed down the whole call tree).
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    let r = vm_arith(
+        ctx,
+        funcs,
+        NanBox::from_bits(a),
+        NanBox::from_bits(b),
+        op as u8,
+    );
+    jit_finish(ctx, r)
+}
+
+/// Generic-JIT slow path for `Op::ValueBin` (`**`, bitwise, shifts, loose `==`/`!=`;
+/// `VB_*` discriminant in `op`): runs the shared [`vm_value_bin`].
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_value_bin(
+    ctx: *mut core::ffi::c_void,
+    a: u64,
+    b: u64,
+    op: u64,
+) -> u64 {
+    // SAFETY: single-threaded reentrancy — as `jit_helper_add`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    // SAFETY: `jit_funcs` outlives this call (borrowed down the whole call tree).
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    let r = vm_value_bin(
+        ctx,
+        funcs,
+        NanBox::from_bits(a),
+        NanBox::from_bits(b),
+        op as u8,
+    );
+    jit_finish(ctx, r)
+}
+
+/// Generic-JIT slow path for relational `<` (`Op::Lt`): runs the shared [`vm_lt`].
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_lt(ctx: *mut core::ffi::c_void, a: u64, b: u64) -> u64 {
+    // SAFETY: single-threaded reentrancy — as `jit_helper_add`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    // SAFETY: `jit_funcs` outlives this call (borrowed down the whole call tree).
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    let r = vm_lt(ctx, funcs, NanBox::from_bits(a), NanBox::from_bits(b));
+    jit_finish(ctx, r)
+}
+
+/// Generic-JIT slow path for strict equality `===` (`Op::StrictEq`): runs the shared
+/// [`vm_strict_eq`]. Never throws, so it always returns a boolean `NanBox`'s bits.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_strict_eq(ctx: *mut core::ffi::c_void, a: u64, b: u64) -> u64 {
+    // SAFETY: as `jit_helper_add`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    vm_strict_eq(ctx.realm, NanBox::from_bits(a), NanBox::from_bits(b)).to_bits()
+}
+
+/// Generic-JIT slow path for a truthiness test (`JumpIfFalse`/`Op::Not` on a
+/// non-number/non-boolean operand): runs the interpreter's `ToBoolean`
+/// (`Realm::truthy`) and returns `1` (truthy) or `0` (falsy). Never throws
+/// (ToBoolean calls no user code), so the caller needs no sentinel check.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_truthy(ctx: *mut core::ffi::c_void, v: u64) -> u64 {
+    // SAFETY: as `jit_helper_add`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    u64::from(ctx.realm.truthy(NanBox::from_bits(v)))
 }
 
 /// The generic-JIT runtime helper for `+`: the slow path the native code calls
@@ -1825,38 +2058,31 @@ fn run_frame(
             // Use the realm's arithmetic (ToNumber on each operand, which applies
             // ToPrimitive to objects) so `[5] - 2` is `3` natively, without an
             // error-driven fall back to the tree-walker. A user `valueOf`/
-            // `toString` is honored first via `to_primitive`.
+            // `toString` is honored first via `to_primitive`. Shared with the
+            // generic-JIT helper via `vm_arith` so the two tiers can't diverge.
             Op::Sub { dst, a, b } => {
-                let x = to_primitive(ctx, funcs, regs[*a as usize], true);
-                let y = to_primitive(ctx, funcs, regs[*b as usize], true);
-                if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_NUM_ERR) {
-                    handle_throw!(VmError::Thrown(e));
+                match vm_arith(ctx, funcs, regs[*a as usize], regs[*b as usize], GA_SUB) {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
                 }
-                regs[*dst as usize] = ctx.realm.sub(x, y);
             }
             Op::Mul { dst, a, b } => {
-                let x = to_primitive(ctx, funcs, regs[*a as usize], true);
-                let y = to_primitive(ctx, funcs, regs[*b as usize], true);
-                if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_NUM_ERR) {
-                    handle_throw!(VmError::Thrown(e));
+                match vm_arith(ctx, funcs, regs[*a as usize], regs[*b as usize], GA_MUL) {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
                 }
-                regs[*dst as usize] = ctx.realm.mul(x, y);
             }
             Op::Div { dst, a, b } => {
-                let x = to_primitive(ctx, funcs, regs[*a as usize], true);
-                let y = to_primitive(ctx, funcs, regs[*b as usize], true);
-                if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_NUM_ERR) {
-                    handle_throw!(VmError::Thrown(e));
+                match vm_arith(ctx, funcs, regs[*a as usize], regs[*b as usize], GA_DIV) {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
                 }
-                regs[*dst as usize] = ctx.realm.div(x, y);
             }
             Op::Mod { dst, a, b } => {
-                let x = to_primitive(ctx, funcs, regs[*a as usize], true);
-                let y = to_primitive(ctx, funcs, regs[*b as usize], true);
-                if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_NUM_ERR) {
-                    handle_throw!(VmError::Thrown(e));
+                match vm_arith(ctx, funcs, regs[*a as usize], regs[*b as usize], GA_MOD) {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
                 }
-                regs[*dst as usize] = ctx.realm.rem(x, y);
             }
             Op::HasProp { dst, key, obj } => {
                 let present = match regs[*obj as usize].as_handle().map(Handle::from_raw) {
@@ -1946,38 +2172,11 @@ fn run_frame(
             #[cfg(not(feature = "std"))]
             Op::BitNot { dst, .. } => regs[*dst as usize] = NanBox::number(f64::NAN),
             Op::ValueBin { dst, op, a, b } => {
-                let (x, y) = (regs[*a as usize], regs[*b as usize]);
-                regs[*dst as usize] = match *op {
-                    VB_LOOSE_EQ | VB_LOOSE_NEQ => {
-                        // `obj == primitive` converts the object with ToPrimitive
-                        // (toString) before comparing, so e.g. `[] == 0` is true.
-                        let (xc, yc) = loose_eq_coerce(ctx.realm, x, y);
-                        let r = ctx.realm.loose_equals(xc, yc);
-                        NanBox::boolean(if *op == VB_LOOSE_EQ { r } else { !r })
-                    }
-                    // `**`/bitwise/shifts are numeric: ToPrimitive each operand
-                    // (honoring a user `valueOf`) before the realm's `std`-gated math.
-                    #[cfg(feature = "std")]
-                    _ => {
-                        let xn = to_primitive(ctx, funcs, x, true);
-                        let yn = to_primitive(ctx, funcs, y, true);
-                        if let Some(e) = symbol_coercion_error(ctx.realm, xn, yn, SYM_NUM_ERR) {
-                            handle_throw!(VmError::Thrown(e));
-                        }
-                        match *op {
-                            VB_POW => ctx.realm.pow(xn, yn),
-                            VB_BIT_AND => ctx.realm.bit_and(xn, yn),
-                            VB_BIT_OR => ctx.realm.bit_or(xn, yn),
-                            VB_BIT_XOR => ctx.realm.bit_xor(xn, yn),
-                            VB_SHL => ctx.realm.shl(xn, yn),
-                            VB_SHR => ctx.realm.shr(xn, yn),
-                            VB_USHR => ctx.realm.ushr(xn, yn),
-                            _ => NanBox::number(f64::NAN),
-                        }
-                    }
-                    #[cfg(not(feature = "std"))]
-                    _ => NanBox::number(f64::NAN),
-                };
+                // Shared with the generic-JIT helper via `vm_value_bin`.
+                match vm_value_bin(ctx, funcs, regs[*a as usize], regs[*b as usize], *op) {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
+                }
             }
             Op::Neg { dst, a } => {
                 let x = to_primitive(ctx, funcs, regs[*a as usize], true);
@@ -1993,12 +2192,11 @@ fn run_frame(
             Op::Lt { dst, a, b } => {
                 // Use the realm's relational comparison so strings and objects
                 // (ToPrimitive) work natively instead of erroring into a fallback.
-                let x = to_primitive(ctx, funcs, regs[*a as usize], true);
-                let y = to_primitive(ctx, funcs, regs[*b as usize], true);
-                if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_NUM_ERR) {
-                    handle_throw!(VmError::Thrown(e));
+                // Shared with the generic-JIT helper via `vm_lt`.
+                match vm_lt(ctx, funcs, regs[*a as usize], regs[*b as usize]) {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
                 }
-                regs[*dst as usize] = ctx.realm.less_than(x, y);
             }
             Op::AddValue { dst, a, b } => {
                 // The general `+`: ToPrimitive each operand then string-concat or
@@ -2010,10 +2208,8 @@ fn run_frame(
                 }
             }
             Op::StrictEq { dst, a, b } => {
-                regs[*dst as usize] = NanBox::boolean(
-                    ctx.realm
-                        .strict_equals(regs[*a as usize], regs[*b as usize]),
-                );
+                // Shared with the generic-JIT helper via `vm_strict_eq`.
+                regs[*dst as usize] = vm_strict_eq(ctx.realm, regs[*a as usize], regs[*b as usize]);
             }
             Op::JumpIfFalse { cond, target } => {
                 if !ctx.realm.truthy(regs[*cond as usize]) {
@@ -11335,5 +11531,446 @@ mod generic_jit_tests {
             .get_property(oj.as_handle().map(Handle::from_raw).unwrap(), "c");
         assert_eq!(ci.and_then(|v| v.as_number()), Some(1.0));
         assert_eq!(cj.and_then(|v| v.as_number()), Some(1.0));
+    }
+
+    // --- Pass 3: control flow + comparisons + value arithmetic ---
+
+    /// A function table with the object/symbol-minting helpers Pass 3 needs
+    /// (`makeVal` has a counting `valueOf`; `makeObj` is a plain empty object).
+    fn p3_funcs() -> Vec<FnProto> {
+        let src = "
+            function makeVal(){ return { c: 0, valueOf: function(){ this.c = this.c + 1; return 42; } }; }
+            function makeObj(){ return {}; }
+        ";
+        let program = crate::parser::Parser::parse_program(src).expect("parse");
+        compile_program(&program).expect("compile helpers")
+    }
+
+    /// Runs `funcs[f_id]` through the interpreter and the JIT-forced generic tier
+    /// with `args`, asserting the JIT compiles to the generic tier and returns a
+    /// bit-identical result. Returns that result.
+    fn diff_ok(funcs: &[FnProto], f_id: usize, args: &[NanBox]) -> NanBox {
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f_id], &jit_generic_helpers())
+            .expect("generic-eligible");
+        assert!(jit.is_generic(), "must be the generic tier");
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let interp = call(&mut ctx, funcs, f_id, args).expect("interp ok");
+        let jitted = call_generic(&mut ctx, funcs, &jit, args)
+            .expect("not a pre-call deopt")
+            .expect("jit ok");
+        assert_eq!(
+            interp.to_bits(),
+            jitted.to_bits(),
+            "JIT diverged from interpreter"
+        );
+        interp
+    }
+
+    /// `f(a,b){ if (a < b) return a+b; else return a-b; }` — a real branchy body
+    /// (forward conditional branch, two `return` arms) over number and mixed
+    /// operands: JIT-forced === interpreter, proving the generic tier lowers the
+    /// branch, `<`, `+`, and `-`.
+    #[test]
+    fn generic_if_else_branch_matches() {
+        let mut funcs = p3_funcs();
+        // 0=a 1=b 2=cond 3=a+b 4=a-b.
+        let f = push_proto(
+            &mut funcs,
+            "f",
+            alloc::vec![
+                Op::Lt { dst: 2, a: 0, b: 1 },
+                Op::JumpIfFalse { cond: 2, target: 4 },
+                Op::AddValue { dst: 3, a: 0, b: 1 },
+                Op::Return { src: 3 },
+                Op::Sub { dst: 4, a: 0, b: 1 },
+                Op::Return { src: 4 },
+            ],
+            5,
+            2,
+        );
+        // number operands: 3 < 5 → 3+5 = 8 (then-arm, fast paths).
+        let r = diff_ok(&funcs, f, &[NanBox::number(3.0), NanBox::number(5.0)]);
+        assert_eq!(r.as_number(), Some(8.0));
+        // number operands: 5 < 3 false → 5-3 = 2 (else-arm).
+        let r = diff_ok(&funcs, f, &[NanBox::number(5.0), NanBox::number(3.0)]);
+        assert_eq!(r.as_number(), Some(2.0));
+        // mixed: string < string → concat in the taken arm (helper slow paths).
+        // String handles are realm-scoped, so run both tiers in one shared realm.
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let s1 = NanBox::handle(ctx.realm.new_string("apple").to_raw());
+        let s2 = NanBox::handle(ctx.realm.new_string("banana").to_raw());
+        let interp = call(&mut ctx, &funcs, f, &[s1, s2]).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[s1, s2])
+            .unwrap()
+            .unwrap();
+        // "apple" < "banana" → "applebanana".
+        assert_eq!(ctx.realm.to_display_string(interp), "applebanana");
+        assert_eq!(
+            ctx.realm.to_display_string(interp),
+            ctx.realm.to_display_string(jitted)
+        );
+    }
+
+    /// A counted loop `sum(n){ let s=0; for(let i=0;i<n;i++) s=s+i; return s; }` —
+    /// a backward branch (loop) accumulating a value. Proves the generic tier lowers
+    /// loops; JIT-forced === interpreter for several `n`.
+    #[test]
+    fn generic_counted_loop_matches() {
+        let mut funcs = p3_funcs();
+        // 0=n 1=s 2=i 3=cond 4=const1.
+        let sum = push_proto(
+            &mut funcs,
+            "sum",
+            alloc::vec![
+                Op::LoadConst {
+                    dst: 1,
+                    value: NanBox::number(0.0)
+                }, // 0: s = 0
+                Op::LoadConst {
+                    dst: 2,
+                    value: NanBox::number(0.0)
+                }, // 1: i = 0
+                Op::LoadConst {
+                    dst: 4,
+                    value: NanBox::number(1.0)
+                }, // 2: const 1
+                Op::Lt { dst: 3, a: 2, b: 0 }, // 3: cond = i < n
+                Op::JumpIfFalse { cond: 3, target: 8 }, // 4: exit
+                Op::AddValue { dst: 1, a: 1, b: 2 }, // 5: s = s + i
+                Op::AddValue { dst: 2, a: 2, b: 4 }, // 6: i = i + 1
+                Op::Jump { target: 3 },        // 7: loop
+                Op::Return { src: 1 },         // 8: return s
+            ],
+            5,
+            1,
+        );
+        for n in [0.0, 1.0, 5.0, 10.0, 100.0] {
+            let r = diff_ok(&funcs, sum, &[NanBox::number(n)]);
+            let expect = (0..n as i64).sum::<i64>() as f64;
+            assert_eq!(r.as_number(), Some(expect), "sum(1..{n})");
+        }
+    }
+
+    /// `===` vs `==` distinction: `1 == "1"` is `true` but `1 === "1"` is `false`,
+    /// matching the interpreter exactly (the number/string mix takes the helper).
+    #[test]
+    fn generic_strict_vs_loose_equality() {
+        let mut funcs = p3_funcs();
+        let strict = push_proto(
+            &mut funcs,
+            "strict",
+            alloc::vec![Op::StrictEq { dst: 2, a: 0, b: 1 }, Op::Return { src: 2 },],
+            3,
+            2,
+        );
+        let loose = push_proto(
+            &mut funcs,
+            "loose",
+            alloc::vec![
+                Op::ValueBin {
+                    dst: 2,
+                    op: VB_LOOSE_EQ,
+                    a: 0,
+                    b: 1
+                },
+                Op::Return { src: 2 },
+            ],
+            3,
+            2,
+        );
+        let one = NanBox::number(1.0);
+        // Build the "1" string in a throwaway realm just for the arg bits.
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let s1 = NanBox::handle(ctx.realm.new_string("1").to_raw());
+        // NOTE: diff_ok builds its own realm; string handles are realm-scoped, so
+        // run these through a shared realm here instead.
+        let jit_strict =
+            crate::jit::JitProto::compile_generic(&funcs[strict], &jit_generic_helpers()).unwrap();
+        let jit_loose =
+            crate::jit::JitProto::compile_generic(&funcs[loose], &jit_generic_helpers()).unwrap();
+        // 1 === "1"  → false, on both tiers.
+        let i_s = call(&mut ctx, &funcs, strict, &[one, s1]).unwrap();
+        let j_s = call_generic(&mut ctx, &funcs, &jit_strict, &[one, s1])
+            .unwrap()
+            .unwrap();
+        assert_eq!(i_s.to_bits(), NanBox::boolean(false).to_bits());
+        assert_eq!(i_s.to_bits(), j_s.to_bits());
+        // 1 == "1"  → true, on both tiers.
+        let i_l = call(&mut ctx, &funcs, loose, &[one, s1]).unwrap();
+        let j_l = call_generic(&mut ctx, &funcs, &jit_loose, &[one, s1])
+            .unwrap()
+            .unwrap();
+        assert_eq!(i_l.to_bits(), NanBox::boolean(true).to_bits());
+        assert_eq!(i_l.to_bits(), j_l.to_bits());
+        // number === number (fast path): 2 === 2 true, 2 === 3 false.
+        let two = NanBox::number(2.0);
+        let three = NanBox::number(3.0);
+        let j_eq = call_generic(&mut ctx, &funcs, &jit_strict, &[two, two])
+            .unwrap()
+            .unwrap();
+        let j_ne = call_generic(&mut ctx, &funcs, &jit_strict, &[two, three])
+            .unwrap()
+            .unwrap();
+        assert_eq!(j_eq.to_bits(), NanBox::boolean(true).to_bits());
+        assert_eq!(j_ne.to_bits(), NanBox::boolean(false).to_bits());
+    }
+
+    /// A relational comparison that throws (`obj < Symbol`): both tiers throw the
+    /// same TypeError, and the operand's side-effecting `valueOf` (evaluated before
+    /// the Symbol faults) runs EXACTLY once even on the throwing path.
+    #[test]
+    fn generic_relational_throws_identically_valueof_once() {
+        let mut funcs = p3_funcs();
+        let f = push_proto(
+            &mut funcs,
+            "lt",
+            alloc::vec![Op::Lt { dst: 2, a: 0, b: 1 }, Op::Return { src: 2 }],
+            3,
+            2,
+        );
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let obj_i = make_val(&mut ctx, &funcs);
+        let obj_j = make_val(&mut ctx, &funcs);
+        let sym_i = NanBox::handle(ctx.realm.new_symbol("s").to_raw());
+        let sym_j = NanBox::handle(ctx.realm.new_symbol("s").to_raw());
+
+        let interp = call(&mut ctx, &funcs, f, &[obj_i, sym_i]);
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[obj_j, sym_j]).unwrap();
+        let (vi, vj) = match (interp, jitted) {
+            (Err(VmError::Thrown(vi)), Err(VmError::Thrown(vj))) => (vi, vj),
+            other => panic!("expected both to throw, got {other:?}"),
+        };
+        let msg_i = ctx
+            .realm
+            .get_property(vi.as_handle().map(Handle::from_raw).unwrap(), "message");
+        let msg_j = ctx
+            .realm
+            .get_property(vj.as_handle().map(Handle::from_raw).unwrap(), "message");
+        assert_eq!(
+            msg_i.map(|m| ctx.realm.to_display_string(m)),
+            msg_j.map(|m| ctx.realm.to_display_string(m))
+        );
+        assert_eq!(
+            msg_i.map(|m| ctx.realm.to_display_string(m)).as_deref(),
+            Some(SYM_NUM_ERR)
+        );
+        let ci = ctx
+            .realm
+            .get_property(obj_i.as_handle().map(Handle::from_raw).unwrap(), "c");
+        let cj = ctx
+            .realm
+            .get_property(obj_j.as_handle().map(Handle::from_raw).unwrap(), "c");
+        assert_eq!(ci.and_then(|v| v.as_number()), Some(1.0));
+        assert_eq!(cj.and_then(|v| v.as_number()), Some(1.0));
+    }
+
+    /// Truthiness in a branch: `f(x){ if (x) return 1; else return 0; }` over
+    /// numbers (incl. 0/-0/NaN), booleans, "", non-empty strings, objects, null,
+    /// and undefined — JIT-forced === interpreter for every case (exercising the
+    /// inline number/boolean truthiness test and the `jit_helper_truthy` fallback).
+    #[test]
+    fn generic_truthiness_in_branch() {
+        let mut funcs = p3_funcs();
+        let f = push_proto(
+            &mut funcs,
+            "truthy",
+            alloc::vec![
+                Op::JumpIfFalse { cond: 0, target: 3 },
+                Op::LoadConst {
+                    dst: 1,
+                    value: NanBox::number(1.0)
+                },
+                Op::Return { src: 1 },
+                Op::LoadConst {
+                    dst: 1,
+                    value: NanBox::number(0.0)
+                },
+                Op::Return { src: 1 },
+            ],
+            2,
+            1,
+        );
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let empty = NanBox::handle(ctx.realm.new_string("").to_raw());
+        let nonempty = NanBox::handle(ctx.realm.new_string("x").to_raw());
+        let obj = make_val(&mut ctx, &funcs); // an object (always truthy)
+        let cases = [
+            (NanBox::number(0.0), false),
+            (NanBox::number(-0.0), false),
+            (NanBox::number(f64::NAN), false),
+            (NanBox::number(5.0), true),
+            (NanBox::number(-3.0), true),
+            (NanBox::boolean(true), true),
+            (NanBox::boolean(false), false),
+            (NanBox::null(), false),
+            (NanBox::undefined(), false),
+            (empty, false),
+            (nonempty, true),
+            (obj, true),
+        ];
+        for (v, want_truthy) in cases {
+            let interp = call(&mut ctx, &funcs, f, &[v]).unwrap();
+            let jitted = call_generic(&mut ctx, &funcs, &jit, &[v]).unwrap().unwrap();
+            assert_eq!(
+                interp.to_bits(),
+                jitted.to_bits(),
+                "value {:#x}",
+                v.to_bits()
+            );
+            assert_eq!(
+                interp.as_number(),
+                Some(if want_truthy { 1.0 } else { 0.0 }),
+                "truthiness of {:#x}",
+                v.to_bits()
+            );
+        }
+    }
+
+    /// Value arithmetic `-`/`*`/`/`/`%`: number fast path (SSE for `-`/`*`/`/`,
+    /// helper for `%`) and the object-`valueOf` slow path, JIT-forced ===
+    /// interpreter. Also proves `%`'s helper-only lowering matches.
+    #[test]
+    fn generic_arithmetic_ops_match() {
+        let mut funcs = p3_funcs();
+        let mk = |funcs: &mut Vec<FnProto>, name: &str, op: Op| {
+            push_proto(funcs, name, alloc::vec![op, Op::Return { src: 2 }], 3, 2)
+        };
+        let sub = mk(&mut funcs, "sub", Op::Sub { dst: 2, a: 0, b: 1 });
+        let mul = mk(&mut funcs, "mul", Op::Mul { dst: 2, a: 0, b: 1 });
+        let div = mk(&mut funcs, "div", Op::Div { dst: 2, a: 0, b: 1 });
+        let rem = mk(&mut funcs, "rem", Op::Mod { dst: 2, a: 0, b: 1 });
+        // number fast path.
+        assert_eq!(
+            diff_ok(&funcs, sub, &[NanBox::number(10.0), NanBox::number(3.0)]).as_number(),
+            Some(7.0)
+        );
+        assert_eq!(
+            diff_ok(&funcs, mul, &[NanBox::number(6.0), NanBox::number(7.0)]).as_number(),
+            Some(42.0)
+        );
+        assert_eq!(
+            diff_ok(&funcs, div, &[NanBox::number(1.0), NanBox::number(4.0)]).as_number(),
+            Some(0.25)
+        );
+        assert_eq!(
+            diff_ok(&funcs, rem, &[NanBox::number(17.0), NanBox::number(5.0)]).as_number(),
+            Some(2.0)
+        );
+        // divide-by-zero → +Infinity, and NaN canonicalization (0/0), fast path.
+        assert!(
+            diff_ok(&funcs, div, &[NanBox::number(1.0), NanBox::number(0.0)])
+                .as_number()
+                .unwrap()
+                .is_infinite()
+        );
+        assert!(
+            diff_ok(&funcs, div, &[NanBox::number(0.0), NanBox::number(0.0)])
+                .as_number()
+                .unwrap()
+                .is_nan()
+        );
+        // object-with-valueOf slow path: 42 - 2 == 40 (valueOf coerces to 42).
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[sub], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let obj_i = make_val(&mut ctx, &funcs);
+        let obj_j = make_val(&mut ctx, &funcs);
+        let two = NanBox::number(2.0);
+        let interp = call(&mut ctx, &funcs, sub, &[obj_i, two]).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[obj_j, two])
+            .unwrap()
+            .unwrap();
+        assert_eq!(interp.as_number(), Some(40.0));
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+        // valueOf ran exactly once on the JIT object.
+        let cj = ctx
+            .realm
+            .get_property(obj_j.as_handle().map(Handle::from_raw).unwrap(), "c");
+        assert_eq!(cj.and_then(|v| v.as_number()), Some(1.0));
+    }
+
+    /// `ValueBin` non-equality forms (`**`, bitwise, shifts) lower via the helper
+    /// and match the interpreter over number operands.
+    #[test]
+    fn generic_value_bin_ops_match() {
+        let mut funcs = p3_funcs();
+        let mk = |funcs: &mut Vec<FnProto>, name: &str, op: u8| {
+            push_proto(
+                funcs,
+                name,
+                alloc::vec![
+                    Op::ValueBin {
+                        dst: 2,
+                        op,
+                        a: 0,
+                        b: 1
+                    },
+                    Op::Return { src: 2 }
+                ],
+                3,
+                2,
+            )
+        };
+        let pow = mk(&mut funcs, "pow", VB_POW);
+        let and = mk(&mut funcs, "and", VB_BIT_AND);
+        let shl = mk(&mut funcs, "shl", VB_SHL);
+        let ushr = mk(&mut funcs, "ushr", VB_USHR);
+        assert_eq!(
+            diff_ok(&funcs, pow, &[NanBox::number(2.0), NanBox::number(10.0)]).as_number(),
+            Some(1024.0)
+        );
+        assert_eq!(
+            diff_ok(&funcs, and, &[NanBox::number(6.0), NanBox::number(3.0)]).as_number(),
+            Some(2.0)
+        );
+        assert_eq!(
+            diff_ok(&funcs, shl, &[NanBox::number(1.0), NanBox::number(4.0)]).as_number(),
+            Some(16.0)
+        );
+        assert_eq!(
+            diff_ok(&funcs, ushr, &[NanBox::number(-1.0), NanBox::number(28.0)]).as_number(),
+            Some(15.0)
+        );
+    }
+
+    /// The relational sugar `>`/`<=`/`>=` (compiled to `Lt` + operand swap / `Not`)
+    /// lowers and matches: `f(a,b){ return a >= b; }` is `!(a < b)`.
+    #[test]
+    fn generic_ge_via_lt_and_not() {
+        let mut funcs = p3_funcs();
+        // a >= b  ==  !(a < b): Lt{dst,a,b}; Not{dst,dst}.
+        let ge = push_proto(
+            &mut funcs,
+            "ge",
+            alloc::vec![
+                Op::Lt { dst: 2, a: 0, b: 1 },
+                Op::Not { dst: 2, a: 2 },
+                Op::Return { src: 2 },
+            ],
+            3,
+            2,
+        );
+        // 5 >= 3 true; 3 >= 5 false; 4 >= 4 true (fast paths).
+        assert_eq!(
+            diff_ok(&funcs, ge, &[NanBox::number(5.0), NanBox::number(3.0)]).to_bits(),
+            NanBox::boolean(true).to_bits()
+        );
+        assert_eq!(
+            diff_ok(&funcs, ge, &[NanBox::number(3.0), NanBox::number(5.0)]).to_bits(),
+            NanBox::boolean(false).to_bits()
+        );
+        assert_eq!(
+            diff_ok(&funcs, ge, &[NanBox::number(4.0), NanBox::number(4.0)]).to_bits(),
+            NanBox::boolean(true).to_bits()
+        );
     }
 }
