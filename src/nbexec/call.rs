@@ -2215,22 +2215,17 @@ impl<'a> Interp<'a> {
             // The instance's `[[Prototype]]` is the *newTarget*'s `.prototype`
             // (the callee's, except under `Reflect.construct(target, args, newTarget)`
             // with a function newTarget), so inherited methods resolve correctly.
+            let default_proto = self.realm.function_prototype(func_id);
             let proto = match self.reflect_new_target {
-                Some(nt)
-                    if nt
-                        .as_handle()
-                        .map(Handle::from_raw)
-                        .and_then(|h| self.realm.function_at(h))
-                        .is_some() =>
-                {
-                    let nt_fid = self
-                        .realm
-                        .function_at(Handle::from_raw(nt.as_handle().unwrap()))
-                        .unwrap()
-                        .0;
-                    self.realm.function_prototype(nt_fid)
+                Some(nt) if nt.as_handle() != callee.as_handle() => {
+                    // GetPrototypeFromConstructor(newTarget, default): `Get(nt,
+                    // "prototype")` when it is an Object (so a native-constructor,
+                    // class, or proxy newTarget supplies its own prototype), else
+                    // the callee's default.
+                    self.instance_proto_checked(nt, callee, Some(default_proto))?
+                        .unwrap_or(default_proto)
                 }
-                _ => self.realm.function_prototype(func_id),
+                _ => default_proto,
             };
             let instance = self.realm.new_object_with_proto(Some(proto));
             let this = NanBox::handle(instance.to_raw());
@@ -2739,13 +2734,21 @@ impl<'a> Interp<'a> {
                     NanBox::handle(arr.to_raw()),
                 );
             }
-            if let Some(opts) = opts_arg.and_then(|v| v.as_handle()).map(Handle::from_raw)
-                && let Some(cause) = self.realm.get_property(opts, "cause")
-                && let Some(eh) = err.as_handle()
+            // InstallErrorCause(O, options): only when `options` is an Object and
+            // `HasProperty(options, "cause")` is true (firing a proxy `has` trap,
+            // propagating an abrupt one) is `cause` read via `Get` (firing a
+            // getter / proxy `get` trap) and installed as a non-enumerable data
+            // property.
+            if let Some(opts) = opts_arg.copied()
+                && self.is_object_value(opts)
+                && let Some(oh) = opts.as_handle().map(Handle::from_raw)
+                && let Some(eh) = err.as_handle().map(Handle::from_raw)
+                && self.has_property_proxied(oh, "cause")?
             {
-                self.realm
-                    .set_property(Handle::from_raw(eh), "cause", cause);
-                self.realm.mark_hidden(Handle::from_raw(eh), "cause");
+                let key = self.new_str("cause");
+                let cause = self.read_member_value(oh, key)?;
+                self.realm.set_property(eh, "cause", cause);
+                self.realm.mark_hidden(eh, "cause");
             }
             // `Reflect.construct(Error, …, newTarget)`: link the error to
             // `GetPrototypeFromConstructor(newTarget, %ErrorType.prototype%)` — the
@@ -2757,7 +2760,13 @@ impl<'a> Interp<'a> {
                 && let Some(eh) = err.as_handle().map(Handle::from_raw)
             {
                 let default = self.realm.object_proto(eh);
-                if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
+                // GetPrototypeFromConstructor performs `Get(newTarget,
+                // "prototype")` — firing a `prototype` accessor / proxy `get`
+                // trap (so a custom-newTarget proxy supplies its trapped
+                // prototype), propagating an abrupt getter.
+                if let Some(proto) =
+                    self.instance_proto_checked(native_new_target, callee, default)?
+                {
                     self.realm.set_object_proto(eh, Some(proto));
                 }
             }

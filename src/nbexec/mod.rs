@@ -4374,6 +4374,25 @@ impl<'a> Interp<'a> {
             self.realm.mark_hidden(str_proto, &iter_key);
         }
         self.setup_first_class_prototype_id("Number", NUMBER_PROTO_METHODS, N_NUMBER_PROTO_FN);
+        // `Number.prototype.toString ( [ radix ] )` has `length` 1 (the generic
+        // `builtin_method_arity` maps "toString" to 0, which is right for
+        // Object/Array/Date but not Number). Override just this method's length.
+        if let Some(num_proto) = self
+            .current
+            .get("Number")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+            && let Some(ts) = self
+                .realm
+                .get_property(num_proto, "toString")
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+        {
+            self.install_fn_name_length(ts, "toString", 1);
+        }
         // The `Number` numeric constants are own data properties of the
         // constructor with the built-in attributes `{ writable: false,
         // enumerable: false, configurable: false }` (so `hasOwnProperty` and
@@ -4572,6 +4591,42 @@ impl<'a> Interp<'a> {
         self.setup_first_class_prototype_id("Map", MAP_PROTO_METHODS, N_MAP_PROTO_FN);
         self.setup_first_class_prototype_id("WeakMap", WEAKMAP_PROTO_METHODS, N_WEAKMAP_PROTO_FN);
         self.setup_first_class_prototype_id("WeakSet", WEAKSET_PROTO_METHODS, N_WEAKSET_PROTO_FN);
+        // Per spec, `Set.prototype.keys` is the *same* function object as
+        // `Set.prototype.values`, and `Set.prototype[Symbol.iterator]` is also
+        // that same object. Likewise `Map.prototype[Symbol.iterator]` is the
+        // same object as `Map.prototype.entries`. Install the shared handles so
+        // the `===` identity holds (writable, configurable, non-enumerable).
+        if let Some(set_proto) = self
+            .current
+            .get("Set")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+            && let Some(values) = self.realm.get_property(set_proto, "values")
+        {
+            self.realm.set_property(set_proto, "keys", values);
+            self.realm.mark_hidden(set_proto, "keys");
+            let iter_sym = self.well_known_symbol("iterator");
+            let iter_key = self.member_key(iter_sym);
+            self.realm.set_hidden_property(set_proto, &iter_key, values);
+        }
+        if let Some(map_proto) = self
+            .current
+            .get("Map")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+            && let Some(entries) = self.realm.get_property(map_proto, "entries")
+        {
+            let iter_sym = self.well_known_symbol("iterator");
+            let iter_key = self.member_key(iter_sym);
+            self.realm
+                .set_hidden_property(map_proto, &iter_key, entries);
+        }
         // `WeakRef.prototype.deref` and `FinalizationRegistry.prototype.{register,
         // unregister}` — direct-id, brand-checking natives. Instances link to these
         // prototypes (see the `construct` arms).
@@ -4856,6 +4911,23 @@ impl<'a> Interp<'a> {
                 "parseInt",
             ],
         );
+        // `Number.parseFloat`/`Number.parseInt` are the *same* function objects
+        // as the global `parseFloat`/`parseInt` (ECMA-262 21.1.2.12/13), so
+        // `Number.parseFloat === parseFloat`. Overwrite the freshly-installed
+        // static-method wrappers with the shared global handles.
+        if let Some(num) = self
+            .current
+            .get("Number")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            for name in ["parseFloat", "parseInt"] {
+                if let Some(g) = self.current.get(name) {
+                    self.realm.set_property(num, name, g);
+                    self.realm.mark_hidden(num, name);
+                }
+            }
+        }
         self.setup_static_methods("String", &["fromCharCode", "fromCodePoint", "raw"]);
         self.setup_static_methods("Symbol", &["for", "keyFor"]);
         self.setup_static_methods("Date", &["now", "parse", "UTC"]);
@@ -6110,17 +6182,21 @@ impl<'a> Interp<'a> {
         }
         let name_v = self.new_str(name);
         self.realm.set_property(obj, "name", name_v);
-        let msg_str = match message {
-            Some(m) if !matches!(m.unpack(), Unpacked::Undefined) => {
-                self.realm.to_display_string(m)
-            }
-            _ => String::new(),
-        };
-        let msg = self.new_str(&msg_str);
-        self.realm.set_property(obj, "message", msg);
-        // `name`/`message` are non-enumerable (so `Object.keys(err)` is empty).
+        // Only when `message` is present (not undefined) is an own, non-enumerable
+        // `message` data property created (ECMA-262 20.5.8.1 InstallErrorCause /
+        // the Error constructor step: `If message is not undefined …`). Otherwise
+        // the instance inherits `Error.prototype.message` (the empty string), and
+        // `err.hasOwnProperty("message")` is `false`.
+        if let Some(m) = message
+            && !matches!(m.unpack(), Unpacked::Undefined)
+        {
+            let msg_str = self.realm.to_display_string(m);
+            let msg = self.new_str(&msg_str);
+            self.realm.set_property(obj, "message", msg);
+            self.realm.mark_hidden(obj, "message");
+        }
+        // `name` is non-enumerable (so `Object.keys(err)` is empty).
         self.realm.mark_hidden(obj, "name");
-        self.realm.mark_hidden(obj, "message");
         // No own `stack` property: per the error-stack-accessor proposal, `stack`
         // is an inherited accessor on `Error.prototype` (see
         // `N_ERROR_PROTO_STACK_GET`/`N_ERROR_PROTO_STACK_SET`) driven by the

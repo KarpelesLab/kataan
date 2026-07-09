@@ -1313,6 +1313,28 @@ impl<'a> Interp<'a> {
                         let ok = self.apply_descriptor(rh, &key, desc, true)?;
                         return Ok(NanBox::boolean(ok));
                     }
+                    // OrdinarySetWithOwnDescriptor final steps for a (non-proxy)
+                    // receiver distinct from the target: the target's own
+                    // descriptor is a *data* descriptor (an accessor on the target
+                    // chain was already handled above). If the receiver already
+                    // has an own *accessor* for the key, the write fails (the
+                    // setter is NOT invoked); a non-writable own data property also
+                    // fails; otherwise the value is written / a data property is
+                    // created on the receiver.
+                    if receiver.as_handle() != Some(h.to_raw()) {
+                        if self.realm.accessor(rh, &key).is_some() {
+                            return Ok(NanBox::boolean(false));
+                        }
+                        if self.realm.has_own(rh, &key) {
+                            if !self.can_write_property(rh, &key) {
+                                return Ok(NanBox::boolean(false));
+                            }
+                        } else if !self.realm.is_extensible(rh) {
+                            return Ok(NanBox::boolean(false));
+                        }
+                        self.assign_member_value(rh, arg(1), value)?;
+                        return Ok(NanBox::boolean(true));
+                    }
                     if !self.can_write_property(rh, &key) {
                         return Ok(NanBox::boolean(false));
                     }

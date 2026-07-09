@@ -1497,10 +1497,9 @@ impl<'a> Interp<'a> {
         if !self.realm.collection_is_weak(coll) {
             return Ok(());
         }
-        let valid = key.as_handle().map(Handle::from_raw).is_some_and(|h| {
-            self.realm.string_value(h).is_none() && self.realm.bigint_at(h).is_none()
-        });
-        if valid {
+        // CanBeHeldWeakly(key): an object or a *non-registered* symbol. A symbol
+        // from `Symbol.for` (in the global registry) cannot be held weakly.
+        if self.can_be_held_weakly(key) {
             return Ok(());
         }
         let m = self.new_str("Invalid value used as weak collection key");

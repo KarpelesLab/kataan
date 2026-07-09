@@ -758,6 +758,15 @@ impl<'a> Interp<'a> {
                 }
                 "keyFor" => {
                     let target = arg(0);
+                    // `Symbol.keyFor(sym)`: if `sym` is not a Symbol, throw a
+                    // TypeError (ECMA-262 20.4.2.6 step 1).
+                    if !target
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .is_some_and(|h| self.realm.symbol_at(h).is_some())
+                    {
+                        return Err(self.type_error("Symbol.keyFor requires a symbol argument"));
+                    }
                     let found = self
                         .symbol_registry
                         .iter()
@@ -1655,8 +1664,11 @@ impl<'a> Interp<'a> {
         // `Map.groupBy(items, cb)` — like `Object.groupBy` but a Map (keys are
         // the callback's return value as-is, so objects work as group keys).
         if self.realm.native_at(handle) == Some(N_MAP) && method == "groupBy" {
-            let items = self.iterate_values(arg(0))?;
+            // GroupBy: IsCallable(callbackfn) is checked *before* iterating the
+            // items (so `Map.groupBy([], null)` throws even for an empty list).
             let cb = arg(1);
+            self.require_callable(cb, "Map.groupBy callback")?;
+            let items = self.iterate_values(arg(0))?;
             let map = self.realm.new_collection(false);
             for (i, item) in items.iter().enumerate() {
                 let key = self.call(cb, &[*item, NanBox::number(i as f64)])?;
@@ -4426,6 +4438,9 @@ impl<'a> Interp<'a> {
                 "forEach" => {
                     let f = arg(0);
                     let this_arg = arg(1);
+                    // IsCallable(callbackfn) is checked before any iteration, so
+                    // `new Map().forEach({})` on an empty collection still throws.
+                    self.require_callable(f, "Map.prototype.forEach callback")?;
                     let coll = NanBox::handle(handle.to_raw());
                     let is_set = self.realm.collection_is_set(handle) == Some(true);
                     // LIVE iteration (mirrors the keys/values/entries iterator): a
