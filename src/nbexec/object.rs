@@ -61,6 +61,14 @@ impl<'a> Interp<'a> {
     /// Builds the property descriptor object for own property `key` of `obj`
     /// (accessor or data), or `None` if `key` is not an own property.
     pub(crate) fn build_descriptor(&mut self, obj: Handle, key: &str) -> Option<NanBox> {
+        // A **mapped `arguments` index** (10.4.4.1 `[[GetOwnProperty]]`): its
+        // reported `[[Value]]` is the live parameter binding it aliases. Refresh the
+        // stored own data property from that binding before the generic path reads
+        // it (the property is always writable while mapped, so the write succeeds).
+        if let Some((scope, param)) = self.arg_map_binding(obj, key) {
+            let value = scope.get(&param).unwrap_or_else(NanBox::undefined);
+            self.realm.set_property(obj, key, value);
+        }
         // A **String exotic object**'s own index / `length` (StringGetOwnProperty):
         // an index `"0".."length-1"` is `{ value: char, writable: false,
         // enumerable: true, configurable: false }`; `length` is
@@ -781,6 +789,26 @@ impl<'a> Interp<'a> {
             );
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
+        // Mapped `arguments` exotic `[[DefineOwnProperty]]` (10.4.4.2): capture the
+        // aliased `(scope, parameter name)` up front (`None` for any other object /
+        // an already-broken index). Step 3: when the descriptor demotes the index to
+        // a non-writable data property *without* an explicit value, substitute the
+        // current binding value into the (freshly normalized) descriptor so it is
+        // preserved after the mapping breaks. The post-store mapping update (accessor
+        // / value / non-writable) runs at the end, once the define has succeeded.
+        let arg_binding = self.arg_map_binding(obj, key);
+        if let Some((scope, param)) = &arg_binding
+            && has_data_field
+            && !self.realm.has_own(desc, "value")
+            && self.realm.has_own(desc, "writable")
+            && !self
+                .realm
+                .get_property(desc, "writable")
+                .is_some_and(|v| self.realm.truthy(v))
+        {
+            let cur = scope.get(param).unwrap_or_else(NanBox::undefined);
+            self.realm.set_property(desc, "value", cur);
+        }
         // Integer-indexed exotic `[[DefineOwnProperty]]` (ECMA-262 10.4.5.3): when
         // `obj` is a typed array and `key` is a canonical numeric index, the only
         // legal define is a writable, enumerable, configurable data property at a
@@ -1074,6 +1102,33 @@ impl<'a> Interp<'a> {
             self.realm.clear_non_configurable_property(obj, key);
         } else {
             self.realm.set_non_configurable_property(obj, key);
+        }
+        // Mapped `arguments` `[[DefineOwnProperty]]` step 6: after a successful
+        // define, keep the parameter binding in sync and/or break the mapping.
+        if let Some((scope, param)) = &arg_binding {
+            if desc_is_accessor {
+                // Redefining the index as an accessor severs the alias.
+                self.arg_map_break(obj, key);
+            } else {
+                // A supplied value flows through to the aliased binding (so
+                // `defineProperty(arguments, i, {value})` updates the parameter).
+                if self.realm.has_own(desc, "value") {
+                    let v = self
+                        .realm
+                        .get_property(desc, "value")
+                        .unwrap_or(NanBox::undefined());
+                    scope.set(param, v);
+                }
+                // Demoting the index to non-writable severs the alias.
+                if self.realm.has_own(desc, "writable")
+                    && !self
+                        .realm
+                        .get_property(desc, "writable")
+                        .is_some_and(|v| self.realm.truthy(v))
+                {
+                    self.arg_map_break(obj, key);
+                }
+            }
         }
         Ok(true)
     }
@@ -1479,9 +1534,19 @@ impl<'a> Interp<'a> {
     /// - A hidden `ARGS_MARKER` makes `Object.prototype.toString` report
     ///   `[object Arguments]`.
     ///
-    /// (True parameter↔index aliasing for a mapped object is not modeled; the
-    /// values are a snapshot of the call arguments.)
-    pub(crate) fn make_arguments_object(&mut self, args: &[NanBox], callee: NanBox) -> NanBox {
+    /// When `mapped_params` is `Some(names)` (a sloppy-mode function with a simple
+    /// parameter list, `names` being its formal-parameter names in order), the
+    /// object is **mapped**: each index `i < min(argc, names.len())` that is the
+    /// *last* parameter with its name aliases the parameter binding in
+    /// `self.current` (10.4.4 `CreateMappedArgumentsObject`), recorded in
+    /// [`Interp::arg_maps`]. When `None` (strict, or a non-simple parameter list),
+    /// the object is unmapped — the indices are a plain snapshot of the arguments.
+    pub(crate) fn make_arguments_object(
+        &mut self,
+        args: &[NanBox],
+        callee: NanBox,
+        mapped_params: Option<&[&str]>,
+    ) -> NanBox {
         let obj = self.realm.new_object();
         // [[Prototype]] = Object.prototype.
         if let Some(proto) = self
@@ -1537,13 +1602,64 @@ impl<'a> Interp<'a> {
             });
             let thrower = NanBox::handle(thrower_h.to_raw());
             self.realm.define_accessor(obj, "callee", thrower, thrower);
+            // A strict arguments object's `callee` accessor is non-enumerable AND
+            // non-configurable (`{enumerable:false, configurable:false}`).
             self.realm.mark_hidden(obj, "callee");
+            self.realm.set_non_configurable_property(obj, "callee");
         } else {
             self.realm.set_hidden_property(obj, "callee", callee);
         }
         self.realm
             .set_hidden_property(obj, ARGS_MARKER, NanBox::boolean(true));
+        // CreateMappedArgumentsObject: build the `[[ParameterMap]]`. An index is
+        // mapped iff it is bound by an argument (`i < argc`) AND its parameter name
+        // does not recur in a *later* formal position (a duplicate name maps only
+        // its last occurrence, per the spec's high-to-low index walk).
+        if let Some(names) = mapped_params {
+            let bound = args.len().min(names.len());
+            let mut slots = alloc::collections::BTreeMap::new();
+            for i in 0..bound {
+                let name = names[i];
+                if !names[i + 1..].contains(&name) {
+                    slots.insert(i, String::from(name));
+                }
+            }
+            if !slots.is_empty() {
+                self.arg_maps.insert(
+                    obj.to_raw(),
+                    super::ArgMap {
+                        scope: self.current.clone(),
+                        slots,
+                    },
+                );
+            }
+        }
         NanBox::handle(obj.to_raw())
+    }
+
+    /// The `(scope, parameter name)` a mapped `arguments` index currently aliases,
+    /// or `None` if `handle` is not a mapped arguments object or `key` is not (or
+    /// no longer) a mapped index. `key` must be a canonical integer string.
+    pub(crate) fn arg_map_binding(&self, handle: Handle, key: &str) -> Option<(Scope, String)> {
+        let map = self.arg_maps.get(&handle.to_raw())?;
+        let i = key.parse::<usize>().ok()?;
+        if alloc::format!("{i}") != key {
+            return None;
+        }
+        let name = map.slots.get(&i)?;
+        Some((map.scope.clone(), name.clone()))
+    }
+
+    /// Breaks the mapping of index `key` on a mapped `arguments` object (drops its
+    /// slot) — the spec's `map.[[Delete]](P)` on a `delete` or on a
+    /// `defineProperty` that installs an accessor / non-writable data property.
+    pub(crate) fn arg_map_break(&mut self, handle: Handle, key: &str) {
+        if let Some(map) = self.arg_maps.get_mut(&handle.to_raw())
+            && let Ok(i) = key.parse::<usize>()
+            && alloc::format!("{i}") == key
+        {
+            map.slots.remove(&i);
+        }
     }
 
     /// `ToObject(v)` for `Object(v)`: `null`/`undefined` yield a fresh object; an
@@ -1725,7 +1841,12 @@ impl<'a> Interp<'a> {
         {
             return Ok(false);
         }
-        Ok(self.realm.delete_property(obj, key))
+        let result = self.realm.delete_property(obj, key);
+        // A successful delete of a mapped `arguments` index breaks its aliasing.
+        if result {
+            self.arg_map_break(obj, key);
+        }
+        Ok(result)
     }
 
     /// `[[PreventExtensions]]` honoring a proxy's `preventExtensions` trap. Returns

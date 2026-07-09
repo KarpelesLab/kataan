@@ -640,6 +640,25 @@ pub struct Interp<'a> {
     host_fns: Vec<Option<HostFn>>,
     /// Test262 `$262.agent` cooperative-scheduler state (see [`agent`]).
     agent: AgentState,
+    /// **Mapped `arguments` exotic objects** (sloppy-mode functions with a simple
+    /// parameter list): the arguments object's heap-handle (raw) maps each
+    /// currently-mapped integer index to the `(scope, parameter name)` binding it
+    /// aliases (10.4.4 `[[ParameterMap]]`). A `[[Get]]` of a mapped index reads the
+    /// live parameter binding, a `[[Set]]` writes it, and `delete` / a
+    /// `defineProperty` that installs an accessor or a non-writable data property
+    /// *breaks* the mapping for that index (drops the slot). Empty for strict
+    /// functions and any non-simple parameter list (which are unmapped).
+    arg_maps: alloc::collections::BTreeMap<u64, ArgMap>,
+}
+
+/// The `[[ParameterMap]]` of one mapped `arguments` object: the shared parameter
+/// scope plus each still-mapped index's parameter name (see [`Interp::arg_maps`]).
+struct ArgMap {
+    /// The function-call scope holding the aliased parameter bindings.
+    scope: Scope,
+    /// Currently-mapped `index → parameter name`. An index is removed when its
+    /// mapping breaks (delete / accessor or non-writable redefine).
+    slots: alloc::collections::BTreeMap<usize, String>,
 }
 
 /// The Test262 `$262.agent` cooperative scheduler + `Atomics.waitAsync` state.
@@ -2774,6 +2793,7 @@ impl<'a> Interp<'a> {
             active_module_key: None,
             host_fns: Vec::new(),
             agent: AgentState::default(),
+            arg_maps: alloc::collections::BTreeMap::new(),
         };
         // The constructor's `current` IS the root scope; capture it as the global
         // scope before `install_globals` populates it, so indirect eval can run

@@ -1636,7 +1636,23 @@ impl<'a> Interp<'a> {
             // the parameters so a parameter default can reference `arguments`
             // (`function f(x = arguments[0]) {}`).
             if !def.is_arrow {
-                let arguments = self.make_arguments_object(args, callee);
+                // A **mapped** arguments object (aliasing `arguments[i]` to the i-th
+                // parameter binding) is created only for a *sloppy* function with a
+                // *simple* parameter list — no defaults, rest, or destructuring
+                // (10.4.4). Otherwise the object is unmapped (a plain snapshot).
+                let simple_params = def.params.iter().all(|p| {
+                    !p.rest && p.default.is_none() && matches!(p.target, BindingTarget::Ident(_))
+                });
+                let mapped_names: Option<Vec<&str>> = (!self.strict && simple_params).then(|| {
+                    def.params
+                        .iter()
+                        .filter_map(|p| match &p.target {
+                            BindingTarget::Ident(id) => Some(id.name.as_ref()),
+                            _ => None,
+                        })
+                        .collect()
+                });
+                let arguments = self.make_arguments_object(args, callee, mapped_names.as_deref());
                 self.current.declare("arguments", arguments);
             }
             // While evaluating parameter defaults, expose the formal parameter

@@ -584,6 +584,11 @@ impl<'a> Interp<'a> {
                                         // same way. `delete_property` handles arrays,
                                         // objects, and aux-bearing cells uniformly.
                                         result = self.realm.delete_property(h, &name);
+                                        // A successful delete of a mapped `arguments`
+                                        // index breaks its aliasing (10.4.4.5).
+                                        if result {
+                                            self.arg_map_break(h, &name);
+                                        }
                                     }
                                 }
                             }
@@ -1995,6 +2000,13 @@ impl<'a> Interp<'a> {
             }
         }
         let name = self.coerce_property_key(key)?;
+        // A **mapped `arguments` index** (10.4.4.4 `[[Set]]`): also write the live
+        // parameter binding it aliases (`arguments[i] = v` updates the i-th
+        // parameter). Fall through to the ordinary store so the own property's
+        // value stays in sync for a subsequent `getOwnPropertyDescriptor`.
+        if let Some((scope, param)) = self.arg_map_binding(handle, &name) {
+            scope.set(&param, new);
+        }
         // A typed array's `length` is fixed (non-writable): ignore the assignment.
         if name == "length" && self.realm.typed_len(handle).is_some() {
             return Ok(());
@@ -2161,6 +2173,14 @@ impl<'a> Interp<'a> {
             let value = scope.get(local).unwrap_or_else(NanBox::undefined);
             // Refresh the stored data property (it is non-configurable but
             // writable, so the engine-internal write is permitted).
+            self.realm.set_property(handle, name, value);
+            return Ok(value);
+        }
+        // A **mapped `arguments` index** (10.4.4.3 `[[Get]]`): the value is the live
+        // parameter binding it aliases. Refresh the stored data property too so a
+        // later `getOwnPropertyDescriptor` reports the current value.
+        if let Some((scope, param)) = self.arg_map_binding(handle, name) {
+            let value = scope.get(&param).unwrap_or_else(NanBox::undefined);
             self.realm.set_property(handle, name, value);
             return Ok(value);
         }
