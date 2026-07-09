@@ -255,6 +255,34 @@ impl Expr {
             _ => false,
         }
     }
+
+    /// Whether this expression is a direct `CallExpression` used as a simple /
+    /// compound assignment, update, or `for`-in/of target under the AnnexB
+    /// "Runtime Errors for Function Call Assignment Targets" web-compat rule
+    /// (`sec-runtime-errors-for-function-call-assignment-targets`): such a target
+    /// parses in sloppy code and produces a runtime `ReferenceError` (it remains a
+    /// static `SyntaxError` in strict mode). Optional-chaining calls (`f?.()`),
+    /// dynamic `import(...)`, and `import.source/defer(...)` are excluded — their
+    /// `AssignmentTargetType` is always `invalid`. Logical assignment (`&&=` etc.)
+    /// and tagged templates are handled by the caller (never web-compat).
+    #[must_use]
+    pub fn is_web_compat_call_target(&self) -> bool {
+        let Expr::Call {
+            callee,
+            optional: false,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        match &**callee {
+            Expr::Ident(id) => &*id.name != "import",
+            Expr::Member { object, .. } => {
+                !matches!(&**object, Expr::Ident(id) if &*id.name == "import")
+            }
+            _ => true,
+        }
+    }
 }
 
 /// An element of an array literal.

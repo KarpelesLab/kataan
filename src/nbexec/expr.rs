@@ -669,6 +669,18 @@ impl<'a> Interp<'a> {
                 argument,
                 ..
             } => {
+                // AnnexB web-compat: a direct CallExpression operand of `++`/`--`
+                // parses in sloppy code but is a runtime ReferenceError (the call is
+                // evaluated first for its side effects). Strict mode rejected it at
+                // parse time.
+                if argument.is_web_compat_call_target() {
+                    self.eval(argument)?;
+                    let m = self
+                        .new_str("Invalid left-hand side expression in prefix/postfix operation");
+                    return Err(ExecError::Throw(
+                        self.make_error(N_REFERENCE_ERROR, Some(m)),
+                    ));
+                }
                 // For a member target, the reference is evaluated exactly once: the
                 // base and (computed) key run once, then GetValue + PutValue share
                 // them — so `obj[keyWithSideEffect()]++` does not run the key twice.
@@ -1779,6 +1791,21 @@ impl<'a> Interp<'a> {
             }
             // An own data property below shadows an inherited accessor/proxy.
             if self.realm.has_own(c, key) {
+                // OrdinarySetWithOwnDescriptor recursion: a *non-writable* inherited
+                // data property makes the whole [[Set]] fail — strict throws, sloppy
+                // silently drops — and no shadowing own property is created on the
+                // receiver. A writable inherited data property allows shadowing (fall
+                // through to the own-property write on the receiver). The walk starts
+                // above the receiver, so `c` is always an ancestor here.
+                if !self.can_write_property(c, key) {
+                    if self.strict {
+                        let m = self.new_str(&alloc::format!(
+                            "Cannot assign to read only property '{key}'"
+                        ));
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
+                    return Ok(Some(()));
+                }
                 break;
             }
             cur = self.realm.object_proto(c);
@@ -2892,6 +2919,19 @@ impl<'a> Interp<'a> {
         target: &'a Expr,
         value: &'a Expr,
     ) -> Result<NanBox, ExecError> {
+        // AnnexB "Runtime Errors for Function Call Assignment Targets": a direct
+        // CallExpression LHS parses in sloppy code but is a runtime ReferenceError.
+        // The call itself is evaluated (its side effects run), then the assignment
+        // fails *before* the RHS is evaluated — matching the spec's ordering
+        // (`f() = g()` calls `f`, never `g`). Strict mode rejected this at parse
+        // time, so only sloppy `=`/`op=` reach here.
+        if target.is_web_compat_call_target() {
+            self.eval(target)?;
+            let m = self.new_str("Invalid left-hand side in assignment");
+            return Err(ExecError::Throw(
+                self.make_error(N_REFERENCE_ERROR, Some(m)),
+            ));
+        }
         // Logical assignment (`&&=`/`||=`/`??=`) short-circuits: the right side
         // is evaluated and stored only when the current value warrants it.
         if matches!(
@@ -3503,6 +3543,20 @@ impl<'a> Interp<'a> {
                 }
                 // An own data property below shadows an inherited accessor.
                 if self.realm.has_own(c, &skey) {
+                    // OrdinarySetWithOwnDescriptor: an *inherited* (`c != handle`)
+                    // non-writable data property makes the whole [[Set]] fail — strict
+                    // throws, sloppy drops — with no shadowing own property created on
+                    // the receiver. The receiver's own property (`c == handle`) falls
+                    // through to the normal write, which honors its own writability.
+                    if c != handle && !self.can_write_property(c, &skey) {
+                        if self.strict {
+                            let m = self.new_str(&alloc::format!(
+                                "Cannot assign to read only property '{skey}'"
+                            ));
+                            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                        }
+                        return Ok(());
+                    }
                     break;
                 }
                 cur = self.realm.object_proto(c);

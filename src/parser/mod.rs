@@ -337,7 +337,21 @@ impl<'src> Parser<'src> {
             ));
         }
         if !left.is_assignment_target() {
-            return Err(self.err_at(left.span(), "invalid assignment target"));
+            // AnnexB web-compat: a direct `CallExpression` LHS (`f() = x`,
+            // `f() += x`) is not a static SyntaxError — it parses and is a runtime
+            // ReferenceError in sloppy code. The strict-mode rejection is deferred
+            // to the validator (which knows the mode). Logical assignment
+            // (`&&=`/`||=`/`??=`) is excluded: its target must be simple in *both*
+            // modes, so a call target there stays a parse error.
+            let logical = matches!(
+                op,
+                crate::ast::AssignOp::AndAssign
+                    | crate::ast::AssignOp::OrAssign
+                    | crate::ast::AssignOp::NullishAssign
+            );
+            if logical || !left.is_web_compat_call_target() {
+                return Err(self.err_at(left.span(), "invalid assignment target"));
+            }
         }
         self.bump();
         let value = self.parse_assignment()?;

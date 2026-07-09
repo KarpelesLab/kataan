@@ -1420,6 +1420,24 @@ impl<'a> Interp<'a> {
         let home = self
             .current_home
             .ok_or(ExecError::Unsupported("super outside a method"))?;
+        // GetSuperBase = HomeObject.[[GetPrototypeOf]](). For a class the home object
+        // is the constructor (static method) or the class prototype (instance method).
+        // PutValue on a SuperProperty performs ToObject(GetSuperBase), so a null super
+        // base — e.g. after `Object.setPrototypeOf(C, null)` — is a TypeError, thrown
+        // *after* the RHS has been evaluated and regardless of whether an inherited
+        // setter exists.
+        let home_obj = if self.current_home_static {
+            self.class_handles
+                .get(home as usize)
+                .and_then(|v| v.as_handle().map(Handle::from_raw))
+        } else {
+            Some(self.class_prototype_by_id(home))
+        };
+        if let Some(ho) = home_obj
+            && self.realm.object_proto(ho).is_none()
+        {
+            return Err(self.type_error("Cannot set property on null (super)"));
+        }
         let mut cur = self.resolve_super(
             self.classes[home as usize],
             &self.class_envs[home as usize].clone(),

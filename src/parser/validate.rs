@@ -600,7 +600,10 @@ impl Validator {
                 self.binding_target(target, ctx)
             }
             ForLeft::Target(e) => {
-                if !is_valid_assign_target(e) {
+                if !is_valid_assign_target(e) && !(e.is_web_compat_call_target() && !ctx.strict) {
+                    // AnnexB web-compat allows a CallExpression for-in/of LHS in
+                    // sloppy code (a runtime ReferenceError); it stays a SyntaxError
+                    // in strict mode and for every other invalid target.
                     return Err(self.err(e.span(), "invalid for-in/of assignment target"));
                 }
                 if ctx.strict {
@@ -1504,8 +1507,12 @@ impl Validator {
             Expr::Update { argument, .. } => {
                 // The operand of `++`/`--` must be a *simple* reference — an
                 // identifier or member access — never a call, literal, or
-                // destructuring pattern.
-                if !is_simple_update_target(argument) {
+                // destructuring pattern. AnnexB web-compat is the one exception: a
+                // direct CallExpression operand is a runtime ReferenceError in
+                // sloppy code (a SyntaxError in strict mode).
+                if !is_simple_update_target(argument)
+                    && !(!ctx.strict && argument.is_web_compat_call_target())
+                {
                     return Err(self.err(argument.span(), "invalid operand for `++`/`--`"));
                 }
                 if ctx.strict {
@@ -1564,11 +1571,23 @@ impl Validator {
                 // A simple assignment `=` may target a destructuring pattern; a
                 // compound assignment (`+=`, …) requires a simple reference.
                 let simple_assign = matches!(op, crate::ast::AssignOp::Assign);
+                // AnnexB web-compat: a direct CallExpression target for a simple
+                // (`=`) or arithmetic/bitwise compound (`+=`, …) assignment is a
+                // runtime ReferenceError in sloppy code, a SyntaxError in strict.
+                // Logical assignment (`&&=`/`||=`/`??=`) is excluded — its call
+                // target is a SyntaxError in both modes (rejected in the parser).
+                let logical = matches!(
+                    op,
+                    crate::ast::AssignOp::AndAssign
+                        | crate::ast::AssignOp::OrAssign
+                        | crate::ast::AssignOp::NullishAssign
+                );
+                let web_compat_call = !logical && !ctx.strict && target.is_web_compat_call_target();
                 if simple_assign {
-                    if !is_valid_assign_target(target) {
+                    if !is_valid_assign_target(target) && !web_compat_call {
                         return Err(self.err(target.span(), "invalid assignment target"));
                     }
-                } else if !is_simple_update_target(target) {
+                } else if !is_simple_update_target(target) && !web_compat_call {
                     return Err(self.err(target.span(), "invalid target for compound assignment"));
                 }
                 if ctx.strict {

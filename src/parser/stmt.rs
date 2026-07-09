@@ -901,7 +901,10 @@ impl<'src> Parser<'src> {
     }
 
     fn expr_for_left(&self, expr: Expr, is_of: bool) -> Result<ForHead> {
-        if !expr.is_assignment_target() {
+        // AnnexB web-compat: a direct `CallExpression` as a `for`-in/of LHS
+        // (`for (f() in x)`) parses in sloppy code and is a runtime ReferenceError;
+        // strict mode rejects it in the validator.
+        if !expr.is_assignment_target() && !expr.is_web_compat_call_target() {
             return Err(self.err_at(
                 expr.span(),
                 "invalid left-hand side in for-in/of (not an assignment target)",

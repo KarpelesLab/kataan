@@ -1137,6 +1137,18 @@ impl<'a> Interp<'a> {
         target: &'a Expr,
         value: NanBox,
     ) -> Result<(), ExecError> {
+        // AnnexB web-compat: a direct CallExpression as a `for`-in/of LHS parses in
+        // sloppy code but is a runtime ReferenceError (the call runs first for its
+        // side effects). Strict mode rejected it at parse time; nested destructuring
+        // call targets are rejected by the validator, so only this for-head path
+        // reaches here.
+        if target.is_web_compat_call_target() {
+            self.eval(target)?;
+            let m = self.new_str("Invalid left-hand side in assignment");
+            return Err(ExecError::Throw(
+                self.make_error(N_REFERENCE_ERROR, Some(m)),
+            ));
+        }
         match target {
             Expr::Array { elements, .. } => {
                 // A *user* iterator is driven by the interleaved iterator protocol —
