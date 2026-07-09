@@ -735,8 +735,18 @@ fn ensure_jit(
         return None; // recursion: this function is mid-compilation
     }
     stack.insert(id);
-    // Resolve each statically-called function to its compiled code address.
+    // Resolve each statically-called function to its compiled code address, keyed by
+    // the callee's ABI so a caller only ever direct-calls a matching signature (a
+    // wrong-ABI direct call would mis-dispatch and crash):
+    //   * `registry`         — Int-ABI callees, for the Int tier's `RegOp::Call`.
+    //   * `generic_registry` — generic-ABI callees + their param count, for the
+    //     generic tier's direct JIT→JIT call.
+    // A Float-ABI callee is direct-callable by neither (the Float tier emits no
+    // calls), so it is registered nowhere and its callers take the interpreter-
+    // reentrant helper.
     let mut registry = alloc::collections::BTreeMap::new();
+    let mut generic_registry: alloc::collections::BTreeMap<u32, (u64, usize)> =
+        alloc::collections::BTreeMap::new();
     for op in &funcs[id].ops {
         if let Op::Call { func, .. } = op {
             let fid = *func as usize;
@@ -744,7 +754,15 @@ fn ensure_jit(
                 && fid < funcs.len()
                 && let Some(j) = ensure_jit(cache, funcs, fid, stack)
             {
-                registry.insert(*func, j.code_ptr() as u64);
+                match j.abi_kind() {
+                    crate::jit::AbiKind::Int => {
+                        registry.insert(*func, j.code_ptr() as u64);
+                    }
+                    crate::jit::AbiKind::Generic => {
+                        generic_registry.insert(*func, (j.code_ptr() as u64, funcs[fid].n_params));
+                    }
+                    crate::jit::AbiKind::Float => {}
+                }
             }
         }
     }
@@ -753,9 +771,16 @@ fn ensure_jit(
     // function they reject but that is generic-eligible (param/const loads, `+`,
     // `Move`, plain property get/set, `Return`) — e.g. a 7+-parameter add or an
     // `obj.key` accessor. The generic tier re-enters the interpreter for
-    // non-numeric operands and all property access via the runtime helpers.
+    // non-numeric operands and all property access via the runtime helpers, and
+    // direct-calls a fellow generic-tier callee (`generic_registry`).
     let compiled = crate::jit::JitProto::compile_with_registry(&funcs[id], &registry)
-        .or_else(|| crate::jit::JitProto::compile_generic(&funcs[id], &jit_generic_helpers()))
+        .or_else(|| {
+            crate::jit::JitProto::compile_generic_with_registry(
+                &funcs[id],
+                &jit_generic_helpers(),
+                &generic_registry,
+            )
+        })
         .map(alloc::rc::Rc::new);
     cache.insert(id, compiled.clone());
     compiled
@@ -1560,6 +1585,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         get_elem: jit_helper_get_elem,
         set_elem: jit_helper_set_elem,
         array_len: jit_helper_array_len,
+        array_len_dense: jit_array_len_dense,
         arith: jit_helper_arith,
         value_bin: jit_helper_value_bin,
         lt: jit_helper_lt,
@@ -1582,6 +1608,29 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
 /// # Safety
 /// `ctx` must be the live `Ctx` the dispatcher passed. The reentrancy is
 /// single-threaded — the native caller holds no live `&mut Ctx` while this runs.
+/// The generic-JIT probe for the inline dense-array `.length` fast path: returns
+/// `1` iff the receiver's spec `.length` equals its dense element-`Vec` length —
+/// i.e. it is a plain [`Cell::Array`] that is **not** a VM function (which reports
+/// its parameter count, and always carries a `\0vmfn` aux property) and has **no**
+/// sparse logical-length override (`arr.length = huge`). Only then may the emitted
+/// code read `off_arr_len` directly; every other receiver (string, VM function,
+/// sparse array, non-array) routes to [`jit_helper_array_len`]. A leaf,
+/// non-allocating read that cannot trigger a collection, so the fast path stays
+/// GC-safe (mirrors [`jit_array_unrestricted`]).
+///
+/// # Safety
+/// As [`jit_array_unrestricted`].
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_array_len_dense(ctx: *mut core::ffi::c_void, recv: u64) -> u64 {
+    // SAFETY: single-threaded reentrancy — a shared borrow suffices (read-only).
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    match NanBox::from_bits(recv).as_handle() {
+        Some(raw) if ctx.realm.jit_array_len_is_dense(Handle::from_raw(raw)) => 1,
+        _ => 0,
+    }
+}
+
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) extern "C" fn jit_array_unrestricted(ctx: *mut core::ffi::c_void, recv: u64) -> u64 {
     // SAFETY: single-threaded reentrancy — a shared borrow suffices (read-only).
@@ -1774,6 +1823,16 @@ pub(crate) extern "C" fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64, b: 
     }
 }
 
+/// Test-only counter of [`jit_helper_call`] entries — lets a differential test
+/// distinguish a direct generic→generic native call (this stays at 0) from the
+/// interpreter-reentrant helper path (this increments). Thread-local so the count
+/// is isolated per test (cargo runs each test on its own thread, and the JIT call
+/// is synchronous on that thread) — a shared global would race under parallelism.
+#[cfg(all(test, feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+std::thread_local! {
+    pub(crate) static JIT_HELPER_CALL_COUNT: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
 /// The generic-JIT runtime helper for a static function call (`Op::Call`): the
 /// slow path the native code calls to invoke callee `id` with `this` and the
 /// marshaled argument buffer. Reconstructs `&mut Ctx`, runs the shared [`vm_call`],
@@ -1795,6 +1854,11 @@ pub(crate) extern "C" fn jit_helper_call(
     argv: *const u64,
     argc: usize,
 ) -> u64 {
+    // Test-only instrumentation: the differential tests count entries here to prove
+    // a generic→generic call took the *direct* native path (this helper NOT entered)
+    // versus the interpreter-reentrant slow path (this helper entered).
+    #[cfg(test)]
+    JIT_HELPER_CALL_COUNT.with(|c| c.set(c.get() + 1));
     // SAFETY: single-threaded reentrancy — as `jit_helper_add`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
@@ -13463,5 +13527,392 @@ mod generic_jit_tests {
             assert_eq!(interp.as_number(), Some(expect));
             assert_eq!(interp.to_bits(), jitted.to_bits());
         }
+    }
+
+    // --- Pass 6: inline `ArrayLen` fast path ---
+
+    /// A `lenOf(a){ return a.length; }` proto (a single `Op::ArrayLen`).
+    fn build_len_of() -> (Vec<FnProto>, usize) {
+        let mut funcs = p3_funcs();
+        let len = push_proto(
+            &mut funcs,
+            "lenOf",
+            alloc::vec![Op::ArrayLen { dst: 1, arr: 0 }, Op::Return { src: 1 }],
+            2,
+            1,
+        );
+        (funcs, len)
+    }
+
+    /// `arr.length` over dense arrays of several lengths flows through the inline
+    /// fast path (read `off_arr_len` raw, box as a number) and is bit-identical to
+    /// the interpreter for every size (including the empty array).
+    #[test]
+    fn generic_array_length_inline_matches() {
+        let (funcs, len) = build_len_of();
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[len], &jit_generic_helpers()).unwrap();
+        assert!(jit.is_generic());
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        for n in [0usize, 1, 2, 3, 5, 8, 16] {
+            let elems: Vec<f64> = (0..n).map(|i| i as f64).collect();
+            let a = mk_array(&mut ctx, &elems);
+            let interp = call(&mut ctx, &funcs, len, &[a]).unwrap();
+            let jitted = call_generic(&mut ctx, &funcs, &jit, &[a]).unwrap().unwrap();
+            assert_eq!(interp.as_number(), Some(n as f64), "interp len {n}");
+            assert_eq!(interp.to_bits(), jitted.to_bits(), "inline len {n}");
+        }
+    }
+
+    /// The inline `.length` read reloads the arena base on every entry: growing the
+    /// heap far past its capacity (reallocating the slot `Vec`) between calls must
+    /// not corrupt the raw read.
+    #[test]
+    fn generic_array_length_inline_heap_churn() {
+        let (funcs, len) = build_len_of();
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[len], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let a = mk_array(&mut ctx, &[1.0, 2.0, 3.0, 4.0, 5.0]);
+        // Churn the object heap to force a slot-array reallocation.
+        for _ in 0..200_000 {
+            let _ = ctx.realm.new_object();
+        }
+        let interp = call(&mut ctx, &funcs, len, &[a]).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[a]).unwrap().unwrap();
+        assert_eq!(interp.as_number(), Some(5.0));
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+    }
+
+    /// A **sparse** array (`length` set beyond the dense cap) and an array carrying a
+    /// **named** property both fail the inline eligibility probe and route to
+    /// `jit_helper_array_len` — still bit-identical to the interpreter (the sparse
+    /// logical length, resp. the dense length).
+    #[test]
+    fn generic_array_length_sparse_and_named_via_helper() {
+        let (funcs, len) = build_len_of();
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[len], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+
+        // Sparse: dense 2 elements, logical length 4e9 (> max_array_len).
+        let sparse = mk_array(&mut ctx, &[1.0, 2.0]);
+        let sh = sparse.as_handle().map(Handle::from_raw).unwrap();
+        assert!(ctx.realm.set_array_length(sh, 4_000_000_000));
+        let interp = call(&mut ctx, &funcs, len, &[sparse]).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[sparse])
+            .unwrap()
+            .unwrap();
+        assert_eq!(interp.as_number(), Some(4_000_000_000.0));
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+
+        // Named property (aux object present): `.length` is still the dense count,
+        // but the probe conservatively routes to the helper.
+        let named = mk_array(&mut ctx, &[7.0, 8.0, 9.0]);
+        let nh = named.as_handle().map(Handle::from_raw).unwrap();
+        ctx.realm.set_property(nh, "foo", NanBox::number(1.0));
+        let interp = call(&mut ctx, &funcs, len, &[named]).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[named])
+            .unwrap()
+            .unwrap();
+        assert_eq!(interp.as_number(), Some(3.0));
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+    }
+
+    /// A **VM function**'s `.length` (its parameter count, NOT the backing closure
+    /// array's element count) must take the helper. The two differ (2 params vs a
+    /// 1-element backing array), so a wrongly-taken inline read would be caught.
+    #[test]
+    fn generic_array_length_vm_function_via_helper() {
+        let (funcs, len) = {
+            let src = "function makeFn(){ return function(a, b){ return a; }; }";
+            let program = crate::parser::Parser::parse_program(src).expect("parse");
+            let mut funcs = compile_program(&program).expect("compile");
+            let len = push_proto(
+                &mut funcs,
+                "lenOf",
+                alloc::vec![Op::ArrayLen { dst: 1, arr: 0 }, Op::Return { src: 1 }],
+                2,
+                1,
+            );
+            (funcs, len)
+        };
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[len], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let f = mint(&mut ctx, &funcs, "makeFn");
+        assert!(
+            ctx.realm
+                .is_vm_function(f.as_handle().map(Handle::from_raw).unwrap())
+        );
+        let interp = call(&mut ctx, &funcs, len, &[f]).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[f]).unwrap().unwrap();
+        assert_eq!(interp.as_number(), Some(2.0), "reports the parameter count");
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+    }
+
+    /// A non-array object with an explicit `length` data property takes the helper
+    /// (`vm_array_len`'s `get_property` fallback) and matches the interpreter.
+    #[test]
+    fn generic_array_length_non_array_via_helper() {
+        let (funcs, len) = {
+            let src = "function mkLen(){ return { length: 42 }; }";
+            let program = crate::parser::Parser::parse_program(src).expect("parse");
+            let mut funcs = compile_program(&program).expect("compile");
+            let len = push_proto(
+                &mut funcs,
+                "lenOf",
+                alloc::vec![Op::ArrayLen { dst: 1, arr: 0 }, Op::Return { src: 1 }],
+                2,
+                1,
+            );
+            (funcs, len)
+        };
+        let jit =
+            crate::jit::JitProto::compile_generic(&funcs[len], &jit_generic_helpers()).unwrap();
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let o = mint(&mut ctx, &funcs, "mkLen");
+        let interp = call(&mut ctx, &funcs, len, &[o]).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[o]).unwrap().unwrap();
+        assert_eq!(interp.as_number(), Some(42.0));
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+    }
+
+    // --- Pass 6: direct generic → generic JIT calls (ABI-tagged registry) ---
+
+    /// A generic function `f(o){ return g(o) + 1; }` calling a fellow **generic**
+    /// function `g(o){ return o.v * 2; }` (both forced onto the generic tier by a
+    /// property access) takes the **direct** JIT→JIT native call: `jit_helper_call`
+    /// is never entered (its counter stays 0), and the result equals the
+    /// interpreter. Wired through the real `ensure_jit` (ABI-tagged registries).
+    #[test]
+    fn generic_direct_call_taken_and_matches() {
+        let (funcs, f) = compile_named(
+            "function mk(){ return { v: 5 }; }
+             function g(o){ return o.v * 2; }
+             function f(o){ return g(o) + 1; }",
+            "f",
+        );
+        let g = id_of(&funcs, "g");
+        let mut cache = alloc::collections::BTreeMap::new();
+        let mut stack = alloc::collections::BTreeSet::new();
+        let jit_f = ensure_jit(&mut cache, &funcs, f, &mut stack).expect("f JITs");
+        assert!(jit_f.is_generic(), "f must be the generic tier");
+        assert_eq!(
+            cache.get(&g).and_then(|c| c.as_ref()).map(|j| j.abi_kind()),
+            Some(crate::jit::AbiKind::Generic),
+            "g must be generic-ABI (so f direct-calls it)"
+        );
+
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let obj = mint(&mut ctx, &funcs, "mk");
+        let interp = call(&mut ctx, &funcs, f, &[obj]).unwrap();
+        // The forced JIT body must reach g WITHOUT the interpreter-reentrant helper.
+        JIT_HELPER_CALL_COUNT.with(|c| c.set(0));
+        let jitted = call_generic(&mut ctx, &funcs, &jit_f, &[obj])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            JIT_HELPER_CALL_COUNT.with(|c| c.get()),
+            0,
+            "generic→generic call took the direct native path"
+        );
+        assert_eq!(interp.as_number(), Some(11.0)); // 5*2 + 1
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+    }
+
+    /// A **throwing** generic callee reached via the direct path: `g(o){ return o.v; }`
+    /// where `o.v` is a getter that throws (after one side effect). The direct call
+    /// propagates the identical thrown value through the throw sentinel, the getter
+    /// runs **exactly once** (separate objects for the two tiers), and
+    /// `jit_helper_call` is still never entered.
+    #[test]
+    fn generic_direct_call_throwing_callee_once() {
+        let (funcs, f) = compile_named(
+            "function mkThrow(){ return { n: 0, get v(){ this.n = this.n + 1; throw { m: 'boom' }; } }; }
+             function g(o){ return o.v; }
+             function f(o){ return g(o) + 1; }",
+            "f",
+        );
+        let g = id_of(&funcs, "g");
+        let mut cache = alloc::collections::BTreeMap::new();
+        let mut stack = alloc::collections::BTreeSet::new();
+        let jit_f = ensure_jit(&mut cache, &funcs, f, &mut stack).expect("f JITs");
+        assert!(jit_f.is_generic());
+        assert_eq!(
+            cache.get(&g).and_then(|c| c.as_ref()).map(|j| j.abi_kind()),
+            Some(crate::jit::AbiKind::Generic)
+        );
+
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let oi = mint(&mut ctx, &funcs, "mkThrow");
+        let oj = mint(&mut ctx, &funcs, "mkThrow");
+        let interp = call(&mut ctx, &funcs, f, &[oi]);
+        JIT_HELPER_CALL_COUNT.with(|c| c.set(0));
+        let jitted = call_generic(&mut ctx, &funcs, &jit_f, &[oj]).unwrap();
+        assert_eq!(
+            JIT_HELPER_CALL_COUNT.with(|c| c.get()),
+            0,
+            "the (throwing) call still took the direct path"
+        );
+        let (vi, vj) = match (interp, jitted) {
+            (Err(VmError::Thrown(vi)), Err(VmError::Thrown(vj))) => (vi, vj),
+            other => panic!("expected both to throw, got {other:?}"),
+        };
+        let mi = ctx
+            .realm
+            .get_property(vi.as_handle().map(Handle::from_raw).unwrap(), "m")
+            .map(|m| ctx.realm.to_display_string(m));
+        let mj = ctx
+            .realm
+            .get_property(vj.as_handle().map(Handle::from_raw).unwrap(), "m")
+            .map(|m| ctx.realm.to_display_string(m));
+        assert_eq!(mi.as_deref(), Some("boom"));
+        assert_eq!(mi, mj);
+        // The counting getter ran exactly once on each object.
+        let ni = ctx
+            .realm
+            .get_property(oi.as_handle().map(Handle::from_raw).unwrap(), "n");
+        let nj = ctx
+            .realm
+            .get_property(oj.as_handle().map(Handle::from_raw).unwrap(), "n");
+        assert_eq!(ni.and_then(|v| v.as_number()), Some(1.0));
+        assert_eq!(nj.and_then(|v| v.as_number()), Some(1.0));
+    }
+
+    /// A **deep** generic call chain `a → b → c` (each forced generic by a property
+    /// access): every edge is a direct native call, so `jit_helper_call` is never
+    /// entered, and the composed result matches the interpreter.
+    #[test]
+    fn generic_deep_direct_calls_match() {
+        let (funcs, a) = compile_named(
+            "function mk(){ return { v: 3 }; }
+             function c(o){ return o.v * 2; }
+             function b(o){ return c(o) + 10; }
+             function a(o){ return b(o) + 100; }",
+            "a",
+        );
+        let mut cache = alloc::collections::BTreeMap::new();
+        let mut stack = alloc::collections::BTreeSet::new();
+        let jit_a = ensure_jit(&mut cache, &funcs, a, &mut stack).expect("a JITs");
+        assert!(jit_a.is_generic());
+        for name in ["b", "c"] {
+            assert_eq!(
+                cache
+                    .get(&id_of(&funcs, name))
+                    .and_then(|c| c.as_ref())
+                    .map(|j| j.abi_kind()),
+                Some(crate::jit::AbiKind::Generic),
+                "{name} must be generic-ABI"
+            );
+        }
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let obj = mint(&mut ctx, &funcs, "mk");
+        let interp = call(&mut ctx, &funcs, a, &[obj]).unwrap();
+        JIT_HELPER_CALL_COUNT.with(|c| c.set(0));
+        let jitted = call_generic(&mut ctx, &funcs, &jit_a, &[obj])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            JIT_HELPER_CALL_COUNT.with(|c| c.get()),
+            0,
+            "all edges direct"
+        );
+        assert_eq!(interp.as_number(), Some(116.0)); // 3*2 + 10 + 100
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+    }
+
+    /// **Mutual recursion** `even ⇄ odd` (both forced generic by a transparent `/1`):
+    /// one edge is a direct call, the recursive back-edge is left unregistered by the
+    /// `stack` guard and takes the interpreter-reentrant helper. The mixed path is
+    /// still correct — bit-identical to the interpreter — and the helper IS entered.
+    #[test]
+    fn generic_mutual_recursion_matches() {
+        let (funcs, even) = compile_named(
+            "function even(n){ if (n < 1) return 1; return odd(n - 1) / 1; }
+             function odd(n){ if (n < 1) return 0; return even(n - 1) / 1; }",
+            "even",
+        );
+        let odd = id_of(&funcs, "odd");
+        let mut cache = alloc::collections::BTreeMap::new();
+        let mut stack = alloc::collections::BTreeSet::new();
+        let jit_even = ensure_jit(&mut cache, &funcs, even, &mut stack).expect("even JITs");
+        assert!(jit_even.is_generic(), "even must be the generic tier");
+        assert_eq!(
+            cache
+                .get(&odd)
+                .and_then(|c| c.as_ref())
+                .map(|j| j.abi_kind()),
+            Some(crate::jit::AbiKind::Generic),
+            "odd must be generic-ABI (even direct-calls it)"
+        );
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        for n in [0.0, 1.0, 2.0, 5.0, 8.0] {
+            let interp = call(&mut ctx, &funcs, even, &[NanBox::number(n)]).unwrap();
+            JIT_HELPER_CALL_COUNT.with(|c| c.set(0));
+            let jitted = call_generic(&mut ctx, &funcs, &jit_even, &[NanBox::number(n)])
+                .unwrap()
+                .unwrap();
+            // even(n) is 1 when n is even, 0 when odd.
+            let want = if (n as u64) % 2 == 0 { 1.0 } else { 0.0 };
+            assert_eq!(interp.as_number(), Some(want), "even({n})");
+            assert_eq!(interp.to_bits(), jitted.to_bits());
+            // n>=2 is the first depth with a recursive back-edge (`odd→even`), which
+            // the `stack` guard leaves unregistered → it takes the helper. (n=1 hits
+            // odd's base case immediately, so it is a single direct `even→odd`.)
+            if n >= 2.0 {
+                assert!(
+                    JIT_HELPER_CALL_COUNT.with(|c| c.get()) > 0,
+                    "the recursive back-edge went through the helper"
+                );
+            }
+        }
+    }
+
+    /// A generic caller `f(o){ return g(o.v); }` whose callee `g(x){ return x + 1; }`
+    /// compiled to the **Int** tier: the ABI-tagged registry keeps `g` out of the
+    /// generic direct-call registry, so the call correctly takes the helper (a direct
+    /// call at the Int ABI would mis-dispatch). Result matches the interpreter.
+    #[test]
+    fn generic_call_int_tier_callee_via_helper() {
+        let (funcs, f) = compile_named(
+            "function mk(){ return { v: 5 }; }
+             function g(x){ return x + 1; }
+             function f(o){ return g(o.v); }",
+            "f",
+        );
+        let g = id_of(&funcs, "g");
+        let mut cache = alloc::collections::BTreeMap::new();
+        let mut stack = alloc::collections::BTreeSet::new();
+        let jit_f = ensure_jit(&mut cache, &funcs, f, &mut stack).expect("f JITs");
+        assert!(jit_f.is_generic(), "f must be the generic tier");
+        assert_eq!(
+            cache.get(&g).and_then(|c| c.as_ref()).map(|j| j.abi_kind()),
+            Some(crate::jit::AbiKind::Int),
+            "g must be Int-ABI (so f must NOT direct-call it)"
+        );
+        let mut realm = Realm::new();
+        let mut ctx = mk_ctx(&mut realm);
+        let obj = mint(&mut ctx, &funcs, "mk");
+        let interp = call(&mut ctx, &funcs, f, &[obj]).unwrap();
+        JIT_HELPER_CALL_COUNT.with(|c| c.set(0));
+        let jitted = call_generic(&mut ctx, &funcs, &jit_f, &[obj])
+            .unwrap()
+            .unwrap();
+        assert!(
+            JIT_HELPER_CALL_COUNT.with(|c| c.get()) > 0,
+            "the Int-ABI callee was reached via the helper, not a direct call"
+        );
+        assert_eq!(interp.as_number(), Some(6.0)); // 5 + 1
+        assert_eq!(interp.to_bits(), jitted.to_bits());
     }
 }

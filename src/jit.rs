@@ -1816,12 +1816,15 @@ pub enum GenericOp {
     /// `reg[dst] = func(reg[args…])` — a plain static call to the function-table
     /// entry `func`, with `this = undefined` (the interpreter's `Op::Call`). The
     /// argument register list lives in the compiled proto's per-call-site table at
-    /// index `site`. Always routed through `jit_helper_call`, which runs the
-    /// interpreter's real call path (`call_with`: arity binding, tier-up, throw);
-    /// a direct JIT→JIT native call is intentionally *not* emitted (the callee's
-    /// registry entry, if any, is Int/Float-ABI code — a different signature — so a
-    /// direct call would mis-dispatch; helper-only is the sanctioned choice, see
-    /// `JIT_DESIGN.md` Pass 4).
+    /// index `site`. When the callee is a registered **generic-ABI** body whose
+    /// parameter count this site satisfies (see
+    /// [`compile_generic_with_registry`](JitProto::compile_generic_with_registry)),
+    /// this emits a **direct native call** to its generic entry (skipping the
+    /// interpreter round-trip); otherwise it routes through `jit_helper_call`, which
+    /// runs the interpreter's real call path (`call_with`: arity binding, tier-up,
+    /// throw). A callee at the Int/Float ABI, absent, recursive, or under-supplied
+    /// is never direct-called (a wrong-ABI direct call would mis-dispatch) — the
+    /// helper is the sanctioned fallback (`JIT_DESIGN.md` Pass 4 / Pass 6).
     Call {
         /// Destination register.
         dst: u8,
@@ -2162,6 +2165,15 @@ pub struct GenericHelpers {
     pub set_elem: JitBinHelper,
     /// The `.length` helper (`jit_helper_array_len`) — `Op::ArrayLen`.
     pub array_len: JitTruthyHelper,
+    /// The `.length` inline-eligibility probe (`jit_array_len_dense`) — returns `1`
+    /// iff the receiver is a plain [`Cell::Array`](crate::cell::Cell::Array) whose
+    /// spec `.length` equals its dense element-`Vec` length: not a VM function
+    /// (which reports its parameter count, and always carries a `\0vmfn` aux
+    /// property) and with no sparse logical-length override. Only then does the
+    /// inline `ArrayLen` fast path read `off_arr_len` directly; otherwise (string,
+    /// VM function, sparse, non-array) it routes to `jit_helper_array_len`. A leaf,
+    /// non-allocating read, so it is GC-safe (mirrors `jit_array_unrestricted`).
+    pub array_len_dense: JitTruthyHelper,
     /// The `-`/`*`/`/`/`%` helper (`jit_helper_arith`), dispatched by a `GA_*`
     /// discriminant passed as the fourth argument.
     pub arith: JitBinHelper,
@@ -2359,6 +2371,24 @@ pub struct SiteInfo {
     cache_ptr: *mut core::ffi::c_void,
 }
 
+/// The calling-convention / signature a compiled [`JitProto`] exposes to a
+/// *caller's* native code — the public mirror of the private [`JitKind`], recorded
+/// per callee so a JIT→JIT direct call is only ever emitted at the matching ABI (a
+/// wrong-ABI direct call would mis-dispatch). Used to build the per-tier call
+/// registries in `nbvm::ensure_jit`.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AbiKind {
+    /// Integer ABI: `extern "C" fn(i64, …) -> i64` (an Int-tier body).
+    Int,
+    /// Float ABI: `extern "C" fn(f64, …) -> f64` (a Float-tier body). No intra-JIT
+    /// direct-call path targets it (the Float tier never emits calls).
+    Float,
+    /// Generic (NanBox) ABI: `extern "C" fn(ctx, *const u64, usize) -> u64` (a
+    /// generic-tier body). A generic caller may direct-call another generic body.
+    Generic,
+}
+
 /// Which native fast path a [`JitProto`] holds.
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2497,13 +2527,34 @@ impl JitProto {
 
     /// Compiles `proto` on the **generic (NanBox) tier** if [`lower_nbvm_generic`]
     /// accepts it, wiring `helpers` as the runtime slow paths (`+`, property
-    /// get/set). Returns `None` if the function isn't generic-eligible.
+    /// get/set). Returns `None` if the function isn't generic-eligible. Equivalent
+    /// to [`compile_generic_with_registry`](Self::compile_generic_with_registry)
+    /// with an empty registry (every static call routes through `jit_helper_call`).
     ///
     /// Per-property-access-site key strings and inline caches are allocated here
     /// (in [`GenericSites`], owned by the returned `JitProto`) so their addresses
     /// are stable; the emitted code holds raw pointers into them.
     #[must_use]
     pub fn compile_generic(proto: &crate::nbvm::FnProto, helpers: &GenericHelpers) -> Option<Self> {
+        Self::compile_generic_with_registry(proto, helpers, &alloc::collections::BTreeMap::new())
+    }
+
+    /// Like [`compile_generic`](Self::compile_generic) but with a `generic_registry`
+    /// of already-compiled **generic-ABI** callees (function-table index →
+    /// `(code_addr, callee_n_params)`). A static call whose callee is present *and*
+    /// whose call site supplies at least `callee_n_params` arguments lowers to a
+    /// **direct native call** to that generic entry (marshaling args through the
+    /// in-frame scratch buffer, checking the throw sentinel), skipping the
+    /// interpreter round-trip of `jit_helper_call`. Any other callee (absent,
+    /// Int/Float-ABI, recursive/unregistered, or an under-supplied arity) keeps the
+    /// helper slow path — the registry must contain **only** generic-ABI entries so
+    /// a direct call is never emitted at a mismatched signature.
+    #[must_use]
+    pub fn compile_generic_with_registry(
+        proto: &crate::nbvm::FnProto,
+        helpers: &GenericHelpers,
+        generic_registry: &alloc::collections::BTreeMap<u32, (u64, usize)>,
+    ) -> Option<Self> {
         let (ops, keys, call_args) = lower_nbvm_generic(proto)?;
         // One persistent inline cache per property-access site.
         let caches: alloc::boxed::Box<[core::cell::UnsafeCell<crate::ic::PropertyCache>]> = (0
@@ -2528,6 +2579,7 @@ impl JitProto {
             helpers,
             &site_info,
             &call_args,
+            generic_registry,
         )?;
         Some(Self {
             func,
@@ -2581,6 +2633,18 @@ impl JitProto {
     #[must_use]
     pub fn is_generic(&self) -> bool {
         self.kind == JitKind::Generic
+    }
+
+    /// The [`AbiKind`] this body exposes to a caller's native code — the tier it
+    /// compiled to. A caller consults this to decide whether a JIT→JIT direct call
+    /// is ABI-compatible (see `nbvm::ensure_jit`).
+    #[must_use]
+    pub fn abi_kind(&self) -> AbiKind {
+        match self.kind {
+            JitKind::Int => AbiKind::Int,
+            JitKind::Float => AbiKind::Float,
+            JitKind::Generic => AbiKind::Generic,
+        }
     }
 
     /// Invokes a generic-tier body with the live context `ctx` (an opaque pointer
@@ -4130,6 +4194,7 @@ impl JitFunction {
         helpers: &GenericHelpers,
         sites: &[SiteInfo],
         call_args: &[Vec<u8>],
+        generic_registry: &alloc::collections::BTreeMap<u32, (u64, usize)>,
     ) -> Option<Self> {
         use crate::nanbox::NanBox;
         if n_regs > 64 || n_params > 32 {
@@ -4141,6 +4206,7 @@ impl JitFunction {
         let get_elem_helper = helpers.get_elem as usize as u64;
         let set_elem_helper = helpers.set_elem as usize as u64;
         let array_len_helper = helpers.array_len as usize as u64;
+        let array_len_dense_helper = helpers.array_len_dense as usize as u64;
         let arith_helper = helpers.arith as usize as u64;
         let value_bin_helper = helpers.value_bin as usize as u64;
         let lt_helper = helpers.lt as usize as u64;
@@ -4648,13 +4714,68 @@ impl JitFunction {
                     if !ok(dst) || !ok(arr) {
                         return None;
                     }
-                    // jit_helper_array_len(ctx, recv).
+                    let helper = a.new_label();
+                    let done = a.new_label();
+                    // ===== inline dense-array `.length` fast path =====
+                    // Read the array element `Vec`'s length directly, but ONLY for a
+                    // receiver whose spec `.length` provably equals that dense count:
+                    // `jit_array_len_dense(ctx, recv)` returns 1 iff it is a plain
+                    // `Cell::Array` that is not a VM function (a VM function reports
+                    // its *parameter* count, not the backing array length) and has no
+                    // sparse logical-length override (`arr.length = huge`). A string
+                    // (UTF-16 code-unit count), a VM function, a sparse array, and any
+                    // non-array receiver all route to `jit_helper_array_len`, which
+                    // runs the full `vm_array_len`. The probe is a leaf, non-allocating
+                    // read and there is no call after `jit_arena`, so the raw walk
+                    // stays GC- and realloc-safe.
+                    a.mov_rdi_r15();
+                    a.load_argreg(1, disp(arr)); // rsi = recv
+                    a.movabs_rax(array_len_dense_helper as i64);
+                    a.call_rax();
+                    a.test_rax_rax();
+                    a.je(helper); // not a plain dense array → helper
+                    // arena = jit_arena(ctx): rax = base, rdx = len. No call after this.
+                    a.mov_rdi_r15();
+                    a.movabs_rax(arena_helper as i64);
+                    a.call_rax();
+                    a.mov_r10_rax(); // r10 = arena base
+                    a.load_rax(disp(arr)); // rax = recv bits
+                    a.movabs_r11(HANDLE_TAG as i64);
+                    a.mov_rcx_rax();
+                    a.and_rcx_r11();
+                    a.cmp_rcx_r11();
+                    a.jne(helper); // not a heap handle → helper
+                    a.mov_r8_rax();
+                    a.shr_r8_imm(32); // r8 = generation
+                    a.movabs_r11(0xffff_ffff_i64);
+                    a.and_rax_r11(); // rax = handle index
+                    a.cmp_rax_rdx();
+                    a.jae(helper); // index >= arena len → helper
+                    a.imul_rax_imm(layout.slot_stride);
+                    a.add_rax_r10();
+                    a.mov_rcx_rax(); // rcx = &Slot
+                    a.cmp_byte_at_rcx_imm(0, layout.slot_occupied_disc);
+                    a.jne(helper);
+                    a.cmp_word_at_rcx_r8w(layout.off_slot_gen);
+                    a.jne(helper);
+                    a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
+                    a.jne(helper); // not a dense array → helper
+                    // len = elems.len() (usize at off_arr_len); the probe guaranteed
+                    // this equals the spec `.length`. Box it as a `NanBox` number
+                    // (its f64 bits stored directly, as the numeric fast paths do).
+                    a.mov_rax_at_rcx(layout.off_arr_len); // rax = dense len (usize)
+                    a.cvtsi2sd_xmm0_rax(); // xmm0 = (f64) len (exact: len <= max_array_len)
+                    a.movsd_mem_xmm0(disp(dst));
+                    a.jmp(done);
+                    // ===== helper slow path: jit_helper_array_len(ctx, recv) =====
+                    a.bind(helper);
                     a.mov_rdi_r15(); // rdi = ctx
                     a.load_argreg(1, disp(arr)); // rsi = recv
                     a.movabs_rax(array_len_helper as i64);
                     a.call_rax();
                     throw_check!();
                     a.store_rax(disp(dst));
+                    a.bind(done);
                 }
                 GenericOp::Arith {
                     dst,
@@ -4866,14 +4987,38 @@ impl JitFunction {
                         a.load_rax(disp(ar));
                         a.store_rax(argbuf_disp(i));
                     }
-                    // jit_helper_call(ctx, func_id, this=undefined, argv_ptr, argc).
-                    a.mov_rdi_r15(); // rdi = ctx
-                    a.movabs_argreg(1, i64::from(func)); // rsi = callee id
-                    a.movabs_argreg(2, NanBox::undefined().to_bits() as i64); // rdx = this
-                    a.lea_argreg(3, argbuf_disp(0)); // rcx = &argbuf[0]
-                    a.movabs_argreg(4, args.len() as i64); // r8 = argc
-                    a.movabs_rax(call_helper as i64);
-                    a.call_rax();
+                    // Direct JIT→JIT call iff the callee is a registered generic-ABI
+                    // body whose parameter count this site satisfies (argc >=
+                    // callee_n_params — the callee reads only args[0..n_params], so
+                    // extra args are ignored exactly as the interpreter ignores them,
+                    // and an under-supplied call must instead take the helper, which
+                    // pads missing params with `undefined`). The direct entry has the
+                    // generic ABI `fn(ctx, *const u64, usize) -> u64`, so it is invoked
+                    // exactly as `call_generic_raw` does: ctx, the marshaled argbuf,
+                    // argc. On a callee throw it returns the same throw sentinel (the
+                    // fault already stashed in `ctx`), which `throw_check!` propagates —
+                    // observationally identical to the helper, minus the interpreter
+                    // round-trip. Everything else (absent, Int/Float-ABI, recursive /
+                    // unregistered, under-supplied arity) keeps the helper slow path.
+                    match generic_registry.get(&func) {
+                        Some(&(addr, callee_n_params)) if args.len() >= callee_n_params => {
+                            a.mov_rdi_r15(); // rdi = ctx
+                            a.lea_argreg(1, argbuf_disp(0)); // rsi = &argbuf[0]
+                            a.movabs_argreg(2, args.len() as i64); // rdx = argc
+                            a.movabs_rax(addr as i64);
+                            a.call_rax();
+                        }
+                        _ => {
+                            // jit_helper_call(ctx, func_id, this=undefined, argv_ptr, argc).
+                            a.mov_rdi_r15(); // rdi = ctx
+                            a.movabs_argreg(1, i64::from(func)); // rsi = callee id
+                            a.movabs_argreg(2, NanBox::undefined().to_bits() as i64); // rdx = this
+                            a.lea_argreg(3, argbuf_disp(0)); // rcx = &argbuf[0]
+                            a.movabs_argreg(4, args.len() as i64); // r8 = argc
+                            a.movabs_rax(call_helper as i64);
+                            a.call_rax();
+                        }
+                    }
                     throw_check!();
                     a.store_rax(disp(dst));
                 }

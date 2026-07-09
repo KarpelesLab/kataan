@@ -2450,6 +2450,23 @@ impl Realm {
     /// [`array_index_has_override`](Realm::array_index_has_override) consults plus
     /// the length bound, evaluated once per store (a leaf, non-allocating read, so
     /// it never reallocates the arena). Returns `false` for any non-array receiver.
+    /// Whether the spec `.length` of the array at `handle` equals its dense
+    /// element-`Vec` length — so the generic-JIT inline `.length` fast path may read
+    /// that length raw (see `nbvm::jit_array_len_dense`). True iff `handle` is a
+    /// [`Cell::Array`] that is **not** a VM function (a VM function reports its
+    /// parameter count, and always carries a `\0vmfn` aux property — excluded here by
+    /// the `aux_props` guard, which also conservatively excludes any array carrying
+    /// named props) and has **no** sparse logical-length override (`arr.length` set
+    /// beyond the dense cap). A leaf, non-allocating read. `false` for any non-array.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_array_len_is_dense(&self, handle: Handle) -> bool {
+        let raw = handle.to_raw();
+        self.heap.get(handle).and_then(Cell::as_array).is_some()
+            && !self.aux_props.contains_key(&raw)
+            && !self.sparse_array_lengths.contains_key(&raw)
+    }
+
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     #[must_use]
     pub(crate) fn jit_array_unrestricted(&self, handle: Handle) -> bool {
