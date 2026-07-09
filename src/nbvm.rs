@@ -5656,7 +5656,9 @@ fn native_global(callee: &Expr) -> Option<u16> {
 fn static_key(key: &PropertyKey) -> Result<String, CompileError> {
     match key {
         PropertyKey::Ident(s) | PropertyKey::Str(s) => Ok(String::from(&**s)),
-        PropertyKey::Number(n) => Ok(alloc::format!("{n}")),
+        // Canonical ECMAScript `ToString(Number)` so a non-canonical numeric
+        // literal key (`0.0000001` → `"1e-7"`) matches `obj[n]` access.
+        PropertyKey::Number(n) => Ok(crate::realm::js_number_string(*n)),
         _ => Err(CompileError::Unsupported("computed/private key")),
     }
 }

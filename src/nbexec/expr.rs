@@ -1551,14 +1551,77 @@ impl<'a> Interp<'a> {
             let handle = Handle::from_raw(raw);
             if let Some((cid, _)) = self.realm.class_at(handle)
                 && self.classes[cid as usize].id.is_none()
-                && !self.realm.has_own(handle, "name")
+                // The class carries a default `name === ""` placeholder unless its
+                // own body declares a `static name` element (which set the real
+                // value). Only overwrite the placeholder — never an explicit one.
+                && !self.class_declares_static_name(cid)
             {
                 let name_v = self.new_str(name);
+                self.realm.clear_readonly_property(handle, "name");
                 self.realm.set_property(handle, "name", name_v);
                 self.realm.mark_hidden(handle, "name");
                 self.realm.set_readonly_property(handle, "name");
             }
         }
+    }
+
+    /// `SetFunctionName` for a name known only at runtime (a `String`, not a
+    /// source `&'a str`) — used by class field initializers, whose field name is
+    /// a computed/private key resolved during evaluation. Mirrors [`set_fn_name`]
+    /// but materializes only the `name` own property (the anonymous function's
+    /// internal `name` stays `""`; `.name` reads resolve to the own property).
+    ///
+    /// [`set_fn_name`]: Self::set_fn_name
+    pub(crate) fn set_fn_name_owned(&mut self, value: NanBox, name: &str) {
+        if let Some(raw) = value.as_handle()
+            && let Some((func_id, _)) = self.realm.function_at(Handle::from_raw(raw))
+            // Don't clobber a name the function already has (a named function
+            // expression keeps its own name over the field name).
+            && self.functions[func_id as usize].name.is_empty()
+        {
+            let handle = Handle::from_raw(raw);
+            let len = self.functions[func_id as usize]
+                .params
+                .iter()
+                .take_while(|p| p.default.is_none() && !p.rest)
+                .count() as u32;
+            self.install_fn_name_length(handle, name, len);
+            return;
+        }
+        // An anonymous class initializer (`#f = class {}`) takes the field name.
+        if let Some(raw) = value.as_handle() {
+            let handle = Handle::from_raw(raw);
+            if let Some((cid, _)) = self.realm.class_at(handle)
+                && self.classes[cid as usize].id.is_none()
+                // The class carries a default `name === ""` placeholder unless its
+                // own body declares a `static name` element (which set the real
+                // value). Only overwrite the placeholder — never an explicit one.
+                && !self.class_declares_static_name(cid)
+            {
+                let name_v = self.new_str(name);
+                self.realm.clear_readonly_property(handle, "name");
+                self.realm.set_property(handle, "name", name_v);
+                self.realm.mark_hidden(handle, "name");
+                self.realm.set_readonly_property(handle, "name");
+            }
+        }
+    }
+
+    /// Whether class `cid`'s body declares a `static name` member (a method,
+    /// accessor, or field with the literal key `name`) — which supplies the
+    /// constructor's `name` own property and therefore blocks NamedEvaluation
+    /// from overwriting it. A computed `static [x]` key is not statically known,
+    /// so it is conservatively ignored here.
+    fn class_declares_static_name(&self, cid: u32) -> bool {
+        self.classes[cid as usize].body.iter().any(|m| {
+            let (is_static, key) = match m {
+                crate::ast::ClassMember::Method(mm) => (mm.is_static, &mm.key),
+                crate::ast::ClassMember::Field(f) => (f.is_static, &f.key),
+                crate::ast::ClassMember::StaticBlock { .. } => return false,
+            };
+            is_static
+                && matches!(key, PropertyKey::Ident(s) | PropertyKey::Str(s) if &**s == "name")
+        })
     }
 
     /// `[[Get]]` of integer index `i` on an array-like receiver, returning
@@ -3468,9 +3531,16 @@ impl<'a> Interp<'a> {
                 if !matches!(setter.unpack(), Unpacked::Undefined) {
                     let this = NanBox::handle(handle.to_raw());
                     self.call_with_this(setter, this, &[new])?;
+                } else if let PropertyKey::Private(s) = property {
+                    // A getter-only *private* accessor always throws on set (there
+                    // is no silent-failure path for private references).
+                    let m = self.new_str(&alloc::format!(
+                        "Cannot write private member #{s} which has only a getter"
+                    ));
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
-                // A getter-only own accessor: the write is silently ignored
-                // (non-strict) — matching ordinary accessor semantics.
+                // A getter-only own (public) accessor: the write is silently
+                // ignored (non-strict) — matching ordinary accessor semantics.
                 return Ok(());
             }
             // Inherited static setter (walk the superclass chain).
@@ -3490,6 +3560,28 @@ impl<'a> Interp<'a> {
                 let class = self.classes[c as usize];
                 let env = self.class_envs[c as usize].clone();
                 cur = self.resolve_super(class, &env)?.map(|(pid, _)| pid);
+            }
+            // PrivateSet brand check on a class receiver: writing `this.#x` where
+            // this class does not carry `#x` (a distinct per-class brand) is a
+            // TypeError — e.g. `C1.access.call(C2)` writing `C1`'s static `#m` on an
+            // unrelated class `C2`. An own accessor was already dispatched above, so
+            // reaching here without an own key means the element is genuinely absent.
+            if let PropertyKey::Private(s) = property {
+                if !self.realm.has_own(handle, &key) {
+                    let m = self.new_str(&alloc::format!(
+                        "Cannot write private member #{s} to an object whose class did not declare it"
+                    ));
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                // A static private *method* is a non-writable own key: PrivateSet
+                // on it is a TypeError (methods and getter-only accessors can't be
+                // assigned).
+                if self.realm.property_is_readonly(handle, &key) {
+                    let m = self.new_str(&alloc::format!(
+                        "Cannot write to private method or accessor #{s}"
+                    ));
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
             }
             // Plain own data static: update both the mirror (authoritative for
             // reflection/reads) and the side table (kept consistent for any
@@ -3657,7 +3749,10 @@ impl<'a> Interp<'a> {
                 }
             }
             PropertyKey::Number(n) => {
-                self.realm.set_property(handle, &alloc::format!("{n}"), new);
+                // Canonical `ToString(Number)` so a non-canonical literal write
+                // (`obj[0.0000001] = v`) keys identically to the read (`"1e-7"`).
+                self.realm
+                    .set_property(handle, &crate::realm::js_number_string(*n), new);
             }
             PropertyKey::Private(s) => {
                 // Writing `obj.#x` where obj's class did not declare `#x` is a TypeError.
@@ -3665,10 +3760,15 @@ impl<'a> Interp<'a> {
                 // so the initial creation of a field is exempt; a class receiver, for
                 // static privates, is resolved via separate per-class storage.)
                 let key = self.private_access_key(s);
-                if !self.is_callable(handle)
-                    && self.realm.class_at(handle).is_none()
-                    && !self.realm.has_own(handle, &key)
-                    && self.realm.accessor(handle, &key).is_none()
+                // PrivateSet requires the receiver to actually carry the private
+                // element — as a field (own data key) or an accessor. This holds for
+                // *static* privates too: `C1.access.call(C2)` writing `this.#m` throws
+                // a TypeError because `C2` lacks `C1`'s `#m` (its distinct per-class
+                // brand). A found accessor was already invoked by the prototype-chain
+                // walk above, so reaching here means the element is genuinely absent.
+                // (First-time field creation writes via `set_property` directly, not
+                // this path, so a fresh field is exempt.)
+                if !self.realm.has_own(handle, &key) && self.realm.accessor(handle, &key).is_none()
                 {
                     let m = self.new_str(&alloc::format!(
                         "Cannot write private member #{s} to an object whose class did not declare it"

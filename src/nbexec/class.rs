@@ -179,13 +179,24 @@ impl<'a> Interp<'a> {
             let saved = core::mem::replace(&mut self.current, class_env.clone());
             let r = (|| -> Result<(), ExecError> {
                 for (idx, member) in class.body.iter().enumerate() {
-                    let key = match member {
-                        ClassMember::Method(m) => &m.key,
-                        ClassMember::Field(field) => &field.key,
+                    let (key, is_static) = match member {
+                        ClassMember::Method(m) => (&m.key, m.is_static),
+                        ClassMember::Field(field) => (&field.key, field.is_static),
                         ClassMember::StaticBlock { .. } => continue,
                     };
                     if matches!(key, PropertyKey::Computed(_)) {
                         let k = self.eval_prop_key(key)?;
+                        // A *static* class element whose computed key evaluates to
+                        // "prototype" is a TypeError (the constructor's `prototype` is
+                        // a non-configurable own property that a class element may not
+                        // redefine). The literal `static prototype` form is rejected
+                        // earlier, at parse time.
+                        if is_static && k == "prototype" {
+                            let m = self.new_str(
+                                "Classes may not have a static property named 'prototype'",
+                            );
+                            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                        }
                         self.class_member_keys[class_id as usize].insert(idx, k);
                     }
                 }
@@ -287,7 +298,13 @@ impl<'a> Interp<'a> {
             // is evaluated in strict mode — a function expression there is strict
             // (its `.caller`/`.arguments` are the poisoned accessors).
             let saved_heritage_strict = core::mem::replace(&mut self.strict, true);
+            // The heritage is evaluated in the class scope (`class_env`), so the
+            // inner class-name binding is in scope: a closure created here
+            // (`class C extends (f = () => C, …)`) captures `class_env` and, when
+            // called after the class is defined, resolves `C` to the class.
+            let saved_heritage_env = core::mem::replace(&mut self.current, class_env.clone());
             let sval = self.eval(expr);
+            self.current = saved_heritage_env;
             self.strict = saved_heritage_strict;
             let sval = sval?;
             // `extends null` makes a base-ish class with a null prototype; any other
@@ -366,13 +383,12 @@ impl<'a> Interp<'a> {
             .as_ref()
             .map(|id| String::from(&*id.name))
             .or_else(|| pending_name.map(String::from));
+        // Every class constructor has an own `name` (a bare anonymous `class {}`
+        // keeps `name === ""`, own/non-writable/non-enumerable/configurable). A
+        // later NamedEvaluation (`x = class {}`) overwrites this default placeholder
+        // via `set_fn_name`, which recognizes it because the body declares no
+        // `static name` member (see `set_fn_name`).
         self.install_fn_name_length(handle, class_name.as_deref().unwrap_or(""), ctor_len);
-        if class_name.is_none() {
-            // Still anonymous (no id, no binding name): `name` becomes own only via
-            // a later NamedEvaluation; drop the placeholder so `set_fn_name` can set
-            // it, but keep `length` (always own).
-            self.realm.delete_property(handle, "name");
-        }
         // Mirror static members as real own properties of the constructor so
         // reflection (`hasOwnProperty`, `getOwnPropertyDescriptor`, `Object.keys`,
         // `verifyProperty`) sees them. The side tables above still drive the fast
@@ -402,6 +418,12 @@ impl<'a> Interp<'a> {
             if !field_keys.contains(&k) {
                 // A static method is non-enumerable; a static field is enumerable.
                 self.realm.mark_hidden(handle, &k);
+                // A static *private method* (`\0#…` key that is not a field) is
+                // non-writable, so `this.#m = v` is a TypeError (PrivateSet on a
+                // method). Public static methods stay writable.
+                if k.starts_with("\u{0}#") {
+                    self.realm.set_readonly_property(handle, &k);
+                }
             }
         }
         let getters: Vec<(String, NanBox)> = self.class_static_get[class_id as usize]
@@ -489,6 +511,18 @@ impl<'a> Interp<'a> {
                                 Some(e) => self.eval(e)?,
                                 None => continue,
                             };
+                            // DefineField step 7: an anonymous function/arrow/class
+                            // static-field initializer takes the field name.
+                            if let Some(init) = &field.value
+                                && matches!(
+                                    init,
+                                    Expr::Function(_) | Expr::Arrow(_) | Expr::Class(_)
+                                )
+                                && let Some(disp) =
+                                    self.method_display_name(&key, MethodKind::Method)
+                            {
+                                self.set_fn_name_owned(v, &disp);
+                            }
                             if let Some(h) = class_val.as_handle().map(Handle::from_raw) {
                                 self.realm.set_property(h, &key, v);
                             }
@@ -1055,25 +1089,30 @@ impl<'a> Interp<'a> {
         // direct eval) sees undefined, not the constructor reached via `new`.
         let saved_target = core::mem::replace(&mut self.new_target, NanBox::undefined());
         let result = (|| {
-            for member in &class.body {
+            for (idx, member) in class.body.iter().enumerate() {
                 if let ClassMember::Field(field) = member
                     && !field.is_static
                 {
-                    // A computed field name (`[expr] = v`) is evaluated here.
+                    // A computed field name (`[expr]`) was evaluated exactly once, in
+                    // source order, at class-definition time (its side effects and
+                    // ToPropertyKey coercion already ran) and stored in
+                    // `class_member_keys`; read it back here rather than re-evaluating
+                    // per construction. Only the *value* is (re)computed below.
                     let is_private = matches!(&field.key, PropertyKey::Private(_));
-                    let key = match &field.key {
-                        PropertyKey::Computed(e) => {
-                            let k = self.eval(e)?;
-                            self.member_key(k)
-                        }
-                        // A private field (`#x = …`) keys on its declaring class.
-                        PropertyKey::Private(s) => crate::nbexec::private_storage_key(s, class_id),
-                        other => static_key(other)?,
-                    };
+                    let key = self.class_member_key(class_id, idx, &field.key)?;
                     let v = match &field.value {
                         Some(e) => self.eval(e)?,
                         None => NanBox::undefined(),
                     };
+                    // DefineField step 7: an anonymous function/arrow/class
+                    // initializer takes the field name (`x = () => {}` → name "x";
+                    // `#f = () => {}` → name "#f").
+                    if let Some(init) = &field.value
+                        && matches!(init, Expr::Function(_) | Expr::Arrow(_) | Expr::Class(_))
+                        && let Some(disp) = self.method_display_name(&key, MethodKind::Method)
+                    {
+                        self.set_fn_name_owned(v, &disp);
+                    }
                     if is_private {
                         // `PrivateFieldAdd` on a **non-extensible** object is a
                         // TypeError (the `nonextensible-applies-to-private`

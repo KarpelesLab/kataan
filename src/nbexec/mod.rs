@@ -8066,7 +8066,10 @@ fn expand_dollar(template: &str, m: &str, before: &str, after: &str) -> String {
 fn static_key(key: &PropertyKey) -> Result<String, ExecError> {
     match key {
         PropertyKey::Ident(s) | PropertyKey::Str(s) => Ok(String::from(&**s)),
-        PropertyKey::Number(n) => Ok(alloc::format!("{n}")),
+        // A numeric literal key is the ECMAScript `ToString(Number)` of its value,
+        // so a non-canonical literal (`0.0000001`, `0x10`, `1.0`) keys under its
+        // canonical form (`"1e-7"`, `"16"`, `"1"`) — matching `obj[n]` access.
+        PropertyKey::Number(n) => Ok(crate::realm::js_number_string(*n)),
         // A private name needs its declaring-class scope to form a storage key,
         // which a free function cannot resolve — callers that may see a private
         // key (class member declaration / access) handle it explicitly.
