@@ -59,6 +59,13 @@ pub struct PromiseState {
     pub value: NanBox,
     /// Reactions registered while pending, drained on settlement.
     pub reactions: Vec<Reaction>,
+    /// The spec's `[[AlreadyResolved]]` flag (25.6.1.3 CreateResolvingFunctions):
+    /// set the first time one of this promise's *resolve/reject* functions is
+    /// invoked. Because resolving with a thenable defers the actual settlement to
+    /// a later job, the promise can still be `Pending` after a resolve has been
+    /// committed — this flag records that commitment so a subsequent reject (e.g.
+    /// from a `Promise` executor that throws *after* calling `resolve`) is ignored.
+    pub already_resolved: bool,
 }
 
 /// The free/release hook for an externally-owned byte region, run once when the

@@ -307,6 +307,60 @@ impl<'a> Interp<'a> {
         Ok(species)
     }
 
+    /// Dispatches `Promise.prototype.{then,catch,finally}` on the *raw* receiver
+    /// `recv` (a primitive number/boolean/string/symbol or an object), used by the
+    /// `N_ARRAY_PROTO_FN` fast-path so these Promise-specific methods are not
+    /// intercepted by the generic array-like / primitive-wrapper handlers.
+    pub(crate) fn promise_proto_dispatch(
+        &mut self,
+        name: &str,
+        recv: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
+        match name {
+            // `then` brand-checks `IsPromise(this)`; a non-promise (incl. any
+            // primitive) is a `TypeError`.
+            "then" => {
+                let h = recv
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .filter(|h| self.realm.promise_state(*h).is_some());
+                match h {
+                    Some(h) => self.perform_promise_then_method(h, arg(0), arg(1)),
+                    None => Err(self.type_error("Promise.prototype.then called on a non-promise")),
+                }
+            }
+            // `catch` is `return Invoke(this, "then", [undefined, onRejected])`.
+            // `GetV` does `ToObject(this)` for the property lookup (so a primitive
+            // receiver with a `then` on its wrapper-prototype is honored), then
+            // `Call(then, this, …)` uses the *original* receiver as `this`.
+            "catch" => {
+                let obj = self.coerce_to_object(recv);
+                let objh = obj.as_handle().map(Handle::from_raw).ok_or_else(|| {
+                    self.type_error("Promise.prototype.catch called on null or undefined")
+                })?;
+                let then = self.read_member(objh, "then")?;
+                self.call_with_this(then, recv, &[NanBox::undefined(), arg(0)])
+            }
+            // `finally` requires an Object receiver (SpeciesConstructor reads
+            // `this.constructor`); a primitive is a `TypeError`.
+            "finally" => {
+                let h = recv.as_handle().map(Handle::from_raw).filter(|_| {
+                    // `is_object_value` excludes primitive-string handles etc.
+                    self.is_object_value(recv)
+                });
+                match h {
+                    Some(h) => self.promise_finally(h, recv, arg(0)),
+                    None => {
+                        Err(self.type_error("Promise.prototype.finally called on a non-object"))
+                    }
+                }
+            }
+            _ => Ok(NanBox::undefined()),
+        }
+    }
+
     /// `Promise.prototype.then(onFulfilled, onRejected)` — the brand-checked,
     /// species-aware spec algorithm. `this` must be a promise (else a `TypeError`);
     /// the result promise is built from `SpeciesConstructor(this, %Promise%)`.
@@ -421,11 +475,26 @@ impl<'a> Interp<'a> {
         // call `then.call(thenable, resolve, reject)`. A throw rejects via the
         // job's `reject` (the bound resolve/reject of `result`).
         if let Some((resolve, reject)) = job.thenable {
+            // `PromiseResolveThenableJob` (25.6.2.2) installs a *fresh* pair of
+            // resolving functions with their own `[[AlreadyResolved]]` flag. The
+            // engine's resolve/reject natives share the promise-level flag (already
+            // committed `true` by the outer resolve that scheduled this job), so
+            // reset it here to model the fresh pair: a `resolve(...)` *inside* the
+            // thenable's `then` commits it, and the step-3a reject after an abrupt
+            // completion is then ignored — while a `then` that throws *without*
+            // resolving still rejects the promise.
+            if let Some(st) = self.realm.promise_state(job.result) {
+                st.borrow_mut().already_resolved = false;
+            }
             let args = [resolve, reject];
             if let Err(ExecError::Throw(e)) = self.call_with_this(job.handler, job.value, &args) {
-                // Reject the target promise with the thrown value (the resolve/reject
-                // pair may already have settled it, in which case settle is a no-op).
-                self.settle(job.result, e, false);
+                let already = self
+                    .realm
+                    .promise_state(job.result)
+                    .is_some_and(|st| st.borrow().already_resolved);
+                if !already {
+                    self.settle(job.result, e, false);
+                }
             }
             return Ok(());
         }

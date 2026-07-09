@@ -1579,6 +1579,7 @@ impl Realm {
                     status: crate::cell::PromiseStatus::Pending,
                     value: NanBox::undefined(),
                     reactions: alloc::vec::Vec::new(),
+                    already_resolved: false,
                 },
             ))))
     }

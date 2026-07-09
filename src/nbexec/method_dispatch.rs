@@ -1678,6 +1678,20 @@ impl<'a> Interp<'a> {
             }
             return Ok(Some(NanBox::handle(map.to_raw())));
         }
+        // `Promise.withResolvers()` — generic over the receiver `C`:
+        // `NewPromiseCapability(C)`, then package `{ promise, resolve, reject }`.
+        // `C` must be a constructor (the this-aware static guard in `call.rs`
+        // already throws a `TypeError` for a non-constructor / non-object receiver
+        // of the genuine static). For a subclass this constructs `new C(executor)`,
+        // so `withResolvers.call(SubPromise).promise` is a `SubPromise` instance.
+        if method == "withResolvers" && self.is_constructor(recv) {
+            let cap = self.new_promise_capability(recv)?;
+            let obj = self.realm.new_object();
+            self.realm.set_property(obj, "promise", cap.promise);
+            self.realm.set_property(obj, "resolve", cap.resolve);
+            self.realm.set_property(obj, "reject", cap.reject);
+            return Ok(Some(NanBox::handle(obj.to_raw())));
+        }
         // `Promise.resolve` / `Promise.reject` invoked with a *custom* constructor
         // receiver (`Promise.resolve.call(C)`, a subclass, or a foreign thenable
         // constructor) go through `NewPromiseCapability(C)` per spec — so `C` is
@@ -1710,12 +1724,18 @@ impl<'a> Interp<'a> {
         if self.realm.native_at(handle) == Some(N_PROMISE) {
             match method {
                 "resolve" => {
-                    // `Promise.resolve(x)` is idempotent on a promise: if `x` is
-                    // already a promise, return it unchanged (same identity).
+                    // `PromiseResolve(%Promise%, x)` is idempotent on a promise only
+                    // when `SameValue(x.constructor, %Promise%)`: if `x` is already a
+                    // promise *and* its `constructor` is this receiver, return it
+                    // unchanged (same identity). A promise whose `constructor` was
+                    // reassigned (e.g. to `null`) is instead wrapped in a fresh one.
                     if let Some(raw) = arg(0).as_handle()
                         && self.realm.promise_state(Handle::from_raw(raw)).is_some()
                     {
-                        return Ok(Some(arg(0)));
+                        let ctor = self.read_member(Handle::from_raw(raw), "constructor")?;
+                        if ctor.as_handle() == recv.as_handle() {
+                            return Ok(Some(arg(0)));
+                        }
                     }
                     let p = self.fresh_promise();
                     self.resolve_with(p, arg(0));
@@ -1725,22 +1745,6 @@ impl<'a> Interp<'a> {
                     let p = self.fresh_promise();
                     self.settle(p, arg(0), false);
                     return Ok(Some(NanBox::handle(p.to_raw())));
-                }
-                // `Promise.withResolvers()` → `{ promise, resolve, reject }`.
-                "withResolvers" => {
-                    let p = self.fresh_promise();
-                    let resolve = self.realm.new_bound_native(N_RESOLVE, p);
-                    let reject = self.realm.new_bound_native(N_REJECT, p);
-                    self.install_fn_name_length(resolve, "", 1);
-                    self.install_fn_name_length(reject, "", 1);
-                    let obj = self.realm.new_object();
-                    self.realm
-                        .set_property(obj, "promise", NanBox::handle(p.to_raw()));
-                    self.realm
-                        .set_property(obj, "resolve", NanBox::handle(resolve.to_raw()));
-                    self.realm
-                        .set_property(obj, "reject", NanBox::handle(reject.to_raw()));
-                    return Ok(Some(NanBox::handle(obj.to_raw())));
                 }
                 _ => {}
             }

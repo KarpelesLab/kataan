@@ -963,6 +963,19 @@ impl<'a> Interp<'a> {
             // call's `this` (e.g. `Array.prototype.slice.call(arguments)`).
             if id == N_ARRAY_PROTO_FN {
                 let name = self.realm.string_value(target).unwrap_or_default();
+                // `Promise.prototype.{then,catch,finally}` share the generic
+                // `N_ARRAY_PROTO_FN` dispatch id, but they are Promise-specific and
+                // must see the *raw* `this` value (no `ToObject` boxing): `then` and
+                // `finally` brand-check and throw a `TypeError` for a primitive /
+                // non-promise receiver, while `catch` performs a generic
+                // `Invoke(this, "then", …)` that coerces a primitive `this` only for
+                // the property lookup (calling the found `then` with the original
+                // receiver). Routing them through the array-like boxing path silently
+                // no-ops on a number/boolean receiver. No `Array.prototype` method
+                // shares these names, so the name alone identifies the Promise method.
+                if matches!(name.as_str(), "then" | "catch" | "finally") {
+                    return self.promise_proto_dispatch(&name, this_val, args);
+                }
                 // Every `Array.prototype` method begins with `ToObject(this value)`,
                 // which throws a TypeError for `null`/`undefined`.
                 if matches!(this_val.unpack(), Unpacked::Null | Unpacked::Undefined) {
@@ -1051,6 +1064,7 @@ impl<'a> Interp<'a> {
                             | "allSettledKeyed"
                             | "resolve"
                             | "reject"
+                            | "withResolvers"
                             | "try"
                     );
                     // For a `this`-aware static, a non-object receiver (number,
@@ -1062,17 +1076,26 @@ impl<'a> Interp<'a> {
                         return Err(self
                             .type_error(&alloc::format!("Promise.{name} called on a non-object")));
                     }
-                    // The combinators run `NewPromiseCapability(C)` unconditionally,
-                    // which requires `C` (the receiver) to be a constructor — a
-                    // non-constructor object (e.g. `Promise.all.call(eval)`) is a
+                    // The combinators and `resolve`/`reject`/`withResolvers` all run
+                    // `NewPromiseCapability(C)`, which requires `C` (the receiver) to
+                    // be a constructor — a non-constructor object (e.g.
+                    // `Promise.all.call(eval)`, `Promise.resolve.call(eval)`) is a
                     // TypeError. We special-case it here because we know this is the
-                    // genuine `Promise` combinator (not an unrelated same-named method,
+                    // genuine `Promise` static (not an unrelated same-named method,
                     // which the name-dispatch guard in `call_method` cannot tell apart).
-                    let is_combinator = matches!(
+                    let requires_ctor = matches!(
                         name.as_str(),
-                        "all" | "race" | "allSettled" | "any" | "allKeyed" | "allSettledKeyed"
+                        "all"
+                            | "race"
+                            | "allSettled"
+                            | "any"
+                            | "allKeyed"
+                            | "allSettledKeyed"
+                            | "resolve"
+                            | "reject"
+                            | "withResolvers"
                     );
-                    if is_combinator && !self.is_constructor(this_val) {
+                    if requires_ctor && !self.is_constructor(this_val) {
                         return Err(self.type_error(&alloc::format!(
                             "Promise.{name} called on a non-constructor"
                         )));
@@ -1263,8 +1286,22 @@ impl<'a> Interp<'a> {
                     }
                     return Ok(result);
                 }
-                N_RESOLVE => self.resolve_with(target, arg0),
-                N_REJECT => self.settle(target, arg0, false),
+                N_RESOLVE => {
+                    // Invoking a promise's resolve function commits its
+                    // `[[AlreadyResolved]]` flag (even when settlement is deferred to
+                    // a thenable job), so a later reject from the same executor is a
+                    // no-op.
+                    if let Some(st) = self.realm.promise_state(target) {
+                        st.borrow_mut().already_resolved = true;
+                    }
+                    self.resolve_with(target, arg0)
+                }
+                N_REJECT => {
+                    if let Some(st) = self.realm.promise_state(target) {
+                        st.borrow_mut().already_resolved = true;
+                    }
+                    self.settle(target, arg0, false)
+                }
                 // A finite-timeout `Atomics.waitAsync` waiter's macrotask: if its
                 // promise (`target`) is still parked, settle it `"timed-out"`.
                 N_ATOMICS_ASYNC_TIMEOUT => self.atomics_wait_async_timeout(target),
@@ -2474,9 +2511,14 @@ impl<'a> Interp<'a> {
             // Promise`): link to `GetPrototypeFromConstructor(newTarget,
             // %Promise.prototype%)` — newTarget's `.prototype` when an Object, else
             // its realm's `%Promise.prototype%`. A plain `new Promise` is untouched.
+            // `instance_proto_checked` performs `Get(newTarget, "prototype")` per
+            // spec, so a throwing `prototype` accessor (get-prototype-abrupt) is
+            // surfaced *before* the executor runs (step 3 precedes step 9).
             if native_new_target.as_handle() != callee.as_handle() {
                 let default = self.realm.object_proto(promise);
-                if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
+                if let Some(proto) =
+                    self.instance_proto_checked(native_new_target, callee, default)?
+                {
                     // A promise is a non-object cell: its `[[Prototype]]` link lives
                     // in the realm's native-proto table (`set_native_proto`), not an
                     // inline object slot.
@@ -2495,7 +2537,17 @@ impl<'a> Interp<'a> {
                 ],
             );
             if let Err(ExecError::Throw(e)) = r {
-                self.settle(promise, e, false);
+                // Step 10a: the executor's abrupt completion calls the *reject*
+                // resolving function, which is a no-op once the promise has already
+                // been resolved (e.g. `resolve(thenable); throw e`) — so the throw is
+                // ignored rather than rejecting an already-resolved promise.
+                let already = self
+                    .realm
+                    .promise_state(promise)
+                    .is_some_and(|st| st.borrow().already_resolved);
+                if !already {
+                    self.settle(promise, e, false);
+                }
             } else {
                 r?;
             }
@@ -3577,7 +3629,16 @@ impl<'a> Interp<'a> {
                 ],
             );
             if let Err(ExecError::Throw(e)) = r {
-                self.settle(backing, e, false);
+                // As in the base `Promise` constructor: a throw *after* `resolve(...)`
+                // is ignored ([[AlreadyResolved]] committed), so it does not reject an
+                // already-resolved subclass promise.
+                let already = self
+                    .realm
+                    .promise_state(backing)
+                    .is_some_and(|st| st.borrow().already_resolved);
+                if !already {
+                    self.settle(backing, e, false);
+                }
             } else {
                 r?;
             }
