@@ -353,10 +353,23 @@ impl<'a> Interp<'a> {
             }
             N_MATH_ABS => NanBox::number(self.realm.to_number(arg(0)).abs()),
             N_STRING => {
-                // `String(obj)` runs the object through ToString (string hint),
-                // honoring a custom `toString`.
-                let p = self.coerce_object(arg(0), "string")?;
-                let s = self.realm.to_display_string(p);
+                // `String()` with no argument is the empty string.
+                if args.is_empty() {
+                    return Ok(NanBox::handle(self.realm.new_string("").to_raw()));
+                }
+                // `String(symbol)` is *not* a TypeError (unlike `new String(sym)`
+                // or an implicit ToString): it yields `SymbolDescriptiveString`.
+                if arg(0)
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|h| self.realm.symbol_at(h).is_some())
+                {
+                    let s = self.realm.to_display_string(arg(0));
+                    return Ok(NanBox::handle(self.realm.new_string(&s).to_raw()));
+                }
+                // Otherwise run the value through ToString (string hint), honoring a
+                // custom/inherited `toString`/`valueOf`/`@@toPrimitive`.
+                let s = self.coerce_to_string(arg(0))?;
                 NanBox::handle(self.realm.new_string(&s).to_raw())
             }
             N_NUMBER => {
@@ -1911,6 +1924,23 @@ impl<'a> Interp<'a> {
             // `%IteratorPrototype%[Symbol.iterator]()` — an iterator is its own
             // iterable: return the receiver.
             N_ITERATOR_PROTO_SELF => self.this_val,
+            // `String.prototype[Symbol.iterator]()` — RequireObjectCoercible +
+            // ToString the receiver (a poisoned `toString` or a null/undefined
+            // `this` throws), then a String Iterator over its code points. The
+            // WTF-8 byte form is preserved so a lone surrogate iterates as one
+            // code unit.
+            N_STRING_PROTO_ITER => {
+                let this = self.this_val;
+                if matches!(this.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    return Err(self.type_error(
+                        "String.prototype[Symbol.iterator] called on null or undefined",
+                    ));
+                }
+                let bytes = self.coerce_to_string_bytes(this)?;
+                let sval = self.new_str_bytes(bytes);
+                let vals = self.iterate_values(sval)?;
+                self.make_builtin_iterator(vals, "String Iterator")
+            }
             // The abstract `%Iterator%` constructor is not callable as a plain
             // function (and `new Iterator()` is a TypeError too — handled in
             // `construct`).

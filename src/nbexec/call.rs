@@ -420,11 +420,12 @@ impl<'a> Interp<'a> {
                 // `ToString(this)` runs (so a poisoned `this.toString` is not
                 // called). The string-receiver path validates it again redundantly.
                 if (name == "replaceAll" || name == "matchAll")
-                    && args.first().copied().is_some_and(|a| self.is_regexp_arg(a))
-                    && let Some(argh) = args
-                        .first()
-                        .and_then(|a| a.as_handle())
-                        .map(Handle::from_raw)
+                    && let Some(arg0) = args.first().copied()
+                    && !matches!(arg0.unpack(), Unpacked::Undefined | Unpacked::Null)
+                    // `IsRegExp(searchValue)` reads `@@match` via `[[Get]]`, so a
+                    // throwing getter propagates (before any `ToString(this)`).
+                    && self.try_is_regexp(arg0)?
+                    && let Some(argh) = arg0.as_handle().map(Handle::from_raw)
                 {
                     let flags_v = self.read_member(argh, "flags")?;
                     if matches!(flags_v.unpack(), Unpacked::Undefined | Unpacked::Null) {
@@ -459,10 +460,19 @@ impl<'a> Interp<'a> {
                 {
                     let sym = self.well_known_symbol(sym_name);
                     let key = self.member_key(sym);
+                    // `GetMethod(searchValue, @@method)`: a non-undefined/null value
+                    // that is not callable is a TypeError (not a silent fall-through
+                    // to the literal-string path).
                     let m = self.read_member(argh, &key)?;
-                    if m.as_handle()
-                        .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-                    {
+                    let callable = m
+                        .as_handle()
+                        .is_some_and(|r| self.is_callable(Handle::from_raw(r)));
+                    if !callable && !matches!(m.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                        return Err(self.type_error(&alloc::format!(
+                            "searchValue[Symbol.{sym_name}] is not a function"
+                        )));
+                    }
+                    if callable {
                         let mut call_args = alloc::vec![this_val];
                         call_args.extend_from_slice(&args[1.min(args.len())..]);
                         return self.call_with_this(m, arg0, &call_args);

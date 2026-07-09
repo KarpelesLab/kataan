@@ -307,14 +307,41 @@ impl<'a> Interp<'a> {
                 let m = self.new_str("Cannot convert a Symbol value to a string");
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
+            // Any object that is not already a primitive string runs
+            // `ToPrimitive(v, "string")` first — `@@toPrimitive`, then
+            // `OrdinaryToPrimitive` (`toString` before `valueOf`) — so a
+            // prototype-inherited or overridden `toString`/`valueOf` is honored
+            // (e.g. `String(fn)` with a custom `Function.prototype.toString`). The
+            // default methods simply reproduce the intrinsic display form, so
+            // ordinary cases are unchanged.
+            //
+            // Arrays and typed arrays are excluded: their `toString`
+            // (`Array.prototype.toString` → `join`) is a built-in that is not yet
+            // callable as a plain first-class function value on this tier, so they
+            // keep the infallible default-display path (byte-identical to before).
+            // The bytecode tier still honors an overridden `Array.prototype.toString`
+            // for them.
             if self.realm.string_value(h).is_none()
+                && self.is_object_value(v)
                 && !self.realm.is_array(h)
-                && self.realm.object_keys(h).is_some()
+                && self.realm.typed_kind(h).is_none()
             {
-                let p = self.coerce_primitive(v, "string")?;
-                if p.as_handle() != v.as_handle() {
-                    return Ok(self.realm.to_display_string(p));
+                let p = if let Some(r) = self.symbol_to_primitive(v, "string")? {
+                    r
+                } else {
+                    self.ordinary_to_primitive(v, "string")?
+                };
+                // `ToString` of the resulting primitive: a Symbol has no string
+                // conversion (e.g. an object whose `toString` returns a Symbol) — a
+                // TypeError, not its descriptive string.
+                if p.as_handle()
+                    .map(Handle::from_raw)
+                    .is_some_and(|ph| self.realm.symbol_at(ph).is_some())
+                {
+                    let m = self.new_str("Cannot convert a Symbol value to a string");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
+                return Ok(self.realm.to_display_string(p));
             }
         }
         Ok(self.realm.to_display_string(v))

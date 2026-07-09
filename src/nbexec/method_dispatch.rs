@@ -128,7 +128,37 @@ impl<'a> Interp<'a> {
             && !(array_proto_generic
                 && (ARRAY_LIKE_METHODS.contains(&method)
                     || matches!(method, "call" | "apply" | "bind")))
+            // The generic `Object.prototype` methods operate on the wrapper *object*
+            // itself (its prototype chain / own properties), so they must NOT unwrap
+            // to the boxed primitive — e.g. `String.prototype.isPrototypeOf(x)` (a
+            // String exotic whose `[[StringData]]` is `""`) must test the object, not
+            // the empty string.
+            && !matches!(
+                method,
+                "hasOwnProperty" | "isPrototypeOf" | "propertyIsEnumerable"
+            )
         {
+            // `toString`/`toLocaleString` only unwrap while the name still resolves
+            // to the wrapper-proto built-in (e.g. `String.prototype.toString`). If it
+            // was deleted/shadowed, the name resolves to `Object.prototype.toString`,
+            // which must run on the wrapper *object* (yielding `"[object String]"`
+            // via its `[[StringData]]` builtin tag) — so defer to real resolution.
+            if matches!(method, "toString" | "toLocaleString") {
+                let resolved = self.read_member(h, method)?;
+                let is_wrapper_proto_builtin = resolved
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|fh| self.realm.native_at(fh))
+                    .is_some_and(|nid| {
+                        matches!(
+                            nid,
+                            N_STRING_PROTO_FN | N_NUMBER_PROTO_FN | N_BOOLEAN_PROTO_FN
+                        )
+                    });
+                if !is_wrapper_proto_builtin {
+                    return Ok(None);
+                }
+            }
             return match method {
                 "valueOf" => Ok(Some(prim)),
                 _ => self.call_method(prim, method, args),
@@ -1933,8 +1963,9 @@ impl<'a> Interp<'a> {
                     Some(self.new_str_bytes(out))
                 }
                 "includes" => {
-                    // A RegExp `searchString` is a TypeError (IsRegExp).
-                    if self.is_regexp_arg(arg(0)) {
+                    // A RegExp `searchString` is a TypeError (IsRegExp reads
+                    // `@@match` via `[[Get]]`, so a throwing getter propagates).
+                    if self.try_is_regexp(arg(0))? {
                         return Err(self.type_error(
                             "String.prototype.includes argument must not be a regular expression",
                         ));
@@ -1979,7 +2010,7 @@ impl<'a> Interp<'a> {
                     Some(self.new_str_bytes(bytes.repeat(n)))
                 }
                 "startsWith" => {
-                    if self.is_regexp_arg(arg(0)) {
+                    if self.try_is_regexp(arg(0))? {
                         return Err(self.type_error(
                             "String.prototype.startsWith argument must not be a regular expression",
                         ));
@@ -1998,7 +2029,7 @@ impl<'a> Interp<'a> {
                     Some(NanBox::boolean(matched))
                 }
                 "endsWith" => {
-                    if self.is_regexp_arg(arg(0)) {
+                    if self.try_is_regexp(arg(0))? {
                         return Err(self.type_error(
                             "String.prototype.endsWith argument must not be a regular expression",
                         ));
@@ -2142,7 +2173,29 @@ impl<'a> Interp<'a> {
                     let is_fn = repl
                         .as_handle()
                         .is_some_and(|r| self.is_callable(Handle::from_raw(r)));
-                    if is_fn && !from.is_empty() {
+                    if is_fn && from.is_empty() {
+                        // An empty search string matches at every UTF-16 boundary
+                        // `0..=length` (advanceBy = max(1, 0) = 1). The functional
+                        // replacer runs at each: emit `replacer("", pos, string)`,
+                        // then the next source char, then the next replacer, … so a
+                        // subject "ab" yields `f(0) a f(1) b f(2)` and an empty
+                        // subject yields a single `f(0)`.
+                        let whole = self.new_str(&s);
+                        let mut out = String::new();
+                        let mut off_units = 0usize;
+                        let empty = self.new_str("");
+                        let r = self.call(repl, &[empty, NanBox::number(0.0), whole])?;
+                        out.push_str(&self.coerce_to_string(r)?);
+                        for ch in s.chars() {
+                            out.push(ch);
+                            off_units += ch.len_utf16();
+                            let empty = self.new_str("");
+                            let off = NanBox::number(off_units as f64);
+                            let r = self.call(repl, &[empty, off, whole])?;
+                            out.push_str(&self.coerce_to_string(r)?);
+                        }
+                        Some(self.new_str(&out))
+                    } else if is_fn {
                         let mut out = String::new();
                         let mut last = 0;
                         // P6: maintain a running UTF-16 unit count for the match

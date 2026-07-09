@@ -2590,6 +2590,11 @@ const N_ERROR_PROTO_STACK_GET: u16 = 669;
 /// %Error.prototype%` throws; otherwise an own data property "stack" is created
 /// (or `[[Set]]` runs if one already exists).
 const N_ERROR_PROTO_STACK_SET: u16 = 670;
+/// `String.prototype[Symbol.iterator]()` — a real own function property (name
+/// `"[Symbol.iterator]"`, length 0). RequireObjectCoercible + ToString the
+/// receiver (so a poisoned `toString` propagates), then return a
+/// `%StringIteratorPrototype%` iterator over the string's code points.
+const N_STRING_PROTO_ITER: u16 = 962;
 /// Hidden array property holding a `FinalizationRegistry`'s `[[Cells]]`: each
 /// cell is a 3-element array `[target, heldValue, unregisterToken]` where an
 /// absent (~empty~) token is stored as `undefined` (safe: `undefined` can never
@@ -4228,6 +4233,17 @@ impl<'a> Interp<'a> {
                     self.realm.mark_hidden(str_proto, alias);
                 }
             }
+            // `String.prototype[Symbol.iterator]` — a real own function property
+            // (writable, non-enumerable, configurable) so it is observable to
+            // `getOwnPropertyDescriptor`/`verifyProperty`, has `length` 0 and
+            // `name` "[Symbol.iterator]", and is not a constructor.
+            let str_iter = self.realm.new_native(N_STRING_PROTO_ITER);
+            self.install_fn_name_length(str_iter, "[Symbol.iterator]", 0);
+            let iter_sym = self.well_known_symbol("iterator");
+            let iter_key = self.member_key(iter_sym);
+            self.realm
+                .set_property(str_proto, &iter_key, NanBox::handle(str_iter.to_raw()));
+            self.realm.mark_hidden(str_proto, &iter_key);
         }
         self.setup_first_class_prototype_id("Number", NUMBER_PROTO_METHODS, N_NUMBER_PROTO_FN);
         // The `Number` numeric constants are own data properties of the
@@ -4264,9 +4280,15 @@ impl<'a> Interp<'a> {
         // `[[StringData]]` (`+0`, `false`, `""`). They carry the matching
         // `PRIM_WRAP` so `Number.prototype.valueOf()` is `0` and
         // `Object.prototype.toString.call(Number.prototype)` is `"[object Number]"`.
-        for (ctor, prim) in [
-            ("Number", NanBox::number(0.0)),
-            ("Boolean", NanBox::boolean(false)),
+        for (ctor, prim, id) in [
+            ("Number", NanBox::number(0.0), N_NUMBER),
+            ("Boolean", NanBox::boolean(false), N_BOOLEAN),
+            // `String.prototype` is itself a String exotic object with
+            // `[[StringData]] = ""` — so `String.prototype.valueOf()` /
+            // `.toString()` return `""` (thisStringValue succeeds) and
+            // `Object.prototype.toString.call(String.prototype)` is
+            // `"[object String]"`. The boxed value is the empty string.
+            ("String", NanBox::undefined(), N_STRING),
         ] {
             if let Some(proto) = self
                 .current
@@ -4277,12 +4299,15 @@ impl<'a> Interp<'a> {
                 .and_then(|p| p.as_handle())
                 .map(Handle::from_raw)
             {
-                self.realm.set_hidden_property(proto, PRIM_WRAP, prim);
-                let id = if ctor == "Number" {
-                    N_NUMBER
+                // The empty-string box must be a real String cell (not the
+                // `undefined` placeholder used to name the arm) so `string_value`
+                // recovers `""`.
+                let prim = if id == N_STRING {
+                    NanBox::handle(self.realm.new_string("").to_raw())
                 } else {
-                    N_BOOLEAN
+                    prim
                 };
+                self.realm.set_hidden_property(proto, PRIM_WRAP, prim);
                 self.realm.set_hidden_property(
                     proto,
                     PRIM_WRAP_TYPE,

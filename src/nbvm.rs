@@ -1011,6 +1011,31 @@ fn vm_call_native(
         NB_OBJECT_KEYS | NB_OBJECT_VALUES | NB_OBJECT_ENTRIES
     ) {
         vm_object_kv(ctx, funcs, native, args)
+    } else if native == NB_STRING {
+        // `String(x)` — `ToString` with the object path running `ToPrimitive(x,
+        // "string")` (its `toString`/`valueOf`, which may call a JS closure), so an
+        // overridden/inherited `Function.prototype.toString`, `Array.prototype.
+        // toString`, etc. is honored. Special cases: no argument → `""`, and a
+        // Symbol argument yields its descriptive string (not a TypeError).
+        if args.is_empty() {
+            return Ok(NanBox::handle(ctx.realm.new_string("").to_raw()));
+        }
+        let arg = args[0];
+        let s = if arg
+            .as_handle()
+            .map(Handle::from_raw)
+            .is_some_and(|h| ctx.realm.symbol_at(h).is_some())
+        {
+            ctx.realm.to_display_string(arg)
+        } else if arg.as_handle().map(Handle::from_raw).is_some_and(|h| {
+            ctx.realm.string_value(h).is_none() && ctx.realm.symbol_at(h).is_none()
+        }) {
+            let prim = to_primitive(ctx, funcs, arg, false);
+            ctx.realm.to_display_string(prim)
+        } else {
+            ctx.realm.to_display_string(arg)
+        };
+        Ok(NanBox::handle(ctx.realm.new_string(&s).to_raw()))
     } else if native == NB_NUMBER {
         // `ToNumber` (`Number(x)`) on an object runs ToPrimitive(number) — its
         // `valueOf`/`toString` — which can call a JS closure; a Symbol/BigInt

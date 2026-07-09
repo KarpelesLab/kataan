@@ -2597,6 +2597,24 @@ impl Realm {
         if key == "length" && self.heap.get(handle).and_then(Cell::as_array).is_some() {
             return false;
         }
+        // A String exotic object (`new String("…")` wrapper) has non-configurable
+        // synthesized own properties: `length` and each integer index in
+        // `[0, length)`. `[[Delete]]` on them returns false. (`string_object_len`
+        // reads the boxed `[[StringData]]` via `PRIM_WRAP`; it is `None` for an
+        // ordinary object, so this never affects a normal `delete`.)
+        if self.heap.get(handle).and_then(Cell::as_object).is_some()
+            && let Some(len) = self.string_object_len(handle)
+        {
+            if key == "length" {
+                return false;
+            }
+            if let Ok(i) = key.parse::<usize>()
+                && alloc::format!("{i}") == key
+                && i < len
+            {
+                return false;
+            }
+        }
         // An array index is an element of the dense store (or a hole carrying an aux
         // accessor), not a named slot — `delete arr[i]` must punch a hole there, not
         // merely touch the aux object.

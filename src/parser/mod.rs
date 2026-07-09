@@ -1583,6 +1583,17 @@ impl<'src> Parser<'src> {
             // `` `…${ ``  and  `}…${ ``  drop one leading and the trailing `${`.
             TemplatePart::Head | TemplatePart::Middle => &text[1..text.len() - 2],
         };
+        // Line-terminator normalization (ECMA-262 TRV/TV): a `<CR><LF>` or a lone
+        // `<CR>` in a template becomes a single `<LF>` in *both* the raw and cooked
+        // values (`<LF>`/`<LS>`/`<PS>` are left as-is). So `` String.raw`\r\n` ``
+        // over literal CRLF/CR source yields "\n", not the original bytes.
+        let normalized;
+        let inner: &str = if inner.contains('\r') {
+            normalized = inner.replace("\r\n", "\n").replace('\r', "\n");
+            &normalized
+        } else {
+            inner
+        };
         if !tagged {
             cook::validate_template_escapes(inner, tok.span)?;
         }
