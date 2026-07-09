@@ -1006,6 +1006,11 @@ fn vm_call_native(
         json_parse(ctx, funcs, args)
     } else if native == NB_ARRAY_FROM {
         vm_array_from(ctx, funcs, args)
+    } else if matches!(
+        native,
+        NB_OBJECT_KEYS | NB_OBJECT_VALUES | NB_OBJECT_ENTRIES
+    ) {
+        vm_object_kv(ctx, funcs, native, args)
     } else if native == NB_NUMBER {
         // `ToNumber` (`Number(x)`) on an object runs ToPrimitive(number) — its
         // `valueOf`/`toString` — which can call a JS closure; a Symbol/BigInt
@@ -4703,6 +4708,76 @@ fn vm_array_from(ctx: &mut Ctx, funcs: &[FnProto], args: &[NanBox]) -> Result<Na
         raw
     };
     Ok(NanBox::handle(ctx.realm.new_array(items).to_raw()))
+}
+
+/// VM-side `Object.keys` / `Object.values` / `Object.entries` — handled in the VM
+/// loop (not `call_native`) because for an *ordinary* object it must invoke user
+/// getters (`Object.values`/`entries`) live, in the spec order of
+/// EnumerableOwnProperties (7.3.24): one `[[OwnPropertyKeys]]` snapshot, then per
+/// key a live enumerability check and `[[Get]]`. A getter mutating a later key's
+/// descriptor / existence / value is therefore observed. A `null`/`undefined`
+/// receiver throws a TypeError; a Proxy has no VM trap machinery, so it defers to
+/// the tree-walker (`VmError::Unsupported`); everything else (arrays / strings /
+/// typed arrays / functions — no getters in play) keeps the pure `call_native`
+/// enumeration.
+fn vm_object_kv(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    native: u16,
+    args: &[NanBox],
+) -> Result<NanBox, VmError> {
+    use crate::nanbox::Unpacked;
+    let recv = args.first().copied().unwrap_or(NanBox::undefined());
+    if matches!(recv.unpack(), Unpacked::Null | Unpacked::Undefined) {
+        let e = make_error(
+            ctx.realm,
+            "TypeError",
+            "Object.keys/values/entries called on null or undefined",
+        );
+        return Err(VmError::Thrown(e));
+    }
+    if let Some(h) = recv.as_handle().map(Handle::from_raw) {
+        // A proxy's `ownKeys`/`getOwnPropertyDescriptor`/`get` traps are not modeled
+        // in the VM — re-run the program on the tree-walker, which drives them.
+        if ctx.realm.proxy_at(h).is_some() {
+            return Err(VmError::Unsupported);
+        }
+        // Ordinary object: live, getter-invoking, spec-ordered enumeration.
+        if ctx.realm.object_keys(h).is_some() {
+            let keys = ctx.realm.own_property_names(h).unwrap_or_default();
+            let mut out = Vec::with_capacity(keys.len());
+            for k in keys {
+                if k.starts_with('#') || k.starts_with('\u{0}') {
+                    continue;
+                }
+                // Live `[[GetOwnProperty]]` — an ordinary object has no observable
+                // side effect, so an own+enumerable probe is equivalent.
+                if !(ctx.realm.has_own(h, &k) && ctx.realm.property_is_enumerable(h, &k)) {
+                    continue;
+                }
+                let item = match native {
+                    NB_OBJECT_KEYS => NanBox::handle(ctx.realm.new_string(&k).to_raw()),
+                    _ => {
+                        // A fresh cache per key: the inline cache keys only on the
+                        // receiver's shape pointer (one property per call site), so
+                        // reusing it across distinct keys would false-hit.
+                        let mut cache = PropertyCache::new();
+                        let v = vm_get_prop(ctx, funcs, recv, &k, &mut cache)?;
+                        if native == NB_OBJECT_VALUES {
+                            v
+                        } else {
+                            let key = NanBox::handle(ctx.realm.new_string(&k).to_raw());
+                            NanBox::handle(ctx.realm.new_array(alloc::vec![key, v]).to_raw())
+                        }
+                    }
+                };
+                out.push(item);
+            }
+            return Ok(NanBox::handle(ctx.realm.new_array(out).to_raw()));
+        }
+    }
+    // Arrays / strings / typed arrays / functions: the pure element+named path.
+    Ok(call_native(ctx, native, args))
 }
 
 /// Invokes a built-in by id (`console.log` writes to `ctx.output`; `Math.*`

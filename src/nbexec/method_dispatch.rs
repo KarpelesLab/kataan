@@ -288,25 +288,39 @@ impl<'a> Interp<'a> {
         // --- universal `Object.prototype` methods (own/inherited reflection) ---
         match method {
             "hasOwnProperty" => {
-                // `member_key` maps a symbol to its internal slot name (a string key
-                // passes through), so a symbol-keyed property is found.
-                let key = self.member_key(arg(0));
+                // ToPropertyKey(V) runs a user `toString`/`valueOf`/`@@toPrimitive`
+                // (which may return a Symbol); the resulting key resolves symbol-keyed
+                // properties via its internal slot name.
+                let key = self.coerce_property_key(arg(0))?;
                 return Ok(Some(NanBox::boolean(self.realm.has_own(handle, &key))));
             }
             "isPrototypeOf" => {
-                let mut cur = arg(0).as_handle().map(Handle::from_raw);
-                while let Some(p) = cur.and_then(|h| self.realm.object_proto(h)) {
+                // Only an object argument has a prototype chain to walk; a primitive
+                // (or missing) argument is `false`. Walk via `[[GetPrototypeOf]]`
+                // (proxy-aware — a proxy fires its `getPrototypeOf` trap).
+                if !self.is_object_value(arg(0)) {
+                    return Ok(Some(NanBox::boolean(false)));
+                }
+                let Some(v) = arg(0).as_handle().map(Handle::from_raw) else {
+                    return Ok(Some(NanBox::boolean(false)));
+                };
+                let mut cur = self.get_proto_of(v)?;
+                for _ in 0..1_000_000 {
+                    let Some(p) = cur.as_handle().map(Handle::from_raw) else {
+                        return Ok(Some(NanBox::boolean(false)));
+                    };
                     if p == handle {
                         return Ok(Some(NanBox::boolean(true)));
                     }
-                    cur = Some(p);
+                    cur = self.get_proto_of(p)?;
                 }
                 return Ok(Some(NanBox::boolean(false)));
             }
             "propertyIsEnumerable" => {
                 // True only for an *own* *enumerable* property (a non-enumerable one,
-                // or an inherited one, is false). `member_key` resolves symbol keys.
-                let key = self.member_key(arg(0));
+                // or an inherited one, is false). ToPropertyKey resolves symbol keys
+                // and runs a user `toString`/`valueOf`/`@@toPrimitive`.
+                let key = self.coerce_property_key(arg(0))?;
                 let r = self.realm.has_own(handle, &key)
                     && self.realm.property_is_enumerable(handle, &key);
                 return Ok(Some(NanBox::boolean(r)));

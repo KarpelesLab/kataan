@@ -105,6 +105,16 @@ pub struct Object {
     /// The `[[Prototype]]` link (`Object.create`/`getPrototypeOf`), if any. A
     /// property miss walks this chain.
     proto: Option<crate::heap::Handle>,
+    /// Unified own-key insertion order across **both** data and accessor
+    /// properties. `None` on the fast path (a pure data object, or one that has
+    /// never held an accessor): enumeration then derives its order from the shape
+    /// (data keys) followed by the accessor side-list, which is correct when the
+    /// two never interleave. The first `define_accessor` seeds this to the current
+    /// data keys and every subsequent new key (data or accessor) is appended, so
+    /// `[[OwnPropertyKeys]]` reports the true chronological creation order even when
+    /// a getter/setter is defined between two data properties (or an accessor is
+    /// later redefined as data, keeping its original slot).
+    key_order: Option<Vec<Box<str>>>,
 }
 
 impl Object {
@@ -128,6 +138,62 @@ impl Object {
             sealed: false,
             class_tag: None,
             proto: None,
+            key_order: None,
+        }
+    }
+
+    /// Appends `key` to the unified insertion-order log iff the object is tracking
+    /// order (it has held an accessor) and the key is not already recorded. A no-op
+    /// on the fast path (`key_order` is `None`). Called after a *new* own key — data
+    /// or accessor — is materialized.
+    fn track_key(&mut self, key: &str) {
+        if let Some(order) = &mut self.key_order
+            && !order.iter().any(|k| k.as_ref() == key)
+        {
+            order.push(Box::from(key));
+        }
+    }
+
+    /// The unified own-key order (data + accessor) reconstructed from the
+    /// insertion log, filtered to keys still present, then self-healed by appending
+    /// any present key the log missed (data keys before accessor keys). Only called
+    /// when `key_order` is `Some`.
+    fn merged_key_order(&self) -> Vec<&str> {
+        let data = self.keys();
+        let acc: Vec<&str> = self.accessors.iter().map(|(k, _, _)| k.as_ref()).collect();
+        let present = |k: &str| data.contains(&k) || acc.contains(&k);
+        let order = self
+            .key_order
+            .as_ref()
+            .expect("merged_key_order needs a log");
+        let mut result: Vec<&str> = Vec::with_capacity(data.len() + acc.len());
+        for k in order {
+            let k = k.as_ref();
+            if present(k) && !result.contains(&k) {
+                result.push(k);
+            }
+        }
+        // Self-heal: any live key the log never recorded (a data key added through a
+        // path that predates tracking) still enumerates — appended in the legacy
+        // data-then-accessor order.
+        for k in data.iter().chain(acc.iter()) {
+            if !result.contains(k) {
+                result.push(k);
+            }
+        }
+        result
+    }
+
+    /// The own-key base sequence for `[[OwnPropertyKeys]]`-style enumeration: the
+    /// unified insertion order when tracking, else the legacy data-then-accessor
+    /// concatenation (correct when data and accessors never interleave).
+    fn enum_base(&self) -> Vec<&str> {
+        if self.key_order.is_some() {
+            self.merged_key_order()
+        } else {
+            let mut keys = self.keys();
+            keys.extend(self.accessors.iter().map(|(k, _, _)| k.as_ref()));
+            keys
         }
     }
 
@@ -156,6 +222,12 @@ impl Object {
     /// Defines an accessor property `name` with `getter`/`setter` (either may be
     /// `undefined`). Replaces an existing accessor of the same name.
     pub fn define_accessor(&mut self, name: &str, getter: NanBox, setter: NanBox) {
+        // Start tracking unified key order the moment an accessor is involved: seed
+        // the log with the current data keys (their chronological order) so this and
+        // every later new key slot into the correct interleaved position.
+        if self.key_order.is_none() {
+            self.key_order = Some(self.keys().into_iter().map(Box::from).collect());
+        }
         if let Some(a) = self
             .accessors
             .iter_mut()
@@ -171,6 +243,7 @@ impl Object {
             self.accessors
                 .push((alloc::boxed::Box::from(name), getter, setter));
         }
+        self.track_key(name);
     }
 
     /// The names of this object's accessor (getter/setter) properties.
@@ -326,6 +399,7 @@ impl Object {
         if self.frozen || self.is_readonly(key) {
             return;
         }
+        let mut added = false;
         match &mut self.data {
             ObjectData::Shaped { shape, slots } => {
                 if let Some(slot) = shape.lookup(key) {
@@ -333,6 +407,7 @@ impl Object {
                 } else if self.extensible {
                     *shape = shape.transition(key);
                     slots.push(value);
+                    added = true;
                 }
                 // A non-extensible object silently ignores new keys.
             }
@@ -342,8 +417,12 @@ impl Object {
                 } else if self.extensible {
                     order.push(Box::from(key));
                     map.insert(Box::from(key), value);
+                    added = true;
                 }
             }
+        }
+        if added {
+            self.track_key(key);
         }
     }
 
@@ -354,6 +433,7 @@ impl Object {
     /// object (e.g. converting an existing accessor property to a data property, or
     /// changing the value of a configurable-but-non-extensible property).
     pub fn force_set(&mut self, key: &str, value: NanBox) {
+        let mut added = false;
         match &mut self.data {
             ObjectData::Shaped { shape, slots } => {
                 if let Some(slot) = shape.lookup(key) {
@@ -361,6 +441,7 @@ impl Object {
                 } else {
                     *shape = shape.transition(key);
                     slots.push(value);
+                    added = true;
                 }
             }
             ObjectData::Dict { order, map } => {
@@ -369,8 +450,12 @@ impl Object {
                 } else {
                     order.push(Box::from(key));
                     map.insert(Box::from(key), value);
+                    added = true;
                 }
             }
+        }
+        if added {
+            self.track_key(key);
         }
     }
 
@@ -429,9 +514,7 @@ impl Object {
     /// `Object.getOwnPropertySymbols`).
     #[must_use]
     pub fn all_keys(&self) -> Vec<&str> {
-        let mut keys = self.keys();
-        keys.extend(self.accessors.iter().map(|(k, _, _)| k.as_ref()));
-        keys
+        self.enum_base()
     }
 
     /// All own property names (data + accessor, **including** non-enumerable) in spec
@@ -439,42 +522,34 @@ impl Object {
     /// insertion order. Used by `getOwnPropertyNames` / `Reflect.ownKeys`.
     #[must_use]
     pub fn ordered_keys(&self) -> Vec<&str> {
-        let keys = self.keys();
-        let mut ints: Vec<&str> = keys
+        let base = self.enum_base();
+        let mut ints: Vec<&str> = base
             .iter()
             .copied()
             .filter(|k| array_index(k).is_some())
             .collect();
         ints.sort_by_key(|k| array_index(k).unwrap());
-        let strs = keys.iter().copied().filter(|k| array_index(k).is_none());
-        let acc = self.accessors.iter().map(|(k, _, _)| k.as_ref());
-        ints.into_iter().chain(strs).chain(acc).collect()
+        let rest = base.into_iter().filter(|k| array_index(k).is_none());
+        ints.into_iter().chain(rest).collect()
     }
 
     /// The own **enumerable** property names (excludes keys marked hidden), in
     /// spec order: integer-index keys ascending, then the rest in insertion order.
     #[must_use]
     pub fn enumerable_keys(&self) -> Vec<&str> {
-        let keys: Vec<&str> = self
-            .keys()
+        let base: Vec<&str> = self
+            .enum_base()
             .into_iter()
             .filter(|k| !self.is_hidden(k))
             .collect();
-        let mut ints: Vec<&str> = keys
+        let mut ints: Vec<&str> = base
             .iter()
             .copied()
             .filter(|k| array_index(k).is_some())
             .collect();
         ints.sort_by_key(|k| array_index(k).unwrap());
-        let strs = keys.into_iter().filter(|k| array_index(k).is_none());
-        // Enumerable accessor (getter/setter) properties live outside the shape;
-        // include those not marked hidden, after the data keys.
-        let acc = self
-            .accessors
-            .iter()
-            .map(|(k, _, _)| k.as_ref())
-            .filter(|k| !self.is_hidden(k));
-        ints.into_iter().chain(strs).chain(acc).collect()
+        let rest = base.into_iter().filter(|k| array_index(k).is_none());
+        ints.into_iter().chain(rest).collect()
     }
 
     /// Marks own property `key` non-enumerable (idempotent).
@@ -638,6 +713,12 @@ impl Object {
         self.hidden.retain(|k| k.as_ref() != key);
         self.readonly.retain(|k| k.as_ref() != key);
         self.non_configurable.retain(|k| k.as_ref() != key);
+        // Drop from the unified insertion log so a later re-add of the same key
+        // appends at the end (a deleted-then-recreated property is chronologically
+        // new), rather than reclaiming its former slot.
+        if let Some(order) = &mut self.key_order {
+            order.retain(|k| k.as_ref() != key);
+        }
         match &mut self.data {
             ObjectData::Shaped { shape, slots } => {
                 if !shape.contains(key) {

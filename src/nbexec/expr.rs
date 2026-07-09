@@ -2806,7 +2806,16 @@ impl<'a> Interp<'a> {
         } else if self.realm.is_array_like(handle) {
             "Array"
         } else if let Some(is_set) = self.realm.collection_is_set(handle) {
-            if is_set { "Set" } else { "Map" }
+            // A weak collection resolves to its *own* constructor's prototype
+            // (`WeakMap`/`WeakSet`), not `Map`/`Set` — otherwise, e.g., a
+            // `@@toStringTag` read after the weak prototype's own tag is deleted
+            // would wrongly fall through to `Map.prototype`'s "Map" tag.
+            match (is_set, self.realm.collection_is_weak(handle)) {
+                (true, false) => "Set",
+                (false, false) => "Map",
+                (true, true) => "WeakSet",
+                (false, true) => "WeakMap",
+            }
         } else if self.realm.function_at(handle).is_some()
             || self.realm.native_at(handle).is_some()
             || self.realm.bound_native_at(handle).is_some()
