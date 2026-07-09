@@ -6,6 +6,10 @@ impl<'a> Interp<'a> {
             || self.realm.host_fn_at(handle).is_some()
             || self.realm.function_at(handle).is_some()
             || self.realm.bound_native_at(handle).is_some()
+            // `%Function.prototype%` is itself a callable function object (its
+            // `[[Call]]` returns `undefined`), even though it is an ordinary
+            // object cell rather than a native.
+            || self.realm.is_function_proto_intrinsic(handle)
             // An [[IsHTMLDDA]] exotic object (`document.all`) has a `[[Call]]`.
             || self.realm.is_html_dda(handle)
             // A bound function (`fn.bind(...)`) is callable.
@@ -133,22 +137,58 @@ impl<'a> Interp<'a> {
         target: NanBox,
         this_val: NanBox,
         bound: Vec<NanBox>,
-    ) -> NanBox {
+    ) -> Result<NanBox, ExecError> {
         let obj = self.realm.new_object();
         // A bound function's `[[Prototype]]` is the target function's
         // `[[Prototype]]` (ordinarily `%Function.prototype%`), not
         // `Object.prototype` (which `new_object` defaults to).
-        let target_proto = target
-            .as_handle()
-            .map(Handle::from_raw)
-            .and_then(|t| self.realm.object_proto(t));
+        let target_h = target.as_handle().map(Handle::from_raw);
+        let target_proto = target_h.and_then(|t| self.realm.object_proto(t));
         self.realm.set_object_proto(obj, target_proto);
         self.realm.set_hidden_property(obj, BOUND_TARGET, target);
         self.realm.set_hidden_property(obj, BOUND_THIS, this_val);
+        let arg_count = bound.len();
         let arr = self.realm.new_array(bound);
         self.realm
             .set_hidden_property(obj, BOUND_ARGS, NanBox::handle(arr.to_raw()));
-        NanBox::handle(obj.to_raw())
+        // SetFunctionLength: L = max(ToIntegerOrInfinity(target.length) −
+        // argCount, 0), with `+∞`/`-∞` handled (ECMA-262 20.2.3.2 / 10.2.5).
+        // `target.length` is read via `read_member` so a synthesized or an own
+        // (possibly `defineProperty`-overridden) value is observed alike.
+        let len_val = match target_h {
+            Some(t) => self.read_member(t, "length")?,
+            None => NanBox::number(0.0),
+        };
+        let l = {
+            let n = self.realm.to_number(len_val);
+            if n.is_nan() {
+                0.0
+            } else {
+                // `trunc_toward_zero` leaves `±∞` unchanged, so `+∞ → +∞` and
+                // `-∞ → 0` (via `max`) fall out naturally.
+                (trunc_toward_zero(n) - arg_count as f64).max(0.0)
+            }
+        };
+        self.realm.set_property(obj, "length", NanBox::number(l));
+        self.realm.mark_hidden(obj, "length");
+        self.realm.set_readonly_property(obj, "length");
+        // SetFunctionName(F, targetName, "bound"): read `target.name` (an abrupt
+        // getter completion propagates); a non-String name is treated as the
+        // empty string, so the bound name is `"bound " + targetName`.
+        let target_name = match target_h {
+            Some(t) => self.read_member(t, "name")?,
+            None => NanBox::undefined(),
+        };
+        let name_str = target_name
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|nh| self.realm.string_value(nh))
+            .unwrap_or_default();
+        let bound_name = self.new_str(&alloc::format!("bound {name_str}"));
+        self.realm.set_property(obj, "name", bound_name);
+        self.realm.mark_hidden(obj, "name");
+        self.realm.set_readonly_property(obj, "name");
+        Ok(NanBox::handle(obj.to_raw()))
     }
 
     /// Calls `callee` with an explicit `this` (a method receiver, or `undefined`
@@ -167,6 +207,11 @@ impl<'a> Interp<'a> {
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         };
         let handle = Handle::from_raw(raw);
+        // `%Function.prototype%` is itself a function object whose `[[Call]]`
+        // accepts any arguments and returns `undefined` (ECMA-262 20.2.3).
+        if self.realm.is_function_proto_intrinsic(handle) {
+            return Ok(NanBox::undefined());
+        }
         // An [[IsHTMLDDA]] exotic object's `[[Call]]` (Annex B `document.all`):
         // return `null` when called with no arguments, or when the first argument
         // is `undefined` or the empty String; otherwise the host-defined result
@@ -1972,6 +2017,14 @@ impl<'a> Interp<'a> {
                 all.extend_from_slice(elems);
             }
             all.extend_from_slice(args);
+            // Bound-function `[[Construct]]` (ECMA-262 10.4.1.2): if
+            // `SameValue(F, newTarget)` then `newTarget` becomes the bound target.
+            // `newTarget` is the explicit `Reflect.construct` value or (for a plain
+            // `new boundFn(...)`) the bound function itself (`callee`).
+            let nt = self.reflect_new_target.unwrap_or(callee);
+            if nt.as_handle() == callee.as_handle() {
+                self.reflect_new_target = Some(target);
+            }
             return self.construct(target, &all);
         }
         // `new UserClass(...)`.

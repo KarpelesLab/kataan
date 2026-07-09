@@ -448,7 +448,7 @@ impl<'a> Interp<'a> {
                 "bind" => {
                     let this = arg(0);
                     let bound: Vec<NanBox> = args.iter().skip(1).copied().collect();
-                    return Ok(Some(self.make_bound_function(recv, this, bound)));
+                    return Ok(Some(self.make_bound_function(recv, this, bound)?));
                 }
                 // A textual representation (the engine does not retain source).
                 "toString" | "toLocaleString" => {
@@ -457,7 +457,15 @@ impl<'a> Interp<'a> {
                     let s = if self.realm.class_at(handle).is_some() {
                         alloc::format!("class {nm} {{ }}")
                     } else {
-                        alloc::format!("function {nm}() {{ [native code] }}")
+                        // Fall back to NativeFunction syntax (Test262's matcher
+                        // accepts it). Only emit the `name` when it is a valid
+                        // IdentifierName (optionally with a `get `/`set ` accessor
+                        // prefix): a private-method name (`#f`), a bracketed symbol
+                        // name, or one with punctuation is not valid NativeFunction
+                        // syntax, so it is dropped rather than producing an
+                        // unparsable `function #f() { … }`.
+                        let seg = crate::realm::native_fn_name_segment(&nm);
+                        alloc::format!("function {seg}() {{ [native code] }}")
                     };
                     return Ok(Some(self.new_str(&s)));
                 }

@@ -132,6 +132,12 @@ fn parse_meta(source: &str) -> Meta {
     };
     let block = &source[start + 5..start + rel_end];
 
+    // Some tests (e.g. the `line-terminator-normalisation-CR` toString tests)
+    // delimit their frontmatter with bare Carriage Return characters. Rust's
+    // `str::lines` only splits on `\n` (stripping a trailing `\r`), so normalise
+    // CR/CRLF to LF first — otherwise the whole block collapses to one line and
+    // `includes:`/`flags:` go unparsed (leaving harness helpers undefined).
+    let block = block.replace(['\r'], "\n");
     let lines: Vec<&str> = block.lines().collect();
     let mut i = 0;
     while i < lines.len() {

@@ -2345,6 +2345,7 @@ impl<'a> Interp<'a> {
         // re-bound function reads `"bound bound …"`); its `length` is the target's
         // length minus the bound arguments (floored at 0).
         if matches!(name, "name" | "length")
+            && !self.realm.has_own(handle, name)
             && let Some(target) = self.realm.get_property(handle, BOUND_TARGET)
         {
             let th = target.as_handle().map(Handle::from_raw);

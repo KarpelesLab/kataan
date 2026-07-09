@@ -1524,11 +1524,17 @@ impl<'a> Interp<'a> {
         if self.strict {
             // A strict arguments object's `callee` is a poisoned accessor
             // (`%ThrowTypeError%`, which has own non-configurable `name`/`length`).
-            let thrower_h = self.realm.new_native(N_THROW_TYPE_ERROR);
-            self.install_fn_name_length(thrower_h, "", 0);
-            self.realm.set_non_configurable_property(thrower_h, "name");
-            self.realm
-                .set_non_configurable_property(thrower_h, "length");
+            // Reuse the realm's single canonical `%ThrowTypeError%` so this getter
+            // is the *same* function object as `Function.prototype.caller`'s
+            // (ECMA-262: one `%ThrowTypeError%` per realm); fall back to a fresh
+            // native only if global setup has not installed it yet.
+            let thrower_h = self.realm.throw_type_error_intrinsic().unwrap_or_else(|| {
+                let h = self.realm.new_native(N_THROW_TYPE_ERROR);
+                self.install_fn_name_length(h, "", 0);
+                self.realm.set_non_configurable_property(h, "name");
+                self.realm.set_non_configurable_property(h, "length");
+                h
+            });
             let thrower = NanBox::handle(thrower_h.to_raw());
             self.realm.define_accessor(obj, "callee", thrower, thrower);
             self.realm.mark_hidden(obj, "callee");

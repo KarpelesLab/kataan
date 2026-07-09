@@ -166,6 +166,12 @@ pub struct Realm {
     /// still be overridden explicitly (`Object.setPrototypeOf(fn, p)`), recorded
     /// in [`native_protos`](Realm::native_protos).
     function_proto_intrinsic: Option<Handle>,
+    /// The realm's single `%ThrowTypeError%` intrinsic — the poisoned accessor
+    /// shared by `Function.prototype.caller`/`.arguments` and a strict
+    /// `arguments` object's `callee`. There is exactly one per realm (ECMA-262
+    /// `%ThrowTypeError%`), so all these accessors are the *same* function
+    /// object (Test262 checks `SameValue`). Installed at global setup.
+    throw_type_error_intrinsic: Option<Handle>,
     /// The realm's `Array.prototype` intrinsic (the default `[[Prototype]]` of a
     /// dense `Cell::Array`, which has no inline object part). So
     /// `Object.getPrototypeOf([])`, `[] instanceof Array`, and `"push" in []`
@@ -261,6 +267,8 @@ pub struct RealmIntrinsics {
     pub bigint_proto: Option<Handle>,
     /// The shared abstract `%TypedArray%` intrinsic constructor.
     pub typed_array: Option<Handle>,
+    /// The realm's single `%ThrowTypeError%` intrinsic.
+    pub throw_type_error: Option<Handle>,
 }
 
 impl Default for Realm {
@@ -302,6 +310,7 @@ impl Realm {
             native_class_tags: alloc::collections::BTreeMap::new(),
             typed_array_intrinsic: None,
             function_proto_intrinsic: None,
+            throw_type_error_intrinsic: None,
             array_proto_intrinsic: None,
             symbol_proto_intrinsic: None,
             bigint_proto_intrinsic: None,
@@ -354,6 +363,17 @@ impl Realm {
         self.function_proto_intrinsic = Some(handle);
     }
 
+    /// Records the realm's single `%ThrowTypeError%` intrinsic.
+    pub fn set_throw_type_error_intrinsic(&mut self, handle: Handle) {
+        self.throw_type_error_intrinsic = Some(handle);
+    }
+
+    /// The realm's `%ThrowTypeError%` intrinsic, if installed.
+    #[must_use]
+    pub fn throw_type_error_intrinsic(&self) -> Option<Handle> {
+        self.throw_type_error_intrinsic
+    }
+
     /// Records the realm's `%Array.prototype%` intrinsic — the default
     /// `[[Prototype]]` for every dense `Cell::Array`.
     pub fn set_array_proto_intrinsic(&mut self, handle: Handle) {
@@ -383,6 +403,7 @@ impl Realm {
             symbol_proto: self.symbol_proto_intrinsic,
             bigint_proto: self.bigint_proto_intrinsic,
             typed_array: self.typed_array_intrinsic,
+            throw_type_error: self.throw_type_error_intrinsic,
         }
     }
 
@@ -395,6 +416,7 @@ impl Realm {
         self.symbol_proto_intrinsic = s.symbol_proto;
         self.bigint_proto_intrinsic = s.bigint_proto;
         self.typed_array_intrinsic = s.typed_array;
+        self.throw_type_error_intrinsic = s.throw_type_error;
     }
 
     /// Records the realm's `%Symbol.prototype%` intrinsic — the `[[Prototype]]`
@@ -413,6 +435,16 @@ impl Realm {
     #[must_use]
     pub fn typed_array_intrinsic(&self) -> Option<Handle> {
         self.typed_array_intrinsic
+    }
+
+    /// Whether `handle` is the realm's `%Function.prototype%` intrinsic. Unlike
+    /// every other prototype object, `%Function.prototype%` is itself a callable
+    /// function object (its `[[Call]]` accepts any arguments and returns
+    /// `undefined`, and `typeof` / `Object.prototype.toString` classify it as a
+    /// function) even though it is represented as an ordinary object cell.
+    #[must_use]
+    pub fn is_function_proto_intrinsic(&self, handle: Handle) -> bool {
+        self.function_proto_intrinsic == Some(handle)
     }
 
     /// Every live typed-array view whose backing bytes cell is `bytes_handle`.
@@ -3775,7 +3807,8 @@ impl Realm {
                         .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
                         .map(|v| self.to_display_string_seen(v, seen))
                         .unwrap_or_default();
-                    alloc::format!("function {name}() {{ [native code] }}")
+                    let seg = native_fn_name_segment(&name);
+                    alloc::format!("function {seg}() {{ [native code] }}")
                 }
                 Some(Cell::Class { .. }) => {
                     let h = Handle::from_raw(raw);
@@ -3800,7 +3833,8 @@ impl Realm {
                         .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
                         .map(|v| self.to_display_string_seen(v, seen))
                         .unwrap_or_default();
-                    alloc::format!("function {name}() {{ [native code] }}")
+                    let seg = native_fn_name_segment(&name);
+                    alloc::format!("function {seg}() {{ [native code] }}")
                 }
                 Some(Cell::Promise(_)) => "[object Promise]".into(),
                 Some(Cell::Date(ms)) => {
@@ -4208,6 +4242,12 @@ impl Realm {
                 // A bytecode-VM closure is represented as an array tagged with the
                 // reserved `\0vmfn` marker; `typeof` reports it as a function.
                 if self.get_property(h, "\u{0}vmfn").is_some() {
+                    return "function";
+                }
+                // `%Function.prototype%` is itself a callable function object
+                // (`typeof Function.prototype === "function"`) despite being an
+                // ordinary object cell.
+                if self.is_function_proto_intrinsic(h) {
                     return "function";
                 }
                 self.heap.get(h).map_or("undefined", Cell::type_of)
@@ -4663,6 +4703,39 @@ pub(crate) fn date_to_iso(ms: f64) -> alloc::string::String {
         alloc::format!("+{y:06}")
     };
     alloc::format!("{year}-{mo:02}-{d:02}T{h:02}:{min:02}:{s:02}.{milli:03}Z")
+}
+
+/// Whether `s` is a valid ECMAScript `IdentifierName` (approximated with the
+/// Rust Unicode alphabetic/alphanumeric predicates, which suffices for the
+/// Test262 `NativeFunction` syntax matcher). An empty string is not a name.
+fn is_identifier_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c == '$' || c == '_' || c.is_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '$' || c == '_' || c.is_alphanumeric())
+}
+
+/// The `name` segment to emit inside `function <seg>() { [native code] }` for a
+/// function whose engine `name` is given (the engine retains no source text).
+/// Returns the name — optionally keeping a `get `/`set ` accessor prefix — only
+/// when it is a valid `IdentifierName`; otherwise the empty string, so the
+/// synthesized `toString` is always valid `NativeFunction` syntax (a
+/// private-method name like `#f`, a bracketed symbol name, or one with
+/// punctuation cannot appear as an identifier there).
+pub(crate) fn native_fn_name_segment(name: &str) -> &str {
+    if is_identifier_name(name) {
+        return name;
+    }
+    if let Some(rest) = name
+        .strip_prefix("get ")
+        .or_else(|| name.strip_prefix("set "))
+        && is_identifier_name(rest)
+    {
+        return name;
+    }
+    ""
 }
 
 #[cfg(test)]

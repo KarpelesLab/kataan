@@ -4392,6 +4392,10 @@ impl<'a> Interp<'a> {
             self.realm.set_non_configurable_property(thrower_h, "name");
             self.realm
                 .set_non_configurable_property(thrower_h, "length");
+            // Record it as the realm's single canonical `%ThrowTypeError%` so a
+            // strict `arguments` object's `callee` accessor is the *same* function
+            // object (ECMA-262: there is exactly one `%ThrowTypeError%` per realm).
+            self.realm.set_throw_type_error_intrinsic(thrower_h);
             let thrower = NanBox::handle(thrower_h.to_raw());
             for key in ["caller", "arguments"] {
                 self.realm
