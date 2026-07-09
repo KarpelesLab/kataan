@@ -180,9 +180,10 @@ impl<'a> Interp<'a> {
         next: NanBox,
     ) -> Result<Option<NanBox>, ExecError> {
         let res = self.call_with_this(next, NanBox::handle(it.to_raw()), &[])?;
-        let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+        if !self.is_object_value(res) {
             return Err(self.type_error("iterator result is not an object"));
-        };
+        }
+        let rh = Handle::from_raw(res.as_handle().unwrap());
         let done = self.read_member(rh, "done")?;
         if self.realm.truthy(done) {
             return Ok(None);
@@ -1557,9 +1558,10 @@ impl<'a> Interp<'a> {
                 let next_fn = self.read_member(ih, "next")?;
                 let res = self.call_with_this(next_fn, NanBox::handle(ih.to_raw()), &[])?;
                 let res = self.await_value(res)?;
-                let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+                if !self.is_object_value(res) {
                     return Err(self.type_error("iterator result is not an object"));
-                };
+                }
+                let rh = Handle::from_raw(res.as_handle().unwrap());
                 let done = self.read_member(rh, "done")?;
                 if self.realm.truthy(done) {
                     break;
@@ -1636,9 +1638,10 @@ impl<'a> Interp<'a> {
         let mut out = Vec::new();
         loop {
             let res = self.call_with_this(next_fn, iterator, &[])?;
-            let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+            if !self.is_object_value(res) {
                 return Err(self.type_error("iterator result is not an object"));
-            };
+            }
+            let rh = Handle::from_raw(res.as_handle().unwrap());
             let done = self.read_member(rh, "done")?;
             if self.realm.truthy(done) {
                 break;
@@ -1664,7 +1667,16 @@ impl<'a> Interp<'a> {
         {
             return self.iterate_values(prim);
         }
-        if let Some(elems) = self.realm.elements_vec(h) {
+        if let Some(mut elems) = self.realm.elements_vec(h) {
+            // The %ArrayIteratorPrototype% `next` does `Get(array, index)`, so a hole
+            // reads as `undefined` (not the internal hole sentinel). Normalize so
+            // for-of / spread / `Array.from` over a sparse array yield real
+            // `undefined` values.
+            for e in &mut elems {
+                if e.is_hole() {
+                    *e = NanBox::undefined();
+                }
+            }
             return Ok(elems);
         }
         if let Some(bytes) = self.realm.string_bytes(h) {
@@ -1743,9 +1755,10 @@ impl<'a> Interp<'a> {
             loop {
                 let next_fn = self.read_member(ih, "next")?;
                 let res = self.call_with_this(next_fn, iterator, &[])?;
-                let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+                if !self.is_object_value(res) {
                     return Err(self.type_error("iterator result is not an object"));
-                };
+                }
+                let rh = Handle::from_raw(res.as_handle().unwrap());
                 let done = self.read_member(rh, "done")?;
                 if self.realm.truthy(done) {
                     break;
@@ -1958,7 +1971,7 @@ impl<'a> Interp<'a> {
                 let iterator = self.call_with_this(f, v, &[])?;
                 return match iterator.as_handle().map(Handle::from_raw) {
                     Some(ih) => Ok(Some(ih)),
-                    None => Err(ExecError::Throw(self.new_str("iterator is not an object"))),
+                    None => Err(self.type_error("iterator is not an object")),
                 };
             }
             return Ok(None);
@@ -1981,7 +1994,7 @@ impl<'a> Interp<'a> {
         let iterator = self.call_with_this(f, v, &[])?;
         match iterator.as_handle().map(Handle::from_raw) {
             Some(ih) => Ok(Some(ih)),
-            None => Err(ExecError::Throw(self.new_str("iterator is not an object"))),
+            None => Err(self.type_error("iterator is not an object")),
         }
     }
 

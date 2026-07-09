@@ -728,11 +728,10 @@ impl<'a> Interp<'a> {
                         for _ in 0..needed {
                             let next_fn = self.read_member(ih, "next")?;
                             let res = self.call_with_this(next_fn, iterator, &[])?;
-                            let Some(rh) = res.as_handle().map(Handle::from_raw) else {
-                                return Err(ExecError::Throw(
-                                    self.new_str("iterator result is not an object"),
-                                ));
-                            };
+                            if !self.is_object_value(res) {
+                                return Err(self.type_error("iterator result is not an object"));
+                            }
+                            let rh = Handle::from_raw(res.as_handle().unwrap());
                             let done = self.read_member(rh, "done")?;
                             if self.realm.truthy(done) {
                                 exhausted = true;
@@ -867,15 +866,20 @@ impl<'a> Interp<'a> {
         use crate::ast::ForLeft;
         let label = self.pending_label.take();
         let iterator = NanBox::handle(ih.to_raw());
+        // `GetIterator` reads `next` **once** (`iteratorRecord.[[NextMethod]]`) and
+        // reuses it for every `IteratorStep`; re-reading it per step would re-run a
+        // `next` accessor (spec: it is accessed only during the iteration prologue).
+        let next_fn = self.read_member(ih, "next")?;
         let mut v = NanBox::undefined();
         loop {
-            let next_fn = self.read_member(ih, "next")?;
             let res = self.call_with_this(next_fn, iterator, &[])?;
-            let Some(rh) = res.as_handle().map(Handle::from_raw) else {
-                return Err(ExecError::Throw(
-                    self.new_str("iterator result is not an object"),
-                ));
-            };
+            // `IteratorNext`: a non-Object result is a TypeError. A string / symbol /
+            // BigInt is heap-backed but *not* an Object, so guard with `is_object_value`
+            // rather than a bare `as_handle` (which would accept those primitives).
+            if !self.is_object_value(res) {
+                return Err(self.type_error("iterator result is not an object"));
+            }
+            let rh = Handle::from_raw(res.as_handle().unwrap());
             let done = self.read_member(rh, "done")?;
             if self.realm.truthy(done) {
                 return Ok(Flow::Normal(v));
@@ -1010,11 +1014,10 @@ impl<'a> Interp<'a> {
     ) -> Result<Option<NanBox>, ExecError> {
         let next_fn = self.read_member(ih, "next")?;
         let res = self.call_with_this(next_fn, iterator, &[])?;
-        let Some(rh) = res.as_handle().map(Handle::from_raw) else {
-            return Err(ExecError::Throw(
-                self.new_str("iterator result is not an object"),
-            ));
-        };
+        if !self.is_object_value(res) {
+            return Err(self.type_error("iterator result is not an object"));
+        }
+        let rh = Handle::from_raw(res.as_handle().unwrap());
         let done = self.read_member(rh, "done")?;
         if self.realm.truthy(done) {
             return Ok(None);
@@ -1041,6 +1044,41 @@ impl<'a> Interp<'a> {
         let mut exhausted = false;
         let result: Result<(), ExecError> = 'pat: {
             for el in elements {
+                // `AssignmentRestElement` (`...target`): if `target` is not itself an
+                // Array/Object literal, its reference is evaluated *first* (before any
+                // iterator step) — so `[...obj[throws()]]` throws before pulling a value.
+                if let ArrayElement::Spread(e) = el {
+                    let target = if matches!(e, Expr::Array { .. } | Expr::Object { .. }) {
+                        None
+                    } else {
+                        match self.eval_assign_ref(e) {
+                            Ok(r) => Some(r),
+                            Err(err) => break 'pat Err(err),
+                        }
+                    };
+                    // Collect the remaining values into a fresh array (each a real
+                    // `IteratorStep`, so `next` side effects are observed).
+                    let mut rest = Vec::new();
+                    while !exhausted {
+                        match self.dstr_iter_step(ih, iterator) {
+                            Ok(Some(v)) => rest.push(v),
+                            Ok(None) => exhausted = true,
+                            Err(err) => {
+                                exhausted = true;
+                                break 'pat Err(err);
+                            }
+                        }
+                    }
+                    let arr = NanBox::handle(self.realm.new_array(rest).to_raw());
+                    let assigned = match target {
+                        Some(r) => self.set_assign_ref(r, arr),
+                        None => self.assign_destructure(e, arr),
+                    };
+                    if let Err(err) = assigned {
+                        break 'pat Err(err);
+                    }
+                    continue;
+                }
                 // For a simple leaf target (`a`, `obj[k]`) the reference is evaluated
                 // before the step, so its side effects run first.
                 let target = match el {
@@ -1068,7 +1106,7 @@ impl<'a> Interp<'a> {
                         Some(r) => self.set_assign_ref(r, v),
                         None => self.assign_destructure(e, v),
                     },
-                    ArrayElement::Spread(_) => unreachable!("has_rest guard"),
+                    ArrayElement::Spread(_) => unreachable!("handled above"),
                 };
                 if let Err(e) = assigned {
                     break 'pat Err(e);
@@ -1101,16 +1139,14 @@ impl<'a> Interp<'a> {
     ) -> Result<(), ExecError> {
         match target {
             Expr::Array { elements, .. } => {
-                let has_rest = elements
-                    .iter()
-                    .any(|e| matches!(e, ArrayElement::Spread(_)));
-                // Without a rest target, a *user* iterator is pulled lazily for only
-                // the values the pattern needs, then closed (`IteratorClose`) — so
-                // `[a, b] = infiniteIterator` terminates and `return()` runs.
-                // (Mirrors the declaration path in `bind_pattern`.) Built-in
-                // iterables (arrays/strings/Sets/generators) take the eager path.
-                if !has_rest
-                    && let Some(ih) = self.for_of_get_iterator(value)?
+                // A *user* iterator is driven by the interleaved iterator protocol —
+                // values pulled one `IteratorStep` at a time (so `[a, b] =
+                // infiniteIterator` terminates), a `...rest` collected per spec with
+                // its target reference evaluated first, and `IteratorClose`/`return()`
+                // run at the right moment. (Mirrors the declaration path in
+                // `bind_pattern`.) Built-in iterables (arrays/strings/Sets) and
+                // generators take the eager path.
+                if let Some(ih) = self.for_of_get_iterator(value)?
                     && self.realm.get_property(ih, GEN_BUF).is_none()
                 {
                     // Real user iterator: interleave `next()`, target evaluation and

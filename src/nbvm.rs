@@ -868,8 +868,15 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
 /// full iterator protocol (including iterator-close and user `.next()`).
 fn vm_iterable_values(ctx: &mut Ctx, v: NanBox) -> Option<Vec<NanBox>> {
     let h = v.as_handle().map(Handle::from_raw)?;
-    // A real array or typed-array view: snapshot its elements.
-    if let Some(elems) = ctx.realm.elements_vec(h) {
+    // A real array or typed-array view: snapshot its elements. A hole reads as
+    // `undefined` (the array iterator does `Get(array, index)`), not the internal
+    // hole sentinel.
+    if let Some(mut elems) = ctx.realm.elements_vec(h) {
+        for e in &mut elems {
+            if e.is_hole() {
+                *e = NanBox::undefined();
+            }
+        }
         return Some(elems);
     }
     // A string iterates one entry per Unicode code point (a lone surrogate is a
