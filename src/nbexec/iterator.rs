@@ -1609,6 +1609,48 @@ impl<'a> Interp<'a> {
         Ok(None)
     }
 
+    /// Drains an **already-obtained** iterator object (the result of calling
+    /// `source[@@iterator]()`) to the `Vec` of its values, propagating a throwing
+    /// `next` / `next().value` (`IteratorStep` / `IteratorValue`). A generator
+    /// iterator drains from its value buffer. Unlike [`Self::iterate_values`], this
+    /// does *not* re-read `@@iterator` — the caller has already invoked it (so a
+    /// `GetMethod`/`@@iterator`-getter side effect is observed exactly once, as
+    /// `TypedArray.from`/`Array.from` require).
+    pub(crate) fn drain_iterator_values(
+        &mut self,
+        iterator: NanBox,
+    ) -> Result<Vec<NanBox>, ExecError> {
+        let Some(ih) = iterator.as_handle().map(Handle::from_raw) else {
+            return Err(self.type_error("iterator is not an object"));
+        };
+        // A generator iterator (its `next` is a built-in, not a readable property)
+        // is drained directly from its buffer.
+        if self.realm.get_property(ih, GEN_BUF).is_some() {
+            return self.iterate_values(iterator);
+        }
+        // `GetIteratorFromMethod` reads `next` **once** (`iteratorRecord.[[NextMethod]]`)
+        // and reuses it for every `IteratorStep` — re-reading it per step would rerun a
+        // `next` *accessor* (which may hand back a fresh, self-resetting iterator each
+        // read, i.e. never terminate).
+        let next_fn = self.read_member(ih, "next")?;
+        let mut out = Vec::new();
+        loop {
+            let res = self.call_with_this(next_fn, iterator, &[])?;
+            let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+                return Err(self.type_error("iterator result is not an object"));
+            };
+            let done = self.read_member(rh, "done")?;
+            if self.realm.truthy(done) {
+                break;
+            }
+            out.push(self.read_member(rh, "value")?);
+            if out.len() > GEN_CAP {
+                return Err(self.type_error("iterator did not terminate"));
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn iterate_values(&mut self, v: NanBox) -> Result<Vec<NanBox>, ExecError> {
         let Some(h) = v.as_handle().map(Handle::from_raw) else {
             let m = self.new_str("is not iterable");
@@ -1785,23 +1827,6 @@ impl<'a> Interp<'a> {
         // A class instance whose `[Symbol.iterator]` is defined with a computed
         // key may not surface as a readable prototype property; scan the class body.
         self.class_iterator_method(h)
-    }
-
-    /// Whether `v` is iterable — a string, array, typed array, or any object with
-    /// a resolvable `[Symbol.iterator]` method. Used to distinguish a genuine
-    /// throw inside the iterator protocol (propagate) from a non-iterable
-    /// array-like source (fall back to index reads).
-    pub(crate) fn value_is_iterable(&mut self, v: NanBox) -> bool {
-        let Some(h) = v.as_handle().map(Handle::from_raw) else {
-            return false;
-        };
-        if self.realm.string_value(h).is_some()
-            || self.realm.is_array(h)
-            || self.realm.typed_kind(h).is_some()
-        {
-            return true;
-        }
-        matches!(self.find_iterator_fn(h), Ok(Some(_)))
     }
 
     /// The keys iterated by `for-in`: object property names or array indices,

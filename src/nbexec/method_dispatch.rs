@@ -34,11 +34,12 @@ impl<'a> Interp<'a> {
         // ValidateTypedArray: the data-accessing `%TypedArray%.prototype` methods
         // throw a TypeError up front if the backing buffer is detached (the view was
         // length-0'd on detach, so without this they would silently operate on an
-        // empty array). `subarray` (builds a fresh view), the iterator factories
-        // (`values`/`keys`/`entries`), and `toString` (generic) are exempt.
+        // empty array). `subarray` (builds a fresh view) is exempt. `toString` is
+        // *not* exempt: it is `Array.prototype.toString`, which delegates to
+        // `%TypedArray%.prototype.join`, so ValidateTypedArray applies to it too.
         if let Some(h) = recv.as_handle().map(Handle::from_raw)
             && self.realm.typed_kind(h).is_some()
-            && !matches!(method, "subarray" | "toString" | "constructor")
+            && !matches!(method, "subarray" | "constructor")
             && TYPED_ARRAY_PROTO_METHODS.iter().any(|(n, _)| *n == method)
             && self.typed_array_detached(h)
         {
@@ -52,7 +53,7 @@ impl<'a> Interp<'a> {
         // guard above.
         if let Some(h) = recv.as_handle().map(Handle::from_raw)
             && self.realm.typed_kind(h).is_some()
-            && !matches!(method, "subarray" | "toString" | "constructor")
+            && !matches!(method, "subarray" | "constructor")
             && TYPED_ARRAY_PROTO_METHODS.iter().any(|(n, _)| *n == method)
             && self.realm.typed_array_out_of_bounds(h)
         {
@@ -610,74 +611,22 @@ impl<'a> Interp<'a> {
                 .contains(&id)
             && matches!(method, "of" | "from")
         {
-            let kind = (id - N_TYPED_ARRAY_BASE) as u8;
-            // `from`'s optional map callback must be callable if present (a
-            // TypeError otherwise), checked before iterating the source.
-            let mapfn = if method == "from" {
-                args.get(1).copied()
+            // `Int8Array.of/from` share the same spec-faithful path as
+            // `%TypedArray%.of/from` (the constructor `handle` is the `this` value);
+            // routing both through one helper keeps the two engine tiers in step and
+            // gets the `GetMethod(@@iterator)` / `TypedArrayCreate` ordering right.
+            let ctor = NanBox::handle(handle.to_raw());
+            let result = if method == "of" {
+                self.typed_array_of(ctor, args)?
             } else {
-                None
+                self.typed_array_from(
+                    ctor,
+                    arg(0),
+                    args.get(1).copied().unwrap_or(NanBox::undefined()),
+                    args.get(2).copied().unwrap_or(NanBox::undefined()),
+                )?
             };
-            let has_mapfn = mapfn.is_some_and(|m| !matches!(m.unpack(), Unpacked::Undefined));
-            if has_mapfn {
-                self.require_callable(mapfn.unwrap(), "TypedArray.from mapfn")?;
-            }
-            // `from` iterates the source (an iterator error propagates, not
-            // swallowed); a non-iterable array-like is read by index. `of` takes
-            // its variadic args directly.
-            let mut items: Vec<NanBox> = if method == "of" {
-                args.to_vec()
-            } else {
-                match self.iterate_values(arg(0)) {
-                    Ok(v) => v,
-                    Err(ExecError::Throw(t)) => {
-                        // A genuine throw from the iterator protocol propagates; a
-                        // non-iterable source falls back to the array-like path.
-                        if self.value_is_iterable(arg(0)) {
-                            return Err(ExecError::Throw(t));
-                        }
-                        let src = arg(0);
-                        let obj = self.coerce_to_object(src);
-                        let Some(h) = obj.as_handle().map(Handle::from_raw) else {
-                            return Ok(Some(self.typed_like(handle, Vec::new())));
-                        };
-                        let len_val = self.read_member(h, "length")?;
-                        let len_n = self.coerce_to_integer_or_infinity(len_val)?;
-                        let len = len_n.clamp(0.0, 9_007_199_254_740_991.0) as usize;
-                        let mut out = Vec::with_capacity(len.min(1 << 20));
-                        for i in 0..len {
-                            out.push(self.read_member(h, &alloc::format!("{i}"))?);
-                        }
-                        out
-                    }
-                    Err(e) => return Err(e),
-                }
-            };
-            if has_mapfn {
-                let mapfn = mapfn.unwrap();
-                let this_arg = args.get(2).copied().unwrap_or(NanBox::undefined());
-                for (i, v) in items.iter_mut().enumerate() {
-                    *v = self.call_with_this(mapfn, this_arg, &[*v, NanBox::number(i as f64)])?;
-                }
-            }
-            // Allocate a backing buffer and view it; each item is coerced on write.
-            let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
-            let buf = self.make_array_buffer(items.len() * elem_size);
-            let bytes_h = self.array_buffer_bytes(buf).unwrap();
-            let view = self
-                .realm
-                .new_typed_array(bytes_h, buf, 0, items.len(), kind);
-            // Each element is ToNumber'd (or ToBigInt'd) per [[Set]] before the
-            // bulk write — a Symbol / uncoercible value is a TypeError (a poisoned
-            // `valueOf` propagates), not the silent NaN `typed_set_from_numbers`
-            // would store.
-            let items = self.coerce_typed_elements(view, &items)?;
-            self.realm.typed_set_from_numbers(view, 0, &items);
-            // Link the result's `[[Prototype]]` to the constructor's `.prototype`
-            // (`Int8Array.of(...)`'s result is an `Int8Array` instance), so
-            // `result.constructor`/`getPrototypeOf(result)` resolve.
-            self.link_view_proto_to_ctor(view, NanBox::handle(handle.to_raw()));
-            return Ok(Some(NanBox::handle(view.to_raw())));
+            return Ok(Some(result));
         }
         // `Date.parse(str)` → epoch ms (or NaN) by ISO parsing.
         if self.realm.native_at(handle) == Some(N_DATE) && method == "parse" {
@@ -2928,10 +2877,17 @@ impl<'a> Interp<'a> {
                             return Ok(Some(NanBox::undefined()));
                         }
                     }
-                    // Array-like source: ToObject(source), then ToLength(src.length),
-                    // bounds-check, then per-element Get + coerce + write (so each
-                    // value's ToNumber/ToBigInt side effects and throws run in order,
-                    // and values are not cached).
+                    // Array-like source: `src = ? ToObject(source)` — a `null`/
+                    // `undefined` source is a TypeError (the engine's `coerce_to_object`
+                    // otherwise substitutes a fresh empty object).
+                    if matches!(src_box.unpack(), Unpacked::Null | Unpacked::Undefined) {
+                        return Err(self.type_error(
+                            "TypedArray.prototype.set source cannot be converted to an object",
+                        ));
+                    }
+                    // Then ToLength(src.length), bounds-check, then per-element Get +
+                    // coerce + write (so each value's ToNumber/ToBigInt side effects and
+                    // throws run in order, and values are not cached).
                     let src_obj = self.coerce_to_object(src_box);
                     let Some(src) = src_obj.as_handle().map(Handle::from_raw) else {
                         return Ok(Some(NanBox::undefined()));

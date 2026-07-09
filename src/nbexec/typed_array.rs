@@ -133,6 +133,177 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `%TypedArray%.from(source, mapfn, thisArg)` (23.2.2.1), generic over the
+    /// `this` constructor `ctor` (so `Int8Array.from(...)` and `%TypedArray%.from`
+    /// share one spec-faithful path). Order: IsConstructor(ctor) → mapfn callable →
+    /// `GetMethod(source, @@iterator)` (invoking a throwing getter) → iterator path
+    /// (drain to a list, then `TypedArrayCreate`, then map+Set each) or array-like
+    /// path (`ToObject`, `LengthOfArrayLike`, `TypedArrayCreate` *before* visiting
+    /// elements, then per-index Get/map/Set). Every step propagates abruptly.
+    pub(crate) fn typed_array_from(
+        &mut self,
+        ctor: NanBox,
+        source: NanBox,
+        mapfn: NanBox,
+        this_arg: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        if !self.is_constructor_value(ctor) {
+            return Err(self.type_error("TypedArray.from requires a constructor this"));
+        }
+        let has_mapfn = !matches!(mapfn.unpack(), Unpacked::Undefined);
+        if has_mapfn
+            && !mapfn
+                .as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+        {
+            return Err(self.type_error("TypedArray.from mapfn is not a function"));
+        }
+        // Step 4: `usingIterator = ? GetMethod(source, @@iterator)` — reads the
+        // property (invoking an accessor, so a throwing getter propagates);
+        // undefined/null → array-like path; a present non-callable is a TypeError.
+        let iter_sym = self.well_known_symbol("iterator");
+        let iter_key = self.member_key(iter_sym);
+        let using_iterator = match source.as_handle().map(Handle::from_raw) {
+            Some(sh) => {
+                let m = self.read_member(sh, &iter_key)?;
+                if matches!(m.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    None
+                } else if !m
+                    .as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    return Err(self.type_error("source is not iterable"));
+                } else {
+                    Some(m)
+                }
+            }
+            None => None,
+        };
+        let target = if let Some(method) = using_iterator {
+            // Steps 5.a–5.c: drain the iterator to a list first, then
+            // `TypedArrayCreate(C, « len »)` — build the target after collecting.
+            let iterator = self.call_with_this(method, source, &[])?;
+            let values = self.drain_iterator_values(iterator)?;
+            let target = self.typed_array_create(ctor, values.len())?;
+            // Step 5.d: map then `Set` each element, interleaved.
+            for (k, v) in values.into_iter().enumerate() {
+                let mapped = if has_mapfn {
+                    self.call_with_this(mapfn, this_arg, &[v, NanBox::number(k as f64)])?
+                } else {
+                    v
+                };
+                self.typed_array_set_index_coerced(target, k, mapped)?;
+            }
+            target
+        } else {
+            // Steps 7–13 (array-like): `ToObject(source)`, then
+            // `len = ? LengthOfArrayLike(arrayLike)`, `TypedArrayCreate(C, «len»)`
+            // *before* visiting elements, then per-index Get / map / Set.
+            let obj = self.coerce_to_object(source);
+            let Some(oh) = obj.as_handle().map(Handle::from_raw) else {
+                return Err(self.type_error("TypedArray.from source is not an object"));
+            };
+            let len_v = self.read_member(oh, "length")?;
+            let len_f = self.coerce_to_integer_or_infinity(len_v)?;
+            let len = if len_f <= 0.0 {
+                0
+            } else if len_f > self.realm.limits.max_array_len as f64 {
+                let m = self.new_str("Invalid typed array length");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            } else {
+                len_f as usize
+            };
+            let target = self.typed_array_create(ctor, len)?;
+            for k in 0..len {
+                let kv = self.read_member(oh, &alloc::format!("{k}"))?;
+                let mapped = if has_mapfn {
+                    self.call_with_this(mapfn, this_arg, &[kv, NanBox::number(k as f64)])?
+                } else {
+                    kv
+                };
+                self.typed_array_set_index_coerced(target, k, mapped)?;
+            }
+            target
+        };
+        self.link_view_proto_to_ctor(target, ctor);
+        Ok(NanBox::handle(target.to_raw()))
+    }
+
+    /// `%TypedArray%.of(...items)` (23.2.2.2), generic over the `this` constructor
+    /// `ctor`: `TypedArrayCreate(C, « len »)` (validating a custom `this`), then each
+    /// item coerced to the element kind and written through.
+    pub(crate) fn typed_array_of(
+        &mut self,
+        ctor: NanBox,
+        items: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        if !self.is_constructor_value(ctor) {
+            return Err(self.type_error("TypedArray.of requires a constructor this"));
+        }
+        let vh = self.typed_array_create(ctor, items.len())?;
+        self.guard_view_immutable(vh)?;
+        let nums = self.coerce_typed_elements(vh, items)?;
+        self.realm.typed_set_from_numbers(vh, 0, &nums);
+        self.link_view_proto_to_ctor(vh, ctor);
+        Ok(NanBox::handle(vh.to_raw()))
+    }
+
+    /// `TypedArrayCreate(constructor, « length »)` (23.2.4.2): `Construct(C, «len»)`,
+    /// then ValidateTypedArray (the result must have a `[[TypedArrayName]]` slot and a
+    /// non-detached buffer) and — since the sole argument is the Number `len` — its
+    /// `[[ArrayLength]]` must be ≥ `len`. Used by `TypedArray.from`/`of` so a custom
+    /// `this` constructor that returns a non-typed-array, a detached, or an
+    /// undersized instance is a TypeError.
+    pub(crate) fn typed_array_create(
+        &mut self,
+        ctor: NanBox,
+        len: usize,
+    ) -> Result<Handle, ExecError> {
+        let result = self.construct(ctor, &[NanBox::number(len as f64)])?;
+        let Some(th) = result.as_handle().map(Handle::from_raw) else {
+            return Err(self.type_error("TypedArray constructor did not return an object"));
+        };
+        let Some(alen) = self.realm.typed_len(th) else {
+            return Err(self.type_error("TypedArray constructor did not return a TypedArray"));
+        };
+        if self.typed_array_detached(th) {
+            return Err(self.type_error("TypedArray constructor returned a detached typed array"));
+        }
+        if alen < len {
+            return Err(self.type_error("TypedArray constructor result is too small"));
+        }
+        // `TypedArrayCreateFromConstructor(C, args, write)`: `from`/`of` populate the
+        // result, so a view over an *immutable* buffer is rejected here — before any
+        // source element is read/mapped (the write would otherwise be the first thing
+        // to fail).
+        self.guard_view_immutable(th)?;
+        Ok(th)
+    }
+
+    /// `Set(typedArray, index, value, true)` for an in-range integer index during
+    /// `TypedArray.from`/`of` element population: coerces `value` to the element kind
+    /// (ToNumber / ToBigInt — an abrupt `valueOf` propagates and interrupts
+    /// population), rejects a write through an immutable buffer, then writes through
+    /// the shared bytes when the index is still valid.
+    pub(crate) fn typed_array_set_index_coerced(
+        &mut self,
+        target: Handle,
+        k: usize,
+        value: NanBox,
+    ) -> Result<(), ExecError> {
+        let coerced = if self.realm.typed_kind(target).is_some_and(is_bigint_kind) {
+            self.coerce_typed_array_write(target, value)?
+        } else {
+            self.coerce_to_number(value)?
+        };
+        self.guard_view_immutable(target)?;
+        if !self.typed_array_detached(target) && self.realm.typed_len(target).is_some_and(|l| k < l)
+        {
+            self.realm.set_element(target, k, coerced);
+        }
+        Ok(())
+    }
+
     /// `subarray`'s TypedArraySpeciesCreate(O, « buffer, beginByteOffset,
     /// newLength »). Returns `Some(view)` when a *custom* `Symbol.species`
     /// constructor is used (constructing `new species(buffer, off, len)`);
@@ -664,25 +835,24 @@ impl<'a> Interp<'a> {
     /// `result.constructor`, `Object.getPrototypeOf(result)`, and inherited members
     /// resolve. (Typed-array views are non-object cells, so the proto lives in the
     /// realm's `native_protos` side table.)
-    pub(crate) fn link_typed_array_proto(&mut self, view: Handle, kind: u8, callee: NanBox) {
-        // A `newTarget` distinct from the callee (a subclass via `super()`, a
-        // `Reflect.construct` newTarget, or `TA.of`/`from` with a subclass) supplies
-        // the view's `[[Prototype]]` from its own `.prototype` — resolved through
-        // `constructor_prototype` so a class / function newTarget (whose prototype
-        // is not a plain aux property) is handled. Otherwise the kind's intrinsic.
-        let proto = self
-            .reflect_new_target
-            .filter(|nt| nt.as_handle() != callee.as_handle())
-            .and_then(|nt| nt.as_handle())
-            .map(Handle::from_raw)
-            .and_then(|nt| self.newtarget_object_proto(nt))
-            .or_else(|| {
-                let kind_name = TYPED_ARRAY_KINDS[kind as usize].0;
-                self.intrinsic_proto(kind_name)
-            });
-        if let Some(proto) = proto {
-            self.realm.set_native_proto(view, proto);
-        }
+    /// `GetPrototypeFromConstructor(newTarget, %TAKind.prototype%)` for the
+    /// typed-array constructor, run at *AllocateTypedArray* time — i.e. **before**
+    /// any argument coercion. Unlike a raw `get_property` read of the stored
+    /// `prototype` (which cannot observe a throwing accessor), this performs a real
+    /// `Get(newTarget, "prototype")`, invoking an
+    /// own `prototype` getter and propagating an abrupt completion. It is only
+    /// consulted when `newTarget` differs from the callee (a subclass `super()`, a
+    /// `Reflect.construct` newTarget). Returns the resolved object prototype, or the
+    /// kind's intrinsic default when `newTarget`'s `prototype` is a non-object.
+    pub(crate) fn typed_newtarget_proto(
+        &mut self,
+        kind: u8,
+        callee: NanBox,
+    ) -> Result<Option<Handle>, ExecError> {
+        let kind_name = TYPED_ARRAY_KINDS[kind as usize].0;
+        let default = self.intrinsic_proto(kind_name);
+        let nt = self.reflect_new_target.unwrap_or(callee);
+        self.instance_proto_checked(nt, callee, default)
     }
 
     /// Whether the typed-array view at `handle` is backed by a detached buffer

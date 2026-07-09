@@ -1652,6 +1652,28 @@ impl Realm {
             .unwrap_or_default()
     }
 
+    /// All raw own keys (including non-enumerable and the `\0sym:` symbol names)
+    /// held in a handle's **auxiliary** object — the side store where a non-object
+    /// cell (typed array, array, function) keeps its named/symbol properties. Empty
+    /// if the handle has no aux object. Complements [`Self::object_all_keys`], which
+    /// only sees keys on a genuine object *cell*: these two together give the full
+    /// own-key set for `[[OwnPropertyKeys]]` on an integer-indexed exotic / array /
+    /// function whose symbol keys would otherwise be dropped.
+    #[must_use]
+    pub fn aux_all_keys(&self, handle: Handle) -> Vec<alloc::string::String> {
+        self.aux_props
+            .get(&handle.to_raw())
+            .and_then(|aux| self.heap.get(*aux))
+            .and_then(Cell::as_object)
+            .map(|obj| {
+                obj.all_keys()
+                    .iter()
+                    .map(|s| alloc::string::String::from(*s))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// All own property keys (data and accessor, including non-enumerable) —
     /// for reflection that ignores enumerability (`getOwnPropertySymbols`).
     #[must_use]
@@ -1899,10 +1921,15 @@ impl Realm {
             }
             return true;
         }
-        // A callable cell (function / native / bound native / class) or a dense
-        // array has no inline object part; record its `[[Prototype]]` override in
-        // the side table so `Object.getPrototypeOf` reflects it.
-        if self.is_callable_cell(handle) || matches!(self.heap.get(handle), Some(Cell::Array(_))) {
+        // A callable cell (function / native / bound native / class), a dense
+        // array, or a typed-array view has no inline object part; record its
+        // `[[Prototype]]` override in the side table so `Object.getPrototypeOf`
+        // reflects it (and `[[HasProperty]]`/`[[Get]]` walk the new chain). Typed
+        // arrays already store their intrinsic proto here via `set_native_proto`.
+        if self.is_callable_cell(handle)
+            || matches!(self.heap.get(handle), Some(Cell::Array(_)))
+            || self.typed_kind(handle).is_some()
+        {
             match proto {
                 Some(p) => {
                     self.native_protos.insert(handle.to_raw(), p);
@@ -2739,7 +2766,7 @@ impl Realm {
     /// slot — or `None` if `handle` is not a String object. Used to recognize a
     /// String exotic object's own `length` and index (`"0".."length-1"`)
     /// properties.
-    fn string_object_len(&self, handle: Handle) -> Option<usize> {
+    pub(crate) fn string_object_len(&self, handle: Handle) -> Option<usize> {
         let sh = match self.get_property(handle, "\u{0}prim") {
             Some(prim) => Handle::from_raw(prim.as_handle()?),
             None => handle,

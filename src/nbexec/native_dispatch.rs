@@ -397,8 +397,8 @@ impl<'a> Interp<'a> {
                 // `RegExp(re)` (no flags) where `re` is a RegExp with the default
                 // constructor returns `re` itself.
                 if matches!(flags_arg.unpack(), Unpacked::Undefined)
+                    && self.is_regexp_arg(pattern)
                     && let Some(ph) = pattern.as_handle().map(Handle::from_raw)
-                    && self.realm.regexp_at(ph).is_some()
                 {
                     let ctor = self.current.get("RegExp").unwrap_or(NanBox::undefined());
                     let ctor_of = self.read_member(ph, "constructor")?;
@@ -911,31 +911,14 @@ impl<'a> Interp<'a> {
                 NanBox::handle(self.realm.new_array(boxed).to_raw())
             }
             N_OBJECT_FREEZE => {
-                // A primitive argument is returned unchanged. A proxy runs the full
-                // SetIntegrityLevel via its traps (throwing if it reports failure);
-                // an ordinary object takes the flag-based fast path.
-                if let Some(raw) = arg(0).as_handle().filter(|_| self.is_object_value(arg(0))) {
-                    let h = Handle::from_raw(raw);
-                    if self.realm.proxy_at(h).is_some() {
-                        if !self.set_integrity_level(h, true)? {
-                            return Err(self.type_error("Object.freeze failed"));
-                        }
-                    } else {
-                        self.realm.freeze_object(h);
-                    }
+                if let Some(raw) = arg(0).as_handle() {
+                    self.realm.freeze_object(Handle::from_raw(raw));
                 }
                 arg(0) // returns the (now frozen) object
             }
             N_OBJECT_SEAL => {
-                if let Some(raw) = arg(0).as_handle().filter(|_| self.is_object_value(arg(0))) {
-                    let h = Handle::from_raw(raw);
-                    if self.realm.proxy_at(h).is_some() {
-                        if !self.set_integrity_level(h, false)? {
-                            return Err(self.type_error("Object.seal failed"));
-                        }
-                    } else {
-                        self.realm.seal_object(h);
-                    }
+                if let Some(raw) = arg(0).as_handle() {
+                    self.realm.seal_object(Handle::from_raw(raw));
                 }
                 arg(0)
             }
@@ -1170,22 +1153,35 @@ impl<'a> Interp<'a> {
                         && let Some(n) = canonical_numeric_index(&key)
                     {
                         let is_neg_zero = n == 0.0 && n.is_sign_negative();
-                        let valid = !self.typed_array_detached(h)
-                            && !is_neg_zero
-                            && n == (n as i64) as f64
-                            && n >= 0.0
+                        let index_ok = !is_neg_zero && n == (n as i64) as f64 && n >= 0.0;
+                        let valid = index_ok
+                            && !self.typed_array_detached(h)
                             && self
                                 .realm
                                 .typed_len(h)
                                 .is_some_and(|len| (n as usize) < len);
                         let same_receiver = receiver.as_handle() == Some(h.to_raw());
                         if same_receiver {
-                            if valid {
-                                self.set_element_checked(h, n as usize, value)?;
-                            } else if self.realm.typed_kind(h).is_some_and(is_bigint_kind) {
-                                let _ = self.coerce_to_bigint(value)?;
+                            // IntegerIndexedElementSet: coerce the value FIRST (its
+                            // `valueOf`/`toString` side effects — which may detach or
+                            // resize the buffer — run unconditionally), then write only
+                            // if the index is *still* a valid integer index. A write
+                            // whose coercion detached the buffer is dropped, but the
+                            // whole [[Set]] still reports success (`true`).
+                            let coerced = if self.realm.typed_kind(h).is_some_and(is_bigint_kind) {
+                                self.coerce_typed_array_write(h, value)?
                             } else {
-                                let _ = self.coerce_to_number(value)?;
+                                self.coerce_to_number(value)?
+                            };
+                            let still_valid = index_ok
+                                && !self.typed_array_detached(h)
+                                && self
+                                    .realm
+                                    .typed_len(h)
+                                    .is_some_and(|len| (n as usize) < len);
+                            if still_valid {
+                                self.guard_view_immutable(h)?;
+                                self.realm.set_element(h, n as usize, coerced);
                             }
                             return Ok(NanBox::boolean(true));
                         }
@@ -1534,16 +1530,17 @@ impl<'a> Interp<'a> {
                 if matches!(arg(0).unpack(), Unpacked::Null | Unpacked::Undefined) {
                     return Err(self.type_error("Object.values called on null or undefined"));
                 }
-                // An ordinary object or a proxy: spec-exact EnumerableOwnProperties
-                // (one key snapshot; live per-key GetOwnProperty + Get, so getters
-                // that mutate later keys — and proxy traps — are observed in order).
-                if let Some(raw) = arg(0).as_handle() {
-                    let h0 = Handle::from_raw(raw);
-                    if self.realm.object_keys(h0).is_some() || self.realm.proxy_at(h0).is_some() {
-                        let kv = self.enumerable_own_kv(h0)?;
-                        let vals: Vec<NanBox> = kv.into_iter().map(|(_, v)| v).collect();
-                        return Ok(NanBox::handle(self.realm.new_array(vals).to_raw()));
+                // A proxy with an `ownKeys` trap: its enumerable keys, each value
+                // read through the proxy (so a `get` trap fires).
+                if let Some(raw) = arg(0).as_handle()
+                    && let Some(keys) = self.proxy_own_enumerable_keys(Handle::from_raw(raw))?
+                {
+                    let ph = Handle::from_raw(raw);
+                    let mut vals = Vec::with_capacity(keys.len());
+                    for k in keys {
+                        vals.push(self.read_member(ph, &k)?);
                     }
+                    return Ok(NanBox::handle(self.realm.new_array(vals).to_raw()));
                 }
                 let mut vals = Vec::new();
                 if let Some(raw) = arg(0).as_handle() {
@@ -1646,21 +1643,21 @@ impl<'a> Interp<'a> {
                 if matches!(arg(0).unpack(), Unpacked::Null | Unpacked::Undefined) {
                     return Err(self.type_error("Object.entries called on null or undefined"));
                 }
-                // An ordinary object or a proxy: spec-exact EnumerableOwnProperties
-                // (one key snapshot; live per-key GetOwnProperty + Get, interleaved).
-                if let Some(raw) = arg(0).as_handle() {
-                    let h0 = Handle::from_raw(raw);
-                    if self.realm.object_keys(h0).is_some() || self.realm.proxy_at(h0).is_some() {
-                        let kv = self.enumerable_own_kv(h0)?;
-                        let pairs: Vec<NanBox> = kv
-                            .into_iter()
-                            .map(|(k, v)| {
-                                let key = self.new_str(&k);
-                                NanBox::handle(self.realm.new_array(alloc::vec![key, v]).to_raw())
-                            })
-                            .collect();
-                        return Ok(NanBox::handle(self.realm.new_array(pairs).to_raw()));
+                // A proxy with an `ownKeys` trap drives the entry list (values read
+                // through the proxy so a `get` trap fires).
+                if let Some(raw) = arg(0).as_handle()
+                    && let Some(keys) = self.proxy_own_enumerable_keys(Handle::from_raw(raw))?
+                {
+                    let ph = Handle::from_raw(raw);
+                    let mut pairs = Vec::with_capacity(keys.len());
+                    for k in keys {
+                        let v = self.read_member(ph, &k)?;
+                        let key = self.new_str(&k);
+                        pairs.push(NanBox::handle(
+                            self.realm.new_array(alloc::vec![key, v]).to_raw(),
+                        ));
                     }
+                    return Ok(NanBox::handle(self.realm.new_array(pairs).to_raw()));
                 }
                 let mut entries: Vec<(alloc::string::String, NanBox)> = Vec::new();
                 if let Some(h) = arg(0).as_handle().map(Handle::from_raw) {
@@ -2218,98 +2215,9 @@ impl<'a> Interp<'a> {
             }
             // `%TypedArray%.from(source, mapFn?, thisArg?)` — generic over the
             // `this` constructor (`Int8Array.from(...)` builds an `Int8Array`).
-            N_TYPED_ARRAY_FROM => {
-                let ctor = self.this_val;
-                // Step 2: IsConstructor(C) — `%TypedArray%.from` called with a `this`
-                // that is not a constructor throws a TypeError.
-                if !self.is_constructor_value(ctor) {
-                    return Err(self.type_error("TypedArray.from requires a constructor this"));
-                }
-                // Step 3: if `mapfn` is not undefined and not callable, throw a
-                // TypeError — *before* accessing `source[@@iterator]` / `length`.
-                let mapfn = arg(1);
-                let has_mapfn = !matches!(mapfn.unpack(), Unpacked::Undefined);
-                if has_mapfn
-                    && !mapfn
-                        .as_handle()
-                        .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-                {
-                    return Err(self.type_error("TypedArray.from mapfn is not a function"));
-                }
-                let items = match self.iterate_values(arg(0)) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        let mut out = Vec::new();
-                        if let Some(h) = arg(0).as_handle().map(Handle::from_raw) {
-                            let len_raw = self
-                                .realm
-                                .get_property(h, "length")
-                                .map(|v| self.realm.to_number(v))
-                                .unwrap_or(0.0);
-                            // Cap the array-like length against `max_array_len`
-                            // BEFORE allocating, so `from({length: 2**32-1})` throws
-                            // a catchable RangeError instead of attempting a
-                            // multi-gigabyte allocation (an unbounded-memory bug).
-                            if len_raw > self.realm.limits.max_array_len as f64 {
-                                let m = self.new_str("Invalid array length");
-                                return Err(ExecError::Throw(
-                                    self.make_error(N_RANGE_ERROR, Some(m)),
-                                ));
-                            }
-                            let len = len_raw.max(0.0) as usize;
-                            for i in 0..len {
-                                let k = alloc::format!("{i}");
-                                out.push(
-                                    self.realm
-                                        .get_property(h, &k)
-                                        .unwrap_or(NanBox::undefined()),
-                                );
-                            }
-                        }
-                        out
-                    }
-                };
-                let items = if !has_mapfn {
-                    items
-                } else {
-                    let f = mapfn;
-                    let this_arg = arg(2);
-                    let mut out = Vec::with_capacity(items.len());
-                    for (i, e) in items.iter().enumerate() {
-                        out.push(self.call_with_this(
-                            f,
-                            this_arg,
-                            &[*e, NanBox::number(i as f64)],
-                        )?);
-                    }
-                    out
-                };
-                let view = self.construct(ctor, &[NanBox::number(items.len() as f64)])?;
-                if let Some(vh) = view.as_handle().map(Handle::from_raw) {
-                    // A custom ctor returning a view over an immutable buffer makes
-                    // the populating element writes fail with a TypeError.
-                    self.guard_view_immutable(vh)?;
-                    let items = self.coerce_typed_elements(vh, &items)?;
-                    self.realm.typed_set_from_numbers(vh, 0, &items);
-                    self.link_view_proto_to_ctor(vh, ctor);
-                }
-                view
-            }
+            N_TYPED_ARRAY_FROM => self.typed_array_from(self.this_val, arg(0), arg(1), arg(2))?,
             // `%TypedArray%.of(...items)` — generic over the `this` constructor.
-            N_TYPED_ARRAY_OF => {
-                let ctor = self.this_val;
-                if !self.is_constructor_value(ctor) {
-                    return Err(self.type_error("TypedArray.of requires a constructor this"));
-                }
-                let view = self.construct(ctor, &[NanBox::number(args.len() as f64)])?;
-                if let Some(vh) = view.as_handle().map(Handle::from_raw) {
-                    self.guard_view_immutable(vh)?;
-                    let nums = self.coerce_typed_elements(vh, args)?;
-                    self.realm.typed_set_from_numbers(vh, 0, &nums);
-                    self.link_view_proto_to_ctor(vh, ctor);
-                }
-                view
-            }
+            N_TYPED_ARRAY_OF => self.typed_array_of(self.this_val, args)?,
             // `get %TypedArray%[Symbol.species]` — returns the receiver constructor.
             // (Also shared by `Map`/`Set`/… species getters, which all return `this`.)
             N_TYPED_ARRAY_SPECIES => self.this_val,
@@ -3391,25 +3299,7 @@ impl<'a> Interp<'a> {
                 };
                 self.new_str(&s)
             }
-            N_OBJ_PROTO_TOLOCALE => {
-                // Object.prototype.toLocaleString(): Return Invoke(this, "toString").
-                // GetV(this, "toString") does ToObject(this) first (throwing for
-                // null/undefined, boxing a primitive), then Call(toString, this) is
-                // made with the *original* this value (a user `toString` in strict
-                // mode therefore sees the primitive, not its wrapper).
-                let this = self.this_val;
-                let h = self.require_object_coercible_to_object(this, "toLocaleString")?;
-                let to_string = self.read_member(h, "toString")?;
-                self.call_with_this(to_string, this, &[])?
-            }
-            N_OBJ_PROTO_VALUEOF => {
-                // Object.prototype.valueOf = ToObject(this value): a primitive is
-                // boxed (so `valueOf.call(true)` is a Boolean *object*, typeof
-                // "object") and null/undefined throws a TypeError.
-                let this = self.this_val;
-                let h = self.require_object_coercible_to_object(this, "valueOf")?;
-                NanBox::handle(h.to_raw())
-            }
+            N_OBJ_PROTO_VALUEOF => self.this_val,
             // `Error.prototype.toString` — the receiver must be an Object (a
             // string/symbol/bigint primitive or null/undefined is a TypeError);
             // reads `name`/`message` (each ToString'd, defaulting to `"Error"`/`""`)
@@ -3445,17 +3335,15 @@ impl<'a> Interp<'a> {
                 self.new_str(&s)
             }
             N_OBJ_PROTO_HASOWN => {
-                // ToPropertyKey(V) then ToObject(this) — the former runs a user
-                // `toString`/`valueOf`/`@@toPrimitive` (and may throw or yield a
-                // Symbol key) *before* the latter, which throws for a
+                // ToPropertyKey(V) then ToObject(this) — the latter throws for a
                 // null/undefined receiver and boxes a primitive.
-                let key = self.coerce_property_key(arg(0))?;
+                let key = self.member_key(arg(0));
                 let this = self.this_val;
                 let h = self.require_object_coercible_to_object(this, "hasOwnProperty")?;
                 NanBox::boolean(self.realm.has_own(h, &key))
             }
             N_OBJ_PROTO_PROPISENUM => {
-                let key = self.coerce_property_key(arg(0))?;
+                let key = self.member_key(arg(0));
                 let this = self.this_val;
                 let h = self.require_object_coercible_to_object(this, "propertyIsEnumerable")?;
                 // An own *and* enumerable property. `property_is_enumerable` works
@@ -3478,19 +3366,14 @@ impl<'a> Interp<'a> {
                 {
                     let this = self.this_val;
                     let target = self.require_object_coercible_to_object(this, "isPrototypeOf")?;
-                    // Walk V's prototype chain via `[[GetPrototypeOf]]` (proxy-aware:
-                    // a proxy in the chain fires its `getPrototypeOf` trap).
-                    let mut cur = self.get_proto_of(v)?;
+                    let mut cur = self.realm.object_proto(v);
                     let mut f = false;
-                    for _ in 0..1_000_000 {
-                        let Some(p) = cur.as_handle().map(Handle::from_raw) else {
-                            break;
-                        };
+                    while let Some(p) = cur {
                         if p == target {
                             f = true;
                             break;
                         }
-                        cur = self.get_proto_of(p)?;
+                        cur = self.realm.object_proto(p);
                     }
                     f
                 } else {

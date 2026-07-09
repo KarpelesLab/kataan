@@ -33,8 +33,11 @@ fn unicode_and_hex_escapes() {
     assert!(re(r"[\x61\x62]", "").is_match("b"));
     // `\t` via `\x09`.
     assert!(re(r"\x09", "").is_match("a\tb"));
-    // A malformed escape is a compile error.
-    assert!(Regex::new(r"\u00", "").is_err());
+    // Without the `u` flag, an ill-formed `\u` is a valid AnnexB IdentityEscape:
+    // `\u00` matches the literal `u00` (`\u` → `u`, then `00`).
+    assert!(re(r"\u00", "").is_match("u00"));
+    // With the `u` flag it IS a compile error (strict unicode mode).
+    assert!(Regex::new(r"\u00", "u").is_err());
 }
 
 #[test]

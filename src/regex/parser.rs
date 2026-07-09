@@ -901,8 +901,24 @@ impl Parser {
                 self.named_refs.push(name.clone());
                 Node::NamedBackref(name)
             }
-            'u' => Node::Char(self.parse_unicode_escape()?),
-            'x' => Node::Char(self.parse_hex_escape(2)?),
+            // `\u` — a Unicode escape. In `u`/`v` mode it must be well-formed;
+            // otherwise (Annex B) an ill-formed `\u` is the IdentityEscape `u`.
+            'u' => {
+                if self.unicode || self.unicode_sets || self.peek_unicode_escape() {
+                    Node::Char(self.parse_unicode_escape()?)
+                } else {
+                    Node::Char('u' as u32)
+                }
+            }
+            // `\x` — a hex escape. In `u`/`v` mode it must be `\xHH`; otherwise an
+            // ill-formed `\x` is the IdentityEscape `x` (Annex B).
+            'x' => {
+                if self.unicode || self.unicode_sets || self.peek_n_hex(2) {
+                    Node::Char(self.parse_hex_escape(2)?)
+                } else {
+                    Node::Char('x' as u32)
+                }
+            }
             // `\p` / `\P` are Unicode property escapes only under the `u` flag.
             // Without it they are an IdentityEscape (Annex B): the literal `p`/`P`.
             'p' if self.unicode => {
@@ -1075,6 +1091,37 @@ impl Parser {
     /// code point (always BMP, so always a valid scalar).
     fn parse_hex_escape(&mut self, n: usize) -> Result<u32, RegexError> {
         self.parse_hex_digits(n)
+    }
+
+    /// Whether the next `n` chars (without consuming) are all hex digits.
+    fn peek_n_hex(&self, n: usize) -> bool {
+        (0..n).all(|i| {
+            self.chars
+                .get(self.pos + i)
+                .is_some_and(char::is_ascii_hexdigit)
+        })
+    }
+
+    /// Whether a `\u` (the `u` already consumed) begins a well-formed Unicode
+    /// escape: `\uHHHH` or `\u{H…}`. Non-consuming (Annex B fallback probe).
+    fn peek_unicode_escape(&self) -> bool {
+        if self.chars.get(self.pos) == Some(&'{') {
+            let mut i = self.pos + 1;
+            let mut any = false;
+            while let Some(&c) = self.chars.get(i) {
+                if c == '}' {
+                    return any;
+                }
+                if !c.is_ascii_hexdigit() {
+                    return false;
+                }
+                any = true;
+                i += 1;
+            }
+            false
+        } else {
+            self.peek_n_hex(4)
+        }
     }
 
     /// Reads exactly `n` hex digits as a code point.

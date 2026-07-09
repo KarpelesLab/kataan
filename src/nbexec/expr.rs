@@ -1731,6 +1731,30 @@ impl<'a> Interp<'a> {
                 }
                 return Ok(None);
             }
+            // Integer-indexed exotic `[[Set]]` reached via the prototype chain: a
+            // *canonical numeric index* on a typed array in the chain never delegates
+            // to a prototype accessor (10.4.5.5). An **invalid** index (out of bounds /
+            // fractional / `-0` / negative / detached) is a silent no-op success — the
+            // write is dropped and the chain is *not* walked further (so a getter/setter
+            // defined on `%TypedArray.prototype%[key]` is unreachable). A **valid** index
+            // falls through to the `has_own` shadow-break below (the element shadows any
+            // prototype accessor; the caller then writes an own property on the receiver).
+            if self.realm.typed_kind(c).is_some()
+                && let Some(n) = canonical_numeric_index(key)
+            {
+                let is_neg_zero = n == 0.0 && n.is_sign_negative();
+                let valid = !self.typed_array_detached(c)
+                    && !is_neg_zero
+                    && n == (n as i64) as f64
+                    && n >= 0.0
+                    && self
+                        .realm
+                        .typed_len(c)
+                        .is_some_and(|len| (n as usize) < len);
+                if !valid {
+                    return Ok(Some(()));
+                }
+            }
             if let Some((_, setter)) = self.realm.accessor(c, key) {
                 if !matches!(setter.unpack(), Unpacked::Undefined) {
                     let this = NanBox::handle(receiver.to_raw());
@@ -1941,13 +1965,14 @@ impl<'a> Interp<'a> {
         if name == "lastIndex" && self.realm.regexp_at(handle).is_some() {
             return self.regex_write_last_index(handle, new);
         }
-        // An own accessor setter takes precedence. A getter-only accessor (no
-        // setter) cannot be written: strict mode throws a TypeError, sloppy drops.
+        // An own accessor setter takes precedence.
         if let Some((_, setter)) = self.realm.accessor(handle, &name) {
             if !matches!(setter.unpack(), Unpacked::Undefined) {
                 let this = NanBox::handle(handle.to_raw());
                 self.call_with_this(setter, this, &[new])?;
             } else if self.strict {
+                // A getter-only accessor cannot be written: the throwing form of
+                // `[[Set]]` raises a TypeError; sloppy assignment drops the write.
                 let m = self.new_str(&alloc::format!(
                     "Cannot assign to read only property '{name}' (accessor has no setter)"
                 ));
@@ -2560,6 +2585,14 @@ impl<'a> Interp<'a> {
         }
         if self.realm.typed_kind(handle).is_none()
             && matches!(name, "buffer" | "byteLength" | "byteOffset" | "length")
+            // An own property on the receiver shadows the inherited branded accessor
+            // (ordinary [[Get]] finds the own property first). Most visibly, an Array
+            // or String-wrapper receiver whose `[[Prototype]]` was set to a typed
+            // array (`Object.setPrototypeOf([], ta)`) still reads its *own* `length`.
+            && !self.realm.has_own(handle, name)
+            && !(name == "length"
+                && (self.realm.is_array(handle)
+                    || self.realm.string_object_len(handle).is_some()))
             && self.brand_on_chain(handle, TYPED_ARRAY_PROTO_BRAND)
         {
             return Err(
@@ -2812,16 +2845,7 @@ impl<'a> Interp<'a> {
         } else if self.realm.is_array_like(handle) {
             "Array"
         } else if let Some(is_set) = self.realm.collection_is_set(handle) {
-            // A weak collection resolves to its *own* constructor's prototype
-            // (`WeakMap`/`WeakSet`), not `Map`/`Set` — otherwise, e.g., a
-            // `@@toStringTag` read after the weak prototype's own tag is deleted
-            // would wrongly fall through to `Map.prototype`'s "Map" tag.
-            match (is_set, self.realm.collection_is_weak(handle)) {
-                (true, false) => "Set",
-                (false, false) => "Map",
-                (true, true) => "WeakSet",
-                (false, true) => "WeakMap",
-            }
+            if is_set { "Set" } else { "Map" }
         } else if self.realm.function_at(handle).is_some()
             || self.realm.native_at(handle).is_some()
             || self.realm.bound_native_at(handle).is_some()

@@ -112,6 +112,25 @@ impl<'a> Interp<'a> {
         self.realm.regexp_at(h).is_some()
     }
 
+    /// `IsRegExp(argument)` (ECMA-262 22.2.7.2), spec-faithful: for an object, read
+    /// `argument[@@match]` via `[[Get]]` (invoking an accessor getter, propagating a
+    /// throw); if not `undefined`, return `ToBoolean` of it; otherwise return whether
+    /// it has a `[[RegExpMatcher]]` (is a RegExp instance). A non-object is never a
+    /// RegExp.
+    pub(crate) fn try_is_regexp(&mut self, v: NanBox) -> Result<bool, ExecError> {
+        if !self.is_object_value(v) {
+            return Ok(false);
+        }
+        let h = v.as_handle().map(Handle::from_raw).unwrap();
+        let sym = self.well_known_symbol("match");
+        let key = self.member_key(sym);
+        let m = self.read_member(h, &key)?;
+        if !matches!(m.unpack(), Unpacked::Undefined) {
+            return Ok(self.realm.truthy(m));
+        }
+        Ok(self.realm.regexp_at(h).is_some())
+    }
+
     /// Builds `RegExp.prototype` as a real object: first-class `exec`/`test`/
     /// `compile`/`toString` methods, the `@@match`/`@@matchAll`/`@@replace`/
     /// `@@search`/`@@split` symbol methods, the `source`/`flags`/flag-getter
@@ -272,9 +291,12 @@ impl<'a> Interp<'a> {
         if matches!(c.unpack(), Unpacked::Undefined) {
             return Ok(default);
         }
-        let Some(ch) = c.as_handle().map(Handle::from_raw) else {
+        // A non-object `constructor` (a primitive string/symbol/bigint is heap
+        // boxed but is *not* an object) is a TypeError.
+        if !self.is_object_value(c) {
             return Err(self.type_error("RegExp species constructor is not an object"));
-        };
+        }
+        let ch = c.as_handle().map(Handle::from_raw).unwrap();
         let species_sym = self.well_known_symbol("species");
         let species_key = self.member_key(species_sym);
         let s = self.read_member(ch, &species_key)?;
@@ -446,7 +468,7 @@ impl<'a> Interp<'a> {
         // `flags` is generic: it reads each flag getter off `this` (Get), so it
         // works on any object (incl. the prototype sentinel), not just a RegExp.
         if name == "flags" {
-            if this_val.as_handle().map(Handle::from_raw).is_none() {
+            if !self.is_object_value(this_val) {
                 return Err(self.type_error("RegExp.prototype.flags getter called on a non-object"));
             }
             return self.regexp_flags_string(this_val);
@@ -706,7 +728,7 @@ impl<'a> Interp<'a> {
             .is_some_and(|fh| self.is_callable(fh))
         {
             let result = self.call_with_this(exec, r, &[s])?;
-            if !matches!(result.unpack(), Unpacked::Null) && result.as_handle().is_none() {
+            if !matches!(result.unpack(), Unpacked::Null) && !self.is_object_value(result) {
                 return Err(self.type_error(
                     "RegExp exec method returned something other than an Object or null",
                 ));
@@ -737,25 +759,46 @@ impl<'a> Interp<'a> {
         self.make_error(N_SYNTAX_ERROR, Some(m))
     }
 
+    /// The spec's internal `Set(O, key, value, true)` (Throw = true) for a *generic*
+    /// receiver: the write always throws on failure (a non-writable data property or
+    /// a setter-less accessor) regardless of the caller's strictness.
+    fn set_prop_throwing(&mut self, h: Handle, key: &str, v: NanBox) -> Result<(), ExecError> {
+        let saved = self.strict;
+        self.strict = true;
+        let key_v = self.new_str(key);
+        let res = self.assign_member_value(h, key_v, v);
+        self.strict = saved;
+        res
+    }
+
+    /// `ToLength(? Get(o, "lastIndex"))`: `ToIntegerOrInfinity` (running a user
+    /// `valueOf`, propagating a throw) clamped to `[0, 2**53 - 1]`.
+    fn last_index_to_length(&mut self, v: NanBox) -> Result<usize, ExecError> {
+        let n = self.coerce_to_integer_or_infinity(v)?;
+        // NOT `clamp`: `max` then `min` maps NaN → 0 (ToLength(NaN) = 0), whereas
+        // `clamp` would return NaN.
+        #[allow(clippy::manual_clamp)]
+        Ok(n.max(0.0).min(9_007_199_254_740_991.0) as usize)
+    }
+
     /// `RegExp.prototype[@@search](string)`.
     fn regexp_symbol_search(&mut self, rx: NanBox, string: NanBox) -> Result<NanBox, ExecError> {
-        let Some(h) = rx.as_handle().map(Handle::from_raw) else {
+        if !self.is_object_value(rx) {
             return Err(self.type_error("RegExp.prototype[Symbol.search] called on a non-object"));
-        };
+        }
+        let h = rx.as_handle().map(Handle::from_raw).unwrap();
         let s_bytes = self.coerce_to_string_bytes(string)?;
         let str_v = self.new_str_bytes(s_bytes);
         // Save/restore `lastIndex` around the search via `[[Get]]`/`[[Set]]` (so a
         // generic receiver's accessor / a throwing setter is observed, per spec).
         let prev = self.read_member(h, "lastIndex")?;
         if !self.same_value(prev, NanBox::number(0.0)) {
-            let key = self.new_str("lastIndex");
-            self.assign_member_value(h, key, NanBox::number(0.0))?;
+            self.set_prop_throwing(h, "lastIndex", NanBox::number(0.0))?;
         }
         let result = self.regexp_exec(rx, str_v)?;
         let cur = self.read_member(h, "lastIndex")?;
         if !self.same_value(cur, prev) {
-            let key = self.new_str("lastIndex");
-            self.assign_member_value(h, key, prev)?;
+            self.set_prop_throwing(h, "lastIndex", prev)?;
         }
         if matches!(result.unpack(), Unpacked::Null) {
             return Ok(NanBox::number(-1.0));
@@ -768,9 +811,10 @@ impl<'a> Interp<'a> {
 
     /// `RegExp.prototype[@@match](string)`.
     fn regexp_symbol_match(&mut self, rx: NanBox, string: NanBox) -> Result<NanBox, ExecError> {
-        let Some(h) = rx.as_handle().map(Handle::from_raw) else {
+        if !self.is_object_value(rx) {
             return Err(self.type_error("RegExp.prototype[Symbol.match] called on a non-object"));
-        };
+        }
+        let h = rx.as_handle().map(Handle::from_raw).unwrap();
         // ToString(string) losslessly; `str_v` (the spec's `S`) is reused on every
         // `RegExpExec` so a surrogate-bearing subject matches and slices correctly.
         let s_bytes = self.coerce_to_string_bytes(string)?;
@@ -783,8 +827,9 @@ impl<'a> Interp<'a> {
             return self.regexp_exec(rx, str_v);
         }
         let unicode = flags.contains('u') || flags.contains('v');
-        // Reset lastIndex to 0 (`Set(rx, "lastIndex", 0, true)`).
-        self.set_last_index(h, 0)?;
+        // Reset lastIndex to 0 (`Set(rx, "lastIndex", 0, true)`); the receiver is
+        // generic, so the property is created/written via the throwing `[[Set]]`.
+        self.set_prop_throwing(h, "lastIndex", NanBox::number(0.0))?;
         let mut results: Vec<NanBox> = Vec::new();
         loop {
             let result = self.regexp_exec(rx, str_v)?;
@@ -800,9 +845,9 @@ impl<'a> Interp<'a> {
             if m_str.is_empty() {
                 // Advance lastIndex to avoid an infinite loop.
                 let li_v = self.read_member(h, "lastIndex")?;
-                let li = self.coerce_to_integer_or_infinity(li_v)?.max(0.0) as usize;
+                let li = self.last_index_to_length(li_v)?;
                 let next = self.advance_string_index(&s, li, unicode);
-                self.set_last_index(h, next)?;
+                self.set_prop_throwing(h, "lastIndex", NanBox::number(next as f64))?;
             }
         }
         if results.is_empty() {
@@ -815,9 +860,10 @@ impl<'a> Interp<'a> {
     /// `RegExp.prototype[@@matchAll](string)` — returns a RegExp String Iterator
     /// (here, an eager generator over the match-result objects).
     fn regexp_symbol_match_all(&mut self, rx: NanBox, string: NanBox) -> Result<NanBox, ExecError> {
-        let Some(h) = rx.as_handle().map(Handle::from_raw) else {
+        if !self.is_object_value(rx) {
             return Err(self.type_error("RegExp.prototype[Symbol.matchAll] called on a non-object"));
-        };
+        }
+        let h = rx.as_handle().map(Handle::from_raw).unwrap();
         let s_bytes = self.coerce_to_string_bytes(string)?;
         let s = crate::wtf8::to_string_lossy(&s_bytes);
         let str_v = self.new_str_bytes(s_bytes);
@@ -836,8 +882,7 @@ impl<'a> Interp<'a> {
         let Some(matcher) = matcher_v.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("RegExp @@matchAll matcher is not an object"));
         };
-        let li_key = self.new_str("lastIndex");
-        self.assign_member_value(matcher, li_key, NanBox::number(li as f64))?;
+        self.set_prop_throwing(matcher, "lastIndex", NanBox::number(li as f64))?;
         let mut out: Vec<NanBox> = Vec::new();
         loop {
             let result = self.regexp_exec(matcher_v, str_v)?;
@@ -885,9 +930,10 @@ impl<'a> Interp<'a> {
         string: NanBox,
         limit: NanBox,
     ) -> Result<NanBox, ExecError> {
-        let Some(h) = rx.as_handle().map(Handle::from_raw) else {
+        if !self.is_object_value(rx) {
             return Err(self.type_error("RegExp.prototype[Symbol.split] called on a non-object"));
-        };
+        }
+        let h = rx.as_handle().map(Handle::from_raw).unwrap();
         let s_bytes = self.coerce_to_string_bytes(string)?;
         let units: Vec<u16> = crate::wtf8::utf16_units(&s_bytes).collect();
         let s = crate::wtf8::to_string_lossy(&s_bytes);
@@ -947,11 +993,9 @@ impl<'a> Interp<'a> {
         let mut p = 0usize; // start of the current segment
         let mut q = 0usize; // search cursor
         while q < size {
-            // `Set(splitter, "lastIndex", q, true)` — goes through `[[Set]]` so a
-            // custom species splitter observes the write (and a throwing setter
-            // propagates).
-            let li_key = self.new_str("lastIndex");
-            self.assign_member_value(splitter, li_key, NanBox::number(q as f64))?;
+            // `Set(splitter, "lastIndex", q, true)` — the throwing form goes through
+            // `[[Set]]` so a custom species splitter observes the write.
+            self.set_prop_throwing(splitter, "lastIndex", NanBox::number(q as f64))?;
             let z = self.regexp_exec(splitter_v, str_v)?;
             if matches!(z.unpack(), Unpacked::Null) {
                 q = self.advance_string_index(&s, q, unicode);
@@ -995,9 +1039,10 @@ impl<'a> Interp<'a> {
         string: NanBox,
         replace: NanBox,
     ) -> Result<NanBox, ExecError> {
-        let Some(h) = rx.as_handle().map(Handle::from_raw) else {
+        if !self.is_object_value(rx) {
             return Err(self.type_error("RegExp.prototype[Symbol.replace] called on a non-object"));
-        };
+        }
+        let h = rx.as_handle().map(Handle::from_raw).unwrap();
         let s_bytes = self.coerce_to_string_bytes(string)?;
         let units: Vec<u16> = crate::wtf8::utf16_units(&s_bytes).collect();
         let s = crate::wtf8::to_string_lossy(&s_bytes);
@@ -1018,7 +1063,7 @@ impl<'a> Interp<'a> {
         let global = flags.contains('g');
         let unicode = flags.contains('u') || flags.contains('v');
         if global {
-            self.set_last_index(h, 0)?;
+            self.set_prop_throwing(h, "lastIndex", NanBox::number(0.0))?;
         }
         // Collect all matches first (so user `exec` runs in the spec order).
         let mut results: Vec<NanBox> = Vec::new();
@@ -1038,9 +1083,9 @@ impl<'a> Interp<'a> {
             let m_str = self.coerce_to_string(m0)?;
             if m_str.is_empty() {
                 let li_v = self.read_member(h, "lastIndex")?;
-                let li = self.coerce_to_integer_or_infinity(li_v)?.max(0.0) as usize;
+                let li = self.last_index_to_length(li_v)?;
                 let next = self.advance_string_index(&s, li, unicode);
-                self.set_last_index(h, next)?;
+                self.set_prop_throwing(h, "lastIndex", NanBox::number(next as f64))?;
             }
         }
         // Build the output.
@@ -1087,7 +1132,15 @@ impl<'a> Interp<'a> {
                 let r = self.call(replace, &call_args)?;
                 self.coerce_to_string(r)?
             } else {
-                self.get_substitution(&matched_units, &units, pos, &captures, named, &repl_str)?
+                // ES2018 named captures: a non-undefined `groups` is `ToObject`'d
+                // before substitution (`groups: null` therefore throws a TypeError).
+                let named_obj = if matches!(named.unpack(), Unpacked::Undefined) {
+                    named
+                } else {
+                    let obj = self.require_object_coercible_to_object(named, "GetSubstitution")?;
+                    NanBox::handle(obj.to_raw())
+                };
+                self.get_substitution(&matched_units, &units, pos, &captures, named_obj, &repl_str)?
             };
             // If position >= next_source_position, append S[next..pos] then the
             // replacement and advance next to pos + m_len.

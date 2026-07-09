@@ -19,10 +19,10 @@ impl<'a> Interp<'a> {
         handler: Handle,
         name: &str,
     ) -> Result<Option<NanBox>, ExecError> {
-        // GetMethod(handler, trapName) is a full `[[Get]]`: an accessor trap on the
-        // handler, or (when the handler is itself a Proxy) its own `get` trap, fires
-        // — so `read_member`, not a raw own-slot read.
-        let trap = self.read_member(handler, name)?;
+        let trap = self
+            .realm
+            .get_property(handler, name)
+            .unwrap_or(NanBox::undefined());
         if matches!(trap.unpack(), Unpacked::Undefined | Unpacked::Null) {
             return Ok(None);
         }
@@ -89,6 +89,25 @@ impl<'a> Interp<'a> {
                 let ch = self.read_member(obj, key).ok()?;
                 return Some(build(self, ch, true));
             }
+        }
+        // A RegExp instance's `lastIndex` is an own data property
+        // `{ writable: true, enumerable: false, configurable: false }` stored as a
+        // compact cell field; synthesize the descriptor when it has not been
+        // materialized into the aux object.
+        if key == "lastIndex"
+            && self.realm.regexp_at(obj).is_some()
+            && !self.realm.has_own(obj, "lastIndex")
+        {
+            let v = NanBox::number(self.realm.regex_last_index(obj) as f64);
+            let d = self.realm.new_object();
+            self.realm.set_property(d, "value", v);
+            self.realm
+                .set_property(d, "writable", NanBox::boolean(true));
+            self.realm
+                .set_property(d, "enumerable", NanBox::boolean(false));
+            self.realm
+                .set_property(d, "configurable", NanBox::boolean(false));
+            return Some(NanBox::handle(d.to_raw()));
         }
         // An array index / `length` is a data property (not stored as a named slot):
         // an in-range index is writable, enumerable, configurable; `length` is
@@ -327,74 +346,6 @@ impl<'a> Interp<'a> {
         NanBox::handle(d.to_raw())
     }
 
-    /// `EnumerableOwnProperties(obj, key+value)` (7.3.24) for `Object.values` /
-    /// `Object.entries`: take **one** `[[OwnPropertyKeys]]` snapshot (String keys,
-    /// spec order), then for each key *in that order* do a live `[[GetOwnProperty]]`
-    /// (so a getter that made a later key non-enumerable, or deleted it, is
-    /// observed) and, when it is present and enumerable, a live `[[Get]]` (invoking
-    /// the getter / proxy `get` trap, interleaved with the descriptor read). Returns
-    /// the `(key, value)` pairs for the enumerable own String properties, in order.
-    ///
-    /// Routed to for ordinary objects and proxies; arrays / strings / typed arrays /
-    /// functions keep their dedicated element+named enumeration.
-    pub(crate) fn enumerable_own_kv(
-        &mut self,
-        obj: Handle,
-    ) -> Result<Vec<(String, NanBox)>, ExecError> {
-        let is_proxy = self.realm.proxy_at(obj).is_some();
-        // [[OwnPropertyKeys]] — the proxy `ownKeys` trap when present (validated),
-        // else the ordinary own String-key list (of the target, for a trapless proxy).
-        let keys: Vec<String> = if is_proxy {
-            match self.proxy_own_keys_raw(obj)? {
-                Some(ks) => ks
-                    .into_iter()
-                    .filter_map(|k| {
-                        k.as_handle()
-                            .map(Handle::from_raw)
-                            .and_then(|h| self.realm.string_value(h))
-                    })
-                    .collect(),
-                None => self
-                    .realm
-                    .proxy_at(obj)
-                    .and_then(|(t, _)| self.realm.own_property_names(t))
-                    .unwrap_or_default(),
-            }
-        } else {
-            self.realm.own_property_names(obj).unwrap_or_default()
-        };
-        let mut out = Vec::with_capacity(keys.len());
-        for k in keys {
-            // Symbol / private storage keys never surface in values/entries.
-            if k.starts_with('#') || k.starts_with('\u{0}') {
-                continue;
-            }
-            let enumerable = if is_proxy {
-                // A proxy must observe the `getOwnPropertyDescriptor` trap here (and
-                // interleaved with `get`), so read a full descriptor.
-                let desc = self.descriptor_of(obj, &k)?;
-                if matches!(desc.unpack(), Unpacked::Undefined) {
-                    continue;
-                }
-                desc.as_handle()
-                    .map(Handle::from_raw)
-                    .and_then(|dh| self.realm.get_property(dh, "enumerable"))
-                    .is_some_and(|v| self.realm.truthy(v))
-            } else {
-                // An ordinary object's `[[GetOwnProperty]]` has no observable side
-                // effect, so the live own+enumerable probe is equivalent and avoids
-                // materializing a descriptor object per key.
-                self.realm.has_own(obj, &k) && self.realm.property_is_enumerable(obj, &k)
-            };
-            if !enumerable {
-                continue;
-            }
-            let v = self.read_member(obj, &k)?;
-            out.push((k, v));
-        }
-        Ok(out)
-    }
-
     /// `Object/Reflect.isExtensible(obj)` — routing a proxy through its
     /// `isExtensible` trap (or forwarding to the target).
     pub(crate) fn is_extensible_of(&mut self, obj: Handle) -> Result<NanBox, ExecError> {
@@ -498,13 +449,6 @@ impl<'a> Interp<'a> {
         let current = self.realm.object_proto(obj);
         if current == proto {
             return Ok(true);
-        }
-        // %Object.prototype% is an immutable-prototype exotic object (10.4.7): its
-        // [[SetPrototypeOf]] returns false for any prototype other than its current
-        // one (the equal case already returned above). `Object.setPrototypeOf` then
-        // throws a TypeError; `Reflect.setPrototypeOf` returns false.
-        if self.object_prototype() == Some(obj) {
-            return Ok(false);
         }
         if !self.realm.is_extensible(obj) {
             return Ok(false);
@@ -2164,60 +2108,28 @@ impl<'a> Interp<'a> {
         for k in self.realm.own_property_names(handle).unwrap_or_default() {
             out.push(self.new_str(&k));
         }
-        for k in self.realm.object_all_keys(handle) {
+        // Symbol keys live directly on a genuine object cell (`object_all_keys`),
+        // but a non-object exotic (typed array, array, function) stores its symbol
+        // keys in the auxiliary object — so consult both (a cell has at most one of
+        // the two, so no duplication) or symbols on a typed array would be dropped
+        // from `[[OwnPropertyKeys]]`.
+        let mut seen_syms: Vec<u64> = Vec::new();
+        for k in self
+            .realm
+            .object_all_keys(handle)
+            .into_iter()
+            .chain(self.realm.aux_all_keys(handle))
+        {
             if let Some(idstr) = k.strip_prefix("\u{0}sym:")
                 && let Ok(id) = idstr.parse::<u64>()
+                && !seen_syms.contains(&id)
                 && let Some(sh) = self.realm.symbol_for_id(id)
             {
+                seen_syms.push(id);
                 out.push(NanBox::handle(sh.to_raw()));
             }
         }
         Ok(out)
-    }
-
-    /// `SetIntegrityLevel(O, level)` (7.3.16) for a Proxy receiver: `[[PreventExtensions]]`
-    /// (its trap), then `[[OwnPropertyKeys]]` (its `ownKeys` trap), then per key a
-    /// `[[GetOwnProperty]]` (frozen only) and `DefinePropertyOrThrow` restricting the
-    /// key to non-configurable (and, when frozen, non-writable for data properties) —
-    /// each routed through the proxy `defineProperty` trap. Returns the boolean
-    /// success (`false` when `[[PreventExtensions]]` failed); a throwing trap
-    /// propagates. Ordinary objects keep the flag-based `freeze_object`/`seal_object`
-    /// fast path.
-    pub(crate) fn set_integrity_level(
-        &mut self,
-        obj: crate::heap::Handle,
-        frozen: bool,
-    ) -> Result<bool, ExecError> {
-        if !self.prevent_extensions_of(obj)? {
-            return Ok(false);
-        }
-        let keys = self.own_property_keys_values(obj)?;
-        for key in keys {
-            let name = self.member_key(key);
-            let desc = self.realm.new_object();
-            if frozen {
-                let cur = self.descriptor_of(obj, &name)?;
-                if matches!(cur.unpack(), Unpacked::Undefined) {
-                    continue;
-                }
-                let is_accessor = cur.as_handle().map(Handle::from_raw).is_some_and(|dh| {
-                    self.realm.has_own(dh, "get") || self.realm.has_own(dh, "set")
-                });
-                self.realm
-                    .set_property(desc, "configurable", NanBox::boolean(false));
-                if !is_accessor {
-                    self.realm
-                        .set_property(desc, "writable", NanBox::boolean(false));
-                }
-            } else {
-                self.realm
-                    .set_property(desc, "configurable", NanBox::boolean(false));
-            }
-            // DefinePropertyOrThrow: `reflect: false` makes a falsy [[DefineOwnProperty]]
-            // (or a falsy `defineProperty` trap) a TypeError.
-            self.apply_descriptor(obj, &name, desc, false)?;
-        }
-        Ok(true)
     }
 
     /// CopyDataProperties(`target`, `source`, `excluded`) — the spec operation

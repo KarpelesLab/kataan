@@ -167,15 +167,30 @@ impl Compiler<'_> {
                 self.emit(Inst::Backref(*n));
             }
             Node::NamedBackref(name) => {
-                // Resolve the name to its group index; an unknown name back-refers
-                // group 0 (the whole match never re-binds, so it matches empty).
-                let n = self
+                // Resolve the name to its group index(es). A unique name emits a plain
+                // `Backref`; a *duplicate* name (ES2025) emits a `BackrefMulti` that
+                // references whichever participated at match time.
+                let indices: alloc::vec::Vec<usize> = self
                     .group_names
                     .iter()
-                    .find(|(_, gn)| gn == name)
-                    .map_or(0, |(idx, _)| *idx);
-                self.groups = self.groups.max(n);
-                self.emit(Inst::Backref(n));
+                    .filter(|(_, gn)| gn == name)
+                    .map(|(idx, _)| *idx)
+                    .collect();
+                match indices.as_slice() {
+                    [] => {
+                        self.emit(Inst::Backref(0));
+                    }
+                    [n] => {
+                        self.groups = self.groups.max(*n);
+                        self.emit(Inst::Backref(*n));
+                    }
+                    _ => {
+                        if let Some(m) = indices.iter().copied().max() {
+                            self.groups = self.groups.max(m);
+                        }
+                        self.emit(Inst::BackrefMulti(indices));
+                    }
+                }
             }
         }
         self.check_size()
@@ -227,6 +242,7 @@ impl Compiler<'_> {
                 // `compile` self-checks `MAX_PROG_SIZE`, so a large `min` (e.g.
                 // `a{1000000,}`) is still rejected promptly as it emits.
                 for _ in 0..min {
+                    self.emit_clear_captures(inner);
                     self.compile(inner)?;
                 }
                 self.compile_star(inner, greedy)?;
@@ -256,6 +272,7 @@ impl Compiler<'_> {
                 }
                 // `min` mandatory copies, then `(max - min)` optional copies.
                 for _ in 0..min {
+                    self.emit_clear_captures(inner);
                     self.compile(inner)?;
                 }
                 for _ in min..max {
@@ -266,11 +283,19 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    /// `inner*` — `L1: Split(body, exit); body; Jmp L1; exit:` (greedy prefers
-    /// the body; lazy prefers the exit).
+    /// Emits a [`Inst::ClearCaptures`] for a quantified atom's groups (a no-op when
+    /// it has none), so each repetition starts with them unset (RepeatMatcher).
+    fn emit_clear_captures(&mut self, inner: &Node) {
+        if let Some((lo, hi)) = group_slot_range(inner) {
+            self.emit(Inst::ClearCaptures { from: lo, to: hi });
+        }
+    }
+
+    /// `inner*` — `L1: Split(clear, exit); clear; body; Jmp L1; exit:`.
     fn compile_star(&mut self, inner: &Node, greedy: bool) -> Result<(), RegexError> {
         let l1 = self.emit(Inst::Split(0, 0));
         let body = self.here();
+        self.emit_clear_captures(inner);
         self.compile(inner)?;
         self.emit(Inst::Jmp(l1));
         let exit = self.here();
@@ -282,10 +307,11 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    /// `inner?` — `Split(body, exit); body; exit:`.
+    /// `inner?` — `Split(body, exit); clear; body; exit:`.
     fn compile_optional(&mut self, inner: &Node, greedy: bool) -> Result<(), RegexError> {
         let split = self.emit(Inst::Split(0, 0));
         let body = self.here();
+        self.emit_clear_captures(inner);
         self.compile(inner)?;
         let exit = self.here();
         self.prog[split] = if greedy {
@@ -476,6 +502,38 @@ fn build_set_matcher(expr: &ClassSetExpr) -> SetMatcher {
         ClassSetExpr::Difference(kids) => {
             SetMatcher::Difference(kids.iter().map(build_set_matcher).collect())
         }
+    }
+}
+
+/// The inclusive capture-*slot* range `(2·minIdx, 2·maxIdx+1)` of every capturing
+/// group nested anywhere in `node`, or `None` if it contains no capturing group.
+fn group_slot_range(node: &Node) -> Option<(usize, usize)> {
+    fn walk(node: &Node, lo: &mut Option<usize>, hi: &mut Option<usize>) {
+        match node {
+            Node::Group { index, inner } => {
+                if let Some(idx) = index {
+                    *lo = Some(lo.map_or(*idx, |v: usize| v.min(*idx)));
+                    *hi = Some(hi.map_or(*idx, |v: usize| v.max(*idx)));
+                }
+                walk(inner, lo, hi);
+            }
+            Node::Modifier { inner, .. }
+            | Node::Look { inner, .. }
+            | Node::LookBehind { inner, .. }
+            | Node::Repeat { inner, .. } => walk(inner, lo, hi),
+            Node::Concat(kids) | Node::Alt(kids) => {
+                for k in kids {
+                    walk(k, lo, hi);
+                }
+            }
+            _ => {}
+        }
+    }
+    let (mut lo, mut hi) = (None, None);
+    walk(node, &mut lo, &mut hi);
+    match (lo, hi) {
+        (Some(l), Some(h)) => Some((2 * l, 2 * h + 1)),
+        _ => None,
     }
 }
 

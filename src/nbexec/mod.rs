@@ -1572,9 +1572,6 @@ const N_ATOMICS_WAIT_ASYNC: u16 = 960;
 /// A bound native (target = the waitAsync promise) that a finite-timeout waiter's
 /// macrotask calls to settle it `"timed-out"` if still pending.
 const N_ATOMICS_ASYNC_TIMEOUT: u16 = 961;
-// Object.prototype.toLocaleString = Invoke(this, "toString") — distinct from
-// Object.prototype.toString (which returns the "[object Tag]" builtin string).
-const N_OBJ_PROTO_TOLOCALE: u16 = 962;
 /// `%GeneratorFunction%` — builds a `function*` from dynamic source (like
 /// `%Function%`); reachable via `Object.getPrototypeOf(function*(){}).constructor`.
 const N_GENERATOR_FUNCTION_CTOR: u16 = 905;
@@ -2080,8 +2077,6 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_OBJECT_SET_PROTO
         | N_OBJECT_IS
         | N_OBJECT_HAS_OWN
-        // `Object.create(O, Properties)`.
-        | N_OBJECT_CREATE
         | N_OBJECT_DEFINE_PROPS
         | N_REFLECT_GET
         | N_REFLECT_HAS
@@ -2101,7 +2096,9 @@ fn builtin_native_arity(id: u16) -> u32 {
         | N_JSON_PARSE
         // `Object.groupBy(items, callbackfn)`; `Object.assign(target, ...sources)`.
         | N_OBJECT_GROUP_BY
-        | N_OBJECT_ASSIGN => 2,
+        | N_OBJECT_ASSIGN
+        // `RegExp(pattern, flags)` — two declared parameters.
+        | N_REGEXP => 2,
         // Length 3.
         N_OBJECT_DEFINE_PROP | N_REFLECT_SET | N_REFLECT_DEFINE_PROP | N_REFLECT_APPLY
         // `SuppressedError(error, suppressed, message)`.
@@ -3177,6 +3174,9 @@ impl<'a> Interp<'a> {
             NanBox::handle(tag_get.to_raw()),
             NanBox::undefined(),
         );
+        // A spec accessor property is non-enumerable (`{ enumerable: false,
+        // configurable: true }`).
+        self.realm.mark_hidden(ta_proto, &tag_key);
         // The `buffer`/`byteLength`/`byteOffset`/`length` accessors as own
         // get-only properties on `%TypedArray%.prototype` (each a bound native
         // carrying its name; rejects a non-TypedArray receiver). `name`/`length`
@@ -4077,7 +4077,7 @@ impl<'a> Interp<'a> {
         let obj_proto = self.realm.new_object();
         for (name, id, arity) in [
             ("toString", N_OBJ_PROTO_TOSTRING, 0u32),
-            ("toLocaleString", N_OBJ_PROTO_TOLOCALE, 0),
+            ("toLocaleString", N_OBJ_PROTO_TOSTRING, 0),
             ("valueOf", N_OBJ_PROTO_VALUEOF, 0),
             ("hasOwnProperty", N_OBJ_PROTO_HASOWN, 1),
             ("isPrototypeOf", N_OBJ_PROTO_ISPROTOTYPEOF, 1),

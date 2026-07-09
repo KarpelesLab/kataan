@@ -77,8 +77,13 @@ impl<'a> Interp<'a> {
         // constructor (the abstract `%TypedArray%` intrinsic and all method/utility
         // natives are *not* constructors).
         if let Some(id) = self.realm.native_at(handle) {
+            // The abstract `%TypedArray%` intrinsic *is* a constructor
+            // (`IsConstructor(%TypedArray%)` is true): it has a `[[Construct]]` that
+            // throws when invoked. So `%TypedArray%.from`/`of` (step 2 IsConstructor)
+            // and `SpeciesConstructor` accept it; the throw happens only if it is
+            // actually constructed (handled in the construct path).
             if id == N_TYPED_ARRAY_ABSTRACT {
-                return false;
+                return true;
             }
             return is_native_constructor(id);
         }
@@ -1790,6 +1795,49 @@ impl<'a> Interp<'a> {
         default_proto
     }
 
+    /// `GetPrototypeFromConstructor(newTarget, default)` performed spec-correctly —
+    /// invoking an own `prototype` *accessor* on `new_target` and propagating an
+    /// abrupt getter (unlike [`Self::instance_proto`], which reads the stored value
+    /// via `get_property` and cannot observe a throw). Used where the spec must
+    /// surface a throwing `prototype` getter (built-in constructors driven by
+    /// `Reflect.construct` / a subclass `super()`). Falls back to `default` when
+    /// `new_target` equals the callee, or its `prototype` is a non-object.
+    pub(crate) fn instance_proto_checked(
+        &mut self,
+        new_target: NanBox,
+        callee: NanBox,
+        default: Option<Handle>,
+    ) -> Result<Option<Handle>, ExecError> {
+        if new_target.as_handle().is_none() || new_target.as_handle() == callee.as_handle() {
+            return Ok(default);
+        }
+        let Some(nt) = new_target.as_handle().map(Handle::from_raw) else {
+            return Ok(default);
+        };
+        // A class newTarget's prototype is a synthesized (non-accessor) object.
+        if let Some((class_id, _)) = self.realm.class_at(nt) {
+            return Ok(Some(self.class_prototype_by_id(class_id)));
+        }
+        // `Get(newTarget, "prototype")`: invoke an own accessor (propagating an
+        // abrupt getter); read an own *data* `prototype` override straight; else
+        // `read_member` yields a function's intrinsic `.prototype`.
+        let proto = if self.realm.accessor(nt, "prototype").is_some() {
+            let key = self.new_str("prototype");
+            self.read_member_value(nt, key)?
+        } else if self.realm.has_own(nt, "prototype") {
+            self.realm
+                .get_property(nt, "prototype")
+                .unwrap_or(NanBox::undefined())
+        } else {
+            self.read_member(nt, "prototype")?
+        };
+        if self.is_object_value(proto) {
+            Ok(proto.as_handle().map(Handle::from_raw))
+        } else {
+            Ok(default)
+        }
+    }
+
     /// `GetPrototypeFromConstructor(newTarget, defaultProto)`'s prototype lookup:
     /// the newTarget's `"prototype"` *only if it is an Object*, else `None` so the
     /// caller substitutes the default intrinsic. Unlike `constructor_prototype`,
@@ -2356,6 +2404,10 @@ impl<'a> Interp<'a> {
             // If `pattern` is a RegExp instance, copy its source and (absent an
             // explicit `flags` argument) its flags too — `new RegExp(/x/i)` clones
             // `/x/i`, while `new RegExp(/x/i, "g")` keeps the source but uses "g".
+            // Step 1 (22.2.4.1): `patternIsRegExp = ? IsRegExp(pattern)` — evaluated
+            // first, unconditionally (reads `pattern[@@match]` via Get, so a throwing
+            // accessor propagates before any other observable step).
+            let pattern_is_regexp = self.try_is_regexp(pattern)?;
             let pat_h = pattern.as_handle().map(Handle::from_raw);
             let (pat, flags) = if let Some((src, fl)) = pat_h.and_then(|h| self.realm.regexp_at(h))
             {
@@ -2365,7 +2417,7 @@ impl<'a> Interp<'a> {
                     self.coerce_to_string(flags_arg)?
                 };
                 (src, flags)
-            } else if let Some(ph) = pat_h.filter(|_| self.is_regexp_arg(pattern)) {
+            } else if let Some(ph) = pat_h.filter(|_| pattern_is_regexp) {
                 // A non-RegExp object with a truthy `@@match` (IsRegExp): use its
                 // `.source`/`.flags` when no flags argument is supplied.
                 let src_v = self.read_member(ph, "source")?;
@@ -2703,9 +2755,12 @@ impl<'a> Interp<'a> {
             // `newTarget.prototype` for a subclass / `Reflect.construct`), so
             // inherited members (the get*/set* methods, the accessors,
             // `Symbol.toStringTag`) resolve through the chain.
+            // OrdinaryCreateFromConstructor runs *last* (25.3.2.1 step 12), after
+            // RequireInternalSlot / ToIndex(byteOffset) / the detached and bounds
+            // checks — so build with the default proto now and resolve newTarget's
+            // (possibly throwing) `prototype` accessor at the end.
             let default = self.intrinsic_proto("DataView");
-            let dv_proto = self.instance_proto(native_new_target, callee, default);
-            let obj = self.realm.new_object_with_proto(dv_proto);
+            let obj = self.realm.new_object_with_proto(default);
             let buf = args.first().copied().unwrap_or(NanBox::undefined());
             // RequireInternalSlot(buffer, [[ArrayBufferData]]): the first argument
             // must be an ArrayBuffer (has the bytes slot), else a TypeError — *before*
@@ -2753,6 +2808,15 @@ impl<'a> Interp<'a> {
                 self.realm
                     .set_hidden_property(obj, DATA_VIEW_LEN, NanBox::number(view_len as f64));
             }
+            // Step 12: `Get(newTarget, "prototype")` — invoking a throwing accessor
+            // now that all argument validation has succeeded.
+            if let Some(proto) = self.instance_proto_checked(native_new_target, callee, default)? {
+                self.realm.set_object_proto(obj, Some(proto));
+            }
+            // Step 13: a final `IsDetachedBuffer` check — the proto getter may have
+            // run user code that detached the buffer; a `DataView` must never be
+            // returned backed by a detached buffer.
+            self.guard_detached_buffer(bh)?;
             return Ok(NanBox::handle(obj.to_raw()));
         }
         // `new Int8Array(n)` / `new Uint8Array([…])` / `new T(buffer, off?, len?)` — a
@@ -2762,6 +2826,22 @@ impl<'a> Interp<'a> {
         if (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16).contains(&id) {
             let kind = (id - N_TYPED_ARRAY_BASE) as u8;
             let elem_size = TYPED_ARRAY_KINDS[kind as usize].1 as usize;
+            // AllocateTypedArray runs GetPrototypeFromConstructor(newTarget, …),
+            // invoking a (possibly throwing) `prototype` accessor. Per 23.2.5.1 this
+            // happens *before* argument processing when the first argument is an
+            // Object (or absent); but for a *primitive* length argument,
+            // `ToIndex(firstArgument)` is evaluated first (so `new TA(Symbol())`
+            // throws a TypeError, not the proto getter's error). `Some(_)` = resolved
+            // eagerly here; `None` = deferred until after the length ToIndex below.
+            let nt_proto: Option<Option<Handle>> = if args
+                .first()
+                .copied()
+                .is_some_and(|v| !self.is_object_value(v))
+            {
+                None
+            } else {
+                Some(self.typed_newtarget_proto(kind, callee)?)
+            };
             // `new T(buffer, byteOffset?, length?)` — a view over an existing ArrayBuffer.
             if let Some(v) = args.first()
                 && let Some(bh) = v.as_handle().map(Handle::from_raw)
@@ -2851,7 +2931,11 @@ impl<'a> Interp<'a> {
                 if !explicit_length && self.realm.get_property(bh, ARRAY_BUFFER_MAXLEN).is_some() {
                     self.realm.mark_length_tracking(view);
                 }
-                self.link_typed_array_proto(view, kind, callee);
+                // The buffer path is only entered for an Object first argument, so
+                // `nt_proto` was resolved eagerly above (`Some(_)`).
+                if let Some(Some(proto)) = nt_proto {
+                    self.realm.set_native_proto(view, proto);
+                }
                 return Ok(NanBox::handle(view.to_raw()));
             }
             // Otherwise allocate a fresh backing buffer and view it from offset 0.
@@ -2940,6 +3024,13 @@ impl<'a> Interp<'a> {
                 }
                 (None, None) => 0,
             };
+            // For a primitive length argument the proto access was deferred until
+            // *after* `ToIndex` above (23.2.5.1 step 6.c) — resolve it now, invoking
+            // (and propagating) a throwing `prototype` accessor before allocation.
+            let nt_proto = match nt_proto {
+                Some(p) => p,
+                None => self.typed_newtarget_proto(kind, callee)?,
+            };
             let buf = self.make_array_buffer(length * elem_size);
             let bytes_h = self.array_buffer_bytes(buf).unwrap();
             let view = self.realm.new_typed_array(bytes_h, buf, 0, length, kind);
@@ -2967,11 +3058,13 @@ impl<'a> Interp<'a> {
                 // Bulk write-through: one buffer borrow, no per-element heap lookup.
                 self.realm.typed_set_from_numbers(view, 0, &s);
             }
-            // Link the view's `[[Prototype]]` to the concrete constructor's
-            // `.prototype` (the *newTarget*'s under `Reflect.construct` /
-            // `TA.of`/`from` with a subclass), so `result.constructor`,
-            // `Object.getPrototypeOf(result)`, and inherited members resolve.
-            self.link_typed_array_proto(view, kind, callee);
+            // Link the view's `[[Prototype]]` to the resolved constructor prototype
+            // (the *newTarget*'s under `Reflect.construct` / a subclass `super()`),
+            // so `result.constructor`, `Object.getPrototypeOf(result)`, and inherited
+            // members resolve.
+            if let Some(proto) = nt_proto {
+                self.realm.set_native_proto(view, proto);
+            }
             return Ok(NanBox::handle(view.to_raw()));
         }
         // `new Number(x)` / `new String(x)` / `new Boolean(x)`: a primitive
@@ -3344,8 +3437,14 @@ impl<'a> Interp<'a> {
             let mut j = i;
             while j > 0 {
                 let order = if has_cmp {
+                    // `v = ? ToNumber(? Call(comparefn, …))`: the comparator result is
+                    // ToNumber-coerced *invoking `@@toPrimitive`/`valueOf`* (whose side
+                    // effects and abrupt completion are observable), not read with the
+                    // infallible `to_number` (which would yield `NaN` for an object
+                    // without running user code).
                     let r = self.call(cmp, &[elems[j - 1], elems[j]])?;
-                    self.realm.to_number(r)
+                    let n = self.coerce_to_number(r)?;
+                    self.realm.to_number(n)
                 } else if numeric {
                     // A typed array's default comparison is numeric ascending (with
                     // `NaN` sorting to the end).

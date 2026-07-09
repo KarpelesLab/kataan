@@ -74,6 +74,14 @@ pub(crate) enum Inst {
     LookBehind { neg: bool, prog: Vec<Inst> },
     /// A backreference: match the text previously captured by group `n`.
     Backref(usize),
+    /// A named backreference `\k<name>` where `name` is a **duplicate** capture
+    /// name (ES2025): references whichever of the listed groups participated (has a
+    /// recorded span); if none is set it matches the empty string.
+    BackrefMulti(alloc::vec::Vec<usize>),
+    /// Reset the capture slots `from..=to` before an iteration of a quantified atom
+    /// (ECMA-262 RepeatMatcher clears the atom's parentheses each repetition).
+    /// Backtrack-safe: the prior values are restored if the iteration fails.
+    ClearCaptures { from: usize, to: usize },
     /// Enter an inline-modifier scope `(?ims-ims:…)`: push the flag delta onto
     /// the flag stack so the enclosed instructions match under the adjusted
     /// `i`/`m`/`s` flags. Paired with a later [`Inst::PopFlags`].
@@ -440,6 +448,44 @@ fn backtrack(
                 }
                 saves[*slot] = old;
                 return false;
+            }
+            Inst::ClearCaptures { from, to } => {
+                let lo = (*from).min(saves.len());
+                let hi = (*to + 1).min(saves.len());
+                let saved: alloc::vec::Vec<Option<usize>> = saves[lo..hi].to_vec();
+                for s in &mut saves[lo..hi] {
+                    *s = None;
+                }
+                if backtrack(ctx, pc + 1, sp, saves, depth + 1, loops, flags_stack) {
+                    return true;
+                }
+                saves[lo..hi].clone_from_slice(&saved);
+                return false;
+            }
+            Inst::BackrefMulti(groups) => {
+                let span = groups.iter().find_map(|g| {
+                    match (
+                        saves.get(2 * g).copied().flatten(),
+                        saves.get(2 * g + 1).copied().flatten(),
+                    ) {
+                        (Some(s), Some(e)) => Some((s, e)),
+                        _ => None,
+                    }
+                });
+                match span {
+                    Some((s, e)) => {
+                        let len = e - s;
+                        if sp + len <= ctx.input.len()
+                            && (0..len).all(|i| unit_eq(ctx.input[sp + i], ctx.input[s + i], cur))
+                        {
+                            sp += len;
+                            pc += 1;
+                        } else {
+                            return false;
+                        }
+                    }
+                    None => pc += 1,
+                }
             }
             Inst::Look { neg, prog } => {
                 // Zero-width: run the sub-program at `sp`. A *positive* lookahead
