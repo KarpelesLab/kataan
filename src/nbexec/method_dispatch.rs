@@ -88,6 +88,33 @@ impl<'a> Interp<'a> {
         // read as an array-like (each UTF-16 unit an element), so the String
         // primitive/wrapper method handlers below must NOT intercept this method.
         let force_array_like = array_proto_generic && ARRAY_LIKE_METHODS.contains(&method);
+        // `Array.prototype.{push,pop,shift,unshift}.call(str)`: ToObject(str) is a
+        // String exotic object whose `length` (and character indices) are
+        // non-writable / non-configurable, so the operation's trailing
+        // `Set(O, "length", …, true)` (and any element `Set`/`Delete`) always fails
+        // → a TypeError. A String *primitive* is not otherwise treated as a generic
+        // array-like target (its UTF-16 units are invisible to `HasProperty`), so
+        // intercept these length-mutating forms here.
+        if matches!(method, "push" | "pop" | "shift" | "unshift")
+            && recv.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                // A String primitive (`Cell::Str`) or a String wrapper (an object
+                // boxing a string under `PRIM_WRAP` — a primitive `this` is boxed via
+                // ToObject before the method dispatch runs). Strings never own these
+                // methods, so reaching here with a string receiver is necessarily a
+                // generic `Array.prototype.<m>.call(str)` application.
+                self.realm.string_value(h).is_some()
+                    || self
+                        .realm
+                        .get_property(h, PRIM_WRAP)
+                        .and_then(|p| p.as_handle())
+                        .map(Handle::from_raw)
+                        .is_some_and(|ph| self.realm.string_value(ph).is_some())
+            })
+        {
+            return Err(self.type_error(&alloc::format!(
+                "Array.prototype.{method} cannot set the non-writable length of a String"
+            )));
+        }
 
         // A primitive wrapper object (`new Number`/`String`/`Boolean`): `valueOf`
         // recovers the boxed primitive; every other method delegates to it. Skip
@@ -3046,18 +3073,21 @@ impl<'a> Interp<'a> {
             }
             // Per spec the length-mutating methods finish with
             // Set(O, "length", …, Throw=true), which throws a TypeError when the
-            // array's `length` is non-writable (explicitly demoted or frozen). The
-            // throw fires whenever the operation would actually change `length`
-            // (push/unshift with items, pop/shift on a non-empty array); a no-op
-            // form (`push()`, `pop()` on `[]`) sets `length` to its current value
-            // and does not throw.
+            // array's `length` is non-writable (explicitly demoted or frozen). This
+            // `Set` is *unconditional* — it fires even for a no-arg `push()`/
+            // `unshift()` or a `pop()`/`shift()` on an empty array (the spec still
+            // performs `Set(O, "length", +0𝔽, true)`), so a non-writable length
+            // throws in every one of these cases.
+            let length_readonly_throw = |this: &mut Self| -> ExecError {
+                let m = this.new_str(
+                    "Cannot assign to read only property 'length' of object '[object Array]'",
+                );
+                ExecError::Throw(this.make_error(N_TYPE_ERROR, Some(m)))
+            };
             match method {
                 "push" => {
-                    if !args.is_empty() && self.realm.array_length_is_readonly(handle) {
-                        let m = self.new_str(
-                            "Cannot assign to read only property 'length' of object '[object Array]'",
-                        );
-                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    if self.realm.array_length_is_readonly(handle) {
+                        return Err(length_readonly_throw(self));
                     }
                     let mut len = elems.len();
                     for a in args {
@@ -3066,25 +3096,19 @@ impl<'a> Interp<'a> {
                     return Ok(Some(NanBox::number(len as f64)));
                 }
                 "pop" => {
-                    if !elems.is_empty() && self.realm.array_length_is_readonly(handle) {
-                        let m = self.new_str(
-                            "Cannot assign to read only property 'length' of object '[object Array]'",
-                        );
-                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    if self.realm.array_length_is_readonly(handle) {
+                        return Err(length_readonly_throw(self));
                     }
                     return Ok(Some(self.realm.array_pop(handle)));
                 }
                 // `splice(start, deleteCount?, ...items)` — mutate in place,
                 // return the removed elements as a new array.
                 "shift" => {
+                    if self.realm.array_length_is_readonly(handle) {
+                        return Err(length_readonly_throw(self));
+                    }
                     if elems.is_empty() {
                         return Ok(Some(NanBox::undefined()));
-                    }
-                    if self.realm.array_length_is_readonly(handle) {
-                        let m = self.new_str(
-                            "Cannot assign to read only property 'length' of object '[object Array]'",
-                        );
-                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                     }
                     // The removed first element: a hole is read as `undefined`
                     // (the sentinel never escapes). The remaining elements keep
@@ -3099,11 +3123,8 @@ impl<'a> Interp<'a> {
                     return Ok(Some(first));
                 }
                 "unshift" => {
-                    if !args.is_empty() && self.realm.array_length_is_readonly(handle) {
-                        let m = self.new_str(
-                            "Cannot assign to read only property 'length' of object '[object Array]'",
-                        );
-                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    if self.realm.array_length_is_readonly(handle) {
+                        return Err(length_readonly_throw(self));
                     }
                     let mut next: Vec<NanBox> = args.to_vec();
                     next.extend_from_slice(&elems);
@@ -3141,7 +3162,7 @@ impl<'a> Interp<'a> {
                     };
                     let default_rem = self.realm.is_array(rem_h)
                         && self.realm.array_length(rem_h) == Some(delete)
-                        && !self.realm.is_frozen(rem_h);
+                        && !self.realm.array_has_index_overrides(rem_h);
                     for (i, e) in removed.iter().enumerate() {
                         if e.is_hole() {
                             continue;
@@ -3565,19 +3586,16 @@ impl<'a> Interp<'a> {
                     let this_arg = arg(1);
                     let arr = callback_recv;
                     let typed = self.realm.typed_kind(handle).is_some();
-                    // A typed array re-reads each element live by index; a plain array
-                    // reads its snapshot at the same index — an index loop is required.
+                    let live = !typed && self.realm.is_array(handle);
+                    // A typed array / real array re-reads each element live by index
+                    // (a callback mutation is observed); a materialized generic
+                    // array-like reads its snapshot. Holes are skipped.
                     #[allow(clippy::needless_range_loop)]
                     for i in 0..elems.len() {
-                        // Typed array: re-read live (a callback resize/detach is
-                        // observed). Plain array skips holes.
-                        let e = if typed {
-                            self.realm
-                                .typed_get(handle, i)
-                                .unwrap_or_else(NanBox::undefined)
-                        } else if is_present(i) {
-                            elems[i]
-                        } else {
+                        let present = is_present(i);
+                        let Some(e) =
+                            self.array_cb_read(handle, i, typed, live, &elems, present, true)?
+                        else {
                             continue;
                         };
                         let cb_args = [e, NanBox::number(i as f64), arr];
@@ -3589,15 +3607,7 @@ impl<'a> Interp<'a> {
                     let f = arg(0);
                     let arr = callback_recv;
                     let typed = self.realm.typed_kind(handle).is_some();
-                    let read = |this: &mut Self, i: usize| -> NanBox {
-                        if typed {
-                            this.realm
-                                .typed_get(handle, i)
-                                .unwrap_or_else(NanBox::undefined)
-                        } else {
-                            elems[i]
-                        }
-                    };
+                    let live = !typed && self.realm.is_array(handle);
                     let mut acc;
                     let mut start = 0;
                     if args.len() >= 2 {
@@ -3605,12 +3615,21 @@ impl<'a> Interp<'a> {
                     } else {
                         // Seed from the first *present* element; a holes-only (or
                         // empty) array with no initial value is a TypeError.
-                        let first = (0..elems.len()).find(|&i| typed || is_present(i));
-                        match first {
-                            Some(i) => {
-                                acc = read(self, i);
-                                start = i + 1;
+                        let mut seed = None;
+                        let mut k = 0;
+                        while k < elems.len() {
+                            let present = is_present(k);
+                            if let Some(v) =
+                                self.array_cb_read(handle, k, typed, live, &elems, present, true)?
+                            {
+                                seed = Some(v);
+                                start = k + 1;
+                                break;
                             }
+                            k += 1;
+                        }
+                        match seed {
+                            Some(v) => acc = v,
                             None => {
                                 let m = self.new_str("Reduce of empty array with no initial value");
                                 return Err(ExecError::Throw(
@@ -3620,10 +3639,12 @@ impl<'a> Interp<'a> {
                         }
                     }
                     for i in start..elems.len() {
-                        if !typed && !is_present(i) {
-                            continue; // holes are skipped (plain array)
-                        }
-                        let e = read(self, i);
+                        let present = is_present(i);
+                        let Some(e) =
+                            self.array_cb_read(handle, i, typed, live, &elems, present, true)?
+                        else {
+                            continue; // holes are skipped
+                        };
                         acc = self.call(f, &[acc, e, NanBox::number(i as f64), arr])?;
                     }
                     return Ok(Some(acc));
@@ -3633,27 +3654,28 @@ impl<'a> Interp<'a> {
                     let f = arg(0);
                     let arr = callback_recv;
                     let typed = self.realm.typed_kind(handle).is_some();
-                    let read = |this: &mut Self, i: usize| -> NanBox {
-                        if typed {
-                            this.realm
-                                .typed_get(handle, i)
-                                .unwrap_or_else(NanBox::undefined)
-                        } else {
-                            elems[i]
-                        }
-                    };
+                    let live = !typed && self.realm.is_array(handle);
                     let mut acc;
                     let mut idx = elems.len();
                     if args.len() >= 2 {
                         acc = arg(1);
                     } else {
                         // Seed from the last present element.
-                        let last = (0..elems.len()).rev().find(|&i| typed || is_present(i));
-                        match last {
-                            Some(i) => {
-                                acc = read(self, i);
-                                idx = i;
+                        let mut seed = None;
+                        let mut k = elems.len();
+                        while k > 0 {
+                            k -= 1;
+                            let present = is_present(k);
+                            if let Some(v) =
+                                self.array_cb_read(handle, k, typed, live, &elems, present, true)?
+                            {
+                                seed = Some(v);
+                                idx = k;
+                                break;
                             }
+                        }
+                        match seed {
+                            Some(v) => acc = v,
                             None => {
                                 let m = self.new_str("Reduce of empty array with no initial value");
                                 return Err(ExecError::Throw(
@@ -3664,10 +3686,12 @@ impl<'a> Interp<'a> {
                     }
                     while idx > 0 {
                         idx -= 1;
-                        if !typed && !is_present(idx) {
-                            continue; // holes are skipped (plain array)
-                        }
-                        let e = read(self, idx);
+                        let present = is_present(idx);
+                        let Some(e) =
+                            self.array_cb_read(handle, idx, typed, live, &elems, present, true)?
+                        else {
+                            continue; // holes are skipped
+                        };
                         acc = self.call(f, &[acc, e, NanBox::number(idx as f64), arr])?;
                     }
                     return Ok(Some(acc));
@@ -3732,9 +3756,12 @@ impl<'a> Interp<'a> {
                     let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
                         return Err(self.type_error("Array species did not return an object"));
                     };
+                    // Only a pristine dense species result (no per-index overrides)
+                    // may take the raw write-through; a custom species with existing
+                    // non-default index attributes needs CreateDataPropertyOrThrow.
                     let default_array = self.realm.is_array(a_h)
                         && self.realm.array_length(a_h) == Some(count)
-                        && !self.realm.is_frozen(a_h);
+                        && !self.realm.array_has_index_overrides(a_h);
                     for (k, e) in elems[a..b].iter().enumerate() {
                         if e.is_hole() {
                             continue;
@@ -4083,15 +4110,12 @@ impl<'a> Interp<'a> {
                 "find" => {
                     let f = arg(0);
                     let typed = self.realm.typed_kind(handle).is_some();
+                    let live = !typed && self.realm.is_array(handle);
                     #[allow(clippy::needless_range_loop)]
                     for i in 0..elems.len() {
-                        let e = if typed {
-                            self.realm
-                                .typed_get(handle, i)
-                                .unwrap_or_else(NanBox::undefined)
-                        } else {
-                            elems[i]
-                        };
+                        let e = self
+                            .array_cb_read(handle, i, typed, live, &elems, false, false)?
+                            .unwrap_or_else(NanBox::undefined);
                         if self.call_truthy_this(
                             f,
                             arg(1),
@@ -4105,15 +4129,12 @@ impl<'a> Interp<'a> {
                 "findIndex" => {
                     let f = arg(0);
                     let typed = self.realm.typed_kind(handle).is_some();
+                    let live = !typed && self.realm.is_array(handle);
                     #[allow(clippy::needless_range_loop)]
                     for i in 0..elems.len() {
-                        let e = if typed {
-                            self.realm
-                                .typed_get(handle, i)
-                                .unwrap_or_else(NanBox::undefined)
-                        } else {
-                            elems[i]
-                        };
+                        let e = self
+                            .array_cb_read(handle, i, typed, live, &elems, false, false)?
+                            .unwrap_or_else(NanBox::undefined);
                         if self.call_truthy_this(
                             f,
                             arg(1),
@@ -4128,15 +4149,12 @@ impl<'a> Interp<'a> {
                 "findLast" => {
                     let f = arg(0);
                     let typed = self.realm.typed_kind(handle).is_some();
+                    let live = !typed && self.realm.is_array(handle);
                     #[allow(clippy::needless_range_loop)]
                     for i in (0..elems.len()).rev() {
-                        let e = if typed {
-                            self.realm
-                                .typed_get(handle, i)
-                                .unwrap_or_else(NanBox::undefined)
-                        } else {
-                            elems[i]
-                        };
+                        let e = self
+                            .array_cb_read(handle, i, typed, live, &elems, false, false)?
+                            .unwrap_or_else(NanBox::undefined);
                         if self.call_truthy_this(
                             f,
                             arg(1),
@@ -4150,15 +4168,12 @@ impl<'a> Interp<'a> {
                 "findLastIndex" => {
                     let f = arg(0);
                     let typed = self.realm.typed_kind(handle).is_some();
+                    let live = !typed && self.realm.is_array(handle);
                     #[allow(clippy::needless_range_loop)]
                     for i in (0..elems.len()).rev() {
-                        let e = if typed {
-                            self.realm
-                                .typed_get(handle, i)
-                                .unwrap_or_else(NanBox::undefined)
-                        } else {
-                            elems[i]
-                        };
+                        let e = self
+                            .array_cb_read(handle, i, typed, live, &elems, false, false)?
+                            .unwrap_or_else(NanBox::undefined);
                         if self.call_truthy_this(
                             f,
                             arg(1),
@@ -4172,17 +4187,15 @@ impl<'a> Interp<'a> {
                 "some" => {
                     let f = arg(0);
                     let typed = self.realm.typed_kind(handle).is_some();
+                    let live = !typed && self.realm.is_array(handle);
                     #[allow(clippy::needless_range_loop)]
                     for i in 0..elems.len() {
-                        // Typed array: re-read live (a callback resize/detach is
-                        // observed; values are not cached). Plain array skips holes.
-                        let e = if typed {
-                            self.realm
-                                .typed_get(handle, i)
-                                .unwrap_or_else(NanBox::undefined)
-                        } else if is_present(i) {
-                            elems[i]
-                        } else {
+                        // Typed array: re-read live. Real array: live `[[Get]]` (a
+                        // callback mutation is observed). Both skip absent indices.
+                        let present = is_present(i);
+                        let Some(e) =
+                            self.array_cb_read(handle, i, typed, live, &elems, present, true)?
+                        else {
                             continue;
                         };
                         if self.call_truthy_this(
@@ -4198,15 +4211,13 @@ impl<'a> Interp<'a> {
                 "every" => {
                     let f = arg(0);
                     let typed = self.realm.typed_kind(handle).is_some();
+                    let live = !typed && self.realm.is_array(handle);
                     #[allow(clippy::needless_range_loop)]
                     for i in 0..elems.len() {
-                        let e = if typed {
-                            self.realm
-                                .typed_get(handle, i)
-                                .unwrap_or_else(NanBox::undefined)
-                        } else if is_present(i) {
-                            elems[i]
-                        } else {
+                        let present = is_present(i);
+                        let Some(e) =
+                            self.array_cb_read(handle, i, typed, live, &elems, present, true)?
+                        else {
                             continue;
                         };
                         if !self.call_truthy_this(
@@ -4504,6 +4515,52 @@ impl<'a> Interp<'a> {
     /// `LengthOfArrayLike(O)` — `ToLength(Get(O, "length"))`, clamped to a `usize`
     /// the engine can index (the 2**53-1 spec cap is far beyond a materializable
     /// array, so a tighter cap is applied to keep the operations bounded).
+    /// Per-iteration element read for an `Array.prototype` callback / scan method
+    /// (`forEach`/`some`/`every`/`reduce`/`reduceRight`/`find*`). ECMA-262 has each
+    /// step do `HasProperty(O, k)` then `Get(O, k)` **live**, so a callback (or an
+    /// index getter) that mutates the array mid-iteration is observed.
+    ///
+    /// - A typed-array view reads its live bytes.
+    /// - A *real* `Array` reads live through `[[Get]]`/`HasProperty` (`live`).
+    /// - A materialized *generic array-like* keeps the pre-read `snapshot`
+    ///   (`snapshot_present` = whether that index was present) — the lazy-scan path
+    ///   already handles the common generic-array-like case; this preserves the
+    ///   existing behaviour for the materialize path.
+    ///
+    /// Returns `Ok(None)` when `skip_holes` is set and the index is absent (the
+    /// hole-skipping methods `forEach`/`some`/`every`/`reduce`/`reduceRight`);
+    /// `find*` pass `skip_holes = false` and read an absent index as `undefined`.
+    #[allow(clippy::too_many_arguments)]
+    fn array_cb_read(
+        &mut self,
+        handle: Handle,
+        i: usize,
+        typed: bool,
+        live: bool,
+        snapshot: &[NanBox],
+        snapshot_present: bool,
+        skip_holes: bool,
+    ) -> Result<Option<NanBox>, ExecError> {
+        if typed {
+            return Ok(Some(
+                self.realm
+                    .typed_get(handle, i)
+                    .unwrap_or_else(NanBox::undefined),
+            ));
+        }
+        if live {
+            let key = alloc::format!("{i}");
+            if skip_holes && !self.has_property(handle, &key) {
+                return Ok(None);
+            }
+            return Ok(Some(self.read_member(handle, &key)?));
+        }
+        if skip_holes && !snapshot_present {
+            return Ok(None);
+        }
+        Ok(Some(snapshot.get(i).copied().unwrap_or_else(NanBox::hole)))
+    }
+
     /// `ArraySpeciesCreate(originalArray, length)` (ECMA-262 23.1.3.13.1): if
     /// `originalArray` is an Array, consult `Get(O,"constructor")` then
     /// `Get(C, @@species)`; an `undefined`/`null` species (or a non-Array
@@ -4521,8 +4578,12 @@ impl<'a> Interp<'a> {
             return Ok(NanBox::handle(self.realm.new_array(v).to_raw()));
         }
         let mut c = self.read_member(original, "constructor")?;
-        // If C is an object, read C[@@species]; undefined/null → default.
-        if let Some(ch) = c.as_handle().map(Handle::from_raw) {
+        // Step 5: "If C is an Object" — read C[@@species]; null → default. Note a
+        // primitive that happens to be heap-allocated (string / symbol / bigint) is
+        // NOT an Object, so it must fall through to the IsConstructor(C) check (step
+        // 7) and throw, rather than being probed for `@@species`.
+        if self.is_object_value(c) {
+            let ch = Handle::from_raw(c.as_handle().expect("object value is a handle"));
             let species_sym = self.well_known_symbol("species");
             let species_key = self.member_key(species_sym);
             let s = self.read_member(ch, &species_key)?;
@@ -4531,9 +4592,6 @@ impl<'a> Interp<'a> {
             } else {
                 s
             };
-        } else if !matches!(c.unpack(), Unpacked::Undefined) {
-            // A non-object, non-undefined `constructor` is a TypeError.
-            return Err(self.type_error("Array species constructor is not an object"));
         }
         // Default Array constructor (or `constructor`/species undefined) → an
         // ordinary array of `length` holes.
@@ -4714,7 +4772,13 @@ impl<'a> Interp<'a> {
     }
 
     fn array_like_delete(&mut self, handle: Handle, i: usize) -> Result<(), ExecError> {
-        self.delete_property_of(handle, &alloc::format!("{i}"))?;
+        // The generic `Array.prototype` mutators delete via `DeletePropertyOrThrow`
+        // (ECMA-262 23.1.3): a failed `[[Delete]]` (a non-configurable index) is a
+        // TypeError, not a silent drop.
+        let key = alloc::format!("{i}");
+        if !self.delete_property_of(handle, &key)? {
+            return Err(self.type_error(&alloc::format!("Cannot delete property '{key}'")));
+        }
         Ok(())
     }
 
@@ -4756,7 +4820,29 @@ impl<'a> Interp<'a> {
     /// The *mutating* generic `Array.prototype` methods over a non-array array-like
     /// `O`: each operates by `Get`/`Set`/`Delete` on integer-index keys and the
     /// `length` property (ECMA-262 23.1.3 — these are "intentionally generic").
+    ///
+    /// Every `Set`/`Delete` these methods perform carries `Throw=true` (they use
+    /// `Set(O, P, V, true)` / `DeletePropertyOrThrow`), independent of the caller's
+    /// strict mode — e.g. `Array.prototype.push.call("")` must throw because a
+    /// String exotic's `length` is non-writable. `assign_member_value` /
+    /// `delete_property_of` key their throw-on-failure off `self.strict`, so force
+    /// a strict context for the duration of the (self-contained) mutation. A user
+    /// setter invoked mid-operation runs with its own function strictness, so this
+    /// only governs the failed-[[Set]]/[[Delete]] throw here.
     fn array_like_mutate(
+        &mut self,
+        method: &str,
+        handle: Handle,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let saved_strict = self.strict;
+        self.strict = true;
+        let r = self.array_like_mutate_impl(method, handle, args);
+        self.strict = saved_strict;
+        r
+    }
+
+    fn array_like_mutate_impl(
         &mut self,
         method: &str,
         handle: Handle,

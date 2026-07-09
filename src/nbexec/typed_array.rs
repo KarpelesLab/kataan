@@ -485,9 +485,16 @@ impl<'a> Interp<'a> {
             let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
                 return Err(self.type_error("Array species did not return an object"));
             };
+            // The bulk `set_element` write-through is only sound when the result is
+            // a *pristine* dense array (as `ArrayCreate(n)` produces): same length,
+            // no frozen/sealed/per-index-descriptor overrides. A custom `@@species`
+            // may hand back an array that already carries indices with non-default
+            // attributes (e.g. a non-writable/non-enumerable data slot), which must
+            // be overwritten via `CreateDataPropertyOrThrow` (a full DefineOwnProperty
+            // that resets attributes) — not a raw value store that preserves them.
             let default_array = self.realm.is_array(a_h)
                 && self.realm.array_length(a_h) == Some(n)
-                && !self.realm.is_frozen(a_h);
+                && !self.realm.array_has_index_overrides(a_h);
             for (i, e) in elems.iter().enumerate() {
                 if e.is_hole() {
                     continue;

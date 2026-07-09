@@ -1941,11 +1941,17 @@ impl<'a> Interp<'a> {
         if name == "lastIndex" && self.realm.regexp_at(handle).is_some() {
             return self.regex_write_last_index(handle, new);
         }
-        // An own accessor setter takes precedence.
+        // An own accessor setter takes precedence. A getter-only accessor (no
+        // setter) cannot be written: strict mode throws a TypeError, sloppy drops.
         if let Some((_, setter)) = self.realm.accessor(handle, &name) {
             if !matches!(setter.unpack(), Unpacked::Undefined) {
                 let this = NanBox::handle(handle.to_raw());
                 self.call_with_this(setter, this, &[new])?;
+            } else if self.strict {
+                let m = self.new_str(&alloc::format!(
+                    "Cannot assign to read only property '{name}' (accessor has no setter)"
+                ));
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
             return Ok(());
         }
