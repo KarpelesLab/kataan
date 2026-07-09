@@ -702,6 +702,44 @@ impl<'a> Interp<'a> {
                         self.make_error(N_REFERENCE_ERROR, Some(m)),
                     ));
                 }
+                // `++super[key]` / `super.x--`: the SuperProperty reference is
+                // evaluated once (GetThisBinding, then — for a computed key — the key
+                // expression + GetSuperBase, captured before ToPropertyKey), then
+                // GetValue and PutValue share it.
+                if let Expr::Member {
+                    object, property, ..
+                } = &**argument
+                    && matches!(&**object, Expr::Super(_))
+                {
+                    self.require_super_this()?;
+                    let (name, obj_base) = match property {
+                        PropertyKey::Computed(key_expr) => {
+                            let k = self.eval(key_expr)?;
+                            let obj_base = self.object_super_base();
+                            (self.coerce_property_key(k)?, obj_base)
+                        }
+                        _ => {
+                            let name = self.eval_prop_key(property)?;
+                            (name, self.object_super_base())
+                        }
+                    };
+                    let current = match obj_base {
+                        Some(Some(proto)) => self.read_super_member_object(proto, &name)?,
+                        Some(None) => {
+                            return Err(self.type_error("Cannot read property of null (super)"));
+                        }
+                        None => self.resolve_super_member(&name)?,
+                    };
+                    let (old, next) = self.update_value(*op, current)?;
+                    match obj_base {
+                        Some(Some(proto)) => self.assign_super_member_object(proto, &name, next)?,
+                        Some(None) => {
+                            return Err(self.type_error("Cannot set property on null (super)"));
+                        }
+                        None => self.assign_super_member(&name, next)?,
+                    }
+                    return Ok(if *prefix { next } else { old });
+                }
                 // For a member target, the reference is evaluated exactly once: the
                 // base and (computed) key run once, then GetValue + PutValue share
                 // them — so `obj[keyWithSideEffect()]++` does not run the key twice.
@@ -883,6 +921,23 @@ impl<'a> Interp<'a> {
                         ));
                     };
                     let inst = inst_val.as_handle().map(Handle::from_raw);
+                    // GetSuperConstructor = GetPrototypeOf(the active derived
+                    // constructor). If it has been reassigned
+                    // (`Object.setPrototypeOf(Derived, notACtor)`) to something that is
+                    // not a constructor, `super(...)` throws a TypeError — *after*
+                    // ArgumentListEvaluation (above), per the SuperCall evaluation order.
+                    if let Some(cval) = self.class_handles.get(derived_cid as usize).copied()
+                        && let Some(ch) = cval.as_handle().map(Handle::from_raw)
+                    {
+                        let super_ctor = self
+                            .realm
+                            .object_proto(ch)
+                            .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw()));
+                        if !self.is_constructor_value(super_ctor) {
+                            let m = self.new_str("Super constructor is not a constructor");
+                            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                        }
+                    }
                     // Bind `this` and clear the pending marker BEFORE invoking the
                     // parent constructor — the parent's body (a base class, or a
                     // further-derived one after its own `super`) reads `this`, and
@@ -906,7 +961,11 @@ impl<'a> Interp<'a> {
                         None
                     } else if let Some(fnp) = self.pending_super_fn {
                         // `super(...)` reaching an ordinary-function superclass:
-                        // `[[Construct]]` — its object return overrides `this`.
+                        // `[[Construct]](args, newTarget)` — the SuperCall's newTarget
+                        // is the derived constructor's own `new.target` (so a
+                        // `Reflect.construct(Derived, …, NT)` threads `NT` into the base
+                        // function's `new.target`). Its object return overrides `this`.
+                        self.pending_new_target = Some(self.new_target);
                         Some(self.call_with_this(fnp, inst_val, &args)?)
                     } else {
                         return Err(ExecError::Unsupported(
@@ -926,7 +985,10 @@ impl<'a> Interp<'a> {
                     if let Some(h) = this_handle {
                         self.init_instance_fields(derived_cid, h)?;
                     }
-                    return Ok(NanBox::undefined());
+                    // `SuperCall` evaluates to the newly-bound `this` value
+                    // (`thisER.BindThisValue(result)`), which a base constructor's
+                    // object return may have overridden — so `x = super()` observes it.
+                    return Ok(self.this_val);
                 }
                 // `super.method(args)` — invoke the base-class method with the
                 // current `this`.
@@ -1415,7 +1477,21 @@ impl<'a> Interp<'a> {
                             let m = self.new_str("'super' keyword unexpected here");
                             return Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))));
                         }
+                        // GetThisBinding precedes evaluating the key expression: in a
+                        // derived constructor before `super()`, `this` is uninitialized
+                        // → ReferenceError, and the key expression is never evaluated.
+                        self.require_super_this()?;
                         let key = self.eval(key_expr)?;
+                        // For an object-literal method, GetSuperBase is captured here —
+                        // *before* ToPropertyKey — so a key whose `toString` mutates the
+                        // home object's prototype still reads from the original base.
+                        if let Some(base) = self.object_super_base() {
+                            let name = self.coerce_property_key(key)?;
+                            let Some(proto) = base else {
+                                return Err(self.type_error("Cannot read property of null (super)"));
+                            };
+                            return self.read_super_member_object(proto, &name);
+                        }
                         // `ToPropertyKey`: a Symbol key must become its sentinel
                         // form (so `super[Symbol.x]` reads the real symbol-keyed
                         // property — and, for a deferred namespace, does *not*
@@ -1423,6 +1499,7 @@ impl<'a> Interp<'a> {
                         let name = self.coerce_property_key(key)?;
                         return self.resolve_super_member(&name);
                     }
+                    self.require_super_this()?;
                     let name = match property {
                         PropertyKey::Ident(name) | PropertyKey::Str(name) => {
                             alloc::string::String::from(&**name)
@@ -3209,22 +3286,42 @@ impl<'a> Interp<'a> {
         } = target
             && matches!(&**object, Expr::Super(_))
         {
+            // GetThisBinding precedes evaluating the key expression: a derived
+            // constructor before `super()` throws ReferenceError here, never running
+            // the key or the RHS.
+            self.require_super_this()?;
             // Evaluate the key *expression* first; for a plain assignment the RHS
             // is evaluated before the key is ToPropertyKey-coerced, so
             // `super[obj] = rhs()` runs `rhs` before `obj.toString` (the spec
             // defers a super reference's key coercion past the RHS). A compound op
             // must read `super[key]` first, so it coerces the key up front.
             let k = self.eval(key_expr)?;
+            // For an object-literal method, GetSuperBase is captured now — before
+            // ToPropertyKey — so a key whose `toString` mutates the home object's
+            // prototype still targets the original base for both read and write.
+            let obj_base = self.object_super_base();
             let (name, new) = if op == AssignOp::Assign {
                 let rhs = self.eval(value)?;
                 (self.coerce_property_key(k)?, rhs)
             } else {
                 let name = self.coerce_property_key(k)?;
-                let current = self.resolve_super_member(&name)?;
+                let current = match obj_base {
+                    Some(Some(proto)) => self.read_super_member_object(proto, &name)?,
+                    Some(None) => {
+                        return Err(self.type_error("Cannot read property of null (super)"));
+                    }
+                    None => self.resolve_super_member(&name)?,
+                };
                 let rhs = self.eval(value)?;
                 (name, self.binary(compound_op(op)?, current, rhs)?)
             };
-            self.assign_super_member(&name, new)?;
+            match obj_base {
+                Some(Some(proto)) => self.assign_super_member_object(proto, &name, new)?,
+                Some(None) => {
+                    return Err(self.type_error("Cannot set property on null (super)"));
+                }
+                None => self.assign_super_member(&name, new)?,
+            }
             return Ok(new);
         }
         // A *compound* assignment to a static (non-computed, non-super) member

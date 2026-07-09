@@ -1348,6 +1348,7 @@ impl<'a> Interp<'a> {
                 object, property, ..
             } => {
                 if matches!(&**object, Expr::Super(_)) {
+                    self.require_super_this()?;
                     let name = self.eval_prop_key(property)?;
                     return Ok(AssignRef::Super { name });
                 }
@@ -1426,6 +1427,7 @@ impl<'a> Interp<'a> {
             } => {
                 // `super.x = v` invokes the inherited setter with the current `this`.
                 if matches!(&**object, Expr::Super(_)) {
+                    self.require_super_this()?;
                     let name = self.eval_prop_key(property)?;
                     return self.assign_super_member(&name, value);
                 }

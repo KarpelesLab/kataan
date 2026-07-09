@@ -913,6 +913,12 @@ impl<'a> Interp<'a> {
             if let Some(sp) = super_proto {
                 self.realm.set_object_proto(proto, Some(sp));
             }
+        } else if class.super_class.is_some() {
+            // `class C extends null {}`: an explicit heritage evaluated to `null`, so
+            // `C.prototype.[[Prototype]]` is `null` (not `Object.prototype`). This
+            // makes `super.x` inside an instance method a `RequireObjectCoercible`
+            // TypeError, per GetSuperBase.
+            self.realm.set_object_proto(proto, None);
         }
 
         // Install this class's own instance methods/accessors.
@@ -1329,6 +1335,76 @@ impl<'a> Interp<'a> {
         result
     }
 
+    /// `GetThisBinding` for a `SuperProperty` / `SuperCall`: inside a *derived*
+    /// constructor before `super(...)` has run, the `this` binding is still in its
+    /// temporal dead zone, so any reference to `super.x` / `super[e]` (which begins
+    /// by evaluating `GetThisBinding`) is a `ReferenceError` — thrown *before* the
+    /// (computed) key expression is evaluated.
+    pub(crate) fn require_super_this(&mut self) -> Result<(), ExecError> {
+        if self.this_val.is_tdz() {
+            let m = self
+                .new_str("Must call super constructor before accessing 'this' or a super property");
+            return Err(ExecError::Throw(
+                self.make_error(N_REFERENCE_ERROR, Some(m)),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `GetSuperBase` for the currently-running *object-literal* method:
+    /// `GetPrototypeOf(HomeObject)` where the home object is the object literal
+    /// itself. Returns `Some(base)` where `base` is `None` when that prototype is
+    /// `null` (the caller then throws `RequireObjectCoercible`); `None` means we are
+    /// not in an object-literal super context (a class method — handled elsewhere).
+    pub(crate) fn object_super_base(&self) -> Option<Option<Handle>> {
+        if self.current_home.is_none()
+            && let Some(home) = self.current_home_object
+        {
+            return Some(self.realm.object_proto(home));
+        }
+        None
+    }
+
+    /// `super.name` read against an already-captured object-literal super base
+    /// `proto` (`base.[[Get]](name, this)`): an inherited getter runs with the
+    /// current `this` as the receiver; otherwise the data property is read.
+    pub(crate) fn read_super_member_object(
+        &mut self,
+        proto: Handle,
+        name: &str,
+    ) -> Result<NanBox, ExecError> {
+        if let Some((getter, _)) = self.realm.accessor(proto, name) {
+            if matches!(getter.unpack(), Unpacked::Undefined) {
+                return Ok(NanBox::undefined());
+            }
+            return self.call_with_this(getter, self.this_val, &[]);
+        }
+        self.read_member(proto, name)
+    }
+
+    /// `super.name = value` against an already-captured object-literal super base
+    /// `proto` (`base.[[Set]](name, value, this)`): an inherited setter runs with
+    /// the current `this` as the receiver; otherwise the write lands on `this`
+    /// through the strict-aware member path (so a frozen receiver throws in strict).
+    pub(crate) fn assign_super_member_object(
+        &mut self,
+        proto: Handle,
+        name: &str,
+        value: NanBox,
+    ) -> Result<(), ExecError> {
+        if let Some((_, setter)) = self.realm.accessor(proto, name)
+            && !matches!(setter.unpack(), Unpacked::Undefined)
+        {
+            self.call_with_this(setter, self.this_val, &[value])?;
+            return Ok(());
+        }
+        if let Some(th) = self.this_val.as_handle().map(Handle::from_raw) {
+            let key = self.new_str(name);
+            self.assign_member_value(th, key, value)?;
+        }
+        Ok(())
+    }
+
     /// Finds `name` as a method in the superclass chain of the currently-running
     /// method's home class, returning a callable bound to the base definition.
     pub(crate) fn resolve_super_method(&mut self, name: &str) -> Result<NanBox, ExecError> {
@@ -1441,20 +1517,16 @@ impl<'a> Interp<'a> {
         value: NanBox,
     ) -> Result<(), ExecError> {
         // An object-literal method: `super.x = v` uses `HomeObject.[[Prototype]]`.
+        // GetSuperBase = HomeObject.[[GetPrototypeOf]](); PutValue on a
+        // SuperProperty performs RequireObjectCoercible, so a null super base
+        // (e.g. `Object.setPrototypeOf(obj, null)`) is a TypeError.
         if self.current_home.is_none()
             && let Some(home) = self.current_home_object
         {
-            if let Some(proto) = self.realm.object_proto(home)
-                && let Some((_, setter)) = self.realm.accessor(proto, name)
-                && !matches!(setter.unpack(), Unpacked::Undefined)
-            {
-                self.call_with_this(setter, self.this_val, &[value])?;
-                return Ok(());
-            }
-            if let Some(th) = self.this_val.as_handle().map(Handle::from_raw) {
-                self.realm.set_property(th, name, value);
-            }
-            return Ok(());
+            let Some(proto) = self.realm.object_proto(home) else {
+                return Err(self.type_error("Cannot set property on null (super)"));
+            };
+            return self.assign_super_member_object(proto, name, value);
         }
         let home = self
             .current_home
@@ -1539,17 +1611,21 @@ impl<'a> Interp<'a> {
             let Some(proto) = self.realm.object_proto(home) else {
                 return Err(self.type_error("Cannot read property of null (super)"));
             };
-            if let Some((getter, _)) = self.realm.accessor(proto, name) {
-                if matches!(getter.unpack(), Unpacked::Undefined) {
-                    return Ok(NanBox::undefined());
-                }
-                return self.call_with_this(getter, self.this_val, &[]);
-            }
-            return self.read_member(proto, name);
+            return self.read_super_member_object(proto, name);
         }
         let home = self
             .current_home
             .ok_or(ExecError::Unsupported("super outside a method"))?;
+        // GetSuperBase for a class instance method = GetPrototypeOf(class.prototype).
+        // `class C extends null` leaves that prototype's `[[Prototype]]` null, so
+        // `? RequireObjectCoercible(GetSuperBase())` throws a TypeError (rather than
+        // silently reading `undefined`).
+        if !self.current_home_static {
+            let home_proto = self.class_prototype_by_id(home);
+            if self.realm.object_proto(home_proto).is_none() {
+                return Err(self.type_error("Cannot read property of null (super)"));
+            }
+        }
         let mut cur = self.resolve_super(
             self.classes[home as usize],
             &self.class_envs[home as usize].clone(),
