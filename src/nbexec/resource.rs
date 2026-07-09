@@ -470,6 +470,51 @@ impl<'a> Interp<'a> {
         self.eval_source_in_realm(idx, &source)
     }
 
+    /// `$262.evalScript(src)` — evaluate `src` as a **Script** in the *current*
+    /// realm's global environment. Unlike an indirect `eval` (which runs its
+    /// lexical declarations in a fresh, discarded declarative environment), a
+    /// script's top-level `let`/`const`/`class` become persistent global lexical
+    /// bindings, and a sloppy script's `var`/function bindings persist too. A
+    /// parse failure throws a SyntaxError.
+    pub(crate) fn eval_script_current_realm(&mut self, src: NanBox) -> Result<NanBox, ExecError> {
+        let source = self.coerce_to_string(src)?;
+        if self.eval_depth >= self.realm.limits.max_eval_depth {
+            let msg = self.new_str("Maximum call stack size exceeded");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(msg))));
+        }
+        // Parse first so a SyntaxError surfaces before any environment swap.
+        let program = self.parse_eval_program(&source, false, false, false, false)?;
+
+        let saved_current = self.current.clone();
+        let saved_var_scope = self.var_scope.clone();
+        let saved_this = self.this_val;
+        let saved_new_target = self.new_target;
+        let saved_strict = self.strict;
+
+        self.strict = has_use_strict(&program.body);
+        // A strict script gets its own child so its lexical declarations don't
+        // leak into the persistent global scope; a sloppy one runs in the global
+        // scope directly so `var`/function declarations persist.
+        self.current = if self.strict {
+            self.global_scope.child()
+        } else {
+            self.global_scope.clone()
+        };
+        self.var_scope = self.current.clone();
+        self.this_val = self.global_this;
+        self.new_target = NanBox::undefined();
+        self.eval_depth += 1;
+        let result = self.run_eval_body(program);
+        self.eval_depth -= 1;
+
+        self.current = saved_current;
+        self.var_scope = saved_var_scope;
+        self.this_val = saved_this;
+        self.new_target = saved_new_target;
+        self.strict = saved_strict;
+        result
+    }
+
     /// Evaluates `source` (as a Script) in the created realm at `idx`, swapping in
     /// that realm's global scope + intrinsics for the duration and restoring the
     /// caller's afterward. Shared by `evalScript` and `$262.agent.start` (which

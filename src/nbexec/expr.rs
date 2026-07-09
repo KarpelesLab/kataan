@@ -596,10 +596,23 @@ impl<'a> Interp<'a> {
                                 }
                             }
                         } else if let Expr::Ident(id) = argument {
-                            if self.current.get(&id.name).is_some() {
-                                // Deleting a resolvable lexical/var binding is a no-op
-                                // that returns `false` (bindings are non-deletable).
-                                result = false;
+                            if let Some(frame) = self.current.owner_frame(&id.name) {
+                                // A resolvable lexical/var binding is non-deletable
+                                // (a no-op returning `false`) EXCEPT a binding a
+                                // sloppy `eval` introduced as deletable into a
+                                // non-global variable environment
+                                // (EvalDeclarationInstantiation
+                                // `CreateMutableBinding(name, true)`): those are
+                                // removed and return `true`, after which the name
+                                // resolves to a ReferenceError.
+                                if !frame.ptr_eq(&self.global_scope)
+                                    && frame.is_local_deletable(&id.name)
+                                {
+                                    frame.delete_local(&id.name);
+                                    result = true;
+                                } else {
+                                    result = false;
+                                }
                             } else if let Some(h) = self.with_binding(&id.name) {
                                 // A bare name that resolves through a `with` object's
                                 // environment deletes that object's property — not the

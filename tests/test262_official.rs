@@ -61,7 +61,7 @@ var print = function () { var s = ''; for (var i = 0; i < arguments.length; i++)
 var $262 = {
   global: this,
   gc: function () {},
-  evalScript: function (src) { return (0, eval)(src); },
+  evalScript: function (src) { return $262_evalScript(src); },
   detachArrayBuffer: function (b) { return $262_detachArrayBuffer(b); },
   createRealm: function () { return $262_createRealm(); },
   IsHTMLDDA: $262_IsHTMLDDA(),

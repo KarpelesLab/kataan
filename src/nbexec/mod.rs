@@ -304,6 +304,15 @@ pub struct Interp<'a> {
     /// `var` and top-level function declarations hoist into. Tracks where the
     /// Annex B.3.3 runtime binding-update writes a block-level function value.
     var_scope: Scope,
+    /// Override for the variable environment of the *next* eval body's hoisting
+    /// pass (the spec's `varEnv`, distinct from the fresh lexical env `lexEnv`).
+    /// A sloppy `eval` runs its lexical (`let`/`const`/`class`) declarations in a
+    /// fresh child scope, but hoists its `var`/function declarations OUT into the
+    /// caller's variable environment (direct) or the global environment
+    /// (indirect). Set by `eval_string`, consumed (taken) by the eval body's
+    /// `hoist_with_kind`; `None` for ordinary function/program hoisting (where
+    /// `varEnv == lexEnv`).
+    eval_var_scope: Option<Scope>,
     /// The names of block-level function declarations that the Annex B.3.3
     /// legacy extension var-hoists into the current variable environment — i.e.
     /// the only names whose outer `var` binding is updated when a block function
@@ -1575,6 +1584,12 @@ const N_262_CREATE_REALM: u16 = 950;
 /// realm's global environment (swapping in its scope + intrinsics), returning the
 /// completion value.
 const N_262_EVAL_SCRIPT: u16 = 951;
+/// `$262.evalScript(src)` — evaluates `src` as a **Script** in the *current*
+/// realm's global environment (distinct from an indirect `eval`: a script's
+/// top-level `let`/`const`/`class` become persistent global lexical bindings,
+/// and a sloppy script's `var`/function bindings persist too). Wired by the
+/// runner's JS prelude to the top-level `$262.evalScript`.
+const N_262_EVAL_SCRIPT_MAIN: u16 = 963;
 /// `$262.agent.start(src)` — spawn a worker agent: create a fresh realm, install
 /// a worker-side `$262.agent`, and run `src` eagerly to completion in it.
 const N_262_AGENT_START: u16 = 952;
@@ -2710,6 +2725,7 @@ impl<'a> Interp<'a> {
             realm: Realm::with_limits(limits),
             current: Scope::root(),
             var_scope: Scope::root(),
+            eval_var_scope: None,
             annexb_block_fns: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
@@ -3822,6 +3838,9 @@ impl<'a> Interp<'a> {
             // prelude) to this global so cross-realm tests can obtain a second
             // realm with a distinct set of intrinsics.
             ("$262_createRealm", N_262_CREATE_REALM),
+            // Test262 host hook: `$262.evalScript` runs code as a Script in the
+            // current realm (so top-level lexical declarations persist globally).
+            ("$262_evalScript", N_262_EVAL_SCRIPT_MAIN),
             // Test262 `$262.agent` host hooks (wired by the runner's JS prelude,
             // and by the worker-side prelude `$262.agent.start` installs). See the
             // `agent` module for the cooperative-scheduler model.
@@ -5185,7 +5204,7 @@ impl<'a> Interp<'a> {
     /// function binds in that function, not on the global object). Per spec a
     /// global `var` property is writable + enumerable but non-configurable.
     fn publish_global_var(&mut self, name: &str, value: NanBox) {
-        if !self.current.ptr_eq(&self.global_scope) {
+        if !self.var_scope.ptr_eq(&self.global_scope) {
             return;
         }
         if let Some(g) = self.global_this.as_handle().map(Handle::from_raw) {
@@ -5340,6 +5359,131 @@ impl<'a> Interp<'a> {
         Ok(last)
     }
 
+    /// CanDeclareGlobalVar: a global `var` binding may be created for `name`
+    /// unless the global object is non-extensible and does not already have it as
+    /// an own property.
+    fn can_declare_global_var(&self, g: Handle, name: &str) -> bool {
+        self.realm.has_own(g, name) || self.realm.is_extensible(g)
+    }
+
+    /// CanDeclareGlobalFunction: a global `function` binding may be created for
+    /// `name` when there is no colliding own property (subject to extensibility),
+    /// or the existing own property is configurable, or it is a writable +
+    /// enumerable data property. A non-configurable accessor / non-writable /
+    /// non-enumerable property (e.g. `NaN`, `undefined`, `Infinity`) blocks it.
+    fn can_declare_global_function(&self, g: Handle, name: &str) -> bool {
+        if !self.realm.has_own(g, name) {
+            return self.realm.is_extensible(g);
+        }
+        if !self.realm.property_is_non_configurable(g, name) {
+            return true;
+        }
+        self.realm.accessor(g, name).is_none()
+            && !self.realm.property_is_readonly(g, name)
+            && self.realm.property_is_enumerable(g, name)
+    }
+
+    /// EvalDeclarationInstantiation static validation for a *sloppy* eval (the
+    /// spec steps that throw before any binding is instantiated). `lex_env` is the
+    /// caller's lexical environment (the eval's own fresh lexEnv is a child of
+    /// it); `var_env` is the variable environment the eval hoists `var`/function
+    /// declarations into.
+    ///
+    /// Throws:
+    /// - **SyntaxError** when a `var`/function name collides with a lexical
+    ///   (`let`/`const`/`class`) binding in a scope between `lex_env` and
+    ///   `var_env`, or with a *global* lexical binding when `var_env` is the
+    ///   global environment (a global lexical lives in the global scope frame but,
+    ///   unlike a `var`/function, is not an own property of the global object).
+    /// - **TypeError** when, at the global variable environment, a `var` fails
+    ///   CanDeclareGlobalVar (non-extensible global) or a function fails
+    ///   CanDeclareGlobalFunction.
+    fn eval_declaration_checks(
+        &mut self,
+        program: &Program,
+        lex_env: &Scope,
+        var_env: &Scope,
+    ) -> Result<(), ExecError> {
+        let mut var_names: Vec<&str> = Vec::new();
+        collect_var_names(&program.body, &mut var_names);
+        let mut fn_names: Vec<&str> = Vec::new();
+        for stmt in &program.body {
+            let stmt = unwrap_exported_function(stmt);
+            if let Stmt::Function(func) = stmt
+                && let Some(id) = &func.id
+            {
+                fn_names.push(&id.name);
+            }
+        }
+        // Block-level function names that Annex B var-hoists also participate in
+        // VarDeclaredNames for the lexical-collision walks.
+        let mut block_fns: Vec<&str> = Vec::new();
+        collect_block_function_names(&program.body, &mut block_fns);
+
+        let all_var_names: Vec<&str> = var_names
+            .iter()
+            .chain(fn_names.iter())
+            .chain(block_fns.iter())
+            .copied()
+            .collect();
+
+        // Walk lexical environments from the caller's lexical env up to (but not
+        // including) the variable environment: a `var` may not hoist over a
+        // like-named lexical binding in a lower scope.
+        let mut lex = Some(lex_env.clone());
+        while let Some(env) = lex {
+            if env.ptr_eq(var_env) {
+                break;
+            }
+            // A `catch (param)` frame is exempt: Annex B.3.4 permits a sloppy
+            // `var`/function to redeclare a catch parameter.
+            if !env.is_catch() {
+                for name in &all_var_names {
+                    if env.has_local(name) {
+                        let m = self.new_str(&alloc::format!(
+                            "Identifier '{name}' has already been declared"
+                        ));
+                        return Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))));
+                    }
+                }
+            }
+            lex = env.parent();
+        }
+
+        let at_global = var_env.ptr_eq(&self.global_scope);
+        if !at_global {
+            return Ok(());
+        }
+        let Some(g) = self.global_this.as_handle().map(Handle::from_raw) else {
+            return Ok(());
+        };
+
+        // A `var` may not collide with a global lexical declaration.
+        for name in &all_var_names {
+            if var_env.has_local(name) && !self.realm.has_own(g, name) {
+                let m = self.new_str(&alloc::format!(
+                    "Identifier '{name}' has already been declared"
+                ));
+                return Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))));
+            }
+        }
+        // CanDeclareGlobalFunction for each function name, then CanDeclareGlobalVar
+        // for each pure `var` name — all validated before any is created.
+        for name in fn_names.iter().chain(block_fns.iter()) {
+            if !self.can_declare_global_function(g, name) {
+                let m = self.new_str(&alloc::format!("Cannot declare global function '{name}'"));
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+        }
+        for name in &var_names {
+            if !self.can_declare_global_var(g, name) {
+                let m = self.new_str(&alloc::format!("Cannot declare global variable '{name}'"));
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+        }
+        Ok(())
+    }
+
     /// The `eval(source)` operation. `direct` is true for a direct eval call
     /// (`eval(s)` by that exact name), false for an indirect one (`(0,eval)(s)`,
     /// `var e = eval; e(s)`, `globalThis.eval(s)`).
@@ -5426,33 +5570,55 @@ impl<'a> Interp<'a> {
         let saved_annexb = core::mem::take(&mut self.annexb_block_fns);
         let (saved_this, saved_new_target) = (self.this_val, self.new_target);
 
-        if !direct {
-            // Indirect eval: runs against the GLOBAL environment with global
-            // `this`, sloppy unless the code self-declares `"use strict"`. Its
-            // `var`/function declarations hoist into the global variable
-            // environment, so a sloppy indirect eval runs directly in the global
-            // scope (mirroring sloppy direct eval, which runs in the caller's
-            // scope). Strict eval gets its own child env so its declarations don't
-            // leak globally.
-            self.strict = code_strict;
-            self.current = if code_strict {
-                self.global_scope.child()
+        // Final strictness of the eval code: a direct eval inherits the caller's,
+        // and either kind may add its own `"use strict"`.
+        let eval_strict = if direct {
+            saved_strict || code_strict
+        } else {
+            code_strict
+        };
+        // The variable environment the eval hoists `var`/function declarations
+        // into (spec `varEnv`): the caller's for a direct eval, the realm's global
+        // env for an indirect one.
+        let var_env = if direct {
+            saved_var_scope.clone()
+        } else {
+            self.global_scope.clone()
+        };
+
+        // EvalDeclarationInstantiation validation for a *sloppy* eval — runs
+        // BEFORE any binding is created, so a rejected declaration leaves the
+        // surrounding environment untouched (no partial hoisting). A strict eval
+        // declares into its own fresh var env, so these collisions can't arise.
+        if !eval_strict {
+            // The lexical-collision walk starts at the eval's lexical env: the
+            // caller's scope for a direct eval, the global env for an indirect one
+            // (an indirect eval never sees the caller's scope chain).
+            let lex_env = if direct {
+                saved_scope.clone()
             } else {
                 self.global_scope.clone()
             };
+            self.eval_declaration_checks(program, &lex_env, &var_env)?;
+        }
+
+        // Both kinds get a fresh declarative *lexical* environment (child of the
+        // caller's env for direct, of the global env for indirect) so their
+        // `let`/`const`/`class` declarations never leak into the surrounding
+        // scope. A sloppy eval additionally hoists its `var`/function declarations
+        // OUT into `var_env` (recorded in `eval_var_scope`, consumed by the body's
+        // hoisting pass); a strict eval keeps them in this fresh env.
+        self.strict = eval_strict;
+        if direct {
+            self.current = saved_scope.child();
+            // `this`/`new.target` are inherited from the caller (unchanged).
+        } else {
+            self.current = self.global_scope.child();
             self.this_val = self.global_this;
             self.new_target = NanBox::undefined();
-        } else {
-            // Direct eval inherits the caller's strictness; the code may add its own.
-            self.strict = saved_strict || code_strict;
-            // Strict eval (caller-strict or code-strict) gets its own variable
-            // environment so its declarations don't leak into the caller. Sloppy
-            // direct eval runs directly in the caller's scope so `var`/function
-            // declarations hoist outward (spec sloppy-mode behaviour).
-            if self.strict {
-                self.current = saved_scope.child();
-            }
-            // `this`/`new.target` are inherited from the caller (unchanged).
+        }
+        if !eval_strict {
+            self.eval_var_scope = Some(var_env);
         }
 
         self.eval_depth += 1;
@@ -5461,6 +5627,7 @@ impl<'a> Interp<'a> {
 
         self.current = saved_scope;
         self.var_scope = saved_var_scope;
+        self.eval_var_scope = None;
         self.annexb_block_fns = saved_annexb;
         self.strict = saved_strict;
         self.this_val = saved_this;
@@ -5586,9 +5753,15 @@ impl<'a> Interp<'a> {
         // Done first; a same-named function declaration then overwrites it.
         if hoist_vars {
             // This is a function/program/eval variable-environment boundary: the
-            // current scope is where `var`/top-level functions hoist, and where
-            // the Annex B.3.3 runtime update for a block function writes.
-            self.var_scope = self.current.clone();
+            // variable scope is where `var`/top-level functions hoist, and where
+            // the Annex B.3.3 runtime update for a block function writes. For an
+            // eval body this may be an OUTER environment (the spec `varEnv`,
+            // supplied via `eval_var_scope`) distinct from the fresh lexical
+            // `self.current`; otherwise it is `self.current` itself.
+            self.var_scope = self
+                .eval_var_scope
+                .take()
+                .unwrap_or_else(|| self.current.clone());
             self.annexb_block_fns = Vec::new();
             let mut var_names: Vec<&str> = Vec::new();
             collect_var_names(stmts, &mut var_names);
@@ -5602,12 +5775,12 @@ impl<'a> Interp<'a> {
             // not apply). In eval code (B.3.3.3) such a collision is permitted, so
             // the binding is still updated.
             for name in &block_fn_names {
-                if eval_code || !self.current.has_local(name) {
+                if eval_code || !self.var_scope.has_local(name) {
                     self.annexb_block_fns.push(String::from(*name));
                 }
             }
             var_names.extend_from_slice(&block_fn_names);
-            let at_global = self.current.ptr_eq(&self.global_scope);
+            let at_global = self.var_scope.ptr_eq(&self.global_scope);
             let global_obj = self.global_this.as_handle().map(Handle::from_raw);
             for name in var_names {
                 // At global scope a `var`/Annex-B name that *already* exists as a
@@ -5618,8 +5791,15 @@ impl<'a> Interp<'a> {
                 // EvalDeclarationInstantiation "binding is not reinitialized" rule.
                 let global_has =
                     at_global && global_obj.is_some_and(|g| self.realm.has_own(g, name));
-                if !self.current.has_local(name) && !global_has {
-                    self.current.declare(name, NanBox::undefined());
+                if !self.var_scope.has_local(name) && !global_has {
+                    // A sloppy `eval`'s `var` in a *non-global* variable
+                    // environment is a deletable binding (`delete` removes it);
+                    // ordinary and global `var` bindings are not.
+                    if eval_code && !at_global {
+                        self.var_scope.declare_deletable(name, NanBox::undefined());
+                    } else {
+                        self.var_scope.declare(name, NanBox::undefined());
+                    }
                 }
                 // A global `var` reserves an own property on the global object
                 // (initially `undefined` until the declaration's initializer runs),
@@ -5656,11 +5836,40 @@ impl<'a> Interp<'a> {
                 );
                 self.set_fn_name(value, &id.name);
                 if hoist_vars {
-                    // A function/program top-level declaration binds here.
-                    self.current.declare(&id.name, value);
+                    // A function/program top-level declaration binds in the
+                    // variable environment (for an eval body, the outer `varEnv`).
+                    // A sloppy `eval`'s function declaration in a non-global
+                    // variable environment is a deletable binding.
+                    if eval_code && !self.var_scope.ptr_eq(&self.global_scope) {
+                        self.var_scope.declare_deletable(&id.name, value);
+                    } else {
+                        self.var_scope.declare(&id.name, value);
+                    }
                     // A global function declaration also publishes on the global
                     // object (`function f(){}; this.f === f`).
-                    self.publish_global_var(&id.name, value);
+                    if self.var_scope.ptr_eq(&self.global_scope)
+                        && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
+                    {
+                        if eval_code {
+                            // CreateGlobalFunctionBinding (deletable). When there is
+                            // no existing own property, or it is configurable,
+                            // (re)define with full data attributes: writable,
+                            // enumerable, configurable. When the existing property
+                            // is non-configurable (but declarable — validated by
+                            // CanDeclareGlobalFunction), update only the value and
+                            // preserve its attributes.
+                            let redefine_attrs = !self.realm.has_own(g, &id.name)
+                                || !self.realm.property_is_non_configurable(g, &id.name);
+                            self.realm.force_set_property(g, &id.name, value);
+                            if redefine_attrs {
+                                self.realm.clear_readonly_property(g, &id.name);
+                                self.realm.clear_hidden_property(g, &id.name);
+                                self.realm.clear_non_configurable_property(g, &id.name);
+                            }
+                        } else {
+                            self.realm.set_property(g, &id.name, value);
+                        }
+                    }
                 } else {
                     // A block-level declaration binds *locally* in the block
                     // scope (block scoping). Its name was also `var`-hoisted to

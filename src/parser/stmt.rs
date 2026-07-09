@@ -79,17 +79,19 @@ impl<'src> Parser<'src> {
         p.module_top_level = true;
         let body = p.parse_statement_list(TokenKind::Eof)?;
         p.expect(TokenKind::Eof)?;
-        let source_type = if body
+        // Eval code is parsed with the Script goal symbol: `import`/`export`
+        // declarations are only legal at a Module's top level, so their presence
+        // here is an early SyntaxError (`eval('export default 1')` throws), not a
+        // module.
+        if body
             .iter()
             .any(|s| matches!(s, Stmt::Import(_) | Stmt::Export(_)))
         {
-            SourceType::Module
-        } else {
-            SourceType::Script
-        };
+            return Err(p.err("`import`/`export` may only appear at the top level of a module"));
+        }
         let program = Program {
             body,
-            source_type,
+            source_type: SourceType::Script,
             span: Span::new(0, source.len() as u32),
         };
         super::validate::validate_program_with(

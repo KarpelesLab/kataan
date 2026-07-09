@@ -2733,6 +2733,7 @@ impl<'a> Interp<'a> {
             N_262_CREATE_REALM => return self.create_realm(),
             // `realm.evalScript(src)` — evaluate `src` in the receiver realm.
             N_262_EVAL_SCRIPT => return self.eval_script_in_realm(arg(0)),
+            N_262_EVAL_SCRIPT_MAIN => return self.eval_script_current_realm(arg(0)),
             // Test262 `$262.agent` cooperative scheduler (see the `agent` module).
             N_262_AGENT_START => return self.agent_start(arg(0)),
             N_262_AGENT_BROADCAST => return self.agent_broadcast(arg(0)),

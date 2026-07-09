@@ -44,6 +44,17 @@ struct ScopeData {
     /// `nbexec`). `None` until the first `using` is recorded, so an ordinary
     /// scope carries no extra allocation (the fast path).
     disposers: Option<alloc::vec::Vec<(NanBox, NanBox, bool)>>,
+    /// Names in this frame created as *deletable* bindings — a sloppy `eval`'s
+    /// `var`/function declaration hoisted into a non-global variable environment
+    /// (EvalDeclarationInstantiation's `CreateMutableBinding(name, true)`). Unlike
+    /// an ordinary `var`/function binding, `delete name` removes these and returns
+    /// `true`. `None` until the first one is recorded (ordinary frames stay lean).
+    deletable: Option<alloc::collections::BTreeSet<String>>,
+    /// Set ONLY on the child scope introduced by a `catch (param)` clause. Per
+    /// Annex B.3.4, a sloppy `var`/function declaration (including one inside a
+    /// direct `eval`) is permitted to redeclare a catch parameter, so the
+    /// EvalDeclarationInstantiation lexical-collision walk skips catch frames.
+    catch_scope: bool,
     /// The object environment record of a `with (obj)` statement, set ONLY on the
     /// child scope that the `with` body runs in (`None` on every other frame).
     /// Resolution interleaves this frame's object with the surrounding lexical
@@ -73,6 +84,8 @@ impl Scope {
             soft_consts: alloc::collections::BTreeSet::new(),
             parent: None,
             disposers: None,
+            deletable: None,
+            catch_scope: false,
             with_obj: None,
             module_imports: None,
         })))
@@ -87,6 +100,8 @@ impl Scope {
             soft_consts: alloc::collections::BTreeSet::new(),
             parent: Some(self.clone()),
             disposers: None,
+            deletable: None,
+            catch_scope: false,
             with_obj: None,
             module_imports: None,
         })))
@@ -100,6 +115,56 @@ impl Scope {
         let child = self.child();
         child.0.borrow_mut().with_obj = Some(obj);
         child
+    }
+
+    /// A new child scope introduced by a `catch (param)` clause (marked so the
+    /// EvalDeclarationInstantiation lexical-collision walk can skip it — a sloppy
+    /// `var` may redeclare a catch parameter, Annex B.3.4).
+    #[must_use]
+    pub fn child_catch(&self) -> Self {
+        let child = self.child();
+        child.0.borrow_mut().catch_scope = true;
+        child
+    }
+
+    /// Whether this frame is a `catch (param)` environment.
+    #[must_use]
+    pub fn is_catch(&self) -> bool {
+        self.0.borrow().catch_scope
+    }
+
+    /// Declares `name` in *this* frame as a *deletable* binding (a sloppy `eval`'s
+    /// `var`/function declaration in a non-global variable environment).
+    pub fn declare_deletable(&self, name: &str, value: NanBox) {
+        let mut data = self.0.borrow_mut();
+        data.vars.insert(String::from(name), value);
+        data.deletable
+            .get_or_insert_with(alloc::collections::BTreeSet::new)
+            .insert(String::from(name));
+    }
+
+    /// Whether `name` is bound in *this* frame as a deletable binding.
+    #[must_use]
+    pub fn is_local_deletable(&self, name: &str) -> bool {
+        self.0
+            .borrow()
+            .deletable
+            .as_ref()
+            .is_some_and(|d| d.contains(name))
+    }
+
+    /// Removes `name` from *this* frame (its value and all binding-kind marks).
+    /// Returns whether a binding was present. Used to implement `delete name` for
+    /// a deletable binding.
+    pub fn delete_local(&self, name: &str) -> bool {
+        let mut data = self.0.borrow_mut();
+        let removed = data.vars.remove(name).is_some();
+        data.consts.remove(name);
+        data.soft_consts.remove(name);
+        if let Some(d) = data.deletable.as_mut() {
+            d.remove(name);
+        }
+        removed
     }
 
     /// The `with` object introduced *at this frame* (`None` unless this is the

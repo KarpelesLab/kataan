@@ -327,7 +327,7 @@ impl<'a> Interp<'a> {
         // A thrown value is routed to the catch clause, if any.
         if let (Err(ExecError::Throw(value)), Some(catch)) = (&outcome, handler) {
             let thrown = *value;
-            let child = self.current.child();
+            let child = self.current.child_catch();
             let saved = core::mem::replace(&mut self.current, child);
             // The catch binding may be a name, a destructuring pattern, or absent
             // (optional catch binding).

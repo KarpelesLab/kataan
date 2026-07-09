@@ -1533,6 +1533,13 @@ impl<'a> Interp<'a> {
         // The callee body opens a new variable environment (set by `hoist_with`);
         // remember the caller's so it is restored on return.
         let saved_var_scope = self.var_scope.clone();
+        // Until the body's own hoisting runs, the current variable environment is
+        // the parameter environment (this call scope). This matters for a sloppy
+        // direct `eval("var x")` evaluated *inside a parameter default*: its `var`
+        // must hoist into the parameter environment, not the caller's (so it does
+        // not leak to the global object). `run_body`'s `hoist_with` overwrites
+        // this with the body scope before body statements run.
+        self.var_scope = self.current.clone();
         let saved_annexb = core::mem::take(&mut self.annexb_block_fns);
         // An arrow has no own `this` — it inherits the enclosing one lexically,
         // so leave `self.this_val` unchanged.
