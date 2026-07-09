@@ -16,8 +16,11 @@ impl<'a> Interp<'a> {
         #[cfg(all(feature = "module", feature = "std"))]
         if let Some((src_scope, src_name)) = self.module_imports.get(name).cloned() {
             return match src_scope.get(&src_name) {
-                Some(v) => Ok(v),
-                None => {
+                // The slot is either absent (source module not yet run) or holds
+                // the TDZ sentinel (the source `let`/`const`/`class` is hoisted but
+                // its initializer has not run): both are an uninitialized binding.
+                Some(v) if !v.is_tdz() => Ok(v),
+                _ => {
                     let msg = self.new_str(&alloc::format!(
                         "Cannot access '{name}' before initialization"
                     ));
@@ -1913,6 +1916,22 @@ impl<'a> Interp<'a> {
             }
             return self.assign_member_value(target, key, new);
         }
+        // A module namespace exotic object's `[[Set]]` (§10.4.6.9) always returns
+        // false: a write is a silent no-op in sloppy code and a TypeError in strict
+        // code (all module code is strict). The property table stays authoritative
+        // for the live read-through; only user-level assignment is rejected here
+        // (engine-internal refreshes go through `realm.set_property`).
+        #[cfg(all(feature = "module", feature = "std"))]
+        if self.module_namespaces.contains_key(&handle.to_raw()) {
+            if self.strict {
+                let name = self.member_key(key);
+                let m = self.new_str(&alloc::format!(
+                    "Cannot assign to read only property '{name}' of a module namespace object"
+                ));
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            return Ok(());
+        }
         // Integer-indexed exotic `[[Set]]`: for a typed array, a *canonical numeric
         // index* key writes the element (after coercing the value — whose side
         // effects/throw still run for an out-of-bounds index) and is a no-op when the
@@ -2167,10 +2186,25 @@ impl<'a> Interp<'a> {
         // refreshed value is also written back so `getOwnPropertyDescriptor`
         // reports it.
         #[cfg(all(feature = "module", feature = "std"))]
-        if let Some(map) = self.module_namespaces.get(&handle.to_raw())
-            && let Some((scope, local)) = map.get(name)
+        if let Some((scope, local)) = self
+            .module_namespaces
+            .get(&handle.to_raw())
+            .and_then(|m| m.get(name))
+            .map(|(s, l)| (s.clone(), l.clone()))
         {
-            let value = scope.get(local).unwrap_or_else(NanBox::undefined);
+            let value = scope.get(&local).unwrap_or_else(NanBox::undefined);
+            // A namespace binding whose source `let`/`const`/`class`/`function*`
+            // has not yet run its initializer is in its Temporal Dead Zone: the
+            // [[Get]] (GetBindingValue with Strict=true) throws a ReferenceError
+            // rather than returning `undefined`.
+            if value.is_tdz() {
+                let msg = self.new_str(&alloc::format!(
+                    "Cannot access '{name}' before initialization"
+                ));
+                return Err(ExecError::Throw(
+                    self.make_error(N_REFERENCE_ERROR, Some(msg)),
+                ));
+            }
             // Refresh the stored data property (it is non-configurable but
             // writable, so the engine-internal write is permitted).
             self.realm.set_property(handle, name, value);

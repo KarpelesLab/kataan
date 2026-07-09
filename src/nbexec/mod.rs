@@ -6073,6 +6073,15 @@ fn collect_lexical_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
                     out.push(&id.name);
                 }
             }
+            // `export let/const/class X …` binds `X` lexically at the module top
+            // level (its inner declaration is a `let`/`const`/`class`). Recurse so
+            // the name is pre-declared in its TDZ like a bare lexical declaration.
+            // (An `export var`/function declaration is *not* lexical, so the
+            // recursion — which only collects `let`/`const`/`class` — skips it.)
+            #[cfg(feature = "module")]
+            Stmt::Export(crate::ast::ExportDecl::Decl { declaration, .. }) => {
+                collect_lexical_names(core::slice::from_ref(declaration), out);
+            }
             _ => {}
         }
     }
@@ -7776,13 +7785,51 @@ pub(crate) fn error_name_message(interp: &Interp, thrown: NanBox) -> Option<(Str
     let raw = thrown.as_handle()?;
     let h = Handle::from_raw(raw);
     let realm = interp.realm();
-    let name = realm.get_property(h, "name")?;
-    let name = realm.to_display_string(name);
-    let message = realm
-        .get_property(h, "message")
+    // `realm.get_property` reads *own* properties only, so walk the prototype
+    // chain by hand to find the first `key` (like an ordinary `[[Get]]`).
+    let inherited = |key: &str| -> Option<NanBox> {
+        let mut cur = Some(h);
+        while let Some(c) = cur {
+            if let Some(v) = realm.get_property(c, key) {
+                return Some(v);
+            }
+            cur = realm.object_proto(c);
+        }
+        None
+    };
+    let message = inherited("message")
         .map(|m| realm.to_display_string(m))
         .unwrap_or_default();
-    Some((name, message))
+    // The error's `name` — usually inherited from `Error.prototype.name`.
+    if let Some(name) = inherited("name") {
+        return Some((realm.to_display_string(name), message));
+    }
+    // A user-defined error class that omits `name` (notably the Test262 harness's
+    // `Test262Error`, which defines only `message` + a custom `toString`): fall
+    // back to its constructor's name, so a negative test can still verify the
+    // thrown *type* (and an uncaught throw renders as `Name: message`, not the
+    // opaque `[object Object]`). A throw whose object has neither is not
+    // error-shaped → `None`. The constructor's own `name` is usually stored; a
+    // function/class `name` computed on read is synthesized from its definition.
+    let ctor = inherited("constructor")
+        .and_then(|c| c.as_handle())
+        .map(Handle::from_raw)?;
+    let ctor_name = if let Some(n) = realm.get_property(ctor, "name") {
+        realm.to_display_string(n)
+    } else if let Some((cid, _)) = realm.class_at(ctor) {
+        interp.classes[cid as usize]
+            .id
+            .as_ref()
+            .map_or_else(String::new, |i| String::from(&*i.name))
+    } else if let Some((fid, _)) = realm.function_at(ctor) {
+        String::from(interp.functions[fid as usize].name)
+    } else {
+        String::new()
+    };
+    if ctor_name.is_empty() {
+        return None;
+    }
+    Some((ctor_name, message))
 }
 
 /// The phase at which a program failed: parsing, or runtime execution.

@@ -24,7 +24,7 @@
 //! Gated on `module` + `std` (the loader needs file I/O for the default host);
 //! the no_std language core does not pull this in.
 
-use super::{ExecError, Interp, N_SYNTAX_ERROR, NanBox, Thrown};
+use super::{ExecError, Interp, N_REFERENCE_ERROR, N_SYNTAX_ERROR, NanBox, Thrown};
 use crate::ast::{ExportDecl, ImportSpecifier, ModuleExportName, Program, Stmt};
 use crate::env::Scope;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -308,6 +308,12 @@ struct ModuleRecord {
     imports: Vec<ImportEntry>,
     /// Re-export requests (resolved keys).
     reexports: Vec<ReExport>,
+    /// This module's `[[RequestedModules]]` in **source order** — every `import`
+    /// / `export … from` dependency key, paired with whether the request is a
+    /// deferred import. Dependencies are evaluated in this order (interleaving
+    /// imports and re-exports as they appear in the source), which the separate
+    /// `imports`/`reexports` lists would not preserve.
+    requested: Vec<(String, bool)>,
     /// Local export names → the module-local binding name they read.
     /// (`export { a as b }` ⇒ `b -> a`; `export const c` ⇒ `c -> c`;
     /// `export default …` ⇒ `default -> *default*`.)
@@ -417,8 +423,23 @@ impl<'a> Interp<'a> {
     pub fn exec_error_to_thrown(&self, e: ExecError, phase: super::ErrorPhase) -> Thrown {
         match e {
             ExecError::Throw(thrown) => {
-                let (name, message) = super::error_name_message(self, thrown)
-                    .unwrap_or_else(|| (self.display(thrown), String::new()));
+                let (name, message) =
+                    super::error_name_message(self, thrown).unwrap_or_else(|| {
+                        // A throw lacking a `name` property (e.g. Test262Error, which
+                        // carries only `message`): surface its `message` so the failure
+                        // is diagnosable rather than the opaque `[object Object]`.
+                        if let Some(raw) = thrown.as_handle()
+                            && let Some(m) = self
+                                .realm()
+                                .get_property(crate::heap::Handle::from_raw(raw), "message")
+                        {
+                            let s = self.realm().to_display_string(m);
+                            if !s.is_empty() {
+                                return (String::from("Test262Error"), s);
+                            }
+                        }
+                        (self.display(thrown), String::new())
+                    });
                 Thrown {
                     phase,
                     name,
@@ -516,6 +537,7 @@ impl<'a> Interp<'a> {
             program,
             imports: Vec::new(),
             reexports: Vec::new(),
+            requested: Vec::new(),
             local_exports,
             scope: Scope::root(),
             import_aliases: Rc::new(BTreeMap::new()),
@@ -558,6 +580,7 @@ impl<'a> Interp<'a> {
 
         let mut imports: Vec<ImportEntry> = Vec::new();
         let mut reexports: Vec<ReExport> = Vec::new();
+        let mut requested: Vec<(String, bool)> = Vec::new();
         let mut local_exports: BTreeMap<String, String> = BTreeMap::new();
 
         let resolve = |spec: &str, this: &mut Self| -> Result<String, ExecError> {
@@ -588,6 +611,7 @@ impl<'a> Interp<'a> {
                             }
                         }
                     }
+                    requested.push((dep.clone(), decl.deferred));
                     imports.push(ImportEntry {
                         key: dep,
                         specifiers: binds,
@@ -604,6 +628,20 @@ impl<'a> Interp<'a> {
                     let dep = resolve(src, self)?;
                     let type_attr = attr_type(attributes);
                     let dep = module_map_key(&dep, type_attr.as_deref());
+                    requested.push((dep.clone(), false));
+                    // An *empty* named re-export (`export {} from "mod"`) still
+                    // contributes "mod" to [[RequestedModules]] — the module is
+                    // loaded, parsed, and evaluated (so an early error in it
+                    // surfaces) but re-exports nothing. Model it as a bare
+                    // load-only import (like `import "mod"`).
+                    if specifiers.is_empty() {
+                        imports.push(ImportEntry {
+                            key: dep.clone(),
+                            specifiers: Vec::new(),
+                            deferred: false,
+                            type_attr: type_attr.clone(),
+                        });
+                    }
                     for sp in specifiers {
                         reexports.push(ReExport::Named {
                             key: dep.clone(),
@@ -631,6 +669,7 @@ impl<'a> Interp<'a> {
                     let dep = resolve(src, self)?;
                     let type_attr = attr_type(attributes);
                     let dep = module_map_key(&dep, type_attr.as_deref());
+                    requested.push((dep.clone(), false));
                     match exported {
                         Some(name) => reexports.push(ReExport::StarAs {
                             key: dep,
@@ -669,6 +708,7 @@ impl<'a> Interp<'a> {
             program,
             imports,
             reexports,
+            requested,
             local_exports,
             scope: Scope::root(),
             import_aliases: Rc::new(BTreeMap::new()),
@@ -702,11 +742,8 @@ impl<'a> Interp<'a> {
         }
         let dep_keys: Vec<String> = {
             let r = &self.modules.records[key];
-            r.imports
-                .iter()
-                .map(|i| i.key.clone())
-                .chain(r.reexports.iter().map(reexport_key))
-                .collect()
+            // Link every requested module (deferred included) in source order.
+            r.requested.iter().map(|(k, _)| k.clone()).collect()
         };
         for dep in &dep_keys {
             self.link_module(dep)?;
@@ -1022,11 +1059,12 @@ impl<'a> Interp<'a> {
         // sync-only graphs the fixtures use have none.)
         let deps: Vec<String> = {
             let r = &self.modules.records[key];
-            r.imports
+            // Evaluate dependencies in source order (`[[RequestedModules]]`),
+            // excluding deferred imports (evaluated lazily on namespace access).
+            r.requested
                 .iter()
-                .filter(|i| !i.deferred)
-                .map(|i| i.key.clone())
-                .chain(r.reexports.iter().map(reexport_key))
+                .filter(|(_, deferred)| !deferred)
+                .map(|(k, _)| k.clone())
                 .collect()
         };
         // Mark Evaluating up front to break cycles (and so a deferred-namespace
@@ -1086,6 +1124,23 @@ impl<'a> Interp<'a> {
         // `var` + function-declaration hoisting at the module variable
         // environment boundary (lexical `let`/`const`/`class` bind on execution).
         self.hoist_with(stmts, true)?;
+        // `export default <AssignmentExpression>` (and an anonymous default
+        // function/class) binds the synthetic `*default*` lexical name, which is
+        // in its Temporal Dead Zone until the `export default` statement runs — so
+        // a namespace `[[Get]]`/`[[GetOwnProperty]]` of `default` before then
+        // throws a ReferenceError. A *named* `export default function f` hoists
+        // like an ordinary function declaration (never TDZ), so it is excluded.
+        for stmt in stmts {
+            if let Stmt::Export(ExportDecl::Default { declaration, .. }) = stmt
+                && !matches!(
+                    &**declaration,
+                    Stmt::Function(crate::ast::Function { id: Some(_), .. })
+                )
+                && !self.current.has_local(DEFAULT_LOCAL)
+            {
+                self.current.declare(DEFAULT_LOCAL, NanBox::tdz());
+            }
+        }
         for stmt in stmts {
             match stmt {
                 Stmt::Import(_) => {}
@@ -1296,6 +1351,139 @@ impl<'a> Interp<'a> {
         // `preventExtensions`, which would leave the flag unset).
         self.realm.seal_object(obj);
         Ok(())
+    }
+
+    /// If `handle` is a module namespace exotic object and `key` names a string
+    /// export, synchronise its stored data property with the *live* binding value
+    /// (§28.3 — namespace properties are live) and, when that binding is still
+    /// uninitialized (Temporal Dead Zone), return the `ReferenceError` its
+    /// `[[GetOwnProperty]]` / `[[Get]]` must throw (per §10.4.6, which routes both
+    /// through `GetBindingValue` with Strict = true). Symbol keys, non-export
+    /// keys, and non-namespace objects are no-ops. This is the shared guard for
+    /// the `[[GetOwnProperty]]`-based operations (`getOwnPropertyDescriptor`,
+    /// `hasOwnProperty`, `Object.hasOwn`, `propertyIsEnumerable`).
+    #[cfg(all(feature = "module", feature = "std"))]
+    pub(crate) fn namespace_binding_tdz(
+        &mut self,
+        handle: crate::heap::Handle,
+        key: &str,
+    ) -> Result<(), ExecError> {
+        if let Some((scope, local)) = self
+            .module_namespaces
+            .get(&handle.to_raw())
+            .and_then(|m| m.get(key))
+            .map(|(s, l)| (s.clone(), l.clone()))
+        {
+            let value = scope.get(&local).unwrap_or_else(NanBox::undefined);
+            if value.is_tdz() {
+                let msg = self.new_str(&alloc::format!(
+                    "Cannot access '{key}' before initialization"
+                ));
+                return Err(ExecError::Throw(
+                    self.make_error(N_REFERENCE_ERROR, Some(msg)),
+                ));
+            }
+            // Refresh the snapshot so a `getOwnPropertyDescriptor` reports the
+            // live value (the property is non-configurable but writable).
+            self.realm.set_property(handle, key, value);
+        }
+        Ok(())
+    }
+
+    /// Whole-object enumeration guard: if `handle` is a module namespace with
+    /// *any* export binding in its Temporal Dead Zone, return the `ReferenceError`
+    /// that iterating its own keys (`Object.keys`, `for..in`, `Object.values` …)
+    /// must throw — each such operation calls `[[GetOwnProperty]]` per key, which
+    /// throws on the first uninitialized binding. Bindings are visited in the
+    /// namespace's sorted-key order (the `BTreeMap` iteration order).
+    #[cfg(all(feature = "module", feature = "std"))]
+    pub(crate) fn namespace_enumeration_tdz(
+        &mut self,
+        handle: crate::heap::Handle,
+    ) -> Result<(), ExecError> {
+        let first_tdz = self.module_namespaces.get(&handle.to_raw()).and_then(|m| {
+            m.iter()
+                .find(|(_, (scope, local))| scope.get(local).is_some_and(|v| v.is_tdz()))
+                .map(|(name, _)| name.clone())
+        });
+        if let Some(name) = first_tdz {
+            let msg = self.new_str(&alloc::format!(
+                "Cannot access '{name}' before initialization"
+            ));
+            return Err(ExecError::Throw(
+                self.make_error(N_REFERENCE_ERROR, Some(msg)),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The module namespace exotic `[[DefineOwnProperty]]` (§10.4.6.11). Returns
+    /// `Ok(None)` when `handle` is not a namespace or `key` is a Symbol (both
+    /// fall through to `OrdinaryDefineOwnProperty` — so `@@toStringTag` and new
+    /// symbols behave ordinarily), otherwise `Ok(Some(result))`:
+    /// - a non-export String key → `false`;
+    /// - a request that would change the binding (configurable, non-enumerable,
+    ///   accessor, non-writable, or a differing value) → `false`;
+    /// - an inert / compatible redefinition → `true`.
+    ///
+    /// A TDZ export binding makes the internal `[[GetOwnProperty]]` throw.
+    #[cfg(all(feature = "module", feature = "std"))]
+    pub(crate) fn namespace_define_own_property(
+        &mut self,
+        handle: crate::heap::Handle,
+        key: &str,
+        desc: crate::heap::Handle,
+    ) -> Result<Option<bool>, ExecError> {
+        if key.starts_with("\u{0}sym:") || !self.module_namespaces.contains_key(&handle.to_raw()) {
+            return Ok(None);
+        }
+        // Step 2: `current = ? [[GetOwnProperty]](P)` — refreshes the live value
+        // and throws a ReferenceError for a TDZ binding.
+        self.namespace_binding_tdz(handle, key)?;
+        // Step 3: a String key that is not an export → false.
+        let is_export = self
+            .module_namespaces
+            .get(&handle.to_raw())
+            .is_some_and(|m| m.contains_key(key));
+        if !is_export {
+            return Ok(Some(false));
+        }
+        // Steps 4-7: any attribute that would alter the fixed shape → false.
+        let present_true = |i: &Self, k: &str| {
+            i.realm.has_own(desc, k)
+                && i.realm
+                    .get_property(desc, k)
+                    .is_some_and(|v| i.realm.truthy(v))
+        };
+        let present_false = |i: &Self, k: &str| {
+            i.realm.has_own(desc, k)
+                && !i
+                    .realm
+                    .get_property(desc, k)
+                    .is_some_and(|v| i.realm.truthy(v))
+        };
+        if present_true(self, "configurable")
+            || present_false(self, "enumerable")
+            || self.realm.has_own(desc, "get")
+            || self.realm.has_own(desc, "set")
+            || present_false(self, "writable")
+        {
+            return Ok(Some(false));
+        }
+        // Step 8: a supplied [[Value]] must SameValue the current binding value.
+        if self.realm.has_own(desc, "value") {
+            let requested = self
+                .realm
+                .get_property(desc, "value")
+                .unwrap_or_else(NanBox::undefined);
+            let current = self
+                .realm
+                .get_property(handle, key)
+                .unwrap_or_else(NanBox::undefined);
+            return Ok(Some(self.realm.same_value(requested, current)));
+        }
+        // Step 9: an inert redefinition succeeds.
+        Ok(Some(true))
     }
 
     /// import-defer lazy trigger for a keyed operation ([[Get]], [[GetOwnProperty]],

@@ -278,6 +278,13 @@ impl<'a> Interp<'a> {
                 left, right, body, ..
             } => {
                 let obj = self.eval(right)?;
+                // `for..in` (EnumerateObjectProperties) calls `[[GetOwnProperty]]`
+                // per own key to test enumerability; a module namespace with any
+                // TDZ export throws a ReferenceError before the loop body runs.
+                #[cfg(all(feature = "module", feature = "std"))]
+                if let Some(raw) = obj.as_handle() {
+                    self.namespace_enumeration_tdz(Handle::from_raw(raw))?;
+                }
                 // A proxy with an `ownKeys` trap enumerates through it; otherwise
                 // the normal own + inherited enumerable key walk.
                 let keys = if let Some(raw) = obj.as_handle()

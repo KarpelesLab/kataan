@@ -890,6 +890,12 @@ impl<'a> Interp<'a> {
                 let target = arg(0)
                     .as_handle()
                     .map(|raw| self.proxy_key_target(Handle::from_raw(raw)));
+                // `Object.keys` (EnumerableOwnPropertyNames) calls `[[GetOwnProperty]]`
+                // per key; a module namespace with any TDZ export throws.
+                #[cfg(all(feature = "module", feature = "std"))]
+                if let Some(h) = target {
+                    self.namespace_enumeration_tdz(h)?;
+                }
                 let mut keys: Vec<alloc::string::String> = Vec::new();
                 if let Some(h) = target {
                     // A String (primitive or wrapper): ToObject exposes index
@@ -925,6 +931,21 @@ impl<'a> Interp<'a> {
             }
             N_OBJECT_FREEZE => {
                 if let Some(raw) = arg(0).as_handle() {
+                    // SetIntegrityLevel(frozen) calls `DefinePropertyOrThrow(k,
+                    // {writable:false, configurable:false})` per own key. A module
+                    // namespace's string exports are writable data properties whose
+                    // `[[DefineOwnProperty]]` rejects `writable:false`, so freezing a
+                    // namespace with any string export throws a TypeError.
+                    #[cfg(all(feature = "module", feature = "std"))]
+                    if self
+                        .module_namespaces
+                        .get(&raw)
+                        .is_some_and(|m| !m.is_empty())
+                    {
+                        return Err(self.type_error(
+                            "Cannot freeze a module namespace object (its exports are writable)",
+                        ));
+                    }
                     self.realm.freeze_object(Handle::from_raw(raw));
                 }
                 arg(0) // returns the (now frozen) object
@@ -1068,6 +1089,9 @@ impl<'a> Interp<'a> {
                 // ToObject(O) first (`null`/`undefined` throws), then ToPropertyKey.
                 let target = self.require_object_coercible_to_object(arg(0), "Object.hasOwn")?;
                 let key = self.coerce_property_key(arg(1))?;
+                // A module namespace's `[[GetOwnProperty]]` of a TDZ export throws.
+                #[cfg(all(feature = "module", feature = "std"))]
+                self.namespace_binding_tdz(target, &key)?;
                 let owned = Some(target).is_some_and(|h| {
                     self.realm.has_own(h, &key)
                         || self
@@ -3401,6 +3425,9 @@ impl<'a> Interp<'a> {
                 // A proxy has no ordinary own-property table: `[[GetOwnProperty]]`
                 // must route through its `getOwnPropertyDescriptor` trap (or forward
                 // to the target). HasOwnProperty is `desc is not undefined`.
+                // A module namespace's `[[GetOwnProperty]]` of a TDZ export throws.
+                #[cfg(all(feature = "module", feature = "std"))]
+                self.namespace_binding_tdz(h, &key)?;
                 if self.realm.proxy_at(h).is_some() {
                     let d = self.descriptor_of(h, &key)?;
                     NanBox::boolean(!matches!(d.unpack(), Unpacked::Undefined))
@@ -3412,6 +3439,9 @@ impl<'a> Interp<'a> {
                 let key = self.member_key(arg(0));
                 let this = self.this_val;
                 let h = self.require_object_coercible_to_object(this, "propertyIsEnumerable")?;
+                // A module namespace's `[[GetOwnProperty]]` of a TDZ export throws.
+                #[cfg(all(feature = "module", feature = "std"))]
+                self.namespace_binding_tdz(h, &key)?;
                 // A proxy routes `[[GetOwnProperty]]` through its trap; the property
                 // is enumerable iff the returned descriptor exists and is enumerable.
                 if self.realm.proxy_at(h).is_some() {

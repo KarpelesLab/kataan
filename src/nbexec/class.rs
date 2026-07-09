@@ -1471,6 +1471,11 @@ impl<'a> Interp<'a> {
         if let Some(th) = self.this_val.as_handle().map(Handle::from_raw) {
             #[cfg(all(feature = "module", feature = "std"))]
             self.trigger_deferred_namespace(th, name)?;
+            // `super.x = v` is `superBase.[[Set]](x, v, this)`; OrdinarySet reads
+            // `Receiver.[[GetOwnProperty]](x)` before writing, so a namespace
+            // receiver whose export `x` is still in its TDZ throws a ReferenceError.
+            #[cfg(all(feature = "module", feature = "std"))]
+            self.namespace_binding_tdz(th, name)?;
             // `super.x = v` is `superBase.[[Set]](x, v, this)` — the write lands on
             // the receiver. Route it through the strict-aware member-assignment path
             // so a failed set (frozen/non-extensible/non-writable receiver) throws a

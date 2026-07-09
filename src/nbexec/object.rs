@@ -235,6 +235,10 @@ impl<'a> Interp<'a> {
         // `[[GetOwnProperty]]` with a String (non-"then") key.
         #[cfg(all(feature = "module", feature = "std"))]
         self.trigger_deferred_namespace(obj, key)?;
+        // A module namespace's `[[GetOwnProperty]]` reads the binding value
+        // (§10.4.6.5 step 4 routes through `[[Get]]`), so a TDZ export throws.
+        #[cfg(all(feature = "module", feature = "std"))]
+        self.namespace_binding_tdz(obj, key)?;
         if let Some((target, handler)) = self.realm.proxy_at(obj) {
             self.guard_revoked(obj)?;
             if let Some(trap) = self.proxy_trap(handler, "getOwnPropertyDescriptor")? {
@@ -672,6 +676,18 @@ impl<'a> Interp<'a> {
         desc: Handle,
         reflect: bool,
     ) -> Result<bool, ExecError> {
+        // A module namespace exotic object has its own `[[DefineOwnProperty]]`
+        // (§10.4.6.11): a String key can only be redefined inertly; a non-export
+        // or shape-altering request fails (Reflect → false, Object → TypeError).
+        #[cfg(all(feature = "module", feature = "std"))]
+        if let Some(ok) = self.namespace_define_own_property(obj, key, desc)? {
+            if !ok && !reflect {
+                return Err(self.type_error(&alloc::format!(
+                    "Cannot redefine property '{key}' of a module namespace object"
+                )));
+            }
+            return Ok(ok);
+        }
         // A proxy routes `Object.defineProperty` through its `defineProperty` trap
         // (called `trap(target, key, descriptor)`), or forwards to the target.
         if let Some((target, handler)) = self.realm.proxy_at(obj) {
