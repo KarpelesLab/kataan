@@ -2271,6 +2271,20 @@ impl<'a> Interp<'a> {
                 let this = self.this_val;
                 self.lazy_gen_resume(this, generator::Resumption::Throw(arg(0)))?
             }
+            // Async-generator `next`/`return`/`throw`: these ALWAYS return a
+            // promise, so a brand-check failure rejects rather than throwing.
+            N_ASYNC_GEN_NEXT => {
+                let this = self.this_val;
+                self.async_gen_resume(this, generator::Resumption::Next(arg(0)))
+            }
+            N_ASYNC_GEN_RETURN => {
+                let this = self.this_val;
+                self.async_gen_resume(this, generator::Resumption::Return(arg(0)))
+            }
+            N_ASYNC_GEN_THROW => {
+                let this = self.this_val;
+                self.async_gen_resume(this, generator::Resumption::Throw(arg(0)))
+            }
             // The abstract `%TypedArray%` intrinsic is not callable directly.
             N_TYPED_ARRAY_ABSTRACT => {
                 let m = self.new_str("Abstract class TypedArray not directly constructable");

@@ -1361,6 +1361,14 @@ const N_GEN_NEXT: u16 = 520;
 const N_GEN_RETURN: u16 = 521;
 /// A lazy generator's `throw(e)` — resumes by throwing `e` at the suspension.
 const N_GEN_THROW: u16 = 522;
+/// An async generator's `next(v)` — like `N_GEN_NEXT` but *always* returns a
+/// promise, so even a brand-check failure (a `this` that is not an async
+/// generator) rejects rather than throwing synchronously.
+const N_ASYNC_GEN_NEXT: u16 = 523;
+/// An async generator's `return(v)` — the promise-returning counterpart.
+const N_ASYNC_GEN_RETURN: u16 = 524;
+/// An async generator's `throw(e)` — the promise-returning counterpart.
+const N_ASYNC_GEN_THROW: u16 = 525;
 /// Async-coroutine resume on fulfilment: bound to the controller object, called
 /// as a microtask reaction when an awaited promise fulfils — resumes the parked
 /// async body with the fulfilment value at the `await` point.

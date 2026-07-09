@@ -1750,7 +1750,20 @@ impl<'a> Interp<'a> {
                     self.strict = true;
                 }
                 let scope = self.current.clone();
-                return Ok(self.make_lazy_generator(body, scope, def.is_async));
+                // The generator object's `[[Prototype]]` is the invoked function's
+                // own `.prototype` (which chains to `%GeneratorPrototype%` /
+                // `%AsyncGeneratorPrototype%`), per `GetPrototypeFromConstructor` —
+                // but only when it is an *Object*. A non-object `.prototype`
+                // (undefined/null/String/Symbol/Number/…) falls back to the
+                // intrinsic prototype (handled by `make_lazy_generator`).
+                let ctor_proto = callee
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|c| self.realm.get_property(c, "prototype"))
+                    .filter(|p| self.is_object_value(*p))
+                    .and_then(|p| p.as_handle())
+                    .map(Handle::from_raw);
+                return Ok(self.make_lazy_generator(body, scope, def.is_async, ctor_proto));
             }
             // An `async` (non-generator) function whose body may `await`: do NOT
             // run its body synchronously. Capture the parameter-bound scope into a

@@ -269,6 +269,36 @@ enum Step<'a> {
         body: &'a Stmt,
         label: Option<String>,
     },
+    /// A reified plain call `f(args)` whose arguments may `yield`. `func` is the
+    /// already-evaluated callee value (this path is only taken for a *plain*,
+    /// non-method call, so the call's `this` is `undefined`). `arguments[idx..]`
+    /// remain to evaluate; `acc` holds the argument values gathered so far. When
+    /// `idx` reaches the end the call is performed and its result pushed.
+    CallArgs {
+        func: NanBox,
+        arguments: &'a [Argument],
+        idx: usize,
+        acc: Vec<NanBox>,
+    },
+    /// Append the just-evaluated argument (top of stack) to a call's argument
+    /// accumulator (spreading it when the argument was `...arg`), then continue.
+    CallArgAppend {
+        func: NanBox,
+        arguments: &'a [Argument],
+        idx: usize,
+        acc: Vec<NanBox>,
+        spread: bool,
+    },
+    /// Complete a static-key member assignment `base.p = <value>` (or
+    /// `base['p'] = …`) whose right-hand side may `yield`: the RHS value is on top
+    /// of the value stack (and stays there as the assignment's result); `base` and
+    /// the static `property` were captured before the RHS was stepped, so a
+    /// `return`/`throw` resumption at the RHS `yield` unwinds *without* performing
+    /// the assignment (exactly as if the abrupt completion appeared at that point).
+    AssignMemberStatic {
+        base: Handle,
+        property: &'a PropertyKey,
+    },
 }
 
 /// A completion threaded through the unwinder.
@@ -316,11 +346,20 @@ type StepResult = Result<StepOut, GenAbrupt>;
 
 impl<'a> Interp<'a> {
     /// Builds a suspended lazy-generator object backed by a [`GenFrame`].
+    ///
+    /// `ctor_proto` is the invoked generator function's own `.prototype` object,
+    /// used as the generator object's `[[Prototype]]` per `GetPrototypeFrom`
+    /// `Constructor`. It chains to `%GeneratorPrototype%` /
+    /// `%AsyncGeneratorPrototype%`, which carry the shared `next`/`return`/`throw`
+    /// and `@@toStringTag`, so the generator object itself has NO own methods —
+    /// they are inherited, exactly as the spec requires. When `ctor_proto` is not
+    /// an object we fall back to the appropriate intrinsic prototype.
     pub(crate) fn make_lazy_generator(
         &mut self,
         body: &'a [Stmt],
         scope: Scope,
         is_async: bool,
+        ctor_proto: Option<Handle>,
     ) -> NanBox {
         let frame = GenFrame {
             body,
@@ -349,26 +388,15 @@ impl<'a> Interp<'a> {
         let obj = self.realm.new_object();
         self.realm
             .set_hidden_property(obj, GEN_FRAME, NanBox::number(id as f64));
-        for (name, nid) in [
-            ("next", N_GEN_NEXT),
-            ("return", N_GEN_RETURN),
-            ("throw", N_GEN_THROW),
-        ] {
-            let f = self.realm.new_native(nid);
-            self.realm
-                .set_property(obj, name, NanBox::handle(f.to_raw()));
-            self.realm.mark_hidden(obj, name);
-        }
-        if let Some(iter_proto) = self
-            .current
-            .get("Iterator")
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-            .and_then(|c| self.realm.get_property(c, "prototype"))
-            .and_then(|p| p.as_handle())
-            .map(Handle::from_raw)
-        {
-            self.realm.set_object_proto(obj, Some(iter_proto));
+        let proto = ctor_proto.or_else(|| {
+            if is_async {
+                self.async_generator_prototype()
+            } else {
+                self.generator_prototype()
+            }
+        });
+        if let Some(proto) = proto {
+            self.realm.set_object_proto(obj, Some(proto));
         }
         NanBox::handle(obj.to_raw())
     }
@@ -451,6 +479,12 @@ impl<'a> Interp<'a> {
                 .set_property(gfp, "prototype", NanBox::handle(gp.to_raw()));
             self.realm.mark_hidden(gfp, "prototype");
             self.realm.set_readonly_property(gfp, "prototype");
+            // `%GeneratorPrototype%.constructor` is `%GeneratorFunction.prototype%`
+            // (this `gfp`): { writable:false, enumerable:false, configurable:true }.
+            self.realm
+                .set_property(gp, "constructor", NanBox::handle(gfp.to_raw()));
+            self.realm.mark_hidden(gp, "constructor");
+            self.realm.set_readonly_property(gp, "constructor");
         }
         self.install_to_string_tag(gfp, "GeneratorFunction");
         // `%GeneratorFunction%` — the constructor, reachable as
@@ -548,9 +582,9 @@ impl<'a> Interp<'a> {
         let aip = self.async_iterator_prototype();
         let agp = self.realm.new_object_with_proto(aip);
         for (name, nid) in [
-            ("next", N_GEN_NEXT),
-            ("return", N_GEN_RETURN),
-            ("throw", N_GEN_THROW),
+            ("next", N_ASYNC_GEN_NEXT),
+            ("return", N_ASYNC_GEN_RETURN),
+            ("throw", N_ASYNC_GEN_THROW),
         ] {
             let f = self.realm.new_native(nid);
             self.install_fn_name_length(f, name, 1);
@@ -597,6 +631,13 @@ impl<'a> Interp<'a> {
                 .set_property(agfp, "prototype", NanBox::handle(agp.to_raw()));
             self.realm.mark_hidden(agfp, "prototype");
             self.realm.set_readonly_property(agfp, "prototype");
+            // `%AsyncGeneratorPrototype%.constructor` is
+            // `%AsyncGeneratorFunction.prototype%` (this `agfp`):
+            // { writable:false, enumerable:false, configurable:true }.
+            self.realm
+                .set_property(agp, "constructor", NanBox::handle(agfp.to_raw()));
+            self.realm.mark_hidden(agp, "constructor");
+            self.realm.set_readonly_property(agp, "constructor");
         }
         self.install_to_string_tag(agfp, "AsyncGeneratorFunction");
         // `%AsyncGeneratorFunction%` — the constructor, reachable as
@@ -704,6 +745,43 @@ impl<'a> Interp<'a> {
         self.realm.set_property(r, "value", value);
         self.realm.set_property(r, "done", NanBox::boolean(done));
         NanBox::handle(r.to_raw())
+    }
+
+    /// A fresh promise already rejected with a `TypeError` carrying `msg`.
+    fn rejected_type_error(&mut self, msg: &str) -> NanBox {
+        let p = self.fresh_promise();
+        let m = self.new_str(msg);
+        let e = self.make_error(N_TYPE_ERROR, Some(m));
+        self.settle(p, e, false);
+        NanBox::handle(p.to_raw())
+    }
+
+    /// `%AsyncGeneratorPrototype%.next/return/throw`: unlike the sync methods
+    /// these ALWAYS return a promise (per the AsyncGenerator abstract operations,
+    /// which create the promise capability *before* validating `this`). A `this`
+    /// that is not an async generator therefore rejects the returned promise with
+    /// a `TypeError` rather than throwing synchronously.
+    pub(crate) fn async_gen_resume(&mut self, this: NanBox, how: Resumption) -> NanBox {
+        let Some(h) = this.as_handle().map(Handle::from_raw) else {
+            return self.rejected_type_error("Generator method called on non-object");
+        };
+        let Some(id) = self.gen_frame_id(h) else {
+            return self.rejected_type_error("Generator method called on a non-generator");
+        };
+        if !self.gen_frames[id].as_ref().is_some_and(|f| f.is_async) {
+            return self.rejected_type_error("Generator method called on a non-async-generator");
+        }
+        // A valid async generator: `lazy_gen_resume` already wraps the result (or
+        // an escaping throw) in a promise for `is_async` frames.
+        match self.lazy_gen_resume(this, how) {
+            Ok(v) => v,
+            Err(ExecError::Throw(e)) => {
+                let p = self.fresh_promise();
+                self.settle(p, e, false);
+                NanBox::handle(p.to_raw())
+            }
+            Err(_) => self.rejected_type_error("async generator internal error"),
+        }
     }
 
     // --- async-function coroutines ------------------------------------------
@@ -1247,6 +1325,20 @@ fn key_has_yield(k: &crate::ast::PropertyKey) -> bool {
     matches!(k, crate::ast::PropertyKey::Computed(e) if expr_has_yield(e))
 }
 
+/// Whether a call `callee(args)` can be reified by the generator step-machine so a
+/// `yield` in an *argument* suspends. Restricted to *plain* calls: the callee must
+/// be yield-free (its reference is evaluated eagerly, in the correct pre-argument
+/// order) and must not be a method (`obj.m`), `super`, direct `eval`, or dynamic
+/// `import` call — those need receiver / this / special-form handling and keep the
+/// eager fallback. A plain call's `this` is `undefined`.
+fn call_reifiable(callee: &Expr) -> bool {
+    match callee {
+        Expr::Super(_) | Expr::Member { .. } => false,
+        Expr::Ident(id) if matches!(id.name.as_ref(), "eval" | "import") => false,
+        _ => !expr_has_yield(callee),
+    }
+}
+
 /// Whether an object literal can be built by the generator step-machine: every
 /// member must be a spread or a plain data property with a *static* key and a
 /// *non-function* value (and not the `__proto__:` prototype setter). Methods,
@@ -1621,6 +1713,62 @@ impl<'a> Interp<'a> {
                     idx: idx + 1,
                     acc,
                 });
+                Ok(StepOut::Continue)
+            }
+            Step::CallArgs {
+                func,
+                arguments,
+                idx,
+                acc,
+            } => {
+                if idx >= arguments.len() {
+                    let r = self
+                        .call_with_this(func, NanBox::undefined(), &acc)
+                        .map_err(GenAbrupt::from)?;
+                    values.push(r);
+                    return Ok(StepOut::Continue);
+                }
+                let (expr, spread) = match &arguments[idx] {
+                    Argument::Item(e) => (e, false),
+                    Argument::Spread(e) => (e, true),
+                };
+                stack.push(Step::CallArgAppend {
+                    func,
+                    arguments,
+                    idx,
+                    acc,
+                    spread,
+                });
+                self.gen_eval_expr(expr, stack, values)
+            }
+            Step::CallArgAppend {
+                func,
+                arguments,
+                idx,
+                mut acc,
+                spread,
+            } => {
+                let v = values.pop().unwrap_or(NanBox::undefined());
+                if spread {
+                    let items = self.iterate_values(v).map_err(GenAbrupt::from)?;
+                    acc.extend(items);
+                } else {
+                    acc.push(v);
+                }
+                stack.push(Step::CallArgs {
+                    func,
+                    arguments,
+                    idx: idx + 1,
+                    acc,
+                });
+                Ok(StepOut::Continue)
+            }
+            Step::AssignMemberStatic { base, property } => {
+                // The RHS value is on top of the stack; it is the assignment's
+                // result, so leave it in place after performing the write.
+                let v = values.last().copied().unwrap_or(NanBox::undefined());
+                self.assign_member(base, property, v)
+                    .map_err(GenAbrupt::from)?;
                 Ok(StepOut::Continue)
             }
             Step::ObjectLit {
@@ -2428,7 +2576,60 @@ impl<'a> Interp<'a> {
                 });
                 Ok(StepOut::Continue)
             }
-            // Any other yield-bearing expression shape (e.g. `f(yield b)`,
+            // `base.p = <value-with-yield>` / `base['p'] = …` — a static-key member
+            // assignment whose RHS may yield, and whose base is yield-free. Evaluate
+            // the base now (correct pre-RHS order), then step the RHS so a yield in
+            // it suspends; the assignment is performed only once the RHS completes
+            // NORMALLY, so a `return`/`throw` at the yield unwinds without writing.
+            // Computed keys, `super.p`, and private names take the eager fallback.
+            Expr::Assign {
+                op: crate::ast::AssignOp::Assign,
+                target,
+                value,
+                ..
+            } if matches!(&**target,
+                Expr::Member { object, property, optional: false, .. }
+                    if !matches!(&**object, Expr::Super(_))
+                        && !expr_has_yield(object)
+                        && matches!(property,
+                            PropertyKey::Ident(_) | PropertyKey::Str(_) | PropertyKey::Number(_))) =>
+            {
+                let Expr::Member {
+                    object, property, ..
+                } = &**target
+                else {
+                    unreachable!()
+                };
+                let base = self.eval(object).map_err(GenAbrupt::from)?;
+                if let Some(h) = base.as_handle().map(Handle::from_raw) {
+                    stack.push(Step::AssignMemberStatic { base: h, property });
+                }
+                // A primitive base mirrors `assign_to`: the write is skipped; only
+                // the RHS is evaluated (for its value / suspension).
+                self.gen_eval_expr(value, stack, values)
+            }
+            // A *plain* call `f(yield)` whose callee is yield-free and is not a
+            // method/`super`/direct-`eval`/`import` call: evaluate the callee now
+            // (its reference cannot reach a `yield`), then step through the
+            // arguments so a `yield` in any argument suspends. A plain call's `this`
+            // is `undefined`. Method calls (`obj.m(yield)`), `super(...)`, direct
+            // eval, and `new` still take the eager fallback (documented follow-up).
+            Expr::Call {
+                callee,
+                arguments,
+                optional,
+                ..
+            } if !*optional && call_reifiable(callee) => {
+                let func = self.eval(callee).map_err(GenAbrupt::from)?;
+                stack.push(Step::CallArgs {
+                    func,
+                    arguments,
+                    idx: 0,
+                    acc: Vec::new(),
+                });
+                Ok(StepOut::Continue)
+            }
+            // Any other yield-bearing expression shape (e.g. `obj.m(yield b)`,
             // a member/computed access, compound/destructuring assignment) is not
             // individually reified; fall back to one-shot eval. The yield-free fast
             // path above means this only runs for genuinely yield-bearing complex
