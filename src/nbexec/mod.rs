@@ -1183,6 +1183,10 @@ const N_INTL_FORMAT_RANGE_TO_PARTS: u16 = 901;
 const N_ITERATOR_TAG_GET: u16 = 902;
 /// `set %IteratorPrototype%[Symbol.toStringTag]` — SetterThatIgnoresPrototypeProperties.
 const N_ITERATOR_TAG_SET: u16 = 903;
+/// `get %IteratorPrototype%.constructor` → `%Iterator%`.
+const N_ITERATOR_CTOR_GET: u16 = 914;
+/// `set %IteratorPrototype%.constructor` — SetterThatIgnoresPrototypeProperties.
+const N_ITERATOR_CTOR_SET: u16 = 915;
 /// A readable static method bound to a `[constructor, name]` pair (so a detached call
 /// still routes to the constructor's `call_method` static dispatch).
 const N_STATIC_METHOD: u16 = 220;
@@ -2331,6 +2335,11 @@ const HELPER_RUNNING: &str = "\u{0}hrun";
 /// For flatMap: the current inner iterator being drained (absent when none).
 const HELPER_INNER: &str = "\u{0}hinner";
 const HELPER_INNER_NEXT: &str = "\u{0}hinnext";
+/// Parallel array of the per-item `@@iterator` methods captured once at
+/// `Iterator.concat` call time (`undefined` for a built-in iterable drained
+/// directly), so iteration re-invokes the stored method rather than re-reading
+/// `@@iterator` (a getter must fire exactly once).
+const HELPER_METHODS: &str = "\u{0}hmethods";
 /// Hidden slots on the `Iterator` constructor caching the three helper-result
 /// prototypes (`%IteratorHelperPrototype%`, `%WrapForValidIteratorPrototype%`,
 /// `%ConcatIteratorPrototype%`).
@@ -3971,11 +3980,20 @@ impl<'a> Interp<'a> {
                 .set_property(iter_proto, name, NanBox::handle(f.to_raw()));
             self.realm.mark_hidden(iter_proto, name);
         }
-        self.realm.set_hidden_property(
+        // `%IteratorPrototype%.constructor` is a get/set accessor (get → %Iterator%;
+        // set = SetterThatIgnoresPrototypeProperties), enumerable: false,
+        // configurable: true — not a plain data property.
+        let ctor_get = self.realm.new_native(N_ITERATOR_CTOR_GET);
+        self.install_fn_name_length(ctor_get, "get constructor", 0);
+        let ctor_set = self.realm.new_native(N_ITERATOR_CTOR_SET);
+        self.install_fn_name_length(ctor_set, "set constructor", 1);
+        self.realm.define_accessor(
             iter_proto,
             "constructor",
-            NanBox::handle(iterator_ctor.to_raw()),
+            NanBox::handle(ctor_get.to_raw()),
+            NanBox::handle(ctor_set.to_raw()),
         );
+        self.realm.mark_hidden(iter_proto, "constructor");
         self.realm.set_hidden_property(
             iterator_ctor,
             "prototype",

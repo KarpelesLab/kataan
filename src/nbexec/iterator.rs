@@ -646,32 +646,64 @@ impl<'a> Interp<'a> {
             return Err(self.type_error("flatMap mapper must return an object"));
         }
         let vh = value.as_handle().map(Handle::from_raw).unwrap();
-        // If `value[Symbol.iterator]` is callable, call it; if it's a built-in
-        // iterable, drain it; otherwise (a plain object carrying its own `next`)
-        // use the object itself as the iterator.
-        let iter_fn = match self.find_iterator_fn(vh) {
-            Ok(f) => f,
+        // GetMethod(value, @@iterator).
+        let iter_sym = self.well_known_symbol("iterator");
+        let iter_key = self.member_key(iter_sym);
+        let mut method = match self.read_member(vh, &iter_key) {
+            Ok(m) => m,
             Err(e) => {
                 let _ = self.iterator_close(src_h);
                 return Err(e);
             }
         };
-        if iter_fn.is_some_and(|fv| {
-            fv.as_handle()
-                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-        }) || self.realm.array_elements(vh).is_some()
-            || self.realm.collection_entries(vh).is_some()
-            || self.realm.get_property(vh, GEN_BUF).is_some()
+        if matches!(method.unpack(), Unpacked::Undefined | Unpacked::Null)
+            && let Ok(Some(m)) = self.class_iterator_method(vh)
         {
-            return match self.get_iter_object(value) {
-                Ok(ih) => Ok(ih),
-                Err(e) => {
-                    let _ = self.iterator_close(src_h);
-                    Err(e)
-                }
-            };
+            method = m;
         }
-        Ok(vh)
+        match method.unpack() {
+            // No `@@iterator`: a built-in iterable (array / Map / Set / generator)
+            // drains; any other object is used directly as the iterator.
+            Unpacked::Undefined | Unpacked::Null => {
+                let is_builtin_iterable = self.realm.array_elements(vh).is_some()
+                    || self.realm.collection_entries(vh).is_some()
+                    || self.realm.get_property(vh, GEN_BUF).is_some();
+                if is_builtin_iterable {
+                    match self.get_iter_object(value) {
+                        Ok(ih) => Ok(ih),
+                        Err(e) => {
+                            let _ = self.iterator_close(src_h);
+                            Err(e)
+                        }
+                    }
+                } else {
+                    Ok(vh)
+                }
+            }
+            // Present but not callable → close src + TypeError (GetMethod step 3).
+            _ => {
+                if !method
+                    .as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    let _ = self.iterator_close(src_h);
+                    return Err(self.type_error("flatMap: Symbol.iterator is not a function"));
+                }
+                let iterator = match self.call_with_this(method, value, &[]) {
+                    Ok(it) => it,
+                    Err(e) => {
+                        let _ = self.iterator_close(src_h);
+                        return Err(e);
+                    }
+                };
+                if self.is_object_value(iterator) {
+                    Ok(iterator.as_handle().map(Handle::from_raw).unwrap())
+                } else {
+                    let _ = self.iterator_close(src_h);
+                    Err(self.type_error("flatMap: the iterator is not an object"))
+                }
+            }
+        }
     }
 
     /// `%IteratorHelperPrototype%.return` — closes the helper (and its source).
@@ -679,14 +711,26 @@ impl<'a> Interp<'a> {
         if let Some(h) = this.as_handle().map(Handle::from_raw) {
             let already_done = self.realm.get_property(h, HELPER_DONE).is_some();
             self.mark_helper_done(h);
-            if !already_done
-                && let Some(src) = self
+            if !already_done {
+                // For `flatMap`, an inner iterator may still be open — close it
+                // first (its `return` is forwarded), then close the source.
+                if let Some(inner) = self
+                    .realm
+                    .get_property(h, HELPER_INNER)
+                    .and_then(|v| v.as_handle())
+                    .map(Handle::from_raw)
+                {
+                    self.realm.delete_property(h, HELPER_INNER);
+                    self.iterator_close(inner)?;
+                }
+                if let Some(src) = self
                     .realm
                     .get_property(h, HELPER_SOURCE)
                     .and_then(|v| v.as_handle())
                     .map(Handle::from_raw)
-            {
-                self.iterator_close(src)?;
+                {
+                    self.iterator_close(src)?;
+                }
             }
         }
         Ok(self.iter_result(NanBox::undefined(), true))
@@ -711,57 +755,77 @@ impl<'a> Interp<'a> {
     /// object with a callable `next` *and* it inherits `%IteratorPrototype%`,
     /// return it unchanged; otherwise wrap it in a `%WrapForValidIterator%`.
     pub(crate) fn iterator_from(&mut self, src: NanBox) -> Result<NanBox, ExecError> {
-        // A string source iterates its code points via `%StringIteratorPrototype%`.
-        if let Some(h) = src.as_handle().map(Handle::from_raw)
-            && self.realm.string_value(h).is_some()
-        {
-            // Build a lazy generator-ish wrapper: reuse the eager string iteration
-            // but expose it through the wrap protocol so helpers attach.
+        // GetIteratorFlattenable(src, iterate-string-primitives): `src` must be an
+        // Object or a primitive String; any other primitive is a TypeError.
+        let src_h = src.as_handle().map(Handle::from_raw);
+        let is_string_prim = src_h.is_some_and(|h| self.realm.string_value(h).is_some());
+        if !self.is_object_value(src) && !is_string_prim {
+            let m = self.new_str("Iterator.from called on a non-object");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        // A primitive String iterates its code points via `%StringIteratorPrototype%`.
+        // (A faithful `GetMethod` here would fire a redefined
+        // `String.prototype[@@iterator]` getter with a *string* receiver — the
+        // primitive-receiver `GetV` semantics are not modelled, so this uses the
+        // built-in iteration directly.)
+        if is_string_prim {
             let values = self.iterate_values(src)?;
             let gen_iter = self.make_generator(values);
             return self.wrap_iterator_value(gen_iter);
         }
-        // A non-string primitive (null/undefined/number/bigint/boolean/symbol) is
-        // a TypeError (`Iterator.from` only accepts objects and strings).
-        if !self.is_object_value(src) {
-            let m = self.new_str("Iterator.from called on a non-object");
-            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        let h = src_h.unwrap();
+        // method = GetMethod(src, @@iterator): the getter fires with `this` = src
+        // (so a `String.prototype[@@iterator]` getter observes a string receiver
+        // for a primitive, an object receiver for a wrapper).
+        let iter_sym = self.well_known_symbol("iterator");
+        let iter_key = self.member_key(iter_sym);
+        let mut method = self.read_member(h, &iter_key)?;
+        // A class computed-key `[Symbol.iterator]() {}` may not surface as a
+        // readable property; fall back to scanning the class body.
+        if matches!(method.unpack(), Unpacked::Undefined | Unpacked::Null)
+            && let Some(m) = self.class_iterator_method(h)?
+        {
+            method = m;
         }
-        // GetIteratorFlattenable(O, iterate-string-primitives): if `O` has
-        // `[Symbol.iterator]`, call it to obtain the iterator; else if `O` is
-        // already an iterator (has a `next`), use it; else if it's a built-in
-        // iterable, drain it into a generator iterator.
-        let h = src.as_handle().map(Handle::from_raw).unwrap();
-        let iter_fn = self.find_iterator_fn(h)?;
-        let iterator = if iter_fn.is_some_and(|fv| {
-            fv.as_handle()
-                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-        }) {
-            let fv = iter_fn.unwrap();
-            self.call_with_this(fv, src, &[])?
-        } else {
-            // No `[Symbol.iterator]`: a built-in iterable drains to a generator,
-            // an object with a `next` is used directly.
-            let is_string_wrapper = self
-                .realm
-                .get_property(h, PRIM_WRAP)
-                .and_then(|p| p.as_handle())
-                .map(Handle::from_raw)
-                .is_some_and(|ph| self.realm.string_value(ph).is_some());
-            let is_builtin_iterable = is_string_wrapper
-                || self.realm.array_elements(h).is_some()
-                || self.realm.collection_entries(h).is_some()
-                || self.realm.get_property(h, GEN_BUF).is_some();
-            if is_builtin_iterable {
-                let vals = self.iterate_values(src)?;
-                self.make_generator(vals)
-            } else {
-                src
+        let iterator = match method.unpack() {
+            Unpacked::Undefined | Unpacked::Null => {
+                // No `@@iterator` (GetMethod → undefined): a built-in iterable
+                // (array / string-wrapper / Map / Set / generator) drains to a
+                // generator; any other object is used directly as the iterator
+                // (GetIteratorDirect — no `next` validation at this step).
+                let is_string_wrapper = self
+                    .realm
+                    .get_property(h, PRIM_WRAP)
+                    .and_then(|p| p.as_handle())
+                    .map(Handle::from_raw)
+                    .is_some_and(|ph| self.realm.string_value(ph).is_some());
+                let is_builtin_iterable = is_string_wrapper
+                    || self.realm.array_elements(h).is_some()
+                    || self.realm.collection_entries(h).is_some()
+                    || self.realm.get_property(h, GEN_BUF).is_some();
+                if is_builtin_iterable {
+                    let vals = self.iterate_values(src)?;
+                    self.make_generator(vals)
+                } else {
+                    src
+                }
+            }
+            _ => {
+                // Present but not callable → TypeError (GetMethod step 3).
+                if !method
+                    .as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    return Err(self.type_error("Iterator.from: Symbol.iterator is not a function"));
+                }
+                self.call_with_this(method, src, &[])?
             }
         };
-        let Some(ih) = iterator.as_handle().map(Handle::from_raw) else {
+        // Step 5: the iterator must be an Object.
+        if !self.is_object_value(iterator) {
             return Err(self.type_error("Iterator.from: not an iterator"));
-        };
+        }
+        let ih = iterator.as_handle().map(Handle::from_raw).unwrap();
         // If the iterator already inherits `%IteratorPrototype%`, return it as-is.
         if self.inherits_iterator_proto(ih) {
             return Ok(iterator);
@@ -830,14 +894,16 @@ impl<'a> Interp<'a> {
     }
 
     /// `%WrapForValidIteratorPrototype%.next` — forwards to the wrapped `next`.
+    /// Requires the `[[Iterated]]` internal slot (`HELPER_SOURCE`).
     pub(crate) fn iter_wrap_next(&mut self, this: NanBox) -> Result<NanBox, ExecError> {
         let Some(h) = this.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("next called on non-object"));
         };
-        let src = self
-            .realm
-            .get_property(h, HELPER_SOURCE)
-            .unwrap_or(NanBox::undefined());
+        // RequireInternalSlot(O, [[Iterated]]).
+        let Some(src) = self.realm.get_property(h, HELPER_SOURCE) else {
+            return Err(self
+                .type_error("%WrapForValidIteratorPrototype%.next requires an [[Iterated]] slot"));
+        };
         let next = self
             .realm
             .get_property(h, HELPER_NEXT)
@@ -847,21 +913,31 @@ impl<'a> Interp<'a> {
 
     /// `%WrapForValidIteratorPrototype%.return` — forwards to the wrapped iterator's
     /// `return` (if callable), else returns `{ value: undefined, done: true }`.
+    /// Requires the `[[Iterated]]` internal slot (`HELPER_SOURCE`).
     pub(crate) fn iter_wrap_return(&mut self, this: NanBox) -> Result<NanBox, ExecError> {
-        if let Some(h) = this.as_handle().map(Handle::from_raw)
-            && let Some(src) = self
-                .realm
-                .get_property(h, HELPER_SOURCE)
-                .and_then(|v| v.as_handle())
-                .map(Handle::from_raw)
+        let Some(h) = this.as_handle().map(Handle::from_raw) else {
+            return Err(
+                self.type_error("%WrapForValidIteratorPrototype%.return requires an object")
+            );
+        };
+        // RequireInternalSlot(O, [[Iterated]]) — a plain object (no wrapped
+        // iterator) throws a TypeError *before* any user `return` is read/called.
+        let Some(src) = self
+            .realm
+            .get_property(h, HELPER_SOURCE)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        else {
+            return Err(self.type_error(
+                "%WrapForValidIteratorPrototype%.return requires an [[Iterated]] slot",
+            ));
+        };
+        let ret = self.read_member(src, "return")?;
+        if ret
+            .as_handle()
+            .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
         {
-            let ret = self.read_member(src, "return")?;
-            if ret
-                .as_handle()
-                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-            {
-                return self.call_with_this(ret, NanBox::handle(src.to_raw()), &[]);
-            }
+            return self.call_with_this(ret, NanBox::handle(src.to_raw()), &[]);
         }
         Ok(self.iter_result(NanBox::undefined(), true))
     }
@@ -870,33 +946,65 @@ impl<'a> Interp<'a> {
     /// `[Symbol.iterator]` method (read eagerly, in order); the result is a lazy
     /// iterator that yields all of the first's values, then the second's, etc.
     pub(crate) fn iterator_concat(&mut self, items: &[NanBox]) -> Result<NanBox, ExecError> {
-        // Validate every argument up front (per spec: collect iterator-getters in
-        // order before producing the result).
+        // Validate every argument up front (per spec: each item's `@@iterator`
+        // method is read via GetMethod *once*, in order, before producing the
+        // result). Store the captured methods so iteration re-invokes them instead
+        // of re-reading `@@iterator` (a getter must fire exactly once).
         let mut sources: Vec<NanBox> = Vec::with_capacity(items.len());
+        let mut methods: Vec<NanBox> = Vec::with_capacity(items.len());
+        let iter_sym = self.well_known_symbol("iterator");
+        let iter_key = self.member_key(iter_sym);
         for it in items {
             if !self.is_object_value(*it) {
                 return Err(self.type_error("Iterator.concat argument is not an object"));
             }
             let h = it.as_handle().map(Handle::from_raw).unwrap();
-            let iter_fn = self.find_iterator_fn(h)?;
-            let has_iter = iter_fn.is_some_and(|fv| {
-                fv.as_handle()
-                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-            });
+            // GetMethod(item, @@iterator): the getter fires here, once.
+            let mut method = self.read_member(h, &iter_key)?;
+            if matches!(method.unpack(), Unpacked::Undefined | Unpacked::Null)
+                && let Some(m) = self.class_iterator_method(h)?
+            {
+                method = m;
+            }
+            let has_method = match method.unpack() {
+                Unpacked::Undefined | Unpacked::Null => false,
+                _ => {
+                    // Present but not callable → TypeError (GetMethod step 3).
+                    if !method
+                        .as_handle()
+                        .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                    {
+                        return Err(
+                            self.type_error("Iterator.concat: Symbol.iterator is not a function")
+                        );
+                    }
+                    true
+                }
+            };
+            // A built-in iterable (array/string/Map/Set/generator) exposes no
+            // readable `@@iterator`; it is drained directly at iteration time.
             let is_builtin_iterable = self.realm.array_elements(h).is_some()
                 || self.realm.string_value(h).is_some()
                 || self.realm.collection_entries(h).is_some()
                 || self.realm.get_property(h, GEN_BUF).is_some();
-            if !has_iter && !is_builtin_iterable {
+            if !has_method && !is_builtin_iterable {
                 return Err(self.type_error("Iterator.concat argument is not iterable"));
             }
             sources.push(*it);
+            methods.push(if has_method {
+                method
+            } else {
+                NanBox::undefined()
+            });
         }
         let arr = self.realm.new_array(sources);
+        let methods_arr = self.realm.new_array(methods);
         let proto = self.iter_ctor_slot(ITER_CONCAT_PROTO_SLOT);
         let h = self.realm.new_object_with_proto(proto);
         self.realm
             .set_hidden_property(h, HELPER_SOURCE, NanBox::handle(arr.to_raw()));
+        self.realm
+            .set_hidden_property(h, HELPER_METHODS, NanBox::handle(methods_arr.to_raw()));
         self.realm
             .set_hidden_property(h, HELPER_COUNTER, NanBox::number(0.0));
         Ok(NanBox::handle(h.to_raw()))
@@ -1333,6 +1441,16 @@ impl<'a> Interp<'a> {
     /// any) and marks the concat result done.
     pub(crate) fn iter_concat_return(&mut self, this: NanBox) -> Result<NanBox, ExecError> {
         if let Some(h) = this.as_handle().map(Handle::from_raw) {
+            // Reentrancy guard: closing the inner iterator invokes its `return`,
+            // which may re-enter this `return` (the underlying generator is
+            // "executing") — that is a TypeError.
+            if self
+                .realm
+                .get_property(h, HELPER_RUNNING)
+                .is_some_and(|v| self.realm.truthy(v))
+            {
+                return Err(self.type_error("Iterator Helper is already running"));
+            }
             let already = self.realm.get_property(h, HELPER_DONE).is_some();
             self.mark_helper_done(h);
             if !already
@@ -1342,7 +1460,11 @@ impl<'a> Interp<'a> {
                     .and_then(|v| v.as_handle())
                     .map(Handle::from_raw)
             {
-                self.iterator_close(inner)?;
+                self.realm
+                    .set_hidden_property(h, HELPER_RUNNING, NanBox::boolean(true));
+                let r = self.iterator_close(inner);
+                self.realm.delete_property(h, HELPER_RUNNING);
+                r?;
             }
         }
         Ok(self.iter_result(NanBox::undefined(), true))
@@ -1420,11 +1542,42 @@ impl<'a> Interp<'a> {
             self.realm
                 .set_hidden_property(h, HELPER_COUNTER, NanBox::number((idx + 1) as f64));
             let src = self.realm.get_element(arr, idx);
-            let ith = match self.get_iter_object(src) {
-                Ok(ih) => ih,
-                Err(e) => {
-                    self.mark_helper_done(h);
-                    return Err(e);
+            // Re-invoke the `@@iterator` method captured at `concat` time (do NOT
+            // re-read `@@iterator` — its getter must fire only once). A stored
+            // `undefined` means a built-in iterable drained directly.
+            let method = self
+                .realm
+                .get_property(h, HELPER_METHODS)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+                .map(|ma| self.realm.get_element(ma, idx))
+                .unwrap_or(NanBox::undefined());
+            let ith = if method
+                .as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                match self.call_with_this(method, src, &[]) {
+                    Ok(it) if self.is_object_value(it) => {
+                        it.as_handle().map(Handle::from_raw).unwrap()
+                    }
+                    Ok(_) => {
+                        self.mark_helper_done(h);
+                        return Err(
+                            self.type_error("Iterator.concat: the iterator is not an object")
+                        );
+                    }
+                    Err(e) => {
+                        self.mark_helper_done(h);
+                        return Err(e);
+                    }
+                }
+            } else {
+                match self.get_iter_object(src) {
+                    Ok(ih) => ih,
+                    Err(e) => {
+                        self.mark_helper_done(h);
+                        return Err(e);
+                    }
                 }
             };
             let inner_next = self.read_member(ith, "next")?;

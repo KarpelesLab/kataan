@@ -1732,7 +1732,16 @@ impl<'a> Interp<'a> {
                 // GetMethod(items, @@iterator): the getter fires (a throw
                 // propagates). A present, callable iterator method → iterate;
                 // otherwise fall back to the array-like (length + indices) read.
+                // ToObject the primitive first (strings/objects are already heap
+                // handles; number/boolean/bigint/symbol box to their wrapper) so a
+                // custom `Number.prototype[@@iterator]` etc. is found — matching
+                // spec's `GetMethod` on the ToObject'd value.
                 let items_box = arg(0);
+                let items_box = if items_box.as_handle().is_some() {
+                    items_box
+                } else {
+                    self.coerce_to_object(items_box)
+                };
                 let is_iterable = match items_box.as_handle().map(Handle::from_raw) {
                     Some(h) => {
                         // A user/inherited callable `@@iterator` (its getter fires,
@@ -2271,6 +2280,25 @@ impl<'a> Interp<'a> {
                     );
                 }
                 self.realm.set_property(this_h, &tag_key, arg(0));
+                NanBox::undefined()
+            }
+            // `get %IteratorPrototype%.constructor` → `%Iterator%`.
+            N_ITERATOR_CTOR_GET => self.current.get("Iterator").unwrap_or(NanBox::undefined()),
+            // `set %IteratorPrototype%.constructor`: SetterThatIgnoresPrototype-
+            // Properties(%Iterator.prototype%, "constructor", v). A non-object
+            // `this`, or `this` being the home prototype itself (detected as owning
+            // the accessor), is a TypeError; otherwise CreateDataProperty/Set on
+            // `this`.
+            N_ITERATOR_CTOR_SET => {
+                let Some(this_h) = self.this_val.as_handle().map(Handle::from_raw) else {
+                    return Err(
+                        self.type_error("Iterator.prototype.constructor setter requires an object")
+                    );
+                };
+                if self.realm.accessor(this_h, "constructor").is_some() {
+                    return Err(self.type_error("cannot set constructor on %Iterator.prototype%"));
+                }
+                self.realm.set_property(this_h, "constructor", arg(0));
                 NanBox::undefined()
             }
             // `get Map.prototype.size` / `get Set.prototype.size` — brand-checked.
