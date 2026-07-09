@@ -1108,11 +1108,10 @@ fn await_in_async() {
         "(async-fn f () (block (expr (await (call g)))))"
     );
     assert_eq!(sx("async () => await x"), "(async-arrow () (await x))");
-    // A plain arrow inside an async function inherits `await`.
-    assert_eq!(
-        prog("async function f() { let g = () => await x; }"),
-        "(async-fn f () (block (let (g (arrow () (await x))))))"
-    );
+    // A plain arrow's body is `ConciseBody[~Await]` per the grammar, so `await`
+    // is an ordinary identifier there — not the await operator — even inside an
+    // enclosing async function. `() => await x` is therefore a Syntax Error.
+    assert!(Parser::parse_program("async function f() { let g = () => await x; }").is_err());
 }
 
 #[test]

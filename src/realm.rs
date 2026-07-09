@@ -4068,7 +4068,20 @@ impl Realm {
             let ca = self.heap.get(Handle::from_raw(ha)).and_then(Cell::as_str);
             let cb = self.heap.get(Handle::from_raw(hb)).and_then(Cell::as_str);
             if let (Some(ra), Some(rb)) = (ca, cb) {
-                return Some(rope_bytes(ra).cmp(&rope_bytes(rb)));
+                let (ba, bb) = (rope_bytes(ra), rope_bytes(rb));
+                // JS string ordering is by UTF-16 code unit. WTF-8 byte order
+                // matches that across the BMP (and for lone surrogates), *except*
+                // for astral characters (U+10000+): their 4-byte forms sort after
+                // 3-byte BMP bytes, yet their surrogate code units (U+D800..U+DFFF)
+                // sort *before* U+E000..U+FFFF. Take the zero-alloc byte fast path
+                // unless an astral char (a 0xF0..0xF4 lead byte) is present, and
+                // only then compare by code unit.
+                let astral = ba.iter().chain(bb.iter()).any(|&b| b >= 0xF0);
+                return Some(if astral {
+                    crate::wtf8::utf16_units(&ba).cmp(crate::wtf8::utf16_units(&bb))
+                } else {
+                    ba.cmp(&bb)
+                });
             }
         }
         // The abstract relational comparison applies ToPrimitive(Number) to each

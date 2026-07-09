@@ -1484,9 +1484,17 @@ impl<'a> Interp<'a> {
                 for stmt in &case.body {
                     match self.exec(stmt)? {
                         // A plain `break` ends the switch, yielding UpdateEmpty of
-                        // its (possibly block-carried) value over V; everything
-                        // else (labeled break, continue, return) bubbles out.
+                        // its (possibly block-carried) value over V.
                         Flow::Break(None, bv) => return Ok(Flow::Normal(update_empty(bv, v))),
+                        // A labeled break / continue bubbles out, but per spec
+                        // CaseBlockEvaluation it carries `Completion(UpdateEmpty(R,
+                        // V))` — the accumulated fall-through value fills an empty
+                        // abrupt value (so `do { switch { case: 10; continue } }
+                        // while(false)` completes with 10, not undefined).
+                        Flow::Break(l, bv) => return Ok(Flow::Break(l, update_empty(bv, v))),
+                        Flow::Continue(l, cv) => {
+                            return Ok(Flow::Continue(l, update_empty(cv, v)));
+                        }
                         Flow::Normal(sv) => {
                             if !sv.is_empty_completion() {
                                 v = sv;

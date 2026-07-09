@@ -3986,21 +3986,27 @@ impl<'a> Interp<'a> {
                 let m = this.new_str(msg);
                 ExecError::Throw(this.make_error(N_TYPE_ERROR, Some(m)))
             };
+            // BigInt division/remainder by zero and a negative exponent are
+            // RangeErrors (not TypeErrors) per BigInt::divide/remainder/exponentiate.
+            let range_throw = |this: &mut Self, msg: &str| {
+                let m = this.new_str(msg);
+                ExecError::Throw(this.make_error(N_RANGE_ERROR, Some(m)))
+            };
             let r = match op {
                 BinaryOp::Add => val(self, x.add(&y)),
                 BinaryOp::Sub => val(self, x.sub(&y)),
                 BinaryOp::Mul => val(self, x.mul(&y)),
                 BinaryOp::Div => match x.divmod(&y) {
                     Some((q, _)) => val(self, q),
-                    None => return Err(throw(self, "Division by zero")),
+                    None => return Err(range_throw(self, "Division by zero")),
                 },
                 BinaryOp::Mod => match x.divmod(&y) {
                     Some((_, rem)) => val(self, rem),
-                    None => return Err(throw(self, "Division by zero")),
+                    None => return Err(range_throw(self, "Division by zero")),
                 },
                 BinaryOp::Exp => {
                     if y.is_negative() {
-                        return Err(throw(self, "Exponent must be non-negative"));
+                        return Err(range_throw(self, "Exponent must be non-negative"));
                     }
                     let e = y.to_i128().and_then(|v| u64::try_from(v).ok()).unwrap_or(0);
                     // Projected result size ≈ bit_len(x) × e. `try_pow` rejects
@@ -4079,7 +4085,13 @@ impl<'a> Interp<'a> {
                 return Ok(None);
             }
         }
-        // BigInt vs Number: compare numerically (`<`/`==` only).
+        // BigInt vs a non-BigInt primitive: exactly one operand is a BigInt (the
+        // both-BigInt case returned above). Equality and the relational operators
+        // compare per spec — a String coerces via StringToBigInt (an invalid string
+        // is "undefined", i.e. never equal / an undefined ordering → `false`), a
+        // Number/Boolean/null compares *mathematically exactly* (no lossy `f64`
+        // round-trip), a Symbol throws for a relational compare (and is unequal for
+        // `==`), and `undefined` is incomparable.
         if matches!(
             op,
             BinaryOp::EqEq
@@ -4089,22 +4101,94 @@ impl<'a> Interp<'a> {
                 | BinaryOp::LtEq
                 | BinaryOp::GtEq
         ) {
-            let to_f = |n: &crate::bignum::BigInt| n.to_i128().map_or(f64::NAN, |v| v as f64);
-            let xn = abig.as_ref().map_or_else(|| self.realm.to_number(a), to_f);
-            let yn = bbig.as_ref().map_or_else(|| self.realm.to_number(b), to_f);
+            use core::cmp::Ordering;
+            let is_equality = matches!(op, BinaryOp::EqEq | BinaryOp::NotEq);
+            let is_relational = !is_equality;
+            // The single BigInt operand and whether it is the left-hand side.
+            let (big, big_left) = match (&abig, &bbig) {
+                (Some(x), _) => (x.clone(), true),
+                (_, Some(y)) => (y.clone(), false),
+                _ => return Ok(None),
+            };
+            let other = if big_left { b } else { a };
+            // Resolve `other` to something comparable to a BigInt.
+            enum Rhs {
+                Big(crate::bignum::BigInt),
+                Num(f64),
+                Incomparable,
+            }
+            let resolved = match other.unpack() {
+                Unpacked::Number(n) => Rhs::Num(n),
+                Unpacked::Bool(bl) => Rhs::Num(if bl { 1.0 } else { 0.0 }),
+                // `==` null/undefined → not equal; a relational compares numerically
+                // (ToNumeric(null) = 0, ToNumeric(undefined) = NaN → incomparable).
+                Unpacked::Null => {
+                    if is_equality {
+                        Rhs::Incomparable
+                    } else {
+                        Rhs::Num(0.0)
+                    }
+                }
+                Unpacked::Undefined => Rhs::Incomparable,
+                Unpacked::Handle(raw) => {
+                    let h = Handle::from_raw(raw);
+                    if let Some(s) = self.realm.string_value(h) {
+                        match string_to_bigint_opt(&s) {
+                            Some(nb) => Rhs::Big(nb),
+                            None => Rhs::Incomparable,
+                        }
+                    } else if self.realm.symbol_at(h).is_some() {
+                        if is_relational {
+                            let m = self.new_str("Cannot convert a Symbol value to a number");
+                            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                        }
+                        Rhs::Incomparable
+                    } else {
+                        // A coercible object is excluded upstream; anything else is
+                        // not a BigInt-comparable primitive — defer.
+                        return Ok(None);
+                    }
+                }
+            };
+            // `ord` is `big` compared against `other`; flip when the BigInt is on
+            // the right so it reflects the source (left-vs-right) order.
+            let ord = match resolved {
+                Rhs::Incomparable => None,
+                Rhs::Big(ob) => Some(big.cmp(&ob)),
+                Rhs::Num(n) => bigint_cmp_f64(&big, n),
+            };
+            let ord = if big_left {
+                ord
+            } else {
+                ord.map(Ordering::reverse)
+            };
             let r = match op {
-                BinaryOp::EqEq => xn == yn,
-                BinaryOp::NotEq => xn != yn,
-                BinaryOp::Lt => xn < yn,
-                BinaryOp::Gt => xn > yn,
-                BinaryOp::LtEq => xn <= yn,
-                _ => xn >= yn,
+                BinaryOp::EqEq => ord == Some(Ordering::Equal),
+                BinaryOp::NotEq => ord != Some(Ordering::Equal),
+                BinaryOp::Lt => ord == Some(Ordering::Less),
+                BinaryOp::Gt => ord == Some(Ordering::Greater),
+                BinaryOp::LtEq => matches!(ord, Some(Ordering::Less | Ordering::Equal)),
+                _ => matches!(ord, Some(Ordering::Greater | Ordering::Equal)),
             };
             return Ok(Some(NanBox::boolean(r)));
         }
         // Mixed arithmetic is a TypeError.
         let m = self.new_str("Cannot mix BigInt and other types");
         Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
+    }
+
+    /// `ToNumber`'s Symbol guard: a Symbol primitive has no numeric conversion, so
+    /// `ToNumeric`/`ToNumber` on one is a `TypeError`. Used to reject a lhs Symbol
+    /// mid-`ToNumeric` before the rhs is converted (spec operand order).
+    fn throw_if_symbol_to_number(&mut self, v: NanBox) -> Result<(), ExecError> {
+        if v.as_handle()
+            .map(Handle::from_raw)
+            .is_some_and(|h| self.realm.symbol_at(h).is_some())
+        {
+            let m = self.new_str("Cannot convert a Symbol value to a number");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        Ok(())
     }
 
     pub(crate) fn binary(
@@ -4167,10 +4251,29 @@ impl<'a> Interp<'a> {
             "number"
         };
         let (a, b) = if coerces && (a.as_handle().is_some() || b.as_handle().is_some()) {
-            (
-                self.coerce_primitive(a, hint)?,
-                self.coerce_primitive(b, hint)?,
-            )
+            // A multiplicative/additive/bitwise/shift operator applies
+            // `ToNumeric(lhs)` *fully* — ToPrimitive **and** ToNumber, the latter
+            // throwing for a Symbol — before touching the rhs, so a lhs whose
+            // conversion throws never evaluates the rhs's `valueOf`
+            // (`order-of-evaluation`). `+` and the relational operators instead
+            // ToPrimitive *both* operands first (a Symbol only throws at the later
+            // ToNumeric/ToString step), so they coerce as a pair.
+            let sequential = !matches!(
+                op,
+                BinaryOp::Add | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq
+            );
+            if sequential {
+                let a = self.coerce_primitive(a, hint)?;
+                self.throw_if_symbol_to_number(a)?;
+                let b = self.coerce_primitive(b, hint)?;
+                self.throw_if_symbol_to_number(b)?;
+                (a, b)
+            } else {
+                (
+                    self.coerce_primitive(a, hint)?,
+                    self.coerce_primitive(b, hint)?,
+                )
+            }
         } else {
             (a, b)
         };
@@ -4193,29 +4296,53 @@ impl<'a> Interp<'a> {
         // `==`/`!=` between an object/array and a number/string primitive coerces
         // the object side (arrays via their join; plain objects via ToPrimitive).
         let (a, b) = if matches!(op, BinaryOp::EqEq | BinaryOp::NotEq) {
-            // True for a non-string heap value (object or array).
+            // True for a real object/array — a heap value that is *not* itself a
+            // primitive (string / Symbol / BigInt cells are primitives, and
+            // ToPrimitive on them is a no-op, so they are not the "object" side).
             let obj = |this: &Self, v: NanBox| {
-                v.as_handle()
-                    .map(Handle::from_raw)
-                    .is_some_and(|h| this.realm.string_value(h).is_none())
+                v.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                    this.realm.string_value(h).is_none()
+                        && this.realm.symbol_at(h).is_none()
+                        && this.realm.bigint_at(h).is_none()
+                })
             };
-            // True for a number, boolean, or string primitive — the operands
-            // against which an object is converted with ToPrimitive (a boolean is
-            // first coerced to a number per the `==` algorithm).
+            // True for any primitive against which an object is converted with
+            // ToPrimitive per the `==` algorithm — a Number, Boolean, String,
+            // Symbol, or BigInt (so `0n == Object(0n)` and `sym == Object(sym)`
+            // coerce the object side and then compare as primitives).
             let prim = |this: &Self, v: NanBox| {
                 v.as_number().is_some()
                     || matches!(v.unpack(), crate::nanbox::Unpacked::Bool(_))
-                    || v.as_handle()
-                        .map(Handle::from_raw)
-                        .is_some_and(|h| this.realm.string_value(h).is_some())
+                    || v.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                        this.realm.string_value(h).is_some()
+                            || this.realm.symbol_at(h).is_some()
+                            || this.realm.bigint_at(h).is_some()
+                    })
             };
-            if obj(self, a) && prim(self, b) {
+            let (a, b) = if obj(self, a) && prim(self, b) {
                 (self.coerce_for_eq(a)?, b)
             } else if obj(self, b) && prim(self, a) {
                 (a, self.coerce_for_eq(b)?)
             } else {
                 (a, b)
+            };
+            // ToPrimitive of the object side may have produced a BigInt (a BigInt
+            // wrapper / a `valueOf` returning a BigInt) or a String to compare
+            // against a BigInt: re-run the dedicated BigInt equality path so
+            // `bigintN == { toString(){ return "N" } }` applies StringToBigInt
+            // rather than a mismatched cross-cell `strict_equals`.
+            let abig = a
+                .as_handle()
+                .and_then(|raw| self.realm.bigint_at(Handle::from_raw(raw)));
+            let bbig = b
+                .as_handle()
+                .and_then(|raw| self.realm.bigint_at(Handle::from_raw(raw)));
+            if (abig.is_some() || bbig.is_some())
+                && let Some(r) = self.bigint_binary(op, abig, bbig, a, b)?
+            {
+                return Ok(r);
             }
+            (a, b)
         } else {
             (a, b)
         };
@@ -4369,6 +4496,12 @@ impl<'a> Interp<'a> {
             || self.realm.function_at(ch).is_some()
             || self.realm.class_at(ch).is_some()
             || self.realm.bound_native_at(ch).is_some()
+            // Any callable is a valid `instanceof` RHS per OrdinaryHasInstance's
+            // IsCallable test — notably `%Function.prototype%` itself, which is a
+            // callable object but not a native/user function (so `[] instanceof
+            // Function.prototype` reads its `.prototype` and walks, rather than
+            // wrongly throwing "not callable").
+            || self.is_callable(ch)
             || self.current.get("Array").and_then(|v| v.as_handle()) == ctor.as_handle()
             || self.current.get("Object").and_then(|v| v.as_handle()) == ctor.as_handle();
         if !is_ctor {
@@ -4586,11 +4719,34 @@ impl<'a> Interp<'a> {
         // `D.prototype` on its chain) is `instanceof D` and `instanceof C`. `Get(ch,
         // "prototype")` fires a proxy `get` trap; `get_proto_of` honors a
         // `getPrototypeOf` trap at each step.
-        if let Some(proto) = self
-            .read_member(ch, "prototype")?
+        let proto_val = self.read_member(ch, "prototype")?;
+        let proto = proto_val
             .as_handle()
             .map(Handle::from_raw)
-        {
+            .filter(|_| self.is_object_value(proto_val));
+        // A non-class callable RHS (e.g. `%Function.prototype%`) follows
+        // OrdinaryHasInstance strictly: `Get(C, "prototype")` must be an Object,
+        // otherwise it is a TypeError (`prototype-getter-with-primitive`).
+        if self.realm.class_at(ch).is_none() {
+            let Some(proto) = proto else {
+                return Err(
+                    self.type_error("Function has non-object prototype in instanceof check")
+                );
+            };
+            let mut cur = oh;
+            for _ in 0..100_000 {
+                let next = self.get_proto_of(cur)?;
+                let Some(p) = next.as_handle().map(Handle::from_raw) else {
+                    return Ok(false);
+                };
+                if p == proto {
+                    return Ok(true);
+                }
+                cur = p;
+            }
+            return Ok(false);
+        }
+        if let Some(proto) = proto {
             let mut cur = oh;
             for _ in 0..100_000 {
                 let next = self.get_proto_of(cur)?;
@@ -4622,4 +4778,63 @@ impl<'a> Interp<'a> {
         }
         Ok(false)
     }
+}
+
+/// `StringToBigInt(str)` (ES2020 7.1.14) as a fallible parse: a trimmed, empty
+/// (or all-whitespace) string is `0n`; a `0x`/`0o`/`0b` prefix selects the radix;
+/// otherwise a decimal (optionally signed) integer literal. Returns `None` — the
+/// spec's `undefined` — for any string that is not a valid `StringIntegerLiteral`
+/// (e.g. `"0."`, `"1.5"`, `"x"`), which the comparison operators treat as an
+/// unequal / undefined-ordering result rather than a throw.
+fn string_to_bigint_opt(s: &str) -> Option<crate::bignum::BigInt> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Some(crate::bignum::BigInt::zero());
+    }
+    let (radix, body) = match t.get(0..2) {
+        Some("0x" | "0X") => (16, &t[2..]),
+        Some("0o" | "0O") => (8, &t[2..]),
+        Some("0b" | "0B") => (2, &t[2..]),
+        _ => (10, t),
+    };
+    crate::bignum::BigInt::from_str_radix(body, radix)
+}
+
+/// Exact comparison of a `BigInt` against an IEEE-754 double, with **no** loss of
+/// precision (the mathematical values are compared, so `2n**60n` vs a nearby
+/// `f64`, or `Number.MAX_VALUE` vs a 1024-bit BigInt, order correctly). Returns
+/// `None` iff `f` is `NaN` (an undefined comparison).
+fn bigint_cmp_f64(big: &crate::bignum::BigInt, f: f64) -> Option<core::cmp::Ordering> {
+    use core::cmp::Ordering;
+    if f.is_nan() {
+        return None;
+    }
+    if f == f64::INFINITY {
+        return Some(Ordering::Less);
+    }
+    if f == f64::NEG_INFINITY {
+        return Some(Ordering::Greater);
+    }
+    // Decompose `f` into integer `mantissa * 2^exp` (exact for every finite f64).
+    let bits = f.to_bits();
+    let sign_neg = bits >> 63 == 1;
+    let raw_exp = ((bits >> 52) & 0x7ff) as i64;
+    let frac = bits & 0x000f_ffff_ffff_ffff;
+    let (mantissa, exp) = if raw_exp == 0 {
+        (frac, -1074i64) // subnormal (or zero)
+    } else {
+        (frac | 0x0010_0000_0000_0000, raw_exp - 1075)
+    };
+    if mantissa == 0 {
+        return Some(big.cmp(&crate::bignum::BigInt::zero())); // f is ±0
+    }
+    let m = crate::bignum::BigInt::from_i128(i128::from(mantissa));
+    let m = if sign_neg { m.neg() } else { m };
+    let two = crate::bignum::BigInt::from_i128(2);
+    // Compare `big` against `m * 2^exp` by clearing the power of two exactly.
+    Some(if exp >= 0 {
+        big.cmp(&m.mul(&two.pow(exp as u64)))
+    } else {
+        big.mul(&two.pow((-exp) as u64)).cmp(&m)
+    })
 }

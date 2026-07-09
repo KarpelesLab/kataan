@@ -256,8 +256,12 @@ impl<'src> Parser<'src> {
             TokenKind::Keyword(Kw::Export) => self.parse_export(),
             // Labeled statement: `ident :`.
             TokenKind::Identifier if self.nth_kind(1) == TokenKind::Colon => self.parse_labeled(),
+            // A keyword usable as a name here is also a valid `LabelIdentifier`
+            // (`await:` in non-module/non-async code, `yield:` outside a generator,
+            // `let:`/`static:` in sloppy code — strict-mode misuse is caught by the
+            // post-parse validator).
             TokenKind::Keyword(kw)
-                if kw.is_contextual() && self.nth_kind(1) == TokenKind::Colon =>
+                if self.keyword_is_binding_ident(kw) && self.nth_kind(1) == TokenKind::Colon =>
             {
                 self.parse_labeled()
             }

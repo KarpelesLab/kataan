@@ -209,9 +209,12 @@ impl<'src> Parser<'src> {
             return Err(self.err("no line terminator is allowed before `=>`"));
         }
         self.expect(TokenKind::Arrow)?;
-        // An arrow is never a generator; an async arrow enables `await`, and a
-        // plain arrow inherits `await` from the enclosing context.
-        let body_async = is_async || self.in_async;
+        // An arrow is never a generator. Only an *async* arrow's `ConciseBody` is
+        // in a `[+Await]` context; a plain arrow's body is `ConciseBody[?In]` with
+        // no `[Await]` (per the grammar), so `await` is an ordinary identifier
+        // there even inside an enclosing async function or class static block
+        // (`static { (() => { var await; }); }` is valid).
+        let body_async = is_async;
         let body = self.in_function_context(false, body_async, |p| {
             if p.at(TokenKind::LBrace) {
                 Ok(ArrowBody::Block(p.parse_block_body()?))

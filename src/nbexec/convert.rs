@@ -263,6 +263,12 @@ impl<'a> Interp<'a> {
             && (self.realm.string_value(h).is_some()
                 || self.realm.is_array(h)
                 || (self.realm.object_keys(h).is_none()
+                    // A function is an ordinary object for ToPrimitive: it must run
+                    // OrdinaryToPrimitive so a user-installed `valueOf`/`toString`
+                    // is honored (`f.valueOf = () => 1; 1 + f` is `2`, not string
+                    // concatenation). Only genuinely key-less *non-callable* exotics
+                    // fall through to the return-as-is fast path.
+                    && !self.is_callable(h)
                     && self.realm.typed_kind(h).is_none()
                     && self.realm.date_at(h).is_none()
                     // A Temporal instance is an ordinary object for ToPrimitive:
