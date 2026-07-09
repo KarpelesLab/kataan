@@ -346,6 +346,12 @@ pub struct Interp<'a> {
     /// where `fn` is a plain user function, not a class or native), parallel to
     /// `classes`; `None` otherwise.
     class_fn_super: Vec<Option<NanBox>>,
+    /// Per-class **class** superclass id (`class D extends C {}` where `C` is a
+    /// class), parallel to `classes`; `None` when the parent is native, an
+    /// ordinary function, `null`, or absent. Cached at class-definition time (the
+    /// heritage is evaluated exactly once per spec) so the eager `.prototype`
+    /// materialization does not re-evaluate the `extends` expression.
+    class_super_id: Vec<Option<u32>>,
     /// Per-class constructor handle (the class value), parallel to `classes`, so
     /// the lazily-materialized `.prototype` can install a `constructor` back-link
     /// and link a derived prototype to its base's prototype.
@@ -2689,6 +2695,7 @@ impl<'a> Interp<'a> {
             class_envs: Vec::new(),
             class_native_super: Vec::new(),
             class_fn_super: Vec::new(),
+            class_super_id: Vec::new(),
             class_handles: Vec::new(),
             private_method_cache: alloc::collections::BTreeMap::new(),
             class_lexical_parent: Vec::new(),
@@ -2802,6 +2809,51 @@ impl<'a> Interp<'a> {
         self.realm.set_property(f, "name", name_v);
         self.realm.mark_hidden(f, "name");
         self.realm.set_readonly_property(f, "name");
+    }
+
+    /// Whether the user function with id `func_id` carries a `prototype` own
+    /// property (i.e. is `[[Construct]]`-able as an ordinary function or a
+    /// generator). Per spec, ordinary function declarations/expressions and
+    /// generator functions/methods (sync + async) have a `prototype`; arrow
+    /// functions, `async` non-generator functions, concise methods, and
+    /// getters/setters do **not**.
+    ///
+    /// NOTE: `is_arrow` / `is_method` are stamped onto the `FnDef` *after*
+    /// `make_method` returns, so calling this at creation time over-includes
+    /// arrows/plain-methods (they read `is_arrow == false` there). Those callers
+    /// rely on [`Self::demote_fn_prototype`] to strip the property once the flag
+    /// is set. At read time (the synthesis gate) the flags are settled, so this
+    /// is exact.
+    pub(crate) fn fn_has_prototype(&self, func_id: u32) -> bool {
+        let d = &self.functions[func_id as usize];
+        d.is_generator || (!d.is_arrow && !d.is_async && !d.is_method && d.home_class.is_none())
+    }
+
+    /// Installs the own `prototype` data property on the constructable function
+    /// `f` with value `proto`. Per spec it is `{ enumerable: false, configurable:
+    /// false }`; `writable` is `true` for ordinary/generator functions and
+    /// `false` for classes. Own-key order is `length`, `name`, `prototype`, so
+    /// this must run *after* [`Self::install_fn_name_length`].
+    pub(crate) fn install_fn_prototype(&mut self, f: Handle, proto: Handle, writable: bool) {
+        self.realm
+            .set_property(f, "prototype", NanBox::handle(proto.to_raw()));
+        self.realm.mark_hidden(f, "prototype");
+        self.realm.set_non_configurable_property(f, "prototype");
+        if !writable {
+            self.realm.set_readonly_property(f, "prototype");
+        }
+    }
+
+    /// Strips a `prototype` own property that [`Self::make_method`] materialized
+    /// on a function later discovered to be non-constructable (an arrow, a
+    /// concise method, or an accessor) — such functions must expose no
+    /// `prototype` at all. Also clears the descriptor flags so a subsequent user
+    /// assignment (`arrow.prototype = x`) creates an ordinary property.
+    pub(crate) fn demote_fn_prototype(&mut self, h: Handle) {
+        self.realm.delete_data_slot(h, "prototype");
+        self.realm.clear_readonly_property(h, "prototype");
+        self.realm.clear_non_configurable_property(h, "prototype");
+        self.realm.clear_hidden_property(h, "prototype");
     }
 
     /// Whether a function's `name` is still the empty-string placeholder (or
@@ -5695,6 +5747,18 @@ impl<'a> Interp<'a> {
                 self.realm.set_function_prototype(func_id, proto);
             }
         }
+        // Materialize the own `prototype` data property for constructable kinds
+        // (ordinary functions + generators). `is_arrow`/`is_method` are not yet
+        // set here, so this over-includes arrows and concise methods; those
+        // callers call `demote_fn_prototype` once the flag is stamped. For a
+        // generator the proto was created above (`set_function_prototype`), so
+        // `function_prototype` returns it without adding a `constructor`
+        // back-link; for a plain function it lazily builds the default proto
+        // (with the back-link) here. `prototype` is `writable: true` for both.
+        if self.fn_has_prototype(func_id) {
+            let proto = self.realm.function_prototype(func_id);
+            self.install_fn_prototype(handle, proto, true);
+        }
         NanBox::handle(handle.to_raw())
     }
 
@@ -5729,9 +5793,17 @@ impl<'a> Interp<'a> {
         // `Object.getPrototypeOf(new TypeError) === TypeError.prototype`,
         // `Object.prototype.toString` reports `[object Error]`, and the inherited
         // `Error.prototype.toString`/`constructor` resolve).
+        // Resolve the *intrinsic* error constructor from the global scope, not the
+        // current lexical scope: a local shadow (`(function(){ function TypeError(){}
+        // … })()`) must not divert an engine-created `TypeError` onto the user
+        // function's `prototype`. (User functions now carry a real own `prototype`,
+        // so a `get_property` on a shadowing binding would otherwise resolve to it
+        // instead of falling through.) Fall back to `current` only if the global
+        // binding is absent (early bootstrap, before the constructors are bound).
         if let Some(proto) = self
-            .current
+            .global_scope
             .get(name)
+            .or_else(|| self.current.get(name))
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .and_then(|c| self.realm.get_property(c, "prototype"))

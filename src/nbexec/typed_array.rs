@@ -117,22 +117,6 @@ impl<'a> Interp<'a> {
         })
     }
 
-    /// Links the typed-array `view`'s `[[Prototype]]` to `ctor.prototype` (the
-    /// constructor used by `TypedArray.of`/`from` / `TypedArraySpeciesCreate`), so
-    /// `result.constructor`, `Object.getPrototypeOf(result)`, and inherited
-    /// members resolve to the actual constructor's prototype.
-    pub(crate) fn link_view_proto_to_ctor(&mut self, view: Handle, ctor: NanBox) {
-        if let Some(proto) = ctor
-            .as_handle()
-            .map(Handle::from_raw)
-            .and_then(|c| self.realm.get_property(c, "prototype"))
-            .and_then(|p| p.as_handle())
-            .map(Handle::from_raw)
-        {
-            self.realm.set_native_proto(view, proto);
-        }
-    }
-
     /// `%TypedArray%.from(source, mapfn, thisArg)` (23.2.2.1), generic over the
     /// `this` constructor `ctor` (so `Int8Array.from(...)` and `%TypedArray%.from`
     /// share one spec-faithful path). Order: IsConstructor(ctor) → mapfn callable →
@@ -225,7 +209,6 @@ impl<'a> Interp<'a> {
             }
             target
         };
-        self.link_view_proto_to_ctor(target, ctor);
         Ok(NanBox::handle(target.to_raw()))
     }
 
@@ -244,7 +227,6 @@ impl<'a> Interp<'a> {
         self.guard_view_immutable(vh)?;
         let nums = self.coerce_typed_elements(vh, items)?;
         self.realm.typed_set_from_numbers(vh, 0, &nums);
-        self.link_view_proto_to_ctor(vh, ctor);
         Ok(NanBox::handle(vh.to_raw()))
     }
 

@@ -152,6 +152,7 @@ impl<'a> Interp<'a> {
         self.class_envs.push(class_env.clone());
         self.class_native_super.push(None);
         self.class_fn_super.push(None);
+        self.class_super_id.push(None);
         self.class_handles.push(class_val);
         self.class_lexical_parent.push(lexical_parent);
         // Record the bare private names this class declares (`#x` → `x`), so a
@@ -300,6 +301,10 @@ impl<'a> Interp<'a> {
                     // constructor inherits the superclass's static members).
                     Some((_, h)) if self.realm.class_at(h).is_some() => {
                         self.realm.set_native_proto(handle, h);
+                        // Cache the resolved super class id so the eager prototype
+                        // build does not re-evaluate the `extends` expression.
+                        self.class_super_id[class_id as usize] =
+                            self.realm.class_at(h).map(|(pid, _)| pid);
                         (None, None)
                     }
                     // A native constructor superclass: a callable native (Map, Set,
@@ -425,6 +430,13 @@ impl<'a> Interp<'a> {
                 self.realm.mark_hidden(handle, k);
             }
         }
+        // Materialize the class's own `prototype` data property — per
+        // MakeClassConstructor it is `{ writable: false, enumerable: false,
+        // configurable: false }`. Building it now (before static initializers)
+        // installs the instance methods and the `constructor` back-link, and lets
+        // a `static x = C.prototype` initializer observe it as an own property.
+        let class_proto = self.class_prototype(class_id, handle);
+        self.install_fn_prototype(handle, class_proto, false);
         // Bind the class's own name in its methods' scope (a named class
         // expression sees itself). The inner binding is an immutable `const`, so
         // reassigning it inside the class body (`class C { m() { C = 1; } }`) is a
@@ -838,8 +850,10 @@ impl<'a> Interp<'a> {
 
         let env = self.class_envs[class_id as usize].clone();
         // Link to the superclass prototype (class chain or function superclass).
+        // Use the *cached* class-super id (resolved once at definition time) so
+        // building the prototype eagerly does not re-evaluate `extends`.
         let class = self.classes[class_id as usize];
-        if let Ok(Some((super_id, _))) = self.resolve_super(class, &env) {
+        if let Some(super_id) = self.class_super_id[class_id as usize] {
             let super_proto = self.class_prototype_by_id(super_id);
             self.realm.set_object_proto(proto, Some(super_proto));
         } else if let Some(fn_super) = self.class_fn_super[class_id as usize]

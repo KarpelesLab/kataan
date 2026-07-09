@@ -1286,6 +1286,13 @@ impl<'a> Interp<'a> {
                                 );
                                 if let Some((fid, _)) = self.realm.function_at(fv) {
                                     self.functions[fid as usize].is_method = true;
+                                    // A concise method is non-constructable and has
+                                    // no `prototype` — except a *generator* method,
+                                    // which does. Strip the tentatively-materialized
+                                    // property for the non-generator case.
+                                    if !self.functions[fid as usize].is_generator {
+                                        self.demote_fn_prototype(fv);
+                                    }
                                 }
                             }
                             self.realm.set_property(handle, &k, v);
@@ -1316,6 +1323,8 @@ impl<'a> Interp<'a> {
                                 if let Some((fid, _)) = self.realm.function_at(fh) {
                                     self.functions[fid as usize].is_method = true;
                                 }
+                                // An accessor has no `prototype`.
+                                self.demote_fn_prototype(fh);
                                 self.realm.set_hidden_property(
                                     fh,
                                     HOME_OBJECT,
@@ -1467,6 +1476,9 @@ impl<'a> Interp<'a> {
             && let Some((func_id, _)) = self.realm.function_at(Handle::from_raw(raw))
         {
             self.functions[func_id as usize].is_arrow = true;
+            // An arrow is not constructable: strip the `prototype` own property
+            // `make_method` tentatively materialized (before `is_arrow` was set).
+            self.demote_fn_prototype(Handle::from_raw(raw));
             // Capture the *lexical* `this`/`new.target`/home at the definition site
             // (hidden slots), so a later call (including via `call`/`apply`/`bind`)
             // resolves them from here rather than the call site.
@@ -2329,6 +2341,12 @@ impl<'a> Interp<'a> {
         if name == "prototype"
             && let Some((func_id, _)) = self.realm.function_at(handle)
             && !self.realm.has_own(handle, "prototype")
+            // Only constructable functions have a `prototype`; a non-constructable
+            // one (arrow / `async` / concise method / accessor) reads it as absent.
+            // Constructable functions normally carry a materialized own property
+            // (so `has_own` is true and this is skipped); this synthesis remains a
+            // safety net for any constructable function created off the main path.
+            && self.fn_has_prototype(func_id)
         {
             let proto = self.realm.function_prototype(func_id);
             return Ok(NanBox::handle(proto.to_raw()));
@@ -2337,6 +2355,7 @@ impl<'a> Interp<'a> {
         // methods/accessors and a `constructor` back-link).
         if name == "prototype"
             && let Some((class_id, _)) = self.realm.class_at(handle)
+            && !self.realm.has_own(handle, "prototype")
         {
             let proto = self.class_prototype(class_id, handle);
             return Ok(NanBox::handle(proto.to_raw()));
@@ -3517,10 +3536,14 @@ impl<'a> Interp<'a> {
                 } else if &**s == "prototype"
                     && let Some((func_id, _)) = self.realm.function_at(handle)
                     && let Some(praw) = new.as_handle()
+                    && !self.realm.property_is_readonly(handle, "prototype")
                 {
                     // `Fn.prototype = obj` reassigns the constructor's prototype.
+                    // Keep the side table (drives the `new`/`Reflect.construct`
+                    // read) and the materialized own data property in sync.
                     self.realm
                         .set_function_prototype(func_id, Handle::from_raw(praw));
+                    self.realm.set_property(handle, "prototype", new);
                 } else if self.allow_property_write(handle, s)? {
                     self.realm.set_property(handle, s, new);
                 }
