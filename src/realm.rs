@@ -4193,8 +4193,13 @@ impl Realm {
                     return "undefined";
                 }
                 // A proxy reflects its target's `typeof` (function vs object).
+                // Recurse (rather than a one-level `type_of`) so a proxy whose
+                // target is itself a proxy — or a callable exotic (bound function,
+                // VM closure) — is classified by walking to the underlying object.
+                // Callability is fixed at proxy creation, so a *revoked* function
+                // proxy still reports "function" (its target handle is retained).
                 if let Some((target, _)) = self.proxy_at(h) {
-                    return self.type_of(target).unwrap_or("object");
+                    return self.type_of_value(NanBox::handle(target.to_raw()));
                 }
                 // A bound function (reserved `\0bnd_t` slot) is a function.
                 if self.get_property(h, "\u{0}bnd_t").is_some() {

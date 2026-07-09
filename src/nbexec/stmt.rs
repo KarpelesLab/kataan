@@ -1210,6 +1210,18 @@ impl<'a> Interp<'a> {
     /// object's `@@unscopables`. Returns the object handle, or `None` to fall back
     /// to the lexical scope chain.
     pub(crate) fn with_binding(&mut self, name: &str) -> Option<Handle> {
+        // Error-swallowing wrapper (a throwing `has` trap / revoked proxy collapses
+        // to "not a with binding") used by the assignment / `typeof` / `delete`
+        // reference sites. The value-read path uses `with_binding_result` so the
+        // trap's throw (a TypeError) propagates per HasBinding's `? HasProperty`.
+        self.with_binding_result(name).unwrap_or(None)
+    }
+
+    /// `HasBinding`-aware resolution of a bare identifier against the enclosing
+    /// `with` object frames, propagating any error thrown by an object environment
+    /// record's `HasProperty` (a proxy `has` trap, a revoked proxy, or a throwing
+    /// `@@unscopables` read).
+    pub(crate) fn with_binding_result(&mut self, name: &str) -> Result<Option<Handle>, ExecError> {
         // Walk the scope chain from innermost outward, interleaving lexical frames
         // with `with` object frames. A local binding shadows an enclosing `with`
         // object; a `with` object shadows a binding further out. The first frame
@@ -1218,46 +1230,48 @@ impl<'a> Interp<'a> {
         while let Some(s) = frame {
             if s.has_local(name) {
                 // An inner lexical binding shadows any outer `with` object.
-                return None;
+                return Ok(None);
             }
             if let Some(obj) = s.with_obj()
                 && let Some(h) = obj.as_handle().map(Handle::from_raw)
-                && let Some(found) = self.with_frame_provides(h, name)
+                && let Some(found) = self.with_frame_provides(h, name)?
             {
-                return Some(found);
+                return Ok(Some(found));
             }
             frame = s.parent();
         }
-        None
+        Ok(None)
     }
 
     /// Whether the `with` object `h` provides `name` as an environment binding:
     /// `HasProperty(name)` and not blocked by a truthy `@@unscopables[name]`.
-    /// `Some(h)` if it provides it; `None` to keep looking further out.
-    fn with_frame_provides(&mut self, h: Handle, name: &str) -> Option<Handle> {
-        // HasBinding for an object environment record is `HasProperty(bindings,
+    /// `Ok(Some(h))` if it provides it; `Ok(None)` to keep looking further out; an
+    /// `Err` when `HasProperty` (a proxy `has` trap) or the `@@unscopables` read
+    /// throws.
+    fn with_frame_provides(&mut self, h: Handle, name: &str) -> Result<Option<Handle>, ExecError> {
+        // HasBinding for an object environment record is `? HasProperty(bindings,
         // N)` — proxy-aware, so `with (new Proxy(o, {has(){…}}))` consults the
         // `has` trap to decide whether `N` is a binding (a trapless proxy forwards
-        // to its target). `has_property` walks the prototype chain like the old
-        // `has_property_chain` but additionally routes through the proxy protocol.
-        if !self.has_property(h, name) {
-            return None;
+        // to its target). A throwing / revoked / non-callable `has` trap propagates
+        // as a TypeError rather than being swallowed.
+        if !self.has_property_proxied(h, name)? {
+            return Ok(None);
         }
         // `@@unscopables`: a truthy entry blocks the binding (the lexical scope
         // shows through instead).
         let unscopables_sym = self.well_known_symbol("unscopables");
         let unscopables_key = self.member_key(unscopables_sym);
         let unscopables = self
-            .read_member(h, &unscopables_key)
-            .ok()
-            .and_then(|v| v.as_handle().map(Handle::from_raw));
-        if let Some(u) = unscopables
-            && let Ok(blocked) = self.read_member(u, name)
-            && self.realm.truthy(blocked)
-        {
-            return None;
+            .read_member(h, &unscopables_key)?
+            .as_handle()
+            .map(Handle::from_raw);
+        if let Some(u) = unscopables {
+            let blocked = self.read_member(u, name)?;
+            if self.realm.truthy(blocked) {
+                return Ok(None);
+            }
         }
-        Some(h)
+        Ok(Some(h))
     }
 
     /// Whether `target` is a *simple* assignment leaf (an identifier or member

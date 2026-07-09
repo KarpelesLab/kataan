@@ -19,10 +19,9 @@ impl<'a> Interp<'a> {
         handler: Handle,
         name: &str,
     ) -> Result<Option<NanBox>, ExecError> {
-        let trap = self
-            .realm
-            .get_property(handler, name)
-            .unwrap_or(NanBox::undefined());
+        // GetMethod(handler, name) is a full `[[Get]]` — it invokes an inherited
+        // getter (a handler whose trap is an accessor) and propagates its throw.
+        let trap = self.read_member(handler, name)?;
         if matches!(trap.unpack(), Unpacked::Undefined | Unpacked::Null) {
             return Ok(None);
         }
@@ -246,13 +245,12 @@ impl<'a> Interp<'a> {
                         "proxy 'getOwnPropertyDescriptor' must return an object or undefined",
                     ));
                 }
-                let target_has = self.realm.has_own(target, key)
-                    || self.realm.accessor(target, key).is_some()
-                    || (key == "length" && self.realm.is_array(target))
-                    || (self.realm.array_length(target).is_some()
-                        && key
-                            .parse::<usize>()
-                            .is_ok_and(|i| i < self.realm.array_length(target).unwrap()));
+                // The target's own descriptor (proxy-aware) and extensibility drive
+                // the 10.5.5 invariants.
+                let target_desc = self.descriptor_of(target, key)?;
+                let target_has = !matches!(target_desc.unpack(), Unpacked::Undefined);
+                let ext = self.is_extensible_of(target)?;
+                let extensible = self.realm.truthy(ext);
                 if matches!(trap_result.unpack(), Unpacked::Undefined) {
                     // Reporting a property as absent has invariants.
                     if target_has {
@@ -261,7 +259,7 @@ impl<'a> Interp<'a> {
                                 "proxy 'getOwnPropertyDescriptor' reported a non-configurable property as absent",
                             ));
                         }
-                        if !self.realm.is_extensible(target) {
+                        if !extensible {
                             return Err(self.type_error(
                                 "proxy 'getOwnPropertyDescriptor' reported a property of a non-extensible target as absent",
                             ));
@@ -273,6 +271,13 @@ impl<'a> Interp<'a> {
                 // and validate against the target.
                 let rh = trap_result.as_handle().map(Handle::from_raw).unwrap();
                 let norm = self.normalize_property_descriptor(rh)?;
+                // Steps 13-14: the reported descriptor must be compatible with the
+                // target's current property (or, when absent, an extensible target).
+                if !self.is_compatible_property_descriptor(extensible, norm, target_desc) {
+                    return Err(self.type_error(
+                        "proxy 'getOwnPropertyDescriptor' reported a descriptor incompatible with the target",
+                    ));
+                }
                 let result_configurable = self
                     .realm
                     .get_property(norm, "configurable")
@@ -285,14 +290,15 @@ impl<'a> Interp<'a> {
                             "proxy 'getOwnPropertyDescriptor' reported a non-configurable descriptor for a configurable or missing target property",
                         ));
                     }
-                    // A non-configurable, non-writable data descriptor requires the
-                    // target's property to be non-writable too.
+                    // A reported non-writable data descriptor requires the target's
+                    // property to be non-writable too (step 15b — gated on the
+                    // presence of [[Writable]], not [[Value]]).
                     let result_writable = self
                         .realm
                         .get_property(norm, "writable")
                         .is_some_and(|v| self.realm.truthy(v));
-                    let has_value = self.realm.has_own(norm, "value");
-                    if has_value
+                    let has_writable = self.realm.has_own(norm, "writable");
+                    if has_writable
                         && !result_writable
                         && !self.realm.property_is_readonly(target, key)
                     {
@@ -362,7 +368,9 @@ impl<'a> Interp<'a> {
                 // enforced here to preserve the 693/693 gate.
                 return Ok(NanBox::boolean(self.realm.truthy(r)));
             }
-            return Ok(NanBox::boolean(self.realm.is_extensible(target)));
+            // An absent trap forwards to the target's `[[IsExtensible]]` — recursing
+            // so a target that is itself a proxy runs its own trap.
+            return self.is_extensible_of(target);
         }
         Ok(NanBox::boolean(self.realm.is_extensible(obj)))
     }
@@ -432,9 +440,19 @@ impl<'a> Interp<'a> {
                 if !self.realm.truthy(r) {
                     return Ok(false);
                 }
-                // Invariant (10.5.2 step 16): if the target is non-extensible, the
-                // new prototype must equal the target's current [[Prototype]].
-                if !self.realm.is_extensible(target) && self.realm.object_proto(target) != proto {
+                // Steps 9-13: `extensibleTarget = ? IsExtensible(target)` — routed
+                // through the target's (possibly proxy) `[[IsExtensible]]`. If the
+                // target is extensible, return true WITHOUT consulting its prototype
+                // (so a throwing `getPrototypeOf` is not observed). Otherwise the new
+                // prototype must equal `? target.[[GetPrototypeOf]]()`.
+                let ext = self.is_extensible_of(target)?;
+                let extensible = self.realm.truthy(ext);
+                if extensible {
+                    return Ok(true);
+                }
+                let target_proto = self.get_proto_of(target)?;
+                let proto_box = proto.map_or(NanBox::null(), |p| NanBox::handle(p.to_raw()));
+                if !self.realm.strict_equals(proto_box, target_proto) {
                     return Err(self.type_error(
                         "proxy 'setPrototypeOf' changed the prototype of a non-extensible target",
                     ));
@@ -529,6 +547,110 @@ impl<'a> Interp<'a> {
         Ok(out)
     }
 
+    /// `IsCompatiblePropertyDescriptor(Extensible, Desc, Current)` — the
+    /// object-less `ValidateAndApplyPropertyDescriptor` (10.1.6.3) used to validate
+    /// a proxy `defineProperty` / `getOwnPropertyDescriptor` trap result against the
+    /// target's current own property. `requested` is the *normalized* descriptor
+    /// (its own fields are exactly the descriptor fields present); `current` is
+    /// `undefined` (the property is absent on the target) or a fully-completed
+    /// descriptor object (as `build_descriptor` / `complete_descriptor` produce).
+    pub(crate) fn is_compatible_property_descriptor(
+        &mut self,
+        extensible: bool,
+        requested: Handle,
+        current: NanBox,
+    ) -> bool {
+        let Some(cur) = current
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|_| !matches!(current.unpack(), Unpacked::Undefined))
+        else {
+            // Current is undefined: a new property is only compatible with an
+            // extensible target.
+            return extensible;
+        };
+        // Presence of a field on the *requested* descriptor.
+        let has = |this: &Self, k: &str| this.realm.has_own(requested, k);
+        let req_truthy = |this: &Self, k: &str| {
+            this.realm
+                .get_property(requested, k)
+                .is_some_and(|v| this.realm.truthy(v))
+        };
+        let cur_truthy = |this: &Self, k: &str| {
+            this.realm
+                .get_property(cur, k)
+                .is_some_and(|v| this.realm.truthy(v))
+        };
+
+        let cur_configurable = cur_truthy(self, "configurable");
+        if cur_configurable {
+            // A configurable current property accepts any change.
+            return true;
+        }
+        // Non-configurable current property.
+        if has(self, "configurable") && req_truthy(self, "configurable") {
+            return false;
+        }
+        if has(self, "enumerable")
+            && req_truthy(self, "enumerable") != cur_truthy(self, "enumerable")
+        {
+            return false;
+        }
+        let req_has_value = has(self, "value");
+        let req_has_writable = has(self, "writable");
+        let req_has_get = has(self, "get");
+        let req_has_set = has(self, "set");
+        let req_is_generic = !req_has_value && !req_has_writable && !req_has_get && !req_has_set;
+        if req_is_generic {
+            return true;
+        }
+        let req_is_data = req_has_value || req_has_writable;
+        let cur_is_data = self.realm.has_own(cur, "value") || self.realm.has_own(cur, "writable");
+        if cur_is_data != req_is_data {
+            // Changing a non-configurable property between data and accessor.
+            return false;
+        }
+        if cur_is_data {
+            if !cur_truthy(self, "writable") {
+                if req_has_writable && req_truthy(self, "writable") {
+                    return false;
+                }
+                if req_has_value {
+                    let rv = self
+                        .realm
+                        .get_property(requested, "value")
+                        .unwrap_or(NanBox::undefined());
+                    let cv = self
+                        .realm
+                        .get_property(cur, "value")
+                        .unwrap_or(NanBox::undefined());
+                    if !self.realm.same_value(rv, cv) {
+                        return false;
+                    }
+                }
+            }
+        } else {
+            // Both accessor descriptors: a non-configurable accessor's get/set are
+            // fixed.
+            for field in ["get", "set"] {
+                if has(self, field) {
+                    let rv = self
+                        .realm
+                        .get_property(requested, field)
+                        .unwrap_or(NanBox::undefined());
+                    let cv = self
+                        .realm
+                        .get_property(cur, field)
+                        .unwrap_or(NanBox::undefined());
+                    if !self.realm.same_value(rv, cv) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// Applies a property descriptor (the shared `Object.defineProperty` / `Reflect
     /// .defineProperty` logic). Returns whether `[[DefineOwnProperty]]` succeeded. An
     /// *invalid* descriptor always throws; a *failed* definition (new property on a
@@ -569,20 +691,23 @@ impl<'a> Interp<'a> {
                         "proxy 'defineProperty' trap returned falsish for property '{key}'"
                     )));
                 }
-                // Invariants (10.5.6) on a successful define. Normalize the incoming
-                // descriptor to inspect what was requested.
+                // Invariants (10.5.6 steps 14-18) on a successful define. Normalize
+                // the incoming descriptor to inspect what was requested, and read the
+                // target's current own descriptor (proxy-aware) + extensibility.
                 let nd = self.normalize_property_descriptor(desc)?;
                 let setting_nonconf = self.realm.has_own(nd, "configurable")
                     && !self
                         .realm
                         .get_property(nd, "configurable")
                         .is_some_and(|v| self.realm.truthy(v));
-                let target_has =
-                    self.realm.has_own(target, key) || self.realm.accessor(target, key).is_some();
+                let target_desc = self.descriptor_of(target, key)?;
+                let target_has = !matches!(target_desc.unpack(), Unpacked::Undefined);
+                let ext = self.is_extensible_of(target)?;
+                let extensible = self.realm.truthy(ext);
                 if !target_has {
                     // A new property requires an extensible target; and a
                     // non-configurable descriptor cannot be added.
-                    if !self.realm.is_extensible(target) {
+                    if !extensible {
                         return Err(self.type_error(
                             "proxy 'defineProperty' added a property to a non-extensible target",
                         ));
@@ -593,13 +718,44 @@ impl<'a> Interp<'a> {
                         ));
                     }
                 } else {
-                    // Redefining an existing target property: a non-configurable
-                    // target property may not be redefined non-configurably unless
-                    // the target's was already non-configurable.
+                    // Redefining an existing target property: the requested
+                    // descriptor must be compatible (IsCompatiblePropertyDescriptor),
+                    // and a non-configurable target property may not be redefined
+                    // non-configurably unless the target's was already
+                    // non-configurable.
+                    if !self.is_compatible_property_descriptor(extensible, nd, target_desc) {
+                        return Err(self.type_error(
+                            "proxy 'defineProperty' trap result is not compatible with the target's property",
+                        ));
+                    }
                     if setting_nonconf && !self.realm.property_is_non_configurable(target, key) {
                         return Err(self.type_error(
                             "proxy 'defineProperty' set configurable:false on a configurable target property",
                         ));
+                    }
+                    // Step 18c: a non-configurable, writable *data* property on the
+                    // target may not be redefined non-writable through the trap.
+                    if let Some(tdh) = target_desc.as_handle().map(Handle::from_raw) {
+                        let t_is_data =
+                            self.realm.has_own(tdh, "value") || self.realm.has_own(tdh, "writable");
+                        let t_conf = self
+                            .realm
+                            .get_property(tdh, "configurable")
+                            .is_some_and(|v| self.realm.truthy(v));
+                        let t_writable = self
+                            .realm
+                            .get_property(tdh, "writable")
+                            .is_some_and(|v| self.realm.truthy(v));
+                        let req_has_writable = self.realm.has_own(nd, "writable");
+                        let req_writable = self
+                            .realm
+                            .get_property(nd, "writable")
+                            .is_some_and(|v| self.realm.truthy(v));
+                        if t_is_data && !t_conf && t_writable && req_has_writable && !req_writable {
+                            return Err(self.type_error(
+                                "proxy 'defineProperty' made a non-configurable writable property non-writable",
+                            ));
+                        }
                     }
                 }
                 return Ok(true);
@@ -1549,6 +1705,20 @@ impl<'a> Interp<'a> {
             }
             return self.delete_property_of(target, key);
         }
+        // A non-proxy target: a String exotic object's own `length` / index and a
+        // RegExp's own `lastIndex` are non-configurable synthesized properties, so
+        // `[[Delete]]` returns false. `delete_property` only tracks physical slots,
+        // so guard those exotics via their descriptor here.
+        if (self.realm.string_object_len(obj).is_some() || self.realm.regexp_at(obj).is_some())
+            && let Some(desc) = self.build_descriptor(obj, key)
+            && let Some(dh) = desc.as_handle().map(Handle::from_raw)
+            && self
+                .realm
+                .get_property(dh, "configurable")
+                .is_some_and(|v| !self.realm.truthy(v))
+        {
+            return Ok(false);
+        }
         Ok(self.realm.delete_property(obj, key))
     }
 
@@ -1928,7 +2098,12 @@ impl<'a> Interp<'a> {
             // absent), so a bare `i < len` must NOT be used here or `[2,,3]` would
             // report index 1 (a hole) as present in `in` / `HasProperty` and in the
             // generic array-like iteration that probes presence with this.
-            let here = self.realm.has_own(c, key) || self.realm.accessor(c, key).is_some();
+            let here = self.realm.has_own(c, key)
+                || self.realm.accessor(c, key).is_some()
+                // A RegExp instance's `lastIndex` is always an own data property
+                // (stored as a compact cell field, so not reported by `has_own`
+                // until materialized).
+                || (key == "lastIndex" && self.realm.regexp_at(c).is_some());
             if here {
                 return Ok(true);
             }

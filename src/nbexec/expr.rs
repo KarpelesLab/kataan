@@ -31,7 +31,7 @@ impl<'a> Interp<'a> {
         // with-object's properties (via `[[Get]]`, so accessors fire) — this
         // shadows even the `undefined`/`NaN`/`Infinity` global identifiers when
         // the with-object provides them (`with ({ NaN: 1 }) { NaN }` is 1).
-        if let Some(h) = self.with_binding(name) {
+        if let Some(h) = self.with_binding_result(name)? {
             return self.read_member(h, name);
         }
         match name {
@@ -4238,11 +4238,36 @@ impl<'a> Interp<'a> {
             }
             return Ok(false);
         }
+        // User class RHS: OrdinaryHasInstance is the authoritative prototype-chain
+        // walk against the class's `.prototype` — so an instance built with a
+        // distinct `newTarget` (`Reflect.construct(C, args, D)`, whose instance has
+        // `D.prototype` on its chain) is `instanceof D` and `instanceof C`. `Get(ch,
+        // "prototype")` fires a proxy `get` trap; `get_proto_of` honors a
+        // `getPrototypeOf` trap at each step.
+        if let Some(proto) = self
+            .read_member(ch, "prototype")?
+            .as_handle()
+            .map(Handle::from_raw)
+        {
+            let mut cur = oh;
+            for _ in 0..100_000 {
+                let next = self.get_proto_of(cur)?;
+                let Some(p) = next.as_handle().map(Handle::from_raw) else {
+                    break;
+                };
+                if p == proto {
+                    return Ok(true);
+                }
+                cur = p;
+            }
+        }
+        // Fallback: the instance's class-tag chain (its class, then each `extends`)
+        // — robust when an instance's prototype was detached but its class identity
+        // is still recorded.
         let (Some(tag), Some((target_id, _))) = (self.realm.class_tag(oh), self.realm.class_at(ch))
         else {
             return Ok(false);
         };
-        // Walk the instance's class chain (its class, then each `extends`).
         let mut cur = Some(tag);
         while let Some(cid) = cur {
             if cid == target_id {

@@ -3340,19 +3340,39 @@ impl<'a> Interp<'a> {
                 let key = self.member_key(arg(0));
                 let this = self.this_val;
                 let h = self.require_object_coercible_to_object(this, "hasOwnProperty")?;
-                NanBox::boolean(self.realm.has_own(h, &key))
+                // A proxy has no ordinary own-property table: `[[GetOwnProperty]]`
+                // must route through its `getOwnPropertyDescriptor` trap (or forward
+                // to the target). HasOwnProperty is `desc is not undefined`.
+                if self.realm.proxy_at(h).is_some() {
+                    let d = self.descriptor_of(h, &key)?;
+                    NanBox::boolean(!matches!(d.unpack(), Unpacked::Undefined))
+                } else {
+                    NanBox::boolean(self.realm.has_own(h, &key))
+                }
             }
             N_OBJ_PROTO_PROPISENUM => {
                 let key = self.member_key(arg(0));
                 let this = self.this_val;
                 let h = self.require_object_coercible_to_object(this, "propertyIsEnumerable")?;
-                // An own *and* enumerable property. `property_is_enumerable` works
-                // for inline objects *and* aux-backed cells (arrays/functions/
-                // classes), where `object_keys` returns `None` and would wrongly
-                // report every aux property non-enumerable.
-                let enumerable =
-                    self.realm.has_own(h, &key) && self.realm.property_is_enumerable(h, &key);
-                NanBox::boolean(enumerable)
+                // A proxy routes `[[GetOwnProperty]]` through its trap; the property
+                // is enumerable iff the returned descriptor exists and is enumerable.
+                if self.realm.proxy_at(h).is_some() {
+                    let d = self.descriptor_of(h, &key)?;
+                    let enumerable = d
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|dh| self.realm.get_property(dh, "enumerable"))
+                        .is_some_and(|v| self.realm.truthy(v));
+                    NanBox::boolean(enumerable)
+                } else {
+                    // An own *and* enumerable property. `property_is_enumerable` works
+                    // for inline objects *and* aux-backed cells (arrays/functions/
+                    // classes), where `object_keys` returns `None` and would wrongly
+                    // report every aux property non-enumerable.
+                    let enumerable =
+                        self.realm.has_own(h, &key) && self.realm.property_is_enumerable(h, &key);
+                    NanBox::boolean(enumerable)
+                }
             }
             N_OBJ_PROTO_ISPROTOTYPEOF => {
                 // Spec order: if V is not an object, return false; *then* ToObject

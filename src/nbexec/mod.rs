@@ -1991,7 +1991,9 @@ fn builtin_method_arity(name: &str) -> u32 {
         // `Promise.prototype.then(onFulfilled, onRejected)`.
         | "then"
         // `Function.prototype.apply(thisArg, argArray)`.
-        | "apply" => 2,
+        | "apply"
+        // `Proxy.revocable(target, handler)`.
+        | "revocable" => 2,
         // Three-argument `Date` setters.
         "setFullYear" | "setUTCFullYear" | "setMinutes" | "setUTCMinutes" => 3,
         // Four-argument `Date` setters.
@@ -4701,6 +4703,9 @@ impl<'a> Interp<'a> {
         self.setup_static_methods("Symbol", &["for", "keyFor"]);
         self.setup_static_methods("Date", &["now", "parse", "UTC"]);
         self.setup_static_methods("BigInt", &["asIntN", "asUintN"]);
+        // `Proxy.revocable` is a readable own function property (name "revocable",
+        // length 2, non-constructor) that routes back through `call_method`.
+        self.setup_static_methods("Proxy", &["revocable"]);
         // `Object`/`Array`/`Reflect` are modeled as namespace objects (their call
         // behavior is special-cased) rather than native-function cells, so they
         // miss the function `name`/`length` synthesis. Install those own data

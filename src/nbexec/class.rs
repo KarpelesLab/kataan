@@ -538,6 +538,32 @@ impl<'a> Interp<'a> {
     /// Instantiates `new Class(args)`: creates the object, installs the methods
     /// of the whole `extends` chain (derived overriding base), then runs the
     /// constructor (with `super(...)` reaching the base).
+    /// `GetPrototypeFromConstructor(newTarget, ...)` for a class instance: when the
+    /// pending `new.target` differs from the class being constructed (an explicit
+    /// `Reflect.construct(C, args, D)` or a proxy forwarding a distinct newTarget),
+    /// the instance's `[[Prototype]]` is `D.[[Get]]("prototype")` when that is an
+    /// Object. Returns `None` to fall back to the class's own prototype (a same
+    /// newTarget, or a non-object `prototype`).
+    fn new_target_instance_proto(
+        &mut self,
+        class_handle: NanBox,
+    ) -> Result<Option<Handle>, ExecError> {
+        let Some(nt) = self.pending_new_target else {
+            return Ok(None);
+        };
+        let Some(nt_h) = nt.as_handle().map(Handle::from_raw) else {
+            return Ok(None);
+        };
+        if class_handle.as_handle().map(Handle::from_raw) == Some(nt_h) {
+            return Ok(None);
+        }
+        let proto = self.read_member(nt_h, "prototype")?;
+        Ok(proto
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|_| self.is_object_value(proto)))
+    }
+
     pub(crate) fn instantiate(
         &mut self,
         class_id: u32,
@@ -578,7 +604,15 @@ impl<'a> Interp<'a> {
             self.construct_native_base(root_id, args, class_handle)?
         } else {
             let obj = self.realm.new_object();
-            self.realm.set_object_proto(obj, Some(proto));
+            // GetPrototypeFromConstructor(newTarget, "%Object.prototype%"): the
+            // instance's [[Prototype]] is `newTarget.prototype` when it is an
+            // object. For a plain `new C()` newTarget is `C` (so this is the class
+            // prototype), but `Reflect.construct(C, args, D)` — or a proxy whose
+            // target is `C` with a distinct newTarget — supplies `D.prototype`.
+            let inst_proto = self
+                .new_target_instance_proto(class_handle)?
+                .unwrap_or(proto);
+            self.realm.set_object_proto(obj, Some(inst_proto));
             obj
         };
         let this_val = NanBox::handle(instance.to_raw());
