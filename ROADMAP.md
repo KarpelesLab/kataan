@@ -132,23 +132,44 @@ These make Kataan more than a fast interpreter. They are *engine* capabilities
 
 ### 2.1 Complete the machine-code JIT (the *whole* VM, not just numbers) — **generic tier landed**
 
-> **Status (generic value tier, Passes 1-5):** a NanBox-value JIT tier now compiles
-> non-numeric hot functions — generic `+`/`-`/`*`/`/`/`%`, comparisons (`<`/`==`/`===`/
-> bitwise/shifts), control flow (loops + branches), property access (`GetProp`/`SetProp`),
-> calls (`Call`/`CallNative`), and computed element access (`arr[i]`/`.length`) — by
-> re-entering the interpreter through runtime helpers over a `*mut Ctx` calling
-> convention, with number-fast-paths inline. Exceptions propagate via a `TAG_JIT_THROW`
-> sentinel + `jit_pending`; every op shares one `vm_*` implementation with the interpreter
-> so the tiers cannot diverge, proven by 36 differential tests (JIT-forced === interpreter,
-> incl. exact-once side effects + identical throws). GC-safe by construction today (GC is
-> not mid-execution-triggered); a `jit_shadow` root hook is wired for a future allocation-
-> triggered GC. **Remaining = the optimization/portability layer** (below): inline
-> machine-code shape/element guards **LANDED** (property GET/SET + array element GET/SET
-> now emit real inline reads/writes over `repr(C)` heap types, offsets runtime-verified
-> by a probe harness that caught a real `Vec`-ptr-offset trap; guard misses + frozen/
-> readonly/handle-value/hole/OOB route to the correct helper; heap-churn differential
-> proven). Remaining: inline `Call`/`ArrayLen`, generalized deopt/OSR,
-> and the shared backend + aarch64. See `JIT_DESIGN.md`.
+> **Status — generic value tier + inline fast paths LANDED (2026-07-09).** The JIT
+> was integer/float-numeric-only (scalar `extern "C" fn(i64…)->i64` ABI, no `&mut Realm`).
+> A **generic NanBox-value tier** now compiles non-numeric hot functions: generic
+> `+`/`-`/`*`/`/`/`%`/`**`/bitwise/shifts, comparisons (`<`/`==`/`===`), `Not`, control
+> flow (loops + branches), property access (`GetProp`/`SetProp`), calls (`Call`/
+> `CallNative`), and computed element access (`arr[i]`/`.length`).
+>
+> *Architecture.* A `*mut Ctx` calling convention (`ctx` pinned in r15, NanBox register
+> file in rbp spill slots) lets JIT code re-enter the interpreter through runtime helpers
+> for anything non-numeric; number cases run inline. Every op shares ONE `vm_*`
+> implementation with the interpreter (`vm_add`/`vm_get_prop`/`vm_call`/…) so the tiers
+> cannot diverge. Exceptions propagate via a `TAG_JIT_THROW` sentinel + `Ctx::jit_pending`
+> (+ `jit_pending_fault`) — no deopt-and-re-run, so side effects fire exactly once.
+> Scouting established the key fact: **the compacting GC is never triggered mid-execution**,
+> so a re-entering JIT is GC-safe by construction today (the roadmap's "stack maps for a
+> moving GC" is forward-insurance, not a current blocker); a `jit_shadow` root hook is
+> wired for a future allocation-triggered GC.
+>
+> *Inline machine-code fast paths.* Property GET/SET and array-element GET/SET and
+> `ArrayLen` emit real inline reads/writes over `#[repr(C)]`/`#[repr(u8)]` heap types
+> (Slot/Cell/ObjectData/Object/PropertyCache). **Safety bedrock:** a `compute_jit_layout()`
+> probe derives every offset/discriminant by pointer arithmetic on real instances (NEVER
+> hand-baked) + gate tests prove them against safe reads incl. post-arena-realloc — the
+> harness caught a real trap (`Vec`'s data ptr is at +8, `cap` at +0 on this toolchain).
+> Guard misses + frozen/readonly/handle-value (generational write barrier)/hole/OOB route
+> to the correct helper; heap-churn differentials (loops while the arena reallocs) stay
+> JIT === interpreter. Direct generic→generic calls go native via an ABI-tagged registry;
+> `CallNative` stays helper-by-design (it re-enters native builtin dispatch).
+>
+> *Verified:* ~50 differential tests (JIT-forced === interpreter, exact-once side effects,
+> identical throws) + layout gate + heap-churn stress; lib 866 / jit 968 green; no_std
+> compiles; JIT-on corpus green.
+>
+> **Remaining (the "large, separate" frontier):** generalized guard-failure **deopt is N/A
+> for this non-speculative tier** (compile-time eligibility + helper slow paths mean no
+> speculative guard fails mid-execution needing interpreter-reg restoration); **OSR** for
+> mid-loop tier-up, and the **Cranelift-style shared backend + aarch64** portability below,
+> are genuine standalone efforts.
 
 Today the JIT compiles integer/float numeric functions and bails to the
 interpreter for everything else. "Complete" means hot functions JIT regardless of
