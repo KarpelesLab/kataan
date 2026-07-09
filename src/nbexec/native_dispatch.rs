@@ -1628,10 +1628,15 @@ impl<'a> Interp<'a> {
                     }
                     // Array index values come from element access (ascending) first
                     // — but a VM closure's backing cells are not enumerable values.
+                    // Only *present* (non-hole) indices enumerate: a sparse array's
+                    // holes are absent own properties, so `[[Get]]` never runs for
+                    // them (matching `Object.keys`, which uses the same index set).
                     if !self.realm.is_vm_function(h)
-                        && let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec)
+                        && let Some(indices) = self.realm.array_enumerable_indices(h)
                     {
-                        vals.extend(elems);
+                        for i in indices {
+                            vals.push(self.read_member(h, &alloc::format!("{i}"))?);
+                        }
                     }
                     let named = self
                         .realm
@@ -1745,11 +1750,14 @@ impl<'a> Interp<'a> {
                         }
                     }
                     // Array index entries (ascending) before named ones — but a VM
-                    // closure's backing cells are not enumerable entries.
+                    // closure's backing cells are not enumerable entries. Holes are
+                    // absent own properties, so a sparse array's missing indices
+                    // contribute no entry (same index set as `Object.keys`).
                     if !self.realm.is_vm_function(h)
-                        && let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec)
+                        && let Some(indices) = self.realm.array_enumerable_indices(h)
                     {
-                        for (i, v) in elems.into_iter().enumerate() {
+                        for i in indices {
+                            let v = self.read_member(h, &alloc::format!("{i}"))?;
                             entries.push((alloc::format!("{i}"), v));
                         }
                     }
