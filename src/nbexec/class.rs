@@ -604,10 +604,21 @@ impl<'a> Interp<'a> {
             return Ok(None);
         }
         let proto = self.read_member(nt_h, "prototype")?;
-        Ok(proto
-            .as_handle()
-            .map(Handle::from_raw)
-            .filter(|_| self.is_object_value(proto)))
+        if self.is_object_value(proto) {
+            return Ok(proto.as_handle().map(Handle::from_raw));
+        }
+        // `newTarget.prototype` is not an Object → the intrinsic default is
+        // `%Object.prototype%` taken from `GetFunctionRealm(newTarget)` (spec
+        // step 4). For a cross-realm newTarget that is the *other* realm's
+        // `%Object.prototype%`; for a same-realm newTarget `realm_default_proto`
+        // returns the current default unchanged, so we yield `None` and let the
+        // caller fall back to the class's own prototype (unchanged behavior).
+        let obj_proto = self.realm.default_object_proto();
+        let remapped = self.realm_default_proto(obj_proto, nt_h);
+        if remapped != obj_proto {
+            return Ok(remapped);
+        }
+        Ok(None)
     }
 
     pub(crate) fn instantiate(

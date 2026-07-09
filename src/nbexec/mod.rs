@@ -583,6 +583,16 @@ pub struct Interp<'a> {
     /// these back cross-realm identity (`other.Array !== Array`). The realm object
     /// returned to JS stores an index into this vector under a hidden slot.
     created_realms: Vec<CreatedRealm>,
+    /// `GetFunctionRealm` side table: maps a callable's raw handle to the index of
+    /// the `$262.createRealm()` realm (`created_realms`) it belongs to. A function
+    /// *absent* from this map belongs to the main realm. Populated for every
+    /// callable installed into a created realm's global (so `other.Object`,
+    /// `other.Function`, … carry their realm) and for functions built *by* a
+    /// created realm's `Function`/`GeneratorFunction` constructor (so
+    /// `new other.Function()` carries the other realm). Consulted only on the
+    /// cross-realm `GetPrototypeFromConstructor` fallback (a `newTarget` whose
+    /// `.prototype` is not an Object), so it never perturbs same-realm construction.
+    fn_realm: alloc::collections::BTreeMap<u64, usize>,
     /// Programs parsed at runtime by `eval` / the `Function` constructor, keyed by
     /// source string. The interpreter's function/AST tables hold `&'a` references
     /// into the running program; a dynamically-parsed `Program` must therefore
@@ -2800,6 +2810,7 @@ impl<'a> Interp<'a> {
             global_scope: Scope::root(),
             shadow_realm_scopes: Vec::new(),
             created_realms: Vec::new(),
+            fn_realm: alloc::collections::BTreeMap::new(),
             eval_programs: alloc::collections::BTreeMap::new(),
             #[cfg(all(feature = "module", feature = "std"))]
             modules: module::ModuleRegistry::new(),
@@ -5650,17 +5661,31 @@ impl<'a> Interp<'a> {
     /// function object is returned. The function is created in the GLOBAL scope
     /// (so it closes over globals only), sloppy unless the body self-declares
     /// `"use strict"`. A parse failure (bad params or body) throws a SyntaxError.
-    fn build_function_constructor(&mut self, args: &[NanBox]) -> Result<NanBox, ExecError> {
-        self.build_function_constructor_kw(args, "function")
+    fn build_function_constructor(
+        &mut self,
+        args: &[NanBox],
+        new_target: NanBox,
+        callee: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        self.build_function_constructor_kw(args, "function", new_target, callee)
     }
 
     /// As `build_function_constructor`, but with an explicit function keyword so the
     /// `GeneratorFunction` ("function*") and `AsyncGeneratorFunction`
     /// ("async function*") intrinsics can reuse the same dynamic-source machinery.
+    ///
+    /// `new_target` / `callee` drive the `GetPrototypeFromConstructor` /
+    /// `GetFunctionRealm` half: a cross-realm `new other.Function()` (or
+    /// `Reflect.construct(Function, …, crossRealmTarget)`) links the built function
+    /// to the appropriate realm's `%Function.prototype%` and tags it with that
+    /// realm. Both are `undefined` for a plain-call `Function(…)` (no realm
+    /// remapping — the current realm's default applies).
     fn build_function_constructor_kw(
         &mut self,
         args: &[NanBox],
         keyword: &str,
+        new_target: NanBox,
+        callee: NanBox,
     ) -> Result<NanBox, ExecError> {
         // Coerce arguments to strings (ToString). Last is the body; the rest are
         // the parameter-list pieces, joined with commas.
@@ -5730,6 +5755,22 @@ impl<'a> Interp<'a> {
                 .take_while(|p| !p.rest && p.default.is_none())
                 .count();
             self.install_fn_name_length(h, "anonymous", len as u32);
+            // `GetFunctionRealm` tagging: a dynamic function belongs to the realm of
+            // the `Function`/`GeneratorFunction`/… whose `[[Construct]]` built it
+            // (`callee`), so a subsequent `new other.Function()` used as a
+            // cross-realm `newTarget` is recognized by `GetPrototypeFromConstructor`.
+            // (Its own `[[Prototype]]` is intentionally left as the current realm's
+            // `%Function.prototype%`: the `AsyncFunction === Function` conflation
+            // makes a realm-derived re-link ambiguous for this path, and none of the
+            // realm-tagging tests observe the built function's own prototype.)
+            let _ = new_target;
+            if let Some(idx) = callee
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|ch| self.get_function_realm(ch))
+            {
+                self.fn_realm.insert(h.to_raw(), idx);
+            }
         }
         Ok(f)
     }

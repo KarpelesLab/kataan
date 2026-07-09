@@ -616,13 +616,29 @@ impl<'a> Interp<'a> {
                 // `Function(args…, body)` called as a plain function behaves the
                 // same as `new Function(…)`: it builds and returns a fresh
                 // anonymous function from the supplied parameter/body source.
-                return self.build_function_constructor(args);
+                // (Plain call → no `newTarget`; the current realm's default proto
+                // applies.)
+                return self.build_function_constructor(
+                    args,
+                    NanBox::undefined(),
+                    NanBox::undefined(),
+                );
             }
             N_GENERATOR_FUNCTION_CTOR => {
-                return self.build_function_constructor_kw(args, "function*");
+                return self.build_function_constructor_kw(
+                    args,
+                    "function*",
+                    NanBox::undefined(),
+                    NanBox::undefined(),
+                );
             }
             N_ASYNC_GENERATOR_FUNCTION_CTOR => {
-                return self.build_function_constructor_kw(args, "async function*");
+                return self.build_function_constructor_kw(
+                    args,
+                    "async function*",
+                    NanBox::undefined(),
+                    NanBox::undefined(),
+                );
             }
             N_EVAL => {
                 // Reaching `eval` through `call_native` means an *indirect* eval

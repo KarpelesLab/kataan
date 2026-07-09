@@ -1879,9 +1879,14 @@ impl<'a> Interp<'a> {
         if new_target.as_handle().is_some()
             && new_target.as_handle() != callee.as_handle()
             && let Some(nt) = new_target.as_handle().map(Handle::from_raw)
-            && let Some(p) = self.newtarget_object_proto(nt)
         {
-            return Some(p);
+            if let Some(p) = self.newtarget_object_proto(nt) {
+                return Some(p);
+            }
+            // `newTarget.prototype` is not an Object → the intrinsic default comes
+            // from `GetFunctionRealm(newTarget)` (spec step 4), which matters when
+            // `newTarget` is a cross-realm constructor.
+            return self.realm_default_proto(default_proto, nt);
         }
         default_proto
     }
@@ -1925,7 +1930,10 @@ impl<'a> Interp<'a> {
         if self.is_object_value(proto) {
             Ok(proto.as_handle().map(Handle::from_raw))
         } else {
-            Ok(default)
+            // `Type(proto)` is not Object → intrinsic default from
+            // `GetFunctionRealm(newTarget)` (spec step 4): a cross-realm newTarget
+            // supplies its own realm's intrinsic.
+            Ok(self.realm_default_proto(default, nt))
         }
     }
 
@@ -1957,6 +1965,72 @@ impl<'a> Interp<'a> {
                 .function_at(nt)
                 .map(|(func_id, _)| self.realm.function_prototype(func_id)),
         }
+    }
+
+    /// `GetFunctionRealm(func)` — the index (into `created_realms`) of the
+    /// `$262.createRealm()` realm a callable belongs to, or `None` for the main
+    /// realm. A bound function forwards to its `[[BoundTargetFunction]]`; a Proxy
+    /// forwards to its `[[ProxyTarget]]` (a revoked proxy has no realm here → the
+    /// main realm). An ordinary/native function is looked up in the `fn_realm`
+    /// side table (absent ⇒ main realm).
+    pub(crate) fn get_function_realm(&self, f: Handle) -> Option<usize> {
+        if let Some(target) = self.realm.get_property(f, BOUND_TARGET)
+            && let Some(th) = target.as_handle().map(Handle::from_raw)
+        {
+            return self.get_function_realm(th);
+        }
+        if let Some((target, _)) = self.realm.proxy_at(f) {
+            return self.get_function_realm(target);
+        }
+        self.fn_realm.get(&f.to_raw()).copied()
+    }
+
+    /// `GetPrototypeFromConstructor` step 4: when a `newTarget`'s `.prototype` is
+    /// not an Object, the intrinsic default proto must be taken from *that
+    /// constructor's realm*, not the currently-running realm. Given the current
+    /// realm's intrinsic `default` proto and the `newTarget` handle, this returns
+    /// the equivalent intrinsic proto in `GetFunctionRealm(newTarget)`'s realm —
+    /// or `default` unchanged when `newTarget` belongs to the main realm (the
+    /// common case, so same-realm construction is never perturbed) or the lookup
+    /// cannot be resolved. The intrinsic is identified by `default.constructor.name`
+    /// and re-resolved against the target realm's global object.
+    pub(crate) fn realm_default_proto(
+        &mut self,
+        default: Option<Handle>,
+        nt: Handle,
+    ) -> Option<Handle> {
+        let Some(def) = default else { return default };
+        let Some(idx) = self.get_function_realm(nt) else {
+            return default;
+        };
+        if idx >= self.created_realms.len() {
+            return default;
+        }
+        // The intrinsic's name from `default.constructor.name` (an own data
+        // property on every built-in prototype, e.g. `%Map.prototype%.constructor`
+        // is `Map`, whose `name` is `"Map"`).
+        let name = self
+            .realm
+            .get_property(def, "constructor")
+            .and_then(|c| c.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|ctor| self.realm.get_property(ctor, "name"))
+            .map(|n| self.realm.to_display_string(n));
+        let Some(name) = name.filter(|n| !n.is_empty()) else {
+            return default;
+        };
+        // Re-resolve `<name>.prototype` against the target realm's global object.
+        let gt = self.created_realms[idx].global_this;
+        let other = gt
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|g| self.realm.get_property(g, &name))
+            .and_then(|c| c.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|ctor| self.realm.get_property(ctor, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw);
+        other.or(default)
     }
 
     /// The intrinsic `.prototype` object handle for a constructor bound at the
@@ -2154,10 +2228,14 @@ impl<'a> Interp<'a> {
             // primitive being wrapped) honors a subclass's `newTarget.prototype`.
             let v = args.first().copied().unwrap_or(NanBox::undefined());
             let result = self.coerce_to_object(v);
+            // Default `%Object.prototype%` (of the current realm) so a cross-realm
+            // `newTarget` with a non-object `.prototype` derives its own realm's
+            // `%Object.prototype%` (GetPrototypeFromConstructor step 4).
+            let default = self.realm.default_object_proto();
             if nt.as_handle() != callee.as_handle()
                 && !self.is_object_value(v)
                 && let Some(rh) = result.as_handle().map(Handle::from_raw)
-                && let Some(proto) = self.instance_proto(nt, callee, None)
+                && let Some(proto) = self.instance_proto(nt, callee, default)
             {
                 self.realm.set_object_proto(rh, Some(proto));
             }
@@ -2193,10 +2271,13 @@ impl<'a> Interp<'a> {
                 self.realm.set_array_length(arr, len);
             }
             // A subclass (`class S extends Array {}` / `Reflect.construct`) links the
-            // dense array to `newTarget.prototype` (default `%Array.prototype%`).
+            // dense array to `newTarget.prototype` (default `%Array.prototype%`). A
+            // cross-realm `newTarget` with a non-object `.prototype` derives its own
+            // realm's `%Array.prototype%` (GetPrototypeFromConstructor step 4).
             let nt = self.reflect_new_target.unwrap_or(callee);
+            let default = self.realm.array_proto_intrinsic();
             if nt.as_handle() != callee.as_handle()
-                && let Some(proto) = self.instance_proto(nt, callee, None)
+                && let Some(proto) = self.instance_proto(nt, callee, default)
             {
                 self.realm.set_object_proto(arr, Some(proto));
             }
@@ -2389,6 +2470,19 @@ impl<'a> Interp<'a> {
                 return Err(self.type_error("Promise executor is not a function"));
             }
             let promise = self.fresh_promise();
+            // `Reflect.construct(Promise, …, newTarget)` (or `class P extends
+            // Promise`): link to `GetPrototypeFromConstructor(newTarget,
+            // %Promise.prototype%)` — newTarget's `.prototype` when an Object, else
+            // its realm's `%Promise.prototype%`. A plain `new Promise` is untouched.
+            if native_new_target.as_handle() != callee.as_handle() {
+                let default = self.realm.object_proto(promise);
+                if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
+                    // A promise is a non-object cell: its `[[Prototype]]` link lives
+                    // in the realm's native-proto table (`set_native_proto`), not an
+                    // inline object slot.
+                    self.realm.set_native_proto(promise, proto);
+                }
+            }
             let resolve = self.realm.new_bound_native(N_RESOLVE, promise);
             let reject = self.realm.new_bound_native(N_REJECT, promise);
             self.install_fn_name_length(resolve, "", 1);
@@ -2601,6 +2695,20 @@ impl<'a> Interp<'a> {
                     .set_property(Handle::from_raw(eh), "cause", cause);
                 self.realm.mark_hidden(Handle::from_raw(eh), "cause");
             }
+            // `Reflect.construct(Error, …, newTarget)`: link the error to
+            // `GetPrototypeFromConstructor(newTarget, %ErrorType.prototype%)` — the
+            // newTarget's `.prototype` (when an Object), else that constructor's
+            // realm's `%ErrorType.prototype%` (`make_error` installed the current
+            // realm's default). A plain `new Error()` (newTarget == callee) is left
+            // untouched.
+            if native_new_target.as_handle() != callee.as_handle()
+                && let Some(eh) = err.as_handle().map(Handle::from_raw)
+            {
+                let default = self.realm.object_proto(eh);
+                if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
+                    self.realm.set_object_proto(eh, Some(proto));
+                }
+            }
             return Ok(err);
         }
         // `new WeakRef(target)` — holds the target. `deref()` always returns it
@@ -2664,11 +2772,14 @@ impl<'a> Interp<'a> {
             let buf = self.make_array_buffer(n);
             // A subclass (`class S extends ArrayBuffer {}` / `Reflect.construct`)
             // re-links the buffer to `newTarget.prototype` (the default
-            // `%ArrayBuffer.prototype%` was installed by `make_array_buffer`).
-            if native_new_target.as_handle() != callee.as_handle()
-                && let Some(proto) = self.instance_proto(native_new_target, callee, None)
-            {
-                self.realm.set_object_proto(buf, Some(proto));
+            // `%ArrayBuffer.prototype%` was installed by `make_array_buffer`). A
+            // cross-realm `newTarget` with a non-object `.prototype` derives its own
+            // realm's `%ArrayBuffer.prototype%` (GetPrototypeFromConstructor step 4).
+            if native_new_target.as_handle() != callee.as_handle() {
+                let default = self.realm.object_proto(buf);
+                if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
+                    self.realm.set_object_proto(buf, Some(proto));
+                }
             }
             // `new ArrayBuffer(n, { maxByteLength })` makes the buffer resizable up
             // to `max`. `read_member` runs a poisoned getter; `maxByteLength` is
@@ -2779,7 +2890,12 @@ impl<'a> Interp<'a> {
                         .map(Handle::from_raw)
                         .filter(|_| self.is_object_value(pv))
                 };
-                p.or(default_proto)
+                // Non-object `prototype` → `%SharedArrayBuffer.prototype%` from the
+                // newTarget's realm (GetPrototypeFromConstructor step 4).
+                match p {
+                    Some(x) => Some(x),
+                    None => self.realm_default_proto(default_proto, nt),
+                }
             } else {
                 default_proto
             };
@@ -3208,25 +3324,40 @@ impl<'a> Interp<'a> {
             let wrapper = self.make_primitive_wrapper(prim, id);
             // A subclass (`class S extends Number {}` / `Reflect.construct`) links
             // the wrapper to `newTarget.prototype` (the default intrinsic was set by
-            // `make_primitive_wrapper`).
+            // `make_primitive_wrapper`). A cross-realm `newTarget` with a non-object
+            // `.prototype` derives its own realm's `%String/Number/Boolean.prototype%`
+            // (GetPrototypeFromConstructor step 4) — pass the wrapper's just-set
+            // intrinsic proto as the default so `realm_default_proto` can remap it.
             if native_new_target.as_handle() != callee.as_handle()
                 && let Some(wh) = wrapper.as_handle().map(Handle::from_raw)
-                && let Some(proto) = self.instance_proto(native_new_target, callee, None)
             {
-                self.realm.set_object_proto(wh, Some(proto));
+                let default = self.realm.object_proto(wh);
+                if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
+                    self.realm.set_object_proto(wh, Some(proto));
+                }
             }
             return Ok(wrapper);
         }
         // `new Function(...)` builds an anonymous function from runtime source —
         // identical to calling `Function(...)` as a plain function.
         if id == N_FUNCTION {
-            return self.build_function_constructor(args);
+            return self.build_function_constructor(args, native_new_target, callee);
         }
         if id == N_GENERATOR_FUNCTION_CTOR {
-            return self.build_function_constructor_kw(args, "function*");
+            return self.build_function_constructor_kw(
+                args,
+                "function*",
+                native_new_target,
+                callee,
+            );
         }
         if id == N_ASYNC_GENERATOR_FUNCTION_CTOR {
-            return self.build_function_constructor_kw(args, "async function*");
+            return self.build_function_constructor_kw(
+                args,
+                "async function*",
+                native_new_target,
+                callee,
+            );
         }
         // `WeakMap`/`WeakSet` reuse the collection cell (no true weak refs here).
         let is_set = match id {

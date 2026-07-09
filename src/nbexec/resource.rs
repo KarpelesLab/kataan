@@ -345,7 +345,10 @@ impl<'a> Interp<'a> {
         if self.is_object_value(proto) {
             return Ok(proto.as_handle().map(Handle::from_raw));
         }
-        Ok(default)
+        // Non-object `prototype` → intrinsic default from
+        // `GetFunctionRealm(newTarget)` (spec step 4): a cross-realm newTarget uses
+        // its own realm's intrinsic.
+        Ok(self.realm_default_proto(default, nt))
     }
 
     /// Stamps the disposable-stack internal slots onto an instance built by a
@@ -430,6 +433,22 @@ impl<'a> Interp<'a> {
             global_this: new_global_this,
             intrinsics: new_intrinsics,
         });
+        // `GetFunctionRealm` tagging: every callable installed on this realm's
+        // global (its `Object`/`Function`/`Array`/… constructors, each a distinct
+        // heap cell from every other realm's) belongs to realm `idx`. Recording
+        // them lets `GetPrototypeFromConstructor` pick *this* realm's intrinsic
+        // default when such a constructor (or a function it builds) is used as a
+        // cross-realm `newTarget` with a non-object `.prototype`.
+        if let Some(gt) = new_global_this.as_handle().map(Handle::from_raw) {
+            for key in self.realm.object_all_keys(gt) {
+                if let Some(v) = self.realm.get_property(gt, &key)
+                    && let Some(h) = v.as_handle().map(Handle::from_raw)
+                    && self.is_callable(h)
+                {
+                    self.fn_realm.insert(h.to_raw(), idx);
+                }
+            }
+        }
         idx
     }
 
