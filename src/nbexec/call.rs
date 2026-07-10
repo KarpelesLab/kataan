@@ -2228,24 +2228,26 @@ impl<'a> Interp<'a> {
         // argument it makes a fresh object; otherwise it is ToObject(value) (the
         // same as calling `Object(value)`).
         if self.is_object_ctor(callee) {
-            let nt = self.reflect_new_target.unwrap_or(callee);
-            // `Object(value)` with an actual object value returns it as-is, ignoring
-            // newTarget; only the fresh-object path (no/null/undefined arg, or a
-            // primitive being wrapped) honors a subclass's `newTarget.prototype`.
+            let nt = self.reflect_new_target.take().unwrap_or(callee);
             let v = args.first().copied().unwrap_or(NanBox::undefined());
-            let result = self.coerce_to_object(v);
-            // Default `%Object.prototype%` (of the current realm) so a cross-realm
-            // `newTarget` with a non-object `.prototype` derives its own realm's
-            // `%Object.prototype%` (GetPrototypeFromConstructor step 4).
-            let default = self.realm.default_object_proto();
-            if nt.as_handle() != callee.as_handle()
-                && !self.is_object_value(v)
-                && let Some(rh) = result.as_handle().map(Handle::from_raw)
-                && let Some(proto) = self.instance_proto_checked(nt, callee, default)?
-            {
-                self.realm.set_object_proto(rh, Some(proto));
+            // ECMA-262 20.1.1.1 step 1: when NewTarget is a *subclass* (≠ the Object
+            // constructor), the result is always a fresh ordinary object whose
+            // `[[Prototype]]` is `newTarget.prototype` — the `value` argument is
+            // ignored entirely (so `new (class extends Object{})({a:1})` has no `a`).
+            if nt.as_handle() != callee.as_handle() {
+                // Default `%Object.prototype%` (of the current realm) so a
+                // cross-realm `newTarget` with a non-object `.prototype` derives its
+                // own realm's `%Object.prototype%` (GetPrototypeFromConstructor).
+                let default = self.realm.default_object_proto();
+                let proto = self
+                    .instance_proto_checked(nt, callee, default)?
+                    .or(default);
+                let obj = self.realm.new_object_with_proto(proto);
+                return Ok(NanBox::handle(obj.to_raw()));
             }
-            return Ok(result);
+            // Otherwise ordinary `Object(value)` = ToObject(value): an object is
+            // returned as-is, a primitive is boxed, null/undefined → a fresh object.
+            return Ok(self.coerce_to_object(v));
         }
         // `new Array(...)` — Array is a namespace object (matched by native id, so
         // a cross-realm `Array` is also handled).

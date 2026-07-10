@@ -480,6 +480,13 @@ impl<'a> Interp<'a> {
         if current == proto {
             return Ok(true);
         }
+        // `Object.prototype` is an immutable-prototype exotic object (10.4.7.2):
+        // its `[[SetPrototypeOf]]` succeeds only for the current prototype (handled
+        // just above) and otherwise fails — so `setPrototypeOf(Object.prototype, x)`
+        // throws and `Reflect.setPrototypeOf` returns `false`.
+        if self.realm.default_object_proto() == Some(obj) {
+            return Ok(false);
+        }
         if !self.realm.is_extensible(obj) {
             return Ok(false);
         }
@@ -1081,12 +1088,29 @@ impl<'a> Interp<'a> {
             // For a numeric index on an array, the value lives in the dense
             // element store (so `arr[i]` reads it and `length` grows), not the aux
             // named-property map. `set_element` extends the array as needed.
+            // Only a *canonical* array index (`0 ..= 2**32 - 2`) is an element; a
+            // larger numeric key (`"4294967295"`+) is an ordinary named property and
+            // does not grow `length`.
             let array_index = if self.realm.is_array(obj) {
-                key.parse::<usize>()
+                key.parse::<u32>()
                     .ok()
-                    .filter(|i| alloc::format!("{i}") == key)
+                    .filter(|&i| i != u32::MAX && alloc::format!("{i}") == key)
+                    .map(|i| i as usize)
             } else {
                 None
+            };
+            // Store a value at an array index, falling back to sparse aux storage
+            // (and a logical `length` bump) when the index is beyond the dense cap
+            // — the backing `Vec` cannot hold billions of slots, but the property
+            // must still exist and `length` become `i + 1`.
+            let store_array_index = |this: &mut Self, i: usize, value: NanBox| {
+                if !this.realm.set_element(obj, i, value) && i >= this.realm.limits.max_array_len {
+                    this.realm.force_set_property(obj, key, value);
+                    let target_len = i + 1;
+                    if this.realm.array_length(obj).unwrap_or(0) < target_len {
+                        this.realm.set_array_length(obj, target_len);
+                    }
+                }
             };
             if self.realm.has_own(desc, "value") {
                 let value = self
@@ -1094,7 +1118,7 @@ impl<'a> Interp<'a> {
                     .get_property(desc, "value")
                     .unwrap_or(NanBox::undefined());
                 if let Some(i) = array_index {
-                    self.realm.set_element(obj, i, value);
+                    store_array_index(self, i, value);
                 } else {
                     // `[[DefineOwnProperty]]` validates extensibility itself, so the
                     // store must bypass the ordinary non-extensible / frozen guard
@@ -1105,7 +1129,7 @@ impl<'a> Interp<'a> {
                 }
             } else if !is_own || existing_is_accessor {
                 if let Some(i) = array_index {
-                    self.realm.set_element(obj, i, NanBox::undefined());
+                    store_array_index(self, i, NanBox::undefined());
                 } else {
                     self.realm.force_set_property(obj, key, NanBox::undefined());
                 }
@@ -1779,6 +1803,52 @@ impl<'a> Interp<'a> {
         Ok(Some(out))
     }
 
+    /// `EnumerableOwnProperties(proxy, kind)` for `Object.values`/`entries`, keeping
+    /// the spec-exact per-key interleaving: for each String own key,
+    /// `[[GetOwnProperty]]` (the `getOwnPropertyDescriptor` trap) fires *immediately
+    /// before* the enumerable key's `[[Get]]` (the `get` trap) — not a first pass of
+    /// all descriptors and then a second pass of all reads. Returns `None` when
+    /// `handle` is not a proxy (the caller then uses the ordinary object path).
+    pub(crate) fn proxy_enumerable_entries(
+        &mut self,
+        proxy: Handle,
+    ) -> Result<Option<Vec<(alloc::string::String, NanBox)>>, ExecError> {
+        if self.realm.proxy_at(proxy).is_none() {
+            return Ok(None);
+        }
+        let Some(keys) = self.proxy_own_keys_raw(proxy)? else {
+            return Ok(None);
+        };
+        let mut out = Vec::new();
+        for k in keys {
+            // Only String keys participate (symbols are skipped).
+            let Some(name) = k
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|h| self.realm.string_value(h))
+            else {
+                continue;
+            };
+            // `[[GetOwnProperty]]` (proxy-aware) — the descriptor trap fires here.
+            let desc = self.descriptor_of(proxy, &name)?;
+            if matches!(desc.unpack(), Unpacked::Undefined) {
+                continue;
+            }
+            let enumerable = desc
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|dh| self.realm.get_property(dh, "enumerable"))
+                .is_some_and(|v| self.realm.truthy(v));
+            if !enumerable {
+                continue;
+            }
+            // `[[Get]]` (the `get` trap) immediately after this key's descriptor.
+            let v = self.read_member(proxy, &name)?;
+            out.push((name, v));
+        }
+        Ok(Some(out))
+    }
+
     /// The proxy `set` trap success invariant (10.5.9): a `true` result is illegal
     /// when the target has `key` as a non-configurable, non-writable data property
     /// with a different value, or as a non-configurable accessor whose setter is
@@ -1870,6 +1940,86 @@ impl<'a> Interp<'a> {
             self.arg_map_break(obj, key);
         }
         Ok(result)
+    }
+
+    /// `SetIntegrityLevel(O, level)` (7.3.15) routed through a proxy's traps:
+    /// `[[PreventExtensions]]`, then `[[OwnPropertyKeys]]` and — per key —
+    /// `[[GetOwnProperty]]` + `[[DefineOwnProperty]]` making it non-configurable
+    /// (and a data property non-writable when `frozen`). A failed prevent-extensions
+    /// or a rejected define is a TypeError.
+    pub(crate) fn proxy_set_integrity_level(
+        &mut self,
+        obj: Handle,
+        frozen: bool,
+    ) -> Result<(), ExecError> {
+        if !self.prevent_extensions_of(obj)? {
+            return Err(
+                self.type_error("Object.freeze/seal: object could not be made non-extensible")
+            );
+        }
+        let keys = self.own_property_keys_values(obj)?;
+        for key in keys {
+            let name = self.member_key(key);
+            let current = self.descriptor_of(obj, &name)?;
+            if matches!(current.unpack(), Unpacked::Undefined) {
+                continue;
+            }
+            let is_accessor = current
+                .as_handle()
+                .map(Handle::from_raw)
+                .is_some_and(|dh| self.realm.has_own(dh, "get") || self.realm.has_own(dh, "set"));
+            let desc = self.realm.new_object();
+            self.realm
+                .set_property(desc, "configurable", NanBox::boolean(false));
+            if frozen && !is_accessor {
+                self.realm
+                    .set_property(desc, "writable", NanBox::boolean(false));
+            }
+            // `apply_descriptor(reflect=false)` routes through the `defineProperty`
+            // trap and throws a TypeError if it is rejected (DefinePropertyOrThrow).
+            self.apply_descriptor(obj, &name, desc, false)?;
+        }
+        Ok(())
+    }
+
+    /// `TestIntegrityLevel(O, level)` (7.3.16) routed through a proxy's traps: a
+    /// non-extensible object all of whose own properties (via `[[GetOwnProperty]]`)
+    /// are non-configurable — and, when `frozen`, every data property non-writable.
+    pub(crate) fn proxy_test_integrity_level(
+        &mut self,
+        obj: Handle,
+        frozen: bool,
+    ) -> Result<bool, ExecError> {
+        let ext = self.is_extensible_of(obj)?;
+        if self.realm.truthy(ext) {
+            return Ok(false);
+        }
+        let keys = self.own_property_keys_values(obj)?;
+        for key in keys {
+            let name = self.member_key(key);
+            let current = self.descriptor_of(obj, &name)?;
+            let Some(dh) = current.as_handle().map(Handle::from_raw) else {
+                continue;
+            };
+            let configurable = self
+                .realm
+                .get_property(dh, "configurable")
+                .is_some_and(|v| self.realm.truthy(v));
+            if configurable {
+                return Ok(false);
+            }
+            if frozen {
+                let is_data = self.realm.has_own(dh, "value") || self.realm.has_own(dh, "writable");
+                let writable = self
+                    .realm
+                    .get_property(dh, "writable")
+                    .is_some_and(|v| self.realm.truthy(v));
+                if is_data && writable {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// `[[PreventExtensions]]` honoring a proxy's `preventExtensions` trap. Returns
@@ -2338,11 +2488,52 @@ impl<'a> Interp<'a> {
         target: Handle,
         descs: Handle,
     ) -> Result<(), ExecError> {
+        // A proxy Properties object drives `[[OwnPropertyKeys]]` + per-key
+        // `[[GetOwnProperty]]` (getOwnPropertyDescriptor trap) then `[[Get]]` (get
+        // trap) through its handler, in spec order — the physical key scan below
+        // would see none of the proxy's virtual keys.
+        if self.realm.proxy_at(descs).is_some() {
+            let keys = self.own_property_keys_values(descs)?;
+            for key in keys {
+                let name = self.member_key(key);
+                let desc = self.descriptor_of(descs, &name)?;
+                if matches!(desc.unpack(), Unpacked::Undefined) {
+                    continue;
+                }
+                let enumerable = desc
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|dh| self.realm.get_property(dh, "enumerable"))
+                    .is_some_and(|v| self.realm.truthy(v));
+                if !enumerable {
+                    continue;
+                }
+                let d_val = self.read_member(descs, &name)?;
+                let Some(d) = d_val
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .filter(|_| self.is_object_value(d_val))
+                else {
+                    return Err(self.type_error("Property description must be an object"));
+                };
+                self.apply_descriptor(target, &name, d, false)?;
+            }
+            return Ok(());
+        }
         // OwnPropertyKeys(Properties) filtered to enumerable, in spec order. A
         // function/array/native keeps its named (accessor) properties in the aux
         // object, so fall back to `aux_named_keys` like `Object.keys`. An array's
         // own enumerable keys also include its integer indices.
         let mut keys: Vec<alloc::string::String> = Vec::new();
+        // A String exotic Properties object (`Object.create(p, "abc")` /
+        // `defineProperties(o, new String("abc"))`) exposes its code-unit indices as
+        // own enumerable properties; each value is a one-char string, so
+        // ToPropertyDescriptor rejects it — the point of these keys enumerating.
+        if let Some(n) = self.string_index_count(descs) {
+            for i in 0..n {
+                keys.push(alloc::format!("{i}"));
+            }
+        }
         if let Some(indices) = self.realm.array_present_indices(descs)
             && !self.realm.is_vm_function(descs)
         {

@@ -1755,21 +1755,34 @@ impl Realm {
         // `"0".."length-1"` (ascending), then `"length"`, then any wrapper named
         // own properties (a `defineProperty` on a `new String(...)`).
         if let Some(slen) = self.string_object_len(handle) {
-            let mut names: Vec<alloc::string::String> =
-                (0..slen).map(|i| alloc::format!("{i}")).collect();
-            names.push(alloc::string::String::from("length"));
+            // Integer-index keys (the string's own `"0".."length-1"` plus any extra
+            // canonical index defined on the wrapper, e.g. `str[5] = …`) enumerate
+            // ascending *before* `"length"`; non-index named keys follow it.
+            let mut index_keys: Vec<u32> =
+                (0..slen).filter_map(|i| u32::try_from(i).ok()).collect();
+            let mut named: Vec<alloc::string::String> = Vec::new();
             if let Some(obj) = self.heap.get(handle).and_then(Cell::as_object) {
                 for k in obj.ordered_keys() {
-                    if k.starts_with('#')
-                        || k.starts_with('\u{0}')
-                        || k == "length"
-                        || k.parse::<usize>().is_ok_and(|i| i < slen)
-                    {
+                    if k.starts_with('#') || k.starts_with('\u{0}') || k == "length" {
                         continue;
                     }
-                    names.push(alloc::string::String::from(k));
+                    if let Ok(n) = k.parse::<u32>()
+                        && n != u32::MAX
+                        && alloc::format!("{n}").as_str() == k
+                    {
+                        if (n as usize) >= slen && !index_keys.contains(&n) {
+                            index_keys.push(n);
+                        }
+                        continue;
+                    }
+                    named.push(alloc::string::String::from(k));
                 }
             }
+            index_keys.sort_unstable();
+            let mut names: Vec<alloc::string::String> =
+                index_keys.iter().map(|i| alloc::format!("{i}")).collect();
+            names.push(alloc::string::String::from("length"));
+            names.extend(named);
             return Some(names);
         }
         if let Some(obj) = self.heap.get(handle)?.as_object() {
@@ -2117,19 +2130,82 @@ impl Realm {
     /// Whether the value at `handle` is a frozen object or array.
     #[must_use]
     pub fn is_frozen(&self, handle: Handle) -> bool {
-        if self.frozen_arrays.contains(&handle.to_raw()) {
-            return true;
+        // Array integrity is tracked via the side registry.
+        if self.heap.get(handle).and_then(Cell::as_array).is_some() {
+            return self.frozen_arrays.contains(&handle.to_raw());
         }
+        // A cached `Object.freeze` flag is a fast `true`.
         if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
-            return o.is_frozen();
-        }
-        // An aux-backed cell (function/Date/…): frozen iff its aux object exists and
-        // is frozen (freeze creates + freezes it).
-        self.aux_props
+            if o.is_frozen() {
+                return true;
+            }
+        } else if self
+            .aux_props
             .get(&handle.to_raw())
             .and_then(|a| self.heap.get(*a))
             .and_then(Cell::as_object)
             .is_some_and(crate::object::Object::is_frozen)
+        {
+            return true;
+        }
+        // Otherwise compute `TestIntegrityLevel(frozen)`: an object made rigid via
+        // `preventExtensions` + per-property `defineProperty` (never
+        // `Object.freeze`) — or one with no own properties — must also qualify.
+        self.test_integrity_level(handle, true)
+    }
+
+    /// `TestIntegrityLevel(O, level)` (7.3.16): a non-extensible object all of
+    /// whose own properties are non-configurable — and, when `frozen`, whose every
+    /// own *data* property is also non-writable. Computed from live attributes so an
+    /// object never passed to `Object.seal`/`freeze` is still classified correctly.
+    #[must_use]
+    fn test_integrity_level(&self, handle: Handle, frozen: bool) -> bool {
+        // Only a genuine object-like cell can be frozen/sealed. A primitive, a
+        // free slot, or a stale (post-compaction) handle is never "frozen" — guard
+        // against `is_extensible`'s `false`-for-unknown default reporting one so.
+        let objectlike = matches!(
+            self.heap.get(handle),
+            Some(
+                Cell::Object(_)
+                    | Cell::Array(_)
+                    | Cell::TypedArray { .. }
+                    | Cell::RegExp { .. }
+                    | Cell::Date(_)
+                    | Cell::Collection { .. }
+                    | Cell::Promise(_)
+                    | Cell::Function { .. }
+                    | Cell::Class { .. }
+                    | Cell::Native(_)
+                    | Cell::HostFn(_)
+                    | Cell::BoundNative { .. }
+            )
+        );
+        if !objectlike {
+            return false;
+        }
+        if self.is_extensible(handle) {
+            return false;
+        }
+        let mut keys = self.own_property_names(handle).unwrap_or_default();
+        keys.extend(self.object_accessor_keys(handle));
+        keys.extend(
+            self.object_all_keys(handle)
+                .into_iter()
+                .filter(|k| k.starts_with("\u{0}sym:")),
+        );
+        for key in keys {
+            if !self.property_is_non_configurable(handle, &key) {
+                return false;
+            }
+            // A data property (no accessor) must be non-writable to be frozen.
+            if frozen
+                && self.accessor(handle, &key).is_none()
+                && !self.property_is_readonly(handle, &key)
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// Whether the `length` of the array at `handle` was made non-writable via
@@ -2222,6 +2298,18 @@ impl Realm {
                 .filter(|&i| !a[i].is_hole() && !o.is_hidden(&alloc::format!("{i}")))
                 .collect(),
         )
+    }
+
+    /// The length of an array's *dense* backing `Vec` (not its logical `length`,
+    /// which may be larger for a sparse array). `None` if not a plain array. Used to
+    /// tell an in-dense index (a real slot) from a beyond-dense index (a hole or an
+    /// aux-stored sparse element that the named `[[Get]]` must resolve).
+    #[must_use]
+    pub fn array_dense_len(&self, handle: Handle) -> Option<usize> {
+        self.heap
+            .get(handle)
+            .and_then(Cell::as_array)
+            .map(|a| a.len())
     }
 
     /// `arr[index]` — the element at `index`, or `undefined` if out of range or
@@ -2864,15 +2952,20 @@ impl Realm {
             return self.sealed_arrays.contains(&handle.to_raw());
         }
         if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
-            return o.is_sealed();
-        }
-        // An aux-backed cell (function/Date/…): sealed iff its aux object exists and
-        // is sealed (seal/freeze creates + seals it).
-        self.aux_props
+            if o.is_sealed() {
+                return true;
+            }
+        } else if self
+            .aux_props
             .get(&handle.to_raw())
             .and_then(|a| self.heap.get(*a))
             .and_then(Cell::as_object)
             .is_some_and(Object::is_sealed)
+        {
+            return true;
+        }
+        // Otherwise compute `TestIntegrityLevel(sealed)`.
+        self.test_integrity_level(handle, false)
     }
 
     /// Whether the cell at `handle` is a callable (any flavour of function): a

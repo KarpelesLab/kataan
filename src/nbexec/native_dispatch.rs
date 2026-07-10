@@ -946,6 +946,14 @@ impl<'a> Interp<'a> {
                 NanBox::handle(self.realm.new_array(boxed).to_raw())
             }
             N_OBJECT_FREEZE => {
+                // A proxy routes SetIntegrityLevel through its traps (ownKeys +
+                // getOwnPropertyDescriptor + defineProperty, per key).
+                if let Some(raw) = arg(0).as_handle()
+                    && self.realm.proxy_at(Handle::from_raw(raw)).is_some()
+                {
+                    self.proxy_set_integrity_level(Handle::from_raw(raw), true)?;
+                    return Ok(arg(0));
+                }
                 if let Some(raw) = arg(0).as_handle() {
                     // SetIntegrityLevel(frozen) calls `DefinePropertyOrThrow(k,
                     // {writable:false, configurable:false})` per own key. A module
@@ -967,6 +975,12 @@ impl<'a> Interp<'a> {
                 arg(0) // returns the (now frozen) object
             }
             N_OBJECT_SEAL => {
+                if let Some(raw) = arg(0).as_handle()
+                    && self.realm.proxy_at(Handle::from_raw(raw)).is_some()
+                {
+                    self.proxy_set_integrity_level(Handle::from_raw(raw), false)?;
+                    return Ok(arg(0));
+                }
                 if let Some(raw) = arg(0).as_handle() {
                     self.realm.seal_object(Handle::from_raw(raw));
                 }
@@ -986,6 +1000,12 @@ impl<'a> Interp<'a> {
             N_OBJECT_IS_SEALED => {
                 // A non-object argument (a primitive) is reported as sealed.
                 let v = arg(0);
+                if let Some(raw) = v.as_handle()
+                    && self.realm.proxy_at(Handle::from_raw(raw)).is_some()
+                {
+                    let r = self.proxy_test_integrity_level(Handle::from_raw(raw), false)?;
+                    return Ok(NanBox::boolean(r));
+                }
                 let sealed = !self.is_object_value(v)
                     || v.as_handle()
                         .is_some_and(|raw| self.realm.is_sealed(Handle::from_raw(raw)));
@@ -1474,8 +1494,14 @@ impl<'a> Interp<'a> {
             }
             // `Object.getOwnPropertyDescriptors(obj)` → a map of all descriptors.
             N_OBJECT_GET_OWN_DESCS => {
+                // `Let obj be ? ToObject(O)`: null/undefined throws, a primitive is
+                // boxed (so its own indices/length get descriptors).
+                let obj = self.require_object_coercible_to_object(
+                    arg(0),
+                    "Object.getOwnPropertyDescriptors",
+                )?;
                 let out = self.realm.new_object();
-                if let Some(obj) = arg(0).as_handle().map(Handle::from_raw) {
+                {
                     if self.realm.proxy_at(obj).is_some() {
                         // A proxy: `[[OwnPropertyKeys]]` (ownKeys trap or trapless
                         // forward) then `[[GetOwnProperty]]` per key via
@@ -1512,6 +1538,12 @@ impl<'a> Interp<'a> {
             N_OBJECT_IS_FROZEN => {
                 // A non-object argument (a primitive) is reported as frozen.
                 let v = arg(0);
+                if let Some(raw) = v.as_handle()
+                    && self.realm.proxy_at(Handle::from_raw(raw)).is_some()
+                {
+                    let r = self.proxy_test_integrity_level(Handle::from_raw(raw), true)?;
+                    return Ok(NanBox::boolean(r));
+                }
                 let frozen = !self.is_object_value(v)
                     || v.as_handle()
                         .is_some_and(|raw| self.realm.is_frozen(Handle::from_raw(raw)));
@@ -1617,16 +1649,12 @@ impl<'a> Interp<'a> {
                 if matches!(arg(0).unpack(), Unpacked::Null | Unpacked::Undefined) {
                     return Err(self.type_error("Object.values called on null or undefined"));
                 }
-                // A proxy with an `ownKeys` trap: its enumerable keys, each value
-                // read through the proxy (so a `get` trap fires).
+                // A proxy: per-key `[[GetOwnProperty]]` (descriptor trap) interleaved
+                // with the enumerable key's `[[Get]]` (get trap), in spec order.
                 if let Some(raw) = arg(0).as_handle()
-                    && let Some(keys) = self.proxy_own_enumerable_keys(Handle::from_raw(raw))?
+                    && let Some(entries) = self.proxy_enumerable_entries(Handle::from_raw(raw))?
                 {
-                    let ph = Handle::from_raw(raw);
-                    let mut vals = Vec::with_capacity(keys.len());
-                    for k in keys {
-                        vals.push(self.read_member(ph, &k)?);
-                    }
+                    let vals: Vec<NanBox> = entries.into_iter().map(|(_, v)| v).collect();
                     return Ok(NanBox::handle(self.realm.new_array(vals).to_raw()));
                 }
                 let mut vals = Vec::new();
@@ -1655,11 +1683,14 @@ impl<'a> Interp<'a> {
                         .object_keys(h)
                         .unwrap_or_else(|| self.realm.aux_named_keys(h));
                     for k in named {
-                        vals.push(
-                            self.realm
-                                .get_property(h, &k)
-                                .unwrap_or(NanBox::undefined()),
-                        );
+                        // EnumerableOwnProperties re-runs `[[GetOwnProperty]]` per
+                        // key: an earlier key's getter may have deleted this key or
+                        // made it non-enumerable (then it is skipped), and `[[Get]]`
+                        // must invoke the getter (a raw read would miss it).
+                        if !self.realm.has_own(h, &k) || !self.realm.property_is_enumerable(h, &k) {
+                            continue;
+                        }
+                        vals.push(self.read_member(h, &k)?);
                     }
                     // A class constructor's enumerable static fields are already
                     // mirrored as own enumerable aux properties (covered by `named`).
@@ -1735,15 +1766,13 @@ impl<'a> Interp<'a> {
                 if matches!(arg(0).unpack(), Unpacked::Null | Unpacked::Undefined) {
                     return Err(self.type_error("Object.entries called on null or undefined"));
                 }
-                // A proxy with an `ownKeys` trap drives the entry list (values read
-                // through the proxy so a `get` trap fires).
+                // A proxy: per-key `[[GetOwnProperty]]` (descriptor trap) interleaved
+                // with the enumerable key's `[[Get]]` (get trap), in spec order.
                 if let Some(raw) = arg(0).as_handle()
-                    && let Some(keys) = self.proxy_own_enumerable_keys(Handle::from_raw(raw))?
+                    && let Some(entries) = self.proxy_enumerable_entries(Handle::from_raw(raw))?
                 {
-                    let ph = Handle::from_raw(raw);
-                    let mut pairs = Vec::with_capacity(keys.len());
-                    for k in keys {
-                        let v = self.read_member(ph, &k)?;
+                    let mut pairs = Vec::with_capacity(entries.len());
+                    for (k, v) in entries {
                         let key = self.new_str(&k);
                         pairs.push(NanBox::handle(
                             self.realm.new_array(alloc::vec![key, v]).to_raw(),
@@ -1778,10 +1807,13 @@ impl<'a> Interp<'a> {
                         .object_keys(h)
                         .unwrap_or_else(|| self.realm.aux_named_keys(h));
                     for k in named {
-                        let v = self
-                            .realm
-                            .get_property(h, &k)
-                            .unwrap_or(NanBox::undefined());
+                        // EnumerableOwnProperties re-runs `[[GetOwnProperty]]` per
+                        // key (an earlier getter may have deleted it or turned off
+                        // enumerability) and `[[Get]]` must invoke the getter.
+                        if !self.realm.has_own(h, &k) || !self.realm.property_is_enumerable(h, &k) {
+                            continue;
+                        }
+                        let v = self.read_member(h, &k)?;
                         entries.push((k, v));
                     }
                     // A class constructor's enumerable static fields are already
@@ -2516,7 +2548,15 @@ impl<'a> Interp<'a> {
                             return Err(e);
                         }
                     };
-                    let key = self.coerce_property_key(k)?;
+                    // ToPropertyKey(k) may throw (a poisoned `toString`/
+                    // `@@toPrimitive`); IfAbruptCloseIterator closes the iterator.
+                    let key = match self.coerce_property_key(k) {
+                        Ok(key) => key,
+                        Err(e) => {
+                            let _ = self.iterator_close(it);
+                            return Err(e);
+                        }
+                    };
                     self.realm.set_property(obj, &key, v);
                 }
                 NanBox::handle(obj.to_raw())
@@ -3521,14 +3561,18 @@ impl<'a> Interp<'a> {
                 let s = match this.unpack() {
                     Unpacked::Undefined => String::from("[object Undefined]"),
                     Unpacked::Null => String::from("[object Null]"),
-                    // A primitive number/boolean (an immediate) reports its class
-                    // (ToObject would box it to a Number/Boolean wrapper).
-                    Unpacked::Number(_) => String::from("[object Number]"),
-                    Unpacked::Bool(_) => String::from("[object Boolean]"),
-                    _ => match this.as_handle().map(Handle::from_raw) {
-                        Some(h) => alloc::format!("[object {}]", self.object_string_tag(h)?),
-                        None => String::from("[object Object]"),
-                    },
+                    // Every other `this` is ToObject'd (a primitive number/boolean/
+                    // string/symbol/bigint boxes to its wrapper) and then reports its
+                    // builtinTag — but a string `Symbol.toStringTag` on the (boxed)
+                    // object's prototype chain OVERRIDES it, so e.g. setting
+                    // `Boolean.prototype[@@toStringTag]` changes `toString.call(true)`.
+                    _ => {
+                        let recv = self.coerce_to_object(this);
+                        match recv.as_handle().map(Handle::from_raw) {
+                            Some(h) => alloc::format!("[object {}]", self.object_string_tag(h)?),
+                            None => String::from("[object Object]"),
+                        }
+                    }
                 };
                 self.new_str(&s)
             }
@@ -3537,12 +3581,17 @@ impl<'a> Interp<'a> {
             // call it with the *original* `this` value (so a strict override reading
             // `typeof this` sees the primitive, not the wrapper).
             N_OBJ_PROTO_TOLOCALESTRING => {
+                // `Return ? Invoke(O, "toString")`. Invoke → GetV(O, "toString")
+                // boxes a primitive for the method lookup but a null/undefined
+                // receiver throws a TypeError; the resolved `toString` is then
+                // called with the *original* this value.
                 let this = self.this_val;
-                let recv = if this.as_handle().is_some() {
-                    this
-                } else {
-                    self.coerce_to_object(this)
-                };
+                if matches!(this.unpack(), Unpacked::Null | Unpacked::Undefined) {
+                    return Err(self.type_error(
+                        "Object.prototype.toLocaleString called on null or undefined",
+                    ));
+                }
+                let recv = self.coerce_to_object(this);
                 let Some(h) = recv.as_handle().map(Handle::from_raw) else {
                     return Err(self.type_error(
                         "Object.prototype.toLocaleString called on null or undefined",
@@ -3551,7 +3600,15 @@ impl<'a> Interp<'a> {
                 let m = self.read_member(h, "toString")?;
                 self.call_with_this(m, this, args)?
             }
-            N_OBJ_PROTO_VALUEOF => self.this_val,
+            // `Object.prototype.valueOf` → `Return ? ToObject(this value)`: a
+            // null/undefined receiver throws a TypeError, and a primitive is boxed
+            // (so `valueOf.call(true)` is a Boolean *object*, `typeof` `"object"`).
+            N_OBJ_PROTO_VALUEOF => {
+                let this = self.this_val;
+                let h =
+                    self.require_object_coercible_to_object(this, "Object.prototype.valueOf")?;
+                NanBox::handle(h.to_raw())
+            }
             // `Error.prototype.toString` — the receiver must be an Object (a
             // string/symbol/bigint primitive or null/undefined is a TypeError);
             // reads `name`/`message` (each ToString'd, defaulting to `"Error"`/`""`)
@@ -3587,9 +3644,11 @@ impl<'a> Interp<'a> {
                 self.new_str(&s)
             }
             N_OBJ_PROTO_HASOWN => {
-                // ToPropertyKey(V) then ToObject(this) — the latter throws for a
-                // null/undefined receiver and boxes a primitive.
-                let key = self.member_key(arg(0));
+                // ToPropertyKey(V) then ToObject(this) — the key coercion runs
+                // *first* (a throwing `toString`/`@@toPrimitive` propagates before
+                // the receiver's ToObject), then ToObject throws for a null/undefined
+                // receiver and boxes a primitive.
+                let key = self.coerce_property_key(arg(0))?;
                 let this = self.this_val;
                 let h = self.require_object_coercible_to_object(this, "hasOwnProperty")?;
                 // A proxy has no ordinary own-property table: `[[GetOwnProperty]]`
@@ -3606,7 +3665,8 @@ impl<'a> Interp<'a> {
                 }
             }
             N_OBJ_PROTO_PROPISENUM => {
-                let key = self.member_key(arg(0));
+                // ToPropertyKey(V) runs before ToObject(this) (spec step order).
+                let key = self.coerce_property_key(arg(0))?;
                 let this = self.this_val;
                 let h = self.require_object_coercible_to_object(this, "propertyIsEnumerable")?;
                 // A module namespace's `[[GetOwnProperty]]` of a TDZ export throws.

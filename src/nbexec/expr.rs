@@ -1773,7 +1773,11 @@ impl<'a> Interp<'a> {
         if self.realm.typed_kind(handle).is_some() {
             return Some(self.realm.get_element(handle, i));
         }
-        if i < self.realm.array_length(handle).unwrap_or(0) {
+        // Only an index within the *dense* backing can be a present element; an
+        // index in `[dense_len, length)` is a hole or a sparse aux-stored element,
+        // so fall through (`None`) to the named `[[Get]]` (which consults the aux
+        // property table, then the prototype chain).
+        if i < self.realm.array_dense_len(handle).unwrap_or(0) {
             let v = self.realm.get_element(handle, i);
             if !v.is_hole() {
                 return Some(v);
@@ -2450,7 +2454,7 @@ impl<'a> Interp<'a> {
             && let Ok(i) = name.parse::<usize>()
             && alloc::format!("{i}") == name
             && (i as u64) < u64::from(u32::MAX)
-            && i < self.realm.array_length(handle).unwrap_or(0)
+            && i < self.realm.array_dense_len(handle).unwrap_or(0)
         {
             let v = self.realm.get_element(handle, i);
             // A genuine hole (absent index) is not an own property: the lookup

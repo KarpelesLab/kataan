@@ -2185,6 +2185,8 @@ fn builtin_native_arity(id: u16) -> u32 {
         // `Object.groupBy(items, callbackfn)`; `Object.assign(target, ...sources)`.
         | N_OBJECT_GROUP_BY
         | N_OBJECT_ASSIGN
+        // `Object.create(O, Properties)` — two declared parameters.
+        | N_OBJECT_CREATE
         // `RegExp(pattern, flags)` — two declared parameters.
         | N_REGEXP => 2,
         // Length 3.

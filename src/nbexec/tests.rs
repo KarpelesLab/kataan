@@ -8540,3 +8540,116 @@ fn tagged_template_raw_is_non_enumerable() {
         "true"
     );
 }
+
+#[test]
+fn object_proto_valueof_boxes_primitive_this() {
+    // `Object.prototype.valueOf` is `ToObject(this)`: a primitive is boxed to a
+    // wrapper object (typeof "object"), and null/undefined throw a TypeError.
+    assert_eq!(run("typeof Object.prototype.valueOf.call(true)"), "object");
+    assert_eq!(run("typeof Object.prototype.valueOf.call(5)"), "object");
+    assert_eq!(
+        run(
+            "try { Object.prototype.valueOf.call(undefined); 'no' } catch (e) { e instanceof TypeError }"
+        ),
+        "true"
+    );
+}
+
+#[test]
+fn object_prototype_tostring_honors_symbol_tostringtag_on_primitive() {
+    // A string `Symbol.toStringTag` on the boxed primitive's prototype overrides
+    // the builtin tag (`toString.call(true)` becomes "[object test262]").
+    assert_eq!(
+        run(r#"Boolean.prototype[Symbol.toStringTag] = 'test262';
+               Object.prototype.toString.call(true)"#),
+        "[object test262]"
+    );
+}
+
+#[test]
+fn object_values_entries_snapshot_and_run_getters() {
+    // EnumerableOwnProperties snapshots the key list once, then per key re-checks
+    // existence/enumerability and reads via `[[Get]]` (invoking a getter). A key
+    // the getter adds is excluded; a deleted future key drops out.
+    assert_eq!(
+        run("var o={a:'A', get b(){ this.c='C'; return 'B'; }};\
+             var v=Object.values(o); v.length===2 && v[1]==='B'"),
+        "true"
+    );
+    assert_eq!(
+        run(
+            "var o={a:'A', get b(){ delete this.c; return 'B'; }, c:'C'};\
+             Object.values(o).length===2"
+        ),
+        "true"
+    );
+}
+
+#[test]
+fn object_create_length_is_two() {
+    assert_eq!(run("Object.create.length"), "2");
+}
+
+#[test]
+fn define_property_large_array_index_is_stored() {
+    // A canonical array index beyond the dense cap is stored sparsely and grows
+    // `length`; 2**32-1 is not an index (an ordinary named property).
+    assert_eq!(
+        run(
+            "var a=[]; Object.defineProperty(a,4294967294,{value:100,configurable:true});\
+             a.hasOwnProperty('4294967294') && a[4294967294]===100 && a.length===4294967295"
+        ),
+        "true"
+    );
+    assert_eq!(
+        run(
+            "var a=[]; Object.defineProperty(a,4294967295,{value:1,configurable:true});\
+             a.hasOwnProperty('4294967295') && a.length===0"
+        ),
+        "true"
+    );
+}
+
+#[test]
+fn is_frozen_computes_test_integrity_level() {
+    // A non-extensible object with no own properties is frozen; one with only
+    // non-configurable non-writable data + non-configurable accessors is frozen.
+    assert_eq!(
+        run("var o={}; Object.preventExtensions(o); Object.isFrozen(o)"),
+        "true"
+    );
+    assert_eq!(
+        run(
+            "var o={}; Object.defineProperty(o,'x',{value:1,writable:false,configurable:false});\
+             Object.defineProperty(o,'y',{get(){return 1;},configurable:false});\
+             Object.preventExtensions(o); Object.isFrozen(o)"
+        ),
+        "true"
+    );
+    // Merely sealed (data still writable) is not frozen.
+    assert_eq!(
+        run("var o={x:1}; Object.seal(o); Object.isFrozen(o)"),
+        "false"
+    );
+}
+
+#[test]
+fn object_subclass_ignores_value_argument() {
+    // `new (class extends Object {})(value)` yields a fresh object with the
+    // subclass prototype, ignoring the value argument (spec step 1).
+    assert_eq!(
+        run("class O extends Object {}; var o=new O({a:1});\
+             o.a===undefined && Object.getPrototypeOf(o)===O.prototype"),
+        "true"
+    );
+}
+
+#[test]
+fn getownpropertynames_orders_string_index_before_length() {
+    // A String exotic object's extra index key sorts ascending before `length`.
+    assert_eq!(
+        run("var s=new String('abc'); s[5]='de';\
+             Object.getOwnPropertyNames(s).join(',')"),
+        "0,1,2,5,length"
+    );
+}
