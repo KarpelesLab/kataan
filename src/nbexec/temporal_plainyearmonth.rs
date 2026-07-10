@@ -13,8 +13,8 @@ use super::*;
 use crate::common::FloatExt;
 use crate::temporal_iso::{
     self, IsoDate, MAX_EPOCH_DAYS, MIN_EPOCH_DAYS, Overflow, RoundMode, TemporalData, TemporalKind,
-    format_iso_year, is_leap_year, iso_date_in_range, iso_days_in_month, iso_days_in_year, pad,
-    regulate_iso_date, round_to_increment,
+    Unit, format_iso_year, is_leap_year, iso_date_in_range, iso_days_in_month, iso_days_in_year,
+    pad, regulate_iso_date, round_to_increment,
 };
 
 /// Prototype method names installed on `Temporal.PlainYearMonth.prototype`.
@@ -241,11 +241,13 @@ fn has_overlong_fraction(main: &str) -> bool {
     false
 }
 
-/// Parses a Temporal PlainYearMonth string into `(year, month, calendar)`, where
-/// `calendar` is the raw first `[u-ca=…]` annotation value (or `None` for the
-/// ISO default). `None` if malformed (does not range-check limits, nor validate
-/// that the calendar id is supported — the caller does).
-fn parse_temporal_year_month(s: &str) -> Option<(i32, u8, Option<alloc::string::String>)> {
+/// Parses a Temporal PlainYearMonth string into `(year, month, day, calendar)`,
+/// where `day` is the ISO reference day carried by a full date string (or `1`
+/// for a bare `YYYY-MM` form) and `calendar` is the raw first `[u-ca=…]`
+/// annotation value (or `None` for the ISO default). `None` if malformed (does
+/// not range-check limits, nor validate that the calendar id is supported — the
+/// caller does).
+fn parse_temporal_year_month(s: &str) -> Option<(i32, u8, u8, Option<alloc::string::String>)> {
     // A non-ASCII minus sign (U+2212) is not accepted anywhere.
     if s.contains('\u{2212}') {
         return None;
@@ -267,7 +269,7 @@ fn parse_temporal_year_month(s: &str) -> Option<(i32, u8, Option<alloc::string::
         if p.z || (p.offset_ns.is_some() && p.time.is_none()) {
             return None;
         }
-        return Some((d.year, d.month, cal));
+        return Some((d.year, d.month, d.day, cal));
     }
     // A bare year-month form (`DateSpecYearMonth`, no day) admits only the ISO
     // calendar: a non-ISO calendar annotation requires the reference day, so it
@@ -276,7 +278,7 @@ fn parse_temporal_year_month(s: &str) -> Option<(i32, u8, Option<alloc::string::
     if matches!(&cal, Some(c) if c != "iso8601") {
         return None;
     }
-    Some((y, m, cal))
+    Some((y, m, 1, cal))
 }
 
 /// Parses a rounding-mode string into a [`RoundMode`].
@@ -393,7 +395,7 @@ impl<'a> Interp<'a> {
             return Ok(alloc::string::String::from(c));
         }
         // Otherwise it must be a valid ISO string carrying a calendar annotation.
-        if let Some((_, _, cal)) = parse_temporal_year_month(&s) {
+        if let Some((_, _, _, cal)) = parse_temporal_year_month(&s) {
             return match cal {
                 Some(c) => self.pym_canonicalize_calendar(&c),
                 None => Ok(alloc::string::String::from("iso8601")),
@@ -730,7 +732,7 @@ impl<'a> Interp<'a> {
         let Some(s) = self.as_string_value(v) else {
             return Err(self.type_error("PlainYearMonth: expected an object or string"));
         };
-        let Some((year, month, cal_ann)) = parse_temporal_year_month(&s) else {
+        let Some((year, month, day, cal_ann)) = parse_temporal_year_month(&s) else {
             return Err(self.pym_range("PlainYearMonth: invalid string"));
         };
         if !ym_within_limits(i64::from(year), i64::from(month)) {
@@ -744,6 +746,7 @@ impl<'a> Interp<'a> {
         let opts = self.pym_options(options)?;
         self.pym_overflow(opts)?;
         if tcal::is_iso(&calendar) {
+            // The ISO reference day is always 1, regardless of any parsed day.
             return Ok((
                 IsoDate {
                     year,
@@ -753,16 +756,10 @@ impl<'a> Interp<'a> {
                 calendar,
             ));
         }
-        // Re-anchor the parsed ISO reference (day 1) to the calendar's canonical
-        // reference day for that calendar month.
-        let f = tcal::iso_to_fields(
-            &calendar,
-            IsoDate {
-                year,
-                month,
-                day: 1,
-            },
-        );
+        // Derive the calendar year+month from the *actual* parsed reference date
+        // (its day matters: it selects the calendar month), then re-anchor to that
+        // calendar month's canonical reference day.
+        let f = tcal::iso_to_fields(&calendar, IsoDate { year, month, day });
         let input = tcal::FieldsInput {
             year: Some(f.year),
             month_code: Some(f.month_code),
@@ -1016,8 +1013,8 @@ impl<'a> Interp<'a> {
     ) -> Result<NanBox, ExecError> {
         let mut dur = self.read_duration(arg)?;
         let opts = self.pym_options(options)?;
-        // overflow is validated but has no effect for the ISO calendar.
-        self.pym_overflow(opts)?;
+        // overflow is validated for every call; it only affects the non-ISO path.
+        let overflow = self.pym_overflow(opts)?;
         if subtract {
             dur = crate::temporal_iso::DurationFields {
                 years: -dur.years,
@@ -1032,35 +1029,117 @@ impl<'a> Interp<'a> {
                 nanoseconds: -dur.nanoseconds,
             };
         }
-        // A PlainYearMonth cannot represent any unit smaller than a month.
-        if dur.weeks != 0
-            || dur.days != 0
-            || dur.hours != 0
-            || dur.minutes != 0
-            || dur.seconds != 0
-            || dur.milliseconds != 0
-            || dur.microseconds != 0
-            || dur.nanoseconds != 0
-        {
-            return Err(self.pym_range("PlainYearMonth: cannot add units smaller than months"));
+        let cal = data.calendar.as_str();
+        if tcal::is_iso(cal) {
+            // ISO fast path — byte-for-byte the original computation.
+            // A PlainYearMonth cannot represent any unit smaller than a month.
+            if dur.weeks != 0
+                || dur.days != 0
+                || dur.hours != 0
+                || dur.minutes != 0
+                || dur.seconds != 0
+                || dur.milliseconds != 0
+                || dur.microseconds != 0
+                || dur.nanoseconds != 0
+            {
+                return Err(self.pym_range("PlainYearMonth: cannot add units smaller than months"));
+            }
+            // Only years and months affect a year-month; add them directly (dropping
+            // the reference day). Working in i64 avoids the i32 wrap that
+            // `add_iso_date` suffers for out-of-range durations.
+            let m0 = (i64::from(data.date.month) - 1) + dur.months;
+            let result_year = i64::from(data.date.year) + dur.years + m0.div_euclid(12);
+            let result_month = m0.rem_euclid(12) + 1;
+            if !ym_within_limits(result_year, result_month) {
+                return Err(self.pym_range("PlainYearMonth: result out of range"));
+            }
+            return Ok(self.new_year_month(
+                IsoDate {
+                    year: result_year as i32,
+                    month: result_month as u8,
+                    day: 1,
+                },
+                cal,
+            ));
         }
-        // Only years and months affect a year-month; add them directly (dropping
-        // the reference day). Working in i64 avoids the i32 wrap that
-        // `add_iso_date` suffers for out-of-range durations.
-        let m0 = (i64::from(data.date.month) - 1) + dur.months;
-        let result_year = i64::from(data.date.year) + dur.years + m0.div_euclid(12);
-        let result_month = m0.rem_euclid(12) + 1;
-        if !ym_within_limits(result_year, result_month) {
-            return Err(self.pym_range("PlainYearMonth: result out of range"));
+        // Non-ISO calendar (`AddDurationToYearMonth`): re-anchor to the reference
+        // day of the calendar month, add years/months (calendar-aware) plus any
+        // weeks/days carry, then re-derive the resulting year-month.
+        let cal = data.calendar.clone();
+        // `ToDateDurationRecordWithoutTime`: fold the time part into whole days.
+        let extra_days = (dur.time_nanos() / temporal_iso::NS_PER_DAY) as i64;
+        let days = dur.days + extra_days;
+        // The overall sign of the (date) duration selects the anchor day: day 1
+        // for a non-negative duration, else the last day of the calendar month.
+        let sign = if dur.years != 0 {
+            dur.years.signum()
+        } else if dur.months != 0 {
+            dur.months.signum()
+        } else if dur.weeks != 0 {
+            dur.weeks.signum()
+        } else {
+            days.signum()
+        };
+        let f = tcal::iso_to_fields(&cal, data.date);
+        let anchor_day = if sign < 0 {
+            // Last day of the calendar month: constrain a huge day request.
+            let first = self.resolve_year_month_cal_day(&cal, &f, 1, Overflow::Constrain)?;
+            tcal::days_in_month(&cal, first)
+        } else {
+            1
+        };
+        let intermediate =
+            self.resolve_year_month_cal_day(&cal, &f, anchor_day, Overflow::Constrain)?;
+        // The anchor day is synthetic (reference day 1 or the month's last day),
+        // so the year/month step always *constrains* it — `overflow` (reject)
+        // only governs the final year-month resolution, whose day-1 reference is
+        // always valid.
+        let added = match tcal::calendar_date_add(
+            &cal,
+            intermediate,
+            dur.years,
+            dur.months,
+            dur.weeks,
+            days,
+            Overflow::Constrain,
+        ) {
+            Ok(d) => d,
+            Err(tcal::CalError::Range(m)) => return Err(self.pym_range(&m)),
+            Err(tcal::CalError::MissingFields(m)) => return Err(self.type_error(&m)),
+        };
+        // Take the resulting year-month, re-anchored to the reference day 1.
+        let rf = tcal::iso_to_fields(&cal, added);
+        let input = tcal::FieldsInput {
+            year: Some(rf.year),
+            month_code: Some(rf.month_code),
+            day: 1,
+            ..Default::default()
+        };
+        let result = self.resolve_year_month_cal(&cal, input, overflow)?;
+        Ok(self.new_year_month(result, &cal))
+    }
+
+    /// Resolves a non-ISO calendar's `(year, monthCode)` fields with a specific
+    /// day to an `IsoDate` (used to anchor add/subtract on the reference day or
+    /// the month's last day), mapping the layer error to the right exception.
+    fn resolve_year_month_cal_day(
+        &mut self,
+        cal: &str,
+        f: &tcal::CalFields,
+        day: i64,
+        overflow: Overflow,
+    ) -> Result<IsoDate, ExecError> {
+        let input = tcal::FieldsInput {
+            year: Some(f.year),
+            month_code: Some(f.month_code.clone()),
+            day,
+            ..Default::default()
+        };
+        match tcal::fields_to_iso(cal, &input, overflow) {
+            Ok(d) => Ok(d),
+            Err(tcal::CalError::Range(m)) => Err(self.pym_range(&m)),
+            Err(tcal::CalError::MissingFields(m)) => Err(self.type_error(&m)),
         }
-        Ok(self.new_year_month(
-            IsoDate {
-                year: result_year as i32,
-                month: result_month as u8,
-                day: 1,
-            },
-            &data.calendar,
-        ))
     }
 
     fn pym_diff(
@@ -1155,22 +1234,56 @@ impl<'a> Interp<'a> {
             return Err(self.pym_range("PlainYearMonth: date out of representable range"));
         }
 
-        // Both operands are the first day of a month, so the difference is an
-        // exact whole number of months (this → other). Computing it directly
-        // avoids `difference_iso_date`, which can loop for dates whose
-        // whole-year intermediate falls outside the representable range.
-        let total_months = (i64::from(other.year) - i64::from(data.date.year)) * 12
-            + (i64::from(other.month) - i64::from(data.date.month));
-        let (years, months) = if largest_year {
-            (total_months / 12, total_months % 12)
+        let cal = data.calendar.clone();
+        let (years, months, cal_ref) = if tcal::is_iso(&cal) {
+            // Both operands are the first day of a month, so the difference is an
+            // exact whole number of months (this → other). Computing it directly
+            // avoids `difference_iso_date`, which can loop for dates whose
+            // whole-year intermediate falls outside the representable range.
+            let total_months = (i64::from(other.year) - i64::from(data.date.year)) * 12
+                + (i64::from(other.month) - i64::from(data.date.month));
+            let (y, m) = if largest_year {
+                (total_months / 12, total_months % 12)
+            } else {
+                (0, total_months)
+            };
+            (y, m, this_ref)
         } else {
-            (0, total_months)
+            // Non-ISO (`CalendarDateUntil`): measure the difference in the
+            // calendar's own year/month terms. Re-anchor both operands to their
+            // calendar month's reference day first — a raw-constructor operand
+            // may carry any reference day, and forcing ISO day 1 would corrupt it.
+            let f_this = tcal::iso_to_fields(&cal, data.date);
+            let this_anchor =
+                self.resolve_year_month_cal_day(&cal, &f_this, 1, Overflow::Constrain)?;
+            let f_other = tcal::iso_to_fields(&cal, other);
+            let other_anchor =
+                self.resolve_year_month_cal_day(&cal, &f_other, 1, Overflow::Constrain)?;
+            let lu = if largest_year {
+                Unit::Year
+            } else {
+                Unit::Month
+            };
+            let parts = tcal::calendar_date_until(&cal, this_anchor, other_anchor, lu);
+            (parts.years, parts.months, this_anchor)
         };
 
         let mode = parse_round_mode(&mode_s);
         let mode = if since { negate_round_mode(mode) } else { mode };
-        let (mut ry, mut rm) =
-            round_year_month(years, months, smallest_year, largest_year, increment, mode);
+        let (mut ry, mut rm) = if tcal::is_iso(&cal) {
+            round_year_month(years, months, smallest_year, largest_year, increment, mode)
+        } else {
+            round_year_month_cal(
+                &cal,
+                cal_ref,
+                years,
+                months,
+                smallest_year,
+                largest_year,
+                increment,
+                mode,
+            )
+        };
         if since {
             ry = -ry;
             rm = -rm;
@@ -1386,5 +1499,41 @@ fn round_year_month(
         // largestUnit month, smallestUnit month: round the total months.
         let total = i128::from(years) * 12 + i128::from(months);
         (0, round_to_increment(total, increment, mode) as i64)
+    }
+}
+
+/// Calendar-aware analogue of [`round_year_month`] for a non-ISO calendar. The
+/// `(years, months)` inputs already come from `CalendarDateUntil`, so they are
+/// separated in the calendar's own terms — the year⇄month boundary uses the
+/// calendar's (variable) `monthsInYear` at the reference date rather than a
+/// hardcoded 12, and no spurious re-carry is applied to the month remainder.
+#[allow(clippy::too_many_arguments)]
+fn round_year_month_cal(
+    cal: &str,
+    reference: IsoDate,
+    years: i64,
+    months: i64,
+    smallest_year: bool,
+    largest_year: bool,
+    increment: i128,
+    mode: RoundMode,
+) -> (i64, i64) {
+    if smallest_year {
+        // Round (years + months/monthsInYear) to `increment` years.
+        let miy = i128::from(tcal::months_in_year(cal, reference).max(1));
+        let units = i128::from(years) * miy + i128::from(months);
+        let rounded = round_to_increment(units, increment * miy, mode);
+        ((rounded / miy) as i64, 0)
+    } else if largest_year {
+        // `months` is already the calendar-month remainder (< monthsInYear);
+        // round it to the increment, keeping the whole-year component.
+        let rm = round_to_increment(i128::from(months), increment, mode) as i64;
+        (years, rm)
+    } else {
+        // largestUnit month: `months` already holds the folded total.
+        (
+            0,
+            round_to_increment(i128::from(months), increment, mode) as i64,
+        )
     }
 }

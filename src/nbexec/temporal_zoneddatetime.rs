@@ -399,8 +399,11 @@ fn balance_datetime(total_ns: i128, largest: Unit) -> DurationFields {
     dur
 }
 
-/// `DifferenceISODateTime(from, to, largestUnit)` (no rounding) in wall time.
+/// `DifferenceISODateTime(from, to, largestUnit)` (no rounding) in wall time. The
+/// date portion is computed in `cal`'s own calendar (ISO takes the shared
+/// `DifferenceISODate` fast path).
 fn datetime_diff(
+    cal: &str,
     from: (IsoDate, IsoTime),
     to: (IsoDate, IsoTime),
     largest: Unit,
@@ -422,7 +425,12 @@ fn datetime_diff(
         adjusted_to = epoch_days_to_iso(iso_to_epoch_days(to.0) + time_sign as i64);
         time_ns -= time_sign * iso::NS_PER_DAY;
     }
-    let (y, mo, w, d) = iso::difference_iso_date(from.0, adjusted_to, largest);
+    let (y, mo, w, d) = if tcal::is_iso(cal) {
+        iso::difference_iso_date(from.0, adjusted_to, largest)
+    } else {
+        let p = tcal::calendar_date_until(cal, from.0, adjusted_to, largest);
+        (p.years, p.months, p.weeks, p.days)
+    };
     let mut dur = iso::balance_time_duration(time_ns, Unit::Hour);
     dur.years = y;
     dur.months = mo;
@@ -1690,9 +1698,28 @@ impl<'a> Interp<'a> {
             data.epoch_ns + dur.time_nanos()
         } else {
             let (d, t) = local_of(&tz, data.epoch_ns);
-            let new_date =
+            // AddZonedDateTime: add the date parts to the wall-clock date *in the
+            // calendar*. ISO takes the shared fast path (byte-for-byte); every other
+            // calendar routes through CalendarDateAdd (variable month lengths / leap
+            // months honoured).
+            let new_date = if tcal::is_iso(&data.calendar) {
                 iso::add_iso_date(d, dur.years, dur.months, dur.weeks, dur.days, overflow)
-                    .ok_or_else(|| self.zdt_range("result out of range"))?;
+                    .ok_or_else(|| self.zdt_range("result out of range"))?
+            } else {
+                match tcal::calendar_date_add(
+                    &data.calendar,
+                    d,
+                    dur.years,
+                    dur.months,
+                    dur.weeks,
+                    dur.days,
+                    overflow,
+                ) {
+                    Ok(r) => r,
+                    Err(tcal::CalError::Range(m)) => return Err(self.zdt_range(&m)),
+                    Err(tcal::CalError::MissingFields(m)) => return Err(self.type_error(&m)),
+                }
+            };
             let wall = iso_to_epoch_days(new_date) as i128 * iso::NS_PER_DAY + time_to_nanos(t);
             let intermediate = wall_to_epoch(&tz, wall);
             intermediate + dur.time_nanos()
@@ -1779,7 +1806,15 @@ impl<'a> Interp<'a> {
         options: NanBox,
         negate: bool,
     ) -> Result<NanBox, ExecError> {
-        let (other_epoch, _other_tz, _other_cal) = self.resolve_zdt(other)?;
+        let (other_epoch, _other_tz, other_cal) = self.resolve_zdt(other)?;
+        let cal = data.calendar.clone();
+        // DifferenceTemporalZonedDateTime enforces CalendarEquals before reading the
+        // options bag. The ISO fast path keeps its original calendar-agnostic
+        // behaviour; a non-ISO receiver requires both operands to share a calendar.
+        if !tcal::is_iso(&cal) && other_cal != cal {
+            return Err(self
+                .zdt_range("cannot compute the difference between dates of different calendars"));
+        }
         let tz = self.zdt_tz(data);
         let opts = self.zdt_options(options)?;
         let units = [
@@ -1845,12 +1880,20 @@ impl<'a> Interp<'a> {
         {
             // Calendar-unit rounding relative to the receiver (NudgeToCalendarUnit),
             // expressed in a single unit (largestUnit == smallestUnit).
-            self.zdt_round_calendar(&tz, data.epoch_ns, other_epoch, smallest, increment, mode)
+            self.zdt_round_calendar(
+                &cal,
+                &tz,
+                data.epoch_ns,
+                other_epoch,
+                smallest,
+                increment,
+                mode,
+            )
         } else {
             // Calendar difference in the time zone's wall time (unrounded).
             let from = local_of(&tz, data.epoch_ns);
             let to = local_of(&tz, other_epoch);
-            datetime_diff(from, to, largest)
+            datetime_diff(&cal, from, to, largest)
         };
         if negate {
             dur = negate_duration(dur);
@@ -1867,8 +1910,10 @@ impl<'a> Interp<'a> {
     /// `start_epoch` to `end_epoch` in `unit`s, rounded to `increment` under `mode`,
     /// with the fraction measured against the instant span of one `unit` step in the
     /// zone (so it is DST-aware).
+    #[allow(clippy::too_many_arguments)]
     fn zdt_round_calendar(
         &self,
+        cal: &str,
         tz: &str,
         start_epoch: i128,
         end_epoch: i128,
@@ -1883,8 +1928,14 @@ impl<'a> Interp<'a> {
         }
         let (sd, st) = local_of(tz, start_epoch);
         let ed = local_of(tz, end_epoch).0;
-        // Whole-unit initial guess from the date difference.
-        let (dy, dm, dw, dd) = iso::difference_iso_date(sd, ed, unit);
+        // Whole-unit initial guess from the date difference (calendar-aware for a
+        // non-ISO calendar, so month lengths / leap months are honoured).
+        let (dy, dm, dw, dd) = if tcal::is_iso(cal) {
+            iso::difference_iso_date(sd, ed, unit)
+        } else {
+            let p = tcal::calendar_date_until(cal, sd, ed, unit);
+            (p.years, p.months, p.weeks, p.days)
+        };
         let mut r1 = match unit {
             Unit::Year => dy,
             Unit::Month => dm,
@@ -1898,7 +1949,11 @@ impl<'a> Interp<'a> {
                 Unit::Week => (0, 0, count, 0),
                 _ => (0, 0, 0, count),
             };
-            let nd = iso::add_iso_date(sd, y, m, w, d, Overflow::Constrain).unwrap_or(sd);
+            let nd = if tcal::is_iso(cal) {
+                iso::add_iso_date(sd, y, m, w, d, Overflow::Constrain).unwrap_or(sd)
+            } else {
+                tcal::calendar_date_add(cal, sd, y, m, w, d, Overflow::Constrain).unwrap_or(sd)
+            };
             let wall = iso_to_epoch_days(nd) as i128 * iso::NS_PER_DAY + time_to_nanos(st);
             wall_to_epoch(tz, wall)
         };
