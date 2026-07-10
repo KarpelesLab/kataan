@@ -193,7 +193,14 @@ impl<'a> Interp<'a> {
                 let s = self.realm.to_display_string(v);
                 return Ok(self.new_str(&s));
             }
-            if self.realm.object_keys(h).is_some() {
+            // A plain object, or a primitive-wrapper (`Object(Symbol())`,
+            // `Object(1n)`, `new Number(1)`, …). Keyless wrappers (Symbol/BigInt
+            // boxes) have no `object_keys` but must still run ToPrimitive so their
+            // boxed primitive surfaces (a bare return-as-is would leave the wrapper
+            // object, coercing to `NaN` and skipping the Symbol/BigInt TypeError).
+            if self.realm.object_keys(h).is_some()
+                || self.realm.get_property(h, PRIM_WRAP).is_some()
+            {
                 return self.coerce_primitive(v, hint);
             }
         }

@@ -8726,3 +8726,77 @@ fn getownpropertynames_orders_string_index_before_length() {
         "0,1,2,5,length"
     );
 }
+
+#[test]
+fn unary_numeric_on_symbol_and_bigint_wrappers() {
+    // ToNumber of a boxed Symbol/BigInt throws under `+` (and `<`/etc.).
+    assert_eq!(
+        run("try{ +Object(Symbol()); 'no' }catch(e){ e instanceof TypeError }"),
+        "true"
+    );
+    assert_eq!(
+        run("try{ +Object(3n); 'no' }catch(e){ e instanceof TypeError }"),
+        "true"
+    );
+    // `-`/`~` on a boxed BigInt stay BigInt (ToNumeric), don't throw.
+    assert_eq!(run("(-Object(3n)).toString()"), "-3");
+    assert_eq!(run("(~Object(3n)).toString()"), "-4");
+    // Number/string/boolean wrappers and dates are unaffected.
+    assert_eq!(run("+Object(5)"), "5");
+    assert_eq!(run("+new Date(1000)"), "1000");
+}
+
+#[test]
+fn json_stringify_symbol_escape_and_empty_replacer() {
+    // Symbols are ignored as values and keys.
+    assert_eq!(run("JSON.stringify(Symbol())"), "undefined");
+    assert_eq!(run("JSON.stringify([Symbol()])"), "[null]");
+    assert_eq!(run("JSON.stringify({key: Symbol()})"), "{}");
+    // 0x08/0x0C escape to \\b / \\f.
+    assert_eq!(run(r#"JSON.stringify("\b\f")"#), r#""\b\f""#);
+    // An empty PropertyList replacer yields {} for objects, and propagates into
+    // nested objects within arrays.
+    assert_eq!(run("JSON.stringify({a:1,b:2}, [])"), "{}");
+    assert_eq!(run("JSON.stringify([1, {a: 2}], [])"), "[1,{}]");
+}
+
+#[test]
+fn json_parse_reviver_source_context() {
+    // A primitive leaf's context.source is its exact JSON text.
+    assert_eq!(
+        run("var s; JSON.parse('1.5e2', function(k,v,c){ s=c.source; return v; }); s"),
+        "1.5e2"
+    );
+    // Objects/arrays get a bare context (no source).
+    assert_eq!(
+        run(
+            "var s='x'; JSON.parse('[1]', function(k,v,c){ if(Array.isArray(v)) s=c.source; return v; }); String(s)"
+        ),
+        "undefined"
+    );
+    // A forward-substituted value loses its source (SameValue check).
+    assert_eq!(
+        run(
+            "var s='x'; JSON.parse('[1,2]', function(k,v,c){ if(k==='0'){this[1]=42;} if(k==='1'){s=c.source;} return this[k]===undefined?v:this[k]; }); String(s)"
+        ),
+        "undefined"
+    );
+}
+
+#[test]
+fn set_composition_lazy_keys_short_circuit() {
+    // isSupersetOf / isDisjointFrom over a set-like stop iterating the argument's
+    // keys as soon as the answer is known (and still return correctly).
+    assert_eq!(
+        run("new Set([1,2,3]).isSupersetOf(new Set([1,9]))"),
+        "false"
+    );
+    assert_eq!(
+        run("new Set([1,2]).isDisjointFrom(new Set([2,3,4]))"),
+        "false"
+    );
+    assert_eq!(
+        run("new Set([1,2]).isDisjointFrom(new Set([3,4,5]))"),
+        "true"
+    );
+}

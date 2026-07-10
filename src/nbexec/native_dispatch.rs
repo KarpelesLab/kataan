@@ -701,20 +701,27 @@ impl<'a> Interp<'a> {
                 let text = self.coerce_to_string(arg(0))?;
                 let chars: Vec<char> = text.chars().collect();
                 let mut pos = 0;
+                // An optional `reviver` transforms each value bottom-up. When one is
+                // present, parse with source spans so the reviver's `context.source`
+                // (the json-parse-with-source proposal) can surface original text.
+                let reviver = arg(1);
+                let has_reviver = reviver
+                    .as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)));
+                if has_reviver {
+                    let (value, src) = self.json_parse_src(&chars, &mut pos, 0)?;
+                    skip_ws(&chars, &mut pos);
+                    if pos != chars.len() {
+                        return Err(self.json_error("Unexpected token in JSON"));
+                    }
+                    let holder = self.realm.new_object();
+                    self.realm.set_property(holder, "", value);
+                    return self.json_revive_ctx(holder, "", reviver, Some(&src));
+                }
                 let value = self.json_parse(&chars, &mut pos, 0)?;
                 skip_ws(&chars, &mut pos);
                 if pos != chars.len() {
                     return Err(self.json_error("Unexpected token in JSON"));
-                }
-                // An optional `reviver` transforms each value bottom-up.
-                let reviver = arg(1);
-                if reviver
-                    .as_handle()
-                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-                {
-                    let holder = self.realm.new_object();
-                    self.realm.set_property(holder, "", value);
-                    return self.json_revive(holder, "", reviver);
                 }
                 value
             }

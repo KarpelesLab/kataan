@@ -5783,12 +5783,22 @@ impl<'a> Interp<'a> {
     /// Drives the set-like record's `keys()` iterator to completion, returning
     /// every yielded value (used by the composition methods that must iterate the
     /// argument rather than probe it with `has`). `-0` is canonicalized to `+0`.
-    fn set_record_keys(&mut self, obj: Handle, keys: NanBox) -> Result<Vec<NanBox>, ExecError> {
+    /// Opens the set-like record's `keys()` iterator, returning `(iterator, next)`
+    /// so a caller can drive it **lazily** one step at a time (via
+    /// [`Self::iter_step`]) and short-circuit + [`Self::iterator_close`] — required
+    /// by the composition methods that may finish before draining the argument
+    /// (`isSupersetOf`, `isDisjointFrom`).
+    fn open_set_keys(&mut self, obj: Handle, keys: NanBox) -> Result<(Handle, NanBox), ExecError> {
         let iter = self.call_with_this(keys, NanBox::handle(obj.to_raw()), &[])?;
         let Some(ih) = iter.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("set-like 'keys' did not return an iterator"));
         };
         let next = self.read_member(ih, "next")?;
+        Ok((ih, next))
+    }
+
+    fn set_record_keys(&mut self, obj: Handle, keys: NanBox) -> Result<Vec<NanBox>, ExecError> {
+        let (ih, next) = self.open_set_keys(obj, keys)?;
         let mut out = Vec::new();
         while let Some(v) = self.iter_step(ih, next)? {
             // CanonicalizeKeyedCollectionKey: `-0` is stored/compared as `+0`.
@@ -5842,8 +5852,18 @@ impl<'a> Interp<'a> {
                 if my_size < other_size {
                     return Ok(NanBox::boolean(false));
                 }
-                for k in self.set_record_keys(obj, keys)? {
+                // Iterate the argument's keys LAZILY: return false (and
+                // IteratorClose) as soon as a key is not in this set — the rest of
+                // the iterator must not be drained.
+                let (ih, next) = self.open_set_keys(obj, keys)?;
+                while let Some(k) = self.iter_step(ih, next)? {
+                    let k = if k.as_number() == Some(0.0) {
+                        NanBox::number(0.0)
+                    } else {
+                        k
+                    };
                     if !in_mine(self, k) {
+                        self.iterator_close(ih)?;
                         return Ok(NanBox::boolean(false));
                     }
                 }
@@ -5857,8 +5877,17 @@ impl<'a> Interp<'a> {
                         }
                     }
                 } else {
-                    for k in self.set_record_keys(obj, keys)? {
+                    // Lazily iterate the argument's keys: return false (and
+                    // IteratorClose) on the first key found in this set.
+                    let (ih, next) = self.open_set_keys(obj, keys)?;
+                    while let Some(k) = self.iter_step(ih, next)? {
+                        let k = if k.as_number() == Some(0.0) {
+                            NanBox::number(0.0)
+                        } else {
+                            k
+                        };
                         if in_mine(self, k) {
+                            self.iterator_close(ih)?;
                             return Ok(NanBox::boolean(false));
                         }
                     }

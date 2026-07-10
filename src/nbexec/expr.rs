@@ -4012,29 +4012,53 @@ impl<'a> Interp<'a> {
             let m = self.new_str("Cannot convert a Symbol value to a number");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
+        // For the numeric unary operators, ToPrimitive(number) may surface a boxed
+        // Symbol/BigInt (e.g. `+Object(Symbol())`, `-Object(1n)`). ToNumber then
+        // throws a TypeError for a Symbol and for a BigInt under `+`; `-`/`~` on a
+        // BigInt stay BigInt (ToNumeric).
+        if matches!(op, UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot) {
+            let p = self.coerce_object(v, "number")?;
+            if let Some(h) = p.as_handle().map(Handle::from_raw) {
+                if self.realm.symbol_at(h).is_some() {
+                    let m = self.new_str("Cannot convert a Symbol value to a number");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                if let Some(big) = self.realm.bigint_at(h) {
+                    return match op {
+                        UnaryOp::Minus => {
+                            Ok(NanBox::handle(self.realm.new_bigint(big.neg()).to_raw()))
+                        }
+                        #[cfg(feature = "std")]
+                        UnaryOp::BitNot => {
+                            let one = crate::bignum::BigInt::from_i128(1);
+                            let nx = big.add(&one).neg();
+                            Ok(NanBox::handle(self.realm.new_bigint(nx).to_raw()))
+                        }
+                        _ => {
+                            let m = self.new_str("Cannot convert a BigInt value to a number");
+                            Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
+                        }
+                    };
+                }
+            }
+            return Ok(match op {
+                UnaryOp::Plus => NanBox::number(self.realm.to_number(p)),
+                UnaryOp::Minus => self.realm.neg(p),
+                #[cfg(feature = "std")]
+                UnaryOp::BitNot => self.realm.bit_not(p),
+                #[cfg(not(feature = "std"))]
+                UnaryOp::BitNot => return Err(ExecError::Unsupported("~ needs std")),
+                _ => unreachable!(),
+            });
+        }
         Ok(match op {
-            UnaryOp::Plus => {
-                let p = self.coerce_object(v, "number")?;
-                NanBox::number(self.realm.to_number(p))
-            }
-            UnaryOp::Minus => {
-                let p = self.coerce_object(v, "number")?;
-                self.realm.neg(p)
-            }
             UnaryOp::Not => self.realm.logical_not(v),
             UnaryOp::Typeof => {
                 let t = self.realm.type_of_value(v);
                 NanBox::handle(self.realm.new_string(t).to_raw())
             }
             UnaryOp::Void => NanBox::undefined(),
-            #[cfg(feature = "std")]
-            UnaryOp::BitNot => {
-                // ToPrimitive(Number) first, so `~obj` honors a user `valueOf`.
-                let p = self.coerce_object(v, "number")?;
-                self.realm.bit_not(p)
-            }
-            #[cfg(not(feature = "std"))]
-            UnaryOp::BitNot => return Err(ExecError::Unsupported("~ needs std")),
+            UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot => unreachable!(),
             UnaryOp::Delete => return Err(ExecError::Unsupported("delete")),
         })
     }

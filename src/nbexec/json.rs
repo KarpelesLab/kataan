@@ -1,46 +1,41 @@
 use super::*;
 
 impl<'a> Interp<'a> {
-    /// `InternalizeJSONProperty(holder, name, reviver)` (25.5.1.1) — the
-    /// `JSON.parse` reviver walk. Reads `val = Get(holder, name)` via `[[Get]]`
-    /// (so an inherited value is observed and a getter fires); if `val` is an
-    /// array its indices are recursed (CreateDataProperty / Delete the result),
-    /// else its *snapshot* of own enumerable keys is recursed; finally returns
-    /// `reviver.call(holder, name, val)`. A `undefined` child result deletes the
-    /// member; any other re-creates it as an own data property.
-    pub(crate) fn json_revive(
+    /// `InternalizeJSONProperty` — the `JSON.parse` reviver walk *with source-text
+    /// access* (the `json-parse-with-source` proposal). Reads `val = Get(holder,
+    /// name)` via `[[Get]]`; if `val` is an array its indices are recursed, else
+    /// its snapshot of own enumerable keys, bottom-up. It additionally passes the
+    /// reviver a third `context` argument: a plain
+    /// object that, for a value that is a primitive **still equal to the one the
+    /// parser produced at this position**, carries a `source` data property with
+    /// that value's exact JSON source text. Structural values (objects/arrays) and
+    /// values a reviver has forward-substituted get a bare `{}` context.
+    ///
+    /// `snapshot` is the parse-time source node for the value currently at
+    /// `holder[key]` (or `None` for a member the reviver added).
+    pub(crate) fn json_revive_ctx(
         &mut self,
         holder: crate::heap::Handle,
         key: &str,
         reviver: NanBox,
+        snapshot: Option<&JsonSrc>,
     ) -> Result<NanBox, ExecError> {
-        // `val = ? Get(holder, name)` — through `[[Get]]` (prototype chain + getters).
         let value = self.read_member(holder, key)?;
         if let Some(vh) = value.as_handle().map(Handle::from_raw) {
-            // `IsArray(val)` unwraps proxy chains — a Proxy whose target is an array
-            // takes the array branch (its traps then fire on the reads/writes
-            // below). A revoked proxy would already have thrown at the `[[Get]]`
-            // above.
             if self.realm.is_array(self.proxy_key_target(vh)) {
-                // `len = ? LengthOfArrayLike(val)` = ToLength(? Get(val,"length")):
-                // both the `[[Get]]` (a proxy trap) and the numeric coercion (a
-                // `valueOf`) run user code whose abrupt completion must propagate.
                 let len_v = self.read_member(vh, "length")?;
                 let len_f = self.coerce_to_integer_or_infinity(len_v)?;
                 let len = len_f.max(0.0).min(9_007_199_254_740_991.0) as usize;
                 for i in 0..len {
                     let ks = alloc::format!("{i}");
-                    let nv = self.json_revive(vh, &ks, reviver)?;
+                    let child = match snapshot {
+                        Some(JsonSrc::Array(v)) => v.get(i),
+                        _ => None,
+                    };
+                    let nv = self.json_revive_ctx(vh, &ks, reviver, child)?;
                     if matches!(nv.unpack(), Unpacked::Undefined) {
-                        // `? val.[[Delete]](P)` — proxy-aware, so a throwing
-                        // `deleteProperty` trap propagates (a non-abrupt `false` is
-                        // ignored).
                         self.delete_property_of(vh, &ks)?;
                     } else {
-                        // `? CreateDataProperty(val, P, newElement)` — proxy-aware
-                        // [[DefineOwnProperty]]: a throwing `defineProperty` trap
-                        // propagates, a non-abrupt failure (e.g. a non-configurable
-                        // index) is ignored (plain CreateDataProperty, not …OrThrow).
                         let desc = self.realm.new_object();
                         self.realm.set_property(desc, "value", nv);
                         self.realm
@@ -53,31 +48,24 @@ impl<'a> Interp<'a> {
                     }
                 }
             } else if self.realm.object_keys(vh).is_some() || self.realm.proxy_at(vh).is_some() {
-                // `keys = ? EnumerableOwnPropertyNames(val, key)` — snapshot now (the
-                // reviver may mutate `val` during the walk). A proxy drives its
-                // `ownKeys`/`getOwnPropertyDescriptor` traps (errors propagate).
                 let keys = if let Some(pk) = self.proxy_own_enumerable_keys(vh)? {
                     pk
                 } else {
-                    // A proxy with no `ownKeys` trap enumerates its target's own
-                    // enumerable keys (proxy_key_target is identity for a plain
-                    // object).
                     self.realm
                         .object_keys(self.proxy_key_target(vh))
                         .unwrap_or_default()
                 };
                 for k in keys {
-                    let nv = self.json_revive(vh, &k, reviver)?;
+                    let child = match snapshot {
+                        Some(JsonSrc::Object(pairs)) => {
+                            pairs.iter().find(|(pk, _)| pk == &k).map(|(_, s)| s)
+                        }
+                        _ => None,
+                    };
+                    let nv = self.json_revive_ctx(vh, &k, reviver, child)?;
                     if matches!(nv.unpack(), Unpacked::Undefined) {
-                        // `? val.[[Delete]](P)` — proxy-aware; a throwing
-                        // `deleteProperty` trap propagates, a non-abrupt `false`
-                        // (e.g. a non-configurable own property) is ignored.
                         self.delete_property_of(vh, &k)?;
                     } else {
-                        // `? CreateDataProperty(val, P, newElement)` — proxy-aware
-                        // [[DefineOwnProperty]]: a throwing `defineProperty` trap
-                        // propagates, a non-abrupt failure (a non-configurable own
-                        // property) is ignored (plain CreateDataProperty).
                         let desc = self.realm.new_object();
                         self.realm.set_property(desc, "value", nv);
                         self.realm
@@ -91,8 +79,22 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        // Build the `context` object. Only a primitive value that is *still* the
+        // one the parser produced here (SameValue) exposes its `source`.
+        let context = self.realm.new_object();
+        if !self.is_object_value(value)
+            && let Some(JsonSrc::Prim { value: pv, source }) = snapshot
+            && self.realm.same_value(*pv, value)
+        {
+            let src_box = self.new_str(source);
+            self.realm.set_property(context, "source", src_box);
+        }
         let kb = self.new_str(key);
-        self.call_with_this(reviver, NanBox::handle(holder.to_raw()), &[kb, value])
+        self.call_with_this(
+            reviver,
+            NanBox::handle(holder.to_raw()),
+            &[kb, value, NanBox::handle(context.to_raw())],
+        )
     }
 
     /// `JSON.stringify(value, replacer, space)` — the unified spec algorithm
@@ -309,6 +311,11 @@ impl<'a> Interp<'a> {
                     let m = self.new_str("Do not know how to serialize a BigInt");
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
+                // A Symbol value serializes to nothing (`typeof` is "symbol"), both
+                // as a value and (via the object key set) as a key.
+                if self.realm.symbol_at(h).is_some() {
+                    return Ok(None);
+                }
                 // A callable value (function or class constructor) serializes to
                 // nothing (`typeof` is "function").
                 if self.is_callable(h) || self.realm.class_at(h).is_some() {
@@ -421,7 +428,7 @@ impl<'a> Interp<'a> {
         &mut self,
         h: Handle,
         replacer_fn: &NanBox,
-        _property_list: Option<&[String]>,
+        property_list: Option<&[String]>,
         gap: &str,
         indent: &str,
         stack: &mut Vec<Handle>,
@@ -451,10 +458,19 @@ impl<'a> Interp<'a> {
         let mut parts: Vec<String> = Vec::with_capacity(len);
         for i in 0..len {
             let ks = alloc::format!("{i}");
-            // The element replacer/PropertyList still applies via property serialize;
-            // a PropertyList does NOT filter array indices (arrays ignore it).
+            // A PropertyList does NOT filter array indices (arrays ignore it for
+            // their own elements), but it MUST propagate to any nested objects, so
+            // pass it through to the recursive serialization.
             let s = self
-                .serialize_json_property(h, &ks, replacer_fn, None, gap, &new_indent, stack)?
+                .serialize_json_property(
+                    h,
+                    &ks,
+                    replacer_fn,
+                    property_list,
+                    gap,
+                    &new_indent,
+                    stack,
+                )?
                 .unwrap_or_else(|| String::from("null"));
             parts.push(s);
         }
@@ -579,6 +595,110 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Like [`Self::json_parse`] but also returns a parallel [`JsonSrc`] tree that
+    /// records, for every primitive leaf, the value produced and its exact source
+    /// substring — the raw material for the `json-parse-with-source` reviver
+    /// `context`. Only invoked when `JSON.parse` is given a callable reviver.
+    pub(crate) fn json_parse_src(
+        &mut self,
+        c: &[char],
+        pos: &mut usize,
+        depth: usize,
+    ) -> Result<(NanBox, JsonSrc), ExecError> {
+        skip_ws(c, pos);
+        let Some(&ch) = c.get(*pos) else {
+            return Err(self.json_error("Unexpected end of JSON input"));
+        };
+        if matches!(ch, '[' | '{') && depth >= self.realm.limits.max_json_depth {
+            return Err(self.json_error("Maximum JSON nesting depth exceeded"));
+        }
+        // Helper: the source substring `c[start..*pos]` collected as a String.
+        match ch {
+            'n' | 't' | 'f' | '"' | '-' | '0'..='9' => {
+                let start = *pos;
+                let value = self.json_parse(c, pos, depth)?;
+                let source: String = c[start..*pos].iter().collect();
+                Ok((value, JsonSrc::Prim { value, source }))
+            }
+            '[' => {
+                *pos += 1;
+                let mut elems = Vec::new();
+                let mut srcs = Vec::new();
+                skip_ws(c, pos);
+                if c.get(*pos) == Some(&']') {
+                    *pos += 1;
+                    return Ok((
+                        NanBox::handle(self.realm.new_array(elems).to_raw()),
+                        JsonSrc::Array(srcs),
+                    ));
+                }
+                loop {
+                    let (v, s) = self.json_parse_src(c, pos, depth + 1)?;
+                    elems.push(v);
+                    srcs.push(s);
+                    skip_ws(c, pos);
+                    match c.get(*pos) {
+                        Some(',') => *pos += 1,
+                        Some(']') => {
+                            *pos += 1;
+                            break;
+                        }
+                        _ => return Err(self.json_error("Expected ',' or ']'")),
+                    }
+                }
+                Ok((
+                    NanBox::handle(self.realm.new_array(elems).to_raw()),
+                    JsonSrc::Array(srcs),
+                ))
+            }
+            '{' => {
+                *pos += 1;
+                let obj = self.realm.new_object();
+                let mut pairs = Vec::new();
+                skip_ws(c, pos);
+                if c.get(*pos) == Some(&'}') {
+                    *pos += 1;
+                    return Ok((NanBox::handle(obj.to_raw()), JsonSrc::Object(pairs)));
+                }
+                loop {
+                    skip_ws(c, pos);
+                    if c.get(*pos) != Some(&'"') {
+                        return Err(self.json_error("Expected property name"));
+                    }
+                    let key = crate::wtf8::to_string_lossy(&self.json_string(c, pos)?);
+                    skip_ws(c, pos);
+                    if c.get(*pos) != Some(&':') {
+                        return Err(self.json_error("Expected ':'"));
+                    }
+                    *pos += 1;
+                    let (v, s) = self.json_parse_src(c, pos, depth + 1)?;
+                    self.realm.set_property(obj, &key, v);
+                    // A duplicate key keeps the last value (matching `set_property`);
+                    // record the last source for it too.
+                    if let Some(slot) = pairs
+                        .iter_mut()
+                        .find(|(k, _): &&mut (String, JsonSrc)| k == &key)
+                    {
+                        slot.1 = s;
+                    } else {
+                        pairs.push((key, s));
+                    }
+                    skip_ws(c, pos);
+                    match c.get(*pos) {
+                        Some(',') => *pos += 1,
+                        Some('}') => {
+                            *pos += 1;
+                            break;
+                        }
+                        _ => return Err(self.json_error("Expected ',' or '}'")),
+                    }
+                }
+                Ok((NanBox::handle(obj.to_raw()), JsonSrc::Object(pairs)))
+            }
+            _ => Err(self.json_error("Unexpected token in JSON")),
+        }
+    }
+
     pub(crate) fn json_lit(
         &mut self,
         c: &[char],
@@ -663,4 +783,15 @@ impl<'a> Interp<'a> {
             }
         }
     }
+}
+
+/// A parse-time source-text snapshot mirroring a parsed JSON value's structure,
+/// used by the `json-parse-with-source` reviver `context`. Each primitive leaf
+/// records the value the parser produced and its exact source substring so the
+/// reviver can be handed the original text (unless a reviver has since replaced
+/// the value at that position — checked by SameValue).
+pub(crate) enum JsonSrc {
+    Prim { value: NanBox, source: String },
+    Array(Vec<JsonSrc>),
+    Object(Vec<(String, JsonSrc)>),
 }

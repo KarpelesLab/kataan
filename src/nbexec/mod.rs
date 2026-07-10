@@ -6992,6 +6992,8 @@ fn json_quote_wtf8(bytes: &[u8]) -> String {
         match cp {
             0x22 => out.push_str("\\\""),
             0x5C => out.push_str("\\\\"),
+            0x08 => out.push_str("\\b"),
+            0x0C => out.push_str("\\f"),
             0x0A => out.push_str("\\n"),
             0x0D => out.push_str("\\r"),
             0x09 => out.push_str("\\t"),
