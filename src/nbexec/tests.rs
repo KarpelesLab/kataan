@@ -2328,6 +2328,61 @@ fn enumerable_accessor_keys() {
 }
 
 #[test]
+fn own_key_order_data_accessor_interleave() {
+    // A getter defined between two data properties keeps its chronological slot in
+    // `[[OwnPropertyKeys]]` (integer-index-then-insertion order, regardless of
+    // data-vs-accessor).
+    assert_eq!(
+        run(
+            "let o={}; o.a=1; Object.defineProperty(o,'b',{get(){return 2;},enumerable:true,configurable:true}); o.c=3; Object.getOwnPropertyNames(o).join(',')"
+        ),
+        "a,b,c"
+    );
+    // Redefining an existing *data* property as an accessor must NOT move it to the
+    // end — it retains its original insertion position (the fix: seed unified key
+    // order before the data slot is deleted).
+    assert_eq!(
+        run(
+            "let o={}; o.x=1; o.y=2; o.z=3; Object.defineProperty(o,'y',{get(){return 9;},enumerable:true,configurable:true}); Object.getOwnPropertyNames(o).join(',')"
+        ),
+        "x,y,z"
+    );
+    assert_eq!(
+        run(
+            "let o={}; o.x=1; o.y=2; o.z=3; Object.defineProperty(o,'y',{get(){return 9;},enumerable:true,configurable:true}); Reflect.ownKeys(o).join(',')"
+        ),
+        "x,y,z"
+    );
+    // The reverse (accessor redefined as data) also keeps its slot.
+    assert_eq!(
+        run(
+            "let o={}; Object.defineProperty(o,'m',{get(){return 1;},enumerable:true,configurable:true}); o.n=2; Object.defineProperty(o,'m',{value:5,enumerable:true,configurable:true}); Object.getOwnPropertyNames(o).join(',')+'|'+o.m"
+        ),
+        "m,n|5"
+    );
+    // Integer-index keys still sort ahead of string keys, then insertion order.
+    assert_eq!(
+        run(
+            "let o={}; o.b=1; o['2']=2; Object.defineProperty(o,'a',{get(){return 0;},enumerable:true,configurable:true}); o['1']=4; Object.getOwnPropertyNames(o).join(',')"
+        ),
+        "1,2,b,a"
+    );
+    // getOwnPropertyDescriptors and for-in observe the same interleaved order.
+    assert_eq!(
+        run(
+            "let o={}; o.a=1; Object.defineProperty(o,'b',{get(){return 2;},enumerable:true,configurable:true}); o.c=3; Object.keys(Object.getOwnPropertyDescriptors(o)).join(',')"
+        ),
+        "a,b,c"
+    );
+    assert_eq!(
+        run(
+            "let o={}; o.a=1; Object.defineProperty(o,'b',{get(){return 2;},enumerable:true,configurable:true}); o.c=3; let r=[]; for(let k in o) r.push(k); r.join(',')"
+        ),
+        "a,b,c"
+    );
+}
+
+#[test]
 fn get_own_property_descriptors() {
     assert_eq!(
         run(

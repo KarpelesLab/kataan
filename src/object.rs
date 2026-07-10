@@ -154,6 +154,20 @@ impl Object {
         }
     }
 
+    /// Begins tracking unified own-key insertion order if not already doing so,
+    /// seeding the log with the current data keys in their present order. Idempotent
+    /// and a no-op once tracking has started. Callers invoke this *before* a
+    /// structural change that would otherwise lose a key's chronological position —
+    /// e.g. converting an existing data property into an accessor, where the data
+    /// slot is deleted (dropping it from the shape) before the accessor is
+    /// materialized: seeding first records the key at its real slot so the accessor
+    /// re-slots into that same position rather than being appended at the end.
+    pub fn ensure_key_order(&mut self) {
+        if self.key_order.is_none() {
+            self.key_order = Some(self.keys().into_iter().map(Box::from).collect());
+        }
+    }
+
     /// The unified own-key order (data + accessor) reconstructed from the
     /// insertion log, filtered to keys still present, then self-healed by appending
     /// any present key the log missed (data keys before accessor keys). Only called

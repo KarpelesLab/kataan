@@ -2972,6 +2972,23 @@ impl Realm {
         }
     }
 
+    /// Starts unified own-key order tracking on `handle`'s property-bearing cell,
+    /// seeding it with the current key order (a no-op once tracking is active).
+    /// `defineProperty` calls this *before* converting an existing data property to
+    /// an accessor, so the deleted-then-re-added key keeps its original insertion
+    /// position in `[[OwnPropertyKeys]]` instead of being appended at the end.
+    pub fn ensure_key_order(&mut self, handle: Handle) {
+        if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.ensure_key_order();
+            return;
+        }
+        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+            && let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
+        {
+            o.ensure_key_order();
+        }
+    }
+
     /// The `(getter, setter)` of accessor `key` on `handle`, if defined. Consults
     /// a callable cell's auxiliary object (see [`define_accessor`](Realm::define_accessor))
     /// so accessors installed on a native (e.g. `%TypedArray%`'s `get [Symbol.species]`)

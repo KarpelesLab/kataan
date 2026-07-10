@@ -1032,6 +1032,14 @@ impl<'a> Interp<'a> {
             // its writable mark. `define_accessor` only overwrites get/set when the
             // supplied value is defined, so seed a clean accessor first to allow a
             // getter/setter to be reset to `undefined`.
+            //
+            // Begin unified own-key order tracking *before* the data slot is deleted:
+            // deleting drops the key from the shape, so if this is an existing data
+            // property being redefined as an accessor, seeding now records its real
+            // insertion position — otherwise `define_accessor` would seed from the
+            // post-deletion key set and append the key at the end, corrupting
+            // `[[OwnPropertyKeys]]` order.
+            self.realm.ensure_key_order(obj);
             self.realm.clear_accessor(obj, key);
             self.realm.delete_data_slot(obj, key);
             self.realm.clear_readonly_property(obj, key);
