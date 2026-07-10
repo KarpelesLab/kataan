@@ -8,6 +8,7 @@
 //! (`TemporalData.tz`) and a calendar (always `"iso8601"`). Wall-clock fields are
 //! derived on demand: `local = epoch_ns + offset(zone, epoch_ns)`, then decomposed
 //! with `balance_time_from_nanos` + `epoch_days_to_iso`.
+use super::temporal_calendar as tcal;
 use super::*;
 #[cfg(not(feature = "std"))]
 use crate::common::FloatExt;
@@ -437,12 +438,14 @@ impl<'a> Interp<'a> {
         ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m)))
     }
 
-    /// Boxes a fresh `Temporal.ZonedDateTime` on the intrinsic prototype.
-    fn make_zdt(&mut self, epoch_ns: i128, tz: String) -> NanBox {
+    /// Boxes a fresh `Temporal.ZonedDateTime` carrying calendar id `cal` on the
+    /// intrinsic prototype.
+    fn make_zdt_cal(&mut self, epoch_ns: i128, tz: String, cal: String) -> NanBox {
         let data = TemporalData {
             kind: TemporalKind::ZonedDateTime,
             epoch_ns,
             tz: Some(tz),
+            calendar: cal,
             ..Default::default()
         };
         self.zdt_alloc(data, TemporalKind::ZonedDateTime)
@@ -487,11 +490,12 @@ impl<'a> Interp<'a> {
         let tz = self.parse_tz_identifier(&tzs)?;
         // calendar: undefined → iso8601; else must be a String naming a bare
         // calendar id (CanonicalizeCalendar — an ISO date string is NOT accepted).
-        self.zdt_calendar_arg(arg(2), false)?;
+        let calendar = self.zdt_calendar_arg(arg(2), false)?;
         let data = TemporalData {
             kind: TemporalKind::ZonedDateTime,
             epoch_ns: epoch,
             tz: Some(tz),
+            calendar,
             ..Default::default()
         };
         self.finish_temporal(data, new_target, callee)
@@ -546,21 +550,18 @@ impl<'a> Interp<'a> {
         Err(self.zdt_range("invalid time zone"))
     }
 
-    /// Validates a constructor/`withCalendar` calendar argument. When
-    /// `allow_iso_string` is set (`withCalendar` → `ToTemporalCalendarIdentifier`
-    /// → `ParseTemporalCalendarString`) a valid ISO date/time/datetime string is
-    /// accepted and its `[u-ca=…]` annotation used; when clear (the constructor →
-    /// `CanonicalizeCalendar`) only a bare calendar identifier is accepted.
-    fn zdt_calendar_arg(&mut self, v: NanBox, allow_iso_string: bool) -> Result<(), ExecError> {
+    /// Validates a constructor/`withCalendar` calendar argument and returns its
+    /// canonical id (`undefined` → `"iso8601"`). When `allow_iso_string` is set
+    /// (`withCalendar` → `ToTemporalCalendarIdentifier` → `ParseTemporalCalendarString`)
+    /// a valid ISO date/time/datetime string is accepted and its `[u-ca=…]`
+    /// annotation used; when clear (the constructor → `CanonicalizeCalendar`) only
+    /// a bare calendar identifier is accepted.
+    fn zdt_calendar_arg(&mut self, v: NanBox, allow_iso_string: bool) -> Result<String, ExecError> {
         if v.is_undefined() {
-            return Ok(());
+            return Ok(String::from("iso8601"));
         }
         if let Some(cal) = self.temporal_object_calendar(v) {
-            return if calendar_string_ok(&cal) {
-                Ok(())
-            } else {
-                Err(self.zdt_range("only the iso8601 calendar is supported"))
-            };
+            return self.zdt_canonicalize_calendar(&cal);
         }
         let Some(s) = v
             .as_handle()
@@ -569,24 +570,22 @@ impl<'a> Interp<'a> {
         else {
             return Err(self.type_error("calendar must be a string"));
         };
-        if zdt_calendar_string_valid(&s, allow_iso_string) {
-            Ok(())
-        } else {
-            Err(self.zdt_range("only the iso8601 calendar is supported"))
+        if let Some(c) = tcal::canonicalize_calendar(&s) {
+            return Ok(String::from(c));
         }
+        if allow_iso_string && let Some(cal) = self.zdt_calendar_from_iso_string(&s) {
+            return Ok(cal);
+        }
+        Err(self.zdt_range(&alloc::format!("invalid calendar identifier '{s}'")))
     }
 
-    /// Validates a property-bag `calendar` field: it must be a primitive String
-    /// naming the ISO calendar (bare or via a date-ish ISO string), or a Temporal
-    /// object (whose `[[Calendar]]` is used via the fast path). Other non-strings
-    /// → TypeError; an unknown calendar → RangeError.
-    fn zdt_validate_calendar_field(&mut self, v: NanBox) -> Result<(), ExecError> {
+    /// Validates a property-bag `calendar` field and returns its canonical id: a
+    /// primitive String naming a calendar (bare or via a date-ish ISO string), or a
+    /// Temporal object (whose `[[Calendar]]` is used via the fast path). Other
+    /// non-strings → TypeError; an unknown calendar → RangeError.
+    fn zdt_validate_calendar_field(&mut self, v: NanBox) -> Result<String, ExecError> {
         if let Some(cal) = self.temporal_object_calendar(v) {
-            return if calendar_string_ok(&cal) {
-                Ok(())
-            } else {
-                Err(self.zdt_range("only the iso8601 calendar is supported"))
-            };
+            return self.zdt_canonicalize_calendar(&cal);
         }
         let Some(s) = v
             .as_handle()
@@ -595,11 +594,31 @@ impl<'a> Interp<'a> {
         else {
             return Err(self.type_error("calendar must be a string"));
         };
-        if calendar_string_ok(&s) {
-            Ok(())
-        } else {
-            Err(self.zdt_range("only the iso8601 calendar is supported"))
+        if let Some(c) = tcal::canonicalize_calendar(&s) {
+            return Ok(String::from(c));
         }
+        if let Some(cal) = self.zdt_calendar_from_iso_string(&s) {
+            return Ok(cal);
+        }
+        Err(self.zdt_range(&alloc::format!("invalid calendar identifier '{s}'")))
+    }
+
+    /// Canonicalizes a bare calendar identifier; an unsupported id is a RangeError.
+    fn zdt_canonicalize_calendar(&mut self, s: &str) -> Result<String, ExecError> {
+        match tcal::canonicalize_calendar(s) {
+            Some(c) => Ok(String::from(c)),
+            None => Err(self.zdt_range(&alloc::format!("invalid calendar identifier '{s}'"))),
+        }
+    }
+
+    /// Extracts a canonical calendar id from a date/time/datetime ISO string's
+    /// `[u-ca=…]` annotation (`ParseTemporalCalendarString`), defaulting to
+    /// `"iso8601"`. Returns `None` if the string does not parse or names an
+    /// unsupported calendar.
+    fn zdt_calendar_from_iso_string(&mut self, s: &str) -> Option<String> {
+        let p = iso::parse_iso_datetime(s).or_else(|| iso::parse_iso_time_string(s))?;
+        let cal = p.calendar.as_deref().unwrap_or("iso8601");
+        tcal::canonicalize_calendar(cal).map(String::from)
     }
 
     /// Reads an `offset` property-bag field: `ToPrimitive(string)` must yield a
@@ -625,48 +644,93 @@ impl<'a> Interp<'a> {
     ) -> Result<NanBox, ExecError> {
         let tz = data.tz.clone().unwrap_or_else(|| String::from("UTC"));
         let (d, t) = local_of(&tz, data.epoch_ns);
+        let cal = data.calendar.as_str();
         let num = |n: i64| NanBox::number(n as f64);
-        Ok(match name {
-            "calendarId" => self.new_str("iso8601"),
-            "timeZoneId" => self.new_str(&tz),
-            "era" | "eraYear" => NanBox::undefined(),
-            "year" => num(i64::from(d.year)),
-            "month" => num(i64::from(d.month)),
-            "monthCode" => {
-                let s = alloc::format!("M{}", iso::pad(u64::from(d.month), 2));
-                self.new_str(&s)
+        // Calendar-independent getters (time / offset / instant / time-zone).
+        match name {
+            "calendarId" => return Ok(self.new_str(cal)),
+            "timeZoneId" => return Ok(self.new_str(&tz)),
+            "hour" => return Ok(num(i64::from(t.hour))),
+            "minute" => return Ok(num(i64::from(t.minute))),
+            "second" => return Ok(num(i64::from(t.second))),
+            "millisecond" => return Ok(num(i64::from(t.millisecond))),
+            "microsecond" => return Ok(num(i64::from(t.microsecond))),
+            "nanosecond" => return Ok(num(i64::from(t.nanosecond))),
+            "epochMilliseconds" => {
+                return Ok(NanBox::number(data.epoch_ns.div_euclid(1_000_000) as f64));
             }
-            "day" => num(i64::from(d.day)),
-            "hour" => num(i64::from(t.hour)),
-            "minute" => num(i64::from(t.minute)),
-            "second" => num(i64::from(t.second)),
-            "millisecond" => num(i64::from(t.millisecond)),
-            "microsecond" => num(i64::from(t.microsecond)),
-            "nanosecond" => num(i64::from(t.nanosecond)),
-            "epochMilliseconds" => NanBox::number(data.epoch_ns.div_euclid(1_000_000) as f64),
-            "epochNanoseconds" => self.zdt_bigint_i128(data.epoch_ns),
-            "dayOfWeek" => num(i64::from(iso::iso_day_of_week(d))),
-            "dayOfYear" => num(i64::from(iso::iso_day_of_year(d))),
-            "weekOfYear" => num(i64::from(iso::iso_week_of_year(d).0)),
-            "yearOfWeek" => num(i64::from(iso::iso_week_of_year(d).1)),
+            "epochNanoseconds" => return Ok(self.zdt_bigint_i128(data.epoch_ns)),
+            "dayOfWeek" => return Ok(num(i64::from(iso::iso_day_of_week(d)))),
             "hoursInDay" => {
                 let start = wall_to_epoch(&tz, iso_to_epoch_days(d) as i128 * iso::NS_PER_DAY);
                 let next = wall_to_epoch(&tz, (iso_to_epoch_days(d) + 1) as i128 * iso::NS_PER_DAY);
                 if !valid_epoch(start) || !valid_epoch(next) {
                     return Err(self.zdt_range("day boundary is out of range"));
                 }
-                NanBox::number((next - start) as f64 / iso::NS_PER_HOUR as f64)
+                return Ok(NanBox::number(
+                    (next - start) as f64 / iso::NS_PER_HOUR as f64,
+                ));
             }
-            "daysInWeek" => num(7),
-            "daysInMonth" => num(i64::from(iso::iso_days_in_month(d.year, d.month))),
-            "daysInYear" => num(i64::from(iso::iso_days_in_year(d.year))),
-            "monthsInYear" => num(12),
-            "inLeapYear" => NanBox::boolean(iso::is_leap_year(d.year)),
+            "daysInWeek" => return Ok(num(7)),
             "offset" => {
                 let s = format_offset(tz_offset_at(&tz, data.epoch_ns));
-                self.new_str(&s)
+                return Ok(self.new_str(&s));
             }
-            "offsetNanoseconds" => NanBox::number(tz_offset_at(&tz, data.epoch_ns) as f64),
+            "offsetNanoseconds" => {
+                return Ok(NanBox::number(tz_offset_at(&tz, data.epoch_ns) as f64));
+            }
+            _ => {}
+        }
+        // ISO-8601 fast path — byte-for-byte the original computation, on the
+        // local (wall-clock) date.
+        if tcal::is_iso(cal) {
+            return Ok(match name {
+                "era" | "eraYear" => NanBox::undefined(),
+                "year" => num(i64::from(d.year)),
+                "month" => num(i64::from(d.month)),
+                "monthCode" => {
+                    let s = alloc::format!("M{}", iso::pad(u64::from(d.month), 2));
+                    self.new_str(&s)
+                }
+                "day" => num(i64::from(d.day)),
+                "dayOfYear" => num(i64::from(iso::iso_day_of_year(d))),
+                "weekOfYear" => num(i64::from(iso::iso_week_of_year(d).0)),
+                "yearOfWeek" => num(i64::from(iso::iso_week_of_year(d).1)),
+                "daysInMonth" => num(i64::from(iso::iso_days_in_month(d.year, d.month))),
+                "daysInYear" => num(i64::from(iso::iso_days_in_year(d.year))),
+                "monthsInYear" => num(12),
+                "inLeapYear" => NanBox::boolean(iso::is_leap_year(d.year)),
+                _ => return Err(self.temporal_todo(&alloc::format!("ZonedDateTime getter {name}"))),
+            });
+        }
+        // Non-ISO calendar: route through the calendar abstraction layer.
+        let f = tcal::iso_to_fields(cal, d);
+        Ok(match name {
+            "era" => match &f.era {
+                Some(e) => self.new_str(e),
+                None => NanBox::undefined(),
+            },
+            "eraYear" => match f.era_year {
+                Some(y) => NanBox::number(y as f64),
+                None => NanBox::undefined(),
+            },
+            "year" => NanBox::number(f.year as f64),
+            "month" => NanBox::number(f.month as f64),
+            "monthCode" => self.new_str(&f.month_code),
+            "day" => NanBox::number(f.day as f64),
+            "dayOfYear" => NanBox::number(tcal::day_of_year(cal, d) as f64),
+            "weekOfYear" => match tcal::week_of_year(cal, d) {
+                Some((w, _)) => NanBox::number(w as f64),
+                None => NanBox::undefined(),
+            },
+            "yearOfWeek" => match tcal::year_of_week(cal, d) {
+                Some(y) => NanBox::number(y as f64),
+                None => NanBox::undefined(),
+            },
+            "daysInMonth" => NanBox::number(tcal::days_in_month(cal, d) as f64),
+            "daysInYear" => NanBox::number(tcal::days_in_year(cal, d) as f64),
+            "monthsInYear" => NanBox::number(tcal::months_in_year(cal, d) as f64),
+            "inLeapYear" => NanBox::boolean(tcal::in_leap_year(cal, d)),
             _ => return Err(self.temporal_todo(&alloc::format!("ZonedDateTime getter {name}"))),
         })
     }
@@ -688,8 +752,8 @@ impl<'a> Interp<'a> {
                 if arg(0).is_undefined() {
                     return Err(self.type_error("withCalendar requires a calendar argument"));
                 }
-                self.zdt_calendar_arg(arg(0), true)?;
-                Ok(self.make_zdt(data.epoch_ns, self.zdt_tz(data)))
+                let cal = self.zdt_calendar_arg(arg(0), true)?;
+                Ok(self.make_zdt_cal(data.epoch_ns, self.zdt_tz(data), cal))
             }
             "add" => self.zdt_add(data, arg(0), arg(1), 1),
             "subtract" => self.zdt_add(data, arg(0), arg(1), -1),
@@ -703,12 +767,12 @@ impl<'a> Interp<'a> {
                 if !valid_epoch(epoch) {
                     return Err(self.zdt_range("start of day is out of range"));
                 }
-                Ok(self.make_zdt(epoch, tz))
+                Ok(self.make_zdt_cal(epoch, tz, data.calendar.clone()))
             }
             "getTimeZoneTransition" => self.zdt_get_transition(data, arg(0)),
             "equals" => {
-                let (epoch, tz) = self.resolve_zdt(arg(0))?;
-                let eq = epoch == data.epoch_ns && tz == self.zdt_tz(data);
+                let (epoch, tz, cal) = self.resolve_zdt(arg(0))?;
+                let eq = epoch == data.epoch_ns && tz == self.zdt_tz(data) && cal == data.calendar;
                 Ok(NanBox::boolean(eq))
             }
             "toInstant" => {
@@ -724,6 +788,7 @@ impl<'a> Interp<'a> {
                 let data2 = TemporalData {
                     kind: TemporalKind::PlainDate,
                     date: d,
+                    calendar: data.calendar.clone(),
                     ..Default::default()
                 };
                 Ok(self.zdt_alloc(data2, TemporalKind::PlainDate))
@@ -743,6 +808,7 @@ impl<'a> Interp<'a> {
                     kind: TemporalKind::PlainDateTime,
                     date: d,
                     time: t,
+                    calendar: data.calendar.clone(),
                     ..Default::default()
                 };
                 Ok(self.zdt_alloc(data2, TemporalKind::PlainDateTime))
@@ -776,11 +842,15 @@ impl<'a> Interp<'a> {
                     self.zdt_disambiguation(opts)?;
                     self.zdt_offset_option(opts)?;
                     self.zdt_overflow(opts)?;
-                    let (epoch, tz) = (dd.epoch_ns, dd.tz.clone().unwrap_or_default());
-                    return Ok(Some(self.make_zdt(epoch, tz)));
+                    let (epoch, tz, cal) = (
+                        dd.epoch_ns,
+                        dd.tz.clone().unwrap_or_default(),
+                        dd.calendar.clone(),
+                    );
+                    return Ok(Some(self.make_zdt_cal(epoch, tz, cal)));
                 }
-                let (epoch, tz) = self.interpret_zdt(arg(0), arg(1))?;
-                Ok(Some(self.make_zdt(epoch, tz)))
+                let (epoch, tz, cal) = self.interpret_zdt(arg(0), arg(1))?;
+                Ok(Some(self.make_zdt_cal(epoch, tz, cal)))
             }
             "compare" => {
                 let a = self.resolve_zdt(arg(0))?.0;
@@ -925,12 +995,12 @@ impl<'a> Interp<'a> {
 
     // --- ToTemporalZonedDateTime ------------------------------------------
 
-    /// `ToTemporalZonedDateTime(item, options)` → `(epoch_ns, tz_id)`.
+    /// `ToTemporalZonedDateTime(item, options)` → `(epoch_ns, tz_id, calendar_id)`.
     fn interpret_zdt(
         &mut self,
         item: NanBox,
         options: NanBox,
-    ) -> Result<(i128, String), ExecError> {
+    ) -> Result<(i128, String, String), ExecError> {
         if let Some(h) = item.as_handle().map(Handle::from_raw) {
             if let Some(dd) = self.realm.temporal_at(h)
                 && dd.kind == TemporalKind::ZonedDateTime
@@ -939,7 +1009,11 @@ impl<'a> Interp<'a> {
                 self.zdt_disambiguation(opts)?;
                 self.zdt_offset_option(opts)?;
                 self.zdt_overflow(opts)?;
-                return Ok((dd.epoch_ns, dd.tz.clone().unwrap_or_default()));
+                return Ok((
+                    dd.epoch_ns,
+                    dd.tz.clone().unwrap_or_default(),
+                    dd.calendar.clone(),
+                ));
             }
             if let Some(s) = self.realm.string_value(h) {
                 return self.zdt_from_string(&s, options);
@@ -952,7 +1026,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Like [`Self::interpret_zdt`] but with no options (used by equals/compare).
-    fn resolve_zdt(&mut self, item: NanBox) -> Result<(i128, String), ExecError> {
+    fn resolve_zdt(&mut self, item: NanBox) -> Result<(i128, String, String), ExecError> {
         self.interpret_zdt(item, NanBox::undefined())
     }
 
@@ -962,10 +1036,18 @@ impl<'a> Interp<'a> {
     /// `PrepareTemporalFields` prescribes (each `ToIntegerWithTruncation` /
     /// `ToPrimitiveAndRequireString` observable at read time); options follow, and
     /// only then does algorithmic (range/suitability) validation run.
-    fn zdt_from_bag(&mut self, h: Handle, options: NanBox) -> Result<(i128, String), ExecError> {
-        // calendar (must be a String naming the ISO calendar).
-        if let Some(v) = self.zdt_field(h, "calendar")? {
-            self.zdt_validate_calendar_field(v)?;
+    fn zdt_from_bag(
+        &mut self,
+        h: Handle,
+        options: NanBox,
+    ) -> Result<(i128, String, String), ExecError> {
+        // calendar (a String naming a calendar, or a Temporal object's calendar).
+        let calendar = match self.zdt_field(h, "calendar")? {
+            Some(v) => self.zdt_validate_calendar_field(v)?,
+            None => String::from("iso8601"),
+        };
+        if !tcal::is_iso(&calendar) {
+            return self.zdt_from_bag_cal(h, &calendar, options);
         }
         let day = self.read_int_field(h, "day")?;
         let hour = self.read_int_field(h, "hour")?;
@@ -1025,7 +1107,119 @@ impl<'a> Interp<'a> {
 
         let wall = iso_to_epoch_days(date) as i128 * iso::NS_PER_DAY + time_to_nanos(time);
         let epoch = self.resolve_epoch(&tz, wall, offset_ns, false, offset_opt)?;
-        Ok((epoch, tz))
+        Ok((epoch, tz, calendar))
+    }
+
+    /// The non-ISO property-bag path (`CalendarDateFromFields` for the date, then
+    /// the wall-clock → instant disambiguation). Reads the calendar date fields
+    /// (`day`/`era`/`eraYear`/`month`/`monthCode`/`year`) + time/offset/timeZone in
+    /// the alphabetical order the spec prescribes and routes the date portion
+    /// through the calendar abstraction layer.
+    fn zdt_from_bag_cal(
+        &mut self,
+        h: Handle,
+        calendar: &str,
+        options: NanBox,
+    ) -> Result<(i128, String, String), ExecError> {
+        // Alphabetical read order: day, era, eraYear, hour, microsecond,
+        // millisecond, minute, month, monthCode, nanosecond, offset, second,
+        // timeZone, year.
+        let day = self.read_int_field(h, "day")?;
+        let era = match self.zdt_field(h, "era")? {
+            Some(v) => Some(self.coerce_to_string(v)?),
+            None => None,
+        };
+        let era_year = self.read_int_field(h, "eraYear")?;
+        let hour = self.read_int_field(h, "hour")?;
+        let us = self.read_int_field(h, "microsecond")?;
+        let ms = self.read_int_field(h, "millisecond")?;
+        let minute = self.read_int_field(h, "minute")?;
+        let month = self.read_int_field(h, "month")?;
+        let month_code = self.zdt_read_month_code_str(h)?;
+        let ns = self.read_int_field(h, "nanosecond")?;
+        let offset_ns = match self.zdt_field(h, "offset")? {
+            Some(v) => Some(self.zdt_read_offset_field(v)?),
+            None => None,
+        };
+        let second = self.read_int_field(h, "second")?;
+        let tz_val = self.zdt_field(h, "timeZone")?;
+        let year = self.read_int_field(h, "year")?;
+
+        // Options (read order: disambiguation, offset, overflow).
+        let opts = self.zdt_options(options)?;
+        self.zdt_disambiguation(opts)?;
+        let offset_opt = self.zdt_offset_option(opts)?;
+        let overflow = self.zdt_overflow(opts)?;
+
+        let Some(day) = day else {
+            return Err(self.type_error("day is required"));
+        };
+        if month.is_none() && month_code.is_none() {
+            return Err(self.type_error("month or monthCode is required"));
+        }
+        let Some(tz_val) = tz_val else {
+            return Err(self.type_error("timeZone is required"));
+        };
+        let tz = self.tz_from_value(tz_val)?;
+
+        let input = tcal::FieldsInput {
+            era,
+            era_year,
+            year,
+            month,
+            month_code,
+            day,
+        };
+        let date = self.zdt_cal_fields_to_iso(calendar, &input, overflow)?;
+        let time = iso::regulate_iso_time(
+            hour.unwrap_or(0),
+            minute.unwrap_or(0),
+            second.unwrap_or(0),
+            ms.unwrap_or(0),
+            us.unwrap_or(0),
+            ns.unwrap_or(0),
+            overflow,
+        )
+        .ok_or_else(|| self.zdt_range("invalid ISO time"))?;
+
+        let wall = iso_to_epoch_days(date) as i128 * iso::NS_PER_DAY + time_to_nanos(time);
+        let epoch = self.resolve_epoch(&tz, wall, offset_ns, false, offset_opt)?;
+        Ok((epoch, tz, String::from(calendar)))
+    }
+
+    /// Runs [`tcal::fields_to_iso`], mapping its error to the right exception.
+    fn zdt_cal_fields_to_iso(
+        &mut self,
+        calendar: &str,
+        input: &tcal::FieldsInput,
+        overflow: Overflow,
+    ) -> Result<IsoDate, ExecError> {
+        match tcal::fields_to_iso(calendar, input, overflow) {
+            Ok(d) => Ok(d),
+            Err(tcal::CalError::Range(m)) => Err(self.zdt_range(&m)),
+            Err(tcal::CalError::MissingFields(m)) => Err(self.type_error(&m)),
+        }
+    }
+
+    /// Reads a `monthCode` field as its raw well-formed string (for the non-ISO
+    /// path, where suitability is judged by the calendar layer).
+    fn zdt_read_month_code_str(&mut self, h: Handle) -> Result<Option<String>, ExecError> {
+        let Some(v) = self.zdt_field(h, "monthCode")? else {
+            return Ok(None);
+        };
+        let prim = self.coerce_primitive(v, "string")?;
+        let Some(s) = prim
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|x| self.realm.string_value(x))
+        else {
+            return Err(self.type_error("monthCode must be a string"));
+        };
+        // Well-formedness only (M + two digits + optional L).
+        if parse_month_code(&s).is_none() {
+            return Err(self.zdt_range("invalid monthCode"));
+        }
+        Ok(Some(s))
     }
 
     /// Reads an integer field (`ToIntegerWithTruncation`) inline; `None` if absent.
@@ -1106,9 +1300,18 @@ impl<'a> Interp<'a> {
     }
 
     /// Builds a ZonedDateTime from an ISO string with a `[TimeZone]` annotation.
-    fn zdt_from_string(&mut self, s: &str, options: NanBox) -> Result<(i128, String), ExecError> {
+    fn zdt_from_string(
+        &mut self,
+        s: &str,
+        options: NanBox,
+    ) -> Result<(i128, String, String), ExecError> {
         let p = parse_zdt_string(s).ok_or_else(|| self.zdt_range("invalid ISO string"))?;
         let tz = self.parse_tz_identifier(&p.tz)?;
+        // The `[u-ca=…]` annotation (canonicalized) supplies the calendar id.
+        let calendar = match p.cal.as_deref() {
+            Some(c) => self.zdt_canonicalize_calendar(c)?,
+            None => String::from("iso8601"),
+        };
 
         let opts = self.zdt_options(options)?;
         self.zdt_disambiguation(opts)?;
@@ -1124,7 +1327,7 @@ impl<'a> Interp<'a> {
         // offset_ns from a numeric offset; z handled separately.
         let offset_ns = if p.z { None } else { p.offset_ns };
         let epoch = self.resolve_epoch(&tz, wall, offset_ns, p.z, offset_opt)?;
-        Ok((epoch, tz))
+        Ok((epoch, tz, calendar))
     }
 
     /// `InterpretISODateTimeOffset`: turns a wall time + (optional) offset/`Z` into
@@ -1188,6 +1391,9 @@ impl<'a> Interp<'a> {
         let tz = self.zdt_tz(data);
         let (cd, ct) = local_of(&tz, data.epoch_ns);
         let cur_offset = tz_offset_at(&tz, data.epoch_ns);
+        if !tcal::is_iso(&data.calendar) {
+            return self.zdt_with_cal(data, h, &tz, cd, ct, cur_offset, options);
+        }
 
         // Read + coerce the partial fields inline in alphabetical order.
         let day = self.read_int_field(h, "day")?;
@@ -1260,7 +1466,111 @@ impl<'a> Interp<'a> {
             .ok_or_else(|| self.zdt_range("invalid ISO time"))?;
         let wall = iso_to_epoch_days(date) as i128 * iso::NS_PER_DAY + time_to_nanos(time);
         let epoch = self.resolve_epoch(&tz, wall, offset_ns, false, offset_opt)?;
-        Ok(self.make_zdt(epoch, tz))
+        Ok(self.make_zdt_cal(epoch, tz, data.calendar.clone()))
+    }
+
+    /// The non-ISO `with` path: merges the provided calendar/time fields over the
+    /// receiver's existing wall-clock fields, re-derives the ISO date through the
+    /// calendar abstraction layer, then applies the wall-clock → instant
+    /// disambiguation.
+    #[allow(clippy::too_many_arguments)]
+    fn zdt_with_cal(
+        &mut self,
+        data: &TemporalData,
+        h: Handle,
+        tz: &str,
+        cd: IsoDate,
+        ct: IsoTime,
+        cur_offset: i128,
+        options: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let cal = data.calendar.as_str();
+        let existing = tcal::iso_to_fields(cal, cd);
+
+        // Alphabetical read order: day, era, eraYear, hour, microsecond,
+        // millisecond, minute, month, monthCode, nanosecond, offset, second, year.
+        let day = self.read_int_field(h, "day")?;
+        let era = match self.zdt_field(h, "era")? {
+            Some(v) => Some(self.coerce_to_string(v)?),
+            None => None,
+        };
+        let era_year = self.read_int_field(h, "eraYear")?;
+        let hour = self.read_int_field(h, "hour")?;
+        let us = self.read_int_field(h, "microsecond")?;
+        let ms = self.read_int_field(h, "millisecond")?;
+        let minute = self.read_int_field(h, "minute")?;
+        let month = self.read_int_field(h, "month")?;
+        let month_code = self.zdt_read_month_code_str(h)?;
+        let ns = self.read_int_field(h, "nanosecond")?;
+        let offset_field = match self.zdt_field(h, "offset")? {
+            Some(v) => Some(self.zdt_read_offset_field(v)?),
+            None => None,
+        };
+        let second = self.read_int_field(h, "second")?;
+        let year = self.read_int_field(h, "year")?;
+        let any = day.is_some()
+            || era.is_some()
+            || era_year.is_some()
+            || hour.is_some()
+            || us.is_some()
+            || ms.is_some()
+            || minute.is_some()
+            || month.is_some()
+            || month_code.is_some()
+            || ns.is_some()
+            || offset_field.is_some()
+            || second.is_some()
+            || year.is_some();
+        if !any {
+            return Err(self.type_error("with() requires at least one recognised field"));
+        }
+        if month.is_some_and(|m| m < 1) || day.is_some_and(|d| d < 1) {
+            return Err(self.zdt_range("month and day must be positive"));
+        }
+
+        // Options (read order: disambiguation, offset, overflow).
+        let opts = self.zdt_options(options)?;
+        self.zdt_disambiguation(opts)?;
+        let offset_opt = self.zdt_offset_option_default(opts, OffsetOpt::Prefer)?;
+        let overflow = self.zdt_overflow(opts)?;
+
+        // Merge date fields: an explicit year (or era+eraYear) wins; otherwise keep
+        // the receiver's year. Prefer monthCode to preserve leap months.
+        let (year, era, era_year) = if year.is_some() || (era.is_some() && era_year.is_some()) {
+            (year, era, era_year)
+        } else {
+            (Some(existing.year), None, None)
+        };
+        let (month, month_code) = if month.is_some() || month_code.is_some() {
+            (month, month_code)
+        } else {
+            (None, Some(existing.month_code.clone()))
+        };
+        let day = day.unwrap_or(existing.day);
+
+        let input = tcal::FieldsInput {
+            era,
+            era_year,
+            year,
+            month,
+            month_code,
+            day,
+        };
+        let date = self.zdt_cal_fields_to_iso(cal, &input, overflow)?;
+
+        let hour = hour.unwrap_or(i64::from(ct.hour));
+        let minute = minute.unwrap_or(i64::from(ct.minute));
+        let second = second.unwrap_or(i64::from(ct.second));
+        let ms = ms.unwrap_or(i64::from(ct.millisecond));
+        let us = us.unwrap_or(i64::from(ct.microsecond));
+        let ns = ns.unwrap_or(i64::from(ct.nanosecond));
+        let offset_ns = Some(offset_field.unwrap_or(cur_offset));
+        let time = iso::regulate_iso_time(hour, minute, second, ms, us, ns, overflow)
+            .ok_or_else(|| self.zdt_range("invalid ISO time"))?;
+
+        let wall = iso_to_epoch_days(date) as i128 * iso::NS_PER_DAY + time_to_nanos(time);
+        let epoch = self.resolve_epoch(tz, wall, offset_ns, false, offset_opt)?;
+        Ok(self.make_zdt_cal(epoch, tz.to_string(), data.calendar.clone()))
     }
 
     fn zdt_offset_option_default(
@@ -1299,7 +1609,7 @@ impl<'a> Interp<'a> {
         if !valid_epoch(epoch) {
             return Err(self.zdt_range("resulting instant is out of range"));
         }
-        Ok(self.make_zdt(epoch, tz))
+        Ok(self.make_zdt_cal(epoch, tz, data.calendar.clone()))
     }
 
     fn zdt_to_time(&mut self, item: NanBox) -> Result<IsoTime, ExecError> {
@@ -1356,7 +1666,7 @@ impl<'a> Interp<'a> {
         arg: NanBox,
     ) -> Result<NanBox, ExecError> {
         let tz = self.tz_from_value(arg)?;
-        Ok(self.make_zdt(data.epoch_ns, tz))
+        Ok(self.make_zdt_cal(data.epoch_ns, tz, data.calendar.clone()))
     }
 
     // --- add / subtract ----------------------------------------------------
@@ -1390,7 +1700,7 @@ impl<'a> Interp<'a> {
         if !valid_epoch(epoch) {
             return Err(self.zdt_range("result out of range"));
         }
-        Ok(self.make_zdt(epoch, tz))
+        Ok(self.make_zdt_cal(epoch, tz, data.calendar.clone()))
     }
 
     fn zdt_to_duration(&mut self, item: NanBox) -> Result<DurationFields, ExecError> {
@@ -1469,7 +1779,7 @@ impl<'a> Interp<'a> {
         options: NanBox,
         negate: bool,
     ) -> Result<NanBox, ExecError> {
-        let (other_epoch, _other_tz) = self.resolve_zdt(other)?;
+        let (other_epoch, _other_tz, _other_cal) = self.resolve_zdt(other)?;
         let tz = self.zdt_tz(data);
         let opts = self.zdt_options(options)?;
         let units = [
@@ -1702,7 +2012,7 @@ impl<'a> Interp<'a> {
         if !valid_epoch(epoch) {
             return Err(self.zdt_range("rounded instant is out of range"));
         }
-        Ok(self.make_zdt(epoch, tz))
+        Ok(self.make_zdt_cal(epoch, tz, data.calendar.clone()))
     }
 
     fn zdt_validate_increment(&mut self, unit: Unit, increment: i64) -> Result<(), ExecError> {
@@ -1777,7 +2087,7 @@ impl<'a> Interp<'a> {
         match best {
             Some(w) => {
                 let epoch = i128::from(w) * iso::NS_PER_SEC;
-                Ok(self.make_zdt(epoch, tz))
+                Ok(self.make_zdt_cal(epoch, tz, data.calendar.clone()))
             }
             None => Ok(NanBox::null()),
         }
@@ -1883,9 +2193,11 @@ impl<'a> Interp<'a> {
                 out.push(']');
             }
         }
+        let cal_id = data.calendar.as_str();
         match cal.as_str() {
-            "always" => out.push_str("[u-ca=iso8601]"),
-            "critical" => out.push_str("[!u-ca=iso8601]"),
+            "always" => out.push_str(&alloc::format!("[u-ca={cal_id}]")),
+            "critical" => out.push_str(&alloc::format!("[!u-ca={cal_id}]")),
+            "auto" if !tcal::is_iso(cal_id) => out.push_str(&alloc::format!("[u-ca={cal_id}]")),
             _ => {}
         }
         Ok(self.new_str(&out))
@@ -1944,65 +2256,6 @@ fn dt_offset_subminute(s: &str) -> bool {
     false
 }
 
-/// Whether a property-bag `calendar` string names the ISO calendar: the bare
-/// identifier `"iso8601"` or a date-ish ISO string whose every `u-ca=` annotation
-/// is `iso8601`.
-/// Validates a calendar identifier supplied as a *string*. A bare `iso8601`
-/// (case-insensitive) is always accepted. When `allow_iso_string` is set, a valid
-/// ISO date / time / datetime string is also accepted (its `[u-ca=…]` annotation,
-/// which must be `iso8601`, is used) — this is the `ParseTemporalCalendarString`
-/// path used by `withCalendar`. When clear, only the bare identifier is accepted
-/// (the constructor's `CanonicalizeCalendar`).
-fn zdt_calendar_string_valid(s: &str, allow_iso_string: bool) -> bool {
-    if s.eq_ignore_ascii_case("iso8601") {
-        return true;
-    }
-    if !allow_iso_string {
-        return false;
-    }
-    // A bare date string with a calendar annotation is handled by
-    // `calendar_string_ok`; a time / datetime string is handled by the ISO
-    // parsers. In every case the extracted calendar annotation must be iso8601.
-    if calendar_string_ok(s) {
-        return true;
-    }
-    if let Some(p) =
-        iso::parse_iso_datetime(s).or_else(|| crate::temporal_iso::parse_iso_time_string(s))
-    {
-        return p
-            .calendar
-            .as_deref()
-            .is_none_or(|c| c.eq_ignore_ascii_case("iso8601"));
-    }
-    false
-}
-
-fn calendar_string_ok(s: &str) -> bool {
-    if s.eq_ignore_ascii_case("iso8601") {
-        return true;
-    }
-    if !s
-        .as_bytes()
-        .first()
-        .is_some_and(|&c| c.is_ascii_digit() || c == b'+' || c == b'-')
-    {
-        return false;
-    }
-    if s.starts_with("-000000") {
-        return false;
-    }
-    let mut rest = s;
-    while let Some(p) = rest.find("u-ca=") {
-        let after = &rest[p + 5..];
-        let end = after.find(']').unwrap_or(after.len());
-        if !after[..end].eq_ignore_ascii_case("iso8601") {
-            return false;
-        }
-        rest = &after[end..];
-    }
-    true
-}
-
 // ---------------------------------------------------------------------------
 // Strict ISO-8601 ZonedDateTime-string parser
 // ---------------------------------------------------------------------------
@@ -2021,6 +2274,8 @@ struct ParsedZdt {
     offset_ns: Option<i128>,
     z: bool,
     tz: String,
+    /// The (raw, un-canonicalized) first `[u-ca=…]` calendar annotation, if any.
+    cal: Option<String>,
 }
 
 struct Zp<'s> {
@@ -2103,7 +2358,7 @@ fn parse_zdt_string(s: &str) -> Option<ParsedZdt> {
         offset = off;
         z = is_z;
     }
-    let tz = zp_annotations(&mut p)?;
+    let (tz, cal) = zp_annotations(&mut p)?;
     if p.i != p.b.len() {
         return None;
     }
@@ -2113,6 +2368,7 @@ fn parse_zdt_string(s: &str) -> Option<ParsedZdt> {
         offset_ns: offset,
         z,
         tz,
+        cal,
     })
 }
 
@@ -2231,9 +2487,11 @@ fn zp_offset(p: &mut Zp) -> Option<(Option<i128>, bool)> {
 }
 
 /// Parses the trailing `[…]` annotations, returning the (single) time-zone
-/// annotation body. Enforces the Temporal annotation rules.
-fn zp_annotations(p: &mut Zp) -> Option<String> {
+/// annotation body plus the first `[u-ca=…]` calendar annotation value (raw).
+/// Enforces the Temporal annotation rules.
+fn zp_annotations(p: &mut Zp) -> Option<(String, Option<String>)> {
     let mut tz: Option<String> = None;
+    let mut cal: Option<String> = None;
     let mut kv_seen = false;
     let mut cal_count = 0_u32;
     let mut cal_critical = false;
@@ -2260,6 +2518,9 @@ fn zp_annotations(p: &mut Zp) -> Option<String> {
             if key == "u-ca" {
                 cal_count += 1;
                 cal_critical |= critical;
+                if cal.is_none() {
+                    cal = Some(content[eq + 1..].to_string());
+                }
             } else if critical {
                 return None;
             }
@@ -2274,5 +2535,5 @@ fn zp_annotations(p: &mut Zp) -> Option<String> {
     if cal_count > 1 && cal_critical {
         return None;
     }
-    tz
+    tz.map(|t| (t, cal))
 }

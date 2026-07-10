@@ -7,6 +7,7 @@
 //! *reference ISO day* (default 1). It is stored in [`TemporalData::date`] as an
 //! [`IsoDate`] carrying the reference day; the `kind` is
 //! [`TemporalKind::PlainYearMonth`].
+use super::temporal_calendar as tcal;
 use super::*;
 #[cfg(not(feature = "std"))]
 use crate::common::FloatExt;
@@ -106,10 +107,11 @@ fn valid_annotation_key(key: &str) -> bool {
 }
 
 /// Validates the annotation tail (`[...]...`) of a Temporal string for
-/// PlainYearMonth: at most one *effective* calendar (which must be `iso8601`),
-/// no critical flag on any unknown annotation, and no multiple calendar
-/// annotations when any is critical.
-fn annotations_ok(s: &str) -> bool {
+/// PlainYearMonth: at most one time-zone annotation, no critical flag on any
+/// unknown annotation, and no multiple calendar annotations when any is
+/// critical. On success returns the raw first `[u-ca=…]` calendar value (if
+/// any) for the caller to canonicalize; `None` means the tail is malformed.
+fn annotations_calendar(s: &str) -> Option<Option<alloc::string::String>> {
     let b = s.as_bytes();
     let mut i = 0usize;
     let mut cal_count = 0u32;
@@ -118,7 +120,7 @@ fn annotations_ok(s: &str) -> bool {
     let mut first_cal: Option<alloc::string::String> = None;
     while i < b.len() {
         if b[i] != b'[' {
-            return false;
+            return None;
         }
         i += 1;
         let critical = b.get(i) == Some(&b'!');
@@ -130,7 +132,7 @@ fn annotations_ok(s: &str) -> bool {
             i += 1;
         }
         if i >= b.len() {
-            return false;
+            return None;
         }
         let content = &s[start..i];
         i += 1; // ']'
@@ -138,7 +140,7 @@ fn annotations_ok(s: &str) -> bool {
             let key = &content[..eq];
             let val = &content[eq + 1..];
             if !valid_annotation_key(key) {
-                return false;
+                return None;
             }
             if key == "u-ca" {
                 cal_count += 1;
@@ -149,7 +151,7 @@ fn annotations_ok(s: &str) -> bool {
                     first_cal = Some(val.to_ascii_lowercase());
                 }
             } else if critical {
-                return false;
+                return None;
             }
         } else {
             // A `=`-less annotation is a time-zone annotation.
@@ -157,9 +159,9 @@ fn annotations_ok(s: &str) -> bool {
         }
     }
     if tz_count >= 2 || (cal_count >= 2 && cal_critical) {
-        return false;
+        return None;
     }
-    !matches!(first_cal, Some(c) if c != "iso8601")
+    Some(first_cal)
 }
 
 /// Parses a year-month-only string (`[±]YYYY[YY] -? MM`) fully.
@@ -239,9 +241,11 @@ fn has_overlong_fraction(main: &str) -> bool {
     false
 }
 
-/// Parses a Temporal PlainYearMonth string into `(year, month)`. `None` if
-/// malformed (does not range-check limits — the caller does).
-fn parse_temporal_year_month(s: &str) -> Option<(i32, u8)> {
+/// Parses a Temporal PlainYearMonth string into `(year, month, calendar)`, where
+/// `calendar` is the raw first `[u-ca=…]` annotation value (or `None` for the
+/// ISO default). `None` if malformed (does not range-check limits, nor validate
+/// that the calendar id is supported — the caller does).
+fn parse_temporal_year_month(s: &str) -> Option<(i32, u8, Option<alloc::string::String>)> {
     // A non-ASCII minus sign (U+2212) is not accepted anywhere.
     if s.contains('\u{2212}') {
         return None;
@@ -250,7 +254,8 @@ fn parse_temporal_year_month(s: &str) -> Option<(i32, u8)> {
         Some(idx) => (&s[..idx], &s[idx..]),
         None => (s, ""),
     };
-    if !annotations_ok(ann) || has_overlong_fraction(main) {
+    let cal = annotations_calendar(ann)?;
+    if has_overlong_fraction(main) {
         return None;
     }
     // A full date/date-time string carries a day; extract its year+month. A
@@ -262,9 +267,16 @@ fn parse_temporal_year_month(s: &str) -> Option<(i32, u8)> {
         if p.z || (p.offset_ns.is_some() && p.time.is_none()) {
             return None;
         }
-        return Some((d.year, d.month));
+        return Some((d.year, d.month, cal));
     }
-    parse_ym_only(main)
+    // A bare year-month form (`DateSpecYearMonth`, no day) admits only the ISO
+    // calendar: a non-ISO calendar annotation requires the reference day, so it
+    // is only valid on a full calendar-date string.
+    let (y, m) = parse_ym_only(main)?;
+    if matches!(&cal, Some(c) if c != "iso8601") {
+        return None;
+    }
+    Some((y, m, cal))
 }
 
 /// Parses a rounding-mode string into a [`RoundMode`].
@@ -336,50 +348,55 @@ impl<'a> Interp<'a> {
             .and_then(|h| self.realm.string_value(h))
     }
 
-    /// `CanonicalizeCalendar` for the *constructor* form: only a bare calendar id
-    /// is accepted (an ISO date string is NOT a valid calendar here).
-    fn canonicalize_calendar_strict(&mut self, v: NanBox) -> Result<(), ExecError> {
-        if Self::is_undef(v) {
-            return Ok(());
-        }
-        let Some(s) = self.as_string_value(v) else {
-            return Err(self.type_error("PlainYearMonth: calendar must be a string"));
-        };
-        if s.eq_ignore_ascii_case("iso8601") {
-            Ok(())
-        } else {
-            Err(self.pym_range("PlainYearMonth: unknown calendar"))
+    /// Canonicalizes a calendar identifier string against the full Temporal
+    /// calendar set (CLDR aliases, ASCII-case-insensitively). An unsupported id
+    /// is a RangeError.
+    fn pym_canonicalize_calendar(&mut self, s: &str) -> Result<alloc::string::String, ExecError> {
+        match tcal::canonicalize_calendar(s) {
+            Some(c) => Ok(alloc::string::String::from(c)),
+            None => Err(self.pym_range(&alloc::format!("PlainYearMonth: unknown calendar '{s}'"))),
         }
     }
 
-    /// `ToTemporalCalendarIdentifier` for the property-bag form: a bare id or an
-    /// ISO string (whose calendar annotation, if any, must be `iso8601`).
-    fn calendar_identifier(&mut self, v: NanBox) -> Result<(), ExecError> {
+    /// `CanonicalizeCalendar` for the *constructor* form: only a bare calendar id
+    /// is accepted (an ISO date string is NOT a valid calendar here). Returns the
+    /// canonical id (default `"iso8601"`).
+    fn canonicalize_calendar_strict(
+        &mut self,
+        v: NanBox,
+    ) -> Result<alloc::string::String, ExecError> {
         if Self::is_undef(v) {
-            return Ok(());
-        }
-        // A *calendared* Temporal object supplies its own calendar (iso8601) via
-        // the fast path; non-calendared objects (`{}`, `Duration`, …) are invalid.
-        if let Some(cal) = self.temporal_object_calendar(v) {
-            return if cal.eq_ignore_ascii_case("iso8601") {
-                Ok(())
-            } else {
-                Err(self.pym_range("PlainYearMonth: unknown calendar"))
-            };
+            return Ok(alloc::string::String::from("iso8601"));
         }
         let Some(s) = self.as_string_value(v) else {
             return Err(self.type_error("PlainYearMonth: calendar must be a string"));
         };
-        if s.eq_ignore_ascii_case("iso8601") {
-            return Ok(());
+        self.pym_canonicalize_calendar(&s)
+    }
+
+    /// `ToTemporalCalendarIdentifier` for the property-bag form: a bare id, a
+    /// calendared Temporal object, or an ISO string whose `[u-ca=…]` annotation
+    /// supplies the calendar. Returns the canonical id (default `"iso8601"`).
+    fn calendar_identifier(&mut self, v: NanBox) -> Result<alloc::string::String, ExecError> {
+        if Self::is_undef(v) {
+            return Ok(alloc::string::String::from("iso8601"));
         }
-        if let Some(idx) = s.find("[u-ca=") {
-            let rest = &s[idx + 6..];
-            let val = rest.split(']').next().unwrap_or("");
-            return if val.eq_ignore_ascii_case("iso8601") {
-                Ok(())
-            } else {
-                Err(self.pym_range("PlainYearMonth: unknown calendar"))
+        // A *calendared* Temporal object supplies its own calendar id.
+        if let Some(cal) = self.temporal_object_calendar(v) {
+            return self.pym_canonicalize_calendar(&cal);
+        }
+        let Some(s) = self.as_string_value(v) else {
+            return Err(self.type_error("PlainYearMonth: calendar must be a string"));
+        };
+        // A bare calendar identifier wins.
+        if let Some(c) = tcal::canonicalize_calendar(&s) {
+            return Ok(alloc::string::String::from(c));
+        }
+        // Otherwise it must be a valid ISO string carrying a calendar annotation.
+        if let Some((_, _, cal)) = parse_temporal_year_month(&s) {
+            return match cal {
+                Some(c) => self.pym_canonicalize_calendar(&c),
+                None => Ok(alloc::string::String::from("iso8601")),
             };
         }
         // A negative-zero extended year is not a valid ISO string.
@@ -390,17 +407,19 @@ impl<'a> Interp<'a> {
         if matches!(first, Some(b) if b.is_ascii_digit() || b == b'+' || b == b'-')
             || s.starts_with('T')
         {
-            Ok(())
+            Ok(alloc::string::String::from("iso8601"))
         } else {
             Err(self.pym_range("PlainYearMonth: unknown calendar"))
         }
     }
 
-    /// Builds a PlainYearMonth instance linked to the intrinsic prototype.
-    fn new_year_month(&mut self, date: IsoDate) -> NanBox {
+    /// Builds a PlainYearMonth instance carrying calendar id `cal`, linked to the
+    /// intrinsic prototype.
+    fn new_year_month(&mut self, date: IsoDate, cal: &str) -> NanBox {
         let data = TemporalData {
             kind: TemporalKind::PlainYearMonth,
             date,
+            calendar: alloc::string::String::from(cal),
             ..Default::default()
         };
         let h = self.realm.new_temporal(data);
@@ -410,10 +429,11 @@ impl<'a> Interp<'a> {
         NanBox::handle(h.to_raw())
     }
 
-    fn new_plain_date(&mut self, date: IsoDate) -> NanBox {
+    fn new_plain_date(&mut self, date: IsoDate, cal: &str) -> NanBox {
         let data = TemporalData {
             kind: TemporalKind::PlainDate,
             date,
+            calendar: alloc::string::String::from(cal),
             ..Default::default()
         };
         let h = self.realm.new_temporal(data);
@@ -540,20 +560,100 @@ impl<'a> Interp<'a> {
         })
     }
 
-    /// Reads and coerces the year/month/monthCode fields off a property bag in
-    /// spec order (calendar, month, monthCode, year).
-    fn read_year_month_fields(
+    /// `CalendarYearMonthFromFields` for a *non-ISO* calendar: resolves the field
+    /// input to a reference `IsoDate` (calendar day 1), mapping the layer's error
+    /// to the right exception, then range-checks the result.
+    fn resolve_year_month_cal(
+        &mut self,
+        cal: &str,
+        mut input: tcal::FieldsInput,
+        overflow: Overflow,
+    ) -> Result<IsoDate, ExecError> {
+        // The reference day is the first day of the calendar month.
+        input.day = 1;
+        let date = match tcal::fields_to_iso(cal, &input, overflow) {
+            Ok(d) => d,
+            Err(tcal::CalError::Range(m)) => return Err(self.pym_range(&m)),
+            Err(tcal::CalError::MissingFields(m)) => return Err(self.type_error(&m)),
+        };
+        if !ym_within_limits(i64::from(date.year), i64::from(date.month)) {
+            return Err(self.pym_range("PlainYearMonth: out of range"));
+        }
+        Ok(date)
+    }
+
+    /// Reads and coerces the `era`/`eraYear`/`month`/`monthCode`/`year` fields off a
+    /// property bag for a non-ISO calendar (alphabetical order), returning a
+    /// [`tcal::FieldsInput`] (with the raw monthCode string — the layer judges its
+    /// suitability). At least one recognised field must be present when `require`.
+    fn read_year_month_fields_cal(
         &mut self,
         h: Handle,
-        read_calendar: bool,
-    ) -> Result<YearMonthFields, ExecError> {
-        // `with` reads (and rejects) the calendar in its own preceding step, so it
-        // must not be read again here (observable order).
-        if read_calendar {
-            let cal = self.pym_get(h, "calendar")?;
-            self.calendar_identifier(cal)?;
+        require: bool,
+    ) -> Result<tcal::FieldsInput, ExecError> {
+        let era_v = self.pym_get(h, "era")?;
+        let era = if Self::is_undef(era_v) {
+            None
+        } else {
+            Some(self.coerce_to_string(era_v)?)
+        };
+        let era_year_v = self.pym_get(h, "eraYear")?;
+        let era_year = if Self::is_undef(era_year_v) {
+            None
+        } else {
+            Some(self.pym_to_integer(era_year_v)?)
+        };
+        let month_v = self.pym_get(h, "month")?;
+        let month = if Self::is_undef(month_v) {
+            None
+        } else {
+            let m = self.pym_to_integer(month_v)?;
+            if m < 1 {
+                return Err(self.pym_range("PlainYearMonth: month must be positive"));
+            }
+            Some(m)
+        };
+        let mc_v = self.pym_get(h, "monthCode")?;
+        let month_code = if Self::is_undef(mc_v) {
+            None
+        } else {
+            let prim = self.coerce_primitive(mc_v, "string")?;
+            let Some(s) = self.as_string_value(prim) else {
+                return Err(self.type_error("PlainYearMonth: monthCode must be a string"));
+            };
+            if parse_month_code_syntax(&s).is_none() {
+                return Err(self.pym_range("PlainYearMonth: malformed monthCode"));
+            }
+            Some(s)
+        };
+        let year_v = self.pym_get(h, "year")?;
+        let year = if Self::is_undef(year_v) {
+            None
+        } else {
+            Some(self.pym_to_integer(year_v)?)
+        };
+        if require
+            && year.is_none()
+            && month.is_none()
+            && month_code.is_none()
+            && era.is_none()
+            && era_year.is_none()
+        {
+            return Err(self.type_error("PlainYearMonth: no recognised fields"));
         }
+        Ok(tcal::FieldsInput {
+            era,
+            era_year,
+            year,
+            month,
+            month_code,
+            day: 1,
+        })
+    }
 
+    /// Reads and coerces the year/month/monthCode fields off a property bag in
+    /// spec order (month, monthCode, year); the calendar is read by the caller.
+    fn read_year_month_fields(&mut self, h: Handle) -> Result<YearMonthFields, ExecError> {
         let month_v = self.pym_get(h, "month")?;
         let month = if Self::is_undef(month_v) {
             None
@@ -593,8 +693,12 @@ impl<'a> Interp<'a> {
     }
 
     /// `ToTemporalYearMonth`: cast an arbitrary value (instance / property bag /
-    /// string) to a reference `IsoDate`.
-    fn cast_year_month(&mut self, v: NanBox, options: NanBox) -> Result<IsoDate, ExecError> {
+    /// string) to a reference `(IsoDate, calendarId)`.
+    fn cast_year_month(
+        &mut self,
+        v: NanBox,
+        options: NanBox,
+    ) -> Result<(IsoDate, alloc::string::String), ExecError> {
         if self.is_object_value(v) {
             let h = v.as_handle().map(Handle::from_raw).unwrap();
             // A PlainYearMonth instance is copied (only options are read).
@@ -603,31 +707,70 @@ impl<'a> Interp<'a> {
             {
                 let opts = self.pym_options(options)?;
                 self.pym_overflow(opts)?;
-                return Ok(data.date);
+                return Ok((data.date, data.calendar.clone()));
             }
-            let (year, month, mc) = self.read_year_month_fields(h, true)?;
+            // The `calendar` field is read + canonicalized first.
+            let cal_v = self.pym_get(h, "calendar")?;
+            let calendar = self.calendar_identifier(cal_v)?;
+            if tcal::is_iso(&calendar) {
+                let (year, month, mc) = self.read_year_month_fields(h)?;
+                let opts = self.pym_options(options)?;
+                let overflow = self.pym_overflow(opts)?;
+                let date = self.resolve_year_month(year, month, mc, overflow)?;
+                return Ok((date, calendar));
+            }
+            let input = self.read_year_month_fields_cal(h, false)?;
             let opts = self.pym_options(options)?;
             let overflow = self.pym_overflow(opts)?;
-            return self.resolve_year_month(year, month, mc, overflow);
+            let date = self.resolve_year_month_cal(&calendar, input, overflow)?;
+            return Ok((date, calendar));
         }
         // A string is parsed; any other primitive is a TypeError. The string is
         // parsed *before* the overflow option is read (spec order).
         let Some(s) = self.as_string_value(v) else {
             return Err(self.type_error("PlainYearMonth: expected an object or string"));
         };
-        let Some((year, month)) = parse_temporal_year_month(&s) else {
+        let Some((year, month, cal_ann)) = parse_temporal_year_month(&s) else {
             return Err(self.pym_range("PlainYearMonth: invalid string"));
         };
         if !ym_within_limits(i64::from(year), i64::from(month)) {
             return Err(self.pym_range("PlainYearMonth: out of range"));
         }
+        // Canonicalize the calendar (may RangeError) before reading overflow.
+        let calendar = match cal_ann {
+            Some(c) => self.pym_canonicalize_calendar(&c)?,
+            None => alloc::string::String::from("iso8601"),
+        };
         let opts = self.pym_options(options)?;
         self.pym_overflow(opts)?;
-        Ok(IsoDate {
-            year,
-            month,
+        if tcal::is_iso(&calendar) {
+            return Ok((
+                IsoDate {
+                    year,
+                    month,
+                    day: 1,
+                },
+                calendar,
+            ));
+        }
+        // Re-anchor the parsed ISO reference (day 1) to the calendar's canonical
+        // reference day for that calendar month.
+        let f = tcal::iso_to_fields(
+            &calendar,
+            IsoDate {
+                year,
+                month,
+                day: 1,
+            },
+        );
+        let input = tcal::FieldsInput {
+            year: Some(f.year),
+            month_code: Some(f.month_code),
             day: 1,
-        })
+            ..Default::default()
+        };
+        let date = self.resolve_year_month_cal(&calendar, input, Overflow::Constrain)?;
+        Ok((date, calendar))
     }
 
     // -- duration reading (for add/subtract) --------------------------------
@@ -709,7 +852,7 @@ impl<'a> Interp<'a> {
         let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
         let year = self.pym_to_integer(arg(0))?;
         let month = self.pym_to_integer(arg(1))?;
-        self.canonicalize_calendar_strict(arg(2))?;
+        let calendar = self.canonicalize_calendar_strict(arg(2))?;
         let ref_day = if Self::is_undef(arg(3)) {
             1
         } else {
@@ -725,6 +868,7 @@ impl<'a> Interp<'a> {
         let data = TemporalData {
             kind: TemporalKind::PlainYearMonth,
             date,
+            calendar,
             ..Default::default()
         };
         self.finish_temporal(data, new_target, callee)
@@ -747,8 +891,8 @@ impl<'a> Interp<'a> {
             "until" => self.pym_diff(data, arg(0), arg(1), false),
             "since" => self.pym_diff(data, arg(0), arg(1), true),
             "equals" => {
-                let other = self.cast_year_month(arg(0), NanBox::undefined())?;
-                Ok(NanBox::boolean(other == data.date))
+                let (other, ocal) = self.cast_year_month(arg(0), NanBox::undefined())?;
+                Ok(NanBox::boolean(other == data.date && ocal == data.calendar))
             }
             "toPlainDate" => self.pym_to_plain_date(data, arg(0)),
             "toString" => {
@@ -799,7 +943,11 @@ impl<'a> Interp<'a> {
         if !Self::is_undef(tz) {
             return Err(self.type_error("PlainYearMonth.with: unexpected timeZone field"));
         }
-        let (in_year, in_month, in_mc) = self.read_year_month_fields(h, false)?;
+        let cal = data.calendar.clone();
+        if !tcal::is_iso(&cal) {
+            return self.pym_with_cal(data.date, &cal, h, options);
+        }
+        let (in_year, in_month, in_mc) = self.read_year_month_fields(h)?;
         // At least one recognised field is required (`IsPartialTemporalObject`).
         if in_year.is_none() && in_month.is_none() && in_mc.is_none() {
             return Err(self.type_error("PlainYearMonth.with: no recognised fields"));
@@ -815,7 +963,48 @@ impl<'a> Interp<'a> {
             (Some(i64::from(data.date.month)), None)
         };
         let date = self.resolve_year_month(year, month, mc, overflow)?;
-        Ok(self.new_year_month(date))
+        Ok(self.new_year_month(date, &cal))
+    }
+
+    /// The non-ISO `with` path: merges the provided calendar fields over the
+    /// receiver's existing calendar fields and re-derives the reference ISO date
+    /// through the layer.
+    fn pym_with_cal(
+        &mut self,
+        date: IsoDate,
+        cal: &str,
+        h: Handle,
+        options: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let existing = tcal::iso_to_fields(cal, date);
+        let provided = self.read_year_month_fields_cal(h, true)?;
+        let opts = self.pym_options(options)?;
+        let overflow = self.pym_overflow(opts)?;
+
+        // Merge: an explicit year (or era+eraYear) wins; otherwise keep the
+        // receiver's year. Likewise for month (prefer monthCode to preserve leap
+        // months).
+        let (year, era, era_year) =
+            if provided.year.is_some() || (provided.era.is_some() && provided.era_year.is_some()) {
+                (provided.year, provided.era, provided.era_year)
+            } else {
+                (Some(existing.year), None, None)
+            };
+        let (month, month_code) = if provided.month.is_some() || provided.month_code.is_some() {
+            (provided.month, provided.month_code)
+        } else {
+            (None, Some(existing.month_code.clone()))
+        };
+        let input = tcal::FieldsInput {
+            era,
+            era_year,
+            year,
+            month,
+            month_code,
+            day: 1,
+        };
+        let result = self.resolve_year_month_cal(cal, input, overflow)?;
+        Ok(self.new_year_month(result, cal))
     }
 
     fn pym_add_sub(
@@ -864,11 +1053,14 @@ impl<'a> Interp<'a> {
         if !ym_within_limits(result_year, result_month) {
             return Err(self.pym_range("PlainYearMonth: result out of range"));
         }
-        Ok(self.new_year_month(IsoDate {
-            year: result_year as i32,
-            month: result_month as u8,
-            day: 1,
-        }))
+        Ok(self.new_year_month(
+            IsoDate {
+                year: result_year as i32,
+                month: result_month as u8,
+                day: 1,
+            },
+            &data.calendar,
+        ))
     }
 
     fn pym_diff(
@@ -878,7 +1070,11 @@ impl<'a> Interp<'a> {
         options: NanBox,
         since: bool,
     ) -> Result<NanBox, ExecError> {
-        let other = self.cast_year_month(arg, NanBox::undefined())?;
+        let (other, ocal) = self.cast_year_month(arg, NanBox::undefined())?;
+        // The two year-months must share a calendar (`CalendarEquals`).
+        if ocal != data.calendar {
+            return Err(self.pym_range("PlainYearMonth: cannot compare across calendars"));
+        }
         let opts = self.pym_options(options)?;
 
         // GetDifferenceSettings reads *all* option properties (largestUnit,
@@ -1018,13 +1214,31 @@ impl<'a> Interp<'a> {
             return Err(self.type_error("PlainYearMonth.toPlainDate: missing 'day'"));
         }
         let day = self.pym_to_integer(day_v)?;
-        let Some(date) = regulate_iso_date(
-            data.date.year,
-            i64::from(data.date.month),
-            day,
-            Overflow::Constrain,
-        ) else {
-            return Err(self.pym_range("PlainYearMonth.toPlainDate: invalid date"));
+        let cal = data.calendar.as_str();
+        let date = if tcal::is_iso(cal) {
+            let Some(date) = regulate_iso_date(
+                data.date.year,
+                i64::from(data.date.month),
+                day,
+                Overflow::Constrain,
+            ) else {
+                return Err(self.pym_range("PlainYearMonth.toPlainDate: invalid date"));
+            };
+            date
+        } else {
+            // Combine the year-month's calendar year+monthCode with the given day.
+            let f = tcal::iso_to_fields(cal, data.date);
+            let input = tcal::FieldsInput {
+                year: Some(f.year),
+                month_code: Some(f.month_code),
+                day,
+                ..Default::default()
+            };
+            match tcal::fields_to_iso(cal, &input, Overflow::Constrain) {
+                Ok(d) => d,
+                Err(tcal::CalError::Range(m)) => return Err(self.pym_range(&m)),
+                Err(tcal::CalError::MissingFields(m)) => return Err(self.type_error(&m)),
+            }
         };
         // `ISODateWithinLimits` for a *PlainDate*: epoch days in `[MIN-1, MAX]`
         // (unlike `iso_date_in_range`, a PlainDate may not sit one day past MAX).
@@ -1032,24 +1246,30 @@ impl<'a> Interp<'a> {
         if !(MIN_EPOCH_DAYS - 1..=MAX_EPOCH_DAYS).contains(&ed) {
             return Err(self.pym_range("PlainYearMonth.toPlainDate: date out of range"));
         }
-        Ok(self.new_plain_date(date))
+        Ok(self.new_plain_date(date, cal))
     }
 
     fn pym_to_string(&mut self, data: &TemporalData, show: &str) -> alloc::string::String {
+        let cal = data.calendar.as_str();
+        let is_iso = tcal::is_iso(cal);
         let mut out = alloc::format!(
             "{}-{}",
             format_iso_year(data.date.year),
             pad(u64::from(data.date.month), 2)
         );
+        // The reference day is appended whenever the calendar annotation is
+        // forced (`always`/`critical`) or the calendar is non-ISO.
+        if matches!(show, "always" | "critical") || !is_iso {
+            out.push('-');
+            out.push_str(&pad(u64::from(data.date.day), 2));
+        }
+        // `FormatCalendarAnnotation`.
         match show {
-            "always" => out.push_str(&alloc::format!(
-                "-{}[u-ca=iso8601]",
-                pad(u64::from(data.date.day), 2)
-            )),
-            "critical" => out.push_str(&alloc::format!(
-                "-{}[!u-ca=iso8601]",
-                pad(u64::from(data.date.day), 2)
-            )),
+            "never" => {}
+            "always" => out.push_str(&alloc::format!("[u-ca={cal}]")),
+            "critical" => out.push_str(&alloc::format!("[!u-ca={cal}]")),
+            // "auto"
+            _ if !is_iso => out.push_str(&alloc::format!("[u-ca={cal}]")),
             _ => {}
         }
         out
@@ -1064,19 +1284,47 @@ impl<'a> Interp<'a> {
         name: &str,
     ) -> Result<NanBox, ExecError> {
         let d = data.date;
+        let cal = data.calendar.as_str();
+        if name == "calendarId" {
+            return Ok(self.new_str(cal));
+        }
+        // ISO-8601 fast path — byte-for-byte the original computation.
+        if tcal::is_iso(cal) {
+            return Ok(match name {
+                "year" => NanBox::number(f64::from(d.year)),
+                "month" => NanBox::number(f64::from(d.month)),
+                "monthCode" => {
+                    let s = month_code(d.month);
+                    self.new_str(&s)
+                }
+                "daysInMonth" => NanBox::number(f64::from(iso_days_in_month(d.year, d.month))),
+                "daysInYear" => NanBox::number(f64::from(iso_days_in_year(d.year))),
+                "monthsInYear" => NanBox::number(12.0),
+                "inLeapYear" => NanBox::boolean(is_leap_year(d.year)),
+                "era" | "eraYear" => NanBox::undefined(),
+                _ => {
+                    return Err(self.temporal_todo(&alloc::format!("PlainYearMonth getter {name}")));
+                }
+            });
+        }
+        // Non-ISO calendar: route through the calendar abstraction layer.
+        let f = tcal::iso_to_fields(cal, d);
         Ok(match name {
-            "year" => NanBox::number(f64::from(d.year)),
-            "month" => NanBox::number(f64::from(d.month)),
-            "monthCode" => {
-                let s = month_code(d.month);
-                self.new_str(&s)
-            }
-            "calendarId" => self.new_str("iso8601"),
-            "daysInMonth" => NanBox::number(f64::from(iso_days_in_month(d.year, d.month))),
-            "daysInYear" => NanBox::number(f64::from(iso_days_in_year(d.year))),
-            "monthsInYear" => NanBox::number(12.0),
-            "inLeapYear" => NanBox::boolean(is_leap_year(d.year)),
-            "era" | "eraYear" => NanBox::undefined(),
+            "era" => match &f.era {
+                Some(e) => self.new_str(e),
+                None => NanBox::undefined(),
+            },
+            "eraYear" => match f.era_year {
+                Some(y) => NanBox::number(y as f64),
+                None => NanBox::undefined(),
+            },
+            "year" => NanBox::number(f.year as f64),
+            "month" => NanBox::number(f.month as f64),
+            "monthCode" => self.new_str(&f.month_code),
+            "daysInMonth" => NanBox::number(tcal::days_in_month(cal, d) as f64),
+            "daysInYear" => NanBox::number(tcal::days_in_year(cal, d) as f64),
+            "monthsInYear" => NanBox::number(tcal::months_in_year(cal, d) as f64),
+            "inLeapYear" => NanBox::boolean(tcal::in_leap_year(cal, d)),
             _ => return Err(self.temporal_todo(&alloc::format!("PlainYearMonth getter {name}"))),
         })
     }
@@ -1092,12 +1340,12 @@ impl<'a> Interp<'a> {
         let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
         match method {
             "from" => {
-                let date = self.cast_year_month(arg(0), arg(1))?;
-                Ok(Some(self.new_year_month(date)))
+                let (date, cal) = self.cast_year_month(arg(0), arg(1))?;
+                Ok(Some(self.new_year_month(date, &cal)))
             }
             "compare" => {
-                let a = self.cast_year_month(arg(0), NanBox::undefined())?;
-                let b = self.cast_year_month(arg(1), NanBox::undefined())?;
+                let (a, _) = self.cast_year_month(arg(0), NanBox::undefined())?;
+                let (b, _) = self.cast_year_month(arg(1), NanBox::undefined())?;
                 let n = match crate::temporal_iso::compare_iso_date(a, b) {
                     core::cmp::Ordering::Less => -1.0,
                     core::cmp::Ordering::Equal => 0.0,
