@@ -284,14 +284,17 @@ impl<'a> Interp<'a> {
         data: crate::temporal_iso::TemporalData,
         new_target: NanBox,
         callee: NanBox,
-    ) -> NanBox {
+    ) -> Result<NanBox, ExecError> {
         let kind = data.kind;
         let h = self.realm.new_temporal(data);
         let default = self.temporal_proto(kind);
-        if let Some(proto) = self.instance_proto(new_target, callee, default) {
+        // `GetPrototypeFromConstructor(newTarget, …)` performs `Get(newTarget,
+        // "prototype")`, so a throwing `prototype` accessor on a `Reflect.construct`
+        // / subclass newTarget propagates rather than being silently dropped.
+        if let Some(proto) = self.instance_proto_checked(new_target, callee, default)? {
             self.realm.set_native_proto(h, proto);
         }
-        NanBox::handle(h.to_raw())
+        Ok(NanBox::handle(h.to_raw()))
     }
 
     /// Routes `new Temporal.<kind>(...)` to the per-type constructor logic.

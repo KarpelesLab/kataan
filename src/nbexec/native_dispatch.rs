@@ -1589,12 +1589,24 @@ impl<'a> Interp<'a> {
                 if let Some(raw) = arg(0).as_handle() {
                     let h = Handle::from_raw(raw);
                     // All own symbol keys, including non-enumerable ones (e.g. a
-                    // symbol defined via `Object.defineProperty`).
-                    for k in self.realm.object_all_keys(h) {
+                    // symbol defined via `Object.defineProperty`). Symbol keys on a
+                    // genuine object cell live in `object_all_keys`; on a non-object
+                    // exotic (array, RegExp, function) they live in the auxiliary
+                    // object, so consult both (a cell has at most one, so no
+                    // duplication) — otherwise a symbol on an array/RegExp is dropped.
+                    let mut seen: Vec<u64> = Vec::new();
+                    for k in self
+                        .realm
+                        .object_all_keys(h)
+                        .into_iter()
+                        .chain(self.realm.aux_all_keys(h))
+                    {
                         if let Some(idstr) = k.strip_prefix("\u{0}sym:")
                             && let Ok(id) = idstr.parse::<u64>()
+                            && !seen.contains(&id)
                             && let Some(sh) = self.realm.symbol_for_id(id)
                         {
+                            seen.push(id);
                             syms.push(NanBox::handle(sh.to_raw()));
                         }
                     }

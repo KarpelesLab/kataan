@@ -494,7 +494,7 @@ impl<'a> Interp<'a> {
             tz: Some(tz),
             ..Default::default()
         };
-        Ok(self.finish_temporal(data, new_target, callee))
+        self.finish_temporal(data, new_target, callee)
     }
 
     /// Parses a *bare* time-zone identifier (offset or IANA name) → canonical id.

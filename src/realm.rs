@@ -1852,6 +1852,43 @@ impl Realm {
             }
             return Some(names);
         }
+        // A RegExp instance's own keys: its integer-index aux keys (ascending), then
+        // the own data property `lastIndex` (present on every RegExp — synthesized
+        // from the compact cell field unless materialized into the aux object), then
+        // any aux-stored named properties (`re.foo = …`) in insertion order.
+        if matches!(self.heap.get(handle), Some(Cell::RegExp { .. })) {
+            let mut index_keys: Vec<u32> = Vec::new();
+            let mut named: Vec<alloc::string::String> = Vec::new();
+            if let Some(aux) = self
+                .aux_props
+                .get(&handle.to_raw())
+                .and_then(|h| self.heap.get(*h))
+                .and_then(Cell::as_object)
+            {
+                for k in aux
+                    .ordered_keys()
+                    .iter()
+                    .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
+                {
+                    if let Ok(n) = k.parse::<u32>()
+                        && n != u32::MAX
+                        && alloc::format!("{n}") == **k
+                    {
+                        index_keys.push(n);
+                    } else if *k != "lastIndex" {
+                        // `lastIndex` is emitted once, in its fixed first-string-key
+                        // position, even if materialized into the aux object.
+                        named.push(alloc::string::String::from(*k));
+                    }
+                }
+            }
+            index_keys.sort_unstable();
+            let mut names: Vec<alloc::string::String> =
+                index_keys.iter().map(|i| alloc::format!("{i}")).collect();
+            names.push(alloc::string::String::from("lastIndex"));
+            names.extend(named);
+            return Some(names);
+        }
         // A native / bound-native / VM-function cell keeps its own named properties
         // (e.g. a built-in function's `name`/`length`) in its auxiliary object.
         if matches!(

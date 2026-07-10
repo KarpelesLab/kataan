@@ -1893,45 +1893,10 @@ impl<'a> Interp<'a> {
         result
     }
 
-    /// `GetPrototypeFromConstructor(newTarget, default)` / the prototype half of
-    /// `OrdinaryCreateFromConstructor`: the `[[Prototype]]` for a freshly built
-    /// built-in instance. `new_target` is the original constructor for a plain
-    /// `new C()`, the subclass for `new Subclass()` (via `super()`), or the
-    /// explicit 3rd argument of `Reflect.construct`. When `new_target` is an
-    /// object with an object `prototype`, that prototype is used; otherwise the
-    /// intrinsic `default_proto` (the constructor's own `.prototype`).
-    ///
-    /// `callee` is the constructor actually invoked; when `new_target` is the same
-    /// callee (the common `new C()` case) the default is returned without a
-    /// redundant `prototype` read.
-    pub(crate) fn instance_proto(
-        &mut self,
-        new_target: NanBox,
-        callee: NanBox,
-        default_proto: Option<Handle>,
-    ) -> Option<Handle> {
-        // A `new.target` distinct from the callee (a subclass via `super()` or a
-        // `Reflect.construct` newTarget) supplies the instance prototype from its
-        // own `.prototype` — when that is an object.
-        if new_target.as_handle().is_some()
-            && new_target.as_handle() != callee.as_handle()
-            && let Some(nt) = new_target.as_handle().map(Handle::from_raw)
-        {
-            if let Some(p) = self.newtarget_object_proto(nt) {
-                return Some(p);
-            }
-            // `newTarget.prototype` is not an Object → the intrinsic default comes
-            // from `GetFunctionRealm(newTarget)` (spec step 4), which matters when
-            // `newTarget` is a cross-realm constructor.
-            return self.realm_default_proto(default_proto, nt);
-        }
-        default_proto
-    }
-
     /// `GetPrototypeFromConstructor(newTarget, default)` performed spec-correctly —
     /// invoking an own `prototype` *accessor* on `new_target` and propagating an
-    /// abrupt getter (unlike [`Self::instance_proto`], which reads the stored value
-    /// via `get_property` and cannot observe a throw). Used where the spec must
+    /// abrupt getter — unlike a plain stored-value read via `get_property`, which
+    /// cannot observe a throw. Used where the spec must
     /// surface a throwing `prototype` getter (built-in constructors driven by
     /// `Reflect.construct` / a subclass `super()`). Falls back to `default` when
     /// `new_target` equals the callee, or its `prototype` is a non-object.
@@ -1988,36 +1953,6 @@ impl<'a> Interp<'a> {
     ) -> Result<Option<Handle>, ExecError> {
         let default = self.realm.intl_prototype(ctor_id);
         self.instance_proto_checked(native_new_target, callee, default)
-    }
-
-    /// `GetPrototypeFromConstructor(newTarget, defaultProto)`'s prototype lookup:
-    /// the newTarget's `"prototype"` *only if it is an Object*, else `None` so the
-    /// caller substitutes the default intrinsic. Unlike `constructor_prototype`,
-    /// this does NOT fall back to a function's own default prototype when the
-    /// explicit `prototype` is a non-object (null/undefined/primitive) — that case
-    /// must use the intrinsic default per spec.
-    pub(crate) fn newtarget_object_proto(&mut self, nt: Handle) -> Option<Handle> {
-        if let Some((class_id, _)) = self.realm.class_at(nt) {
-            return Some(self.class_prototype_by_id(class_id));
-        }
-        match self.realm.get_property(nt, "prototype") {
-            // An explicit `prototype`: honor it only when it is an Object; a
-            // non-object (null / undefined / primitive) means the caller must fall
-            // back to the intrinsic default (GetPrototypeFromConstructor step 3).
-            Some(p) => {
-                if self.is_object_value(p) {
-                    p.as_handle().map(Handle::from_raw)
-                } else {
-                    None
-                }
-            }
-            // No stored `prototype`: an ordinary function's lazily-materialized
-            // default prototype object; anything else has no object prototype.
-            None => self
-                .realm
-                .function_at(nt)
-                .map(|(func_id, _)| self.realm.function_prototype(func_id)),
-        }
     }
 
     /// `GetFunctionRealm(func)` — the index (into `created_realms`) of the
@@ -2283,7 +2218,7 @@ impl<'a> Interp<'a> {
             if nt.as_handle() != callee.as_handle()
                 && !self.is_object_value(v)
                 && let Some(rh) = result.as_handle().map(Handle::from_raw)
-                && let Some(proto) = self.instance_proto(nt, callee, default)
+                && let Some(proto) = self.instance_proto_checked(nt, callee, default)?
             {
                 self.realm.set_object_proto(rh, Some(proto));
             }
@@ -2325,7 +2260,7 @@ impl<'a> Interp<'a> {
             let nt = self.reflect_new_target.unwrap_or(callee);
             let default = self.realm.array_proto_intrinsic();
             if nt.as_handle() != callee.as_handle()
-                && let Some(proto) = self.instance_proto(nt, callee, default)
+                && let Some(proto) = self.instance_proto_checked(nt, callee, default)?
             {
                 self.realm.set_object_proto(arr, Some(proto));
             }
@@ -2641,7 +2576,7 @@ impl<'a> Interp<'a> {
             // intrinsic `Date.prototype` — so `Object.getPrototypeOf(date)`,
             // `instanceof`, and `Date.prototype.isPrototypeOf(date)` resolve.
             let default = self.intrinsic_proto("Date");
-            if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
+            if let Some(proto) = self.instance_proto_checked(native_new_target, callee, default)? {
                 self.realm.set_native_proto(d, proto);
             }
             return Ok(NanBox::handle(d.to_raw()));
@@ -2704,7 +2639,7 @@ impl<'a> Interp<'a> {
             // A subclass (`class S extends RegExp {}` / `Reflect.construct`) links
             // the instance to `newTarget.prototype` instead of `RegExp.prototype`.
             let default = self.intrinsic_proto("RegExp");
-            if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
+            if let Some(proto) = self.instance_proto_checked(native_new_target, callee, default)? {
                 self.realm.set_native_proto(r, proto);
             }
             return Ok(NanBox::handle(r.to_raw()));
@@ -2797,7 +2732,7 @@ impl<'a> Interp<'a> {
             // so `instanceof`, `Object.getPrototypeOf`, and the brand-checking
             // `deref` / `[Symbol.toStringTag]` resolve.
             let default = self.intrinsic_proto("WeakRef");
-            if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
+            if let Some(proto) = self.instance_proto_checked(native_new_target, callee, default)? {
                 self.realm.set_object_proto(obj, Some(proto));
             }
             return Ok(NanBox::handle(obj.to_raw()));
@@ -2823,7 +2758,7 @@ impl<'a> Interp<'a> {
             self.realm
                 .set_hidden_property(obj, FINREG_CELLS, NanBox::handle(cells.to_raw()));
             let default = self.intrinsic_proto("FinalizationRegistry");
-            if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
+            if let Some(proto) = self.instance_proto_checked(native_new_target, callee, default)? {
                 self.realm.set_object_proto(obj, Some(proto));
             }
             return Ok(NanBox::handle(obj.to_raw()));
@@ -2847,7 +2782,9 @@ impl<'a> Interp<'a> {
             // realm's `%ArrayBuffer.prototype%` (GetPrototypeFromConstructor step 4).
             if native_new_target.as_handle() != callee.as_handle() {
                 let default = self.realm.object_proto(buf);
-                if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
+                if let Some(proto) =
+                    self.instance_proto_checked(native_new_target, callee, default)?
+                {
                     self.realm.set_object_proto(buf, Some(proto));
                 }
             }
@@ -3402,7 +3339,9 @@ impl<'a> Interp<'a> {
                 && let Some(wh) = wrapper.as_handle().map(Handle::from_raw)
             {
                 let default = self.realm.object_proto(wh);
-                if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
+                if let Some(proto) =
+                    self.instance_proto_checked(native_new_target, callee, default)?
+                {
                     self.realm.set_object_proto(wh, Some(proto));
                 }
             }
@@ -3452,7 +3391,7 @@ impl<'a> Interp<'a> {
             _ => "",
         };
         let default = self.intrinsic_proto(ctor_name);
-        if let Some(proto) = self.instance_proto(native_new_target, callee, default) {
+        if let Some(proto) = self.instance_proto_checked(native_new_target, callee, default)? {
             // A collection is a non-object cell: its `[[Prototype]]` link is kept
             // in the realm's native-proto table (read by `object_proto`). A subclass
             // (`class S extends Map {}` / `Reflect.construct`) links to

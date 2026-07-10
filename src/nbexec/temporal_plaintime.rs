@@ -591,7 +591,7 @@ impl<'a> Interp<'a> {
                     time,
                     ..Default::default()
                 };
-                Ok(self.finish_temporal(data, new_target, callee))
+                self.finish_temporal(data, new_target, callee)
             }
             None => Err(self.plaintime_range_error("Temporal.PlainTime: time out of range")),
         }

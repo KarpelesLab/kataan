@@ -577,7 +577,7 @@ impl<'a> Interp<'a> {
             duration: fields,
             ..Default::default()
         };
-        Ok(self.finish_temporal(data, new_target, callee))
+        self.finish_temporal(data, new_target, callee)
     }
 
     /// A `Temporal.Duration.prototype.<method>()` call.

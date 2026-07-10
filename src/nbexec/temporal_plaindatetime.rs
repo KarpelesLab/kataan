@@ -204,7 +204,7 @@ impl<'a> Interp<'a> {
             time,
             ..Default::default()
         };
-        Ok(self.finish_temporal(data, new_target, callee))
+        self.finish_temporal(data, new_target, callee)
     }
 
     /// A `Temporal.PlainDateTime.prototype.<method>()` call.

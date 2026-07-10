@@ -71,7 +71,7 @@ impl<'a> Interp<'a> {
             },
             ..Default::default()
         };
-        Ok(self.finish_temporal(data, new_target, callee))
+        self.finish_temporal(data, new_target, callee)
     }
 
     /// A `Temporal.PlainMonthDay.prototype.<method>()` call.

@@ -230,7 +230,7 @@ impl<'a> Interp<'a> {
             epoch_ns: epoch,
             ..Default::default()
         };
-        Ok(self.finish_temporal(data, new_target, callee))
+        self.finish_temporal(data, new_target, callee)
     }
 
     /// A `Temporal.Instant.prototype.<getter>` read.
