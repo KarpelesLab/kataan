@@ -9171,3 +9171,121 @@ fn for_await_over_sync_array_yields_in_order() {
         "a,b,c"
     );
 }
+
+#[test]
+fn resizable_length_tracking_view_tracks_buffer() {
+    // A view with no explicit length over a resizable buffer re-spans on resize;
+    // its `.length` follows the buffer's current byte length.
+    assert_eq!(
+        run(
+            "var rab=new ArrayBuffer(4,{maxByteLength:8}); var ta=new Uint8Array(rab); \
+             var a=ta.length; rab.resize(2); var b=ta.length; rab.resize(8); var c=ta.length; \
+             a+','+b+','+c"
+        ),
+        "4,2,8"
+    );
+    // `.resizable`/`.maxByteLength` reflect the resizable allocation.
+    assert_eq!(
+        run("var rab=new ArrayBuffer(4,{maxByteLength:8}); \
+             rab.resizable+','+rab.maxByteLength+','+(new ArrayBuffer(4)).resizable"),
+        "true,8,false"
+    );
+}
+
+#[test]
+fn resizable_out_of_bounds_fixed_view_reads_empty() {
+    // A fixed-length view whose resizable buffer shrinks below its extent is
+    // out of bounds: `.length` collapses to 0 and integer reads are undefined,
+    // then it becomes valid again when the buffer is grown back. The bytes past
+    // the shrink point were dropped, so on regrow they read back zero-filled.
+    assert_eq!(
+        run(
+            "var rab=new ArrayBuffer(4,{maxByteLength:8}); var ta=new Uint8Array(rab,0,4); \
+             ta[0]=1; ta[3]=9; rab.resize(2); \
+             var oob=ta.length+','+ta[0]+','+ta[3]; \
+             rab.resize(4); var back=ta.length+','+ta[0]+','+ta[3]; \
+             oob+'|'+back"
+        ),
+        "0,undefined,undefined|4,1,0"
+    );
+}
+
+#[test]
+fn resizable_fill_out_of_bounds_throws_typeerror() {
+    // `%TypedArray%.prototype.fill` re-validates after argument coercion: a
+    // `valueOf` that shrinks the buffer below a fixed-length view is a TypeError.
+    assert_eq!(
+        run(
+            "var rab=new ArrayBuffer(4,{maxByteLength:8}); var ta=new Uint8Array(rab,0,4); \
+             var evil={valueOf(){ rab.resize(2); return 3; }}; \
+             var e='no'; try { ta.fill(evil,1,2); } catch(x){ e=x.constructor.name; } e"
+        ),
+        "TypeError"
+    );
+    // A length-tracking view is not out of bounds on a plain shrink: no throw,
+    // and the write is clamped to the new (shorter) length.
+    assert_eq!(
+        run(
+            "var rab=new ArrayBuffer(4,{maxByteLength:8}); var ta=new Uint8Array(rab); \
+             var evil={valueOf(){ rab.resize(2); return 5; }}; \
+             ta.fill(evil); ta.length+':'+ta.join(',')"
+        ),
+        "2:5,5"
+    );
+}
+
+#[test]
+fn generic_array_fill_on_shrunk_typed_array_is_noop_not_throw() {
+    // The *generic* `Array.prototype.fill.call(ta)` runs the ordinary array-like
+    // algorithm: an out-of-bounds `Set` is a silent no-op, never a TypeError.
+    assert_eq!(
+        run(
+            "var rab=new ArrayBuffer(4,{maxByteLength:8}); var ta=new Uint8Array(rab,0,4); \
+             var evil={valueOf(){ rab.resize(2); return 3; }}; \
+             var e='no'; try { Array.prototype.fill.call(ta,evil,1,2); } catch(x){ e=x.constructor.name; } e"
+        ),
+        "no"
+    );
+}
+
+#[test]
+fn resizable_typed_iterator_throws_on_oob_and_latches_done() {
+    // Iterating a fixed-length view whose buffer shrinks out of bounds mid-loop
+    // throws a TypeError at the next step.
+    assert_eq!(
+        run(
+            "var rab=new ArrayBuffer(4,{maxByteLength:8}); var ta=new Uint8Array(rab,0,4); \
+             var e='no'; var seen=0; \
+             try { for (var v of ta) { seen++; if (seen===2) rab.resize(2); } } \
+             catch(x){ e=x.constructor.name; } seen+','+e"
+        ),
+        "2,TypeError"
+    );
+    // Once the cursor passes the current length the iterator is done and stays
+    // done even after the buffer grows back (length-tracking view).
+    assert_eq!(
+        run(
+            "var rab=new ArrayBuffer(3,{maxByteLength:5}); var ta=new Int8Array(rab); \
+             ta[0]=11; var it=ta.values(); var r0=it.next().value; \
+             rab.resize(0); var d1=it.next().done; rab.resize(5); var d2=it.next().done; \
+             r0+','+d1+','+d2"
+        ),
+        "11,true,true"
+    );
+}
+
+#[test]
+fn resizable_with_uses_original_length_and_current_index_bound() {
+    // `%TypedArray%.prototype.with` sizes the result from the pre-coercion length
+    // but validates the index against the current (post-coercion) length.
+    assert_eq!(
+        run(
+            "var rab=new ArrayBuffer(2,{maxByteLength:5}); var ta=new Int8Array(rab); \
+             ta[0]=11; ta[1]=22; \
+             var value={valueOf(){ rab.resize(5); return 123; }}; \
+             var r=ta.with(4,value); \
+             r.length+','+r.join(',')+'|'+ta.length"
+        ),
+        "2,11,22|5"
+    );
+}

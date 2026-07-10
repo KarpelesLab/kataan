@@ -225,8 +225,14 @@ impl<'a> Interp<'a> {
         }
         let vh = self.typed_array_create(ctor, items.len())?;
         self.guard_view_immutable(vh)?;
-        let nums = self.coerce_typed_elements(vh, items)?;
-        self.realm.typed_set_from_numbers(vh, 0, &nums);
+        // Step 6 is a per-element `Set(newObj, k, items[k], true)`: coercion and the
+        // write are **interleaved** and each `Set` re-validates the index against the
+        // live length. A `valueOf` that resizes the backing buffer between elements is
+        // thus observed — an out-of-bounds index at its own step is silently skipped
+        // (not written from a later, grown state).
+        for (k, item) in items.iter().enumerate() {
+            self.typed_array_set_index_coerced(vh, k, *item)?;
+        }
         Ok(NanBox::handle(vh.to_raw()))
     }
 
@@ -475,27 +481,6 @@ impl<'a> Interp<'a> {
     /// view operation, *before* argument coercion, so a poisoned `valueOf` is not
     /// observed when the write is forbidden. A non-view, or a view over a mutable
     /// buffer, passes.
-    pub(crate) fn coerce_typed_elements(
-        &mut self,
-        view: Handle,
-        items: &[NanBox],
-    ) -> Result<Vec<NanBox>, ExecError> {
-        let is_bigint = self
-            .realm
-            .typed_kind(view)
-            .is_some_and(crate::nbexec::is_bigint_kind);
-        let mut out = Vec::with_capacity(items.len());
-        for e in items {
-            out.push(if is_bigint {
-                let b = self.coerce_to_bigint(*e)?;
-                NanBox::handle(self.realm.new_bigint(b).to_raw())
-            } else {
-                self.coerce_to_number(*e)?
-            });
-        }
-        Ok(out)
-    }
-
     pub(crate) fn guard_view_immutable(&mut self, handle: Handle) -> Result<(), ExecError> {
         // A typed array exposes its buffer via `typed_array_object`; a `DataView`
         // stores it under `DATA_VIEW_BUF`.
@@ -584,10 +569,14 @@ impl<'a> Interp<'a> {
             return Err(self.type_error("constructor property is not an object"));
         } else {
             let ch = ctor.as_handle().map(Handle::from_raw).unwrap();
-            let is_default = self.realm.native_at(ch).is_some_and(|id| {
-                (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16)
-                    .contains(&id)
-            });
+            // The fast same-kind path applies only when `constructor` is the
+            // receiver's *own* kind constructor (e.g. a `Float64Array`'s
+            // `%Float64Array%`). A `constructor` overridden to a **different** built-in
+            // typed-array constructor must go through the species path so the result
+            // has that other kind (`Construct(C, «len»)`), not the receiver's.
+            let recv_kind = self.realm.typed_kind(recv).unwrap_or(0);
+            let is_default =
+                self.realm.native_at(ch) == Some(N_TYPED_ARRAY_BASE + recv_kind as u16);
             if is_default {
                 None
             } else {

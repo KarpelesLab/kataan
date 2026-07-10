@@ -3053,8 +3053,9 @@ impl<'a> Interp<'a> {
             self.realm
                 .set_hidden_property(obj, DATA_VIEW_OFF, NanBox::number(byte_off as f64));
             // An explicit byteLength (3rd arg) is honored; otherwise the view spans
-            // the rest of the buffer from `byteOffset`.
-            if let Some(len) = args.get(2)
+            // the rest of the buffer from `byteOffset` (a length-tracking DataView
+            // when the buffer is resizable).
+            let view_len = if let Some(len) = args.get(2)
                 && !matches!(len.unpack(), Unpacked::Undefined)
             {
                 // ToIndex(byteLength) (a Symbol / abrupt valueOf throws).
@@ -3070,16 +3071,37 @@ impl<'a> Interp<'a> {
                 }
                 self.realm
                     .set_hidden_property(obj, DATA_VIEW_LEN, NanBox::number(view_len as f64));
-            }
+                Some(view_len)
+            } else {
+                None
+            };
             // Step 12: `Get(newTarget, "prototype")` — invoking a throwing accessor
             // now that all argument validation has succeeded.
             if let Some(proto) = self.instance_proto_checked(native_new_target, callee, default)? {
                 self.realm.set_object_proto(obj, Some(proto));
             }
-            // Step 13: a final `IsDetachedBuffer` check — the proto getter may have
-            // run user code that detached the buffer; a `DataView` must never be
-            // returned backed by a detached buffer.
+            // Steps 13-15: the proto getter may have run user code that detached or
+            // (for a resizable buffer) *resized* the backing store. Re-read the live
+            // byte length and re-validate `byteOffset` (and `byteOffset + byteLength`
+            // for an explicit-length view) against it — a range that no longer fits is
+            // a RangeError; a detached buffer is a TypeError.
             self.guard_detached_buffer(bh)?;
+            let buf_len_now = self
+                .array_buffer_bytes(bh)
+                .and_then(|h| self.realm.bytes_len(h))
+                .unwrap_or(0);
+            if byte_off > buf_len_now {
+                let m = self.new_str("Start offset is outside the bounds of the buffer");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+            if let Some(view_len) = view_len
+                && byte_off
+                    .checked_add(view_len)
+                    .is_none_or(|end| end > buf_len_now)
+            {
+                let m = self.new_str("Invalid DataView length: exceeds buffer bounds");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
             return Ok(NanBox::handle(obj.to_raw()));
         }
         // `new Int8Array(n)` / `new Uint8Array([…])` / `new T(buffer, off?, len?)` — a
@@ -3211,6 +3233,19 @@ impl<'a> Interp<'a> {
             // drained through that iterator (which the user may have overridden — e.g.
             // a patched `ArrayIteratorPrototype.next`), handled by the iterable branch
             // below; it must NOT be short-circuited by a raw element grab.
+            // InitializeTypedArrayFromTypedArray step 8: a typed-array source whose
+            // (resizable) backing buffer has shrunk below it — or been detached — is
+            // out of bounds, a TypeError raised *before* any element is copied (rather
+            // than silently copying its collapsed zero-length contents).
+            if let Some(sh) = args
+                .first()
+                .copied()
+                .and_then(|v| v.as_handle().map(Handle::from_raw))
+                .filter(|h| self.realm.typed_kind(*h).is_some())
+                && (self.typed_array_detached(sh) || self.realm.typed_array_out_of_bounds(sh))
+            {
+                return Err(self.type_error("TypedArray source is detached or out of bounds"));
+            }
             let mut src: Option<Vec<NanBox>> = args
                 .first()
                 .copied()

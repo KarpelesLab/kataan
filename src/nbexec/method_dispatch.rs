@@ -1251,7 +1251,6 @@ impl<'a> Interp<'a> {
             && let Some(bh) = bytesv.as_handle().map(Handle::from_raw)
         {
             self.guard_immutable_buffer(handle)?;
-            self.guard_detached_buffer(handle)?;
             let Some(max) = self
                 .realm
                 .get_property(handle, ARRAY_BUFFER_MAXLEN)
@@ -1261,12 +1260,16 @@ impl<'a> Interp<'a> {
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             };
             // newLength is ToIndex'd: a negative / non-integer-out-of-range / huge
-            // value is a RangeError (not silently clamped to 0).
+            // value is a RangeError (not silently clamped to 0). The coercion runs
+            // *before* the detached check (spec 25.1.6.x steps 3-4), so a `valueOf`
+            // that detaches the buffer is still observed and the argument evaluated.
             let new_f = self.coerce_to_integer_or_infinity(arg(0))?;
             if !new_f.is_finite() || new_f < 0.0 || new_f >= 9_007_199_254_740_992.0 {
                 let m = self.new_str("ArrayBuffer.prototype.resize: invalid length");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }
+            // Step 4: a single IsDetachedBuffer check *after* argument coercion.
+            self.guard_detached_buffer(handle)?;
             let new_len = new_f as usize;
             if new_len > max {
                 let m = self.new_str("ArrayBuffer.prototype.resize: length exceeds maxByteLength");
@@ -3021,11 +3024,21 @@ impl<'a> Interp<'a> {
                     };
                     let start = self.typed_clamp_index_checked(arg(1), 0, tlen)?;
                     let end = self.typed_clamp_index_checked(arg(2), tlen, tlen)?;
-                    // A value/start/end coercion may have detached the buffer — that
-                    // is a TypeError (re-ValidateTypedArray after the coercions).
-                    if self.typed_array_detached(handle) {
+                    // A value/start/end coercion may have detached the buffer, or
+                    // shrunk a resizable one below this (fixed-length) view's extent —
+                    // both make the re-derived buffer witness out of bounds, a
+                    // TypeError (re-ValidateTypedArray after the coercions). A
+                    // length-tracking view instead re-spans (never out of bounds on a
+                    // plain shrink) and its write is just clamped to the new length.
+                    // Only the *branded* `%TypedArray%.prototype.fill` re-validates;
+                    // a generic `Array.prototype.fill.call(ta)` runs the ordinary
+                    // array-like algorithm (a `Set` to an out-of-bounds index is a
+                    // silent no-op, never a TypeError).
+                    if self.typed_array_detached(handle)
+                        || (!array_proto_generic && self.realm.typed_array_out_of_bounds(handle))
+                    {
                         return Err(self.type_error(
-                            "TypedArray.prototype.fill called on a detached ArrayBuffer",
+                            "TypedArray.prototype.fill called on a detached or out-of-bounds ArrayBuffer",
                         ));
                     }
                     // A coercion may have shrunk a resizable buffer; re-read the live
@@ -3044,18 +3057,31 @@ impl<'a> Interp<'a> {
                     let target = self.typed_clamp_index_checked(arg(0), 0, tlen)?;
                     let start = self.typed_clamp_index_checked(arg(1), 0, tlen)?;
                     let end = self.typed_clamp_index_checked(arg(2), tlen, tlen)?;
-                    // A target/start/end coercion may have detached the buffer — that
-                    // is a TypeError (re-ValidateTypedArray after the coercions).
-                    if self.typed_array_detached(handle) {
+                    // `count` (elements to copy) is fixed against the *original* length
+                    // captured before argument coercion — `min(end - start, len - to)`.
+                    let count = end.saturating_sub(start).min(tlen.saturating_sub(target));
+                    // A target/start/end coercion may have detached the buffer, or
+                    // shrunk a resizable one below this (fixed-length) view's extent:
+                    // the re-derived witness is out of bounds → TypeError. A
+                    // length-tracking view re-spans instead (only its live length
+                    // shrinks) and the copy is truncated to the current buffer below.
+                    // Only the branded `%TypedArray%.prototype.copyWithin` re-validates;
+                    // a generic `Array.prototype.copyWithin.call(ta)` runs the ordinary
+                    // array-like algorithm (out-of-bounds `Set`s are silent no-ops).
+                    if self.typed_array_detached(handle)
+                        || (!array_proto_generic && self.realm.typed_array_out_of_bounds(handle))
+                    {
                         return Err(self.type_error(
-                            "TypedArray.prototype.copyWithin called on a detached ArrayBuffer",
+                            "TypedArray.prototype.copyWithin called on a detached or out-of-bounds ArrayBuffer",
                         ));
                     }
-                    // A coercion may have shrunk a resizable buffer; clamp to the
-                    // live length so the copy stays in bounds.
+                    // A coercion may have shrunk a resizable buffer; clamp the copy so
+                    // neither the source nor destination range runs past the live end
+                    // (the spec's per-byte `bufferByteLimit` stop).
                     let live = self.realm.typed_len(handle).unwrap_or(0);
-                    let (target, start, end) = (target.min(live), start.min(live), end.min(live));
-                    let count = end.saturating_sub(start).min(live.saturating_sub(target));
+                    let count = count
+                        .min(live.saturating_sub(target))
+                        .min(live.saturating_sub(start));
                     self.realm.typed_copy_within(handle, target, start, count);
                     return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
@@ -3087,6 +3113,12 @@ impl<'a> Interp<'a> {
                             "TypedArray.prototype.set called on a detached or out-of-bounds typed array",
                         ));
                     }
+                    // `targetLength` is fixed here (after the offset coercion, before
+                    // any source access): a `length` getter on an array-like source
+                    // that resizes the target buffer must **not** be observed by the
+                    // `srcLength + targetOffset > targetLength` bounds check (per-element
+                    // writes below re-validate against the live length instead).
+                    let target_len = self.realm.typed_len(handle).unwrap_or(0);
                     let src_box = arg(0);
                     if let Some(src) = src_box.as_handle().map(Handle::from_raw) {
                         // A typed-array source: same-kind → raw byte copy; otherwise
@@ -3151,13 +3183,14 @@ impl<'a> Interp<'a> {
                     // ToLength: ToIntegerOrInfinity, clamped to [0, 2^53-1].
                     let len_n = self.coerce_to_integer_or_infinity(len_val)?;
                     let src_len = len_n.clamp(0.0, 9_007_199_254_740_991.0) as usize;
-                    let tlen_live = self.realm.typed_len(handle).unwrap_or(tlen);
-                    let offset = if offset_n.is_finite() && offset_n <= tlen_live as f64 {
+                    // Bounds-check against the target length captured *before* the
+                    // `length` getter ran (which may have resized the buffer).
+                    let offset = if offset_n.is_finite() && offset_n <= target_len as f64 {
                         offset_n as usize
                     } else {
-                        tlen_live + 1
+                        target_len + 1
                     };
-                    if offset.checked_add(src_len).is_none_or(|e| e > tlen_live) {
+                    if offset.checked_add(src_len).is_none_or(|e| e > target_len) {
                         let m = self.new_str("offset is out of bounds");
                         return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                     }
@@ -3251,6 +3284,14 @@ impl<'a> Interp<'a> {
                         && matches!(arg(1).unpack(), Unpacked::Undefined)
                     {
                         self.realm.mark_length_tracking(view);
+                        // `new_len` was computed from the parent's length at method
+                        // entry, which may be stale if a begin/end coercion resized the
+                        // buffer afterwards (e.g. an initially out-of-bounds parent that
+                        // was grown back). Re-derive every length-tracking view's span
+                        // from the current buffer (a no-op byte resize) so the fresh
+                        // view reports the live length.
+                        let cur = self.realm.bytes_len(bytes_h).unwrap_or(0);
+                        self.realm.resize_buffer(bytes_h, cur);
                     }
                     return Ok(Some(NanBox::handle(view.to_raw())));
                 }
@@ -3488,6 +3529,15 @@ impl<'a> Interp<'a> {
                                 .realm
                                 .typed_get(handle, i)
                                 .unwrap_or_else(NanBox::undefined);
+                            // `element = Get(array, k)`; only a non-null/undefined
+                            // element is `Invoke`d. A resizable buffer shrunk mid-loop
+                            // (by a user `toLocaleString` override) makes later indices
+                            // out of bounds → `Get` returns `undefined`, which renders
+                            // as the empty string rather than throwing.
+                            if matches!(e.unpack(), Unpacked::Null | Unpacked::Undefined) {
+                                parts.push(String::new());
+                                continue;
+                            }
                             // Invoke(element, "toLocaleString"): box the Number/BigInt
                             // element (ToObject), read the (possibly user-overridden)
                             // method off the wrapper's prototype, and call it with the
@@ -3659,6 +3709,10 @@ impl<'a> Interp<'a> {
                     // (a resize during coercion is observed) — out of range is a
                     // RangeError.
                     if self.realm.typed_kind(handle).is_some() {
+                        // `len` is fixed at step 3 (before any coercion): it sizes the
+                        // result and anchors a negative index. A resize during value
+                        // coercion changes only the *current* length used by the
+                        // IsValidIntegerIndex check below.
                         let len = elems.len() as i64;
                         let i = self.coerce_to_integer_or_infinity(arg(0))? as i64;
                         let value = if self.realm.typed_kind(handle).is_some_and(is_bigint_kind) {
@@ -3667,18 +3721,27 @@ impl<'a> Interp<'a> {
                             self.coerce_to_number(arg(1))?
                         };
                         let idx = if i < 0 { len + i } else { i };
+                        // IsValidIntegerIndex(O, idx): validated against the *current*
+                        // length (a resize during coercion is observed) and false when
+                        // the view is now detached or out of bounds → RangeError.
                         let cur = self.realm.typed_len(handle).unwrap_or(0) as i64;
-                        if idx < 0 || idx >= cur {
+                        if idx < 0
+                            || idx >= cur
+                            || self.typed_array_detached(handle)
+                            || self.realm.typed_array_out_of_bounds(handle)
+                        {
                             let m = self.new_str("Invalid typed array index");
                             return Err(ExecError::Throw(
                                 self.make_error(N_ERROR_BASE + 2, Some(m)),
                             ));
                         }
-                        // `with` uses TypedArrayCreateSameType (NOT species) — build a
-                        // same-kind result over the live elements.
-                        let mut out = Vec::with_capacity(cur as usize);
-                        for k in 0..cur as usize {
-                            out.push(if k == idx as usize {
+                        // `with` uses TypedArrayCreateSameType (NOT species), sized to
+                        // the *original* `len`. `idx` (validated against the possibly
+                        // larger current length) may fall outside `0..len`, in which
+                        // case the value is simply not placed (loop stops at `len`).
+                        let mut out = Vec::with_capacity(len as usize);
+                        for k in 0..len as usize {
+                            out.push(if k as i64 == idx {
                                 value
                             } else {
                                 self.realm
@@ -4666,7 +4729,19 @@ impl<'a> Interp<'a> {
                         return Ok(Some(NanBox::handle(handle.to_raw())));
                     }
                     let sorted = self.sort_array(elems, arg(0), numeric)?;
-                    self.write_back_elements(handle, sorted);
+                    if numeric {
+                        // A typed array: the comparator may have shrunk/detached a
+                        // resizable backing buffer. The write-back is a sequence of
+                        // `Set`s that re-validate each index, so only the still-in-bounds
+                        // prefix is written (a fixed-length view now out of bounds has a
+                        // live length of 0 → nothing is written back).
+                        let live = self.realm.typed_len(handle).unwrap_or(0);
+                        let mut sorted = sorted;
+                        sorted.truncate(live);
+                        self.realm.typed_set_from_numbers(handle, 0, &sorted);
+                    } else {
+                        self.write_back_elements(handle, sorted);
+                    }
                     return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
                 // `toSpliced(start, deleteCount, ...items)` — a spliced copy

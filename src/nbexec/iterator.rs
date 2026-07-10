@@ -365,6 +365,12 @@ impl<'a> Interp<'a> {
         h: Handle,
         ta: Handle,
     ) -> Result<NanBox, ExecError> {
+        // Once the cursor has passed the (live) length the iterator has completed
+        // (`CreateArrayIterator`'s closure returned); it stays done even if the
+        // backing buffer is later grown back in bounds.
+        if self.realm.get_property(h, GEN_DONE).is_some() {
+            return Ok(self.iter_result(NanBox::undefined(), true));
+        }
         let kind = self
             .realm
             .get_property(h, GEN_KIND)
@@ -375,10 +381,21 @@ impl<'a> Interp<'a> {
             .get_property(h, GEN_IDX)
             .and_then(|n| n.as_number())
             .unwrap_or(0.0) as usize;
-        // The live length (tracks a resizable backing buffer); `None`/0 for a
-        // detached or out-of-bounds view ends the iteration.
+        // Spec: each `next()` re-derives the buffer witness; if the view's
+        // fixed-length range now exceeds a shrunk resizable buffer (or its buffer
+        // was detached), `IsTypedArrayOutOfBounds` is true → throw a `TypeError`.
+        // A *length-tracking* view re-spans instead (never out of bounds unless its
+        // start offset itself is past the end), so it iterates its shrunk length.
+        if self.typed_array_detached(ta) || self.realm.typed_array_out_of_bounds(ta) {
+            return Err(self.type_error(
+                "TypedArray iterator: the backing ArrayBuffer is out of bounds or detached",
+            ));
+        }
+        // The live length (tracks a resizable backing buffer).
         let len = self.realm.typed_len(ta).unwrap_or(0);
         if idx >= len {
+            self.realm
+                .set_hidden_property(h, GEN_DONE, NanBox::boolean(true));
             return Ok(self.iter_result(NanBox::undefined(), true));
         }
         self.realm
