@@ -7634,6 +7634,144 @@ fn static_private_not_inherited_by_subclass() {
 }
 
 #[test]
+fn direct_eval_sees_enclosing_private_names() {
+    // A direct `eval` inside a method may reference the enclosing class's private
+    // names — resolution walks the lexical class chain unchanged.
+    assert_eq!(
+        run(r#"class C{#m(){return "ok"}g(){return eval("this.#m()")}}new C().g()"#),
+        "ok"
+    );
+    assert_eq!(
+        run(r#"class C{#x=42;g(){return eval("this.#x")}}new C().g()"#),
+        "42"
+    );
+    // A brand check still throws for a wrong receiver reached through eval.
+    assert_eq!(
+        run(
+            r#"class C{#m(){return 1}g(){return eval("this.#m()")}}try{C.prototype.g.call({});'no'}catch(e){e.constructor.name}"#
+        ),
+        "TypeError"
+    );
+    // An indirect eval does NOT see the private names (SyntaxError at parse).
+    assert_eq!(
+        run(
+            r#"var e=eval;class C{#m(){}g(){try{return e("this.#m")}catch(err){return err.constructor.name}}}new C().g()"#
+        ),
+        "SyntaxError"
+    );
+}
+
+#[test]
+fn direct_eval_arguments_in_field_initializer_is_early_error() {
+    // ContainsArguments: `arguments` in a direct eval inside a field initializer
+    // is a SyntaxError (thrown when the initializer runs).
+    assert_eq!(
+        run(r#"class C{x=eval("1;arguments;")}try{new C();'no'}catch(e){e.constructor.name}"#),
+        "SyntaxError"
+    );
+    // Transparent through arrows inside the eval body.
+    assert_eq!(
+        run(r#"class C{x=eval("(()=>arguments)")}try{new C();'no'}catch(e){e.constructor.name}"#),
+        "SyntaxError"
+    );
+    // And through arrows the initializer stores and invokes later.
+    assert_eq!(
+        run(
+            r#"class C{x=()=>{var t=()=>eval("arguments");t()}}try{new C().x();'no'}catch(e){e.constructor.name}"#
+        ),
+        "SyntaxError"
+    );
+    // A nested *non-arrow* function shields its own `arguments` (no early error).
+    assert_eq!(
+        run(r#"class C{x=eval("(function(){return arguments.length})(1,2)")}new C().x"#),
+        "2"
+    );
+    // Outside a field initializer, `arguments` in a direct eval is fine.
+    assert_eq!(
+        run(r#"function f(){return eval("arguments.length")}f(1,2,3)"#),
+        "3"
+    );
+}
+
+#[test]
+fn private_element_double_initialization_throws() {
+    // A base that returns the same object twice re-runs private installation on
+    // it — PrivateMethodOrAccessorAdd / PrivateFieldAdd throw on the second pass.
+    let dbl = |body: &str| {
+        alloc::format!(
+            "var o={{}};class B{{constructor(a){{return a}}}};class C extends B{{{body}}};new C(o);try{{new C(o);'no'}}catch(e){{e.constructor.name}}"
+        )
+    };
+    assert_eq!(run(&dbl("#m(){}")), "TypeError");
+    assert_eq!(run(&dbl("get #a(){return 1}")), "TypeError");
+    assert_eq!(run(&dbl("set #a(v){}")), "TypeError");
+    assert_eq!(run(&dbl("get #a(){return 1}\nset #a(v){}")), "TypeError");
+    assert_eq!(run(&dbl("#f=1;")), "TypeError");
+    // A get/set pair in one class body is a single element — first init is fine.
+    assert_eq!(
+        run("class C{get #a(){return 7}set #a(v){}rd(){return this.#a}}new C().rd()"),
+        "7"
+    );
+}
+
+#[test]
+fn class_field_create_data_property_or_throw() {
+    // A public field on a frozen `this` throws (CreateDataPropertyOrThrow).
+    assert_eq!(
+        run("class T{f=Object.freeze(this);g=1}try{new T();'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    // A private field / method / accessor on a non-extensible instance throws.
+    assert_eq!(
+        run(
+            "class B{constructor(s){if(s)Object.preventExtensions(this)}}class C extends B{#v=1;constructor(s){super(s)}}try{new C(true);'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+    // Normal (extensible) construction is unaffected.
+    assert_eq!(run("class C{a=1;b=2}var c=new C();c.a+','+c.b"), "1,2");
+}
+
+#[test]
+fn native_error_subclass_message_own_property() {
+    // `new Sub(msg)` installs an own `message`; `new Sub()` does not (it inherits
+    // the prototype's).
+    assert_eq!(
+        run("class E extends TypeError{}new E('x').hasOwnProperty('message')"),
+        "true"
+    );
+    assert_eq!(run("class E extends TypeError{}new E('x').message"), "x");
+    assert_eq!(
+        run("class E extends TypeError{}new E().hasOwnProperty('message')"),
+        "false"
+    );
+    assert_eq!(
+        run("class E extends Error{}E.prototype.message='d';new E().message"),
+        "d"
+    );
+}
+
+#[test]
+fn private_access_on_primitive_receiver_throws() {
+    // PrivateFieldGet/Set step 2: a private read/write with a primitive `this`
+    // (reached via `method.call(primitive)`) is a TypeError.
+    assert_eq!(
+        run(
+            "class C{#p=1;get(){return this.#p}}try{C.prototype.get.call(15);'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        run(
+            "class C{#p=1;set(){this.#p=2}}try{C.prototype.set.call('s');'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+    // A normal primitive read still reports its wrapper constructor.
+    assert_eq!(run("(5).constructor===Number"), "true");
+}
+
+#[test]
 fn class_name_inner_binding_is_const() {
     // The class name is an immutable inner binding: reassigning it inside the
     // class body is a TypeError (both class expressions and declarations).

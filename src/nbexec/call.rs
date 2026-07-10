@@ -1681,6 +1681,16 @@ impl<'a> Interp<'a> {
         } else {
             core::mem::replace(&mut self.new_target_in_scope, true)
         };
+        // The "inside a class field initializer" context (for the ContainsArguments
+        // early error on a nested direct `eval`) is lexical: an arrow restores the
+        // state captured at its definition (so an `eval('arguments')` reached
+        // through arrows defined in a field initializer still errors even when the
+        // arrow runs later); a non-arrow shields it (its own `arguments` binding).
+        let saved_field_init = if def.is_arrow {
+            core::mem::replace(&mut self.in_field_initializer, def.field_init)
+        } else {
+            core::mem::replace(&mut self.in_field_initializer, false)
+        };
         // C2: the tree-walk depth counter measures native recursion *within* one
         // function frame; reset it for the callee's body (deep function-call
         // recursion is bounded separately by `call_depth`) so genuine recursion is
@@ -1880,6 +1890,7 @@ impl<'a> Interp<'a> {
         self.current_home_static = saved_home_static;
         self.new_target = saved_target;
         self.new_target_in_scope = saved_nt_scope;
+        self.in_field_initializer = saved_field_init;
         self.eval_depth = saved_eval_depth;
         self.eval_param_names = saved_eval_param_names;
         self.strict = saved_strict;
@@ -3682,17 +3693,21 @@ impl<'a> Interp<'a> {
                     .set_property(instance, "errors", NanBox::handle(arr.to_raw()));
                 self.realm.mark_hidden(instance, "errors");
             }
-            let msg = match msg_arg {
-                Some(m) if !matches!(m.unpack(), Unpacked::Undefined) => {
-                    let s = self.realm.to_display_string(m);
-                    self.new_str(&s)
-                }
-                _ => self.new_str(""),
-            };
-            self.realm.set_property(instance, "message", msg);
-            // `name`/`message` are non-enumerable (out of `Object.keys`/JSON).
+            // Per the NativeError/Error constructor: an own `message` property is
+            // created ONLY when the `message` argument is not `undefined`. When it
+            // is omitted, no own `message` is installed — reads fall through to
+            // `%Error.prototype%.message` (`""`), and `hasOwnProperty("message")`
+            // is `false`.
+            if let Some(m) = msg_arg
+                && !matches!(m.unpack(), Unpacked::Undefined)
+            {
+                let s = self.realm.to_display_string(m);
+                let msg = self.new_str(&s);
+                self.realm.set_property(instance, "message", msg);
+                self.realm.mark_hidden(instance, "message");
+            }
+            // `name` is non-enumerable (out of `Object.keys`/JSON).
             self.realm.mark_hidden(instance, "name");
-            self.realm.mark_hidden(instance, "message");
             // ES2022 `cause`: `new Error(msg, { cause })` installs a non-enumerable
             // `cause` when the options argument has such a property (even if undefined).
             if let Some(opts) = opts_arg

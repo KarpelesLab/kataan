@@ -74,6 +74,55 @@ impl<'a> Interp<'a> {
         None
     }
 
+    /// CreateDataPropertyOrThrow for a string-keyed public class field: define an
+    /// own writable/enumerable/configurable data property, throwing a TypeError if
+    /// the define fails (e.g. the receiver is non-extensible/frozen, or an existing
+    /// own property is non-configurable). Unlike `[[Set]]`, this never invokes an
+    /// inherited setter — a public field always defines an own property.
+    pub(crate) fn define_public_field_or_throw(
+        &mut self,
+        obj: Handle,
+        key: &str,
+        value: NanBox,
+    ) -> Result<(), ExecError> {
+        let desc = self.realm.new_object();
+        self.realm.set_property(desc, "value", value);
+        self.realm
+            .set_property(desc, "writable", NanBox::boolean(true));
+        self.realm
+            .set_property(desc, "enumerable", NanBox::boolean(true));
+        self.realm
+            .set_property(desc, "configurable", NanBox::boolean(true));
+        // `reflect = true` returns `Ok(false)` on a failed define; turn that into
+        // the CreateDataPropertyOrThrow TypeError.
+        if !self.apply_descriptor(obj, key, desc, true)? {
+            let m = self.new_str(&alloc::format!(
+                "Cannot create field '{key}' on this object"
+            ));
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        Ok(())
+    }
+
+    /// The bare private names (`x` for `#x`) visible at the current execution
+    /// site: the union declared by every lexically-enclosing class, innermost
+    /// first. A *direct* `eval` seeds its parser's private scope with these so the
+    /// eval body may reference the enclosing class's `#names` — runtime resolution
+    /// then works unchanged (the eval body runs with `current_lexical_home` intact).
+    pub(crate) fn visible_private_names(&self) -> alloc::vec::Vec<alloc::boxed::Box<str>> {
+        let mut out: alloc::vec::Vec<alloc::boxed::Box<str>> = alloc::vec::Vec::new();
+        let mut cur = self.current_lexical_home.or(self.current_home);
+        while let Some(cid) = cur {
+            for n in &self.class_private_names[cid as usize] {
+                if !out.iter().any(|x| **x == **n) {
+                    out.push(n.clone());
+                }
+            }
+            cur = self.class_lexical_parent[cid as usize];
+        }
+        out
+    }
+
     /// The storage key for a private reference `#name` at the current execution
     /// site, resolving it to its lexically-enclosing declaring class. When the
     /// name does not resolve (no enclosing class declares it), returns a key
@@ -497,6 +546,10 @@ impl<'a> Interp<'a> {
             // eval) is a valid token that evaluates to undefined.
             let saved_nt_scope = core::mem::replace(&mut self.new_target_in_scope, true);
             let saved_target = core::mem::replace(&mut self.new_target, NanBox::undefined());
+            // Static blocks and static field initializers are field-initializer
+            // context: a nested direct `eval` referencing `arguments` is an early
+            // error.
+            let saved_fi = core::mem::replace(&mut self.in_field_initializer, true);
             let r = (|| {
                 for (idx, member) in class.body.iter().enumerate() {
                     match member {
@@ -524,7 +577,29 @@ impl<'a> Interp<'a> {
                                 self.set_fn_name_owned(v, &disp);
                             }
                             if let Some(h) = class_val.as_handle().map(Handle::from_raw) {
-                                self.realm.set_property(h, &key, v);
+                                let is_private = matches!(&field.key, PropertyKey::Private(_));
+                                if is_private {
+                                    // A private static field is an internal element
+                                    // of the constructor. PrivateFieldAdd cannot add
+                                    // it to a non-extensible object (a `static #g`
+                                    // whose initializer sealed the constructor). (No
+                                    // double-add check: a class is constructed once,
+                                    // and a placeholder slot for the field already
+                                    // exists from ClassDefinitionEvaluation.)
+                                    if !self.realm.is_extensible(h) {
+                                        let m = self.new_str(
+                                            "Cannot add private field to a non-extensible object",
+                                        );
+                                        return Err(ExecError::Throw(
+                                            self.make_error(N_TYPE_ERROR, Some(m)),
+                                        ));
+                                    }
+                                    self.realm.set_property(h, &key, v);
+                                } else {
+                                    // A public static field is CreateDataPropertyOrThrow
+                                    // on the constructor.
+                                    self.define_public_field_or_throw(h, &key, v)?;
+                                }
                             }
                         }
                         _ => {}
@@ -532,6 +607,7 @@ impl<'a> Interp<'a> {
                 }
                 Ok(())
             })();
+            self.in_field_initializer = saved_fi;
             self.current = saved;
             self.this_val = saved_this;
             self.strict = saved_strict;
@@ -1022,6 +1098,16 @@ impl<'a> Interp<'a> {
     ) -> Result<(), ExecError> {
         let cenv = self.class_envs[class_id as usize].clone();
         let class = self.classes[class_id as usize];
+        // PrivateMethodOrAccessorAdd (7.3.28) step 3: adding a private
+        // method/accessor whose key is already present on the object is a
+        // TypeError. This surfaces "double initialization" — e.g. a derived
+        // constructor whose base returns the *same* object twice (`new C(obj)`
+        // then `new C(obj)`). A getter/setter pair declared in the same class
+        // shares one key and is merged into a single element within this pass, so
+        // only a key installed by a *previous* pass triggers the error; keys
+        // installed in the current pass are tracked in `installed_this_pass`.
+        let mut installed_this_pass: alloc::collections::BTreeSet<String> =
+            alloc::collections::BTreeSet::new();
         for member in &class.body {
             let ClassMember::Method(m) = member else {
                 continue;
@@ -1035,6 +1121,23 @@ impl<'a> Interp<'a> {
                 self.current = saved;
                 k?
             };
+            if self.realm.has_own(instance, &key) && !installed_this_pass.contains(&key) {
+                let msg = self
+                    .new_str("Cannot install private methods/accessors on the same object twice");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(msg))));
+            }
+            // A private method/accessor is an internal element of the object; per
+            // the `nonextensible-applies-to-private` semantics it cannot be added
+            // to a non-extensible object (e.g. a derived class whose base sealed
+            // the shared `this`). A getter/setter pair merges into an element
+            // already begun in this pass, so only the first install of a key is
+            // gated on extensibility.
+            if !installed_this_pass.contains(&key) && !self.realm.is_extensible(instance) {
+                let msg = self
+                    .new_str("Cannot add private method or accessor to a non-extensible object");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(msg))));
+            }
+            installed_this_pass.insert(key.clone());
             // A private method/accessor is defined once per class and shared by
             // every instance (`c1.#m === c2.#m`); cache by (class, kind, key).
             let cache_key = (
@@ -1115,10 +1218,15 @@ impl<'a> Interp<'a> {
                     // per construction. Only the *value* is (re)computed below.
                     let is_private = matches!(&field.key, PropertyKey::Private(_));
                     let key = self.class_member_key(class_id, idx, &field.key)?;
+                    // A field initializer is field-initializer context: a nested
+                    // direct `eval` that references `arguments` is an early error.
+                    let saved_fi = core::mem::replace(&mut self.in_field_initializer, true);
                     let v = match &field.value {
-                        Some(e) => self.eval(e)?,
-                        None => NanBox::undefined(),
+                        Some(e) => self.eval(e),
+                        None => Ok(NanBox::undefined()),
                     };
+                    self.in_field_initializer = saved_fi;
+                    let v = v?;
                     // DefineField step 7: an anonymous function/arrow/class
                     // initializer takes the field name (`x = () => {}` → name "x";
                     // `#f = () => {}` → name "#f").
@@ -1129,6 +1237,18 @@ impl<'a> Interp<'a> {
                         self.set_fn_name_owned(v, &disp);
                     }
                     if is_private {
+                        // `PrivateFieldAdd` step 4: if the private field is already
+                        // present on the object, throw a TypeError. This surfaces a
+                        // double initialization — a derived constructor whose base
+                        // returns an object that already carries this class's private
+                        // field (`class A { constructor(a){return a;} }; class C
+                        // extends A { #x; }; new C(existingCInstance)`).
+                        if self.realm.has_own(instance, &key) {
+                            let m = self.new_str(
+                                "Cannot initialize private field on the same object twice",
+                            );
+                            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                        }
                         // `PrivateFieldAdd` on a **non-extensible** object is a
                         // TypeError (the `nonextensible-applies-to-private`
                         // semantics) — e.g. a base constructor returned a frozen
@@ -1148,7 +1268,11 @@ impl<'a> Interp<'a> {
                     // (e.g. a base constructor returned one) that forces evaluation.
                     #[cfg(all(feature = "module", feature = "std"))]
                     self.trigger_deferred_namespace(instance, &key)?;
-                    self.realm.set_property(instance, &key, v);
+                    // CreateDataPropertyOrThrow: a public field on a non-extensible
+                    // / frozen instance (`f = Object.freeze(this); g = 1`) throws,
+                    // and it defines an own property rather than invoking an
+                    // inherited setter.
+                    self.define_public_field_or_throw(instance, &key, v)?;
                 }
             }
             Ok(())

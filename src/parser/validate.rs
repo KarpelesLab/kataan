@@ -52,7 +52,7 @@ use alloc::vec::Vec;
 
 /// Validates a parsed [`Program`], returning the first early error found.
 pub(crate) fn validate_program(program: &Program) -> Result<()> {
-    validate_program_with(program, false, false, false, false)
+    validate_program_with(program, false, false, false, false, &[], false)
 }
 
 /// Validates an eval program that inherits a `super` context from the calling
@@ -66,6 +66,16 @@ pub(crate) fn validate_program_with(
     allow_super_call: bool,
     allow_new_target: bool,
     inherited_strict: bool,
+    // Private names visible at a *direct-eval* call site (from the enclosing class
+    // scope chain). The eval body may reference these `#names` even though it does
+    // not declare them itself, so seed the validator's private scope with them.
+    // Empty for ordinary program / indirect-eval validation.
+    outer_private_names: &[Box<str>],
+    // Whether this eval body runs directly inside a class field initializer /
+    // static block. In that position an early error is raised if the eval'd
+    // StatementList references `arguments` (ContainsArguments — the special
+    // "Eval Inside Initializer" static semantics).
+    in_field_initializer: bool,
 ) -> Result<()> {
     // A direct eval inside strict code is itself strict code even without its own
     // `"use strict"` directive (`inherited_strict`); the early-error checks below
@@ -73,8 +83,15 @@ pub(crate) fn validate_program_with(
     let strict = inherited_strict
         || program.source_type == SourceType::Module
         || body_is_strict(&program.body);
+    // Seed the private scope with the names visible at the eval call site so that
+    // a private reference (`this.#x`) in the eval body validates.
+    let seeded_privates: Vec<Box<str>> = outer_private_names.to_vec();
+    let mut private_scopes = Vec::new();
+    if !seeded_privates.is_empty() {
+        private_scopes.push(seeded_privates);
+    }
     let mut v = Validator {
-        private_scopes: Vec::new(),
+        private_scopes,
         labels: Vec::new(),
         is_module: program.source_type == SourceType::Module,
         in_assign_target: false,
@@ -83,6 +100,11 @@ pub(crate) fn validate_program_with(
         allow_super_property,
         allow_super_call,
         allow_new_target,
+        // A direct eval inside a field initializer / static block inherits the
+        // "no `arguments`" restriction (the ContainsArguments early error). The
+        // normal walk raises a SyntaxError on any `arguments` reference not
+        // shielded by a nested non-arrow function boundary.
+        in_field_init: in_field_initializer,
         ..Ctx::top(strict)
     };
     v.check_top_level_scope(&program.body, strict)?;

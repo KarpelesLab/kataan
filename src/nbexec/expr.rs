@@ -1678,6 +1678,16 @@ impl<'a> Interp<'a> {
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(msg))));
         }
         let Some(raw) = obj.as_handle() else {
+            // PrivateFieldGet / PrivateMethodOrAccessorGet step 2: if the receiver
+            // is not an object (a primitive `this`, e.g. `method.call(15)` reaching
+            // `this.#p`), throw a TypeError — a primitive can never carry a private
+            // brand.
+            if let PropertyKey::Private(s) = property {
+                let m = self.new_str(&alloc::format!(
+                    "Cannot read private member #{s} from a non-object"
+                ));
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
             // A number/boolean primitive reports its wrapper constructor
             // (`(5).constructor === Number`); other reads are `undefined`
             // here (method calls go through the call path).
@@ -3774,6 +3784,15 @@ impl<'a> Interp<'a> {
                     // (number/boolean) silently ignores the write in sloppy mode.
                     if matches!(obj.unpack(), Unpacked::Null | Unpacked::Undefined) {
                         return Err(self.type_error("Cannot set property of null or undefined"));
+                    }
+                    // PrivateFieldSet step 2: a private write requires an object
+                    // receiver — a primitive `this` (`method.call(15)` reaching
+                    // `this.#p = …`) is a TypeError, never a silent no-op.
+                    if let PropertyKey::Private(s) = property {
+                        let m = self.new_str(&alloc::format!(
+                            "Cannot write private member #{s} to a non-object"
+                        ));
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                     }
                     return Ok(rhs);
                 };

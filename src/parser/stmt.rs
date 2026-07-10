@@ -74,6 +74,12 @@ impl<'src> Parser<'src> {
         allow_super_call: bool,
         allow_new_target: bool,
         inherited_strict: bool,
+        // Private names visible at the (direct-)eval call site, so the eval body
+        // may reference the enclosing class's `#names` without re-declaring them.
+        outer_private_names: &[alloc::boxed::Box<str>],
+        // Whether the direct eval runs inside a class field initializer / static
+        // block (activates the ContainsArguments early error for `arguments`).
+        in_field_initializer: bool,
     ) -> Result<Program> {
         let mut p = Parser::new(source)?;
         p.module_top_level = true;
@@ -100,6 +106,8 @@ impl<'src> Parser<'src> {
             allow_super_call,
             allow_new_target,
             inherited_strict,
+            outer_private_names,
+            in_field_initializer,
         )?;
         Ok(program)
     }

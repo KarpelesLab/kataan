@@ -502,7 +502,7 @@ impl<'a> Interp<'a> {
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(msg))));
         }
         // Parse first so a SyntaxError surfaces before any environment swap.
-        let program = self.parse_eval_program(&source, false, false, false, false)?;
+        let program = self.parse_eval_program(&source, false, false, false, false, &[], false)?;
 
         let saved_current = self.current.clone();
         let saved_var_scope = self.var_scope.clone();
@@ -552,7 +552,7 @@ impl<'a> Interp<'a> {
         let intrinsics = self.created_realms[idx].intrinsics;
 
         // Parse first so a SyntaxError surfaces before any environment swap.
-        let program = self.parse_eval_program(source, false, false, false, false)?;
+        let program = self.parse_eval_program(source, false, false, false, false, &[], false)?;
 
         let saved_current = self.current.clone();
         let saved_global_scope = self.global_scope.clone();
@@ -1172,7 +1172,7 @@ impl<'a> Interp<'a> {
         // Parse first: a SyntaxError from parsing is surfaced to the caller realm
         // *as a SyntaxError* (per the ShadowRealm spec), not wrapped. ShadowRealm
         // code is global-scoped, so no inherited `super`.
-        let program = self.parse_eval_program(&source, false, false, false, false)?;
+        let program = self.parse_eval_program(&source, false, false, false, false, &[], false)?;
         // Evaluate the parsed program in the instance's persistent global scope (a
         // best-effort isolated environment that shares the intrinsics). A *runtime*
         // throw is wrapped as a TypeError per the spec.

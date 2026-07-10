@@ -188,6 +188,11 @@ pub(crate) struct FnDef<'a> {
     /// Set post-creation like `is_arrow`. Class methods are detected via
     /// `home_class` instead.
     is_method: bool,
+    /// Whether this function was defined lexically inside a class field
+    /// initializer / static block. Only consulted for arrows (which are
+    /// transparent to the ContainsArguments early error on a nested direct
+    /// `eval`); a non-arrow resets the runtime flag to `false` on entry.
+    field_init: bool,
 }
 
 /// One SplitMix64 step: scrambles an input word into a well-distributed output.
@@ -528,6 +533,13 @@ pub struct Interp<'a> {
     /// Whether the currently-running method was entered as a static method, so
     /// `super.x` resolves against the superclass's static members.
     current_home_static: bool,
+    /// Whether execution is directly inside a class field initializer or static
+    /// initialization block (with no intervening non-arrow function boundary). A
+    /// *direct* `eval` here inherits the ContainsArguments early error: an
+    /// `arguments` reference in the eval body is a SyntaxError. Reset to `false`
+    /// across ordinary function/method calls (an arrow keeps it, matching the
+    /// lexical `arguments` inheritance).
+    in_field_initializer: bool,
     /// While a *derived* class constructor body runs before `super(...)`, holds
     /// `(instanceValue, classId)`: `this` is in its temporal dead zone
     /// (`this_val` is `tdz()`), and the stashed instance + class let `super(...)`
@@ -2836,6 +2848,7 @@ impl<'a> Interp<'a> {
             current_home: None,
             current_lexical_home: None,
             current_home_object: None,
+            in_field_initializer: false,
             eval_param_names: None,
             current_home_static: false,
             pending_label: None,
@@ -5485,6 +5498,7 @@ impl<'a> Interp<'a> {
     /// program is owned by the interpreter for the rest of the run: it is boxed,
     /// leaked once to a `&'static Program` (which coerces to `&'a`), and cached by
     /// source so repeated `eval`/`Function` of the same string parse only once.
+    #[allow(clippy::too_many_arguments)]
     fn parse_eval_program(
         &mut self,
         source: &str,
@@ -5492,18 +5506,28 @@ impl<'a> Interp<'a> {
         allow_super_call: bool,
         allow_new_target: bool,
         inherited_strict: bool,
+        // Private names visible at the (direct-)eval call site — seed the
+        // validator's private scope so the eval body may reference the enclosing
+        // class's `#names`. Empty for an indirect eval or outside any class.
+        outer_private_names: &[alloc::boxed::Box<str>],
+        // Whether the direct eval runs inside a class field initializer / static
+        // block (activates the ContainsArguments early error for `arguments`).
+        in_field_initializer: bool,
     ) -> Result<&'a Program, ExecError> {
         // The cache is keyed by source *and* the inherited `super`/`new.target`
-        // context *and* inherited strictness: the same text `"super.x"` /
-        // `"new.target"` / `"public = 1"` is a SyntaxError in one caller and valid
-        // in another, so they must not share a cached AST. A 4-byte flag prefix
-        // (outside the JS source grammar) keeps it unambiguous.
+        // context *and* inherited strictness *and* the visible private names /
+        // field-initializer flag: the same text `"super.x"` / `"new.target"` /
+        // `"public = 1"` / `"this.#x"` / `"arguments"` is a SyntaxError in one
+        // caller and valid in another, so they must not share a cached AST. A
+        // flag prefix (outside the JS source grammar) keeps it unambiguous.
         let key = alloc::format!(
-            "{}{}{}{}\0{source}",
+            "{}{}{}{}{}{}\0{source}",
             u8::from(allow_super_property),
             u8::from(allow_super_call),
             u8::from(allow_new_target),
             u8::from(inherited_strict),
+            u8::from(in_field_initializer),
+            outer_private_names.join(","),
         );
         if let Some(p) = self.eval_programs.get(&key) {
             return Ok(p);
@@ -5514,6 +5538,8 @@ impl<'a> Interp<'a> {
             allow_super_call,
             allow_new_target,
             inherited_strict,
+            outer_private_names,
+            in_field_initializer,
         ) {
             Ok(program) => {
                 // The AST is fully owned (no borrow of `source`); leaking the box
@@ -5717,12 +5743,28 @@ impl<'a> Interp<'a> {
         // directive; an indirect eval starts sloppy (its strictness comes only
         // from a `"use strict"` in the code itself).
         let inherited_strict = direct && self.strict;
+        // Private names visible at a *direct* eval call site: the union of all
+        // `#names` declared by the lexically-enclosing class chain. Seeding the
+        // parser with these lets the eval body reference `this.#x` (which resolves
+        // at runtime against the unchanged `current_lexical_home`). An indirect
+        // eval runs in the global scope and sees none.
+        let outer_private_names = if direct {
+            self.visible_private_names()
+        } else {
+            Vec::new()
+        };
+        // A direct eval inside a class field initializer / static block inherits
+        // the ContainsArguments early error (an `arguments` reference in the eval
+        // body is a SyntaxError).
+        let in_field_initializer = direct && self.in_field_initializer;
         let program = self.parse_eval_program(
             source,
             allow_super_property,
             false,
             allow_new_target,
             inherited_strict,
+            &outer_private_names,
+            in_field_initializer,
         )?;
         let code_strict = has_use_strict(&program.body);
 
@@ -5892,7 +5934,7 @@ impl<'a> Interp<'a> {
         // A `Function(…)` body is global-scoped — no inherited `super`. (Its body
         // is wrapped in a function expression, so `new.target` inside is enabled by
         // the parser's own function-boundary handling, not this top-level flag.)
-        let program = self.parse_eval_program(&source, false, false, false, false)?;
+        let program = self.parse_eval_program(&source, false, false, false, false, &[], false)?;
         // The wrapper parses to a single parenthesized function-expression
         // statement; pull the `Function` node back out.
         let func = program.body.iter().find_map(|s| match s {
@@ -6184,6 +6226,12 @@ impl<'a> Interp<'a> {
             home_static,
             lexical_class,
             is_method: false,
+            // Capture whether this function is *lexically* inside a class field
+            // initializer / static block. An arrow inherits this on invocation (so
+            // a direct `eval` reached through nested arrows defined in a field
+            // initializer still gets the ContainsArguments early error); a
+            // non-arrow shields it (its own `arguments` binding).
+            field_init: self.in_field_initializer,
         });
         let handle = self.realm.new_function(func_id, self.current.clone());
         // Materialize `name` ("" until a later NamedEvaluation / method key sets
