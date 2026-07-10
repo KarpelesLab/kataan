@@ -310,6 +310,33 @@ enum Step<'a> {
         acc: Vec<NanBox>,
         spread: bool,
     },
+    /// A reified method call `recv.property(args)` whose arguments may `await`/
+    /// `yield`. The receiver `recv` was evaluated eagerly (its expression is
+    /// yield-free) and already checked non-nullish (the pre-argument spec order);
+    /// `property` is a yield-free key. `arguments[idx..]` remain to evaluate; `acc`
+    /// holds the argument values gathered so far. When `idx` reaches the end the
+    /// call is completed via `call_member_dispatch` — identical built-in / own-
+    /// property / `this`-binding semantics to the eager path — and its result
+    /// pushed. Only entered for non-optional calls on a non-`super`, non-`import`
+    /// receiver, so no optional short-circuit can arise inside the step machine.
+    MethodCallArgs {
+        recv: NanBox,
+        property: &'a PropertyKey,
+        arguments: &'a [Argument],
+        idx: usize,
+        acc: Vec<NanBox>,
+    },
+    /// Append the just-evaluated argument (top of stack) to a method call's
+    /// argument accumulator (spreading it when the argument was `...arg`), then
+    /// continue with the next argument.
+    MethodCallArgAppend {
+        recv: NanBox,
+        property: &'a PropertyKey,
+        arguments: &'a [Argument],
+        idx: usize,
+        acc: Vec<NanBox>,
+        spread: bool,
+    },
     /// Complete a static-key member assignment `base.p = <value>` (or
     /// `base['p'] = …`) whose right-hand side may `yield`: the RHS value is on top
     /// of the value stack (and stays there as the assignment's result); `base` and
@@ -1525,6 +1552,33 @@ fn call_reifiable(callee: &Expr) -> bool {
     }
 }
 
+/// Whether a *method* call `recv.property(args)` can be reified by the step-machine
+/// so an `await`/`yield` in an *argument* suspends. Restricted to a non-optional
+/// call whose callee is a non-`super`, non-optional member with a *yield-free*
+/// receiver and *yield-free* key (both evaluated eagerly, once, in the correct
+/// pre-argument order); the `import.defer`/`import.source`/dynamic-`import` pseudo
+/// member forms (receiver identifier `import`) are intercepted specially in the
+/// eager path and keep it. Method calls whose receiver or key themselves suspend
+/// (e.g. `(await x).m()`, `o[await k]()`) keep the eager fallback (documented).
+fn method_call_reifiable(callee: &Expr) -> bool {
+    let Expr::Member {
+        object,
+        property,
+        optional,
+        ..
+    } = callee
+    else {
+        return false;
+    };
+    if *optional || matches!(&**object, Expr::Super(_)) {
+        return false;
+    }
+    if matches!(&**object, Expr::Ident(id) if id.name.as_ref() == "import") {
+        return false;
+    }
+    !expr_has_yield(object) && !key_has_yield(property)
+}
+
 /// Whether an object literal can be built by the generator step-machine: every
 /// member must be a spread or a plain data property with a *static* key and a
 /// *non-function* value (and not the `__proto__:` prototype setter). Methods,
@@ -1943,6 +1997,58 @@ impl<'a> Interp<'a> {
                 }
                 stack.push(Step::CallArgs {
                     func,
+                    arguments,
+                    idx: idx + 1,
+                    acc,
+                });
+                Ok(StepOut::Continue)
+            }
+            Step::MethodCallArgs {
+                recv,
+                property,
+                arguments,
+                idx,
+                acc,
+            } => {
+                if idx >= arguments.len() {
+                    let r = self
+                        .call_member_dispatch(recv, property, false, &acc)
+                        .map_err(GenAbrupt::from)?;
+                    values.push(r);
+                    return Ok(StepOut::Continue);
+                }
+                let (expr, spread) = match &arguments[idx] {
+                    Argument::Item(e) => (e, false),
+                    Argument::Spread(e) => (e, true),
+                };
+                stack.push(Step::MethodCallArgAppend {
+                    recv,
+                    property,
+                    arguments,
+                    idx,
+                    acc,
+                    spread,
+                });
+                self.gen_eval_expr(expr, stack, values)
+            }
+            Step::MethodCallArgAppend {
+                recv,
+                property,
+                arguments,
+                idx,
+                mut acc,
+                spread,
+            } => {
+                let v = values.pop().unwrap_or(NanBox::undefined());
+                if spread {
+                    let items = self.iterate_values(v).map_err(GenAbrupt::from)?;
+                    acc.extend(items);
+                } else {
+                    acc.push(v);
+                }
+                stack.push(Step::MethodCallArgs {
+                    recv,
+                    property,
                     arguments,
                     idx: idx + 1,
                     acc,
@@ -2817,6 +2923,39 @@ impl<'a> Interp<'a> {
                 let func = self.eval(callee).map_err(GenAbrupt::from)?;
                 stack.push(Step::CallArgs {
                     func,
+                    arguments,
+                    idx: 0,
+                    acc: Vec::new(),
+                });
+                Ok(StepOut::Continue)
+            }
+            // A method call `recv.m(await x)` / `assert.sameValue((await x).v, …)`
+            // whose callee member is yield-free (receiver + key) but whose
+            // arguments contain an `await`/`yield`. Evaluate the receiver eagerly
+            // (correct pre-argument order), run the nullish-base TypeError check
+            // (also before arguments), then step the arguments so a suspension
+            // parks — completing with `call_member_dispatch` (identical `this`-
+            // binding / built-in / own-property semantics to the eager path). The
+            // receiver is non-optional and non-`super`/`import`, and the call is
+            // non-optional, so no optional short-circuit reaches the step machine.
+            Expr::Call {
+                callee,
+                arguments,
+                optional: false,
+                ..
+            } if method_call_reifiable(callee) => {
+                let Expr::Member {
+                    object, property, ..
+                } = &**callee
+                else {
+                    unreachable!()
+                };
+                let recv = self.eval(object).map_err(GenAbrupt::from)?;
+                self.method_recv_check(recv, property, false)
+                    .map_err(GenAbrupt::from)?;
+                stack.push(Step::MethodCallArgs {
+                    recv,
+                    property,
                     arguments,
                     idx: 0,
                     acc: Vec::new(),

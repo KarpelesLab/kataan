@@ -1027,190 +1027,13 @@ impl<'a> Interp<'a> {
                 } = &**callee
                 {
                     let recv = self.eval(object)?;
-                    if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                        if *optional {
-                            return Err(ExecError::OptShortCircuit);
-                        }
-                        // Resolving the callee member (`obj.m`) on a nullish base is a
-                        // TypeError, thrown *before* the arguments are evaluated (spec
-                        // reference order): `o.bar.gar(foo())` throws before `foo()`.
-                        let key = match property {
-                            PropertyKey::Ident(s) | PropertyKey::Str(s) => {
-                                alloc::string::String::from(&**s)
-                            }
-                            PropertyKey::Number(n) => {
-                                self.realm.to_display_string(NanBox::number(*n))
-                            }
-                            PropertyKey::Computed(e) => {
-                                let k = self.eval(e)?;
-                                self.coerce_property_key(k)?
-                            }
-                            PropertyKey::Private(s) => alloc::format!("#{s}"),
-                        };
-                        return Err(self.type_error(&alloc::format!(
-                            "Cannot read properties of {} (reading '{key}')",
-                            self.realm.to_display_string(recv)
-                        )));
-                    }
+                    // Resolving the callee member (`obj.m`) on a nullish base is a
+                    // TypeError (or, for `obj?.m()`, an optional short-circuit),
+                    // thrown *before* the arguments are evaluated (spec reference
+                    // order): `o.bar.gar(foo())` throws before `foo()`.
+                    self.method_recv_check(recv, property, *optional)?;
                     let args = self.eval_args(arguments)?;
-                    // The built-in name-based dispatch (`call_method`) is an
-                    // optimization for *unshadowed* built-in methods. If the
-                    // receiver carries an *own* property of this name (e.g.
-                    // `s.valueOf = Number.prototype.valueOf`), that property is the
-                    // method to invoke — resolving and calling the function value
-                    // preserves its own `this`-validation (so a cross-type
-                    // `Number.prototype.valueOf` call on a String wrapper throws),
-                    // rather than the receiver's built-in behavior.
-                    if let PropertyKey::Ident(name) | PropertyKey::Str(name) = property
-                        && recv
-                            .as_handle()
-                            .map(Handle::from_raw)
-                            .is_some_and(|h| self.realm.has_own(h, name))
-                    {
-                        let rh = recv.as_handle().map(Handle::from_raw).unwrap();
-                        let f = self.read_member(rh, name)?;
-                        if f.as_handle()
-                            .map(Handle::from_raw)
-                            .is_some_and(|fh| self.is_callable(fh))
-                        {
-                            return self.call_with_this(f, recv, &args);
-                        }
-                    }
-                    if let PropertyKey::Ident(name) | PropertyKey::Str(name) = property
-                        && let Some(result) = self.call_method(recv, name, &args)?
-                    {
-                        return Ok(result);
-                    }
-                    // `obj[Symbol.iterator]()` → an iterator over the receiver.
-                    if let PropertyKey::Computed(e) = property {
-                        let key = self.eval(e)?;
-                        let iter_sym = self.well_known_symbol("iterator");
-                        if self.realm.strict_equals(key, iter_sym) {
-                            // A generator/iterator is its own iterator (identity) —
-                            // both the eager built-in iterables (`GEN_BUF`) and a
-                            // lazy generator (`GEN_FRAME`).
-                            if recv.as_handle().map(Handle::from_raw).is_some_and(|h| {
-                                self.realm.get_property(h, GEN_BUF).is_some()
-                                    || self.realm.get_property(h, GEN_FRAME).is_some()
-                                    || self.realm.get_property(h, GEN_COLL).is_some()
-                                    || self.realm.get_property(h, GEN_TA).is_some()
-                            }) {
-                                return Ok(recv);
-                            }
-                            // A typed array yields a **live** values iterator.
-                            if let Some(h) = recv.as_handle().map(Handle::from_raw)
-                                && self.realm.typed_kind(h).is_some()
-                            {
-                                return Ok(self.make_live_typed_iterator(h, 1));
-                            }
-                            // A non-weak Map/Set yields a **live** iterator (a Set
-                            // over its values, a Map over its entries), so
-                            // `s[Symbol.iterator]()` observes mutation mid-iteration.
-                            if let Some(h) = recv.as_handle().map(Handle::from_raw)
-                                && !self.realm.collection_is_weak(h)
-                                && self.realm.collection_entries(h).is_some()
-                            {
-                                let is_set = self.realm.collection_is_set(h) == Some(true);
-                                let tag = if is_set {
-                                    "Set Iterator"
-                                } else {
-                                    "Map Iterator"
-                                };
-                                let kind = if is_set { 1 } else { 2 };
-                                return Ok(self.make_live_collection_iterator(h, kind, tag));
-                            }
-                            let vals = self.iterate_values(recv)?;
-                            // Tag the iterator with the receiver's kind so its
-                            // prototype is the real `%ArrayIteratorPrototype%` /
-                            // `%StringIteratorPrototype%` / `%Map|SetIteratorPrototype%`.
-                            let tag = recv.as_handle().map(Handle::from_raw).and_then(|h| {
-                                if self.realm.array_elements(h).is_some()
-                                    || self.realm.is_array(h)
-                                    || self.realm.typed_kind(h).is_some()
-                                {
-                                    Some("Array Iterator")
-                                } else if self.realm.string_value(h).is_some()
-                                    || self
-                                        .realm
-                                        .get_property(h, PRIM_WRAP_TYPE)
-                                        .and_then(|t| t.as_number())
-                                        == Some(f64::from(N_STRING))
-                                {
-                                    // A primitive string cell, or a boxed `String`
-                                    // wrapper (`new String("…")`) whose `[[StringData]]`
-                                    // lives in the `PRIM_WRAP` slot.
-                                    Some("String Iterator")
-                                } else {
-                                    match self.realm.collection_is_set(h) {
-                                        Some(true) => Some("Set Iterator"),
-                                        Some(false) => Some("Map Iterator"),
-                                        None => None,
-                                    }
-                                }
-                            });
-                            return Ok(match tag {
-                                Some(t) => self.make_builtin_iterator(vals, t),
-                                None => self.make_generator(vals),
-                            });
-                        }
-                    }
-                    // Not a built-in method: read the member and call it.
-                    let Some(raw) = recv.as_handle() else {
-                        if *call_optional {
-                            return Err(ExecError::OptShortCircuit);
-                        }
-                        // The receiver is a primitive. `null`/`undefined` cannot be
-                        // coerced, so any member access is a catchable TypeError.
-                        if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                            let m = self.new_str("cannot read property of null or undefined");
-                            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-                        }
-                        // For a number/boolean primitive, an inherited (or
-                        // prototype-assigned) method is found by boxing the value and
-                        // walking its prototype chain — then invoked with the original
-                        // primitive as `this` (e.g.
-                        // `Number.prototype.toLowerCase = String.prototype.toLowerCase`,
-                        // or a computed key like `false["toString"]()`).
-                        let name = match property {
-                            PropertyKey::Ident(name) | PropertyKey::Str(name) => {
-                                Some(alloc::string::String::from(&**name))
-                            }
-                            PropertyKey::Number(n) => {
-                                Some(self.realm.to_display_string(NanBox::number(*n)))
-                            }
-                            PropertyKey::Computed(e) => {
-                                let k = self.eval(e)?;
-                                Some(self.coerce_property_key(k)?)
-                            }
-                            PropertyKey::Private(_) => None,
-                        };
-                        if let Some(name) = name {
-                            let boxed = self.coerce_to_object(recv);
-                            if let Some(bh) = boxed.as_handle().map(Handle::from_raw) {
-                                let f = self.read_member(bh, &name)?;
-                                if *call_optional
-                                    && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null)
-                                {
-                                    return Err(ExecError::OptShortCircuit);
-                                }
-                                if f.as_handle()
-                                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-                                {
-                                    return self.call_with_this(f, recv, &args);
-                                }
-                            }
-                        }
-                        let m = self.new_str("is not a function");
-                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-                    };
-                    let f = self.member(Handle::from_raw(raw), property)?;
-                    // `f?.()` short-circuits when `f` is nullish.
-                    if *call_optional && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null)
-                    {
-                        return Err(ExecError::OptShortCircuit);
-                    }
-                    // Method call: `this` is the receiver.
-                    return self.call_with_this(f, recv, &args);
+                    return self.call_member_dispatch(recv, property, *call_optional, &args);
                 }
                 // A bare-identifier callee resolved through a `with (obj)` binding is
                 // called with `obj` as the `this` value (the with-object is the
@@ -1518,6 +1341,210 @@ impl<'a> Interp<'a> {
             }
             _ => Err(ExecError::Unsupported("expression")),
         }
+    }
+
+    /// Phase A of a method call `recv.property(...)`: the nullish-base check that
+    /// runs *before* argument evaluation. Returns `Err(OptShortCircuit)` when the
+    /// base is nullish and the member access is optional (`obj?.m()`), a
+    /// `TypeError` when it is nullish and not optional, and `Ok(())` otherwise.
+    /// Factored out so the generator/async step-machine can perform it eagerly
+    /// (correct pre-argument order) before stepping suspending arguments.
+    pub(crate) fn method_recv_check(
+        &mut self,
+        recv: NanBox,
+        property: &'a PropertyKey,
+        member_optional: bool,
+    ) -> Result<(), ExecError> {
+        if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            if member_optional {
+                return Err(ExecError::OptShortCircuit);
+            }
+            let key = match property {
+                PropertyKey::Ident(s) | PropertyKey::Str(s) => alloc::string::String::from(&**s),
+                PropertyKey::Number(n) => self.realm.to_display_string(NanBox::number(*n)),
+                PropertyKey::Computed(e) => {
+                    let k = self.eval(e)?;
+                    self.coerce_property_key(k)?
+                }
+                PropertyKey::Private(s) => alloc::format!("#{s}"),
+            };
+            return Err(self.type_error(&alloc::format!(
+                "Cannot read properties of {} (reading '{key}')",
+                self.realm.to_display_string(recv)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Phase C of a method call `recv.property(args)`: the built-in/own-property/
+    /// primitive dispatch that runs *after* the receiver (already checked
+    /// non-nullish by [`Self::method_recv_check`]) and the arguments have been
+    /// evaluated. `call_optional` is the *call*'s own `?.()` flag. Factored out
+    /// verbatim from the eager `Expr::Call` path so the generator/async
+    /// step-machine can reify a method call whose *arguments* contain an
+    /// `await`/`yield`: evaluate the receiver eagerly, step the arguments (so a
+    /// suspension parks), then complete here with identical semantics (built-in
+    /// dispatch, own-property shadowing, `this` binding, primitive boxing).
+    pub(crate) fn call_member_dispatch(
+        &mut self,
+        recv: NanBox,
+        property: &'a PropertyKey,
+        call_optional: bool,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        // The built-in name-based dispatch (`call_method`) is an
+        // optimization for *unshadowed* built-in methods. If the
+        // receiver carries an *own* property of this name (e.g.
+        // `s.valueOf = Number.prototype.valueOf`), that property is the
+        // method to invoke — resolving and calling the function value
+        // preserves its own `this`-validation (so a cross-type
+        // `Number.prototype.valueOf` call on a String wrapper throws),
+        // rather than the receiver's built-in behavior.
+        if let PropertyKey::Ident(name) | PropertyKey::Str(name) = property
+            && recv
+                .as_handle()
+                .map(Handle::from_raw)
+                .is_some_and(|h| self.realm.has_own(h, name))
+        {
+            let rh = recv.as_handle().map(Handle::from_raw).unwrap();
+            let f = self.read_member(rh, name)?;
+            if f.as_handle()
+                .map(Handle::from_raw)
+                .is_some_and(|fh| self.is_callable(fh))
+            {
+                return self.call_with_this(f, recv, args);
+            }
+        }
+        if let PropertyKey::Ident(name) | PropertyKey::Str(name) = property
+            && let Some(result) = self.call_method(recv, name, args)?
+        {
+            return Ok(result);
+        }
+        // `obj[Symbol.iterator]()` → an iterator over the receiver.
+        if let PropertyKey::Computed(e) = property {
+            let key = self.eval(e)?;
+            let iter_sym = self.well_known_symbol("iterator");
+            if self.realm.strict_equals(key, iter_sym) {
+                // A generator/iterator is its own iterator (identity) —
+                // both the eager built-in iterables (`GEN_BUF`) and a
+                // lazy generator (`GEN_FRAME`).
+                if recv.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                    self.realm.get_property(h, GEN_BUF).is_some()
+                        || self.realm.get_property(h, GEN_FRAME).is_some()
+                        || self.realm.get_property(h, GEN_COLL).is_some()
+                        || self.realm.get_property(h, GEN_TA).is_some()
+                }) {
+                    return Ok(recv);
+                }
+                // A typed array yields a **live** values iterator.
+                if let Some(h) = recv.as_handle().map(Handle::from_raw)
+                    && self.realm.typed_kind(h).is_some()
+                {
+                    return Ok(self.make_live_typed_iterator(h, 1));
+                }
+                // A non-weak Map/Set yields a **live** iterator (a Set
+                // over its values, a Map over its entries), so
+                // `s[Symbol.iterator]()` observes mutation mid-iteration.
+                if let Some(h) = recv.as_handle().map(Handle::from_raw)
+                    && !self.realm.collection_is_weak(h)
+                    && self.realm.collection_entries(h).is_some()
+                {
+                    let is_set = self.realm.collection_is_set(h) == Some(true);
+                    let tag = if is_set {
+                        "Set Iterator"
+                    } else {
+                        "Map Iterator"
+                    };
+                    let kind = if is_set { 1 } else { 2 };
+                    return Ok(self.make_live_collection_iterator(h, kind, tag));
+                }
+                let vals = self.iterate_values(recv)?;
+                // Tag the iterator with the receiver's kind so its
+                // prototype is the real `%ArrayIteratorPrototype%` /
+                // `%StringIteratorPrototype%` / `%Map|SetIteratorPrototype%`.
+                let tag = recv.as_handle().map(Handle::from_raw).and_then(|h| {
+                    if self.realm.array_elements(h).is_some()
+                        || self.realm.is_array(h)
+                        || self.realm.typed_kind(h).is_some()
+                    {
+                        Some("Array Iterator")
+                    } else if self.realm.string_value(h).is_some()
+                        || self
+                            .realm
+                            .get_property(h, PRIM_WRAP_TYPE)
+                            .and_then(|t| t.as_number())
+                            == Some(f64::from(N_STRING))
+                    {
+                        // A primitive string cell, or a boxed `String`
+                        // wrapper (`new String("…")`) whose `[[StringData]]`
+                        // lives in the `PRIM_WRAP` slot.
+                        Some("String Iterator")
+                    } else {
+                        match self.realm.collection_is_set(h) {
+                            Some(true) => Some("Set Iterator"),
+                            Some(false) => Some("Map Iterator"),
+                            None => None,
+                        }
+                    }
+                });
+                return Ok(match tag {
+                    Some(t) => self.make_builtin_iterator(vals, t),
+                    None => self.make_generator(vals),
+                });
+            }
+        }
+        // Not a built-in method: read the member and call it.
+        let Some(raw) = recv.as_handle() else {
+            if call_optional {
+                return Err(ExecError::OptShortCircuit);
+            }
+            // The receiver is a primitive. `null`/`undefined` cannot be
+            // coerced, so any member access is a catchable TypeError.
+            if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                let m = self.new_str("cannot read property of null or undefined");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            // For a number/boolean primitive, an inherited (or
+            // prototype-assigned) method is found by boxing the value and
+            // walking its prototype chain — then invoked with the original
+            // primitive as `this` (e.g.
+            // `Number.prototype.toLowerCase = String.prototype.toLowerCase`,
+            // or a computed key like `false["toString"]()`).
+            let name = match property {
+                PropertyKey::Ident(name) | PropertyKey::Str(name) => {
+                    Some(alloc::string::String::from(&**name))
+                }
+                PropertyKey::Number(n) => Some(self.realm.to_display_string(NanBox::number(*n))),
+                PropertyKey::Computed(e) => {
+                    let k = self.eval(e)?;
+                    Some(self.coerce_property_key(k)?)
+                }
+                PropertyKey::Private(_) => None,
+            };
+            if let Some(name) = name {
+                let boxed = self.coerce_to_object(recv);
+                if let Some(bh) = boxed.as_handle().map(Handle::from_raw) {
+                    let f = self.read_member(bh, &name)?;
+                    if call_optional && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                        return Err(ExecError::OptShortCircuit);
+                    }
+                    if f.as_handle()
+                        .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                    {
+                        return self.call_with_this(f, recv, args);
+                    }
+                }
+            }
+            let m = self.new_str("is not a function");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        };
+        let f = self.member(Handle::from_raw(raw), property)?;
+        // `f?.()` short-circuits when `f` is nullish.
+        if call_optional && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            return Err(ExecError::OptShortCircuit);
+        }
+        // Method call: `this` is the receiver.
+        self.call_with_this(f, recv, args)
     }
 
     /// Reads `property` off the already-evaluated member base `obj` — the tail of
