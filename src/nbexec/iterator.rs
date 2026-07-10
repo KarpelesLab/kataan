@@ -426,6 +426,11 @@ impl<'a> Interp<'a> {
         let Some(h) = this.as_handle().map(Handle::from_raw) else {
             return self.iter_helper_next_body(this);
         };
+        // `Iterator.zip`/`zipKeyed` results share `%IteratorHelperPrototype%` but
+        // drive several underlying iterators — route to the dedicated stepper.
+        if self.realm.get_property(h, ZIP_ITERS).is_some() {
+            return self.iter_zip_next(this);
+        }
         if self
             .realm
             .get_property(h, HELPER_RUNNING)
@@ -709,6 +714,10 @@ impl<'a> Interp<'a> {
     /// `%IteratorHelperPrototype%.return` — closes the helper (and its source).
     pub(crate) fn iter_helper_return(&mut self, this: NanBox) -> Result<NanBox, ExecError> {
         if let Some(h) = this.as_handle().map(Handle::from_raw) {
+            // Zip/zipKeyed results share this prototype — close all sub-iterators.
+            if self.realm.get_property(h, ZIP_ITERS).is_some() {
+                return self.iter_zip_return(this);
+            }
             let already_done = self.realm.get_property(h, HELPER_DONE).is_some();
             self.mark_helper_done(h);
             if !already_done {
@@ -1042,8 +1051,13 @@ impl<'a> Interp<'a> {
     }
 
     /// `Iterator.zip(iterables, options)` / `Iterator.zipKeyed(iterables, options)`
-    /// (the `joint-iteration` proposal). Reads the options, opens each underlying
-    /// iterator (in order), and returns a lazy `%ZipIteratorPrototype%` result.
+    /// (the `joint-iteration` proposal). Reads the options (`mode`, and — only for
+    /// `"longest"` — `padding`) *before* touching the iterables, opens each
+    /// underlying iterator in order (`GetIteratorFlattenable`, interleaved with the
+    /// iteration of `iterables` itself for the positional form), then returns a lazy
+    /// `%IteratorHelperPrototype%` result whose `next` drives all sub-iterators one
+    /// step at a time honoring the shortest/longest/strict mode. On any abrupt
+    /// completion while opening, the already-opened iterators are closed in reverse.
     pub(crate) fn iterator_zip(
         &mut self,
         iterables: NanBox,
@@ -1055,24 +1069,37 @@ impl<'a> Interp<'a> {
         } else {
             "Iterator.zip"
         };
+        // 1. iterables must be an Object.
         if !self.is_object_value(iterables) {
             return Err(self.type_error(&alloc::format!("{what}: iterables is not an object")));
         }
-        // options: undefined → {}; else must be an object.
-        let opts_present = !matches!(options.unpack(), Unpacked::Undefined);
-        if opts_present && !self.is_object_value(options) {
-            return Err(self.type_error(&alloc::format!("{what}: options is not an object")));
-        }
-        // mode (default "shortest").
-        let mode_val = if opts_present {
-            self.read_member(options.as_handle().map(Handle::from_raw).unwrap(), "mode")?
-        } else {
-            NanBox::undefined()
+        // 2. GetOptionsObject(options): undefined → treated as absent; else Object.
+        let opts_h = match options.unpack() {
+            Unpacked::Undefined => None,
+            _ => {
+                if !self.is_object_value(options) {
+                    return Err(
+                        self.type_error(&alloc::format!("{what}: options is not an object"))
+                    );
+                }
+                Some(options.as_handle().map(Handle::from_raw).unwrap())
+            }
+        };
+        // 3-5. mode = Get(options, "mode"); default "shortest". The value must be
+        // exactly one of the three primitive strings (no coercion, String wrappers
+        // rejected) or undefined.
+        let mode_val = match opts_h {
+            Some(oh) => self.read_member(oh, "mode")?,
+            None => NanBox::undefined(),
         };
         let mode = if matches!(mode_val.unpack(), Unpacked::Undefined) {
             0u8
-        } else {
-            let s = self.realm.to_display_string(mode_val);
+        } else if !self.is_object_value(mode_val)
+            && let Some(s) = mode_val
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|mh| self.realm.string_value(mh))
+        {
             match s.as_str() {
                 "shortest" => 0,
                 "longest" => 1,
@@ -1083,175 +1110,384 @@ impl<'a> Interp<'a> {
                     )));
                 }
             }
-        };
-        // Collect (key?, iterable) pairs (before padding, since keyed padding is
-        // read per key).
-        let pairs: Vec<(Option<String>, NanBox)> = if keyed {
-            let h = iterables.as_handle().map(Handle::from_raw).unwrap();
-            let keys = self.realm.object_keys_with_symbols(h);
-            let mut out = Vec::new();
-            for k in keys {
-                // Only string keys participate (per zipKeyed's own enumerable keys);
-                // symbol keys are included too in the spec, but we key by string.
-                let v = self.read_member(h, &k)?;
-                out.push((Some(k), v));
-            }
-            out
         } else {
-            // iterables is itself iterated to a list.
-            let vals = self.iterate_values(iterables)?;
-            vals.into_iter().map(|v| (None, v)).collect()
+            return Err(self.type_error(&alloc::format!(
+                "{what}: mode must be 'shortest', 'longest', or 'strict'"
+            )));
         };
-        // padding (only for longest mode). For `zip` it is an iterable of per-position
-        // fillers; for `zipKeyed` it is an object read per key (matching `pairs`).
+        // 6-7. paddingOption = Get(options, "padding") — read *before* the iterables,
+        // and only when mode is "longest". Must be undefined or an Object.
+        let mut padding_opt = NanBox::undefined();
+        if mode == 1
+            && let Some(oh) = opts_h
+        {
+            padding_opt = self.read_member(oh, "padding")?;
+            if !matches!(padding_opt.unpack(), Unpacked::Undefined)
+                && !self.is_object_value(padding_opt)
+            {
+                return Err(self.type_error(&alloc::format!("{what}: padding is not an object")));
+            }
+        }
+        // 8-12. Open each underlying iterator (in order). The positional form
+        // iterates `iterables` itself; the keyed form walks its own enumerable keys.
+        let mut iters: Vec<NanBox> = Vec::new();
+        let mut nexts: Vec<NanBox> = Vec::new();
+        let mut keys: Vec<NanBox> = Vec::new();
+        if keyed {
+            let ih = iterables.as_handle().map(Handle::from_raw).unwrap();
+            self.zip_open_keyed(ih, &mut iters, &mut nexts, &mut keys)?;
+        } else {
+            self.zip_open_positional(iterables, &mut iters, &mut nexts)?;
+        }
+        let iter_count = iters.len();
+        // 14. padding (longest mode only).
         let mut padding: Vec<NanBox> = Vec::new();
-        if mode == 1 && opts_present {
-            let pad_val = self.read_member(
-                options.as_handle().map(Handle::from_raw).unwrap(),
-                "padding",
-            )?;
-            if !matches!(pad_val.unpack(), Unpacked::Undefined) {
-                if !self.is_object_value(pad_val) {
-                    return Err(
-                        self.type_error(&alloc::format!("{what}: padding is not an object"))
-                    );
-                }
-                if keyed {
-                    let ph = pad_val.as_handle().map(Handle::from_raw).unwrap();
-                    for (k, _) in &pairs {
-                        let pv = self.read_member(ph, k.as_deref().unwrap_or(""))?;
-                        padding.push(pv);
+        if mode == 1 {
+            if matches!(padding_opt.unpack(), Unpacked::Undefined) {
+                padding.resize(iter_count, NanBox::undefined());
+            } else if keyed {
+                // Per-key Get(paddingOption, key).
+                let ph = padding_opt.as_handle().map(Handle::from_raw).unwrap();
+                for key in &keys {
+                    let name = self.member_key(*key);
+                    match self.read_member(ph, &name) {
+                        Ok(v) => padding.push(v),
+                        Err(e) => return Err(self.zip_close_throw(&iters, e)),
                     }
-                } else {
-                    // padding is collected per-iterator (indexed by position).
-                    padding = self.zip_collect_padding(pad_val)?;
                 }
+            } else {
+                self.zip_iterate_padding(padding_opt, &iters, &mut padding, iter_count)?;
             }
         }
-        // Open each iterator (GetIteratorFlattenable), caching its `next`. On an
-        // error opening iterator N, close the already-opened ones.
-        let mut iters: Vec<NanBox> = Vec::with_capacity(pairs.len());
-        let mut nexts: Vec<NanBox> = Vec::with_capacity(pairs.len());
-        let mut keys_vec: Vec<NanBox> = Vec::with_capacity(pairs.len());
-        for (k, iterable) in &pairs {
-            let ih = match self.zip_open_iterator(*iterable) {
-                Ok(h) => h,
-                Err(e) => {
-                    for opened in &iters {
-                        if let Some(oh) = opened.as_handle().map(Handle::from_raw) {
-                            let _ = self.iterator_close(oh);
-                        }
-                    }
-                    return Err(e);
-                }
-            };
-            let next = self.read_member(ih, "next")?;
-            iters.push(NanBox::handle(ih.to_raw()));
-            nexts.push(next);
-            if let Some(ks) = k {
-                let kb = self.new_str(ks);
-                keys_vec.push(kb);
-            }
+        while padding.len() < iter_count {
+            padding.push(NanBox::undefined());
         }
-        // Build the zip-iterator object.
-        let proto = self.iter_ctor_slot(ITER_ZIP_PROTO_SLOT);
+        // Build the lazy result object (a `%IteratorHelperPrototype%` instance).
+        let proto = self.iter_helper_proto();
         let h = self.realm.new_object_with_proto(proto);
         let iters_arr = self.realm.new_array(iters);
         let nexts_arr = self.realm.new_array(nexts);
+        let pad_arr = self.realm.new_array(padding);
+        let fin: Vec<NanBox> = (0..iter_count).map(|_| NanBox::boolean(false)).collect();
+        let fin_arr = self.realm.new_array(fin);
         self.realm
             .set_hidden_property(h, ZIP_ITERS, NanBox::handle(iters_arr.to_raw()));
         self.realm
             .set_hidden_property(h, ZIP_NEXTS, NanBox::handle(nexts_arr.to_raw()));
         self.realm
             .set_hidden_property(h, ZIP_MODE, NanBox::number(f64::from(mode)));
-        // Pad the padding list to the iterator count with undefined.
-        while padding.len() < pairs.len() {
-            padding.push(NanBox::undefined());
-        }
-        let pad_arr = self.realm.new_array(padding);
         self.realm
             .set_hidden_property(h, ZIP_PADDING, NanBox::handle(pad_arr.to_raw()));
-        // Per-iterator finished flags (longest mode), initially all false.
-        let fin: Vec<NanBox> = (0..pairs.len()).map(|_| NanBox::boolean(false)).collect();
-        let fin_arr = self.realm.new_array(fin);
         self.realm
             .set_hidden_property(h, ZIP_FINISHED, NanBox::handle(fin_arr.to_raw()));
         if keyed {
-            let keys_arr = self.realm.new_array(keys_vec);
+            let keys_arr = self.realm.new_array(keys);
             self.realm
                 .set_hidden_property(h, ZIP_KEYS, NanBox::handle(keys_arr.to_raw()));
         }
         Ok(NanBox::handle(h.to_raw()))
     }
 
-    /// Collects `padding[0..]` (the per-iterator filler values) by iterating the
-    /// padding iterable into a list.
-    fn zip_collect_padding(&mut self, padding: NanBox) -> Result<Vec<NanBox>, ExecError> {
-        self.iterate_values(padding)
-    }
-
-    /// GetIteratorFlattenable(value, REJECT_PRIMITIVES) for zip: the value must be
-    /// an object; use its `[Symbol.iterator]` if callable, else (a built-in
-    /// iterable) drain it, else use the object itself as the iterator (it must
-    /// carry its own `next`).
-    fn zip_open_iterator(&mut self, value: NanBox) -> Result<Handle, ExecError> {
-        if !self.is_object_value(value) {
-            return Err(self.type_error("Iterator.zip: an iterable is not an object"));
-        }
-        let vh = value.as_handle().map(Handle::from_raw).unwrap();
-        let iter_fn = self.find_iterator_fn(vh)?;
-        if iter_fn.is_some_and(|fv| {
-            fv.as_handle()
-                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-        }) || self.realm.array_elements(vh).is_some()
-            || self.realm.collection_entries(vh).is_some()
-            || self.realm.get_property(vh, GEN_BUF).is_some()
-        {
-            return self.get_iter_object(value);
-        }
-        // No `[Symbol.iterator]`: the object itself is the iterator.
-        Ok(vh)
-    }
-
-    /// Closes every still-open iterator recorded on a zip-iterator object.
-    fn zip_close_all(&mut self, iters_arr: Handle, skip: usize) -> Result<(), ExecError> {
-        let iters = self
-            .realm
-            .array_elements(iters_arr)
-            .map(<[_]>::to_vec)
-            .unwrap_or_default();
-        // Close the still-open iterators in REVERSE index order (per Iterator.zip:
-        // the abrupt path runs IteratorClose from the last opened down to the
-        // first), skipping the one that already aborted.
-        for (i, it) in iters.iter().enumerate().rev() {
-            if i == skip {
-                continue;
-            }
-            if let Some(ih) = it.as_handle().map(Handle::from_raw) {
-                let _ = self.iterator_close(ih);
+    /// GetIterator(iterables) then, interleaved, `IteratorStepValue` +
+    /// `GetIteratorFlattenable` for each element (positional `Iterator.zip`). On an
+    /// abrupt step the opened iterators are closed (reverse); on an abrupt flatten
+    /// the opened iterators *and* the input iterator are closed (reverse of
+    /// « inputIter » ++ iters).
+    fn zip_open_positional(
+        &mut self,
+        iterables: NanBox,
+        iters: &mut Vec<NanBox>,
+        nexts: &mut Vec<NanBox>,
+    ) -> Result<(), ExecError> {
+        let input_ih = self.get_iter_object(iterables)?;
+        let input_next = self.read_member(input_ih, "next")?;
+        loop {
+            match self.iter_step(input_ih, input_next) {
+                Ok(None) => break,
+                Ok(Some(v)) => match self.zip_get_iterator_flattenable(v) {
+                    Ok((ih, next)) => {
+                        iters.push(NanBox::handle(ih.to_raw()));
+                        nexts.push(next);
+                    }
+                    Err(e) => {
+                        // « inputIter » ++ iters, reverse: iters (reverse) then input.
+                        let err = self.zip_close_throw(iters, e);
+                        let _ = self.iterator_close(input_ih);
+                        return Err(err);
+                    }
+                },
+                Err(e) => return Err(self.zip_close_throw(iters, e)),
             }
         }
         Ok(())
     }
 
-    /// `%ZipIteratorPrototype%.next` — produces one zipped array (or null-proto
-    /// object for zipKeyed), honoring the shortest/longest/strict mode.
+    /// Walks `iterables`' own keys ([[OwnPropertyKeys]] order, strings then symbols),
+    /// and for each *enumerable* key whose value is not undefined opens an iterator
+    /// (`GetIteratorFlattenable`) — the keyed `Iterator.zipKeyed` form. On any abrupt
+    /// completion the already-opened iterators are closed in reverse.
+    fn zip_open_keyed(
+        &mut self,
+        iterables: Handle,
+        iters: &mut Vec<NanBox>,
+        nexts: &mut Vec<NanBox>,
+        keys: &mut Vec<NanBox>,
+    ) -> Result<(), ExecError> {
+        let all_keys = self.own_property_keys_values(iterables)?;
+        for key in all_keys {
+            let name = self.member_key(key);
+            let desc = match self.descriptor_of(iterables, &name) {
+                Ok(d) => d,
+                Err(e) => return Err(self.zip_close_throw(iters, e)),
+            };
+            if matches!(desc.unpack(), Unpacked::Undefined) {
+                continue;
+            }
+            let enumerable = desc
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|dh| self.realm.get_property(dh, "enumerable"))
+                .is_some_and(|v| self.realm.truthy(v));
+            if !enumerable {
+                continue;
+            }
+            let value = match self.read_member(iterables, &name) {
+                Ok(v) => v,
+                Err(e) => return Err(self.zip_close_throw(iters, e)),
+            };
+            if matches!(value.unpack(), Unpacked::Undefined) {
+                continue;
+            }
+            match self.zip_get_iterator_flattenable(value) {
+                Ok((ih, next)) => {
+                    keys.push(key);
+                    iters.push(NanBox::handle(ih.to_raw()));
+                    nexts.push(next);
+                }
+                Err(e) => return Err(self.zip_close_throw(iters, e)),
+            }
+        }
+        Ok(())
+    }
+
+    /// `GetIteratorFlattenable(value, reject-primitives)`: the value must be an
+    /// Object; use its `[Symbol.iterator]` if present (call it), else the object
+    /// itself is the iterator. Returns the iterator and its (once-read) `next`.
+    fn zip_get_iterator_flattenable(
+        &mut self,
+        value: NanBox,
+    ) -> Result<(Handle, NanBox), ExecError> {
+        if !self.is_object_value(value) {
+            return Err(self.type_error("Iterator.zip: an iterable is not an object"));
+        }
+        let vh = value.as_handle().map(Handle::from_raw).unwrap();
+        let iter_sym = self.well_known_symbol("iterator");
+        let iter_key = self.member_key(iter_sym);
+        let mut method = self.read_member(vh, &iter_key)?;
+        if matches!(method.unpack(), Unpacked::Undefined | Unpacked::Null)
+            && let Some(m) = self.class_iterator_method(vh)?
+        {
+            method = m;
+        }
+        let iterator = match method.unpack() {
+            Unpacked::Undefined | Unpacked::Null => value,
+            _ => {
+                if !method
+                    .as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    return Err(self.type_error("Iterator.zip: Symbol.iterator is not a function"));
+                }
+                self.call_with_this(method, value, &[])?
+            }
+        };
+        if !self.is_object_value(iterator) {
+            return Err(self.type_error("Iterator.zip: the iterator is not an object"));
+        }
+        let ih = iterator.as_handle().map(Handle::from_raw).unwrap();
+        let next = self.read_member(ih, "next")?;
+        Ok((ih, next))
+    }
+
+    /// Iterates the `padding` iterable (positional longest mode) exactly `iter_count`
+    /// times, filling any remaining slots (and every slot after it is exhausted) with
+    /// undefined; if the padding iterator was not exhausted it is closed. An abrupt
+    /// completion closes the opened sub-iterators (reverse) and propagates.
+    fn zip_iterate_padding(
+        &mut self,
+        padding_opt: NanBox,
+        iters: &[NanBox],
+        padding: &mut Vec<NanBox>,
+        iter_count: usize,
+    ) -> Result<(), ExecError> {
+        let pad_ih = match self.get_iter_object(padding_opt) {
+            Ok(h) => h,
+            Err(e) => return Err(self.zip_close_throw(iters, e)),
+        };
+        let pad_next = match self.read_member(pad_ih, "next") {
+            Ok(n) => n,
+            Err(e) => return Err(self.zip_close_throw(iters, e)),
+        };
+        let mut using = true;
+        for _ in 0..iter_count {
+            if using {
+                match self.iter_step(pad_ih, pad_next) {
+                    Ok(Some(v)) => padding.push(v),
+                    Ok(None) => {
+                        using = false;
+                        padding.push(NanBox::undefined());
+                    }
+                    Err(e) => return Err(self.zip_close_throw(iters, e)),
+                }
+            } else {
+                padding.push(NanBox::undefined());
+            }
+        }
+        if using && let Err(e) = self.iterator_close(pad_ih) {
+            return Err(self.zip_close_throw(iters, e));
+        }
+        Ok(())
+    }
+
+    /// `IteratorCloseAll(list, ThrowCompletion(e))`: closes a plain list of iterator
+    /// handles in reverse order, swallowing every `return()` error, and returns the
+    /// original throw `e` (which always propagates).
+    fn zip_close_throw(&mut self, iters: &[NanBox], e: ExecError) -> ExecError {
+        for it in iters.iter().rev() {
+            if let Some(ih) = it.as_handle().map(Handle::from_raw) {
+                let _ = self.iterator_close(ih);
+            }
+        }
+        e
+    }
+
+    /// Whether the `fin` flag at index `i` is set (a two-step read to avoid holding
+    /// an immutable `realm` borrow across the mutable `get_element`).
+    fn zip_fin(&mut self, fin: Handle, i: usize) -> bool {
+        let v = self.realm.get_element(fin, i);
+        self.realm.truthy(v)
+    }
+
+    /// `IteratorCloseAll(openIters, NormalCompletion)` over a zip result's recorded
+    /// state: closes every still-open iterator (finished flag false) in reverse index
+    /// order (= reverse of the insertion-ordered `openIters` list), marking each
+    /// finished. The first thrown `return()` becomes the completion.
+    fn zip_close_open_normal(&mut self, iters: Handle, fin: Handle) -> Result<(), ExecError> {
+        let mut completion = Ok(());
+        let count = self.realm.array_elements(iters).map_or(0, <[_]>::len);
+        for i in (0..count).rev() {
+            if self.zip_fin(fin, i) {
+                continue;
+            }
+            self.realm.set_element(fin, i, NanBox::boolean(true));
+            let Some(ih) = self
+                .realm
+                .get_element(iters, i)
+                .as_handle()
+                .map(Handle::from_raw)
+            else {
+                continue;
+            };
+            match &completion {
+                Ok(()) => {
+                    if let Err(e) = self.iterator_close(ih) {
+                        completion = Err(e);
+                    }
+                }
+                Err(_) => {
+                    let _ = self.iterator_close(ih);
+                }
+            }
+        }
+        completion
+    }
+
+    /// `IteratorCloseAll(openIters, ThrowCompletion(e))`: closes every still-open
+    /// iterator (reverse index order), swallows their errors, returns the throw `e`.
+    fn zip_close_open_throw(&mut self, iters: Handle, fin: Handle, e: ExecError) -> ExecError {
+        let count = self.realm.array_elements(iters).map_or(0, <[_]>::len);
+        for i in (0..count).rev() {
+            if self.zip_fin(fin, i) {
+                continue;
+            }
+            self.realm.set_element(fin, i, NanBox::boolean(true));
+            if let Some(ih) = self
+                .realm
+                .get_element(iters, i)
+                .as_handle()
+                .map(Handle::from_raw)
+            {
+                let _ = self.iterator_close(ih);
+            }
+        }
+        e
+    }
+
+    /// `%IteratorHelperPrototype%.next` for an `Iterator.zip`/`zipKeyed` result:
+    /// runs one closure step (with the shared reentrancy guard), wrapping the result.
     pub(crate) fn iter_zip_next(&mut self, this: NanBox) -> Result<NanBox, ExecError> {
         let Some(h) = this.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("Zip Iterator next called on non-object"));
         };
+        // Reentrancy guard (GeneratorValidate: already executing → TypeError).
+        if self
+            .realm
+            .get_property(h, HELPER_RUNNING)
+            .is_some_and(|v| self.realm.truthy(v))
+        {
+            return Err(self.type_error("Iterator Helper is already running"));
+        }
         if self.realm.get_property(h, ZIP_DONE).is_some() {
             return Ok(self.iter_result(NanBox::undefined(), true));
         }
-        let iters_arr = self
+        self.realm
+            .set_hidden_property(h, HELPER_RUNNING, NanBox::boolean(true));
+        let result = self.zip_step(h);
+        self.realm.delete_property(h, HELPER_RUNNING);
+        match result {
+            Ok(Some(v)) => {
+                // A yielded value moves the generator to "suspended-yield".
+                self.realm
+                    .set_hidden_property(h, ZIP_STARTED, NanBox::boolean(true));
+                Ok(self.iter_result(v, false))
+            }
+            Ok(None) => {
+                self.realm
+                    .set_hidden_property(h, ZIP_DONE, NanBox::boolean(true));
+                Ok(self.iter_result(NanBox::undefined(), true))
+            }
+            Err(e) => {
+                self.realm
+                    .set_hidden_property(h, ZIP_DONE, NanBox::boolean(true));
+                Err(e)
+            }
+        }
+    }
+
+    /// One `IteratorZip` closure step: produces the next zipped array (`zip`) or
+    /// null-prototype object (`zipKeyed`), or `None` when the whole zip is done.
+    fn zip_step(&mut self, h: Handle) -> Result<Option<NanBox>, ExecError> {
+        let iters = self
             .realm
             .get_property(h, ZIP_ITERS)
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .unwrap();
-        let nexts_arr = self
+        let nexts = self
             .realm
             .get_property(h, ZIP_NEXTS)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .unwrap();
+        let fin = self
+            .realm
+            .get_property(h, ZIP_FINISHED)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .unwrap();
+        let padding = self
+            .realm
+            .get_property(h, ZIP_PADDING)
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .unwrap();
@@ -1260,178 +1496,165 @@ impl<'a> Interp<'a> {
             .get_property(h, ZIP_MODE)
             .and_then(|n| n.as_number())
             .unwrap_or(0.0) as u8;
-        let count = self.realm.array_elements(iters_arr).map_or(0, |e| e.len());
-        if count == 0 {
-            // Zero iterators: zip is immediately done.
-            self.realm
-                .set_hidden_property(h, ZIP_DONE, NanBox::boolean(true));
-            return Ok(self.iter_result(NanBox::undefined(), true));
+        let count = self.realm.array_elements(iters).map_or(0, <[_]>::len);
+        // If openIters is empty, the zip is done.
+        if (0..count).all(|i| self.zip_fin(fin, i)) {
+            return Ok(None);
         }
-        let mut values: Vec<NanBox> = Vec::with_capacity(count);
-        let mut any_live = false;
-        let mut all_done_strict = true;
+        let mut results: Vec<NanBox> = Vec::with_capacity(count);
         for i in 0..count {
-            let fin_arr = self
-                .realm
-                .get_property(h, ZIP_FINISHED)
-                .and_then(|v| v.as_handle())
-                .map(Handle::from_raw)
-                .unwrap();
-            let already_fin = self.realm.get_element(fin_arr, i);
-            if mode == 1 && self.realm.truthy(already_fin) {
-                // Longest mode: a finished iterator contributes its padding value.
-                let pad_arr = self
-                    .realm
-                    .get_property(h, ZIP_PADDING)
-                    .and_then(|v| v.as_handle())
-                    .map(Handle::from_raw)
-                    .unwrap();
-                values.push(self.realm.get_element(pad_arr, i));
+            if self.zip_fin(fin, i) {
+                // A finished iterator (longest) contributes its padding value.
+                results.push(self.realm.get_element(padding, i));
                 continue;
             }
-            let it = self.realm.get_element(iters_arr, i);
-            let next = self.realm.get_element(nexts_arr, i);
-            let ih = it.as_handle().map(Handle::from_raw).unwrap();
-            let step = self.iter_step(ih, next);
-            match step {
-                Ok(Some(v)) => {
-                    values.push(v);
-                    any_live = true;
-                    all_done_strict = false;
+            let ih = self
+                .realm
+                .get_element(iters, i)
+                .as_handle()
+                .map(Handle::from_raw)
+                .unwrap();
+            let next = self.realm.get_element(nexts, i);
+            match self.iter_step(ih, next) {
+                Ok(Some(v)) => results.push(v),
+                Err(e) => {
+                    self.realm.set_element(fin, i, NanBox::boolean(true));
+                    return Err(self.zip_close_open_throw(iters, fin, e));
                 }
                 Ok(None) => {
+                    // Remove this iterator from openIters.
+                    self.realm.set_element(fin, i, NanBox::boolean(true));
                     match mode {
                         0 => {
-                            // shortest: this iterator is done → close the others, finish.
-                            self.realm
-                                .set_hidden_property(h, ZIP_DONE, NanBox::boolean(true));
-                            self.zip_close_all(iters_arr, i)?;
-                            return Ok(self.iter_result(NanBox::undefined(), true));
+                            // shortest: close the remaining open iterators, finish.
+                            self.zip_close_open_normal(iters, fin)?;
+                            return Ok(None);
                         }
                         2 => {
-                            // strict: if this is the first iterator's first done, the
-                            // others must also be done; otherwise a TypeError.
-                            if i == 0 {
-                                // Verify all remaining are also done.
-                                let ok =
-                                    self.zip_strict_verify_rest(iters_arr, nexts_arr, count)?;
-                                self.realm
-                                    .set_hidden_property(h, ZIP_DONE, NanBox::boolean(true));
-                                if ok {
-                                    return Ok(self.iter_result(NanBox::undefined(), true));
-                                }
-                                return Err(self.type_error(
+                            // strict: a later iterator finishing first is a mismatch.
+                            if i != 0 {
+                                let te = self.type_error(
                                     "Iterator.zip strict mode: iterators have different lengths",
-                                ));
+                                );
+                                return Err(self.zip_close_open_throw(iters, fin, te));
                             }
-                            // A later iterator finished before the first → length mismatch.
-                            self.realm
-                                .set_hidden_property(h, ZIP_DONE, NanBox::boolean(true));
-                            self.zip_close_all(iters_arr, i)?;
-                            return Err(self.type_error(
-                                "Iterator.zip strict mode: iterators have different lengths",
-                            ));
+                            // The first finished: every other iterator must also be
+                            // done on this step (IteratorStep, value not read).
+                            for k in 1..count {
+                                let kh = self
+                                    .realm
+                                    .get_element(iters, k)
+                                    .as_handle()
+                                    .map(Handle::from_raw)
+                                    .unwrap();
+                                let knext = self.realm.get_element(nexts, k);
+                                match self.iter_step_done(kh, knext) {
+                                    Ok(true) => {
+                                        self.realm.set_element(fin, k, NanBox::boolean(true));
+                                    }
+                                    Ok(false) => {
+                                        let te = self.type_error(
+                                            "Iterator.zip strict mode: iterators have different lengths",
+                                        );
+                                        return Err(self.zip_close_open_throw(iters, fin, te));
+                                    }
+                                    Err(e) => {
+                                        self.realm.set_element(fin, k, NanBox::boolean(true));
+                                        return Err(self.zip_close_open_throw(iters, fin, e));
+                                    }
+                                }
+                            }
+                            return Ok(None);
                         }
                         _ => {
-                            // longest: mark finished, contribute padding.
-                            let fin_arr2 = self
-                                .realm
-                                .get_property(h, ZIP_FINISHED)
-                                .and_then(|v| v.as_handle())
-                                .map(Handle::from_raw)
-                                .unwrap();
-                            self.realm.set_element(fin_arr2, i, NanBox::boolean(true));
-                            let pad_arr = self
-                                .realm
-                                .get_property(h, ZIP_PADDING)
-                                .and_then(|v| v.as_handle())
-                                .map(Handle::from_raw)
-                                .unwrap();
-                            values.push(self.realm.get_element(pad_arr, i));
+                            // longest: when the last live iterator finishes, we are
+                            // done; otherwise this slot contributes its padding.
+                            if (0..count).all(|j| self.zip_fin(fin, j)) {
+                                return Ok(None);
+                            }
+                            results.push(self.realm.get_element(padding, i));
                         }
                     }
                 }
-                Err(e) => {
-                    self.realm
-                        .set_hidden_property(h, ZIP_DONE, NanBox::boolean(true));
-                    self.zip_close_all(iters_arr, i)?;
-                    return Err(e);
-                }
             }
         }
-        let _ = all_done_strict;
-        // Longest mode: when every iterator is finished, the zip is done.
-        if mode == 1 && !any_live {
-            self.realm
-                .set_hidden_property(h, ZIP_DONE, NanBox::boolean(true));
-            return Ok(self.iter_result(NanBox::undefined(), true));
+        Ok(Some(self.zip_finish_results(h, results)))
+    }
+
+    /// One `IteratorStep` (done-only, does not read `value`): returns whether the
+    /// iterator is done. Used by strict-mode "all remaining are done" verification.
+    fn iter_step_done(&mut self, it: Handle, next: NanBox) -> Result<bool, ExecError> {
+        let res = self.call_with_this(next, NanBox::handle(it.to_raw()), &[])?;
+        if !self.is_object_value(res) {
+            return Err(self.type_error("iterator result is not an object"));
         }
-        // Build the result: an array (zip) or a null-proto object keyed by the
-        // recorded keys (zipKeyed).
-        let result = if let Some(keys_arr) = self
+        let rh = Handle::from_raw(res.as_handle().unwrap());
+        let done = self.read_member(rh, "done")?;
+        Ok(self.realm.truthy(done))
+    }
+
+    /// Builds the yielded value from a step's per-iterator results: a fresh Array
+    /// (`zip`) or a null-prototype object keyed by the recorded keys (`zipKeyed`).
+    fn zip_finish_results(&mut self, h: Handle, results: Vec<NanBox>) -> NanBox {
+        if let Some(keys) = self
             .realm
             .get_property(h, ZIP_KEYS)
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
         {
             let obj = self.realm.new_object_with_proto(None);
-            for (i, v) in values.into_iter().enumerate() {
-                let k = self.realm.get_element(keys_arr, i);
-                let ks = self.realm.to_display_string(k);
-                self.realm.set_property(obj, &ks, v);
+            for (i, v) in results.into_iter().enumerate() {
+                let key = self.realm.get_element(keys, i);
+                let name = self.member_key(key);
+                self.realm.set_property(obj, &name, v);
             }
             NanBox::handle(obj.to_raw())
         } else {
-            NanBox::handle(self.realm.new_array(values).to_raw())
-        };
-        Ok(self.iter_result(result, false))
-    }
-
-    /// Strict-mode helper: after the first iterator reports done, verify every
-    /// other iterator is also done (a live value is a length mismatch). Closes any
-    /// iterator that is *not* done. Returns Ok(true) if all are done.
-    fn zip_strict_verify_rest(
-        &mut self,
-        iters_arr: Handle,
-        nexts_arr: Handle,
-        count: usize,
-    ) -> Result<bool, ExecError> {
-        for i in 1..count {
-            let it = self.realm.get_element(iters_arr, i);
-            let next = self.realm.get_element(nexts_arr, i);
-            let ih = it.as_handle().map(Handle::from_raw).unwrap();
-            match self.iter_step(ih, next)? {
-                None => {}
-                Some(_) => {
-                    // This one still had a value → mismatch; close the rest.
-                    for j in (i + 1)..count {
-                        let oj = self.realm.get_element(iters_arr, j);
-                        if let Some(oh) = oj.as_handle().map(Handle::from_raw) {
-                            let _ = self.iterator_close(oh);
-                        }
-                    }
-                    return Ok(false);
-                }
-            }
+            NanBox::handle(self.realm.new_array(results).to_raw())
         }
-        Ok(true)
     }
 
-    /// `%ZipIteratorPrototype%.return` — closes every open underlying iterator.
+    /// `%IteratorHelperPrototype%.return` for an `Iterator.zip`/`zipKeyed` result —
+    /// closes every still-open underlying iterator (reverse order), under the
+    /// shared reentrancy guard, and propagates the first thrown `return()`.
     pub(crate) fn iter_zip_return(&mut self, this: NanBox) -> Result<NanBox, ExecError> {
         if let Some(h) = this.as_handle().map(Handle::from_raw) {
+            if self
+                .realm
+                .get_property(h, HELPER_RUNNING)
+                .is_some_and(|v| self.realm.truthy(v))
+            {
+                return Err(self.type_error("Iterator Helper is already running"));
+            }
             let already = self.realm.get_property(h, ZIP_DONE).is_some();
-            self.realm
-                .set_hidden_property(h, ZIP_DONE, NanBox::boolean(true));
-            if !already
-                && let Some(iters_arr) = self
+            if !already {
+                self.realm
+                    .set_hidden_property(h, ZIP_DONE, NanBox::boolean(true));
+                let iters = self
                     .realm
                     .get_property(h, ZIP_ITERS)
                     .and_then(|v| v.as_handle())
-                    .map(Handle::from_raw)
-            {
-                let count = self.realm.array_elements(iters_arr).map_or(0, |e| e.len());
-                self.zip_close_all(iters_arr, count + 1)?;
+                    .map(Handle::from_raw);
+                let fin = self
+                    .realm
+                    .get_property(h, ZIP_FINISHED)
+                    .and_then(|v| v.as_handle())
+                    .map(Handle::from_raw);
+                if let (Some(iters), Some(fin)) = (iters, fin) {
+                    // Only a *started* (suspended-yield) generator closes as
+                    // "executing" (reentrant next/return throw). A suspended-start
+                    // generator is already "completed", so no running guard.
+                    let started = self.realm.get_property(h, ZIP_STARTED).is_some();
+                    if started {
+                        self.realm
+                            .set_hidden_property(h, HELPER_RUNNING, NanBox::boolean(true));
+                    }
+                    let r = self.zip_close_open_normal(iters, fin);
+                    if started {
+                        self.realm.delete_property(h, HELPER_RUNNING);
+                    }
+                    r?;
+                }
             }
         }
         Ok(self.iter_result(NanBox::undefined(), true))

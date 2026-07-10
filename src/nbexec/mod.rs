@@ -2411,6 +2411,11 @@ const ZIP_KEYS: &str = "\u{0}zkeys";
 const ZIP_DONE: &str = "\u{0}zdone";
 /// Per-iterator "already finished" flags (longest mode), as a parallel array.
 const ZIP_FINISHED: &str = "\u{0}zfin";
+/// Set once the zip result has yielded a value (generator moved to
+/// "suspended-yield"); distinguishes a `return()` that closes as "executing"
+/// (reentrant calls throw) from a "suspended-start" one (reentrant calls
+/// return done).
+const ZIP_STARTED: &str = "\u{0}zstart";
 /// Reserved hidden keys for a bound function (`Function.prototype.bind`).
 /// Hidden slot holding a primitive-wrapper object's boxed value, and its
 /// constructor id (for `instanceof`).
