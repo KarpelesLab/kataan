@@ -3,10 +3,14 @@
 //! method/getter/static logic), so it can be implemented independently of the
 //! other Temporal types and of the shared wiring in `temporal.rs`.
 //!
-//! A `PlainDateTime` is a calendar date plus a wall-clock time (no time zone),
-//! calendar `"iso8601"`. It stores both `TemporalData.date` (`IsoDate`) and
-//! `TemporalData.time` (`IsoTime`) and is essentially `PlainDate + PlainTime`
-//! combined, reusing the shared `crate::temporal_iso` helpers.
+//! A `PlainDateTime` is a calendar date plus a wall-clock time (no time zone).
+//! It stores both `TemporalData.date` (`IsoDate`) and `TemporalData.time`
+//! (`IsoTime`) plus a calendar id in `TemporalData.calendar` (default
+//! `"iso8601"`); it is essentially `PlainDate + PlainTime` combined, reusing the
+//! shared `crate::temporal_iso` helpers. The calendar-dependent date fields route
+//! through [`super::temporal_calendar`] for a non-ISO calendar, keeping the ISO
+//! fast path byte-for-byte unchanged; the wall-clock time is calendar-independent.
+use super::temporal_calendar as tcal;
 use super::*;
 #[cfg(not(feature = "std"))]
 use crate::common::FloatExt;
@@ -93,6 +97,42 @@ impl DtBag {
 
     fn any_time(&self) -> bool {
         self.hour.is_some()
+            || self.minute.is_some()
+            || self.second.is_some()
+            || self.ms.is_some()
+            || self.us.is_some()
+            || self.ns.is_some()
+    }
+}
+
+/// The recognised calendar/time fields of a **non-ISO** date-time property bag —
+/// like [`DtBag`] but carrying `era`/`eraYear` and the raw `monthCode` string (the
+/// calendar layer judges its suitability), for `CalendarDateFromFields`.
+#[derive(Default)]
+struct CalDtBag {
+    era: Option<String>,
+    era_year: Option<i64>,
+    year: Option<i64>,
+    month: Option<i64>,
+    month_code: Option<String>,
+    day: Option<i64>,
+    hour: Option<i64>,
+    minute: Option<i64>,
+    second: Option<i64>,
+    ms: Option<i64>,
+    us: Option<i64>,
+    ns: Option<i64>,
+}
+
+impl CalDtBag {
+    fn any(&self) -> bool {
+        self.era.is_some()
+            || self.era_year.is_some()
+            || self.year.is_some()
+            || self.month.is_some()
+            || self.month_code.is_some()
+            || self.day.is_some()
+            || self.hour.is_some()
             || self.minute.is_some()
             || self.second.is_some()
             || self.ms.is_some()
@@ -189,8 +229,9 @@ impl<'a> Interp<'a> {
         let ms = self.pdt_to_int_opt(arg(6))?;
         let us = self.pdt_to_int_opt(arg(7))?;
         let ns = self.pdt_to_int_opt(arg(8))?;
-        // calendar (10th arg): must be a String naming "iso8601" (case-insensitive).
-        self.pdt_calendar_arg(arg(9))?;
+        // calendar (10th arg): undefined → iso8601; a String → canonicalized (the
+        // full Temporal calendar-id set); a non-string → TypeError.
+        let calendar = self.pdt_validate_calendar(arg(9))?;
 
         let date = self.pdt_regulate_date(year, month, day, Overflow::Reject)?;
         let time = iso::regulate_iso_time(hour, minute, second, ms, us, ns, Overflow::Reject)
@@ -202,6 +243,7 @@ impl<'a> Interp<'a> {
             kind: TemporalKind::PlainDateTime,
             date,
             time,
+            calendar,
             ..Default::default()
         };
         self.finish_temporal(data, new_target, callee)
@@ -226,11 +268,11 @@ impl<'a> Interp<'a> {
             "since" => self.pdt_diff(data, arg(0), arg(1), true),
             "round" => self.pdt_round(data, arg(0)),
             "equals" => {
-                let (d2, t2) = self.pdt_to_datetime(arg(0), NanBox::undefined())?;
-                let eq = data.date == d2 && data.time == t2;
+                let (d2, t2, cal2) = self.pdt_to_datetime(arg(0), NanBox::undefined())?;
+                let eq = data.date == d2 && data.time == t2 && data.calendar == cal2;
                 Ok(NanBox::boolean(eq))
             }
-            "toPlainDate" => Ok(self.pdt_make_date(data.date)),
+            "toPlainDate" => Ok(self.pdt_make_date(data.date, &data.calendar)),
             "toPlainTime" => Ok(self.pdt_make_time(data.time)),
             "toString" => self.pdt_to_string(data, arg(0)),
             "toJSON" | "toLocaleString" => self.pdt_to_string(data, NanBox::undefined()),
@@ -250,6 +292,7 @@ impl<'a> Interp<'a> {
                     kind: crate::temporal_iso::TemporalKind::ZonedDateTime,
                     epoch_ns: local_ns - offset,
                     tz: Some(tz),
+                    calendar: data.calendar.clone(),
                     ..Default::default()
                 }))
             }
@@ -266,32 +309,74 @@ impl<'a> Interp<'a> {
     ) -> Result<NanBox, ExecError> {
         let d = data.date;
         let t = data.time;
+        let cal = data.calendar.as_str();
         let num = |n: i64| NanBox::number(n as f64);
+        // Calendar-independent getters (the wall-clock time + the calendar id).
+        match name {
+            "calendarId" => return Ok(self.new_str(cal)),
+            "hour" => return Ok(num(i64::from(t.hour))),
+            "minute" => return Ok(num(i64::from(t.minute))),
+            "second" => return Ok(num(i64::from(t.second))),
+            "millisecond" => return Ok(num(i64::from(t.millisecond))),
+            "microsecond" => return Ok(num(i64::from(t.microsecond))),
+            "nanosecond" => return Ok(num(i64::from(t.nanosecond))),
+            _ => {}
+        }
+        // ISO-8601 fast path — byte-for-byte the original computation.
+        if tcal::is_iso(cal) {
+            return Ok(match name {
+                "era" | "eraYear" => NanBox::undefined(),
+                "year" => num(i64::from(d.year)),
+                "month" => num(i64::from(d.month)),
+                "monthCode" => {
+                    let s = alloc::format!("M{}", iso::pad(u64::from(d.month), 2));
+                    self.new_str(&s)
+                }
+                "day" => num(i64::from(d.day)),
+                "dayOfWeek" => num(i64::from(iso::iso_day_of_week(d))),
+                "dayOfYear" => num(i64::from(iso::iso_day_of_year(d))),
+                "weekOfYear" => num(i64::from(iso::iso_week_of_year(d).0)),
+                "yearOfWeek" => num(i64::from(iso::iso_week_of_year(d).1)),
+                "daysInWeek" => num(7),
+                "daysInMonth" => num(i64::from(iso::iso_days_in_month(d.year, d.month))),
+                "daysInYear" => num(i64::from(iso::iso_days_in_year(d.year))),
+                "monthsInYear" => num(12),
+                "inLeapYear" => NanBox::boolean(iso::is_leap_year(d.year)),
+                _ => {
+                    return Err(self.temporal_todo(&alloc::format!("PlainDateTime getter {name}")));
+                }
+            });
+        }
+        // Non-ISO calendar: route through the calendar abstraction layer.
+        let f = tcal::iso_to_fields(cal, d);
         Ok(match name {
-            "calendarId" => self.new_str("iso8601"),
-            "era" | "eraYear" => NanBox::undefined(),
-            "year" => num(i64::from(d.year)),
-            "month" => num(i64::from(d.month)),
-            "monthCode" => {
-                let s = alloc::format!("M{}", iso::pad(u64::from(d.month), 2));
-                self.new_str(&s)
-            }
-            "day" => num(i64::from(d.day)),
-            "hour" => num(i64::from(t.hour)),
-            "minute" => num(i64::from(t.minute)),
-            "second" => num(i64::from(t.second)),
-            "millisecond" => num(i64::from(t.millisecond)),
-            "microsecond" => num(i64::from(t.microsecond)),
-            "nanosecond" => num(i64::from(t.nanosecond)),
-            "dayOfWeek" => num(i64::from(iso::iso_day_of_week(d))),
-            "dayOfYear" => num(i64::from(iso::iso_day_of_year(d))),
-            "weekOfYear" => num(i64::from(iso::iso_week_of_year(d).0)),
-            "yearOfWeek" => num(i64::from(iso::iso_week_of_year(d).1)),
-            "daysInWeek" => num(7),
-            "daysInMonth" => num(i64::from(iso::iso_days_in_month(d.year, d.month))),
-            "daysInYear" => num(i64::from(iso::iso_days_in_year(d.year))),
-            "monthsInYear" => num(12),
-            "inLeapYear" => NanBox::boolean(iso::is_leap_year(d.year)),
+            "era" => match &f.era {
+                Some(e) => self.new_str(e),
+                None => NanBox::undefined(),
+            },
+            "eraYear" => match f.era_year {
+                Some(y) => NanBox::number(y as f64),
+                None => NanBox::undefined(),
+            },
+            "year" => NanBox::number(f.year as f64),
+            "month" => NanBox::number(f.month as f64),
+            "monthCode" => self.new_str(&f.month_code),
+            "day" => NanBox::number(f.day as f64),
+            "dayOfWeek" => NanBox::number(tcal::day_of_week(d) as f64),
+            "dayOfYear" => NanBox::number(tcal::day_of_year(cal, d) as f64),
+            "weekOfYear" => match tcal::week_of_year(cal, d) {
+                Some((w, _)) => NanBox::number(w as f64),
+                None => NanBox::undefined(),
+            },
+            "yearOfWeek" => match tcal::year_of_week(cal, d) {
+                Some(y) => NanBox::number(y as f64),
+                None => NanBox::undefined(),
+            },
+            "daysInWeek" => NanBox::number(tcal::days_in_week() as f64),
+            "daysInMonth" => NanBox::number(tcal::days_in_month(cal, d) as f64),
+            "daysInYear" => NanBox::number(tcal::days_in_year(cal, d) as f64),
+            "monthsInYear" => NanBox::number(tcal::months_in_year(cal, d) as f64),
+            "inLeapYear" => NanBox::boolean(tcal::in_leap_year(cal, d)),
             _ => return Err(self.temporal_todo(&alloc::format!("PlainDateTime getter {name}"))),
         })
     }
@@ -306,12 +391,12 @@ impl<'a> Interp<'a> {
         let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
         match method {
             "from" => {
-                let (date, time) = self.pdt_to_datetime(arg(0), arg(1))?;
-                Ok(Some(self.pdt_make(date, time)))
+                let (date, time, cal) = self.pdt_to_datetime(arg(0), arg(1))?;
+                Ok(Some(self.pdt_make_cal(date, time, &cal)))
             }
             "compare" => {
-                let (d1, t1) = self.pdt_to_datetime(arg(0), NanBox::undefined())?;
-                let (d2, t2) = self.pdt_to_datetime(arg(1), NanBox::undefined())?;
+                let (d1, t1, _) = self.pdt_to_datetime(arg(0), NanBox::undefined())?;
+                let (d2, t2, _) = self.pdt_to_datetime(arg(1), NanBox::undefined())?;
                 let ord = iso::compare_iso_date(d1, d2).then(iso::compare_iso_time(t1, t2));
                 Ok(Some(NanBox::number(match ord {
                     core::cmp::Ordering::Less => -1.0,
@@ -366,19 +451,16 @@ impl<'a> Interp<'a> {
             .ok_or_else(|| self.pdt_range("invalid ISO date"))
     }
 
-    /// Validates a constructor/`withCalendar` calendar argument: it must be a
-    /// primitive String naming `iso8601` (case-insensitive). Non-strings →
-    /// TypeError; unknown calendar → RangeError. `undefined` is accepted.
-    fn pdt_calendar_arg(&mut self, v: NanBox) -> Result<(), ExecError> {
+    /// Validates a constructor/`withCalendar` calendar argument and returns its
+    /// canonical id: `undefined` → `"iso8601"`; a calendared Temporal object → its
+    /// id; a String → canonicalized against the full Temporal calendar-id set
+    /// (unknown → RangeError); a non-string → TypeError.
+    fn pdt_validate_calendar(&mut self, v: NanBox) -> Result<String, ExecError> {
         if v.is_undefined() {
-            return Ok(());
+            return Ok(String::from("iso8601"));
         }
         if let Some(cal) = self.temporal_object_calendar(v) {
-            return if cal.eq_ignore_ascii_case("iso8601") {
-                Ok(())
-            } else {
-                Err(self.pdt_range("only the iso8601 calendar is supported"))
-            };
+            return self.pdt_canonicalize_calendar(&cal);
         }
         let Some(s) = v
             .as_handle()
@@ -387,47 +469,47 @@ impl<'a> Interp<'a> {
         else {
             return Err(self.type_error("calendar must be a string"));
         };
-        if s.eq_ignore_ascii_case("iso8601") {
-            Ok(())
-        } else {
-            Err(self.pdt_range("only the iso8601 calendar is supported"))
+        self.pdt_canonicalize_calendar(&s)
+    }
+
+    /// Canonicalizes a calendar identifier against the full Temporal calendar set
+    /// (CLDR aliases, ASCII-case-insensitively); an unsupported id → RangeError.
+    fn pdt_canonicalize_calendar(&mut self, s: &str) -> Result<String, ExecError> {
+        match tcal::canonicalize_calendar(s) {
+            Some(c) => Ok(String::from(c)),
+            None => Err(self.pdt_range(&alloc::format!("invalid calendar identifier '{s}'"))),
         }
     }
 
-    /// Reads and validates the optional `calendar` field of a property bag (for
-    /// `from`/`compare`/`equals`/`until`/`since`). A string must name `iso8601`
-    /// (case-insensitive); a non-string, non-object value → TypeError.
-    fn pdt_bag_calendar(&mut self, h: Handle) -> Result<(), ExecError> {
+    /// Reads the optional `calendar` field of a property bag (for `from`/`with`
+    /// etc.) and returns its canonical id (default `"iso8601"`). A calendared
+    /// Temporal object supplies its `[[Calendar]]`; a string is either a calendar
+    /// id or a parseable ISO string whose `[u-ca=…]` annotation supplies one; a
+    /// non-string, non-object value → TypeError; an unsupported id → RangeError.
+    fn pdt_bag_calendar(&mut self, h: Handle) -> Result<String, ExecError> {
         let Some(v) = self.pdt_field(h, "calendar")? else {
-            return Ok(());
+            return Ok(String::from("iso8601"));
         };
-        // A *calendared* Temporal object supplies its `[[Calendar]]` via the fast
-        // path (no property read). Non-calendared objects (`{}`, `Duration`, …)
-        // and every other non-string value are a TypeError.
         if let Some(cal) = self.temporal_object_calendar(v) {
-            return if cal.eq_ignore_ascii_case("iso8601") {
-                Ok(())
-            } else {
-                Err(self.pdt_range("only the iso8601 calendar is supported"))
-            };
+            return self.pdt_canonicalize_calendar(&cal);
         }
-        if let Some(s) = v
+        let Some(s) = v
             .as_handle()
             .map(Handle::from_raw)
             .and_then(|x| self.realm.string_value(x))
-        {
-            // A calendar identifier (`"iso8601"`, case-insensitive) or a date-ish
-            // ISO string whose `[u-ca=…]` annotations (if any) all name `iso8601`.
-            // Partial forms (`"2020-01"`, `"01-01"`) are accepted for the calendar
-            // slot even though they are not full PlainDateTime strings.
-            if pdt_calendar_string_ok(&s) {
-                Ok(())
-            } else {
-                Err(self.pdt_range("only the iso8601 calendar is supported"))
-            }
-        } else {
-            Err(self.type_error("calendar must be a string"))
+        else {
+            return Err(self.type_error("calendar must be a string"));
+        };
+        // A bare calendar identifier, or a date-ish ISO string whose `[u-ca=…]`
+        // annotation names one. Partial forms (`"2020-01"`, `"01-01"`) are accepted
+        // for the calendar slot even though they are not full PlainDateTime strings.
+        if let Some(c) = tcal::canonicalize_calendar(&s) {
+            return Ok(String::from(c));
         }
+        if let Some(c) = pdt_calendar_string_id(&s) {
+            return Ok(c);
+        }
+        Err(self.pdt_range(&alloc::format!("invalid calendar identifier '{s}'")))
     }
 
     // --- options helpers ---------------------------------------------------
@@ -571,6 +653,95 @@ impl<'a> Interp<'a> {
         Ok(bag)
     }
 
+    /// `PrepareTemporalFields` for a **non-ISO** date-time property bag, reading the
+    /// recognised keys (including `era`/`eraYear`) in alphabetical order. Unlike the
+    /// ISO reader, `monthCode` is kept as its raw well-formed string — the calendar
+    /// layer decides its suitability.
+    fn pdt_read_bag_cal(&mut self, h: Handle) -> Result<CalDtBag, ExecError> {
+        let mut bag = CalDtBag::default();
+        if let Some(v) = self.pdt_field(h, "day")? {
+            bag.day = Some(self.pdt_to_int(v)?);
+        }
+        if let Some(v) = self.pdt_field(h, "era")? {
+            bag.era = Some(self.coerce_to_string(v)?);
+        }
+        if let Some(v) = self.pdt_field(h, "eraYear")? {
+            bag.era_year = Some(self.pdt_to_int(v)?);
+        }
+        if let Some(v) = self.pdt_field(h, "hour")? {
+            bag.hour = Some(self.pdt_to_int(v)?);
+        }
+        if let Some(v) = self.pdt_field(h, "microsecond")? {
+            bag.us = Some(self.pdt_to_int(v)?);
+        }
+        if let Some(v) = self.pdt_field(h, "millisecond")? {
+            bag.ms = Some(self.pdt_to_int(v)?);
+        }
+        if let Some(v) = self.pdt_field(h, "minute")? {
+            bag.minute = Some(self.pdt_to_int(v)?);
+        }
+        if let Some(v) = self.pdt_field(h, "month")? {
+            bag.month = Some(self.pdt_to_int(v)?);
+        }
+        if let Some(v) = self.pdt_field(h, "monthCode")? {
+            let prim = self.coerce_primitive(v, "string")?;
+            let Some(s) = prim
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|x| self.realm.string_value(x))
+            else {
+                return Err(self.type_error("monthCode must be a string"));
+            };
+            // Well-formedness only (M + two digits + optional L); the calendar layer
+            // checks whether the code occurs in the year.
+            parse_month_code(&s).ok_or_else(|| self.pdt_range("invalid monthCode"))?;
+            bag.month_code = Some(s);
+        }
+        if let Some(v) = self.pdt_field(h, "nanosecond")? {
+            bag.ns = Some(self.pdt_to_int(v)?);
+        }
+        if let Some(v) = self.pdt_field(h, "second")? {
+            bag.second = Some(self.pdt_to_int(v)?);
+        }
+        if let Some(v) = self.pdt_field(h, "year")? {
+            bag.year = Some(self.pdt_to_int(v)?);
+        }
+        Ok(bag)
+    }
+
+    /// Regulates a non-ISO `CalDtBag`'s time fields into an [`IsoTime`], defaulting
+    /// each absent component to 0.
+    fn pdt_cal_bag_time(
+        &mut self,
+        bag: &CalDtBag,
+        overflow: Overflow,
+    ) -> Result<IsoTime, ExecError> {
+        iso::regulate_iso_time(
+            bag.hour.unwrap_or(0),
+            bag.minute.unwrap_or(0),
+            bag.second.unwrap_or(0),
+            bag.ms.unwrap_or(0),
+            bag.us.unwrap_or(0),
+            bag.ns.unwrap_or(0),
+            overflow,
+        )
+        .ok_or_else(|| self.pdt_range("invalid ISO time"))
+    }
+
+    /// Runs [`tcal::fields_to_iso`], mapping its error to the right exception.
+    fn pdt_cal_fields_to_iso(
+        &mut self,
+        cal: &str,
+        input: &tcal::FieldsInput,
+        overflow: Overflow,
+    ) -> Result<IsoDate, ExecError> {
+        match tcal::fields_to_iso(cal, input, overflow) {
+            Ok(d) => Ok(d),
+            Err(tcal::CalError::Range(m)) => Err(self.pdt_range(&m)),
+            Err(tcal::CalError::MissingFields(m)) => Err(self.type_error(&m)),
+        }
+    }
+
     /// Resolves `month`/`monthCode` fields into a month number (checking that they
     /// agree when both are present, and that a `monthCode` is in range). `fallback`
     /// supplies the default.
@@ -600,27 +771,27 @@ impl<'a> Interp<'a> {
 
     // --- ToTemporalDateTime -----------------------------------------------
 
-    /// `ToTemporalDateTime(item, options)` → the ISO date + time. Accepts a
-    /// `PlainDateTime` (copy), a `PlainDate` (midnight), a property bag, or an ISO
-    /// string.
+    /// `ToTemporalDateTime(item, options)` → the ISO date + time + calendar id.
+    /// Accepts a `PlainDateTime` (copy), a `PlainDate` (midnight), a property bag,
+    /// or an ISO string.
     fn pdt_to_datetime(
         &mut self,
         item: NanBox,
         options: NanBox,
-    ) -> Result<(IsoDate, IsoTime), ExecError> {
+    ) -> Result<(IsoDate, IsoTime, String), ExecError> {
         if let Some(h) = item.as_handle().map(Handle::from_raw) {
             if let Some(d) = self.realm.temporal_at(h) {
                 let opts = self.pdt_options(options)?;
                 self.pdt_overflow(opts)?; // validated even though ignored on copy
                 return match d.kind {
-                    TemporalKind::PlainDateTime => Ok((d.date, d.time)),
-                    TemporalKind::PlainDate => Ok((d.date, IsoTime::default())),
+                    TemporalKind::PlainDateTime => Ok((d.date, d.time, d.calendar.clone())),
+                    TemporalKind::PlainDate => Ok((d.date, IsoTime::default(), d.calendar.clone())),
                     // A ZonedDateTime yields its wall-clock date+time in its zone.
                     TemporalKind::ZonedDateTime => {
                         let tz = d.tz.as_deref().unwrap_or("UTC");
-                        Ok(crate::nbexec::temporal_zoneddatetime::local_of(
-                            tz, d.epoch_ns,
-                        ))
+                        let (date, time) =
+                            crate::nbexec::temporal_zoneddatetime::local_of(tz, d.epoch_ns);
+                        Ok((date, time, d.calendar.clone()))
                     }
                     _ => Err(self.type_error("expected a PlainDateTime")),
                 };
@@ -628,18 +799,21 @@ impl<'a> Interp<'a> {
             if let Some(s) = self.realm.string_value(h) {
                 // Parse (and range-check) the string *before* touching `options`, so
                 // an invalid string throws without observing the options bag.
-                let (date, time) = pdt_parse_datetime(&s)
+                let (date, time, cal) = pdt_parse_datetime(&s)
                     .ok_or_else(|| self.pdt_range("invalid PlainDateTime string"))?;
                 if !pdt_in_range(date, time) {
                     return Err(self.pdt_range("PlainDateTime outside representable range"));
                 }
                 let opts = self.pdt_options(options)?;
                 self.pdt_overflow(opts)?;
-                return Ok((date, time));
+                return Ok((date, time, cal));
             }
             if self.is_object_value(item) {
                 let opts = self.pdt_options(options)?;
-                self.pdt_bag_calendar(h)?;
+                let cal = self.pdt_bag_calendar(h)?;
+                if !tcal::is_iso(&cal) {
+                    return self.pdt_datetime_from_bag_cal(h, &cal, opts);
+                }
                 let bag = self.pdt_read_bag(h)?;
                 let overflow = self.pdt_overflow(opts)?;
                 let year = bag
@@ -664,10 +838,41 @@ impl<'a> Interp<'a> {
                 if !pdt_in_range(date, time) {
                     return Err(self.pdt_range("PlainDateTime outside representable range"));
                 }
-                return Ok((date, time));
+                return Ok((date, time, cal));
             }
         }
         Err(self.type_error("cannot convert value to a Temporal.PlainDateTime"))
+    }
+
+    /// The non-ISO property-bag path of `ToTemporalDateTime`: reads the calendar
+    /// fields (`era`/`eraYear`/`year`/`month`/`monthCode`/`day`) through the layer
+    /// and the time fields directly.
+    fn pdt_datetime_from_bag_cal(
+        &mut self,
+        h: Handle,
+        cal: &str,
+        opts: Option<Handle>,
+    ) -> Result<(IsoDate, IsoTime, String), ExecError> {
+        let bag = self.pdt_read_bag_cal(h)?;
+        let overflow = self.pdt_overflow(opts)?;
+        let day = bag.day.ok_or_else(|| self.type_error("day is required"))?;
+        if bag.month.is_none() && bag.month_code.is_none() {
+            return Err(self.type_error("month or monthCode is required"));
+        }
+        let input = tcal::FieldsInput {
+            era: bag.era.clone(),
+            era_year: bag.era_year,
+            year: bag.year,
+            month: bag.month,
+            month_code: bag.month_code.clone(),
+            day,
+        };
+        let date = self.pdt_cal_fields_to_iso(cal, &input, overflow)?;
+        let time = self.pdt_cal_bag_time(&bag, overflow)?;
+        if !pdt_in_range(date, time) {
+            return Err(self.pdt_range("PlainDateTime outside representable range"));
+        }
+        Ok((date, time, String::from(cal)))
     }
 
     // --- with / withPlainTime / withCalendar ------------------------------
@@ -694,6 +899,9 @@ impl<'a> Interp<'a> {
         }
         if self.pdt_field(h, "timeZone")?.is_some() {
             return Err(self.type_error("with() fields must not have a timeZone property"));
+        }
+        if !tcal::is_iso(&data.calendar) {
+            return self.pdt_with_cal(data, h, options);
         }
         let bag = self.pdt_read_bag(h)?;
         let opts = self.pdt_options(options)?;
@@ -724,7 +932,65 @@ impl<'a> Interp<'a> {
         if !pdt_in_range(date, time) {
             return Err(self.pdt_range("PlainDateTime outside representable range"));
         }
-        Ok(self.pdt_make(date, time))
+        Ok(self.pdt_make_cal(date, time, &data.calendar))
+    }
+
+    /// The non-ISO `with` path: merges the provided fields over the receiver's
+    /// existing calendar fields, re-derives the ISO date through the layer, and
+    /// merges the time fields over the receiver's wall-clock time.
+    fn pdt_with_cal(
+        &mut self,
+        data: &TemporalData,
+        h: Handle,
+        options: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let cal = data.calendar.as_str();
+        let existing = tcal::iso_to_fields(cal, data.date);
+        let bag = self.pdt_read_bag_cal(h)?;
+        let opts = self.pdt_options(options)?;
+        let overflow = self.pdt_overflow(opts)?;
+        if !bag.any() {
+            return Err(self.type_error("with() requires at least one recognised field"));
+        }
+        // Merge: an explicit year (or era+eraYear) wins; otherwise keep the
+        // receiver's year. Likewise for month (prefer monthCode to preserve leap
+        // months) and day.
+        let (year, era, era_year) =
+            if bag.year.is_some() || (bag.era.is_some() && bag.era_year.is_some()) {
+                (bag.year, bag.era.clone(), bag.era_year)
+            } else {
+                (Some(existing.year), None, None)
+            };
+        let (month, month_code) = if bag.month.is_some() || bag.month_code.is_some() {
+            (bag.month, bag.month_code.clone())
+        } else {
+            (None, Some(existing.month_code.clone()))
+        };
+        let day = bag.day.unwrap_or(existing.day);
+        let input = tcal::FieldsInput {
+            era,
+            era_year,
+            year,
+            month,
+            month_code,
+            day,
+        };
+        let date = self.pdt_cal_fields_to_iso(cal, &input, overflow)?;
+        let ct = data.time;
+        let time = iso::regulate_iso_time(
+            bag.hour.unwrap_or(i64::from(ct.hour)),
+            bag.minute.unwrap_or(i64::from(ct.minute)),
+            bag.second.unwrap_or(i64::from(ct.second)),
+            bag.ms.unwrap_or(i64::from(ct.millisecond)),
+            bag.us.unwrap_or(i64::from(ct.microsecond)),
+            bag.ns.unwrap_or(i64::from(ct.nanosecond)),
+            overflow,
+        )
+        .ok_or_else(|| self.pdt_range("invalid ISO time"))?;
+        if !pdt_in_range(date, time) {
+            return Err(self.pdt_range("PlainDateTime outside representable range"));
+        }
+        Ok(self.pdt_make_cal(date, time, cal))
     }
 
     fn pdt_with_plain_time(
@@ -737,12 +1003,12 @@ impl<'a> Interp<'a> {
         } else {
             self.pdt_to_time(arg)?
         };
-        Ok(self.pdt_make(data.date, time))
+        Ok(self.pdt_make_cal(data.date, time, &data.calendar))
     }
 
     fn pdt_with_calendar(&mut self, data: &TemporalData, arg: NanBox) -> Result<NanBox, ExecError> {
-        self.pdt_calendar_arg(arg)?;
-        Ok(self.pdt_make(data.date, data.time))
+        let cal = self.pdt_validate_calendar(arg)?;
+        Ok(self.pdt_make_cal(data.date, data.time, &cal))
     }
 
     /// `ToTemporalTime(item)` → an ISO time. Accepts a `PlainTime`/`PlainDateTime`
@@ -811,7 +1077,7 @@ impl<'a> Interp<'a> {
         if !pdt_in_range(new_date, new_time) {
             return Err(self.pdt_range("result outside representable range"));
         }
-        Ok(self.pdt_make(new_date, new_time))
+        Ok(self.pdt_make_cal(new_date, new_time, &data.calendar))
     }
 
     /// `ToTemporalDuration(item)`: a `Temporal.Duration`, an ISO duration string,
@@ -892,7 +1158,7 @@ impl<'a> Interp<'a> {
         options: NanBox,
         negate: bool,
     ) -> Result<NanBox, ExecError> {
-        let (d2, t2) = self.pdt_to_datetime(other, NanBox::undefined())?;
+        let (d2, t2, _) = self.pdt_to_datetime(other, NanBox::undefined())?;
         let opts = self.pdt_options(options)?;
         let units = [
             "year",
@@ -1008,7 +1274,7 @@ impl<'a> Interp<'a> {
         if !pdt_in_range(date, time) {
             return Err(self.pdt_range("rounded PlainDateTime outside representable range"));
         }
-        Ok(self.pdt_make(date, time))
+        Ok(self.pdt_make_cal(date, time, &data.calendar))
     }
 
     /// `ValidateTemporalRoundingIncrement` for a PlainDateTime round unit
@@ -1101,9 +1367,11 @@ impl<'a> Interp<'a> {
                 + u32::from(time.nanosecond);
             out.push_str(&iso::format_fraction(sub, precision));
         }
+        let id = data.calendar.as_str();
         match cal.as_str() {
-            "always" => out.push_str("[u-ca=iso8601]"),
-            "critical" => out.push_str("[!u-ca=iso8601]"),
+            "always" => out.push_str(&alloc::format!("[u-ca={id}]")),
+            "critical" => out.push_str(&alloc::format!("[!u-ca={id}]")),
+            "auto" if !tcal::is_iso(id) => out.push_str(&alloc::format!("[u-ca={id}]")),
             _ => {}
         }
         Ok(self.new_str(&out))
@@ -1135,20 +1403,24 @@ impl<'a> Interp<'a> {
 
     // --- result builders ---------------------------------------------------
 
-    fn pdt_make(&mut self, date: IsoDate, time: IsoTime) -> NanBox {
+    /// Builds a `Temporal.PlainDateTime` carrying calendar id `cal` (default
+    /// `"iso8601"`), linked to the intrinsic prototype.
+    fn pdt_make_cal(&mut self, date: IsoDate, time: IsoTime, cal: &str) -> NanBox {
         let data = TemporalData {
             kind: TemporalKind::PlainDateTime,
             date,
             time,
+            calendar: String::from(cal),
             ..Default::default()
         };
         self.pdt_alloc(data, TemporalKind::PlainDateTime)
     }
 
-    fn pdt_make_date(&mut self, date: IsoDate) -> NanBox {
+    fn pdt_make_date(&mut self, date: IsoDate, cal: &str) -> NanBox {
         let data = TemporalData {
             kind: TemporalKind::PlainDate,
             date,
+            calendar: String::from(cal),
             ..Default::default()
         };
         self.pdt_alloc(data, TemporalKind::PlainDate)
@@ -1251,8 +1523,10 @@ impl PdtCursor<'_> {
 /// The `PlainDateTime` ISO-string grammar (strict): a required date, an optional
 /// `T`/space-introduced time with an optional numeric UTC offset (a bare `Z`
 /// designator is rejected), and optional `[…]` annotations. Returns the ISO
-/// date+time, or `None` for any malformed / unsupported form.
-fn pdt_parse_datetime(s: &str) -> Option<(IsoDate, IsoTime)> {
+/// date+time plus the calendar id from the first `[u-ca=…]` annotation
+/// (canonicalized, defaulting to `"iso8601"`), or `None` for any malformed /
+/// unsupported form.
+fn pdt_parse_datetime(s: &str) -> Option<(IsoDate, IsoTime, String)> {
     // The Unicode MINUS SIGN (U+2212) is never accepted in a Temporal string.
     if s.as_bytes().windows(3).any(|w| w == [0xE2, 0x88, 0x92]) {
         return None;
@@ -1281,8 +1555,8 @@ fn pdt_parse_datetime(s: &str) -> Option<(IsoDate, IsoTime)> {
             return None; // bare `Z` designator is invalid for a PlainDateTime
         }
     }
-    pdt_parse_annotations(&mut c)?;
-    (c.i == c.b.len()).then_some((date, time))
+    let cal = pdt_parse_annotations(&mut c)?;
+    (c.i == c.b.len()).then_some((date, time, cal))
 }
 
 /// Parses the date portion, enforcing consistent separator usage (all-dashes or
@@ -1362,12 +1636,14 @@ fn pdt_parse_offset(c: &mut PdtCursor) -> Option<bool> {
 }
 
 /// Parses the `[…]` annotation suffixes, enforcing the ISO annotation rules
-/// (lowercase keys; a single time-zone annotation; an `iso8601` calendar; no
-/// conflicting-critical or unknown-critical annotations). `None` on violation.
-fn pdt_parse_annotations(c: &mut PdtCursor) -> Option<()> {
+/// (lowercase keys; a single time-zone annotation; no conflicting-critical or
+/// unknown-critical annotations). Returns the calendar id from the first
+/// `[u-ca=…]` annotation (canonicalized, defaulting to `"iso8601"`), or `None` on
+/// a rule violation or an unsupported calendar id.
+fn pdt_parse_annotations(c: &mut PdtCursor) -> Option<String> {
     let mut cal_count = 0;
     let mut cal_critical = false;
-    let mut first_cal_iso = true;
+    let mut first_cal: Option<String> = None;
     let mut tz_count = 0;
     while c.eat(b'[') {
         let critical = c.eat(b'!');
@@ -1389,7 +1665,7 @@ fn pdt_parse_annotations(c: &mut PdtCursor) -> Option<()> {
                 cal_count += 1;
                 cal_critical |= critical;
                 if cal_count == 1 {
-                    first_cal_iso = val.eq_ignore_ascii_case(b"iso8601");
+                    first_cal = Some(core::str::from_utf8(val).ok()?.into());
                 }
             } else if critical {
                 return None; // unknown annotation with the critical flag
@@ -1398,37 +1674,39 @@ fn pdt_parse_annotations(c: &mut PdtCursor) -> Option<()> {
             tz_count += 1; // a time-zone annotation
         }
     }
-    (!(cal_count > 1 && cal_critical) && tz_count <= 1 && first_cal_iso).then_some(())
+    if (cal_count > 1 && cal_critical) || tz_count > 1 {
+        return None;
+    }
+    match first_cal {
+        Some(v) => tcal::canonicalize_calendar(&v).map(String::from),
+        None => Some(String::from("iso8601")),
+    }
 }
 
-/// Whether a property-bag `calendar` **string** names the ISO calendar: either
-/// the bare identifier `"iso8601"` or a date-ish ISO string (leading digit/sign)
-/// whose every `u-ca=` annotation value is `iso8601`.
-fn pdt_calendar_string_ok(s: &str) -> bool {
-    if s.eq_ignore_ascii_case("iso8601") {
-        return true;
-    }
+/// The canonical calendar id named by a property-bag `calendar` **string** that is
+/// a date-ish ISO string (leading digit/sign) whose first `u-ca=` annotation
+/// supplies it (defaulting to `"iso8601"`), or `None` when the string is not a
+/// date-ish form or carries an unsupported calendar id.
+fn pdt_calendar_string_id(s: &str) -> Option<String> {
     if !s
         .as_bytes()
         .first()
         .is_some_and(|&c| c.is_ascii_digit() || c == b'+' || c == b'-')
     {
-        return false;
+        return None;
     }
     // Minus-zero is not a valid extended year (`-000000`).
     if s.starts_with("-000000") {
-        return false;
+        return None;
     }
-    let mut rest = s;
-    while let Some(p) = rest.find("u-ca=") {
-        let after = &rest[p + 5..];
-        let end = after.find(']').unwrap_or(after.len());
-        if !after[..end].eq_ignore_ascii_case("iso8601") {
-            return false;
+    match s.find("u-ca=") {
+        Some(p) => {
+            let after = &s[p + 5..];
+            let end = after.find(']').unwrap_or(after.len());
+            tcal::canonicalize_calendar(&after[..end]).map(String::from)
         }
-        rest = &after[end..];
+        None => Some(String::from("iso8601")),
     }
-    true
 }
 
 /// Negates every field of a duration.
