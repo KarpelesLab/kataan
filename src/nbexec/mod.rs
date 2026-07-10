@@ -318,6 +318,12 @@ pub struct Interp<'a> {
     /// `hoist_with_kind`; `None` for ordinary function/program hoisting (where
     /// `varEnv == lexEnv`).
     eval_var_scope: Option<Scope>,
+    /// True while running a `$262.evalScript` body, which is a *Script* (its
+    /// `var`/function global bindings are non-configurable per
+    /// GlobalDeclarationInstantiation), not an indirect `eval` (whose global
+    /// `var`/function bindings are configurable/deletable). It otherwise shares
+    /// the eval-body machinery (`run_eval_body`).
+    script_eval_globals: bool,
     /// The names of block-level function declarations that the Annex B.3.3
     /// legacy extension var-hoists into the current variable environment — i.e.
     /// the only names whose outer `var` binding is updated when a block function
@@ -2795,6 +2801,7 @@ impl<'a> Interp<'a> {
             current: Scope::root(),
             var_scope: Scope::root(),
             eval_var_scope: None,
+            script_eval_globals: false,
             annexb_block_fns: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
@@ -6085,8 +6092,9 @@ impl<'a> Interp<'a> {
                     // A global `var`/function binding created by *script* code is
                     // non-configurable (CreateGlobalVarBinding with deletable
                     // false). Bindings created by global *eval* code are deletable
-                    // (configurable), so only lock script-scope ones.
-                    if !eval_code {
+                    // (configurable), so only lock script-scope ones — a
+                    // `$262.evalScript` body is a Script, so it locks too.
+                    if !eval_code || self.script_eval_globals {
                         self.realm.set_non_configurable_property(g, name);
                     }
                 }
@@ -6122,24 +6130,28 @@ impl<'a> Interp<'a> {
                     if self.var_scope.ptr_eq(&self.global_scope)
                         && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
                     {
-                        if eval_code {
-                            // CreateGlobalFunctionBinding (deletable). When there is
-                            // no existing own property, or it is configurable,
-                            // (re)define with full data attributes: writable,
-                            // enumerable, configurable. When the existing property
-                            // is non-configurable (but declarable — validated by
-                            // CanDeclareGlobalFunction), update only the value and
-                            // preserve its attributes.
-                            let redefine_attrs = !self.realm.has_own(g, &id.name)
-                                || !self.realm.property_is_non_configurable(g, &id.name);
-                            self.realm.force_set_property(g, &id.name, value);
-                            if redefine_attrs {
-                                self.realm.clear_readonly_property(g, &id.name);
-                                self.realm.clear_hidden_property(g, &id.name);
+                        // CreateGlobalFunctionBinding. When there is no existing own
+                        // property, or it is configurable, (re)define with full data
+                        // attributes: writable, enumerable, and configurable set to
+                        // the binding's *deletable* flag. A binding created by
+                        // *script* code (top-level program or `$262.evalScript`) is
+                        // non-configurable (deletable = false); one created by global
+                        // `eval` code is configurable (deletable = true). When the
+                        // existing property is non-configurable (but declarable —
+                        // validated by CanDeclareGlobalFunction), update only the
+                        // value and preserve its attributes.
+                        let deletable = eval_code && !self.script_eval_globals;
+                        let redefine_attrs = !self.realm.has_own(g, &id.name)
+                            || !self.realm.property_is_non_configurable(g, &id.name);
+                        self.realm.force_set_property(g, &id.name, value);
+                        if redefine_attrs {
+                            self.realm.clear_readonly_property(g, &id.name);
+                            self.realm.clear_hidden_property(g, &id.name);
+                            if deletable {
                                 self.realm.clear_non_configurable_property(g, &id.name);
+                            } else {
+                                self.realm.set_non_configurable_property(g, &id.name);
                             }
-                        } else {
-                            self.realm.set_property(g, &id.name, value);
                         }
                     }
                 } else {
@@ -6533,8 +6545,14 @@ fn has_use_strict(stmts: &[Stmt]) -> bool {
     for stmt in stmts {
         match stmt {
             Stmt::Expr { expression, .. } => match &**expression {
-                Expr::Str { value, .. } => {
-                    if &**value == b"use strict" {
+                Expr::Str { value, span, .. } => {
+                    // A Use Strict Directive's *source text* must be exactly
+                    // `use strict` — no escape sequence or line continuation. The
+                    // 10-character directive inside two quotes is 12 source bytes;
+                    // an escaped form (`'use strict'`, `'use str\<LF>ict'`)
+                    // cooks to the same value but is longer, so it is not a
+                    // directive and does not trigger strict mode.
+                    if &**value == b"use strict" && span.end.saturating_sub(span.start) == 12 {
                         return true;
                     }
                 }
@@ -8368,6 +8386,17 @@ pub fn eval_source_typed(
             });
         }
     };
+    // `parse_program` infers the goal symbol, promoting a unit with a top-level
+    // `import`/`export` to a Module. Run as a *Script* (this entry), such a
+    // declaration is an early SyntaxError — `import`/`export` are legal only at a
+    // Module's top level. (Module tests go through the module loader instead.)
+    if program.source_type == crate::ast::SourceType::Module {
+        return Err(Thrown {
+            phase: ErrorPhase::Parse,
+            name: String::from("SyntaxError"),
+            message: String::from("`import`/`export` may only appear at the top level of a module"),
+        });
+    }
     let mut interp = Interp::new_with_limits(limits);
     match interp.run(&program) {
         Ok(value) => {

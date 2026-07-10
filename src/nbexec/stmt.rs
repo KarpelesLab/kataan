@@ -1276,6 +1276,24 @@ impl<'a> Interp<'a> {
     /// `with` object frames, propagating any error thrown by an object environment
     /// record's `HasProperty` (a proxy `has` trap, a revoked proxy, or a throwing
     /// `@@unscopables` read).
+    /// Whether execution is lexically inside at least one active `with (obj)`
+    /// object environment. When it is, a bare-identifier reference's binding is
+    /// resolved object-first (`with_binding_result`); the global-object
+    /// write fallback (which assumes the reference resolved to the *global*
+    /// environment record) must not short-circuit that — e.g. a `with`-provided
+    /// binding deleted mid-assignment must still throw in strict mode rather than
+    /// silently retargeting a like-named global property.
+    pub(crate) fn in_with_scope(&self) -> bool {
+        let mut frame = Some(self.current.clone());
+        while let Some(s) = frame {
+            if s.with_obj().is_some() {
+                return true;
+            }
+            frame = s.parent();
+        }
+        false
+    }
+
     pub(crate) fn with_binding_result(&mut self, name: &str) -> Result<Option<Handle>, ExecError> {
         // Walk the scope chain from innermost outward, interleaving lexical frames
         // with `with` object frames. A local binding shadows an enclosing `with`
@@ -1415,6 +1433,21 @@ impl<'a> Interp<'a> {
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
         if !self.current.set(name, value) {
+            // A property on the global object (created via `this.x = …` /
+            // `globalThis.x = …`, or a global `var`) is a *resolvable* reference:
+            // assignment updates that property — in strict mode too. Only a truly
+            // *unresolvable* reference (no binding and no global-object property)
+            // is a strict-mode ReferenceError. Mirrors the read path's
+            // global-object own-property fallback (`read_ident_ref`). Skipped
+            // inside a `with` scope, where the reference is resolved object-first
+            // and a deleted binding must still reach the strict-mode throw below.
+            if !self.in_with_scope()
+                && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
+                && self.realm.has_own(g, name)
+            {
+                self.realm.set_property(g, name, value);
+                return Ok(());
+            }
             // Strict mode forbids creating an implicit global.
             if self.strict {
                 let m = self.new_str(&alloc::format!("{name} is not defined"));

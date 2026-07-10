@@ -1688,25 +1688,51 @@ impl<'a> Interp<'a> {
                 ));
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
-            // A number/boolean primitive reports its wrapper constructor
-            // (`(5).constructor === Number`); other reads are `undefined`
-            // here (method calls go through the call path).
-            if let PropertyKey::Ident(n) | PropertyKey::Str(n) = property
-                && n.as_ref() == "constructor"
-            {
-                let name = if obj.as_number().is_some() {
-                    "Number"
-                } else if matches!(obj.unpack(), Unpacked::Bool(_)) {
-                    "Boolean"
-                } else {
-                    return Ok(NanBox::undefined());
-                };
-                return Ok(self.current.get(name).unwrap_or(NanBox::undefined()));
+            // Reading a property of a number/boolean primitive follows
+            // GetValue → ToObject → [[Get]]: box the primitive into its wrapper
+            // (whose [[Prototype]] is the intrinsic `Number.prototype` /
+            // `Boolean.prototype`) and read through it, so an inherited property
+            // — a built-in like `constructor`/`toFixed` *or* a user-added
+            // `Number.prototype.foo` — resolves instead of reporting `undefined`.
+            if matches!(obj.unpack(), Unpacked::Number(_) | Unpacked::Bool(_)) {
+                let wrapper = self.coerce_to_object(obj);
+                if let Some(wh) = wrapper.as_handle().map(Handle::from_raw) {
+                    return self.member(wh, property);
+                }
             }
             return Ok(NanBox::undefined());
         };
         let handle = crate::heap::Handle::from_raw(raw);
         self.member(handle, property)
+    }
+
+    /// PutValue for a reference whose base is a **primitive** (number, boolean,
+    /// string, symbol, or BigInt): ToObject the primitive into its wrapper
+    /// (`Number.prototype` / `String.prototype` / … on its chain) and perform
+    /// `[[Set]]` with the primitive as the conceptual receiver. An inherited
+    /// setter or a Proxy on the wrapper's prototype chain handles the write;
+    /// otherwise the write would create an own data property on the non-object
+    /// receiver, which fails — a strict-mode TypeError, a sloppy silent no-op.
+    pub(crate) fn write_primitive_member(
+        &mut self,
+        prim: NanBox,
+        property: &'a PropertyKey,
+        new: NanBox,
+    ) -> Result<(), ExecError> {
+        let key = self.eval_prop_key(property)?;
+        let wrapper = self.coerce_to_object(prim);
+        let Some(wh) = wrapper.as_handle().map(Handle::from_raw) else {
+            return Ok(());
+        };
+        if self.set_through_proto_chain(wh, &key, new)?.is_some() {
+            return Ok(());
+        }
+        if self.strict {
+            return Err(self.type_error(&alloc::format!(
+                "Cannot create property '{key}' on a primitive value"
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn eval_fn_expr(&mut self, func: &'a Function) -> NanBox {
@@ -3652,6 +3678,19 @@ impl<'a> Interp<'a> {
         {
             self.pending_class_name = Some(&id.name);
         }
+        // PutValue resolves the LHS reference *before* the RHS runs. For a plain
+        // `x = rhs` naming a bare identifier with no binding, capture whether `x`
+        // is already an own global-object property NOW, so a strict assignment to
+        // an unresolvable reference still throws even when the RHS creates that
+        // property (`undeclared = (this.undeclared = 5)` must throw).
+        let ident_pre_own_global = if let Expr::Ident(id) = target {
+            self.global_this
+                .as_handle()
+                .map(Handle::from_raw)
+                .is_some_and(|g| self.realm.has_own(g, &id.name))
+        } else {
+            false
+        };
         let rhs = self.eval(value)?;
         self.pending_class_name = None;
         // Destructuring assignment: `[a, b] = …` / `({ x } = …)`.
@@ -3749,6 +3788,23 @@ impl<'a> Interp<'a> {
                     self.binary(compound_op(op)?, current, rhs)?
                 };
                 if !self.current.set(name, new) {
+                    // A property on the global object (created via `this.x = …` /
+                    // `globalThis.x = …`, or a global `var`) is a *resolvable*
+                    // reference — assignment updates it, in strict mode too. Only a
+                    // truly unresolvable reference is a strict-mode ReferenceError.
+                    // Mirrors the read path's global-object own-property fallback.
+                    // Skipped inside a `with` scope (object-first resolution): a
+                    // deleted `with` binding must still reach the strict throw.
+                    // Uses the pre-RHS resolvability (`ident_pre_own_global`): the
+                    // reference is resolved before the RHS, so a property the RHS
+                    // itself creates does NOT make the reference resolvable.
+                    if !self.in_with_scope()
+                        && ident_pre_own_global
+                        && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
+                    {
+                        self.realm.set_property(g, name, new);
+                        return Ok(new);
+                    }
                     if self.strict {
                         let m = self.new_str(&alloc::format!("{name} is not defined"));
                         return Err(ExecError::Throw(
@@ -3794,8 +3850,39 @@ impl<'a> Interp<'a> {
                         ));
                         return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                     }
+                    // Writing a property of a number/boolean primitive follows
+                    // PutValue → ToObject → [[Set]] (see `write_primitive_member`):
+                    // an inherited setter / prototype Proxy fires, else it is a
+                    // strict-mode TypeError / sloppy no-op.
+                    if matches!(obj.unpack(), Unpacked::Number(_) | Unpacked::Bool(_)) {
+                        let new = if op == AssignOp::Assign {
+                            rhs
+                        } else {
+                            let current = self.read_member_of(obj, property, false)?;
+                            self.binary(compound_op(op)?, current, rhs)?
+                        };
+                        self.write_primitive_member(obj, property, new)?;
+                        return Ok(new);
+                    }
                     return Ok(rhs);
                 };
+                // A primitive base that is a *heap* value (a String / Symbol /
+                // BigInt primitive) is ToObject'd before `[[Set]]`: an inherited
+                // setter or a Proxy on the wrapper's prototype chain fires, else
+                // the write would create an own data property on the non-object
+                // primitive receiver — a strict-mode TypeError, a sloppy no-op
+                // (see `write_primitive_member`). An ordinary object base writes
+                // directly.
+                if !self.is_object_value(obj) {
+                    let new = if op == AssignOp::Assign {
+                        rhs
+                    } else {
+                        let current = self.read_member_of(obj, property, false)?;
+                        self.binary(compound_op(op)?, current, rhs)?
+                    };
+                    self.write_primitive_member(obj, property, new)?;
+                    return Ok(new);
+                }
                 let handle = crate::heap::Handle::from_raw(raw);
                 let new = if op == AssignOp::Assign {
                     rhs

@@ -1700,10 +1700,15 @@ impl<'a> Interp<'a> {
         // `"use strict"` prologue, or defined in strict code) runs its whole body —
         // including parameter-default evaluation — in strict mode. An arrow
         // inherits the enclosing mode (already reflected in its `is_strict`).
+        // Strict mode is *lexical*: the callee runs in its own strictness
+        // (`def.is_strict`, which already folds in inherited strict code, a
+        // `"use strict"` prologue, and class-body strictness), NOT the caller's.
+        // A strict function calling a sloppy one (e.g. a `new Function(...)`
+        // body, always sloppy unless it self-declares strict) must CLEAR strict
+        // for that call — otherwise a direct `eval` inside the sloppy callee
+        // would wrongly parse as strict.
         let saved_strict = self.strict;
-        if def.is_strict {
-            self.strict = true;
-        }
+        self.strict = def.is_strict;
         // Cleared for this call so a nested call / the body never inherits an
         // outer function's parameter set; restored after the call returns.
         let saved_eval_param_names = core::mem::take(&mut self.eval_param_names);

@@ -772,13 +772,27 @@ impl<'src> Lexer<'src> {
                 }
                 b'\\' => {
                     self.advance();
-                    if self.peek().is_some_and(|b| b == b'\n' || b == b'\r') {
-                        return Err(Error::syntax(
-                            "unterminated regular expression literal",
-                            Span::new(start as u32, self.pos as u32),
-                        ));
+                    // A `\` must be followed by a RegularExpressionNonTerminator,
+                    // i.e. any SourceCharacter but not a LineTerminator (LF, CR,
+                    // U+2028 LS, U+2029 PS) — an early SyntaxError otherwise.
+                    match self.peek() {
+                        Some(b'\n') | Some(b'\r') => {
+                            return Err(Error::syntax(
+                                "unterminated regular expression literal",
+                                Span::new(start as u32, self.pos as u32),
+                            ));
+                        }
+                        Some(c)
+                            if c >= 0x80
+                                && self.peek_char().is_some_and(is_unicode_line_terminator) =>
+                        {
+                            return Err(Error::syntax(
+                                "regular expression literal may not contain a line terminator",
+                                Span::new(start as u32, self.pos as u32),
+                            ));
+                        }
+                        _ => self.advance_any(),
                     }
-                    self.advance_any();
                 }
                 b'[' => {
                     in_class = true;
@@ -792,7 +806,18 @@ impl<'src> Lexer<'src> {
                     self.advance();
                     break;
                 }
-                _ => self.advance_any(),
+                _ => {
+                    // A RegularExpressionChar is a SourceCharacter but not a
+                    // LineTerminator; U+2028 (LS) and U+2029 (PS) are multibyte
+                    // line terminators the ASCII branches above cannot catch.
+                    if c >= 0x80 && self.peek_char().is_some_and(is_unicode_line_terminator) {
+                        return Err(Error::syntax(
+                            "regular expression literal may not contain a line terminator",
+                            Span::new(start as u32, self.pos as u32),
+                        ));
+                    }
+                    self.advance_any();
+                }
             }
         }
         // Flags: identifier-continue characters immediately after the closing

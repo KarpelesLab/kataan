@@ -895,7 +895,16 @@ impl Parser {
             // is set). Otherwise (Annex B) `\k` is the identity escape `k` and the
             // following `<name>` is matched literally. A bare `\k` not followed by
             // `<` is always the literal character `k`.
-            'k' if self.pattern_has_named_groups && self.chars.get(self.pos) == Some(&'<') => {
+            'k' if self.pattern_has_named_groups => {
+                // When the pattern declares any named group, every `\k` is a
+                // named backreference and MUST be `\k<GroupName>` — a `\k` not
+                // followed by `<name>` is a Syntax Error (not the Annex B identity
+                // escape `k`, which applies only when there are no named groups).
+                if self.chars.get(self.pos) != Some(&'<') {
+                    return Err(RegexError::new(
+                        "`\\k` must be followed by a group name in a pattern with named groups",
+                    ));
+                }
                 self.eat('<');
                 let name = self.parse_group_name()?;
                 self.named_refs.push(name.clone());

@@ -523,7 +523,14 @@ impl<'a> Interp<'a> {
         self.this_val = self.global_this;
         self.new_target = NanBox::undefined();
         self.eval_depth += 1;
+        // `$262.evalScript` runs a *Script*, so its global `var`/function
+        // bindings are non-configurable (GlobalDeclarationInstantiation), unlike
+        // an indirect `eval`'s deletable ones — even though both reuse
+        // `run_eval_body`.
+        let saved_script_eval = self.script_eval_globals;
+        self.script_eval_globals = true;
         let result = self.run_eval_body(program);
+        self.script_eval_globals = saved_script_eval;
         self.eval_depth -= 1;
 
         self.current = saved_current;

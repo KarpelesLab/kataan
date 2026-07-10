@@ -5331,6 +5331,13 @@ pub fn execute_typed(
             });
         }
     };
+    // Run as a *Script*: a unit `parse_program` promoted to a Module (because it
+    // has a top-level `import`/`export`) is an early SyntaxError here — those
+    // declarations are legal only at a Module's top level. (Module tests use the
+    // module loader.) Defer to nbexec, which reports the same parse-phase error.
+    if program.source_type == crate::ast::SourceType::Module {
+        return crate::nbexec::eval_source_typed(source, limits);
+    }
     let Ok(protos) = compile_program(&program) else {
         return crate::nbexec::eval_source_typed(source, limits);
     };
@@ -5430,7 +5437,15 @@ fn body_starts_strict(body: &[Stmt]) -> bool {
     for stmt in body {
         match stmt {
             Stmt::Expr { expression, .. } => match &**expression {
-                Expr::Str { value, .. } if &**value == b"use strict" => return true,
+                // A Use Strict Directive's *source text* must be exactly
+                // `use strict` (12 source bytes with quotes) — an escaped form
+                // like `'use strict'` cooks to the same value but is longer,
+                // so it does not trigger strict mode.
+                Expr::Str { value, span, .. }
+                    if &**value == b"use strict" && span.end.saturating_sub(span.start) == 12 =>
+                {
+                    return true;
+                }
                 Expr::Str { .. } => {} // another directive — keep scanning
                 _ => return false,
             },
