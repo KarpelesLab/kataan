@@ -526,6 +526,16 @@ fn canonicalize_extension(singleton: char, subs: &[String]) -> Option<String> {
                 vals.push(subs[i].clone());
                 i += 1;
             }
+            // CLDR bcp47 type alias: for the boolean collation keys
+            // kb/kc/kh/kk/kn the type "yes" is an alias of "true"
+            // (`<type name="true" alias="yes"/>`). Other keys (ka/kf/kr/ks/kv)
+            // have no such alias and keep "yes".
+            if vals.len() == 1
+                && vals[0] == "yes"
+                && matches!(key.as_str(), "kb" | "kc" | "kh" | "kk" | "kn")
+            {
+                vals[0] = String::from("true");
+            }
             // A `true` type value is elided in canonical form.
             if vals.len() == 1 && vals[0] == "true" {
                 vals.clear();
@@ -3600,11 +3610,59 @@ impl<'a> Interp<'a> {
                     // `signDisplay: "always"` formatted `+0` as "+0"; -0 takes the
                     // negative sign, so drop a leading "+" before prepending "-".
                     let mag = body.strip_prefix('+').unwrap_or(&body);
+                    // `currencySign: "accounting"` parenthesizes a negative -0 in
+                    // the en family (e.g. "($0.00)"), matching the finite path below.
+                    let en_family = locale == "en" || locale.starts_with("en-");
+                    if en_family
+                        && self
+                            .realm
+                            .get_property(handle, "currencySign")
+                            .map(|v| self.realm.to_display_string(v))
+                            .as_deref()
+                            == Some("accounting")
+                    {
+                        return alloc::format!("({mag})");
+                    }
                     return alloc::format!("-{mag}");
                 }
                 return body;
             }
             let formatted = intl::number::format(&locale, n, &opts);
+            // A small-magnitude negative that rounds to a displayed zero
+            // (e.g. -0.0001 → "0", or -0.004 currency → "$0.00") carries no sign
+            // under signDisplay "negative"/"never"/"exceptZero" — only "auto"/
+            // "always" sign a zero. The intl crate keeps the input value's minus,
+            // so strip it when every rendered digit is zero. (A literal -0 is
+            // handled by the negative-zero branch above; -∞/NaN have no digits.)
+            if formatted.starts_with('-') && n.is_finite() {
+                let digits = formatted.bytes().filter(u8::is_ascii_digit);
+                let mut any = false;
+                let all_zero = digits.inspect(|_| any = true).all(|b| b == b'0');
+                if any && all_zero {
+                    let sd = self
+                        .realm
+                        .get_property(handle, "signDisplay")
+                        .map(|v| self.realm.to_display_string(v))
+                        .unwrap_or_default();
+                    if matches!(sd.as_str(), "negative" | "never" | "exceptZero") {
+                        return String::from(&formatted[1..]);
+                    }
+                }
+            }
+            // `signDisplay: "always"` signs a NaN as non-negative ("+NaN"); the
+            // intl crate leaves NaN unsigned (it signs ±∞ but not NaN). Only
+            // "always" signs NaN — "auto"/"never"/"exceptZero"/"negative" do not.
+            if n.is_nan()
+                && !formatted.starts_with(['+', '-'])
+                && self
+                    .realm
+                    .get_property(handle, "signDisplay")
+                    .map(|v| self.realm.to_display_string(v))
+                    .as_deref()
+                    == Some("always")
+            {
+                return alloc::format!("+{formatted}");
+            }
             // `currencySign: "accounting"` renders a negative currency amount in the
             // locale's accounting pattern. That pattern is CLDR-locale data: the
             // en family parenthesizes (`($5.00)`), but many locales (e.g. de-DE:
