@@ -2836,7 +2836,7 @@ impl<'a> Interp<'a> {
                 return self.make_intl_formatter(id, args);
             }
             // `Intl.Collator(...)` without `new` builds the same collator object.
-            N_INTL_COLLATOR => self.make_collator(args),
+            N_INTL_COLLATOR => self.make_collator(args)?,
             // `Intl.PluralRules(...)` without `new` is a TypeError (ECMA-402
             // sec-intl.pluralrules: "If NewTarget is undefined, throw a TypeError").
             N_INTL_PLURAL_RULES => {
@@ -2914,7 +2914,17 @@ impl<'a> Interp<'a> {
                     .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
                     .map(|v| self.realm.to_display_string(v))
                     .unwrap_or_default();
-                let code = self.realm.to_display_string(arg(0));
+                // `code = ? ToString(code)`, then validate it against the instance
+                // `[[Type]]` grammar — a mismatch is a RangeError. The original
+                // (non-canonicalized) code is kept for the name lookup / `code`
+                // fallback (the canonical form is not observable via `of`).
+                let code = self.coerce_to_string(arg(0))?;
+                if crate::nbexec::intl_fmt::validate_display_code(&ty, &code).is_none() {
+                    let m = self.new_str(&alloc::format!(
+                        "invalid {ty} code for Intl.DisplayNames.of"
+                    ));
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
                 #[cfg(feature = "intl")]
                 {
                     let locale = fmt
@@ -2956,10 +2966,13 @@ impl<'a> Interp<'a> {
                     self.new_str(&s)
                 }
             }
-            // `Intl.Segmenter(...)` without `new`.
-            N_INTL_SEGMENTER => self.make_segmenter(args),
-            // `Intl.Locale` / `Intl.DurationFormat` require `new` — a plain call
-            // (no `new`) is a TypeError (ECMA-402 sec-intl.locale / -.durationformat).
+            // `Intl.Segmenter` / `Intl.Locale` / `Intl.DurationFormat` require
+            // `new` — a plain call (no `new`) is a TypeError (ECMA-402
+            // sec-intl.segmenter / -.locale / -.durationformat: "If NewTarget is
+            // undefined, throw a TypeError exception.").
+            N_INTL_SEGMENTER => {
+                return Err(self.type_error("Constructor Intl.Segmenter requires 'new'"));
+            }
             N_INTL_LOCALE => {
                 return Err(self.type_error("Constructor Intl.Locale requires 'new'"));
             }
@@ -3077,7 +3090,10 @@ impl<'a> Interp<'a> {
                 if let Some(h) = self.this_val.as_handle().map(Handle::from_raw)
                     && self.realm.get_property(h, "\u{0}intl").is_some()
                 {
-                    let s = self.intl_format_value(h, arg(0));
+                    // A DateTimeFormat coerces its argument via ToNumber + TimeClip
+                    // (a non-finite/out-of-range date is a RangeError); a
+                    // NumberFormat formats any numeric value (incl. ±Infinity).
+                    let s = self.intl_format_checked(h, arg(0))?;
                     self.new_str(&s)
                 } else {
                     let s = self.realm.to_display_string(arg(0));
@@ -3108,9 +3124,14 @@ impl<'a> Interp<'a> {
             // canonical request is reported as supported.
             N_INTL_SUPPORTED_LOCALES => {
                 let requested = self.canonicalize_locale_list(arg(0))?;
-                // `options` is read (ToObject) and `localeMatcher` validated even
-                // though the result does not otherwise depend on it.
+                // `options = ? CoerceOptionsToObject(options)`: `undefined` → no
+                // options; `null` (→ ToObject) is a TypeError; a primitive is
+                // boxed. `localeMatcher` is then read + validated (RangeError on an
+                // invalid value) even though the result does not depend on it.
                 let opts_arg = arg(1);
+                if matches!(opts_arg.unpack(), Unpacked::Null) {
+                    return Err(self.type_error("supportedLocalesOf options must not be null"));
+                }
                 if !matches!(opts_arg.unpack(), Unpacked::Undefined) {
                     let opts = self
                         .coerce_to_object(opts_arg)
@@ -3123,8 +3144,16 @@ impl<'a> Interp<'a> {
                         Some("best fit"),
                     )?;
                 }
+                // LookupSupportedLocales: keep only locales this engine can
+                // actually serve. It serves every structurally valid locale
+                // *except* the "no linguistic content" subtag `zxx` (and the
+                // undetermined `und`), which carry no data and must be dropped.
                 let mut out = Vec::with_capacity(requested.len());
                 for tag in requested {
+                    let primary = tag.split(['-', '_']).next().unwrap_or("");
+                    if primary.eq_ignore_ascii_case("zxx") || primary.eq_ignore_ascii_case("und") {
+                        continue;
+                    }
                     let v = self.new_str(&tag);
                     out.push(v);
                 }
@@ -3205,12 +3234,7 @@ impl<'a> Interp<'a> {
                         .as_deref()
                         == Some("datetime")
                 {
-                    let ms = match arg(0).as_handle().map(Handle::from_raw) {
-                        Some(dh) if self.realm.date_at(dh).is_some() => {
-                            self.realm.date_at(dh).unwrap()
-                        }
-                        _ => self.realm.to_number(arg(0)),
-                    };
+                    let ms = self.datetime_operand(arg(0))?;
                     let parts = self.datetime_parts(h, ms);
                     let mut arr_elems = Vec::with_capacity(parts.len());
                     for (ty, val) in parts {

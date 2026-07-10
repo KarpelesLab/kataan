@@ -1974,6 +1974,22 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `GetPrototypeFromConstructor(newTarget, "%Intl.X.prototype%")` for an Intl
+    /// service constructor: reads `newTarget.prototype` (propagating a throwing
+    /// accessor — e.g. a poisoned getter — and honoring a cross-realm newTarget's
+    /// own-realm intrinsic), defaulting to this realm's `%Intl.<ctor_id>.prototype%`.
+    /// Must be called *before* the instance is initialized (the prototype read
+    /// precedes option evaluation per OrdinaryCreateFromConstructor).
+    pub(crate) fn intl_instance_proto(
+        &mut self,
+        ctor_id: u16,
+        native_new_target: NanBox,
+        callee: NanBox,
+    ) -> Result<Option<Handle>, ExecError> {
+        let default = self.realm.intl_prototype(ctor_id);
+        self.instance_proto_checked(native_new_target, callee, default)
+    }
+
     /// `GetPrototypeFromConstructor(newTarget, defaultProto)`'s prototype lookup:
     /// the newTarget's `"prototype"` *only if it is an Object*, else `None` so the
     /// caller substitutes the default intrinsic. Unlike `constructor_prototype`,
@@ -2429,51 +2445,44 @@ impl<'a> Interp<'a> {
             return Ok(NanBox::handle(p.to_raw()));
         }
         // `new Intl.NumberFormat(locales, options)` / `Intl.DateTimeFormat(...)`.
-        if id == N_INTL_NUMBER_FORMAT || id == N_INTL_DATETIME_FORMAT {
-            let result = self.make_intl_formatter(id, args)?;
-            // OrdinaryCreateFromConstructor(newTarget): a subclass /
-            // `Reflect.construct` newTarget supplies the instance prototype (the
-            // formatter defaults to `%Intl.X.prototype%`).
+        // Every Intl service constructor performs
+        // `OrdinaryCreateFromConstructor(NewTarget, "%Intl.X.prototype%", …)`: the
+        // prototype is derived from `newTarget` (a subclass / `Reflect.construct`
+        // newTarget, incl. a cross-realm one) *before* the instance is
+        // initialized, then applied to the fresh instance.
+        if matches!(
+            id,
+            N_INTL_NUMBER_FORMAT
+                | N_INTL_DATETIME_FORMAT
+                | N_INTL_COLLATOR
+                | N_INTL_PLURAL_RULES
+                | N_INTL_LIST_FORMAT
+                | N_INTL_REL_TIME
+                | N_INTL_DISPLAY_NAMES
+                | N_INTL_SEGMENTER
+                | N_INTL_LOCALE
+                | N_INTL_DURATION_FORMAT
+        ) {
+            let proto = self.intl_instance_proto(id, native_new_target, callee)?;
+            let result = match id {
+                N_INTL_NUMBER_FORMAT | N_INTL_DATETIME_FORMAT => {
+                    self.make_intl_formatter(id, args)?
+                }
+                N_INTL_COLLATOR => self.make_collator(args)?,
+                N_INTL_PLURAL_RULES => self.make_plural_rules(args)?,
+                N_INTL_LIST_FORMAT => self.make_list_format(args)?,
+                N_INTL_REL_TIME => self.make_relative_time_format(args)?,
+                N_INTL_DISPLAY_NAMES => self.make_display_names(args)?,
+                N_INTL_SEGMENTER => self.make_segmenter(args)?,
+                N_INTL_LOCALE => self.make_locale(args)?,
+                _ => self.make_duration_format(args)?,
+            };
             if let Some(oh) = result.as_handle().map(Handle::from_raw)
-                && let Some(proto) = self.instance_proto(native_new_target, callee, None)
+                && let Some(p) = proto
             {
-                self.realm.set_object_proto(oh, Some(proto));
+                self.realm.set_object_proto(oh, Some(p));
             }
             return Ok(result);
-        }
-        // `new Intl.Collator(...)` → an object whose `compare` is a bound function
-        // (so `arr.sort(new Intl.Collator().compare)` works); code-point order, no
-        // locale tailoring (matching `localeCompare`).
-        if id == N_INTL_COLLATOR {
-            return Ok(self.make_collator(args));
-        }
-        // `new Intl.PluralRules(...)` → an object with a `select(n)` method.
-        if id == N_INTL_PLURAL_RULES {
-            return self.make_plural_rules(args);
-        }
-        // `new Intl.ListFormat(locale, { type, style })` → an object with a `format(list)`.
-        if id == N_INTL_LIST_FORMAT {
-            return self.make_list_format(args);
-        }
-        // `new Intl.RelativeTimeFormat(locale, { numeric, style })` → an object with `format`.
-        if id == N_INTL_REL_TIME {
-            return self.make_relative_time_format(args);
-        }
-        // `new Intl.DisplayNames(locale, { type })` → an object with an `of(code)` method.
-        if id == N_INTL_DISPLAY_NAMES {
-            return self.make_display_names(args);
-        }
-        // `new Intl.Segmenter(locale, { granularity })` → an object with a `segment(s)` method.
-        if id == N_INTL_SEGMENTER {
-            return Ok(self.make_segmenter(args));
-        }
-        // `new Intl.Locale(tag, options)` → a branded Locale with `language`/… accessors.
-        if id == N_INTL_LOCALE {
-            return self.make_locale(args);
-        }
-        // `new Intl.DurationFormat(locales, options)` → a branded DurationFormat.
-        if id == N_INTL_DURATION_FORMAT {
-            return self.make_duration_format(args);
         }
         // `new DisposableStack()` / `new AsyncDisposableStack()`. The instance's
         // `[[Prototype]]` comes from `native_new_target.prototype` (already
@@ -3570,7 +3579,7 @@ impl<'a> Interp<'a> {
                 N_INTL_PLURAL_RULES => self.init_plural_rules(instance, args)?,
                 N_INTL_LIST_FORMAT => self.init_list_format(instance, args)?,
                 N_INTL_REL_TIME => self.init_relative_time_format(instance, args)?,
-                N_INTL_SEGMENTER => self.init_segmenter(instance, args),
+                N_INTL_SEGMENTER => self.init_segmenter(instance, args)?,
                 N_INTL_LOCALE => self.init_locale(instance, args)?,
                 _ => unreachable!(),
             }

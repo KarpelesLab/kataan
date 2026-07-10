@@ -1346,7 +1346,10 @@ impl<'a> Interp<'a> {
             && !matches!(self.realm.to_display_string(kind).as_str(), "list" | "rtf")
             && method == "format"
         {
-            let s = self.intl_format_value(handle, arg(0));
+            // DateTimeFormat validates the argument via ToNumber + TimeClip (a
+            // non-finite / out-of-range date is a RangeError); NumberFormat formats
+            // any numeric value.
+            let s = self.intl_format_checked(handle, arg(0))?;
             return Ok(Some(self.new_str(&s)));
         }
         // --- Date instance methods ---

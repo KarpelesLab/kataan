@@ -412,6 +412,85 @@ pub(crate) fn canonicalize_locale_id(tag: &str) -> Option<String> {
     Some(out)
 }
 
+/// Validates + canonicalizes the `code` argument to
+/// `Intl.DisplayNames.prototype.of` against its instance `[[Type]]` (ECMA-402
+/// `CanonicalizeDisplayNamesType`-adjacent `of` grammar). Returns the
+/// canonical code, or `None` when `code` does not match the type's grammar (the
+/// caller raises a `RangeError`). Unknown types pass through unchanged.
+pub(crate) fn validate_display_code(ty: &str, code: &str) -> Option<String> {
+    let is_alpha = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphabetic());
+    let is_digit = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let is_alnum = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric());
+    match ty {
+        // unicode_language_id: a structurally valid tag with NO extension/private
+        // singletons (a length-1 subtag such as `u` in `en-u-hebrew` is invalid).
+        "language" => {
+            if code.split('-').any(|p| p.len() == 1) {
+                return None;
+            }
+            canonicalize_locale_id(code)
+        }
+        // unicode_region_subtag = alpha{2} | digit{3}.
+        "region" => {
+            if code.len() == 2 && is_alpha(code) {
+                Some(code.to_ascii_uppercase())
+            } else if code.len() == 3 && is_digit(code) {
+                Some(String::from(code))
+            } else {
+                None
+            }
+        }
+        // unicode_script_subtag = alpha{4} (title-cased).
+        "script" => {
+            if code.len() == 4 && is_alpha(code) {
+                let mut t = String::new();
+                for (i, c) in code.chars().enumerate() {
+                    if i == 0 {
+                        t.push(c.to_ascii_uppercase());
+                    } else {
+                        t.push(c.to_ascii_lowercase());
+                    }
+                }
+                Some(t)
+            } else {
+                None
+            }
+        }
+        // IsWellFormedCurrencyCode: 3 ASCII letters (upper-cased).
+        "currency" => (code.len() == 3 && is_alpha(code)).then(|| code.to_ascii_uppercase()),
+        // `type` nonterminal: alphanum{3,8} (-alphanum{3,8})* (lower-cased).
+        "calendar" => {
+            if code
+                .split('-')
+                .all(|p| (3..=8).contains(&p.len()) && is_alnum(p))
+            {
+                Some(code.to_ascii_lowercase())
+            } else {
+                None
+            }
+        }
+        // A fixed enumeration (ES2023 Table of date-time field codes).
+        "dateTimeField" => {
+            const FIELDS: &[&str] = &[
+                "era",
+                "year",
+                "quarter",
+                "month",
+                "weekOfYear",
+                "weekday",
+                "day",
+                "dayPeriod",
+                "hour",
+                "minute",
+                "second",
+                "timeZoneName",
+            ];
+            FIELDS.contains(&code).then(|| String::from(code))
+        }
+        _ => Some(String::from(code)),
+    }
+}
+
 /// Canonicalizes one extension's subtags into its `singleton-subtag-…` body.
 /// For `u`/`t` the keyword/field groups are sorted by key (ASCII order); for
 /// other singletons (and private use `x`) the order is preserved.
@@ -912,8 +991,11 @@ impl<'a> Interp<'a> {
         let sel_v = self.new_str(&selector);
         let bpair = self.realm.new_array(alloc::vec![inst_v, sel_v]);
         let bound = self.realm.new_bound_native(N_INTL_BOUND_CALL, bpair);
-        // The bound `format`/`compare`'s `name` is `""` and `length` is 1.
-        self.install_fn_name_length(bound, "", 1);
+        // The bound function's `name` is `""`; its `length` is 2 for `compare`
+        // (a two-argument comparator) and 1 for `format` (sec-collator-compare /
+        // sec-number-format-functions).
+        let len = if selector == "compare" { 2 } else { 1 };
+        self.install_fn_name_length(bound, "", len);
         let boundv = NanBox::handle(bound.to_raw());
         self.realm.set_hidden_property(inst, &cache_key, boundv);
         Ok(boundv)
@@ -956,9 +1038,33 @@ impl<'a> Interp<'a> {
             }
             _ => {
                 // `format`: format the single argument against the captured formatter.
-                let s = self.intl_format_value(inst, arg0);
+                let s = self.intl_format_checked(inst, arg0)?;
                 Ok(self.new_str(&s))
             }
+        }
+    }
+
+    /// `format(value)` for a NumberFormat or DateTimeFormat instance. A
+    /// DateTimeFormat coerces `value` via `ToNumber` + `TimeClip` (a non-finite /
+    /// out-of-range date is a RangeError; `undefined` → now); a NumberFormat
+    /// formats any numeric value (including `±Infinity`). Shared by the `format`
+    /// method dispatch and the bound `get format` function.
+    pub(crate) fn intl_format_checked(
+        &mut self,
+        inst: Handle,
+        value: NanBox,
+    ) -> Result<String, ExecError> {
+        let is_datetime = self
+            .realm
+            .get_property(inst, "\u{0}intl")
+            .map(|k| self.realm.to_display_string(k))
+            .as_deref()
+            == Some("datetime");
+        if is_datetime {
+            let ms = self.datetime_operand(value)?;
+            Ok(self.format_intl_datetime(inst, ms))
+        } else {
+            Ok(self.intl_format_value(inst, value))
         }
     }
 
@@ -1009,11 +1115,14 @@ impl<'a> Interp<'a> {
             .unwrap_or_else(|| String::from("en-US"));
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
-        // Coerce options: `undefined` → no options; otherwise ToObject (a
-        // primitive other than undefined is wrapped, exposing no option keys).
+        // `options = ? CoerceOptionsToObject(options)`: `undefined` → no options;
+        // `null` (→ ToObject) is a TypeError; any other primitive is wrapped
+        // (exposing no own option keys).
         let opts_arg = args.get(1).copied().unwrap_or(NanBox::undefined());
         let opts = if matches!(opts_arg.unpack(), Unpacked::Undefined) {
             None
+        } else if matches!(opts_arg.unpack(), Unpacked::Null) {
+            return Err(self.type_error("Intl formatter options must not be null"));
         } else {
             self.coerce_to_object(opts_arg)
                 .as_handle()
@@ -1334,6 +1443,32 @@ impl<'a> Interp<'a> {
                 Some("auto"),
             )?
             .unwrap();
+        // SetNumberFormatDigitOptions: a `roundingIncrement` other than 1 is only
+        // valid with the *fractionDigits* rounding type — else a TypeError — and
+        // additionally requires maximumFractionDigits == minimumFractionDigits
+        // (else a RangeError).
+        if rinc != 1.0 {
+            let rounding_type = if rounding_priority == "morePrecision" {
+                "morePrecision"
+            } else if rounding_priority == "lessPrecision" {
+                "lessPrecision"
+            } else if mnsd.is_some() {
+                "significantDigits"
+            } else {
+                "fractionDigits"
+            };
+            if rounding_type != "fractionDigits" {
+                return Err(self.type_error(
+                    "roundingIncrement other than 1 requires the fractionDigits rounding type",
+                ));
+            }
+            if let (Some(a), Some(b)) = (mnfd, mxfd)
+                && a != b
+            {
+                let m = self.new_str("roundingIncrement requires equal min/max fraction digits");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+        }
         let tzd = self
             .get_string_option(
                 opts,
@@ -1570,6 +1705,35 @@ impl<'a> Interp<'a> {
             let gran = get_str(self, "granularity").unwrap_or_else(|| String::from("grapheme"));
             let gv = self.new_str(&gran);
             self.realm.set_property(out, "granularity", gv);
+        } else if kind == "collator" {
+            // `Intl.Collator.prototype.resolvedOptions()` — `{ locale, usage,
+            // sensitivity, ignorePunctuation, collation, numeric?, caseFirst? }`
+            // in that order (Table: "Resolved Options of Collator instances").
+            let usage = get_str(self, "usage").unwrap_or_else(|| String::from("sort"));
+            let uv = self.new_str(&usage);
+            self.realm.set_property(out, "usage", uv);
+            let sensitivity =
+                get_str(self, "sensitivity").unwrap_or_else(|| String::from("variant"));
+            let sv = self.new_str(&sensitivity);
+            self.realm.set_property(out, "sensitivity", sv);
+            let ip = fmt
+                .and_then(|h| self.realm.get_property(h, "ignorePunctuation"))
+                .is_some_and(|v| self.realm.truthy(v));
+            self.realm
+                .set_property(out, "ignorePunctuation", NanBox::boolean(ip));
+            let collation = get_str(self, "collation").unwrap_or_else(|| String::from("default"));
+            let cv = self.new_str(&collation);
+            self.realm.set_property(out, "collation", cv);
+            // `numeric`/`caseFirst` are reported only when the instance resolved
+            // them (they are optional keys of the resolved-options table).
+            if let Some(n) = fmt.and_then(|h| self.realm.get_property(h, "numeric")) {
+                let nv = NanBox::boolean(self.realm.truthy(n));
+                self.realm.set_property(out, "numeric", nv);
+            }
+            if let Some(cf) = get_str(self, "caseFirst") {
+                let cfv = self.new_str(&cf);
+                self.realm.set_property(out, "caseFirst", cfv);
+            }
         } else if kind == "display" {
             // `Intl.DisplayNames.prototype.resolvedOptions()` — `{ locale, style,
             // type, fallback[, languageDisplay] }` (Table: "Resolved Options of
@@ -1928,10 +2092,30 @@ impl<'a> Interp<'a> {
         out
     }
 
+    /// `Intl.DateTimeFormat` operand coercion for `format`/`formatToParts`:
+    /// `undefined` → the current time; otherwise `? ToNumber(value)` (which runs
+    /// a throwing `valueOf`), then `TimeClip`. A non-finite or out-of-range time
+    /// value (`|x| > 8.64e15`) is a **RangeError** (sec-partitiondatetimepattern).
+    pub(crate) fn datetime_operand(&mut self, value: NanBox) -> Result<f64, ExecError> {
+        let x = if matches!(value.unpack(), Unpacked::Undefined) {
+            now_ms()
+        } else {
+            let n = self.coerce_to_number(value)?;
+            self.realm.to_number(n)
+        };
+        if !x.is_finite() || x.abs() > 8.64e15_f64 {
+            let m = self.new_str("date value is not a finite time value");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        Ok(x)
+    }
+
     /// The `[[NumberFormat]]`/`[[DateTimeFormat]]` instance for a `formatRange`
     /// call, plus its two coerced numeric endpoints. Per spec both `start`/`end`
     /// are **required** (`undefined` → TypeError) and must not be `NaN`
-    /// (→ RangeError); a `start > end` is allowed. Returns `(instance, x, y)`.
+    /// (→ RangeError); a `start > end` is allowed. For a DateTimeFormat the
+    /// endpoints are additionally `TimeClip`-validated (non-finite / out-of-range
+    /// → RangeError). Returns `(instance, x, y)`.
     fn intl_range_operands(
         &mut self,
         this: NanBox,
@@ -1955,6 +2139,16 @@ impl<'a> Interp<'a> {
         let (x, y) = (self.realm.to_number(x), self.realm.to_number(y));
         if x.is_nan() || y.is_nan() {
             let m = self.new_str("formatRange arguments must not be NaN");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        let is_datetime = self
+            .realm
+            .get_property(inst, "\u{0}intl")
+            .map(|k| self.realm.to_display_string(k))
+            .as_deref()
+            == Some("datetime");
+        if is_datetime && (!x.is_finite() || x.abs() > 8.64e15_f64 || y.abs() > 8.64e15_f64) {
+            let m = self.new_str("formatRange date value is not a finite time value");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
         Ok((inst, x, y))
@@ -2173,6 +2367,11 @@ impl<'a> Interp<'a> {
             &["lookup", "best fit"],
             Some("best fit"),
         )?;
+        // Spec option-evaluation order: `style` is read (and validated) *before*
+        // `type` (sec-Intl.DisplayNames steps 12–14), so an invalid `style` is a
+        // RangeError even when the required `type` is absent.
+        let style =
+            self.get_string_option(opts, "style", &["narrow", "short", "long"], Some("long"))?;
         // `type` is a **required** option (its absence — including when `options`
         // is undefined — is a TypeError); it must be one of the valid types.
         let type_s = self.get_string_option(
@@ -2196,11 +2395,9 @@ impl<'a> Interp<'a> {
         // Mark the service kind so `resolvedOptions` reports the DisplayNames shape.
         let kindv = self.new_str("display");
         self.realm.set_hidden_property(obj, "\u{0}intl", kindv);
-        // `style` (default "long"), `fallback` (default "code"), and — for a
-        // language type — `languageDisplay` (default "dialect"), validated + stored.
-        let style =
-            self.get_string_option(opts, "style", &["narrow", "short", "long"], Some("long"))?;
         self.store_str(obj, "style", &style);
+        // `fallback` (default "code") and — for a language type —
+        // `languageDisplay` (default "dialect"), validated + stored.
         let fallback = self.get_string_option(opts, "fallback", &["code", "none"], Some("code"))?;
         self.store_str(obj, "fallback", &fallback);
         if type_s == "language" {
@@ -2219,29 +2416,97 @@ impl<'a> Interp<'a> {
     /// Builds an `Intl.Collator` instance: an object capturing the locale and
     /// `sensitivity`/`numeric` options with a readable `compare` function (usable directly and
     /// as `arr.sort(collator.compare)`).
-    pub(crate) fn make_collator(&mut self, args: &[NanBox]) -> NanBox {
+    pub(crate) fn make_collator(&mut self, args: &[NanBox]) -> Result<NanBox, ExecError> {
         let obj = self.realm.new_object();
-        let locale = args
-            .first()
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-            .and_then(|h| self.realm.string_value(h))
+        self.init_collator(obj, args)?;
+        Ok(NanBox::handle(obj.to_raw()))
+    }
+
+    /// `InitializeCollator`: canonicalizes the requested locales, then reads and
+    /// validates the options in spec order — `usage`, `localeMatcher`,
+    /// `collation`, `numeric`, `caseFirst`, `sensitivity`, `ignorePunctuation` —
+    /// storing the resolved values behind hidden slots for `resolvedOptions`.
+    pub(crate) fn init_collator(&mut self, obj: Handle, args: &[NanBox]) -> Result<(), ExecError> {
+        let marker = self.new_str("collator");
+        self.realm.set_hidden_property(obj, "\u{0}intl", marker);
+        // 1. CanonicalizeLocaleList(locales) — a malformed tag raises a RangeError.
+        let locale = self
+            .canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?
+            .into_iter()
+            .next()
             .unwrap_or_else(|| String::from("en"));
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
-        if let Some(opts) = args
-            .get(1)
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
+        // GetOptionsObject: `undefined` → no options; a non-object (other than
+        // undefined, e.g. `null`) is a TypeError; otherwise the object itself.
+        let opts_arg = args.get(1).copied().unwrap_or(NanBox::undefined());
+        let opts = if matches!(opts_arg.unpack(), Unpacked::Undefined) {
+            None
+        } else if self.is_object_value(opts_arg) {
+            opts_arg.as_handle().map(Handle::from_raw)
+        } else {
+            return Err(self.type_error("Intl.Collator options must be an object"));
+        };
+        // Read order (observable via throwing getters): usage, localeMatcher,
+        // collation, numeric, caseFirst, sensitivity, ignorePunctuation.
+        let usage = self
+            .get_string_option(opts, "usage", &["sort", "search"], Some("sort"))?
+            .unwrap();
+        let _ = self.get_string_option(
+            opts,
+            "localeMatcher",
+            &["lookup", "best fit"],
+            Some("best fit"),
+        )?;
+        // `collation`: an unvalidated string that must match the `type` grammar
+        // (alphanum{3,8} groups) — a malformed value is a RangeError.
+        let collation = self.get_string_option(opts, "collation", &[], None)?;
+        if let Some(c) = &collation
+            && !c
+                .split('-')
+                .all(|p| (3..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()))
         {
-            for key in ["sensitivity", "numeric", "caseFirst"] {
-                if let Some(v) = self.realm.get_property(opts, key) {
-                    self.realm.set_hidden_property(obj, key, v);
-                }
-            }
+            let m = self.new_str(&alloc::format!("invalid collation option: {c}"));
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        let numeric = self.get_bool_option(opts, "numeric", None)?;
+        let case_first =
+            self.get_string_option(opts, "caseFirst", &["upper", "lower", "false"], None)?;
+        let sensitivity = self
+            .get_string_option(
+                opts,
+                "sensitivity",
+                &["base", "accent", "case", "variant"],
+                None,
+            )?
+            .unwrap_or_else(|| String::from("variant"));
+        // `ignorePunctuation` default is locale-dependent (CLDR): true for Thai,
+        // false elsewhere.
+        let primary = locale.split(['-', '_']).next().unwrap_or("");
+        let ip_default = primary.eq_ignore_ascii_case("th");
+        let ignore_punct = self
+            .get_bool_option(opts, "ignorePunctuation", Some(ip_default))?
+            .unwrap_or(ip_default);
+        // Store the resolved slots for resolvedOptions.
+        self.store_str(obj, "usage", &Some(usage));
+        self.store_str(obj, "sensitivity", &Some(sensitivity));
+        let ipv = NanBox::boolean(ignore_punct);
+        self.realm
+            .set_hidden_property(obj, "ignorePunctuation", ipv);
+        self.store_str(
+            obj,
+            "collation",
+            &Some(collation.unwrap_or_else(|| String::from("default"))),
+        );
+        if let Some(n) = numeric {
+            let nv = NanBox::boolean(n);
+            self.realm.set_hidden_property(obj, "numeric", nv);
+        }
+        if let Some(cf) = case_first {
+            self.store_str(obj, "caseFirst", &Some(cf));
         }
         self.brand_intl_instance(obj, N_INTL_COLLATOR);
-        NanBox::handle(obj.to_raw())
+        Ok(())
     }
 
     /// Builds an `Intl.ListFormat` instance (`InitializeListFormat`): canonicalizes
@@ -2603,36 +2868,56 @@ impl<'a> Interp<'a> {
 
     /// Builds an `Intl.Segmenter` instance: an object capturing `granularity` with a readable
     /// `segment(input)` method.
-    pub(crate) fn make_segmenter(&mut self, args: &[NanBox]) -> NanBox {
+    pub(crate) fn make_segmenter(&mut self, args: &[NanBox]) -> Result<NanBox, ExecError> {
         let obj = self.realm.new_object();
-        self.init_segmenter(obj, args);
-        NanBox::handle(obj.to_raw())
+        self.init_segmenter(obj, args)?;
+        Ok(NanBox::handle(obj.to_raw()))
     }
 
-    pub(crate) fn init_segmenter(&mut self, obj: Handle, args: &[NanBox]) {
-        // Resolve + store the locale (best-effort; the constructor path validates).
+    pub(crate) fn init_segmenter(&mut self, obj: Handle, args: &[NanBox]) -> Result<(), ExecError> {
+        // 1. CanonicalizeLocaleList(locales) — a malformed tag / non-string,
+        //    non-object element raises a RangeError/TypeError.
         let locale = self
-            .canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))
-            .ok()
-            .and_then(|r| r.into_iter().next())
+            .canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?
+            .into_iter()
+            .next()
             .unwrap_or_else(|| String::from("en"));
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
-        // `granularity` (default "grapheme"), stored so `resolvedOptions` reports it.
-        let gran = args
-            .get(1)
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-            .and_then(|opts| self.realm.get_property(opts, "granularity"))
-            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
-            .map(|v| self.realm.to_display_string(v))
-            .unwrap_or_else(|| String::from("grapheme"));
+        // GetOptionsObject: `undefined` → no options; a non-object (other than
+        // undefined, e.g. `null`) is a TypeError; otherwise the object itself.
+        let opts_arg = args.get(1).copied().unwrap_or(NanBox::undefined());
+        let opts = if matches!(opts_arg.unpack(), Unpacked::Undefined) {
+            None
+        } else if self.is_object_value(opts_arg) {
+            opts_arg.as_handle().map(Handle::from_raw)
+        } else {
+            return Err(self.type_error("Intl.Segmenter options must be an object"));
+        };
+        // Options are read in spec order: localeMatcher, then granularity.
+        let _ = self.get_string_option(
+            opts,
+            "localeMatcher",
+            &["lookup", "best fit"],
+            Some("best fit"),
+        )?;
+        // `granularity` (default "grapheme"), validated + stored so
+        // `resolvedOptions` reports it (an invalid value is a RangeError).
+        let gran = self
+            .get_string_option(
+                opts,
+                "granularity",
+                &["grapheme", "word", "sentence"],
+                Some("grapheme"),
+            )?
+            .unwrap();
         let granv = self.new_str(&gran);
         self.realm.set_hidden_property(obj, "granularity", granv);
         // Mark the service kind so `resolvedOptions` reports the Segmenter shape.
         let kindv = self.new_str("segmenter");
         self.realm.set_hidden_property(obj, "\u{0}intl", kindv);
         self.brand_intl_instance(obj, N_INTL_SEGMENTER);
+        Ok(())
     }
 
     /// Breaks a UTC millisecond timestamp into typed `(type, value)` parts per an
@@ -3819,17 +4104,22 @@ impl<'a> Interp<'a> {
 
     pub(crate) fn init_locale(&mut self, obj: Handle, args: &[NanBox]) -> Result<(), ExecError> {
         let tag_arg = args.first().copied().unwrap_or(NanBox::undefined());
-        // A `Locale` argument contributes its `[[Locale]]` tag; otherwise ToString
-        // (undefined/symbol throw via the usual coercion / TypeError below).
-        let base_tag = if let Some(h) = tag_arg.as_handle().map(Handle::from_raw)
-            && let Some(t) = self.realm.get_property(h, "\u{0}locale_tag")
-        {
-            self.realm.to_display_string(t)
-        } else if matches!(tag_arg.unpack(), Unpacked::Undefined) {
+        // Step 7: If Type(tag) is not String or Object, throw a TypeError. A
+        // `Locale` argument contributes its `[[Locale]]` tag; a String/Object is
+        // ToString-ed; everything else (undefined/null/boolean/number/symbol/
+        // bigint) is a TypeError *before* any structural validation.
+        let base_tag = if let Some(h) = tag_arg.as_handle().map(Handle::from_raw) {
+            if let Some(t) = self.realm.get_property(h, "\u{0}locale_tag") {
+                self.realm.to_display_string(t)
+            } else if matches!(self.realm.type_of(h), Some("symbol") | Some("bigint")) {
+                let m = self.new_str("Intl.Locale: tag must be a string or Locale");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            } else {
+                self.coerce_to_string(tag_arg)?
+            }
+        } else {
             let m = self.new_str("Intl.Locale: tag must be a string or Locale");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-        } else {
-            self.coerce_to_string(tag_arg)?
         };
         let Some(canon) = canonicalize_locale_id(&base_tag) else {
             let m = self.new_str(&alloc::format!("invalid language tag: {base_tag}"));
