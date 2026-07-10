@@ -2392,6 +2392,24 @@ impl<'a> Interp<'a> {
             // `get %TypedArray%[Symbol.species]` — returns the receiver constructor.
             // (Also shared by `Map`/`Set`/… species getters, which all return `this`.)
             N_TYPED_ARRAY_SPECIES => self.this_val,
+            // `Function.prototype.toString` reached *indirectly* (`.call`/`.apply`,
+            // ToPrimitive, `String(fn)`, `fn + ""`). A direct `fn.toString()` is
+            // handled by the method-name shortcut. Throws a TypeError on a
+            // non-callable `this` (per 20.2.3.5).
+            N_FUNCTION_TO_STRING => {
+                let this = self.this_val;
+                let h = this
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .filter(|h| self.is_callable(*h) || self.realm.class_at(*h).is_some());
+                let Some(h) = h else {
+                    let m = self
+                        .new_str("Function.prototype.toString requires that 'this' be a Function");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                };
+                let s = self.function_to_string_repr(h)?;
+                self.new_str(&s)
+            }
             // `get %IteratorPrototype%[Symbol.toStringTag]` → always "Iterator".
             N_ITERATOR_TAG_GET => self.new_str("Iterator"),
             // `set %IteratorPrototype%[Symbol.toStringTag]`: SetterThatIgnores-

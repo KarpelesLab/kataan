@@ -290,6 +290,11 @@ impl<'a> Interp<'a> {
             self.realm.freeze_object(raw_h);
             self.realm
                 .set_property(strings_h, "raw", NanBox::handle(raw_h.to_raw()));
+            // Per spec the template object's `raw` is
+            // `{ writable:false, enumerable:false, configurable:false }` — mark it
+            // non-enumerable *before* freezing (freeze then locks writable /
+            // configurable). Without this it enumerates in `for-in`/`Object.keys`.
+            self.realm.mark_hidden(strings_h, "raw");
             self.realm.freeze_object(strings_h);
             let arr = NanBox::handle(strings_h.to_raw());
             self.tagged_template_cache.insert(cache_key, arr);

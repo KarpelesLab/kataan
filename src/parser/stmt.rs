@@ -616,13 +616,21 @@ impl<'src> Parser<'src> {
         }
 
         let tok = self.peek_tok();
-        // String/number literal key — always `key: target`.
-        if matches!(tok.kind, TokenKind::String | TokenKind::Number) {
+        // String/number/bigint literal key — always `key: target`. A BigInt key is
+        // ToString of its value (`1n` → `"1"`).
+        if matches!(
+            tok.kind,
+            TokenKind::String | TokenKind::Number | TokenKind::BigInt
+        ) {
             self.bump();
-            let key = if tok.kind == TokenKind::String {
-                PropertyKey::Str(cook::string_key(tok.text(self.source), tok.span)?.into())
-            } else {
-                PropertyKey::Number(cook::number(tok.text(self.source)))
+            let key = match tok.kind {
+                TokenKind::String => {
+                    PropertyKey::Str(cook::string_key(tok.text(self.source), tok.span)?.into())
+                }
+                TokenKind::BigInt => {
+                    PropertyKey::Str(cook::bigint_property_key(tok.text(self.source)).into())
+                }
+                _ => PropertyKey::Number(cook::number(tok.text(self.source))),
             };
             self.expect(TokenKind::Colon)?;
             let value = self.parse_binding_target()?;

@@ -1565,6 +1565,13 @@ const N_OBJ_PROTO_TOSTRING: u16 = 675;
 /// "toString")` (NOT the `[[Class]]` tag), so a user-overridden `toString` on the
 /// receiver (or its prototype) is honored, with the *original* `this` value.
 const N_OBJ_PROTO_TOLOCALESTRING: u16 = 964;
+/// `Function.prototype.toString` — a dedicated dispatch id (distinct from the
+/// shared `N_ARRAY_PROTO_FN` used by `call`/`apply`/`bind`) so an *indirect*
+/// invocation (`Function.prototype.toString.call(fn)`, `String(fn)`, `fn + ""`,
+/// ToPrimitive) renders the callable's source-representation instead of being
+/// misrouted to `Array.prototype.toString` (which would yield `"[object
+/// Function]"`). Reads its receiver from `this`; a non-callable `this` throws.
+const N_FUNCTION_TO_STRING: u16 = 965;
 /// `%Segments.prototype%.containing(index)` — a bound native on the object
 /// returned by `Intl.Segmenter.prototype.segment`.
 const N_INTL_SEGMENTS_CONTAINING: u16 = 676;
@@ -4565,6 +4572,26 @@ impl<'a> Interp<'a> {
         }
         self.setup_regexp_prototype();
         self.setup_first_class_prototype("Function", FUNCTION_PROTO_METHODS);
+        // Replace `Function.prototype.toString` with a *dedicated*-id native so it
+        // is not confused with `Array.prototype.toString` when invoked indirectly
+        // (both otherwise share `N_ARRAY_PROTO_FN`). Direct `fn.toString()` is
+        // intercepted by the method-name shortcut; this value is what a `.call` /
+        // `.apply` / ToPrimitive / `String(fn)` reaches.
+        if let Some(func_proto) = self
+            .current
+            .get("Function")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|f| self.realm.get_property(f, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        {
+            let ts = self.new_named_native("toString", N_FUNCTION_TO_STRING);
+            self.install_fn_name_length(ts, "toString", 0);
+            self.realm
+                .set_property(func_proto, "toString", NanBox::handle(ts.to_raw()));
+            self.realm.mark_hidden(func_proto, "toString");
+        }
         // Record `%Function.prototype%` as the default `[[Prototype]]` of every
         // ordinary/native callable (so `Object.getPrototypeOf(fn)` resolves to it
         // instead of `null`).
@@ -4993,6 +5020,25 @@ impl<'a> Interp<'a> {
         }
         // Newly-created plain objects now inherit from `Object.prototype`.
         self.realm.set_default_object_proto(obj_proto);
+        // `%IteratorPrototype%` was created before `Object.prototype` existed, so
+        // its `[[Prototype]]` was left null. Per spec it is `%Object.prototype%`
+        // (25.1.2.1) — link it now so every iterator (array/string/map/set/regexp/
+        // generator, and any object inheriting `%IteratorPrototype%`) inherits
+        // `toString`/`valueOf`. Without this, ToPrimitive on an iterator (e.g. a
+        // generator object used as a computed property key) throws "Cannot convert
+        // object to primitive value" instead of yielding "[object <Tag>]".
+        if let Some(iter_proto) = self
+            .current
+            .get("Iterator")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+            && self.realm.object_proto(iter_proto).is_none()
+        {
+            self.realm.set_object_proto(iter_proto, Some(obj_proto));
+        }
         // Build the real `.prototype` objects (with branded methods/accessors,
         // `constructor`, and `[Symbol.toStringTag]`) for every `Intl` service
         // constructor — `Object.prototype` now exists, so the prototypes inherit it.

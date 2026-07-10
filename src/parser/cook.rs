@@ -150,6 +150,24 @@ pub(super) fn bigint(text: &str) -> String {
     text.chars().filter(|&c| c != '_' && c != 'n').collect()
 }
 
+/// The property key a **BigInt literal** contributes as an object/class member
+/// name (`{ 1n: v }`, `class { 1n() {} }`, `let { 1n: a } = …`): per spec it is
+/// `ToString` of the BigInt *value* (a canonical decimal string), so `0x10n`
+/// keys `"16"` and `999999999999999999n` keys its exact digits (never lossily
+/// coerced through an `f64`). Non-decimal bases are normalized to decimal.
+pub(super) fn bigint_property_key(text: &str) -> String {
+    let digits: String = text.chars().filter(|&c| c != '_' && c != 'n').collect();
+    let (radix, body) = match digits.get(0..2) {
+        Some("0x" | "0X") => (16, &digits[2..]),
+        Some("0o" | "0O") => (8, &digits[2..]),
+        Some("0b" | "0B") => (2, &digits[2..]),
+        _ => (10, digits.as_str()),
+    };
+    let n = crate::bignum::BigInt::from_str_radix(body, radix)
+        .unwrap_or_else(crate::bignum::BigInt::zero);
+    alloc::format!("{n}")
+}
+
 /// Decodes a string-literal token (including its surrounding quotes) into its
 /// runtime value — WTF-8 bytes preserving any lone UTF-16 surrogates.
 pub(super) fn string(raw: &str, span: Span) -> Result<Vec<u8>> {

@@ -8,6 +8,26 @@ fn is_js_trim_ws(c: char) -> bool {
 }
 
 impl<'a> Interp<'a> {
+    /// `Function.prototype.toString` source-representation for the callable
+    /// `handle`: `class <Name> { }` for a class, else NativeFunction syntax
+    /// (`function <name>() { [native code] }` — the engine retains no source).
+    /// The `name` segment is emitted only when it is a valid IdentifierName
+    /// (optionally with a `get `/`set ` prefix); a `#private`, symbol-bracketed,
+    /// or punctuated name is dropped rather than produce an unparsable string.
+    pub(crate) fn function_to_string_repr(
+        &mut self,
+        handle: Handle,
+    ) -> Result<alloc::string::String, ExecError> {
+        let nm = self.read_member(handle, "name")?;
+        let nm = self.realm.to_display_string(nm);
+        Ok(if self.realm.class_at(handle).is_some() {
+            alloc::format!("class {nm} {{ }}")
+        } else {
+            let seg = crate::realm::native_fn_name_segment(&nm);
+            alloc::format!("function {seg}() {{ [native code] }}")
+        })
+    }
+
     /// Dispatches a built-in method on a string/array receiver. Returns
     /// `Ok(None)` if `method` is not a recognized built-in (the caller then
     /// treats it as an ordinary property-valued function).
@@ -634,21 +654,7 @@ impl<'a> Interp<'a> {
                 }
                 // A textual representation (the engine does not retain source).
                 "toString" | "toLocaleString" => {
-                    let nm = self.read_member(handle, "name")?;
-                    let nm = self.realm.to_display_string(nm);
-                    let s = if self.realm.class_at(handle).is_some() {
-                        alloc::format!("class {nm} {{ }}")
-                    } else {
-                        // Fall back to NativeFunction syntax (Test262's matcher
-                        // accepts it). Only emit the `name` when it is a valid
-                        // IdentifierName (optionally with a `get `/`set ` accessor
-                        // prefix): a private-method name (`#f`), a bracketed symbol
-                        // name, or one with punctuation is not valid NativeFunction
-                        // syntax, so it is dropped rather than producing an
-                        // unparsable `function #f() { … }`.
-                        let seg = crate::realm::native_fn_name_segment(&nm);
-                        alloc::format!("function {seg}() {{ [native code] }}")
-                    };
+                    let s = self.function_to_string_repr(handle)?;
                     return Ok(Some(self.new_str(&s)));
                 }
                 _ => {}

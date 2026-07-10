@@ -161,6 +161,11 @@ impl<'src> Parser<'src> {
             && !is_generator
             && matches!(self.peek(), TokenKind::Keyword(Kw::Get | Kw::Set))
             && !self.modifier_is_name(1)
+            // A getter/setter is never a generator: `get *m(){}` is NOT an
+            // accessor named `m` — `get` is a plain field/method name (`*m` is a
+            // separate generator method, reached via ASI). Only `async` may be a
+            // modifier before `*`.
+            && self.nth_kind(1) != TokenKind::Star
         {
             let k = if self.at(TokenKind::Keyword(Kw::Get)) {
                 MethodKind::Get
@@ -321,6 +326,12 @@ impl<'src> Parser<'src> {
             TokenKind::Number => {
                 self.bump();
                 Ok(PropertyKey::Number(cook::number(tok.text(self.source))))
+            }
+            TokenKind::BigInt => {
+                self.bump();
+                Ok(PropertyKey::Str(
+                    cook::bigint_property_key(tok.text(self.source)).into(),
+                ))
             }
             TokenKind::Identifier => {
                 self.bump();

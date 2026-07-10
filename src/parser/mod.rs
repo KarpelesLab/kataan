@@ -1428,14 +1428,35 @@ impl<'src> Parser<'src> {
         }
 
         let tok = self.peek_tok();
-        // A literal string/number key always takes `: value`.
-        if matches!(tok.kind, TokenKind::String | TokenKind::Number) {
+        // A literal string/number/bigint key takes `: value` (a data property) or
+        // `(…) {…}` (a method) — e.g. `{ 1n: v }` / `{ 1n() {} }`. A BigInt key is
+        // ToString of its value (`1n` → `"1"`), a canonical property name.
+        if matches!(
+            tok.kind,
+            TokenKind::String | TokenKind::Number | TokenKind::BigInt
+        ) {
             self.bump();
-            let key = if tok.kind == TokenKind::String {
-                PropertyKey::Str(cook::string_key(tok.text(self.source), tok.span)?.into())
-            } else {
-                PropertyKey::Number(cook::number(tok.text(self.source)))
+            let key = match tok.kind {
+                TokenKind::String => {
+                    PropertyKey::Str(cook::string_key(tok.text(self.source), tok.span)?.into())
+                }
+                TokenKind::BigInt => {
+                    PropertyKey::Str(cook::bigint_property_key(tok.text(self.source)).into())
+                }
+                _ => PropertyKey::Number(cook::number(tok.text(self.source))),
             };
+            // `key() { … }` — a method with a literal key.
+            if self.at(TokenKind::LParen) {
+                let func = self.parse_method_tail(false, false)?;
+                let span = start.to(self.prev_span());
+                return Ok(ObjectMember::Property {
+                    key,
+                    value: Box::new(Expr::Function(func)),
+                    shorthand: false,
+                    method: true,
+                    span,
+                });
+            }
             self.expect(TokenKind::Colon)?;
             let value = self.parse_assignment()?;
             let span = start.to(value.span());

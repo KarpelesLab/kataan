@@ -8441,3 +8441,102 @@ fn intl_datetime_numbering_system() {
         "6/15/2020"
     );
 }
+
+#[test]
+fn function_to_string_is_consistent_across_coercion_paths() {
+    // `Function.prototype.toString` reached indirectly (`String(fn)`, `fn + ""`,
+    // `.call`) must render the same source-representation as `fn.toString()`,
+    // not be misrouted to `Array.prototype.toString` ("[object Function]").
+    assert_eq!(
+        run(r#"var f=function g(){}; String(f) === f.toString()"#),
+        "true"
+    );
+    assert_eq!(
+        run(r#"var f=function g(){}; (""+f) === f.toString()"#),
+        "true"
+    );
+    assert_eq!(
+        run(r#"var f=function(){}; Function.prototype.toString.call(f) === f.toString()"#),
+        "true"
+    );
+    // A function used as a computed property key stringifies consistently, so a
+    // later lookup with the same function resolves.
+    assert_eq!(
+        run(r#"var o={[function(){}]:1}; o[String(function(){})] === 1 && o[function(){}] === 1"#),
+        "true"
+    );
+    // Non-callable `this` throws a TypeError.
+    assert_eq!(
+        run(r#"try{Function.prototype.toString.call({});false}catch(e){e instanceof TypeError}"#),
+        "true"
+    );
+}
+
+#[test]
+fn iterators_inherit_object_prototype() {
+    // `%IteratorPrototype%.[[Prototype]]` is `%Object.prototype%`, so every
+    // iterator inherits `toString`/`valueOf`; ToPrimitive on an iterator (e.g. a
+    // generator object used as a computed key) yields "[object <Tag>]" instead of
+    // throwing "Cannot convert object to primitive value".
+    assert_eq!(
+        run(r#"typeof [][Symbol.iterator]().toString === "function""#),
+        "true"
+    );
+    assert_eq!(
+        run(r#"function* g(){}; String(g()) === "[object Generator]""#),
+        "true"
+    );
+    assert_eq!(
+        run(r#"function* g(){}; Object.keys({[g()]:1})[0] === "[object Generator]""#),
+        "true"
+    );
+}
+
+#[test]
+fn bigint_literal_property_keys() {
+    // A BigInt literal key is ToString of its value (a canonical decimal string),
+    // exact even beyond 2^53, and supports non-decimal bases.
+    assert_eq!(
+        run(r#"({999999999999999999n: true})["999999999999999999"] === true"#),
+        "true"
+    );
+    assert_eq!(run(r#"({0x10n: "s"})["16"] === "s""#), "true");
+    assert_eq!(run(r#"({1n(){return "m";}})["1"]() === "m""#), "true");
+    assert_eq!(
+        run(r#"class C{1n(){return "c";}}; new C()["1"]() === "c""#),
+        "true"
+    );
+    assert_eq!(run(r#"var {1n: a} = {"1":"v"}; a === "v""#), "true");
+    // A plain numeric-keyed concise method still works (regression guard).
+    assert_eq!(run(r#"({5(){return "five";}})["5"]() === "five""#), "true");
+}
+
+#[test]
+fn class_field_named_get_set_before_generator_asi() {
+    // `get`/`set` followed by `*` is a plain field/method name (a getter is never
+    // a generator); the `*m(){}` is a separate generator method via ASI.
+    assert_eq!(
+        run(r#"class A{ get
+ *a(){} }; A.prototype.hasOwnProperty("a") && new A().hasOwnProperty("get")"#),
+        "true"
+    );
+    // Ordinary accessors and async generators still parse correctly.
+    assert_eq!(
+        run(
+            r#"class C{ get x(){return 1;} async *g(){} }; new C().x === 1 && typeof new C().g === "function""#
+        ),
+        "true"
+    );
+}
+
+#[test]
+fn tagged_template_raw_is_non_enumerable() {
+    // The template object's `raw` property is
+    // `{ writable:false, enumerable:false, configurable:false }`.
+    assert_eq!(
+        run(r#"var t; (function tag(x){t=x;})`${1}`;
+               var d=Object.getOwnPropertyDescriptor(t,"raw");
+               !d.enumerable && !d.writable && !d.configurable"#),
+        "true"
+    );
+}
