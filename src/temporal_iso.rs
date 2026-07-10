@@ -558,7 +558,36 @@ impl DurationFields {
                 sign = s;
             }
         }
-        true
+        // `IsValidDuration` magnitude limits: |years|,|months|,|weeks| < 2^32, and
+        // the combined day+time total (in whole seconds) < 2^53. An overflowing
+        // (hence invalid) field magnitude is rejected rather than wrapping.
+        const TWO_POW_32: i128 = 1 << 32;
+        const TWO_POW_53: i128 = 1 << 53;
+        if self.years.abs() >= TWO_POW_32
+            || self.months.abs() >= TWO_POW_32
+            || self.weeks.abs() >= TWO_POW_32
+        {
+            return false;
+        }
+        let mut total_ns: i128 = 0;
+        for (v, mult) in [
+            (self.days, NS_PER_DAY),
+            (self.hours, NS_PER_HOUR),
+            (self.minutes, NS_PER_MINUTE),
+            (self.seconds, NS_PER_SEC),
+            (self.milliseconds, 1_000_000),
+            (self.microseconds, 1_000),
+            (self.nanoseconds, 1),
+        ] {
+            let Some(contrib) = v.checked_mul(mult) else {
+                return false;
+            };
+            let Some(sum) = total_ns.checked_add(contrib) else {
+                return false;
+            };
+            total_ns = sum;
+        }
+        (total_ns / NS_PER_SEC).abs() < TWO_POW_53
     }
 
     /// The sub-day portion expressed as a nanosecond count (hours…nanoseconds).
@@ -1291,6 +1320,34 @@ mod tests {
         // Negative magnitudes carry their sign through the i128 fields.
         let d = balance_time_duration(-ns_total, Unit::Nanosecond);
         assert_eq!(d.nanoseconds, -ns_total);
+    }
+
+    #[test]
+    fn duration_is_valid_enforces_magnitude_limits() {
+        let mk = |years: i128, months: i128, weeks: i128, days: i128| DurationFields {
+            years,
+            months,
+            weeks,
+            days,
+            ..Default::default()
+        };
+        // Ordinary durations are valid.
+        assert!(mk(1, 2, 3, 4).is_valid());
+        // years/months/weeks are bounded by 2^32 (exclusive).
+        let two_pow_32: i128 = 1 << 32;
+        assert!(mk(two_pow_32 - 1, 0, 0, 0).is_valid());
+        assert!(!mk(two_pow_32, 0, 0, 0).is_valid());
+        assert!(!mk(0, two_pow_32, 0, 0).is_valid());
+        assert!(!mk(0, 0, two_pow_32, 0).is_valid());
+        assert!(!mk(0, 0, -two_pow_32, 0).is_valid());
+        // days are bounded by the seconds total, not 2^32: ceil(2^53 / 86400) is
+        // the first invalid magnitude.
+        assert!(mk(0, 0, 0, 104_249_991_374).is_valid());
+        assert!(mk(0, 0, 0, -104_249_991_374).is_valid());
+        assert!(!mk(0, 0, 0, 104_249_991_375).is_valid());
+        assert!(!mk(0, 0, 0, -104_249_991_375).is_valid());
+        // Mixed signs are invalid.
+        assert!(!mk(1, -1, 0, 0).is_valid());
     }
 
     #[test]

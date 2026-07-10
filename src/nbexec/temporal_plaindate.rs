@@ -102,18 +102,44 @@ impl<'a> Interp<'a> {
             }
             "toPlainDateTime" => {
                 let time = self.pd_to_temporal_time(arg(0))?;
+                // `ISODateTimeWithinLimits` on the combined date-time.
+                let ns = crate::temporal_iso::iso_to_epoch_days(data.date) as i128
+                    * crate::temporal_iso::NS_PER_DAY
+                    + crate::temporal_iso::time_to_nanos(time);
+                if !(ns > crate::temporal_iso::MIN_EPOCH_NS - crate::temporal_iso::NS_PER_DAY
+                    && ns < crate::temporal_iso::MAX_EPOCH_NS + crate::temporal_iso::NS_PER_DAY)
+                {
+                    return Err(self
+                        .pd_range_error("combined date-time is outside the representable range"));
+                }
                 Ok(self.pd_new_kind(TemporalKind::PlainDateTime, data.date, time))
             }
-            "toPlainYearMonth" => Ok(self.pd_new_kind(
-                TemporalKind::PlainYearMonth,
-                data.date,
-                temporal_iso::IsoTime::default(),
-            )),
-            "toPlainMonthDay" => Ok(self.pd_new_kind(
-                TemporalKind::PlainMonthDay,
-                data.date,
-                temporal_iso::IsoTime::default(),
-            )),
+            "toPlainYearMonth" => {
+                // A PlainYearMonth stores a reference ISO day; for the ISO
+                // calendar `ISOYearMonthFromFields` fixes it at 1.
+                let mut d = data.date;
+                if tcal::is_iso(&cal) {
+                    d.day = 1;
+                }
+                Ok(self.pd_new_kind(
+                    TemporalKind::PlainYearMonth,
+                    d,
+                    temporal_iso::IsoTime::default(),
+                ))
+            }
+            "toPlainMonthDay" => {
+                // A PlainMonthDay stores a reference ISO year; for the ISO
+                // calendar the canonical reference year is 1972 (a leap year).
+                let mut d = data.date;
+                if tcal::is_iso(&cal) {
+                    d.year = 1972;
+                }
+                Ok(self.pd_new_kind(
+                    TemporalKind::PlainMonthDay,
+                    d,
+                    temporal_iso::IsoTime::default(),
+                ))
+            }
             "toString" => {
                 let s = self.pd_to_string(data.date, &cal, arg(0))?;
                 Ok(self.new_str(&s))
@@ -129,54 +155,60 @@ impl<'a> Interp<'a> {
                 // `date.toZonedDateTime(timeZone | { timeZone, plainTime })` → the
                 // instant of the (date, plainTime|midnight) wall time in the zone.
                 let item = arg(0);
-                // A plain object (not a Temporal value) is a `{ timeZone, plainTime }`
-                // bag whose time-zone-like lives on `timeZone`; a String or a
-                // `Temporal.ZonedDateTime` is itself the time-zone-like.
-                let tz_like = if self.is_object_value(item)
+                // A plain (non-Temporal) object is a `{ timeZone, plainTime }` bag:
+                // read `timeZone` first (observably), then `plainTime`. When the bag
+                // carries no `timeZone`, the object itself is the time-zone-like. A
+                // String or `Temporal.ZonedDateTime` is itself the time-zone-like
+                // (with no separate plain time).
+                let is_plain_obj = self.is_object_value(item)
                     && item
                         .as_handle()
                         .map(Handle::from_raw)
                         .and_then(|h| self.realm.temporal_at(h))
-                        .is_none()
-                {
+                        .is_none();
+                let (tz, time) = if is_plain_obj {
                     let h = item.as_handle().map(Handle::from_raw).unwrap();
-                    let v = self
-                        .realm
-                        .get_property(h, "timeZone")
-                        .unwrap_or(NanBox::undefined());
-                    if v.is_undefined() {
-                        return Err(self.type_error("toZonedDateTime: missing timeZone"));
+                    let tzlike = self.read_member(h, "timeZone")?;
+                    if tzlike.is_undefined() {
+                        (
+                            self.temporal_tz_arg(item)?,
+                            temporal_iso::IsoTime::default(),
+                        )
+                    } else {
+                        let tz = self.temporal_tz_arg(tzlike)?;
+                        // `plainTime` runs the full `ToTemporalTime` (string/bag/
+                        // PlainTime/PlainDateTime/ZonedDateTime); absent → midnight.
+                        let ptv = self.read_member(h, "plainTime")?;
+                        let time = if ptv.is_undefined() {
+                            temporal_iso::IsoTime::default()
+                        } else {
+                            self.pd_to_temporal_time(ptv)?
+                        };
+                        (tz, time)
                     }
-                    v
                 } else {
-                    item
+                    (
+                        self.temporal_tz_arg(item)?,
+                        temporal_iso::IsoTime::default(),
+                    )
                 };
-                let tz = self.temporal_tz_arg(tz_like)?;
-                let mut time = crate::temporal_iso::IsoTime::default();
-                if self.is_object_value(item)
-                    && let Some(h) = item.as_handle().map(Handle::from_raw)
-                {
-                    let ptv = self
-                        .realm
-                        .get_property(h, "plainTime")
-                        .unwrap_or(NanBox::undefined());
-                    if let Some(pt) = ptv
-                        .as_handle()
-                        .map(Handle::from_raw)
-                        .and_then(|hh| self.realm.temporal_at(hh))
-                        && pt.kind == crate::temporal_iso::TemporalKind::PlainTime
-                    {
-                        time = pt.time;
-                    }
-                }
+                // `ISODateTimeWithinLimits` on the combined wall date-time.
                 let local_ns = crate::temporal_iso::iso_to_epoch_days(data.date) as i128
                     * crate::temporal_iso::NS_PER_DAY
                     + crate::temporal_iso::time_to_nanos(time);
+                if !(local_ns > crate::temporal_iso::MIN_EPOCH_NS - crate::temporal_iso::NS_PER_DAY
+                    && local_ns
+                        < crate::temporal_iso::MAX_EPOCH_NS + crate::temporal_iso::NS_PER_DAY)
+                {
+                    return Err(self
+                        .pd_range_error("combined date-time is outside the representable range"));
+                }
                 let offset = self.temporal_tz_offset_ns(&tz, local_ns).unwrap_or(0);
                 Ok(self.build_temporal(crate::temporal_iso::TemporalData {
                     kind: crate::temporal_iso::TemporalKind::ZonedDateTime,
                     epoch_ns: local_ns - offset,
                     tz: Some(tz),
+                    calendar: cal.clone(),
                     ..Default::default()
                 }))
             }
@@ -440,25 +472,32 @@ impl<'a> Interp<'a> {
             if let Some(td) = self.realm.temporal_at(h) {
                 return match td.kind {
                     TemporalKind::PlainTime | TemporalKind::PlainDateTime => Ok(td.time),
+                    // ToTemporalTime on a ZonedDateTime uses its wall-clock time
+                    // (the time part of the instant in its own time zone).
+                    TemporalKind::ZonedDateTime => {
+                        let tz = td.tz.clone().unwrap_or_else(|| String::from("UTC"));
+                        let epoch = td.epoch_ns;
+                        Ok(super::temporal_zoneddatetime::local_of(&tz, epoch).1)
+                    }
                     _ => Err(self.type_error("toPlainDateTime: not a time-like value")),
                 };
             }
             // A property bag of time fields (ToTemporalTimeRecord); at least one
-            // recognised field must be present.
+            // recognised field must be present. Fields are read in alphabetical
+            // order (hour, microsecond, millisecond, minute, nanosecond, second),
+            // through the proxy/getter-aware accessor so traps are observed. The
+            // index is the position in `regulate_iso_time`'s argument list.
             let mut fields = [0_i64; 6];
             let mut any = false;
-            for (i, k) in [
-                "hour",
-                "minute",
-                "second",
-                "millisecond",
-                "microsecond",
-                "nanosecond",
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let pv = self.realm.get_property(h, k).unwrap_or(NanBox::undefined());
+            for (k, i) in [
+                ("hour", 0usize),
+                ("microsecond", 4),
+                ("millisecond", 3),
+                ("minute", 1),
+                ("nanosecond", 5),
+                ("second", 2),
+            ] {
+                let pv = self.read_member(h, k)?;
                 if !matches!(pv.unpack(), Unpacked::Undefined) {
                     any = true;
                     fields[i] = self.coerce_to_integer_or_infinity(pv)? as i64;
@@ -489,9 +528,16 @@ impl<'a> Interp<'a> {
                 .type_error("toPlainDateTime: expected a time, time-like object, or ISO string"));
         }
         let s = self.coerce_to_string(v)?;
-        parse_iso_time_string(&s)
-            .and_then(|p| p.time.or(Some(IsoTime::default())))
-            .ok_or_else(|| self.pd_range_error("toPlainDateTime: invalid time string"))
+        // `ParseTemporalTimeString`: a bare `Z`/UTC designator or a date-only
+        // string (no time component) is rejected — no implicit midnight.
+        let Some(p) = parse_iso_time_string(&s) else {
+            return Err(self.pd_range_error("toPlainDateTime: invalid time string"));
+        };
+        if p.z {
+            return Err(self.pd_range_error("toPlainDateTime: UTC designator not allowed"));
+        }
+        p.time
+            .ok_or_else(|| self.pd_range_error("toPlainDateTime: string has no time component"))
     }
 
     fn pd_new_kind(
@@ -572,6 +618,17 @@ impl<'a> Interp<'a> {
                         // though the date is copied verbatim.
                         self.pd_overflow(options)?;
                         return Ok((td.date, td.calendar.clone()));
+                    }
+                    TemporalKind::ZonedDateTime => {
+                        // `ToTemporalDate` on a ZonedDateTime uses its internal
+                        // slots (instant + time zone) directly — no field getters
+                        // are observed — then reads the overflow option.
+                        let tz = td.tz.clone().unwrap_or_else(|| String::from("UTC"));
+                        let epoch = td.epoch_ns;
+                        let cal = td.calendar.clone();
+                        let (date, _time) = super::temporal_zoneddatetime::local_of(&tz, epoch);
+                        self.pd_overflow(options)?;
+                        return Ok((date, cal));
                     }
                     _ => {}
                 }
@@ -1096,6 +1153,11 @@ impl<'a> Interp<'a> {
             return Err(self.type_error("with() requires a fields object"));
         }
         let h = fields.as_handle().map(Handle::from_raw).unwrap();
+        // `IsPartialTemporalObject`: a Temporal-branded object (PlainDate,
+        // ZonedDateTime, …) is not a partial property bag → TypeError.
+        if self.realm.temporal_at(h).is_some() {
+            return Err(self.type_error("with() argument must be a plain object"));
+        }
         // Reject a calendar / timeZone property (RejectTemporalLikeObject).
         for banned in ["calendar", "timeZone"] {
             let v = self.read_member(h, banned)?;
@@ -1248,7 +1310,16 @@ impl<'a> Interp<'a> {
             else {
                 return Err(self.type_error("calendar must be a string"));
             };
-            self.pd_canonicalize_calendar(&s)?
+            // `ToTemporalCalendarIdentifier` for a calendar *argument* accepts only
+            // a bare calendar id — a full ISO string (even one carrying `[u-ca=…]`)
+            // is not a valid calendar identifier here.
+            if let Some(c) = tcal::canonicalize_calendar(&s) {
+                String::from(c)
+            } else {
+                return Err(
+                    self.pd_range_error(&alloc::format!("invalid calendar identifier '{s}'"))
+                );
+            }
         };
         Ok(self.pd_new_cal(date, &id))
     }
@@ -1271,8 +1342,14 @@ impl<'a> Interp<'a> {
             ));
         }
         let opts = self.pd_options(options)?;
-        let smallest = self.pd_unit_option(opts, "smallestUnit", false)?;
+        // `GetDifferenceSettings`: read and cast *all* options first, in the order
+        // largestUnit, roundingIncrement, roundingMode, smallestUnit — before any
+        // algorithmic (disallowed-unit / largest-vs-smallest) validation.
         let largest_raw = self.pd_unit_option(opts, "largestUnit", true)?;
+        // `GetRoundingIncrementOption` (validated for every call; for the date
+        // units used here there is no per-unit maximum, so any finite integer in
+        // [1, 1e9] is accepted — an out-of-range/NaN value is a RangeError).
+        let increment = self.pd_rounding_increment(opts)?;
         let mode = self.get_string_option(
             opts,
             "roundingMode",
@@ -1289,12 +1366,21 @@ impl<'a> Interp<'a> {
             ],
             Some("trunc"),
         )?;
-        // `GetRoundingIncrementOption` (validated for every call; for the date
-        // units used here there is no per-unit maximum, so any finite integer in
-        // [1, 1e9] is accepted — an out-of-range/NaN value is a RangeError).
-        let increment = self.pd_rounding_increment(opts)?;
+        let smallest_raw = self.pd_unit_option(opts, "smallestUnit", false)?;
 
-        let smallest = smallest.unwrap_or(Unit::Day);
+        // Algorithmic validation (after all reads): a PlainDate difference admits
+        // only date units (year/month/week/day); a time unit is a RangeError.
+        if let Some(l) = largest_raw
+            && (l as u8) > (Unit::Day as u8)
+        {
+            return Err(self.pd_range_error("largestUnit must be a date unit"));
+        }
+        if let Some(s) = smallest_raw
+            && (s as u8) > (Unit::Day as u8)
+        {
+            return Err(self.pd_range_error("smallestUnit must be a date unit"));
+        }
+        let smallest = smallest_raw.unwrap_or(Unit::Day);
         // Default largestUnit ("auto") is the larger of Day and smallestUnit.
         let largest = largest_raw.unwrap_or(if (smallest as u8) < (Unit::Day as u8) {
             smallest
@@ -1404,7 +1490,8 @@ impl<'a> Interp<'a> {
         }
         let e1 = step(r1);
         let count = if e1 == to_e {
-            r1
+            // Even an exact-boundary count must still snap to `roundingIncrement`.
+            round_inc(i128::from(r1), i128::from(increment.max(1)), mode) as i64
         } else {
             let e2 = step(r1 + sign);
             let den = i128::from((e2 - e1).abs().max(1));
@@ -1414,7 +1501,16 @@ impl<'a> Interp<'a> {
         };
         match smallest {
             Unit::Year => out.years = i128::from(count),
-            Unit::Month => out.months = i128::from(count),
+            Unit::Month => {
+                // `BubbleRelativeDuration`: a rounded month count can reach a whole
+                // year (e.g. 12 months → 1 year), so re-express the rounded target
+                // date as a difference in `largest` units, balancing months upward.
+                let rd =
+                    add_iso_date(anchor, 0, count, 0, 0, Overflow::Constrain).unwrap_or(anchor);
+                let (by, bm, _bw, _bd) = difference_iso_date(from, rd, largest);
+                out.years = i128::from(by);
+                out.months = i128::from(bm);
+            }
             _ => out.weeks = i128::from(count),
         }
         out
@@ -1501,7 +1597,8 @@ impl<'a> Interp<'a> {
         }
         let e1 = step(r1);
         let count = if e1 == to_e {
-            r1
+            // Even an exact-boundary count must still snap to `roundingIncrement`.
+            round_inc(i128::from(r1), i128::from(increment.max(1)), mode) as i64
         } else {
             let e2 = step(r1 + sign);
             let den = i128::from((e2 - e1).abs().max(1));
@@ -1511,7 +1608,15 @@ impl<'a> Interp<'a> {
         };
         match smallest {
             Unit::Year => out.years = i128::from(count),
-            Unit::Month => out.months = i128::from(count),
+            Unit::Month => {
+                // `BubbleRelativeDuration` (calendar-aware): a rounded month count
+                // can reach a whole calendar year; re-express the rounded target
+                // date as a difference in `largest` units.
+                let rd = cadd(anchor, 0, count, 0);
+                let b = tcal::calendar_date_until(cal, from, rd, largest);
+                out.years = i128::from(b.years);
+                out.months = i128::from(b.months);
+            }
             _ => out.weeks = i128::from(count),
         }
         out
@@ -1538,9 +1643,11 @@ impl<'a> Interp<'a> {
         Ok(i)
     }
 
-    /// Reads a date-difference unit option (`years`/`months`/`weeks`/`days`,
-    /// plural or singular). `undefined` -> `None`; a time unit or unknown value
-    /// -> RangeError.
+    /// `GetTemporalUnit`: reads and casts a difference-unit option to a [`Unit`]
+    /// (singular or plural spelling), accepting *any* temporal unit. `undefined`
+    /// (or `"auto"` when allowed) -> `None`; an unrecognized string -> RangeError.
+    /// Whether a *time* unit is legal for this operation is validated by the
+    /// caller, after every option has been read.
     fn pd_unit_option(
         &mut self,
         opts: Option<Handle>,
@@ -1560,6 +1667,12 @@ impl<'a> Interp<'a> {
             "month" | "months" => Unit::Month,
             "week" | "weeks" => Unit::Week,
             "day" | "days" => Unit::Day,
+            "hour" | "hours" => Unit::Hour,
+            "minute" | "minutes" => Unit::Minute,
+            "second" | "seconds" => Unit::Second,
+            "millisecond" | "milliseconds" => Unit::Millisecond,
+            "microsecond" | "microseconds" => Unit::Microsecond,
+            "nanosecond" | "nanoseconds" => Unit::Nanosecond,
             _ => {
                 return Err(
                     self.pd_range_error(&alloc::format!("invalid value '{s}' for option {prop}"))

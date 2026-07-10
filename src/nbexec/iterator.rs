@@ -245,6 +245,15 @@ impl<'a> Interp<'a> {
         {
             return self.live_typed_iter_next(h, ta);
         }
+        // A **live** plain-array iterator (has `GEN_ARR`) re-reads its live length.
+        if let Some(arr) = self
+            .realm
+            .get_property(h, GEN_ARR)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            return self.live_array_iter_next(h, arr);
+        }
         let Some(buf) = self
             .realm
             .get_property(h, GEN_BUF)
@@ -388,6 +397,52 @@ impl<'a> Interp<'a> {
                 .realm
                 .typed_get(ta, idx)
                 .unwrap_or_else(NanBox::undefined),
+        };
+        Ok(self.iter_result(value, false))
+    }
+
+    /// `next()` for a **live** plain-array iterator (see `make_live_array_iterator`):
+    /// re-reads `length` each step and `Get`s the element at the cursor, so a value
+    /// appended/assigned after the iterator was created is observed. Once the cursor
+    /// reaches the current length the iterator is exhausted (and stays done even if
+    /// the array later grows again — matching the spec's monotonic index cursor).
+    pub(crate) fn live_array_iter_next(
+        &mut self,
+        h: Handle,
+        arr: Handle,
+    ) -> Result<NanBox, ExecError> {
+        // Once the cursor first reaches the (then-current) length, the underlying
+        // generator completes; it stays done thereafter even if the array later
+        // grows (a monotonic, latched cursor — matching `CreateArrayIterator`).
+        if self.realm.get_property(h, GEN_DONE).is_some() {
+            return Ok(self.iter_result(NanBox::undefined(), true));
+        }
+        let kind = self
+            .realm
+            .get_property(h, GEN_KIND)
+            .and_then(|n| n.as_number())
+            .unwrap_or(0.0) as u8;
+        let idx = self
+            .realm
+            .get_property(h, GEN_IDX)
+            .and_then(|n| n.as_number())
+            .unwrap_or(0.0) as usize;
+        let len = self.realm.array_length(arr).unwrap_or(0);
+        if idx >= len {
+            self.realm
+                .set_hidden_property(h, GEN_DONE, NanBox::boolean(true));
+            return Ok(self.iter_result(NanBox::undefined(), true));
+        }
+        self.realm
+            .set_hidden_property(h, GEN_IDX, NanBox::number((idx + 1) as f64));
+        let value = match kind {
+            0 => NanBox::number(idx as f64), // keys
+            2 => {
+                // entries: [index, element]
+                let e = self.read_member(arr, &alloc::format!("{idx}"))?;
+                self.new_iter_pair(NanBox::number(idx as f64), e)
+            }
+            _ => self.read_member(arr, &alloc::format!("{idx}"))?, // values
         };
         Ok(self.iter_result(value, false))
     }
@@ -1838,20 +1893,42 @@ impl<'a> Interp<'a> {
         let h = items_box.as_handle().map(Handle::from_raw);
         let iterable = match h {
             Some(h) => {
+                // GetMethod(items, @@asyncIterator): a present, non-null value that
+                // is not callable is a TypeError (rejects the returned promise);
+                // undefined/null means "no async iterator", so fall through to the
+                // sync iterator / array-like path.
                 let sym = self.well_known_symbol("asyncIterator");
                 let akey = self.member_key(sym);
-                let has_async = self
-                    .read_member(h, &akey)?
-                    .as_handle()
-                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)));
+                let async_m = self.read_member(h, &akey)?;
+                let has_async = if matches!(async_m.unpack(), Unpacked::Undefined | Unpacked::Null)
+                {
+                    false
+                } else if self.is_callable_value(async_m) {
+                    true
+                } else {
+                    return Err(
+                        self.type_error("Array.fromAsync: @@asyncIterator is not a function")
+                    );
+                };
+                // GetMethod(items, @@iterator): same non-callable → TypeError rule.
+                let has_sync = if has_async {
+                    false
+                } else {
+                    match self.find_iterator_fn(h)? {
+                        Some(f) if self.is_callable_value(f) => true,
+                        Some(f) if matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null) => {
+                            false
+                        }
+                        Some(_) => {
+                            return Err(
+                                self.type_error("Array.fromAsync: @@iterator is not a function")
+                            );
+                        }
+                        None => false,
+                    }
+                };
                 has_async
-                    || self
-                        .find_iterator_fn(h)?
-                        .filter(|f| {
-                            f.as_handle()
-                                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-                        })
-                        .is_some()
+                    || has_sync
                     || self.realm.is_array(h)
                     || self.realm.string_value(h).is_some()
                     || self.realm.collection_is_set(h).is_some()

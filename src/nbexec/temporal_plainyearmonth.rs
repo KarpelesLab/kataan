@@ -247,7 +247,9 @@ fn has_overlong_fraction(main: &str) -> bool {
 /// annotation value (or `None` for the ISO default). `None` if malformed (does
 /// not range-check limits, nor validate that the calendar id is supported — the
 /// caller does).
-fn parse_temporal_year_month(s: &str) -> Option<(i32, u8, u8, Option<alloc::string::String>)> {
+pub(crate) fn parse_temporal_year_month(
+    s: &str,
+) -> Option<(i32, u8, u8, Option<alloc::string::String>)> {
     // A non-ASCII minus sign (U+2212) is not accepted anywhere.
     if s.contains('\u{2212}') {
         return None;
@@ -1015,6 +1017,16 @@ impl<'a> Interp<'a> {
         let opts = self.pym_options(options)?;
         // overflow is validated for every call; it only affects the non-ISO path.
         let overflow = self.pym_overflow(opts)?;
+        // `AddDurationToYearMonth` converts the receiver to its first-of-month date
+        // (`CalendarDateFromFields`); a boundary year-month whose day-1 date is
+        // unrepresentable is a RangeError (thrown after the options are read).
+        if !iso_date_in_range(IsoDate {
+            year: data.date.year,
+            month: data.date.month,
+            day: 1,
+        }) {
+            return Err(self.pym_range("PlainYearMonth: date out of representable range"));
+        }
         if subtract {
             dur = crate::temporal_iso::DurationFields {
                 years: -dur.years,
@@ -1215,6 +1227,13 @@ impl<'a> Interp<'a> {
         // largestUnit must be >= smallestUnit; a year is larger than a month.
         if smallest_year && !largest_year {
             return Err(self.pym_range("PlainYearMonth: largestUnit smaller than smallestUnit"));
+        }
+
+        // If both year-months denote the same ISO date, the difference is zero —
+        // returned before the fields are converted to a (day-1) date, so a boundary
+        // year-month whose day-1 date is unrepresentable still compares to itself.
+        if data.date == other {
+            return Ok(self.pym_new_duration(crate::temporal_iso::DurationFields::default()));
         }
 
         // The difference is measured between the *first days* of the two months,

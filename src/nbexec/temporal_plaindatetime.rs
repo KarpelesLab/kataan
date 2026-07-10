@@ -94,15 +94,6 @@ impl DtBag {
             || self.us.is_some()
             || self.ns.is_some()
     }
-
-    fn any_time(&self) -> bool {
-        self.hour.is_some()
-            || self.minute.is_some()
-            || self.second.is_some()
-            || self.ms.is_some()
-            || self.us.is_some()
-            || self.ns.is_some()
-    }
 }
 
 /// The recognised calendar/time fields of a **non-ISO** date-time property bag —
@@ -284,13 +275,28 @@ impl<'a> Interp<'a> {
                 // Interpret this wall-clock date-time in `timeZone` → an exact
                 // instant (epoch ns = local wall ns − zone offset).
                 let tz = self.temporal_tz_arg(arg(0))?;
+                // `GetOptionsObject` (TypeError on a primitive), then read/validate
+                // the `disambiguation` option (RangeError on a bad value).
+                let opts = self.pdt_options(arg(1))?;
+                self.pdt_str_option(
+                    opts,
+                    "disambiguation",
+                    &["compatible", "earlier", "later", "reject"],
+                )?;
                 let local_ns = crate::temporal_iso::iso_to_epoch_days(data.date) as i128
                     * crate::temporal_iso::NS_PER_DAY
                     + crate::temporal_iso::time_to_nanos(data.time);
                 let offset = self.temporal_tz_offset_ns(&tz, local_ns).unwrap_or(0);
+                let epoch = local_ns - offset;
+                // The resulting exact time must be within the Instant range.
+                if !(crate::temporal_iso::MIN_EPOCH_NS..=crate::temporal_iso::MAX_EPOCH_NS)
+                    .contains(&epoch)
+                {
+                    return Err(self.pdt_range("instant is outside the representable range"));
+                }
                 Ok(self.build_temporal(crate::temporal_iso::TemporalData {
                     kind: crate::temporal_iso::TemporalKind::ZonedDateTime,
-                    epoch_ns: local_ns - offset,
+                    epoch_ns: epoch,
                     tz: Some(tz),
                     calendar: data.calendar.clone(),
                     ..Default::default()
@@ -469,7 +475,13 @@ impl<'a> Interp<'a> {
         else {
             return Err(self.type_error("calendar must be a string"));
         };
-        self.pdt_canonicalize_calendar(&s)
+        // `ToTemporalCalendarIdentifier` for a calendar *argument* accepts only a
+        // bare calendar id — a full ISO string (even one carrying `[u-ca=…]`) is
+        // not a valid calendar identifier here (see calendar-invalid-iso-string).
+        if let Some(c) = tcal::canonicalize_calendar(&s) {
+            return Ok(String::from(c));
+        }
+        Err(self.pdt_range(&alloc::format!("invalid calendar identifier '{s}'")))
     }
 
     /// Canonicalizes a calendar identifier against the full Temporal calendar set
@@ -904,6 +916,12 @@ impl<'a> Interp<'a> {
             return self.pdt_with_cal(data, h, options);
         }
         let bag = self.pdt_read_bag(h)?;
+        // `day`/`month` are read with `ToPositiveIntegerWithTruncation` during field
+        // preparation, so a non-positive value is a RangeError *before* the options
+        // object is validated (GetOptionsObject → TypeError).
+        if matches!(bag.day, Some(d) if d < 1) || matches!(bag.month, Some(m) if m < 1) {
+            return Err(self.pdt_range("month and day must be positive"));
+        }
         let opts = self.pdt_options(options)?;
         let overflow = self.pdt_overflow(opts)?;
         if !bag.any() {
@@ -1007,6 +1025,11 @@ impl<'a> Interp<'a> {
     }
 
     fn pdt_with_calendar(&mut self, data: &TemporalData, arg: NanBox) -> Result<NanBox, ExecError> {
+        // `withCalendar` requires a calendar argument: `ToTemporalCalendarIdentifier`
+        // of `undefined` is a TypeError (unlike the constructor's ISO default).
+        if arg.is_undefined() {
+            return Err(self.type_error("withCalendar requires a calendar argument"));
+        }
         let cal = self.pdt_validate_calendar(arg)?;
         Ok(self.pdt_make_cal(data.date, data.time, &cal))
     }
@@ -1018,6 +1041,12 @@ impl<'a> Interp<'a> {
             if let Some(d) = self.realm.temporal_at(h) {
                 return match d.kind {
                     TemporalKind::PlainTime | TemporalKind::PlainDateTime => Ok(d.time),
+                    // ToTemporalTime on a ZonedDateTime uses its wall-clock time.
+                    TemporalKind::ZonedDateTime => {
+                        let tz = d.tz.clone().unwrap_or_else(|| String::from("UTC"));
+                        let epoch = d.epoch_ns;
+                        Ok(super::temporal_zoneddatetime::local_of(&tz, epoch).1)
+                    }
                     _ => Err(self.type_error("expected a PlainTime")),
                 };
             }
@@ -1029,17 +1058,34 @@ impl<'a> Interp<'a> {
                     .ok_or_else(|| self.pdt_range("string is missing a time"));
             }
             if self.is_object_value(item) {
-                let bag = self.pdt_read_bag(h)?;
-                if !bag.any_time() {
+                // ToTemporalTimeRecord reads *only* the time fields, in alphabetical
+                // order (hour, microsecond, millisecond, minute, nanosecond, second),
+                // through the getter/proxy-aware accessor.
+                let mut t = [0_i64; 6]; // hour, minute, second, ms, us, ns
+                let mut any = false;
+                for (k, i) in [
+                    ("hour", 0usize),
+                    ("microsecond", 4),
+                    ("millisecond", 3),
+                    ("minute", 1),
+                    ("nanosecond", 5),
+                    ("second", 2),
+                ] {
+                    if let Some(v) = self.pdt_field(h, k)? {
+                        any = true;
+                        t[i] = self.pdt_to_int(v)?;
+                    }
+                }
+                if !any {
                     return Err(self.type_error("no time fields present"));
                 }
                 return iso::regulate_iso_time(
-                    bag.hour.unwrap_or(0),
-                    bag.minute.unwrap_or(0),
-                    bag.second.unwrap_or(0),
-                    bag.ms.unwrap_or(0),
-                    bag.us.unwrap_or(0),
-                    bag.ns.unwrap_or(0),
+                    t[0],
+                    t[1],
+                    t[2],
+                    t[3],
+                    t[4],
+                    t[5],
                     Overflow::Constrain,
                 )
                 .ok_or_else(|| self.pdt_range("invalid ISO time"));
@@ -1209,26 +1255,30 @@ impl<'a> Interp<'a> {
             "nanosecond",
             "nanoseconds",
         ];
+        // `GetDifferenceSettings`: read and cast *all* options first, in the order
+        // largestUnit, roundingIncrement, roundingMode, smallestUnit — before any
+        // algorithmic validation (largest-vs-smallest, increment maximum).
+        // `largestUnit` additionally accepts `"auto"` (→ the default).
+        let mut units_auto = units.to_vec();
+        units_auto.push("auto");
+        let largest_raw = match self.pdt_str_option(opts, "largestUnit", &units_auto)? {
+            Some(s) if s != "auto" => Some(parse_unit(&s).unwrap_or(Unit::Day)),
+            _ => None,
+        };
+        let increment = self.pdt_rounding_increment(opts)?;
+        let mode = self.pdt_rounding_mode(opts, RoundMode::Trunc)?;
         let smallest = match self.pdt_str_option(opts, "smallestUnit", &units)? {
             Some(s) => parse_unit(&s).unwrap_or(Unit::Nanosecond),
             None => Unit::Nanosecond,
         };
-        // `largestUnit` additionally accepts `"auto"` (→ the default).
-        let mut units_auto = units.to_vec();
-        units_auto.push("auto");
-        let largest = match self.pdt_str_option(opts, "largestUnit", &units_auto)? {
-            Some(s) if s != "auto" => parse_unit(&s).unwrap_or(Unit::Day),
-            _ => Unit::Day.min(smallest),
-        };
+        let largest = largest_raw.unwrap_or(Unit::Day.min(smallest));
         if largest > smallest {
             return Err(self.pdt_range("largestUnit must be at least as large as smallestUnit"));
         }
-        let increment = self.pdt_rounding_increment(opts)?;
         // ValidateTemporalRoundingIncrement (non-inclusive) for time smallestUnits.
         if smallest >= Unit::Hour {
             self.pdt_validate_increment(smallest, increment)?;
         }
-        let mode = self.pdt_rounding_mode(opts, RoundMode::Trunc)?;
 
         let from = (data.date, data.time);
         let to = (d2, t2);
@@ -1241,6 +1291,13 @@ impl<'a> Interp<'a> {
         // independent, shared by every calendar. Only the coarser-largest paths,
         // whose date part spans calendar years/months/weeks, differ for non-ISO.
         let is_iso = tcal::is_iso(&data.calendar);
+        // `since` rounds the reversed (from→to) difference with the rounding mode
+        // negated (`NegateRoundingMode`), then negates the whole result below.
+        let mode = if negate {
+            pdt_negate_round_mode(mode)
+        } else {
+            mode
+        };
         let mut dur = if largest >= Unit::Day {
             pdt_round_duration(from, to, largest, smallest, increment, mode)
         } else if matches!(smallest, Unit::Year | Unit::Month | Unit::Week) {
@@ -1362,11 +1419,13 @@ impl<'a> Interp<'a> {
             "nanosecond",
             "nanoseconds",
         ];
+        // Read/cast all options first, in spec order: calendarName (above),
+        // fractionalSecondDigits, roundingMode, smallestUnit.
+        let frac = self.pdt_frac_digits(opts)?;
+        let mode = self.pdt_rounding_mode(opts, RoundMode::Trunc)?;
         let smallest = self
             .pdt_str_option(opts, "smallestUnit", &time_units)?
             .map(|s| parse_unit(&s).unwrap_or(Unit::Nanosecond));
-        let frac = self.pdt_frac_digits(opts)?;
-        let mode = self.pdt_rounding_mode(opts, RoundMode::Trunc)?;
 
         // Rounding increment (ns) + whether seconds show + fixed precision.
         let (inc_ns, seconds_shown, precision): (i128, bool, Option<u8>) = match smallest {
@@ -1426,10 +1485,16 @@ impl<'a> Interp<'a> {
         }
         if v.is_number() {
             let n = v.as_number().unwrap_or(f64::NAN);
-            if n.is_nan() || !(0.0..=9.0).contains(&n) {
+            // GetStringOrNumberOption: floor first, *then* range-check, so e.g.
+            // 9.7 → 9 (valid) and -0.6 → -1 (RangeError).
+            if n.is_nan() {
                 return Err(self.pdt_range("fractionalSecondDigits out of range"));
             }
-            return Ok(Some(n.floor() as u8));
+            let f = n.floor();
+            if !(0.0..=9.0).contains(&f) {
+                return Err(self.pdt_range("fractionalSecondDigits out of range"));
+            }
+            return Ok(Some(f as u8));
         }
         let s = self.coerce_to_string(v)?;
         if s == "auto" {
@@ -1842,6 +1907,18 @@ fn pdt_round_duration(
 /// `smallest`, then rounds the `smallest` count measured against the *local
 /// nanosecond* span of one increment step (so time-of-day is folded into the
 /// fraction), per `NudgeToCalendarUnit`.
+/// `NegateRoundingMode`: swaps ceil/floor and halfCeil/halfFloor; symmetric modes
+/// (expand/trunc/halfExpand/halfTrunc/halfEven) are unchanged.
+fn pdt_negate_round_mode(mode: RoundMode) -> RoundMode {
+    match mode {
+        RoundMode::Ceil => RoundMode::Floor,
+        RoundMode::Floor => RoundMode::Ceil,
+        RoundMode::HalfCeil => RoundMode::HalfFloor,
+        RoundMode::HalfFloor => RoundMode::HalfCeil,
+        other => other,
+    }
+}
+
 fn pdt_round_calendar(
     from: (IsoDate, IsoTime),
     to: (IsoDate, IsoTime),
@@ -1912,7 +1989,8 @@ fn pdt_round_calendar(
     }
     let e1 = step_ns(r1);
     let count = if e1 == to_ns {
-        r1
+        // Even an exact-boundary count must still snap to `roundingIncrement`.
+        iso::round_to_increment(i128::from(r1), i128::from(increment.max(1)), mode) as i64
     } else {
         let e2 = step_ns(r1 + sign_i);
         let den = (e2 - e1).abs().max(1);
@@ -1922,7 +2000,15 @@ fn pdt_round_calendar(
     };
     match smallest {
         Unit::Year => out.years = i128::from(count),
-        Unit::Month => out.months = i128::from(count),
+        Unit::Month => {
+            // `BubbleRelativeDuration`: a rounded month count can reach a whole
+            // year; re-express the rounded target date as a difference in `largest`.
+            let rd =
+                iso::add_iso_date(anchor, 0, count, 0, 0, Overflow::Constrain).unwrap_or(anchor);
+            let (by, bm, _bw, _bd) = iso::difference_iso_date(from_date, rd, largest);
+            out.years = i128::from(by);
+            out.months = i128::from(bm);
+        }
         _ => out.weeks = i128::from(count),
     }
     out

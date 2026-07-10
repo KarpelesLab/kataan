@@ -135,6 +135,23 @@ impl<'a> Interp<'a> {
         NanBox::handle(obj.to_raw())
     }
 
+    /// A **live** plain-array iterator over `arr` (`kind`: 0 keys, 1 values, 2
+    /// entries). Each `next()` re-reads the array's current `length` and `Get`s the
+    /// element at the cursor, so elements appended/assigned after the iterator was
+    /// created are observed (per spec `CreateArrayIterator`).
+    pub(crate) fn make_live_array_iterator(&mut self, arr: Handle, kind: u8) -> NanBox {
+        let proto = self.builtin_iterator_proto("Array Iterator");
+        let obj = self.realm.new_object();
+        self.realm.set_object_proto(obj, Some(proto));
+        self.realm
+            .set_hidden_property(obj, GEN_ARR, NanBox::handle(arr.to_raw()));
+        self.realm
+            .set_hidden_property(obj, GEN_KIND, NanBox::number(f64::from(kind)));
+        self.realm
+            .set_hidden_property(obj, GEN_IDX, NanBox::number(0.0));
+        NanBox::handle(obj.to_raw())
+    }
+
     /// Builds a built-in iterator over `values` (a snapshot) whose `[[Prototype]]`
     /// is the `%XIteratorPrototype%` for `tag` (so `next` is inherited, not an own
     /// property). The receiver carries the same buffer/index slots a generator

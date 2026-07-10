@@ -1008,11 +1008,17 @@ impl<'a> Interp<'a> {
                 // and `length` are read generically. A string primitive is a heap
                 // value (`Cell::Str`) but still needs boxing into a `String`
                 // wrapper so its per-unit indices are read as array-like.
-                let is_string_prim = this_val
-                    .as_handle()
-                    .map(Handle::from_raw)
-                    .is_some_and(|h| self.realm.string_value(h).is_some());
-                let this_obj = if this_val.as_handle().is_none() || is_string_prim {
+                // A String/Symbol/BigInt primitive is a heap value (`Cell::Str`/
+                // `Cell::Symbol`/`Cell::BigInt`) rather than an immediate, so
+                // `as_handle()` is `Some`; it still needs boxing into its wrapper
+                // object (a String wrapper's per-unit indices are read as array-like;
+                // a Symbol/BigInt wrapper is what a method like `sort` returns).
+                let is_boxable_prim = this_val.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                    self.realm.string_value(h).is_some()
+                        || self.realm.symbol_at(h).is_some()
+                        || self.realm.bigint_at(h).is_some()
+                });
+                let this_obj = if this_val.as_handle().is_none() || is_boxable_prim {
                     self.coerce_to_object(this_val)
                 } else {
                     this_val

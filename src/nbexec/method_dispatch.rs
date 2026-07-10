@@ -74,6 +74,150 @@ impl<'a> Interp<'a> {
         // unwrapped) — consume the one-shot flag so it applies only to this call.
         let array_proto_generic = core::mem::take(&mut self.array_proto_generic);
 
+        // `Array.prototype.toString` (23.1.3.36) is receiver-agnostic: it does
+        // `O = ToObject(this)`, `func = Get(O, "join")`, and calls `func` if it is
+        // callable, else falls back to `%Object.prototype.toString%` (yielding e.g.
+        // `"[object Boolean]"` for a boxed primitive or `"[object Object]"` for a
+        // plain array-like whose chain has no `join`). Intercept the *genuine*
+        // `Array.prototype.toString` (the `array_proto_generic` flag) up front so a
+        // boxed-primitive / non-array receiver is handled per spec rather than
+        // unwrapped. A real array's `join` resolves to the callable
+        // `Array.prototype.join`, so this preserves ordinary `[1,2].toString()`.
+        if method == "toString"
+            && array_proto_generic
+            && let Some(h) = recv.as_handle().map(Handle::from_raw)
+        {
+            let join = self.read_member(h, "join")?;
+            if self.is_callable_value(join) {
+                return self.call_with_this(join, recv, args).map(Some);
+            }
+            let tag = self.object_string_tag(h)?;
+            return Ok(Some(self.new_str(&alloc::format!("[object {tag}]"))));
+        }
+        // `Array.prototype.toReversed` (23.1.3.33): `len = LengthOfArrayLike(O)`,
+        // then read `from = len-1 … 0` via `[[Get]]` — so index accessors fire in
+        // **descending** order — building a fresh dense array. Intercept up front
+        // (a real array, a `.call` on an array-like, or an inheriting object) so the
+        // access order and length re-read are spec-exact; typed arrays keep their
+        // own branded `toReversed` (a same-kind view) below.
+        if method == "toReversed"
+            && let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && self.realm.typed_kind(h).is_none()
+            && (self.realm.is_array(h) || array_proto_generic || self.inherits_array_proto(h))
+        {
+            let len = self.array_like_length(h)?;
+            // `ArrayCreate(len)` (the result) throws a RangeError when `len` exceeds
+            // the array-length limit — *before* any source element is read.
+            if len > self.realm.limits.max_array_len {
+                let m = self.new_str("Invalid array length");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+            let mut out = Vec::with_capacity(len.min(1 << 16));
+            for k in 0..len {
+                let from = len - k - 1;
+                out.push(self.read_member(h, &alloc::format!("{from}"))?);
+            }
+            return Ok(Some(NanBox::handle(self.realm.new_array(out).to_raw())));
+        }
+        // `Array.prototype.toSpliced(start, skipCount, ...items)` (23.1.3.35):
+        // builds a fresh dense array = the receiver with `actualSkipCount` elements
+        // removed at `actualStart` and `items` inserted. `newLen > 2^53-1` is a
+        // TypeError (checked before `ArrayCreate`, which itself RangeErrors above
+        // `2^32-1`); elements are `[[Get]]` in the exact spec order (`0..start`,
+        // then the tail `r..`), so a skipped index is never read.
+        if method == "toSpliced"
+            && let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && self.realm.typed_kind(h).is_none()
+            && (self.realm.is_array(h) || array_proto_generic || self.inherits_array_proto(h))
+        {
+            let len = self.array_like_length(h)?;
+            let rel_start = self.coerce_to_integer_or_infinity(arg(0))?;
+            let actual_start = if rel_start == f64::NEG_INFINITY {
+                0
+            } else if rel_start < 0.0 {
+                ((len as f64) + rel_start).max(0.0) as usize
+            } else {
+                (rel_start as usize).min(len)
+            };
+            let (insert_count, skip_count) = if args.is_empty() {
+                (0usize, 0usize)
+            } else if args.len() == 1 {
+                (0usize, len - actual_start)
+            } else {
+                let dc = self.coerce_to_integer_or_infinity(arg(1))?;
+                let dc = dc.max(0.0).min((len - actual_start) as f64) as usize;
+                (args.len() - 2, dc)
+            };
+            let new_len = len + insert_count - skip_count;
+            // Step 12: `newLen > 2^53-1` → TypeError (before ArrayCreate).
+            if new_len as f64 > 9_007_199_254_740_991.0 {
+                return Err(self.type_error("Array.prototype.toSpliced result exceeds 2**53-1"));
+            }
+            // ArrayCreate(newLen) → RangeError above the array-length limit.
+            if new_len > self.realm.limits.max_array_len {
+                let m = self.new_str("Invalid array length");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+            let mut out = Vec::with_capacity(new_len.min(1 << 16));
+            for k in 0..actual_start {
+                out.push(self.read_member(h, &alloc::format!("{k}"))?);
+            }
+            for item in args.iter().skip(2) {
+                out.push(*item);
+            }
+            let mut r = actual_start + skip_count;
+            while out.len() < new_len {
+                out.push(self.read_member(h, &alloc::format!("{r}"))?);
+                r += 1;
+            }
+            return Ok(Some(NanBox::handle(self.realm.new_array(out).to_raw())));
+        }
+        // `Array.prototype.slice` on a *generic* array-like (a plain object / proxy
+        // reached via `.call`, not a real Array): read only the `[k, final)` window
+        // lazily via `HasProperty`/`[[Get]]` — so a huge `length` (e.g. 2^53+2)
+        // slices a small range without materializing every index (which would
+        // RangeError), and only the sliced indices' getters fire. A non-Array source
+        // means `ArraySpeciesCreate` yields a plain dense array.
+        if method == "slice"
+            && let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && self.realm.is_generic_array_like_target(h)
+            && (array_proto_generic || self.inherits_array_proto(h))
+            && !self.inherits_iterator_proto(h)
+        {
+            let len = self.array_like_length(h)?;
+            let rel_start = self.coerce_to_integer_or_infinity(arg(0))?;
+            let k = if rel_start == f64::NEG_INFINITY {
+                0
+            } else if rel_start < 0.0 {
+                ((len as f64) + rel_start).max(0.0) as usize
+            } else {
+                (rel_start as usize).min(len)
+            };
+            let rel_end = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                len as f64
+            } else {
+                self.coerce_to_integer_or_infinity(arg(1))?
+            };
+            let final_i = if rel_end == f64::NEG_INFINITY {
+                0
+            } else if rel_end < 0.0 {
+                ((len as f64) + rel_end).max(0.0) as usize
+            } else {
+                (rel_end as usize).min(len)
+            };
+            let count = final_i.saturating_sub(k);
+            if count > self.realm.limits.max_array_len {
+                let m = self.new_str("Invalid array length");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+            let mut out = alloc::vec![NanBox::hole(); count];
+            for (n, i) in (k..final_i).enumerate() {
+                if self.has_property(h, &alloc::format!("{i}")) {
+                    out[n] = self.read_member(h, &alloc::format!("{i}"))?;
+                }
+            }
+            return Ok(Some(NanBox::handle(self.realm.new_array(out).to_raw())));
+        }
         // `Array.prototype.concat` is receiver-agnostic (ECMA-262 23.1.3.1: it
         // begins with `ToObject(this)`), so intercept it up front for *any*
         // receiver — a real array, a non-array array-like, or a boxed primitive —
@@ -134,6 +278,7 @@ impl<'a> Interp<'a> {
             && let Some(prim) = self.realm.get_property(h, PRIM_WRAP)
             && !(array_proto_generic
                 && (ARRAY_LIKE_METHODS.contains(&method)
+                    || MUTATING_GENERIC.contains(&method)
                     || matches!(method, "call" | "apply" | "bind")))
             // The generic `Object.prototype` methods operate on the wrapper *object*
             // itself (its prototype chain / own properties), so they must NOT unwrap
@@ -2689,6 +2834,15 @@ impl<'a> Interp<'a> {
             // treated as an array-like — so skip the array-like coercion for it.
             && !self.inherits_iterator_proto(handle)
         {
+            // `Array.prototype.toSorted`: IsCallable(comparefn) is validated
+            // *before* the `length` read (23.1.3.34 step 1), so a bad comparefn
+            // throws even when the receiver's `length` getter would throw.
+            if method == "toSorted"
+                && !matches!(arg(0).unpack(), Unpacked::Undefined)
+                && !self.is_callable_value(arg(0))
+            {
+                return Err(self.type_error("comparefn must be a function"));
+            }
             // ToLength(Get(O, "length")): the length is coerced through a JS
             // `valueOf`/`toString` (so an object length with a custom coercion is
             // honored), NaN/negatives become 0, and the result is clamped to
@@ -2809,6 +2963,14 @@ impl<'a> Interp<'a> {
                 .array_elements(handle)
                 .map(|a| a.iter().map(|e| e.is_hole()).collect())
         };
+        // Whether the receiver reaching the element arms is a *real* dense array
+        // (not a materialized generic array-like snapshot, nor a typed array). Only
+        // such a receiver may be read *live* via `[[Get]]`/`HasProperty` (so a
+        // callback mutating a later index is observed); a materialized generic
+        // snapshot must instead consult the recorded presence mask, since its absent
+        // indices were filled with `undefined` (which `HasProperty` would report as
+        // present).
+        let receiver_is_real_array = real_holes.is_some();
         // `true` if index `i` is *present* (not a hole): the recorded
         // `HasProperty` for a materialized generic array-like, or the dense
         // hole check for a real array (and unconditionally `true` for any other
@@ -3233,6 +3395,13 @@ impl<'a> Interp<'a> {
                     }
                     let len_key = self.new_str("length");
                     self.assign_member_value(rem_h, len_key, NanBox::number(delete as f64))?;
+                    // Spec closes with `Set(O, "length", newLen, true)`, which throws a
+                    // TypeError when `length` is non-writable and the length changes.
+                    let insert_count = args.len().saturating_sub(2);
+                    let new_len = len - delete + insert_count;
+                    if new_len != len && self.realm.array_length_is_readonly(handle) {
+                        return Err(length_readonly_throw(self));
+                    }
                     let mut next: Vec<NanBox> = elems[..start].to_vec();
                     next.extend_from_slice(&args[2.min(args.len())..]);
                     next.extend_from_slice(&elems[start + delete..]);
@@ -3348,9 +3517,18 @@ impl<'a> Interp<'a> {
                                     let r = self.call_with_this(m, *e, &[])?;
                                     self.coerce_to_string(r)?
                                 } else {
-                                    // A string/boolean (or other) primitive element:
-                                    // its `toLocaleString` is identity-ish — ToString.
-                                    self.coerce_to_string(*e)?
+                                    // A string/boolean/symbol (or other) primitive
+                                    // element: `Invoke(element, "toLocaleString")` —
+                                    // box it (ToObject) to resolve the possibly
+                                    // user-overridden method, then call it with the
+                                    // *primitive* as `this` (so an override observing a
+                                    // strict primitive `this` — e.g. `typeof this` —
+                                    // sees `"boolean"`/`"string"`, not the wrapper).
+                                    let boxed = self.coerce_to_object(*e);
+                                    let bh = boxed.as_handle().map(Handle::from_raw).unwrap();
+                                    let m = self.read_member(bh, "toLocaleString")?;
+                                    let r = self.call_with_this(m, *e, &[])?;
+                                    self.coerce_to_string(r)?
                                 }
                             }
                         };
@@ -3386,6 +3564,11 @@ impl<'a> Interp<'a> {
                             }
                         }
                         return Ok(Some(NanBox::boolean(found)));
+                    }
+                    // Length is checked before ToInteger(fromIndex): an empty array
+                    // returns false without coercing the (side-effecting) fromIndex.
+                    if elems.is_empty() {
+                        return Ok(Some(NanBox::boolean(false)));
                     }
                     let from = self.array_from_index_checked(arg(1), elems.len())?;
                     // SameValueZero: like `===` but `NaN` matches `NaN`. `includes`
@@ -3542,6 +3725,12 @@ impl<'a> Interp<'a> {
                         }
                         return Ok(Some(NanBox::number(idx)));
                     }
+                    // Length is checked before ToInteger(fromIndex): an empty array
+                    // returns -1 without coercing the (possibly side-effecting)
+                    // fromIndex argument.
+                    if elems.is_empty() {
+                        return Ok(Some(NanBox::number(-1.0)));
+                    }
                     let from = self.array_from_index_checked(arg(1), elems.len())?;
                     let mut idx = -1.0;
                     for (i, e) in elems.iter().enumerate().skip(from) {
@@ -3584,20 +3773,30 @@ impl<'a> Interp<'a> {
                         }
                         return Ok(Some(NanBox::handle(dest.to_raw())));
                     }
+                    // A real array reads each `kValue` *live* via `[[Get]]` (a
+                    // callback that mutates a later index is observed); holes are
+                    // skipped and preserved as holes in the dense result. A
+                    // materialized generic array-like reads its snapshot + mask.
+                    let live = receiver_is_real_array;
                     let mut out = Vec::with_capacity(elems.len());
-                    for (i, e) in elems.iter().enumerate() {
-                        // A hole maps to a hole (callback skipped) — preserved as a
-                        // real hole in the dense result (typed arrays have none).
-                        if !is_present(i) {
-                            out.push(if self.realm.typed_kind(handle).is_some() {
-                                NanBox::undefined()
-                            } else {
-                                NanBox::hole()
-                            });
-                            continue;
+                    for i in 0..elems.len() {
+                        let present = is_present(i);
+                        match self.array_cb_read(
+                            handle,
+                            i,
+                            false,
+                            live,
+                            &elems,
+                            present,
+                            true,
+                            array_proto_generic,
+                        )? {
+                            None => out.push(NanBox::hole()),
+                            Some(e) => {
+                                let cb_args = [e, NanBox::number(i as f64), arr];
+                                out.push(self.call_with_this(f, this_arg, &cb_args)?);
+                            }
                         }
-                        let cb_args = [*e, NanBox::number(i as f64), arr];
-                        out.push(self.call_with_this(f, this_arg, &cb_args)?);
                     }
                     // A typed-array `map` allocates via TypedArraySpeciesCreate.
                     return Ok(Some(self.typed_like_species(handle, out)?));
@@ -3626,15 +3825,30 @@ impl<'a> Interp<'a> {
                         }
                         return Ok(Some(self.typed_like_species(handle, out)?));
                     }
+                    // A real array reads each `kValue` *live* via `[[Get]]` (a
+                    // callback that mutates a later index is observed); holes are
+                    // skipped. A materialized generic array-like reads snapshot + mask.
+                    let live = receiver_is_real_array;
                     let mut out = Vec::new();
-                    for (i, e) in elems.iter().enumerate() {
-                        if !is_present(i) {
+                    for i in 0..elems.len() {
+                        let present = is_present(i);
+                        let Some(e) = self.array_cb_read(
+                            handle,
+                            i,
+                            false,
+                            live,
+                            &elems,
+                            present,
+                            true,
+                            array_proto_generic,
+                        )?
+                        else {
                             continue; // holes are skipped
-                        }
-                        let cb_args = [*e, NanBox::number(i as f64), arr];
+                        };
+                        let cb_args = [e, NanBox::number(i as f64), arr];
                         let r = self.call_with_this(f, this_arg, &cb_args)?;
                         if self.realm.truthy(r) {
-                            out.push(*e);
+                            out.push(e);
                         }
                     }
                     return Ok(Some(self.typed_like_species(handle, out)?));
@@ -3651,8 +3865,16 @@ impl<'a> Interp<'a> {
                     #[allow(clippy::needless_range_loop)]
                     for i in 0..elems.len() {
                         let present = is_present(i);
-                        let Some(e) =
-                            self.array_cb_read(handle, i, typed, live, &elems, present, true)?
+                        let Some(e) = self.array_cb_read(
+                            handle,
+                            i,
+                            typed,
+                            live,
+                            &elems,
+                            present,
+                            true,
+                            array_proto_generic,
+                        )?
                         else {
                             continue;
                         };
@@ -3677,9 +3899,16 @@ impl<'a> Interp<'a> {
                         let mut k = 0;
                         while k < elems.len() {
                             let present = is_present(k);
-                            if let Some(v) =
-                                self.array_cb_read(handle, k, typed, live, &elems, present, true)?
-                            {
+                            if let Some(v) = self.array_cb_read(
+                                handle,
+                                k,
+                                typed,
+                                live,
+                                &elems,
+                                present,
+                                true,
+                                array_proto_generic,
+                            )? {
                                 seed = Some(v);
                                 start = k + 1;
                                 break;
@@ -3698,8 +3927,16 @@ impl<'a> Interp<'a> {
                     }
                     for i in start..elems.len() {
                         let present = is_present(i);
-                        let Some(e) =
-                            self.array_cb_read(handle, i, typed, live, &elems, present, true)?
+                        let Some(e) = self.array_cb_read(
+                            handle,
+                            i,
+                            typed,
+                            live,
+                            &elems,
+                            present,
+                            true,
+                            array_proto_generic,
+                        )?
                         else {
                             continue; // holes are skipped
                         };
@@ -3724,9 +3961,16 @@ impl<'a> Interp<'a> {
                         while k > 0 {
                             k -= 1;
                             let present = is_present(k);
-                            if let Some(v) =
-                                self.array_cb_read(handle, k, typed, live, &elems, present, true)?
-                            {
+                            if let Some(v) = self.array_cb_read(
+                                handle,
+                                k,
+                                typed,
+                                live,
+                                &elems,
+                                present,
+                                true,
+                                array_proto_generic,
+                            )? {
                                 seed = Some(v);
                                 idx = k;
                                 break;
@@ -3745,8 +3989,16 @@ impl<'a> Interp<'a> {
                     while idx > 0 {
                         idx -= 1;
                         let present = is_present(idx);
-                        let Some(e) =
-                            self.array_cb_read(handle, idx, typed, live, &elems, present, true)?
+                        let Some(e) = self.array_cb_read(
+                            handle,
+                            idx,
+                            typed,
+                            live,
+                            &elems,
+                            present,
+                            true,
+                            array_proto_generic,
+                        )?
                         else {
                             continue; // holes are skipped
                         };
@@ -3846,6 +4098,19 @@ impl<'a> Interp<'a> {
                         _ => 1,
                     };
                     return Ok(Some(self.make_live_typed_iterator(handle, kind)));
+                }
+                // A **real** array yields a live iterator (`CreateArrayIterator`
+                // re-reads `length`/`Get(k)` each `next()`, so an element pushed or
+                // assigned after `.values()`/`.keys()`/`.entries()` is observed); a
+                // materialized generic array-like keeps its snapshot.
+                "keys" if self.realm.is_array(handle) => {
+                    return Ok(Some(self.make_live_array_iterator(handle, 0)));
+                }
+                "values" if self.realm.is_array(handle) => {
+                    return Ok(Some(self.make_live_array_iterator(handle, 1)));
+                }
+                "entries" if self.realm.is_array(handle) => {
+                    return Ok(Some(self.make_live_array_iterator(handle, 2)));
                 }
                 "keys" => {
                     let ks: Vec<NanBox> =
@@ -4172,7 +4437,16 @@ impl<'a> Interp<'a> {
                     #[allow(clippy::needless_range_loop)]
                     for i in 0..elems.len() {
                         let e = self
-                            .array_cb_read(handle, i, typed, live, &elems, false, false)?
+                            .array_cb_read(
+                                handle,
+                                i,
+                                typed,
+                                live,
+                                &elems,
+                                false,
+                                false,
+                                array_proto_generic,
+                            )?
                             .unwrap_or_else(NanBox::undefined);
                         if self.call_truthy_this(
                             f,
@@ -4191,7 +4465,16 @@ impl<'a> Interp<'a> {
                     #[allow(clippy::needless_range_loop)]
                     for i in 0..elems.len() {
                         let e = self
-                            .array_cb_read(handle, i, typed, live, &elems, false, false)?
+                            .array_cb_read(
+                                handle,
+                                i,
+                                typed,
+                                live,
+                                &elems,
+                                false,
+                                false,
+                                array_proto_generic,
+                            )?
                             .unwrap_or_else(NanBox::undefined);
                         if self.call_truthy_this(
                             f,
@@ -4211,7 +4494,16 @@ impl<'a> Interp<'a> {
                     #[allow(clippy::needless_range_loop)]
                     for i in (0..elems.len()).rev() {
                         let e = self
-                            .array_cb_read(handle, i, typed, live, &elems, false, false)?
+                            .array_cb_read(
+                                handle,
+                                i,
+                                typed,
+                                live,
+                                &elems,
+                                false,
+                                false,
+                                array_proto_generic,
+                            )?
                             .unwrap_or_else(NanBox::undefined);
                         if self.call_truthy_this(
                             f,
@@ -4230,7 +4522,16 @@ impl<'a> Interp<'a> {
                     #[allow(clippy::needless_range_loop)]
                     for i in (0..elems.len()).rev() {
                         let e = self
-                            .array_cb_read(handle, i, typed, live, &elems, false, false)?
+                            .array_cb_read(
+                                handle,
+                                i,
+                                typed,
+                                live,
+                                &elems,
+                                false,
+                                false,
+                                array_proto_generic,
+                            )?
                             .unwrap_or_else(NanBox::undefined);
                         if self.call_truthy_this(
                             f,
@@ -4251,8 +4552,16 @@ impl<'a> Interp<'a> {
                         // Typed array: re-read live. Real array: live `[[Get]]` (a
                         // callback mutation is observed). Both skip absent indices.
                         let present = is_present(i);
-                        let Some(e) =
-                            self.array_cb_read(handle, i, typed, live, &elems, present, true)?
+                        let Some(e) = self.array_cb_read(
+                            handle,
+                            i,
+                            typed,
+                            live,
+                            &elems,
+                            present,
+                            true,
+                            array_proto_generic,
+                        )?
                         else {
                             continue;
                         };
@@ -4273,8 +4582,16 @@ impl<'a> Interp<'a> {
                     #[allow(clippy::needless_range_loop)]
                     for i in 0..elems.len() {
                         let present = is_present(i);
-                        let Some(e) =
-                            self.array_cb_read(handle, i, typed, live, &elems, present, true)?
+                        let Some(e) = self.array_cb_read(
+                            handle,
+                            i,
+                            typed,
+                            live,
+                            &elems,
+                            present,
+                            true,
+                            array_proto_generic,
+                        )?
                         else {
                             continue;
                         };
@@ -4601,8 +4918,23 @@ impl<'a> Interp<'a> {
         snapshot: &[NanBox],
         snapshot_present: bool,
         skip_holes: bool,
+        array_proto_generic: bool,
     ) -> Result<Option<NanBox>, ExecError> {
         if typed {
+            // A *generic* `Array.prototype.<m>.call(ta)` reads the view as an
+            // ordinary array-like: `HasProperty(O, i)` is false for an index whose
+            // resizable buffer shrank below it (or a detached view), so a
+            // hole-skipping iterator (`every`/`some`/`forEach`/`reduce`/`find*`)
+            // skips it. The *branded* `%TypedArray%.prototype.<m>` (a direct
+            // `ta.<m>()`) instead visits every index in `0..len` and reads
+            // `undefined` for an out-of-bounds one (no `HasProperty` gate) — so only
+            // apply the skip on the generic path.
+            if skip_holes && array_proto_generic {
+                let cur_len = self.realm.typed_len(handle).unwrap_or(0);
+                if i >= cur_len {
+                    return Ok(None);
+                }
+            }
             return Ok(Some(
                 self.realm
                     .typed_get(handle, i)
@@ -4742,12 +5074,15 @@ impl<'a> Interp<'a> {
         // Items = [O, ...args].
         for item in core::iter::once(o_v).chain(args.iter().copied()) {
             let ih = item.as_handle().map(Handle::from_raw);
-            // IsConcatSpreadable(E): a non-object is never spread; otherwise a
-            // defined `@@isConcatSpreadable` (read via the accessor path so a getter
-            // fires / may throw) decides via ToBoolean, else `IsArray` (which
-            // unwraps proxies and throws on a revoked one).
+            // IsConcatSpreadable(E): "If Type(E) is not Object, return false" — so a
+            // *primitive* string/symbol/bigint (a heap value, but not an Object) is
+            // never spread even when `@@isConcatSpreadable` is inherited from a
+            // primitive prototype (e.g. `String.prototype`). Otherwise a defined
+            // `@@isConcatSpreadable` (read via the accessor path so a getter fires /
+            // may throw) decides via ToBoolean, else `IsArray` (which unwraps
+            // proxies and throws on a revoked one).
             let spread = match ih {
-                Some(h) => {
+                Some(h) if self.is_object_value(item) => {
                     let v = self.read_member(h, &spread_key)?;
                     if matches!(v.unpack(), Unpacked::Undefined) {
                         self.is_array_unwrap_proxy(item)?
@@ -4755,7 +5090,7 @@ impl<'a> Interp<'a> {
                         self.realm.truthy(v)
                     }
                 }
-                None => false,
+                _ => false,
             };
             if spread {
                 let h = ih.expect("spreadable implies an object");
@@ -4910,6 +5245,15 @@ impl<'a> Interp<'a> {
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
         let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
+        // `Array.prototype.sort`: IsCallable(comparefn) is validated *before* the
+        // `length` read (23.1.3.30 step 1), so a bad comparefn throws even when the
+        // receiver's `length` getter would throw.
+        if method == "sort"
+            && !matches!(arg(0).unpack(), Unpacked::Undefined)
+            && !self.is_callable_value(arg(0))
+        {
+            return Err(self.type_error("comparefn must be a function"));
+        }
         let len = self.array_like_length(handle)?;
         match method {
             "push" => {

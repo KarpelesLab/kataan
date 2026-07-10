@@ -1846,8 +1846,38 @@ impl<'a> Interp<'a> {
                     }
                     None => false,
                 };
-                let mut mapped_already = false;
-                let raw_items = if is_iterable {
+                // When `Array.from` is invoked with a constructor `this` (e.g.
+                // `Array.from.call(C, …)` or a subclass `C.from(…)`), the result is
+                // `Construct(C, …)`. Per spec (23.1.2.1) the target is constructed
+                // *before* iteration begins (a throwing constructor aborts before the
+                // iterator is even obtained). The iterator path constructs with **no
+                // arguments** (`Construct(C)`); the array-like path constructs with
+                // `«len»`. Only the default `%Array%` / a non-constructor `this`
+                // builds a plain dense array.
+                let this_c = self.this_val;
+                let is_array_ctor =
+                    self.current.get("Array").and_then(|v| v.as_handle()) == this_c.as_handle();
+                let use_ctor = self.is_constructor_value(this_c) && !is_array_ctor;
+                // Helper: unwrap a freshly-`Construct`ed target to its handle.
+                if is_iterable {
+                    // Iterator path: `A = IsConstructor(C) ? Construct(C) : ArrayCreate(0)`
+                    // is performed **before** `GetIterator` — a throwing constructor
+                    // aborts before the iterator is obtained, and `Construct(C)` takes
+                    // no arguments (so `Array.from.call(Object, [])` yields `{}`, not
+                    // `new Object(0)`).
+                    let target_h = if use_ctor {
+                        let target = self.construct(this_c, &[])?;
+                        match target.as_handle().map(Handle::from_raw) {
+                            Some(th) => Some(th),
+                            None => {
+                                return Err(self.type_error(
+                                    "Array.from constructor did not return an object",
+                                ));
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     // Iterate LAZILY, applying mapFn per element interleaved with
                     // IteratorStep, so an abrupt mapFn completion IteratorCloses the
                     // still-open iterator (a `next`/getter throw propagates directly).
@@ -1875,14 +1905,31 @@ impl<'a> Interp<'a> {
                         } else {
                             val
                         };
-                        out.push(mapped);
+                        // A `CreateDataPropertyOrThrow` failure also closes the iterator.
+                        if let Some(th) = target_h {
+                            if let Err(e) = self.create_data_property_or_throw(th, k, mapped) {
+                                let _ = self.iterator_close(it);
+                                return Err(e);
+                            }
+                        } else {
+                            out.push(mapped);
+                        }
                         k += 1;
                     }
-                    mapped_already = has_map;
-                    out
+                    if let Some(th) = target_h {
+                        let len_key = self.new_str("length");
+                        self.assign_member_value(th, len_key, NanBox::number(k as f64))?;
+                        NanBox::handle(th.to_raw())
+                    } else {
+                        NanBox::handle(self.realm.new_array(out).to_raw())
+                    }
                 } else {
-                    // Array-like: ToLength(Get(O, "length")) then Get each index.
+                    // Array-like: `len = LengthOfArrayLike(items)`, then
+                    // `A = IsConstructor(C) ? Construct(C, «len») : ArrayCreate(len)`,
+                    // then `Get`/mapFn/`CreateDataPropertyOrThrow` each index.
                     let mut out = Vec::new();
+                    let mut target_h = None;
+                    let mut final_len = 0usize;
                     if let Some(h) = items_box.as_handle().map(Handle::from_raw) {
                         let len_val = self.read_member(h, "length")?;
                         let len_num = self.coerce_to_number(len_val)?;
@@ -1899,54 +1946,43 @@ impl<'a> Interp<'a> {
                         } else {
                             len_raw as usize
                         };
+                        final_len = len;
+                        if use_ctor {
+                            let target = self.construct(this_c, &[NanBox::number(len as f64)])?;
+                            target_h = Some(match target.as_handle().map(Handle::from_raw) {
+                                Some(th) => th,
+                                None => {
+                                    return Err(self.type_error(
+                                        "Array.from constructor did not return an object",
+                                    ));
+                                }
+                            });
+                        }
                         for i in 0..len {
-                            out.push(self.read_member(h, &alloc::format!("{i}"))?);
+                            let v = self.read_member(h, &alloc::format!("{i}"))?;
+                            let v = if has_map {
+                                self.call_with_this(
+                                    map_fn,
+                                    this_arg,
+                                    &[v, NanBox::number(i as f64)],
+                                )?
+                            } else {
+                                v
+                            };
+                            match target_h {
+                                Some(th) => self.create_data_property_or_throw(th, i, v)?,
+                                None => out.push(v),
+                            }
                         }
                     }
-                    out
-                };
-                let items = if !has_map || mapped_already {
-                    raw_items
-                } else {
-                    let mut out = Vec::with_capacity(raw_items.len());
-                    for (i, e) in raw_items.iter().enumerate() {
-                        out.push(self.call_with_this(
-                            map_fn,
-                            this_arg,
-                            &[*e, NanBox::number(i as f64)],
-                        )?);
+                    if let Some(th) = target_h {
+                        // `Set(A, "length", len, true)`.
+                        let len_key = self.new_str("length");
+                        self.assign_member_value(th, len_key, NanBox::number(final_len as f64))?;
+                        NanBox::handle(th.to_raw())
+                    } else {
+                        NanBox::handle(self.realm.new_array(out).to_raw())
                     }
-                    out
-                };
-                // When `Array.from` is invoked with a constructor `this` (e.g.
-                // `Array.from.call(C, …)` or a subclass `C.from(…)`), the result is
-                // `Construct(C, «len»)` populated via `CreateDataPropertyOrThrow`
-                // and given the final `length`; only the default `%Array%`/non-
-                // constructor `this` builds a plain dense array.
-                let this_c = self.this_val;
-                let is_array_ctor =
-                    self.current.get("Array").and_then(|v| v.as_handle()) == this_c.as_handle();
-                if self.is_constructor_value(this_c) && !is_array_ctor {
-                    // `Construct(C, «len»)`, then `CreateDataPropertyOrThrow` each
-                    // element and `Set(A, "length", len)`.
-                    let len = items.len();
-                    let target = self.construct(this_c, &[NanBox::number(len as f64)])?;
-                    let Some(th) = target.as_handle().map(Handle::from_raw) else {
-                        return Err(
-                            self.type_error("Array.from constructor did not return an object")
-                        );
-                    };
-                    for (i, e) in items.iter().enumerate() {
-                        // `CreateDataPropertyOrThrow(A, i, e)` — routes array indices
-                        // into the dense element store (a raw `set_property` would
-                        // stash them as named props that `join`/dense reads miss).
-                        self.create_data_property_or_throw(th, i, *e)?;
-                    }
-                    let len_key = self.new_str("length");
-                    self.assign_member_value(th, len_key, NanBox::number(len as f64))?;
-                    target
-                } else {
-                    NanBox::handle(self.realm.new_array(items).to_raw())
                 }
             }
             // `Array.fromAsync(asyncItems, mapFn?, thisArg?)` — returns a promise.
@@ -3477,6 +3513,25 @@ impl<'a> Interp<'a> {
                     },
                 };
                 self.new_str(&s)
+            }
+            // `Object.prototype.toLocaleString()` → `Invoke(this, "toString")`: box a
+            // primitive `this` to resolve the (possibly overridden) `toString`, then
+            // call it with the *original* `this` value (so a strict override reading
+            // `typeof this` sees the primitive, not the wrapper).
+            N_OBJ_PROTO_TOLOCALESTRING => {
+                let this = self.this_val;
+                let recv = if this.as_handle().is_some() {
+                    this
+                } else {
+                    self.coerce_to_object(this)
+                };
+                let Some(h) = recv.as_handle().map(Handle::from_raw) else {
+                    return Err(self.type_error(
+                        "Object.prototype.toLocaleString called on null or undefined",
+                    ));
+                };
+                let m = self.read_member(h, "toString")?;
+                self.call_with_this(m, this, args)?
             }
             N_OBJ_PROTO_VALUEOF => self.this_val,
             // `Error.prototype.toString` — the receiver must be an Object (a

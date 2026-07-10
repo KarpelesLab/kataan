@@ -1561,6 +1561,10 @@ const WASM_TABLE_MAX: &str = "\u{0}tmax";
 // to a free id so the 12th typed-array kind, `Float16Array`, can take
 // `N_TYPED_ARRAY_BASE + 11 = 179` and keep the kind ids contiguous.)
 const N_OBJ_PROTO_TOSTRING: u16 = 675;
+/// `Object.prototype.toLocaleString` — per spec it is `return Invoke(this,
+/// "toString")` (NOT the `[[Class]]` tag), so a user-overridden `toString` on the
+/// receiver (or its prototype) is honored, with the *original* `this` value.
+const N_OBJ_PROTO_TOLOCALESTRING: u16 = 964;
 /// `%Segments.prototype%.containing(index)` — a bound native on the object
 /// returned by `Intl.Segmenter.prototype.segment`.
 const N_INTL_SEGMENTS_CONTAINING: u16 = 676;
@@ -2368,6 +2372,13 @@ const GEN_DONE: &str = "\u{0}gdone";
 /// mid-iteration is observed (`GEN_IDX` holds the cursor, `GEN_KIND` the 0/1/2
 /// keys/values/entries selector).
 const GEN_TA: &str = "\u{0}gta";
+/// Hidden slot on a **live** plain-array iterator (from an explicit
+/// `arr.values()`/`.keys()`/`.entries()`): the array handle. Each `next()`
+/// re-reads the array's current `length` and `Get`s the element at the cursor,
+/// so elements pushed/assigned after the iterator was created are observed (per
+/// spec `CreateArrayIterator`). `GEN_IDX` is the cursor, `GEN_KIND` the 0/1/2
+/// keys/values/entries selector.
+const GEN_ARR: &str = "\u{0}garr";
 /// Hidden slot on a *lazy* generator object: the index of its suspended
 /// [`generator::GenFrame`] in `Interp::gen_frames`.
 const GEN_FRAME: &str = "\u{0}gframe";
@@ -4231,7 +4242,7 @@ impl<'a> Interp<'a> {
         let obj_proto = self.realm.new_object();
         for (name, id, arity) in [
             ("toString", N_OBJ_PROTO_TOSTRING, 0u32),
-            ("toLocaleString", N_OBJ_PROTO_TOSTRING, 0),
+            ("toLocaleString", N_OBJ_PROTO_TOLOCALESTRING, 0),
             ("valueOf", N_OBJ_PROTO_VALUEOF, 0),
             ("hasOwnProperty", N_OBJ_PROTO_HASOWN, 1),
             ("isPrototypeOf", N_OBJ_PROTO_ISPROTOTYPEOF, 1),
