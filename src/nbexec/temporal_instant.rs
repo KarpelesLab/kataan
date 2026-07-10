@@ -192,6 +192,8 @@ impl<'a> Interp<'a> {
 
     /// Boxes a fresh `Temporal.Duration` for `since`/`until` results.
     fn make_duration(&mut self, duration: DurationFields) -> NanBox {
+        // Duration fields are Numbers: quantize to float64-representable integers.
+        let duration = temporal_iso::quantize_duration_fields(duration);
         let data = TemporalData {
             kind: TemporalKind::Duration,
             duration,

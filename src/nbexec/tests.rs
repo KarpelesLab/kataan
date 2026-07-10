@@ -3538,6 +3538,79 @@ fn bigint_typed_arrays() {
 }
 
 #[test]
+fn construct_throwing_prototype_getter_propagates_not_recurses() {
+    // `reflect_new_target` is a one-shot: a `new X()` inside a throwing
+    // `prototype` getter used by `Reflect.construct` must not re-observe the
+    // outer newTarget (which previously caused unbounded recursion → a spurious
+    // "Maximum call stack size exceeded" instead of the getter's own throw).
+    for target in ["Uint8Array", "Float64Array", "Array", "(function C(){})"] {
+        let src = alloc::format!(
+            "function E(){{ this.m='boom'; }} \
+             var nt = function(){{}}.bind(null); \
+             Object.defineProperty(nt,'prototype',{{get(){{ throw new E(); }}}}); \
+             var out='?'; \
+             try {{ Reflect.construct({target}, [], nt); }} catch(e){{ out = e.m; }} \
+             out"
+        );
+        assert_eq!(run(&src), "boom", "target = {target}");
+    }
+}
+
+#[test]
+fn typed_array_to_string_is_array_to_string() {
+    // %TypedArray%.prototype.toString is the SAME function object as
+    // Array.prototype.toString (23.2.3.30), and still joins the view.
+    let ta = "Object.getPrototypeOf(Int8Array).prototype";
+    assert_eq!(
+        run(&alloc::format!(
+            "{ta}.toString === Array.prototype.toString"
+        )),
+        "true"
+    );
+    assert_eq!(run("new Uint8Array([1,2,3]).toString()"), "1,2,3");
+}
+
+#[test]
+fn typed_array_from_array_honors_overridden_iterator_next() {
+    // `new TA(array)` drains the array via its @@iterator's actual `next`
+    // (InitializeTypedArrayFromList), honoring a patched
+    // %ArrayIteratorPrototype%.next rather than a raw element grab.
+    assert_eq!(
+        run("var P=Object.getPrototypeOf([].values()); \
+             var vals=[1,2,3,4]; \
+             P.next=function(){ var d=vals.length===0; return {value:vals.pop(),done:d}; }; \
+             var a=new Uint16Array([0]); \
+             a.length+':'+a[0]+','+a[1]+','+a[2]+','+a[3]"),
+        "4:4,3,2,1"
+    );
+}
+
+#[test]
+fn reflect_set_typed_array_receiver_respects_integer_index_bounds() {
+    // OrdinarySet's CreateDataProperty on a typed-array receiver: an invalid
+    // index fails (false) without coercing the value; a valid index coerces
+    // and writes.
+    assert_eq!(
+        run(
+            "var t=new Int8Array([0,0]); var r=new Int8Array([9]); var c=0; \
+             var v={valueOf(){c++; return 5;}}; \
+             var ok=Reflect.set(t,1,v,r); ok+','+t[1]+','+r.hasOwnProperty(1)+','+c"
+        ),
+        "false,0,false,0"
+    );
+    // Receiver on the target's prototype chain (O === Receiver) → the value is
+    // coerced exactly once and the out-of-bounds write is a silent success.
+    assert_eq!(
+        run(
+            "var r=new Int32Array(10); var o=Object.create(r); var c=0; \
+             var v={valueOf(){c++; return 1;}}; \
+             Reflect.set(o,100,v,r)+','+c"
+        ),
+        "true,1"
+    );
+}
+
+#[test]
 fn typed_array_view_aliasing() {
     // Sibling views over one ArrayBuffer share bytes intrinsically.
     assert_eq!(

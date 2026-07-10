@@ -3199,9 +3199,15 @@ impl<'a> Interp<'a> {
                     let abuf = self.realm.typed_array_object(handle).unwrap();
                     let parent_off = self.realm.typed_byte_offset(handle).unwrap_or(0);
                     let sub_off = parent_off + start * elem_size;
-                    // TypedArraySpeciesCreate(O, « buffer, beginByteOffset, newLength »).
+                    // 23.2.3.30 step 15: an auto-length (length-tracking) view with
+                    // `end` undefined passes only « buffer, beginByteOffset » to the
+                    // species constructor (the new view length-tracks too); otherwise
+                    // « buffer, beginByteOffset, newLength ».
+                    let pass_length = !(self.realm.is_length_tracking(handle)
+                        && matches!(arg(1).unpack(), Unpacked::Undefined));
+                    // TypedArraySpeciesCreate(O, argumentsList).
                     if let Some(view) =
-                        self.typed_subarray_species(handle, abuf, sub_off, new_len)?
+                        self.typed_subarray_species(handle, abuf, sub_off, new_len, pass_length)?
                     {
                         return Ok(Some(view));
                     }

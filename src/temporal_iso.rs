@@ -602,6 +602,30 @@ impl DurationFields {
     }
 }
 
+/// Quantizes each Duration field to the nearest float64-representable integer.
+/// The spec stores Duration fields as Numbers (`CreateDurationRecord` /
+/// `TemporalDurationFromInternal` yield `𝔽`-valued fields), so a value that a
+/// difference produces internally as an exact integer beyond 2^53 must first be
+/// rounded to f64 precision — e.g. `18446744073709551` microseconds becomes
+/// `18446744073709552`. Components below 2^53 are unaffected (a no-op).
+#[must_use]
+pub fn quantize_duration_fields(mut d: DurationFields) -> DurationFields {
+    fn q(v: i128) -> i128 {
+        (v as f64) as i128
+    }
+    d.years = q(d.years);
+    d.months = q(d.months);
+    d.weeks = q(d.weeks);
+    d.days = q(d.days);
+    d.hours = q(d.hours);
+    d.minutes = q(d.minutes);
+    d.seconds = q(d.seconds);
+    d.milliseconds = q(d.milliseconds);
+    d.microseconds = q(d.microseconds);
+    d.nanoseconds = q(d.nanoseconds);
+    d
+}
+
 /// Balances a raw nanosecond total into duration time fields down to
 /// `largest_unit` (Hour..Nanosecond). Used by Duration.round / Instant / Time.
 #[must_use]
@@ -891,6 +915,17 @@ pub fn parse_iso_time_string(s: &str) -> Option<ParsedIso> {
         return None;
     }
     Some(out)
+}
+
+/// `ParseTemporalCalendarString`: the string is not a bare builtin calendar id,
+/// so parse it as an annotated ISO date / date-time / time string and return its
+/// raw (un-canonicalized) calendar annotation, defaulting to `"iso8601"`. Returns
+/// `None` when the string is not a valid Temporal string (→ RangeError). The
+/// caller must still canonicalize the returned id (an unknown id → RangeError).
+#[must_use]
+pub fn parse_calendar_string(s: &str) -> Option<String> {
+    let p = parse_iso_datetime(s)?;
+    Some(p.calendar.unwrap_or_else(|| String::from("iso8601")))
 }
 
 /// Parses a Temporal date/datetime/time string into its components. Accepts the
@@ -1320,6 +1355,52 @@ mod tests {
         // Negative magnitudes carry their sign through the i128 fields.
         let d = balance_time_duration(-ns_total, Unit::Nanosecond);
         assert_eq!(d.nanoseconds, -ns_total);
+    }
+
+    #[test]
+    fn quantize_duration_rounds_fields_to_float64() {
+        // 18446744073709551 is not float64-representable; the nearest f64 integer
+        // is 18446744073709552 (matching the Instant `since` float64 test262 case).
+        let mut d = DurationFields::default();
+        d.microseconds = 18_446_744_073_709_551;
+        d.nanoseconds = -616;
+        let q = quantize_duration_fields(d);
+        assert_eq!(q.microseconds, 18_446_744_073_709_552);
+        // A value below 2^53 is already exact — quantization is a no-op.
+        assert_eq!(q.nanoseconds, -616);
+        let small = DurationFields {
+            years: 1,
+            months: 11,
+            days: 24,
+            ..Default::default()
+        };
+        assert_eq!(quantize_duration_fields(small), small);
+    }
+
+    #[test]
+    fn parse_calendar_string_extracts_annotation() {
+        // Bare date / date-time / time strings default to iso8601.
+        assert_eq!(
+            parse_calendar_string("2020-01-01").as_deref(),
+            Some("iso8601")
+        );
+        assert_eq!(
+            parse_calendar_string("2020-01-01T00:00:00").as_deref(),
+            Some("iso8601")
+        );
+        assert_eq!(parse_calendar_string("15:23").as_deref(), Some("iso8601"));
+        assert_eq!(
+            parse_calendar_string("T15:23:30").as_deref(),
+            Some("iso8601")
+        );
+        // A `[u-ca=…]` annotation supplies the (raw, un-canonicalized) id.
+        assert_eq!(
+            parse_calendar_string("2020-01-01[u-ca=hebrew]").as_deref(),
+            Some("hebrew")
+        );
+        // Malformed strings are rejected.
+        assert_eq!(parse_calendar_string(""), None);
+        assert_eq!(parse_calendar_string("not-a-date"), None);
     }
 
     #[test]

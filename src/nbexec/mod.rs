@@ -3305,7 +3305,27 @@ impl<'a> Interp<'a> {
         // the call's typed-array `this`), so `typeof ta.map === "function"`, the
         // method's own `name`/`length`, and `%TypedArray%.prototype.map.call(ta, …)`
         // all behave per spec. Arities (the `length` own property) follow the spec.
+        // `%TypedArray%.prototype.toString` *is* the same built-in function object
+        // as `Array.prototype.toString` (23.2.3.30 — SameValue). Reuse Array's
+        // (installed earlier). The shared array-method dispatch already handles a
+        // typed-array receiver, so direct `ta.toString()` keeps working.
+        let array_to_string = self
+            .current
+            .get("Array")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|ap| self.realm.get_property(ap, "toString"));
         for &(name, arity) in TYPED_ARRAY_PROTO_METHODS {
+            if name == "toString"
+                && let Some(shared) = array_to_string
+            {
+                self.realm.set_property(ta_proto, name, shared);
+                self.realm.mark_hidden(ta_proto, name);
+                continue;
+            }
             let name_h = self.realm.new_string(name);
             let f = self.realm.new_bound_native(N_TYPED_ARRAY_PROTO_FN, name_h);
             self.install_fn_name_length(f, name, arity);

@@ -204,9 +204,20 @@ impl<'a> Interp<'a> {
                         .pd_range_error("combined date-time is outside the representable range"));
                 }
                 let offset = self.temporal_tz_offset_ns(&tz, local_ns).unwrap_or(0);
+                // `GetStartOfDay` / `GetEpochNanosecondsFor`: the resulting instant
+                // must be a valid epoch-nanoseconds value (a boundary date combined
+                // with a time-of-day or a zone offset can fall outside it).
+                let epoch_ns = local_ns - offset;
+                if !(crate::temporal_iso::MIN_EPOCH_NS..=crate::temporal_iso::MAX_EPOCH_NS)
+                    .contains(&epoch_ns)
+                {
+                    return Err(
+                        self.pd_range_error("resulting instant is outside the representable range")
+                    );
+                }
                 Ok(self.build_temporal(crate::temporal_iso::TemporalData {
                     kind: crate::temporal_iso::TemporalKind::ZonedDateTime,
-                    epoch_ns: local_ns - offset,
+                    epoch_ns,
                     tz: Some(tz),
                     calendar: cal.clone(),
                     ..Default::default()
@@ -1310,10 +1321,15 @@ impl<'a> Interp<'a> {
             else {
                 return Err(self.type_error("calendar must be a string"));
             };
-            // `ToTemporalCalendarIdentifier` for a calendar *argument* accepts only
-            // a bare calendar id — a full ISO string (even one carrying `[u-ca=…]`)
-            // is not a valid calendar identifier here.
+            // `ToTemporalCalendarSlotValue`: a bare builtin calendar id, or (via
+            // `ParseTemporalCalendarString`) a valid annotated ISO date / date-time
+            // / time string whose `[u-ca=…]` annotation supplies the id (default
+            // `iso8601`). An unknown id or a malformed string → RangeError.
             if let Some(c) = tcal::canonicalize_calendar(&s) {
+                String::from(c)
+            } else if let Some(raw) = temporal_iso::parse_calendar_string(&s)
+                && let Some(c) = tcal::canonicalize_calendar(&raw)
+            {
                 String::from(c)
             } else {
                 return Err(
@@ -1397,11 +1413,11 @@ impl<'a> Interp<'a> {
         // `NegateRoundingMode`).
         let round_mode = pd_round_mode_from_str(mode.as_deref(), negate);
         let mut duration = if tcal::is_iso(cal) {
-            self.pd_round_date_diff(date, other_date, largest, smallest, increment, round_mode)
+            self.pd_round_date_diff(date, other_date, largest, smallest, increment, round_mode)?
         } else {
             self.pd_round_date_diff_cal(
                 cal, date, other_date, largest, smallest, increment, round_mode,
-            )
+            )?
         };
         if negate {
             duration.years = -duration.years;
@@ -1418,27 +1434,27 @@ impl<'a> Interp<'a> {
     /// is measured against the day-span of one increment step from an anchor that
     /// already carries the coarser components (`NudgeToCalendarUnit`).
     fn pd_round_date_diff(
-        &self,
+        &mut self,
         from: IsoDate,
         to: IsoDate,
         largest: Unit,
         smallest: Unit,
         increment: i64,
         mode: crate::temporal_iso::RoundMode,
-    ) -> DurationFields {
+    ) -> Result<DurationFields, ExecError> {
         use crate::temporal_iso::{
             add_iso_date, iso_to_epoch_days, round_to_increment as round_inc,
         };
         let (years, months, weeks, days) = difference_iso_date(from, to, largest);
         if smallest == Unit::Day {
             let d = round_inc(i128::from(days), i128::from(increment.max(1)), mode);
-            return DurationFields {
+            return Ok(DurationFields {
                 years: i128::from(years),
                 months: i128::from(months),
                 weeks: i128::from(weeks),
                 days: d,
                 ..Default::default()
-            };
+            });
         }
         // Keep components coarser than `smallest`; round the `smallest` count.
         let (keep_y, keep_m) = match smallest {
@@ -1456,7 +1472,7 @@ impl<'a> Interp<'a> {
             ..Default::default()
         };
         if sign == 0 {
-            return out;
+            return Ok(out);
         }
         let (sy, sm, sw, _) = difference_iso_date(anchor, to, smallest);
         let mut r1 = match smallest {
@@ -1464,16 +1480,15 @@ impl<'a> Interp<'a> {
             Unit::Month => sm,
             _ => sw,
         };
-        let step = |count: i64| -> i64 {
+        let unit_add = |count: i64| -> Option<IsoDate> {
             let (y, m, w) = match smallest {
                 Unit::Year => (count, 0, 0),
                 Unit::Month => (0, count, 0),
                 _ => (0, 0, count),
             };
-            iso_to_epoch_days(
-                add_iso_date(anchor, y, m, w, 0, Overflow::Constrain).unwrap_or(anchor),
-            )
+            add_iso_date(anchor, y, m, w, 0, Overflow::Constrain)
         };
+        let step = |count: i64| -> i64 { iso_to_epoch_days(unit_add(count).unwrap_or(anchor)) };
         let beyond = |e: i64| if sign > 0 { e > to_e } else { e < to_e };
         for _ in 0..12 {
             if beyond(step(r1 + sign)) {
@@ -1487,6 +1502,14 @@ impl<'a> Interp<'a> {
             } else {
                 break;
             }
+        }
+        // `NudgeToCalendarUnit` projects the ceil (`r2`) increment-multiple endpoint
+        // via `CalendarDateAdd`; a date outside the representable ISO range throws a
+        // RangeError. Only a coarse unit with a large `roundingIncrement` reaches it.
+        let inc = increment.max(1);
+        let r2 = (r1 / inc) * inc + inc * sign;
+        if unit_add(r2).is_none() {
+            return Err(self.pd_range_error("rounded date is outside the valid ISO range"));
         }
         let e1 = step(r1);
         let count = if e1 == to_e {
@@ -1513,7 +1536,7 @@ impl<'a> Interp<'a> {
             }
             _ => out.weeks = i128::from(count),
         }
-        out
+        Ok(out)
     }
 
     /// The calendar-aware analogue of [`Self::pd_round_date_diff`] for a non-ISO
@@ -1523,7 +1546,7 @@ impl<'a> Interp<'a> {
     /// months are honoured. The rounding structure mirrors the ISO path exactly.
     #[allow(clippy::too_many_arguments)]
     fn pd_round_date_diff_cal(
-        &self,
+        &mut self,
         cal: &str,
         from: IsoDate,
         to: IsoDate,
@@ -1531,19 +1554,19 @@ impl<'a> Interp<'a> {
         smallest: Unit,
         increment: i64,
         mode: crate::temporal_iso::RoundMode,
-    ) -> DurationFields {
+    ) -> Result<DurationFields, ExecError> {
         use crate::temporal_iso::{iso_to_epoch_days, round_to_increment as round_inc};
         let parts = tcal::calendar_date_until(cal, from, to, largest);
         let (years, months, weeks, days) = (parts.years, parts.months, parts.weeks, parts.days);
         if smallest == Unit::Day {
             let d = round_inc(i128::from(days), i128::from(increment.max(1)), mode);
-            return DurationFields {
+            return Ok(DurationFields {
                 years: i128::from(years),
                 months: i128::from(months),
                 weeks: i128::from(weeks),
                 days: d,
                 ..Default::default()
-            };
+            });
         }
         // Keep components coarser than `smallest`; round the `smallest` count.
         let (keep_y, keep_m) = match smallest {
@@ -1551,9 +1574,13 @@ impl<'a> Interp<'a> {
             Unit::Month => (years, 0),
             _ => (years, months), // Week
         };
-        // Calendar-aware add relative to a base (Constrain, falling back on error).
+        // Calendar-aware add relative to a base (Constrain); `None` when the result
+        // falls outside the representable ISO range.
+        let cadd_opt = |base: IsoDate, y: i64, m: i64, w: i64| -> Option<IsoDate> {
+            tcal::calendar_date_add(cal, base, y, m, w, 0, Overflow::Constrain).ok()
+        };
         let cadd = |base: IsoDate, y: i64, m: i64, w: i64| -> IsoDate {
-            tcal::calendar_date_add(cal, base, y, m, w, 0, Overflow::Constrain).unwrap_or(base)
+            cadd_opt(base, y, m, w).unwrap_or(base)
         };
         let anchor = cadd(from, keep_y, keep_m, 0);
         let anchor_e = iso_to_epoch_days(anchor);
@@ -1565,7 +1592,7 @@ impl<'a> Interp<'a> {
             ..Default::default()
         };
         if sign == 0 {
-            return out;
+            return Ok(out);
         }
         let sub = tcal::calendar_date_until(cal, anchor, to, smallest);
         let mut r1 = match smallest {
@@ -1573,14 +1600,15 @@ impl<'a> Interp<'a> {
             Unit::Month => sub.months,
             _ => sub.weeks,
         };
-        let step = |count: i64| -> i64 {
+        let unit_add = |count: i64| -> Option<IsoDate> {
             let (y, m, w) = match smallest {
                 Unit::Year => (count, 0, 0),
                 Unit::Month => (0, count, 0),
                 _ => (0, 0, count),
             };
-            iso_to_epoch_days(cadd(anchor, y, m, w))
+            cadd_opt(anchor, y, m, w)
         };
+        let step = |count: i64| -> i64 { iso_to_epoch_days(unit_add(count).unwrap_or(anchor)) };
         let beyond = |e: i64| if sign > 0 { e > to_e } else { e < to_e };
         for _ in 0..14 {
             if beyond(step(r1 + sign)) {
@@ -1594,6 +1622,13 @@ impl<'a> Interp<'a> {
             } else {
                 break;
             }
+        }
+        // `NudgeToCalendarUnit`: the ceil (`r2`) increment-multiple endpoint must be
+        // representable, else a RangeError.
+        let inc = increment.max(1);
+        let r2 = (r1 / inc) * inc + inc * sign;
+        if unit_add(r2).is_none() {
+            return Err(self.pd_range_error("rounded date is outside the valid ISO range"));
         }
         let e1 = step(r1);
         let count = if e1 == to_e {
@@ -1619,7 +1654,7 @@ impl<'a> Interp<'a> {
             }
             _ => out.weeks = i128::from(count),
         }
-        out
+        Ok(out)
     }
 
     /// `GetRoundingIncrementOption`: default 1; `ToNumber` (Symbol/BigInt →

@@ -816,6 +816,8 @@ impl<'a> Interp<'a> {
 
     /// Builds a fresh `Temporal.Duration` bound to the intrinsic prototype.
     fn new_duration(&mut self, d: DurationFields) -> NanBox {
+        // Duration fields are Numbers: quantize to float64-representable integers.
+        let d = crate::temporal_iso::quantize_duration_fields(d);
         let data = TemporalData {
             kind: TemporalKind::Duration,
             duration: d,

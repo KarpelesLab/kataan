@@ -298,6 +298,7 @@ impl<'a> Interp<'a> {
         buffer: Handle,
         byte_offset: usize,
         new_len: usize,
+        pass_length: bool,
     ) -> Result<Option<NanBox>, ExecError> {
         let ctor = self.read_member(recv, "constructor")?;
         if matches!(ctor.unpack(), Unpacked::Undefined) {
@@ -322,12 +323,17 @@ impl<'a> Interp<'a> {
         if !self.is_constructor_value(species) {
             return Err(self.type_error("Symbol.species is not a constructor"));
         }
-        let args = [
+        // Per 23.2.3.30 step 15: when O's [[ArrayLength]] is *auto* (a
+        // length-tracking view) and `end` is undefined, the argument list is
+        // « buffer, beginByteOffset » (no length) — the new view also length-tracks.
+        // Otherwise it is « buffer, beginByteOffset, newLength ».
+        let args: &[NanBox] = &[
             NanBox::handle(buffer.to_raw()),
             NanBox::number(byte_offset as f64),
             NanBox::number(new_len as f64),
         ];
-        let result = self.construct(species, &args)?;
+        let args = if pass_length { args } else { &args[..2] };
+        let result = self.construct(species, args)?;
         if result
             .as_handle()
             .map(Handle::from_raw)
@@ -830,11 +836,11 @@ impl<'a> Interp<'a> {
         &mut self,
         kind: u8,
         callee: NanBox,
+        new_target: NanBox,
     ) -> Result<Option<Handle>, ExecError> {
         let kind_name = TYPED_ARRAY_KINDS[kind as usize].0;
         let default = self.intrinsic_proto(kind_name);
-        let nt = self.reflect_new_target.unwrap_or(callee);
-        self.instance_proto_checked(nt, callee, default)
+        self.instance_proto_checked(new_target, callee, default)
     }
 
     /// Whether the typed-array view at `handle` is backed by a detached buffer

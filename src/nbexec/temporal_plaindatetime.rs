@@ -821,12 +821,16 @@ impl<'a> Interp<'a> {
                 return Ok((date, time, cal));
             }
             if self.is_object_value(item) {
-                let opts = self.pdt_options(options)?;
+                // Observable order (`ToTemporalDateTime`): read `calendar` and all
+                // the date/time fields *before* `GetOptionsObject`, so a primitive
+                // `options` value throws only after every field has been read.
                 let cal = self.pdt_bag_calendar(h)?;
                 if !tcal::is_iso(&cal) {
+                    let opts = self.pdt_options(options)?;
                     return self.pdt_datetime_from_bag_cal(h, &cal, opts);
                 }
                 let bag = self.pdt_read_bag(h)?;
+                let opts = self.pdt_options(options)?;
                 let overflow = self.pdt_overflow(opts)?;
                 let year = bag
                     .year
@@ -1021,6 +1025,11 @@ impl<'a> Interp<'a> {
         } else {
             self.pdt_to_time(arg)?
         };
+        // `CreateTemporalDateTime`: the combined date+time must be within the valid
+        // ISO range (a boundary date with a different time can fall outside it).
+        if !pdt_in_range(data.date, time) {
+            return Err(self.pdt_range("combined date-time is outside the valid ISO range"));
+        }
         Ok(self.pdt_make_cal(data.date, time, &data.calendar))
     }
 
@@ -1030,7 +1039,28 @@ impl<'a> Interp<'a> {
         if arg.is_undefined() {
             return Err(self.type_error("withCalendar requires a calendar argument"));
         }
-        let cal = self.pdt_validate_calendar(arg)?;
+        // `ToTemporalCalendarSlotValue`: unlike the constructor, `withCalendar`
+        // accepts (via `ParseTemporalCalendarString`) a valid annotated ISO string
+        // whose `[u-ca=…]` annotation supplies the calendar id (default iso8601).
+        let cal = if let Some(c) = self.temporal_object_calendar(arg) {
+            self.pdt_canonicalize_calendar(&c)?
+        } else if let Some(s) = arg
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.string_value(h))
+        {
+            if let Some(c) = tcal::canonicalize_calendar(&s) {
+                String::from(c)
+            } else if let Some(raw) = iso::parse_calendar_string(&s)
+                && let Some(c) = tcal::canonicalize_calendar(&raw)
+            {
+                String::from(c)
+            } else {
+                return Err(self.pdt_range(&alloc::format!("invalid calendar identifier '{s}'")));
+            }
+        } else {
+            return Err(self.type_error("calendar must be a string"));
+        };
         Ok(self.pdt_make_cal(data.date, data.time, &cal))
     }
 
@@ -1053,6 +1083,13 @@ impl<'a> Interp<'a> {
             if let Some(s) = self.realm.string_value(h) {
                 let p = iso::parse_iso_time_string(&s)
                     .ok_or_else(|| self.pdt_range("invalid PlainTime string"))?;
+                // `ParseTemporalTimeString` forbids the UTC designator (`Z`): a
+                // string like "09:00:00Z" is not a valid PlainTime.
+                if p.z {
+                    return Err(
+                        self.pdt_range("a PlainTime string must not carry a UTC designator")
+                    );
+                }
                 return p
                     .time
                     .ok_or_else(|| self.pdt_range("string is missing a time"));
@@ -1301,13 +1338,22 @@ impl<'a> Interp<'a> {
         let mut dur = if largest >= Unit::Day {
             pdt_round_duration(from, to, largest, smallest, increment, mode)
         } else if matches!(smallest, Unit::Year | Unit::Month | Unit::Week) {
-            if is_iso {
+            let rounded = if is_iso {
                 pdt_round_calendar(from, to, largest, smallest, increment, mode)
             } else {
                 pdt_round_calendar_cal(&data.calendar, from, to, largest, smallest, increment, mode)
-            }
+            };
+            rounded.map_err(|()| self.pdt_range("rounded date is outside the valid ISO range"))?
         } else if is_iso {
-            pdt_difference(from, to, largest)
+            // A calendar `largestUnit` with a day/time `smallestUnit`: round the
+            // day+time span (NudgeToDayOrTimeUnit + BubbleRelativeDuration). When no
+            // rounding is required (nanoseconds, increment 1) the raw difference is
+            // already exact.
+            if smallest == Unit::Nanosecond && increment == 1 {
+                pdt_difference(from, to, largest)
+            } else {
+                pdt_round_day_time(from, to, largest, smallest, increment, mode)
+            }
         } else {
             pdt_difference_cal(&data.calendar, from, to, largest)
         };
@@ -1539,6 +1585,8 @@ impl<'a> Interp<'a> {
     }
 
     fn pdt_make_duration(&mut self, dur: DurationFields) -> NanBox {
+        // Duration fields are Numbers: quantize to float64-representable integers.
+        let dur = iso::quantize_duration_fields(dur);
         let data = TemporalData {
             kind: TemporalKind::Duration,
             duration: dur,
@@ -1926,7 +1974,7 @@ fn pdt_round_calendar(
     smallest: Unit,
     increment: i64,
     mode: RoundMode,
-) -> DurationFields {
+) -> Result<DurationFields, ()> {
     let (from_date, from_time) = from;
     let base = pdt_difference(from, to, largest);
     let to_ns = iso::iso_to_epoch_days(to.0) as i128 * iso::NS_PER_DAY + iso::time_to_nanos(to.1);
@@ -1965,7 +2013,7 @@ fn pdt_round_calendar(
         ..Default::default()
     };
     if sign == 0 {
-        return out;
+        return Ok(out);
     }
     let seed = pdt_difference((anchor, from_time), to, smallest);
     let mut r1 = (match smallest {
@@ -1986,6 +2034,18 @@ fn pdt_round_calendar(
         } else {
             break;
         }
+    }
+    // `NudgeToCalendarUnit` projects the ceil (`r2`) increment-multiple endpoint via
+    // `CalendarDateAdd`; a date outside the representable ISO range throws.
+    let inc = increment.max(1);
+    let r2 = (r1 / inc) * inc + inc * sign_i;
+    let (ry, rm, rw) = match smallest {
+        Unit::Year => (r2, 0, 0),
+        Unit::Month => (0, r2, 0),
+        _ => (0, 0, r2),
+    };
+    if iso::add_iso_date(anchor, ry, rm, rw, 0, Overflow::Constrain).is_none() {
+        return Err(());
     }
     let e1 = step_ns(r1);
     let count = if e1 == to_ns {
@@ -2011,6 +2071,50 @@ fn pdt_round_calendar(
         }
         _ => out.weeks = i128::from(count),
     }
+    Ok(out)
+}
+
+/// `RoundRelativeDuration` for a PlainDateTime difference with a calendar
+/// `largestUnit` (year/month/week) but a **day-or-time** `smallestUnit`.
+/// `NudgeToDayOrTimeUnit` rounds the combined whole-day + time-of-day span to the
+/// smallest unit (a rounded-up time carries into the day count), then
+/// `BubbleRelativeDuration` re-expresses the whole-day part in `largestUnit` terms
+/// (so a carried day can cross a month/year boundary). Year boundaries that fall
+/// outside the representable range are never materialised — only the actual end
+/// date is, so a result that stays within a few days of the limit does not throw.
+fn pdt_round_day_time(
+    from: (IsoDate, IsoTime),
+    to: (IsoDate, IsoTime),
+    largest: Unit,
+    smallest: Unit,
+    increment: i64,
+    mode: RoundMode,
+) -> DurationFields {
+    let base = pdt_difference(from, to, largest);
+    // NudgeToDayOrTimeUnit: round (whole days + time-of-day), in nanoseconds, to
+    // the smallest unit; `days * nsPerDay` is already a multiple of any sub-day
+    // unit, so this rounds only the time part and carries into the day count.
+    let total_ns = base.days * iso::NS_PER_DAY + base.time_nanos();
+    let unit = unit_ns(smallest) * i128::from(increment.max(1));
+    let rounded = iso::round_to_increment(total_ns, unit, mode);
+    let new_days = (rounded / iso::NS_PER_DAY) as i64;
+    let rem = rounded % iso::NS_PER_DAY;
+    // BubbleRelativeDuration: the whole-day date part, re-expressed in largestUnit.
+    let end_date = iso::add_iso_date(
+        from.0,
+        base.years as i64,
+        base.months as i64,
+        base.weeks as i64,
+        new_days,
+        Overflow::Constrain,
+    )
+    .unwrap_or(from.0);
+    let (by, bm, bw, bd) = iso::difference_iso_date(from.0, end_date, largest);
+    let mut out = iso::balance_time_duration(rem, Unit::Hour);
+    out.years = i128::from(by);
+    out.months = i128::from(bm);
+    out.weeks = i128::from(bw);
+    out.days = i128::from(bd);
     out
 }
 
@@ -2064,7 +2168,7 @@ fn pdt_round_calendar_cal(
     smallest: Unit,
     increment: i64,
     mode: RoundMode,
-) -> DurationFields {
+) -> Result<DurationFields, ()> {
     let (from_date, from_time) = from;
     let base = pdt_difference_cal(cal, from, to, largest);
     let to_ns = iso::iso_to_epoch_days(to.0) as i128 * iso::NS_PER_DAY + iso::time_to_nanos(to.1);
@@ -2077,20 +2181,27 @@ fn pdt_round_calendar_cal(
         Unit::Month => (base.years, 0),
         _ => (base.years, base.months), // Week
     };
-    // Calendar-aware add relative to a base (Constrain, falling back on error).
+    // Calendar-aware add relative to a base (Constrain); `None` when the result
+    // falls outside the representable ISO range.
+    let cadd_opt = |base: IsoDate, y: i64, m: i64, w: i64| -> Option<IsoDate> {
+        tcal::calendar_date_add(cal, base, y, m, w, 0, Overflow::Constrain).ok()
+    };
     let cadd = |base: IsoDate, y: i64, m: i64, w: i64| -> IsoDate {
-        tcal::calendar_date_add(cal, base, y, m, w, 0, Overflow::Constrain).unwrap_or(base)
+        cadd_opt(base, y, m, w).unwrap_or(base)
     };
     let anchor = cadd(from_date, keep_y as i64, keep_m as i64, 0);
     // Local pseudo-epoch (ns) of `anchor + count smallest-units`, keeping `from`'s
     // wall time.
-    let step_ns = |count: i64| -> i128 {
+    let unit_add = |count: i64| -> Option<IsoDate> {
         let (y, m, w) = match smallest {
             Unit::Year => (count, 0, 0),
             Unit::Month => (0, count, 0),
             _ => (0, 0, count),
         };
-        let nd = cadd(anchor, y, m, w);
+        cadd_opt(anchor, y, m, w)
+    };
+    let step_ns = |count: i64| -> i128 {
+        let nd = unit_add(count).unwrap_or(anchor);
         iso::iso_to_epoch_days(nd) as i128 * iso::NS_PER_DAY + iso::time_to_nanos(from_time)
     };
     let mut out = DurationFields {
@@ -2099,7 +2210,7 @@ fn pdt_round_calendar_cal(
         ..Default::default()
     };
     if sign == 0 {
-        return out;
+        return Ok(out);
     }
     let seed = pdt_difference_cal(cal, (anchor, from_time), to, smallest);
     let mut r1 = (match smallest {
@@ -2121,6 +2232,13 @@ fn pdt_round_calendar_cal(
             break;
         }
     }
+    // `NudgeToCalendarUnit`: the ceil (`r2`) increment-multiple endpoint must be
+    // representable, else a RangeError.
+    let inc = increment.max(1);
+    let r2 = (r1 / inc) * inc + inc * sign_i;
+    if unit_add(r2).is_none() {
+        return Err(());
+    }
     let e1 = step_ns(r1);
     let count = if e1 == to_ns {
         r1
@@ -2136,7 +2254,7 @@ fn pdt_round_calendar_cal(
         Unit::Month => out.months = i128::from(count),
         _ => out.weeks = i128::from(count),
     }
-    out
+    Ok(out)
 }
 
 /// `RoundISODateTime`: rounds the date+time to `smallest` with `increment`.

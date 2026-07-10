@@ -2189,24 +2189,27 @@ impl<'a> Interp<'a> {
             // The instance's `[[Prototype]]` is the *newTarget*'s `.prototype`
             // (the callee's, except under `Reflect.construct(target, args, newTarget)`
             // with a function newTarget), so inherited methods resolve correctly.
+            // `reflect_new_target` is a one-shot: *take* it up front so a nested
+            // construction inside the `prototype` getter (e.g. `throw new Err()`)
+            // does not re-observe this construction's newTarget and recurse.
+            let new_target = self.reflect_new_target.take().unwrap_or(callee);
             let default_proto = self.realm.function_prototype(func_id);
-            let proto = match self.reflect_new_target {
-                Some(nt) if nt.as_handle() != callee.as_handle() => {
-                    // GetPrototypeFromConstructor(newTarget, default): `Get(nt,
-                    // "prototype")` when it is an Object (so a native-constructor,
-                    // class, or proxy newTarget supplies its own prototype), else
-                    // the callee's default.
-                    self.instance_proto_checked(nt, callee, Some(default_proto))?
-                        .unwrap_or(default_proto)
-                }
-                _ => default_proto,
+            let proto = if new_target.as_handle() != callee.as_handle() {
+                // GetPrototypeFromConstructor(newTarget, default): `Get(nt,
+                // "prototype")` when it is an Object (so a native-constructor,
+                // class, or proxy newTarget supplies its own prototype), else
+                // the callee's default.
+                self.instance_proto_checked(new_target, callee, Some(default_proto))?
+                    .unwrap_or(default_proto)
+            } else {
+                default_proto
             };
             let instance = self.realm.new_object_with_proto(Some(proto));
             let this = NanBox::handle(instance.to_raw());
             // Record the constructor for `instanceof` (hidden, GC-traced slot).
             self.realm.set_hidden_property(instance, CTOR_KEY, callee);
             // `new.target` inside the constructor body is the constructor itself.
-            self.pending_new_target = Some(self.reflect_new_target.take().unwrap_or(callee));
+            self.pending_new_target = Some(new_target);
             let ret = self.call_with_this(callee, this, args)?;
             // The constructor return rule: if the body returns an Object, that
             // object is the result; otherwise the freshly-bound `this`. The object
@@ -2282,7 +2285,9 @@ impl<'a> Interp<'a> {
             // dense array to `newTarget.prototype` (default `%Array.prototype%`). A
             // cross-realm `newTarget` with a non-object `.prototype` derives its own
             // realm's `%Array.prototype%` (GetPrototypeFromConstructor step 4).
-            let nt = self.reflect_new_target.unwrap_or(callee);
+            // *Take* the one-shot newTarget so the `prototype` getter's own
+            // constructions do not re-observe (and infinitely recurse on) it.
+            let nt = self.reflect_new_target.take().unwrap_or(callee);
             let default = self.realm.array_proto_intrinsic();
             if nt.as_handle() != callee.as_handle()
                 && let Some(proto) = self.instance_proto_checked(nt, callee, default)?
@@ -2327,18 +2332,13 @@ impl<'a> Interp<'a> {
         };
         // The constructor under which the instance is created (`new.target`): the
         // explicit `Reflect.construct` newTarget, the subclass reached via
-        // `super()`, or — for a plain `new C()` — the callee itself. Consumed (not
+        // `super()`, or — for a plain `new C()` — the callee itself. *Taken* (not
         // peeked) so a `Reflect.construct(NativeCtor, args, NT)` newTarget cannot
-        // leak into a subsequent unrelated construction. The typed-array path reads
-        // `reflect_new_target` directly, so for those ids we leave it in place and
-        // let `link_typed_array_proto` consume the value.
-        let is_typed_array_id =
-            (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16).contains(&id);
-        let native_new_target = if is_typed_array_id {
-            self.reflect_new_target.unwrap_or(callee)
-        } else {
-            self.reflect_new_target.take().unwrap_or(callee)
-        };
+        // leak into a subsequent unrelated construction — including a nested one
+        // triggered *by this construction's own* `prototype` getter (which would
+        // otherwise re-observe `NT` and recurse). The typed-array path threads the
+        // captured value into `typed_newtarget_proto` explicitly.
+        let native_new_target = self.reflect_new_target.take().unwrap_or(callee);
         // The abstract `%TypedArray%` intrinsic cannot be constructed directly.
         if id == N_TYPED_ARRAY_ABSTRACT {
             let m = self.new_str("Abstract class TypedArray not directly constructable");
@@ -3087,7 +3087,7 @@ impl<'a> Interp<'a> {
             {
                 None
             } else {
-                Some(self.typed_newtarget_proto(kind, callee)?)
+                Some(self.typed_newtarget_proto(kind, callee, native_new_target)?)
             };
             // `new T(buffer, byteOffset?, length?)` — a view over an existing ArrayBuffer.
             if let Some(v) = args.first()
@@ -3188,14 +3188,22 @@ impl<'a> Interp<'a> {
             // Otherwise allocate a fresh backing buffer and view it from offset 0.
             // `new T(arrayLike)` copies+coerces the source's elements into the buffer;
             // `new T(length)` / `new T()` zero-fill.
+            //
+            // Only a *typed-array* source is copied directly here
+            // (InitializeTypedArrayFromTypedArray — a per-element read, no iterator).
+            // A plain Array is an ordinary Object with an `@@iterator`, so it must be
+            // drained through that iterator (which the user may have overridden — e.g.
+            // a patched `ArrayIteratorPrototype.next`), handled by the iterable branch
+            // below; it must NOT be short-circuited by a raw element grab.
             let mut src: Option<Vec<NanBox>> = args
                 .first()
                 .copied()
                 .and_then(|v| v.as_handle().map(Handle::from_raw))
+                .filter(|h| self.realm.typed_kind(*h).is_some())
                 .and_then(|h| self.realm.elements_vec(h));
             // InitializeTypedArrayFromArrayLike: a *plain object* with a `length`
-            // property and no `Symbol.iterator` (real arrays / typed arrays / buffers
-            // were already handled above; the iterable path is handled elsewhere).
+            // property and no `Symbol.iterator` (typed arrays / buffers were already
+            // handled above; the iterable path is handled elsewhere).
             // Read `length` (ToLength), then Get each index 0..length in order; the
             // per-element ToNumber / ToBigInt coercion happens on the write below.
             if src.is_none()
@@ -3219,11 +3227,14 @@ impl<'a> Interp<'a> {
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
                 if has_iter {
-                    // InitializeTypedArrayFromList: the source is iterable. Drain
-                    // its iterator (calling `[Symbol.iterator]()` then `.next()`),
-                    // then coerce each value to the element type.
+                    // InitializeTypedArrayFromList: the source is iterable. Get the
+                    // iterator (`GetIteratorFromMethod`: call `[Symbol.iterator]()`)
+                    // then drain it via the *actual* `next` protocol — honoring a
+                    // user-overridden `next` (e.g. a patched
+                    // `%ArrayIteratorPrototype%.next`) — before coercing each value.
                     let bigint = is_bigint_kind(kind);
-                    let values = self.iterate_values(args[0])?;
+                    let iterator = self.call_with_this(iter_fn, args[0], &[])?;
+                    let values = self.drain_iterator_values(iterator)?;
                     let mut elems = Vec::with_capacity(values.len());
                     for v in values {
                         let v = if bigint { v } else { self.coerce_to_number(v)? };
@@ -3276,7 +3287,7 @@ impl<'a> Interp<'a> {
             // (and propagating) a throwing `prototype` accessor before allocation.
             let nt_proto = match nt_proto {
                 Some(p) => p,
-                None => self.typed_newtarget_proto(kind, callee)?,
+                None => self.typed_newtarget_proto(kind, callee, native_new_target)?,
             };
             let buf = self.make_array_buffer(length * elem_size);
             let bytes_h = self.array_buffer_bytes(buf).unwrap();

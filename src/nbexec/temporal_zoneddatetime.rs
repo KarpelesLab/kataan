@@ -1905,6 +1905,8 @@ impl<'a> Interp<'a> {
         if negate {
             dur = negate_duration(dur);
         }
+        // Duration fields are Numbers: quantize to float64-representable integers.
+        let dur = iso::quantize_duration_fields(dur);
         let data2 = TemporalData {
             kind: TemporalKind::Duration,
             duration: dur,

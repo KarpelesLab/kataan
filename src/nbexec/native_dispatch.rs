@@ -1269,6 +1269,53 @@ impl<'a> Interp<'a> {
                     // `this` (an accessor with no setter fails).
                     let mut cur = Some(h);
                     while let Some(c) = cur {
+                        // Integer-indexed exotic `[[Set]]` at a *typed-array* chain
+                        // node `O = c` (10.4.5.5): a canonical numeric index never
+                        // consults an inherited setter and is governed by O's bounds.
+                        //   - SameValue(O, Receiver): TypedArraySetElement — coerce V
+                        //     (side effects run), write only if still a valid index,
+                        //     and always report success.
+                        //   - O ≠ Receiver, *invalid* index: a silent success (no
+                        //     coercion, no write) — the property never reaches the
+                        //     receiver.
+                        //   - O ≠ Receiver, *valid* index: fall through to OrdinarySet,
+                        //     which creates the data property on the *receiver* below.
+                        if self.realm.typed_kind(c).is_some()
+                            && let Some(n) = canonical_numeric_index(&key)
+                        {
+                            let index_ok = n == (n as i64) as f64
+                                && n >= 0.0
+                                && !(n == 0.0 && n.is_sign_negative());
+                            let valid = index_ok
+                                && !self.typed_array_detached(c)
+                                && self
+                                    .realm
+                                    .typed_len(c)
+                                    .is_some_and(|len| (n as usize) < len);
+                            if receiver.as_handle() == Some(c.to_raw()) {
+                                let coerced =
+                                    if self.realm.typed_kind(c).is_some_and(is_bigint_kind) {
+                                        self.coerce_typed_array_write(c, value)?
+                                    } else {
+                                        self.coerce_to_number(value)?
+                                    };
+                                let still_valid = index_ok
+                                    && !self.typed_array_detached(c)
+                                    && self
+                                        .realm
+                                        .typed_len(c)
+                                        .is_some_and(|len| (n as usize) < len);
+                                if still_valid {
+                                    self.guard_view_immutable(c)?;
+                                    self.realm.set_element(c, n as usize, coerced);
+                                }
+                                return Ok(NanBox::boolean(true));
+                            }
+                            if !valid {
+                                return Ok(NanBox::boolean(true));
+                            }
+                            break;
+                        }
                         if let Some((_, setter)) = self.realm.accessor(c, &key) {
                             if matches!(setter.unpack(), Unpacked::Undefined) {
                                 return Ok(NanBox::boolean(false));
@@ -1342,6 +1389,35 @@ impl<'a> Interp<'a> {
                     // fails; otherwise the value is written / a data property is
                     // created on the receiver.
                     if receiver.as_handle() != Some(h.to_raw()) {
+                        // CreateDataProperty(Receiver, P, V) when the receiver is a
+                        // *typed array* and P is a canonical numeric index: the
+                        // receiver's integer-indexed [[DefineOwnProperty]] governs.
+                        // An index that is not a valid integer index for the receiver
+                        // fails the define (returns false) and the value is **not**
+                        // coerced; a valid index coerces and writes.
+                        if self.realm.typed_kind(rh).is_some()
+                            && let Some(rn) = canonical_numeric_index(&key)
+                        {
+                            let r_valid = rn == (rn as i64) as f64
+                                && rn >= 0.0
+                                && !(rn == 0.0 && rn.is_sign_negative())
+                                && !self.typed_array_detached(rh)
+                                && self
+                                    .realm
+                                    .typed_len(rh)
+                                    .is_some_and(|len| (rn as usize) < len);
+                            if !r_valid {
+                                return Ok(NanBox::boolean(false));
+                            }
+                            let coerced = if self.realm.typed_kind(rh).is_some_and(is_bigint_kind) {
+                                self.coerce_typed_array_write(rh, value)?
+                            } else {
+                                self.coerce_to_number(value)?
+                            };
+                            self.guard_view_immutable(rh)?;
+                            self.realm.set_element(rh, rn as usize, coerced);
+                            return Ok(NanBox::boolean(true));
+                        }
                         if self.realm.accessor(rh, &key).is_some() {
                             return Ok(NanBox::boolean(false));
                         }

@@ -1287,6 +1287,33 @@ impl<'a> Interp<'a> {
             (parts.years, parts.months, this_anchor)
         };
 
+        // `NudgeToCalendarUnit` projects the ceil (`r2`) increment-multiple endpoint
+        // via `CalendarDateAdd`; a date outside the representable ISO range throws a
+        // RangeError. `DifferenceTemporalPlainYearMonth` skips rounding entirely when
+        // the smallest unit is month and the increment is 1, so guard only then.
+        if smallest_year || increment != 1 {
+            let inc = increment.max(1);
+            let (unit_total, is_year_unit): (i128, bool) = if smallest_year {
+                (i128::from(years), true)
+            } else {
+                (i128::from(years) * 12 + i128::from(months), false)
+            };
+            let sign = unit_total.signum();
+            if sign != 0 {
+                let r2 = ((unit_total / inc) * inc + inc * sign) as i64;
+                let (ay, am) = if is_year_unit { (r2, 0) } else { (0, r2) };
+                let ok = if tcal::is_iso(&cal) {
+                    temporal_iso::add_iso_date(cal_ref, ay, am, 0, 0, Overflow::Constrain).is_some()
+                } else {
+                    tcal::calendar_date_add(&cal, cal_ref, ay, am, 0, 0, Overflow::Constrain)
+                        .is_ok()
+                };
+                if !ok {
+                    return Err(self.pym_range("rounded date is outside the valid ISO range"));
+                }
+            }
+        }
+
         let mode = parse_round_mode(&mode_s);
         let mode = if since { negate_round_mode(mode) } else { mode };
         let (mut ry, mut rm) = if tcal::is_iso(&cal) {
