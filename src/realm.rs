@@ -1991,6 +1991,38 @@ impl Realm {
         false
     }
 
+    /// Swaps *all* per-handle state between `a` and `b` — the heap cell plus every
+    /// handle-keyed side table (named props of non-object cells, native prototype,
+    /// class tag, array frozen/sealed/extensible/length flags, length-tracking
+    /// view flag). After the call `a` is, in every observable respect, what `b`
+    /// was and vice-versa, while both handle *identities* are preserved.
+    ///
+    /// This is how a class that `extends` a cell-bearing native (`Map`/`Set`/
+    /// `Date`/`Array`/typed array/`RegExp`/wrapper/…) is initialized: the derived
+    /// instance starts as a placeholder ordinary object threaded as `this`, and
+    /// when `super(...)` runs the real native cell is constructed *from the
+    /// `super` arguments* (with `new.target` for its prototype) and transplanted
+    /// into the placeholder handle — so the `super(...)` arguments (not the
+    /// derived constructor's outer arguments) seed the native, and the shared
+    /// `this` handle keeps its identity.
+    pub fn swap_cell_state(&mut self, a: Handle, b: Handle) {
+        if a.to_raw() == b.to_raw() {
+            return;
+        }
+        self.heap.swap(a, b);
+        let (ka, kb) = (a.to_raw(), b.to_raw());
+        swap_map_entry(&mut self.aux_props, ka, kb);
+        swap_map_entry(&mut self.native_protos, ka, kb);
+        swap_map_entry(&mut self.native_class_tags, ka, kb);
+        swap_map_entry(&mut self.sparse_array_lengths, ka, kb);
+        swap_set_entry(&mut self.frozen_arrays, ka, kb);
+        swap_set_entry(&mut self.sealed_arrays, ka, kb);
+        swap_set_entry(&mut self.non_extensible_arrays, ka, kb);
+        swap_set_entry(&mut self.length_tracking_views, ka, kb);
+        swap_set_entry(&mut self.nonwritable_array_lengths, ka, kb);
+        swap_set_entry(&mut self.callable_null_protos, ka, kb);
+    }
+
     /// The cached `.prototype` object of the `Intl` service constructor with native
     /// dispatch id `ctor_id`, if it has been materialized.
     #[must_use]
@@ -4683,6 +4715,38 @@ pub fn parse_date_string(s: &str) -> Option<f64> {
         return Some(ms);
     }
     parse_human_date(s)
+}
+
+/// Swaps the entries for keys `a` and `b` in a handle-keyed map (either both
+/// present, one present, or neither — the two keys exchange whatever value each
+/// held). Helper for [`Realm::swap_cell_state`].
+fn swap_map_entry<V>(map: &mut alloc::collections::BTreeMap<u64, V>, a: u64, b: u64) {
+    let va = map.remove(&a);
+    let vb = map.remove(&b);
+    if let Some(v) = vb {
+        map.insert(a, v);
+    }
+    if let Some(v) = va {
+        map.insert(b, v);
+    }
+}
+
+/// Swaps membership of keys `a` and `b` in a handle-keyed set. Helper for
+/// [`Realm::swap_cell_state`].
+fn swap_set_entry(set: &mut alloc::collections::BTreeSet<u64>, a: u64, b: u64) {
+    let ha = set.contains(&a);
+    let hb = set.contains(&b);
+    if ha == hb {
+        return;
+    }
+    // Exactly one held membership → move it to the other key.
+    if ha {
+        set.remove(&a);
+        set.insert(b);
+    } else {
+        set.remove(&b);
+        set.insert(a);
+    }
 }
 
 /// Parses the engine's `toString`/`toUTCString`/`toDateString` output:

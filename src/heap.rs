@@ -235,6 +235,43 @@ impl<T> Heap<T> {
         }
     }
 
+    /// Swaps the *values* held by two live handles, leaving each slot's identity
+    /// (generation/age) — and therefore each handle's validity — intact. After
+    /// the swap `a` refers to what `b` held and vice-versa. No-op if either
+    /// handle is stale or they alias the same slot. Used to transplant a
+    /// freshly-built native cell into a placeholder instance handle (a class that
+    /// `extends` a native builds the real cell from the `super(...)` arguments,
+    /// then moves it into the already-threaded `this` handle).
+    pub fn swap(&mut self, a: Handle, b: Handle) {
+        if a.index == b.index {
+            return;
+        }
+        let (i, j) = (a.index as usize, b.index as usize);
+        if i >= self.slots.len() || j >= self.slots.len() {
+            return;
+        }
+        let (lo, hi) = if i < j { (i, j) } else { (j, i) };
+        let (left, right) = self.slots.split_at_mut(hi);
+        let (sa, sb) = (&mut left[lo], &mut right[0]);
+        if let (
+            Slot::Occupied {
+                generation: ga,
+                value: va,
+                ..
+            },
+            Slot::Occupied {
+                generation: gb,
+                value: vb,
+                ..
+            },
+        ) = (sa, sb)
+            && *ga == a.generation
+            && *gb == b.generation
+        {
+            core::mem::swap(va, vb);
+        }
+    }
+
     /// Whether `handle` still refers to a live object.
     #[must_use]
     pub fn is_live(&self, handle: Handle) -> bool {

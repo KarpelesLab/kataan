@@ -642,30 +642,28 @@ impl<'a> Interp<'a> {
         // derived-over-base.
         let proto = self.class_prototype_by_id(class_id);
 
-        // A class extending a *cell-bearing* native (Map/Set/typed array/Date/
-        // RegExp/wrapper/ArrayBuffer/DataView/Array) must produce a real native
-        // instance (with the native internal slots), not a plain object. The base
-        // native constructor builds it with `newTarget` = this class, so its
-        // `[[Prototype]]` is the class prototype and the existing per-id
-        // construction (storage, seeding, length, …) runs exactly once. (The
-        // implicit/explicit `super(...)` for such a class is then a no-op — the
-        // cell already exists; see `run_constructor`.)
+        // The instance always starts as an ordinary object. For a class extending
+        // a *cell-bearing* native (Map/Set/typed array/Date/RegExp/wrapper/
+        // ArrayBuffer/DataView/Array) this is a *placeholder*: when `super(...)`
+        // runs, the real native cell is built **from the `super` arguments** (with
+        // `new.target` for its prototype) and transplanted into this handle by
+        // `apply_native_super` — so the native is seeded by the arguments actually
+        // passed to `super(...)`, not the derived constructor's outer arguments,
+        // while the shared `this` handle keeps its identity. (Deferring to
+        // `super()` also means the native constructor is never run with the wrong
+        // — outer — arguments, so its side effects and any validation happen once,
+        // on the correct arguments.)
         let class_handle = self.class_handles[class_id as usize];
-        let native_root = chain
-            .iter()
-            .find_map(|(cid, _)| self.class_native_super[*cid as usize])
-            .filter(|id| Self::native_base_is_cell(*id));
-        let instance = if let Some(root_id) = native_root {
-            // The base constructor links the cell to `class_handle.prototype` (which
-            // is `proto`, the class prototype) via the `newTarget` path.
-            self.construct_native_base(root_id, args, class_handle)?
-        } else {
+        let instance = {
             let obj = self.realm.new_object();
             // GetPrototypeFromConstructor(newTarget, "%Object.prototype%"): the
             // instance's [[Prototype]] is `newTarget.prototype` when it is an
             // object. For a plain `new C()` newTarget is `C` (so this is the class
             // prototype), but `Reflect.construct(C, args, D)` — or a proxy whose
             // target is `C` with a distinct newTarget — supplies `D.prototype`.
+            // (For a cell-native base this placeholder prototype is superseded by
+            // the transplanted native cell's prototype, which is derived from the
+            // same `new.target`.)
             let inst_proto = self
                 .new_target_instance_proto(class_handle)?
                 .unwrap_or(proto);

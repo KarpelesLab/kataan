@@ -3516,6 +3516,24 @@ impl<'a> Interp<'a> {
         instance: Handle,
         args: &[NanBox],
     ) -> Result<(), ExecError> {
+        // A *cell-bearing* native base (Map/Set/typed array/Date/RegExp/wrapper/
+        // ArrayBuffer/DataView/Array/Temporal): `instance` is the placeholder
+        // ordinary object threaded as `this`. Build the real native cell **from
+        // the `super(...)` arguments** with `new.target` for its prototype
+        // (`GetPrototypeFromConstructor`), then transplant it into `instance` so
+        // the shared `this` handle becomes that native — seeded by the arguments
+        // actually passed to `super(...)`, not the derived constructor's outer
+        // arguments. The instance's own class tag (set at allocation) is
+        // re-applied after the transplant since the fresh cell carries none.
+        if Self::native_base_is_cell(native_id) {
+            let saved_tag = self.realm.class_tag(instance);
+            let fresh = self.construct_native_base(native_id, args, self.new_target)?;
+            self.realm.swap_cell_state(instance, fresh);
+            if let Some(tag) = saved_tag {
+                self.realm.set_class_tag(instance, tag);
+            }
+            return Ok(());
+        }
         // `class S extends DisposableStack {}` (or the async variant): `super()`
         // stamps the internal-slot brand + an empty disposer list and
         // `disposed = false` onto the (already-allocated, class-proto-linked)
