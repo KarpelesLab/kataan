@@ -12,6 +12,7 @@
 
 use super::*;
 use crate::temporal_iso::TemporalKind;
+use alloc::string::String;
 
 // --- Native-id block (1200+, well clear of the existing ~912 ceiling) --------
 // One constructor id per type (needed for is_native_constructor, construct
@@ -72,7 +73,16 @@ fn ctor_len(kind: TemporalKind) -> u32 {
 }
 
 /// The `.length` of a prototype method by name (spec required-arg count; default 0).
-fn method_len(name: &str) -> u32 {
+fn method_len(kind: TemporalKind, name: &str) -> u32 {
+    // `toPlainDate` takes a required `item` on the calendar-only types
+    // (`PlainMonthDay`/`PlainYearMonth`), but is nullary on `PlainDateTime`/
+    // `ZonedDateTime` (it just drops the time/zone).
+    if name == "toPlainDate" {
+        return match kind {
+            TemporalKind::PlainMonthDay | TemporalKind::PlainYearMonth => 1,
+            _ => 0,
+        };
+    }
     match name {
         "with"
         | "add"
@@ -83,9 +93,8 @@ fn method_len(name: &str) -> u32 {
         | "total"
         | "equals"
         | "toZonedDateTime"
-        | "withPlainTime"
+        | "toZonedDateTimeISO"
         | "withCalendar"
-        | "toPlainDate"
         | "withTimeZone"
         | "getTimeZoneTransition" => 1,
         _ => 0,
@@ -173,7 +182,7 @@ impl<'a> Interp<'a> {
             for &m in methods {
                 let name_h = self.realm.new_string(m);
                 let f = self.realm.new_bound_native(N_TEMPORAL_PROTO_FN, name_h);
-                self.install_fn_name_length(f, m, method_len(m));
+                self.install_fn_name_length(f, m, method_len(kind, m));
                 self.realm
                     .set_property(proto, m, NanBox::handle(f.to_raw()));
                 self.realm.mark_hidden(proto, m);
@@ -392,28 +401,27 @@ impl<'a> Interp<'a> {
         if matches!(arg.unpack(), Unpacked::Undefined) {
             return Ok(alloc::string::String::from("UTC"));
         }
-        // A string time-zone id, or an object with a `timeZone`/`id`.
-        let s = if self.is_object_value(arg) {
-            let h = arg.as_handle().map(Handle::from_raw).unwrap();
-            let tzv = self
-                .realm
-                .get_property(h, "timeZone")
-                .unwrap_or(NanBox::undefined());
-            self.coerce_to_string(if matches!(tzv.unpack(), Unpacked::Undefined) {
-                arg
-            } else {
-                tzv
-            })?
-        } else {
-            self.coerce_to_string(arg)?
-        };
-        // Accept UTC, a fixed offset, or a known IANA name.
-        if self.temporal_tz_offset_ns(&s, 0).is_some() {
-            Ok(s)
-        } else {
-            let m = self.new_str(&alloc::format!("invalid time zone: {s}"));
-            Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))))
+        // `ToTemporalTimeZoneIdentifier`: an Object is only accepted when it is a
+        // `Temporal.ZonedDateTime` (its `[[TimeZone]]` is used); any other object
+        // or non-string primitive is a TypeError. A String is parsed as a bare
+        // identifier or a datetime string carrying a `[TimeZone]`/`Z`/offset.
+        if self.is_object_value(arg) {
+            if let Some(h) = arg.as_handle().map(Handle::from_raw)
+                && let Some(d) = self.realm.temporal_at(h)
+                && d.kind == TemporalKind::ZonedDateTime
+            {
+                return Ok(d.tz.clone().unwrap_or_else(|| String::from("UTC")));
+            }
+            return Err(self.type_error("time zone must be a string or Temporal.ZonedDateTime"));
         }
+        let Some(s) = arg
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.string_value(h))
+        else {
+            return Err(self.type_error("time zone must be a string"));
+        };
+        self.tz_from_string(&s)
     }
 
     /// The offset (in nanoseconds east of UTC) for time-zone id `tz` at

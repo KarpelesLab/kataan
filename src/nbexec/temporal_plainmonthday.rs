@@ -468,6 +468,11 @@ impl<'a> Interp<'a> {
             return Err(self.type_error("PlainMonthDay.with: argument must be an object"));
         }
         let h = Handle::from_raw(fields.as_handle().unwrap());
+        // `IsPartialTemporalObject`: a Temporal-branded object (PlainDate,
+        // ZonedDateTime, …) is not a partial property bag → TypeError.
+        if self.realm.temporal_at(h).is_some() {
+            return Err(self.type_error("PlainMonthDay.with: argument must be a plain object"));
+        }
         // Reject a bag that carries a calendar or timeZone.
         for key in ["calendar", "timeZone"] {
             let v = self.read_member(h, key)?;
@@ -637,7 +642,9 @@ fn arg_or_undef(args: &[NanBox], i: usize) -> NanBox {
 /// Whether `date` is within the ISO plain-date range (noon-based bounds, no
 /// time-of-day slop): `epoch_days ∈ [MIN_EPOCH_DAYS, MAX_EPOCH_DAYS]`.
 fn pmd_date_in_range(date: IsoDate) -> bool {
-    (MIN_EPOCH_DAYS..=MAX_EPOCH_DAYS).contains(&iso_to_epoch_days(date))
+    // `ISODateWithinLimits`: a `PlainDate` may sit one day below the minimum
+    // instant date (to leave room for a time-of-day), i.e. `[MIN-1, MAX]`.
+    (MIN_EPOCH_DAYS - 1..=MAX_EPOCH_DAYS).contains(&iso_to_epoch_days(date))
 }
 
 /// Clamps a leap-second `:60` to `:59` (the time is irrelevant to a MonthDay,

@@ -11,9 +11,9 @@ use super::*;
 #[cfg(not(feature = "std"))]
 use crate::common::FloatExt;
 use crate::temporal_iso::{
-    self, IsoDate, Overflow, RoundMode, TemporalData, TemporalKind, format_iso_year, is_leap_year,
-    iso_date_in_range, iso_days_in_month, iso_days_in_year, pad, regulate_iso_date,
-    round_to_increment,
+    self, IsoDate, MAX_EPOCH_DAYS, MIN_EPOCH_DAYS, Overflow, RoundMode, TemporalData, TemporalKind,
+    format_iso_year, is_leap_year, iso_date_in_range, iso_days_in_month, iso_days_in_year, pad,
+    regulate_iso_date, round_to_increment,
 };
 
 /// Prototype method names installed on `Temporal.PlainYearMonth.prototype`.
@@ -542,15 +542,29 @@ impl<'a> Interp<'a> {
 
     /// Reads and coerces the year/month/monthCode fields off a property bag in
     /// spec order (calendar, month, monthCode, year).
-    fn read_year_month_fields(&mut self, h: Handle) -> Result<YearMonthFields, ExecError> {
-        let cal = self.pym_get(h, "calendar")?;
-        self.calendar_identifier(cal)?;
+    fn read_year_month_fields(
+        &mut self,
+        h: Handle,
+        read_calendar: bool,
+    ) -> Result<YearMonthFields, ExecError> {
+        // `with` reads (and rejects) the calendar in its own preceding step, so it
+        // must not be read again here (observable order).
+        if read_calendar {
+            let cal = self.pym_get(h, "calendar")?;
+            self.calendar_identifier(cal)?;
+        }
 
         let month_v = self.pym_get(h, "month")?;
         let month = if Self::is_undef(month_v) {
             None
         } else {
-            Some(self.pym_to_integer(month_v)?)
+            // `month` is a `ToPositiveIntegerWithTruncation`: a non-positive value
+            // is a RangeError (thrown while reading fields, before options).
+            let m = self.pym_to_integer(month_v)?;
+            if m < 1 {
+                return Err(self.pym_range("PlainYearMonth: month must be positive"));
+            }
+            Some(m)
         };
 
         let mc_v = self.pym_get(h, "monthCode")?;
@@ -591,7 +605,7 @@ impl<'a> Interp<'a> {
                 self.pym_overflow(opts)?;
                 return Ok(data.date);
             }
-            let (year, month, mc) = self.read_year_month_fields(h)?;
+            let (year, month, mc) = self.read_year_month_fields(h, true)?;
             let opts = self.pym_options(options)?;
             let overflow = self.pym_overflow(opts)?;
             return self.resolve_year_month(year, month, mc, overflow);
@@ -772,7 +786,11 @@ impl<'a> Interp<'a> {
             return Err(self.type_error("PlainYearMonth.with: argument must be an object"));
         }
         let h = arg.as_handle().map(Handle::from_raw).unwrap();
-        // RejectObjectWithCalendarOrTimeZone.
+        // `IsPartialTemporalObject`: a Temporal-branded object is not a partial bag.
+        if self.realm.temporal_at(h).is_some() {
+            return Err(self.type_error("PlainYearMonth.with: argument must be a plain object"));
+        }
+        // RejectObjectWithCalendarOrTimeZone (calendar/timeZone read here, once).
         let cal = self.pym_get(h, "calendar")?;
         if !Self::is_undef(cal) {
             return Err(self.type_error("PlainYearMonth.with: unexpected calendar field"));
@@ -781,7 +799,11 @@ impl<'a> Interp<'a> {
         if !Self::is_undef(tz) {
             return Err(self.type_error("PlainYearMonth.with: unexpected timeZone field"));
         }
-        let (in_year, in_month, in_mc) = self.read_year_month_fields(h)?;
+        let (in_year, in_month, in_mc) = self.read_year_month_fields(h, false)?;
+        // At least one recognised field is required (`IsPartialTemporalObject`).
+        if in_year.is_none() && in_month.is_none() && in_mc.is_none() {
+            return Err(self.type_error("PlainYearMonth.with: no recognised fields"));
+        }
         let opts = self.pym_options(options)?;
         let overflow = self.pym_overflow(opts)?;
 
@@ -1004,7 +1026,10 @@ impl<'a> Interp<'a> {
         ) else {
             return Err(self.pym_range("PlainYearMonth.toPlainDate: invalid date"));
         };
-        if !iso_date_in_range(date) {
+        // `ISODateWithinLimits` for a *PlainDate*: epoch days in `[MIN-1, MAX]`
+        // (unlike `iso_date_in_range`, a PlainDate may not sit one day past MAX).
+        let ed = crate::temporal_iso::iso_to_epoch_days(date);
+        if !(MIN_EPOCH_DAYS - 1..=MAX_EPOCH_DAYS).contains(&ed) {
             return Err(self.pym_range("PlainYearMonth.toPlainDate: date out of range"));
         }
         Ok(self.new_plain_date(date))

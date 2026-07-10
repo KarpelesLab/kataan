@@ -920,7 +920,10 @@ impl<'a> Interp<'a> {
             Some(s) => parse_unit(&s).unwrap_or(Unit::Nanosecond),
             None => Unit::Nanosecond,
         };
-        let largest = match self.pdt_str_option(opts, "largestUnit", &units)? {
+        // `largestUnit` additionally accepts `"auto"` (→ the default).
+        let mut units_auto = units.to_vec();
+        units_auto.push("auto");
+        let largest = match self.pdt_str_option(opts, "largestUnit", &units_auto)? {
             Some(s) if s != "auto" => parse_unit(&s).unwrap_or(Unit::Day),
             _ => Unit::Day.min(smallest),
         };
@@ -928,14 +931,22 @@ impl<'a> Interp<'a> {
             return Err(self.pdt_range("largestUnit must be at least as large as smallestUnit"));
         }
         let increment = self.pdt_rounding_increment(opts)?;
+        // ValidateTemporalRoundingIncrement (non-inclusive) for time smallestUnits.
+        if smallest >= Unit::Hour {
+            self.pdt_validate_increment(smallest, increment)?;
+        }
         let mode = self.pdt_rounding_mode(opts, RoundMode::Trunc)?;
 
         let from = (data.date, data.time);
         let to = (d2, t2);
-        // The time-only path (no year/month component) supports rounding; the
-        // calendar path is emitted unrounded.
+        // Day-or-finer largestUnit → pure time/day rounding; a calendar
+        // smallestUnit (year/month/week) uses calendar-relative rounding
+        // (NudgeToCalendarUnit); a coarser-largest with a day/time smallestUnit is
+        // emitted with the calendar part unrounded.
         let mut dur = if largest >= Unit::Day {
             pdt_round_duration(from, to, largest, smallest, increment, mode)
+        } else if matches!(smallest, Unit::Year | Unit::Month | Unit::Week) {
+            pdt_round_calendar(from, to, largest, smallest, increment, mode)
         } else {
             pdt_difference(from, to, largest)
         };
@@ -1508,6 +1519,90 @@ fn pdt_round_duration(
     let inc = unit_ns(smallest) * i128::from(increment.max(1));
     let rounded = iso::round_to_increment(total, inc, mode);
     pdt_balance_datetime(rounded, largest)
+}
+
+/// `RoundDuration` for a date+time difference rounded to a calendar
+/// `smallestUnit` (Year/Month/Week). Keeps the components coarser than
+/// `smallest`, then rounds the `smallest` count measured against the *local
+/// nanosecond* span of one increment step (so time-of-day is folded into the
+/// fraction), per `NudgeToCalendarUnit`.
+fn pdt_round_calendar(
+    from: (IsoDate, IsoTime),
+    to: (IsoDate, IsoTime),
+    largest: Unit,
+    smallest: Unit,
+    increment: i64,
+    mode: RoundMode,
+) -> DurationFields {
+    let (from_date, from_time) = from;
+    let base = pdt_difference(from, to, largest);
+    let to_ns = iso::iso_to_epoch_days(to.0) as i128 * iso::NS_PER_DAY + iso::time_to_nanos(to.1);
+    let from_ns =
+        iso::iso_to_epoch_days(from_date) as i128 * iso::NS_PER_DAY + iso::time_to_nanos(from_time);
+    let sign = (to_ns - from_ns).signum();
+    let sign_i = sign as i64;
+    let (keep_y, keep_m) = match smallest {
+        Unit::Year => (0, 0),
+        Unit::Month => (base.years, 0),
+        _ => (base.years, base.months), // Week
+    };
+    let anchor = iso::add_iso_date(from_date, keep_y, keep_m, 0, 0, Overflow::Constrain)
+        .unwrap_or(from_date);
+    // Local pseudo-epoch (ns) of `anchor + count smallest-units`, keeping `from`'s
+    // wall time.
+    let step_ns = |count: i64| -> i128 {
+        let (y, m, w) = match smallest {
+            Unit::Year => (count, 0, 0),
+            Unit::Month => (0, count, 0),
+            _ => (0, 0, count),
+        };
+        let nd = iso::add_iso_date(anchor, y, m, w, 0, Overflow::Constrain).unwrap_or(anchor);
+        iso::iso_to_epoch_days(nd) as i128 * iso::NS_PER_DAY + iso::time_to_nanos(from_time)
+    };
+    let mut out = DurationFields {
+        years: keep_y,
+        months: keep_m,
+        ..Default::default()
+    };
+    if sign == 0 {
+        return out;
+    }
+    let seed = pdt_difference((anchor, from_time), to, smallest);
+    let mut r1 = match smallest {
+        Unit::Year => seed.years,
+        Unit::Month => seed.months,
+        _ => seed.weeks,
+    };
+    let beyond = |e: i128| if sign > 0 { e > to_ns } else { e < to_ns };
+    for _ in 0..14 {
+        if beyond(step_ns(r1 + sign_i)) {
+            break;
+        }
+        r1 += sign_i;
+    }
+    for _ in 0..14 {
+        if beyond(step_ns(r1)) {
+            r1 -= sign_i;
+        } else {
+            break;
+        }
+    }
+    let e1 = step_ns(r1);
+    let count = if e1 == to_ns {
+        r1
+    } else {
+        let e2 = step_ns(r1 + sign_i);
+        let den = (e2 - e1).abs().max(1);
+        let num = (to_ns - e1).abs();
+        let x = i128::from(r1) * den + sign * num;
+        (iso::round_to_increment(x, i128::from(increment.max(1)) * den, mode) / den) as i64
+    };
+    match smallest {
+        Unit::Year => out.years = count,
+        Unit::Month => out.months = count,
+        _ => out.weeks = count,
+    }
+    out
 }
 
 /// `RoundISODateTime`: rounds the date+time to `smallest` with `increment`.

@@ -485,8 +485,9 @@ impl<'a> Interp<'a> {
             return Err(self.type_error("time zone must be a string"));
         };
         let tz = self.parse_tz_identifier(&tzs)?;
-        // calendar: undefined → iso8601; else must be a String naming iso8601.
-        self.zdt_calendar_arg(arg(2))?;
+        // calendar: undefined → iso8601; else must be a String naming a bare
+        // calendar id (CanonicalizeCalendar — an ISO date string is NOT accepted).
+        self.zdt_calendar_arg(arg(2), false)?;
         let data = TemporalData {
             kind: TemporalKind::ZonedDateTime,
             epoch_ns: epoch,
@@ -512,7 +513,7 @@ impl<'a> Interp<'a> {
 
     /// `ToTemporalTimeZoneIdentifier` from a string: a bare identifier, or a
     /// datetime string carrying a `[TimeZone]` annotation.
-    fn tz_from_string(&mut self, s: &str) -> Result<String, ExecError> {
+    pub(crate) fn tz_from_string(&mut self, s: &str) -> Result<String, ExecError> {
         if s.is_empty() {
             return Err(self.zdt_range("invalid time zone"));
         }
@@ -545,8 +546,12 @@ impl<'a> Interp<'a> {
         Err(self.zdt_range("invalid time zone"))
     }
 
-    /// Validates a constructor/`withCalendar` calendar argument.
-    fn zdt_calendar_arg(&mut self, v: NanBox) -> Result<(), ExecError> {
+    /// Validates a constructor/`withCalendar` calendar argument. When
+    /// `allow_iso_string` is set (`withCalendar` → `ToTemporalCalendarIdentifier`
+    /// → `ParseTemporalCalendarString`) a valid ISO date/time/datetime string is
+    /// accepted and its `[u-ca=…]` annotation used; when clear (the constructor →
+    /// `CanonicalizeCalendar`) only a bare calendar identifier is accepted.
+    fn zdt_calendar_arg(&mut self, v: NanBox, allow_iso_string: bool) -> Result<(), ExecError> {
         if v.is_undefined() {
             return Ok(());
         }
@@ -564,7 +569,7 @@ impl<'a> Interp<'a> {
         else {
             return Err(self.type_error("calendar must be a string"));
         };
-        if calendar_string_ok(&s) {
+        if zdt_calendar_string_valid(&s, allow_iso_string) {
             Ok(())
         } else {
             Err(self.zdt_range("only the iso8601 calendar is supported"))
@@ -683,7 +688,7 @@ impl<'a> Interp<'a> {
                 if arg(0).is_undefined() {
                     return Err(self.type_error("withCalendar requires a calendar argument"));
                 }
-                self.zdt_calendar_arg(arg(0))?;
+                self.zdt_calendar_arg(arg(0), true)?;
                 Ok(self.make_zdt(data.epoch_ns, self.zdt_tz(data)))
             }
             "add" => self.zdt_add(data, arg(0), arg(1), 1),
@@ -1512,6 +1517,12 @@ impl<'a> Interp<'a> {
         if largest > smallest {
             return Err(self.zdt_range("largestUnit must be at least as large as smallestUnit"));
         }
+        // ValidateTemporalRoundingIncrement (non-inclusive) for time smallestUnits:
+        // the increment must divide evenly into, and be smaller than, the next
+        // coarser unit (e.g. 11h or 24h are invalid; 29min is invalid).
+        if smallest >= Unit::Hour {
+            self.zdt_validate_increment(smallest, increment)?;
+        }
 
         let mut dur = if largest >= Unit::Day {
             // Time-only difference (exact nanoseconds), with sign-aware rounding.
@@ -1790,24 +1801,35 @@ impl<'a> Interp<'a> {
             .zdt_str_option(opts, "offset", &["auto", "never"])?
             .unwrap_or_else(|| String::from("auto"));
         let mode = self.zdt_rounding_mode(opts, RoundMode::Trunc)?;
-        let time_units = [
-            "minute",
-            "minutes",
-            "second",
-            "seconds",
-            "millisecond",
-            "milliseconds",
-            "microsecond",
-            "microseconds",
-            "nanosecond",
-            "nanoseconds",
-        ];
-        let smallest = self
-            .zdt_str_option(opts, "smallestUnit", &time_units)?
-            .map(|s| parse_unit(&s).unwrap_or(Unit::Nanosecond));
+        // smallestUnit is READ (coerced to a raw string, accepting any unit name)
+        // before timeZoneName; whether it is a time unit is validated only after
+        // every option has been read (all options are read before validation).
+        let smallest_raw = match opts {
+            Some(h) => {
+                let v = self.read_member(h, "smallestUnit")?;
+                if v.is_undefined() {
+                    None
+                } else {
+                    Some(self.coerce_to_string(v)?)
+                }
+            }
+            None => None,
+        };
         let tzname = self
             .zdt_str_option(opts, "timeZoneName", &["auto", "never", "critical"])?
             .unwrap_or_else(|| String::from("auto"));
+        let smallest = match smallest_raw {
+            None => None,
+            Some(s) => {
+                let u = parse_unit(&s).ok_or_else(|| self.zdt_range("invalid smallestUnit"))?;
+                // toString allows only minute..nanosecond (hour and coarser are
+                // date/too-coarse units here).
+                if u <= Unit::Hour {
+                    return Err(self.zdt_range("smallestUnit must be minute..nanosecond"));
+                }
+                Some(u)
+            }
+        };
 
         let (inc_ns, seconds_shown, precision): (i128, bool, Option<u8>) = match smallest {
             Some(Unit::Minute) => (iso::NS_PER_MINUTE, false, None),
@@ -1925,6 +1947,36 @@ fn dt_offset_subminute(s: &str) -> bool {
 /// Whether a property-bag `calendar` string names the ISO calendar: the bare
 /// identifier `"iso8601"` or a date-ish ISO string whose every `u-ca=` annotation
 /// is `iso8601`.
+/// Validates a calendar identifier supplied as a *string*. A bare `iso8601`
+/// (case-insensitive) is always accepted. When `allow_iso_string` is set, a valid
+/// ISO date / time / datetime string is also accepted (its `[u-ca=…]` annotation,
+/// which must be `iso8601`, is used) — this is the `ParseTemporalCalendarString`
+/// path used by `withCalendar`. When clear, only the bare identifier is accepted
+/// (the constructor's `CanonicalizeCalendar`).
+fn zdt_calendar_string_valid(s: &str, allow_iso_string: bool) -> bool {
+    if s.eq_ignore_ascii_case("iso8601") {
+        return true;
+    }
+    if !allow_iso_string {
+        return false;
+    }
+    // A bare date string with a calendar annotation is handled by
+    // `calendar_string_ok`; a time / datetime string is handled by the ISO
+    // parsers. In every case the extracted calendar annotation must be iso8601.
+    if calendar_string_ok(s) {
+        return true;
+    }
+    if let Some(p) =
+        iso::parse_iso_datetime(s).or_else(|| crate::temporal_iso::parse_iso_time_string(s))
+    {
+        return p
+            .calendar
+            .as_deref()
+            .is_none_or(|c| c.eq_ignore_ascii_case("iso8601"));
+    }
+    false
+}
+
 fn calendar_string_ok(s: &str) -> bool {
     if s.eq_ignore_ascii_case("iso8601") {
         return true;

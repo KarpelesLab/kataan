@@ -1308,12 +1308,15 @@ impl<'a> Interp<'a> {
             Some(self.dur_parse_month_code(&s)?)
         };
         let nanosecond = self.dur_bag_field(h, "nanosecond")?.unwrap_or(0);
-        // offset (validated for format only)
+        // offset (validated for format only): read, then `ToPrimitive(string)`
+        // which must yield a String (per ToRelativeTemporalObject / the offset
+        // field's ToOffsetString) — an object with a `toString` is accepted.
         let offset_v = self.read_member(h, "offset")?;
         let offset_ns = if offset_v.is_undefined() {
             None
         } else {
-            let Some(s) = offset_v
+            let prim = self.coerce_primitive(offset_v, "string")?;
+            let Some(s) = prim
                 .as_handle()
                 .map(Handle::from_raw)
                 .and_then(|oh| self.realm.string_value(oh))

@@ -611,8 +611,14 @@ pub fn round_to_increment(x: i128, increment: i128, mode: RoundMode) -> i128 {
     let pick_upper = match mode {
         RoundMode::Ceil | RoundMode::Expand => true,
         RoundMode::Floor | RoundMode::Trunc => false,
-        RoundMode::HalfCeil | RoundMode::HalfExpand => 2 * r >= increment,
-        RoundMode::HalfFloor | RoundMode::HalfTrunc => 2 * r > increment,
+        // HalfCeil/HalfFloor are absolute-direction (toward ±∞); HalfExpand
+        // (away from zero) and HalfTrunc (toward zero) are sign-sensitive on a
+        // tie — `upper` sits toward +∞, so for a negative `x` "away from zero"
+        // means `lower` and "toward zero" means `upper`.
+        RoundMode::HalfCeil => 2 * r >= increment,
+        RoundMode::HalfFloor => 2 * r > increment,
+        RoundMode::HalfExpand => 2 * r > increment || (2 * r == increment && x >= 0),
+        RoundMode::HalfTrunc => 2 * r > increment || (2 * r == increment && x < 0),
         RoundMode::HalfEven => {
             if 2 * r == increment {
                 (q % 2) != 0

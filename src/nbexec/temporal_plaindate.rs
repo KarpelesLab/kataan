@@ -126,7 +126,29 @@ impl<'a> Interp<'a> {
                 // `date.toZonedDateTime(timeZone | { timeZone, plainTime })` → the
                 // instant of the (date, plainTime|midnight) wall time in the zone.
                 let item = arg(0);
-                let tz = self.temporal_tz_arg(item)?;
+                // A plain object (not a Temporal value) is a `{ timeZone, plainTime }`
+                // bag whose time-zone-like lives on `timeZone`; a String or a
+                // `Temporal.ZonedDateTime` is itself the time-zone-like.
+                let tz_like = if self.is_object_value(item)
+                    && item
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|h| self.realm.temporal_at(h))
+                        .is_none()
+                {
+                    let h = item.as_handle().map(Handle::from_raw).unwrap();
+                    let v = self
+                        .realm
+                        .get_property(h, "timeZone")
+                        .unwrap_or(NanBox::undefined());
+                    if v.is_undefined() {
+                        return Err(self.type_error("toZonedDateTime: missing timeZone"));
+                    }
+                    v
+                } else {
+                    item
+                };
+                let tz = self.temporal_tz_arg(tz_like)?;
                 let mut time = crate::temporal_iso::IsoTime::default();
                 if self.is_object_value(item)
                     && let Some(h) = item.as_handle().map(Handle::from_raw)
@@ -927,8 +949,8 @@ impl<'a> Interp<'a> {
     ) -> Result<NanBox, ExecError> {
         let other_date = self.pd_to_temporal_date(other, NanBox::undefined())?;
         let opts = self.pd_options(options)?;
-        let smallest = self.pd_unit_option(opts, "smallestUnit")?;
-        let largest_raw = self.pd_unit_option(opts, "largestUnit")?;
+        let smallest = self.pd_unit_option(opts, "smallestUnit", false)?;
+        let largest_raw = self.pd_unit_option(opts, "largestUnit", true)?;
         let mode = self.get_string_option(
             opts,
             "roundingMode",
@@ -961,35 +983,114 @@ impl<'a> Interp<'a> {
             return Err(self.pd_range_error("largestUnit must be larger than smallestUnit"));
         }
 
-        let (from, to) = if negate {
-            (other_date, date)
-        } else {
-            (date, other_date)
-        };
-        let (years, months, weeks, mut days) = difference_iso_date(from, to, largest);
-        // Round the smallest unit. Only day-granularity rounding is self-contained
-        // (year/month/week rounding needs calendar-relative arithmetic); for a
-        // larger `smallestUnit` the increment is left unapplied. A unit increment
-        // (the default) is always a no-op, so this never perturbs the common path.
-        if increment > 1 && smallest == Unit::Day {
-            // `since` (negate) rounds with the negated rounding mode, then the
-            // whole difference is negated — mirrored here by rounding the already
-            // sign-flipped `days` with the negated mode.
-            let round_mode = pd_round_mode_from_str(mode.as_deref(), negate);
-            days = crate::temporal_iso::round_to_increment(
-                i128::from(days),
-                i128::from(increment),
-                round_mode,
-            ) as i64;
+        // Compute in the forward (`until`) orientation and round with the
+        // rounding mode negated for `since`; the whole difference is then negated
+        // for `since` (matching `DifferenceTemporalPlainDate` +
+        // `NegateRoundingMode`).
+        let round_mode = pd_round_mode_from_str(mode.as_deref(), negate);
+        let mut duration =
+            self.pd_round_date_diff(date, other_date, largest, smallest, increment, round_mode);
+        if negate {
+            duration.years = -duration.years;
+            duration.months = -duration.months;
+            duration.weeks = -duration.weeks;
+            duration.days = -duration.days;
         }
-        let duration = DurationFields {
-            years,
-            months,
-            weeks,
-            days,
+        Ok(self.pd_new_duration(duration))
+    }
+
+    /// `RoundDuration` for a date-only difference (ISO calendar). Computes the
+    /// `from → to` difference in `largest` units, then rounds to `smallest`
+    /// (`increment`, `mode`). For a `smallestUnit` coarser than a day the fraction
+    /// is measured against the day-span of one increment step from an anchor that
+    /// already carries the coarser components (`NudgeToCalendarUnit`).
+    fn pd_round_date_diff(
+        &self,
+        from: IsoDate,
+        to: IsoDate,
+        largest: Unit,
+        smallest: Unit,
+        increment: i64,
+        mode: crate::temporal_iso::RoundMode,
+    ) -> DurationFields {
+        use crate::temporal_iso::{
+            add_iso_date, iso_to_epoch_days, round_to_increment as round_inc,
+        };
+        let (years, months, weeks, days) = difference_iso_date(from, to, largest);
+        if smallest == Unit::Day {
+            let d = round_inc(i128::from(days), i128::from(increment.max(1)), mode) as i64;
+            return DurationFields {
+                years,
+                months,
+                weeks,
+                days: d,
+                ..Default::default()
+            };
+        }
+        // Keep components coarser than `smallest`; round the `smallest` count.
+        let (keep_y, keep_m) = match smallest {
+            Unit::Year => (0, 0),
+            Unit::Month => (years, 0),
+            _ => (years, months), // Week
+        };
+        let anchor = add_iso_date(from, keep_y, keep_m, 0, 0, Overflow::Constrain).unwrap_or(from);
+        let anchor_e = iso_to_epoch_days(anchor);
+        let to_e = iso_to_epoch_days(to);
+        let sign = (to_e - anchor_e).signum();
+        let mut out = DurationFields {
+            years: keep_y,
+            months: keep_m,
             ..Default::default()
         };
-        Ok(self.pd_new_duration(duration))
+        if sign == 0 {
+            return out;
+        }
+        let (sy, sm, sw, _) = difference_iso_date(anchor, to, smallest);
+        let mut r1 = match smallest {
+            Unit::Year => sy,
+            Unit::Month => sm,
+            _ => sw,
+        };
+        let step = |count: i64| -> i64 {
+            let (y, m, w) = match smallest {
+                Unit::Year => (count, 0, 0),
+                Unit::Month => (0, count, 0),
+                _ => (0, 0, count),
+            };
+            iso_to_epoch_days(
+                add_iso_date(anchor, y, m, w, 0, Overflow::Constrain).unwrap_or(anchor),
+            )
+        };
+        let beyond = |e: i64| if sign > 0 { e > to_e } else { e < to_e };
+        for _ in 0..12 {
+            if beyond(step(r1 + sign)) {
+                break;
+            }
+            r1 += sign;
+        }
+        for _ in 0..12 {
+            if beyond(step(r1)) {
+                r1 -= sign;
+            } else {
+                break;
+            }
+        }
+        let e1 = step(r1);
+        let count = if e1 == to_e {
+            r1
+        } else {
+            let e2 = step(r1 + sign);
+            let den = i128::from((e2 - e1).abs().max(1));
+            let num = i128::from((to_e - e1).abs());
+            let x = i128::from(r1) * den + i128::from(sign) * num;
+            (round_inc(x, i128::from(increment.max(1)) * den, mode) / den) as i64
+        };
+        match smallest {
+            Unit::Year => out.years = count,
+            Unit::Month => out.months = count,
+            _ => out.weeks = count,
+        }
+        out
     }
 
     /// `GetRoundingIncrementOption`: default 1; `ToNumber` (Symbol/BigInt →
@@ -1020,10 +1121,16 @@ impl<'a> Interp<'a> {
         &mut self,
         opts: Option<Handle>,
         prop: &str,
+        allow_auto: bool,
     ) -> Result<Option<Unit>, ExecError> {
         let Some(s) = self.get_string_option(opts, prop, &[], None)? else {
             return Ok(None);
         };
+        // `largestUnit: "auto"` means the default (→ `None`); it is invalid as a
+        // smallestUnit.
+        if allow_auto && s == "auto" {
+            return Ok(None);
+        }
         let u = match s.as_str() {
             "year" | "years" => Unit::Year,
             "month" | "months" => Unit::Month,

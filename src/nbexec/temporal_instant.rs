@@ -45,6 +45,20 @@ fn unit_length(u: Unit) -> i128 {
     }
 }
 
+/// Any Temporal unit name (with its plural), year..nanosecond. Used where the
+/// spec reads and *casts* the unit before deciding whether it is allowed for the
+/// operation (so a disallowed-but-valid unit like `"week"` on `Instant` must
+/// still parse, then be rejected only after every option has been read).
+fn parse_any_unit(s: &str) -> Option<Unit> {
+    Some(match s {
+        "year" | "years" => Unit::Year,
+        "month" | "months" => Unit::Month,
+        "week" | "weeks" => Unit::Week,
+        "day" | "days" => Unit::Day,
+        _ => return parse_time_unit(s),
+    })
+}
+
 /// A time unit name (with its plural), restricted to hour..nanosecond.
 fn parse_time_unit(s: &str) -> Option<Unit> {
     Some(match s {
@@ -258,7 +272,21 @@ impl<'a> Interp<'a> {
             "valueOf" => Err(self.type_error(
                 "Temporal.Instant.prototype.valueOf: use compare() or an explicit conversion",
             )),
-            "toZonedDateTimeISO" => Err(self.temporal_todo("Instant.prototype.toZonedDateTimeISO")),
+            "toZonedDateTimeISO" => {
+                // The time zone is required: `undefined` is not a valid
+                // `ToTemporalTimeZoneIdentifier` argument.
+                if arg(0).is_undefined() {
+                    return Err(self.type_error("toZonedDateTimeISO requires a time zone"));
+                }
+                let tz = self.temporal_tz_arg(arg(0))?;
+                Ok(self.build_temporal(TemporalData {
+                    kind: TemporalKind::ZonedDateTime,
+                    epoch_ns: data.epoch_ns,
+                    tz: Some(tz),
+                    calendar: alloc::string::String::from("iso8601"),
+                    ..Default::default()
+                }))
+            }
             _ => Err(self.temporal_todo(&alloc::format!("Instant.prototype.{method}"))),
         }
     }
@@ -460,13 +488,24 @@ impl<'a> Interp<'a> {
         let mut increment: i128 = 1;
         if let Some(h) = opts {
             // Read order per GetDifferenceSettings: largestUnit, roundingIncrement,
-            // roundingMode, smallestUnit.
-            largest = self.read_unit_option(h, "largestUnit", true)?;
+            // roundingMode, smallestUnit. Every option is READ and cast (accepting
+            // any valid unit name) BEFORE any algorithmic validation; a
+            // disallowed-for-Instant unit is rejected only afterward.
+            largest = self.read_any_unit_option(h, "largestUnit", true)?;
             increment = self.read_rounding_increment(h)?;
             mode = self.read_rounding_mode(h, RoundMode::Trunc)?;
-            if let Some(u) = self.read_unit_option(h, "smallestUnit", false)? {
+            if let Some(u) = self.read_any_unit_option(h, "smallestUnit", false)? {
                 smallest = u;
             }
+        }
+        // Instant only supports time units (hour..nanosecond) for both bounds.
+        if smallest < Unit::Hour {
+            return Err(self.range_err("smallestUnit must be a time unit for Instant"));
+        }
+        if let Some(l) = largest
+            && l < Unit::Hour
+        {
+            return Err(self.range_err("largestUnit must be a time unit for Instant"));
         }
         // Default largestUnit = the coarser of Second and smallestUnit.
         let largest = largest.unwrap_or_else(|| core::cmp::min(Unit::Second, smallest));
@@ -547,12 +586,15 @@ impl<'a> Interp<'a> {
         let mut offset: Option<i128> = None;
 
         if !ignore_options && let Some(h) = self.get_options_object(options_arg)? {
-            // Read order mirrors the spec: timeZone, fractionalSecondDigits,
-            // roundingMode, smallestUnit.
-            let tz = self.read_string_option(h, "timeZone")?;
+            // Read order mirrors the spec: fractionalSecondDigits, roundingMode,
+            // smallestUnit, then timeZone last (all options are read before any
+            // algorithmic validation).
             let digits = self.read_fractional_digits(h)?;
             mode = self.read_rounding_mode(h, RoundMode::Trunc)?;
             let su = self.read_string_option(h, "smallestUnit")?;
+            // timeZone is READ (raw, no coercion) last, before any algorithmic
+            // validation of the units, per ToTemporalTimeZoneIdentifier.
+            let tz_val = self.read_member(h, "timeZone")?;
             if let Some(s) = su {
                 let u = parse_time_unit(&s)
                     .filter(|u| *u != Unit::Hour)
@@ -607,8 +649,14 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
-            if let Some(tz) = tz {
-                offset = Some(self.parse_offset_identifier(&tz)?);
+            // Resolve the timeZone read above via ToTemporalTimeZoneIdentifier
+            // (bare id, or a datetime string carrying a `[TimeZone]`/`Z`/offset;
+            // a `Temporal.ZonedDateTime` object uses its `[[TimeZone]]`; any other
+            // non-string is a TypeError). Its offset at this instant determines
+            // the rendered wall-clock. `undefined` renders UTC (`Z`).
+            if !tz_val.is_undefined() {
+                let id = self.temporal_tz_arg(tz_val)?;
+                offset = Some(self.temporal_tz_offset_ns(&id, data.epoch_ns).unwrap_or(0));
             }
         }
 
@@ -662,49 +710,6 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Parses a `timeZone` string into a fixed offset (ns). Only `UTC` and
-    /// numeric `±HH[:MM[:SS]]` offsets are supported; named zones throw.
-    fn parse_offset_identifier(&mut self, s: &str) -> Result<i128, ExecError> {
-        let t = s.trim();
-        if t.eq_ignore_ascii_case("utc") {
-            return Ok(0);
-        }
-        // Strip a bracketed annotation form if present.
-        let core = t
-            .strip_prefix('[')
-            .and_then(|r| r.strip_suffix(']'))
-            .unwrap_or(t);
-        let bytes = core.as_bytes();
-        let (neg, rest) = match bytes.first() {
-            Some(b'+') => (false, &core[1..]),
-            Some(b'-') => (true, &core[1..]),
-            _ => return Err(self.range_err("unsupported time zone")),
-        };
-        let mut it = rest.split(':');
-        let hh = it.next().and_then(|p| p.parse::<i128>().ok());
-        let Some(hh) = hh.filter(|h| (0..=23).contains(h)) else {
-            return Err(self.range_err("invalid offset"));
-        };
-        let mm = match it.next() {
-            None => 0,
-            Some(p) => match p.parse::<i128>().ok().filter(|m| (0..=59).contains(m)) {
-                Some(m) => m,
-                None => return Err(self.range_err("invalid offset")),
-            },
-        };
-        let ss = match it.next() {
-            None => 0,
-            Some(p) => match p.split('.').next().and_then(|x| x.parse::<i128>().ok()) {
-                Some(s) if (0..=59).contains(&s) => s,
-                _ => return Err(self.range_err("invalid offset")),
-            },
-        };
-        let ns = hh * temporal_iso::NS_PER_HOUR
-            + mm * temporal_iso::NS_PER_MINUTE
-            + ss * temporal_iso::NS_PER_SEC;
-        Ok(if neg { -ns } else { ns })
-    }
-
     // --- option-reading helpers -------------------------------------------
 
     /// `GetOptionsObject`: `undefined` → no options; an object → that object; any
@@ -745,6 +750,24 @@ impl<'a> Interp<'a> {
             Some(s) if allow_auto && s == "auto" => Ok(None),
             Some(s) => Ok(Some(
                 parse_time_unit(&s).ok_or_else(|| self.range_err("invalid unit"))?,
+            )),
+        }
+    }
+
+    /// Reads a unit option accepting *any* valid unit name (year..nanosecond);
+    /// `allow_auto` maps `"auto"`/absence to `None`. Whether the unit is allowed
+    /// for the operation is validated by the caller, after all options are read.
+    fn read_any_unit_option(
+        &mut self,
+        h: Handle,
+        key: &str,
+        allow_auto: bool,
+    ) -> Result<Option<Unit>, ExecError> {
+        match self.read_string_option(h, key)? {
+            None => Ok(None),
+            Some(s) if allow_auto && s == "auto" => Ok(None),
+            Some(s) => Ok(Some(
+                parse_any_unit(&s).ok_or_else(|| self.range_err("invalid unit"))?,
             )),
         }
     }
