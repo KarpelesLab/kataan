@@ -148,6 +148,38 @@ enum Step<'a> {
         body: &'a Stmt,
         label: Option<String>,
     },
+    /// The lazy `for await (left of right)` driver (14.7.5 ForIn/OfBodyEvaluation,
+    /// async). One `next()` is pulled per iteration and parked on `await` — an
+    /// infinite source with a `break` therefore terminates (calling `return`)
+    /// rather than draining eagerly. `async_inner` is whether the iterator record
+    /// came from `[Symbol.asyncIterator]` (native async, whose `next()` returns a
+    /// promise) vs a sync iterator wrapped as AsyncFromSyncIterator (whose result
+    /// values are unwrapped/awaited per iteration). This is the loop step the
+    /// unwinder recognizes: a body break/return/throw (or non-matching label)
+    /// triggers `IteratorClose`; a matching `continue` re-loops without closing.
+    ForAwaitLoop {
+        ih: Handle,
+        next: NanBox,
+        left: &'a ForLeft,
+        body: &'a Stmt,
+        label: Option<String>,
+        async_inner: bool,
+    },
+    /// (`for await`) After awaiting the per-iteration `next()` result (native
+    /// async) or the unwrapped `value` (sync-wrapped), bind it and run the body.
+    ForAwaitBind {
+        ih: Handle,
+        next: NanBox,
+        left: &'a ForLeft,
+        body: &'a Stmt,
+        label: Option<String>,
+        async_inner: bool,
+    },
+    /// (`for await` over a sync-wrapped iterator) The IteratorClose-on-rejection
+    /// guard for AsyncFromSyncIteratorContinuation while the non-done `value` is
+    /// awaited: removed on the fulfil path (by `ForAwaitBind`); on an unwinding
+    /// throw it runs `IteratorClose` on the sync iterator.
+    ForAwaitValueGuard { ih: Handle },
     /// A `try` region marker: while present, a throw is routed to `handler` (if
     /// any) and `finalizer` (if any) runs on the way out.
     TryRegion {
@@ -173,8 +205,43 @@ enum Step<'a> {
     /// A `yield*` delegation pumping `iter`. `next` is the iterator's `next`
     /// method, cached once at acquisition per spec (GetIterator stores
     /// [[NextMethod]]) so it is not re-read every step — only `return`/`throw` are
-    /// fetched per-use.
-    YieldStar { iter: Handle, next: NanBox },
+    /// fetched per-use. `async_inner` records whether the delegated iterator was
+    /// obtained via `[Symbol.asyncIterator]` (a native async iterator, whose
+    /// `next()` results are promises) vs a sync iterator (whose result values are
+    /// unwrapped per `AsyncFromSyncIteratorContinuation`).
+    YieldStar {
+        iter: Handle,
+        next: NanBox,
+        async_inner: bool,
+    },
+    /// (async `yield*` only) After awaiting a native-async inner iterator's raw
+    /// `next`/`return`/`throw` result promise, process it: read `done`/`value` and
+    /// either re-yield (non-done), complete the delegation, or forward a return.
+    YieldStarResult {
+        iter: Handle,
+        next: NanBox,
+        kind: YsKind,
+    },
+    /// (async `yield*` only) After awaiting the inner `value` (AsyncGeneratorYield /
+    /// AsyncFromSyncIteratorContinuation value-unwrap), finish the step: re-yield
+    /// (non-done), forward a return completion, or produce the `yield*` result.
+    YieldStarAfterValue {
+        iter: Handle,
+        next: NanBox,
+        async_inner: bool,
+        done: bool,
+        kind: YsKind,
+        /// A [`Step::YieldStarClose`] guard sits directly beneath this step (the
+        /// sync-wrapped non-done value-unwrap `Await`): remove it on the fulfil path
+        /// so it only fires if that `Await` rejects.
+        has_close_guard: bool,
+    },
+    /// (async `yield*` over a sync-wrapped iterator only) The IteratorClose-on-
+    /// rejection guard for AsyncFromSyncIteratorContinuation: while a non-done inner
+    /// `value` is being awaited, a rejection must close the sync iterator (call its
+    /// `return`). Consumed without effect on the fulfil path (removed by the
+    /// matching `YieldStarAfterValue`); on an unwinding throw it runs `IteratorClose`.
+    YieldStarClose { iter: Handle },
     /// Complete a member read `<object on stack>.property` after the (possibly
     /// suspending) object operand has been evaluated onto the value stack. Used so
     /// `(await x).prop` / `(yield x).prop` suspend at the `await`/`yield` instead of
@@ -399,6 +466,15 @@ enum Step<'a> {
         base: Handle,
         property: &'a PropertyKey,
     },
+}
+
+/// Which method an async `yield*` delegation step is servicing (mirrors the
+/// resume completion forwarded to the inner iterator).
+#[derive(Clone, Copy)]
+enum YsKind {
+    Next,
+    Return,
+    Throw,
 }
 
 /// A completion threaded through the unwinder.
@@ -1316,10 +1392,15 @@ impl<'a> Interp<'a> {
         // `return`/`throw` — is forwarded to the inner iterator.
         let mut pending: Option<Completion> = None;
         if started && matches!(stack.last(), Some(Step::YieldStar { .. })) {
-            let Some(Step::YieldStar { iter, next }) = stack.pop() else {
+            let Some(Step::YieldStar {
+                iter,
+                next,
+                async_inner,
+            }) = stack.pop()
+            else {
                 unreachable!()
             };
-            match self.gen_yield_star_step(iter, how, next, &mut stack, &mut values) {
+            match self.gen_yield_star_step(iter, how, next, async_inner, &mut stack, &mut values) {
                 Ok(StepOut::Yield(v)) => {
                     self.store_machine(id, stack, values);
                     return Ok(GenStep::Yielded(v));
@@ -1895,6 +1976,133 @@ impl<'a> Interp<'a> {
                 }
                 self.gen_exec_loop_body(body, stack, values, &label)
             }
+            Step::ForAwaitLoop {
+                ih,
+                next,
+                left,
+                body,
+                label,
+                async_inner,
+            } => {
+                // Pull one `next()` and park on the result / value `await`. The loop
+                // step is NOT re-pushed until the body is about to run (in
+                // `ForAwaitBind`), so a rejection *before* the body (a rejected
+                // `next()` result, or the sync value-unwrap) does not re-close via
+                // this loop marker — only a body-abrupt completion does.
+                let iter_val = NanBox::handle(ih.to_raw());
+                let res = self
+                    .call_with_this(next, iter_val, &[])
+                    .map_err(GenAbrupt::from)?;
+                if async_inner {
+                    // Native async iterator: `next()` returns a promise; await it,
+                    // then read `done`/`value` from the settled result in `ForAwaitBind`.
+                    stack.push(Step::ForAwaitBind {
+                        ih,
+                        next,
+                        left,
+                        body,
+                        label,
+                        async_inner: true,
+                    });
+                    return Ok(StepOut::Await(res));
+                }
+                // Sync iterator wrapped as async: the result is a plain object. Read
+                // `done` now; a done result ends the loop (no body). Otherwise unwrap
+                // (`await`) the value, guarded so a rejection closes the sync iterator.
+                let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+                    return Err(GenAbrupt::Throw(
+                        self.make_type_error("iterator result is not an object"),
+                    ));
+                };
+                let done = self.read_member(rh, "done").map_err(GenAbrupt::from)?;
+                if self.realm.truthy(done) {
+                    return Ok(StepOut::Continue);
+                }
+                let value = self.read_member(rh, "value").map_err(GenAbrupt::from)?;
+                stack.push(Step::ForAwaitValueGuard { ih });
+                stack.push(Step::ForAwaitBind {
+                    ih,
+                    next,
+                    left,
+                    body,
+                    label,
+                    async_inner: false,
+                });
+                Ok(StepOut::Await(value))
+            }
+            Step::ForAwaitBind {
+                ih,
+                next,
+                left,
+                body,
+                label,
+                async_inner,
+            } => {
+                // The awaited operand is on the value stack: a result object (native
+                // async) or an unwrapped value (sync-wrapped).
+                let awaited = values.pop().unwrap_or(NanBox::undefined());
+                let value = if async_inner {
+                    let Some(rh) = awaited.as_handle().map(Handle::from_raw) else {
+                        return Err(GenAbrupt::Throw(
+                            self.make_type_error("iterator result is not an object"),
+                        ));
+                    };
+                    let done = self.read_member(rh, "done").map_err(GenAbrupt::from)?;
+                    if self.realm.truthy(done) {
+                        return Ok(StepOut::Continue);
+                    }
+                    self.read_member(rh, "value").map_err(GenAbrupt::from)?
+                } else {
+                    // The sync value-unwrap `await` fulfilled: drop its close guard
+                    // (it only fires on rejection).
+                    if matches!(stack.last(), Some(Step::ForAwaitValueGuard { .. })) {
+                        stack.pop();
+                    }
+                    awaited
+                };
+                // Re-push the loop marker for the next iteration BELOW the body, so a
+                // body break/return/throw unwinds into it (IteratorClose), and a
+                // matching `continue` re-loops.
+                stack.push(Step::ForAwaitLoop {
+                    ih,
+                    next,
+                    left,
+                    body,
+                    label: label.clone(),
+                    async_inner,
+                });
+                // Bind the loop variable in a fresh per-iteration scope.
+                let child = self.current.child();
+                let prev = core::mem::replace(&mut self.current, child);
+                stack.push(Step::PopScope { scope: prev });
+                // `for await ([ x = yield ] of …)` — an assignment-target pattern
+                // whose default/computed-key yields: destructure through the step
+                // machine (so the yield suspends), then run the body via a deferred
+                // step. (Mirrors the plain `for-of` `ForEach` path.)
+                if let ForLeft::Target(expr) = left
+                    && expr_has_yield(expr)
+                {
+                    stack.push(Step::RunLoopBody { body, label });
+                    stack.push(Step::Destructure {
+                        target: expr,
+                        value,
+                    });
+                    return Ok(StepOut::Continue);
+                }
+                match left {
+                    ForLeft::Decl { target, .. } => {
+                        self.bind_pattern(target, value).map_err(GenAbrupt::from)?;
+                    }
+                    ForLeft::Target(expr) => {
+                        self.assign_destructure(expr, value)
+                            .map_err(GenAbrupt::from)?;
+                    }
+                }
+                self.gen_exec_loop_body(body, stack, values, &label)
+            }
+            // A value-unwrap close guard reached normally (its `await` fulfilled) is
+            // a no-op — `ForAwaitBind` already removed it.
+            Step::ForAwaitValueGuard { .. } => Ok(StepOut::Continue),
             // A `try` region reached with no abrupt completion: run its
             // `finalizer` (if any) on the normal way out, restoring the try scope.
             Step::TryRegion {
@@ -2569,7 +2777,8 @@ impl<'a> Interp<'a> {
                     // `yield*`: obtain the inner iterator and start pumping with an
                     // initial `next(undefined)`. `gen_yield_star_step` re-pushes a
                     // `YieldStar` step itself on a non-done inner result.
-                    let iter = self.gen_delegate_iter(operand).map_err(GenAbrupt::from)?;
+                    let (iter, async_inner) =
+                        self.gen_delegate_iter(operand).map_err(GenAbrupt::from)?;
                     // GetIterator caches [[NextMethod]] once (GetV(iter, "next"));
                     // this single read is the only "get next" the delegation makes.
                     let next = self.read_member(iter, "next").map_err(GenAbrupt::from)?;
@@ -2577,6 +2786,7 @@ impl<'a> Interp<'a> {
                         iter,
                         Resumption::Next(NanBox::undefined()),
                         next,
+                        async_inner,
                         stack,
                         values,
                     )
@@ -2598,7 +2808,11 @@ impl<'a> Interp<'a> {
                 let awaited = values.pop().unwrap_or(NanBox::undefined());
                 Ok(StepOut::Yield(awaited))
             }
-            Step::YieldStar { iter, next } => {
+            Step::YieldStar {
+                iter,
+                next,
+                async_inner,
+            } => {
                 // A `YieldStar` on top at resume is intercepted by `gen_drive`
                 // (which forwards the resumption to the inner iterator); reaching
                 // it here means it was not the suspension point, so pump it with
@@ -2607,10 +2821,56 @@ impl<'a> Interp<'a> {
                     iter,
                     Resumption::Next(NanBox::undefined()),
                     next,
+                    async_inner,
                     stack,
                     values,
                 )
             }
+            Step::YieldStarResult { iter, next, kind } => {
+                // The awaited native-async inner result promise settled; its result
+                // object is on the value stack. Process it.
+                let res = values.pop().unwrap_or(NanBox::undefined());
+                self.gen_yield_star_process(iter, next, kind, res, stack, values)
+            }
+            Step::YieldStarAfterValue {
+                iter,
+                next,
+                async_inner,
+                done,
+                kind,
+                has_close_guard,
+            } => {
+                // The awaited inner `value` is on the value stack.
+                let value = values.pop().unwrap_or(NanBox::undefined());
+                // The value `Await` fulfilled: drop the close guard beneath (it only
+                // fires if that `Await` rejects).
+                if has_close_guard && matches!(stack.last(), Some(Step::YieldStarClose { .. })) {
+                    stack.pop();
+                }
+                if !done {
+                    // AsyncGeneratorYield: re-yield the settled value and stay in
+                    // delegation (a `YieldStar` beneath is the next suspend point).
+                    stack.push(Step::YieldStar {
+                        iter,
+                        next,
+                        async_inner,
+                    });
+                    Ok(StepOut::Yield(value))
+                } else if matches!(kind, YsKind::Return) {
+                    // A forwarded `return` whose inner iterator completed (or had no
+                    // `return` method): the outer generator returns the value.
+                    Err(GenAbrupt::Return(value))
+                } else {
+                    // `next`/`throw` completed the delegation: the `yield*`
+                    // expression evaluates to the (awaited) inner value.
+                    values.push(value);
+                    Ok(StepOut::Continue)
+                }
+            }
+            // A close guard reached on the normal path (its value `Await` did not
+            // reject) is a no-op — `YieldStarAfterValue` already removed it, but a
+            // stray one is harmless.
+            Step::YieldStarClose { .. } => Ok(StepOut::Continue),
             Step::AwaitExpr => {
                 // `await v`: suspend the async coroutine on `v`'s settlement. On
                 // resume, `gen_drive` pushes the fulfilment value (or routes a
@@ -2753,19 +3013,27 @@ impl<'a> Interp<'a> {
                 ..
             } => {
                 let iterable = self.eval(right).map_err(GenAbrupt::from)?;
-                // Eager list of values (mirrors the non-await tree-walker for the
-                // built-in iterables; user iterators are drained up front here —
-                // a documented simplification for yield-bearing for-of bodies).
-                // `for await` drives the async-iterator protocol via
-                // [`Self::for_await_values`] — awaiting each `next()` result for an
-                // async iterable (`async function*` / `[Symbol.asyncIterator]`), or
-                // awaiting each yielded value of a sync iterable. The values come
-                // back already settled, so the `ForEach` step does not re-await.
-                let items = if *is_await {
-                    self.for_await_values(iterable).map_err(GenAbrupt::from)?
-                } else {
-                    self.iterate_values(iterable).map_err(GenAbrupt::from)?
-                };
+                // `for await` drives the async-iterator protocol **lazily**: one
+                // `next()` per iteration, parked on `await`, closing the iterator
+                // (`IteratorClose`) on a `break`/`return`/`throw` out of the body —
+                // so an infinite source with a `break` terminates instead of being
+                // eagerly drained. A plain `for-of` still materializes an eager list
+                // of values (a documented simplification for yield-bearing bodies).
+                if *is_await {
+                    let (ih, next, async_inner) = self
+                        .for_await_iter_record(iterable)
+                        .map_err(GenAbrupt::from)?;
+                    stack.push(Step::ForAwaitLoop {
+                        ih,
+                        next,
+                        left,
+                        body,
+                        label: label.clone(),
+                        async_inner,
+                    });
+                    return Ok(StepOut::Continue);
+                }
+                let items = self.iterate_values(iterable).map_err(GenAbrupt::from)?;
                 stack.push(Step::ForEach {
                     left,
                     body,
@@ -2909,7 +3177,8 @@ fn loop_label<'a>(step: &'a Step<'_>) -> Option<&'a String> {
         Step::While { label, .. }
         | Step::DoWhile { label, .. }
         | Step::ForLoop { label, .. }
-        | Step::ForEach { label, .. } => label.as_ref(),
+        | Step::ForEach { label, .. }
+        | Step::ForAwaitLoop { label, .. } => label.as_ref(),
         _ => None,
     }
 }
@@ -3422,9 +3691,67 @@ impl<'a> Interp<'a> {
                         _ => {}
                     }
                 }
+                Step::ForAwaitLoop { .. } => {
+                    // The `for await` loop marker is being unwound by a body-abrupt
+                    // completion. A matching `continue` re-loops WITHOUT closing; any
+                    // other completion (break/return/throw, or a non-matching label)
+                    // runs `IteratorClose` (14.7.5: not-LoopContinues → close), then
+                    // consumes a matching break or keeps propagating.
+                    let (ih, label) = if let Step::ForAwaitLoop { ih, label, .. } = &step {
+                        (*ih, label.clone())
+                    } else {
+                        unreachable!()
+                    };
+                    match &completion {
+                        Completion::Continue(None) => {
+                            stack.push(step);
+                            return Ok(None);
+                        }
+                        Completion::Continue(Some(l)) if label.as_deref() == Some(l.as_str()) => {
+                            stack.push(step);
+                            return Ok(None);
+                        }
+                        _ => {}
+                    }
+                    // IteratorClose: under a throw completion the original throw takes
+                    // precedence and any close error is swallowed (spec step 6); under
+                    // break/return a close error propagates as a throw.
+                    let is_throw = matches!(completion, Completion::Throw(_));
+                    if let Err(e) = self.iterator_close(ih)
+                        && !is_throw
+                    {
+                        completion = Completion::Throw(throw_value(e));
+                    }
+                    match &completion {
+                        Completion::Break(None) => return Ok(None),
+                        Completion::Break(Some(l)) if label.as_deref() == Some(l.as_str()) => {
+                            return Ok(None);
+                        }
+                        // Return / Throw / a non-matching break keep unwinding.
+                        _ => {}
+                    }
+                }
+                Step::ForAwaitValueGuard { ih } => {
+                    // The non-done value-unwrap `await` rejected: close the sync
+                    // iterator for side effects; the original rejection wins (spec).
+                    if let Completion::Throw(_) = &completion {
+                        let _ = self.iterator_close(ih);
+                    }
+                }
                 Step::SwitchRegion => {
                     if matches!(completion, Completion::Break(None)) {
                         return Ok(None);
+                    }
+                }
+                Step::YieldStarClose { iter } => {
+                    // AsyncFromSyncIteratorContinuation's `onRejected`: the non-done
+                    // value `Await` rejected — close the sync iterator (call its
+                    // `return`) for its side effects. Per IteratorClose under a throw
+                    // completion (spec step 6), the original rejection takes
+                    // precedence over anything `return` yields, so its result — a
+                    // throw *or* a non-object — is discarded.
+                    if let Completion::Throw(_) = &completion {
+                        let _ = self.iterator_close(iter);
                     }
                 }
                 Step::DestructureArrayClose { ih, done } => {
@@ -3585,17 +3912,19 @@ fn throw_value(e: ExecError) -> NanBox {
 // --- yield* delegation -------------------------------------------------------
 
 impl<'a> Interp<'a> {
-    /// Obtains the inner iterator object for `yield* operand`
-    /// (`GetIterator(operand, sync)`).
-    fn gen_delegate_iter(&mut self, operand: NanBox) -> Result<Handle, ExecError> {
+    /// Obtains the inner iterator object for `yield* operand` together with whether
+    /// it is a *native async* iterator (obtained via `[Symbol.asyncIterator]`, so
+    /// its `next()`/`return()`/`throw()` return promises). A sync iterator (`false`)
+    /// is driven as an AsyncFromSyncIterator: each result value is unwrapped
+    /// (awaited) per step in `gen_yield_star_step`.
+    fn gen_delegate_iter(&mut self, operand: NanBox) -> Result<(Handle, bool), ExecError> {
         let Some(h) = operand.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("yield* operand is not iterable"));
         };
         // In an async generator, `yield*` uses GetIterator(operand, async): a
         // callable `[Symbol.asyncIterator]` is used directly; a non-callable (but
         // present) one is a TypeError. An absent `[Symbol.asyncIterator]` falls
-        // through to the sync `[Symbol.iterator]` (AsyncFromSyncIterator — each
-        // result is awaited per step in `gen_yield_star_step`).
+        // through to the sync `[Symbol.iterator]` (AsyncFromSyncIterator).
         if self.gen_is_async {
             let sym = self.well_known_symbol("asyncIterator");
             let key = self.member_key(sym);
@@ -3613,10 +3942,11 @@ impl<'a> Interp<'a> {
                 if !self.is_object_value(iterator) {
                     return Err(self.type_error("yield* iterator is not an object"));
                 }
-                return iterator
+                let ih = iterator
                     .as_handle()
                     .map(Handle::from_raw)
-                    .ok_or_else(|| self.type_error("yield* iterator is not an object"));
+                    .ok_or_else(|| self.type_error("yield* iterator is not an object"))?;
+                return Ok((ih, true));
             }
         }
         // A user object exposing `[Symbol.iterator]` is driven through its real
@@ -3626,10 +3956,11 @@ impl<'a> Interp<'a> {
                 .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
         {
             let iterator = self.call_with_this(f, operand, &[])?;
-            return iterator
+            let ih = iterator
                 .as_handle()
                 .map(Handle::from_raw)
-                .ok_or_else(|| self.type_error("yield* iterator is not an object"));
+                .ok_or_else(|| self.type_error("yield* iterator is not an object"))?;
+            return Ok((ih, false));
         }
         // A built-in iterable (array / string / Map / Set) whose `Symbol.iterator`
         // is built-in dispatch (not a readable property): materialize an eager
@@ -3637,30 +3968,82 @@ impl<'a> Interp<'a> {
         // time, preserving the surfaced-value sequence.
         let vals = self.iterate_values(operand)?;
         let iter = self.make_generator(vals);
-        iter.as_handle()
+        let ih = iter
+            .as_handle()
             .map(Handle::from_raw)
-            .ok_or_else(|| self.type_error("yield* operand is not iterable"))
+            .ok_or_else(|| self.type_error("yield* operand is not iterable"))?;
+        Ok((ih, false))
+    }
+
+    /// GetIterator(iterable, async) for a `for await` loop: the iterator handle,
+    /// its cached `[[NextMethod]]`, and whether it is a native async iterator
+    /// (`[Symbol.asyncIterator]`) or a sync iterator wrapped as AsyncFromSyncIterator.
+    pub(crate) fn for_await_iter_record(
+        &mut self,
+        iterable: NanBox,
+    ) -> Result<(Handle, NanBox, bool), ExecError> {
+        // A native async iterable (async generator object or callable
+        // `[Symbol.asyncIterator]`) is driven directly.
+        if let Some(ih) = self.async_iterator_of(iterable)? {
+            let next = self.read_member(ih, "next")?;
+            return Ok((ih, next, true));
+        }
+        // Otherwise GetIterator(iterable, sync) and wrap as AsyncFromSyncIterator.
+        let Some(h) = iterable.as_handle().map(Handle::from_raw) else {
+            let m = self.new_str("is not async iterable");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        };
+        if let Some(f) = self.find_iterator_fn(h)?
+            && f.as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+        {
+            let it = self.call_with_this(f, iterable, &[])?;
+            let ih = it
+                .as_handle()
+                .map(Handle::from_raw)
+                .ok_or_else(|| self.type_error("iterator is not an object"))?;
+            let next = self.read_member(ih, "next")?;
+            return Ok((ih, next, false));
+        }
+        // A built-in iterable (array / string / Map / Set) with built-in-dispatch
+        // `Symbol.iterator`: materialize a real iterator over its values (finite).
+        let vals = self.iterate_values(iterable)?;
+        let iter = self.make_generator(vals);
+        let ih = iter
+            .as_handle()
+            .map(Handle::from_raw)
+            .ok_or_else(|| self.type_error("is not async iterable"))?;
+        let next = self.read_member(ih, "next")?;
+        Ok((ih, next, false))
     }
 
     /// Advances a `yield*` delegation one step: calls the inner iterator with
     /// `how` (a `next(v)` resume, a forwarded `return(v)`, or a forwarded
-    /// `throw(e)`). On a non-done inner result, re-pushes the [`Step::YieldStar`]
-    /// and surfaces the inner value (the outer generator yields it). On a done
-    /// result, the `yield*` expression evaluates to the inner return value.
+    /// `throw(e)`).
+    ///
+    /// A **sync** generator surfaces the inner result object verbatim
+    /// (GeneratorYield(innerResult)) on a non-done result and completes on a done
+    /// one. An **async** generator implements AsyncGeneratorYield's `yield*`:
+    /// awaiting the (native-async) inner result promise, unwrapping (awaiting) the
+    /// inner `value` before re-yielding, and awaiting a missing-`return`'s value —
+    /// each parking the coroutine on the microtask queue (via [`Step::YieldStar`]-
+    /// family steps) rather than draining eagerly.
     fn gen_yield_star_step(
         &mut self,
         iter: Handle,
         how: Resumption,
         next_method: NanBox,
+        async_inner: bool,
         stack: &mut Vec<Step<'a>>,
         values: &mut Vec<NanBox>,
     ) -> StepResult {
         let iter_val = NanBox::handle(iter.to_raw());
-        let (method_name, arg, is_next) = match how {
-            Resumption::Next(v) => ("next", v, true),
-            Resumption::Return(v) => ("return", v, false),
-            Resumption::Throw(e) => ("throw", e, false),
+        let (method_name, arg, kind) = match how {
+            Resumption::Next(v) => ("next", v, YsKind::Next),
+            Resumption::Return(v) => ("return", v, YsKind::Return),
+            Resumption::Throw(e) => ("throw", e, YsKind::Throw),
         };
+        let is_next = matches!(kind, YsKind::Next);
         // `next` is the cached [[NextMethod]] (read once at acquisition, not every
         // step); `return`/`throw` are fetched per-use (GetMethod each time), and an
         // absent one has special handling below.
@@ -3673,9 +4056,23 @@ impl<'a> Interp<'a> {
         let absent = method.is_undefined() || method.is_null();
         if absent {
             match how {
-                // No inner `return`: the delegation completes, the `yield*` value
-                // is the forwarded value, and the outer `return` continues.
-                Resumption::Return(v) => return Err(GenAbrupt::Return(v)),
+                // No inner `return`: the delegation completes and the outer `return`
+                // continues with the forwarded value. In an async generator the
+                // value is first `Await`ed (14.4.14: "Return ? Await(received)").
+                Resumption::Return(v) => {
+                    if self.gen_is_async {
+                        stack.push(Step::YieldStarAfterValue {
+                            iter,
+                            next: next_method,
+                            async_inner,
+                            done: true,
+                            kind: YsKind::Return,
+                            has_close_guard: false,
+                        });
+                        return Ok(StepOut::Await(v));
+                    }
+                    return Err(GenAbrupt::Return(v));
+                }
                 // No inner `throw`: per spec (14.4.14 5.b.iii), IteratorClose the
                 // inner iterator with a *normal* completion first — giving it a
                 // chance to clean up — then throw a TypeError. If `return` itself is
@@ -3699,50 +4096,111 @@ impl<'a> Interp<'a> {
         let res = self
             .call_with_this(method, iter_val, &[arg])
             .map_err(GenAbrupt::from)?;
-        // An async generator's inner iterator yields *promises* of results: await
-        // each before reading `done`/`value` (eagerly, per the engine's async
-        // model). A non-promise — a sync inner iterator (AsyncFromSyncIterator) —
-        // passes through unchanged.
-        let res = if self.gen_is_async {
-            self.await_value(res).map_err(GenAbrupt::from)?
-        } else {
-            res
-        };
+        if !self.gen_is_async {
+            // --- Sync generator `yield*` (unchanged) --------------------------
+            let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+                return Err(GenAbrupt::Throw(
+                    self.make_type_error("iterator result is not an object"),
+                ));
+            };
+            let done = self.read_member(rh, "done").map_err(GenAbrupt::from)?;
+            if self.realm.truthy(done) {
+                let value = self.read_member(rh, "value").map_err(GenAbrupt::from)?;
+                if matches!(how, Resumption::Return(_)) {
+                    return Err(GenAbrupt::Return(value));
+                }
+                values.push(value);
+                return Ok(StepOut::Continue);
+            }
+            stack.push(Step::YieldStar {
+                iter,
+                next: next_method,
+                async_inner,
+            });
+            return Ok(StepOut::YieldResult(res));
+        }
+        // --- Async generator `yield*` (AsyncGeneratorYield) -------------------
+        if async_inner {
+            // IteratorNext for a native async iterator returns a promise: await it,
+            // then process the settled result object in `YieldStarResult`.
+            stack.push(Step::YieldStarResult {
+                iter,
+                next: next_method,
+                kind,
+            });
+            return Ok(StepOut::Await(res));
+        }
+        // A sync inner iterator wrapped as async (AsyncFromSyncIterator): its result
+        // is a plain object; read `done`/`value`, then `Await` the value (unwrap /
+        // AsyncGeneratorYield) before re-yielding or completing.
         let Some(rh) = res.as_handle().map(Handle::from_raw) else {
             return Err(GenAbrupt::Throw(
                 self.make_type_error("iterator result is not an object"),
             ));
         };
-        // IteratorComplete reads `done` first; `value` (IteratorValue) is read only
-        // when the delegation completes — it must NOT be accessed for an incomplete
-        // result (its getter has observable side effects).
         let done = self.read_member(rh, "done").map_err(GenAbrupt::from)?;
-        if self.realm.truthy(done) {
-            // Delegation finished. For a forwarded `return`, the outer generator
-            // returns the inner return value; otherwise the `yield*` expression
-            // evaluates to it.
-            let value = self.read_member(rh, "value").map_err(GenAbrupt::from)?;
-            if matches!(how, Resumption::Return(_)) {
-                return Err(GenAbrupt::Return(value));
-            }
-            values.push(value);
-            Ok(StepOut::Continue)
-        } else {
-            // Stay in delegation. A *sync* `yield*` does GeneratorYield(innerResult)
-            // — it surfaces the inner result object verbatim (its `value` getter is
-            // read by the outer consumer). An *async* `yield*` (AsyncGeneratorYield)
-            // unwraps the value and re-wraps per its own protocol, so read it here.
+        let done = self.realm.truthy(done);
+        let value = self.read_member(rh, "value").map_err(GenAbrupt::from)?;
+        // AsyncFromSyncIteratorContinuation closes the sync iterator if the value
+        // `Await` rejects — but only when the result was not done (`onRejected` is
+        // undefined for a done result). Push a close guard beneath the after-value
+        // step so a rejection during the value `Await` runs IteratorClose.
+        if !done {
+            stack.push(Step::YieldStarClose { iter });
+        }
+        stack.push(Step::YieldStarAfterValue {
+            iter,
+            next: next_method,
+            async_inner,
+            done,
+            kind,
+            has_close_guard: !done,
+        });
+        Ok(StepOut::Await(value))
+    }
+
+    /// Processes a native-async inner iterator's already-awaited `next`/`return`/
+    /// `throw` result object (`res`) for an async `yield*` (from
+    /// [`Step::YieldStarResult`]). Non-done: `Await` the value (AsyncGeneratorYield)
+    /// then re-yield. Done: the `yield*` value is the inner value (a forwarded
+    /// `return` returns it from the outer generator; `next`/`throw` continue).
+    fn gen_yield_star_process(
+        &mut self,
+        iter: Handle,
+        next_method: NanBox,
+        kind: YsKind,
+        res: NanBox,
+        stack: &mut Vec<Step<'a>>,
+        values: &mut Vec<NanBox>,
+    ) -> StepResult {
+        // Only reached for a native-async inner iterator (from `YieldStarResult`).
+        let async_inner = true;
+        let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+            return Err(GenAbrupt::Throw(
+                self.make_type_error("iterator result is not an object"),
+            ));
+        };
+        let done = self.read_member(rh, "done").map_err(GenAbrupt::from)?;
+        let done = self.realm.truthy(done);
+        let value = self.read_member(rh, "value").map_err(GenAbrupt::from)?;
+        if !done {
+            // AsyncGeneratorYield(value) does NOT itself `Await` the value — a
+            // native async iterator's promise value is re-yielded verbatim (only a
+            // sync-wrapped iterator unwraps it, inside AsyncFromSyncIteratorContinuation,
+            // handled in `gen_yield_star_step`). So re-yield the raw value.
             stack.push(Step::YieldStar {
                 iter,
                 next: next_method,
+                async_inner,
             });
-            if self.gen_is_async {
-                let value = self.read_member(rh, "value").map_err(GenAbrupt::from)?;
-                Ok(StepOut::Yield(value))
-            } else {
-                Ok(StepOut::YieldResult(res))
-            }
+            return Ok(StepOut::Yield(value));
         }
+        // Done: no further await of the value (the whole result was already awaited).
+        if matches!(kind, YsKind::Return) {
+            return Err(GenAbrupt::Return(value));
+        }
+        values.push(value);
+        Ok(StepOut::Continue)
     }
 
     fn make_type_error(&mut self, msg: &str) -> NanBox {

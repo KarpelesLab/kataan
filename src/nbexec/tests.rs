@@ -8994,3 +8994,93 @@ fn set_composition_lazy_keys_short_circuit() {
         "true"
     );
 }
+
+// The `run` helper drains the microtask queue before rendering the final value,
+// but that value is captured *before* draining — so async results are observed
+// via a mutated object/array reference (whose contents reflect the post-drain
+// state), not via a freshly computed primitive.
+
+#[test]
+fn async_gen_yield_star_sync_iterator_unwraps_promise_values() {
+    // `yield* syncIter` in an async generator wraps the sync iterator as an
+    // AsyncFromSyncIterator: each yielded value is unwrapped (awaited).
+    assert_eq!(
+        run("var out = [];
+             function* g() { yield Promise.resolve(1); yield 2; }
+             async function* ag() { yield* g(); }
+             (async () => { for await (var v of ag()) out.push(v); })();
+             out"),
+        "1,2"
+    );
+}
+
+#[test]
+fn async_gen_yield_star_native_async_does_not_unwrap() {
+    // A native async iterator's promise value is re-yielded verbatim (NOT
+    // unwrapped) — AsyncGeneratorYield does not itself await the value.
+    assert_eq!(
+        run(
+            "var out = [];
+             var p = Promise.resolve('x');
+             var asyncIter = {
+               [Symbol.asyncIterator]() { return this; },
+               _done: false,
+               next() { var d = this._done; this._done = true; return Promise.resolve({ value: p, done: d }); },
+             };
+             async function* ag() { yield* asyncIter; }
+             (async () => { for await (var v of ag()) out.push(v === p); })();
+             out"
+        ),
+        "true"
+    );
+}
+
+#[test]
+fn for_await_over_infinite_sync_iterator_breaks_and_closes() {
+    // A lazy `for await` over an infinite sync iterator terminates on `break`
+    // (it does NOT drain eagerly) and calls the iterator's `return`.
+    assert_eq!(
+        run("var out = []; var count = 0;
+             var it = {
+               [Symbol.iterator]() { return this; },
+               next() { count += 1; return { value: count, done: false }; },
+               return() { out.push('returned'); return { done: true }; },
+             };
+             (async () => { for await (var v of it) { if (v >= 3) break; } out.push(count); })();
+             out"),
+        "returned,3"
+    );
+}
+
+#[test]
+fn async_gen_yield_star_value_rejection_closes_sync_iterator() {
+    // When the unwrapped value rejects, the sync iterator is closed (its `return`
+    // is called) and the rejection propagates.
+    assert_eq!(
+        run("var out = [];
+             var it = {
+               [Symbol.iterator]() { return this; },
+               next() { return { value: Promise.reject('boom'), done: false }; },
+               return() { out.push('returned'); return { done: true }; },
+             };
+             async function* ag() { yield* it; }
+             (async () => {
+               try { for await (var v of ag()) {} } catch (e) { out.push(e); }
+             })();
+             out"),
+        "returned,boom"
+    );
+}
+
+#[test]
+fn for_await_over_sync_array_yields_in_order() {
+    // A plain sync array in `for await` is driven lazily and awaits each value.
+    assert_eq!(
+        run(
+            "var out = [];
+             (async () => { for await (var v of [Promise.resolve('a'), 'b', Promise.resolve('c')]) out.push(v); })();
+             out"
+        ),
+        "a,b,c"
+    );
+}

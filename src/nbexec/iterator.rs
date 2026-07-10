@@ -2039,7 +2039,7 @@ impl<'a> Interp<'a> {
     /// the async-generator object itself, or the result of calling its callable
     /// `[Symbol.asyncIterator]`. `None` for a sync iterable (the caller falls back
     /// to the synchronous protocol).
-    fn async_iterator_of(&mut self, v: NanBox) -> Result<Option<Handle>, ExecError> {
+    pub(crate) fn async_iterator_of(&mut self, v: NanBox) -> Result<Option<Handle>, ExecError> {
         let Some(h) = v.as_handle().map(Handle::from_raw) else {
             return Ok(None);
         };

@@ -3797,14 +3797,22 @@ impl<'a> Interp<'a> {
                     // deleted `with` binding must still reach the strict throw.
                     // Uses the pre-RHS resolvability (`ident_pre_own_global`): the
                     // reference is resolved before the RHS, so a property the RHS
-                    // itself creates does NOT make the reference resolvable.
+                    // itself creates does NOT make the reference resolvable
+                    // (`undeclared = (this.undeclared = 5)` throws in strict). But
+                    // SetMutableBinding for the global object env record also re-checks
+                    // HasProperty at PutValue time: if the RHS deleted the property, a
+                    // strict write throws ReferenceError while a sloppy write recreates
+                    // it (`x = (delete global.x, 2)`).
                     if !self.in_with_scope()
                         && ident_pre_own_global
                         && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
+                        && (self.realm.has_own(g, name) || !self.strict)
                     {
                         self.realm.set_property(g, name, new);
                         return Ok(new);
                     }
+                    // A strict write whose global-object property the RHS deleted
+                    // (or an unresolvable reference) falls through to the throw.
                     if self.strict {
                         let m = self.new_str(&alloc::format!("{name} is not defined"));
                         return Err(ExecError::Throw(
