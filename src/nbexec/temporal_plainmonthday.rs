@@ -364,19 +364,28 @@ impl<'a> Interp<'a> {
         if overflow == Overflow::Reject {
             return Err(self.pmd_range_error("PlainMonthDay: monthCode/day does not exist"));
         }
-        // Constrain: the monthCode must occur at all (day 1), then clamp the day
-        // down to the largest value that occurs for that monthCode.
-        let Some(base) = self.pmd_ref_search(cal, mc, 1) else {
-            return Err(self.pmd_range_error("PlainMonthDay: monthCode does not occur"));
-        };
+        // Constrain: reduce the *day* as little as possible (a Chinese/Hebrew month
+        // is at most 30 days, so day 31 clamps to 30), preferring to keep the day
+        // and — for a leap monthCode that cannot hold it — collapse onto the
+        // regular month it augments rather than shrink the day further. Concretely
+        // Chinese `M02L`-30 → `M02`-30 (a leap month that never reaches 30 days),
+        // while `M03L`-31 → `M03L`-30 (a leap month that does) and Hebrew Adar I
+        // stays Adar I. Walk candidate days from the request downward; at each day
+        // try the leap month first, then its base month.
+        let base_code = tcal::constrain_leap_base_code(cal, mc);
         let mut d = day.min(31);
-        while d >= 2 {
+        while d >= 1 {
             if let Some(iso) = self.pmd_ref_search(cal, mc, d) {
+                return Ok(iso);
+            }
+            if let Some(base) = &base_code
+                && let Some(iso) = self.pmd_ref_search(cal, base, d)
+            {
                 return Ok(iso);
             }
             d -= 1;
         }
-        Ok(base)
+        Err(self.pmd_range_error("PlainMonthDay: monthCode does not occur"))
     }
 
     // --- ToTemporalMonthDay -------------------------------------------------

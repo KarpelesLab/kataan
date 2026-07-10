@@ -369,6 +369,21 @@ fn chinese_leap_month(year: i64) -> i64 {
     0
 }
 
+/// Whether an intercalary month numbered `num` ever occurs in the Chinese/Dangi
+/// table (used to decide whether a `M<NN>L` leap code that is absent in a given
+/// year is nonetheless a *valid* leap code that may be constrained onto `M<NN>`,
+/// vs. a code — like `M01L`/`M12L` — that never carries a leap month and is
+/// therefore invalid). A leap `M<NN>L` code is only constrainable for an `NN`
+/// that is astronomically an intercalary month somewhere in the supported range.
+fn chinese_leap_num_occurs(num: i64) -> bool {
+    if !(1..=12).contains(&num) {
+        return false;
+    }
+    // The intl table covers Chinese years 1900–2099; a leap month numbered `num`
+    // that never appears there is not a real intercalary month for this model.
+    (1900..=2099).any(|y| chinese_leap_month(y) == num)
+}
+
 // ---------------------------------------------------------------------------
 // Internal calendar "parts" — arithmetic year, ordinal month, day, code
 // ---------------------------------------------------------------------------
@@ -790,6 +805,64 @@ fn parse_month_code(code: &str) -> Option<(i64, bool)> {
     Some((n, leap))
 }
 
+/// The 1-based ordinal position of an exact `month_code` in `cal`'s `year`, or
+/// `None` if that code does not occur in the year (e.g. a leap month absent that
+/// year). This is the exact map — no constraining.
+fn month_code_to_ordinal(cal: &str, year: i64, code: &str) -> Option<i64> {
+    match cal {
+        "hebrew" => hebrew_month_list(year)
+            .iter()
+            .position(|(_, c)| c == code)
+            .map(|i| i as i64 + 1),
+        "chinese" | "dangi" => chinese_month_list(year)
+            .iter()
+            .position(|(_, _, c)| c == code)
+            .map(|i| i as i64 + 1),
+        _ => {
+            // Non-leap-month calendars: the ordinal is the code number, and a
+            // leap code is never valid.
+            let (num, leap) = parse_month_code(code)?;
+            if leap || num < 1 || num > months_in_year_by(cal, year) {
+                None
+            } else {
+                Some(num)
+            }
+        }
+    }
+}
+
+/// The `overflow: "constrain"` target ordinal for a leap `month_code` that does
+/// **not** occur in `cal`'s `year`. Per the Temporal spec the leap month
+/// collapses onto the named month it augments:
+/// * Hebrew Adar I (`M05L`) → Adar (`M06`) in a common year;
+/// * Chinese/Dangi `M<NN>L` → its base month `M<NN>` in a year lacking that leap.
+///
+/// Returns `None` for a non-leap code or a calendar without leap months (those
+/// codes are simply out of range, not constrainable).
+fn month_code_constrain_ordinal(cal: &str, year: i64, code: &str) -> Option<i64> {
+    let base = constrain_leap_base_code(cal, code)?;
+    month_code_to_ordinal(cal, year, &base)
+}
+
+/// The regular (non-leap) month code that a leap `code` collapses onto under
+/// `overflow: "constrain"`, or `None` if `code` is not a constrainable leap code
+/// for `cal`. Hebrew Adar I (`M05L`) → Adar (`M06`); a Chinese/Dangi intercalary
+/// `M<NN>L` → its base `M<NN>` (only for an `NN` that is a real intercalary month
+/// in the supported range). Exposed so `PlainMonthDay`'s reference-year search can
+/// fall back to the augmented month when a day does not fit the leap month.
+#[must_use]
+pub(crate) fn constrain_leap_base_code(cal: &str, code: &str) -> Option<String> {
+    let (num, leap) = parse_month_code(code)?;
+    if !leap {
+        return None;
+    }
+    match cal {
+        "hebrew" => (num == 5).then(|| "M06".to_string()),
+        "chinese" | "dangi" => chinese_leap_num_occurs(num).then(|| format!("M{num:02}")),
+        _ => None,
+    }
+}
+
 /// Resolves the ordinal month for `year` from an optional ordinal `month` and/or
 /// a `month_code`, honoring `overflow` for a code/leap that does not occur.
 fn resolve_ordinal(
@@ -801,33 +874,27 @@ fn resolve_ordinal(
 ) -> Result<i64, CalError> {
     let n_months = months_in_year_by(cal, year);
     if let Some(code) = month_code {
-        let (num, leap) = parse_month_code(code)
+        // Validate the code shape up front (rejects malformed codes regardless of
+        // whether the named month happens to occur this year).
+        parse_month_code(code)
             .ok_or_else(|| CalError::Range(format!("invalid monthCode '{code}'")))?;
-        let ord = match cal {
-            "hebrew" => hebrew_month_list(year)
-                .iter()
-                .position(|(_, c)| c == code)
-                .map(|i| i as i64 + 1),
-            "chinese" | "dangi" => chinese_month_list(year)
-                .iter()
-                .position(|(_, _, c)| c == code)
-                .map(|i| i as i64 + 1),
-            _ => {
-                // Non-leap-month calendars: the ordinal is the code number, and a
-                // leap code is never valid.
-                if leap || num < 1 || num > n_months {
-                    None
-                } else {
-                    Some(num)
-                }
-            }
-        };
-        let ord = match ord {
+        let ord = match month_code_to_ordinal(cal, year, code) {
             Some(o) => o,
             None => {
-                return Err(CalError::Range(format!(
-                    "monthCode '{code}' does not occur in {cal} year {year}"
-                )));
+                // The code does not occur this year — only a leap month can be
+                // absent. Constrain collapses it onto its named month; reject
+                // throws.
+                let not_found = || {
+                    CalError::Range(format!(
+                        "monthCode '{code}' does not occur in {cal} year {year}"
+                    ))
+                };
+                match overflow {
+                    Overflow::Constrain => {
+                        month_code_constrain_ordinal(cal, year, code).ok_or_else(not_found)?
+                    }
+                    Overflow::Reject => return Err(not_found()),
+                }
             }
         };
         if let Some(m) = month
@@ -1129,14 +1196,23 @@ pub(crate) fn calendar_date_add(
     overflow: Overflow,
 ) -> Result<IsoDate, CalError> {
     let f = iso_to_fields(cal, iso);
-    // 1. Add years to the calendar year, then walk the months.
-    let (year, ord_month) = add_ordinal_months(cal, f.year + years, f.month, months);
+    // 1. Add years to the calendar year. A calendar year's ordinal month
+    //    *positions* shift as leap months appear or vanish, so the anchor month
+    //    must be re-resolved from its **monthCode** (the stable named month) in
+    //    the post-addition year — not carried as a raw ordinal. A leap month that
+    //    is absent in the new year constrains onto its named month (Adar I → Adar,
+    //    `M<NN>L` → `M<NN>`) or, under `reject`, throws.
+    let year_after = f.year + years;
+    let start_ord = resolve_ordinal(cal, year_after, None, Some(&f.month_code), overflow)?;
+    // 2. Walk the ordinal months (a leap month is one ordinal step like any
+    //    other), rolling across calendar years whose month counts vary.
+    let (year, ord_month) = add_ordinal_months(cal, year_after, start_ord, months);
     if !(-CAL_YEAR_LIMIT..=CAL_YEAR_LIMIT).contains(&year) {
         return Err(CalError::Range(format!(
             "{cal} year {year} is out of the representable range"
         )));
     }
-    // 2. Constrain (or reject) the day against the target month's length.
+    // 3. Constrain (or reject) the day against the target month's length.
     let dim = days_in_month_by(cal, year, ord_month);
     let day = match overflow {
         Overflow::Constrain => f.day.min(dim.max(1)),
@@ -1150,7 +1226,7 @@ pub(crate) fn calendar_date_add(
             f.day
         }
     };
-    // 3. Field → ISO, then apply the plain week/day offset in JDN space.
+    // 4. Field → ISO, then apply the plain week/day offset in JDN space.
     let base = iso_from_parts(cal, year, ord_month, day).ok_or_else(|| {
         CalError::Range(format!(
             "{cal} date {year}-{ord_month}-{day} is not representable"
@@ -1168,21 +1244,32 @@ pub(crate) fn calendar_date_add(
     Ok(jdn_to_iso(jdn))
 }
 
-/// The net number of ordinal-month steps spanned by `years` calendar years
-/// starting at `base_year` (summing each year's variable month count). Used to
-/// fold whole years into a total month count for `largestUnit: "month"`.
-fn months_between_years(cal: &str, base_year: i64, years: i64) -> i64 {
-    let mut total = 0;
-    if years >= 0 {
-        for y in base_year..base_year + years {
-            total += months_in_year_by(cal, y);
-        }
-    } else {
-        for y in base_year + years..base_year {
-            total -= months_in_year_by(cal, y);
-        }
+/// The signed number of ordinal-month steps from `(y_from, o_from)` to
+/// `(y_to, o_to)`, summing each intervening calendar year's variable month count
+/// (which differs across leap years). Positive when the target is later. Used to
+/// fold a whole-years + whole-months difference into a single month total for
+/// `largestUnit: "month"`, where the month count of each year span depends on
+/// exactly which months the leap month falls between — so it cannot be derived
+/// from the year count alone.
+fn ordinal_month_distance(cal: &str, y_from: i64, o_from: i64, y_to: i64, o_to: i64) -> i64 {
+    if (y_from, o_from) == (y_to, o_to) {
+        return 0;
     }
-    total
+    let forward = (y_to, o_to) > (y_from, o_from);
+    let (ya, oa, yb, ob) = if forward {
+        (y_from, o_from, y_to, o_to)
+    } else {
+        (y_to, o_to, y_from, o_from)
+    };
+    // Steps from (ya, oa) to (yb, ob): fill out year ya from oa to its last
+    // month, cross into each subsequent year, and stop at ob. Telescopes to
+    // Σ months_in_year(ya..yb) − oa + ob.
+    let mut sum = 0;
+    for y in ya..yb {
+        sum += months_in_year_by(cal, y);
+    }
+    sum = sum - oa + ob;
+    if forward { sum } else { -sum }
 }
 
 /// `CalendarDateUntil`: the calendar-aware difference from `iso1` to `iso2`, in
@@ -1253,8 +1340,13 @@ pub(crate) fn calendar_date_until(
     let days = iso_to_jdn(iso2) - iso_to_jdn(mid);
 
     if largest_unit == Unit::Month {
-        // Fold whole years into months (each year's month count varies).
-        let total_months = months_between_years(cal, f1.year, years) + months;
+        // Fold the whole-years + whole-months span into one month total by
+        // counting the ordinal-month steps from the start to `mid` directly. This
+        // respects leap years (13 months) and the fact that a same-monthCode year
+        // step spans 12 or 13 ordinal months depending on where the leap month
+        // sits relative to the month — which a per-year-count sum cannot capture.
+        let mid_f = iso_to_fields(cal, mid);
+        let total_months = ordinal_month_distance(cal, f1.year, f1.month, mid_f.year, mid_f.month);
         return DateDurationParts {
             months: total_months,
             days,
@@ -1427,49 +1519,166 @@ mod tests {
         }
     }
 
+    /// Builds an ISO date from `cal` fields `(year, monthCode, day)` with reject.
     #[cfg(feature = "intl")]
-    #[test]
-    fn arith_hebrew_leap_month() {
-        use crate::temporal_iso::Unit;
-        // 5784 is a Hebrew leap year (13 months). Adding one year to a date keeps
-        // the same *ordinal* month position (ICU4X semantics), and month-by-month
-        // addition walks the 13-month year correctly.
-        // Start: an ordinary date, add 1 year, confirm year advances by one.
-        let start = iso(2023, 10, 1); // within Hebrew year 5784.
-        let f0 = iso_to_fields("hebrew", start);
-        let plus1 = calendar_date_add("hebrew", start, 1, 0, 0, 0, Overflow::Constrain).unwrap();
-        let f1 = iso_to_fields("hebrew", plus1);
-        assert_eq!(f1.year, f0.year + 1, "hebrew +1yr advances year");
-        assert_eq!(f1.month, f0.month, "hebrew +1yr keeps ordinal month");
-
-        // Adding months across the leap month Adar I / Adar II must cross 13
-        // months in a leap year: adding monthsInYear months == adding 1 year.
-        let miy = months_in_year("hebrew", start);
-        let via_months =
-            calendar_date_add("hebrew", start, 0, miy, 0, 0, Overflow::Constrain).unwrap();
-        assert_eq!(via_months, plus1, "hebrew +{miy}mo == +1yr");
-
-        // until round-trips the month count.
-        let diff = calendar_date_until("hebrew", start, via_months, Unit::Month);
-        assert_eq!(diff.months, miy, "hebrew until months across leap year");
+    fn from_code(cal: &str, year: i64, code: &str, day: i64) -> IsoDate {
+        fields_to_iso(
+            cal,
+            &FieldsInput {
+                year: Some(year),
+                month_code: Some(code.to_string()),
+                day,
+                ..Default::default()
+            },
+            Overflow::Reject,
+        )
+        .unwrap_or_else(|_| panic!("{cal} {year}-{code}-{day} should be representable"))
     }
 
     #[cfg(feature = "intl")]
     #[test]
-    fn arith_chinese_leap_year() {
-        // Adding a year in the Chinese calendar keeps the ordinal month, even when
-        // the source or target year contains a leap month.
-        let start = iso(2023, 4, 20); // Chinese year 2023 has a leap 2nd month.
-        let f0 = iso_to_fields("chinese", start);
-        let plus1 = calendar_date_add("chinese", start, 1, 0, 0, 0, Overflow::Constrain).unwrap();
-        let f1 = iso_to_fields("chinese", plus1);
-        assert_eq!(f1.year, f0.year + 1, "chinese +1yr advances year");
-        assert_eq!(f1.month, f0.month, "chinese +1yr keeps ordinal month");
-        // Walking monthsInYear months equals one year.
-        let miy = months_in_year("chinese", start);
-        let via_months =
-            calendar_date_add("chinese", start, 0, miy, 0, 0, Overflow::Constrain).unwrap();
-        assert_eq!(via_months, plus1, "chinese +{miy}mo == +1yr");
+    fn arith_hebrew_leap_month() {
+        use crate::temporal_iso::Unit;
+        let code_of = |d: IsoDate| iso_to_fields("hebrew", d).month_code;
+        let year_of = |d: IsoDate| iso_to_fields("hebrew", d).year;
+        let add =
+            |d, y, m| calendar_date_add("hebrew", d, y, m, 0, 0, Overflow::Constrain).unwrap();
+
+        // Year addition preserves the *named* month (monthCode), NOT the raw
+        // ordinal: 5782 (leap) Nisan `M07` is ordinal 8, but +1yr lands on 5783
+        // (common) Nisan `M07`, which is ordinal 7.
+        let nisan_leap = from_code("hebrew", 5782, "M07", 1);
+        let plus1 = add(nisan_leap, 1, 0);
+        assert_eq!(year_of(plus1), 5783, "hebrew +1yr advances year");
+        assert_eq!(code_of(plus1), "M07", "hebrew +1yr preserves monthCode");
+
+        // Adar I (`M05L`) of leap 5784 has no counterpart in common 5785: constrain
+        // collapses onto Adar (`M06`); reject throws.
+        let adar1 = from_code("hebrew", 5784, "M05L", 1);
+        let c = add(adar1, 1, 0);
+        assert_eq!(
+            (year_of(c), code_of(c).as_str()),
+            (5785, "M06"),
+            "Adar I +1yr → Adar"
+        );
+        assert!(
+            matches!(
+                calendar_date_add("hebrew", adar1, 1, 0, 0, 0, Overflow::Reject),
+                Err(CalError::Range(_))
+            ),
+            "Adar I +1yr rejects when the leap month is absent"
+        );
+
+        // The leap month is a single ordinal step in the month walk: Tevet (`M04`)
+        // of leap 5784 → +2 = Adar I (`M05L`), +3 = Adar II (`M06`).
+        let tevet = from_code("hebrew", 5784, "M04", 1);
+        assert_eq!(code_of(add(tevet, 0, 2)), "M05L", "M04 +2mo → Adar I");
+        assert_eq!(code_of(add(tevet, 0, 3)), "M06", "M04 +3mo → Adar II");
+
+        // until across a leap boundary: Shevat→Shevat leap→common is a whole year
+        // yet spans 13 ordinal months (the leap year it leaves has 13).
+        let leap_shevat = from_code("hebrew", 5784, "M05", 1);
+        let common2_shevat = from_code("hebrew", 5785, "M05", 1);
+        let y = calendar_date_until("hebrew", leap_shevat, common2_shevat, Unit::Year);
+        assert_eq!((y.years, y.months), (1, 0), "M05→M05 leap→common is 1y");
+        let m = calendar_date_until("hebrew", leap_shevat, common2_shevat, Unit::Month);
+        assert_eq!(m.months, 13, "M05→M05 leap→common is 13mo not 12mo");
+
+        // Calendar-specific constraining in `until`: Adar I → next common Adar
+        // (`M06`) is a full year, but Adar I → next common Shevat (`M05`) is only
+        // 12 months (not a year).
+        let common2_adar = from_code("hebrew", 5785, "M06", 1);
+        let ya = calendar_date_until("hebrew", adar1, common2_adar, Unit::Year);
+        assert_eq!((ya.years, ya.months), (1, 0), "M05L→M06 is 1y");
+        let ys = calendar_date_until("hebrew", adar1, common2_shevat, Unit::Year);
+        assert_eq!((ys.years, ys.months), (0, 12), "M05L→M05 is 12mo not 1y");
+    }
+
+    #[cfg(feature = "intl")]
+    #[test]
+    fn arith_chinese_leap_month() {
+        let code_of = |d: IsoDate| iso_to_fields("chinese", d).month_code;
+        let year_of = |d: IsoDate| iso_to_fields("chinese", d).year;
+
+        // Pick a Chinese leap year from the table and its leap-month number.
+        let leap_year = (2000..=2030)
+            .find(|&y| chinese_leap_month(y) != 0)
+            .expect("a chinese leap year exists in range");
+        let lm = chinese_leap_month(leap_year);
+        let base = format!("M{lm:02}");
+        let leap = format!("M{lm:02}L");
+
+        // Year addition preserves the monthCode.
+        let m08 = from_code("chinese", leap_year, "M08", 1);
+        let plus1 = calendar_date_add("chinese", m08, 1, 0, 0, 0, Overflow::Constrain).unwrap();
+        assert_eq!(year_of(plus1), leap_year + 1, "chinese +1yr advances year");
+        assert_eq!(code_of(plus1), "M08", "chinese +1yr preserves monthCode");
+
+        // The intercalary month is one ordinal step: `M<lm>` + 1 month → `M<lm>L`.
+        let base_iso = from_code("chinese", leap_year, &base, 1);
+        let stepped =
+            calendar_date_add("chinese", base_iso, 0, 1, 0, 0, Overflow::Constrain).unwrap();
+        assert_eq!(code_of(stepped), leap, "M{lm:02} +1mo → M{lm:02}L");
+
+        // Resolving the leap code in a year that lacks it: reject throws, constrain
+        // drops the leap marker onto the base month.
+        let common_year = (leap_year + 1..=2035)
+            .find(|&y| chinese_leap_month(y) == 0)
+            .expect("a chinese common year exists in range");
+        let fi = |ov| {
+            fields_to_iso(
+                "chinese",
+                &FieldsInput {
+                    year: Some(common_year),
+                    month_code: Some(leap.clone()),
+                    day: 1,
+                    ..Default::default()
+                },
+                ov,
+            )
+        };
+        assert!(
+            matches!(fi(Overflow::Reject), Err(CalError::Range(_))),
+            "leap code rejects in common year"
+        );
+        let constrained = fi(Overflow::Constrain).expect("leap code constrains in common year");
+        assert_eq!(
+            code_of(constrained),
+            base,
+            "leap code constrains onto base month"
+        );
+    }
+
+    #[cfg(feature = "intl")]
+    #[test]
+    fn leap_code_validity() {
+        let fi = |cal: &str, y: i64, code: &str, ov| {
+            fields_to_iso(
+                cal,
+                &FieldsInput {
+                    year: Some(y),
+                    month_code: Some(code.to_string()),
+                    day: 1,
+                    ..Default::default()
+                },
+                ov,
+            )
+        };
+        // Hebrew: `M05L` is the only leap code. It exists in leap 5784, is absent
+        // (rejects / constrains to Adar) in common 5783, and any other `M<NN>L` or
+        // an out-of-range `M13` is invalid even under constrain.
+        assert!(fi("hebrew", 5784, "M05L", Overflow::Reject).is_ok());
+        assert!(fi("hebrew", 5783, "M05L", Overflow::Reject).is_err());
+        assert!(fi("hebrew", 5783, "M05L", Overflow::Constrain).is_ok());
+        assert!(fi("hebrew", 5784, "M02L", Overflow::Constrain).is_err());
+        assert!(fi("hebrew", 5779, "M13", Overflow::Constrain).is_err());
+        // Chinese: `M01L` and `M12L` never carry an intercalary month → invalid
+        // even under constrain.
+        assert!(!chinese_leap_num_occurs(1));
+        assert!(!chinese_leap_num_occurs(12));
+        assert!(chinese_leap_num_occurs(6));
+        assert!(fi("chinese", 2001, "M12L", Overflow::Constrain).is_err());
+        assert!(fi("chinese", 2001, "M13", Overflow::Constrain).is_err());
     }
 
     #[cfg(feature = "intl")]
