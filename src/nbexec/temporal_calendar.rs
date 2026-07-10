@@ -26,7 +26,7 @@
 //!   [`in_leap_year`], [`day_of_week`], [`day_of_year`], [`week_of_year`],
 //!   [`year_of_week`], [`days_in_week`].
 
-use crate::temporal_iso::{IsoDate, Overflow};
+use crate::temporal_iso::{IsoDate, MAX_EPOCH_DAYS, MIN_EPOCH_DAYS, Overflow, Unit};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -1058,6 +1058,217 @@ pub(crate) fn year_of_week(cal: &str, iso: IsoDate) -> Option<i64> {
     week_of_year(cal, iso).map(|(_, y)| y)
 }
 
+// ---------------------------------------------------------------------------
+// Public API: calendar-aware date arithmetic (CalendarDateAdd / CalendarDateUntil)
+// ---------------------------------------------------------------------------
+
+/// The four date-portion components of a calendar difference. The caller balances
+/// these (with any time components) into a `Temporal.Duration`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DateDurationParts {
+    pub years: i64,
+    pub months: i64,
+    pub weeks: i64,
+    pub days: i64,
+}
+
+/// A safe bound on a calendar arithmetic year, well outside the representable ISO
+/// range (±273790 years), so the intermediate field→ISO conversion never wraps
+/// its `i32` year. The caller's `ISODateWithinLimits` check is the precise gate.
+const CAL_YEAR_LIMIT: i64 = 500_000;
+
+/// Adds `months` ordinal months to `(year, ord_month)`, walking calendar years —
+/// whose month counts (and leap months) vary — so the ordinal month always stays
+/// in `1..=months_in_year`. Returns the new `(year, ord_month)`.
+fn add_ordinal_months(cal: &str, mut year: i64, mut ord_month: i64, months: i64) -> (i64, i64) {
+    if months >= 0 {
+        let mut rem = months;
+        while rem > 0 {
+            let n = months_in_year_by(cal, year);
+            let room = n - ord_month; // months addable while staying in this year
+            if rem <= room {
+                ord_month += rem;
+                rem = 0;
+            } else {
+                rem -= room + 1; // step to month 1 of the next year
+                year += 1;
+                ord_month = 1;
+            }
+        }
+    } else {
+        let mut rem = -months;
+        while rem > 0 {
+            let room = ord_month - 1; // months subtractable while staying in this year
+            if rem <= room {
+                ord_month -= rem;
+                rem = 0;
+            } else {
+                rem -= ord_month; // step to the last month of the previous year
+                year -= 1;
+                ord_month = months_in_year_by(cal, year);
+            }
+        }
+    }
+    (year, ord_month)
+}
+
+/// `CalendarDateAdd`: adds a date duration to `iso` in `cal`'s own calendar
+/// (variable month lengths + leap months honoured), returning the ISO date.
+///
+/// Order (per the Temporal spec): add `years` to the calendar year and `months`
+/// by walking the calendar, constrain the day to the target month's length
+/// (`overflow`), convert back to ISO, then apply `weeks*7 + days` as a plain,
+/// calendar-independent day offset.
+pub(crate) fn calendar_date_add(
+    cal: &str,
+    iso: IsoDate,
+    years: i64,
+    months: i64,
+    weeks: i64,
+    days: i64,
+    overflow: Overflow,
+) -> Result<IsoDate, CalError> {
+    let f = iso_to_fields(cal, iso);
+    // 1. Add years to the calendar year, then walk the months.
+    let (year, ord_month) = add_ordinal_months(cal, f.year + years, f.month, months);
+    if !(-CAL_YEAR_LIMIT..=CAL_YEAR_LIMIT).contains(&year) {
+        return Err(CalError::Range(format!(
+            "{cal} year {year} is out of the representable range"
+        )));
+    }
+    // 2. Constrain (or reject) the day against the target month's length.
+    let dim = days_in_month_by(cal, year, ord_month);
+    let day = match overflow {
+        Overflow::Constrain => f.day.min(dim.max(1)),
+        Overflow::Reject => {
+            if f.day > dim {
+                return Err(CalError::Range(format!(
+                    "day {} is out of range for {cal} {year}-M{ord_month:02}",
+                    f.day
+                )));
+            }
+            f.day
+        }
+    };
+    // 3. Field → ISO, then apply the plain week/day offset in JDN space.
+    let base = iso_from_parts(cal, year, ord_month, day).ok_or_else(|| {
+        CalError::Range(format!(
+            "{cal} date {year}-{ord_month}-{day} is not representable"
+        ))
+    })?;
+    let jdn = iso_to_jdn(base) + weeks * 7 + days;
+    // Bound the JDN so the final i32-year conversion cannot wrap (the caller's
+    // ISODateWithinLimits check is the precise range gate).
+    let epoch_days = jdn - greg_to_jdn(1970, 1, 1);
+    if !(MIN_EPOCH_DAYS - 2..=MAX_EPOCH_DAYS + 2).contains(&epoch_days) {
+        return Err(CalError::Range(
+            "result is outside the representable range".to_string(),
+        ));
+    }
+    Ok(jdn_to_iso(jdn))
+}
+
+/// The net number of ordinal-month steps spanned by `years` calendar years
+/// starting at `base_year` (summing each year's variable month count). Used to
+/// fold whole years into a total month count for `largestUnit: "month"`.
+fn months_between_years(cal: &str, base_year: i64, years: i64) -> i64 {
+    let mut total = 0;
+    if years >= 0 {
+        for y in base_year..base_year + years {
+            total += months_in_year_by(cal, y);
+        }
+    } else {
+        for y in base_year + years..base_year {
+            total -= months_in_year_by(cal, y);
+        }
+    }
+    total
+}
+
+/// `CalendarDateUntil`: the calendar-aware difference from `iso1` to `iso2`, in
+/// components down to `largest_unit` (Year / Month / Week / Day). Days (and, for
+/// `Week`, weeks) hold the calendar-independent remainder; the caller balances the
+/// result into a `Temporal.Duration`. Signs follow `iso1 → iso2`.
+pub(crate) fn calendar_date_until(
+    cal: &str,
+    iso1: IsoDate,
+    iso2: IsoDate,
+    largest_unit: Unit,
+) -> DateDurationParts {
+    // Day / Week: a pure ISO-day difference (calendar-independent).
+    if matches!(largest_unit, Unit::Week | Unit::Day) {
+        let mut days = iso_to_jdn(iso2) - iso_to_jdn(iso1);
+        let mut weeks = 0;
+        if largest_unit == Unit::Week {
+            weeks = days / 7;
+            days %= 7;
+        }
+        return DateDurationParts {
+            weeks,
+            days,
+            ..Default::default()
+        };
+    }
+    // Year / Month: count whole calendar years, then whole calendar months, then
+    // the leftover days (mirroring DifferenceISODate but calendar-aware). The
+    // reference algorithm adds candidate years/months and backs off if it passes
+    // the target.
+    let jdn1 = iso_to_jdn(iso1);
+    let jdn2 = iso_to_jdn(iso2);
+    if jdn1 == jdn2 {
+        return DateDurationParts::default();
+    }
+    let sign = if jdn2 > jdn1 { 1 } else { -1 };
+    let f1 = iso_to_fields(cal, iso1);
+    let f2 = iso_to_fields(cal, iso2);
+
+    // Adds to `iso1` with Constrain; on any failure falls back to the anchor
+    // (mirroring the ISO reference's `.unwrap_or(from)`).
+    let add = |y: i64, m: i64| -> IsoDate {
+        calendar_date_add(cal, iso1, y, m, 0, 0, Overflow::Constrain).unwrap_or(iso1)
+    };
+    // Whether `d` lies strictly beyond `iso2` in the `sign` direction.
+    let passes = |d: IsoDate| -> bool {
+        let dd = iso_to_jdn(d) - jdn2;
+        if sign > 0 { dd > 0 } else { dd < 0 }
+    };
+
+    // Whole years: seed with the calendar-year difference, back off any overshoot,
+    // then advance while another whole year still fits.
+    let mut years = f2.year - f1.year;
+    while passes(add(years, 0)) {
+        years -= sign;
+    }
+    while !passes(add(years + sign, 0)) {
+        years += sign;
+    }
+
+    // Whole months within the final year span (bounded by months_in_year).
+    let mut months = 0;
+    while !passes(add(years, months + sign)) {
+        months += sign;
+    }
+
+    let mid = add(years, months);
+    let days = iso_to_jdn(iso2) - iso_to_jdn(mid);
+
+    if largest_unit == Unit::Month {
+        // Fold whole years into months (each year's month count varies).
+        let total_months = months_between_years(cal, f1.year, years) + months;
+        return DateDurationParts {
+            months: total_months,
+            days,
+            ..Default::default()
+        };
+    }
+    DateDurationParts {
+        years,
+        months,
+        days,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1150,6 +1361,147 @@ mod tests {
             let back = fields_to_iso(cal, &input, Overflow::Reject)
                 .unwrap_or_else(|_| panic!("{cal} roundtrip failed"));
             assert_eq!(back, d, "calendar {cal} round-trip");
+        }
+    }
+
+    #[test]
+    fn arith_gregory_matches_iso() {
+        use crate::temporal_iso::{Unit, add_iso_date, difference_iso_date};
+        // The Gregorian calendar's arithmetic year == the ISO year, so
+        // calendar-aware add/until must agree with the ISO reference.
+        let cases = [
+            (iso(2020, 1, 31), 0_i64, 1_i64, 0_i64, 0_i64), // Jan 31 + 1mo -> Feb 29 (constrain)
+            (iso(2021, 1, 31), 0, 1, 0, 0),                 // -> Feb 28
+            (iso(2020, 2, 29), 1, 0, 0, 0),                 // leap day + 1yr -> Feb 28
+            (iso(2023, 6, 15), 2, 5, 1, 10),
+            (iso(2023, 12, 15), 0, 0, 0, 40),
+            (iso(2023, 3, 15), -1, -4, -2, -5),
+        ];
+        for (d, y, m, w, days) in cases {
+            let got = calendar_date_add("gregory", d, y, m, w, days, Overflow::Constrain).unwrap();
+            let want = add_iso_date(d, y, m, w, days, Overflow::Constrain).unwrap();
+            assert_eq!(got, want, "gregory add {d:?} +{y}y{m}m{w}w{days}d");
+        }
+        // until must agree with DifferenceISODate for every date largestUnit.
+        let pairs = [
+            (iso(2020, 1, 15), iso(2023, 6, 20)),
+            (iso(2023, 6, 20), iso(2020, 1, 15)),
+            (iso(2020, 2, 29), iso(2021, 3, 1)),
+            (iso(2019, 12, 31), iso(2020, 1, 1)),
+        ];
+        for lu in [Unit::Year, Unit::Month, Unit::Week, Unit::Day] {
+            for (a, b) in pairs {
+                let got = calendar_date_until("gregory", a, b, lu);
+                let (wy, wm, ww, wd) = difference_iso_date(a, b, lu);
+                assert_eq!(
+                    (got.years, got.months, got.weeks, got.days),
+                    (wy, wm, ww, wd),
+                    "gregory until {a:?}->{b:?} largest {lu:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn arith_add_until_inverse() {
+        use crate::temporal_iso::Unit;
+        // For any calendar, until(a, a+dur) recovers the duration in the same
+        // units when the addition loses nothing (no day constrain).
+        let cals = ["gregory", "coptic", "ethiopic", "indian", "buddhist", "roc"];
+        for cal in cals {
+            let a = iso(2015, 5, 10);
+            let b = calendar_date_add(cal, a, 2, 3, 0, 0, Overflow::Constrain).unwrap();
+            let diff = calendar_date_until(cal, a, b, Unit::Year);
+            // Re-adding the reported difference must land back on b.
+            let back = calendar_date_add(
+                cal,
+                a,
+                diff.years,
+                diff.months,
+                diff.weeks,
+                diff.days,
+                Overflow::Constrain,
+            )
+            .unwrap();
+            assert_eq!(back, b, "{cal} add/until inverse");
+        }
+    }
+
+    #[cfg(feature = "intl")]
+    #[test]
+    fn arith_hebrew_leap_month() {
+        use crate::temporal_iso::Unit;
+        // 5784 is a Hebrew leap year (13 months). Adding one year to a date keeps
+        // the same *ordinal* month position (ICU4X semantics), and month-by-month
+        // addition walks the 13-month year correctly.
+        // Start: an ordinary date, add 1 year, confirm year advances by one.
+        let start = iso(2023, 10, 1); // within Hebrew year 5784.
+        let f0 = iso_to_fields("hebrew", start);
+        let plus1 = calendar_date_add("hebrew", start, 1, 0, 0, 0, Overflow::Constrain).unwrap();
+        let f1 = iso_to_fields("hebrew", plus1);
+        assert_eq!(f1.year, f0.year + 1, "hebrew +1yr advances year");
+        assert_eq!(f1.month, f0.month, "hebrew +1yr keeps ordinal month");
+
+        // Adding months across the leap month Adar I / Adar II must cross 13
+        // months in a leap year: adding monthsInYear months == adding 1 year.
+        let miy = months_in_year("hebrew", start);
+        let via_months =
+            calendar_date_add("hebrew", start, 0, miy, 0, 0, Overflow::Constrain).unwrap();
+        assert_eq!(via_months, plus1, "hebrew +{miy}mo == +1yr");
+
+        // until round-trips the month count.
+        let diff = calendar_date_until("hebrew", start, via_months, Unit::Month);
+        assert_eq!(diff.months, miy, "hebrew until months across leap year");
+    }
+
+    #[cfg(feature = "intl")]
+    #[test]
+    fn arith_chinese_leap_year() {
+        // Adding a year in the Chinese calendar keeps the ordinal month, even when
+        // the source or target year contains a leap month.
+        let start = iso(2023, 4, 20); // Chinese year 2023 has a leap 2nd month.
+        let f0 = iso_to_fields("chinese", start);
+        let plus1 = calendar_date_add("chinese", start, 1, 0, 0, 0, Overflow::Constrain).unwrap();
+        let f1 = iso_to_fields("chinese", plus1);
+        assert_eq!(f1.year, f0.year + 1, "chinese +1yr advances year");
+        assert_eq!(f1.month, f0.month, "chinese +1yr keeps ordinal month");
+        // Walking monthsInYear months equals one year.
+        let miy = months_in_year("chinese", start);
+        let via_months =
+            calendar_date_add("chinese", start, 0, miy, 0, 0, Overflow::Constrain).unwrap();
+        assert_eq!(via_months, plus1, "chinese +{miy}mo == +1yr");
+    }
+
+    #[cfg(feature = "intl")]
+    #[test]
+    fn arith_islamic_constrain() {
+        // Islamic-civil months alternate 30/29 days. Take the 30th of a 30-day
+        // month, add one month, and confirm the day is constrained to the next
+        // month's length.
+        // Find an islamic date on day 30.
+        let mut found = None;
+        for off in 0..40 {
+            let d = jdn_to_iso(iso_to_jdn(iso(2000, 1, 1)) + off);
+            let f = iso_to_fields("islamic-civil", d);
+            if f.day == 30 {
+                found = Some((d, f));
+                break;
+            }
+        }
+        let (d, f) = found.expect("a day-30 islamic-civil date exists in range");
+        let next = calendar_date_add("islamic-civil", d, 0, 1, 0, 0, Overflow::Constrain).unwrap();
+        let nf = iso_to_fields("islamic-civil", next);
+        // Same year (unless the month wrapped) and day <= that month's length.
+        let dim = days_in_month("islamic-civil", next);
+        assert!(nf.day <= dim, "islamic constrain: day {} <= {dim}", nf.day);
+        assert!(nf.day <= f.day, "islamic constrain never grows the day");
+        // Reject must throw when the source day exceeds the target month length.
+        if dim < 30 {
+            let rejected = calendar_date_add("islamic-civil", d, 0, 1, 0, 0, Overflow::Reject);
+            assert!(
+                matches!(rejected, Err(CalError::Range(_))),
+                "islamic reject overflows"
+            );
         }
     }
 

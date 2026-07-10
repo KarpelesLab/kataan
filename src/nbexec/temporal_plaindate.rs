@@ -94,8 +94,8 @@ impl<'a> Interp<'a> {
             "subtract" => self.pd_add(data.date, &cal, arg(0), arg(1), true),
             "with" => self.pd_with(data.date, &cal, arg(0), arg(1)),
             "withCalendar" => self.pd_with_calendar(data.date, arg(0)),
-            "until" => self.pd_difference(data.date, arg(0), arg(1), false),
-            "since" => self.pd_difference(data.date, arg(0), arg(1), true),
+            "until" => self.pd_difference(data.date, &cal, arg(0), arg(1), false),
+            "since" => self.pd_difference(data.date, &cal, arg(0), arg(1), true),
             "equals" => {
                 let (other, ocal) = self.pd_to_temporal_date(arg(0), NanBox::undefined())?;
                 Ok(NanBox::boolean(other == data.date && ocal == cal))
@@ -942,10 +942,10 @@ impl<'a> Interp<'a> {
 
     /// `add` / `subtract`: adds (or, when `negate`, subtracts) a Duration.
     ///
-    /// Wave 1 note: the arithmetic itself is still performed in the ISO calendar;
-    /// only the calendar *id* is carried onto the result (so `calendarId` and the
-    /// field getters stay correct). Calendar-aware year/month addition is a later
-    /// wave — the affected non-ISO `add`/`subtract` tests remain ledgered.
+    /// The ISO-8601 calendar takes the shared ISO fast path (`AddISODate`); every
+    /// other calendar routes through [`tcal::calendar_date_add`], which honours
+    /// the calendar's variable month lengths and leap months (adding years/months
+    /// in calendar terms, then weeks/days as a plain day offset).
     fn pd_add(
         &mut self,
         date: IsoDate,
@@ -970,20 +970,35 @@ impl<'a> Interp<'a> {
             };
         }
         let overflow = self.pd_overflow(options)?;
-        // Guard against a year that would overflow the i32 in the shared
-        // year/month balancing (huge `years`/`months` durations).
-        let approx_year =
-            i64::from(date.year) + d.years + (i64::from(date.month) + d.months - 1).div_euclid(12);
-        if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&approx_year) {
-            return Err(self.pd_range_error("result is outside the representable range"));
-        }
         // The sub-day time part contributes only its whole-day carry to a date.
         let extra_days = (d.time_nanos() / temporal_iso::NS_PER_DAY) as i64;
         let days = d.days + extra_days;
-        match add_iso_date(date, d.years, d.months, d.weeks, days, overflow) {
-            Some(result) if Self::pd_in_range(result) => Ok(self.pd_new_cal(result, cal)),
-            _ => Err(self.pd_range_error("result is outside the representable range")),
+        if tcal::is_iso(cal) {
+            // ISO fast path — byte-for-byte the original computation.
+            // Guard against a year that would overflow the i32 in the shared
+            // year/month balancing (huge `years`/`months` durations).
+            let approx_year = i64::from(date.year)
+                + d.years
+                + (i64::from(date.month) + d.months - 1).div_euclid(12);
+            if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&approx_year) {
+                return Err(self.pd_range_error("result is outside the representable range"));
+            }
+            return match add_iso_date(date, d.years, d.months, d.weeks, days, overflow) {
+                Some(result) if Self::pd_in_range(result) => Ok(self.pd_new_cal(result, cal)),
+                _ => Err(self.pd_range_error("result is outside the representable range")),
+            };
         }
+        // Non-ISO: calendar-aware year/month addition through the calendar layer.
+        let result =
+            match tcal::calendar_date_add(cal, date, d.years, d.months, d.weeks, days, overflow) {
+                Ok(r) => r,
+                Err(tcal::CalError::Range(m)) => return Err(self.pd_range_error(&m)),
+                Err(tcal::CalError::MissingFields(m)) => return Err(self.type_error(&m)),
+            };
+        if !Self::pd_in_range(result) {
+            return Err(self.pd_range_error("result is outside the representable range"));
+        }
+        Ok(self.pd_new_cal(result, cal))
     }
 
     /// `ToTemporalDuration`: a Duration instance, an ISO string, or a property
@@ -1224,11 +1239,19 @@ impl<'a> Interp<'a> {
     fn pd_difference(
         &mut self,
         date: IsoDate,
+        cal: &str,
         other: NanBox,
         options: NanBox,
         negate: bool,
     ) -> Result<NanBox, ExecError> {
-        let (other_date, _) = self.pd_to_temporal_date(other, NanBox::undefined())?;
+        let (other_date, other_cal) = self.pd_to_temporal_date(other, NanBox::undefined())?;
+        // A non-ISO receiver requires both dates to share the same calendar (the
+        // ISO fast path keeps its original, calendar-agnostic behaviour).
+        if !tcal::is_iso(cal) && other_cal != cal {
+            return Err(self.pd_range_error(
+                "cannot compute the difference between dates of different calendars",
+            ));
+        }
         let opts = self.pd_options(options)?;
         let smallest = self.pd_unit_option(opts, "smallestUnit", false)?;
         let largest_raw = self.pd_unit_option(opts, "largestUnit", true)?;
@@ -1269,8 +1292,13 @@ impl<'a> Interp<'a> {
         // for `since` (matching `DifferenceTemporalPlainDate` +
         // `NegateRoundingMode`).
         let round_mode = pd_round_mode_from_str(mode.as_deref(), negate);
-        let mut duration =
-            self.pd_round_date_diff(date, other_date, largest, smallest, increment, round_mode);
+        let mut duration = if tcal::is_iso(cal) {
+            self.pd_round_date_diff(date, other_date, largest, smallest, increment, round_mode)
+        } else {
+            self.pd_round_date_diff_cal(
+                cal, date, other_date, largest, smallest, increment, round_mode,
+            )
+        };
         if negate {
             duration.years = -duration.years;
             duration.months = -duration.months;
@@ -1350,6 +1378,103 @@ impl<'a> Interp<'a> {
             r1 += sign;
         }
         for _ in 0..12 {
+            if beyond(step(r1)) {
+                r1 -= sign;
+            } else {
+                break;
+            }
+        }
+        let e1 = step(r1);
+        let count = if e1 == to_e {
+            r1
+        } else {
+            let e2 = step(r1 + sign);
+            let den = i128::from((e2 - e1).abs().max(1));
+            let num = i128::from((to_e - e1).abs());
+            let x = i128::from(r1) * den + i128::from(sign) * num;
+            (round_inc(x, i128::from(increment.max(1)) * den, mode) / den) as i64
+        };
+        match smallest {
+            Unit::Year => out.years = count,
+            Unit::Month => out.months = count,
+            _ => out.weeks = count,
+        }
+        out
+    }
+
+    /// The calendar-aware analogue of [`Self::pd_round_date_diff`] for a non-ISO
+    /// calendar: the `from → to` difference is measured in the calendar's own
+    /// year/month terms (via [`tcal::calendar_date_until`]) and the coarse-unit
+    /// nudge steps with [`tcal::calendar_date_add`], so month lengths and leap
+    /// months are honoured. The rounding structure mirrors the ISO path exactly.
+    #[allow(clippy::too_many_arguments)]
+    fn pd_round_date_diff_cal(
+        &self,
+        cal: &str,
+        from: IsoDate,
+        to: IsoDate,
+        largest: Unit,
+        smallest: Unit,
+        increment: i64,
+        mode: crate::temporal_iso::RoundMode,
+    ) -> DurationFields {
+        use crate::temporal_iso::{iso_to_epoch_days, round_to_increment as round_inc};
+        let parts = tcal::calendar_date_until(cal, from, to, largest);
+        let (years, months, weeks, days) = (parts.years, parts.months, parts.weeks, parts.days);
+        if smallest == Unit::Day {
+            let d = round_inc(i128::from(days), i128::from(increment.max(1)), mode) as i64;
+            return DurationFields {
+                years,
+                months,
+                weeks,
+                days: d,
+                ..Default::default()
+            };
+        }
+        // Keep components coarser than `smallest`; round the `smallest` count.
+        let (keep_y, keep_m) = match smallest {
+            Unit::Year => (0, 0),
+            Unit::Month => (years, 0),
+            _ => (years, months), // Week
+        };
+        // Calendar-aware add relative to a base (Constrain, falling back on error).
+        let cadd = |base: IsoDate, y: i64, m: i64, w: i64| -> IsoDate {
+            tcal::calendar_date_add(cal, base, y, m, w, 0, Overflow::Constrain).unwrap_or(base)
+        };
+        let anchor = cadd(from, keep_y, keep_m, 0);
+        let anchor_e = iso_to_epoch_days(anchor);
+        let to_e = iso_to_epoch_days(to);
+        let sign = (to_e - anchor_e).signum();
+        let mut out = DurationFields {
+            years: keep_y,
+            months: keep_m,
+            ..Default::default()
+        };
+        if sign == 0 {
+            return out;
+        }
+        let sub = tcal::calendar_date_until(cal, anchor, to, smallest);
+        let mut r1 = match smallest {
+            Unit::Year => sub.years,
+            Unit::Month => sub.months,
+            _ => sub.weeks,
+        };
+        let step = |count: i64| -> i64 {
+            let (y, m, w) = match smallest {
+                Unit::Year => (count, 0, 0),
+                Unit::Month => (0, count, 0),
+                _ => (0, 0, count),
+            };
+            iso_to_epoch_days(cadd(anchor, y, m, w))
+        };
+        let beyond = |e: i64| if sign > 0 { e > to_e } else { e < to_e };
+        for _ in 0..14 {
+            if beyond(step(r1 + sign)) {
+                break;
+            }
+            r1 += sign;
+        }
+        for _ in 0..14 {
             if beyond(step(r1)) {
                 r1 -= sign;
             } else {
