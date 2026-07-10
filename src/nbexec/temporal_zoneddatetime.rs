@@ -1544,7 +1544,7 @@ impl<'a> Interp<'a> {
 
         // Merge date fields: an explicit year (or era+eraYear) wins; otherwise keep
         // the receiver's year. Prefer monthCode to preserve leap months.
-        let (year, era, era_year) = if year.is_some() || (era.is_some() && era_year.is_some()) {
+        let (year, era, era_year) = if year.is_some() || era.is_some() || era_year.is_some() {
             (year, era, era_year)
         } else {
             (Some(existing.year), None, None)

@@ -562,10 +562,15 @@ impl<'a> Interp<'a> {
         let Some(day) = day else {
             return Err(self.type_error("PlainMonthDay: 'day' is required"));
         };
-        if era.is_some() != era_year.is_some() {
+        // era / eraYear only carry meaning for calendars that use eras; for
+        // iso8601 / chinese / dangi they are ignored entirely (no pairing check,
+        // no year contribution), so a bare `{ era, eraYear, monthCode, day }`
+        // still resolves through the monthCode-only reference path.
+        if tcal::has_eras(cal) && era.is_some() != era_year.is_some() {
             return Err(self.type_error("PlainMonthDay: era and eraYear must both be present"));
         }
-        let has_year = year.is_some() || (era.is_some() && era_year.is_some());
+        let has_year =
+            year.is_some() || (tcal::has_eras(cal) && era.is_some() && era_year.is_some());
         if month_code.is_none() && month.is_none() {
             return Err(self.type_error("PlainMonthDay: 'month' or 'monthCode' is required"));
         }

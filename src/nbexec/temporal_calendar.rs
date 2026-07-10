@@ -137,20 +137,28 @@ fn greg_to_jdn(year: i64, month: i64, day: i64) -> i64 {
     let a = (14 - month).div_euclid(12);
     let y = year + 4800 - a;
     let m = month + 12 * a - 3;
-    day + (153 * m + 2) / 5 + 365 * y + y / 4 - y / 100 + y / 400 - 32045
+    // Floor division (`div_euclid`) throughout: for proleptic dates far in the BC
+    // era `y` goes negative, where truncating `/` would give the wrong leap-day
+    // count. For any date after ~4801 BC (`y >= 0`) this is identical to `/`.
+    day + (153 * m + 2).div_euclid(5) + 365 * y + y.div_euclid(4) - y.div_euclid(100)
+        + y.div_euclid(400)
+        - 32045
 }
 
 /// The proleptic Gregorian `(year, month, day)` of a Julian Day Number.
 fn jdn_to_greg(jdn: i64) -> (i64, i64, i64) {
+    // Floor division throughout: the intermediate `a = jdn + 32044` goes negative
+    // for JDNs before ~4801 BC, where truncating `/` on the century terms would be
+    // off by one. For any JDN >= -32044 this matches the classic truncating form.
     let a = jdn + 32044;
     let b = (4 * a + 3).div_euclid(146097);
-    let c = a - 146097 * b / 4;
-    let d = (4 * c + 3) / 1461;
-    let e = c - 1461 * d / 4;
-    let m = (5 * e + 2) / 153;
-    let day = e - (153 * m + 2) / 5 + 1;
-    let month = m + 3 - 12 * (m / 10);
-    let year = 100 * b + d - 4800 + m / 10;
+    let c = a - (146097 * b).div_euclid(4);
+    let d = (4 * c + 3).div_euclid(1461);
+    let e = c - (1461 * d).div_euclid(4);
+    let m = (5 * e + 2).div_euclid(153);
+    let day = e - (153 * m + 2).div_euclid(5) + 1;
+    let month = m + 3 - 12 * m.div_euclid(10);
+    let year = 100 * b + d - 4800 + m.div_euclid(10);
     (year, month, day)
 }
 
@@ -302,21 +310,45 @@ fn islamic_to_jdn(_cal: &str, y: i64, m: i64, d: i64) -> i64 {
     greg_to_jdn(y, m, d)
 }
 
-#[cfg(feature = "intl")]
+/// JDN of 1 Farvardin, Persian (Solar Hijri) year 1.
+const PERSIAN_EPOCH: i64 = 1_948_321;
+
+/// Persian (Solar Hijri) `(year, month, day)` → JDN, using the arithmetic
+/// 2820-year cycle. Unlike the `intl` crate's historical variant (which has no
+/// year 0 and collapses years 0 and -1), this is the *proleptic* form Temporal
+/// requires: a continuous `epbase = year - 474` for all years, so year 0 exists
+/// and non-positive years round-trip. For every year >= 1 it is bit-identical to
+/// the crate's tabular algorithm.
+fn persian_to_jdn(year: i64, month: i64, day: i64) -> i64 {
+    let epbase = year - 474;
+    let epyear = 474 + epbase.rem_euclid(2820);
+    let month_days = if month <= 7 {
+        (month - 1) * 31
+    } else {
+        (month - 1) * 30 + 6
+    };
+    day + month_days
+        + (epyear * 682 - 110).div_euclid(2816)
+        + (epyear - 1) * 365
+        + epbase.div_euclid(2820) * 1_029_983
+        + (PERSIAN_EPOCH - 1)
+}
+
+/// The Persian (Solar Hijri) `(year, month, day)` of a Julian Day Number.
 fn persian_from_jdn(jdn: i64) -> (i64, i64, i64) {
-    intl::calendar::jdn_to_persian(jdn)
-}
-#[cfg(feature = "intl")]
-fn persian_to_jdn(y: i64, m: i64, d: i64) -> i64 {
-    intl::calendar::persian_to_jdn(y, m, d)
-}
-#[cfg(not(feature = "intl"))]
-fn persian_from_jdn(jdn: i64) -> (i64, i64, i64) {
-    jdn_to_greg(jdn)
-}
-#[cfg(not(feature = "intl"))]
-fn persian_to_jdn(y: i64, m: i64, d: i64) -> i64 {
-    greg_to_jdn(y, m, d)
+    let mut year = 475 + (jdn - PERSIAN_EPOCH).div_euclid(366);
+    while persian_to_jdn(year, 1, 1) > jdn {
+        year -= 1;
+    }
+    while persian_to_jdn(year + 1, 1, 1) <= jdn {
+        year += 1;
+    }
+    let mut month = 1;
+    while month < 12 && persian_to_jdn(year, month + 1, 1) <= jdn {
+        month += 1;
+    }
+    let day = jdn - persian_to_jdn(year, month, 1) + 1;
+    (year, month, day)
 }
 
 #[cfg(feature = "intl")]
@@ -673,13 +705,21 @@ fn derive_era(cal: &str, year: i64, iso: IsoDate) -> (Option<String>, Option<i64
 /// else Gregorian `ce`/`bce`.
 fn derive_japanese_era(iso: IsoDate) -> (Option<String>, Option<i64>) {
     // Meiji began 1868-10-23.
-    if (
+    let ymd = (
         i64::from(iso.year),
         i64::from(iso.month),
         i64::from(iso.day),
-    ) >= (1868, 10, 23)
-    {
+    );
+    if ymd >= (1868, 10, 23) {
         let (name, ey) = japanese_era_name(iso);
+        // ICU4X (and thus Temporal) only labels dates on/after Japan's Gregorian
+        // adoption (1873-01-01) with the "meiji" era; the traditional Meiji reign
+        // days of 1868-1872 read back as the gregorian "ce" era instead. The
+        // eraYear anchor is unchanged (so "meiji" input still counts from 1868 and
+        // 1873 reads back as Meiji 6).
+        if name == "meiji" && ymd < (1873, 1, 1) {
+            return (Some("ce".to_string()), Some(i64::from(iso.year)));
+        }
         (Some(name), Some(ey))
     } else if iso.year >= 1 {
         (Some("ce".to_string()), Some(i64::from(iso.year)))
@@ -936,6 +976,32 @@ pub(crate) fn fields_to_iso(
     input: &FieldsInput,
     overflow: Overflow,
 ) -> Result<IsoDate, CalError> {
+    // Era / eraYear validation for calendars that use eras. These checks run even
+    // when a plain `year` is also present (an `era` still has to be a real era for
+    // the calendar, and `era`/`eraYear` must always come as a pair).
+    if has_eras(cal) {
+        match (input.era.as_deref(), input.era_year) {
+            // A complete pair: the era code must be valid for this calendar. The
+            // `eraYear` itself is left unchecked here so that out-of-bounds regnal
+            // values remap leniently on read (e.g. Reiwa 1 January → Heisei 31).
+            (Some(era), Some(ey)) => {
+                if era_to_year(cal, era, ey).is_none() {
+                    return Err(CalError::Range(format!(
+                        "{era} is not a valid era in calendar {cal}"
+                    )));
+                }
+            }
+            (None, None) => {}
+            // Exactly one of `era` / `eraYear` supplied → a TypeError per
+            // CalendarResolveFields (they are mutually required).
+            _ => {
+                return Err(CalError::MissingFields(
+                    "era and eraYear must be provided together".to_string(),
+                ));
+            }
+        }
+    }
+
     // Resolve the arithmetic year.
     let year = if let Some(y) = input.year {
         y
@@ -1309,30 +1375,42 @@ pub(crate) fn calendar_date_until(
     let f1 = iso_to_fields(cal, iso1);
     let f2 = iso_to_fields(cal, iso2);
 
+    let f1_day = f1.day;
     // Adds to `iso1` with Constrain; on any failure falls back to the anchor
     // (mirroring the ISO reference's `.unwrap_or(from)`).
     let add = |y: i64, m: i64| -> IsoDate {
         calendar_date_add(cal, iso1, y, m, 0, 0, Overflow::Constrain).unwrap_or(iso1)
     };
-    // Whether `d` lies strictly beyond `iso2` in the `sign` direction.
-    let passes = |d: IsoDate| -> bool {
-        let dd = iso_to_jdn(d) - jdn2;
-        if sign > 0 { dd > 0 } else { dd < 0 }
+    // Whether a candidate `(years, months)` step lands strictly beyond `iso2`.
+    //
+    // The overshoot is measured with the *ideal* (unconstrained) day-of-month —
+    // the anchor's own day, even when that day does not exist in the target month.
+    // Comparing the constrained landing date instead would hide a real overshoot:
+    // e.g. Jan 29 + 1 month lands on the non-existent Feb 29, which constrains down
+    // to Feb 28 and would look like an exact one-month hit, when Temporal treats it
+    // as 30 days (not a whole month). Because a calendar's `(year, ordinalMonth,
+    // day)` triple is monotonic in real time, a lexicographic compare is valid even
+    // for an out-of-range `day`.
+    let passes = |y: i64, m: i64| -> bool {
+        let tf = iso_to_fields(cal, add(y, m));
+        let a = (tf.year, tf.month, f1_day);
+        let b = (f2.year, f2.month, f2.day);
+        if sign > 0 { a > b } else { a < b }
     };
 
     // Whole years: seed with the calendar-year difference, back off any overshoot,
     // then advance while another whole year still fits.
     let mut years = f2.year - f1.year;
-    while passes(add(years, 0)) {
+    while passes(years, 0) {
         years -= sign;
     }
-    while !passes(add(years + sign, 0)) {
+    while !passes(years + sign, 0) {
         years += sign;
     }
 
     // Whole months within the final year span (bounded by months_in_year).
     let mut months = 0;
-    while !passes(add(years, months + sign)) {
+    while !passes(years, months + sign) {
         months += sign;
     }
 
@@ -1722,5 +1800,156 @@ mod tests {
         assert_eq!(f.year, 1);
         assert_eq!(f.month, 1);
         assert_eq!(f.day, 1);
+    }
+
+    #[test]
+    fn greg_jdn_roundtrip_bc() {
+        // Floor-division fix: proleptic Gregorian <-> JDN must round-trip for
+        // dates deep in the BC era (JDN < -32044), where the classic truncating
+        // formula was off by one. Also confirm nothing changed for a modern date.
+        for &j in &[
+            -300000i64, -284654, -50000, -32045, -32044, 0, 2_451_545, 3_000_000,
+        ] {
+            let (y, m, d) = jdn_to_greg(j);
+            assert_eq!(greg_to_jdn(y, m, d), j, "greg roundtrip at jdn {j}");
+        }
+        // The J2000 epoch (2000-01-01 12:00 UT is JDN 2451545).
+        assert_eq!(jdn_to_greg(2_451_545), (2000, 1, 1));
+    }
+
+    fn from_era(cal: &str, era: &str, ey: i64, code: &str) -> Result<IsoDate, CalError> {
+        fields_to_iso(
+            cal,
+            &FieldsInput {
+                era: Some(era.to_string()),
+                era_year: Some(ey),
+                month_code: Some(code.to_string()),
+                day: 1,
+                ..Default::default()
+            },
+            Overflow::Reject,
+        )
+    }
+
+    #[cfg(feature = "intl")]
+    #[test]
+    fn non_positive_single_era_year_roundtrips() {
+        // Single-era calendars: eraYear equals the arithmetic year and must
+        // round-trip for non-positive values (regression: ethioaa +1 and persian
+        // -1 collapsed to 0 before the coptic-BC / continuous-persian fixes).
+        // Gated on `intl` because hebrew needs the crate's month data.
+        for (cal, era) in [
+            ("ethioaa", "aa"),
+            ("coptic", "am"),
+            ("buddhist", "be"),
+            ("hebrew", "am"),
+            ("indian", "shaka"),
+            ("persian", "ap"),
+        ] {
+            for ey in [-1i64, 0, 1] {
+                let d = from_era(cal, era, ey, "M01").expect("resolves");
+                let f = iso_to_fields(cal, d);
+                assert_eq!(f.era.as_deref(), Some(era), "{cal} era");
+                assert_eq!(f.era_year, Some(ey), "{cal} eraYear {ey} round-trips");
+                assert_eq!(f.year, ey, "{cal} year == eraYear for {ey}");
+            }
+        }
+    }
+
+    #[cfg(feature = "intl")]
+    #[test]
+    fn persian_year_zero_exists() {
+        // Temporal's proleptic Persian has a real year 0 distinct from year -1
+        // (the intl crate's historical variant collapses them).
+        let jm1 = iso_to_jdn(from_era("persian", "ap", -1, "M01").unwrap());
+        let j0 = iso_to_jdn(from_era("persian", "ap", 0, "M01").unwrap());
+        let j1 = iso_to_jdn(from_era("persian", "ap", 1, "M01").unwrap());
+        assert!(jm1 < j0 && j0 < j1, "persian years -1 < 0 < 1 are ordered");
+        // Each proleptic year is a full 365- or 366-day solar year (no collapse).
+        assert!((365..=366).contains(&(j1 - j0)), "persian year 0 length");
+        assert!((365..=366).contains(&(j0 - jm1)), "persian year -1 length");
+    }
+
+    #[cfg(feature = "intl")]
+    #[test]
+    fn japanese_meiji_era_label_boundary() {
+        // ICU / Temporal only label dates on/after the 1873-01-01 Gregorian
+        // adoption as "meiji"; the traditional Meiji days of 1868-1872 read back
+        // as the gregorian "ce" era, while 1873 reads back as Meiji 6.
+        let f = iso_to_fields("japanese", iso(1868, 10, 23));
+        assert_eq!(f.era.as_deref(), Some("ce"));
+        assert_eq!(f.era_year, Some(1868));
+        let f = iso_to_fields("japanese", iso(1872, 12, 31));
+        assert_eq!(f.era.as_deref(), Some("ce"));
+        let f = iso_to_fields("japanese", iso(1873, 1, 1));
+        assert_eq!(f.era.as_deref(), Some("meiji"));
+        assert_eq!(f.era_year, Some(6));
+        // A later modern era is unaffected.
+        let f = iso_to_fields("japanese", iso(2019, 5, 1));
+        assert_eq!(f.era.as_deref(), Some("reiwa"));
+        assert_eq!(f.era_year, Some(1));
+    }
+
+    #[test]
+    fn era_erayear_pairing_and_validity() {
+        // Exactly one of era / eraYear → TypeError (MissingFields); an unknown era
+        // code (even alongside a valid year) → RangeError; a valid pair resolves.
+        let only_era = fields_to_iso(
+            "gregory",
+            &FieldsInput {
+                era: Some("ce".to_string()),
+                year: Some(2000),
+                month_code: Some("M01".to_string()),
+                day: 1,
+                ..Default::default()
+            },
+            Overflow::Reject,
+        );
+        assert!(matches!(only_era, Err(CalError::MissingFields(_))));
+
+        let only_erayear = fields_to_iso(
+            "gregory",
+            &FieldsInput {
+                era_year: Some(1),
+                month_code: Some("M01".to_string()),
+                day: 1,
+                ..Default::default()
+            },
+            Overflow::Reject,
+        );
+        assert!(matches!(only_erayear, Err(CalError::MissingFields(_))));
+
+        let bad_era = fields_to_iso(
+            "buddhist",
+            &FieldsInput {
+                era: Some("xyz".to_string()),
+                era_year: Some(2025),
+                year: Some(2025),
+                month_code: Some("M01".to_string()),
+                day: 1,
+                ..Default::default()
+            },
+            Overflow::Reject,
+        );
+        assert!(matches!(bad_era, Err(CalError::Range(_))));
+
+        // A non-era calendar ignores era/eraYear entirely.
+        assert!(
+            fields_to_iso(
+                "iso8601",
+                &FieldsInput {
+                    era: Some("xyz".to_string()),
+                    era_year: Some(1),
+                    year: Some(1970),
+                    month_code: Some("M01".to_string()),
+                    day: 1,
+                    ..Default::default()
+                },
+                Overflow::Reject,
+            )
+            .is_ok()
+        );
+        // "ad" is an accepted alias for "ce".
+        assert!(from_era("gregory", "ad", 2024, "M01").is_ok());
     }
 }

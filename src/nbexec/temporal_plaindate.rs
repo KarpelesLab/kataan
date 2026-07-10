@@ -1191,7 +1191,11 @@ impl<'a> Interp<'a> {
         // Merge: an explicit year (or era+eraYear) wins; otherwise keep the
         // receiver's year. Likewise for month (prefer monthCode to preserve leap
         // months) and day.
-        let (year, era, era_year) = if year.is_some() || (era.is_some() && era_year.is_some()) {
+        // If the caller supplies *any* of the year group (year / era / eraYear),
+        // pass exactly what they gave through to the layer, which validates the
+        // combination (e.g. eraYear alone → TypeError). Only when none is present
+        // do we fall back to the receiver's year.
+        let (year, era, era_year) = if year.is_some() || era.is_some() || era_year.is_some() {
             (year, era, era_year)
         } else {
             (Some(existing.year), None, None)

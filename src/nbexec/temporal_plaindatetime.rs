@@ -956,7 +956,7 @@ impl<'a> Interp<'a> {
         // receiver's year. Likewise for month (prefer monthCode to preserve leap
         // months) and day.
         let (year, era, era_year) =
-            if bag.year.is_some() || (bag.era.is_some() && bag.era_year.is_some()) {
+            if bag.year.is_some() || bag.era.is_some() || bag.era_year.is_some() {
                 (bag.year, bag.era.clone(), bag.era_year)
             } else {
                 (Some(existing.year), None, None)

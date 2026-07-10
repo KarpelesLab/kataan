@@ -982,7 +982,7 @@ impl<'a> Interp<'a> {
         // receiver's year. Likewise for month (prefer monthCode to preserve leap
         // months).
         let (year, era, era_year) =
-            if provided.year.is_some() || (provided.era.is_some() && provided.era_year.is_some()) {
+            if provided.year.is_some() || provided.era.is_some() || provided.era_year.is_some() {
                 (provided.year, provided.era, provided.era_year)
             } else {
                 (Some(existing.year), None, None)
