@@ -517,22 +517,27 @@ impl Realm {
         self.length_tracking_views.contains(&handle.to_raw())
     }
 
-    /// Whether the fixed-length typed-array view at `handle` is currently *out of
-    /// bounds*: its `[[ByteOffset]] + length·elem_size` exceeds the backing
-    /// buffer's current byte length (e.g. the resizable buffer was shrunk below
-    /// the view's declared extent), or its offset itself is past the end. A
-    /// length-tracking view is never out of bounds (it re-spans on resize); a
-    /// detached buffer is reported separately. Returns `false` for a non-view.
+    /// Whether the typed-array view at `handle` is currently *out of bounds*
+    /// (spec `IsTypedArrayOutOfBounds`). A **fixed-length** view is out of bounds
+    /// when its `[[ByteOffset]] + length·elem_size` exceeds the backing buffer's
+    /// current byte length (e.g. the resizable buffer was shrunk below the view's
+    /// declared extent), or its offset itself is past the end. A **length-tracking**
+    /// view re-spans on resize, so it is out of bounds only when its `[[ByteOffset]]`
+    /// alone exceeds the current byte length (the buffer shrank below where the view
+    /// starts). A detached buffer is reported separately. Returns `false` for a
+    /// non-view.
     #[must_use]
     pub fn typed_array_out_of_bounds(&self, handle: Handle) -> bool {
         let Some((bytes, off, len, kind)) = self.heap.get(handle).and_then(Cell::as_typed_array)
         else {
             return false;
         };
-        if self.length_tracking_views.contains(&handle.to_raw()) {
-            return false;
-        }
         let cur = self.bytes_len(bytes).unwrap_or(0);
+        if self.length_tracking_views.contains(&handle.to_raw()) {
+            // A length-tracking view's extent always equals the current buffer end,
+            // so it is out of bounds only when its start offset is past that end.
+            return off > cur;
+        }
         let size = typed_elem_size(kind);
         off.checked_add(len.saturating_mul(size))
             .is_none_or(|end| end > cur)
@@ -1054,7 +1059,12 @@ impl Realm {
     /// vector, or `None` if it is not a view. `BigInt64Array`/`BigUint64Array`
     /// elements decode to freshly allocated `BigInt`s (hence `&mut self`).
     pub fn typed_elements(&mut self, handle: Handle) -> Option<Vec<NanBox>> {
-        let (buffer, byte_offset, length, kind) = self.heap.get(handle)?.as_typed_array()?;
+        let (buffer, byte_offset, _len, kind) = self.heap.get(handle)?.as_typed_array()?;
+        // Use the *effective* element count (0 for an out-of-bounds view whose
+        // resizable buffer shrank below its extent/offset), not the stored
+        // `[[ArrayLength]]`, so every reader (iteration, spread, generic
+        // `Array.prototype` methods, JSON, …) observes the collapsed length.
+        let length = self.typed_len(handle)?;
         let size = typed_elem_size(kind);
         if is_bigint_kind(kind) {
             // Decode the raw BigInts first (immutable borrow of the bytes), then

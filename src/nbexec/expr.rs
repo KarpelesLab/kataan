@@ -2921,6 +2921,38 @@ impl<'a> Interp<'a> {
                     self.type_error("Cannot perform DataView operation on a detached ArrayBuffer")
                 );
             }
+            // IsViewOutOfBounds: a resizable buffer shrank under the view — its
+            // `byteLength`/`byteOffset` getters then throw a TypeError. A
+            // length-tracking DataView (no recorded length) is out of bounds only
+            // when its offset alone is past the current end; a fixed-length view
+            // when its offset+length no longer fits.
+            if matches!(name, "byteLength" | "byteOffset")
+                && let Some(bh) = buf.as_handle().map(Handle::from_raw)
+            {
+                let total = self
+                    .array_buffer_bytes(bh)
+                    .and_then(|b| self.realm.bytes_len(b))
+                    .unwrap_or(0);
+                let off = self
+                    .realm
+                    .get_property(handle, DATA_VIEW_OFF)
+                    .and_then(|n| n.as_number())
+                    .unwrap_or(0.0) as usize;
+                let recorded = self
+                    .realm
+                    .get_property(handle, DATA_VIEW_LEN)
+                    .and_then(|n| n.as_number())
+                    .map(|n| n as usize);
+                let oob = match recorded {
+                    Some(len) => off.checked_add(len).is_none_or(|end| end > total),
+                    None => off > total,
+                };
+                if oob {
+                    return Err(
+                        self.type_error("get DataView.prototype accessor on an out-of-bounds view")
+                    );
+                }
+            }
             return Ok(match name {
                 "buffer" => buf,
                 "byteOffset" => self

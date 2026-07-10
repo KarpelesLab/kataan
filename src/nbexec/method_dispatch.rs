@@ -37,7 +37,13 @@ impl<'a> Interp<'a> {
         // empty array). `subarray` (builds a fresh view) is exempt. `toString` is
         // *not* exempt: it is `Array.prototype.toString`, which delegates to
         // `%TypedArray%.prototype.join`, so ValidateTypedArray applies to it too.
+        //
+        // This validation is specific to the *branded* `%TypedArray%.prototype`
+        // entry points; a **generic** `Array.prototype.<m>.call(ta)` (the
+        // `array_proto_generic` one-shot) runs the ordinary array-like algorithm,
+        // which reads the view's (0-for-out-of-bounds) length instead of throwing.
         if let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && !self.array_proto_generic
             && self.realm.typed_kind(h).is_some()
             && !matches!(method, "subarray" | "constructor")
             && TYPED_ARRAY_PROTO_METHODS.iter().any(|(n, _)| *n == method)
@@ -50,8 +56,9 @@ impl<'a> Interp<'a> {
         // ValidateTypedArray also rejects a view that is *out of bounds* (a
         // fixed-length view whose resizable buffer shrank below its declared
         // extent) with a TypeError, up front — same exempt set as the detached
-        // guard above.
+        // guard above (and likewise skipped for the generic `Array.prototype` path).
         if let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && !self.array_proto_generic
             && self.realm.typed_kind(h).is_some()
             && !matches!(method, "subarray" | "constructor")
             && TYPED_ARRAY_PROTO_METHODS.iter().any(|(n, _)| *n == method)
@@ -3036,6 +3043,21 @@ impl<'a> Interp<'a> {
                         ));
                     }
                     let bytes_h = self.realm.typed_buffer(handle).unwrap();
+                    // The default `new TA(buffer, beginByteOffset, newLength)` also
+                    // validates the range against the *current* buffer byte length
+                    // (the source may be out of bounds, or a coercion may have shrunk
+                    // a resizable buffer): a begin offset past the end — or a fixed
+                    // sub-range that no longer fits — is a RangeError.
+                    let buf_len = self.realm.bytes_len(bytes_h).unwrap_or(0);
+                    if sub_off > buf_len
+                        || sub_off
+                            .checked_add(new_len.saturating_mul(elem_size))
+                            .is_none_or(|e| e > buf_len)
+                    {
+                        let m =
+                            self.new_str("TypedArray.prototype.subarray: offset is out of bounds");
+                        return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                    }
                     let view = self
                         .realm
                         .new_typed_array(bytes_h, abuf, sub_off, new_len, kind);
