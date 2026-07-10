@@ -1320,6 +1320,23 @@ impl<'a> Interp<'a> {
                         self.async_step(fid, target, generator::Resumption::Throw(arg0));
                     }
                 }
+                // Async-generator resume reactions: `target` is the async generator
+                // object. Resume its parked body at the `await` point with the
+                // settled value (fulfil) or by throwing the reason (reject).
+                N_ASYNC_GEN_AWAIT_FULFILL => {
+                    self.async_gen_resume_await(target, generator::Resumption::Next(arg0));
+                }
+                N_ASYNC_GEN_AWAIT_REJECT => {
+                    self.async_gen_resume_await(target, generator::Resumption::Throw(arg0));
+                }
+                // `AsyncGeneratorAwaitReturn` reactions: settle the front request
+                // with the awaited return value, then drain the request queue.
+                N_ASYNC_GEN_RETURN_FULFILL => {
+                    self.async_gen_return_settled(target, arg0, true);
+                }
+                N_ASYNC_GEN_RETURN_REJECT => {
+                    self.async_gen_return_settled(target, arg0, false);
+                }
                 // `NewPromiseCapability` executor: capture (resolve, reject) into the
                 // bound state object. Per spec, each may be set only once.
                 N_PROMISE_CAPABILITY_EXECUTOR => {

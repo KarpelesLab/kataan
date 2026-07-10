@@ -1387,6 +1387,19 @@ const N_ASYNC_RESUME_FULFILL: u16 = 560;
 /// a microtask reaction when an awaited promise rejects — resumes the parked async
 /// body by throwing the rejection reason at the `await` point.
 const N_ASYNC_RESUME_REJECT: u16 = 561;
+/// Async-generator resume on an awaited value fulfilling: bound to the async
+/// generator object, called as a microtask reaction to resume the parked body at
+/// the `await` point with the settled value.
+const N_ASYNC_GEN_AWAIT_FULFILL: u16 = 562;
+/// Async-generator resume on an awaited value rejecting: resumes the parked body
+/// by throwing the rejection reason at the `await` point.
+const N_ASYNC_GEN_AWAIT_REJECT: u16 = 563;
+/// `AsyncGeneratorAwaitReturn` fulfilment: the awaited `return(v)` value settled;
+/// resolve the front request with `{value, done:true}` and drain the queue.
+const N_ASYNC_GEN_RETURN_FULFILL: u16 = 564;
+/// `AsyncGeneratorAwaitReturn` rejection: the awaited `return(v)` value rejected;
+/// reject the front request with the reason and drain the queue.
+const N_ASYNC_GEN_RETURN_REJECT: u16 = 565;
 /// `Object.prototype.__defineGetter__(P, getter)` (Annex B).
 const N_OBJ_DEFINE_GETTER: u16 = 348;
 /// `Object.prototype.__defineSetter__(P, setter)` (Annex B).

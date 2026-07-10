@@ -901,9 +901,13 @@ fn mode_selection_and_skips() {
     let module = parse_meta("/*---\nflags: [module]\n---*/\n");
     assert_eq!(skip_reason("language/module-code/x.js", &module), None);
 
+    // Temporal is implemented now, so it is no longer skipped as an unimplemented
+    // feature. `import-bytes` is still gated, so it stands in as the skip probe.
     let temporal = parse_meta("/*---\nfeatures: [Temporal]\n---*/\n");
+    assert_eq!(skip_reason("built-ins/Temporal/x.js", &temporal), None);
+    let unimpl = parse_meta("/*---\nfeatures: [import-bytes]\n---*/\n");
     assert_eq!(
-        skip_reason("built-ins/Temporal/x.js", &temporal),
+        skip_reason("built-ins/x.js", &unimpl),
         Some("unimplemented feature")
     );
 

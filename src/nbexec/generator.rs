@@ -43,6 +43,16 @@ pub(crate) enum Resumption {
     Throw(NanBox),
 }
 
+/// A queued AsyncGenerator request (27.6 `[[AsyncGeneratorQueue]]`). Each
+/// `next`/`return`/`throw` on an async generator creates one, appended FIFO;
+/// the front element is the request currently being serviced, and its `promise`
+/// settles (with the `{value, done}` result, or the thrown reason) when the
+/// generator yields/returns/throws for it.
+struct AsyncGenRequest {
+    how: Resumption,
+    promise: Handle,
+}
+
 /// The result of advancing a generator one step.
 pub(crate) enum GenStep {
     /// Hit a `yield`; the operand is the surfaced value (`{value, done:false}`).
@@ -82,6 +92,11 @@ pub(crate) struct GenFrame<'a> {
     /// each return a *promise* (resolved with the `{value, done}` result, or
     /// rejected with a thrown value) rather than the bare result object.
     is_async: bool,
+    /// (async generators only) the `[[AsyncGeneratorQueue]]` of pending
+    /// `next`/`return`/`throw` requests. The front element is the request being
+    /// serviced; the generator drains them one at a time in FIFO order, per-
+    /// `await`/`yield` suspending onto the microtask queue between steps.
+    async_queue: Vec<AsyncGenRequest>,
 }
 
 /// One pending action on the generator's explicit execution stack.
@@ -160,6 +175,12 @@ enum Step<'a> {
     /// [[NextMethod]]) so it is not re-read every step — only `return`/`throw` are
     /// fetched per-use.
     YieldStar { iter: Handle, next: NanBox },
+    /// Complete a member read `<object on stack>.property` after the (possibly
+    /// suspending) object operand has been evaluated onto the value stack. Used so
+    /// `(await x).prop` / `(yield x).prop` suspend at the `await`/`yield` instead of
+    /// falling to the eager one-shot walker (which would eager-await a still-pending
+    /// promise). Restricted to non-`super`, non-optional bases with a yield-free key.
+    MemberRead { property: &'a PropertyKey },
     /// Assign the value on the stack to simple target `name`, leaving the value
     /// on the stack as the assignment's result.
     AssignName { name: &'a str },
@@ -377,6 +398,7 @@ impl<'a> Interp<'a> {
             done: false,
             running: false,
             is_async,
+            async_queue: Vec::new(),
         };
         let id = if let Some(slot) = self.gen_frames.iter().position(Option::is_none) {
             self.gen_frames[slot] = Some(frame);
@@ -771,16 +793,179 @@ impl<'a> Interp<'a> {
         if !self.gen_frames[id].as_ref().is_some_and(|f| f.is_async) {
             return self.rejected_type_error("Generator method called on a non-async-generator");
         }
-        // A valid async generator: `lazy_gen_resume` already wraps the result (or
-        // an escaping throw) in a promise for `is_async` frames.
-        match self.lazy_gen_resume(this, how) {
-            Ok(v) => v,
-            Err(ExecError::Throw(e)) => {
-                let p = self.fresh_promise();
-                self.settle(p, e, false);
-                NanBox::handle(p.to_raw())
+        // `AsyncGeneratorEnqueue` (27.6.3.5): create the request's promise
+        // capability and append the request to the `[[AsyncGeneratorQueue]]`. The
+        // returned promise settles when this request reaches the front and the
+        // generator yields/returns/throws for it — so multiple `.next()` calls
+        // before the first resolves queue and settle in FIFO order.
+        let promise = self.fresh_promise();
+        let was_idle = self.gen_frames[id]
+            .as_ref()
+            .is_some_and(|f| f.async_queue.is_empty() && !f.running);
+        if let Some(f) = self.gen_frames[id].as_mut() {
+            f.async_queue.push(AsyncGenRequest { how, promise });
+        }
+        // Kick off `AsyncGeneratorResume` only when the generator is idle (no
+        // request currently being serviced and not synchronously executing). If it
+        // is executing or parked on an `await`, the request just waits its turn:
+        // the in-flight drive drains it when the current request settles.
+        if was_idle {
+            self.async_gen_drive(h, id, how);
+        }
+        NanBox::handle(promise.to_raw())
+    }
+
+    /// Drives an async generator through queued requests, per-`await`/`yield`
+    /// suspending onto the microtask queue (27.6.3 AsyncGeneratorResume / Yield /
+    /// DrainQueue). `how` is the completion to resume the generator body with: the
+    /// front request's own completion when (re)starting a request, or the settled
+    /// awaited value when resumed from an `await` microtask. Each iteration either
+    /// suspends (parking the generator until a microtask resumes it) or settles the
+    /// front request's promise and advances to the next queued request.
+    fn async_gen_drive(&mut self, genobj: Handle, id: usize, mut how: Resumption) {
+        loop {
+            let (started, done) = self.gen_frames[id]
+                .as_ref()
+                .map_or((true, true), |f| (f.started, f.done));
+            // `AsyncGeneratorAwaitReturn` (27.6.3.8): a `return(v)` on a generator
+            // that has not started or has already completed does not run any
+            // generator code — it awaits `v`, then settles the request with
+            // `{value: v, done: true}` (or rejects if the await rejects).
+            if let Resumption::Return(v) = how
+                && (!started || done)
+            {
+                if let Some(f) = self.gen_frames[id].as_mut() {
+                    f.done = true;
+                }
+                let inner = self.promise_resolve(v);
+                let on_f = self
+                    .realm
+                    .new_bound_native(N_ASYNC_GEN_RETURN_FULFILL, genobj);
+                let on_r = self
+                    .realm
+                    .new_bound_native(N_ASYNC_GEN_RETURN_REJECT, genobj);
+                self.register_then(
+                    inner,
+                    NanBox::handle(on_f.to_raw()),
+                    NanBox::handle(on_r.to_raw()),
+                    false,
+                );
+                return;
             }
-            Err(_) => self.rejected_type_error("async generator internal error"),
+            match self.run_generator(id, how) {
+                // `await value`: `PromiseResolve(value)` then park the generator —
+                // a microtask resumes it (at the `await` point) on settlement. The
+                // front request stays in place; it is settled on a later yield/done.
+                Ok(GenStep::Awaited(v)) => {
+                    let inner = self.promise_resolve(v);
+                    let on_f = self
+                        .realm
+                        .new_bound_native(N_ASYNC_GEN_AWAIT_FULFILL, genobj);
+                    let on_r = self
+                        .realm
+                        .new_bound_native(N_ASYNC_GEN_AWAIT_REJECT, genobj);
+                    self.register_then(
+                        inner,
+                        NanBox::handle(on_f.to_raw()),
+                        NanBox::handle(on_r.to_raw()),
+                        false,
+                    );
+                    return;
+                }
+                // `yield value` (value already `await`ed by the step machine):
+                // resolve the front request with `{value, done:false}` and advance.
+                Ok(GenStep::Yielded(v)) => {
+                    let result = self.gen_result(v, false);
+                    self.async_gen_settle(id, result, true);
+                }
+                // An async `yield*` passes the inner iterator's result object
+                // through verbatim (`{value, done}`); resolve the request with it.
+                Ok(GenStep::YieldedResult(v)) => {
+                    self.async_gen_settle(id, v, true);
+                }
+                // The body completed / returned: resolve the front request with
+                // `{value, done:true}`, then drain any remaining queued requests.
+                Ok(GenStep::Done(v)) => {
+                    let result = self.gen_result(v, true);
+                    self.async_gen_settle(id, result, true);
+                }
+                // An uncaught throw completes the generator: reject the front
+                // request, then drain the rest against the now-completed generator.
+                Err(ExecError::Throw(e)) => {
+                    self.async_gen_settle(id, e, false);
+                }
+                Err(_) => {
+                    let m = self.new_str("async generator internal error");
+                    let e = self.make_error(N_TYPE_ERROR, Some(m));
+                    self.async_gen_settle(id, e, false);
+                }
+            }
+            // The current request has been settled and removed. Continue with the
+            // next queued request (AsyncGeneratorDrainQueue), or park if none.
+            match self.gen_frames[id]
+                .as_ref()
+                .and_then(|f| f.async_queue.first().map(|r| r.how))
+            {
+                Some(next) => how = next,
+                None => return,
+            }
+        }
+    }
+
+    /// Removes the front `[[AsyncGeneratorQueue]]` request and settles its promise
+    /// (`AsyncGeneratorCompleteStep`): resolves with `value` (an iterator-result
+    /// object) when `fulfilled`, else rejects with `value` as the thrown reason.
+    fn async_gen_settle(&mut self, id: usize, value: NanBox, fulfilled: bool) {
+        let req = self.gen_frames[id].as_mut().and_then(|f| {
+            if f.async_queue.is_empty() {
+                None
+            } else {
+                Some(f.async_queue.remove(0))
+            }
+        });
+        if let Some(req) = req {
+            if fulfilled {
+                self.resolve_with(req.promise, value);
+            } else {
+                self.settle(req.promise, value, false);
+            }
+        }
+    }
+
+    /// Resumes an async generator parked on an `await`, or continues its request
+    /// queue after an `AsyncGeneratorAwaitReturn` settles. Called from the bound
+    /// microtask reactions (`N_ASYNC_GEN_*_FULFILL`/`_REJECT`); `gen` is the async
+    /// generator object, from which the frame id is recovered.
+    pub(crate) fn async_gen_resume_await(&mut self, genobj: Handle, how: Resumption) {
+        if let Some(id) = self.gen_frame_id(genobj) {
+            self.async_gen_drive(genobj, id, how);
+        }
+    }
+
+    /// The `AsyncGeneratorAwaitReturn` fulfilment reaction: the awaited return
+    /// value settled — resolve the front request with `{value, done:true}`, then
+    /// drain the remaining queue.
+    pub(crate) fn async_gen_return_settled(
+        &mut self,
+        genobj: Handle,
+        value: NanBox,
+        fulfilled: bool,
+    ) {
+        let Some(id) = self.gen_frame_id(genobj) else {
+            return;
+        };
+        if fulfilled {
+            let result = self.gen_result(value, true);
+            self.async_gen_settle(id, result, true);
+        } else {
+            self.async_gen_settle(id, value, false);
+        }
+        // Drain any requests queued behind the completed return.
+        if let Some(next) = self.gen_frames[id]
+            .as_ref()
+            .and_then(|f| f.async_queue.first().map(|r| r.how))
+        {
+            self.async_gen_drive(genobj, id, next);
         }
     }
 
@@ -816,6 +1001,7 @@ impl<'a> Interp<'a> {
             done: false,
             running: false,
             is_async: false,
+            async_queue: Vec::new(),
         };
         let id = if let Some(slot) = self.gen_frames.iter().position(Option::is_none) {
             self.gen_frames[slot] = Some(frame);
@@ -1988,6 +2174,14 @@ impl<'a> Interp<'a> {
                 self.assign_to_name(name, v).map_err(GenAbrupt::from)?;
                 Ok(StepOut::Continue)
             }
+            Step::MemberRead { property } => {
+                let obj = values.pop().unwrap_or(NanBox::undefined());
+                let v = self
+                    .read_member_of(obj, property, false)
+                    .map_err(GenAbrupt::from)?;
+                values.push(v);
+                Ok(StepOut::Continue)
+            }
             Step::Logical { op, right } => {
                 let left = values.pop().unwrap_or(NanBox::undefined());
                 let short = match op {
@@ -2629,11 +2823,26 @@ impl<'a> Interp<'a> {
                 });
                 Ok(StepOut::Continue)
             }
+            // `(<expr-with-await/yield>).prop` — a member READ whose *object*
+            // suspends. Evaluate the object step-by-step (so the `await`/`yield`
+            // parks), then complete the property read with `read_member_of` (same
+            // getter/primitive semantics as the eager walker). Restricted to a
+            // non-`super`, non-optional base with a yield-free (static or
+            // suspension-free computed) key; other shapes take the fallback.
+            Expr::Member {
+                object,
+                property,
+                optional: false,
+                ..
+            } if !matches!(&**object, Expr::Super(_)) && !key_has_yield(property) => {
+                stack.push(Step::MemberRead { property });
+                self.gen_eval_expr(object, stack, values)
+            }
             // Any other yield-bearing expression shape (e.g. `obj.m(yield b)`,
-            // a member/computed access, compound/destructuring assignment) is not
-            // individually reified; fall back to one-shot eval. The yield-free fast
-            // path above means this only runs for genuinely yield-bearing complex
-            // operands, which are a documented follow-up.
+            // a computed access with a yielding key, compound/destructuring
+            // assignment) is not individually reified; fall back to one-shot eval.
+            // The yield-free fast path above means this only runs for genuinely
+            // yield-bearing complex operands, which are a documented follow-up.
             _ => {
                 let v = self.eval(expr).map_err(GenAbrupt::from)?;
                 values.push(v);

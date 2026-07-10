@@ -1514,38 +1514,52 @@ impl<'a> Interp<'a> {
                     return self.resolve_super_member(&name);
                 }
                 let obj = self.eval(object)?;
-                if matches!(obj.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                    if *optional {
-                        // Short-circuit the rest of the enclosing optional chain.
-                        return Err(ExecError::OptShortCircuit);
-                    }
-                    // `null.x` / `undefined.x` throws a catchable TypeError.
-                    let msg = self.new_str("cannot read property of null or undefined");
-                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(msg))));
-                }
-                let Some(raw) = obj.as_handle() else {
-                    // A number/boolean primitive reports its wrapper constructor
-                    // (`(5).constructor === Number`); other reads are `undefined`
-                    // here (method calls go through the call path).
-                    if let PropertyKey::Ident(n) | PropertyKey::Str(n) = property
-                        && n.as_ref() == "constructor"
-                    {
-                        let name = if obj.as_number().is_some() {
-                            "Number"
-                        } else if matches!(obj.unpack(), Unpacked::Bool(_)) {
-                            "Boolean"
-                        } else {
-                            return Ok(NanBox::undefined());
-                        };
-                        return Ok(self.current.get(name).unwrap_or(NanBox::undefined()));
-                    }
-                    return Ok(NanBox::undefined());
-                };
-                let handle = crate::heap::Handle::from_raw(raw);
-                self.member(handle, property)
+                self.read_member_of(obj, property, *optional)
             }
             _ => Err(ExecError::Unsupported("expression")),
         }
+    }
+
+    /// Reads `property` off the already-evaluated member base `obj` — the tail of
+    /// a (non-`super`) `Expr::Member` evaluation, factored out so the generator/
+    /// async step-machine can reify a member read whose *object* contains an
+    /// `await`/`yield` (evaluating the base step-by-step, then completing the read
+    /// here with identical semantics — getters, computed keys, primitive bases).
+    pub(crate) fn read_member_of(
+        &mut self,
+        obj: NanBox,
+        property: &'a PropertyKey,
+        optional: bool,
+    ) -> Result<NanBox, ExecError> {
+        if matches!(obj.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            if optional {
+                // Short-circuit the rest of the enclosing optional chain.
+                return Err(ExecError::OptShortCircuit);
+            }
+            // `null.x` / `undefined.x` throws a catchable TypeError.
+            let msg = self.new_str("cannot read property of null or undefined");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(msg))));
+        }
+        let Some(raw) = obj.as_handle() else {
+            // A number/boolean primitive reports its wrapper constructor
+            // (`(5).constructor === Number`); other reads are `undefined`
+            // here (method calls go through the call path).
+            if let PropertyKey::Ident(n) | PropertyKey::Str(n) = property
+                && n.as_ref() == "constructor"
+            {
+                let name = if obj.as_number().is_some() {
+                    "Number"
+                } else if matches!(obj.unpack(), Unpacked::Bool(_)) {
+                    "Boolean"
+                } else {
+                    return Ok(NanBox::undefined());
+                };
+                return Ok(self.current.get(name).unwrap_or(NanBox::undefined()));
+            }
+            return Ok(NanBox::undefined());
+        };
+        let handle = crate::heap::Handle::from_raw(raw);
+        self.member(handle, property)
     }
 
     pub(crate) fn eval_fn_expr(&mut self, func: &'a Function) -> NanBox {
