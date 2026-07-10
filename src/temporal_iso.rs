@@ -766,6 +766,98 @@ impl Cursor<'_> {
     }
 }
 
+/// Whether `core` (the part of a time string before any `[...]` annotation)
+/// *also* parses as a valid `ValidMonthDay` (`--`?`MM``-`?`DD`) or
+/// `DateSpecYearMonth` (`YYYY``-`?`MM`). Such strings are ambiguous between a
+/// bare time and a calendar date and, per the Temporal grammar, may only be
+/// parsed as a time when a `T` designator is present.
+fn time_core_is_calendar_ambiguous(core: &str) -> bool {
+    let b = core.as_bytes();
+    // ValidMonthDay: optional "--", MM, optional "-", DD.
+    let md = {
+        let mut i = 0;
+        if b.len() >= 2 && b[0] == b'-' && b[1] == b'-' {
+            i = 2;
+        }
+        let digit = |x: u8| x.is_ascii_digit();
+        let two = |b: &[u8], i: usize| -> Option<i64> {
+            if i + 2 <= b.len() && digit(b[i]) && digit(b[i + 1]) {
+                Some(i64::from(b[i] - b'0') * 10 + i64::from(b[i + 1] - b'0'))
+            } else {
+                None
+            }
+        };
+        (|| {
+            let mm = two(b, i)?;
+            i += 2;
+            if i < b.len() && b[i] == b'-' {
+                i += 1;
+            }
+            let dd = two(b, i)?;
+            i += 2;
+            if i != b.len() || !(1..=12).contains(&mm) {
+                return None;
+            }
+            // MonthDay days: leap-day (Feb 29) is a legal month-day, so use the
+            // leap-year day count for the month.
+            let max = iso_days_in_month(2000, mm as u8);
+            if dd >= 1 && dd <= i64::from(max) {
+                Some(())
+            } else {
+                None
+            }
+        })()
+        .is_some()
+    };
+    // DateSpecYearMonth: YYYY, optional "-", MM.
+    let ym = {
+        let two = |b: &[u8], i: usize| -> Option<i64> {
+            if i + 2 <= b.len() && b[i].is_ascii_digit() && b[i + 1].is_ascii_digit() {
+                Some(i64::from(b[i] - b'0') * 10 + i64::from(b[i + 1] - b'0'))
+            } else {
+                None
+            }
+        };
+        (|| {
+            if b.len() < 4 || !b[..4].iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            let mut i = 4;
+            if i < b.len() && b[i] == b'-' {
+                i += 1;
+            }
+            let mm = two(b, i)?;
+            i += 2;
+            if i == b.len() && (1..=12).contains(&mm) {
+                Some(())
+            } else {
+                None
+            }
+        })()
+        .is_some()
+    };
+    md || ym
+}
+
+/// Like [`parse_iso_datetime`], but for contexts that parse a **time** from a
+/// string (e.g. `Temporal.PlainTime.from`). Enforces the grammar rule that a
+/// bare time whose leading component is *also* a valid calendar month-day or
+/// year-month is ambiguous and must carry a `T` designator; such strings return
+/// `None` (→ RangeError).
+#[must_use]
+pub fn parse_iso_time_string(s: &str) -> Option<ParsedIso> {
+    let out = parse_iso_datetime(s)?;
+    // Only a bare time (no date component) can be ambiguous, and only when the
+    // string does not start with a `T`/`t` designator.
+    if out.date.is_none()
+        && !matches!(s.as_bytes().first(), Some(b'T' | b't'))
+        && time_core_is_calendar_ambiguous(s.split('[').next().unwrap_or(s))
+    {
+        return None;
+    }
+    Some(out)
+}
+
 /// Parses a Temporal date/datetime/time string into its components. Accepts the
 /// common grammar: `±YYYYYY`/`YYYY` `-`? `MM` `-`? `DD` (`T`|` `) time,
 /// optional fractional seconds, optional `Z`/offset, optional `[tz]` and
@@ -800,7 +892,7 @@ pub fn parse_iso_datetime(s: &str) -> Option<ParsedIso> {
         out.z = z;
     }
 
-    parse_annotations(&mut c, &mut out);
+    parse_annotations(&mut c, &mut out)?;
     // Must be fully consumed.
     if c.i != c.b.len() {
         return None;
@@ -853,6 +945,11 @@ fn parse_time_and_offset(c: &mut Cursor) -> Option<(IsoTime, Option<i128>, bool)
             second = c.digits(2)?;
             frac_ns = parse_fraction(c)?;
         }
+    }
+    // A parsed second of `60` denotes a (positive) leap second, which the ISO
+    // calendar does not model; per the grammar it is accepted and clamped to 59.
+    if second == 60 {
+        second = 59;
     }
     let time = regulate_iso_time(
         hour,
@@ -911,13 +1008,19 @@ fn parse_offset(c: &mut Cursor) -> Option<(Option<i128>, bool)> {
         let mut s = 0;
         let mut frac = 0_i64;
         if c.eat(b':') {
-            m = c.digits(2).unwrap_or(0);
+            m = c.digits(2)?;
             if c.eat(b':') {
-                s = c.digits(2).unwrap_or(0);
+                s = c.digits(2)?;
                 frac = parse_fraction(c)?;
             }
         } else if c.peek().is_some_and(|b| b.is_ascii_digit()) {
-            m = c.digits(2).unwrap_or(0);
+            m = c.digits(2)?;
+            // Compact form: an offset may carry seconds (and a fraction) with no
+            // `:` separators, e.g. `+000000` or `-023000.5`.
+            if c.peek().is_some_and(|b| b.is_ascii_digit()) {
+                s = c.digits(2)?;
+                frac = parse_fraction(c)?;
+            }
         }
         // A UTC offset's hour/minute/second components have the usual ranges; a
         // value like `+24:00` or `-00:60` is not a valid offset (→ parse error).
@@ -933,24 +1036,75 @@ fn parse_offset(c: &mut Cursor) -> Option<(Option<i128>, bool)> {
     Some((None, false))
 }
 
-fn parse_annotations(c: &mut Cursor, out: &mut ParsedIso) {
+/// An annotation key is `AKeyLeadingChar AKeyChar*` where the leading char is a
+/// lowercase ASCII letter or `_`, and subsequent chars add ASCII digits and `-`.
+/// Uppercase (or otherwise out-of-grammar) keys make the whole string invalid.
+fn is_valid_annotation_key(key: &str) -> bool {
+    let mut chars = key.bytes();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_lowercase() || first == b'_') {
+        return false;
+    }
+    chars.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// Parses the optional time-zone annotation (`[!?TZID]`) followed by zero or more
+/// key-value annotations (`[!?key=value]`), enforcing the Temporal grammar's
+/// validity rules. Returns `None` (→ RangeError at the call site) for any invalid
+/// annotation: an unterminated bracket, an uppercase/malformed annotation key, a
+/// critical flag on an *unknown* annotation, a time-zone annotation anywhere but
+/// first, more than one time-zone annotation, or more than one calendar (`u-ca`)
+/// annotation when any of them is flagged critical.
+fn parse_annotations(c: &mut Cursor, out: &mut ParsedIso) -> Option<()> {
+    let mut first = true;
+    let mut tz_seen = false;
+    let mut cal_count = 0_u32;
+    let mut cal_critical = false;
     while c.eat(b'[') {
         let critical = c.eat(b'!');
-        let _ = critical;
         let start = c.i;
         while c.peek().is_some_and(|b| b != b']') {
             c.i += 1;
         }
         let inner = core::str::from_utf8(&c.b[start..c.i]).unwrap_or("");
         if !c.eat(b']') {
-            return;
+            return None; // unterminated annotation
         }
-        if let Some(cal) = inner.strip_prefix("u-ca=") {
-            out.calendar = Some(String::from(cal));
-        } else if !inner.is_empty() {
+        if let Some(eq) = inner.find('=') {
+            // A key-value annotation. Key must be lowercase-only; value non-empty.
+            let key = &inner[..eq];
+            let value = &inner[eq + 1..];
+            if !is_valid_annotation_key(key) || value.is_empty() {
+                return None;
+            }
+            if key == "u-ca" {
+                cal_count += 1;
+                cal_critical |= critical;
+                if out.calendar.is_none() {
+                    out.calendar = Some(String::from(value));
+                }
+            } else if critical {
+                // A critical flag on an unknown annotation must be rejected.
+                return None;
+            }
+            // Unknown, non-critical annotations are ignored.
+        } else {
+            // No `=`: this can only be the (single) leading time-zone annotation.
+            if !first || tz_seen || inner.is_empty() {
+                return None;
+            }
+            tz_seen = true;
             out.tz_name = Some(String::from(inner));
         }
+        first = false;
     }
+    // Multiple calendar annotations are allowed only when none is critical.
+    if cal_count > 1 && cal_critical {
+        return None;
+    }
+    Some(())
 }
 
 /// Parses a Temporal ISO 8601 **duration** string (`±P…`) into fields. Returns
@@ -1058,7 +1212,12 @@ fn peek_number(c: &mut Cursor) -> Option<(i64, Option<i64>)> {
     }
     let mut n = 0_i64;
     while c.peek().is_some_and(|b| b.is_ascii_digit()) {
-        n = n * 10 + i64::from(c.peek().unwrap() - b'0');
+        // A duration field that overflows i64 is out of range (→ RangeError at
+        // the call site); use checked arithmetic so an absurdly long run of
+        // digits (e.g. "PT" + "1".repeat(1000) + "S") fails instead of panicking.
+        n = n
+            .checked_mul(10)?
+            .checked_add(i64::from(c.peek().unwrap() - b'0'))?;
         c.i += 1;
     }
     let frac = if c.peek() == Some(b'.') || c.peek() == Some(b',') {

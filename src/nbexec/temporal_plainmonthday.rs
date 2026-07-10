@@ -267,14 +267,15 @@ impl<'a> Interp<'a> {
         if v.is_undefined() {
             return Ok(());
         }
-        // A Temporal object supplies its own (always iso8601) calendar.
-        if let Some(handle) = v.as_handle().map(Handle::from_raw) {
-            if self.realm.temporal_at(handle).is_some() {
-                return Ok(());
-            }
-            if let Some(s) = self.realm.string_value(handle) {
-                return self.pmd_check_calendar_string(&s);
-            }
+        // A *calendared* Temporal object supplies its own (iso8601) calendar via
+        // the fast path; non-calendared objects (`{}`, `Duration`, …) are invalid.
+        if let Some(cal) = self.temporal_object_calendar(v) {
+            return self.pmd_check_calendar_string(&cal);
+        }
+        if let Some(handle) = v.as_handle().map(Handle::from_raw)
+            && let Some(s) = self.realm.string_value(handle)
+        {
+            return self.pmd_check_calendar_string(&s);
         }
         Err(self.type_error("PlainMonthDay: calendar must be a string"))
     }

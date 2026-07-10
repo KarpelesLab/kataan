@@ -246,6 +246,9 @@ impl<'a> Interp<'a> {
         if matches!(v.unpack(), Unpacked::Undefined) {
             return Ok(());
         }
+        if let Some(cal) = self.temporal_object_calendar(v) {
+            return self.pd_canonicalize_calendar(&cal);
+        }
         let Some(s) = v
             .as_handle()
             .map(Handle::from_raw)
@@ -344,7 +347,7 @@ impl<'a> Interp<'a> {
     /// PlainTime/PlainDateTime instance → its time, an object with time fields →
     /// each `ToIntegerWithTruncation`'d + constrained, or an ISO string.
     fn pd_to_temporal_time(&mut self, v: NanBox) -> Result<temporal_iso::IsoTime, ExecError> {
-        use crate::temporal_iso::{IsoTime, Overflow, parse_iso_datetime, regulate_iso_time};
+        use crate::temporal_iso::{IsoTime, Overflow, parse_iso_time_string, regulate_iso_time};
         if matches!(v.unpack(), Unpacked::Undefined) {
             return Ok(IsoTime::default());
         }
@@ -403,7 +406,7 @@ impl<'a> Interp<'a> {
                 .type_error("toPlainDateTime: expected a time, time-like object, or ISO string"));
         }
         let s = self.coerce_to_string(v)?;
-        parse_iso_datetime(&s)
+        parse_iso_time_string(&s)
             .and_then(|p| p.time.or(Some(IsoTime::default())))
             .ok_or_else(|| self.pd_range_error("toPlainDateTime: invalid time string"))
     }
@@ -644,6 +647,9 @@ impl<'a> Interp<'a> {
     /// string that is either the `"iso8601"` id or a parseable ISO date/time
     /// string whose (defaulted) calendar is ISO. A non-string is a TypeError.
     fn pd_validate_calendar_field(&mut self, v: NanBox) -> Result<(), ExecError> {
+        if let Some(cal) = self.temporal_object_calendar(v) {
+            return self.pd_canonicalize_calendar(&cal);
+        }
         let Some(s) = v
             .as_handle()
             .map(Handle::from_raw)
@@ -896,6 +902,10 @@ impl<'a> Interp<'a> {
 
     /// `withCalendar`: only the ISO calendar is supported.
     fn pd_with_calendar(&mut self, date: IsoDate, cal: NanBox) -> Result<NanBox, ExecError> {
+        if let Some(c) = self.temporal_object_calendar(cal) {
+            self.pd_canonicalize_calendar(&c)?;
+            return Ok(self.pd_new(date));
+        }
         let Some(s) = cal
             .as_handle()
             .map(Handle::from_raw)
@@ -919,9 +929,7 @@ impl<'a> Interp<'a> {
         let opts = self.pd_options(options)?;
         let smallest = self.pd_unit_option(opts, "smallestUnit")?;
         let largest_raw = self.pd_unit_option(opts, "largestUnit")?;
-        // roundingMode / roundingIncrement are validated but only the default
-        // (trunc, 1) is fully supported here.
-        let _ = self.get_string_option(
+        let mode = self.get_string_option(
             opts,
             "roundingMode",
             &[
@@ -937,6 +945,10 @@ impl<'a> Interp<'a> {
             ],
             Some("trunc"),
         )?;
+        // `GetRoundingIncrementOption` (validated for every call; for the date
+        // units used here there is no per-unit maximum, so any finite integer in
+        // [1, 1e9] is accepted — an out-of-range/NaN value is a RangeError).
+        let increment = self.pd_rounding_increment(opts)?;
 
         let smallest = smallest.unwrap_or(Unit::Day);
         // Default largestUnit ("auto") is the larger of Day and smallestUnit.
@@ -954,7 +966,22 @@ impl<'a> Interp<'a> {
         } else {
             (date, other_date)
         };
-        let (years, months, weeks, days) = difference_iso_date(from, to, largest);
+        let (years, months, weeks, mut days) = difference_iso_date(from, to, largest);
+        // Round the smallest unit. Only day-granularity rounding is self-contained
+        // (year/month/week rounding needs calendar-relative arithmetic); for a
+        // larger `smallestUnit` the increment is left unapplied. A unit increment
+        // (the default) is always a no-op, so this never perturbs the common path.
+        if increment > 1 && smallest == Unit::Day {
+            // `since` (negate) rounds with the negated rounding mode, then the
+            // whole difference is negated — mirrored here by rounding the already
+            // sign-flipped `days` with the negated mode.
+            let round_mode = pd_round_mode_from_str(mode.as_deref(), negate);
+            days = crate::temporal_iso::round_to_increment(
+                i128::from(days),
+                i128::from(increment),
+                round_mode,
+            ) as i64;
+        }
         let duration = DurationFields {
             years,
             months,
@@ -963,6 +990,27 @@ impl<'a> Interp<'a> {
             ..Default::default()
         };
         Ok(self.pd_new_duration(duration))
+    }
+
+    /// `GetRoundingIncrementOption`: default 1; `ToNumber` (Symbol/BigInt →
+    /// TypeError), non-finite → RangeError, then truncate toward zero and require
+    /// the result to lie in `[1, 1e9]`.
+    fn pd_rounding_increment(&mut self, opts: Option<Handle>) -> Result<i64, ExecError> {
+        let Some(h) = opts else { return Ok(1) };
+        let v = self.read_member(h, "roundingIncrement")?;
+        if matches!(v.unpack(), Unpacked::Undefined) {
+            return Ok(1);
+        }
+        let num = self.coerce_to_number(v)?;
+        let n = self.realm.to_number(num);
+        if !n.is_finite() {
+            return Err(self.pd_range_error("roundingIncrement must be a finite integer"));
+        }
+        let i = n.trunc() as i64;
+        if !(1..=1_000_000_000).contains(&i) {
+            return Err(self.pd_range_error("roundingIncrement out of range"));
+        }
+        Ok(i)
     }
 
     /// Reads a date-difference unit option (`years`/`months`/`weeks`/`days`,
@@ -1018,6 +1066,34 @@ impl<'a> Interp<'a> {
             _ => {}
         }
         s
+    }
+}
+
+/// Maps a `roundingMode` option string (defaulting to `trunc`) to a [`RoundMode`],
+/// applying `NegateRoundingMode` when `negate` is set (as `since` does before it
+/// flips the sign of the whole difference).
+fn pd_round_mode_from_str(mode: Option<&str>, negate: bool) -> crate::temporal_iso::RoundMode {
+    use crate::temporal_iso::RoundMode;
+    let m = match mode {
+        Some("ceil") => RoundMode::Ceil,
+        Some("floor") => RoundMode::Floor,
+        Some("expand") => RoundMode::Expand,
+        Some("halfCeil") => RoundMode::HalfCeil,
+        Some("halfFloor") => RoundMode::HalfFloor,
+        Some("halfExpand") => RoundMode::HalfExpand,
+        Some("halfTrunc") => RoundMode::HalfTrunc,
+        Some("halfEven") => RoundMode::HalfEven,
+        _ => RoundMode::Trunc,
+    };
+    if !negate {
+        return m;
+    }
+    match m {
+        RoundMode::Ceil => RoundMode::Floor,
+        RoundMode::Floor => RoundMode::Ceil,
+        RoundMode::HalfCeil => RoundMode::HalfFloor,
+        RoundMode::HalfFloor => RoundMode::HalfCeil,
+        other => other,
     }
 }
 

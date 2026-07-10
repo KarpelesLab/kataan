@@ -358,11 +358,14 @@ impl<'a> Interp<'a> {
         if Self::is_undef(v) {
             return Ok(());
         }
-        // A Temporal object supplies its own calendar (always iso8601 here).
-        if let Some(h) = v.as_handle().map(Handle::from_raw)
-            && self.realm.temporal_at(h).is_some()
-        {
-            return Ok(());
+        // A *calendared* Temporal object supplies its own calendar (iso8601) via
+        // the fast path; non-calendared objects (`{}`, `Duration`, …) are invalid.
+        if let Some(cal) = self.temporal_object_calendar(v) {
+            return if cal.eq_ignore_ascii_case("iso8601") {
+                Ok(())
+            } else {
+                Err(self.pym_range("PlainYearMonth: unknown calendar"))
+            };
         }
         let Some(s) = self.as_string_value(v) else {
             return Err(self.type_error("PlainYearMonth: calendar must be a string"));

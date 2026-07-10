@@ -373,6 +373,13 @@ impl<'a> Interp<'a> {
         if v.is_undefined() {
             return Ok(());
         }
+        if let Some(cal) = self.temporal_object_calendar(v) {
+            return if cal.eq_ignore_ascii_case("iso8601") {
+                Ok(())
+            } else {
+                Err(self.pdt_range("only the iso8601 calendar is supported"))
+            };
+        }
         let Some(s) = v
             .as_handle()
             .map(Handle::from_raw)
@@ -394,6 +401,16 @@ impl<'a> Interp<'a> {
         let Some(v) = self.pdt_field(h, "calendar")? else {
             return Ok(());
         };
+        // A *calendared* Temporal object supplies its `[[Calendar]]` via the fast
+        // path (no property read). Non-calendared objects (`{}`, `Duration`, …)
+        // and every other non-string value are a TypeError.
+        if let Some(cal) = self.temporal_object_calendar(v) {
+            return if cal.eq_ignore_ascii_case("iso8601") {
+                Ok(())
+            } else {
+                Err(self.pdt_range("only the iso8601 calendar is supported"))
+            };
+        }
         if let Some(s) = v
             .as_handle()
             .map(Handle::from_raw)
@@ -408,9 +425,6 @@ impl<'a> Interp<'a> {
             } else {
                 Err(self.pdt_range("only the iso8601 calendar is supported"))
             }
-        } else if self.is_object_value(v) {
-            // A calendar-bearing Temporal object; assume ISO (the only calendar).
-            Ok(())
         } else {
             Err(self.type_error("calendar must be a string"))
         }
@@ -601,6 +615,13 @@ impl<'a> Interp<'a> {
                 return match d.kind {
                     TemporalKind::PlainDateTime => Ok((d.date, d.time)),
                     TemporalKind::PlainDate => Ok((d.date, IsoTime::default())),
+                    // A ZonedDateTime yields its wall-clock date+time in its zone.
+                    TemporalKind::ZonedDateTime => {
+                        let tz = d.tz.as_deref().unwrap_or("UTC");
+                        Ok(crate::nbexec::temporal_zoneddatetime::local_of(
+                            tz, d.epoch_ns,
+                        ))
+                    }
                     _ => Err(self.type_error("expected a PlainDateTime")),
                 };
             }
@@ -735,7 +756,7 @@ impl<'a> Interp<'a> {
                 };
             }
             if let Some(s) = self.realm.string_value(h) {
-                let p = iso::parse_iso_datetime(&s)
+                let p = iso::parse_iso_time_string(&s)
                     .ok_or_else(|| self.pdt_range("invalid PlainTime string"))?;
                 return p
                     .time

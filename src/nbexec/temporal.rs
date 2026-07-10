@@ -248,6 +248,25 @@ impl<'a> Interp<'a> {
         self.temporal_protos.get(kind as usize).copied().flatten()
     }
 
+    /// The object branch of `ToTemporalCalendarSlotValue`: if `v` is a
+    /// *calendared* Temporal object (`PlainDate`, `PlainDateTime`,
+    /// `PlainMonthDay`, `PlainYearMonth`, or `ZonedDateTime`), returns its
+    /// `[[Calendar]]` identifier **without** observably reading any property
+    /// (the spec's fast path). Returns `None` for every other value, so callers
+    /// fall through to the string branch (or a `TypeError`).
+    pub(crate) fn temporal_object_calendar(&self, v: NanBox) -> Option<String> {
+        let h = v.as_handle().map(Handle::from_raw)?;
+        let d = self.realm.temporal_at(h)?;
+        match d.kind {
+            TemporalKind::PlainDate
+            | TemporalKind::PlainDateTime
+            | TemporalKind::PlainMonthDay
+            | TemporalKind::PlainYearMonth
+            | TemporalKind::ZonedDateTime => Some(d.calendar.clone()),
+            _ => None,
+        }
+    }
+
     /// Links a freshly-built Temporal instance to `newTarget.prototype` (subclass)
     /// or the intrinsic prototype, then returns it boxed.
     #[allow(dead_code)] // used by per-type construct logic as it lands

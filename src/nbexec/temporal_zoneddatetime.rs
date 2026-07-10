@@ -265,7 +265,7 @@ fn tz_offset_at(tz: &str, epoch_ns: i128) -> i128 {
 }
 
 /// The local (wall-clock) ISO date + time for an exact instant in `tz`.
-fn local_of(tz: &str, epoch_ns: i128) -> (IsoDate, IsoTime) {
+pub(crate) fn local_of(tz: &str, epoch_ns: i128) -> (IsoDate, IsoTime) {
     let off = tz_offset_at(tz, epoch_ns);
     let (day, time) = balance_time_from_nanos(epoch_ns + off);
     (epoch_days_to_iso(day), time)
@@ -550,6 +550,13 @@ impl<'a> Interp<'a> {
         if v.is_undefined() {
             return Ok(());
         }
+        if let Some(cal) = self.temporal_object_calendar(v) {
+            return if calendar_string_ok(&cal) {
+                Ok(())
+            } else {
+                Err(self.zdt_range("only the iso8601 calendar is supported"))
+            };
+        }
         let Some(s) = v
             .as_handle()
             .map(Handle::from_raw)
@@ -565,9 +572,17 @@ impl<'a> Interp<'a> {
     }
 
     /// Validates a property-bag `calendar` field: it must be a primitive String
-    /// naming the ISO calendar (bare or via a date-ish ISO string). Any non-string
-    /// (including Temporal objects) → TypeError; an unknown calendar → RangeError.
+    /// naming the ISO calendar (bare or via a date-ish ISO string), or a Temporal
+    /// object (whose `[[Calendar]]` is used via the fast path). Other non-strings
+    /// → TypeError; an unknown calendar → RangeError.
     fn zdt_validate_calendar_field(&mut self, v: NanBox) -> Result<(), ExecError> {
+        if let Some(cal) = self.temporal_object_calendar(v) {
+            return if calendar_string_ok(&cal) {
+                Ok(())
+            } else {
+                Err(self.zdt_range("only the iso8601 calendar is supported"))
+            };
+        }
         let Some(s) = v
             .as_handle()
             .map(Handle::from_raw)
@@ -2054,82 +2069,15 @@ fn parse_zdt_string(s: &str) -> Option<ParsedZdt> {
 /// and `[…]` annotations. A `Z` designator, a date-only string, the U+2212 minus
 /// sign, >9 fractional digits, or bad annotations all reject.
 fn parse_plaintime_string(s: &str) -> Option<IsoTime> {
-    if s.as_bytes().windows(3).any(|w| w == [0xE2, 0x88, 0x92]) {
+    // Delegate to the shared ISO parser, which enforces the time-designator
+    // disambiguation rule (a bare time that is also a valid month-day/year-month
+    // needs a `T` prefix), strict `[...]` annotation validity, and rejection of
+    // the U+2212 minus sign. A `Z`/UTC designator is not a valid PlainTime.
+    let p = crate::temporal_iso::parse_iso_time_string(s)?;
+    if p.z {
         return None;
     }
-    let mut p = Zp {
-        b: s.as_bytes(),
-        i: 0,
-    };
-    let save = p.i;
-    let time = if zp_date(&mut p).is_some() {
-        // A leading date is only a PlainTime if a `T`/`t`/space-introduced time follows.
-        if !(p.eat(b'T') || p.eat(b't') || p.eat(b' ')) {
-            return None;
-        }
-        zp_time(&mut p)?
-    } else {
-        p.i = save;
-        // A bare time may carry an optional `T`/`t` designator.
-        let _ = p.eat(b'T') || p.eat(b't');
-        zp_time(&mut p)?
-    };
-    // An optional numeric offset (consumed, ignored); a `Z` designator is invalid.
-    let (_off, z) = zp_offset(&mut p)?;
-    if z {
-        return None;
-    }
-    zp_annotations_ok(&mut p)?;
-    if p.i != p.b.len() {
-        return None;
-    }
-    Some(time)
-}
-
-/// Validates the trailing `[…]` annotations (any number of time-zone / calendar
-/// annotations, subject to the Temporal rules), ignoring their contents.
-fn zp_annotations_ok(p: &mut Zp) -> Option<()> {
-    let mut tz_seen = false;
-    let mut kv_seen = false;
-    let mut cal_count = 0_u32;
-    let mut cal_critical = false;
-    while p.eat(b'[') {
-        let critical = p.eat(b'!');
-        let start = p.i;
-        while p.peek().is_some_and(|c| c != b']') {
-            p.i += 1;
-        }
-        if !p.eat(b']') {
-            return None;
-        }
-        let content = core::str::from_utf8(&p.b[start..p.i - 1]).ok()?;
-        if let Some(eq) = content.find('=') {
-            kv_seen = true;
-            let key = &content[..eq];
-            if key.is_empty()
-                || !key
-                    .bytes()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_')
-            {
-                return None;
-            }
-            if key == "u-ca" {
-                cal_count += 1;
-                cal_critical |= critical;
-            } else if critical {
-                return None;
-            }
-        } else {
-            if tz_seen || kv_seen || content.is_empty() {
-                return None;
-            }
-            tz_seen = true;
-        }
-    }
-    if cal_count > 1 && cal_critical {
-        return None;
-    }
-    Some(())
+    p.time
 }
 
 fn zp_date(p: &mut Zp) -> Option<IsoDate> {

@@ -222,7 +222,7 @@ impl<'a> Interp<'a> {
     /// Parses an ISO string into an [`IsoTime`] under PlainTime rules: a bare `Z`
     /// designator or a date-only string is rejected.
     fn plaintime_parse(&mut self, s: &str) -> Result<IsoTime, ExecError> {
-        let Some(p) = temporal_iso::parse_iso_datetime(s) else {
+        let Some(p) = temporal_iso::parse_iso_time_string(s) else {
             return Err(self.plaintime_range_error("Temporal.PlainTime: invalid ISO string"));
         };
         if p.z {

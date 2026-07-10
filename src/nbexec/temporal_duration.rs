@@ -1272,19 +1272,23 @@ impl<'a> Interp<'a> {
         // calendar
         let cal_v = self.read_member(h, "calendar")?;
         if !cal_v.is_undefined() {
-            let Some(s) = cal_v
-                .as_handle()
-                .map(Handle::from_raw)
-                .and_then(|ch| self.realm.string_value(ch))
-            else {
-                return Err(self.type_error("calendar must be a string"));
+            let ok = if let Some(c) = self.temporal_object_calendar(cal_v) {
+                c.is_ascii() && c.eq_ignore_ascii_case("iso8601")
+            } else {
+                let Some(s) = cal_v
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|ch| self.realm.string_value(ch))
+                else {
+                    return Err(self.type_error("calendar must be a string"));
+                };
+                (s.is_ascii() && s.eq_ignore_ascii_case("iso8601"))
+                    || parse_iso_datetime(&s).is_some_and(|p| {
+                        p.calendar
+                            .as_ref()
+                            .is_none_or(|c| c.is_ascii() && c.eq_ignore_ascii_case("iso8601"))
+                    })
             };
-            let ok = (s.is_ascii() && s.eq_ignore_ascii_case("iso8601"))
-                || parse_iso_datetime(&s).is_some_and(|p| {
-                    p.calendar
-                        .as_ref()
-                        .is_none_or(|c| c.is_ascii() && c.eq_ignore_ascii_case("iso8601"))
-                });
             if !ok {
                 return Err(self.dur_range_error("relativeTo calendar must be iso8601"));
             }
