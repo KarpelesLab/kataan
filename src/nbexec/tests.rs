@@ -6227,6 +6227,93 @@ fn proxy_of_array_generic_methods() {
 }
 
 #[test]
+fn prototype_methods_are_first_class_function_objects() {
+    // A `<Ctor>.prototype.<method>` value reference is a real callable function
+    // object with `typeof === "function"` and the spec `name`/`length` — not a
+    // call-site-only dispatch. Covers Array/String/%TypedArray% prototypes.
+    assert_eq!(run("typeof Array.prototype.map"), "function");
+    assert_eq!(run("Array.prototype.map.name"), "map");
+    assert_eq!(run("Array.prototype.map.length"), "1");
+    assert_eq!(run("typeof String.prototype.slice"), "function");
+    assert_eq!(run("String.prototype.slice.name"), "slice");
+    assert_eq!(run("String.prototype.charAt.length"), "1");
+    assert_eq!(
+        run("typeof Object.getPrototypeOf(Uint8Array.prototype).map"),
+        "function"
+    );
+    assert_eq!(
+        run("Object.getPrototypeOf(Uint8Array.prototype).map.name"),
+        "map"
+    );
+
+    // The value read from a live receiver is the very same function object as
+    // the one on the prototype (identity, not a fresh per-read thunk).
+    assert_eq!(run("[1,2].map === Array.prototype.map"), "true");
+    assert_eq!(run("'ab'.slice === String.prototype.slice"), "true");
+
+    // The materialized method is non-enumerable, writable, configurable — the
+    // built-in method attributes ({ writable:true, enumerable:false,
+    // configurable:true }).
+    assert_eq!(
+        run(
+            "var d=Object.getOwnPropertyDescriptor(Array.prototype,'map');\
+             [d.writable,d.enumerable,d.configurable].join(',')"
+        ),
+        "true,false,true"
+    );
+
+    // The fast path `[].map(...)` is unchanged and still produces the same
+    // result as the first-class function applied via `.call`.
+    assert_eq!(run("[1,2,3].map(x=>x*2).join(',')"), "2,4,6");
+    assert_eq!(
+        run("Array.prototype.map.call([1,2,3],x=>x*2).join(',')"),
+        "2,4,6"
+    );
+}
+
+#[test]
+fn prototype_methods_work_via_call_apply_reflect_bind() {
+    // `.call` on an array-like object (no `Array` involved) runs the generic
+    // algorithm on the ToObject'd `this`.
+    assert_eq!(
+        run("var al={0:'a',1:'b',length:2};\
+             Array.prototype.map.call(al,x=>x+x).join(',')"),
+        "aa,bb"
+    );
+    // `Reflect.apply` invokes the stored first-class method.
+    assert_eq!(
+        run("Reflect.apply(Array.prototype.slice,[1,2,3,4],[1,3]).join(',')"),
+        "2,3"
+    );
+    // A mutating method (`push`) stored in a variable and applied via `.call`.
+    assert_eq!(
+        run("var p=Array.prototype.push;var a=[1];p.call(a,2,3);a.join(',')"),
+        "1,2,3"
+    );
+    // `Function.prototype.call.bind(method)` — the classic uncurry-this idiom.
+    assert_eq!(
+        run(
+            "var boundSlice=Function.prototype.call.bind(Array.prototype.slice);\
+             boundSlice([9,8,7],1).join(',')"
+        ),
+        "8,7"
+    );
+    // String method via `.call` on a primitive `this`.
+    assert_eq!(run("String.prototype.slice.call('hello',1,3)"), "el");
+    // A %TypedArray% prototype method via `.call` on a typed-array receiver.
+    assert_eq!(
+        run("var m=Object.getPrototypeOf(Uint8Array.prototype).map;\
+             Array.from(m.call(new Uint8Array([5,6]),x=>x+1)).join(',')"),
+        "6,7"
+    );
+    // The array iterator method is first-class too.
+    assert_eq!(
+        run("Array.prototype[Symbol.iterator].call([5,6]).next().value"),
+        "5"
+    );
+}
+
+#[test]
 fn proxy_object_spread_copies_own_enumerable() {
     // `{...proxy}` (CopyDataProperties) must enumerate the proxy's own keys
     // through the ownKeys/getOwnPropertyDescriptor/get protocol.
