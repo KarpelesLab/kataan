@@ -41,10 +41,18 @@ impl BigInt {
         Self(Int::from_i128(v))
     }
 
-    /// Converts to the nearest `f64` (overflowing to ±∞ for huge magnitudes).
+    /// Converts to the nearest `f64` (overflowing to ±∞ for huge magnitudes),
+    /// with correct round-to-nearest-even. For any value that fits in an `i128`
+    /// (magnitude < 2^127) we route through Rust's `i128 as f64`, which is IEEE
+    /// correctly-rounded; the backend's own conversion can round the wrong way at
+    /// a tie's neighbour (e.g. `Number(8692288669465520373761n)`), so it is only a
+    /// fallback for the rare > 2^127 magnitudes.
     #[must_use]
     pub fn to_f64(&self) -> f64 {
-        self.0.to_f64()
+        match self.to_i128() {
+            Some(v) => v as f64,
+            None => self.0.to_f64(),
+        }
     }
 
     /// Converts to an `i128` if it fits, else `None`.

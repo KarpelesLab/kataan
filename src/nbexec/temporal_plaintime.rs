@@ -320,7 +320,7 @@ impl<'a> Interp<'a> {
                 if !n.is_finite() || n.fract() != 0.0 {
                     return Err(self.plaintime_range_error("Temporal.Duration: non-integer field"));
                 }
-                *slot = n as i64;
+                *slot = n as i128;
             }
             if !any {
                 return Err(self.type_error("Temporal.Duration: object has no duration properties"));
@@ -352,16 +352,16 @@ impl<'a> Interp<'a> {
     /// and the whole duration, reduced to nanoseconds, must stay below
     /// `2^53` seconds. (`RangeError` otherwise.)
     fn plaintime_validate_duration(&mut self, d: &DurationFields) -> Result<(), ExecError> {
-        const MAX_CAL: i64 = 1_i64 << 32; // 2^32
-        if d.years.unsigned_abs() >= MAX_CAL as u64
-            || d.months.unsigned_abs() >= MAX_CAL as u64
-            || d.weeks.unsigned_abs() >= MAX_CAL as u64
+        const MAX_CAL: u128 = 1_u128 << 32; // 2^32
+        if d.years.unsigned_abs() >= MAX_CAL
+            || d.months.unsigned_abs() >= MAX_CAL
+            || d.weeks.unsigned_abs() >= MAX_CAL
         {
             return Err(self.plaintime_range_error("Temporal.Duration: value out of range"));
         }
         // 2^53 seconds expressed in nanoseconds.
         const MAX_TIME_NS: i128 = 9_007_199_254_740_992_i128 * 1_000_000_000;
-        let total = i128::from(d.days) * temporal_iso::NS_PER_DAY + d.time_nanos();
+        let total = d.days * temporal_iso::NS_PER_DAY + d.time_nanos();
         if total.abs() >= MAX_TIME_NS {
             return Err(self.plaintime_range_error("Temporal.Duration: value out of range"));
         }

@@ -1066,11 +1066,16 @@ impl<'a> Interp<'a> {
         // AddDateTime: add the time part (yielding a day carry), then the date part.
         // The time-part carry is calendar-independent; only the date-add step differs.
         let (day_carry, new_time) = iso::add_time(data.time, dur.time_nanos());
-        let date_days = dur.days + day_carry;
+        let date_days = (dur.days + i128::from(day_carry)) as i64;
         let new_date = if tcal::is_iso(&data.calendar) {
             // ISO fast path — byte-for-byte the original computation.
             iso::add_iso_date(
-                data.date, dur.years, dur.months, dur.weeks, date_days, overflow,
+                data.date,
+                dur.years as i64,
+                dur.months as i64,
+                dur.weeks as i64,
+                date_days,
+                overflow,
             )
             .ok_or_else(|| self.pdt_range("result outside representable range"))?
         } else {
@@ -1079,9 +1084,9 @@ impl<'a> Interp<'a> {
             match tcal::calendar_date_add(
                 &data.calendar,
                 data.date,
-                dur.years,
-                dur.months,
-                dur.weeks,
+                dur.years as i64,
+                dur.months as i64,
+                dur.weeks as i64,
                 date_days,
                 overflow,
             ) {
@@ -1140,7 +1145,7 @@ impl<'a> Interp<'a> {
                 if !n.is_finite() || n.fract() != 0.0 {
                     return Err(self.pdt_range("duration fields must be integers"));
                 }
-                let val = n as i64;
+                let val = n as i128;
                 any = true;
                 match key {
                     "years" => d.years = val,
@@ -1787,28 +1792,28 @@ fn pdt_difference(
     }
     let (y, mo, w, d) = iso::difference_iso_date(from.0, adjusted_to, largest);
     let mut dur = iso::balance_time_duration(time_ns, Unit::Hour);
-    dur.years = y;
-    dur.months = mo;
-    dur.weeks = w;
-    dur.days = d;
+    dur.years = i128::from(y);
+    dur.months = i128::from(mo);
+    dur.weeks = i128::from(w);
+    dur.days = i128::from(d);
     dur
 }
 
 /// Balances a signed nanosecond total into a duration down to `largest`, where
 /// `largest` is Day or a finer unit.
 fn pdt_balance_datetime(total_ns: i128, largest: Unit) -> DurationFields {
-    let sign = total_ns.signum() as i64;
+    let sign = total_ns.signum();
     let mut r = total_ns.abs();
-    let (mut weeks, mut days) = (0_i64, 0_i64);
+    let (mut weeks, mut days) = (0_i128, 0_i128);
     if largest <= Unit::Day {
-        days = (r / iso::NS_PER_DAY) as i64;
+        days = r / iso::NS_PER_DAY;
         r %= iso::NS_PER_DAY;
         if largest == Unit::Week {
             weeks = days / 7;
             days %= 7;
         }
     }
-    let mut dur = iso::balance_time_duration(r * i128::from(sign), largest);
+    let mut dur = iso::balance_time_duration(r * sign, largest);
     dur.days = days * sign;
     dur.weeks = weeks * sign;
     dur
@@ -1857,8 +1862,15 @@ fn pdt_round_calendar(
         Unit::Month => (base.years, 0),
         _ => (base.years, base.months), // Week
     };
-    let anchor = iso::add_iso_date(from_date, keep_y, keep_m, 0, 0, Overflow::Constrain)
-        .unwrap_or(from_date);
+    let anchor = iso::add_iso_date(
+        from_date,
+        keep_y as i64,
+        keep_m as i64,
+        0,
+        0,
+        Overflow::Constrain,
+    )
+    .unwrap_or(from_date);
     // Local pseudo-epoch (ns) of `anchor + count smallest-units`, keeping `from`'s
     // wall time.
     let step_ns = |count: i64| -> i128 {
@@ -1879,11 +1891,11 @@ fn pdt_round_calendar(
         return out;
     }
     let seed = pdt_difference((anchor, from_time), to, smallest);
-    let mut r1 = match smallest {
+    let mut r1 = (match smallest {
         Unit::Year => seed.years,
         Unit::Month => seed.months,
         _ => seed.weeks,
-    };
+    }) as i64;
     let beyond = |e: i128| if sign > 0 { e > to_ns } else { e < to_ns };
     for _ in 0..14 {
         if beyond(step_ns(r1 + sign_i)) {
@@ -1909,9 +1921,9 @@ fn pdt_round_calendar(
         (iso::round_to_increment(x, i128::from(increment.max(1)) * den, mode) / den) as i64
     };
     match smallest {
-        Unit::Year => out.years = count,
-        Unit::Month => out.months = count,
-        _ => out.weeks = count,
+        Unit::Year => out.years = i128::from(count),
+        Unit::Month => out.months = i128::from(count),
+        _ => out.weeks = i128::from(count),
     }
     out
 }
@@ -1944,10 +1956,10 @@ fn pdt_difference_cal(
     }
     let parts = tcal::calendar_date_until(cal, from.0, adjusted_to, largest);
     let mut dur = iso::balance_time_duration(time_ns, Unit::Hour);
-    dur.years = parts.years;
-    dur.months = parts.months;
-    dur.weeks = parts.weeks;
-    dur.days = parts.days;
+    dur.years = i128::from(parts.years);
+    dur.months = i128::from(parts.months);
+    dur.weeks = i128::from(parts.weeks);
+    dur.days = i128::from(parts.days);
     dur
 }
 
@@ -1983,7 +1995,7 @@ fn pdt_round_calendar_cal(
     let cadd = |base: IsoDate, y: i64, m: i64, w: i64| -> IsoDate {
         tcal::calendar_date_add(cal, base, y, m, w, 0, Overflow::Constrain).unwrap_or(base)
     };
-    let anchor = cadd(from_date, keep_y, keep_m, 0);
+    let anchor = cadd(from_date, keep_y as i64, keep_m as i64, 0);
     // Local pseudo-epoch (ns) of `anchor + count smallest-units`, keeping `from`'s
     // wall time.
     let step_ns = |count: i64| -> i128 {
@@ -2004,11 +2016,11 @@ fn pdt_round_calendar_cal(
         return out;
     }
     let seed = pdt_difference_cal(cal, (anchor, from_time), to, smallest);
-    let mut r1 = match smallest {
+    let mut r1 = (match smallest {
         Unit::Year => seed.years,
         Unit::Month => seed.months,
         _ => seed.weeks,
-    };
+    }) as i64;
     let beyond = |e: i128| if sign > 0 { e > to_ns } else { e < to_ns };
     for _ in 0..14 {
         if beyond(step_ns(r1 + sign_i)) {
@@ -2034,9 +2046,9 @@ fn pdt_round_calendar_cal(
         (iso::round_to_increment(x, i128::from(increment.max(1)) * den, mode) / den) as i64
     };
     match smallest {
-        Unit::Year => out.years = count,
-        Unit::Month => out.months = count,
-        _ => out.weeks = count,
+        Unit::Year => out.years = i128::from(count),
+        Unit::Month => out.months = i128::from(count),
+        _ => out.weeks = i128::from(count),
     }
     out
 }

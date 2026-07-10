@@ -389,13 +389,13 @@ impl<'a> Interp<'a> {
 
     /// `ToIntegerIfIntegral`: `ToNumber`, then a **RangeError** unless the result
     /// is a finite integer (used for Duration property-bag fields).
-    fn pd_to_integer_if_integral(&mut self, v: NanBox) -> Result<i64, ExecError> {
+    fn pd_to_integer_if_integral(&mut self, v: NanBox) -> Result<i128, ExecError> {
         let num = self.coerce_to_number(v)?;
         let n = self.realm.to_number(num);
         if !n.is_finite() || n.fract() != 0.0 {
             return Err(self.pd_range_error("duration field must be an integer"));
         }
-        Ok(n as i64)
+        Ok(n as i128)
     }
 
     /// Builds a fresh `Temporal.PlainDate` linked to the intrinsic prototype.
@@ -971,30 +971,44 @@ impl<'a> Interp<'a> {
         }
         let overflow = self.pd_overflow(options)?;
         // The sub-day time part contributes only its whole-day carry to a date.
-        let extra_days = (d.time_nanos() / temporal_iso::NS_PER_DAY) as i64;
-        let days = d.days + extra_days;
+        let extra_days = d.time_nanos() / temporal_iso::NS_PER_DAY;
+        let days = (d.days + extra_days) as i64;
         if tcal::is_iso(cal) {
             // ISO fast path — byte-for-byte the original computation.
             // Guard against a year that would overflow the i32 in the shared
             // year/month balancing (huge `years`/`months` durations).
             let approx_year = i64::from(date.year)
-                + d.years
-                + (i64::from(date.month) + d.months - 1).div_euclid(12);
+                + d.years as i64
+                + (i64::from(date.month) + d.months as i64 - 1).div_euclid(12);
             if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&approx_year) {
                 return Err(self.pd_range_error("result is outside the representable range"));
             }
-            return match add_iso_date(date, d.years, d.months, d.weeks, days, overflow) {
+            return match add_iso_date(
+                date,
+                d.years as i64,
+                d.months as i64,
+                d.weeks as i64,
+                days,
+                overflow,
+            ) {
                 Some(result) if Self::pd_in_range(result) => Ok(self.pd_new_cal(result, cal)),
                 _ => Err(self.pd_range_error("result is outside the representable range")),
             };
         }
         // Non-ISO: calendar-aware year/month addition through the calendar layer.
-        let result =
-            match tcal::calendar_date_add(cal, date, d.years, d.months, d.weeks, days, overflow) {
-                Ok(r) => r,
-                Err(tcal::CalError::Range(m)) => return Err(self.pd_range_error(&m)),
-                Err(tcal::CalError::MissingFields(m)) => return Err(self.type_error(&m)),
-            };
+        let result = match tcal::calendar_date_add(
+            cal,
+            date,
+            d.years as i64,
+            d.months as i64,
+            d.weeks as i64,
+            days,
+            overflow,
+        ) {
+            Ok(r) => r,
+            Err(tcal::CalError::Range(m)) => return Err(self.pd_range_error(&m)),
+            Err(tcal::CalError::MissingFields(m)) => return Err(self.type_error(&m)),
+        };
         if !Self::pd_in_range(result) {
             return Err(self.pd_range_error("result is outside the representable range"));
         }
@@ -1331,11 +1345,11 @@ impl<'a> Interp<'a> {
         };
         let (years, months, weeks, days) = difference_iso_date(from, to, largest);
         if smallest == Unit::Day {
-            let d = round_inc(i128::from(days), i128::from(increment.max(1)), mode) as i64;
+            let d = round_inc(i128::from(days), i128::from(increment.max(1)), mode);
             return DurationFields {
-                years,
-                months,
-                weeks,
+                years: i128::from(years),
+                months: i128::from(months),
+                weeks: i128::from(weeks),
                 days: d,
                 ..Default::default()
             };
@@ -1351,8 +1365,8 @@ impl<'a> Interp<'a> {
         let to_e = iso_to_epoch_days(to);
         let sign = (to_e - anchor_e).signum();
         let mut out = DurationFields {
-            years: keep_y,
-            months: keep_m,
+            years: i128::from(keep_y),
+            months: i128::from(keep_m),
             ..Default::default()
         };
         if sign == 0 {
@@ -1399,9 +1413,9 @@ impl<'a> Interp<'a> {
             (round_inc(x, i128::from(increment.max(1)) * den, mode) / den) as i64
         };
         match smallest {
-            Unit::Year => out.years = count,
-            Unit::Month => out.months = count,
-            _ => out.weeks = count,
+            Unit::Year => out.years = i128::from(count),
+            Unit::Month => out.months = i128::from(count),
+            _ => out.weeks = i128::from(count),
         }
         out
     }
@@ -1426,11 +1440,11 @@ impl<'a> Interp<'a> {
         let parts = tcal::calendar_date_until(cal, from, to, largest);
         let (years, months, weeks, days) = (parts.years, parts.months, parts.weeks, parts.days);
         if smallest == Unit::Day {
-            let d = round_inc(i128::from(days), i128::from(increment.max(1)), mode) as i64;
+            let d = round_inc(i128::from(days), i128::from(increment.max(1)), mode);
             return DurationFields {
-                years,
-                months,
-                weeks,
+                years: i128::from(years),
+                months: i128::from(months),
+                weeks: i128::from(weeks),
                 days: d,
                 ..Default::default()
             };
@@ -1450,8 +1464,8 @@ impl<'a> Interp<'a> {
         let to_e = iso_to_epoch_days(to);
         let sign = (to_e - anchor_e).signum();
         let mut out = DurationFields {
-            years: keep_y,
-            months: keep_m,
+            years: i128::from(keep_y),
+            months: i128::from(keep_m),
             ..Default::default()
         };
         if sign == 0 {
@@ -1496,9 +1510,9 @@ impl<'a> Interp<'a> {
             (round_inc(x, i128::from(increment.max(1)) * den, mode) / den) as i64
         };
         match smallest {
-            Unit::Year => out.years = count,
-            Unit::Month => out.months = count,
-            _ => out.weeks = count,
+            Unit::Year => out.years = i128::from(count),
+            Unit::Month => out.months = i128::from(count),
+            _ => out.weeks = i128::from(count),
         }
         out
     }

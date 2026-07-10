@@ -382,18 +382,18 @@ fn negate_duration(d: DurationFields) -> DurationFields {
 
 /// Balances a signed nanosecond total into a duration down to `largest` (Day or finer).
 fn balance_datetime(total_ns: i128, largest: Unit) -> DurationFields {
-    let sign = total_ns.signum() as i64;
+    let sign = total_ns.signum();
     let mut r = total_ns.abs();
-    let (mut weeks, mut days) = (0_i64, 0_i64);
+    let (mut weeks, mut days) = (0_i128, 0_i128);
     if largest <= Unit::Day {
-        days = (r / iso::NS_PER_DAY) as i64;
+        days = r / iso::NS_PER_DAY;
         r %= iso::NS_PER_DAY;
         if largest == Unit::Week {
             weeks = days / 7;
             days %= 7;
         }
     }
-    let mut dur = iso::balance_time_duration(r * i128::from(sign), largest);
+    let mut dur = iso::balance_time_duration(r * sign, largest);
     dur.days = days * sign;
     dur.weeks = weeks * sign;
     dur
@@ -432,10 +432,10 @@ fn datetime_diff(
         (p.years, p.months, p.weeks, p.days)
     };
     let mut dur = iso::balance_time_duration(time_ns, Unit::Hour);
-    dur.years = y;
-    dur.months = mo;
-    dur.weeks = w;
-    dur.days = d;
+    dur.years = i128::from(y);
+    dur.months = i128::from(mo);
+    dur.weeks = i128::from(w);
+    dur.days = i128::from(d);
     dur
 }
 
@@ -1703,16 +1703,23 @@ impl<'a> Interp<'a> {
             // calendar routes through CalendarDateAdd (variable month lengths / leap
             // months honoured).
             let new_date = if tcal::is_iso(&data.calendar) {
-                iso::add_iso_date(d, dur.years, dur.months, dur.weeks, dur.days, overflow)
-                    .ok_or_else(|| self.zdt_range("result out of range"))?
+                iso::add_iso_date(
+                    d,
+                    dur.years as i64,
+                    dur.months as i64,
+                    dur.weeks as i64,
+                    dur.days as i64,
+                    overflow,
+                )
+                .ok_or_else(|| self.zdt_range("result out of range"))?
             } else {
                 match tcal::calendar_date_add(
                     &data.calendar,
                     d,
-                    dur.years,
-                    dur.months,
-                    dur.weeks,
-                    dur.days,
+                    dur.years as i64,
+                    dur.months as i64,
+                    dur.weeks as i64,
+                    dur.days as i64,
                     overflow,
                 ) {
                     Ok(r) => r,
@@ -1772,7 +1779,7 @@ impl<'a> Interp<'a> {
                 if !n.is_finite() || n.fract() != 0.0 {
                     return Err(self.zdt_range("duration fields must be integers"));
                 }
-                let val = n as i64;
+                let val = n as i128;
                 any = true;
                 match key {
                     "years" => d.years = val,
@@ -1991,10 +1998,10 @@ impl<'a> Interp<'a> {
             (rounded / den) as i64
         };
         match unit {
-            Unit::Year => dur.years = count,
-            Unit::Month => dur.months = count,
-            Unit::Week => dur.weeks = count,
-            _ => dur.days = count,
+            Unit::Year => dur.years = i128::from(count),
+            Unit::Month => dur.months = i128::from(count),
+            Unit::Week => dur.weeks = i128::from(count),
+            _ => dur.days = i128::from(count),
         }
         dur
     }

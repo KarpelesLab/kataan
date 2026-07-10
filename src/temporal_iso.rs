@@ -60,16 +60,16 @@ pub struct IsoDateTime {
 /// sign across all non-zero fields).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct DurationFields {
-    pub years: i64,
-    pub months: i64,
-    pub weeks: i64,
-    pub days: i64,
-    pub hours: i64,
-    pub minutes: i64,
-    pub seconds: i64,
-    pub milliseconds: i64,
-    pub microseconds: i64,
-    pub nanoseconds: i64,
+    pub years: i128,
+    pub months: i128,
+    pub weeks: i128,
+    pub days: i128,
+    pub hours: i128,
+    pub minutes: i128,
+    pub seconds: i128,
+    pub milliseconds: i128,
+    pub microseconds: i128,
+    pub nanoseconds: i128,
 }
 
 /// Temporal calendar/rounding unit, ordered largest→smallest.
@@ -528,7 +528,7 @@ impl DurationFields {
             self.nanoseconds,
         ] {
             if v != 0 {
-                return v.signum();
+                return v.signum() as i64;
             }
         }
         0
@@ -537,7 +537,7 @@ impl DurationFields {
     /// Whether all non-zero fields share one sign (DurationSign well-formedness).
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        let mut sign = 0_i64;
+        let mut sign = 0_i128;
         for v in [
             self.years,
             self.months,
@@ -564,12 +564,12 @@ impl DurationFields {
     /// The sub-day portion expressed as a nanosecond count (hours…nanoseconds).
     #[must_use]
     pub fn time_nanos(&self) -> i128 {
-        i128::from(self.hours) * NS_PER_HOUR
-            + i128::from(self.minutes) * NS_PER_MINUTE
-            + i128::from(self.seconds) * NS_PER_SEC
-            + i128::from(self.milliseconds) * 1_000_000
-            + i128::from(self.microseconds) * 1_000
-            + i128::from(self.nanoseconds)
+        self.hours * NS_PER_HOUR
+            + self.minutes * NS_PER_MINUTE
+            + self.seconds * NS_PER_SEC
+            + self.milliseconds * 1_000_000
+            + self.microseconds * 1_000
+            + self.nanoseconds
     }
 }
 
@@ -580,9 +580,9 @@ pub fn balance_time_duration(total_ns: i128, largest: Unit) -> DurationFields {
     let sign = total_ns.signum();
     let mut r = total_ns.abs();
     let mut d = DurationFields::default();
-    let mut set = |field: &mut i64, per: i128, active: bool| {
+    let mut set = |field: &mut i128, per: i128, active: bool| {
         if active {
-            *field = (r / per) as i64 * sign as i64;
+            *field = (r / per) * sign;
             r %= per;
         }
     };
@@ -591,7 +591,7 @@ pub fn balance_time_duration(total_ns: i128, largest: Unit) -> DurationFields {
     set(&mut d.seconds, NS_PER_SEC, largest <= Unit::Second);
     set(&mut d.milliseconds, 1_000_000, largest <= Unit::Millisecond);
     set(&mut d.microseconds, 1_000, largest <= Unit::Microsecond);
-    d.nanoseconds = r as i64 * sign as i64;
+    d.nanoseconds = r * sign;
     d
 }
 
@@ -1123,7 +1123,7 @@ pub fn parse_iso_duration(s: &str) -> Option<DurationFields> {
         i: 0,
     };
     let sign = match c.eat_sign() {
-        Some(true) => -1_i64,
+        Some(true) => -1_i128,
         _ => 1,
     };
     if !(c.eat(b'P') || c.eat(b'p')) {
@@ -1149,10 +1149,10 @@ pub fn parse_iso_duration(s: &str) -> Option<DurationFields> {
         last_date = ord;
         c.i += 1;
         match ord {
-            1 => d.years = n * sign,
-            2 => d.months = n * sign,
-            3 => d.weeks = n * sign,
-            _ => d.days = n * sign,
+            1 => d.years = i128::from(n) * sign,
+            2 => d.months = i128::from(n) * sign,
+            3 => d.weeks = i128::from(n) * sign,
+            _ => d.days = i128::from(n) * sign,
         }
         any = true;
     }
@@ -1178,21 +1178,21 @@ pub fn parse_iso_duration(s: &str) -> Option<DurationFields> {
             any = true;
             match ord {
                 1 => {
-                    d.hours = n * sign;
+                    d.hours = i128::from(n) * sign;
                     if let Some(f) = frac {
                         distribute_fraction(&mut d, f, NS_PER_HOUR, sign);
                         break;
                     }
                 }
                 2 => {
-                    d.minutes = n * sign;
+                    d.minutes = i128::from(n) * sign;
                     if let Some(f) = frac {
                         distribute_fraction(&mut d, f, NS_PER_MINUTE, sign);
                         break;
                     }
                 }
                 _ => {
-                    d.seconds = n * sign;
+                    d.seconds = i128::from(n) * sign;
                     if let Some(f) = frac {
                         distribute_fraction(&mut d, f, NS_PER_SEC, sign);
                     }
@@ -1253,21 +1253,45 @@ fn peek_number(c: &mut Cursor) -> Option<(i64, Option<i64>)> {
 
 /// Distributes a fractional part (in 1e-9 units of `per`-nanosecond-worth) down
 /// into seconds/millis/micros/nanos of `d`.
-fn distribute_fraction(d: &mut DurationFields, frac_1e9: i64, per: i128, sign: i64) {
+fn distribute_fraction(d: &mut DurationFields, frac_1e9: i64, per: i128, sign: i128) {
     let total_ns = i128::from(frac_1e9) * per / NS_PER_SEC;
     let mut r = total_ns;
-    d.seconds += (r / NS_PER_SEC) as i64 * sign;
+    d.seconds += (r / NS_PER_SEC) * sign;
     r %= NS_PER_SEC;
-    d.milliseconds += (r / 1_000_000) as i64 * sign;
+    d.milliseconds += (r / 1_000_000) * sign;
     r %= 1_000_000;
-    d.microseconds += (r / 1_000) as i64 * sign;
+    d.microseconds += (r / 1_000) * sign;
     r %= 1_000;
-    d.nanoseconds += r as i64 * sign;
+    d.nanoseconds += r * sign;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn balance_time_duration_holds_large_i128_fields() {
+        // A Duration nanoseconds field can reach ~2^53 seconds' worth of ns
+        // (~9.007e24), far beyond i64. Balancing to microseconds/nanoseconds must
+        // carry the full magnitude, not saturate.
+        let seconds: i128 = 8_692_288_669_465_520;
+        // largestUnit = microseconds: seconds*1e6 + 373761
+        let micro_total = seconds * 1_000_000 + 373_761;
+        let d = balance_time_duration(micro_total * 1_000, Unit::Microsecond);
+        assert_eq!(d.microseconds, 8_692_288_669_465_520_373_761);
+        assert_eq!(d.microseconds, micro_total);
+        assert_eq!(d.nanoseconds, 0);
+
+        // largestUnit = nanoseconds: the whole ns total lands in one field.
+        let ns_total = seconds * 1_000_000_000 + 321_414_345;
+        let d = balance_time_duration(ns_total, Unit::Nanosecond);
+        assert_eq!(d.nanoseconds, 8_692_288_669_465_520_321_414_345);
+        assert_eq!(d.nanoseconds, ns_total);
+
+        // Negative magnitudes carry their sign through the i128 fields.
+        let d = balance_time_duration(-ns_total, Unit::Nanosecond);
+        assert_eq!(d.nanoseconds, -ns_total);
+    }
 
     #[test]
     fn epoch_round_trip() {

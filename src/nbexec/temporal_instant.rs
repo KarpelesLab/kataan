@@ -447,7 +447,7 @@ impl<'a> Interp<'a> {
             if !n.is_finite() || n.fract() != 0.0 {
                 return Err(self.range_err("duration fields must be integers"));
             }
-            let iv = n as i64;
+            let iv = n as i128;
             match f {
                 "days" => d.days = iv,
                 "hours" => d.hours = iv,

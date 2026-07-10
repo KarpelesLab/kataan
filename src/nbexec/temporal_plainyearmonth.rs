@@ -330,13 +330,13 @@ impl<'a> Interp<'a> {
     }
 
     /// `ToIntegerIfIntegral`: a Number that must be an integer, else RangeError.
-    fn pym_to_integral(&mut self, v: NanBox) -> Result<i64, ExecError> {
+    fn pym_to_integral(&mut self, v: NanBox) -> Result<i128, ExecError> {
         let num = self.coerce_to_number(v)?;
         let f = self.realm.to_number(num);
         if !f.is_finite() || f.fract() != 0.0 {
             return Err(self.pym_range("PlainYearMonth: value must be an integer"));
         }
-        Ok(f as i64)
+        Ok(f as i128)
     }
 
     fn is_undef(v: NanBox) -> bool {
@@ -798,7 +798,7 @@ impl<'a> Interp<'a> {
                 "weeks",
                 "years",
             ];
-            let mut vals = [0i64; 10];
+            let mut vals = [0i128; 10];
             let mut any = false;
             for (i, name) in names.iter().enumerate() {
                 let fv = self.pym_get(h, name)?;
@@ -1047,8 +1047,8 @@ impl<'a> Interp<'a> {
             // Only years and months affect a year-month; add them directly (dropping
             // the reference day). Working in i64 avoids the i32 wrap that
             // `add_iso_date` suffers for out-of-range durations.
-            let m0 = (i64::from(data.date.month) - 1) + dur.months;
-            let result_year = i64::from(data.date.year) + dur.years + m0.div_euclid(12);
+            let m0 = (i64::from(data.date.month) - 1) + dur.months as i64;
+            let result_year = i64::from(data.date.year) + dur.years as i64 + m0.div_euclid(12);
             let result_month = m0.rem_euclid(12) + 1;
             if !ym_within_limits(result_year, result_month) {
                 return Err(self.pym_range("PlainYearMonth: result out of range"));
@@ -1067,7 +1067,7 @@ impl<'a> Interp<'a> {
         // weeks/days carry, then re-derive the resulting year-month.
         let cal = data.calendar.clone();
         // `ToDateDurationRecordWithoutTime`: fold the time part into whole days.
-        let extra_days = (dur.time_nanos() / temporal_iso::NS_PER_DAY) as i64;
+        let extra_days = dur.time_nanos() / temporal_iso::NS_PER_DAY;
         let days = dur.days + extra_days;
         // The overall sign of the (date) duration selects the anchor day: day 1
         // for a non-negative duration, else the last day of the calendar month.
@@ -1097,10 +1097,10 @@ impl<'a> Interp<'a> {
         let added = match tcal::calendar_date_add(
             &cal,
             intermediate,
-            dur.years,
-            dur.months,
-            dur.weeks,
-            days,
+            dur.years as i64,
+            dur.months as i64,
+            dur.weeks as i64,
+            days as i64,
             Overflow::Constrain,
         ) {
             Ok(d) => d,
@@ -1290,8 +1290,8 @@ impl<'a> Interp<'a> {
         }
 
         let d = crate::temporal_iso::DurationFields {
-            years: ry,
-            months: rm,
+            years: i128::from(ry),
+            months: i128::from(rm),
             ..Default::default()
         };
         Ok(self.pym_new_duration(d))

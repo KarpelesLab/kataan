@@ -414,6 +414,71 @@ fn duration_fields_valid(f: &[f64; 10]) -> bool {
     (total_ns / NS_PER_SEC).abs() < TWO_POW_53
 }
 
+/// `2.0_f64.powi(k)` for `0 <= k <= 1023`, built from the IEEE-754 bit pattern so
+/// it is exact and available in `no_std` (no `f64::powi`).
+fn exp2_u32(k: u32) -> f64 {
+    debug_assert!(k <= 1023);
+    f64::from_bits((1023_u64 + u64::from(k)) << 52)
+}
+
+/// Correctly-rounded (round-to-nearest, ties-to-even) value of `num / den` as an
+/// `f64`, for `den > 0`. Computing the integer quotient and the fractional
+/// remainder as two separate `f64`s and adding them (`whole + rem`) double-rounds
+/// once the quotient nears/exceeds `2^53`; this rounds the exact rational once.
+/// `DivideNormalizedTimeDuration` in the Temporal spec is an exact rational, so
+/// `Duration.prototype.total` must round it a single time.
+fn ratio_to_f64(num: i128, den: i128) -> f64 {
+    debug_assert!(den > 0);
+    if num == 0 {
+        return 0.0;
+    }
+    let neg = num < 0;
+    let n = num.unsigned_abs();
+    let d = den.unsigned_abs();
+    let q = n / d; // integer part of |num|/|den|
+    let rem = n % d; // exact value is q + rem/d, with 0 <= rem < d
+    let qbits = 128 - q.leading_zeros(); // significant bits of q (0 when q == 0)
+    let result = if q == 0 {
+        // |value| < 1. A single IEEE division is correctly rounded when both
+        // operands are exactly representable; `den` here is a fixed
+        // nanoseconds-per-unit constant (<= 3.6e12 < 2^53) and `rem < den`.
+        (rem as f64) / (d as f64)
+    } else if qbits <= 53 {
+        // q is exact in an f64 and there is mantissa room for `53 - qbits`
+        // fraction bits. Build the 54-bit integer `floor(value * 2^scale)` (a
+        // guard bit below the mantissa), then round-half-even using the division
+        // remainder `fr` as the sticky bit. `value = mant * 2^-fbits`.
+        let fbits = 53 - qbits;
+        let scale = fbits + 1; // 1..=53
+        let scaled = (rem << scale) / d; // fraction bits of rem/d (fits: rem < 2^42)
+        let fr = (rem << scale) % d; // sticky remainder
+        let m_full = (q << scale) + scaled; // 54-bit: floor(value * 2^scale)
+        let guard = m_full & 1;
+        let mut mant = m_full >> 1; // 53-bit mantissa
+        if guard == 1 && (fr > 0 || (mant & 1) == 1) {
+            mant += 1;
+        }
+        (mant as f64) / exp2_u32(fbits)
+    } else {
+        // q has > 53 significant bits: keep the top 53, and round using the bits
+        // of q we drop plus the sub-integer fraction rem/d as the sticky bit.
+        let drop = qbits - 53;
+        let kept = q >> drop;
+        let dropped = q & ((1_u128 << drop) - 1);
+        let half = 1_u128 << (drop - 1);
+        let round_up = match dropped.cmp(&half) {
+            core::cmp::Ordering::Greater => true,
+            core::cmp::Ordering::Less => false,
+            // Exactly halfway among the dropped q-bits: the fraction rem/d (if
+            // non-zero) tips it up, otherwise round to even.
+            core::cmp::Ordering::Equal => rem > 0 || (kept & 1) == 1,
+        };
+        let m = kept + u128::from(round_up);
+        (m as f64) * exp2_u32(drop)
+    };
+    if neg { -result } else { result }
+}
+
 /// Parses a Temporal ISO 8601 **duration** string (`±P…`) into raw field values
 /// (as `f64`, so an overflowing 1000-digit component becomes a non-finite value
 /// the caller's validation rejects). Returns `None` for a malformed string.
@@ -676,7 +741,7 @@ impl<'a> Interp<'a> {
             "milliseconds" => d.milliseconds,
             "microseconds" => d.microseconds,
             "nanoseconds" => d.nanoseconds,
-            "sign" => d.sign(),
+            "sign" => i128::from(d.sign()),
             "blank" => return Ok(NanBox::boolean(d.sign() == 0)),
             _ => return Err(self.temporal_todo(&alloc::format!("Duration getter {name}"))),
         };
@@ -738,8 +803,8 @@ impl<'a> Interp<'a> {
                         self.dur_range_error("compare requires relativeTo for calendar units")
                     );
                 }
-                let na = da.days as i128 * NS_PER_DAY + da.time_nanos();
-                let nb = db.days as i128 * NS_PER_DAY + db.time_nanos();
+                let na = da.days * NS_PER_DAY + da.time_nanos();
+                let nb = db.days * NS_PER_DAY + db.time_nanos();
                 let r = (na - nb).signum() as f64;
                 Ok(Some(NanBox::number(r)))
             }
@@ -786,16 +851,16 @@ impl<'a> Interp<'a> {
             return Err(self.dur_range_error("Invalid Duration: out of range or mixed signs"));
         }
         Ok(DurationFields {
-            years: f[0] as i64,
-            months: f[1] as i64,
-            weeks: f[2] as i64,
-            days: f[3] as i64,
-            hours: f[4] as i64,
-            minutes: f[5] as i64,
-            seconds: f[6] as i64,
-            milliseconds: f[7] as i64,
-            microseconds: f[8] as i64,
-            nanoseconds: f[9] as i64,
+            years: f[0] as i128,
+            months: f[1] as i128,
+            weeks: f[2] as i128,
+            days: f[3] as i128,
+            hours: f[4] as i128,
+            minutes: f[5] as i128,
+            seconds: f[6] as i128,
+            milliseconds: f[7] as i128,
+            microseconds: f[8] as i128,
+            nanoseconds: f[9] as i128,
         })
     }
 
@@ -986,8 +1051,7 @@ impl<'a> Interp<'a> {
         // The result balances only up to the larger of the two operands' own
         // largest units (durations do not spontaneously balance beyond that).
         let largest = default_largest_unit(&d).min(default_largest_unit(&other));
-        let total_ns =
-            (d.days + other.days) as i128 * NS_PER_DAY + d.time_nanos() + other.time_nanos();
+        let total_ns = (d.days + other.days) * NS_PER_DAY + d.time_nanos() + other.time_nanos();
         // Reject a combined magnitude that no longer fits a valid duration before
         // balancing (which would otherwise overflow the i64 fields silently).
         if (total_ns / NS_PER_SEC).abs() >= TWO_POW_53 {
@@ -1109,7 +1173,7 @@ impl<'a> Interp<'a> {
         }
 
         // No calendar involvement and no anchor: pure fixed-length rounding.
-        let total_ns = d.days as i128 * NS_PER_DAY + d.time_nanos();
+        let total_ns = d.days * NS_PER_DAY + d.time_nanos();
         let incr = ns_per_unit(smallest) * increment;
         let rounded = self.dur_round_increment(total_ns, incr.max(1), mode);
         if (rounded / NS_PER_SEC).abs() >= TWO_POW_53 {
@@ -1459,14 +1523,21 @@ impl<'a> Interp<'a> {
     fn dur_apply(
         &mut self,
         a: &DurAnchor,
-        years: i64,
-        months: i64,
-        weeks: i64,
-        days: i64,
+        years: i128,
+        months: i128,
+        weeks: i128,
+        days: i128,
         norm: i128,
     ) -> Result<DurTarget, ExecError> {
-        let d1 = add_iso_date(a.date, years, months, weeks, days, Overflow::Constrain)
-            .ok_or_else(|| self.dur_range_error("relativeTo date arithmetic out of range"))?;
+        let d1 = add_iso_date(
+            a.date,
+            years as i64,
+            months as i64,
+            weeks as i64,
+            days as i64,
+            Overflow::Constrain,
+        )
+        .ok_or_else(|| self.dur_range_error("relativeTo date arithmetic out of range"))?;
         match &a.tz {
             None => {
                 let combined = a.time_ns + norm;
@@ -1984,13 +2055,11 @@ impl<'a> Interp<'a> {
             return Err(self.dur_range_error("total with calendar units requires relativeTo"));
         }
 
-        let total_ns = d.days as i128 * NS_PER_DAY + d.time_nanos();
+        let total_ns = d.days * NS_PER_DAY + d.time_nanos();
         let per = ns_per_unit(unit);
-        // Exact whole part plus fractional remainder, kept separate to preserve
-        // precision when the quotient is large.
-        let whole = (total_ns / per) as f64;
-        let rem = (total_ns % per) as f64 / per as f64;
-        Ok(NanBox::number(whole + rem))
+        // `DivideNormalizedTimeDuration`: the exact rational total_ns/per rounded to
+        // a double exactly once (a naive whole-plus-fraction split double-rounds).
+        Ok(NanBox::number(ratio_to_f64(total_ns, per)))
     }
 
     /// `TemporalDurationToString(duration, precision)`.
@@ -2027,15 +2096,14 @@ impl<'a> Interp<'a> {
         // the duration's own largest unit: a rounded-up second may carry into
         // minutes/hours, and (when a date unit is present) hours into days —
         // but the carry never propagates past days (e.g. 1:59:60 → 2h).
-        let total_subsec = d.seconds as i128 * NS_PER_SEC
-            + d.milliseconds as i128 * 1_000_000
-            + d.microseconds as i128 * 1_000
-            + d.nanoseconds as i128;
+        let total_subsec = d.seconds * NS_PER_SEC
+            + d.milliseconds * 1_000_000
+            + d.microseconds * 1_000
+            + d.nanoseconds;
         let rounded_subsec = self.dur_round_increment(total_subsec, incr_ns.max(1), mode);
-        let total_time_ns =
-            d.hours as i128 * NS_PER_HOUR + d.minutes as i128 * NS_PER_MINUTE + rounded_subsec;
+        let total_time_ns = d.hours * NS_PER_HOUR + d.minutes * NS_PER_MINUTE + rounded_subsec;
         // Validity: the whole duration's normalized seconds must stay under 2^53.
-        let secs_total = d.days as i128 * NS_PER_DAY + total_time_ns;
+        let secs_total = d.days * NS_PER_DAY + total_time_ns;
         if (secs_total / NS_PER_SEC).abs() >= TWO_POW_53 {
             return Err(self.dur_range_error("Duration is out of range for toString"));
         }
@@ -2045,9 +2113,9 @@ impl<'a> Interp<'a> {
         let dl = default_largest_unit(&d) as usize;
         let mut whole_seconds = rounded_subsec / NS_PER_SEC;
         let frac = (rounded_subsec % NS_PER_SEC).unsigned_abs() as u32;
-        let mut disp_minutes = d.minutes as i128;
-        let mut disp_hours = d.hours as i128;
-        let mut disp_days = d.days as i128;
+        let mut disp_minutes = d.minutes;
+        let mut disp_hours = d.hours;
+        let mut disp_days = d.days;
         if precision.is_some() {
             if dl <= Unit::Minute as usize {
                 disp_minutes += whole_seconds / 60;
@@ -2160,5 +2228,89 @@ fn default_largest_unit(d: &DurationFields) -> Unit {
         Unit::Microsecond
     } else {
         Unit::Nanosecond
+    }
+}
+
+#[cfg(test)]
+mod ratio_tests {
+    use super::{exp2_u32, ratio_to_f64};
+
+    /// The reference: a single IEEE division, correctly rounded whenever both
+    /// operands are exactly representable as `f64` (|num|, den < 2^53).
+    fn reference(num: i128, den: i128) -> f64 {
+        num as f64 / den as f64
+    }
+
+    #[test]
+    fn exp2_is_exact_power_of_two() {
+        assert_eq!(exp2_u32(0), 1.0);
+        assert_eq!(exp2_u32(1), 2.0);
+        assert_eq!(exp2_u32(43), 8_796_093_022_208.0);
+        assert_eq!(exp2_u32(52), 4_503_599_627_370_496.0);
+    }
+
+    #[test]
+    fn matches_single_ieee_division_for_small_operands() {
+        // Every case here has |num| < 2^53 and den < 2^53, so the reference is
+        // itself correctly rounded and `ratio_to_f64` must reproduce it bit-exactly.
+        let dens = [1_i128, 1_000, 1_000_000, 1_000_000_000, 3_600_000_000_000];
+        for &den in &dens {
+            for num in [0_i128, 1, 2, 7, 816, 999_999, 2_939_649_187_497_660] {
+                assert_eq!(
+                    ratio_to_f64(num, den).to_bits(),
+                    reference(num, den).to_bits(),
+                    "num={num} den={den}"
+                );
+                assert_eq!(
+                    ratio_to_f64(-num, den).to_bits(),
+                    reference(-num, den).to_bits(),
+                    "num=-{num} den={den}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn large_quotient_rounds_once_not_twice() {
+        // total("milliseconds") of {milliseconds: 2^53, microseconds: 1999}: the
+        // exact value 9007199254740993.999 rounds up to 9007199254740994 (spacing 2
+        // at 2^53). A whole-plus-fraction split would land on 9007199254740992.
+        let total_ns = 9_007_199_254_740_992_i128 * 1_000_000 + 1999 * 1_000;
+        assert_eq!(ratio_to_f64(total_ns, 1_000_000), 9_007_199_254_740_994.0);
+    }
+
+    #[test]
+    fn hour_total_is_spec_exact() {
+        // Duration{hours:816, nanoseconds:2049187497660}.total("hours"). The
+        // numerator fits in 2^53, so `reference` is itself correctly rounded and
+        // is the test262 expected value 816.56921874935. A naive whole+fraction
+        // split double-rounds one ULP away from it.
+        let total_ns = 816_i128 * super::NS_PER_HOUR + 2_049_187_497_660;
+        assert!(total_ns < (1_i128 << 53));
+        assert_eq!(
+            ratio_to_f64(total_ns, super::NS_PER_HOUR).to_bits(),
+            reference(total_ns, super::NS_PER_HOUR).to_bits()
+        );
+    }
+
+    #[test]
+    fn sub_unit_fraction_is_correct() {
+        // |value| < 1 branch: 91035820 ns / 1 hour.
+        let expected = 91_035_820_f64 / super::NS_PER_HOUR as f64;
+        assert_eq!(
+            ratio_to_f64(91_035_820, super::NS_PER_HOUR).to_bits(),
+            expected.to_bits()
+        );
+    }
+
+    #[test]
+    fn huge_microsecond_quotient() {
+        // A quotient far beyond 2^53 (the > 53-bit branch): 2^53 seconds in µs is
+        // exactly representable (= 2^59 * 15625), so the result is exact.
+        let total_ns = 9_007_199_254_740_992_i128 * super::NS_PER_SEC;
+        assert_eq!(
+            ratio_to_f64(total_ns, 1_000),
+            9_007_199_254_740_992_000_000.0
+        );
     }
 }
