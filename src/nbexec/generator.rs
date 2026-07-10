@@ -263,6 +263,58 @@ enum Step<'a> {
         i: usize,
         items: Vec<NanBox>,
     },
+    /// Lazily destructure `elements[idx..]` over a **user iterator** `ih`, pulling
+    /// exactly one `IteratorStep` per element (so `[a] = infiniteIterator`
+    /// terminates and a per-element default that `yield`s suspends at the right
+    /// moment). `done` is the shared `iteratorRecord.[[done]]`; the matching
+    /// `DestructureArrayClose` guard sitting below this step on the stack performs
+    /// `IteratorClose` — on the normal way out *or* while `gen_unwind` unwinds an
+    /// abrupt completion (`return()`/`throw`/`break` from an element's default).
+    DestructureArrayIter {
+        elements: &'a [ArrayElement],
+        idx: usize,
+        ih: Handle,
+        done: alloc::rc::Rc<core::cell::Cell<bool>>,
+    },
+    /// The `IteratorClose` guard for a lazy array destructuring (see
+    /// [`Step::DestructureArrayIter`]). Executed normally after the last element,
+    /// or matched by `gen_unwind` during an abrupt unwind.
+    DestructureArrayClose {
+        ih: Handle,
+        done: alloc::rc::Rc<core::cell::Cell<bool>>,
+    },
+    /// A rest target `...obj[key]` (lazy path) whose computed `key` may `yield`:
+    /// `obj` is on the value stack; evaluate `key` on top, then drain and assign.
+    /// The reference is fully evaluated *before* the iterator is drained (spec
+    /// order), so a `yield` in the key that is resumed with `return()`/`throw`
+    /// closes the iterator without pulling a value.
+    DestructureRestKey {
+        key: &'a Expr,
+        ih: Handle,
+        done: alloc::rc::Rc<core::cell::Cell<bool>>,
+    },
+    /// Complete `...obj[key]`: `obj` and (on top) the key are on the value stack;
+    /// drain the remaining iterator values into a fresh array and assign it.
+    DestructureRestSet {
+        ih: Handle,
+        done: alloc::rc::Rc<core::cell::Cell<bool>>,
+    },
+    /// An element target `obj[key]` (lazy path) whose computed `key` may `yield`:
+    /// `obj` is on the value stack; evaluate `key`, then do the one `IteratorStep`
+    /// and assign. The reference is evaluated *before* the step (spec order), so a
+    /// `yield` in the key resumed with `return()`/`throw` closes the iterator
+    /// without calling `next`.
+    DestructureElemKey {
+        key: &'a Expr,
+        ih: Handle,
+        done: alloc::rc::Rc<core::cell::Cell<bool>>,
+    },
+    /// Complete an element `obj[key]`: `obj` and (on top) the key are on the value
+    /// stack; take one `IteratorStep` (unless the iterator is done) and assign.
+    DestructureElemSet {
+        ih: Handle,
+        done: alloc::rc::Rc<core::cell::Cell<bool>>,
+    },
     /// Destructure `members[idx..]` of an object pattern from source object `src`;
     /// `used` records keys already consumed (for a `...rest`).
     DestructureObjectMember {
@@ -2189,6 +2241,200 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
+            Step::DestructureArrayIter {
+                elements,
+                idx,
+                ih,
+                done,
+            } => {
+                if idx >= elements.len() {
+                    // All elements consumed; the `DestructureArrayClose` guard below
+                    // performs the normal-completion `IteratorClose`.
+                    return Ok(StepOut::Continue);
+                }
+                let iterator = NanBox::handle(ih.to_raw());
+                let step_val = |me: &mut Self, done: &alloc::rc::Rc<core::cell::Cell<bool>>| {
+                    if done.get() {
+                        return Ok(NanBox::undefined());
+                    }
+                    match me.dstr_iter_step(ih, iterator) {
+                        Ok(Some(v)) => Ok(v),
+                        Ok(None) => {
+                            done.set(true);
+                            Ok(NanBox::undefined())
+                        }
+                        Err(e) => {
+                            // A throwing `next()` finishes the iterator (no close).
+                            done.set(true);
+                            Err(e)
+                        }
+                    }
+                };
+                match &elements[idx] {
+                    ArrayElement::Hole => {
+                        let _ = step_val(self, &done).map_err(GenAbrupt::from)?;
+                        stack.push(Step::DestructureArrayIter {
+                            elements,
+                            idx: idx + 1,
+                            ih,
+                            done,
+                        });
+                        Ok(StepOut::Continue)
+                    }
+                    ArrayElement::Item(e) => {
+                        // `obj[key]` whose base or computed key `yield`s: the target
+                        // reference is evaluated **before** the `IteratorStep` (spec
+                        // order). Evaluate `obj` then `key` through the step machine;
+                        // a `yield` resumed with `return()`/`throw` then closes the
+                        // iterator without calling `next`. (A defaulted target is an
+                        // `Expr::Assign`, so this narrow `Member` match excludes it.)
+                        if let Expr::Member {
+                            object,
+                            property: PropertyKey::Computed(key),
+                            ..
+                        } = e
+                            && (expr_has_yield(object) || expr_has_yield(key))
+                        {
+                            stack.push(Step::DestructureArrayIter {
+                                elements,
+                                idx: idx + 1,
+                                ih,
+                                done: done.clone(),
+                            });
+                            stack.push(Step::DestructureElemKey { key, ih, done });
+                            return self.gen_eval_expr(object, stack, values);
+                        }
+                        let v = step_val(self, &done).map_err(GenAbrupt::from)?;
+                        stack.push(Step::DestructureArrayIter {
+                            elements,
+                            idx: idx + 1,
+                            ih,
+                            done,
+                        });
+                        stack.push(Step::Destructure {
+                            target: e,
+                            value: v,
+                        });
+                        Ok(StepOut::Continue)
+                    }
+                    ArrayElement::Spread(e) => {
+                        // `...obj[key]` whose base or computed key `yield`s: per spec
+                        // the rest *reference* is evaluated **before** the iterator is
+                        // drained. Evaluate `obj` then `key` through the step machine
+                        // (so a `yield` there suspends), and only then drain + assign —
+                        // so a `return()`/`throw` resumption closes the iterator
+                        // without pulling (and without calling a throwing `next`).
+                        if let Expr::Member {
+                            object,
+                            property: PropertyKey::Computed(key),
+                            ..
+                        } = e
+                            && (expr_has_yield(object) || expr_has_yield(key))
+                        {
+                            stack.push(Step::DestructureArrayIter {
+                                elements,
+                                idx: idx + 1,
+                                ih,
+                                done: done.clone(),
+                            });
+                            stack.push(Step::DestructureRestKey { key, ih, done });
+                            return self.gen_eval_expr(object, stack, values);
+                        }
+                        // `...rest` (no yielding reference): collect all remaining
+                        // values into a fresh array, exhausting the iterator.
+                        let mut rest = Vec::new();
+                        while !done.get() {
+                            match self.dstr_iter_step(ih, iterator) {
+                                Ok(Some(v)) => rest.push(v),
+                                Ok(None) => done.set(true),
+                                Err(e) => {
+                                    done.set(true);
+                                    return Err(GenAbrupt::from(e));
+                                }
+                            }
+                        }
+                        let arr = NanBox::handle(self.realm.new_array(rest).to_raw());
+                        stack.push(Step::DestructureArrayIter {
+                            elements,
+                            idx: idx + 1,
+                            ih,
+                            done,
+                        });
+                        stack.push(Step::Destructure {
+                            target: e,
+                            value: arr,
+                        });
+                        Ok(StepOut::Continue)
+                    }
+                }
+            }
+            Step::DestructureRestKey { key, ih, done } => {
+                // `obj` is on the value stack (kept); evaluate the computed key.
+                stack.push(Step::DestructureRestSet { ih, done });
+                self.gen_eval_expr(key, stack, values)
+            }
+            Step::DestructureRestSet { ih, done } => {
+                let key = values.pop().unwrap_or(NanBox::undefined());
+                let objval = values.pop().unwrap_or(NanBox::undefined());
+                let iterator = NanBox::handle(ih.to_raw());
+                let mut rest = Vec::new();
+                while !done.get() {
+                    match self.dstr_iter_step(ih, iterator) {
+                        Ok(Some(v)) => rest.push(v),
+                        Ok(None) => done.set(true),
+                        Err(e) => {
+                            done.set(true);
+                            return Err(GenAbrupt::from(e));
+                        }
+                    }
+                }
+                let arr = NanBox::handle(self.realm.new_array(rest).to_raw());
+                if let Some(raw) = objval.as_handle() {
+                    self.assign_member_value(Handle::from_raw(raw), key, arr)
+                        .map_err(GenAbrupt::from)?;
+                }
+                Ok(StepOut::Continue)
+            }
+            Step::DestructureElemKey { key, ih, done } => {
+                // `obj` is on the value stack (kept); evaluate the computed key.
+                stack.push(Step::DestructureElemSet { ih, done });
+                self.gen_eval_expr(key, stack, values)
+            }
+            Step::DestructureElemSet { ih, done } => {
+                let key = values.pop().unwrap_or(NanBox::undefined());
+                let objval = values.pop().unwrap_or(NanBox::undefined());
+                let iterator = NanBox::handle(ih.to_raw());
+                // The single `IteratorStep` for this element (spec order: after the
+                // reference was evaluated above).
+                let v = if done.get() {
+                    NanBox::undefined()
+                } else {
+                    match self.dstr_iter_step(ih, iterator) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => {
+                            done.set(true);
+                            NanBox::undefined()
+                        }
+                        Err(e) => {
+                            done.set(true);
+                            return Err(GenAbrupt::from(e));
+                        }
+                    }
+                };
+                if let Some(raw) = objval.as_handle() {
+                    self.assign_member_value(Handle::from_raw(raw), key, v)
+                        .map_err(GenAbrupt::from)?;
+                }
+                Ok(StepOut::Continue)
+            }
+            Step::DestructureArrayClose { ih, done } => {
+                // Normal completion: close a not-yet-exhausted iterator. A `return`
+                // that yields a non-Object throws a TypeError (propagated).
+                if !done.get() {
+                    self.iterator_close(ih).map_err(GenAbrupt::from)?;
+                }
+                Ok(StepOut::Continue)
+            }
             Step::DestructureObjectMember {
                 members,
                 idx,
@@ -2700,6 +2946,31 @@ impl<'a> Interp<'a> {
     ) -> StepResult {
         match target {
             Expr::Array { elements, .. } => {
+                // A *user* iterator is driven one `IteratorStep` per element (so an
+                // infinite iterator terminates, a per-element default `yield`s at the
+                // right moment, and `IteratorClose`/`return()` runs on abrupt exit).
+                // Built-in iterables (arrays/strings/Sets) and generators — which
+                // always terminate — take the eager value-list path. Mirrors the
+                // non-generator `assign_destructure`.
+                if let Some(ih) = self.for_of_get_iterator(value).map_err(GenAbrupt::from)?
+                    && self.realm.get_property(ih, GEN_BUF).is_none()
+                {
+                    let done = alloc::rc::Rc::new(core::cell::Cell::new(false));
+                    // The guard sits below the element steps: normal flow reaches it
+                    // last (IteratorClose on a not-yet-done iterator); an abrupt
+                    // unwind pops the element steps and hits it in `gen_unwind`.
+                    stack.push(Step::DestructureArrayClose {
+                        ih,
+                        done: done.clone(),
+                    });
+                    stack.push(Step::DestructureArrayIter {
+                        elements,
+                        idx: 0,
+                        ih,
+                        done,
+                    });
+                    return Ok(StepOut::Continue);
+                }
                 let items = self.iterate_values(value).map_err(GenAbrupt::from)?;
                 stack.push(Step::DestructureArrayElem {
                     elements,
@@ -3154,6 +3425,20 @@ impl<'a> Interp<'a> {
                 Step::SwitchRegion => {
                     if matches!(completion, Completion::Break(None)) {
                         return Ok(None);
+                    }
+                }
+                Step::DestructureArrayClose { ih, done } => {
+                    // A destructuring element completed abruptly (a default's
+                    // `yield` got `return()`/`throw`, or a target assignment threw)
+                    // while the iterator was not yet done: run `IteratorClose`. A
+                    // `throw` completion takes precedence over any error from
+                    // `return()`; a non-throw completion is replaced by the close's
+                    // throw (e.g. `return()` returning a non-Object → TypeError).
+                    if !done.get()
+                        && let Err(e) = self.iterator_close(ih)
+                        && !matches!(completion, Completion::Throw(_))
+                    {
+                        completion = Completion::Throw(throw_value(e));
                     }
                 }
                 // Expression/other steps are discarded; drop any partial operand

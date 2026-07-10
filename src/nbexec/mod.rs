@@ -5381,9 +5381,20 @@ impl<'a> Interp<'a> {
     /// in the global scope — never in the current (function/block) scope, so the
     /// new global outlives the enclosing frame. (Strict mode throws instead.)
     pub(crate) fn declare_sloppy_global(&mut self, name: &str, value: NanBox) {
-        self.global_scope.declare(name, value);
+        // A sloppy assignment to an *unresolvable* reference (`x = 1` with no `x`
+        // binding) creates an ordinary, **configurable** data property on the
+        // global object — *not* a binding in the global environment record's
+        // declarative part. This matters for `delete x`: a property created this
+        // way is deletable (returns `true`, then the name is unresolvable again),
+        // whereas a declared `var`/`let`/`function` binding is not. Reads resolve
+        // via `read_ident_ref`'s global-object fallback, so no declarative binding
+        // is needed.
         if let Some(g) = self.global_this.as_handle().map(Handle::from_raw) {
             self.realm.set_property(g, name, value);
+        } else {
+            // No global object (an unusual embedding): fall back to a declarative
+            // binding so the write is not simply lost.
+            self.global_scope.declare(name, value);
         }
     }
 

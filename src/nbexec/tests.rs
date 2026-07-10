@@ -6520,6 +6520,62 @@ fn with_statement_consults_proxy_has_trap() {
 }
 
 #[test]
+fn with_unscopables_non_object_is_ignored() {
+    // A non-Object `@@unscopables` (`''` — a heap string, still a `Handle`) must
+    // NOT block bindings: `toString` still resolves to the with-object's property.
+    assert_eq!(
+        run("var t={};var env={toString:t};env[Symbol.unscopables]='';\
+             var r;with(env){r=(toString===t)};r"),
+        "true"
+    );
+}
+
+#[test]
+fn generator_array_destructuring_closes_iterator_on_return() {
+    // `[ {} = yield ] = iter` inside a generator: an `iter.return()` at the yield
+    // is an abrupt completion that must `IteratorClose` the (not-done) iterator —
+    // calling its `return()` once — and the destructuring must pull lazily (one
+    // step per element) rather than draining an infinite iterator.
+    assert_eq!(
+        run("var nextCount=0,returnCount=0,unreachable=0;\
+             var iterator={next:function(){nextCount++;return{done:false,value:undefined};},\
+                           return:function(){returnCount++;return{};}};\
+             var iterable={};iterable[Symbol.iterator]=function(){return iterator;};\
+             function* g(){var result;result=[ {} = yield ] = iterable;unreachable++;}\
+             var it=g();it.next();var r=it.return(777);\
+             (nextCount===1 && returnCount===1 && unreachable===0 && r.value===777 && r.done===true)"),
+        "true"
+    );
+}
+
+#[test]
+fn delete_sloppy_global_is_configurable() {
+    // A sloppy assignment to an unresolvable reference creates a *configurable*
+    // global-object property (not a declarative binding), so `delete` removes it
+    // and the name becomes unresolvable again.
+    assert_eq!(
+        run("(function(){zzTemp=1;var d=delete zzTemp;var gone;\
+              try{zzTemp;gone=false;}catch(e){gone=(e instanceof ReferenceError);}\
+              return d===true && gone===true;})()"),
+        "true"
+    );
+}
+
+#[test]
+fn parenthesized_optional_chain_call_preserves_this() {
+    // `(a?.b)()` — a parenthesized optional chain is reference-transparent, so the
+    // call keeps `this` = the member's base (unlike a bare `a?.b()` chain).
+    assert_eq!(
+        run("var a={b:function(){return this._b;},_b:{c:42}};\
+             ((a?.b)().c===42 && (a?.b)?.().c===42)"),
+        "true"
+    );
+    // A nullish base makes the parenthesized value `undefined`; the *outer* call
+    // then throws (not part of the chain) — but an outer `?.()` short-circuits.
+    assert_eq!(run("var a=null;((a?.b)?.()===undefined)"), "true");
+}
+
+#[test]
 fn reflect_set_proxy_target_returns_trap_boolean() {
     // Reflect.set on a proxy target returns the [[Set]] boolean: a falsy `set`
     // trap result is `false` (not a throw), a truthy one is `true`.

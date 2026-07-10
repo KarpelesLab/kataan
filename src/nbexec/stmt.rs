@@ -1014,7 +1014,7 @@ impl<'a> Interp<'a> {
     /// `Ok(Some(value))` for a yielded element, `Ok(None)` at end-of-iteration
     /// (`{ done: true }`). An abrupt result-access is propagated. Callers treat
     /// both `Ok(None)` and `Err(_)` as "iterator done" for `IteratorClose` purposes.
-    fn dstr_iter_step(
+    pub(crate) fn dstr_iter_step(
         &mut self,
         ih: Handle,
         iterator: NanBox,
@@ -1312,15 +1312,16 @@ impl<'a> Interp<'a> {
         if !self.has_property_proxied(h, name)? {
             return Ok(None);
         }
-        // `@@unscopables`: a truthy entry blocks the binding (the lexical scope
-        // shows through instead).
+        // `@@unscopables`: only an **Object** value blocks bindings (spec: `If
+        // Type(unscopables) is Object`). A non-object (`''`, a number, `null`,
+        // `undefined`) is ignored — note a heap string is a `Handle` too, so a bare
+        // `as_handle()` check would wrongly treat `@@unscopables = ''` as an object.
         let unscopables_sym = self.well_known_symbol("unscopables");
         let unscopables_key = self.member_key(unscopables_sym);
-        let unscopables = self
-            .read_member(h, &unscopables_key)?
-            .as_handle()
-            .map(Handle::from_raw);
-        if let Some(u) = unscopables {
+        let unscopables_val = self.read_member(h, &unscopables_key)?;
+        if self.is_object_value(unscopables_val)
+            && let Some(u) = unscopables_val.as_handle().map(Handle::from_raw)
+        {
             let blocked = self.read_member(u, name)?;
             if self.realm.truthy(blocked) {
                 return Ok(None);
@@ -1382,7 +1383,17 @@ impl<'a> Interp<'a> {
     pub(crate) fn assign_to_name(&mut self, name: &str, value: NanBox) -> Result<(), ExecError> {
         // A bare identifier inside `with (obj)` assigns to the with-object's
         // property (via `[[Set]]`, so setters fire) when it provides the name.
-        if let Some(h) = self.with_binding(name) {
+        if let Some(h) = self.with_binding_result(name)? {
+            // `SetMutableBinding(N, V, S)` for an object environment record re-checks
+            // `? HasProperty(bindingObject, N)` (a second `has` trap) after the
+            // `HasBinding` resolution: if the binding no longer exists and the
+            // reference is strict, throw a ReferenceError; otherwise still `[[Set]]`.
+            if !self.has_property_proxied(h, name)? && self.strict {
+                let m = self.new_str(&alloc::format!("{name} is not defined"));
+                return Err(ExecError::Throw(
+                    self.make_error(N_REFERENCE_ERROR, Some(m)),
+                ));
+            }
             let key = self.new_str(name);
             self.assign_member_value(h, key, value)?;
             return Ok(());

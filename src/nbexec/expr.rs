@@ -35,7 +35,48 @@ impl<'a> Interp<'a> {
         // shadows even the `undefined`/`NaN`/`Infinity` global identifiers when
         // the with-object provides them (`with ({ NaN: 1 }) { NaN }` is 1).
         if let Some(h) = self.with_binding_result(name)? {
+            // `GetBindingValue(N, S)` for an object environment record re-checks
+            // `? HasProperty(bindingObject, N)` (a second proxy `has` trap) *after*
+            // the `HasBinding` resolution above — so a binding deleted by the
+            // `@@unscopables` getter is observed: strict → ReferenceError, sloppy →
+            // undefined.
+            if !self.has_property_proxied(h, name)? {
+                if self.strict {
+                    let msg = self.new_str(&alloc::format!("{name} is not defined"));
+                    return Err(ExecError::Throw(
+                        self.make_error(N_REFERENCE_ERROR, Some(msg)),
+                    ));
+                }
+                return Ok(NanBox::undefined());
+            }
             return self.read_member(h, name);
+        }
+        self.read_ident_lexical(name)
+    }
+
+    /// The non-`with` portion of `GetValue` for a bare identifier: the
+    /// predeclared globals, a lexical binding, or a global-object own property.
+    /// Split out so a caller that has *already* resolved (and rejected) the `with`
+    /// object frames — e.g. a bare-identifier **call**, whose callee reference and
+    /// `this`-base must be resolved by a single `HasBinding` — can finish the read
+    /// without re-consulting the `with` chain (which would re-run its `has` trap).
+    pub(crate) fn read_ident_lexical(&mut self, name: &str) -> Result<NanBox, ExecError> {
+        // A live module-import binding (as in `read_ident_ref`) — preserved here so
+        // callers using this non-`with` path (e.g. a bare-identifier call) still
+        // resolve imported functions.
+        #[cfg(all(feature = "module", feature = "std"))]
+        if let Some((src_scope, src_name)) = self.module_imports.get(name).cloned() {
+            return match src_scope.get(&src_name) {
+                Some(v) if !v.is_tdz() => Ok(v),
+                _ => {
+                    let msg = self.new_str(&alloc::format!(
+                        "Cannot access '{name}' before initialization"
+                    ));
+                    Err(ExecError::Throw(
+                        self.make_error(N_REFERENCE_ERROR, Some(msg)),
+                    ))
+                }
+            };
         }
         match name {
             "undefined" => return Ok(NanBox::undefined()),
@@ -1022,6 +1063,45 @@ impl<'a> Interp<'a> {
                     let f = self.resolve_super_method(&name)?;
                     return self.call_with_this(f, self.this_val, &args);
                 }
+                // A **parenthesized** optional chain used as a call target, e.g.
+                // `(a?.b)()` / `(a?.b)?.()`. A ParenthesizedExpression is
+                // reference-transparent, so the call keeps `this` = the member's
+                // base — unlike a bare `a?.b()` (one chain), the outer `()` is *not*
+                // part of the chain, so a `?.` short-circuit inside yields
+                // `undefined` which the outer call then invokes (a TypeError, unless
+                // the outer call is itself `?.()`).
+                if let Expr::OptChain { expr, .. } = &**callee
+                    && let Expr::Member {
+                        object,
+                        property,
+                        optional,
+                        ..
+                    } = &**expr
+                {
+                    let recv = match self.eval(object) {
+                        Ok(v) => v,
+                        // The inner chain short-circuited (`object` was nullish at a
+                        // `?.`): the parenthesized value is `undefined`.
+                        Err(ExecError::OptShortCircuit) => {
+                            if *call_optional {
+                                return Err(ExecError::OptShortCircuit);
+                            }
+                            let args = self.eval_args(arguments)?;
+                            return self.call(NanBox::undefined(), &args);
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if *optional && matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                        if *call_optional {
+                            return Err(ExecError::OptShortCircuit);
+                        }
+                        let args = self.eval_args(arguments)?;
+                        return self.call(NanBox::undefined(), &args);
+                    }
+                    self.method_recv_check(recv, property, *optional)?;
+                    let args = self.eval_args(arguments)?;
+                    return self.call_member_dispatch(recv, property, *call_optional, &args);
+                }
                 // A `recv.method(args)` call: try a built-in method on the
                 // receiver before falling back to a property-valued function.
                 if let Expr::Member {
@@ -1040,21 +1120,46 @@ impl<'a> Interp<'a> {
                     let args = self.eval_args(arguments)?;
                     return self.call_member_dispatch(recv, property, *call_optional, &args);
                 }
-                // A bare-identifier callee resolved through a `with (obj)` binding is
-                // called with `obj` as the `this` value (the with-object is the
-                // reference's base), so `with (o) { m(); }` calls `o.m` with `this`=`o`.
-                if let Expr::Ident(id) = &**callee
-                    && let Some(h) = self.with_binding(&id.name)
-                {
-                    let f = self.read_member(h, &id.name)?;
-                    if *call_optional && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null)
-                    {
-                        return Err(ExecError::OptShortCircuit);
+                // A bare-identifier callee: resolve the reference **once** (a single
+                // `HasBinding`) so the `has` trap of a `with (proxy)` frame fires
+                // exactly once. If a `with` object provides the name, the call's
+                // `this` is that object (`with (o) { m(); }` calls `o.m` with
+                // `this`=`o`) and the callee read re-checks `HasProperty`
+                // (`GetBindingValue`); otherwise finish the read against the lexical
+                // / global scope without re-consulting the `with` chain.
+                if let Expr::Ident(id) = &**callee {
+                    let name = &*id.name;
+                    if let Some(h) = self.with_binding_result(name)? {
+                        // `GetBindingValue`: a binding deleted after `HasBinding`
+                        // (via the `@@unscopables` getter) is a strict ReferenceError,
+                        // else `undefined` (→ not-callable TypeError below).
+                        let f = if self.has_property_proxied(h, name)? {
+                            self.read_member(h, name)?
+                        } else if self.strict {
+                            let m = self.new_str(&alloc::format!("{name} is not defined"));
+                            return Err(ExecError::Throw(
+                                self.make_error(N_REFERENCE_ERROR, Some(m)),
+                            ));
+                        } else {
+                            NanBox::undefined()
+                        };
+                        if *call_optional
+                            && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null)
+                        {
+                            return Err(ExecError::OptShortCircuit);
+                        }
+                        let args = self.eval_args(arguments)?;
+                        return self.call_with_this(f, NanBox::handle(h.to_raw()), &args);
                     }
-                    let args = self.eval_args(arguments)?;
-                    return self.call_with_this(f, NanBox::handle(h.to_raw()), &args);
                 }
-                let f = self.eval(callee)?;
+                let f = if let Expr::Ident(id) = &**callee {
+                    // The `with` chain was already consulted above (no match); finish
+                    // against the lexical / global scope so its `has` trap is not
+                    // re-run.
+                    self.read_ident_lexical(&id.name)?
+                } else {
+                    self.eval(callee)?
+                };
                 if *call_optional && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null) {
                     return Err(ExecError::OptShortCircuit);
                 }
@@ -3455,11 +3560,30 @@ impl<'a> Interp<'a> {
         {
             let name = &*id.name;
             // A `with`-object binding (captured before the RHS so the object's
-            // current value is read first and a setter fires on write).
-            if let Some(h) = self.with_binding(name) {
-                let current = self.read_member(h, name)?;
+            // current value is read first and a setter fires on write). Both
+            // `GetBindingValue` (the read) and `SetMutableBinding` (the write)
+            // re-run `? HasProperty` (a proxy `has` trap) after the `HasBinding`
+            // resolution — a binding deleted mid-operation is a strict-mode
+            // ReferenceError.
+            if let Some(h) = self.with_binding_result(name)? {
+                let current = if self.has_property_proxied(h, name)? {
+                    self.read_member(h, name)?
+                } else if self.strict {
+                    let m = self.new_str(&alloc::format!("{name} is not defined"));
+                    return Err(ExecError::Throw(
+                        self.make_error(N_REFERENCE_ERROR, Some(m)),
+                    ));
+                } else {
+                    NanBox::undefined()
+                };
                 let rhs = self.eval(value)?;
                 let new = self.binary(compound_op(op)?, current, rhs)?;
+                if !self.has_property_proxied(h, name)? && self.strict {
+                    let m = self.new_str(&alloc::format!("{name} is not defined"));
+                    return Err(ExecError::Throw(
+                        self.make_error(N_REFERENCE_ERROR, Some(m)),
+                    ));
+                }
                 let key = self.new_str(name);
                 self.assign_member_value(h, key, new)?;
                 return Ok(new);
@@ -3543,13 +3667,22 @@ impl<'a> Interp<'a> {
                 // A bare identifier inside `with (obj)` reads/writes the with-object's
                 // property when it provides the name (so `with(o){ x op= v }` and
                 // setters/getters work).
-                if let Some(h) = self.with_binding(name) {
+                if let Some(h) = self.with_binding_result(name)? {
                     let new = if op == AssignOp::Assign {
                         rhs
                     } else {
                         let current = self.read_member(h, name)?;
                         self.binary(compound_op(op)?, current, rhs)?
                     };
+                    // `SetMutableBinding` re-checks `? HasProperty` (a second `has`
+                    // trap) after `HasBinding`: a strict write to a now-missing
+                    // binding is a ReferenceError; sloppy still `[[Set]]`s.
+                    if !self.has_property_proxied(h, name)? && self.strict {
+                        let m = self.new_str(&alloc::format!("{name} is not defined"));
+                        return Err(ExecError::Throw(
+                            self.make_error(N_REFERENCE_ERROR, Some(m)),
+                        ));
+                    }
                     let key = self.new_str(name);
                     self.assign_member_value(h, key, new)?;
                     return Ok(new);
