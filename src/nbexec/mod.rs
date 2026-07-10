@@ -2721,6 +2721,7 @@ mod regexp;
 mod resource;
 mod stmt;
 mod temporal;
+mod temporal_calendar;
 mod temporal_duration;
 mod temporal_instant;
 mod temporal_plaindate;
