@@ -2062,9 +2062,15 @@ impl<'a> Interp<'a> {
             return Err(self.type_error("CreateListFromArrayLike called on non-object"));
         }
         let h = v.as_handle().map(Handle::from_raw).unwrap();
-        // A real dense array: fast path.
+        // A real dense array: fast path. A hole is normalized to `undefined` — the
+        // spec does `Get(obj, index)`, which on an absent index of an ordinary
+        // array yields `undefined` (not the internal hole sentinel, which must
+        // never escape as a value).
         if let Some(elems) = self.realm.array_elements(h) {
-            return Ok(elems.to_vec());
+            return Ok(elems
+                .iter()
+                .map(|e| if e.is_hole() { NanBox::undefined() } else { *e })
+                .collect());
         }
         let len_val = self.read_member(h, "length")?;
         let len_num = self.coerce_to_number(len_val)?;

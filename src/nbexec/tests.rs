@@ -9581,3 +9581,232 @@ fn same_realm_array_species_still_honored() {
         "true"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for the contained Test262 fixes in this change set.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn class_extends_requires_constructor_with_object_prototype() {
+    // `extends <non-constructor>` is a TypeError (ClassDefinitionEvaluation).
+    let t = |src: &str| {
+        run(&alloc::format!(
+            "(function(){{ try {{ {src}; return 'ok'; }} catch(e) {{ return e.constructor.name; }} }})()"
+        ))
+    };
+    assert_eq!(t("class C extends 42 {}"), "TypeError");
+    assert_eq!(t("class C extends Math.abs {}"), "TypeError"); // callable, not a constructor
+    // A bound function that is a constructor but has no `prototype` → TypeError.
+    assert_eq!(
+        t("var B = function(){}.bind(); class C extends B {}"),
+        "TypeError"
+    );
+    // A `prototype` getter is evaluated exactly once; a primitive result throws.
+    assert_eq!(
+        run(r#"
+            var calls = 0;
+            var B = function(){}.bind();
+            Object.defineProperty(B, 'prototype', { get(){ calls++; return 42; }, configurable: true });
+            var threw = false;
+            try { eval('(class extends B {})'); } catch(e) { threw = e instanceof TypeError; }
+            threw + ':' + calls
+        "#),
+        "true:1"
+    );
+    // A valid subclass still works.
+    assert_eq!(
+        run("class A { m(){return 5;} } class B extends A {} new B().m()"),
+        "5"
+    );
+    // `extends null` is valid (null prototype).
+    assert_eq!(
+        run("class C extends null {} Object.getPrototypeOf(C.prototype) === null"),
+        "true"
+    );
+}
+
+#[test]
+fn class_constructor_own_key_order() {
+    // `length, name, prototype` precede static members in source order, even when
+    // a static member overrides `name`/`length`.
+    assert_eq!(
+        run(r#"class A { static method(){} static length(){} }
+               JSON.stringify(Object.getOwnPropertyNames(A))"#),
+        r#"["length","name","prototype","method"]"#
+    );
+    assert_eq!(
+        run(r#"class N { static name(){} }
+               JSON.stringify(Object.getOwnPropertyNames(N))"#),
+        r#"["length","name","prototype"]"#
+    );
+    assert_eq!(
+        run(r#"class C { static get length(){} }
+               JSON.stringify(Object.getOwnPropertyNames(C))"#),
+        r#"["length","name","prototype"]"#
+    );
+}
+
+#[test]
+fn map_foreach_delete_then_readd_is_revisited() {
+    // A key deleted then re-added during `forEach` is visited again at its new
+    // position (live-cursor iteration over the compacting backing store).
+    assert_eq!(
+        run(r#"
+            var m = new Map([['foo',0],['bar',1]]);
+            var count = 0, out = [];
+            m.forEach(function(v,k){
+                if (count === 0) { m.delete('foo'); m.set('foo','baz'); }
+                out.push(k+'='+v); count++;
+            });
+            count + '|' + out.join(',') + '|' + m.size
+        "#),
+        "3|foo=0,bar=1,foo=baz|2"
+    );
+}
+
+#[test]
+fn set_composition_iterates_this_live() {
+    // `isSubsetOf` iterates `this` live: an element deleted by the argument's
+    // `has` is skipped rather than re-tested.
+    assert_eq!(
+        run(r#"
+            var base = new Set(['a','b','c']);
+            var evil = { size: 3, has(v){ if (v==='a') base.delete('c'); return ['x','a','b'].includes(v); }, keys(){ throw new Error('nope'); } };
+            base.isSubsetOf(evil) + '|' + [...base].join(',')
+        "#),
+        "true|a,b"
+    );
+}
+
+#[test]
+fn reflect_apply_normalizes_array_holes() {
+    // A hole in the args array reaches the callee as `undefined`, not the internal
+    // hole sentinel (so `Object.is(args[2], undefined)` holds).
+    assert_eq!(
+        run(r#"
+            var got;
+            function f(){ got = arguments; }
+            Reflect.apply(f, null, ['a', 2, , null]);
+            got.length + '|' + Object.is(got[2], undefined) + '|' + (got[3] === null)
+        "#),
+        "4|true|true"
+    );
+}
+
+#[test]
+fn string_coercion_honors_overridden_array_tostring() {
+    assert_eq!(
+        run(r#"
+            Array.prototype.toString = function(){ return '__A__'; };
+            String([1,2]) + '|' + String(new Array)
+        "#),
+        "__A__|__A__"
+    );
+}
+
+#[test]
+fn replace_all_passes_this_object_to_symbol_replace() {
+    // `O` handed to `@@replace` is the `this` value of `replaceAll` — the wrapper
+    // object for a `new String(...)` receiver, not the boxed primitive.
+    assert_eq!(
+        run(r#"
+            var sv = /./g;
+            var str = new String('Leo');
+            var seen;
+            Object.defineProperty(sv, Symbol.replace, { value: function(O){ seen = (O === str); return 42; } });
+            str.replaceAll(sv, {}) + '|' + seen
+        "#),
+        "42|true"
+    );
+}
+
+#[test]
+fn private_field_on_proxy_and_returned_object() {
+    // A private field brands a Proxy returned by a base constructor (bypassing its
+    // traps) and is readable.
+    assert_eq!(
+        run(r#"
+            var trapped = [];
+            class Base { constructor(){ return new Proxy(this, { get(o,p){ trapped.push(p); return o[p]; } }); } }
+            class Test extends Base { #f = 3; method(){ return this.#f; } }
+            new Test().method() + '|' + JSON.stringify(trapped)
+        "#),
+        r#"3|["method"]"#
+    );
+    // A base constructor that returns an object rebinds `this`; the derived class's
+    // private field lands on that object.
+    assert_eq!(
+        run(r#"
+            class TB { constructor(o){ return o; } }
+            class C extends TB { #val = 42; static val(o){ return o.#val; } constructor(o){ super(o); } }
+            var t = new C({});
+            C.val(t)
+        "#),
+        "42"
+    );
+}
+
+#[test]
+fn public_hash_named_field_enumerates() {
+    // A computed public field whose name starts with `#` is an ordinary enumerable
+    // property (only the `\0`-sentinel internal slots are hidden).
+    assert_eq!(
+        run(r##"
+            class C { ["#constructor"] = 42; }
+            var c = new C();
+            JSON.stringify(Object.keys(c)) + '|' + c.propertyIsEnumerable('#constructor')
+        "##),
+        r##"["#constructor"]|true"##
+    );
+    // A real private field stays hidden.
+    assert_eq!(
+        run(r##"class P { #secret = 1; pub = 2; } JSON.stringify(Object.keys(new P()))"##),
+        r#"["pub"]"#
+    );
+}
+
+#[test]
+fn iterator_from_primitive_string_fires_symbol_iterator_getter() {
+    // `Iterator.from` on a primitive string reads `@@iterator` with the string
+    // primitive as the receiver (GetV semantics).
+    assert_eq!(
+        run(r#"
+            var seen;
+            var orig = String.prototype[Symbol.iterator];
+            Object.defineProperty(String.prototype, Symbol.iterator, {
+                get(){ 'use strict'; seen = typeof this; return orig; }, configurable: true
+            });
+            Iterator.from('');
+            var a = seen;
+            Iterator.from(new String(''));
+            a + '|' + seen
+        "#),
+        "string|object"
+    );
+}
+
+#[test]
+#[cfg(feature = "intl")]
+fn intl_collator_subclass_super_carries_slot() {
+    // `class X extends Intl.Collator { constructor(l,o){ super(l,o); } }`: the
+    // derived instance must carry the Collator internal slot so its
+    // `compare`/`resolvedOptions` bound-function getters accept the receiver
+    // (the `super()` into the native ctor initializes the slot in place).
+    assert_eq!(
+        run(r#"
+            class MyCollator extends Intl.Collator {
+                constructor(locales, options) { super(locales, options); }
+            }
+            var c = new MyCollator(['en']);
+            var a = ['B', 'A'];
+            a.sort(c.compare);
+            a.join(',') + '|' + (c instanceof MyCollator) + '|' + (c instanceof Intl.Collator)
+        "#),
+        "A,B|true|true"
+    );
+    // A constructor-less subclass works the same way.
+    assert_eq!(
+        run(r#"class C extends Intl.Collator {} typeof new C('en').resolvedOptions().locale"#),
+        "string"
+    );
+}

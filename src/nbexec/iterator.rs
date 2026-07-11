@@ -314,18 +314,28 @@ impl<'a> Interp<'a> {
         let entries = self.realm.collection_entries(coll).unwrap_or_default();
         // Determine the next position: 0 if not started, else after the
         // last-yielded key (or its recorded slot if it was since deleted).
+        let recorded_idx = self
+            .realm
+            .get_property(h, GEN_IDX)
+            .and_then(|n| n.as_number())
+            .unwrap_or(0.0) as usize;
         let next_pos = match self.realm.get_property(h, GEN_LASTKEY) {
             None => 0,
             Some(last_key) => match entries
                 .iter()
                 .position(|(k, _)| self.realm.same_value_zero(*k, last_key))
             {
-                Some(q) => q + 1,
-                None => self
-                    .realm
-                    .get_property(h, GEN_IDX)
-                    .and_then(|n| n.as_number())
-                    .unwrap_or(0.0) as usize,
+                // The last-yielded key is still at (or before) its recorded slot —
+                // a pure delete only shifts survivors left — so advance past it.
+                Some(q) if q <= recorded_idx => q + 1,
+                // Found only at a *later* slot than recorded: the key was deleted
+                // and re-added (a brand-new entry appended at the end). Treat the
+                // original as deleted and resume from its recorded slot (now the
+                // successor after the compacting delete); the re-added copy is a
+                // fresh entry that the cursor reaches later.
+                Some(_) => recorded_idx,
+                // Deleted (and not re-added): resume from the recorded slot.
+                None => recorded_idx,
             },
         };
         let Some(&(k, v)) = entries.get(next_pos) else {
@@ -844,23 +854,49 @@ impl<'a> Interp<'a> {
             let m = self.new_str("Iterator.from called on a non-object");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
-        // A primitive String iterates its code points via `%StringIteratorPrototype%`.
-        // (A faithful `GetMethod` here would fire a redefined
-        // `String.prototype[@@iterator]` getter with a *string* receiver — the
-        // primitive-receiver `GetV` semantics are not modelled, so this uses the
-        // built-in iteration directly.)
-        if is_string_prim {
-            let values = self.iterate_values(src)?;
-            let gen_iter = self.make_generator(values);
-            return self.wrap_iterator_value(gen_iter);
-        }
+        // Both an Object and a primitive String flow through the same GetMethod
+        // path below: for a primitive String, `src` is a heap string cell used as
+        // its own receiver, so `read_member`/`call_with_this` fire a redefined
+        // `String.prototype[@@iterator]` getter/method with a *string* receiver
+        // (`GetV` primitive-receiver semantics), while a `String` wrapper observes
+        // an object receiver.
         let h = src_h.unwrap();
         // method = GetMethod(src, @@iterator): the getter fires with `this` = src
         // (so a `String.prototype[@@iterator]` getter observes a string receiver
         // for a primitive, an object receiver for a wrapper).
         let iter_sym = self.well_known_symbol("iterator");
         let iter_key = self.member_key(iter_sym);
-        let mut method = self.read_member(h, &iter_key)?;
+        let mut method = if is_string_prim {
+            // `GetV(src, @@iterator)` for a *primitive* String: walk the wrapper's
+            // prototype chain (`String.prototype`) for the property, firing an
+            // accessor getter with the **primitive** as the receiver — so a
+            // redefined `String.prototype[@@iterator]` getter observes
+            // `typeof this === "string"`. The built-in `@@iterator` is not a
+            // materialized property, so an unmodified chain yields `undefined`
+            // here and falls through to the built-in string iteration below.
+            let wrapper = self.coerce_to_object(src);
+            let mut cur = wrapper.as_handle().map(Handle::from_raw);
+            let mut m = NanBox::undefined();
+            while let Some(o) = cur {
+                if let Some((getter, _)) = self.realm.accessor(o, &iter_key) {
+                    if !matches!(getter.unpack(), Unpacked::Undefined) {
+                        m = self.call_with_this(getter, src, &[])?;
+                    }
+                    break;
+                }
+                if self.realm.has_own(o, &iter_key) {
+                    m = self
+                        .realm
+                        .get_property(o, &iter_key)
+                        .unwrap_or_else(NanBox::undefined);
+                    break;
+                }
+                cur = self.realm.object_proto(o);
+            }
+            m
+        } else {
+            self.read_member(h, &iter_key)?
+        };
         // A class computed-key `[Symbol.iterator]() {}` may not surface as a
         // readable property; fall back to scanning the class body.
         if matches!(method.unpack(), Unpacked::Undefined | Unpacked::Null)
@@ -881,6 +917,7 @@ impl<'a> Interp<'a> {
                     .map(Handle::from_raw)
                     .is_some_and(|ph| self.realm.string_value(ph).is_some());
                 let is_builtin_iterable = is_string_wrapper
+                    || is_string_prim
                     || self.realm.array_elements(h).is_some()
                     || self.realm.collection_entries(h).is_some()
                     || self.realm.get_property(h, GEN_BUF).is_some();

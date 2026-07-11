@@ -207,6 +207,7 @@ impl<'a> Interp<'a> {
         self.class_native_super.push(None);
         self.class_fn_super.push(None);
         self.class_super_id.push(None);
+        self.class_proto_parent.push(None);
         self.class_handles.push(class_val);
         self.class_lexical_parent.push(lexical_parent);
         // Record the bare private names this class declares (`#x` → `x`), so a
@@ -365,12 +366,36 @@ impl<'a> Interp<'a> {
             // non-object, or a non-constructor object (arrow/generator/async fn,
             // a plain object), is a TypeError (the superclass must be a constructor).
             if matches!(sval.unpack(), Unpacked::Null) {
+                // ClassDefinitionEvaluation: `extends null` → protoParent = null.
+                self.class_proto_parent[class_id as usize] = Some(NanBox::null());
                 (None, None)
             } else {
-                match sval.as_handle().map(|r| (sval, Handle::from_raw(r))) {
+                // ECMA-262 ClassDefinitionEvaluation: a non-`null` heritage must be a
+                // constructor, else throw a TypeError (this rejects `extends 42`,
+                // `extends Math.abs` — a callable non-constructor native — arrow /
+                // generator / async functions, and plain objects alike).
+                if !self.is_constructor_value(sval) {
+                    let m = self.new_str("Class extends value is not a constructor or null");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                let h = Handle::from_raw(sval.as_handle().unwrap());
+                // `protoParent = Get(superclass, "prototype")`, read exactly once
+                // (may fire a `prototype` getter). It must be an Object or `null`;
+                // anything else (e.g. a bound function's absent `prototype`, or a
+                // `prototype` set to a primitive) is a TypeError.
+                let proto_parent = self.read_member(h, "prototype")?;
+                if !matches!(proto_parent.unpack(), Unpacked::Null)
+                    && !self.is_object_value(proto_parent)
+                {
+                    let m = self
+                        .new_str("Class extends value does not have a valid prototype property");
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                self.class_proto_parent[class_id as usize] = Some(proto_parent);
+                match (sval, h) {
                     // `class D extends C {}` → `getPrototypeOf(D) === C` (the
                     // constructor inherits the superclass's static members).
-                    Some((_, h)) if self.realm.class_at(h).is_some() => {
+                    (_, h) if self.realm.class_at(h).is_some() => {
                         self.realm.set_native_proto(handle, h);
                         // Cache the resolved super class id so the eager prototype
                         // build does not re-evaluate the `extends` expression.
@@ -383,20 +408,18 @@ impl<'a> Interp<'a> {
                     // Error, Promise, …) *or* a namespace-object constructor
                     // (`Array`/`Object`, recognized by identity). `getPrototypeOf(D)`
                     // is the superclass; the native base id drives `super()` and the
-                    // instance's internal slots.
-                    Some((_, h)) if self.native_base_kind(h).is_some() => {
+                    // instance's internal slots. Restricted to native bases that are
+                    // *constructors* (guaranteed by the `is_constructor_value` gate
+                    // above) — a callable non-constructor native (`Math.abs`) has a
+                    // native id but is not a valid superclass.
+                    (_, h) if self.native_base_kind(h).is_some() => {
                         self.realm.set_native_proto(handle, h);
                         (self.native_base_kind(h), None)
                     }
-                    // A callable ordinary function used as a superclass — only if it
-                    // is actually a constructor (its prototype is linked below).
-                    Some((v, h)) if self.is_callable(h) && self.is_constructor_value(v) => {
-                        (None, Some(v))
-                    }
-                    _ => {
-                        let m = self.new_str("Class extends value is not a constructor or null");
-                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-                    }
+                    // A callable ordinary function used as a superclass (already
+                    // validated as a constructor above); its prototype is linked
+                    // via the cached `protoParent` in the lazy `.prototype` build.
+                    (v, _) => (None, Some(v)),
                 }
             }
         } else {
@@ -443,6 +466,15 @@ impl<'a> Interp<'a> {
         // via `set_fn_name`, which recognizes it because the body declares no
         // `static name` member (see `set_fn_name`).
         self.install_fn_name_length(handle, class_name.as_deref().unwrap_or(""), ctor_len);
+        // Materialize the class's own `prototype` data property *before* the static
+        // members, so `[[OwnPropertyKeys]]` order is `length, name, prototype, …static`
+        // (per MakeConstructor, which installs `prototype` prior to ClassElement
+        // evaluation). It is `{ writable: false, enumerable: false, configurable:
+        // false }`; building it now installs the instance methods and the
+        // `constructor` back-link, and lets a `static x = C.prototype` initializer
+        // observe it as an own property.
+        let class_proto = self.class_prototype(class_id, handle);
+        self.install_fn_prototype(handle, class_proto, false);
         // Mirror static members as real own properties of the constructor so
         // reflection (`hasOwnProperty`, `getOwnPropertyDescriptor`, `Object.keys`,
         // `verifyProperty`) sees them. The side tables above still drive the fast
@@ -466,7 +498,15 @@ impl<'a> Interp<'a> {
             // placeholder so it carries the member's own attributes.
             let is_name_len = k == "name" || k == "length";
             if is_name_len {
-                self.realm.delete_property(handle, &k);
+                // A static member named `name`/`length` overrides the default, but
+                // *in place* — the key already exists, so update it rather than
+                // delete + re-add (which would move it to the end of
+                // `[[OwnPropertyKeys]]`). Clear the default's read-only flag; a
+                // static *field* is additionally enumerable, so clear `hidden` too.
+                self.realm.clear_readonly_property(handle, &k);
+                if field_keys.contains(&k) {
+                    self.realm.clear_hidden_property(handle, &k);
+                }
             }
             self.realm.set_property(handle, &k, v);
             if !field_keys.contains(&k) {
@@ -491,6 +531,7 @@ impl<'a> Interp<'a> {
             // A static accessor named `name`/`length` overrides the default data
             // property installed above; drop the data slot so the getter wins.
             if k == "name" || k == "length" {
+                self.realm.ensure_key_order(handle);
                 self.realm.delete_data_slot(handle, &k);
             }
             self.realm.define_accessor(handle, &k, getter, setter);
@@ -499,6 +540,7 @@ impl<'a> Interp<'a> {
         for (k, setter) in &setters {
             if !self.class_static_get[class_id as usize].contains_key(k) {
                 if k == "name" || k == "length" {
+                    self.realm.ensure_key_order(handle);
                     self.realm.delete_data_slot(handle, k);
                 }
                 self.realm
@@ -506,13 +548,6 @@ impl<'a> Interp<'a> {
                 self.realm.mark_hidden(handle, k);
             }
         }
-        // Materialize the class's own `prototype` data property — per
-        // MakeClassConstructor it is `{ writable: false, enumerable: false,
-        // configurable: false }`. Building it now (before static initializers)
-        // installs the instance methods and the `constructor` back-link, and lets
-        // a `static x = C.prototype` initializer observe it as an own property.
-        let class_proto = self.class_prototype(class_id, handle);
-        self.install_fn_prototype(handle, class_proto, false);
         // Bind the class's own name in its methods' scope (a named class
         // expression sees itself). The inner binding is an immutable `const`, so
         // reassigning it inside the class body (`class C { m() { C = 1; } }`) is a
@@ -977,7 +1012,14 @@ impl<'a> Interp<'a> {
         // Use the *cached* class-super id (resolved once at definition time) so
         // building the prototype eagerly does not re-evaluate `extends`.
         let class = self.classes[class_id as usize];
-        if let Some(super_id) = self.class_super_id[class_id as usize] {
+        if let Some(proto_parent) = self.class_proto_parent[class_id as usize] {
+            // `protoParent` (`Get(superclass, "prototype")`) was captured once at
+            // class-definition time. Re-reading would double-fire a `prototype`
+            // getter, so use the cached value: an Object becomes `D.prototype`'s
+            // `[[Prototype]]`; `null` (from `extends null`) makes it null.
+            self.realm
+                .set_object_proto(proto, proto_parent.as_handle().map(Handle::from_raw));
+        } else if let Some(super_id) = self.class_super_id[class_id as usize] {
             let super_proto = self.class_prototype_by_id(super_id);
             self.realm.set_object_proto(proto, Some(super_proto));
         } else if let Some(fn_super) = self.class_fn_super[class_id as usize]
@@ -1137,7 +1179,8 @@ impl<'a> Interp<'a> {
             // the shared `this`). A getter/setter pair merges into an element
             // already begun in this pass, so only the first install of a key is
             // gated on extensibility.
-            if !installed_this_pass.contains(&key) && !self.realm.is_extensible(instance) {
+            let extensible = self.is_extensible_of(instance)?;
+            if !installed_this_pass.contains(&key) && !self.realm.truthy(extensible) {
                 let msg = self
                     .new_str("Cannot add private method or accessor to a non-extensible object");
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(msg))));
@@ -1260,7 +1303,8 @@ impl<'a> Interp<'a> {
                         // object or a module namespace. Private fields are *not*
                         // string-keyed properties, so they never force a deferred
                         // module namespace.
-                        if !self.realm.is_extensible(instance) {
+                        let extensible = self.is_extensible_of(instance)?;
+                        if !self.realm.truthy(extensible) {
                             let m =
                                 self.new_str("Cannot add private field to a non-extensible object");
                             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
@@ -1404,6 +1448,11 @@ impl<'a> Interp<'a> {
                         // `super()` clears `pending_this_init` (and sets `this`); if
                         // it is still set, the body returned without calling super.
                         let super_called = self.pending_this_init.is_none();
+                        // The `this` binding *after* `super()` — a base constructor
+                        // that returned an object rebinds it to that object (`SuperCall`
+                        // → `BindThisValue`). Captured before restoring the outer
+                        // `this`, so it can become the construction result.
+                        let bound_this = self.this_val;
                         self.this_val = poisoned_this.expect("derived poisoned this");
                         self.pending_this_init = saved_pending;
                         // A derived constructor must call `super()` before it
@@ -1421,6 +1470,13 @@ impl<'a> Interp<'a> {
                             return Err(ExecError::Throw(
                                 self.make_error(N_REFERENCE_ERROR, Some(m)),
                             ));
+                        }
+                        // With an empty completion, `[[Construct]]` yields
+                        // `thisER.GetThisBinding()` — the (possibly super-rebound)
+                        // `this`, not the originally-allocated placeholder. A
+                        // non-empty object return overrides it (kept as `r`).
+                        if ret_empty {
+                            return Ok(Some(bound_this));
                         }
                     }
                     Ok(r)

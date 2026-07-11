@@ -4785,7 +4785,11 @@ fn vm_object_kv(
             let keys = ctx.realm.own_property_names(h).unwrap_or_default();
             let mut out = Vec::with_capacity(keys.len());
             for k in keys {
-                if k.starts_with('#') || k.starts_with('\u{0}') {
+                // Only engine-internal slots (the `\u{0}` sentinel prefix — private
+                // elements, generator state, wrapper boxes, …) are hidden; a public
+                // property whose *name* legitimately starts with `#` (e.g. a computed
+                // field `["#x"]`) enumerates normally.
+                if k.starts_with('\u{0}') {
                     continue;
                 }
                 // Live `[[GetOwnProperty]]` — an ordinary object has no observable

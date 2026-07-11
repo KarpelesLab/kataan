@@ -327,6 +327,23 @@ impl<'a> Interp<'a> {
             // was deleted/shadowed, the name resolves to `Object.prototype.toString`,
             // which must run on the wrapper *object* (yielding `"[object String]"`
             // via its `[[StringData]]` builtin tag) — so defer to real resolution.
+            // A `new String(...)` receiver delegates `match`/`replace`/`replaceAll`/
+            // `search`/`split` to a searchValue object's `@@method` with `O` = the
+            // wrapper **object** (its `this` value), so `O` keeps its identity —
+            // must run *before* unwrapping to the boxed primitive, which would
+            // otherwise pass the primitive string as `O`.
+            if prim
+                .as_handle()
+                .map(Handle::from_raw)
+                .is_some_and(|ph| self.realm.string_value(ph).is_some())
+                && matches!(
+                    method,
+                    "match" | "matchAll" | "search" | "replace" | "replaceAll" | "split"
+                )
+                && let Some(r) = self.string_symbol_delegate(recv, method, args)?
+            {
+                return Ok(Some(r));
+            }
             if matches!(method, "toString" | "toLocaleString") {
                 let resolved = self.read_member(h, method)?;
                 let is_wrapper_proto_builtin = resolved
@@ -2032,48 +2049,13 @@ impl<'a> Interp<'a> {
         // lookup happens ONLY when the argument **is an Object** — a primitive
         // regexp (a string, or a `BigInt`/`Symbol` whose prototype might carry a
         // `@@match`) is never inspected; it is coerced to a string pattern.
-        if self.realm.string_value(handle).is_some()
-            && let Some(sym_name) = match method {
-                "match" => Some("match"),
-                "matchAll" => Some("matchAll"),
-                "search" => Some("search"),
-                "replace" | "replaceAll" => Some("replace"),
-                "split" => Some("split"),
-                _ => None,
-            }
-            && self.is_object_value(arg(0))
-            && let Some(argh) = arg(0).as_handle().map(Handle::from_raw)
-        {
-            // `replaceAll`/`matchAll` first require that a RegExp `searchValue`/
-            // `regexp` be global (`IsRegExp` + `Get(flags)` not containing "g" →
-            // TypeError), checked *before* dispatching the symbol method.
-            if matches!(method, "replaceAll" | "matchAll") && self.is_regexp_arg(arg(0)) {
-                let flags_v = self.read_member(argh, "flags")?;
-                if matches!(flags_v.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                    return Err(self.type_error(&alloc::format!(
-                        "String.prototype.{method} called with a non-global RegExp argument"
-                    )));
-                }
-                let flags_s = self.coerce_to_string(flags_v)?;
-                if !flags_s.contains('g') {
-                    return Err(self.type_error(&alloc::format!(
-                        "String.prototype.{method} called with a non-global RegExp argument"
-                    )));
-                }
-            }
-            let sym = self.well_known_symbol(sym_name);
-            let key = self.member_key(sym);
-            let m = self.read_member(argh, &key)?;
-            if m.as_handle()
-                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-            {
-                // Pass the receiver string value itself (a String already), so a
-                // surrogate-bearing subject reaches the symbol method losslessly
-                // (`new_str(&string_value)` would replacement-char a lone surrogate).
-                let this_str = NanBox::handle(handle.to_raw());
-                let mut call_args = alloc::vec![this_str];
-                call_args.extend_from_slice(&args[1.min(args.len())..]);
-                return Ok(Some(self.call_with_this(m, arg(0), &call_args)?));
+        if self.realm.string_value(handle).is_some() {
+            // `O` (the `this` value passed to the `@@method`) is the primitive
+            // string receiver here; a `String` *wrapper* receiver is intercepted
+            // earlier (before unwrapping) so its object identity is preserved.
+            let o = NanBox::handle(handle.to_raw());
+            if let Some(r) = self.string_symbol_delegate(o, method, args)? {
+                return Ok(Some(r));
             }
         }
 
@@ -4899,7 +4881,16 @@ impl<'a> Interp<'a> {
                                 .iter()
                                 .position(|(k, _)| self.realm.same_value_zero(*k, lk))
                             {
-                                Some(q) => q + 1,
+                                // Still at (or before) its recorded slot — a pure
+                                // delete only shifts survivors left — so advance past.
+                                Some(q) if q <= idx => q + 1,
+                                // Found only at a *later* slot: the key was deleted and
+                                // re-added (a fresh entry at the end). Treat the old
+                                // occurrence as deleted, resuming from the recorded slot
+                                // (its successor post-compaction); the re-added copy is
+                                // reached later as a new entry.
+                                Some(_) => idx,
+                                // Deleted (and not re-added): resume from recorded slot.
                                 None => idx,
                             },
                         };
@@ -5920,6 +5911,90 @@ impl<'a> Interp<'a> {
         Ok(out)
     }
 
+    /// `String.prototype.{match,matchAll,search,replace,replaceAll,split}` delegate
+    /// to a `searchValue`/`separator` object's `@@match`/`@@replace`/… method when
+    /// present: `Return ? Call(replacer, searchValue, « O, replaceValue »)`. `o` is
+    /// the `this` value (`RequireObjectCoercible(this)`) passed as the method's
+    /// first argument — a primitive string for a primitive receiver, or the wrapper
+    /// **object** for a `new String(...)` receiver (so `O` keeps its identity).
+    /// Returns `Some(result)` when the delegation fired, `None` to fall through to
+    /// the literal-string handling.
+    fn string_symbol_delegate(
+        &mut self,
+        o: NanBox,
+        method: &str,
+        args: &[NanBox],
+    ) -> Result<Option<NanBox>, ExecError> {
+        let sym_name = match method {
+            "match" => "match",
+            "matchAll" => "matchAll",
+            "search" => "search",
+            "replace" | "replaceAll" => "replace",
+            "split" => "split",
+            _ => return Ok(None),
+        };
+        let search = args.first().copied().unwrap_or_else(NanBox::undefined);
+        if !self.is_object_value(search) {
+            return Ok(None);
+        }
+        let argh = Handle::from_raw(search.as_handle().unwrap());
+        // `replaceAll`/`matchAll` first require that a RegExp `searchValue` be
+        // global (`IsRegExp` + `Get(flags)` not containing "g" → TypeError),
+        // checked *before* dispatching the symbol method.
+        if matches!(method, "replaceAll" | "matchAll") && self.is_regexp_arg(search) {
+            let flags_v = self.read_member(argh, "flags")?;
+            if matches!(flags_v.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                return Err(self.type_error(&alloc::format!(
+                    "String.prototype.{method} called with a non-global RegExp argument"
+                )));
+            }
+            let flags_s = self.coerce_to_string(flags_v)?;
+            if !flags_s.contains('g') {
+                return Err(self.type_error(&alloc::format!(
+                    "String.prototype.{method} called with a non-global RegExp argument"
+                )));
+            }
+        }
+        let sym = self.well_known_symbol(sym_name);
+        let key = self.member_key(sym);
+        let m = self.read_member(argh, &key)?;
+        if m.as_handle()
+            .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+        {
+            let mut call_args = alloc::vec![o];
+            call_args.extend_from_slice(&args[1.min(args.len())..]);
+            return Ok(Some(self.call_with_this(m, search, &call_args)?));
+        }
+        Ok(None)
+    }
+
+    /// One step of a **live**, delete-tolerant cursor over collection `coll`'s
+    /// keys (used by the Set-composition methods whose argument callback may
+    /// mutate `this` mid-iteration). `last` is the previously-yielded
+    /// `(key, index)`; returns the next `(key, index)` or `None` at the end.
+    /// Mirrors the `forEach`/live-iterator resume logic: a pure delete only shifts
+    /// survivors left, so a key found *past* its recorded slot was deleted and
+    /// re-added (skip it), and a missing key resumes from the recorded slot.
+    fn collection_live_step(
+        &self,
+        coll: Handle,
+        last: Option<(NanBox, usize)>,
+    ) -> Option<(NanBox, usize)> {
+        let entries = self.realm.collection_entries(coll).unwrap_or_default();
+        let next_pos = match last {
+            None => 0,
+            Some((lk, idx)) => match entries
+                .iter()
+                .position(|(k, _)| self.realm.same_value_zero(*k, lk))
+            {
+                Some(q) if q <= idx => q + 1,
+                Some(_) => idx,
+                None => idx,
+            },
+        };
+        entries.get(next_pos).map(|(k, _)| (*k, next_pos))
+    }
+
     /// The ES2025 Set composition methods over a `GetSetRecord` argument.
     fn set_composition(
         &mut self,
@@ -5949,8 +6024,14 @@ impl<'a> Interp<'a> {
                 if my_size > other_size {
                     return Ok(NanBox::boolean(false));
                 }
-                for m in &mine {
-                    if !other_has(self, *m)? {
+                // Iterate `this` LIVE (not the `mine` snapshot): `other.has` may
+                // delete elements of `this`, and a deleted element must not be
+                // passed to `has` (ECMA-262 iterates `O.[[SetData]]` by index,
+                // skipping now-empty slots).
+                let mut last = None;
+                while let Some((e, idx)) = self.collection_live_step(handle, last) {
+                    last = Some((e, idx));
+                    if !other_has(self, e)? {
                         return Ok(NanBox::boolean(false));
                     }
                 }
@@ -5979,8 +6060,13 @@ impl<'a> Interp<'a> {
             }
             "isDisjointFrom" => {
                 if my_size <= other_size {
-                    for m in &mine {
-                        if other_has(self, *m)? {
+                    // Iterate `this` LIVE: `other.has` may delete elements of
+                    // `this`, and a since-deleted element must not be passed to
+                    // `has` (see `isSubsetOf`).
+                    let mut last = None;
+                    while let Some((e, idx)) = self.collection_live_step(handle, last) {
+                        last = Some((e, idx));
+                        if other_has(self, e)? {
                             return Ok(NanBox::boolean(false));
                         }
                     }
@@ -6049,16 +6135,23 @@ impl<'a> Interp<'a> {
                 }
                 Ok(NanBox::handle(result.to_raw()))
             }
-            // symmetricDifference: in exactly one of the two.
+            // symmetricDifference: in exactly one of the two. `resultSetData` is a
+            // copy of `this` taken now; membership is tested against the LIVE
+            // `this` (which the argument's `keys` iterator may mutate), per
+            // ECMA-262 24.2.4.19 — not against the `resultSetData` copy.
             _ => {
                 let result = self.realm.new_collection(true);
                 for m in &mine {
                     self.realm.collection_set(result, *m, *m);
                 }
                 for k in self.set_record_keys(obj, keys)? {
-                    if in_mine(self, k) {
-                        self.realm.collection_delete(result, k);
-                    } else {
+                    let in_o = self.realm.collection_has(handle, k);
+                    let in_result = self.realm.collection_has(result, k);
+                    if in_o {
+                        if in_result {
+                            self.realm.collection_delete(result, k);
+                        }
+                    } else if !in_result {
                         self.realm.collection_set(result, k, k);
                     }
                 }

@@ -328,17 +328,12 @@ impl<'a> Interp<'a> {
             // default methods simply reproduce the intrinsic display form, so
             // ordinary cases are unchanged.
             //
-            // Arrays and typed arrays are excluded: their `toString`
-            // (`Array.prototype.toString` → `join`) is a built-in that is not yet
-            // callable as a plain first-class function value on this tier, so they
-            // keep the infallible default-display path (byte-identical to before).
-            // The bytecode tier still honors an overridden `Array.prototype.toString`
-            // for them.
-            if self.realm.string_value(h).is_none()
-                && self.is_object_value(v)
-                && !self.realm.is_array(h)
-                && self.realm.typed_kind(h).is_none()
-            {
+            // Arrays and typed arrays also run `ToPrimitive("string")`: their
+            // `toString` (`Array.prototype.toString` → `join`, or a user override)
+            // is a callable first-class value that `ordinary_to_primitive` invokes,
+            // so `String([1,2])` honors an overridden `Array.prototype.toString`
+            // (and the default reproduces the same `join`-based display).
+            if self.realm.string_value(h).is_none() && self.is_object_value(v) {
                 let p = if let Some(r) = self.symbol_to_primitive(v, "string")? {
                     r
                 } else {

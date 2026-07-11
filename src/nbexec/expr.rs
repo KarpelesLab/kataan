@@ -1981,24 +1981,33 @@ impl<'a> Interp<'a> {
                 // is the base class) that lacks the own element throws even though a
                 // plain `read_member` would walk up to the base's static private.
                 let key = self.private_access_key(s);
-                if !self.realm.has_own(handle, &key) && self.realm.accessor(handle, &key).is_none()
-                {
+                // A private element is an OWN internal slot, never inherited and
+                // never routed through a proxy's `get` trap. A private accessor is
+                // invoked directly; a private field/method is read raw from the
+                // holder's own storage (its auxiliary object for an exotic holder
+                // such as a Proxy), bypassing `read_member`'s prototype walk and
+                // proxy traps.
+                if let Some((getter, _)) = self.realm.accessor(handle, &key) {
+                    // A private accessor declared with only a setter (`set #g(v) {}`)
+                    // has no getter — reading it is a TypeError.
+                    if matches!(getter.unpack(), Unpacked::Undefined) {
+                        let m = self.new_str(&alloc::format!(
+                            "Cannot read private member #{s} which has only a setter"
+                        ));
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
+                    return self.call_with_this(getter, NanBox::handle(handle.to_raw()), &[]);
+                }
+                if !self.realm.has_own(handle, &key) {
                     let m = self.new_str(&alloc::format!(
                         "Cannot read private member #{s} from an object whose class did not declare it"
                     ));
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
-                // Reading a private accessor declared with only a setter
-                // (`set #g(v) {}`) is a TypeError — there is no getter.
-                if let Some((getter, _)) = self.realm.accessor(handle, &key)
-                    && matches!(getter.unpack(), Unpacked::Undefined)
-                {
-                    let m = self.new_str(&alloc::format!(
-                        "Cannot read private member #{s} which has only a setter"
-                    ));
-                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-                }
-                self.read_member(handle, &key)
+                Ok(self
+                    .realm
+                    .get_property(handle, &key)
+                    .unwrap_or_else(NanBox::undefined))
             }
         }
     }

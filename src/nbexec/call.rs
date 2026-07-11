@@ -3640,6 +3640,7 @@ impl<'a> Interp<'a> {
             native_id,
             N_INTL_NUMBER_FORMAT
                 | N_INTL_DATETIME_FORMAT
+                | N_INTL_COLLATOR
                 | N_INTL_PLURAL_RULES
                 | N_INTL_LIST_FORMAT
                 | N_INTL_REL_TIME
@@ -3652,6 +3653,7 @@ impl<'a> Interp<'a> {
                 N_INTL_NUMBER_FORMAT | N_INTL_DATETIME_FORMAT => {
                     self.init_intl_formatter_state(instance, native_id, args)?;
                 }
+                N_INTL_COLLATOR => self.init_collator(instance, args)?,
                 N_INTL_PLURAL_RULES => self.init_plural_rules(instance, args)?,
                 N_INTL_LIST_FORMAT => self.init_list_format(instance, args)?,
                 N_INTL_REL_TIME => self.init_relative_time_format(instance, args)?,

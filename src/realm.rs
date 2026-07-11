@@ -1675,7 +1675,7 @@ impl Realm {
                 // (`\0`-prefixed) are never enumerable, so they stay out of
                 // `Object.keys`, spread, `for-in`, and JSON. Methods are marked
                 // hidden via `enumerable_keys`.
-                .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
+                .filter(|s| !s.starts_with('\u{0}'))
                 .map(|s| alloc::string::String::from(*s))
                 .collect(),
         )
@@ -1694,7 +1694,7 @@ impl Realm {
         };
         obj.enumerable_keys()
             .iter()
-            .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
+            .filter(|s| !s.starts_with('\u{0}'))
             .map(|s| alloc::string::String::from(*s))
             .collect()
     }
@@ -1710,7 +1710,11 @@ impl Realm {
             .map(|obj| {
                 obj.enumerable_keys()
                     .iter()
-                    .filter(|s| !s.starts_with('#'))
+                    // Keep public string keys (incl. a name literally starting with
+                    // `#`, e.g. a computed `["#x"]` field) and Symbol keys (the
+                    // `\u{0}sym:` sentinel), but drop every other engine-internal
+                    // slot (private elements, generator state, wrapper boxes, …).
+                    .filter(|s| !s.starts_with('\u{0}') || s.starts_with("\u{0}sym:"))
                     .map(|s| alloc::string::String::from(*s))
                     .collect()
             })
@@ -1785,7 +1789,7 @@ impl Realm {
             let mut named: Vec<alloc::string::String> = Vec::new();
             if let Some(obj) = self.heap.get(handle).and_then(Cell::as_object) {
                 for k in obj.ordered_keys() {
-                    if k.starts_with('#') || k.starts_with('\u{0}') || k == "length" {
+                    if k.starts_with('\u{0}') || k == "length" {
                         continue;
                     }
                     if let Ok(n) = k.parse::<u32>()
@@ -1813,7 +1817,7 @@ impl Realm {
             return Some(
                 obj.ordered_keys()
                     .iter()
-                    .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
+                    .filter(|s| !s.starts_with('\u{0}'))
                     .map(|s| alloc::string::String::from(*s))
                     .collect(),
             );
@@ -1839,11 +1843,7 @@ impl Realm {
                 .and_then(|h| self.heap.get(*h))
                 .and_then(Cell::as_object)
             {
-                for k in aux
-                    .all_keys()
-                    .iter()
-                    .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
-                {
+                for k in aux.all_keys().iter().filter(|s| !s.starts_with('\u{0}')) {
                     // A canonical array-index key (`"0".."4294967294"`, no leading
                     // zeros) is an element key; anything else is a named key.
                     if let Ok(n) = k.parse::<u32>()
@@ -1880,7 +1880,7 @@ impl Realm {
                 for k in aux
                     .ordered_keys()
                     .iter()
-                    .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
+                    .filter(|s| !s.starts_with('\u{0}'))
                 {
                     names.push(alloc::string::String::from(*k));
                 }
@@ -1903,7 +1903,7 @@ impl Realm {
                 for k in aux
                     .ordered_keys()
                     .iter()
-                    .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
+                    .filter(|s| !s.starts_with('\u{0}'))
                 {
                     if let Ok(n) = k.parse::<u32>()
                         && n != u32::MAX
@@ -1949,7 +1949,7 @@ impl Realm {
                 for k in aux
                     .ordered_keys()
                     .iter()
-                    .filter(|s| !s.starts_with('#') && !s.starts_with('\u{0}'))
+                    .filter(|s| !s.starts_with('\u{0}'))
                 {
                     names.push(alloc::string::String::from(*k));
                 }
@@ -3241,6 +3241,12 @@ impl Realm {
                 // objects per spec: a script may set arbitrary own properties on
                 // them (`d.value = 1`), stored in an auxiliary object.
                 || matches!(c, Cell::Date(_) | Cell::Collection { .. } | Cell::Promise(_))
+                // A Proxy exotic object carries **private elements** (fields /
+                // methods / accessors) as internal slots that bypass its traps —
+                // `class Sub extends ProxyReturningBase { #f = 1 }`. They are stored
+                // on and read from the proxy's own auxiliary object directly, never
+                // routed through the `get`/`set`/`has` handler.
+                || matches!(c, Cell::Proxy { .. })
         })
     }
 

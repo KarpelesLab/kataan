@@ -380,6 +380,13 @@ pub struct Interp<'a> {
     /// heritage is evaluated exactly once per spec) so the eager `.prototype`
     /// materialization does not re-evaluate the `extends` expression.
     class_super_id: Vec<Option<u32>>,
+    /// Per-class resolved `protoParent` — `Get(superclass, "prototype")` captured
+    /// once at class-definition time (ECMA-262 ClassDefinitionEvaluation reads it
+    /// exactly once, so re-reading in the lazy `.prototype` build would double-fire
+    /// a `prototype` getter). `Some(obj)` for an object protoParent, `Some(null)`
+    /// for `extends null`, `None` for a class with no heritage (defaults to
+    /// `Object.prototype`).
+    class_proto_parent: Vec<Option<NanBox>>,
     /// Per-class constructor handle (the class value), parallel to `classes`, so
     /// the lazily-materialized `.prototype` can install a `constructor` back-link
     /// and link a derived prototype to its base's prototype.
@@ -2285,6 +2292,11 @@ fn is_native_constructor(id: u16) -> bool {
             // even though invoking it always throws a TypeError.
             | N_SYMBOL
             | N_BIGINT
+            // The abstract `Iterator` constructor has a `[[Construct]]` (throws when
+            // `newTarget` is `Iterator` itself, like `%TypedArray%`), so
+            // `IsConstructor(Iterator)` is true and `class X extends Iterator {}` is
+            // valid.
+            | N_ITERATOR
             | N_MAP
             | N_SET
             | N_WEAKMAP
@@ -2841,6 +2853,7 @@ impl<'a> Interp<'a> {
             class_native_super: Vec::new(),
             class_fn_super: Vec::new(),
             class_super_id: Vec::new(),
+            class_proto_parent: Vec::new(),
             class_handles: Vec::new(),
             private_method_cache: alloc::collections::BTreeMap::new(),
             class_lexical_parent: Vec::new(),
