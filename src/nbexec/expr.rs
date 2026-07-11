@@ -1059,6 +1059,10 @@ impl<'a> Interp<'a> {
                             return Err(ExecError::Unsupported("private super member"));
                         }
                     };
+                    // MakeSuperPropertyReference does GetThisBinding, which throws a
+                    // ReferenceError if `this` is uninitialized (a derived
+                    // constructor before `super(...)`).
+                    self.require_super_this()?;
                     let args = self.eval_args(arguments)?;
                     let f = self.resolve_super_method(&name)?;
                     return self.call_with_this(f, self.this_val, &args);
@@ -1532,6 +1536,32 @@ impl<'a> Interp<'a> {
                 .is_some_and(|fh| self.is_callable(fh))
             {
                 return self.call_with_this(f, recv, args);
+            }
+        }
+        // A monkey-patched *inherited* `Promise.prototype.{then,catch,finally}` must
+        // be honored on a direct `promise.then(…)` call: the native fast-path below
+        // (`call_method`) bypasses the prototype chain, so a user reassignment of
+        // these methods would otherwise be invisible (observable in reaction/species
+        // call-counting tests). Only when the resolved method is a *user* function
+        // (no native backing) do we route through it; the pristine intrinsic keeps
+        // the fast path.
+        {
+            let pname = match property {
+                PropertyKey::Ident(n) | PropertyKey::Str(n) => Some(&**n),
+                _ => None,
+            };
+            if let Some(name) = pname
+                && matches!(name, "then" | "catch" | "finally")
+                && let Some(rh) = recv.as_handle().map(Handle::from_raw)
+                && self.realm.promise_state(rh).is_some()
+            {
+                let f = self.read_member(rh, name)?;
+                if let Some(fh) = f.as_handle().map(Handle::from_raw)
+                    && self.is_callable(fh)
+                    && self.realm.native_at(fh).is_none()
+                {
+                    return self.call_with_this(f, recv, args);
+                }
             }
         }
         if let PropertyKey::Ident(name) | PropertyKey::Str(name) = property
@@ -4043,6 +4073,17 @@ impl<'a> Interp<'a> {
                     ));
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
+            }
+            // An accessor inherited through the *ordinary* `[[Prototype]]` chain
+            // (not the class-static side tables) handles the write — most notably
+            // the poisoned `Function.prototype.caller`/`.arguments` accessors that a
+            // class constructor inherits. `set_through_proto_chain` invokes the
+            // setter (a poisoned one throws) and stops; it returns `None` for a plain
+            // inherited/absent data property, which falls through to the data write.
+            if !self.realm.has_own(handle, &key)
+                && let Some(()) = self.set_through_proto_chain(handle, &key, new)?
+            {
+                return Ok(());
             }
             // Plain own data static: update both the mirror (authoritative for
             // reflection/reads) and the side table (kept consistent for any

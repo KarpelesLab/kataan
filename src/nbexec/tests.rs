@@ -9810,3 +9810,156 @@ fn intl_collator_subclass_super_carries_slot() {
         "string"
     );
 }
+
+#[test]
+fn monkey_patched_promise_then_honored_on_direct_call() {
+    // A user reassignment of the *inherited* `Promise.prototype.then` must be
+    // observed on a direct `promise.then(...)` call (the native fast-path used to
+    // bypass the prototype chain). Regression coverage for the reaction/species
+    // call-counting fixes.
+    assert_eq!(
+        run(r#"
+            var orig = Promise.prototype.then;
+            var called = false;
+            Promise.prototype.then = function (a, b) { called = true; return orig.call(this, a, b); };
+            Promise.resolve(1).then(function () {});
+            Promise.prototype.then = orig;
+            called
+        "#),
+        "true"
+    );
+}
+
+#[test]
+fn promise_finally_then_call_counting() {
+    // `finally` on a resolved subclass produces the spec number of `then` calls
+    // (the thenable-adoption path now goes through `Promise.prototype.then`).
+    let out = |src: &str| {
+        let program = Parser::parse_program(src).expect("parse");
+        let mut interp = Interp::new();
+        interp.run(&program).expect("exec");
+        String::from(interp.output())
+    };
+    assert_eq!(
+        out(r#"
+            class MyPromise extends Promise {}
+            var mp1 = MyPromise.resolve({});
+            var mp2 = MyPromise.resolve(42);
+            var thenCalls = [];
+            var then = Promise.prototype.then;
+            Promise.prototype.then = function (a, b) { thenCalls.push(this); return then.call(this, a, b); };
+            mp1.finally(function () { return mp2; }).then(function () {
+                console.log('count=' + thenCalls.length);
+            }).then(function () {}, function () {});
+        "#),
+        "count=5\n"
+    );
+}
+
+#[test]
+fn static_block_has_own_variable_environment() {
+    // A `var` inside a `static { }` block does not leak to the enclosing scope,
+    // and each static block is independent.
+    assert_eq!(
+        run(r#"var t = 'outer'; class C { static { var t = 'inner'; } } t"#),
+        "outer"
+    );
+    assert_eq!(
+        run(r#"
+            var p1, p2;
+            class C {
+                static { var t = 'first'; p1 = t; }
+                static { var t = 'second'; p2 = t; }
+            }
+            p1 + ',' + p2
+        "#),
+        "first,second"
+    );
+}
+
+#[test]
+fn constructor_body_hoists_vars_like_function_code() {
+    // A strict class constructor body is function code: its `var` bindings hoist,
+    // so a write from a nested `catch` scope updates the hoisted binding rather
+    // than throwing a spurious ReferenceError.
+    assert_eq!(
+        run(r#"
+            class C {
+                constructor() {
+                    var e;
+                    try { throw new TypeError('x'); } catch (err) { e = err; }
+                    this.n = e.constructor.name;
+                }
+            }
+            new C().n
+        "#),
+        "TypeError"
+    );
+}
+
+#[test]
+fn super_property_before_super_call_throws_reference_error() {
+    // `super.m()` in a derived constructor before `super(...)` does GetThisBinding,
+    // which throws a ReferenceError (not a raw string) when `this` is uninitialized.
+    let out = |src: &str| {
+        let program = Parser::parse_program(src).expect("parse");
+        let mut interp = Interp::new();
+        let _ = interp.run(&program);
+        String::from(interp.output())
+    };
+    assert_eq!(
+        out(r#"
+            class B { m() { return 1; } }
+            class D extends B {
+                constructor() {
+                    var r = 'none';
+                    try { super.m(); } catch (e) { r = (e instanceof ReferenceError); }
+                    console.log(r);
+                    super();
+                }
+            }
+            new D();
+        "#),
+        "true\n"
+    );
+}
+
+#[test]
+fn class_constructor_caller_arguments_are_poisoned() {
+    // A class constructor inherits the poisoned `Function.prototype.caller`/
+    // `.arguments` accessors: both read and write throw a TypeError (and no own
+    // property is created by the write).
+    assert_eq!(
+        run(r#"
+            class C {}
+            var r = 'ok';
+            try { C.caller = {}; r = 'no-throw'; } catch (e) { r = e.constructor.name; }
+            r + '|' + C.hasOwnProperty('caller')
+        "#),
+        "TypeError|false"
+    );
+}
+
+#[test]
+fn concatenated_boundary_surrogates_coalesce() {
+    // WTF-8 canonicalization: a high surrogate concatenated with a low surrogate
+    // pairs into the astral scalar, so the two encodings compare equal, iterate as
+    // one code point, and slice splits them back into lone surrogates.
+    assert_eq!(run(r#"('\uD83D' + '\uDCA9') === '\u{1F4A9}'"#), "true");
+    assert_eq!(run(r#"('\uD83D' + '\uDCA9').length"#), "2");
+    assert_eq!(run(r#"[...('\uD83D' + '\uDCA9')].length"#), "1");
+    // slice() splits an astral character into its lone surrogate halves.
+    assert_eq!(
+        run(r#""\u{1F4A9}".slice(0, 1).charCodeAt(0) === 0xD83D"#),
+        "true"
+    );
+    assert_eq!(
+        run(r#""\u{1F4A9}".slice(1).charCodeAt(0) === 0xDCA9"#),
+        "true"
+    );
+    assert_eq!(run(r#""\u{1F4A9}".slice(0, 1).isWellFormed()"#), "false");
+    assert_eq!(
+        run(r#"('a' + '\uD83D' + '\uDCA9' + 'd').toWellFormed() === 'a\u{1F4A9}d'"#),
+        "true"
+    );
+}

@@ -43,6 +43,47 @@ pub const fn is_surrogate(cp: u32) -> bool {
     cp >= SURROGATE_MIN && cp <= SURROGATE_MAX
 }
 
+/// Decodes the 3-byte WTF-8 surrogate sequence at `b` (`ED A0..BF 80..BF`) to its
+/// code point, or `None` if `b` is not exactly such a sequence. Used to detect a
+/// surrogate at a concatenation boundary.
+#[inline]
+fn decode_surrogate3(b: &[u8]) -> Option<u32> {
+    if b.len() != 3 || b[0] != 0xED || b[1] & 0xC0 != 0x80 || b[2] & 0xC0 != 0x80 {
+        return None;
+    }
+    let cp =
+        (u32::from(b[0] & 0x0F) << 12) | (u32::from(b[1] & 0x3F) << 6) | u32::from(b[2] & 0x3F);
+    is_surrogate(cp).then_some(cp)
+}
+
+/// If `bytes` ends with a lone **high** surrogate code point (`U+D800..=U+DBFF`,
+/// its 3-byte WTF-8 form), returns it. Used to pair a boundary surrogate with a
+/// following low surrogate on concatenation.
+#[must_use]
+pub fn trailing_high_surrogate(bytes: &[u8]) -> Option<u16> {
+    let n = bytes.len();
+    if n < 3 {
+        return None;
+    }
+    let cp = decode_surrogate3(&bytes[n - 3..])?;
+    (SURROGATE_MIN..=HIGH_SURROGATE_MAX)
+        .contains(&cp)
+        .then_some(cp as u16)
+}
+
+/// If `bytes` begins with a lone **low** surrogate code point (`U+DC00..=U+DFFF`,
+/// its 3-byte WTF-8 form), returns it.
+#[must_use]
+pub fn leading_low_surrogate(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 3 {
+        return None;
+    }
+    let cp = decode_surrogate3(&bytes[..3])?;
+    (LOW_SURROGATE_MIN..=SURROGATE_MAX)
+        .contains(&cp)
+        .then_some(cp as u16)
+}
+
 /// WTF-8-encodes a single code point — **including** a lone surrogate — and
 /// appends it to `out`.
 ///
@@ -262,10 +303,11 @@ fn byte_offset_of_unit(bytes: &[u8], unit: usize, round_up: bool) -> usize {
 /// Extracts the WTF-8 bytes for the UTF-16 unit range `[start_unit, end_unit)`.
 ///
 /// Indices are clamped to `[0, utf16_len]`, and `start > end` yields an empty
-/// slice (mirroring JS `slice`-style clamping). The result is surrogate-boundary
-/// correct: an astral character is included whole or not at all — a boundary
-/// landing inside a pair rounds the *start* down and the *end* up to that
-/// character's edges.
+/// slice (mirroring JS `slice`-style clamping). A boundary that falls **inside**
+/// an astral character's surrogate pair splits it, exactly like JavaScript: e.g.
+/// `"💩".slice(0, 1)` yields the lone leading surrogate. The astral character's
+/// halves are re-encoded as lone surrogate code points (3 bytes each); non-astral
+/// characters are copied byte-for-byte.
 #[must_use]
 pub fn slice_utf16(bytes: &[u8], start_unit: usize, end_unit: usize) -> Vec<u8> {
     let len = utf16_len(bytes);
@@ -274,14 +316,63 @@ pub fn slice_utf16(bytes: &[u8], start_unit: usize, end_unit: usize) -> Vec<u8> 
     if s >= e {
         return Vec::new();
     }
+    // Fast path: neither boundary splits an astral pair — a plain byte sub-slice.
     let start_byte = byte_offset_of_unit(bytes, s, false);
     let end_byte = byte_offset_of_unit(bytes, e, true);
-    // A start and end inside the *same* astral pair would otherwise invert
-    // (start rounds down, end rounds up past it); guard against that.
-    if start_byte >= end_byte {
-        return Vec::new();
+    if unit_at_char_boundary(bytes, s) && unit_at_char_boundary(bytes, e) {
+        return bytes[start_byte..end_byte].to_vec();
     }
-    bytes[start_byte..end_byte].to_vec()
+    // Slow path: a boundary lands mid-pair, so re-encode the touched units,
+    // splitting the boundary astral character(s) into lone surrogates.
+    let mut out = Vec::new();
+    let mut units_seen = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() && units_seen < e {
+        let (cp, n) = decode_code_point(bytes, i);
+        if cp >= FOUR_BYTE_MIN {
+            let v = cp - 0x1_0000;
+            let hi = (0xD800 + (v >> 10)) as u16;
+            let lo = (LOW_SURROGATE_MIN + (v & 0x3FF)) as u16;
+            if units_seen >= s && units_seen < e {
+                encode_utf16_unit(hi, &mut out);
+            }
+            if units_seen + 1 >= s && units_seen + 1 < e {
+                encode_utf16_unit(lo, &mut out);
+            }
+            units_seen += 2;
+        } else {
+            if units_seen >= s && units_seen < e {
+                out.extend_from_slice(&bytes[i..i + n]);
+            }
+            units_seen += 1;
+        }
+        i += n;
+    }
+    out
+}
+
+/// Whether UTF-16 `unit` falls on a whole-character boundary of `bytes` (i.e. it
+/// does **not** land on the low half of an astral surrogate pair). The endpoints
+/// `0` and `utf16_len` are boundaries.
+fn unit_at_char_boundary(bytes: &[u8], unit: usize) -> bool {
+    if unit == 0 {
+        return true;
+    }
+    let mut units_seen = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if units_seen == unit {
+            return true;
+        }
+        let (cp, n) = decode_code_point(bytes, i);
+        let w = if cp >= FOUR_BYTE_MIN { 2 } else { 1 };
+        if units_seen < unit && unit < units_seen + w {
+            return false; // lands on the low half of this astral pair
+        }
+        units_seen += w;
+        i += n;
+    }
+    true
 }
 
 /// Returns `Some(&str)` when `bytes` is valid UTF-8 — i.e. contains no surrogate
@@ -441,11 +532,11 @@ mod tests {
         assert_eq!(slice_utf16(&bytes, 0, 1), b"a");
         // Trailing "b".
         assert_eq!(slice_utf16(&bytes, 3, 4), b"b");
-        // A boundary that lands on the low half (unit 2) rounds down to the
-        // start of the astral char — slice [1,2) includes the whole 😀.
-        assert_eq!(slice_utf16(&bytes, 1, 2), "😀".as_bytes());
-        // [2,3) starts inside the pair → also rounds to the astral char start.
-        assert_eq!(slice_utf16(&bytes, 2, 3), "😀".as_bytes());
+        // A boundary that lands on the low half (unit 2) SPLITS the astral char,
+        // exactly like JS `"a😀b".slice(1, 2)` → the lone leading surrogate D83D.
+        assert_eq!(slice_utf16(&bytes, 1, 2), enc(0xD83D));
+        // [2,3) starts inside the pair → the lone trailing surrogate DE00.
+        assert_eq!(slice_utf16(&bytes, 2, 3), enc(0xDE00));
         // Out-of-range / inverted clamps to empty.
         assert_eq!(slice_utf16(&bytes, 3, 1), b"");
         assert_eq!(slice_utf16(&bytes, 10, 20), b"");

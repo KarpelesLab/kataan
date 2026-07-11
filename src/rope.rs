@@ -112,6 +112,25 @@ impl Rope {
         if len > MAX_STRING_LEN {
             return None;
         }
+        // WTF-8 canonicalization at the boundary: if `self` ends with a lone high
+        // surrogate and `other` begins with a lone low surrogate, they denote a
+        // single astral scalar (exactly as UTF-16 decoding would pair them). Coalesce
+        // them into the 4-byte astral form so the two byte encodings of the same
+        // UTF-16 sequence stay canonical — and therefore compare byte-equal, iterate
+        // as one code point, and are "well-formed". This only materializes in the
+        // rare case that a boundary pair actually exists; the common concat stays
+        // O(1). The peek walks to the rightmost leaf of `self` / leftmost of `other`.
+        if let Some(hi) = wtf8::trailing_high_surrogate(self.last_leaf_bytes())
+            && let Some(lo) = wtf8::leading_low_surrogate(other.first_leaf_bytes())
+        {
+            let mut bytes = self.materialize_bytes();
+            bytes.truncate(bytes.len() - 3); // drop the lone high surrogate
+            let cp = 0x1_0000 + ((u32::from(hi) - 0xD800) << 10) + (u32::from(lo) - 0xDC00);
+            wtf8::encode_code_point(cp, &mut bytes);
+            let other_bytes = other.materialize_bytes();
+            bytes.extend_from_slice(&other_bytes[3..]); // drop the lone low surrogate
+            return Some(Rope::from_wtf8(bytes));
+        }
         Some(Rope(Rc::new(Node::Concat {
             left: self.clone(),
             right: other.clone(),
@@ -145,6 +164,31 @@ impl Rope {
         match &*self.0 {
             Node::Leaf(s) => Some(s),
             Node::Concat { .. } => None,
+        }
+    }
+
+    /// The rightmost leaf's bytes (O(depth)) — used to peek the trailing code unit
+    /// for boundary surrogate coalescing without materializing the whole rope.
+    #[must_use]
+    fn last_leaf_bytes(&self) -> &[u8] {
+        let mut node = &self.0;
+        loop {
+            match &**node {
+                Node::Leaf(s) => return s,
+                Node::Concat { right, .. } => node = &right.0,
+            }
+        }
+    }
+
+    /// The leftmost leaf's bytes (O(depth)).
+    #[must_use]
+    fn first_leaf_bytes(&self) -> &[u8] {
+        let mut node = &self.0;
+        loop {
+            match &**node {
+                Node::Leaf(s) => return s,
+                Node::Concat { left, .. } => node = &left.0,
+            }
         }
     }
 

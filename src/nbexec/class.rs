@@ -594,9 +594,26 @@ impl<'a> Interp<'a> {
                 for (idx, member) in class.body.iter().enumerate() {
                     match member {
                         ClassMember::StaticBlock { body, .. } => {
-                            for stmt in body {
-                                self.exec(stmt)?;
-                            }
+                            // Each `static { … }` block is its own function code
+                            // (OrdinaryFunctionCreate): it opens a fresh variable
+                            // *and* lexical environment, so a `var`/`let`/function
+                            // declared inside does not leak to the enclosing scope
+                            // (nor to a sibling static block). Open a child scope and
+                            // hoist the body into it (which also retargets
+                            // `var_scope`), then restore.
+                            let block_scope = self.current.child();
+                            let saved_cur = core::mem::replace(&mut self.current, block_scope);
+                            let saved_vs = self.var_scope.clone();
+                            let r = (|| -> Result<(), ExecError> {
+                                self.hoist_with(body, true)?;
+                                for stmt in body {
+                                    self.exec(stmt)?;
+                                }
+                                Ok(())
+                            })();
+                            self.current = saved_cur;
+                            self.var_scope = saved_vs;
+                            r?;
                         }
                         ClassMember::Field(field) if field.is_static => {
                             let key = self.class_member_key(class_id, idx, &field.key)?;
@@ -1408,6 +1425,10 @@ impl<'a> Interp<'a> {
                     };
                     let scope = self.current.child();
                     let saved = core::mem::replace(&mut self.current, scope);
+                    // The constructor body opens its own variable environment (like
+                    // any function code): remember the caller's so it is restored on
+                    // return. `hoist_with` retargets `var_scope` to the body scope.
+                    let saved_var_scope = self.var_scope.clone();
                     let r: Result<Option<NanBox>, ExecError> = (|| {
                         // `arguments` is available in the constructor (incl. its
                         // parameter defaults), bound before the parameters.
@@ -1431,6 +1452,13 @@ impl<'a> Interp<'a> {
                             };
                             self.bind_pattern(&param.target, value)?;
                         }
+                        // Hoist the body's `var`/function declarations into this
+                        // variable environment and pre-declare its lexical (`let`/
+                        // `const`/`class`) names in their TDZ — exactly like function
+                        // code. Without this, a `var` was never bound, so a later
+                        // write from a nested scope (e.g. `catch (e) { x = e }`) in a
+                        // strict class body threw a spurious ReferenceError.
+                        self.hoist_with(&ctor.value.body, true)?;
                         // The constructor's `return value` (if an object) overrides
                         // the new instance; captured here.
                         let mut returned = None;
@@ -1443,6 +1471,7 @@ impl<'a> Interp<'a> {
                         Ok(returned)
                     })();
                     self.current = saved;
+                    self.var_scope = saved_var_scope;
                     let r = r?;
                     if is_derived {
                         // `super()` clears `pending_this_init` (and sets `this`); if

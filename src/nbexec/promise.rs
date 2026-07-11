@@ -245,34 +245,17 @@ impl<'a> Interp<'a> {
             self.settle(handle, value, true);
             return;
         }
-        // A real promise with the intrinsic `then` is adopted directly (cheaper and
-        // keeps identity for the common case).
-        if self.realm.promise_state(vh).is_some()
-            && self
-                .current
-                .get("Promise")
-                .and_then(|p| p.as_handle())
-                .map(Handle::from_raw)
-                .and_then(|pc| self.realm.get_property(pc, "prototype"))
-                .and_then(|pp| pp.as_handle())
-                .and_then(|pp| self.realm.get_property(Handle::from_raw(pp), "then"))
-                == Some(then)
-        {
-            let on_f = self.realm.new_bound_native(N_RESOLVE, handle);
-            let on_r = self.realm.new_bound_native(N_REJECT, handle);
-            self.register_then(
-                vh,
-                NanBox::handle(on_f.to_raw()),
-                NanBox::handle(on_r.to_raw()),
-                false,
-            );
-            return;
-        }
         // A thenable (any object with a callable `then`): EnqueuePromiseResolve-
         // ThenableJob — call `then(resolve, reject)` as a microtask so ordering
         // matches the spec (one extra tick before the thenable's `then` runs).
+        // NewPromiseResolveThenableJob creates a *fresh* pair of resolving
+        // functions via CreateResolvingFunctions: each is an anonymous built-in
+        // with `length` 1 and `name` "" (observable when the thenable's `then`
+        // inspects the arguments it is handed).
         let on_f = self.realm.new_bound_native(N_RESOLVE, handle);
         let on_r = self.realm.new_bound_native(N_REJECT, handle);
+        self.install_fn_name_length(on_f, "", 1);
+        self.install_fn_name_length(on_r, "", 1);
         self.microtasks.push(Job {
             handler: then,
             value,
