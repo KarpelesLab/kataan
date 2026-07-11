@@ -471,8 +471,13 @@ pub fn difference_iso_date(from: IsoDate, to: IsoDate, largest: Unit) -> (i64, i
     }
     let mut months = 0_i64;
     loop {
-        let next =
-            add_iso_date(from, years, months + sign, 0, 0, Overflow::Constrain).unwrap_or(mid);
+        // Adding one more month may leave the representable ISO date range near the
+        // ±271821/275760 boundary. Since `to` is representable, an unrepresentable
+        // `next` is necessarily beyond it — stop (otherwise `unwrap_or(mid)` would
+        // pin `next` to `mid` and loop forever).
+        let Some(next) = add_iso_date(from, years, months + sign, 0, 0, Overflow::Constrain) else {
+            break;
+        };
         if sign > 0 && compare_iso_date(next, to) == core::cmp::Ordering::Greater
             || sign < 0 && compare_iso_date(next, to) == core::cmp::Ordering::Less
         {
@@ -1332,6 +1337,35 @@ fn distribute_fraction(d: &mut DurationFields, frac_1e9: i64, per: i128, sign: i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn difference_iso_date_terminates_at_year_range_boundary() {
+        // From 1970 to the maximum ISO date: adding one more month than fits leaves
+        // the representable range (`add_iso_date` -> None). The Year/Month loop must
+        // stop there rather than spin forever pinning `next` to `mid`.
+        let from = IsoDate {
+            year: 1970,
+            month: 1,
+            day: 1,
+        };
+        let to = IsoDate {
+            year: 275760,
+            month: 9,
+            day: 13,
+        };
+        let (y, m, _w, d) = difference_iso_date(from, to, Unit::Year);
+        assert_eq!(y, 273790);
+        assert_eq!(m, 8);
+        assert_eq!(d, 12);
+        // Symmetric at the minimum boundary.
+        let min = IsoDate {
+            year: -271821,
+            month: 4,
+            day: 19,
+        };
+        let (ny, _nm, _nw, _nd) = difference_iso_date(to, min, Unit::Year);
+        assert!(ny < 0);
+    }
 
     #[test]
     fn balance_time_duration_holds_large_i128_fields() {

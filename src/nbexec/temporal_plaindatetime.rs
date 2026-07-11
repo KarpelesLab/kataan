@@ -278,16 +278,26 @@ impl<'a> Interp<'a> {
                 // `GetOptionsObject` (TypeError on a primitive), then read/validate
                 // the `disambiguation` option (RangeError on a bad value).
                 let opts = self.pdt_options(arg(1))?;
-                self.pdt_str_option(
-                    opts,
-                    "disambiguation",
-                    &["compatible", "earlier", "later", "reject"],
-                )?;
+                let disamb = self
+                    .pdt_str_option(
+                        opts,
+                        "disambiguation",
+                        &["compatible", "earlier", "later", "reject"],
+                    )?
+                    .unwrap_or_else(|| alloc::string::String::from("compatible"));
                 let local_ns = crate::temporal_iso::iso_to_epoch_days(data.date) as i128
                     * crate::temporal_iso::NS_PER_DAY
                     + crate::temporal_iso::time_to_nanos(data.time);
-                let offset = self.temporal_tz_offset_ns(&tz, local_ns).unwrap_or(0);
-                let epoch = local_ns - offset;
+                // `GetEpochNanosecondsFor` with proper DST disambiguation — a naïve
+                // offset-at-the-wall-instant conversion is wrong inside gaps/overlaps.
+                let epoch = crate::nbexec::temporal_zoneddatetime::epoch_for_wall_disamb(
+                    &tz, local_ns, &disamb,
+                )
+                .map_err(|()| {
+                    self.pdt_range(
+                        "wall-clock time is ambiguous or nonexistent (disambiguation: reject)",
+                    )
+                })?;
                 // The resulting exact time must be within the Instant range.
                 if !(crate::temporal_iso::MIN_EPOCH_NS..=crate::temporal_iso::MAX_EPOCH_NS)
                     .contains(&epoch)

@@ -166,36 +166,33 @@ impl<'a> Interp<'a> {
                         .map(Handle::from_raw)
                         .and_then(|h| self.realm.temporal_at(h))
                         .is_none();
-                let (tz, time) = if is_plain_obj {
+                // `time` is `None` when no `plainTime` was supplied — the spec then
+                // uses `GetStartOfDay` (DST-gap aware), not a plain midnight.
+                let (tz, time): (_, Option<temporal_iso::IsoTime>) = if is_plain_obj {
                     let h = item.as_handle().map(Handle::from_raw).unwrap();
                     let tzlike = self.read_member(h, "timeZone")?;
                     if tzlike.is_undefined() {
-                        (
-                            self.temporal_tz_arg(item)?,
-                            temporal_iso::IsoTime::default(),
-                        )
+                        (self.temporal_tz_arg(item)?, None)
                     } else {
                         let tz = self.temporal_tz_arg(tzlike)?;
                         // `plainTime` runs the full `ToTemporalTime` (string/bag/
-                        // PlainTime/PlainDateTime/ZonedDateTime); absent → midnight.
+                        // PlainTime/PlainDateTime/ZonedDateTime); absent → start of day.
                         let ptv = self.read_member(h, "plainTime")?;
                         let time = if ptv.is_undefined() {
-                            temporal_iso::IsoTime::default()
+                            None
                         } else {
-                            self.pd_to_temporal_time(ptv)?
+                            Some(self.pd_to_temporal_time(ptv)?)
                         };
                         (tz, time)
                     }
                 } else {
-                    (
-                        self.temporal_tz_arg(item)?,
-                        temporal_iso::IsoTime::default(),
-                    )
+                    (self.temporal_tz_arg(item)?, None)
                 };
                 // `ISODateTimeWithinLimits` on the combined wall date-time.
+                let time_of_day = time.unwrap_or_default();
                 let local_ns = crate::temporal_iso::iso_to_epoch_days(data.date) as i128
                     * crate::temporal_iso::NS_PER_DAY
-                    + crate::temporal_iso::time_to_nanos(time);
+                    + crate::temporal_iso::time_to_nanos(time_of_day);
                 if !(local_ns > crate::temporal_iso::MIN_EPOCH_NS - crate::temporal_iso::NS_PER_DAY
                     && local_ns
                         < crate::temporal_iso::MAX_EPOCH_NS + crate::temporal_iso::NS_PER_DAY)
@@ -203,18 +200,36 @@ impl<'a> Interp<'a> {
                     return Err(self
                         .pd_range_error("combined date-time is outside the representable range"));
                 }
-                let offset = self.temporal_tz_offset_ns(&tz, local_ns).unwrap_or(0);
-                // `GetStartOfDay` / `GetEpochNanosecondsFor`: the resulting instant
-                // must be a valid epoch-nanoseconds value (a boundary date combined
-                // with a time-of-day or a zone offset can fall outside it).
-                let epoch_ns = local_ns - offset;
-                if !(crate::temporal_iso::MIN_EPOCH_NS..=crate::temporal_iso::MAX_EPOCH_NS)
-                    .contains(&epoch_ns)
-                {
-                    return Err(
+                // `GetStartOfDay` when no time was given (DST-gap aware); otherwise
+                // `GetEpochNanosecondsFor` with `compatible` disambiguation — a naïve
+                // offset-at-the-wall-instant conversion is wrong near DST transitions.
+                let epoch_ns = if time.is_none() {
+                    crate::nbexec::temporal_zoneddatetime::start_of_day_pub(
+                        &tz,
+                        crate::temporal_iso::iso_to_epoch_days(data.date),
+                    )
+                    .filter(|e| {
+                        (crate::temporal_iso::MIN_EPOCH_NS..=crate::temporal_iso::MAX_EPOCH_NS)
+                            .contains(e)
+                    })
+                    .ok_or_else(|| {
                         self.pd_range_error("resulting instant is outside the representable range")
-                    );
-                }
+                    })?
+                } else {
+                    crate::nbexec::temporal_zoneddatetime::epoch_for_wall_disamb(
+                        &tz,
+                        local_ns,
+                        "compatible",
+                    )
+                    .ok()
+                    .filter(|e| {
+                        (crate::temporal_iso::MIN_EPOCH_NS..=crate::temporal_iso::MAX_EPOCH_NS)
+                            .contains(e)
+                    })
+                    .ok_or_else(|| {
+                        self.pd_range_error("resulting instant is outside the representable range")
+                    })?
+                };
                 Ok(self.build_temporal(crate::temporal_iso::TemporalData {
                     kind: crate::temporal_iso::TemporalKind::ZonedDateTime,
                     epoch_ns,

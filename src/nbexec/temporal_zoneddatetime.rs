@@ -263,6 +263,299 @@ fn resolve_named(s: &str) -> Option<String> {
         .map(|z| z.name().to_string())
 }
 
+/// IANA "backward" link table: a non-primary time-zone identifier (a link) mapped
+/// to its primary (canonical) target. Sorted by key for binary search. Derived
+/// from the tzdb `backward` file; the UTC/GMT-zero family is handled separately in
+/// [`tz_primary`] (their Temporal primary identifier is "UTC", not the tzdb target).
+static TZ_LINKS: &[(&str, &str)] = &[
+    ("Africa/Accra", "Africa/Abidjan"),
+    ("Africa/Addis_Ababa", "Africa/Nairobi"),
+    ("Africa/Asmara", "Africa/Nairobi"),
+    ("Africa/Asmera", "Africa/Nairobi"),
+    ("Africa/Bamako", "Africa/Abidjan"),
+    ("Africa/Bangui", "Africa/Lagos"),
+    ("Africa/Banjul", "Africa/Abidjan"),
+    ("Africa/Blantyre", "Africa/Maputo"),
+    ("Africa/Brazzaville", "Africa/Lagos"),
+    ("Africa/Bujumbura", "Africa/Maputo"),
+    ("Africa/Conakry", "Africa/Abidjan"),
+    ("Africa/Dakar", "Africa/Abidjan"),
+    ("Africa/Dar_es_Salaam", "Africa/Nairobi"),
+    ("Africa/Djibouti", "Africa/Nairobi"),
+    ("Africa/Douala", "Africa/Lagos"),
+    ("Africa/Freetown", "Africa/Abidjan"),
+    ("Africa/Gaborone", "Africa/Maputo"),
+    ("Africa/Harare", "Africa/Maputo"),
+    ("Africa/Kampala", "Africa/Nairobi"),
+    ("Africa/Kigali", "Africa/Maputo"),
+    ("Africa/Kinshasa", "Africa/Lagos"),
+    ("Africa/Libreville", "Africa/Lagos"),
+    ("Africa/Lome", "Africa/Abidjan"),
+    ("Africa/Luanda", "Africa/Lagos"),
+    ("Africa/Lubumbashi", "Africa/Maputo"),
+    ("Africa/Lusaka", "Africa/Maputo"),
+    ("Africa/Malabo", "Africa/Lagos"),
+    ("Africa/Maseru", "Africa/Johannesburg"),
+    ("Africa/Mbabane", "Africa/Johannesburg"),
+    ("Africa/Mogadishu", "Africa/Nairobi"),
+    ("Africa/Niamey", "Africa/Lagos"),
+    ("Africa/Nouakchott", "Africa/Abidjan"),
+    ("Africa/Ouagadougou", "Africa/Abidjan"),
+    ("Africa/Porto-Novo", "Africa/Lagos"),
+    ("Africa/Timbuktu", "Africa/Abidjan"),
+    ("America/Anguilla", "America/Puerto_Rico"),
+    ("America/Antigua", "America/Puerto_Rico"),
+    (
+        "America/Argentina/ComodRivadavia",
+        "America/Argentina/Catamarca",
+    ),
+    ("America/Aruba", "America/Puerto_Rico"),
+    ("America/Atikokan", "America/Panama"),
+    ("America/Atka", "America/Adak"),
+    ("America/Blanc-Sablon", "America/Puerto_Rico"),
+    ("America/Buenos_Aires", "America/Argentina/Buenos_Aires"),
+    ("America/Catamarca", "America/Argentina/Catamarca"),
+    ("America/Cayman", "America/Panama"),
+    ("America/Coral_Harbour", "America/Panama"),
+    ("America/Cordoba", "America/Argentina/Cordoba"),
+    ("America/Creston", "America/Phoenix"),
+    ("America/Curacao", "America/Puerto_Rico"),
+    ("America/Dominica", "America/Puerto_Rico"),
+    ("America/Ensenada", "America/Tijuana"),
+    ("America/Fort_Wayne", "America/Indiana/Indianapolis"),
+    ("America/Godthab", "America/Nuuk"),
+    ("America/Grenada", "America/Puerto_Rico"),
+    ("America/Guadeloupe", "America/Puerto_Rico"),
+    ("America/Indianapolis", "America/Indiana/Indianapolis"),
+    ("America/Jujuy", "America/Argentina/Jujuy"),
+    ("America/Knox_IN", "America/Indiana/Knox"),
+    ("America/Kralendijk", "America/Puerto_Rico"),
+    ("America/Louisville", "America/Kentucky/Louisville"),
+    ("America/Lower_Princes", "America/Puerto_Rico"),
+    ("America/Marigot", "America/Puerto_Rico"),
+    ("America/Mendoza", "America/Argentina/Mendoza"),
+    ("America/Montreal", "America/Toronto"),
+    ("America/Montserrat", "America/Puerto_Rico"),
+    ("America/Nassau", "America/Toronto"),
+    ("America/Nipigon", "America/Toronto"),
+    ("America/Pangnirtung", "America/Iqaluit"),
+    ("America/Port_of_Spain", "America/Puerto_Rico"),
+    ("America/Porto_Acre", "America/Rio_Branco"),
+    ("America/Rainy_River", "America/Winnipeg"),
+    ("America/Rosario", "America/Argentina/Cordoba"),
+    ("America/Santa_Isabel", "America/Tijuana"),
+    ("America/Shiprock", "America/Denver"),
+    ("America/St_Barthelemy", "America/Puerto_Rico"),
+    ("America/St_Kitts", "America/Puerto_Rico"),
+    ("America/St_Lucia", "America/Puerto_Rico"),
+    ("America/St_Thomas", "America/Puerto_Rico"),
+    ("America/St_Vincent", "America/Puerto_Rico"),
+    ("America/Thunder_Bay", "America/Toronto"),
+    ("America/Tortola", "America/Puerto_Rico"),
+    ("America/Virgin", "America/Puerto_Rico"),
+    ("America/Yellowknife", "America/Edmonton"),
+    ("Antarctica/DumontDUrville", "Pacific/Port_Moresby"),
+    ("Antarctica/McMurdo", "Pacific/Auckland"),
+    ("Antarctica/South_Pole", "Pacific/Auckland"),
+    ("Antarctica/Syowa", "Asia/Riyadh"),
+    ("Arctic/Longyearbyen", "Europe/Berlin"),
+    ("Asia/Aden", "Asia/Riyadh"),
+    ("Asia/Ashkhabad", "Asia/Ashgabat"),
+    ("Asia/Bahrain", "Asia/Qatar"),
+    ("Asia/Brunei", "Asia/Kuching"),
+    ("Asia/Calcutta", "Asia/Kolkata"),
+    ("Asia/Choibalsan", "Asia/Ulaanbaatar"),
+    ("Asia/Chongqing", "Asia/Shanghai"),
+    ("Asia/Chungking", "Asia/Shanghai"),
+    ("Asia/Dacca", "Asia/Dhaka"),
+    ("Asia/Harbin", "Asia/Shanghai"),
+    ("Asia/Istanbul", "Europe/Istanbul"),
+    ("Asia/Kashgar", "Asia/Urumqi"),
+    ("Asia/Katmandu", "Asia/Kathmandu"),
+    ("Asia/Kuala_Lumpur", "Asia/Singapore"),
+    ("Asia/Kuwait", "Asia/Riyadh"),
+    ("Asia/Macao", "Asia/Macau"),
+    ("Asia/Muscat", "Asia/Dubai"),
+    ("Asia/Phnom_Penh", "Asia/Bangkok"),
+    ("Asia/Rangoon", "Asia/Yangon"),
+    ("Asia/Saigon", "Asia/Ho_Chi_Minh"),
+    ("Asia/Tel_Aviv", "Asia/Jerusalem"),
+    ("Asia/Thimbu", "Asia/Thimphu"),
+    ("Asia/Ujung_Pandang", "Asia/Makassar"),
+    ("Asia/Ulan_Bator", "Asia/Ulaanbaatar"),
+    ("Asia/Vientiane", "Asia/Bangkok"),
+    ("Atlantic/Faeroe", "Atlantic/Faroe"),
+    ("Atlantic/Jan_Mayen", "Europe/Berlin"),
+    ("Atlantic/Reykjavik", "Africa/Abidjan"),
+    ("Atlantic/St_Helena", "Africa/Abidjan"),
+    ("Australia/ACT", "Australia/Sydney"),
+    ("Australia/Canberra", "Australia/Sydney"),
+    ("Australia/Currie", "Australia/Hobart"),
+    ("Australia/LHI", "Australia/Lord_Howe"),
+    ("Australia/NSW", "Australia/Sydney"),
+    ("Australia/North", "Australia/Darwin"),
+    ("Australia/Queensland", "Australia/Brisbane"),
+    ("Australia/South", "Australia/Adelaide"),
+    ("Australia/Tasmania", "Australia/Hobart"),
+    ("Australia/Victoria", "Australia/Melbourne"),
+    ("Australia/West", "Australia/Perth"),
+    ("Australia/Yancowinna", "Australia/Broken_Hill"),
+    ("Brazil/Acre", "America/Rio_Branco"),
+    ("Brazil/DeNoronha", "America/Noronha"),
+    ("Brazil/East", "America/Sao_Paulo"),
+    ("Brazil/West", "America/Manaus"),
+    ("CET", "Europe/Brussels"),
+    ("CST6CDT", "America/Chicago"),
+    ("Canada/Atlantic", "America/Halifax"),
+    ("Canada/Central", "America/Winnipeg"),
+    ("Canada/Eastern", "America/Toronto"),
+    ("Canada/Mountain", "America/Edmonton"),
+    ("Canada/Newfoundland", "America/St_Johns"),
+    ("Canada/Pacific", "America/Vancouver"),
+    ("Canada/Saskatchewan", "America/Regina"),
+    ("Canada/Yukon", "America/Whitehorse"),
+    ("Chile/Continental", "America/Santiago"),
+    ("Chile/EasterIsland", "Pacific/Easter"),
+    ("Cuba", "America/Havana"),
+    ("EET", "Europe/Athens"),
+    ("EST", "America/Panama"),
+    ("EST5EDT", "America/New_York"),
+    ("Egypt", "Africa/Cairo"),
+    ("Eire", "Europe/Dublin"),
+    ("Europe/Amsterdam", "Europe/Brussels"),
+    ("Europe/Belfast", "Europe/London"),
+    ("Europe/Bratislava", "Europe/Prague"),
+    ("Europe/Busingen", "Europe/Zurich"),
+    ("Europe/Copenhagen", "Europe/Berlin"),
+    ("Europe/Guernsey", "Europe/London"),
+    ("Europe/Isle_of_Man", "Europe/London"),
+    ("Europe/Jersey", "Europe/London"),
+    ("Europe/Kiev", "Europe/Kyiv"),
+    ("Europe/Ljubljana", "Europe/Belgrade"),
+    ("Europe/Luxembourg", "Europe/Brussels"),
+    ("Europe/Mariehamn", "Europe/Helsinki"),
+    ("Europe/Monaco", "Europe/Paris"),
+    ("Europe/Nicosia", "Asia/Nicosia"),
+    ("Europe/Oslo", "Europe/Berlin"),
+    ("Europe/Podgorica", "Europe/Belgrade"),
+    ("Europe/San_Marino", "Europe/Rome"),
+    ("Europe/Sarajevo", "Europe/Belgrade"),
+    ("Europe/Skopje", "Europe/Belgrade"),
+    ("Europe/Stockholm", "Europe/Berlin"),
+    ("Europe/Tiraspol", "Europe/Chisinau"),
+    ("Europe/Uzhgorod", "Europe/Kyiv"),
+    ("Europe/Vaduz", "Europe/Zurich"),
+    ("Europe/Vatican", "Europe/Rome"),
+    ("Europe/Zagreb", "Europe/Belgrade"),
+    ("Europe/Zaporozhye", "Europe/Kyiv"),
+    ("GB", "Europe/London"),
+    ("GB-Eire", "Europe/London"),
+    ("HST", "Pacific/Honolulu"),
+    ("Hongkong", "Asia/Hong_Kong"),
+    ("Iceland", "Africa/Abidjan"),
+    ("Indian/Antananarivo", "Africa/Nairobi"),
+    ("Indian/Christmas", "Asia/Bangkok"),
+    ("Indian/Cocos", "Asia/Yangon"),
+    ("Indian/Comoro", "Africa/Nairobi"),
+    ("Indian/Kerguelen", "Indian/Maldives"),
+    ("Indian/Mahe", "Asia/Dubai"),
+    ("Indian/Mayotte", "Africa/Nairobi"),
+    ("Indian/Reunion", "Asia/Dubai"),
+    ("Iran", "Asia/Tehran"),
+    ("Israel", "Asia/Jerusalem"),
+    ("Jamaica", "America/Jamaica"),
+    ("Japan", "Asia/Tokyo"),
+    ("Kwajalein", "Pacific/Kwajalein"),
+    ("Libya", "Africa/Tripoli"),
+    ("MET", "Europe/Brussels"),
+    ("MST", "America/Phoenix"),
+    ("MST7MDT", "America/Denver"),
+    ("Mexico/BajaNorte", "America/Tijuana"),
+    ("Mexico/BajaSur", "America/Mazatlan"),
+    ("Mexico/General", "America/Mexico_City"),
+    ("NZ", "Pacific/Auckland"),
+    ("NZ-CHAT", "Pacific/Chatham"),
+    ("Navajo", "America/Denver"),
+    ("PRC", "Asia/Shanghai"),
+    ("PST8PDT", "America/Los_Angeles"),
+    ("Pacific/Chuuk", "Pacific/Port_Moresby"),
+    ("Pacific/Enderbury", "Pacific/Kanton"),
+    ("Pacific/Funafuti", "Pacific/Tarawa"),
+    ("Pacific/Johnston", "Pacific/Honolulu"),
+    ("Pacific/Majuro", "Pacific/Tarawa"),
+    ("Pacific/Midway", "Pacific/Pago_Pago"),
+    ("Pacific/Pohnpei", "Pacific/Guadalcanal"),
+    ("Pacific/Ponape", "Pacific/Guadalcanal"),
+    ("Pacific/Saipan", "Pacific/Guam"),
+    ("Pacific/Samoa", "Pacific/Pago_Pago"),
+    ("Pacific/Truk", "Pacific/Port_Moresby"),
+    ("Pacific/Wake", "Pacific/Tarawa"),
+    ("Pacific/Wallis", "Pacific/Tarawa"),
+    ("Pacific/Yap", "Pacific/Port_Moresby"),
+    ("Poland", "Europe/Warsaw"),
+    ("Portugal", "Europe/Lisbon"),
+    ("ROC", "Asia/Taipei"),
+    ("ROK", "Asia/Seoul"),
+    ("Singapore", "Asia/Singapore"),
+    ("Turkey", "Europe/Istanbul"),
+    ("US/Alaska", "America/Anchorage"),
+    ("US/Aleutian", "America/Adak"),
+    ("US/Arizona", "America/Phoenix"),
+    ("US/Central", "America/Chicago"),
+    ("US/East-Indiana", "America/Indiana/Indianapolis"),
+    ("US/Eastern", "America/New_York"),
+    ("US/Hawaii", "Pacific/Honolulu"),
+    ("US/Indiana-Starke", "America/Indiana/Knox"),
+    ("US/Michigan", "America/Detroit"),
+    ("US/Mountain", "America/Denver"),
+    ("US/Pacific", "America/Los_Angeles"),
+    ("US/Samoa", "Pacific/Pago_Pago"),
+    ("W-SU", "Europe/Moscow"),
+    ("WET", "Europe/Lisbon"),
+];
+
+/// The UTC/GMT-zero family, whose Temporal *primary* time-zone identifier is "UTC"
+/// (used for `equals`/`until`/`since` comparison; the display id is still preserved).
+fn is_utc_family(id: &str) -> bool {
+    matches!(
+        id,
+        "UTC"
+            | "Etc/UTC"
+            | "Etc/UCT"
+            | "UCT"
+            | "Etc/Universal"
+            | "Universal"
+            | "Etc/Zulu"
+            | "Zulu"
+            | "Etc/GMT"
+            | "Etc/GMT+0"
+            | "Etc/GMT-0"
+            | "Etc/GMT0"
+            | "Etc/Greenwich"
+            | "GMT"
+            | "GMT+0"
+            | "GMT-0"
+            | "GMT0"
+            | "Greenwich"
+    )
+}
+
+/// `TimeZoneEquals`/primary-identifier resolution: maps a (case-normalized) IANA
+/// time-zone identifier to its Temporal *primary* identifier, so that links compare
+/// equal to their canonical zone (e.g. `Asia/Calcutta` → `Asia/Kolkata`, every
+/// UTC/GMT-zero alias → `UTC`). Offset identifiers and unknown names are returned
+/// unchanged. Only the primary is used for comparison; the stored/display id is not
+/// rewritten.
+pub(crate) fn tz_primary(id: &str) -> String {
+    if is_utc_family(id) {
+        return String::from("UTC");
+    }
+    if let Ok(idx) = TZ_LINKS.binary_search_by(|(k, _)| (*k).cmp(id)) {
+        return String::from(TZ_LINKS[idx].1);
+    }
+    String::from(id)
+}
+
 /// The offset (ns east of UTC) of `tz` at the exact instant `epoch_ns`.
 /// `GetOffsetNanosecondsFor(tz, epoch_ns)`.
 fn tz_offset_at(tz: &str, epoch_ns: i128) -> i128 {
@@ -420,10 +713,55 @@ fn offset_match(tz: &str, wall_ns: i128, off: i128, match_minutes: bool) -> Opti
 
 /// `GetEpochNanosecondsFor(tz, wall_ns, "compatible")`: the exact instant whose local
 /// wall time is `wall_ns`, using the default (compatible) disambiguation, which never
-/// conflicts. Also serves as `GetStartOfDay` when `wall_ns` is a midnight.
+/// conflicts.
 pub(crate) fn wall_to_epoch(tz: &str, wall_ns: i128) -> i128 {
     disambiguate(tz, wall_ns, Disamb::Compatible)
         .unwrap_or_else(|()| wall_ns - tz_offset_at(tz, wall_ns))
+}
+
+/// `GetEpochNanosecondsFor(tz, wall_ns, disambiguation)`: resolves a wall time to a
+/// single exact instant honouring the named `disambiguation` option
+/// (`compatible`/`earlier`/`later`/`reject`). `Err(())` is the `reject` conflict on a
+/// gap/overlap — the caller turns it into a `RangeError`. Unlike a naïve
+/// offset-at-the-wall-instant conversion, this is correct near DST transitions.
+pub(crate) fn epoch_for_wall_disamb(tz: &str, wall_ns: i128, disamb: &str) -> Result<i128, ()> {
+    let d = match disamb {
+        "earlier" => Disamb::Earlier,
+        "later" => Disamb::Later,
+        "reject" => Disamb::Reject,
+        _ => Disamb::Compatible,
+    };
+    disambiguate(tz, wall_ns, d)
+}
+
+/// `GetStartOfDay(tz, isoDate)`: the first exact instant of the calendar day
+/// `epoch_days` (days since the ISO epoch) in `tz`.
+///
+/// Normally this is local midnight, but when midnight falls inside a
+/// spring-forward gap it is the instant of the transition that ends the gap (so
+/// a day can start at 00:30, 01:00, …); when midnight occurs twice (a fall-back
+/// straddling midnight) it is the *earlier* of the two. Returns `None` only when
+/// the one-day-earlier probe epoch is outside the representable instant range —
+/// the caller turns that into a `RangeError`.
+pub(crate) fn start_of_day_pub(tz: &str, epoch_days: i64) -> Option<i128> {
+    start_of_day(tz, epoch_days)
+}
+
+fn start_of_day(tz: &str, epoch_days: i64) -> Option<i128> {
+    let midnight = epoch_days as i128 * iso::NS_PER_DAY;
+    let (poss, n) = possible_instants(tz, midnight);
+    if n > 0 {
+        // Single instant, or (fall-back overlap) the earlier of the two.
+        return Some(poss[0]);
+    }
+    // Midnight is skipped (a DST gap starting at/around 00:00): the start of the
+    // day is the transition that ends the gap.
+    let day_before = midnight - iso::NS_PER_DAY;
+    if !(iso::MIN_EPOCH_NS..=iso::MAX_EPOCH_NS).contains(&day_before) {
+        return None;
+    }
+    let z = timezone_data::load(tz).ok()?;
+    zone_next_transition(&z, day_before)
 }
 
 /// `GetNamedTimeZoneNextTransition`: the first offset transition strictly after
@@ -503,6 +841,21 @@ fn negate_round_mode(mode: RoundMode) -> RoundMode {
 
 /// `RoundNumberToIncrement` (signed): rounds `x` to a multiple of `inc`, with the
 /// half-tie and directional modes following the sign of `x`.
+/// `RoundTemporalInstant`: rounds an exact epoch-nanoseconds value to `inc` ns
+/// using `RoundNumberToIncrementAsIfPositive` — the rounding-mode direction is
+/// applied as if the value were positive, so a negative epoch does not flip the
+/// meaning of `expand`/`trunc`/`halfExpand`/`halfTrunc`.
+fn round_instant(epoch: i128, inc: i128, mode: RoundMode) -> i128 {
+    let m = match mode {
+        RoundMode::Expand => RoundMode::Ceil,
+        RoundMode::Trunc => RoundMode::Floor,
+        RoundMode::HalfExpand => RoundMode::HalfCeil,
+        RoundMode::HalfTrunc => RoundMode::HalfFloor,
+        other => other,
+    };
+    iso::round_to_increment(epoch, inc, m)
+}
+
 fn round_signed(x: i128, inc: i128, mode: RoundMode) -> i128 {
     if inc <= 1 {
         return x;
@@ -856,8 +1209,11 @@ impl<'a> Interp<'a> {
             "epochNanoseconds" => return Ok(self.zdt_bigint_i128(data.epoch_ns)),
             "dayOfWeek" => return Ok(num(i64::from(iso::iso_day_of_week(d)))),
             "hoursInDay" => {
-                let start = wall_to_epoch(&tz, iso_to_epoch_days(d) as i128 * iso::NS_PER_DAY);
-                let next = wall_to_epoch(&tz, (iso_to_epoch_days(d) + 1) as i128 * iso::NS_PER_DAY);
+                let start = start_of_day(&tz, iso_to_epoch_days(d));
+                let next = start_of_day(&tz, iso_to_epoch_days(d) + 1);
+                let (Some(start), Some(next)) = (start, next) else {
+                    return Err(self.zdt_range("day boundary is out of range"));
+                };
                 if !valid_epoch(start) || !valid_epoch(next) {
                     return Err(self.zdt_range("day boundary is out of range"));
                 }
@@ -957,16 +1313,19 @@ impl<'a> Interp<'a> {
             "startOfDay" => {
                 let tz = self.zdt_tz(data);
                 let (d, _) = local_of(&tz, data.epoch_ns);
-                let epoch = wall_to_epoch(&tz, iso_to_epoch_days(d) as i128 * iso::NS_PER_DAY);
-                if !valid_epoch(epoch) {
-                    return Err(self.zdt_range("start of day is out of range"));
-                }
+                let epoch = start_of_day(&tz, iso_to_epoch_days(d))
+                    .filter(|e| valid_epoch(*e))
+                    .ok_or_else(|| self.zdt_range("start of day is out of range"))?;
                 Ok(self.make_zdt_cal(epoch, tz, data.calendar.clone()))
             }
             "getTimeZoneTransition" => self.zdt_get_transition(data, arg(0)),
             "equals" => {
                 let (epoch, tz, cal) = self.resolve_zdt(arg(0))?;
-                let eq = epoch == data.epoch_ns && tz == self.zdt_tz(data) && cal == data.calendar;
+                // `TimeZoneEquals` compares *primary* (canonical) identifiers, so a
+                // link equals its canonical zone (e.g. Asia/Calcutta == Asia/Kolkata).
+                let eq = epoch == data.epoch_ns
+                    && tz_primary(&tz) == tz_primary(&self.zdt_tz(data))
+                    && cal == data.calendar;
                 Ok(NanBox::boolean(eq))
             }
             "toInstant" => {
@@ -1273,8 +1632,10 @@ impl<'a> Interp<'a> {
             None => None,
         };
         let offset_ns = offset_field.map(|(o, _)| o);
-        // A seconds-precision offset field forces exact matching.
-        let match_minutes = !matches!(offset_field, Some((_, true)));
+        // A property-bag offset is always matched exactly (never minute-rounded):
+        // `matchBehaviour` is only `match-minutes` for a minute-precision offset
+        // parsed from an ISO string, per `ToTemporalZonedDateTime`.
+        let match_minutes = false;
         let second = self.read_int_field(h, "second")?;
         let tz_val = self.zdt_field(h, "timeZone")?;
         let year = self.read_int_field(h, "year")?;
@@ -1364,8 +1725,10 @@ impl<'a> Interp<'a> {
             None => None,
         };
         let offset_ns = offset_field.map(|(o, _)| o);
-        // A seconds-precision offset field forces exact matching.
-        let match_minutes = !matches!(offset_field, Some((_, true)));
+        // A property-bag offset is always matched exactly (never minute-rounded):
+        // `matchBehaviour` is only `match-minutes` for a minute-precision offset
+        // parsed from an ISO string, per `ToTemporalZonedDateTime`.
+        let match_minutes = false;
         let second = self.read_int_field(h, "second")?;
         let tz_val = self.zdt_field(h, "timeZone")?;
         let year = self.read_int_field(h, "year")?;
@@ -1557,6 +1920,14 @@ impl<'a> Interp<'a> {
         {
             return Err(self.zdt_range("date-time is outside the representable range"));
         }
+        // A date-only string (no time component, wall offset behaviour) resolves to
+        // `GetStartOfDay` — DST-gap aware — per `InterpretISODateTimeOffset`.
+        if !p.has_time && !p.z && p.offset_ns.is_none() {
+            let epoch = start_of_day(&tz, iso_to_epoch_days(p.date))
+                .filter(|e| valid_epoch(*e))
+                .ok_or_else(|| self.zdt_range("start of day is out of range"))?;
+            return Ok((epoch, tz, calendar));
+        }
         // offset_ns from a numeric offset; z handled separately. A minute-precision
         // offset string (no seconds) enables minute-rounded matching.
         let offset_ns = if p.z { None } else { p.offset_ns };
@@ -1580,6 +1951,33 @@ impl<'a> Interp<'a> {
         disamb: Disamb,
         match_minutes: bool,
     ) -> Result<i128, ExecError> {
+        // `CheckISODaysRange` (per `InterpretISODateTimeOffset`): the effective ISO
+        // date must have |epoch days| ≤ 10^8. Which date is checked depends on the
+        // offset behaviour: `exact`/`use` check the offset-balanced date; the
+        // `option` (prefer/reject) path checks the raw wall date; `wall`/`ignore`
+        // skip it (the epoch validity check below suffices). This rejects e.g.
+        // "-271821-04-19T…" (day −10^8−1) whose epoch can still land exactly on the
+        // representable boundary.
+        let day_of = |ns: i128| ns.div_euclid(iso::NS_PER_DAY);
+        let checked_days: Option<i128> = if has_z {
+            Some(day_of(wall_ns))
+        } else if let Some(off) = offset_ns {
+            match offset_opt {
+                OffsetOpt::Use => Some(day_of(wall_ns - off)),
+                OffsetOpt::Prefer | OffsetOpt::Reject => Some(day_of(wall_ns)),
+                OffsetOpt::Ignore => None,
+            }
+        } else {
+            None
+        };
+        if let Some(days) = checked_days
+            && days.abs() > 100_000_000
+        {
+            return Err(
+                self.zdt_range("date-time is outside the representable range of ZonedDateTime")
+            );
+        }
+
         let epoch = if has_z {
             wall_ns
         } else if let Some(off) = offset_ns {
@@ -1842,16 +2240,21 @@ impl<'a> Interp<'a> {
     ) -> Result<NanBox, ExecError> {
         let tz = self.zdt_tz(data);
         let (cd, _) = local_of(&tz, data.epoch_ns);
-        let time = if arg.is_undefined() {
-            IsoTime::default()
+        // With no argument, `withPlainTime()` means the start of the day
+        // (`GetStartOfDay`), which is DST-gap aware — not a plain midnight.
+        let epoch = if arg.is_undefined() {
+            start_of_day(&tz, iso_to_epoch_days(cd))
+                .filter(|e| valid_epoch(*e))
+                .ok_or_else(|| self.zdt_range("resulting instant is out of range"))?
         } else {
-            self.zdt_to_time(arg)?
+            let time = self.zdt_to_time(arg)?;
+            let wall = iso_to_epoch_days(cd) as i128 * iso::NS_PER_DAY + time_to_nanos(time);
+            let epoch = wall_to_epoch(&tz, wall);
+            if !valid_epoch(epoch) {
+                return Err(self.zdt_range("resulting instant is out of range"));
+            }
+            epoch
         };
-        let wall = iso_to_epoch_days(cd) as i128 * iso::NS_PER_DAY + time_to_nanos(time);
-        let epoch = wall_to_epoch(&tz, wall);
-        if !valid_epoch(epoch) {
-            return Err(self.zdt_range("resulting instant is out of range"));
-        }
         Ok(self.make_zdt_cal(epoch, tz, data.calendar.clone()))
     }
 
@@ -2048,8 +2451,9 @@ impl<'a> Interp<'a> {
         options: NanBox,
         negate: bool,
     ) -> Result<NanBox, ExecError> {
-        let (other_epoch, _other_tz, other_cal) = self.resolve_zdt(other)?;
+        let (other_epoch, other_tz, other_cal) = self.resolve_zdt(other)?;
         let cal = data.calendar.clone();
+        let tz = self.zdt_tz(data);
         // DifferenceTemporalZonedDateTime enforces CalendarEquals before reading the
         // options bag. The ISO fast path keeps its original calendar-agnostic
         // behaviour; a non-ISO receiver requires both operands to share a calendar.
@@ -2057,7 +2461,6 @@ impl<'a> Interp<'a> {
             return Err(self
                 .zdt_range("cannot compute the difference between dates of different calendars"));
         }
-        let tz = self.zdt_tz(data);
         let opts = self.zdt_options(options)?;
         let units = [
             "year",
@@ -2111,33 +2514,54 @@ impl<'a> Interp<'a> {
             self.zdt_validate_increment(smallest, increment)?;
         }
 
+        // `DifferenceZonedDateTime` (a *date* largestUnit — year/month/week/day)
+        // measures whole days against the zone's own day boundaries, so both
+        // operands must share a time zone (`TimeZoneEquals` on primary identifiers).
+        // A time-unit largestUnit (hour or finer) is a pure epoch difference and
+        // needs no such check.
+        if largest <= Unit::Day && tz_primary(&tz) != tz_primary(&other_tz) {
+            return Err(self
+                .zdt_range("cannot compute the difference between dates in different time zones"));
+        }
+
         let mut dur = if largest == Unit::Day {
             // `DifferenceZonedDateTime` with largestUnit day: the day count follows the
             // time zone's own (variable-length) day boundaries, not a fixed 24 hours.
-            self.zdt_diff_days(&tz, data.epoch_ns, other_epoch, smallest, increment, mode)
+            self.zdt_diff_days(&tz, data.epoch_ns, other_epoch, smallest, increment, mode)?
         } else if largest >= Unit::Day {
             // Hour or finer: an exact nanosecond difference, with sign-aware rounding.
             let total = other_epoch - data.epoch_ns;
             let inc = unit_ns(smallest) * i128::from(increment.max(1));
             let rounded = round_signed(total, inc, mode);
             balance_datetime(rounded, largest)
-        } else if largest == smallest
-            && matches!(smallest, Unit::Year | Unit::Month | Unit::Week | Unit::Day)
-        {
-            // Calendar-unit rounding relative to the receiver (NudgeToCalendarUnit),
-            // expressed in a single unit (largestUnit == smallestUnit).
+        } else if matches!(smallest, Unit::Year | Unit::Month | Unit::Week | Unit::Day) {
+            // Calendar-unit rounding relative to the receiver (NudgeToCalendarUnit at
+            // the smallestUnit), then balanced up to the (coarser or equal) calendar
+            // largestUnit — e.g. 1y 11m 24d rounded to months, expanded, is 2 years.
             self.zdt_round_calendar(
                 &cal,
                 &tz,
                 data.epoch_ns,
                 other_epoch,
                 smallest,
+                largest,
                 increment,
                 mode,
             )
         } else {
-            // Calendar difference (years/months/weeks) — DST-aware, unrounded.
-            self.zdt_calendar_diff(&cal, &tz, data.epoch_ns, other_epoch, largest)
+            // Calendar largestUnit (years/months/weeks) with a time smallestUnit —
+            // DST-aware date diff plus the time remainder rounded at smallestUnit
+            // (which may bubble a whole day up into the date part).
+            self.zdt_calendar_diff(
+                &cal,
+                &tz,
+                data.epoch_ns,
+                other_epoch,
+                largest,
+                smallest,
+                increment,
+                mode,
+            )
         };
         if negate {
             dur = negate_duration(dur);
@@ -2166,6 +2590,14 @@ impl<'a> Interp<'a> {
         w: i64,
         d: i64,
     ) -> i128 {
+        // `AddZonedDateTime`: a zero date portion adds nothing to the wall date, so
+        // the instant is unchanged (`AddInstant` of a zero time duration). Crucially
+        // this does NOT re-resolve the wall time through disambiguation — which would
+        // otherwise collapse a fall-back overlap onto the *earlier* instant and lose
+        // which of the two same-wall-clock instants we started from.
+        if y == 0 && m == 0 && w == 0 && d == 0 {
+            return ns;
+        }
         let (date, t) = local_of(tz, ns);
         let nd = if tcal::is_iso(cal) {
             iso::add_iso_date(date, y, m, w, d, Overflow::Constrain)
@@ -2185,6 +2617,7 @@ impl<'a> Interp<'a> {
     /// date part is the wall-clock calendar difference, but the time part is the exact
     /// instant gap left after adding that date part back (so DST offset shifts are
     /// reflected — a 24-hour remainder does not collapse to a day inside a 25-hour day).
+    #[allow(clippy::too_many_arguments)]
     fn zdt_calendar_diff(
         &self,
         cal: &str,
@@ -2192,6 +2625,9 @@ impl<'a> Interp<'a> {
         ns1: i128,
         ns2: i128,
         largest: Unit,
+        smallest: Unit,
+        increment: i64,
+        mode: RoundMode,
     ) -> DurationFields {
         let from = local_of(tz, ns1);
         let to = local_of(tz, ns2);
@@ -2205,7 +2641,75 @@ impl<'a> Interp<'a> {
             d.weeks as i64,
             d.days as i64,
         );
-        let rem = iso::balance_time_duration(ns2 - date_epoch, Unit::Hour);
+        // `NudgeToDayOrTime`: round the exact sub-day time remainder at the (time)
+        // smallestUnit. When it rounds up to a whole day, that day bubbles into the
+        // date part (`BubbleRelativeDuration`) — e.g. …23:59:59.999999999 rounded up
+        // to the microsecond becomes the next day, which can carry all the way to a
+        // year. A nanosecond smallestUnit with increment 1 leaves this a no-op.
+        let overall_sign = (ns2 - ns1).signum();
+        let inc = unit_ns(smallest) * i128::from(increment.max(1));
+        let rem_ns = ns2 - date_epoch;
+        let rounded = round_signed(rem_ns, inc, mode);
+        let next_date_epoch = self.add_zdt_date_epoch(
+            cal,
+            tz,
+            ns1,
+            d.years as i64,
+            d.months as i64,
+            d.weeks as i64,
+            d.days as i64 + overall_sign as i64,
+        );
+        let day_len = (next_date_epoch - date_epoch).abs();
+        // Carry only when *rounding* pushes a genuinely sub-day remainder up to a
+        // full day. When the unrounded remainder already equals the (possibly
+        // DST-shortened) day length, `end` sits exactly on the next day boundary —
+        // that is the "pick the smaller of two possible durations" case, and the
+        // difference must stay in days/time rather than balancing up a whole day
+        // (which could wrongly bubble into a month).
+        let leftover = if day_len > 0 && rem_ns.abs() < day_len && rounded.abs() >= day_len {
+            // The time rounded up to (at least) a full day: carry it into the date
+            // part and re-difference so the extra day bubbles up through the calendar.
+            let carried_days = d.days as i64 + overall_sign as i64;
+            let end_date = if tcal::is_iso(cal) {
+                iso::add_iso_date(
+                    from.0,
+                    d.years as i64,
+                    d.months as i64,
+                    d.weeks as i64,
+                    carried_days,
+                    Overflow::Constrain,
+                )
+            } else {
+                tcal::calendar_date_add(
+                    cal,
+                    from.0,
+                    d.years as i64,
+                    d.months as i64,
+                    d.weeks as i64,
+                    carried_days,
+                    Overflow::Constrain,
+                )
+                .ok()
+            };
+            if let Some(ed2) = end_date {
+                let (by, bm, bw, bd) = if tcal::is_iso(cal) {
+                    iso::difference_iso_date(from.0, ed2, largest)
+                } else {
+                    let p = tcal::calendar_date_until(cal, from.0, ed2, largest);
+                    (p.years, p.months, p.weeks, p.days)
+                };
+                d.years = i128::from(by);
+                d.months = i128::from(bm);
+                d.weeks = i128::from(bw);
+                d.days = i128::from(bd);
+            } else {
+                d.days += overall_sign;
+            }
+            rounded - overall_sign * day_len
+        } else {
+            rounded
+        };
+        let rem = iso::balance_time_duration(leftover, Unit::Hour);
         d.hours = rem.hours;
         d.minutes = rem.minutes;
         d.seconds = rem.seconds;
@@ -2222,17 +2726,17 @@ impl<'a> Interp<'a> {
     /// day part is added as wall-clock days, and the leftover is the exact instant gap.
     #[allow(clippy::too_many_arguments)]
     fn zdt_diff_days(
-        &self,
+        &mut self,
         tz: &str,
         ns1: i128,
         ns2: i128,
         smallest: Unit,
         increment: i64,
         mode: RoundMode,
-    ) -> DurationFields {
+    ) -> Result<DurationFields, ExecError> {
         let sign = (ns2 - ns1).signum();
         if sign == 0 {
-            return DurationFields::default();
+            return Ok(DurationFields::default());
         }
         let (sd, st) = local_of(tz, ns1);
         let ed = local_of(tz, ns2).0;
@@ -2269,27 +2773,47 @@ impl<'a> Interp<'a> {
             // Round the day count itself, measuring the fraction against the actual
             // (DST-aware) length of the day being crossed.
             let den = (add_days(days + sign) - add_days(days)).abs().max(1);
+            let inc = i128::from(increment.max(1));
             let scaled = days * den + sign * remainder.abs();
-            let rounded = round_signed(scaled, i128::from(increment.max(1)) * den, mode) / den;
-            return DurationFields {
+            // The rounding brackets `scaled` between two multiples of `inc` days; the
+            // far bound's instant is materialized (`AddZonedDateTime`), so if adding
+            // that many days overflows the representable range it is a RangeError —
+            // even when rounding would ultimately land on the nearer bound.
+            let floor_units = scaled.abs() / (inc * den);
+            let far_days = sign * (floor_units + 1) * inc;
+            if !valid_epoch(add_days(far_days)) {
+                return Err(self.zdt_range("rounded day boundary is out of range"));
+            }
+            let rounded = round_signed(scaled, inc * den, mode) / den;
+            return Ok(DurationFields {
                 days: rounded,
                 ..Default::default()
-            };
+            });
         }
 
         // largestUnit day with a sub-day smallestUnit: keep the whole days and round
         // the time remainder.
         let inc = unit_ns(smallest) * i128::from(increment.max(1));
-        let rounded = round_signed(remainder, inc, mode);
+        let mut rounded = round_signed(remainder, inc, mode);
+        // If rounding the remainder reaches (or passes) the full length of the day
+        // being crossed, it bubbles up into an extra day (BubbleRelativeDuration):
+        // e.g. 23h59m rounded to the nearest hour becomes a whole day.
+        let day_len = (add_days(days + sign) - add_days(days)).abs();
+        if day_len > 0 && rounded.abs() >= day_len {
+            days += sign;
+            rounded -= sign * day_len;
+        }
         let mut dur = iso::balance_time_duration(rounded, Unit::Hour);
         dur.days = days;
-        dur
+        Ok(dur)
     }
 
-    /// `NudgeToCalendarUnit` for a single calendar unit: the whole difference from
-    /// `start_epoch` to `end_epoch` in `unit`s, rounded to `increment` under `mode`,
+    /// `NudgeToCalendarUnit` for a calendar `unit` (the smallestUnit), rounding the
+    /// difference from `start_epoch` to `end_epoch` to `increment` under `mode`,
     /// with the fraction measured against the instant span of one `unit` step in the
-    /// zone (so it is DST-aware).
+    /// zone (so it is DST-aware). The rounded count is then re-expressed up to
+    /// `largest` (`BalanceDateDurationRelative`) — e.g. rounding to months and
+    /// balancing to years turns 24 months into 2 years.
     #[allow(clippy::too_many_arguments)]
     fn zdt_round_calendar(
         &self,
@@ -2298,6 +2822,7 @@ impl<'a> Interp<'a> {
         start_epoch: i128,
         end_epoch: i128,
         unit: Unit,
+        largest: Unit,
         increment: i64,
         mode: RoundMode,
     ) -> DurationFields {
@@ -2308,27 +2833,18 @@ impl<'a> Interp<'a> {
         }
         let (sd, st) = local_of(tz, start_epoch);
         let ed = local_of(tz, end_epoch).0;
-        // Whole-unit initial guess from the date difference (calendar-aware for a
-        // non-ISO calendar, so month lengths / leap months are honoured).
+        // Full unrounded date difference at `largest` (calendar-aware for non-ISO).
+        // NudgeToCalendarUnit keeps the units coarser than `unit` and rounds only the
+        // `unit` component — it does NOT re-express the whole span in `unit`s (which
+        // would corrupt e.g. a whole month rounded to weeks).
         let (dy, dm, dw, dd) = if tcal::is_iso(cal) {
-            iso::difference_iso_date(sd, ed, unit)
+            iso::difference_iso_date(sd, ed, largest)
         } else {
-            let p = tcal::calendar_date_until(cal, sd, ed, unit);
+            let p = tcal::calendar_date_until(cal, sd, ed, largest);
             (p.years, p.months, p.weeks, p.days)
         };
-        let mut r1 = match unit {
-            Unit::Year => dy,
-            Unit::Month => dm,
-            Unit::Week => dw,
-            _ => dd,
-        };
-        let add = |count: i64| -> i128 {
-            let (y, m, w, d) = match unit {
-                Unit::Year => (count, 0, 0, 0),
-                Unit::Month => (0, count, 0, 0),
-                Unit::Week => (0, 0, count, 0),
-                _ => (0, 0, 0, count),
-            };
+        // The instant of (start date + a date duration) at the start wall time.
+        let add_date = |y: i64, m: i64, w: i64, d: i64| -> i128 {
             let nd = if tcal::is_iso(cal) {
                 iso::add_iso_date(sd, y, m, w, d, Overflow::Constrain).unwrap_or(sd)
             } else {
@@ -2337,6 +2853,19 @@ impl<'a> Interp<'a> {
             let wall = iso_to_epoch_days(nd) as i128 * iso::NS_PER_DAY + time_to_nanos(st);
             wall_to_epoch(tz, wall)
         };
+        // A date duration keeping the units coarser than `unit`, `unit` = `v`, finer = 0.
+        let with_comp = |v: i64| -> (i64, i64, i64, i64) {
+            match unit {
+                Unit::Year => (v, 0, 0, 0),
+                Unit::Month => (dy, v, 0, 0),
+                Unit::Week => (dy, dm, v, 0),
+                _ => (dy, dm, dw, v),
+            }
+        };
+        let comp_epoch = |v: i64| -> i128 {
+            let (y, m, w, d) = with_comp(v);
+            add_date(y, m, w, d)
+        };
         let beyond = |e: i128| -> bool {
             if sign > 0 {
                 e > end_epoch
@@ -2344,38 +2873,61 @@ impl<'a> Interp<'a> {
                 e < end_epoch
             }
         };
-        // Correct the guess: grow while the next step stays on the near side, then
-        // shrink while the current step overshoots.
+        // The current value of the `unit` component, then corrected so that its own
+        // instant is on the near side of `end_epoch` and the next step overshoots
+        // (time-of-day / DST can shift the wall-date guess by a step).
+        let mut r1 = match unit {
+            Unit::Year => dy,
+            Unit::Month => dm,
+            Unit::Week => dw,
+            _ => dd,
+        };
         for _ in 0..8 {
-            if beyond(add(r1 + sign)) {
+            if beyond(comp_epoch(r1 + sign)) {
                 break;
             }
             r1 += sign;
         }
         for _ in 0..8 {
-            if beyond(add(r1)) {
+            if beyond(comp_epoch(r1)) {
                 r1 -= sign;
             } else {
                 break;
             }
         }
-        let epoch1 = add(r1);
-        let count = if epoch1 == end_epoch {
+        let epoch1 = comp_epoch(r1);
+        let rounded_v = if epoch1 == end_epoch {
             r1
         } else {
-            let epoch2 = add(r1 + sign);
+            let epoch2 = comp_epoch(r1 + sign);
             let den = (epoch2 - epoch1).abs().max(1);
             let num = (end_epoch - epoch1).abs();
             let x = i128::from(r1) * den + i128::from(sign) * num;
             let rounded = round_signed(x, i128::from(increment.max(1)) * den, mode);
             (rounded / den) as i64
         };
-        match unit {
-            Unit::Year => dur.years = i128::from(count),
-            Unit::Month => dur.months = i128::from(count),
-            Unit::Week => dur.weeks = i128::from(count),
-            _ => dur.days = i128::from(count),
-        }
+        // `BubbleRelativeDuration`: the nudged date duration (coarser units + rounded
+        // `unit` component) is re-expressed up to `largest` by adding it to the start
+        // date and re-differencing, carrying any full coarser unit (e.g. 12 months →
+        // 1 year, or a rounded-up week that completes a month).
+        let (ny, nm, nw, nd2) = with_comp(rounded_v);
+        let end_date = if tcal::is_iso(cal) {
+            iso::add_iso_date(sd, ny, nm, nw, nd2, Overflow::Constrain)
+        } else {
+            tcal::calendar_date_add(cal, sd, ny, nm, nw, nd2, Overflow::Constrain).ok()
+        };
+        let (by, bm, bw, bd) = match end_date {
+            Some(ed2) if tcal::is_iso(cal) => iso::difference_iso_date(sd, ed2, largest),
+            Some(ed2) => {
+                let p = tcal::calendar_date_until(cal, sd, ed2, largest);
+                (p.years, p.months, p.weeks, p.days)
+            }
+            None => (ny, nm, nw, nd2),
+        };
+        dur.years = i128::from(by);
+        dur.months = i128::from(bm);
+        dur.weeks = i128::from(bw);
+        dur.days = i128::from(bd);
         dur
     }
 
@@ -2426,13 +2978,24 @@ impl<'a> Interp<'a> {
         let tz = self.zdt_tz(data);
         let epoch = if smallest == Unit::Day {
             let (d, _) = local_of(&tz, data.epoch_ns);
-            let start = wall_to_epoch(&tz, iso_to_epoch_days(d) as i128 * iso::NS_PER_DAY);
-            let next = wall_to_epoch(&tz, (iso_to_epoch_days(d) + 1) as i128 * iso::NS_PER_DAY);
+            let start = start_of_day(&tz, iso_to_epoch_days(d));
+            let next = start_of_day(&tz, iso_to_epoch_days(d) + 1);
+            let (Some(start), Some(next)) = (start, next) else {
+                return Err(self.zdt_range("day boundary is out of range"));
+            };
             if !valid_epoch(start) || !valid_epoch(next) {
                 return Err(self.zdt_range("day boundary is out of range"));
             }
+            // When a wall date "starts twice" (a fall-back straddling midnight), the
+            // instant can be at or past the *next* day's start; the spec clamps it to
+            // one ns before, so it still rounds within its own (long) day.
+            let this_ns = if data.epoch_ns >= next {
+                next - 1
+            } else {
+                data.epoch_ns
+            };
             let day_len = next - start;
-            let progress = data.epoch_ns - start;
+            let progress = this_ns - start;
             let rounded = iso::round_to_increment(progress, day_len, mode);
             start + rounded
         } else {
@@ -2582,12 +3145,17 @@ impl<'a> Interp<'a> {
         };
 
         let tz = self.zdt_tz(data);
-        let offset_ns = tz_offset_at(&tz, data.epoch_ns);
-        // Round the wall time, carrying a whole-day overflow into the date.
-        let (d0, t0) = local_of(&tz, data.epoch_ns);
-        let rounded = iso::round_to_increment(time_to_nanos(t0), inc_ns, mode);
-        let (carry, time) = balance_time_from_nanos(rounded);
-        let date = epoch_days_to_iso(iso_to_epoch_days(d0) + carry);
+        // `RoundTemporalInstant` rounds the exact epoch, then the offset and wall
+        // time are re-derived from the rounded instant. This is correct when the
+        // rounded time lands in a DST gap (e.g. rounding 01:59:59.999… up to 02:00
+        // in a spring-forward zone yields the post-transition 03:00 at the new
+        // offset), which rounding the wall time in isolation cannot express.
+        let rounded_epoch = round_instant(data.epoch_ns, inc_ns, mode);
+        if !valid_epoch(rounded_epoch) {
+            return Err(self.zdt_range("rounded instant is out of range"));
+        }
+        let offset_ns = tz_offset_at(&tz, rounded_epoch);
+        let (date, time) = local_of(&tz, rounded_epoch);
 
         let mut out = alloc::format!(
             "{}-{}-{}T{}:{}",
@@ -2724,6 +3292,9 @@ struct ParsedZdt {
     tz: String,
     /// The (raw, un-canonicalized) first `[u-ca=…]` calendar annotation, if any.
     cal: Option<String>,
+    /// Whether the string carried an explicit time component. A date-only string
+    /// (`has_time == false`) resolves to the start of the day rather than midnight.
+    has_time: bool,
 }
 
 struct Zp<'s> {
@@ -2800,7 +3371,9 @@ fn parse_zdt_string(s: &str) -> Option<ParsedZdt> {
     let mut time = IsoTime::default();
     let mut offset = None;
     let mut z = false;
+    let mut has_time = false;
     if p.eat(b'T') || p.eat(b't') || p.eat(b' ') {
+        has_time = true;
         time = zp_time(&mut p)?;
         let (off, is_z) = zp_offset(&mut p)?;
         offset = off;
@@ -2817,6 +3390,7 @@ fn parse_zdt_string(s: &str) -> Option<ParsedZdt> {
         z,
         tz,
         cal,
+        has_time,
     })
 }
 
@@ -3108,5 +3682,63 @@ mod dst_tests {
         let far = wall_to_epoch("America/New_York", wall(2099, 6, 15, 12, 0));
         assert!(zone_next_transition(&zone, far).is_some());
         assert!(zone_prev_transition(&zone, far).is_some());
+    }
+
+    #[test]
+    fn start_of_day_across_midnight_gap() {
+        // America/Toronto 1919-03-31: the day starts at 00:30 because a 1-hour
+        // spring-forward at 1919-03-30T23:30 skips 23:30..00:29 across midnight.
+        let tz = "America/Toronto";
+        let day = iso_to_epoch_days(IsoDate {
+            year: 1919,
+            month: 3,
+            day: 31,
+        });
+        let epoch = start_of_day(tz, day).expect("start of day exists");
+        let (d, t) = local_of(tz, epoch);
+        assert_eq!((d.month, d.day, t.hour, t.minute), (3, 31, 0, 30));
+
+        // A day whose midnight is unambiguous starts at exactly 00:00.
+        let normal = iso_to_epoch_days(IsoDate {
+            year: 2020,
+            month: 6,
+            day: 15,
+        });
+        let (_, nt) = local_of(tz, start_of_day(tz, normal).unwrap());
+        assert_eq!((nt.hour, nt.minute), (0, 0));
+    }
+
+    #[test]
+    fn start_of_day_fall_back_returns_earlier() {
+        // Antarctica/Casey 2010-03-05 midnight occurs twice (a 3-hour fall-back
+        // straddling midnight); GetStartOfDay returns the earlier (+11) instant.
+        let tz = "Antarctica/Casey";
+        let day = iso_to_epoch_days(IsoDate {
+            year: 2010,
+            month: 3,
+            day: 5,
+        });
+        let epoch = start_of_day(tz, day).unwrap();
+        // Earlier occurrence is at offset +11:00.
+        assert_eq!(tz_offset_at(tz, epoch), 11 * iso::NS_PER_HOUR);
+    }
+
+    #[test]
+    fn tz_primary_canonicalizes_links_and_utc_family() {
+        // IANA "backward" links resolve to their canonical zone.
+        assert_eq!(tz_primary("Asia/Calcutta"), "Asia/Kolkata");
+        assert_eq!(tz_primary("Asia/Ulan_Bator"), "Asia/Ulaanbaatar");
+        assert_eq!(tz_primary("America/Atka"), "America/Adak");
+        assert_eq!(tz_primary("Europe/Nicosia"), "Asia/Nicosia");
+        assert_eq!(tz_primary("Australia/Canberra"), "Australia/Sydney");
+        // The whole UTC/GMT-zero family shares the primary "UTC".
+        for id in ["UTC", "Etc/UTC", "Etc/GMT", "GMT", "Greenwich", "Zulu"] {
+            assert_eq!(tz_primary(id), "UTC", "{id}");
+        }
+        // A canonical zone and an offset id are returned unchanged.
+        assert_eq!(tz_primary("Asia/Kolkata"), "Asia/Kolkata");
+        assert_eq!(tz_primary("+05:30"), "+05:30");
+        // Distinct zones keep distinct primaries.
+        assert_ne!(tz_primary("Asia/Colombo"), tz_primary("Asia/Kolkata"));
     }
 }
