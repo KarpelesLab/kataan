@@ -3463,8 +3463,19 @@ impl<'a> Interp<'a> {
                         .as_deref()
                         == Some("datetime")
                 {
-                    let ms = self.datetime_operand(arg(0))?;
-                    let parts = self.datetime_parts(h, ms);
+                    #[cfg(feature = "intl")]
+                    let parts = match self.temporal_format_parts(h, arg(0))? {
+                        Some(p) => p,
+                        None => {
+                            let ms = self.datetime_operand(arg(0))?;
+                            self.datetime_parts(h, ms)
+                        }
+                    };
+                    #[cfg(not(feature = "intl"))]
+                    let parts = {
+                        let ms = self.datetime_operand(arg(0))?;
+                        self.datetime_parts(h, ms)
+                    };
                     let mut arr_elems = Vec::with_capacity(parts.len());
                     for (ty, val) in parts {
                         let o = self.realm.new_object();

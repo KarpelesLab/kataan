@@ -533,6 +533,45 @@ pub(crate) fn unicode_type_alias(key: &str, value: &str) -> Option<&'static str>
     })
 }
 
+/// Extracts the `-u-ca-<calendar>` value from a BCP-47 locale tag, if present
+/// (e.g. `"en-u-ca-iso8601"` → `Some("iso8601")`, `"ja-u-ca-islamic-civil"` →
+/// `Some("islamic-civil")`). The calendar value may span several `-`-joined
+/// subtags (each ≥ 3 chars); collection stops at the next 2-char extension key.
+#[cfg(feature = "intl")]
+pub(crate) fn locale_unicode_calendar(locale: &str) -> Option<String> {
+    let lower = locale.to_ascii_lowercase();
+    let subtags: Vec<&str> = lower.split('-').collect();
+    // Find the "-u-" singleton extension, then the "ca" key inside it.
+    let mut i = 0;
+    while i < subtags.len() {
+        if subtags[i] == "u" {
+            let mut j = i + 1;
+            while j < subtags.len() && subtags[j] != "u" {
+                if subtags[j] == "ca" {
+                    let mut parts = Vec::new();
+                    let mut k = j + 1;
+                    while k < subtags.len() && subtags[k].len() >= 3 {
+                        parts.push(subtags[k]);
+                        k += 1;
+                    }
+                    if parts.is_empty() {
+                        return None;
+                    }
+                    let value = parts.join("-");
+                    return Some(
+                        unicode_type_alias("ca", &value)
+                            .map(String::from)
+                            .unwrap_or(value),
+                    );
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 pub(crate) fn canonicalize_locale_id(tag: &str) -> Option<String> {
     // Structurally rejected outright: empty, non-ASCII, `_` separators, and the
     // empty subtags produced by leading/trailing/doubled `-`.
@@ -1360,6 +1399,10 @@ impl<'a> Interp<'a> {
             .as_deref()
             == Some("datetime");
         if is_datetime {
+            #[cfg(feature = "intl")]
+            if let Some(s) = self.temporal_format_flat(inst, value)? {
+                return Ok(s);
+            }
             let ms = self.datetime_operand(value)?;
             Ok(self.format_intl_datetime(inst, ms))
         } else {
@@ -1987,6 +2030,11 @@ impl<'a> Interp<'a> {
             self.store_str(obj, "year", &numeric);
             self.store_str(obj, "month", &numeric);
             self.store_str(obj, "day", &numeric);
+            // Mark that year/month/day are the implicit default (not user-requested),
+            // so the ECMA-402 Temporal formatting protocol (which operates on the
+            // *raw* component options) treats them as absent.
+            self.realm
+                .set_hidden_property(obj, "\u{0}dtf_default_date", NanBox::boolean(true));
         }
         Ok(())
     }
@@ -2500,13 +2548,35 @@ impl<'a> Interp<'a> {
         start: NanBox,
         end: NanBox,
     ) -> Result<String, ExecError> {
+        #[cfg(feature = "intl")]
+        if let Some((inst, fx, fy, same)) = self.intl_temporal_range(this, start, end)? {
+            let _ = inst;
+            if same {
+                return Ok(fx);
+            }
+            return Ok(alloc::format!("{fx}\u{2013}{fy}"));
+        }
         let (inst, x, y) = self.intl_range_operands(this, start, end)?;
         let fx = self.intl_format_value(inst, NanBox::number(x));
         if x == y {
             return Ok(fx);
         }
         let fy = self.intl_format_value(inst, NanBox::number(y));
+        // A DateTimeFormat range collapses when both endpoints render identically
+        // (e.g. two instants on the same day with a date-only format).
+        if self.intl_kind_is_datetime(inst) && fx == fy {
+            return Ok(fx);
+        }
         Ok(alloc::format!("{fx}\u{2013}{fy}"))
+    }
+
+    /// Whether the `\0intl`-branded instance `inst` is an `Intl.DateTimeFormat`.
+    fn intl_kind_is_datetime(&self, inst: Handle) -> bool {
+        self.realm
+            .get_property(inst, "\u{0}intl")
+            .map(|k| self.realm.to_display_string(k))
+            .as_deref()
+            == Some("datetime")
     }
 
     /// `formatRangeToParts(x, y)` → an array of `{ type, value, source }` parts.
@@ -2516,11 +2586,40 @@ impl<'a> Interp<'a> {
         start: NanBox,
         end: NanBox,
     ) -> Result<NanBox, ExecError> {
+        #[cfg(feature = "intl")]
+        if let Some((inst, fx, fy, same)) = self.intl_temporal_range(this, start, end)? {
+            let _ = inst;
+            let mut parts: Vec<(&str, String, &str)> = alloc::vec![("literal", fx, "startRange")];
+            if !same {
+                parts.push(("literal", String::from("\u{2013}"), "shared"));
+                parts.push(("literal", fy, "endRange"));
+            }
+            let mut elems = Vec::with_capacity(parts.len());
+            for (ty, val, src) in parts {
+                let o = self.realm.new_object();
+                let tv = self.new_str(ty);
+                let vv = self.new_str(&val);
+                let sv = self.new_str(src);
+                self.realm.set_property(o, "type", tv);
+                self.realm.set_property(o, "value", vv);
+                self.realm.set_property(o, "source", sv);
+                elems.push(NanBox::handle(o.to_raw()));
+            }
+            return Ok(NanBox::handle(self.realm.new_array(elems).to_raw()));
+        }
         let (inst, x, y) = self.intl_range_operands(this, start, end)?;
         let fx = self.intl_format_value(inst, NanBox::number(x));
-        let mut parts: Vec<(&str, String, &str)> = alloc::vec![("literal", fx, "startRange")];
-        if x != y {
-            let fy = self.intl_format_value(inst, NanBox::number(y));
+        let is_dt = self.intl_kind_is_datetime(inst);
+        let fy = if x != y {
+            Some(self.intl_format_value(inst, NanBox::number(y)))
+        } else {
+            None
+        };
+        let mut parts: Vec<(&str, String, &str)> =
+            alloc::vec![("literal", fx.clone(), "startRange")];
+        if let Some(fy) = fy
+            && !(is_dt && fy == fx)
+        {
             parts.push(("literal", String::from("\u{2013}"), "shared"));
             parts.push(("literal", fy, "endRange"));
         }
@@ -3333,15 +3432,21 @@ impl<'a> Interp<'a> {
             o.day_period = opt(self, "dayPeriod").as_deref().and_then(name);
             o.fractional_second_digits =
                 opt(self, "fractionalSecondDigits").and_then(|s| s.parse().ok());
-            // ECMA-402 default when no component is requested: a numeric date.
+            // ECMA-402 `ToDateTimeOptions` default: when *none* of the date/time
+            // components (weekday/year/month/day/dayPeriod/hour/minute/second/
+            // fractionalSecondDigits) is requested, fall back to a numeric date.
+            // `era` and `timeZoneName` do NOT count (an era-only or timeZoneName-only
+            // formatter still gets the default date), and a dayPeriod-only or
+            // fractionalSecond-only formatter must NOT (it renders just that field).
             if o.weekday.is_none()
-                && o.era.is_none()
                 && o.year.is_none()
                 && o.month.is_none()
                 && o.day.is_none()
+                && o.day_period.is_none()
                 && o.hour.is_none()
                 && o.minute.is_none()
                 && o.second.is_none()
+                && o.fractional_second_digits.is_none()
             {
                 o.year = Some(Numeric2Digit::Numeric);
                 o.month = Some(MonthStyle::Numeric);
@@ -3381,6 +3486,609 @@ impl<'a> Interp<'a> {
                 .collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// ECMA-402 `HandleDateTimeValue`: if `value` is a Temporal object, resolve it
+    /// (WITHOUT calling `valueOf`) against `handle`'s `Intl.DateTimeFormat` options
+    /// into the `(epoch-milliseconds, kind)` needed for formatting. A
+    /// `Temporal.ZonedDateTime` throws a `TypeError`; a calendar mismatch throws a
+    /// `RangeError`. Returns `Ok(None)` when `value` is not a Temporal object (the
+    /// caller then falls back to the `ToNumber` / `Date` path).
+    #[cfg(feature = "intl")]
+    pub(crate) fn temporal_dtf_value(
+        &mut self,
+        handle: Handle,
+        value: NanBox,
+    ) -> Result<Option<(f64, crate::temporal_iso::TemporalKind)>, ExecError> {
+        use crate::temporal_iso::{TemporalKind, iso_to_epoch_days};
+        let Some(h) = value.as_handle().map(Handle::from_raw) else {
+            return Ok(None);
+        };
+        let Some(d) = self.realm.temporal_at(h) else {
+            return Ok(None);
+        };
+        // Resolved DateTimeFormat calendar: the explicit `calendar` option, else the
+        // locale's `-u-ca-` extension, else "gregory".
+        let dtf_cal = self
+            .realm
+            .get_property(handle, "calendar")
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+            .map(|v| self.realm.to_display_string(v))
+            .or_else(|| {
+                self.realm
+                    .get_property(handle, "\u{0}locale")
+                    .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                    .map(|v| self.realm.to_display_string(v))
+                    .and_then(|loc| locale_unicode_calendar(&loc))
+            })
+            .unwrap_or_else(|| String::from("gregory"));
+        let cal = d.calendar.clone();
+        // Calendar-compatibility checks (per-type).
+        let cal_ok_iso = cal == dtf_cal || cal == "iso8601";
+        let cal_ok_exact = cal == dtf_cal;
+        let noon = 43_200_000_i64;
+        let tod = |t: &crate::temporal_iso::IsoTime| -> i64 {
+            i64::from(t.hour) * 3_600_000
+                + i64::from(t.minute) * 60_000
+                + i64::from(t.second) * 1_000
+                + i64::from(t.millisecond)
+        };
+        let ms = match d.kind {
+            TemporalKind::ZonedDateTime => {
+                return Err(self.type_error(
+                    "Temporal.ZonedDateTime is not supported by Intl.DateTimeFormat.prototype.format; \
+                     use toLocaleString() or explicit options",
+                ));
+            }
+            TemporalKind::Duration => return Ok(None),
+            TemporalKind::Instant => (d.epoch_ns / 1_000_000) as f64,
+            TemporalKind::PlainDate | TemporalKind::PlainDateTime => {
+                if !cal_ok_iso {
+                    let m = self.new_str(
+                        "Temporal object calendar is incompatible with this Intl.DateTimeFormat",
+                    );
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
+                let days = iso_to_epoch_days(d.date);
+                if d.kind == TemporalKind::PlainDate {
+                    (days * 86_400_000 + noon) as f64
+                } else {
+                    (days * 86_400_000 + tod(&d.time)) as f64
+                }
+            }
+            TemporalKind::PlainYearMonth | TemporalKind::PlainMonthDay => {
+                if !cal_ok_exact {
+                    let m = self.new_str(
+                        "Temporal object calendar is incompatible with this Intl.DateTimeFormat",
+                    );
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
+                (iso_to_epoch_days(d.date) * 86_400_000 + noon) as f64
+            }
+            TemporalKind::PlainTime => tod(&d.time) as f64,
+        };
+        Ok(Some((ms, d.kind)))
+    }
+
+    /// ECMA-402 `GetDateTimeFormat` specialized for a Temporal `kind`: builds the
+    /// effective `intl` crate options for formatting a Temporal object, restricting
+    /// `handle`'s DateTimeFormat options to the type's data model (per the spec's
+    /// `required`/`defaults`/`inherit` rules). Returns `Ok(None)` when the format is
+    /// *null* — meaning the requested options don't overlap the type's data model —
+    /// which the caller turns into a `TypeError`.
+    #[cfg(feature = "intl")]
+    pub(crate) fn temporal_plain_options(
+        &mut self,
+        handle: Handle,
+        kind: crate::temporal_iso::TemporalKind,
+    ) -> Option<intl::datetime::DateTimeFormatOptions> {
+        use crate::temporal_iso::TemporalKind;
+        use intl::datetime::{
+            DateStyle, DateTimeFormatOptions, HourCycle, MonthStyle, NameStyle, Numeric2Digit,
+            TimeZoneNameStyle,
+        };
+        let opt = |this: &Self, k: &str| -> Option<String> {
+            this.realm
+                .get_property(handle, k)
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .map(|v| this.realm.to_display_string(v))
+        };
+        let defaulted = self
+            .realm
+            .get_property(handle, "\u{0}dtf_default_date")
+            .and_then(|v| v.as_boolean())
+            .unwrap_or(false);
+        // Raw component options (the auto-filled numeric date is treated as absent).
+        let weekday = opt(self, "weekday");
+        let era = opt(self, "era");
+        let (year, month, day) = if defaulted {
+            (None, None, None)
+        } else {
+            (opt(self, "year"), opt(self, "month"), opt(self, "day"))
+        };
+        let day_period = opt(self, "dayPeriod");
+        let hour = opt(self, "hour");
+        let minute = opt(self, "minute");
+        let second = opt(self, "second");
+        let frac = self
+            .realm
+            .get_property(handle, "fractionalSecondDigits")
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+            .map(|v| self.realm.to_number(v) as u8);
+        let tz_name = opt(self, "timeZoneName");
+        let hour_cycle_s = opt(self, "hourCycle");
+        let hour12 = self
+            .realm
+            .get_property(handle, "hour12")
+            .and_then(|v| v.as_boolean());
+        let date_style = opt(self, "dateStyle");
+        let time_style = opt(self, "timeStyle");
+        let ds = date_style.is_some();
+        let ts = time_style.is_some();
+        // Presence of the nine format components (dateStyle/timeStyle expanded).
+        let p_weekday = weekday.is_some() || (ds && date_style.as_deref() == Some("full"));
+        let p_year = year.is_some() || ds;
+        let p_month = month.is_some() || ds;
+        let p_day = day.is_some() || ds;
+        let p_hour = hour.is_some() || ts;
+        let p_minute = minute.is_some() || ts;
+        let p_second = second.is_some() || (ts && time_style.as_deref() != Some("short"));
+        let p_day_period = day_period.is_some();
+        let p_frac = frac.is_some();
+        let any_present = p_weekday
+            || p_year
+            || p_month
+            || p_day
+            || p_hour
+            || p_minute
+            || p_second
+            || p_day_period
+            || p_frac;
+
+        // Style helpers.
+        let name = |s: &str| match s {
+            "long" => Some(NameStyle::Long),
+            "short" => Some(NameStyle::Short),
+            "narrow" => Some(NameStyle::Narrow),
+            _ => None,
+        };
+        let n2 = |s: &str| match s {
+            "numeric" => Some(Numeric2Digit::Numeric),
+            "2-digit" => Some(Numeric2Digit::TwoDigit),
+            _ => None,
+        };
+        let mstyle = |s: &str| match s {
+            "numeric" => Some(MonthStyle::Numeric),
+            "2-digit" => Some(MonthStyle::TwoDigit),
+            "long" => Some(MonthStyle::Long),
+            "short" => Some(MonthStyle::Short),
+            "narrow" => Some(MonthStyle::Narrow),
+            _ => None,
+        };
+        let hc = |s: &str| match s {
+            "h11" => Some(HourCycle::H11),
+            "h12" => Some(HourCycle::H12),
+            "h23" => Some(HourCycle::H23),
+            "h24" => Some(HourCycle::H24),
+            _ => None,
+        };
+        // Native dateStyle → crate DateStyle (kept as-is for date-capable types).
+        let dstyle = |s: &str| match s {
+            "full" => Some(DateStyle::Full),
+            "long" => Some(DateStyle::Long),
+            "medium" => Some(DateStyle::Medium),
+            "short" => Some(DateStyle::Short),
+            _ => None,
+        };
+        // timeStyle downgraded to drop the time-zone name (plain types have no zone):
+        // "full"/"long" carry a zone name, so clamp them to "medium".
+        let tstyle_no_tz = |s: &str| match s {
+            "short" => Some(DateStyle::Short),
+            _ => Some(DateStyle::Medium),
+        };
+        // dateStyle expanded to (year, month) styles for year-month / month-day.
+        let ds_year = |s: &str| match s {
+            "short" => Numeric2Digit::TwoDigit,
+            _ => Numeric2Digit::Numeric,
+        };
+        let ds_month = |s: &str| match s {
+            "full" | "long" => MonthStyle::Long,
+            "medium" => MonthStyle::Short,
+            _ => MonthStyle::Numeric,
+        };
+
+        let mut o = DateTimeFormatOptions::default();
+        match kind {
+            TemporalKind::PlainDate => {
+                let need_defaults = !(p_weekday || p_year || p_month || p_day);
+                if need_defaults {
+                    if any_present {
+                        return None;
+                    }
+                    o.era = era.as_deref().and_then(name);
+                    o.year = Some(Numeric2Digit::Numeric);
+                    o.month = Some(MonthStyle::Numeric);
+                    o.day = Some(Numeric2Digit::Numeric);
+                } else if ds {
+                    o.date_style = date_style.as_deref().and_then(dstyle);
+                } else {
+                    o.weekday = weekday.as_deref().and_then(name);
+                    o.era = era.as_deref().and_then(name);
+                    o.year = year.as_deref().and_then(n2);
+                    o.month = month.as_deref().and_then(mstyle);
+                    o.day = day.as_deref().and_then(n2);
+                }
+            }
+            TemporalKind::PlainYearMonth => {
+                let need_defaults = !(p_year || p_month);
+                if need_defaults {
+                    if any_present {
+                        return None;
+                    }
+                    o.era = era.as_deref().and_then(name);
+                    o.year = Some(Numeric2Digit::Numeric);
+                    o.month = Some(MonthStyle::Numeric);
+                } else if ds {
+                    let s = date_style.as_deref().unwrap_or("short");
+                    o.year = Some(ds_year(s));
+                    o.month = Some(ds_month(s));
+                } else {
+                    o.era = era.as_deref().and_then(name);
+                    o.year = year.as_deref().and_then(n2);
+                    o.month = month.as_deref().and_then(mstyle);
+                }
+            }
+            TemporalKind::PlainMonthDay => {
+                let need_defaults = !(p_month || p_day);
+                if need_defaults {
+                    if any_present {
+                        return None;
+                    }
+                    o.month = Some(MonthStyle::Numeric);
+                    o.day = Some(Numeric2Digit::Numeric);
+                } else if ds {
+                    let s = date_style.as_deref().unwrap_or("short");
+                    o.month = Some(ds_month(s));
+                    o.day = Some(Numeric2Digit::Numeric);
+                } else {
+                    o.month = month.as_deref().and_then(mstyle);
+                    o.day = day.as_deref().and_then(n2);
+                }
+            }
+            TemporalKind::PlainTime => {
+                let need_defaults = !(p_day_period || p_hour || p_minute || p_second || p_frac);
+                if need_defaults {
+                    if any_present {
+                        return None;
+                    }
+                    o.hour_cycle = hour_cycle_s.as_deref().and_then(hc);
+                    o.hour12 = hour12;
+                    o.hour = Some(Numeric2Digit::Numeric);
+                    o.minute = Some(Numeric2Digit::Numeric);
+                    o.second = Some(Numeric2Digit::Numeric);
+                } else {
+                    o.hour_cycle = hour_cycle_s.as_deref().and_then(hc);
+                    o.hour12 = hour12;
+                    if ts {
+                        o.time_style = time_style.as_deref().and_then(tstyle_no_tz);
+                    } else {
+                        o.hour = hour.as_deref().and_then(n2);
+                        o.minute = minute.as_deref().and_then(n2);
+                        o.second = second.as_deref().and_then(n2);
+                        o.day_period = day_period.as_deref().and_then(name);
+                        o.fractional_second_digits = frac;
+                    }
+                }
+            }
+            TemporalKind::PlainDateTime => {
+                // required = ~any~ → never null (needDefaults ⇒ !anyPresent).
+                o.hour_cycle = hour_cycle_s.as_deref().and_then(hc);
+                o.hour12 = hour12;
+                if !any_present {
+                    o.era = era.as_deref().and_then(name);
+                    o.year = Some(Numeric2Digit::Numeric);
+                    o.month = Some(MonthStyle::Numeric);
+                    o.day = Some(Numeric2Digit::Numeric);
+                    o.hour = Some(Numeric2Digit::Numeric);
+                    o.minute = Some(Numeric2Digit::Numeric);
+                    o.second = Some(Numeric2Digit::Numeric);
+                } else {
+                    if ds {
+                        o.date_style = date_style.as_deref().and_then(dstyle);
+                    } else {
+                        o.weekday = weekday.as_deref().and_then(name);
+                        o.era = era.as_deref().and_then(name);
+                        o.year = year.as_deref().and_then(n2);
+                        o.month = month.as_deref().and_then(mstyle);
+                        o.day = day.as_deref().and_then(n2);
+                    }
+                    if ts {
+                        o.time_style = time_style.as_deref().and_then(tstyle_no_tz);
+                    } else {
+                        o.hour = hour.as_deref().and_then(n2);
+                        o.minute = minute.as_deref().and_then(n2);
+                        o.second = second.as_deref().and_then(n2);
+                        o.day_period = day_period.as_deref().and_then(name);
+                        o.fractional_second_digits = frac;
+                    }
+                }
+            }
+            TemporalKind::Instant => {
+                // required = ~any~, defaults = ~all~, inherit = ~all~: keep every
+                // requested option (including timeZoneName) and, absent any component,
+                // fall back to a full numeric date *and* time. An Instant has absolute
+                // time, so the DateTimeFormat's time zone applies (engine is UTC-only).
+                o.hour_cycle = hour_cycle_s.as_deref().and_then(hc);
+                o.hour12 = hour12;
+                if !any_present {
+                    o.era = era.as_deref().and_then(name);
+                    o.year = Some(Numeric2Digit::Numeric);
+                    o.month = Some(MonthStyle::Numeric);
+                    o.day = Some(Numeric2Digit::Numeric);
+                    o.hour = Some(Numeric2Digit::Numeric);
+                    o.minute = Some(Numeric2Digit::Numeric);
+                    o.second = Some(Numeric2Digit::Numeric);
+                } else {
+                    if ds {
+                        o.date_style = date_style.as_deref().and_then(dstyle);
+                    } else {
+                        o.weekday = weekday.as_deref().and_then(name);
+                        o.era = era.as_deref().and_then(name);
+                        o.year = year.as_deref().and_then(n2);
+                        o.month = month.as_deref().and_then(mstyle);
+                        o.day = day.as_deref().and_then(n2);
+                    }
+                    if ts {
+                        // Instant keeps the native time style (time-zone name and all).
+                        o.time_style = time_style.as_deref().and_then(dstyle);
+                    } else {
+                        o.hour = hour.as_deref().and_then(n2);
+                        o.minute = minute.as_deref().and_then(n2);
+                        o.second = second.as_deref().and_then(n2);
+                        o.day_period = day_period.as_deref().and_then(name);
+                        o.fractional_second_digits = frac;
+                    }
+                }
+                if let Some(tzn) = tz_name.as_deref() {
+                    o.time_zone_name = match tzn {
+                        "long" => Some(TimeZoneNameStyle::Long),
+                        "short" => Some(TimeZoneNameStyle::Short),
+                        "shortOffset" => Some(TimeZoneNameStyle::ShortOffset),
+                        "longOffset" => Some(TimeZoneNameStyle::LongOffset),
+                        "shortGeneric" => Some(TimeZoneNameStyle::ShortGeneric),
+                        "longGeneric" => Some(TimeZoneNameStyle::LongGeneric),
+                        _ => None,
+                    };
+                    o.tz_offset_minutes = Some(0); // engine is UTC-only
+                }
+                return Some(o);
+            }
+            // ZonedDateTime / Duration never reach here.
+            _ => return None,
+        }
+        // Plain temporal types never render a time-zone name.
+        let _ = tz_name;
+        Some(o)
+    }
+
+    /// Renders `ms` through explicit `intl` crate options into `{type,value}` parts
+    /// (the Temporal branch of `format`/`formatToParts`).
+    #[cfg(feature = "intl")]
+    pub(crate) fn temporal_datetime_parts(
+        &self,
+        handle: Handle,
+        ms: f64,
+        o: &intl::datetime::DateTimeFormatOptions,
+    ) -> Vec<(&'static str, String)> {
+        use intl::datetime::{self, DateTime};
+        let locale = self
+            .realm
+            .get_property(handle, "\u{0}locale")
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("en"));
+        let msi = ms as i64;
+        let day = msi.div_euclid(86_400_000);
+        let tod = msi.rem_euclid(86_400_000);
+        let (y, mo, d) = crate::realm::civil_from_days(day);
+        let dt = DateTime {
+            year: y as i32,
+            month: mo as u8,
+            day: d as u8,
+            hour: (tod / 3_600_000) as u8,
+            minute: ((tod / 60_000) % 60) as u8,
+            second: ((tod / 1_000) % 60) as u8,
+            millisecond: (tod % 1_000) as u16,
+        };
+        match datetime::format_to_parts(&locale, &dt, o) {
+            Ok(parts) => parts
+                .into_iter()
+                .map(|p| (p.kind.as_str(), p.value))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// The Temporal branch of `Intl.DateTimeFormat.prototype.format(value)`:
+    /// if `value` is a Temporal object, formats it per the ECMA-402 protocol and
+    /// returns `Ok(Some(string))`; otherwise `Ok(None)` (caller uses the number path).
+    #[cfg(feature = "intl")]
+    pub(crate) fn temporal_format_flat(
+        &mut self,
+        handle: Handle,
+        value: NanBox,
+    ) -> Result<Option<String>, ExecError> {
+        let Some((ms, kind)) = self.temporal_dtf_value(handle, value)? else {
+            return Ok(None);
+        };
+        let Some(o) = self.temporal_plain_options(handle, kind) else {
+            return Err(self.type_error(
+                "the requested Intl.DateTimeFormat options are not compatible with this Temporal type",
+            ));
+        };
+        let mut s = String::new();
+        for (_, v) in self.temporal_datetime_parts(handle, ms, &o) {
+            s.push_str(&v);
+        }
+        Ok(Some(self.apply_numbering_digits(handle, s)))
+    }
+
+    /// The Temporal branch of `formatToParts` — `Ok(Some(parts))` or `Ok(None)`.
+    #[cfg(feature = "intl")]
+    pub(crate) fn temporal_format_parts(
+        &mut self,
+        handle: Handle,
+        value: NanBox,
+    ) -> Result<Option<Vec<(&'static str, String)>>, ExecError> {
+        let Some((ms, kind)) = self.temporal_dtf_value(handle, value)? else {
+            return Ok(None);
+        };
+        let Some(o) = self.temporal_plain_options(handle, kind) else {
+            return Err(self.type_error(
+                "the requested Intl.DateTimeFormat options are not compatible with this Temporal type",
+            ));
+        };
+        Ok(Some(self.temporal_datetime_parts(handle, ms, &o)))
+    }
+
+    /// `Temporal.<Type>.prototype.toLocaleString(locales, options)`: constructs an
+    /// `Intl.DateTimeFormat` from the arguments and formats the Temporal receiver
+    /// through the ECMA-402 Temporal protocol (identical to `dtf.format(this)`).
+    /// Used for the calendared/plain types (Duration and ZonedDateTime keep their
+    /// own `toString`-based behavior).
+    #[cfg(feature = "intl")]
+    pub(crate) fn temporal_to_locale_string(
+        &mut self,
+        this: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let locales = args.first().copied().unwrap_or(NanBox::undefined());
+        let options = args.get(1).copied().unwrap_or(NanBox::undefined());
+        let fmt_args = [locales, options];
+        let inst = self.make_intl_formatter(N_INTL_DATETIME_FORMAT, &fmt_args)?;
+        let Some(h) = inst.as_handle().map(Handle::from_raw) else {
+            return Ok(self.new_str(""));
+        };
+        let s = self.temporal_format_flat(h, this)?.unwrap_or_default();
+        Ok(self.new_str(&s))
+    }
+
+    /// A range-endpoint "kind" tag: `0` for a Date/number, and a distinct value per
+    /// Temporal type. Two `formatRange` endpoints must share the same tag.
+    #[cfg(feature = "intl")]
+    fn range_type_tag(&self, value: NanBox) -> u8 {
+        use crate::temporal_iso::TemporalKind;
+        if let Some(h) = value.as_handle().map(Handle::from_raw)
+            && let Some(d) = self.realm.temporal_at(h)
+        {
+            return match d.kind {
+                TemporalKind::PlainDate => 1,
+                TemporalKind::PlainTime => 2,
+                TemporalKind::PlainDateTime => 3,
+                TemporalKind::Duration => 4,
+                TemporalKind::Instant => 5,
+                TemporalKind::PlainYearMonth => 6,
+                TemporalKind::PlainMonthDay => 7,
+                TemporalKind::ZonedDateTime => 8,
+            };
+        }
+        0
+    }
+
+    /// Whether `value` carries a Temporal internal slot.
+    #[cfg(feature = "intl")]
+    fn is_temporal_value(&self, value: NanBox) -> bool {
+        value
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.temporal_at(h))
+            .is_some()
+    }
+
+    /// The Temporal-aware branch of `formatRange`/`formatRangeToParts`. Returns
+    /// `Ok(None)` when neither endpoint is a Temporal object (the caller then uses
+    /// the ordinary numeric range path); otherwise `Ok(Some((inst, startStr,
+    /// endStr, collapsed)))`. Both arguments must be defined; endpoints are formatted
+    /// per the ECMA-402 Temporal protocol (no `valueOf` coercion).
+    #[cfg(feature = "intl")]
+    fn intl_temporal_range(
+        &mut self,
+        this: NanBox,
+        start: NanBox,
+        end: NanBox,
+    ) -> Result<Option<(Handle, String, String, bool)>, ExecError> {
+        let Some(inst) = this
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|h| self.realm.get_property(*h, "\u{0}intl").is_some())
+        else {
+            return Ok(None);
+        };
+        let is_dt = self
+            .realm
+            .get_property(inst, "\u{0}intl")
+            .map(|k| self.realm.to_display_string(k))
+            .as_deref()
+            == Some("datetime");
+        if !is_dt {
+            return Ok(None);
+        }
+        if !self.is_temporal_value(start) && !self.is_temporal_value(end) {
+            return Ok(None);
+        }
+        if matches!(start.unpack(), Unpacked::Undefined)
+            || matches!(end.unpack(), Unpacked::Undefined)
+        {
+            return Err(self.type_error("formatRange requires two defined arguments"));
+        }
+        // Both endpoints must be the *same* kind (a Date/number counts as one kind,
+        // and each Temporal type as its own); a mismatch is a TypeError.
+        if self.range_type_tag(start) != self.range_type_tag(end) {
+            return Err(
+                self.type_error("formatRange arguments must be of the same Date/Temporal type")
+            );
+        }
+        let (_mx, fx) = self.intl_range_dt_endpoint(inst, start)?;
+        let (_my, fy) = self.intl_range_dt_endpoint(inst, end)?;
+        // Collapse to a single value when both endpoints render identically (the
+        // spec collapses per-field; equal formatted strings is a faithful proxy).
+        let same = fx == fy;
+        Ok(Some((inst, fx, fy, same)))
+    }
+
+    /// Resolves one date/time range endpoint (a Temporal object, or a Date/number)
+    /// into its `(epoch-milliseconds, formatted-string)`.
+    #[cfg(feature = "intl")]
+    fn intl_range_dt_endpoint(
+        &mut self,
+        inst: Handle,
+        value: NanBox,
+    ) -> Result<(f64, String), ExecError> {
+        if let Some((ms, kind)) = self.temporal_dtf_value(inst, value)? {
+            let Some(o) = self.temporal_plain_options(inst, kind) else {
+                return Err(self.type_error(
+                    "the requested Intl.DateTimeFormat options are not compatible with this Temporal type",
+                ));
+            };
+            let mut s = String::new();
+            for (_, v) in self.temporal_datetime_parts(inst, ms, &o) {
+                s.push_str(&v);
+            }
+            return Ok((ms, self.apply_numbering_digits(inst, s)));
+        }
+        // Ordinary Date / number endpoint.
+        let ms = match value.as_handle().map(Handle::from_raw) {
+            Some(h) if self.realm.date_at(h).is_some() => self.realm.date_at(h).unwrap(),
+            _ => {
+                let n = self.coerce_to_number(value)?;
+                self.realm.to_number(n)
+            }
+        };
+        if !ms.is_finite() || ms.abs() > 8.64e15_f64 {
+            let m = self.new_str("formatRange date value is not a finite time value");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        Ok((ms, self.format_intl_datetime(inst, ms)))
     }
 
     /// Hand-rolled en-US fallback for [`datetime_parts`](Self::datetime_parts) when the `intl`

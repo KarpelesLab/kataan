@@ -10133,3 +10133,84 @@ fn concatenated_boundary_surrogates_coalesce() {
         "true"
     );
 }
+
+/// ECMA-402 Temporal formatting protocol: `Intl.DateTimeFormat.prototype.format`
+/// formats a Temporal object WITHOUT calling its (throwing) `valueOf`, restricting
+/// the output to the type's data model.
+#[cfg(feature = "intl")]
+#[test]
+fn dtf_format_temporal_plain_types() {
+    // PlainDate → date only; PlainTime → time only; PlainMonthDay drops the year;
+    // PlainYearMonth drops the day; PlainDateTime keeps both.
+    assert_eq!(
+        run(r#"new Intl.DateTimeFormat("en-US").format(new Temporal.PlainDate(2021,8,4))"#),
+        "8/4/2021"
+    );
+    assert_eq!(
+        run(
+            r#"new Intl.DateTimeFormat("en-US").format(new Temporal.PlainMonthDay(8,4,"gregory"))"#
+        ),
+        "8/4"
+    );
+    assert_eq!(
+        run(
+            r#"new Intl.DateTimeFormat("en-US").format(new Temporal.PlainYearMonth(2021,8,"gregory"))"#
+        ),
+        "8/2021"
+    );
+    assert_eq!(
+        run(
+            r#"new Intl.DateTimeFormat("en-US").format(new Temporal.PlainDateTime(2021,8,4,0,30,45,123)).includes("8/4/2021")"#
+        ),
+        "true"
+    );
+}
+
+/// A `Temporal.ZonedDateTime` is rejected by `format` with a `TypeError`, and a
+/// PlainTime with a date-only formatter (no overlap) is a `TypeError`.
+#[cfg(feature = "intl")]
+#[test]
+fn dtf_format_temporal_errors() {
+    assert_eq!(
+        run(
+            r#"try{new Intl.DateTimeFormat("en").format(new Temporal.ZonedDateTime(0n,"UTC"));"no"}catch(e){e.constructor.name}"#
+        ),
+        "TypeError"
+    );
+    // A year-only formatter cannot format a PlainTime (no field overlap).
+    assert_eq!(
+        run(
+            r#"try{new Intl.DateTimeFormat("en",{year:"numeric"}).format(new Temporal.PlainTime(1,2));"no"}catch(e){e.constructor.name}"#
+        ),
+        "TypeError"
+    );
+}
+
+/// `Temporal.<Type>.prototype.toLocaleString` formats through the same protocol,
+/// matching `Intl.DateTimeFormat.prototype.format`.
+#[cfg(feature = "intl")]
+#[test]
+fn temporal_to_locale_string_matches_format() {
+    assert_eq!(
+        run(r#"var d=new Temporal.PlainDate(1976,11,18);
+               d.toLocaleString("en-US")===new Intl.DateTimeFormat("en-US").format(d)"#),
+        "true"
+    );
+    assert_eq!(
+        run(r#"new Temporal.PlainYearMonth(2021,8,"gregory").toLocaleString("en-US")"#),
+        "8/2021"
+    );
+}
+
+/// A `-u-ca-` locale extension resolves the DateTimeFormat calendar so an iso8601
+/// Temporal object is calendar-compatible.
+#[cfg(feature = "intl")]
+#[test]
+fn dtf_temporal_locale_calendar_extension() {
+    assert_eq!(
+        run(
+            r#"new Temporal.PlainYearMonth(2024,12,"iso8601",26).toLocaleString("en-u-ca-iso8601",{timeZone:"UTC"})"#
+        ),
+        "12/2024"
+    );
+}
