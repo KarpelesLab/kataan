@@ -75,9 +75,12 @@ impl<'a> Interp<'a> {
                 self.realm
                     .restore_intrinsics(self.created_realms[idx].intrinsics);
                 self.global_this = self.created_realms[idx].global_this;
+                let child_intl = core::mem::take(&mut self.created_realms[idx].intl_protos);
+                let saved_intl = self.realm.replace_intl_protos(child_intl);
                 // A worker callback is an independent agent: its faults are only
                 // ever observed by the main agent through (missing) reports.
                 let _ = self.call(cb, &[sab]);
+                self.created_realms[idx].intl_protos = self.realm.replace_intl_protos(saved_intl);
                 self.realm.restore_intrinsics(saved_intrinsics);
                 self.global_this = saved_gt;
             } else {

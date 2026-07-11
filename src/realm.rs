@@ -2109,6 +2109,23 @@ impl Realm {
         self.intl_protos.insert(ctor_id, proto);
     }
 
+    /// Removes and returns the entire `Intl` service `.prototype` cache. Used by
+    /// `$262.createRealm` to swap the map per realm: each realm builds (and reads)
+    /// its own distinct set of `%Intl.X.prototype%` intrinsics, keyed by the same
+    /// ctor ids, so the map must be swapped rather than shared.
+    pub fn take_intl_protos(&mut self) -> alloc::collections::BTreeMap<u16, Handle> {
+        core::mem::take(&mut self.intl_protos)
+    }
+
+    /// Installs `map` as the active `Intl` service `.prototype` cache, returning the
+    /// previous one (swap semantics — see [`take_intl_protos`](Self::take_intl_protos)).
+    pub fn replace_intl_protos(
+        &mut self,
+        map: alloc::collections::BTreeMap<u16, Handle>,
+    ) -> alloc::collections::BTreeMap<u16, Handle> {
+        core::mem::replace(&mut self.intl_protos, map)
+    }
+
     /// Allocates an empty object whose `[[Prototype]]` is `proto` (`Object.create`).
     pub fn new_object_with_proto(&mut self, proto: Option<Handle>) -> Handle {
         let h = self.new_object();

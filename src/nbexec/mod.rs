@@ -2819,6 +2819,12 @@ struct CreatedRealm {
     global_this: NanBox,
     /// The realm's intrinsic prototype pointers, swapped in during `evalScript`.
     intrinsics: RealmIntrinsics,
+    /// The realm's `Intl` service `.prototype` intrinsics (`%Intl.X.prototype%`),
+    /// keyed by ctor id. Swapped into `Realm::intl_protos` while executing in this
+    /// realm (they are a distinct set of objects from every other realm's), and
+    /// consulted by `GetPrototypeFromConstructor` when a cross-realm `newTarget`
+    /// belonging to this realm has a non-object `.prototype`.
+    intl_protos: alloc::collections::BTreeMap<u16, Handle>,
 }
 
 impl<'a> Interp<'a> {
@@ -6057,9 +6063,10 @@ impl<'a> Interp<'a> {
             // (`callee`), so a subsequent `new other.Function()` used as a
             // cross-realm `newTarget` is recognized by `GetPrototypeFromConstructor`.
             // (Its own `[[Prototype]]` is intentionally left as the current realm's
-            // `%Function.prototype%`: the `AsyncFunction === Function` conflation
-            // makes a realm-derived re-link ambiguous for this path, and none of the
-            // realm-tagging tests observe the built function's own prototype.)
+            // `%Function.prototype%`: the `AsyncFunction === Function` conflation —
+            // and the fact that `%GeneratorFunction%`/`%AsyncGeneratorFunction%` are
+            // not bare globals — makes a realm-derived re-link ambiguous for this
+            // path, so the `*-prototype` realm-tagging tests are deferred.)
             let _ = new_target;
             if let Some(idx) = callee
                 .as_handle()

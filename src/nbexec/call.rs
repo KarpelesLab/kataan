@@ -2002,23 +2002,42 @@ impl<'a> Interp<'a> {
         let Some(nt) = new_target.as_handle().map(Handle::from_raw) else {
             return Ok(default);
         };
+        self.get_proto_from_constructor(nt, default)
+    }
+
+    /// `Get(newTarget, "prototype")`: invoke an own accessor (propagating an abrupt
+    /// getter); read an own *data* `prototype` override straight; else `read_member`
+    /// yields a function's intrinsic `.prototype`.
+    pub(crate) fn read_constructor_prototype(&mut self, nt: Handle) -> Result<NanBox, ExecError> {
+        if self.realm.accessor(nt, "prototype").is_some() {
+            let key = self.new_str("prototype");
+            self.read_member_value(nt, key)
+        } else if self.realm.has_own(nt, "prototype") {
+            Ok(self
+                .realm
+                .get_property(nt, "prototype")
+                .unwrap_or(NanBox::undefined()))
+        } else {
+            self.read_member(nt, "prototype")
+        }
+    }
+
+    /// `GetPrototypeFromConstructor(nt, intrinsicDefaultProto)` proper — reads
+    /// `Get(nt, "prototype")` (propagating a throwing accessor), using it when it is
+    /// an Object, else the intrinsic `default` from `GetFunctionRealm(nt)`'s realm.
+    /// Unlike [`instance_proto_checked`](Self::instance_proto_checked) this has no
+    /// `nt == callee` shortcut, so it also serves the ordinary-function construct
+    /// path (where the callee's *own* reassigned `.prototype` must be observed).
+    pub(crate) fn get_proto_from_constructor(
+        &mut self,
+        nt: Handle,
+        default: Option<Handle>,
+    ) -> Result<Option<Handle>, ExecError> {
         // A class newTarget's prototype is a synthesized (non-accessor) object.
         if let Some((class_id, _)) = self.realm.class_at(nt) {
             return Ok(Some(self.class_prototype_by_id(class_id)));
         }
-        // `Get(newTarget, "prototype")`: invoke an own accessor (propagating an
-        // abrupt getter); read an own *data* `prototype` override straight; else
-        // `read_member` yields a function's intrinsic `.prototype`.
-        let proto = if self.realm.accessor(nt, "prototype").is_some() {
-            let key = self.new_str("prototype");
-            self.read_member_value(nt, key)?
-        } else if self.realm.has_own(nt, "prototype") {
-            self.realm
-                .get_property(nt, "prototype")
-                .unwrap_or(NanBox::undefined())
-        } else {
-            self.read_member(nt, "prototype")?
-        };
+        let proto = self.read_constructor_prototype(nt)?;
         if self.is_object_value(proto) {
             Ok(proto.as_handle().map(Handle::from_raw))
         } else {
@@ -2042,7 +2061,48 @@ impl<'a> Interp<'a> {
         callee: NanBox,
     ) -> Result<Option<Handle>, ExecError> {
         let default = self.realm.intl_prototype(ctor_id);
-        self.instance_proto_checked(native_new_target, callee, default)
+        if native_new_target.as_handle().is_none()
+            || native_new_target.as_handle() == callee.as_handle()
+        {
+            return Ok(default);
+        }
+        let Some(nt) = native_new_target.as_handle().map(Handle::from_raw) else {
+            return Ok(default);
+        };
+        // A class newTarget's prototype is a synthesized (non-accessor) object.
+        if let Some((class_id, _)) = self.realm.class_at(nt) {
+            return Ok(Some(self.class_prototype_by_id(class_id)));
+        }
+        let proto = self.read_constructor_prototype(nt)?;
+        if self.is_object_value(proto) {
+            return Ok(proto.as_handle().map(Handle::from_raw));
+        }
+        // Non-object `.prototype` → the `%Intl.<ctor>.prototype%` intrinsic of
+        // `GetFunctionRealm(newTarget)`'s realm. The generic `realm_default_proto`
+        // cannot resolve these (an `Intl` service constructor is nested under the
+        // `Intl` namespace, not a bare global), so consult the target realm's own
+        // captured Intl prototype cache directly.
+        Ok(self.realm_intl_default_proto(ctor_id, default, nt))
+    }
+
+    /// `GetPrototypeFromConstructor` step 4 specialized for `Intl` services: the
+    /// intrinsic `%Intl.<ctor_id>.prototype%` belonging to `GetFunctionRealm(nt)`'s
+    /// realm. Returns the current realm's `default` for a main-realm (or
+    /// unresolved) `newTarget`, so same-realm construction is never perturbed.
+    fn realm_intl_default_proto(
+        &self,
+        ctor_id: u16,
+        default: Option<Handle>,
+        nt: Handle,
+    ) -> Option<Handle> {
+        match self.get_function_realm(nt) {
+            Some(i) if i < self.created_realms.len() => self.created_realms[i]
+                .intl_protos
+                .get(&ctor_id)
+                .copied()
+                .or(default),
+            _ => default,
+        }
     }
 
     /// `GetFunctionRealm(func)` — the index (into `created_realms`) of the
@@ -2121,6 +2181,33 @@ impl<'a> Interp<'a> {
             .and_then(|p| p.as_handle())
             .map(Handle::from_raw);
         other.or(default)
+    }
+
+    /// `GetPrototypeFromConstructor` step 4 for an intrinsic whose constructor is
+    /// bound at a known global `name` (e.g. `"Iterator"`): the `<name>.prototype`
+    /// object of `GetFunctionRealm(nt)`'s realm. Unlike
+    /// [`realm_default_proto`](Self::realm_default_proto) it does not read
+    /// `default.constructor.name` (which fails when `constructor` is an *accessor*,
+    /// as on `%Iterator.prototype%`) — the caller supplies the name directly.
+    /// Returns `default` for a main-realm (or unresolved) `nt`.
+    fn realm_named_proto(&self, name: &str, default: Option<Handle>, nt: Handle) -> Option<Handle> {
+        let Some(idx) = self.get_function_realm(nt) else {
+            return default;
+        };
+        if idx >= self.created_realms.len() {
+            return default;
+        }
+        self.created_realms[idx]
+            .global_this
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|g| self.realm.get_property(g, name))
+            .and_then(|c| c.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|ctor| self.realm.get_property(ctor, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+            .or(default)
     }
 
     /// The intrinsic `.prototype` object handle for a constructor bound at the
@@ -2272,17 +2359,25 @@ impl<'a> Interp<'a> {
             // construction inside the `prototype` getter (e.g. `throw new Err()`)
             // does not re-observe this construction's newTarget and recurse.
             let new_target = self.reflect_new_target.take().unwrap_or(callee);
-            let default_proto = self.realm.function_prototype(func_id);
-            let proto = if new_target.as_handle() != callee.as_handle() {
-                // GetPrototypeFromConstructor(newTarget, default): `Get(nt,
-                // "prototype")` when it is an Object (so a native-constructor,
-                // class, or proxy newTarget supplies its own prototype), else
-                // the callee's default.
-                self.instance_proto_checked(new_target, callee, Some(default_proto))?
-                    .unwrap_or(default_proto)
-            } else {
-                default_proto
-            };
+            // GetPrototypeFromConstructor(newTarget, %Object.prototype%): the
+            // intrinsic default proto for an ordinary function's `[[Construct]]` is
+            // always `%Object.prototype%` (spec 10.2.2 / 27.7.5 OrdinaryCallEvaluate
+            // → OrdinaryCreateFromConstructor). `get_proto_from_constructor` reads
+            // `Get(newTarget, "prototype")` directly and uses it when it is an
+            // Object; when it is not (a `.prototype` reassigned to `null`/a
+            // primitive, even for a plain `new C()`), it falls back to
+            // `%Object.prototype%` — of newTarget's *own realm* for a cross-realm
+            // newTarget (e.g. `Reflect.construct(fn, [], otherRealmCtor)` or
+            // `Construct(C)` where `C` is another realm's function).
+            let obj_default = self.realm.default_object_proto();
+            let fallback = obj_default.unwrap_or_else(|| self.realm.function_prototype(func_id));
+            let nt_handle = new_target
+                .as_handle()
+                .map(Handle::from_raw)
+                .unwrap_or(handle);
+            let proto = self
+                .get_proto_from_constructor(nt_handle, obj_default)?
+                .unwrap_or(fallback);
             let instance = self.realm.new_object_with_proto(Some(proto));
             let this = NanBox::handle(instance.to_raw());
             // Record the constructor for `instanceof` (hidden, GC-traced slot).
@@ -3517,6 +3612,41 @@ impl<'a> Interp<'a> {
                 native_new_target,
                 callee,
             );
+        }
+        // The abstract `Iterator` constructor (27.1.3.1): a TypeError when
+        // constructed directly (`new Iterator()` — `newTarget` is `%Iterator%`
+        // itself), otherwise `OrdinaryCreateFromConstructor(newTarget,
+        // "%Iterator.prototype%")`. A subclass (`class X extends Iterator {}`) or a
+        // cross-realm `Reflect.construct(Iterator, [], otherRealmCtor)` derives its
+        // own realm's `%Iterator.prototype%` (GetPrototypeFromConstructor step 4,
+        // resolved by name against `newTarget`'s realm).
+        if id == N_ITERATOR {
+            if native_new_target.as_handle() == callee.as_handle() {
+                let m = self.new_str("Abstract class Iterator not directly constructable");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            let default = self.intrinsic_proto("Iterator");
+            let nt = native_new_target
+                .as_handle()
+                .map(Handle::from_raw)
+                .unwrap_or(handle);
+            // GetPrototypeFromConstructor(newTarget, "%Iterator.prototype%"): use an
+            // object `newTarget.prototype`, else the `%Iterator.prototype%` of
+            // `newTarget`'s realm. `%Iterator.prototype%.constructor` is an accessor,
+            // so `realm_default_proto`'s name-via-`constructor` lookup cannot resolve
+            // it — resolve by the known global name "Iterator" directly.
+            let proto = if let Some((class_id, _)) = self.realm.class_at(nt) {
+                Some(self.class_prototype_by_id(class_id))
+            } else {
+                let p = self.read_constructor_prototype(nt)?;
+                if self.is_object_value(p) {
+                    p.as_handle().map(Handle::from_raw)
+                } else {
+                    self.realm_named_proto("Iterator", default, nt)
+                }
+            };
+            let obj = self.realm.new_object_with_proto(proto.or(default));
+            return Ok(NanBox::handle(obj.to_raw()));
         }
         // `WeakMap`/`WeakSet` reuse the collection cell (no true weak refs here).
         let is_set = match id {

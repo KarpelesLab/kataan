@@ -9752,6 +9752,121 @@ fn same_realm_array_species_still_honored() {
     );
 }
 
+#[test]
+fn ordinary_construct_null_prototype_falls_back_to_object_prototype() {
+    // GetPrototypeFromConstructor: `new C()` where `C.prototype` was reassigned to
+    // a non-object (`null`) links the instance to `%Object.prototype%`, not the
+    // stale intrinsic `.prototype` object.
+    assert_eq!(
+        run(r#"
+            function C(){}
+            C.prototype = null;
+            Object.getPrototypeOf(new C()) === Object.prototype
+        "#),
+        "true"
+    );
+    // A reassigned *object* `.prototype` is still honored.
+    assert_eq!(
+        run(r#"
+            var p = {};
+            function D(){}
+            D.prototype = p;
+            Object.getPrototypeOf(new D()) === p
+        "#),
+        "true"
+    );
+    // A normal function's instance still inherits the function's own `.prototype`.
+    assert_eq!(
+        run(r#"
+            function E(){}
+            Object.getPrototypeOf(new E()) === E.prototype
+        "#),
+        "true"
+    );
+}
+
+#[test]
+fn ordinary_construct_cross_realm_derives_new_targets_object_prototype() {
+    // `Construct(C)` / `Reflect.construct(fn, [], C)` where `C` belongs to another
+    // realm and has a non-object `.prototype` links the result to *that realm's*
+    // `%Object.prototype%` (GetPrototypeFromConstructor step 4).
+    assert_eq!(
+        run(r#"
+            var other = $262_createRealm().global;
+            var C = new other.Function();
+            C.prototype = null;
+            var a = Array.of.call(C, 1, 2, 3);
+            var b = Array.from.call(C, []);
+            var d = Reflect.construct(function(){}, [], C);
+            (Object.getPrototypeOf(a) === other.Object.prototype) &&
+            (Object.getPrototypeOf(b) === other.Object.prototype) &&
+            (Object.getPrototypeOf(d) === other.Object.prototype)
+        "#),
+        "true"
+    );
+}
+
+#[test]
+fn iterator_abstract_construct_and_cross_realm_proto() {
+    // `new Iterator()` (newTarget is `%Iterator%` itself) is a TypeError.
+    assert_eq!(
+        run(r#"
+            var threw = false;
+            try { new Iterator(); } catch (e) { threw = (e instanceof TypeError); }
+            threw
+        "#),
+        "true"
+    );
+    // `Reflect.construct(Iterator, [], newTarget)` with a cross-realm `newTarget`
+    // whose `.prototype` is not an object derives that realm's `%Iterator.prototype%`
+    // (resolved by name, since `%Iterator.prototype%.constructor` is an accessor).
+    assert_eq!(
+        run(r#"
+            var other = $262_createRealm().global;
+            var nt = new other.Function();
+            nt.prototype = undefined;
+            var ai = Reflect.construct(Iterator, [1], nt);
+            var np = Reflect.construct(Iterator, [1], (function(){ var f = new other.Function(); f.prototype = null; return f; })());
+            (Object.getPrototypeOf(ai) === other.Iterator.prototype) &&
+            (Object.getPrototypeOf(np) === other.Iterator.prototype)
+        "#),
+        "true"
+    );
+    // An object `.prototype` on the newTarget is used directly.
+    assert_eq!(
+        run(r#"
+            var other = $262_createRealm().global;
+            var nt = new other.Function();
+            var op = {};
+            nt.prototype = op;
+            Object.getPrototypeOf(Reflect.construct(Iterator, [1], nt)) === op
+        "#),
+        "true"
+    );
+}
+
+#[cfg(feature = "intl")]
+#[test]
+fn intl_cross_realm_derives_new_targets_service_prototype() {
+    // Each `$262.createRealm()` realm builds its own distinct `%Intl.X.prototype%`
+    // intrinsics (the cache is swapped per realm), and a cross-realm `newTarget`
+    // with a non-object `.prototype` derives that realm's service prototype.
+    assert_eq!(
+        run(r#"
+            var other = $262_createRealm().global;
+            var nt = new other.Function();
+            nt.prototype = undefined;
+            var nf = Reflect.construct(Intl.NumberFormat, [], nt);
+            var loc = Reflect.construct(Intl.Locale, ['en'], nt);
+            (typeof other.Intl.NumberFormat.prototype === 'object') &&
+            (Object.getPrototypeOf(nf) === other.Intl.NumberFormat.prototype) &&
+            (Object.getPrototypeOf(loc) === other.Intl.Locale.prototype) &&
+            (Object.getPrototypeOf(new Intl.NumberFormat()) === Intl.NumberFormat.prototype)
+        "#),
+        "true"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Regression tests for the contained Test262 fixes in this change set.
 // ---------------------------------------------------------------------------

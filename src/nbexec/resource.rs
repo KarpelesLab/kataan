@@ -410,10 +410,19 @@ impl<'a> Interp<'a> {
         self.this_val = NanBox::undefined();
         self.new_target = NanBox::undefined();
         self.strict = false;
+        // The `Intl` service `.prototype` cache is keyed by ctor id, so it cannot
+        // hold two realms' prototypes at once — clear it (stashing the active realm's)
+        // so the child's `install_intl_prototypes` builds and wires its own distinct
+        // `%Intl.X.prototype%` objects onto the child's constructors rather than
+        // short-circuiting on the parent realm's cached entries.
+        let saved_intl_protos = self.realm.take_intl_protos();
         self.install_globals();
         let new_global_this = self.global_this;
         let new_global_scope = self.global_scope.clone();
         let new_intrinsics = self.realm.intrinsics_snapshot();
+        // Capture the child's freshly-built Intl prototypes, then restore the active
+        // realm's cache so its own `Intl.X.prototype` reads stay correct.
+        let new_intl_protos = self.realm.replace_intl_protos(saved_intl_protos);
 
         // Restore the active realm's environment — including its intrinsic
         // prototype pointers, so `[]`/`{}` literals created afterward in the
@@ -432,6 +441,7 @@ impl<'a> Interp<'a> {
             global_scope: new_global_scope,
             global_this: new_global_this,
             intrinsics: new_intrinsics,
+            intl_protos: new_intl_protos,
         });
         // `GetFunctionRealm` tagging: every callable reachable from this realm's
         // global (its `Object`/`Function`/`Array`/… constructors AND their
@@ -627,10 +637,16 @@ impl<'a> Interp<'a> {
         self.this_val = global_this;
         self.new_target = NanBox::undefined();
         self.realm.restore_intrinsics(intrinsics);
+        // Swap in the child realm's `Intl` service `.prototype` cache so same-realm
+        // `new Intl.X()` inside the evaluated source links to *this* realm's
+        // prototypes (and any lazily-built ones are written back below).
+        let child_intl = core::mem::take(&mut self.created_realms[idx].intl_protos);
+        let saved_intl = self.realm.replace_intl_protos(child_intl);
         self.eval_depth += 1;
         let result = self.run_eval_body(program);
         self.eval_depth -= 1;
 
+        self.created_realms[idx].intl_protos = self.realm.replace_intl_protos(saved_intl);
         self.current = saved_current;
         self.global_scope = saved_global_scope;
         self.var_scope = saved_var_scope;
