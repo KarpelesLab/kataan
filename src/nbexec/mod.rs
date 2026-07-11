@@ -4035,6 +4035,11 @@ impl<'a> Interp<'a> {
                 .set_property(intl, name, NanBox::handle(f.to_raw()));
             self.realm.mark_hidden(intl, name);
         }
+        // ECMA-402: the `Intl` namespace object is an ordinary object whose
+        // [[Prototype]] is %Object.prototype% and which carries an own
+        // `[Symbol.toStringTag]` of `"Intl"`. Both are installed later (with the
+        // other namespace objects, once `Object.prototype` exists) — see the
+        // `Reflect`/`JSON`/`Math` fix-up loop.
         self.current.declare("Intl", NanBox::handle(intl.to_raw()));
         // The typed-array constructors.
         for (i, (name, _)) in TYPED_ARRAY_KINDS.iter().enumerate() {
@@ -4893,6 +4898,7 @@ impl<'a> Interp<'a> {
             ("JSON", "JSON"),
             ("Math", "Math"),
             ("Atomics", "Atomics"),
+            ("Intl", "Intl"),
         ] {
             if let Some(ns) = self
                 .current

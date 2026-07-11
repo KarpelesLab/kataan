@@ -274,11 +274,63 @@ fn is_well_formed_unit(unit: &str) -> bool {
 /// singleton (`x` private-use last); `-u-`/`-t-` keyword/field groups sorted by
 /// key in ASCII order. Not performed (needs CLDR data the crate omits): legacy
 /// language/region alias replacement, `-u-` type alias mapping (e.g. `yes`→`true`).
+/// UTS-35 §3.3.1 "regular" grandfathered tag → canonical replacement, matched
+/// on the lowercased language(-variant) base. This is the fixed set of regular
+/// grandfathered tags that remain structurally valid Unicode BCP-47 locale ids
+/// (their preferred replacement changes the primary language subtag).
+fn grandfathered_canonical(base: &str) -> Option<&'static str> {
+    Some(match base {
+        "art-lojban" => "jbo",
+        "cel-gaulish" => "xtg",
+        "zh-guoyu" => "zh",
+        "zh-hakka" => "hak",
+        "zh-xiang" => "hsn",
+        _ => return None,
+    })
+}
+
+/// CLDR `bcp47` Unicode-extension type-value alias → canonical value, for the
+/// `(key, value)` pairs ECMA-402 exercises. Deprecated type values (e.g.
+/// `ca-islamicc`, `ks-primary`, `ms-imperial`) canonicalize to their preferred
+/// forms. `value` is the full (hyphen-joined) type. Returns `None` when the pair
+/// has no alias.
+pub(crate) fn unicode_type_alias(key: &str, value: &str) -> Option<&'static str> {
+    Some(match (key, value) {
+        // -u-ca- (calendar)
+        ("ca", "ethiopic-amete-alem") => "ethioaa",
+        ("ca", "islamicc") => "islamic-civil",
+        // -u-ks- (collation strength)
+        ("ks", "primary") => "level1",
+        ("ks", "tertiary") => "level3",
+        // -u-ms- (measurement system)
+        ("ms", "imperial") => "uksystem",
+        _ => return None,
+    })
+}
+
 pub(crate) fn canonicalize_locale_id(tag: &str) -> Option<String> {
     // Structurally rejected outright: empty, non-ASCII, `_` separators, and the
     // empty subtags produced by leading/trailing/doubled `-`.
     if tag.is_empty() || !tag.is_ascii() || tag.contains('_') {
         return None;
+    }
+    // UTS-35 §3.3.1 "regular" grandfathered tags: the language(-variant) base is
+    // replaced by its canonical form (the irregular `i-*`/`sgn-*`/`en-gb-oed`
+    // grandfathered forms are structurally invalid and rejected by the grammar
+    // below). Extensions, if any, are preserved; the substituted tag is then
+    // canonicalized normally.
+    {
+        let lower = tag.to_ascii_lowercase();
+        let subs: Vec<&str> = lower.split('-').collect();
+        let base_end = subs.iter().position(|p| p.len() == 1).unwrap_or(subs.len());
+        if let Some(repl) = grandfathered_canonical(&subs[..base_end].join("-")) {
+            let mut rebuilt = String::from(repl);
+            for p in &subs[base_end..] {
+                rebuilt.push('-');
+                rebuilt.push_str(p);
+            }
+            return canonicalize_locale_id(&rebuilt);
+        }
     }
     let parts: Vec<&str> = tag.split('-').collect();
     if parts.iter().any(|p| p.is_empty()) {
@@ -526,6 +578,13 @@ fn canonicalize_extension(singleton: char, subs: &[String]) -> Option<String> {
                 vals.push(subs[i].clone());
                 i += 1;
             }
+            // CLDR bcp47 type-value aliases (calendar/collation-strength/
+            // measurement): a deprecated value canonicalizes to its preferred
+            // form (`ca-islamicc` → `ca-islamic-civil`, `ks-primary` → `ks-level1`,
+            // `ms-imperial` → `ms-uksystem`, …).
+            if let Some(canon) = unicode_type_alias(&key, &vals.join("-")) {
+                vals = canon.split('-').map(String::from).collect();
+            }
             // CLDR bcp47 type alias: for the boolean collation keys
             // kb/kc/kh/kk/kn the type "yes" is an alias of "true"
             // (`<type name="true" alias="yes"/>`). Other keys (ka/kf/kr/ks/kv)
@@ -540,7 +599,11 @@ fn canonicalize_extension(singleton: char, subs: &[String]) -> Option<String> {
             if vals.len() == 1 && vals[0] == "true" {
                 vals.clear();
             }
-            keywords.push((key, vals));
+            // UTS-35 canonicalization: a repeated key keeps its *first* occurrence
+            // and discards the rest (`da-u-ca-gregory-ca-buddhist` → `da-u-ca-gregory`).
+            if !keywords.iter().any(|(k, _)| k == &key) {
+                keywords.push((key, vals));
+            }
         }
         keywords.sort_by(|a, b| a.0.cmp(&b.0));
         let mut body = String::from("u");
@@ -726,6 +789,7 @@ const LOCALE_ACCESSORS: &[&str] = &[
     "numeric",
     "region",
     "script",
+    "variants",
 ];
 
 /// The arity (`length`) of a branded `Intl` prototype data method, given its
@@ -3955,6 +4019,16 @@ impl<'a> Interp<'a> {
             push_tag(self, &s, &mut seen)?;
             return Ok(seen);
         }
+        // A `Locale` object (has `[[InitializedLocale]]`) is likewise a single-
+        // element list contributing its already-canonical `[[Locale]]` tag — read
+        // directly (never via `toString`, which a subclass may override).
+        if let Some(h) = locales.as_handle().map(Handle::from_raw)
+            && self.realm.get_property(h, "\u{0}brand_loc").is_some()
+            && let Some(loc) = self.realm.get_property(h, "\u{0}locale_tag")
+        {
+            seen.push(self.realm.to_display_string(loc));
+            return Ok(seen);
+        }
         // ToObject(null) is a TypeError (undefined was handled above).
         if matches!(locales.unpack(), Unpacked::Null) {
             let m = self.new_str("Cannot convert null to object");
@@ -3977,8 +4051,9 @@ impl<'a> Interp<'a> {
         };
         for i in 0..len {
             let key = alloc::format!("{i}");
-            // HasProperty check: skip absent indices (sparse array-likes).
-            if !self.has_property(oh, &key) {
+            // HasProperty check: skip absent indices (sparse array-likes). Uses the
+            // proxy-aware `[[HasProperty]]` so a `has` trap runs (and may throw).
+            if !self.has_property_proxied(oh, &key)? {
                 continue;
             }
             let el = self.read_member(oh, &key)?;
@@ -4184,13 +4259,20 @@ impl<'a> Interp<'a> {
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         };
         // Read the option overrides (each validated like the formatter options).
-        let opts = args
-            .get(1)
-            .copied()
-            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
-            .map(|v| self.coerce_to_object(v))
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw);
+        // `ApplyOptionsToTag` does `ToObject(options)`: `undefined` yields no
+        // overrides, `null` is a **TypeError**, and any other primitive boxes.
+        let opts_arg = args.get(1).copied().unwrap_or(NanBox::undefined());
+        let opts = match opts_arg.unpack() {
+            Unpacked::Undefined => None,
+            Unpacked::Null => {
+                let m = self.new_str("Intl.Locale options must not be null");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            _ => self
+                .coerce_to_object(opts_arg)
+                .as_handle()
+                .map(Handle::from_raw),
+        };
         let language = self.get_string_option(opts, "language", &[], None)?;
         let script = self.get_string_option(opts, "script", &[], None)?;
         let region = self.get_string_option(opts, "region", &[], None)?;
@@ -4287,7 +4369,9 @@ impl<'a> Interp<'a> {
             parsed.variants = vs;
         }
         if let Some(c) = &calendar {
-            parsed.set_keyword("ca", c);
+            // A deprecated calendar value passed via the `calendar` option is
+            // canonicalized like the `-u-ca-` type (`islamicc` → `islamic-civil`).
+            parsed.set_keyword("ca", unicode_type_alias("ca", c).unwrap_or(c));
         }
         if let Some(c) = &collation {
             parsed.set_keyword("co", c);
@@ -4307,6 +4391,14 @@ impl<'a> Interp<'a> {
         if let Some(fw) = &first_day {
             parsed.set_keyword("fw", fw);
         }
+        // Applying the options may turn the base into a regular grandfathered
+        // form (`cel` + variant `gaulish` → `cel-gaulish` → `xtg`); re-canonicalize
+        // and re-derive the components so the accessors reflect the replacement.
+        if grandfathered_canonical(&parsed.base_name()).is_some()
+            && let Some(canon) = canonicalize_locale_id(&parsed.to_tag())
+        {
+            parsed = ParsedLocale::from_canonical(&canon);
+        }
         let final_tag = parsed.to_tag();
         let tagv = self.new_str(&final_tag);
         self.realm.set_hidden_property(obj, "\u{0}locale_tag", tagv);
@@ -4320,6 +4412,11 @@ impl<'a> Interp<'a> {
         store(self, "\u{0}loc_language", Some(&parsed.language));
         store(self, "\u{0}loc_script", parsed.script.as_deref());
         store(self, "\u{0}loc_region", parsed.region.as_deref());
+        // `variants`: the `-`-joined variant subtags (already lowercased + sorted
+        // by `from_canonical`), or `undefined` when the base name has none.
+        if !parsed.variants.is_empty() {
+            store(self, "\u{0}loc_variants", Some(&parsed.variants.join("-")));
+        }
         store(self, "\u{0}loc_baseName", Some(&parsed.base_name()));
         store(self, "\u{0}loc_ca", parsed.keyword("ca"));
         store(self, "\u{0}loc_co", parsed.keyword("co"));
@@ -4358,6 +4455,7 @@ impl<'a> Interp<'a> {
             "language" => read(self, "\u{0}loc_language"),
             "script" => read(self, "\u{0}loc_script"),
             "region" => read(self, "\u{0}loc_region"),
+            "variants" => read(self, "\u{0}loc_variants"),
             "baseName" => read(self, "\u{0}loc_baseName"),
             "calendar" => read(self, "\u{0}loc_ca"),
             "collation" => read(self, "\u{0}loc_co"),
@@ -4454,7 +4552,37 @@ impl<'a> Interp<'a> {
                     .set_property(obj, "weekend", NanBox::handle(weekend.to_raw()));
                 Ok(NanBox::handle(obj.to_raw()))
             }
-            // maximize/minimize: rebuild a Locale from the (unchanged) tag.
+            // maximize/minimize: apply the CLDR likely-subtags data (Add/Remove
+            // Likely Subtags, UTS-35) to the base name, preserving the `-u-`
+            // keywords and other extensions. ECMA-402 `minimize` is defined as
+            // "maximize, then remove", so it runs on the maximized locale.
+            "maximize" | "minimize" => {
+                #[allow(unused_mut)]
+                let mut pl = ParsedLocale::from_canonical(&tag);
+                #[cfg(feature = "intl")]
+                {
+                    let base = pl.base_name();
+                    if let Ok(loc) = intl::locale::Locale::parse(&base) {
+                        let result = if name == "maximize" {
+                            loc.maximize()
+                        } else {
+                            loc.maximize().minimize()
+                        };
+                        pl.language = if result.language.is_empty() {
+                            String::from("und")
+                        } else {
+                            result.language.clone()
+                        };
+                        pl.script = result.script.clone();
+                        pl.region = result.region.clone();
+                        pl.variants = result.variants.clone();
+                    }
+                }
+                let new_tag = pl.to_tag();
+                let tagv = self.new_str(&new_tag);
+                self.make_locale(&[tagv])
+            }
+            // Any other method name: rebuild a Locale from the (unchanged) tag.
             _ => {
                 let tagv = self.new_str(&tag);
                 self.make_locale(&[tagv])
@@ -5349,6 +5477,9 @@ struct ParsedLocale {
     script: Option<String>,
     region: Option<String>,
     variants: Vec<String>,
+    /// `-u-` leading attributes (keyword-less subtags, e.g. the `attr` in
+    /// `en-u-attr-co-phonebk`), sorted; emitted before the keywords.
+    attributes: Vec<String>,
     /// `-u-` keyword `(key, value)` pairs (value may be empty for `kn`/`true`).
     keywords: Vec<(String, String)>,
     /// Any other extensions (`-t-`, `-x-`, …) preserved verbatim after the `-u-` block.
@@ -5363,6 +5494,7 @@ impl ParsedLocale {
         let mut script = None;
         let mut region = None;
         let mut variants = Vec::new();
+        let mut attributes: Vec<String> = Vec::new();
         let mut keywords = Vec::new();
         let mut other_ext = Vec::new();
         let parts: Vec<&str> = canon.split('-').collect();
@@ -5400,7 +5532,9 @@ impl ParsedLocale {
                 // 2-char key, then read each key's run of non-key value subtags.
                 while i < parts.len() && parts[i].len() != 1 {
                     if parts[i].len() != 2 {
-                        // An attribute (no key) — preserve as a bare keyword-less subtag.
+                        // An attribute (no key) — a keyword-less subtag preserved
+                        // before the keywords (`en-u-attr-co-phonebk`).
+                        attributes.push(String::from(parts[i]));
                         i += 1;
                         continue;
                     }
@@ -5414,21 +5548,26 @@ impl ParsedLocale {
                     keywords.push((key, vals.join("-")));
                 }
             } else {
-                // Preserve other extensions verbatim.
+                // Preserve other extensions verbatim. Private use (`x`) consumes
+                // *all* remaining subtags, including length-1 ones (so `x-u-foo`
+                // is one private sequence, not the start of a `-u-` extension).
+                let private = singleton == "x";
                 let mut buf = alloc::vec![String::from(singleton)];
                 i += 1;
-                while i < parts.len() && parts[i].len() != 1 {
+                while i < parts.len() && (private || parts[i].len() != 1) {
                     buf.push(String::from(parts[i]));
                     i += 1;
                 }
                 other_ext.push(buf.join("-"));
             }
         }
+        attributes.sort();
         ParsedLocale {
             language,
             script,
             region,
             variants,
+            attributes,
             keywords,
             other_ext,
         }
@@ -5471,24 +5610,37 @@ impl ParsedLocale {
         out
     }
 
-    /// Rebuilds the full canonical tag (base name + sorted `-u-` keywords + other
-    /// extensions).
+    /// Rebuilds the full canonical tag: base name followed by every extension
+    /// ordered by its singleton (`-a-`/`-t-`/`-u-`/… ascending, private use `-x-`
+    /// last), with the `-u-` attributes and keywords each sorted.
     fn to_tag(&self) -> String {
         let mut out = self.base_name();
+        // The `-u-` block, assembled from its (sorted) attributes and keywords.
         let mut kw = self.keywords.clone();
         kw.sort_by(|a, b| a.0.cmp(&b.0));
-        if !kw.is_empty() {
-            out.push_str("-u");
+        let mut exts: Vec<String> = self.other_ext.clone();
+        if !kw.is_empty() || !self.attributes.is_empty() {
+            let mut u = String::from("u");
+            for a in &self.attributes {
+                u.push('-');
+                u.push_str(a);
+            }
             for (k, v) in &kw {
-                out.push('-');
-                out.push_str(k);
+                u.push('-');
+                u.push_str(k);
                 if !v.is_empty() && v != "true" {
-                    out.push('-');
-                    out.push_str(v);
+                    u.push('-');
+                    u.push_str(v);
                 }
             }
+            exts.push(u);
         }
-        for e in &self.other_ext {
+        // Extensions sort by their leading singleton, with private use (`x`) last.
+        exts.sort_by_key(|e| {
+            let s = e.as_bytes().first().copied().unwrap_or(b'~');
+            (s == b'x', s)
+        });
+        for e in &exts {
             out.push('-');
             out.push_str(e);
         }

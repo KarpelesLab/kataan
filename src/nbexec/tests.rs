@@ -561,6 +561,176 @@ fn intl_locale_compare_options() {
     );
 }
 
+/// The `Intl` namespace object is an ordinary object: its `[[Prototype]]` is
+/// `%Object.prototype%` and it carries an own `[Symbol.toStringTag]` of `"Intl"`.
+#[test]
+fn intl_namespace_prototype_and_tostringtag() {
+    assert_eq!(
+        run("Object.getPrototypeOf(Intl)===Object.prototype"),
+        "true"
+    );
+    assert_eq!(run("Object.prototype.toString.call(Intl)"), "[object Intl]");
+    assert_eq!(run("Intl[Symbol.toStringTag]"), "Intl");
+    assert_eq!(
+        run(
+            "var d=Object.getOwnPropertyDescriptor(Intl,Symbol.toStringTag);\
+             [d.writable,d.enumerable,d.configurable].join(',')"
+        ),
+        "false,false,true"
+    );
+    assert_eq!(run("Object.isExtensible(Intl)"), "true");
+}
+
+/// `Intl.Locale.prototype.variants` returns the base-name variant subtags (joined
+/// by `-`), or `undefined` when there are none; the accessor is named
+/// `"get variants"`.
+#[test]
+fn intl_locale_variants_getter() {
+    assert_eq!(
+        run("new Intl.Locale('en-US-1996-fonipa').variants"),
+        "1996-fonipa"
+    );
+    assert_eq!(run("typeof new Intl.Locale('sv').variants"), "undefined");
+    assert_eq!(
+        run("new Intl.Locale('sl-rozaj-biske-1994').variants"), // sorted
+        "1994-biske-rozaj"
+    );
+    assert_eq!(
+        run("Object.getOwnPropertyDescriptor(Intl.Locale.prototype,'variants').get.name"),
+        "get variants"
+    );
+    // Private-use subtags are preserved; a repeated `-u-` key keeps the first.
+    assert_eq!(
+        run("new Intl.Locale('en-x-u-foo').toString()"),
+        "en-x-u-foo"
+    );
+    assert_eq!(
+        run("new Intl.Locale('da-u-ca-gregory-ca-buddhist').toString()"),
+        "da-u-ca-gregory"
+    );
+}
+
+/// `Intl.Locale.prototype.maximize`/`minimize` apply the CLDR likely-subtags data
+/// (only meaningful with the `intl` crate).
+#[cfg(feature = "intl")]
+#[test]
+fn intl_locale_maximize_minimize() {
+    assert_eq!(
+        run("new Intl.Locale('en').maximize().toString()"),
+        "en-Latn-US"
+    );
+    assert_eq!(
+        run("new Intl.Locale('zh').maximize().toString()"),
+        "zh-Hans-CN"
+    );
+    assert_eq!(run("new Intl.Locale('und').minimize().toString()"), "en");
+    // `Hant` is the likely script for `zh-TW`, so it drops on minimization.
+    assert_eq!(
+        run("new Intl.Locale('zh-Hant-TW').minimize().toString()"),
+        "zh-TW"
+    );
+    assert_eq!(
+        run("new Intl.Locale('en-Latn-US').minimize().toString()"),
+        "en"
+    );
+    // Extensions survive maximization.
+    assert_eq!(
+        run("new Intl.Locale('en-u-ca-gregory').maximize().toString()"),
+        "en-Latn-US-u-ca-gregory"
+    );
+}
+
+/// Regular grandfathered tags and CLDR `bcp47` `-u-` type-value aliases
+/// canonicalize to their preferred forms (both via `getCanonicalLocales` and the
+/// `Intl.Locale` constructor).
+#[test]
+fn intl_grandfathered_and_type_aliases() {
+    // Regular grandfathered tags → canonical.
+    assert_eq!(run("Intl.getCanonicalLocales('art-lojban')[0]"), "jbo");
+    assert_eq!(run("Intl.getCanonicalLocales('cel-gaulish')[0]"), "xtg");
+    assert_eq!(run("Intl.getCanonicalLocales('zh-guoyu')[0]"), "zh");
+    assert_eq!(run("Intl.getCanonicalLocales('zh-xiang')[0]"), "hsn");
+    // Irregular grandfathered forms remain structurally invalid → RangeError.
+    assert_eq!(
+        run("try{Intl.getCanonicalLocales('i-klingon');'no'}catch(e){e.constructor.name}"),
+        "RangeError"
+    );
+    // -u- type-value aliases.
+    assert_eq!(
+        run("Intl.getCanonicalLocales('und-u-ca-ethiopic-amete-alem')[0]"),
+        "und-u-ca-ethioaa"
+    );
+    assert_eq!(
+        run("Intl.getCanonicalLocales('und-u-ca-islamicc')[0]"),
+        "und-u-ca-islamic-civil"
+    );
+    assert_eq!(
+        run("Intl.getCanonicalLocales('und-u-ks-primary')[0]"),
+        "und-u-ks-level1"
+    );
+    assert_eq!(
+        run("Intl.getCanonicalLocales('und-u-ms-imperial')[0]"),
+        "und-u-ms-uksystem"
+    );
+    // The `calendar` option is canonicalized like the `-u-ca-` type.
+    assert_eq!(
+        run("new Intl.Locale('en',{calendar:'islamicc'}).calendar"),
+        "islamic-civil"
+    );
+    assert_eq!(
+        run("new Intl.Locale('en',{calendar:'ethiopic-amete-alem'}).toString()"),
+        "en-u-ca-ethioaa"
+    );
+    // A grandfathered base produced by options (`cel` + variant `gaulish`).
+    assert_eq!(
+        run("new Intl.Locale('cel',{variants:'gaulish'}).baseName"),
+        "xtg"
+    );
+}
+
+/// `-u-` extension leading attributes (keyword-less subtags) are preserved and
+/// sorted; a `Locale` object is a single-element locale list; a `null` options
+/// argument is a TypeError.
+#[test]
+fn intl_locale_attributes_list_and_null_options() {
+    assert_eq!(
+        run("new Intl.Locale('en-u-attr-co-phonebk').toString()"),
+        "en-u-attr-co-phonebk"
+    );
+    assert_eq!(
+        run("new Intl.Locale('pt-u-attr2-attr1-ca-gregory').toString()"),
+        "pt-u-attr1-attr2-ca-gregory"
+    );
+    assert_eq!(
+        run("new Intl.Locale('en-u-baz-a-bar-x-u-foo').toString()"),
+        "en-a-bar-u-baz-x-u-foo"
+    );
+    // A `Locale` value passed to `getCanonicalLocales` is a single-element list.
+    assert_eq!(
+        run("Intl.getCanonicalLocales(new Intl.Locale('ar-EG'))[0]"),
+        "ar-EG"
+    );
+    assert_eq!(
+        run("Intl.getCanonicalLocales(new Intl.Locale('ar-EG')).length"),
+        "1"
+    );
+    // `null` options → TypeError; `undefined` is fine.
+    assert_eq!(
+        run("try{new Intl.Locale('en',null);'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    assert_eq!(run("new Intl.Locale('en',undefined).toString()"), "en");
+    // `CanonicalizeLocaleList` uses proxy-aware `[[HasProperty]]`: a throwing
+    // `has` trap propagates.
+    assert_eq!(
+        run(
+            "var p=new Proxy({0:'en',length:1},{has(){throw new TypeError('h')}});\
+             try{Intl.getCanonicalLocales(p);'no'}catch(e){e.constructor.name}"
+        ),
+        "TypeError"
+    );
+}
+
 /// `Number.prototype.toLocaleString` applies every NumberFormat option.
 #[cfg(feature = "intl")]
 #[test]
