@@ -2011,16 +2011,14 @@ impl<'a> Interp<'a> {
         (epoch_days_to_iso(day), time)
     }
 
-    /// The exact instant whose local wall time is `wall_ns` (single-step
-    /// disambiguation, sufficient for fixed offsets and non-transition instants).
+    /// The exact instant whose local wall time is `wall_ns`, using the default
+    /// (`compatible`) disambiguation across DST gaps/overlaps — shared with the
+    /// `ZonedDateTime` resolver so the two stay consistent (`AddZonedDateTime`).
     fn dur_wall_to_epoch(&self, tz: &str, wall_ns: i128) -> i128 {
         if let Some(ns) = parse_fixed_offset(tz) {
             return wall_ns - ns;
         }
-        let o0 = self.dur_tz_offset_at(tz, wall_ns);
-        let cand = wall_ns - o0;
-        let o1 = self.dur_tz_offset_at(tz, cand);
-        wall_ns - o1
+        super::temporal_zoneddatetime::wall_to_epoch(tz, wall_ns)
     }
 
     /// `Temporal.Duration.prototype.total(unitOrOptions)` — time units only.

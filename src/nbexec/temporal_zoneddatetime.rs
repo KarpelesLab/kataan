@@ -82,6 +82,16 @@ enum OffsetOpt {
     Reject,
 }
 
+/// `disambiguation` option: how to resolve a wall-clock time that maps to zero
+/// (spring-forward gap) or two (fall-back overlap) exact instants.
+#[derive(Clone, Copy, PartialEq)]
+enum Disamb {
+    Compatible,
+    Earlier,
+    Later,
+    Reject,
+}
+
 /// Nanoseconds in one unit (Day..Nanosecond).
 fn unit_ns(u: Unit) -> i128 {
     match u {
@@ -254,6 +264,7 @@ fn resolve_named(s: &str) -> Option<String> {
 }
 
 /// The offset (ns east of UTC) of `tz` at the exact instant `epoch_ns`.
+/// `GetOffsetNanosecondsFor(tz, epoch_ns)`.
 fn tz_offset_at(tz: &str, epoch_ns: i128) -> i128 {
     if let Some((ns, _)) = parse_offset_id(tz) {
         return ns;
@@ -272,17 +283,188 @@ pub(crate) fn local_of(tz: &str, epoch_ns: i128) -> (IsoDate, IsoTime) {
     (epoch_days_to_iso(day), time)
 }
 
-/// `GetEpochNanosecondsFor(tz, wall_ns, "compatible")`: the exact instant whose
-/// local wall time is `wall_ns`. Fixed-offset zones are exact; named zones use the
-/// offset at the candidate instant (a pragmatic single-step disambiguation).
-fn wall_to_epoch(tz: &str, wall_ns: i128) -> i128 {
-    if let Some((ns, _)) = parse_offset_id(tz) {
-        return wall_ns - ns;
+/// `GetPossibleEpochNanoseconds(tz, wall_ns)`: the list (0, 1, or 2 entries, sorted
+/// ascending) of exact instants whose local wall time in `tz` equals `wall_ns`
+/// (treated as an ISO date-time, i.e. a UTC epoch count of the wall clock). Zero
+/// entries = a spring-forward gap; two = a fall-back overlap.
+///
+/// Follows the reference algorithm: probe the zone's offset one day before and one
+/// day after the wall time (which straddles at most one transition), form a
+/// candidate instant for each distinct offset, and keep those whose local time
+/// round-trips back to `wall_ns`.
+fn possible_instants(tz: &str, wall_ns: i128) -> ([i128; 2], usize) {
+    if let Some((off, _)) = parse_offset_id(tz) {
+        return ([wall_ns - off, 0], 1);
     }
-    let o0 = tz_offset_at(tz, wall_ns);
-    let cand = wall_ns - o0;
-    let o1 = tz_offset_at(tz, cand);
-    if o1 == o0 { cand } else { wall_ns - o1 }
+    let Ok(z) = timezone_data::load(tz) else {
+        return ([wall_ns, 0], 1);
+    };
+    let off_at = |epoch: i128| -> i128 {
+        let secs = epoch.div_euclid(iso::NS_PER_SEC) as i64;
+        i128::from(z.lookup(secs).offset) * iso::NS_PER_SEC
+    };
+    let day = iso::NS_PER_DAY;
+    // Clamp the probe points to the representable range (per the spec, so the
+    // ±1-day probe never overflows near the edges).
+    let ns_earlier = if wall_ns - day < iso::MIN_EPOCH_NS - day {
+        wall_ns
+    } else {
+        wall_ns - day
+    };
+    let ns_later = if wall_ns + day > iso::MAX_EPOCH_NS + day {
+        wall_ns
+    } else {
+        wall_ns + day
+    };
+    let off_earlier = off_at(ns_earlier);
+    let off_later = off_at(ns_later);
+
+    let mut out = [0_i128; 2];
+    let mut n = 0_usize;
+    let consider = |off: i128, out: &mut [i128; 2], n: &mut usize| {
+        let epoch = wall_ns - off;
+        // Keep only if the candidate's own local time is exactly `wall_ns`.
+        if epoch + off_at(epoch) == wall_ns && !(*n == 1 && out[0] == epoch) {
+            out[*n] = epoch;
+            *n += 1;
+        }
+    };
+    consider(off_earlier, &mut out, &mut n);
+    if off_later != off_earlier {
+        consider(off_later, &mut out, &mut n);
+    }
+    if n == 2 && out[0] > out[1] {
+        out.swap(0, 1);
+    }
+    (out, n)
+}
+
+/// `DisambiguatePossibleEpochNanoseconds(tz, wall_ns, disambiguation)`: resolves the
+/// wall time to a single exact instant. `Err(())` signals the `reject` conflict
+/// (a gap or an overlap) that the caller turns into a `RangeError`.
+fn disambiguate(tz: &str, wall_ns: i128, d: Disamb) -> Result<i128, ()> {
+    let (poss, n) = possible_instants(tz, wall_ns);
+    if n == 1 {
+        return Ok(poss[0]);
+    }
+    if n == 2 {
+        // Fall-back overlap.
+        return match d {
+            Disamb::Earlier | Disamb::Compatible => Ok(poss[0]),
+            Disamb::Later => Ok(poss[1]),
+            Disamb::Reject => Err(()),
+        };
+    }
+    // n == 0: a spring-forward gap.
+    if d == Disamb::Reject {
+        return Err(());
+    }
+    if let Some((off, _)) = parse_offset_id(tz) {
+        // Fixed-offset zones never have gaps.
+        return Ok(wall_ns - off);
+    }
+    // The size of the gap is (offsetAfter − offsetBefore); shift the wall time by it
+    // and re-resolve into the adjacent interval.
+    let day = iso::NS_PER_DAY;
+    let ns_earlier = if wall_ns - day < iso::MIN_EPOCH_NS - day {
+        wall_ns
+    } else {
+        wall_ns - day
+    };
+    let ns_later = if wall_ns + day > iso::MAX_EPOCH_NS + day {
+        wall_ns
+    } else {
+        wall_ns + day
+    };
+    let off_before = tz_offset_at(tz, ns_earlier);
+    let off_after = tz_offset_at(tz, ns_later);
+    let gap = off_after - off_before;
+    if d == Disamb::Earlier {
+        let (p, m) = possible_instants(tz, wall_ns - gap);
+        Ok(if m > 0 {
+            p[0]
+        } else {
+            wall_ns - gap - off_before
+        })
+    } else {
+        // Compatible or Later: resolve forward into the later interval.
+        let (p, m) = possible_instants(tz, wall_ns + gap);
+        Ok(if m > 0 {
+            p[m - 1]
+        } else {
+            wall_ns + gap - off_after
+        })
+    }
+}
+
+/// The `offset: prefer|reject` reconciliation: scans the possible instants for
+/// `wall_ns` and returns the one whose implied offset matches `off`. Under
+/// `MATCH_MINUTES` (a minute-precision source offset string) an instant whose
+/// offset rounds to the same minute matches; otherwise (`MATCH_EXACTLY`) the
+/// offset must be identical to the nanosecond.
+fn offset_match(tz: &str, wall_ns: i128, off: i128, match_minutes: bool) -> Option<i128> {
+    let (poss, n) = possible_instants(tz, wall_ns);
+    for &epoch in poss.iter().take(n) {
+        let candidate_offset = wall_ns - epoch;
+        if candidate_offset == off {
+            return Some(epoch);
+        }
+        if match_minutes
+            && round_signed(candidate_offset, iso::NS_PER_MINUTE, RoundMode::HalfExpand) == off
+        {
+            return Some(epoch);
+        }
+    }
+    None
+}
+
+/// `GetEpochNanosecondsFor(tz, wall_ns, "compatible")`: the exact instant whose local
+/// wall time is `wall_ns`, using the default (compatible) disambiguation, which never
+/// conflicts. Also serves as `GetStartOfDay` when `wall_ns` is a midnight.
+pub(crate) fn wall_to_epoch(tz: &str, wall_ns: i128) -> i128 {
+    disambiguate(tz, wall_ns, Disamb::Compatible)
+        .unwrap_or_else(|()| wall_ns - tz_offset_at(tz, wall_ns))
+}
+
+/// `GetNamedTimeZoneNextTransition`: the first offset transition strictly after
+/// `epoch_ns` (in ns), combining the stored transition table with the POSIX
+/// extend rule (so future transitions past the stored range are found). `None`
+/// once the zone has no further transitions (e.g. a fixed zone with no DST rule).
+fn zone_next_transition(zone: &timezone_data::Zone<'_>, epoch_ns: i128) -> Option<i128> {
+    let secs = epoch_ns.div_euclid(iso::NS_PER_SEC) as i64;
+    let max_secs = (iso::MAX_EPOCH_NS / iso::NS_PER_SEC) as i64;
+    // `transitions_for_range` yields stored + POSIX-generated transitions in
+    // chronological order; the first one strictly after the instant is the answer.
+    zone.transitions_for_range(secs, max_secs)
+        .map(|t| i128::from(t.when) * iso::NS_PER_SEC)
+        .find(|&w| w > epoch_ns)
+}
+
+/// `GetNamedTimeZonePreviousTransition`: the last offset transition strictly before
+/// `epoch_ns` (in ns). Stored transitions cover history; any POSIX-generated one is
+/// at most ~1 year back, so a bounded look-back window suffices past the stored range.
+fn zone_prev_transition(zone: &timezone_data::Zone<'_>, epoch_ns: i128) -> Option<i128> {
+    let secs = epoch_ns.div_euclid(iso::NS_PER_SEC) as i64;
+    let mut best: Option<i128> = zone
+        .transitions()
+        .map(|t| i128::from(t.when) * iso::NS_PER_SEC)
+        .filter(|&w| w < epoch_ns)
+        .max();
+    let last_stored = zone
+        .transitions()
+        .last()
+        .map(|t| t.when)
+        .unwrap_or(i64::MIN);
+    if secs > last_stored {
+        let start = (secs - 800 * 86_400).max(last_stored.saturating_add(1));
+        for t in zone.transitions_for_range(start, secs.saturating_add(2)) {
+            let w = i128::from(t.when) * iso::NS_PER_SEC;
+            if w < epoch_ns {
+                best = Some(best.map_or(w, |b| b.max(w)));
+            }
+        }
+    }
+    best
 }
 
 /// Formats an offset (ns east of UTC) as `±HH:MM` (or `±HH:MM:SS[.fff]`).
@@ -631,7 +813,10 @@ impl<'a> Interp<'a> {
 
     /// Reads an `offset` property-bag field: `ToPrimitive(string)` must yield a
     /// String (else TypeError); bad offset syntax → RangeError.
-    fn zdt_read_offset_field(&mut self, v: NanBox) -> Result<i128, ExecError> {
+    /// Reads an `offset` field string → `(offset_ns, has_seconds)`. `has_seconds`
+    /// is set when the source string carried sub-minute (seconds) precision, which
+    /// forces `MATCH_EXACTLY` rather than minute-rounded matching.
+    fn zdt_read_offset_field(&mut self, v: NanBox) -> Result<(i128, bool), ExecError> {
         let prim = self.coerce_primitive(v, "string")?;
         let Some(s) = prim
             .as_handle()
@@ -640,7 +825,8 @@ impl<'a> Interp<'a> {
         else {
             return Err(self.type_error("offset must be a string"));
         };
-        parse_offset_value(&s).ok_or_else(|| self.zdt_range("invalid offset string"))
+        let off = parse_offset_value(&s).ok_or_else(|| self.zdt_range("invalid offset string"))?;
+        Ok((off, offset_str_has_seconds(&s)))
     }
 
     /// A `Temporal.ZonedDateTime.prototype.<getter>` read.
@@ -935,13 +1121,30 @@ impl<'a> Interp<'a> {
         )
     }
 
-    fn zdt_disambiguation(&mut self, opts: Option<Handle>) -> Result<(), ExecError> {
-        self.zdt_str_option(
-            opts,
-            "disambiguation",
-            &["compatible", "earlier", "later", "reject"],
-        )?;
-        Ok(())
+    fn zdt_disambiguation(&mut self, opts: Option<Handle>) -> Result<Disamb, ExecError> {
+        Ok(
+            match self
+                .zdt_str_option(
+                    opts,
+                    "disambiguation",
+                    &["compatible", "earlier", "later", "reject"],
+                )?
+                .as_deref()
+            {
+                Some("earlier") => Disamb::Earlier,
+                Some("later") => Disamb::Later,
+                Some("reject") => Disamb::Reject,
+                _ => Disamb::Compatible,
+            },
+        )
+    }
+
+    /// `DisambiguatePossibleEpochNanoseconds`, throwing a `RangeError` for the
+    /// `reject` conflict (a gap or overlap that `reject` refuses to resolve).
+    fn disamb_epoch(&mut self, tz: &str, wall_ns: i128, d: Disamb) -> Result<i128, ExecError> {
+        disambiguate(tz, wall_ns, d).map_err(|()| {
+            self.zdt_range("wall-clock time is ambiguous or nonexistent (disambiguation: reject)")
+        })
     }
 
     fn zdt_rounding_mode(
@@ -1065,17 +1268,20 @@ impl<'a> Interp<'a> {
         let month = self.read_int_field(h, "month")?;
         let month_code = self.read_month_code_field(h)?;
         let ns = self.read_int_field(h, "nanosecond")?;
-        let offset_ns = match self.zdt_field(h, "offset")? {
+        let offset_field = match self.zdt_field(h, "offset")? {
             Some(v) => Some(self.zdt_read_offset_field(v)?),
             None => None,
         };
+        let offset_ns = offset_field.map(|(o, _)| o);
+        // A seconds-precision offset field forces exact matching.
+        let match_minutes = !matches!(offset_field, Some((_, true)));
         let second = self.read_int_field(h, "second")?;
         let tz_val = self.zdt_field(h, "timeZone")?;
         let year = self.read_int_field(h, "year")?;
 
         // Options (read order: disambiguation, offset, overflow).
         let opts = self.zdt_options(options)?;
-        self.zdt_disambiguation(opts)?;
+        let disamb = self.zdt_disambiguation(opts)?;
         let offset_opt = self.zdt_offset_option(opts)?;
         let overflow = self.zdt_overflow(opts)?;
 
@@ -1114,7 +1320,15 @@ impl<'a> Interp<'a> {
         .ok_or_else(|| self.zdt_range("invalid ISO time"))?;
 
         let wall = iso_to_epoch_days(date) as i128 * iso::NS_PER_DAY + time_to_nanos(time);
-        let epoch = self.resolve_epoch(&tz, wall, offset_ns, false, offset_opt)?;
+        let epoch = self.resolve_epoch(
+            &tz,
+            wall,
+            offset_ns,
+            false,
+            offset_opt,
+            disamb,
+            match_minutes,
+        )?;
         Ok((epoch, tz, calendar))
     }
 
@@ -1145,17 +1359,20 @@ impl<'a> Interp<'a> {
         let month = self.read_int_field(h, "month")?;
         let month_code = self.zdt_read_month_code_str(h)?;
         let ns = self.read_int_field(h, "nanosecond")?;
-        let offset_ns = match self.zdt_field(h, "offset")? {
+        let offset_field = match self.zdt_field(h, "offset")? {
             Some(v) => Some(self.zdt_read_offset_field(v)?),
             None => None,
         };
+        let offset_ns = offset_field.map(|(o, _)| o);
+        // A seconds-precision offset field forces exact matching.
+        let match_minutes = !matches!(offset_field, Some((_, true)));
         let second = self.read_int_field(h, "second")?;
         let tz_val = self.zdt_field(h, "timeZone")?;
         let year = self.read_int_field(h, "year")?;
 
         // Options (read order: disambiguation, offset, overflow).
         let opts = self.zdt_options(options)?;
-        self.zdt_disambiguation(opts)?;
+        let disamb = self.zdt_disambiguation(opts)?;
         let offset_opt = self.zdt_offset_option(opts)?;
         let overflow = self.zdt_overflow(opts)?;
 
@@ -1191,7 +1408,15 @@ impl<'a> Interp<'a> {
         .ok_or_else(|| self.zdt_range("invalid ISO time"))?;
 
         let wall = iso_to_epoch_days(date) as i128 * iso::NS_PER_DAY + time_to_nanos(time);
-        let epoch = self.resolve_epoch(&tz, wall, offset_ns, false, offset_opt)?;
+        let epoch = self.resolve_epoch(
+            &tz,
+            wall,
+            offset_ns,
+            false,
+            offset_opt,
+            disamb,
+            match_minutes,
+        )?;
         Ok((epoch, tz, String::from(calendar)))
     }
 
@@ -1322,7 +1547,7 @@ impl<'a> Interp<'a> {
         };
 
         let opts = self.zdt_options(options)?;
-        self.zdt_disambiguation(opts)?;
+        let disamb = self.zdt_disambiguation(opts)?;
         let offset_opt = self.zdt_offset_option(opts)?;
         self.zdt_overflow(opts)?;
 
@@ -1332,14 +1557,19 @@ impl<'a> Interp<'a> {
         {
             return Err(self.zdt_range("date-time is outside the representable range"));
         }
-        // offset_ns from a numeric offset; z handled separately.
+        // offset_ns from a numeric offset; z handled separately. A minute-precision
+        // offset string (no seconds) enables minute-rounded matching.
         let offset_ns = if p.z { None } else { p.offset_ns };
-        let epoch = self.resolve_epoch(&tz, wall, offset_ns, p.z, offset_opt)?;
+        let match_minutes = !dt_offset_subminute(s);
+        let epoch =
+            self.resolve_epoch(&tz, wall, offset_ns, p.z, offset_opt, disamb, match_minutes)?;
         Ok((epoch, tz, calendar))
     }
 
-    /// `InterpretISODateTimeOffset`: turns a wall time + (optional) offset/`Z` into
-    /// an exact instant, honouring the `offset` reconciliation option.
+    /// `InterpretISODateTimeOffset`: turns a wall time + (optional) offset/`Z` into an
+    /// exact instant, honouring both the `offset` reconciliation option and the
+    /// `disambiguation` option (used whenever the offset is ignored or does not match).
+    #[allow(clippy::too_many_arguments)]
     fn resolve_epoch(
         &mut self,
         tz: &str,
@@ -1347,26 +1577,31 @@ impl<'a> Interp<'a> {
         offset_ns: Option<i128>,
         has_z: bool,
         offset_opt: OffsetOpt,
+        disamb: Disamb,
+        match_minutes: bool,
     ) -> Result<i128, ExecError> {
         let epoch = if has_z {
             wall_ns
         } else if let Some(off) = offset_ns {
-            let candidate = wall_ns - off;
             match offset_opt {
-                OffsetOpt::Use => candidate,
-                OffsetOpt::Ignore => wall_to_epoch(tz, wall_ns),
+                // `use`: honour the given offset exactly, transitions notwithstanding.
+                OffsetOpt::Use => wall_ns - off,
+                // `ignore`: discard the offset and disambiguate the wall time.
+                OffsetOpt::Ignore => self.disamb_epoch(tz, wall_ns, disamb)?,
+                // `prefer` / `reject`: keep any possible instant whose implied offset
+                // matches (to the minute only when the source was minute-precision).
                 OffsetOpt::Prefer | OffsetOpt::Reject => {
-                    if tz_offset_at(tz, candidate) == off {
-                        candidate
-                    } else if offset_opt == OffsetOpt::Prefer {
-                        wall_to_epoch(tz, wall_ns)
-                    } else {
-                        return Err(self.zdt_range("offset does not match the time zone"));
+                    match offset_match(tz, wall_ns, off, match_minutes) {
+                        Some(epoch) => epoch,
+                        None if offset_opt == OffsetOpt::Prefer => {
+                            self.disamb_epoch(tz, wall_ns, disamb)?
+                        }
+                        None => return Err(self.zdt_range("offset does not match the time zone")),
                     }
                 }
             }
         } else {
-            wall_to_epoch(tz, wall_ns)
+            self.disamb_epoch(tz, wall_ns, disamb)?
         };
         if !valid_epoch(epoch) {
             return Err(self.zdt_range("resulting instant is out of range"));
@@ -1441,7 +1676,7 @@ impl<'a> Interp<'a> {
 
         // Options (read order: disambiguation, offset, overflow).
         let opts = self.zdt_options(options)?;
-        self.zdt_disambiguation(opts)?;
+        let disamb = self.zdt_disambiguation(opts)?;
         let offset_opt = self.zdt_offset_option_default(opts, OffsetOpt::Prefer)?;
         let overflow = self.zdt_overflow(opts)?;
 
@@ -1461,7 +1696,7 @@ impl<'a> Interp<'a> {
         let ms = ms.unwrap_or(i64::from(ct.millisecond));
         let us = us.unwrap_or(i64::from(ct.microsecond));
         let ns = ns.unwrap_or(i64::from(ct.nanosecond));
-        let offset_ns = Some(offset_field.unwrap_or(cur_offset));
+        let offset_ns = Some(offset_field.map(|(o, _)| o).unwrap_or(cur_offset));
 
         let date = iso::regulate_iso_date(
             i32::try_from(year).map_err(|_| self.zdt_range("year out of range"))?,
@@ -1473,7 +1708,7 @@ impl<'a> Interp<'a> {
         let time = iso::regulate_iso_time(hour, minute, second, ms, us, ns, overflow)
             .ok_or_else(|| self.zdt_range("invalid ISO time"))?;
         let wall = iso_to_epoch_days(date) as i128 * iso::NS_PER_DAY + time_to_nanos(time);
-        let epoch = self.resolve_epoch(&tz, wall, offset_ns, false, offset_opt)?;
+        let epoch = self.resolve_epoch(&tz, wall, offset_ns, false, offset_opt, disamb, false)?;
         Ok(self.make_zdt_cal(epoch, tz, data.calendar.clone()))
     }
 
@@ -1538,7 +1773,7 @@ impl<'a> Interp<'a> {
 
         // Options (read order: disambiguation, offset, overflow).
         let opts = self.zdt_options(options)?;
-        self.zdt_disambiguation(opts)?;
+        let disamb = self.zdt_disambiguation(opts)?;
         let offset_opt = self.zdt_offset_option_default(opts, OffsetOpt::Prefer)?;
         let overflow = self.zdt_overflow(opts)?;
 
@@ -1572,12 +1807,12 @@ impl<'a> Interp<'a> {
         let ms = ms.unwrap_or(i64::from(ct.millisecond));
         let us = us.unwrap_or(i64::from(ct.microsecond));
         let ns = ns.unwrap_or(i64::from(ct.nanosecond));
-        let offset_ns = Some(offset_field.unwrap_or(cur_offset));
+        let offset_ns = Some(offset_field.map(|(o, _)| o).unwrap_or(cur_offset));
         let time = iso::regulate_iso_time(hour, minute, second, ms, us, ns, overflow)
             .ok_or_else(|| self.zdt_range("invalid ISO time"))?;
 
         let wall = iso_to_epoch_days(date) as i128 * iso::NS_PER_DAY + time_to_nanos(time);
-        let epoch = self.resolve_epoch(tz, wall, offset_ns, false, offset_opt)?;
+        let epoch = self.resolve_epoch(tz, wall, offset_ns, false, offset_opt, disamb, false)?;
         Ok(self.make_zdt_cal(epoch, tz.to_string(), data.calendar.clone()))
     }
 
@@ -1876,8 +2111,12 @@ impl<'a> Interp<'a> {
             self.zdt_validate_increment(smallest, increment)?;
         }
 
-        let mut dur = if largest >= Unit::Day {
-            // Time-only difference (exact nanoseconds), with sign-aware rounding.
+        let mut dur = if largest == Unit::Day {
+            // `DifferenceZonedDateTime` with largestUnit day: the day count follows the
+            // time zone's own (variable-length) day boundaries, not a fixed 24 hours.
+            self.zdt_diff_days(&tz, data.epoch_ns, other_epoch, smallest, increment, mode)
+        } else if largest >= Unit::Day {
+            // Hour or finer: an exact nanosecond difference, with sign-aware rounding.
             let total = other_epoch - data.epoch_ns;
             let inc = unit_ns(smallest) * i128::from(increment.max(1));
             let rounded = round_signed(total, inc, mode);
@@ -1897,10 +2136,8 @@ impl<'a> Interp<'a> {
                 mode,
             )
         } else {
-            // Calendar difference in the time zone's wall time (unrounded).
-            let from = local_of(&tz, data.epoch_ns);
-            let to = local_of(&tz, other_epoch);
-            datetime_diff(&cal, from, to, largest)
+            // Calendar difference (years/months/weeks) — DST-aware, unrounded.
+            self.zdt_calendar_diff(&cal, &tz, data.epoch_ns, other_epoch, largest)
         };
         if negate {
             dur = negate_duration(dur);
@@ -1913,6 +2150,140 @@ impl<'a> Interp<'a> {
             ..Default::default()
         };
         Ok(self.zdt_alloc(data2, TemporalKind::Duration))
+    }
+
+    /// `AddZonedDateTime` of a date-only duration: the instant reached by adding the
+    /// calendar `y/m/w/d` to the wall-clock date of `ns` (keeping its wall time), then
+    /// re-resolving via the default disambiguation. Falls back to `ns` on overflow.
+    #[allow(clippy::too_many_arguments)]
+    fn add_zdt_date_epoch(
+        &self,
+        cal: &str,
+        tz: &str,
+        ns: i128,
+        y: i64,
+        m: i64,
+        w: i64,
+        d: i64,
+    ) -> i128 {
+        let (date, t) = local_of(tz, ns);
+        let nd = if tcal::is_iso(cal) {
+            iso::add_iso_date(date, y, m, w, d, Overflow::Constrain)
+        } else {
+            tcal::calendar_date_add(cal, date, y, m, w, d, Overflow::Constrain).ok()
+        };
+        match nd {
+            Some(nd) => {
+                let wall = iso_to_epoch_days(nd) as i128 * iso::NS_PER_DAY + time_to_nanos(t);
+                wall_to_epoch(tz, wall)
+            }
+            None => ns,
+        }
+    }
+
+    /// `DifferenceZonedDateTime` for a calendar largestUnit (year/month/week): the
+    /// date part is the wall-clock calendar difference, but the time part is the exact
+    /// instant gap left after adding that date part back (so DST offset shifts are
+    /// reflected — a 24-hour remainder does not collapse to a day inside a 25-hour day).
+    fn zdt_calendar_diff(
+        &self,
+        cal: &str,
+        tz: &str,
+        ns1: i128,
+        ns2: i128,
+        largest: Unit,
+    ) -> DurationFields {
+        let from = local_of(tz, ns1);
+        let to = local_of(tz, ns2);
+        let mut d = datetime_diff(cal, from, to, largest);
+        let date_epoch = self.add_zdt_date_epoch(
+            cal,
+            tz,
+            ns1,
+            d.years as i64,
+            d.months as i64,
+            d.weeks as i64,
+            d.days as i64,
+        );
+        let rem = iso::balance_time_duration(ns2 - date_epoch, Unit::Hour);
+        d.hours = rem.hours;
+        d.minutes = rem.minutes;
+        d.seconds = rem.seconds;
+        d.milliseconds = rem.milliseconds;
+        d.microseconds = rem.microseconds;
+        d.nanoseconds = rem.nanoseconds;
+        d
+    }
+
+    /// `DifferenceZonedDateTime` restricted to largestUnit day: the whole-day count
+    /// between two instants measured against the time zone's own day boundaries (a
+    /// day may be 23/24/25 hours across a DST transition), plus the balanced time
+    /// remainder (rounded to `smallest`/`increment`). Mirrors `AddZonedDateTime`: the
+    /// day part is added as wall-clock days, and the leftover is the exact instant gap.
+    #[allow(clippy::too_many_arguments)]
+    fn zdt_diff_days(
+        &self,
+        tz: &str,
+        ns1: i128,
+        ns2: i128,
+        smallest: Unit,
+        increment: i64,
+        mode: RoundMode,
+    ) -> DurationFields {
+        let sign = (ns2 - ns1).signum();
+        if sign == 0 {
+            return DurationFields::default();
+        }
+        let (sd, st) = local_of(tz, ns1);
+        let ed = local_of(tz, ns2).0;
+        let start_days = iso_to_epoch_days(sd);
+        let start_time_ns = time_to_nanos(st);
+        // The instant of (start wall date + `n` days) at the start wall time.
+        let add_days = |n: i128| -> i128 {
+            let nd = epoch_days_to_iso(start_days + n as i64);
+            let wall = iso_to_epoch_days(nd) as i128 * iso::NS_PER_DAY + start_time_ns;
+            wall_to_epoch(tz, wall)
+        };
+        let beyond = |e: i128| -> bool { if sign > 0 { e > ns2 } else { e < ns2 } };
+        // Initial guess from the wall-clock date difference, then correct by at most a
+        // day or two (a DST day differs from a calendar day by well under 24 hours).
+        let mut days = (iso_to_epoch_days(ed) - start_days) as i128;
+        for _ in 0..4 {
+            if beyond(add_days(days + sign)) {
+                break;
+            }
+            days += sign;
+        }
+        for _ in 0..4 {
+            if beyond(add_days(days)) {
+                days -= sign;
+            } else {
+                break;
+            }
+        }
+        // The leftover exact instant gap (same sign as the overall difference, and no
+        // larger than the crossed day) is the sub-day part.
+        let remainder = ns2 - add_days(days);
+
+        if smallest == Unit::Day {
+            // Round the day count itself, measuring the fraction against the actual
+            // (DST-aware) length of the day being crossed.
+            let den = (add_days(days + sign) - add_days(days)).abs().max(1);
+            let scaled = days * den + sign * remainder.abs();
+            let rounded = round_signed(scaled, i128::from(increment.max(1)) * den, mode) / den;
+            return DurationFields {
+                days: rounded,
+                ..Default::default()
+            };
+        }
+
+        // largestUnit day with a sub-day smallestUnit: keep the whole days and round
+        // the time remainder.
+        let inc = unit_ns(smallest) * i128::from(increment.max(1));
+        let rounded = round_signed(remainder, inc, mode);
+        let mut dur = iso::balance_time_duration(rounded, Unit::Hour);
+        dur.days = days;
+        dur
     }
 
     /// `NudgeToCalendarUnit` for a single calendar unit: the whole difference from
@@ -2137,23 +2508,16 @@ impl<'a> Interp<'a> {
         let Ok(zone) = timezone_data::load(&tz) else {
             return Ok(NanBox::null());
         };
-        let secs = data.epoch_ns.div_euclid(iso::NS_PER_SEC) as i64;
-        let mut best: Option<i64> = None;
-        for tr in zone.transitions() {
-            if next {
-                if tr.when > secs && best.is_none_or(|b| tr.when < b) {
-                    best = Some(tr.when);
-                }
-            } else if tr.when < secs && best.is_none_or(|b| tr.when > b) {
-                best = Some(tr.when);
-            }
-        }
+        let best = if next {
+            zone_next_transition(&zone, data.epoch_ns)
+        } else {
+            zone_prev_transition(&zone, data.epoch_ns)
+        };
         match best {
-            Some(w) => {
-                let epoch = i128::from(w) * iso::NS_PER_SEC;
+            Some(epoch) if valid_epoch(epoch) => {
                 Ok(self.make_zdt_cal(epoch, tz, data.calendar.clone()))
             }
-            None => Ok(NanBox::null()),
+            _ => Ok(NanBox::null()),
         }
     }
 
@@ -2296,6 +2660,26 @@ impl<'a> Interp<'a> {
 /// Whether the trailing UTC offset of a datetime string (no annotation) carries a
 /// sub-minute component (a seconds field), which disqualifies it as a time-zone
 /// identifier even when its value is a whole minute (e.g. `-07:00:00`).
+/// Whether a bare offset string (e.g. `-11:20:00`, `+0530`, `-11:20`) carries a
+/// seconds (sub-minute) component. Such offsets force `MATCH_EXACTLY`.
+fn offset_str_has_seconds(s: &str) -> bool {
+    let s = s.trim();
+    let body = s.strip_prefix(['+', '-', '\u{2212}']).unwrap_or(s);
+    if body.contains('.') || body.contains(',') {
+        return true;
+    }
+    let colons = body.matches(':').count();
+    if colons >= 2 {
+        return true;
+    }
+    if colons == 0 {
+        // Compact form: HHMMSS (>4 significant digits) has seconds.
+        let digits = body.chars().take_while(char::is_ascii_digit).count();
+        return digits > 4;
+    }
+    false
+}
+
 fn dt_offset_subminute(s: &str) -> bool {
     let Some(tpos) = s.find(['T', 't']) else {
         return false;
@@ -2600,4 +2984,129 @@ fn zp_annotations(p: &mut Zp) -> Option<(String, Option<String>)> {
         return None;
     }
     tz.map(|t| (t, cal))
+}
+
+#[cfg(test)]
+mod dst_tests {
+    use super::*;
+
+    /// Wall-clock date-time as a UTC epoch count of nanoseconds (an ISO date-time
+    /// treated as if UTC), matching the input to `possible_instants`/`disambiguate`.
+    fn wall(y: i32, mo: u8, d: u8, h: i128, mi: i128) -> i128 {
+        iso_to_epoch_days(IsoDate {
+            year: y,
+            month: mo,
+            day: d,
+        }) as i128
+            * iso::NS_PER_DAY
+            + h * iso::NS_PER_HOUR
+            + mi * iso::NS_PER_MINUTE
+    }
+
+    #[test]
+    fn spring_forward_gap() {
+        let tz = "America/New_York";
+        // 2020-03-08 02:30 does not exist (clocks jump 02:00 -> 03:00 EDT).
+        let w = wall(2020, 3, 8, 2, 30);
+        let (_, n) = possible_instants(tz, w);
+        assert_eq!(n, 0, "spring-forward wall time has no valid instant");
+
+        // compatible / later resolve forward to 03:30 (-04:00); earlier back to 01:30.
+        let later = disambiguate(tz, w, Disamb::Compatible).unwrap();
+        let (ld, lt) = local_of(tz, later);
+        assert_eq!((ld.month, ld.day, lt.hour, lt.minute), (3, 8, 3, 30));
+        assert_eq!(tz_offset_at(tz, later), -4 * iso::NS_PER_HOUR);
+
+        let earlier = disambiguate(tz, w, Disamb::Earlier).unwrap();
+        let (_, et) = local_of(tz, earlier);
+        assert_eq!((et.hour, et.minute), (1, 30));
+        assert_eq!(tz_offset_at(tz, earlier), -5 * iso::NS_PER_HOUR);
+
+        assert!(disambiguate(tz, w, Disamb::Reject).is_err());
+    }
+
+    #[test]
+    fn fall_back_overlap() {
+        let tz = "America/New_York";
+        // 2020-11-01 01:30 occurs twice (clocks fall 02:00 -> 01:00).
+        let w = wall(2020, 11, 1, 1, 30);
+        let (poss, n) = possible_instants(tz, w);
+        assert_eq!(n, 2, "fall-back wall time has two valid instants");
+        assert_eq!(poss[1] - poss[0], iso::NS_PER_HOUR, "one hour apart");
+
+        // earlier = -04:00 (EDT), later = -05:00 (EST); compatible = earlier.
+        let earlier = disambiguate(tz, w, Disamb::Earlier).unwrap();
+        let later = disambiguate(tz, w, Disamb::Later).unwrap();
+        let compatible = disambiguate(tz, w, Disamb::Compatible).unwrap();
+        assert_eq!(earlier, poss[0]);
+        assert_eq!(later, poss[1]);
+        assert_eq!(compatible, poss[0]);
+        assert_eq!(tz_offset_at(tz, earlier), -4 * iso::NS_PER_HOUR);
+        assert_eq!(tz_offset_at(tz, later), -5 * iso::NS_PER_HOUR);
+        // Both render as the same wall clock.
+        assert_eq!(local_of(tz, earlier).1.hour, 1);
+        assert_eq!(local_of(tz, later).1.hour, 1);
+
+        assert!(disambiguate(tz, w, Disamb::Reject).is_err());
+    }
+
+    #[test]
+    fn ordinary_wall_time_unique() {
+        let tz = "America/New_York";
+        let w = wall(2020, 6, 15, 12, 0);
+        let (_, n) = possible_instants(tz, w);
+        assert_eq!(n, 1);
+        // 12:00 EDT (-04:00) -> 16:00 UTC.
+        let e = wall_to_epoch(tz, w);
+        assert_eq!(tz_offset_at(tz, e), -4 * iso::NS_PER_HOUR);
+        assert_eq!(local_of(tz, e).1.hour, 12);
+    }
+
+    #[test]
+    fn fixed_offset_zone_has_single_instant() {
+        let (_, n) = possible_instants("+05:30", wall(2020, 3, 8, 2, 30));
+        assert_eq!(n, 1);
+        assert_eq!(
+            wall_to_epoch("+05:30", wall(2020, 1, 1, 0, 0)),
+            wall(2020, 1, 1, 0, 0) - (5 * iso::NS_PER_HOUR + 30 * iso::NS_PER_MINUTE)
+        );
+    }
+
+    #[test]
+    fn transitions_next_and_previous() {
+        let zone = timezone_data::load("America/New_York").unwrap();
+        // A summer instant: previous transition is the spring-forward, next is fall-back.
+        let summer = wall_to_epoch("America/New_York", wall(2020, 6, 15, 12, 0));
+        let next = zone_next_transition(&zone, summer).expect("a next transition");
+        let prev = zone_prev_transition(&zone, summer).expect("a previous transition");
+        assert!(next > summer && prev < summer);
+        // Spring-forward: offset just before is EST(-5), just after EDT(-4).
+        assert_eq!(
+            tz_offset_at("America/New_York", prev - 1),
+            -5 * iso::NS_PER_HOUR
+        );
+        assert_eq!(
+            tz_offset_at("America/New_York", prev),
+            -4 * iso::NS_PER_HOUR
+        );
+        // Fall-back: offset flips from EDT(-4) back to EST(-5).
+        assert_eq!(
+            tz_offset_at("America/New_York", next - 1),
+            -4 * iso::NS_PER_HOUR
+        );
+        assert_eq!(
+            tz_offset_at("America/New_York", next),
+            -5 * iso::NS_PER_HOUR
+        );
+    }
+
+    #[test]
+    fn transitions_reach_future_via_posix_rule() {
+        // Well past the stored transition table (~2037): the POSIX extend rule must
+        // still yield the yearly US DST transitions.
+        let zone = timezone_data::load("America/New_York").unwrap();
+        let far = wall_to_epoch("America/New_York", wall(2099, 6, 15, 12, 0));
+        assert!(zone_next_transition(&zone, far).is_some());
+        assert!(zone_prev_transition(&zone, far).is_some());
+    }
 }
