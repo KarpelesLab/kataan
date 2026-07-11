@@ -576,13 +576,21 @@ pub struct Interp<'a> {
     /// The promise-reaction microtask queue, drained after the script.
     microtasks: Vec<Job>,
     /// Pending `setTimeout` callbacks (macrotasks), run after the microtask queue
-    /// drains — ordered by `delay`, then insertion (`seq`). No real clock: delays
-    /// only order callbacks relative to each other.
+    /// drains — ordered by absolute virtual fire-time `at`, then insertion (`seq`).
     macrotasks: Vec<Timer>,
     /// Monotonic id handed out by `setTimeout` (for `clearTimeout`).
     timer_next_id: u64,
-    /// Monotonic insertion counter breaking equal-`delay` ties.
+    /// Monotonic insertion counter breaking equal-`at` ties.
     timer_seq: u64,
+    /// The **virtual clock** (milliseconds). There is no real time source in the
+    /// cooperative single-threaded model, so time is modeled: dispatching a
+    /// macrotask advances `virtual_now` to that timer's scheduled fire-time
+    /// (`at = virtual_now-at-schedule + delay`). `$262.agent.monotonicNow()` reads
+    /// this clock, so a worker that parks in `Atomics.waitAsync(…, timeout)` and is
+    /// released by the timeout observes `monotonicNow()` advance by ~`timeout`.
+    /// (`Date.now()` is deliberately NOT tied to this — it uses the wall clock so
+    /// `Date` tests see a real epoch timestamp.)
+    virtual_now: f64,
     /// Whether the currently-executing code is in strict mode (`"use strict"`),
     /// which propagates into nested functions.
     strict: bool,
@@ -732,9 +740,6 @@ struct AgentState {
     /// eagerly under `$262.agent.start` — so a `receiveBroadcast` callback it
     /// registers is tagged with the realm to restore when it is later invoked.
     current_agent_realm: Option<usize>,
-    /// A monotonic tick handed out by `$262.agent.monotonicNow()` (no real clock;
-    /// a strictly non-decreasing counter suffices for the spin-wait idiom).
-    mono: u64,
 }
 
 /// One pending `Atomics.waitAsync` async waiter.
@@ -1166,7 +1171,8 @@ struct Job {
 /// A pending `setTimeout` callback.
 struct Timer {
     id: u64,
-    delay: f64,
+    /// Absolute virtual fire-time (ms on the [`Interp::virtual_now`] clock).
+    at: f64,
     seq: u64,
     callback: NanBox,
     args: Vec<NanBox>,
@@ -2872,6 +2878,7 @@ impl<'a> Interp<'a> {
             macrotasks: Vec::new(),
             timer_next_id: 1,
             timer_seq: 0,
+            virtual_now: 0.0,
             strict: false,
             global_this: NanBox::undefined(),
             output: String::new(),

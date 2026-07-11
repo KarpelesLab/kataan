@@ -456,19 +456,59 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
-    /// Runs the earliest-due `setTimeout` macrotask (least `delay`, ties by
-    /// insertion order). A no-op when none are pending.
+    /// Queues a macrotask (a `setTimeout`-style callback) on the virtual clock and
+    /// returns its timer id (for `clearTimeout`). The fire-time is
+    /// `at = virtual_now + max(delay, TICK)`: the `TICK` floor guarantees the clock
+    /// advances on every dispatch, so a self-rescheduling `setTimeout(fn, 0)` (the
+    /// Test262 `$262.agent.tryYield`/`getReportAsync` polling idiom) cannot starve a
+    /// later timer (a parked `waitAsync` timeout) forever — the clock ticks past it.
+    pub(crate) fn schedule_timer(
+        &mut self,
+        delay: f64,
+        callback: NanBox,
+        args: Vec<NanBox>,
+    ) -> u64 {
+        // Minimum virtual advance per timer dispatch (a la the HTML nested-timeout
+        // clamp): keeps `virtual_now` strictly increasing across dispatches.
+        const TICK: f64 = 1.0;
+        let delay = if delay.is_finite() {
+            delay.max(0.0)
+        } else {
+            0.0
+        };
+        let at = self.virtual_now + delay.max(TICK);
+        let id = self.timer_next_id;
+        self.timer_next_id += 1;
+        let seq = self.timer_seq;
+        self.timer_seq += 1;
+        self.macrotasks.push(Timer {
+            id,
+            at,
+            seq,
+            callback,
+            args,
+        });
+        id
+    }
+
+    /// Runs the earliest-due `setTimeout` macrotask (least virtual fire-time `at`,
+    /// ties by insertion order), advancing the virtual clock to that fire-time. A
+    /// no-op when none are pending.
     pub(crate) fn run_one_macrotask(&mut self) -> Result<(), ExecError> {
         let Some(idx) = self
             .macrotasks
             .iter()
             .enumerate()
-            .min_by(|(_, a), (_, b)| a.delay.total_cmp(&b.delay).then(a.seq.cmp(&b.seq)))
+            .min_by(|(_, a), (_, b)| a.at.total_cmp(&b.at).then(a.seq.cmp(&b.seq)))
             .map(|(i, _)| i)
         else {
             return Ok(());
         };
         let t = self.macrotasks.remove(idx);
+        // Advance the virtual clock to this timer's fire-time (never backwards).
+        if t.at > self.virtual_now {
+            self.virtual_now = t.at;
+        }
         self.call(t.callback, &t.args)?;
         Ok(())
     }

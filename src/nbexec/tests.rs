@@ -9421,3 +9421,82 @@ fn to_string_dynamic_and_builtin_functions_are_native_syntax() {
     );
     assert_eq!(run("'' + Math.max"), "function max() { [native code] }");
 }
+
+// --- Atomics cooperative scheduler + virtual clock (see `nbexec::agent`) ---
+
+#[test]
+fn atomics_sync_wait_finite_timeout_times_out_and_advances_clock() {
+    // A synchronous `Atomics.wait` on a matching value with a finite timeout
+    // blocks for the whole timeout, then times out. The virtual clock advances by
+    // the timeout so a `monotonicNow()`-measured duration observes the elapsed ms.
+    assert_eq!(
+        out(r#"
+            var i32 = new Int32Array(new SharedArrayBuffer(8));
+            var before = $262_agent_monotonicNow();
+            var r = Atomics.wait(i32, 0, 0, 250);
+            var after = $262_agent_monotonicNow();
+            console.log(r + " " + (after - before));
+        "#),
+        "timed-out 250\n"
+    );
+}
+
+#[test]
+fn atomics_sync_wait_value_mismatch_is_not_equal_and_no_time_passes() {
+    // A value mismatch returns "not-equal" at once — the clock does not advance.
+    assert_eq!(
+        out(r#"
+            var i32 = new Int32Array(new SharedArrayBuffer(8));
+            var before = $262_agent_monotonicNow();
+            var r = Atomics.wait(i32, 0, 7, 250);
+            var after = $262_agent_monotonicNow();
+            console.log(r + " " + (after - before));
+        "#),
+        "not-equal 0\n"
+    );
+}
+
+#[test]
+fn atomics_wait_async_resolves_ok_on_notify() {
+    // `Atomics.waitAsync` parks a waiter; a matching same-agent `Atomics.notify`
+    // wakes it, settling the promise "ok" (drained as a microtask after the script).
+    assert_eq!(
+        out(r#"
+            var i32 = new Int32Array(new SharedArrayBuffer(8));
+            var res = Atomics.waitAsync(i32, 0, 0, 1000);
+            res.value.then(function (v) { console.log("settled " + v); });
+            var woken = Atomics.notify(i32, 0, 1);
+            console.log("notified " + woken + " async " + res.async);
+        "#),
+        "notified 1 async true\nsettled ok\n"
+    );
+}
+
+#[test]
+fn atomics_wait_async_resolves_timed_out_and_advances_clock() {
+    // With no notify, a finite-timeout `waitAsync` settles "timed-out" when its
+    // timeout macrotask fires, advancing the virtual clock by the timeout.
+    assert_eq!(
+        out(r#"
+            var i32 = new Int32Array(new SharedArrayBuffer(8));
+            var before = $262_agent_monotonicNow();
+            Atomics.waitAsync(i32, 0, 0, 300).value.then(function (v) {
+                console.log(v + " " + ($262_agent_monotonicNow() - before));
+            });
+        "#),
+        "timed-out 300\n"
+    );
+}
+
+#[test]
+fn virtual_clock_set_timeout_fires_in_delay_order_and_advances() {
+    // Macrotasks fire earliest-virtual-fire-time first, and dispatching one
+    // advances the virtual clock read by `monotonicNow()`.
+    assert_eq!(
+        out(r#"
+            setTimeout(function () { console.log("b " + $262_agent_monotonicNow()); }, 200);
+            setTimeout(function () { console.log("a " + $262_agent_monotonicNow()); }, 50);
+        "#),
+        "a 50\nb 200\n"
+    );
+}

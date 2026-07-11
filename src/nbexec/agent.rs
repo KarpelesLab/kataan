@@ -118,12 +118,12 @@ impl<'a> Interp<'a> {
         Ok(NanBox::undefined())
     }
 
-    /// `$262.agent.monotonicNow()` — a strictly non-decreasing millisecond-ish
-    /// reading (a counter; the engine has no real clock).
+    /// `$262.agent.monotonicNow()` — reads the virtual clock (ms). Advancing when
+    /// macrotasks (timeouts) fire, this lets a worker that parks in
+    /// `Atomics.waitAsync(…, timeout)` and is released by the timeout observe the
+    /// elapsed `monotonicNow()` grow by ~`timeout`, as a real clock would.
     pub(crate) fn agent_monotonic_now(&mut self) -> f64 {
-        let now = self.agent.mono;
-        self.agent.mono += 1;
-        now as f64
+        self.virtual_now
     }
 
     // --- Atomics.waitAsync support ---
@@ -217,17 +217,7 @@ impl<'a> Interp<'a> {
             let cb = self
                 .realm
                 .new_bound_native(N_ATOMICS_ASYNC_TIMEOUT, promise);
-            let id = self.timer_next_id;
-            self.timer_next_id += 1;
-            let seq = self.timer_seq;
-            self.timer_seq += 1;
-            self.macrotasks.push(Timer {
-                id,
-                delay: t,
-                seq,
-                callback: NanBox::handle(cb.to_raw()),
-                args: Vec::new(),
-            });
+            self.schedule_timer(t, NanBox::handle(cb.to_raw()), Vec::new());
         }
         self.realm
             .set_property(result, "async", NanBox::boolean(true));
