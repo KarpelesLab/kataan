@@ -7315,6 +7315,124 @@ fn copy_within_precise_for_hole_accessor_arrays() {
 }
 
 #[test]
+fn precise_readers_through_inherited_index() {
+    // join / toString read a hole via [[Get]] — an inherited Array.prototype index
+    // resolves through the prototype chain instead of rendering empty.
+    assert_eq!(
+        run("Array.prototype[1]=1;var x=[0];x.length=2;x.join()"),
+        "0,1"
+    );
+    assert_eq!(
+        run("Array.prototype[1]=1;var x=[0];x.length=2;x.toString()"),
+        "0,1"
+    );
+    // toLocaleString invokes the *inherited* element's toLocaleString too (n===2).
+    assert_eq!(
+        run(
+            "var n=0;var o={toLocaleString(){n++;return ''}};Array.prototype[1]=o;\
+             var x=[o];x.length=2;x.toLocaleString();n"
+        ),
+        "2"
+    );
+    // slice reads the inherited hole via HasProperty+[[Get]] and creates an own
+    // property in the copy.
+    assert_eq!(
+        run("Array.prototype[1]=1;var x=[0];x.length=2;var a=x.slice();\
+             a[0]+','+a[1]+','+a.hasOwnProperty('1')"),
+        "0,1,true"
+    );
+    // Dense fast path unchanged (no holes, no proto pollution).
+    assert_eq!(run("[1,2,3].join(',')"), "1,2,3");
+    assert_eq!(run("[1,2,3].toString()"), "1,2,3");
+    assert_eq!(run("['a','b'].toLocaleString()"), "a,b");
+    assert_eq!(run("[1,,3].join(',')"), "1,,3");
+    assert_eq!(run("JSON.stringify([0,1,2,3].slice(1,3))"), "[1,2]");
+}
+
+#[test]
+fn precise_length_mutators_through_prototype_and_frozen_length() {
+    // pop reads the inherited hole value; shift moves it down; unshift shifts the
+    // inherited index up — all via [[Get]]/[[Set]]/Delete through the prototype.
+    assert_eq!(
+        run("Array.prototype[1]=1;var x=[0];x.length=2;x.pop()"),
+        "1"
+    );
+    assert_eq!(
+        run("Array.prototype[1]=1;var x=[0];x.length=2;x.shift();x[0]"),
+        "1"
+    );
+    assert_eq!(
+        run("Array.prototype[0]=1;var x=[];x.length=1;x.unshift(0);x[0]+','+x[1]"),
+        "0,1"
+    );
+    // pop on an empty frozen array: the closing Set(O,"length",…,true) throws even
+    // though the value is unchanged (ordinary [[Set]] of a non-writable property
+    // returns false regardless of same-value).
+    assert_eq!(
+        run("var a=[];Object.freeze(a);try{a.pop();'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    assert_eq!(
+        run("var a=[];Object.freeze(a);try{a.push(1);'no'}catch(e){e.constructor.name}"),
+        "TypeError"
+    );
+    // pop on `new Array(1)` whose inherited getter freezes mid-operation: the getter
+    // fires once, then the length Set throws and length is unchanged.
+    assert_eq!(
+        run("var log=0;var a=new Array(1);\
+             Object.defineProperty(Array.prototype,'0',{get(){Object.freeze(a);log++},configurable:true});\
+             try{a.pop()}catch(e){};log+','+a.length"),
+        "1,1"
+    );
+    // push on an array whose inherited Array.prototype[0] *setter* fires (freezing
+    // the array), then the length Set throws — no own index property is created.
+    assert_eq!(
+        run(
+            "var a=[];Object.defineProperty(Array.prototype,'0',{set(_v){Object.freeze(a)},configurable:true});\
+             var t;try{a.push(1)}catch(e){t=e.constructor.name};t+','+a.hasOwnProperty(0)+','+a.length"
+        ),
+        "TypeError,false,0"
+    );
+    // An *own* accessor at an index still shadows an inherited one on write (the own
+    // setter fires, not the prototype's).
+    assert_eq!(
+        run(
+            "var hit=0;Object.defineProperty(Array.prototype,'0',{get(){return 11},configurable:true});\
+             var a=[];Object.defineProperty(a,'0',{set(v){hit=v},get(){return hit},configurable:true});\
+             a[0]=7;hit"
+        ),
+        "7"
+    );
+    // Dense fast path unchanged.
+    assert_eq!(run("var a=[1,2,3];a.pop();JSON.stringify(a)"), "[1,2]");
+    assert_eq!(run("var a=[1,2,3];a.shift();JSON.stringify(a)"), "[2,3]");
+    assert_eq!(
+        run("var a=[1,2,3];a.unshift(0);JSON.stringify(a)"),
+        "[0,1,2,3]"
+    );
+    assert_eq!(
+        run("var a=[1,2,3];a.push(4);JSON.stringify(a)"),
+        "[1,2,3,4]"
+    );
+}
+
+#[test]
+fn sort_write_back_fires_inherited_setter() {
+    // SortIndexedProperties write-back goes through [[Set]]: an inherited setter on
+    // Object.prototype fires (no own property is created at that index), and the
+    // inherited getter is read during collection.
+    assert_eq!(
+        run("var log=[];Object.defineProperty(Object.prototype,'2',\
+               {get(){log.push('g');return 4},set(v){log.push('s'+v)},configurable:true});\
+             var a=[undefined,3,,2,undefined,,1];a.sort();\
+             log.join(',')+'|'+a[0]+a[1]+a[3]+'|'+a.hasOwnProperty('2')"),
+        "g,s3|124|false"
+    );
+    // Dense sort unchanged.
+    assert_eq!(run("JSON.stringify([3,1,2].sort())"), "[1,2,3]");
+}
+
+#[test]
 fn splice_coerces_args_with_tointegerorinfinity() {
     // splice's start/deleteCount are ToIntegerOrInfinity (valueOf, not toString);
     // a throwing coercion propagates; Infinity clamps to the length.

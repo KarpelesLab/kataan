@@ -3388,8 +3388,26 @@ impl<'a> Interp<'a> {
                 );
                 ExecError::Throw(this.make_error(N_TYPE_ERROR, Some(m)))
             };
+            // A *real* array whose dense store has holes, whose indices carry
+            // attribute/accessor overrides, or whose default prototype chain has an
+            // integer-indexed accessor cannot use the dense fast path: element reads
+            // must `[[Get]]` through the prototype (a hole may resolve to an inherited
+            // value / getter), writes must `[[Set]]` (firing inherited setters) and
+            // deletes must `DeletePropertyOrThrow`. This mirrors the precise gating
+            // already used by `sort`/`reverse`/`copyWithin`. A typed array (which has
+            // no holes and its own exotic element methods) never takes this path.
+            let precise_array = self.realm.typed_kind(handle).is_none()
+                && (self.realm.array_has_index_overrides(handle)
+                    || elems.iter().any(|e| e.is_hole())
+                    || self.realm.proto_index_accessor_dirty());
             match method {
                 "push" => {
+                    // Precise: `Set(O, ToString(len+i), E, true)` fires an inherited
+                    // setter, and the final `Set(O, "length", …, true)` throws on a
+                    // frozen / non-writable length.
+                    if precise_array {
+                        return Ok(Some(self.array_like_mutate(method, handle, args)?));
+                    }
                     if self.realm.array_length_is_readonly(handle) {
                         return Err(length_readonly_throw(self));
                     }
@@ -3400,6 +3418,13 @@ impl<'a> Interp<'a> {
                     return Ok(Some(NanBox::number(len as f64)));
                 }
                 "pop" => {
+                    // Precise: `Get(O, len-1)` (an inherited getter fires),
+                    // `DeletePropertyOrThrow`, then `Set(O, "length", len-1, true)`
+                    // (throws on a frozen / non-writable length — evaluated *after*
+                    // the getter, which may itself freeze the array).
+                    if precise_array {
+                        return Ok(Some(self.array_like_mutate(method, handle, args)?));
+                    }
                     if self.realm.array_length_is_readonly(handle) {
                         return Err(length_readonly_throw(self));
                     }
@@ -3408,6 +3433,12 @@ impl<'a> Interp<'a> {
                 // `splice(start, deleteCount?, ...items)` — mutate in place,
                 // return the removed elements as a new array.
                 "shift" => {
+                    // Precise: read/move each index via `[[Get]]`/`HasProperty`/
+                    // `[[Set]]`/`Delete` (inherited getters/setters fire, holes
+                    // resolve through the prototype), then `Set(O, "length", …, true)`.
+                    if precise_array {
+                        return Ok(Some(self.array_like_mutate(method, handle, args)?));
+                    }
                     if self.realm.array_length_is_readonly(handle) {
                         return Err(length_readonly_throw(self));
                     }
@@ -3427,6 +3458,12 @@ impl<'a> Interp<'a> {
                     return Ok(Some(first));
                 }
                 "unshift" => {
+                    // Precise: shift the existing elements up via `[[Get]]`/`[[Set]]`/
+                    // `Delete` (inherited accessors fire, holes preserved), write the
+                    // prepended items, then `Set(O, "length", …, true)`.
+                    if precise_array {
+                        return Ok(Some(self.array_like_mutate(method, handle, args)?));
+                    }
                     if self.realm.array_length_is_readonly(handle) {
                         return Err(length_readonly_throw(self));
                     }
@@ -3525,15 +3562,24 @@ impl<'a> Interp<'a> {
                     // through ToString (so a custom `toString` is honored). The
                     // receiver array seeds the cycle set, so a self-reference (or a
                     // mutual cycle back to it) renders empty rather than recursing.
+                    // A hole/accessor/prototype-polluted array reads each element via
+                    // `[[Get]]` (spec `Get(O, ToString(k))`): a hole resolves through
+                    // the prototype chain (an inherited value or getter), rather than
+                    // rendering empty. `sep` was already ToString'd above (spec order).
                     let mut parts: Vec<String> = Vec::with_capacity(elems.len());
-                    for e in &elems {
+                    for (k, dense) in elems.iter().enumerate() {
+                        let e = if precise_array {
+                            self.read_member(handle, &alloc::format!("{k}"))?
+                        } else {
+                            *dense
+                        };
                         let s = match e.unpack() {
                             Unpacked::Null | Unpacked::Undefined => String::new(),
                             // A direct self-reference back to the receiver renders
                             // empty (per `Array.prototype.join`), without recursing.
                             Unpacked::Handle(raw) if raw == handle.to_raw() => String::new(),
                             _ => {
-                                let p = self.coerce_object(*e, "string")?;
+                                let p = self.coerce_object(e, "string")?;
                                 self.realm.to_display_string(p)
                             }
                         };
@@ -3583,8 +3629,17 @@ impl<'a> Interp<'a> {
                         }
                         return Ok(Some(self.new_str(&parts.join(","))));
                     }
+                    // A hole/accessor/prototype-polluted array reads each element via
+                    // `[[Get]]` (spec `Get(O, k)`): a hole resolves through the
+                    // prototype chain, so an inherited element's `toLocaleString` is
+                    // invoked too (rather than rendering empty).
                     let mut parts: Vec<String> = Vec::with_capacity(elems.len());
-                    for e in &elems {
+                    for (k, dense) in elems.iter().enumerate() {
+                        let e = if precise_array {
+                            self.read_member(handle, &alloc::format!("{k}"))?
+                        } else {
+                            *dense
+                        };
                         let s = match e.unpack() {
                             Unpacked::Null | Unpacked::Undefined => String::new(),
                             Unpacked::Handle(raw) if raw == handle.to_raw() => String::new(),
@@ -3607,7 +3662,7 @@ impl<'a> Interp<'a> {
                                     // (abrupt completions propagate).
                                     let h = e.as_handle().map(Handle::from_raw).unwrap();
                                     let m = self.read_member(h, "toLocaleString")?;
-                                    let r = self.call_with_this(m, *e, &[])?;
+                                    let r = self.call_with_this(m, e, &[])?;
                                     self.coerce_to_string(r)?
                                 } else {
                                     // A string/boolean/symbol (or other) primitive
@@ -3617,10 +3672,10 @@ impl<'a> Interp<'a> {
                                     // *primitive* as `this` (so an override observing a
                                     // strict primitive `this` — e.g. `typeof this` —
                                     // sees `"boolean"`/`"string"`, not the wrapper).
-                                    let boxed = self.coerce_to_object(*e);
+                                    let boxed = self.coerce_to_object(e);
                                     let bh = boxed.as_handle().map(Handle::from_raw).unwrap();
                                     let m = self.read_member(bh, "toLocaleString")?;
-                                    let r = self.call_with_this(m, *e, &[])?;
+                                    let r = self.call_with_this(m, e, &[])?;
                                     self.coerce_to_string(r)?
                                 }
                             }
@@ -4178,14 +4233,30 @@ impl<'a> Interp<'a> {
                     let default_array = self.realm.is_array(a_h)
                         && self.realm.array_length(a_h) == Some(count)
                         && !self.realm.array_has_index_overrides(a_h);
-                    for (k, e) in elems[a..b].iter().enumerate() {
-                        if e.is_hole() {
-                            continue;
-                        }
-                        if default_array {
-                            self.realm.set_element(a_h, k, *e);
+                    for k in 0..count {
+                        // Spec `slice`: `kPresent = HasProperty(O, k)`; only a present
+                        // index is `Get` and `CreateDataProperty`d into the copy (an
+                        // absent index leaves a hole, `n`/`k` still advancing). A
+                        // hole/accessor/prototype-polluted array resolves presence and
+                        // value through the prototype chain (so an inherited element
+                        // becomes an own property in the copy); a dense array reads the
+                        // snapshot directly and skips genuine holes.
+                        let e = if precise_array {
+                            if !self.has_property(handle, &alloc::format!("{}", a + k)) {
+                                continue;
+                            }
+                            self.read_member(handle, &alloc::format!("{}", a + k))?
                         } else {
-                            self.create_data_property_or_throw(a_h, k, *e)?;
+                            let e = elems[a + k];
+                            if e.is_hole() {
+                                continue;
+                            }
+                            e
+                        };
+                        if default_array {
+                            self.realm.set_element(a_h, k, e);
+                        } else {
+                            self.create_data_property_or_throw(a_h, k, e)?;
                         }
                     }
                     let len_key = self.new_str("length");

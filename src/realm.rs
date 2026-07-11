@@ -140,6 +140,16 @@ pub struct Realm {
     /// descriptor reports it and a later `length` redefine is validated. Same
     /// non-GC-root caveat as `frozen_arrays`.
     nonwritable_array_lengths: alloc::collections::BTreeSet<u64>,
+    /// Set once a user installs an *integer-indexed accessor* on the default array
+    /// prototype chain (`%Array.prototype%` or `%Object.prototype%`). The dense
+    /// array-index write fast path in `assign_member_value` skips the prototype
+    /// walk when an array's `[[Prototype]]` is the pristine `%Array.prototype%`
+    /// (which normally has no inherited index setters); this flag makes that walk
+    /// happen anyway, so an inherited setter (e.g. `Array.prototype[0] = set...`)
+    /// fires on an absent-own index write. Latches on (never cleared); it only
+    /// costs a prototype walk that was already spec-required in the rare programs
+    /// that pollute those prototypes.
+    proto_index_accessor_dirty: bool,
     /// Logical `length` of an array set above its dense backing capacity (a valid
     /// uint32 length up to 2^32-1 that exceeds [`Limits::max_array_len`]). The dense
     /// `Vec` storage is not actually grown that far (a multi-gigabyte allocation);
@@ -313,6 +323,7 @@ impl Realm {
             sealed_arrays: alloc::collections::BTreeSet::new(),
             non_extensible_arrays: alloc::collections::BTreeSet::new(),
             nonwritable_array_lengths: alloc::collections::BTreeSet::new(),
+            proto_index_accessor_dirty: false,
             sparse_array_lengths: alloc::collections::BTreeMap::new(),
             default_object_proto: None,
             native_protos: alloc::collections::BTreeMap::new(),
@@ -2247,6 +2258,15 @@ impl Realm {
         true
     }
 
+    /// Whether an integer-indexed accessor has ever been installed on the default
+    /// array prototype chain (`%Array.prototype%` / `%Object.prototype%`). When
+    /// set, an absent-own array-index `[[Set]]` must walk the prototype chain even
+    /// for a pristine-prototype array, so an inherited setter fires.
+    #[must_use]
+    pub fn proto_index_accessor_dirty(&self) -> bool {
+        self.proto_index_accessor_dirty
+    }
+
     /// Whether the `length` of the array at `handle` was made non-writable via
     /// `Object.defineProperty(arr, "length", {writable:false})`. An array's
     /// `length` is writable by default.
@@ -3098,6 +3118,15 @@ impl Realm {
     /// `%TypedArray%` intrinsic), the accessor is recorded on its auxiliary
     /// object so a prototype-chain `get`/`set` still resolves it.
     pub fn define_accessor(&mut self, handle: Handle, key: &str, getter: NanBox, setter: NanBox) {
+        // Installing an integer-indexed accessor on the default array prototype
+        // chain (`%Array.prototype%` / `%Object.prototype%`) invalidates the
+        // "pristine Array.prototype ⇒ no inherited index setter" write fast path.
+        if key.parse::<u32>().is_ok_and(|i| i < u32::MAX) {
+            let ap = self.array_proto_intrinsic;
+            if Some(handle) == ap || ap.and_then(|p| self.object_proto(p)) == Some(handle) {
+                self.proto_index_accessor_dirty = true;
+            }
+        }
         if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.define_accessor(key, getter, setter);
             return;

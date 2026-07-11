@@ -2389,19 +2389,25 @@ impl<'a> Interp<'a> {
                 // / frozen), which it then honors. A typed-array view writes through
                 // its bytes via `set_element_checked`.
                 if self.realm.typed_kind(handle).is_none() {
-                    // OrdinarySet: when the index is an *absent* own slot (a hole
-                    // or past the end) and the array's `[[Prototype]]` is NOT the
-                    // default `%Array.prototype%` (which has no index setters), an
-                    // inherited setter / proxy on the chain handles the write —
-                    // e.g. `Object.setPrototypeOf(arr, proxy); arr[0] = v`. An
-                    // array with the default prototype stays on the dense fast path
-                    // (no walk, no key allocation).
+                    // OrdinarySet: when the index has no own property (a hole or past
+                    // the end) an inherited setter / proxy on the chain handles the
+                    // write. This walk is skipped for the common case — a pristine
+                    // `%Array.prototype%` chain (no inherited index setters) unless one
+                    // was installed (`proto_index_accessor_dirty`), e.g.
+                    // `Array.prototype[0] = set…` or `Object.setPrototypeOf(arr, proxy)`.
+                    // An *own* accessor at the index shadows any inherited one, so it
+                    // is left to `store_array_index` (which fires the own setter).
                     let absent_own = self
                         .realm
                         .array_length(handle)
                         .is_none_or(|len| i >= len || self.realm.get_element(handle, i).is_hole());
                     if absent_own
-                        && self.realm.object_proto(handle) != self.realm.array_proto_intrinsic()
+                        && (self.realm.object_proto(handle) != self.realm.array_proto_intrinsic()
+                            || self.realm.proto_index_accessor_dirty())
+                        && self
+                            .realm
+                            .accessor(handle, &alloc::format!("{i}"))
+                            .is_none()
                         && let Some(()) =
                             self.set_through_proto_chain(handle, &alloc::format!("{i}"), new)?
                     {
@@ -2531,16 +2537,17 @@ impl<'a> Interp<'a> {
     /// throws (the length is left one above the stuck index in both modes).
     pub(crate) fn write_array_length(&mut self, handle: Handle, n: usize) -> Result<(), ExecError> {
         if self.realm.array_length_is_readonly(handle) {
-            // A non-writable `length`: reject a real change.
-            let cur = self.realm.array_length(handle).unwrap_or(0);
-            if n != cur {
-                if self.strict {
-                    let m = self.new_str("Cannot assign to read only property 'length'");
-                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-                }
-                return Ok(()); // sloppy: silently dropped
+            // Ordinary `[[Set]]` of a non-writable data property returns `false`
+            // whether or not the new value equals the current one — the same-value
+            // exception lives only in `[[DefineOwnProperty]]`/ValidateAndApply, not
+            // in `[[Set]]`. So `Set(O, "length", V, true)` on a frozen / non-writable
+            // -length array (e.g. the closing `Set` of `pop`/`push` on an empty
+            // frozen array) throws in strict mode; a sloppy assignment drops silently.
+            if self.strict {
+                let m = self.new_str("Cannot assign to read only property 'length'");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
-            return Ok(()); // same-value: no-op
+            return Ok(()); // sloppy: silently dropped
         }
         let all_deleted = self.set_array_length_checked(handle, n)?;
         if !all_deleted && self.strict {
