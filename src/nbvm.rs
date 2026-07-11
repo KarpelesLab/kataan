@@ -6695,6 +6695,29 @@ impl Compiler {
         self.assign_pattern(target, value_reg)
     }
 
+    /// Binds one iteration's value to a `for-in`/`for-of` declaration head. A
+    /// `let`/`const` head introduces a fresh per-iteration binding
+    /// ([`Self::bind_pattern`]); a `var` head has *no* per-iteration binding — its
+    /// `ForBinding` resolves the hoisted (function-scope) `var` and `PutValue`s it,
+    /// so `for (var x in obj)` leaves `x` set to the last key after the loop. A
+    /// plain identifier takes that assignment path (when the hoisted binding is in
+    /// scope); anything else falls back to per-name binding.
+    fn bind_for_decl(
+        &mut self,
+        kind: &crate::ast::VarDeclKind,
+        target: &BindingTarget,
+        value_reg: Reg,
+    ) -> Result<(), CompileError> {
+        if *kind == crate::ast::VarDeclKind::Var
+            && let BindingTarget::Ident(Ident { name, .. }) = target
+            && let Some(b) = self.lookup(name)
+        {
+            self.write_var(b, value_reg);
+            return Ok(());
+        }
+        self.bind_pattern(target, value_reg)
+    }
+
     fn bind_pattern(&mut self, target: &BindingTarget, value_reg: Reg) -> Result<(), CompileError> {
         match target {
             BindingTarget::Ident(Ident { name, .. }) => {
@@ -7262,7 +7285,7 @@ impl Compiler {
                     index: i,
                 });
                 // The loop variable — an identifier or a destructuring pattern.
-                self.bind_pattern(target, cur)?;
+                self.bind_for_decl(kind, target, cur)?;
                 self.enter_loop();
                 self.stmt(body)?;
                 let cont = self.ops.len(); // `continue` advances the index
@@ -7287,7 +7310,7 @@ impl Compiler {
                 left, right, body, ..
             } => {
                 use crate::ast::ForLeft;
-                let ForLeft::Decl { target, .. } = left else {
+                let ForLeft::Decl { kind, target, .. } = left else {
                     return Err(CompileError::Unsupported("for-in binding"));
                 };
                 self.scopes.push(alloc::collections::BTreeMap::new());
@@ -7315,7 +7338,7 @@ impl Compiler {
                     arr,
                     index: i,
                 });
-                self.bind_pattern(target, cur)?;
+                self.bind_for_decl(kind, target, cur)?;
                 self.enter_loop();
                 self.stmt(body)?;
                 let cont = self.ops.len();

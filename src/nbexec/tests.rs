@@ -8246,13 +8246,103 @@ fn live_typed_array_iteration() {
         "true"
     );
     assert_eq!(run("[...new Float64Array([1.5,2.5])].join(',')"), "1.5,2.5");
-    // Plain arrays unchanged (snapshot fast path).
+    // A plain-array `for…of` is also **live**: the default `%ArrayIterator%`
+    // re-reads `length` each step (`CreateArrayIterator`), so an element pushed
+    // during the loop is visited (a value appended before the cursor reaches it).
     assert_eq!(
         run(
             "var a=[1,2,3];var out=[];var i=0;for(var x of a){out.push(x);if(i===0)a.push(99);i++}out.join(',')"
         ),
-        "1,2,3"
+        "1,2,3,99"
     );
+    // A `pop` during iteration contracts the live length (test262 for-of/array-contract).
+    assert_eq!(
+        run("var a=[0,1];var n=0;for(var x of a){a.pop();n++}n"),
+        "1"
+    );
+}
+
+#[test]
+fn construct_returning_a_function_yields_that_function() {
+    // ECMA-262 10.2.2 [[Construct]]: a constructor that returns an *object* makes
+    // `new` yield that object — a returned *function* is an object too (test262
+    // language/statements/function/S13.2.2_A8_*).
+    assert_eq!(
+        run(
+            "function F(){this.a=1;g.b=2;return g;function g(x){return x+1}} var o=new F(); o.a===undefined && o.b===2 && o(4)===5"
+        ),
+        "true"
+    );
+    // A returned primitive is ignored; the fresh instance wins.
+    assert_eq!(run("function F(){this.a=1;return 7} new F().a"), "1");
+}
+
+#[test]
+fn var_for_in_of_binding_writes_the_hoisted_var() {
+    // A `var` ForBinding has no per-iteration binding: it PutValue()s the hoisted
+    // function-scope var, so the name survives the loop with the last value.
+    assert_eq!(run("var a=5;for(var a in {x:1,y:2}){}a"), "y");
+    assert_eq!(
+        run("(function(){var a;for(var a of [1,2,3]){}return a})()"),
+        "3"
+    );
+    // Redeclaring the catch parameter via a `var` for-in writes through to it
+    // (test262 annexB try/catch-redeclared-for-in-var).
+    assert_eq!(
+        run(
+            "var after;try{throw 'e'}catch(err){for(var err in {propertyName:null}){}after=err}after"
+        ),
+        "propertyName"
+    );
+    // A `let`/`const` head keeps its own per-iteration binding (unchanged).
+    assert_eq!(run("var a=5;for(let a of [1,2]){}a"), "5");
+}
+
+#[test]
+fn for_of_over_plain_array_is_live() {
+    // test262 language/statements/for-of/array-expand and array-contract.
+    assert_eq!(
+        run("var a=[0];var n=0;var f=0,s=1;for(var x of a){f=s;s=null;if(f!==null)a.push(1);n++}n"),
+        "2"
+    );
+    assert_eq!(
+        run("var a=[0,1];var n=0;for(var x of a){a.pop();n++}n"),
+        "1"
+    );
+}
+
+#[test]
+fn sloppy_let_as_identifier_statement() {
+    // At a StatementListItem `let` heads a LexicalDeclaration only when a binding
+    // follows; `let = 1`, `let;`, `let.x` are expression statements over the
+    // ordinary identifier `let` (test262 for/head-lhs-let, for-in/head-lhs-let).
+    assert_eq!(run("var let;let=1;let"), "1");
+    assert_eq!(run("var let=3;let+4"), "7");
+    assert_eq!(run("var let=1,a;for(let;;){a='ran';break}a"), "ran");
+    // A real declaration still declares.
+    assert_eq!(run("let x=5;x"), "5");
+    // `async of => …` is an async arrow, valid as a classic-`for` initializer.
+    assert_eq!(run("var i=0,c=0;for(async of => {}; i<3; ++i){c++}c"), "3");
+    assert_eq!(run("typeof (async of => of)"), "function");
+}
+
+#[test]
+fn assignment_resolves_lhs_reference_before_rhs() {
+    // PutValue resolves the LHS reference *before* evaluating the RHS. A RHS that
+    // deletes the `with`-object binding still writes through to that object
+    // (SetMutableBinding recreates it in sloppy mode) — test262 S11.13.1_A5.
+    assert_eq!(
+        run("var x=0;var scope={x:1};with(scope){x=(delete scope.x,2)}''+scope.x+','+x"),
+        "2,0"
+    );
+    // A RHS whose direct `eval` creates a shadowing `var` does not capture the
+    // assignment: the LHS still names the outer binding — test262 S11.13.1_A6.
+    assert_eq!(
+        run("var x=0;var innerX=(function(){x=(eval('var x;'),1);return x})();''+innerX+','+x"),
+        "undefined,1"
+    );
+    // The ordinary case is unaffected.
+    assert_eq!(run("var a=1;a=a+1;a"), "2");
 }
 
 #[test]

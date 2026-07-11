@@ -2432,6 +2432,20 @@ impl<'a> Interp<'a> {
     /// (arrays/strings/Maps/Sets) and generator values, which `iterate_values`
     /// drains eagerly, and for non-iterables.
     pub(crate) fn for_of_get_iterator(&mut self, v: NanBox) -> Result<Option<Handle>, ExecError> {
+        self.for_of_get_iterator_ext(v, false)
+    }
+
+    /// As [`Self::for_of_get_iterator`], but when `array_live` is set a plain array
+    /// with the intrinsic `[Symbol.iterator]` returns a **live** `%ArrayIterator%`
+    /// (re-reads `length` and `Get`s each element per step) instead of `None` — so a
+    /// `for…of` observes `push`/`pop`/getter side effects mid-iteration, matching
+    /// `CreateArrayIterator`. Destructuring/spread callers pass `false` and keep the
+    /// eager snapshot path.
+    pub(crate) fn for_of_get_iterator_ext(
+        &mut self,
+        v: NanBox,
+        array_live: bool,
+    ) -> Result<Option<Handle>, ExecError> {
         let Some(h) = v.as_handle().map(Handle::from_raw) else {
             return Ok(None);
         };
@@ -2468,6 +2482,10 @@ impl<'a> Interp<'a> {
             let is_default = matches!((resolved, default_iter), (Some(r), Some(d))
                 if r.as_handle().is_some() && r.as_handle() == d.as_handle());
             if is_default {
+                if array_live {
+                    let it = self.make_live_array_iterator(h, 1);
+                    return Ok(it.as_handle().map(Handle::from_raw));
+                }
                 return Ok(None);
             }
             if let Some(f) = resolved

@@ -135,6 +135,11 @@ impl<'src> Parser<'src> {
                 TokenKind::LParen => self.paren_arrow_at(1),
                 // `async =>` — `async` itself is the parameter name.
                 TokenKind::Arrow => true,
+                // `async of => …` — a contextual keyword (`of`, `as`, `get`, …) is a
+                // valid single async-arrow parameter name.
+                TokenKind::Keyword(kw) if kw.is_contextual() => {
+                    self.nth_kind(2) == TokenKind::Arrow
+                }
                 _ => false,
             },
             TokenKind::Keyword(kw) if kw.is_contextual() => self.nth_kind(1) == TokenKind::Arrow,
@@ -171,8 +176,10 @@ impl<'src> Parser<'src> {
         let start = self.cur_span();
         let is_async = self.at(TokenKind::Keyword(Kw::Async)) && {
             // Only consume `async` as the arrow marker, not as a sole `async =>`
-            // parameter name.
+            // parameter name. A contextual keyword (`async of => …`) is a valid
+            // single parameter, so `async` is the marker there too.
             matches!(self.nth_kind(1), TokenKind::Identifier | TokenKind::LParen)
+                || matches!(self.nth_kind(1), TokenKind::Keyword(k) if k.is_contextual())
         };
         if is_async {
             self.bump();

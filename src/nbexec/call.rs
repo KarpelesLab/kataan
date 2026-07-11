@@ -2390,12 +2390,9 @@ impl<'a> Interp<'a> {
             // forms recognized are plain objects, arrays, and exotic
             // slot-bearing objects (typed arrays, DataViews, ArrayBuffers, Maps,
             // …) — so a constructor (or `Symbol.species`) that hands back a typed
-            // array is honored. (A returned *function* keeps the legacy lenient
-            // `this` result to preserve the curated `new.target` gate.)
-            if let Some(rh) = ret.as_handle().map(Handle::from_raw)
-                && self.is_object_value(ret)
-                && !self.is_callable(rh)
-            {
+            // array is honored — as is a returned *function* (functions are objects,
+            // so `new (function(){ return f; })` yields `f`, per ECMA-262 10.2.2).
+            if self.is_object_value(ret) {
                 return Ok(ret);
             }
             return Ok(this);
@@ -2488,10 +2485,7 @@ impl<'a> Interp<'a> {
             let this = NanBox::handle(instance.to_raw());
             self.realm.set_hidden_property(instance, CTOR_KEY, callee);
             let ret = self.call_with_this(callee, this, args)?;
-            if let Some(rh) = ret.as_handle().map(Handle::from_raw)
-                && self.is_object_value(ret)
-                && !self.is_callable(rh)
-            {
+            if self.is_object_value(ret) {
                 return Ok(ret);
             }
             return Ok(this);

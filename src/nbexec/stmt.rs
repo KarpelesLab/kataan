@@ -254,7 +254,7 @@ impl<'a> Interp<'a> {
                 // runs lazily: one `next()` per iteration, with `IteratorClose` on an
                 // early exit — so `break` calls `return()` and an infinite iterator can
                 // be cut short. `for await` keeps the eager path (it awaits each value).
-                if !*is_await && let Some(ih) = self.for_of_get_iterator(iterable)? {
+                if !*is_await && let Some(ih) = self.for_of_get_iterator_ext(iterable, true)? {
                     // A user `[Symbol.iterator]` that is a generator is still drained
                     // eagerly (its `next` is built-in dispatch, not a readable method) —
                     // from this same iterator, so it is not re-created.
@@ -693,6 +693,29 @@ impl<'a> Interp<'a> {
 
     /// Binds a (possibly destructuring) target to `value`, declaring the names
     /// it introduces in the current scope.
+    /// Binds one iteration's value to a `for-in`/`for-of` declaration head. A
+    /// `let`/`const`/`using` head gets a fresh per-iteration binding in the loop's
+    /// child scope ([`Self::bind_pattern`]). A `var` head, however, has no
+    /// per-iteration binding: its `ForBinding` is `BindingInitialization` with a
+    /// `undefined` environment, i.e. resolve the (hoisted, function-scope) binding
+    /// and `PutValue` — so `for (var x in obj)` leaves `x` set to the last key
+    /// after the loop, and `catch (e) { for (var e in obj) {} }` writes through to
+    /// the catch/var binding. A plain identifier takes that assignment path; a
+    /// destructuring `var` pattern falls back to per-name binding.
+    pub(crate) fn bind_for_decl(
+        &mut self,
+        kind: &crate::ast::VarDeclKind,
+        target: &'a BindingTarget,
+        value: NanBox,
+    ) -> Result<(), ExecError> {
+        if matches!(kind, crate::ast::VarDeclKind::Var)
+            && let BindingTarget::Ident(id) = target
+        {
+            return self.assign_to_name(&id.name, value);
+        }
+        self.bind_pattern(target, value)
+    }
+
     pub(crate) fn bind_pattern(
         &mut self,
         target: &'a BindingTarget,
@@ -898,7 +921,7 @@ impl<'a> Interp<'a> {
             let r = (|| {
                 match left {
                     ForLeft::Decl { kind, target, .. } => {
-                        self.bind_pattern(target, item)?;
+                        self.bind_for_decl(kind, target, item)?;
                         // A `for (using x of …)` / `for (await using x of …)`
                         // head records `x` as a disposable, disposed at the end of
                         // *this* iteration (in reverse order with any others).
@@ -959,7 +982,7 @@ impl<'a> Interp<'a> {
             let r = (|| {
                 match left {
                     ForLeft::Decl { kind, target, .. } => {
-                        self.bind_pattern(target, item)?;
+                        self.bind_for_decl(kind, target, item)?;
                         if matches!(
                             kind,
                             crate::ast::VarDeclKind::Using | crate::ast::VarDeclKind::AwaitUsing

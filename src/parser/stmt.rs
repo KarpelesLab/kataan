@@ -217,7 +217,16 @@ impl<'src> Parser<'src> {
                 let span = self.bump().span;
                 Ok(Stmt::Empty { span })
             }
-            TokenKind::Keyword(Kw::Var | Kw::Let | Kw::Const) => self.parse_var_statement(),
+            TokenKind::Keyword(Kw::Var | Kw::Const) => self.parse_var_statement(),
+            // `let` heads a `LexicalDeclaration` only when followed by a binding
+            // (`let x`, `let [`, `let {`); otherwise (sloppy code) it is the
+            // ordinary identifier `let` and the construct is an
+            // `ExpressionStatement` — `let = 1`, `let;`, `let.foo`, `let instanceof
+            // x`. (`let [` is always a declaration per the grammar lookahead.)
+            // Strict-mode misuse of bare `let` is caught by the post-parse
+            // identifier-reference validator.
+            TokenKind::Keyword(Kw::Let) if self.let_binding_follows() => self.parse_var_statement(),
+            TokenKind::Keyword(Kw::Let) => self.parse_expression_statement(),
             // `using x = …` / `await using x = …` — explicit-resource-management
             // declarations (only at a `StatementListItem` position). `using` and
             // `await` are otherwise ordinary identifiers, so this is gated on a
@@ -417,6 +426,25 @@ impl<'src> Parser<'src> {
     /// Whether the token `n` ahead is a `BindingIdentifier` that may follow
     /// `using` — an identifier (but not `using` itself) or `yield`/`await` used
     /// as a name. Patterns (`[`/`{`) are not permitted after `using`.
+    /// Whether the token after a leading `let` begins a `LexicalDeclaration`
+    /// binding — i.e. `let` heads a declaration rather than being the ordinary
+    /// identifier `let` in an `ExpressionStatement`. A binding follows on `[`/`{`
+    /// (`let [a]`, `let {a}` — `let [` is always a declaration per the grammar
+    /// lookahead) or a `BindingIdentifier` name. Crucially `await`/`yield` count as
+    /// binding identifiers here *regardless of context*: `let\nawait 0` inside an
+    /// async function is the declaration `let await` (an early error), not
+    /// `let; await 0;` via ASI. Operators/`=`/`;`/`.`/`(` do not begin a binding, so
+    /// `let = 1`, `let;`, `let.x`, `let instanceof y` are expression statements.
+    fn let_binding_follows(&self) -> bool {
+        match self.nth_kind(1) {
+            TokenKind::LBracket | TokenKind::LBrace | TokenKind::Identifier => true,
+            TokenKind::Keyword(kw) => {
+                self.keyword_is_binding_ident(kw) || matches!(kw, Kw::Yield | Kw::Await)
+            }
+            _ => false,
+        }
+    }
+
     fn nth_is_binding_ident(&self, n: usize) -> bool {
         match self.nth_kind(n) {
             TokenKind::Identifier => self
@@ -786,8 +814,14 @@ impl<'src> Parser<'src> {
         // production, whose head only excludes a leading `let`; there `async` is a
         // valid LHS identifier (`for await (async of x)`). A bare `async` followed
         // by `of` can only be the forbidden form, so reject it eagerly — but only
-        // outside `for await`.
-        if !is_await && self.peek_tok().text(self.source) == "async" && self.nth_is_named(1, "of") {
+        // outside `for await`. The exception is `async of => …`, an *async arrow*
+        // (`async (of) => …`) used as a classic-`for` initializer; the following
+        // `=>` disambiguates it, so it is not the forbidden `for-of` LHS.
+        if !is_await
+            && self.peek_tok().text(self.source) == "async"
+            && self.nth_is_named(1, "of")
+            && self.nth_kind(2) != TokenKind::Arrow
+        {
             return Err(self.err("`async` may not be the left-hand side of a `for-of` loop"));
         }
 

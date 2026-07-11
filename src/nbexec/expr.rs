@@ -3759,6 +3759,28 @@ impl<'a> Interp<'a> {
         } else {
             false
         };
+        // PutValue also resolves *which* binding the LHS names before the RHS runs.
+        // Capture that base now — the `with`-object frame that provides the name, or
+        // else the scope frame that owns it — so a RHS that mutates the binding
+        // structure (a `with`-object `delete`, or a direct-eval `var` that creates a
+        // shadowing local) cannot redirect the write to a different binding
+        // (test262 assignment/S11.13.1_A5*/A6*). The `with` walk is gated on there
+        // being a `with` scope at all, keeping the common case a single frame walk.
+        let (ident_with_ref, ident_owner_scope) = if let Expr::Ident(id) = target {
+            let with_ref = if self.in_with_scope() {
+                self.with_binding_result(&id.name)?
+            } else {
+                None
+            };
+            let owner = if with_ref.is_none() {
+                self.current.owner_frame(&id.name)
+            } else {
+                None
+            };
+            (with_ref, owner)
+        } else {
+            (None, None)
+        };
         let rhs = self.eval(value)?;
         self.pending_class_name = None;
         // Destructuring assignment: `[a, b] = …` / `({ x } = …)`.
@@ -3783,8 +3805,9 @@ impl<'a> Interp<'a> {
                 }
                 // A bare identifier inside `with (obj)` reads/writes the with-object's
                 // property when it provides the name (so `with(o){ x op= v }` and
-                // setters/getters work).
-                if let Some(h) = self.with_binding_result(name)? {
+                // setters/getters work). The providing object was resolved *before*
+                // the RHS (`ident_with_ref`), per PutValue's reference order.
+                if let Some(h) = ident_with_ref {
                     let new = if op == AssignOp::Assign {
                         rhs
                     } else {
@@ -3855,7 +3878,15 @@ impl<'a> Interp<'a> {
                     let current = self.read_ident_ref(name)?;
                     self.binary(compound_op(op)?, current, rhs)?
                 };
-                if !self.current.set(name, new) {
+                // Write through the frame resolved *before* the RHS
+                // (`ident_owner_scope`) so a direct-eval `var` created by the RHS
+                // cannot capture the assignment; in the common case this is the same
+                // frame `self.current.set` would find.
+                let stored = match &ident_owner_scope {
+                    Some(sc) => sc.set(name, new),
+                    None => self.current.set(name, new),
+                };
+                if !stored {
                     // A property on the global object (created via `this.x = …` /
                     // `globalThis.x = …`, or a global `var`) is a *resolvable*
                     // reference — assignment updates it, in strict mode too. Only a
