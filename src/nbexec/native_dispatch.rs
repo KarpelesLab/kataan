@@ -3480,7 +3480,10 @@ impl<'a> Interp<'a> {
                 // sign/integer-group/decimal/fraction split) via the shared helper.
                 let entries: Vec<(&'static str, String)> = match fmt {
                     Some(h) if self.realm.get_property(h, "\u{0}intl").is_some() => {
-                        self.number_handle_parts(h, arg(0))
+                        // ToIntlMathematicalValue: coerce (ToPrimitive/ToNumber, BigInt
+                        // via its value) before splitting into parts.
+                        let n = self.coerce_intl_number(arg(0))?;
+                        self.number_handle_parts(h, NanBox::number(n))
                     }
                     _ => {
                         // A plain (non-Intl) receiver: classify the coerced display string.

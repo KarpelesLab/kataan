@@ -168,6 +168,231 @@ fn numbering_system_name_from_zero(c: char) -> Option<&'static str> {
     })
 }
 
+/// Whether a decimal digit vector, rounded at index `cut`, rounds *up* under
+/// `mode`. Mirrors `intl::number`'s internal `should_round_up`, but the caller
+/// feeds the value's **shortest round-trip decimal** so the rounding boundary
+/// matches ECMA-402 / ICU (which rounds the shortest decimal) rather than the
+/// f64's exact binary expansion (`1.15` is really `1.1499…`, so the crate's own
+/// path wrongly rounds it *down*).
+#[cfg(feature = "intl")]
+fn dec_round_up(
+    digits: &[u8],
+    cut: usize,
+    mode: intl::number::RoundingMode,
+    negative: bool,
+) -> bool {
+    use intl::number::RoundingMode::*;
+    if cut >= digits.len() {
+        return false;
+    }
+    let first = digits[cut];
+    let rest_nonzero = digits[cut + 1..].iter().any(|&d| d != 0);
+    let any = first != 0 || rest_nonzero;
+    let gt_half = first > 5 || (first == 5 && rest_nonzero);
+    let eq_half = first == 5 && !rest_nonzero;
+    let kept_last_odd = cut > 0 && digits[cut - 1] % 2 == 1;
+    match mode {
+        Trunc => false,
+        Expand => any,
+        Ceil => any && !negative,
+        Floor => any && negative,
+        HalfExpand => gt_half || eq_half,
+        HalfTrunc => gt_half,
+        HalfEven => gt_half || (eq_half && kept_last_odd),
+        HalfCeil => gt_half || (eq_half && !negative),
+        HalfFloor => gt_half || (eq_half && negative),
+    }
+}
+
+/// Add `delta` (< 10^18) at the units place of a big-endian decimal digit vector,
+/// growing `point` (integer-digit count) on a leading carry.
+#[cfg(feature = "intl")]
+fn dec_add_units(digits: &mut alloc::vec::Vec<u8>, point: &mut usize, delta: u64) {
+    let mut carry = delta;
+    let mut i = digits.len();
+    while carry > 0 && i > 0 {
+        i -= 1;
+        let sum = digits[i] as u64 + carry;
+        digits[i] = (sum % 10) as u8;
+        carry = sum / 10;
+    }
+    while carry > 0 {
+        digits.insert(0, (carry % 10) as u8);
+        carry /= 10;
+        *point += 1;
+    }
+}
+
+/// Subtract `delta` (≤ the represented value) at the units place of a big-endian
+/// decimal digit vector.
+#[cfg(feature = "intl")]
+fn dec_sub_units(digits: &mut [u8], mut delta: u64) {
+    let mut i = digits.len();
+    while delta > 0 && i > 0 {
+        i -= 1;
+        let cur = digits[i] as i64 - (delta % 10) as i64;
+        delta /= 10;
+        if cur < 0 {
+            digits[i] = (cur + 10) as u8;
+            delta += 1;
+        } else {
+            digits[i] = cur as u8;
+        }
+    }
+}
+
+/// Round the **shortest round-trip decimal** of finite non-zero `n` to `keep_frac`
+/// fraction digits (or, when `sig` is `Some`, to that many significant digits)
+/// under `mode`, then snap to the nearest multiple of `increment` at the fraction
+/// place. Returns a "clean" f64 whose exact binary expansion re-renders (through
+/// `intl::number::format`) to the ECMA-402-correct digits, sidestepping the
+/// crate's binary-expansion rounding boundary. See [`dec_round_up`].
+#[cfg(feature = "intl")]
+fn intl_decimal_round(
+    n: f64,
+    keep_frac: usize,
+    sig: Option<usize>,
+    increment: u32,
+    mode: intl::number::RoundingMode,
+) -> f64 {
+    if !n.is_finite() || n == 0.0 {
+        return n;
+    }
+    let negative = n.is_sign_negative();
+    let abs = n.abs();
+    let s = alloc::format!("{abs}");
+    let (ip, fp) = s.split_once('.').unwrap_or((s.as_str(), ""));
+    let mut digits: alloc::vec::Vec<u8> = ip.bytes().chain(fp.bytes()).map(|b| b - b'0').collect();
+    let mut point = ip.len();
+    if increment > 1 && sig.is_none() {
+        // `roundingIncrement`: round `value × 10^keep_frac` to the nearest multiple
+        // of `increment`, comparing the full discarded remainder against the
+        // increment midpoint (no intermediate rounding to the fraction place, which
+        // would double-round, e.g. 1.25 inc=2 → 1.2, not 1.4).
+        let inc = increment as u64;
+        // Pad so exactly `point + keep_frac` digits precede the cut.
+        while digits.len() < point + keep_frac {
+            digits.push(0);
+        }
+        let cut = point + keep_frac;
+        // Remainder of the kept integer modulo the increment, and the quotient's
+        // low bit (for ties-to-even on the multiple index).
+        let mut rem_int: u64 = 0;
+        let mut q_low: u64 = 0;
+        for &d in &digits[..cut] {
+            let cur = rem_int * 10 + d as u64;
+            q_low = q_low.wrapping_mul(10).wrapping_add(cur / inc);
+            rem_int = cur % inc;
+        }
+        // Fractional remainder below the cut, classified against 1/2.
+        let first = digits.get(cut).copied().unwrap_or(0);
+        let rest_nonzero = cut < digits.len() && digits[cut + 1..].iter().any(|&d| d != 0);
+        let frac_pos = cut < digits.len() && (first != 0 || rest_nonzero);
+        let frac_gt_half = first > 5 || (first == 5 && rest_nonzero);
+        let frac_eq_half = first == 5 && !rest_nonzero;
+        // Zero the fraction below the cut, keep the kept integer.
+        digits.truncate(cut);
+        let twice = rem_int * 2;
+        let tie = {
+            use intl::number::RoundingMode::*;
+            match mode {
+                Trunc | HalfTrunc => false,
+                Floor => negative,
+                Ceil => !negative,
+                HalfFloor => negative,
+                HalfCeil | HalfExpand | Expand => true,
+                HalfEven => (q_low & 1) == 1,
+            }
+        };
+        let up_snap = match twice.cmp(&inc) {
+            core::cmp::Ordering::Greater => true,
+            core::cmp::Ordering::Equal => {
+                if frac_pos {
+                    true
+                } else {
+                    tie
+                }
+            }
+            core::cmp::Ordering::Less => {
+                if inc - twice == 1 {
+                    frac_gt_half || (frac_eq_half && tie)
+                } else {
+                    false
+                }
+            }
+        };
+        if up_snap {
+            dec_add_units(&mut digits, &mut point, inc - rem_int);
+        } else if rem_int > 0 {
+            dec_sub_units(&mut digits, rem_int);
+        }
+    } else {
+        let cut = if let Some(ms) = sig {
+            match digits.iter().position(|&d| d != 0) {
+                Some(fz) => (fz + ms).min(digits.len()),
+                None => point,
+            }
+        } else {
+            (point + keep_frac).min(digits.len())
+        };
+        let up = dec_round_up(&digits, cut, mode, negative);
+        for d in digits.iter_mut().skip(cut).take(point.saturating_sub(cut)) {
+            *d = 0;
+        }
+        digits.truncate(cut.max(point));
+        if up {
+            let mut i = cut;
+            loop {
+                if i == 0 {
+                    digits.insert(0, 1);
+                    point += 1;
+                    break;
+                }
+                i -= 1;
+                if digits[i] == 9 {
+                    digits[i] = 0;
+                } else {
+                    digits[i] += 1;
+                    break;
+                }
+            }
+        }
+    }
+    let int_s: String = digits[..point]
+        .iter()
+        .map(|&d| (b'0' + d) as char)
+        .collect();
+    let frac_s: String = digits[point..]
+        .iter()
+        .map(|&d| (b'0' + d) as char)
+        .collect();
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    out.push_str(if int_s.is_empty() { "0" } else { &int_s });
+    if !frac_s.is_empty() {
+        out.push('.');
+        out.push_str(&frac_s);
+    }
+    out.parse::<f64>().unwrap_or(n)
+}
+
+/// Whether a locale renders a negative `currencySign: "accounting"` amount with
+/// parentheses (the CLDR root default, inherited by en/ja/ko/zh and most others)
+/// rather than a leading minus (e.g. de-DE). Approximates the accounting pattern
+/// the `intl` crate does not expose; the minus-sign locales are left to the crate.
+#[cfg(feature = "intl")]
+fn accounting_uses_parens(locale: &str) -> bool {
+    let lang = locale
+        .split(['-', '_'])
+        .next()
+        .unwrap_or(locale)
+        .to_ascii_lowercase();
+    // Locales known to keep a minus sign in their accounting pattern.
+    !matches!(lang.as_str(), "de" | "nl" | "fi" | "hu" | "et")
+}
+
 /// `WeekdayToString` for `Intl.Locale`'s `firstDayOfWeek`: a weekday name
 /// (`mon`…`sun`) or the 1–7 numeric form (1 = Monday) maps to the canonical name;
 /// anything else is invalid.
@@ -1138,8 +1363,23 @@ impl<'a> Interp<'a> {
             let ms = self.datetime_operand(value)?;
             Ok(self.format_intl_datetime(inst, ms))
         } else {
-            Ok(self.intl_format_value(inst, value))
+            let n = self.coerce_intl_number(value)?;
+            Ok(self.intl_format_value(inst, NanBox::number(n)))
         }
+    }
+
+    /// `Intl.NumberFormat` operand coercion (a reduced `ToIntlMathematicalValue`
+    /// collapsed to an f64): a BigInt uses its numeric value; everything else is
+    /// `ToPrimitive`(number) then `ToNumber` — so an object with a `valueOf`
+    /// returning a numeric string formats as that number, and a `Symbol` throws.
+    pub(crate) fn coerce_intl_number(&mut self, value: NanBox) -> Result<f64, ExecError> {
+        if let Some(h) = value.as_handle().map(Handle::from_raw)
+            && let Some(big) = self.realm.bigint_at(h)
+        {
+            return Ok(big.to_f64());
+        }
+        let prim = self.coerce_to_number(value)?;
+        Ok(self.realm.to_number(prim))
     }
 
     /// Builds an `Intl.NumberFormat`/`DateTimeFormat` instance — an object that
@@ -1964,9 +2204,14 @@ impl<'a> Interp<'a> {
             let priority =
                 get_str(self, "roundingPriority").unwrap_or_else(|| String::from("auto"));
             let has_sig = mnsd.is_some() || mxsd.is_some();
+            // SetNumberFormatDigitOptions defaults: the currency-specific fraction
+            // digits apply only in "standard" notation; compact defaults max to 0;
+            // scientific/engineering (and standard non-currency) use 0..=3; percent 0.
+            let notation = get_str(self, "notation").unwrap_or_else(|| String::from("standard"));
             let (def_min, def_max): (f64, f64) = match style.as_str() {
-                "currency" => (2.0, 2.0),
+                "currency" if notation == "standard" => (2.0, 2.0),
                 "percent" => (0.0, 0.0),
+                _ if notation == "compact" => (0.0, 0.0),
                 _ => (0.0, 3.0),
             };
             let report_frac = |this: &mut Self, out: Handle| {
@@ -2208,9 +2453,27 @@ impl<'a> Interp<'a> {
         {
             return Err(self.type_error("formatRange requires two defined arguments"));
         }
-        let x = self.coerce_to_number(start)?;
-        let y = self.coerce_to_number(end)?;
-        let (x, y) = (self.realm.to_number(x), self.realm.to_number(y));
+        // `Intl.NumberFormat` uses ToIntlMathematicalValue, which accepts a BigInt
+        // operand (via its numeric value); `Intl.DateTimeFormat` uses ToNumber,
+        // which throws on a BigInt. Branch on the receiver kind.
+        let is_number_format = self
+            .realm
+            .get_property(inst, "\u{0}intl")
+            .map(|k| self.realm.to_display_string(k))
+            .as_deref()
+            == Some("number");
+        let coerce_operand = |this: &mut Self, v: NanBox| -> Result<f64, ExecError> {
+            if is_number_format
+                && let Some(h) = v.as_handle().map(Handle::from_raw)
+                && let Some(big) = this.realm.bigint_at(h)
+            {
+                return Ok(big.to_f64());
+            }
+            let n = this.coerce_to_number(v)?;
+            Ok(this.realm.to_number(n))
+        };
+        let x = coerce_operand(self, start)?;
+        let y = coerce_operand(self, end)?;
         if x.is_nan() || y.is_nan() {
             let m = self.new_str("formatRange arguments must not be NaN");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
@@ -3530,13 +3793,23 @@ impl<'a> Interp<'a> {
             Some("halfEven") => RoundingMode::HalfEven,
             _ => RoundingMode::HalfExpand,
         };
-        if matches!(
-            self.realm
-                .get_property(handle, "useGrouping")
-                .map(|v| v.unpack()),
-            Some(Unpacked::Bool(false))
-        ) {
-            o.use_grouping = UseGrouping::Never;
+        // `useGrouping` is stored as a boolean (`false` → never, `true` → always) or
+        // a string (`"min2"`/`"auto"`/`"always"`), per GetStringOrBooleanOption.
+        match self
+            .realm
+            .get_property(handle, "useGrouping")
+            .map(|v| v.unpack())
+        {
+            Some(Unpacked::Bool(false)) => o.use_grouping = UseGrouping::Never,
+            Some(Unpacked::Bool(true)) => o.use_grouping = UseGrouping::Always,
+            Some(_) => match opt_str(self, "useGrouping").as_deref() {
+                Some("min2") => o.use_grouping = UseGrouping::Min2,
+                Some("always") | Some("true") => o.use_grouping = UseGrouping::Always,
+                Some("false") => o.use_grouping = UseGrouping::Never,
+                // "auto" (and the absence of the option) keeps the locale default.
+                _ => {}
+            },
+            None => {}
         }
         if let Some(mid) = opt_num(self, "minimumIntegerDigits") {
             o.minimum_integer_digits = mid;
@@ -3608,6 +3881,64 @@ impl<'a> Interp<'a> {
         String::from("latn")
     }
 
+    /// Pre-round `n` to the resolved precision using the ECMA-402 / ICU decimal
+    /// rounding (see [`intl_decimal_round`]), returning a value the `intl` crate
+    /// re-renders correctly. Applies to standard-notation decimal/currency only:
+    /// percent (the crate scales by 100) and scientific/engineering/compact
+    /// (mantissa rounding) are left untouched. Shared by `format`/`formatToParts`.
+    #[cfg(feature = "intl")]
+    fn number_precision_round(
+        &mut self,
+        handle: Handle,
+        opts: &mut intl::number::NumberFormatOptions,
+        n: f64,
+    ) -> f64 {
+        use intl::number::{Notation, NumberStyle};
+        if !n.is_finite() || n == 0.0 || opts.notation != Notation::Standard {
+            return n;
+        }
+        if matches!(opts.style, NumberStyle::Percent) {
+            return n;
+        }
+        // `roundingPriority` other than the default `auto` combines the significant-
+        // and fraction-digit results in a way the crate can't express; leave those
+        // to the existing path rather than pre-rounding on the wrong precision.
+        let priority = self
+            .realm
+            .get_property(handle, "roundingPriority")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_default();
+        if matches!(priority.as_str(), "morePrecision" | "lessPrecision")
+            && opts.maximum_significant_digits.is_some()
+            && opts.maximum_fraction_digits.is_some()
+        {
+            return n;
+        }
+        let increment = self
+            .realm
+            .get_property(handle, "roundingIncrement")
+            .and_then(|v| v.as_number())
+            .unwrap_or(1.0) as u32;
+        let sig = opts.maximum_significant_digits.map(|s| s as usize);
+        // Effective maximum fraction digits (the crate's pattern default when unset).
+        let default_max = match opts.style {
+            NumberStyle::Currency if opts.currency == Some("JPY") => 0,
+            NumberStyle::Currency => 2,
+            _ => 3,
+        };
+        let keep_frac = opts
+            .maximum_fraction_digits
+            .map(|m| m as usize)
+            .unwrap_or(default_max);
+        let rounded = intl_decimal_round(n, keep_frac, sig, increment, opts.rounding_mode);
+        // We already applied the correct rounding to the shortest decimal; hand the
+        // crate a mode that won't re-round the pre-rounded value's f64 noise (a
+        // directional mode like `ceil`/`expand` would spuriously round `1.3` — really
+        // `1.30000…0444` — up again). `halfExpand` leaves the clean value untouched.
+        opts.rounding_mode = intl::number::RoundingMode::HalfExpand;
+        rounded
+    }
+
     fn intl_format_number_inner(&mut self, handle: Handle, n: f64) -> String {
         #[cfg(feature = "intl")]
         if !self.number_uses_handrolled(handle) {
@@ -3617,31 +3948,11 @@ impl<'a> Interp<'a> {
                 .map(|v| self.realm.to_display_string(v))
                 .unwrap_or_else(|| String::from("en"));
             let mut opts = self.number_format_options(handle);
-            // `roundingIncrement`: round to the nearest `increment × 10^-maxFrac`
-            // step (the intl crate has no such option). Only when > 1 (the default);
-            // a basic half-away-from-zero rounding covers the common cases.
-            let n = {
-                let inc = self
-                    .realm
-                    .get_property(handle, "roundingIncrement")
-                    .and_then(|v| v.as_number())
-                    .unwrap_or(1.0);
-                if inc > 1.0 && n.is_finite() {
-                    let max_frac = self
-                        .realm
-                        .get_property(handle, "maximumFractionDigits")
-                        .and_then(|v| v.as_number())
-                        .unwrap_or(0.0);
-                    let step = inc * 10f64.powi(-(max_frac as i32));
-                    if step > 0.0 {
-                        (n / step).round() * step
-                    } else {
-                        n
-                    }
-                } else {
-                    n
-                }
-            };
+            // Round the value's shortest round-trip decimal ourselves (ECMA-402 /
+            // ICU rounding) and hand the crate a "clean" value — this fixes the
+            // crate's binary-expansion rounding boundary (`1.15` → `1.2`, not `1.1`)
+            // and applies `roundingIncrement` (which the crate has no option for).
+            let n = self.number_precision_round(handle, &mut opts, n);
             // `trailingZeroDisplay: "stripIfInteger"`: an integer value drops its
             // forced trailing fraction (and significant) zeros. The intl crate has
             // no such option, so lower the minimum digit counts for this value.
@@ -3658,39 +3969,16 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
-            // `intl` 0.4 panics on negative zero; format +0 and re-apply the sign.
-            if n == 0.0 && n.is_sign_negative() {
-                let body = intl::number::format(&locale, 0.0, &opts);
-                let sd = self
-                    .realm
-                    .get_property(handle, "signDisplay")
-                    .map(|v| self.realm.to_display_string(v))
-                    .unwrap_or_default();
-                // `never`/`exceptZero`/`negative` do not sign a negative *zero*
-                // (only `auto`/`always` do).
-                if !matches!(sd.as_str(), "never" | "exceptZero" | "negative")
-                    && !body.starts_with('-')
-                {
-                    // `signDisplay: "always"` formatted `+0` as "+0"; -0 takes the
-                    // negative sign, so drop a leading "+" before prepending "-".
-                    let mag = body.strip_prefix('+').unwrap_or(&body);
-                    // `currencySign: "accounting"` parenthesizes a negative -0 in
-                    // the en family (e.g. "($0.00)"), matching the finite path below.
-                    let en_family = locale == "en" || locale.starts_with("en-");
-                    if en_family
-                        && self
-                            .realm
-                            .get_property(handle, "currencySign")
-                            .map(|v| self.realm.to_display_string(v))
-                            .as_deref()
-                            == Some("accounting")
-                    {
-                        return alloc::format!("({mag})");
-                    }
-                    return alloc::format!("-{mag}");
-                }
-                return body;
-            }
+            // `intl` 0.5 panics formatting a true negative zero. Substitute the
+            // smallest negative subnormal (which rounds to a displayed zero) so the
+            // crate applies the locale's negative affix (e.g. ar's U+200E mark) and
+            // the resolved `signDisplay` logic uniformly, instead of us hand-rolling
+            // the sign and losing locale marks.
+            let n = if n == 0.0 && n.is_sign_negative() {
+                -f64::from_bits(1)
+            } else {
+                n
+            };
             let formatted = intl::number::format(&locale, n, &opts);
             // A small-magnitude negative that rounds to a displayed zero
             // (e.g. -0.0001 → "0", or -0.004 currency → "$0.00") carries no sign
@@ -3728,13 +4016,12 @@ impl<'a> Interp<'a> {
                 return alloc::format!("+{formatted}");
             }
             // `currencySign: "accounting"` renders a negative currency amount in the
-            // locale's accounting pattern. That pattern is CLDR-locale data: the
-            // en family parenthesizes (`($5.00)`), but many locales (e.g. de-DE:
-            // `-987,00 $`) just keep the minus. The intl crate has no currencySign
-            // field, so approximate the parenthesizing locales (en) here and leave
-            // the rest on the crate's minus output.
-            let en_family = locale == "en" || locale.starts_with("en-");
-            if en_family
+            // locale's accounting pattern. That pattern is CLDR-locale data: most
+            // locales inherit the root's parenthesized form (`($5.00)`), but some
+            // (e.g. de-DE: `-987,00 $`) keep the minus. The intl crate has no
+            // currencySign field, so approximate the parenthesizing locales here and
+            // leave the minus-locales on the crate's output.
+            if accounting_uses_parens(&locale)
                 && formatted.starts_with('-')
                 && self
                     .realm
@@ -4633,27 +4920,65 @@ impl<'a> Interp<'a> {
                 .get_property(handle, "\u{0}locale")
                 .map(|v| self.realm.to_display_string(v))
                 .unwrap_or_else(|| String::from("en"));
-            let opts = self.number_format_options(handle);
-            // `intl` 0.4 panics formatting negative zero; format +0 and re-apply the
-            // sign per `signDisplay` (negative zero shows "-0" under auto/always).
-            let neg_zero = n == 0.0 && n.is_sign_negative();
-            let feed = if neg_zero { 0.0 } else { n };
+            let mut opts = self.number_format_options(handle);
+            // Pre-round to the ECMA-402 / ICU decimal (matches the `format` path).
+            let n = self.number_precision_round(handle, &mut opts, n);
+            // `intl` 0.5 panics formatting a true negative zero; feed the smallest
+            // negative subnormal (rounds to a displayed zero) so the crate emits the
+            // proper minusSign / locale marks and applies `signDisplay` itself.
+            let feed = if n == 0.0 && n.is_sign_negative() {
+                -f64::from_bits(1)
+            } else {
+                n
+            };
             let mut parts: Vec<(&'static str, String)> =
                 intl::number::format_to_parts(&locale, feed, &opts)
                     .into_iter()
                     .map(|p| (p.kind.as_str(), p.value))
                     .collect();
-            if neg_zero {
-                let sd = self
-                    .realm
-                    .get_property(handle, "signDisplay")
-                    .map(|v| self.realm.to_display_string(v))
-                    .unwrap_or_default();
-                let show = !matches!(sd.as_str(), "never" | "exceptZero")
-                    && !parts.iter().any(|(t, _)| *t == "minusSign");
-                if show {
-                    parts.insert(0, ("minusSign", String::from("-")));
-                }
+            let sd = self
+                .realm
+                .get_property(handle, "signDisplay")
+                .map(|v| self.realm.to_display_string(v))
+                .unwrap_or_default();
+            // The crate leaves NaN unsigned; `signDisplay: "always"` prefixes a
+            // plusSign part ("+NaN"), matching the string `format` path.
+            if n.is_nan()
+                && sd == "always"
+                && !parts
+                    .iter()
+                    .any(|(t, _)| *t == "minusSign" || *t == "plusSign")
+            {
+                parts.insert(0, ("plusSign", String::from("+")));
+            }
+            // The crate aliases `signDisplay: "negative"` to `"auto"`, so it wrongly
+            // signs a value that rounds to a displayed zero; "negative"/"never"/
+            // "exceptZero" must not sign zero. Drop the minusSign in that case.
+            if matches!(sd.as_str(), "negative" | "never" | "exceptZero")
+                && parts.iter().any(|(t, _)| *t == "minusSign")
+                && !parts.iter().any(|(t, v)| {
+                    matches!(*t, "integer" | "fraction") && v.chars().any(|c| c != '0')
+                })
+                && !parts.iter().any(|(t, _)| matches!(*t, "nan" | "infinity"))
+            {
+                parts.retain(|(t, _)| *t != "minusSign");
+            }
+            // `currencySign: "accounting"` parenthesizes a negative amount in the
+            // parenthesizing locales (see `accounting_uses_parens`): the minusSign
+            // part becomes a leading `literal "("` and a trailing `literal ")"`.
+            let accounting = self
+                .realm
+                .get_property(handle, "currencySign")
+                .map(|v| self.realm.to_display_string(v))
+                .as_deref()
+                == Some("accounting");
+            if accounting
+                && accounting_uses_parens(&locale)
+                && parts.iter().any(|(t, _)| *t == "minusSign")
+            {
+                parts.retain(|(t, _)| *t != "minusSign");
+                parts.insert(0, ("literal", String::from("(")));
+                parts.push(("literal", String::from(")")));
             }
             return parts;
         }
@@ -5788,4 +6113,54 @@ fn titlecase_script(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(all(test, feature = "intl"))]
+mod decimal_round_tests {
+    use super::intl_decimal_round;
+    use intl::number::RoundingMode;
+
+    // Round a value and render it the way `intl::number::format` would for en-US
+    // decimal (min/max fraction), so the assertions read like the ECMA-402 output.
+    fn fmt(n: f64, keep_frac: usize, sig: Option<usize>, inc: u32, mode: RoundingMode) -> f64 {
+        intl_decimal_round(n, keep_frac, sig, inc, mode)
+    }
+
+    #[test]
+    fn shortest_decimal_boundary() {
+        // 1.15 is really 1.1499… in f64; ECMA-402 rounds the *shortest* decimal up.
+        assert_eq!(fmt(1.15, 3, Some(2), 1, RoundingMode::HalfExpand), 1.2);
+        assert_eq!(fmt(1.15, 3, Some(2), 1, RoundingMode::HalfEven), 1.2);
+        assert_eq!(fmt(1.15, 3, Some(2), 1, RoundingMode::HalfCeil), 1.2);
+        assert_eq!(fmt(-1.15, 3, Some(2), 1, RoundingMode::HalfFloor), -1.2);
+        // 123.445 minSig handled by crate; here max 5 sig → 123.45.
+        assert_eq!(
+            fmt(123.445, 3, Some(5), 1, RoundingMode::HalfExpand),
+            123.45
+        );
+    }
+
+    #[test]
+    fn rounding_increment_direct() {
+        // 1.25 inc=2 maxFrac=1 → nearest 0.2 → 1.2 (not double-rounded to 1.4).
+        assert_eq!(fmt(1.25, 1, None, 2, RoundingMode::HalfExpand), 1.2);
+        // 1.075 inc=5 maxFrac=2 → nearest 0.05, tie → away → 1.10.
+        assert_eq!(fmt(1.0750, 2, None, 5, RoundingMode::HalfExpand), 1.1);
+        // 1.15 inc=10 maxFrac=2 → nearest 0.10, tie → 1.20.
+        assert_eq!(fmt(1.15, 2, None, 10, RoundingMode::HalfExpand), 1.2);
+        // 1.20 inc=20 maxFrac=2 → nearest 0.20 → already a multiple → 1.20.
+        assert_eq!(fmt(1.20, 2, None, 20, RoundingMode::HalfExpand), 1.2);
+        // 1.5 inc=25 maxFrac=2 → multiples 1.25/1.50 → 1.50.
+        assert_eq!(fmt(1.5000, 2, None, 25, RoundingMode::HalfExpand), 1.5);
+        // 1.25 inc=250 maxFrac=3 → nearest 0.250 → 1.250.
+        assert_eq!(fmt(1.2500, 3, None, 250, RoundingMode::HalfExpand), 1.25);
+    }
+
+    #[test]
+    fn plain_fraction_rounding() {
+        assert_eq!(fmt(1.005, 2, None, 1, RoundingMode::HalfExpand), 1.01);
+        assert_eq!(fmt(2.5, 0, None, 1, RoundingMode::HalfEven), 2.0);
+        assert_eq!(fmt(3.5, 0, None, 1, RoundingMode::HalfEven), 4.0);
+        assert_eq!(fmt(0.0, 2, None, 1, RoundingMode::HalfExpand), 0.0);
+    }
 }
