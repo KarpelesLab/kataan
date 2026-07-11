@@ -3607,6 +3607,14 @@ impl<'a> Interp<'a> {
                 callee,
             );
         }
+        if id == N_ASYNC_FUNCTION_CTOR {
+            return self.build_function_constructor_kw(
+                args,
+                "async function",
+                native_new_target,
+                callee,
+            );
+        }
         // The abstract `Iterator` constructor (27.1.3.1): a TypeError when
         // constructed directly (`new Iterator()` — `newTarget` is `%Iterator%`
         // itself), otherwise `OrdinaryCreateFromConstructor(newTarget,

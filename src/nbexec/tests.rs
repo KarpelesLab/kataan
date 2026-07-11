@@ -10777,3 +10777,206 @@ fn weak_collection_tag_and_constructor_not_conflated_with_strong() {
     // The weak collection's own methods still resolve (from its prototype).
     assert_eq!(run("typeof (new WeakMap()).set"), "function");
 }
+
+#[test]
+fn async_function_prototype_tostringtag_and_ctor() {
+    // A (non-generator) async function reports "[object AsyncFunction]" — even
+    // through a Proxy wrapper (the tag is read from %AsyncFunction.prototype%).
+    assert_eq!(
+        run("Object.prototype.toString.call(async function(){})"),
+        "[object AsyncFunction]"
+    );
+    assert_eq!(
+        run("Object.prototype.toString.call(new Proxy(async function(){}, {}))"),
+        "[object AsyncFunction]"
+    );
+    assert_eq!(
+        run("Object.prototype.toString.call(async () => {})"),
+        "[object AsyncFunction]"
+    );
+    // %AsyncFunction% is a distinct constructor reachable via `.constructor`.
+    assert_eq!(
+        run("(async function(){}).constructor.name"),
+        "AsyncFunction"
+    );
+    assert_eq!(
+        run("(async function(){}).constructor === Function"),
+        "false"
+    );
+    // Its prototype carries the tag; removing it falls back to "[object Function]".
+    assert_eq!(
+        run("var af=(async function(){}).constructor;\
+             Object.defineProperty(af.prototype, Symbol.toStringTag, {value:undefined});\
+             Object.prototype.toString.call(async function(){})"),
+        "[object Function]"
+    );
+    // A plain async function's [[Prototype]] is NOT %Function.prototype%.
+    assert_eq!(
+        run("Object.getPrototypeOf(async function(){}) === Function.prototype"),
+        "false"
+    );
+}
+
+#[test]
+fn proxy_set_preserves_receiver() {
+    // A trapless-forward [[Set]] keeps the Receiver, so the inherited
+    // `Object.prototype.__proto__` setter runs against the proxy and its
+    // [[SetPrototypeOf]] trap fires (abrupt completion propagates).
+    assert_eq!(
+        run("var thrown=false;\
+             var p=new Proxy({}, {setPrototypeOf(){ throw new Error('t'); }});\
+             try { p.__proto__ = {}; } catch(e){ thrown = e.message==='t'; }\
+             thrown"),
+        "true"
+    );
+    // OrdinarySetWithOwnDescriptor writes to the Receiver: a proxy Receiver with
+    // no set trap but a defineProperty trap routes the write through it.
+    assert_eq!(
+        run("var log=[];\
+             var p=new Proxy({foo:1}, {defineProperty(t,k,d){ log.push(k); return Reflect.defineProperty(t,k,d); }});\
+             p.foo=2; p.foo=2;\
+             log.join(',')"),
+        "foo,foo"
+    );
+    // A trapless proxy whose *target* is itself a proxy forwards the set.
+    assert_eq!(
+        run("var hit='';\
+             var inner=new Proxy({}, {set(t,k,v){ hit=k; return true; }});\
+             var outer=new Proxy(inner, {});\
+             outer.x=5; hit"),
+        "x"
+    );
+}
+
+#[test]
+fn proxy_get_preserves_receiver() {
+    // A trapless-forward [[Get]] runs an inherited getter with `this` = the proxy.
+    assert_eq!(
+        run("var t={get attr(){ return this; }};\
+             var p=new Proxy(t, {get:null});\
+             p.attr === p"),
+        "true"
+    );
+    // A proxy on the prototype chain also preserves the original receiver.
+    assert_eq!(
+        run("var t={get attr(){ return this; }};\
+             var pp=Object.create(new Proxy(t, {}));\
+             pp.attr === pp"),
+        "true"
+    );
+}
+
+#[test]
+fn object_keys_proxy_calls_get_own_property() {
+    // EnumerableOwnPropertyNames calls [[GetOwnProperty]] per key even with no
+    // getOwnPropertyDescriptor trap — the trap *lookup* on a proxy-wrapped handler
+    // is observable. An empty array's own key list is ["length"].
+    assert_eq!(
+        run("var log=[];\
+             Object.keys(new Proxy([], new Proxy({}, {get(t,pk){ log.push(pk); }})));\
+             log.join(',')"),
+        "ownKeys,getOwnPropertyDescriptor"
+    );
+}
+
+#[test]
+fn proxy_is_extensible_invariant() {
+    // The isExtensible trap result must equal the target's actual extensibility.
+    assert_eq!(
+        run(
+            "var p=new Proxy(Object.freeze({}), {isExtensible(){ return true; }});\
+             var threw=false;\
+             try { Object.isExtensible(p); } catch(e){ threw = e instanceof TypeError; }\
+             threw"
+        ),
+        "true"
+    );
+    // A trap that agrees with the target is fine.
+    assert_eq!(
+        run(
+            "var p=new Proxy({}, {isExtensible(t){ return Reflect.isExtensible(t); }});\
+             Object.isExtensible(p)"
+        ),
+        "true"
+    );
+}
+
+#[test]
+fn string_wrapper_defined_index_is_read() {
+    // String-exotic [[GetOwnProperty]] falls back to OrdinaryGetOwnProperty for an
+    // out-of-range index, so a defined own property at that index is readable.
+    assert_eq!(
+        run("var s=new String('str');\
+             Object.defineProperty(s,'4',{value:4,writable:true,enumerable:true,configurable:true});\
+             s[4]"),
+        "4"
+    );
+    // An out-of-range index with no own property is still undefined.
+    assert_eq!(run("(new String('str'))[9]"), "undefined");
+    // A primitive string is unaffected.
+    assert_eq!(run("'str'[4]"), "undefined");
+}
+
+#[test]
+fn regexp_last_index_partial_define_keeps_writable() {
+    // A `{ value }`-only redefine of the synthesized `lastIndex` keeps
+    // writable:true (it must not fall to the new-property writable:false default).
+    assert_eq!(
+        run("var re=/x/;\
+             Reflect.defineProperty(re,'lastIndex',{value:'foo'});\
+             Object.getOwnPropertyDescriptor(re,'lastIndex').writable"),
+        "true"
+    );
+    assert_eq!(
+        run("var re=/x/;\
+             Reflect.defineProperty(re,'lastIndex',{value:7});\
+             re.lastIndex"),
+        "7"
+    );
+    // exec still resets lastIndex through the materialized slot.
+    assert_eq!(
+        run("var re=/x/g;\
+             Object.defineProperty(re,'lastIndex',{value:0});\
+             re.exec('xx'); re.lastIndex"),
+        "1"
+    );
+}
+
+#[test]
+fn object_tolocalestring_primitive_this_receiver() {
+    // `Object.prototype.toLocaleString` invokes `toString` with Receiver = the
+    // original `this`. A strict `toString` accessor getter reading `typeof this`
+    // therefore sees the primitive ("boolean"), not a boxed wrapper ("object").
+    assert_eq!(
+        run("'use strict';\
+             Object.defineProperty(Boolean.prototype, 'toString', {\
+               get: function(){ var v = typeof this; return function(){ return v; }; }, configurable:true });\
+             true.toLocaleString()"),
+        "boolean"
+    );
+}
+
+#[test]
+fn proxy_set_typed_array_integer_index_exotic() {
+    // A canonical numeric index reaching a TypedArray in the receiver's prototype
+    // chain is the integer-indexed exotic [[Set]] — it never walks past the view
+    // to an inherited setter. An out-of-bounds/invalid index is a silent no-op.
+    assert_eq!(
+        run("Object.defineProperty(Float64Array.prototype, '1', {\
+               set: function(){ throw new Error('unreachable'); }, configurable:true });\
+             var target=new Float64Array([0]);\
+             var recv=new Proxy(Object.create(target), {\
+               defineProperty(){ throw new Error('define unreachable'); } });\
+             recv[1] = 2.3;\
+             (!target.hasOwnProperty('1')) + ',' + (!Object.prototype.hasOwnProperty.call(recv,'1'))"),
+        "true,true"
+    );
+    // A valid index on a proxy directly wrapping a TypedArray writes the element
+    // (through the trapless [[DefineOwnProperty]] forward to the view).
+    assert_eq!(
+        run("var ta=new Float64Array([0,0,0]);\
+             var p=new Proxy(ta, {});\
+             p[1]=5; ta[1]"),
+        "5"
+    );
+}

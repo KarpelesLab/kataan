@@ -693,6 +693,72 @@ impl<'a> Interp<'a> {
         Some(gfp)
     }
 
+    /// `%AsyncFunction.prototype%` — an ordinary object inheriting
+    /// `%Function.prototype%` with `[Symbol.toStringTag]` "AsyncFunction"
+    /// ({ w:false, e:false, c:true }). A (non-generator) `async function`'s
+    /// `[[Prototype]]` is set to this via `set_native_proto`, so
+    /// `Object.prototype.toString.call(asyncFn)` yields "[object AsyncFunction]"
+    /// (the tag is read through the prototype chain — including a proxy wrapper).
+    /// It has no own `prototype` (async functions are not constructable);
+    /// `.constructor` intentionally still resolves up to `%Function%` (the
+    /// `AsyncFunction === Function` conflation), so only the tag is added. Cached
+    /// on the `Iterator` constructor.
+    pub(crate) fn async_function_prototype(&mut self) -> Option<Handle> {
+        let iter_ctor = self
+            .current
+            .get("Iterator")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)?;
+        const CACHE: &str = "\u{0}asyncfnproto";
+        if let Some(h) = self
+            .realm
+            .get_property(iter_ctor, CACHE)
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            return Some(h);
+        }
+        let fn_proto = self
+            .current
+            .get("Function")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw);
+        let afp = self.realm.new_object_with_proto(fn_proto);
+        self.install_to_string_tag(afp, "AsyncFunction");
+        // `%AsyncFunction%` — the constructor, reachable as
+        // `Object.getPrototypeOf(async function(){}).constructor`. Its own
+        // `[[Prototype]]` is `%Function%`; `prototype` is `%AsyncFunction.prototype%`
+        // { w:false, e:false, c:false }; the prototype's `constructor` points back
+        // { w:false, e:false, c:true }. Distinct from `%Function%` so
+        // `asyncFn.constructor.prototype[@@toStringTag]` targets THIS prototype
+        // (the `Object.prototype.toString` tag), not `%Function.prototype%`.
+        let af = self.realm.new_native(N_ASYNC_FUNCTION_CTOR);
+        self.install_fn_name_length(af, "AsyncFunction", 1);
+        self.realm
+            .set_property(af, "prototype", NanBox::handle(afp.to_raw()));
+        self.realm.mark_hidden(af, "prototype");
+        self.realm.set_readonly_property(af, "prototype");
+        self.realm.set_non_configurable_property(af, "prototype");
+        if let Some(fn_ctor) = self
+            .current
+            .get("Function")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        {
+            self.realm.set_native_proto(af, fn_ctor);
+        }
+        self.realm
+            .set_property(afp, "constructor", NanBox::handle(af.to_raw()));
+        self.realm.mark_hidden(afp, "constructor");
+        self.realm.set_readonly_property(afp, "constructor");
+        self.realm
+            .set_hidden_property(iter_ctor, CACHE, NanBox::handle(afp.to_raw()));
+        Some(afp)
+    }
+
     /// `%AsyncIteratorPrototype%` — `[Symbol.asyncIterator]` returns `this`,
     /// inheriting `%Object.prototype%`. Cached on the `Iterator` constructor.
     fn async_iterator_prototype(&mut self) -> Option<Handle> {

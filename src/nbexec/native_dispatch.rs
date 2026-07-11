@@ -663,6 +663,14 @@ impl<'a> Interp<'a> {
                     NanBox::undefined(),
                 );
             }
+            N_ASYNC_FUNCTION_CTOR => {
+                return self.build_function_constructor_kw(
+                    args,
+                    "async function",
+                    NanBox::undefined(),
+                    NanBox::undefined(),
+                );
+            }
             N_EVAL => {
                 // Reaching `eval` through `call_native` means an *indirect* eval
                 // (the callee wasn't the literal identifier `eval` — e.g.
@@ -3728,7 +3736,12 @@ impl<'a> Interp<'a> {
                         "Object.prototype.toLocaleString called on null or undefined",
                     ));
                 };
-                let m = self.read_member(h, "toString")?;
+                // `GetV(O, "toString")` resolves the method through the boxed
+                // wrapper's prototype chain but with Receiver = the *original* `this`
+                // — so an overriding `toString` accessor getter runs against the
+                // primitive (a strict getter reading `typeof this` sees "boolean",
+                // not "object").
+                let m = self.get_with_receiver(h, "toString", this)?;
                 self.call_with_this(m, this, args)?
             }
             // `Object.prototype.valueOf` → `Return ? ToObject(this value)`: a

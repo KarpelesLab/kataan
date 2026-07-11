@@ -2232,12 +2232,58 @@ impl<'a> Interp<'a> {
         receiver: NanBox,
     ) -> Result<bool, ExecError> {
         let Some((target, handler)) = self.realm.proxy_at(handle) else {
-            // Reached an ordinary object via a trapless forward: OrdinarySet
-            // returning the boolean. An inherited **getter-only** accessor fails
-            // (`false`); a setter runs (with the receiver as `this`) and succeeds;
-            // otherwise a data property is written.
+            // Reached an ordinary object `O = handle` via a trapless forward:
+            // OrdinarySet(O, key, value, Receiver) returning the boolean. An
+            // inherited **getter-only** accessor fails (`false`); a setter runs
+            // (with the Receiver as `this`) and succeeds; otherwise the write lands
+            // on the *Receiver* (OrdinarySetWithOwnDescriptor).
             let mut cur = Some(handle);
             while let Some(c) = cur {
+                // Integer-indexed exotic `[[Set]]` (10.4.5.5): a canonical numeric
+                // index on a **TypedArray** reached in the chain is governed by that
+                // view's bounds and NEVER consults an inherited setter/data property
+                // (the prototype chain past it is unreachable for such a key).
+                //   - SameValue(O, Receiver): TypedArraySetElement — coerce V (its
+                //     side effects run), write only if the index is still valid, and
+                //     always report success.
+                //   - O ≠ Receiver, *invalid* index: a silent success (no write) —
+                //     terminal, so an inherited setter is unreachable.
+                //   - O ≠ Receiver, *valid* index: fall through to OrdinarySet, which
+                //     creates the data property on the Receiver below.
+                if self.realm.typed_kind(c).is_some()
+                    && let Some(n) = canonical_numeric_index(key)
+                {
+                    let index_ok =
+                        n == (n as i64) as f64 && n >= 0.0 && !(n == 0.0 && n.is_sign_negative());
+                    let valid = index_ok
+                        && !self.typed_array_detached(c)
+                        && self
+                            .realm
+                            .typed_len(c)
+                            .is_some_and(|len| (n as usize) < len);
+                    if receiver.as_handle() == Some(c.to_raw()) {
+                        let coerced = if self.realm.typed_kind(c).is_some_and(is_bigint_kind) {
+                            self.coerce_typed_array_write(c, value)?
+                        } else {
+                            self.coerce_to_number(value)?
+                        };
+                        let still_valid = index_ok
+                            && !self.typed_array_detached(c)
+                            && self
+                                .realm
+                                .typed_len(c)
+                                .is_some_and(|len| (n as usize) < len);
+                        if still_valid {
+                            self.guard_view_immutable(c)?;
+                            self.realm.set_element(c, n as usize, coerced);
+                        }
+                        return Ok(true);
+                    }
+                    if !valid {
+                        return Ok(true);
+                    }
+                    break;
+                }
                 if let Some((_, setter)) = self.realm.accessor(c, key) {
                     if matches!(setter.unpack(), Unpacked::Undefined) {
                         return Ok(false);
@@ -2250,8 +2296,65 @@ impl<'a> Interp<'a> {
                 }
                 cur = self.realm.object_proto(c);
             }
+            // No accessor on the chain: the own descriptor (if any) is a data
+            // descriptor. The value is written to the **Receiver**, not to `O`.
+            let Some(recv_h) = receiver.as_handle().map(Handle::from_raw) else {
+                return Ok(false);
+            };
+            if recv_h == handle {
+                // Receiver === O: ordinary own write (honoring read-only /
+                // non-extensible gates).
+                if !self.can_write_property(recv_h, key) {
+                    return Ok(false);
+                }
+                let key_box = self.new_str(key);
+                self.assign_member_value(recv_h, key_box, value)?;
+                return Ok(true);
+            }
+            // Receiver differs from O (a trapless proxy forwarded here with the
+            // original Receiver): OrdinarySetWithOwnDescriptor writes to the
+            // Receiver via `[[DefineOwnProperty]]` — for a proxy Receiver this runs
+            // its `getOwnPropertyDescriptor` + `defineProperty` traps.
+            if self.realm.proxy_at(recv_h).is_some() {
+                let existing = self.descriptor_of(recv_h, key)?;
+                let desc = self.realm.new_object();
+                self.realm.set_property(desc, "value", value);
+                if let Some(dh) = existing.as_handle().map(Handle::from_raw) {
+                    let is_accessor = self.realm.get_property(dh, "get").is_some()
+                        || self.realm.get_property(dh, "set").is_some();
+                    let writable = self
+                        .realm
+                        .get_property(dh, "writable")
+                        .is_some_and(|v| self.realm.truthy(v));
+                    if is_accessor || !writable {
+                        return Ok(false);
+                    }
+                } else {
+                    self.realm
+                        .set_property(desc, "writable", NanBox::boolean(true));
+                    self.realm
+                        .set_property(desc, "enumerable", NanBox::boolean(true));
+                    self.realm
+                        .set_property(desc, "configurable", NanBox::boolean(true));
+                }
+                let ok = self.apply_descriptor(recv_h, key, desc, true)?;
+                return Ok(ok);
+            }
+            // Ordinary Receiver distinct from O: an own accessor / non-writable
+            // own data property rejects; otherwise create/update the own data
+            // property on the Receiver.
+            if self.realm.accessor(recv_h, key).is_some() {
+                return Ok(false);
+            }
+            if self.realm.has_own(recv_h, key) {
+                if !self.can_write_property(recv_h, key) {
+                    return Ok(false);
+                }
+            } else if !self.realm.is_extensible(recv_h) {
+                return Ok(false);
+            }
             let key_box = self.new_str(key);
-            self.assign_member_value(handle, key_box, value)?;
+            self.assign_member_value(recv_h, key_box, value)?;
             return Ok(true);
         };
         self.guard_revoked(handle)?;
@@ -2282,35 +2385,23 @@ impl<'a> Interp<'a> {
         key: NanBox,
         new: NanBox,
     ) -> Result<(), ExecError> {
-        // Proxy `set` trap (or forward to the target).
-        if let Some((target, handler)) = self.realm.proxy_at(handle) {
-            self.guard_revoked(handle)?;
-            if let Some(trap) = self.proxy_trap(handler, "set")? {
-                let name = self.member_key(key);
-                let key_box = self.key_to_value(&name);
-                let recv = NanBox::handle(handle.to_raw());
-                let handler_box = NanBox::handle(handler.to_raw());
-                let r = self.call_with_this(
-                    trap,
-                    handler_box,
-                    &[NanBox::handle(target.to_raw()), key_box, new, recv],
-                )?;
-                // A `set` trap returning a falsy value is a failed [[Set]]: a strict-mode
-                // assignment then throws a TypeError (sloppy mode fails silently).
-                if !self.realm.truthy(r) {
-                    if self.strict {
-                        let m = self.new_str(&alloc::format!(
-                            "'set' on proxy: trap returned falsish for property '{name}'"
-                        ));
-                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-                    }
-                    return Ok(());
-                }
-                // A truthy result is subject to the [[Set]] success invariants.
-                self.proxy_set_invariant_check(target, &name, new)?;
-                return Ok(());
+        // Proxy `[[Set]]`: route through the receiver-aware `proxy_set_bool`
+        // (shared with `Reflect.set`), passing the proxy itself as the Receiver.
+        // This preserves the Receiver across a trapless forward — so an inherited
+        // accessor setter (e.g. `Object.prototype.__proto__`) runs with `this` =
+        // the proxy, and a nested proxy target re-enters its own trap. A `false`
+        // result is a failed [[Set]]: strict code throws, sloppy code is silent.
+        if self.realm.proxy_at(handle).is_some() {
+            let name = self.member_key(key);
+            let recv = NanBox::handle(handle.to_raw());
+            let ok = self.proxy_set_bool(handle, &name, new, recv)?;
+            if !ok && self.strict {
+                let m = self.new_str(&alloc::format!(
+                    "'set' on proxy: trap returned falsish for property '{name}'"
+                ));
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
-            return self.assign_member_value(target, key, new);
+            return Ok(());
         }
         // A module namespace exotic object's `[[Set]]` (§10.4.6.9) always returns
         // false: a write is a silent no-op in sloppy code and a TypeError in strict
@@ -2573,6 +2664,94 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// The proxy `[[Get]]` success invariants (10.5.8): a non-configurable,
+    /// non-writable data property of the target must be reported with its actual
+    /// value; a non-configurable accessor with no getter must report `undefined`.
+    pub(crate) fn proxy_get_invariant_check(
+        &mut self,
+        target: crate::heap::Handle,
+        name: &str,
+        result: NanBox,
+    ) -> Result<(), ExecError> {
+        if let Some((getter, _)) = self.realm.accessor(target, name) {
+            if self.realm.property_is_non_configurable(target, name)
+                && matches!(getter.unpack(), Unpacked::Undefined)
+                && !matches!(result.unpack(), Unpacked::Undefined)
+            {
+                return Err(self.type_error(
+                    "proxy 'get' returned a value for a non-configurable accessor with no getter",
+                ));
+            }
+        } else if self.realm.has_own(target, name)
+            && self.realm.property_is_non_configurable(target, name)
+            && self.realm.property_is_readonly(target, name)
+        {
+            let actual = self
+                .realm
+                .get_property(target, name)
+                .unwrap_or(NanBox::undefined());
+            if !self.realm.strict_equals(result, actual) {
+                return Err(self.type_error(
+                    "proxy 'get' returned a different value for a non-configurable non-writable property",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `[[Get]](P, Receiver)` on `obj`, threading an explicit Receiver so that an
+    /// inherited accessor getter (or a proxy `get` trap) runs with `this` =
+    /// `receiver` — the piece the receiver-less `read_member` drops when it
+    /// forwards a trapless proxy to its target or descends into a proxy on the
+    /// prototype chain. Data / exotic properties are receiver-independent, so those
+    /// defer to `read_member`.
+    pub(crate) fn get_with_receiver(
+        &mut self,
+        obj: crate::heap::Handle,
+        name: &str,
+        receiver: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        // A proxy: its `get` trap (with the Receiver), or a trapless forward to the
+        // target that keeps the Receiver (recursing so a proxy target runs its own
+        // trap / chain).
+        if let Some((target, handler)) = self.realm.proxy_at(obj) {
+            self.guard_revoked(obj)?;
+            if let Some(trap) = self.proxy_trap(handler, "get")? {
+                let key = self.key_to_value(name);
+                let handler_box = NanBox::handle(handler.to_raw());
+                let result = self.call_with_this(
+                    trap,
+                    handler_box,
+                    &[NanBox::handle(target.to_raw()), key, receiver],
+                )?;
+                self.proxy_get_invariant_check(target, name, result)?;
+                return Ok(result);
+            }
+            return self.get_with_receiver(target, name, receiver);
+        }
+        // An ordinary object: walk own → prototype chain. An accessor getter runs
+        // with the Receiver; a proxy on the chain delegates its `[[Get]]` with the
+        // same Receiver; an own data property (or reaching a non-proxy end) defers
+        // to `read_member` for the receiver-independent read of `obj`.
+        let mut cur = Some(obj);
+        while let Some(c) = cur {
+            if c != obj && self.realm.proxy_at(c).is_some() {
+                return self.get_with_receiver(c, name, receiver);
+            }
+            if let Some((getter, _)) = self.realm.accessor(c, name) {
+                if matches!(getter.unpack(), Unpacked::Undefined) {
+                    return Ok(NanBox::undefined());
+                }
+                return self.call_with_this(getter, receiver, &[]);
+            }
+            if self.realm.has_own(c, name) {
+                break;
+            }
+            cur = self.realm.object_proto(c);
+        }
+        self.read_member(obj, name)
+    }
+
     pub(crate) fn read_member(
         &mut self,
         handle: crate::heap::Handle,
@@ -2633,17 +2812,24 @@ impl<'a> Interp<'a> {
         // fast numeric-index path is skipped without any allocation.
         if let Ok(i) = name.parse::<usize>() {
             if let Some(leaf) = self.realm.string_leaf_bytes(handle) {
-                let unit = crate::wtf8::utf16_index(leaf, i);
-                return Ok(match unit {
-                    Some(u) => self.new_str_bytes(crate::wtf8::from_utf16(&[u])),
-                    None => NanBox::undefined(),
-                });
-            }
-            if let Some(bytes) = self.realm.string_bytes(handle) {
-                return Ok(match crate::wtf8::utf16_index(&bytes, i) {
-                    Some(u) => self.new_str_bytes(crate::wtf8::from_utf16(&[u])),
-                    None => NanBox::undefined(),
-                });
+                if let Some(u) = crate::wtf8::utf16_index(leaf, i) {
+                    return Ok(self.new_str_bytes(crate::wtf8::from_utf16(&[u])));
+                }
+                // Out of range: a String *wrapper* object can still carry an
+                // ordinary own property at that index (`Object.defineProperty(new
+                // String("s"), "4", …)`) — String-exotic `[[GetOwnProperty]]` falls
+                // back to OrdinaryGetOwnProperty. Only shortcut to `undefined` when
+                // there is no such own property (the common primitive-string case).
+                if !self.realm.has_own(handle, name) {
+                    return Ok(NanBox::undefined());
+                }
+            } else if let Some(bytes) = self.realm.string_bytes(handle) {
+                if let Some(u) = crate::wtf8::utf16_index(&bytes, i) {
+                    return Ok(self.new_str_bytes(crate::wtf8::from_utf16(&[u])));
+                }
+                if !self.realm.has_own(handle, name) {
+                    return Ok(NanBox::undefined());
+                }
             }
         }
         // A canonical numeric string key on an array (`arr["0"]`) reads the
@@ -2689,47 +2875,12 @@ impl<'a> Interp<'a> {
             }
             return Ok(NanBox::undefined());
         }
-        // Proxy `get` trap (or forward the read to the target).
-        if let Some((target, handler)) = self.realm.proxy_at(handle) {
-            self.guard_revoked(handle)?;
-            if let Some(trap) = self.proxy_trap(handler, "get")? {
-                let key = self.key_to_value(name);
-                let recv = NanBox::handle(handle.to_raw());
-                let handler_box = NanBox::handle(handler.to_raw());
-                let result = self.call_with_this(
-                    trap,
-                    handler_box,
-                    &[NanBox::handle(target.to_raw()), key, recv],
-                )?;
-                // Invariants (10.5.8): a non-configurable, non-writable data
-                // property of the target must be reported with its actual value; a
-                // non-configurable accessor with no getter must report undefined.
-                if let Some((getter, _)) = self.realm.accessor(target, name) {
-                    if self.realm.property_is_non_configurable(target, name)
-                        && matches!(getter.unpack(), Unpacked::Undefined)
-                        && !matches!(result.unpack(), Unpacked::Undefined)
-                    {
-                        return Err(self.type_error(
-                            "proxy 'get' returned a value for a non-configurable accessor with no getter",
-                        ));
-                    }
-                } else if self.realm.has_own(target, name)
-                    && self.realm.property_is_non_configurable(target, name)
-                    && self.realm.property_is_readonly(target, name)
-                {
-                    let actual = self
-                        .realm
-                        .get_property(target, name)
-                        .unwrap_or(NanBox::undefined());
-                    if !self.realm.strict_equals(result, actual) {
-                        return Err(self.type_error(
-                            "proxy 'get' returned a different value for a non-configurable non-writable property",
-                        ));
-                    }
-                }
-                return Ok(result);
-            }
-            return self.read_member(target, name);
+        // Proxy `[[Get]]`: the `get` trap, or a trapless forward to the target that
+        // preserves the Receiver (so an inherited accessor getter runs with `this`
+        // = the proxy). Routed through `get_with_receiver` with Receiver = the
+        // proxy itself.
+        if self.realm.proxy_at(handle).is_some() {
+            return self.get_with_receiver(handle, name, NanBox::handle(handle.to_raw()));
         }
         // An error object's `.constructor` is its specific error global — its
         // prototype otherwise reports a generic `Object`. Recognized by an own
@@ -3293,10 +3444,16 @@ impl<'a> Interp<'a> {
                 } else {
                     crate::wtf8::utf16_index(&self.realm.string_bytes(ph).unwrap_or_default(), i)
                 };
-                return Ok(match unit {
-                    Some(u) => self.new_str_bytes(crate::wtf8::from_utf16(&[u])),
-                    None => NanBox::undefined(),
-                });
+                if let Some(u) = unit {
+                    return Ok(self.new_str_bytes(crate::wtf8::from_utf16(&[u])));
+                }
+                // Out of range: String-exotic `[[GetOwnProperty]]` falls back to
+                // OrdinaryGetOwnProperty, so an own property defined at that index on
+                // the *wrapper* (`Object.defineProperty(new String("s"), "4", …)`) is
+                // still read. Only shortcut to `undefined` when there is none.
+                if !self.realm.has_own(handle, name) {
+                    return Ok(NanBox::undefined());
+                }
             }
             let v = self.member_value(ph, name);
             if !matches!(v.unpack(), Unpacked::Undefined) {
@@ -3314,9 +3471,10 @@ impl<'a> Interp<'a> {
         while let Some(p) = cur {
             // A proxy in the prototype chain handles the read via its own `[[Get]]`
             // (a `get` trap, or forwarding to the target and its prototype chain),
-            // which is terminal for the lookup.
+            // which is terminal for the lookup. The Receiver stays the original
+            // object so an inherited accessor getter runs with the right `this`.
             if self.realm.proxy_at(p).is_some() {
-                return self.read_member(p, name);
+                return self.get_with_receiver(p, name, NanBox::handle(handle.to_raw()));
             }
             if let Some((getter, _)) = self.realm.accessor(p, name) {
                 if matches!(getter.unpack(), Unpacked::Undefined) {
@@ -4139,35 +4297,23 @@ impl<'a> Interp<'a> {
             self.class_statics[cid as usize].insert(key, new);
             return Ok(());
         }
-        // Proxy `set` trap (or forward the write to the target).
-        if let Some((target, handler)) = self.realm.proxy_at(handle) {
-            self.guard_revoked(handle)?;
-            if let Some(trap) = self.proxy_trap(handler, "set")? {
-                let key = self.eval_prop_key(property)?;
-                let key_box = self.key_to_value(&key);
-                let recv = NanBox::handle(handle.to_raw());
-                let handler_box = NanBox::handle(handler.to_raw());
-                let r = self.call_with_this(
-                    trap,
-                    handler_box,
-                    &[NanBox::handle(target.to_raw()), key_box, new, recv],
-                )?;
-                // A `set` trap returning a falsy value is a failed [[Set]]: a strict-mode
-                // assignment then throws a TypeError (sloppy mode fails silently).
-                if !self.realm.truthy(r) {
-                    if self.strict {
-                        let m = self.new_str(&alloc::format!(
-                            "'set' on proxy: trap returned falsish for property '{key}'"
-                        ));
-                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-                    }
-                    return Ok(());
-                }
-                // A truthy result is subject to the [[Set]] success invariants.
-                self.proxy_set_invariant_check(target, &key, new)?;
-                return Ok(());
+        // Proxy `[[Set]]`: route through the receiver-aware `proxy_set_bool`
+        // (shared with `Reflect.set` and `assign_member_value`), passing the proxy
+        // itself as the Receiver. A trapless forward keeps the Receiver, so an
+        // inherited accessor setter (e.g. `Object.prototype.__proto__`) runs with
+        // `this` = the proxy and a nested proxy target re-enters its own trap. A
+        // `false` result is a failed [[Set]]: strict code throws, sloppy is silent.
+        if self.realm.proxy_at(handle).is_some() {
+            let key = self.eval_prop_key(property)?;
+            let recv = NanBox::handle(handle.to_raw());
+            let ok = self.proxy_set_bool(handle, &key, new, recv)?;
+            if !ok && self.strict {
+                let m = self.new_str(&alloc::format!(
+                    "'set' on proxy: trap returned falsish for property '{key}'"
+                ));
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
-            return self.assign_member(target, property, new);
+            return Ok(());
         }
         // An accessor setter — own or inherited via the prototype chain — takes
         // precedence over creating a data property. A private accessor

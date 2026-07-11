@@ -373,12 +373,17 @@ impl<'a> Interp<'a> {
                 let handler_box = NanBox::handle(handler.to_raw());
                 let r =
                     self.call_with_this(trap, handler_box, &[NanBox::handle(target.to_raw())])?;
-                // NOTE: ECMA-262 10.5.3 requires the trap result to match the
-                // target's actual [[IsExtensible]] (else a TypeError). The curated
-                // gate's `proxy-introspection-traps.js` relies on the trap result
-                // overriding a frozen target, so the invariant is intentionally not
-                // enforced here to preserve the 693/693 gate.
-                return Ok(NanBox::boolean(self.realm.truthy(r)));
+                let result = self.realm.truthy(r);
+                // Invariant (10.5.3 step 8): the boolean trap result must equal the
+                // target's actual `[[IsExtensible]]()` — else a TypeError. The
+                // target's extensibility is authoritative; a trap cannot lie.
+                let target_ext = self.is_extensible_of(target)?;
+                if result != self.realm.truthy(target_ext) {
+                    return Err(self.type_error(
+                        "proxy 'isExtensible' trap result does not match the target's extensibility",
+                    ));
+                }
+                return Ok(NanBox::boolean(result));
             }
             // An absent trap forwards to the target's `[[IsExtensible]]` — recursing
             // so a target that is itself a proxy runs its own trap.
@@ -905,6 +910,24 @@ impl<'a> Interp<'a> {
         // ordinary-object path (which would store a shadowing aux slot).
         if self.realm.is_array(obj) && key == "length" {
             return self.apply_array_length_descriptor(obj, desc, reflect);
+        }
+        // A RegExp's `lastIndex` is a synthesized own data property
+        // ({ writable:true, enumerable:false, configurable:false }) backed by the
+        // cell's compact field. Before a `[[DefineOwnProperty]]`, materialize it as
+        // a real aux property carrying its *actual* attributes, so the generic path
+        // below merges a partial descriptor against them — a `{ value }`-only
+        // redefine keeps `writable:true` (rather than falling to the new-property
+        // `writable:false` default). `exec`'s `set_last_index_value` keeps the aux
+        // slot in sync with the cell once it exists.
+        if key == "lastIndex"
+            && self.realm.regexp_at(obj).is_some()
+            && !self.realm.has_own(obj, "lastIndex")
+        {
+            let cur = NanBox::number(self.realm.regex_last_index(obj) as f64);
+            self.realm.set_property(obj, "lastIndex", cur);
+            self.realm.mark_hidden(obj, "lastIndex");
+            self.realm.set_non_configurable_property(obj, "lastIndex");
+            // `writable` intentionally left true (the synthesized default).
         }
         // ArrayDefineOwnProperty (10.4.2.1): defining an index `>= length` when the
         // array's `length` is non-writable fails — a new element cannot grow a
@@ -1760,19 +1783,13 @@ impl<'a> Interp<'a> {
         let Some((target, handler)) = self.realm.proxy_at(proxy) else {
             return Ok(None);
         };
-        // `[[OwnPropertyKeys]]` via the validated trap result (type/duplicate/
-        // invariant checks); `None` when there is no `ownKeys` trap.
-        let Some(keys) = self.proxy_own_keys_raw(proxy)? else {
-            return Ok(None);
-        };
-        let target_box = NanBox::handle(target.to_raw());
-        let gopd = self
-            .realm
-            .get_property(handler, "getOwnPropertyDescriptor")
-            .unwrap_or(NanBox::undefined());
-        let gopd_callable = gopd
-            .as_handle()
-            .is_some_and(|r| self.is_callable(Handle::from_raw(r)));
+        // `[[OwnPropertyKeys]]`: the validated `ownKeys` trap result, or — with no
+        // trap — the target's own keys (the proxy's default forward). Either way the
+        // proxy's `[[OwnPropertyKeys]]` is consulted, then EnumerableOwnPropertyNames
+        // runs `[[GetOwnProperty]]` per key below.
+        let _ = handler;
+        let _ = target;
+        let keys = self.own_property_keys_values(proxy)?;
         let mut out = Vec::new();
         for k in keys {
             // Only string keys participate in `Object.keys` (symbols are skipped).
@@ -1783,19 +1800,21 @@ impl<'a> Interp<'a> {
             else {
                 continue;
             };
-            let enumerable = if gopd_callable {
-                let kbox = self.new_str(&name);
-                let desc = self.call(gopd, &[target_box, kbox])?;
-                desc.as_handle()
-                    .map(Handle::from_raw)
-                    .and_then(|dh| self.realm.get_property(dh, "enumerable"))
-                    .is_some_and(|v| self.realm.truthy(v))
-            } else {
-                // No descriptor trap: forward to the target — an own, enumerable
-                // property only (a key the target lacks is not enumerable).
-                self.realm.has_own(target, &name)
-                    && self.realm.property_is_enumerable(target, &name)
-            };
+            // EnumerableOwnPropertyNames calls `O.[[GetOwnProperty]](key)` per key —
+            // the proxy's `[[GetOwnProperty]]`, which invokes the
+            // `getOwnPropertyDescriptor` trap (or, absent a trap, forwards to the
+            // target). Using `descriptor_of` keeps that observable interleaving even
+            // when the handler has no descriptor trap (the trap *lookup* still fires
+            // the handler's own `[[Get]]`, e.g. a proxy-wrapped handler).
+            let desc = self.descriptor_of(proxy, &name)?;
+            if matches!(desc.unpack(), Unpacked::Undefined) {
+                continue;
+            }
+            let enumerable = desc
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|dh| self.realm.get_property(dh, "enumerable"))
+                .is_some_and(|v| self.realm.truthy(v));
             if enumerable {
                 out.push(name);
             }

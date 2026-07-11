@@ -1712,6 +1712,9 @@ const N_ATOMICS_ASYNC_TIMEOUT: u16 = 961;
 const N_GENERATOR_FUNCTION_CTOR: u16 = 905;
 /// `%AsyncGeneratorFunction%` — builds an `async function*` from dynamic source.
 const N_ASYNC_GENERATOR_FUNCTION_CTOR: u16 = 906;
+/// `%AsyncFunction%` — builds an `async function` from dynamic source. Reachable
+/// as `Object.getPrototypeOf(async function(){}).constructor`.
+const N_ASYNC_FUNCTION_CTOR: u16 = 966;
 /// `%AsyncIteratorPrototype%[@@asyncDispose]` — calls the iterator's `return` and
 /// returns a promise (fulfilled with `undefined`, rejected if `return` throws).
 const N_ASYNC_ITERATOR_DISPOSE: u16 = 907;
@@ -2201,7 +2204,7 @@ fn builtin_native_arity(id: u16) -> u32 {
         N_ATOMICS_LOAD => 2,
         N_ATOMICS_ADD | N_ATOMICS_SUB | N_ATOMICS_AND | N_ATOMICS_OR | N_ATOMICS_XOR
         | N_ATOMICS_EXCHANGE | N_ATOMICS_STORE | N_ATOMICS_NOTIFY => 3,
-        N_GENERATOR_FUNCTION_CTOR | N_ASYNC_GENERATOR_FUNCTION_CTOR => 1,
+        N_GENERATOR_FUNCTION_CTOR | N_ASYNC_GENERATOR_FUNCTION_CTOR | N_ASYNC_FUNCTION_CTOR => 1,
         N_ASYNC_ITERATOR_DISPOSE => 0,
         N_RETURN_UNDEFINED => 1,
         // Length 2.
@@ -2310,6 +2313,7 @@ fn is_native_constructor(id: u16) -> bool {
             | N_FUNCTION
             | N_GENERATOR_FUNCTION_CTOR
             | N_ASYNC_GENERATOR_FUNCTION_CTOR
+            | N_ASYNC_FUNCTION_CTOR
             | N_ARRAY_BUFFER
             | N_SHARED_ARRAY_BUFFER
             | N_DATA_VIEW
@@ -6388,6 +6392,16 @@ impl<'a> Interp<'a> {
                 let proto = self.realm.new_object_with_proto(Some(gp));
                 self.realm.set_function_prototype(func_id, proto);
             }
+        }
+        // A (non-generator) `async function`'s `[[Prototype]]` is
+        // `%AsyncFunction.prototype%` (distinct from `%Function.prototype%`, which
+        // it inherits), so `Object.prototype.toString` reports "[object AsyncFunction]"
+        // and the `@@toStringTag` is observable even through a Proxy wrapper.
+        if is_async
+            && !is_generator
+            && let Some(afp) = self.async_function_prototype()
+        {
+            self.realm.set_native_proto(handle, afp);
         }
         // An `async function*`'s `[[Prototype]]` is `%AsyncGeneratorFunction.prototype%`.
         if is_generator
