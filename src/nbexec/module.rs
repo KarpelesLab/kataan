@@ -528,6 +528,7 @@ impl<'a> Interp<'a> {
             body: Vec::new(),
             source_type: crate::ast::SourceType::Module,
             span: crate::common::Span::new(0, 0),
+            source: alloc::boxed::Box::from(""),
         };
         let program: &'static Program = alloc::boxed::Box::leak(alloc::boxed::Box::new(empty));
         let mut local_exports = BTreeMap::new();
@@ -885,6 +886,7 @@ impl<'a> Interp<'a> {
                             func.is_generator,
                         );
                         self.set_fn_name(value, &id.name);
+                        self.set_fn_source(value, func.span);
                         scope.declare(&id.name, value);
                         // `export default function f` also binds `*default*`.
                         if is_default {
@@ -903,6 +905,7 @@ impl<'a> Interp<'a> {
                             func.is_generator,
                         );
                         self.set_fn_name(value, "default");
+                        self.set_fn_source(value, func.span);
                         scope.declare_const(DEFAULT_LOCAL, value);
                     }
                     None => {}
@@ -1195,6 +1198,7 @@ impl<'a> Interp<'a> {
                             func.is_generator,
                         );
                         self.set_fn_name(value, "default");
+                        self.set_fn_source(value, func.span);
                         self.current.declare_const(DEFAULT_LOCAL, value);
                         Ok(())
                     }

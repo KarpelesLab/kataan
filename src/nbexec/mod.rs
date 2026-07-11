@@ -334,6 +334,14 @@ pub struct Interp<'a> {
     functions: Vec<FnDef<'a>>,
     /// Class-AST table; a class cell holds an index into this.
     classes: Vec<&'a Class>,
+    /// The source text of the code region currently being *defined* — the program
+    /// (or `eval`/`Function` body) whose AST is executing. Set by the run/eval
+    /// entry points; `class.span` / `function.span` byte offsets index into it, so
+    /// `set_fn_source` / `make_class` can slice a function/class's literal source
+    /// for `Function.prototype.toString`. Empty until the first program runs (and
+    /// for internal callers that don't set it — those functions then use the
+    /// NativeFunction fallback).
+    src: &'a str,
     /// Per-class evaluated *computed* member keys, by `class.body` index. Filled
     /// eagerly at class definition (ClassDefinitionEvaluation evaluates every
     /// computed `PropertyName` in source order, so a throwing key is a
@@ -2805,6 +2813,7 @@ impl<'a> Interp<'a> {
             annexb_block_fns: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
+            src: "",
             pending_this_init: None,
             class_member_keys: Vec::new(),
             builtin_iter_protos: alloc::collections::BTreeMap::new(),
@@ -5467,6 +5476,10 @@ impl<'a> Interp<'a> {
     /// Runs a whole program, returning the value of its last expression
     /// statement (or `undefined`).
     pub fn run(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
+        // Retain the program's source so function/class definitions can slice
+        // their literal text for `Function.prototype.toString` (AST spans are byte
+        // offsets into this source).
+        self.src = &program.source;
         self.strict = self.strict || has_use_strict(&program.body);
         // Script-level `this` is the global object (the realm's `globalThis`),
         // regardless of strictness — so a top-level `this.x = …` (sloppy globals)
@@ -5570,6 +5583,17 @@ impl<'a> Interp<'a> {
     /// NOT drain the event loop — eval runs synchronously within the surrounding
     /// execution, which drains microtasks at its own top level.
     fn run_eval_body(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
+        // The eval body's function/class spans index into the eval program's own
+        // (leaked) source; retain it for `Function.prototype.toString` while its
+        // statements run, then restore the enclosing source so a subsequent
+        // definition in the surrounding code slices the right text.
+        let saved_src = core::mem::replace(&mut self.src, &program.source);
+        let result = self.run_eval_body_inner(program);
+        self.src = saved_src;
+        result
+    }
+
+    fn run_eval_body_inner(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
         self.hoist_with_kind(&program.body, true, true)?;
         let mut last = NanBox::undefined();
         for stmt in &program.body {
@@ -5961,6 +5985,12 @@ impl<'a> Interp<'a> {
         let saved_scope = core::mem::replace(&mut self.current, self.global_scope.clone());
         let saved_strict = self.strict;
         self.strict = has_use_strict(&func.body);
+        // A `Function`/`GeneratorFunction`/`AsyncFunction`/`AsyncGeneratorFunction`
+        // constructor result deliberately keeps NO retained source, so
+        // `Function.prototype.toString` renders the NativeFunction form. The dynamic
+        // wrapper's `async`/`*` prefix sits outside the extracted `func` span, so a
+        // sliced source would drop it and no longer be valid NativeFunction syntax
+        // (which the `AsyncFunction`/`GeneratorFunction` toString tests require).
         let f = self.make_function(
             &func.params,
             Body::Block(&func.body),
@@ -6115,6 +6145,7 @@ impl<'a> Interp<'a> {
                     func.is_generator,
                 );
                 self.set_fn_name(value, &id.name);
+                self.set_fn_source(value, func.span);
                 if hoist_vars {
                     // A function/program top-level declaration binds in the
                     // variable environment (for an eval body, the outer `varEnv`).
@@ -6190,6 +6221,29 @@ impl<'a> Interp<'a> {
     /// and hoisted at the function/program boundary instead).
     fn hoist(&mut self, stmts: &'a [Stmt]) -> Result<(), ExecError> {
         self.hoist_with(stmts, false)
+    }
+
+    /// The literal source slice for AST `span`, from the current source region
+    /// (`self.src`), or `None` if no source is retained or the span is out of
+    /// range / not on a UTF-8 boundary. The parser's spans are byte offsets into
+    /// the source the AST was parsed from, so this reproduces the exact original
+    /// text (comments and whitespace included).
+    fn src_slice(&self, span: crate::common::Span) -> Option<&'a str> {
+        self.src.get(span.start as usize..span.end as usize)
+    }
+
+    /// Stamps the literal source text of `span` onto the function/class `value`,
+    /// so `Function.prototype.toString` (and `String(fn)` / `"" + fn`) reproduce
+    /// it. Stored in the realm keyed by the value's handle, so both the display
+    /// path (`Realm::to_display_string`) and the method path
+    /// (`function_to_string_repr`) — and both engine tiers — share one source of
+    /// truth. A no-op if `value` is not a heap handle or no source is retained.
+    fn set_fn_source(&mut self, value: NanBox, span: crate::common::Span) {
+        if let Some(slice) = self.src_slice(span)
+            && let Some(h) = value.as_handle().map(Handle::from_raw)
+        {
+            self.realm.set_fn_source(h, alloc::rc::Rc::from(slice));
+        }
     }
 
     /// Registers a function definition and allocates a closure capturing the

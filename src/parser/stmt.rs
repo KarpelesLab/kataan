@@ -51,6 +51,7 @@ impl<'src> Parser<'src> {
             body,
             source_type,
             span: Span::new(0, source.len() as u32),
+            source: source.into(),
         };
         // Static-semantics early errors (private names, lexical redeclaration,
         // strict-mode rules, …) are enforced as a post-parse pass so they surface
@@ -99,6 +100,7 @@ impl<'src> Parser<'src> {
             body,
             source_type: SourceType::Script,
             span: Span::new(0, source.len() as u32),
+            source: source.into(),
         };
         super::validate::validate_program_with(
             &program,
@@ -137,6 +139,7 @@ impl<'src> Parser<'src> {
             body,
             source_type: SourceType::Module,
             span: Span::new(0, source.len() as u32),
+            source: source.into(),
         };
         super::validate::validate_program(&program)?;
         Ok(program)

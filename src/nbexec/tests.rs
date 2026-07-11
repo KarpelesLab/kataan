@@ -9289,3 +9289,135 @@ fn resizable_with_uses_original_length_and_current_index_bound() {
         "2,11,22|5"
     );
 }
+
+// --- Function.prototype.toString source-text (ECMA-262 20.2.3.5) -------------
+
+#[test]
+fn to_string_reproduces_function_declaration_source() {
+    // A function declaration reproduces its exact source, comments/whitespace
+    // included — not a synthesized signature.
+    assert_eq!(
+        run(
+            "/* x */function /* a */ f /* b */ ( /* c */ y /* d */ ) /* e */ { /* g */ ; }\nf.toString()"
+        ),
+        "function /* a */ f /* b */ ( /* c */ y /* d */ ) /* e */ { /* g */ ; }"
+    );
+    // `String(f)` and `"" + f` take the same path.
+    assert_eq!(
+        run("function g(a,b){return a}\nString(g)"),
+        "function g(a,b){return a}"
+    );
+    assert_eq!(run("function h(){}\n'' + h"), "function h(){}");
+}
+
+#[test]
+fn to_string_reproduces_arrow_source() {
+    assert_eq!(run("var f = (a) => a + 1\n'' + f"), "(a) => a + 1");
+    assert_eq!(
+        run("var g = /* z */a /* a */ => /* b */ 0\n'' + g"),
+        "a /* a */ => /* b */ 0"
+    );
+    assert_eq!(
+        run("var h = async /* a */ ( /* b */ ) /* c */ => /* d */ 0\n'' + h"),
+        "async /* a */ ( /* b */ ) /* c */ => /* d */ 0"
+    );
+}
+
+#[test]
+fn to_string_reproduces_class_source() {
+    // A class has no valid NativeFunction fallback, so it MUST reproduce source.
+    assert_eq!(
+        run("class /* a */ A /* b */ { /* c */ }\nA.toString()"),
+        "class /* a */ A /* b */ { /* c */ }"
+    );
+    assert_eq!(
+        run("class A{}; class B extends A { m(){} }\n'' + B"),
+        "class B extends A { m(){} }"
+    );
+    // `String(C)` path too.
+    assert_eq!(
+        run("class C { constructor(){} n(){} }\nString(C)"),
+        "class C { constructor(){} n(){} }"
+    );
+}
+
+#[test]
+fn to_string_reproduces_object_method_and_accessor_source() {
+    // A concise method's source is the whole MethodDefinition (key + body).
+    assert_eq!(
+        run("var o = { /* p */f /* a */ ( /* b */ ) /* c */ { /* d */ } }\n'' + o.f"),
+        "f /* a */ ( /* b */ ) /* c */ { /* d */ }"
+    );
+    // A computed-key method: its exact source, so it can even round-trip as a key.
+    assert_eq!(
+        run("var g = { [ { a(){} }.a ](){ } }['a(){}']\n'' + g"),
+        "[ { a(){} }.a ](){ }"
+    );
+    // A generator method includes its `*` prefix.
+    assert_eq!(run("var o = { *gen(){} }\n'' + o.gen"), "*gen(){}");
+    // A getter includes its `get` prefix; source read off the descriptor.
+    assert_eq!(
+        run(
+            "var o = { get /* a */ x /* b */ ( /* c */ ) /* d */ { } }\n'' + Object.getOwnPropertyDescriptor(o, 'x').get"
+        ),
+        "get /* a */ x /* b */ ( /* c */ ) /* d */ { }"
+    );
+}
+
+#[test]
+fn to_string_eval_body_uses_its_own_source() {
+    // A function/class defined inside `eval` slices the eval body's source, not
+    // the enclosing program's.
+    assert_eq!(
+        run("eval('var f = function ff(){ return 1 }'); '' + f"),
+        "function ff(){ return 1 }"
+    );
+    assert_eq!(
+        run("eval('var C = class CC { m(){} }'); '' + C"),
+        "class CC { m(){} }"
+    );
+    // A definition in the enclosing code after an eval still uses the outer source.
+    assert_eq!(
+        run("eval('1'); function main(){}\n'' + main"),
+        "function main(){}"
+    );
+}
+
+#[test]
+fn to_string_proxy_of_callable_is_native_syntax() {
+    // A Proxy has no `[[SourceText]]`; `Function.prototype.toString` yields the
+    // NativeFunction form, never the wrapped function/class source.
+    assert_eq!(
+        run("class A{}; '' + (new Proxy(A, {}))"),
+        "function A() { [native code] }"
+    );
+    assert_eq!(
+        run("function foo(){}; (new Proxy(foo, {})).toString()"),
+        "function foo() { [native code] }"
+    );
+    // Calling `Function.prototype.toString` on a non-callable proxy throws.
+    assert_eq!(
+        run(
+            "var threw=false; try { Function.prototype.toString.call(new Proxy({}, {})) } catch(e){ threw = e instanceof TypeError }\nthrew"
+        ),
+        "true"
+    );
+}
+
+#[test]
+fn to_string_dynamic_and_builtin_functions_are_native_syntax() {
+    // The `Function` constructor / built-ins retain no source → NativeFunction form.
+    assert_eq!(
+        run("'' + Function('a', 'return a')"),
+        "function anonymous() { [native code] }"
+    );
+    // An `async function` built dynamically stays valid NativeFunction syntax
+    // (no dangling `async` from a partial slice).
+    assert_eq!(
+        run(
+            "var AsyncFunction = (async function(){}).constructor; '' + (new AsyncFunction('return 1'))"
+        ),
+        "function anonymous() { [native code] }"
+    );
+    assert_eq!(run("'' + Math.max"), "function max() { [native code] }");
+}

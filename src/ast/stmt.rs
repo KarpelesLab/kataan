@@ -15,6 +15,12 @@ pub struct Program {
     pub source_type: SourceType,
     /// The span covering the whole program.
     pub span: Span,
+    /// The original source text this unit was parsed from. Retained (owned) so
+    /// that a function/class node's byte-offset `span` can be resliced back to
+    /// its literal source for `Function.prototype.toString` — including for a
+    /// leaked `eval` / `Function` sub-program, whose transient source string
+    /// would otherwise be gone by the time `toString` runs.
+    pub source: Box<str>,
 }
 
 /// Whether a [`Program`] is a script or an ECMAScript module. (Module

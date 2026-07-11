@@ -2513,10 +2513,19 @@ impl<'a> Interp<'a> {
             // non-callable `this` (per 20.2.3.5).
             N_FUNCTION_TO_STRING => {
                 let this = self.this_val;
-                let h = this
-                    .as_handle()
-                    .map(Handle::from_raw)
-                    .filter(|h| self.is_callable(*h) || self.realm.class_at(*h).is_some());
+                let h = this.as_handle().map(Handle::from_raw).filter(|h| {
+                    // `Function.prototype.toString` requires `this` to have a
+                    // `[[Call]]` (any callable, or a class — whose `[[Call]]`
+                    // throws — or a proxy wrapping one). A proxy wrapping a class
+                    // is callable even though the bare class is modeled as a
+                    // non-`Function` cell, so accept it explicitly.
+                    self.is_callable(*h)
+                        || self.realm.class_at(*h).is_some()
+                        || self
+                            .realm
+                            .proxy_at(*h)
+                            .is_some_and(|(t, _)| self.realm.class_at(t).is_some())
+                });
                 let Some(h) = h else {
                     let m = self
                         .new_str("Function.prototype.toString requires that 'this' be a Function");

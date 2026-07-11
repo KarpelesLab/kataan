@@ -1225,7 +1225,7 @@ impl<'a> Interp<'a> {
                             value,
                             shorthand,
                             method,
-                            ..
+                            span: member_span,
                         } => {
                             // `{ __proto__: obj }` — only the *unquoted identifier*
                             // form (not `"__proto__":`, computed, shorthand, or a
@@ -1307,6 +1307,12 @@ impl<'a> Interp<'a> {
                                 && matches!(&**value, Expr::Function(_))
                                 && let Some(fv) = v.as_handle().map(Handle::from_raw)
                             {
+                                // A concise method's source text (ECMA-262
+                                // 20.2.3.5) is its whole MethodDefinition — the key,
+                                // any `*`/`async`/`get`/`set` prefix, params and
+                                // body — i.e. the object member's span, not the
+                                // inner function-expression span `eval` stamped.
+                                self.set_fn_source(v, *member_span);
                                 self.realm.set_hidden_property(
                                     fv,
                                     HOME_OBJECT,
@@ -1335,7 +1341,7 @@ impl<'a> Interp<'a> {
                             key,
                             is_getter,
                             value,
-                            ..
+                            span: member_span,
                         } => {
                             let k = self.eval_prop_key(key)?;
                             let f = self.make_function(
@@ -1344,6 +1350,9 @@ impl<'a> Interp<'a> {
                                 false,
                                 false,
                             );
+                            // The accessor's source text (ECMA-262 20.2.3.5) is its
+                            // whole `get`/`set` MethodDefinition — the member span.
+                            self.set_fn_source(f, *member_span);
                             // An object-literal accessor's `[[HomeObject]]` is this
                             // object, so `super.x` inside it resolves via the proto;
                             // an accessor is a method (no `[[Construct]]`).
@@ -1748,18 +1757,21 @@ impl<'a> Interp<'a> {
                 func.is_generator,
             );
             self.set_fn_name(f, &id.name);
+            self.set_fn_source(f, func.span);
             // The name is an immutable binding: reassigning it inside the body
             // throws in strict mode and is a silent no-op in sloppy mode.
             self.current.declare_soft_const(&id.name, f);
             self.current = saved;
             return f;
         }
-        self.make_function(
+        let f = self.make_function(
             &func.params,
             Body::Block(&func.body),
             func.is_async,
             func.is_generator,
-        )
+        );
+        self.set_fn_source(f, func.span);
+        f
     }
 
     pub(crate) fn eval_arrow(&mut self, arrow: &'a Arrow) -> NanBox {
@@ -1768,6 +1780,7 @@ impl<'a> Interp<'a> {
             ArrowBody::Block(b) => Body::Block(b),
         };
         let f = self.make_function(&arrow.params, body, arrow.is_async, false);
+        self.set_fn_source(f, arrow.span);
         // Arrows have no own `arguments` binding (they inherit the enclosing one).
         if let Some(raw) = f.as_handle()
             && let Some((func_id, _)) = self.realm.function_at(Handle::from_raw(raw))

@@ -109,6 +109,15 @@ pub struct Realm {
     /// and not relocated on a moving collection — sound only because collection is
     /// never driven mid-execution (see `[[latent-engine-conformance-bugs]]`).
     aux_props: alloc::collections::BTreeMap<u64, Handle>,
+    /// Literal source text of a user function/method/arrow/class, keyed by the
+    /// callable's handle — the exact byte slice of the defining production (the
+    /// `function`/`get`/`set`/`*`/`async`/`class` keyword or method key through
+    /// the closing `}`), retained for `Function.prototype.toString` (ECMA-262
+    /// 20.2.3.5) and `String(fn)` / `"" + fn`. Absent for built-ins and
+    /// dynamically-built (`Function` constructor) functions, which render the
+    /// NativeFunction form instead. Same handle-keyed, non-GC-root caveat as
+    /// `aux_props`; the value holds no handles, so relocation cannot corrupt it.
+    fn_source: alloc::collections::BTreeMap<u64, alloc::rc::Rc<str>>,
     /// Handles of frozen arrays (`Object.freeze([...])`). Arrays have no inline
     /// object part to carry the flag; same handle-keyed, non-GC-root caveat as
     /// `aux_props`.
@@ -298,6 +307,7 @@ impl Realm {
             fn_ctor: alloc::collections::BTreeMap::new(),
             class_protos: alloc::collections::BTreeMap::new(),
             aux_props: alloc::collections::BTreeMap::new(),
+            fn_source: alloc::collections::BTreeMap::new(),
             length_tracking_views: alloc::collections::BTreeSet::new(),
             frozen_arrays: alloc::collections::BTreeSet::new(),
             sealed_arrays: alloc::collections::BTreeSet::new(),
@@ -1290,6 +1300,18 @@ impl Realm {
     pub fn class_at(&self, handle: Handle) -> Option<(u32, crate::env::Scope)> {
         let (id, env) = self.heap.get(handle)?.as_class()?;
         Some((id, env.clone()))
+    }
+
+    /// Records the literal source text of the callable at `handle` (for
+    /// `Function.prototype.toString` — see the `fn_source` field).
+    pub fn set_fn_source(&mut self, handle: Handle, source: alloc::rc::Rc<str>) {
+        self.fn_source.insert(handle.to_raw(), source);
+    }
+
+    /// The retained literal source text of the callable at `handle`, if any.
+    #[must_use]
+    pub fn fn_source(&self, handle: Handle) -> Option<&str> {
+        self.fn_source.get(&handle.to_raw()).map(|s| &**s)
     }
 
     /// Allocates an empty `Map` (`is_set = false`) or `Set` (`is_set = true`).
@@ -4004,12 +4026,19 @@ impl Realm {
                 }
                 Some(Cell::Object(_)) => "[object Object]".into(),
                 // A callable stringifies as `Function.prototype.toString` would —
-                // `function name() { [native code] }` (the engine retains no source)
-                // — and a class as `class Name { }`. The name is read from the own
-                // `name` property when materialized (else empty). This keeps `"" + fn`
-                // / `String(fn)` consistent with `fn.toString()`.
+                // the retained literal source text (ECMA-262 20.2.3.5) when the
+                // function was defined from source, else the NativeFunction form
+                // `function name() { [native code] }`. A class likewise reproduces
+                // its `class … { … }` source (it has no valid NativeFunction
+                // fallback), or `class Name { }` when no source is retained. The
+                // name is read from the own `name` property when materialized (else
+                // empty). This keeps `"" + fn` / `String(fn)` consistent with
+                // `fn.toString()`.
                 Some(Cell::Function { .. } | Cell::Native(_) | Cell::HostFn(_)) => {
                     let h = Handle::from_raw(raw);
+                    if let Some(src) = self.fn_source(h) {
+                        return src.into();
+                    }
                     let name = self
                         .get_property(h, "name")
                         .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
@@ -4020,6 +4049,9 @@ impl Realm {
                 }
                 Some(Cell::Class { .. }) => {
                     let h = Handle::from_raw(raw);
+                    if let Some(src) = self.fn_source(h) {
+                        return src.into();
+                    }
                     let name = self
                         .get_property(h, "name")
                         .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
@@ -4100,11 +4132,25 @@ impl Realm {
                     parts.join(",")
                 }
                 Some(Cell::Bytes(_)) => alloc::string::String::new(),
-                // A proxy renders as its target would.
+                // A *callable* proxy stringifies via `Function.prototype.toString`,
+                // which has no `[[SourceText]]` for an exotic Proxy object and so
+                // yields the NativeFunction form — it does NOT reproduce the wrapped
+                // function/class source (ECMA-262 20.2.3.5). A non-callable proxy
+                // renders as its target would (e.g. `[object Object]`, array join).
                 Some(Cell::Proxy { target, .. }) => {
+                    let target = *target;
                     let h = Handle::from_raw(raw);
                     if seen.contains(&h) || seen.len() >= self.limits.max_display_depth {
                         return alloc::string::String::new();
+                    }
+                    if self.is_callable_cell(target) {
+                        let name = self
+                            .get_property(target, "name")
+                            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                            .map(|v| self.to_display_string_seen(v, seen))
+                            .unwrap_or_default();
+                        let seg = native_fn_name_segment(&name);
+                        return alloc::format!("function {seg}() {{ [native code] }}");
                     }
                     seen.push(h);
                     let s = self.to_display_string_seen(NanBox::handle(target.to_raw()), seen);

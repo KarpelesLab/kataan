@@ -542,6 +542,7 @@ impl<'a> Interp<'a> {
                 func.is_generator,
             );
             self.set_fn_name(value, &id.name);
+            self.set_fn_source(value, func.span);
             self.current.declare(&id.name, value);
             self.current = saved;
             if self

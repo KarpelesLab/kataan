@@ -18,8 +18,20 @@ impl<'a> Interp<'a> {
         &mut self,
         handle: Handle,
     ) -> Result<alloc::string::String, ExecError> {
+        // A function/method/arrow/class defined from source reproduces its exact
+        // literal text (ECMA-262 20.2.3.5). A Proxy has no `[[SourceText]]`, so it
+        // renders the NativeFunction form regardless of what it wraps — never the
+        // wrapped source.
+        if self.realm.proxy_at(handle).is_none()
+            && let Some(src) = self.realm.fn_source(handle)
+        {
+            return Ok(src.into());
+        }
         let nm = self.read_member(handle, "name")?;
         let nm = self.realm.to_display_string(nm);
+        // A class with no retained source (e.g. a native/subclassed intrinsic)
+        // still uses the `class …` form; a Proxy or ordinary function uses the
+        // NativeFunction form.
         Ok(if self.realm.class_at(handle).is_some() {
             alloc::format!("class {nm} {{ }}")
         } else {

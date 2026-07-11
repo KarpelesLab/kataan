@@ -190,6 +190,11 @@ impl<'a> Interp<'a> {
         let class_env = self.current.child();
         let handle = self.realm.new_class(class_id, class_env.clone());
         let class_val = NanBox::handle(handle.to_raw());
+        // Record the class's literal source text (`class … { … }`, comments and
+        // whitespace included) for `Function.prototype.toString`. A class — unlike
+        // a function — has no valid NativeFunction fallback (`class A {}` is not
+        // `function … { [native code] }`), so it MUST reproduce its source.
+        self.set_fn_source(class_val, class.span);
         self.class_member_keys
             .push(alloc::collections::BTreeMap::new());
         self.class_statics.push(alloc::collections::BTreeMap::new());
