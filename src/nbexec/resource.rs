@@ -433,19 +433,61 @@ impl<'a> Interp<'a> {
             global_this: new_global_this,
             intrinsics: new_intrinsics,
         });
-        // `GetFunctionRealm` tagging: every callable installed on this realm's
-        // global (its `Object`/`Function`/`Array`/… constructors, each a distinct
-        // heap cell from every other realm's) belongs to realm `idx`. Recording
-        // them lets `GetPrototypeFromConstructor` pick *this* realm's intrinsic
-        // default when such a constructor (or a function it builds) is used as a
-        // cross-realm `newTarget` with a non-object `.prototype`.
+        // `GetFunctionRealm` tagging: every callable reachable from this realm's
+        // global (its `Object`/`Function`/`Array`/… constructors AND their
+        // prototype methods / accessor getters+setters / static methods, each a
+        // distinct heap cell from every other realm's) belongs to realm `idx`.
+        // Recording them lets `GetPrototypeFromConstructor` pick *this* realm's
+        // intrinsic default for a cross-realm `newTarget`, lets a cross-realm
+        // intrinsic method throw *this* realm's `%TypeError%` (see `make_error`),
+        // and lets `ArraySpeciesCreate` recognize `realmC.[[%Array%]]`.
+        //
+        // A *bounded breadth-first* walk over own data properties (recursing into
+        // object values) and accessor getters/setters, guarded by a `visited` set,
+        // so the shared iterator/regexp/intl prototypes and any cycles terminate.
         if let Some(gt) = new_global_this.as_handle().map(Handle::from_raw) {
-            for key in self.realm.object_all_keys(gt) {
-                if let Some(v) = self.realm.get_property(gt, &key)
-                    && let Some(h) = v.as_handle().map(Handle::from_raw)
-                    && self.is_callable(h)
-                {
-                    self.fn_realm.insert(h.to_raw(), idx);
+            let mut visited = alloc::collections::BTreeSet::new();
+            let mut queue = alloc::vec::Vec::new();
+            queue.push((gt, 0u32));
+            visited.insert(gt.to_raw());
+            while let Some((obj, depth)) = queue.pop() {
+                if depth > 3 {
+                    continue;
+                }
+                // A native cell (a constructor such as `String`/`Array`) stores its
+                // own properties — including `prototype` and static methods — in an
+                // *auxiliary* object, not the cell itself, so both key stores must
+                // be walked to reach e.g. `String.prototype` (and thence its methods).
+                let mut keys = self.realm.object_all_keys(obj);
+                keys.extend(self.realm.aux_all_keys(obj));
+                for key in keys {
+                    // Accessor (getter/setter) — tag both halves; they never carry
+                    // a nested object graph to recurse into.
+                    if let Some((g, s)) = self.realm.accessor(obj, &key) {
+                        for f in [g, s] {
+                            if let Some(h) = f.as_handle().map(Handle::from_raw)
+                                && self.is_callable(h)
+                            {
+                                self.fn_realm.entry(h.to_raw()).or_insert(idx);
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(v) = self.realm.get_property(obj, &key) else {
+                        continue;
+                    };
+                    let Some(h) = v.as_handle().map(Handle::from_raw) else {
+                        continue;
+                    };
+                    if self.is_callable(h) {
+                        self.fn_realm.entry(h.to_raw()).or_insert(idx);
+                    }
+                    // Recurse into object values (a constructor's `.prototype`, a
+                    // namespace object such as `Math`/`JSON`/`Reflect`, …) once, so
+                    // prototype methods are tagged. Bounded by `visited` + depth.
+                    if self.is_object_value(v) && visited.insert(h.to_raw()) {
+                        queue.push((h, depth + 1));
+                    }
                 }
             }
         }

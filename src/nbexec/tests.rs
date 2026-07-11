@@ -9500,3 +9500,84 @@ fn virtual_clock_set_timeout_fires_in_delay_order_and_advances() {
         "a 50\nb 200\n"
     );
 }
+
+// --- Cross-realm intrinsic identity / species (GetFunctionRealm) ------------
+
+#[test]
+fn cross_realm_intrinsic_throws_its_own_realms_type_error() {
+    // A method belonging to another realm, called on a bad `this`, must throw
+    // *that realm's* `%TypeError%` — the value assert.throws inspects is the
+    // error's `.constructor`, so it must be `other.TypeError`, not the main one.
+    assert_eq!(
+        run(r#"
+            var other = $262_createRealm().global;
+            var e;
+            try { other.String.prototype.valueOf.call(false); } catch (x) { e = x; }
+            (e.constructor === other.TypeError) && (e.constructor !== TypeError)
+        "#),
+        "true"
+    );
+    // The same for a value-of on a null `this` reached via Reflect.apply.
+    assert_eq!(
+        run(r#"
+            var other = $262_createRealm().global;
+            var e;
+            try { Reflect.apply(other.String.prototype.toString, null, []); }
+            catch (x) { e = x; }
+            e.constructor === other.TypeError
+        "#),
+        "true"
+    );
+}
+
+#[test]
+fn cross_realm_class_brand_check_throws_defining_realms_type_error() {
+    // A class evaluated in another realm (via that realm's indirect `eval`) whose
+    // private-method brand check fails throws the *defining realm's* TypeError.
+    assert_eq!(
+        run(r#"
+            var r1 = $262_createRealm();
+            var C1 = r1.global.eval("(class { #m(){return 1;} access(o){ return o.#m(); } })");
+            var c1 = new C1();
+            var okSelf = (c1.access(c1) === 1);
+            var e;
+            try { c1.access({}); } catch (x) { e = x; }
+            okSelf && (e.constructor === r1.global.TypeError)
+        "#),
+        "true"
+    );
+}
+
+#[test]
+fn array_species_create_nulls_cross_realm_array_constructor() {
+    // ArraySpeciesCreate: when the original array's `constructor` is *another
+    // realm's* `%Array%`, it is treated as undefined — the current realm's
+    // `%Array%` builds the result and the foreign `@@species` is never read.
+    assert_eq!(
+        run(r#"
+            var arr = [];
+            var OArray = $262_createRealm().global.Array;
+            var called = 0;
+            arr.constructor = OArray;
+            Object.defineProperty(OArray, Symbol.species, { get: function(){ called++; } });
+            var r = arr.map(function(){});
+            called + ":" + (Object.getPrototypeOf(r) === Array.prototype)
+        "#),
+        "0:true"
+    );
+}
+
+#[test]
+fn same_realm_array_species_still_honored() {
+    // A same-realm subclass `@@species` override is still consulted (no
+    // over-eager cross-realm nullification of the current realm's constructor).
+    assert_eq!(
+        run(r#"
+            class MyArr extends Array {}
+            var a = new MyArr(1, 2, 3);
+            var r = a.map(function(x){ return x; });
+            r instanceof MyArr
+        "#),
+        "true"
+    );
+}

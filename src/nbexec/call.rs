@@ -193,7 +193,32 @@ impl<'a> Interp<'a> {
 
     /// Calls `callee` with an explicit `this` (a method receiver, or `undefined`
     /// for a plain call).
+    ///
+    /// Establishes the *running realm* for the duration of the call: the callee's
+    /// `GetFunctionRealm` becomes `cur_realm` (`None` for the main realm), so a
+    /// cross-realm intrinsic throws *that realm's* `%TypeError%` (see `make_error`)
+    /// and `ArraySpeciesCreate` sees the correct current Realm Record — regardless
+    /// of which of the many dispatch branches (native / bound-native / host /
+    /// user-closure) ultimately runs the body. A nested user-closure entry
+    /// (`invoke_inner`) refines this from the closure's captured scope, so an
+    /// eval-created cross-realm closure is attributed correctly too.
     pub(crate) fn call_with_this(
+        &mut self,
+        callee: NanBox,
+        this_val: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let realm = callee
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|h| self.get_function_realm(h));
+        let saved_realm = core::mem::replace(&mut self.cur_realm, realm);
+        let r = self.call_with_this_inner(callee, this_val, args);
+        self.cur_realm = saved_realm;
+        r
+    }
+
+    fn call_with_this_inner(
         &mut self,
         callee: NanBox,
         this_val: NanBox,
@@ -1581,6 +1606,18 @@ impl<'a> Interp<'a> {
         callee: NanBox,
     ) -> Result<NanBox, ExecError> {
         let call_scope = captured.child();
+        // Enter the closure's realm: a function defined in a `$262.createRealm()`
+        // realm (its scope chain roots at that realm's global scope) must throw
+        // *that realm's* errors (e.g. a private-brand-check TypeError from a class
+        // evaluated cross-realm). Falls back to `GetFunctionRealm(callee)`; `None`
+        // for a main-realm closure leaves the fast path unchanged.
+        let closure_realm = self.realm_of_scope(&captured).or_else(|| {
+            callee
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|h| self.get_function_realm(h))
+        });
+        let saved_cur_realm = core::mem::replace(&mut self.cur_realm, closure_realm);
         let saved = core::mem::replace(&mut self.current, call_scope);
         // A function defined in a module carries that module's import aliases in
         // its captured scope chain; restore them so a named import read inside the
@@ -1883,6 +1920,7 @@ impl<'a> Interp<'a> {
             r
         })();
         self.current = saved;
+        self.cur_realm = saved_cur_realm;
         #[cfg(all(feature = "module", feature = "std"))]
         if let Some(mi) = saved_module_imports {
             self.module_imports = mi;
@@ -2010,6 +2048,18 @@ impl<'a> Interp<'a> {
             return self.get_function_realm(target);
         }
         self.fn_realm.get(&f.to_raw()).copied()
+    }
+
+    /// The `created_realms` index of the realm a *captured closure scope* roots
+    /// at — a function defined inside a `$262.createRealm()` realm's code (e.g.
+    /// via that realm's `eval`) captures a scope chain whose root is that realm's
+    /// global scope, so this identifies the closure's realm even when it was never
+    /// entered in the `fn_realm` side table. `None` for the main realm.
+    pub(crate) fn realm_of_scope(&self, scope: &Scope) -> Option<usize> {
+        let root = scope.root_scope();
+        self.created_realms
+            .iter()
+            .position(|r| r.global_scope.ptr_eq(&root))
     }
 
     /// `GetPrototypeFromConstructor` step 4: when a `newTarget`'s `.prototype` is

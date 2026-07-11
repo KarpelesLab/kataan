@@ -336,6 +336,23 @@ impl Scope {
         Rc::ptr_eq(&self.0, &other.0)
     }
 
+    /// The topmost (parentless) scope of this chain — a function's captured
+    /// scope roots at its defining realm's global scope, so comparing this
+    /// against each `$262.createRealm()` realm's global scope identifies the
+    /// realm a closure belongs to (`GetFunctionRealm` for eval-created closures
+    /// that are not otherwise tagged).
+    #[must_use]
+    pub fn root_scope(&self) -> Scope {
+        let mut cur = self.clone();
+        loop {
+            let parent = cur.0.borrow().parent.clone();
+            match parent {
+                Some(p) => cur = p,
+                None => return cur,
+            }
+        }
+    }
+
     /// Visits every heap [`Handle`] reachable from this scope chain's bindings
     /// (for GC tracing of a closure's captured values).
     pub fn for_each_handle(&self, visit: &mut dyn FnMut(Handle)) {

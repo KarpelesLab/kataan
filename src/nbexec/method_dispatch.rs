@@ -5070,6 +5070,27 @@ impl<'a> Interp<'a> {
             return Ok(NanBox::handle(self.realm.new_array(v).to_raw()));
         }
         let mut c = self.read_member(original, "constructor")?;
+        // Step 6 (cross-realm): if C is a constructor from a *different* realm than
+        // the current Realm Record and `SameValue(C, realmC.[[%Array%]])`, then C is
+        // set to undefined — so `[].map()` on an array whose `.constructor` was set
+        // to another realm's `Array` builds the result with *this* realm's `%Array%`
+        // (and never reads that other realm's `@@species`). `cur_realm` is the realm
+        // of the executing `Array.prototype.*` method (the current Realm Record).
+        if self.is_constructor_value(c)
+            && let Some(ch) = c.as_handle().map(Handle::from_raw)
+            && let Some(realm_c) = self.get_function_realm(ch)
+            && Some(realm_c) != self.cur_realm
+            && realm_c < self.created_realms.len()
+            && self.created_realms[realm_c]
+                .global_this
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|gt| self.realm.get_property(gt, "Array"))
+                .and_then(|a| a.as_handle())
+                == c.as_handle()
+        {
+            c = NanBox::undefined();
+        }
         // Step 5: "If C is an Object" — read C[@@species]; null → default. Note a
         // primitive that happens to be heap-allocated (string / symbol / bigint) is
         // NOT an Object, so it must fall through to the IsConstructor(C) check (step

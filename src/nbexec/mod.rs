@@ -627,6 +627,16 @@ pub struct Interp<'a> {
     /// cross-realm `GetPrototypeFromConstructor` fallback (a `newTarget` whose
     /// `.prototype` is not an Object), so it never perturbs same-realm construction.
     fn_realm: alloc::collections::BTreeMap<u64, usize>,
+    /// The `created_realms` index of the realm whose function is *currently
+    /// executing* — `None` for the main realm. Pushed on entry to every native
+    /// method dispatch and every user-closure invocation (derived from the
+    /// callee's `GetFunctionRealm`, falling back to the callee's captured global
+    /// scope), restored on return. Consulted by [`Interp::make_error`] so an error
+    /// thrown by a cross-realm intrinsic (e.g. `otherRealm.String.prototype.valueOf`
+    /// called on a bad `this`) carries *that realm's* `%TypeError%`, and by
+    /// [`Interp::array_species_create`] to identify the current Realm Record for the
+    /// `SameValue(C, realmC.[[%Array%]])` cross-realm nullification step.
+    cur_realm: Option<usize>,
     /// Programs parsed at runtime by `eval` / the `Function` constructor, keyed by
     /// source string. The interpreter's function/AST tables hold `&'a` references
     /// into the running program; a dynamically-parsed `Program` must therefore
@@ -2886,6 +2896,7 @@ impl<'a> Interp<'a> {
             shadow_realm_scopes: Vec::new(),
             created_realms: Vec::new(),
             fn_realm: alloc::collections::BTreeMap::new(),
+            cur_realm: None,
             eval_programs: alloc::collections::BTreeMap::new(),
             #[cfg(all(feature = "module", feature = "std"))]
             modules: module::ModuleRegistry::new(),
@@ -6307,6 +6318,16 @@ impl<'a> Interp<'a> {
             field_init: self.in_field_initializer,
         });
         let handle = self.realm.new_function(func_id, self.current.clone());
+        // `GetFunctionRealm` tagging: a closure created while executing in a
+        // `$262.createRealm()` realm (e.g. a class method built by that realm's
+        // `eval`) belongs to that realm, so a brand-check / type error it later
+        // throws carries *that realm's* `%TypeError%` (see `make_error`). The
+        // closure's captured scope may root at the main global scope (an indirect
+        // eval runs there), so scope-walking alone would miss it — record it
+        // explicitly. `None` (main realm) leaves the fast path untouched.
+        if let Some(idx) = self.cur_realm {
+            self.fn_realm.insert(handle.to_raw(), idx);
+        }
         // Materialize `name` ("" until a later NamedEvaluation / method key sets
         // it) and `length` as own data properties so `hasOwnProperty("name")` and
         // `verifyProperty` behave per spec even for anonymous functions. A named
@@ -6398,9 +6419,19 @@ impl<'a> Interp<'a> {
         // so a `get_property` on a shadowing binding would otherwise resolve to it
         // instead of falling through.) Fall back to `current` only if the global
         // binding is absent (early bootstrap, before the constructors are bound).
-        if let Some(proto) = self
-            .global_scope
-            .get(name)
+        // When a *cross-realm* intrinsic is executing (`cur_realm` is set — e.g.
+        // `otherRealm.String.prototype.valueOf` called on a bad `this`, or a class
+        // method from a class evaluated in another realm hitting a brand-check
+        // failure), the thrown error must be that realm's `%TypeError%` — resolve
+        // the constructor from *that realm's* global object, not the main realm's.
+        let realm_ctor = self
+            .cur_realm
+            .filter(|i| *i < self.created_realms.len())
+            .and_then(|i| self.created_realms[i].global_this.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|gt| self.realm.get_property(gt, name));
+        if let Some(proto) = realm_ctor
+            .or_else(|| self.global_scope.get(name))
             .or_else(|| self.current.get(name))
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
