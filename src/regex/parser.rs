@@ -797,6 +797,27 @@ impl Parser {
                 Some('\\') if self.chars.get(self.pos + 1) == Some(&'u') => {
                     self.pos += 2; // `\u`
                     let cp = self.parse_unicode_escape()?;
+                    // A `\u` lead surrogate immediately followed by a `\u` trail
+                    // surrogate combines into one astral code point in a
+                    // RegExpIdentifierName — regardless of the `u`/`v` flag (in `u`
+                    // mode `parse_unicode_escape` already folded them, so `cp` is no
+                    // longer a lone surrogate and this branch does nothing).
+                    let cp = if (0xD800..=0xDBFF).contains(&cp)
+                        && self.chars.get(self.pos) == Some(&'\\')
+                        && self.chars.get(self.pos + 1) == Some(&'u')
+                    {
+                        let save = self.pos;
+                        self.pos += 2; // `\u`
+                        let lo = self.parse_unicode_escape()?;
+                        if (0xDC00..=0xDFFF).contains(&lo) {
+                            0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+                        } else {
+                            self.pos = save;
+                            cp
+                        }
+                    } else {
+                        cp
+                    };
                     char::from_u32(cp)
                         .ok_or_else(|| RegexError::new("invalid code point in group name"))?
                 }
@@ -930,6 +951,26 @@ impl Parser {
             }
             // `\p` / `\P` are Unicode property escapes only under the `u` flag.
             // Without it they are an IdentityEscape (Annex B): the literal `p`/`P`.
+            // In `v` mode a lone `\p{…}` may name a *property of strings*, so it
+            // parses as a (single-operand) ClassSetExpression that can carry the
+            // matchable string set; `\P{…}` of a string property is an early error
+            // (handled inside `parse_class_set_property`). An ordinary code-point
+            // property stays on the plain-class path below to keep that hot path
+            // unchanged.
+            'p' | 'P' if self.unicode_sets => {
+                let set = self.parse_class_set_property(c == 'P')?;
+                match set {
+                    // A property of strings — wrap as a top-level class set.
+                    ClassSetExpr::Strings(_) => Node::ClassSet {
+                        neg: false,
+                        set: Box::new(set),
+                    },
+                    // A code-point property escape — same node as the plain path.
+                    ClassSetExpr::Items(items) => Node::Class { neg: false, items },
+                    // `parse_class_set_property` only returns Strings or Items.
+                    _ => unreachable!("class-set property escape is Strings or Items"),
+                }
+            }
             'p' if self.unicode => {
                 class_shorthand(Shorthand::Property(self.parse_property(false)?, false))
             }
@@ -974,7 +1015,14 @@ impl Parser {
     /// (`\p{Script=Greek}`). An unrecognised property/value, a malformed body, or
     /// an empty name/value is rejected with a `RegexError` so the caller raises a
     /// `SyntaxError` — the corpus's negative parse tests rely on this.
-    fn parse_property(&mut self, negated: bool) -> Result<super::props::PropEscape, RegexError> {
+    /// Reads a `\p{…}` body (the `\p`/`\P` already consumed) into its property
+    /// `name` and optional `=value`. Shared by [`parse_property`](Self::parse_property)
+    /// (which resolves to a code-point [`PropEscape`](super::props::PropEscape)) and
+    /// the `v`-mode class-set path (which may instead resolve a lone name to a
+    /// *property of strings*).
+    fn read_property_body(
+        &mut self,
+    ) -> Result<(alloc::string::String, Option<alloc::string::String>), RegexError> {
         if !self.eat('{') {
             return Err(RegexError::new("expected `{` after `\\p`"));
         }
@@ -993,6 +1041,60 @@ impl Parser {
                 None => return Err(RegexError::new("unterminated `\\p{…}`")),
             }
         }
+        Ok((name, value))
+    }
+
+    /// Parses a `\p{…}` in a `v`-mode ClassSetExpression. Unlike
+    /// [`parse_property`](Self::parse_property) this also accepts a lone *property
+    /// of strings* name (`\p{Emoji_Keycap_Sequence}` …), returning it as a
+    /// [`ClassSetExpr::Strings`] set when closed-form data is available. A code-point
+    /// property resolves to a single-shorthand [`ClassSetExpr::Items`]. `negated`
+    /// is the `\P` form; a property of strings may not be negated (or appear inside
+    /// a negated class), which is a `SyntaxError`.
+    fn parse_class_set_property(&mut self, negated: bool) -> Result<ClassSetExpr, RegexError> {
+        let (name, value) = self.read_property_body()?;
+        // A lone name that is a property of strings takes the string-set path.
+        if value.is_none()
+            && !name.is_empty()
+            && super::props::is_property_of_strings(&name)
+            // A code-point property of the same name (none currently) would be
+            // preferred; `resolve_lone` returning `None` confirms it is only a
+            // property of strings.
+            && super::props::resolve_lone(&name).is_none()
+        {
+            if negated || self.in_negated_class {
+                return Err(RegexError::new(
+                    "a property of strings may not be negated or placed in a negated class",
+                ));
+            }
+            return match super::props::strings_for_property(&name) {
+                Some(strings) => Ok(ClassSetExpr::Strings(strings)),
+                None => Err(RegexError::unsupported(
+                    "unsupported `\\p{…}` property of strings",
+                )),
+            };
+        }
+        // Otherwise it is an ordinary code-point property escape.
+        let prop = self.resolve_property(negated, name, value)?;
+        Ok(ClassSetExpr::Items(alloc::vec![ClassItem::Shorthand(
+            Shorthand::Property(prop, negated),
+        )]))
+    }
+
+    fn parse_property(&mut self, negated: bool) -> Result<super::props::PropEscape, RegexError> {
+        let (name, value) = self.read_property_body()?;
+        self.resolve_property(negated, name, value)
+    }
+
+    /// Resolves an already-read `\p{…}` body to a code-point
+    /// [`PropEscape`](super::props::PropEscape), applying the property-of-strings
+    /// early-error rules. See [`parse_property`](Self::parse_property).
+    fn resolve_property(
+        &self,
+        negated: bool,
+        name: alloc::string::String,
+        value: Option<alloc::string::String>,
+    ) -> Result<super::props::PropEscape, RegexError> {
         let is_lone = value.is_none();
         let resolved = match value {
             // `name=value` — both sides must be non-empty and resolve.
@@ -1533,10 +1635,7 @@ impl Parser {
             }
             'p' | 'P' => {
                 self.pos += 1; // `p`/`P`
-                let prop = self.parse_property(e == 'P')?;
-                Ok(ClassSetExpr::Items(alloc::vec![ClassItem::Shorthand(
-                    Shorthand::Property(prop, e == 'P'),
-                )]))
+                self.parse_class_set_property(e == 'P')
             }
             _ => {
                 // A single-character class escape (`\u`, `\x`, `\n`, identity, …).

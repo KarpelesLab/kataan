@@ -573,6 +573,59 @@ fn v_flag_string_literals() {
 }
 
 #[test]
+fn group_name_surrogate_pairs_non_unicode() {
+    // In a non-`u` regex a group name may use `\u` surrogate pairs, `\u{…}` code
+    // point escapes, or literal astral characters (all name U+1D453 `𝑓` …).
+    // Previously a `\u`-surrogate-pair name was rejected as an invalid code point.
+    assert!(Regex::new(r"(?<𝑓>fox)", "").is_ok());
+    assert!(Regex::new(r"(?<\u{1d453}>fox)", "").is_ok());
+    assert!(Regex::new("(?<\u{1d453}>fox)", "").is_ok());
+    // Named backreference to an astral-named group.
+    assert!(re(r"(?<𝑓>dog)(.*?)(\k<𝑓>)", "").is_match("dog eat dog"));
+    // A lone `\u` surrogate that does not pair is still an invalid name.
+    assert!(Regex::new(r"(?<\ud835x>fox)", "").is_err());
+}
+
+#[test]
+fn v_flag_property_of_strings_keycap() {
+    // `\p{Emoji_Keycap_Sequence}` matches the twelve `<base>U+FE0F U+20E3`
+    // keycap strings (multi-code-point), and nothing else.
+    let kc = "0\u{FE0F}\u{20E3}"; // 0️⃣
+    let hashkc = "#\u{FE0F}\u{20E3}"; // #️⃣
+    assert!(re(r"^\p{Emoji_Keycap_Sequence}$", "v").is_match(kc));
+    assert!(re(r"^\p{Emoji_Keycap_Sequence}$", "v").is_match(hashkc));
+    assert!(!re(r"^\p{Emoji_Keycap_Sequence}$", "v").is_match("0"));
+    // As a class operand, combined with a string literal via union.
+    let re1 = re(r"^[\p{Emoji_Keycap_Sequence}\q{0|2}]+$", "v");
+    assert!(re1.is_match(kc));
+    assert!(re1.is_match("0"));
+    let mut combo = alloc::string::String::new();
+    combo.push_str(kc);
+    combo.push_str(hashkc);
+    combo.push('0');
+    assert!(re1.is_match(&combo));
+    // Difference: `[0-9]` minus the keycap strings still matches bare digits
+    // (a bare `0` is not a keycap sequence) but never a keycap sequence.
+    let d = re(r"^[[0-9]--\p{Emoji_Keycap_Sequence}]+$", "v");
+    assert!(d.is_match("019"));
+    assert!(!d.is_match(kc));
+    // Intersection with a string literal set keeps only the shared strings.
+    let i = re(r"^[\p{Emoji_Keycap_Sequence}&&\q{0️⃣|zz}]+$", "v");
+    assert!(i.is_match(kc));
+    assert!(!i.is_match(hashkc));
+}
+
+#[test]
+fn v_flag_property_of_strings_errors() {
+    // A property of strings may not be negated…
+    assert!(Regex::new(r"\P{Emoji_Keycap_Sequence}", "v").is_err());
+    // …nor appear inside a negated class…
+    assert!(Regex::new(r"[^\p{Emoji_Keycap_Sequence}]", "v").is_err());
+    // …and unsupported string properties stay a hard error when matched.
+    assert!(Regex::new(r"[\p{RGI_Emoji}]", "v").is_err());
+}
+
+#[test]
 fn v_flag_syntax_errors() {
     assert!(Regex::new(r"[^\q{ab}]", "v").is_err()); // negated class with string
     assert!(Regex::new("[a~~b]", "v").is_err()); // reserved double punctuator

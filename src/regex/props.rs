@@ -152,6 +152,35 @@ pub(crate) fn is_property_of_strings(name: &str) -> bool {
     )
 }
 
+/// Resolves a *property of strings* name (a `v`-mode `\p{…}` that matches a set of
+/// multi-code-point strings) to that set of strings, when this engine has the
+/// closed-form data for it. Each string is a sequence of scalar code points.
+///
+/// Only `Emoji_Keycap_Sequence` is provided as closed-form data: it is a small,
+/// stable, fully-enumerated Unicode set — the twelve sequences
+/// `{ # * 0 1 2 3 4 5 6 7 8 9 } U+FE0F U+20E3`. The remaining properties of
+/// strings (`RGI_Emoji` and its component sequence properties, `Basic_Emoji`)
+/// depend on the full, versioned emoji-sequence tables the engine does not carry,
+/// so they return `None` and stay deferred (a never-matched literal keeps
+/// parsing; a matched one is an unsupported-feature error).
+#[must_use]
+pub(crate) fn strings_for_property(name: &str) -> Option<alloc::vec::Vec<alloc::vec::Vec<u32>>> {
+    if name != "Emoji_Keycap_Sequence" {
+        return None;
+    }
+    // U+0023 `#`, U+002A `*`, U+0030..=U+0039 `0`..`9`, each followed by the
+    // emoji variation selector U+FE0F and the combining enclosing keycap U+20E3.
+    let bases: [u32; 12] = [
+        0x23, 0x2A, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
+    ];
+    Some(
+        bases
+            .iter()
+            .map(|&b| alloc::vec![b, 0xFE0F, 0x20E3])
+            .collect(),
+    )
+}
+
 /// Resolves a `name=value` property escape. The left-hand side must be one of the
 /// non-binary properties `General_Category`/`gc`, `Script`/`sc`, or
 /// `Script_Extensions`/`scx`; the value is validated against it. Any other LHS,
