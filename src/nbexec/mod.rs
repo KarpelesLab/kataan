@@ -4419,6 +4419,16 @@ impl<'a> Interp<'a> {
             .map(Handle::from_raw)
         {
             self.realm.set_array_proto_intrinsic(arr_proto);
+            // `Array.prototype` is an Array exotic object with an own `length`
+            // property (`{ value: 0, writable: true, enumerable: false,
+            // configurable: false }`). We model the prototype itself as a plain
+            // object, but expose the own `length` so `Array.prototype.length === 0`
+            // and `"length" in Object.create(Array.prototype)` hold.
+            self.realm
+                .set_property(arr_proto, "length", NanBox::number(0.0));
+            self.realm.mark_hidden(arr_proto, "length");
+            self.realm
+                .set_non_configurable_property(arr_proto, "length");
             // `Array.prototype[Symbol.iterator]` is the *same* function object as
             // `Array.prototype.values` (per spec), so `[][Symbol.iterator] ===
             // [].values` and the `arguments` object's iterator matches

@@ -10488,3 +10488,84 @@ fn intl_to_locale_case() {
     // Turkish dotless-i tailoring for uppercase.
     assert_eq!(run(r#"("i").toLocaleUpperCase("tr")"#), "\u{130}");
 }
+
+#[test]
+fn flatmap_forwards_this_arg() {
+    // `flatMap(callbackfn, thisArg)` forwards the second argument as `this`.
+    assert_eq!(
+        run("var m={tag:7};[1].flatMap(function(){return [this.tag];}, m)[0]"),
+        "7"
+    );
+}
+
+#[test]
+fn array_species_create_through_proxy_receiver() {
+    // `Array.prototype.{map,filter,slice,splice,concat}` on a Proxy whose target is
+    // an Array must run ArraySpeciesCreate against the *original* receiver (reading
+    // `constructor`/`@@species` through the proxy), not a materialized snapshot.
+    let harness = "var array=[1,2,3];\
+        var proxy=new Proxy(new Proxy(array,{}),{});\
+        var Ctor=function(){};\
+        array.constructor=function(){};\
+        array.constructor[Symbol.species]=Ctor;";
+    for m in ["map", "filter"] {
+        assert_eq!(
+            run(&alloc::format!(
+                "{harness}Object.getPrototypeOf(Array.prototype.{m}.call(proxy,function(){{return true;}}))===Ctor.prototype"
+            )),
+            "true",
+            "method {m}"
+        );
+    }
+    for m in ["slice", "splice", "concat"] {
+        assert_eq!(
+            run(&alloc::format!(
+                "{harness}Object.getPrototypeOf(Array.prototype.{m}.call(proxy))===Ctor.prototype"
+            )),
+            "true",
+            "method {m}"
+        );
+    }
+}
+
+#[test]
+fn array_prototype_has_own_length_zero() {
+    // `Array.prototype` exposes an own `length` (0, writable, non-enumerable,
+    // non-configurable), so `"length" in Object.create(Array.prototype)` holds.
+    assert_eq!(run("Array.prototype.length"), "0");
+    assert_eq!(run(r#""length" in Object.create(Array.prototype)"#), "true");
+    assert_eq!(
+        run(
+            "var d=Object.getOwnPropertyDescriptor(Array.prototype,'length');\
+             [d.value,d.writable,d.enumerable,d.configurable].join(',')"
+        ),
+        "0,true,false,false"
+    );
+    // Not enumerable — does not appear in Object.keys.
+    assert_eq!(run("Object.keys(Array.prototype).length"), "0");
+}
+
+#[test]
+fn weak_collection_tag_and_constructor_not_conflated_with_strong() {
+    // A WeakMap/WeakSet inherits from its own prototype, not Map/Set: deleting the
+    // prototype's `@@toStringTag` falls back to "[object Object]" (not "[object
+    // Map]"), and `.constructor` is WeakMap/WeakSet.
+    assert_eq!(run("(new WeakMap()).constructor===WeakMap"), "true");
+    assert_eq!(run("(new WeakSet()).constructor===WeakSet"), "true");
+    assert_eq!(
+        run(
+            "var wm=new WeakMap();delete WeakMap.prototype[Symbol.toStringTag];\
+             Object.prototype.toString.call(wm)"
+        ),
+        "[object Object]"
+    );
+    assert_eq!(
+        run(
+            "var ws=new WeakSet();delete WeakSet.prototype[Symbol.toStringTag];\
+             Object.prototype.toString.call(ws)"
+        ),
+        "[object Object]"
+    );
+    // The weak collection's own methods still resolve (from its prototype).
+    assert_eq!(run("typeof (new WeakMap()).set"), "function");
+}

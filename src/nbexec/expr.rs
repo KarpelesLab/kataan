@@ -3374,7 +3374,16 @@ impl<'a> Interp<'a> {
         } else if self.realm.is_array_like(handle) {
             "Array"
         } else if let Some(is_set) = self.realm.collection_is_set(handle) {
-            if is_set { "Set" } else { "Map" }
+            // A *weak* collection inherits from `%WeakMap/WeakSet.prototype%`, not
+            // the strong `%Map/Set.prototype%` — conflating them resolved a WeakMap's
+            // first-class members (e.g. a `Symbol.toStringTag` fallback) from
+            // `Map.prototype`, wrongly reporting `[object Map]`.
+            match (self.realm.collection_is_weak(handle), is_set) {
+                (true, true) => "WeakSet",
+                (true, false) => "WeakMap",
+                (false, true) => "Set",
+                (false, false) => "Map",
+            }
         } else if self.realm.function_at(handle).is_some()
             || self.realm.native_at(handle).is_some()
             || self.realm.bound_native_at(handle).is_some()

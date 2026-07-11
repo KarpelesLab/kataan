@@ -242,13 +242,31 @@ impl<'a> Interp<'a> {
                 let m = self.new_str("Invalid array length");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }
-            let mut out = alloc::vec![NanBox::hole(); count];
+            // `A = ArraySpeciesCreate(O, count)` — for a *proxy* whose target is an
+            // Array, `IsArray(O)` is true, so this reads `O.constructor`/`@@species`
+            // (through the proxy's traps) and may build an exotic result rather than a
+            // plain dense Array. A genuinely non-Array array-like yields a plain Array.
+            let a_v = self.array_species_create(h, count)?;
+            let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
+                return Err(self.type_error("Array species did not return an object"));
+            };
+            let default_array = self.realm.is_array(a_h)
+                && self.realm.array_length(a_h) == Some(count)
+                && !self.realm.array_has_index_overrides(a_h);
             for (n, i) in (k..final_i).enumerate() {
-                if self.has_property(h, &alloc::format!("{i}")) {
-                    out[n] = self.read_member(h, &alloc::format!("{i}"))?;
+                let key = alloc::format!("{i}");
+                if self.has_property(h, &key) {
+                    let v = self.read_member(h, &key)?;
+                    if default_array {
+                        self.realm.set_element(a_h, n, v);
+                    } else {
+                        self.create_data_property_or_throw(a_h, n, v)?;
+                    }
                 }
             }
-            return Ok(Some(NanBox::handle(self.realm.new_array(out).to_raw())));
+            let len_key = self.new_str("length");
+            self.assign_member_value(a_h, len_key, NanBox::number(count as f64))?;
+            return Ok(Some(a_v));
         }
         // `Array.prototype.concat` is receiver-agnostic (ECMA-262 23.1.3.1: it
         // begins with `ToObject(this)`), so intercept it up front for *any*
@@ -3003,6 +3021,12 @@ impl<'a> Interp<'a> {
         // object as its 3rd argument (`O`), not the materialized snapshot — so
         // `(v, i, arr) => arr === O` and `arr instanceof Boolean` hold.
         let callback_recv = NanBox::handle(handle.to_raw());
+        // The *original* receiver (before any generic-array-like / sparse-array
+        // materialization). `ArraySpeciesCreate` must read `constructor`/`@@species`
+        // from this — a Proxy receiver is materialized into a plain-array snapshot
+        // for iteration, but species selection must still see the proxy's traps /
+        // the target's `constructor`.
+        let species_recv = handle;
         let handle = array_like.unwrap_or(handle);
         // S5/S3/S8: bulk typed-array mutators (`fill`/`copyWithin`/`set`/`subarray`)
         // operate on the backing bytes directly. Handle them up front using the
@@ -3436,7 +3460,7 @@ impl<'a> Interp<'a> {
                     let removed: Vec<NanBox> = elems[start..start + delete].to_vec();
                     // The removed array is `ArraySpeciesCreate(O, deleteCount)`
                     // populated by `CreateDataPropertyOrThrow` (holes preserved).
-                    let rem_v = self.array_species_create(handle, delete)?;
+                    let rem_v = self.array_species_create(species_recv, delete)?;
                     let Some(rem_h) = rem_v.as_handle().map(Handle::from_raw) else {
                         return Err(self.type_error("Array species did not return an object"));
                     };
@@ -3881,7 +3905,7 @@ impl<'a> Interp<'a> {
                         }
                     }
                     // A typed-array `map` allocates via TypedArraySpeciesCreate.
-                    return Ok(Some(self.typed_like_species(handle, out)?));
+                    return Ok(Some(self.typed_like_species(species_recv, out)?));
                 }
                 "filter" => {
                     let f = arg(0);
@@ -3905,7 +3929,7 @@ impl<'a> Interp<'a> {
                                 out.push(e);
                             }
                         }
-                        return Ok(Some(self.typed_like_species(handle, out)?));
+                        return Ok(Some(self.typed_like_species(species_recv, out)?));
                     }
                     // A real array reads each `kValue` *live* via `[[Get]]` (a
                     // callback that mutates a later index is observed); holes are
@@ -3933,7 +3957,7 @@ impl<'a> Interp<'a> {
                             out.push(e);
                         }
                     }
-                    return Ok(Some(self.typed_like_species(handle, out)?));
+                    return Ok(Some(self.typed_like_species(species_recv, out)?));
                 }
                 "forEach" => {
                     let f = arg(0);
@@ -4144,7 +4168,7 @@ impl<'a> Interp<'a> {
                     // `A = ArraySpeciesCreate(O, count)`, then
                     // `CreateDataPropertyOrThrow` each *present* element (holes are
                     // skipped, leaving a hole in the copy), then `Set length`.
-                    let a_v = self.array_species_create(handle, count)?;
+                    let a_v = self.array_species_create(species_recv, count)?;
                     let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
                         return Err(self.type_error("Array species did not return an object"));
                     };
@@ -4316,7 +4340,7 @@ impl<'a> Interp<'a> {
                     };
                     // `A = ArraySpeciesCreate(O, 0)` — throws a TypeError for a
                     // non-constructor `@@species`, *before* any element access.
-                    let a_v = self.array_species_create(handle, 0)?;
+                    let a_v = self.array_species_create(species_recv, 0)?;
                     let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
                         return Err(self.type_error("Array species did not return an object"));
                     };
@@ -4402,11 +4426,14 @@ impl<'a> Interp<'a> {
                     let f = arg(0);
                     // `A = ArraySpeciesCreate(O, 0)` first — a non-constructor
                     // `@@species` is a TypeError before any mapping.
-                    let a_v = self.array_species_create(handle, 0)?;
+                    let a_v = self.array_species_create(species_recv, 0)?;
                     let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
                         return Err(self.type_error("Array species did not return an object"));
                     };
                     let default_array = self.realm.is_array(a_h) && !self.realm.is_frozen(a_h);
+                    // `flatMap(callbackfn, thisArg)` — the optional second argument
+                    // is the `this` value for each callback invocation.
+                    let this_arg = arg(1);
                     let mut k = 0usize;
                     for (i, e) in elems.iter().enumerate() {
                         // Only *present* elements are mapped (HasProperty); an
@@ -4415,7 +4442,11 @@ impl<'a> Interp<'a> {
                         if !is_present(i) {
                             continue;
                         }
-                        let r = self.call(f, &[*e, NanBox::number(i as f64), callback_recv])?;
+                        let r = self.call_with_this(
+                            f,
+                            this_arg,
+                            &[*e, NanBox::number(i as f64), callback_recv],
+                        )?;
                         // Flatten one level: a mapped array spreads its *present*
                         // elements (holes skipped), a non-array is appended.
                         let items: Vec<NanBox> = match r
@@ -5068,7 +5099,10 @@ impl<'a> Interp<'a> {
         length: usize,
     ) -> Result<NanBox, ExecError> {
         // A non-Array original (the generic-array-like concat path) → ArrayCreate.
-        if !self.realm.is_array(original) {
+        // IsArray is proxy-aware (a proxy whose target is an Array *is* an Array, and
+        // a revoked proxy throws), so unwrap the proxy chain here. The subsequent
+        // `Get(original, "constructor")` also runs through any proxy `get` trap.
+        if !self.is_array_unwrap_proxy(NanBox::handle(original.to_raw()))? {
             let mut v = alloc::vec![NanBox::hole(); 0];
             v.resize(length, NanBox::hole());
             return Ok(NanBox::handle(self.realm.new_array(v).to_raw()));
@@ -5554,17 +5588,35 @@ impl<'a> Interp<'a> {
                     let m = self.new_str("Invalid array length");
                     return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                 }
-                // Collect the removed elements (hole-preserving) into a fresh array.
-                let mut removed: Vec<NanBox> = Vec::with_capacity(delete_count);
+                // `A = ArraySpeciesCreate(O, actualDeleteCount)` — for a *proxy* whose
+                // target is an Array, `IsArray(O)` is true, so this reads
+                // `O.constructor`/`@@species` (through the proxy's traps) and may build
+                // an exotic result. Collect the removed elements via
+                // `CreateDataPropertyOrThrow` (holes preserved by skipping absent keys).
+                let removed_arr_v = self.array_species_create(handle, delete_count)?;
+                let Some(removed_arr) = removed_arr_v.as_handle().map(Handle::from_raw) else {
+                    return Err(self.type_error("Array species did not return an object"));
+                };
+                let default_removed = self.realm.is_array(removed_arr)
+                    && self.realm.array_length(removed_arr) == Some(delete_count)
+                    && !self.realm.array_has_index_overrides(removed_arr);
                 for k in 0..delete_count {
                     let idx = start + k;
                     if self.has_property(handle, &alloc::format!("{idx}")) {
-                        removed.push(self.array_like_get(handle, idx)?);
-                    } else {
-                        removed.push(NanBox::hole());
+                        let v = self.array_like_get(handle, idx)?;
+                        if default_removed {
+                            self.realm.set_element(removed_arr, k, v);
+                        } else {
+                            self.create_data_property_or_throw(removed_arr, k, v)?;
+                        }
                     }
                 }
-                let removed_arr = self.realm.new_array(removed);
+                let rem_len_key = self.new_str("length");
+                self.assign_member_value(
+                    removed_arr,
+                    rem_len_key,
+                    NanBox::number(delete_count as f64),
+                )?;
                 // Shift the tail to its new position.
                 if insert_count < delete_count {
                     for k in start..(len - delete_count) {
@@ -5583,7 +5635,7 @@ impl<'a> Interp<'a> {
                     self.array_like_set(handle, start + j, *item)?;
                 }
                 self.array_like_set_length(handle, len - delete_count + insert_count)?;
-                Ok(NanBox::handle(removed_arr.to_raw()))
+                Ok(removed_arr_v)
             }
             _ => Ok(NanBox::undefined()),
         }

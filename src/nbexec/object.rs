@@ -2591,7 +2591,13 @@ impl<'a> Interp<'a> {
         } else if self.realm.date_at(handle).is_some() {
             "Date"
         } else if let Some(is_set) = self.realm.collection_is_set(handle) {
-            if is_set { "Set" } else { "Map" }
+            // Distinguish weak collections so `wm.constructor === WeakMap` (not Map).
+            match (self.realm.collection_is_weak(handle), is_set) {
+                (true, true) => "WeakSet",
+                (true, false) => "WeakMap",
+                (false, true) => "Set",
+                (false, false) => "Map",
+            }
         } else if self.realm.promise_state(handle).is_some() {
             "Promise"
         } else if self.realm.object_keys(handle).is_some() {
