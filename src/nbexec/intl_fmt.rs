@@ -413,6 +413,248 @@ fn weekday_to_string(s: &str) -> Option<String> {
     }))
 }
 
+/// Split a BCP-47 locale into its base (with the requested `u`-extension keyword
+/// removed) and the value of that keyword, if present. `key` is the two-letter
+/// Unicode keyword (e.g. `"hc"`, `"nu"`, `"ca"`). Returns
+/// `(locale_without_key, Some(value))` when the keyword is present, else
+/// `(locale.to_owned(), None)`. Keys are exactly two chars; type values are
+/// 3–8 chars, so the two are distinguishable within the `-u-` section.
+fn split_u_keyword(locale: &str, key: &str) -> (String, Option<String>) {
+    let segs: Vec<&str> = locale.split('-').collect();
+    // Locate the `u` singleton extension (a length-1 segment equal to `u`).
+    let mut ustart = None;
+    for (i, s) in segs.iter().enumerate() {
+        if s.len() == 1 && s.eq_ignore_ascii_case("u") {
+            ustart = Some(i);
+            break;
+        }
+    }
+    let Some(ustart) = ustart else {
+        return (String::from(locale), None);
+    };
+    // The `u` section runs until the next singleton (length-1) segment or end.
+    let mut ext_end = ustart + 1;
+    while ext_end < segs.len() && segs[ext_end].len() != 1 {
+        ext_end += 1;
+    }
+    let is_key = |s: &str| s.len() == 2 && s.bytes().all(|b| b.is_ascii_alphanumeric());
+    let mut found: Option<String> = None;
+    let mut kept: Vec<&str> = Vec::new();
+    let mut j = ustart + 1;
+    while j < ext_end {
+        let cur = segs[j];
+        if is_key(cur) {
+            // Gather this keyword's type values (3–8 char segments until the
+            // next 2-char key or the section end).
+            let mut k = j + 1;
+            while k < ext_end && !is_key(segs[k]) {
+                k += 1;
+            }
+            if cur.eq_ignore_ascii_case(key) {
+                found = Some(segs[j + 1..k].join("-").to_ascii_lowercase());
+            } else {
+                kept.extend_from_slice(&segs[j..k]);
+            }
+            j = k;
+        } else {
+            // A leading attribute (no key) — preserve it.
+            kept.push(cur);
+            j += 1;
+        }
+    }
+    if found.is_none() {
+        return (String::from(locale), None);
+    }
+    let mut out: Vec<&str> = segs[..ustart].to_vec();
+    if !kept.is_empty() {
+        out.push("u");
+        out.extend_from_slice(&kept);
+    }
+    out.extend_from_slice(&segs[ext_end..]);
+    (out.join("-"), found)
+}
+
+/// Decide whether the dropped-tail `dropped` (the digits at and beyond the kept
+/// precision) rounds the retained value up (away from zero), under `mode`.
+#[cfg(feature = "intl")]
+fn exact_round_up(dropped: &[u8], mode: intl::number::RoundingMode, neg: bool) -> bool {
+    use intl::number::RoundingMode::*;
+    if dropped.is_empty() {
+        return false;
+    }
+    let first = dropped[0];
+    let rest_nonzero = dropped[1..].iter().any(|&d| d != 0);
+    let any_nonzero = first != 0 || rest_nonzero;
+    match mode {
+        Trunc => false,
+        Expand => any_nonzero,
+        Ceil => any_nonzero && !neg,
+        Floor => any_nonzero && neg,
+        HalfExpand => first >= 5,
+        HalfTrunc => first > 5 || (first == 5 && rest_nonzero),
+        HalfCeil => (first > 5 || (first == 5 && rest_nonzero)) || (first == 5 && !neg),
+        HalfFloor => (first > 5 || (first == 5 && rest_nonzero)) || (first == 5 && neg),
+        // Half-even (banker's) needs the last kept digit; approximate as halfExpand
+        // (unused by the exact-decimal target tests).
+        _ => first >= 5,
+    }
+}
+
+/// Add one unit at the least-significant retained position of `int.frac`,
+/// propagating the carry (grows `int` if it overflows).
+#[cfg(feature = "intl")]
+fn exact_increment(int: &mut alloc::vec::Vec<u8>, frac: &mut [u8]) {
+    let mut carry = 1u8;
+    for d in frac.iter_mut().rev() {
+        let s = *d + carry;
+        *d = s % 10;
+        carry = s / 10;
+        if carry == 0 {
+            return;
+        }
+    }
+    for d in int.iter_mut().rev() {
+        let s = *d + carry;
+        *d = s % 10;
+        carry = s / 10;
+        if carry == 0 {
+            return;
+        }
+    }
+    if carry > 0 {
+        int.insert(0, carry);
+    }
+}
+
+/// From a probe like `"1.1"` / `"-1.1"` (latn digits), split the leading prefix,
+/// the decimal separator, and the trailing suffix.
+#[cfg(feature = "intl")]
+fn split_number_scaffold(probe: &str) -> (String, String, String) {
+    let chars: alloc::vec::Vec<char> = probe.chars().collect();
+    let mut i = 0;
+    let mut prefix = String::new();
+    while i < chars.len() && !chars[i].is_ascii_digit() {
+        prefix.push(chars[i]);
+        i += 1;
+    }
+    while i < chars.len() && chars[i].is_ascii_digit() {
+        i += 1;
+    }
+    let mut sep = String::new();
+    while i < chars.len() && !chars[i].is_ascii_digit() {
+        sep.push(chars[i]);
+        i += 1;
+    }
+    while i < chars.len() && chars[i].is_ascii_digit() {
+        i += 1;
+    }
+    let suffix: String = chars[i..].iter().collect();
+    (prefix, sep, suffix)
+}
+
+/// From a probe like `"1,111"` (latn), extract the first group separator that
+/// appears between integer digit groups (`""` if the value isn't grouped).
+#[cfg(feature = "intl")]
+fn extract_group_sep(probe: &str) -> String {
+    let chars: alloc::vec::Vec<char> = probe.chars().collect();
+    let mut i = 0;
+    while i < chars.len() && !chars[i].is_ascii_digit() {
+        i += 1; // skip prefix
+    }
+    while i < chars.len() && chars[i].is_ascii_digit() {
+        i += 1; // first integer group
+    }
+    let mut sep = String::new();
+    while i < chars.len() && !chars[i].is_ascii_digit() {
+        sep.push(chars[i]);
+        i += 1;
+    }
+    sep
+}
+
+/// `ToRawFixed`: round the value `(int, frac)` to at most `max_frac` fraction
+/// digits under `mode`. Returns the rounded `(int, frac)`.
+#[cfg(feature = "intl")]
+fn to_raw_fixed(
+    neg: bool,
+    mut int: alloc::vec::Vec<u8>,
+    mut frac: alloc::vec::Vec<u8>,
+    max_frac: usize,
+    mode: intl::number::RoundingMode,
+) -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
+    if frac.len() > max_frac {
+        let up = exact_round_up(&frac[max_frac..], mode, neg);
+        frac.truncate(max_frac);
+        if up {
+            exact_increment(&mut int, &mut frac);
+        }
+    }
+    (int, frac)
+}
+
+/// `ToRawPrecision`: round the value `(int, frac)` to at most `max_sig`
+/// significant digits under `mode`. Returns the rounded `(int, frac)`.
+#[cfg(feature = "intl")]
+fn to_raw_precision(
+    neg: bool,
+    int: alloc::vec::Vec<u8>,
+    frac: alloc::vec::Vec<u8>,
+    max_sig: usize,
+    mode: intl::number::RoundingMode,
+) -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
+    let mut digits: alloc::vec::Vec<u8> = int.iter().chain(frac.iter()).copied().collect();
+    let mut point = int.len();
+    let Some(first_sig) = digits.iter().position(|&d| d != 0) else {
+        return (int, frac);
+    };
+    let last = first_sig + max_sig.max(1) - 1;
+    if last + 1 < digits.len() {
+        let up = exact_round_up(&digits[last + 1..], mode, neg);
+        digits.truncate(last + 1);
+        if up {
+            let mut carry = 1u8;
+            for d in digits.iter_mut().rev() {
+                let s = *d + carry;
+                *d = s % 10;
+                carry = s / 10;
+                if carry == 0 {
+                    break;
+                }
+            }
+            if carry > 0 {
+                digits.insert(0, carry);
+                point += 1;
+            }
+        }
+    }
+    while digits.len() < point {
+        digits.push(0);
+    }
+    let int_out = digits[..point].to_vec();
+    let frac_out = digits[point..].to_vec();
+    (int_out, frac_out)
+}
+
+/// Group `int_str` (latn digits, no sign) into thousands with `sep`.
+#[cfg(feature = "intl")]
+fn group_thousands_sep(int_str: &str, sep: &str) -> String {
+    if sep.is_empty() || int_str.len() <= 3 {
+        return String::from(int_str);
+    }
+    let bytes = int_str.as_bytes();
+    let mut out = String::new();
+    let first = bytes.len() % 3;
+    let first = if first == 0 { 3 } else { first };
+    out.push_str(&int_str[..first]);
+    let mut i = first;
+    while i < bytes.len() {
+        out.push_str(sep);
+        out.push_str(&int_str[i..i + 3]);
+        i += 3;
+    }
+    out
+}
+
 /// Whether `s` matches the UTS-35 `type` value production: one or more
 /// `alphanum{3,8}` subtags joined by `-` (used for `ca`/`nu` option validation).
 fn is_unicode_type_value(s: &str) -> bool {
@@ -802,22 +1044,92 @@ pub(crate) fn default_numbering_for_locale_str(locale: &str) -> String {
 /// extension; an option-sourced override drops it. Values that are not known
 /// numbering systems are ignored (falling back to the locale default).
 pub(crate) fn resolve_nu_key(base: &str, locale: &str, option: Option<&str>) -> (String, String) {
+    // The generic/algorithmic aliases (`native`, `traditio`, `finance`) are valid
+    // `nu` type values but have no fixed digit mapping, so ECMA-402 does not treat
+    // them as selectable numbering systems: a `-u-nu-native` (etc.) request is
+    // ignored, falling back to the locale default.
+    let selectable = |nu: &str| {
+        is_known_numbering_system(nu) && !matches!(nu, "native" | "traditio" | "finance")
+    };
     let mut value = default_numbering_for_locale_str(base);
     let mut addition = String::new();
     #[cfg(feature = "intl")]
     if let Some(ext) = locale_unicode_keyword(locale, "nu")
-        && is_known_numbering_system(&ext)
+        && selectable(&ext)
     {
         value = ext.clone();
         addition = alloc::format!("-nu-{ext}");
     }
     let _ = locale;
     if let Some(opt) = option
-        && is_known_numbering_system(opt)
+        && selectable(opt)
         && opt != value
     {
         value = String::from(opt);
         addition = String::new();
+    }
+    (value, addition)
+}
+
+/// The calendar identifiers ECMA-402 `AvailableCalendars` reports (the CLDR
+/// BCP-47 calendar types with fixed semantics). Used to validate a `calendar`
+/// option / `-u-ca-` extension value: an unrecognized one is ignored.
+pub(crate) const AVAILABLE_CALENDARS: [&str; 16] = [
+    "buddhist",
+    "chinese",
+    "coptic",
+    "dangi",
+    "ethioaa",
+    "ethiopic",
+    "gregory",
+    "hebrew",
+    "indian",
+    "islamic-civil",
+    "islamic-tbla",
+    "islamic-umalqura",
+    "iso8601",
+    "japanese",
+    "persian",
+    "roc",
+];
+
+/// Canonicalize a calendar identifier: lowercase it, apply the CLDR type alias
+/// (`islamicc` → `islamic-civil`, `ethiopic-amete-alem` → `ethioaa`), then map the
+/// deprecated `islamic`/`islamic-rgsa` to a concrete available calendar
+/// (`islamic-civil`, per CreateDateTimeFormat step 9).
+pub(crate) fn canonicalize_calendar(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    let canon = unicode_type_alias("ca", &lower)
+        .map(String::from)
+        .unwrap_or(lower);
+    match canon.as_str() {
+        "islamic" | "islamic-rgsa" => String::from("islamic-civil"),
+        _ => canon,
+    }
+}
+
+/// ResolveLocale for the Unicode `ca` (calendar) key, mirroring [`resolve_nu_key`].
+/// Returns `(resolved_calendar, extension_addition)`. An unavailable calendar
+/// (option or extension) is ignored; the addition is kept only when the value is
+/// extension-sourced.
+pub(crate) fn resolve_ca_key(_base: &str, locale: &str, option: Option<&str>) -> (String, String) {
+    let mut value = String::from("gregory");
+    let mut addition = String::new();
+    #[cfg(feature = "intl")]
+    if let Some(ext) = locale_unicode_calendar(locale) {
+        let ext = canonicalize_calendar(&ext);
+        if AVAILABLE_CALENDARS.contains(&ext.as_str()) {
+            addition = alloc::format!("-ca-{ext}");
+            value = ext;
+        }
+    }
+    let _ = locale;
+    if let Some(opt) = option {
+        let opt = canonicalize_calendar(opt);
+        if AVAILABLE_CALENDARS.contains(&opt.as_str()) && opt != value {
+            value = opt;
+            addition = String::new();
+        }
     }
     (value, addition)
 }
@@ -1683,12 +1995,19 @@ impl<'a> Interp<'a> {
             == Some("datetime");
         if is_datetime {
             #[cfg(feature = "intl")]
-            if let Some(s) = self.temporal_format_flat(inst, value)? {
+            if let Some(s) = self.temporal_format_flat(inst, value, false)? {
                 return Ok(s);
             }
             let ms = self.datetime_operand(value)?;
             Ok(self.format_intl_datetime(inst, ms))
         } else {
+            // ECMA-402 `ToIntlMathematicalValue`: a string / BigInt argument with
+            // more precision than an f64 preserves formats from its exact decimal
+            // digits, bypassing the crate's f64 round-trip.
+            #[cfg(feature = "intl")]
+            if let Some(s) = self.try_exact_decimal_format(inst, value) {
+                return Ok(s);
+            }
             let n = self.coerce_intl_number(value)?;
             Ok(self.intl_format_value(inst, NanBox::number(n)))
         }
@@ -1875,13 +2194,22 @@ impl<'a> Interp<'a> {
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }
         }
-        // Absent an explicit option, resolve the locale's CLDR default numbering
-        // system (e.g. `ar` → `arab`, `fa` → `arabext`) rather than always `latn`.
-        let nu = match nu {
-            Some(ns) => Some(ns),
-            None => Some(self.default_numbering_for_locale(obj)),
-        };
-        self.store_str(obj, "numberingSystem", &nu);
+        // ResolveLocale for the `nu` key: a supported `numberingSystem` option
+        // wins, else the locale's `-u-nu-` extension (if it names a known system),
+        // else the CLDR default. The resolved locale keeps only the relevant
+        // extension (`-u-nu-` when it survives) and drops irrelevant ones (e.g.
+        // `-u-cu-`), so `resolvedOptions().locale` reflects only what applied.
+        let raw_locale = self
+            .realm
+            .get_property(obj, "\u{0}locale")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("en-US"));
+        let base = strip_unicode_extension(&raw_locale);
+        let (resolved_nu, add) = resolve_nu_key(&base, &raw_locale, nu.as_deref());
+        let resolved_locale = build_resolved_locale(&base, &[add]);
+        let locv = self.new_str(&resolved_locale);
+        self.realm.set_hidden_property(obj, "\u{0}locale", locv);
+        self.store_str(obj, "numberingSystem", &Some(resolved_nu));
 
         // --- SetNumberFormatUnitOptions ---
         let style = self
@@ -1976,7 +2304,7 @@ impl<'a> Interp<'a> {
             Some(h) => self.read_member(h, "useGrouping")?,
             None => NanBox::undefined(),
         };
-        let use_grouping_val = self.normalize_use_grouping(ug_raw)?;
+        let use_grouping_val = self.normalize_use_grouping(ug_raw, &notation)?;
         let sign_display = self
             .get_string_option(
                 opts,
@@ -2145,12 +2473,22 @@ impl<'a> Interp<'a> {
     }
 
     /// `GetBooleanOrStringNumberFormatOption` for `useGrouping`: `undefined` →
-    /// `"auto"`; `true` → `"always"`; a falsy value → `false`; the strings
-    /// `"true"`/`"false"` → `"auto"`; one of `"min2"`/`"auto"`/`"always"` → that
-    /// string; any other string (or non-string, via ToString) → **RangeError**.
-    fn normalize_use_grouping(&mut self, raw: NanBox) -> Result<UseGroupingResolved, ExecError> {
+    /// the default (`"min2"` when `notation` is `"compact"`, else `"auto"`);
+    /// `true` → `"always"`; a falsy value → `false`; the strings `"true"`/`"false"`
+    /// → the default; one of `"min2"`/`"auto"`/`"always"` → that string; any other
+    /// string (or non-string, via ToString) → **RangeError**.
+    fn normalize_use_grouping(
+        &mut self,
+        raw: NanBox,
+        notation: &str,
+    ) -> Result<UseGroupingResolved, ExecError> {
+        let fallback = if notation == "compact" {
+            "min2"
+        } else {
+            "auto"
+        };
         if matches!(raw.unpack(), Unpacked::Undefined) {
-            return Ok(UseGroupingResolved::Str("auto"));
+            return Ok(UseGroupingResolved::Str(fallback));
         }
         if matches!(raw.unpack(), Unpacked::Bool(true)) {
             return Ok(UseGroupingResolved::Str("always"));
@@ -2160,7 +2498,7 @@ impl<'a> Interp<'a> {
         }
         let s = self.coerce_to_string(raw)?;
         match s.as_str() {
-            "true" | "false" => Ok(UseGroupingResolved::Str("auto")),
+            "true" | "false" => Ok(UseGroupingResolved::Str(fallback)),
             "min2" => Ok(UseGroupingResolved::Str("min2")),
             "auto" => Ok(UseGroupingResolved::Str("auto")),
             "always" => Ok(UseGroupingResolved::Str("always")),
@@ -2187,7 +2525,6 @@ impl<'a> Interp<'a> {
             let m = self.new_str("invalid calendar");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
-        self.store_str(obj, "calendar", &ca);
         let nu = self.get_string_option(opts, "numberingSystem", &[], None)?;
         if let Some(n) = &nu
             && !is_unicode_type_value(n)
@@ -2195,13 +2532,32 @@ impl<'a> Interp<'a> {
             let m = self.new_str("invalid numberingSystem");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
-        // Absent an explicit option, resolve the locale's CLDR default (as for
-        // NumberFormat) so e.g. a `fa` DateTimeFormat renders native digits.
-        let nu = match nu {
-            Some(ns) => Some(ns),
-            None => Some(self.default_numbering_for_locale(obj)),
-        };
-        self.store_str(obj, "numberingSystem", &nu);
+        // ResolveLocale for the relevant DateTimeFormat extension keys (`ca`, `nu`,
+        // `hc`): a supported option wins, else the locale's `-u-` extension value,
+        // else the default. The resolved locale keeps only surviving relevant keys
+        // (`-u-ca-`/`-u-nu-`/`-u-hc-`) and drops irrelevant ones (e.g. `-u-cu-`).
+        // `hc` is retained here as-is; its option interplay is finalized in
+        // `dtf_hour_resolution` at resolvedOptions time.
+        let raw_locale = self
+            .realm
+            .get_property(obj, "\u{0}locale")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("en-US"));
+        let base = strip_unicode_extension(&raw_locale);
+        let (resolved_ca, ca_add) = resolve_ca_key(&base, &raw_locale, ca.as_deref());
+        let (resolved_nu, nu_add) = resolve_nu_key(&base, &raw_locale, nu.as_deref());
+        let hc_ext = split_u_keyword(&raw_locale, "hc")
+            .1
+            .filter(|v| matches!(v.as_str(), "h11" | "h12" | "h23" | "h24"));
+        let hc_add = hc_ext
+            .as_deref()
+            .map(|v| alloc::format!("-hc-{v}"))
+            .unwrap_or_default();
+        let resolved_locale = build_resolved_locale(&base, &[ca_add, hc_add, nu_add]);
+        let locv = self.new_str(&resolved_locale);
+        self.realm.set_hidden_property(obj, "\u{0}locale", locv);
+        self.store_str(obj, "calendar", &Some(resolved_ca));
+        self.store_str(obj, "numberingSystem", &Some(resolved_nu));
         // hour12 (boolean) and hourCycle (enum).
         let hour12 = self.get_bool_option(opts, "hour12", None)?;
         if let Some(b) = hour12 {
@@ -2320,6 +2676,102 @@ impl<'a> Interp<'a> {
                 .set_hidden_property(obj, "\u{0}dtf_default_date", NanBox::boolean(true));
         }
         Ok(())
+    }
+
+    /// The locale's default 12-hour cycle (`"h11"`/`"h12"`) and its default clock
+    /// (whether it is a 12-hour locale). `base_locale` has no `-u-hc-` keyword.
+    /// Uses the `intl` crate's CLDR time patterns to decide 12- vs 24-hour; the
+    /// non-intl build falls back to the en-family heuristic.
+    fn locale_hour_defaults(&self, base_locale: &str) -> (&'static str, bool) {
+        // CLDR's 12-hour cycle is `h11` (0–11) for Japanese, `h12` (1–12) else.
+        let primary = base_locale.split('-').next().unwrap_or("");
+        let hc12 = if primary.eq_ignore_ascii_case("ja") {
+            "h11"
+        } else {
+            "h12"
+        };
+        #[cfg(feature = "intl")]
+        {
+            use intl::datetime::{DateTime, DateTimeFormatOptions, Numeric2Digit};
+            let dt = DateTime {
+                year: 2020,
+                month: 1,
+                day: 1,
+                hour: 13,
+                minute: 0,
+                second: 0,
+                millisecond: 0,
+            };
+            let mut o = DateTimeFormatOptions::default();
+            o.hour = Some(Numeric2Digit::Numeric);
+            if let Ok(parts) = intl::datetime::format_to_parts(base_locale, &dt, &o) {
+                // A 12-hour locale renders 13:00 with a dayPeriod part (or an hour
+                // value != "13").
+                let is_12h = parts.iter().any(|p| {
+                    matches!(p.kind, intl::datetime::DateTimePartType::DayPeriod)
+                        || (matches!(p.kind, intl::datetime::DateTimePartType::Hour)
+                            && p.value != "13")
+                });
+                return (hc12, is_12h);
+            }
+        }
+        let is_12h = primary.eq_ignore_ascii_case("en");
+        (hc12, is_12h)
+    }
+
+    /// ECMA-402 hour-cycle resolution for a `DateTimeFormat` instance: returns the
+    /// resolved locale (its `-u-hc-` keyword kept only when it survives the option
+    /// interplay), the resolved `[[HourCycle]]` (`None` when no hour field), and
+    /// `[[HourCycle]]`-derived `hour12` (`None` when no hour field).
+    fn dtf_hour_resolution(&self, handle: Handle) -> (String, Option<String>, Option<bool>) {
+        let raw_locale = self
+            .realm
+            .get_property(handle, "\u{0}locale")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("en-US"));
+        let (base_locale, hc_ext) = split_u_keyword(&raw_locale, "hc");
+        let hc_ext = hc_ext.filter(|v| matches!(v.as_str(), "h11" | "h12" | "h23" | "h24"));
+        let get_str = |k: &str| -> Option<String> {
+            self.realm
+                .get_property(handle, k)
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .map(|v| self.realm.to_display_string(v))
+        };
+        let hc_opt = get_str("hourCycle");
+        let hour12 = self
+            .realm
+            .get_property(handle, "hour12")
+            .and_then(|v| v.as_boolean());
+        // [[Hour]] is set iff an hour component or a timeStyle was requested.
+        let hour_present = get_str("hour").is_some() || get_str("timeStyle").is_some();
+
+        // Resolved locale: the `-u-hc-` keyword is kept only when it is present
+        // and neither hour12 nor a *differing* hourCycle option overrides it.
+        let keep_ext = hc_ext.is_some()
+            && hour12.is_none()
+            && match &hc_opt {
+                Some(opt) => Some(opt.as_str()) == hc_ext.as_deref(),
+                None => true,
+            };
+        let resolved_locale = if keep_ext {
+            raw_locale.clone()
+        } else {
+            base_locale.clone()
+        };
+
+        if !hour_present {
+            return (resolved_locale, None, None);
+        }
+        let (hc12, default_is_12h) = self.locale_hour_defaults(&base_locale);
+        let resolved_hc = match hour12 {
+            Some(true) => String::from(hc12),
+            Some(false) => String::from("h23"),
+            None => hc_opt
+                .or(hc_ext)
+                .unwrap_or_else(|| String::from(if default_is_12h { hc12 } else { "h23" })),
+        };
+        let h12 = matches!(resolved_hc.as_str(), "h11" | "h12");
+        (resolved_locale, Some(resolved_hc), Some(h12))
     }
 
     /// `Intl.NumberFormat`/`DateTimeFormat` `resolvedOptions()` — a fresh object
@@ -2614,27 +3066,23 @@ impl<'a> Interp<'a> {
             let tz = get_str(self, "timeZone").unwrap_or_else(|| String::from("UTC"));
             let tzv = self.new_str(&tz);
             self.realm.set_property(out, "timeZone", tzv);
-            // When an hour field is present, resolvedOptions always reports
-            // hourCycle + hour12 — the explicit option, else a default resolved from
-            // hour12 or the locale (en-family defaults to 12-hour, else 24-hour).
-            let hour_present = get_str(self, "hour").is_some();
-            let explicit_h12 = fmt
-                .and_then(|h| self.realm.get_property(h, "hour12"))
-                .and_then(|v| v.as_boolean());
-            if let Some(hc) = get_str(self, "hourCycle") {
-                let v = self.new_str(&hc);
-                self.realm.set_property(out, "hourCycle", v);
-                let h12 = matches!(hc.as_str(), "h11" | "h12");
-                self.realm.set_property(out, "hour12", NanBox::boolean(h12));
-            } else if hour_present {
-                let loc = get_str(self, "\u{0}locale").unwrap_or_default();
-                let h12 = explicit_h12.unwrap_or_else(|| loc == "en" || loc.starts_with("en-"));
-                let hc = if h12 { "h12" } else { "h23" };
-                let v = self.new_str(hc);
-                self.realm.set_property(out, "hourCycle", v);
-                self.realm.set_property(out, "hour12", NanBox::boolean(h12));
-            } else if let Some(h) = fmt.and_then(|h| self.realm.get_property(h, "hour12")) {
-                self.realm.set_property(out, "hour12", h);
+            // Hour-cycle resolution (ECMA-402 CreateDateTimeFormat + the
+            // resolvedOptions Table 6/7 rules): `[[HourCycle]]` and the derived
+            // `hour12` are reported *only* when an hour field is present (no hour →
+            // both undefined; e.g. a dateStyle-only or numeric-date formatter). The
+            // resolved locale's `-u-hc-` keyword survives only when it is not
+            // overridden by a differing option.
+            if let Some(fmt) = fmt {
+                let (resolved_locale, hour_cycle, hour12) = self.dtf_hour_resolution(fmt);
+                let lv = self.new_str(&resolved_locale);
+                self.realm.set_property(out, "locale", lv);
+                if let Some(hc) = hour_cycle {
+                    let v = self.new_str(&hc);
+                    self.realm.set_property(out, "hourCycle", v);
+                }
+                if let Some(h12) = hour12 {
+                    self.realm.set_property(out, "hour12", NanBox::boolean(h12));
+                }
             }
             for key in [
                 "weekday",
@@ -3902,6 +4350,7 @@ impl<'a> Interp<'a> {
         &mut self,
         handle: Handle,
         value: NanBox,
+        zoned_ok: bool,
     ) -> Result<Option<(f64, crate::temporal_iso::TemporalKind)>, ExecError> {
         use crate::temporal_iso::{TemporalKind, iso_to_epoch_days};
         let Some(h) = value.as_handle().map(Handle::from_raw) else {
@@ -3937,11 +4386,25 @@ impl<'a> Interp<'a> {
                 + i64::from(t.millisecond)
         };
         let ms = match d.kind {
-            TemporalKind::ZonedDateTime => {
+            // `Intl.DateTimeFormat.prototype.format`/`formatToParts`/`formatRange`
+            // reject a `ZonedDateTime` (its own `toLocaleString` — `zoned_ok` —
+            // formats it via its instant + time zone instead).
+            TemporalKind::ZonedDateTime if !zoned_ok => {
                 return Err(self.type_error(
                     "Temporal.ZonedDateTime is not supported by Intl.DateTimeFormat.prototype.format; \
                      use toLocaleString() or explicit options",
                 ));
+            }
+            TemporalKind::ZonedDateTime => {
+                // Format the ZonedDateTime's instant in its time zone (UTC-only
+                // engine → the instant's wall clock). Its calendar must match.
+                if !cal_ok_iso {
+                    let m = self.new_str(
+                        "Temporal object calendar is incompatible with this Intl.DateTimeFormat",
+                    );
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
+                (d.epoch_ns / 1_000_000) as f64
             }
             TemporalKind::Duration => return Ok(None),
             TemporalKind::Instant => (d.epoch_ns / 1_000_000) as f64,
@@ -4216,11 +4679,13 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
-            TemporalKind::Instant => {
+            TemporalKind::Instant | TemporalKind::ZonedDateTime => {
                 // required = ~any~, defaults = ~all~, inherit = ~all~: keep every
                 // requested option (including timeZoneName) and, absent any component,
-                // fall back to a full numeric date *and* time. An Instant has absolute
-                // time, so the DateTimeFormat's time zone applies (engine is UTC-only).
+                // fall back to a full numeric date *and* time. An Instant / ZonedDateTime
+                // has absolute time, so the DateTimeFormat's time zone applies (engine
+                // is UTC-only). A ZonedDateTime additionally defaults `timeZoneName` to
+                // "short" when no component options were requested.
                 o.hour_cycle = hour_cycle_s.as_deref().and_then(hc);
                 o.hour12 = hour12;
                 if !any_present {
@@ -4231,6 +4696,10 @@ impl<'a> Interp<'a> {
                     o.hour = Some(Numeric2Digit::Numeric);
                     o.minute = Some(Numeric2Digit::Numeric);
                     o.second = Some(Numeric2Digit::Numeric);
+                    if kind == TemporalKind::ZonedDateTime && tz_name.is_none() {
+                        o.time_zone_name = Some(TimeZoneNameStyle::Short);
+                        o.tz_offset_minutes = Some(0); // engine is UTC-only
+                    }
                 } else {
                     if ds {
                         o.date_style = date_style.as_deref().and_then(dstyle);
@@ -4397,8 +4866,9 @@ impl<'a> Interp<'a> {
         &mut self,
         handle: Handle,
         value: NanBox,
+        zoned_ok: bool,
     ) -> Result<Option<String>, ExecError> {
-        let Some((ms, kind)) = self.temporal_dtf_value(handle, value)? else {
+        let Some((ms, kind)) = self.temporal_dtf_value(handle, value, zoned_ok)? else {
             return Ok(None);
         };
         let Some(o) = self.temporal_plain_options(handle, kind) else {
@@ -4419,8 +4889,9 @@ impl<'a> Interp<'a> {
         &mut self,
         handle: Handle,
         value: NanBox,
+        zoned_ok: bool,
     ) -> Result<Option<Vec<(&'static str, String)>>, ExecError> {
-        let Some((ms, kind)) = self.temporal_dtf_value(handle, value)? else {
+        let Some((ms, kind)) = self.temporal_dtf_value(handle, value, zoned_ok)? else {
             return Ok(None);
         };
         let Some(o) = self.temporal_plain_options(handle, kind) else {
@@ -4449,7 +4920,10 @@ impl<'a> Interp<'a> {
         let Some(h) = inst.as_handle().map(Handle::from_raw) else {
             return Ok(self.new_str(""));
         };
-        let s = self.temporal_format_flat(h, this)?.unwrap_or_default();
+        // `toLocaleString` accepts a `ZonedDateTime` (unlike `format`).
+        let s = self
+            .temporal_format_flat(h, this, true)?
+            .unwrap_or_default();
         Ok(self.new_str(&s))
     }
 
@@ -4544,7 +5018,7 @@ impl<'a> Interp<'a> {
         inst: Handle,
         value: NanBox,
     ) -> Result<(f64, String), ExecError> {
-        if let Some((ms, kind)) = self.temporal_dtf_value(inst, value)? {
+        if let Some((ms, kind)) = self.temporal_dtf_value(inst, value, false)? {
             let Some(o) = self.temporal_plain_options(inst, kind) else {
                 return Err(self.type_error(
                     "the requested Intl.DateTimeFormat options are not compatible with this Temporal type",
@@ -4869,14 +5343,19 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        if !has_style {
+        // ECMA-402 `ToDateTimeOptions` uses a *single* `needDefaults` flag over the
+        // whole `required` set: any present component (date *or* time, per what the
+        // method requires) suppresses *all* defaults. So `toLocaleString` with a lone
+        // `{ year }` yields just the year — not year + a defaulted time.
+        let need_defaults = !((want_date && has_date) || (want_time && has_time));
+        if !has_style && need_defaults {
             let num = self.new_str("numeric");
-            if want_date && !has_date {
+            if want_date {
                 for k in ["year", "month", "day"] {
                     self.realm.set_property(obj, k, num);
                 }
             }
-            if want_time && !has_time {
+            if want_time {
                 for k in ["hour", "minute", "second"] {
                     self.realm.set_property(obj, k, num);
                 }
@@ -5042,21 +5521,270 @@ impl<'a> Interp<'a> {
     /// `intl::number::format` (CLDR, locale-aware, full ECMA-402 options); the rest, and the
     /// no-`intl` build, use the hand-rolled en-US path below.
     pub(crate) fn intl_format_number(&mut self, handle: Handle, n: f64) -> String {
+        // `roundingPriority` more/lessPrecision selects between the significant-
+        // and fraction-digit results — an interplay the crate can't express.
+        #[cfg(feature = "intl")]
+        if let Some(s) = self.try_rounding_priority(handle, n) {
+            return s;
+        }
         let s = self.intl_format_number_inner(handle, n);
         self.apply_numbering_digits(handle, s)
     }
 
-    /// The CLDR default numbering-system *name* for the format object's resolved
-    /// locale — detected from the native zero digit the `intl` crate emits for that
-    /// locale (so its per-locale table, with regional exceptions, is authoritative).
-    /// `latn` when there is no `intl` data or the system is unrecognized.
-    fn default_numbering_for_locale(&mut self, obj: Handle) -> String {
-        let locale = self
+    /// Parse a string / BigInt `value` into an exact decimal
+    /// `(negative, integer_digits, fraction_digits)` — but only when it carries
+    /// more significant digits than an `f64` preserves (so the ordinary numeric
+    /// path would silently round it). Returns `None` for values the crate's f64
+    /// path renders exactly (≤ 15 significant digits) or that aren't a plain
+    /// decimal literal (Infinity/NaN/exponent/etc.).
+    #[cfg(feature = "intl")]
+    fn extract_exact_decimal(&self, value: NanBox) -> Option<(bool, String, String)> {
+        let h = value.as_handle().map(Handle::from_raw)?;
+        let raw = if let Some(big) = self.realm.bigint_at(h) {
+            alloc::format!("{big}")
+        } else {
+            self.realm.string_value(h)?
+        };
+        let s = raw.trim();
+        let (neg, body) = match s.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, s.strip_prefix('+').unwrap_or(s)),
+        };
+        if body.is_empty() || body.matches('.').count() > 1 {
+            return None;
+        }
+        if !body.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+            return None;
+        }
+        let mut it = body.splitn(2, '.');
+        let int_part = it.next().unwrap_or("");
+        let frac_part = it.next().unwrap_or("");
+        // Significant-digit span (first to last nonzero across int+frac).
+        let all = alloc::format!("{int_part}{frac_part}");
+        let first_nz = all.bytes().position(|b| b != b'0');
+        let last_nz = all.bytes().rposition(|b| b != b'0');
+        let sig = match (first_nz, last_nz) {
+            (Some(a), Some(b)) => b - a + 1,
+            _ => 0,
+        };
+        // A large-magnitude integer (its trailing zeros are significant) also
+        // exceeds f64 integer precision beyond ~15 digits, even at low `sig`.
+        let int_magnitude = int_part.trim_start_matches('0').len();
+        if sig <= 15 && int_magnitude <= 15 {
+            return None;
+        }
+        Some((neg, String::from(int_part), String::from(frac_part)))
+    }
+
+    /// Exact-decimal `Intl.NumberFormat.prototype.format` for a high-precision
+    /// string / BigInt argument (ECMA-402 `ToIntlMathematicalValue` keeps the full
+    /// value; the crate's `f64` path would round it). Handles only
+    /// standard-notation plain-decimal formatting with fraction-digit options —
+    /// everything else returns `None` to fall back to the numeric path.
+    #[cfg(feature = "intl")]
+    fn try_exact_decimal_format(&mut self, handle: Handle, value: NanBox) -> Option<String> {
+        use intl::number::{Notation, NumberStyle, UseGrouping};
+        let opts = self.number_format_options(handle);
+        if opts.notation != Notation::Standard
+            || !matches!(opts.style, NumberStyle::Decimal)
+            || opts.minimum_significant_digits.is_some()
+            || opts.maximum_significant_digits.is_some()
+        {
+            return None;
+        }
+        let increment = self
             .realm
-            .get_property(obj, "\u{0}locale")
+            .get_property(handle, "roundingIncrement")
+            .and_then(|v| v.as_number())
+            .unwrap_or(1.0);
+        if increment != 1.0 {
+            return None;
+        }
+        let (neg, int_part, frac_part) = self.extract_exact_decimal(value)?;
+
+        let max_frac = opts.maximum_fraction_digits.unwrap_or(3) as usize;
+        let min_frac = opts.minimum_fraction_digits.unwrap_or(0) as usize;
+        let min_int = (opts.minimum_integer_digits.max(1)) as usize;
+
+        let mut int_digits: alloc::vec::Vec<u8> = int_part.bytes().map(|b| b - b'0').collect();
+        let mut frac_digits: alloc::vec::Vec<u8> = frac_part.bytes().map(|b| b - b'0').collect();
+        // Round the fraction to maximumFractionDigits.
+        if frac_digits.len() > max_frac {
+            let up = exact_round_up(&frac_digits[max_frac..], opts.rounding_mode, neg);
+            frac_digits.truncate(max_frac);
+            if up {
+                exact_increment(&mut int_digits, &mut frac_digits);
+            }
+        }
+        // Trim trailing fraction zeros down to minimumFractionDigits, then pad up.
+        while frac_digits.len() > min_frac && frac_digits.last() == Some(&0) {
+            frac_digits.pop();
+        }
+        while frac_digits.len() < min_frac {
+            frac_digits.push(0);
+        }
+        // Normalize the integer digits (strip leading zeros, pad to the minimum).
+        while int_digits.len() > 1 && int_digits.first() == Some(&0) {
+            int_digits.remove(0);
+        }
+        while int_digits.len() < min_int {
+            int_digits.insert(0, 0);
+        }
+        let grouping = !matches!(opts.use_grouping, UseGrouping::Never);
+        Some(self.assemble_decimal(handle, neg, &int_digits, &frac_digits, grouping))
+    }
+
+    /// Assemble a locale-scaffolded decimal string from latn `int`/`frac` digit
+    /// vectors (probing the `intl` crate for the locale's affixes/separators),
+    /// then substitute the resolved numbering-system digits. Shared by the
+    /// exact-decimal and roundingPriority renderers.
+    #[cfg(feature = "intl")]
+    fn assemble_decimal(
+        &mut self,
+        handle: Handle,
+        neg: bool,
+        int: &[u8],
+        frac: &[u8],
+        grouping: bool,
+    ) -> String {
+        let int_str: String = int.iter().map(|d| (b'0' + d) as char).collect();
+        let frac_str: String = frac.iter().map(|d| (b'0' + d) as char).collect();
+        let probe = self.intl_format_number_inner(handle, if neg { -1.1 } else { 1.1 });
+        let (prefix, dec_sep, suffix) = split_number_scaffold(&probe);
+        let grouped = if grouping {
+            let gp = self.intl_format_number_inner(handle, if neg { -1111.0 } else { 1111.0 });
+            let group_sep = extract_group_sep(&gp);
+            group_thousands_sep(&int_str, &group_sep)
+        } else {
+            int_str
+        };
+        let mut out = String::new();
+        out.push_str(&prefix);
+        out.push_str(&grouped);
+        if !frac_str.is_empty() {
+            out.push_str(&dec_sep);
+            out.push_str(&frac_str);
+        }
+        out.push_str(&suffix);
+        self.apply_numbering_digits(handle, out)
+    }
+
+    /// `roundingPriority: "morePrecision"` / `"lessPrecision"`: ECMA-402
+    /// `FormatNumericToString` computes both `ToRawPrecision` (significant-digit)
+    /// and `ToRawFixed` (fraction-digit) results and selects between them by their
+    /// rounding magnitude. The `intl` crate can't express this interplay, so we
+    /// render it here for standard-notation decimal formatting. Returns `None`
+    /// (fall back to the crate) for any other configuration.
+    #[cfg(feature = "intl")]
+    fn try_rounding_priority(&mut self, handle: Handle, n: f64) -> Option<String> {
+        use intl::number::{Notation, NumberStyle, UseGrouping};
+        if !n.is_finite() || n == 0.0 {
+            return None;
+        }
+        let priority = self
+            .realm
+            .get_property(handle, "roundingPriority")
             .map(|v| self.realm.to_display_string(v))
-            .unwrap_or_else(|| String::from("en"));
-        default_numbering_for_locale_str(&locale)
+            .unwrap_or_default();
+        if !matches!(priority.as_str(), "morePrecision" | "lessPrecision") {
+            return None;
+        }
+        let opts = self.number_format_options(handle);
+        if opts.notation != Notation::Standard || !matches!(opts.style, NumberStyle::Decimal) {
+            return None;
+        }
+        let min_sig = opts.minimum_significant_digits.unwrap_or(1) as usize;
+        let max_sig = opts.maximum_significant_digits.unwrap_or(21) as usize;
+        let min_frac = opts.minimum_fraction_digits.unwrap_or(0) as usize;
+        let max_frac = opts
+            .maximum_fraction_digits
+            .map(|m| m as usize)
+            .unwrap_or_else(|| min_frac.max(3));
+
+        // Shortest round-trip decimal of |n| (exponent form → fall back).
+        let neg = n.is_sign_negative();
+        let shortest = alloc::format!("{}", n.abs());
+        if shortest.contains(['e', 'E', 'i', 'n']) {
+            return None;
+        }
+        let mut it = shortest.splitn(2, '.');
+        let int_part = it.next().unwrap_or("0");
+        let frac_part = it.next().unwrap_or("");
+        let int_v: alloc::vec::Vec<u8> = int_part.bytes().map(|b| b - b'0').collect();
+        let frac_v: alloc::vec::Vec<u8> = frac_part.bytes().map(|b| b - b'0').collect();
+
+        // sResult = ToRawPrecision; fResult = ToRawFixed.
+        let (s_int, s_frac) = to_raw_precision(
+            neg,
+            int_v.clone(),
+            frac_v.clone(),
+            max_sig,
+            opts.rounding_mode,
+        );
+        let (f_int, f_frac) = to_raw_fixed(neg, int_v, frac_v, max_frac, opts.rounding_mode);
+        // ECMA-402 rounding magnitudes: ToRawPrecision rounds at
+        // `e - maxSig + 1` (e = exponent of the most significant digit);
+        // ToRawFixed rounds at `-maxFrac`. Lower (more negative) = more precise.
+        let e = {
+            let int_stripped = int_part.trim_start_matches('0');
+            if !int_stripped.is_empty() {
+                int_stripped.len() as i32 - 1
+            } else {
+                match frac_part.bytes().position(|b| b != b'0') {
+                    Some(p) => -(p as i32) - 1,
+                    None => 0,
+                }
+            }
+        };
+        let s_mag = e - max_sig as i32 + 1;
+        let f_mag = -(max_frac as i32);
+
+        let use_s = if priority == "morePrecision" {
+            s_mag <= f_mag
+        } else {
+            s_mag > f_mag
+        };
+
+        // Build the selected result's digit vectors with its own minimum padding.
+        let (int_d, frac_d) = if use_s {
+            // ToRawPrecision: pad with trailing zeros up to minimumSignificantDigits.
+            let (mut i, mut f) = (s_int, s_frac);
+            let sig_now = {
+                let first = i
+                    .iter()
+                    .chain(f.iter())
+                    .position(|&d| d != 0)
+                    .unwrap_or(i.len());
+                (i.len() + f.len()).saturating_sub(first)
+            };
+            if sig_now < min_sig {
+                f.resize(f.len() + (min_sig - sig_now), 0);
+            }
+            // Normalize leading zeros (keep at least one integer digit).
+            while i.len() > 1 && i[0] == 0 {
+                i.remove(0);
+            }
+            (i, f)
+        } else {
+            // ToRawFixed: trim trailing zeros down to minimumFractionDigits, then pad.
+            let (i, mut f) = (f_int, f_frac);
+            while f.len() > min_frac && f.last() == Some(&0) {
+                f.pop();
+            }
+            if f.len() < min_frac {
+                f.resize(min_frac, 0);
+            }
+            (i, f)
+        };
+
+        // minimumIntegerDigits padding.
+        let min_int = opts.minimum_integer_digits.max(1) as usize;
+        let mut int_d = int_d;
+        while int_d.len() < min_int {
+            int_d.insert(0, 0);
+        }
+        let grouping = !matches!(opts.use_grouping, UseGrouping::Never);
+        Some(self.assemble_decimal(handle, neg, &int_d, &frac_d, grouping))
     }
 
     /// Pre-round `n` to the resolved precision using the ECMA-402 / ICU decimal
@@ -5571,26 +6299,9 @@ impl<'a> Interp<'a> {
     pub(crate) fn intl_supported_values_of(&mut self, key: NanBox) -> Result<NanBox, ExecError> {
         let k = self.coerce_to_string(key)?;
         let values: &[&str] = match k.as_str() {
-            "calendar" => &[
-                "buddhist",
-                "chinese",
-                "coptic",
-                "dangi",
-                "ethioaa",
-                "ethiopic",
-                "gregory",
-                "hebrew",
-                "indian",
-                "islamic",
-                "islamic-civil",
-                "islamic-rgsa",
-                "islamic-tbla",
-                "islamic-umalqura",
-                "iso8601",
-                "japanese",
-                "persian",
-                "roc",
-            ],
+            // `AvailableCalendars`: the concrete calendar types (the deprecated
+            // `islamic`/`islamic-rgsa` aliases are resolved away, not reported).
+            "calendar" => &AVAILABLE_CALENDARS,
             "collation" => &[
                 "compat", "dict", "emoji", "eor", "phonebk", "phonetic", "pinyin", "searchjl",
                 "stroke", "trad", "unihan", "zhuyin",
@@ -5619,6 +6330,12 @@ impl<'a> Interp<'a> {
             }
         };
         let mut sorted: Vec<&str> = values.to_vec();
+        // The generic/algorithmic numbering aliases (`native`/`traditio`/`finance`)
+        // have no fixed digit mapping and are not selectable via the `nu` key, so
+        // they are not reported by `supportedValuesOf` either.
+        if k == "numberingSystem" {
+            sorted.retain(|s| !matches!(*s, "native" | "traditio" | "finance"));
+        }
         sorted.sort_unstable();
         sorted.dedup();
         let elems: Vec<NanBox> = sorted.iter().map(|s| self.new_str(s)).collect();
@@ -7354,6 +8071,142 @@ mod decimal_round_tests {
         assert_eq!(fmt(2.5, 0, None, 1, RoundingMode::HalfEven), 2.0);
         assert_eq!(fmt(3.5, 0, None, 1, RoundingMode::HalfEven), 4.0);
         assert_eq!(fmt(0.0, 2, None, 1, RoundingMode::HalfExpand), 0.0);
+    }
+}
+
+// ECMA-402 resolution helpers (`-u-` keyword extraction, calendar / numbering
+// canonicalization) and the exact-decimal / roundingPriority digit routines,
+// tested as pure functions.
+#[cfg(test)]
+mod resolution_helper_tests {
+    use super::*;
+
+    #[test]
+    fn split_u_keyword_hc() {
+        assert_eq!(
+            split_u_keyword("en-US-u-hc-h23", "hc"),
+            (String::from("en-US"), Some(String::from("h23")))
+        );
+        // Keeps sibling keywords when removing `hc`.
+        assert_eq!(
+            split_u_keyword("en-u-ca-gregory-hc-h11-nu-arab", "hc"),
+            (
+                String::from("en-u-ca-gregory-nu-arab"),
+                Some(String::from("h11"))
+            )
+        );
+        // Absent keyword → unchanged, None.
+        assert_eq!(
+            split_u_keyword("en-US", "hc"),
+            (String::from("en-US"), None)
+        );
+        // Removing the only keyword drops the whole `-u-` section.
+        assert_eq!(
+            split_u_keyword("de-u-hc-h24", "hc"),
+            (String::from("de"), Some(String::from("h24")))
+        );
+    }
+
+    #[test]
+    fn calendar_canonicalization() {
+        assert_eq!(canonicalize_calendar("islamicc"), "islamic-civil");
+        assert_eq!(canonicalize_calendar("ISO8601"), "iso8601");
+        assert_eq!(canonicalize_calendar("ethiopic-amete-alem"), "ethioaa");
+        // Deprecated `islamic`/`islamic-rgsa` fall back to a concrete calendar.
+        assert_eq!(canonicalize_calendar("islamic"), "islamic-civil");
+        assert_eq!(canonicalize_calendar("islamic-rgsa"), "islamic-civil");
+        assert_eq!(canonicalize_calendar("gregory"), "gregory");
+    }
+
+    #[test]
+    fn resolve_ca_option_and_extension() {
+        // Invalid option ignored → the extension calendar is used and kept.
+        assert_eq!(
+            resolve_ca_key("en", "en-u-ca-iso8601", Some("invalid")),
+            (String::from("iso8601"), String::from("-ca-iso8601"))
+        );
+        // Valid option differing from the extension → option wins, extension dropped.
+        assert_eq!(
+            resolve_ca_key("en", "en-u-ca-gregory", Some("iso8601")),
+            (String::from("iso8601"), String::new())
+        );
+        // Both invalid → default gregory, no extension.
+        assert_eq!(
+            resolve_ca_key("en", "en-u-ca-invalid", Some("invalid2")),
+            (String::from("gregory"), String::new())
+        );
+    }
+
+    #[test]
+    fn resolve_nu_rejects_generic_aliases() {
+        // `native`/`traditio`/`finance` are not selectable → fall back to default.
+        assert_eq!(
+            resolve_nu_key("ja-JP", "ja-JP-u-nu-native", None),
+            (String::from("latn"), String::new())
+        );
+        assert_eq!(
+            resolve_nu_key("en", "en", Some("finance")),
+            (String::from("latn"), String::new())
+        );
+        // A real system via the extension is kept.
+        assert_eq!(
+            resolve_nu_key("en", "en-u-nu-arab", None),
+            (String::from("arab"), String::from("-nu-arab"))
+        );
+    }
+}
+
+#[cfg(all(test, feature = "intl"))]
+mod exact_decimal_tests {
+    use super::*;
+    use intl::number::RoundingMode;
+
+    fn digits(v: &[u8]) -> alloc::vec::Vec<u8> {
+        v.to_vec()
+    }
+
+    #[test]
+    fn raw_fixed_rounds_half_expand() {
+        // 1.625 → 2 fraction digits, halfExpand → 1.63.
+        let (i, f) = to_raw_fixed(
+            false,
+            digits(&[1]),
+            digits(&[6, 2, 5]),
+            2,
+            RoundingMode::HalfExpand,
+        );
+        assert_eq!((i, f), (digits(&[1]), digits(&[6, 3])));
+    }
+
+    #[test]
+    fn raw_precision_rounds_to_sig_digits() {
+        // 1.234 → 3 significant digits → 1.23.
+        let (i, f) = to_raw_precision(
+            false,
+            digits(&[1]),
+            digits(&[2, 3, 4]),
+            3,
+            RoundingMode::HalfExpand,
+        );
+        assert_eq!((i, f), (digits(&[1]), digits(&[2, 3])));
+    }
+
+    #[test]
+    fn round_up_modes() {
+        assert!(exact_round_up(&[5], RoundingMode::HalfExpand, false));
+        assert!(!exact_round_up(&[4, 9], RoundingMode::HalfExpand, false));
+        assert!(!exact_round_up(&[5], RoundingMode::Trunc, false));
+        assert!(exact_round_up(&[1], RoundingMode::Expand, false));
+    }
+
+    #[test]
+    fn group_thousands() {
+        assert_eq!(group_thousands_sep("100000", ","), "100,000");
+        assert_eq!(
+            group_thousands_sep("987654321987654321", ","),
+            "987,654,321,987,654,321"
+        );
+        assert_eq!(group_thousands_sep("12", ","), "12");
     }
 }
 

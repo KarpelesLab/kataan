@@ -326,17 +326,13 @@ impl<'a> Interp<'a> {
         method: &str,
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
-        // `toLocaleString` on a calendared/plain Temporal type constructs an
-        // `Intl.DateTimeFormat` and formats the receiver via the ECMA-402 Temporal
-        // protocol. `Duration` (uses `Intl.DurationFormat`) and `ZonedDateTime`
-        // (its own time-zone-aware path) keep their existing `toString` behavior.
+        // `toLocaleString` on a calendared/plain Temporal type (and ZonedDateTime,
+        // via its instant + time zone) constructs an `Intl.DateTimeFormat` and
+        // formats the receiver through the ECMA-402 Temporal protocol. Only
+        // `Duration` (which uses `Intl.DurationFormat`) keeps its `toString`-based
+        // behavior.
         #[cfg(feature = "intl")]
-        if method == "toLocaleString"
-            && !matches!(
-                data.kind,
-                TemporalKind::Duration | TemporalKind::ZonedDateTime
-            )
-        {
+        if method == "toLocaleString" && !matches!(data.kind, TemporalKind::Duration) {
             return self.temporal_to_locale_string(this, args);
         }
         match data.kind {

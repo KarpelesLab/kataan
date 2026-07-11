@@ -3135,6 +3135,13 @@ impl<'a> Interp<'a> {
                 }
                 let parts = rel_time_parts(value, &unit, &numeric, &style);
                 let out: String = parts.into_iter().map(|(_, v, _)| v).collect();
+                // PartitionRelativeTimePattern formats the magnitude through the
+                // instance's [[NumberFormat]], so the resolved numbering system's
+                // digits apply (e.g. an `-u-nu-arab` locale renders Arabic-Indic).
+                let out = match fmt {
+                    Some(h) => self.apply_numbering_digits(h, out),
+                    None => out,
+                };
                 self.new_str(&out)
             }
             // `Intl.DisplayNames(...)` without `new`.
@@ -3436,6 +3443,10 @@ impl<'a> Interp<'a> {
                         let o = self.realm.new_object();
                         let tv = self.new_str(ty);
                         self.realm.set_property(o, "type", tv);
+                        // Substitute the resolved numbering system's digits into the
+                        // numeric parts (integer/group/decimal/fraction), matching the
+                        // instance's [[NumberFormat]] output.
+                        let val = self.apply_numbering_digits(h, val);
                         let vv = self.new_str(&val);
                         self.realm.set_property(o, "value", vv);
                         if with_unit {
@@ -3457,7 +3468,7 @@ impl<'a> Interp<'a> {
                         == Some("datetime")
                 {
                     #[cfg(feature = "intl")]
-                    let parts = match self.temporal_format_parts(h, arg(0))? {
+                    let parts = match self.temporal_format_parts(h, arg(0), false)? {
                         Some(p) => p,
                         None => {
                             let ms = self.datetime_operand(arg(0))?;
