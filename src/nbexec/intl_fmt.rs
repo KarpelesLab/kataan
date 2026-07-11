@@ -4303,10 +4303,90 @@ impl<'a> Interp<'a> {
             second: ((tod / 1_000) % 60) as u8,
             millisecond: (tod % 1_000) as u16,
         };
+        // Non-Gregorian calendar rendering (Islamic / Persian): the `intl` crate can
+        // only format these via a coarse `DateStyle` (no field-level parts), so this
+        // path is taken only when the resolved calendar is one the crate ships CLDR
+        // month/era names for AND a `dateStyle` is in effect. Everything else (all
+        // Gregorian/ISO output, and field-component options) falls through to the
+        // Gregorian `format_to_parts` below.
+        if let Some(alt) = self.alt_calendar_date_parts(handle, &locale, &dt, o) {
+            return alt;
+        }
         match datetime::format_to_parts(&locale, &dt, o) {
             Ok(parts) => dtf_pad_time_parts(parts),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// Renders the date portion of a Temporal object whose resolved `Intl`
+    /// calendar is one the `intl` crate ships localized names for (Islamic and
+    /// Persian). Returns `None` (Gregorian fallthrough) unless the DateTimeFormat
+    /// `handle`'s resolved calendar is Islamic/Persian *and* the effective options
+    /// carry a `dateStyle` (the only shape the crate's coarse calendar API can
+    /// satisfy). When taken, the localized date is emitted as a single `month`
+    /// part, optionally followed by the Gregorian-rendered time. `dt` is the
+    /// engine's proleptic-Gregorian pivot for the value (date + time-of-day).
+    #[cfg(feature = "intl")]
+    fn alt_calendar_date_parts(
+        &self,
+        handle: Handle,
+        locale: &str,
+        dt: &intl::datetime::DateTime,
+        o: &intl::datetime::DateTimeFormatOptions,
+    ) -> Option<Vec<(&'static str, String)>> {
+        use crate::temporal_iso::IsoDate;
+        use intl::datetime;
+        // The crate only renders a whole `dateStyle`; per-field month/era options on
+        // a non-Gregorian calendar aren't expressible through its public API.
+        let date_style = o.date_style?;
+        let cal = self.dtf_resolved_calendar(handle);
+        // Which crate formatter (if any) covers this calendar. All Islamic variants
+        // share the same localized month/era names; only the day arithmetic (which
+        // the engine has already done) differs between them.
+        let is_islamic = cal.starts_with("islamic");
+        let is_persian = cal == "persian";
+        if !is_islamic && !is_persian {
+            return None;
+        }
+        let iso = IsoDate {
+            year: dt.year,
+            month: dt.month,
+            day: dt.day,
+        };
+        let f = crate::nbexec::temporal_calendar::iso_to_fields(&cal, iso);
+        let (yy, mm, dd) = (f.year, f.month, f.day);
+        let date = if is_islamic {
+            datetime::format_islamic_date(locale, yy, mm, dd, date_style)
+        } else {
+            datetime::format_persian_date(locale, yy, mm, dd, date_style)
+        };
+        // Optional time portion (dateStyle + timeStyle). The crate has no
+        // calendar-specific time rendering, so the Gregorian time formatter is used
+        // — time-of-day is calendar-independent.
+        let mut parts: Vec<(&'static str, String)> = alloc::vec![("month", date)];
+        if let Some(ts) = o.time_style {
+            parts.push(("literal", String::from(", ")));
+            parts.push(("hour", datetime::format_time(locale, dt, ts)));
+        }
+        Some(parts)
+    }
+
+    /// The resolved `Intl.DateTimeFormat` calendar for `handle`: the explicit
+    /// `calendar` option, else the locale's `-u-ca-` extension, else `"gregory"`.
+    #[cfg(feature = "intl")]
+    fn dtf_resolved_calendar(&self, handle: Handle) -> String {
+        self.realm
+            .get_property(handle, "calendar")
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+            .map(|v| self.realm.to_display_string(v))
+            .or_else(|| {
+                self.realm
+                    .get_property(handle, "\u{0}locale")
+                    .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                    .map(|v| self.realm.to_display_string(v))
+                    .and_then(|loc| locale_unicode_calendar(&loc))
+            })
+            .unwrap_or_else(|| String::from("gregory"))
     }
 
     /// The Temporal branch of `Intl.DateTimeFormat.prototype.format(value)`:
@@ -7274,5 +7354,59 @@ mod decimal_round_tests {
         assert_eq!(fmt(2.5, 0, None, 1, RoundingMode::HalfEven), 2.0);
         assert_eq!(fmt(3.5, 0, None, 1, RoundingMode::HalfEven), 4.0);
         assert_eq!(fmt(0.0, 2, None, 1, RoundingMode::HalfExpand), 0.0);
+    }
+}
+
+// Non-Gregorian (Islamic / Persian) `dateStyle` rendering: the engine computes the
+// calendar fields via `temporal_calendar`, then the `intl` crate renders the
+// localized month/era names. This exercises that wiring at the seam.
+#[cfg(all(test, feature = "intl"))]
+mod alt_calendar_format_tests {
+    use crate::nbexec::temporal_calendar::iso_to_fields;
+    use crate::temporal_iso::IsoDate;
+    use intl::datetime::{DateStyle, format_islamic_date, format_persian_date};
+
+    #[test]
+    fn islamic_month_fields_and_names() {
+        // 2024-03-26 (proleptic Gregorian) is 17 Ramadan 1445 in islamic-tbla.
+        let iso = IsoDate {
+            year: 2024,
+            month: 3,
+            day: 26,
+        };
+        let f = iso_to_fields("islamic-tbla", iso);
+        assert_eq!(f.month, 9, "Ramadan is the 9th Islamic month");
+        assert_eq!(f.year, 1445);
+        // dateStyle:long spells the month out; dateStyle:short does not.
+        let long = format_islamic_date("en", f.year, f.month, f.day, DateStyle::Long);
+        assert!(long.contains("Ramadan"), "long includes month name: {long}");
+        let short = format_islamic_date("en", f.year, f.month, f.day, DateStyle::Short);
+        assert!(
+            !short.contains("Ramadan"),
+            "short uses a numeric month: {short}"
+        );
+    }
+
+    #[test]
+    fn persian_month_fields_and_names() {
+        // 2024-03-26 is 7 Farvardin 1403 in the Persian (Solar Hijri) calendar.
+        let iso = IsoDate {
+            year: 2024,
+            month: 3,
+            day: 26,
+        };
+        let f = iso_to_fields("persian", iso);
+        assert_eq!(f.month, 1, "Farvardin is the 1st Persian month");
+        assert_eq!(f.year, 1403);
+        let long = format_persian_date("en", f.year, f.month, f.day, DateStyle::Long);
+        assert!(
+            long.contains("Farvardin"),
+            "long includes month name: {long}"
+        );
+        let short = format_persian_date("en", f.year, f.month, f.day, DateStyle::Short);
+        assert!(
+            !short.contains("Farvardin"),
+            "short uses a numeric month: {short}"
+        );
     }
 }
