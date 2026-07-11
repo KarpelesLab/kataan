@@ -1282,6 +1282,19 @@ impl<'a> Interp<'a> {
                 // array; return the segment-data object whose `[index, index+len)`
                 // range covers `index` (undefined out of range / non-integer).
                 N_INTL_SEGMENTS_CONTAINING => {
+                    // `RequireInternalSlot(this, [[SegmentsSegmenter]])`: `this` must
+                    // be a genuine Segments object (a foreign receiver — via
+                    // `containing.call(x)` — throws a TypeError).
+                    let branded = this_val
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|h| self.realm.get_property(h, "\u{0}segments"))
+                        .is_some_and(|v| matches!(v.unpack(), Unpacked::Bool(true)));
+                    if !branded {
+                        return Err(self.type_error(
+                            "Segments.prototype.containing called on a non-Segments object",
+                        ));
+                    }
                     // ToIntegerOrInfinity(index): a Symbol/BigInt throws; NaN → 0.
                     let idx = self.coerce_to_integer_or_infinity(arg0)?;
                     let mut result = NanBox::undefined();

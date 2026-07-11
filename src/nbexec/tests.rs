@@ -10214,3 +10214,162 @@ fn dtf_temporal_locale_calendar_extension() {
         "12/2024"
     );
 }
+
+/// `Intl.ListFormat` honors `type`/`style` in `format` and `formatToParts`
+/// (English CLDR reference patterns for short/narrow and `unit`).
+#[cfg(feature = "intl")]
+#[test]
+fn intl_list_format_type_style() {
+    assert_eq!(
+        run(r#"new Intl.ListFormat("en",{style:"short"}).format(["a","b"])"#),
+        "a & b"
+    );
+    assert_eq!(
+        run(r#"new Intl.ListFormat("en",{type:"unit",style:"narrow"}).format(["a","b","c"])"#),
+        "a b c"
+    );
+    // formatToParts uses the same style-aware connectors.
+    assert_eq!(
+        run(r#"new Intl.ListFormat("en",{style:"short"}).formatToParts(["a","b"])[1].value"#),
+        " & "
+    );
+}
+
+/// `Intl.Collator` ResolveLocale: `-u-kn-`/`-u-kf-` set numeric/caseFirst, while
+/// non-relevant or unsupported Unicode extensions are dropped from the resolved
+/// locale (leaving resolvedOptions identical to the plain locale).
+#[cfg(feature = "intl")]
+#[test]
+fn intl_collator_resolve_locale_extensions() {
+    assert_eq!(
+        run(r#"new Intl.Collator("en-u-kn-true").resolvedOptions().numeric"#),
+        "true"
+    );
+    assert_eq!(
+        run(r#"new Intl.Collator("en-u-kf-upper").resolvedOptions().caseFirst"#),
+        "upper"
+    );
+    // An irrelevant/unsupported extension key does not affect the resolved locale.
+    assert_eq!(
+        run(
+            r#"new Intl.Collator("en-u-kb-true").resolvedOptions().locale===new Intl.Collator("en").resolvedOptions().locale"#
+        ),
+        "true"
+    );
+    // A private-use `-x-u-...` is not a real extension.
+    assert_eq!(
+        run(r#"new Intl.Collator("de-x-u-co-phonebk").resolvedOptions().collation"#),
+        "default"
+    );
+    // ignorePunctuation:false keeps spaces significant (NonIgnorable weighting).
+    assert_eq!(
+        run(r#"new Intl.Collator("en",{ignorePunctuation:false}).compare("a","a ")<0"#),
+        "true"
+    );
+}
+
+/// `Intl.supportedValuesOf("numberingSystem")` returns the full CLDR set, and the
+/// numbering system resolves through the `-u-nu-` extension in the formatters.
+#[cfg(feature = "intl")]
+#[test]
+fn intl_numbering_system_resolution() {
+    assert_eq!(
+        run(r#"Intl.supportedValuesOf("numberingSystem").includes("armn")"#),
+        "true"
+    );
+    assert_eq!(
+        run(r#"new Intl.RelativeTimeFormat("en-u-nu-arab").resolvedOptions().numberingSystem"#),
+        "arab"
+    );
+    // A known option overrides the extension; an unknown one falls back to it.
+    assert_eq!(
+        run(
+            r#"new Intl.RelativeTimeFormat("en-u-nu-arab",{numberingSystem:"invalid"}).resolvedOptions().numberingSystem"#
+        ),
+        "arab"
+    );
+    assert_eq!(
+        run(
+            r#"new Intl.DurationFormat("en",{numberingSystem:"adlm"}).resolvedOptions().numberingSystem"#
+        ),
+        "adlm"
+    );
+}
+
+/// `Intl.PluralRules` with compact notation derives the compact-exponent operand,
+/// so French selects `many` for 1.5e6 (which is `other` in standard notation).
+#[cfg(feature = "intl")]
+#[test]
+fn intl_plural_rules_compact_notation() {
+    assert_eq!(
+        run(r#"new Intl.PluralRules("fr",{notation:"compact"}).select(1.5e6)"#),
+        "many"
+    );
+    assert_eq!(
+        run(r#"new Intl.PluralRules("fr",{notation:"standard"}).select(1.5e6)"#),
+        "other"
+    );
+}
+
+/// `String.prototype.localeCompare` initializes a Collator (validating locales /
+/// options) and uses real UCA collation (lowercase sorts before uppercase).
+#[cfg(feature = "intl")]
+#[test]
+fn intl_locale_compare_collator_semantics() {
+    assert_eq!(run(r#"("a").localeCompare("A")"#), "-1");
+    // Invalid `locales`/`options` throw the same errors as `new Intl.Collator`.
+    assert_eq!(
+        run(r#"try{("").localeCompare("",null);"ok"}catch(e){e.constructor.name}"#),
+        "TypeError"
+    );
+    assert_eq!(
+        run(
+            r#"try{("").localeCompare("","de",{usage:"invalid"});"ok"}catch(e){e.constructor.name}"#
+        ),
+        "RangeError"
+    );
+}
+
+/// `Intl.DurationFormat` treats a negative-zero field as `+0` (no minus sign).
+#[cfg(feature = "intl")]
+#[test]
+fn intl_duration_format_negative_zero() {
+    assert_eq!(
+        run(
+            r#"new Intl.DurationFormat("en",{yearsDisplay:"always"}).format({years:-0})===new Intl.DurationFormat("en",{yearsDisplay:"always"}).format({years:0})"#
+        ),
+        "true"
+    );
+}
+
+/// `Intl.Segmenter`: `segment` does `ToString` (Symbol throws) and
+/// `%Segments.prototype%.containing` brand-checks its receiver.
+#[cfg(feature = "intl")]
+#[test]
+fn intl_segmenter_string_and_branding() {
+    assert_eq!(
+        run(r#"try{new Intl.Segmenter().segment(Symbol());"ok"}catch(e){e.constructor.name}"#),
+        "TypeError"
+    );
+    assert_eq!(
+        run(
+            r#"var c=new Intl.Segmenter().segment("x").containing; try{c.call({});"ok"}catch(e){e.constructor.name}"#
+        ),
+        "TypeError"
+    );
+}
+
+/// `String.prototype.toLocaleUpperCase`/`toLocaleLowerCase` validate the locale
+/// argument and apply Turkic case tailoring.
+#[cfg(feature = "intl")]
+#[test]
+fn intl_to_locale_case() {
+    assert_eq!(
+        run(
+            r#"try{("x").toLocaleUpperCase("not a valid locale");"ok"}catch(e){e.constructor.name}"#
+        ),
+        "RangeError"
+    );
+    // Turkish dotless-i tailoring for uppercase.
+    assert_eq!(run(r#"("i").toLocaleUpperCase("tr")"#), "\u{130}");
+}

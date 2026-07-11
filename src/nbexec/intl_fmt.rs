@@ -572,6 +572,289 @@ pub(crate) fn locale_unicode_calendar(locale: &str) -> Option<String> {
     None
 }
 
+/// Extracts the `-u-<key>-<value>` type value from a BCP-47 locale tag, if
+/// present (e.g. `locale_unicode_keyword("en-u-nu-arab", "nu")` → `Some("arab")`).
+/// The value may span several `-`-joined subtags (each ≥ 3 chars); collection
+/// stops at the next 2-char extension key or the end of the `-u-` group.
+pub(crate) fn locale_unicode_keyword(locale: &str, key: &str) -> Option<String> {
+    let lower = locale.to_ascii_lowercase();
+    let subtags: Vec<&str> = lower.split('-').collect();
+    let mut i = 0;
+    while i < subtags.len() {
+        // A private-use singleton (`x`) starts private subtags; a `-u-` after it
+        // is not a real extension (`de-x-u-co-phonebk` has no `co` keyword).
+        if subtags[i] == "x" {
+            break;
+        }
+        if subtags[i] == "u" {
+            let mut j = i + 1;
+            while j < subtags.len() && subtags[j].len() != 1 {
+                if subtags[j] == key {
+                    let mut parts = Vec::new();
+                    let mut k = j + 1;
+                    while k < subtags.len() && subtags[k].len() >= 3 {
+                        parts.push(subtags[k]);
+                        k += 1;
+                    }
+                    if parts.is_empty() {
+                        return None;
+                    }
+                    return Some(parts.join("-"));
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Extracts a boolean Unicode `-u-<key>-` keyword (e.g. `kn`) from a locale tag:
+/// a bare key or an explicit `true` → `Some(true)`, `false` → `Some(false)`, the
+/// key being absent → `None`. Handles the canonical form where a `true` value is
+/// dropped (`en-u-kn-true` → `en-u-kn`).
+pub(crate) fn locale_unicode_bool_keyword(locale: &str, key: &str) -> Option<bool> {
+    let lower = locale.to_ascii_lowercase();
+    let subs: Vec<&str> = lower.split('-').collect();
+    let mut i = 0;
+    while i < subs.len() {
+        if subs[i] == "x" {
+            break;
+        }
+        if subs[i] == "u" {
+            let mut j = i + 1;
+            while j < subs.len() && subs[j].len() != 1 {
+                if subs[j] == key {
+                    return Some(match subs.get(j + 1) {
+                        Some(v) if v.len() >= 3 => *v != "false",
+                        _ => true,
+                    });
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether `co` is a collation type the engine treats as a supported
+/// `Intl.Collator` collation (the CLDR collation identifiers, excluding the
+/// reserved `standard`/`search` values that are never valid `-u-co-` types).
+pub(crate) fn is_supported_collation(co: &str) -> bool {
+    matches!(
+        co,
+        "compat"
+            | "dict"
+            | "emoji"
+            | "eor"
+            | "phonebk"
+            | "phonetic"
+            | "pinyin"
+            | "searchjl"
+            | "stroke"
+            | "trad"
+            | "unihan"
+            | "zhuyin"
+    )
+}
+
+/// Zero-pads the minute/second fields of crate-produced `DateTimePart`s to two
+/// digits when combined with another time field, and maps each to its ECMA-402
+/// `(type, value)` part. CLDR/ICU has no single-digit `m`/`s` time format:
+/// whenever minute or second appears alongside another time field it renders
+/// 2-digit even for the `"numeric"` option (the crate widens by option only).
+/// Shared by the `Date` and Temporal DateTimeFormat rendering paths.
+#[cfg(feature = "intl")]
+fn dtf_pad_time_parts(
+    parts: alloc::vec::Vec<intl::datetime::DateTimePart>,
+) -> Vec<(&'static str, String)> {
+    use intl::datetime::DateTimePartType;
+    let has_hour = parts.iter().any(|p| p.kind == DateTimePartType::Hour);
+    let has_min = parts.iter().any(|p| p.kind == DateTimePartType::Minute);
+    let has_sec = parts.iter().any(|p| p.kind == DateTimePartType::Second);
+    parts
+        .into_iter()
+        .map(|p| {
+            let mut v = p.value;
+            let widen = match p.kind {
+                DateTimePartType::Minute => has_hour || has_sec,
+                DateTimePartType::Second => has_hour || has_min,
+                _ => false,
+            };
+            if widen && v.len() == 1 && v.as_bytes()[0].is_ascii_digit() {
+                v.insert(0, '0');
+            }
+            (p.kind.as_str(), v)
+        })
+        .collect()
+}
+
+/// The complete set of CLDR numbering-system identifiers (BCP-47 `nu` types).
+/// Mirrors ECMA-402's `AvailableNumberingSystems`; used by
+/// `Intl.supportedValuesOf("numberingSystem")` and to validate the
+/// `numberingSystem` option against known systems in the Intl formatters.
+pub(crate) const NUMBERING_SYSTEMS: &[&str] = &[
+    "adlm", "ahom", "arab", "arabext", "armn", "armnlow", "bali", "beng", "bhks", "brah", "cakm",
+    "cham", "cyrl", "deva", "diak", "ethi", "finance", "fullwide", "gara", "geor", "gong", "gonm",
+    "grek", "greklow", "gujr", "gukh", "guru", "hanidays", "hanidec", "hans", "hansfin", "hant",
+    "hantfin", "hebr", "hmng", "hmnp", "java", "jpan", "jpanfin", "jpanyear", "kali", "kawi",
+    "khmr", "knda", "krai", "lana", "lanatham", "laoo", "latn", "lepc", "limb", "mathbold",
+    "mathdbl", "mathmono", "mathsanb", "mathsans", "mlym", "modi", "mong", "mroo", "mtei", "mymr",
+    "mymrepka", "mymrpao", "mymrshan", "mymrtlng", "nagm", "native", "newa", "nkoo", "olck",
+    "onao", "orya", "osma", "outlined", "rohg", "roman", "romanlow", "saur", "segment", "shrd",
+    "sind", "sinh", "sora", "sund", "sunu", "takr", "talu", "taml", "tamldec", "tnsa", "telu",
+    "thai", "tirh", "tibt", "tols", "traditio", "vaii", "wara", "wcho",
+];
+
+/// Whether `nu` is a known CLDR numbering-system identifier.
+pub(crate) fn is_known_numbering_system(nu: &str) -> bool {
+    NUMBERING_SYSTEMS.contains(&nu)
+}
+
+/// `floor(log10(a))` for `a > 0`, computed by scaling so it is exact at powers
+/// of ten (`log10(1e6)` can round to just under 6.0 in `f64`).
+#[cfg(feature = "intl")]
+fn decimal_magnitude(a: f64) -> i32 {
+    if a <= 0.0 || !a.is_finite() {
+        return 0;
+    }
+    let mut m = 0i32;
+    let mut x = a;
+    if x >= 1.0 {
+        while x >= 10.0 {
+            x /= 10.0;
+            m += 1;
+        }
+    } else {
+        while x < 1.0 {
+            x *= 10.0;
+            m -= 1;
+        }
+    }
+    m
+}
+
+/// Builds the plural-operand string carrying the compact-decimal exponent for a
+/// non-standard `notation`, in the crate's `<mantissa>c<exp>` form (e.g. `1.5e6`
+/// in compact → `"1.5c6"`). Returns `None` for standard notation or when no
+/// exponent applies (so the caller uses the plain decimal). `compact`/
+/// `engineering` use exponents that are multiples of three; `scientific` uses
+/// the full magnitude; compact suppresses exponents below 1000.
+#[cfg(feature = "intl")]
+fn plural_notation_operand_string(n: f64, notation: &str) -> Option<String> {
+    let a = n.abs();
+    if a == 0.0 || !a.is_finite() {
+        return None;
+    }
+    let mag = decimal_magnitude(a);
+    let e = match notation {
+        "scientific" => mag,
+        "engineering" => (mag as f64 / 3.0).floor() as i32 * 3,
+        "compact" => {
+            if mag < 3 {
+                0
+            } else {
+                (mag as f64 / 3.0).floor() as i32 * 3
+            }
+        }
+        _ => return None,
+    };
+    if e <= 0 {
+        return None;
+    }
+    let mantissa = a / libm_pow10(e);
+    Some(alloc::format!("{mantissa}c{e}"))
+}
+
+/// `10^e` for a small non-negative exponent, exact for the range used by
+/// compact/scientific plural operands.
+#[cfg(feature = "intl")]
+fn libm_pow10(e: i32) -> f64 {
+    let mut p = 1.0f64;
+    for _ in 0..e {
+        p *= 10.0;
+    }
+    p
+}
+
+/// The CLDR default numbering system for `locale` (e.g. `ar` → `arab`), derived
+/// from the shape of its zero digit. Honors an explicit `-u-nu-` extension via
+/// the crate. Falls back to `latn`.
+pub(crate) fn default_numbering_for_locale_str(locale: &str) -> String {
+    #[cfg(feature = "intl")]
+    {
+        let zero = intl::number::format_decimal_native(locale, 0.0);
+        if let Some(c) = zero.chars().next()
+            && let Some(name) = numbering_system_name_from_zero(c)
+        {
+            return String::from(name);
+        }
+    }
+    let _ = locale;
+    String::from("latn")
+}
+
+/// ResolveLocale for the Unicode `nu` key. Given the extension-free `base`, the
+/// full requested `locale` (for its `-u-nu-` extension), and the validated
+/// `option`, returns `(resolved_value, extension_addition)`. The addition is
+/// non-empty (e.g. `"-nu-arab"`) only when the value is sourced from the
+/// extension; an option-sourced override drops it. Values that are not known
+/// numbering systems are ignored (falling back to the locale default).
+pub(crate) fn resolve_nu_key(base: &str, locale: &str, option: Option<&str>) -> (String, String) {
+    let mut value = default_numbering_for_locale_str(base);
+    let mut addition = String::new();
+    #[cfg(feature = "intl")]
+    if let Some(ext) = locale_unicode_keyword(locale, "nu")
+        && is_known_numbering_system(&ext)
+    {
+        value = ext.clone();
+        addition = alloc::format!("-nu-{ext}");
+    }
+    let _ = locale;
+    if let Some(opt) = option
+        && is_known_numbering_system(opt)
+        && opt != value
+    {
+        value = String::from(opt);
+        addition = String::new();
+    }
+    (value, addition)
+}
+
+/// Removes the `-u-`/`-t-`/`-x-` singleton extensions (and everything after the
+/// first singleton subtag) from a canonical BCP-47 tag, leaving just the
+/// language/script/region/variant core — the base for ResolveLocale's
+/// resolved-locale reconstruction.
+pub(crate) fn strip_unicode_extension(locale: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for sub in locale.split('-') {
+        if sub.len() == 1 {
+            break; // a singleton subtag (u/t/x/…) starts the extensions
+        }
+        out.push(sub);
+    }
+    out.join("-")
+}
+
+/// Reconstructs a resolved locale from its extension-free `base` and the list of
+/// per-key Unicode-extension additions (each already rendered, e.g. `"-nu-arab"`,
+/// `"-kn"`, `"-kf-upper"`). Keys are emitted in canonical (alphabetical) order.
+/// An empty addition list yields the bare `base`.
+pub(crate) fn build_resolved_locale(base: &str, additions: &[String]) -> String {
+    let mut adds: Vec<&String> = additions.iter().filter(|a| !a.is_empty()).collect();
+    if adds.is_empty() {
+        return String::from(base);
+    }
+    adds.sort();
+    let mut out = String::from(base);
+    out.push_str("-u");
+    for a in adds {
+        out.push_str(a);
+    }
+    out
+}
+
 pub(crate) fn canonicalize_locale_id(tag: &str) -> Option<String> {
     // Structurally rejected outright: empty, non-ASCII, `_` separators, and the
     // empty subtags produced by leading/trailing/doubled `-`.
@@ -2723,6 +3006,16 @@ impl<'a> Interp<'a> {
         let numeric = self
             .get_string_option(opts, "numeric", &["always", "auto"], Some("always"))?
             .unwrap();
+        // ResolveLocale for the `nu` key: a known `numberingSystem` option wins,
+        // else the locale's `-u-nu-` extension, else the CLDR default. The
+        // resolved locale keeps `-u-nu-` only when the value came from the
+        // extension (an option-sourced value drops the key from the tag).
+        let base = strip_unicode_extension(&locale);
+        let (resolved_nu, add) = resolve_nu_key(&base, &locale, nu.as_deref());
+        let resolved_locale = build_resolved_locale(&base, &[add]);
+        let locv = self.new_str(&resolved_locale);
+        self.realm.set_hidden_property(obj, "\u{0}locale", locv);
+        self.store_str(obj, "numberingSystem", &Some(resolved_nu));
         self.store_str(obj, "style", &Some(style));
         self.store_str(obj, "numeric", &Some(numeric));
         self.brand_intl_instance(obj, N_INTL_REL_TIME);
@@ -2923,26 +3216,124 @@ impl<'a> Interp<'a> {
         let ignore_punct = self
             .get_bool_option(opts, "ignorePunctuation", Some(ip_default))?
             .unwrap_or(ip_default);
+        // --- ResolveLocale over Collator's relevant extension keys (co, kn, kf).
+        // Each key's value comes from the locale's `-u-` extension when supported,
+        // overridden by a supported option; an option-sourced value drops the key
+        // from the resolved locale, while an extension-sourced value keeps it.
+        // Non-relevant `-u-` keys and unsupported values are dropped entirely.
+        let base = strip_unicode_extension(&locale);
+        let mut additions: Vec<String> = Vec::new();
+
+        // co (collation): default "default".
+        let mut co_value = String::from("default");
+        if let Some(ext) = locale_unicode_keyword(&locale, "co")
+            && is_supported_collation(&ext)
+        {
+            co_value = ext.clone();
+            additions.push(alloc::format!("-co-{ext}"));
+        }
+        if let Some(opt) = &collation
+            && is_supported_collation(opt)
+            && *opt != co_value
+        {
+            co_value = opt.clone();
+            additions.retain(|a| !a.starts_with("-co-"));
+        }
+
+        // kn (numeric): default false; reported only when set from ext or option.
+        let ext_kn = locale_unicode_bool_keyword(&locale, "kn");
+        let mut kn_value = ext_kn.unwrap_or(false);
+        if let Some(b) = ext_kn {
+            additions.push(if b {
+                String::from("-kn")
+            } else {
+                String::from("-kn-false")
+            });
+        }
+        if let Some(opt) = numeric
+            && opt != kn_value
+        {
+            kn_value = opt;
+            additions.retain(|a| a != "-kn" && a != "-kn-false");
+        }
+        let kn_reported = ext_kn.is_some() || numeric.is_some();
+
+        // kf (caseFirst): reported only when set from ext or option.
+        let mut kf_value: Option<String> = None;
+        if let Some(ext) = locale_unicode_keyword(&locale, "kf")
+            && matches!(ext.as_str(), "upper" | "lower" | "false")
+        {
+            kf_value = Some(ext.clone());
+            additions.push(alloc::format!("-kf-{ext}"));
+        }
+        if let Some(opt) = &case_first
+            && kf_value.as_deref() != Some(opt.as_str())
+        {
+            kf_value = Some(opt.clone());
+            additions.retain(|a| !a.starts_with("-kf-"));
+        }
+
+        let resolved_locale = build_resolved_locale(&base, &additions);
+        let rlv = self.new_str(&resolved_locale);
+        self.realm.set_hidden_property(obj, "\u{0}locale", rlv);
+
         // Store the resolved slots for resolvedOptions.
         self.store_str(obj, "usage", &Some(usage));
         self.store_str(obj, "sensitivity", &Some(sensitivity));
         let ipv = NanBox::boolean(ignore_punct);
         self.realm
             .set_hidden_property(obj, "ignorePunctuation", ipv);
-        self.store_str(
-            obj,
-            "collation",
-            &Some(collation.unwrap_or_else(|| String::from("default"))),
-        );
-        if let Some(n) = numeric {
-            let nv = NanBox::boolean(n);
-            self.realm.set_hidden_property(obj, "numeric", nv);
+        self.store_str(obj, "collation", &Some(co_value));
+        if kn_reported {
+            self.realm
+                .set_hidden_property(obj, "numeric", NanBox::boolean(kn_value));
         }
-        if let Some(cf) = case_first {
+        if let Some(cf) = kf_value {
             self.store_str(obj, "caseFirst", &Some(cf));
         }
         self.brand_intl_instance(obj, N_INTL_COLLATOR);
         Ok(())
+    }
+
+    /// Compares `a` and `b` under an `Intl.Collator` instance's resolved slots via
+    /// real UCA collation: `sensitivity` → strength, `numeric` → numeric ordering,
+    /// `ignorePunctuation` → variable-weighting (Shifted vs NonIgnorable). Shared by
+    /// `Intl.Collator.prototype.compare` and `String.prototype.localeCompare`.
+    #[cfg(feature = "intl")]
+    pub(crate) fn collator_ordering(
+        &mut self,
+        ch: Option<Handle>,
+        a: &str,
+        b: &str,
+    ) -> core::cmp::Ordering {
+        use intl::unicode::collate::{AlternateHandling, Collator, Strength};
+        let strength = match ch
+            .and_then(|h| self.realm.get_property(h, "sensitivity"))
+            .map(|v| self.realm.to_display_string(v))
+            .as_deref()
+        {
+            Some("base") => Strength::Primary,
+            Some("accent") => Strength::Secondary,
+            _ => Strength::Tertiary,
+        };
+        let numeric = matches!(
+            ch.and_then(|h| self.realm.get_property(h, "numeric"))
+                .map(|v| v.unpack()),
+            Some(Unpacked::Bool(true))
+        );
+        let alternate = if matches!(
+            ch.and_then(|h| self.realm.get_property(h, "ignorePunctuation"))
+                .map(|v| v.unpack()),
+            Some(Unpacked::Bool(true))
+        ) {
+            AlternateHandling::Shifted
+        } else {
+            AlternateHandling::NonIgnorable
+        };
+        Collator::new(alternate)
+            .with_strength(strength)
+            .with_numeric(numeric)
+            .compare(a, b)
     }
 
     /// Builds an `Intl.ListFormat` instance (`InitializeListFormat`): canonicalizes
@@ -3092,21 +3483,26 @@ impl<'a> Interp<'a> {
         &self,
         items: &[String],
         list_type: &str,
-        _style: &str,
+        style: &str,
     ) -> Vec<(&'static str, String)> {
         let n = items.len();
         let mut parts: Vec<(&'static str, String)> = Vec::new();
         if n == 0 {
             return parts;
         }
-        // en patterns. `pair` is the two-element connector; `start`/`middle`/`end`
-        // are the three-or-more connectors. (CLDR `listPattern` for `en`.)
-        let (pair, end): (&str, &str) = match list_type {
-            "disjunction" => (" or ", ", or "),
-            "unit" => (", ", ", "),
-            _ => (" and ", ", and "), // conjunction (default)
+        // English CLDR `listPattern`s, keyed by (type, style). `pair` is the
+        // two-element connector; `middle` joins non-final elements; `end` is the
+        // final connector for three-or-more lists. (Reference-locale data; the
+        // `intl` crate exposes only conjunction/disjunction *long*, so short /
+        // narrow / unit patterns are encoded here.)
+        let (pair, middle, end): (&str, &str, &str) = match (list_type, style) {
+            ("disjunction", _) => (" or ", ", ", ", or "),
+            ("unit", "narrow") => (" ", " ", " "),
+            ("unit", _) => (", ", ", ", ", "),
+            (_, "short") => (" & ", ", ", ", & "), // conjunction short
+            (_, "narrow") => (", ", ", ", ", "),   // conjunction narrow
+            _ => (" and ", ", ", ", and "),        // conjunction long (default)
         };
-        let middle = ", ";
         for (i, it) in items.iter().enumerate() {
             if i > 0 {
                 let lit = if n == 2 {
@@ -3219,11 +3615,21 @@ impl<'a> Interp<'a> {
                 .map(|v| self.realm.to_display_string(v))
                 .as_deref()
                 == Some("ordinal");
-            let ops = if n == (n as i64) as f64 {
-                intl::plural::PluralOperands::from_int(n as i64)
-            } else {
-                intl::plural::PluralOperands::parse(&alloc::format!("{n}"))
-                    .unwrap_or_else(|| intl::plural::PluralOperands::from_int(n as i64))
+            let notation = fmt
+                .and_then(|h| self.realm.get_property(h, "notation"))
+                .map(|v| self.realm.to_display_string(v))
+                .unwrap_or_else(|| String::from("standard"));
+            // For compact/scientific/engineering notation the plural operands carry
+            // a non-zero compact-decimal exponent `c`/`e` (e.g. 1.5e6 in compact →
+            // mantissa 1.5, exponent 6), which some locales' `many` rules depend on
+            // (fr: `e ∉ 0..5 → many`). Encode it via the crate's `<mantissa>c<exp>`
+            // operand syntax; standard notation uses the plain decimal.
+            let ops = match plural_notation_operand_string(n, &notation) {
+                Some(s) => intl::plural::PluralOperands::parse(&s)
+                    .unwrap_or_else(|| intl::plural::PluralOperands::from_int(n as i64)),
+                None if n == (n as i64) as f64 => intl::plural::PluralOperands::from_int(n as i64),
+                None => intl::plural::PluralOperands::parse(&alloc::format!("{n}"))
+                    .unwrap_or_else(|| intl::plural::PluralOperands::from_int(n as i64)),
             };
             let cat = if ordinal {
                 intl::plural::ordinal_category(&locale, &ops)
@@ -3480,10 +3886,7 @@ impl<'a> Interp<'a> {
             o.tz_offset_minutes = Some(0); // engine is UTC-only
         }
         match datetime::format_to_parts(&locale, &dt, &o) {
-            Ok(parts) => parts
-                .into_iter()
-                .map(|p| (p.kind.as_str(), p.value))
-                .collect(),
+            Ok(parts) => dtf_pad_time_parts(parts),
             Err(_) => Vec::new(),
         }
     }
@@ -3901,10 +4304,7 @@ impl<'a> Interp<'a> {
             millisecond: (tod % 1_000) as u16,
         };
         match datetime::format_to_parts(&locale, &dt, o) {
-            Ok(parts) => parts
-                .into_iter()
-                .map(|p| (p.kind.as_str(), p.value))
-                .collect(),
+            Ok(parts) => dtf_pad_time_parts(parts),
             Err(_) => Vec::new(),
         }
     }
@@ -4571,22 +4971,12 @@ impl<'a> Interp<'a> {
     /// locale (so its per-locale table, with regional exceptions, is authoritative).
     /// `latn` when there is no `intl` data or the system is unrecognized.
     fn default_numbering_for_locale(&mut self, obj: Handle) -> String {
-        #[cfg(feature = "intl")]
-        {
-            let locale = self
-                .realm
-                .get_property(obj, "\u{0}locale")
-                .map(|v| self.realm.to_display_string(v))
-                .unwrap_or_else(|| String::from("en"));
-            let zero = intl::number::format_decimal_native(&locale, 0.0);
-            if let Some(c) = zero.chars().next()
-                && let Some(name) = numbering_system_name_from_zero(c)
-            {
-                return String::from(name);
-            }
-        }
-        let _ = obj;
-        String::from("latn")
+        let locale = self
+            .realm
+            .get_property(obj, "\u{0}locale")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("en"));
+        default_numbering_for_locale_str(&locale)
     }
 
     /// Pre-round `n` to the resolved precision using the ECMA-402 / ICU decimal
@@ -5140,17 +5530,7 @@ impl<'a> Interp<'a> {
                 "TMT", "TND", "TOP", "TRY", "TTD", "TWD", "TZS", "UAH", "UGX", "USD", "UYU", "UZS",
                 "VES", "VND", "VUV", "WST", "XAF", "XCD", "XOF", "XPF", "YER", "ZAR", "ZMW", "ZWL",
             ],
-            "numberingSystem" => &[
-                "adlm", "ahom", "arab", "arabext", "bali", "beng", "bhks", "brah", "cakm", "cham",
-                "deva", "diak", "fullwide", "gara", "gong", "gonm", "gujr", "gukh", "guru",
-                "hanidec", "hmng", "hmnp", "java", "kali", "kawi", "khmr", "knda", "krai", "lana",
-                "lanatham", "laoo", "latn", "lepc", "limb", "mathbold", "mathdbl", "mathmono",
-                "mathsanb", "mathsans", "mlym", "modi", "mong", "mroo", "mtei", "mymr", "mymrepka",
-                "mymrpao", "mymrshan", "mymrtlng", "nagm", "newa", "nkoo", "olck", "onao", "orya",
-                "osma", "outlined", "rohg", "saur", "segment", "shrd", "sind", "sinh", "sora",
-                "sund", "sunu", "takr", "talu", "tamldec", "telu", "thai", "tibt", "tirh", "tnsa",
-                "tols", "vaii", "wara", "wcho",
-            ],
+            "numberingSystem" => NUMBERING_SYSTEMS,
             "timeZone" => &["UTC"],
             "unit" => SANCTIONED_UNITS,
             _ => {
@@ -6133,6 +6513,25 @@ impl<'a> Interp<'a> {
             return Err(self.type_error("Intl.DurationFormat.format: argument must be an object"));
         }
         let oh = input.as_handle().map(Handle::from_raw).unwrap();
+        // `ToDurationRecord` reads a `Temporal.Duration` from its internal slots,
+        // NOT via the (user-observable, potentially tainted) prototype getters.
+        if let Some(td) = self.realm.temporal_at(oh)
+            && td.kind == crate::temporal_iso::TemporalKind::Duration
+        {
+            let d = &td.duration;
+            return Ok([
+                d.years as f64,
+                d.months as f64,
+                d.weeks as f64,
+                d.days as f64,
+                d.hours as f64,
+                d.minutes as f64,
+                d.seconds as f64,
+                d.milliseconds as f64,
+                d.microseconds as f64,
+                d.nanoseconds as f64,
+            ]);
+        }
         let mut rec = [0.0f64; 10];
         let mut any = false;
         for (i, unit) in Self::DURATION_UNITS.iter().enumerate() {
@@ -6336,14 +6735,19 @@ impl<'a> Interp<'a> {
         let mut result: Vec<Vec<(&'static str, String, Option<&'static str>)>> = Vec::new();
         let mut need_separator = false;
         let mut display_negative_sign = true;
-        // Whether any field is negative (for the negative-zero leading-sign rule).
-        let any_negative = duration
-            .iter()
-            .any(|&v| v < 0.0 || (v == 0.0 && v.is_sign_negative()));
+        // Whether the duration is negative (drives the leading unit's sign). Per
+        // DurationSign, a negative *zero* field counts as zero — `{years:-0}` has
+        // sign 0 and formats identically to `{years:+0}` (no minus sign).
+        let any_negative = duration.iter().any(|&v| v < 0.0);
         for idx in 0..units.len() {
             let unit = units[idx];
             let singular: &'static str = duration_singular(unit);
+            // Normalize a negative-zero field to +0 (a genuinely-negative duration
+            // re-applies the leading sign below); `{years:-0}` must format as "0".
             let mut value = duration[idx];
+            if value == 0.0 {
+                value = 0.0;
+            }
             let style_u = ustyle[idx].clone();
             let display_u = udisp[idx].clone();
             // Combine numeric seconds/ms/us with their fractional remainder.
@@ -6684,7 +7088,7 @@ impl ParsedLocale {
 /// Whether `ns` is a numbering system this engine treats as supported (only `latn`
 /// and `arab` have data; others fall back to the locale default for DurationFormat).
 fn is_supported_numbering_system(ns: &str) -> bool {
-    matches!(ns, "latn" | "arab")
+    is_known_numbering_system(ns)
 }
 
 /// The singular `Intl.NumberFormat` unit name for a duration unit field

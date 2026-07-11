@@ -3087,9 +3087,13 @@ impl<'a> Interp<'a> {
                 // build) use the hardcoded en list patterns.
                 #[cfg(feature = "intl")]
                 {
-                    let crate_style = match list_type.as_str() {
-                        "disjunction" => Some(intl::list::ListStyle::Or),
-                        "conjunction" => Some(intl::list::ListStyle::And),
+                    // The crate is locale-aware only for conjunction/disjunction
+                    // in the *long* style; short/narrow and `unit` route through
+                    // the (English) CLDR pattern table below so `format` and
+                    // `formatToParts` agree.
+                    let crate_style = match (list_type.as_str(), style.as_str()) {
+                        ("disjunction", "long") => Some(intl::list::ListStyle::Or),
+                        ("conjunction", "long") => Some(intl::list::ListStyle::And),
                         _ => None,
                     };
                     if let Some(crate_style) = crate_style {
@@ -3217,7 +3221,9 @@ impl<'a> Interp<'a> {
                     .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
                     .map(|v| self.realm.to_display_string(v))
                     .unwrap_or_else(|| String::from("grapheme"));
-                let input = self.realm.to_display_string(arg(0));
+                // `segment(string)` does `? ToString(string)` (a Symbol throws a
+                // TypeError; a missing argument yields "undefined").
+                let input = self.coerce_to_string(arg(0))?;
                 let segs = segment_text(&input, &gran);
                 let mut elems = Vec::with_capacity(segs.len());
                 for (index, seg, is_word_like) in segs {
@@ -3234,6 +3240,11 @@ impl<'a> Interp<'a> {
                     elems.push(NanBox::handle(o.to_raw()));
                 }
                 let arr = self.realm.new_array(elems);
+                // Brand the Segments object (spec `[[SegmentsSegmenter]]`) so
+                // `%Segments.prototype%.containing` can `RequireInternalSlot` its
+                // `this` value and reject foreign receivers with a TypeError.
+                self.realm
+                    .set_hidden_property(arr, "\u{0}segments", NanBox::boolean(true));
                 // Attach `containing(index)` (a bound native over this segments
                 // array) so `segments.containing(i)` works, alongside iteration.
                 let containing = self.realm.new_bound_native(N_INTL_SEGMENTS_CONTAINING, arr);
@@ -3251,26 +3262,8 @@ impl<'a> Interp<'a> {
                 // (→ strength) and `numeric`; otherwise code-point order.
                 #[cfg(feature = "intl")]
                 let ord = {
-                    use intl::unicode::collate::{AlternateHandling, Collator, Strength};
                     let fmt = self.this_val.as_handle().map(Handle::from_raw);
-                    let strength = match fmt
-                        .and_then(|h| self.realm.get_property(h, "sensitivity"))
-                        .map(|v| self.realm.to_display_string(v))
-                        .as_deref()
-                    {
-                        Some("base") => Strength::Primary,
-                        Some("accent") => Strength::Secondary,
-                        _ => Strength::Tertiary,
-                    };
-                    let numeric = matches!(
-                        fmt.and_then(|h| self.realm.get_property(h, "numeric"))
-                            .map(|v| v.unpack()),
-                        Some(Unpacked::Bool(true))
-                    );
-                    Collator::new(AlternateHandling::Shifted)
-                        .with_strength(strength)
-                        .with_numeric(numeric)
-                        .compare(&a, &b)
+                    self.collator_ordering(fmt, &a, &b)
                 };
                 #[cfg(not(feature = "intl"))]
                 let ord = a.cmp(&b);

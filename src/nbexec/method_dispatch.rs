@@ -2113,11 +2113,39 @@ impl<'a> Interp<'a> {
                 // surrogate-bearing string maps case over the code-point view,
                 // passing lone surrogates through unchanged (a surrogate has no
                 // case) so they survive the round-trip.
-                "toUpperCase" | "toLocaleUpperCase" => {
-                    Some(self.new_str_bytes(case_map_wtf8(&bytes, true)))
-                }
-                "toLowerCase" | "toLocaleLowerCase" => {
-                    Some(self.new_str_bytes(case_map_wtf8(&bytes, false)))
+                "toUpperCase" => Some(self.new_str_bytes(case_map_wtf8(&bytes, true))),
+                "toLowerCase" => Some(self.new_str_bytes(case_map_wtf8(&bytes, false))),
+                "toLocaleUpperCase" | "toLocaleLowerCase" => {
+                    // The `locales` argument is `CanonicalizeLocaleList`-validated
+                    // (a malformed tag is a RangeError).
+                    let locales = self.canonicalize_locale_list(arg(0))?;
+                    let upper = method == "toLocaleUpperCase";
+                    // Turkic (`tr`/`az`) and Lithuanian (`lt`) locales tailor the
+                    // case mapping (dotted/dotless I, combining-dot handling); other
+                    // locales use the default (locale-independent) mapping. Only the
+                    // valid-UTF-8 fast path is tailored (lone surrogates are
+                    // case-neutral and keep the WTF-8 mapping).
+                    #[cfg(feature = "intl")]
+                    {
+                        let lang = locales.first().map(String::as_str).unwrap_or("");
+                        let primary = lang.split('-').next().unwrap_or("");
+                        let special = matches!(primary, "tr" | "az" | "lt");
+                        if special && let Ok(s) = core::str::from_utf8(&bytes) {
+                            let out = if upper {
+                                intl::unicode::uppercase_str_lang(s, lang)
+                            } else {
+                                intl::unicode::lowercase_str_lang(s, lang)
+                            };
+                            Some(self.new_str(&out))
+                        } else {
+                            Some(self.new_str_bytes(case_map_wtf8(&bytes, upper)))
+                        }
+                    }
+                    #[cfg(not(feature = "intl"))]
+                    {
+                        let _ = &locales;
+                        Some(self.new_str_bytes(case_map_wtf8(&bytes, upper)))
+                    }
                 }
                 "trim" => {
                     let s = crate::wtf8::to_string_lossy(&bytes);
@@ -2664,32 +2692,17 @@ impl<'a> Interp<'a> {
                     // ToString(that) — unwraps a String wrapper and runs a user
                     // toString (abrupt-propagating), rather than the raw display form.
                     let other = self.coerce_to_string(arg(0))?;
-                    // With an `options` argument, honor `numeric`/`sensitivity` via the
-                    // UCA collator (so `"10".localeCompare("9",u,{numeric:true}) > 0`);
-                    // the no-options default stays plain code-point order.
+                    // Per ECMA-402, `localeCompare` initializes an `Intl.Collator`
+                    // from (locales, options): this validates both arguments —
+                    // throwing the same TypeError/RangeError as `new Intl.Collator`
+                    // — and drives real UCA collation (honoring sensitivity /
+                    // numeric / ignorePunctuation, and the default lowercase-first
+                    // ordering) rather than raw code-point comparison.
                     #[cfg(feature = "intl")]
-                    let ord = if let Some(opts) = arg(2).as_handle().map(Handle::from_raw) {
-                        use intl::unicode::collate::{AlternateHandling, Collator, Strength};
-                        let strength = match self
-                            .realm
-                            .get_property(opts, "sensitivity")
-                            .map(|v| self.realm.to_display_string(v))
-                            .as_deref()
-                        {
-                            Some("base") => Strength::Primary,
-                            Some("accent") => Strength::Secondary,
-                            _ => Strength::Tertiary,
-                        };
-                        let numeric = matches!(
-                            self.realm.get_property(opts, "numeric").map(|v| v.unpack()),
-                            Some(Unpacked::Bool(true))
-                        );
-                        Collator::new(AlternateHandling::Shifted)
-                            .with_strength(strength)
-                            .with_numeric(numeric)
-                            .compare(&s, &other)
-                    } else {
-                        s.as_str().cmp(other.as_str())
+                    let ord = {
+                        let collator = self.make_collator(&[arg(1), arg(2)])?;
+                        let ch = collator.as_handle().map(Handle::from_raw);
+                        self.collator_ordering(ch, &s, &other)
                     };
                     #[cfg(not(feature = "intl"))]
                     let ord = s.as_str().cmp(other.as_str());
