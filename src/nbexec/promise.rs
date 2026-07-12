@@ -1113,11 +1113,7 @@ impl<'a> Interp<'a> {
         let it = self.get_iter_object(iterable)?;
         let next_m = self.read_member(it, "next")?;
         let mut i = 0usize;
-        loop {
-            let item = match self.iter_step(it, next_m)? {
-                Some(v) => v,
-                None => break,
-            };
+        while let Some(item) = self.iter_step(it, next_m)? {
             self.realm.set_element(values, i, NanBox::undefined());
             let cur = self.cell_get(remaining);
             self.cell_set(remaining, cur + 1.0);
@@ -1196,11 +1192,7 @@ impl<'a> Interp<'a> {
         // Lazy iteration + IteratorClose on an abrupt `promiseResolve`/`then`.
         let it = self.get_iter_object(iterable)?;
         let next_m = self.read_member(it, "next")?;
-        loop {
-            let item = match self.iter_step(it, next_m)? {
-                Some(v) => v,
-                None => break,
-            };
+        while let Some(item) = self.iter_step(it, next_m)? {
             if let Err(e) = self.perform_promise_race_element(c, promise_resolve, item, cap) {
                 let _ = self.iterator_close(it);
                 return Err(e);
@@ -1248,11 +1240,7 @@ impl<'a> Interp<'a> {
         let it = self.get_iter_object(iterable)?;
         let next_m = self.read_member(it, "next")?;
         let mut i = 0usize;
-        loop {
-            let item = match self.iter_step(it, next_m)? {
-                Some(v) => v,
-                None => break,
-            };
+        while let Some(item) = self.iter_step(it, next_m)? {
             self.realm.set_element(errors, i, NanBox::undefined());
             let cur = self.cell_get(remaining);
             self.cell_set(remaining, cur + 1.0);

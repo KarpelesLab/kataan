@@ -3,7 +3,7 @@
 //! Built on the §4.0 embedding API (`Interp::register_global_fn` / `register_fn`
 //! / `Ctx`), so runtime builtins and third-party host code travel one path. Each
 //! submodule installs one area's globals into a live [`Interp`] and is
-//! independently testable; [`install_all`] wires them together for the CLI.
+//! independently testable; `install_all` wires them together for the CLI.
 use crate::nbexec::Interp;
 
 pub mod node;

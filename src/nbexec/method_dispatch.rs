@@ -1296,7 +1296,7 @@ impl<'a> Interp<'a> {
             // *before* the detached check (spec 25.1.6.x steps 3-4), so a `valueOf`
             // that detaches the buffer is still observed and the argument evaluated.
             let new_f = self.coerce_to_integer_or_infinity(arg(0))?;
-            if !new_f.is_finite() || new_f < 0.0 || new_f >= 9_007_199_254_740_992.0 {
+            if !new_f.is_finite() || !(0.0..9_007_199_254_740_992.0).contains(&new_f) {
                 let m = self.new_str("ArrayBuffer.prototype.resize: invalid length");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }

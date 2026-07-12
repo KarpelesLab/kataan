@@ -237,7 +237,7 @@ pub enum Op {
     Return { src: Reg },
     /// Proper tail call to static function `func` with `args` (strict-mode PTC):
     /// instead of pushing a new activation, the callee *reuses* the current
-    /// frame (the interpreter trampolines in [`call_with_inner`]), so unbounded
+    /// frame (the interpreter trampolines in `call_with_inner`), so unbounded
     /// tail recursion runs in O(1) native stack. Emitted only for a `return`
     /// (and its tail-transparent sub-expressions) in a strict, non-async
     /// function. No `dst`: it is the frame's final act.
@@ -794,7 +794,7 @@ fn ensure_jit(
 
 /// How a single frame's execution ([`run_frame`]) finished normally: either it
 /// `return`ed (or fell off the end), or it hit a tail call whose activation the
-/// caller ([`call_with_inner`]) must set up by *reusing* this frame (the PTC
+/// caller (`call_with_inner`) must set up by *reusing* this frame (the PTC
 /// trampoline). Splitting the two lets the trampoline loop stay in the frame
 /// owner, keeping the native stack flat under unbounded tail recursion.
 enum FrameExit {
@@ -1866,11 +1866,11 @@ pub(crate) extern "C" fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64, b: 
     }
 }
 
-/// Test-only counter of [`jit_helper_call`] entries — lets a differential test
-/// distinguish a direct generic→generic native call (this stays at 0) from the
-/// interpreter-reentrant helper path (this increments). Thread-local so the count
-/// is isolated per test (cargo runs each test on its own thread, and the JIT call
-/// is synchronous on that thread) — a shared global would race under parallelism.
+// Test-only counter of `jit_helper_call` entries — lets a differential test
+// distinguish a direct generic→generic native call (this stays at 0) from the
+// interpreter-reentrant helper path (this increments). Thread-local so the count
+// is isolated per test (cargo runs each test on its own thread, and the JIT call
+// is synchronous on that thread) — a shared global would race under parallelism.
 #[cfg(all(test, feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 std::thread_local! {
     pub(crate) static JIT_HELPER_CALL_COUNT: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
@@ -12053,8 +12053,10 @@ mod generic_jit_tests {
         assert_eq!(raw_get(base, len, bits(o3), &cx), None);
 
         // Dictionary-mode object: must miss (ObjectData tag != Shaped).
-        let mut dlim = crate::limits::Limits::default();
-        dlim.object_dictionary_threshold = 2;
+        let dlim = crate::limits::Limits {
+            object_dictionary_threshold: 2,
+            ..Default::default()
+        };
         let mut drealm = Realm::with_limits(dlim);
         let d = drealm.new_object();
         drealm.set_property(d, "a", NanBox::number(1.0));
@@ -14024,7 +14026,11 @@ mod generic_jit_tests {
                 .unwrap()
                 .unwrap();
             // even(n) is 1 when n is even, 0 when odd.
-            let want = if (n as u64) % 2 == 0 { 1.0 } else { 0.0 };
+            let want = if (n as u64).is_multiple_of(2) {
+                1.0
+            } else {
+                0.0
+            };
             assert_eq!(interp.as_number(), Some(want), "even({n})");
             assert_eq!(interp.to_bits(), jitted.to_bits());
             // n>=2 is the first depth with a recursive back-edge (`odd→even`), which

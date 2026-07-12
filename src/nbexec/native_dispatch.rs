@@ -2040,11 +2040,7 @@ impl<'a> Interp<'a> {
                     let next = self.read_member(it, "next")?;
                     let mut out = Vec::new();
                     let mut k = 0usize;
-                    loop {
-                        let val = match self.iter_step(it, next)? {
-                            Some(v) => v,
-                            None => break,
-                        };
+                    while let Some(val) = self.iter_step(it, next)? {
                         let mapped = if has_map {
                             match self.call_with_this(
                                 map_fn,

@@ -1,8 +1,8 @@
 //! §4.1 — the event loop & timer scheduling (`ROADMAP.md` §4.1).
 //!
 //! This is the **macrotask / timer** layer of the host runtime, built entirely
-//! on the §4.0 embedding API ([`Interp::register_global_fn`], [`Ctx`], and the
-//! [`Ctx::persist`] / [`Interp::persistent`] / [`Interp::release_persistent`]
+//! on the §4.0 embedding API ([`Interp::register_global_fn`], `Ctx`, and the
+//! `Ctx::persist` / [`Interp::persistent`] / [`Interp::release_persistent`]
 //! handle-scope so a moving GC cannot drop a pinned callback). The engine
 //! already owns a Promise **microtask** queue; here we add:
 //!
@@ -20,7 +20,7 @@
 //! A `TimerStore` lives in a thread-local (the engine is single-threaded, so a
 //! thread-local is a natural side table keyed by the running thread's `Interp`).
 //! Each scheduled callback and its extra arguments are pinned with
-//! [`Ctx::persist`], so the store holds only stable `u32` persistent-handle
+//! `Ctx::persist`, so the store holds only stable `u32` persistent-handle
 //! indices — never a bare `NanBox` the GC could relocate. One-shot timers and
 //! `nextTick` entries release their handles when they fire; intervals keep theirs
 //! until cleared.
@@ -83,7 +83,7 @@ mod imp {
 
     /// A scheduled timer: `setTimeout` (`period == None`), `setInterval`
     /// (`period == Some(ms)`), or `setImmediate` (a `period == None`, `due == now`
-    /// entry). `cb` / `args` are persistent-handle indices ([`Ctx::persist`]).
+    /// entry). `cb` / `args` are persistent-handle indices (`Ctx::persist`).
     struct TimerEntry {
         id: u64,
         /// Virtual-clock time at which the callback becomes due.

@@ -25,7 +25,7 @@ impl<'a> Interp<'a> {
             if self.realm.is_array(self.proxy_key_target(vh)) {
                 let len_v = self.read_member(vh, "length")?;
                 let len_f = self.coerce_to_integer_or_infinity(len_v)?;
-                let len = len_f.max(0.0).min(9_007_199_254_740_991.0) as usize;
+                let len = len_f.clamp(0.0, 9_007_199_254_740_991.0) as usize;
                 for i in 0..len {
                     let ks = alloc::format!("{i}");
                     let child = match snapshot {
@@ -122,8 +122,7 @@ impl<'a> Interp<'a> {
                 let len_v = self.read_member(rh, "length")?;
                 let len = self
                     .coerce_to_integer_or_infinity(len_v)?
-                    .max(0.0)
-                    .min(9_007_199_254_740_991.0) as usize;
+                    .clamp(0.0, 9_007_199_254_740_991.0) as usize;
                 let mut list: Vec<String> = Vec::new();
                 for i in 0..len {
                     let e = self.read_member(rh, &alloc::format!("{i}"))?;

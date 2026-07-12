@@ -3146,8 +3146,7 @@ impl<'a> Interp<'a> {
             // newTarget.prototype's getter), so an over-large but valid index still
             // observes that getter's abrupt completion before the RangeError.
             if !raw.is_finite()
-                || raw < 0.0
-                || raw >= 9_007_199_254_740_992.0
+                || !(0.0..9_007_199_254_740_992.0).contains(&raw)
                 || raw != (raw as u64) as f64
             {
                 let m = self.new_str("Invalid SharedArrayBuffer length");

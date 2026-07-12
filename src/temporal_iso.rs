@@ -1395,9 +1395,11 @@ mod tests {
     fn quantize_duration_rounds_fields_to_float64() {
         // 18446744073709551 is not float64-representable; the nearest f64 integer
         // is 18446744073709552 (matching the Instant `since` float64 test262 case).
-        let mut d = DurationFields::default();
-        d.microseconds = 18_446_744_073_709_551;
-        d.nanoseconds = -616;
+        let d = DurationFields {
+            microseconds: 18_446_744_073_709_551,
+            nanoseconds: -616,
+            ..Default::default()
+        };
         let q = quantize_duration_fields(d);
         assert_eq!(q.microseconds, 18_446_744_073_709_552);
         // A value below 2^53 is already exact — quantization is a no-op.

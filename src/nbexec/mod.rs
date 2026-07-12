@@ -53,7 +53,7 @@ pub enum ExecError {
     OptShortCircuit,
     /// A **proper tail call** (strict-mode PTC): a `return f(args)` in genuine
     /// tail position hands the resolved callee/`this`/args back to the enclosing
-    /// [`Interp::invoke`] instead of calling recursively. `invoke`'s trampoline
+    /// `Interp::invoke` instead of calling recursively. `invoke`'s trampoline
     /// re-dispatches it in place, so unbounded tail recursion runs in O(1) native
     /// stack. Produced only where `self.tail_pos` holds (a strict, non-async
     /// function body, outside any `try` Block), so it never escapes the `invoke`
@@ -7482,10 +7482,9 @@ fn json_hex4(c: &[char], at: usize) -> Option<u16> {
 fn dataview_method(method: &str) -> Option<(bool, usize, bool, bool, bool)> {
     let (is_set, t) = if let Some(t) = method.strip_prefix("get") {
         (false, t)
-    } else if let Some(t) = method.strip_prefix("set") {
-        (true, t)
     } else {
-        return None;
+        let t = method.strip_prefix("set")?;
+        (true, t)
     };
     // (size, signed, is_float, is_bigint)
     let (size, signed, is_float, is_bigint) = match t {

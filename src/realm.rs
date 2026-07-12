@@ -53,7 +53,7 @@ pub(crate) const PROMISE_STATE_SLOT: &str = "\u{0}PromiseState";
 pub(crate) const TEMPORAL_SLOT: &str = "\u{0}temporal";
 
 /// The hidden internal-slot key that brands an ordinary object as an
-/// **[[IsHTMLDDA]]** exotic object (the Annex-B `document.all` value, exposed to
+/// **`[[IsHTMLDDA]]`** exotic object (the Annex-B `document.all` value, exposed to
 /// Test262 as `$262.IsHTMLDDA`). The object is otherwise an ordinary extensible
 /// object (so `defineProperty`, a `[[Prototype]]`, `instanceof`, etc. all work),
 /// but its presence makes `typeof` report `"undefined"`, `ToBoolean` report
@@ -410,7 +410,7 @@ impl Realm {
     }
 
     /// Snapshots the realm-wide intrinsic prototype pointers that
-    /// [`crate::nbexec::Interp::install_globals`] installs. Used by
+    /// `crate::nbexec::Interp::install_globals` installs. Used by
     /// `$262.createRealm` to build a second global environment on the shared heap
     /// and then restore the original realm's intrinsics, so ordinary object/array/
     /// symbol/bigint literals created afterward keep their original realm's
@@ -1481,7 +1481,7 @@ impl Realm {
     /// Allocates a branded `Temporal.*` instance. The instance is an **ordinary
     /// extensible object** so all property machinery (get/set/defineProperty/
     /// isExtensible/…) applies to it; the immutable Temporal record is stashed in
-    /// a hidden [`TEMPORAL_SLOT`] internal slot as a non-enumerable data carrier
+    /// a hidden `TEMPORAL_SLOT` internal slot as a non-enumerable data carrier
     /// ([`Cell::TemporalData`]) that is never surfaced as a value.
     pub fn new_temporal(&mut self, data: crate::temporal_iso::TemporalData) -> Handle {
         let obj = self.new_object();
@@ -1493,7 +1493,7 @@ impl Realm {
     }
 
     /// The `Temporal.*` internal-slot record, if `handle` is a Temporal instance
-    /// (i.e. an ordinary object carrying the hidden [`TEMPORAL_SLOT`] data cell).
+    /// (i.e. an ordinary object carrying the hidden `TEMPORAL_SLOT` data cell).
     #[must_use]
     pub fn temporal_at(
         &self,
@@ -3622,7 +3622,7 @@ impl Realm {
     }
 
     /// Pins `value` as a **persistent handle** and returns its slot index (see
-    /// [`host_persistent`](Self::host_persistent)). The value survives GC and stays
+    /// `host_persistent`). The value survives GC and stays
     /// valid across compaction until [`release_persistent`](Self::release_persistent).
     /// A freed slot is reused before growing the table.
     pub fn persist(&mut self, value: NanBox) -> u32 {
@@ -3652,7 +3652,7 @@ impl Realm {
     }
 
     /// Attaches opaque `state` to the object at `handle` (replacing any previous
-    /// state), keyed weakly by the handle (see [`host_native_state`](Self::host_native_state)).
+    /// state), keyed weakly by the handle (see `host_native_state`).
     pub fn set_native_state(
         &mut self,
         handle: Handle,
@@ -4580,9 +4580,9 @@ impl Realm {
         v.to_boolean()
     }
 
-    /// Whether the value at `handle` is an **[[IsHTMLDDA]]** exotic object (the
+    /// Whether the value at `handle` is an **`[[IsHTMLDDA]]`** exotic object (the
     /// Annex-B `document.all` value): an ordinary object carrying the hidden
-    /// [`HTMLDDA_SLOT`] brand. Such an object lies about `typeof` (`"undefined"`),
+    /// `HTMLDDA_SLOT` brand. Such an object lies about `typeof` (`"undefined"`),
     /// is falsy, is loosely equal to `null`/`undefined`, and is callable.
     #[must_use]
     pub fn is_html_dda(&self, handle: Handle) -> bool {

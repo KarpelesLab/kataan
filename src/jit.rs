@@ -2372,7 +2372,7 @@ pub struct SiteInfo {
 }
 
 /// The calling-convention / signature a compiled [`JitProto`] exposes to a
-/// *caller's* native code — the public mirror of the private [`JitKind`], recorded
+/// *caller's* native code — the public mirror of the private `JitKind`, recorded
 /// per callee so a JIT→JIT direct call is only ever emitted at the matching ABI (a
 /// wrong-ABI direct call would mis-dispatch). Used to build the per-tier call
 /// registries in `nbvm::ensure_jit`.
@@ -2409,7 +2409,7 @@ enum JitKind {
 /// pointer to the live interpreter context (`nbvm::Ctx`), which the helper
 /// reconstructs; the operands and result are raw `NanBox` words. On a thrown
 /// exception the helper stashes the value in the context and returns
-/// [`NanBox::jit_throw_bits`](crate::nanbox::NanBox::jit_throw_bits).
+/// `NanBox::jit_throw_bits`(crate::nanbox::NanBox::jit_throw_bits).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub type JitAddHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64) -> u64;
 
@@ -2532,7 +2532,7 @@ impl JitProto {
     /// with an empty registry (every static call routes through `jit_helper_call`).
     ///
     /// Per-property-access-site key strings and inline caches are allocated here
-    /// (in [`GenericSites`], owned by the returned `JitProto`) so their addresses
+    /// (in `GenericSites`, owned by the returned `JitProto`) so their addresses
     /// are stable; the emitted code holds raw pointers into them.
     #[must_use]
     pub fn compile_generic(proto: &crate::nbvm::FnProto, helpers: &GenericHelpers) -> Option<Self> {
@@ -2650,7 +2650,7 @@ impl JitProto {
     /// Invokes a generic-tier body with the live context `ctx` (an opaque pointer
     /// the runtime helpers reconstruct) and `NanBox` arguments. Returns the raw
     /// result word, or `None` on an arity mismatch (a pre-call deopt). The word is
-    /// either a `NanBox`'s bits or [`NanBox::jit_throw_bits`] — the caller
+    /// either a `NanBox`'s bits or `NanBox::jit_throw_bits` — the caller
     /// interprets the sentinel (see `nbvm::call_generic`).
     ///
     /// # Safety
@@ -4182,7 +4182,7 @@ impl JitFunction {
     /// `Not`/`JumpIfFalse` inline a number/boolean truthiness test with a
     /// `jit_helper_truthy` fallback. Control flow (`Jump`/`JumpIfFalse`, forward
     /// and backward) uses one label per op. A helper that throws returns the
-    /// [`NanBox::jit_throw_bits`] sentinel, on which this jumps to an epilogue that
+    /// `NanBox::jit_throw_bits` sentinel, on which this jumps to an epilogue that
     /// returns the sentinel unchanged so the caller reads `ctx.jit_pending`.
     /// Returns `None` on the unavailable target or a malformed program.
     #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]

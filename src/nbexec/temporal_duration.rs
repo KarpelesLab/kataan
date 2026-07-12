@@ -2546,7 +2546,7 @@ mod relative_tests {
         let combined = alloc::format!("{prelude}{src}");
         match crate::nbvm::execute_typed(&combined, crate::limits::Limits::default()) {
             Ok((out, _)) => Ok(out),
-            Err(t) => Err(alloc::string::String::from(t.name)),
+            Err(t) => Err(t.name),
         }
     }
 
