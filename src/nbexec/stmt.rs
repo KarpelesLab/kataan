@@ -392,7 +392,17 @@ impl<'a> Interp<'a> {
                 // Only a plain call reuses the frame. A method / `super` call binds
                 // a receiver, and a spread needs iteration → leave those to the
                 // ordinary call path (still correct, just not PTC).
-                let simple = !matches!(&**callee, Expr::Member { .. } | Expr::Super(_))
+                // Dynamic `import(specifier)` is desugared to a call of the bare
+                // `import` reference and intercepted in the ordinary `Expr::Call`
+                // path (`import` is not a real binding, so evaluating the callee
+                // here would throw "import is not defined"). It is not a tail call —
+                // hand it back to the ordinary path so the interception fires. (This
+                // arm is only reached in strict functions, where `tail_pos` is armed;
+                // sloppy dynamic import inside a function already routes here.)
+                let is_dynamic_import =
+                    matches!(&**callee, Expr::Ident(id) if &*id.name == "import");
+                let simple = !is_dynamic_import
+                    && !matches!(&**callee, Expr::Member { .. } | Expr::Super(_))
                     && arguments
                         .iter()
                         .all(|a| matches!(a, crate::ast::Argument::Item(_)));
