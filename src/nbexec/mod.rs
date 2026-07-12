@@ -5715,6 +5715,18 @@ impl<'a> Interp<'a> {
     }
 
     fn run_eval_body_inner(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
+        // GlobalDeclarationInstantiation for a *Script* (`$262.evalScript` /
+        // `createRealm().evalScript`) running directly in the global environment
+        // (sloppy scripts only; a strict script declares into a discarded child
+        // env). Rejects — before any binding is created — a lexical decl that
+        // collides with an existing global var/lexical/restricted-global, a
+        // var/function decl that collides with a global lexical, and a
+        // var/function the global object refuses to define. An indirect/direct
+        // `eval` (which runs its own EvalDeclarationInstantiation before this)
+        // has `script_eval_globals` false and is unaffected.
+        if self.script_eval_globals && self.var_scope.ptr_eq(&self.global_scope) {
+            self.global_declaration_checks(program)?;
+        }
         self.hoist_with_kind(&program.body, true, true)?;
         let mut last = NanBox::undefined();
         for stmt in &program.body {
@@ -5811,6 +5823,24 @@ impl<'a> Interp<'a> {
         let mut lex = Some(lex_env.clone());
         while let Some(env) = lex {
             if env.ptr_eq(var_env) {
+                // Reached the variable environment. In the spec the function
+                // body's lexical Environment Record is a *distinct* child of the
+                // variable environment; this engine merges them into one frame, so
+                // a top-level `let`/`const`/`class` of the body lives here rather
+                // than in a separate frame the walk above would have visited.
+                // Reject a `var`/function whose name collides with one (the global
+                // case is handled separately below via the own-property check, so
+                // skip the global frame here).
+                if !env.ptr_eq(&self.global_scope) {
+                    for name in &all_var_names {
+                        if env.has_lexical(name) {
+                            let m = self.new_str(&alloc::format!(
+                                "Identifier '{name}' has already been declared"
+                            ));
+                            return Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))));
+                        }
+                    }
+                }
                 break;
             }
             // A `catch (param)` frame is exempt: Annex B.3.4 permits a sloppy
@@ -5847,6 +5877,94 @@ impl<'a> Interp<'a> {
         }
         // CanDeclareGlobalFunction for each function name, then CanDeclareGlobalVar
         // for each pure `var` name — all validated before any is created.
+        for name in fn_names.iter().chain(block_fns.iter()) {
+            if !self.can_declare_global_function(g, name) {
+                let m = self.new_str(&alloc::format!("Cannot declare global function '{name}'"));
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+        }
+        for name in &var_names {
+            if !self.can_declare_global_var(g, name) {
+                let m = self.new_str(&alloc::format!("Cannot declare global variable '{name}'"));
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+        }
+        Ok(())
+    }
+
+    /// GlobalDeclarationInstantiation static validation for a *Script* running in
+    /// the global environment (an `$262.evalScript` body). Runs BEFORE any binding
+    /// is created, so a rejected declaration leaves the global environment
+    /// untouched (the test's "no bindings created" assertions).
+    ///
+    /// Throws:
+    /// - **SyntaxError** when a lexical (`let`/`const`/`class`) name collides with
+    ///   an existing global lexical binding, a global var/function binding, or a
+    ///   restricted (non-configurable) global property; or when a `var`/function
+    ///   name collides with an existing global lexical binding.
+    /// - **TypeError** when a function name fails CanDeclareGlobalFunction or a
+    ///   `var` name fails CanDeclareGlobalVar (non-extensible / non-configurable
+    ///   colliding global property).
+    fn global_declaration_checks(&mut self, program: &Program) -> Result<(), ExecError> {
+        let Some(g) = self.global_this.as_handle().map(Handle::from_raw) else {
+            return Ok(());
+        };
+
+        let mut lex_names: Vec<&str> = Vec::new();
+        collect_lexical_names(&program.body, &mut lex_names);
+
+        let mut var_names: Vec<&str> = Vec::new();
+        collect_var_names(&program.body, &mut var_names);
+        let mut fn_names: Vec<&str> = Vec::new();
+        for stmt in &program.body {
+            let stmt = unwrap_exported_function(stmt);
+            if let Stmt::Function(func) = stmt
+                && let Some(id) = &func.id
+            {
+                fn_names.push(&id.name);
+            }
+        }
+        let mut block_fns: Vec<&str> = Vec::new();
+        collect_block_function_names(&program.body, &mut block_fns);
+
+        // A global lexical binding lives in the global scope frame but, unlike a
+        // `var`/function, is not an own property of the global object.
+        let has_global_lexical = |g: Handle, name: &str, this: &Self| {
+            this.global_scope.has_local(name) && !this.realm.has_own(g, name)
+        };
+
+        let syntax_err = |this: &mut Self, name: &str| {
+            let m = this.new_str(&alloc::format!(
+                "Identifier '{name}' has already been declared"
+            ));
+            ExecError::Throw(this.make_error(N_SYNTAX_ERROR, Some(m)))
+        };
+
+        // Lexical names: reject a collision with a global lexical (HasLexicalDeclaration),
+        // or with a global var/function or restricted global — both of which appear
+        // as a *non-configurable* own property of the global object
+        // (HasVarDeclaration / HasRestrictedGlobalProperty).
+        for name in &lex_names {
+            if has_global_lexical(g, name, self)
+                || (self.realm.has_own(g, name) && self.realm.property_is_non_configurable(g, name))
+            {
+                return Err(syntax_err(self, name));
+            }
+        }
+
+        // Var/function names must not collide with a global lexical binding.
+        for name in var_names
+            .iter()
+            .chain(fn_names.iter())
+            .chain(block_fns.iter())
+        {
+            if has_global_lexical(g, name, self) {
+                return Err(syntax_err(self, name));
+            }
+        }
+
+        // CanDeclareGlobalFunction / CanDeclareGlobalVar — validated before any
+        // binding is created.
         for name in fn_names.iter().chain(block_fns.iter()) {
             if !self.can_declare_global_function(g, name) {
                 let m = self.new_str(&alloc::format!("Cannot declare global function '{name}'"));
@@ -6285,6 +6403,21 @@ impl<'a> Interp<'a> {
                         self.realm.set_non_configurable_property(g, name);
                     }
                 }
+            }
+            // Record this body's top-level lexical (`let`/`const`/`class`) names on
+            // the (shared) variable-environment frame. In the spec a non-strict
+            // function body keeps a lexical Environment Record distinct from its
+            // variable Environment Record; this engine merges them into one frame,
+            // so the recorded set is what EvalDeclarationInstantiation consults to
+            // reject a sloppy direct `eval("var x")` that collides with a top-level
+            // `let`/`const`/`class` of the enclosing body. Marked on `self.current`
+            // (where those declarations bind: the function body scope, or an eval's
+            // fresh lexical env), not on `var_scope` (which, for an eval, is the
+            // outer variable environment).
+            let mut lex_names: Vec<&str> = Vec::new();
+            collect_lexical_names(stmts, &mut lex_names);
+            for name in lex_names {
+                self.current.mark_lexical(name);
             }
         }
         for stmt in stmts {

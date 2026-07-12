@@ -72,6 +72,16 @@ struct ScopeData {
     /// nearest module frame (`Scope::module_imports`). `None` on ordinary frames.
     #[allow(clippy::type_complexity)]
     module_imports: Option<Rc<BTreeMap<String, (Scope, String)>>>,
+    /// Names declared *lexically* (`let`/`const`/`class`) at the top level of the
+    /// function/eval/program body whose variable environment this frame is. In
+    /// this engine a function body's lexical environment and variable environment
+    /// share a single frame; this set records which of the frame's names came from
+    /// a top-level lexical declaration (as opposed to a `var`, parameter or
+    /// hoisted function). It is read only by EvalDeclarationInstantiation, so a
+    /// sloppy direct `eval("var x")` can reject a `var` that collides with a
+    /// like-named top-level `let`/`const`/`class` (which the spec keeps in a
+    /// distinct lexical Environment Record). `None` on frames that carry none.
+    lexical: Option<alloc::collections::BTreeSet<String>>,
 }
 
 impl Scope {
@@ -88,6 +98,7 @@ impl Scope {
             catch_scope: false,
             with_obj: None,
             module_imports: None,
+            lexical: None,
         })))
     }
 
@@ -104,6 +115,7 @@ impl Scope {
             catch_scope: false,
             with_obj: None,
             module_imports: None,
+            lexical: None,
         })))
     }
 
@@ -131,6 +143,28 @@ impl Scope {
     #[must_use]
     pub fn is_catch(&self) -> bool {
         self.0.borrow().catch_scope
+    }
+
+    /// Records `name` as a top-level *lexical* (`let`/`const`/`class`) declaration
+    /// of the body whose variable environment this frame is. Read only by
+    /// EvalDeclarationInstantiation (see the `lexical` field).
+    pub fn mark_lexical(&self, name: &str) {
+        self.0
+            .borrow_mut()
+            .lexical
+            .get_or_insert_with(alloc::collections::BTreeSet::new)
+            .insert(String::from(name));
+    }
+
+    /// Whether `name` was recorded as a top-level lexical declaration of this
+    /// frame's body (see [`Scope::mark_lexical`]).
+    #[must_use]
+    pub fn has_lexical(&self, name: &str) -> bool {
+        self.0
+            .borrow()
+            .lexical
+            .as_ref()
+            .is_some_and(|l| l.contains(name))
     }
 
     /// Declares `name` in *this* frame as a *deletable* binding (a sloppy `eval`'s
