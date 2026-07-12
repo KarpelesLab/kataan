@@ -4309,6 +4309,48 @@ fn cross_realm_generator_function_is_distinct() {
 }
 
 #[test]
+fn cross_realm_created_realm_iterator_proto_chains_own_object_proto() {
+    // A created realm's `%IteratorPrototype%` inherits *that realm's*
+    // `Object.prototype`, not the parent realm's (regression: `new_object()` in
+    // `install_globals` picked up the previous realm's `default_object_proto`).
+    assert_eq!(
+        run262(
+            "var other = $262.createRealm().global;\
+             Object.getPrototypeOf(other.Iterator.prototype) === other.Object.prototype"
+        ),
+        "true",
+    );
+    // …and it is NOT the main realm's `Object.prototype`.
+    assert_eq!(
+        run262(
+            "var other = $262.createRealm().global;\
+             Object.getPrototypeOf(other.Iterator.prototype) === Object.prototype"
+        ),
+        "false",
+    );
+}
+
+#[test]
+fn cross_realm_dynamic_generator_prototype_and_body_realm() {
+    // `Reflect.construct(otherRealm.GeneratorFunction, [body], newTarget)`: the
+    // created function's `.prototype` object inherits the *constructor* realm's
+    // `%GeneratorPrototype%`, and its body reads the constructor realm's globals.
+    let src = "var A = $262.createRealm().global;\
+         A.calls = 0;\
+         var AGF = A.eval('(0, function*(){})').constructor;\
+         var aGenProto = Object.getPrototypeOf(A.eval('(0, function*(){})').prototype);\
+         var B = $262.createRealm().global;\
+         var nt = new B.Function(); nt.prototype = null;\
+         var fn = Reflect.construct(AGF, ['calls += 1;'], nt);\
+         var protoOk = Object.getPrototypeOf(fn.prototype) === aGenProto;\
+         var g = fn();\
+         var instOk = g instanceof A.Object;\
+         g.next();\
+         protoOk && instOk && A.calls === 1";
+    assert_eq!(run262(src), "true");
+}
+
+#[test]
 fn cross_realm_new_non_constructor_throws_current_realm_type_error() {
     // `new otherRealm.parseInt(0)` (a non-constructor) throws the *current* realm's
     // TypeError — the "not a constructor" check precedes any [[Construct]].

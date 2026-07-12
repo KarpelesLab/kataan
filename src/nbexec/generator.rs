@@ -670,6 +670,15 @@ impl<'a> Interp<'a> {
         // { w:false,e:false,c:false }; the prototype's `constructor` points back
         // { w:false,e:false,c:true }.
         let gf = self.realm.new_native(N_GENERATOR_FUNCTION_CTOR);
+        // `GetFunctionRealm` tagging: a `%GeneratorFunction%` built lazily while
+        // running inside a `$262.createRealm()` realm belongs to *that* realm — so a
+        // cross-realm `Reflect.construct(otherRealm.GeneratorFunction, …)` enters the
+        // constructor's realm, giving the created function's `.prototype` object and
+        // body that realm's `%GeneratorPrototype%` / globals (CreateDynamicFunction
+        // step 19 `realmF`). Untagged (main realm) leaves the fast path untouched.
+        if let Some(idx) = self.cur_realm {
+            self.fn_realm.insert(gf.to_raw(), idx);
+        }
         self.install_fn_name_length(gf, "GeneratorFunction", 1);
         self.realm
             .set_property(gf, "prototype", NanBox::handle(gfp.to_raw()));
@@ -736,6 +745,11 @@ impl<'a> Interp<'a> {
         // `asyncFn.constructor.prototype[@@toStringTag]` targets THIS prototype
         // (the `Object.prototype.toString` tag), not `%Function.prototype%`.
         let af = self.realm.new_native(N_ASYNC_FUNCTION_CTOR);
+        // `GetFunctionRealm` tagging (see `%GeneratorFunction%`): a lazily-built
+        // `%AsyncFunction%` belongs to the realm it was built in.
+        if let Some(idx) = self.cur_realm {
+            self.fn_realm.insert(af.to_raw(), idx);
+        }
         self.install_fn_name_length(af, "AsyncFunction", 1);
         self.realm
             .set_property(af, "prototype", NanBox::handle(afp.to_raw()));
@@ -886,6 +900,11 @@ impl<'a> Interp<'a> {
         // `%AsyncGeneratorFunction%` — the constructor, reachable as
         // `Object.getPrototypeOf(async function*(){}).constructor`.
         let agf = self.realm.new_native(N_ASYNC_GENERATOR_FUNCTION_CTOR);
+        // `GetFunctionRealm` tagging (see `%GeneratorFunction%`): a lazily-built
+        // `%AsyncGeneratorFunction%` belongs to the realm it was built in.
+        if let Some(idx) = self.cur_realm {
+            self.fn_realm.insert(agf.to_raw(), idx);
+        }
         self.install_fn_name_length(agf, "AsyncGeneratorFunction", 1);
         self.realm
             .set_property(agf, "prototype", NanBox::handle(agfp.to_raw()));
@@ -1369,6 +1388,14 @@ impl<'a> Interp<'a> {
                 f.strict,
             )
         };
+        // Enter the generator's realm (derived from its captured scope's root): a
+        // generator created in a `$262.createRealm()` realm — e.g. one built by a
+        // cross-realm `GeneratorFunction` constructor — must resolve globals (a
+        // sloppy undeclared read/write, `globalThis`, error intrinsics) against
+        // *that* realm's global object, not the ambient one. `None` (main realm)
+        // is the untouched fast path.
+        let gen_realm = self.realm_of_scope(&scope);
+        let realm_guard = self.enter_realm(gen_realm);
         let saved_scope = core::mem::replace(&mut self.current, scope);
         let saved_this = core::mem::replace(&mut self.this_val, this_val);
         let saved_target = core::mem::replace(&mut self.new_target, new_target);
@@ -1389,6 +1416,7 @@ impl<'a> Interp<'a> {
         } else {
             self.current = saved_scope;
         }
+        self.leave_realm(realm_guard);
         self.this_val = saved_this;
         self.new_target = saved_target;
         self.current_home = saved_home;

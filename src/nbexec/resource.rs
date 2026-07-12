@@ -1250,27 +1250,105 @@ impl<'a> Interp<'a> {
                 // throw, not reject): ToString(specifier) — which may run a user
                 // `toString`/`valueOf` and throw — then a TypeError if `exportName`
                 // is not a String.
-                let _specifier = self.coerce_to_string(arg(0))?;
+                let specifier = self.coerce_to_string(arg(0))?;
                 let export_name = arg(1);
-                if export_name
+                let export_str = export_name
                     .as_handle()
                     .map(Handle::from_raw)
-                    .is_none_or(|h| self.realm.string_value(h).is_none())
-                {
+                    .and_then(|h| self.realm.string_value(h));
+                let Some(export_str) = export_str else {
                     return Err(
                         self.type_error("ShadowRealm importValue exportName must be a string")
                     );
-                }
-                // Modules are unsupported: return a rejected promise (the
-                // constructor + `evaluate` are the conformance focus).
-                let p = self.fresh_promise();
-                let m = self.new_str("ShadowRealm.prototype.importValue is not supported");
-                let err = self.make_error(N_TYPE_ERROR, Some(m));
-                self.settle(p, err, false);
-                Ok(NanBox::handle(p.to_raw()))
+                };
+                self.shadow_realm_import_value(realm_obj, &specifier, &export_str)
             }
             _ => Err(self.type_error("unknown ShadowRealm method")),
         }
+    }
+
+    /// `ShadowRealm.prototype.importValue(specifier, exportName)` — dynamic-imports
+    /// `specifier` INTO the shadow realm, and returns a promise resolved with the
+    /// named export's value **wrapped into the caller realm** (GetWrappedValue: a
+    /// primitive passes through, a callable becomes a caller-realm function
+    /// wrapper, any other object is a TypeError). Any resolve / load / link /
+    /// evaluate failure — or a missing export — rejects the promise with a
+    /// *caller-realm* TypeError (the tests check `Object.getPrototypeOf(err) ===
+    /// TypeError.prototype`), never the shadow realm's inner error object.
+    #[cfg(all(feature = "module", feature = "std"))]
+    fn shadow_realm_import_value(
+        &mut self,
+        realm_obj: Option<Handle>,
+        specifier: &str,
+        export_name: &str,
+    ) -> Result<NanBox, ExecError> {
+        let caller_realm = self.cur_realm;
+        let promise = self.fresh_promise();
+        // The instance's genuinely-distinct realm environment index.
+        let realm_idx = realm_obj
+            .and_then(|h| self.realm.get_property(h, SHADOWREALM_SCOPE_IDX))
+            .and_then(|v| v.as_number())
+            .map(|n| n as usize)
+            .filter(|i| *i < self.created_realms.len());
+        let Some(realm_idx) = realm_idx else {
+            let m = self.new_str("ShadowRealm has no associated realm");
+            let err = self.make_error(N_TYPE_ERROR, Some(m));
+            self.settle(promise, err, false);
+            return Ok(NanBox::handle(promise.to_raw()));
+        };
+        // Resolve the specifier relative to the importing (caller-realm) module —
+        // captured now, before the realm swap, so a Test262 sibling fixture is
+        // found next to the test file.
+        let referrer = self.current_module_key();
+        let outcome =
+            self.shadow_realm_import(realm_idx, specifier, referrer.as_deref(), export_name);
+        match outcome {
+            Ok(value) => {
+                // GetWrappedValue(callerRealm, value).
+                if !self.is_object_value(value) {
+                    self.settle(promise, value, true);
+                } else if self.is_callable_value(value) {
+                    match self.make_wrapped_function(value, caller_realm) {
+                        Ok(w) => self.settle(promise, w, true),
+                        Err(_) => {
+                            let m = self
+                                .new_str("ShadowRealm importValue wrapped value creation threw");
+                            let err = self.make_error(N_TYPE_ERROR, Some(m));
+                            self.settle(promise, err, false);
+                        }
+                    }
+                } else {
+                    let m = self
+                        .new_str("ShadowRealm importValue export is not a primitive or callable");
+                    let err = self.make_error(N_TYPE_ERROR, Some(m));
+                    self.settle(promise, err, false);
+                }
+            }
+            // Any failure crossing the boundary rejects with a *caller-realm*
+            // TypeError (discard the shadow realm's inner error value).
+            Err(_) => {
+                let m = self.new_str("ShadowRealm importValue failed");
+                let err = self.make_error(N_TYPE_ERROR, Some(m));
+                self.settle(promise, err, false);
+            }
+        }
+        Ok(NanBox::handle(promise.to_raw()))
+    }
+
+    /// Fallback when the module subsystem is not built (no `module`/`std`):
+    /// `importValue` cannot load a module, so it returns a rejected promise.
+    #[cfg(not(all(feature = "module", feature = "std")))]
+    fn shadow_realm_import_value(
+        &mut self,
+        _realm_obj: Option<Handle>,
+        _specifier: &str,
+        _export_name: &str,
+    ) -> Result<NanBox, ExecError> {
+        let promise = self.fresh_promise();
+        let m = self.new_str("ShadowRealm.prototype.importValue is not supported");
+        let err = self.make_error(N_TYPE_ERROR, Some(m));
+        self.settle(promise, err, false);
+        Ok(NanBox::handle(promise.to_raw()))
     }
 
     /// `ShadowRealm.prototype.evaluate(sourceText)` — `sourceText` must be a

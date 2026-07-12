@@ -5174,13 +5174,18 @@ impl<'a> Interp<'a> {
         }
         // Newly-created plain objects now inherit from `Object.prototype`.
         self.realm.set_default_object_proto(obj_proto);
-        // `%IteratorPrototype%` was created before `Object.prototype` existed, so
-        // its `[[Prototype]]` was left null. Per spec it is `%Object.prototype%`
-        // (25.1.2.1) — link it now so every iterator (array/string/map/set/regexp/
-        // generator, and any object inheriting `%IteratorPrototype%`) inherits
-        // `toString`/`valueOf`. Without this, ToPrimitive on an iterator (e.g. a
-        // generator object used as a computed property key) throws "Cannot convert
-        // object to primitive value" instead of yielding "[object <Tag>]".
+        // `%IteratorPrototype%` was created before *this realm's* `Object.prototype`
+        // existed, so its `[[Prototype]]` is either null (main realm) or — in a
+        // `$262.createRealm()` realm built while `default_object_proto` still points
+        // at the *previous* realm — that other realm's `Object.prototype`. Per spec
+        // it is *this* realm's `%Object.prototype%` (25.1.2.1) — link it now
+        // (unconditionally, so a created realm's iterator chain does not leak the
+        // parent realm's `Object.prototype`) so every iterator (array/string/map/set/
+        // regexp/generator, and any object inheriting `%IteratorPrototype%`) inherits
+        // this realm's `toString`/`valueOf`. Without this, ToPrimitive on an iterator
+        // (e.g. a generator object used as a computed property key) throws "Cannot
+        // convert object to primitive value" instead of yielding "[object <Tag>]",
+        // and a cross-realm `iter instanceof otherRealm.Object` is wrong.
         if let Some(iter_proto) = self
             .current
             .get("Iterator")
@@ -5189,7 +5194,6 @@ impl<'a> Interp<'a> {
             .and_then(|c| self.realm.get_property(c, "prototype"))
             .and_then(|p| p.as_handle())
             .map(Handle::from_raw)
-            && self.realm.object_proto(iter_proto).is_none()
         {
             self.realm.set_object_proto(iter_proto, Some(obj_proto));
         }

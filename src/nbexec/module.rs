@@ -1919,6 +1919,100 @@ impl<'a> Interp<'a> {
         Ok(NanBox::handle(promise.to_raw()))
     }
 
+    /// `ShadowRealm.prototype.importValue` loading primitive: imports `specifier`
+    /// **into** the ShadowRealm at `realm_idx` (its global scope + `globalThis` +
+    /// intrinsics swapped in for the whole load / link / evaluate, so the module
+    /// runs genuinely isolated in that realm), then returns the raw value of its
+    /// `export_name` export. The specifier resolves relative to `referrer` (the
+    /// importing module — a sibling fixture in the Test262 harness). A resolve /
+    /// load (parse) / link / evaluate failure, or a missing export, is an
+    /// `ExecError`; the caller (`shadow_realm_dispatch`) turns it into a
+    /// caller-realm `TypeError` rejection per the ShadowRealm spec.
+    pub(crate) fn shadow_realm_import(
+        &mut self,
+        realm_idx: usize,
+        specifier: &str,
+        referrer: Option<&str>,
+        export_name: &str,
+    ) -> Result<NanBox, ExecError> {
+        let host = FileModuleHost;
+        let dep = host
+            .resolve(specifier, referrer)
+            .map_err(|e| self.type_error(&e))?;
+        let dep = module_map_key(&dep, None);
+
+        // Swap the ShadowRealm's environment in for the duration (mirrors
+        // `shadow_realm_run_program`), so the imported module's own scope roots at
+        // *that* realm's global scope and its `[]`/`{}`/error intrinsics come from
+        // it. Restored unconditionally afterward.
+        let scope = self.created_realms[realm_idx].global_scope.clone();
+        let global_this = self.created_realms[realm_idx].global_this;
+        let intrinsics = self.created_realms[realm_idx].intrinsics;
+        let saved_current = self.current.clone();
+        let saved_global_scope = self.global_scope.clone();
+        let saved_var_scope = self.var_scope.clone();
+        let saved_global_this = self.global_this;
+        let saved_this = self.this_val;
+        let saved_new_target = self.new_target;
+        let saved_strict = self.strict;
+        let saved_realm = self.cur_realm;
+        let saved_intrinsics = self.realm.intrinsics_snapshot();
+        let child_intl = core::mem::take(&mut self.created_realms[realm_idx].intl_protos);
+        self.current = scope.clone();
+        self.global_scope = scope.clone();
+        self.var_scope = scope;
+        self.global_this = global_this;
+        self.this_val = NanBox::undefined();
+        self.new_target = NanBox::undefined();
+        self.strict = true;
+        self.cur_realm = Some(realm_idx);
+        self.realm.restore_intrinsics(intrinsics);
+        let saved_intl = self.realm.replace_intl_protos(child_intl);
+
+        let outcome = (|this: &mut Self| -> Result<NanBox, ExecError> {
+            // Load is the parse/resolution phase (a SyntaxError in the fixture
+            // surfaces here); link wires imports; evaluate runs the body (a
+            // top-level-await body blocks to settlement inside `run_module_body`).
+            this.load_module(&dep, &host, None)?;
+            this.link_module(&dep)?;
+            this.evaluate_module(&dep)?;
+            let ns = this.namespace_object(&dep)?;
+            let ns_h = ns
+                .as_handle()
+                .map(crate::heap::Handle::from_raw)
+                .ok_or_else(|| this.type_error("module namespace is not an object"))?;
+            // The export must exist as an own property of the namespace, else a
+            // TypeError (importValue rejects for a non-existent export name).
+            let has = this
+                .realm
+                .own_property_names(ns_h)
+                .unwrap_or_default()
+                .iter()
+                .any(|k| k == export_name);
+            if !has {
+                return Err(this.type_error(&alloc::format!(
+                    "module has no export named '{export_name}'"
+                )));
+            }
+            Ok(this
+                .realm
+                .get_property(ns_h, export_name)
+                .unwrap_or_else(NanBox::undefined))
+        })(self);
+
+        self.created_realms[realm_idx].intl_protos = self.realm.replace_intl_protos(saved_intl);
+        self.current = saved_current;
+        self.global_scope = saved_global_scope;
+        self.var_scope = saved_var_scope;
+        self.global_this = saved_global_this;
+        self.this_val = saved_this;
+        self.new_target = saved_new_target;
+        self.strict = saved_strict;
+        self.cur_realm = saved_realm;
+        self.realm.restore_intrinsics(saved_intrinsics);
+        outcome
+    }
+
     /// Processes a dynamic `import(specifier, options)` second argument per the
     /// `ImportCall` runtime semantics (import-attributes): validates `options`
     /// is an Object (or absent/undefined), reads its `with` attributes object,
@@ -1989,7 +2083,7 @@ impl<'a> Interp<'a> {
     /// The key of the module whose body is currently running, found by matching
     /// the active scope against each record's scope. Falls back to the script
     /// import base (so a script's `import()` resolves relative to its file).
-    fn current_module_key(&self) -> Option<String> {
+    pub(crate) fn current_module_key(&self) -> Option<String> {
         self.modules
             .records
             .values()
