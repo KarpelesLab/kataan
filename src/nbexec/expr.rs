@@ -1591,6 +1591,34 @@ impl<'a> Interp<'a> {
                 {
                     return Ok(self.make_live_typed_iterator(h, 1));
                 }
+                // A real array yields a **live** `%ArrayIterator%` (each `next()`
+                // re-reads `length` and `Get`s the element at the cursor, so a
+                // `push`/length change after `[Symbol.iterator]()` is observed —
+                // `CreateArrayIterator`).
+                if let Some(h) = recv.as_handle().map(Handle::from_raw)
+                    && (self.realm.array_elements(h).is_some() || self.realm.is_array(h))
+                {
+                    return Ok(self.make_live_array_iterator(h, 1));
+                }
+                // A generic array-like object whose `@@iterator` is the intrinsic
+                // `%Array.prototype.values%` (e.g. an `arguments` exotic object)
+                // also iterates **live** over its `length` property.
+                if let Some(h) = recv.as_handle().map(Handle::from_raw)
+                    && self.realm.get_property(h, "length").is_some()
+                {
+                    let iter_key = self.member_key(iter_sym);
+                    let own_iter = self.realm.get_property(h, &iter_key);
+                    let arr_values = self
+                        .realm
+                        .array_proto_intrinsic()
+                        .and_then(|p| self.realm.get_property(p, "values"));
+                    if let (Some(oi), Some(av)) = (own_iter, arr_values)
+                        && oi.as_handle().is_some()
+                        && oi.as_handle() == av.as_handle()
+                    {
+                        return Ok(self.make_live_array_iterator(h, 1));
+                    }
+                }
                 // A non-weak Map/Set yields a **live** iterator (a Set
                 // over its values, a Map over its entries), so
                 // `s[Symbol.iterator]()` observes mutation mid-iteration.
@@ -2239,6 +2267,16 @@ impl<'a> Interp<'a> {
             // on the *Receiver* (OrdinarySetWithOwnDescriptor).
             let mut cur = Some(handle);
             while let Some(c) = cur {
+                // A **proxy** reached while walking the prototype chain: its own
+                // `[[Set]]` internal method takes over (OrdinarySetWithOwnDescriptor
+                // delegates to `parent.[[Set]](P, V, Receiver)` when the property is
+                // absent on the descendant). This fires the proxy's `set` trap (or
+                // forwards to its target, possibly another proxy) with the ORIGINAL
+                // Receiver preserved. `handle` itself is never a proxy here (that case
+                // takes the trap path below), so this only triggers for an ancestor.
+                if self.realm.proxy_at(c).is_some() {
+                    return self.proxy_set_bool(c, key, value, receiver);
+                }
                 // Integer-indexed exotic `[[Set]]` (10.4.5.5): a canonical numeric
                 // index on a **TypedArray** reached in the chain is governed by that
                 // view's bounds and NEVER consults an inherited setter/data property
@@ -4414,6 +4452,28 @@ impl<'a> Interp<'a> {
                 if let Some(i) = k.as_number().and_then(as_index)
                     && self.realm.is_array(handle)
                 {
+                    // OrdinarySet: when the index has no own property, honor an
+                    // inherited index setter reached through the prototype chain
+                    // (e.g. `Array.prototype[1]`'s setter, for a `for (arr[1] in …)`
+                    // / `[arr[1]] = …` target) before the dense write. Guarded like
+                    // `assign_member_value` so a pristine `%Array.prototype%` chain
+                    // keeps the fast path.
+                    let absent_own = self
+                        .realm
+                        .array_length(handle)
+                        .is_none_or(|len| i >= len || self.realm.get_element(handle, i).is_hole());
+                    if absent_own
+                        && (self.realm.object_proto(handle) != self.realm.array_proto_intrinsic()
+                            || self.realm.proto_index_accessor_dirty())
+                        && self
+                            .realm
+                            .accessor(handle, &alloc::format!("{i}"))
+                            .is_none()
+                        && let Some(()) =
+                            self.set_through_proto_chain(handle, &alloc::format!("{i}"), new)?
+                    {
+                        return Ok(());
+                    }
                     self.store_array_index(handle, i, new)?;
                 } else {
                     let name = self.coerce_property_key(k)?;

@@ -4,10 +4,26 @@ use super::*;
 /// object/key (for a member), super-property name, or the identifier target
 /// expression. Lets the target be resolved *before* the iterator step, then
 /// assigned once the element value is known (spec evaluation order).
-enum AssignRef {
+enum AssignRef<'a> {
     Ident(String),
-    Member { obj: NanBox, key: String },
+    Member { obj: NanBox, key: AssignKey<'a> },
     Super { name: String },
+}
+
+/// The property key of a pre-evaluated member assignment reference. A computed
+/// key's `ToPropertyKey` (its `ToPrimitive`/`toString`) is *deferred* to the
+/// `PutValue` (i.e. [`set_assign_ref`]), matching the spec order for a
+/// destructuring target: the reference is evaluated (base + key expression)
+/// before the source value is obtained, but the key coercion runs only at the
+/// final store.
+enum AssignKey<'a> {
+    /// A static key with no observable coercion side effect (ident/string/number
+    /// or a private name). The original `PropertyKey` is retained so the store
+    /// goes through the full `assign_member` path — preserving private-field
+    /// brand checks, `__proto__`/`lastIndex` magic, and class-static handling.
+    Ready(&'a PropertyKey),
+    /// A computed key value awaiting `ToPropertyKey` at store time.
+    Deferred(NanBox),
 }
 
 impl<'a> Interp<'a> {
@@ -287,15 +303,17 @@ impl<'a> Interp<'a> {
                 }
                 // A proxy with an `ownKeys` trap enumerates through it; otherwise
                 // the normal own + inherited enumerable key walk.
-                let keys = if let Some(raw) = obj.as_handle()
+                let (keys, enum_obj) = if let Some(raw) = obj.as_handle()
                     && let Some(trap_keys) =
                         self.proxy_own_enumerable_keys(Handle::from_raw(raw))?
                 {
-                    trap_keys.iter().map(|k| self.new_str(k)).collect()
+                    // A proxy's `ownKeys` trap owns the enumeration; its key set is
+                    // taken as-is (no post-hoc deletion re-check against the proxy).
+                    (trap_keys.iter().map(|k| self.new_str(k)).collect(), None)
                 } else {
-                    self.iterate_keys(obj)
+                    (self.iterate_keys(obj), Some(obj))
                 };
-                self.exec_for_each(left, body, keys)
+                self.exec_for_each_enum(left, body, keys, enum_obj)
             }
             Stmt::Switch {
                 discriminant,
@@ -973,10 +991,35 @@ impl<'a> Interp<'a> {
         body: &'a Stmt,
         items: Vec<NanBox>,
     ) -> Result<Flow, ExecError> {
+        self.exec_for_each_enum(left, body, items, None)
+    }
+
+    /// Like [`Self::exec_for_each`], but for `for-in` the enumerated `enum_obj` is
+    /// threaded so a property **deleted during enumeration** — before it is
+    /// visited — is skipped (EnumerateObjectProperties returns an iterator that
+    /// only surfaces properties still present). `for-of` passes `None`.
+    pub(crate) fn exec_for_each_enum(
+        &mut self,
+        left: &'a crate::ast::ForLeft,
+        body: &'a Stmt,
+        items: Vec<NanBox>,
+        enum_obj: Option<NanBox>,
+    ) -> Result<Flow, ExecError> {
         use crate::ast::ForLeft;
         let label = self.pending_label.take();
         let mut v = NanBox::undefined();
         for item in items {
+            // `for-in`: skip a key whose property has been deleted since the key
+            // set was captured (and not yet re-added). A same-named property still
+            // reachable on the prototype chain keeps the key live.
+            if let Some(eo) = enum_obj
+                && let Some(raw) = eo.as_handle()
+            {
+                let key = self.member_key(item);
+                if !self.has_property(Handle::from_raw(raw), &key) {
+                    continue;
+                }
+            }
             let child = self.current.child();
             let saved = core::mem::replace(&mut self.current, child);
             let r = (|| {
@@ -1233,12 +1276,30 @@ impl<'a> Interp<'a> {
                         ObjectMember::Property {
                             key, value: tgt, ..
                         } => {
+                            // PropertyName is evaluated first (its `ToPropertyKey`
+                            // side effect is observed here).
                             let k = self.eval_prop_key(key)?;
-                            // Read through `read_member` so accessors fire and
-                            // inherited / length properties resolve.
-                            let v = self.read_member(src, &k)?;
-                            used.push(k);
-                            self.assign_destructure(tgt, v)?;
+                            used.push(k.clone());
+                            // KeyedDestructuringAssignmentEvaluation: for a simple
+                            // leaf target (`obj.p` / `obj[expr]` / an identifier),
+                            // evaluate its *reference* (base + key expression, no
+                            // key coercion yet) *before* reading the source value,
+                            // then read (GetV), apply a `= default` when the read
+                            // is `undefined`, and only then store (PutValue — which
+                            // runs the target key's `ToPropertyKey`). A nested
+                            // Array/Object pattern has no reference to pre-evaluate:
+                            // read, default, then recurse.
+                            let (inner, default_expr) = Self::split_default(tgt);
+                            if Self::is_simple_assign_target(inner) {
+                                let r = self.eval_assign_ref(inner)?;
+                                let v = self.read_member(src, &k)?;
+                                let v = self.apply_dstr_default(inner, v, default_expr)?;
+                                self.set_assign_ref(r, v)?;
+                            } else {
+                                let v = self.read_member(src, &k)?;
+                                let v = self.apply_dstr_default(inner, v, default_expr)?;
+                                self.assign_destructure(inner, v)?;
+                            }
                         }
                         ObjectMember::Spread { value: tgt, .. } => {
                             let obj = self.realm.new_object();
@@ -1260,22 +1321,9 @@ impl<'a> Interp<'a> {
                 value: default_expr,
                 ..
             } => {
-                let v = if matches!(value.unpack(), Unpacked::Undefined) {
-                    let d = self.eval(default_expr)?;
-                    // `[a = function(){}] = []` names the function after the target
-                    // (`a`) when the default is an anonymous function/class/arrow.
-                    if let Expr::Ident(id) = &**inner
-                        && matches!(
-                            &**default_expr,
-                            Expr::Function(_) | Expr::Class(_) | Expr::Arrow(_)
-                        )
-                    {
-                        self.set_fn_name(d, &id.name);
-                    }
-                    d
-                } else {
-                    value
-                };
+                // `[a = function(){}] = []` names the function after the target
+                // (`a`) when the default is an anonymous function/class/arrow.
+                let v = self.apply_dstr_default(inner, value, Some(default_expr))?;
                 self.assign_destructure(inner, v)
             }
             // A leaf target (identifier or member).
@@ -1380,12 +1428,57 @@ impl<'a> Interp<'a> {
         matches!(target, Expr::Ident(_) | Expr::Member { .. })
     }
 
+    /// Splits a destructuring element target into its inner
+    /// DestructuringAssignmentTarget and an optional `= default` Initializer:
+    /// `x = d` → `(x, Some(d))`; any other target → `(target, None)`.
+    fn split_default(target: &'a Expr) -> (&'a Expr, Option<&'a Expr>) {
+        if let Expr::Assign {
+            op: AssignOp::Assign,
+            target: inner,
+            value: default_expr,
+            ..
+        } = target
+        {
+            (inner, Some(default_expr))
+        } else {
+            (target, None)
+        }
+    }
+
+    /// Applies a destructuring `= default`: when `v` is `undefined` and a default
+    /// initializer is present, evaluates it (naming an anonymous function/class
+    /// default after a plain-identifier target, per NamedEvaluation). Otherwise
+    /// returns `v` unchanged.
+    fn apply_dstr_default(
+        &mut self,
+        inner: &'a Expr,
+        v: NanBox,
+        default_expr: Option<&'a Expr>,
+    ) -> Result<NanBox, ExecError> {
+        let Some(default_expr) = default_expr else {
+            return Ok(v);
+        };
+        if !matches!(v.unpack(), Unpacked::Undefined) {
+            return Ok(v);
+        }
+        let d = self.eval(default_expr)?;
+        if let Expr::Ident(id) = inner
+            && matches!(
+                default_expr,
+                Expr::Function(_) | Expr::Class(_) | Expr::Arrow(_)
+            )
+        {
+            self.set_fn_name(d, &id.name);
+        }
+        Ok(d)
+    }
+
     /// Evaluates the *reference* of a simple assignment leaf (its object/key for a
     /// member, or the name for an identifier) without yet producing a value, then
     /// returns a closure-free handle to complete the assignment later via
     /// [`set_assign_ref`](Self::set_assign_ref). Side effects in the object/key
     /// expressions happen here, matching the spec's "evaluate target, then step".
-    fn eval_assign_ref(&mut self, target: &'a Expr) -> Result<AssignRef, ExecError> {
+    fn eval_assign_ref(&mut self, target: &'a Expr) -> Result<AssignRef<'a>, ExecError> {
         match target {
             Expr::Member {
                 object, property, ..
@@ -1396,7 +1489,14 @@ impl<'a> Interp<'a> {
                     return Ok(AssignRef::Super { name });
                 }
                 let obj = self.eval(object)?;
-                let key = self.eval_prop_key(property)?;
+                // Evaluate the property-key *expression* to a value but defer
+                // `ToPropertyKey` (a computed key's `toString`/`toPrimitive`) to
+                // the store — per KeyedDestructuringAssignmentEvaluation the key
+                // coercion is part of `PutValue`, after the source value is read.
+                let key = match property {
+                    PropertyKey::Computed(e) => AssignKey::Deferred(self.eval(e)?),
+                    _ => AssignKey::Ready(property),
+                };
                 Ok(AssignRef::Member { obj, key })
             }
             Expr::Ident(id) => Ok(AssignRef::Ident(String::from(&*id.name))),
@@ -1405,11 +1505,47 @@ impl<'a> Interp<'a> {
     }
 
     /// Completes a pre-evaluated assignment reference with `value`.
-    fn set_assign_ref(&mut self, r: AssignRef, value: NanBox) -> Result<(), ExecError> {
+    fn set_assign_ref(&mut self, r: AssignRef<'a>, value: NanBox) -> Result<(), ExecError> {
         match r {
             AssignRef::Ident(name) => self.assign_to_name(&name, value),
             AssignRef::Super { name } => self.assign_super_member(&name, value),
-            AssignRef::Member { obj, key } => {
+            // A static-key target routes through the full `assign_member` so a
+            // private-field write brand-checks (`this.#x` on a non-instance is a
+            // TypeError), and `__proto__`/`lastIndex`/class-static semantics apply.
+            // Mirrors the `eval_assign` object/primitive dispatch (always a plain
+            // store — destructuring has no compound operator).
+            AssignRef::Member {
+                obj,
+                key: AssignKey::Ready(property),
+            } => {
+                let Some(raw) = obj.as_handle() else {
+                    if matches!(obj.unpack(), Unpacked::Null | Unpacked::Undefined) {
+                        return Err(self.type_error("Cannot set property of null or undefined"));
+                    }
+                    if let PropertyKey::Private(s) = property {
+                        let m = self.new_str(&alloc::format!(
+                            "Cannot write private member #{s} to a non-object"
+                        ));
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
+                    self.write_primitive_member(obj, property, value)?;
+                    return Ok(());
+                };
+                if self.is_object_value(obj) {
+                    self.assign_member(Handle::from_raw(raw), property, value)
+                } else {
+                    self.write_primitive_member(obj, property, value)
+                }
+            }
+            // A computed key: `ToPropertyKey` runs here (at `PutValue`), so the
+            // key's `toString` fires *after* the source value has been read. A
+            // computed key is never a private name, so the plain value store is
+            // correct.
+            AssignRef::Member {
+                obj,
+                key: AssignKey::Deferred(v),
+            } => {
+                let key = self.coerce_property_key(v)?;
                 if let Some(raw) = obj.as_handle() {
                     let k = self.new_str(&key);
                     self.assign_member_value(Handle::from_raw(raw), k, value)?;

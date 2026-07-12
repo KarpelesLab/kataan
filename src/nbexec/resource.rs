@@ -421,6 +421,11 @@ impl<'a> Interp<'a> {
         let new_global_this = self.global_this;
         let new_global_scope = self.global_scope.clone();
         let new_intrinsics = self.realm.intrinsics_snapshot();
+        // Capture the child's freshly-built `%RegExp.prototype%` for the
+        // realm-aware getter special-case (see `current_regexp_proto`). Reading it
+        // off `self.regexp_proto` (which `install_globals` just set) does not
+        // disturb the field's existing lifecycle.
+        let new_regexp_proto = self.regexp_proto;
         // Capture the child's freshly-built Intl prototypes, then restore the active
         // realm's cache so its own `Intl.X.prototype` reads stay correct.
         let new_intl_protos = self.realm.replace_intl_protos(saved_intl_protos);
@@ -442,6 +447,7 @@ impl<'a> Interp<'a> {
             global_scope: new_global_scope,
             global_this: new_global_this,
             intrinsics: new_intrinsics,
+            regexp_proto: new_regexp_proto,
             intl_protos: new_intl_protos,
         });
         // `GetFunctionRealm` tagging: every callable reachable from this realm's

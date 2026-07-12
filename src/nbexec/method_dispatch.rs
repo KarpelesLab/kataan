@@ -5441,7 +5441,7 @@ impl<'a> Interp<'a> {
         Ok(a_v)
     }
 
-    fn array_like_length(&mut self, handle: Handle) -> Result<usize, ExecError> {
+    pub(crate) fn array_like_length(&mut self, handle: Handle) -> Result<usize, ExecError> {
         let len_val = self.read_member(handle, "length")?;
         let len_num = self.coerce_to_number(len_val)?;
         let raw = self.realm.to_number(len_num);

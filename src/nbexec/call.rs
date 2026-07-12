@@ -2937,10 +2937,21 @@ impl<'a> Interp<'a> {
                 return Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))));
             }
             let r = self.new_regexp_instance(&pat, &flags);
-            // A subclass (`class S extends RegExp {}` / `Reflect.construct`) links
-            // the instance to `newTarget.prototype` instead of `RegExp.prototype`.
+            // `RegExpAlloc`: link `[[Prototype]]` via
+            // `GetPrototypeFromConstructor(newTarget, "%RegExp.prototype%")`. A
+            // subclass (`class S extends RegExp {}` / `Reflect.construct`) uses
+            // `newTarget.prototype`; a *cross-realm* `new other.RegExp()` (where
+            // `newTarget === callee` but the callee belongs to another realm) must
+            // still read the callee's own `.prototype` — that realm's
+            // `%RegExp.prototype%` — rather than this realm's default, so read it
+            // directly instead of taking `instance_proto_checked`'s `nt == callee`
+            // shortcut.
             let default = self.intrinsic_proto("RegExp");
-            if let Some(proto) = self.instance_proto_checked(native_new_target, callee, default)? {
+            let proto = match native_new_target.as_handle().map(Handle::from_raw) {
+                Some(nt) => self.get_proto_from_constructor(nt, default)?,
+                None => default,
+            };
+            if let Some(proto) = proto {
                 self.realm.set_native_proto(r, proto);
             }
             return Ok(NanBox::handle(r.to_raw()));

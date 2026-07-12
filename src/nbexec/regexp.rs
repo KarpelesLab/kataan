@@ -392,11 +392,28 @@ impl<'a> Interp<'a> {
         self.realm.regexp_at(h).map(|_| h)
     }
 
-    /// Whether `this` is the `RegExp.prototype` sentinel object.
+    /// The *currently-running* realm's `%RegExp.prototype%` sentinel — the main
+    /// realm's when no cross-realm function is executing (`cur_realm` is `None`),
+    /// otherwise that created realm's own. This is the object against which the
+    /// `get RegExp.prototype.source`/flag-getter `SameValue(R, %RegExpPrototype%)`
+    /// special-case must compare, so a *foreign*-realm prototype is rejected (a
+    /// `TypeError`) rather than mistaken for the sentinel.
+    fn current_regexp_proto(&self) -> Option<Handle> {
+        match self.cur_realm {
+            Some(idx) if idx < self.created_realms.len() => self.created_realms[idx].regexp_proto,
+            _ => self.main_regexp_proto,
+        }
+    }
+
+    /// Whether `this` is *the currently-running realm's* `RegExp.prototype`
+    /// sentinel object (a realm-aware `SameValue`), not merely *some* realm's — a
+    /// cross-realm `%RegExp.prototype%` is deliberately **not** treated as the
+    /// sentinel, so the flag/source getters throw a `TypeError` on it.
     fn is_regexp_proto(&self, this: NanBox) -> bool {
-        this.as_handle()
-            .map(Handle::from_raw)
-            .is_some_and(|h| self.realm.get_property(h, REGEXP_PROTO_BRAND).is_some())
+        let Some(h) = this.as_handle() else {
+            return false;
+        };
+        self.current_regexp_proto().is_some_and(|p| p.to_raw() == h)
     }
 
     /// Dispatch for a first-class `RegExp.prototype.<method>` (id
@@ -545,6 +562,23 @@ impl<'a> Interp<'a> {
         let Some(h) = self.this_regexp(this_val) else {
             return Err(self.type_error("RegExp.prototype.compile called on a non-RegExp object"));
         };
+        // Legacy-features gate (Annex B `RegExp.prototype.compile`): the method is
+        // a no-op recompile *only* when the instance's `[[LegacyFeaturesEnabled]]`
+        // is set — i.e. it was created by the *current* realm's intrinsic `%RegExp%`
+        // directly, so its `[[Prototype]]` is exactly the current realm's
+        // `%RegExp.prototype%`. A cross-realm RegExp (a different realm's prototype)
+        // or a subclass instance (a subclass prototype) has legacy features
+        // disabled → `TypeError` (thrown in the *current* realm, so a cross-realm
+        // `.call` carries that realm's `%TypeError%`).
+        let same_proto = matches!(
+            (self.realm.object_proto(h), self.current_regexp_proto()),
+            (Some(a), Some(b)) if a.to_raw() == b.to_raw()
+        );
+        if !same_proto {
+            return Err(self.type_error(
+                "RegExp.prototype.compile called on an incompatible (cross-realm or subclass) RegExp",
+            ));
+        }
         // `compile(re)` copies `re`'s source/flags; supplying flags too is a
         // TypeError.
         let (pat_s, flags_s) = if let Some(ph) = pattern.as_handle().map(Handle::from_raw)

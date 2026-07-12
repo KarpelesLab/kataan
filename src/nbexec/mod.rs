@@ -521,6 +521,14 @@ pub struct Interp<'a> {
     /// `RegExp.prototype`, recorded at setup so RegExp instances can link their
     /// `[[Prototype]]` to it (and species lookups resolve cheaply).
     regexp_proto: Option<Handle>,
+    /// The *main* realm's `%RegExp.prototype%`, captured once after the main
+    /// `install_globals` (before any `$262.createRealm()` can clobber
+    /// `regexp_proto`). Used together with each created realm's own
+    /// `%RegExp.prototype%` to make the `get RegExp.prototype.source`/flag-getter
+    /// `SameValue(R, %RegExpPrototype%)` special-case *realm-aware*: only the
+    /// currently-running realm's prototype sentinel returns `"(?:)"`/`undefined`;
+    /// a foreign-realm prototype (or any other non-RegExp) throws a `TypeError`.
+    main_regexp_proto: Option<Handle>,
     /// The `%RegExp%` intrinsic constructor handle, recorded at setup. Used to
     /// brand-check the receiver of the Annex B.2.5 legacy static accessors
     /// (`RegExp.$1`/`input`/`lastMatch`/…), which require `this === RegExp`.
@@ -2860,6 +2868,10 @@ struct CreatedRealm {
     global_this: NanBox,
     /// The realm's intrinsic prototype pointers, swapped in during `evalScript`.
     intrinsics: RealmIntrinsics,
+    /// This realm's own `%RegExp.prototype%` sentinel object. Consulted by the
+    /// realm-aware `SameValue(R, %RegExpPrototype%)` special-case in the
+    /// `get RegExp.prototype.source`/flag getters (see [`Interp::current_regexp_proto`]).
+    regexp_proto: Option<Handle>,
     /// The realm's `Intl` service `.prototype` intrinsics (`%Intl.X.prototype%`),
     /// keyed by ctor id. Swapped into `Realm::intl_protos` while executing in this
     /// realm (they are a distinct set of objects from every other realm's), and
@@ -2930,6 +2942,7 @@ impl<'a> Interp<'a> {
             well_known_symbols: alloc::collections::BTreeMap::new(),
             tagged_template_cache: alloc::collections::BTreeMap::new(),
             regexp_proto: None,
+            main_regexp_proto: None,
             regexp_ctor: None,
             #[cfg(feature = "intl")]
             intl_intern: alloc::collections::BTreeMap::new(),
@@ -2987,6 +3000,7 @@ impl<'a> Interp<'a> {
         // when execution returns to a main-realm function (`cur_realm` = `None`).
         interp.main_global_this = interp.global_this;
         interp.main_global_scope = interp.global_scope.clone();
+        interp.main_regexp_proto = interp.regexp_proto;
         interp
     }
 

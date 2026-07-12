@@ -890,40 +890,39 @@ impl<'a> Interp<'a> {
                         "Cannot assign to read only property 'stack' of Error.prototype",
                     ));
                 }
-                if self.realm.has_own(h, "stack") {
-                    // [[Set]] with Throw=true. An own accessor with no setter cannot
-                    // be written: throw (the assignment path would silently no-op).
-                    if let Some((_, setter)) = self.realm.accessor(h, "stack")
-                        && matches!(setter.unpack(), Unpacked::Undefined)
-                    {
-                        return Err(
-                            self.type_error("Cannot set property 'stack' which has only a getter")
-                        );
-                    }
-                    // A getter-only own accessor is handled above; a non-writable own
-                    // data property must also throw even in sloppy code, so force
-                    // strict semantics for this write.
-                    let key = self.new_str("stack");
-                    let saved = self.strict;
-                    self.strict = true;
-                    let r = self.assign_member_value(h, key, v);
-                    self.strict = saved;
-                    r?;
-                } else {
-                    // CreateDataPropertyOrThrow: fails (TypeError) on a non-extensible
-                    // receiver.
-                    let desc = self.realm.new_object();
-                    self.realm.set_property(desc, "value", v);
+                // Step 3: `desc = ? this.[[GetOwnProperty]]("stack")`. Routed through
+                // `descriptor_of`, which fires a Proxy `getOwnPropertyDescriptor` trap
+                // (and propagates a throwing trap) rather than reading the raw slot.
+                let desc = self.descriptor_of(h, "stack")?;
+                if matches!(desc.unpack(), Unpacked::Undefined) {
+                    // Step 4: no own "stack" → `CreateDataPropertyOrThrow(this, "stack",
+                    // v)`. `apply_descriptor` fires a Proxy `defineProperty` trap; a
+                    // false result (or non-extensible target) becomes a TypeError, a
+                    // throwing trap propagates.
+                    let d = self.realm.new_object();
+                    self.realm.set_property(d, "value", v);
                     self.realm
-                        .set_property(desc, "writable", NanBox::boolean(true));
+                        .set_property(d, "writable", NanBox::boolean(true));
                     self.realm
-                        .set_property(desc, "enumerable", NanBox::boolean(true));
+                        .set_property(d, "enumerable", NanBox::boolean(true));
                     self.realm
-                        .set_property(desc, "configurable", NanBox::boolean(true));
-                    if !self.apply_descriptor(h, "stack", desc, true)? {
+                        .set_property(d, "configurable", NanBox::boolean(true));
+                    if !self.apply_descriptor(h, "stack", d, true)? {
                         return Err(self.type_error(
-                            "Cannot create property 'stack' on a non-extensible object",
+                            "set Error.prototype.stack: CreateDataPropertyOrThrow failed",
                         ));
+                    }
+                } else {
+                    // Step 5: an own "stack" exists → `Set(this, "stack", v, true)`,
+                    // i.e. `this.[[Set]]("stack", v, this)`. `proxy_set_bool` fires a
+                    // Proxy `set` trap (or performs OrdinarySet with `this` as the
+                    // receiver); a false result throws (Throw=true — this also covers a
+                    // getter-only accessor or a non-writable own data property), and a
+                    // throwing trap propagates.
+                    if !self.proxy_set_bool(h, "stack", v, this)? {
+                        return Err(
+                            self.type_error("set Error.prototype.stack: [[Set]] returned false")
+                        );
                     }
                 }
                 NanBox::undefined()
@@ -1307,6 +1306,16 @@ impl<'a> Interp<'a> {
                     // `this` (an accessor with no setter fails).
                     let mut cur = Some(h);
                     while let Some(c) = cur {
+                        // A **proxy** found in the prototype chain (not the target
+                        // itself): OrdinarySetWithOwnDescriptor delegates to
+                        // `parent.[[Set]](P, V, Receiver)`, firing the proxy's `set`
+                        // trap (or forwarding to its own target) with the original
+                        // Receiver. The target-is-proxy case keeps its dedicated
+                        // handling below.
+                        if c.to_raw() != h.to_raw() && self.realm.proxy_at(c).is_some() {
+                            let ok = self.proxy_set_bool(c, &key, value, receiver)?;
+                            return Ok(NanBox::boolean(ok));
+                        }
                         // Integer-indexed exotic `[[Set]]` at a *typed-array* chain
                         // node `O = c` (10.4.5.5): a canonical numeric index never
                         // consults an inherited setter and is governed by O's bounds.
