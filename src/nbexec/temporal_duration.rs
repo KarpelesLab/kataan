@@ -775,36 +775,50 @@ impl<'a> Interp<'a> {
                 if da == db {
                     return Ok(Some(NanBox::number(0.0)));
                 }
-                let has_calendar =
-                    |d: &DurationFields| d.years != 0 || d.months != 0 || d.weeks != 0;
-                if let Some(a) = anchor {
-                    let ta = self.dur_apply(
-                        &a,
-                        da.years,
-                        da.months,
-                        da.weeks,
-                        da.days,
-                        da.time_nanos(),
-                    )?;
-                    let tb = self.dur_apply(
-                        &a,
-                        db.years,
-                        db.months,
-                        db.weeks,
-                        db.days,
-                        db.time_nanos(),
-                    )?;
+                let lu_a = default_largest_unit(&da);
+                let lu_b = default_largest_unit(&db);
+                // A date-category largest unit (day or coarser) means the day count
+                // may be irregular under a zoned anchor, so those are added to the
+                // anchor and compared as instants. Everything else — time-only
+                // durations, or day-durations under a plain anchor — is compared as
+                // a straight (24h-day) time span, WITHOUT anchoring (so a time-only
+                // comparison never overflows the anchor's instant range).
+                let a_date = (lu_a as usize) <= (Unit::Day as usize);
+                let b_date = (lu_b as usize) <= (Unit::Day as usize);
+                if let Some(a) = &anchor
+                    && a.tz.is_some()
+                    && (a_date || b_date)
+                {
+                    let ta =
+                        self.dur_apply(a, da.years, da.months, da.weeks, da.days, da.time_nanos())?;
+                    let tb =
+                        self.dur_apply(a, db.years, db.months, db.weeks, db.days, db.time_nanos())?;
                     let r = (ta.dest_rel - tb.dest_rel).signum() as f64;
                     return Ok(Some(NanBox::number(r)));
                 }
-                // No anchor: calendar units on either operand are a RangeError.
-                if has_calendar(&da) || has_calendar(&db) {
-                    return Err(
-                        self.dur_range_error("compare requires relativeTo for calendar units")
-                    );
+                // Fallback: compare as time durations. Calendar units (year/month/
+                // week) must first be resolved to a day count against a (plain)
+                // relativeTo — absent one, that is a RangeError.
+                let a_cal = matches!(lu_a, Unit::Year | Unit::Month | Unit::Week);
+                let b_cal = matches!(lu_b, Unit::Year | Unit::Month | Unit::Week);
+                let (mut d1, mut d2) = (da.days, db.days);
+                if a_cal || b_cal {
+                    let Some(a) = &anchor else {
+                        return Err(
+                            self.dur_range_error("compare requires relativeTo for calendar units")
+                        );
+                    };
+                    d1 = self.dur_date_days(a, &da)?;
+                    d2 = self.dur_date_days(a, &db)?;
                 }
-                let na = da.days * NS_PER_DAY + da.time_nanos();
-                let nb = db.days * NS_PER_DAY + db.time_nanos();
+                let na = d1 * NS_PER_DAY + da.time_nanos();
+                let nb = d2 * NS_PER_DAY + db.time_nanos();
+                // `add24HourDays`: folding the resolved day count into the time span
+                // must not exceed the maximum representable time duration.
+                const MAX_TIME_NS: i128 = 9_007_199_254_740_991 * NS_PER_SEC + NS_PER_SEC - 1;
+                if na.abs() > MAX_TIME_NS || nb.abs() > MAX_TIME_NS {
+                    return Err(self.dur_range_error("duration time span out of range"));
+                }
                 let r = (na - nb).signum() as f64;
                 Ok(Some(NanBox::number(r)))
             }
@@ -1161,12 +1175,44 @@ impl<'a> Interp<'a> {
 
         if let Some(a) = anchor {
             let sign = d.sign();
-            if sign == 0 {
+            // A zero-length duration usually rounds to zero. But with a
+            // ZonedDateTime anchor, a sub-day smallestUnit, and a date-category
+            // largestUnit, the spec still probes the day boundary (start-of-day
+            // and start-of-next-day) via NudgeToZonedTime — which throws a
+            // RangeError when the anchor sits at the edge of the representable
+            // range. Run the nudge (with sign forced to +1) in that case.
+            let smallest_is_time = matches!(
+                smallest,
+                Unit::Hour
+                    | Unit::Minute
+                    | Unit::Second
+                    | Unit::Millisecond
+                    | Unit::Microsecond
+                    | Unit::Nanosecond
+            );
+            // Rounding to nanosecond/increment-1 is a no-op: the spec returns the
+            // difference without a RoundRelativeDuration, so the boundary is not
+            // probed and a max-edge anchor does not throw.
+            let is_noop = smallest == Unit::Nanosecond && increment == 1;
+            let zoned_probe = sign == 0
+                && a.tz.is_some()
+                && smallest_is_time
+                && (largest as usize) <= (Unit::Day as usize)
+                && !is_noop;
+            if sign == 0 && !zoned_probe {
                 return Ok(self.new_duration(DurationFields::default()));
             }
+            let eff_sign = if sign == 0 { 1 } else { sign };
             let t = self.dur_apply(&a, d.years, d.months, d.weeks, d.days, d.time_nanos())?;
+            // A plain (non-zoned) relativeTo anchors the difference at its date's
+            // midnight; both endpoints must lie within the ISO date-time range.
+            // (A zero-length difference short-circuits before this check.)
+            if a.tz.is_none() && sign != 0 {
+                self.dur_reject_datetime(a.date, a.time_ns)?;
+                self.dur_reject_datetime(t.date, t.tod)?;
+            }
             let fields = self.dur_round_from_target(
-                &a, t.date, t.tod, t.dest_rel, sign, smallest, largest, increment, mode,
+                &a, t.date, t.tod, t.dest_rel, eff_sign, smallest, largest, increment, mode,
             )?;
             return Ok(self.new_duration(fields));
         }
@@ -1306,13 +1352,24 @@ impl<'a> Interp<'a> {
             return Err(self.dur_range_error("relativeTo date out of range"));
         }
         if let Some(tz_name) = p.tz_name {
-            // A zoned relativeTo: validate the zone and resolve to an instant.
+            // A zoned relativeTo: its LOCAL date must satisfy CheckISODaysRange
+            // (|epochDays| ≤ MAX_EPOCH_DAYS — one day tighter than the plain ±1
+            // slop), the zone must be valid, and the resolved instant must be
+            // representable.
+            if iso_to_epoch_days(date).abs() > MAX_EPOCH_DAYS {
+                return Err(self.dur_range_error("relativeTo date out of range"));
+            }
             let Some(tz) = self.dur_resolve_tz_string(&tz_name) else {
                 return Err(self.dur_range_error("invalid relativeTo time zone"));
             };
             let time = p.time.unwrap_or_default();
             let wall = iso_to_epoch_days(date) as i128 * NS_PER_DAY + time_to_nanos(time);
             let epoch = self.dur_zoned_epoch(&tz, wall, p.z, p.offset_ns)?;
+            if !(crate::temporal_iso::MIN_EPOCH_NS..=crate::temporal_iso::MAX_EPOCH_NS)
+                .contains(&epoch)
+            {
+                return Err(self.dur_range_error("relativeTo instant out of range"));
+            }
             let (ldate, ltime) = self.dur_local_of(&tz, epoch);
             return Ok(DurAnchor {
                 date: ldate,
@@ -1325,6 +1382,8 @@ impl<'a> Interp<'a> {
         if p.z {
             return Err(self.dur_range_error("relativeTo string has a UTC designator but no zone"));
         }
+        // Its date-at-noon must be within the representable ISO date-time range.
+        self.dur_reject_daterange(date)?;
         Ok(DurAnchor {
             date,
             time_ns: 0,
@@ -1520,6 +1579,14 @@ impl<'a> Interp<'a> {
         abs - self.dur_anchor_epoch_abs(a)
     }
 
+    /// `DateDurationDays`: the whole-day count obtained by adding only a
+    /// duration's calendar (year/month/week/day) part to the anchor — used by
+    /// `Duration.compare` to resolve calendar units against a plain relativeTo.
+    fn dur_date_days(&mut self, a: &DurAnchor, d: &DurationFields) -> Result<i128, ExecError> {
+        let t = self.dur_apply(a, d.years, d.months, d.weeks, d.days, 0)?;
+        Ok((iso_to_epoch_days(t.date) - iso_to_epoch_days(a.date)) as i128)
+    }
+
     /// Adds a duration's date part + normalized time to an anchor, yielding the
     /// resulting wall date, wall time-of-day, and signed ns from the anchor.
     fn dur_apply(
@@ -1617,11 +1684,35 @@ impl<'a> Interp<'a> {
         let (cy, cm, cw, cd) = difference_iso_date(a.date, adj, diff_unit);
 
         let smallest_is_cal = matches!(smallest, Unit::Year | Unit::Month | Unit::Week);
+        let smallest_is_time = matches!(
+            smallest,
+            Unit::Hour
+                | Unit::Minute
+                | Unit::Second
+                | Unit::Millisecond
+                | Unit::Microsecond
+                | Unit::Nanosecond
+        );
+        // NudgeToZonedTime: with a ZonedDateTime anchor and a sub-day smallestUnit,
+        // days keep their (possibly non-24h) calendar length — the sub-day time is
+        // rounded on its own against the actual day span, rather than folding days
+        // into the time as fixed 24h intervals.
+        // A no-op rounding (nanosecond, increment 1) keeps the difference as-is:
+        // route it through the plain fixed-length path so no day boundary is probed.
+        let is_noop = smallest == Unit::Nanosecond && increment == 1;
+        let zoned_time = a.tz.is_some()
+            && smallest_is_time
+            && (largest as usize) <= (Unit::Day as usize)
+            && !is_noop;
         let (mut y, mut m, mut w, mut days, norm_time, nudged_rel, did_expand) = if smallest_is_cal
         {
             let nc = self
                 .dur_nudge_calendar(a, cy, cm, cw, cd, dest_rel, sign, smallest, increment, mode)?;
             (nc.0, nc.1, nc.2, nc.3, 0_i128, nc.4, nc.5)
+        } else if zoned_time {
+            self.dur_nudge_zoned_time(
+                a, adj, cy, cm, cw, cd, subday, sign, smallest, increment, mode,
+            )?
         } else {
             // Fixed-length nudge (day/time): combine leftover days + sub-day time.
             let norm_with_days = cd as i128 * NS_PER_DAY + subday;
@@ -1733,6 +1824,94 @@ impl<'a> Interp<'a> {
             (start, start_rel)
         };
         Ok((fields.0, fields.1, fields.2, fields.3, nudged, expand))
+    }
+
+    /// `RejectDateRange`: a plain `relativeTo` date is representable only when its
+    /// noon instant lies within the ISO date-time range (`DATETIME_NS_MIN/MAX`) —
+    /// noon, not midnight, so the ±1-day date span is admitted symmetrically.
+    fn dur_reject_daterange(&mut self, date: IsoDate) -> Result<(), ExecError> {
+        let ns = iso_to_epoch_days(date) as i128 * NS_PER_DAY + NS_PER_DAY / 2;
+        let min = crate::temporal_iso::MIN_EPOCH_NS - NS_PER_DAY + 1;
+        let max = crate::temporal_iso::MAX_EPOCH_NS + NS_PER_DAY - 1;
+        if ns < min || ns > max {
+            return Err(self.dur_range_error(
+                "date is outside the representable range for a relativeTo parameter",
+            ));
+        }
+        Ok(())
+    }
+
+    /// `RejectDateTimeRange`: a bare (non-zoned) ISO date-time is representable
+    /// only within one day of the instant limits (`DATETIME_NS_MIN/MAX`), which is
+    /// one nanosecond tighter at each edge than the ±1-day ISO-date span. A plain
+    /// `relativeTo` whose date-at-midnight lies just outside is rejected.
+    fn dur_reject_datetime(&mut self, date: IsoDate, time_ns: i128) -> Result<(), ExecError> {
+        let ns = iso_to_epoch_days(date) as i128 * NS_PER_DAY + time_ns;
+        let min = crate::temporal_iso::MIN_EPOCH_NS - NS_PER_DAY + 1;
+        let max = crate::temporal_iso::MAX_EPOCH_NS + NS_PER_DAY - 1;
+        if ns < min || ns > max {
+            return Err(self.dur_range_error(
+                "date is outside the representable range for a relativeTo parameter",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Epoch ns of `date` at the anchor's wall time-of-day, relative to the
+    /// anchor — but throwing a RangeError when that absolute instant falls
+    /// outside the representable range (the checked analogue of `dur_wall_rel`,
+    /// used where the spec's `GetEpochNanosecondsFor` would reject a boundary).
+    fn dur_wall_rel_checked(&mut self, a: &DurAnchor, date: IsoDate) -> Result<i128, ExecError> {
+        let wall = iso_to_epoch_days(date) as i128 * NS_PER_DAY + a.time_ns;
+        let abs = match &a.tz {
+            Some(tz) => self.dur_wall_to_epoch(tz, wall),
+            None => wall,
+        };
+        if !(crate::temporal_iso::MIN_EPOCH_NS..=crate::temporal_iso::MAX_EPOCH_NS).contains(&abs) {
+            return Err(self.dur_range_error("day boundary is out of range"));
+        }
+        Ok(abs - self.dur_anchor_epoch_abs(a))
+    }
+
+    /// `NudgeToZonedTime`: rounds a sub-day time unit within a zoned day, keeping
+    /// the calendar day count (`cd`) intact. `adj`/`subday` are the target date and
+    /// the sign-aligned sub-day remainder. Returns the same tuple shape as
+    /// `dur_nudge_calendar`: `(years, months, weeks, days, norm_time, nudged_rel,
+    /// did_expand)`.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn dur_nudge_zoned_time(
+        &mut self,
+        a: &DurAnchor,
+        adj: IsoDate,
+        cy: i64,
+        cm: i64,
+        cw: i64,
+        cd: i64,
+        subday: i128,
+        sign: i64,
+        unit: Unit,
+        increment: i128,
+        mode: RoundMode,
+    ) -> Result<(i64, i64, i64, i64, i128, i128, bool), ExecError> {
+        // Start / end of the target's whole-day interval, as instants. These probe
+        // the representable range and may throw at the edge.
+        let start_rel = self.dur_wall_rel_checked(a, adj)?;
+        let end_date = epoch_days_to_iso(iso_to_epoch_days(adj) + sign);
+        let end_rel = self.dur_wall_rel_checked(a, end_date)?;
+        let day_span = end_rel - start_rel;
+        let unit_ns = (ns_per_unit(unit) * increment).max(1);
+        let mut rounded = self.dur_round_increment(subday, unit_ns, mode);
+        // Did the rounded time reach or cross the end of the (possibly non-24h) day?
+        let beyond = rounded - day_span;
+        let did_beyond = if sign >= 0 { beyond >= 0 } else { beyond <= 0 };
+        let (day_delta, nudged_rel) = if did_beyond {
+            // Rounded into the next day: re-round the overshoot from the day-end.
+            rounded = self.dur_round_increment(beyond, unit_ns, mode);
+            (sign, end_rel + rounded)
+        } else {
+            (0, start_rel + rounded)
+        };
+        Ok((cy, cm, cw, cd + day_delta, rounded, nudged_rel, did_beyond))
     }
 
     /// `ApplyUnsignedRoundingMode` reduced to a boolean: whether to round toward
@@ -1879,8 +2058,42 @@ impl<'a> Interp<'a> {
     ) -> Result<f64, ExecError> {
         let sign = d.sign();
         let t = self.dur_apply(a, d.years, d.months, d.weeks, d.days, d.time_nanos())?;
-        if sign == 0 {
+        // With a ZonedDateTime anchor, `day` is an irregular-length unit: even a
+        // zero-length total probes the day boundary (which throws at the edge of
+        // the representable range). Every other zero-length total is 0.
+        let zoned_day = unit == Unit::Day && a.tz.is_some();
+        if sign == 0 && !zoned_day {
             return Ok(0.0);
+        }
+        let eff_sign = if sign == 0 { 1 } else { sign };
+        // A plain (non-zoned) relativeTo anchors at its date's midnight; both
+        // endpoints of a non-empty difference must be within the ISO date-time
+        // range (a zero-length total returned above, before this check).
+        if a.tz.is_none() && sign != 0 {
+            self.dur_reject_datetime(a.date, a.time_ns)?;
+            self.dur_reject_datetime(t.date, t.tod)?;
+        }
+        if zoned_day {
+            // Whole days toward the destination + the fractional remainder, using
+            // the actual (possibly non-24h) length of the bounding zoned day.
+            let mut adj = t.date;
+            let subday = t.tod - a.time_ns;
+            if eff_sign > 0 && subday < 0 {
+                adj = epoch_days_to_iso(iso_to_epoch_days(adj) - 1);
+            } else if eff_sign < 0 && subday > 0 {
+                adj = epoch_days_to_iso(iso_to_epoch_days(adj) + 1);
+            }
+            let (_, _, _, cd) = difference_iso_date(a.date, adj, Unit::Day);
+            let end_date = epoch_days_to_iso(iso_to_epoch_days(adj) + eff_sign);
+            let start_rel = self.dur_wall_rel_checked(a, adj)?;
+            let end_rel = self.dur_wall_rel_checked(a, end_date)?;
+            let asp = (end_rel - start_rel).unsigned_abs();
+            if asp == 0 {
+                return Ok(cd as f64);
+            }
+            let ap = (t.dest_rel - start_rel).unsigned_abs() as i128;
+            let num = cd as i128 * asp as i128 + eff_sign as i128 * ap;
+            return Ok(ratio_to_f64(num, asp as i128));
         }
         if matches!(unit, Unit::Year | Unit::Month | Unit::Week) {
             // Whole units toward the destination + the fractional remainder.
@@ -1913,17 +2126,24 @@ impl<'a> Interp<'a> {
                 .ok_or_else(|| self.dur_range_error("total out of range"))?;
             let start_rel = self.dur_wall_rel(a, start_date);
             let end_rel = self.dur_wall_rel(a, end_date);
-            // prog/span is a non-negative fraction (numerator and denominator
-            // share the duration's sign); reapply the sign to the fraction.
-            let span = (end_rel - start_rel) as f64;
-            let prog = (t.dest_rel - start_rel) as f64;
-            return Ok(r1 as f64 + sign as f64 * (prog / span).abs());
+            // `r1 + sign·(|prog|/|span|)` is a single exact rational in the spec
+            // (`TotalDuration`); computing the fraction as an f64 and adding the
+            // whole part double-rounds. Fold it into one numerator/denominator and
+            // round to a double exactly once. prog/span share the duration's sign.
+            let span = end_rel - start_rel;
+            let prog = t.dest_rel - start_rel;
+            let asp = span.unsigned_abs();
+            if asp == 0 {
+                return Ok(r1 as f64);
+            }
+            let ap = prog.unsigned_abs() as i128;
+            let asp = asp as i128;
+            let num = r1 as i128 * asp + sign as i128 * ap;
+            return Ok(ratio_to_f64(num, asp));
         }
-        // Fixed-length unit: exact division of the anchored ns displacement.
+        // Fixed-length unit: the exact rational displacement/unit, rounded once.
         let per = ns_per_unit(unit);
-        let whole = (t.dest_rel / per) as f64;
-        let rem = (t.dest_rel % per) as f64 / per as f64;
-        Ok(whole + rem)
+        Ok(ratio_to_f64(t.dest_rel, per))
     }
 
     // -- time-zone helpers (fixed-offset + IANA) ------------------------------
@@ -2312,5 +2532,155 @@ mod ratio_tests {
             ratio_to_f64(total_ns, 1_000),
             9_007_199_254_740_992_000_000.0
         );
+    }
+}
+
+/// End-to-end checks of `Duration.prototype.round/total/compare` with a
+/// `relativeTo` — the calendar/DST-aware rounding and range-limit semantics.
+#[cfg(test)]
+mod relative_tests {
+    /// Runs a sloppy-mode script, returning its `print` output on success or the
+    /// thrown error's name (e.g. `"RangeError"`) on a throw.
+    fn run(src: &str) -> Result<alloc::string::String, alloc::string::String> {
+        let prelude = "var print = function () { var s=''; for (var i=0;i<arguments.length;i++){ if(i) s+=' '; s+=arguments[i]; } console.log(s); };\n";
+        let combined = alloc::format!("{prelude}{src}");
+        match crate::nbvm::execute_typed(&combined, crate::limits::Limits::default()) {
+            Ok((out, _)) => Ok(out),
+            Err(t) => Err(alloc::string::String::from(t.name)),
+        }
+    }
+
+    #[test]
+    fn zoned_round_keeps_days_separate_half_even() {
+        // 3 days 12 hours, smallestUnit hours, increment 8, halfEven. With a
+        // ZonedDateTime relativeTo the days stay separate, so only 12h rounds:
+        // 12h/8 = 1.5 → halfEven → 16h. Result: 3 days 16 hours.
+        let out = run(r#"
+            var d = new Temporal.Duration(0,0,0,3,12);
+            var z = new Temporal.ZonedDateTime(0n, "UTC");
+            var r = d.round({ smallestUnit:"hours", roundingIncrement:8, roundingMode:"halfEven", relativeTo:z });
+            print(r.days, r.hours);
+        "#)
+        .expect("no throw");
+        assert_eq!(out.trim(), "3 16");
+    }
+
+    #[test]
+    fn plain_round_folds_days_half_even() {
+        // The same rounding with a PlainDate relativeTo folds days at 24h:
+        // 84h/8 = 10.5 → halfEven → 80h → 3 days 8 hours.
+        let out = run(r#"
+            var d = new Temporal.Duration(0,0,0,3,12);
+            var p = new Temporal.PlainDate(1970,1,1);
+            var r = d.round({ smallestUnit:"hours", roundingIncrement:8, roundingMode:"halfEven", relativeTo:p });
+            print(r.days, r.hours);
+        "#)
+        .expect("no throw");
+        assert_eq!(out.trim(), "3 8");
+    }
+
+    #[test]
+    fn total_month_is_single_rounded_rational() {
+        // total("months") of P5W5D relative to 1972-01-31 must equal the exact
+        // rational rounded once (1.3548387096774193), not a double-rounded value.
+        let out = run(r#"
+            var d = new Temporal.Duration(0,0,5,5);
+            print(d.total({ unit:"months", relativeTo:"1972-01-31" }));
+        "#)
+        .expect("no throw");
+        assert_eq!(out.trim(), "1.3548387096774193");
+    }
+
+    #[test]
+    fn round_next_day_boundary_out_of_range_throws() {
+        // A zero duration at the max instant: rounding to days must probe the
+        // next-day boundary, which is out of range → RangeError.
+        let err = run(r#"
+            var d = new Temporal.Duration();
+            var z = new Temporal.ZonedDateTime(86400_0000_0000_000_000_000n, "UTC");
+            d.round({ largestUnit:"days", smallestUnit:"minutes", relativeTo:z });
+        "#)
+        .unwrap_err();
+        assert_eq!(err, "RangeError");
+    }
+
+    #[test]
+    fn round_noop_at_max_zoned_does_not_throw() {
+        // A no-op rounding (nanosecond/increment 1) does NOT probe the boundary,
+        // so a max-edge ZonedDateTime relativeTo is fine.
+        let out = run(r#"
+            var d = new Temporal.Duration();
+            var r = d.round({ largestUnit:"years", relativeTo:"-271821-04-20T00:00+00:00[UTC]" });
+            print(r.years, r.days);
+        "#)
+        .expect("no throw");
+        assert_eq!(out.trim(), "0 0");
+    }
+
+    #[test]
+    fn total_days_zoned_boundary_throws_one_second_past() {
+        // total("days") of a zero duration: valid exactly at the max whole day,
+        // but one second later the day-end boundary is out of range → RangeError.
+        let ok = run(r#"
+            print(new Temporal.Duration(0).total({ unit:"days", relativeTo:"+275760-09-12T00:00:00+00:00[UTC]" }));
+        "#)
+        .expect("no throw");
+        assert_eq!(ok.trim(), "0");
+        let err = run(r#"
+            new Temporal.Duration(0).total({ unit:"days", relativeTo:"+275760-09-12T00:00:01+00:00[UTC]" });
+        "#)
+        .unwrap_err();
+        assert_eq!(err, "RangeError");
+    }
+
+    #[test]
+    fn offset_zone_relativeto_local_date_out_of_range_throws() {
+        // A zoned relativeTo whose LOCAL date is beyond the CheckISODaysRange
+        // bound is rejected at parse (both zero and non-zero durations throw).
+        let err = run(r#"
+            new Temporal.Duration(0,0,0,0,0,5).round({ smallestUnit:"minutes", relativeTo:"-271821-04-19T23:00-01:00[-01:00]" });
+        "#)
+        .unwrap_err();
+        assert_eq!(err, "RangeError");
+    }
+
+    #[test]
+    fn plain_relativeto_max_date_valid_but_next_is_not() {
+        // +275760-09-13 is a valid plain relativeTo; +275760-09-14 is out of range.
+        run(r#"
+            new Temporal.Duration(0,0,0,0,0,5).round({ smallestUnit:"minutes", relativeTo:"+275760-09-13" });
+        "#)
+        .expect("valid max date");
+        let err = run(r#"
+            new Temporal.Duration().round({ smallestUnit:"minutes", relativeTo:"+275760-09-14" });
+        "#)
+        .unwrap_err();
+        assert_eq!(err, "RangeError");
+    }
+
+    #[test]
+    fn compare_time_only_at_max_zoned_does_not_anchor() {
+        // Time-only durations compare as a straight time span even with a zoned
+        // relativeTo at the max instant — no AddZonedDateTime, so no overflow.
+        let out = run(r#"
+            var a = new Temporal.Duration(0,0,0,0,0,5);
+            var b = new Temporal.Duration();
+            print(Temporal.Duration.compare(a, b, { relativeTo:"+275760-09-13T00:00Z[UTC]" }));
+        "#)
+        .expect("no throw");
+        assert_eq!(out.trim(), "1");
+    }
+
+    #[test]
+    fn compare_calendar_time_overflow_throws() {
+        // 1 year + (2^53-1) seconds vs 2 years, relative to a plain date: folding
+        // the year's days into the huge time span overflows → RangeError.
+        let err = run(r#"
+            var a = Temporal.Duration.from({ years:1, seconds: 2**53 - 1 });
+            var b = Temporal.Duration.from({ years:2 });
+            Temporal.Duration.compare(a, b, { relativeTo: new Temporal.PlainDate(2000,1,1) });
+        "#)
+        .unwrap_err();
+        assert_eq!(err, "RangeError");
     }
 }
