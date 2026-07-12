@@ -1398,14 +1398,31 @@ pub(crate) fn calendar_date_until(
         if sign > 0 { a > b } else { a < b }
     };
 
-    // Whole years: seed with the calendar-year difference, back off any overshoot,
-    // then advance while another whole year still fits.
-    let mut years = f2.year - f1.year;
-    while passes(years, 0) {
+    // Whole years — via the Temporal reference `untilCalendar` rule: two dates are
+    // a whole year apart only when the *monthCode* ordering agrees with the year
+    // ordering. Comparing monthCodes lexicographically (so a leap "M04L" sorts
+    // after "M04" and before "M05", and all base codes are zero-padded to two
+    // digits) is exactly what makes a leap-vs-nonleap boundary count as months and
+    // not a year: adding a year to a leap-month date constrains onto a *different*
+    // monthCode, which must not be counted as a full year.
+    let diff_days = f2.day - f1.day;
+    let diff_in_year_sign = if f2.month_code > f1.month_code {
+        1
+    } else if f2.month_code < f1.month_code {
+        -1
+    } else {
+        diff_days.signum()
+    };
+    // When `iso1`'s month-day sits further into the year than `iso2`'s (relative to
+    // the travel direction), the raw year subtraction overshoots by one.
+    let mut years = if diff_in_year_sign * sign < 0 {
+        (f2.year - f1.year) - sign
+    } else {
+        f2.year - f1.year
+    };
+    // Correct any residual leap-year overshoot left by the constrained year add.
+    if passes(years, 0) {
         years -= sign;
-    }
-    while !passes(years + sign, 0) {
-        years += sign;
     }
 
     // Whole months within the final year span (bounded by months_in_year).

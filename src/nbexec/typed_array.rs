@@ -396,8 +396,20 @@ impl<'a> Interp<'a> {
             && self.realm.is_array(handle)
             && i >= self.realm.limits.max_array_len;
         if over_cap {
-            let m = self.new_str("Invalid array length");
-            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            // A valid array index (`i <= 2**32 - 2`) beyond the dense storage cap:
+            // a plain `arr[i] = v` write never raises "Invalid array length" (that
+            // is reserved for an explicit `.length =` past 2**32-1). Store the
+            // element sparsely as a named property and bump the logical `length`
+            // to `i + 1`, mirroring the array-index `defineProperty` path — the
+            // backing `Vec` cannot hold billions of slots, but the property must
+            // still exist and `length` grow.
+            let key = alloc::format!("{i}");
+            self.realm.force_set_property(handle, &key, value);
+            let target_len = i + 1;
+            if self.realm.array_length(handle).unwrap_or(0) < target_len {
+                self.realm.set_array_length(handle, target_len);
+            }
+            return Ok(());
         }
         // A write to a BigInt typed-array element ToBigInt-coerces the value (a
         // Number throws TypeError) — even for an out-of-bounds index, where the

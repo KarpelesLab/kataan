@@ -184,18 +184,19 @@ fn regex_compiled_cache_preserves_behaviour() {
     );
 }
 
-/// C1: a dense-array element *write* whose growth would exceed the configured
-/// `max_array_len` cap throws a catchable `RangeError("Invalid array length")`
-/// instead of being a silent no-op. A *length* set to a valid uint32 above the
-/// cap is a spec-conformant sparse length (no allocation), not a RangeError;
-/// only a length above the uint32 ceiling (2^32-1) is invalid.
+/// C1: a dense-array element *write* to a valid array index (`< 2^32-1`) past the
+/// configured `max_array_len` cap is served *sparsely* (stored as an aux named
+/// property + a logical-length bump), never a `RangeError` — a plain `arr[i] = v`
+/// is spec-conformant and grows `length` to `i + 1`. A *length* set to a valid
+/// uint32 above the cap is likewise a sparse length (no allocation); only a length
+/// above the uint32 ceiling (2^32-1) is invalid.
 #[test]
 fn oversized_array_growth_throws_range_error() {
-    // `a[1e9] = 1` (index 1e9 > the 100M default cap) throws RangeError — a
-    // dense element write past the cap cannot be served.
+    // `a[1e9] = 1` (index 1e9 > the 100M default cap) stores sparsely and grows
+    // `length` to 1e9+1 — a valid array index write never throws.
     assert_eq!(
-        run("var a=[1]; try{a[1e9]=1;'noThrow'}catch(e){e.constructor.name}"),
-        "RangeError"
+        run("var a=[1]; a[1e9]=1; String(a.length)+','+a[1e9]"),
+        "1000000001,1"
     );
     // `a.length = 1e9` is a valid uint32: a sparse length, reported as-is, no throw.
     assert_eq!(

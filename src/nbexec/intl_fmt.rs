@@ -530,6 +530,146 @@ fn exact_increment(int: &mut alloc::vec::Vec<u8>, frac: &mut [u8]) {
     }
 }
 
+/// Whether a compact-notation formatter carries no explicit digit options, so the
+/// ECMA-402 default rounding (`roundingPriority: "morePrecision"` with
+/// `maximumFractionDigits: 0` / `maximumSignificantDigits: 2`) applies and the
+/// crate's plain one-fraction-digit mantissa must be re-rounded (see
+/// [`compact_reround_parts`]). Any user-set fraction/significant digit count opts
+/// out (the crate then honors the given precision).
+#[cfg(feature = "intl")]
+fn compact_wants_reround(opts: &intl::number::NumberFormatOptions) -> bool {
+    matches!(opts.notation, intl::number::Notation::Compact)
+        && opts.minimum_fraction_digits.is_none()
+        && opts.maximum_fraction_digits.is_none()
+        && opts.minimum_significant_digits.is_none()
+        && opts.maximum_significant_digits.is_none()
+}
+
+/// Re-round the mantissa of a default compact-notation result to the ECMA-402
+/// default precision. The crate renders the compact mantissa with a single
+/// fraction digit (`987654321` → `987.7M`); the spec applies
+/// `roundingPriority: "morePrecision"` over `maximumFractionDigits: 0` and
+/// `maximumSignificantDigits: 2`, which for a mantissa whose most-significant
+/// digit sits at decimal exponent `e` keeps `max(0, 1 - e)` fraction digits
+/// (`987.65…M` → `988M`, `9.87…K` → `9.9K`, `0.159` → `0.16`). Operates on the
+/// crate's tagged `(kind, value)` parts (latn digits, before numbering-system
+/// substitution): rewrites the leading `integer`/`decimal`/`fraction` run in
+/// place, leaving the sign and compact-suffix parts untouched. Grouped mantissae
+/// (a `group` part right after the integer) are left alone — compact mantissae are
+/// always < 1000 there, so no re-rounding is needed.
+#[cfg(feature = "intl")]
+fn compact_reround_parts(
+    parts: &mut alloc::vec::Vec<(&'static str, String)>,
+    mode: intl::number::RoundingMode,
+) {
+    let Some(int_idx) = parts.iter().position(|(k, _)| *k == "integer") else {
+        return;
+    };
+    // Skip a grouped integer core (a `group` immediately after the integer): the
+    // digits span several parts, but such a mantissa is >= 1000 with no fraction,
+    // so `max(0, 1 - e)` is already 0 and nothing needs re-rounding.
+    if parts.get(int_idx + 1).map(|(k, _)| *k) == Some("group") {
+        return;
+    }
+    let neg = parts.iter().any(|(k, _)| *k == "minusSign");
+    let int_str = parts[int_idx].1.clone();
+    let (dec_idx, frac_idx) = if parts.get(int_idx + 1).map(|(k, _)| *k) == Some("decimal") {
+        let f = if parts.get(int_idx + 2).map(|(k, _)| *k) == Some("fraction") {
+            Some(int_idx + 2)
+        } else {
+            None
+        };
+        (Some(int_idx + 1), f)
+    } else {
+        (None, None)
+    };
+    let frac_str = frac_idx.map(|i| parts[i].1.clone()).unwrap_or_default();
+    // Only re-round plain latn digits (kataan substitutes the numbering system
+    // afterwards); bail on anything unexpected.
+    if !int_str.bytes().all(|b| b.is_ascii_digit()) || !frac_str.bytes().all(|b| b.is_ascii_digit())
+    {
+        return;
+    }
+    // Decimal exponent `e` of the mantissa's most-significant digit.
+    let int_stripped = int_str.trim_start_matches('0');
+    let e: i32 = if !int_stripped.is_empty() {
+        int_stripped.len() as i32 - 1
+    } else {
+        match frac_str.bytes().position(|b| b != b'0') {
+            Some(p) => -(p as i32) - 1,
+            None => 0,
+        }
+    };
+    let keep = (1 - e).max(0) as usize;
+    let mut int_d: alloc::vec::Vec<u8> = int_str.bytes().map(|b| b - b'0').collect();
+    let mut frac_d: alloc::vec::Vec<u8> = frac_str.bytes().map(|b| b - b'0').collect();
+    if frac_d.len() > keep {
+        let up = exact_round_up(&frac_d[keep..], mode, neg);
+        frac_d.truncate(keep);
+        if up {
+            exact_increment(&mut int_d, &mut frac_d);
+        }
+    }
+    // Trim trailing fraction zeros (minimumFractionDigits defaults to 0).
+    while frac_d.last() == Some(&0) {
+        frac_d.pop();
+    }
+    while int_d.len() > 1 && int_d[0] == 0 {
+        int_d.remove(0);
+    }
+    let new_int: String = int_d.iter().map(|d| (b'0' + d) as char).collect();
+    let new_frac: String = frac_d.iter().map(|d| (b'0' + d) as char).collect();
+    let dec_sep = dec_idx.map(|i| parts[i].1.clone());
+    // Remove the old fraction then decimal (descending index keeps `int_idx` valid).
+    if let Some(fi) = frac_idx {
+        parts.remove(fi);
+    }
+    if let Some(di) = dec_idx {
+        parts.remove(di);
+    }
+    parts[int_idx].1 = new_int;
+    if !new_frac.is_empty() {
+        let sep = dec_sep.unwrap_or_else(|| String::from("."));
+        parts.insert(int_idx + 1, ("decimal", sep));
+        parts.insert(int_idx + 2, ("fraction", new_frac));
+    }
+}
+
+/// Split the separator whitespace off each `compact` part into its own `literal`
+/// part, matching ECMA-402's parts shaping: a CLDR compact pattern like `"0 Mio."`
+/// tags the space between the number and the suffix as a `literal` and only the
+/// bare suffix as `compact` (`[integer "988"][literal "\u{a0}"][compact "Mio."]`).
+/// The `intl` crate returns the leading/trailing whitespace fused into the
+/// `compact` value; only the *outer* whitespace is peeled here (an internal space
+/// in a multi-word suffix stays part of the `compact` token).
+#[cfg(feature = "intl")]
+fn split_compact_affix_parts(parts: &mut alloc::vec::Vec<(&'static str, String)>) {
+    let needs = parts.iter().any(|(k, v)| {
+        *k == "compact" && (v.starts_with(char::is_whitespace) || v.ends_with(char::is_whitespace))
+    });
+    if !needs {
+        return;
+    }
+    let mut out: alloc::vec::Vec<(&'static str, String)> =
+        alloc::vec::Vec::with_capacity(parts.len() + 2);
+    for (k, v) in core::mem::take(parts) {
+        if k != "compact" || v.trim().is_empty() {
+            out.push((k, v));
+            continue;
+        }
+        let lead_len = v.len() - v.trim_start().len();
+        let core_end = v.trim_end().len();
+        if lead_len > 0 {
+            out.push(("literal", String::from(&v[..lead_len])));
+        }
+        out.push(("compact", String::from(&v[lead_len..core_end])));
+        if core_end < v.len() {
+            out.push(("literal", String::from(&v[core_end..])));
+        }
+    }
+    *parts = out;
+}
+
 /// From a probe like `"1.1"` / `"-1.1"` (latn digits), split the leading prefix,
 /// the decimal separator, and the trailing suffix.
 #[cfg(feature = "intl")]
@@ -5604,8 +5744,9 @@ impl<'a> Interp<'a> {
     }
 
     /// Whether an `Intl.NumberFormat` instance must use the hand-rolled path rather than the
-    /// `intl` crate: `style: "unit"` and `notation: "compact"` aren't yet faithfully rendered
-    /// by `intl::number::format` (units are dropped; compact rounds differently from V8).
+    /// `intl` crate: `style: "unit"` isn't yet faithfully rendered by `intl::number::format`
+    /// (narrow unit patterns are missing). `notation: "compact"` goes through the crate now,
+    /// with its mantissa re-rounded by [`compact_reround_parts`] to the ECMA-402 default.
     #[cfg(feature = "intl")]
     pub(crate) fn number_uses_handrolled(&mut self, handle: Handle) -> bool {
         let get = |this: &mut Self, k: &str| -> Option<String> {
@@ -5615,7 +5756,6 @@ impl<'a> Interp<'a> {
                 .map(|v| this.realm.to_display_string(v))
         };
         get(self, "style").as_deref() == Some("unit")
-            || get(self, "notation").as_deref() == Some("compact")
     }
 
     /// Formats `n` per an `Intl.NumberFormat` instance. With the `intl` crate, all styles
@@ -5987,6 +6127,23 @@ impl<'a> Interp<'a> {
             } else {
                 n
             };
+            // Default compact notation: render via the tagged parts so the mantissa
+            // can be re-rounded to the ECMA-402 default precision (the crate's plain
+            // string path keeps a single fraction digit — `987654321` → `987.7M`
+            // instead of `988M`). NaN/∞ carry no mantissa and fall through.
+            if n.is_finite() && compact_wants_reround(&opts) {
+                let mut o = opts;
+                o.maximum_fraction_digits = Some(6);
+                let mut parts: Vec<(&'static str, String)> =
+                    intl::number::format_to_parts(&locale, n, &o)
+                        .into_iter()
+                        .map(|p| (p.kind.as_str(), p.value))
+                        .collect();
+                compact_reround_parts(&mut parts, opts.rounding_mode);
+                // Return latn digits; the caller (`intl_format_number`) applies the
+                // numbering system.
+                return parts.into_iter().map(|(_, v)| v).collect();
+            }
             let formatted = intl::number::format(&locale, n, &opts);
             // A small-magnitude negative that rounds to a displayed zero
             // (e.g. -0.0001 → "0", or -0.004 currency → "$0.00") carries no sign
@@ -6918,11 +7075,27 @@ impl<'a> Interp<'a> {
             } else {
                 n
             };
+            // Default compact notation: request full mantissa precision from the
+            // crate, then re-round to the ECMA-402 default (see the `format` path
+            // and [`compact_reround_parts`]).
+            let reround = feed.is_finite() && compact_wants_reround(&opts);
+            if reround {
+                opts.maximum_fraction_digits = Some(6);
+            }
             let mut parts: Vec<(&'static str, String)> =
                 intl::number::format_to_parts(&locale, feed, &opts)
                     .into_iter()
                     .map(|p| (p.kind.as_str(), p.value))
                     .collect();
+            if reround {
+                compact_reround_parts(&mut parts, opts.rounding_mode);
+            }
+            // Compact suffixes carry a separator space fused into the `compact`
+            // token; peel it into a `literal` part per ECMA-402 (applies whether or
+            // not the mantissa was re-rounded).
+            if matches!(opts.notation, intl::number::Notation::Compact) {
+                split_compact_affix_parts(&mut parts);
+            }
             let sd = self
                 .realm
                 .get_property(handle, "signDisplay")

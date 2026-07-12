@@ -3871,6 +3871,38 @@ impl<'a> Interp<'a> {
                         }
                         return Ok(Some(NanBox::number(idx)));
                     }
+                    // A sparse array (logical length beyond the dense store) is
+                    // scanned by its *present* indices in ascending order from
+                    // `from` — iterating every index up to `len` would be billions
+                    // of steps. Present = dense non-hole slots plus any element
+                    // stored past the dense cap as an aux integer-key property; a
+                    // named key `>= len` (a boundary/2**32+ property) is not an
+                    // element and is excluded.
+                    let dense_len = elems.len();
+                    let logical = self.realm.array_length(handle).unwrap_or(dense_len);
+                    if logical > dense_len {
+                        let from = self.array_from_index_checked(arg(1), logical)?;
+                        let mut present: Vec<usize> = (from..dense_len.min(logical))
+                            .filter(|&i| !elems[i].is_hole())
+                            .collect();
+                        for k in self.realm.aux_all_keys(handle) {
+                            if let Ok(i) = k.parse::<usize>()
+                                && i >= from
+                                && i < logical
+                                && alloc::format!("{i}") == k
+                            {
+                                present.push(i);
+                            }
+                        }
+                        present.sort_unstable();
+                        for &i in &present {
+                            let e = self.read_member(handle, &alloc::format!("{i}"))?;
+                            if self.realm.strict_equals(e, target) {
+                                return Ok(Some(NanBox::number(i as f64)));
+                            }
+                        }
+                        return Ok(Some(NanBox::number(-1.0)));
+                    }
                     // Length is checked before ToInteger(fromIndex): an empty array
                     // returns -1 without coercing the (possibly side-effecting)
                     // fromIndex argument.
@@ -4440,9 +4472,16 @@ impl<'a> Interp<'a> {
                     };
                     // A hole/accessor array copies through `[[Get]]`/`[[Set]]`/
                     // `Delete` (getters/setters fire, holes propagate), choosing the
-                    // copy *direction* so overlapping ranges are not clobbered.
+                    // copy *direction* so overlapping ranges are not clobbered. The
+                    // precise path is also taken when coercing `target`/`start`/`end`
+                    // (each ToInteger may run a user `valueOf`) mutated the array —
+                    // e.g. shrank its length — so the copy must consult the *live*
+                    // array (`HasProperty`/`[[Get]]`/`Delete`), not the stale
+                    // pre-coercion `elems` snapshot (`len` stays the captured value).
                     if self.realm.array_has_index_overrides(handle)
                         || elems.iter().any(|e| e.is_hole())
+                        || self.realm.array_length(handle) != Some(elems.len())
+                        || self.realm.array_dense_len(handle) != Some(elems.len())
                     {
                         let count = (end - start).min(len - target).max(0);
                         let (mut from, mut to, dir) = if start < target && target < start + count {
@@ -4554,7 +4593,15 @@ impl<'a> Interp<'a> {
                 }
                 "lastIndexOf" => {
                     let target = arg(0);
-                    let len = elems.len();
+                    let typed = self.realm.typed_kind(handle).is_some();
+                    let dense_len = elems.len();
+                    // The *logical* length (a sparse array's may exceed the dense
+                    // snapshot: `arr[2**32-2] = v` leaves the dense store empty).
+                    let len = if typed {
+                        dense_len
+                    } else {
+                        self.realm.array_length(handle).unwrap_or(dense_len)
+                    };
                     if len == 0 {
                         return Ok(Some(NanBox::number(-1.0)));
                     }
@@ -4570,13 +4617,38 @@ impl<'a> Interp<'a> {
                     } else {
                         len - 1
                     };
-                    let typed = self.realm.typed_kind(handle).is_some();
                     // Per spec, a fromIndex coercion that detached / OOB'd the typed
                     // array makes `lastIndexOf` return -1 (no search).
                     if typed
                         && (self.typed_array_detached(handle)
                             || self.realm.typed_array_out_of_bounds(handle))
                     {
+                        return Ok(Some(NanBox::number(-1.0)));
+                    }
+                    // A sparse array (logical length beyond the dense store) is walked
+                    // by its *present* indices in descending order — iterating every
+                    // index down from `from` would be billions of steps. Present =
+                    // dense non-hole slots plus any element stored past the dense cap
+                    // as an aux integer-key named property.
+                    if !typed && len > dense_len {
+                        let mut present: Vec<usize> = (0..dense_len.min(from + 1))
+                            .filter(|&i| !elems[i].is_hole())
+                            .collect();
+                        for k in self.realm.aux_all_keys(handle) {
+                            if let Ok(i) = k.parse::<usize>()
+                                && i <= from
+                                && alloc::format!("{i}") == k
+                            {
+                                present.push(i);
+                            }
+                        }
+                        present.sort_unstable();
+                        for &i in present.iter().rev() {
+                            let e = self.read_member(handle, &alloc::format!("{i}"))?;
+                            if self.realm.strict_equals(e, target) {
+                                return Ok(Some(NanBox::number(i as f64)));
+                            }
+                        }
                         return Ok(Some(NanBox::number(-1.0)));
                     }
                     let mut found = -1.0;
@@ -5159,9 +5231,7 @@ impl<'a> Interp<'a> {
         // a revoked proxy throws), so unwrap the proxy chain here. The subsequent
         // `Get(original, "constructor")` also runs through any proxy `get` trap.
         if !self.is_array_unwrap_proxy(NanBox::handle(original.to_raw()))? {
-            let mut v = alloc::vec![NanBox::hole(); 0];
-            v.resize(length, NanBox::hole());
-            return Ok(NanBox::handle(self.realm.new_array(v).to_raw()));
+            return self.array_create_holes(length);
         }
         let mut c = self.read_member(original, "constructor")?;
         // Step 6 (cross-realm): if C is a constructor from a *different* realm than
@@ -5205,14 +5275,30 @@ impl<'a> Interp<'a> {
         let is_default = matches!(c.unpack(), Unpacked::Undefined)
             || self.current.get("Array").and_then(|v| v.as_handle()) == c.as_handle();
         if is_default {
-            let mut v = alloc::vec![NanBox::hole(); 0];
-            v.resize(length, NanBox::hole());
-            return Ok(NanBox::handle(self.realm.new_array(v).to_raw()));
+            return self.array_create_holes(length);
         }
         if !self.is_constructor_value(c) {
             return Err(self.type_error("Array species is not a constructor"));
         }
         self.construct(c, &[NanBox::number(length as f64)])
+    }
+
+    /// `ArrayCreate(length)` — a plain array of `length` holes. A `length` above
+    /// the uint32 ceiling (2**32-1) is a `RangeError("Invalid array length")`. A
+    /// length beyond the dense storage cap is left *sparse* (an empty backing
+    /// `Vec` with a logical-length override) rather than materialized, so a valid
+    /// but enormous species length (e.g. the default-species result of a method on
+    /// a `length === 2**32-1` array) neither aborts nor OOMs.
+    fn array_create_holes(&mut self, length: usize) -> Result<NanBox, ExecError> {
+        if length as u64 > u64::from(u32::MAX) {
+            let m = self.new_str("Invalid array length");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        let h = self.realm.new_array(alloc::vec::Vec::new());
+        if length > 0 {
+            self.realm.set_array_length(h, length);
+        }
+        Ok(NanBox::handle(h.to_raw()))
     }
 
     /// `CreateDataPropertyOrThrow(O, ToString(index), value)`: defines a
@@ -5633,16 +5719,6 @@ impl<'a> Interp<'a> {
                 {
                     let m = self.new_str("Invalid array length");
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-                }
-                // ArraySpeciesCreate(O, actualDeleteCount): a non-array `O` builds a
-                // fresh array of that length — ArrayCreate throws a RangeError when
-                // the length exceeds 2**32-1 (and the engine's own cap), *before* any
-                // element is read or written.
-                if delete_count > u32::MAX as usize
-                    || delete_count > self.realm.limits.max_array_len
-                {
-                    let m = self.new_str("Invalid array length");
-                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                 }
                 // `A = ArraySpeciesCreate(O, actualDeleteCount)` — for a *proxy* whose
                 // target is an Array, `IsArray(O)` is true, so this reads

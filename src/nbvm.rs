@@ -2700,20 +2700,18 @@ fn run_frame(
                     return Err(VmError::Unsupported);
                 }
                 let i = fi as usize;
-                // C1: a dense-array write past the capacity cap is refused by the
-                // realm (a silent no-op); surface it as a catchable
-                // `RangeError("Invalid array length")` so `a[1e9] = 1` throws
-                // rather than vanishing. A typed-array out-of-bounds write stays a
-                // spec no-op. This applies only to true array *indices*
-                // (`[0, 2**32−1)`); the boundary `2**32−1` and above are ordinary
-                // named properties (handled below) and never raise this RangeError.
+                // A dense-array write to a valid array index (`[0, 2**32−1)`) past
+                // the storage cap must store the element sparsely (as a named
+                // property) and grow the logical `length` — a plain `arr[i] = v`
+                // never raises "Invalid array length". The descriptor-aware
+                // tree-walker owns that sparse path (`set_element_checked`); fault
+                // to it. A typed-array out-of-bounds write stays a spec no-op.
                 if ctx.realm.typed_len(handle).is_none()
                     && ctx.realm.is_array(handle)
                     && (i as u64) < u64::from(u32::MAX)
                     && i >= ctx.realm.limits.max_array_len
                 {
-                    let e = make_error(ctx.realm, "RangeError", "Invalid array length");
-                    handle_throw!(VmError::Thrown(e));
+                    return Err(VmError::Unsupported);
                 }
                 // A plain Array's element keys are [0, 2**32−1); the boundary value
                 // 2**32−1 is an ordinary named property (no ArraySetLength).
@@ -9187,12 +9185,13 @@ mod tests {
         realm.to_display_string(value)
     }
 
-    /// C1: in the bytecode VM, a dense-array element write past the
-    /// `max_array_len` cap raises a catchable `RangeError`. A `length` set to a
-    /// valid uint32 above the cap is a spec-conformant sparse length (no throw);
-    /// only a length above the uint32 ceiling is invalid. Exercised through the
-    /// production `execute` entry (VM with the tree-walker fallback) since a raw
-    /// `bc()` run has no fallback for the `try`/`catch` and `RangeError` ctor.
+    /// C1: in the bytecode VM, a dense-array element write to a valid array index
+    /// (`< 2^32-1`) past the `max_array_len` cap is served *sparsely* (the VM
+    /// faults to the tree-walker, which stores it as an aux named property + a
+    /// logical-length bump) — a plain `arr[i] = v` never throws. A `length` set to
+    /// a valid uint32 above the cap is likewise a sparse length; only a length
+    /// above the uint32 ceiling is invalid. Exercised through the production
+    /// `execute` entry (VM with the tree-walker fallback).
     #[test]
     fn vm_oversized_array_growth_throws_range_error() {
         let v = |src: &str| -> String {
@@ -9201,21 +9200,17 @@ mod tests {
                 Err(e) => alloc::format!("ERR:{e}"),
             }
         };
-        // A dense element write past the cap → caught RangeError instance.
+        // A valid-index element write past the cap stores sparsely, growing
+        // `length` to `i + 1`; no throw.
         assert_eq!(
-            v("var a=[1]; try{a[1e9]=1;'no'}catch(e){e.constructor.name}"),
-            "RangeError"
+            v("var a=[1]; a[1e9]=1; String(a.length)+','+a[1e9]"),
+            "1000000001,1"
         );
         // A valid uint32 `length` set is a sparse length (no throw); reported as-is.
         assert_eq!(v("var a=[1]; a.length=1e9; String(a.length)"), "1000000000");
         assert_eq!(
             v("var a=[1]; a['length']=1e9; String(a.length)"),
             "1000000000"
-        );
-        // Uncaught element-write overflow → surfaced as a RangeError completion.
-        assert_eq!(
-            v("var a=[1]; a[1e9]=1"),
-            "ERR:RangeError: Invalid array length"
         );
         // A length above the uint32 ceiling (2^32) is invalid → RangeError.
         assert_eq!(

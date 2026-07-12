@@ -2567,7 +2567,10 @@ impl Realm {
     pub fn set_array_length(&mut self, handle: Handle, len: usize) -> bool {
         let cap = self.limits.max_array_len;
         let raw = handle.to_raw();
-        match self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
+        // The prior logical length, to detect a shrink that must delete sparse
+        // elements (integer-index named properties stored past the dense cap).
+        let old_len = self.array_length(handle);
+        let is_array = match self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
             Some(a) => {
                 if len > cap {
                     // Sparse: keep whatever dense elements exist (already <= cap), and
@@ -2586,7 +2589,43 @@ impl Realm {
                 true
             }
             None => false,
+        };
+        if !is_array {
+            return false;
         }
+        // On a shrink, delete every *sparse* element (an integer-index named
+        // property stored past the dense cap) whose index is >= the new length.
+        // The dense `Vec` resize above already dropped in-dense indices; the aux
+        // object it cannot reach is swept here so `arr[hugeIdx]` reads `undefined`
+        // after `arr.length` is lowered below it (ArraySetLength deletes them).
+        if old_len.is_some_and(|old| len < old)
+            && let Some(aux) = self.aux_props.get(&raw).copied()
+        {
+            let doomed: Vec<alloc::string::String> = self
+                .heap
+                .get(aux)
+                .and_then(Cell::as_object)
+                .map(|o| {
+                    o.all_keys()
+                        .iter()
+                        .filter(|k| {
+                            k.parse::<usize>()
+                                .is_ok_and(|i| i >= len && alloc::format!("{i}") == **k)
+                        })
+                        .map(|s| alloc::string::String::from(*s))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !doomed.is_empty() {
+                let root = Rc::clone(&self.root_shape);
+                if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
+                    for k in &doomed {
+                        o.delete(Rc::clone(&root), k);
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Whether an `arr.length = new_len` set needs the descriptor-aware tree-walker

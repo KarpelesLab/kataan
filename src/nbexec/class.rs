@@ -357,6 +357,13 @@ impl<'a> Interp<'a> {
             // inner class-name binding is in scope: a closure created here
             // (`class C extends (f = () => C, …)`) captures `class_env` and, when
             // called after the class is defined, resolves `C` to the class.
+            // Per ClassDefinitionEvaluation the inner name binding exists but is
+            // uninitialized (TDZ) while the heritage runs, so a *direct* reference to
+            // it there (`class x extends x {}`) is a ReferenceError, not a resolution
+            // to an outer binding. It is initialized to the class value below.
+            if let Some(id) = &class.id {
+                class_env.declare_const(&id.name, NanBox::tdz());
+            }
             let saved_heritage_env = core::mem::replace(&mut self.current, class_env.clone());
             let sval = self.eval(expr);
             self.current = saved_heritage_env;
@@ -1411,9 +1418,15 @@ impl<'a> Interp<'a> {
                     // `super(...)` initializes `this` and runs this class's field
                     // initializers. A *base* constructor binds `this` and runs its
                     // fields up front, before the body.
+                    // A class with *any* heritage (`extends <expr>`) is a derived
+                    // constructor — including `extends null`, whose `super()` reaches
+                    // `%Function.prototype%` (a non-constructor) and throws a TypeError,
+                    // and whose `this` is in its TDZ until then. `parent`/native/fn are
+                    // all absent for `extends null`, so the AST heritage is the signal.
                     let is_derived = parent.is_some()
                         || self.pending_super_native.is_some()
-                        || self.pending_super_fn.is_some();
+                        || self.pending_super_fn.is_some()
+                        || class.super_class.is_some();
                     let (poisoned_this, saved_pending) = if is_derived {
                         let inst = NanBox::handle(instance.to_raw());
                         let sp = self.pending_this_init.replace((inst, class_id));

@@ -1081,31 +1081,15 @@ impl<'a> Interp<'a> {
         // `ToDateDurationRecordWithoutTime`: fold the time part into whole days.
         let extra_days = dur.time_nanos() / temporal_iso::NS_PER_DAY;
         let days = dur.days + extra_days;
-        // The overall sign of the (date) duration selects the anchor day: day 1
-        // for a non-negative duration, else the last day of the calendar month.
-        let sign = if dur.years != 0 {
-            dur.years.signum()
-        } else if dur.months != 0 {
-            dur.months.signum()
-        } else if dur.weeks != 0 {
-            dur.weeks.signum()
-        } else {
-            days.signum()
-        };
+        // `AddDurationToYearMonth` (spec): set the reference day to 1, build the
+        // first-of-month date with `constrain` (day 1 is always valid), then add
+        // the calendar-aware duration under the *caller's* `overflow`. Passing the
+        // real overflow is what makes a `reject` that lands on a leap month absent
+        // in the target year (e.g. Adar I `M05L` a year away from a common year, or
+        // a numeric ordinal that maps to a vanished intercalary month) throw a
+        // RangeError instead of silently constraining onto the augmented month.
         let f = tcal::iso_to_fields(&cal, data.date);
-        let anchor_day = if sign < 0 {
-            // Last day of the calendar month: constrain a huge day request.
-            let first = self.resolve_year_month_cal_day(&cal, &f, 1, Overflow::Constrain)?;
-            tcal::days_in_month(&cal, first)
-        } else {
-            1
-        };
-        let intermediate =
-            self.resolve_year_month_cal_day(&cal, &f, anchor_day, Overflow::Constrain)?;
-        // The anchor day is synthetic (reference day 1 or the month's last day),
-        // so the year/month step always *constrains* it — `overflow` (reject)
-        // only governs the final year-month resolution, whose day-1 reference is
-        // always valid.
+        let intermediate = self.resolve_year_month_cal_day(&cal, &f, 1, Overflow::Constrain)?;
         let added = match tcal::calendar_date_add(
             &cal,
             intermediate,
@@ -1113,7 +1097,7 @@ impl<'a> Interp<'a> {
             dur.months as i64,
             dur.weeks as i64,
             days as i64,
-            Overflow::Constrain,
+            overflow,
         ) {
             Ok(d) => d,
             Err(tcal::CalError::Range(m)) => return Err(self.pym_range(&m)),
