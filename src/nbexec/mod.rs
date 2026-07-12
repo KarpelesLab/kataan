@@ -6101,16 +6101,29 @@ impl<'a> Interp<'a> {
                 .take_while(|p| !p.rest && p.default.is_none())
                 .count();
             self.install_fn_name_length(h, "anonymous", len as u32);
+            // `GetPrototypeFromConstructor(newTarget, fallbackProto)`
+            // (CreateDynamicFunction step 22/18): the built function's
+            // `[[Prototype]]` derives from `newTarget`'s realm. `make_function`
+            // already set the current realm's kind-appropriate fallback
+            // (`%Function.prototype%` / `%GeneratorFunction.prototype%` / …); a
+            // cross-realm `newTarget` (`Reflect.construct(Function, …, otherRealmC)`)
+            // whose `.prototype` is a non-Object re-links to *its* realm's
+            // `%Function.prototype%` (via `realm_default_proto`, keyed on the
+            // fallback's `constructor.name`). A same-realm / plain-call `newTarget`
+            // (`== callee` or absent) leaves the fallback untouched. The
+            // `GeneratorFunction`/`AsyncFunction`/`AsyncGeneratorFunction` families
+            // are NOT bare globals, so their cross-realm intrinsic cannot be
+            // re-resolved this way — those `*/proto-from-ctor-realm` cases remain
+            // deferred (and are also gated on cross-realm `eval` running in the
+            // target realm, which it does not yet).
+            let default = self.realm.object_proto(h);
+            if let Some(proto) = self.instance_proto_checked(new_target, callee, default)? {
+                self.realm.set_native_proto(h, proto);
+            }
             // `GetFunctionRealm` tagging: a dynamic function belongs to the realm of
             // the `Function`/`GeneratorFunction`/… whose `[[Construct]]` built it
             // (`callee`), so a subsequent `new other.Function()` used as a
             // cross-realm `newTarget` is recognized by `GetPrototypeFromConstructor`.
-            // (Its own `[[Prototype]]` is intentionally left as the current realm's
-            // `%Function.prototype%`: the `AsyncFunction === Function` conflation —
-            // and the fact that `%GeneratorFunction%`/`%AsyncGeneratorFunction%` are
-            // not bare globals — makes a realm-derived re-link ambiguous for this
-            // path, so the `*-prototype` realm-tagging tests are deferred.)
-            let _ = new_target;
             if let Some(idx) = callee
                 .as_handle()
                 .map(Handle::from_raw)

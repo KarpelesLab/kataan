@@ -10209,6 +10209,57 @@ fn iterator_abstract_construct_and_cross_realm_proto() {
     );
 }
 
+#[test]
+fn dynamic_function_cross_realm_derives_new_targets_function_prototype() {
+    // `Reflect.construct(Function, [], C)` where `C` belongs to another realm and
+    // has a non-object `.prototype` links the built function to *that realm's*
+    // `%Function.prototype%` (CreateDynamicFunction → GetPrototypeFromConstructor
+    // step 4, resolving the intrinsic in `GetFunctionRealm(C)`'s realm).
+    assert_eq!(
+        run(r#"
+            var other = $262_createRealm().global;
+            var C = new other.Function();
+            C.prototype = null;
+            var o = Reflect.construct(Function, [], C);
+            Object.getPrototypeOf(o) === other.Function.prototype
+        "#),
+        "true"
+    );
+    // A non-null non-object `.prototype` (e.g. a number) still derives the realm's
+    // intrinsic default.
+    assert_eq!(
+        run(r#"
+            var other = $262_createRealm().global;
+            var C = new other.Function();
+            C.prototype = 1;
+            Object.getPrototypeOf(Reflect.construct(Function, [], C)) === other.Function.prototype
+        "#),
+        "true"
+    );
+    // An object `.prototype` on the cross-realm newTarget is used directly.
+    assert_eq!(
+        run(r#"
+            var other = $262_createRealm().global;
+            var C = new other.Function();
+            var op = {};
+            C.prototype = op;
+            Object.getPrototypeOf(Reflect.construct(Function, [], C)) === op
+        "#),
+        "true"
+    );
+    // Same-realm construction (plain `new Function()` / `Function()`) is untouched:
+    // the built function keeps the current realm's `%Function.prototype%`.
+    assert_eq!(
+        run(r#"
+            var a = new Function("return 1");
+            var b = Function("return 2");
+            (Object.getPrototypeOf(a) === Function.prototype) &&
+            (Object.getPrototypeOf(b) === Function.prototype) && (b() === 2)
+        "#),
+        "true"
+    );
+}
+
 #[cfg(feature = "intl")]
 #[test]
 fn intl_cross_realm_derives_new_targets_service_prototype() {
