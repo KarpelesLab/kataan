@@ -249,7 +249,7 @@ impl<'a> Interp<'a> {
                 is_await,
                 ..
             } => {
-                let iterable = self.eval(right)?;
+                let iterable = self.eval_for_head_rhs(left, right)?;
                 // A user iterator (not a built-in array/string/Map/Set or generator)
                 // runs lazily: one `next()` per iteration, with `IteratorClose` on an
                 // early exit — so `break` calls `return()` and an infinite iterator can
@@ -277,7 +277,7 @@ impl<'a> Interp<'a> {
             Stmt::ForIn {
                 left, right, body, ..
             } => {
-                let obj = self.eval(right)?;
+                let obj = self.eval_for_head_rhs(left, right)?;
                 // `for..in` (EnumerateObjectProperties) calls `[[GetOwnProperty]]`
                 // per own key to test enumerability; a module namespace with any
                 // TDZ export throws a ReferenceError before the loop body runs.
@@ -1507,6 +1507,44 @@ impl<'a> Interp<'a> {
             }
             _ => Err(ExecError::Unsupported("assignment target")),
         }
+    }
+
+    /// Evaluates a `for-in`/`for-of` head's right-hand side (the iterable /
+    /// enumerated-object expression) per ForIn/OfHeadEvaluation. When the head is
+    /// a **lexical** ForDeclaration (`let`/`const`/`using`/`await using`), its
+    /// bound names are first created in a fresh declarative environment as
+    /// uninitialized (TDZ) bindings, the expression is evaluated in that
+    /// environment, and the environment is then discarded (step 2–4). A reference
+    /// to a bound name *inside* the expression — directly (`for (let x of [x])`)
+    /// or through a closure captured there (`for (let x of (f = () => x, []))`) —
+    /// therefore throws a ReferenceError. A `var` head or a bare assignment target
+    /// evaluates the expression in the current scope, unchanged.
+    fn eval_for_head_rhs(
+        &mut self,
+        left: &'a crate::ast::ForLeft,
+        right: &'a Expr,
+    ) -> Result<NanBox, ExecError> {
+        use crate::ast::{ForLeft, VarDeclKind};
+        let mut tdz_names: Vec<&str> = Vec::new();
+        if let ForLeft::Decl { kind, target, .. } = left
+            && !matches!(kind, VarDeclKind::Var)
+        {
+            collect_binding_idents(target, &mut tdz_names);
+        }
+        if tdz_names.is_empty() {
+            return self.eval(right);
+        }
+        // The TDZ environment lives only for the duration of the expression
+        // evaluation; any closure created within it keeps it alive (its bound
+        // names stay uninitialized forever, so a later call still throws).
+        let child = self.current.child();
+        for name in &tdz_names {
+            child.declare(name, NanBox::tdz());
+        }
+        let saved = core::mem::replace(&mut self.current, child);
+        let result = self.eval(right);
+        self.current = saved;
+        result
     }
 
     pub(crate) fn exec_switch(

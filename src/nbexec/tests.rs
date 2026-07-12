@@ -8299,6 +8299,55 @@ fn var_for_in_of_binding_writes_the_hoisted_var() {
 }
 
 #[test]
+fn for_of_in_head_bound_names_are_in_tdz() {
+    // ForIn/OfHeadEvaluation: the ForDeclaration's bound names are created in a
+    // TDZ *before* the iterable/enumerated expression is evaluated, so a
+    // reference to a bound name inside that expression throws a ReferenceError
+    // (test262 for-of/for-in head-*-bound-names-fordecl-tdz).
+    let is_ref_err = "e instanceof ReferenceError";
+    assert_eq!(
+        run(&alloc::format!(
+            "var a=1;try{{let a=2;for(let a of [a]){{}}}}catch(e){{a={is_ref_err}}}a"
+        )),
+        "true"
+    );
+    assert_eq!(
+        run(&alloc::format!(
+            "var a=1;try{{let a=2;for(let a in {{a:a}}){{}}}}catch(e){{a={is_ref_err}}}a"
+        )),
+        "true"
+    );
+    // `const` head, same rule.
+    assert_eq!(
+        run(&alloc::format!(
+            "var a=1;try{{for(const x of [x]){{}}}}catch(e){{a={is_ref_err}}}a"
+        )),
+        "true"
+    );
+    // A closure created in the head expression captures the TDZ binding, so a
+    // later `typeof x` in it still throws (test262 scope-head-lex-open).
+    assert_eq!(
+        run(&alloc::format!(
+            "var p;for(let x of (p=function(){{typeof x;}},[]));\
+             var a=0;try{{p()}}catch(e){{a={is_ref_err}}}a"
+        )),
+        "true"
+    );
+    // Negatives: an expression that does not reference a bound name is fine, and
+    // the per-iteration body binding is unaffected.
+    assert_eq!(run("var s=0;for(let i of [1,2,3])s+=i;s"), "6");
+    assert_eq!(run("var arr=[1,2];var n=0;for(let y of arr)n++;n"), "2");
+    // A `var` head is *not* in a TDZ (the name is hoisted to `undefined`); the
+    // array `[v]` reads that hoisted `undefined` without throwing.
+    assert_eq!(run("var n=0;for(var v of [v]){n++}n"), "1");
+    // Per-iteration binding still gives each closure its own value.
+    assert_eq!(
+        run("var f=[];for(let i of [0,1,2]){f.push(function(){return i})}f[0]()+f[1]()+f[2]()"),
+        "3"
+    );
+}
+
+#[test]
 fn for_of_over_plain_array_is_live() {
     // test262 language/statements/for-of/array-expand and array-contract.
     assert_eq!(
