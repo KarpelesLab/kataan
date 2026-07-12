@@ -157,7 +157,7 @@ fn parse_month_code(s: &str) -> Option<(i64, bool)> {
 /// Parses a bare offset *identifier* (minute precision only): `±HH`, `±HHMM`,
 /// `±HH:MM`. Returns `(offset_ns, canonical "±HH:MM")`. Sub-minute forms and any
 /// trailing junk are rejected (they are not valid time-zone identifiers).
-fn parse_offset_id(s: &str) -> Option<(i128, String)> {
+pub(crate) fn parse_offset_id(s: &str) -> Option<(i128, String)> {
     let (neg, rest) = match s.as_bytes().first()? {
         b'+' => (false, &s[1..]),
         b'-' => (true, &s[1..]),
@@ -257,7 +257,7 @@ fn parse_offset_value(s: &str) -> Option<i128> {
 }
 
 /// Resolves an IANA time-zone name to its canonical form via the embedded db.
-fn resolve_named(s: &str) -> Option<String> {
+pub(crate) fn resolve_named(s: &str) -> Option<String> {
     timezone_data::load_insensitive(s)
         .ok()
         .map(|z| z.name().to_string())
@@ -558,7 +558,7 @@ pub(crate) fn tz_primary(id: &str) -> String {
 
 /// The offset (ns east of UTC) of `tz` at the exact instant `epoch_ns`.
 /// `GetOffsetNanosecondsFor(tz, epoch_ns)`.
-fn tz_offset_at(tz: &str, epoch_ns: i128) -> i128 {
+pub(crate) fn tz_offset_at(tz: &str, epoch_ns: i128) -> i128 {
     if let Some((ns, _)) = parse_offset_id(tz) {
         return ns;
     }
@@ -3740,5 +3740,84 @@ mod dst_tests {
         assert_eq!(tz_primary("+05:30"), "+05:30");
         // Distinct zones keep distinct primaries.
         assert_ne!(tz_primary("Asia/Colombo"), tz_primary("Asia/Kolkata"));
+    }
+
+    // The following exercise the reusable helpers that back ECMA-402
+    // `Intl.DateTimeFormat` time-zone resolution and offset application (see
+    // `intl_fmt::Interp::dtf_resolve_time_zone` / `dtf_zone_offset_ms`).
+
+    #[test]
+    fn offset_identifier_canonicalization_for_dtf() {
+        // `IsTimeZoneOffsetString` accepts `±HH`, `±HHMM`, `±HH:MM` (minute
+        // precision) and normalizes to `±HH:MM`.
+        assert_eq!(parse_offset_id("+03").unwrap().1, "+03:00");
+        assert_eq!(parse_offset_id("+0300").unwrap().1, "+03:00");
+        assert_eq!(parse_offset_id("+01:03").unwrap().1, "+01:03");
+        assert_eq!(parse_offset_id("-14").unwrap().1, "-14:00");
+        assert_eq!(parse_offset_id("-2100").unwrap().1, "-21:00");
+        // Negative zero collapses to `+00:00`.
+        assert_eq!(parse_offset_id("-00").unwrap().1, "+00:00");
+        assert_eq!(parse_offset_id("-00:00").unwrap().1, "+00:00");
+        // Malformed offsets are rejected (→ RangeError in DTF).
+        for bad in [
+            "+3",
+            "+24",
+            "+23:0",
+            "-10.50",
+            "-1:10",
+            "+15:59:00",
+            "+13234",
+            "-22230",
+        ] {
+            assert!(parse_offset_id(bad).is_none(), "{bad} should be rejected");
+        }
+        // A U+2212 MINUS SIGN is not an ASCII sign, so it never parses.
+        assert!(parse_offset_id("\u{2212}05").is_none());
+    }
+
+    #[test]
+    fn named_zone_resolution_is_case_insensitive_and_preserves_links() {
+        // ASCII-case-insensitive matching returns the correctly-cased [[Identifier]].
+        assert_eq!(
+            resolve_named("africa/abidjan").as_deref(),
+            Some("Africa/Abidjan")
+        );
+        assert_eq!(
+            resolve_named("AMERICA/NEW_YORK").as_deref(),
+            Some("America/New_York")
+        );
+        assert_eq!(resolve_named("utc").as_deref(), Some("UTC"));
+        // Link identifiers are preserved, NOT canonicalized to their primary
+        // (matches `timezone-not-canonicalized.js`).
+        assert_eq!(
+            resolve_named("Asia/Calcutta").as_deref(),
+            Some("Asia/Calcutta")
+        );
+        // Legacy non-IANA abbreviations are not valid names.
+        for bad in ["ACT", "PST", "EST5EDT-junk", "MEZ", "invalid"] {
+            assert_eq!(resolve_named(bad), None, "{bad} should not resolve");
+        }
+    }
+
+    #[test]
+    fn named_zone_offset_is_dst_aware() {
+        let tz = "America/New_York";
+        // 2021-08-04T00:00Z is summer → Eastern Daylight Time = UTC-4.
+        let summer = wall(2021, 8, 4, 0, 0);
+        assert_eq!(tz_offset_at(tz, summer), -4 * iso::NS_PER_HOUR);
+        // 2021-01-04T00:00Z is winter → Eastern Standard Time = UTC-5.
+        let winter = wall(2021, 1, 4, 0, 0);
+        assert_eq!(tz_offset_at(tz, winter), -5 * iso::NS_PER_HOUR);
+        // Asia/Kolkata is a fixed +05:30 all year.
+        assert_eq!(
+            tz_offset_at("Asia/Kolkata", summer),
+            5 * iso::NS_PER_HOUR + 30 * iso::NS_PER_MINUTE
+        );
+        // A bare offset identifier applies its fixed offset regardless of instant.
+        assert_eq!(tz_offset_at("+03:00", winter), 3 * iso::NS_PER_HOUR);
+        assert_eq!(
+            tz_offset_at("-0509", summer),
+            -(5 * iso::NS_PER_HOUR + 9 * iso::NS_PER_MINUTE)
+        );
     }
 }

@@ -2566,8 +2566,17 @@ impl<'a> Interp<'a> {
         }
         let hc = self.get_string_option(opts, "hourCycle", &["h11", "h12", "h23", "h24"], None)?;
         self.store_str(obj, "hourCycle", &hc);
-        let _tz = self.get_string_option(opts, "timeZone", &[], None)?;
-        self.store_str(obj, "timeZone", &_tz);
+        // `timeZone`: ECMA-402 CreateDateTimeFormat steps 28–30. Undefined defaults
+        // to the (system) UTC zone; otherwise the string is either an offset
+        // identifier (`IsTimeZoneOffsetString`, canonicalized to `±HH:MM`) or a
+        // named IANA identifier (ASCII-case-insensitively matched via the embedded
+        // tz database and stored as its correctly-cased [[Identifier]] — links are
+        // NOT canonicalized to their primary). Anything else is a RangeError.
+        let tz = match self.get_string_option(opts, "timeZone", &[], None)? {
+            Some(s) => self.dtf_resolve_time_zone(&s)?,
+            None => String::from("UTC"),
+        };
+        self.store_str(obj, "timeZone", &Some(tz));
         // weekday/era/year/month/day/hour/minute/second/… component options.
         let nv = ["numeric", "2-digit"];
         let nm = ["long", "short", "narrow"];
@@ -2676,6 +2685,77 @@ impl<'a> Interp<'a> {
                 .set_hidden_property(obj, "\u{0}dtf_default_date", NanBox::boolean(true));
         }
         Ok(())
+    }
+
+    /// ECMA-402 CreateDateTimeFormat time-zone resolution (steps 29–30). Accepts a
+    /// UTC-offset identifier (`IsTimeZoneOffsetString`, minute precision only —
+    /// `±HH`, `±HHMM`, `±HH:MM` — normalized to `±HH:MM`, and `-00` → `+00:00`), or
+    /// a named IANA identifier matched ASCII-case-insensitively against the embedded
+    /// tz database and returned as its correctly-cased [[Identifier]] (links such as
+    /// `Asia/Calcutta` are preserved, NOT canonicalized to their primary). An empty
+    /// string, a U+2212 sign, a malformed offset, or an unknown name is a RangeError.
+    /// Reuses the Temporal time-zone helpers (same tz database as `ZonedDateTime`).
+    fn dtf_resolve_time_zone(&mut self, s: &str) -> Result<String, ExecError> {
+        use super::temporal_zoneddatetime::{parse_offset_id, resolve_named};
+        if !s.is_empty() {
+            if let Some((_, canon)) = parse_offset_id(s) {
+                return Ok(canon);
+            }
+            if let Some(name) = resolve_named(s) {
+                return Ok(name);
+            }
+        }
+        let m = self.new_str(&alloc::format!("invalid time zone: {s}"));
+        Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))))
+    }
+
+    /// The offset (in milliseconds east of UTC) that DateTimeFormat instance
+    /// `handle`'s resolved `timeZone` applies at the exact instant `epoch_ms`.
+    /// Returns 0 for the UTC default (and for any zone the tz database cannot
+    /// resolve). Named zones consult the embedded IANA data (DST-aware); offset
+    /// identifiers apply their fixed offset. Shared by the number/`Date` and the
+    /// Temporal (Instant/ZonedDateTime) formatting paths.
+    #[cfg(feature = "intl")]
+    fn dtf_zone_offset_ms(&self, handle: Handle, epoch_ms: i64) -> i64 {
+        let Some(tz) = self
+            .realm
+            .get_property(handle, "timeZone")
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+            .map(|v| self.realm.to_display_string(v))
+        else {
+            return 0;
+        };
+        if tz == "UTC" || tz.is_empty() {
+            return 0;
+        }
+        let epoch_ns = i128::from(epoch_ms) * 1_000_000;
+        (super::temporal_zoneddatetime::tz_offset_at(&tz, epoch_ns) / 1_000_000) as i64
+    }
+
+    /// Applies DateTimeFormat `handle`'s time zone to a Temporal value's epoch
+    /// milliseconds: an Instant/ZonedDateTime is an exact instant, so its wall-clock
+    /// rendering is shifted into the resolved zone (and the zone offset recorded for
+    /// `timeZoneName`); the wall-clock Plain* types carry no instant and are rendered
+    /// as-is (the zone is ignored, per the spec's `isPlain` handling). Returns the
+    /// (possibly shifted) epoch milliseconds to decompose.
+    #[cfg(feature = "intl")]
+    fn dtf_apply_temporal_zone(
+        &self,
+        handle: Handle,
+        ms: f64,
+        kind: crate::temporal_iso::TemporalKind,
+        o: &mut intl::datetime::DateTimeFormatOptions,
+    ) -> f64 {
+        use crate::temporal_iso::TemporalKind;
+        if matches!(kind, TemporalKind::Instant | TemporalKind::ZonedDateTime) {
+            let off = self.dtf_zone_offset_ms(handle, ms as i64);
+            if o.time_zone_name.is_some() {
+                o.tz_offset_minutes = Some((off / 60_000) as i32);
+            }
+            ms + off as f64
+        } else {
+            ms
+        }
     }
 
     /// The locale's default 12-hour cycle (`"h11"`/`"h12"`) and its default clock
@@ -4230,7 +4310,11 @@ impl<'a> Interp<'a> {
                 .map(|v| this.realm.to_display_string(v))
         };
         let locale = opt(self, "\u{0}locale").unwrap_or_else(|| String::from("en"));
-        let msi = ms as i64;
+        // A `Date`/number is an exact instant; shift its wall clock into the
+        // instance's resolved time zone (offset at that instant, DST-aware for named
+        // zones) before decomposing. `zone_off_ms` also feeds `timeZoneName`.
+        let zone_off_ms = self.dtf_zone_offset_ms(handle, ms as i64);
+        let msi = ms as i64 + zone_off_ms;
         let day = msi.div_euclid(86_400_000);
         let tod = msi.rem_euclid(86_400_000);
         let (y, mo, d) = crate::realm::civil_from_days(day);
@@ -4331,7 +4415,7 @@ impl<'a> Interp<'a> {
                 "longGeneric" => Some(TimeZoneNameStyle::LongGeneric),
                 _ => None,
             };
-            o.tz_offset_minutes = Some(0); // engine is UTC-only
+            o.tz_offset_minutes = Some((zone_off_ms / 60_000) as i32);
         }
         match datetime::format_to_parts(&locale, &dt, &o) {
             Ok(parts) => dtf_pad_time_parts(parts),
@@ -4871,11 +4955,12 @@ impl<'a> Interp<'a> {
         let Some((ms, kind)) = self.temporal_dtf_value(handle, value, zoned_ok)? else {
             return Ok(None);
         };
-        let Some(o) = self.temporal_plain_options(handle, kind) else {
+        let Some(mut o) = self.temporal_plain_options(handle, kind) else {
             return Err(self.type_error(
                 "the requested Intl.DateTimeFormat options are not compatible with this Temporal type",
             ));
         };
+        let ms = self.dtf_apply_temporal_zone(handle, ms, kind, &mut o);
         let mut s = String::new();
         for (_, v) in self.temporal_datetime_parts(handle, ms, &o) {
             s.push_str(&v);
@@ -4894,11 +4979,12 @@ impl<'a> Interp<'a> {
         let Some((ms, kind)) = self.temporal_dtf_value(handle, value, zoned_ok)? else {
             return Ok(None);
         };
-        let Some(o) = self.temporal_plain_options(handle, kind) else {
+        let Some(mut o) = self.temporal_plain_options(handle, kind) else {
             return Err(self.type_error(
                 "the requested Intl.DateTimeFormat options are not compatible with this Temporal type",
             ));
         };
+        let ms = self.dtf_apply_temporal_zone(handle, ms, kind, &mut o);
         Ok(Some(self.temporal_datetime_parts(handle, ms, &o)))
     }
 
@@ -5019,11 +5105,12 @@ impl<'a> Interp<'a> {
         value: NanBox,
     ) -> Result<(f64, String), ExecError> {
         if let Some((ms, kind)) = self.temporal_dtf_value(inst, value, false)? {
-            let Some(o) = self.temporal_plain_options(inst, kind) else {
+            let Some(mut o) = self.temporal_plain_options(inst, kind) else {
                 return Err(self.type_error(
                     "the requested Intl.DateTimeFormat options are not compatible with this Temporal type",
                 ));
             };
+            let ms = self.dtf_apply_temporal_zone(inst, ms, kind, &mut o);
             let mut s = String::new();
             for (_, v) in self.temporal_datetime_parts(inst, ms, &o) {
                 s.push_str(&v);
