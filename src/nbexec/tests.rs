@@ -11319,3 +11319,91 @@ fn abstract_module_source_intrinsic_shape() {
     "#;
     assert_eq!(run(program), "true");
 }
+
+#[test]
+fn shadow_realm_evaluate_isolates_globalthis_side_effects() {
+    // A `ShadowRealm` has its own genuinely-distinct `globalThis`: assignments in
+    // the shadow realm never touch the host realm's globals, and successive
+    // `evaluate` calls on the same instance share the shadow realm's globals.
+    let program = r#"
+        globalThis.myValue = 'host';
+        const r = new ShadowRealm();
+        r.evaluate('globalThis.myValue = "shadow";');
+        const inShadow = r.evaluate('globalThis.myValue');
+        // Host is untouched; shadow retained its own write.
+        (globalThis.myValue === 'host') && (inShadow === 'shadow')
+    "#;
+    assert_eq!(run(program), "true");
+}
+
+#[test]
+fn shadow_realm_instances_do_not_share_globals() {
+    // Two distinct `ShadowRealm` instances each have their own `globalThis`.
+    let program = r#"
+        const a = new ShadowRealm();
+        const b = new ShadowRealm();
+        a.evaluate('globalThis.x = 1;');
+        b.evaluate('globalThis.x = 2;');
+        (a.evaluate('globalThis.x') === 1) && (b.evaluate('globalThis.x') === 2)
+    "#;
+    assert_eq!(run(program), "true");
+}
+
+#[test]
+fn shadow_realm_globalthis_properties_are_configurable() {
+    // Every host-added `globalThis` property in a shadow realm is configurable
+    // (deletable), except the ES non-configurable value trio.
+    let program = r#"
+        const r = new ShadowRealm();
+        r.evaluate(`
+          const names = Object.keys(Object.getOwnPropertyDescriptors(globalThis));
+          const nonConfig = ['undefined', 'Infinity', 'NaN'];
+          const missed = Object.entries(Object.getOwnPropertyDescriptors(globalThis))
+            .filter(e => e[1].configurable === false)
+            .map(e => e[0])
+            .filter(n => !nonConfig.includes(n));
+          missed.join(',');
+        `)
+    "#;
+    assert_eq!(run(program), "");
+}
+
+#[test]
+fn shadow_realm_evaluate_wraps_callable_and_marshals_primitives() {
+    // A callable result is exposed as a wrapped function; calling it marshals
+    // primitives across the boundary. A non-primitive, non-callable argument or
+    // return value is a TypeError.
+    let program = r#"
+        const r = new ShadowRealm();
+        const add = r.evaluate('(a, b) => a + b');
+        let ok = (typeof add === 'function') && (add(2, 3) === 5);
+        // Passing an object argument across the boundary throws.
+        let threwArg = false;
+        try { add({}, 1); } catch (e) { threwArg = e instanceof TypeError; }
+        // Returning a non-callable object across the boundary throws.
+        let threwRet = false;
+        try { r.evaluate('({})'); } catch (e) { threwRet = e instanceof TypeError; }
+        ok && threwArg && threwRet
+    "#;
+    assert_eq!(run(program), "true");
+}
+
+#[test]
+fn shadow_realm_nested_realms_stay_isolated() {
+    // A shadow realm can create its own nested shadow realm; the three realms
+    // (host, realm1, realm2) each keep an independent `globalThis`.
+    let program = r#"
+        globalThis.myValue = 'a';
+        const realm1 = new ShadowRealm();
+        realm1.evaluate('globalThis.myValue = "b";');
+        const realm2Evaluate = realm1.evaluate(`
+          const realm2 = new ShadowRealm();
+          (str) => realm2.evaluate(str);
+        `);
+        realm2Evaluate('globalThis.myValue = "c";');
+        (globalThis.myValue === 'a')
+          && (realm1.evaluate('globalThis.myValue') === 'b')
+          && (realm2Evaluate('globalThis.myValue') === 'c')
+    "#;
+    assert_eq!(run(program), "true");
+}

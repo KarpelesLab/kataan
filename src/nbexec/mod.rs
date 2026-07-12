@@ -610,19 +610,15 @@ pub struct Interp<'a> {
     /// `eval` and the `Function` constructor run against a fresh child of this,
     /// regardless of the caller's current nesting.
     global_scope: Scope,
-    /// Per-`ShadowRealm`-instance persistent global scope (a child of
-    /// `global_scope`). A `ShadowRealm` instance stores an index into this vector
-    /// under a hidden slot, so successive `evaluate` calls on the same instance
-    /// share variable/function declarations. (Intrinsics are shared with the host
-    /// realm — a best-effort model, not a fully isolated realm.)
-    shadow_realm_scopes: Vec<Scope>,
-    /// Per-`$262.createRealm()` global environments — each a *genuinely distinct*
-    /// realm: its own global scope populated by a fresh `install_globals` (so its
-    /// `Array`/`Object`/`TypeError`/… are separate heap cells from every other
-    /// realm's), its own global object, and a snapshot of its intrinsic prototype
-    /// pointers. Unlike `shadow_realm_scopes` (which share the host intrinsics),
-    /// these back cross-realm identity (`other.Array !== Array`). The realm object
-    /// returned to JS stores an index into this vector under a hidden slot.
+    /// Per-`$262.createRealm()` **and** per-`ShadowRealm`-instance global
+    /// environments — each a *genuinely distinct* realm: its own global scope
+    /// populated by a fresh `install_globals` (so its `Array`/`Object`/`TypeError`/…
+    /// are separate heap cells from every other realm's), its own global object, and
+    /// a snapshot of its intrinsic prototype pointers. These back cross-realm
+    /// identity (`other.Array !== Array`) and `ShadowRealm` isolation (a shadow
+    /// realm's `globalThis` side effects never leak out). The realm object /
+    /// `ShadowRealm` instance returned to JS stores an index into this vector under a
+    /// hidden slot.
     created_realms: Vec<CreatedRealm>,
     /// `GetFunctionRealm` side table: maps a callable's raw handle to the index of
     /// the `$262.createRealm()` realm (`created_realms`) it belongs to. A function
@@ -2949,7 +2945,6 @@ impl<'a> Interp<'a> {
             global_this: NanBox::undefined(),
             output: String::new(),
             global_scope: Scope::root(),
-            shadow_realm_scopes: Vec::new(),
             created_realms: Vec::new(),
             fn_realm: alloc::collections::BTreeMap::new(),
             cur_realm: None,

@@ -37,8 +37,9 @@ const CREATED_REALM_IDX: &str = "\u{0}created_realm";
 
 /// Hidden internal-slot brand marking a `ShadowRealm` instance.
 const SHADOWREALM_BRAND: &str = "\u{0}shadowrealm";
-/// Hidden slot on a `ShadowRealm` instance: the index of its persistent global
-/// scope in `Interp::shadow_realm_scopes`.
+/// Hidden slot on a `ShadowRealm` instance: the index of its genuinely-distinct
+/// realm environment in `Interp::created_realms` (its own global object +
+/// intrinsics, so `globalThis` side effects stay isolated from the host realm).
 const SHADOWREALM_SCOPE_IDX: &str = "\u{0}shadowrealm_scope";
 
 /// `DisposableStack.prototype` method names (each a brand-checked bound native).
@@ -703,9 +704,10 @@ impl<'a> Interp<'a> {
     pub(crate) fn init_shadow_realm_super(&mut self, instance: Handle) {
         self.realm
             .set_hidden_property(instance, SHADOWREALM_BRAND, NanBox::boolean(true));
-        let idx = self.shadow_realm_scopes.len();
-        let scope = self.global_scope.child();
-        self.shadow_realm_scopes.push(scope);
+        // Allocate a genuinely-distinct realm (its own global object + intrinsics)
+        // so `evaluate` runs in an isolated environment whose `globalThis` side
+        // effects never leak to the host realm.
+        let idx = self.create_realm_env();
         self.realm
             .set_hidden_property(instance, SHADOWREALM_SCOPE_IDX, NanBox::number(idx as f64));
     }
@@ -1183,25 +1185,38 @@ impl<'a> Interp<'a> {
             .unwrap_or(error)
     }
 
-    /// `new ShadowRealm()` — a fresh branded instance. The "realm" itself is
-    /// modeled lazily: `evaluate` runs source in a fresh global child scope.
+    /// `new ShadowRealm()` — a fresh branded instance backed by a genuinely
+    /// distinct realm (its own global object + intrinsics), so `evaluate` runs in
+    /// an isolated environment whose `globalThis` side effects never leak out.
     pub(crate) fn construct_shadow_realm(
         &mut self,
         callee: NanBox,
         new_target: NanBox,
     ) -> Result<NanBox, ExecError> {
         let obj = self.realm.new_object();
-        let default = self.intrinsic_proto("ShadowRealm");
+        // The intrinsic default `[[Prototype]]` is the *callee's* own
+        // `%ShadowRealm.prototype%` — not the main realm's. For a cross-realm
+        // constructor (`Reflect.construct(otherRealm.ShadowRealm, [])`, where
+        // newTarget === callee) `resource_instance_proto` short-circuits to this
+        // default, so it must already be the other realm's prototype for the
+        // instance's `evaluate` to be attributed to that realm.
+        let default = callee
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+            .or_else(|| self.intrinsic_proto("ShadowRealm"));
         if let Some(proto) = self.resource_instance_proto(new_target, callee, default)? {
             self.realm.set_object_proto(obj, Some(proto));
         }
         self.realm
             .set_hidden_property(obj, SHADOWREALM_BRAND, NanBox::boolean(true));
-        // Allocate a persistent per-instance global scope (a child of the host
-        // global scope) so successive `evaluate` calls share declarations.
-        let idx = self.shadow_realm_scopes.len();
-        let scope = self.global_scope.child();
-        self.shadow_realm_scopes.push(scope);
+        // Allocate a genuinely-distinct realm environment (its own populated global
+        // scope + `globalThis` + intrinsic prototypes). Successive `evaluate` calls
+        // on this instance share that realm's persistent global scope, so their
+        // declarations persist — but stay fully isolated from the host realm.
+        let idx = self.create_realm_env();
         self.realm
             .set_hidden_property(obj, SHADOWREALM_SCOPE_IDX, NanBox::number(idx as f64));
         Ok(NanBox::handle(obj.to_raw()))
@@ -1267,6 +1282,12 @@ impl<'a> Interp<'a> {
         realm_obj: Option<Handle>,
         source_arg: NanBox,
     ) -> Result<NanBox, ExecError> {
+        // `callerRealm` is the current Realm Record — i.e. the realm of the
+        // `evaluate` method being invoked (`self.cur_realm`, established by
+        // `call_with_this`). The evaluation result is wrapped *into* this realm
+        // (its `%Function.prototype%`), and any boundary TypeError is thrown from
+        // it (see `make_error`).
+        let caller_realm = self.cur_realm;
         // The argument must be a String (no coercion of objects).
         let Some(source) = source_arg
             .as_handle()
@@ -1279,10 +1300,20 @@ impl<'a> Interp<'a> {
         // *as a SyntaxError* (per the ShadowRealm spec), not wrapped. ShadowRealm
         // code is global-scoped, so no inherited `super`.
         let program = self.parse_eval_program(&source, false, false, false, false, &[], false)?;
-        // Evaluate the parsed program in the instance's persistent global scope (a
-        // best-effort isolated environment that shares the intrinsics). A *runtime*
-        // throw is wrapped as a TypeError per the spec.
-        let result = self.shadow_realm_run_program(realm_obj, program);
+        // The instance's genuinely-distinct realm environment (its `created_realms`
+        // index, stamped at construction).
+        let Some(realm_idx) = realm_obj
+            .and_then(|h| self.realm.get_property(h, SHADOWREALM_SCOPE_IDX))
+            .and_then(|v| v.as_number())
+            .map(|n| n as usize)
+            .filter(|i| *i < self.created_realms.len())
+        else {
+            return Err(self.type_error("ShadowRealm has no associated realm"));
+        };
+        // Evaluate the parsed program in that realm (its globals/intrinsics swapped
+        // in for the duration). A *runtime* throw is wrapped as a TypeError from the
+        // caller realm per the spec.
+        let result = self.shadow_realm_run_program(realm_idx, program);
         let value = match result {
             Ok(v) => v,
             Err(ExecError::Throw(_)) => {
@@ -1294,11 +1325,11 @@ impl<'a> Interp<'a> {
         if !self.is_object_value(value) {
             return Ok(value);
         }
-        // A callable is wrapped in a new function in the caller's realm. Any error
-        // raised while copying `name`/`length` (e.g. a throwing accessor) is
-        // wrapped as a TypeError per the spec.
+        // A callable is wrapped in a new function derived from the caller's realm.
+        // Any error raised while copying `name`/`length` (e.g. a throwing accessor
+        // or a proxy trap) is wrapped as a TypeError per the spec.
         if self.is_callable_value(value) {
-            return match self.make_wrapped_function(value) {
+            return match self.make_wrapped_function(value, caller_realm) {
                 Ok(w) => Ok(w),
                 Err(ExecError::Throw(_)) => {
                     Err(self.type_error("ShadowRealm wrapped function creation threw"))
@@ -1311,65 +1342,146 @@ impl<'a> Interp<'a> {
         Err(self.type_error("ShadowRealm.prototype.evaluate result is not a primitive or callable"))
     }
 
-    /// Runs an already-parsed `program` in the `ShadowRealm` instance's persistent
-    /// global scope, returning its completion value. Declarations persist across
-    /// successive `evaluate` calls on the same instance. Mirrors indirect-eval
-    /// scoping (global `this`, sloppy unless the source self-declares strict).
+    /// Runs an already-parsed `program` in the genuinely-distinct realm at
+    /// `realm_idx`, returning its completion value. That realm's global scope,
+    /// `globalThis`, intrinsic prototypes, and `Intl` prototype cache are swapped
+    /// in for the duration (and `cur_realm` set to `realm_idx`, so a nested `new
+    /// ShadowRealm()` / thrown error / created closure is attributed to it), then
+    /// restored. Declarations persist across successive `evaluate` calls on the
+    /// same instance (they live in the realm's persistent global scope). Mirrors
+    /// [`eval_source_in_realm`](Self::eval_source_in_realm) but over a pre-parsed
+    /// program (parsing happens earlier so a SyntaxError surfaces in the *caller*
+    /// realm).
     fn shadow_realm_run_program(
         &mut self,
-        realm_obj: Option<Handle>,
+        realm_idx: usize,
         program: &'a Program,
     ) -> Result<NanBox, ExecError> {
         if self.eval_depth >= self.realm.limits.max_eval_depth {
             let msg = self.new_str("Maximum call stack size exceeded");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(msg))));
         }
-        // The instance's persistent scope (a fresh child fallback if absent).
-        let scope = realm_obj
-            .and_then(|h| self.realm.get_property(h, SHADOWREALM_SCOPE_IDX))
-            .and_then(|v| v.as_number())
-            .and_then(|n| self.shadow_realm_scopes.get(n as usize).cloned())
-            .unwrap_or_else(|| self.global_scope.child());
+        let scope = self.created_realms[realm_idx].global_scope.clone();
+        let global_this = self.created_realms[realm_idx].global_this;
+        let intrinsics = self.created_realms[realm_idx].intrinsics;
+
+        let saved_current = self.current.clone();
+        let saved_global_scope = self.global_scope.clone();
+        let saved_var_scope = self.var_scope.clone();
+        let saved_global_this = self.global_this;
+        let saved_this = self.this_val;
+        let saved_new_target = self.new_target;
         let saved_strict = self.strict;
-        let saved_scope = self.current.clone();
-        let (saved_this, saved_new_target) = (self.this_val, self.new_target);
+        let saved_realm = self.cur_realm;
+        let saved_intrinsics = self.realm.intrinsics_snapshot();
+
         self.strict = has_use_strict(&program.body);
         // A strict program gets its own child so its lexical declarations don't
-        // leak into the shared instance scope; a sloppy one runs directly in it so
-        // `var`/function declarations persist (matching global-scope eval).
-        self.current = if self.strict { scope.child() } else { scope };
-        self.this_val = self.global_this;
+        // leak into the realm's persistent global scope; a sloppy one runs directly
+        // in it so `var`/function declarations persist (matching global-scope eval).
+        self.current = if self.strict {
+            scope.child()
+        } else {
+            scope.clone()
+        };
+        self.global_scope = scope;
+        self.var_scope = self.current.clone();
+        self.global_this = global_this;
+        self.this_val = global_this;
         self.new_target = NanBox::undefined();
+        self.cur_realm = Some(realm_idx);
+        self.realm.restore_intrinsics(intrinsics);
+        // Swap in the realm's `Intl` service `.prototype` cache so same-realm
+        // `new Intl.X()` inside the evaluated source links to *this* realm's
+        // prototypes (and any lazily-built ones are written back below).
+        let child_intl = core::mem::take(&mut self.created_realms[realm_idx].intl_protos);
+        let saved_intl = self.realm.replace_intl_protos(child_intl);
         self.eval_depth += 1;
         let result = self.run_eval_body(program);
         self.eval_depth -= 1;
-        self.current = saved_scope;
-        self.strict = saved_strict;
+
+        self.created_realms[realm_idx].intl_protos = self.realm.replace_intl_protos(saved_intl);
+        self.current = saved_current;
+        self.global_scope = saved_global_scope;
+        self.var_scope = saved_var_scope;
+        self.global_this = saved_global_this;
         self.this_val = saved_this;
         self.new_target = saved_new_target;
+        self.strict = saved_strict;
+        self.cur_realm = saved_realm;
+        self.realm.restore_intrinsics(saved_intrinsics);
         result
     }
 
-    /// Wraps a callable `target` from the shadow realm in a new function exposed in
-    /// the caller's realm: an `N_SHADOW_REALM_WRAPPED` bound native carrying the
-    /// target, with `length`/`name` copied from the target.
-    fn make_wrapped_function(&mut self, target: NanBox) -> Result<NanBox, ExecError> {
+    /// A realm's `%Function.prototype%` — `realm`'s (`created_realms`) or the main
+    /// realm's (`None` / out of range). Resolved through the realm's `globalThis`,
+    /// so it is the correct heap cell for that realm even though intrinsics are not
+    /// currently swapped in.
+    fn realm_function_prototype(&mut self, realm: Option<usize>) -> Option<Handle> {
+        let gt = match realm {
+            Some(idx) if idx < self.created_realms.len() => self.created_realms[idx].global_this,
+            _ => self.main_global_this,
+        };
+        gt.as_handle()
+            .map(Handle::from_raw)
+            .and_then(|g| self.realm.get_property(g, "Function"))
+            .and_then(|f| f.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|f| self.realm.get_property(f, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+    }
+
+    /// Wraps a callable `target` in a new function exposed in `into_realm` (the
+    /// realm that will receive the wrapper — `None` for the main realm): an
+    /// `N_SHADOW_REALM_WRAPPED` bound native carrying the target, whose
+    /// `[[Prototype]]` is `into_realm`'s `%Function.prototype%` and whose
+    /// `[[Realm]]` (GetFunctionRealm) is `into_realm` — so calling it enters that
+    /// realm and its boundary TypeErrors carry that realm's `%TypeError%`.
+    /// `length`/`name` are copied from the target via CopyNameAndLength (whose
+    /// `HasOwnProperty(target, "length")` step is proxy-aware and may throw).
+    fn make_wrapped_function(
+        &mut self,
+        target: NanBox,
+        into_realm: Option<usize>,
+    ) -> Result<NanBox, ExecError> {
         let Some(th) = target.as_handle().map(Handle::from_raw) else {
             return Ok(NanBox::undefined());
         };
         let f = self.realm.new_bound_native(N_SHADOW_REALM_WRAPPED, th);
-        // `length` is `ToIntegerOrInfinity(Get(target, "length"))` clamped to
-        // [0, +∞): `read_member` invokes a `length` accessor if present.
-        let raw_len = self.read_member(th, "length")?;
-        let n = self.realm.to_number(raw_len);
-        // `ToIntegerOrInfinity` then clamped to [0, +∞]: NaN → 0, +∞ stays +∞,
-        // anything ≤ 0 → 0, otherwise truncated toward zero.
-        let length = if n.is_nan() || n <= 0.0 {
+        // `[[Prototype]]` = `into_realm`'s `%Function.prototype%` (WrappedFunctionCreate
+        // step 5). For the main realm this equals a wrapped callable's default proto,
+        // so same-realm wrappers are unchanged.
+        if let Some(fp) = self.realm_function_prototype(into_realm) {
+            self.realm.set_native_proto(f, fp);
+        }
+        // GetFunctionRealm tag: the wrapper belongs to `into_realm`, so a later
+        // call enters it (see `call_with_this`) and a non-wrappable argument/return
+        // throws *that realm's* `%TypeError%`. `None` (main) leaves the fast path.
+        if let Some(idx) = into_realm {
+            self.fn_realm.insert(f.to_raw(), idx);
+        }
+        // CopyNameAndLength: `HasOwnProperty(target, "length")` first (a proxy's
+        // `getOwnPropertyDescriptor` trap / a revoked proxy throws here), then
+        // `Get(target, "length")` only if present. `descriptor_of` is the
+        // proxy-aware `[[GetOwnProperty]]`.
+        let length = if matches!(
+            self.descriptor_of(th, "length")?.unpack(),
+            Unpacked::Undefined
+        ) {
             0.0
-        } else if n.is_infinite() {
-            f64::INFINITY
         } else {
-            trunc_toward_zero(n)
+            let raw_len = self.read_member(th, "length")?;
+            let n = self.realm.to_number(raw_len);
+            // `ToIntegerOrInfinity` clamped to [0, +∞]: NaN → 0, +∞ stays +∞,
+            // anything ≤ 0 → 0, otherwise truncated toward zero.
+            if n.is_nan() || n <= 0.0 {
+                0.0
+            } else if n.is_infinite() {
+                f64::INFINITY
+            } else {
+                trunc_toward_zero(n)
+            }
         };
         self.realm
             .set_hidden_property(f, "length", NanBox::number(length));
@@ -1401,13 +1513,22 @@ impl<'a> Interp<'a> {
         target: Handle,
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
+        // `call_with_this` has already entered the wrapper's own realm (its
+        // `[[Realm]]`, the *caller* realm the wrapper was created in), so
+        // `self.cur_realm` is that realm — boundary TypeErrors below carry its
+        // `%TypeError%`, and the call result is wrapped back *into* it.
+        let caller_realm = self.cur_realm;
+        // Arguments are wrapped *into the target's realm* (GetWrappedValue with the
+        // target's Realm Record), so the wrapped-callable arg the target receives is
+        // one of its own realm's functions.
+        let target_realm = self.get_function_realm(target);
         // Each argument must be a primitive or a callable (which is re-wrapped).
         let mut call_args = Vec::with_capacity(args.len());
         for &a in args {
             if !self.is_object_value(a) {
                 call_args.push(a);
             } else if self.is_callable_value(a) {
-                let w = self.make_wrapped_function(a)?;
+                let w = self.make_wrapped_function(a, target_realm)?;
                 call_args.push(w);
             } else {
                 return Err(self.type_error("wrapped function arguments must be primitives"));
@@ -1425,7 +1546,8 @@ impl<'a> Interp<'a> {
             return Ok(result);
         }
         if self.is_callable_value(result) {
-            return self.make_wrapped_function(result);
+            // The return value is wrapped back into the caller realm.
+            return self.make_wrapped_function(result, caller_realm);
         }
         Err(self.type_error("wrapped function result is not a primitive or callable"))
     }
