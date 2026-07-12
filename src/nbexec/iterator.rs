@@ -254,6 +254,11 @@ impl<'a> Interp<'a> {
         {
             return self.live_array_iter_next(h, arr);
         }
+        // A **lazy** RegExp String Iterator (has `RSI_MATCHER`) calls RegExpExec
+        // on each `next()`.
+        if self.realm.get_property(h, RSI_MATCHER).is_some() {
+            return self.regexp_string_iter_next(h);
+        }
         let Some(buf) = self
             .realm
             .get_property(h, GEN_BUF)
@@ -491,7 +496,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Builds an iterator-result object `{ value, done }`.
-    fn iter_result(&mut self, value: NanBox, done: bool) -> NanBox {
+    pub(crate) fn iter_result(&mut self, value: NanBox, done: bool) -> NanBox {
         let r = self.realm.new_object();
         self.realm.set_property(r, "value", value);
         self.realm.set_property(r, "done", NanBox::boolean(done));

@@ -4129,6 +4129,113 @@ fn uri_encoding_functions() {
         run("try{decodeURIComponent('%zz');'no'}catch(e){e instanceof Error}"),
         "true"
     );
+    // `decodeURI` preserves the reserved set (`;/?:@&=+$,#`); `decodeURIComponent`
+    // decodes it.
+    assert_eq!(run("decodeURI('%3B')"), "%3B");
+    assert_eq!(run("decodeURIComponent('%3B')"), ";");
+    assert_eq!(run("decodeURI('http:%2f%2Fa')"), "http:%2f%2Fa");
+    assert_eq!(run("decodeURIComponent('%2f')"), "/");
+    // Multi-byte UTF-8 assembles into the code point (Cyrillic).
+    assert_eq!(run("decodeURI('%D0%AE') === '\\u042E'"), "true");
+    // Invalid/overlong UTF-8 → URIError.
+    assert_eq!(
+        run("try{decodeURI('%C0%80');'no'}catch(e){e instanceof URIError}"),
+        "true"
+    );
+    // A lone surrogate is preserved verbatim by decode (not a `%` escape) …
+    assert_eq!(
+        run("decodeURI('\\uD800').charCodeAt(0).toString(16)"),
+        "d800"
+    );
+    // … but encoding an unpaired surrogate throws a URIError.
+    assert_eq!(
+        run("try{encodeURI('\\uD800');'no'}catch(e){e instanceof URIError}"),
+        "true"
+    );
+    assert_eq!(
+        run("try{encodeURIComponent('\\uDC00');'no'}catch(e){e instanceof URIError}"),
+        "true"
+    );
+    // A valid surrogate pair encodes to its 4-byte UTF-8 form.
+    assert_eq!(run("encodeURIComponent('\\u{1F600}')"), "%F0%9F%98%80");
+}
+
+#[test]
+fn uri_globals_resolve_inside_try() {
+    // Regression: the URI/escape globals must be resolvable as bare identifiers
+    // everywhere (they were missing from the VM's known-globals list, so a
+    // reference inside a `try` compiled to an inline ReferenceError throw).
+    for g in [
+        "decodeURI",
+        "decodeURIComponent",
+        "encodeURI",
+        "encodeURIComponent",
+        "escape",
+        "unescape",
+    ] {
+        assert_eq!(
+            run(&alloc::format!("try{{typeof {g}}}catch(e){{'threw'}}")),
+            "function",
+            "{g} should resolve inside a try block"
+        );
+    }
+}
+
+#[test]
+fn class_prototype_constructor_is_first() {
+    // `MakeConstructor` defines `prototype.constructor` before the ClassElements,
+    // so `constructor` precedes the methods in `[[OwnPropertyKeys]]` order.
+    assert_eq!(
+        run("class C{a(){} b(){}} Object.getOwnPropertyNames(C.prototype).join(',')"),
+        "constructor,a,b"
+    );
+    assert_eq!(
+        run("class C{a(){} ['b'](){} c(){}} Object.getOwnPropertyNames(C.prototype).join(',')"),
+        "constructor,a,b,c"
+    );
+    // A class instance inherits `constructor` from the prototype — it has no own
+    // `constructor` property.
+    assert_eq!(
+        run("class C{} new C().hasOwnProperty('constructor')"),
+        "false"
+    );
+    assert_eq!(run("class C{} new C().constructor === C"), "true");
+    // A computed `['constructor']` method is an ordinary prototype method, not the
+    // class constructor, so it is what an instance reads.
+    assert_eq!(
+        run("class C{['constructor'](){return 1;}} new C().constructor()"),
+        "1"
+    );
+    assert_eq!(
+        run("class C{['constructor'](){return 1;}} C.prototype.constructor !== C"),
+        "true"
+    );
+}
+
+#[test]
+fn match_all_iterator_honors_custom_exec() {
+    // `%RegExpStringIteratorPrototype%.next` calls `RegExpExec` lazily, so a
+    // custom `exec` installed after the iterator is created is honored.
+    assert_eq!(
+        run("var it=/./g[Symbol.matchAll]('abc');\
+             RegExp.prototype.exec=function(){return ['ZZ'];};\
+             var r=it.next(); r.value[0]+':'+r.done"),
+        "ZZ:false"
+    );
+    // A `null` result ends iteration.
+    assert_eq!(
+        run("var it=/./g[Symbol.matchAll]('abc');\
+             RegExp.prototype.exec=function(){return null;};\
+             var r=it.next(); String(r.value)+':'+r.done"),
+        "undefined:true"
+    );
+    // A throwing `exec` propagates out of `next()`.
+    assert_eq!(
+        run("var it=/./[Symbol.matchAll]('');\
+             RegExp.prototype.exec=function(){throw new TypeError('x');};\
+             try{it.next();'no'}catch(e){e instanceof TypeError}"),
+        "true"
+    );
 }
 
 #[test]

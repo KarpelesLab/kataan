@@ -2446,6 +2446,17 @@ const GEN_TA: &str = "\u{0}gta";
 /// spec `CreateArrayIterator`). `GEN_IDX` is the cursor, `GEN_KIND` the 0/1/2
 /// keys/values/entries selector.
 const GEN_ARR: &str = "\u{0}garr";
+/// Hidden slots on a *lazy* RegExp String Iterator (from `RegExp.prototype
+/// [@@matchAll]` / `String.prototype.matchAll`). Each `next()` calls
+/// `RegExpExec(matcher, subject)` — honoring a user-overridden `exec` — instead
+/// of iterating a snapshot, so a custom `exec` installed between `next()` calls
+/// is observed (per spec `%RegExpStringIteratorPrototype%.next`). `RSI_MATCHER`
+/// is the (species-constructed) matcher, `RSI_STR` the subject string, and
+/// `RSI_FLAGS` a bitfield (`1`=global, `2`=fullUnicode); `GEN_DONE` marks it
+/// exhausted.
+const RSI_MATCHER: &str = "\u{0}rsim";
+const RSI_STR: &str = "\u{0}rsis";
+const RSI_FLAGS: &str = "\u{0}rsif";
 /// Hidden slot on a *lazy* generator object: the index of its suspended
 /// [`generator::GenFrame`] in `Interp::gen_frames`.
 const GEN_FRAME: &str = "\u{0}gframe";
@@ -8206,52 +8217,112 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Percent-encodes `s`. The unreserved set (`A-Za-z0-9-_.!~*'()`) is always kept;
-/// `extra` adds characters preserved by `encodeURI` (the URI reserved set).
-fn uri_encode(s: &str, extra: &str) -> String {
-    let mut out = String::new();
+/// `Encode` abstract operation (spec 19.2.6.5). Percent-encodes the UTF-16 code
+/// units of WTF-8 `bytes`. The unreserved set (`A-Za-z0-9-_.!~*'()`) is always
+/// kept; `extra` adds the characters preserved by `encodeURI` (the reserved set).
+/// Returns `None` (→ `URIError`) on an unpaired surrogate.
+fn uri_encode(bytes: &[u8], extra: &str) -> Option<Vec<u8>> {
+    fn hex(n: u32) -> u8 {
+        char::from_digit(n, 16).unwrap().to_ascii_uppercase() as u8
+    }
+    let units: alloc::vec::Vec<u16> = crate::wtf8::utf16_units(bytes).collect();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut buf = [0u8; 4];
-    for ch in s.chars() {
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        let cp: u32 = if (0xD800..=0xDBFF).contains(&u) {
+            // A high surrogate must be followed by a low surrogate.
+            if i + 1 < units.len() && (0xDC00..=0xDFFF).contains(&units[i + 1]) {
+                let c = 0x10000 + (((u as u32 - 0xD800) << 10) | (units[i + 1] as u32 - 0xDC00));
+                i += 2;
+                c
+            } else {
+                return None;
+            }
+        } else if (0xDC00..=0xDFFF).contains(&u) {
+            // A lone low surrogate is unpaired.
+            return None;
+        } else {
+            i += 1;
+            u as u32
+        };
+        // `cp` is now a valid scalar value.
+        let ch = char::from_u32(cp).unwrap();
         let keep = ch.is_ascii_alphanumeric() || "-_.!~*'()".contains(ch) || extra.contains(ch);
         if keep {
-            out.push(ch);
+            out.push(cp as u8);
         } else {
             for b in ch.encode_utf8(&mut buf).bytes() {
-                out.push('%');
-                out.push(
-                    char::from_digit((b >> 4) as u32, 16)
-                        .unwrap()
-                        .to_ascii_uppercase(),
-                );
-                out.push(
-                    char::from_digit((b & 0xf) as u32, 16)
-                        .unwrap()
-                        .to_ascii_uppercase(),
-                );
+                out.push(b'%');
+                out.push(hex((b as u32) >> 4));
+                out.push(hex((b as u32) & 0xf));
             }
         }
     }
-    out
+    Some(out)
 }
 
-/// Decodes percent-escapes in `s` (`%XX` → byte), returning `None` on a malformed
-/// escape or invalid UTF-8.
-fn uri_decode(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
+/// `Decode` abstract operation (spec 19.2.6.4). Decodes `%XX` percent-escapes in
+/// WTF-8 `bytes`, assembling multi-byte UTF-8 sequences into scalar values.
+/// When `preserve_reserved` is set (`decodeURI`), an escape whose octet is an
+/// ASCII char in the reserved set `;/?:@&=+$,#` is kept verbatim. Returns `None`
+/// (→ `URIError`) on any malformed escape or invalid/overlong UTF-8. Non-escape
+/// bytes (including WTF-8 lone surrogates) are copied through unchanged.
+fn uri_decode(bytes: &[u8], preserve_reserved: bool) -> Option<Vec<u8>> {
+    const RESERVED: &[u8] = b";/?:@&=+$,#";
+    fn hexbyte(bytes: &[u8], i: usize) -> Option<u8> {
+        let hi = (*bytes.get(i + 1)? as char).to_digit(16)?;
+        let lo = (*bytes.get(i + 2)? as char).to_digit(16)?;
+        Some((hi * 16 + lo) as u8)
+    }
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hi = (*bytes.get(i + 1)? as char).to_digit(16)?;
-            let lo = (*bytes.get(i + 2)? as char).to_digit(16)?;
-            out.push((hi * 16 + lo) as u8);
-            i += 3;
-        } else {
+        if bytes[i] != b'%' {
             out.push(bytes[i]);
             i += 1;
+            continue;
         }
+        let start = i;
+        let b0 = hexbyte(bytes, i)?;
+        i += 3;
+        if b0 < 0x80 {
+            if preserve_reserved && RESERVED.contains(&b0) {
+                out.extend_from_slice(&bytes[start..start + 3]);
+            } else {
+                out.push(b0);
+            }
+            continue;
+        }
+        // Multi-byte lead octet: 110xxxxx→2, 1110xxxx→3, 11110xxx→4 octets.
+        let n = if b0 & 0xE0 == 0xC0 {
+            2
+        } else if b0 & 0xF0 == 0xE0 {
+            3
+        } else if b0 & 0xF8 == 0xF0 {
+            4
+        } else {
+            return None;
+        };
+        let mut seq: [u8; 4] = [b0, 0, 0, 0];
+        for slot in seq.iter_mut().take(n).skip(1) {
+            if bytes.get(i) != Some(&b'%') {
+                return None;
+            }
+            let bx = hexbyte(bytes, i)?;
+            i += 3;
+            if bx & 0xC0 != 0x80 {
+                return None;
+            }
+            *slot = bx;
+        }
+        // Strict UTF-8 validation (rejects overlong forms, surrogates, and
+        // out-of-range code points, matching RFC 3629 / the spec's UTF8 rules).
+        let s = core::str::from_utf8(&seq[..n]).ok()?;
+        out.extend_from_slice(s.as_bytes());
     }
-    String::from_utf8(out).ok()
+    Some(out)
 }
 
 /// `escape(string)` (Annex B.2.1.1). Operates on the UTF-16 code units of the

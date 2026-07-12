@@ -865,7 +865,6 @@ impl<'a> Interp<'a> {
         }
         let h = rx.as_handle().map(Handle::from_raw).unwrap();
         let s_bytes = self.coerce_to_string_bytes(string)?;
-        let s = crate::wtf8::to_string_lossy(&s_bytes);
         let str_v = self.new_str_bytes(s_bytes);
         let flags_v = self.read_member(h, "flags")?;
         let flags = self.coerce_to_string(flags_v)?;
@@ -883,29 +882,71 @@ impl<'a> Interp<'a> {
             return Err(self.type_error("RegExp @@matchAll matcher is not an object"));
         };
         self.set_prop_throwing(matcher, "lastIndex", NanBox::number(li as f64))?;
-        let mut out: Vec<NanBox> = Vec::new();
-        loop {
-            let result = self.regexp_exec(matcher_v, str_v)?;
-            if matches!(result.unpack(), Unpacked::Null) {
-                break;
-            }
-            let Some(rh) = result.as_handle().map(Handle::from_raw) else {
-                break;
-            };
-            out.push(result);
-            if !global {
-                break;
-            }
+        // Build a *lazy* iterator: `next()` runs `RegExpExec` on demand so a
+        // custom `exec` installed after creation (or between `next()` calls) is
+        // honored, and a throwing `exec` surfaces at the right step.
+        let proto = self.builtin_iterator_proto("RegExp String Iterator");
+        let obj = self.realm.new_object();
+        self.realm.set_object_proto(obj, Some(proto));
+        self.realm.set_hidden_property(obj, RSI_MATCHER, matcher_v);
+        self.realm.set_hidden_property(obj, RSI_STR, str_v);
+        let bits = (global as u32) | ((unicode as u32) << 1);
+        self.realm
+            .set_hidden_property(obj, RSI_FLAGS, NanBox::number(f64::from(bits)));
+        Ok(NanBox::handle(obj.to_raw()))
+    }
+
+    /// `%RegExpStringIteratorPrototype%.next` (spec 22.2.9.2.1). Calls
+    /// `RegExpExec(matcher, subject)` — honoring an overridden `exec` — and, for a
+    /// global regexp, advances `lastIndex` past an empty match. Detaches once a
+    /// match is `null` (or after the single match of a non-global regexp).
+    pub(crate) fn regexp_string_iter_next(&mut self, h: Handle) -> Result<NanBox, ExecError> {
+        if self.realm.get_property(h, GEN_DONE).is_some() {
+            return Ok(self.iter_result(NanBox::undefined(), true));
+        }
+        let matcher_v = self
+            .realm
+            .get_property(h, RSI_MATCHER)
+            .unwrap_or(NanBox::undefined());
+        let str_v = self
+            .realm
+            .get_property(h, RSI_STR)
+            .unwrap_or(NanBox::undefined());
+        let bits = self
+            .realm
+            .get_property(h, RSI_FLAGS)
+            .and_then(|n| n.as_number())
+            .unwrap_or(0.0) as u32;
+        let global = bits & 1 != 0;
+        let unicode = bits & 2 != 0;
+        let result = self.regexp_exec(matcher_v, str_v)?;
+        if matches!(result.unpack(), Unpacked::Null) {
+            self.realm
+                .set_hidden_property(h, GEN_DONE, NanBox::boolean(true));
+            return Ok(self.iter_result(NanBox::undefined(), true));
+        }
+        if !global {
+            self.realm
+                .set_hidden_property(h, GEN_DONE, NanBox::boolean(true));
+            return Ok(self.iter_result(result, false));
+        }
+        // Global: `matchStr = ToString(Get(match, "0"))`; on an empty match,
+        // bump the matcher's `lastIndex` so iteration terminates.
+        if let Some(rh) = result.as_handle().map(Handle::from_raw) {
             let match0 = self.read_member(rh, "0")?;
             let m_str = self.coerce_to_string(match0)?;
-            if m_str.is_empty() {
+            if m_str.is_empty()
+                && let Some(matcher) = matcher_v.as_handle().map(Handle::from_raw)
+            {
                 let cli_v = self.read_member(matcher, "lastIndex")?;
                 let cli = self.coerce_to_integer_or_infinity(cli_v)?.max(0.0) as usize;
+                let s_bytes = self.coerce_to_string_bytes(str_v)?;
+                let s = crate::wtf8::to_string_lossy(&s_bytes);
                 let next = self.advance_string_index(&s, cli, unicode);
-                self.realm.set_regex_last_index(matcher, next);
+                self.set_prop_throwing(matcher, "lastIndex", NanBox::number(next as f64))?;
             }
         }
-        Ok(self.make_builtin_iterator(out, "RegExp String Iterator"))
+        Ok(self.iter_result(result, false))
     }
 
     /// `AdvanceStringIndex(S, index, unicode)` over the `&str` subject. Returns the

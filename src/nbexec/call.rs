@@ -2328,12 +2328,11 @@ impl<'a> Interp<'a> {
         if let Some((class_id, env)) = self.realm.class_at(handle) {
             // `new.target` inside the class constructor is the class itself.
             self.pending_new_target = Some(self.reflect_new_target.take().unwrap_or(callee));
-            let inst = self.instantiate(class_id, &env, args)?;
-            // `instance.constructor === TheClass` (non-enumerable back-reference).
-            if let Some(ih) = inst.as_handle().map(Handle::from_raw) {
-                self.realm.set_hidden_property(ih, "constructor", callee);
-            }
-            return Ok(inst);
+            // `instance.constructor` is inherited from `TheClass.prototype`'s
+            // `constructor` back-link (installed by `class_prototype`) — the
+            // instance gets no *own* `constructor` (per spec, and so a computed
+            // `["constructor"]() {}` method on the prototype is what is read).
+            return self.instantiate(class_id, &env, args);
         }
         // `new constructorFunction(...)`: bind a fresh object as `this`, run the
         // body, and return it — unless the function explicitly returned an object

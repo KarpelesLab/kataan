@@ -1070,6 +1070,13 @@ impl<'a> Interp<'a> {
             self.realm.set_object_proto(proto, None);
         }
 
+        // Non-enumerable `constructor` back-link. Installed *before* the instance
+        // methods so `[[OwnPropertyKeys]]` order is `constructor, …methods` (per
+        // MakeConstructor, which defines `prototype.constructor` prior to
+        // ClassElement evaluation).
+        self.realm
+            .set_hidden_property(proto, "constructor", NanBox::handle(class_handle.to_raw()));
+
         // Install this class's own instance methods/accessors.
         for (idx, member) in class.body.iter().enumerate() {
             let ClassMember::Method(m) = member else {
@@ -1118,9 +1125,6 @@ impl<'a> Interp<'a> {
                 MethodKind::Constructor => {}
             }
         }
-        // Non-enumerable `constructor` back-link.
-        self.realm
-            .set_hidden_property(proto, "constructor", NanBox::handle(class_handle.to_raw()));
         proto
     }
 

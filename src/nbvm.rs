@@ -373,6 +373,12 @@ const KNOWN_GLOBALS: &[&str] = &[
     "setTimeout",
     "clearTimeout",
     "queueMicrotask",
+    "decodeURI",
+    "decodeURIComponent",
+    "encodeURI",
+    "encodeURIComponent",
+    "escape",
+    "unescape",
 ];
 
 /// A compiled function: its instruction stream, register-file size, and the
@@ -9032,6 +9038,14 @@ impl Compiler {
         // `instance.constructor` reflection all work on the bytecode path.
         let proto = self.alloc();
         self.ops.push(Op::NewObject { dst: proto });
+        // `proto.constructor === C` (non-enumerable), installed *before* the
+        // instance methods so `[[OwnPropertyKeys]]` order is `constructor,
+        // …methods` (per MakeConstructor; matches the tree-walker).
+        self.ops.push(Op::SetHidden {
+            obj: proto,
+            key: String::from("constructor"),
+            src: cobj,
+        });
         let mut chain: Vec<String> = Vec::new();
         let mut cur = Some(String::from(name));
         while let Some(n) = cur {
@@ -9078,13 +9092,8 @@ impl Compiler {
                 });
             }
         }
-        // `proto.constructor === C` (non-enumerable) and `C.prototype === proto`
-        // (non-enumerable).
-        self.ops.push(Op::SetHidden {
-            obj: proto,
-            key: String::from("constructor"),
-            src: cobj,
-        });
+        // `C.prototype === proto` (non-enumerable). The `constructor` back-link on
+        // `proto` was installed above, before the methods.
         self.ops.push(Op::SetHidden {
             obj: cobj,
             key: String::from("prototype"),

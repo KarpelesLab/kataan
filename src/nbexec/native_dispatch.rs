@@ -2908,23 +2908,24 @@ impl<'a> Interp<'a> {
             // URI encoding/decoding. `encodeURI` preserves the URI reserved set
             // on top of the unreserved set that `encodeURIComponent` keeps.
             N_ENCODE_URI_COMPONENT | N_ENCODE_URI => {
-                let s = self.coerce_to_string(arg(0))?;
+                let bytes = self.coerce_to_string_bytes(arg(0))?;
                 let extra = if id == N_ENCODE_URI {
                     ";,/?:@&=+$#"
                 } else {
                     ""
                 };
-                let out = uri_encode(&s, extra);
-                let h = self.realm.new_string(&out);
-                NanBox::handle(h.to_raw())
+                match uri_encode(&bytes, extra) {
+                    Some(out) => self.new_str_bytes(out),
+                    None => {
+                        let m = self.new_str("URI malformed");
+                        return Err(ExecError::Throw(self.make_error(N_URI_ERROR, Some(m))));
+                    }
+                }
             }
             N_DECODE_URI_COMPONENT | N_DECODE_URI => {
-                let s = self.coerce_to_string(arg(0))?;
-                match uri_decode(&s) {
-                    Some(out) => {
-                        let h = self.realm.new_string(&out);
-                        NanBox::handle(h.to_raw())
-                    }
+                let bytes = self.coerce_to_string_bytes(arg(0))?;
+                match uri_decode(&bytes, id == N_DECODE_URI) {
+                    Some(out) => self.new_str_bytes(out),
                     None => {
                         let m = self.new_str("URI malformed");
                         return Err(ExecError::Throw(self.make_error(N_URI_ERROR, Some(m))));
