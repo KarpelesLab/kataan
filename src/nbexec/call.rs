@@ -1,5 +1,17 @@
 use super::*;
 
+/// The saved running-realm state produced by [`Interp::enter_realm`] and consumed
+/// by [`Interp::leave_realm`]. `Unchanged` is the fast path (a same-realm call): it
+/// carries nothing and restores nothing.
+pub(crate) enum RealmGuard {
+    Unchanged,
+    Swapped {
+        realm: Option<usize>,
+        global_this: NanBox,
+        global_scope: Scope,
+    },
+}
+
 impl<'a> Interp<'a> {
     pub(crate) fn is_callable(&self, handle: Handle) -> bool {
         self.realm.native_at(handle).is_some()
@@ -212,10 +224,54 @@ impl<'a> Interp<'a> {
             .as_handle()
             .map(Handle::from_raw)
             .and_then(|h| self.get_function_realm(h));
-        let saved_realm = core::mem::replace(&mut self.cur_realm, realm);
+        let guard = self.enter_realm(realm);
         let r = self.call_with_this_inner(callee, this_val, args);
-        self.cur_realm = saved_realm;
+        self.leave_realm(guard);
         r
+    }
+
+    /// Enters `realm` (a `$262.createRealm()` index, or `None` for the main realm):
+    /// makes it the *running realm* (`cur_realm`) and swaps in its global object +
+    /// global (root) lexical scope, so a cross-realm function's indirect `eval`,
+    /// `Function`-constructor body, sloppy-`this` binding, and global-object
+    /// identifier fallback all resolve against *that realm's* globals. Returns a
+    /// guard to hand back to [`leave_realm`](Self::leave_realm). A no-op fast path
+    /// when the realm is unchanged (the overwhelming common case — a same-realm
+    /// call), so it never clones a scope or perturbs the hot call path.
+    pub(crate) fn enter_realm(&mut self, realm: Option<usize>) -> RealmGuard {
+        if realm == self.cur_realm {
+            return RealmGuard::Unchanged;
+        }
+        let (gt, gs) = match realm {
+            Some(idx) if idx < self.created_realms.len() => (
+                self.created_realms[idx].global_this,
+                self.created_realms[idx].global_scope.clone(),
+            ),
+            _ => (self.main_global_this, self.main_global_scope.clone()),
+        };
+        let guard = RealmGuard::Swapped {
+            realm: self.cur_realm,
+            global_this: self.global_this,
+            global_scope: self.global_scope.clone(),
+        };
+        self.cur_realm = realm;
+        self.global_this = gt;
+        self.global_scope = gs;
+        guard
+    }
+
+    /// Restores the running realm + globals saved by [`enter_realm`](Self::enter_realm).
+    pub(crate) fn leave_realm(&mut self, guard: RealmGuard) {
+        if let RealmGuard::Swapped {
+            realm,
+            global_this,
+            global_scope,
+        } = guard
+        {
+            self.cur_realm = realm;
+            self.global_this = global_this;
+            self.global_scope = global_scope;
+        }
     }
 
     fn call_with_this_inner(
@@ -1630,7 +1686,7 @@ impl<'a> Interp<'a> {
                 .map(Handle::from_raw)
                 .and_then(|h| self.get_function_realm(h))
         });
-        let saved_cur_realm = core::mem::replace(&mut self.cur_realm, closure_realm);
+        let realm_guard = self.enter_realm(closure_realm);
         let saved = core::mem::replace(&mut self.current, call_scope);
         // A function defined in a module carries that module's import aliases in
         // its captured scope chain; restore them so a named import read inside the
@@ -1933,7 +1989,7 @@ impl<'a> Interp<'a> {
             r
         })();
         self.current = saved;
-        self.cur_realm = saved_cur_realm;
+        self.leave_realm(realm_guard);
         #[cfg(all(feature = "module", feature = "std"))]
         if let Some(mi) = saved_module_imports {
             self.module_imports = mi;
@@ -2183,6 +2239,50 @@ impl<'a> Interp<'a> {
         other.or(default)
     }
 
+    /// `GetPrototypeFromConstructor` step 4 specialized for the dynamic-function
+    /// families whose constructor is *not* a bare global — `%GeneratorFunction%`,
+    /// `%AsyncFunction%`, `%AsyncGeneratorFunction%` (reached only as
+    /// `Object.getPrototypeOf(function*(){}).constructor` etc.). The generic
+    /// [`realm_default_proto`](Self::realm_default_proto) cannot resolve these
+    /// (it re-reads `<constructor.name>` off the target realm's *global object*,
+    /// where these names are absent), so this consults `GetFunctionRealm(nt)`'s
+    /// realm directly: it enters that realm's global scope and (re)builds the
+    /// kind-appropriate `%…Function.prototype%` there (cached on the realm's own
+    /// `Iterator` constructor). Returns the current realm's `default` for a
+    /// main-realm (or unresolved) `newTarget`, so same-realm construction is never
+    /// perturbed. `keyword` is the CreateDynamicFunction kind ("function*",
+    /// "async function", "async function*"); a plain "function" never routes here.
+    pub(crate) fn realm_family_fn_proto(
+        &mut self,
+        nt: Handle,
+        keyword: &str,
+        default: Option<Handle>,
+    ) -> Option<Handle> {
+        let Some(idx) = self.get_function_realm(nt) else {
+            return default;
+        };
+        if idx >= self.created_realms.len() {
+            return default;
+        }
+        // Enter the target realm's global environment (scope + intrinsics) so the
+        // family-prototype builder resolves *its* `Iterator`/`Function` and caches
+        // onto *its* constructors, then restore the caller's.
+        let scope = self.created_realms[idx].global_scope.clone();
+        let saved_current = core::mem::replace(&mut self.current, scope);
+        let saved_intrinsics = self.realm.intrinsics_snapshot();
+        self.realm
+            .restore_intrinsics(self.created_realms[idx].intrinsics);
+        let proto = match keyword {
+            "function*" => self.generator_function_prototype(),
+            "async function*" => self.async_generator_function_prototype(),
+            "async function" => self.async_function_prototype(),
+            _ => None,
+        };
+        self.realm.restore_intrinsics(saved_intrinsics);
+        self.current = saved_current;
+        proto.or(default)
+    }
+
     /// `GetPrototypeFromConstructor` step 4 for an intrinsic whose constructor is
     /// bound at a known global `name` (e.g. `"Iterator"`): the `<name>.prototype`
     /// object of `GetFunctionRealm(nt)`'s realm. Unlike
@@ -2262,6 +2362,31 @@ impl<'a> Interp<'a> {
         callee: NanBox,
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
+        // Enter the constructor's realm for the duration of the construction, so a
+        // cross-realm `new other.Function(...)` (whose body scope, sloppy-`this`,
+        // and generated intrinsics come from *its* realm's globals) and a
+        // cross-realm dynamic `Function`/`GeneratorFunction` build against the
+        // right global environment. A same-realm `new` is the `Unchanged` fast path.
+        //
+        // Only enter for an *actual* constructor: `new otherRealm.parseInt(0)`
+        // (a non-constructor) must throw the *current* realm's `%TypeError%` — the
+        // "not a constructor" check is performed by the running execution context,
+        // before any [[Construct]] would consult the callee's realm.
+        let realm = if self.is_constructor_value(callee) {
+            callee
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|h| self.get_function_realm(h))
+        } else {
+            self.cur_realm
+        };
+        let guard = self.enter_realm(realm);
+        let r = self.construct_inner(callee, args);
+        self.leave_realm(guard);
+        r
+    }
+
+    fn construct_inner(&mut self, callee: NanBox, args: &[NanBox]) -> Result<NanBox, ExecError> {
         let Some(raw) = callee.as_handle() else {
             // `new` on a primitive is a catchable JS `TypeError`.
             let m = self.new_str("is not a constructor");

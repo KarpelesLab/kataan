@@ -4238,6 +4238,91 @@ fn match_all_iterator_honors_custom_exec() {
     );
 }
 
+/// Runs `src` with a minimal `$262` host object (exposing `createRealm` /
+/// `evalScript`), so cross-realm behavior can be exercised in unit tests.
+fn run262(src: &str) -> String {
+    const PRELUDE: &str = "var $262 = { global: this, \
+        createRealm: function () { return $262_createRealm(); }, \
+        evalScript: function (s) { return $262_evalScript(s); } };\n";
+    let full = alloc::format!("{PRELUDE}{src}");
+    let program = Parser::parse_program(&full).expect("parse");
+    let mut interp = Interp::new();
+    let value = interp.run(&program).expect("exec");
+    interp.realm().to_display_string(value)
+}
+
+#[test]
+fn cross_realm_eval_runs_in_target_realm() {
+    // A created realm's `eval` resolves *that realm's* globals, not the caller's.
+    assert_eq!(
+        run262(
+            "var other = $262.createRealm().global;\
+             other.eval('Object') === Object"
+        ),
+        "false",
+    );
+    // And identity holds: the other realm's `Object` is what its `eval` sees.
+    assert_eq!(
+        run262(
+            "var other = $262.createRealm().global;\
+             other.eval('Object') === other.Object"
+        ),
+        "true",
+    );
+}
+
+#[test]
+fn cross_realm_dynamic_function_body_globals() {
+    // A function built by another realm's `Function` constructor runs (sloppy
+    // `this`, global reads) in that realm's global environment.
+    assert_eq!(
+        run262(
+            "var other = $262.createRealm().global;\
+             var f = new other.Function('return this');\
+             f() === other"
+        ),
+        "true",
+    );
+    assert_eq!(
+        run262(
+            "var other = $262.createRealm().global;\
+             var f = new other.Function('return Object');\
+             f() === other.Object"
+        ),
+        "true",
+    );
+}
+
+#[test]
+fn cross_realm_generator_function_is_distinct() {
+    // `%GeneratorFunction%` produced inside another realm's `eval` belongs to that
+    // realm (its `.constructor` differs from the main realm's).
+    assert_eq!(
+        run262(
+            "var GF = Object.getPrototypeOf(function*(){}).constructor;\
+             var other = $262.createRealm().global;\
+             var OGF = Object.getPrototypeOf(other.eval('(0, function*(){})')).constructor;\
+             OGF === GF"
+        ),
+        "false",
+    );
+}
+
+#[test]
+fn cross_realm_new_non_constructor_throws_current_realm_type_error() {
+    // `new otherRealm.parseInt(0)` (a non-constructor) throws the *current* realm's
+    // TypeError — the "not a constructor" check precedes any [[Construct]].
+    assert_eq!(
+        run262(
+            "var other = $262.createRealm().global;\
+             var ok = false;\
+             try { new other.parseInt(0); } catch (e) { ok = e instanceof TypeError; }\
+             ok"
+        ),
+        "true",
+    );
+}
+
 #[test]
 fn global_this_object() {
     assert_eq!(run("typeof globalThis"), "object");

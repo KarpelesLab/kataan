@@ -644,6 +644,14 @@ pub struct Interp<'a> {
     /// [`Interp::array_species_create`] to identify the current Realm Record for the
     /// `SameValue(C, realmC.[[%Array%]])` cross-realm nullification step.
     cur_realm: Option<usize>,
+    /// The *main* realm's global object and global (root) lexical scope, captured
+    /// once after the main `install_globals`. `global_this`/`global_scope` are
+    /// swapped to a `$262.createRealm()` realm's while a cross-realm function
+    /// executes (so its indirect `eval` / `Function` body / sloppy-`this` binding
+    /// see *that* realm's globals); these anchors are what they are restored to
+    /// when execution returns to a main-realm function (`cur_realm` = `None`).
+    main_global_this: NanBox,
+    main_global_scope: Scope,
     /// Programs parsed at runtime by `eval` / the `Function` constructor, keyed by
     /// source string. The interpreter's function/AST tables hold `&'a` references
     /// into the running program; a dynamically-parsed `Program` must therefore
@@ -2945,6 +2953,8 @@ impl<'a> Interp<'a> {
             created_realms: Vec::new(),
             fn_realm: alloc::collections::BTreeMap::new(),
             cur_realm: None,
+            main_global_this: NanBox::undefined(),
+            main_global_scope: Scope::root(),
             eval_programs: alloc::collections::BTreeMap::new(),
             #[cfg(all(feature = "module", feature = "std"))]
             modules: module::ModuleRegistry::new(),
@@ -2970,6 +2980,10 @@ impl<'a> Interp<'a> {
         interp.global_scope = interp.current.clone();
         interp.var_scope = interp.current.clone();
         interp.install_globals();
+        // Anchor the main realm's globals so a cross-realm swap can restore them
+        // when execution returns to a main-realm function (`cur_realm` = `None`).
+        interp.main_global_this = interp.global_this;
+        interp.main_global_scope = interp.global_scope.clone();
         interp
     }
 
@@ -6117,7 +6131,29 @@ impl<'a> Interp<'a> {
             // deferred (and are also gated on cross-realm `eval` running in the
             // target realm, which it does not yet).
             let default = self.realm.object_proto(h);
-            if let Some(proto) = self.instance_proto_checked(new_target, callee, default)? {
+            // For the non-bare-global families (`function*` / `async function` /
+            // `async function*`), a cross-realm `newTarget` with a non-object
+            // `.prototype` must derive *its* realm's `%…Function.prototype%`, which
+            // the generic remap (keyed on `constructor.name` as a global) cannot
+            // resolve — route those through the family-aware helper. A plain
+            // `function` (whose `%Function.prototype%` IS a bare global) and every
+            // same-realm case go through the generic `instance_proto_checked`.
+            let is_family = matches!(keyword, "function*" | "async function*" | "async function");
+            let remapped = if is_family
+                && new_target.as_handle().is_some()
+                && new_target.as_handle() != callee.as_handle()
+                && let Some(nt) = new_target.as_handle().map(Handle::from_raw)
+            {
+                let ntp = self.read_constructor_prototype(nt)?;
+                if self.is_object_value(ntp) {
+                    ntp.as_handle().map(Handle::from_raw)
+                } else {
+                    self.realm_family_fn_proto(nt, keyword, default)
+                }
+            } else {
+                self.instance_proto_checked(new_target, callee, default)?
+            };
+            if let Some(proto) = remapped {
                 self.realm.set_native_proto(h, proto);
             }
             // `GetFunctionRealm` tagging: a dynamic function belongs to the realm of
