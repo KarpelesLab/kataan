@@ -3203,7 +3203,7 @@ impl<'a> Interp<'a> {
         // honor a subclass override).
         if name == "lastIndex"
             && self.realm.regexp_at(handle).is_some()
-            && !self.realm.has_own(handle, "lastIndex")
+            && !self.realm.regex_aux_last_index_defined(handle)
         {
             return Ok(NanBox::number(self.realm.regex_last_index(handle) as f64));
         }

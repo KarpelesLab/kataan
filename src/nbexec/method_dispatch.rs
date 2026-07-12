@@ -903,24 +903,9 @@ impl<'a> Interp<'a> {
             {
                 return Ok(Some(NanBox::number(f64::NAN)));
             }
-            // A two-digit year (0..=99) maps to 1900+year.
-            let yi = year_n as i64;
-            let year = if (0..=99).contains(&yi) {
-                1900 + yi
-            } else {
-                yi
-            };
-            let total_months = year * 12 + month as i64;
-            let y = total_months.div_euclid(12);
-            let mo = total_months.rem_euclid(12) as u32 + 1;
-            let days = crate::realm::days_from_civil(y, mo, 1) + (day as i64 - 1);
-            let ms = time_clip(
-                (days * 86_400_000
-                    + hours as i64 * 3_600_000
-                    + mins as i64 * 60_000
-                    + secs as i64 * 1_000
-                    + millis as i64) as f64,
-            );
+            // MakeDate(MakeDay(y, m, d), MakeTime(h, min, s, milli)) in IEEE-754
+            // `f64` (the two-digit-year mapping is folded into the helper).
+            let ms = crate::nbexec::make_date_ms(year_n, month, day, hours, mins, secs, millis);
             return Ok(Some(NanBox::number(ms)));
         }
         // --- `Proxy.revocable(target, handler)` → `{ proxy, revoke }` ---

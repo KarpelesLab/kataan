@@ -103,7 +103,7 @@ impl<'a> Interp<'a> {
         // materialized into the aux object.
         if key == "lastIndex"
             && self.realm.regexp_at(obj).is_some()
-            && !self.realm.has_own(obj, "lastIndex")
+            && !self.realm.regex_aux_last_index_defined(obj)
         {
             let v = NanBox::number(self.realm.regex_last_index(obj) as f64);
             let d = self.realm.new_object();
@@ -921,7 +921,7 @@ impl<'a> Interp<'a> {
         // slot in sync with the cell once it exists.
         if key == "lastIndex"
             && self.realm.regexp_at(obj).is_some()
-            && !self.realm.has_own(obj, "lastIndex")
+            && !self.realm.regex_aux_last_index_defined(obj)
         {
             let cur = NanBox::number(self.realm.regex_last_index(obj) as f64);
             self.realm.set_property(obj, "lastIndex", cur);

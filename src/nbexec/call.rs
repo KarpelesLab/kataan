@@ -2839,26 +2839,10 @@ impl<'a> Interp<'a> {
                 {
                     f64::NAN
                 } else {
-                    // A two-digit year (0..=99) maps to 1900+year.
-                    let yi = year_n as i64;
-                    let year = if (0..=99).contains(&yi) {
-                        1900 + yi
-                    } else {
-                        yi
-                    };
-                    let total_months = year * 12 + month as i64;
-                    let y = total_months.div_euclid(12);
-                    let mo = total_months.rem_euclid(12) as u32 + 1; // 1..=12
-                    // Measure the day as an offset from the 1st so an out-of-range
-                    // (incl. negative) day rolls over via integer arithmetic.
-                    let days = crate::realm::days_from_civil(y, mo, 1) + (day as i64 - 1);
-                    time_clip(
-                        (days * 86_400_000
-                            + hours as i64 * 3_600_000
-                            + mins as i64 * 60_000
-                            + secs as i64 * 1_000
-                            + millis as i64) as f64,
-                    )
+                    // MakeDate(MakeDay(y, m, d), MakeTime(h, min, s, milli)) in
+                    // IEEE-754 `f64` (an out-of-range/negative day rolls over, the
+                    // two-digit-year mapping is folded in). Local ≈ UTC here.
+                    crate::nbexec::make_date_ms(year_n, month, day, hours, mins, secs, millis)
                 }
             } else {
                 match args.first().copied() {

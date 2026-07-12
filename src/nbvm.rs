@@ -1267,7 +1267,7 @@ fn vm_get_prop(
                     "lastIndex" => {
                         // An aux own slot (a non-canonical value such as an object,
                         // or a `defineProperty` descriptor) shadows the compact cell.
-                        if ctx.realm.has_own(handle, "lastIndex") {
+                        if ctx.realm.regex_aux_last_index_defined(handle) {
                             done = false;
                         } else {
                             result = NanBox::number(ctx.realm.regex_last_index(handle) as f64);
@@ -2018,7 +2018,7 @@ fn set_regex_last_index_value(realm: &mut Realm, handle: Handle, v: NanBox) {
     });
     match canonical {
         Some(n) => {
-            if realm.has_own(handle, "lastIndex") {
+            if realm.regex_aux_last_index_defined(handle) {
                 realm.set_property(handle, "lastIndex", v);
             }
             realm.set_regex_last_index(handle, n as usize);
@@ -3901,7 +3901,7 @@ fn regex_method(
         //    non-global/non-sticky regex),
         //  - the sticky (`y`) flag (anchored match at exactly `lastIndex`),
         //  - the `d` (hasIndices) flag (the result needs an `.indices` array).
-        if ctx.realm.has_own(h, "lastIndex") || flags.contains('y') || flags.contains('d') {
+        if ctx.realm.regex_aux_last_index_defined(h) || flags.contains('y') || flags.contains('d') {
             return None;
         }
         let text = ctx.realm.to_display_string(arg0);

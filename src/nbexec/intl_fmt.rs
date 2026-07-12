@@ -2,6 +2,10 @@ use super::*;
 #[cfg(not(feature = "std"))]
 use crate::common::FloatExt;
 
+/// A list of `(type, value)` date/time format parts, as produced by the
+/// `formatToParts` machinery (`datetime_parts` / `temporal_format_parts`).
+type DateTimeParts = Vec<(&'static str, String)>;
+
 /// The resolved form of `Intl.NumberFormat`'s `useGrouping` option: a boolean
 /// `false`, or one of the string modes `"auto"`/`"always"`/`"min2"`.
 enum UseGroupingResolved {
@@ -3359,12 +3363,27 @@ impl<'a> Interp<'a> {
         start: NanBox,
         end: NanBox,
     ) -> Result<String, ExecError> {
-        #[cfg(feature = "intl")]
-        if let Some((inst, fx, fy, same)) = self.intl_temporal_range(this, start, end)? {
-            let _ = inst;
-            if same {
+        let Some(inst) = this
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|h| self.realm.get_property(*h, "\u{0}intl").is_some())
+        else {
+            return Err(self.type_error("formatRange called on an incompatible receiver"));
+        };
+        // A DateTimeFormat range concatenates each endpoint's field parts (sharing
+        // the same operand resolution / same-kind check as `formatRangeToParts`),
+        // joined by a separator; an equal-endpoints range collapses to the lone
+        // start value.
+        if self.intl_kind_is_datetime(inst) {
+            let (sp, ep) = self.dtf_range_field_parts(inst, start, end)?;
+            let join = |parts: &[(&'static str, String)]| -> String {
+                parts.iter().map(|(_, v)| v.as_str()).collect()
+            };
+            let fx = join(&sp);
+            if sp == ep {
                 return Ok(fx);
             }
+            let fy = join(&ep);
             return Ok(alloc::format!("{fx}\u{2013}{fy}"));
         }
         let (inst, x, y) = self.intl_range_operands(this, start, end)?;
@@ -3373,11 +3392,6 @@ impl<'a> Interp<'a> {
             return Ok(fx);
         }
         let fy = self.intl_format_value(inst, NanBox::number(y));
-        // A DateTimeFormat range collapses when both endpoints render identically
-        // (e.g. two instants on the same day with a date-only format).
-        if self.intl_kind_is_datetime(inst) && fx == fy {
-            return Ok(fx);
-        }
         Ok(alloc::format!("{fx}\u{2013}{fy}"))
     }
 
@@ -3397,43 +3411,131 @@ impl<'a> Interp<'a> {
         start: NanBox,
         end: NanBox,
     ) -> Result<NanBox, ExecError> {
-        #[cfg(feature = "intl")]
-        if let Some((inst, fx, fy, same)) = self.intl_temporal_range(this, start, end)? {
-            let _ = inst;
-            let mut parts: Vec<(&str, String, &str)> = alloc::vec![("literal", fx, "startRange")];
-            if !same {
-                parts.push(("literal", String::from("\u{2013}"), "shared"));
-                parts.push(("literal", fy, "endRange"));
-            }
-            let mut elems = Vec::with_capacity(parts.len());
-            for (ty, val, src) in parts {
-                let o = self.realm.new_object();
-                let tv = self.new_str(ty);
-                let vv = self.new_str(&val);
-                let sv = self.new_str(src);
-                self.realm.set_property(o, "type", tv);
-                self.realm.set_property(o, "value", vv);
-                self.realm.set_property(o, "source", sv);
-                elems.push(NanBox::handle(o.to_raw()));
-            }
-            return Ok(NanBox::handle(self.realm.new_array(elems).to_raw()));
+        let Some(inst) = this
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|h| self.realm.get_property(*h, "\u{0}intl").is_some())
+        else {
+            return Err(self.type_error("formatRange called on an incompatible receiver"));
+        };
+        // `Intl.DateTimeFormat`: emit the *field-level* parts (year/month/day/hour/…
+        // with `literal` separators) of each endpoint, each tagged with its
+        // `source`. Mirroring `formatToParts` this way makes an equal-endpoints
+        // range byte-for-byte `formatToParts` (all `"shared"`), and gives the
+        // per-field granularity callers rely on (e.g. finding the literal that
+        // precedes a `dayPeriod`). We do not yet apply CLDR's field-level range
+        // *collapse* (shared prefix/suffix fields), so a partly-overlapping range
+        // renders the full start value, a shared separator, then the full end value.
+        if self.intl_kind_is_datetime(inst) {
+            let (sp, ep) = self.dtf_range_field_parts(inst, start, end)?;
+            let tagged: Vec<(&str, String, &str)> = if sp == ep {
+                sp.into_iter().map(|(t, v)| (t, v, "shared")).collect()
+            } else {
+                let mut v: Vec<(&str, String, &str)> = Vec::with_capacity(sp.len() + ep.len() + 1);
+                for (t, val) in sp {
+                    v.push((t, val, "startRange"));
+                }
+                v.push(("literal", String::from("\u{2013}"), "shared"));
+                for (t, val) in ep {
+                    v.push((t, val, "endRange"));
+                }
+                v
+            };
+            return Ok(self.intl_build_source_parts(tagged));
         }
+        // `Intl.NumberFormat`: format each endpoint as a single value joined by a
+        // shared range separator (`x === y` collapses to the lone start value).
         let (inst, x, y) = self.intl_range_operands(this, start, end)?;
         let fx = self.intl_format_value(inst, NanBox::number(x));
-        let is_dt = self.intl_kind_is_datetime(inst);
-        let fy = if x != y {
-            Some(self.intl_format_value(inst, NanBox::number(y)))
-        } else {
-            None
-        };
-        let mut parts: Vec<(&str, String, &str)> =
-            alloc::vec![("literal", fx.clone(), "startRange")];
-        if let Some(fy) = fy
-            && !(is_dt && fy == fx)
-        {
+        let mut parts: Vec<(&str, String, &str)> = alloc::vec![("literal", fx, "startRange")];
+        if x != y {
+            let fy = self.intl_format_value(inst, NanBox::number(y));
             parts.push(("literal", String::from("\u{2013}"), "shared"));
             parts.push(("literal", fy, "endRange"));
         }
+        Ok(self.intl_build_source_parts(parts))
+    }
+
+    /// The `(startFieldParts, endFieldParts)` for a `DateTimeFormat` range: each is
+    /// the field-level part list (`Vec<(type, value)>`) of one endpoint, produced by
+    /// the same machinery as `formatToParts`. Both endpoints are required
+    /// (`undefined` → TypeError) and must share the same Date/Temporal kind.
+    ///
+    /// Per `PartitionDateTimeRangePattern`, `ToDateTimeFormattable` runs on *both*
+    /// endpoints (in order) — a Temporal object is kept as-is, anything else is
+    /// `ToNumber`-coerced (running its `valueOf`) — **before** the same-kind check.
+    /// A `NaN` from `ToNumber` does not throw here; the `TimeClip` RangeError is
+    /// raised only later, when the number is actually formatted.
+    fn dtf_range_field_parts(
+        &mut self,
+        inst: Handle,
+        start: NanBox,
+        end: NanBox,
+    ) -> Result<(DateTimeParts, DateTimeParts), ExecError> {
+        if matches!(start.unpack(), Unpacked::Undefined)
+            || matches!(end.unpack(), Unpacked::Undefined)
+        {
+            return Err(self.type_error("formatRange requires two defined arguments"));
+        }
+        #[cfg(feature = "intl")]
+        let sx_temporal = self.is_temporal_value(start);
+        #[cfg(not(feature = "intl"))]
+        let sx_temporal = false;
+        let sx_num = if sx_temporal {
+            0.0
+        } else {
+            let n = self.coerce_to_number(start)?;
+            self.realm.to_number(n)
+        };
+        #[cfg(feature = "intl")]
+        let sy_temporal = self.is_temporal_value(end);
+        #[cfg(not(feature = "intl"))]
+        let sy_temporal = false;
+        let sy_num = if sy_temporal {
+            0.0
+        } else {
+            let n = self.coerce_to_number(end)?;
+            self.realm.to_number(n)
+        };
+        // SameTemporalType: if either endpoint is a Temporal object, both must be
+        // the same Temporal kind (a plain number counts as its own, non-Temporal
+        // kind, so a Temporal-vs-number pair is always a mismatch).
+        #[cfg(feature = "intl")]
+        if (sx_temporal || sy_temporal) && self.range_type_tag(start) != self.range_type_tag(end) {
+            return Err(
+                self.type_error("formatRange arguments must be of the same Date/Temporal type")
+            );
+        }
+        let sp = self.dtf_operand_parts(inst, start, sx_temporal, sx_num)?;
+        let ep = self.dtf_operand_parts(inst, end, sy_temporal, sy_num)?;
+        Ok((sp, ep))
+    }
+
+    /// The field-level parts of one already-`ToDateTimeFormattable`-resolved range
+    /// endpoint: a Temporal object via the ECMA-402 Temporal protocol, otherwise the
+    /// `TimeClip`-validated number `num` (non-finite / out-of-range → RangeError).
+    #[cfg_attr(not(feature = "intl"), expect(unused_variables))]
+    fn dtf_operand_parts(
+        &mut self,
+        inst: Handle,
+        value: NanBox,
+        is_temporal: bool,
+        num: f64,
+    ) -> Result<Vec<(&'static str, String)>, ExecError> {
+        #[cfg(feature = "intl")]
+        if is_temporal && let Some(p) = self.temporal_format_parts(inst, value, false)? {
+            return Ok(p);
+        }
+        if !num.is_finite() || num.abs() > 8.64e15_f64 {
+            let m = self.new_str("date value is not a finite time value");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        Ok(self.datetime_parts(inst, num))
+    }
+
+    /// Materializes a `[{ type, value, source }]` array from `(type, value, source)`
+    /// triples.
+    fn intl_build_source_parts(&mut self, parts: Vec<(&str, String, &str)>) -> NanBox {
         let mut elems = Vec::with_capacity(parts.len());
         for (ty, val, src) in parts {
             let o = self.realm.new_object();
@@ -3445,7 +3547,7 @@ impl<'a> Interp<'a> {
             self.realm.set_property(o, "source", sv);
             elems.push(NanBox::handle(o.to_raw()));
         }
-        Ok(NanBox::handle(self.realm.new_array(elems).to_raw()))
+        NanBox::handle(self.realm.new_array(elems).to_raw())
     }
 
     pub(crate) fn intl_format_value(&mut self, handle: Handle, value: NanBox) -> String {
@@ -5043,93 +5145,6 @@ impl<'a> Interp<'a> {
             .map(Handle::from_raw)
             .and_then(|h| self.realm.temporal_at(h))
             .is_some()
-    }
-
-    /// The Temporal-aware branch of `formatRange`/`formatRangeToParts`. Returns
-    /// `Ok(None)` when neither endpoint is a Temporal object (the caller then uses
-    /// the ordinary numeric range path); otherwise `Ok(Some((inst, startStr,
-    /// endStr, collapsed)))`. Both arguments must be defined; endpoints are formatted
-    /// per the ECMA-402 Temporal protocol (no `valueOf` coercion).
-    #[cfg(feature = "intl")]
-    fn intl_temporal_range(
-        &mut self,
-        this: NanBox,
-        start: NanBox,
-        end: NanBox,
-    ) -> Result<Option<(Handle, String, String, bool)>, ExecError> {
-        let Some(inst) = this
-            .as_handle()
-            .map(Handle::from_raw)
-            .filter(|h| self.realm.get_property(*h, "\u{0}intl").is_some())
-        else {
-            return Ok(None);
-        };
-        let is_dt = self
-            .realm
-            .get_property(inst, "\u{0}intl")
-            .map(|k| self.realm.to_display_string(k))
-            .as_deref()
-            == Some("datetime");
-        if !is_dt {
-            return Ok(None);
-        }
-        if !self.is_temporal_value(start) && !self.is_temporal_value(end) {
-            return Ok(None);
-        }
-        if matches!(start.unpack(), Unpacked::Undefined)
-            || matches!(end.unpack(), Unpacked::Undefined)
-        {
-            return Err(self.type_error("formatRange requires two defined arguments"));
-        }
-        // Both endpoints must be the *same* kind (a Date/number counts as one kind,
-        // and each Temporal type as its own); a mismatch is a TypeError.
-        if self.range_type_tag(start) != self.range_type_tag(end) {
-            return Err(
-                self.type_error("formatRange arguments must be of the same Date/Temporal type")
-            );
-        }
-        let (_mx, fx) = self.intl_range_dt_endpoint(inst, start)?;
-        let (_my, fy) = self.intl_range_dt_endpoint(inst, end)?;
-        // Collapse to a single value when both endpoints render identically (the
-        // spec collapses per-field; equal formatted strings is a faithful proxy).
-        let same = fx == fy;
-        Ok(Some((inst, fx, fy, same)))
-    }
-
-    /// Resolves one date/time range endpoint (a Temporal object, or a Date/number)
-    /// into its `(epoch-milliseconds, formatted-string)`.
-    #[cfg(feature = "intl")]
-    fn intl_range_dt_endpoint(
-        &mut self,
-        inst: Handle,
-        value: NanBox,
-    ) -> Result<(f64, String), ExecError> {
-        if let Some((ms, kind)) = self.temporal_dtf_value(inst, value, false)? {
-            let Some(mut o) = self.temporal_plain_options(inst, kind) else {
-                return Err(self.type_error(
-                    "the requested Intl.DateTimeFormat options are not compatible with this Temporal type",
-                ));
-            };
-            let ms = self.dtf_apply_temporal_zone(inst, ms, kind, &mut o);
-            let mut s = String::new();
-            for (_, v) in self.temporal_datetime_parts(inst, ms, &o) {
-                s.push_str(&v);
-            }
-            return Ok((ms, self.apply_numbering_digits(inst, s)));
-        }
-        // Ordinary Date / number endpoint.
-        let ms = match value.as_handle().map(Handle::from_raw) {
-            Some(h) if self.realm.date_at(h).is_some() => self.realm.date_at(h).unwrap(),
-            _ => {
-                let n = self.coerce_to_number(value)?;
-                self.realm.to_number(n)
-            }
-        };
-        if !ms.is_finite() || ms.abs() > 8.64e15_f64 {
-            let m = self.new_str("formatRange date value is not a finite time value");
-            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
-        }
-        Ok((ms, self.format_intl_datetime(inst, ms)))
     }
 
     /// Hand-rolled en-US fallback for [`datetime_parts`](Self::datetime_parts) when the `intl`

@@ -1601,6 +1601,21 @@ impl Realm {
         }
     }
 
+    /// Whether a `RegExp`'s `lastIndex` has been *materialized* as an explicit
+    /// auxiliary own property — via `defineProperty` or a non-canonical assignment
+    /// (an object/`NaN`/negative/non-integer value) — as opposed to the synthesized
+    /// data property every RegExp carries in its compact cell field. The stateful
+    /// `lastIndex` write paths use this to decide whether to mirror the value into
+    /// the aux slot and to honor a user-installed `writable: false`.
+    #[must_use]
+    pub fn regex_aux_last_index_defined(&self, handle: Handle) -> bool {
+        self.aux_props
+            .get(&handle.to_raw())
+            .and_then(|aux| self.heap.get(*aux))
+            .and_then(Cell::as_object)
+            .is_some_and(|o| o.contains("lastIndex") || o.accessor("lastIndex").is_some())
+    }
+
     /// The `(source, flags)` of the `RegExp` at `handle` (owned), if it is one.
     #[must_use]
     pub fn regexp_at(
@@ -3103,6 +3118,12 @@ impl Realm {
             && i < len
             && alloc::format!("{i}") == key
         {
+            return true;
+        }
+        // A RegExp carries an own (synthesized) `lastIndex` data property, present
+        // on every instance even before an assignment materializes an aux slot
+        // (RegExpAlloc's DefinePropertyOrThrow).
+        if key == "lastIndex" && matches!(self.heap.get(handle), Some(Cell::RegExp { .. })) {
             return true;
         }
         // A non-object cell: check its auxiliary props (data or accessor).

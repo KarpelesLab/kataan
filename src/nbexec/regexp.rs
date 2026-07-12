@@ -333,7 +333,7 @@ impl<'a> Interp<'a> {
     ) -> Result<(), ExecError> {
         // A user `Object.defineProperty(re, "lastIndex", { writable: false })`
         // lands in the aux object; honor its writability.
-        if self.realm.has_own(handle, "lastIndex")
+        if self.realm.regex_aux_last_index_defined(handle)
             && (self.realm.property_is_readonly(handle, "lastIndex")
                 || self.realm.is_frozen(handle))
         {
@@ -354,7 +354,7 @@ impl<'a> Interp<'a> {
         });
         if is_canonical {
             // Drop any stale aux mirror so the compact cell field is authoritative.
-            if self.realm.has_own(handle, "lastIndex") {
+            if self.realm.regex_aux_last_index_defined(handle) {
                 self.realm.set_property(handle, "lastIndex", new);
             }
             self.realm.set_regex_last_index(handle, n as usize);
@@ -578,12 +578,12 @@ impl<'a> Interp<'a> {
         // own `lastIndex` (installed via `defineProperty`) therefore makes
         // `compile` throw a TypeError *after* the source/flags have been updated.
         self.realm.recompile_regexp(h, &pat_s, &flags_s);
-        if self.realm.has_own(h, "lastIndex")
+        if self.realm.regex_aux_last_index_defined(h)
             && (self.realm.property_is_readonly(h, "lastIndex") || self.realm.is_frozen(h))
         {
             return Err(self.type_error("Cannot assign to read only property 'lastIndex'"));
         }
-        if self.realm.has_own(h, "lastIndex") {
+        if self.realm.regex_aux_last_index_defined(h) {
             self.realm.set_property(h, "lastIndex", NanBox::number(0.0));
         }
         Ok(this_val)
@@ -694,12 +694,12 @@ impl<'a> Interp<'a> {
     /// As [`set_last_index`](Self::set_last_index) but with an arbitrary value (the
     /// `@@search` save/restore preserves a non-integer/object `lastIndex`).
     fn set_last_index_value(&mut self, h: Handle, v: NanBox) -> Result<(), ExecError> {
-        if self.realm.has_own(h, "lastIndex")
+        if self.realm.regex_aux_last_index_defined(h)
             && (self.realm.property_is_readonly(h, "lastIndex") || self.realm.is_frozen(h))
         {
             return Err(self.type_error("Cannot assign to read only property 'lastIndex'"));
         }
-        if self.realm.has_own(h, "lastIndex") {
+        if self.realm.regex_aux_last_index_defined(h) {
             self.realm.set_property(h, "lastIndex", v);
         }
         let n = self.realm.to_number(v);

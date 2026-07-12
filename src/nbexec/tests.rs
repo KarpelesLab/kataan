@@ -136,6 +136,29 @@ fn regex_compiled_cache_preserves_behaviour() {
         "true:2"
     );
 
+    // `lastIndex` is a real own data property (RegExpAlloc's DefinePropertyOrThrow):
+    // hasOwnProperty is true even before any assignment, its descriptor is
+    // { writable:true, enumerable:false, configurable:false }, and it appears in
+    // getOwnPropertyNames — while still reading/writing the compact cell field.
+    assert_eq!(run(r#"/x/.hasOwnProperty("lastIndex")"#), "true");
+    assert_eq!(
+        run(
+            r#"var d=Object.getOwnPropertyDescriptor(/x/g,"lastIndex"); [d.value,d.writable,d.enumerable,d.configurable].join(",")"#
+        ),
+        "0,true,false,false"
+    );
+    assert_eq!(
+        run(r#"Object.getOwnPropertyNames(/x/).indexOf("lastIndex")>=0"#),
+        "true"
+    );
+    // A materialized non-writable descriptor is honored by an assignment.
+    assert_eq!(
+        run(
+            r#"{ let re=/x/; Object.defineProperty(re,"lastIndex",{value:3,writable:false}); re.lastIndex=9; re.lastIndex }"#
+        ),
+        "3"
+    );
+
     // Same source, different flags are distinct programs and must not collide
     // through the cache: `/x/u` (unicode) vs `/x/` (plain) behave per their
     // own flags. `/😀/u` matches the astral char as one unit-pair; `/./` only
@@ -2622,6 +2645,29 @@ fn date_multi_arg_and_subtraction() {
     );
     assert_eq!(run("let d=new Date(0); d.getTime()"), "0");
     assert_eq!(run("(new Date(2000)) - (new Date(1000))"), "1000");
+    // A two-digit year maps to 1900 + year.
+    assert_eq!(run("Date.UTC(70,0,1)"), "0");
+    assert_eq!(run("Date.UTC(2020,0,1)"), "1577836800000");
+}
+
+#[test]
+fn date_utc_ieee754_arithmetic() {
+    // MakeTime/MakeDate arithmetic follows IEEE-754 float rules exactly (the spec
+    // is explicit that `*`/`+` are the ECMAScript operators): once magnitudes
+    // exceed 2^53, exact-integer math would round differently or overflow an i64.
+    assert_eq!(
+        run("Date.UTC(1970, 0, 1, 80063993375, 29, 1, -288230376151711740)"),
+        "29312"
+    );
+    assert_eq!(
+        run("Date.UTC(1970, 0, 213503982336, 0, 0, 0, -18446744073709552000)"),
+        "34447360"
+    );
+    // The same float path backs `new Date(y, m, …)`.
+    assert_eq!(
+        run("new Date(1970, 0, 1, 80063993375, 29, 1, -288230376151711740).getTime()"),
+        "29312"
+    );
 }
 
 #[test]
@@ -8862,6 +8908,47 @@ fn intl_number_format_range() {
     assert_eq!(
         run("new Intl.NumberFormat('en').formatRangeToParts(3,5).map(x=>x.source).join('|')"),
         "startRange|shared|endRange"
+    );
+}
+
+#[cfg(feature = "intl")]
+#[test]
+fn intl_datetime_format_range_to_parts() {
+    // A DateTimeFormat range emits *field-level* parts (year/month/day/… with
+    // `literal` separators), not one opaque literal per endpoint. A differing
+    // range shows each endpoint's fields tagged startRange/endRange around a
+    // shared separator.
+    assert_eq!(
+        run(
+            "new Intl.DateTimeFormat('en-US').formatRangeToParts(new Date(Date.UTC(2019,0,3)),new Date(Date.UTC(2019,0,5))).map(p=>p.type).join('|')"
+        ),
+        "month|literal|day|literal|year|literal|month|literal|day|literal|year"
+    );
+    // Equal displayed fields collapse: every part is tagged "shared" and the
+    // list is byte-for-byte formatToParts (same type/value sequence).
+    assert_eq!(
+        run(
+            "var d=new Date(Date.UTC(2019,7,10)); var f=new Intl.DateTimeFormat('en',{year:'numeric',month:'short',day:'numeric'}); var r=f.formatRangeToParts(d,d); var p=f.formatToParts(d); r.every((e,i)=>e.type===p[i].type&&e.value===p[i].value&&e.source==='shared')&&r.length===p.length"
+        ),
+        "true"
+    );
+    // There is an inner `literal` immediately before the `dayPeriod` field (this
+    // is what the resolved-time-zone tests probe; a single opaque literal used to
+    // read past the array end and throw).
+    assert_eq!(
+        run(
+            "var parts=new Intl.DateTimeFormat('en-US',{timeStyle:'short'}).formatRangeToParts(0,86400); parts.some((part,i)=>part.type==='literal'&&parts[i+1]&&parts[i+1].type==='dayPeriod')"
+        ),
+        "true"
+    );
+    // ToDateTimeFormattable coerces both operands (running valueOf) *before* the
+    // SameTemporalType check: a NaN-returning valueOf paired with a Temporal
+    // object still calls valueOf, then throws TypeError (not RangeError).
+    assert_eq!(
+        run(
+            "var n=0; var bad={valueOf(){n++;return NaN;}}; try{new Intl.DateTimeFormat().formatRange(bad,new Temporal.PlainDate(1970,1,1));}catch(e){} n"
+        ),
+        "1"
     );
 }
 

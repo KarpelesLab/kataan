@@ -8187,6 +8187,52 @@ fn time_clip(t: f64) -> f64 {
     if truncated == 0.0 { 0.0 } else { truncated }
 }
 
+/// `TimeClip(MakeDate(MakeDay(year, month, day), MakeTime(h, min, s, milli)))`
+/// (§21.4.1.11–.13), for `Date.UTC` and the `new Date(y, m, …)` multi-argument
+/// form. Every component is first `ToIntegerOrInfinity`-truncated, then the
+/// combination is carried out in IEEE-754 `f64` **exactly as the ECMAScript `*`
+/// and `+` operators** — not as exact integers. This matters once magnitudes
+/// exceed 2^53: integer arithmetic (or an `i64` intermediate) would round
+/// differently, or overflow. Every argument must already be finite (callers
+/// reject NaN/∞ before calling). A two-digit `year` (0..=99) → `1900 + year`.
+pub(crate) fn make_date_ms(
+    year_n: f64,
+    month: f64,
+    day: f64,
+    hours: f64,
+    mins: f64,
+    secs: f64,
+    millis: f64,
+) -> f64 {
+    // MakeFullYear: a two-digit year maps to 1900 + year, else the year as-is.
+    let yr_full = {
+        let yi = trunc_toward_zero(year_n);
+        if (0.0..=99.0).contains(&yi) {
+            1900.0 + yi
+        } else {
+            year_n
+        }
+    };
+    // ToIntegerOrInfinity each component (all finite here).
+    let y = trunc_toward_zero(yr_full);
+    let m = trunc_toward_zero(month);
+    let dt = trunc_toward_zero(day);
+    let h = trunc_toward_zero(hours);
+    let mi = trunc_toward_zero(mins);
+    let s = trunc_toward_zero(secs);
+    let milli = trunc_toward_zero(millis);
+    // MakeDay: ym = y + floor(m / 12); mn = m modulo 12; Day(ym, mn, 1) + dt - 1.
+    let m_floor = crate::common::FloatExt::floor(m / 12.0);
+    let ym = y + m_floor;
+    let mn = m - m_floor * 12.0; // 0.0..=11.0
+    let day_base = crate::realm::days_from_civil(ym as i64, mn as u32 + 1, 1) as f64;
+    let day_number = day_base + (dt - 1.0);
+    // MakeTime: ((h·msPerHour + m·msPerMinute) + s·msPerSecond) + milli.
+    let time = ((h * 3_600_000.0 + mi * 60_000.0) + s * 1_000.0) + milli;
+    // MakeDate: day · msPerDay + time.
+    time_clip(day_number * 86_400_000.0 + time)
+}
+
 fn int_to_radix(n: f64, radix: u32) -> String {
     const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     let neg = n < 0.0;
