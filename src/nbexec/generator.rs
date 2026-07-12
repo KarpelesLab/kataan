@@ -1245,11 +1245,35 @@ impl<'a> Interp<'a> {
     /// Settles the coroutine's result promise on completion, or parks it on the
     /// next awaited value (scheduling the resume reactions).
     pub(crate) fn async_step(&mut self, id: usize, controller: Handle, how: Resumption) {
+        // A coroutine driving a *module* body (top-level await) carries the module
+        // key on its controller: re-establish the module's ambient state (import
+        // aliases, `import.meta`, active-module key, top-level var environment) for
+        // this resume, since `run_generator` only restores the lexical/`this`/strict
+        // context captured in the frame, not the module-evaluation context. Restored
+        // after the step so the surrounding event-loop tick is unaffected.
+        #[cfg(all(feature = "module", feature = "std"))]
+        let module_ctx = self.enter_module_context_for_controller(controller);
         let promise = self
             .realm
             .get_property(controller, ASYNC_PROMISE)
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw);
+        self.async_step_inner(id, controller, how, promise);
+        #[cfg(all(feature = "module", feature = "std"))]
+        if let Some(ctx) = module_ctx {
+            self.exit_module_context(ctx);
+        }
+    }
+
+    /// The body of [`Self::async_step`] (the generator drive and promise
+    /// settlement), split out so the module-coroutine ambient state can wrap it.
+    fn async_step_inner(
+        &mut self,
+        id: usize,
+        controller: Handle,
+        how: Resumption,
+        promise: Option<Handle>,
+    ) {
         match self.run_generator(id, how) {
             Ok(GenStep::Done(v)) => {
                 if let Some(p) = promise {
@@ -1554,6 +1578,14 @@ pub(crate) fn body_has_await(body: &Body<'_>) -> bool {
         Body::Block(stmts) => stmts.iter().any(stmt_has_yield),
         Body::Expr(e) => expr_has_yield(e),
     }
+}
+
+/// Whether a statement contains a reachable top-level `await` (or `for await`)
+/// not nested inside a function/class boundary. `await` and `yield` are the same
+/// suspension points to the coroutine walker, so this is [`stmt_has_yield`] under
+/// an await-focused name (used by the module top-level-await detector).
+pub(crate) fn stmt_has_await(s: &Stmt) -> bool {
+    stmt_has_yield(s)
 }
 
 /// Whether a statement may execute a `yield` reachable in the *current*
@@ -2964,8 +2996,11 @@ impl<'a> Interp<'a> {
     ) -> StepResult {
         // A yield-free statement runs in one shot; its abrupt completions become
         // generator-machine completions (so break/continue/return out of it are
-        // handled by the unwinder, honoring an enclosing label).
-        if !stmt_has_yield(stmt) {
+        // handled by the unwinder, honoring an enclosing label). A module
+        // top-level `import`/`export` is excluded: `exec` rejects it as an
+        // unsupported statement, so it must reach the dedicated match arms below
+        // (its own declaration payload runs there) even when yield-free.
+        if !stmt_has_yield(stmt) && !matches!(stmt, Stmt::Import(_) | Stmt::Export(_)) {
             // A directly-labeled yield-free loop needs its label for inner
             // break/continue; `exec` reads `pending_label`.
             if let Some(l) = label
@@ -3199,6 +3234,19 @@ impl<'a> Interp<'a> {
                 // Restore eagerly on the synchronous path.
                 self.current = saved;
                 r
+            }
+            // Module top-level statements reached when a module body with
+            // top-level `await` is driven on this coroutine engine. An `import`
+            // declaration is a no-op at run time (its bindings were wired at link
+            // time). An `export` evaluates its inner declaration/default payload
+            // (the export *slot* was wired at link time) one-shot — an `await` in
+            // an exported initializer runs eagerly, which is a rare corner the
+            // suspending path does not reify.
+            Stmt::Import(_) => Ok(StepOut::Continue),
+            #[cfg(all(feature = "module", feature = "std"))]
+            Stmt::Export(decl) => {
+                self.exec_export(decl).map_err(GenAbrupt::from)?;
+                Ok(StepOut::Continue)
             }
             // Yield-bearing forms not otherwise handled fall back to one-shot
             // execution (no reachable yield will actually run).

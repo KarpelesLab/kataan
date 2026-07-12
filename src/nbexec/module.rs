@@ -1090,7 +1090,24 @@ impl<'a> Interp<'a> {
 
     /// Runs one module's top-level statements in its own environment, with its
     /// import aliases active and `import.meta` set up. Modules are always strict.
+    ///
+    /// A module whose body contains a **top-level `await`** (or `for await`) is a
+    /// spec async module: its body is driven as a suspendable coroutine (the same
+    /// engine that runs async functions), so an `await` suspends the module and
+    /// yields to the microtask queue rather than draining the event loop inline —
+    /// giving the specified tick interleaving. Such a body is run to settlement
+    /// here (blocking on the event loop until the module's evaluation promise
+    /// resolves/rejects), preserving the synchronous-completion contract the
+    /// depth-first `evaluate_module` relies on for a dependency; the entry's
+    /// trailing reactions (`$DONE`, further `.then`s) drain in `evaluate_entry`.
     fn run_module_body(&mut self, key: &str) -> Result<(), ExecError> {
+        let is_tla = {
+            let r = &self.modules.records[key];
+            matches!(r.kind, ModuleKind::JavaScript) && module_body_has_await(&r.program.body)
+        };
+        if is_tla {
+            return self.run_module_body_async(key);
+        }
         let (scope, program, aliases) = {
             let r = &self.modules.records[key];
             (r.scope.clone(), r.program, r.import_aliases.clone())
@@ -1118,6 +1135,134 @@ impl<'a> Interp<'a> {
         self.annexb_block_fns = saved_annexb;
         self.active_module_key = saved_active;
         result
+    }
+
+    /// Runs a **top-level-await** module body as a suspendable async coroutine
+    /// (the async-function engine), draining the event loop until the module's
+    /// evaluation promise settles. An `await` therefore suspends the whole module
+    /// body and yields to pending microtasks — matching the spec's async-module
+    /// tick interleaving — instead of draining the event loop inline at the
+    /// `await`. A rejection of the evaluation promise becomes this module's
+    /// evaluation error (propagated / cached by `evaluate_module`).
+    fn run_module_body_async(&mut self, key: &str) -> Result<(), ExecError> {
+        use crate::cell::PromiseStatus::{Pending, Rejected};
+        let (scope, program) = {
+            let r = &self.modules.records[key];
+            (r.scope.clone(), r.program)
+        };
+        // `import.meta` (built lazily, once) — materialised before the coroutine
+        // runs so an early `import.meta` read on the first burst sees it.
+        let _ = self.module_meta(key);
+        // Pre-declare the `*default*` lexical binding in its Temporal Dead Zone for
+        // an anonymous `export default <expr>` (as `exec_module_stmts` does), so a
+        // namespace access of `default` before the statement runs is a
+        // ReferenceError. A *named* default (`export default function f`) hoists
+        // ordinarily and is excluded.
+        for stmt in &program.body {
+            if let Stmt::Export(ExportDecl::Default { declaration, .. }) = stmt
+                && !matches!(
+                    &**declaration,
+                    Stmt::Function(crate::ast::Function { id: Some(_), .. })
+                )
+                && !scope.has_local(DEFAULT_LOCAL)
+            {
+                scope.declare(DEFAULT_LOCAL, NanBox::tdz());
+            }
+        }
+        // Capture a module-appropriate execution context into the coroutine frame:
+        // `this` is undefined, no home object / new.target, always strict. The
+        // per-resume module ambient state (import aliases, `import.meta`, active
+        // key, var environment) is installed by `async_step` from the controller's
+        // module key, so it is *not* part of the frame.
+        let saved_this = core::mem::replace(&mut self.this_val, NanBox::undefined());
+        let saved_target = core::mem::replace(&mut self.new_target, NanBox::undefined());
+        let saved_home = self.current_home.take();
+        let saved_home_static = core::mem::replace(&mut self.current_home_static, false);
+        let saved_home_obj = self.current_home_object.take();
+        let saved_strict = core::mem::replace(&mut self.strict, true);
+        let (id, promise, controller) =
+            self.make_async_frame(super::Body::Block(&program.body), scope);
+        self.this_val = saved_this;
+        self.new_target = saved_target;
+        self.current_home = saved_home;
+        self.current_home_static = saved_home_static;
+        self.current_home_object = saved_home_obj;
+        self.strict = saved_strict;
+        // Tag the controller as a module coroutine so each resume re-establishes
+        // the module's ambient state.
+        let key_val = self.new_str(key);
+        self.realm
+            .set_hidden_property(controller, super::MODULE_KEY, key_val);
+        // Drive the first synchronous burst (body up to the first top-level
+        // `await`, or to completion for a body whose only await is unreachable).
+        self.async_step(
+            id,
+            controller,
+            super::generator::Resumption::Next(NanBox::undefined()),
+        );
+        // Block on the event loop until the module's evaluation promise settles, so
+        // a *dependency* module completes before its importer's body runs (the DFS
+        // contract). The entry module's trailing reactions drain in
+        // `evaluate_entry`'s own event-loop pass.
+        while self
+            .realm
+            .promise_state(promise)
+            .is_some_and(|s| s.borrow().status == Pending)
+            && (!self.microtasks.is_empty() || !self.macrotasks.is_empty())
+        {
+            if self.microtasks.is_empty() {
+                self.run_one_macrotask()?;
+            } else {
+                self.run_one_microtask()?;
+            }
+        }
+        // A rejected evaluation promise is this module's evaluation error.
+        if let Some(state) = self.realm.promise_state(promise) {
+            let st = state.borrow();
+            if st.status == Rejected {
+                return Err(ExecError::Throw(st.value));
+            }
+        }
+        Ok(())
+    }
+
+    /// If `controller` is an async coroutine driving a module body (it carries a
+    /// [`MODULE_KEY`] slot), install that module's ambient evaluation state (import
+    /// aliases, `import.meta`, active-module key, and the module top-level variable
+    /// environment), returning the prior state to restore afterwards. Returns
+    /// `None` for an ordinary async-function controller (no module context).
+    pub(crate) fn enter_module_context_for_controller(
+        &mut self,
+        controller: crate::heap::Handle,
+    ) -> Option<ModuleContextSave> {
+        let key = self
+            .realm
+            .get_property(controller, super::MODULE_KEY)
+            .and_then(|v| v.as_handle())
+            .map(crate::heap::Handle::from_raw)
+            .and_then(|h| self.realm.string_value(h))?;
+        let (var_scope, aliases) = {
+            let r = self.modules.records.get(&key)?;
+            (r.scope.clone(), r.import_aliases.clone())
+        };
+        let meta = self.module_meta(&key);
+        Some(ModuleContextSave {
+            var_scope: core::mem::replace(&mut self.var_scope, var_scope),
+            module_imports: core::mem::replace(&mut self.module_imports, aliases),
+            import_meta: self.import_meta.replace(meta),
+            active_module_key: self.active_module_key.replace(key),
+            annexb_block_fns: core::mem::take(&mut self.annexb_block_fns),
+        })
+    }
+
+    /// Restores the ambient module-evaluation state saved by
+    /// [`Self::enter_module_context_for_controller`].
+    pub(crate) fn exit_module_context(&mut self, save: ModuleContextSave) {
+        self.var_scope = save.var_scope;
+        self.module_imports = save.module_imports;
+        self.import_meta = save.import_meta;
+        self.active_module_key = save.active_module_key;
+        self.annexb_block_fns = save.annexb_block_fns;
     }
 
     /// Hoists then executes a module body's statements, treating `import` as a
@@ -1158,7 +1303,7 @@ impl<'a> Interp<'a> {
 
     /// Evaluates an `export` declaration's payload (the binding side; the export
     /// *slot* wiring already happened at link time).
-    fn exec_export(&mut self, decl: &'a ExportDecl) -> Result<(), ExecError> {
+    pub(crate) fn exec_export(&mut self, decl: &'a ExportDecl) -> Result<(), ExecError> {
         match decl {
             // Re-exports and bare `export { … }` bind nothing locally.
             ExportDecl::All { .. } => Ok(()),
@@ -1861,6 +2006,32 @@ impl<'a> Interp<'a> {
     pub fn set_script_import_base(&mut self, base: Option<String>) {
         self.script_import_base = base;
     }
+}
+
+/// The ambient module-evaluation state saved while an async module coroutine
+/// runs (restored after each `async_step`). See
+/// [`Interp::enter_module_context_for_controller`].
+pub(crate) struct ModuleContextSave {
+    var_scope: Scope,
+    module_imports: Rc<BTreeMap<String, (Scope, String)>>,
+    import_meta: Option<NanBox>,
+    active_module_key: Option<String>,
+    annexb_block_fns: Vec<String>,
+}
+
+/// Whether a module body's top-level statements contain a reachable `await` (or
+/// `for await`) — i.e. this is an async (top-level-await) module. Unlike the
+/// async-function detector, this also descends into an `export`'s inner
+/// declaration (`export const x = await f()`), which is otherwise opaque to the
+/// statement walker.
+fn module_body_has_await(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Export(ExportDecl::Decl { declaration, .. })
+        | Stmt::Export(ExportDecl::Default { declaration, .. }) => {
+            super::generator::stmt_has_await(declaration)
+        }
+        other => super::generator::stmt_has_await(other),
+    })
 }
 
 /// What kind of slot an import binding maps to.

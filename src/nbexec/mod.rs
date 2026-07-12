@@ -2481,6 +2481,14 @@ const GEN_FRAME: &str = "\u{0}gframe";
 /// Hidden slot on an *async* coroutine controller object: the raw handle of the
 /// promise the async function call returned (settled when the body completes).
 const ASYNC_PROMISE: &str = "\u{0}aprom";
+/// Hidden slot on an async coroutine controller driving a **module body** with
+/// top-level `await`: the resolved key of that module. Its presence marks the
+/// coroutine as a module evaluation, so each resume re-establishes the module's
+/// ambient state (import aliases, `import.meta`, the active-module key, and the
+/// module top-level variable environment) before the body runs. Absent on an
+/// ordinary async-function controller.
+#[cfg(all(feature = "module", feature = "std"))]
+const MODULE_KEY: &str = "\u{0}modkey";
 /// Reserved hidden slots for a lazy ES2025 iterator-helper object (the object
 /// returned by `Iterator.prototype.{map,filter,take,drop,flatMap}` and
 /// `Iterator.from`). The helper pulls from its underlying iterator one step at a
