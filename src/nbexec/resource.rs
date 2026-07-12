@@ -523,6 +523,47 @@ impl<'a> Interp<'a> {
         Ok(NanBox::handle(realm_obj.to_raw()))
     }
 
+    /// `$262.AbstractModuleSource` — build the `%AbstractModuleSource%` intrinsic
+    /// (source-phase-imports proposal §28) and return its constructor. Only the
+    /// *intrinsic shape* is materialized (no loadable module-source objects exist
+    /// yet): the abstract constructor (throws on `[[Call]]`/`[[Construct]]`,
+    /// `name` = "AbstractModuleSource", `length` = 0, `[[Prototype]]` =
+    /// %FunctionPrototype%) and `%AbstractModuleSource.prototype%` (its
+    /// `[[Prototype]]` is %Object.prototype%, a `constructor` data property back to
+    /// the ctor, and a `@@toStringTag` accessor getter returning the receiver's
+    /// `[[ModuleSourceClassName]]` — always `undefined` here since no receiver
+    /// carries that slot).
+    pub(crate) fn abstract_module_source(&mut self) -> Result<NanBox, ExecError> {
+        // The abstract constructor: `new`/call both throw a TypeError.
+        let ctor = self.realm.new_native(N_ABSTRACT_MODULE_SOURCE_CTOR);
+        self.install_fn_name_length(ctor, "AbstractModuleSource", 0);
+        // `%AbstractModuleSource.prototype%` — a plain object (so its
+        // `[[Prototype]]` is %Object.prototype%).
+        let proto = self.realm.new_object();
+        // `%AbstractModuleSource.prototype%.constructor` — a data property
+        // { writable: true, enumerable: false, configurable: true }.
+        self.realm
+            .set_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
+        self.realm.mark_hidden(proto, "constructor");
+        // `get %AbstractModuleSource%.prototype[@@toStringTag]` — an accessor with
+        // no setter, { enumerable: false, configurable: true }.
+        let tag_get = self.realm.new_native(N_ABSTRACT_MODULE_SOURCE_TAG_GET);
+        self.install_fn_name_length(tag_get, "get [Symbol.toStringTag]", 0);
+        let tag_sym = self.well_known_symbol("toStringTag");
+        let tag_key = self.member_key(tag_sym);
+        self.realm.define_accessor(
+            proto,
+            &tag_key,
+            NanBox::handle(tag_get.to_raw()),
+            NanBox::undefined(),
+        );
+        self.realm.mark_hidden(proto, &tag_key);
+        // `%AbstractModuleSource%.prototype` — { writable: false, enumerable:
+        // false, configurable: false }.
+        self.install_fn_prototype(ctor, proto, false);
+        Ok(NanBox::handle(ctor.to_raw()))
+    }
+
     /// `realm.evalScript(src)` — evaluate `src` in the receiver realm's global
     /// environment (swapping in its scope + intrinsics), returning the completion
     /// value. `this` must be a realm object built by [`create_realm`].

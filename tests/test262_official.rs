@@ -64,6 +64,7 @@ var $262 = {
   evalScript: function (src) { return $262_evalScript(src); },
   detachArrayBuffer: function (b) { return $262_detachArrayBuffer(b); },
   createRealm: function () { return $262_createRealm(); },
+  AbstractModuleSource: $262_AbstractModuleSource(),
   IsHTMLDDA: $262_IsHTMLDDA(),
   agent: {
     start: function (src) { return $262_agent_start(src); },

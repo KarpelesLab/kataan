@@ -3021,6 +3021,21 @@ impl<'a> Interp<'a> {
             // (also `realm.createRealm()`). Builds a second realm with distinct
             // intrinsics and returns its `$262`-shaped realm object.
             N_262_CREATE_REALM => return self.create_realm(),
+            // `$262_AbstractModuleSource()` — build+return the `%AbstractModuleSource%`
+            // intrinsic (source-phase-imports; intrinsic shape only).
+            N_262_ABSTRACT_MODULE_SOURCE => return self.abstract_module_source(),
+            // `%AbstractModuleSource%()` / `new %AbstractModuleSource%()` — the
+            // abstract constructor always throws a TypeError (§28.1.1.1).
+            N_ABSTRACT_MODULE_SOURCE_CTOR => {
+                let m =
+                    self.new_str("Abstract class AbstractModuleSource not directly constructable");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            // `get %AbstractModuleSource%.prototype[@@toStringTag]` — returns the
+            // receiver's `[[ModuleSourceClassName]]`, or `undefined` when the
+            // receiver is not an object or lacks that internal slot. No object
+            // carries that slot yet (no loadable module sources), so: undefined.
+            N_ABSTRACT_MODULE_SOURCE_TAG_GET => NanBox::undefined(),
             // `realm.evalScript(src)` — evaluate `src` in the receiver realm.
             N_262_EVAL_SCRIPT => return self.eval_script_in_realm(arg(0)),
             N_262_EVAL_SCRIPT_MAIN => return self.eval_script_current_realm(arg(0)),

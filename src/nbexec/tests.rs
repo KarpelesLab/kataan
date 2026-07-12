@@ -11136,3 +11136,50 @@ fn proxy_set_typed_array_integer_index_exotic() {
         "5"
     );
 }
+
+#[test]
+fn abstract_module_source_intrinsic_shape() {
+    // The `%AbstractModuleSource%` intrinsic (source-phase-imports proposal) is
+    // exposed to Test262 via the `$262_AbstractModuleSource()` host hook. Only the
+    // intrinsic *shape* is materialized (no loadable module sources yet). A single
+    // program captures one instance in `C` and checks the full intrinsic shape:
+    //   - it is a function whose `[[Prototype]]` is %FunctionPrototype%;
+    //   - `name` = "AbstractModuleSource" and `length` = 0, each
+    //     { writable: false, enumerable: false, configurable: true };
+    //   - the abstract constructor throws a TypeError on `[[Construct]]`;
+    //   - `prototype` is { writable: false, enumerable: false, configurable: false }
+    //     and its `[[Prototype]]` is %Object.prototype%;
+    //   - `prototype.constructor` is a data property back to `C`
+    //     { writable: true, enumerable: false, configurable: true };
+    //   - `prototype[@@toStringTag]` is a getter-only accessor
+    //     { enumerable: false, configurable: true } returning undefined for any
+    //     receiver lacking a `[[ModuleSourceClassName]]` slot.
+    let program = r#"
+        var C = $262_AbstractModuleSource();
+        var ok = typeof C === 'function'
+            && Object.getPrototypeOf(C) === Function.prototype;
+        var nd = Object.getOwnPropertyDescriptor(C, 'name');
+        ok = ok && nd.value === 'AbstractModuleSource' && nd.writable === false
+            && nd.enumerable === false && nd.configurable === true;
+        var ld = Object.getOwnPropertyDescriptor(C, 'length');
+        ok = ok && ld.value === 0 && ld.writable === false
+            && ld.enumerable === false && ld.configurable === true;
+        var threw = false;
+        try { new C(); } catch (e) { threw = e instanceof TypeError; }
+        ok = ok && threw;
+        var pd = Object.getOwnPropertyDescriptor(C, 'prototype');
+        ok = ok && pd.writable === false && pd.enumerable === false
+            && pd.configurable === false;
+        ok = ok && Object.getPrototypeOf(C.prototype) === Object.prototype;
+        var cd = Object.getOwnPropertyDescriptor(C.prototype, 'constructor');
+        ok = ok && cd.value === C && cd.writable === true
+            && cd.enumerable === false && cd.configurable === true;
+        var td = Object.getOwnPropertyDescriptor(C.prototype, Symbol.toStringTag);
+        ok = ok && typeof td.get === 'function' && td.set === undefined
+            && td.enumerable === false && td.configurable === true
+            && td.get.call(262) === undefined
+            && td.get.call(C.prototype) === undefined;
+        ok
+    "#;
+    assert_eq!(run(program), "true");
+}

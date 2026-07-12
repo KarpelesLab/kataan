@@ -1700,6 +1700,20 @@ const N_262_AGENT_RECEIVE_BROADCAST: u16 = 957;
 const N_262_AGENT_SLEEP: u16 = 958;
 /// `$262.agent.monotonicNow()` — a monotonic millisecond clock reading.
 const N_262_AGENT_MONOTONIC_NOW: u16 = 959;
+/// `$262_AbstractModuleSource()` — the Test262 host hook exposing the
+/// `%AbstractModuleSource%` intrinsic (source-phase-imports proposal). Builds and
+/// returns the abstract `%AbstractModuleSource%` constructor with its
+/// `%AbstractModuleSource.prototype%` (see [`Interp::abstract_module_source`]).
+const N_262_ABSTRACT_MODULE_SOURCE: u16 = 1214;
+/// `%AbstractModuleSource%()` — the abstract constructor. It has no usable
+/// `[[Construct]]`/`[[Call]]`: invoking it (directly or via `new`) throws a
+/// TypeError per the source-phase-imports proposal (§28.1.1.1).
+const N_ABSTRACT_MODULE_SOURCE_CTOR: u16 = 1215;
+/// `get %AbstractModuleSource%.prototype[@@toStringTag]` — returns the receiver's
+/// `[[ModuleSourceClassName]]`, or `undefined` when the receiver is not an object
+/// or lacks that internal slot. Since no loadable module-source objects exist yet
+/// (only the intrinsic shape), this always returns `undefined`.
+const N_ABSTRACT_MODULE_SOURCE_TAG_GET: u16 = 1216;
 /// `Atomics.waitAsync(view, idx, value, timeout)` — the async, non-blocking
 /// counterpart of `Atomics.wait`; returns `{ async, value }` (a promise when it
 /// would block) settled `"ok"` by a matching `notify` or `"timed-out"`.
@@ -4011,6 +4025,10 @@ impl<'a> Interp<'a> {
             ("$262_agent_receiveBroadcast", N_262_AGENT_RECEIVE_BROADCAST),
             ("$262_agent_sleep", N_262_AGENT_SLEEP),
             ("$262_agent_monotonicNow", N_262_AGENT_MONOTONIC_NOW),
+            // Test262 host hook: `$262.AbstractModuleSource` is wired (by the
+            // runner's JS prelude) to the `%AbstractModuleSource%` intrinsic so
+            // the source-phase-imports intrinsic-shape tests can introspect it.
+            ("$262_AbstractModuleSource", N_262_ABSTRACT_MODULE_SOURCE),
         ] {
             let f = self.new_named_native(name, id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
