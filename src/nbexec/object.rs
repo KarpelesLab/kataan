@@ -903,6 +903,63 @@ impl<'a> Interp<'a> {
             }
             return Ok(true);
         }
+        // String exotic object `[[DefineOwnProperty]]` (ECMA-262 10.4.3.4): an own
+        // index (`"0".."length-1"`) or `length` is a synthesized data property that
+        // is non-writable and non-configurable. StringGetOwnProperty yields it, and
+        // the define must be `IsCompatiblePropertyDescriptor` against it — so only a
+        // same-value, same-attributes redefine succeeds; any change of value, kind,
+        // writability, enumerability, or configurability fails (a TypeError for
+        // `Object.defineProperty`, `false` for `Reflect.defineProperty`). A wrapper's
+        // *named* own property is ordinary and falls through to the generic path.
+        if let Some(slen) = self.string_index_count(obj) {
+            let is_index = key
+                .parse::<usize>()
+                .ok()
+                .filter(|&i| alloc::format!("{i}") == key && i < slen)
+                .is_some();
+            if key == "length" || is_index {
+                let cur_value = if key == "length" {
+                    NanBox::number(slen as f64)
+                } else {
+                    self.read_member(obj, key)?
+                };
+                // An index is enumerable; `length` is not.
+                let cur_enum = is_index;
+                let truthy_field = |this: &Self, field: &str| -> bool {
+                    this.realm.has_own(desc, field)
+                        && this
+                            .realm
+                            .get_property(desc, field)
+                            .is_some_and(|v| this.realm.truthy(v))
+                };
+                // IsCompatiblePropertyDescriptor for a non-configurable, non-writable
+                // data property: reject making it configurable/writable, toggling
+                // enumerable, switching to an accessor, or changing the value.
+                let value_changed = self.realm.has_own(desc, "value") && {
+                    let nv = self
+                        .realm
+                        .get_property(desc, "value")
+                        .unwrap_or(NanBox::undefined());
+                    !self.realm.same_value(nv, cur_value)
+                };
+                let incompatible = truthy_field(self, "configurable")
+                    || truthy_field(self, "writable")
+                    || has_accessor_field
+                    || (self.realm.has_own(desc, "enumerable")
+                        && truthy_field(self, "enumerable") != cur_enum)
+                    || value_changed;
+                if incompatible {
+                    if reflect {
+                        return Ok(false);
+                    }
+                    let m = self.new_str(&alloc::format!(
+                        "Cannot redefine property '{key}' of a String exotic object"
+                    ));
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                return Ok(true);
+            }
+        }
         // An array's `length` is an exotic own data property governed by
         // ArraySetLength (ECMA-262 10.4.3.1): it is `{enumerable:false,
         // configurable:false}`, writable by default, and its "value" resizes the

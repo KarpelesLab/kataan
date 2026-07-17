@@ -12,9 +12,15 @@ assert.sameValue(3 instanceof Even, false, "3 is odd");
 assert.sameValue(0 instanceof Even, true, "0 is even");
 assert.sameValue("x" instanceof Even, false, "non-number");
 
-// A [Symbol.hasInstance] property on an ordinary function works too.
+// A [Symbol.hasInstance] property on an ordinary function works too. It must be
+// installed via defineProperty: %Function.prototype%[@@hasInstance] is
+// { [[Writable]]: false }, so a plain `Matcher[Symbol.hasInstance] = ...`
+// assignment is a silent no-op in sloppy mode and would NOT override it.
 function Matcher() {}
-Matcher[Symbol.hasInstance] = function (x) { return x === "match"; };
+Object.defineProperty(Matcher, Symbol.hasInstance, {
+  value: function (x) { return x === "match"; },
+  configurable: true,
+});
 assert.sameValue("match" instanceof Matcher, true, "custom match");
 assert.sameValue("nope" instanceof Matcher, false, "custom non-match");
 

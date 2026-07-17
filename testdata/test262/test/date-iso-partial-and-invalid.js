@@ -19,5 +19,6 @@ assert.sameValue(isNaN(new Date("2024-03-32").getTime()), true, "day 32 invalid"
 assert.sameValue(String(new Date("xyz")), "Invalid Date", "unparseable string");
 assert.sameValue(String(new Date(NaN)), "Invalid Date", "NaN timestamp");
 assert.sameValue("" + new Date(NaN), "Invalid Date", "concatenation");
-// A valid date is unaffected.
-assert.sameValue(String(new Date(0)).slice(0, 10), "1970-01-01", "valid date");
+// A valid date is unaffected. (String()/toString use the human date format
+// "Thu Jan 01 1970 ..."; the ISO "1970-01-01" prefix comes from toISOString.)
+assert.sameValue(new Date(0).toISOString().slice(0, 10), "1970-01-01", "valid date");

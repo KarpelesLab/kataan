@@ -4,7 +4,10 @@ features: [new.target]
 ---*/
 // A constructor invoked with `new` sees itself; a plain call sees undefined.
 function F() { return new.target; }
-assert.sameValue(new F() instanceof F, true, "new F() constructs");
+// F returns new.target (=F, an object). Per spec, a constructor that returns an
+// object yields that object, so `new F()` evaluates to F itself. (`F instanceof F`
+// would be false — F.prototype is not on F's own prototype chain.)
+assert.sameValue(new F(), F, "new F() returns new.target (=F)");
 assert.sameValue(F(), undefined, "plain call: new.target is undefined");
 
 function G() { this.viaNew = new.target === G; }

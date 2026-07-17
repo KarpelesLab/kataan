@@ -26,7 +26,10 @@ assert.sameValue(
 var bigArr = [1234n, 5n];
 assert.sameValue(bigArr.toLocaleString(), "1,234,5", "bigint elements group too");
 
-// Number.prototype.toLocaleString is unchanged, and -0 renders as "0".
+// Number.prototype.toLocaleString is unchanged, and -0 renders as "-0".
 assert.sameValue((1234567).toLocaleString(), "1,234,567", "number grouping");
 assert.sameValue((1234.56).toLocaleString(), "1,234.56", "number with fraction");
-assert.sameValue((-0).toLocaleString(), "0", "negative zero renders as 0");
+// ECMA-402 PartitionNumberPattern step 1 routes -0 through the NegativePattern
+// (test262 intl402/.../format-negative-numbers.js asserts format(0) !== format(-0)),
+// so Number.prototype.toLocaleString renders -0 as "-0", not "0".
+assert.sameValue((-0).toLocaleString(), "-0", "negative zero renders as -0");
