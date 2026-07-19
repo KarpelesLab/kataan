@@ -530,6 +530,95 @@ fn exact_increment(int: &mut alloc::vec::Vec<u8>, frac: &mut [u8]) {
     }
 }
 
+/// Map an ECMA-402 [`RoundingMode`](intl::number::RoundingMode) to the
+/// `puremp::Decimal` [`Rounding`](puremp::decimal::Rounding) that reproduces it
+/// exactly. `puremp` has no ties-toward-±∞ mode, so `halfCeil`/`halfFloor` are
+/// resolved per the value's sign (`neg`) into ties-away-from / ties-toward zero —
+/// exact because the sign fixes which of ±∞ the tie rounds toward.
+#[cfg(feature = "intl")]
+fn intl_mode_to_rounding(mode: intl::number::RoundingMode, neg: bool) -> puremp::decimal::Rounding {
+    use intl::number::RoundingMode as M;
+    use puremp::decimal::Rounding as R;
+    match mode {
+        M::Trunc => R::Down,
+        M::Expand => R::Up,
+        M::Floor => R::Floor,
+        M::Ceil => R::Ceiling,
+        M::HalfExpand => R::HalfUp,
+        M::HalfTrunc => R::HalfDown,
+        M::HalfEven => R::HalfEven,
+        M::HalfCeil => {
+            if neg {
+                R::HalfDown
+            } else {
+                R::HalfUp
+            }
+        }
+        M::HalfFloor => {
+            if neg {
+                R::HalfUp
+            } else {
+                R::HalfDown
+            }
+        }
+    }
+}
+
+/// Exact ECMA-402 `ToRawPrecision` for a high-precision operand: rounds the exact
+/// value `±int_part.frac_part` to `max_sig` significant digits (then pads trailing
+/// zeros up to `min_sig`) using a `puremp::Decimal`, so the result is exact for
+/// values beyond `f64` precision and every rounding mode — including half-even,
+/// which the hand-rolled digit helpers only approximate. Returns the rounded
+/// `(integer_digits, fraction_digits)` latn digit vectors for `assemble_decimal`.
+#[cfg(feature = "intl")]
+fn exact_significant_digits(
+    neg: bool,
+    int_part: &str,
+    frac_part: &str,
+    min_sig: Option<usize>,
+    max_sig: Option<usize>,
+    mode: intl::number::RoundingMode,
+) -> Option<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)> {
+    use puremp::decimal::Decimal;
+    // Reassemble the signed literal and parse it into an exact base-10 Decimal.
+    let mut lit = String::new();
+    if neg {
+        lit.push('-');
+    }
+    lit.push_str(if int_part.is_empty() { "0" } else { int_part });
+    if !frac_part.is_empty() {
+        lit.push('.');
+        lit.push_str(frac_part);
+    }
+    let d: Decimal = lit.parse().ok()?;
+    let rounded = match max_sig {
+        Some(m) => d.round_to_digits(m.max(1) as u32, intl_mode_to_rounding(mode, neg)),
+        None => d,
+    };
+    // Expand the rounded Decimal to plain (non-scientific) int/frac digit runs.
+    let s = alloc::format!("{}", rounded.abs());
+    let (ip, fp) = s.split_once('.').unwrap_or((s.as_str(), ""));
+    let mut int_digits: alloc::vec::Vec<u8> = ip.bytes().map(|b| b - b'0').collect();
+    let mut frac_digits: alloc::vec::Vec<u8> = fp.bytes().map(|b| b - b'0').collect();
+    if int_digits.is_empty() {
+        int_digits.push(0);
+    }
+    // minimumSignificantDigits: pad trailing zeros so at least `min_sig` significant
+    // digits (counting from the first nonzero, trailing zeros included) are present.
+    if let Some(min_sig) = min_sig {
+        let first = int_digits
+            .iter()
+            .chain(frac_digits.iter())
+            .position(|&d| d != 0)
+            .unwrap_or(int_digits.len());
+        let sig_now = (int_digits.len() + frac_digits.len()).saturating_sub(first);
+        if sig_now < min_sig {
+            frac_digits.resize(frac_digits.len() + (min_sig - sig_now), 0);
+        }
+    }
+    Some((int_digits, frac_digits))
+}
+
 /// Whether a compact-notation formatter carries no explicit digit options, so the
 /// ECMA-402 default rounding (`roundingPriority: "morePrecision"` with
 /// `maximumFractionDigits: 0` / `maximumSignificantDigits: 2`) applies and the
@@ -5827,11 +5916,10 @@ impl<'a> Interp<'a> {
     fn try_exact_decimal_format(&mut self, handle: Handle, value: NanBox) -> Option<String> {
         use intl::number::{Notation, NumberStyle, UseGrouping};
         let opts = self.number_format_options(handle);
-        if opts.notation != Notation::Standard
-            || !matches!(opts.style, NumberStyle::Decimal)
-            || opts.minimum_significant_digits.is_some()
-            || opts.maximum_significant_digits.is_some()
-        {
+        // Only standard-notation decimal style is shaped by `assemble_decimal`'s
+        // probe; currency/percent/unit affixes and scientific/engineering/compact
+        // mantissa shaping stay on the crate's f64 path.
+        if opts.notation != Notation::Standard || !matches!(opts.style, NumberStyle::Decimal) {
             return None;
         }
         let increment = self
@@ -5840,31 +5928,50 @@ impl<'a> Interp<'a> {
             .and_then(|v| v.as_number())
             .unwrap_or(1.0);
         if increment != 1.0 {
+            // roundingIncrement rounds to a multiple of `increment` at the fraction
+            // place; exact multiple-rounding on huge values isn't implemented here,
+            // so leave it to the f64 path.
             return None;
         }
         let (neg, int_part, frac_part) = self.extract_exact_decimal(value)?;
-
-        let max_frac = opts.maximum_fraction_digits.unwrap_or(3) as usize;
-        let min_frac = opts.minimum_fraction_digits.unwrap_or(0) as usize;
         let min_int = (opts.minimum_integer_digits.max(1)) as usize;
 
-        let mut int_digits: alloc::vec::Vec<u8> = int_part.bytes().map(|b| b - b'0').collect();
-        let mut frac_digits: alloc::vec::Vec<u8> = frac_part.bytes().map(|b| b - b'0').collect();
-        // Round the fraction to maximumFractionDigits.
-        if frac_digits.len() > max_frac {
-            let up = exact_round_up(&frac_digits[max_frac..], opts.rounding_mode, neg);
-            frac_digits.truncate(max_frac);
-            if up {
-                exact_increment(&mut int_digits, &mut frac_digits);
+        let (mut int_digits, frac_digits) = if opts.minimum_significant_digits.is_some()
+            || opts.maximum_significant_digits.is_some()
+        {
+            // Significant-digit rounding (ECMA-402 roundingType `significantDigits`),
+            // done exactly with a `puremp::Decimal`.
+            exact_significant_digits(
+                neg,
+                &int_part,
+                &frac_part,
+                opts.minimum_significant_digits.map(|m| m as usize),
+                opts.maximum_significant_digits.map(|m| m as usize),
+                opts.rounding_mode,
+            )?
+        } else {
+            let max_frac = opts.maximum_fraction_digits.unwrap_or(3) as usize;
+            let min_frac = opts.minimum_fraction_digits.unwrap_or(0) as usize;
+            let mut int_digits: alloc::vec::Vec<u8> = int_part.bytes().map(|b| b - b'0').collect();
+            let mut frac_digits: alloc::vec::Vec<u8> =
+                frac_part.bytes().map(|b| b - b'0').collect();
+            // Round the fraction to maximumFractionDigits.
+            if frac_digits.len() > max_frac {
+                let up = exact_round_up(&frac_digits[max_frac..], opts.rounding_mode, neg);
+                frac_digits.truncate(max_frac);
+                if up {
+                    exact_increment(&mut int_digits, &mut frac_digits);
+                }
             }
-        }
-        // Trim trailing fraction zeros down to minimumFractionDigits, then pad up.
-        while frac_digits.len() > min_frac && frac_digits.last() == Some(&0) {
-            frac_digits.pop();
-        }
-        while frac_digits.len() < min_frac {
-            frac_digits.push(0);
-        }
+            // Trim trailing fraction zeros down to minimumFractionDigits, then pad up.
+            while frac_digits.len() > min_frac && frac_digits.last() == Some(&0) {
+                frac_digits.pop();
+            }
+            while frac_digits.len() < min_frac {
+                frac_digits.push(0);
+            }
+            (int_digits, frac_digits)
+        };
         // Normalize the integer digits (strip leading zeros, pad to the minimum).
         while int_digits.len() > 1 && int_digits.first() == Some(&0) {
             int_digits.remove(0);

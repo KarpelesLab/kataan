@@ -997,8 +997,28 @@ impl<'a> Interp<'a> {
                     return Ok(Some(self.new_str(&bigint_to_radix(&big, radix))));
                 }
                 "valueOf" => return Ok(Some(NanBox::handle(self.realm.new_bigint(big).to_raw()))),
-                // Grouped base-10 form (no locale data, en-US-ish default).
+                // `toLocaleString(locales, options)` — build a real NumberFormat and
+                // format the BigInt *value* through it, so every option
+                // (notation/style/significant digits/signDisplay/…) applies and the
+                // result is byte-identical to `Intl.NumberFormat.prototype.format`.
+                // Passing the BigInt NanBox (not an f64) also routes it through the
+                // exact-decimal path, preserving precision beyond 2^53.
                 "toLocaleString" => {
+                    #[cfg(feature = "intl")]
+                    {
+                        let fmt_args = [
+                            args.first().copied().unwrap_or(NanBox::undefined()),
+                            args.get(1).copied().unwrap_or(NanBox::undefined()),
+                        ];
+                        let inst = self.make_intl_formatter(N_INTL_NUMBER_FORMAT, &fmt_args)?;
+                        let value = NanBox::handle(handle.to_raw());
+                        let s = match inst.as_handle().map(Handle::from_raw) {
+                            Some(h) => self.intl_format_checked(h, value)?,
+                            None => group_thousands_str(&bigint_to_radix(&big, 10)),
+                        };
+                        return Ok(Some(self.new_str(&s)));
+                    }
+                    #[cfg(not(feature = "intl"))]
                     return Ok(Some(
                         self.new_str(&group_thousands_str(&bigint_to_radix(&big, 10))),
                     ));
