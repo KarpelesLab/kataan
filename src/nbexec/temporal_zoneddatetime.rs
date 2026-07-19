@@ -768,7 +768,7 @@ fn start_of_day(tz: &str, epoch_days: i64) -> Option<i128> {
 /// `epoch_ns` (in ns), combining the stored transition table with the POSIX
 /// extend rule (so future transitions past the stored range are found). `None`
 /// once the zone has no further transitions (e.g. a fixed zone with no DST rule).
-fn zone_next_transition(zone: &timezone_data::Zone<'_>, epoch_ns: i128) -> Option<i128> {
+fn zone_next_transition(zone: &timezone_data::Zone, epoch_ns: i128) -> Option<i128> {
     let secs = epoch_ns.div_euclid(iso::NS_PER_SEC) as i64;
     let max_secs = (iso::MAX_EPOCH_NS / iso::NS_PER_SEC) as i64;
     // `transitions_for_range` yields stored + POSIX-generated transitions in
@@ -781,10 +781,11 @@ fn zone_next_transition(zone: &timezone_data::Zone<'_>, epoch_ns: i128) -> Optio
 /// `GetNamedTimeZonePreviousTransition`: the last offset transition strictly before
 /// `epoch_ns` (in ns). Stored transitions cover history; any POSIX-generated one is
 /// at most ~1 year back, so a bounded look-back window suffices past the stored range.
-fn zone_prev_transition(zone: &timezone_data::Zone<'_>, epoch_ns: i128) -> Option<i128> {
+fn zone_prev_transition(zone: &timezone_data::Zone, epoch_ns: i128) -> Option<i128> {
     let secs = epoch_ns.div_euclid(iso::NS_PER_SEC) as i64;
     let mut best: Option<i128> = zone
         .transitions()
+        .iter()
         .map(|t| i128::from(t.when) * iso::NS_PER_SEC)
         .filter(|&w| w < epoch_ns)
         .max();

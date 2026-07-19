@@ -84,9 +84,12 @@ intl = { version = "0.5", optional = true, default-features = false, features = 
     "full", "alloc", "case", "collation", "identifiers",
     "number", "currency", "datetime", "calendars-extra", "list", "displaynames", "relative", "units", "locale",
 ] }
-puremp = { version = "0.2", default-features = false, features = ["int"] }
+# `int` backs BigInt; `rational`/`decimal` give exact (non-f64) arithmetic for
+# Intl NumberFormat rounding and Temporal duration ratios (avoids the f64
+# round-trip that loses BigInt precision / mis-rounds at the ULP boundary).
+puremp = { version = "0.2", default-features = false, features = ["int", "rational", "decimal"] }
 # IANA time-zone database (no_std, no-alloc) for Temporal.ZonedDateTime.
-timezone-data = "0.1"
+timezone-data = "0.2"
 
 [lints.rust]
 # Keep the foundation documented and the API surface honest.
