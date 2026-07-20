@@ -282,23 +282,31 @@ fn indian_leap(saka_year: i64) -> bool {
 /// astronomical Thursday-epoch variant) is one day later, i.e. its epoch is one
 /// day earlier — subtracting 1 from the pivot JDN advances the reported date by
 /// a day. Verified against Test262: 2000-01-01 = 1420-09-24 (civil) / -09-25
-/// (tbla). `islamic-umalqura` has no astronomical data here → it falls back to
-/// the civil tabular algorithm (documented; exact-umalqura tests are ledgered —
-/// this is also what the spec permits outside umalqura's range of accuracy).
+/// (tbla). `islamic-umalqura` is handled separately via the intl crate's
+/// dedicated Umm al-Qura table (`jdn_to_umalqura`/`umalqura_to_jdn`) and never
+/// reaches this delta.
 fn islamic_delta(cal: &str) -> i64 {
     match cal {
         "islamic-tbla" => -1,
-        // islamic-civil, islamic-umalqura (≈ civil).
+        // islamic-civil (umalqura is routed to its own table below).
         _ => 0,
     }
 }
 
 #[cfg(feature = "intl")]
 fn islamic_from_jdn(cal: &str, jdn: i64) -> (i64, i64, i64) {
+    if cal == "islamic-umalqura" {
+        // Real Umm al-Qura (Saudi) table; auto-falls-back to civil tabular
+        // outside the tabulated range (AH 1300–1600).
+        return intl::calendar::jdn_to_umalqura(jdn);
+    }
     intl::calendar::jdn_to_islamic(jdn - islamic_delta(cal))
 }
 #[cfg(feature = "intl")]
 fn islamic_to_jdn(cal: &str, y: i64, m: i64, d: i64) -> i64 {
+    if cal == "islamic-umalqura" {
+        return intl::calendar::umalqura_to_jdn(y, m, d);
+    }
     intl::calendar::islamic_to_jdn(y, m, d) + islamic_delta(cal)
 }
 #[cfg(not(feature = "intl"))]
@@ -373,28 +381,42 @@ fn hebrew_leap(year: i64) -> bool {
     (7 * year + 1).rem_euclid(19) < 7
 }
 
+/// Both the Chinese and Korean dangi calendars are lunisolar with an identical
+/// month/`leap` convention; they differ only in the meridian at which the New
+/// Moon / solar term is observed (Beijing vs. Korea), so a few years carry a
+/// different leap month or New-Year day. `cal` selects the underlying intl
+/// table: `"dangi"` → the Korean table, anything else → the Chinese table.
 #[cfg(feature = "intl")]
-fn chinese_from_jdn(jdn: i64) -> Option<(i64, i64, i64, bool)> {
-    intl::calendar::jdn_to_chinese(jdn)
+fn chinese_from_jdn(cal: &str, jdn: i64) -> Option<(i64, i64, i64, bool)> {
+    if cal == "dangi" {
+        intl::calendar::jdn_to_dangi(jdn)
+    } else {
+        intl::calendar::jdn_to_chinese(jdn)
+    }
 }
 #[cfg(feature = "intl")]
-fn chinese_to_jdn(y: i64, m: i64, d: i64, leap: bool) -> Option<i64> {
-    intl::calendar::chinese_to_jdn(y, m, d, leap)
+fn chinese_to_jdn(cal: &str, y: i64, m: i64, d: i64, leap: bool) -> Option<i64> {
+    if cal == "dangi" {
+        intl::calendar::dangi_to_jdn(y, m, d, leap)
+    } else {
+        intl::calendar::chinese_to_jdn(y, m, d, leap)
+    }
 }
 #[cfg(not(feature = "intl"))]
-fn chinese_from_jdn(jdn: i64) -> Option<(i64, i64, i64, bool)> {
+fn chinese_from_jdn(_cal: &str, jdn: i64) -> Option<(i64, i64, i64, bool)> {
     let (y, m, d) = jdn_to_greg(jdn);
     Some((y, m, d, false))
 }
 #[cfg(not(feature = "intl"))]
-fn chinese_to_jdn(y: i64, m: i64, d: i64, _leap: bool) -> Option<i64> {
+fn chinese_to_jdn(_cal: &str, y: i64, m: i64, d: i64, _leap: bool) -> Option<i64> {
     Some(greg_to_jdn(y, m, d))
 }
 
-/// The Chinese year's leap-month number (1..=12), or 0 if the year has none.
-fn chinese_leap_month(year: i64) -> i64 {
+/// The Chinese/dangi year's leap-month number (1..=12), or 0 if the year has
+/// none. `cal` selects the meridian (see [`chinese_from_jdn`]).
+fn chinese_leap_month(cal: &str, year: i64) -> i64 {
     for m in 1..=12 {
-        if chinese_to_jdn(year, m, 1, true).is_some() {
+        if chinese_to_jdn(cal, year, m, 1, true).is_some() {
             return m;
         }
     }
@@ -407,13 +429,13 @@ fn chinese_leap_month(year: i64) -> i64 {
 /// vs. a code — like `M01L`/`M12L` — that never carries a leap month and is
 /// therefore invalid). A leap `M<NN>L` code is only constrainable for an `NN`
 /// that is astronomically an intercalary month somewhere in the supported range.
-fn chinese_leap_num_occurs(num: i64) -> bool {
+fn chinese_leap_num_occurs(cal: &str, num: i64) -> bool {
     if !(1..=12).contains(&num) {
         return false;
     }
-    // The intl table covers Chinese years 1900–2099; a leap month numbered `num`
+    // The intl table covers years 1900–2099; a leap month numbered `num`
     // that never appears there is not a real intercalary month for this model.
-    (1900..=2099).any(|y| chinese_leap_month(y) == num)
+    (1900..=2099).any(|y| chinese_leap_month(cal, y) == num)
 }
 
 // ---------------------------------------------------------------------------
@@ -468,8 +490,8 @@ fn hebrew_month_list(year: i64) -> Vec<(i64, String)> {
 
 /// Chinese civil month order, returning `(nominal_month, is_leap, code)` for each
 /// ordinal position in the year.
-fn chinese_month_list(year: i64) -> Vec<(i64, bool, String)> {
-    let leap_m = chinese_leap_month(year);
+fn chinese_month_list(cal: &str, year: i64) -> Vec<(i64, bool, String)> {
+    let leap_m = chinese_leap_month(cal, year);
     let mut out = Vec::new();
     for m in 1..=12 {
         out.push((m, false, format!("M{m:02}")));
@@ -583,8 +605,8 @@ fn parts_from_iso(cal: &str, iso: IsoDate) -> Parts {
             }
         }
         "chinese" | "dangi" => {
-            if let Some((y, nominal, d, leap)) = chinese_from_jdn(jdn) {
-                let list = chinese_month_list(y);
+            if let Some((y, nominal, d, leap)) = chinese_from_jdn(cal, jdn) {
+                let list = chinese_month_list(cal, y);
                 let (ord, code) = list
                     .iter()
                     .enumerate()
@@ -647,11 +669,11 @@ fn iso_from_parts(cal: &str, year: i64, ord_month: i64, day: i64) -> Option<IsoD
             jdn_to_iso(hebrew_to_jdn(year, intl_m, day))
         }
         "chinese" | "dangi" => {
-            let list = chinese_month_list(year);
+            let list = chinese_month_list(cal, year);
             let (nominal, leap) = list
                 .get((ord_month - 1) as usize)
                 .map(|(m, l, _)| (*m, *l))?;
-            jdn_to_iso(chinese_to_jdn(year, nominal, day, leap)?)
+            jdn_to_iso(chinese_to_jdn(cal, year, nominal, day, leap)?)
         }
         _ => jdn_to_iso(greg_to_jdn(year, ord_month, day)),
     };
@@ -854,7 +876,7 @@ fn month_code_to_ordinal(cal: &str, year: i64, code: &str) -> Option<i64> {
             .iter()
             .position(|(_, c)| c == code)
             .map(|i| i as i64 + 1),
-        "chinese" | "dangi" => chinese_month_list(year)
+        "chinese" | "dangi" => chinese_month_list(cal, year)
             .iter()
             .position(|(_, _, c)| c == code)
             .map(|i| i as i64 + 1),
@@ -898,7 +920,7 @@ pub(crate) fn constrain_leap_base_code(cal: &str, code: &str) -> Option<String> 
     }
     match cal {
         "hebrew" => (num == 5).then(|| "M06".to_string()),
-        "chinese" | "dangi" => chinese_leap_num_occurs(num).then(|| format!("M{num:02}")),
+        "chinese" | "dangi" => chinese_leap_num_occurs(cal, num).then(|| format!("M{num:02}")),
         _ => None,
     }
 }
@@ -1070,7 +1092,7 @@ fn months_in_year_by(cal: &str, year: i64) -> i64 {
     match cal {
         "coptic" | "ethiopic" | "ethioaa" => 13,
         "hebrew" if hebrew_leap(year) => 13,
-        "chinese" | "dangi" if chinese_leap_month(year) != 0 => 13,
+        "chinese" | "dangi" if chinese_leap_month(cal, year) != 0 => 13,
         _ => 12,
     }
 }
@@ -1125,7 +1147,7 @@ pub(crate) fn in_leap_year(cal: &str, iso: IsoDate) -> bool {
         "ethioaa" => coptic_like_leap(p.year - 5500),
         "indian" => indian_leap(p.year),
         "hebrew" => hebrew_leap(p.year),
-        "chinese" | "dangi" => chinese_leap_month(p.year) != 0,
+        "chinese" | "dangi" => chinese_leap_month(cal, p.year) != 0,
         // persian / islamic: a leap year simply has more days.
         _ => days_in_year(cal, iso) > days_in_year_min(cal),
     }
@@ -1697,9 +1719,9 @@ mod tests {
 
         // Pick a Chinese leap year from the table and its leap-month number.
         let leap_year = (2000..=2030)
-            .find(|&y| chinese_leap_month(y) != 0)
+            .find(|&y| chinese_leap_month("chinese", y) != 0)
             .expect("a chinese leap year exists in range");
-        let lm = chinese_leap_month(leap_year);
+        let lm = chinese_leap_month("chinese", leap_year);
         let base = format!("M{lm:02}");
         let leap = format!("M{lm:02}L");
 
@@ -1718,7 +1740,7 @@ mod tests {
         // Resolving the leap code in a year that lacks it: reject throws, constrain
         // drops the leap marker onto the base month.
         let common_year = (leap_year + 1..=2035)
-            .find(|&y| chinese_leap_month(y) == 0)
+            .find(|&y| chinese_leap_month("chinese", y) == 0)
             .expect("a chinese common year exists in range");
         let fi = |ov| {
             fields_to_iso(
@@ -1746,6 +1768,41 @@ mod tests {
 
     #[cfg(feature = "intl")]
     #[test]
+    fn dangi_and_umalqura_use_dedicated_tables() {
+        // `islamic-umalqura` routes to the real Umm al-Qura table, which diverges
+        // from the civil tabular calendar: 2016-06-06 is 1 Ramadan 1437 in
+        // umalqura but 29 Sha'ban 1437 in the civil calendar.
+        let u = iso_to_fields("islamic-umalqura", iso(2016, 6, 6));
+        assert_eq!((u.year, u.month, u.day), (1437, 9, 1));
+        let c = iso_to_fields("islamic-civil", iso(2016, 6, 6));
+        assert_eq!((c.year, c.month, c.day), (1437, 8, 29));
+
+        // `dangi` routes to the Korean-meridian table, whose leap months differ
+        // from the Chinese calendar's in some years (e.g. 2017: Chinese M06L vs
+        // Dangi M05L).
+        assert_eq!(chinese_leap_month("chinese", 2017), 6);
+        assert_eq!(chinese_leap_month("dangi", 2017), 5);
+
+        // Both crate-backed calendars round-trip an ordinary date through fields.
+        for cal in ["islamic-umalqura", "dangi"] {
+            let d = iso(2023, 6, 15);
+            let f = iso_to_fields(cal, d);
+            let input = FieldsInput {
+                era: f.era.clone(),
+                era_year: f.era_year,
+                year: Some(f.year),
+                month: Some(f.month),
+                month_code: None,
+                day: f.day,
+            };
+            let back = fields_to_iso(cal, &input, Overflow::Reject)
+                .unwrap_or_else(|_| panic!("{cal} roundtrip failed"));
+            assert_eq!(back, d, "calendar {cal} round-trip");
+        }
+    }
+
+    #[cfg(feature = "intl")]
+    #[test]
     fn leap_code_validity() {
         let fi = |cal: &str, y: i64, code: &str, ov| {
             fields_to_iso(
@@ -1769,9 +1826,9 @@ mod tests {
         assert!(fi("hebrew", 5779, "M13", Overflow::Constrain).is_err());
         // Chinese: `M01L` and `M12L` never carry an intercalary month → invalid
         // even under constrain.
-        assert!(!chinese_leap_num_occurs(1));
-        assert!(!chinese_leap_num_occurs(12));
-        assert!(chinese_leap_num_occurs(6));
+        assert!(!chinese_leap_num_occurs("chinese", 1));
+        assert!(!chinese_leap_num_occurs("chinese", 12));
+        assert!(chinese_leap_num_occurs("chinese", 6));
         assert!(fi("chinese", 2001, "M12L", Overflow::Constrain).is_err());
         assert!(fi("chinese", 2001, "M13", Overflow::Constrain).is_err());
     }

@@ -2,10 +2,6 @@ use super::*;
 #[cfg(not(feature = "std"))]
 use crate::common::FloatExt;
 
-/// A list of `(type, value)` date/time format parts, as produced by the
-/// `formatToParts` machinery (`datetime_parts` / `temporal_format_parts`).
-type DateTimeParts = Vec<(&'static str, String)>;
-
 /// The resolved form of `Intl.NumberFormat`'s `useGrouping` option: a boolean
 /// `false`, or one of the string modes `"auto"`/`"always"`/`"min2"`.
 enum UseGroupingResolved {
@@ -1165,6 +1161,25 @@ fn dtf_pad_time_parts(
         .collect()
 }
 
+/// The sexagenary (stem-branch) cyclic year name for the 1-based cyclic index
+/// `cyclic1` (1..=60), e.g. `36` → `己亥`. The 60-name cycle is the ten heavenly
+/// stems crossed with the twelve earthly branches; the Han characters are the
+/// canonical (and CLDR `zh`) forms. Used for the `yearName` part of Chinese/Dangi
+/// lunisolar dates (the crate's localized cyclic names are not public).
+#[cfg(feature = "intl")]
+fn sexagenary_year_name(cyclic1: i64) -> String {
+    const STEMS: [&str; 10] = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"];
+    const BRANCHES: [&str; 12] = [
+        "子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥",
+    ];
+    let i = (cyclic1 - 1).rem_euclid(60);
+    alloc::format!(
+        "{}{}",
+        STEMS[(i % 10) as usize],
+        BRANCHES[(i % 12) as usize]
+    )
+}
+
 /// The complete set of CLDR numbering-system identifiers (BCP-47 `nu` types).
 /// Mirrors ECMA-402's `AvailableNumberingSystems`; used by
 /// `Intl.supportedValuesOf("numberingSystem")` and to validate the
@@ -1400,7 +1415,48 @@ pub(crate) fn build_resolved_locale(base: &str, additions: &[String]) -> String 
     out
 }
 
+/// ECMA-402 `CanonicalizeUnicodeLocaleId(tag)`: validate `tag` as a structurally
+/// valid language tag, then return its full canonical form.
+///
+/// Structure and case are canonicalized by the strict local grammar
+/// ([`canonicalize_locale_id_structural`]) — which, unlike `intl`'s looser BCP-47
+/// parser, rejects `_` separators, 4-alpha "languages", extlang subtags, and
+/// duplicate variant/singleton subtags, sorts variant subtags, and applies the
+/// `-u-`/`-t-` extension canonicalization (attribute/keyword sort, `true`/`yes`
+/// elision only for the keys that alias it). On top of that, the deprecated
+/// **base** subtags (language / script / region / variant, plus grandfathered
+/// whole-tag forms) are substituted with their CLDR-canonical replacements via
+/// `intl::locale::canonicalize` — the alias corpus (aliases.bin) newly shipped by
+/// intl 0.5.1. Extension (`-u-`/`-t-`) subtags keep the local canonicalization,
+/// which is more complete/correct here than intl 0.5.1 (which mis-drops `ka-yes`
+/// and lacks `rg`/`sd` subdivision aliases). Returns `None` (→ **RangeError**)
+/// when the tag is not structurally valid.
 pub(crate) fn canonicalize_locale_id(tag: &str) -> Option<String> {
+    // Strict structural validation + local canonical form (rejects invalid tags,
+    // e.g. `i-klingon`, → RangeError).
+    let structural = canonicalize_locale_id_structural(tag)?;
+    // Split off the extension/private-use suffix (the first length-1 subtag onward)
+    // — its local canonicalization is authoritative; only the base takes intl's
+    // alias substitution.
+    let subs: Vec<&str> = structural.split('-').collect();
+    let ext_at = subs.iter().position(|s| s.len() == 1).unwrap_or(subs.len());
+    let base = subs[..ext_at].join("-");
+    // Apply the CLDR base-subtag alias corpus, then re-run the strict canonicalizer
+    // so any alias-introduced subtags are re-normalized (variant re-sort, casing).
+    let aliased_base = intl::locale::canonicalize(&base)
+        .and_then(|b| canonicalize_locale_id_structural(&b))
+        .unwrap_or(base);
+    if ext_at == subs.len() {
+        Some(aliased_base)
+    } else {
+        Some(alloc::format!(
+            "{aliased_base}-{}",
+            subs[ext_at..].join("-")
+        ))
+    }
+}
+
+fn canonicalize_locale_id_structural(tag: &str) -> Option<String> {
     // Structurally rejected outright: empty, non-ASCII, `_` separators, and the
     // empty subtags produced by leading/trailing/doubled `-`.
     if tag.is_empty() || !tag.is_ascii() || tag.contains('_') {
@@ -1421,7 +1477,7 @@ pub(crate) fn canonicalize_locale_id(tag: &str) -> Option<String> {
                 rebuilt.push('-');
                 rebuilt.push_str(p);
             }
-            return canonicalize_locale_id(&rebuilt);
+            return canonicalize_locale_id_structural(&rebuilt);
         }
     }
     let parts: Vec<&str> = tag.split('-').collect();
@@ -1732,7 +1788,7 @@ fn canonicalize_extension(singleton: char, subs: &[String]) -> Option<String> {
         let tlang_canon = if tlang.is_empty() {
             None
         } else {
-            Some(canonicalize_locale_id(&tlang.join("-"))?)
+            Some(canonicalize_locale_id_structural(&tlang.join("-"))?)
         };
         let mut fields: Vec<(String, Vec<String>)> = Vec::new();
         while i < subs.len() {
@@ -3599,21 +3655,12 @@ impl<'a> Interp<'a> {
         else {
             return Err(self.type_error("formatRange called on an incompatible receiver"));
         };
-        // A DateTimeFormat range concatenates each endpoint's field parts (sharing
-        // the same operand resolution / same-kind check as `formatRangeToParts`),
-        // joined by a separator; an equal-endpoints range collapses to the lone
-        // start value.
+        // A DateTimeFormat range is rendered via the CLDR interval patterns (shared
+        // fields collapsed, the locale interval separator); the flat string is the
+        // concatenation of the tagged range parts.
         if self.intl_kind_is_datetime(inst) {
-            let (sp, ep) = self.dtf_range_field_parts(inst, start, end)?;
-            let join = |parts: &[(&'static str, String)]| -> String {
-                parts.iter().map(|(_, v)| v.as_str()).collect()
-            };
-            let fx = join(&sp);
-            if sp == ep {
-                return Ok(fx);
-            }
-            let fy = join(&ep);
-            return Ok(alloc::format!("{fx}\u{2013}{fy}"));
+            let parts = self.dtf_range_dispatch(inst, start, end)?;
+            return Ok(parts.iter().map(|(_, v, _)| v.as_str()).collect());
         }
         let (inst, x, y) = self.intl_range_operands(this, start, end)?;
         let fx = self.intl_format_value(inst, NanBox::number(x));
@@ -3647,29 +3694,15 @@ impl<'a> Interp<'a> {
         else {
             return Err(self.type_error("formatRange called on an incompatible receiver"));
         };
-        // `Intl.DateTimeFormat`: emit the *field-level* parts (year/month/day/hour/…
-        // with `literal` separators) of each endpoint, each tagged with its
-        // `source`. Mirroring `formatToParts` this way makes an equal-endpoints
-        // range byte-for-byte `formatToParts` (all `"shared"`), and gives the
-        // per-field granularity callers rely on (e.g. finding the literal that
-        // precedes a `dayPeriod`). We do not yet apply CLDR's field-level range
-        // *collapse* (shared prefix/suffix fields), so a partly-overlapping range
-        // renders the full start value, a shared separator, then the full end value.
+        // `Intl.DateTimeFormat`: for a Gregorian, number-valued range, the `intl`
+        // crate's `format_range_to_parts` applies the CLDR interval patterns (the
+        // greatest-difference field, shared-field collapse, the locale interval
+        // separator). Temporal endpoints and non-Gregorian calendars fall back to a
+        // field-level approximation (each endpoint's `formatToParts`, tagged by
+        // source), which still collapses byte-for-byte to `formatToParts` when the
+        // endpoints are practically equal.
         if self.intl_kind_is_datetime(inst) {
-            let (sp, ep) = self.dtf_range_field_parts(inst, start, end)?;
-            let tagged: Vec<(&str, String, &str)> = if sp == ep {
-                sp.into_iter().map(|(t, v)| (t, v, "shared")).collect()
-            } else {
-                let mut v: Vec<(&str, String, &str)> = Vec::with_capacity(sp.len() + ep.len() + 1);
-                for (t, val) in sp {
-                    v.push((t, val, "startRange"));
-                }
-                v.push(("literal", String::from("\u{2013}"), "shared"));
-                for (t, val) in ep {
-                    v.push((t, val, "endRange"));
-                }
-                v
-            };
+            let tagged = self.dtf_range_dispatch(inst, start, end)?;
             return Ok(self.intl_build_source_parts(tagged));
         }
         // `Intl.NumberFormat`: format each endpoint as a single value joined by a
@@ -3685,22 +3718,20 @@ impl<'a> Interp<'a> {
         Ok(self.intl_build_source_parts(parts))
     }
 
-    /// The `(startFieldParts, endFieldParts)` for a `DateTimeFormat` range: each is
-    /// the field-level part list (`Vec<(type, value)>`) of one endpoint, produced by
-    /// the same machinery as `formatToParts`. Both endpoints are required
-    /// (`undefined` → TypeError) and must share the same Date/Temporal kind.
+    /// Resolves and validates a `DateTimeFormat` range's two endpoints, returning
+    /// `(startIsTemporal, startNumber, endIsTemporal, endNumber)`. Both endpoints are
+    /// required (`undefined` → TypeError) and must share the same Date/Temporal kind.
     ///
     /// Per `PartitionDateTimeRangePattern`, `ToDateTimeFormattable` runs on *both*
     /// endpoints (in order) — a Temporal object is kept as-is, anything else is
     /// `ToNumber`-coerced (running its `valueOf`) — **before** the same-kind check.
     /// A `NaN` from `ToNumber` does not throw here; the `TimeClip` RangeError is
     /// raised only later, when the number is actually formatted.
-    fn dtf_range_field_parts(
+    fn dtf_resolve_range_operands(
         &mut self,
-        inst: Handle,
         start: NanBox,
         end: NanBox,
-    ) -> Result<(DateTimeParts, DateTimeParts), ExecError> {
+    ) -> Result<(bool, f64, bool, f64), ExecError> {
         if matches!(start.unpack(), Unpacked::Undefined)
             || matches!(end.unpack(), Unpacked::Undefined)
         {
@@ -3735,9 +3766,125 @@ impl<'a> Interp<'a> {
                 self.type_error("formatRange arguments must be of the same Date/Temporal type")
             );
         }
+        Ok((sx_temporal, sx_num, sy_temporal, sy_num))
+    }
+
+    /// The tagged `(type, value, source)` parts of a `DateTimeFormat` range.
+    ///
+    /// A Gregorian, number-valued range is rendered through the `intl` crate's
+    /// `format_range_to_parts` (real CLDR interval patterns). Temporal endpoints and
+    /// non-Gregorian calendars fall back to a field-level approximation: each
+    /// endpoint's `formatToParts`, tagged `startRange`/`endRange` and joined by a
+    /// shared interval separator, collapsing to all-`shared` when the endpoints are
+    /// practically equal.
+    fn dtf_range_dispatch(
+        &mut self,
+        inst: Handle,
+        start: NanBox,
+        end: NanBox,
+    ) -> Result<Vec<(&'static str, String, &'static str)>, ExecError> {
+        let (sx_temporal, sx_num, sy_temporal, sy_num) =
+            self.dtf_resolve_range_operands(start, end)?;
+        #[cfg(feature = "intl")]
+        {
+            let cal = self.dtf_resolved_calendar(inst);
+            let gregorian = matches!(cal.as_str(), "gregory" | "gregorian" | "iso8601");
+            if gregorian && !sx_temporal && !sy_temporal {
+                for n in [sx_num, sy_num] {
+                    if !n.is_finite() || n.abs() > 8.64e15_f64 {
+                        let m = self.new_str("date value is not a finite time value");
+                        return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                    }
+                }
+                // The collapse decision uses each endpoint's full field parts (so a
+                // second-/fractional-second-only difference — which the crate's
+                // greatest-difference search does not detect — still produces a
+                // range). Practically-equal endpoints collapse to all-`shared`.
+                let sp = self.datetime_parts(inst, sx_num);
+                let ep = self.datetime_parts(inst, sy_num);
+                if sp == ep {
+                    return Ok(sp.into_iter().map(|(t, v)| (t, v, "shared")).collect());
+                }
+                // Endpoints differ: prefer the crate's CLDR interval patterns when it
+                // resolves a genuine split; otherwise (it only collapsed because the
+                // sole difference is below the minute) fall back to a field-level range
+                // joined by the default CLDR interval separator.
+                let crate_parts = self.dtf_range_crate_parts(inst, sx_num, sy_num);
+                if crate_parts.iter().any(|(_, _, src)| *src != "shared") {
+                    return Ok(crate_parts);
+                }
+                let mut v: Vec<(&'static str, String, &'static str)> =
+                    Vec::with_capacity(sp.len() + ep.len() + 1);
+                for (t, val) in sp {
+                    v.push((t, val, "startRange"));
+                }
+                v.push((
+                    "literal",
+                    String::from("\u{2009}\u{2013}\u{2009}"),
+                    "shared",
+                ));
+                for (t, val) in ep {
+                    v.push((t, val, "endRange"));
+                }
+                return Ok(v);
+            }
+        }
         let sp = self.dtf_operand_parts(inst, start, sx_temporal, sx_num)?;
         let ep = self.dtf_operand_parts(inst, end, sy_temporal, sy_num)?;
-        Ok((sp, ep))
+        Ok(if sp == ep {
+            sp.into_iter().map(|(t, v)| (t, v, "shared")).collect()
+        } else {
+            let mut v: Vec<(&'static str, String, &'static str)> =
+                Vec::with_capacity(sp.len() + ep.len() + 1);
+            for (t, val) in sp {
+                v.push((t, val, "startRange"));
+            }
+            v.push(("literal", String::from("\u{2013}"), "shared"));
+            for (t, val) in ep {
+                v.push((t, val, "endRange"));
+            }
+            v
+        })
+    }
+
+    /// The tagged range parts for a Gregorian, number-valued `DateTimeFormat` range,
+    /// via the `intl` crate's CLDR interval patterns. Numeric part values are mapped
+    /// through the instance's resolved numbering system.
+    #[cfg(feature = "intl")]
+    fn dtf_range_crate_parts(
+        &mut self,
+        inst: Handle,
+        sx_num: f64,
+        sy_num: f64,
+    ) -> Vec<(&'static str, String, &'static str)> {
+        use intl::datetime::{self, DateTimePartType};
+        let (locale, dt1, o) = self.dtf_locale_dt_opts(inst, sx_num);
+        let (_, dt2, _) = self.dtf_locale_dt_opts(inst, sy_num);
+        let raw = match datetime::format_range_to_parts(&locale, &dt1, &dt2, &o) {
+            Ok(parts) => parts,
+            Err(_) => return Vec::new(),
+        };
+        // Match `dtf_pad_time_parts`: an abutting hour/second widens a single-digit
+        // minute (and hour/minute widens second) to two digits, so a collapsed range
+        // is byte-for-byte `format` (which pads the same way).
+        let has_hour = raw.iter().any(|p| p.kind == DateTimePartType::Hour);
+        let has_min = raw.iter().any(|p| p.kind == DateTimePartType::Minute);
+        let has_sec = raw.iter().any(|p| p.kind == DateTimePartType::Second);
+        raw.into_iter()
+            .map(|p| {
+                let widen = match p.kind {
+                    DateTimePartType::Minute => has_hour || has_sec,
+                    DateTimePartType::Second => has_hour || has_min,
+                    _ => false,
+                };
+                let mut v = p.value;
+                if widen && v.len() == 1 && v.as_bytes()[0].is_ascii_digit() {
+                    v.insert(0, '0');
+                }
+                let value = self.apply_numbering_digits(inst, v);
+                (p.kind.as_str(), value, p.source.as_str())
+            })
+            .collect()
     }
 
     /// The field-level parts of one already-`ToDateTimeFormattable`-resolved range
@@ -4630,8 +4777,36 @@ impl<'a> Interp<'a> {
         handle: Handle,
         ms: f64,
     ) -> Vec<(&'static str, String)> {
+        use intl::datetime;
+        let (locale, dt, o) = self.dtf_locale_dt_opts(handle, ms);
+        // Chinese/Dangi lunisolar calendars: the crate's `format_to_parts` renders
+        // only proleptic Gregorian, so derive the `relatedYear`/`yearName` (+ numeric
+        // month/day) parts these calendars require ourselves.
+        if let Some(p) = self.lunisolar_parts(handle, &locale, &dt, &o) {
+            return p;
+        }
+        match datetime::format_to_parts(&locale, &dt, &o) {
+            Ok(parts) => dtf_pad_time_parts(parts),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Builds the `intl` crate `(locale, DateTime, DateTimeFormatOptions)` for
+    /// `handle` at instant `ms` — the shared front half of [`datetime_parts`] and
+    /// the `formatRange` renderers. The `DateTime` is the instant shifted into the
+    /// instance's resolved time zone; the options mirror the stored ECMA-402 fields.
+    #[cfg(feature = "intl")]
+    fn dtf_locale_dt_opts(
+        &mut self,
+        handle: Handle,
+        ms: f64,
+    ) -> (
+        String,
+        intl::datetime::DateTime,
+        intl::datetime::DateTimeFormatOptions,
+    ) {
         use intl::datetime::{
-            self, DateStyle, DateTime, DateTimeFormatOptions, HourCycle, MonthStyle, NameStyle,
+            DateStyle, DateTime, DateTimeFormatOptions, HourCycle, MonthStyle, NameStyle,
             Numeric2Digit, TimeZoneNameStyle,
         };
         let opt = |this: &mut Self, k: &str| -> Option<String> {
@@ -4748,10 +4923,112 @@ impl<'a> Interp<'a> {
             };
             o.tz_offset_minutes = Some((zone_off_ms / 60_000) as i32);
         }
-        match datetime::format_to_parts(&locale, &dt, &o) {
-            Ok(parts) => dtf_pad_time_parts(parts),
-            Err(_) => Vec::new(),
+        (locale, dt, o)
+    }
+
+    /// Chinese/Dangi lunisolar `formatToParts` output for `handle` (returns `None`
+    /// unless the resolved calendar is `chinese`/`dangi` and the Gregorian date is
+    /// within the crate's supported lunisolar range). Produces `relatedYear` (the
+    /// Gregorian year the lunisolar year began), `yearName` (the sexagenary cyclic
+    /// name), and numeric `month`/`day` parts; the localized lunisolar month names
+    /// are not reachable through the `intl` crate's public API, so months render
+    /// numerically. Any requested time components are appended via the crate's
+    /// (calendar-independent) time formatter.
+    #[cfg(feature = "intl")]
+    fn lunisolar_parts(
+        &self,
+        handle: Handle,
+        locale: &str,
+        dt: &intl::datetime::DateTime,
+        o: &intl::datetime::DateTimeFormatOptions,
+    ) -> Option<Vec<(&'static str, String)>> {
+        use intl::calendar;
+        use intl::datetime::{self, DateTimeFormatOptions, MonthStyle, Numeric2Digit};
+        let cal = self.dtf_resolved_calendar(handle);
+        let (y, m, d) = (dt.year as i64, dt.month as i64, dt.day as i64);
+        let (cyear, cmonth, cday, _leap) = match cal.as_str() {
+            "chinese" => calendar::gregorian_to_chinese(y, m, d)?,
+            "dangi" => calendar::gregorian_to_dangi(y, m, d)?,
+            _ => return None,
+        };
+        // The related Gregorian year (the year the lunisolar year began) and the
+        // 1-based sexagenary index, exactly as the crate's `format_chinese_date`
+        // derives them.
+        let related = if cal == "dangi" {
+            calendar::dangi_to_gregorian(cyear, 1, 1, false)
+        } else {
+            calendar::chinese_to_gregorian(cyear, 1, 1, false)
         }
+        .map_or(cyear, |g| g.0);
+        let cyclic1 = (related - 4).rem_euclid(60) + 1;
+        // zh renders the year/month/day with trailing `年`/`月`/`日` field markers;
+        // other locales separate the numeric fields with plain literals.
+        let zh = locale.starts_with("zh");
+        let two = |v: i64| alloc::format!("{v:02}");
+        let mut parts: Vec<(&'static str, String)> = Vec::new();
+        if o.year.is_some() {
+            parts.push(("relatedYear", alloc::format!("{related}")));
+            parts.push(("yearName", sexagenary_year_name(cyclic1)));
+            if zh {
+                parts.push(("literal", String::from("年")));
+            }
+        }
+        if let Some(mstyle) = o.month {
+            if !zh && !parts.is_empty() {
+                parts.push(("literal", String::from(", ")));
+            }
+            parts.push((
+                "month",
+                match mstyle {
+                    MonthStyle::TwoDigit => two(cmonth),
+                    _ => alloc::format!("{cmonth}"),
+                },
+            ));
+            if zh {
+                parts.push(("literal", String::from("月")));
+            }
+        }
+        if let Some(dstyle) = o.day {
+            if !zh && !parts.is_empty() {
+                parts.push(("literal", String::from(" ")));
+            }
+            parts.push((
+                "day",
+                match dstyle {
+                    Numeric2Digit::TwoDigit => two(cday),
+                    _ => alloc::format!("{cday}"),
+                },
+            ));
+            if zh {
+                parts.push(("literal", String::from("日")));
+            }
+        }
+        // Time-of-day is calendar-independent: reuse the crate's time formatter for
+        // any requested hour/minute/second/dayPeriod/fractionalSecond components.
+        let has_time = o.hour.is_some()
+            || o.minute.is_some()
+            || o.second.is_some()
+            || o.day_period.is_some()
+            || o.fractional_second_digits.is_some();
+        if has_time {
+            let mut to = DateTimeFormatOptions::default();
+            to.hour = o.hour;
+            to.minute = o.minute;
+            to.second = o.second;
+            to.day_period = o.day_period;
+            to.fractional_second_digits = o.fractional_second_digits;
+            to.hour12 = o.hour12;
+            to.hour_cycle = o.hour_cycle;
+            to.time_zone_name = o.time_zone_name;
+            to.tz_offset_minutes = o.tz_offset_minutes;
+            if let Ok(tp) = datetime::format_to_parts(locale, dt, &to) {
+                if !parts.is_empty() {
+                    parts.push(("literal", String::from(", ")));
+                }
+                parts.extend(dtf_pad_time_parts(tp));
+            }
+        }
+        Some(parts)
     }
 
     /// ECMA-402 `HandleDateTimeValue`: if `value` is a Temporal object, resolve it
