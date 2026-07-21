@@ -988,11 +988,24 @@ impl Parser {
             'c' if self.unicode => {
                 return Err(RegexError::new("invalid `\\c` control escape"));
             }
-            // A control-letter-less `\c` (non-`u`): Annex B identity escape → `\`.
-            'c' => Node::Char('\\' as u32),
+            // A `\c` not followed by a valid ControlLetter (non-`u`): Annex B
+            // treats the backslash literally, so the pattern matches `\` and then
+            // the `c` as an ordinary character. Rewind so the `c` (and anything
+            // after it) is re-parsed as a normal atom rather than being swallowed.
+            'c' => {
+                self.pos -= 1; // un-consume the `c`
+                Node::Char('\\' as u32)
+            }
             // ControlEscapes (`\f \n \r \t \v`) — valid CharacterEscapes in every
             // mode. (`\0` is handled below as a NUL escape.)
             'f' | 'n' | 'r' | 't' | 'v' => Node::Char(escape_char(c) as u32),
+            // `\0` followed by octal digits is a LegacyOctalEscapeSequence
+            // (non-`u`): decode the leading octal digits (≤ 255). Under `u` a
+            // `\0` followed by a digit is a Syntax Error (handled by the identity
+            // fallback below), so this relaxed form applies only in non-`u` mode.
+            '0' if !self.unicode && self.peek().is_some_and(|c| ('0'..='7').contains(&c)) => {
+                Node::Char(self.read_legacy_octal('0'))
+            }
             // `\0` — the NUL character, provided it is not the start of a longer
             // legacy-octal/decimal sequence (a following digit would be one).
             '0' if !self.peek().is_some_and(|c| c.is_ascii_digit()) => Node::Char(0),
@@ -1329,19 +1342,26 @@ impl Parser {
                             let val = self.read_legacy_octal(d);
                             self.push_class_member(&mut items, val)?;
                         }
-                        // `\cX` — a control escape inside a class (`X` an ASCII
-                        // letter → U+0001..=U+001A). Under `u`, `\c` not followed by
-                        // a letter is a Syntax Error; without `u` it falls through
-                        // to the identity fallback (Annex B).
-                        'c' if self.peek().is_some_and(|c| c.is_ascii_alphabetic()) => {
+                        // `\cX` — a control escape inside a class. `X` is an ASCII
+                        // letter in every mode; Annex B (non-`u`) additionally
+                        // admits a DecimalDigit or `_` (ClassControlLetter). The
+                        // value is the control letter's code point modulo 32.
+                        'c' if self.peek().is_some_and(|c| c.is_ascii_alphabetic())
+                            || (!self.unicode
+                                && self.peek().is_some_and(|c| c.is_ascii_digit() || c == '_')) =>
+                        {
                             let letter = self.bump().unwrap();
-                            self.push_class_member(
-                                &mut items,
-                                (letter.to_ascii_uppercase() as u32 - 'A' as u32) + 1,
-                            )?;
+                            self.push_class_member(&mut items, (letter as u32) % 32)?;
                         }
                         'c' if self.unicode => {
                             return Err(RegexError::new("invalid `\\c` control escape"));
+                        }
+                        // A `\c` not followed by a valid ClassControlLetter (non-`u`):
+                        // Annex B (ClassAtomNoDash :: `\`) treats it as a literal
+                        // backslash followed by a literal `c`, both class members.
+                        'c' => {
+                            self.push_class_member(&mut items, '\\' as u32)?;
+                            self.push_class_member(&mut items, 'c' as u32)?;
                         }
                         // Any other escaped character is a ClassEscape IdentityEscape.
                         // Under `u` only SyntaxCharacters, `/`, and `-` may be escaped
@@ -1418,6 +1438,23 @@ impl Parser {
                 return Err(RegexError::new(
                     "invalid character class range with a class-escape endpoint",
                 ));
+            }
+            // Annex B (non-`u`): if the high endpoint is a class-escape shorthand
+            // (`\d \D \w \W \s \S`), it is a *set*, not a single character, so no
+            // range is formed (CharacterRangeOrUnion). The `-` becomes a literal
+            // dash and the shorthand a separate class member: push the low char
+            // and the dash, leaving the shorthand for the class loop to parse.
+            if !self.unicode
+                && self.chars.get(self.pos + 1) == Some(&'\\')
+                && self
+                    .chars
+                    .get(self.pos + 2)
+                    .is_some_and(|&n| matches!(n, 'd' | 'D' | 'w' | 'W' | 's' | 'S'))
+            {
+                items.push(ClassItem::Char(c));
+                items.push(ClassItem::Char('-' as u32));
+                self.pos += 1; // consume the literal `-`
+                return Ok(());
             }
             self.pos += 1; // `-`
             let hi = if self.peek() == Some('\\') {
@@ -1690,8 +1727,12 @@ impl Parser {
                 self.parse_class_set_char_after_backslash()
             }
             Some(c) => {
-                // Reserved/`ClassSetSyntaxCharacter`s may not appear unescaped.
-                if matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '/' | '|') {
+                // Reserved/`ClassSetSyntaxCharacter`s may not appear unescaped. A
+                // range dash and the `&&`/`--` operators are consumed by the
+                // caller before reaching here, so any `-` seen at this point is a
+                // bare `ClassSetSyntaxCharacter` and is an early Syntax Error
+                // (`[-]/v` must throw), not a literal dash as in non-`v` classes.
+                if matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '/' | '|' | '-') {
                     return Err(RegexError::new("unescaped reserved character in class set"));
                 }
                 // A reserved double punctuator (`&&`, `!!`, `##`, …) unescaped is

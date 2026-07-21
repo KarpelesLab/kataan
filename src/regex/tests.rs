@@ -414,6 +414,53 @@ fn positive_lookbehind_captures_propagate() {
 }
 
 #[test]
+fn lookbehind_reverse_captures() {
+    // The lookbehind body matches right-to-left (ECMAScript direction -1), so a
+    // quantified group captures its rightmost/leftmost iteration per the spec.
+    // Cases mirror test262 built-ins/RegExp/lookBehind/captures.js.
+    let grp = |pat: &str, subj: &str, g: usize| -> Option<alloc::string::String> {
+        let units = u16s(subj);
+        let caps = re(pat, "").captures_in_u16(&units, 0)?;
+        caps.group(g)
+            .map(|(s, e)| alloc::string::String::from_utf16(&units[s..e]).unwrap())
+    };
+
+    // `(?<=(\w){3})def` over "abcdef": the group's last (reverse) iteration is "a".
+    assert_eq!(grp(r"(?<=(\w){3})def", "abcdef", 1).as_deref(), Some("a"));
+    // Nested groups: `(?<=(\w(\w)))def` → g1 "bc", g2 "c".
+    assert_eq!(grp(r"(?<=(\w(\w)))def", "abcdef", 1).as_deref(), Some("bc"));
+    assert_eq!(grp(r"(?<=(\w(\w)))def", "abcdef", 2).as_deref(), Some("c"));
+    // `(?<=(\w{2}))def` → "bc".
+    assert_eq!(grp(r"(?<=(\w{2}))def", "abcdef", 1).as_deref(), Some("bc"));
+    // Greedy loop binds from the right: `(?<=(b+))c` over "abbbbbbc".
+    assert_eq!(grp(r"(?<=(b+))c", "abbbbbbc", 1).as_deref(), Some("bbbbbb"));
+    assert_eq!(grp(r"(?<=(b\d+))c", "ab1234c", 1).as_deref(), Some("b1234"));
+    // Backreference inside the lookbehind (reverse order): `(?<=\1(\w))d` /i.
+    let units = u16s("abcCd");
+    let caps = re(r"(?<=\1(\w))d", "i").captures_in_u16(&units, 0).unwrap();
+    assert_eq!(
+        caps.group(1)
+            .map(|(s, e)| alloc::string::String::from_utf16(&units[s..e]).unwrap()),
+        Some(alloc::string::String::from("C"))
+    );
+    // Reverse evaluation order: `(?<=(\w+)\1)c` over "ababc" → g1 "abab".
+    assert_eq!(grp(r"(?<=(\w+)\1)c", "ababc", 1).as_deref(), Some("abab"));
+
+    // Fixed-length lookbehind still works unchanged.
+    assert!(
+        re(r"(?<=abc)def", "")
+            .captures_in_u16(&u16s("abcdef"), 0)
+            .is_some()
+    );
+    // Lookahead nested inside a lookbehind resets to forward matching.
+    assert!(
+        re(r"(?<=a(?=b))b", "")
+            .captures_in_u16(&u16s("ab"), 0)
+            .is_some()
+    );
+}
+
+#[test]
 fn group_name_validation() {
     // Valid identifier-name groups compile.
     assert!(Regex::new(r"(?<a>x)", "").is_ok());
@@ -632,4 +679,72 @@ fn v_flag_syntax_errors() {
     assert!(Regex::new("[a&&]", "v").is_err()); // trailing operator
     assert!(Regex::new("[(]", "v").is_err()); // unescaped reserved char
     assert!(Regex::new(r"[\(]", "v").is_ok()); // escaped is fine
+}
+
+#[test]
+fn annexb_control_escape_fallback() {
+    // Main pattern: `\c` not followed by an ASCII letter is a literal `\` then
+    // `c` in non-`u` mode (Annex B), so `\c0` matches the text "\c0", not U+0010.
+    assert!(re(r"\c0", "").is_match(r"\c0"));
+    assert_eq!(re(r"\c0", "").find_from("\u{0f}\u{10}\u{11}", 0), None);
+    // Followed by a non-ASCII letter (Cyrillic А): same literal fallback.
+    assert!(re(r"\cА", "").is_match(r"\cА"));
+    // Inside a class the invalid `\c` contributes BOTH `\` and `c` as members.
+    let c = re(r"[\c ]", "");
+    assert!(c.is_match("\\"));
+    assert!(c.is_match("c"));
+    // Inside a class, Annex B ClassControlLetter admits DecimalDigit and `_`:
+    // `\c0` = 0x30 % 32 = 0x10, `\c_` = 0x5F % 32 = 0x1F.
+    assert_eq!(
+        re(r"[\c0]", "").find_from("\u{0f}\u{10}\u{11}", 0),
+        Some((1, 2))
+    );
+    assert_eq!(
+        re(r"[\c_]", "").find_from("\u{1e}\u{1f}\u{20}", 0),
+        Some((1, 2))
+    );
+    // Letters still work in both modes.
+    assert!(re(r"\cA", "").is_match("\u{1}"));
+    assert!(re(r"\cA", "u").is_match("\u{1}"));
+}
+
+#[test]
+fn annexb_legacy_octal_zero_prefixed() {
+    // `\0` followed by octal digits is a LegacyOctalEscapeSequence (non-`u`).
+    assert_eq!(re(r"\00", "").find_from("\u{0}", 0), Some((0, 1)));
+    assert_eq!(re(r"\07", "").find_from("\u{7}", 0), Some((0, 1)));
+    assert_eq!(re(r"\007", "").find_from("\u{7}", 0), Some((0, 1)));
+    // At most three octal digits total: `\0111` = \x09 then literal '1'.
+    assert!(re(r"\0111", "").is_match("\u{9}1"));
+    // A bare `\0` (no following digit) is still NUL.
+    assert_eq!(re(r"\0", "").find_from("\u{0}", 0), Some((0, 1)));
+    // Under `u`, `\0` followed by a digit is a Syntax Error.
+    assert!(Regex::new(r"\00", "u").is_err());
+}
+
+#[test]
+fn annexb_class_range_shorthand_endpoint() {
+    // Non-`u`: a `-` whose high endpoint is a class-escape shorthand does NOT
+    // form a range (CharacterRangeOrUnion): `[%-\d]` = { '%', '-', \d }.
+    assert_eq!(
+        re(r"[%-\d]+", "").find_from("&%0123456789-&", 0),
+        Some((1, 13))
+    );
+    // `[--\d]` = { '-', \d } (no '.' match).
+    assert_eq!(
+        re(r"[--\d]+", "").find_from(".-0123456789-.", 0),
+        Some((1, 13))
+    );
+    // Under `u` the same pattern is a Syntax Error.
+    assert!(Regex::new(r"[%-\d]", "u").is_err());
+}
+
+#[test]
+fn v_flag_bare_dash_is_error() {
+    // In `v` mode `-` is a ClassSetSyntaxCharacter and must be escaped: a bare
+    // `[-]` is an early Syntax Error, while `[\-]` is a literal dash.
+    assert!(Regex::new("[-]", "v").is_err());
+    assert!(Regex::new(r"[\-]", "v").is_ok());
+    // A genuine range still parses.
+    assert!(Regex::new("[a-z]", "v").is_ok());
 }

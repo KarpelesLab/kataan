@@ -24,6 +24,7 @@ pub(crate) fn compile(
         groups: 0,
         group_names,
         unicode,
+        reverse: false,
     };
     c.emit(Inst::Save(0));
     c.compile(ast)?;
@@ -41,6 +42,14 @@ struct Compiler<'a> {
     /// its two surrogate code units (each a one-unit `Char`); in `u` mode it
     /// compiles to a single code-point `Char` that the VM matches as a pair.
     unicode: bool,
+    /// Whether this (sub-)program matches **right-to-left**. Set only inside a
+    /// lookbehind body (ECMAScript direction `-1`): concatenations compile in
+    /// reversed order and a capturing group emits its end-marker before its
+    /// start-marker, so that a VM consuming input backward records the group's
+    /// forward `(start, end)` span correctly and greedy quantifiers bind from the
+    /// right. A lookahead nested inside a lookbehind resets to forward; a nested
+    /// lookbehind flips back to reverse.
+    reverse: bool,
 }
 
 impl Compiler<'_> {
@@ -92,16 +101,35 @@ impl Compiler<'_> {
                 self.emit(Inst::Class(Class { neg: *neg, members }));
             }
             Node::Concat(nodes) => {
-                for n in nodes {
-                    self.compile(n)?;
+                // In a lookbehind the concatenation is matched right-to-left, so
+                // emit the sub-nodes in reversed source order (the VM consumes the
+                // subject backward). Each sub-node is itself compiled in reverse.
+                if self.reverse {
+                    for n in nodes.iter().rev() {
+                        self.compile(n)?;
+                    }
+                } else {
+                    for n in nodes {
+                        self.compile(n)?;
+                    }
                 }
             }
             Node::Group { index, inner } => {
                 if let Some(idx) = index {
                     self.groups = self.groups.max(*idx);
-                    self.emit(Inst::Save(2 * idx));
-                    self.compile(inner)?;
-                    self.emit(Inst::Save(2 * idx + 1));
+                    // Forward: Save(start); body; Save(end). Reverse: the right edge
+                    // of the group is reached first, so record the end slot first,
+                    // then the (reversed) body, then the start slot — the resulting
+                    // span is still forward `(start, end)`.
+                    if self.reverse {
+                        self.emit(Inst::Save(2 * idx + 1));
+                        self.compile(inner)?;
+                        self.emit(Inst::Save(2 * idx));
+                    } else {
+                        self.emit(Inst::Save(2 * idx));
+                        self.compile(inner)?;
+                        self.emit(Inst::Save(2 * idx + 1));
+                    }
                 } else {
                     self.compile(inner)?;
                 }
@@ -133,11 +161,14 @@ impl Compiler<'_> {
             // A lookahead compiles its body into a self-contained sub-program
             // (ending in `Match`) run zero-width by the VM.
             Node::Look { neg, inner } => {
+                // A lookahead always matches forward (direction `+1`), even when
+                // nested inside a lookbehind — reset `reverse`.
                 let mut sub = Compiler {
                     prog: Vec::new(),
                     groups: 0,
                     group_names: self.group_names,
                     unicode: self.unicode,
+                    reverse: false,
                 };
                 sub.compile(inner)?;
                 sub.emit(Inst::Match);
@@ -148,11 +179,15 @@ impl Compiler<'_> {
                 });
             }
             Node::LookBehind { neg, inner } => {
+                // A lookbehind matches right-to-left (direction `-1`): compile its
+                // body in reverse so the VM consumes the subject backward from the
+                // assertion point.
                 let mut sub = Compiler {
                     prog: Vec::new(),
                     groups: 0,
                     group_names: self.group_names,
                     unicode: self.unicode,
+                    reverse: true,
                 };
                 sub.compile(inner)?;
                 sub.emit(Inst::Match);
@@ -258,6 +293,7 @@ impl Compiler<'_> {
                     groups: 0,
                     group_names: self.group_names,
                     unicode: self.unicode,
+                    reverse: self.reverse,
                 };
                 probe.compile(inner)?;
                 let inner_size = probe.prog.len().max(1);

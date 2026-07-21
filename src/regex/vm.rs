@@ -219,6 +219,39 @@ fn read_cp(input: &[u16], sp: usize, unicode: bool) -> Option<(u32, usize)> {
     Some((u, 1))
 }
 
+/// Reads the code point that **ends** at unit index `sp` (i.e. the character
+/// immediately to the left of `sp`), returning it and the number of code units it
+/// spans, for right-to-left (lookbehind) matching. In `u` mode a well-formed
+/// surrogate pair ending at `sp` decodes to one code point (length 2); otherwise
+/// the single unit at `sp - 1` is returned. `None` at the left edge (`sp == 0`).
+fn read_cp_back(input: &[u16], sp: usize, unicode: bool) -> Option<(u32, usize)> {
+    if sp == 0 {
+        return None;
+    }
+    let lo = *input.get(sp - 1)? as u32;
+    if unicode && (0xDC00..=0xDFFF).contains(&lo) && sp >= 2 {
+        let hi = input[sp - 2] as u32;
+        if (0xD800..=0xDBFF).contains(&hi) {
+            let cp = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
+            return Some((cp, 2));
+        }
+    }
+    Some((lo, 1))
+}
+
+/// Reads one character in the current match direction, returning its code point
+/// and the resulting position. Forward: the character starting at `sp`, advancing
+/// to `sp + len`. Reverse: the character ending at `sp`, retreating to `sp - len`.
+fn read_dir(input: &[u16], sp: usize, unicode: bool, reverse: bool) -> Option<(u32, usize)> {
+    if reverse {
+        let (cp, len) = read_cp_back(input, sp, unicode)?;
+        Some((cp, sp - len))
+    } else {
+        let (cp, len) = read_cp(input, sp, unicode)?;
+        Some((cp, sp + len))
+    }
+}
+
 /// Runs `prog` against `input` (UTF-16 code units) starting at unit index
 /// `start`, returning the capture slots (`2 * (group_count + 1)` of them, as
 /// `(start, end)` unit-index pairs) on success.
@@ -241,6 +274,7 @@ pub(crate) fn run_shared(
         input,
         flags,
         match_end: None,
+        reverse: false,
         steps,
         budget,
     };
@@ -267,9 +301,15 @@ struct Ctx<'a> {
     prog: &'a [Inst],
     input: &'a [u16],
     flags: Flags,
-    /// When `Some(p)`, `Match` succeeds only at position `p` (for lookbehind,
-    /// which requires the sub-pattern to end exactly at the assertion point).
+    /// When `Some(p)`, `Match` succeeds only at position `p`. Currently unused by
+    /// the reverse-lookbehind path (which imposes no end constraint) but retained
+    /// for the forward sub-program contract.
     match_end: Option<usize>,
+    /// Whether this context consumes the subject **right-to-left**. Set for a
+    /// lookbehind sub-program (which is compiled in reverse): consuming
+    /// instructions read the character *ending* at `sp` and decrement `sp`, and
+    /// backreferences compare backward. Every other context runs forward.
+    reverse: bool,
     /// Backtrack steps consumed so far. A single shared `Cell` is referenced by
     /// the root context and every lookaround sub-context, so the budget bounds
     /// the *whole* match (sub-programs included), not each context separately.
@@ -325,40 +365,40 @@ fn backtrack(
         match &ctx.prog[pc] {
             Inst::Match => return ctx.match_end.is_none_or(|p| sp == p),
             Inst::Char(c) => {
-                if let Some((cp, len)) = read_cp(ctx.input, sp, unicode)
+                if let Some((cp, nsp)) = read_dir(ctx.input, sp, unicode, ctx.reverse)
                     && cp_eq(cp, *c, cur)
                 {
-                    sp += len;
+                    sp = nsp;
                     pc += 1;
                     continue;
                 }
                 return false;
             }
             Inst::Any => {
-                if let Some((cp, len)) = read_cp(ctx.input, sp, unicode)
+                if let Some((cp, nsp)) = read_dir(ctx.input, sp, unicode, ctx.reverse)
                     && (cur.dotall || !is_line_term(cp))
                 {
-                    sp += len;
+                    sp = nsp;
                     pc += 1;
                     continue;
                 }
                 return false;
             }
             Inst::Class(class) => {
-                if let Some((cp, len)) = read_cp(ctx.input, sp, unicode)
+                if let Some((cp, nsp)) = read_dir(ctx.input, sp, unicode, ctx.reverse)
                     && class_matches(class, cp, cur)
                 {
-                    sp += len;
+                    sp = nsp;
                     pc += 1;
                     continue;
                 }
                 return false;
             }
             Inst::ClassSet { neg, matcher } => {
-                if let Some((cp, len)) = read_cp(ctx.input, sp, unicode)
+                if let Some((cp, nsp)) = read_dir(ctx.input, sp, unicode, ctx.reverse)
                     && (matcher.matches(cp, cur) ^ *neg)
                 {
-                    sp += len;
+                    sp = nsp;
                     pc += 1;
                     continue;
                 }
@@ -379,9 +419,10 @@ fn backtrack(
                         // Greedy: consume as many as possible, recording each
                         // position, then try the continuation from longest down.
                         let mut positions = alloc::vec![sp];
-                        while let Some(adv) = consume_one(&ctx.prog[consume_pc], ctx.input, sp, cur)
+                        while let Some(nsp) =
+                            consume_one(&ctx.prog[consume_pc], ctx.input, sp, cur, ctx.reverse)
                         {
-                            sp += adv;
+                            sp = nsp;
                             positions.push(sp);
                             if !ctx.tick() {
                                 return false;
@@ -402,11 +443,12 @@ fn backtrack(
                         if backtrack(ctx, cont_pc, sp, saves, depth + 1, loops, flags_stack) {
                             return true;
                         }
-                        let Some(adv) = consume_one(&ctx.prog[consume_pc], ctx.input, sp, cur)
+                        let Some(nsp) =
+                            consume_one(&ctx.prog[consume_pc], ctx.input, sp, cur, ctx.reverse)
                         else {
                             return false;
                         };
-                        sp += adv;
+                        sp = nsp;
                         if !ctx.tick() {
                             return false;
                         }
@@ -474,11 +516,8 @@ fn backtrack(
                 });
                 match span {
                     Some((s, e)) => {
-                        let len = e - s;
-                        if sp + len <= ctx.input.len()
-                            && (0..len).all(|i| unit_eq(ctx.input[sp + i], ctx.input[s + i], cur))
-                        {
-                            sp += len;
+                        if let Some(nsp) = match_backref(ctx, sp, s, e, cur) {
+                            sp = nsp;
                             pc += 1;
                         } else {
                             return false;
@@ -499,6 +538,8 @@ fn backtrack(
                     input: ctx.input,
                     flags: cur,
                     match_end: None,
+                    // A lookahead always matches forward, even inside a lookbehind.
+                    reverse: false,
                     steps: ctx.steps,
                     budget: ctx.budget,
                 };
@@ -535,42 +576,35 @@ fn backtrack(
                 return false;
             }
             Inst::LookBehind { neg, prog } => {
-                // The sub-pattern must match some substring ending exactly at
-                // `sp`; try every start position `j <= sp`. A *positive* lookbehind
-                // propagates the captures of the matched substring; a *negative*
-                // one contributes nothing.
+                // The body is compiled *in reverse* (ECMAScript direction `-1`), so
+                // run it once starting at `sp` and consuming the subject backward:
+                // it succeeds when it reaches `Match` at some start position `<= sp`.
+                // Matching right-to-left is what makes greedy quantifiers bind from
+                // the right and capture groups record their rightmost iteration
+                // (e.g. `(?<=(\w){3})` capturing the leftmost of the three units).
+                // A *positive* lookbehind propagates the captures of the matched
+                // substring; a *negative* one contributes nothing.
                 let sub = Ctx {
                     prog,
                     input: ctx.input,
                     flags: cur,
-                    match_end: Some(sp),
+                    match_end: None,
+                    reverse: true,
                     steps: ctx.steps,
                     budget: ctx.budget,
                 };
-                let mut found: Option<Vec<Option<usize>>> = None;
-                for j in (0..=sp).rev() {
-                    // Each rescan start counts as a step; the O(n) rescan is thus
-                    // bounded by the shared budget (RE-6 backstop).
-                    if !ctx.tick() {
-                        return false;
-                    }
-                    let mut sub_saves = saves.clone();
-                    let mut sub_loops = Vec::new();
-                    let mut sub_flags = alloc::vec![cur];
-                    if backtrack(
-                        &sub,
-                        0,
-                        j,
-                        &mut sub_saves,
-                        depth + 1,
-                        &mut sub_loops,
-                        &mut sub_flags,
-                    ) {
-                        found = Some(sub_saves);
-                        break;
-                    }
-                }
-                let matched = found.is_some();
+                let mut sub_saves = saves.clone();
+                let mut sub_loops = Vec::new();
+                let mut sub_flags = alloc::vec![cur];
+                let matched = backtrack(
+                    &sub,
+                    0,
+                    sp,
+                    &mut sub_saves,
+                    depth + 1,
+                    &mut sub_loops,
+                    &mut sub_flags,
+                );
                 if matched == *neg {
                     return false;
                 }
@@ -578,7 +612,7 @@ fn backtrack(
                     pc += 1;
                     continue;
                 }
-                let saved = core::mem::replace(saves, found.unwrap());
+                let saved = core::mem::replace(saves, sub_saves);
                 if backtrack(ctx, pc + 1, sp, saves, depth + 1, loops, flags_stack) {
                     return true;
                 }
@@ -593,11 +627,8 @@ fn backtrack(
                     (Some(s), Some(e)) => {
                         // Backrefs compare raw code units (a captured span is a
                         // run of units); case folding is applied unit-by-unit.
-                        let len = e - s;
-                        if sp + len <= ctx.input.len()
-                            && (0..len).all(|i| unit_eq(ctx.input[sp + i], ctx.input[s + i], cur))
-                        {
-                            sp += len;
+                        if let Some(nsp) = match_backref(ctx, sp, s, e, cur) {
+                            sp = nsp;
                             pc += 1;
                         } else {
                             return false;
@@ -700,10 +731,16 @@ fn loop_head(prog: &[Inst], split_pc: usize) -> Option<(usize, usize)> {
     }
 }
 
-/// Tries to consume one character with a single-consume instruction at `sp`,
-/// returning the number of code units advanced (1 or 2) on success.
-fn consume_one(inst: &Inst, input: &[u16], sp: usize, flags: Flags) -> Option<usize> {
-    let (cp, len) = read_cp(input, sp, flags.unicode)?;
+/// Tries to consume one character with a single-consume instruction at `sp` in the
+/// current direction, returning the resulting position (`sp ± len`) on success.
+fn consume_one(
+    inst: &Inst,
+    input: &[u16],
+    sp: usize,
+    flags: Flags,
+    reverse: bool,
+) -> Option<usize> {
+    let (cp, nsp) = read_dir(input, sp, flags.unicode, reverse)?;
     let ok = match inst {
         Inst::Char(c) => cp_eq(cp, *c, flags),
         Inst::Any => flags.dotall || !is_line_term(cp),
@@ -711,7 +748,30 @@ fn consume_one(inst: &Inst, input: &[u16], sp: usize, flags: Flags) -> Option<us
         Inst::ClassSet { neg, matcher } => matcher.matches(cp, flags) ^ *neg,
         _ => false,
     };
-    ok.then_some(len)
+    ok.then_some(nsp)
+}
+
+/// Matches a backreference to the captured span `[s, e)` at position `sp` in the
+/// context's direction, comparing code units (case-folded under `i`). Forward:
+/// consumes `input[sp..sp+len]`, returning `sp + len`. Reverse: consumes
+/// `input[sp-len..sp]`, returning `sp - len`. `None` if it does not match or would
+/// run off the subject.
+fn match_backref(ctx: &Ctx, sp: usize, s: usize, e: usize, flags: Flags) -> Option<usize> {
+    let len = e - s;
+    if ctx.reverse {
+        if sp >= len && (0..len).all(|i| unit_eq(ctx.input[sp - len + i], ctx.input[s + i], flags))
+        {
+            Some(sp - len)
+        } else {
+            None
+        }
+    } else if sp + len <= ctx.input.len()
+        && (0..len).all(|i| unit_eq(ctx.input[sp + i], ctx.input[s + i], flags))
+    {
+        Some(sp + len)
+    } else {
+        None
+    }
 }
 
 /// Compares two scalar code points for equality, honoring the `i` flag.

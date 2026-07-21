@@ -448,8 +448,13 @@ impl<'a> Interp<'a> {
                 if this_val.as_handle().map(Handle::from_raw).is_none() {
                     return Err(self.type_error("RegExp.prototype.test called on a non-object"));
                 }
-                let s = self.coerce_to_string(arg(0))?;
-                let str_v = self.new_str(&s);
+                // `ToString(S)` must be **lossless**: a lone surrogate in the
+                // subject has to survive to the matcher (it is a valid code unit and
+                // e.g. `\p{gc=Surrogate}` must match it). `coerce_to_string` yields a
+                // UTF-8 `String`, which replaces lone surrogates with U+FFFD, so use
+                // the WTF-8 byte path (as `exec` already does) instead.
+                let bytes = self.coerce_to_string_bytes(arg(0))?;
+                let str_v = self.new_str_bytes(bytes);
                 let r = self.regexp_exec(this_val, str_v)?;
                 Ok(NanBox::boolean(!matches!(r.unpack(), Unpacked::Null)))
             }
