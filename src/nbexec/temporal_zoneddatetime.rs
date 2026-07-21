@@ -562,7 +562,7 @@ pub(crate) fn tz_offset_at(tz: &str, epoch_ns: i128) -> i128 {
     if let Some((ns, _)) = parse_offset_id(tz) {
         return ns;
     }
-    if let Ok(z) = timezone_data::load(tz) {
+    if let Ok(z) = timezone_data::load(&tz_primary(tz)) {
         let secs = epoch_ns.div_euclid(iso::NS_PER_SEC) as i64;
         return i128::from(z.lookup(secs).offset) * iso::NS_PER_SEC;
     }
@@ -589,7 +589,7 @@ fn possible_instants(tz: &str, wall_ns: i128) -> ([i128; 2], usize) {
     if let Some((off, _)) = parse_offset_id(tz) {
         return ([wall_ns - off, 0], 1);
     }
-    let Ok(z) = timezone_data::load(tz) else {
+    let Ok(z) = timezone_data::load(&tz_primary(tz)) else {
         return ([wall_ns, 0], 1);
     };
     let off_at = |epoch: i128| -> i128 {
@@ -695,7 +695,12 @@ fn disambiguate(tz: &str, wall_ns: i128, d: Disamb) -> Result<i128, ()> {
 /// `MATCH_MINUTES` (a minute-precision source offset string) an instant whose
 /// offset rounds to the same minute matches; otherwise (`MATCH_EXACTLY`) the
 /// offset must be identical to the nanosecond.
-fn offset_match(tz: &str, wall_ns: i128, off: i128, match_minutes: bool) -> Option<i128> {
+pub(crate) fn offset_match(
+    tz: &str,
+    wall_ns: i128,
+    off: i128,
+    match_minutes: bool,
+) -> Option<i128> {
     let (poss, n) = possible_instants(tz, wall_ns);
     for &epoch in poss.iter().take(n) {
         let candidate_offset = wall_ns - epoch;
@@ -760,7 +765,7 @@ fn start_of_day(tz: &str, epoch_days: i64) -> Option<i128> {
     if !(iso::MIN_EPOCH_NS..=iso::MAX_EPOCH_NS).contains(&day_before) {
         return None;
     }
-    let z = timezone_data::load(tz).ok()?;
+    let z = timezone_data::load(&tz_primary(tz)).ok()?;
     zone_next_transition(&z, day_before)
 }
 
@@ -772,10 +777,19 @@ fn zone_next_transition(zone: &timezone_data::Zone, epoch_ns: i128) -> Option<i1
     let secs = epoch_ns.div_euclid(iso::NS_PER_SEC) as i64;
     let max_secs = (iso::MAX_EPOCH_NS / iso::NS_PER_SEC) as i64;
     // `transitions_for_range` yields stored + POSIX-generated transitions in
-    // chronological order; the first one strictly after the instant is the answer.
-    zone.transitions_for_range(secs, max_secs)
-        .map(|t| i128::from(t.when) * iso::NS_PER_SEC)
-        .find(|&w| w > epoch_ns)
+    // chronological order; the first one strictly after the instant that actually
+    // changes the UTC offset is the answer (a rule/abbreviation change that leaves
+    // the offset unchanged is not a `getTimeZoneTransition` transition).
+    for t in zone.transitions_for_range(secs, max_secs) {
+        let w = i128::from(t.when) * iso::NS_PER_SEC;
+        if w <= epoch_ns {
+            continue;
+        }
+        if zone.lookup(t.when - 1).offset != zone.lookup(t.when).offset {
+            return Some(w);
+        }
+    }
+    None
 }
 
 /// `GetNamedTimeZonePreviousTransition`: the last offset transition strictly before
@@ -783,11 +797,15 @@ fn zone_next_transition(zone: &timezone_data::Zone, epoch_ns: i128) -> Option<i1
 /// at most ~1 year back, so a bounded look-back window suffices past the stored range.
 fn zone_prev_transition(zone: &timezone_data::Zone, epoch_ns: i128) -> Option<i128> {
     let secs = epoch_ns.div_euclid(iso::NS_PER_SEC) as i64;
+    // Only transitions that actually change the UTC offset count (see
+    // `zone_next_transition`); the latest such transition strictly before the
+    // instant is the answer.
+    let changes_offset = |when: i64| zone.lookup(when - 1).offset != zone.lookup(when).offset;
     let mut best: Option<i128> = zone
         .transitions()
         .iter()
+        .filter(|t| i128::from(t.when) * iso::NS_PER_SEC < epoch_ns && changes_offset(t.when))
         .map(|t| i128::from(t.when) * iso::NS_PER_SEC)
-        .filter(|&w| w < epoch_ns)
         .max();
     let last_stored = zone
         .transitions()
@@ -798,7 +816,7 @@ fn zone_prev_transition(zone: &timezone_data::Zone, epoch_ns: i128) -> Option<i1
         let start = (secs - 800 * 86_400).max(last_stored.saturating_add(1));
         for t in zone.transitions_for_range(start, secs.saturating_add(2)) {
             let w = i128::from(t.when) * iso::NS_PER_SEC;
-            if w < epoch_ns {
+            if w < epoch_ns && changes_offset(t.when) {
                 best = Some(best.map_or(w, |b| b.max(w)));
             }
         }
@@ -2456,9 +2474,9 @@ impl<'a> Interp<'a> {
         let cal = data.calendar.clone();
         let tz = self.zdt_tz(data);
         // DifferenceTemporalZonedDateTime enforces CalendarEquals before reading the
-        // options bag. The ISO fast path keeps its original calendar-agnostic
-        // behaviour; a non-ISO receiver requires both operands to share a calendar.
-        if !tcal::is_iso(&cal) && other_cal != cal {
+        // options bag: both operands must share a calendar, regardless of which one
+        // is ISO (an ISO receiver against a non-ISO argument is still a mismatch).
+        if other_cal != cal {
             return Err(self
                 .zdt_range("cannot compute the difference between dates of different calendars"));
         }
@@ -3069,7 +3087,7 @@ impl<'a> Interp<'a> {
         if parse_offset_id(&tz).is_some() {
             return Ok(NanBox::null());
         }
-        let Ok(zone) = timezone_data::load(&tz) else {
+        let Ok(zone) = timezone_data::load(&tz_primary(&tz)) else {
             return Ok(NanBox::null());
         };
         let best = if next {
@@ -3175,7 +3193,11 @@ impl<'a> Interp<'a> {
             out.push_str(&iso::format_fraction(sub, precision));
         }
         if offset_mode != "never" {
-            out.push_str(&format_offset(offset_ns));
+            // `FormatDateTimeUTCOffsetRounded`: the ISO offset is shown to the
+            // nearest minute (a historical sub-minute LMT offset like +00:09:21
+            // renders as +00:09, even though `offsetNanoseconds` keeps it exact).
+            let disp = round_signed(offset_ns, iso::NS_PER_MINUTE, RoundMode::HalfExpand);
+            out.push_str(&format_offset(disp));
         }
         match tzname.as_str() {
             "never" => {}
@@ -3249,7 +3271,7 @@ fn offset_str_has_seconds(s: &str) -> bool {
     false
 }
 
-fn dt_offset_subminute(s: &str) -> bool {
+pub(crate) fn dt_offset_subminute(s: &str) -> bool {
     let Some(tpos) = s.find(['T', 't']) else {
         return false;
     };

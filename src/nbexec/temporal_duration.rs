@@ -76,6 +76,11 @@ struct DurAnchor {
     date: IsoDate,
     time_ns: i128,
     tz: Option<String>,
+    /// The anchor's exact instant (epoch ns). For a plain anchor this is just its
+    /// wall midnight; for a zoned anchor it is the resolved instant — which, unlike
+    /// re-disambiguating the wall time, preserves the correct occurrence within a
+    /// fall-back overlap (`AddZonedDateTime`/`ComputeNudgeWindow` use it directly).
+    epoch_ns: i128,
 }
 
 /// The instant an anchor+duration lands on: its wall `date`, wall time-of-day
@@ -1033,6 +1038,7 @@ impl<'a> Interp<'a> {
                 date: t1.date,
                 time_ns: t1.tod,
                 tz: a.tz.clone(),
+                epoch_ns: a.epoch_ns + t1.dest_rel,
             };
             let t2 = self.dur_apply(
                 &a2,
@@ -1307,6 +1313,7 @@ impl<'a> Interp<'a> {
                         date: td.date,
                         time_ns: 0,
                         tz: None,
+                        epoch_ns: iso_to_epoch_days(td.date) as i128 * NS_PER_DAY,
                     })),
                     TemporalKind::ZonedDateTime => {
                         let tz = td.tz.clone().unwrap_or_else(|| String::from("UTC"));
@@ -1315,6 +1322,7 @@ impl<'a> Interp<'a> {
                             date,
                             time_ns: time_to_nanos(time),
                             tz: Some(tz),
+                            epoch_ns: td.epoch_ns,
                         }))
                     }
                     _ => Err(self.type_error("relativeTo must be a date, datetime, or string")),
@@ -1364,7 +1372,10 @@ impl<'a> Interp<'a> {
             };
             let time = p.time.unwrap_or_default();
             let wall = iso_to_epoch_days(date) as i128 * NS_PER_DAY + time_to_nanos(time);
-            let epoch = self.dur_zoned_epoch(&tz, wall, p.z, p.offset_ns)?;
+            // A minute-precision offset string matches to the minute; a sub-minute
+            // one must match exactly (`InterpretISODateTimeOffset`).
+            let match_minutes = !super::temporal_zoneddatetime::dt_offset_subminute(s);
+            let epoch = self.dur_zoned_epoch(&tz, wall, p.z, p.offset_ns, match_minutes)?;
             if !(crate::temporal_iso::MIN_EPOCH_NS..=crate::temporal_iso::MAX_EPOCH_NS)
                 .contains(&epoch)
             {
@@ -1375,6 +1386,7 @@ impl<'a> Interp<'a> {
                 date: ldate,
                 time_ns: time_to_nanos(ltime),
                 tz: Some(tz),
+                epoch_ns: epoch,
             });
         }
         // A plain (non-zoned) relativeTo string may not carry a bare UTC
@@ -1388,6 +1400,7 @@ impl<'a> Interp<'a> {
             date,
             time_ns: 0,
             tz: None,
+            epoch_ns: iso_to_epoch_days(date) as i128 * NS_PER_DAY,
         })
     }
 
@@ -1498,18 +1511,21 @@ impl<'a> Interp<'a> {
         };
         if let Some(tz_name) = tz {
             let wall = iso_to_epoch_days(date) as i128 * NS_PER_DAY + time_to_nanos(time);
-            let epoch = self.dur_zoned_epoch(&tz_name, wall, false, offset_ns)?;
+            // A property-bag `offset` field is matched exactly (never to the minute).
+            let epoch = self.dur_zoned_epoch(&tz_name, wall, false, offset_ns, false)?;
             let (ldate, ltime) = self.dur_local_of(&tz_name, epoch);
             return Ok(DurAnchor {
                 date: ldate,
                 time_ns: time_to_nanos(ltime),
                 tz: Some(tz_name),
+                epoch_ns: epoch,
             });
         }
         Ok(DurAnchor {
             date,
             time_ns: 0,
             tz: None,
+            epoch_ns: iso_to_epoch_days(date) as i128 * NS_PER_DAY,
         })
     }
 
@@ -1561,22 +1577,24 @@ impl<'a> Interp<'a> {
 
     /// The absolute epoch nanoseconds of the anchor's own instant.
     fn dur_anchor_epoch_abs(&self, a: &DurAnchor) -> i128 {
-        let wall = iso_to_epoch_days(a.date) as i128 * NS_PER_DAY + a.time_ns;
-        match &a.tz {
-            Some(tz) => self.dur_wall_to_epoch(tz, wall),
-            None => wall,
-        }
+        a.epoch_ns
     }
 
     /// Epoch nanoseconds, relative to the anchor, of `date` combined with the
     /// anchor's own wall time-of-day (used for calendar start/end boundaries).
     fn dur_wall_rel(&self, a: &DurAnchor, date: IsoDate) -> i128 {
+        // The anchor's own date maps to the anchor instant exactly (per
+        // `ComputeNudgeWindow`, re-disambiguating the wall time would pick the
+        // wrong occurrence within a fall-back overlap).
+        if date == a.date {
+            return 0;
+        }
         let wall = iso_to_epoch_days(date) as i128 * NS_PER_DAY + a.time_ns;
         let abs = match &a.tz {
             Some(tz) => self.dur_wall_to_epoch(tz, wall),
             None => wall,
         };
-        abs - self.dur_anchor_epoch_abs(a)
+        abs - a.epoch_ns
     }
 
     /// `DateDurationDays`: the whole-day count obtained by adding only a
@@ -1628,8 +1646,15 @@ impl<'a> Interp<'a> {
                 })
             }
             Some(tz) => {
-                let wall1 = iso_to_epoch_days(d1) as i128 * NS_PER_DAY + a.time_ns;
-                let epoch1 = self.dur_wall_to_epoch(tz, wall1);
+                // `AddZonedDateTime`: a zero-length date part adds the time to the
+                // anchor instant directly (preserving the correct fall-back
+                // occurrence); otherwise the date part is applied in wall time.
+                let epoch1 = if years == 0 && months == 0 && weeks == 0 && days == 0 {
+                    a.epoch_ns
+                } else {
+                    let wall1 = iso_to_epoch_days(d1) as i128 * NS_PER_DAY + a.time_ns;
+                    self.dur_wall_to_epoch(tz, wall1)
+                };
                 let epoch_final = epoch1 + norm;
                 if !(crate::temporal_iso::MIN_EPOCH_NS..=crate::temporal_iso::MAX_EPOCH_NS)
                     .contains(&epoch_final)
@@ -1664,58 +1689,75 @@ impl<'a> Interp<'a> {
         if sign == 0 {
             return Ok(DurationFields::default());
         }
-        // Difference granularity: the coarsest of largest and day (difference is
-        // only defined for calendar units + day).
-        let diff_unit = if (largest as usize) <= (Unit::Day as usize) {
-            largest
-        } else {
-            Unit::Day
-        };
-        // Borrow so the sub-day time-of-day agrees with the overall sign.
-        let mut adj = date;
-        let mut subday = tod - a.time_ns;
-        if sign > 0 && subday < 0 {
-            adj = epoch_days_to_iso(iso_to_epoch_days(adj) - 1);
-            subday += NS_PER_DAY;
-        } else if sign < 0 && subday > 0 {
-            adj = epoch_days_to_iso(iso_to_epoch_days(adj) + 1);
-            subday -= NS_PER_DAY;
+        // `DifferenceZonedDateTimeWithRounding`: a time-category `largestUnit` is a
+        // pure instant difference (`DifferenceInstant`) — no days are involved, so
+        // the whole result is the rounded exact-ns displacement balanced to
+        // `largest`. This is correct for both plain and zoned anchors (a zoned day
+        // may be 23/25h, so folding days as a fixed 24h would be wrong here).
+        if (largest as usize) > (Unit::Day as usize) {
+            let unit_ns = (ns_per_unit(smallest) * increment).max(1);
+            let rounded = self.dur_round_increment(dest_rel, unit_ns, mode);
+            if (rounded / NS_PER_SEC).abs() >= TWO_POW_53 {
+                return Err(self.dur_range_error("rounded Duration is out of range"));
+            }
+            let time = balance_time_duration(rounded, largest);
+            let f = [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                time.hours as f64,
+                time.minutes as f64,
+                time.seconds as f64,
+                time.milliseconds as f64,
+                time.microseconds as f64,
+                time.nanoseconds as f64,
+            ];
+            return self.dur_build(f);
         }
-        let (cy, cm, cw, cd) = difference_iso_date(a.date, adj, diff_unit);
+        // Date-category `largestUnit`: decompose the displacement into a balanced
+        // (calendar-date, sub-day time) difference. A `ZonedDateTime` anchor uses
+        // `DifferenceZonedDateTime` (irregular day lengths + exact-ns remainder); a
+        // plain anchor uses the uniform-24h borrow (`DifferenceISODateTime`).
+        let diff_unit = largest;
+        let (cy, cm, cw, cd, time_rem, adj) = if a.tz.is_some() {
+            self.dur_zoned_difference(a, date, tod, dest_rel, diff_unit)
+        } else {
+            let mut adj = date;
+            let mut subday = tod - a.time_ns;
+            if sign > 0 && subday < 0 {
+                adj = epoch_days_to_iso(iso_to_epoch_days(adj) - 1);
+                subday += NS_PER_DAY;
+            } else if sign < 0 && subday > 0 {
+                adj = epoch_days_to_iso(iso_to_epoch_days(adj) + 1);
+                subday -= NS_PER_DAY;
+            }
+            let (cy, cm, cw, cd) = difference_iso_date(a.date, adj, diff_unit);
+            (cy, cm, cw, cd, subday, adj)
+        };
 
         let smallest_is_cal = matches!(smallest, Unit::Year | Unit::Month | Unit::Week);
-        let smallest_is_time = matches!(
-            smallest,
-            Unit::Hour
-                | Unit::Minute
-                | Unit::Second
-                | Unit::Millisecond
-                | Unit::Microsecond
-                | Unit::Nanosecond
-        );
-        // NudgeToZonedTime: with a ZonedDateTime anchor and a sub-day smallestUnit,
-        // days keep their (possibly non-24h) calendar length — the sub-day time is
-        // rounded on its own against the actual day span, rather than folding days
-        // into the time as fixed 24h intervals.
-        // A no-op rounding (nanosecond, increment 1) keeps the difference as-is:
-        // route it through the plain fixed-length path so no day boundary is probed.
+        let zoned = a.tz.is_some();
+        // `IsCalendarUnit(smallestUnit) || (timeZone && smallestUnit == day)` — the
+        // irregular-length units rounded via the epoch-ns bounding technique.
+        let irregular_day = smallest == Unit::Day && zoned;
+        // A no-op rounding (nanosecond, increment 1) keeps the balanced difference.
         let is_noop = smallest == Unit::Nanosecond && increment == 1;
-        let zoned_time = a.tz.is_some()
-            && smallest_is_time
-            && (largest as usize) <= (Unit::Day as usize)
-            && !is_noop;
-        let (mut y, mut m, mut w, mut days, norm_time, nudged_rel, did_expand) = if smallest_is_cal
-        {
+        let (mut y, mut m, mut w, mut days, norm_time, nudged_rel, did_expand) = if is_noop {
+            (cy, cm, cw, cd, time_rem, dest_rel, false)
+        } else if smallest_is_cal || irregular_day {
             let nc = self
                 .dur_nudge_calendar(a, cy, cm, cw, cd, dest_rel, sign, smallest, increment, mode)?;
             (nc.0, nc.1, nc.2, nc.3, 0_i128, nc.4, nc.5)
-        } else if zoned_time {
+        } else if zoned {
+            // `NudgeToZonedTime`: a sub-day smallestUnit keeps the (possibly non-24h)
+            // day length — the sub-day time is rounded against the actual day span.
             self.dur_nudge_zoned_time(
-                a, adj, cy, cm, cw, cd, subday, sign, smallest, increment, mode,
+                a, adj, cy, cm, cw, cd, time_rem, sign, smallest, increment, mode,
             )?
         } else {
-            // Fixed-length nudge (day/time): combine leftover days + sub-day time.
-            let norm_with_days = cd as i128 * NS_PER_DAY + subday;
+            // `NudgeToDayOrTime` (plain anchor): combine leftover 24h-days + time.
+            let norm_with_days = cd as i128 * NS_PER_DAY + time_rem;
             let unit_ns = ns_per_unit(smallest) * increment;
             let rounded = self.dur_round_increment(norm_with_days, unit_ns.max(1), mode);
             let whole_days = norm_with_days / NS_PER_DAY;
@@ -1745,18 +1787,13 @@ impl<'a> Interp<'a> {
             days = bd;
         }
 
-        // Assemble the final fields, balancing the time portion to `largest`.
-        let (final_days, time) = if (largest as usize) > (Unit::Day as usize) {
-            let total = days as i128 * NS_PER_DAY + norm_time;
-            (0_i64, balance_time_duration(total, largest))
-        } else {
-            (days, balance_time_duration(norm_time, Unit::Hour))
-        };
+        // Assemble the final fields (largest is date-category, so days stay days).
+        let time = balance_time_duration(norm_time, Unit::Hour);
         let f = [
             y as f64,
             m as f64,
             w as f64,
-            final_days as f64,
+            days as f64,
             time.hours as f64,
             time.minutes as f64,
             time.seconds as f64,
@@ -1765,6 +1802,52 @@ impl<'a> Interp<'a> {
             time.nanoseconds as f64,
         ];
         self.dur_build(f)
+    }
+
+    /// `DifferenceZonedDateTime`: decomposes the signed displacement of a
+    /// `ZonedDateTime` anchor+duration into a balanced (calendar-date, exact-ns
+    /// sub-day time) difference. `date`/`tod` are the target's wall date and
+    /// time-of-day; `dest_rel` is the signed exact-ns displacement from the anchor.
+    /// Returns `(years, months, weeks, days, time_remainder_ns, intermediate_date)`,
+    /// where `intermediate_date = anchor.date + (years,months,weeks,days)`.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn dur_zoned_difference(
+        &mut self,
+        a: &DurAnchor,
+        date: IsoDate,
+        tod: i128,
+        dest_rel: i128,
+        diff_unit: Unit,
+    ) -> (i64, i64, i64, i64, i128, IsoDate) {
+        // Same wall calendar day: no calendar involvement, the whole displacement is
+        // the exact-ns time remainder. Avoids day-correction over-shoot on same-day
+        // reverse-wallclock DST diffs (proposal-temporal issue #3141).
+        if date == a.date {
+            return (0, 0, 0, 0, dest_rel, a.date);
+        }
+        // Internal sign convention (per spec): +1 when travelling backward.
+        let sign_conv: i64 = if dest_rel < 0 { 1 } else { -1 };
+        // ISO wall-clock overshoot: if the time-of-day diff points the same way as
+        // this inverted sign, at least one day correction is required.
+        let wall_time_diff = tod - a.time_ns;
+        let mut day_corr: i64 = if wall_time_diff.signum() as i64 == sign_conv {
+            1
+        } else {
+            0
+        };
+        let max_corr: i64 = if sign_conv == -1 { 2 } else { 1 };
+        let (mut inter_date, mut time_rem);
+        loop {
+            inter_date = epoch_days_to_iso(iso_to_epoch_days(date) + day_corr * sign_conv);
+            let inter_rel = self.dur_wall_rel(a, inter_date);
+            time_rem = dest_rel - inter_rel;
+            if time_rem.signum() as i64 != sign_conv || day_corr >= max_corr {
+                break;
+            }
+            day_corr += 1;
+        }
+        let (cy, cm, cw, cd) = difference_iso_date(a.date, inter_date, diff_unit);
+        (cy, cm, cw, cd, time_rem, inter_date)
     }
 
     /// `NudgeToCalendarUnit`: rounds the `unit` calendar component toward the
@@ -1795,11 +1878,17 @@ impl<'a> Interp<'a> {
                 let r = trunc_to_increment(cm, inc);
                 (r, (cy, r, 0, 0), (cy, r + step, 0, 0))
             }
-            _ => {
+            Unit::Week => {
                 // Week: fold the leftover whole days (from a coarser difference)
                 // into the week count before truncating to the increment.
                 let r = trunc_to_increment(cw + cd / 7, inc);
                 (r, (cy, cm, r, 0), (cy, cm, r + step, 0))
+            }
+            _ => {
+                // Day (irregular-length unit with a ZonedDateTime anchor): round the
+                // day count against the actual epoch-ns span of `[r1, r2]` days.
+                let r = trunc_to_increment(cd, inc);
+                (r, (cy, cm, cw, r), (cy, cm, cw, r + step))
             }
         };
         let start_date = add_iso_date(
@@ -1862,6 +1951,10 @@ impl<'a> Interp<'a> {
     /// outside the representable range (the checked analogue of `dur_wall_rel`,
     /// used where the spec's `GetEpochNanosecondsFor` would reject a boundary).
     fn dur_wall_rel_checked(&mut self, a: &DurAnchor, date: IsoDate) -> Result<i128, ExecError> {
+        // The anchor's own date maps to its exact instant (already validated).
+        if date == a.date {
+            return Ok(0);
+        }
         let wall = iso_to_epoch_days(date) as i128 * NS_PER_DAY + a.time_ns;
         let abs = match &a.tz {
             Some(tz) => self.dur_wall_to_epoch(tz, wall),
@@ -1870,7 +1963,7 @@ impl<'a> Interp<'a> {
         if !(crate::temporal_iso::MIN_EPOCH_NS..=crate::temporal_iso::MAX_EPOCH_NS).contains(&abs) {
             return Err(self.dur_range_error("day boundary is out of range"));
         }
-        Ok(abs - self.dur_anchor_epoch_abs(a))
+        Ok(abs - a.epoch_ns)
     }
 
     /// `NudgeToZonedTime`: rounds a sub-day time unit within a zoned day, keeping
@@ -2074,18 +2167,17 @@ impl<'a> Interp<'a> {
             self.dur_reject_datetime(t.date, t.tod)?;
         }
         if zoned_day {
-            // Whole days toward the destination + the fractional remainder, using
-            // the actual (possibly non-24h) length of the bounding zoned day.
-            let mut adj = t.date;
-            let subday = t.tod - a.time_ns;
-            if eff_sign > 0 && subday < 0 {
-                adj = epoch_days_to_iso(iso_to_epoch_days(adj) - 1);
-            } else if eff_sign < 0 && subday > 0 {
-                adj = epoch_days_to_iso(iso_to_epoch_days(adj) + 1);
-            }
-            let (_, _, _, cd) = difference_iso_date(a.date, adj, Unit::Day);
-            let end_date = epoch_days_to_iso(iso_to_epoch_days(adj) + eff_sign);
-            let start_rel = self.dur_wall_rel_checked(a, adj)?;
+            // `NudgeToCalendarUnit` total for an irregular (zoned) day: the whole
+            // days of the balanced difference toward the destination, plus the
+            // fractional remainder over the actual span of the bounding zoned day
+            // (`anchor + r1 days` … `anchor + (r1±1) days`, wall-time preserved).
+            let (_, _, _, cd, _, _) =
+                self.dur_zoned_difference(a, t.date, t.tod, t.dest_rel, Unit::Day);
+            let start_date = add_iso_date(a.date, 0, 0, 0, cd, Overflow::Constrain)
+                .ok_or_else(|| self.dur_range_error("total out of range"))?;
+            let end_date = add_iso_date(a.date, 0, 0, 0, cd + eff_sign, Overflow::Constrain)
+                .ok_or_else(|| self.dur_range_error("total out of range"))?;
+            let start_rel = self.dur_wall_rel_checked(a, start_date)?;
             let end_rel = self.dur_wall_rel_checked(a, end_date)?;
             let asp = (end_rel - start_rel).unsigned_abs();
             if asp == 0 {
@@ -2197,17 +2289,26 @@ impl<'a> Interp<'a> {
         wall: i128,
         z: bool,
         offset: Option<i128>,
+        match_minutes: bool,
     ) -> Result<i128, ExecError> {
         if z {
             return Ok(wall);
         }
         if let Some(off) = offset {
-            let cand = wall - off;
-            let zone_off = self.dur_tz_offset_at(tz, cand);
-            if zone_off != off {
+            // `InterpretISODateTimeOffset` (offset "reject"): the offset must match
+            // one of the wall time's possible instants — exactly when the source
+            // carried sub-minute precision, otherwise to the nearest minute (so an
+            // `HH:MM` string matches a historical sub-minute zone offset).
+            if let Some(fixed) = parse_fixed_offset(tz) {
+                if fixed == off {
+                    return Ok(wall - off);
+                }
                 return Err(self.dur_range_error("offset does not match the time zone"));
             }
-            return Ok(cand);
+            match super::temporal_zoneddatetime::offset_match(tz, wall, off, match_minutes) {
+                Some(e) => return Ok(e),
+                None => return Err(self.dur_range_error("offset does not match the time zone")),
+            }
         }
         Ok(self.dur_wall_to_epoch(tz, wall))
     }

@@ -2858,6 +2858,52 @@ impl<'a> Interp<'a> {
             }
             return Ok(Some(self.array_iter_sparse(method, handle, args)?));
         }
+        // `flat`/`flatMap` on a generic array-like (a plain object *or* a proxy
+        // whose target is an array) run FlattenIntoArray *live*: `LengthOfArrayLike`,
+        // then `ArraySpeciesCreate` (reads `constructor`/`@@species`), then per index
+        // `HasProperty` → `Get` with recursion into nested arrays. This is the exact
+        // spec MOP order/count a proxy observes — the materialize path would instead
+        // pre-read every element (wrong access count) and read `constructor` late. A
+        // real dense array keeps its fast `elems` path below.
+        if self.realm.is_generic_array_like_target(handle)
+            && matches!(method, "flat" | "flatMap")
+            && (array_proto_generic || self.inherits_array_proto(handle))
+            && !self.inherits_iterator_proto(handle)
+        {
+            let source_len = self.array_like_length(handle)?;
+            let (depth, mapper, this_arg) = if method == "flat" {
+                let depth = if matches!(arg(0).unpack(), Unpacked::Undefined) {
+                    1
+                } else {
+                    self.coerce_to_integer_or_infinity(arg(0))? as i32
+                };
+                (depth, None, NanBox::undefined())
+            } else {
+                self.require_callable(arg(0), "flatMap callback")?;
+                (1, Some(arg(0)), arg(1))
+            };
+            let a_v = self.array_species_create(handle, 0)?;
+            let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
+                return Err(self.type_error("Array species did not return an object"));
+            };
+            self.flatten_into_array(a_h, handle, source_len, 0, depth, mapper, this_arg)?;
+            return Ok(Some(a_v));
+        }
+        // `map`/`filter` on a *plain* generic array-like (not a proxy whose target is
+        // an array — those still need `@@species` from the materialize path) read each
+        // element live per iteration (`HasProperty` then `Get`) so a callback that
+        // mutates a later index is observed; the result is built via
+        // `ArraySpeciesCreate` → `CreateDataPropertyOrThrow` (an out-of-range `length`
+        // throws a RangeError before any callback, matching `ArrayCreate`).
+        if self.realm.is_generic_array_like_target(handle)
+            && matches!(method, "map" | "filter")
+            && (array_proto_generic || self.inherits_array_proto(handle))
+            && !self.inherits_iterator_proto(handle)
+            && !is_string_receiver
+            && !self.is_array_unwrap_proxy(NanBox::handle(handle.to_raw()))?
+        {
+            return Ok(Some(self.array_map_filter_generic(method, handle, args)?));
+        }
         let mut array_like = None;
         if self.realm.is_generic_array_like_target(handle)
             && ARRAY_LIKE_METHODS.contains(&method)
@@ -3409,8 +3455,13 @@ impl<'a> Interp<'a> {
                 "push" => {
                     // Precise: `Set(O, ToString(len+i), E, true)` fires an inherited
                     // setter, and the final `Set(O, "length", …, true)` throws on a
-                    // frozen / non-writable length.
-                    if precise_array {
+                    // frozen / non-writable length. Also take the precise generic path
+                    // when the *logical* length exceeds the dense store (a sparse array
+                    // whose `length` was widened, e.g. `x.length = 2**32-1`): the fast
+                    // path would push at the wrong (dense) index, and the final
+                    // `Set(O,"length", len+argCount)` must throw a RangeError once it
+                    // crosses the 2^32 array-length ceiling.
+                    if precise_array || self.realm.array_length(handle) != Some(elems.len()) {
                         return Ok(Some(self.array_like_mutate(method, handle, args)?));
                     }
                     if self.realm.array_length_is_readonly(handle) {
@@ -5368,6 +5419,106 @@ impl<'a> Interp<'a> {
     /// non-array array-like `this` (`Array.prototype.concat.call(obj)`) and a boxed
     /// primitive `this` (`.call(101)` → a `Number` wrapper added as one element)
     /// behave per spec.
+    /// `FlattenIntoArray(target, source, sourceLen, start, depth [, mapper, thisArg])`
+    /// (ECMA-262 23.1.3.13.1) run *live* against a generic array-like `source`: for
+    /// each index `HasProperty(source, P)` then `Get(source, P)` (a proxy observes
+    /// each trap in spec order/count), optionally mapped, recursing one level into a
+    /// nested array (proxy-aware `IsArray`) while `depth > 0`. Returns the next
+    /// `targetIndex`.
+    #[allow(clippy::too_many_arguments)]
+    fn flatten_into_array(
+        &mut self,
+        target: Handle,
+        source: Handle,
+        source_len: usize,
+        start: usize,
+        depth: i32,
+        mapper: Option<NanBox>,
+        this_arg: NanBox,
+    ) -> Result<usize, ExecError> {
+        const MAX_SAFE: usize = 9_007_199_254_740_991; // 2^53 - 1
+        let mut target_index = start;
+        for source_index in 0..source_len {
+            let key = alloc::format!("{source_index}");
+            if !self.has_property(source, &key) {
+                continue;
+            }
+            let mut element = self.read_member(source, &key)?;
+            if let Some(m) = mapper {
+                element = self.call_with_this(
+                    m,
+                    this_arg,
+                    &[
+                        element,
+                        NanBox::number(source_index as f64),
+                        NanBox::handle(source.to_raw()),
+                    ],
+                )?;
+            }
+            let should_flatten = depth > 0 && self.is_array_unwrap_proxy(element)?;
+            if should_flatten {
+                let element_h = Handle::from_raw(element.as_handle().expect("array is an object"));
+                let element_len = self.array_like_length(element_h)?;
+                // Nested flattening never carries the mapper (per spec step iv.2).
+                target_index = self.flatten_into_array(
+                    target,
+                    element_h,
+                    element_len,
+                    target_index,
+                    depth - 1,
+                    None,
+                    NanBox::undefined(),
+                )?;
+            } else {
+                if target_index >= MAX_SAFE {
+                    return Err(self.type_error("flatten result exceeds maximum array length"));
+                }
+                self.create_data_property_or_throw(target, target_index, element)?;
+                target_index += 1;
+            }
+        }
+        Ok(target_index)
+    }
+
+    /// `Array.prototype.map`/`filter` over a *plain* (non-array, non-proxy-of-array)
+    /// generic array-like: `LengthOfArrayLike`, then `IsCallable(callbackfn)`, then
+    /// `ArraySpeciesCreate` (an out-of-range length throws before any callback), then
+    /// per index `HasProperty` → `Get` → callback, reading each element *live* so a
+    /// callback that mutates a later index is observed.
+    fn array_map_filter_generic(
+        &mut self,
+        method: &str,
+        handle: Handle,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let f = args.first().copied().unwrap_or_else(NanBox::undefined);
+        let this_arg = args.get(1).copied().unwrap_or_else(NanBox::undefined);
+        let len = self.array_like_length(handle)?;
+        self.require_callable(f, &alloc::format!("{method} callback"))?;
+        let is_map = method == "map";
+        let a_v = self.array_species_create(handle, if is_map { len } else { 0 })?;
+        let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
+            return Err(self.type_error("Array species did not return an object"));
+        };
+        let o = NanBox::handle(handle.to_raw());
+        let mut to = 0usize;
+        for i in 0..len {
+            let key = alloc::format!("{i}");
+            if !self.has_property(handle, &key) {
+                continue;
+            }
+            let kv = self.read_member(handle, &key)?;
+            let mapped = self.call_with_this(f, this_arg, &[kv, NanBox::number(i as f64), o])?;
+            if is_map {
+                self.create_data_property_or_throw(a_h, i, mapped)?;
+            } else if self.realm.truthy(mapped) {
+                self.create_data_property_or_throw(a_h, to, kv)?;
+                to += 1;
+            }
+        }
+        Ok(a_v)
+    }
+
     pub(crate) fn array_concat(
         &mut self,
         this: NanBox,
@@ -5639,24 +5790,36 @@ impl<'a> Interp<'a> {
                 let mid = len / 2;
                 for lower in 0..mid {
                     let upper = len - lower - 1;
+                    // Spec order per pair (23.1.3.26): HasProperty(lower), then
+                    // Get(lower) *only if present*, then HasProperty(upper), then
+                    // Get(upper) *only if present* — so an absent index is never read
+                    // and a throwing getter fires at the exact point a proxy expects.
                     let lower_exists = self.has_property(handle, &alloc::format!("{lower}"));
+                    let lower_val = if lower_exists {
+                        Some(self.array_like_get(handle, lower)?)
+                    } else {
+                        None
+                    };
                     let upper_exists = self.has_property(handle, &alloc::format!("{upper}"));
-                    let lower_val = self.array_like_get(handle, lower)?;
-                    let upper_val = self.array_like_get(handle, upper)?;
-                    match (lower_exists, upper_exists) {
-                        (true, true) => {
-                            self.array_like_set(handle, lower, upper_val)?;
-                            self.array_like_set(handle, upper, lower_val)?;
+                    let upper_val = if upper_exists {
+                        Some(self.array_like_get(handle, upper)?)
+                    } else {
+                        None
+                    };
+                    match (lower_val, upper_val) {
+                        (Some(lv), Some(uv)) => {
+                            self.array_like_set(handle, lower, uv)?;
+                            self.array_like_set(handle, upper, lv)?;
                         }
-                        (false, true) => {
-                            self.array_like_set(handle, lower, upper_val)?;
+                        (None, Some(uv)) => {
+                            self.array_like_set(handle, lower, uv)?;
                             self.array_like_delete(handle, upper)?;
                         }
-                        (true, false) => {
+                        (Some(lv), None) => {
                             self.array_like_delete(handle, lower)?;
-                            self.array_like_set(handle, upper, lower_val)?;
+                            self.array_like_set(handle, upper, lv)?;
                         }
-                        (false, false) => {}
+                        (None, None) => {}
                     }
                 }
                 Ok(NanBox::handle(handle.to_raw()))
@@ -5680,7 +5843,9 @@ impl<'a> Interp<'a> {
                 let mut buf: Vec<Option<NanBox>> = Vec::with_capacity(count);
                 for k in 0..count {
                     let idx = from + k;
-                    if self.has_property(handle, &alloc::format!("{idx}")) {
+                    // `fromPresent = HasProperty(O, fromKey)` then ReturnIfAbrupt — a
+                    // throwing `has` trap propagates (must not collapse to `false`).
+                    if self.has_property_proxied(handle, &alloc::format!("{idx}"))? {
                         buf.push(Some(self.array_like_get(handle, idx)?));
                     } else {
                         buf.push(None);
