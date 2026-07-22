@@ -317,17 +317,10 @@ language/expressions/dynamic-import/import-defer/import-defer-transitive-async-m
 language/expressions/dynamic-import/import-defer/sync-dependency-of-deferred-async-module/main.js  # async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [] and expected [dep, tla-with-dep start, tla-with-dep end] )
 language/expressions/import.meta/distinct-for-each-module.js  # expected pass, Runtime Test262Error: foreign import.meta accessed via function call Expected SameValue(«[object Object]», «[object Object]») to be false
 language/expressions/import.meta/import-meta-is-an-ordinary-object.js  # expected pass, Runtime Test262Error: import.meta is not callable Expected a TypeError but got a ReferenceError
-language/expressions/in/private-field-rhs-non-object.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«null», «null») to be false
-language/expressions/in/private-field-rhs-yield-present.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«undefined», «true») to be true
-language/expressions/optional-chaining/eval-optional-call.js  # [sloppy] expected pass, Runtime Test262Error: fn() returns "global" value from indirect eval Expected SameValue(«"local"», «"global"») to be true
-language/expressions/optional-chaining/member-expression.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"a"», «""») to be true
 language/expressions/postfix-decrement/operator-x-postfix-decrement-calls-putvalue-lhs-newvalue-.js  # [sloppy] expected pass, Runtime Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all
 language/expressions/postfix-increment/operator-x-postfix-increment-calls-putvalue-lhs-newvalue-.js  # [sloppy] expected pass, Runtime Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all
 language/expressions/prefix-decrement/operator-prefix-decrement-x-calls-putvalue-lhs-newvalue-.js  # [sloppy] expected pass, Runtime Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all
 language/expressions/prefix-increment/operator-prefix-increment-x-calls-putvalue-lhs-newvalue-.js  # [sloppy] expected pass, Runtime Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all
-language/expressions/tagged-template/cache-eval-inner-function.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«,,», «,,») to be false
-language/expressions/tagged-template/constructor-invocation.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-language/expressions/tagged-template/invalid-escape-sequences.js  # [sloppy] expected pass, Runtime Test262Error: Cooked template value should be undefined for illegal escape sequences Expected SameValue(«"\u0001"», «undefined») to be true
 language/expressions/yield/from-with.js  # [sloppy] expected pass, Runtime Test262Error: Second result `value` Expected SameValue(«1», «2») to be true
 language/expressions/yield/rhs-template-middle.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: unexpected token TemplateMiddle (at 7247..7251)
 language/expressions/yield/star-in-rltn-expr.js  # [sloppy] expected pass, Runtime TypeError: yield* operand is not iterable
@@ -377,19 +370,9 @@ language/statements/for-await-of/async-from-sync-iterator-continuation-abrupt-co
 language/statements/for-await-of/ticks-with-async-iter-resolved-promise-and-constructor-lookup-two.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [pre, loop, post, tick 1, tick 2] and expected [pre, constru)
 language/statements/for-await-of/ticks-with-sync-iter-resolved-promise-and-constructor-lookup.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [pre, loop, post, tick 1, tick 2, tick 3, tick 4] and expect)
 language/statements/for-in/resizable-buffer.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«""», «"012"») to be true
-language/statements/for-of/arguments-mapped-aliasing.js  # [sloppy] expected pass, Runtime Test262Error: argument at index 1 Expected SameValue(«2», «3») to be true
-language/statements/for-of/arguments-mapped-mutation.js  # [sloppy] expected pass, Runtime Test262Error: argument at index 1 Expected SameValue(«2», «4») to be true
-language/statements/for-of/arguments-unmapped-mutation.js  # [sloppy] expected pass, Runtime Test262Error: argument at index 1 Expected SameValue(«2», «4») to be true
 language/statements/for/scope-body-lex-open.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"inside"», «"outside"») to be true
 language/statements/function/S13.2.2_A18_T1.js  # [sloppy] expected pass, Runtime Test262Error: #4: this.b === true. Actual: this.b ===undefined
 language/statements/function/S13.2.2_A18_T2.js  # [sloppy] expected pass, Runtime Test262Error: #4: this.b === true. Actual: this.b ===undefined
-language/statements/let/syntax/let-closure-inside-condition.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«0», «5») to be true
-language/statements/let/syntax/let-closure-inside-initialization.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«0», «5») to be true
-language/statements/let/syntax/let-closure-inside-next-expression.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«1», «5») to be true
-language/statements/switch/scope-lex-async-function.js  # [sloppy] expected ReferenceError but the test passed
-language/statements/switch/scope-lex-async-generator.js  # [sloppy] expected ReferenceError but the test passed
-language/statements/switch/scope-lex-generator.js  # [sloppy] expected ReferenceError but the test passed
-language/statements/switch/scope-lex-open-case.js  # [sloppy] expected pass, Runtime Test262Error: reference from "selector" Expression Expected SameValue(«"outside"», «"inside"») to be true
 language/statements/try/scope-catch-block-lex-open.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"inside"», «"outside"») to be true
 language/statements/using/syntax/using-invalid-assignment-statement-body-for-of.js  # [sloppy] expected pass, Runtime Test262Error: Expected a TypeError to be thrown but no exception was thrown at all
 language/statements/variable/S12.2_A11.js  # [sloppy] expected pass, Runtime Test262Error: #2: __declared__var === "baloon". Actual:  __declared__var ===undefined

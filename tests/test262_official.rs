@@ -594,10 +594,16 @@ fn coordinate() {
     let total = collect_tests(&root).len();
     eprintln!("test262 official: {total} test files at {}", root.display());
 
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(8);
+    let workers = std::env::var("KATAAN_T262_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(8)
+        });
     let exe = std::env::current_exe().expect("current_exe");
     let pid = std::process::id();
     let tmp = std::env::temp_dir();
@@ -679,7 +685,7 @@ fn coordinate() {
             "\n{} ledger entries now PASS (remove them from the ledger):",
             newly_passing.len()
         );
-        for r in newly_passing.iter().take(40) {
+        for r in newly_passing.iter().take(100000) {
             eprintln!("  + {r}");
         }
     }
@@ -687,7 +693,7 @@ fn coordinate() {
         let mut sorted = regressions.clone();
         sorted.sort();
         eprintln!("\n{} REGRESSIONS (failing, not in ledger):", sorted.len());
-        for r in sorted.iter().take(80) {
+        for r in sorted.iter().take(100000) {
             let reason = fails
                 .iter()
                 .find(|(p, _)| &p == r)

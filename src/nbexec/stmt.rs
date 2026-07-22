@@ -1698,36 +1698,42 @@ impl<'a> Interp<'a> {
         discriminant: &'a Expr,
         cases: &'a [crate::ast::SwitchCase],
     ) -> Result<Flow, ExecError> {
+        // The discriminant is evaluated in the *enclosing* scope, before the
+        // switch's block environment exists (spec step 1-2, oldEnv).
         let value = self.eval(discriminant)?;
-        // Find the first matching `case` (strict equality), else `default`.
-        let mut start = None;
-        for (i, case) in cases.iter().enumerate() {
-            if let Some(test) = &case.test {
-                let t = self.eval(test)?;
-                if self.realm.strict_equals(value, t) {
-                    start = Some(i);
-                    break;
-                }
-            }
-        }
-        if start.is_none() {
-            start = cases.iter().position(|c| c.test.is_none());
-        }
-        let Some(start) = start else {
-            return Ok(Flow::Normal(NanBox::undefined()));
-        };
-        // Run from the matched clause, falling through until `break`.
+        // A switch body is a single lexical (block) scope shared by all cases.
+        // The block environment is created *before* the case selector expressions
+        // are evaluated (spec steps 3-6: blockEnv + BlockDeclarationInstantiation,
+        // then CaseBlockEvaluation) so a closure created in a `case` selector — or
+        // in the body — captures that block's `let`/`const`/function bindings.
         let child = self.current.child();
         let saved = core::mem::replace(&mut self.current, child);
-        // A switch body is a single lexical scope shared by all cases: hoist the
-        // block-level function declarations of *every* case into it (regardless
-        // of which clause matched), mirroring a block's `exec_seq` hoist. Without
-        // this, a `function f(){}` inside a `case` is never instantiated and the
-        // Annex B.3.3 runtime update of its outer `var` binding cannot fire.
         let result = (|| {
+            // BlockDeclarationInstantiation for the whole CaseBlock: instantiate
+            // every case's block-level function declarations and pre-declare its
+            // `let`/`const`/`class` names in their TDZ, regardless of which clause
+            // matches. Without this a `function f(){}` inside a `case` is never
+            // instantiated and the Annex B.3.3 runtime update of its outer `var`
+            // binding cannot fire.
             for case in cases {
                 self.hoist(&case.body)?;
             }
+            // Find the first matching `case` (strict equality), else `default`.
+            // The selector expressions run in the block environment.
+            let mut start = None;
+            for (i, case) in cases.iter().enumerate() {
+                if let Some(test) = &case.test {
+                    let t = self.eval(test)?;
+                    if self.realm.strict_equals(value, t) {
+                        start = Some(i);
+                        break;
+                    }
+                }
+            }
+            let start = match start.or_else(|| cases.iter().position(|c| c.test.is_none())) {
+                Some(s) => s,
+                None => return Ok(Flow::Normal(NanBox::undefined())),
+            };
             // Spec CaseBlockEvaluation: V starts undefined and tracks the last
             // non-empty completion across the executed (fall-through) statements;
             // a `break` returns that accumulated value (UpdateEmpty(break, V)).
@@ -1772,17 +1778,26 @@ impl<'a> Interp<'a> {
         let label = self.pending_label.take();
         let child = self.current.child();
         let saved = core::mem::replace(&mut self.current, child);
-        // For a `let`/`const` head, each iteration gets a fresh binding (so a
-        // closure created in the body captures that iteration's value).
+        // For a `let`/`const` head, each iteration gets a fresh copy of the head
+        // bindings (CreatePerIterationEnvironment), so a closure created anywhere
+        // in the head — test, body, or increment — captures that iteration's value.
+        let mut per_iter_const = false;
         let per_iter_names: Vec<String> = match init {
-            Some(ForInit::Var(decl)) if decl.kind != crate::ast::VarDeclKind::Var => decl
-                .declarations
-                .iter()
-                .filter_map(|d| match &d.target {
-                    BindingTarget::Ident(Ident { name, .. }) => Some(String::from(&**name)),
-                    _ => None,
-                })
-                .collect(),
+            Some(ForInit::Var(decl))
+                if matches!(
+                    decl.kind,
+                    crate::ast::VarDeclKind::Let | crate::ast::VarDeclKind::Const
+                ) =>
+            {
+                per_iter_const = decl.kind == crate::ast::VarDeclKind::Const;
+                decl.declarations
+                    .iter()
+                    .filter_map(|d| match &d.target {
+                        BindingTarget::Ident(Ident { name, .. }) => Some(String::from(&**name)),
+                        _ => None,
+                    })
+                    .collect()
+            }
             _ => Vec::new(),
         };
         let result = (|| {
@@ -1793,6 +1808,11 @@ impl<'a> Interp<'a> {
                 }
                 None => {}
             }
+            // Seed the first per-iteration environment from the loop-header scope
+            // before the initial test (spec ForBodyEvaluation step 2).
+            if !per_iter_names.is_empty() {
+                self.per_iteration_env(&per_iter_names, per_iter_const);
+            }
             let mut v = NanBox::undefined();
             loop {
                 let go = match test {
@@ -1802,29 +1822,16 @@ impl<'a> Interp<'a> {
                 if !go {
                     break;
                 }
-                // Run the body in a per-iteration scope seeded from the loop
-                // variables, then copy any mutations back for test/update.
-                let flow = if per_iter_names.is_empty() {
-                    self.exec(body)?
-                } else {
-                    let iter = self.current.child();
-                    for name in &per_iter_names {
-                        iter.declare(name, self.current.get(name).unwrap_or(NanBox::undefined()));
-                    }
-                    let loop_scope = core::mem::replace(&mut self.current, iter);
-                    let f = self.exec(body);
-                    for name in &per_iter_names {
-                        if let Some(v) = self.current.get(name) {
-                            loop_scope.set(name, v);
-                        }
-                    }
-                    self.current = loop_scope;
-                    f?
-                };
+                let flow = self.exec(body)?;
                 match loop_step(flow, &label, &mut v) {
                     LoopAction::Next => {}
                     LoopAction::Stop => break,
                     LoopAction::Propagate(f) => return Ok(f),
+                }
+                // Copy the bindings into a fresh environment after the body and
+                // before the increment (CreatePerIterationEnvironment again).
+                if !per_iter_names.is_empty() {
+                    self.per_iteration_env(&per_iter_names, per_iter_const);
                 }
                 if let Some(u) = update {
                     self.eval(u)?;
@@ -1838,5 +1845,24 @@ impl<'a> Interp<'a> {
         let result = self.dispose_block_scope(result);
         self.current = saved;
         result
+    }
+
+    /// CreatePerIterationEnvironment: replace `self.current` with a fresh child
+    /// scope holding a copy of each per-iteration `let`/`const` binding, so the
+    /// next iteration's test/body/increment (and any closure created in them)
+    /// operate on distinct bindings from the previous iteration's. `is_const`
+    /// preserves the head's immutability so a `for (const …)` increment/body
+    /// assignment still throws a TypeError.
+    fn per_iteration_env(&mut self, names: &[String], is_const: bool) {
+        let iter = self.current.child();
+        for name in names {
+            let v = self.current.get(name).unwrap_or(NanBox::undefined());
+            if is_const {
+                iter.declare_const(name, v);
+            } else {
+                iter.declare(name, v);
+            }
+        }
+        self.current = iter;
     }
 }

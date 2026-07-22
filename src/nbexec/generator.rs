@@ -280,6 +280,10 @@ enum Step<'a> {
     EvalThen { expr: &'a Expr },
     /// Combine the top two stack values with `op` (left below, right on top).
     BinaryOp { op: crate::ast::BinaryOp },
+    /// The ergonomic brand check `#name in <rhs>`, where `<rhs>` (already on the
+    /// value stack) may have suspended on a `yield`/`await`. Pops the RHS and
+    /// pushes whether the private element is present (TypeError if non-object).
+    PrivateIn { name: &'a str },
     /// Build an array literal: `elements[idx..]` remain to evaluate; `acc` holds
     /// the values gathered so far. On reaching the end a new array is pushed.
     ArrayLit {
@@ -2479,6 +2483,22 @@ impl<'a> Interp<'a> {
                 values.push(v);
                 Ok(StepOut::Continue)
             }
+            Step::PrivateIn { name } => {
+                let obj = values.pop().unwrap_or(NanBox::undefined());
+                // §13.10.1: the RHS of `#x in rhs` must be an Object.
+                if !self.is_object_value(obj) {
+                    let m = self.new_str(
+                        "Cannot use 'in' operator to check for a private name in a non-object",
+                    );
+                    return Err(GenAbrupt::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                let key = self.private_access_key(name);
+                let present = obj.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                    self.realm.has_own(h, &key) || self.realm.accessor(h, &key).is_some()
+                });
+                values.push(NanBox::boolean(present));
+                Ok(StepOut::Continue)
+            }
             Step::ArrayLit { elements, idx, acc } => {
                 if idx >= elements.len() {
                     let h = self.realm.new_array(acc);
@@ -3890,8 +3910,23 @@ impl<'a> Interp<'a> {
                 stack.push(Step::DestructureStart { target });
                 self.gen_eval_expr(value, stack, values)
             }
+            // `#name in <rhs>` — the ergonomic brand check where the RHS may hide a
+            // `yield`/`await` (`#field in (yield)`). Step the RHS so it suspends,
+            // then perform the brand check once it completes.
+            Expr::Binary {
+                op: crate::ast::BinaryOp::In,
+                left,
+                right,
+                ..
+            } if matches!(&**left, Expr::PrivateName(..)) => {
+                let Expr::PrivateName(name, _) = &**left else {
+                    unreachable!()
+                };
+                stack.push(Step::PrivateIn { name });
+                self.gen_eval_expr(right, stack, values)
+            }
             // `left <op> right` where a yield hides in an operand. The `#x in obj`
-            // brand check (a private left operand) is left to the fallback.
+            // brand check (a private left operand) is handled above.
             Expr::Binary {
                 op, left, right, ..
             } if !matches!(&**left, Expr::PrivateName(..)) => {

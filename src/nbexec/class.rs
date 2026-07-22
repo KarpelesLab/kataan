@@ -1942,6 +1942,11 @@ impl<'a> Interp<'a> {
                     return if m.kind == MethodKind::Get {
                         self.call_with_this(f, self.this_val, &[])
                     } else {
+                        // `make_method` leaves `name` empty; a method's own
+                        // `name` own-property is its key (SetFunctionName at class
+                        // definition), so `super.m.name === "m"` — install it on
+                        // this freshly synthesized method value.
+                        self.set_fn_name_owned(f, name);
                         Ok(f)
                     };
                 }

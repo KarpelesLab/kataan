@@ -308,7 +308,7 @@ impl<'a> Interp<'a> {
         &mut self,
         quasi: &'a crate::ast::TemplateLiteral,
     ) -> Result<Vec<NanBox>, ExecError> {
-        let cache_key = core::ptr::from_ref(quasi) as usize;
+        let cache_key = (core::ptr::from_ref(quasi) as usize, self.eval_site_epoch);
         let strings_arr = if let Some(cached) = self.tagged_template_cache.get(&cache_key) {
             *cached
         } else {
@@ -854,6 +854,15 @@ impl<'a> Interp<'a> {
                     && let Expr::PrivateName(name, _) = &**left
                 {
                     let obj = self.eval(right)?;
+                    // §13.10.1: `PrivateIdentifier in ShiftExpression` throws a
+                    // TypeError when the right-hand value is not an Object (rather
+                    // than reporting the brand as absent).
+                    if !self.is_object_value(obj) {
+                        let m = self.new_str(
+                            "Cannot use 'in' operator to check for a private name in a non-object",
+                        );
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
                     let key = self.private_access_key(name);
                     let present = obj.as_handle().map(Handle::from_raw).is_some_and(|h| {
                         self.realm.has_own(h, &key) || self.realm.accessor(h, &key).is_some()
@@ -1248,7 +1257,13 @@ impl<'a> Interp<'a> {
                 // caller's scope (so it can read/modify locals and hoist `var`s),
                 // inheriting the caller's strictness — unlike an indirect eval,
                 // which `call`/`call_native` route through the global scope.
+                //
+                // An *optional* call `eval?.(x)` is an OptionalChain, not the
+                // direct-eval syntactic form (`CallExpression : MemberExpression
+                // Arguments`), so it is always an *indirect* eval — fall through to
+                // `self.call` below.
                 if let Expr::Ident(id) = &**callee
+                    && !*call_optional
                     && id.name.as_ref() == "eval"
                     && f.as_handle()
                         .map(Handle::from_raw)

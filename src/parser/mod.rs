@@ -803,7 +803,13 @@ impl<'src> Parser<'src> {
                         span,
                     };
                 }
-                TokenKind::NoSubstitutionTemplate | TokenKind::TemplateHead if allow_call => {
+                TokenKind::NoSubstitutionTemplate | TokenKind::TemplateHead => {
+                    // A tagged template is a `MemberExpression` tail, so it binds
+                    // tighter than `new` and is consumed even while parsing a `new`
+                    // callee (`allow_call == false`): `new tag`\`x\`` parses as
+                    // `new (tag`\`x\``)`, with any following `(...)` becoming the
+                    // `new`'s arguments.
+                    //
                     // A tagged template may not appear in the tail of an optional
                     // chain (`a?.b`…`` ` is a SyntaxError); parentheses break the
                     // chain and make it legal again.
@@ -1629,8 +1635,20 @@ impl<'src> Parser<'src> {
         } else {
             inner
         };
-        if !tagged {
-            cook::validate_template_escapes(inner, tok.span)?;
+        // A segment with an escape that is not a valid TemplateEscapeSequence
+        // (legacy octal, `\8`/`\9`, malformed `\x`/`\u`) has no cooked value:
+        // an *untagged* template makes it an early SyntaxError, while a *tagged*
+        // template tolerates it and records `cooked: None` (TV = undefined), the
+        // `.raw` value staying present.
+        if let Err(e) = cook::validate_template_escapes(inner, tok.span) {
+            if !tagged {
+                return Err(e);
+            }
+            return Ok(TemplateElement {
+                raw: inner.into(),
+                cooked: None,
+                span: tok.span,
+            });
         }
         let cooked = cook::decode_escapes(inner, tok.span).ok().map(Into::into);
         Ok(TemplateElement {

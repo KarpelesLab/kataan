@@ -516,8 +516,17 @@ pub struct Interp<'a> {
     /// Cached well-known symbols (e.g. `Symbol.iterator`), created on first use.
     well_known_symbols: alloc::collections::BTreeMap<&'static str, NanBox>,
     /// The frozen template-strings object for each tagged-template site (keyed by the
-    /// AST node's address), so the same array is passed to the tag on every evaluation.
-    tagged_template_cache: alloc::collections::BTreeMap<usize, NanBox>,
+    /// AST node's address *and* the eval-site epoch, so the same array is passed to the
+    /// tag on every evaluation of that site). The epoch disambiguates distinct `eval`
+    /// calls whose identical source text shares one cached-and-leaked AST: per
+    /// GetTemplateObject each `eval` invocation is a *different* site, but a loop inside
+    /// one eval is the *same* site.
+    tagged_template_cache: alloc::collections::BTreeMap<(usize, u64), NanBox>,
+    /// The template-cache epoch of the currently executing eval body (0 at the top
+    /// level / outside any eval). Set for the dynamic extent of one `run_eval_body`.
+    eval_site_epoch: u64,
+    /// Monotonic counter minting a fresh `eval_site_epoch` for each eval invocation.
+    eval_site_counter: u64,
     /// `RegExp.prototype`, recorded at setup so RegExp instances can link their
     /// `[[Prototype]]` to it (and species lookups resolve cheaply).
     regexp_proto: Option<Handle>,
@@ -2959,6 +2968,8 @@ impl<'a> Interp<'a> {
             symbol_registry: alloc::collections::BTreeMap::new(),
             well_known_symbols: alloc::collections::BTreeMap::new(),
             tagged_template_cache: alloc::collections::BTreeMap::new(),
+            eval_site_epoch: 0,
+            eval_site_counter: 0,
             regexp_proto: None,
             main_regexp_proto: None,
             regexp_ctor: None,
@@ -5727,7 +5738,15 @@ impl<'a> Interp<'a> {
         // statements run, then restore the enclosing source so a subsequent
         // definition in the surrounding code slices the right text.
         let saved_src = core::mem::replace(&mut self.src, &program.source);
+        // Mint a fresh eval-site epoch for this invocation so its tagged-template
+        // sites are distinct from any other eval of the same (deduplicated) source:
+        // each `eval` call is a different site, while a loop inside this body reuses
+        // the epoch and so shares one cached template object.
+        let saved_epoch = self.eval_site_epoch;
+        self.eval_site_counter += 1;
+        self.eval_site_epoch = self.eval_site_counter;
         let result = self.run_eval_body_inner(program);
+        self.eval_site_epoch = saved_epoch;
         self.src = saved_src;
         result
     }
@@ -7035,7 +7054,10 @@ fn collect_block_function_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
 
         for stmt in stmts {
             match stmt {
-                Stmt::Function(f) if in_block => {
+                // Annex B.3.3 var-hoists only a *plain* FunctionDeclaration; a
+                // generator / async / async-generator declaration is purely
+                // lexical (block-scoped) and never gains an outer `var` binding.
+                Stmt::Function(f) if in_block && !f.is_generator && !f.is_async => {
                     if let Some(id) = &f.id
                         && !blocked.contains(&&*id.name)
                     {

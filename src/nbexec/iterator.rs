@@ -2654,6 +2654,25 @@ impl<'a> Interp<'a> {
             }
             return Ok(None);
         }
+        // An `arguments` object is array-like with `%Array.prototype.values%` as
+        // its `@@iterator`. Give `for…of` a **live** `%ArrayIterator%` (like a real
+        // array) so each step re-reads `length` and `Get`s the element through the
+        // mapped `[[Get]]` — observing a mid-loop element mutation or a
+        // mapped-parameter write. A user `@@iterator` override falls through to the
+        // generic protocol path below.
+        if array_live && self.realm.get_property(h, ARGS_MARKER).is_some() {
+            let resolved = self.find_iterator_fn(h)?;
+            let default_iter = self
+                .realm
+                .array_proto_intrinsic()
+                .and_then(|p| self.realm.get_property(p, "values"));
+            let is_default = matches!((resolved, default_iter), (Some(r), Some(d))
+                if r.as_handle().is_some() && r.as_handle() == d.as_handle());
+            if is_default {
+                let it = self.make_live_array_iterator(h, 1);
+                return Ok(it.as_handle().map(Handle::from_raw));
+            }
+        }
         if self.realm.string_value(h).is_some()
             || self.realm.collection_entries(h).is_some()
             || self.realm.get_property(h, GEN_BUF).is_some()
