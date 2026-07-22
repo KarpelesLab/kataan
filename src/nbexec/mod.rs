@@ -577,6 +577,12 @@ pub struct Interp<'a> {
     /// derived constructor that completes with this still set never called
     /// `super` — accessing `this` / the implicit return is a ReferenceError.
     pending_this_init: Option<(NanBox, u32)>,
+    /// The this-binding cell of the *derived* class constructor currently running
+    /// (a small realm object whose `THIS_CELL_SLOT` holds the live `this` value,
+    /// `tdz()` until `super(...)` binds it). Arrows created before `super(...)`
+    /// capture this handle so their lexical `this` tracks the binding rather than
+    /// snapshotting a dead-zone value. `None` outside a derived constructor.
+    this_cell: Option<Handle>,
     /// While a *parameter default value* is being evaluated, the BoundNames of
     /// the enclosing function's formal parameters (plus `arguments` for a
     /// non-arrow). A sloppy direct `eval("var X")` running here is an
@@ -2433,6 +2439,17 @@ const ARROW_NEW_TARGET: &str = "\u{0}antgt";
 const ARROW_HOME_OBJ: &str = "\u{0}ahome";
 const ARROW_HOME_CLASS: &str = "\u{0}ahcls";
 const ARROW_HOME_STATIC: &str = "\u{0}ahsta";
+/// Hidden slot on an arrow defined in a derived constructor *before* `super(...)`:
+/// a handle to the enclosing constructor's this-binding cell (see `THIS_CELL_SLOT`).
+/// The arrow's lexical `this` is a *live* reference to that binding, still in its
+/// temporal dead zone at definition, so the value is resolved through the cell on
+/// every call — throwing while `this` is unbound, yielding the instance after
+/// `super()` binds it. Present only when `ARROW_THIS` would have snapshotted a TDZ.
+const ARROW_THIS_CELL: &str = "\u{0}acell";
+/// Hidden slot on a derived constructor's this-binding cell holding the current
+/// `this` value (`tdz()` until `super(...)` runs). Read by arrows that captured the
+/// cell (`ARROW_THIS_CELL`).
+const THIS_CELL_SLOT: &str = "\u{0}tcell";
 /// Reserved hidden keys for an eager generator's result object: the buffer of
 /// yielded values and the current `next()` cursor.
 /// Sentinel description for a `Symbol()` created with no argument (so its
@@ -2902,6 +2919,7 @@ impl<'a> Interp<'a> {
             classes: Vec::new(),
             src: "",
             pending_this_init: None,
+            this_cell: None,
             class_member_keys: Vec::new(),
             builtin_iter_protos: alloc::collections::BTreeMap::new(),
             class_statics: Vec::new(),

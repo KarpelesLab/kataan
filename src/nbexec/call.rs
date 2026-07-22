@@ -1525,7 +1525,20 @@ impl<'a> Interp<'a> {
             let saved_home_obj = self.current_home_object;
             let saved_home = self.current_home;
             let saved_home_static = self.current_home_static;
-            if let Some(t) = self.realm.get_property(handle, ARROW_THIS) {
+            // An arrow captured in a derived constructor before `super(...)` reads
+            // its lexical `this` live from the constructor's this-binding cell (still
+            // `tdz()` until `super()` runs); otherwise it uses the snapshot.
+            if let Some(cell) = self
+                .realm
+                .get_property(handle, ARROW_THIS_CELL)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+            {
+                self.this_val = self
+                    .realm
+                    .get_property(cell, THIS_CELL_SLOT)
+                    .unwrap_or_else(NanBox::tdz);
+            } else if let Some(t) = self.realm.get_property(handle, ARROW_THIS) {
                 self.this_val = t;
             }
             if let Some(nt) = self.realm.get_property(handle, ARROW_NEW_TARGET) {
@@ -3877,6 +3890,55 @@ impl<'a> Interp<'a> {
             let saved_tag = self.realm.class_tag(instance);
             let fresh = self.construct_native_base(native_id, args, self.new_target)?;
             self.realm.swap_cell_state(instance, fresh);
+            if let Some(tag) = saved_tag {
+                self.realm.set_class_tag(instance, tag);
+            }
+            return Ok(());
+        }
+        // `class F extends Function {}` (or the `%GeneratorFunction%` /
+        // `%AsyncFunction%` / `%AsyncGeneratorFunction%` families): `super(...args)`
+        // runs the dynamic-function constructor over the `super` arguments (the last
+        // is the body, the rest the parameter list) with `new.target` for the built
+        // function's `[[Prototype]]`, then transplants the resulting callable cell
+        // into the placeholder `instance` so the shared `this` handle *becomes* a
+        // real function — callable, with its own `.prototype`, `name`, and `length`
+        // — while keeping its identity and class tag (analogous to the cell-native
+        // path above, but the "cell" here is a function).
+        if matches!(
+            native_id,
+            N_FUNCTION
+                | N_GENERATOR_FUNCTION_CTOR
+                | N_ASYNC_FUNCTION_CTOR
+                | N_ASYNC_GENERATOR_FUNCTION_CTOR
+        ) {
+            let saved_tag = self.realm.class_tag(instance);
+            let new_target = self.new_target;
+            let fresh = match native_id {
+                N_FUNCTION => {
+                    self.build_function_constructor(args, new_target, NanBox::undefined())
+                }
+                N_GENERATOR_FUNCTION_CTOR => self.build_function_constructor_kw(
+                    args,
+                    "function*",
+                    new_target,
+                    NanBox::undefined(),
+                ),
+                N_ASYNC_FUNCTION_CTOR => self.build_function_constructor_kw(
+                    args,
+                    "async function",
+                    new_target,
+                    NanBox::undefined(),
+                ),
+                _ => self.build_function_constructor_kw(
+                    args,
+                    "async function*",
+                    new_target,
+                    NanBox::undefined(),
+                ),
+            }?;
+            if let Some(fresh_h) = fresh.as_handle().map(Handle::from_raw) {
+                self.realm.swap_cell_state(instance, fresh_h);
+            }
             if let Some(tag) = saved_tag {
                 self.realm.set_class_tag(instance, tag);
             }

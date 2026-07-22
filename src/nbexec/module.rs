@@ -1348,7 +1348,13 @@ impl<'a> Interp<'a> {
                         Ok(())
                     }
                     Stmt::Class(class) => {
-                        let value = self.make_class(class)?;
+                        // NamedEvaluation gives the anonymous class the name "default"
+                        // *before* its static initializers run, so a
+                        // `static f = this.name` observes "default" (not "").
+                        self.pending_class_name = Some("default");
+                        let value = self.make_class(class);
+                        self.pending_class_name = None;
+                        let value = value?;
                         self.set_fn_name(value, "default");
                         self.current.declare_const(DEFAULT_LOCAL, value);
                         Ok(())

@@ -956,23 +956,24 @@ impl<'a> Interp<'a> {
                 // instance.
                 if matches!(&**callee, Expr::Super(_)) {
                     let args = self.eval_args(arguments)?;
+                    // SuperCall evaluation order: after ArgumentListEvaluation,
+                    // GetSuperConstructor + its IsConstructor check, then
+                    // `Construct(superCtor, args, newTarget)`, and only *then*
+                    // `BindThisValue` — whose "already initialized" check (a second
+                    // `super()`) is a ReferenceError thrown *after* the base
+                    // constructor has run. So even a doomed second `super()` still
+                    // evaluates its arguments and invokes the base constructor (whose
+                    // side effects therefore happen); its result is then discarded.
+                    //
                     // The instance + this class's id are stashed in
                     // `pending_this_init` while `this` is in its TDZ (set by the
-                    // derived constructor). Calling `super()` a second time leaves
-                    // it `None` → ReferenceError.
-                    let Some((inst_val, derived_cid)) = self.pending_this_init else {
-                        let m = self.new_str("Super constructor may only be called once");
-                        return Err(ExecError::Throw(
-                            self.make_error(N_REFERENCE_ERROR, Some(m)),
-                        ));
-                    };
-                    let inst = inst_val.as_handle().map(Handle::from_raw);
-                    // GetSuperConstructor = GetPrototypeOf(the active derived
-                    // constructor). If it has been reassigned
-                    // (`Object.setPrototypeOf(Derived, notACtor)`) to something that is
-                    // not a constructor, `super(...)` throws a TypeError — *after*
-                    // ArgumentListEvaluation (above), per the SuperCall evaluation order.
-                    if let Some(cval) = self.class_handles.get(derived_cid as usize).copied()
+                    // derived constructor). A second `super()` leaves it `None`.
+                    let pending = self.pending_this_init;
+                    // GetSuperConstructor reassigned-to-non-constructor check (only the
+                    // first, binding, `super()` reaches BindThisValue without throwing
+                    // for another reason; a second one is a ReferenceError regardless).
+                    if let Some((_, derived_cid)) = pending
+                        && let Some(cval) = self.class_handles.get(derived_cid as usize).copied()
                         && let Some(ch) = cval.as_handle().map(Handle::from_raw)
                     {
                         let super_ctor = self
@@ -984,40 +985,102 @@ impl<'a> Interp<'a> {
                             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                         }
                     }
-                    // Bind `this` and clear the pending marker BEFORE invoking the
-                    // parent constructor — the parent's body (a base class, or a
-                    // further-derived one after its own `super`) reads `this`, and
-                    // a second `super()` must now see `None` and error.
+                    // Resolve the super-constructor binding. Normally it is the
+                    // transient `pending_super*` set while the enclosing derived
+                    // constructor runs. But an arrow `() => super()` can be invoked
+                    // *after* that constructor has returned (those transients are then
+                    // cleared) — recover the binding from the arrow's lexical home
+                    // class so the base still runs (SuperCall step 7) before
+                    // BindThisValue throws.
+                    let have_pending = self.pending_super.is_some()
+                        || self.pending_super_native.is_some()
+                        || self.pending_super_fn.is_some();
+                    let (eff_super, eff_native, eff_fn) = if have_pending {
+                        (
+                            self.pending_super.clone(),
+                            self.pending_super_native,
+                            self.pending_super_fn,
+                        )
+                    } else if let Some(home) = self.current_home {
+                        let native = self
+                            .class_native_super
+                            .get(home as usize)
+                            .copied()
+                            .flatten();
+                        let fnp = self.class_fn_super.get(home as usize).copied().flatten();
+                        let classp = if native.is_none()
+                            && fnp.is_none()
+                            && let Some(class) = self.classes.get(home as usize).copied()
+                        {
+                            let cenv = self.current.clone();
+                            self.resolve_super(class, &cenv)?
+                        } else {
+                            None
+                        };
+                        (classp, native, fnp)
+                    } else {
+                        (None, None, None)
+                    };
+                    // The object the base constructor initializes: the derived
+                    // instance on the first `super()`; a throwaway on a second one
+                    // (the base still runs, but its result is discarded and
+                    // BindThisValue then throws).
+                    let (inst_val, first_call) = match pending {
+                        Some((iv, _)) => (iv, true),
+                        None => (NanBox::handle(self.realm.new_object().to_raw()), false),
+                    };
+                    let inst = inst_val.as_handle().map(Handle::from_raw);
+                    // Point `this` at the object under construction and clear the
+                    // pending marker BEFORE invoking the base constructor — the base's
+                    // body reads `this`, and a nested second `super()` must now see
+                    // `None`. On a second `super()` the already-bound `this` is saved
+                    // and restored after the (discarded) base construction.
+                    let saved_this_val = self.this_val;
                     self.this_val = inst_val;
                     self.pending_this_init = None;
-                    // If the super constructor returns an Object, that object
-                    // becomes the derived `this` (`SuperCall` → `BindThisValue`),
-                    // replacing the freshly-allocated instance — and this class's
-                    // field initializers then run on it.
-                    let returned = if let Some((pid, penv)) = self.pending_super.clone() {
-                        match inst {
-                            Some(h) => self.run_constructor(pid, &penv, h, &args)?,
-                            None => None,
+                    // `Construct(superCtor, args, newTarget)`. An Object return rebinds
+                    // `this` (`BindThisValue`), replacing the allocated instance.
+                    let base_result = (|| -> Result<Option<NanBox>, ExecError> {
+                        if let Some((pid, penv)) = eff_super {
+                            match inst {
+                                Some(h) => self.run_constructor(pid, &penv, h, &args),
+                                None => Ok(None),
+                            }
+                        } else if let Some(nid) = eff_native {
+                            // `super(...)` reaching a native constructor (`extends Error`).
+                            if let Some(h) = inst {
+                                self.apply_native_super(nid, h, &args)?;
+                            }
+                            Ok(None)
+                        } else if let Some(fnp) = eff_fn {
+                            // `super(...)` reaching an ordinary-function superclass:
+                            // `[[Construct]](args, newTarget)` — the SuperCall's
+                            // newTarget is the derived constructor's own `new.target`
+                            // (so a `Reflect.construct(Derived, …, NT)` threads `NT`
+                            // into the base function's `new.target`). Its object return
+                            // overrides `this`.
+                            self.pending_new_target = Some(self.new_target);
+                            self.call_with_this(fnp, inst_val, &args).map(Some)
+                        } else {
+                            Err(ExecError::Unsupported(
+                                "super outside a derived constructor",
+                            ))
                         }
-                    } else if let Some(nid) = self.pending_super_native {
-                        // `super(...)` reaching a native constructor (`extends Error`).
-                        if let Some(h) = inst {
-                            self.apply_native_super(nid, h, &args)?;
-                        }
-                        None
-                    } else if let Some(fnp) = self.pending_super_fn {
-                        // `super(...)` reaching an ordinary-function superclass:
-                        // `[[Construct]](args, newTarget)` — the SuperCall's newTarget
-                        // is the derived constructor's own `new.target` (so a
-                        // `Reflect.construct(Derived, …, NT)` threads `NT` into the base
-                        // function's `new.target`). Its object return overrides `this`.
-                        self.pending_new_target = Some(self.new_target);
-                        Some(self.call_with_this(fnp, inst_val, &args)?)
-                    } else {
-                        return Err(ExecError::Unsupported(
-                            "super outside a derived constructor",
+                    })();
+                    if !first_call {
+                        // Second `super()`: the base ran (side effects happened) on the
+                        // throwaway; a base error still precedes BindThisValue, so
+                        // propagate it first, then throw the "already initialized"
+                        // ReferenceError. `this` and the field initializers are
+                        // untouched (fields run exactly once, on the first `super()`).
+                        base_result?;
+                        self.this_val = saved_this_val;
+                        let m = self.new_str("Super constructor may only be called once");
+                        return Err(ExecError::Throw(
+                            self.make_error(N_REFERENCE_ERROR, Some(m)),
                         ));
-                    };
+                    }
+                    let returned = base_result?;
                     // A returned *object* (not a primitive wrapper handle) rebinds
                     // `this`; the field initializers below then target it.
                     let this_handle = match self.constructor_return_handle(returned) {
@@ -1027,8 +1090,20 @@ impl<'a> Interp<'a> {
                         }
                         None => inst,
                     };
-                    // This class's field initializers run *after* `super()` returns.
-                    if let Some(h) = this_handle {
+                    // `this` is now initialized (BindThisValue): publish it into the
+                    // this-binding cell so an arrow captured before `super()` (whose
+                    // lexical `this` was in its TDZ) observes the bound value. Done
+                    // *after* the base constructor so such an arrow still sees TDZ
+                    // while the base's own body runs.
+                    if let Some(cell) = self.this_cell {
+                        self.realm
+                            .set_hidden_property(cell, THIS_CELL_SLOT, self.this_val);
+                    }
+                    // This class's field initializers run *after* `super()` returns —
+                    // exactly once (a second `super()` took the branch above).
+                    if let Some((_, derived_cid)) = pending
+                        && let Some(h) = this_handle
+                    {
                         self.init_instance_fields(derived_cid, h)?;
                     }
                     // `SuperCall` evaluates to the newly-bound `this` value
@@ -1291,6 +1366,12 @@ impl<'a> Interp<'a> {
                                                 let nm = self.new_str(&name);
                                                 if let Some(h) = v.as_handle().map(Handle::from_raw)
                                                 {
+                                                    // The class carries a readonly `name`
+                                                    // `""` placeholder from creation, and
+                                                    // `set_property` no-ops on a readonly
+                                                    // property — clear the flag first so the
+                                                    // NamedEvaluation name actually lands.
+                                                    self.realm.clear_readonly_property(h, "name");
                                                     self.realm.set_property(h, "name", nm);
                                                     self.realm.mark_hidden(h, "name");
                                                     self.realm.set_readonly_property(h, "name");
@@ -1381,7 +1462,17 @@ impl<'a> Interp<'a> {
                                 if let Some(nm) = self.method_display_name(&k, kind)
                                     && self.fn_name_unset(fh)
                                 {
-                                    self.install_fn_name_length(fh, &nm, value.params.len() as u32);
+                                    // `length` is the ExpectedArgumentCount: params
+                                    // before the first one with a default / rest. A
+                                    // setter with a defaulted param (`set m(x = 42)`)
+                                    // therefore has `length` 0, not 1.
+                                    let len = value
+                                        .params
+                                        .iter()
+                                        .take_while(|p| p.default.is_none() && !p.rest)
+                                        .count()
+                                        as u32;
+                                    self.install_fn_name_length(fh, &nm, len);
                                 }
                             }
                             if *is_getter {
@@ -1852,6 +1943,16 @@ impl<'a> Interp<'a> {
             // resolves them from here rather than the call site.
             let h = Handle::from_raw(raw);
             self.realm.set_hidden_property(h, ARROW_THIS, self.this_val);
+            // Inside a derived constructor before `super(...)`, the lexical `this`
+            // is still in its temporal dead zone. Snapshotting `tdz()` would make
+            // the arrow throw forever; instead capture the constructor's this-binding
+            // *cell* so a call resolves the (later-bound) value live.
+            if self.this_val.is_tdz()
+                && let Some(cell) = self.this_cell
+            {
+                self.realm
+                    .set_hidden_property(h, ARROW_THIS_CELL, NanBox::handle(cell.to_raw()));
+            }
             self.realm
                 .set_hidden_property(h, ARROW_NEW_TARGET, self.new_target);
             if let Some(home) = self.current_home_object {

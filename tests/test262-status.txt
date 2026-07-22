@@ -301,16 +301,11 @@ intl402/TypedArray/prototype/toLocaleString/calls-toLocaleString-number-elements
 language/arguments-object/10.6-13-a-2.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/arguments-object/10.6-13-a-3.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/destructuring/binding/keyed-destructuring-property-reference-target-evaluation-order-with-bindings.js  # [sloppy] expected pass, Runtime Test262Error: Actual [binding::source, binding::sourceKey, sourceKey, get source, binding::defaultValue] and expected [binding::source, binding::sourceKey, sourceKey, binding::varTarget, get source, binding::defaultValue] should have the same contents. 
-language/expressions/arrow-function/lexical-super-call-from-within-constructor.js  # [sloppy] expected pass, Runtime Test262Error: The value of `count` is `2`, because S7 of `SuperCall : super Arguments` will call the super constructor. Expected SameValue(«1», «2») to be true
 language/expressions/arrow-function/syntax/arrowparameters-bindingidentifier-yield.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: expected a semicolon or newline, found Arrow (at 7061..7063)
 language/expressions/assignment/fn-name-lhs-cover.js  # [sloppy] expected pass, Runtime Test262Error: name descriptor value should be ; name value should be 
 language/expressions/call/eval-realm-indirect.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"inside"», «"outside"») to be true
 language/expressions/class/accessor-name-inst-computed-yield-expr.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«undefined», «"get yield"») to be true
 language/expressions/class/accessor-name-static-computed-yield-expr.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«undefined», «"get yield"») to be true
-language/expressions/class/constructor-this-tdz-during-initializers.js  # [sloppy] expected pass, Runtime ReferenceError: Must call super constructor before accessing 'this' or returning from derived constructor
-language/expressions/class/elements/class-name-static-initializer-default-export.js  # expected pass, Runtime Test262Error: Expected SameValue(«""», «"default"») to be true
-language/expressions/class/elements/fields-run-once-on-double-super.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«1», «2») to be true
-language/expressions/class/subclass-builtins/subclass-Function.js  # [sloppy] expected pass, Runtime Test262Error: Expected true but got false
 language/expressions/delete/11.4.1-4.a-8.js  # [sloppy] expected pass, Runtime Test262Error: d Expected SameValue(«false», «true») to be true
 language/expressions/division/no-magic-asi-from-block-eval.js  # [sloppy] expected pass, Runtime SyntaxError: SyntaxError: unterminated regular expression literal (at 11..13)
 language/expressions/division/no-magic-asi.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: unterminated regular expression literal (line terminator) (at 7268..7271)
@@ -327,11 +322,9 @@ language/expressions/import.meta/import-meta-is-an-ordinary-object.js  # expecte
 language/expressions/in/private-field-rhs-non-object.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«null», «null») to be false
 language/expressions/in/private-field-rhs-yield-present.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«undefined», «true») to be true
 language/expressions/object/accessor-name-computed-yield-expr.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«undefined», «"get yield"») to be true
-language/expressions/object/fn-name-class.js  # [sloppy] expected pass, Runtime Test262Error: name descriptor value should be [test262]; name value should be [test262]
 language/expressions/object/method-definition/computed-property-name-yield-expression.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«20», «10») to be true
 language/expressions/object/method-definition/generator-prop-name-yield-expr.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«[object Object]», «null») to be true
 language/expressions/object/method-definition/name-prop-name-yield-expr.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«[object Object]», «null») to be true
-language/expressions/object/setter-length-dflt.js  # [sloppy] expected pass, Runtime Test262Error: length descriptor value should be 0; length value should be 0
 language/expressions/optional-chaining/eval-optional-call.js  # [sloppy] expected pass, Runtime Test262Error: fn() returns "global" value from indirect eval Expected SameValue(«"local"», «"global"») to be true
 language/expressions/optional-chaining/member-expression.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"a"», «""») to be true
 language/expressions/postfix-decrement/operator-x-postfix-decrement-calls-putvalue-lhs-newvalue-.js  # [sloppy] expected pass, Runtime Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all
@@ -386,16 +379,6 @@ language/statements/await-using/await-using-implies-await-if-evaluated.js  # [sl
 language/statements/await-using/syntax/await-using-invalid-assignment-statement-body-for-of.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Expected a TypeError to be thrown asynchronously but no exception w)
 language/statements/class/accessor-name-inst-computed-yield-expr.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«undefined», «"get yield"») to be true
 language/statements/class/accessor-name-static-computed-yield-expr.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«undefined», «"get yield"») to be true
-language/statements/class/definition/this-check-ordering.js  # [sloppy] expected pass, Runtime Test262Error: The value of `baseCalled` is `1` Expected SameValue(«0», «1») to be true
-language/statements/class/subclass-builtins/subclass-Function.js  # [sloppy] expected pass, Runtime Test262Error: Expected true but got false
-language/statements/class/subclass/builtin-objects/Function/instance-length.js  # [sloppy] expected pass, Runtime Test262Error: length should be an own property
-language/statements/class/subclass/builtin-objects/Function/instance-name.js  # [sloppy] expected pass, Runtime Test262Error: name should be an own property
-language/statements/class/subclass/builtin-objects/Function/regular-subclassing.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-language/statements/class/subclass/builtin-objects/Function/super-must-be-called.js  # [sloppy] expected pass, Runtime Test262Error: Expected true but got false
-language/statements/class/subclass/builtin-objects/GeneratorFunction/instance-length.js  # [sloppy] expected pass, Runtime Test262Error: length should be an own property
-language/statements/class/subclass/builtin-objects/GeneratorFunction/instance-name.js  # [sloppy] expected pass, Runtime Test262Error: name should be an own property
-language/statements/class/subclass/builtin-objects/GeneratorFunction/instance-prototype.js  # [sloppy] expected pass, Runtime TypeError: Object.keys called on null or undefined
-language/statements/class/subclass/builtin-objects/GeneratorFunction/regular-subclassing.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/statements/const/syntax/const-invalid-assignment-statement-body-for-in.js  # [sloppy] expected pass, Runtime Test262Error: Expected a TypeError to be thrown but no exception was thrown at all
 language/statements/const/syntax/const-invalid-assignment-statement-body-for-of.js  # [sloppy] expected pass, Runtime Test262Error: Expected a TypeError to be thrown but no exception was thrown at all
 language/statements/for-await-of/async-from-sync-iterator-continuation-abrupt-completion-get-constructor.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [start, never reached, tick 1, tick 2] and expected [start, )

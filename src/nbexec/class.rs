@@ -923,9 +923,28 @@ impl<'a> Interp<'a> {
                 .and_then(|v| v.as_handle())
                 .map(Handle::from_raw);
         }
+        // The dynamic-function family constructors `%GeneratorFunction%`,
+        // `%AsyncFunction%`, `%AsyncGeneratorFunction%` are not bare globals
+        // (reached only via `Object.getPrototypeOf(fn).constructor`), so resolve
+        // each through its prototype's `constructor` back-link. `%Function%` itself
+        // is a bare global and falls through to the scan below.
+        let dyn_fn_proto = match id {
+            N_GENERATOR_FUNCTION_CTOR => self.generator_function_prototype(),
+            N_ASYNC_FUNCTION_CTOR => self.async_function_prototype(),
+            N_ASYNC_GENERATOR_FUNCTION_CTOR => self.async_generator_function_prototype(),
+            _ => None,
+        };
+        if let Some(proto) = dyn_fn_proto {
+            return self
+                .realm
+                .get_property(proto, "constructor")
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw);
+        }
         // Other single-name natives: resolve by scanning the well-known global
         // bindings for the callable whose native id matches.
         for name in [
+            "Function",
             "Iterator",
             "Map",
             "Set",
@@ -1406,6 +1425,10 @@ impl<'a> Interp<'a> {
         let saved_lexical_home = self.current_lexical_home.replace(class_id);
         let saved_home_static = core::mem::replace(&mut self.current_home_static, false);
         let saved_home_obj = self.current_home_object.replace(instance);
+        // A derived constructor's `this` binding is initialized late (by `super()`);
+        // its cell (allocated in the derived branch below) is restored here so a
+        // nested `super()` reaching a further-derived base doesn't leak its cell.
+        let saved_this_cell = self.this_cell;
         let result = (|| {
             let ctor = class.body.iter().find_map(|m| match m {
                 ClassMember::Method(m) if m.kind == MethodKind::Constructor => Some(m),
@@ -1430,6 +1453,13 @@ impl<'a> Interp<'a> {
                     let (poisoned_this, saved_pending) = if is_derived {
                         let inst = NanBox::handle(instance.to_raw());
                         let sp = self.pending_this_init.replace((inst, class_id));
+                        // Allocate this constructor's this-binding cell (holds `tdz()`
+                        // until `super()` runs). Arrows created before `super()`
+                        // capture it so their lexical `this` tracks the binding.
+                        let cell = self.realm.new_object();
+                        self.realm
+                            .set_hidden_property(cell, THIS_CELL_SLOT, NanBox::tdz());
+                        self.this_cell = Some(cell);
                         (
                             Some(core::mem::replace(&mut self.this_val, NanBox::tdz())),
                             sp,
@@ -1572,6 +1602,7 @@ impl<'a> Interp<'a> {
         self.current_lexical_home = saved_lexical_home;
         self.current_home_static = saved_home_static;
         self.current_home_object = saved_home_obj;
+        self.this_cell = saved_this_cell;
         result
     }
 
