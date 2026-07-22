@@ -176,6 +176,20 @@ impl<'a> Interp<'a> {
 
     /// Registers a class and allocates a class value capturing the current scope.
     pub(crate) fn make_class(&mut self, class: &'a Class) -> Result<NanBox, ExecError> {
+        self.make_class_with_keys(class, None)
+    }
+
+    /// Like [`Interp::make_class`], but with the class's *computed member keys*
+    /// optionally supplied pre-evaluated (`idx → storage-key`). The generator
+    /// step-machine uses this: it evaluates the computed keys itself (so a `yield`/
+    /// `await` in one suspends) and passes the results here, rather than having the
+    /// definition-time key-evaluation loop re-run — and re-suspend, which it cannot —
+    /// them. `None` restores the ordinary eager behavior.
+    pub(crate) fn make_class_with_keys(
+        &mut self,
+        class: &'a Class,
+        precomputed_keys: Option<&alloc::collections::BTreeMap<usize, String>>,
+    ) -> Result<NanBox, ExecError> {
         let class_id = self.classes.len() as u32;
         // The home class of the code evaluating this definition is this class's
         // *lexical parent* — captured now, before the static-member loop below may
@@ -240,7 +254,13 @@ impl<'a> Interp<'a> {
                         ClassMember::StaticBlock { .. } => continue,
                     };
                     if matches!(key, PropertyKey::Computed(_)) {
-                        let k = self.eval_prop_key(key)?;
+                        // A pre-evaluated key (supplied by the generator step-machine,
+                        // where the expression may have suspended on a `yield`) is
+                        // reused verbatim; otherwise evaluate it here, in source order.
+                        let k = match precomputed_keys.and_then(|m| m.get(&idx)) {
+                            Some(k) => k.clone(),
+                            None => self.eval_prop_key(key)?,
+                        };
                         // A *static* class element whose computed key evaluates to
                         // "prototype" is a TypeError (the constructor's `prototype` is
                         // a non-configurable own property that a class element may not

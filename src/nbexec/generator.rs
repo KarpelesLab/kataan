@@ -28,8 +28,8 @@
 
 use super::*;
 use crate::ast::{
-    Argument, ArrayElement, BindingTarget, CatchClause, Expr, ForInit, ForLeft, Ident, LogicalOp,
-    ObjectMember, PropertyKey, Stmt, SwitchCase, VarDeclKind,
+    Argument, ArrayElement, BindingTarget, CatchClause, Class, ClassMember, Expr, ForInit, ForLeft,
+    Ident, LogicalOp, MethodKind, ObjectMember, Param, PropertyKey, Stmt, SwitchCase, VarDeclKind,
 };
 
 /// How a generator is being resumed.
@@ -296,20 +296,46 @@ enum Step<'a> {
         spread: bool,
     },
     /// Build an object literal step-by-step onto `target`: `members[idx..]` remain.
-    /// Only entered for objects whose members are all data properties (static key,
-    /// non-function value) or spreads — see `object_lit_steppable`.
+    /// Handles every member form — data / method / accessor / spread / `__proto__`
+    /// and computed keys whose expression may `yield`/`await`. Entered for any
+    /// object literal that contains a reachable suspension (see the `Expr::Object`
+    /// arm of `gen_eval_expr`); each member's key (if computed) and value are driven
+    /// through `gen_eval_expr`, then defined with the same semantics as the eager
+    /// walker (`obj_define_property_member` / `obj_define_accessor_member`).
     ObjectLit {
         members: &'a [ObjectMember],
         idx: usize,
         target: Handle,
     },
-    /// Set the just-evaluated value (top of stack) as own property `key` of
-    /// `target`, then continue with the next object-literal member.
-    ObjectLitSet {
+    /// A computed-key property `{ [k]: v }`: the evaluated key is on top of the
+    /// stack — coerce it (`ToPropertyKey`), then evaluate the value for the pair.
+    ObjectLitPropKey {
+        members: &'a [ObjectMember],
+        idx: usize,
+        target: Handle,
+    },
+    /// Complete a property: its value is on top of the stack; define it on `target`
+    /// under storage key `key` (SetFunctionName / `[[HomeObject]]` for a method or
+    /// function-valued property), then continue with the next member.
+    ObjectLitPropVal {
         members: &'a [ObjectMember],
         idx: usize,
         target: Handle,
         key: String,
+    },
+    /// A computed-key accessor `{ get [k]() {} }`: the evaluated key is on top of
+    /// the stack — coerce it, create the get/set function, and pair it on `target`.
+    ObjectLitAccessorKey {
+        members: &'a [ObjectMember],
+        idx: usize,
+        target: Handle,
+    },
+    /// A `__proto__:` member whose value (top of stack) may have yielded: apply it
+    /// as `target`'s `[[Prototype]]` (only for an Object or `null`), then continue.
+    ObjectLitProtoSet {
+        members: &'a [ObjectMember],
+        idx: usize,
+        target: Handle,
     },
     /// Spread the just-evaluated value (top of stack) into `target`
     /// (CopyDataProperties), then continue with the next member.
@@ -318,6 +344,24 @@ enum Step<'a> {
         idx: usize,
         target: Handle,
     },
+    /// Evaluate a class's *computed member keys* in source order so a `yield`/
+    /// `await` in one suspends; `keys` accumulates `idx → storage-key`. When all
+    /// are done the class is built (`make_class_with_keys`) and its value pushed.
+    ClassKeys {
+        class: &'a Class,
+        idx: usize,
+        keys: alloc::collections::BTreeMap<usize, String>,
+    },
+    /// Store the just-evaluated computed key (top of stack) for the class member at
+    /// `idx` (running the `static`-named-`prototype` TypeError check), then continue.
+    ClassKeyStore {
+        class: &'a Class,
+        idx: usize,
+        keys: alloc::collections::BTreeMap<usize, String>,
+    },
+    /// A class *declaration*: the finished class value is on top of the stack;
+    /// bind it to the class name (if any), leaving no expression value.
+    ClassDeclBind { class: &'a Class },
     /// Destructure `value` into assignment `target` (an array/object pattern, a
     /// defaulted target, or a leaf) — a `yield` in a default initializer suspends.
     /// The iterator pull / property reads themselves are synchronous.
@@ -1629,9 +1673,11 @@ fn stmt_has_yield(s: &Stmt) -> bool {
         | Stmt::Continue { .. }
         | Stmt::Debugger { .. }
         | Stmt::Function(_)
-        | Stmt::Class(_)
         | Stmt::Import(_)
         | Stmt::Export(_) => false,
+        // A class declaration with a `yield`-bearing computed member key must be
+        // driven through the machine so the key suspends (`class C { get [yield](){} }`).
+        Stmt::Class(c) => class_computed_key_has_yield(c),
         Stmt::Var(decl) => decl
             .declarations
             .iter()
@@ -1726,8 +1772,12 @@ fn stmt_has_yield(s: &Stmt) -> bool {
 fn expr_has_yield(e: &Expr) -> bool {
     match e {
         Expr::Yield { .. } => true,
-        // Boundaries: a nested function/arrow/class introduces its own context.
-        Expr::Function(_) | Expr::Arrow(_) | Expr::Class(_) => false,
+        // Boundaries: a nested function/arrow introduces its own context.
+        Expr::Function(_) | Expr::Arrow(_) => false,
+        // A class body is a boundary (method bodies, field initializers have their
+        // own context), EXCEPT a *computed member key* (`class { get [yield]() {} }`)
+        // which is evaluated in the enclosing generator context at definition time.
+        Expr::Class(c) => class_computed_key_has_yield(c),
         Expr::Null(_)
         | Expr::Bool { .. }
         | Expr::Number { .. }
@@ -1754,7 +1804,9 @@ fn expr_has_yield(e: &Expr) -> bool {
                 key_has_yield(key) || expr_has_yield(value)
             }
             crate::ast::ObjectMember::Spread { value, .. } => expr_has_yield(value),
-            crate::ast::ObjectMember::Accessor { .. } => false,
+            // An accessor's function body is a boundary, but its *computed* key
+            // (`get [yield]()`) is evaluated in the enclosing generator context.
+            crate::ast::ObjectMember::Accessor { key, .. } => key_has_yield(key),
         }),
         Expr::Member {
             object, property, ..
@@ -1797,6 +1849,19 @@ fn key_has_yield(k: &crate::ast::PropertyKey) -> bool {
     matches!(k, crate::ast::PropertyKey::Computed(e) if expr_has_yield(e))
 }
 
+/// Whether any of a class's *computed member keys* (`[expr]` on a method or
+/// field) contains a `yield`/`await` reachable in the enclosing generator/async
+/// context. Method bodies, field initializers, and the `extends` heritage are
+/// their own contexts / left to the eager fallback, so only the member keys are
+/// examined here.
+fn class_computed_key_has_yield(c: &crate::ast::Class) -> bool {
+    c.body.iter().any(|m| match m {
+        ClassMember::Method(m) => key_has_yield(&m.key),
+        ClassMember::Field(f) => key_has_yield(&f.key),
+        ClassMember::StaticBlock { .. } => false,
+    })
+}
+
 /// Whether a call `callee(args)` can be reified by the generator step-machine so a
 /// `yield` in an *argument* suspends. Restricted to *plain* calls: the callee must
 /// be yield-free (its reference is evaluated eagerly, in the correct pre-argument
@@ -1836,34 +1901,6 @@ fn method_call_reifiable(callee: &Expr) -> bool {
         return false;
     }
     !expr_has_yield(object) && !key_has_yield(property)
-}
-
-/// Whether an object literal can be built by the generator step-machine: every
-/// member must be a spread or a plain data property with a *static* key and a
-/// *non-function* value (and not the `__proto__:` prototype setter). Methods,
-/// accessors, computed keys, function-valued props, and `__proto__` need
-/// name/home/proto handling — and never reach a `yield` in their own value — so
-/// such objects defer to the one-shot `eval` fast path instead.
-fn object_lit_steppable(members: &[ObjectMember]) -> bool {
-    members.iter().all(|m| match m {
-        ObjectMember::Spread { .. } => true,
-        ObjectMember::Property {
-            key,
-            value,
-            shorthand,
-            ..
-        } => {
-            let static_key = !matches!(key, PropertyKey::Computed(_));
-            let fn_valued = matches!(
-                &**value,
-                Expr::Function(_) | Expr::Arrow(_) | Expr::Class(_)
-            );
-            let proto_setter =
-                !shorthand && matches!(key, PropertyKey::Ident(s) if &**s == "__proto__");
-            static_key && !fn_valued && !proto_setter
-        }
-        ObjectMember::Accessor { .. } => false,
-    })
 }
 
 // --- the stepping machine ----------------------------------------------------
@@ -1913,6 +1950,164 @@ impl<'a> Interp<'a> {
             // A disposer threw: it becomes the (possibly aggregated) completion.
             Err(e) => Completion::Throw(throw_value(e)),
         }
+    }
+
+    /// Whether an object-literal `Property` member is the `{ __proto__: v }`
+    /// prototype setter: the unquoted-identifier `__proto__` key, non-shorthand,
+    /// non-`Function` value (a quoted / computed / shorthand / method / `Function`
+    /// form makes an ordinary own `__proto__` data property instead). Mirrors the
+    /// eager object-literal evaluator's discrimination.
+    fn is_proto_member(key: &PropertyKey, value: &Expr, shorthand: bool) -> bool {
+        !shorthand
+            && !matches!(value, Expr::Function(_))
+            && matches!(key, PropertyKey::Ident(s) if &**s == "__proto__")
+    }
+
+    /// Sets a `{ __proto__: v }` member's effect on `target`: `[[Prototype]]` is
+    /// set only when `v` is an Object or `null`; any other primitive is ignored
+    /// (the object keeps its prototype and gains no own `__proto__` property).
+    fn obj_apply_proto(&mut self, target: Handle, v: NanBox) {
+        if matches!(v.unpack(), Unpacked::Null) {
+            self.realm.set_object_proto(target, None);
+        } else if self.is_object_value(v)
+            && let Some(p) = v.as_handle().map(Handle::from_raw)
+        {
+            self.realm.set_object_proto(target, Some(p));
+        }
+    }
+
+    /// Defines a data / method / function-valued object-literal property on
+    /// `target` under storage key `k` with the already-evaluated value `v` —
+    /// applying NamedEvaluation (SetFunctionName) and, for a concise method,
+    /// `[[HomeObject]]` / method-flag / source handling exactly as the inline
+    /// object-literal evaluator (`eval`'s `Expr::Object` arm) does. Shared by that
+    /// eager walker's stepped counterpart so a computed key that suspended on a
+    /// `yield` (its result being `k`) defines the member identically.
+    fn obj_define_property_member(
+        &mut self,
+        target: Handle,
+        member: &'a ObjectMember,
+        k: String,
+        v: NanBox,
+    ) -> Result<(), ExecError> {
+        let ObjectMember::Property {
+            key,
+            value,
+            method,
+            span: member_span,
+            ..
+        } = member
+        else {
+            unreachable!()
+        };
+        let (method, member_span) = (*method, *member_span);
+        let value: &'a Expr = value;
+        // A method / function-valued property is named after its key when
+        // otherwise anonymous (a Symbol computed key → `[description]`).
+        if matches!(value, Expr::Function(_) | Expr::Arrow(_) | Expr::Class(_)) {
+            match key {
+                PropertyKey::Ident(s) | PropertyKey::Str(s) => {
+                    self.set_fn_name(v, s);
+                }
+                PropertyKey::Computed(_) => {
+                    let params: &[Param] = match value {
+                        Expr::Function(f) => &f.params,
+                        _ => &[],
+                    };
+                    if let Some(name) = self.method_display_name(&k, MethodKind::Method)
+                        && v.as_handle()
+                            .map(Handle::from_raw)
+                            .is_some_and(|h| self.fn_name_unset(h))
+                    {
+                        if matches!(value, Expr::Class(_)) {
+                            let nm = self.new_str(&name);
+                            if let Some(h) = v.as_handle().map(Handle::from_raw) {
+                                self.realm.clear_readonly_property(h, "name");
+                                self.realm.set_property(h, "name", nm);
+                                self.realm.mark_hidden(h, "name");
+                                self.realm.set_readonly_property(h, "name");
+                            }
+                        } else {
+                            self.install_method_meta(v, &name, params);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A concise method records this object as its `[[HomeObject]]` (so
+        // `super.x` resolves through the object's prototype) and is a method.
+        if method
+            && matches!(value, Expr::Function(_))
+            && let Some(fv) = v.as_handle().map(Handle::from_raw)
+        {
+            self.set_fn_source(v, member_span);
+            self.realm
+                .set_hidden_property(fv, HOME_OBJECT, NanBox::handle(target.to_raw()));
+            if let Some((fid, _)) = self.realm.function_at(fv) {
+                self.functions[fid as usize].is_method = true;
+                if !self.functions[fid as usize].is_generator {
+                    self.demote_fn_prototype(fv);
+                }
+            }
+        }
+        self.realm.set_property(target, &k, v);
+        Ok(())
+    }
+
+    /// Defines a `get`/`set` accessor object-literal member (the member at
+    /// `members[idx]`, or any `ObjectMember::Accessor`) on `target` under storage
+    /// key `k` — creating the accessor function with `[[HomeObject]]`, method flag,
+    /// source, and SetFunctionName (`"get x"` / `"set x"`) exactly as the eager
+    /// evaluator does, then pairing it via `define_accessor`.
+    fn gen_define_accessor_member(
+        &mut self,
+        member: &'a ObjectMember,
+        target: Handle,
+        k: String,
+    ) -> Result<(), GenAbrupt> {
+        let ObjectMember::Accessor {
+            is_getter,
+            value,
+            span,
+            ..
+        } = member
+        else {
+            unreachable!()
+        };
+        let f = self.make_function(&value.params, Body::Block(&value.body), false, false);
+        self.set_fn_source(f, *span);
+        if let Some(fh) = f.as_handle().map(Handle::from_raw) {
+            if let Some((fid, _)) = self.realm.function_at(fh) {
+                self.functions[fid as usize].is_method = true;
+            }
+            self.demote_fn_prototype(fh);
+            self.realm
+                .set_hidden_property(fh, HOME_OBJECT, NanBox::handle(target.to_raw()));
+            let kind = if *is_getter {
+                MethodKind::Get
+            } else {
+                MethodKind::Set
+            };
+            if let Some(nm) = self.method_display_name(&k, kind)
+                && self.fn_name_unset(fh)
+            {
+                let len = value
+                    .params
+                    .iter()
+                    .take_while(|p| p.default.is_none() && !p.rest)
+                    .count() as u32;
+                self.install_fn_name_length(fh, &nm, len);
+            }
+        }
+        if *is_getter {
+            self.realm
+                .define_accessor(target, &k, f, NanBox::undefined());
+        } else {
+            self.realm
+                .define_accessor(target, &k, NanBox::undefined(), f);
+        }
+        Ok(())
     }
 
     fn gen_step(&mut self, stack: &mut Vec<Step<'a>>, values: &mut Vec<NanBox>) -> StepResult {
@@ -2459,16 +2654,45 @@ impl<'a> Interp<'a> {
                     return Ok(StepOut::Continue);
                 }
                 match &members[idx] {
-                    ObjectMember::Property { key, value, .. } => {
-                        // `object_lit_steppable` guarantees a static key here.
-                        let k = self.eval_prop_key(key).map_err(GenAbrupt::from)?;
-                        stack.push(Step::ObjectLitSet {
-                            members,
-                            idx,
-                            target,
-                            key: k,
-                        });
-                        self.gen_eval_expr(value, stack, values)
+                    ObjectMember::Property {
+                        key,
+                        value,
+                        shorthand,
+                        ..
+                    } => {
+                        // `{ __proto__: v }` — the unquoted-ident, non-shorthand,
+                        // non-`Function` form sets `[[Prototype]]`; evaluate the
+                        // value (it may yield) then apply it as the prototype.
+                        if Self::is_proto_member(key, value, *shorthand) {
+                            stack.push(Step::ObjectLitProtoSet {
+                                members,
+                                idx,
+                                target,
+                            });
+                            return self.gen_eval_expr(value, stack, values);
+                        }
+                        match key {
+                            PropertyKey::Computed(kexpr) => {
+                                // Evaluate the computed key first (it may yield);
+                                // the value is evaluated once the key completes.
+                                stack.push(Step::ObjectLitPropKey {
+                                    members,
+                                    idx,
+                                    target,
+                                });
+                                self.gen_eval_expr(kexpr, stack, values)
+                            }
+                            _ => {
+                                let k = self.eval_prop_key(key).map_err(GenAbrupt::from)?;
+                                stack.push(Step::ObjectLitPropVal {
+                                    members,
+                                    idx,
+                                    target,
+                                    key: k,
+                                });
+                                self.gen_eval_expr(value, stack, values)
+                            }
+                        }
                     }
                     ObjectMember::Spread { value, .. } => {
                         stack.push(Step::ObjectLitSpread {
@@ -2478,18 +2702,84 @@ impl<'a> Interp<'a> {
                         });
                         self.gen_eval_expr(value, stack, values)
                     }
-                    // Excluded by `object_lit_steppable`.
-                    ObjectMember::Accessor { .. } => unreachable!(),
+                    ObjectMember::Accessor { key, .. } => match key {
+                        PropertyKey::Computed(kexpr) => {
+                            stack.push(Step::ObjectLitAccessorKey {
+                                members,
+                                idx,
+                                target,
+                            });
+                            self.gen_eval_expr(kexpr, stack, values)
+                        }
+                        _ => {
+                            let k = self.eval_prop_key(key).map_err(GenAbrupt::from)?;
+                            self.gen_define_accessor_member(&members[idx], target, k)?;
+                            stack.push(Step::ObjectLit {
+                                members,
+                                idx: idx + 1,
+                                target,
+                            });
+                            Ok(StepOut::Continue)
+                        }
+                    },
                 }
             }
-            Step::ObjectLitSet {
+            Step::ObjectLitPropKey {
+                members,
+                idx,
+                target,
+            } => {
+                let kv = values.pop().unwrap_or(NanBox::undefined());
+                let key = self.coerce_property_key(kv).map_err(GenAbrupt::from)?;
+                let ObjectMember::Property { value, .. } = &members[idx] else {
+                    unreachable!()
+                };
+                stack.push(Step::ObjectLitPropVal {
+                    members,
+                    idx,
+                    target,
+                    key,
+                });
+                self.gen_eval_expr(value, stack, values)
+            }
+            Step::ObjectLitPropVal {
                 members,
                 idx,
                 target,
                 key,
             } => {
                 let v = values.pop().unwrap_or(NanBox::undefined());
-                self.realm.set_property(target, &key, v);
+                self.obj_define_property_member(target, &members[idx], key, v)
+                    .map_err(GenAbrupt::from)?;
+                stack.push(Step::ObjectLit {
+                    members,
+                    idx: idx + 1,
+                    target,
+                });
+                Ok(StepOut::Continue)
+            }
+            Step::ObjectLitAccessorKey {
+                members,
+                idx,
+                target,
+            } => {
+                let kv = values.pop().unwrap_or(NanBox::undefined());
+                let key = self.coerce_property_key(kv).map_err(GenAbrupt::from)?;
+                self.gen_define_accessor_member(&members[idx], target, key)?;
+                stack.push(Step::ObjectLit {
+                    members,
+                    idx: idx + 1,
+                    target,
+                });
+                Ok(StepOut::Continue)
+            }
+            Step::ObjectLitProtoSet {
+                members,
+                idx,
+                target,
+            } => {
+                let v = values.pop().unwrap_or(NanBox::undefined());
+                self.obj_apply_proto(target, v);
                 stack.push(Step::ObjectLit {
                     members,
                     idx: idx + 1,
@@ -2510,6 +2800,71 @@ impl<'a> Interp<'a> {
                     idx: idx + 1,
                     target,
                 });
+                Ok(StepOut::Continue)
+            }
+            Step::ClassKeys { class, idx, keys } => {
+                // Advance to the next computed member key; evaluate it through the
+                // machine so a `yield`/`await` in it suspends. Non-computed and
+                // static-block members are skipped (their keys need no evaluation).
+                let mut i = idx;
+                while i < class.body.len() {
+                    let key = match &class.body[i] {
+                        ClassMember::Method(m) => &m.key,
+                        ClassMember::Field(f) => &f.key,
+                        ClassMember::StaticBlock { .. } => {
+                            i += 1;
+                            continue;
+                        }
+                    };
+                    if let PropertyKey::Computed(kexpr) = key {
+                        stack.push(Step::ClassKeyStore {
+                            class,
+                            idx: i,
+                            keys,
+                        });
+                        return self.gen_eval_expr(kexpr, stack, values);
+                    }
+                    i += 1;
+                }
+                // All computed keys evaluated: build the class with them substituted.
+                let v = self
+                    .make_class_with_keys(class, Some(&keys))
+                    .map_err(GenAbrupt::from)?;
+                values.push(v);
+                Ok(StepOut::Continue)
+            }
+            Step::ClassKeyStore {
+                class,
+                idx,
+                mut keys,
+            } => {
+                let kv = values.pop().unwrap_or(NanBox::undefined());
+                let k = self.coerce_property_key(kv).map_err(GenAbrupt::from)?;
+                // A `static` element whose computed key evaluates to "prototype" is a
+                // TypeError, raised here (during key evaluation) as the spec requires.
+                let is_static = match &class.body[idx] {
+                    ClassMember::Method(m) => m.is_static,
+                    ClassMember::Field(f) => f.is_static,
+                    ClassMember::StaticBlock { .. } => false,
+                };
+                if is_static && k == "prototype" {
+                    let m =
+                        self.new_str("Classes may not have a static property named 'prototype'");
+                    return Err(GenAbrupt::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                keys.insert(idx, k);
+                stack.push(Step::ClassKeys {
+                    class,
+                    idx: idx + 1,
+                    keys,
+                });
+                Ok(StepOut::Continue)
+            }
+            Step::ClassDeclBind { class } => {
+                let v = values.pop().unwrap_or(NanBox::undefined());
+                if let Some(id) = &class.id {
+                    self.current.declare(&id.name, v);
+                }
                 Ok(StepOut::Continue)
             }
             Step::DestructureStart { target } => {
@@ -3276,6 +3631,19 @@ impl<'a> Interp<'a> {
                 self.exec_export(decl).map_err(GenAbrupt::from)?;
                 Ok(StepOut::Continue)
             }
+            // `class C { get [yield](){} }` (declaration) — step the class's
+            // computed member keys (so a `yield`/`await` in one suspends), build the
+            // class, then bind it to the class name. Reached only when a computed
+            // member key has a reachable suspension.
+            Stmt::Class(class) => {
+                stack.push(Step::ClassDeclBind { class });
+                stack.push(Step::ClassKeys {
+                    class,
+                    idx: 0,
+                    keys: alloc::collections::BTreeMap::new(),
+                });
+                Ok(StepOut::Continue)
+            }
             // Yield-bearing forms not otherwise handled fall back to one-shot
             // execution (no reachable yield will actually run).
             _ => match self.exec(stmt) {
@@ -3543,18 +3911,31 @@ impl<'a> Interp<'a> {
                 });
                 Ok(StepOut::Continue)
             }
-            // `{ a: yield b, ...yield s }` — step through members so a yield in a
-            // data value or spread operand suspends. Restricted to plain
-            // data-property (static key, non-function value) and spread members;
-            // methods/accessors/computed-keys/`__proto__`/function-valued props
-            // (which need name/home/proto handling and never reach a yield in their
-            // own value) defer to the one-shot fast path below.
-            Expr::Object { members, .. } if object_lit_steppable(members) => {
+            // `{ [yield k]: v, get [yield](){}, ...yield s }` — step through members
+            // so a `yield`/`await` in a computed key, a data value, or a spread
+            // operand suspends. Every member form is handled (data / method /
+            // accessor / `__proto__` / spread); each computed key and value is driven
+            // through the machine, then the member is defined with the same
+            // semantics as the eager walker. Reached only when a member has a
+            // reachable suspension (the `!expr_has_yield` short-circuit above).
+            Expr::Object { members, .. } => {
                 let target = self.realm.new_object();
                 stack.push(Step::ObjectLit {
                     members,
                     idx: 0,
                     target,
+                });
+                Ok(StepOut::Continue)
+            }
+            // `class C { get [yield](){} }` (expression) — evaluate the class's
+            // computed member keys through the machine so a `yield`/`await` in one
+            // suspends, then build the class. Reached only when a computed member key
+            // has a reachable suspension.
+            Expr::Class(class) => {
+                stack.push(Step::ClassKeys {
+                    class,
+                    idx: 0,
+                    keys: alloc::collections::BTreeMap::new(),
                 });
                 Ok(StepOut::Continue)
             }
