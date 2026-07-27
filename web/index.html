@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kataan — a JavaScript engine in pure Rust</title>
+    <meta
+      name="description"
+      content="Kataan is a JavaScript engine written in pure Rust. Run JavaScript in it here — the engine itself is compiled to WebAssembly and executing in this tab."
+    />
+    <link rel="icon" href="data:," />
+    <!-- Type is a progressive enhancement: if fonts do not load, the stacks in
+         styles.css fall back to the system sans and mono and the page is
+         unchanged in structure. Vue is vendored (see vendor/) because a failure
+         there would leave a blank page. -->
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+Condensed:wght@600&family=IBM+Plex+Sans:wght@400;600&display=swap"
+    />
+    <link rel="stylesheet" href="styles.css" />
+    <link rel="preload" href="kataan.wasm" as="fetch" crossorigin="anonymous" />
+  </head>
+  <body>
+    <div id="app" v-cloak>
+      <header class="masthead">
+        <div class="masthead__id">
+          <span class="wordmark">kataan</span>
+          <span class="tagline">a JavaScript engine in pure Rust</span>
+        </div>
+        <nav class="masthead__links">
+          <a href="#pipeline">Pipeline</a>
+          <a href="#conformance">Conformance</a>
+          <a href="#embed">Embed</a>
+          <a href="#build">This build</a>
+          <a class="ext" href="https://github.com/KarpelesLab/kataan">GitHub</a>
+        </nav>
+      </header>
+
+      <!-- The thesis: the engine is running in this tab. Type in it. -->
+      <main class="console" id="pipeline">
+        <div class="console__intro">
+          <h1>
+            Type JavaScript. Watch a Rust engine
+            <em>take it apart</em> and run it.
+          </h1>
+          <p>
+            The engine below is <code>kataan</code> compiled to WebAssembly.
+            Nothing is sent anywhere — the lexer, parser and bytecode VM are all
+            executing in this tab. Pick a stage to see the source as the engine
+            sees it.
+          </p>
+        </div>
+
+        <div class="rig">
+          <section class="pane pane--source">
+            <div class="pane__bar">
+              <span class="pane__label">source</span>
+              <div class="chips">
+                <button
+                  v-for="ex in examples"
+                  :key="ex.id"
+                  class="chip"
+                  :class="{ 'chip--on': ex.id === activeExample }"
+                  type="button"
+                  @click="load(ex)"
+                >
+                  {{ ex.label }}
+                </button>
+              </div>
+            </div>
+            <textarea
+              ref="editor"
+              v-model="source"
+              class="editor"
+              spellcheck="false"
+              autocapitalize="off"
+              autocomplete="off"
+              autocorrect="off"
+              aria-label="JavaScript source"
+              @keydown.ctrl.enter.prevent="run"
+              @keydown.meta.enter.prevent="run"
+              @keydown.tab.prevent="indent"
+            ></textarea>
+            <div class="pane__foot">
+              <button class="run" type="button" :disabled="busy" @click="run">
+                {{ busy ? 'Running…' : 'Run' }}
+                <kbd>{{ modKey }}↵</kbd>
+              </button>
+              <span v-if="note" class="note">{{ note }}</span>
+            </div>
+          </section>
+
+          <section class="pane pane--out">
+            <div class="pane__bar">
+              <span class="pane__label">stage</span>
+              <!-- The pipeline is the structure: source becomes tokens,
+                   then a tree, then a value. -->
+              <div class="stages" role="tablist" aria-label="Pipeline stage">
+                <button
+                  v-for="s in stages"
+                  :key="s.id"
+                  class="stage"
+                  :class="{ 'stage--on': s.id === stage }"
+                  type="button"
+                  role="tab"
+                  :aria-selected="s.id === stage"
+                  @click="select(s.id)"
+                >
+                  {{ s.label }}
+                </button>
+              </div>
+            </div>
+
+            <div class="out" :class="{ 'out--stale': stale }">
+              <p v-if="!booted" class="out__status">
+                {{ bootError || 'Fetching the engine…' }}
+              </p>
+              <template v-else-if="result">
+                <pre v-if="result.printed" class="out__printed">{{ result.printed }}</pre>
+                <pre
+                  class="out__value"
+                  :class="{ 'out__value--bad': !result.ok }"
+                >{{ result.value || '(no value)' }}</pre>
+              </template>
+              <p v-else class="out__status">Run the snippet to see this stage.</p>
+            </div>
+
+            <div class="pane__foot pane__foot--right">
+              <span v-if="result" class="timing">
+                {{ stageVerb }} in {{ result.ms.toFixed(1) }} ms
+              </span>
+            </div>
+          </section>
+        </div>
+      </main>
+
+      <section class="band" id="conformance">
+        <div class="band__head">
+          <p class="eyebrow">Conformance</p>
+          <h2>Measured against the whole of Test262, every night.</h2>
+          <p class="lede">
+            Not a curated subset — the full upstream tc39 suite, gated in CI by a
+            ledger of known failures that is only ever allowed to shrink. A
+            change that fails a test not already in the ledger does not land.
+          </p>
+        </div>
+
+        <dl class="figures">
+          <div class="figure figure--hero">
+            <dt>of Test262 passing</dt>
+            <dd>{{ conformance.rate }}</dd>
+            <p>{{ conformance.passing }} of {{ conformance.ran }} applicable tests</p>
+          </div>
+          <div class="figure">
+            <dt>known failures</dt>
+            <dd>{{ conformance.ledger }}</dd>
+            <p>every one is written down</p>
+          </div>
+          <div class="figure">
+            <dt>foreign code</dt>
+            <dd>0</dd>
+            <p>no C, anywhere on the path</p>
+          </div>
+        </dl>
+
+        <div class="remaining">
+          <p class="remaining__title">What is left, by cluster</p>
+          <ul class="bars">
+            <li v-for="c in conformance.clusters" :key="c.name">
+              <span class="bars__name">{{ c.name }}</span>
+              <span class="bars__track">
+                <span
+                  class="bars__fill"
+                  :style="{ width: (c.count / conformance.worst * 100) + '%' }"
+                ></span>
+              </span>
+              <span class="bars__count">{{ c.count }}</span>
+            </li>
+          </ul>
+          <p class="remaining__note">
+            Mostly CLDR locale data and the Atomics multi-agent scheduler. The
+            language itself is done.
+          </p>
+        </div>
+      </section>
+
+      <section class="band band--split" id="embed">
+        <div class="band__head">
+          <p class="eyebrow">Embedding</p>
+          <h2>Three ways in.</h2>
+          <p class="lede">
+            The same engine is a Rust library, a C library, and a command-line
+            tool. This page uses the C ABI, compiled to WebAssembly.
+          </p>
+        </div>
+        <div class="cards">
+          <article v-for="w in ways" :key="w.title" class="card">
+            <h3>{{ w.title }}</h3>
+            <pre class="card__code"><code>{{ w.code }}</code></pre>
+            <p>{{ w.note }}</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="band" id="build">
+        <div class="band__head">
+          <p class="eyebrow">This build</p>
+          <h2>What is and is not in the tab.</h2>
+        </div>
+        <div class="caveats">
+          <div class="caveat">
+            <h3>In</h3>
+            <p>
+              The language, the standard library, the in-house regular-expression
+              engine, <code>Intl</code>, <code>Temporal</code>, and BigInt. That
+              is {{ build.gzip }} over the wire — about
+              {{ build.intlShare }} of it is Unicode and CLDR data, which is what
+              makes <code>Intl</code> and the non-ISO calendars work.
+            </p>
+          </div>
+          <div class="caveat">
+            <h3>Out</h3>
+            <p>
+              The host runtime: no <code>fetch</code>, no file system, no real
+              timers. Bare WebAssembly also has no clock, so
+              <code>Date.now()</code> reads <code>0</code> here — that is this
+              build, not the engine.
+            </p>
+          </div>
+          <div class="caveat">
+            <h3>Runaway scripts</h3>
+            <p>
+              A running WebAssembly instance cannot be interrupted, so the engine
+              lives in a worker with a {{ build.timeout }} budget. Write
+              <code>for (;;) {}</code> and the worker is replaced, not the tab.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <footer class="foot">
+        <span>kataan v{{ build.version }}</span>
+        <span class="foot__sep">·</span>
+        <a href="https://github.com/KarpelesLab/kataan">source</a>
+        <span class="foot__sep">·</span>
+        <a href="https://crates.io/crates/kataan">crates.io</a>
+        <span class="foot__sep">·</span>
+        <a href="https://docs.rs/kataan">docs.rs</a>
+        <span class="foot__sep">·</span>
+        <span>MIT</span>
+      </footer>
+    </div>
+
+    <script src="vendor/vue.global.prod.js"></script>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

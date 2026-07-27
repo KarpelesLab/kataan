@@ -8801,6 +8801,35 @@ pub fn eval_source_with_limits(
     Ok((String::from(interp.output()), completion))
 }
 
+/// Like [`eval_source_with_limits`], but the captured output is returned on the
+/// error path too.
+///
+/// An uncaught throw does not un-print what the script already printed, and a
+/// host running untrusted code generally wants to show both — the output up to
+/// the fault, and the fault. The `Result` is the completion value, or the
+/// rendered error.
+///
+/// # Errors
+/// The inner `Result` carries a parse or execution error message; a parse
+/// failure produces no output.
+#[cfg(feature = "std")]
+pub fn eval_source_capturing(
+    source: &str,
+    limits: crate::limits::Limits,
+) -> (String, Result<String, String>) {
+    let program = match crate::parser::Parser::parse_program(source) {
+        Ok(program) => program,
+        Err(e) => return (String::new(), Err(alloc::format!("{e}"))),
+    };
+    let mut interp = Interp::new_with_limits(limits);
+    let outcome = match interp.run(&program) {
+        Ok(value) => Ok(interp.display(value)),
+        Err(ExecError::Throw(thrown)) => Err(format_thrown(&interp, thrown)),
+        Err(other) => Err(alloc::format!("{other:?}")),
+    };
+    (String::from(interp.output()), outcome)
+}
+
 /// Formats an uncaught thrown value for an error message: `name: message` for an
 /// error-shaped object, otherwise the value's display string.
 fn format_thrown(interp: &Interp, thrown: NanBox) -> String {

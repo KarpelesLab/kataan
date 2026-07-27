@@ -111,3 +111,16 @@ codegen-units = 1
 [profile.bench]
 lto = "thin"
 codegen-units = 1
+
+# Size-tuned profile for the browser build (`web/`, published to GitHub Pages).
+# A JS engine that carries Unicode tables, CLDR data and tzdata is inherently
+# large, and every byte crosses the network before the page can run anything —
+# so trade compile time and inlining for size here. `panic` is deliberately left
+# at the default: the C ABI turns a caught panic into `KT_INTERNAL`, and
+# `panic = "abort"` would make it a trap instead.
+[profile.wasm-web]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true

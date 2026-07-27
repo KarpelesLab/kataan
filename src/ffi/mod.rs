@@ -200,6 +200,130 @@ pub unsafe extern "C" fn kt_eval(
     }
 }
 
+/// Renders `source` as the engine's **token stream** — one line per token,
+/// `start..end kind "text"` — into `out` (in/out length convention).
+///
+/// This is the first stage of the pipeline `kt_eval` runs end to end, exposed so
+/// a host can show *how* the engine sees a script rather than only what it
+/// returns. It is the same dump the `kataan lex` subcommand prints.
+///
+/// Returns [`KtStatus::Ok`], or [`KtStatus::InvalidInput`] with the error
+/// message in `out` if the source does not tokenize.
+///
+/// # Safety
+///
+/// Same contract as [`kt_eval`].
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kt_lex(
+    source: *const c_char,
+    source_len: usize,
+    out: *mut c_char,
+    out_len: *mut usize,
+) -> c_int {
+    // SAFETY: forwarded verbatim to the shared helper, which documents the
+    // same contract this function does.
+    unsafe {
+        stage_dump(source, source_len, out, out_len, |src| {
+            use alloc::string::ToString;
+            use core::fmt::Write as _;
+            let tokens = crate::lexer::Lexer::new(src)
+                .tokenize()
+                .map_err(|e| e.to_string())?;
+            let mut dump = alloc::string::String::new();
+            for tok in &tokens {
+                let newline = if tok.newline_before { " <nl>" } else { "" };
+                let _ = writeln!(
+                    dump,
+                    "{:>5}..{:<5} {:<26} {:?}{newline}",
+                    tok.span.start,
+                    tok.span.end,
+                    alloc::format!("{:?}", tok.kind),
+                    tok.text(src),
+                );
+            }
+            Ok(dump)
+        })
+    }
+}
+
+/// Renders `source` as the engine's **abstract syntax tree** into `out` (in/out
+/// length convention) — the same dump the `kataan parse` subcommand prints.
+///
+/// Returns [`KtStatus::Ok`], or [`KtStatus::InvalidInput`] with the parse error
+/// in `out`.
+///
+/// # Safety
+///
+/// Same contract as [`kt_eval`].
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kt_parse(
+    source: *const c_char,
+    source_len: usize,
+    out: *mut c_char,
+    out_len: *mut usize,
+) -> c_int {
+    // SAFETY: forwarded verbatim to the shared helper.
+    unsafe {
+        stage_dump(source, source_len, out, out_len, |src| {
+            use alloc::string::ToString;
+            crate::parser::Parser::parse_program(src)
+                .map(|program| alloc::format!("{program:#?}"))
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
+/// Shared body of the pipeline-stage dumps ([`kt_lex`], [`kt_parse`]): validate
+/// the pointers, decode the source, run `render`, and copy the text out — with
+/// an error message taking the same path as a successful dump so the caller can
+/// display it either way.
+///
+/// # Safety
+///
+/// Same contract as [`kt_eval`].
+#[cfg(feature = "std")]
+unsafe fn stage_dump(
+    source: *const c_char,
+    source_len: usize,
+    out: *mut c_char,
+    out_len: *mut usize,
+    render: impl FnOnce(&str) -> Result<alloc::string::String, alloc::string::String>,
+) -> c_int {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if out_len.is_null() || (source.is_null() && source_len != 0) {
+            return KtStatus::NullPointer;
+        }
+        // SAFETY: caller guarantees `source` covers `source_len` bytes; a null
+        // pointer with zero length is the empty input (never dereferenced).
+        let bytes: &[u8] = if source.is_null() {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(source as *const u8, source_len) }
+        };
+        let Ok(src) = core::str::from_utf8(bytes) else {
+            return KtStatus::InvalidInput;
+        };
+        let (text, ok) = match render(src) {
+            Ok(text) => (text, true),
+            Err(message) => (message, false),
+        };
+        // SAFETY: `out_len` is non-null (checked) and `out` honors the
+        // length convention.
+        match unsafe { copy_out(text.as_bytes(), out, out_len) } {
+            KtStatus::Ok if !ok => KtStatus::InvalidInput,
+            other => other,
+        }
+    }));
+    match outcome {
+        Ok(status) => status as c_int,
+        Err(_) => KtStatus::Internal as c_int,
+    }
+}
+
 /// Evaluates `source`, capturing **both** what the script printed and its
 /// completion value.
 ///
@@ -251,9 +375,11 @@ pub unsafe extern "C" fn kt_eval_capture(
         let Ok(src) = core::str::from_utf8(bytes) else {
             return KtStatus::InvalidInput;
         };
-        let (printed, completion, ok) = match crate::nbvm::execute(src) {
-            Ok((printed, completion)) => (printed, completion, true),
-            Err(message) => (alloc::string::String::new(), message, false),
+        let (printed, outcome) =
+            crate::nbvm::execute_capturing(src, crate::limits::Limits::default());
+        let (completion, ok) = match outcome {
+            Ok(completion) => (completion, true),
+            Err(message) => (message, false),
         };
         let mut joined = printed.into_bytes();
         joined.push(0);

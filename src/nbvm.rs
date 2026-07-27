@@ -5335,6 +5335,32 @@ pub fn execute_with_limits(
     }
 }
 
+/// Like [`execute_with_limits`], but the captured output is returned on the
+/// error path too — see [`crate::nbexec::eval_source_capturing`].
+///
+/// Compilation happens before execution, so the tree-walker fallback is still
+/// clean: nothing has been printed when it is taken.
+#[cfg(feature = "std")]
+pub fn execute_capturing(
+    source: &str,
+    limits: crate::limits::Limits,
+) -> (String, Result<String, String>) {
+    let program = match crate::parser::Parser::parse_program(source) {
+        Ok(program) => program,
+        Err(e) => return (String::new(), Err(alloc::format!("{e}"))),
+    };
+    let Ok(protos) = compile_program(&program) else {
+        return crate::nbexec::eval_source_capturing(source, limits);
+    };
+    let mut realm = Realm::with_limits(limits);
+    match run_program_capturing(&mut realm, &protos, 0, &[]) {
+        Ok((value, output)) => (output, Ok(realm.to_display_string(value))),
+        // A runtime fault on the bytecode path re-runs on the reference
+        // tree-walker, which is also what surfaces the thrown value.
+        Err(_) => crate::nbexec::eval_source_capturing(source, limits),
+    }
+}
+
 /// Like [`execute_with_limits`], but on failure returns a structured
 /// [`Thrown`](crate::nbexec::Thrown) carrying the error's JS *type* — the entry
 /// point the Test262 conformance runner uses to verify a `negative` test fails

@@ -1,0 +1,100 @@
+name: Pages
+
+# Builds the engine for the browser and publishes web/ to GitHub Pages.
+#
+# The site is static: no bundler, no npm project. The only build step is
+# compiling the crate to `wasm32-unknown-unknown` and dropping the module next
+# to the page, plus vendoring Vue so the published site has no runtime
+# dependency on a CDN.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'web/**'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; let a run in progress finish rather than cancelling
+# it mid-upload.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust with the wasm target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The browser build deliberately omits `host`, `cli` and `crypto`: there is
+      # no event loop, file system or OS entropy source in a tab, and pulling
+      # them in would only add weight. `ffi` is what the page calls through.
+      - name: Build the engine for the browser
+        run: |
+          cargo rustc --lib --locked \
+            --target wasm32-unknown-unknown \
+            --profile wasm-web \
+            --no-default-features --features std,regex,intl,module,ffi \
+            --crate-type cdylib
+
+      - name: Assemble the site
+        run: |
+          set -euo pipefail
+          mkdir -p dist/vendor
+          cp web/index.html web/styles.css web/app.js web/kataan.js \
+             web/kataan-worker.js web/examples.js dist/
+          cp target/wasm32-unknown-unknown/wasm-web/kataan.wasm dist/
+          # Vendored so the published page has no runtime CDN dependency: a CDN
+          # outage would otherwise leave a blank page rather than a degraded one.
+          curl -fsSL https://unpkg.com/vue@3.5.13/dist/vue.global.prod.js \
+            -o dist/vendor/vue.global.prod.js
+          # Jekyll would otherwise try to process the directory.
+          touch dist/.nojekyll
+          echo "--- dist ---"
+          ls -la dist
+          du -h dist/kataan.wasm
+
+      # The page states its own numbers, so they must come from the repository
+      # rather than from whatever was true when the copy was written.
+      - name: Stamp version and ledger figures into the page
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          ledger=$(awk '!/^#/ && NF' tests/test262-status.txt | wc -l | tr -d ' ')
+          gzip_kb=$(gzip -9c dist/kataan.wasm | wc -c | awk '{printf "%.1f", $1/1048576}')
+          sed -i \
+            -e "s/version: '[^']*'/version: '${version}'/" \
+            -e "s/ledger: [0-9]*/ledger: ${ledger}/" \
+            -e "s/gzip: '[^']*'/gzip: '${gzip_kb} MB'/" \
+            dist/app.js
+          echo "version=${version} ledger=${ledger} gzip=${gzip_kb}MB"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
