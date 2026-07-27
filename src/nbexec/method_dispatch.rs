@@ -106,6 +106,33 @@ impl<'a> Interp<'a> {
         // unwrapped) — consume the one-shot flag so it applies only to this call.
         let array_proto_generic = core::mem::take(&mut self.array_proto_generic);
 
+        // Array methods are dispatched by name, which is only sound while
+        // `%Array.prototype%` still holds the built-in of that name. Once user code
+        // has replaced one (`Array.prototype.toString = Object.prototype.toString`),
+        // the call has to resolve the property and invoke whatever is there.
+        //
+        // `replaced_dispatch` guards the re-entry: resolving the name may yield a
+        // built-in marker whose own call path routes back here with the same
+        // receiver and name, which must then take the ordinary dispatch below
+        // rather than look the name up a second time. Keying on the pair (rather
+        // than a bare flag) still lets a replacement call a *different* replaced
+        // method, or the same one on another object.
+        if !array_proto_generic
+            && self.realm.proto_replaced(method)
+            && let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && !self
+                .replaced_dispatch
+                .contains(&(h.to_raw(), method.into()))
+        {
+            let f = self.read_member(h, method)?;
+            if self.is_callable_value(f) {
+                self.replaced_dispatch.push((h.to_raw(), method.into()));
+                let out = self.call_with_this(f, recv, args);
+                self.replaced_dispatch.pop();
+                return out.map(Some);
+            }
+        }
+
         // `Array.prototype.toString` (23.1.3.36) is receiver-agnostic: it does
         // `O = ToObject(this)`, `func = Get(O, "join")`, and calls `func` if it is
         // callable, else falls back to `%Object.prototype.toString%` (yielding e.g.

@@ -466,6 +466,13 @@ pub struct Interp<'a> {
     /// (read its own `length`/indexed properties) rather than unwrapped to its
     /// boxed primitive and dispatched as a String/Number/Boolean method.
     array_proto_generic: bool,
+    /// Receiver/name pairs whose *replaced* built-in prototype method is currently
+    /// being dispatched through the property. Resolving such a name can yield a
+    /// built-in marker whose call path re-enters `call_method` with the same pair;
+    /// this stack makes that second entry take the ordinary by-name dispatch
+    /// instead of looking the property up again forever. Empty unless a program
+    /// overwrites a built-in prototype method, so it costs nothing in normal code.
+    replaced_dispatch: Vec<(u64, alloc::string::String)>,
     /// When a *generic* array-like receiver is materialized for an iteration
     /// method (`map`/`filter`/`forEach`/`reduce`/…), this records which indices
     /// were actually *present* (`HasProperty`) on the source object, so those
@@ -2971,6 +2978,7 @@ impl<'a> Interp<'a> {
             pending_new_target: None,
             reflect_new_target: None,
             array_proto_generic: false,
+            replaced_dispatch: Vec::new(),
             array_like_present: None,
             wasm_states: alloc::collections::BTreeMap::new(),
             wasm_modules: alloc::collections::BTreeMap::new(),

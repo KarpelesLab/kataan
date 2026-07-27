@@ -150,6 +150,14 @@ pub struct Realm {
     /// costs a prototype walk that was already spec-required in the rare programs
     /// that pollute those prototypes.
     proto_index_accessor_dirty: bool,
+    /// Names on `%Array.prototype%` / `%Function.prototype%` that user code has
+    /// *replaced* (assigned over, or redefined). Method calls on those receivers
+    /// are normally dispatched by name straight to the built-in implementation;
+    /// for a replaced name the call must instead resolve the property and invoke
+    /// whatever is there. Only genuine overwrites are recorded — installing a name
+    /// that was not already present (realm boot, or a brand-new
+    /// `Array.prototype.mine`) already goes through ordinary lookup.
+    proto_replaced: alloc::collections::BTreeSet<alloc::string::String>,
     /// Logical `length` of an array set above its dense backing capacity (a valid
     /// uint32 length up to 2^32-1 that exceeds [`Limits::max_array_len`]). The dense
     /// `Vec` storage is not actually grown that far (a multi-gigabyte allocation);
@@ -406,6 +414,7 @@ impl Realm {
             non_extensible_arrays: alloc::collections::BTreeSet::new(),
             nonwritable_array_lengths: alloc::collections::BTreeSet::new(),
             proto_index_accessor_dirty: false,
+            proto_replaced: alloc::collections::BTreeSet::new(),
             sparse_array_lengths: alloc::collections::BTreeMap::new(),
             default_object_proto: None,
             native_protos: alloc::collections::BTreeMap::new(),
@@ -2509,6 +2518,37 @@ impl Realm {
         self.proto_index_accessor_dirty
     }
 
+    /// Whether user code has replaced a built-in prototype's `key`, so a
+    /// `receiver.<key>()` call must go through the property rather than dispatch
+    /// to the built-in by name. Cheap in the overwhelmingly common case: the set
+    /// stays empty unless a program actually overwrites one.
+    #[must_use]
+    pub fn proto_replaced(&self, key: &str) -> bool {
+        !self.proto_replaced.is_empty() && self.proto_replaced.contains(key)
+    }
+
+    /// Records an overwrite of an existing named property on a tracked built-in
+    /// prototype.
+    fn note_proto_write(&mut self, handle: Handle, key: &str, value: NanBox) {
+        if Some(handle) != self.array_proto_intrinsic
+            && Some(handle) != self.function_proto_intrinsic
+        {
+            return;
+        }
+        if key.parse::<u32>().is_ok() {
+            return;
+        }
+        // Only an overwrite counts, and only one that changes the value: realm
+        // boot installs each built-in once (no prior own property), and assigning
+        // a property back to what it already held observably changes nothing.
+        match self.get_property(handle, key) {
+            Some(cur) if !cur.same_value(value) => {
+                self.proto_replaced.insert(key.into());
+            }
+            _ => {}
+        }
+    }
+
     /// Whether the `length` of the array at `handle` was made non-writable via
     /// `Object.defineProperty(arr, "length", {writable:false})`. An array's
     /// `length` is writable by default.
@@ -3514,6 +3554,7 @@ impl Realm {
     /// Sets own property `key` to `value` on the object at `handle`. Returns
     /// `false` if the handle is stale or the cell is not an object.
     pub fn set_property(&mut self, handle: Handle, key: &str, value: NanBox) -> bool {
+        self.note_proto_write(handle, key, value);
         let dict_threshold = self.limits.object_dictionary_threshold;
         if let Some(obj) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             obj.maybe_convert_to_dict(key, dict_threshold);
@@ -3543,6 +3584,7 @@ impl Realm {
     /// to create or overwrite a data slot even on a non-extensible/frozen object
     /// (e.g. an accessor→data conversion of a configurable property).
     pub fn force_set_property(&mut self, handle: Handle, key: &str, value: NanBox) -> bool {
+        self.note_proto_write(handle, key, value);
         let dict_threshold = self.limits.object_dictionary_threshold;
         if let Some(obj) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             obj.maybe_convert_to_dict(key, dict_threshold);
