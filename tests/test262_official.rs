@@ -758,7 +758,13 @@ fn manage_shard(
     // A test producing no progress for this long is treated as hung (an infinite
     // loop or catastrophic backtracking) — the child is killed and the in-flight
     // test recorded as a failure, exactly like a native crash.
-    const IDLE_TIMEOUT_SECS: u64 = 20;
+    //
+    // Generous on purpose. A genuinely hung test never finishes, so the only cost
+    // of a long timeout is how quickly one is detected; a *short* one turns the
+    // slowest legitimate tests (some Temporal arithmetic) into spurious failures
+    // whenever the machine is loaded — which is exactly when the suite is run
+    // with several workers.
+    const IDLE_TIMEOUT_SECS: u64 = 90;
     // Hard per-worker address-space cap (KiB) enforced via `ulimit -v`. A test
     // with an unbounded allocation (e.g. a typed array / ArrayBuffer / string of
     // pathological size) hits this ceiling, its allocation is refused, the worker
