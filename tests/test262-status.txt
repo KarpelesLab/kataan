@@ -127,10 +127,7 @@ intl402/FallbackSymbol/description.js  # [sloppy] expected pass, Runtime Test262
 intl402/FallbackSymbol/per-realm.js  # [sloppy] expected pass, Runtime Test262Error: %Intl%.[[FallbackSymbol]] should exist in original realm Expected SameValue(«undefined», «undefined») to be false
 intl402/Intl/getCanonicalLocales/non-iana-canon.js  # [sloppy] expected pass, Runtime Test262Error: The value of Intl.getCanonicalLocales(tag)[0] equals the value of `canonical` Expected SameValue(«"hy-arevela"», «"hy"») to be true
 intl402/Intl/getCanonicalLocales/preferred-variant.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"ja-Latn-alalc97-hepburn"», «"ja-Latn-alalc97"») to be true
-intl402/Intl/getCanonicalLocales/transformed-ext-canonical.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"en-t-iw"», «"en-t-he"») to be true
-intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-region.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"und-u-rg-no23"», «"und-u-rg-no50"») to be true
-intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-subdivision.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"und-NO-u-sd-no23"», «"und-NO-u-sd-no50"») to be true
-intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-timezone.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"und-u-tz-cnckg"», «"und-u-tz-cnsha"») to be true
+intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-timezone.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"und-u-tz-eire"», «"und-u-tz-iedub"») to be true
 intl402/Intl/supportedValuesOf/currencies-accepted-by-DisplayNames.js  # [sloppy] expected pass, Runtime Test262Error: AAA supported but not returned by supportedValuesOf
 intl402/Intl/supportedValuesOf/timeZones-include-non-continental.js  # [sloppy] expected pass, Runtime Test262Error: non-continental timezone Etc/GMT+1 is not supported
 intl402/ListFormat/prototype/format/es-es-long.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"foo, bar"», «"foo y bar"») to be true
