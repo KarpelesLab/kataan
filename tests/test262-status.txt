@@ -14,8 +14,6 @@ built-ins/Array/fromAsync/asyncitems-array-add-to-singleton.js  # [sloppy] async
 built-ins/Array/fromAsync/asyncitems-array-add.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [1, 2, 3] and expected [1, 2, 3, 4] should have the same con)
 built-ins/Array/fromAsync/asyncitems-array-mutate.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [1, 2, 3] and expected [1, 8, 3] should have the same conten)
 built-ins/Array/fromAsync/asyncitems-array-remove.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [1, 2, 3] and expected [1, 2] should have the same contents.)
-built-ins/Array/isArray/15.4.3.2-0-5.js  # [sloppy] expected pass, Runtime Test262Error: Array.isArray(Array.prototype) must return true Expected SameValue(«false», «true») to be true
-built-ins/Array/prototype/exotic-array.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«0», «3») to be true
 built-ins/ArrayBuffer/data-allocation-after-object-creation.js  # [sloppy] expected pass, Runtime Test262Error: Expected a DummyError but got a RangeError
 built-ins/ArrayBuffer/options-maxbytelength-compared-before-object-creation.js  # [sloppy] expected pass, Runtime Test262Error: Expected a RangeError but got a Test262Error
 built-ins/ArrayBuffer/prototype/slice/species-returns-immutable-arraybuffer.js  # [sloppy] expected pass, Runtime Test262Error: Expected a TypeError to be thrown but no exception was thrown at all
@@ -200,7 +198,6 @@ language/destructuring/binding/keyed-destructuring-property-reference-target-eva
 language/expressions/arrow-function/syntax/arrowparameters-bindingidentifier-yield.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: expected a semicolon or newline, found Arrow (at 7114..7116)
 language/expressions/assignment/fn-name-lhs-cover.js  # [sloppy] expected pass, Runtime Test262Error: name descriptor value should be ; name value should be 
 language/expressions/call/eval-realm-indirect.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"inside"», «"outside"») to be true
-language/expressions/conditional/tco-pos.js  # crash or timeout (native abort / hang)
 language/expressions/delete/11.4.1-4.a-8.js  # [sloppy] expected pass, Runtime Test262Error: d Expected SameValue(«false», «true») to be true
 language/expressions/division/no-magic-asi-from-block-eval.js  # [sloppy] expected pass, Runtime SyntaxError: SyntaxError: unterminated regular expression literal (at 11..13)
 language/expressions/division/no-magic-asi.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: unterminated regular expression literal (line terminator) (at 7321..7324)
@@ -214,7 +211,6 @@ language/expressions/dynamic-import/import-defer/import-defer-transitive-async-m
 language/expressions/dynamic-import/import-defer/sync-dependency-of-deferred-async-module/main.js  # async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [] and expected [dep, tla-with-dep start, tla-with-dep end] )
 language/expressions/import.meta/distinct-for-each-module.js  # expected pass, Runtime Test262Error: foreign import.meta accessed via function call Expected SameValue(«[object Object]», «[object Object]») to be false
 language/expressions/import.meta/import-meta-is-an-ordinary-object.js  # expected pass, Runtime Test262Error: import.meta is not callable Expected a TypeError but got a ReferenceError
-language/expressions/logical-assignment/left-hand-side-private-reference-data-property-or.js  # crash or timeout (native abort / hang)
 language/expressions/postfix-decrement/operator-x-postfix-decrement-calls-putvalue-lhs-newvalue-.js  # [sloppy] expected pass, Runtime Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all
 language/expressions/postfix-increment/operator-x-postfix-increment-calls-putvalue-lhs-newvalue-.js  # [sloppy] expected pass, Runtime Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all
 language/expressions/prefix-decrement/operator-prefix-decrement-x-calls-putvalue-lhs-newvalue-.js  # [sloppy] expected pass, Runtime Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all

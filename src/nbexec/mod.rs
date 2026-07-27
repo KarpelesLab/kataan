@@ -3352,7 +3352,18 @@ impl<'a> Interp<'a> {
         // `toString`/`valueOf` fallback resolve through the chain — e.g.
         // `Number.prototype.hasOwnProperty("constructor")`).
         let obj_proto = self.object_prototype();
-        let proto = self.realm.new_object_with_proto(obj_proto);
+        // `Array.prototype` is itself an Array exotic object (23.1.3): its
+        // `[[Class]]` is Array, so `Array.isArray(Array.prototype)` is true, and it
+        // has the array `length`, so `Array.prototype[2] = 42` widens it to 3. It
+        // still inherits `Object.prototype` and carries its methods as ordinary
+        // (auxiliary) named properties.
+        let proto = if ctor_name == "Array" {
+            let h = self.realm.new_array(Vec::new());
+            self.realm.set_object_proto(h, obj_proto);
+            h
+        } else {
+            self.realm.new_object_with_proto(obj_proto)
+        };
         for &name in methods {
             let name_h = self.realm.new_string(name);
             let f = self.realm.new_bound_native(native_id, name_h);
@@ -4535,16 +4546,6 @@ impl<'a> Interp<'a> {
             .map(Handle::from_raw)
         {
             self.realm.set_array_proto_intrinsic(arr_proto);
-            // `Array.prototype` is an Array exotic object with an own `length`
-            // property (`{ value: 0, writable: true, enumerable: false,
-            // configurable: false }`). We model the prototype itself as a plain
-            // object, but expose the own `length` so `Array.prototype.length === 0`
-            // and `"length" in Object.create(Array.prototype)` hold.
-            self.realm
-                .set_property(arr_proto, "length", NanBox::number(0.0));
-            self.realm.mark_hidden(arr_proto, "length");
-            self.realm
-                .set_non_configurable_property(arr_proto, "length");
             // `Array.prototype[Symbol.iterator]` is the *same* function object as
             // `Array.prototype.values` (per spec), so `[][Symbol.iterator] ===
             // [].values` and the `arguments` object's iterator matches
