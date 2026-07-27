@@ -7,6 +7,445 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/KarpelesLab/kataan/compare/v0.0.7...v0.0.8) - 2026-07-27
+
+### Added
+
+- *(temporal)* astronomical Chinese/Dangi calendars (+5, unbounds the range)
+- *(intl)* CLDR alias tables for BCP-47 extension subtags (+3)
+- *(regex)* Unicode 17 property tables, emoji string properties, spec \s (+~45)
+- *(engine)* per-iteration let, switch TDZ, for-of arguments, tagged-template, optional-chaining, #x in (+17)
+- *(engine)* yield/await in computed property keys (object literals + class members) (+8)
+- *(engine)* class super()/this-binding cell + Function/GeneratorFunction subclassing (+17)
+- *(engine)* Temporal DST duration rounding + IANA links, Array live flatten/map/filter observable order (+21)
+- *(regex)* reverse-lookbehind captures, lossless surrogate ToString, AnnexB legacy parse (+20)
+- *(intl)* wire intl-0.5.1 dangi/umalqura calendars + DateTimeFormat interval & non-Gregorian formatting + getCanonicalLocales aliases (+97)
+- *(intl)* BigInt-exact NumberFormat via puremp::Decimal significant-digits (+4)
+- *(engine)* String-exotic [[DefineOwnProperty]] + curated fixture corrections (+1)
+- *(engine)* lexical-env separation for eval/global declaration-instantiation (+17)
+- *(engine)* Array.fromAsync iterator-driven, RegExp cross-realm brand, ArrayIterator/Proxy-set, destructuring/for-in order (+42)
+- *(engine)* Temporal lunisolar arithmetic, Array sparse mutators, NumberFormat compact, class extends-null/heritage-TDZ (+70)
+- *(engine)* formatRange field-level parts, Date.UTC fp, RegExp lastIndex physical (+12)
+- *(intl)* DateTimeFormat IANA timezone support via the Temporal tz data (+14)
+- *(realm,module)* Gen/AsyncGen proto-from-ctor-realm-prototype + ShadowRealm importValue (+3)
+- *(module)* single-module top-level-await via suspendable coroutine (+3)
+- *(shadowrealm)* genuine realm isolation on the realm-global-swap foundation (+8)
+- *(realm)* swap global_this/global_scope at realm boundaries (+7)
+- *(realm)* cross-realm proto-from-ctor for dynamic Function (+1)
+- *(module)* %AbstractModuleSource% intrinsic (+8)
+- *(engine)* URI encode/decode, matchAll iterator, class constructor order (+31)
+- *(tdz)* for-of/for-in head lexical TDZ (+12)
+- *(temporal)* Duration relativeTo rounding — built-ins/Temporal now 0 fails (+10)
+- *(engine)* Proxy Set/Get receiver preservation + AsyncFunction tag + Object (+25)
+- *(temporal)* DST cross-midnight, IANA canon, NudgeToCalendarUnit, hang fix (+40)
+- *(temporal)* DST/timezone arithmetic — disambiguation, transitions, DST-aware diff (+26)
+- *(intl)* DTF hourCycle/ZDT-toLocaleString + NF exact-decimal + RTF numbering (+39)
+- *(intl)* Islamic/Persian dateStyle for Temporal toLocaleString (+3)
+- *(language)* 3rd contained grind — assignment order, for-of protocol, using decls (+18)
+- *(array)* precise [[Get]]/[[Set]]/[[Delete]] for hole+accessor mutators (+16)
+- *(array)* species-create through Proxy, prototype.length, weak-collection tag (+12)
+- *(realm)* proto-from-ctor-realm — per-realm Intl protos + GetPrototypeFromConstructor (+15)
+- *(regex)* v-flag property-of-strings (Emoji_Keycap_Sequence) + astral group names (+26)
+- *(intl)* smaller-services algorithmic — ListFormat, Collator, localeCompare, numbering (+36)
+- *(intl)* Temporal→DateTimeFormat protocol + toLocaleString + DTF algorithmic (+93)
+- *(intl)* NumberFormat algorithmic — decimal rounding, BigInt/coercion, accounting (+52)
+- *(intl)* re-wire Locale/Intl to intl-0.5 CLDR data + bounded aliases (+22)
+- *(engine)* Promise finally/species, static-block scope, WTF-8 surrogates (+18)
+- *(engine)* scattered code-tail — class extends, live collections, private-on-proxy (+25)
+- *(realm)* cross-realm error identity + ArraySpeciesCreate lookup (+19)
+- *(atomics)* virtual-clock cooperative scheduling for wait/waitAsync (+39)
+- *(function)* source-text .toString() for classes + computed methods (+7)
+- *(typedarray)* resizable-buffer OOB + length-tracking view completion (+31)
+- *(async-gen)* lazy yield* delegation + for-await over sync iterators (+31)
+- *(language)* diffuse tail — regex-literal LT, strict/global bindings, directives (+30)
+- *(class)* diffuse grind — direct-eval private names, private-elem invariants (+42)
+- *(language)* 2nd diffuse grind — lazy IteratorClose destructuring +47 (+48)
+- *(builtins)* diffuse tail — JSON parse-with-source +9, Set +4, unary-wrapper +2 (+18)
+- *(typedarray,temporal)* diffuse grind — TypedArray +19, Temporal ISO +27 (+48)
+- *(object)* diffuse conformance grind — built-ins/Object 67→15 (+52)
+- *(language)* diffuse conformance grind — statements/expressions (+34, 46 fixed)
+- *(temporal,array)* diffuse conformance grind — Temporal ISO +92, Array +53 (+142)
+- *(temporal)* widen Duration to i128 + correctly-rounded total/BigInt→Number (+14)
+- *(temporal)* per-calendar edge fixes — BC round-trip, era validation, month-until overshoot (+181)
+- *(temporal)* harden lunisolar leap-month semantics in the calendar layer (+67)
+- *(temporal)* calendar-aware arithmetic for PlainDateTime/ZonedDateTime/YearMonth (+286)
+- *(temporal)* calendar-aware arithmetic + PlainMonthDay wiring (+152)
+- *(temporal)* non-ISO calendar wiring for ZonedDateTime + PlainYearMonth (+410)
+- *(temporal)* non-ISO calendar wiring for PlainDateTime (+230)
+- *(temporal)* non-ISO calendar layer + PlainDate wiring (+238)
+- *(async-gen)* reify method-call arguments in the step machine (+3)
+- *(async-gen)* spec-shaped request queue + per-await microtask suspension (+7)
+- *(conformance)* implement Iterator.zip / Iterator.zipKeyed proposal (+33)
+- *(conformance)* resizable/growable ArrayBuffer + length-tracking views (§3.8)
+- *(conformance)* GetPrototypeFromConstructor uses newTarget's realm (proto-from-ctor-realm, +45)
+- *(conformance)* implement mapped arguments object ([[ParameterMap]]) (26 → 2, +24)
+- *(jit)* direct generic→generic calls + inline ArrayLen; retire JIT_DESIGN.md
+- *(jit)* direct generic JIT→JIT calls + inline ArrayLen (§2.1 / Pass 6)
+- *(jit)* inline property-SET + array-element GET/SET fast paths (§2.1 Pass 6)
+- *(jit)* inline monomorphic property-GET fast path (§2.1 Pass 6)
+- *(jit)* generic-tier array element access + .length — Pass 5
+- *(jit)* generic-tier function calls (Op::Call / Op::CallNative) — Pass 4
+- *(jit)* generic-tier control flow + comparisons + value arithmetic — Pass 3
+- *(jit)* generic-tier property access (GetProp/SetProp) — Pass 2
+- *(jit)* generic (NanBox) tier substrate — Pass 1, end-to-end generic Add
+- *(host)* §4.3 web platform globals + fix no_std build (FloatExt) (+59 tests)
+- *(host)* §4.5 node-compat builtins — Buffer, path, os, util, querystring, process (+23 tests)
+- *(wasm)* §2.2 reference types + bulk-table + JS-boundary tables (+9 tests)
+- *(host)* §4.1 event loop + timers (setTimeout/Interval/Immediate, nextTick, AbortController)
+- *(conformance)* implement proper tail calls (PTC) on both tiers — un-skip +34
+- *(test262)* $262.agent cooperative scheduler + Atomics.waitAsync
+- *(conformance)* implement $262.createRealm (cross-realm) — un-skip +77
+- *(conformance)* import attributes + assertions + JSON/text modules — un-skip +94
+- *(conformance)* implement class decorators + accessor auto-accessors — un-skip +24
+- *(conformance)* implement IsHTMLDDA (document.all) exotic — un-skip +34
+- *(temporal)* implement Duration relativeTo calendar arithmetic (+124)
+- *(temporal)* Temporal instances are ordinary extensible objects (+31)
+- *(temporal)* PlainDate.toPlainDateTime accepts a time-like (ToTemporalTime)
+- *(temporal)* implement toZonedDateTime on PlainDate + PlainDateTime (+26)
+- *(temporal)* implement Temporal.Now — Temporal fully un-skipped, 3920 pass
+- *(temporal)* implement Temporal.ZonedDateTime — 844/901, corpus 3003→3875 pass
+- *(temporal)* Date.prototype.toTemporalInstant → Temporal.Instant (+8)
+- *(temporal)* subclassing, subclass statics, and valueOf via ToPrimitive (+19)
+- *(temporal)* implement 7 Temporal types — 2984 test262 tests now pass (was 0)
+- *(temporal)* scaffold Temporal (ROADMAP §4) — ISO core + brand + registration + dispatch
+- *(sab)* make SharedArrayBuffer subclassable (class extends SharedArrayBuffer)
+- *(sab)* brand-check SharedArrayBuffer.prototype.slice/grow receiver
+- *(sab)* brand-check SharedArrayBuffer prototype getters + grow receiver
+- *(sab)* validate SharedArrayBuffer length + maxByteLength via ToIndex; un-skip
+- *(atomics)* wait requires a shared buffer — TypeError before arg coercion
+- *(atomics)* BigInt64Array/BigUint64Array read-modify-write
+- *(atomics)* throw TypeError for writing ops on an immutable ArrayBuffer
+- *(atomics)* implement single-agent notify/wait + fix arity/proto; un-skip Atomics
+- *(tdz)* hoist block/script/function let/const/class to TDZ at scope entry
+- async-generator yield Awaits its operand (AsyncGeneratorYield) (§async-generators)
+- @@asyncDispose then-chains PromiseResolve(return()) → undefined (§async-generators)
+- %AsyncIteratorPrototype%[Symbol.asyncDispose] (§async-generators)
+- generator instance prototype chain (g.prototype inherits %GeneratorPrototype%) (§generators)
+- %GeneratorFunction% / %AsyncGeneratorFunction% constructor objects (§generators)
+- distinct %AsyncGeneratorFunction.prototype% / %AsyncGeneratorPrototype% / %AsyncIteratorPrototype% (§async-generators)
+- distinct %GeneratorFunction.prototype% / %GeneratorPrototype% for sync generators (§generators)
+- Intl.Locale Info API — getCalendars/getCollations/getHourCycles/getNumberingSystems/getTimeZones/getTextInfo/getWeekInfo (§intl402)
+- Atomics.pause([N]) — spin-loop hint (§built-ins)
+- %IteratorPrototype%[Symbol.toStringTag] get/set accessor (§built-ins)
+- *(intl)* Intl.Locale can be subclassed (§3.9)
+- *(intl)* subclassing for ListFormat/RelativeTimeFormat/Segmenter + fix instance proto (§3.9)
+- *(intl)* Intl.PluralRules can be subclassed (§3.9)
+- *(intl)* Intl.Locale firstDayOfWeek option + accessor (ES2024, §3.9)
+- *(intl)* validate Intl.Locale language/script/region option shapes (§3.9)
+- *(intl)* validate Intl.Locale calendar/collation/numberingSystem options (§3.9)
+- *(intl)* Intl.Locale variants option (§3.9)
+- *(intl)* DateTimeFormat defaults to a numeric date when no options given (§3.9)
+- *(intl)* Collator ignorePunctuation locale default (Thai → true) (§3.9)
+- *(intl)* DateTimeFormat resolvedOptions reports default hourCycle/hour12 (§3.9)
+- *(intl)* complete supportedValuesOf('numberingSystem') list (78 systems) (§3.9)
+- *(intl)* complete the numbering-system digit table (77 systems + hanidec) (§3.9)
+- *(intl)* numbering system in DateTimeFormat (digits + locale default) (§3.9)
+- *(intl)* resolve locale's CLDR default numbering system in NumberFormat (§3.9)
+- *(intl)* apply numbering-system digits to NumberFormat.formatToParts too (§3.9)
+- *(intl)* numbering-system digit substitution in NumberFormat (§3.9 CLDR)
+- *(sab)* SharedArrayBuffer grow() + slice() — deterministic core complete (§3.9)
+- *(sab)* SharedArrayBuffer core — construct + accessors + typed-array/Atomics backing (§3.9)
+- *(atomics)* single-agent Atomics over integer typed arrays (§3.9)
+- *(ffi)* C ABI value layer — KtValue + pure constructors/inspectors (§4.0)
+- *(embed)* Ctx::array_set completes the host array API (§4.0)
+- *(intl)* Intl.Segmenter segments.containing(index) (§3.9)
+- *(embed)* host-backed native state + Drop finalizers (§4.0)
+- *(embed)* deferred promises — async host continuation (§4.0)
+- *(embed)* persistent handles (§4.0 handle scope)
+- *(typedarray)* implement Float16Array (ES2025) (§3.6)
+- *(embed)* trap host-function panics at the boundary as a JS Error (§4.0)
+- *(embed)* host constructors — register_constructor + new HostCtor() (§4.0 M4)
+- *(embed)* Ctx set_property — full [[Set]] for host functions (§4.0)
+- *(embed)* Ctx construct + is_constructor for host functions (§4.0)
+- *(embed)* Ctx promise creation for async host functions (§4.0)
+- *(embed)* Ctx property API — has / has_own / delete / own_keys (§4.0)
+- *(embed)* Ctx value-inspection + array access for host functions (§4.0)
+- *(intl)* NumberFormat/DateTimeFormat formatRange + formatRangeToParts (§3.9)
+- *(regex)* Annex B legacy octal escapes (§3.9 web-compat)
+- *(lexer)* Annex B B.1.2 legacy octal string escapes (§3.9 web-compat)
+- *(lexer)* Annex B B.1.3 HTML-like comments (§3.9 web-compat)
+- *(typedarray)* live iteration observes resize / element writes (§3.6)
+- *(collections)* live Set/Map iteration (mutation mid-iteration observed) (§3.6)
+
+### Fixed
+
+- *(intl)* canonicalize a `-t-` extension's tlang through the CLDR aliases
+- *(regexp)* escape lone surrogates in RegExp.escape
+- *(temporal)* PlainMonthDay year-range check and month-without-monthCode TypeError
+- *(temporal)* floor the Islamic leap-day term for pre-epoch years (+6)
+- *(temporal)* propagate the calendar through PlainDate's toPlain* conversions
+- *(temporal)* constrain any Chinese/Dangi leap month code onto its base month
+- *(temporal)* use the 33-year arithmetic rule for the Persian calendar (+17)
+- *(intl)* gate the CLDR alias corpus behind the `intl` feature
+- *(array)* bound ArraySetLength's non-configurable scan by real indices (+1)
+- *(module)* dynamic import() in strict/module tail position (+2)
+- *(intl)* signDisplay/-0/NaN sign logic + accounting -0 + unicode-ext yes→true (+12)
+- *(conformance)* instance_proto throwing-getter propagation + aux symbol enumeration (+10)
+- *(conformance)* preserve key insertion position on data->accessor redefine
+- *(conformance)* Intl structural pass — option/descriptor/validation (+63)
+- *(conformance)* second Temporal tractable pass (328 -> 154, +139, ~93%->96.7%)
+- *(conformance)* super(...args) into a native constructor no longer drops the args
+- *(conformance)* drive down tractable Temporal failures (453 → 328, +125, ~90%→93%)
+- *(conformance)* Object.values/entries skip array holes on the nbexec tier
+- *(conformance)* mop up small builtin clusters (+23)
+- *(conformance)* mop up language statements/expressions tail (+61)
+- *(conformance)* drive down built-ins/Promise cluster (16 → 5 fail, +11)
+- *(conformance)* drive down super cluster (18 → 1 fail, +17, +2 class)
+- *(conformance)* drive down generators cluster (56 → 24 fail, +32)
+- *(conformance)* drive down language/eval-code cluster (26 → 1 fail, +25)
+- *(conformance)* drive down class cluster (statements 105→85, expressions 49→31, +38)
+- *(conformance)* drive down language/module-code cluster (31 → 13 fail, +18, +2 dynamic-import)
+- *(conformance)* drive down built-ins/Iterator cluster (49 → 36 fail, +13)
+- *(conformance)* drive down assignment cluster (33 → 22 fail, +11, +2 Object, +7 targettype)
+- *(conformance)* drive down language/statements/for-of cluster (37 → 27 fail, +10)
+- *(conformance)* materialize function/class `prototype` own property (+~35)
+- *(conformance)* drive down built-ins/String cluster (37 → 10 fail, +27)
+- *(conformance)* drive down built-ins/Function cluster (44 → 25 fail, +19)
+- *(conformance)* drive down built-ins/Proxy cluster (51 → 18 fail, +33)
+- *(conformance)* drive down TypedArray (+52) and RegExp (+26) clusters
+- *(conformance)* drive down built-ins/Array cluster (220 → 170 fail, +50)
+- *(conformance)* drive down built-ins/Object cluster (84 → 47 fail, +37)
+- *(temporal)* ISO parser tail — >9-digit RangeError, offset ranges, date-sep consistency (+14)
+- *(temporal)* reject U+2212 minus sign in ISO strings (+12)
+- *(temporal)* toPlainDateTime rejects non-string primitives with TypeError
+- *(temporal)* bind statics to their type (from/compare ignore this) (+11)
+- *(proxy)* pass real Symbol keys to traps, not the internal sentinel string
+- *(super)* super.x = v routes through the strict-aware member assignment
+- *(super)* resolve super.prop/super.method() over the real prototype chain
+- *(iterator)* Iterator.zip/zipKeyed close still-open iterators in reverse order
+- *(array)* Array.from iterable path iterates lazily and IteratorCloses on mapFn throw
+- *(promise)* all/allSettled/race/any iterate lazily and IteratorClose on abrupt
+- *(error)* Error/NativeError/AggregateError coerce message via ToString; AggregateError IterableToList propagates
+- *(collections)* Map/Set/WeakMap/WeakSet constructor uses spec AddEntriesFromIterable
+- *(arraybuffer)* new ArrayBuffer(length) does ToIndex (runs valueOf, propagates)
+- *(symbol)* Symbol(description) does ToString (runs user toString, propagates)
+- *(json)* JSON.parse(text) does ToString first (runs user toString, propagates)
+- *(symbol)* Symbol.for(key) does ToString (runs user toString, propagates)
+- *(typedarray)* from/of coerce each element via ToNumber/ToBigInt
+- *(global)* parseInt/parseFloat/URI functions coerce args via ToString/ToNumber
+- *(global)* isNaN/isFinite coerce via ToNumber (runs valueOf, propagates)
+- *(update)* member key ToPropertyKey deferred past the null-base check
+- *(update)* with-binding update op resolves the reference once (self-mutating getter)
+- *(assign)* read_target on an unresolvable identifier throws ReferenceError
+- *(logical-assign)* computed-member target evaluates base+key once (lhs-before-rhs)
+- *(logical-assign)* NamedEvaluation for x &&= / ||= / ??= anonymous RHS
+- *(string)* replaceAll/matchAll use spec IsRegExp ([[Get]] @@match, propagates)
+- *(json)* stringify replacer PropertyList built via [[Get]] (proxy-aware, propagates)
+- *(json)* reviver object walk is proxy-aware ([[Delete]]/CreateDataProperty + target keys)
+- *(json)* reviver IsArray unwraps proxies + ToLength coercion propagates
+- *(json)* reviver array walk uses proxy-aware [[Delete]] / CreateDataProperty
+- *(regex)* unicode-mode restricted identity/control escapes in classes + unterminated backslash-u-brace
+- *(arraybuffer)* resize() ToIndex's newLength (negative → RangeError, not clamp)
+- *(arraybuffer)* ToIndex + allocation-cap validation for maxByteLength option
+- *(typedarray)* length-tracking view over a resizable buffer floors, not throws
+- *(generators)* cache yield* [[NextMethod]] once instead of re-reading each step
+- *(atomics)* store return value + shell-host wait model — Atomics non-agent 100%
+- *(sab)* split length ToIndex from allocation limit — SAB single-agent 100%
+- *(fn+sab)* honor non-object fn.prototype assignment; SAB newTarget proto via [[Get]]
+- *(sab)* SharedArrayBuffer maxByteLength option runs its getter (poisoned propagates)
+- *(sab)* non-object newTarget.prototype falls back to %SharedArrayBuffer.prototype%
+- *(arraybuffer)* slice SpeciesConstructor rejects a non-object constructor
+- *(sab)* SharedArrayBuffer.prototype.grow ToIndex's its newLength arg
+- *(atomics)* isLockFree coerces its arg via ToIntegerOrInfinity
+- *(nbvm)* mirror array non-writable-length mutator throw in the bytecode tier
+- *(delete)* throw TypeError on delete of a nullish plain-member base
+- *(array)* throw TypeError from push/pop/shift/unshift on non-writable length
+- %TypedArray%.prototype.toLocaleString invokes each element's own toLocaleString (§built-ins)
+- isSealed/isFrozen (and seal/freeze) work on aux-backed cells (functions, Dates) (§built-ins)
+- Object.preventExtensions works on aux-backed cells (functions, Dates, …) (§built-ins)
+- ++/-- on a member evaluates the reference (base + computed key) exactly once (§expressions)
+- Object.freeze on an array freezes its named props + reports elements non-writable (§built-ins)
+- NBVM regex .groups is null-proto + duplicate-name participating-capture-wins (§regexp)
+- duplicate named groups — a participating capture wins in .groups/.indices.groups (§regexp)
+- Iterator.zipKeyed longest-mode padding is read per key, not iterated (§iterator-helpers)
+- iterator helpers throw TypeError on reentrant next() (GeneratorValidate) (§iterator-helpers)
+- yield* over an iterator with a non-callable next throws a TypeError (§generators)
+- named function expression name is a soft immutable binding (§functions)
+- Object.seal/freeze work on aux-backed cells (functions, Dates) (§built-ins)
+- constructor .prototype is non-writable and non-configurable (§built-ins)
+- Set/Map.prototype.forEach iterates live (observes mid-callback mutation) (§built-ins)
+- Intl.Locale getWeekInfo — {firstDay,weekend} only, firstDay from firstDayOfWeek (§intl402)
+- AggregateError constructor has length 2 (§built-ins)
+- String.prototype.padStart/padEnd have length 1, not 2 (§built-ins)
+- correct length for collection constructors + several methods (§built-ins)
+- correct length for Map/WeakMap.set (2), Map.groupBy/Object.groupBy (2) (§built-ins)
+- anonymous functions materialize name "" as an own property (§language)
+- well-known symbols are own data properties of %Symbol% (§built-ins)
+- JSON.stringify.length is 3, JSON.parse.length is 2 (§built-ins)
+- ToPrimitive on a wrapper runs OrdinaryToPrimitive (honors user valueOf/toString) (§built-ins)
+- GetPrototypeFromConstructor uses default proto when newTarget.prototype isn't an object (§built-ins)
+- %ThrowTypeError% has own non-configurable name ("")/length (0) (§built-ins)
+- Function.prototype has own name ("") and length (0) (§built-ins)
+- install name/length on ArrayBuffer.isView + Function.prototype[Symbol.hasInstance] (§built-ins)
+- concise methods / accessors / class methods are not constructors (§language)
+- *(proxy)* Object.getOwnPropertyNames forwards to target for a trap-less proxy (§built-ins)
+- *(iter)* array destructuring/for-of honor an overridden Array Symbol.iterator (§language)
+- *(intl)* NumberFormat/DateTimeFormat/Collator/Segmenter constructor length is 0 (§3.9)
+- *(intl)* reject Symbol locale-list elements + DisplayNames uses CanonicalizeLocaleList (§3.9)
+- *(intl)* DisplayNames length=2 + localeMatcher validated first (§3.9)
+- *(intl)* Collator.resolvedOptions returns Collator keys, not NumberFormat (§3.9)
+- *(intl)* DateTimeFormat resolvedOptions property order (§3.9)
+- *(typedarray)* default sort places -0 before +0 (§3.6)
+- *(intl)* NumberFormat.formatToParts decomposes unit/compact suffixes (§3.9)
+- *(intl)* segments.containing coerces index via ToIntegerOrInfinity (§3.9)
+- *(intl)* Date.prototype.toLocale{,Date,Time}String apply DateTimeFormat options (§3.9)
+- *(intl)* Number.prototype.toLocaleString applies all NumberFormat options (§3.9)
+- *(intl)* String.prototype.localeCompare honors numeric/sensitivity options (§3.9)
+- *(intl)* Intl.Segmenter.resolvedOptions reports locale + granularity (§3.9)
+- *(module)* re-exporting an imported binding follows the import (§3.1)
+- *(module)* named imports resolve inside functions called cross-module (§3.1)
+- *(module)* a module namespace object reports Object.isSealed true (§3.1)
+- *(intl)* accounting parens are en-family only; de-DE keeps the minus (§3.9)
+- *(intl)* accounting currency post-processes the locale-correct output (de-DE) (§3.9)
+- *(array)* C.fromAsync populates a subclass result via CreateDataPropertyOrThrow (§3.7)
+- *(intl)* DisplayNames.of honors fallback for a not-found name (§3.9)
+- *(intl)* DisplayNames resolvedOptions + style/fallback/languageDisplay defaults (§3.9)
+- *(intl)* signDisplay "negative" excludes negative zero (§3.9)
+- *(intl)* currencySign "accounting" parenthesizes negative currency (§3.9)
+- *(intl)* apply roundingIncrement (round to nearest step) (§3.9)
+- *(intl)* trailingZeroDisplay "stripIfInteger" drops trailing zeros (§3.9)
+- *(intl)* a lone significant-digit option defaults the other (§3.9)
+- *(intl)* limit native-super resolution to NumberFormat/DateTimeFormat (§3.9)
+- *(intl)* DisplayNames requires a valid `type` option (§3.9)
+- *(intl)* signDisplay "always" on -0 is "-0", not "-+0" (§3.9)
+- *(lexer)* HTML-like comments are script-only, not in modules (§3.9)
+- *(intl)* NumberFormat / DateTimeFormat subclassing (§3.9)
+- *(intl)* all service constructors are non-enumerable properties of Intl (§3.9)
+- *(regex)* \b inside a character class is a backspace (§3.6)
+- *(class)* a static method captures the class scope (self-name visible) (§3.6)
+- *(class)* the class-name inner binding is an immutable const (§3.6)
+- *(class)* static private members are not inherited by a subclass (§3.6)
+- *(class)* private methods install after super(), not at allocation (§3.6)
+- *(string)* match/replace/etc. read @@method only for an Object arg (§3.6)
+- *(array)* C.from populates a subclass result via CreateDataPropertyOrThrow (§3.6)
+- *(class)* AggregateError subclass errors + Symbol/BigInt non-constructor super (§3.6)
+- *(class)* WeakRef / FinalizationRegistry subclassing (§3.6 subclass builtins)
+- *(error)* a native-error subclass resolves .constructor to the subclass (§3.6)
+- *(string)* for-in enumerates a String object's index keys (§3.6)
+
+### Other
+
+- *(test262)* re-bless ledger (293 -> 287 known failures)
+- refresh the Test262 headline to the gated 99.45% (51,603/51,890)
+- fix a broken intra-doc link in the trig helpers
+- *(temporal)* memoize the lunisolar sui and year resolutions
+- *(roadmap)* mark §3.10 non-ISO calendar arithmetic landed
+- *(test262)* re-bless ledger (295 -> 292 known failures)
+- refresh the Test262 headline to the gated 99.44% (51,598/51,890)
+- *(intl)* drop the redundant 'static lifetimes on the generated tables
+- *(test262)* re-bless ledger (325 -> 295 known failures)
+- *(roadmap)* record why a plain rope memo is the wrong fix
+- *(collections)* hash-index Map/Set lookups (O(n) -> O(1) per operation)
+- *(roadmap)* add the three open items found this session, refresh headline
+- *(readme)* update the Test262 pass-rate to the measured 99.4% (51,565/51,890)
+- *(test262)* re-bless ledger (378 -> 325 known failures)
+- *(array)* serve push/pop without snapshotting the whole array
+- *(regex)* make global match/replace/split linear in the subject length
+- *(engine)* O(1) string type test (string `+=` quadratic -> linear)
+- *(engine)* flatten per-iteration `let` environments (quadratic -> linear)
+- intl 0.5.0 → 0.5.1 (chinese range 1800-2200 + islamic/persian data) (+11)
+- bump timezone-data 0.1→0.2, enable puremp rational+decimal
+- *(test262)* un-ledger 3 detached-copyWithin tests that pass in release (+3)
+- *(ci)* fix clippy (--all-features --all-targets) and rustdoc warnings
+- *(array)* lock in first-class prototype-method behavior (already implemented)
+- *(test262)* re-bless ledger (3509 -> 3428 known failures)
+- *(test262)* re-bless ledger (3774 -> 3676 known failures)
+- *(test262)* re-bless ledger (3897 -> 3896 known failures)
+- *(test262)* re-bless ledger (4267 -> 3981 known failures)
+- *(test262)* re-bless ledger (2518 -> 4391 known failures)
+- *(jit)* record Pass 6 inline fast paths landed (property + element)
+- *(jit)* repr(C)/repr(u8) on the property-GET hot types (Pass 6 prep)
+- *(jit)* record generic tier (Passes 1-5) landed in ROADMAP §2.1 + design status
+- *(jit)* design + pass spine for JIT completion (§2.1)
+- *(roadmap)* mark §4.1 event loop, §4.3 web globals, §4.5 node builtins landed
+- *(host)* src/host module for the §4 runtime (web/node/timers stubs)
+- *(roadmap)* mark tail-call optimization implemented — §3.9 skipped-subsystems complete
+- *(roadmap)* mark Atomics $262.agent cooperative scheduler implemented (§3.8)
+- *(roadmap)* mark cross-realm implemented (identity bulk, §3.9)
+- *(roadmap)* mark IsHTMLDDA/decorators/import-attributes implemented (§3.9)
+- *(roadmap)* mark Temporal implemented (~90%, un-skipped) in §3.9
+- *(temporal)* add timezone-data dep for Temporal.ZonedDateTime
+- *(temporal)* implementation guide for the per-type fan-out
+- de-ledger 5 more $262.evalScript tests flipped by the indirect-eval fix
+- $262.evalScript is indirect eval (global scope) not direct
+- de-ledger 8 postfix/prefix tests flipped by the read_ident_ref fix
+- Revert "fix(string): replaceAll/matchAll use spec IsRegExp ([[Get]] @@match, propagates)"
+- skip $262.agent tests + ledger newly-surfaced SAB-feature failures
+- *(test262)* bless 5 flips (gate 0-reg), session -868
+- *(test262)* bless 20 flips TDZ+array-mutators (gate 0-reg), session -863
+- *(test262)* bless 9 flips (gate 0-reg), session -843
+- *(test262)* bless 6 flips (gate 0-reg), session -834
+- *(test262)* bless 8 flips (gate 0-reg), session -828
+- *(test262)* bless 10 flips (gate 0-reg), session -820
+- *(test262)* bless 7 flips (gate 0-reg), session -810
+- *(test262)* bless 23 flips (gate 0-reg), session -803
+- *(test262)* bless 36 flips (gate 0-reg), session -780
+- *(test262)* bless 38 flips (gate 0-reg), session -744
+- *(test262)* bless 27 flips (gate 0-reg), session -706
+- *(test262)* bless 1 flips (gate 0-reg), session -679
+- *(test262)* bless 8 flips (gate 0-reg), session -678
+- *(test262)* bless 14 flips (gate 0-reg), session -670
+- *(test262)* bless 16 flips (gate 0-reg), session -656
+- *(test262)* bless 24 flips (gate 0-reg), session -640
+- *(test262)* bless 3 flips (gate 0-reg), session -616
+- *(test262)* bless 19 flips (prototype-descriptor/freeze-seal, gate 0-reg), session -613
+- collapse freeze_object aux if-let to a let-chain (clippy)
+- *(test262)* bless 11 flips (gate 0-reg), session -594
+- *(test262)* bless 30 flips (gate 0-reg), session -583
+- *(test262)* bless 5 flips (Atomics.pause/Locale Info, gate 0-reg), session -553
+- *(test262)* bless 1 flips (AggregateError etc., gate 0-reg), session -548
+- *(test262)* bless 2 more arity flips (padStart/padEnd/AggregateError), session -547
+- *(test262)* bless 14 arity flips (Map/Set/etc. constructor+method lengths, gate 0-reg, 94.35%)
+- *(test262)* ledger 3 generator/async prototype not-callable tests (proto conflation)
+- *(test262)* bless 8 flips (anon-function name materialization, gate 0-reg), session -534
+- *(test262)* bless 23 flips (Iterator toStringTag + well-known symbols, gate 0-reg), session -526
+- fn_name_unset uses is_none_or (clippy)
+- *(test262)* bless 8 flips (ToPrimitive wrapper coercion + JSON, gate 0-reg), session -503
+- *(test262)* bless 24 flips (concise-method/name-length/GetPrototypeFromConstructor, gate 0-reg), session -495
+- *(test262)* re-bless ledger (2598 -> 2601 known failures)
+- *(test262)* bless 5 more flips (gate-confirmed 0 regressions), session -461
+- *(test262)* bless 45 array-iterator destructuring flips (iter-val-array-prototype)
+- Revert empty ledger — bless script bug (empty capture → awk treated ledger as skip file)
+- *(test262)* bless remaining 2632 array-iterator flips (gate-confirmed 0 regressions, 94.16%)
+- *(test262)* bless 40 flips (array-iterator ~110 + intl402, gate-confirmed 0 regressions)
+- *(test262)* bless 11 flips (Intl subclassing + Locale, gate-confirmed 0 regressions)
+- *(test262)* bless 5 Locale flips (language/script/region validation + firstDayOfWeek)
+- *(test262)* remove 6 now-passing Intl.Locale tests (variants + option validation)
+- *(test262)* remove 3 now-passing DateTimeFormat resolvedOptions tests
+- Revert "Collator resolvedOptions" changes — locale -u- canonicalization gap caused regressions
+- *(test262)* remove 3 now-passing DateTimeFormat resolvedOptions order tests
+- *(test262)* remove 2 now-passing entries (numbering-systems + supportedValuesOf)
+- *(intl)* fix hanidec assertion after completing the numbering table
+- *(test262)* add KATAAN_TEST262_FILTER for local subset runs; note Atomics/SAB status
+- *(test262)* remove 1 now-passing entry (Atomics/pause — namespace now present)
+- *(roadmap)* record the single-agent Atomics/SAB deterministic core as done (§3.6)
+- *(test262)* remove 2 now-passing entries (formatToParts unit/compact + TA sort -0/+0)
+- *(test262)* remove 2 now-passing ledger entries (Segmenter containing index-coercion)
+- *(roadmap)* refresh headline (≈93.9%) + record this cycle's converted clusters
+- *(test262)* remove 4 now-passing ledger entries (Number/Date toLocaleString)
+- *(test262)* remove 12 now-passing ledger entries (Segmenter + module)
+- *(intl)* regression tests for this cycle's Segmenter/localeCompare/toLocaleString fixes
+- *(test262)* remove 2 now-passing ledger entries (module import-closure fix)
+- *(embed)* demo native state (napi_wrap) in the host-fn example
+- *(roadmap)* record §4.0 native state + finalizers landed; Rust API feature-complete
+- *(roadmap)* record §4.0 async continuation (deferred promises) landed
+- *(roadmap)* record §4.0 handle scope (persistent handles) landed
+- *(roadmap)* record §4.0 host-boundary panic-trapping landed
+- *(roadmap)* record §4.0 host constructors landed
+- *(test262)* remove 15 now-passing ledger entries (DisplayNames resolvedOptions + fromAsync)
+- *(embed)* expand the host-fn example with the §4.0 M2 introspection API
+- *(roadmap)* record §4.0 M2 Ctx expansion (inspection/property/promise API)
+- *(test262)* remove 8 now-passing ledger entries (NumberFormat signDisplay/formatting)
+- *(roadmap)* refresh headline pass-rate (≈93.8%) + record converted clusters
+- fix fromAsync dense-storage test — observe via microtask drain
+- *(test262)* remove 38 now-passing ledger entries (formatRange + DisplayNames + Intl structural)
+- fix roundingIncrement test — inline JS (format! braces broke compilation)
+- *(test262)* remove 15 now-passing ledger entries (Intl structural + regex/octal)
+- *(test262)* remove 31 now-passing ledger entries (live typed-array iter + AnnexB octal/comments)
+- *(test262)* remove 35 now-passing ledger entries (class-cluster fixes)
+- *(test262)* remove 15 now-passing ledger entries (live Set/Map iteration + regression cleared)
+- *(test262)* remove 40 now-passing ledger entries (String-exotic, BigInt, subclass, etc.)
+
 ## [0.0.7](https://github.com/KarpelesLab/kataan/compare/v0.0.6...v0.0.7) - 2026-07-04
 
 ### Added
