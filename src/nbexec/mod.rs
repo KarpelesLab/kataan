@@ -2880,6 +2880,7 @@ mod regexp;
 mod resource;
 mod stmt;
 mod temporal;
+mod temporal_astro;
 mod temporal_calendar;
 mod temporal_duration;
 mod temporal_instant;

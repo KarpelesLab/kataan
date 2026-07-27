@@ -432,41 +432,28 @@ fn hebrew_leap(year: i64) -> bool {
 /// Moon / solar term is observed (Beijing vs. Korea), so a few years carry a
 /// different leap month or New-Year day. `cal` selects the underlying intl
 /// table: `"dangi"` → the Korean table, anything else → the Chinese table.
-#[cfg(feature = "intl")]
 fn chinese_from_jdn(cal: &str, jdn: i64) -> Option<(i64, i64, i64, bool)> {
-    if cal == "dangi" {
-        intl::calendar::jdn_to_dangi(jdn)
-    } else {
-        intl::calendar::jdn_to_chinese(jdn)
-    }
+    let d = super::temporal_astro::from_jdn(lunisolar_kind(cal), jdn)?;
+    Some((d.year, d.month, d.day, d.leap))
 }
-#[cfg(feature = "intl")]
+
 fn chinese_to_jdn(cal: &str, y: i64, m: i64, d: i64, leap: bool) -> Option<i64> {
+    super::temporal_astro::to_jdn(lunisolar_kind(cal), y, m, d, leap)
+}
+
+/// Which meridian's observations define the calendar.
+fn lunisolar_kind(cal: &str) -> super::temporal_astro::Lunisolar {
     if cal == "dangi" {
-        intl::calendar::dangi_to_jdn(y, m, d, leap)
+        super::temporal_astro::Lunisolar::Dangi
     } else {
-        intl::calendar::chinese_to_jdn(y, m, d, leap)
+        super::temporal_astro::Lunisolar::Chinese
     }
-}
-#[cfg(not(feature = "intl"))]
-fn chinese_from_jdn(_cal: &str, jdn: i64) -> Option<(i64, i64, i64, bool)> {
-    let (y, m, d) = jdn_to_greg(jdn);
-    Some((y, m, d, false))
-}
-#[cfg(not(feature = "intl"))]
-fn chinese_to_jdn(_cal: &str, y: i64, m: i64, d: i64, _leap: bool) -> Option<i64> {
-    Some(greg_to_jdn(y, m, d))
 }
 
 /// The Chinese/dangi year's leap-month number (1..=12), or 0 if the year has
 /// none. `cal` selects the meridian (see [`chinese_from_jdn`]).
 fn chinese_leap_month(cal: &str, year: i64) -> i64 {
-    for m in 1..=12 {
-        if chinese_to_jdn(cal, year, m, 1, true).is_some() {
-            return m;
-        }
-    }
-    0
+    super::temporal_astro::leap_month_of_year(lunisolar_kind(cal), year)
 }
 
 // ---------------------------------------------------------------------------
