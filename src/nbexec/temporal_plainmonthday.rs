@@ -590,6 +590,17 @@ impl<'a> Interp<'a> {
                 day,
             };
             let iso = self.pmd_layer_fields(cal, &input, overflow)?;
+            // `CalendarMonthDayFromFields` resolves the month/day *in that year*
+            // first, so the intermediate date must satisfy `ISODateWithinLimits`
+            // before the reference year is re-derived. Without this an absurd
+            // `year` (the corpus uses ±999999) silently fell through to the
+            // reference search and produced a PlainMonthDay instead of throwing.
+            let days = iso_to_epoch_days(iso);
+            if !(crate::temporal_iso::MIN_EPOCH_DAYS..=crate::temporal_iso::MAX_EPOCH_DAYS)
+                .contains(&days)
+            {
+                return Err(self.pmd_range_error("PlainMonthDay: date is out of range"));
+            }
             // An explicit year and era/eraYear must agree.
             if year.is_some() && era.is_some() && era_year.is_some() {
                 let input_era = tcal::FieldsInput {
@@ -883,14 +894,32 @@ impl<'a> Interp<'a> {
         }
         let overflow = self.pmd_overflow(options)?;
 
-        // Year context: the provided year, else the receiver's calendar year.
-        let year_ctx = year.unwrap_or(existing.year);
+        // `ISODateToFields(calendar, isoDate, month-day)` contributes only
+        // `monthCode` and `day` — never a year — and `CalendarMergeFields` drops
+        // the receiver's `monthCode` as soon as the partial supplies `month` or
+        // `monthCode` of its own.
         let (month, month_code) = if month.is_some() || month_code.is_some() {
             (month, month_code)
         } else {
             (None, Some(existing.month_code.clone()))
         };
         let day = day.unwrap_or(existing.day);
+        // With no `monthCode` to go on, a non-ISO month-day cannot be resolved
+        // from `month` alone — there is no year to interpret it in, and the
+        // receiver does not supply one. (ISO is exempt: its reference year is
+        // fixed at 1972, so `month` is unambiguous.) This is the
+        // `CalendarResolveFields` TypeError.
+        if month_code.is_none() && year.is_none() {
+            return Err(self
+                .type_error("PlainMonthDay.with: 'monthCode' or 'year' is required with 'month'"));
+        }
+        // Without a year, the reference-year search resolves (monthCode, day)
+        // directly, exactly as the `from({ monthCode, day })` path does.
+        let Some(year_ctx) = year else {
+            let mc = month_code.expect("checked above");
+            let result = self.pmd_reference(cal, &mc, day, overflow)?;
+            return Ok(self.pmd_new(result, cal));
+        };
         let input = tcal::FieldsInput {
             year: Some(year_ctx),
             month,
