@@ -425,21 +425,6 @@ fn chinese_leap_month(cal: &str, year: i64) -> i64 {
     0
 }
 
-/// Whether an intercalary month numbered `num` ever occurs in the Chinese/Dangi
-/// table (used to decide whether a `M<NN>L` leap code that is absent in a given
-/// year is nonetheless a *valid* leap code that may be constrained onto `M<NN>`,
-/// vs. a code — like `M01L`/`M12L` — that never carries a leap month and is
-/// therefore invalid). A leap `M<NN>L` code is only constrainable for an `NN`
-/// that is astronomically an intercalary month somewhere in the supported range.
-fn chinese_leap_num_occurs(cal: &str, num: i64) -> bool {
-    if !(1..=12).contains(&num) {
-        return false;
-    }
-    // The intl table covers years 1900–2099; a leap month numbered `num`
-    // that never appears there is not a real intercalary month for this model.
-    (1900..=2099).any(|y| chinese_leap_month(cal, y) == num)
-}
-
 // ---------------------------------------------------------------------------
 // Internal calendar "parts" — arithmetic year, ordinal month, day, code
 // ---------------------------------------------------------------------------
@@ -922,7 +907,13 @@ pub(crate) fn constrain_leap_base_code(cal: &str, code: &str) -> Option<String> 
     }
     match cal {
         "hebrew" => (num == 5).then(|| "M06".to_string()),
-        "chinese" | "dangi" => chinese_leap_num_occurs(cal, num).then(|| format!("M{num:02}")),
+        // Every `M01L`..`M12L` is a well-formed Chinese/Dangi intercalary code
+        // and collapses onto the month it augments under `constrain` — whether or
+        // not that intercalary month ever actually occurs. (Rarity is not the
+        // test: `overflow: "reject"` throws on its own path, so restricting this
+        // to leap numbers observed in the ephemeris only broke the *constrain*
+        // case for the rare ones.)
+        "chinese" | "dangi" => (1..=12).contains(&num).then(|| format!("M{num:02}")),
         _ => None,
     }
 }
@@ -1826,13 +1817,16 @@ mod tests {
         assert!(fi("hebrew", 5783, "M05L", Overflow::Constrain).is_ok());
         assert!(fi("hebrew", 5784, "M02L", Overflow::Constrain).is_err());
         assert!(fi("hebrew", 5779, "M13", Overflow::Constrain).is_err());
-        // Chinese: `M01L` and `M12L` never carry an intercalary month → invalid
-        // even under constrain.
-        assert!(!chinese_leap_num_occurs("chinese", 1));
-        assert!(!chinese_leap_num_occurs("chinese", 12));
-        assert!(chinese_leap_num_occurs("chinese", 6));
-        assert!(fi("chinese", 2001, "M12L", Overflow::Constrain).is_err());
+        // Chinese: every `M01L`..`M12L` is a well-formed intercalary code, so
+        // under `constrain` it collapses onto the month it augments even for the
+        // numbers that (in this ephemeris) never actually carry a leap month —
+        // `reject` is what refuses an absent one. `M13` has no base month and
+        // stays invalid either way.
+        assert!(fi("chinese", 2001, "M12L", Overflow::Constrain).is_ok());
+        assert!(fi("chinese", 2001, "M01L", Overflow::Constrain).is_ok());
+        assert!(fi("chinese", 2001, "M12L", Overflow::Reject).is_err());
         assert!(fi("chinese", 2001, "M13", Overflow::Constrain).is_err());
+        assert!(fi("chinese", 2001, "M13L", Overflow::Constrain).is_err());
     }
 
     #[cfg(feature = "intl")]
