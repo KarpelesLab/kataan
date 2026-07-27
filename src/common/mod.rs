@@ -69,8 +69,8 @@ impl FloatExt for f64 {
 
 /// Sine of an angle **in degrees**, to within ~1e-13 absolute.
 ///
-/// The astronomical calendar algorithms (see
-/// [`temporal_astro`](crate::nbexec::temporal_astro)) evaluate hundreds of
+/// The astronomical calendar algorithms (the private `nbexec::temporal_astro`
+/// module) evaluate hundreds of
 /// `sin`/`cos` terms whose arguments are degree-valued polynomials, and `core`
 /// has no transcendental functions — so the `--no-default-features` build cannot
 /// use `f64::sin`. This is a self-contained replacement: reduce modulo 360°,
