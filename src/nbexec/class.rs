@@ -860,7 +860,7 @@ impl<'a> Interp<'a> {
         // instead of the freshly-built instance.
         let returned_object = match ret {
             Some(v) => v.as_handle().map(Handle::from_raw).is_some_and(|h| {
-                self.realm.string_value(h).is_none()
+                !self.realm.is_string_handle(h)
                     && self.realm.bigint_at(h).is_none()
                     && self.realm.symbol_at(h).is_none()
             }),
@@ -1409,7 +1409,7 @@ impl<'a> Interp<'a> {
         ret.and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .filter(|h| {
-                self.realm.string_value(*h).is_none()
+                !self.realm.is_string_handle(*h)
                     && self.realm.bigint_at(*h).is_none()
                     && self.realm.symbol_at(*h).is_none()
             })

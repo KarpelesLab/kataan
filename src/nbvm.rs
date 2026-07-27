@@ -923,14 +923,14 @@ fn loose_eq_coerce(realm: &mut Realm, x: NanBox, y: NanBox) -> (NanBox, NanBox) 
     let is_obj = |realm: &Realm, v: NanBox| {
         v.as_handle()
             .map(Handle::from_raw)
-            .is_some_and(|h| realm.string_value(h).is_none())
+            .is_some_and(|h| !realm.is_string_handle(h))
     };
     let is_prim = |realm: &Realm, v: NanBox| {
         v.as_number().is_some()
             || matches!(v.unpack(), crate::nanbox::Unpacked::Bool(_))
             || v.as_handle()
                 .map(Handle::from_raw)
-                .is_some_and(|h| realm.string_value(h).is_some())
+                .is_some_and(|h| realm.is_string_handle(h))
     };
     if is_obj(realm, x) && is_prim(realm, y) {
         let s = realm.to_display_string(x);
@@ -953,7 +953,7 @@ fn to_primitive(ctx: &mut Ctx, funcs: &[FnProto], v: NanBox, number_hint: bool) 
         return v;
     };
     let h = Handle::from_raw(raw);
-    if ctx.realm.string_value(h).is_some() || ctx.realm.date_at(h).is_some() {
+    if ctx.realm.is_string_handle(h) || ctx.realm.date_at(h).is_some() {
         return v;
     }
     let order: [&str; 2] = if number_hint {
@@ -975,7 +975,7 @@ fn to_primitive(ctx: &mut Ctx, funcs: &[FnProto], v: NanBox, number_hint: bool) 
                 || res
                     .as_handle()
                     .map(Handle::from_raw)
-                    .is_some_and(|rh| ctx.realm.string_value(rh).is_some());
+                    .is_some_and(|rh| ctx.realm.is_string_handle(rh));
             if is_prim {
                 return res;
             }
@@ -1040,9 +1040,11 @@ fn vm_call_native(
             .is_some_and(|h| ctx.realm.symbol_at(h).is_some())
         {
             ctx.realm.to_display_string(arg)
-        } else if arg.as_handle().map(Handle::from_raw).is_some_and(|h| {
-            ctx.realm.string_value(h).is_none() && ctx.realm.symbol_at(h).is_none()
-        }) {
+        } else if arg
+            .as_handle()
+            .map(Handle::from_raw)
+            .is_some_and(|h| !ctx.realm.is_string_handle(h) && ctx.realm.symbol_at(h).is_none())
+        {
             let prim = to_primitive(ctx, funcs, arg, false);
             ctx.realm.to_display_string(prim)
         } else {
@@ -3396,7 +3398,7 @@ fn json_normalize(
     // `toJSON(key)` replaces the value (real objects only — not strings/bigints/Dates,
     // whose serialization the realm handles).
     if let Some(h) = v.as_handle().map(Handle::from_raw)
-        && ctx.realm.string_value(h).is_none()
+        && !ctx.realm.is_string_handle(h)
         && ctx.realm.bigint_at(h).is_none()
         && ctx.realm.date_at(h).is_none()
     {
@@ -3418,7 +3420,7 @@ fn json_normalize(
     // Recurse into plain arrays/objects, rebuilding a normalized copy. Closures,
     // strings, and Dates pass through to the serializer unchanged.
     if let Some(h) = v.as_handle().map(Handle::from_raw)
-        && ctx.realm.string_value(h).is_none()
+        && !ctx.realm.is_string_handle(h)
         && !ctx.realm.is_vm_function(h)
         && ctx.realm.date_at(h).is_none()
     {
@@ -4551,7 +4553,7 @@ fn builtin_method(
                 let needs_walk = |v: NanBox| {
                     v.as_handle()
                         .map(Handle::from_raw)
-                        .is_some_and(|hh| ctx.realm.string_value(hh).is_none())
+                        .is_some_and(|hh| !ctx.realm.is_string_handle(hh))
                 };
                 if needs_walk(arg0()) || args.get(1).copied().is_some_and(needs_walk) {
                     return None;
@@ -4703,7 +4705,7 @@ fn vm_array_from(ctx: &mut Ctx, funcs: &[FnProto], args: &[NanBox]) -> Result<Na
             .array_elements(h)
             .map(<[_]>::to_vec)
             .unwrap_or_default(),
-        Some(h) if ctx.realm.string_value(h).is_some() => ctx
+        Some(h) if ctx.realm.is_string_handle(h) => ctx
             .realm
             .string_value(h)
             .unwrap_or_default()
@@ -5072,7 +5074,7 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
                     .map(|(k, _)| k)
                     .collect(),
                 // A string: its characters.
-                Some(h) if ctx.realm.string_value(h).is_some() => ctx
+                Some(h) if ctx.realm.is_string_handle(h) => ctx
                     .realm
                     .string_value(h)
                     .unwrap_or_default()

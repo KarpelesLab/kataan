@@ -1575,7 +1575,7 @@ impl<'a> Interp<'a> {
         let name = if raw_name
             .as_handle()
             .map(Handle::from_raw)
-            .is_some_and(|h| self.realm.string_value(h).is_some())
+            .is_some_and(|h| self.realm.is_string_handle(h))
         {
             self.realm.to_display_string(raw_name)
         } else {

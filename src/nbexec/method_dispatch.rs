@@ -304,13 +304,13 @@ impl<'a> Interp<'a> {
                 // ToObject before the method dispatch runs). Strings never own these
                 // methods, so reaching here with a string receiver is necessarily a
                 // generic `Array.prototype.<m>.call(str)` application.
-                self.realm.string_value(h).is_some()
+                self.realm.is_string_handle(h)
                     || self
                         .realm
                         .get_property(h, PRIM_WRAP)
                         .and_then(|p| p.as_handle())
                         .map(Handle::from_raw)
-                        .is_some_and(|ph| self.realm.string_value(ph).is_some())
+                        .is_some_and(|ph| self.realm.is_string_handle(ph))
             })
         {
             return Err(self.type_error(&alloc::format!(
@@ -353,7 +353,7 @@ impl<'a> Interp<'a> {
             if prim
                 .as_handle()
                 .map(Handle::from_raw)
-                .is_some_and(|ph| self.realm.string_value(ph).is_some())
+                .is_some_and(|ph| self.realm.is_string_handle(ph))
                 && matches!(
                     method,
                     "match" | "matchAll" | "search" | "replace" | "replaceAll" | "split"
@@ -2072,7 +2072,7 @@ impl<'a> Interp<'a> {
         // lookup happens ONLY when the argument **is an Object** — a primitive
         // regexp (a string, or a `BigInt`/`Symbol` whose prototype might carry a
         // `@@match`) is never inspected; it is coerced to a string pattern.
-        if self.realm.string_value(handle).is_some() {
+        if self.realm.is_string_handle(handle) {
             // `O` (the `this` value passed to the `@@method`) is the primitive
             // string receiver here; a `String` *wrapper* receiver is intercepted
             // earlier (before unwrapping) so its object identity is preserved.
@@ -2088,7 +2088,7 @@ impl<'a> Interp<'a> {
         // spec — so `"abc".match()` matches the empty pattern and a coerced
         // `toString` is honored. (`replace`/`replaceAll`/`split` keep treating a
         // non-RegExp argument literally, handled in the string-methods block below.)
-        if self.realm.string_value(handle).is_some()
+        if self.realm.is_string_handle(handle)
             && let Some(sym_name) = match method {
                 "match" => Some("match"),
                 "matchAll" => Some("matchAll"),
@@ -2824,13 +2824,13 @@ impl<'a> Interp<'a> {
         // data properties that `HasProperty` (used by the lazy scan) cannot see;
         // keep those on the materialization path (which has the `is_string_like`
         // special case).
-        let is_string_receiver = self.realm.string_value(handle).is_some()
+        let is_string_receiver = self.realm.is_string_handle(handle)
             || self
                 .realm
                 .get_property(handle, PRIM_WRAP)
                 .and_then(|p| p.as_handle())
                 .map(Handle::from_raw)
-                .is_some_and(|p| self.realm.string_value(p).is_some());
+                .is_some_and(|p| self.realm.is_string_handle(p));
         if self.realm.is_generic_array_like_target(handle)
             && LAZY_SCAN_GENERIC.contains(&method)
             && (array_proto_generic || self.inherits_array_proto(handle))
@@ -2974,13 +2974,13 @@ impl<'a> Interp<'a> {
                 // A String primitive/wrapper `this` (its boxed string) exposes every
                 // in-range index as a present own data property — `HasProperty`
                 // wouldn't see them, so treat them all as present.
-                let is_string_like = self.realm.string_value(handle).is_some()
+                let is_string_like = self.realm.is_string_handle(handle)
                     || self
                         .realm
                         .get_property(handle, PRIM_WRAP)
                         .and_then(|p| p.as_handle())
                         .map(Handle::from_raw)
-                        .is_some_and(|p| self.realm.string_value(p).is_some());
+                        .is_some_and(|p| self.realm.is_string_handle(p));
                 let mut tmp = Vec::with_capacity(len);
                 let mut present = Vec::with_capacity(len);
                 for i in 0..len {

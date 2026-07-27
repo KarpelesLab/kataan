@@ -6837,7 +6837,7 @@ impl<'a> Interp<'a> {
         let is_string = locales
             .as_handle()
             .map(Handle::from_raw)
-            .is_some_and(|h| self.realm.string_value(h).is_some());
+            .is_some_and(|h| self.realm.is_string_handle(h));
         let push_tag =
             |this: &mut Self, tag: &str, seen: &mut Vec<String>| -> Result<(), ExecError> {
                 match canonicalize_locale_id(tag) {
@@ -6904,7 +6904,7 @@ impl<'a> Interp<'a> {
             let el_is_string = el
                 .as_handle()
                 .map(Handle::from_raw)
-                .is_some_and(|h| self.realm.string_value(h).is_some());
+                .is_some_and(|h| self.realm.is_string_handle(h));
             let el_is_object = self.is_object_value(el) && !el_is_string;
             let ty = self.realm.type_of_value(el);
             let el_is_primitive_nonstring =

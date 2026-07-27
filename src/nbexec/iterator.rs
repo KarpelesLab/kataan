@@ -861,7 +861,7 @@ impl<'a> Interp<'a> {
         // GetIteratorFlattenable(src, iterate-string-primitives): `src` must be an
         // Object or a primitive String; any other primitive is a TypeError.
         let src_h = src.as_handle().map(Handle::from_raw);
-        let is_string_prim = src_h.is_some_and(|h| self.realm.string_value(h).is_some());
+        let is_string_prim = src_h.is_some_and(|h| self.realm.is_string_handle(h));
         if !self.is_object_value(src) && !is_string_prim {
             let m = self.new_str("Iterator.from called on a non-object");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
@@ -927,7 +927,7 @@ impl<'a> Interp<'a> {
                     .get_property(h, PRIM_WRAP)
                     .and_then(|p| p.as_handle())
                     .map(Handle::from_raw)
-                    .is_some_and(|ph| self.realm.string_value(ph).is_some());
+                    .is_some_and(|ph| self.realm.is_string_handle(ph));
                 let is_builtin_iterable = is_string_wrapper
                     || is_string_prim
                     || self.realm.array_elements(h).is_some()
@@ -1114,7 +1114,7 @@ impl<'a> Interp<'a> {
             // A built-in iterable (array/string/Map/Set/generator) exposes no
             // readable `@@iterator`; it is drained directly at iteration time.
             let is_builtin_iterable = self.realm.array_elements(h).is_some()
-                || self.realm.string_value(h).is_some()
+                || self.realm.is_string_handle(h)
                 || self.realm.collection_entries(h).is_some()
                 || self.realm.get_property(h, GEN_BUF).is_some();
             if !has_method && !is_builtin_iterable {
@@ -1160,7 +1160,7 @@ impl<'a> Interp<'a> {
             };
         }
         if self.realm.array_elements(vh).is_some()
-            || self.realm.string_value(vh).is_some()
+            || self.realm.is_string_handle(vh)
             || self.realm.collection_entries(vh).is_some()
             || self.realm.get_property(vh, GEN_BUF).is_some()
         {
@@ -2306,7 +2306,7 @@ impl<'a> Interp<'a> {
         // wrapper is not iterable — falls through to the error).
         if let Some(prim) = self.realm.get_property(h, PRIM_WRAP)
             && let Some(ph) = prim.as_handle().map(Handle::from_raw)
-            && self.realm.string_value(ph).is_some()
+            && self.realm.is_string_handle(ph)
         {
             return self.iterate_values(prim);
         }
@@ -2673,7 +2673,7 @@ impl<'a> Interp<'a> {
                 return Ok(it.as_handle().map(Handle::from_raw));
             }
         }
-        if self.realm.string_value(h).is_some()
+        if self.realm.is_string_handle(h)
             || self.realm.collection_entries(h).is_some()
             || self.realm.get_property(h, GEN_BUF).is_some()
         {

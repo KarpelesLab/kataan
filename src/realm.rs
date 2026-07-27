@@ -1669,6 +1669,16 @@ impl Realm {
         Some(self.heap.get(handle)?.as_str()?.materialize())
     }
 
+    /// Whether `handle` refers to a string cell — an O(1) *type test*.
+    ///
+    /// Prefer this over `string_value(h).is_some()`, which materializes the whole
+    /// rope just to throw it away: for a string built by repeated `+=` that turns
+    /// each type test into a full copy, making the concatenation quadratic.
+    #[must_use]
+    pub fn is_string_handle(&self, handle: Handle) -> bool {
+        self.heap.get(handle).is_some_and(|c| c.as_str().is_some())
+    }
+
     /// The array elements at `handle`, or `None` if it is not an array.
     #[must_use]
     pub fn array_elements(&self, handle: Handle) -> Option<&[NanBox]> {

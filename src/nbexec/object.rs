@@ -1478,7 +1478,7 @@ impl<'a> Interp<'a> {
         };
         let h = Handle::from_raw(raw);
         // Immutable heap values are shared, not copied.
-        if self.realm.string_value(h).is_some() || self.realm.bigint_at(h).is_some() {
+        if self.realm.is_string_handle(h) || self.realm.bigint_at(h).is_some() {
             return Ok(v);
         }
         if self.is_callable(h) || self.realm.symbol_at(h).is_some() {
@@ -1549,7 +1549,7 @@ impl<'a> Interp<'a> {
         }
         // Any other heap value that is not a non-object primitive (string /
         // bigint are heap cells but not weakly holdable).
-        self.realm.string_value(h).is_none() && self.realm.bigint_at(h).is_none()
+        !self.realm.is_string_handle(h) && self.realm.bigint_at(h).is_none()
     }
 
     /// `thisSymbolValue(this)` (ECMA-262 20.4.3): if `this` is a Symbol
@@ -1805,7 +1805,7 @@ impl<'a> Interp<'a> {
             Unpacked::Bool(_) => self.make_primitive_wrapper(v, N_BOOLEAN),
             Unpacked::Handle(raw) => {
                 let h = Handle::from_raw(raw);
-                if self.realm.string_value(h).is_some() {
+                if self.realm.is_string_handle(h) {
                     self.make_primitive_wrapper(v, N_STRING)
                 } else if self.realm.symbol_at(h).is_some() {
                     // ToObject(Symbol) → a Symbol wrapper object (its prototype
@@ -2382,7 +2382,7 @@ impl<'a> Interp<'a> {
                 }
                 _ => "Object",
             }
-        } else if self.realm.string_value(h).is_some() {
+        } else if self.realm.is_string_handle(h) {
             "String"
         } else if self.realm.date_at(h).is_some() {
             "Date"
@@ -2647,7 +2647,7 @@ impl<'a> Interp<'a> {
     ) -> Option<NanBox> {
         let name = if self.realm.is_array(handle) {
             "Array"
-        } else if self.realm.string_value(handle).is_some() {
+        } else if self.realm.is_string_handle(handle) {
             "String"
         } else if self.realm.regexp_at(handle).is_some() {
             "RegExp"

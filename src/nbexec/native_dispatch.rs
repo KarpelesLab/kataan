@@ -869,7 +869,7 @@ impl<'a> Interp<'a> {
                 let is_string = v
                     .as_handle()
                     .map(Handle::from_raw)
-                    .is_some_and(|h| self.realm.string_value(h).is_some());
+                    .is_some_and(|h| self.realm.is_string_handle(h));
                 if !is_string {
                     return Err(
                         self.type_error("set Error.prototype.stack requires a String value")
@@ -1692,7 +1692,7 @@ impl<'a> Interp<'a> {
                         .filter(|k| {
                             k.as_handle()
                                 .map(Handle::from_raw)
-                                .is_some_and(|h| self.realm.string_value(h).is_some())
+                                .is_some_and(|h| self.realm.is_string_handle(h))
                         })
                         .collect();
                     return Ok(NanBox::handle(self.realm.new_array(boxed).to_raw()));
@@ -1995,7 +1995,7 @@ impl<'a> Interp<'a> {
                             .is_some();
                         has_iter
                             || self.realm.is_array_like(h)
-                            || self.realm.string_value(h).is_some()
+                            || self.realm.is_string_handle(h)
                             || self.realm.collection_is_set(h).is_some()
                             || self.realm.get_property(h, GEN_BUF).is_some()
                     }

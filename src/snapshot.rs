@@ -173,7 +173,7 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
     let mut root_indices = Vec::new();
     for r in roots {
         // Only value cells (string/date/bigint/array/object) are serializable roots.
-        let serializable = realm.string_value(*r).is_some()
+        let serializable = realm.is_string_handle(*r)
             || realm.date_at(*r).is_some()
             || realm.bigint_at(*r).is_some()
             || realm.function_at(*r).is_some()

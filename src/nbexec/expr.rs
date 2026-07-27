@@ -233,7 +233,7 @@ impl<'a> Interp<'a> {
     pub(crate) fn coerce_property_key(&mut self, k: NanBox) -> Result<String, ExecError> {
         let is_object_key = k.as_handle().is_some_and(|raw| {
             let h = Handle::from_raw(raw);
-            self.realm.symbol_at(h).is_none() && self.realm.string_value(h).is_none()
+            self.realm.symbol_at(h).is_none() && !self.realm.is_string_handle(h)
         });
         if is_object_key {
             let p = self.coerce_object(k, "string")?;
@@ -292,7 +292,7 @@ impl<'a> Interp<'a> {
     /// rather than a string/symbol/bigint primitive or an immediate.
     pub(crate) fn is_object_value(&self, v: NanBox) -> bool {
         v.as_handle().map(Handle::from_raw).is_some_and(|h| {
-            self.realm.string_value(h).is_none()
+            !self.realm.is_string_handle(h)
                 && self.realm.symbol_at(h).is_none()
                 && self.realm.bigint_at(h).is_none()
         })
@@ -1751,7 +1751,7 @@ impl<'a> Interp<'a> {
                         || self.realm.typed_kind(h).is_some()
                     {
                         Some("Array Iterator")
-                    } else if self.realm.string_value(h).is_some()
+                    } else if self.realm.is_string_handle(h)
                         || self
                             .realm
                             .get_property(h, PRIM_WRAP_TYPE)
@@ -3688,7 +3688,7 @@ impl<'a> Interp<'a> {
     /// For a built-in array/string/function value, the first-class method `name`
     /// from its constructor's prototype (`Array.prototype` etc.), or `None`.
     pub(crate) fn builtin_proto_method(&mut self, handle: Handle, name: &str) -> Option<NanBox> {
-        let ctor_name = if self.realm.string_value(handle).is_some() {
+        let ctor_name = if self.realm.is_string_handle(handle) {
             "String"
         } else if self.realm.is_array_like(handle) {
             "Array"
@@ -3779,7 +3779,7 @@ impl<'a> Interp<'a> {
                 // `toString` runs once, before the RHS), reused for read and write.
                 if key.as_handle().is_some_and(|r| {
                     let h = crate::heap::Handle::from_raw(r);
-                    self.realm.symbol_at(h).is_none() && self.realm.string_value(h).is_none()
+                    self.realm.symbol_at(h).is_none() && !self.realm.is_string_handle(h)
                 }) {
                     let pk = self.coerce_property_key(key)?;
                     key = self.new_str(&pk);
@@ -3867,7 +3867,7 @@ impl<'a> Interp<'a> {
                 // typed-array fast paths in `read_member_value` still apply.
                 if key.as_handle().is_some_and(|raw| {
                     let h = Handle::from_raw(raw);
-                    self.realm.symbol_at(h).is_none() && self.realm.string_value(h).is_none()
+                    self.realm.symbol_at(h).is_none() && !self.realm.is_string_handle(h)
                 }) {
                     let pk = self.coerce_property_key(key)?;
                     key = self.new_str(&pk);
@@ -5004,7 +5004,7 @@ impl<'a> Interp<'a> {
         let is_coercible_object = |this: &Self, v: NanBox| {
             v.as_handle().map(Handle::from_raw).is_some_and(|h| {
                 this.realm.bigint_at(h).is_none()
-                    && this.realm.string_value(h).is_none()
+                    && !this.realm.is_string_handle(h)
                     && this.realm.symbol_at(h).is_none()
             })
         };
@@ -5101,7 +5101,7 @@ impl<'a> Interp<'a> {
             // ToPrimitive on them is a no-op, so they are not the "object" side).
             let obj = |this: &Self, v: NanBox| {
                 v.as_handle().map(Handle::from_raw).is_some_and(|h| {
-                    this.realm.string_value(h).is_none()
+                    !this.realm.is_string_handle(h)
                         && this.realm.symbol_at(h).is_none()
                         && this.realm.bigint_at(h).is_none()
                 })
@@ -5114,7 +5114,7 @@ impl<'a> Interp<'a> {
                 v.as_number().is_some()
                     || matches!(v.unpack(), crate::nanbox::Unpacked::Bool(_))
                     || v.as_handle().map(Handle::from_raw).is_some_and(|h| {
-                        this.realm.string_value(h).is_some()
+                        this.realm.is_string_handle(h)
                             || this.realm.symbol_at(h).is_some()
                             || this.realm.bigint_at(h).is_some()
                     })
@@ -5318,7 +5318,7 @@ impl<'a> Interp<'a> {
             return Ok(false);
         };
         if self.realm.symbol_at(oh).is_some()
-            || self.realm.string_value(oh).is_some()
+            || self.realm.is_string_handle(oh)
             || self.realm.bigint_at(oh).is_some()
         {
             return Ok(false);
@@ -5468,7 +5468,7 @@ impl<'a> Interp<'a> {
         }
         if self.current.get("Object").and_then(|v| v.as_handle()) == ctor.as_handle() {
             // Heap primitives (string/symbol/bigint values) are not objects.
-            if self.realm.string_value(oh).is_some()
+            if self.realm.is_string_handle(oh)
                 || self.realm.symbol_at(oh).is_some()
                 || self.realm.bigint_at(oh).is_some()
             {

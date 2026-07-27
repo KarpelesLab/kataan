@@ -1095,7 +1095,7 @@ impl<'a> Interp<'a> {
                 // object (a String wrapper's per-unit indices are read as array-like;
                 // a Symbol/BigInt wrapper is what a method like `sort` returns).
                 let is_boxable_prim = this_val.as_handle().map(Handle::from_raw).is_some_and(|h| {
-                    self.realm.string_value(h).is_some()
+                    self.realm.is_string_handle(h)
                         || self.realm.symbol_at(h).is_some()
                         || self.realm.bigint_at(h).is_some()
                 });

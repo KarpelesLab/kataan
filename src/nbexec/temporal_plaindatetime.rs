@@ -1385,7 +1385,7 @@ impl<'a> Interp<'a> {
         let string_form = options
             .as_handle()
             .map(Handle::from_raw)
-            .is_some_and(|h| self.realm.string_value(h).is_some());
+            .is_some_and(|h| self.realm.is_string_handle(h));
         let units = [
             "day",
             "days",

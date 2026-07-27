@@ -130,7 +130,7 @@ impl<'a> Interp<'a> {
                         Unpacked::Number(_) => Some(self.realm.to_display_string(e)),
                         Unpacked::Handle(raw) => {
                             let h = Handle::from_raw(raw);
-                            if self.realm.string_value(h).is_some() {
+                            if self.realm.is_string_handle(h) {
                                 Some(self.realm.to_display_string(e))
                             } else if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
                                 // A String/Number wrapper contributes its key via

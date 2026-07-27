@@ -548,7 +548,7 @@ impl<'a> Interp<'a> {
         let is_string = v
             .as_handle()
             .map(Handle::from_raw)
-            .is_some_and(|h| self.realm.string_value(h).is_some());
+            .is_some_and(|h| self.realm.is_string_handle(h));
         if !is_string {
             return Err(self
                 .type_error("toPlainDateTime: expected a time, time-like object, or ISO string"));

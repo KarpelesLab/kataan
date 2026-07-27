@@ -206,7 +206,7 @@ impl<'a> Interp<'a> {
         let is_string = item
             .as_handle()
             .map(Handle::from_raw)
-            .is_some_and(|h| self.realm.string_value(h).is_some());
+            .is_some_and(|h| self.realm.is_string_handle(h));
         if !is_string {
             return Err(self.type_error("Temporal.PlainTime: invalid argument"));
         }
@@ -334,7 +334,7 @@ impl<'a> Interp<'a> {
         let is_string = item
             .as_handle()
             .map(Handle::from_raw)
-            .is_some_and(|h| self.realm.string_value(h).is_some());
+            .is_some_and(|h| self.realm.is_string_handle(h));
         if !is_string {
             return Err(self.type_error("Temporal.Duration: invalid argument"));
         }
@@ -446,7 +446,7 @@ impl<'a> Interp<'a> {
         let (increment, mode, smallest_str) = if round_to
             .as_handle()
             .map(Handle::from_raw)
-            .is_some_and(|h| self.realm.string_value(h).is_some())
+            .is_some_and(|h| self.realm.is_string_handle(h))
         {
             (
                 1,

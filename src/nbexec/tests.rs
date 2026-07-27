@@ -11611,3 +11611,25 @@ fn array_length_shrink_from_sparse_length_terminates() {
         "4"
     );
 }
+
+#[test]
+fn string_concat_is_linear_not_quadratic() {
+    // `+=` builds a rope in O(1), but the surrounding `is a string?` type tests
+    // used to go through `string_value`, which MATERIALIZES the rope — turning
+    // every append into a full copy. This many appends takes seconds if the
+    // quadratic behaviour returns, and milliseconds otherwise.
+    assert_eq!(
+        run("var s=''; for (var i=0;i<40000;i++) s+='x'; s.length"),
+        "40000"
+    );
+    // The rope still reads back correctly through the type-test paths.
+    assert_eq!(
+        run("var s=''; for (var i=0;i<5;i++) s+=i; s + '|' + (typeof s) + '|' + s.charAt(3)"),
+        "01234|string|3"
+    );
+    // A lone-surrogate boundary pair still coalesces across a concat.
+    assert_eq!(
+        run(r#"var s="\uD83D"; s += "\uDE00"; s.length + ":" + s.codePointAt(0)"#),
+        "2:128512"
+    );
+}
