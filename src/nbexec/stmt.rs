@@ -1866,8 +1866,19 @@ impl<'a> Interp<'a> {
     /// operate on distinct bindings from the previous iteration's. `is_const`
     /// preserves the head's immutability so a `for (const …)` increment/body
     /// assignment still throws a TypeError.
+    ///
+    /// The new environment is parented on `lastIterationEnv.[[OuterEnv]]` — the
+    /// scope *enclosing* the loop — exactly as 14.7.4.4 step 1.b/1.d specifies,
+    /// NOT on the outgoing iteration. Iteration environments are therefore
+    /// siblings and the chain stays a constant depth; chaining them would make
+    /// every identifier lookup in the loop walk one link per completed iteration,
+    /// i.e. quadratic in the trip count (and retain every iteration's scope).
     fn per_iteration_env(&mut self, names: &[String], is_const: bool) {
-        let iter = self.current.child();
+        let outer = self
+            .current
+            .parent()
+            .unwrap_or_else(|| self.current.clone());
+        let iter = outer.child();
         for name in names {
             let v = self.current.get(name).unwrap_or(NanBox::undefined());
             if is_const {

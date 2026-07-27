@@ -11537,3 +11537,36 @@ fn shadow_realm_nested_realms_stay_isolated() {
     "#;
     assert_eq!(run(program), "true");
 }
+
+#[test]
+fn per_iteration_let_env_is_flat_and_captures_per_iteration() {
+    // The classic per-iteration capture: each closure sees its own `i`.
+    assert_eq!(
+        run("var f=[]; for (let i=0;i<3;i++) f.push(()=>i); f.map(g=>g()).join(',')"),
+        "0,1,2"
+    );
+    // The increment and the body see the same (current) iteration binding.
+    assert_eq!(run("var s=0; for (let i=0;i<5;i++) { s+=i; } s"), "10");
+    // …and a closure made in the *increment* also captures per-iteration.
+    assert_eq!(
+        run("var f=[]; for (let i=0;i<3;i++,f.push(()=>i)); f.map(g=>g()).join(',')"),
+        "1,2,3"
+    );
+    // Each iteration environment is a sibling parented on the loop's OUTER
+    // scope, not on the previous iteration (14.7.4.4 step 1.b) — so an outer
+    // binding stays exactly one lookup away however many iterations have run.
+    // Chaining them made every lookup in the loop walk one link per completed
+    // iteration; this trip count is large enough that the quadratic form takes
+    // minutes while the correct one is instant.
+    assert_eq!(
+        run("var s=0; for (let i=0;i<20000;i++) { s+=1; } s"),
+        "20000"
+    );
+    // A `const` head keeps its immutability across the per-iteration copy.
+    assert_eq!(
+        run(
+            "var ok=false; try { for (const c=0;;) { c=1; } } catch (e) { ok = e instanceof TypeError; } ok"
+        ),
+        "true"
+    );
+}
