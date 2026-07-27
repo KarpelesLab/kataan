@@ -2895,7 +2895,12 @@ impl<'a> Interp<'a> {
         // mutates a later index is observed; the result is built via
         // `ArraySpeciesCreate` → `CreateDataPropertyOrThrow` (an out-of-range `length`
         // throws a RangeError before any callback, matching `ArrayCreate`).
-        if self.realm.is_generic_array_like_target(handle)
+        // A typed array is not a "generic array-like target" — it has its own
+        // exotic element methods — but `Array.prototype.map.call(ta)` *is* the
+        // generic algorithm, and must read live: the callback can `resize()` the
+        // backing buffer and take later indices out of bounds.
+        let generic_over_typed = array_proto_generic && self.realm.typed_kind(handle).is_some();
+        if (self.realm.is_generic_array_like_target(handle) || generic_over_typed)
             && matches!(method, "map" | "filter")
             && (array_proto_generic || self.inherits_array_proto(handle))
             && !self.inherits_iterator_proto(handle)
@@ -3490,12 +3495,22 @@ impl<'a> Interp<'a> {
             // must `[[Get]]` through the prototype (a hole may resolve to an inherited
             // value / getter), writes must `[[Set]]` (firing inherited setters) and
             // deletes must `DeletePropertyOrThrow`. This mirrors the precise gating
-            // already used by `sort`/`reverse`/`copyWithin`. A typed array (which has
-            // no holes and its own exotic element methods) never takes this path.
-            let precise_array = self.realm.typed_kind(handle).is_none()
-                && (self.realm.array_has_index_overrides(handle)
-                    || elems.iter().any(|e| e.is_hole())
-                    || self.realm.proto_index_accessor_dirty());
+            // already used by `sort`/`reverse`/`copyWithin`.
+            //
+            // A typed array reached through its *own* `%TypedArray%.prototype`
+            // method never needs this — it has no holes, and those methods are
+            // exotic-element operations. But `Array.prototype.map.call(ta)` is
+            // the *generic* array-like algorithm, which the spec defines in terms
+            // of `HasProperty`/`Get` per index; the snapshot is only an
+            // optimization, and it is unsound here because the callback can
+            // `resize()` the backing buffer and take indices out of bounds
+            // underneath the iteration.
+            let generic_typed = array_proto_generic && self.realm.typed_kind(handle).is_some();
+            let precise_array = generic_typed
+                || (self.realm.typed_kind(handle).is_none()
+                    && (self.realm.array_has_index_overrides(handle)
+                        || elems.iter().any(|e| e.is_hole())
+                        || self.realm.proto_index_accessor_dirty()));
             match method {
                 "push" => {
                     // Precise: `Set(O, ToString(len+i), E, true)` fires an inherited
@@ -4305,7 +4320,12 @@ impl<'a> Interp<'a> {
                     // ToIntegerOrInfinity (abrupt-propagating) and allocates the
                     // result via TypedArraySpeciesCreate; a plain array keeps the
                     // existing infallible bound computation + plain-array result.
-                    if self.realm.typed_kind(handle).is_some() {
+                    // …unless this is a *generic* `Array.prototype.slice.call(ta)`,
+                    // which is the array-like algorithm: `len` is read before the
+                    // argument coercion, and each index is then `HasProperty`/`Get`
+                    // afterwards, so a coercion that shrinks the buffer leaves holes
+                    // rather than throwing.
+                    if !array_proto_generic && self.realm.typed_kind(handle).is_some() {
                         let len = elems.len();
                         let a = self.typed_clamp_index_checked(arg(0), 0, len)?;
                         let b = self.typed_clamp_index_checked(arg(1), len, len)?;
@@ -4967,8 +4987,11 @@ impl<'a> Interp<'a> {
                     // in place (checked before the comparator runs).
                     self.guard_view_immutable(handle)?;
                     // Sorts in place and returns the same array. A typed array sorts
-                    // numerically by default (a plain array lexicographically).
-                    let numeric = self.realm.typed_kind(handle).is_some();
+                    // numerically by default (a plain array lexicographically) — but
+                    // only through its own `%TypedArray%.prototype.sort`. A generic
+                    // `Array.prototype.sort.call(ta)` is the array-like algorithm,
+                    // whose default comparator is the string one.
+                    let numeric = !array_proto_generic && self.realm.typed_kind(handle).is_some();
                     // A plain array with hole or accessor-override indices runs the
                     // spec-precise `SortIndexedProperties`: collect every *present*
                     // element via `[[Get]]` (index getters fire), sort, write the
@@ -4976,11 +4999,24 @@ impl<'a> Interp<'a> {
                     // `DeletePropertyOrThrow` the trailing indices. An ordinary
                     // dense array (and every typed array) keeps the fast in-memory
                     // sort over its element store.
-                    if !numeric
-                        && let Some(len) = self.realm.array_length(handle)
-                        && (self.realm.array_has_index_overrides(handle)
-                            || elems.iter().any(|e| e.is_hole()))
-                    {
+                    // A generic `Array.prototype.sort.call(ta)` always takes the
+                    // precise path: the comparator may `resize()` the buffer, and the
+                    // write-back is `Set(O, k, v)`, which on an out-of-bounds
+                    // integer-indexed key is a silent no-op — so the elements must
+                    // *not* be blitted back into the store.
+                    let precise_len =
+                        if array_proto_generic && self.realm.typed_kind(handle).is_some() {
+                            Some(elems.len())
+                        } else if !numeric
+                            && let Some(len) = self.realm.array_length(handle)
+                            && (self.realm.array_has_index_overrides(handle)
+                                || elems.iter().any(|e| e.is_hole()))
+                        {
+                            Some(len)
+                        } else {
+                            None
+                        };
+                    if let Some(len) = precise_len {
                         // Validate the comparefn up front (before any element access).
                         if !matches!(arg(0).unpack(), Unpacked::Undefined)
                             && !self.is_callable_value(arg(0))

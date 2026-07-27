@@ -1099,8 +1099,13 @@ impl<'a> Interp<'a> {
                     this_val
                 };
                 let this_eff = match this_obj.as_handle().map(Handle::from_raw) {
+                    // `map`/`filter` are excluded: they reach a generic per-index
+                    // path that already builds a plain array via ArraySpeciesCreate,
+                    // and copying the elements up front would freeze a view whose
+                    // buffer the callback is allowed to resize.
                     Some(h)
                         if PLAIN_ARRAY_RESULT.contains(&name.as_str())
+                            && !matches!(name.as_str(), "map" | "filter" | "slice")
                             && self.realm.typed_kind(h).is_some() =>
                     {
                         let elems = self.realm.typed_elements(h).unwrap_or_default();
