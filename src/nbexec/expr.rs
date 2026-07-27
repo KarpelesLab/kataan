@@ -2806,15 +2806,21 @@ impl<'a> Interp<'a> {
     /// (so `-1`, `4294967296`, `1.5`, `NaN` are RangeErrors), and the `ToNumber`
     /// coercion fires `valueOf`/`toString` (a Symbol throws). Returns the
     /// validated `u32` length.
+    ///
+    /// Steps 3 and 4 coerce `v` *twice* — once for `ToUint32`, once for
+    /// `ToNumber` — and both are observable, so `v.valueOf` runs twice even when
+    /// the two agree.
     pub(crate) fn array_length_from_value(&mut self, v: NanBox) -> Result<usize, ExecError> {
         // ToNumber(v) — abrupt-propagating (a Symbol/throwing valueOf).
-        let num = self.coerce_to_number(v)?;
-        match self.realm.array_length_uint32(num) {
-            Some(n) => Ok(n as usize),
-            None => {
-                let m = self.new_str("Invalid array length");
-                Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))))
-            }
+        let first = self.coerce_to_number(v)?;
+        let new_len = self.realm.to_number(first) as u32;
+        let second = self.coerce_to_number(v)?;
+        let number_len = self.realm.to_number(second);
+        if number_len.is_finite() && number_len == f64::from(new_len) {
+            Ok(new_len as usize)
+        } else {
+            let m = self.new_str("Invalid array length");
+            Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))))
         }
     }
 

@@ -1295,9 +1295,15 @@ impl<'a> Interp<'a> {
             // length is a RangeError). `coerce_to_number` runs ToPrimitive (a
             // throwing `toString`/`valueOf` propagates; one returning a non-
             // primitive is itself a TypeError).
+            //
+            // Steps 3 and 4 coerce `Desc.[[Value]]` *twice* — `ToUint32` then
+            // `ToNumber` — and both are observable: a `valueOf` that changes the
+            // array between them (say, demoting `length` to non-writable) is
+            // exactly what decides the outcome of the validation below.
+            let prim = self.coerce_to_number(value)?;
+            let len = self.realm.to_number(prim) as u32;
             let prim = self.coerce_to_number(value)?;
             let num = self.realm.to_number(prim);
-            let len = num as u32;
             if !(num.is_finite() && f64::from(len) == num) {
                 let m = self.new_str("Invalid array length");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));

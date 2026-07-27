@@ -1478,6 +1478,22 @@ impl<'a> Interp<'a> {
                         self.assign_member_value(rh, arg(1), value)?;
                         return Ok(NanBox::boolean(true));
                     }
+                    // `Reflect.set(array, "length", v)` is ArraySetLength, whose
+                    // order matters: `v` is coerced *first* (twice, observably), and
+                    // only then validated against the current writability — which the
+                    // coercion itself may have demoted. A rejected length is a `false`
+                    // return, not a throw, and the ordinary `can_write_property` check
+                    // below would read the writability too early to see it.
+                    if key == "length" && self.realm.is_array(rh) {
+                        let n = self.array_length_from_value(value)?;
+                        if self.realm.array_length_is_readonly(rh) {
+                            return Ok(NanBox::boolean(false));
+                        }
+                        // A shrink that hits a non-configurable index stops there and
+                        // reports failure (the length is left one above it).
+                        let all_deleted = self.set_array_length_checked(rh, n)?;
+                        return Ok(NanBox::boolean(all_deleted));
+                    }
                     if !self.can_write_property(rh, &key) {
                         return Ok(NanBox::boolean(false));
                     }

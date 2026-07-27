@@ -15,8 +15,6 @@ built-ins/Array/fromAsync/asyncitems-array-add.js  # [sloppy] async did not comp
 built-ins/Array/fromAsync/asyncitems-array-mutate.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [1, 2, 3] and expected [1, 8, 3] should have the same conten)
 built-ins/Array/fromAsync/asyncitems-array-remove.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [1, 2, 3] and expected [1, 2] should have the same contents.)
 built-ins/Array/isArray/15.4.3.2-0-5.js  # [sloppy] expected pass, Runtime Test262Error: Array.isArray(Array.prototype) must return true Expected SameValue(«false», «true») to be true
-built-ins/Array/length/define-own-prop-length-coercion-order-set.js  # [sloppy] expected pass, Runtime Test262Error: Actual [number] and expected [number, number] should have the same contents. The value of hints is expected to be ["number", "number"]
-built-ins/Array/length/define-own-prop-length-coercion-order.js  # [sloppy] expected pass, Runtime Test262Error: Object.defineProperty(array, "length", {value: length, writable: true}) throws a TypeError exception Expected a TypeError to be thrown but no exception was thrown at all
 built-ins/Array/prototype/exotic-array.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«0», «3») to be true
 built-ins/ArrayBuffer/data-allocation-after-object-creation.js  # [sloppy] expected pass, Runtime Test262Error: Expected a DummyError but got a RangeError
 built-ins/ArrayBuffer/options-maxbytelength-compared-before-object-creation.js  # [sloppy] expected pass, Runtime Test262Error: Expected a RangeError but got a Test262Error
