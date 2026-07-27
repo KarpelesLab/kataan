@@ -11722,3 +11722,103 @@ fn array_push_pop_fast_path_preserves_semantics() {
         "40000:39999"
     );
 }
+
+#[test]
+fn collection_hash_index_matches_same_value_zero() {
+    // The index hash must agree with SameValueZero everywhere the two differ
+    // from `===`: NaN is its own key, and -0/+0 are one key.
+    assert_eq!(
+        run("var m=new Map(); m.set(NaN,'n'); m.get(NaN) + ':' + m.has(NaN) + ':' + m.size"),
+        "n:true:1"
+    );
+    assert_eq!(
+        run(
+            "var m=new Map(); m.set(-0,'z'); m.set(0,'p'); m.size + ':' + m.get(-0) + ':' +
+             Object.is(m.keys().next().value, 0)"
+        ),
+        "1:p:true"
+    );
+    // Strings and BigInts are value types: distinct cells, one key.
+    assert_eq!(
+        run("var m=new Map(); m.set('a'+'b', 1); m.get('ab') + ':' + m.has(['a','b'].join(''))"),
+        "1:true"
+    );
+    assert_eq!(
+        run("var m=new Map(); m.set(10n**20n, 'big'); m.get(BigInt('1' + '0'.repeat(20)))"),
+        "big"
+    );
+    // Objects and symbols are identity keys — equal-looking ones stay distinct.
+    assert_eq!(
+        run("var m=new Map(); var a={},b={}; m.set(a,1); m.set(b,2);
+             m.size + ':' + m.get(a) + ':' + m.get(b)"),
+        "2:1:2"
+    );
+    assert_eq!(
+        run("var m=new Map(); m.set(Symbol('x'),1); m.set(Symbol('x'),2); m.size"),
+        "2"
+    );
+    // Primitives that are not numbers still discriminate.
+    assert_eq!(
+        run(
+            "var m=new Map(); m.set(true,1); m.set(false,2); m.set(null,3); m.set(undefined,4);
+             [m.get(true),m.get(false),m.get(null),m.get(undefined),m.size].join(',')"
+        ),
+        "1,2,3,4,4"
+    );
+    // A number key and its string form are different keys.
+    assert_eq!(
+        run("var m=new Map(); m.set(1,'n'); m.set('1','s'); m.size + ':' + m.get(1) + m.get('1')"),
+        "2:ns"
+    );
+}
+
+#[test]
+fn collection_index_survives_mutation() {
+    // Delete renumbers the entries, so the index must be invalidated.
+    assert_eq!(
+        run("var m=new Map(); for (var i=0;i<50;i++) m.set(i,i);
+             m.delete(10); m.delete(0);
+             [m.has(10), m.has(0), m.get(11), m.get(49), m.size].join(',')"),
+        "false,false,11,49,48"
+    );
+    // …and re-inserting a deleted key works (it appends at the end).
+    assert_eq!(
+        run(
+            "var m=new Map(); m.set('a',1); m.set('b',2); m.delete('a'); m.set('a',3);
+             [...m.keys()].join('') + ':' + m.get('a')"
+        ),
+        "ba:3"
+    );
+    // clear() drops everything, and the map is usable afterwards.
+    assert_eq!(
+        run(
+            "var m=new Map(); for (var i=0;i<30;i++) m.set(i,i); m.clear();
+             m.size + ':' + m.has(5) + ':' + (m.set(5,'x'), m.get(5))"
+        ),
+        "0:false:x"
+    );
+    // Overwriting an existing key updates in place and keeps insertion order.
+    assert_eq!(
+        run("var m=new Map(); m.set('a',1); m.set('b',2); m.set('a',9);
+             m.size + ':' + [...m.values()].join(',')"),
+        "2:9,2"
+    );
+    // Sets behave the same way.
+    assert_eq!(
+        run("var s=new Set(); for (var i=0;i<40;i++) s.add(i%20);
+             s.size + ':' + s.has(19) + ':' + (s.delete(19), s.has(19))"),
+        "20:true:false"
+    );
+    // Live iteration still observes mutations made during the walk.
+    assert_eq!(
+        run("var s=new Set([1,2]); var out=[]; for (const v of s) { out.push(v); if (v===1) s.add(3); }
+             out.join(',')"),
+        "1,2,3"
+    );
+    // A large map stays linear — quadratic behaviour here takes seconds.
+    assert_eq!(
+        run("var m=new Map(); for (var i=0;i<40000;i++) m.set(i,i);
+             m.size + ':' + m.get(39999) + ':' + m.has(-1)"),
+        "40000:39999:false"
+    );
+}

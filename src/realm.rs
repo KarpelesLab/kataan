@@ -1413,7 +1413,136 @@ impl Realm {
             is_set,
             is_weak: false,
             entries: Vec::new(),
+            index: None,
         })
+    }
+
+    /// A hash of `v` consistent with [`same_value_zero`](Self::same_value_zero):
+    /// whenever two values are `SameValueZero`-equal they hash the same. The
+    /// converse need not hold — [`collection_find`](Self::collection_find)
+    /// re-checks every candidate with the real predicate, so a collision only
+    /// costs a comparison.
+    ///
+    /// * numbers — `-0` folds to `+0` and every `NaN` to one canonical bit
+    ///   pattern, matching `SameValueZero`;
+    /// * strings and BigInts are *value* types across cells, so they hash their
+    ///   contents (BigInts by their `Display` form, which is canonical);
+    /// * every other reference (object, symbol, …) is identity-compared, so it
+    ///   hashes its raw handle.
+    fn collection_key_hash(&self, v: NanBox) -> u64 {
+        // FNV-1a over a tag byte plus the discriminating bytes.
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut h = OFFSET;
+        let eat = |bytes: &[u8], h: &mut u64| {
+            for b in bytes {
+                *h ^= u64::from(*b);
+                *h = h.wrapping_mul(PRIME);
+            }
+        };
+        if let Some(n) = v.as_number() {
+            // `SameValueZero`: NaN ≡ NaN and -0 ≡ +0.
+            let bits = if n.is_nan() {
+                f64::NAN.to_bits()
+            } else if n == 0.0 {
+                0f64.to_bits()
+            } else {
+                n.to_bits()
+            };
+            eat(&[0], &mut h);
+            eat(&bits.to_le_bytes(), &mut h);
+            return h;
+        }
+        if let Some(raw) = v.as_handle() {
+            let cell = self.heap.get(Handle::from_raw(raw));
+            if let Some(rope) = cell.and_then(Cell::as_str) {
+                eat(&[1], &mut h);
+                eat(&rope_bytes(rope), &mut h);
+                return h;
+            }
+            if let Some(b) = cell.and_then(Cell::as_bigint) {
+                eat(&[2], &mut h);
+                eat(alloc::string::ToString::to_string(b).as_bytes(), &mut h);
+                return h;
+            }
+            eat(&[3], &mut h);
+            eat(&raw.to_le_bytes(), &mut h);
+            return h;
+        }
+        // The remaining primitives (bool/null/undefined) discriminate by their
+        // own bits, which `strict_equals` compares directly.
+        eat(&[4], &mut h);
+        eat(&v.to_bits().to_le_bytes(), &mut h);
+        h
+    }
+
+    /// The index of the entry whose key is `SameValueZero`-equal to `key`, using
+    /// (and building on demand) the collection's hash index. `None` if absent or
+    /// `handle` is not a collection.
+    fn collection_find(&mut self, handle: Handle, key: NanBox) -> Option<usize> {
+        let hash = self.collection_key_hash(key);
+        if self.collection_index_missing(handle) {
+            self.collection_build_index(handle);
+        }
+        let candidates = {
+            let Some(Cell::Collection { index, .. }) = self.heap.get(handle) else {
+                return None;
+            };
+            index.as_ref()?.get(&hash)?.clone()
+        };
+        let (_, entries) = self.heap.get(handle).and_then(Cell::as_collection)?;
+        candidates.into_iter().map(|i| i as usize).find(|&i| {
+            entries
+                .get(i)
+                .is_some_and(|(k, _)| self.same_value_zero(*k, key))
+        })
+    }
+
+    /// Whether the collection at `handle` has no live index (so a lookup must
+    /// build one first).
+    fn collection_index_missing(&self, handle: Handle) -> bool {
+        matches!(
+            self.heap.get(handle),
+            Some(Cell::Collection { index: None, .. })
+        )
+    }
+
+    /// Builds the hash index for the collection at `handle` from its entries.
+    /// Hashing needs `&self.heap` (a string/BigInt key is read through it), so
+    /// the map is assembled first and installed after.
+    fn collection_build_index(&mut self, handle: Handle) {
+        let Some((_, entries)) = self.heap.get(handle).and_then(Cell::as_collection) else {
+            return;
+        };
+        let keys: Vec<NanBox> = entries.iter().map(|(k, _)| *k).collect();
+        let mut map: alloc::collections::BTreeMap<u64, Vec<u32>> =
+            alloc::collections::BTreeMap::new();
+        for (i, k) in keys.iter().enumerate() {
+            map.entry(self.collection_key_hash(*k))
+                .or_default()
+                .push(i as u32);
+        }
+        if let Some(Cell::Collection { index, .. }) = self.heap.get_mut(handle) {
+            *index = Some(map);
+        }
+    }
+
+    /// Records that `entries[i]` (a freshly appended entry) has key hash `hash`.
+    /// A no-op when no index is live — the next lookup rebuilds it wholesale.
+    fn collection_index_push(&mut self, handle: Handle, hash: u64, i: u32) {
+        if let Some(Cell::Collection {
+            index: Some(map), ..
+        }) = self.heap.get_mut(handle)
+        {
+            map.entry(hash).or_default().push(i);
+        }
+    }
+
+    /// Drops the index (after a removal, which renumbers the entries after it).
+    fn collection_index_clear(&mut self, handle: Handle) {
+        if let Some(Cell::Collection { index, .. }) = self.heap.get_mut(handle) {
+            *index = None;
+        }
     }
 
     /// Marks a collection as weak (`WeakMap`/`WeakSet`), so its keys are validated.
@@ -1457,19 +1586,30 @@ impl Realm {
     /// Sets `key → value` in the collection at `handle` (inserting or updating,
     /// by `SameValueZero` key match). Returns `false` if not a collection.
     pub fn collection_set(&mut self, handle: Handle, key: NanBox, value: NanBox) -> bool {
-        // Find an existing key first (immutable borrow), then write.
-        let pos = match self.heap.get(handle).and_then(Cell::as_collection) {
-            Some((_, entries)) => entries
-                .iter()
-                .position(|(k, _)| self.same_value_zero(*k, key)),
-            None => return false,
+        let Some((is_set, _)) = self.heap.get(handle).and_then(Cell::as_collection) else {
+            return false;
         };
+        // `Map.prototype.set` step 5 / `Set.prototype.add` step 4: a `-0` key is
+        // normalized to `+0` before it is stored, so the key read back out of
+        // `keys()`/`entries()` is `+0`. (A `-0` *value* in a Map is untouched.)
+        let key = match key.as_number() {
+            Some(n) if n == 0.0 && n.is_sign_negative() => NanBox::number(0.0),
+            _ => key,
+        };
+        let value = if is_set { key } else { value };
+        // Look the key up through the hash index (built on demand), then write.
+        let pos = self.collection_find(handle, key);
+        let hash = self.collection_key_hash(key);
         let Some((_, entries)) = self.heap.get_mut(handle).and_then(Cell::as_collection_mut) else {
             return false;
         };
         match pos {
             Some(i) => entries[i].1 = value,
-            None => entries.push((key, value)),
+            None => {
+                let i = entries.len() as u32;
+                entries.push((key, value));
+                self.collection_index_push(handle, hash, i);
+            }
         }
         self.write_barrier(handle, key);
         self.write_barrier(handle, value);
@@ -1479,21 +1619,15 @@ impl Realm {
     /// The value for `key` in the collection, or `None` if absent / not a
     /// collection.
     #[must_use]
-    pub fn collection_get(&self, handle: Handle, key: NanBox) -> Option<NanBox> {
+    pub fn collection_get(&mut self, handle: Handle, key: NanBox) -> Option<NanBox> {
+        let i = self.collection_find(handle, key)?;
         let (_, entries) = self.heap.get(handle)?.as_collection()?;
-        entries
-            .iter()
-            .find(|(k, _)| self.same_value_zero(*k, key))
-            .map(|(_, v)| *v)
+        entries.get(i).map(|(_, v)| *v)
     }
 
     /// Whether the collection contains `key`.
-    #[must_use]
-    pub fn collection_has(&self, handle: Handle, key: NanBox) -> bool {
-        self.heap
-            .get(handle)
-            .and_then(Cell::as_collection)
-            .is_some_and(|(_, e)| e.iter().any(|(k, _)| self.same_value_zero(*k, key)))
+    pub fn collection_has(&mut self, handle: Handle, key: NanBox) -> bool {
+        self.collection_find(handle, key).is_some()
     }
 
     /// Removes `key`; returns whether it was present.
@@ -1502,19 +1636,20 @@ impl Realm {
         if let Some((_, e)) = self.heap.get_mut(handle).and_then(Cell::as_collection_mut) {
             e.clear();
         }
+        self.collection_index_clear(handle);
     }
 
     /// `Map.delete(key)` / `Set.delete(value)` — removes the entry, returning
     /// whether one was present.
     pub fn collection_delete(&mut self, handle: Handle, key: NanBox) -> bool {
-        let pos = match self.heap.get(handle).and_then(Cell::as_collection) {
-            Some((_, e)) => e.iter().position(|(k, _)| self.same_value_zero(*k, key)),
-            None => return false,
+        let Some(i) = self.collection_find(handle, key) else {
+            return false;
         };
-        if let Some(i) = pos
-            && let Some((_, e)) = self.heap.get_mut(handle).and_then(Cell::as_collection_mut)
-        {
+        if let Some((_, e)) = self.heap.get_mut(handle).and_then(Cell::as_collection_mut) {
             e.remove(i);
+            // The removal renumbers every later entry, so the index is dropped
+            // rather than patched; the next lookup rebuilds it.
+            self.collection_index_clear(handle);
             return true;
         }
         false

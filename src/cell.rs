@@ -266,6 +266,17 @@ pub enum Cell {
         /// The entries, in insertion order, compared by `SameValueZero`-ish
         /// strict equality.
         entries: Vec<(NanBox, NanBox)>,
+        /// Lazily-built lookup index: a `SameValueZero`-compatible key hash to
+        /// the indices in `entries` that hash to it (collisions are resolved by
+        /// re-checking with the real equality, so the hash only has to be
+        /// *consistent*, never injective). `None` means "not built or
+        /// invalidated" — the next lookup rebuilds it.
+        ///
+        /// Without this, every `set`/`get`/`has`/`delete` linear-scanned
+        /// `entries`, so filling a `Map` was quadratic in its size. It is
+        /// deliberately *not* serialized and is dropped on GC relocation (which
+        /// rewrites the handles that object keys hash by).
+        index: Option<alloc::collections::BTreeMap<u64, Vec<u32>>>,
     },
     /// A `Symbol` primitive: an immutable description and a process-unique id.
     /// Symbols compare by identity (two `Symbol("x")` are distinct).
@@ -693,11 +704,14 @@ impl crate::gc::Relocate for Cell {
             Cell::Object(o) => o.relocate_handles(forward),
             Cell::Array(elems) => elems.iter_mut().for_each(fwd),
             Cell::Function { env, .. } | Cell::Class { env, .. } => env.relocate_handles(forward),
-            Cell::Collection { entries, .. } => {
+            Cell::Collection { entries, index, .. } => {
                 for (k, v) in entries {
                     fwd(k);
                     fwd(v);
                 }
+                // Object/symbol keys hash by their raw handle, which relocation
+                // has just rewritten — drop the index so it is rebuilt.
+                *index = None;
             }
             Cell::Promise(p) => {
                 let mut s = p.borrow_mut();
