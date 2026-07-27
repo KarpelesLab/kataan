@@ -319,27 +319,29 @@ fn islamic_to_jdn(_cal: &str, y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// JDN of 1 Farvardin, Persian (Solar Hijri) year 1.
-const PERSIAN_EPOCH: i64 = 1_948_321;
+const PERSIAN_EPOCH: i64 = 1_948_320;
 
-/// Persian (Solar Hijri) `(year, month, day)` → JDN, using the arithmetic
-/// 2820-year cycle. Unlike the `intl` crate's historical variant (which has no
-/// year 0 and collapses years 0 and -1), this is the *proleptic* form Temporal
-/// requires: a continuous `epbase = year - 474` for all years, so year 0 exists
-/// and non-positive years round-trip. For every year >= 1 it is bit-identical to
-/// the crate's tabular algorithm.
+/// Persian (Solar Hijri) `(year, month, day)` → JDN.
+///
+/// Uses the **33-year arithmetic rule** — `floor((8·year + 21) / 33)` leap days
+/// before a year — which is what ICU (and therefore Temporal's `persian`
+/// calendar) implements, and which reproduces the Iranian calendar authority's
+/// Nowruz dates exactly across the corpus's 1206–1498 range. The 2820-year
+/// (Birashk) cycle this used to use agrees with it for most years but drifts by
+/// a day at cycle boundaries — it put Nowruz of 1210, 1243, 1404, 1437 and 1470
+/// on the wrong ISO day.
+///
+/// Both the year term and the leap term are floor-divided, so the formula is
+/// *proleptic*: year 0 exists as an ordinary year and non-positive years
+/// round-trip, as Temporal requires (the `intl` crate's historical variant has
+/// no year 0).
 fn persian_to_jdn(year: i64, month: i64, day: i64) -> i64 {
-    let epbase = year - 474;
-    let epyear = 474 + epbase.rem_euclid(2820);
     let month_days = if month <= 7 {
         (month - 1) * 31
     } else {
         (month - 1) * 30 + 6
     };
-    day + month_days
-        + (epyear * 682 - 110).div_euclid(2816)
-        + (epyear - 1) * 365
-        + epbase.div_euclid(2820) * 1_029_983
-        + (PERSIAN_EPOCH - 1)
+    PERSIAN_EPOCH - 1 + 365 * (year - 1) + (8 * year + 21).div_euclid(33) + month_days + day
 }
 
 /// The Persian (Solar Hijri) `(year, month, day)` of a Julian Day Number.
