@@ -487,6 +487,65 @@ struct SuiMonth {
 /// onward; the intercalary month is the first in the sui with no major solar
 /// term, and only exists when the sui spans thirteen lunations.
 fn months_of_sui(cal: Lunisolar, day: i64) -> ([SuiMonth; 14], usize) {
+    if let Some(hit) = sui_cache::get(cal, day) {
+        return hit;
+    }
+    let (s1, s2, months, len) = months_of_sui_uncached(cal, day);
+    sui_cache::put(cal, s1, s2, months, len);
+    (months, len)
+}
+
+/// Memo for [`months_of_sui`], keyed by *containment*: a sui is identified by
+/// the solstice interval `[s1, s2)`, and `winter_solstice_on_or_before` is
+/// constant across it — so a cached entry can be recognised without computing
+/// anything. Callers hammer one year at a time (the `PlainMonthDay`
+/// reference-year search alone evaluates a candidate year hundreds of times),
+/// which made this the difference between ~190 000 walks for a single corpus
+/// test and a few hundred.
+///
+/// Two slots, one per calendar, so alternating chinese/dangi queries do not
+/// thrash. Under `no_std` there is no `thread_local!`, so the cache compiles out
+/// and every call recomputes — correct, just slower, and nothing perf-sensitive
+/// runs there.
+#[cfg(feature = "std")]
+mod sui_cache {
+    use super::{Lunisolar, SuiMonth};
+    use std::cell::RefCell;
+
+    type Entry = (i64, i64, [SuiMonth; 14], usize);
+    std::thread_local! {
+        static SLOTS: RefCell<[Option<Entry>; 2]> = const { RefCell::new([None, None]) };
+    }
+
+    fn slot(cal: Lunisolar) -> usize {
+        usize::from(cal == Lunisolar::Dangi)
+    }
+
+    pub(super) fn get(cal: Lunisolar, day: i64) -> Option<([SuiMonth; 14], usize)> {
+        SLOTS.with(|s| {
+            let s = s.borrow();
+            let (s1, s2, months, len) = s[slot(cal)].as_ref()?;
+            (*s1..*s2).contains(&day).then_some((*months, *len))
+        })
+    }
+
+    pub(super) fn put(cal: Lunisolar, s1: i64, s2: i64, months: [SuiMonth; 14], len: usize) {
+        SLOTS.with(|s| s.borrow_mut()[slot(cal)] = Some((s1, s2, months, len)));
+    }
+}
+
+#[cfg(not(feature = "std"))]
+mod sui_cache {
+    use super::{Lunisolar, SuiMonth};
+    pub(super) fn get(_: Lunisolar, _: i64) -> Option<([SuiMonth; 14], usize)> {
+        None
+    }
+    pub(super) fn put(_: Lunisolar, _: i64, _: i64, _: [SuiMonth; 14], _: usize) {}
+}
+
+/// [`months_of_sui`] proper, also returning the solstice bounds that identify
+/// the sui for the memo.
+fn months_of_sui_uncached(cal: Lunisolar, day: i64) -> (i64, i64, [SuiMonth; 14], usize) {
     let s1 = winter_solstice_on_or_before(cal, day);
     let s2 = winter_solstice_on_or_before(cal, s1 + 370);
     // The first new moon after the solstice starts month 12 (the solstice itself
@@ -534,7 +593,7 @@ fn months_of_sui(cal: Lunisolar, day: i64) -> ([SuiMonth; 14], usize) {
         term = next_term;
         index += 1;
     }
-    (months, len)
+    (s1, s2, months, len)
 }
 
 /// The New Year (start of month 1) within an already-computed sui.
@@ -625,6 +684,68 @@ fn from_rd(cal: Lunisolar, day: i64) -> LunisolarDate {
 /// Aligning on the reported year makes the round-trip exact by construction
 /// wherever the labelling is monotonic, which it is everywhere.
 fn year_start(cal: Lunisolar, year: i64) -> Option<([SuiMonth; 14], usize, i64)> {
+    if let Some(hit) = year_cache::get(cal, year) {
+        return Some(hit);
+    }
+    let computed = year_start_uncached(cal, year)?;
+    year_cache::put(cal, year, computed);
+    Some(computed)
+}
+
+/// Memo for [`year_start`], keyed by the lunisolar year.
+///
+/// `PlainMonthDay`'s reference-year search sweeps ~200 candidate years looking
+/// for the one that carries a given month/day, and its `constrain` path repeats
+/// that whole sweep once per candidate day — so the same handful of years is
+/// resolved thousands of times. Direct-mapped rather than LRU because the access
+/// pattern is a contiguous scan, which a small LRU would thrash.
+///
+/// Under `no_std` there is no `thread_local!`, so this compiles out and every
+/// call recomputes — correct, just slower.
+#[cfg(feature = "std")]
+mod year_cache {
+    use super::{Lunisolar, SuiMonth};
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use std::cell::RefCell;
+
+    /// `(calendar is dangi, year, months, len, new year)`.
+    type Entry = (bool, i64, [SuiMonth; 14], usize, i64);
+    const SLOTS: usize = 256;
+    std::thread_local! {
+        static TABLE: RefCell<Vec<Option<Entry>>> = RefCell::new(vec![None; SLOTS]);
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    fn index(year: i64) -> usize {
+        (year.rem_euclid(SLOTS as i64)) as usize
+    }
+
+    pub(super) fn get(cal: Lunisolar, year: i64) -> Option<([SuiMonth; 14], usize, i64)> {
+        TABLE.with(|t| {
+            let t = t.borrow();
+            let (is_dangi, y, months, len, ny) = t[index(year)].as_ref()?;
+            (*is_dangi == (cal == Lunisolar::Dangi) && *y == year).then_some((*months, *len, *ny))
+        })
+    }
+
+    pub(super) fn put(cal: Lunisolar, year: i64, v: ([SuiMonth; 14], usize, i64)) {
+        TABLE.with(|t| {
+            t.borrow_mut()[index(year)] = Some((cal == Lunisolar::Dangi, year, v.0, v.1, v.2));
+        });
+    }
+}
+
+#[cfg(not(feature = "std"))]
+mod year_cache {
+    use super::{Lunisolar, SuiMonth};
+    pub(super) fn get(_: Lunisolar, _: i64) -> Option<([SuiMonth; 14], usize, i64)> {
+        None
+    }
+    pub(super) fn put(_: Lunisolar, _: i64, _: ([SuiMonth; 14], usize, i64)) {}
+}
+
+fn year_start_uncached(cal: Lunisolar, year: i64) -> Option<([SuiMonth; 14], usize, i64)> {
     let mut anchor = rd_from_gregorian(year, 12, 31);
     let (mut months, mut len, mut new_year) = sui_of_year_containing(cal, anchor);
     for _ in 0..4 {
