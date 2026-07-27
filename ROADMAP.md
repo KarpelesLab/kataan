@@ -603,8 +603,17 @@ regex match/replace/split path, and `Array.prototype.push`/`pop`. What remains:
   live-iteration key cursor.
 - **Residual `push` superlinearity** (~×3.7 after the snapshot fix) and the rest
   of the per-dispatch work in `call_method`.
-- **Rope reads.** `charCodeAt` on a `+=`-built string materializes the tree per
-  call; a memo (or flatten-on-read) would make repeated indexing linear.
+- **Rope reads.** `charCodeAt` on a `+=`-built string re-walks and re-copies the
+  whole tree per call. **A plain memo on the `Concat` node is the wrong fix and
+  was tried and reverted:** it makes repeated indexing ~7× faster but costs
+  O(n²) *memory*, because a rope read at every growth stage caches a full copy
+  at each level and the old roots stay alive as left children — 1.5 GB peak RSS
+  for a 128 KB string, against 17.6 MB before. The fix has to **flatten in
+  place**, replacing the node's children with the flattened bytes so the
+  intermediate nodes are released (which also makes that pattern linear in
+  time). That means putting the children behind the same interior-mutability
+  cell as the cache, so `as_leaf_bytes`/`last_leaf_bytes`/`first_leaf_bytes`
+  must stop handing out borrows into the tree first.
 
 ### 5.1 Long-standing performance work
 
