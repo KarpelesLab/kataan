@@ -112,7 +112,7 @@ impl<'a> Interp<'a> {
                     return Err(self
                         .pd_range_error("combined date-time is outside the representable range"));
                 }
-                Ok(self.pd_new_kind(TemporalKind::PlainDateTime, data.date, time))
+                Ok(self.pd_new_kind_cal(TemporalKind::PlainDateTime, data.date, time, &cal))
             }
             "toPlainYearMonth" => {
                 // A PlainYearMonth stores a reference ISO day; for the ISO
@@ -121,10 +121,11 @@ impl<'a> Interp<'a> {
                 if tcal::is_iso(&cal) {
                     d.day = 1;
                 }
-                Ok(self.pd_new_kind(
+                Ok(self.pd_new_kind_cal(
                     TemporalKind::PlainYearMonth,
                     d,
                     temporal_iso::IsoTime::default(),
+                    &cal,
                 ))
             }
             "toPlainMonthDay" => {
@@ -134,10 +135,11 @@ impl<'a> Interp<'a> {
                 if tcal::is_iso(&cal) {
                     d.year = 1972;
                 }
-                Ok(self.pd_new_kind(
+                Ok(self.pd_new_kind_cal(
                     TemporalKind::PlainMonthDay,
                     d,
                     temporal_iso::IsoTime::default(),
+                    &cal,
                 ))
             }
             "toString" => {
@@ -572,10 +574,27 @@ impl<'a> Interp<'a> {
         date: IsoDate,
         time: temporal_iso::IsoTime,
     ) -> NanBox {
+        self.pd_new_kind_cal(kind, date, time, "iso8601")
+    }
+
+    /// As [`pd_new_kind`](Self::pd_new_kind), carrying calendar id `cal`. The
+    /// `toPlainDateTime`/`toPlainYearMonth`/`toPlainMonthDay` conversions must
+    /// propagate the receiver's `[[Calendar]]` — without it a
+    /// `buddhist`-calendared date produced an `iso8601` year-month, so
+    /// `d.toPlainYearMonth().year` reported the ISO year instead of the
+    /// calendar's.
+    fn pd_new_kind_cal(
+        &mut self,
+        kind: TemporalKind,
+        date: IsoDate,
+        time: temporal_iso::IsoTime,
+        cal: &str,
+    ) -> NanBox {
         let data = TemporalData {
             kind,
             date,
             time,
+            calendar: String::from(cal),
             ..Default::default()
         };
         let h = self.realm.new_temporal(data);
