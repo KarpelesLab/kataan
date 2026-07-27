@@ -36,7 +36,7 @@ def read(path):
 def emit(out, name, doc, pairs):
     pairs = sorted(set(pairs))
     out(f"\n/// {doc} — {len(pairs)} aliases.\n")
-    out(f"pub(crate) static {name}: &[(&'static str, &'static str)] = &[\n")
+    out(f'pub(crate) static {name}: &[(&str, &str)] = &[\n')
     for a, b in pairs:
         out(f'    ("{a}", "{b}"),\n')
     out("];\n")

@@ -19,7 +19,7 @@ pub(crate) fn lookup(table: &[(&'static str, &'static str)], key: &str) -> Optio
 }
 
 /// `-u-tz-` deprecated time-zone ids — 22 aliases.
-pub(crate) static TIMEZONE: &[(&'static str, &'static str)] = &[
+pub(crate) static TIMEZONE: &[(&str, &str)] = &[
     ("aqams", "aqmcm"),
     ("aukns", "auhba"),
     ("caffs", "cawnp"),
@@ -45,11 +45,10 @@ pub(crate) static TIMEZONE: &[(&'static str, &'static str)] = &[
 ];
 
 /// `-t-` deprecated tvalue subtags — 2 aliases.
-pub(crate) static TRANSFORM_VALUE: &[(&'static str, &'static str)] =
-    &[("c", "c11"), ("names", "prprname")];
+pub(crate) static TRANSFORM_VALUE: &[(&str, &str)] = &[("c", "c11"), ("names", "prprname")];
 
 /// `-u-rg-`/`-u-sd-` deprecated subdivision ids — 117 aliases.
-pub(crate) static SUBDIVISION: &[(&'static str, &'static str)] = &[
+pub(crate) static SUBDIVISION: &[(&str, &str)] = &[
     ("cn11", "cnbj"),
     ("cn12", "cntj"),
     ("cn13", "cnhe"),
