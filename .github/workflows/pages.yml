@@ -14,7 +14,6 @@ on:
       - 'web/**'
       - 'src/**'
       - 'Cargo.toml'
-      - 'Cargo.lock'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -45,9 +44,11 @@ jobs:
       # The browser build deliberately omits `host`, `cli` and `crypto`: there is
       # no event loop, file system or OS entropy source in a tab, and pulling
       # them in would only add weight. `ffi` is what the page calls through.
+      # `Cargo.lock` is intentionally not committed for this library crate
+      # (see .gitignore), so `--locked` is not available here.
       - name: Build the engine for the browser
         run: |
-          cargo rustc --lib --locked \
+          cargo rustc --lib \
             --target wasm32-unknown-unknown \
             --profile wasm-web \
             --no-default-features --features std,regex,intl,module,ffi \
