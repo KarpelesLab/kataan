@@ -2446,7 +2446,7 @@ impl<'a> Interp<'a> {
                 }
                 let bytes = self.coerce_to_string_bytes(arg(0))?;
                 let mut st = self.realm.legacy_regexp().clone();
-                st.input = bytes;
+                st.set_input(bytes);
                 self.realm.set_legacy_regexp(st);
                 NanBox::undefined()
             }

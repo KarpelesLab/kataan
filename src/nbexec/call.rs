@@ -731,18 +731,12 @@ impl<'a> Interp<'a> {
                 }
                 let st = self.realm.legacy_regexp();
                 let bytes = match selector.as_str() {
-                    "input" => st.input.clone(),
-                    "lastMatch" => st.last_match.clone(),
-                    "lastParen" => st.last_paren.clone(),
-                    "leftContext" => st.left_context.clone(),
-                    "rightContext" => st.right_context.clone(),
-                    s if s.starts_with('$') => {
-                        let n: usize = s[1..].parse().unwrap_or(0);
-                        st.parens
-                            .get(n.wrapping_sub(1))
-                            .cloned()
-                            .unwrap_or_default()
-                    }
+                    "input" => st.input(),
+                    "lastMatch" => st.last_match(),
+                    "lastParen" => st.last_paren(),
+                    "leftContext" => st.left_context(),
+                    "rightContext" => st.right_context(),
+                    s if s.starts_with('$') => st.paren(s[1..].parse().unwrap_or(0)),
                     _ => alloc::vec::Vec::new(),
                 };
                 return Ok(self.new_str_bytes(bytes));

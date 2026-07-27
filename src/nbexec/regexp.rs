@@ -378,6 +378,37 @@ impl<'a> Interp<'a> {
     /// surrogate-free case) and the **lossless** UTF-16 code units (so a
     /// surrogate-bearing subject indexes/slices correctly). Runs a user `toString`/
     /// `@@toPrimitive` exactly once.
+    /// The subject of a `RegExpBuiltinExec`: the (lossless) string value to expose
+    /// as the result's `.input`, plus its UTF-16 code units.
+    ///
+    /// When `value` is already a string cell it *is* the input — no re-allocation
+    /// — and its units are served from (or installed into) the one-entry
+    /// [`Interp::subject_units_cache`]. The raw handle encodes the heap slot's
+    /// generation, so a reused slot can never hit a stale entry, and string cells
+    /// are immutable, so a hit is always still accurate. A non-string `value` is
+    /// `ToString`ed and not cached (each coercion may observe a different result).
+    fn subject_units_cached(
+        &mut self,
+        value: NanBox,
+    ) -> Result<(NanBox, alloc::rc::Rc<Vec<u16>>), ExecError> {
+        if let Some(raw) = value.as_handle()
+            && self.realm.is_string_handle(Handle::from_raw(raw))
+        {
+            if let Some((cached_raw, units)) = &self.subject_units_cache
+                && *cached_raw == raw
+            {
+                return Ok((value, units.clone()));
+            }
+            let bytes = self.coerce_to_string_bytes(value)?;
+            let units = alloc::rc::Rc::new(crate::wtf8::utf16_units(&bytes).collect::<Vec<u16>>());
+            self.subject_units_cache = Some((raw, units.clone()));
+            return Ok((value, units));
+        }
+        let bytes = self.coerce_to_string_bytes(value)?;
+        let units = alloc::rc::Rc::new(crate::wtf8::utf16_units(&bytes).collect::<Vec<u16>>());
+        Ok((self.new_str_bytes(bytes), units))
+    }
+
     fn subject_units(&mut self, value: NanBox) -> Result<(String, Vec<u16>), ExecError> {
         let bytes = self.coerce_to_string_bytes(value)?;
         let units: Vec<u16> = crate::wtf8::utf16_units(&bytes).collect();
@@ -639,10 +670,12 @@ impl<'a> Interp<'a> {
         s_value: NanBox,
     ) -> Result<NanBox, ExecError> {
         // ToString the subject losslessly (a lone surrogate survives), and keep
-        // the string value as the match result's `.input`.
-        let bytes = self.coerce_to_string_bytes(s_value)?;
-        let units: Vec<u16> = crate::wtf8::utf16_units(&bytes).collect();
-        let input = self.new_str_bytes(bytes);
+        // the string value as the match result's `.input`. Both the UTF-16
+        // conversion and the `.input` string are memoized on the subject handle:
+        // a global `@@replace`/`@@match`/`@@split` (and any user
+        // `while ((m = re.exec(s)))`) re-execs against the same string, and
+        // redoing this per match is what made those operations quadratic.
+        let (input, units) = self.subject_units_cached(s_value)?;
         let (_source, flags) = self.realm.regexp_at(h).unwrap_or_default();
         let global = flags.contains('g');
         let sticky = flags.contains('y');
@@ -703,22 +736,17 @@ impl<'a> Interp<'a> {
     /// capture groups 1..=9 (plus `lastParen`, the highest-index group that
     /// participated). All slices are stored as WTF-8 (surrogates preserved).
     #[cfg(feature = "regex")]
-    fn update_legacy_regexp(&mut self, units: &[u16], c: &crate::regex::Captures) {
-        let slice = |a: usize, b: usize| crate::wtf8::from_utf16(&units[a..b]);
-        let (ms, me) = c.whole();
-        let mut st = crate::realm::LegacyRegExpState {
-            input: crate::wtf8::from_utf16(units),
-            last_match: slice(ms, me),
-            left_context: slice(0, ms),
-            right_context: slice(me, units.len()),
-            ..Default::default()
-        };
-        for i in 1..=9usize {
-            if let Some((a, b)) = c.group(i) {
-                st.parens[i - 1] = slice(a, b);
-                st.last_paren = slice(a, b);
-            }
+    fn update_legacy_regexp(
+        &mut self,
+        units: &alloc::rc::Rc<Vec<u16>>,
+        c: &crate::regex::Captures,
+    ) {
+        let mut groups: [Option<(usize, usize)>; 9] = [None; 9];
+        for (i, g) in groups.iter_mut().enumerate() {
+            *g = c.group(i + 1);
         }
+        let mut st = self.realm.legacy_regexp().clone();
+        st.record(units.clone(), c.whole(), groups);
         self.realm.set_legacy_regexp(st);
     }
 

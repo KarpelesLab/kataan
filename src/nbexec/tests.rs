@@ -11633,3 +11633,47 @@ fn string_concat_is_linear_not_quadratic() {
         "2:128512"
     );
 }
+
+#[test]
+fn legacy_regexp_statics_are_lazy_but_correct() {
+    // Annex B.2.5 statics reflect the last successful match. They are recorded
+    // as index ranges and materialized on read; a global match must not pay for
+    // building them per match (that made `replace(/x/g, …)` quadratic).
+    assert_eq!(
+        run(
+            r#"/b(c)(d)/.exec("abcde"); [RegExp.lastMatch, RegExp.$1, RegExp.$2,
+             RegExp.leftContext, RegExp.rightContext, RegExp.lastParen,
+             RegExp.input].join("|")"#
+        ),
+        "bcd|c|d|a|e|d|abcde"
+    );
+    // An absent group is the empty string, and `$3` (never present) too.
+    assert_eq!(
+        run(
+            r#"/a(x)?(b)/.exec("ab"); "[" + RegExp.$1 + "][" + RegExp.$2 + "][" + RegExp.$3 + "]""#
+        ),
+        "[][b][]"
+    );
+    // `lastParen` is the highest-index participating group.
+    assert_eq!(run(r#"/(a)(b)?/.exec("a"); RegExp.lastParen"#), "a");
+    // A failed match leaves the previous record intact.
+    assert_eq!(
+        run(r#"/a/.exec("xay"); /zzz/.exec("xay"); RegExp.lastMatch + RegExp.leftContext"#),
+        "ax"
+    );
+    // `RegExp.input = …` overrides only `input`, not the match record.
+    assert_eq!(
+        run(r#"/b/.exec("abc"); RegExp.input = "zz"; RegExp.input + "|" + RegExp.lastMatch"#),
+        "zz|b"
+    );
+    // A global replace over a long subject stays linear.
+    assert_eq!(
+        run(r#"var s = "ab".repeat(20000); s.replace(/a/g, "c").length"#),
+        "40000"
+    );
+    // …and the statics still reflect its final match.
+    assert_eq!(
+        run(r#""ab".repeat(3).replace(/a(b)/g, "x"); RegExp.$1"#),
+        "b"
+    );
+}

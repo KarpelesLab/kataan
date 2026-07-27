@@ -249,21 +249,103 @@ pub struct Realm {
 /// The mutable state behind the Annex B.2.5 RegExp legacy static accessors
 /// (`RegExp.input`/`$_`, `RegExp.lastMatch`/`$&`, `RegExp.lastParen`/`$+`,
 /// `RegExp.leftContext`/`` $` ``, `RegExp.rightContext`/`$'`, `RegExp.$1`..`$9`).
-/// Each field stores WTF-8 bytes so a surrogate-bearing subject round-trips.
+///
+/// The state is stored **lazily**: the subject's UTF-16 units (shared, so
+/// recording costs one refcount bump) plus the match and capture index ranges.
+/// The accessors are what materialize WTF-8 bytes, and they are almost never
+/// read — whereas *every* successful match records state, so materializing the
+/// subject, both contexts and nine groups eagerly made a global match quadratic
+/// in the subject length.
 #[derive(Default, Clone)]
 pub struct LegacyRegExpState {
-    /// The last subject string matched against (`RegExp.input` / `$_`).
-    pub input: alloc::vec::Vec<u8>,
-    /// The portion of the subject that matched (`RegExp.lastMatch` / `$&`).
-    pub last_match: alloc::vec::Vec<u8>,
-    /// The last (highest-index) captured group (`RegExp.lastParen` / `$+`).
-    pub last_paren: alloc::vec::Vec<u8>,
-    /// The substring preceding the match (`RegExp.leftContext` / `` $` ``).
-    pub left_context: alloc::vec::Vec<u8>,
-    /// The substring following the match (`RegExp.rightContext` / `$'`).
-    pub right_context: alloc::vec::Vec<u8>,
-    /// Captured groups 1..=9 (`RegExp.$1`..`$9`); absent groups are empty.
-    pub parens: [alloc::vec::Vec<u8>; 9],
+    /// The last subject matched against, as UTF-16 code units.
+    subject: alloc::rc::Rc<alloc::vec::Vec<u16>>,
+    /// The whole match's `[start, end)` unit range within `subject`.
+    whole: (usize, usize),
+    /// `[start, end)` for capture groups 1..=9; `None` for an absent group.
+    groups: [Option<(usize, usize)>; 9],
+    /// The highest-index group that participated (`RegExp.lastParen` / `$+`).
+    last_paren: Option<(usize, usize)>,
+    /// An explicit `RegExp.input = …` assignment, which overrides the recorded
+    /// subject for the `input`/`$_` accessor only.
+    input_override: Option<alloc::vec::Vec<u8>>,
+}
+
+impl LegacyRegExpState {
+    /// Records a successful match: the subject (shared) and the index ranges.
+    /// O(1) plus the group scan — no string is built here.
+    pub fn record(
+        &mut self,
+        subject: alloc::rc::Rc<alloc::vec::Vec<u16>>,
+        whole: (usize, usize),
+        groups: [Option<(usize, usize)>; 9],
+    ) {
+        self.subject = subject;
+        self.whole = whole;
+        self.groups = groups;
+        self.last_paren = groups.iter().rev().find_map(|g| *g);
+        self.input_override = None;
+    }
+
+    /// WTF-8 bytes for a unit range of the subject, clamped to its length.
+    fn slice(&self, a: usize, b: usize) -> alloc::vec::Vec<u8> {
+        let len = self.subject.len();
+        let (a, b) = (a.min(len), b.min(len));
+        if a >= b {
+            return alloc::vec::Vec::new();
+        }
+        crate::wtf8::from_utf16(&self.subject[a..b])
+    }
+
+    /// `RegExp.input` / `$_` — the last subject, or the last explicitly assigned value.
+    #[must_use]
+    pub fn input(&self) -> alloc::vec::Vec<u8> {
+        match &self.input_override {
+            Some(b) => b.clone(),
+            None => self.slice(0, self.subject.len()),
+        }
+    }
+
+    /// `RegExp.input = …` — overrides the reported subject without disturbing the
+    /// recorded match ranges.
+    pub fn set_input(&mut self, bytes: alloc::vec::Vec<u8>) {
+        self.input_override = Some(bytes);
+    }
+
+    /// `RegExp.lastMatch` / `$&`.
+    #[must_use]
+    pub fn last_match(&self) -> alloc::vec::Vec<u8> {
+        self.slice(self.whole.0, self.whole.1)
+    }
+
+    /// `RegExp.lastParen` / `$+` — the highest-index participating group.
+    #[must_use]
+    pub fn last_paren(&self) -> alloc::vec::Vec<u8> {
+        self.last_paren
+            .map_or_else(alloc::vec::Vec::new, |(a, b)| self.slice(a, b))
+    }
+
+    /// `RegExp.leftContext` / `` $` `` — the subject before the match.
+    #[must_use]
+    pub fn left_context(&self) -> alloc::vec::Vec<u8> {
+        self.slice(0, self.whole.0)
+    }
+
+    /// `RegExp.rightContext` / `$'` — the subject after the match.
+    #[must_use]
+    pub fn right_context(&self) -> alloc::vec::Vec<u8> {
+        self.slice(self.whole.1, self.subject.len())
+    }
+
+    /// `RegExp.$n` for `n` in 1..=9; an absent group (or out-of-range `n`) is empty.
+    #[must_use]
+    pub fn paren(&self, n: usize) -> alloc::vec::Vec<u8> {
+        self.groups
+            .get(n.wrapping_sub(1))
+            .copied()
+            .flatten()
+            .map_or_else(alloc::vec::Vec::new, |(a, b)| self.slice(a, b))
+    }
 }
 
 /// A snapshot of a realm's intrinsic prototype pointers (the realm-wide
