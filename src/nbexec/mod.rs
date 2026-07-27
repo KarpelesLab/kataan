@@ -280,7 +280,10 @@ fn math_random_seed() -> [u64; 2] {
     // output varies because the entropy sources below are XOR-mixed into `acc`.
     let mut acc: u64 = 0x9E37_79B9_7F4A_7C15;
     acc ^= cycle_counter();
-    #[cfg(feature = "std")]
+    #[cfg(all(
+        feature = "std",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     {
         if let Ok(d) =
             std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -8969,17 +8972,26 @@ pub fn eval_source_typed(
     }
 }
 
-/// The current time in milliseconds since the Unix epoch (`0.0` without `std`,
-/// which has no clock).
+/// The current time in milliseconds since the Unix epoch, or `0.0` on a target
+/// with no clock — `no_std`, and `wasm32-unknown-unknown`, where `std` exists
+/// but `SystemTime::now` *panics* because the bare-wasm platform has no time
+/// source. (`wasm32-wasip1` and the browser-with-JS-glue targets do have one, so
+/// the exclusion is deliberately narrow.)
 fn now_ms() -> f64 {
-    #[cfg(feature = "std")]
+    #[cfg(all(
+        feature = "std",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as f64)
             .unwrap_or(0.0)
     }
-    #[cfg(not(feature = "std"))]
+    #[cfg(any(
+        not(feature = "std"),
+        all(target_arch = "wasm32", target_os = "unknown")
+    ))]
     {
         0.0
     }

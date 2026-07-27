@@ -318,6 +318,12 @@ pub(crate) const NB_MATH_TRUNC: u16 = 32;
 /// Built-in globals the tree-walker provides as bare values. An unknown
 /// identifier that is *not* one of these throws a `ReferenceError` at runtime
 /// (correct JS); one that *is* falls back so the tree-walker resolves it.
+///
+/// This mirrors the set the interpreter installs, so it goes stale whenever a
+/// global is added — and a *missing* entry is silently wrong twice over: the
+/// value path throws a spurious `ReferenceError`, and `typeof` answers
+/// `"undefined"` for something that exists. `globals_match_installed_set` keeps
+/// the two in sync by diffing this list against `globalThis` at runtime.
 const KNOWN_GLOBALS: &[&str] = &[
     "Math",
     "console",
@@ -379,6 +385,18 @@ const KNOWN_GLOBALS: &[&str] = &[
     "encodeURIComponent",
     "escape",
     "unescape",
+    "Temporal",
+    "Atomics",
+    "SharedArrayBuffer",
+    "Float16Array",
+    "FinalizationRegistry",
+    "DisposableStack",
+    "AsyncDisposableStack",
+    "ShadowRealm",
+    "SuppressedError",
+    "atob",
+    "btoa",
+    "eval",
 ];
 
 /// A compiled function: its instruction stream, register-file size, and the
@@ -9176,6 +9194,64 @@ impl Compiler {
 
 #[cfg(test)]
 mod tests {
+
+    /// `KNOWN_GLOBALS` mirrors the set of globals the interpreter installs, and a
+    /// *missing* entry is wrong twice over: the value path emits a spurious
+    /// `ReferenceError`, and `typeof` is answered at compile time as
+    /// `"undefined"` for a global that plainly exists. (That is exactly how
+    /// `Temporal` — installed unconditionally since the Temporal work — came to
+    /// report `typeof Temporal === "undefined"` on this path while
+    /// `Temporal.PlainDate.from(…)` worked.)
+    ///
+    /// Diff the list against the live global object so it cannot drift again.
+    #[test]
+    fn globals_match_installed_set() {
+        let (_, installed) =
+            crate::nbexec::eval_source("Object.getOwnPropertyNames(globalThis).join(' ')")
+                .expect("enumerate globals");
+        let missing: alloc::vec::Vec<&str> = installed
+            .split(' ')
+            // The `$262_*` harness hooks are not part of the language surface,
+            // and the value keywords are handled ahead of the list.
+            .filter(|n| {
+                !n.starts_with("$262_") && !matches!(*n, "undefined" | "NaN" | "Infinity" | "")
+            })
+            .filter(|n| !KNOWN_GLOBALS.contains(n))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "globals installed but absent from KNOWN_GLOBALS: {missing:?}"
+        );
+        // …and nothing in the list that is not actually installed, which would
+        // send a genuinely-undefined name down the slow tree-walker path.
+        let stale: alloc::vec::Vec<&&str> = KNOWN_GLOBALS
+            .iter()
+            .filter(|n| !installed.split(' ').any(|g| g == **n))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "KNOWN_GLOBALS entries not installed: {stale:?}"
+        );
+    }
+
+    /// `typeof` on a global must report the global, not `"undefined"` — and on a
+    /// genuinely undefined name it must still be `"undefined"` rather than a
+    /// `ReferenceError`.
+    #[test]
+    fn typeof_reports_globals_and_absent_names() {
+        for (src, want) in [
+            ("typeof Temporal", "object"),
+            ("typeof Atomics", "object"),
+            ("typeof Math", "object"),
+            ("typeof eval", "function"),
+            ("typeof Float16Array", "function"),
+            ("typeof FinalizationRegistry", "function"),
+            ("typeof no_such_global_anywhere", "undefined"),
+        ] {
+            let (_, got) = crate::nbexec::eval_source(src).expect(src);
+            assert_eq!(got, want, "{src}");
+        }
+    }
     use super::*;
 
     /// Compiles `src` to bytecode and runs it over a fresh realm, returning the

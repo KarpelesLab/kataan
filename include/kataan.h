@@ -37,6 +37,26 @@ typedef enum {
 } KtStatus;
 
 /*
+ * Allocates `len` bytes inside the library's allocator and returns the pointer,
+ * or NULL if `len` is 0 or the allocation fails.
+ *
+ * A C caller normally owns its own buffers and never needs this. It exists for
+ * hosts that cannot allocate *inside* the module's address space — notably
+ * WebAssembly, where the host can only reach linear memory and so must ask the
+ * module for a region before writing a script into it.
+ *
+ * Release the pointer with kt_free(), passing the same `len`.
+ */
+unsigned char *kt_alloc(size_t len);
+
+/*
+ * Releases a region obtained from kt_alloc(). `ptr` must come from kt_alloc()
+ * and `len` must be the length it was allocated with; a NULL `ptr` or a zero
+ * `len` is a no-op.
+ */
+void kt_free(unsigned char *ptr, size_t len);
+
+/*
  * Returns the engine version as a static NUL-terminated string. The pointer is
  * valid for the lifetime of the program and must not be freed.
  */
@@ -70,6 +90,25 @@ int kt_version_copy(char *buf, size_t *len);
  * not persist state between calls.
  */
 int kt_eval(const char *source, size_t source_len, char *out, size_t *out_len);
+
+/*
+ * Evaluates `source`, capturing BOTH what the script printed and its completion
+ * value. kt_eval() reports only the completion value, which loses everything a
+ * script wrote with console.log.
+ *
+ * `out` receives the two halves separated by a single NUL byte:
+ *
+ *     <console output> '\0' <completion value>
+ *
+ * so each half is itself a NUL-terminated string, and *out_len (the usual
+ * in/out length convention) covers the pair. A script that printed nothing
+ * yields an empty first half.
+ *
+ * Returns KT_OK, or KT_INVALID_INPUT with the error message as the completion
+ * half on a parse error / uncaught throw.
+ */
+int kt_eval_capture(const char *source, size_t source_len, char *out,
+                    size_t *out_len);
 
 /*
  * Evaluate `source` with a pre-installed global ArrayBuffer named `buffer`, built

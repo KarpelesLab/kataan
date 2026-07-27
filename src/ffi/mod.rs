@@ -46,6 +46,52 @@ pub enum KtStatus {
     Internal = -100,
 }
 
+/// Allocates `len` bytes inside the library's allocator and returns the
+/// pointer, or `NULL` if `len` is `0` or the allocation fails.
+///
+/// A C caller normally owns its own buffers and never needs this. It exists for
+/// hosts that cannot allocate *inside* the module's address space — notably
+/// WebAssembly, where JavaScript can only reach linear memory and so must ask
+/// the module for a region before writing a script into it.
+///
+/// Every pointer returned here must be released with [`kt_free`], passing the
+/// same `len`.
+///
+/// # Safety
+///
+/// Always safe to call. The returned region is uninitialized.
+#[unsafe(no_mangle)]
+pub extern "C" fn kt_alloc(len: usize) -> *mut u8 {
+    if len == 0 {
+        return core::ptr::null_mut();
+    }
+    let Ok(layout) = std::alloc::Layout::from_size_align(len, 1) else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: `layout` has a non-zero size (checked above).
+    unsafe { std::alloc::alloc(layout) }
+}
+
+/// Releases a region obtained from [`kt_alloc`].
+///
+/// # Safety
+///
+/// `ptr` must be a pointer returned by [`kt_alloc`] that has not already been
+/// freed, and `len` must be the length it was allocated with. A `NULL` `ptr` or
+/// a zero `len` is a no-op.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kt_free(ptr: *mut u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let Ok(layout) = std::alloc::Layout::from_size_align(len, 1) else {
+        return;
+    };
+    // SAFETY: the caller guarantees `ptr` came from `kt_alloc` with this `len`,
+    // so the layout matches the one it was allocated with.
+    unsafe { std::alloc::dealloc(ptr, layout) }
+}
+
 /// Returns the engine version as a static, NUL-terminated C string. The
 /// returned pointer is valid for the lifetime of the program and must not be
 /// freed by the caller.
@@ -144,6 +190,77 @@ pub unsafe extern "C" fn kt_eval(
         // SAFETY: `out_len` is non-null (checked) and `out` honors the
         // length convention.
         match unsafe { copy_out(text.as_bytes(), out, out_len) } {
+            KtStatus::Ok if !ok => KtStatus::InvalidInput,
+            other => other,
+        }
+    }));
+    match outcome {
+        Ok(status) => status as c_int,
+        Err(_) => KtStatus::Internal as c_int,
+    }
+}
+
+/// Evaluates `source`, capturing **both** what the script printed and its
+/// completion value.
+///
+/// [`kt_eval`] reports only the completion value, which is enough for an
+/// expression but loses everything a script wrote with `console.log`. This
+/// variant writes both into `out`, separated by a single NUL byte:
+///
+/// ```text
+/// <console output> 0x00 <completion value>
+/// ```
+///
+/// so each half is itself a NUL-terminated C string and `*out_len` (the usual
+/// in/out length convention) covers the pair. A script that printed nothing
+/// yields an empty first half.
+///
+/// Returns [`KtStatus::Ok`] on success. On a parse error or an uncaught throw
+/// the error message is written as the *completion* half (the console half
+/// holds whatever the script managed to print first) and the status is
+/// [`KtStatus::InvalidInput`]. A caught Rust panic yields
+/// [`KtStatus::Internal`].
+///
+/// # Safety
+///
+/// Same contract as [`kt_eval`]: `out_len` must be a valid pointer to a
+/// `usize`; `source` must cover `source_len` readable bytes when that is
+/// non-zero; and `out` must be writable for `*out_len` bytes when the output
+/// fits.
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kt_eval_capture(
+    source: *const c_char,
+    source_len: usize,
+    out: *mut c_char,
+    out_len: *mut usize,
+) -> c_int {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if out_len.is_null() || (source.is_null() && source_len != 0) {
+            return KtStatus::NullPointer;
+        }
+        // SAFETY: caller guarantees `source` covers `source_len` bytes; a null
+        // pointer with zero length is the empty input (never dereferenced).
+        let bytes: &[u8] = if source.is_null() {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(source as *const u8, source_len) }
+        };
+        let Ok(src) = core::str::from_utf8(bytes) else {
+            return KtStatus::InvalidInput;
+        };
+        let (printed, completion, ok) = match crate::nbvm::execute(src) {
+            Ok((printed, completion)) => (printed, completion, true),
+            Err(message) => (alloc::string::String::new(), message, false),
+        };
+        let mut joined = printed.into_bytes();
+        joined.push(0);
+        joined.extend_from_slice(completion.as_bytes());
+        // SAFETY: `out_len` is non-null (checked) and `out` honors the
+        // length convention.
+        match unsafe { copy_out(&joined, out, out_len) } {
             KtStatus::Ok if !ok => KtStatus::InvalidInput,
             other => other,
         }

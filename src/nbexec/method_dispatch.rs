@@ -5481,7 +5481,9 @@ impl<'a> Interp<'a> {
         mapper: Option<NanBox>,
         this_arg: NanBox,
     ) -> Result<usize, ExecError> {
-        const MAX_SAFE: usize = 9_007_199_254_740_991; // 2^53 - 1
+        // 2^53 - 1. Held as `u64` because `usize` is 32 bits on wasm32, where
+        // the literal does not fit (and the limit is unreachable anyway).
+        const MAX_SAFE: u64 = 9_007_199_254_740_991;
         let mut target_index = start;
         for source_index in 0..source_len {
             let key = alloc::format!("{source_index}");
@@ -5515,7 +5517,7 @@ impl<'a> Interp<'a> {
                     NanBox::undefined(),
                 )?;
             } else {
-                if target_index >= MAX_SAFE {
+                if target_index as u64 >= MAX_SAFE {
                     return Err(self.type_error("flatten result exceeds maximum array length"));
                 }
                 self.create_data_property_or_throw(target, target_index, element)?;
