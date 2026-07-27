@@ -1431,6 +1431,26 @@ pub(crate) fn build_resolved_locale(base: &str, additions: &[String]) -> String 
 /// which is more complete/correct here than intl 0.5.1 (which mis-drops `ka-yes`
 /// and lacks `rg`/`sd` subdivision aliases). Returns `None` (→ **RangeError**)
 /// when the tag is not structurally valid.
+/// Canonicalizes a `-t-` extension's *tlang* — structural normalization plus the
+/// CLDR base-subtag alias corpus, since a tlang is itself a language tag. Kept
+/// separate from [`canonicalize_locale_id`] because a tlang carries no extensions
+/// of its own, so there is no suffix to split off.
+fn canonicalize_tlang(tlang: &str) -> Option<String> {
+    let structural = canonicalize_locale_id_structural(tlang)?;
+    #[cfg(feature = "intl")]
+    {
+        Some(
+            intl::locale::canonicalize(&structural)
+                .and_then(|t| canonicalize_locale_id_structural(&t))
+                .unwrap_or(structural),
+        )
+    }
+    #[cfg(not(feature = "intl"))]
+    {
+        Some(structural)
+    }
+}
+
 pub(crate) fn canonicalize_locale_id(tag: &str) -> Option<String> {
     // Strict structural validation + local canonical form (rejects invalid tags,
     // e.g. `i-klingon`, → RangeError).
@@ -1789,11 +1809,15 @@ fn canonicalize_extension(singleton: char, subs: &[String]) -> Option<String> {
             tlang.push(subs[i].clone());
             i += 1;
         }
-        // Canonicalize the tlang via the locale-id rules (lang/script/region/variants).
+        // Canonicalize the tlang via the locale-id rules (lang/script/region/
+        // variants). It is a *language tag*, so the CLDR alias corpus applies to
+        // it exactly as it does to the base tag — `en-t-iw` canonicalizes to
+        // `en-t-he`. Structural normalization alone left the deprecated subtag
+        // in place.
         let tlang_canon = if tlang.is_empty() {
             None
         } else {
-            Some(canonicalize_locale_id_structural(&tlang.join("-"))?)
+            Some(canonicalize_tlang(&tlang.join("-"))?)
         };
         let mut fields: Vec<(String, Vec<String>)> = Vec::new();
         while i < subs.len() {
