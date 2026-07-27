@@ -1443,9 +1443,14 @@ pub(crate) fn canonicalize_locale_id(tag: &str) -> Option<String> {
     let base = subs[..ext_at].join("-");
     // Apply the CLDR base-subtag alias corpus, then re-run the strict canonicalizer
     // so any alias-introduced subtags are re-normalized (variant re-sort, casing).
+    // The alias corpus is `intl` data; without that feature the structural
+    // canonical form stands on its own (no alias substitution, still valid).
+    #[cfg(feature = "intl")]
     let aliased_base = intl::locale::canonicalize(&base)
         .and_then(|b| canonicalize_locale_id_structural(&b))
         .unwrap_or(base);
+    #[cfg(not(feature = "intl"))]
+    let aliased_base = base;
     if ext_at == subs.len() {
         Some(aliased_base)
     } else {
