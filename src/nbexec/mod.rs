@@ -2651,6 +2651,48 @@ const DYN_FN_MARKER: &str = "\u{0}dynfn";
 /// A safety cap on eagerly-collected `yield`s (an infinite generator would
 /// otherwise hang); exceeding it throws instead.
 const GEN_CAP: usize = 1_000_000;
+
+// `Array.fromAsync` runs as a spec async closure: it suspends at every `Await`
+// and resumes from the microtask queue, so its loop state cannot live on the
+// Rust stack. It lives in an ordinary array instead — the GC traces the handles
+// in it, and the two continuation functions (`BoundNative`s over that array,
+// held by the promise's reaction) keep it alive. These name its slots.
+/// The iterator object (`undefined` on the array-like path).
+const FA_ITER: usize = 0;
+/// `iteratorRecord.[[NextMethod]]`, read once and reused for every step.
+const FA_NEXT: usize = 1;
+/// `mapfn`, or `undefined` when there is no mapping.
+const FA_MAP: usize = 2;
+/// `thisArg` for `mapfn`.
+const FA_THIS: usize = 3;
+/// `A` — the result object being populated.
+const FA_A: usize = 4;
+/// `k` — the index of the element being produced.
+const FA_K: usize = 5;
+/// Whether the iterator is a genuine async iterator (vs a sync one wrapped as
+/// async-from-sync), which decides what gets awaited and how a close behaves.
+const FA_ASYNC: usize = 6;
+/// The promise `fromAsync` returned, settled when the loop ends.
+const FA_PROMISE: usize = 7;
+/// Which `Await` the loop is suspended at — one of the `FA_STAGE_*` values.
+const FA_STAGE: usize = 8;
+/// The array-like source (`undefined` on the iterable path).
+const FA_SRC: usize = 9;
+/// `len` for the array-like path.
+const FA_LEN: usize = 10;
+/// The number of slots in the state array.
+const FA_SLOTS: usize = 11;
+
+/// Suspended awaiting the promise a genuine async iterator's `next()` returned.
+const FA_STAGE_NEXT_RESULT: f64 = 0.0;
+/// Suspended awaiting a yielded value (the async-from-sync wrapping).
+const FA_STAGE_VALUE: f64 = 1.0;
+/// Suspended awaiting `mapfn`'s result on the iterable path.
+const FA_STAGE_MAPPED: f64 = 2.0;
+/// Suspended awaiting `Get(arrayLike, k)` on the array-like path.
+const FA_STAGE_LIKE_VALUE: f64 = 3.0;
+/// Suspended awaiting `mapfn`'s result on the array-like path.
+const FA_STAGE_LIKE_MAPPED: f64 = 4.0;
 // Bound natives (carry a target promise handle):
 const N_RESOLVE: u16 = 100;
 const N_REJECT: u16 = 101;
@@ -2792,6 +2834,10 @@ const N_JSON_IS_RAW: u16 = 651;
 /// `Array.fromAsync(asyncItems, mapFn?, thisArg?)` — returns a promise of an
 /// array, awaiting each value of an (a)sync iterable / array-like.
 const N_ARRAY_FROM_ASYNC: u16 = 652;
+/// `Array.fromAsync`'s fulfillment continuation, bound to its loop state.
+const N_FROM_ASYNC_STEP: u16 = 1217;
+/// `Array.fromAsync`'s rejection continuation, bound to its loop state.
+const N_FROM_ASYNC_THROW: u16 = 1218;
 /// `RegExp.escape(S)` — escapes `S` so it matches literally in a pattern.
 const N_REGEXP_ESCAPE: u16 = 653;
 /// The ES2025 `uint8array-base64` proposal methods. Instance methods on

@@ -430,32 +430,23 @@ problem — that cell is downstream of the loss. The fix is a WTF-8 input path f
 the lexer/parser (source as `&[u8]`, string/regex literal payloads carried as
 WTF-8), which also removes the last lossy boundary in `eval`/`Function`.
 
-### 3.12 `Array.fromAsync` as a suspendable frame
+### 3.12 `Array.fromAsync` as a suspendable frame — **landed**
 
-`array_from_async_core` drives the whole iteration in a Rust loop, so the promise
-`Array.fromAsync(items)` returns is already settled by the time the caller gets
-it. The spec awaits each `IteratorStep`, which means exactly *one* element has
-been read when the call returns — a mutation made by the caller before its first
-`await` is observed by the rest of the iteration (4 ledgered tests, the
-`fromAsync/asyncitems-array-{add,add-to-singleton,mutate,remove}` family). The
-iterator itself is already live; the loop simply runs too early.
+`array_from_async_core` drove the whole iteration in a Rust loop, so the promise
+`Array.fromAsync(items)` returned was already settled by the time the caller got
+it, where the spec has read exactly one element. It is now the continuation chain
+described below: `array_from_async_start` runs the prefix the spec's
+`AsyncFunctionStart` runs synchronously — the `mapfn` check, the
+`@@asyncIterator`/`@@iterator` lookups, `Construct(C)`, and the first
+`IteratorStep` — and then suspends. Each `Await` resolves a promise whose
+reaction is a pair of `BoundNative` continuations over the loop state, which
+lives in an ordinary array so the GC traces it. `built-ins/Array` is now clear.
 
-A native Rust frame cannot suspend the way an async function's step machine can,
-so the fix is one of two shapes:
-
-- **Self-host it.** Evaluate a `fromAsync` written in JavaScript at realm boot,
-  closing over the intrinsics it needs (`Object.defineProperty`, `Symbol
-  .asyncIterator`, …) so later tampering cannot reach it. Every `await` then
-  suspends for free. This is the smaller change and the one that generalises —
-  the same hazard applies to any other builtin defined in terms of `Await`.
-- **Make the loop a continuation chain.** Do the first `IteratorStep`
-  synchronously, then attach one step per microtask turn to the promise the
-  previous step produced.
-
-Either way the ~40 currently-passing `fromAsync` tests are the constraint: the
-error messages, the property-access order, and the iterator-close paths all have
-coverage, so the replacement has to be verified against the whole family, not
-just the four.
+The alternative considered and rejected was self-hosting `fromAsync` in
+JavaScript so each `await` suspends for free. It is the smaller change and it
+generalises to any other builtin defined in terms of `Await`, but it needs the
+intrinsics captured at realm boot to be safe against later tampering, and it
+would have moved 95 passing tests onto a new code path all at once.
 
 ### 3.13 The gate
 

@@ -1932,21 +1932,31 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// `Array.fromAsync(asyncItems, mapFn?, thisArg?)` — the synchronous core.
-    /// Resolves the input's `@@asyncIterator` / `@@iterator` (each getter fires
-    /// once), then drives the iterator step-by-step — awaiting each value, applying
-    /// `mapFn` (awaiting its result), and closing the iterator on an abrupt mapFn /
-    /// define completion — or, for a non-iterable array-like, `Get`s each indexed
-    /// element. Builds the result (a plain array, or a `Construct`ed custom
-    /// `this`-value). The dispatch site wraps the returned value — or a thrown
-    /// value — into the promise `fromAsync` returns, so every failure rejects it.
-    pub(crate) fn array_from_async_core(
+    /// `Array.fromAsync(asyncItems, mapFn?, thisArg?)` — the synchronous prefix.
+    ///
+    /// The spec runs the whole body as an async closure started by
+    /// `AsyncFunctionStart`, so everything up to the *first* `Await` runs
+    /// synchronously and the rest resumes from the microtask queue. That is what
+    /// this function and [`Self::fa_resume`] are between them: here we run
+    /// the prefix — validate `mapfn`, read `@@asyncIterator` (then `@@iterator`
+    /// only if it is absent, each getter firing once), obtain the iterator,
+    /// `Construct` the result — and take the loop up to its first `Await`;
+    /// `fa_resume` takes each subsequent step off the queue.
+    ///
+    /// Driving the loop to completion here instead would settle `promise` before
+    /// the caller ever sees it, and a caller is entitled to mutate the source
+    /// before its own first `await` and have the rest of the iteration observe it.
+    ///
+    /// Anything thrown by the prefix propagates to the dispatch site, which
+    /// rejects `promise` — `fromAsync` never throws synchronously.
+    pub(crate) fn array_from_async_start(
         &mut self,
         items_box: NanBox,
         map_fn: NanBox,
         this_arg: NanBox,
         this_ctor: NanBox,
-    ) -> Result<NanBox, ExecError> {
+        promise: Handle,
+    ) -> Result<(), ExecError> {
         let has_map = !matches!(map_fn.unpack(), Unpacked::Undefined);
         if has_map {
             self.require_callable(map_fn, "Array.fromAsync mapFn")?;
@@ -2015,95 +2025,39 @@ impl<'a> Interp<'a> {
             None
         };
 
+        // The loop state, held in an ordinary array so the two continuation
+        // functions (which are `BoundNative`s over it) keep it alive and the GC
+        // traces the handles in it for free.
+        let mut slots = alloc::vec![NanBox::undefined(); FA_SLOTS];
+        slots[FA_MAP] = map_fn;
+        slots[FA_THIS] = this_arg;
+        slots[FA_PROMISE] = NanBox::handle(promise.to_raw());
+
         if let Some((ih, is_async)) = iter {
-            // Iterable path (3.j): `A` is `Construct`ed early with **no** arguments,
+            // Iterable path (3.h): `A` is `Construct`ed early with **no** arguments,
             // then populated element-by-element as the iterator is stepped.
-            let target = if use_ctor {
+            let a = if use_ctor {
                 let t = self.construct(this_ctor, &[])?;
                 let Some(th) = t.as_handle().map(Handle::from_raw) else {
                     return Err(
                         self.type_error("Array.fromAsync constructor did not return an object")
                     );
                 };
-                Some(th)
+                th
             } else {
-                None
+                self.realm.new_array(Vec::new())
             };
-            let mut plain: Vec<NanBox> = Vec::new();
             // `iteratorRecord.[[NextMethod]]` is read once and reused for every step.
             let next_fn = self.read_member(ih, "next")?;
-            let ih_box = NanBox::handle(ih.to_raw());
-            let mut k = 0usize;
-            loop {
-                // IteratorStep: for an async iterator, `next()` returns a promise of
-                // the result record, which is awaited before its `done`/`value` read.
-                let mut res = self.call_with_this(next_fn, ih_box, &[])?;
-                if is_async {
-                    res = self.await_value(res)?;
-                }
-                if !self.is_object_value(res) {
-                    return Err(self.type_error("iterator result is not an object"));
-                }
-                let rh = Handle::from_raw(res.as_handle().unwrap());
-                let done = self.read_member(rh, "done")?;
-                if self.realm.truthy(done) {
-                    break;
-                }
-                let mut value = self.read_member(rh, "value")?;
-                // A sync iterator wrapped as async-from-sync awaits each yielded value;
-                // a rejection closes the underlying sync iterator (AsyncFromSync
-                // `closeOnRejection`), so its `finally` / `return()` still runs.
-                if !is_async {
-                    match self.await_value(value) {
-                        Ok(v) => value = v,
-                        Err(e) => {
-                            self.close_from_async_iter(ih, false);
-                            return Err(e);
-                        }
-                    }
-                }
-                if has_map {
-                    // A throwing/rejecting mapFn closes the iterator (return()) and
-                    // rejects the promise; the original error takes precedence.
-                    match self.call_with_this(map_fn, this_arg, &[value, NanBox::number(k as f64)])
-                    {
-                        Ok(m) => match self.await_value(m) {
-                            Ok(m) => value = m,
-                            Err(e) => {
-                                self.close_from_async_iter(ih, is_async);
-                                return Err(e);
-                            }
-                        },
-                        Err(e) => {
-                            self.close_from_async_iter(ih, is_async);
-                            return Err(e);
-                        }
-                    }
-                }
-                if let Some(th) = target {
-                    // CreateDataPropertyOrThrow(A, k, value); a define failure closes
-                    // the iterator (AsyncIteratorClose / IteratorClose).
-                    if let Err(e) = self.create_data_property_or_throw(th, k, value) {
-                        self.close_from_async_iter(ih, is_async);
-                        return Err(e);
-                    }
-                } else {
-                    plain.push(value);
-                }
-                k += 1;
-                if k > GEN_CAP {
-                    self.close_from_async_iter(ih, is_async);
-                    return Err(self.type_error("iterator did not terminate"));
-                }
-            }
-            if let Some(th) = target {
-                self.set_length_or_throw(th, k)?;
-                Ok(NanBox::handle(th.to_raw()))
-            } else {
-                Ok(NanBox::handle(self.realm.new_array(plain).to_raw()))
-            }
+            slots[FA_ITER] = NanBox::handle(ih.to_raw());
+            slots[FA_NEXT] = next_fn;
+            slots[FA_A] = NanBox::handle(a.to_raw());
+            slots[FA_K] = NanBox::number(0.0);
+            slots[FA_ASYNC] = NanBox::boolean(is_async);
+            let s = self.realm.new_array(slots);
+            self.fa_iter_step(s)
         } else {
-            // Array-like path (3.k): ToLength(Get(O, "length")), then await Get(O, k).
+            // Array-like path (3.i): ToLength(Get(O, "length")), then await Get(O, k).
             let len = if let Some(h) = obj_h {
                 let len_val = self.read_member(h, "length")?;
                 let len_num = self.coerce_to_number(len_val)?;
@@ -2121,41 +2075,222 @@ impl<'a> Interp<'a> {
                 0
             };
             // For an array-like, `A` is `Construct`ed with the length argument.
-            let target = if use_ctor {
+            let a = if use_ctor {
                 let t = self.construct(this_ctor, &[NanBox::number(len as f64)])?;
                 let Some(th) = t.as_handle().map(Handle::from_raw) else {
                     return Err(
                         self.type_error("Array.fromAsync constructor did not return an object")
                     );
                 };
-                Some(th)
+                th
             } else {
-                None
+                self.realm.new_array(Vec::new())
             };
-            let mut plain: Vec<NanBox> = Vec::new();
-            if let Some(h) = obj_h {
-                for i in 0..len {
-                    let v = self.read_member(h, &alloc::format!("{i}"))?;
-                    let mut v = self.await_value(v)?;
-                    if has_map {
-                        let mapped =
-                            self.call_with_this(map_fn, this_arg, &[v, NanBox::number(i as f64)])?;
-                        v = self.await_value(mapped)?;
-                    }
-                    if let Some(th) = target {
-                        self.create_data_property_or_throw(th, i, v)?;
-                    } else {
-                        plain.push(v);
-                    }
+            slots[FA_A] = NanBox::handle(a.to_raw());
+            slots[FA_K] = NanBox::number(0.0);
+            slots[FA_ASYNC] = NanBox::boolean(false);
+            slots[FA_SRC] = obj_h.map_or_else(NanBox::undefined, |h| NanBox::handle(h.to_raw()));
+            slots[FA_LEN] = NanBox::number(len as f64);
+            let s = self.realm.new_array(slots);
+            self.fa_like_step(s)
+        }
+    }
+
+    /// Reads a slot of an `Array.fromAsync` loop state.
+    fn fa(&self, s: Handle, slot: usize) -> NanBox {
+        self.realm
+            .array_elements(s)
+            .and_then(|e| e.get(slot).copied())
+            .unwrap_or_else(NanBox::undefined)
+    }
+
+    /// Reads a numeric slot of an `Array.fromAsync` loop state.
+    fn fa_num(&self, s: Handle, slot: usize) -> f64 {
+        self.realm.to_number(self.fa(s, slot))
+    }
+
+    /// `Await(value)`, resuming the loop at `stage`. The continuation pair is two
+    /// `BoundNative`s over the state, so the reaction the promise holds is what
+    /// keeps the whole activation alive.
+    fn fa_await(&mut self, s: Handle, value: NanBox, stage: f64) {
+        self.realm.set_element(s, FA_STAGE, NanBox::number(stage));
+        let p = self.promise_resolve(value);
+        let on_f = self.realm.new_bound_native(N_FROM_ASYNC_STEP, s);
+        let on_r = self.realm.new_bound_native(N_FROM_ASYNC_THROW, s);
+        self.register_then(
+            p,
+            NanBox::handle(on_f.to_raw()),
+            NanBox::handle(on_r.to_raw()),
+            false,
+        );
+    }
+
+    /// Rejects the `Array.fromAsync` promise with `reason`.
+    fn fa_reject(&mut self, s: Handle, reason: NanBox) {
+        if let Some(p) = self.fa(s, FA_PROMISE).as_handle().map(Handle::from_raw) {
+            self.settle(p, reason, false);
+        }
+    }
+
+    /// Resumes an `Array.fromAsync` loop from the microtask queue: `rejected` says
+    /// which of the two continuation functions the promise called. Never propagates
+    /// a throw — there is no caller left to catch one, so every abrupt completion
+    /// becomes a rejection of the `fromAsync` promise.
+    pub(crate) fn fa_resume(&mut self, s: Handle, incoming: NanBox, rejected: bool) {
+        let stage = self.fa_num(s, FA_STAGE);
+        if rejected {
+            // A rejected `Await` closes the iterator at the two points where the
+            // spec does: a value rejection is AsyncFromSyncIterator's
+            // `closeOnRejection` (so the underlying sync iterator's `finally` still
+            // runs), and a rejected `mapfn` result is AsyncIteratorClose. A `next()`
+            // that rejects has already ended the iteration, and is not closed.
+            if let Some(ih) = self.fa(s, FA_ITER).as_handle().map(Handle::from_raw) {
+                let is_async = self.realm.truthy(self.fa(s, FA_ASYNC));
+                match stage {
+                    FA_STAGE_VALUE => self.close_from_async_iter(ih, false),
+                    FA_STAGE_MAPPED => self.close_from_async_iter(ih, is_async),
+                    _ => {}
                 }
             }
-            if let Some(th) = target {
-                self.set_length_or_throw(th, len)?;
-                Ok(NanBox::handle(th.to_raw()))
-            } else {
-                Ok(NanBox::handle(self.realm.new_array(plain).to_raw()))
+            self.fa_reject(s, incoming);
+            return;
+        }
+        let r = match stage {
+            FA_STAGE_NEXT_RESULT => self.fa_after_next(s, incoming),
+            FA_STAGE_VALUE => self.fa_after_value(s, incoming),
+            FA_STAGE_MAPPED => self.fa_place(s, incoming),
+            FA_STAGE_LIKE_VALUE => self.fa_like_after_value(s, incoming),
+            _ => self.fa_like_place(s, incoming),
+        };
+        if let Err(ExecError::Throw(e)) = r {
+            self.fa_reject(s, e);
+        }
+    }
+
+    /// `IteratorStep`: call `next()`, and for a genuine async iterator await the
+    /// promise of the result record before its `done`/`value` are read.
+    fn fa_iter_step(&mut self, s: Handle) -> Result<(), ExecError> {
+        let k = self.fa_num(s, FA_K);
+        if k > GEN_CAP as f64 {
+            if let Some(ih) = self.fa(s, FA_ITER).as_handle().map(Handle::from_raw) {
+                let is_async = self.realm.truthy(self.fa(s, FA_ASYNC));
+                self.close_from_async_iter(ih, is_async);
+            }
+            return Err(self.type_error("iterator did not terminate"));
+        }
+        let iter = self.fa(s, FA_ITER);
+        let next_fn = self.fa(s, FA_NEXT);
+        let res = self.call_with_this(next_fn, iter, &[])?;
+        if self.realm.truthy(self.fa(s, FA_ASYNC)) {
+            self.fa_await(s, res, FA_STAGE_NEXT_RESULT);
+            return Ok(());
+        }
+        self.fa_after_next(s, res)
+    }
+
+    /// The iterator result record is in hand: stop on `done`, else take its value
+    /// (awaiting it when the iterator is a sync one wrapped as async-from-sync).
+    fn fa_after_next(&mut self, s: Handle, res: NanBox) -> Result<(), ExecError> {
+        if !self.is_object_value(res) {
+            return Err(self.type_error("iterator result is not an object"));
+        }
+        let rh = Handle::from_raw(res.as_handle().expect("checked object"));
+        let done = self.read_member(rh, "done")?;
+        if self.realm.truthy(done) {
+            return self.fa_finish(s, self.fa_num(s, FA_K));
+        }
+        let value = self.read_member(rh, "value")?;
+        if self.realm.truthy(self.fa(s, FA_ASYNC)) {
+            return self.fa_after_value(s, value);
+        }
+        self.fa_await(s, value, FA_STAGE_VALUE);
+        Ok(())
+    }
+
+    /// The element value is in hand: apply `mapfn` (awaiting its result) or place
+    /// the value directly.
+    fn fa_after_value(&mut self, s: Handle, value: NanBox) -> Result<(), ExecError> {
+        let map_fn = self.fa(s, FA_MAP);
+        if matches!(map_fn.unpack(), Unpacked::Undefined) {
+            return self.fa_place(s, value);
+        }
+        let this_arg = self.fa(s, FA_THIS);
+        let k = self.fa_num(s, FA_K);
+        // A throwing mapfn closes the iterator (`return()`) and rejects with the
+        // original error; the close's own completion is discarded.
+        match self.call_with_this(map_fn, this_arg, &[value, NanBox::number(k)]) {
+            Ok(m) => {
+                self.fa_await(s, m, FA_STAGE_MAPPED);
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(ih) = self.fa(s, FA_ITER).as_handle().map(Handle::from_raw) {
+                    let is_async = self.realm.truthy(self.fa(s, FA_ASYNC));
+                    self.close_from_async_iter(ih, is_async);
+                }
+                Err(e)
             }
         }
+    }
+
+    /// `CreateDataPropertyOrThrow(A, k, value)`, then round the loop again.
+    fn fa_place(&mut self, s: Handle, value: NanBox) -> Result<(), ExecError> {
+        let k = self.fa_num(s, FA_K);
+        let a = Handle::from_raw(self.fa(s, FA_A).as_handle().expect("result object"));
+        if let Err(e) = self.create_data_property_or_throw(a, k as usize, value) {
+            if let Some(ih) = self.fa(s, FA_ITER).as_handle().map(Handle::from_raw) {
+                let is_async = self.realm.truthy(self.fa(s, FA_ASYNC));
+                self.close_from_async_iter(ih, is_async);
+            }
+            return Err(e);
+        }
+        self.realm.set_element(s, FA_K, NanBox::number(k + 1.0));
+        self.fa_iter_step(s)
+    }
+
+    /// Array-like path: `Get(arrayLike, k)` then await it.
+    fn fa_like_step(&mut self, s: Handle) -> Result<(), ExecError> {
+        let k = self.fa_num(s, FA_K);
+        let len = self.fa_num(s, FA_LEN);
+        if k >= len {
+            return self.fa_finish(s, len);
+        }
+        let src = Handle::from_raw(self.fa(s, FA_SRC).as_handle().expect("array-like source"));
+        let v = self.read_member(src, &alloc::format!("{k}"))?;
+        self.fa_await(s, v, FA_STAGE_LIKE_VALUE);
+        Ok(())
+    }
+
+    /// Array-like path: apply `mapfn` (awaiting its result) or place the value.
+    fn fa_like_after_value(&mut self, s: Handle, value: NanBox) -> Result<(), ExecError> {
+        let map_fn = self.fa(s, FA_MAP);
+        if matches!(map_fn.unpack(), Unpacked::Undefined) {
+            return self.fa_like_place(s, value);
+        }
+        let this_arg = self.fa(s, FA_THIS);
+        let k = self.fa_num(s, FA_K);
+        let m = self.call_with_this(map_fn, this_arg, &[value, NanBox::number(k)])?;
+        self.fa_await(s, m, FA_STAGE_LIKE_MAPPED);
+        Ok(())
+    }
+
+    /// Array-like path: `CreateDataPropertyOrThrow(A, k, value)`, then continue.
+    fn fa_like_place(&mut self, s: Handle, value: NanBox) -> Result<(), ExecError> {
+        let k = self.fa_num(s, FA_K);
+        let a = Handle::from_raw(self.fa(s, FA_A).as_handle().expect("result object"));
+        self.create_data_property_or_throw(a, k as usize, value)?;
+        self.realm.set_element(s, FA_K, NanBox::number(k + 1.0));
+        self.fa_like_step(s)
+    }
+
+    /// `Set(A, "length", len, true)` and fulfill the `fromAsync` promise with `A`.
+    fn fa_finish(&mut self, s: Handle, len: f64) -> Result<(), ExecError> {
+        let a = Handle::from_raw(self.fa(s, FA_A).as_handle().expect("result object"));
+        self.set_length_or_throw(a, len as usize)?;
+        if let Some(p) = self.fa(s, FA_PROMISE).as_handle().map(Handle::from_raw) {
+            self.resolve_with(p, NanBox::handle(a.to_raw()));
+        }
+        Ok(())
     }
 
     /// `Set(A, "length", n, true)` for the `Array.fromAsync` result: the throwing

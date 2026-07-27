@@ -10,10 +10,6 @@ annexB/built-ins/RegExp/legacy-accessors/leftContext/this-cross-realm-constructo
 annexB/built-ins/RegExp/legacy-accessors/rightContext/this-cross-realm-constructor.js  # [sloppy] expected pass, Runtime Test262Error: RegExp.rightContext getter throws for cross-realm receiver Expected a TypeError to be thrown but no exception was thrown at all
 annexB/language/function-code/block-decl-nested-blocks-with-fun-decl.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«2», «1») to be true
 annexB/language/statements/for-in/nonstrict-initializer.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: expected Semicolon, found Keyword(In) (at 7116..7118)
-built-ins/Array/fromAsync/asyncitems-array-add-to-singleton.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [1] and expected [1, 7] should have the same contents.  )
-built-ins/Array/fromAsync/asyncitems-array-add.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [1, 2, 3] and expected [1, 2, 3, 4] should have the same con)
-built-ins/Array/fromAsync/asyncitems-array-mutate.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [1, 2, 3] and expected [1, 8, 3] should have the same conten)
-built-ins/Array/fromAsync/asyncitems-array-remove.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [1, 2, 3] and expected [1, 2] should have the same contents.)
 built-ins/ArrayBuffer/data-allocation-after-object-creation.js  # [sloppy] expected pass, Runtime Test262Error: Expected a DummyError but got a RangeError
 built-ins/ArrayBuffer/options-maxbytelength-compared-before-object-creation.js  # [sloppy] expected pass, Runtime Test262Error: Expected a RangeError but got a Test262Error
 built-ins/ArrayBuffer/prototype/slice/species-returns-immutable-arraybuffer.js  # [sloppy] expected pass, Runtime Test262Error: Expected a TypeError to be thrown but no exception was thrown at all

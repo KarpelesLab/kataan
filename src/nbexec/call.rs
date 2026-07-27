@@ -384,6 +384,13 @@ impl<'a> Interp<'a> {
         }
         // A bound native (promise resolve/reject) carries its target.
         if let Some((id, target)) = self.realm.bound_native_at(handle) {
+            // `Array.fromAsync`'s two continuations: the target is the loop state,
+            // and the argument is the settled value of the `Await` it suspended at.
+            if id == N_FROM_ASYNC_STEP || id == N_FROM_ASYNC_THROW {
+                let incoming = args.first().copied().unwrap_or_else(NanBox::undefined);
+                self.fa_resume(target, incoming, id == N_FROM_ASYNC_THROW);
+                return Ok(NanBox::undefined());
+            }
             // A first-class `ArrayBuffer.prototype.<method>`: reject a `this` that is
             // not an Object with an `[[ArrayBufferData]]` slot, then dispatch.
             if id == N_AB_PROTO_FN || id == N_SAB_PROTO_FN {
