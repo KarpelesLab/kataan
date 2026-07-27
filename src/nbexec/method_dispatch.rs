@@ -3380,6 +3380,51 @@ impl<'a> Interp<'a> {
                 _ => {}
             }
         }
+        // `push`/`pop` touch only the end of the array, so they are served before
+        // the `elements_vec` snapshot below — that snapshot copies every element,
+        // which would make a `for (…) a.push(x)` loop quadratic in the array
+        // length. The `precise_array` guard is re-derived here *without* the
+        // whole-array hole scan, which neither method needs: `push` writes at
+        // indices at or past the current length, so holes below it cannot affect
+        // it, and `pop` only cares whether the single index it reads is a hole.
+        if matches!(method, "push" | "pop")
+            && self.realm.typed_kind(handle).is_none()
+            && let Some(dense_len) = self.realm.array_elements(handle).map(<[_]>::len)
+        {
+            let overridden = self.realm.array_has_index_overrides(handle)
+                || self.realm.proto_index_accessor_dirty();
+            let length_readonly_throw = |this: &mut Self| -> ExecError {
+                let m = this.new_str(
+                    "Cannot assign to read only property 'length' of object '[object Array]'",
+                );
+                ExecError::Throw(this.make_error(N_TYPE_ERROR, Some(m)))
+            };
+            if method == "push" {
+                // A widened logical length (`x.length = 2**32-1`) means the dense
+                // store no longer says where to append, and the final
+                // `Set(O, "length", …)` must be able to raise a RangeError.
+                if overridden || self.realm.array_length(handle) != Some(dense_len) {
+                    return Ok(Some(self.array_like_mutate(method, handle, args)?));
+                }
+                if self.realm.array_length_is_readonly(handle) {
+                    return Err(length_readonly_throw(self));
+                }
+                let mut len = dense_len;
+                for a in args {
+                    len = self.realm.array_push(handle, *a).unwrap_or(len);
+                }
+                return Ok(Some(NanBox::number(len as f64)));
+            }
+            // `pop`: an inherited getter fires only if the index it reads is a hole.
+            let reads_hole = dense_len > 0 && self.realm.array_hole_at(handle, dense_len - 1);
+            if overridden || reads_hole || self.realm.array_length(handle) != Some(dense_len) {
+                return Ok(Some(self.array_like_mutate(method, handle, args)?));
+            }
+            if self.realm.array_length_is_readonly(handle) {
+                return Err(length_readonly_throw(self));
+            }
+            return Ok(Some(self.realm.array_pop(handle)));
+        }
         if let Some(elems) = self.realm.elements_vec(handle) {
             // Methods whose integer-position arguments go through
             // ToIntegerOrInfinity (→ ToNumber): a Symbol argument must throw a

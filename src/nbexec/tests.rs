@@ -11677,3 +11677,48 @@ fn legacy_regexp_statics_are_lazy_but_correct() {
         "b"
     );
 }
+
+#[test]
+fn array_push_pop_fast_path_preserves_semantics() {
+    // The no-copy `push`/`pop` path must agree with the precise generic one.
+    assert_eq!(
+        run("var a=[1,2]; a.push(3,4) + ':' + a.join(',')"),
+        "4:1,2,3,4"
+    );
+    assert_eq!(run("var a=[1,2,3]; a.pop() + ':' + a.join(',')"), "3:1,2");
+    assert_eq!(run("var a=[]; a.pop() + ':' + a.length"), "undefined:0");
+    // Holes below the write positions do not affect `push`…
+    assert_eq!(
+        run("var a=[1]; a[3]=4; a.push(5); a.length + ':' + (1 in a)"),
+        "5:false"
+    );
+    // …but a hole at the index `pop` reads must go through the precise path so
+    // an inherited getter fires.
+    assert_eq!(
+        run(
+            "Object.defineProperty(Array.prototype,'2',{get(){return 'proto';},configurable:true});
+             var a=[0,1]; a.length=3; var r=a.pop();
+             delete Array.prototype[2]; r + ':' + a.length"
+        ),
+        "proto:2"
+    );
+    // A non-writable `length` still throws on push/pop.
+    assert_eq!(
+        run(
+            "var a=[1,2]; Object.defineProperty(a,'length',{writable:false});
+             var n=0; try { a.push(3); } catch (e) { n += e instanceof TypeError; }
+             try { a.pop(); } catch (e) { n += e instanceof TypeError; } n"
+        ),
+        "2"
+    );
+    // A widened logical length routes to the precise path (appends at `length`).
+    assert_eq!(
+        run("var a=[1]; a.length=5; a.push(9); a.length + ':' + a[5]"),
+        "6:9"
+    );
+    // Repeated push stays linear — quadratic behaviour here takes seconds.
+    assert_eq!(
+        run("var a=[]; for (var i=0;i<40000;i++) a.push(i); a.length + ':' + a[39999]"),
+        "40000:39999"
+    );
+}
