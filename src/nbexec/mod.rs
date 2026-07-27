@@ -4817,6 +4817,10 @@ impl<'a> Interp<'a> {
             self.realm.set_non_configurable_property(thrower_h, "name");
             self.realm
                 .set_non_configurable_property(thrower_h, "length");
+            // …and it is created with [[Extensible]] false (ECMA-262 10.2.4
+            // step 6: "Perform ! SetIntegrityLevel(F, frozen)"), so
+            // `Object.isExtensible` is false and `Object.isFrozen` is true.
+            self.realm.freeze_object(thrower_h);
             // Record it as the realm's single canonical `%ThrowTypeError%` so a
             // strict `arguments` object's `callee` accessor is the *same* function
             // object (ECMA-262: there is exactly one `%ThrowTypeError%` per realm).

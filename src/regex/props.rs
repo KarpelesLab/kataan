@@ -134,10 +134,10 @@ pub(crate) fn resolve_lone(name: &str) -> Option<PropEscape> {
 }
 
 /// The seven ECMAScript *properties of strings* (`\p{…}` names valid only in a
-/// `v`-mode class, matching multi-code-point strings). This engine does not yet
-/// implement them, but they are well-formed per spec — so a `\p{…}` with one of
-/// these names is an *unsupported* (deferred) escape rather than a `SyntaxError`,
-/// keeping a never-matched `v`-mode literal that uses one from failing at parse.
+/// `v`-mode class, matching multi-code-point strings). All seven are backed by
+/// the generated Unicode Emoji tables in [`super::props_emoji`]; the predicate
+/// stays separate from the data so the parser can apply the early-error rules
+/// (a property of strings may not be negated, nor used without `v`) by name.
 #[must_use]
 pub(crate) fn is_property_of_strings(name: &str) -> bool {
     matches!(
@@ -152,33 +152,12 @@ pub(crate) fn is_property_of_strings(name: &str) -> bool {
     )
 }
 
-/// Resolves a *property of strings* name (a `v`-mode `\p{…}` that matches a set of
-/// multi-code-point strings) to that set of strings, when this engine has the
-/// closed-form data for it. Each string is a sequence of scalar code points.
-///
-/// Only `Emoji_Keycap_Sequence` is provided as closed-form data: it is a small,
-/// stable, fully-enumerated Unicode set — the twelve sequences
-/// `{ # * 0 1 2 3 4 5 6 7 8 9 } U+FE0F U+20E3`. The remaining properties of
-/// strings (`RGI_Emoji` and its component sequence properties, `Basic_Emoji`)
-/// depend on the full, versioned emoji-sequence tables the engine does not carry,
-/// so they return `None` and stay deferred (a never-matched literal keeps
-/// parsing; a matched one is an unsupported-feature error).
+/// Resolves a *property of strings* name (a `v`-mode `\p{…}` that matches a set
+/// of multi-code-point strings) to that set. Each string is a sequence of scalar
+/// code points, taken from the generated Unicode Emoji tables.
 #[must_use]
 pub(crate) fn strings_for_property(name: &str) -> Option<alloc::vec::Vec<alloc::vec::Vec<u32>>> {
-    if name != "Emoji_Keycap_Sequence" {
-        return None;
-    }
-    // U+0023 `#`, U+002A `*`, U+0030..=U+0039 `0`..`9`, each followed by the
-    // emoji variation selector U+FE0F and the combining enclosing keycap U+20E3.
-    let bases: [u32; 12] = [
-        0x23, 0x2A, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
-    ];
-    Some(
-        bases
-            .iter()
-            .map(|&b| alloc::vec![b, 0xFE0F, 0x20E3])
-            .collect(),
-    )
+    super::props_emoji::sequences(name)
 }
 
 /// Resolves a `name=value` property escape. The left-hand side must be one of the
@@ -696,37 +675,6 @@ impl BinProp {
             // feature, so they resolve exactly.
             XidStart => u::is_xid_start(c),
             XidContinue => u::is_xid_continue(c),
-            // Properties without a dedicated public `intl` predicate or a closed
-            // form (the emoji/grapheme UCD tables are not in this crate's built
-            // feature set, and `ID_Start`/`ID_Continue` differ from the `XID_*`
-            // forms). They are valid names (so never a SyntaxError) but have no
-            // data here, so they match nothing. Listed explicitly so adding data
-            // later is a compile-checked change.
-            IdStart
-            | IdContinue
-            | CaseIgnorable
-            | ChangesWhenNfkcCasefolded
-            | Deprecated
-            | Emoji
-            | EmojiComponent
-            | EmojiModifier
-            | EmojiModifierBase
-            | EmojiPresentation
-            | ExtendedPictographic
-            | Extender
-            | GraphemeBase
-            | GraphemeExtend
-            | IdsBinaryOperator
-            | IdsTrinaryOperator
-            | Ideographic
-            | LogicalOrderException
-            | PatternSyntax
-            | PatternWhiteSpace
-            | Radical
-            | SentenceTerminal
-            | SoftDotted
-            | TerminalPunctuation
-            | UnifiedIdeograph => false,
             // Closed-form variants are handled in `matches` and never reach here.
             Ascii
             | AsciiHexDigit
@@ -736,7 +684,53 @@ impl BinProp {
             | RegionalIndicator
             | NoncharacterCodePoint
             | VariationSelector => false,
+            // Everything else has no public `intl` predicate and no closed form:
+            // served by the generated UCD range tables (same Unicode version as
+            // the `intl` tables above).
+            other => other.matches_ranges(cp),
         }
+    }
+
+    /// Membership via the generated UCD range tables in [`super::props_data`],
+    /// for the binary properties `intl` exposes no predicate for. `None` means
+    /// this property is not table-backed (it is closed-form or `intl`-backed and
+    /// answered by the callers above).
+    fn ranges(self) -> Option<&'static [(u32, u32)]> {
+        use super::props_data as d;
+        use BinProp::*;
+        Some(match self {
+            CaseIgnorable => d::CASE_IGNORABLE,
+            ChangesWhenNfkcCasefolded => d::CHANGES_WHEN_NFKC_CASEFOLDED,
+            Deprecated => d::DEPRECATED,
+            Emoji => d::EMOJI,
+            EmojiComponent => d::EMOJI_COMPONENT,
+            EmojiModifier => d::EMOJI_MODIFIER,
+            EmojiModifierBase => d::EMOJI_MODIFIER_BASE,
+            EmojiPresentation => d::EMOJI_PRESENTATION,
+            ExtendedPictographic => d::EXTENDED_PICTOGRAPHIC,
+            Extender => d::EXTENDER,
+            GraphemeBase => d::GRAPHEME_BASE,
+            GraphemeExtend => d::GRAPHEME_EXTEND,
+            IdContinue => d::ID_CONTINUE,
+            IdStart => d::ID_START,
+            IdsBinaryOperator => d::IDS_BINARY_OPERATOR,
+            IdsTrinaryOperator => d::IDS_TRINARY_OPERATOR,
+            Ideographic => d::IDEOGRAPHIC,
+            LogicalOrderException => d::LOGICAL_ORDER_EXCEPTION,
+            PatternSyntax => d::PATTERN_SYNTAX,
+            PatternWhiteSpace => d::PATTERN_WHITE_SPACE,
+            Radical => d::RADICAL,
+            SentenceTerminal => d::SENTENCE_TERMINAL,
+            SoftDotted => d::SOFT_DOTTED,
+            TerminalPunctuation => d::TERMINAL_PUNCTUATION,
+            UnifiedIdeograph => d::UNIFIED_IDEOGRAPH,
+            _ => return None,
+        })
+    }
+
+    fn matches_ranges(self, cp: u32) -> bool {
+        self.ranges()
+            .is_some_and(|r| super::props_data::in_ranges(r, cp))
     }
 
     #[cfg(not(feature = "intl"))]
@@ -751,7 +745,9 @@ impl BinProp {
             Uppercase => c.is_uppercase(),
             WhiteSpace => c.is_whitespace(),
             HexDigit => c.is_ascii_hexdigit(),
-            _ => false,
+            // The generated UCD range tables carry their own data and need no
+            // `intl` feature, so they stay exact here too.
+            other => other.matches_ranges(cp),
         }
     }
 }

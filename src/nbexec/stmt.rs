@@ -1615,6 +1615,19 @@ impl<'a> Interp<'a> {
                 && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
                 && self.realm.has_own(g, name)
             {
+                // …but a *non-writable* one (`NaN`, `Infinity`, `undefined`)
+                // rejects the write. `PutValue` on a strict reference whose
+                // `[[Set]]` returns false is a TypeError; sloppy code silently
+                // ignores it.
+                if self.realm.property_is_readonly(g, name) {
+                    if self.strict {
+                        let m = self.new_str(&alloc::format!(
+                            "Cannot assign to read only property '{name}'"
+                        ));
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
+                    return Ok(());
+                }
                 self.realm.set_property(g, name, value);
                 return Ok(());
             }

@@ -930,8 +930,27 @@ fn is_ascii_digit(c: u32) -> bool {
     (0x30..=0x39).contains(&c)
 }
 
+/// `\s` per §22.2.2.9 `CharacterClassEscape :: s` — *WhiteSpace* ∪
+/// *LineTerminator*, i.e. TAB/VT/FF/ZWNBSP plus the `Zs` category (*USP*) plus
+/// LF/CR/LS/PS. This is deliberately NOT Unicode `White_Space`: that property
+/// includes U+0085 (NEL), which ECMAScript excludes, and omits U+FEFF, which
+/// ECMAScript includes. The set is closed-form and version-stable except for
+/// `Zs`, which has not changed since Unicode 6.3.
 fn is_space(c: u32) -> bool {
-    char::from_u32(c).is_some_and(|ch| ch.is_whitespace())
+    matches!(
+        c,
+        0x09..=0x0D          // TAB, LF, VT, FF, CR
+            | 0x20           // SPACE (Zs)
+            | 0xA0           // NBSP (Zs)
+            | 0x1680         // OGHAM SPACE MARK (Zs)
+            | 0x2000..=0x200A// EN QUAD..HAIR SPACE (Zs)
+            | 0x2028         // LINE SEPARATOR
+            | 0x2029         // PARAGRAPH SEPARATOR
+            | 0x202F         // NARROW NBSP (Zs)
+            | 0x205F         // MEDIUM MATHEMATICAL SPACE (Zs)
+            | 0x3000         // IDEOGRAPHIC SPACE (Zs)
+            | 0xFEFF         // ZWNBSP
+    )
 }
 
 fn assert_ok(assert: &Assert, input: &[u16], sp: usize, flags: Flags) -> bool {

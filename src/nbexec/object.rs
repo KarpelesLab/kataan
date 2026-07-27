@@ -1657,7 +1657,8 @@ impl<'a> Interp<'a> {
     /// - `[Symbol.iterator]` is `Array.prototype.values` (writable, configurable,
     ///   non-enumerable), so `[...arguments]`/`for-of` work.
     /// - `callee`: in sloppy mode the *function itself* (writable, configurable,
-    ///   non-enumerable); in strict mode a poisoned accessor throwing `TypeError`.
+    ///   non-enumerable) on a *mapped* object; on an *unmapped* one a poisoned
+    ///   accessor throwing `TypeError`.
     /// - A hidden `ARGS_MARKER` makes `Object.prototype.toString` report
     ///   `[object Arguments]`.
     ///
@@ -1712,9 +1713,12 @@ impl<'a> Interp<'a> {
         {
             self.realm.set_hidden_property(obj, &iter_key, values);
         }
-        // `callee`.
-        if self.strict {
-            // A strict arguments object's `callee` is a poisoned accessor
+        // `callee`. It is the poisoned accessor on every **unmapped** arguments
+        // object (10.4.4.6 CreateUnmappedArgumentsObject step 6) — not only in
+        // strict mode: a *sloppy* function with a non-simple parameter list
+        // (`function f(a = 0) {}`) is also unmapped and also gets the accessor.
+        if mapped_params.is_none() {
+            // An unmapped arguments object's `callee` is a poisoned accessor
             // (`%ThrowTypeError%`, which has own non-configurable `name`/`length`).
             // Reuse the realm's single canonical `%ThrowTypeError%` so this getter
             // is the *same* function object as `Function.prototype.caller`'s
@@ -2498,26 +2502,13 @@ impl<'a> Interp<'a> {
     /// chain includes `Error.prototype`, or it is a class instance whose `extends`
     /// chain reaches a native `Error*` constructor.
     pub(crate) fn is_error_object(&mut self, handle: Handle) -> bool {
-        // Resolve `Error.prototype` (the root of every error prototype chain).
-        let error_proto = self
-            .current
-            .get("Error")
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-            .and_then(|c| self.realm.get_property(c, "prototype"))
-            .and_then(|p| p.as_handle())
-            .map(Handle::from_raw);
-        if let Some(ep) = error_proto {
-            let mut cur = self.realm.object_proto(handle);
-            for _ in 0..10_000 {
-                let Some(c) = cur else { break };
-                if c == ep {
-                    return true;
-                }
-                cur = self.realm.object_proto(c);
-            }
-        }
-        false
+        // The `[[ErrorData]]` internal slot (see `ERROR_DATA`), NOT membership of
+        // an error prototype chain: `Object.prototype.toString` reports
+        // `[object Error]` only for objects that *have* the slot. Every
+        // `NativeError.prototype` inherits from `%Error.prototype%` but is an
+        // ordinary object without the slot, so it reports `[object Object]` — as
+        // does any plain object given an error prototype.
+        self.realm.has_own(handle, crate::nbexec::ERROR_DATA)
     }
 
     /// Whether `handle` has `name` as an own or inherited property (walks the

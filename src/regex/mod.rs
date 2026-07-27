@@ -49,6 +49,8 @@
 mod compile;
 mod parser;
 mod props;
+mod props_data;
+mod props_emoji;
 mod vm;
 
 #[cfg(test)]

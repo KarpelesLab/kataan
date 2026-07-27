@@ -1,6 +1,8 @@
 //! Regex engine tests.
 
 use super::Regex;
+use alloc::format;
+use alloc::string::ToString;
 
 fn re(pattern: &str, flags: &str) -> Regex {
     Regex::new(pattern, flags).expect("compile ok")
@@ -668,8 +670,11 @@ fn v_flag_property_of_strings_errors() {
     assert!(Regex::new(r"\P{Emoji_Keycap_Sequence}", "v").is_err());
     // …nor appear inside a negated class…
     assert!(Regex::new(r"[^\p{Emoji_Keycap_Sequence}]", "v").is_err());
-    // …and unsupported string properties stay a hard error when matched.
-    assert!(Regex::new(r"[\p{RGI_Emoji}]", "v").is_err());
+    // …including the ones backed by the generated emoji tables.
+    assert!(Regex::new(r"[^\p{RGI_Emoji}]", "v").is_err());
+    assert!(Regex::new(r"\P{RGI_Emoji}", "v").is_err());
+    // A well-formed, un-negated one is accepted.
+    assert!(Regex::new(r"[\p{RGI_Emoji}]", "v").is_ok());
 }
 
 #[test]
@@ -747,4 +752,99 @@ fn v_flag_bare_dash_is_error() {
     assert!(Regex::new(r"[\-]", "v").is_ok());
     // A genuine range still parses.
     assert!(Regex::new("[a-z]", "v").is_ok());
+}
+
+#[test]
+fn whitespace_class_escape_is_not_unicode_white_space() {
+    // `\s` is *WhiteSpace* ∪ *LineTerminator*, not the Unicode `White_Space`
+    // property: U+0085 (NEL) has `White_Space` but is NOT `\s`, and U+FEFF
+    // (ZWNBSP) is `\s` but does not have `White_Space`.
+    assert!(!re(r"\s", "").is_match("\u{0085}"));
+    assert!(re(r"\S", "").is_match("\u{0085}"));
+    assert!(re(r"\s", "").is_match("\u{FEFF}"));
+    assert!(!re(r"\S", "").is_match("\u{FEFF}"));
+    for c in [
+        '\t', '\n', '\u{b}', '\u{c}', '\r', ' ', '\u{a0}', '\u{1680}',
+    ] {
+        assert!(re(r"^\s$", "").is_match(&c.to_string()), "{c:?} is \\s");
+    }
+    for c in ['\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}'] {
+        assert!(re(r"^\s$", "").is_match(&c.to_string()), "{c:?} is \\s");
+    }
+}
+
+#[test]
+fn unicode_property_tables_match_intl_version() {
+    // The generated tables in `props_data` and the `intl` crate's own tables
+    // must be the same UCD version, or `\p{…}` would answer from two different
+    // Unicode releases depending on which property was asked for.
+    assert_eq!(
+        super::props_data::UNICODE_VERSION,
+        intl::unicode::UNICODE_VERSION,
+    );
+}
+
+#[test]
+fn unicode_property_escapes_table_backed() {
+    // Spot-checks across the properties served by the generated UCD tables —
+    // one member and one non-member each, taken from the property definitions.
+    let cases: &[(&str, char, char)] = &[
+        ("ID_Start", 'ª', '_'),
+        ("ID_Continue", '_', '-'),
+        ("Case_Ignorable", '\'', 'a'),
+        ("Changes_When_NFKC_Casefolded", 'A', 'a'),
+        ("Deprecated", 'ŉ', 'a'),
+        ("Emoji", '#', 'a'),
+        ("Emoji_Component", '#', 'a'),
+        ("Emoji_Modifier", '\u{1F3FB}', 'a'),
+        ("Emoji_Modifier_Base", '\u{261D}', 'a'),
+        ("Emoji_Presentation", '\u{231A}', '#'),
+        ("Extended_Pictographic", '\u{00A9}', 'a'),
+        ("Extender", '·', 'a'),
+        ("Grapheme_Base", 'Ό', '\u{0301}'),
+        ("Grapheme_Extend", '\u{05BF}', 'a'),
+        ("IDS_Binary_Operator", '\u{2FF0}', 'a'),
+        ("IDS_Trinary_Operator", '\u{2FF2}', 'a'),
+        ("Ideographic", '\u{16FE4}', 'a'),
+        ("Logical_Order_Exception", '\u{0E40}', 'a'),
+        ("Pattern_Syntax", '`', 'a'),
+        ("Pattern_White_Space", '\u{200E}', 'a'),
+        ("Radical", '\u{2E80}', 'a'),
+        ("Sentence_Terminal", '!', 'a'),
+        ("Soft_Dotted", 'į', 'a'),
+        ("Terminal_Punctuation", '!', 'a'),
+        ("Unified_Ideograph", '\u{FA11}', 'a'),
+    ];
+    for &(name, yes, no) in cases {
+        let r = re(&format!(r"^\p{{{name}}}$"), "u");
+        assert!(
+            r.is_match(&yes.to_string()),
+            "\\p{{{name}}} should match {yes:?}"
+        );
+        assert!(
+            !r.is_match(&no.to_string()),
+            "\\p{{{name}}} should not match {no:?}"
+        );
+    }
+}
+
+#[test]
+fn emoji_property_of_strings_tables() {
+    // `RGI_Emoji` is the union of the six component sequence properties, and a
+    // `v`-mode class matches the whole sequence (longest-first).
+    assert_eq!(super::props_emoji::EMOJI_VERSION, (17, 0));
+    assert!(re(r"^\p{RGI_Emoji}$", "v").is_match("\u{1F1E8}\u{1F1F6}"));
+    assert!(re(r"^\p{RGI_Emoji}$", "v").is_match("\u{1F426}\u{200D}\u{2B1B}"));
+    assert!(re(r"^\p{Basic_Emoji}$", "v").is_match("\u{231A}"));
+    assert!(!re(r"^\p{Basic_Emoji}$", "v").is_match("a"));
+    assert!(re(r"^\p{RGI_Emoji_Flag_Sequence}$", "v").is_match("\u{1F1E8}\u{1F1F6}"));
+    assert!(re(r"^\p{Emoji_Keycap_Sequence}$", "v").is_match("#\u{FE0F}\u{20E3}"));
+    assert!(re(r"^\p{RGI_Emoji_Modifier_Sequence}$", "v").is_match("\u{261D}\u{1F3FB}"));
+    assert!(
+        re(r"^\p{RGI_Emoji_Tag_Sequence}$", "v")
+            .is_match("\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}")
+    );
+    // A property of strings may not be negated, nor used outside `v` mode.
+    assert!(Regex::new(r"\P{RGI_Emoji}", "v").is_err());
+    assert!(Regex::new(r"\p{RGI_Emoji}", "u").is_err());
 }
