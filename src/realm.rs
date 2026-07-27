@@ -2688,22 +2688,46 @@ impl Realm {
                 .is_some_and(|o| !o.non_configurable_is_empty());
         let mut stop_at: Option<usize> = None;
         if restricted {
-            // Walk from the top down; the first index that is present (or has an
-            // accessor) and non-configurable halts the deletion.
-            let mut i = cur;
+            // Only an index that actually *exists* can halt the deletion, and an
+            // index exists either in the dense `Vec` or as an integer-keyed own
+            // property on the aux object. Scanning the whole `[new_len, cur)`
+            // range would walk the *logical* length — up to 2^32-1 for a sparse
+            // array (`arr.length = 2**32 - 1; arr.length = 2`), which never
+            // finishes. Bound the dense walk by the dense length and find any
+            // out-of-dense stopper by looking at the aux keys directly.
+            let dense_len = self
+                .heap
+                .get(handle)
+                .and_then(Cell::as_array)
+                .map_or(0, |a| a.len());
+            let mut i = cur.min(dense_len);
             while i > new_len {
                 i -= 1;
-                let present = !self.array_hole_at(handle, i)
-                    && self
-                        .heap
-                        .get(handle)
-                        .and_then(Cell::as_array)
-                        .is_some_and(|a| i < a.len());
                 let key = alloc::format!("{i}");
-                let has_accessor = self.accessor(handle, &key).is_some();
-                if (present || has_accessor) && self.property_is_non_configurable(handle, &key) {
+                let present =
+                    !self.array_hole_at(handle, i) || self.accessor(handle, &key).is_some();
+                if present && self.property_is_non_configurable(handle, &key) {
                     stop_at = Some(i);
                     break;
+                }
+            }
+            // Sparse (past-the-dense-cap) indices: the highest non-configurable
+            // one in range wins over any dense stopper below it.
+            if let Some(aux) = self.aux_props.get(&raw).copied()
+                && let Some(o) = self.heap.get(aux).and_then(Cell::as_object)
+            {
+                let sparse_stop = o
+                    .all_keys()
+                    .into_iter()
+                    .filter_map(|k| k.parse::<usize>().ok().map(|i| (i, k)))
+                    .filter(|&(i, _)| i >= new_len && i < cur && i >= dense_len)
+                    .filter(|(_, k)| o.is_non_configurable(k))
+                    .map(|(i, _)| i)
+                    .max();
+                if let Some(i) = sparse_stop
+                    && stop_at.is_none_or(|s| i > s)
+                {
+                    stop_at = Some(i);
                 }
             }
         }

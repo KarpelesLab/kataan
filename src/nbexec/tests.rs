@@ -11570,3 +11570,44 @@ fn per_iteration_let_env_is_flat_and_captures_per_iteration() {
         "true"
     );
 }
+
+#[test]
+fn array_length_shrink_from_sparse_length_terminates() {
+    // ArraySetLength's stop-at-non-configurable scan must be bounded by the
+    // indices that can actually exist, not by the *logical* length: shrinking
+    // back from 2**32-1 on an array carrying a non-configurable index used to
+    // walk every one of the 4.29 billion indices in between.
+    assert_eq!(
+        run(
+            "var a=[0,1]; Object.defineProperty(a,'1',{value:1,configurable:false});
+             a.length = 4294967295; a.length = 2; a.length"
+        ),
+        "2"
+    );
+    // The stop-at behaviour itself is unchanged: a shrink past a
+    // non-configurable index leaves the length one above it.
+    assert_eq!(
+        run(
+            "var a=[0,1,2]; Object.defineProperty(a,'1',{value:1,configurable:false});
+             a.length = 0; a.length"
+        ),
+        "2"
+    );
+    // …and defining `length` below it is a TypeError.
+    assert_eq!(
+        run(
+            "var a=[0,1]; Object.defineProperty(a,'1',{value:1,configurable:false});
+             var ok=false; try { Object.defineProperty(a,'length',{value:1}); }
+             catch (e) { ok = e instanceof TypeError; } ok && a.length === 2"
+        ),
+        "true"
+    );
+    // A *sparse* (past-the-dense-cap) non-configurable index still stops it.
+    assert_eq!(
+        run(
+            "var a=[]; a[3]=1; Object.defineProperty(a,'3',{value:1,configurable:false});
+             a.length = 0; a.length"
+        ),
+        "4"
+    );
+}
