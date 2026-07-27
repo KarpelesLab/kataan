@@ -7,10 +7,14 @@ JS + WASM engine, and a runtime that stands beside Node.js / Bun / Deno. Finishe
 foundations are summarized once (§1) and not re-litigated; everything after is
 forward-looking.
 
-> **Headline status (2026-07):** the official tc39/Test262 corpus (~53k tests)
-> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 93.9 %**
-> of the ~44k *ran* tests (the ~9k skipped are Temporal / Atomics / agents /
-> cross-realm — see §3.9). **ES modules + dynamic `import()` now run** (the
+> **Headline status (2026-07-27):** the official tc39/Test262 corpus (~53k tests)
+> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 99.4 %**
+> — 51,565 of the 51,890 *ran* tests, **325 ledgered failures** (the ~1.5k
+> skipped are host-specific or unimplemented proposals; Temporal / Atomics /
+> agents / cross-realm are no longer skip-gated — see §3.9). The largest
+> remaining clusters are non-ISO calendar *arithmetic* (§3.10), CLDR output data
+> in Intl, and the Atomics multi-agent scheduler (§3.8).
+> **ES modules + dynamic `import()` now run** (the
 > module-flagged suite is no longer skipped — §3.1). The remaining headline
 > language gap is the **Intl services** (now almost entirely the CLDR locale-*data*
 > output in the external `intl` crate — unit long/narrow forms, compact-long,
@@ -398,7 +402,29 @@ one both adds coverage and moves its tests from skipped → ran:
 - **cross-realm** (`$262.createRealm`) — IMPLEMENTED (identity bulk 77/204; deep proto-from-ctor-realm ledgered).
 - **Tail-call optimization** — IMPLEMENTED (PTC on both tiers, 34/35, un-skipped).
 
-### 3.10 The gate
+### 3.10 Non-ISO calendar arithmetic (intl402/Temporal, ~61)
+
+The calendar *identifiers* all resolve and every Temporal type accepts them —
+the ledger's older "invalid calendar identifier" comments are stale. What fails
+now is **arithmetic accuracy** in the non-ISO conversions: Nowruz (1 Farvardin)
+lands a day late for some Persian years, and `PlainDateTime`/`ZonedDateTime`
+`until`/`since` disagree by a day on the same inputs. Fix against the corpus as
+oracle — in `intl`'s `calendar.rs` (astronomical Persian, Chinese/Dangi
+ephemeris) or by overriding locally where the crate's table is known-divergent.
+The single biggest remaining ledger cluster.
+
+### 3.11 WTF-8 program text (lone surrogates through the parser)
+
+`Parser::parse_program` takes `&'src str`, so a lone surrogate in program text —
+`eval("/" + String.fromCharCode(0xD800) + "/")` — is folded to U+FFFD *before*
+any AST node exists. This is why `RegExp.prototype.source` cannot round-trip one
+(~7 ledgered tests: the `RegExp-*-escape-BMP` and `S7.8.5_*` families,
+`RegExp/escape/escaped-surrogates`). It is **not** a `Cell::RegExp` storage
+problem — that cell is downstream of the loss. The fix is a WTF-8 input path for
+the lexer/parser (source as `&[u8]`, string/regex literal payloads carried as
+WTF-8), which also removes the last lossy boundary in `eval`/`Function`.
+
+### 3.12 The gate
 
 Keep the full Test262 nightly job; drive the ledger to empty. Fuzz parser, regex,
 JSON, and both VMs. Maintain the zero-regression rule and the no_std build matrix.
@@ -559,6 +585,28 @@ piece.
 ---
 
 ## 5. Performance frontier
+
+### 5.0 Algorithmic complexity of the core data structures
+
+Scaling probes (time a construct at *n*, *2n*, *4n*; a ~×4-per-doubling ratio is
+quadratic) found several O(n²) paths in constructs that must be linear. Four are
+fixed — per-iteration `let` environments, the string `+=` type test, the global
+regex match/replace/split path, and `Array.prototype.push`/`pop`. What remains:
+
+- **`Map`/`Set` are O(n) per operation.** `Cell::Collection` is a plain
+  `Vec<(NanBox, NanBox)>`; `collection_set`/`get`/`has`/`delete` all linear-scan
+  it with `same_value_zero`, so building a map is quadratic (40 000 inserts ≈
+  1.1 s) and every lookup is proportional to size. Needs a hash index whose hash
+  agrees with `SameValueZero` (numbers: `-0` ≡ `+0`, `NaN` ≡ `NaN`; strings and
+  BigInts by value; objects/symbols by handle identity), sited so it does not
+  disturb `Cell`'s `Trace`/`Relocate`/snapshot impls, and kept correct across the
+  live-iteration key cursor.
+- **Residual `push` superlinearity** (~×3.7 after the snapshot fix) and the rest
+  of the per-dispatch work in `call_method`.
+- **Rope reads.** `charCodeAt` on a `+=`-built string materializes the tree per
+  call; a memo (or flatten-on-read) would make repeated indexing linear.
+
+### 5.1 Long-standing performance work
 
 - **Interpreter:** IC tuning, array element-kind fast paths, rope tuning, finish
   the generational nursery + write barriers on the existing moving GC for
