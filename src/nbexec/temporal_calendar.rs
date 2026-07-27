@@ -293,21 +293,65 @@ fn islamic_delta(cal: &str) -> i64 {
     }
 }
 
+/// JDN of 1 Muharram, civil (tabular) Islamic year 1.
+const ISLAMIC_EPOCH: i64 = 1_948_440;
+
+/// Civil (tabular) Islamic `(year, month, day)` → JDN.
+///
+/// The 30-year cycle has 11 leap years, so `floor((11·year + 3) / 30)` leap days
+/// precede a year. The division must **floor**, not truncate: the `intl` crate's
+/// `islamic_to_jdn` uses `/`, which rounds toward zero and therefore loses a day
+/// for pre-epoch (negative) years — visible at Temporal's minimum representable
+/// date, where `islamic-civil` came out one day early. Everything at or after the
+/// epoch is identical to the crate's result.
+fn islamic_civil_to_jdn(year: i64, month: i64, day: i64) -> i64 {
+    // Months alternate 30/29 days: ceil(29.5·(month−1)) days precede `month`.
+    let before = 29 * (month - 1) + month.div_euclid(2);
+    day + before + (year - 1) * 354 + (3 + 11 * year).div_euclid(30) + ISLAMIC_EPOCH - 1
+}
+
+/// The civil (tabular) Islamic `(year, month, day)` of a JDN — the inverse of
+/// [`islamic_civil_to_jdn`], by estimate-then-correct (the estimate is within one
+/// year for any in-domain JDN, so the corrections run O(1) times).
+fn islamic_civil_from_jdn(jdn: i64) -> (i64, i64, i64) {
+    let mut year = (30 * (jdn - ISLAMIC_EPOCH) + 10646).div_euclid(10631);
+    while islamic_civil_to_jdn(year, 1, 1) > jdn {
+        year -= 1;
+    }
+    while islamic_civil_to_jdn(year + 1, 1, 1) <= jdn {
+        year += 1;
+    }
+    let mut month = 1;
+    while month < 12 && islamic_civil_to_jdn(year, month + 1, 1) <= jdn {
+        month += 1;
+    }
+    let day = jdn - islamic_civil_to_jdn(year, month, 1) + 1;
+    (year, month, day)
+}
+
 #[cfg(feature = "intl")]
 fn islamic_from_jdn(cal: &str, jdn: i64) -> (i64, i64, i64) {
     if cal == "islamic-umalqura" {
         // Real Umm al-Qura (Saudi) table; auto-falls-back to civil tabular
-        // outside the tabulated range (AH 1300–1600).
-        return intl::calendar::jdn_to_umalqura(jdn);
+        // outside the tabulated range (AH 1300–1600) — and the crate's fallback
+        // has the same negative-year truncation, so use ours outside the table.
+        let (y, _, _) = islamic_civil_from_jdn(jdn);
+        if (1300..=1600).contains(&y) {
+            return intl::calendar::jdn_to_umalqura(jdn);
+        }
+        return islamic_civil_from_jdn(jdn);
     }
-    intl::calendar::jdn_to_islamic(jdn - islamic_delta(cal))
+    islamic_civil_from_jdn(jdn - islamic_delta(cal))
 }
 #[cfg(feature = "intl")]
 fn islamic_to_jdn(cal: &str, y: i64, m: i64, d: i64) -> i64 {
     if cal == "islamic-umalqura" {
-        return intl::calendar::umalqura_to_jdn(y, m, d);
+        if (1300..=1600).contains(&y) {
+            return intl::calendar::umalqura_to_jdn(y, m, d);
+        }
+        return islamic_civil_to_jdn(y, m, d);
     }
-    intl::calendar::islamic_to_jdn(y, m, d) + islamic_delta(cal)
+    islamic_civil_to_jdn(y, m, d) + islamic_delta(cal)
 }
 #[cfg(not(feature = "intl"))]
 fn islamic_from_jdn(_cal: &str, jdn: i64) -> (i64, i64, i64) {
