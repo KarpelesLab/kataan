@@ -13,8 +13,7 @@ forward-looking.
 > skipped are host-specific or unimplemented proposals; Temporal / Atomics /
 > agents / cross-realm are no longer skip-gated — see §3.9). The largest
 > remaining clusters are CLDR output data in Intl (NumberFormat 27,
-> DateTimeFormat 18), the Atomics multi-agent scheduler (§3.8), and the
-> Chinese/Dangi ephemeris outside 1900-2099 (§3.10).
+> DateTimeFormat 18) and the Atomics multi-agent scheduler (§3.8).
 > **ES modules + dynamic `import()` now run** (the
 > module-flagged suite is no longer skipped — §3.1). The remaining headline
 > language gap is the **Intl services** (now almost entirely the CLDR locale-*data*
@@ -403,16 +402,22 @@ one both adds coverage and moves its tests from skipped → ran:
 - **cross-realm** (`$262.createRealm`) — IMPLEMENTED (identity bulk 77/204; deep proto-from-ctor-realm ledgered).
 - **Tail-call optimization** — IMPLEMENTED (PTC on both tiers, 34/35, un-skipped).
 
-### 3.10 Non-ISO calendar arithmetic (intl402/Temporal, ~61)
+### 3.10 Non-ISO calendar arithmetic — **landed**
 
-The calendar *identifiers* all resolve and every Temporal type accepts them —
-the ledger's older "invalid calendar identifier" comments are stale. What fails
-now is **arithmetic accuracy** in the non-ISO conversions: Nowruz (1 Farvardin)
-lands a day late for some Persian years, and `PlainDateTime`/`ZonedDateTime`
-`until`/`since` disagree by a day on the same inputs. Fix against the corpus as
-oracle — in `intl`'s `calendar.rs` (astronomical Persian, Chinese/Dangi
-ephemeris) or by overriding locally where the crate's table is known-divergent.
-The single biggest remaining ledger cluster.
+Was the largest ledger cluster (~61). The calendar *identifiers* had always
+resolved; what failed was arithmetic. Fixed: Persian now uses ICU's 33-year rule
+rather than the 2820-year Birashk cycle; the Islamic leap term floors instead of
+truncating (it lost a day for pre-epoch years); a leap `M<NN>L` constrains onto
+its base month for every `NN`; `PlainDate`'s `toPlain*` conversions keep the
+calendar; and the Chinese/Dangi calendars are now **computed astronomically**
+(`src/nbexec/temporal_astro.rs` — solar longitude, new moons, ΔT, the
+observation meridian) instead of read from a 1900-2100 table, which both
+unbounds the range and matches the reference implementations across the range
+the suite pins exactly.
+
+Residual (2 tests): a Chinese leap month at 1718 comes out a day long — a
+sub-day ephemeris difference ~200 years outside the pinned range, in a test
+whose own comment notes ICU4X and ICU4C disagree there.
 
 ### 3.11 WTF-8 program text (lone surrogates through the parser)
 
