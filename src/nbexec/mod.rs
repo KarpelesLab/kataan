@@ -2866,6 +2866,7 @@ mod class;
 mod convert;
 mod expr;
 mod generator;
+mod intl_aliases;
 mod intl_fmt;
 mod iterator;
 mod json;

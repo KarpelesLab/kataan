@@ -1000,8 +1000,20 @@ pub(crate) fn unicode_type_alias(key: &str, value: &str) -> Option<&'static str>
         ("ks", "tertiary") => "level3",
         // -u-ms- (measurement system)
         ("ms", "imperial") => "uksystem",
+        // -u-tz- (time zone) and -u-rg-/-u-sd- (region override / subdivision):
+        // the CLDR deprecation tables, generated into `intl_aliases`.
+        ("tz", v) => return super::intl_aliases::lookup(super::intl_aliases::TIMEZONE, v),
+        ("rg" | "sd", v) => {
+            return super::intl_aliases::lookup(super::intl_aliases::SUBDIVISION, v);
+        }
         _ => return None,
     })
+}
+
+/// The preferred form of a `-t-` *tvalue* (`m0-names` → `m0-prprname`), from
+/// CLDR's `bcp47/transform.xml` deprecation aliases.
+pub(crate) fn transform_value_alias(value: &str) -> Option<&'static str> {
+    super::intl_aliases::lookup(super::intl_aliases::TRANSFORM_VALUE, value)
 }
 
 /// Extracts the `-u-ca-<calendar>` value from a BCP-47 locale tag, if present
@@ -1830,6 +1842,10 @@ fn canonicalize_extension(singleton: char, subs: &[String]) -> Option<String> {
             }
             if vals.is_empty() {
                 return None; // a tfield key must have a value
+            }
+            // CLDR bcp47 tvalue aliases (`m0-names` → `m0-prprname`).
+            if let Some(canon) = transform_value_alias(&vals.join("-")) {
+                vals = canon.split('-').map(String::from).collect();
             }
             fields.push((key, vals));
         }
