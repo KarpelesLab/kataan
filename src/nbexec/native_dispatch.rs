@@ -4013,6 +4013,13 @@ fn regexp_escape_wtf8(bytes: &[u8]) -> alloc::vec::Vec<u8> {
                     out.extend_from_slice(alloc::format!("\\u{u:04x}").as_bytes());
                 }
             }
+        } else if (0xD800..=0xDFFF).contains(&c) {
+            // `EncodeForRegExpEscape` step: a *lone* leading or trailing
+            // surrogate is emitted as `\uHHHH`, so the result is well-formed
+            // UTF-16 even when the input is not. (A surrogate *pair* has already
+            // been decoded to its astral scalar by `code_points`, so only lone
+            // ones reach here.)
+            out.extend_from_slice(alloc::format!("\\u{c:04x}").as_bytes());
         } else {
             crate::wtf8::encode_code_point(c, &mut out);
         }
