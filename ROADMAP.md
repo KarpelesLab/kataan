@@ -8,8 +8,8 @@ foundations are summarized once (§1) and not re-litigated; everything after is
 forward-looking.
 
 > **Headline status (2026-07-27):** the official tc39/Test262 corpus (~53k tests)
-> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 99.44 %**
-> — 51,598 of the 51,890 *ran* tests, **292 ledgered failures** (the ~1.5k
+> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 99.45 %**
+> — 51,603 of the 51,890 *ran* tests, **287 ledgered failures** (the ~1.5k
 > skipped are host-specific or unimplemented proposals; Temporal / Atomics /
 > agents / cross-realm are no longer skip-gated — see §3.9). The largest
 > remaining clusters are CLDR output data in Intl (NumberFormat 27,
