@@ -30,10 +30,10 @@ tri-modal model proven out in the sibling projects
 >
 > Conformance is measured against the **full upstream tc39/Test262** (~53k tests),
 > run in CI and gated by a known-failures ledger that only ever shrinks. The
-> current pass-rate is **≈ 99.4 %** — 51,565 of the 51,890 applicable tests run
-> (the ~1.5k skipped are host-specific or still-unimplemented proposals; the 325
-> remaining failures are mostly non-ISO calendar arithmetic in Temporal, CLDR
-> output data in Intl, and the Atomics multi-agent scheduler).
+> current pass-rate is **≈ 99.44 %** — 51,598 of the 51,890 applicable tests run
+> (the ~1.5k skipped are host-specific or still-unimplemented proposals; the 292
+> remaining failures are mostly CLDR output data in Intl, the Atomics
+> multi-agent scheduler, and the Chinese/Dangi ephemeris outside 1900-2099).
 > Working areas include **ES modules** (static `import`/`export`, live bindings,
 > re-exports, cycles, top-level `await`, `import.meta`) and **dynamic `import()`**,
 > explicit resource management (`using`/`await using`), spec **statement

@@ -8,12 +8,13 @@ foundations are summarized once (§1) and not re-litigated; everything after is
 forward-looking.
 
 > **Headline status (2026-07-27):** the official tc39/Test262 corpus (~53k tests)
-> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 99.4 %**
-> — 51,565 of the 51,890 *ran* tests, **325 ledgered failures** (the ~1.5k
+> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 99.44 %**
+> — 51,598 of the 51,890 *ran* tests, **292 ledgered failures** (the ~1.5k
 > skipped are host-specific or unimplemented proposals; Temporal / Atomics /
 > agents / cross-realm are no longer skip-gated — see §3.9). The largest
-> remaining clusters are non-ISO calendar *arithmetic* (§3.10), CLDR output data
-> in Intl, and the Atomics multi-agent scheduler (§3.8).
+> remaining clusters are CLDR output data in Intl (NumberFormat 27,
+> DateTimeFormat 18), the Atomics multi-agent scheduler (§3.8), and the
+> Chinese/Dangi ephemeris outside 1900-2099 (§3.10).
 > **ES modules + dynamic `import()` now run** (the
 > module-flagged suite is no longer skipped — §3.1). The remaining headline
 > language gap is the **Intl services** (now almost entirely the CLDR locale-*data*
