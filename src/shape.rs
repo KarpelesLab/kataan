@@ -19,7 +19,7 @@
 //! shape with a value vector, and inline caches over shapes, build on top.
 
 use alloc::boxed::Box;
-use alloc::rc::Rc;
+use alloc::rc::{Rc, Weak};
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
@@ -38,7 +38,14 @@ pub struct Shape {
     len: u32,
     /// Cached child shapes, one per property added from here — so a repeated
     /// `+key` reuses the same child rather than forking the tree.
-    transitions: RefCell<Vec<(Box<str>, Rc<Shape>)>>,
+    ///
+    /// **Weak** on purpose. A child holds its parent strongly (the parent chain
+    /// is the layout), so a strong cache entry here would close a cycle and no
+    /// shape would ever be freed — leaking the entire transition tree of every
+    /// realm. A cached child that no object still uses is simply dropped and
+    /// rebuilt on next use; shape identity is only ever a cache-hit test
+    /// ([`crate::ic`]), so a rebuilt shape costs a miss, never correctness.
+    transitions: RefCell<Vec<(Box<str>, Weak<Shape>)>>,
 }
 
 impl Shape {
@@ -76,14 +83,17 @@ impl Shape {
         if self.lookup(key).is_some() {
             return Rc::clone(self);
         }
-        // Reuse the cached transition if this `+key` was taken before.
-        if let Some((_, child)) = self
+        // Reuse the cached transition if this `+key` was taken before and the
+        // child is still in use. (The `let` ends the borrow before the
+        // `borrow_mut` below.)
+        let cached = self
             .transitions
             .borrow()
             .iter()
             .find(|(k, _)| k.as_ref() == key)
-        {
-            return Rc::clone(child);
+            .and_then(|(_, child)| child.upgrade());
+        if let Some(child) = cached {
+            return child;
         }
         let child = Rc::new(Shape {
             parent: Some(Rc::clone(self)),
@@ -92,9 +102,13 @@ impl Shape {
             len: self.len + 1,
             transitions: RefCell::new(Vec::new()),
         });
-        self.transitions
-            .borrow_mut()
-            .push((Box::from(key), Rc::clone(&child)));
+        // Replace a dead entry in place rather than growing the cache with it.
+        let mut transitions = self.transitions.borrow_mut();
+        match transitions.iter_mut().find(|(k, _)| k.as_ref() == key) {
+            Some(entry) => entry.1 = Rc::downgrade(&child),
+            None => transitions.push((Box::from(key), Rc::downgrade(&child))),
+        }
+        drop(transitions);
         child
     }
 
@@ -195,6 +209,29 @@ mod tests {
         let again = s.transition("x");
         assert!(Rc::ptr_eq(&s, &again));
         assert_eq!(again.len(), 2);
+    }
+
+    #[test]
+    fn a_shape_subtree_is_freed_with_its_last_user() {
+        // The transition cache holds children *weakly*, so a shape nobody uses is
+        // released. A strong cache would close a parent↔child cycle and leak the
+        // whole transition tree of every realm (~465 kB per realm, which is what
+        // made a long-lived process running many scripts grow without bound).
+        let root = Shape::root();
+        {
+            let child = root.transition("a").transition("b");
+            assert_eq!(child.len(), 2);
+            assert!(Rc::strong_count(&root) > 1, "the child chain roots here");
+        }
+        assert_eq!(
+            Rc::strong_count(&root),
+            1,
+            "dropping the last user must free the subtree"
+        );
+        // Rebuilding after the drop yields an equivalent layout.
+        let again = root.transition("a").transition("b");
+        assert_eq!(again.keys(), ["a", "b"]);
+        assert_eq!(again.lookup("b"), Some(1));
     }
 
     #[test]
