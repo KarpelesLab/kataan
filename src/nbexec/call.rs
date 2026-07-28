@@ -163,24 +163,7 @@ impl<'a> Interp<'a> {
         let arr = self.realm.new_array(bound);
         self.realm
             .set_hidden_property(obj, BOUND_ARGS, NanBox::handle(arr.to_raw()));
-        // SetFunctionLength: L = max(ToIntegerOrInfinity(target.length) −
-        // argCount, 0), with `+∞`/`-∞` handled (ECMA-262 20.2.3.2 / 10.2.5).
-        // `target.length` is read via `read_member` so a synthesized or an own
-        // (possibly `defineProperty`-overridden) value is observed alike.
-        let len_val = match target_h {
-            Some(t) => self.read_member(t, "length")?,
-            None => NanBox::number(0.0),
-        };
-        let l = {
-            let n = self.realm.to_number(len_val);
-            if n.is_nan() {
-                0.0
-            } else {
-                // `trunc_toward_zero` leaves `±∞` unchanged, so `+∞ → +∞` and
-                // `-∞ → 0` (via `max`) fall out naturally.
-                (trunc_toward_zero(n) - arg_count as f64).max(0.0)
-            }
-        };
+        let l = self.bound_function_length(target_h, arg_count)?;
         self.realm.set_property(obj, "length", NanBox::number(l));
         self.realm.mark_hidden(obj, "length");
         self.realm.set_readonly_property(obj, "length");
@@ -2194,9 +2177,85 @@ impl<'a> Interp<'a> {
         } else {
             // `Type(proto)` is not Object → intrinsic default from
             // `GetFunctionRealm(newTarget)` (spec step 4): a cross-realm newTarget
-            // supplies its own realm's intrinsic.
+            // supplies its own realm's intrinsic. `GetFunctionRealm` itself throws
+            // a TypeError when the chain reaches a **revoked** proxy, which has no
+            // realm to report (7.3.22 step 4.a) — reachable when the `get`
+            // trap that produced the non-object `prototype` revoked the proxy.
+            self.guard_function_realm(nt)?;
             Ok(self.realm_default_proto(default, nt))
         }
+    }
+
+    /// `Function.prototype.bind` steps 5-8: the `length` of a bound function.
+    ///
+    /// `0` unless the target has an **own** `length` — an inherited one is ignored
+    /// — whose value is a **Number**; otherwise
+    /// `max(ToIntegerOrInfinity(length) − argCount, 0)`. The own-property test
+    /// accounts for a callable's synthesized `length` (which has no physical slot
+    /// but is still an own property, unless it was deleted); the value itself is
+    /// read with `read_member` so a `defineProperty` override is observed and a
+    /// throwing accessor propagates.
+    pub(crate) fn bound_function_length(
+        &mut self,
+        target: Option<Handle>,
+        arg_count: usize,
+    ) -> Result<f64, ExecError> {
+        let Some(t) = target else { return Ok(0.0) };
+        let has_own = self.realm.has_own(t, "length")
+            || (self.realm.is_callable_cell(t) && self.fn_meta_synthesizable(t, "length"));
+        if !has_own {
+            return Ok(0.0);
+        }
+        let len_val = self.read_member(t, "length")?;
+        let Unpacked::Number(n) = len_val.unpack() else {
+            return Ok(0.0);
+        };
+        if n.is_nan() {
+            return Ok(0.0);
+        }
+        // `trunc_toward_zero` leaves `±∞` unchanged, so `+∞ → +∞` and `-∞ → 0`
+        // (via `max`) fall out naturally.
+        Ok((trunc_toward_zero(n) - arg_count as f64).max(0.0))
+    }
+
+    /// Builds a `TypeError` from the realm the callable `f` belongs to.
+    ///
+    /// A built-in method runs with its own function object's realm as the running
+    /// execution context, so the errors it raises come from *that* realm's
+    /// intrinsics. The name-based method fast paths never push such a context (they
+    /// never resolve the method object at all), so a cross-realm receiver would
+    /// otherwise report the main realm's `%TypeError%`.
+    pub(crate) fn type_error_in_realm_of(&mut self, f: Handle, msg: &str) -> ExecError {
+        let realm = self.get_function_realm(f);
+        let guard = self.enter_realm(realm);
+        let e = self.type_error(msg);
+        self.leave_realm(guard);
+        e
+    }
+
+    /// `GetFunctionRealm`'s abrupt case: a bound-function/proxy chain that reaches
+    /// a revoked proxy has no realm, and the spec throws a `TypeError` rather than
+    /// falling back to any realm.
+    pub(crate) fn guard_function_realm(&mut self, f: Handle) -> Result<(), ExecError> {
+        let mut cur = f;
+        // The chain is finite (each link is a distinct object), but bound/proxy
+        // cycles are conceivable through user code — bound the walk.
+        for _ in 0..1000 {
+            if self.realm.proxy_revoked(cur) {
+                return Err(self.type_error("Cannot get the function realm of a revoked proxy"));
+            }
+            let next = self
+                .realm
+                .get_property(cur, BOUND_TARGET)
+                .and_then(|t| t.as_handle())
+                .map(Handle::from_raw)
+                .or_else(|| self.realm.proxy_at(cur).map(|(t, _)| t));
+            match next {
+                Some(n) => cur = n,
+                None => return Ok(()),
+            }
+        }
+        Ok(())
     }
 
     /// `GetPrototypeFromConstructor(newTarget, "%Intl.X.prototype%")` for an Intl
@@ -2271,7 +2330,17 @@ impl<'a> Interp<'a> {
         if let Some((target, _)) = self.realm.proxy_at(f) {
             return self.get_function_realm(target);
         }
-        self.fn_realm.get(&f.to_raw()).copied()
+        if let Some(idx) = self.fn_realm.get(&f.to_raw()).copied() {
+            return Some(idx);
+        }
+        // A *class* value is never entered into `fn_realm` (only functions are), so
+        // fall back to the realm its captured scope roots at — otherwise a class
+        // defined in another realm reports the main realm and its errors are built
+        // from the wrong intrinsics.
+        if let Some((_, env)) = self.realm.class_at(f) {
+            return self.realm_of_scope(&env);
+        }
+        None
     }
 
     /// The `created_realms` index of the realm a *captured closure scope* roots
@@ -2475,10 +2544,28 @@ impl<'a> Interp<'a> {
         } else {
             self.cur_realm
         };
+        // `[[Construct]]`'s post-body steps run after the callee context is removed,
+        // so remember which realm issued this construction (see
+        // `Interp::construct_caller_realm`).
+        let caller_realm = self.cur_realm;
         let guard = self.enter_realm(realm);
+        let saved_caller = core::mem::replace(&mut self.construct_caller_realm, caller_realm);
         let r = self.construct_inner(callee, args);
+        self.construct_caller_realm = saved_caller;
         self.leave_realm(guard);
         r
+    }
+
+    /// Builds an error as `[[Construct]]`'s post-body steps would: in the realm of
+    /// the execution context that issued the construction. See
+    /// [`Interp::construct_caller_realm`].
+    pub(crate) fn construct_caller_error(&mut self, id: u16, message: &str) -> ExecError {
+        let realm = self.construct_caller_realm;
+        let guard = self.enter_realm(realm);
+        let m = self.new_str(message);
+        let e = ExecError::Throw(self.make_error(id, Some(m)));
+        self.leave_realm(guard);
+        e
     }
 
     fn construct_inner(&mut self, callee: NanBox, args: &[NanBox]) -> Result<NanBox, ExecError> {
@@ -2521,6 +2608,12 @@ impl<'a> Interp<'a> {
                 }
                 return Ok(result);
             }
+            // No `construct` trap: `Construct(target, args, newTarget)` — and
+            // `newTarget` stays the *proxy* (or the explicit `Reflect.construct`
+            // one), never the target. That is what makes the target read
+            // `proxy.prototype` through the `get` trap.
+            let nt = self.reflect_new_target.take().unwrap_or(callee);
+            self.reflect_new_target = Some(nt);
             return self.construct(NanBox::handle(target.to_raw()), args);
         }
         // `new boundFn(...)`: construct the bound target with the bound arguments
@@ -3176,51 +3269,65 @@ impl<'a> Interp<'a> {
             // runs a user `valueOf`/`toString` (propagating a poisoned one) and a
             // Symbol argument is a TypeError — the raw `to_number` skipped that,
             // giving a spurious RangeError from a NaN.
-            let raw = match args.first() {
-                Some(v) => self.coerce_to_integer_or_infinity(*v)?,
-                None => 0.0,
+            // Step 2: ToIndex(length) — a range check only. The *allocation* cap
+            // belongs to `CreateByteDataBlock`, which AllocateArrayBuffer runs after
+            // `OrdinaryCreateFromConstructor`, so it must not pre-empt the
+            // `newTarget.prototype` getter below.
+            let byte_len = match args.first() {
+                Some(v) => self.coerce_to_index(*v)?,
+                None => 0,
             };
-            let n = self.validate_alloc_len(raw, "Invalid ArrayBuffer length")?;
-            let buf = self.make_array_buffer(n);
-            // A subclass (`class S extends ArrayBuffer {}` / `Reflect.construct`)
-            // re-links the buffer to `newTarget.prototype` (the default
-            // `%ArrayBuffer.prototype%` was installed by `make_array_buffer`). A
-            // cross-realm `newTarget` with a non-object `.prototype` derives its own
-            // realm's `%ArrayBuffer.prototype%` (GetPrototypeFromConstructor step 4).
-            if native_new_target.as_handle() != callee.as_handle() {
-                let default = self.realm.object_proto(buf);
-                if let Some(proto) =
-                    self.instance_proto_checked(native_new_target, callee, default)?
-                {
-                    self.realm.set_object_proto(buf, Some(proto));
-                }
-            }
-            // `new ArrayBuffer(n, { maxByteLength })` makes the buffer resizable up
-            // to `max`. `read_member` runs a poisoned getter; `maxByteLength` is
-            // ToIndex'd and bounded by the allocation cap (validate_alloc_len rejects
-            // negative / excessive / over-limit — e.g. 7 PiB or 2^53-1), and must be
-            // >= the length.
+            // Step 3: GetArrayBufferMaxByteLengthOption(options) — reads (and
+            // ToIndexes) `options.maxByteLength` when `options` is an Object.
+            let mut max_len: Option<u64> = None;
             if let Some(opts) = args
                 .get(1)
+                .copied()
+                .filter(|v| self.is_object_value(*v))
                 .and_then(|v| v.as_handle())
                 .map(Handle::from_raw)
             {
                 let maxv = self.read_member(opts, "maxByteLength")?;
                 if !matches!(maxv.unpack(), Unpacked::Undefined) {
-                    let max_f = self.coerce_to_integer_or_infinity(maxv)?;
-                    let max =
-                        self.validate_alloc_len(max_f, "Invalid ArrayBuffer maxByteLength")?;
-                    if max < n {
-                        let m =
-                            self.new_str("ArrayBuffer maxByteLength is smaller than its length");
-                        return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
-                    }
-                    self.realm.set_hidden_property(
-                        buf,
-                        ARRAY_BUFFER_MAXLEN,
-                        NanBox::number(max as f64),
-                    );
+                    max_len = Some(self.coerce_to_index(maxv)?);
                 }
+            }
+            // AllocateArrayBuffer step 3.a: a resizable buffer may not start out
+            // longer than its maximum. Checked before the object is created.
+            if max_len.is_some_and(|m| byte_len > m) {
+                let m = self.new_str("ArrayBuffer maxByteLength is smaller than its length");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
+            // Step 4: OrdinaryCreateFromConstructor — this is what reads
+            // `newTarget.prototype`, and a subclass (`class S extends ArrayBuffer {}`
+            // / `Reflect.construct`) re-links the buffer to it. A cross-realm
+            // `newTarget` with a non-object `.prototype` derives its own realm's
+            // `%ArrayBuffer.prototype%` (GetPrototypeFromConstructor step 4).
+            let proto = if native_new_target.as_handle() == callee.as_handle() {
+                None
+            } else {
+                let default = self.intrinsic_proto("ArrayBuffer");
+                self.instance_proto_checked(native_new_target, callee, default)?
+            };
+            // Step 5: CreateByteDataBlock — where an unallocatable size (7 PiB, or
+            // a maximum beyond the engine's cap) becomes a RangeError.
+            let n = self.validate_alloc_len(byte_len as f64, "Invalid ArrayBuffer length")?;
+            let max = match max_len {
+                Some(m) => {
+                    Some(self.validate_alloc_len(m as f64, "Invalid ArrayBuffer maxByteLength")?)
+                }
+                None => None,
+            };
+            let buf = self.make_array_buffer(n);
+            if let Some(proto) = proto {
+                self.realm.set_object_proto(buf, Some(proto));
+            }
+            if let Some(max) = max {
+                self.realm.set_hidden_property(
+                    buf,
+                    ARRAY_BUFFER_MAXLEN,
+                    NanBox::number(max as f64),
+                );
             }
             return Ok(NanBox::handle(buf.to_raw()));
         }

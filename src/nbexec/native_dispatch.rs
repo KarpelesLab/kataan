@@ -622,7 +622,8 @@ impl<'a> Interp<'a> {
                         if let Some(raw) = prim.as_handle() {
                             let h = Handle::from_raw(raw);
                             if let Some(s) = self.realm.string_value(h)
-                                && s.trim().len() as u64 > self.realm.limits.max_bigint_bits
+                                && s.trim_matches(crate::realm::is_js_whitespace).len() as u64
+                                    > self.realm.limits.max_bigint_bits
                             {
                                 let m = self.new_str("Maximum BigInt size exceeded");
                                 return Err(ExecError::Throw(
@@ -1007,7 +1008,26 @@ impl<'a> Interp<'a> {
                             "Cannot freeze a module namespace object (its exports are writable)",
                         ));
                     }
-                    self.realm.freeze_object(Handle::from_raw(raw));
+                    let h = Handle::from_raw(raw);
+                    if self.is_object_value(arg(0)) {
+                        // SetIntegrityLevel step 3: `[[PreventExtensions]]` must
+                        // succeed. It fails for a typed array that is not fixed
+                        // length.
+                        if !self.prevent_extensions_of(h)? {
+                            return Err(self.type_error("Object.freeze failed"));
+                        }
+                        // …and step 5.b then defines every own key `configurable:
+                        // false`, which an integer-indexed exotic object rejects.
+                        // So a typed array with any element cannot be frozen.
+                        if self.realm.typed_kind(h).is_some()
+                            && self.realm.typed_len(h).is_some_and(|n| n > 0)
+                        {
+                            return Err(self.type_error(
+                                "Cannot redefine an index of an integer-indexed exotic object",
+                            ));
+                        }
+                    }
+                    self.realm.freeze_object(h);
                 }
                 arg(0) // returns the (now frozen) object
             }
@@ -1019,7 +1039,15 @@ impl<'a> Interp<'a> {
                     return Ok(arg(0));
                 }
                 if let Some(raw) = arg(0).as_handle() {
-                    self.realm.seal_object(Handle::from_raw(raw));
+                    let h = Handle::from_raw(raw);
+                    // SetIntegrityLevel step 3 (see `N_OBJECT_FREEZE`). Sealing
+                    // only makes the own keys non-configurable, which an
+                    // integer-indexed exotic object accepts, so there is no
+                    // element-count restriction here.
+                    if self.is_object_value(arg(0)) && !self.prevent_extensions_of(h)? {
+                        return Err(self.type_error("Object.seal failed"));
+                    }
+                    self.realm.seal_object(h);
                 }
                 arg(0)
             }
@@ -2923,7 +2951,9 @@ impl<'a> Interp<'a> {
             }
             N_PARSE_FLOAT => {
                 let s = self.coerce_to_string(arg(0))?;
-                NanBox::number(parse_float_prefix(s.trim()))
+                NanBox::number(parse_float_prefix(
+                    s.trim_matches(crate::realm::is_js_whitespace),
+                ))
             }
             // URI encoding/decoding. `encodeURI` preserves the URI reserved set
             // on top of the unreserved set that `encodeURIComponent` keeps.

@@ -1,11 +1,8 @@
 use super::*;
 
-/// The ECMAScript `TrimString` white-space set: every Unicode `White_Space`
-/// code point **plus** U+FEFF (ZERO WIDTH NO-BREAK SPACE / BOM), which the spec
-/// includes but Rust's `char::is_whitespace` (current Unicode) does not.
-fn is_js_trim_ws(c: char) -> bool {
-    c.is_whitespace() || c == '\u{FEFF}'
-}
+// `TrimString` skips the same white-space set as `ToNumber`, `parseInt` /
+// `parseFloat` and `StringToBigInt`.
+use crate::realm::is_js_whitespace;
 
 impl<'a> Interp<'a> {
     /// `Function.prototype.toString` source-representation for the callable
@@ -717,7 +714,10 @@ impl<'a> Interp<'a> {
                             v
                         }
                     } else {
-                        return Err(self.type_error("CreateListFromArrayLike called on non-object"));
+                        return Err(self.type_error_in_realm_of(
+                            handle,
+                            "CreateListFromArrayLike called on non-object",
+                        ));
                     };
                     return self.call_with_this(recv, this, &list).map(Some);
                 }
@@ -2199,7 +2199,7 @@ impl<'a> Interp<'a> {
                 }
                 "trim" => {
                     let s = crate::wtf8::to_string_lossy(&bytes);
-                    Some(self.new_str(s.trim_matches(is_js_trim_ws)))
+                    Some(self.new_str(s.trim_matches(is_js_whitespace)))
                 }
                 "charAt" => {
                     // UTF-16-indexed: the unit at `i` as a one-unit string,
@@ -2539,21 +2539,21 @@ impl<'a> Interp<'a> {
                 }
                 "trimStart" => {
                     let s = crate::wtf8::to_string_lossy(&bytes);
-                    Some(self.new_str(s.trim_start_matches(is_js_trim_ws)))
+                    Some(self.new_str(s.trim_start_matches(is_js_whitespace)))
                 }
                 "trimEnd" => {
                     let s = crate::wtf8::to_string_lossy(&bytes);
-                    Some(self.new_str(s.trim_end_matches(is_js_trim_ws)))
+                    Some(self.new_str(s.trim_end_matches(is_js_whitespace)))
                 }
                 // Annex B.2.3: `trimLeft`/`trimRight` are legacy aliases of
                 // `trimStart`/`trimEnd`.
                 "trimLeft" => {
                     let s = crate::wtf8::to_string_lossy(&bytes);
-                    Some(self.new_str(s.trim_start_matches(is_js_trim_ws)))
+                    Some(self.new_str(s.trim_start_matches(is_js_whitespace)))
                 }
                 "trimRight" => {
                     let s = crate::wtf8::to_string_lossy(&bytes);
-                    Some(self.new_str(s.trim_end_matches(is_js_trim_ws)))
+                    Some(self.new_str(s.trim_end_matches(is_js_whitespace)))
                 }
                 // Annex B.2.3 legacy HTML wrapper methods. `CreateHTML(S, tag,
                 // attribute, value)`: wraps the receiver string `S` in
@@ -5297,8 +5297,17 @@ impl<'a> Interp<'a> {
         // Default `Object.prototype` methods for an object receiver that did not
         // match a more specific built-in and has no own/inherited method of its
         // own (e.g. a plain object's `toString`/`valueOf`).
+        //
+        // This stands in for the method on `%Object.prototype%`, so it applies
+        // only while that method is still there: once `Object.prototype.toString`
+        // is deleted there is nothing left to inherit and the call must be the
+        // ordinary "not a function" TypeError.
         if let Some(h) = recv.as_handle().map(Handle::from_raw)
             && matches!(method, "toString" | "valueOf" | "toLocaleString")
+            && self
+                .realm
+                .default_object_proto()
+                .is_none_or(|p| self.realm.has_own(p, method))
         {
             // A user-defined (own or inherited) method takes precedence.
             let own = self.read_member(h, method)?;

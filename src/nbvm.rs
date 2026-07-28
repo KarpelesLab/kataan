@@ -2113,7 +2113,7 @@ fn coerce_bigint_typed_write(
             if realm.bigint_at(h).is_some() {
                 return Ok(value); // already a BigInt
             } else if let Some(s) = realm.string_value(h) {
-                let t = s.trim();
+                let t = s.trim_matches(crate::realm::is_js_whitespace);
                 if t.is_empty() {
                     crate::bignum::BigInt::zero()
                 } else {
@@ -4548,7 +4548,11 @@ fn builtin_method(
         let result = match key {
             "toUpperCase" => NanBox::handle(ctx.realm.new_string(&s.to_uppercase()).to_raw()),
             "toLowerCase" => NanBox::handle(ctx.realm.new_string(&s.to_lowercase()).to_raw()),
-            "trim" => NanBox::handle(ctx.realm.new_string(s.trim()).to_raw()),
+            "trim" => NanBox::handle(
+                ctx.realm
+                    .new_string(s.trim_matches(crate::realm::is_js_whitespace))
+                    .to_raw(),
+            ),
             "includes" => NanBox::boolean(s.contains(&ctx.realm.to_display_string(arg0()))),
             "startsWith" => NanBox::boolean(s.starts_with(&ctx.realm.to_display_string(arg0()))),
             "endsWith" => NanBox::boolean(s.ends_with(&ctx.realm.to_display_string(arg0()))),
@@ -4938,14 +4942,19 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             if radix != 0 && !(2..=36).contains(&radix) {
                 NanBox::number(f64::NAN)
             } else {
-                NanBox::number(parse_int(s.trim(), radix as u32))
+                NanBox::number(parse_int(
+                    s.trim_matches(crate::realm::is_js_whitespace),
+                    radix as u32,
+                ))
             }
         }
         NB_PARSE_FLOAT => {
             let s = ctx
                 .realm
                 .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
-            NanBox::number(parse_float_prefix(s.trim()))
+            NanBox::number(parse_float_prefix(
+                s.trim_matches(crate::realm::is_js_whitespace),
+            ))
         }
         NB_IS_NAN => NanBox::boolean(
             ctx.realm
@@ -5057,7 +5066,9 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             let s = ctx
                 .realm
                 .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
-            NanBox::number(parse_float_prefix(s.trim()))
+            NanBox::number(parse_float_prefix(
+                s.trim_matches(crate::realm::is_js_whitespace),
+            ))
         }
         NB_NUMBER_PARSE_INT => {
             let s = ctx
@@ -5072,7 +5083,10 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             if radix != 0 && !(2..=36).contains(&radix) {
                 NanBox::number(f64::NAN)
             } else {
-                NanBox::number(parse_int(s.trim(), radix as u32))
+                NanBox::number(parse_int(
+                    s.trim_matches(crate::realm::is_js_whitespace),
+                    radix as u32,
+                ))
             }
         }
         NB_STRING_FROM_CHAR_CODE => {

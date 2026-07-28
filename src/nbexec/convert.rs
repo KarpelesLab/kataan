@@ -96,7 +96,7 @@ impl<'a> Interp<'a> {
                 if let Some(s) = self.realm.string_value(h) {
                     // StringToBigInt: an empty/whitespace string is `0n`; an
                     // otherwise-invalid string is a SyntaxError.
-                    let t = s.trim();
+                    let t = s.trim_matches(crate::realm::is_js_whitespace);
                     if t.is_empty() {
                         return Ok(crate::bignum::BigInt::zero());
                     }

@@ -5,10 +5,18 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-/// The largest accepted explicit quantifier bound (`a{N}` / `a{N,M}`). Bounds
-/// above this are rejected at parse time so a pattern like `a{99999999999}` can
-/// never reach the compiler and blow up instruction count / memory (RE-3). The
-/// compiler enforces a stricter *expanded-size* budget on top of this.
+/// The value an explicit quantifier bound (`a{N}` / `a{N,M}`) saturates to.
+///
+/// *Quantifier* accepts any *DecimalDigits*, however long — `b{9007199254740991}`
+/// is a perfectly legal pattern — so an out-of-range bound is **not** a Syntax
+/// Error. It is instead clamped here to a value the compiler recognizes as
+/// unsatisfiable (it is far above [`crate::limits::DEFAULT_MAX_STRING_LEN`], so
+/// no subject can ever supply that many iterations of a non-nullable atom) and
+/// answered statically. The `{n,m}` ordering check compares the digits, not the
+/// clamped values, so `a{10000000000000000000000,1}` is still rejected.
+///
+/// The compiler's expanded-size budget (RE-3) still bounds the bounds that *are*
+/// small enough to expand.
 const MAX_QUANT: usize = crate::limits::DEFAULT_REGEX_MAX_QUANT;
 
 /// Maximum nesting depth the parser will descend (groups / lookaround). Past this
@@ -19,6 +27,15 @@ const MAX_QUANT: usize = crate::limits::DEFAULT_REGEX_MAX_QUANT;
 /// well below the point that would exhaust a small (2 MiB) embedding stack while
 /// remaining far above any realistic legitimate nesting.
 const MAX_PARSE_DEPTH: u32 = crate::limits::DEFAULT_REGEX_MAX_PARSE_DEPTH;
+
+/// Whether the non-negative integer written as `a` is greater than the one
+/// written as `b`. Both are normalized decimal digit runs (no leading zeros), so
+/// the longer one is larger and equal lengths compare lexicographically. Used for
+/// the `{n,m}` ordering check, which must stay exact for bounds too large to
+/// represent as a `usize`.
+fn digits_gt(a: &[char], b: &[char]) -> bool {
+    (a.len(), a) > (b.len(), b)
+}
 
 /// A regex compilation error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -469,13 +486,11 @@ impl Parser {
 
     /// Parses a `{n}` / `{n,}` / `{n,m}` quantifier, returning `Ok(None)` (without
     /// consuming) if it is not a well-formed bound (then `{` is a literal). An
-    /// out-of-range bound (`parse_int` overflow) or an inverted range (`{5,2}`)
-    /// is a hard `Err` rather than a silent fallback.
+    /// inverted range (`{5,2}`) is a hard `Err`.
     fn try_parse_brace(&mut self) -> Result<Option<(usize, Option<usize>)>, RegexError> {
         let save = self.pos;
         self.pos += 1; // `{`
-        let min = self.parse_int()?;
-        let Some(min) = min else {
+        let Some((min, min_digits)) = self.parse_int() else {
             self.pos = save;
             return Ok(None);
         };
@@ -483,7 +498,7 @@ impl Parser {
             if self.peek() == Some('}') {
                 None
             } else {
-                match self.parse_int()? {
+                match self.parse_int() {
                     Some(m) => Some(m),
                     None => {
                         self.pos = save;
@@ -492,50 +507,50 @@ impl Parser {
                 }
             }
         } else {
-            Some(min)
+            Some((min, min_digits.clone()))
         };
         if !self.eat('}') {
             self.pos = save;
             return Ok(None);
         }
-        // Reject an inverted range like `a{5,2}`.
-        if let Some(m) = max
-            && min > m
+        // Reject an inverted range like `a{5,2}`. Compare the *digits*, not the
+        // parsed values: two bounds that both saturated to `MAX_QUANT` may still be
+        // out of order (`a{10000000000000000000000,1000000000000000000000}`).
+        if let Some((_, max_digits)) = &max
+            && digits_gt(&min_digits, max_digits)
         {
             return Err(RegexError::new(
                 "quantifier range out of order (min greater than max)",
             ));
         }
-        Ok(Some((min, max)))
+        Ok(Some((min, max.map(|(m, _)| m))))
     }
 
-    /// Parses a run of decimal digits as a quantifier bound. `Ok(None)` means no
-    /// digits were present (so `{` is a literal); `Ok(Some(v))` is the value;
-    /// `Err` is returned when the value exceeds `MAX_QUANT` — quantifier bounds
-    /// must NOT silently saturate (a saturated giant bound would blow up the
-    /// compiler / allocate enormously, RE-3), so an out-of-range bound is a hard
-    /// compile error.
-    fn parse_int(&mut self) -> Result<Option<usize>, RegexError> {
+    /// Parses a run of decimal digits as a quantifier bound, returning the value
+    /// (clamped to `MAX_QUANT`) together with the significant digits, or `None`
+    /// when no digit was present (then `{` is a literal). A bound too large to
+    /// represent is *not* an error — see [`MAX_QUANT`].
+    fn parse_int(&mut self) -> Option<(usize, Vec<char>)> {
         let start = self.pos;
         let mut value: usize = 0;
-        let mut overflow = false;
+        let mut digits: Vec<char> = Vec::new();
         while let Some(c) = self.peek() {
-            if let Some(d) = c.to_digit(10) {
-                value = value.saturating_mul(10).saturating_add(d as usize);
-                if value > MAX_QUANT {
-                    overflow = true;
-                }
-                self.pos += 1;
-            } else {
-                break;
+            let Some(d) = c.to_digit(10) else { break };
+            value = value
+                .saturating_mul(10)
+                .saturating_add(d as usize)
+                .min(MAX_QUANT);
+            // Keep the digits normalized (no leading zeros) so `digits_gt` can
+            // compare by length first.
+            if !(digits.is_empty() && d == 0) {
+                digits.push(c);
             }
+            self.pos += 1;
         }
         if self.pos == start {
-            Ok(None)
-        } else if overflow {
-            Err(RegexError::new("quantifier bound too large"))
+            None
         } else {
-            Ok(Some(value))
+            Some((value, digits))
         }
     }
 

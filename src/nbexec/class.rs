@@ -878,8 +878,12 @@ impl<'a> Interp<'a> {
             && let Some(v) = ret
             && !matches!(v.unpack(), Unpacked::Undefined)
         {
-            let m = self.new_str("Derived constructors may only return object or undefined");
-            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            // `[[Construct]]` step 13.c — after the callee context was removed, so
+            // the error belongs to the caller's realm.
+            return Err(self.construct_caller_error(
+                N_TYPE_ERROR,
+                "Derived constructors may only return object or undefined",
+            ));
         }
         Ok(this_val)
     }
@@ -1560,11 +1564,12 @@ impl<'a> Interp<'a> {
                         // is a "must call super" ReferenceError.
                         let ret_empty = r.is_none_or(|v| matches!(v.unpack(), Unpacked::Undefined));
                         if !super_called && ret_empty {
-                            let m = self.new_str(
+                            // `[[Construct]]` step 15's `GetThisBinding` — after the
+                            // callee context was removed, so the error belongs to
+                            // the caller's realm.
+                            return Err(self.construct_caller_error(
+                                N_REFERENCE_ERROR,
                                 "Must call super constructor before accessing 'this' or returning from derived constructor",
-                            );
-                            return Err(ExecError::Throw(
-                                self.make_error(N_REFERENCE_ERROR, Some(m)),
                             ));
                         }
                         // With an empty completion, `[[Construct]]` yields

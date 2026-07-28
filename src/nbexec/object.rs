@@ -1,6 +1,21 @@
 use super::*;
 
 impl<'a> Interp<'a> {
+    /// Whether a callable's `name` / `length` should be *synthesized* for `handle`
+    /// — i.e. there is no physical own slot **and** the property has not been
+    /// deleted.
+    ///
+    /// Both are computed from the function definition on every read rather than
+    /// stored, so "no physical slot" alone cannot be the test: `delete f.length`
+    /// removes nothing physical for most callables, and would leave the value
+    /// coming straight back. [`crate::realm::fn_meta_tombstone`] records the
+    /// deletion so it sticks.
+    pub(crate) fn fn_meta_synthesizable(&self, handle: Handle, key: &str) -> bool {
+        !self.realm.has_own(handle, key)
+            && crate::realm::fn_meta_tombstone(key)
+                .is_none_or(|tomb| !self.realm.has_own(handle, tomb))
+    }
+
     /// Throws a `TypeError` if `handle` is a revoked proxy (used to guard every
     /// proxy operation).
     pub(crate) fn guard_revoked(&mut self, handle: Handle) -> Result<(), ExecError> {
@@ -182,7 +197,7 @@ impl<'a> Interp<'a> {
         // native whose `name` was installed as a real slot) flows through the
         // generic data-property path below, which reads its recorded attributes.
         if matches!(key, "length" | "name")
-            && !self.realm.has_own(obj, key)
+            && self.fn_meta_synthesizable(obj, key)
             && (self.is_callable(obj) || self.realm.class_at(obj).is_some())
             && !self.realm.is_array(obj)
         {
@@ -1010,7 +1025,7 @@ impl<'a> Interp<'a> {
         // spec defaults (and the second redefine sees them as configurable).
         let is_intrinsic_callable_prop = (key == "length" || key == "name")
             && self.realm.is_callable_cell(obj)
-            && !self.realm.has_own(obj, key)
+            && self.fn_meta_synthesizable(obj, key)
             && self.realm.accessor(obj, key).is_none();
         let is_own = self.realm.has_own(obj, key)
             || self.realm.accessor(obj, key).is_some()
@@ -2131,6 +2146,12 @@ impl<'a> Interp<'a> {
                 return Ok(false);
             }
             return self.prevent_extensions_of(target);
+        }
+        // A typed array's `[[PreventExtensions]]` returns **false** unless the view
+        // is fixed length: making a view over a resizable buffer non-extensible
+        // would be a promise the buffer can break by resizing.
+        if self.typed_array_is_fixed_length(obj) == Some(false) {
+            return Ok(false);
         }
         self.realm.prevent_extensions(obj);
         Ok(true)

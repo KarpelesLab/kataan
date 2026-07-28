@@ -82,6 +82,20 @@ pub(crate) enum Inst {
     /// (ECMA-262 RepeatMatcher clears the atom's parentheses each repetition).
     /// Backtrack-safe: the prior values are restored if the iteration fails.
     ClearCaptures { from: usize, to: usize },
+    /// Record the position at which an *optional* (min = 0) quantifier iteration
+    /// begins, for the paired [`Inst::EmptyFail`]. Emitted only when the quantified
+    /// atom can match the empty string.
+    Mark,
+    /// ECMA-262 RepeatMatcher step 2.b: *"If min = 0 and y's endIndex = x's
+    /// endIndex, return failure."* Pops the position pushed by the matching
+    /// [`Inst::Mark`] and fails the iteration if it consumed nothing, so the body
+    /// backtracks into its other alternatives instead of the loop silently exiting
+    /// with the empty iteration's captures still bound.
+    EmptyFail,
+    /// An instruction that never matches. Emitted for a quantifier whose minimum
+    /// count provably cannot be satisfied by any subject the engine can hold (see
+    /// `compile_repeat`).
+    Fail,
     /// Enter an inline-modifier scope `(?ims-ims:…)`: push the flag delta onto
     /// the flag stack so the enclosed instructions match under the adjusted
     /// `i`/`m`/`s` flags. Paired with a later [`Inst::PopFlags`].
@@ -258,7 +272,7 @@ fn read_dir(input: &[u16], sp: usize, unicode: bool, reverse: bool) -> Option<(u
 #[derive(Default)]
 pub(crate) struct Scratch {
     saves: Vec<Option<usize>>,
-    loops: Vec<(usize, usize)>,
+    marks: Vec<usize>,
     flag_stack: Vec<Flags>,
 }
 
@@ -282,12 +296,12 @@ pub(crate) fn run_with(
 ) -> Option<Vec<Option<(usize, usize)>>> {
     let Scratch {
         saves,
-        loops,
+        marks,
         flag_stack,
     } = scratch;
     saves.clear();
     saves.resize(2 * (group_count + 1), None);
-    loops.clear();
+    marks.clear();
     // The flag stack: the base flags sit at the bottom; each entered
     // inline-modifier scope (`(?ims-ims:…)`) pushes the locally-adjusted flags.
     flag_stack.clear();
@@ -301,7 +315,7 @@ pub(crate) fn run_with(
         steps,
         budget,
     };
-    if backtrack(&ctx, 0, start, saves, 0, loops, flag_stack) {
+    if backtrack(&ctx, 0, start, saves, 0, marks, flag_stack) {
         // Pair the raw save slots into (start, end) spans per group.
         let mut groups = Vec::with_capacity(group_count + 1);
         for g in 0..=group_count {
@@ -359,10 +373,10 @@ fn backtrack(
     mut sp: usize,
     saves: &mut Vec<Option<usize>>,
     depth: u32,
-    // Active loop-head positions on the current path: each `(split_pc, sp)` we
-    // are currently iterating. Re-entering the same loop head at the same `sp`
-    // means the body matched empty (`/()*/`, `/(a*)*/`) — that path is pruned.
-    loops: &mut Vec<(usize, usize)>,
+    // The positions at which the *optional* quantifier iterations enclosing this
+    // point began, pushed by [`Inst::Mark`] and consumed by [`Inst::EmptyFail`].
+    // Properly nested: every `Mark` restores the stack on the way out.
+    marks: &mut Vec<usize>,
     // The flag stack: the top entry is the flags in effect at this point, after
     // applying any enclosing inline-modifier scopes. `unicode` never changes
     // (only `i`/`m`/`s` can be modified), so it is read once below.
@@ -448,7 +462,7 @@ fn backtrack(
                             }
                         }
                         while let Some(p) = positions.pop() {
-                            if backtrack(ctx, cont_pc, p, saves, depth + 1, loops, flags_stack) {
+                            if backtrack(ctx, cont_pc, p, saves, depth + 1, marks, flags_stack) {
                                 return true;
                             }
                             if !ctx.tick() {
@@ -459,7 +473,7 @@ fn backtrack(
                     }
                     // Lazy: try the continuation first at each length, growing.
                     loop {
-                        if backtrack(ctx, cont_pc, sp, saves, depth + 1, loops, flags_stack) {
+                        if backtrack(ctx, cont_pc, sp, saves, depth + 1, marks, flags_stack) {
                             return true;
                         }
                         let Some(nsp) =
@@ -474,29 +488,14 @@ fn backtrack(
                     }
                 }
 
-                // Zero-width-progress guard: a `*`/`+` loop compiles to
-                // `Split(body, exit); body…; Jmp(split)`, so the body loops back
-                // to this Split. Track the loop heads currently being iterated;
-                // if we re-enter *this* head at the *same* `sp`, the body matched
-                // empty (`/()*/`, `/(a*)*/`) and re-entering can only recurse
-                // forever, so prune straight to the exit branch.
-                if let Some((body, exit)) = loop_head(ctx.prog, pc) {
-                    if loops.contains(&(pc, sp)) {
-                        pc = exit;
-                        continue;
-                    }
-                    loops.push((pc, sp));
-                    let took_body = backtrack(ctx, body, sp, saves, depth + 1, loops, flags_stack);
-                    loops.pop();
-                    if took_body {
-                        return true;
-                    }
-                    pc = exit;
-                    continue;
-                }
-
-                // A plain (non-loop) Split, e.g. alternation or `?`.
-                if backtrack(ctx, *a, sp, saves, depth + 1, loops, flags_stack) {
+                // An ordinary Split — an alternation, a `?`, or a `*`/`+` loop
+                // head. The first target is always the preferred branch (the
+                // compiler puts the body first for a greedy quantifier and the
+                // exit first for a lazy one), so trying `a` before `b` gives the
+                // right preference order for every construct. Zero-width loop
+                // iterations are stopped by the `Mark`/`EmptyFail` pair the
+                // compiler wraps around a nullable quantifier body, not here.
+                if backtrack(ctx, *a, sp, saves, depth + 1, marks, flags_stack) {
                     return true;
                 }
                 pc = *b;
@@ -504,7 +503,7 @@ fn backtrack(
             Inst::Save(slot) => {
                 let old = saves[*slot];
                 saves[*slot] = Some(sp);
-                if backtrack(ctx, pc + 1, sp, saves, depth + 1, loops, flags_stack) {
+                if backtrack(ctx, pc + 1, sp, saves, depth + 1, marks, flags_stack) {
                     return true;
                 }
                 saves[*slot] = old;
@@ -517,12 +516,39 @@ fn backtrack(
                 for s in &mut saves[lo..hi] {
                     *s = None;
                 }
-                if backtrack(ctx, pc + 1, sp, saves, depth + 1, loops, flags_stack) {
+                if backtrack(ctx, pc + 1, sp, saves, depth + 1, marks, flags_stack) {
                     return true;
                 }
                 saves[lo..hi].clone_from_slice(&saved);
                 return false;
             }
+            Inst::Mark => {
+                // Remember where this optional iteration starts; the paired
+                // `EmptyFail` pops it. Recursing keeps the stack balanced on every
+                // exit path, including a failure inside the body.
+                marks.push(sp);
+                let r = backtrack(ctx, pc + 1, sp, saves, depth + 1, marks, flags_stack);
+                marks.pop();
+                return r;
+            }
+            Inst::EmptyFail => {
+                // RepeatMatcher step 2.b. Pop first so the continuation (which may
+                // start the next iteration, or leave an enclosing quantifier) sees
+                // the enclosing mark on top; push back on the way out so the
+                // matching `Mark` frame pops what it pushed.
+                let Some(mark) = marks.pop() else {
+                    pc += 1;
+                    continue;
+                };
+                if sp == mark {
+                    marks.push(mark);
+                    return false;
+                }
+                let r = backtrack(ctx, pc + 1, sp, saves, depth + 1, marks, flags_stack);
+                marks.push(mark);
+                return r;
+            }
+            Inst::Fail => return false,
             Inst::BackrefMulti(groups) => {
                 let span = groups.iter().find_map(|g| {
                     match (
@@ -563,7 +589,7 @@ fn backtrack(
                     budget: ctx.budget,
                 };
                 let mut sub_saves = saves.clone();
-                let mut sub_loops = Vec::new();
+                let mut sub_marks = Vec::new();
                 // The sub-program starts under the flags in effect at the
                 // assertion (so an enclosing `(?i:…(?=…)…)` is honored).
                 let mut sub_flags = alloc::vec![cur];
@@ -573,7 +599,7 @@ fn backtrack(
                     sp,
                     &mut sub_saves,
                     depth + 1,
-                    &mut sub_loops,
+                    &mut sub_marks,
                     &mut sub_flags,
                 );
                 if matched == *neg {
@@ -588,7 +614,7 @@ fn backtrack(
                 // later failure restore the originals so backtracking past the
                 // assertion is sound.
                 let saved = core::mem::replace(saves, sub_saves);
-                if backtrack(ctx, pc + 1, sp, saves, depth + 1, loops, flags_stack) {
+                if backtrack(ctx, pc + 1, sp, saves, depth + 1, marks, flags_stack) {
                     return true;
                 }
                 *saves = saved;
@@ -613,7 +639,7 @@ fn backtrack(
                     budget: ctx.budget,
                 };
                 let mut sub_saves = saves.clone();
-                let mut sub_loops = Vec::new();
+                let mut sub_marks = Vec::new();
                 let mut sub_flags = alloc::vec![cur];
                 let matched = backtrack(
                     &sub,
@@ -621,7 +647,7 @@ fn backtrack(
                     sp,
                     &mut sub_saves,
                     depth + 1,
-                    &mut sub_loops,
+                    &mut sub_marks,
                     &mut sub_flags,
                 );
                 if matched == *neg {
@@ -632,7 +658,7 @@ fn backtrack(
                     continue;
                 }
                 let saved = core::mem::replace(saves, sub_saves);
-                if backtrack(ctx, pc + 1, sp, saves, depth + 1, loops, flags_stack) {
+                if backtrack(ctx, pc + 1, sp, saves, depth + 1, marks, flags_stack) {
                     return true;
                 }
                 *saves = saved;
@@ -669,7 +695,7 @@ fn backtrack(
                 // the remainder recursively so the push is undone on every exit
                 // path (success, failure, or backtrack), keeping the stack sound.
                 flags_stack.push(delta.apply(cur));
-                let r = backtrack(ctx, pc + 1, sp, saves, depth + 1, loops, flags_stack);
+                let r = backtrack(ctx, pc + 1, sp, saves, depth + 1, marks, flags_stack);
                 flags_stack.pop();
                 return r;
             }
@@ -678,7 +704,7 @@ fn backtrack(
                 // the restored flags, then push back so the caller's stack is
                 // unchanged on return.
                 let restored = flags_stack.pop();
-                let r = backtrack(ctx, pc + 1, sp, saves, depth + 1, loops, flags_stack);
+                let r = backtrack(ctx, pc + 1, sp, saves, depth + 1, marks, flags_stack);
                 if let Some(f) = restored {
                     flags_stack.push(f);
                 }
@@ -722,32 +748,6 @@ fn is_single_consume(inst: &Inst) -> bool {
         inst,
         Inst::Char(_) | Inst::Any | Inst::Class(_) | Inst::ClassSet { .. }
     )
-}
-
-/// Recognizes a `*`/`+` loop head at `split_pc` (any body, not just a single
-/// instruction). The compiler always emits the body immediately after the
-/// `Split` (at `split_pc + 1`) and ends it with `Jmp(split_pc)` just before the
-/// exit. Returns `(body_pc, exit_pc)` if so; greedy and lazy differ only in which
-/// `Split` branch is the body. Used to drive the zero-width-progress guard.
-fn loop_head(prog: &[Inst], split_pc: usize) -> Option<(usize, usize)> {
-    let Inst::Split(a, b) = &prog[split_pc] else {
-        return None;
-    };
-    let body = split_pc + 1;
-    // The body branch is whichever target points just past the Split.
-    let exit = if *a == body {
-        *b
-    } else if *b == body {
-        *a
-    } else {
-        return None;
-    };
-    // A loop body is closed by `Jmp(split_pc)` sitting immediately before `exit`.
-    if exit > 0 && matches!(prog.get(exit - 1), Some(Inst::Jmp(t)) if *t == split_pc) {
-        Some((body, exit))
-    } else {
-        None
-    }
 }
 
 /// Tries to consume one character with a single-consume instruction at `sp` in the

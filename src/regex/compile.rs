@@ -261,6 +261,25 @@ impl Compiler<'_> {
         max: Option<usize>,
         greedy: bool,
     ) -> Result<(), RegexError> {
+        // A quantifier bound may be any decimal integer — the spec caps neither
+        // bound of `{n,m}` — but a bound larger than any subject could satisfy
+        // needs no expansion at all. An atom that cannot match the empty string
+        // consumes at least one code unit per iteration, and a subject can never
+        // hold more than `DEFAULT_MAX_STRING_LEN` of them, so no more than `cap`
+        // iterations are ever possible: a larger `min` can never be reached (the
+        // whole quantifier can never match) and a larger `max` is indistinguishable
+        // from "unbounded". A nullable atom has no such ceiling, and an
+        // unexpandable bound on one is still rejected by `MAX_PROG_SIZE` below.
+        let (min, max) = if can_match_empty(inner) {
+            (min, max)
+        } else {
+            let cap = crate::limits::DEFAULT_MAX_STRING_LEN;
+            if min > cap {
+                self.emit(Inst::Fail);
+                return self.check_size();
+            }
+            (min, max.filter(|m| *m <= cap))
+        };
         match max {
             // Unbounded tail (`*`, `+`, `{n,}`): the optional/star part adds only
             // a small constant (a `Split`/`Jmp` around one real copy of `inner`),
@@ -327,12 +346,24 @@ impl Compiler<'_> {
         }
     }
 
-    /// `inner*` — `L1: Split(clear, exit); clear; body; Jmp L1; exit:`.
+    /// `inner*` — `L1: Split(mark, exit); mark; clear; body; empty-fail; Jmp L1; exit:`.
+    ///
+    /// The `Mark`/`EmptyFail` bracket implements RepeatMatcher step 2.b and is
+    /// emitted only when `inner` can match the empty string; a body that always
+    /// consumes keeps the tight `Split; <consume>; Jmp` shape the VM's
+    /// `simple_loop` fast path recognizes.
     fn compile_star(&mut self, inner: &Node, greedy: bool) -> Result<(), RegexError> {
+        let nullable = can_match_empty(inner);
         let l1 = self.emit(Inst::Split(0, 0));
         let body = self.here();
+        if nullable {
+            self.emit(Inst::Mark);
+        }
         self.emit_clear_captures(inner);
         self.compile(inner)?;
+        if nullable {
+            self.emit(Inst::EmptyFail);
+        }
         self.emit(Inst::Jmp(l1));
         let exit = self.here();
         self.prog[l1] = if greedy {
@@ -343,12 +374,19 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    /// `inner?` — `Split(body, exit); clear; body; exit:`.
+    /// `inner?` — `Split(mark, exit); mark; clear; body; empty-fail; exit:`.
     fn compile_optional(&mut self, inner: &Node, greedy: bool) -> Result<(), RegexError> {
+        let nullable = can_match_empty(inner);
         let split = self.emit(Inst::Split(0, 0));
         let body = self.here();
+        if nullable {
+            self.emit(Inst::Mark);
+        }
         self.emit_clear_captures(inner);
         self.compile(inner)?;
+        if nullable {
+            self.emit(Inst::EmptyFail);
+        }
         let exit = self.here();
         self.prog[split] = if greedy {
             Inst::Split(body, exit)
@@ -538,6 +576,32 @@ fn build_set_matcher(expr: &ClassSetExpr) -> SetMatcher {
         ClassSetExpr::Difference(kids) => {
             SetMatcher::Difference(kids.iter().map(build_set_matcher).collect())
         }
+    }
+}
+
+/// Whether `node` can match the empty string.
+///
+/// Used for two decisions, both of which want a *conservative* answer: a
+/// quantifier over a nullable atom needs the `Mark`/`EmptyFail` empty-iteration
+/// guard, and only a non-nullable atom lets a huge bound be answered statically.
+/// Erring towards `true` costs an optimization; erring towards `false` would be
+/// unsound, so every zero-width construct answers `true`.
+fn can_match_empty(node: &Node) -> bool {
+    match node {
+        // Consume exactly one code point. A `v`-mode class is the one exception:
+        // `\q{}` gives it an empty-string alternative.
+        Node::Char(_) | Node::Any | Node::Class { .. } => false,
+        Node::ClassSet { set, .. } => set_strings(set).iter().any(alloc::vec::Vec::is_empty),
+        // Zero-width by construction.
+        Node::Empty | Node::Start | Node::End | Node::WordBoundary { .. } => true,
+        Node::Look { .. } | Node::LookBehind { .. } => true,
+        // An unset group backreference matches the empty string, as does a
+        // reference to a group that captured nothing.
+        Node::Backref(_) | Node::NamedBackref(_) => true,
+        Node::Group { inner, .. } | Node::Modifier { inner, .. } => can_match_empty(inner),
+        Node::Concat(kids) => kids.iter().all(can_match_empty),
+        Node::Alt(kids) => kids.iter().any(can_match_empty),
+        Node::Repeat { inner, min, .. } => *min == 0 || can_match_empty(inner),
     }
 }
 

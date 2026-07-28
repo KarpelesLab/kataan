@@ -248,11 +248,75 @@ fn redos_zero_width_terminates() {
 
 #[test]
 fn compile_blowup_rejected() {
-    assert!(Regex::new("a{99999999999}", "").is_err());
     assert!(Regex::new("a{5,2}", "").is_err());
     assert!(Regex::new("(a{1000}){1000}", "").is_err());
     assert!(Regex::new("a{100}", "").is_ok());
     assert!(Regex::new("a{2,4}", "").is_ok());
+}
+
+/// *Quantifier* accepts arbitrarily long *DecimalDigits*, so a bound far beyond
+/// any expandable size is a valid pattern, not a Syntax Error. No subject can
+/// supply that many iterations of an atom that always consumes, so the compiler
+/// answers it statically instead of expanding it.
+#[test]
+fn huge_quantifier_bound_compiles_and_never_matches() {
+    let big = "9007199254740991";
+    for pattern in [
+        alloc::format!("b{{{big}}}"),
+        alloc::format!("b{{{big},}}"),
+        alloc::format!("b{{{big},{big}}}"),
+        alloc::string::String::from("a{99999999999}"),
+    ] {
+        let r = Regex::new(&pattern, "").expect("huge bound is not a Syntax Error");
+        assert!(!r.is_match(""), "{pattern}");
+        assert!(!r.is_match("bbbb"), "{pattern}");
+    }
+    // A `max` too large to reach is indistinguishable from unbounded.
+    let r = Regex::new(&alloc::format!("b{{1,{big}}}"), "").unwrap();
+    assert_eq!(r.find_from("bbb", 0), Some((0, 3)));
+    // The ordering check stays exact for bounds too large to represent.
+    assert!(Regex::new("a{10000000000000000000000,1}", "").is_err());
+    assert!(Regex::new("a{1,10000000000000000000000}", "").is_ok());
+}
+
+/// ECMA-262 RepeatMatcher step 2.b: an *optional* (min = 0) iteration that
+/// consumed nothing is discarded — the iteration fails so the body backtracks
+/// into its other alternatives, rather than the loop exiting with the empty
+/// iteration's captures still bound.
+#[test]
+fn empty_optional_iteration_is_discarded() {
+    // Two iterations of the star: "a" then "b". A loop that merely stopped on the
+    // empty iteration would match only "a".
+    let caps = re("(a?b??)*", "").captures_from("ab", 0).unwrap();
+    assert_eq!(caps.whole(), (0, 2));
+    assert_eq!(caps.group(1), Some((1, 2)));
+    // The empty iteration must not publish its captures.
+    let caps = re("(?:(?=(abc)))?a", "").captures_from("abc", 0).unwrap();
+    assert_eq!(caps.group(1), None);
+    // ... while an unquantified or mandatory iteration does.
+    let caps = re("(?:(?=(abc))){1,1}a", "")
+        .captures_from("abc", 0)
+        .unwrap();
+    assert_eq!(caps.group(1), Some((0, 3)));
+}
+
+/// A lazy quantifier whose body is more than a single instruction must still
+/// prefer the exit branch (`simple_loop` only covers single-instruction bodies).
+#[test]
+fn lazy_loop_prefers_the_exit_branch() {
+    assert_eq!(re("(?:ab)*?", "").find_from("abab", 0), Some((0, 0)));
+    // Fewest iterations that let the continuation match: one, not two.
+    assert_eq!(re("(?:ab)*?ab$", "").find_from("abab", 0), Some((0, 4)));
+    assert_eq!(re("(?:ab)*?a", "").find_from("abab", 0), Some((0, 1)));
+}
+
+/// `AdvanceStringIndex`: in `u` mode a failed attempt steps over a whole
+/// surrogate pair, so a lone-surrogate pattern never matches half of one.
+#[test]
+fn unicode_scan_advances_by_code_point() {
+    let units = u16s("\u{1D306}");
+    assert_eq!(re("\\udf06", "u").find_in_u16(&units, 0), None);
+    assert_eq!(re("\\udf06", "").find_in_u16(&units, 0), Some((1, 2)));
 }
 
 // --- UTF-16 code-unit API (`*_in_u16`) ---

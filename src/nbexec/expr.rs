@@ -2732,9 +2732,32 @@ impl<'a> Interp<'a> {
                 self.set_element_checked(handle, i, new)?;
             } else {
                 self.realm.set_property(handle, &name, new);
+                self.sync_global_object_write(handle, &name, new);
             }
         }
         Ok(())
+    }
+
+    /// Mirrors a write to the **global object** (`globalThis.X = v`, or the object
+    /// `Function("return this")()` returns) into the global *binding* `X`, so a
+    /// bare `X` afterwards reads the new value.
+    ///
+    /// Kataan's global scope is a declarative record and `globalThis` is an object
+    /// that mirrors it, so the two would otherwise drift apart. Syncing on the
+    /// **write** side keeps identifier *reads* on the plain binding path: the
+    /// alternative — resolving every bare identifier through the global object —
+    /// also routes the interpreter's own intrinsic lookups through it, so tampering
+    /// with a global would leak into engine-internal construction (`%Promise%`,
+    /// species constructors, …). Only an existing binding is updated; a brand-new
+    /// `globalThis.foo = 1` is created by the ordinary global-object fallback that
+    /// identifier resolution already consults.
+    fn sync_global_object_write(&mut self, handle: Handle, name: &str, new: NanBox) {
+        if self.global_this.as_handle() != Some(handle.to_raw()) {
+            return;
+        }
+        if self.global_scope.get(name).is_some() {
+            self.global_scope.set(name, new);
+        }
     }
 
     /// `arr[i] = v` for an array index: the dense fast path unless the index carries
@@ -3159,7 +3182,7 @@ impl<'a> Interp<'a> {
         // re-bound function reads `"bound bound …"`); its `length` is the target's
         // length minus the bound arguments (floored at 0).
         if matches!(name, "name" | "length")
-            && !self.realm.has_own(handle, name)
+            && self.fn_meta_synthesizable(handle, name)
             && let Some(target) = self.realm.get_property(handle, BOUND_TARGET)
         {
             let th = target.as_handle().map(Handle::from_raw);
@@ -3173,21 +3196,17 @@ impl<'a> Interp<'a> {
                 };
                 return Ok(self.new_str(&alloc::format!("bound {tname}")));
             }
-            // `length`: target.length − number of pre-bound arguments.
-            let tlen = match th {
-                Some(t) => {
-                    let v = self.read_member(t, "length")?;
-                    self.realm.to_number(v)
-                }
-                None => 0.0,
-            };
+            // `length`: the same `Function.prototype.bind` steps 5-8 that
+            // `make_bound_function` runs eagerly, for a bound function whose
+            // physical slot is absent.
             let bound = self
                 .realm
                 .get_property(handle, BOUND_ARGS)
                 .and_then(|a| a.as_handle().map(Handle::from_raw))
                 .and_then(|bh| self.realm.array_length(bh))
                 .unwrap_or(0);
-            return Ok(NanBox::number((tlen - bound as f64).max(0.0)));
+            let len = self.bound_function_length(th, bound)?;
+            return Ok(NanBox::number(len));
         }
         // `obj.__proto__` reads the prototype link (unless shadowed by an own
         // data property of that name).
@@ -3209,7 +3228,7 @@ impl<'a> Interp<'a> {
         // declared id of an anonymous class.
         if name == "name"
             && self.realm.class_at(handle).is_some()
-            && !self.realm.has_own(handle, "name")
+            && self.fn_meta_synthesizable(handle, "name")
         {
             let cname = self
                 .realm
@@ -3220,7 +3239,7 @@ impl<'a> Interp<'a> {
         }
         // A function's `length` (params before a default/rest) and `name`.
         if matches!(name, "length" | "name")
-            && !self.realm.has_own(handle, name)
+            && self.fn_meta_synthesizable(handle, name)
             && let Some((func_id, _)) = self.realm.function_at(handle)
         {
             let def = self.functions[func_id as usize];
@@ -3238,7 +3257,7 @@ impl<'a> Interp<'a> {
         // A dynamically-registered host function (`register_fn`, ROADMAP §4.0)
         // reports the declared `name`/`length` its registry entry carries.
         if matches!(name, "length" | "name")
-            && !self.realm.has_own(handle, name)
+            && self.fn_meta_synthesizable(handle, name)
             && let Some(id) = self.realm.host_fn_at(handle)
             && let Some((fn_name, len)) = self.host_fn_meta(id)
         {
@@ -3254,7 +3273,7 @@ impl<'a> Interp<'a> {
         // `length`; first-class prototype/static methods (bound natives) carry
         // neither. Synthesize both from the dispatch identity so every built-in
         // function exposes the spec-mandated own `name`/`length` data properties.
-        if matches!(name, "length" | "name") && !self.realm.has_own(handle, name) {
+        if matches!(name, "length" | "name") && self.fn_meta_synthesizable(handle, name) {
             if let Some((id, target)) = self.realm.bound_native_at(handle) {
                 let method = if id == N_ARRAY_PROTO_FN
                     || id == N_AB_PROTO_FN
@@ -4616,6 +4635,7 @@ impl<'a> Interp<'a> {
                     let name = self.coerce_property_key(k)?;
                     if self.allow_property_write(handle, &name)? {
                         self.realm.set_property(handle, &name, new);
+                        self.sync_global_object_write(handle, &name, new);
                     }
                 }
             }
@@ -4638,6 +4658,7 @@ impl<'a> Interp<'a> {
                     self.realm.set_property(handle, "prototype", new);
                 } else if self.allow_property_write(handle, s)? {
                     self.realm.set_property(handle, s, new);
+                    self.sync_global_object_write(handle, s, new);
                 }
             }
             PropertyKey::Number(n) => {
@@ -5593,7 +5614,7 @@ impl<'a> Interp<'a> {
 /// (e.g. `"0."`, `"1.5"`, `"x"`), which the comparison operators treat as an
 /// unequal / undefined-ordering result rather than a throw.
 fn string_to_bigint_opt(s: &str) -> Option<crate::bignum::BigInt> {
-    let t = s.trim();
+    let t = s.trim_matches(crate::realm::is_js_whitespace);
     if t.is_empty() {
         return Some(crate::bignum::BigInt::zero());
     }

@@ -1424,15 +1424,20 @@ impl<'a> Interp<'a> {
     /// `p instanceof Promise`, and the inherited `Symbol.toStringTag` resolve).
     pub(crate) fn fresh_promise(&mut self) -> Handle {
         let p = self.realm.new_promise();
-        if let Some(proto) = self
-            .current
-            .get("Promise")
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-            .and_then(|c| self.realm.get_property(c, "prototype"))
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-        {
+        // The **intrinsic** `%Promise.prototype%`, captured at install time — not
+        // whatever the live `Promise` binding names now. `NewPromiseCapability(
+        // %Promise%)` is specified against the intrinsic, so replacing the global
+        // `Promise` must not change the prototype of a promise the engine creates
+        // for `import()`, an async function, or a reaction job.
+        if let Some(proto) = self.realm.promise_proto_intrinsic().or_else(|| {
+            self.current
+                .get("Promise")
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+                .and_then(|c| self.realm.get_property(c, "prototype"))
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+        }) {
             self.realm.set_native_proto(p, proto);
         }
         p

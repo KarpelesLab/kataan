@@ -59,8 +59,13 @@ pub const DEFAULT_REGEX_STEP_BASE: u64 = 300_000;
 pub const DEFAULT_REGEX_MAX_DEPTH: u32 = 2_000;
 /// Default maximum regex *pattern* parser nesting depth (groups/lookaround).
 pub const DEFAULT_REGEX_MAX_PARSE_DEPTH: u32 = 300;
-/// Default maximum accepted `{n,m}` quantifier bound.
-pub const DEFAULT_REGEX_MAX_QUANT: usize = 1_000_000;
+/// Default value a `{n,m}` quantifier bound saturates to.
+///
+/// *Quantifier* accepts arbitrarily long *DecimalDigits*, so a huge bound is not
+/// a Syntax Error; the regex parser clamps it here instead. The value is kept
+/// above [`DEFAULT_MAX_STRING_LEN`] so the compiler can recognize a clamped
+/// bound as unsatisfiable by any subject rather than trying to expand it.
+pub const DEFAULT_REGEX_MAX_QUANT: usize = 1 << 31;
 /// Default maximum compiled regex program size (instructions).
 pub const DEFAULT_REGEX_MAX_PROG_SIZE: usize = 100_000;
 

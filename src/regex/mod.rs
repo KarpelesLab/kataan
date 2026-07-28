@@ -419,6 +419,13 @@ impl Regex {
                 if s > last {
                     return None;
                 }
+                // In `u` mode a match can only begin on a character boundary, so a
+                // hit in the middle of a surrogate pair is not a candidate — step
+                // over it and look for the next occurrence.
+                if flags.unicode && !is_char_boundary(units, s) {
+                    s += 1;
+                    continue;
+                }
             }
             if let Some(groups) = vm::run_with(
                 &mut scratch,
@@ -432,7 +439,7 @@ impl Regex {
             ) {
                 return Some(Captures { groups });
             }
-            s += 1;
+            s = advance_string_index(units, s, flags.unicode);
         }
         None
     }
@@ -468,6 +475,29 @@ impl Regex {
         out.extend(&chars[pos.min(chars.len())..]);
         out
     }
+}
+
+/// `AdvanceStringIndex(S, index, fullUnicode)`: the next position a match may
+/// begin at after a failed attempt at `s`. With `u` set a surrogate pair is one
+/// character, so the scan steps over both units and never starts inside a pair.
+fn advance_string_index(units: &[u16], s: usize, unicode: bool) -> usize {
+    if unicode
+        && let Some(&hi) = units.get(s)
+        && (0xD800..=0xDBFF).contains(&hi)
+        && units
+            .get(s + 1)
+            .is_some_and(|lo| (0xDC00..=0xDFFF).contains(lo))
+    {
+        return s + 2;
+    }
+    s + 1
+}
+
+/// Whether unit index `s` is the start of a character — false only for the low
+/// half of a surrogate pair. Used in `u` mode, where a match may not begin inside
+/// a pair.
+fn is_char_boundary(units: &[u16], s: usize) -> bool {
+    s == 0 || !(0xDC00..=0xDFFF).contains(&units[s]) || !(0xD800..=0xDBFF).contains(&units[s - 1])
 }
 
 /// Whether `prog` can only match at the position the scan starts from: every
@@ -509,9 +539,13 @@ fn program_is_anchored(prog: &[vm::Inst]) -> bool {
             // Zero-width and position-agnostic: keep looking for the `^`.
             Inst::Save(_)
             | Inst::ClearCaptures { .. }
+            | Inst::Mark
+            | Inst::EmptyFail
             | Inst::Assert(Assert::End | Assert::WordBoundary | Assert::NotWordBoundary)
             | Inst::Look { .. }
             | Inst::LookBehind { .. } => stack.push(pc + 1),
+            // Never matches, so this path proves nothing.
+            Inst::Fail => {}
             // Consumes input, matches, or changes the meaning of `^`.
             _ => return false,
         }
@@ -563,9 +597,13 @@ fn program_first_unit(prog: &[vm::Inst]) -> Option<u16> {
             // Zero-width: the required unit, if any, is still ahead.
             Inst::Save(_)
             | Inst::ClearCaptures { .. }
+            | Inst::Mark
+            | Inst::EmptyFail
             | Inst::Assert(_)
             | Inst::Look { .. }
             | Inst::LookBehind { .. } => stack.push(pc + 1),
+            // Never matches: contributes no path, so no required unit either.
+            Inst::Fail => {}
             _ => return None,
         }
     }

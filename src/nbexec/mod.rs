@@ -680,6 +680,16 @@ pub struct Interp<'a> {
     /// [`Interp::array_species_create`] to identify the current Realm Record for the
     /// `SameValue(C, realmC.[[%Array%]])` cross-realm nullification step.
     cur_realm: Option<usize>,
+    /// The realm that was running when the innermost in-flight `[[Construct]]` was
+    /// issued — i.e. the realm of *callerContext*.
+    ///
+    /// `[[Construct]]` removes the callee context (step 11) *before* checking the
+    /// constructor's completion, so the two errors those later steps raise — a
+    /// derived constructor returning a non-object (step 13.c) and one that never
+    /// ran `super()` (step 15's `GetThisBinding`) — belong to the caller's realm,
+    /// not the constructor's. Every other error inside a construction is raised
+    /// while the callee context is live and uses [`Self::cur_realm`].
+    construct_caller_realm: Option<usize>,
     /// The *main* realm's global object and global (root) lexical scope, captured
     /// once after the main `install_globals`. `global_this`/`global_scope` are
     /// swapped to a `$262.createRealm()` realm's while a cross-realm function
@@ -3133,6 +3143,7 @@ impl<'a> Interp<'a> {
             created_realms: Vec::new(),
             fn_realm: alloc::collections::BTreeMap::new(),
             cur_realm: None,
+            construct_caller_realm: None,
             main_global_this: NanBox::undefined(),
             main_global_scope: Scope::root(),
             eval_programs: alloc::collections::BTreeMap::new(),
@@ -5035,6 +5046,13 @@ impl<'a> Interp<'a> {
         // is readable / detachable and `Promise.prototype[Symbol.toStringTag]`
         // exists. Promise instances link to it below.
         self.setup_first_class_prototype("Promise", PROMISE_PROTO_METHODS);
+        // Capture `%Promise.prototype%` now, while the `Promise` binding is still
+        // the intrinsic: every engine-created promise links to *this*, so
+        // overwriting the global `Promise` cannot change what `import()`, an async
+        // function, or a reaction job hands back.
+        if let Some(proto) = self.intrinsic_proto("Promise") {
+            self.realm.set_promise_proto_intrinsic(proto);
+        }
         // `Ctor.prototype[Symbol.toStringTag]` — a non-enumerable, non-writable,
         // configurable string. (`Object.prototype.toString` reads it.)
         self.install_proto_to_string_tag("Set", "Set");
@@ -6857,10 +6875,31 @@ impl<'a> Interp<'a> {
         // back-link; for a plain function it lazily builds the default proto
         // (with the back-link) here. `prototype` is `writable: true` for both.
         if self.fn_has_prototype(func_id) {
+            let existed = self.realm.function_prototype_cached(func_id).is_some();
             let proto = self.realm.function_prototype(func_id);
+            // MakeConstructor step 7.a builds the `prototype` object from the
+            // *current* Realm Record's `%Object.prototype%` — for a cross-realm
+            // `Reflect.construct(otherRealm.Function, …)` that is the constructor's
+            // realm, not the main one (whose intrinsic `new_object` defaults to).
+            // Only for a freshly-built proto: an already-materialized one keeps
+            // whatever link it has.
+            if !existed && let Some(op) = self.running_realm_object_proto() {
+                self.realm.set_object_proto(proto, Some(op));
+            }
             self.install_fn_prototype(handle, proto, true);
         }
         NanBox::handle(handle.to_raw())
+    }
+
+    /// `%Object.prototype%` of the *running* realm ([`Self::cur_realm`]), or `None`
+    /// when that is the main realm (whose intrinsic is already the heap default, so
+    /// nothing needs re-linking).
+    fn running_realm_object_proto(&self) -> Option<Handle> {
+        let idx = self.cur_realm?;
+        self.created_realms
+            .get(idx)?
+            .intrinsics
+            .default_object_proto
     }
 
     /// Calls `callee` with `args`.
@@ -9173,7 +9212,7 @@ fn now_ms() -> f64 {
 /// A minimal `parseInt`: skips leading whitespace, reads an optional sign and
 /// the leading decimal digits, and returns `NaN` if there are none.
 fn parse_int(s: &str, radix: u32) -> f64 {
-    let mut t = s.trim_start();
+    let mut t = s.trim_start_matches(crate::realm::is_js_whitespace);
     let mut neg = false;
     if let Some(rest) = t.strip_prefix('-') {
         neg = true;

@@ -224,6 +224,11 @@ pub struct Realm {
     /// override is recorded in [`native_protos`](Realm::native_protos) /
     /// [`callable_null_protos`](Realm::callable_null_protos).
     array_proto_intrinsic: Option<Handle>,
+    /// `%Promise.prototype%` — the `[[Prototype]]` of every engine-created promise.
+    /// Captured at install time so an engine-internal promise (dynamic `import()`,
+    /// an async function's result, a microtask reaction) never picks up a *tampered*
+    /// global `Promise` binding.
+    promise_proto_intrinsic: Option<Handle>,
     /// The realm's `Symbol.prototype` intrinsic (the `[[Prototype]]` of a Symbol
     /// primitive `Cell::Symbol`, which has no inline object part). So
     /// `Object.getPrototypeOf(Symbol())` resolves to `Symbol.prototype`. Symbol
@@ -386,6 +391,8 @@ pub struct RealmIntrinsics {
     pub default_object_proto: Option<Handle>,
     /// `%Array.prototype%` — the default `[[Prototype]]` of a dense array.
     pub array_proto: Option<Handle>,
+    /// `%Promise.prototype%` — the `[[Prototype]]` of an engine-created promise.
+    pub promise_proto: Option<Handle>,
     /// `%Function.prototype%` — the default `[[Prototype]]` of a callable.
     pub function_proto: Option<Handle>,
     /// `%Symbol.prototype%` — the `[[Prototype]]` of a `Symbol` primitive.
@@ -443,6 +450,7 @@ impl Realm {
             function_proto_intrinsic: None,
             throw_type_error_intrinsic: None,
             array_proto_intrinsic: None,
+            promise_proto_intrinsic: None,
             symbol_proto_intrinsic: None,
             bigint_proto_intrinsic: None,
             intl_protos: alloc::collections::BTreeMap::new(),
@@ -519,6 +527,17 @@ impl Realm {
         self.array_proto_intrinsic
     }
 
+    /// Records the realm's `%Promise.prototype%` intrinsic.
+    pub fn set_promise_proto_intrinsic(&mut self, handle: Handle) {
+        self.promise_proto_intrinsic = Some(handle);
+    }
+
+    /// The realm's `%Promise.prototype%` intrinsic, if installed.
+    #[must_use]
+    pub fn promise_proto_intrinsic(&self) -> Option<Handle> {
+        self.promise_proto_intrinsic
+    }
+
     /// Snapshots the realm-wide intrinsic prototype pointers that
     /// `crate::nbexec::Interp::install_globals` installs. Used by
     /// `$262.createRealm` to build a second global environment on the shared heap
@@ -530,6 +549,7 @@ impl Realm {
         RealmIntrinsics {
             default_object_proto: self.default_object_proto,
             array_proto: self.array_proto_intrinsic,
+            promise_proto: self.promise_proto_intrinsic,
             function_proto: self.function_proto_intrinsic,
             symbol_proto: self.symbol_proto_intrinsic,
             bigint_proto: self.bigint_proto_intrinsic,
@@ -543,6 +563,7 @@ impl Realm {
     pub fn restore_intrinsics(&mut self, s: RealmIntrinsics) {
         self.default_object_proto = s.default_object_proto;
         self.array_proto_intrinsic = s.array_proto;
+        self.promise_proto_intrinsic = s.promise_proto;
         self.function_proto_intrinsic = s.function_proto;
         self.symbol_proto_intrinsic = s.symbol_proto;
         self.bigint_proto_intrinsic = s.bigint_proto;
@@ -710,6 +731,13 @@ impl Realm {
             self.set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
         }
         proto
+    }
+
+    /// The already-materialized `.prototype` object for `func_id`, if any — so a
+    /// caller can tell a fresh allocation from a reused one without forcing it.
+    #[must_use]
+    pub fn function_prototype_cached(&self, func_id: u32) -> Option<Handle> {
+        self.fn_protos.get(&func_id).copied()
     }
 
     /// Reassigns a constructor function's `.prototype` (`Fn.prototype = obj`).
@@ -3299,6 +3327,14 @@ impl Realm {
             }
             o.delete(root, key);
         }
+        // A callable's `name`/`length` are synthesized on read from the function
+        // definition, so removing the physical slot is not enough to make the
+        // property go away — record that it was deleted.
+        if let Some(tomb) = fn_meta_tombstone(key)
+            && self.is_callable_cell(handle)
+        {
+            self.set_hidden_property(handle, tomb, NanBox::boolean(true));
+        }
         // A non-object receiver with no aux: nothing to delete, which counts as
         // success.
         true
@@ -3326,6 +3362,15 @@ impl Realm {
         if self.heap.get(handle).and_then(Cell::as_array).is_some() {
             self.sealed_arrays.insert(handle.to_raw());
             self.non_extensible_arrays.insert(handle.to_raw());
+            // Named (non-index) properties live in the aux object; seal them there
+            // too, or `delete arr.foo` would still succeed on a sealed array (the
+            // side registry only governs the index properties). Mirrors
+            // [`Self::freeze_object`].
+            if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+                && let Some(obj) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
+            {
+                obj.seal();
+            }
         } else if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.seal();
         } else {
@@ -4688,7 +4733,7 @@ impl Realm {
                 match self.heap.get(Handle::from_raw(raw)).and_then(Cell::as_str) {
                     Some(rope) => {
                         let s = rope.materialize();
-                        let t = s.trim();
+                        let t = s.trim_matches(is_js_whitespace);
                         if t.is_empty() {
                             return 0.0;
                         }
@@ -4725,7 +4770,7 @@ impl Realm {
     /// Parses a string to a number with the same rules as `ToNumber` over a
     /// string (radix prefixes, trimming, empty → 0).
     fn number_from_str(&self, s: &str) -> f64 {
-        let t = s.trim();
+        let t = s.trim_matches(is_js_whitespace);
         if t.is_empty() {
             return 0.0;
         }
@@ -5160,6 +5205,50 @@ fn rope_bytes(r: &Rope) -> alloc::borrow::Cow<'_, [u8]> {
         Some(b) => alloc::borrow::Cow::Borrowed(b),
         None => alloc::borrow::Cow::Owned(r.materialize_bytes()),
     }
+}
+
+/// The hidden slot recording that a callable's `name` / `length` own property was
+/// **deleted**, keyed by the property name.
+///
+/// Both are derived from the function definition on every read rather than stored
+/// as real slots, so "no physical slot" cannot mean "no property" — otherwise
+/// `delete f.length` would report success and `f.length` would immediately come
+/// back. The marker is hidden (never enumerated) and lives on the function object,
+/// so it is per-function and survives for as long as the function does.
+#[must_use]
+pub fn fn_meta_tombstone(key: &str) -> Option<&'static str> {
+    match key {
+        "length" => Some("\u{0}fndellen"),
+        "name" => Some("\u{0}fndelname"),
+        _ => None,
+    }
+}
+
+/// The ECMAScript *StrWhiteSpace* set: the code points `ToNumber`, `TrimString`,
+/// `parseInt`, `parseFloat` and `StringToBigInt` skip at either end of a string.
+///
+/// It is *WhiteSpace* ∪ *LineTerminator* — TAB/LF/VT/FF/CR, SPACE, NBSP, the `Zs`
+/// category, LS/PS, and ZWNBSP (U+FEFF). Deliberately **not** Rust's
+/// `char::is_whitespace` (the Unicode `White_Space` property), which differs from
+/// ECMAScript in both directions: it omits U+FEFF (dropped from `White_Space` in
+/// Unicode 4.0.1, but still ECMAScript white space) and it includes U+0085 (NEL,
+/// which ECMAScript does not treat as white space).
+#[must_use]
+pub fn is_js_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\u{09}'..='\u{0D}'      // TAB, LF, VT, FF, CR
+            | '\u{20}'           // SPACE (Zs)
+            | '\u{A0}'           // NBSP (Zs)
+            | '\u{1680}'         // OGHAM SPACE MARK (Zs)
+            | '\u{2000}'..='\u{200A}' // EN QUAD..HAIR SPACE (Zs)
+            | '\u{2028}'         // LINE SEPARATOR
+            | '\u{2029}'         // PARAGRAPH SEPARATOR
+            | '\u{202F}'         // NARROW NBSP (Zs)
+            | '\u{205F}'         // MEDIUM MATHEMATICAL SPACE (Zs)
+            | '\u{3000}'         // IDEOGRAPHIC SPACE (Zs)
+            | '\u{FEFF}' // ZWNBSP
+    )
 }
 
 /// Parses a (decimal, already-trimmed, non-radix) `StrDecimalLiteral` to an

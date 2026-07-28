@@ -478,6 +478,31 @@ impl<'a> Interp<'a> {
             .is_some()
     }
 
+    /// `IsTypedArrayFixedLength(O)`: whether the typed array `handle` has a length
+    /// that can never change. A length-tracking view is not fixed length, and
+    /// neither is *any* view over a resizable (non-shared) buffer, since a resize
+    /// can shrink it out from under the view.
+    ///
+    /// `None` for a non-typed-array, so callers can tell "not a typed array" from
+    /// "a typed array that is not fixed length".
+    pub(crate) fn typed_array_is_fixed_length(&self, handle: Handle) -> Option<bool> {
+        self.realm.typed_kind(handle)?;
+        if self.realm.is_length_tracking(handle) {
+            return Some(false);
+        }
+        // The *`ArrayBuffer` object* (not the raw byte store) is what carries the
+        // resizable/shared markers.
+        let Some(buf) = self.realm.typed_array_object(handle) else {
+            return Some(true);
+        };
+        let resizable = self.realm.get_property(buf, ARRAY_BUFFER_MAXLEN).is_some();
+        let shared = self
+            .realm
+            .get_property(buf, SHARED_ARRAY_BUFFER_BRAND)
+            .is_some();
+        Some(!resizable || shared)
+    }
+
     /// Throws a `TypeError` if the `ArrayBuffer` `buf` is immutable — every
     /// operation that would modify, resize, or transfer its bytes is rejected.
     pub(crate) fn guard_immutable_buffer(&mut self, buf: Handle) -> Result<(), ExecError> {
@@ -788,6 +813,35 @@ impl<'a> Interp<'a> {
             return Err(self
                 .type_error("ArrayBuffer.prototype.slice: species did not return an ArrayBuffer"));
         };
+        // Steps 20-23. The result must be the *same flavour* of buffer as the
+        // source: `ArrayBuffer.prototype.slice` rejects a shared result and
+        // `SharedArrayBuffer.prototype.slice` rejects a non-shared one (this helper
+        // serves both).
+        let src_shared = self
+            .realm
+            .get_property(original, SHARED_ARRAY_BUFFER_BRAND)
+            .is_some();
+        let new_shared = self
+            .realm
+            .get_property(nh, SHARED_ARRAY_BUFFER_BRAND)
+            .is_some();
+        if new_shared != src_shared {
+            return Err(self.type_error(if src_shared {
+                "SharedArrayBuffer.prototype.slice: species did not return a SharedArrayBuffer"
+            } else {
+                "ArrayBuffer.prototype.slice: species returned a SharedArrayBuffer"
+            }));
+        }
+        // A shared buffer can never be detached, so the detach check is only for
+        // the non-shared case.
+        if !src_shared {
+            self.guard_detached_buffer(nh)?;
+        }
+        if self.is_immutable_buffer(nh) {
+            return Err(self.type_error(
+                "ArrayBuffer.prototype.slice: species returned an immutable ArrayBuffer",
+            ));
+        }
         if self.realm.bytes_at(nb_bytes).map_or(0, <[u8]>::len) < new_len {
             return Err(self.type_error("ArrayBuffer.prototype.slice: species buffer is too small"));
         }
