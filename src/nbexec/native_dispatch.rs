@@ -3104,9 +3104,13 @@ impl<'a> Interp<'a> {
             // `Intl.supportedValuesOf(key)` — supported identifiers for a key.
             N_INTL_SUPPORTED_VALUES_OF => return self.intl_supported_values_of(arg(0)),
             // `Intl.NumberFormat(...)` / `Intl.DateTimeFormat(...)` called without
-            // `new` build the same formatter object.
+            // `new` build the same formatter object, then run the ECMA-402
+            // normative-optional Chain{Number,DateTime}Format step: if `this` is
+            // already an instance of the constructor, the formatter is stashed on
+            // it under `%Intl%.[[FallbackSymbol]]` and `this` is returned.
             N_INTL_NUMBER_FORMAT | N_INTL_DATETIME_FORMAT => {
-                return self.make_intl_formatter(id, args);
+                let fmt = self.make_intl_formatter(id, args)?;
+                return self.chain_intl_formatter(id, fmt);
             }
             // `Intl.Collator(...)` without `new` builds the same collator object.
             N_INTL_COLLATOR => self.make_collator(args)?,

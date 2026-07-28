@@ -1182,6 +1182,15 @@ pub(crate) fn is_supported_collation(co: &str) -> bool {
 /// whenever minute or second appears alongside another time field it renders
 /// 2-digit even for the `"numeric"` option (the crate widens by option only).
 /// Shared by the `Date` and Temporal DateTimeFormat rendering paths.
+///
+/// Literal separators additionally have U+202F (narrow no-break space) folded to
+/// a plain space. CLDR 42 changed the `en` time patterns to separate the clock
+/// from the day period with U+202F; the resulting web breakage led the reference
+/// implementation (V8, hence `node`) to fold it back to U+0020 in *date-time*
+/// output specifically — `Intl.NumberFormat` keeps its U+202F group separator
+/// (e.g. `fr`). Test262 bakes that reference behaviour into the
+/// `DateTimeFormat/prototype/{format,formatToParts}/dayPeriod-*-en.js`
+/// expectations, so match it here rather than in the shared CLDR tables.
 #[cfg(feature = "intl")]
 fn dtf_pad_time_parts(
     parts: alloc::vec::Vec<intl::datetime::DateTimePart>,
@@ -1201,6 +1210,9 @@ fn dtf_pad_time_parts(
             };
             if widen && v.len() == 1 && v.as_bytes()[0].is_ascii_digit() {
                 v.insert(0, '0');
+            }
+            if p.kind == DateTimePartType::Literal && v.contains('\u{202f}') {
+                v = v.replace('\u{202f}', " ");
             }
             (p.kind.as_str(), v)
         })
@@ -2200,6 +2212,122 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `%Intl%.[[FallbackSymbol]]` — the per-realm private symbol whose
+    /// `[[Description]]` is `"IntlLegacyConstructedSymbol"`, used by the ECMA-402
+    /// normative-optional legacy constructor mode (`Intl.NumberFormat.call(obj)`)
+    /// to stash the real formatter on an arbitrary receiver. Created on first use
+    /// and cached on the `Intl` namespace object so it is stable per realm.
+    pub(crate) fn intl_fallback_symbol(&mut self) -> Option<NanBox> {
+        let ns = self.intl_namespace()?;
+        if let Some(v) = self.realm.get_property(ns, "\u{0}fallback_symbol") {
+            return Some(v);
+        }
+        let sym = NanBox::handle(
+            self.realm
+                .new_symbol("IntlLegacyConstructedSymbol")
+                .to_raw(),
+        );
+        self.realm
+            .set_hidden_property(ns, "\u{0}fallback_symbol", sym);
+        Some(sym)
+    }
+
+    /// `OrdinaryHasInstance(%Intl.X%, o)` without consulting a (tamperable)
+    /// namespace property: walks `o`'s prototype chain — proxy-aware, so a Proxy
+    /// wrapping a legacy-constructed object still reports `true` — looking for the
+    /// intrinsic `%Intl.X.prototype%` of the service with `ctor_id`.
+    fn intl_proto_on_chain(&mut self, o: NanBox, ctor_id: u16) -> Result<bool, ExecError> {
+        let Some(svc) = INTL_SERVICES.iter().find(|s| s.ctor_id == ctor_id) else {
+            return Ok(false);
+        };
+        let Some(proto) = self.intl_service_prototype(svc) else {
+            return Ok(false);
+        };
+        let Some(mut cur) = o.as_handle().map(Handle::from_raw) else {
+            return Ok(false);
+        };
+        if !self.is_object_value(o) {
+            return Ok(false);
+        }
+        for _ in 0..100_000 {
+            let Some(next) = self.get_proto_of(cur)?.as_handle().map(Handle::from_raw) else {
+                return Ok(false);
+            };
+            if next == proto {
+                return Ok(true);
+            }
+            cur = next;
+        }
+        Ok(false)
+    }
+
+    /// `ChainNumberFormat` / `ChainDateTimeFormat` (ECMA-402 normative optional):
+    /// when `Intl.NumberFormat` / `Intl.DateTimeFormat` is called *without* `new`
+    /// and `this` is already an instance of that constructor, the freshly built
+    /// `formatter` is stashed on `this` under `%Intl%.[[FallbackSymbol]]` as a
+    /// non-writable/non-enumerable/non-configurable own property and `this` is
+    /// returned; otherwise the formatter itself is returned.
+    pub(crate) fn chain_intl_formatter(
+        &mut self,
+        ctor_id: u16,
+        formatter: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let this = self.this_val;
+        if !self.intl_proto_on_chain(this, ctor_id)? {
+            return Ok(formatter);
+        }
+        let (Some(sym), Some(h)) = (
+            self.intl_fallback_symbol(),
+            this.as_handle().map(Handle::from_raw),
+        ) else {
+            return Ok(formatter);
+        };
+        let key = self.member_key(sym);
+        // DefinePropertyOrThrow: an existing non-configurable own property of the
+        // same name cannot be redefined.
+        if self.realm.get_property(h, &key).is_some()
+            && self.realm.property_is_non_configurable(h, &key)
+        {
+            return Err(self.type_error("Cannot redefine %Intl%.[[FallbackSymbol]]"));
+        }
+        self.realm.set_hidden_property(h, &key, formatter);
+        self.realm.set_readonly_property(h, &key);
+        self.realm.set_non_configurable_property(h, &key);
+        Ok(this)
+    }
+
+    /// `UnwrapNumberFormat` / `UnwrapDateTimeFormat`: `Intl.NumberFormat.prototype`
+    /// `.format`/`.resolvedOptions` accept a legacy-constructed receiver — an object
+    /// that lacks the `[[InitializedNumberFormat]]` slot but is an instance of the
+    /// constructor — by reading the real formatter out of
+    /// `%Intl%.[[FallbackSymbol]]`. The `Get` is a full property read, so a Proxy
+    /// receiver runs its `get` trap.
+    fn unwrap_legacy_intl(
+        &mut self,
+        this: NanBox,
+        marker: &str,
+    ) -> Result<Option<NanBox>, ExecError> {
+        let ctor_id = match marker {
+            "\u{0}brand_nf" => N_INTL_NUMBER_FORMAT,
+            "\u{0}brand_dtf" => N_INTL_DATETIME_FORMAT,
+            _ => return Ok(None),
+        };
+        let Some(h) = this.as_handle().map(Handle::from_raw) else {
+            return Ok(None);
+        };
+        if self.realm.get_property(h, marker).is_some() {
+            return Ok(None);
+        }
+        if !self.intl_proto_on_chain(this, ctor_id)? {
+            return Ok(None);
+        }
+        let Some(sym) = self.intl_fallback_symbol() else {
+            return Ok(None);
+        };
+        let key = self.member_key(sym);
+        Ok(Some(self.read_member(h, &key)?))
+    }
+
     /// RequireInternalSlot for a branded `Intl` receiver: returns the receiver
     /// handle when `this` is an object carrying the hidden `marker`, else a
     /// TypeError. The prototype object itself (which has no marker) is rejected,
@@ -2246,6 +2374,15 @@ impl<'a> Interp<'a> {
             .map(Handle::from_raw)
             .and_then(|h| self.realm.string_value(h))
             .unwrap_or_default();
+        // `Intl.NumberFormat.prototype.resolvedOptions` /
+        // `Intl.DateTimeFormat.prototype.resolvedOptions` accept a
+        // legacy-constructed receiver (Unwrap{Number,DateTime}Format) before the
+        // brand check; the other prototype methods do not.
+        let this = if selector == "resolvedOptions" {
+            self.unwrap_legacy_intl(this, &marker)?.unwrap_or(this)
+        } else {
+            this
+        };
         self.require_intl_slot(this, &marker, "Intl method")?;
         let id = Self::intl_underlying_native(&selector);
         // The underlying method native reads `self.this_val`; preserve the receiver.
@@ -2282,6 +2419,13 @@ impl<'a> Interp<'a> {
             .map(Handle::from_raw)
             .and_then(|h| self.realm.string_value(h))
             .unwrap_or_default();
+        // `get Intl.NumberFormat.prototype.format` / `get …DateTimeFormat…format`
+        // unwrap a legacy-constructed receiver before the brand check.
+        let this = if selector == "format" {
+            self.unwrap_legacy_intl(this, &marker)?.unwrap_or(this)
+        } else {
+            this
+        };
         let inst = self.require_intl_slot(this, &marker, "Intl bound-function getter")?;
         let cache_key = alloc::format!("\u{0}bound_{selector}");
         if let Some(v) = self.realm.get_property(inst, &cache_key) {
@@ -3884,6 +4028,11 @@ impl<'a> Interp<'a> {
                 if sp == ep {
                     return Ok(sp.into_iter().map(|(t, v)| (t, v, "shared")).collect());
                 }
+                // Same date, different time of day: the date is rendered once.
+                let sep = self.dtf_interval_separator(inst);
+                if let Some(v) = Self::dtf_same_day_range(&sp, &ep, &sep) {
+                    return Ok(v);
+                }
                 // Endpoints differ: prefer the crate's CLDR interval patterns when it
                 // resolves a genuine split; otherwise (it only collapsed because the
                 // sole difference is below the minute) fall back to a field-level range
@@ -3897,11 +4046,7 @@ impl<'a> Interp<'a> {
                 for (t, val) in sp {
                     v.push((t, val, "startRange"));
                 }
-                v.push((
-                    "literal",
-                    String::from("\u{2009}\u{2013}\u{2009}"),
-                    "shared",
-                ));
+                v.push(("literal", sep, "shared"));
                 for (t, val) in ep {
                     v.push((t, val, "endRange"));
                 }
@@ -3910,20 +4055,126 @@ impl<'a> Interp<'a> {
         }
         let sp = self.dtf_operand_parts(inst, start, sx_temporal, sx_num)?;
         let ep = self.dtf_operand_parts(inst, end, sy_temporal, sy_num)?;
-        Ok(if sp == ep {
-            sp.into_iter().map(|(t, v)| (t, v, "shared")).collect()
-        } else {
-            let mut v: Vec<(&'static str, String, &'static str)> =
-                Vec::with_capacity(sp.len() + ep.len() + 1);
-            for (t, val) in sp {
-                v.push((t, val, "startRange"));
-            }
-            v.push(("literal", String::from("\u{2013}"), "shared"));
-            for (t, val) in ep {
-                v.push((t, val, "endRange"));
-            }
-            v
-        })
+        if sp == ep {
+            return Ok(sp.into_iter().map(|(t, v)| (t, v, "shared")).collect());
+        }
+        #[cfg(feature = "intl")]
+        let sep = self.dtf_interval_separator(inst);
+        #[cfg(not(feature = "intl"))]
+        let sep = String::from("\u{2013}");
+        #[cfg(feature = "intl")]
+        if let Some(v) = Self::dtf_same_day_range(&sp, &ep, &sep) {
+            return Ok(v);
+        }
+        let mut v: Vec<(&'static str, String, &'static str)> =
+            Vec::with_capacity(sp.len() + ep.len() + 1);
+        for (t, val) in sp {
+            v.push((t, val, "startRange"));
+        }
+        v.push(("literal", sep, "shared"));
+        for (t, val) in ep {
+            v.push((t, val, "endRange"));
+        }
+        Ok(v)
+    }
+
+    /// UTS #35 §2.6.2 date+time interval composition: when a range's two endpoints
+    /// fall on the same date and differ only in the time of day, the date is
+    /// rendered *once* and only the time is ranged — `"8/4/2021, 12:30:45 AM – 11:30:45 PM"`,
+    /// not the date twice. CLDR ships interval patterns for date-only and
+    /// time-only skeletons but none for a combined one (there is no `yMdhms`
+    /// item), so the composition is done here from the two endpoints' own
+    /// crate-produced field parts: the common date prefix (up to and including the
+    /// date/time connector literal) becomes `shared`, the two time tails
+    /// `startRange`/`endRange`.
+    ///
+    /// `None` when the shape does not apply — the dates differ, there are no time
+    /// fields, the formatter is time-only, or the locale pattern puts a date field
+    /// after a time field — leaving the caller's ordinary interval-pattern path in
+    /// charge.
+    #[cfg(feature = "intl")]
+    fn dtf_same_day_range(
+        sp: &[(&'static str, String)],
+        ep: &[(&'static str, String)],
+        sep: &str,
+    ) -> Option<Vec<(&'static str, String, &'static str)>> {
+        fn is_time(t: &str) -> bool {
+            matches!(
+                t,
+                "hour" | "minute" | "second" | "fractionalSecond" | "dayPeriod" | "timeZoneName"
+            )
+        }
+        fn is_date(t: &str) -> bool {
+            matches!(
+                t,
+                "weekday" | "era" | "year" | "month" | "day" | "relatedYear" | "yearName"
+            )
+        }
+        let i = sp.iter().position(|(t, _)| is_time(t))?;
+        let j = ep.iter().position(|(t, _)| is_time(t))?;
+        // A time-first (or date-interleaved) locale pattern cannot be split this way.
+        if i == 0 || i != j || sp[i..].iter().chain(&ep[j..]).any(|(t, _)| is_date(t)) {
+            return None;
+        }
+        // Only a pure time-of-day difference composes; anything else is a genuine
+        // date range and belongs to the CLDR interval patterns.
+        if sp[..i] != ep[..j] || sp[i..] == ep[j..] {
+            return None;
+        }
+        let mut v: Vec<(&'static str, String, &'static str)> =
+            Vec::with_capacity(sp.len() + ep.len() + 1);
+        for (t, val) in &sp[..i] {
+            v.push((t, val.clone(), "shared"));
+        }
+        for (t, val) in &sp[i..] {
+            v.push((t, val.clone(), "startRange"));
+        }
+        v.push(("literal", String::from(sep), "shared"));
+        for (t, val) in &ep[j..] {
+            v.push((t, val.clone(), "endRange"));
+        }
+        Some(v)
+    }
+
+    /// The locale's CLDR date-interval separator (`"\u{2009}–\u{2009}"` for `en`).
+    /// Read out of the `intl` crate's interval patterns — by formatting a synthetic
+    /// one-day numeric-date range and taking the `shared` literal — rather than
+    /// hard-coded, so the field-level range fallback (Temporal endpoints,
+    /// non-Gregorian calendars, and sub-minute differences the crate's
+    /// greatest-difference search misses) joins its two halves exactly the way the
+    /// crate-driven Gregorian path does. Without that agreement a formatter reports
+    /// two different separators depending on the endpoint kind.
+    #[cfg(feature = "intl")]
+    fn dtf_interval_separator(&mut self, inst: Handle) -> String {
+        use intl::datetime::{
+            DateTime, DateTimeFormatOptions, DateTimePartType, MonthStyle, Numeric2Digit,
+            RangeSource, format_range_to_parts,
+        };
+        let locale = self
+            .realm
+            .get_property(inst, "\u{0}locale")
+            .map_or_else(|| String::from("en"), |v| self.realm.to_display_string(v));
+        let mut o = DateTimeFormatOptions::default();
+        o.year = Some(Numeric2Digit::Numeric);
+        o.month = Some(MonthStyle::Numeric);
+        o.day = Some(Numeric2Digit::Numeric);
+        let a = DateTime {
+            year: 2021,
+            month: 8,
+            day: 4,
+            ..DateTime::default()
+        };
+        let b = DateTime { day: 5, ..a };
+        format_range_to_parts(&locale, &a, &b, &o)
+            .ok()
+            .and_then(|ps| {
+                ps.into_iter()
+                    .find(|p| {
+                        p.kind == DateTimePartType::Literal && p.source == RangeSource::Shared
+                    })
+                    .map(|p| p.value)
+            })
+            .unwrap_or_else(|| String::from("\u{2009}\u{2013}\u{2009}"))
     }
 
     /// The tagged range parts for a Gregorian, number-valued `DateTimeFormat` range,
@@ -3936,10 +4187,28 @@ impl<'a> Interp<'a> {
         sx_num: f64,
         sy_num: f64,
     ) -> Vec<(&'static str, String, &'static str)> {
-        use intl::datetime::{self, DateTimePartType};
         let (locale, dt1, o) = self.dtf_locale_dt_opts(inst, sx_num);
         let (_, dt2, _) = self.dtf_locale_dt_opts(inst, sy_num);
-        let raw = match datetime::format_range_to_parts(&locale, &dt1, &dt2, &o) {
+        self.dtf_crate_range_parts(inst, &locale, &dt1, &dt2, &o)
+    }
+
+    /// The shared back half of the crate-driven range paths: runs the `intl`
+    /// crate's CLDR interval formatter over an already-built
+    /// `(locale, start, end, options)` and normalizes the parts the same way
+    /// [`dtf_pad_time_parts`] normalizes single-date parts (2-digit
+    /// minute/second widening, U+202F folding), then maps digits through the
+    /// instance's numbering system.
+    #[cfg(feature = "intl")]
+    fn dtf_crate_range_parts(
+        &mut self,
+        inst: Handle,
+        locale: &str,
+        dt1: &intl::datetime::DateTime,
+        dt2: &intl::datetime::DateTime,
+        o: &intl::datetime::DateTimeFormatOptions,
+    ) -> Vec<(&'static str, String, &'static str)> {
+        use intl::datetime::{self, DateTimePartType};
+        let raw = match datetime::format_range_to_parts(locale, dt1, dt2, o) {
             Ok(parts) => parts,
             Err(_) => return Vec::new(),
         };
@@ -3959,6 +4228,9 @@ impl<'a> Interp<'a> {
                 let mut v = p.value;
                 if widen && v.len() == 1 && v.as_bytes()[0].is_ascii_digit() {
                     v.insert(0, '0');
+                }
+                if p.kind == DateTimePartType::Literal && v.contains('\u{202f}') {
+                    v = v.replace('\u{202f}', " ");
                 }
                 let value = self.apply_numbering_digits(inst, v);
                 (p.kind.as_str(), value, p.source.as_str())
@@ -4876,7 +5148,6 @@ impl<'a> Interp<'a> {
         handle: Handle,
         ms: f64,
     ) -> Vec<(&'static str, String)> {
-        use intl::datetime;
         let (locale, dt, o) = self.dtf_locale_dt_opts(handle, ms);
         // Chinese/Dangi lunisolar calendars: the crate's `format_to_parts` renders
         // only proleptic Gregorian, so derive the `relatedYear`/`yearName` (+ numeric
@@ -4884,10 +5155,200 @@ impl<'a> Interp<'a> {
         if let Some(p) = self.lunisolar_parts(handle, &locale, &dt, &o) {
             return p;
         }
-        match datetime::format_to_parts(&locale, &dt, &o) {
+        Self::dtf_crate_parts(&locale, &dt, &o)
+    }
+
+    /// Runs the `intl` crate's CLDR date-time formatter and repairs the shapes it
+    /// cannot express on its own, so every `Intl.DateTimeFormat` rendering path
+    /// (legacy `Date`, Temporal, `toLocaleString`) agrees:
+    ///
+    /// * a `dayPeriod`-only options set, and the stale `midnight` override — see
+    ///   [`day_period_text`](Self::day_period_text);
+    /// * an options set whose time skeleton has no CLDR `availableFormat` (a lone
+    ///   `minute`/`second`/`fractionalSecondDigits`) — see
+    ///   [`lone_time_field_parts`](Self::lone_time_field_parts);
+    /// * a BCE year, which is era-relative rather than astronomical — see
+    ///   [`fix_bce_era_year`](Self::fix_bce_era_year).
+    #[cfg(feature = "intl")]
+    fn dtf_crate_parts(
+        locale: &str,
+        dt: &intl::datetime::DateTime,
+        o: &intl::datetime::DateTimeFormatOptions,
+    ) -> Vec<(&'static str, String)> {
+        // A `dayPeriod`-only options set renders exactly the flexible day period.
+        if o.day_period.is_some() && Self::day_period_is_only_field(o) {
+            return match Self::day_period_text(locale, dt, o) {
+                Some(v) => alloc::vec![("dayPeriod", v)],
+                None => Vec::new(),
+            };
+        }
+        let mut parts = match intl::datetime::format_to_parts(locale, dt, o) {
             Ok(parts) => dtf_pad_time_parts(parts),
             Err(_) => Vec::new(),
+        };
+        if parts.is_empty()
+            && let Some(p) = Self::lone_time_field_parts(locale, dt, o)
+        {
+            return p;
         }
+        // Midnight correction (see [`day_period_text`]).
+        if o.day_period.is_some()
+            && dt.hour == 0
+            && (dt.minute, dt.second, dt.millisecond) == (0, 0, 0)
+            && let Some(fixed) = Self::day_period_text(locale, dt, o)
+        {
+            for p in &mut parts {
+                if p.0 == "dayPeriod" {
+                    p.1.clone_from(&fixed);
+                }
+            }
+        }
+        Self::fix_bce_era_year(dt, &mut parts);
+        parts
+    }
+
+    /// The proleptic Gregorian calendar has no year 0, so UTS #35's `y` field is
+    /// the *era-relative* year: ISO year 0 renders as `1 BC`, ISO −271821 as
+    /// `271822 BC`. The `intl` crate renders the raw astronomical year (its era
+    /// field is already BCE-correct), so rewrite the year part here — matching the
+    /// crate's own two-digit (`yy`) rendering when that is what it produced, so a
+    /// `dateStyle: "short"` date is converted as well.
+    #[cfg(feature = "intl")]
+    fn fix_bce_era_year(dt: &intl::datetime::DateTime, parts: &mut [(&'static str, String)]) {
+        if dt.year > 0 {
+            return;
+        }
+        let era_year = 1 - i64::from(dt.year);
+        let astro_full = alloc::format!("{}", dt.year);
+        let astro_two = alloc::format!("{:02}", dt.year.rem_euclid(100));
+        for p in parts.iter_mut() {
+            if p.0 != "year" {
+                continue;
+            }
+            if p.1 == astro_full {
+                p.1 = alloc::format!("{era_year}");
+            } else if p.1 == astro_two {
+                p.1 = alloc::format!("{:02}", era_year.rem_euclid(100));
+            }
+        }
+    }
+
+    /// Renders an options set whose time skeleton CLDR has no `availableFormat`
+    /// for — a lone `minute`, `second` or `fractionalSecondDigits`. The `intl`
+    /// crate resolves a skeleton strictly through the CLDR `availableFormats`
+    /// table (it does not synthesize a pattern the way ICU's
+    /// `DateTimePatternGenerator` does), so `{ second: "numeric" }` resolves to a
+    /// *date* pattern that then has every field stripped, i.e. an empty string.
+    ///
+    /// The fields are recovered from a probe with the full `hour`/`minute`/`second`
+    /// skeleton (which every locale has), keeping the span from the first to the
+    /// last *requested* field and dropping the separators that bordered a dropped
+    /// field. The probe forces the numeric width because a lone field is never
+    /// zero-padded (`{ second: "2-digit" }` renders `6`, not `06` — padding is a
+    /// property of the abutting pattern, not of the option).
+    #[cfg(feature = "intl")]
+    fn lone_time_field_parts(
+        locale: &str,
+        dt: &intl::datetime::DateTime,
+        o: &intl::datetime::DateTimeFormatOptions,
+    ) -> Option<Vec<(&'static str, String)>> {
+        use intl::datetime::{DateTimePartType, Numeric2Digit};
+        if o.date_style.is_some() || o.time_style.is_some() {
+            return None;
+        }
+        let wants = |k: DateTimePartType| match k {
+            DateTimePartType::Hour => o.hour.is_some(),
+            DateTimePartType::Minute => o.minute.is_some(),
+            DateTimePartType::Second => o.second.is_some(),
+            DateTimePartType::FractionalSecond => o.fractional_second_digits.is_some(),
+            DateTimePartType::DayPeriod => o.day_period.is_some(),
+            _ => false,
+        };
+        let mut probe = *o;
+        probe.hour = Some(Numeric2Digit::Numeric);
+        probe.minute = Some(Numeric2Digit::Numeric);
+        probe.second = Some(Numeric2Digit::Numeric);
+        let parts = intl::datetime::format_to_parts(locale, dt, &probe).ok()?;
+        let first = parts.iter().position(|p| wants(p.kind))?;
+        let last = parts.iter().rposition(|p| wants(p.kind))?;
+        let mut out: Vec<(&'static str, String)> = Vec::new();
+        let mut pending: Option<String> = None;
+        for p in &parts[first..=last] {
+            if p.kind == DateTimePartType::Literal {
+                pending = Some(p.value.clone());
+            } else if wants(p.kind) {
+                if let Some(l) = pending.take()
+                    && !out.is_empty()
+                {
+                    out.push(("literal", l));
+                }
+                out.push((p.kind.as_str(), p.value.clone()));
+            } else {
+                pending = None;
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// Whether `dayPeriod` is the *only* field an `Intl.DateTimeFormat` asked for
+    /// (`new Intl.DateTimeFormat("en", { dayPeriod: "long" })`), which per
+    /// ECMA-402 renders the flexible day period and nothing else.
+    #[cfg(feature = "intl")]
+    fn day_period_is_only_field(o: &intl::datetime::DateTimeFormatOptions) -> bool {
+        o.weekday.is_none()
+            && o.era.is_none()
+            && o.year.is_none()
+            && o.month.is_none()
+            && o.day.is_none()
+            && o.hour.is_none()
+            && o.minute.is_none()
+            && o.second.is_none()
+            && o.fractional_second_digits.is_none()
+            && o.time_zone_name.is_none()
+            && o.date_style.is_none()
+            && o.time_style.is_none()
+    }
+
+    /// The CLDR flexible day-period text ("in the morning", "noon", "at night")
+    /// for `dt` at the width `o.day_period` requests.
+    ///
+    /// Two `intl`-crate quirks are routed around, without inventing any locale
+    /// string — the text always comes from the crate's CLDR tables:
+    ///
+    /// * the crate builds its time skeleton from `hour`/`minute`/`second` only, so
+    ///   an options set carrying no time field resolves to a *date* pattern that
+    ///   then has every field stripped. A synthetic 12-hour `hour` field is what
+    ///   pulls CLDR's flexible day-period field `B` into the pattern.
+    /// * the crate applies a `midnight` override to `B` at exactly 00:00:00.000.
+    ///   CLDR removed `midnight` from the day-period *format* rules (it survives
+    ///   only for the `b` field), so `B` at midnight must come from the ordinary
+    ///   range rules — which is what the crate yields one millisecond later. The
+    ///   `noon` override at 12:00 is still current CLDR and is left alone.
+    #[cfg(feature = "intl")]
+    fn day_period_text(
+        locale: &str,
+        dt: &intl::datetime::DateTime,
+        o: &intl::datetime::DateTimeFormatOptions,
+    ) -> Option<String> {
+        use intl::datetime::{DateTimePartType, HourCycle, Numeric2Digit};
+        o.day_period?;
+        let mut probe = *o;
+        probe.hour = Some(Numeric2Digit::Numeric);
+        probe.hour12 = Some(true);
+        probe.hour_cycle = Some(HourCycle::H12);
+        probe.fractional_second_digits = None;
+        probe.time_zone_name = None;
+        probe.date_style = None;
+        probe.time_style = None;
+        let mut when = *dt;
+        if when.hour == 0 && (when.minute, when.second, when.millisecond) == (0, 0, 0) {
+            when.millisecond = 1;
+        }
+        intl::datetime::format_to_parts(locale, &when, &probe)
+            .ok()?
+            .into_iter()
+            .find(|p| p.kind == DateTimePartType::DayPeriod)
+            .map(|p| p.value)
     }
 
     /// Builds the `intl` crate `(locale, DateTime, DateTimeFormatOptions)` for
@@ -5543,7 +6004,7 @@ impl<'a> Interp<'a> {
         ms: f64,
         o: &intl::datetime::DateTimeFormatOptions,
     ) -> Vec<(&'static str, String)> {
-        use intl::datetime::{self, DateTime};
+        use intl::datetime::DateTime;
         let locale = self
             .realm
             .get_property(handle, "\u{0}locale")
@@ -5572,10 +6033,7 @@ impl<'a> Interp<'a> {
         if let Some(alt) = self.alt_calendar_date_parts(handle, &locale, &dt, o) {
             return alt;
         }
-        match datetime::format_to_parts(&locale, &dt, o) {
-            Ok(parts) => dtf_pad_time_parts(parts),
-            Err(_) => Vec::new(),
-        }
+        Self::dtf_crate_parts(&locale, &dt, o)
     }
 
     /// Renders the date portion of a Temporal object whose resolved `Intl`
@@ -5963,8 +6421,10 @@ impl<'a> Interp<'a> {
                 time.push(("second", two(second)));
             }
             if h12 {
-                // CLDR separates the time from AM/PM with U+202F (narrow no-break space).
-                time.push(lit("\u{202f}"));
+                // CLDR separates the time from AM/PM with U+202F (narrow no-break
+                // space); like the `intl`-crate path (see `dtf_pad_time_parts`)
+                // this is folded to a plain space to match the reference engine.
+                time.push(lit(" "));
                 time.push((
                     "dayPeriod",
                     String::from(if hour24 < 12 { "AM" } else { "PM" }),

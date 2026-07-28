@@ -833,6 +833,84 @@ fn intl_datetime_is_locale_aware() {
     );
 }
 
+/// `Intl.DateTimeFormat` field shapes the CLDR `availableFormats` table has no
+/// entry for: the flexible day period on its own, and a lone `minute`/`second`/
+/// `fractionalSecondDigits` (never zero-padded, whatever width was asked for).
+#[cfg(feature = "intl")]
+#[test]
+fn intl_datetime_lone_field_options() {
+    let src = r#"
+        const t = new Date(Date.UTC(2024,0,1,2,35,6,789));
+        const f = o => new Intl.DateTimeFormat("en", Object.assign({timeZone:"UTC"}, o)).format(t);
+        console.log([f({dayPeriod:"long"}), f({minute:"numeric"}), f({second:"2-digit"}),
+                     f({fractionalSecondDigits:3}), f({second:"numeric",fractionalSecondDigits:2})].join("|"))
+    "#;
+    assert_eq!(out(src), "in the morning|35|6|789|6.78\n");
+    // CLDR dropped the `midnight` day-period *format* rule; 00:00 is `morning1`.
+    assert_eq!(
+        out(
+            r#"console.log(new Intl.DateTimeFormat("en",{timeZone:"UTC",dayPeriod:"long"}).format(new Date(0)))"#
+        ),
+        "in the morning\n"
+    );
+}
+
+/// The proleptic Gregorian calendar has no year 0: the `year` field is
+/// era-relative, so ISO year 0 renders as `1 BC` (and `01` two-digit).
+#[cfg(feature = "intl")]
+#[test]
+fn intl_datetime_bce_era_year() {
+    let src = r#"
+        const d = new Date(-62151602400000);
+        const a = new Intl.DateTimeFormat("en-US",{timeZone:"UTC",year:"numeric",era:"short"}).format(d);
+        const b = new Intl.DateTimeFormat("en-US",{timeZone:"UTC",year:"2-digit"}).format(d);
+        console.log(a + "|" + b)
+    "#;
+    assert_eq!(out(src), "1 BC|01\n");
+}
+
+/// A `formatRange` whose endpoints share a date and differ only in the time of
+/// day renders the date once (UTS #35 §2.6.2 date+time interval composition).
+#[cfg(feature = "intl")]
+#[test]
+fn intl_datetime_same_day_range() {
+    let src = r#"
+        const f = new Intl.DateTimeFormat("en-US",{timeZone:"UTC",year:"numeric",month:"numeric",
+            day:"numeric",hour:"numeric",minute:"numeric"});
+        console.log(f.formatRange(Date.UTC(2021,7,4,0,30), Date.UTC(2021,7,4,23,30)))
+    "#;
+    assert_eq!(
+        out(src),
+        "8/4/2021, 12:30 AM\u{2009}\u{2013}\u{2009}11:30 PM\n"
+    );
+}
+
+/// The ECMA-402 normative-optional legacy constructor mode: calling
+/// `Intl.NumberFormat` as a function on an existing instance stashes the new
+/// formatter under `%Intl%.[[FallbackSymbol]]` and returns the receiver, and
+/// `resolvedOptions` unwraps it again on a receiver that has no
+/// `[[InitializedNumberFormat]]` of its own.
+#[cfg(feature = "intl")]
+#[test]
+fn intl_legacy_constructed_symbol() {
+    let src = r#"
+        const bare = Object.create(Intl.NumberFormat.prototype);
+        const r = Intl.NumberFormat.call(bare, "de");
+        const s = Object.getOwnPropertySymbols(r);
+        const d = Object.getOwnPropertyDescriptor(r, s[0]);
+        // A receiver that *is* already a NumberFormat keeps its own slots.
+        const own = new Intl.NumberFormat("fr");
+        Intl.NumberFormat.call(own, "de");
+        console.log([r === bare, s.length, s[0].description, d.writable, d.enumerable, d.configurable,
+                     Intl.NumberFormat.prototype.resolvedOptions.call(r).locale,
+                     own.resolvedOptions().locale].join("|"))
+    "#;
+    assert_eq!(
+        out(src),
+        "true|1|IntlLegacyConstructedSymbol|false|false|false|de|fr\n"
+    );
+}
+
 /// With the `intl` crate, `Intl.DisplayNames` / `Intl.ListFormat` are locale-aware (the
 /// en-only fallback ignores the locale argument).
 #[cfg(feature = "intl")]
@@ -4094,10 +4172,11 @@ fn date_string_methods() {
         "Thu, 01 Jan 1970 00:00:00 GMT"
     );
     // toLocaleString now routes through a real DateTimeFormat: the en-US default
-    // is 12-hour with a narrow no-break space (U+202F) before the day period.
+    // is 12-hour. CLDR's U+202F before the day period is folded to a plain space
+    // to match the reference engine (see `dtf_pad_time_parts`).
     assert_eq!(
         run("new Date(Date.UTC(2020,5,15,10,30,45)).toLocaleString()"),
-        "6/15/2020, 10:30:45\u{202f}AM"
+        "6/15/2020, 10:30:45 AM"
     );
     assert_eq!(
         run("new Date(Date.UTC(2020,5,15)).toLocaleDateString()"),
