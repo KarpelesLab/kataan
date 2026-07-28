@@ -1055,21 +1055,29 @@ impl<'a> Interp<'a> {
             Some(Status::Linked) => {}
             _ => return Err(self.syntax_error(&alloc::format!("module {key} not linked"))),
         }
-        // Evaluate dependencies first (post-order). A *deferred* import
-        // (`import defer`) is NOT in the eager evaluation list — its module is
-        // evaluated lazily when its namespace is first accessed. (Per spec only
-        // the deferred module's *async* transitive deps are pre-evaluated; the
-        // sync-only graphs the fixtures use have none.)
-        let deps: Vec<String> = {
-            let r = &self.modules.records[key];
-            // Evaluate dependencies in source order (`[[RequestedModules]]`),
-            // excluding deferred imports (evaluated lazily on namespace access).
-            r.requested
-                .iter()
-                .filter(|(_, deferred)| !deferred)
-                .map(|(k, _)| k.clone())
-                .collect()
-        };
+        // Evaluate dependencies first (post-order), in source order
+        // (`[[RequestedModules]]`). A *deferred* import (`import defer`) is not
+        // itself evaluated here — that happens lazily on first namespace access —
+        // but its **asynchronous** transitive dependencies still are, because a
+        // module with top-level await cannot be evaluated synchronously later when
+        // the namespace is touched. That is
+        // `GatherAsynchronousTransitiveDependencies`.
+        let requested: Vec<(String, bool)> = self.modules.records[key].requested.clone();
+        let mut deps: Vec<String> = Vec::new();
+        for (dep_key, deferred) in &requested {
+            if *deferred {
+                let mut seen = alloc::collections::BTreeSet::new();
+                let mut gathered = Vec::new();
+                self.gather_async_transitive_deps(dep_key, &mut seen, &mut gathered);
+                for m in gathered {
+                    if !deps.contains(&m) {
+                        deps.push(m);
+                    }
+                }
+            } else {
+                deps.push(dep_key.clone());
+            }
+        }
         // Mark Evaluating up front to break cycles (and so a deferred-namespace
         // access of this in-flight module throws a TypeError).
         if let Some(r) = self.modules.records.get_mut(key) {
@@ -1100,6 +1108,43 @@ impl<'a> Interp<'a> {
     /// resolves/rejects), preserving the synchronous-completion contract the
     /// depth-first `evaluate_module` relies on for a dependency; the entry's
     /// trailing reactions (`$DONE`, further `.then`s) drain in `evaluate_entry`.
+    /// `GatherAsynchronousTransitiveDependencies(module, seen)` — the modules
+    /// reachable from `key` that must be evaluated *eagerly* even though `key`
+    /// itself sits behind a deferred import, because they have top-level await.
+    ///
+    /// A deferred module is normally evaluated on first namespace access, which is
+    /// a synchronous operation; a module with TLA cannot be evaluated
+    /// synchronously, so the spec hoists those out of the deferral and evaluates
+    /// them with the importing module. Walking stops at the first module with TLA
+    /// on each path — evaluating it will evaluate its own dependencies anyway —
+    /// and at any module already evaluating or evaluated.
+    fn gather_async_transitive_deps(
+        &self,
+        key: &str,
+        seen: &mut alloc::collections::BTreeSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        if !seen.insert(String::from(key)) {
+            return;
+        }
+        let Some(r) = self.modules.records.get(key) else {
+            return;
+        };
+        if matches!(r.status, Status::Evaluating | Status::Evaluated) {
+            return;
+        }
+        if matches!(r.kind, ModuleKind::JavaScript) && module_body_has_await(&r.program.body) {
+            if !out.iter().any(|m| m == key) {
+                out.push(String::from(key));
+            }
+            return;
+        }
+        let requested: Vec<String> = r.requested.iter().map(|(k, _)| k.clone()).collect();
+        for dep in &requested {
+            self.gather_async_transitive_deps(dep, seen, out);
+        }
+    }
+
     fn run_module_body(&mut self, key: &str) -> Result<(), ExecError> {
         let is_tla = {
             let r = &self.modules.records[key];
@@ -1910,7 +1955,16 @@ impl<'a> Interp<'a> {
                 .map_err(|e| this.type_error(&e))?;
             this.load_module(&dep, &host, None)?;
             this.link_module(&dep)?;
-            // Deliberately NOT evaluated — deferred until first namespace access.
+            // Deliberately NOT evaluated — deferred until first namespace access —
+            // except for the asynchronous transitive dependencies, which cannot be
+            // evaluated synchronously when that access happens and so are hoisted
+            // out of the deferral exactly as for a static `import defer`.
+            let mut seen = alloc::collections::BTreeSet::new();
+            let mut gathered = Vec::new();
+            this.gather_async_transitive_deps(&dep, &mut seen, &mut gathered);
+            for m in &gathered {
+                this.evaluate_module(m)?;
+            }
             this.deferred_namespace_object(&dep)
         })(self);
         match outcome {
