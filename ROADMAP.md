@@ -374,6 +374,19 @@ helper edges, `Iterator.zip`/`zipKeyed`), **String** (54), **Function** (59 —
   whose receiver matters. (`Array.of` now honors a constructor receiver via
   `this_val`, like `Array.from`.)
 
+- **Global-object tampering — the write-side design landed.** Reflecting the
+  global object into identifier *reads* was tried and dropped: it leaked a
+  tampered global into the engine's own intrinsic use and broke dynamic import.
+  The direction that works is the **write** side — `globalThis.X = v` mirrors
+  into the declarative global binding, so identifier reads stay on the plain
+  binding path and never consult the global object. The paired guard is that
+  internal machinery must hold captured intrinsics rather than live global
+  bindings: `fresh_promise` now links `%Promise.prototype%` from the intrinsics
+  snapshot instead of reading global `Promise`, which is exactly the coupling
+  that sank the read-side attempt. `Object/{entries,values,
+  getOwnPropertyDescriptors}/tamper-with-global-object` pass (1509e251). Any
+  further internal use of a live global binding is the same latent bug.
+
 ### 3.8 Resizable / shared memory & atomics (skip-gated today)
 
 - **Resizable/growable `ArrayBuffer`:** length-tracking is partly in; the
