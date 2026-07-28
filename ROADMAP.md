@@ -652,33 +652,34 @@ regex match/replace/split path, and `Array.prototype.push`/`pop`. What remains:
   cold-start vs `node -e` / `bun`; code-cache load/evict/reload throughput;
   per-object memory vs V8/JSC heaps.
 
-### 5.2 The regex subject is rebuilt on every call
+### 5.2 Regex throughput — **the algorithmic gaps are closed**
 
-`regex_method` (and the `nbexec` twin) transcodes the whole subject to a fresh
-`Vec<u16>` per `test`/`exec`, because the matcher takes `&[u16]`. So the cost of
-a match is O(subject length) *even when the match itself is O(1)* — after the
-anchoring fix (ad422b64) that buffer is the entire remaining cost of an anchored
-`test`: 4000 tests over a 10 MB string spend ~67 s copying ~80 GB, against node's
-23 ms.
+Four O(subject) costs on matches that should be O(1) are fixed: the scan retried
+every offset for a `^`-anchored pattern (ad422b64), the subject was transcoded to
+`Vec<u16>` per call in both tiers (954252dc), offsets that cannot start a match
+were not skipped (ea252b82), and every attempt allocated three working vectors
+(563db978). Against node on a 10 MB subject:
 
-Two shapes, and the cheap-looking one is a trap:
+| | node | before | now |
+| --- | --- | --- | --- |
+| 4000 anchored `test` | 3 ms | >120 s | 19 ms |
+| 20 unanchored scans | 37 ms | 3306 ms | 37 ms |
 
-- **Cache the units on the string.** Precedent exists (`Cell::RegExp` caches its
-  compiled program the same way), but so does a scar: the rope `charCodeAt` memo
-  made repeated access 7× faster and took peak RSS from 17.6 MB to 1.5 GB, and
-  was reverted. A units cache doubles the footprint of every string a regex ever
-  touches. If it is done at all it wants a *bounded* cache — one slot, or an LRU
-  of a few — keyed so a freed-and-reused handle cannot alias, not a per-cell
-  field.
-- **Make the subject lazy.** Give the matcher a cursor over the string's WTF-8
-  bytes instead of a materialized slice, so it reads only the units it visits.
-  This is the real fix — it makes an anchored or early-failing match genuinely
-  O(match), not O(subject) — and it is a refactor of the matcher's input API
-  (`captures_in_u16` and friends) rather than a cache with an invalidation
-  problem.
+What remains is **constant-factor**, not algorithmic — `split`, global `replace`
+and an `exec` loop are all linear in subject length, just 12–78× slower per unit
+of work (600 KB: split 7 ms vs 565 ms, replace 16 ms vs 201 ms, exec loop 5 ms vs
+185 ms). That is match-object construction, string allocation and interpreter
+dispatch, so it belongs to §5.1 and the JIT rather than here.
 
-The same materialization sits behind `split`/`replace`/`match`, so the lazy path
-would pay off across all of them.
+Two contained pieces of headroom are still specific to the matcher:
+
+- **Extend the start filter to classes.** `program_first_unit` only fires on a
+  single required literal, so `/\s+/` — the `split` case above — filters nothing.
+  A first-unit *set* (a 256-bit map for Latin-1, plus a fallback predicate) would
+  cover classes and character-class-led alternations.
+- **Widen the filter to a literal prefix.** Matching `abc` at an offset whose
+  next two units cannot continue it still starts the matcher; a short memcmp
+  first would cut that.
 
 ---
 
