@@ -817,6 +817,55 @@ impl Realm {
             .alloc(Cell::Bytes(crate::cell::ByteStore::Owned(data)))
     }
 
+    /// Allocates the zeroed data block of a `SharedArrayBuffer` — a refcounted
+    /// [`crate::cell::SharedBlock`] so the *same* bytes can also back an
+    /// `ArrayBuffer` object in another agent's heap (see
+    /// [`Realm::new_bytes_over_shared`]).
+    pub fn new_shared_bytes(&mut self, len: usize) -> Handle {
+        let block = alloc::sync::Arc::new(crate::cell::SharedBlock::zeroed(len));
+        self.heap
+            .alloc(Cell::Bytes(crate::cell::ByteStore::Shared(block)))
+    }
+
+    /// Allocates a byte store over an *existing* shared data block — how a
+    /// broadcast `SharedArrayBuffer` is re-materialized in the receiving agent's
+    /// heap without copying its bytes.
+    pub fn new_bytes_over_shared(
+        &mut self,
+        block: alloc::sync::Arc<crate::cell::SharedBlock>,
+    ) -> Handle {
+        self.heap
+            .alloc(Cell::Bytes(crate::cell::ByteStore::Shared(block)))
+    }
+
+    /// Converts the engine-owned byte store at `handle` into a *shared* data
+    /// block, preserving its bytes and its cell identity (so existing views stay
+    /// valid). Used where an engine-owned buffer becomes a `SharedArrayBuffer`
+    /// after the fact, e.g. `SharedArrayBuffer.prototype.slice`'s copy.
+    pub fn make_bytes_shared(&mut self, handle: Handle) {
+        let data = match self.heap.get(handle) {
+            Some(Cell::Bytes(crate::cell::ByteStore::Owned(v))) => v.clone(),
+            _ => return,
+        };
+        let block = alloc::sync::Arc::new(crate::cell::SharedBlock::zeroed(data.len()));
+        block.as_mut_slice().copy_from_slice(&data);
+        if let Some(cell) = self.heap.get_mut(handle) {
+            *cell = Cell::Bytes(crate::cell::ByteStore::Shared(block));
+        }
+    }
+
+    /// The shared data block backing the byte store at `handle`, if it is one.
+    #[must_use]
+    pub fn shared_block_at(
+        &self,
+        handle: Handle,
+    ) -> Option<alloc::sync::Arc<crate::cell::SharedBlock>> {
+        match self.heap.get(handle) {
+            Some(Cell::Bytes(crate::cell::ByteStore::Shared(b))) => Some(b.clone()),
+            _ => None,
+        }
+    }
+
     /// Allocates a byte store that wraps an external, caller-owned region
     /// zero-copy (e.g. IPC shared memory). The engine reads/writes the region in
     /// place and runs `free` (if any) when the cell is collected.
@@ -858,6 +907,12 @@ impl Realm {
         match self.heap.get_mut(handle).and_then(Cell::as_byte_store_mut) {
             Some(crate::cell::ByteStore::Owned(v)) => {
                 v.resize(new_len, 0);
+                true
+            }
+            // A growable `SharedArrayBuffer`: resize the shared block in place, so
+            // every agent's view of it grows together.
+            Some(crate::cell::ByteStore::Shared(b)) => {
+                b.resize(new_len);
                 true
             }
             _ => false,

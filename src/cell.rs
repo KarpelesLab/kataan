@@ -85,6 +85,73 @@ pub enum ByteStore {
     Owned(Vec<u8>),
     /// A zero-copy wrapper over a caller-owned region.
     External(ExternalBytes),
+    /// The data block of a `SharedArrayBuffer`: refcounted so the *same* bytes
+    /// can back an `ArrayBuffer` object in more than one agent's heap (each agent
+    /// has its own [`crate::heap::Heap`], but they share this block — exactly the
+    /// spec's "the same Shared Data Block").
+    Shared(alloc::sync::Arc<SharedBlock>),
+}
+
+/// The data block behind a `SharedArrayBuffer`, shareable between agents.
+///
+/// Agents are real OS threads (see `nbexec::agent_pool`), but the engine runs
+/// **at most one agent at a time**: every agent must hold the pool's single
+/// execution token ("the baton") to run JS, and the baton is a `Mutex`-backed
+/// lock, so each handoff is a release/acquire pair that establishes
+/// happens-before between the agents. Accesses to this block therefore never
+/// race, even though the type is `Sync`; this is the same audited-primitive
+/// posture as [`ByteStore::External`], with the baton standing in for the
+/// caller's validity contract.
+pub struct SharedBlock {
+    data: core::cell::UnsafeCell<Vec<u8>>,
+}
+
+// SAFETY: see the type docs — the agent baton serializes every access to `data`
+// and orders it across threads, so no two agents ever touch it concurrently.
+#[allow(unsafe_code)]
+unsafe impl Send for SharedBlock {}
+// SAFETY: as `Send`.
+#[allow(unsafe_code)]
+unsafe impl Sync for SharedBlock {}
+
+impl SharedBlock {
+    /// A zeroed block of `len` bytes.
+    #[must_use]
+    pub fn zeroed(len: usize) -> Self {
+        SharedBlock {
+            data: core::cell::UnsafeCell::new(alloc::vec![0u8; len]),
+        }
+    }
+
+    /// A read view of the block.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: the baton grants the calling agent exclusive access (type docs).
+        #[allow(unsafe_code)]
+        unsafe {
+            &*self.data.get()
+        }
+    }
+
+    /// A mutable view of the block.
+    #[must_use]
+    #[allow(clippy::mut_from_ref)]
+    pub fn as_mut_slice(&self) -> &mut [u8] {
+        // SAFETY: the baton grants the calling agent exclusive access (type docs).
+        #[allow(unsafe_code)]
+        unsafe {
+            &mut *self.data.get()
+        }
+    }
+
+    /// Resizes the block to `new_len`, zero-filling on growth (SAB `grow`).
+    pub fn resize(&self, new_len: usize) {
+        // SAFETY: the baton grants the calling agent exclusive access (type docs).
+        #[allow(unsafe_code)]
+        unsafe {
+            (*self.data.get()).resize(new_len, 0);
+        }
+    }
 }
 
 /// A zero-copy wrapper over an external byte region (see [`ByteStore::External`]).
@@ -115,6 +182,7 @@ impl ByteStore {
         match self {
             ByteStore::Owned(v) => v.len(),
             ByteStore::External(e) => e.len,
+            ByteStore::Shared(b) => b.as_slice().len(),
         }
     }
 
@@ -134,6 +202,7 @@ impl ByteStore {
             // crate's `unsafe_code = "deny"` policy).
             #[allow(unsafe_code)]
             ByteStore::External(e) => unsafe { core::slice::from_raw_parts(e.ptr, e.len) },
+            ByteStore::Shared(b) => b.as_slice(),
         }
     }
 
@@ -144,6 +213,7 @@ impl ByteStore {
             // SAFETY: as `as_slice`, and `&mut self` guarantees exclusive access.
             #[allow(unsafe_code)]
             ByteStore::External(e) => unsafe { core::slice::from_raw_parts_mut(e.ptr, e.len) },
+            ByteStore::Shared(b) => b.as_mut_slice(),
         }
     }
 }

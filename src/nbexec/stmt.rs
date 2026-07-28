@@ -148,6 +148,10 @@ impl<'a> Interp<'a> {
                 // `undefined` if none — never empty.
                 let mut v = NanBox::undefined();
                 while self.eval_truthy(test)? {
+                    // Scheduling point: a spin loop over shared memory (the
+                    // `$262.agent` tests' `waitUntil` / `while (Atomics.load(…))`)
+                    // must hand the baton to the other agents. No-op without one.
+                    self.agent_tick()?;
                     let f = self.exec(body)?;
                     match loop_step(f, &label, &mut v) {
                         LoopAction::Next => {}
@@ -161,6 +165,7 @@ impl<'a> Interp<'a> {
                 let label = self.pending_label.take();
                 let mut v = NanBox::undefined();
                 loop {
+                    self.agent_tick()?;
                     let f = self.exec(body)?;
                     match loop_step(f, &label, &mut v) {
                         LoopAction::Next => {}
@@ -1838,6 +1843,7 @@ impl<'a> Interp<'a> {
             }
             let mut v = NanBox::undefined();
             loop {
+                self.agent_tick()?;
                 let go = match test {
                     Some(t) => self.eval_truthy(t)?,
                     None => true,

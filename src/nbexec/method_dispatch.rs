@@ -1251,6 +1251,17 @@ impl<'a> Interp<'a> {
                     SHARED_ARRAY_BUFFER_BRAND,
                     NanBox::boolean(true),
                 );
+                // Its data block must be a *shared* one like any other
+                // `SharedArrayBuffer`'s, so the copy can itself be broadcast to
+                // another agent and waited on across agents.
+                if let Some(bytes) = self
+                    .realm
+                    .get_property(nb, ARRAY_BUFFER_BYTES)
+                    .and_then(|v| v.as_handle())
+                    .map(Handle::from_raw)
+                {
+                    self.realm.make_bytes_shared(bytes);
+                }
                 if let Some(proto) = self
                     .current
                     .get("SharedArrayBuffer")

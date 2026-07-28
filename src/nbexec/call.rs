@@ -3426,7 +3426,7 @@ impl<'a> Interp<'a> {
                 let m = self.new_str("SharedArrayBuffer length exceeds the allocation limit");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }
-            let buf = self.make_array_buffer(n);
+            let buf = self.make_shared_array_buffer(n);
             self.realm
                 .set_hidden_property(buf, SHARED_ARRAY_BUFFER_BRAND, NanBox::boolean(true));
             if let Some(max) = maxlen {

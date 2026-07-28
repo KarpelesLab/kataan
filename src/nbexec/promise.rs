@@ -531,10 +531,29 @@ impl<'a> Interp<'a> {
     /// earliest-due `setTimeout` macrotask (draining microtasks after each), until
     /// both queues are empty.
     pub(crate) fn run_event_loop(&mut self) -> Result<(), ExecError> {
-        self.drain_microtasks()?;
-        while !self.macrotasks.is_empty() {
-            self.run_one_macrotask()?;
+        loop {
             self.drain_microtasks()?;
+            // An `Atomics.waitAsync` promise another agent has notified settles
+            // here, queueing the microtasks its `await`/`then` continuation runs.
+            #[cfg(feature = "std")]
+            if self.agent_settle_async_wakes() {
+                continue;
+            }
+            if !self.macrotasks.is_empty() {
+                self.run_one_macrotask()?;
+                // A timer-driven poll loop (`$262.agent.getReportAsync`) must let
+                // the other agents run, or the report it waits for never arrives.
+                self.agent_tick()?;
+                continue;
+            }
+            // Nothing left to run, but a cross-agent `waitAsync` is still parked:
+            // block until it is notified or times out rather than declaring the
+            // event loop finished.
+            #[cfg(feature = "std")]
+            if self.agent_idle_for_waiters() {
+                continue;
+            }
+            break;
         }
         Ok(())
     }

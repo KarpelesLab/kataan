@@ -254,9 +254,9 @@ impl<'a> Interp<'a> {
                 if id == N_ATOMICS_NOTIFY {
                     // Coerce `count` (default +Infinity, else ToIntegerOrInfinity
                     // clamped to ≥ 0) — its `valueOf` runs and may throw. Then wake
-                    // up to `count` matching `waitAsync` waiters (single-agent: no
-                    // *blocking* `wait` can ever be parked, but same-agent
-                    // `waitAsync` promises can), returning the number woken.
+                    // up to `count` waiters on this location — blocking `wait`s
+                    // parked in other agents and `waitAsync` promises alike, in
+                    // FIFO order — returning the number woken.
                     let count = if matches!(arg(2).unpack(), crate::nanbox::Unpacked::Undefined) {
                         f64::INFINITY
                     } else {
@@ -267,12 +267,11 @@ impl<'a> Interp<'a> {
                 } else {
                     // `wait`/`waitAsync` on a shell-like host ([[CanBlock]] = true):
                     // coerce `value` then `timeout` (running their `valueOf`) and
-                    // read the current element. `wait` blocks; this engine is
-                    // single-agent, so no `notify` can arrive mid-block — a matching
-                    // value resolves "timed-out" (nothing wakes it), a mismatch
-                    // "not-equal". `waitAsync` instead parks an async waiter that a
-                    // later same-agent `notify` can resolve "ok". Tests needing
-                    // [[CanBlock]] = false carry flags:[CanBlockIsFalse] (skipped).
+                    // read the current element. A mismatch is "not-equal"; a match
+                    // makes `wait` block (parking this agent's thread on the pool's
+                    // waiter list) and `waitAsync` park a waiter another agent's
+                    // `notify` can resolve "ok". Tests needing [[CanBlock]] = false
+                    // carry flags:[CanBlockIsFalse] (skipped).
                     let (equal, timeout) = if crate::nbexec::is_bigint_kind(kind) {
                         let v = self.coerce_to_bigint(arg(2))?.to_u64_wrapping();
                         let timeout =
@@ -306,31 +305,36 @@ impl<'a> Interp<'a> {
                     if id == N_ATOMICS_WAIT_ASYNC {
                         return Ok(self.atomics_wait_async(ta, idx, kind, equal, timeout));
                     }
-                    // Synchronous `Atomics.wait`. Each agent runs cooperatively to
-                    // completion, so a blocking wait cannot be woken by a *later*
-                    // cross-agent `notify` (that agent has already finished). Model
-                    // the outcomes on the virtual clock:
-                    //   * value mismatch -> "not-equal" (returns at once, no time
-                    //     passes);
-                    //   * value match, finite timeout -> the wait blocks for the
-                    //     whole timeout and then times out: advance the virtual clock
-                    //     by `timeout` so a `monotonicNow()`-measured duration around
-                    //     the wait observes the elapsed time, and return "timed-out";
-                    //   * value match, infinite timeout -> "timed-out" (the model
-                    //     cannot block forever, and no notify can reach a finished
-                    //     agent).
-                    if equal {
-                        let t = if timeout.is_nan() {
-                            f64::INFINITY
-                        } else {
-                            timeout.max(0.0)
-                        };
-                        if t.is_finite() && t > 0.0 {
-                            self.virtual_now += t;
-                        }
-                        return Ok(self.new_str("timed-out"));
+                    // Synchronous `Atomics.wait`. A value mismatch is "not-equal"
+                    // and returns at once.
+                    if !equal {
+                        return Ok(self.new_str("not-equal"));
                     }
-                    return Ok(self.new_str("not-equal"));
+                    // ToNumber(timeout) with NaN → +Infinity, negatives clamped.
+                    let t = if timeout.is_nan() {
+                        f64::INFINITY
+                    } else {
+                        timeout.max(0.0)
+                    };
+                    // Once other agents exist, this genuinely blocks: the calling
+                    // agent parks on the pool's `(block, index)` waiter list until
+                    // another agent's `Atomics.notify` wakes it ("ok") or the
+                    // timeout expires ("timed-out").
+                    #[cfg(feature = "std")]
+                    if t > 0.0
+                        && let Some(r) = self.atomics_wait_blocking(ta, idx, kind, t)
+                    {
+                        return Ok(self.new_str(r));
+                    }
+                    // Single-agent (no `$262.agent` was ever started): nothing can
+                    // ever notify this location, so the wait's only possible
+                    // outcome is "timed-out". Advance the virtual clock by the
+                    // timeout so a `monotonicNow()`-measured duration around the
+                    // wait observes it, instead of really sleeping.
+                    if t.is_finite() && t > 0.0 {
+                        self.virtual_now += t;
+                    }
+                    return Ok(self.new_str("timed-out"));
                 }
             }
             N_MATH_MAX => {
@@ -3089,7 +3093,7 @@ impl<'a> Interp<'a> {
             // `realm.evalScript(src)` — evaluate `src` in the receiver realm.
             N_262_EVAL_SCRIPT => return self.eval_script_in_realm(arg(0)),
             N_262_EVAL_SCRIPT_MAIN => return self.eval_script_current_realm(arg(0)),
-            // Test262 `$262.agent` cooperative scheduler (see the `agent` module).
+            // Test262 `$262.agent` host hooks (see the `agent` module).
             N_262_AGENT_START => return self.agent_start(arg(0)),
             N_262_AGENT_BROADCAST => return self.agent_broadcast(arg(0)),
             N_262_AGENT_GET_REPORT => return Ok(self.agent_get_report()),
@@ -3098,15 +3102,13 @@ impl<'a> Interp<'a> {
             N_262_AGENT_RECEIVE_BROADCAST => {
                 return self.agent_receive_broadcast(arg(0));
             }
-            // `sleep(ms)` — advance the virtual clock by `ms` (models the agent
-            // sleeping). This is only reachable through `$262.agent`, so it cannot
-            // affect ordinary timer/Promise code. `leaving()`/`tryYield` are handled
-            // in JS (the worker prelude / atomicsHelper), so need no native.
+            // `sleep(ms)` — yield to the other agents for `ms` and advance the
+            // virtual clock. This is only reachable through `$262.agent`, so it
+            // cannot affect ordinary timer/Promise code. `leaving()`/`tryYield` are
+            // handled in JS (the worker prelude / atomicsHelper), so need no native.
             N_262_AGENT_SLEEP => {
                 let ms = self.realm.to_number(arg(0));
-                if ms.is_finite() && ms > 0.0 {
-                    self.virtual_now += ms;
-                }
+                self.agent_sleep(ms);
                 NanBox::undefined()
             }
             N_262_AGENT_MONOTONIC_NOW => NanBox::number(self.agent_monotonic_now()),

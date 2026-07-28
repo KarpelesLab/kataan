@@ -794,32 +794,66 @@ struct ArgMap {
     slots: alloc::collections::BTreeMap<usize, String>,
 }
 
-/// The Test262 `$262.agent` cooperative scheduler + `Atomics.waitAsync` state.
+/// This agent's slice of the Test262 `$262.agent` model (see the `agent` and
+/// `agent_pool` modules).
 ///
-/// This engine is single-threaded (the heap is `Rc`, not `Send`), so worker
-/// agents are modeled cooperatively: `$262.agent.start(src)` runs the worker to
-/// completion *eagerly* in a fresh realm, and a worker that registers a
-/// `receiveBroadcast` callback has it invoked later when the main agent
-/// `broadcast`s. Reports flow through a shared FIFO queue. True cross-agent
-/// interleaving (main *blocks* in `Atomics.wait` while a worker runs and
-/// `notify`s) is out of scope — those tests time out and are ledgered.
+/// With the `std` feature every agent is a real OS thread running its own
+/// `Interp`, and the *cross-agent* state (reports, the `(block, index)` waiter
+/// lists, the execution baton) lives in the shared [`agent_pool::AgentPool`] the
+/// `pool` field points at. `pool` is `None` until the first `$262.agent.start`,
+/// so an ordinary single-agent program pays nothing and keeps using the
+/// same-agent `waiters` list below.
 #[derive(Default)]
 struct AgentState {
-    /// The shared FIFO report queue: workers `report(msg)` push, the main agent
-    /// `getReport()` pops (returns the front, or `null` when empty).
+    /// Same-agent FIFO report queue, used only when no [`agent_pool::AgentPool`]
+    /// exists (no worker was ever started, or a `no_std` build).
     reports: alloc::collections::VecDeque<String>,
-    /// Worker `receiveBroadcast(cb)` callbacks awaiting a `broadcast`: each is
-    /// `(created-realm index, callback)`. Drained (in order) by `broadcast(sab)`,
-    /// which invokes every callback with the SharedArrayBuffer.
+    /// `receiveBroadcast(cb)` callbacks this agent registered, awaiting a
+    /// `broadcast`. The `usize` is the created-realm index a callback must be
+    /// restored into (the `no_std` cooperative model); a threaded worker owns its
+    /// whole `Interp`, so it stores `usize::MAX` and needs no realm swap.
     broadcasts: Vec<(usize, NanBox)>,
-    /// Pending `Atomics.waitAsync` waiters, keyed by `(buffer handle, byte
-    /// index)`; a matching `Atomics.notify` settles the promise with `"ok"`, and
-    /// a finite-timeout waiter is settled `"timed-out"` by a macrotask.
+    /// Same-agent `Atomics.waitAsync` waiters, keyed by `(buffer handle, byte
+    /// index)`. Used only when no pool exists; with a pool the waiter lives in
+    /// the pool (so another agent's `notify` can find it) and this agent keeps
+    /// only the id→promise mapping in `pool_waiters`.
     waiters: Vec<AtomicsWaiter>,
     /// The created-realm index of the worker whose source is *currently* running
-    /// eagerly under `$262.agent.start` — so a `receiveBroadcast` callback it
-    /// registers is tagged with the realm to restore when it is later invoked.
+    /// eagerly under the `no_std` cooperative `$262.agent.start`.
     current_agent_realm: Option<usize>,
+    /// The shared scheduler, once this program has started an agent (or, in a
+    /// worker, from the moment its `Interp` is built).
+    #[cfg(feature = "std")]
+    pool: Option<alloc::sync::Arc<agent_pool::AgentPool>>,
+    /// This agent's id in the pool (0 = the main agent).
+    #[cfg(feature = "std")]
+    id: usize,
+    /// Worker threads this agent started (empty in a worker) — joined at teardown.
+    #[cfg(feature = "std")]
+    workers: Vec<std::thread::JoinHandle<()>>,
+    /// This agent's parked `Atomics.waitAsync` waiters, as `(pool waiter id, the
+    /// promise to settle)`. The waiter itself (its location and deadline) lives
+    /// in the pool, where every agent's `notify` can see it.
+    #[cfg(feature = "std")]
+    pool_waiters: Vec<(u64, Handle)>,
+}
+
+#[cfg(feature = "std")]
+impl Drop for AgentState {
+    fn drop(&mut self) {
+        // Only the agent that *started* workers tears the pool down: signal every
+        // parked/looping worker to unwind, then join so no thread outlives the
+        // `Interp` whose reports it writes into.
+        if self.workers.is_empty() {
+            return;
+        }
+        if let Some(pool) = &self.pool {
+            pool.shutdown();
+        }
+        for h in core::mem::take(&mut self.workers) {
+            let _ = h.join();
+        }
+    }
 }
 
 /// One pending `Atomics.waitAsync` async waiter.
@@ -1718,14 +1752,15 @@ const N_ATOMICS_IS_LOCK_FREE: u16 = 686;
 /// `undefined` (validates that `N`, if present, is an integral Number).
 const N_ATOMICS_PAUSE: u16 = 904;
 /// `Atomics.notify(typedArray, index, count)` — wakes up to `count` agents
-/// waiting on `(buffer, index)`. In this single-agent engine no agent is ever
-/// waiting, so after validating the (integer TypedArray, in-range index,
-/// non-negative count) it always returns `0`.
+/// waiting on the `(Shared Data Block, byte index)` waiter list, in FIFO order,
+/// and returns how many it woke (`0` when no `$262.agent` has been started, since
+/// then nothing can be waiting).
 const N_ATOMICS_NOTIFY: u16 = 909;
 /// `Atomics.wait(typedArray, index, value, timeout)` — blocks the agent until
-/// notified. Requires a shared integer TypedArray whose agent CanBlock; the main
-/// agent cannot block and a non-shared buffer is invalid, so after validation
-/// this throws a TypeError in the single-agent engine.
+/// notified. Requires a shared integer TypedArray. Once other agents exist this
+/// genuinely parks the calling agent's thread (see the `agent` module); with a
+/// single agent nothing could ever notify it, so it resolves `"timed-out"` at
+/// once rather than really sleeping.
 const N_ATOMICS_WAIT: u16 = 910;
 /// `SharedArrayBuffer.prototype` getter (byteLength / maxByteLength / growable).
 /// Like [`N_AB_ACCESSOR`] but brand-validates the receiver is a *shared* buffer —
@@ -1759,8 +1794,9 @@ const N_262_EVAL_SCRIPT: u16 = 951;
 /// and a sloppy script's `var`/function bindings persist too). Wired by the
 /// runner's JS prelude to the top-level `$262.evalScript`.
 const N_262_EVAL_SCRIPT_MAIN: u16 = 963;
-/// `$262.agent.start(src)` — spawn a worker agent: create a fresh realm, install
-/// a worker-side `$262.agent`, and run `src` eagerly to completion in it.
+/// `$262.agent.start(src)` — spawn a worker agent: with `std`, an OS thread
+/// running `src` in an `Interp` of its own (see the `agent` module); without it,
+/// a fresh realm of this `Interp` that runs `src` eagerly to completion.
 const N_262_AGENT_START: u16 = 952;
 /// `$262.agent.broadcast(sab)` / `safeBroadcast(sab)` — deliver the
 /// SharedArrayBuffer to every worker's registered `receiveBroadcast` callback.
@@ -1774,7 +1810,8 @@ const N_262_AGENT_REPORT: u16 = 956;
 /// `$262.agent.receiveBroadcast(cb)` — register a worker callback for the next
 /// `broadcast` (deferred: invoked when the main agent broadcasts).
 const N_262_AGENT_RECEIVE_BROADCAST: u16 = 957;
-/// `$262.agent.sleep(ms)` — a cooperative no-op (no real clock to block on).
+/// `$262.agent.sleep(ms)` — hand the execution baton to the other agents for
+/// `ms` (and advance this agent's virtual clock by it).
 const N_262_AGENT_SLEEP: u16 = 958;
 /// `$262.agent.monotonicNow()` — a monotonic millisecond clock reading.
 const N_262_AGENT_MONOTONIC_NOW: u16 = 959;
@@ -2991,6 +3028,8 @@ const PCOMB_INDEX: &str = "\u{0}pc_idx";
 const PCOMB_CALLED: &str = "\u{0}pc_called";
 
 mod agent;
+#[cfg(feature = "std")]
+mod agent_pool;
 mod base64;
 mod call;
 mod class;

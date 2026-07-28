@@ -10250,7 +10250,7 @@ fn to_string_dynamic_and_builtin_functions_are_native_syntax() {
     assert_eq!(run("'' + Math.max"), "function max() { [native code] }");
 }
 
-// --- Atomics cooperative scheduler + virtual clock (see `nbexec::agent`) ---
+// --- Atomics agents + virtual clock (see `nbexec::agent`) ------------------
 
 #[test]
 fn atomics_sync_wait_finite_timeout_times_out_and_advances_clock() {
@@ -10313,6 +10313,103 @@ fn atomics_wait_async_resolves_timed_out_and_advances_clock() {
             });
         "#),
         "timed-out 300\n"
+    );
+}
+
+/// The main-agent side of an agent test: spin on the shared `RUNNING` counter
+/// until `n` workers have checked in, exactly as `$262.agent.waitUntil` does.
+#[cfg(feature = "std")]
+const AGENT_WAIT_UNTIL: &str = r"
+function waitUntil(ta, index, expected) {
+  while (Atomics.load(ta, index) !== expected) ;
+}
+function report() {
+  var r;
+  while ((r = $262_agent_getReport()) === null) $262_agent_sleep(1);
+  return r;
+}
+";
+
+#[test]
+#[cfg(feature = "std")]
+fn agent_worker_blocks_in_atomics_wait_until_notified() {
+    // The point of the threaded agent model: the worker really *parks* inside
+    // `Atomics.wait` (mid-callback, on a buffer broadcast from the main agent),
+    // and the main agent's `Atomics.notify` finds it on the waiter list, reports
+    // one wake, and releases it with "ok".
+    assert_eq!(
+        out(&alloc::format!(
+            r#"{AGENT_WAIT_UNTIL}
+            $262_agent_start(`
+              $262.agent.receiveBroadcast(function (sab) {{
+                var a = new Int32Array(sab);
+                Atomics.add(a, 1, 1);
+                $262.agent.report(Atomics.wait(a, 0, 0, 30000));
+              }});
+            `);
+            var i32 = new Int32Array(new SharedArrayBuffer(8));
+            $262_agent_broadcast(i32.buffer);
+            waitUntil(i32, 1, 1);
+            console.log("woke " + Atomics.notify(i32, 0, 1));
+            console.log("report " + report());
+            console.log("again " + Atomics.notify(i32, 0, 1));
+        "#
+        )),
+        "woke 1\nreport ok\nagain 0\n"
+    );
+}
+
+#[test]
+#[cfg(feature = "std")]
+fn agent_notify_wakes_exactly_one_of_two_parked_workers() {
+    // Two workers park on the same location; `notify(…, 1)` wakes exactly one and
+    // the other runs out its (short) timeout. Sorting makes the pair order-free.
+    assert_eq!(
+        out(&alloc::format!(
+            r#"{AGENT_WAIT_UNTIL}
+            for (var i = 0; i < 2; i++) {{
+              $262_agent_start(`
+                $262.agent.receiveBroadcast(function (sab) {{
+                  var a = new Int32Array(sab);
+                  Atomics.add(a, 1, 1);
+                  $262.agent.report(Atomics.wait(a, 0, 0, 250));
+                }});
+              `);
+            }}
+            var i32 = new Int32Array(new SharedArrayBuffer(8));
+            $262_agent_broadcast(i32.buffer);
+            waitUntil(i32, 1, 2);
+            console.log("woke " + Atomics.notify(i32, 0, 1));
+            console.log([report(), report()].sort().join(","));
+        "#
+        )),
+        "woke 1\nok,timed-out\n"
+    );
+}
+
+#[test]
+#[cfg(feature = "std")]
+fn agent_broadcast_shares_the_same_data_block() {
+    // A broadcast hands over the buffer's *Shared Data Block*, not a copy: the
+    // worker's `Atomics.store` through its own `SharedArrayBuffer` object is
+    // visible to the main agent reading the original one.
+    assert_eq!(
+        out(&alloc::format!(
+            r#"{AGENT_WAIT_UNTIL}
+            $262_agent_start(`
+              $262.agent.receiveBroadcast(function (sab) {{
+                var a = new Int32Array(sab);
+                Atomics.store(a, 0, 42);
+                Atomics.add(a, 1, 1);
+              }});
+            `);
+            var i32 = new Int32Array(new SharedArrayBuffer(8));
+            $262_agent_broadcast(i32.buffer);
+            waitUntil(i32, 1, 1);
+            console.log("shared " + Atomics.load(i32, 0));
+        "#
+        )),
+        "shared 42\n"
     );
 }
 

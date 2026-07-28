@@ -745,6 +745,49 @@ impl<'a> Interp<'a> {
         obj
     }
 
+    /// Builds a `SharedArrayBuffer`'s object over `len` zeroed bytes. Identical
+    /// to [`Interp::make_array_buffer`] except that the data block is a
+    /// *refcounted shared* block, so `$262.agent.broadcast` can hand the very same
+    /// bytes to another agent's heap ([`Interp::make_array_buffer_over_shared`]).
+    /// The caller still stamps `SHARED_ARRAY_BUFFER_BRAND` and the prototype.
+    pub(crate) fn make_shared_array_buffer(&mut self, len: usize) -> Handle {
+        let obj = self.realm.new_object();
+        let bytes = self.realm.new_shared_bytes(len);
+        self.realm
+            .set_hidden_property(obj, ARRAY_BUFFER_BYTES, NanBox::handle(bytes.to_raw()));
+        self.link_array_buffer_proto(obj);
+        obj
+    }
+
+    /// Builds a fully-formed `SharedArrayBuffer` object over an *existing* shared
+    /// data block: the receiving side of a `$262.agent.broadcast`, where the
+    /// object is new (it lives in this agent's heap) but the bytes are the same
+    /// Shared Data Block the broadcasting agent allocated.
+    pub(crate) fn make_array_buffer_over_shared(
+        &mut self,
+        block: alloc::sync::Arc<crate::cell::SharedBlock>,
+    ) -> Handle {
+        let obj = self.realm.new_object();
+        let bytes = self.realm.new_bytes_over_shared(block);
+        self.realm
+            .set_hidden_property(obj, ARRAY_BUFFER_BYTES, NanBox::handle(bytes.to_raw()));
+        self.link_array_buffer_proto(obj);
+        self.realm
+            .set_hidden_property(obj, SHARED_ARRAY_BUFFER_BRAND, NanBox::boolean(true));
+        if let Some(proto) = self
+            .current
+            .get("SharedArrayBuffer")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        {
+            self.realm.set_object_proto(obj, Some(proto));
+        }
+        obj
+    }
+
     /// An `ArrayBuffer` whose contiguous [`Cell::Bytes`] store is a copy of `bytes`.
     pub(crate) fn make_array_buffer_from_bytes(&mut self, bytes: &[u8]) -> Handle {
         self.array_buffer_from_bytes(bytes)

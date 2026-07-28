@@ -12,27 +12,6 @@ annexB/language/function-code/block-decl-nested-blocks-with-fun-decl.js  # [slop
 annexB/language/statements/for-in/nonstrict-initializer.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: expected Semicolon, found Keyword(In) (at 7116..7118)
 built-ins/AsyncDisposableStack/prototype/disposeAsync/explicit-await-for-null.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [dispose, job 1, job 2] and expected [job 1, dispose, job 2])
 built-ins/AsyncDisposableStack/prototype/disposeAsync/explicit-await-for-undefined.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [dispose, job 1, job 2] and expected [job 1, dispose, job 2])
-built-ins/Atomics/notify/bigint/notify-all-on-loc.js  # [sloppy] expected pass, Runtime Test262Error: Atomics.notify(i64a, WAIT_INDEX) returns the value of `NUMAGENT` Expected SameValue(«0», «3») to be true
-built-ins/Atomics/notify/count-defaults-to-infinity-missing.js  # [sloppy] expected pass, Runtime Test262Error: Atomics.notify(i32a, WAIT_INDEX /*, count missing */) returns the value of `NUMAGENT` Expected SameValue(«0», «4») to be true
-built-ins/Atomics/notify/count-defaults-to-infinity-undefined.js  # [sloppy] expected pass, Runtime Test262Error: Atomics.notify(i32a, WAIT_INDEX, undefined) returns the value of `NUMAGENT` Expected SameValue(«0», «4») to be true
-built-ins/Atomics/notify/notify-all-on-loc.js  # [sloppy] expected pass, Runtime Test262Error: Atomics.notify(i32a, WAIT_INDEX) returns the value of `NUMAGENT` Expected SameValue(«0», «3») to be true
-built-ins/Atomics/notify/notify-all.js  # [sloppy] expected pass, Runtime Test262Error: Atomics.notify(i32a, WAIT_INDEX) returns the value of `NUMAGENT` Expected SameValue(«0», «3») to be true
-built-ins/Atomics/notify/notify-in-order-one-time.js  # crash or timeout (native abort / hang)
-built-ins/Atomics/notify/notify-in-order.js  # crash or timeout (native abort / hang)
-built-ins/Atomics/notify/notify-one.js  # [sloppy] expected pass, Runtime Test262Error: Atomics.notify(i32a, 0, NOTIFYCOUNT) returns the value of `NOTIFYCOUNT` Expected SameValue(«0», «1») to be true
-built-ins/Atomics/notify/notify-renotify-noop.js  # [sloppy] expected pass, Runtime Test262Error: Atomics.notify(i32a, 0, 1) returns 1 Expected SameValue(«0», «1») to be true
-built-ins/Atomics/notify/notify-two.js  # [sloppy] expected pass, Runtime Test262Error: Atomics.notify(i32a, 0, NOTIFYCOUNT) returns the value of `NOTIFYCOUNT` Expected SameValue(«0», «2») to be true
-built-ins/Atomics/notify/undefined-index-defaults-to-zero.js  # crash or timeout (native abort / hang)
-built-ins/Atomics/wait/bigint/nan-for-timeout.js  # [sloppy] expected pass, Runtime Test262Error: Atomics.notify(i64a, 0) returns 1 Expected SameValue(«0», «1») to be true
-built-ins/Atomics/wait/bigint/waiterlist-block-indexedposition-wake.js  # crash or timeout (native abort / hang)
-built-ins/Atomics/wait/bigint/waiterlist-order-of-operations-is-fifo.js  # crash or timeout (native abort / hang)
-built-ins/Atomics/wait/bigint/was-woken-before-timeout.js  # [sloppy] expected pass, Runtime Test262Error: Atomics.notify(i64a, 0) returns 1 Expected SameValue(«0», «1») to be true
-built-ins/Atomics/wait/nan-for-timeout.js  # [sloppy] expected pass, Runtime Test262Error: Atomics.notify(i32a, 0) returns 1 Expected SameValue(«0», «1») to be true
-built-ins/Atomics/wait/undefined-for-timeout.js  # [sloppy] expected pass, Runtime Test262Error: Atomics.notify(i32a, WAIT_INDEX, NOTIFYCOUNT) returns the value of `NOTIFYCOUNT` (2) Expected SameValue(«0», «2») to be true
-built-ins/Atomics/wait/undefined-index-defaults-to-zero.js  # [sloppy] expected pass, Runtime Test262Error: Atomics.notify(i32a, 0) returns 1 Expected SameValue(«0», «1») to be true
-built-ins/Atomics/wait/waiterlist-block-indexedposition-wake.js  # crash or timeout (native abort / hang)
-built-ins/Atomics/wait/waiterlist-order-of-operations-is-fifo.js  # crash or timeout (native abort / hang)
-built-ins/Atomics/wait/was-woken-before-timeout.js  # [sloppy] expected pass, Runtime Test262Error: Atomics.notify(i32a, 0) returns 1 Expected SameValue(«0», «1») to be true
 built-ins/Error/prototype/stack/setter-cross-realm.js  # crash or timeout (native abort / hang)
 built-ins/JSON/stringify/value-bigint-cross-realm.js  # [sloppy] expected pass, Runtime TypeError: Do not know how to serialize a BigInt
 built-ins/String/prototype/match/regexp-prototype-match-v-u-flag.js  # [sloppy] expected pass, Runtime Test262Error: Actual [�, �, a, �, �, b, �, �, c, �, �, ‍, �, �, ‍, �, �, ‍, �, �, d] and expected [�, �, a, �, �, b, �, �, c, �, �, ‍, �, �, ‍, �, �, ‍, �, �, d] should have the same contents. Dot without u or v flag
