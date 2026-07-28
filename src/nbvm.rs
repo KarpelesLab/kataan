@@ -3919,7 +3919,18 @@ fn regex_method(
         //    non-global/non-sticky regex),
         //  - the sticky (`y`) flag (anchored match at exactly `lastIndex`),
         //  - the `d` (hasIndices) flag (the result needs an `.indices` array).
-        if ctx.realm.regex_aux_last_index_defined(h) || flags.contains('y') || flags.contains('d') {
+        //  - a subject that is not already a String, since `ToString(S)` may run a
+        //    user `toString`/`valueOf` (and a `Symbol` must throw). This path has
+        //    no way to call back into JS, and coercing with the *internal* display
+        //    conversion instead silently skipped those — `/z/.test({toString(){…}})`
+        //    matched against `"[object Object]"` without ever calling the method.
+        if ctx.realm.regex_aux_last_index_defined(h)
+            || flags.contains('y')
+            || flags.contains('d')
+            || !arg0
+                .as_handle()
+                .is_some_and(|raw| ctx.realm.is_string_handle(Handle::from_raw(raw)))
+        {
             return None;
         }
         // Use the RegExp cell's compiled-program cache (RE-P1): a reused regex is
@@ -3935,11 +3946,24 @@ fn regex_method(
         } else {
             0
         };
-        // Collect the subject to UTF-16 code units ONCE (RE-7); spans index this
-        // buffer. The subject's lossless WTF-8 bytes feed the unit buffer.
-        let subject_bytes = string_arg_bytes(ctx, arg0);
-        let units: Vec<u16> = crate::wtf8::utf16_units(&subject_bytes).collect();
-        let caps = re.captures_in_u16(&units, start);
+        // The subject as UTF-16 code units; spans index this buffer. A string
+        // argument goes through the realm's one-slot memo, so matching the same
+        // subject repeatedly — a `test`/`exec` loop — transcodes it once rather
+        // than once per call. Anything else is coerced and transcoded here (a
+        // fresh string every time, so there is nothing to reuse).
+        let cached = arg0
+            .as_handle()
+            .and_then(|raw| ctx.realm.regex_subject_units(Handle::from_raw(raw)));
+        let owned: Vec<u16>;
+        let units: &[u16] = match &cached {
+            Some(u) => u,
+            None => {
+                let subject_bytes = string_arg_bytes(ctx, arg0);
+                owned = crate::wtf8::utf16_units(&subject_bytes).collect();
+                &owned
+            }
+        };
+        let caps = re.captures_in_u16(units, start);
         if stateful {
             let next = caps.as_ref().map_or(0, |c| c.whole().1);
             ctx.realm.set_regex_last_index(h, next);
@@ -3953,7 +3977,7 @@ fn regex_method(
                 // subject on every call.
                 let text = ctx.realm.to_display_string(arg0);
                 let input = NanBox::handle(ctx.realm.new_string(&text).to_raw());
-                regex_match_object(ctx.realm, &units, input, &caps, re.group_names())
+                regex_match_object(ctx.realm, units, input, &caps, re.group_names())
             }
             (_, None) => NanBox::null(),
         }));
@@ -5052,9 +5076,17 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             }
         }
         NB_STRING_FROM_CHAR_CODE => {
-            // Each argument is ToUint16'd into a UTF-16 code unit; decoding the
-            // sequence combines an adjacent high/low surrogate pair into one astral
-            // code point (a lone surrogate becomes U+FFFD, unrepresentable in UTF-8).
+            // Each argument is ToUint16'd into a UTF-16 code unit; the resulting
+            // sequence is decoded to **WTF-8**, so an adjacent high/low surrogate
+            // pair combines into one astral code point and a lone surrogate is
+            // preserved (DOMString semantics — a JS string is a code-unit
+            // sequence, not necessarily well-formed Unicode).
+            //
+            // Decoding through a Rust `String` instead, as this did, replaced a
+            // lone surrogate with U+FFFD — so `String.fromCharCode(0xD800)` came
+            // back as the replacement character and every downstream operation
+            // (`charCodeAt`, regex matching, `indexOf`) saw the wrong string. The
+            // tree-walker has always used the WTF-8 path here.
             let units: Vec<u16> = args
                 .iter()
                 .map(|a| {
@@ -5066,10 +5098,8 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
                     }
                 })
                 .collect();
-            let s: String = char::decode_utf16(units)
-                .map(|r| r.unwrap_or('\u{FFFD}'))
-                .collect();
-            NanBox::handle(ctx.realm.new_string(&s).to_raw())
+            let bytes = crate::wtf8::from_utf16(&units);
+            NanBox::handle(ctx.realm.new_string_wtf8(bytes).to_raw())
         }
         NB_ARRAY_IS_ARRAY => {
             let yes = args

@@ -150,6 +150,24 @@ pub struct Realm {
     /// costs a prototype walk that was already spec-required in the rare programs
     /// that pollute those prototypes.
     proto_index_accessor_dirty: bool,
+    /// One-slot memo of the most recent regex subject widened to UTF-16, kept
+    /// because the matcher takes `&[u16]` and every `test`/`exec`/`split`/…
+    /// otherwise re-transcodes the whole subject — making a match cost O(subject)
+    /// even when the match itself is O(1) (`ROADMAP.md` §5.2).
+    ///
+    /// Keyed by the subject rope's **node identity**. That is sound precisely
+    /// because the slot holds a clone of the rope: the node stays alive, so its
+    /// address cannot be reused by a different string and a pointer match cannot
+    /// be a false positive. Strings are immutable, so an identical node is
+    /// identical content.
+    ///
+    /// Deliberately one slot. The win is a subject matched repeatedly — a
+    /// `test`/`exec` loop, a global `replace`, a `split` — and a per-string cache
+    /// would instead grow with every string a regex ever touches (the reverted
+    /// rope `charCodeAt` memo did exactly that, taking peak RSS from 17.6 MB to
+    /// 1.5 GB). Cost here is bounded by one subject, and it is released as soon
+    /// as a different one is matched.
+    regex_subject_units: Option<(Rope, alloc::rc::Rc<alloc::vec::Vec<u16>>)>,
     /// Names on `%Array.prototype%` / `%Function.prototype%` that user code has
     /// *replaced* (assigned over, or redefined). Method calls on those receivers
     /// are normally dispatched by name straight to the built-in implementation;
@@ -414,6 +432,7 @@ impl Realm {
             non_extensible_arrays: alloc::collections::BTreeSet::new(),
             nonwritable_array_lengths: alloc::collections::BTreeSet::new(),
             proto_index_accessor_dirty: false,
+            regex_subject_units: None,
             proto_replaced: alloc::collections::BTreeSet::new(),
             sparse_array_lengths: alloc::collections::BTreeMap::new(),
             default_object_proto: None,
@@ -726,6 +745,30 @@ impl Realm {
     #[must_use]
     pub fn string_bytes(&self, handle: Handle) -> Option<alloc::vec::Vec<u8>> {
         Some(self.heap.get(handle)?.as_str()?.materialize_bytes())
+    }
+
+    /// The string at `handle` widened to UTF-16 code units — the subject form the
+    /// regex matcher consumes — reusing the previous result when it is the same
+    /// string. See [`regex_subject_units`](Realm::regex_subject_units) (the field)
+    /// for why the identity test is sound and why the memo is one slot.
+    ///
+    /// `None` when the cell is not a string; the caller then coerces and
+    /// transcodes without the memo (a non-string subject is a fresh string every
+    /// call, so there would be nothing to reuse).
+    pub fn regex_subject_units(
+        &mut self,
+        handle: Handle,
+    ) -> Option<alloc::rc::Rc<alloc::vec::Vec<u16>>> {
+        let rope = self.heap.get(handle)?.as_str()?.clone();
+        if let Some((cached, units)) = &self.regex_subject_units
+            && cached.ptr_eq(&rope)
+        {
+            return Some(alloc::rc::Rc::clone(units));
+        }
+        let bytes = rope.materialize_bytes();
+        let units = alloc::rc::Rc::new(crate::wtf8::utf16_units(&bytes).collect());
+        self.regex_subject_units = Some((rope, alloc::rc::Rc::clone(&units)));
+        Some(units)
     }
 
     /// Borrows the WTF-8 bytes of the string at `handle` *without allocating* when

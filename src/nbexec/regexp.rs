@@ -484,8 +484,19 @@ impl<'a> Interp<'a> {
                 // e.g. `\p{gc=Surrogate}` must match it). `coerce_to_string` yields a
                 // UTF-8 `String`, which replaces lone surrogates with U+FFFD, so use
                 // the WTF-8 byte path (as `exec` already does) instead.
-                let bytes = self.coerce_to_string_bytes(arg(0))?;
-                let str_v = self.new_str_bytes(bytes);
+                //
+                // A subject that is *already* a string is passed through as-is.
+                // `ToString` is the identity on it, and re-wrapping its bytes in a
+                // fresh cell handed `subject_units_cached` a new handle every call —
+                // so its memo missed every time and `re.test(s)` in a loop
+                // re-transcoded the whole subject on each iteration.
+                let str_v = match arg(0).as_handle().map(Handle::from_raw) {
+                    Some(h) if self.realm.is_string_handle(h) => arg(0),
+                    _ => {
+                        let bytes = self.coerce_to_string_bytes(arg(0))?;
+                        self.new_str_bytes(bytes)
+                    }
+                };
                 let r = self.regexp_exec(this_val, str_v)?;
                 Ok(NanBox::boolean(!matches!(r.unpack(), Unpacked::Null)))
             }

@@ -192,6 +192,16 @@ impl Rope {
         }
     }
 
+    /// Whether `self` and `other` share one backing node — an `Rc` pointer
+    /// comparison, so it is O(1) and says nothing about equal *content* held in
+    /// two allocations. Callers holding a clone of one side keep that allocation
+    /// alive, which is what makes the identity meaningful: a live node's address
+    /// cannot be reused by a different node.
+    #[must_use]
+    pub fn ptr_eq(&self, other: &Rope) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+
     /// Materializes the rope into a flat WTF-8 byte buffer in O(n), iteratively
     /// (so a deeply nested rope cannot overflow the stack). This is the
     /// lossless form — lone surrogates are preserved. Callers wanting a real
