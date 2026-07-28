@@ -132,6 +132,40 @@ fn substitute_numbering_digits(nu: &str, s: String) -> String {
     }
 }
 
+/// The CLDR collation tailoring for a resolved locale tag, memoized.
+///
+/// Building one parses the locale's CLDR rule, which is far too expensive to
+/// redo per comparison — a sort calls the collator `O(n log n)` times, and
+/// re-parsing made a 3000-element `Intl.Collator("sv")` sort take 28s against
+/// 2.7s for an untailored locale. Keyed by the resolved tag (so `-u-co-`
+/// variants get their own entry) and bounded by the number of distinct locales a
+/// program actually collates in.
+#[cfg(all(feature = "intl", feature = "std"))]
+fn locale_tailoring(locale: &str) -> Option<alloc::rc::Rc<intl::unicode::collate::Tailoring>> {
+    std::thread_local! {
+        static CACHE: core::cell::RefCell<
+            alloc::collections::BTreeMap<String, Option<alloc::rc::Rc<intl::unicode::collate::Tailoring>>>,
+        > = const { core::cell::RefCell::new(alloc::collections::BTreeMap::new()) };
+    }
+    CACHE.with(|cache| {
+        if let Some(hit) = cache.borrow().get(locale).cloned() {
+            return hit;
+        }
+        let built = intl::unicode::collate::Tailoring::for_locale(locale).map(alloc::rc::Rc::new);
+        cache
+            .borrow_mut()
+            .insert(String::from(locale), built.clone());
+        built
+    })
+}
+
+/// As above, without the memo: `thread_local!` needs `std`, so the `no_std` build
+/// rebuilds the tailoring per call.
+#[cfg(all(feature = "intl", not(feature = "std")))]
+fn locale_tailoring(locale: &str) -> Option<alloc::rc::Rc<intl::unicode::collate::Tailoring>> {
+    intl::unicode::collate::Tailoring::for_locale(locale).map(alloc::rc::Rc::new)
+}
+
 /// The numbering-system name for a native zero digit `c` (the reverse of
 /// [`numbering_system_digit_base`]) — used to name the CLDR default numbering
 /// system a locale resolves to, detected from the digit the `intl` crate emits.
@@ -4381,6 +4415,26 @@ impl<'a> Interp<'a> {
         } else {
             AlternateHandling::NonIgnorable
         };
+        // The resolved locale's CLDR tailoring, when the crate bundles one (78
+        // locales, plus the `-u-co-` variants). Without this every locale sorted in
+        // root DUCET order, so `new Intl.Collator("sv")` folded `å ä ö` in with
+        // `a`/`o` instead of ordering them after `z` — the locale was accepted and
+        // then ignored.
+        //
+        // `Tailoring` carries no strength / numeric / variable-weighting knobs, so
+        // it can only serve a collator that asked for the defaults. Any other option
+        // set keeps the option-aware root collator, which is what every locale got
+        // before — so this only ever adds tailoring, never removes an option.
+        if strength == Strength::Tertiary
+            && !numeric
+            && alternate == AlternateHandling::NonIgnorable
+            && let Some(locale) = ch
+                .and_then(|h| self.realm.get_property(h, "\u{0}locale"))
+                .map(|v| self.realm.to_display_string(v))
+            && let Some(tailoring) = locale_tailoring(&locale)
+        {
+            return tailoring.compare(a, b);
+        }
         Collator::new(alternate)
             .with_strength(strength)
             .with_numeric(numeric)

@@ -134,7 +134,7 @@ log.length;`,
   {
     id: 'unicode',
     label: 'Unicode strings',
-    note: 'Full case mapping, segmentation and normalisation — no ICU, no C.',
+    note: 'Case mapping, segmentation, normalisation and locale collation — no ICU, no C.',
     source: `console.log("ß".toUpperCase(), "İ".toLowerCase().length);
 console.log("e\\u0301".normalize("NFC") === "é");
 
@@ -144,7 +144,11 @@ const family = "👩‍👩‍👦";
 console.log("code units:", family.length,
             "graphemes:", [...seg.segment(family)].length);
 
-// Collation understands numbers inside strings…
+// Collation is locale-aware: Swedish orders å ä ö after z.
+const sv = new Intl.Collator("sv").compare;
+console.log(["zebra", "ängel", "åka", "apa"].sort(sv).join(" "));
+
+// It understands numbers inside strings…
 const natural = new Intl.Collator("en", { numeric: true });
 console.log(["item10", "item2", "item1"].sort(natural.compare).join(" "));
 
