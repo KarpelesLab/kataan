@@ -2345,7 +2345,7 @@ impl<'a> Interp<'a> {
                     )?;
                     NanBox::handle(promise.to_raw())
                 } else if let Some(result) = wrap_result {
-                    let wrapper = self.promise_resolve(result);
+                    let wrapper = self.promise_resolve_checked(result)?;
                     let onf = self.realm.new_native(N_RETURN_UNDEFINED);
                     let then = self.read_member(wrapper, "then")?;
                     self.call_with_this(

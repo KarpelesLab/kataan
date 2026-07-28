@@ -266,19 +266,50 @@ impl<'a> Interp<'a> {
         });
     }
 
-    /// `PromiseResolve(%Promise%, value)`: if `value` is already a promise, return
-    /// it unchanged (same identity); otherwise wrap it in a fresh promise resolved
-    /// with `value` (adopting a thenable). Used by `await` to obtain the promise
-    /// whose settlement resumes an async coroutine.
-    pub(crate) fn promise_resolve(&mut self, value: NanBox) -> Handle {
+    /// `PromiseResolve(%Promise%, value)` (27.2.4.7.1): if `value` is already a
+    /// promise **whose `constructor` is `%Promise%`**, return it unchanged (same
+    /// identity); otherwise wrap it in a fresh promise resolved with `value`
+    /// (adopting a thenable). Used by `Await` to obtain the promise whose
+    /// settlement resumes an async coroutine.
+    ///
+    /// Step 1.a is an observable `Get(x, "constructor")` — a throwing accessor
+    /// there makes the whole abstract operation (and so the enclosing `Await`)
+    /// complete abruptly, and a foreign constructor forces the extra wrapper
+    /// promise (one more tick). Both are load-bearing for `for await` /
+    /// async-generator tick accounting, hence the `Result`.
+    pub(crate) fn promise_resolve_checked(&mut self, value: NanBox) -> Result<Handle, ExecError> {
         if let Some(raw) = value.as_handle()
             && self.realm.promise_state(Handle::from_raw(raw)).is_some()
         {
-            return Handle::from_raw(raw);
+            let h = Handle::from_raw(raw);
+            let ctor = self.read_member(h, "constructor")?;
+            let default_c = self.current.get("Promise").unwrap_or(NanBox::undefined());
+            if self.realm.same_value(ctor, default_c) {
+                return Ok(h);
+            }
         }
         let p = self.fresh_promise();
         self.resolve_with(p, value);
-        p
+        Ok(p)
+    }
+
+    /// [`Self::promise_resolve_checked`] for callers with nowhere to route an
+    /// abrupt `constructor` lookup (host entry points): a throwing getter falls
+    /// back to the identity result rather than being swallowed into a pending
+    /// promise.
+    pub(crate) fn promise_resolve(&mut self, value: NanBox) -> Handle {
+        match self.promise_resolve_checked(value) {
+            Ok(p) => p,
+            Err(_) => value
+                .as_handle()
+                .map(Handle::from_raw)
+                .filter(|h| self.realm.promise_state(*h).is_some())
+                .unwrap_or_else(|| {
+                    let p = self.fresh_promise();
+                    self.resolve_with(p, value);
+                    p
+                }),
+        }
     }
 
     /// `SpeciesConstructor(O, %Promise%)` — the constructor used by `then`/`finally`

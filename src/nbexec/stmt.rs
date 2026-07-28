@@ -212,8 +212,18 @@ impl<'a> Interp<'a> {
                 // `return expr;` — in tail position (strict, non-async, outside a
                 // `try` Block) a tail call reuses the caller's frame (PTC).
                 Some(e) if self.tail_pos => self.eval_tail_return(e),
-                Some(e) => Ok(Flow::Return(self.eval(e)?)),
-                None => Ok(Flow::Return(NanBox::undefined())),
+                // The flag is set *after* the operand is evaluated: a nested call
+                // in `return f();` runs its own `return`s first and would
+                // otherwise leave the flag describing the callee.
+                Some(e) => {
+                    let v = self.eval(e)?;
+                    self.return_had_expr = true;
+                    Ok(Flow::Return(v))
+                }
+                None => {
+                    self.return_had_expr = false;
+                    Ok(Flow::Return(NanBox::undefined()))
+                }
             },
             // A bare `break`/`continue` has an empty completion value; the
             // enclosing StatementList's `UpdateEmpty` fills in the accumulated

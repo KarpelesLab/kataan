@@ -1443,6 +1443,40 @@ impl<'a> Interp<'a> {
                 N_ASYNC_GEN_RETURN_REJECT => {
                     self.async_gen_return_settled(target, arg0, false);
                 }
+                // `AsyncGeneratorUnwrapYieldResumption` reactions: the `return(v)`
+                // value delivered to a generator suspended at a `yield` has been
+                // awaited — resume the body with it (fulfil) or throw it at the
+                // `yield` point (reject).
+                N_ASYNC_GEN_YIELD_RETURN_FULFILL => {
+                    self.async_gen_yield_return_settled(target, arg0, true);
+                }
+                N_ASYNC_GEN_YIELD_RETURN_REJECT => {
+                    self.async_gen_yield_return_settled(target, arg0, false);
+                }
+                // `AsyncFromSyncIteratorContinuation` reactions on the settled
+                // `valueWrapper`: `target` is the `[done, syncIterator]` state.
+                N_ASYNC_FROM_SYNC_UNWRAP => {
+                    let done = self
+                        .realm
+                        .array_elements(target)
+                        .and_then(|e| e.first().copied())
+                        .is_some_and(|v| self.realm.truthy(v));
+                    return Ok(self.gen_result(arg0, done));
+                }
+                N_ASYNC_FROM_SYNC_CLOSE => {
+                    if let Some(ih) = self
+                        .realm
+                        .array_elements(target)
+                        .and_then(|e| e.get(1).copied())
+                        .and_then(|v| v.as_handle())
+                        .map(Handle::from_raw)
+                    {
+                        // IteratorClose under a throw completion: the original
+                        // rejection wins, so any error from `return()` is dropped.
+                        let _ = self.iterator_close(ih);
+                    }
+                    return Err(ExecError::Throw(arg0));
+                }
                 // `NewPromiseCapability` executor: capture (resolve, reject) into the
                 // bound state object. Per spec, each may be set only once.
                 N_PROMISE_CAPABILITY_EXECUTOR => {

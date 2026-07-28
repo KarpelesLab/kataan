@@ -175,11 +175,6 @@ enum Step<'a> {
         label: Option<String>,
         async_inner: bool,
     },
-    /// (`for await` over a sync-wrapped iterator) The IteratorClose-on-rejection
-    /// guard for AsyncFromSyncIteratorContinuation while the non-done `value` is
-    /// awaited: removed on the fulfil path (by `ForAwaitBind`); on an unwinding
-    /// throw it runs `IteratorClose` on the sync iterator.
-    ForAwaitValueGuard { ih: Handle },
     /// A `try` region marker: while present, a throw is routed to `handler` (if
     /// any) and `finalizer` (if any) runs on the way out.
     TryRegion {
@@ -264,6 +259,9 @@ enum Step<'a> {
     Discard,
     /// `return <value on stack>`.
     ReturnValue,
+    /// (async generators) `return <awaited value on stack>` — the second half of
+    /// `ReturnValue`, reached once the operand's `Await` has settled.
+    ReturnAwaited,
     /// `throw <value on stack>`.
     ThrowValue,
     /// `var`/`let`/`const <name> = <value on stack>` (simple identifier target).
@@ -1050,11 +1048,83 @@ impl<'a> Interp<'a> {
         result
     }
 
-    fn gen_result(&mut self, value: NanBox, done: bool) -> NanBox {
+    pub(crate) fn gen_result(&mut self, value: NanBox, done: bool) -> NanBox {
         let r = self.realm.new_object();
         self.realm.set_property(r, "value", value);
         self.realm.set_property(r, "done", NanBox::boolean(done));
         NanBox::handle(r.to_raw())
+    }
+
+    /// `AsyncFromSyncIteratorContinuation(result, promiseCapability,
+    /// syncIteratorRecord, true)` (27.1.4.4) for the `result` object a *sync*
+    /// iterator just produced: reads `done`/`value`, wraps the value with
+    /// `PromiseResolve(%Promise%, value)`, and returns the promise that settles
+    /// with `CreateIterResultObject(unwrapped, done)`.
+    ///
+    /// The wrapper promise is a real link in the chain — awaiting the returned
+    /// promise therefore costs the two microtask turns the spec prescribes, not
+    /// one. An abrupt `PromiseResolve` (step 6) closes the sync iterator when the
+    /// result was not `done`, then propagates.
+    fn async_from_sync_continuation(
+        &mut self,
+        iter: Handle,
+        result: Result<NanBox, ExecError>,
+    ) -> Result<Handle, ExecError> {
+        let result = result?;
+        let Some(rh) = result.as_handle().map(Handle::from_raw) else {
+            return Err(self.type_error("iterator result is not an object"));
+        };
+        let done = self.read_member(rh, "done")?;
+        let done = self.realm.truthy(done);
+        let value = self.read_member(rh, "value")?;
+        let w = match self.promise_resolve_checked(value) {
+            Ok(w) => w,
+            Err(e) => {
+                // `closeOnRejection` is true here (this is `next`, not `return`):
+                // a non-done result closes the sync iterator before rejecting.
+                if !done {
+                    let _ = self.iterator_close(iter);
+                }
+                return Err(e);
+            }
+        };
+        let state = self.realm.new_array(alloc::vec![
+            NanBox::boolean(done),
+            NanBox::handle(iter.to_raw())
+        ]);
+        let on_f = self.realm.new_bound_native(N_ASYNC_FROM_SYNC_UNWRAP, state);
+        // Step 10: `onRejected` exists only for a non-done result; for a done one
+        // the rejection simply passes through to the capability.
+        let on_r = if done {
+            NanBox::undefined()
+        } else {
+            let f = self.realm.new_bound_native(N_ASYNC_FROM_SYNC_CLOSE, state);
+            NanBox::handle(f.to_raw())
+        };
+        Ok(self.register_then(w, NanBox::handle(on_f.to_raw()), on_r, false))
+    }
+
+    /// `%AsyncFromSyncIteratorPrototype%.next` over a sync iterator: pull one
+    /// `next()` and run [`Self::async_from_sync_continuation`] on it, **always**
+    /// returning a promise. Every abrupt completion inside is an
+    /// `IfAbruptRejectPromise` — it rejects the returned promise rather than
+    /// throwing at the call site, so the caller's `Await` still costs its tick and
+    /// the error surfaces one turn later (observable, and what `for await` over a
+    /// poisoned sync iterator relies on).
+    fn async_from_sync_next(&mut self, iter: Handle, next: NanBox) -> Result<Handle, ExecError> {
+        let iter_val = NanBox::handle(iter.to_raw());
+        let result = self.call_with_this(next, iter_val, &[]);
+        match self.async_from_sync_continuation(iter, result) {
+            Ok(p) => Ok(p),
+            Err(ExecError::Throw(e)) => {
+                let p = self.fresh_promise();
+                self.settle(p, e, false);
+                Ok(p)
+            }
+            // A non-throw fatal (stack overflow, resource limit) is not a JS
+            // completion and must keep unwinding.
+            Err(other) => Err(other),
+        }
     }
 
     /// A fresh promise already rejected with a `TypeError` carrying `msg`.
@@ -1110,7 +1180,21 @@ impl<'a> Interp<'a> {
     /// awaited value when resumed from an `await` microtask. Each iteration either
     /// suspends (parking the generator until a microtask resumes it) or settles the
     /// front request's promise and advances to the next queued request.
-    fn async_gen_drive(&mut self, genobj: Handle, id: usize, mut how: Resumption) {
+    fn async_gen_drive(&mut self, genobj: Handle, id: usize, how: Resumption) {
+        self.async_gen_drive_from(genobj, id, how, true);
+    }
+
+    /// [`Self::async_gen_drive`], with `unwrap` selecting whether the *initial*
+    /// `how` still has to go through `AsyncGeneratorUnwrapYieldResumption`
+    /// (27.6.3.7). It is `false` only on the re-entry from that operation's own
+    /// `Await` reaction, whose value has already been unwrapped.
+    fn async_gen_drive_from(
+        &mut self,
+        genobj: Handle,
+        id: usize,
+        mut how: Resumption,
+        mut unwrap: bool,
+    ) {
         loop {
             let (started, done) = self.gen_frames[id]
                 .as_ref()
@@ -1125,7 +1209,24 @@ impl<'a> Interp<'a> {
                 if let Some(f) = self.gen_frames[id].as_mut() {
                     f.done = true;
                 }
-                let inner = self.promise_resolve(v);
+                // Step 6/7: `PromiseResolve` is a *completion* — a `constructor`
+                // getter that throws completes the step abruptly, rejecting the
+                // request's promise instead of parking on an await.
+                let inner = match self.promise_resolve_checked(v) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let e = self.abrupt_value(e, "async generator internal error");
+                        self.async_gen_settle(id, e, false);
+                        match self.next_queued(id) {
+                            Some(next) => {
+                                how = next;
+                                unwrap = true;
+                                continue;
+                            }
+                            None => return,
+                        }
+                    }
+                };
                 let on_f = self
                     .realm
                     .new_bound_native(N_ASYNC_GEN_RETURN_FULFILL, genobj);
@@ -1140,12 +1241,54 @@ impl<'a> Interp<'a> {
                 );
                 return;
             }
+            // `AsyncGeneratorUnwrapYieldResumption` (27.6.3.7): a `return`
+            // completion delivered to a generator suspended *at a yield* is first
+            // `Await`ed, and only the settled value becomes the return completion
+            // resumed into the body. A rejection (or an abrupt `PromiseResolve`)
+            // is instead thrown at the yield point, where the body's `try`/
+            // `finally` can observe it.
+            if unwrap && let Resumption::Return(v) = how {
+                match self.promise_resolve_checked(v) {
+                    Ok(inner) => {
+                        let on_f = self
+                            .realm
+                            .new_bound_native(N_ASYNC_GEN_YIELD_RETURN_FULFILL, genobj);
+                        let on_r = self
+                            .realm
+                            .new_bound_native(N_ASYNC_GEN_YIELD_RETURN_REJECT, genobj);
+                        self.register_then(
+                            inner,
+                            NanBox::handle(on_f.to_raw()),
+                            NanBox::handle(on_r.to_raw()),
+                            false,
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        how = Resumption::Throw(
+                            self.abrupt_value(e, "async generator internal error"),
+                        );
+                    }
+                }
+            }
+            unwrap = true;
             match self.run_generator(id, how) {
                 // `await value`: `PromiseResolve(value)` then park the generator —
                 // a microtask resumes it (at the `await` point) on settlement. The
                 // front request stays in place; it is settled on a later yield/done.
                 Ok(GenStep::Awaited(v)) => {
-                    let inner = self.promise_resolve(v);
+                    // An abrupt `PromiseResolve` (a throwing `constructor` getter)
+                    // is the `Await`'s own completion: resume the body by throwing
+                    // it at the `await` point rather than parking.
+                    let inner = match self.promise_resolve_checked(v) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            how = Resumption::Throw(
+                                self.abrupt_value(e, "async generator internal error"),
+                            );
+                            continue;
+                        }
+                    };
                     let on_f = self
                         .realm
                         .new_bound_native(N_ASYNC_GEN_AWAIT_FULFILL, genobj);
@@ -1190,13 +1333,51 @@ impl<'a> Interp<'a> {
             }
             // The current request has been settled and removed. Continue with the
             // next queued request (AsyncGeneratorDrainQueue), or park if none.
-            match self.gen_frames[id]
-                .as_ref()
-                .and_then(|f| f.async_queue.first().map(|r| r.how))
-            {
+            match self.next_queued(id) {
                 Some(next) => how = next,
                 None => return,
             }
+        }
+    }
+
+    /// The completion of the front `[[AsyncGeneratorQueue]]` request, if any.
+    fn next_queued(&self, id: usize) -> Option<Resumption> {
+        self.gen_frames[id]
+            .as_ref()
+            .and_then(|f| f.async_queue.first().map(|r| r.how))
+    }
+
+    /// The thrown value of an abrupt completion reached where no `Result` can be
+    /// propagated (inside a microtask reaction): a genuine `throw` surfaces its
+    /// value, any other fatal becomes a `TypeError` carrying `msg`.
+    fn abrupt_value(&mut self, e: ExecError, msg: &str) -> NanBox {
+        match e {
+            ExecError::Throw(v) => v,
+            _ => {
+                let m = self.new_str(msg);
+                self.make_error(N_TYPE_ERROR, Some(m))
+            }
+        }
+    }
+
+    /// The `AsyncGeneratorUnwrapYieldResumption` `Await` reaction: the awaited
+    /// `return(v)` value settled while the generator was suspended at a `yield`.
+    /// On fulfilment the body is resumed with a `return` completion carrying the
+    /// *unwrapped* value (skipping a second unwrap); on rejection the reason is
+    /// thrown at the yield point.
+    pub(crate) fn async_gen_yield_return_settled(
+        &mut self,
+        genobj: Handle,
+        value: NanBox,
+        fulfilled: bool,
+    ) {
+        let Some(id) = self.gen_frame_id(genobj) else {
+            return;
+        };
+        if fulfilled {
+            self.async_gen_drive_from(genobj, id, Resumption::Return(value), false);
+        } else {
+            self.async_gen_drive_from(genobj, id, Resumption::Throw(value), false);
         }
     }
 
@@ -1338,54 +1519,66 @@ impl<'a> Interp<'a> {
         &mut self,
         id: usize,
         controller: Handle,
-        how: Resumption,
+        mut how: Resumption,
         promise: Option<Handle>,
     ) {
-        match self.run_generator(id, how) {
-            Ok(GenStep::Done(v)) => {
-                if let Some(p) = promise {
-                    self.resolve_with(p, v);
+        // `how` is re-driven (rather than returned) when `Await`'s own
+        // `PromiseResolve` completes abruptly: that abrupt completion belongs at
+        // the `await` point inside the body, not to the caller.
+        loop {
+            match self.run_generator(id, how) {
+                Ok(GenStep::Done(v)) => {
+                    if let Some(p) = promise {
+                        self.resolve_with(p, v);
+                    }
+                }
+                Ok(GenStep::Awaited(v)) => {
+                    // `await v`: PromiseResolve(v), then schedule the coroutine's
+                    // resume as microtask reactions on its settlement.
+                    let inner = match self.promise_resolve_checked(v) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            how = Resumption::Throw(self.abrupt_value(e, "await internal error"));
+                            continue;
+                        }
+                    };
+                    let on_f = self
+                        .realm
+                        .new_bound_native(N_ASYNC_RESUME_FULFILL, controller);
+                    let on_r = self
+                        .realm
+                        .new_bound_native(N_ASYNC_RESUME_REJECT, controller);
+                    self.register_then(
+                        inner,
+                        NanBox::handle(on_f.to_raw()),
+                        NanBox::handle(on_r.to_raw()),
+                        false,
+                    );
+                }
+                // A generator suspension cannot arise in an async (non-generator) body.
+                Ok(GenStep::Yielded(_)) | Ok(GenStep::YieldedResult(_)) => {
+                    if let Some(p) = promise {
+                        self.resolve_with(p, NanBox::undefined());
+                    }
+                }
+                Err(ExecError::Throw(e)) => {
+                    if let Some(p) = promise {
+                        self.settle(p, e, false);
+                    }
+                }
+                // A non-throw fatal (stack overflow, resource limit): reject with it as
+                // best-effort so the loop does not silently swallow it. There is no
+                // surrounding `Result` here (we run inside a microtask), so surface it
+                // through the promise.
+                Err(other) => {
+                    if let Some(p) = promise {
+                        let msg = self.new_str(&alloc::format!("{other:?}"));
+                        let err = self.make_error(N_TYPE_ERROR, Some(msg));
+                        self.settle(p, err, false);
+                    }
                 }
             }
-            Ok(GenStep::Awaited(v)) => {
-                // `await v`: PromiseResolve(v), then schedule the coroutine's
-                // resume as microtask reactions on its settlement.
-                let inner = self.promise_resolve(v);
-                let on_f = self
-                    .realm
-                    .new_bound_native(N_ASYNC_RESUME_FULFILL, controller);
-                let on_r = self
-                    .realm
-                    .new_bound_native(N_ASYNC_RESUME_REJECT, controller);
-                self.register_then(
-                    inner,
-                    NanBox::handle(on_f.to_raw()),
-                    NanBox::handle(on_r.to_raw()),
-                    false,
-                );
-            }
-            // A generator suspension cannot arise in an async (non-generator) body.
-            Ok(GenStep::Yielded(_)) | Ok(GenStep::YieldedResult(_)) => {
-                if let Some(p) = promise {
-                    self.resolve_with(p, NanBox::undefined());
-                }
-            }
-            Err(ExecError::Throw(e)) => {
-                if let Some(p) = promise {
-                    self.settle(p, e, false);
-                }
-            }
-            // A non-throw fatal (stack overflow, resource limit): reject with it as
-            // best-effort so the loop does not silently swallow it. There is no
-            // surrounding `Result` here (we run inside a microtask), so surface it
-            // through the promise.
-            Err(other) => {
-                if let Some(p) = promise {
-                    let msg = self.new_str(&alloc::format!("{other:?}"));
-                    let err = self.make_error(N_TYPE_ERROR, Some(msg));
-                    self.settle(p, err, false);
-                }
-            }
+            return;
         }
     }
 
@@ -2314,13 +2507,13 @@ impl<'a> Interp<'a> {
                 // `ForAwaitBind`), so a rejection *before* the body (a rejected
                 // `next()` result, or the sync value-unwrap) does not re-close via
                 // this loop marker — only a body-abrupt completion does.
-                let iter_val = NanBox::handle(ih.to_raw());
-                let res = self
-                    .call_with_this(next, iter_val, &[])
-                    .map_err(GenAbrupt::from)?;
                 if async_inner {
                     // Native async iterator: `next()` returns a promise; await it,
                     // then read `done`/`value` from the settled result in `ForAwaitBind`.
+                    let iter_val = NanBox::handle(ih.to_raw());
+                    let res = self
+                        .call_with_this(next, iter_val, &[])
+                        .map_err(GenAbrupt::from)?;
                     stack.push(Step::ForAwaitBind {
                         ih,
                         next,
@@ -2331,20 +2524,15 @@ impl<'a> Interp<'a> {
                     });
                     return Ok(StepOut::Await(res));
                 }
-                // Sync iterator wrapped as async: the result is a plain object. Read
-                // `done` now; a done result ends the loop (no body). Otherwise unwrap
-                // (`await`) the value, guarded so a rejection closes the sync iterator.
-                let Some(rh) = res.as_handle().map(Handle::from_raw) else {
-                    return Err(GenAbrupt::Throw(
-                        self.make_type_error("iterator result is not an object"),
-                    ));
-                };
-                let done = self.read_member(rh, "done").map_err(GenAbrupt::from)?;
-                if self.realm.truthy(done) {
-                    return Ok(StepOut::Continue);
-                }
-                let value = self.read_member(rh, "value").map_err(GenAbrupt::from)?;
-                stack.push(Step::ForAwaitValueGuard { ih });
+                // Sync iterator wrapped as AsyncFromSyncIterator: the sync result
+                // object is turned by `%AsyncFromSyncIteratorPrototype%.next` into a
+                // *promise* of an iterator-result object. Awaiting that promise is
+                // what the loop does — two microtask turns per iteration (the
+                // continuation's value unwrap, then this `Await`), which is
+                // observable and must not be collapsed into one.
+                let p = self
+                    .async_from_sync_next(ih, next)
+                    .map_err(GenAbrupt::from)?;
                 stack.push(Step::ForAwaitBind {
                     ih,
                     next,
@@ -2353,7 +2541,7 @@ impl<'a> Interp<'a> {
                     label,
                     async_inner: false,
                 });
-                Ok(StepOut::Await(value))
+                Ok(StepOut::Await(NanBox::handle(p.to_raw())))
             }
             Step::ForAwaitBind {
                 ih,
@@ -2363,10 +2551,11 @@ impl<'a> Interp<'a> {
                 label,
                 async_inner,
             } => {
-                // The awaited operand is on the value stack: a result object (native
-                // async) or an unwrapped value (sync-wrapped).
+                // The awaited operand is on the value stack: an iterator-result
+                // object either way (a native async iterator's own `next()` promise,
+                // or the AsyncFromSyncIterator continuation's).
                 let awaited = values.pop().unwrap_or(NanBox::undefined());
-                let value = if async_inner {
+                let value = {
                     let Some(rh) = awaited.as_handle().map(Handle::from_raw) else {
                         return Err(GenAbrupt::Throw(
                             self.make_type_error("iterator result is not an object"),
@@ -2377,13 +2566,6 @@ impl<'a> Interp<'a> {
                         return Ok(StepOut::Continue);
                     }
                     self.read_member(rh, "value").map_err(GenAbrupt::from)?
-                } else {
-                    // The sync value-unwrap `await` fulfilled: drop its close guard
-                    // (it only fires on rejection).
-                    if matches!(stack.last(), Some(Step::ForAwaitValueGuard { .. })) {
-                        stack.pop();
-                    }
-                    awaited
                 };
                 // Re-push the loop marker for the next iteration BELOW the body, so a
                 // body break/return/throw unwinds into it (IteratorClose), and a
@@ -2425,9 +2607,6 @@ impl<'a> Interp<'a> {
                 }
                 self.gen_exec_loop_body(body, stack, values, &label)
             }
-            // A value-unwrap close guard reached normally (its `await` fulfilled) is
-            // a no-op — `ForAwaitBind` already removed it.
-            Step::ForAwaitValueGuard { .. } => Ok(StepOut::Continue),
             // A `try` region reached with no abrupt completion: run its
             // `finalizer` (if any) on the normal way out, restoring the try scope.
             Step::TryRegion {
@@ -2456,6 +2635,18 @@ impl<'a> Interp<'a> {
                 Ok(StepOut::Continue)
             }
             Step::ReturnValue => {
+                let v = values.pop().unwrap_or(NanBox::undefined());
+                // 14.10.1 step 3: in an async *generator* (GetGeneratorKind() is
+                // async) an explicit `return <expr>` awaits the operand before the
+                // return completion — so `return undefined` costs a tick that a
+                // bare `return;` (and falling off the end) does not.
+                if self.gen_is_async {
+                    stack.push(Step::ReturnAwaited);
+                    return Ok(StepOut::Await(v));
+                }
+                Err(GenAbrupt::Return(v))
+            }
+            Step::ReturnAwaited => {
                 let v = values.pop().unwrap_or(NanBox::undefined());
                 Err(GenAbrupt::Return(v))
             }
@@ -3413,6 +3604,13 @@ impl<'a> Interp<'a> {
             }
             return match self.exec(stmt) {
                 Ok(Flow::Normal(_)) => Ok(StepOut::Continue),
+                // 14.10.1 step 3: in an async generator, `return <Expression>;`
+                // awaits its operand before the return completion propagates. The
+                // statement ran in one shot, so the `Await` is re-entered here.
+                Ok(Flow::Return(v)) if self.gen_is_async && self.return_had_expr => {
+                    stack.push(Step::ReturnAwaited);
+                    Ok(StepOut::Await(v))
+                }
                 Ok(Flow::Return(v)) => Err(GenAbrupt::Return(v)),
                 Ok(Flow::Break(l, _)) => {
                     // A labeled break matching this statement's label is consumed.
@@ -4287,13 +4485,6 @@ impl<'a> Interp<'a> {
                         }
                         // Return / Throw / a non-matching break keep unwinding.
                         _ => {}
-                    }
-                }
-                Step::ForAwaitValueGuard { ih } => {
-                    // The non-done value-unwrap `await` rejected: close the sync
-                    // iterator for side effects; the original rejection wins (spec).
-                    if let Completion::Throw(_) = &completion {
-                        let _ = self.iterator_close(ih);
                     }
                 }
                 Step::SwitchRegion => {

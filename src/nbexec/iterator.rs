@@ -2114,7 +2114,22 @@ impl<'a> Interp<'a> {
     /// keeps the whole activation alive.
     fn fa_await(&mut self, s: Handle, value: NanBox, stage: f64) {
         self.realm.set_element(s, FA_STAGE, NanBox::number(stage));
-        let p = self.promise_resolve(value);
+        // `Await`'s own `PromiseResolve` is observable (`Get(x, "constructor")`)
+        // and can complete abruptly; there is no caller left to catch it, so it
+        // rejects the `fromAsync` promise like any other abrupt completion.
+        let p = match self.promise_resolve_checked(value) {
+            Ok(p) => p,
+            Err(ExecError::Throw(e)) => {
+                self.fa_reject(s, e);
+                return;
+            }
+            Err(_) => {
+                let m = self.new_str("Array.fromAsync internal error");
+                let e = self.make_error(N_TYPE_ERROR, Some(m));
+                self.fa_reject(s, e);
+                return;
+            }
+        };
         let on_f = self.realm.new_bound_native(N_FROM_ASYNC_STEP, s);
         let on_r = self.realm.new_bound_native(N_FROM_ASYNC_THROW, s);
         self.register_then(

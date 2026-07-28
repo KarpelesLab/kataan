@@ -427,6 +427,13 @@ pub struct Interp<'a> {
     /// callee is a plain JS function), `return f(...)` yields
     /// [`ExecError::TailCall`] for `invoke`'s trampoline instead of recursing.
     tail_pos: bool,
+    /// Whether the `Flow::Return` most recently produced by the one-shot walker
+    /// came from `return <Expression>;` rather than a bare `return;`. Only the
+    /// former is `Await`ed in an async generator (14.10.1 step 3), and the two are
+    /// indistinguishable from the [`Flow::Return`] value alone (both can carry
+    /// `undefined`). Written where the completion is produced, read immediately by
+    /// the coroutine walker's yield-free fast path.
+    return_had_expr: bool,
     /// Whether `new.target` is lexically in scope at the current execution point —
     /// true inside a non-arrow function/method/constructor body, a class field
     /// initializer, or a static block; false at top-level script/module code. An
@@ -1495,6 +1502,21 @@ const N_ASYNC_GEN_RETURN_FULFILL: u16 = 564;
 /// `AsyncGeneratorAwaitReturn` rejection: the awaited `return(v)` value rejected;
 /// reject the front request with the reason and drain the queue.
 const N_ASYNC_GEN_RETURN_REJECT: u16 = 565;
+/// `AsyncGeneratorUnwrapYieldResumption` fulfilment: a `return(v)` delivered to a
+/// generator suspended at a `yield` awaits `v` first; resume the body with a
+/// `return` completion carrying the settled value.
+const N_ASYNC_GEN_YIELD_RETURN_FULFILL: u16 = 566;
+/// `AsyncGeneratorUnwrapYieldResumption` rejection: the awaited `return(v)` value
+/// rejected; throw the reason at the `yield` point instead.
+const N_ASYNC_GEN_YIELD_RETURN_REJECT: u16 = 567;
+/// `AsyncFromSyncIteratorContinuation`'s value-unwrap closure (27.1.4.4 step 8):
+/// bound to a `[done, syncIterator]` state array, it turns the settled
+/// `valueWrapper` into `CreateIterResultObject(value, done)`.
+const N_ASYNC_FROM_SYNC_UNWRAP: u16 = 568;
+/// `AsyncFromSyncIteratorContinuation`'s `closeOnRejection` closure (step 10): the
+/// non-done value wrapper rejected — close the underlying *sync* iterator, then
+/// re-throw so the capability rejects with the original reason.
+const N_ASYNC_FROM_SYNC_CLOSE: u16 = 569;
 /// `Object.prototype.__defineGetter__(P, getter)` (Annex B).
 const N_OBJ_DEFINE_GETTER: u16 = 348;
 /// `Object.prototype.__defineSetter__(P, setter)` (Annex B).
@@ -3016,6 +3038,7 @@ impl<'a> Interp<'a> {
             pending_class_name: None,
             call_depth: 0,
             tail_pos: false,
+            return_had_expr: false,
             new_target_in_scope: false,
             eval_depth: 0,
             rng_state: math_random_seed(),
