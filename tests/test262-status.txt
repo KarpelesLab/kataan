@@ -212,13 +212,7 @@ language/expressions/yield/rhs-template-middle.js  # [sloppy] expected pass, Par
 language/expressions/yield/star-in-rltn-expr.js  # [sloppy] expected pass, Runtime TypeError: yield* operand is not iterable
 language/function-code/10.4.3-1-104.js  # [strict] expected pass, Runtime Test262Error: (5).x === 5
 language/function-code/10.4.3-1-106.js  # [strict] expected pass, Runtime Test262Error: typeof (5).x Expected SameValue(«"object"», «"number"») to be true
-language/function-code/block-decl-onlystrict.js  # [strict] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/function-code/switch-case-decl-onlystrict.js  # [strict] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/function-code/switch-dflt-decl-onlystrict.js  # [strict] expected pass, Runtime TypeError: cannot read property of null or undefined
-language/global-code/block-decl-strict.js  # [strict] expected pass, Runtime Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all
 language/global-code/decl-lex-restricted-global.js  # [sloppy] expected SyntaxError but the test passed
-language/global-code/switch-case-decl-strict.js  # [strict] expected pass, Runtime Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all
-language/global-code/switch-dflt-decl-strict.js  # [strict] expected pass, Runtime Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all
 language/import/import-defer/errors/get-other-while-dep-evaluating-async/main.js  # async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: ns.foo while evaluating throws a TypeError )
 language/import/import-defer/errors/module-throws/defer-import-after-evaluation.js  # async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Evaluation errors are thrown for modules evaluated before getting t)
 language/import/import-defer/evaluation-top-level-await/flattening-order/main.js  # expected pass, Runtime Test262Error: Actual [1, 3, 5] and expected [1, 2.1.1 start, 2.2.1, 2.2 start, 3, 5, 2.1.1 end, 2.2 end, 4.1 start, 4.1 end] should have the same contents. 

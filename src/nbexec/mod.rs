@@ -6462,8 +6462,16 @@ impl<'a> Interp<'a> {
             collect_var_names(stmts, &mut var_names);
             // Annex B: a function declared inside a block also var-hoists its name
             // to the enclosing function scope (initially `undefined`).
+            //
+            // B.3.3 is a **sloppy-mode** web-compatibility extension only. In
+            // strict code a block-level function declaration is an ordinary
+            // lexical declaration of that block, so its name must not appear in
+            // the variable environment at all and a reference outside the block is
+            // a ReferenceError.
             let mut block_fn_names: Vec<&str> = Vec::new();
-            collect_block_function_names(stmts, &mut block_fn_names);
+            if !self.strict {
+                collect_block_function_names(stmts, &mut block_fn_names);
+            }
             // A block-function name qualifies for the B.3.3 runtime update unless
             // it collides with a parameter or other binding already present in the
             // variable environment (where the function-code extension B.3.3.2 does
