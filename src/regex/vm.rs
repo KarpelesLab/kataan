@@ -30,7 +30,7 @@ use core::cell::Cell;
 /// pattern; lowered ~33× to keep catastrophic backtracking well under a second
 /// while still covering legitimate patterns (the regex suite passes). The
 /// counter is created once per *find* (in `captures_at`) and shared across all
-/// start positions via `run_shared`, so the bound covers the whole operation,
+/// start positions via `run_with`, so the bound covers the whole operation,
 /// not each start independently (RE-8).
 const STEP_BASE: u64 = crate::limits::DEFAULT_REGEX_STEP_BASE;
 const STEP_PER_CHAR: u64 = 1_000;
@@ -252,14 +252,26 @@ fn read_dir(input: &[u16], sp: usize, unicode: bool, reverse: bool) -> Option<(u
     }
 }
 
+/// The per-attempt working buffers, owned by the caller so one scan reuses them
+/// across start positions instead of allocating three vectors per offset — an
+/// attempt that fails on its first instruction still paid for all three.
+#[derive(Default)]
+pub(crate) struct Scratch {
+    saves: Vec<Option<usize>>,
+    loops: Vec<(usize, usize)>,
+    flag_stack: Vec<Flags>,
+}
+
 /// Runs `prog` against `input` (UTF-16 code units) starting at unit index
 /// `start`, returning the capture slots (`2 * (group_count + 1)` of them, as
-/// `(start, end)` unit-index pairs) on success.
+/// `(start, end)` unit-index pairs) on success. `scratch` is reset per attempt.
 ///
 /// Threads a caller-owned step counter and budget so a multi-start find
 /// ([`super::Regex::captures_at`]) shares one budget across all start positions
 /// instead of resetting it per start (RE-8).
-pub(crate) fn run_shared(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_with(
+    scratch: &mut Scratch,
     prog: &[Inst],
     input: &[u16],
     start: usize,
@@ -268,7 +280,18 @@ pub(crate) fn run_shared(
     steps: &Cell<u64>,
     budget: u64,
 ) -> Option<Vec<Option<(usize, usize)>>> {
-    let mut saves = alloc::vec![None; 2 * (group_count + 1)];
+    let Scratch {
+        saves,
+        loops,
+        flag_stack,
+    } = scratch;
+    saves.clear();
+    saves.resize(2 * (group_count + 1), None);
+    loops.clear();
+    // The flag stack: the base flags sit at the bottom; each entered
+    // inline-modifier scope (`(?ims-ims:…)`) pushes the locally-adjusted flags.
+    flag_stack.clear();
+    flag_stack.push(flags);
     let ctx = Ctx {
         prog,
         input,
@@ -278,11 +301,7 @@ pub(crate) fn run_shared(
         steps,
         budget,
     };
-    let mut loops: Vec<(usize, usize)> = Vec::new();
-    // The flag stack: the base flags sit at the bottom; each entered
-    // inline-modifier scope (`(?ims-ims:…)`) pushes the locally-adjusted flags.
-    let mut flag_stack: Vec<Flags> = alloc::vec![flags];
-    if backtrack(&ctx, 0, start, &mut saves, 0, &mut loops, &mut flag_stack) {
+    if backtrack(&ctx, 0, start, saves, 0, loops, flag_stack) {
         // Pair the raw save slots into (start, end) spans per group.
         let mut groups = Vec::with_capacity(group_count + 1);
         for g in 0..=group_count {

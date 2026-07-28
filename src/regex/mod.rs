@@ -410,6 +410,8 @@ impl Regex {
         } else {
             self.first_unit
         };
+        // One set of working buffers for the whole scan (see `vm::Scratch`).
+        let mut scratch = vm::Scratch::default();
         let mut s = start;
         while s <= last {
             if let Some(want) = filter {
@@ -418,9 +420,16 @@ impl Regex {
                     return None;
                 }
             }
-            if let Some(groups) =
-                vm::run_shared(prog, units, s, self.group_count, flags, &steps, budget)
-            {
+            if let Some(groups) = vm::run_with(
+                &mut scratch,
+                prog,
+                units,
+                s,
+                self.group_count,
+                flags,
+                &steps,
+                budget,
+            ) {
                 return Some(Captures { groups });
             }
             s += 1;
