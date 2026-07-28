@@ -91,6 +91,18 @@ pub struct Lexer<'src> {
     /// param-list `)` — pops the matching entry. Nested function expressions in
     /// parameter defaults push/pop in LIFO order with their own bodies.
     func_stmt_stack: Vec<bool>,
+    /// Stack of pending `class` contexts: one entry per `class` keyword whose
+    /// body `{` has not yet been seen, recording whether that `class` occurred in
+    /// *statement* position (a `ClassDeclaration`, so a `/` after the closing `}`
+    /// is a regex) versus *expression* position (a `ClassExpression`, a value, so
+    /// a following `/` is division), together with the brace and paren nesting
+    /// depths at the keyword. The body `{` is the next `{` seen at those same
+    /// depths, which is what distinguishes it from a brace inside the
+    /// `extends` expression (`class C extends f({a: 1}) {}` — the object literal
+    /// is one paren deeper).
+    class_stack: Vec<(bool, usize, u32)>,
+    /// Nesting depth of `(`/`[`, tracked only to place a class body `{`.
+    paren_depth: u32,
     /// Set while scanning an identifier (or private name) that contained a
     /// `\u` escape; consumed and cleared by [`Lexer::make`].
     cur_had_escape: bool,
@@ -119,6 +131,8 @@ impl<'src> Lexer<'src> {
             brace_stack: Vec::new(),
             last_rbrace_closed_block: false,
             func_stmt_stack: Vec::new(),
+            class_stack: Vec::new(),
+            paren_depth: 0,
             cur_had_escape: false,
             module,
         }
@@ -193,10 +207,22 @@ impl<'src> Lexer<'src> {
                     matches!(self.brace_stack.pop(), Some(BraceKind::Block));
                 TokenKind::RBrace
             }
-            b'(' => self.single(TokenKind::LParen),
-            b')' => self.single(TokenKind::RParen),
-            b'[' => self.single(TokenKind::LBracket),
-            b']' => self.single(TokenKind::RBracket),
+            b'(' => {
+                self.paren_depth += 1;
+                self.single(TokenKind::LParen)
+            }
+            b')' => {
+                self.paren_depth = self.paren_depth.saturating_sub(1);
+                self.single(TokenKind::RParen)
+            }
+            b'[' => {
+                self.paren_depth += 1;
+                self.single(TokenKind::LBracket)
+            }
+            b']' => {
+                self.paren_depth = self.paren_depth.saturating_sub(1);
+                self.single(TokenKind::RBracket)
+            }
             b';' => self.single(TokenKind::Semicolon),
             b',' => self.single(TokenKind::Comma),
             b'~' => self.single(TokenKind::Tilde),
@@ -1262,6 +1288,14 @@ impl<'src> Lexer<'src> {
     /// the line-terminator flag of the `{` token (for the `return`⏎`{` ASI case).
     fn brace_is_block(&mut self, newline_before: bool) -> bool {
         use TokenKind as T;
+        // A pending `class` whose nesting depths match: this `{` opens its body.
+        if let Some(&(is_decl, braces, parens)) = self.class_stack.last()
+            && braces == self.brace_stack.len()
+            && parens == self.paren_depth
+        {
+            self.class_stack.pop();
+            return is_decl;
+        }
         let Some(prev) = self.prev_significant else {
             // Start of input: a `{` begins a (block) statement.
             return true;
@@ -1406,6 +1440,15 @@ impl<'src> Lexer<'src> {
         if kind == TokenKind::Keyword(Keyword::Function) {
             let is_decl = self.function_at_statement_start();
             self.func_stmt_stack.push(is_decl);
+        }
+        // Likewise a `class` keyword: its body `{` opens a block for a
+        // `ClassDeclaration` (so `class C {} /re/` lexes the `/` as a regex) and a
+        // value for a `ClassExpression`. Recorded with the nesting depths so the
+        // body brace can be told from one inside the `extends` expression.
+        if kind == TokenKind::Keyword(Keyword::Class) {
+            let is_decl = self.function_at_statement_start();
+            self.class_stack
+                .push((is_decl, self.brace_stack.len(), self.paren_depth));
         }
         if kind != TokenKind::Eof {
             self.prev_significant = Some(kind);
