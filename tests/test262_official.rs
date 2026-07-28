@@ -709,6 +709,11 @@ fn coordinate() {
     );
 }
 
+/// The recorded reason for a worker killed after making no progress.
+fn hung_reason(secs: u64) -> String {
+    format!("no progress for {secs}s (hung)")
+}
+
 /// What a shard's progress file reveals after a child exits.
 struct Scan {
     /// The child finished its whole shard (wrote the `DONE` marker).
@@ -759,12 +764,12 @@ fn manage_shard(
     // loop or catastrophic backtracking) — the child is killed and the in-flight
     // test recorded as a failure, exactly like a native crash.
     //
-    // Generous on purpose. A genuinely hung test never finishes, so the only cost
-    // of a long timeout is how quickly one is detected; a *short* one turns the
-    // slowest legitimate tests (some Temporal arithmetic) into spurious failures
-    // whenever the machine is loaded — which is exactly when the suite is run
-    // with several workers.
-    const IDLE_TIMEOUT_SECS: u64 = 90;
+    // A hang costs this much wall clock every time one is hit, and the suite hits
+    // ~20 by design (the `$262.agent` tests that need true interleaving), so it
+    // wants to be as small as is safely possible. It is *not* the knob for
+    // spurious failures: those came from workers crossing the address-space cap
+    // below, which aborts rather than stalls — see `KillReason`.
+    const IDLE_TIMEOUT_SECS: u64 = 30;
     // Hard per-worker address-space cap (KiB) enforced via `ulimit -v`. A test
     // with an unbounded allocation (e.g. a typed array / ArrayBuffer / string of
     // pathological size) hits this ceiling, its allocation is refused, the worker
@@ -813,6 +818,12 @@ fn manage_shard(
         let file_len = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
         let mut last_len = file_len(outpath);
         let mut idle = 0u64;
+        // Why the child stopped. A worker that exits on its own has crashed or
+        // been aborted (a failed allocation under the `ulimit -v` cap above); one
+        // we kill has stopped making progress. Both leave an in-flight test, but
+        // they are different faults and reporting them as one ("crash or timeout")
+        // sends the reader looking at the wrong thing.
+        let mut killed = false;
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => break,
@@ -828,6 +839,7 @@ fn manage_shard(
                 idle += 1;
             }
             if idle >= IDLE_TIMEOUT_SECS {
+                killed = true;
                 let _ = child.kill();
                 let _ = child.wait();
                 break;
@@ -845,10 +857,15 @@ fn manage_shard(
                     .append(true)
                     .open(outpath)
                 {
-                    let _ = writeln!(
-                        f,
-                        "R\t{idx}\t{rel}\tFAIL\tcrash or timeout (native abort / hang)"
-                    );
+                    let reason = if killed {
+                        hung_reason(IDLE_TIMEOUT_SECS)
+                    } else {
+                        String::from(
+                            "worker exited mid-test (native abort — a failed allocation \
+                             under the address-space cap, or a stack overflow)",
+                        )
+                    };
+                    let _ = writeln!(f, "R\t{idx}\t{rel}\tFAIL\t{reason}");
                 }
                 start = idx + workers;
             }
