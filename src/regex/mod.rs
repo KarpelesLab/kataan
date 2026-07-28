@@ -83,6 +83,11 @@ pub struct Regex {
     /// The original pattern source, retained so [`scalar_prog`](Self::scalar_prog)
     /// can be parsed+compiled lazily on first adapter use.
     source: alloc::string::String,
+    /// Whether every path through the program passes a `^` assertion before it
+    /// can consume input or match — so a non-multiline match can only begin at
+    /// one position and the scan must not retry at every offset. See
+    /// [`program_is_anchored`].
+    anchored: bool,
     /// Number of capturing groups (excluding the whole-match group 0).
     group_count: usize,
     /// `(group index, name)` pairs for named capture groups (`(?<name>…)`).
@@ -200,6 +205,7 @@ impl Regex {
         let (ast, _, group_names) = parser::parse(pattern, flags.unicode, flags.unicode_sets)?;
         let (prog, group_count) = compile::compile(&ast, &group_names, flags.unicode)?;
         Ok(Regex {
+            anchored: program_is_anchored(&prog),
             prog,
             scalar_prog: core::cell::OnceCell::new(),
             source: alloc::string::String::from(pattern),
@@ -374,7 +380,19 @@ impl Regex {
         start: usize,
         flags: Flags,
     ) -> Option<Captures> {
-        let last = if flags.sticky { start } else { units.len() };
+        // A sticky match must begin exactly at `start`. So must an anchored one
+        // (`^…`) when `m` is off: `^` holds only at position 0, so if `start` is 0
+        // there is exactly one candidate, and if it is not, no position from
+        // `start` on can match — and either way one attempt settles it. Without
+        // this the scan retried every offset in the subject and let the VM reject
+        // each on the leading assertion, making a guaranteed-failing anchored
+        // `test()` cost O(subject length) instead of O(1).
+        let anchored = self.anchored && !flags.multiline;
+        let last = if flags.sticky || anchored {
+            start
+        } else {
+            units.len()
+        };
         let steps = core::cell::Cell::new(0u64);
         let budget = vm::budget_for(units.len());
         for s in start..=last {
@@ -418,6 +436,55 @@ impl Regex {
         out.extend(&chars[pos.min(chars.len())..]);
         out
     }
+}
+
+/// Whether `prog` can only match at the position the scan starts from: every
+/// path from the entry reaches a `^` assertion before it consumes input or
+/// matches.
+///
+/// Walks the control-flow graph, following `Jmp`/`Split` and passing through the
+/// zero-width bookkeeping instructions. Reaching a consuming instruction — or
+/// `Match` — without having passed `Assert::Start` proves the pattern can match
+/// somewhere other than the start, so the answer is `false`. Anything unhandled
+/// answers `false` too, which only costs the optimization.
+///
+/// Deliberately conservative in three places: an `Assert::Start` *inside* a
+/// lookaround does not count (the lookaround is zero-width and may be negated),
+/// a revisited instruction contributes no new path (any real counterexample is
+/// found on some first visit), and an inline-modifier scope gives up entirely
+/// since `(?m:^)` would make the assertion match at every line start.
+///
+/// The result holds only when the `m` flag is off — the caller checks that.
+fn program_is_anchored(prog: &[vm::Inst]) -> bool {
+    use vm::{Assert, Inst};
+    let mut seen = alloc::vec![false; prog.len()];
+    let mut stack = alloc::vec![0usize];
+    while let Some(pc) = stack.pop() {
+        let Some(inst) = prog.get(pc) else {
+            return false;
+        };
+        if core::mem::replace(&mut seen[pc], true) {
+            continue;
+        }
+        match inst {
+            // Pinned to the subject start: this path cannot match anywhere else.
+            Inst::Assert(Assert::Start) => {}
+            Inst::Jmp(t) => stack.push(*t),
+            Inst::Split(a, b) => {
+                stack.push(*a);
+                stack.push(*b);
+            }
+            // Zero-width and position-agnostic: keep looking for the `^`.
+            Inst::Save(_)
+            | Inst::ClearCaptures { .. }
+            | Inst::Assert(Assert::End | Assert::WordBoundary | Assert::NotWordBoundary)
+            | Inst::Look { .. }
+            | Inst::LookBehind { .. } => stack.push(pc + 1),
+            // Consumes input, matches, or changes the meaning of `^`.
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Expands a replacement template (`$&`, `$1`..`$9`) for one match.

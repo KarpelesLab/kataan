@@ -3922,7 +3922,6 @@ fn regex_method(
         if ctx.realm.regex_aux_last_index_defined(h) || flags.contains('y') || flags.contains('d') {
             return None;
         }
-        let text = ctx.realm.to_display_string(arg0);
         // Use the RegExp cell's compiled-program cache (RE-P1): a reused regex is
         // compiled once, not per call. Clone the `Rc` out before any match work.
         let Some(re) = ctx.realm.regex_compiled(h) else {
@@ -3948,6 +3947,11 @@ fn regex_method(
         return Some(Ok(match (key, caps) {
             ("test", c) => NanBox::boolean(c.is_some()),
             (_, Some(caps)) => {
+                // Materialized only here: `exec`'s result carries the subject as
+                // its `input` property. `test`, and a failed `exec`, never need
+                // it — and copying it unconditionally cost a full copy of the
+                // subject on every call.
+                let text = ctx.realm.to_display_string(arg0);
                 let input = NanBox::handle(ctx.realm.new_string(&text).to_raw());
                 regex_match_object(ctx.realm, &units, input, &caps, re.group_names())
             }
