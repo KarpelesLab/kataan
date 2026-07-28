@@ -364,6 +364,10 @@ enum Step<'a> {
     /// A class *declaration*: the finished class value is on top of the stack;
     /// bind it to the class name (if any), leaving no expression value.
     ClassDeclBind { class: &'a Class },
+    /// `export default <expr>` whose expression suspended: the finished value is
+    /// on top of the stack; name it (NamedEvaluation) and bind `*default*`.
+    #[cfg(all(feature = "module", feature = "std"))]
+    ExportDefaultBind { expr: &'a Expr },
     /// Destructure `value` into assignment `target` (an array/object pattern, a
     /// defaulted target, or a leaf) — a `yield` in a default initializer suspends.
     /// The iterator pull / property reads themselves are synchronous.
@@ -3078,6 +3082,21 @@ impl<'a> Interp<'a> {
                 }
                 Ok(StepOut::Continue)
             }
+            #[cfg(all(feature = "module", feature = "std"))]
+            Step::ExportDefaultBind { expr } => {
+                let v = values.pop().unwrap_or(NanBox::undefined());
+                // NamedEvaluation: an anonymous function/class/arrow gets "default".
+                if matches!(
+                    expr,
+                    Expr::Function(crate::ast::Function { id: None, .. })
+                        | Expr::Class(Class { id: None, .. })
+                        | Expr::Arrow(_)
+                ) {
+                    self.set_fn_name(v, "default");
+                }
+                self.current.declare_const(super::module::DEFAULT_LOCAL, v);
+                Ok(StepOut::Continue)
+            }
             Step::DestructureStart { target } => {
                 // The RHS result is on top of the value stack; leave it there and
                 // destructure a copy into `target`.
@@ -3846,7 +3865,31 @@ impl<'a> Interp<'a> {
             Stmt::Import(_) => Ok(StepOut::Continue),
             #[cfg(all(feature = "module", feature = "std"))]
             Stmt::Export(decl) => {
-                self.exec_export(decl).map_err(GenAbrupt::from)?;
+                // `export default <expr>` / `export <declaration>` whose payload
+                // contains a reachable `await` is driven through the machine, so
+                // the suspension is real — an eager `await` here would resume the
+                // rest of the module body ahead of the already-queued microtasks.
+                // Everything else keeps the one-shot path (the export *slot* was
+                // wired at link time).
+                let stepped = match decl {
+                    crate::ast::ExportDecl::Default { declaration, .. } => match &**declaration {
+                        Stmt::Expr { expression, .. } if expr_has_yield(expression) => {
+                            stack.push(Step::ExportDefaultBind { expr: expression });
+                            stack.push(Step::EvalThen { expr: expression });
+                            true
+                        }
+                        _ => false,
+                    },
+                    crate::ast::ExportDecl::Decl { declaration, .. }
+                        if stmt_has_yield(declaration) =>
+                    {
+                        return self.gen_exec_stmt(declaration, stack, values, &None);
+                    }
+                    _ => false,
+                };
+                if !stepped {
+                    self.exec_export(decl).map_err(GenAbrupt::from)?;
+                }
                 Ok(StepOut::Continue)
             }
             // `class C { get [yield](){} }` (declaration) — step the class's

@@ -2564,6 +2564,23 @@ const ASYNC_PROMISE: &str = "\u{0}aprom";
 /// ordinary async-function controller.
 #[cfg(all(feature = "module", feature = "std"))]
 const MODULE_KEY: &str = "\u{0}modkey";
+/// Hidden slots of a dynamic-import continuation's bound state object: the
+/// resolved module key, the `type` import attribute (absent when none), the
+/// `import()` promise to settle, and whether the request is `import.defer`.
+#[cfg(all(feature = "module", feature = "std"))]
+const DYN_KEY: &str = "\u{0}dynkey";
+#[cfg(all(feature = "module", feature = "std"))]
+const DYN_TYPE: &str = "\u{0}dyntype";
+#[cfg(all(feature = "module", feature = "std"))]
+const DYN_PROMISE: &str = "\u{0}dynprom";
+#[cfg(all(feature = "module", feature = "std"))]
+const DYN_DEFER: &str = "\u{0}dyndefer";
+/// Hidden slots of a `SafePerformPromiseAll` state object: the outstanding
+/// element count and the aggregate promise to settle.
+#[cfg(all(feature = "module", feature = "std"))]
+const SAFE_ALL_REMAINING: &str = "\u{0}sparem";
+#[cfg(all(feature = "module", feature = "std"))]
+const SAFE_ALL_TARGET: &str = "\u{0}spatgt";
 /// Reserved hidden slots for a lazy ES2025 iterator-helper object (the object
 /// returned by `Iterator.prototype.{map,filter,take,drop,flatMap}` and
 /// `Iterator.from`). The helper pulls from its underlying iterator one step at a
@@ -2860,6 +2877,32 @@ const N_ARRAY_FROM_ASYNC: u16 = 652;
 const N_FROM_ASYNC_STEP: u16 = 1217;
 /// `Array.fromAsync`'s rejection continuation, bound to its loop state.
 const N_FROM_ASYNC_THROW: u16 = 1218;
+/// `AsyncModuleExecutionFulfilled` / `AsyncModuleExecutionRejected`, bound to a
+/// string holding the module's resolved key: the reactions
+/// [`ExecuteAsyncModule`](module) hooks on a top-level-await module's evaluation
+/// promise.
+#[cfg(all(feature = "module", feature = "std"))]
+const N_MODULE_FULFILLED: u16 = 1219;
+#[cfg(all(feature = "module", feature = "std"))]
+const N_MODULE_REJECTED: u16 = 1220;
+/// `ContinueDynamicImport`'s onFulfilled / onRejected closures, bound to a state
+/// object carrying the imported key, the `import()` promise, and whether this is
+/// the `import.defer` phase.
+#[cfg(all(feature = "module", feature = "std"))]
+const N_DYNAMIC_IMPORT_FULFILLED: u16 = 1221;
+#[cfg(all(feature = "module", feature = "std"))]
+const N_DYNAMIC_IMPORT_REJECTED: u16 = 1222;
+/// The job that runs a dynamic import's load/link/evaluate continuation once the
+/// enclosing module-graph `Evaluate()` has returned (bound to the same state).
+#[cfg(all(feature = "module", feature = "std"))]
+const N_DYNAMIC_IMPORT_JOB: u16 = 1223;
+/// `SafePerformPromiseAll`'s element reactions, bound to the shared count/target
+/// state (used by import-defer to await hoisted asynchronous dependencies without
+/// touching `Promise.prototype.then`).
+#[cfg(all(feature = "module", feature = "std"))]
+const N_SAFE_ALL_FULFILL: u16 = 1224;
+#[cfg(all(feature = "module", feature = "std"))]
+const N_SAFE_ALL_REJECT: u16 = 1225;
 /// `RegExp.escape(S)` — escapes `S` so it matches literally in a pattern.
 const N_REGEXP_ESCAPE: u16 = 653;
 /// The ES2025 `uint8array-base64` proposal methods. Instance methods on
@@ -6562,6 +6605,18 @@ impl<'a> Interp<'a> {
                 self.current.mark_lexical(name);
             }
         }
+        // A **module** body's top-level function declarations were already
+        // instantiated by InitializeEnvironment (link time), so that an importer —
+        // or a cyclic dependency evaluated first — can call them before this body
+        // runs. Re-creating them here would replace those very objects, so a
+        // property an earlier module put on one (or the `*default*` binding of
+        // `export default function f`) would be lost. Skip them; every other part
+        // of hoisting (`var`, Annex B, lexical TDZ) still applies. Direct `eval`
+        // at module top level is *not* module code and still declares its own.
+        #[cfg(all(feature = "module", feature = "std"))]
+        let module_top_level = hoist_vars && !eval_code && self.at_module_top_level();
+        #[cfg(not(all(feature = "module", feature = "std")))]
+        let module_top_level = false;
         for stmt in stmts {
             // A module's `export function f(){}` / `export default function f(){}`
             // hoists `f` exactly like a bare function declaration: unwrap the
@@ -6570,6 +6625,9 @@ impl<'a> Interp<'a> {
             if let Stmt::Function(func) = stmt
                 && let Some(id) = &func.id
             {
+                if module_top_level {
+                    continue;
+                }
                 let value = self.make_function(
                     &func.params,
                     Body::Block(&func.body),

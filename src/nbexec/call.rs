@@ -1523,6 +1523,48 @@ impl<'a> Interp<'a> {
                 N_PROMISE_ALLSETTLEDKEYED_REJECT => {
                     return self.promise_allsettled_keyed_element(target, arg0, false);
                 }
+                // Async module evaluation continuations (16.2.1.5.3.3 / .4): the
+                // bound target is a string holding the module's resolved key.
+                #[cfg(all(feature = "module", feature = "std"))]
+                N_MODULE_FULFILLED => {
+                    if let Some(key) = self.realm.string_value(target) {
+                        self.async_module_execution_fulfilled(&key);
+                    }
+                    return Ok(NanBox::undefined());
+                }
+                #[cfg(all(feature = "module", feature = "std"))]
+                N_MODULE_REJECTED => {
+                    if let Some(key) = self.realm.string_value(target) {
+                        self.async_module_execution_rejected(&key, arg0);
+                    }
+                    return Ok(NanBox::undefined());
+                }
+                // `ContinueDynamicImport` continuations and its deferred job.
+                #[cfg(all(feature = "module", feature = "std"))]
+                N_DYNAMIC_IMPORT_FULFILLED => {
+                    self.dynamic_import_fulfilled(target);
+                    return Ok(NanBox::undefined());
+                }
+                #[cfg(all(feature = "module", feature = "std"))]
+                N_DYNAMIC_IMPORT_REJECTED => {
+                    self.dynamic_import_rejected(target, arg0);
+                    return Ok(NanBox::undefined());
+                }
+                #[cfg(all(feature = "module", feature = "std"))]
+                N_DYNAMIC_IMPORT_JOB => {
+                    self.run_dynamic_import_job(target);
+                    return Ok(NanBox::undefined());
+                }
+                #[cfg(all(feature = "module", feature = "std"))]
+                N_SAFE_ALL_FULFILL => {
+                    self.safe_promise_all_element(target, arg0, true);
+                    return Ok(NanBox::undefined());
+                }
+                #[cfg(all(feature = "module", feature = "std"))]
+                N_SAFE_ALL_REJECT => {
+                    self.safe_promise_all_element(target, arg0, false);
+                    return Ok(NanBox::undefined());
+                }
                 N_PROMISE_THEN_FINALLY => return self.promise_finally_thunk(target, arg0, true),
                 N_PROMISE_CATCH_FINALLY => return self.promise_finally_thunk(target, arg0, false),
                 // Value/throw thunks: ignore the (one) argument and return/throw the

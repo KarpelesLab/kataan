@@ -24,7 +24,10 @@
 //! Gated on `module` + `std` (the loader needs file I/O for the default host);
 //! the no_std language core does not pull this in.
 
-use super::{ExecError, Interp, N_REFERENCE_ERROR, N_SYNTAX_ERROR, NanBox, Thrown};
+use super::{
+    DYN_DEFER, DYN_KEY, DYN_PROMISE, DYN_TYPE, ExecError, Interp, N_REFERENCE_ERROR,
+    N_SYNTAX_ERROR, NanBox, SAFE_ALL_REMAINING, SAFE_ALL_TARGET, Thrown,
+};
 use crate::ast::{ExportDecl, ImportSpecifier, ModuleExportName, Program, Stmt};
 use crate::env::Scope;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -230,8 +233,25 @@ enum Status {
     /// deferred-namespace access of a module in this state is a TypeError
     /// (import-defer: the module's bindings are not yet initialized).
     Evaluating,
+    /// `evaluating-async`: the module (or its strongly-connected component) has
+    /// started evaluating but is still waiting on a top-level `await` — its own,
+    /// or one in an asynchronous dependency. Its body may not have run at all yet
+    /// (`[[PendingAsyncDependencies]]` > 0).
+    EvaluatingAsync,
     /// Body has finished running (successfully or with a captured `eval_error`).
     Evaluated,
+}
+
+/// `[[AsyncEvaluationOrder]]` — unset for a module that never participates in an
+/// asynchronous evaluation, an ascending integer while it does, and `done` once
+/// it has settled. The integer orders `AsyncModuleExecutionFulfilled`'s
+/// `execList`, which is what makes an async graph resume leaf-to-root in the
+/// order evaluation *started*.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AsyncOrder {
+    Unset,
+    Order(u32),
+    Done,
 }
 
 /// One `import` request of a module: the resolved key of the dependency plus the
@@ -341,23 +361,53 @@ struct ModuleRecord {
     /// value (JSON parsed / text string), materialised at load time so a JSON
     /// parse failure surfaces in the load/resolution phase.
     default_value: Option<NanBox>,
+    /// `[[HasTLA]]` — the body contains a top-level `await` (so it evaluates as a
+    /// suspendable coroutine and settles asynchronously). Computed once at parse.
+    has_tla: bool,
+    /// `[[DFSIndex]]` / `[[DFSAncestorIndex]]` — Tarjan indices assigned by
+    /// `InnerModuleEvaluation`; equal iff this module is its cycle's root.
+    dfs_index: u32,
+    dfs_ancestor_index: u32,
+    /// `[[PendingAsyncDependencies]]` — how many dependencies are still
+    /// `evaluating-async`. While non-zero this module's body has not run.
+    pending_async_deps: u32,
+    /// `[[AsyncEvaluationOrder]]`.
+    async_order: AsyncOrder,
+    /// `[[CycleRoot]]` — the module whose `[[TopLevelCapability]]` settles for
+    /// this whole strongly-connected component.
+    cycle_root: Option<String>,
+    /// `[[AsyncParentModules]]` — modules that are waiting on this one.
+    async_parents: Vec<String>,
+    /// `[[TopLevelCapability]]` — the promise `Evaluate()` handed out (only ever
+    /// set on a cycle root, or on a module whose evaluation failed outright).
+    top_level_capability: Option<crate::heap::Handle>,
 }
 
 /// The set of loaded modules, keyed by resolved key, plus the active host.
 pub struct ModuleRegistry {
     records: BTreeMap<String, ModuleRecord>,
+    /// The agent-wide `[[AsyncEvaluationOrder]]` counter (the spec's
+    /// *asyncEvaluationOrder* slot on the surrounding agent).
+    async_order_counter: u32,
+    /// Depth of the currently running `Evaluate()` — a module graph walk is in
+    /// progress while non-zero. `Evaluate` asserts it never runs concurrently
+    /// with another `Evaluate` in the same agent, so a dynamic `import()` reached
+    /// from a module body must defer its own link/evaluate to a job.
+    evaluating_depth: u32,
 }
 
 impl ModuleRegistry {
     pub(crate) fn new() -> Self {
         Self {
             records: BTreeMap::new(),
+            async_order_counter: 0,
+            evaluating_depth: 0,
         }
     }
 }
 
 /// The synthetic local name an `export default` value is bound under.
-const DEFAULT_LOCAL: &str = "*default*";
+pub(crate) const DEFAULT_LOCAL: &str = "*default*";
 
 impl<'a> Interp<'a> {
     /// Loads, links, and evaluates the module graph rooted at `entry_key`
@@ -408,11 +458,21 @@ impl<'a> Interp<'a> {
         if self.script_import_base.is_none() {
             self.script_import_base = Some(entry_key.to_string());
         }
-        let r = self.evaluate_module(entry_key);
-        // Drain microtasks/timers even on failure so a rejected top-level-await
-        // promise's reactions run (matching `run`'s post-body event loop).
+        let promise = self.evaluate_module(entry_key);
+        // Drain microtasks/timers so the graph's top-level `await`s (and any
+        // trailing reactions) run — the entry's evaluation promise only settles
+        // once the whole graph has completed.
         let _ = self.run_event_loop();
-        r?;
+        let promise = promise?;
+        // A rejected top-level capability is the graph's evaluation error.
+        if let Some(state) = self.realm.promise_state(promise) {
+            let st = state.borrow();
+            if st.status == crate::cell::PromiseStatus::Rejected {
+                let v = st.value;
+                drop(st);
+                return Err(ExecError::Throw(v));
+            }
+        }
         self.run_event_loop()?;
         self.namespace_object(entry_key)
     }
@@ -549,6 +609,14 @@ impl<'a> Interp<'a> {
             eval_error: None,
             kind,
             default_value: Some(value),
+            has_tla: false,
+            dfs_index: 0,
+            dfs_ancestor_index: 0,
+            pending_async_deps: 0,
+            async_order: AsyncOrder::Unset,
+            cycle_root: None,
+            async_parents: Vec::new(),
+            top_level_capability: None,
         }
     }
 
@@ -720,6 +788,14 @@ impl<'a> Interp<'a> {
             eval_error: None,
             kind: ModuleKind::JavaScript,
             default_value: None,
+            has_tla: module_body_has_await(&program.body),
+            dfs_index: 0,
+            dfs_ancestor_index: 0,
+            pending_async_deps: 0,
+            async_order: AsyncOrder::Unset,
+            cycle_root: None,
+            async_parents: Vec::new(),
+            top_level_capability: None,
         })
     }
 
@@ -1036,32 +1112,91 @@ impl<'a> Interp<'a> {
 
     // --- Evaluate -------------------------------------------------------
 
-    /// Evaluates `key` and (post-order) its dependencies, each exactly once.
-    /// A module is marked `Evaluated` *before* its body runs so an import cycle
-    /// does not re-enter it.
-    fn evaluate_module(&mut self, key: &str) -> Result<(), ExecError> {
-        match self.modules.records.get(key).map(|r| r.status) {
-            Some(Status::Evaluating | Status::Evaluated) => {
-                // Re-entrant (cycle) or already done; rethrow a prior failure.
-                // (A still-`Evaluating` module is on the stack — a normal import
-                // cycle, which proceeds; the import-defer "accessed while
-                // evaluating" TypeError is enforced in `force_deferred_namespace`,
-                // not here.)
-                if let Some(err) = self.modules.records.get(key).and_then(|r| r.eval_error) {
-                    return Err(ExecError::Throw(err));
-                }
-                return Ok(());
+    /// `Evaluate()` (16.2.1.5.3) — evaluates the graph rooted at `key` and returns
+    /// the module's **top-level capability** promise: fulfilled with `undefined`
+    /// once the whole graph (including every top-level `await`) has completed,
+    /// rejected with the evaluation error otherwise.
+    ///
+    /// The returned promise may still be pending: an asynchronous module does not
+    /// block the walk, so the caller must chain on it rather than assume the body
+    /// has run (see [`Self::evaluate_module_now`] for the callers that legitimately
+    /// require synchronous completion).
+    fn evaluate_module(&mut self, key: &str) -> Result<crate::heap::Handle, ExecError> {
+        // Step 4: an already-(async-)evaluated module delegates to its cycle root,
+        // which is where the capability for the whole component lives.
+        let mut key = key.to_string();
+        {
+            let Some(r) = self.modules.records.get(&key) else {
+                return Err(self.syntax_error(&alloc::format!("module {key} not linked")));
+            };
+            if matches!(r.status, Status::EvaluatingAsync | Status::Evaluated)
+                && let Some(root) = &r.cycle_root
+            {
+                key = root.clone();
             }
-            Some(Status::Linked) => {}
-            _ => return Err(self.syntax_error(&alloc::format!("module {key} not linked"))),
         }
-        // Evaluate dependencies first (post-order), in source order
-        // (`[[RequestedModules]]`). A *deferred* import (`import defer`) is not
-        // itself evaluated here — that happens lazily on first namespace access —
-        // but its **asynchronous** transitive dependencies still are, because a
-        // module with top-level await cannot be evaluated synchronously later when
-        // the namespace is touched. That is
-        // `GatherAsynchronousTransitiveDependencies`.
+        if let Some(p) = self.modules.records[&key].top_level_capability {
+            return Ok(p);
+        }
+        let capability = self.fresh_promise();
+        self.modules
+            .records
+            .get_mut(&key)
+            .expect("record")
+            .top_level_capability = Some(capability);
+
+        let mut stack: Vec<String> = Vec::new();
+        self.modules.evaluating_depth += 1;
+        let result = self.inner_module_evaluation(&key, &mut stack, 0);
+        self.modules.evaluating_depth -= 1;
+
+        match result {
+            Err(ExecError::Throw(err)) => {
+                // Step 9: every module still on the stack failed with this error.
+                for m in &stack {
+                    if let Some(r) = self.modules.records.get_mut(m) {
+                        r.status = Status::Evaluated;
+                        r.eval_error = Some(err);
+                        r.async_order = AsyncOrder::Done;
+                    }
+                }
+                self.settle(capability, err, false);
+            }
+            Err(other) => return Err(other),
+            Ok(_) => {
+                // Step 10: a module that is not asynchronously evaluating has
+                // finished, so its capability resolves now.
+                if self.modules.records[&key].status == Status::Evaluated {
+                    self.settle(capability, NanBox::undefined(), true);
+                }
+            }
+        }
+        Ok(capability)
+    }
+
+    /// `Evaluate()` for the callers that require the graph to have *finished*
+    /// (a `import defer` namespace force, whose asynchronous dependencies were
+    /// hoisted out of the deferral precisely so this is synchronous). Surfaces a
+    /// rejected top-level capability as the thrown evaluation error.
+    fn evaluate_module_now(&mut self, key: &str) -> Result<(), ExecError> {
+        let promise = self.evaluate_module(key)?;
+        if let Some(state) = self.realm.promise_state(promise) {
+            let st = state.borrow();
+            if st.status == crate::cell::PromiseStatus::Rejected {
+                return Err(ExecError::Throw(st.value));
+            }
+        }
+        Ok(())
+    }
+
+    /// The dependency list `InnerModuleEvaluation` walks, in `[[RequestedModules]]`
+    /// (source) order. A *deferred* import (`import defer`) contributes not itself
+    /// but its **asynchronous** transitive dependencies
+    /// (`GatherAsynchronousTransitiveDependencies`): the deferred module is
+    /// evaluated lazily on first namespace access, which is a synchronous
+    /// operation, so anything with top-level await below it must be hoisted out of
+    /// the deferral and evaluated with the importer.
+    fn evaluation_deps(&self, key: &str) -> Vec<String> {
         let requested: Vec<(String, bool)> = self.modules.records[key].requested.clone();
         let mut deps: Vec<String> = Vec::new();
         for (dep_key, deferred) in &requested {
@@ -1078,36 +1213,259 @@ impl<'a> Interp<'a> {
                 deps.push(dep_key.clone());
             }
         }
-        // Mark Evaluating up front to break cycles (and so a deferred-namespace
-        // access of this in-flight module throws a TypeError).
-        if let Some(r) = self.modules.records.get_mut(key) {
-            r.status = Status::Evaluating;
-        }
-        for dep in &deps {
-            self.evaluate_module(dep)?;
-        }
-        let result = self.run_module_body(key);
-        if let Some(r) = self.modules.records.get_mut(key) {
-            r.status = Status::Evaluated;
-            if let Err(ExecError::Throw(v)) = &result {
-                r.eval_error = Some(*v);
-            }
-        }
-        result
+        deps
     }
 
-    /// Runs one module's top-level statements in its own environment, with its
-    /// import aliases active and `import.meta` set up. Modules are always strict.
-    ///
-    /// A module whose body contains a **top-level `await`** (or `for await`) is a
-    /// spec async module: its body is driven as a suspendable coroutine (the same
-    /// engine that runs async functions), so an `await` suspends the module and
-    /// yields to the microtask queue rather than draining the event loop inline —
-    /// giving the specified tick interleaving. Such a body is run to settlement
-    /// here (blocking on the event loop until the module's evaluation promise
-    /// resolves/rejects), preserving the synchronous-completion contract the
-    /// depth-first `evaluate_module` relies on for a dependency; the entry's
-    /// trailing reactions (`$DONE`, further `.then`s) drain in `evaluate_entry`.
+    /// `InnerModuleEvaluation(module, stack, index)` (16.2.1.5.3.1) — the
+    /// depth-first walk that assigns the Tarjan indices, counts each importer's
+    /// still-pending asynchronous dependencies (rather than blocking on them),
+    /// executes what is ready, and settles each completed strongly-connected
+    /// component's status and cycle root.
+    fn inner_module_evaluation(
+        &mut self,
+        key: &str,
+        stack: &mut Vec<String>,
+        index: u32,
+    ) -> Result<u32, ExecError> {
+        match self.modules.records.get(key).map(|r| r.status) {
+            Some(Status::EvaluatingAsync | Status::Evaluated) => {
+                if let Some(err) = self.modules.records[key].eval_error {
+                    return Err(ExecError::Throw(err));
+                }
+                return Ok(index);
+            }
+            // Already on the stack — a cycle back-edge.
+            Some(Status::Evaluating) => return Ok(index),
+            Some(Status::Linked) => {}
+            _ => return Err(self.syntax_error(&alloc::format!("module {key} not linked"))),
+        }
+        {
+            let r = self.modules.records.get_mut(key).expect("record");
+            r.status = Status::Evaluating;
+            r.dfs_index = index;
+            r.dfs_ancestor_index = index;
+            r.pending_async_deps = 0;
+        }
+        let mut index = index + 1;
+        stack.push(key.to_string());
+
+        for dep in self.evaluation_deps(key) {
+            index = self.inner_module_evaluation(&dep, stack, index)?;
+            // Step 11.c: a dependency still on the stack (status `evaluating`) is
+            // part of this cycle and contributes its ancestor index; otherwise its
+            // component is closed and what we wait on is its cycle root.
+            let target = if stack.contains(&dep) {
+                let ancestor = self.modules.records[&dep].dfs_ancestor_index;
+                let r = self.modules.records.get_mut(key).expect("record");
+                r.dfs_ancestor_index = r.dfs_ancestor_index.min(ancestor);
+                dep.clone()
+            } else {
+                let root = self.modules.records[&dep]
+                    .cycle_root
+                    .clone()
+                    .unwrap_or_else(|| dep.clone());
+                if let Some(err) = self.modules.records[&root].eval_error {
+                    return Err(ExecError::Throw(err));
+                }
+                root
+            };
+            // Step 11.c.v: an `[[AsyncEvaluationOrder]]` that is still an *integer*
+            // means that module has started but not settled — including a module
+            // of this very cycle that has already reached its own step 12.
+            let Some(target_rec) = self.modules.records.get_mut(&target) else {
+                continue;
+            };
+            if matches!(target_rec.async_order, AsyncOrder::Order(_)) {
+                target_rec.async_parents.push(key.to_string());
+                self.modules
+                    .records
+                    .get_mut(key)
+                    .expect("record")
+                    .pending_async_deps += 1;
+            }
+        }
+
+        let (pending, has_tla) = {
+            let r = &self.modules.records[key];
+            (r.pending_async_deps, r.has_tla)
+        };
+        if pending > 0 || has_tla {
+            let order = self.modules.async_order_counter;
+            self.modules.async_order_counter += 1;
+            self.modules
+                .records
+                .get_mut(key)
+                .expect("record")
+                .async_order = AsyncOrder::Order(order);
+            if pending == 0 {
+                self.execute_async_module(key);
+            }
+        } else {
+            self.run_module_body(key)?;
+        }
+
+        let (dfs_index, dfs_ancestor) = {
+            let r = &self.modules.records[key];
+            (r.dfs_index, r.dfs_ancestor_index)
+        };
+        if dfs_ancestor == dfs_index {
+            // This module roots a (possibly singleton) cycle: close the component.
+            while let Some(m) = stack.pop() {
+                let r = self.modules.records.get_mut(&m).expect("record");
+                r.status = if matches!(r.async_order, AsyncOrder::Unset) {
+                    Status::Evaluated
+                } else {
+                    Status::EvaluatingAsync
+                };
+                r.cycle_root = Some(key.to_string());
+                if m == key {
+                    break;
+                }
+            }
+        }
+        Ok(index)
+    }
+
+    /// `ExecuteAsyncModule(module)` (16.2.1.5.3.2) — starts a top-level-await
+    /// module's body as a suspendable coroutine and hooks its evaluation promise
+    /// with the `AsyncModuleExecutionFulfilled` / `AsyncModuleExecutionRejected`
+    /// continuations. Returns immediately: the graph walk continues while the body
+    /// is parked on its `await`.
+    fn execute_async_module(&mut self, key: &str) {
+        let (promise, id, controller) = self.start_module_coroutine(key);
+        let state = self.new_str(key);
+        let Some(state) = state.as_handle().map(crate::heap::Handle::from_raw) else {
+            return;
+        };
+        let on_f = self
+            .realm
+            .new_bound_native(super::N_MODULE_FULFILLED, state);
+        let on_r = self.realm.new_bound_native(super::N_MODULE_REJECTED, state);
+        self.register_then(
+            promise,
+            NanBox::handle(on_f.to_raw()),
+            NanBox::handle(on_r.to_raw()),
+            false,
+        );
+        self.drive_module_coroutine(id, controller);
+    }
+
+    /// `AsyncModuleExecutionFulfilled(module)` (16.2.1.5.3.3) — the module's body
+    /// completed: mark it evaluated, settle its top-level capability, then run
+    /// every ancestor that this unblocked, oldest `[[AsyncEvaluationOrder]]` first.
+    pub(crate) fn async_module_execution_fulfilled(&mut self, key: &str) {
+        {
+            let Some(r) = self.modules.records.get_mut(key) else {
+                return;
+            };
+            if r.status == Status::Evaluated {
+                // Already settled by a rejection that reached it first.
+                return;
+            }
+            r.async_order = AsyncOrder::Done;
+            r.status = Status::Evaluated;
+        }
+        if let Some(cap) = self.modules.records[key].top_level_capability {
+            self.settle(cap, NanBox::undefined(), true);
+        }
+        let mut exec_list: Vec<String> = Vec::new();
+        self.gather_available_ancestors(key, &mut exec_list);
+        exec_list.sort_by_key(|m| match self.modules.records[m].async_order {
+            AsyncOrder::Order(n) => n,
+            _ => u32::MAX,
+        });
+        for m in exec_list {
+            let (status, has_tla) = {
+                let r = &self.modules.records[&m];
+                (r.status, r.has_tla)
+            };
+            if status == Status::Evaluated {
+                // Its evaluation already failed; nothing left to run.
+            } else if has_tla {
+                self.execute_async_module(&m);
+            } else {
+                match self.run_module_body(&m) {
+                    Err(ExecError::Throw(v)) => self.async_module_execution_rejected(&m, v),
+                    Err(other) => {
+                        let msg = self.new_str(&alloc::format!("{other:?}"));
+                        let err = self.make_error(super::N_TYPE_ERROR, Some(msg));
+                        self.async_module_execution_rejected(&m, err);
+                    }
+                    Ok(()) => {
+                        let r = self.modules.records.get_mut(&m).expect("record");
+                        r.async_order = AsyncOrder::Done;
+                        r.status = Status::Evaluated;
+                        if let Some(cap) = r.top_level_capability {
+                            self.settle(cap, NanBox::undefined(), true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `AsyncModuleExecutionRejected(module, error)` (16.2.1.5.3.4) — records the
+    /// evaluation error and propagates it to every module waiting on this one.
+    pub(crate) fn async_module_execution_rejected(&mut self, key: &str, error: NanBox) {
+        let parents = {
+            let Some(r) = self.modules.records.get_mut(key) else {
+                return;
+            };
+            if r.status == Status::Evaluated {
+                return;
+            }
+            r.eval_error = Some(error);
+            r.status = Status::Evaluated;
+            r.async_order = AsyncOrder::Done;
+            r.async_parents.clone()
+        };
+        // Own capability first, *then* the ancestors': a rejection settles the
+        // graph's promises leaf-to-root (16.2.1.5.3.4 steps 9–10).
+        if let Some(cap) = self.modules.records[key].top_level_capability {
+            self.settle(cap, error, false);
+        }
+        for m in parents {
+            self.async_module_execution_rejected(&m, error);
+        }
+    }
+
+    /// `GatherAvailableAncestors(module, execList)` (16.2.1.5.3.5) — decrements
+    /// each waiting importer's `[[PendingAsyncDependencies]]` and collects those
+    /// that just reached zero (recursing through synchronous ones, which will
+    /// unblock their own parents as soon as they run).
+    fn gather_available_ancestors(&mut self, key: &str, exec_list: &mut Vec<String>) {
+        let parents = self.modules.records[key].async_parents.clone();
+        for m in parents {
+            if exec_list.contains(&m) {
+                continue;
+            }
+            let failed = {
+                let root = self.modules.records[&m]
+                    .cycle_root
+                    .clone()
+                    .unwrap_or_else(|| m.clone());
+                self.modules
+                    .records
+                    .get(&root)
+                    .is_some_and(|r| r.eval_error.is_some())
+            };
+            if failed {
+                continue;
+            }
+            let (ready, has_tla) = {
+                let r = self.modules.records.get_mut(&m).expect("record");
+                r.pending_async_deps = r.pending_async_deps.saturating_sub(1);
+                (r.pending_async_deps == 0, r.has_tla)
+            };
+            if ready {
+                exec_list.push(m.clone());
+                if !has_tla {
+                    self.gather_available_ancestors(&m, exec_list);
+                }
+            }
+        }
+    }
+
     /// `GatherAsynchronousTransitiveDependencies(module, seen)` — the modules
     /// reachable from `key` that must be evaluated *eagerly* even though `key`
     /// itself sits behind a deferred import, because they have top-level await.
@@ -1130,10 +1488,13 @@ impl<'a> Interp<'a> {
         let Some(r) = self.modules.records.get(key) else {
             return;
         };
-        if matches!(r.status, Status::Evaluating | Status::Evaluated) {
+        if matches!(
+            r.status,
+            Status::Evaluating | Status::EvaluatingAsync | Status::Evaluated
+        ) {
             return;
         }
-        if matches!(r.kind, ModuleKind::JavaScript) && module_body_has_await(&r.program.body) {
+        if r.has_tla {
             if !out.iter().any(|m| m == key) {
                 out.push(String::from(key));
             }
@@ -1145,14 +1506,11 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `ExecuteModule()` for a **synchronous** module: runs its top-level
+    /// statements in its own environment, with its import aliases active and
+    /// `import.meta` set up. Modules are always strict. A top-level-await module
+    /// goes through [`Self::execute_async_module`] instead.
     fn run_module_body(&mut self, key: &str) -> Result<(), ExecError> {
-        let is_tla = {
-            let r = &self.modules.records[key];
-            matches!(r.kind, ModuleKind::JavaScript) && module_body_has_await(&r.program.body)
-        };
-        if is_tla {
-            return self.run_module_body_async(key);
-        }
         let (scope, program, aliases) = {
             let r = &self.modules.records[key];
             (r.scope.clone(), r.program, r.import_aliases.clone())
@@ -1182,15 +1540,16 @@ impl<'a> Interp<'a> {
         result
     }
 
-    /// Runs a **top-level-await** module body as a suspendable async coroutine
-    /// (the async-function engine), draining the event loop until the module's
-    /// evaluation promise settles. An `await` therefore suspends the whole module
-    /// body and yields to pending microtasks — matching the spec's async-module
-    /// tick interleaving — instead of draining the event loop inline at the
-    /// `await`. A rejection of the evaluation promise becomes this module's
-    /// evaluation error (propagated / cached by `evaluate_module`).
-    fn run_module_body_async(&mut self, key: &str) -> Result<(), ExecError> {
-        use crate::cell::PromiseStatus::{Pending, Rejected};
+    /// `ExecuteModule(capability)` for a **top-level-await** module: builds the
+    /// suspendable async coroutine over the body and returns its evaluation
+    /// promise (the spec's capability), *without* driving it — the caller hooks
+    /// the promise first (`ExecuteAsyncModule` steps 5–11 precede step 12) and
+    /// then calls [`Self::drive_module_coroutine`] to run the first synchronous
+    /// burst.
+    fn start_module_coroutine(
+        &mut self,
+        key: &str,
+    ) -> (crate::heap::Handle, usize, crate::heap::Handle) {
         let (scope, program) = {
             let r = &self.modules.records[key];
             (r.scope.clone(), r.program)
@@ -1238,37 +1597,31 @@ impl<'a> Interp<'a> {
         let key_val = self.new_str(key);
         self.realm
             .set_hidden_property(controller, super::MODULE_KEY, key_val);
-        // Drive the first synchronous burst (body up to the first top-level
-        // `await`, or to completion for a body whose only await is unreachable).
+        (promise, id, controller)
+    }
+
+    /// Runs the first synchronous burst of a module coroutine built by
+    /// [`Self::start_module_coroutine`] — the body up to its first top-level
+    /// `await`, or to completion for a body whose `await` is never reached. The
+    /// module does **not** block here: control returns to the graph walk while the
+    /// body is parked.
+    fn drive_module_coroutine(&mut self, id: usize, controller: crate::heap::Handle) {
         self.async_step(
             id,
             controller,
             super::generator::Resumption::Next(NanBox::undefined()),
         );
-        // Block on the event loop until the module's evaluation promise settles, so
-        // a *dependency* module completes before its importer's body runs (the DFS
-        // contract). The entry module's trailing reactions drain in
-        // `evaluate_entry`'s own event-loop pass.
-        while self
-            .realm
-            .promise_state(promise)
-            .is_some_and(|s| s.borrow().status == Pending)
-            && (!self.microtasks.is_empty() || !self.macrotasks.is_empty())
-        {
-            if self.microtasks.is_empty() {
-                self.run_one_macrotask()?;
-            } else {
-                self.run_one_microtask()?;
-            }
-        }
-        // A rejected evaluation promise is this module's evaluation error.
-        if let Some(state) = self.realm.promise_state(promise) {
-            let st = state.borrow();
-            if st.status == Rejected {
-                return Err(ExecError::Throw(st.value));
-            }
-        }
-        Ok(())
+    }
+
+    /// True when the statement list being hoisted is a **module body's** top
+    /// level: the active module's environment is the variable environment being
+    /// populated. (A nested function body inside the module has its own scope, so
+    /// it does not match.)
+    pub(crate) fn at_module_top_level(&self) -> bool {
+        self.active_module_key
+            .as_ref()
+            .and_then(|k| self.modules.records.get(k))
+            .is_some_and(|r| r.scope.ptr_eq(&self.var_scope))
     }
 
     /// If `controller` is an async coroutine driving a module body (it carries a
@@ -1756,7 +2109,7 @@ impl<'a> Interp<'a> {
                 "Cannot access a deferred module namespace while the module is being evaluated",
             ));
         }
-        self.evaluate_module(&dep)?;
+        self.evaluate_module_now(&dep)?;
         self.deferred_namespaces.remove(&handle.to_raw());
         // The deferred namespace's data properties were snapshotted at creation
         // time — before the module ran, so each held `undefined`. Now that the
@@ -1795,7 +2148,9 @@ impl<'a> Interp<'a> {
             let Some(r) = self.modules.records.get(&k) else {
                 continue;
             };
-            if r.status == Status::Evaluating {
+            // `evaluating-async` counts too: such a module has started but its
+            // bindings are not all initialized (it may not have run at all yet).
+            if matches!(r.status, Status::Evaluating | Status::EvaluatingAsync) {
                 return true;
             }
             // Don't descend into an already-evaluated module: its subgraph ran
@@ -1902,7 +2257,7 @@ impl<'a> Interp<'a> {
         let promise = self.fresh_promise();
         let referrer = self.current_module_key();
         let host = FileModuleHost;
-        let outcome: Result<NanBox, ExecError> = (|this: &mut Self| {
+        let resolved: Result<(String, Option<String>), ExecError> = (|this: &mut Self| {
             // `ToString(specifier)` is part of the ImportCall steps, so a throwing
             // `toString`/`Symbol.toPrimitive`/`valueOf` *rejects the promise*
             // rather than propagating synchronously. Use the real ToString (not
@@ -1915,22 +2270,320 @@ impl<'a> Interp<'a> {
             let dep = host
                 .resolve(&spec_str, referrer.as_deref())
                 .map_err(|e| this.type_error(&e))?;
-            let dep = module_map_key(&dep, type_attr.as_deref());
-            this.load_module(&dep, &host, type_attr.as_deref())?;
-            this.link_module(&dep)?;
-            this.evaluate_module(&dep)?;
-            this.namespace_object(&dep)
+            Ok((module_map_key(&dep, type_attr.as_deref()), type_attr))
         })(self);
-        match outcome {
+        match resolved {
+            Ok((dep, type_attr)) => self.start_dynamic_import(&dep, type_attr.as_deref(), promise),
+            Err(e) => self.reject_dynamic_import(promise, e),
+        }
+        Ok(NanBox::handle(promise.to_raw()))
+    }
+
+    /// `FinishLoadingImportedModule` + `ContinueDynamicImport` for a resolved
+    /// dynamic-import request: loads, links, and evaluates `dep`, settling
+    /// `promise` with its namespace once the evaluation promise does.
+    ///
+    /// `Evaluate()` may not run while another `Evaluate()` is in progress in the
+    /// same agent (16.2.1.5.3 step 1), so when this call is reached *from a module
+    /// body* the whole continuation is deferred to a job — which is also what stops
+    /// a dynamic import from preempting the enclosing graph's depth-first order.
+    pub(crate) fn start_dynamic_import(
+        &mut self,
+        dep: &str,
+        type_attr: Option<&str>,
+        promise: crate::heap::Handle,
+    ) {
+        if self.modules.evaluating_depth > 0 {
+            self.defer_dynamic_import(dep, type_attr, promise, false);
+            return;
+        }
+        let host = FileModuleHost;
+        let outcome: Result<(), ExecError> = (|this: &mut Self| {
+            this.load_module(dep, &host, type_attr)?;
+            this.link_module(dep)?;
+            let evaluated = this.evaluate_module(dep)?;
+            this.settle_namespace_when(evaluated, dep, promise, false);
+            Ok(())
+        })(self);
+        if let Err(e) = outcome {
+            self.reject_dynamic_import(promise, e);
+        }
+    }
+
+    /// `ContinueDynamicImport` for the **defer** phase (`import.defer(specifier)`):
+    /// loads and links `dep` but evaluates only its asynchronous transitive
+    /// dependencies, then fulfils `promise` with the Deferred Module Namespace.
+    pub(crate) fn start_dynamic_import_deferred(
+        &mut self,
+        dep: &str,
+        promise: crate::heap::Handle,
+    ) {
+        if self.modules.evaluating_depth > 0 {
+            self.defer_dynamic_import(dep, None, promise, true);
+            return;
+        }
+        let host = FileModuleHost;
+        let outcome: Result<(), ExecError> = (|this: &mut Self| {
+            this.load_module(dep, &host, None)?;
+            this.link_module(dep)?;
+            // Deliberately NOT evaluated — deferred until first namespace access —
+            // except for the asynchronous transitive dependencies, which cannot be
+            // evaluated synchronously when that access happens and so are hoisted
+            // out of the deferral exactly as for a static `import defer`.
+            let mut seen = alloc::collections::BTreeSet::new();
+            let mut gathered = Vec::new();
+            this.gather_async_transitive_deps(dep, &mut seen, &mut gathered);
+            let mut pending: Vec<crate::heap::Handle> = Vec::new();
+            for m in &gathered {
+                let p = this.evaluate_module(m)?;
+                if this
+                    .realm
+                    .promise_state(p)
+                    .is_some_and(|s| s.borrow().status == crate::cell::PromiseStatus::Pending)
+                {
+                    pending.push(p);
+                }
+            }
+            if pending.is_empty() {
+                // Every hoisted dependency already completed: the deferred
+                // namespace is available now.
+                for m in &gathered {
+                    if let Some(err) = this.modules.records[m].eval_error {
+                        return Err(ExecError::Throw(err));
+                    }
+                }
+                let ns = this.deferred_namespace_object(dep)?;
+                this.settle(promise, ns, true);
+            } else {
+                // Wait for the still-running ones before handing out the namespace.
+                let all = this.safe_perform_promise_all(&pending);
+                this.settle_namespace_when(all, dep, promise, true);
+            }
+            Ok(())
+        })(self);
+        if let Err(e) = outcome {
+            self.reject_dynamic_import(promise, e);
+        }
+    }
+
+    /// `SafePerformPromiseAll(promises)` — an aggregate promise that fulfils once
+    /// every element has fulfilled and rejects with the first rejection. Unlike
+    /// `Promise.all` it performs the reactions directly, so a patched
+    /// `Promise.prototype.then` (or a `@@species` constructor) is never observed
+    /// by import-defer's asynchronous-dependency hoisting.
+    fn safe_perform_promise_all(
+        &mut self,
+        promises: &[crate::heap::Handle],
+    ) -> crate::heap::Handle {
+        let result = self.fresh_promise();
+        if promises.is_empty() {
+            self.settle(result, NanBox::undefined(), true);
+            return result;
+        }
+        let state = self.realm.new_object();
+        self.realm.set_hidden_property(
+            state,
+            SAFE_ALL_REMAINING,
+            NanBox::number(promises.len() as f64),
+        );
+        self.realm
+            .set_hidden_property(state, SAFE_ALL_TARGET, NanBox::handle(result.to_raw()));
+        for p in promises {
+            let on_f = self
+                .realm
+                .new_bound_native(super::N_SAFE_ALL_FULFILL, state);
+            let on_r = self.realm.new_bound_native(super::N_SAFE_ALL_REJECT, state);
+            self.register_then(
+                *p,
+                NanBox::handle(on_f.to_raw()),
+                NanBox::handle(on_r.to_raw()),
+                false,
+            );
+        }
+        result
+    }
+
+    /// One element settlement of [`Self::safe_perform_promise_all`]: a rejection
+    /// settles the aggregate immediately, a fulfilment once the count reaches zero.
+    pub(crate) fn safe_promise_all_element(
+        &mut self,
+        state: crate::heap::Handle,
+        value: NanBox,
+        fulfilled: bool,
+    ) {
+        let Some(target) = self
+            .realm
+            .get_property(state, SAFE_ALL_TARGET)
+            .and_then(|v| v.as_handle())
+            .map(crate::heap::Handle::from_raw)
+        else {
+            return;
+        };
+        if !fulfilled {
+            self.settle(target, value, false);
+            return;
+        }
+        let remaining = self
+            .realm
+            .get_property(state, SAFE_ALL_REMAINING)
+            .and_then(|v| v.as_number())
+            .unwrap_or(0.0)
+            - 1.0;
+        self.realm
+            .set_hidden_property(state, SAFE_ALL_REMAINING, NanBox::number(remaining));
+        if remaining <= 0.0 {
+            self.settle(target, NanBox::undefined(), true);
+        }
+    }
+
+    /// Hooks `evaluated` (a module's top-level capability, or an aggregate of
+    /// several) so that `promise` fulfils with `dep`'s (deferred) namespace object
+    /// when it does, and rejects with the same reason when it rejects.
+    fn settle_namespace_when(
+        &mut self,
+        evaluated: crate::heap::Handle,
+        dep: &str,
+        promise: crate::heap::Handle,
+        deferred_phase: bool,
+    ) {
+        let state = self.realm.new_object();
+        let key_val = self.new_str(dep);
+        self.realm.set_hidden_property(state, DYN_KEY, key_val);
+        self.realm
+            .set_hidden_property(state, DYN_PROMISE, NanBox::handle(promise.to_raw()));
+        self.realm
+            .set_hidden_property(state, DYN_DEFER, NanBox::boolean(deferred_phase));
+        let on_f = self
+            .realm
+            .new_bound_native(super::N_DYNAMIC_IMPORT_FULFILLED, state);
+        let on_r = self
+            .realm
+            .new_bound_native(super::N_DYNAMIC_IMPORT_REJECTED, state);
+        self.register_then(
+            evaluated,
+            NanBox::handle(on_f.to_raw()),
+            NanBox::handle(on_r.to_raw()),
+            false,
+        );
+    }
+
+    /// Queues the load/link/evaluate continuation of a dynamic import as a job, so
+    /// it runs once the enclosing `Evaluate()` has returned.
+    fn defer_dynamic_import(
+        &mut self,
+        dep: &str,
+        type_attr: Option<&str>,
+        promise: crate::heap::Handle,
+        deferred_phase: bool,
+    ) {
+        let state = self.realm.new_object();
+        let key_val = self.new_str(dep);
+        self.realm.set_hidden_property(state, DYN_KEY, key_val);
+        if let Some(t) = type_attr {
+            let t = self.new_str(t);
+            self.realm.set_hidden_property(state, DYN_TYPE, t);
+        }
+        self.realm
+            .set_hidden_property(state, DYN_PROMISE, NanBox::handle(promise.to_raw()));
+        self.realm
+            .set_hidden_property(state, DYN_DEFER, NanBox::boolean(deferred_phase));
+        let job = self
+            .realm
+            .new_bound_native(super::N_DYNAMIC_IMPORT_JOB, state);
+        let trigger = self.promise_resolve(NanBox::undefined());
+        self.register_then(
+            trigger,
+            NanBox::handle(job.to_raw()),
+            NanBox::undefined(),
+            false,
+        );
+    }
+
+    /// Runs a deferred dynamic-import job (the [`Self::defer_dynamic_import`]
+    /// continuation), reading its request back out of the bound state object.
+    pub(crate) fn run_dynamic_import_job(&mut self, state: crate::heap::Handle) {
+        let key = self.hidden_string(state, DYN_KEY).unwrap_or_default();
+        let type_attr = self.hidden_string(state, DYN_TYPE);
+        let Some(promise) = self
+            .realm
+            .get_property(state, DYN_PROMISE)
+            .and_then(|v| v.as_handle())
+            .map(crate::heap::Handle::from_raw)
+        else {
+            return;
+        };
+        let deferred_phase = self
+            .realm
+            .get_property(state, DYN_DEFER)
+            .is_some_and(|v| self.realm.truthy(v));
+        // The enclosing `Evaluate()` has returned by now, so this runs the real
+        // continuation rather than deferring again.
+        if deferred_phase {
+            self.start_dynamic_import_deferred(&key, promise);
+        } else {
+            self.start_dynamic_import(&key, type_attr.as_deref(), promise);
+        }
+    }
+
+    /// Fulfils a dynamic import's promise with the imported module's namespace
+    /// (the `ContinueDynamicImport` onFulfilled closure).
+    pub(crate) fn dynamic_import_fulfilled(&mut self, state: crate::heap::Handle) {
+        let key = self.hidden_string(state, DYN_KEY).unwrap_or_default();
+        let Some(promise) = self
+            .realm
+            .get_property(state, DYN_PROMISE)
+            .and_then(|v| v.as_handle())
+            .map(crate::heap::Handle::from_raw)
+        else {
+            return;
+        };
+        let deferred_phase = self
+            .realm
+            .get_property(state, DYN_DEFER)
+            .is_some_and(|v| self.realm.truthy(v));
+        let ns = if deferred_phase {
+            self.deferred_namespace_object(&key)
+        } else {
+            self.namespace_object(&key)
+        };
+        match ns {
             Ok(ns) => self.settle(promise, ns, true),
-            Err(ExecError::Throw(v)) => self.settle(promise, v, false),
-            Err(other) => {
+            Err(e) => self.reject_dynamic_import(promise, e),
+        }
+    }
+
+    /// Rejects a dynamic import's promise with the module's evaluation error (the
+    /// `ContinueDynamicImport` onRejected closure).
+    pub(crate) fn dynamic_import_rejected(&mut self, state: crate::heap::Handle, error: NanBox) {
+        if let Some(promise) = self
+            .realm
+            .get_property(state, DYN_PROMISE)
+            .and_then(|v| v.as_handle())
+            .map(crate::heap::Handle::from_raw)
+        {
+            self.settle(promise, error, false);
+        }
+    }
+
+    /// Reads a hidden string slot off a bound-native state object.
+    fn hidden_string(&self, state: crate::heap::Handle, slot: &str) -> Option<String> {
+        self.realm
+            .get_property(state, slot)
+            .and_then(|v| v.as_handle())
+            .map(crate::heap::Handle::from_raw)
+            .and_then(|h| self.realm.string_value(h))
+    }
+
+    /// Settles a dynamic import's promise with a load/link/evaluate failure.
+    fn reject_dynamic_import(&mut self, promise: crate::heap::Handle, e: ExecError) {
+        match e {
+            ExecError::Throw(v) => self.settle(promise, v, false),
+            other => {
                 let m = self.new_str(&alloc::format!("dynamic import failed: {other:?}"));
                 let err = self.make_error(N_SYNTAX_ERROR, Some(m));
                 self.settle(promise, err, false);
             }
         }
-        Ok(NanBox::handle(promise.to_raw()))
     }
 
     /// Evaluates `import.defer(specifier)` (import-defer proposal): loads and
@@ -1948,33 +2601,14 @@ impl<'a> Interp<'a> {
         };
         let referrer = self.current_module_key();
         let host = FileModuleHost;
-        let outcome: Result<NanBox, ExecError> = (|this: &mut Self| {
+        let resolved: Result<String, ExecError> = (|this: &mut Self| {
             let spec_str = this.coerce_to_string(spec)?;
-            let dep = host
-                .resolve(&spec_str, referrer.as_deref())
-                .map_err(|e| this.type_error(&e))?;
-            this.load_module(&dep, &host, None)?;
-            this.link_module(&dep)?;
-            // Deliberately NOT evaluated — deferred until first namespace access —
-            // except for the asynchronous transitive dependencies, which cannot be
-            // evaluated synchronously when that access happens and so are hoisted
-            // out of the deferral exactly as for a static `import defer`.
-            let mut seen = alloc::collections::BTreeSet::new();
-            let mut gathered = Vec::new();
-            this.gather_async_transitive_deps(&dep, &mut seen, &mut gathered);
-            for m in &gathered {
-                this.evaluate_module(m)?;
-            }
-            this.deferred_namespace_object(&dep)
+            host.resolve(&spec_str, referrer.as_deref())
+                .map_err(|e| this.type_error(&e))
         })(self);
-        match outcome {
-            Ok(ns) => self.settle(promise, ns, true),
-            Err(ExecError::Throw(v)) => self.settle(promise, v, false),
-            Err(other) => {
-                let m = self.new_str(&alloc::format!("dynamic import failed: {other:?}"));
-                let err = self.make_error(N_SYNTAX_ERROR, Some(m));
-                self.settle(promise, err, false);
-            }
+        match resolved {
+            Ok(dep) => self.start_dynamic_import_deferred(&dep, promise),
+            Err(e) => self.reject_dynamic_import(promise, e),
         }
         Ok(NanBox::handle(promise.to_raw()))
     }
@@ -2031,11 +2665,13 @@ impl<'a> Interp<'a> {
 
         let outcome = (|this: &mut Self| -> Result<NanBox, ExecError> {
             // Load is the parse/resolution phase (a SyntaxError in the fixture
-            // surfaces here); link wires imports; evaluate runs the body (a
-            // top-level-await body blocks to settlement inside `run_module_body`).
+            // surfaces here); link wires imports; evaluate runs the body.
+            // (`importValue` reads the export synchronously here, so a fixture
+            // with top-level `await` would not have finished — the ShadowRealm
+            // integration has no event loop of its own to drive it.)
             this.load_module(&dep, &host, None)?;
             this.link_module(&dep)?;
-            this.evaluate_module(&dep)?;
+            this.evaluate_module_now(&dep)?;
             let ns = this.namespace_object(&dep)?;
             let ns_h = ns
                 .as_handle()
