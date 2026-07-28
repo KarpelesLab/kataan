@@ -88,6 +88,10 @@ pub struct Regex {
     /// one position and the scan must not retry at every offset. See
     /// [`program_is_anchored`].
     anchored: bool,
+    /// The one code unit every match must begin with, when the program has one.
+    /// A scan can then skip straight to the next occurrence instead of running
+    /// the matcher at every offset. See [`program_first_unit`].
+    first_unit: Option<u16>,
     /// Number of capturing groups (excluding the whole-match group 0).
     group_count: usize,
     /// `(group index, name)` pairs for named capture groups (`(?<name>…)`).
@@ -206,6 +210,7 @@ impl Regex {
         let (prog, group_count) = compile::compile(&ast, &group_names, flags.unicode)?;
         Ok(Regex {
             anchored: program_is_anchored(&prog),
+            first_unit: program_first_unit(&prog),
             prog,
             scalar_prog: core::cell::OnceCell::new(),
             source: alloc::string::String::from(pattern),
@@ -395,12 +400,30 @@ impl Regex {
         };
         let steps = core::cell::Cell::new(0u64);
         let budget = vm::budget_for(units.len());
-        for s in start..=last {
+        // When every match must begin with one known code unit, offsets where the
+        // subject does not hold it cannot match, so skip to the next occurrence
+        // rather than starting the matcher and having it fail on its first step.
+        // Under `i` the unit stands for a whole case-folding class, so the filter
+        // does not apply.
+        let filter = if flags.ignore_case {
+            None
+        } else {
+            self.first_unit
+        };
+        let mut s = start;
+        while s <= last {
+            if let Some(want) = filter {
+                s += units[s..].iter().position(|&u| u == want)?;
+                if s > last {
+                    return None;
+                }
+            }
             if let Some(groups) =
                 vm::run_shared(prog, units, s, self.group_count, flags, &steps, budget)
             {
                 return Some(Captures { groups });
             }
+            s += 1;
         }
         None
     }
@@ -485,6 +508,59 @@ fn program_is_anchored(prog: &[vm::Inst]) -> bool {
         }
     }
     true
+}
+
+/// The single code unit every match of `prog` must start with, or `None` when
+/// there is no such unit.
+///
+/// Same walk as [`program_is_anchored`]: follow control flow to the first
+/// input-consuming instruction on each path. If every path reaches the *same*
+/// `Inst::Char`, that unit is required and a scan can skip offsets without it.
+/// Anything else — two different literals, a class, `.`, a backreference, or a
+/// reachable `Match` (the pattern matches empty) — means no single unit is
+/// required.
+///
+/// Astral literals are excluded: in `u` mode one `Char` spans a surrogate pair,
+/// and filtering on the high surrogate alone would be a different predicate than
+/// the one the matcher applies. Only costs the optimization.
+///
+/// The result holds only when `i` is off — the caller checks that, since under
+/// case folding the literal stands for a class rather than one unit.
+fn program_first_unit(prog: &[vm::Inst]) -> Option<u16> {
+    use vm::Inst;
+    let mut seen = alloc::vec![false; prog.len()];
+    let mut stack = alloc::vec![0usize];
+    let mut required: Option<u16> = None;
+    while let Some(pc) = stack.pop() {
+        let inst = prog.get(pc)?;
+        if core::mem::replace(&mut seen[pc], true) {
+            continue;
+        }
+        match inst {
+            // The first thing this path consumes. Every path must agree.
+            Inst::Char(c) => {
+                let unit = u16::try_from(*c).ok()?;
+                match required {
+                    None => required = Some(unit),
+                    Some(prev) if prev == unit => {}
+                    Some(_) => return None,
+                }
+            }
+            Inst::Jmp(t) => stack.push(*t),
+            Inst::Split(a, b) => {
+                stack.push(*a);
+                stack.push(*b);
+            }
+            // Zero-width: the required unit, if any, is still ahead.
+            Inst::Save(_)
+            | Inst::ClearCaptures { .. }
+            | Inst::Assert(_)
+            | Inst::Look { .. }
+            | Inst::LookBehind { .. } => stack.push(pc + 1),
+            _ => return None,
+        }
+    }
+    required
 }
 
 /// Expands a replacement template (`$&`, `$1`..`$9`) for one match.
