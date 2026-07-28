@@ -12,19 +12,22 @@ const STAGES = [
   { id: 'parse', label: 'Tree', verb: 'parsed' },
 ];
 
-// Figures come from the nightly gate; the workflow rewrites them at build time
-// so the page cannot quietly drift from the ledger.
+// Every figure here is derived from `tests/test262-status.txt` by the deploy
+// workflow, which rewrites this whole block — the ledger count, the pass count
+// (`ran` minus the ledger, exact while the gate is green), the rate, and the
+// cluster bars. `ran` is the one number a run reports rather than the ledger, so
+// it is the only literal to touch by hand, when the corpus itself changes size.
 const CONFORMANCE = {
-  rate: '99.45%',
-  passing: '51,603',
+  rate: '99.69%',
+  passing: '51,729',
   ran: '51,890',
-  ledger: 287,
+  ledger: 161,
   clusters: [
     { name: 'intl402/Temporal', count: 27 },
-    { name: 'intl402/NumberFormat', count: 27 },
-    { name: 'built-ins/Atomics', count: 21 },
-    { name: 'intl402/DateTimeFormat', count: 18 },
-    { name: 'built-ins/Array', count: 18 },
+    { name: 'intl402/NumberFormat', count: 24 },
+    { name: 'language/expressions', count: 19 },
+    { name: 'language/statements', count: 10 },
+    { name: 'annexB/built-ins', count: 8 },
   ],
 };
 CONFORMANCE.worst = Math.max(...CONFORMANCE.clusters.map((c) => c.count));

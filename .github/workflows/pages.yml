@@ -73,18 +73,45 @@ jobs:
 
       # The page states its own numbers, so they must come from the repository
       # rather than from whatever was true when the copy was written.
+      #
+      # Everything except `ran` is derived from the ledger: the pass count is
+      # `ran` minus the ledger (exact while the gate is green, which is the only
+      # state that ships), and the cluster bars are the ledger's own top areas.
+      # Stamping only *some* of them is worse than stamping none — the page would
+      # show a fresh ledger count beside a stale rate.
       - name: Stamp version and ledger figures into the page
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          ledger=$(awk '!/^#/ && NF' tests/test262-status.txt | wc -l | tr -d ' ')
           gzip_kb=$(gzip -9c dist/kataan.wasm | wc -c | awk '{printf "%.1f", $1/1048576}')
           sed -i \
             -e "s/version: '[^']*'/version: '${version}'/" \
-            -e "s/ledger: [0-9]*/ledger: ${ledger}/" \
             -e "s/gzip: '[^']*'/gzip: '${gzip_kb} MB'/" \
             dist/app.js
-          echo "version=${version} ledger=${ledger} gzip=${gzip_kb}MB"
+          python3 - "$version" "$gzip_kb" <<'PY'
+          import re, sys, collections
+          rows = [l for l in open('tests/test262-status.txt').read().splitlines()
+                  if l.strip() and not l.startswith('#')]
+          ledger = len(rows)
+          areas = collections.Counter('/'.join(r.split()[0].split('/')[:2]) for r in rows)
+          src = open('dist/app.js').read()
+          ran = int(re.search(r"ran: '([\d,]+)'", src).group(1).replace(',', ''))
+          passing = ran - ledger
+          clusters = ''.join(
+              f"    {{ name: '{n}', count: {c} }},\n" for n, c in areas.most_common(5))
+          block = (
+              "const CONFORMANCE = {\n"
+              f"  rate: '{passing / ran * 100:.2f}%',\n"
+              f"  passing: '{passing:,}',\n"
+              f"  ran: '{ran:,}',\n"
+              f"  ledger: {ledger},\n"
+              "  clusters: [\n" + clusters + "  ],\n};\n")
+          src = re.sub(r"const CONFORMANCE = \{.*?\n\};\n", block, src, count=1, flags=re.S)
+          open('dist/app.js', 'w').write(src)
+          print(f"ledger={ledger} passing={passing} ran={ran} "
+                f"rate={passing / ran * 100:.2f}%")
+          PY
+          echo "version=${version} gzip=${gzip_kb}MB"
 
       - uses: actions/upload-pages-artifact@v3
         with:
