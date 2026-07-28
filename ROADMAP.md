@@ -652,6 +652,34 @@ regex match/replace/split path, and `Array.prototype.push`/`pop`. What remains:
   cold-start vs `node -e` / `bun`; code-cache load/evict/reload throughput;
   per-object memory vs V8/JSC heaps.
 
+### 5.2 The regex subject is rebuilt on every call
+
+`regex_method` (and the `nbexec` twin) transcodes the whole subject to a fresh
+`Vec<u16>` per `test`/`exec`, because the matcher takes `&[u16]`. So the cost of
+a match is O(subject length) *even when the match itself is O(1)* — after the
+anchoring fix (ad422b64) that buffer is the entire remaining cost of an anchored
+`test`: 4000 tests over a 10 MB string spend ~67 s copying ~80 GB, against node's
+23 ms.
+
+Two shapes, and the cheap-looking one is a trap:
+
+- **Cache the units on the string.** Precedent exists (`Cell::RegExp` caches its
+  compiled program the same way), but so does a scar: the rope `charCodeAt` memo
+  made repeated access 7× faster and took peak RSS from 17.6 MB to 1.5 GB, and
+  was reverted. A units cache doubles the footprint of every string a regex ever
+  touches. If it is done at all it wants a *bounded* cache — one slot, or an LRU
+  of a few — keyed so a freed-and-reused handle cannot alias, not a per-cell
+  field.
+- **Make the subject lazy.** Give the matcher a cursor over the string's WTF-8
+  bytes instead of a materialized slice, so it reads only the units it visits.
+  This is the real fix — it makes an anchored or early-failing match genuinely
+  O(match), not O(subject) — and it is a refactor of the matcher's input API
+  (`captures_in_u16` and friends) rather than a cache with an invalidation
+  problem.
+
+The same materialization sits behind `split`/`replace`/`match`, so the lazy path
+would pay off across all of them.
+
 ---
 
 ## 6. Design invariants that still constrain remaining work
