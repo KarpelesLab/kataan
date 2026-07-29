@@ -18,14 +18,14 @@ const STAGES = [
 // cluster bars. `ran` is the one number a run reports rather than the ledger, so
 // it is the only literal to touch by hand, when the corpus itself changes size.
 const CONFORMANCE = {
-  rate: '99.69%',
-  passing: '51,729',
+  rate: '99.71%',
+  passing: '51,739',
   ran: '51,890',
-  ledger: 161,
+  ledger: 151,
   clusters: [
     { name: 'intl402/Temporal', count: 27 },
-    { name: 'intl402/NumberFormat', count: 24 },
     { name: 'language/expressions', count: 19 },
+    { name: 'intl402/NumberFormat', count: 14 },
     { name: 'language/statements', count: 10 },
     { name: 'annexB/built-ins', count: 8 },
   ],
