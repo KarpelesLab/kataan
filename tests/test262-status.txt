@@ -49,25 +49,15 @@ intl402/Locale/constructor-non-iana-canon.js  # [sloppy] expected pass, Runtime 
 intl402/Locale/constructor-options-region-valid.js  # [sloppy] expected pass, Runtime Test262Error: new Intl.Locale('en', {region: "554"}).toString() returns "en-NZ" Expected SameValue(«"en-554"», «"en-NZ"») to be true
 intl402/Locale/likely-subtags-grandfathered.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"art-fonipa-lojban"», «"jbo-fonipa"») to be true
 intl402/Locale/likely-subtags.js  # [sloppy] expected pass, Runtime Test262Error: "en-fonipa".minimize() should be "en-fonipa" Expected SameValue(«"en-Latn-US-fonipa"», «"en-fonipa"») to be true
-intl402/NumberFormat/prototype/format/engineering-scientific-zh-TW.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"NaN"», «"非數值"») to be true
-intl402/NumberFormat/prototype/format/notation-compact-zh-TW.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"9.9亿"», «"9.9億"») to be true
-intl402/NumberFormat/prototype/format/signDisplay-negative-zh-TW.js  # [sloppy] expected pass, Runtime Test262Error: NaN Expected SameValue(«"NaN"», «"非數值"») to be true
-intl402/NumberFormat/prototype/format/signDisplay-zh-TW.js  # [sloppy] expected pass, Runtime Test262Error: NaN (auto) Expected SameValue(«"NaN"», «"非數值"») to be true
 intl402/NumberFormat/prototype/format/unit-de-DE.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"-987 km/h"», «"-987 km/h"») to be true
 intl402/NumberFormat/prototype/format/unit-en-US.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"-987 km/h"», «"-987 km/h"») to be true
 intl402/NumberFormat/prototype/format/unit-ja-JP.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"-987 km/h"», «"-987 km/h"») to be true
 intl402/NumberFormat/prototype/format/unit-ko-KR.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"-987 km/h"», «"-987km/h"») to be true
 intl402/NumberFormat/prototype/format/unit-zh-TW.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"-987 km/h"», «"-987 公里/小時"») to be true
-intl402/NumberFormat/prototype/format/useGrouping-en-IN.js  # [sloppy] expected pass, Runtime Test262Error: (omitted) Expected SameValue(«"100,000"», «"1,00,000"») to be true
-intl402/NumberFormat/prototype/format/useGrouping-extended-en-IN.js  # [sloppy] expected pass, Runtime Test262Error: "always" Expected SameValue(«"100,000"», «"1,00,000"») to be true
 intl402/NumberFormat/prototype/formatRange/en-US.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"$3.00–$5.00"», «"$3 – $5"») to be true
 intl402/NumberFormat/prototype/formatRange/pt-PT.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"€ 3,00–€ 5,00"», «"3 - 5 €"») to be true
 intl402/NumberFormat/prototype/formatRangeToParts/en-US.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«3», «5») to be true
-intl402/NumberFormat/prototype/formatToParts/engineering-scientific-zh-TW.js  # [sloppy] expected pass, Runtime Test262Error: NaN - engineering: parts[0].value Expected SameValue(«"NaN"», «"非數值"») to be true
-intl402/NumberFormat/prototype/formatToParts/notation-compact-zh-TW.js  # [sloppy] expected pass, Runtime Test262Error: Compact short: 987654321: parts[3].value Expected SameValue(«"亿"», «"億"») to be true
 intl402/NumberFormat/prototype/formatToParts/percent-en-US.js  # [sloppy] expected pass, Runtime Test262Error: unit: length Expected SameValue(«4», «3») to be true
-intl402/NumberFormat/prototype/formatToParts/signDisplay-negative-zh-TW.js  # [sloppy] expected pass, Runtime Test262Error: NaN (negative): parts[0].value Expected SameValue(«"NaN"», «"非數值"») to be true
-intl402/NumberFormat/prototype/formatToParts/signDisplay-zh-TW.js  # [sloppy] expected pass, Runtime Test262Error: NaN (auto): parts[0].value Expected SameValue(«"NaN"», «"非數值"») to be true
 intl402/NumberFormat/prototype/formatToParts/unit-de-DE.js  # [sloppy] expected pass, Runtime Test262Error: undefined: parts[2].value Expected SameValue(«" "», «" "») to be true
 intl402/NumberFormat/prototype/formatToParts/unit-en-US.js  # [sloppy] expected pass, Runtime Test262Error: undefined: parts[2].value Expected SameValue(«" "», «" "») to be true
 intl402/NumberFormat/prototype/formatToParts/unit-ja-JP.js  # [sloppy] expected pass, Runtime Test262Error: undefined: parts[2].value Expected SameValue(«" "», «" "») to be true

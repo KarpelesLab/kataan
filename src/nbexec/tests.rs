@@ -835,7 +835,13 @@ fn intl_datetime_is_locale_aware() {
 
 /// `Intl.DateTimeFormat` field shapes the CLDR `availableFormats` table has no
 /// entry for: the flexible day period on its own, and a lone `minute`/`second`/
-/// `fractionalSecondDigits` (never zero-padded, whatever width was asked for).
+/// `fractionalSecondDigits`. `intl` 0.5.3 synthesizes a pattern for these rather
+/// than falling back to a date pattern and stripping it to nothing.
+///
+/// A lone `second: "2-digit"` gives `06`, which is where we part company with
+/// V8/node — they render `6` for both widths. ECMA-402's format matcher adjusts
+/// the chosen pattern's field widths to the *requested* width, so honouring
+/// `2-digit` is the better reading, and no Test262 test covers the case.
 #[cfg(feature = "intl")]
 #[test]
 fn intl_datetime_lone_field_options() {
@@ -845,7 +851,7 @@ fn intl_datetime_lone_field_options() {
         console.log([f({dayPeriod:"long"}), f({minute:"numeric"}), f({second:"2-digit"}),
                      f({fractionalSecondDigits:3}), f({second:"numeric",fractionalSecondDigits:2})].join("|"))
     "#;
-    assert_eq!(out(src), "in the morning|35|6|789|6.78\n");
+    assert_eq!(out(src), "in the morning|35|06|789|6.78\n");
     // CLDR dropped the `midnight` day-period *format* rule; 00:00 is `morning1`.
     assert_eq!(
         out(

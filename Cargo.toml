@@ -38,7 +38,7 @@ required-features = ["cli"]
 # `crypto` is in the default set so `Math.random` is seeded from real OS entropy
 # (purecrypto's CSPRNG); the no_std core drops it and falls back to a best-effort
 # entropy mix (cycle counter + clock + ASLR), never a fixed seed.
-default = ["std", "regex", "intl", "module", "host", "cli", "crypto"]
+default = ["std", "regex", "intl", "intl-tz-names", "module", "host", "cli", "crypto"]
 std = ["alloc"]
 alloc = []
 
@@ -49,6 +49,12 @@ regex = []
 # mapping/folding, character properties) over the pure-Rust `intl` crate — a
 # no_std ICU analog.
 intl = ["alloc", "dep:intl"]
+# Localized time-zone names (CLDR metazone data, all eleven tzdb areas). Split
+# out because it is ~1 MB gzipped — a third of the browser build — and the
+# browser build drops it: without it `timeZoneName` falls back to the localized
+# GMT offset, which is UTS #35's own last resort rather than a failure. The
+# conformance build keeps it, since Test262 checks the names.
+intl-tz-names = ["intl", "intl/tz-names"]
 # ESM + CommonJS module loader/linker.
 module = []
 # Host runtime: event loop, timers, console, encoding, URL, streams, process.
@@ -80,9 +86,17 @@ purecrypto = { version = "0.6", optional = true, default-features = false, featu
 # 0.5 gates each formatter behind its own feature (the 0.4 `full` no longer
 # pulls them in). Enable the Intl-service formatters the engine uses (`plural`
 # and `calendar` are always-on and need no feature).
-intl = { version = "0.5.2", optional = true, default-features = false, features = [
+intl = { version = "0.5.3", optional = true, default-features = false, features = [
     "full", "alloc", "case", "collation", "identifiers",
     "number", "currency", "datetime", "calendars-extra", "list", "displaynames", "relative", "units", "locale",
+    # 0.5.3 gates the newly-added data so a consumer compiles in only what it
+    # serves. `Intl` is spec surface here, so we take all of it: `units-narrow`
+    # backs `unitDisplay: "narrow"`, `number-numsys` the `-u-nu-` extension and
+    # per-numbering-system symbols, `number-range` `formatRange`, and the
+    # `tz-names-*` areas `timeZoneName` long/short (an area left out silently
+    # degrades to a GMT offset, which would be a conformance failure, not a
+    # graceful fallback, for us).
+    "units-narrow", "number-numsys", "number-range",
 ] }
 # `int` backs BigInt; `rational`/`decimal` give exact (non-f64) arithmetic for
 # Intl NumberFormat rounding and Temporal duration ratios (avoids the f64

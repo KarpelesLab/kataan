@@ -132,6 +132,30 @@ fn substitute_numbering_digits(nu: &str, s: String) -> String {
     }
 }
 
+/// Whether `c` is a digit of numbering system `nu`.
+///
+/// The scaffold probes format a sample and read it back to find the locale's
+/// affixes and separators, so they must know which characters are digits *in the
+/// system the sample was rendered in*. No character-class test can stand in:
+/// `hanidec` renders with CJK ideographs (`一二三`), which Unicode classes as
+/// ordinary letters, not digits. Latin digits are always accepted too, since a
+/// probe may come back un-substituted.
+fn is_digit_of_numbering_system(nu: &str, c: char) -> bool {
+    if c.is_ascii_digit() {
+        return true;
+    }
+    if nu == "hanidec" {
+        return matches!(
+            c,
+            '〇' | '一' | '二' | '三' | '四' | '五' | '六' | '七' | '八' | '九'
+        );
+    }
+    match numbering_system_digit_base(nu) {
+        Some(base) => (c as u32) >= base && (c as u32) < base + 10,
+        None => false,
+    }
+}
+
 /// The CLDR collation tailoring for a resolved locale tag, memoized.
 ///
 /// Building one parses the locale's CLDR rule, which is far too expensive to
@@ -792,23 +816,23 @@ fn split_compact_affix_parts(parts: &mut alloc::vec::Vec<(&'static str, String)>
 /// From a probe like `"1.1"` / `"-1.1"` (latn digits), split the leading prefix,
 /// the decimal separator, and the trailing suffix.
 #[cfg(feature = "intl")]
-fn split_number_scaffold(probe: &str) -> (String, String, String) {
+fn split_number_scaffold(probe: &str, nu: &str) -> (String, String, String) {
     let chars: alloc::vec::Vec<char> = probe.chars().collect();
     let mut i = 0;
     let mut prefix = String::new();
-    while i < chars.len() && !chars[i].is_ascii_digit() {
+    while i < chars.len() && !is_digit_of_numbering_system(nu, chars[i]) {
         prefix.push(chars[i]);
         i += 1;
     }
-    while i < chars.len() && chars[i].is_ascii_digit() {
+    while i < chars.len() && is_digit_of_numbering_system(nu, chars[i]) {
         i += 1;
     }
     let mut sep = String::new();
-    while i < chars.len() && !chars[i].is_ascii_digit() {
+    while i < chars.len() && !is_digit_of_numbering_system(nu, chars[i]) {
         sep.push(chars[i]);
         i += 1;
     }
-    while i < chars.len() && chars[i].is_ascii_digit() {
+    while i < chars.len() && is_digit_of_numbering_system(nu, chars[i]) {
         i += 1;
     }
     let suffix: String = chars[i..].iter().collect();
@@ -818,17 +842,17 @@ fn split_number_scaffold(probe: &str) -> (String, String, String) {
 /// From a probe like `"1,111"` (latn), extract the first group separator that
 /// appears between integer digit groups (`""` if the value isn't grouped).
 #[cfg(feature = "intl")]
-fn extract_group_sep(probe: &str) -> String {
+fn extract_group_sep(probe: &str, nu: &str) -> String {
     let chars: alloc::vec::Vec<char> = probe.chars().collect();
     let mut i = 0;
-    while i < chars.len() && !chars[i].is_ascii_digit() {
+    while i < chars.len() && !is_digit_of_numbering_system(nu, chars[i]) {
         i += 1; // skip prefix
     }
-    while i < chars.len() && chars[i].is_ascii_digit() {
+    while i < chars.len() && is_digit_of_numbering_system(nu, chars[i]) {
         i += 1; // first integer group
     }
     let mut sep = String::new();
-    while i < chars.len() && !chars[i].is_ascii_digit() {
+    while i < chars.len() && !is_digit_of_numbering_system(nu, chars[i]) {
         sep.push(chars[i]);
         i += 1;
     }
@@ -1332,7 +1356,11 @@ fn libm_pow10(e: i32) -> f64 {
 pub(crate) fn default_numbering_for_locale_str(locale: &str) -> String {
     #[cfg(feature = "intl")]
     {
-        let zero = intl::number::format_decimal_native(locale, 0.0);
+        // The locale's *default* numbering system — what `ResolveLocale` resolves
+        // and what `Intl.NumberFormat(locale)` uses. Not
+        // `otherNumberingSystems.native`: CLDR gives `ar` a default of `latn` and a
+        // native of `arab`, and ECMA-402 wants the former.
+        let zero = intl::number::format_decimal_default_numbering(locale, 0.0);
         if let Some(c) = zero.chars().next()
             && let Some(name) = numbering_system_name_from_zero(c)
         {
@@ -6834,11 +6862,21 @@ impl<'a> Interp<'a> {
     ) -> String {
         let int_str: String = int.iter().map(|d| (b'0' + d) as char).collect();
         let frac_str: String = frac.iter().map(|d| (b'0' + d) as char).collect();
+        // Probe with the *full* locale, `-u-nu-` included: the sample is read back
+        // for the locale's affixes and separators, and those differ per numbering
+        // system (`ar-u-nu-arab` uses U+066B where plain `ar` uses `.`). The digits
+        // that come back are the system's own, which is why the splitters are told
+        // which system to expect rather than assuming ASCII.
+        let nu = self
+            .realm
+            .get_property(handle, "numberingSystem")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_default();
         let probe = self.intl_format_number_inner(handle, if neg { -1.1 } else { 1.1 });
-        let (prefix, dec_sep, suffix) = split_number_scaffold(&probe);
+        let (prefix, dec_sep, suffix) = split_number_scaffold(&probe, &nu);
         let grouped = if grouping {
             let gp = self.intl_format_number_inner(handle, if neg { -1111.0 } else { 1111.0 });
-            let group_sep = extract_group_sep(&gp);
+            let group_sep = extract_group_sep(&gp, &nu);
             group_thousands_sep(&int_str, &group_sep)
         } else {
             int_str
