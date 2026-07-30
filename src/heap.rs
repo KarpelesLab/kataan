@@ -136,6 +136,31 @@ pub struct Heap<T> {
     /// write barrier records them). A minor collection scans only these as old
     /// roots instead of the whole old generation.
     remembered: BTreeSet<u32>,
+    /// Objects allocated since the last collection — the **allocation-pressure**
+    /// signal an allocation-triggered collector polls at its safepoints (see
+    /// `Realm::maybe_collect`). Reading it is a field load, so the check on the
+    /// allocation path costs nothing when it does not fire.
+    allocs_since_gc: usize,
+    /// **GC-verification mode** (`KATAAN_GC_VERIFY=1`): instead of actually
+    /// freeing a swept slot, record it here and keep the object alive. Any later
+    /// [`get`](Heap::get)/[`get_mut`](Heap::get_mut) of a recorded handle means
+    /// the collector reclaimed something the program still uses — i.e. the root
+    /// set is incomplete — and is counted in `hits` (and, with
+    /// `KATAAN_GC_VERIFY=panic`, aborts). `None` (the default) in every ordinary
+    /// build/run, so the extra check is a single null test on a cold field.
+    poison: Option<alloc::boxed::Box<PoisonState>>,
+}
+
+/// The bookkeeping behind [`Heap`]'s GC-verification mode (see `Heap::poison`).
+struct PoisonState {
+    /// Handles the collector wanted to free (but did not, so a use-after-free is
+    /// observable as a *hit* rather than as corruption).
+    freed: BTreeSet<Handle>,
+    /// How many times a recorded handle was resolved after being "freed"
+    /// (counted from the `&self` read path, hence the [`core::cell::Cell`]).
+    hits: core::cell::Cell<usize>,
+    /// Abort on the first hit rather than only counting it.
+    panic_on_hit: bool,
 }
 
 impl<T> Default for Heap<T> {
@@ -154,6 +179,60 @@ impl<T> Heap<T> {
             live: 0,
             compact_gen: COMPACT_GEN_BASE,
             remembered: BTreeSet::new(),
+            allocs_since_gc: 0,
+            poison: None,
+        }
+    }
+
+    /// Objects allocated since the last [`reset_alloc_pressure`](Heap::reset_alloc_pressure).
+    #[must_use]
+    pub const fn allocs_since_gc(&self) -> usize {
+        self.allocs_since_gc
+    }
+
+    /// Clears the allocation-pressure counter (called when a collection runs).
+    pub const fn reset_alloc_pressure(&mut self) {
+        self.allocs_since_gc = 0;
+    }
+
+    /// Turns on **GC-verification mode**: swept slots are recorded but not freed,
+    /// and resolving a recorded handle afterwards is counted (see `Heap::poison`).
+    /// `panic_on_hit` aborts on the first such use instead.
+    pub fn enable_gc_verify(&mut self, panic_on_hit: bool) {
+        self.poison = Some(alloc::boxed::Box::new(PoisonState {
+            freed: BTreeSet::new(),
+            hits: core::cell::Cell::new(0),
+            panic_on_hit,
+        }));
+    }
+
+    /// How many times a swept-but-retained handle has been resolved in
+    /// GC-verification mode (`0` when the mode is off). Non-zero means the
+    /// collector's root set is incomplete.
+    #[must_use]
+    pub fn gc_verify_hits(&self) -> usize {
+        self.poison.as_ref().map_or(0, |p| p.hits.get())
+    }
+
+    /// Whether GC-verification mode is on.
+    #[must_use]
+    pub const fn gc_verify(&self) -> bool {
+        self.poison.is_some()
+    }
+
+    /// Records (in verification mode) that `handle` was resolved after the
+    /// collector wanted it freed — an incomplete root set. Cold: only reached
+    /// when the mode is on.
+    #[cold]
+    fn note_poison_use(&self, handle: Handle) {
+        if let Some(p) = &self.poison
+            && p.freed.contains(&handle)
+        {
+            p.hits.set(p.hits.get() + 1);
+            assert!(
+                !p.panic_on_hit,
+                "kataan GC verify: use of collected handle {handle:?}"
+            );
         }
     }
 
@@ -185,6 +264,7 @@ impl<T> Heap<T> {
     /// returns a handle to it.
     pub fn alloc(&mut self, value: T) -> Handle {
         self.live += 1;
+        self.allocs_since_gc += 1;
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             // A freed slot already had its generation bumped; reuse it as-is.
@@ -216,6 +296,26 @@ impl<T> Heap<T> {
     /// (its slot was freed/reused) or out of range.
     #[must_use]
     pub fn get(&self, handle: Handle) -> Option<&T> {
+        if self.poison.is_some() {
+            self.note_poison_use(handle);
+        }
+        match self.slots.get(handle.index as usize)? {
+            Slot::Occupied {
+                generation, value, ..
+            } if *generation == handle.generation => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Like [`get`](Heap::get), but exempt from the GC-verification poison check.
+    ///
+    /// For code that *enumerates* the heap — [`live_handles`](Heap::live_handles)
+    /// and friends — rather than following a handle the program handed it. Such a
+    /// scan naturally visits objects the collector wanted to free (verification
+    /// mode keeps them), which is not a use-after-free and must not be reported as
+    /// one.
+    #[must_use]
+    pub fn peek(&self, handle: Handle) -> Option<&T> {
         match self.slots.get(handle.index as usize)? {
             Slot::Occupied {
                 generation, value, ..
@@ -227,6 +327,20 @@ impl<T> Heap<T> {
     /// Mutably borrows the value behind `handle`, with the same staleness check
     /// as [`get`](Heap::get).
     pub fn get_mut(&mut self, handle: Handle) -> Option<&mut T> {
+        if self.poison.is_some() {
+            self.note_poison_use(handle);
+        }
+        match self.slots.get_mut(handle.index as usize)? {
+            Slot::Occupied {
+                generation, value, ..
+            } if *generation == handle.generation => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The mutable counterpart of [`peek`](Heap::peek): exempt from the
+    /// GC-verification poison check, for code driven by a heap enumeration.
+    pub fn peek_mut(&mut self, handle: Handle) -> Option<&mut T> {
         match self.slots.get_mut(handle.index as usize)? {
             Slot::Occupied {
                 generation, value, ..
@@ -250,9 +364,22 @@ impl<T> Heap<T> {
         if i >= self.slots.len() || j >= self.slots.len() {
             return;
         }
+        // `split_at_mut` forces a low/high split, so re-associate the two borrows
+        // with `a` and `b` before comparing generations. Getting this backwards
+        // whenever `a.index > b.index` checked each handle's generation against the
+        // *other* slot — harmless for as long as every slot sat at generation 0
+        // (nothing was ever freed), but once the collector recycles slots the
+        // generations diverge, the check fails, and the swap silently no-ops:
+        // a `class X extends Map/TypedArray/...` instance would stay the bare
+        // placeholder object it was allocated as.
         let (lo, hi) = if i < j { (i, j) } else { (j, i) };
         let (left, right) = self.slots.split_at_mut(hi);
-        let (sa, sb) = (&mut left[lo], &mut right[0]);
+        let (slot_lo, slot_hi) = (&mut left[lo], &mut right[0]);
+        let (sa, sb) = if i < j {
+            (slot_lo, slot_hi)
+        } else {
+            (slot_hi, slot_lo)
+        };
         if let (
             Slot::Occupied {
                 generation: ga,
@@ -273,9 +400,17 @@ impl<T> Heap<T> {
     }
 
     /// Whether `handle` still refers to a live object.
+    ///
+    /// Deliberately bypasses the GC-verification poison check: the collector asks
+    /// this about handles it finds in weak side tables, and a *liveness query* on
+    /// a collected handle is correct behaviour, not a use-after-free. Only an
+    /// actual [`get`](Heap::get)/[`get_mut`](Heap::get_mut) counts as a use.
     #[must_use]
     pub fn is_live(&self, handle: Handle) -> bool {
-        self.get(handle).is_some()
+        matches!(
+            self.slots.get(handle.index as usize),
+            Some(Slot::Occupied { generation, .. }) if *generation == handle.generation
+        )
     }
 
     /// A handle to every currently-live slot (used by the collector to find the
@@ -424,19 +559,33 @@ impl<T> Heap<T> {
     /// generation is bumped so existing handles to it become stale. A stale or
     /// out-of-range handle frees nothing and returns `None`.
     pub fn free(&mut self, handle: Handle) -> Option<T> {
+        // GC-verification mode keeps the object alive and only records the
+        // intent, so a root-set gap shows up as a counted *use* of a collected
+        // handle instead of as silent corruption.
+        if let Some(p) = &mut self.poison {
+            p.freed.insert(handle);
+            return None;
+        }
         let slot = self.slots.get_mut(handle.index as usize)?;
         match slot {
             Slot::Occupied { generation, .. } if *generation == handle.generation => {
-                // Bump the generation and take the value out. Clamp the bump to
-                // stay strictly below the compaction-reserved range so free/reuse
+                // Bump the generation and take the value out. The bump must stay
+                // strictly below the compaction-reserved range, so free/reuse
                 // generations remain disjoint from those `compact_to` hands out
-                // (>= COMPACT_GEN_BASE). Wrapping to 0 is sound: 0 is the initial
-                // low-range generation used by fresh allocations.
-                let next_gen = if generation.wrapping_add(1) >= COMPACT_GEN_BASE {
-                    0
-                } else {
-                    *generation + 1
-                };
+                // (>= COMPACT_GEN_BASE).
+                //
+                // A slot whose generation would leave that range is **retired**
+                // instead of wrapping back to 0: it is dropped from the free list
+                // and never reallocated. Wrapping was sound while the slot's own
+                // handles were the only consumers, but the realm keeps several
+                // handle-*keyed* side tables (`aux_props`, `fn_source`, the array
+                // integrity flag sets, …) whose entries are only pruned
+                // opportunistically; a wrapped generation could make a brand-new
+                // object collide with a stale entry (inheriting, say, another
+                // array's "frozen" flag). Retiring costs one dead slot per 32767
+                // reuses of that slot and removes the hazard outright.
+                let next_gen = generation.wrapping_add(1);
+                let retire = next_gen >= COMPACT_GEN_BASE;
                 let Slot::Occupied { value, .. } = core::mem::replace(
                     slot,
                     Slot::Free {
@@ -445,7 +594,9 @@ impl<T> Heap<T> {
                 ) else {
                     unreachable!()
                 };
-                self.free.push(handle.index);
+                if !retire {
+                    self.free.push(handle.index);
+                }
                 self.live -= 1;
                 Some(value)
             }
@@ -511,6 +662,53 @@ mod tests {
         assert_eq!(h.get(a), Some(&1));
         assert_eq!(h.get(c), Some(&3));
         assert_eq!(h.get(d), Some(&4));
+    }
+
+    #[test]
+    fn swap_works_in_both_index_orders_with_differing_generations() {
+        // Regression: `swap` compared each handle's generation against the *other*
+        // slot whenever `a.index > b.index`. That was invisible while nothing was
+        // ever freed (every slot sat at generation 0) but silently no-ops once the
+        // collector recycles slots and generations diverge.
+        for reversed in [false, true] {
+            let mut h: Heap<i32> = Heap::new();
+            // Give slot 0 a generation of 2 and slot 1 a generation of 1, so the
+            // crossed comparison cannot accidentally succeed.
+            let s0 = h.alloc(0);
+            h.free(s0);
+            let s0 = h.alloc(0);
+            h.free(s0);
+            let low = h.alloc(10);
+            let scratch = h.alloc(0);
+            h.free(scratch);
+            let high = h.alloc(20);
+            assert_ne!(low.generation, high.generation, "generations must differ");
+            assert!(low.index < high.index || high.index < low.index);
+
+            let (a, b) = if reversed { (high, low) } else { (low, high) };
+            h.swap(a, b);
+            assert_eq!(h.get(a), Some(&if reversed { 10 } else { 20 }));
+            assert_eq!(h.get(b), Some(&if reversed { 20 } else { 10 }));
+        }
+    }
+
+    #[test]
+    fn a_slot_is_retired_rather_than_wrapping_its_generation() {
+        // Handle identity must be globally unique for the lifetime of the heap:
+        // the realm keeps handle-keyed side tables that are only pruned
+        // opportunistically, so a wrapped generation could let a brand-new object
+        // inherit a dead one's entry. The slot is dropped instead.
+        let mut h: Heap<i32> = Heap::new();
+        let mut last = h.alloc(1);
+        // Cycle one slot until it retires; every handle handed out must be distinct.
+        let mut seen = BTreeSet::new();
+        for _ in 0..(COMPACT_GEN_BASE as usize + 4) {
+            assert!(seen.insert(last), "a handle was handed out twice: {last:?}");
+            h.free(last);
+            last = h.alloc(1);
+        }
+        // Retirement means the table grew past the single recycled slot.
+        assert!(h.slots.len() > 1, "the exhausted slot should have retired");
     }
 
     #[test]

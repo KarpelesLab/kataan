@@ -481,6 +481,24 @@ struct Ctx<'a> {
     jit_shadow: alloc::vec::Vec<u64>,
     /// Function-call nesting depth (recursion guard).
     call_depth: usize,
+    /// Whether this context may run an allocation-triggered collection at a
+    /// [`vm_safepoint`]. Only the `run_program*` entry points set it: they own the
+    /// whole `Ctx` and their `funcs` table is compiled *before* the realm exists,
+    /// so no bytecode constant can be a heap handle the collector would have to
+    /// know about. The bare [`run`] entry (hand-built op arrays, used by tests and
+    /// the snapshot path) leaves it `false`.
+    gc_enabled: bool,
+    /// Non-zero while a Rust frame between the VM loop and here holds live
+    /// [`NanBox`]es that are *not* in a register window (today: the microtask
+    /// drain, which pops a job into a local before invoking its handler).
+    /// [`vm_safepoint`] refuses to collect while it is set.
+    gc_lock: usize,
+    /// The activation inputs of the **outermost** frame — its `args`, `captures`
+    /// and `this` — which live in [`call_with_inner`]'s Rust locals rather than in
+    /// the register window. Republished here on every (re)binding of that frame so
+    /// [`vm_safepoint`] can root them. Only maintained at `call_depth == 1`, the
+    /// only depth that can collect.
+    top_frame_roots: Vec<NanBox>,
 }
 
 // The recursion-guard, handler-stack, JSON-depth, and string-length caps now
@@ -519,6 +537,9 @@ pub fn run_program(
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_shadow: alloc::vec::Vec::new(),
         call_depth: 0,
+        gc_enabled: true,
+        gc_lock: 0,
+        top_frame_roots: Vec::new(),
     };
     let value = call(&mut ctx, funcs, id, args)?;
     drain_microtasks(&mut ctx, funcs)?;
@@ -551,6 +572,9 @@ pub fn run_program_capturing(
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_shadow: alloc::vec::Vec::new(),
         call_depth: 0,
+        gc_enabled: true,
+        gc_lock: 0,
+        top_frame_roots: Vec::new(),
     };
     let value = call(&mut ctx, funcs, id, args)?;
     // Run the promise event loop before returning (then-callbacks, async tails).
@@ -651,6 +675,15 @@ fn call_with_inner(
         if let Some(slot) = regs.get_mut(proto.n_params + proto.n_captures) {
             *slot = this_val;
         }
+        // Republish the outermost activation's inputs for the GC safepoint: they
+        // live in this function's Rust locals, which the collector cannot see.
+        // Only depth 1 can collect, so deeper frames skip the copy entirely.
+        if ctx.gc_enabled && ctx.call_depth == 1 {
+            ctx.top_frame_roots.clear();
+            ctx.top_frame_roots.extend_from_slice(&args);
+            ctx.top_frame_roots.extend_from_slice(&captures);
+            ctx.top_frame_roots.push(this_val);
+        }
         // Tier-up: count this activation, optimize the body once the function gets
         // hot, and run the optimized bytecode thereafter.
         let optimized: Option<alloc::rc::Rc<Vec<Op>>> = {
@@ -699,6 +732,9 @@ fn call_with_inner(
         // a body that awaits falls back at compile time.)
         if proto.is_async {
             let p = ctx.realm.new_promise();
+            // The returned promise is a Rust local across the body; a safepoint
+            // inside would otherwise not see it.
+            ctx.top_frame_roots.push(NanBox::handle(p.to_raw()));
             match run_frame(ctx, funcs, body, &mut regs) {
                 Ok(FrameExit::Return(ret)) => {
                     settle(ctx, p, ret.unwrap_or(NanBox::undefined()), true);
@@ -866,6 +902,11 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_shadow: alloc::vec::Vec::new(),
         call_depth: 0,
+        // Hand-built op arrays may embed heap handles as `LoadConst` values that
+        // this entry point cannot enumerate, so it never collects.
+        gc_enabled: false,
+        gc_lock: 0,
+        top_frame_roots: Vec::new(),
     };
     match run_frame(&mut ctx, &[], program, &mut regs)? {
         FrameExit::Return(v) => Ok(v.unwrap_or(NanBox::undefined())),
@@ -2265,6 +2306,17 @@ fn promise_then(ctx: &mut Ctx, p: Handle, on_f: NanBox, on_r: NanBox) -> Handle 
 
 /// Runs the promise microtask queue to completion (the event loop).
 fn drain_microtasks(ctx: &mut Ctx, funcs: &[FnProto]) -> Result<(), VmError> {
+    // The popped job's handler/value/result live in a Rust local for the duration
+    // of the handler call, and the handler runs at `call_depth == 1` (the depth
+    // that may collect) — so lock the GC out for the whole drain rather than
+    // trying to publish a moving target.
+    ctx.gc_lock += 1;
+    let r = drain_microtasks_inner(ctx, funcs);
+    ctx.gc_lock -= 1;
+    r
+}
+
+fn drain_microtasks_inner(ctx: &mut Ctx, funcs: &[FnProto]) -> Result<(), VmError> {
     while let Some(task) = ctx.microtasks.pop_front() {
         if task.handler.as_handle().is_some() {
             // A handler runs and its result settles the dependent promise.
@@ -2404,6 +2456,70 @@ fn fold2(dst: Reg, a: Option<f64>, b: Option<f64>, f: impl Fn(f64, f64) -> NanBo
         }),
         _ => None,
     }
+}
+
+/// The bytecode tier's **GC safepoint**, taken on a loop back-edge.
+///
+/// Collection is only sound where the whole root set is enumerable, and in this
+/// engine that is true at exactly one place: the top of the *outermost*
+/// activation's dispatch loop. Everywhere else a live [`NanBox`] may sit in a
+/// Rust local — a caller's register window (`regs` is a Rust-stack `Vec`), a
+/// native builtin's argument vector, a half-built array — none of which the
+/// collector can see. Hence the three guards:
+///
+/// * `gc_enabled` — this `Ctx` came from a `run_program*` entry, whose bytecode
+///   was compiled before the realm existed (so no `LoadConst` can be a handle
+///   from a table we don't scan; we scan them anyway, belt and braces).
+/// * `call_depth == 1` — no other activation, native, or JIT frame is below us,
+///   so no other register window or Rust-local value exists.
+/// * `gc_lock == 0` — no VM-owned Rust frame (the microtask drain) is holding
+///   values outside a register window.
+///
+/// Roots handed over: this frame's registers, the outermost activation's
+/// `args`/`captures`/`this` ([`Ctx::top_frame_roots`]), the pending microtask
+/// queue, and every handle-valued bytecode constant. The realm adds its own
+/// intrinsics in [`Realm::maybe_collect`].
+fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox]) {
+    if !ctx.gc_enabled || ctx.call_depth != 1 || ctx.gc_lock != 0 {
+        return;
+    }
+    // Cheap pre-check: skip building the root vector unless a cycle is due.
+    if ctx.realm.gc_pressure() < ctx.realm.gc_next_threshold() {
+        return;
+    }
+    let mut roots: Vec<Handle> = Vec::new();
+    fn push(roots: &mut Vec<Handle>, v: NanBox) {
+        if let Some(raw) = v.as_handle() {
+            roots.push(Handle::from_raw(raw));
+        }
+    }
+    for r in regs.iter().chain(ctx.top_frame_roots.iter()) {
+        push(&mut roots, *r);
+    }
+    for t in &ctx.microtasks {
+        push(&mut roots, t.handler);
+        push(&mut roots, t.value);
+        roots.push(t.result);
+    }
+    // Bytecode constants: `compile_program` runs before the realm exists so these
+    // are all immediates today, but rooting them costs one pass over the program
+    // per cycle and makes the safepoint independent of that invariant.
+    for op in program
+        .iter()
+        .chain(funcs.iter().flat_map(|f| f.ops.iter()))
+    {
+        if let Op::LoadConst { value, .. } = op {
+            push(&mut roots, *value);
+        }
+    }
+    for (_, body) in ctx.tiers.values() {
+        for op in body.iter().flat_map(|b| b.iter()) {
+            if let Op::LoadConst { value, .. } = op {
+                push(&mut roots, *value);
+            }
+        }
+    }
+    ctx.realm.maybe_collect(&roots);
 }
 
 /// Executes one function body (`program`) against the register file `regs`.
@@ -2641,7 +2757,15 @@ fn run_frame(
                     pc = *target;
                 }
             }
-            Op::Jump { target } => pc = *target,
+            Op::Jump { target } => {
+                // A backward jump is a loop back-edge — the one point in the
+                // dispatch loop where no partially-evaluated opcode state exists,
+                // so it is where an allocation-triggered collection can run.
+                if *target <= pc {
+                    vm_safepoint(ctx, funcs, program, regs);
+                }
+                pc = *target;
+            }
             Op::NewString { dst, value } => {
                 let handle = ctx.realm.new_string(value);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
@@ -11804,6 +11928,9 @@ mod generic_jit_tests {
             jit_funcs: None,
             jit_shadow: alloc::vec::Vec::new(),
             call_depth: 0,
+            gc_enabled: false,
+            gc_lock: 0,
+            top_frame_roots: Vec::new(),
         }
     }
 

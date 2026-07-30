@@ -275,7 +275,42 @@ pub struct Realm {
     /// Tunable resource limits for work driven in this realm. Defaults to
     /// [`crate::limits::Limits::default`]; override with [`Realm::with_limits`].
     pub limits: crate::limits::Limits,
+    /// Allocation-pressure trigger: the number of objects that may be allocated
+    /// after the last collection before [`maybe_collect`](Realm::maybe_collect)
+    /// runs another one. Re-armed after every cycle to
+    /// `max(GC_MIN_THRESHOLD, live * GC_GROWTH)`, so a program with a genuinely
+    /// large live set collects proportionally rarely instead of thrashing.
+    gc_threshold: usize,
+    /// A fixed threshold pinned by `KATAAN_GC_THRESHOLD`, which switches off the
+    /// growth heuristic. Set it low to make **every** safepoint collect — that is
+    /// how the root set is stress-tested against the whole Test262 corpus (paired
+    /// with `KATAAN_GC_VERIFY`), where the production threshold would leave most
+    /// short tests never collecting at all.
+    gc_threshold_pinned: Option<usize>,
 }
+
+/// The remaining handle-keyed side tables [`Realm::ephemeron_prune`] must sweep,
+/// grouped into one struct so that function keeps a sane arity. None of these
+/// root anything (their values are plain data, or handles that are already
+/// strong roots via [`Realm::gc_roots`]); pruning them is what stops a
+/// long-running program from accumulating one dead entry per collected object.
+struct PruneTables<'t> {
+    fn_source: &'t mut alloc::collections::BTreeMap<u64, alloc::rc::Rc<str>>,
+    length_tracking_views: &'t mut alloc::collections::BTreeSet<u64>,
+    nonwritable_array_lengths: &'t mut alloc::collections::BTreeSet<u64>,
+    sparse_array_lengths: &'t mut alloc::collections::BTreeMap<u64, usize>,
+    native_protos: &'t mut alloc::collections::BTreeMap<u64, Handle>,
+    callable_null_protos: &'t mut alloc::collections::BTreeSet<u64>,
+    native_class_tags: &'t mut alloc::collections::BTreeMap<u64, u32>,
+}
+
+/// The floor for the allocation-pressure trigger: never collect more often than
+/// once per this many allocations, however small the live set is.
+const GC_MIN_THRESHOLD: usize = 65_536;
+
+/// The heap-growth factor: after a cycle, allow the live set to grow by this
+/// multiple before collecting again.
+const GC_GROWTH: usize = 2;
 
 /// The mutable state behind the Annex B.2.5 RegExp legacy static accessors
 /// (`RegExp.input`/`$_`, `RegExp.lastMatch`/`$&`, `RegExp.lastParen`/`$+`,
@@ -421,8 +456,26 @@ impl Realm {
     /// Creates an empty realm with the given resource [`Limits`](crate::limits::Limits).
     #[must_use]
     pub fn with_limits(limits: crate::limits::Limits) -> Self {
+        let mut heap = Heap::new();
+        // `KATAAN_GC_VERIFY=1` keeps swept objects alive and counts any later use
+        // of one, turning an incomplete root set into an observable (and safe)
+        // diagnostic; `=panic` aborts on the first such use.
+        #[cfg(feature = "std")]
+        if let Ok(v) = std::env::var("KATAAN_GC_VERIFY")
+            && v != "0"
+        {
+            heap.enable_gc_verify(v == "panic");
+        }
+        // `KATAAN_GC_THRESHOLD=<n>` pins the allocation-pressure trigger at `n`
+        // objects and disables the growth heuristic (see `gc_threshold_pinned`).
+        #[cfg(feature = "std")]
+        let pinned: Option<usize> = std::env::var("KATAAN_GC_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        #[cfg(not(feature = "std"))]
+        let pinned: Option<usize> = None;
         Self {
-            heap: Heap::new(),
+            heap,
             root_shape: Shape::root(),
             atoms: AtomTable::new(),
             incremental: None,
@@ -459,6 +512,8 @@ impl Realm {
             host_native_state: alloc::collections::BTreeMap::new(),
             legacy_regexp: LegacyRegExpState::default(),
             limits,
+            gc_threshold: pinned.unwrap_or(GC_MIN_THRESHOLD),
+            gc_threshold_pinned: pinned,
         }
     }
 
@@ -607,8 +662,10 @@ impl Realm {
             .live_handles()
             .into_iter()
             .filter(|h| {
+                // A whole-heap scan, so `peek`: visiting a slot the collector
+                // wanted to free is enumeration, not a use-after-free.
                 matches!(
-                    self.heap.get(*h),
+                    self.heap.peek(*h),
                     Some(Cell::TypedArray { buffer, .. }) if *buffer == bytes_handle
                 )
             })
@@ -618,7 +675,9 @@ impl Realm {
     /// Sets the intrinsic `length` of the typed-array view at `handle` (used when a
     /// resizable buffer grows/shrinks, or on detach). No-op for a non-view.
     fn set_typed_length(&mut self, handle: Handle, new_len: usize) {
-        if let Some(Cell::TypedArray { length, .. }) = self.heap.get_mut(handle) {
+        // Always called with a handle produced by `views_over`'s heap enumeration,
+        // so `peek_mut` (no GC-verification use accounting).
+        if let Some(Cell::TypedArray { length, .. }) = self.heap.peek_mut(handle) {
             *length = new_len;
         }
     }
@@ -641,7 +700,9 @@ impl Realm {
     pub fn resize_buffer(&mut self, bytes_handle: Handle, new_byte_len: usize) {
         self.bytes_resize(bytes_handle, new_byte_len);
         for v in self.views_over(bytes_handle) {
-            let Some((_, off, _, kind)) = self.heap.get(v).and_then(Cell::as_typed_array) else {
+            // `peek`: `v` came out of a heap enumeration, not from a handle the
+            // program holds, so a swept-but-retained slot here is not a use.
+            let Some((_, off, _, kind)) = self.heap.peek(v).and_then(Cell::as_typed_array) else {
                 continue;
             };
             // Only an auto-length-tracking view re-spans the resized buffer. A
@@ -4068,6 +4129,114 @@ impl Realm {
         r
     }
 
+    /// Every handle the **realm itself** must keep alive independently of the
+    /// program's own roots: the intrinsic prototypes it stamps onto new cells,
+    /// the explicit `[[Prototype]]` overrides of non-object callables, the
+    /// lazily-materialized class and `Intl` prototypes, and the embedder's
+    /// pinned values.
+    ///
+    /// Deliberately over-approximate — these are all O(intrinsics)-sized and a
+    /// spurious root only costs retention, whereas a missing one frees a live
+    /// object. Callers append their own roots and pass the union to
+    /// [`collect`](Self::collect).
+    pub fn gc_roots(&self, out: &mut Vec<Handle>) {
+        out.extend(
+            [
+                self.default_object_proto,
+                self.typed_array_intrinsic,
+                self.function_proto_intrinsic,
+                self.throw_type_error_intrinsic,
+                self.array_proto_intrinsic,
+                self.promise_proto_intrinsic,
+                self.symbol_proto_intrinsic,
+                self.bigint_proto_intrinsic,
+            ]
+            .into_iter()
+            .flatten(),
+        );
+        // Explicit prototype links for cells with no inline object part, and the
+        // class prototypes: both are keyed by an identity the heap graph does not
+        // reach, so their values are strong roots.
+        out.extend(self.native_protos.values().copied());
+        out.extend(self.class_protos.values().copied());
+        out.extend(self.intl_protos.values().copied());
+        // Host-pinned values and the JIT's spilled temporaries.
+        out.extend(
+            self.host_persistent
+                .iter()
+                .flatten()
+                .chain(self.jit_shadow_roots.iter())
+                .filter_map(|nb| nb.as_handle().map(Handle::from_raw)),
+        );
+        // Deliberately **not** included: `aux_props`, `fn_protos`, `fn_ctor` and
+        // `symbols_by_id`. Those are weak-key (ephemeron) tables that
+        // [`collect`](Self::collect) expands and prunes itself; strong-rooting
+        // their values would pin one closure per function id (and every symbol
+        // ever minted) forever. The minor path, which cannot prune, still roots
+        // them via [`gc_side_table_values`](Self::gc_side_table_values).
+    }
+
+    /// Objects allocated since the last collection — the input to the
+    /// allocation-pressure trigger. A safepoint compares it against
+    /// [`gc_next_threshold`](Self::gc_next_threshold) before doing the (much more
+    /// expensive) work of building a root set.
+    #[must_use]
+    pub const fn gc_pressure(&self) -> usize {
+        self.heap.allocs_since_gc()
+    }
+
+    /// The allocation count at which the next [`maybe_collect`](Self::maybe_collect)
+    /// will actually collect.
+    #[must_use]
+    pub const fn gc_next_threshold(&self) -> usize {
+        self.gc_threshold
+    }
+
+    /// Runs a collection **iff** enough has been allocated since the last one
+    /// (see `gc_threshold`), and re-arms the trigger. `roots` must be the
+    /// complete root set for the calling safepoint — the realm's own
+    /// [`gc_roots`](Self::gc_roots) are added here, so callers supply only the
+    /// program-side roots.
+    ///
+    /// Returns the [`Stats`] when a cycle ran. The check itself is a load and a
+    /// compare, so putting it on a hot safepoint costs nothing when it does not
+    /// fire.
+    pub fn maybe_collect(&mut self, roots: &[Handle]) -> Option<Stats> {
+        if self.heap.allocs_since_gc() < self.gc_threshold {
+            return None;
+        }
+        self.maybe_collect_with(roots, &mut |_, _| {}, &mut |_| {})
+    }
+
+    /// [`maybe_collect`](Self::maybe_collect) with the external weak-key hooks of
+    /// [`collect_with`](Self::collect_with).
+    pub fn maybe_collect_with(
+        &mut self,
+        roots: &[Handle],
+        extern_expand: &mut dyn FnMut(&alloc::collections::BTreeSet<Handle>, &mut Vec<Handle>),
+        extern_prune: &mut dyn FnMut(&alloc::collections::BTreeSet<Handle>),
+    ) -> Option<Stats> {
+        if self.heap.allocs_since_gc() < self.gc_threshold {
+            return None;
+        }
+        let mut all: Vec<Handle> = roots.to_vec();
+        self.gc_roots(&mut all);
+        let stats = self.collect_with(&all, extern_expand, extern_prune);
+        self.heap.reset_alloc_pressure();
+        self.gc_threshold = self
+            .gc_threshold_pinned
+            .unwrap_or_else(|| GC_MIN_THRESHOLD.max(self.heap.len().saturating_mul(GC_GROWTH)));
+        Some(stats)
+    }
+
+    /// How many times a collected object has been used since the run began, when
+    /// `KATAAN_GC_VERIFY` is on (always `0` otherwise). Non-zero means the root
+    /// set handed to [`maybe_collect`](Self::maybe_collect) is incomplete.
+    #[must_use]
+    pub fn gc_verify_hits(&self) -> usize {
+        self.heap.gc_verify_hits()
+    }
+
     /// Pins `value` as a **persistent handle** and returns its slot index (see
     /// `host_persistent`). The value survives GC and stays
     /// valid across compaction until [`release_persistent`](Self::release_persistent).
@@ -4200,11 +4369,32 @@ impl Realm {
             u64,
             alloc::boxed::Box<dyn core::any::Any>,
         >,
+        tables: PruneTables<'_>,
     ) {
+        let PruneTables {
+            fn_source,
+            length_tracking_views,
+            nonwritable_array_lengths,
+            sparse_array_lengths,
+            native_protos,
+            callable_null_protos,
+            native_class_tags,
+        } = tables;
         let dead = |raw: u64| {
             let h = Handle::from_raw(raw);
             key_collectable(h) && !marked.contains(&h)
         };
+        for set in [
+            &mut *length_tracking_views,
+            &mut *nonwritable_array_lengths,
+            &mut *callable_null_protos,
+        ] {
+            set.retain(|raw| !dead(*raw));
+        }
+        fn_source.retain(|raw, _| !dead(*raw));
+        sparse_array_lengths.retain(|raw, _| !dead(*raw));
+        native_protos.retain(|raw, _| !dead(*raw));
+        native_class_tags.retain(|raw, _| !dead(*raw));
         aux_props.retain(|cell_raw, _| !dead(*cell_raw));
         frozen_arrays.retain(|raw| !dead(*raw));
         sealed_arrays.retain(|raw| !dead(*raw));
@@ -4241,6 +4431,25 @@ impl Realm {
     /// its dead key's handle — fixing the unbounded side-table leak). See
     /// [`gc::mark_with_ephemerons`] and [`gc::sweep_full`].
     pub fn collect(&mut self, roots: &[Handle]) -> Stats {
+        self.collect_with(roots, &mut |_, _| {}, &mut |_| {})
+    }
+
+    /// [`collect`](Self::collect) with two hooks for **weak-key tables the realm
+    /// does not own** — the interpreter's mapped-`arguments` map and its
+    /// realm-of-function map are keyed by an object handle and would otherwise
+    /// grow one dead entry per call.
+    ///
+    /// `extern_expand(marked, extra)` runs inside the ephemeron fixpoint: for each
+    /// entry whose *key* is in `marked` it must push that entry's value handles
+    /// into `extra` (never the key — a dead key must stay collectable).
+    /// `extern_prune(marked)` runs after the fixpoint and before the sweep, and
+    /// must drop every entry whose key is not in `marked`.
+    pub fn collect_with(
+        &mut self,
+        roots: &[Handle],
+        extern_expand: &mut dyn FnMut(&alloc::collections::BTreeSet<Handle>, &mut Vec<Handle>),
+        extern_prune: &mut dyn FnMut(&alloc::collections::BTreeSet<Handle>),
+    ) -> Stats {
         let Self {
             heap,
             aux_props,
@@ -4251,6 +4460,13 @@ impl Realm {
             sealed_arrays,
             non_extensible_arrays,
             host_native_state,
+            fn_source,
+            length_tracking_views,
+            nonwritable_array_lengths,
+            sparse_array_lengths,
+            native_protos,
+            callable_null_protos,
+            native_class_tags,
             ..
         } = self;
         // Phase 1 — mark from the real roots, expanding the weak-key side-tables
@@ -4266,7 +4482,9 @@ impl Realm {
                     symbols_by_id,
                     extra,
                 );
+                extern_expand(marked, extra);
             });
+        extern_prune(&marked);
         // Phase 2 — drop every entry whose key is unmarked (full collection: an
         // unmarked key is genuinely dead, so no generation guard is needed).
         Self::ephemeron_prune(
@@ -4280,6 +4498,15 @@ impl Realm {
             sealed_arrays,
             non_extensible_arrays,
             host_native_state,
+            PruneTables {
+                fn_source,
+                length_tracking_views,
+                nonwritable_array_lengths,
+                sparse_array_lengths,
+                native_protos,
+                callable_null_protos,
+                native_class_tags,
+            },
         );
         // Phase 3 — sweep the unmarked objects and promote the survivors.
         gc::sweep_full(heap, &marked)
@@ -4339,6 +4566,13 @@ impl Realm {
                 sealed_arrays,
                 non_extensible_arrays,
                 host_native_state,
+                fn_source,
+                length_tracking_views,
+                nonwritable_array_lengths,
+                sparse_array_lengths,
+                native_protos,
+                callable_null_protos,
+                native_class_tags,
                 ..
             } = self;
             let marked =
@@ -4364,6 +4598,15 @@ impl Realm {
                 sealed_arrays,
                 non_extensible_arrays,
                 host_native_state,
+                PruneTables {
+                    fn_source,
+                    length_tracking_views,
+                    nonwritable_array_lengths,
+                    sparse_array_lengths,
+                    native_protos,
+                    callable_null_protos,
+                    native_class_tags,
+                },
             );
         }
 

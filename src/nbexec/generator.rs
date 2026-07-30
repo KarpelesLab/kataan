@@ -1721,7 +1721,11 @@ impl<'a> Interp<'a> {
         // different coroutine reentrantly.
         let saved_gen_async = self.gen_is_async;
         self.gen_is_async = self.gen_frames[id].as_ref().is_some_and(|f| f.is_async);
+        // A coroutine body's statement boundaries are not GC-safe: the suspended
+        // activation lives in `gen_frames`, which the safepoint does not trace.
+        let saved_gc = core::mem::replace(&mut self.gc_ok, false);
         let result = self.gen_drive_inner(id, how, started);
+        self.gc_ok = saved_gc;
         self.gen_is_async = saved_gen_async;
         result
     }

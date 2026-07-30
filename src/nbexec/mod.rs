@@ -787,6 +787,18 @@ pub struct Interp<'a> {
     /// *breaks* the mapping for that index (drops the slot). Empty for strict
     /// functions and any non-simple parameter list (which are unmapped).
     arg_maps: alloc::collections::BTreeMap<u64, ArgMap>,
+    /// Whether a collection may run at the next statement boundary — the
+    /// tree-walker's GC fence (see the [`gc`] module). `false` by default and for
+    /// the dynamic extent of every function / `eval` / module / generator / class
+    /// body; `true` only while the top-level script statement chain runs, which is
+    /// the one place the live set is fully enumerable.
+    gc_ok: bool,
+    /// Live [`NanBox`]es published by the statement executors for the duration of
+    /// their sub-statement recursion — a loop's completion value, a `for-of`
+    /// iterator and current item, a `for-in` key list, a `try`'s pending
+    /// completion. These sit in Rust locals the collector cannot otherwise see;
+    /// see [`Interp::gc_root`].
+    gc_shadow: Vec<NanBox>,
 }
 
 /// The `[[ParameterMap]]` of one mapped `arguments` object: the shared parameter
@@ -3044,6 +3056,9 @@ mod call;
 mod class;
 mod convert;
 mod expr;
+mod gc;
+#[cfg(test)]
+mod gc_tests;
 mod generator;
 mod intl_aliases;
 mod intl_fmt;
@@ -3213,6 +3228,8 @@ impl<'a> Interp<'a> {
             host_fns: Vec::new(),
             agent: AgentState::default(),
             arg_maps: alloc::collections::BTreeMap::new(),
+            gc_ok: false,
+            gc_shadow: Vec::new(),
         };
         // The constructor's `current` IS the root scope; capture it as the global
         // scope before `install_globals` populates it, so indirect eval can run
@@ -5885,26 +5902,48 @@ impl<'a> Interp<'a> {
             self.global_declaration_checks(program)?;
         }
         self.hoist_with(&program.body, true)?;
+        // This statement chain is the *only* GC-safe region in the tree-walker:
+        // nothing is on the Rust stack below it but the driver. Open the fence
+        // here; every nested body (function, `eval`, class, module, generator)
+        // closes it again for its own extent.
+        let saved_gc = core::mem::replace(&mut self.gc_ok, true);
+        let r = self.run_toplevel_body(&program.body);
+        self.gc_ok = saved_gc;
+        let last = r?;
+        // Run the event loop (microtasks + `setTimeout`) before returning.
+        self.run_event_loop()?;
+        Ok(last)
+    }
+
+    /// The top-level statement loop of [`run`](Self::run), split out so the GC
+    /// fence is restored on every exit path. The running completion value is a
+    /// live Rust local across each statement, so it is published as a GC root.
+    fn run_toplevel_body(&mut self, body: &'a [Stmt]) -> Result<NanBox, ExecError> {
         let mut last = NanBox::undefined();
-        for stmt in &program.body {
-            match self.exec(stmt)? {
+        let mark = self.gc_root(&[last]);
+        for stmt in body {
+            match self.exec(stmt) {
                 // UpdateEmpty: an empty completion (declaration / empty statement)
                 // never replaces a preceding non-empty value; the script's value
                 // is the last non-empty statement value (undefined if none).
-                Flow::Normal(v) => {
+                Ok(Flow::Normal(v)) => {
                     if !v.is_empty_completion() {
                         last = v;
+                        self.gc_reroot(mark, &[last]);
                     }
                 }
-                Flow::Return(v) => {
-                    self.run_event_loop()?;
+                Ok(Flow::Return(v)) => {
+                    self.gc_unroot(mark);
                     return Ok(v);
                 }
-                Flow::Break(..) | Flow::Continue(..) => {}
+                Ok(Flow::Break(..) | Flow::Continue(..)) => {}
+                Err(e) => {
+                    self.gc_unroot(mark);
+                    return Err(e);
+                }
             }
         }
-        // Run the event loop (microtasks + `setTimeout`) before returning.
-        self.run_event_loop()?;
+        self.gc_unroot(mark);
         Ok(last)
     }
 
@@ -5984,6 +6023,9 @@ impl<'a> Interp<'a> {
         // (leaked) source; retain it for `Function.prototype.toString` while its
         // statements run, then restore the enclosing source so a subsequent
         // definition in the surrounding code slices the right text.
+        // An `eval` body is reached from a native call frame holding live Rust
+        // locals, so its statement boundaries are not GC-safe.
+        let saved_gc = core::mem::replace(&mut self.gc_ok, false);
         let saved_src = core::mem::replace(&mut self.src, &program.source);
         // Mint a fresh eval-site epoch for this invocation so its tagged-template
         // sites are distinct from any other eval of the same (deduplicated) source:
@@ -5995,6 +6037,7 @@ impl<'a> Interp<'a> {
         let result = self.run_eval_body_inner(program);
         self.eval_site_epoch = saved_epoch;
         self.src = saved_src;
+        self.gc_ok = saved_gc;
         result
     }
 

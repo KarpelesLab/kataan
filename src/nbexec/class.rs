@@ -190,6 +190,20 @@ impl<'a> Interp<'a> {
         class: &'a Class,
         precomputed_keys: Option<&alloc::collections::BTreeMap<usize, String>>,
     ) -> Result<NanBox, ExecError> {
+        // ClassDefinitionEvaluation runs user code (computed keys, static blocks,
+        // static field initializers) while this function holds the half-built
+        // class in Rust locals, so nothing inside it is a GC-safe point.
+        let saved_gc = core::mem::replace(&mut self.gc_ok, false);
+        let r = self.make_class_with_keys_inner(class, precomputed_keys);
+        self.gc_ok = saved_gc;
+        r
+    }
+
+    fn make_class_with_keys_inner(
+        &mut self,
+        class: &'a Class,
+        precomputed_keys: Option<&alloc::collections::BTreeMap<usize, String>>,
+    ) -> Result<NanBox, ExecError> {
         let class_id = self.classes.len() as u32;
         // The home class of the code evaluating this definition is this class's
         // *lexical parent* — captured now, before the static-member loop below may
@@ -1420,6 +1434,22 @@ impl<'a> Interp<'a> {
     }
 
     pub(crate) fn run_constructor(
+        &mut self,
+        class_id: u32,
+        env: &Scope,
+        instance: Handle,
+        args: &[NanBox],
+    ) -> Result<Option<NanBox>, ExecError> {
+        // A constructor body executes statements directly (not through
+        // `run_body`), and its caller holds the half-initialized instance and the
+        // argument vector in Rust locals — so close the GC fence for its extent.
+        let saved_gc = core::mem::replace(&mut self.gc_ok, false);
+        let r = self.run_constructor_inner(class_id, env, instance, args);
+        self.gc_ok = saved_gc;
+        r
+    }
+
+    fn run_constructor_inner(
         &mut self,
         class_id: u32,
         env: &Scope,

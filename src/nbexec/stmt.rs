@@ -26,8 +26,32 @@ enum AssignKey<'a> {
     Deferred(NanBox),
 }
 
+/// The value a completion carries, for GC rooting: a thrown value, or the value
+/// of a normal/return/break/continue completion. `undefined` for the non-value
+/// errors (a tail-call request carries its own operands, which are rooted by the
+/// frame that consumes them).
+fn flow_value(outcome: &Result<Flow, ExecError>) -> NanBox {
+    match outcome {
+        Ok(Flow::Normal(v) | Flow::Return(v) | Flow::Break(_, v) | Flow::Continue(_, v)) => *v,
+        Err(ExecError::Throw(v)) => *v,
+        Err(_) => NanBox::undefined(),
+    }
+}
+
 impl<'a> Interp<'a> {
     pub(crate) fn run_body(&mut self, body: Body<'a>) -> Result<NanBox, ExecError> {
+        // A function / `eval` / module / generator body is reached through a Rust
+        // frame that holds live values the collector cannot see (the caller's
+        // argument vector, a native's temporaries, the callee lookup). Close the
+        // GC fence for its whole extent — statement boundaries inside a body never
+        // collect. See the `gc` module.
+        let saved_gc = core::mem::replace(&mut self.gc_ok, false);
+        let r = self.run_body_inner(body);
+        self.gc_ok = saved_gc;
+        r
+    }
+
+    fn run_body_inner(&mut self, body: Body<'a>) -> Result<NanBox, ExecError> {
         match body {
             Body::Expr(e) => self.eval(e),
             Body::Block(stmts) => {
@@ -78,6 +102,10 @@ impl<'a> Interp<'a> {
             let err = self.make_error(N_ERROR_BASE + 2, Some(msg));
             return Err(ExecError::Throw(err));
         }
+        // GC safepoint. Only fires in the top-level statement chain, where every
+        // enclosing Rust frame is a statement executor that has published its live
+        // locals (see the `gc` module). Two loads and a compare otherwise.
+        self.gc_safepoint();
         self.eval_depth += 1;
         let r = self.exec_inner(stmt);
         self.eval_depth -= 1;
@@ -147,36 +175,48 @@ impl<'a> Interp<'a> {
                 // Per spec the loop value is the last non-empty body completion,
                 // `undefined` if none — never empty.
                 let mut v = NanBox::undefined();
-                while self.eval_truthy(test)? {
-                    // Scheduling point: a spin loop over shared memory (the
-                    // `$262.agent` tests' `waitUntil` / `while (Atomics.load(…))`)
-                    // must hand the baton to the other agents. No-op without one.
-                    self.agent_tick()?;
-                    let f = self.exec(body)?;
-                    match loop_step(f, &label, &mut v) {
-                        LoopAction::Next => {}
-                        LoopAction::Stop => break,
-                        LoopAction::Propagate(f) => return Ok(f),
+                // The accumulated completion value is a live Rust local across the
+                // body; publish it for the GC safepoint inside the body.
+                let mark = self.gc_root(&[v]);
+                let r = (|s: &mut Self| -> Result<Flow, ExecError> {
+                    while s.eval_truthy(test)? {
+                        // Scheduling point: a spin loop over shared memory (the
+                        // `$262.agent` tests' `waitUntil` / `while (Atomics.load(…))`)
+                        // must hand the baton to the other agents. No-op without one.
+                        s.agent_tick()?;
+                        let f = s.exec(body)?;
+                        match loop_step(f, &label, &mut v) {
+                            LoopAction::Next => s.gc_reroot(mark, &[v]),
+                            LoopAction::Stop => break,
+                            LoopAction::Propagate(f) => return Ok(f),
+                        }
                     }
-                }
-                Ok(Flow::Normal(v))
+                    Ok(Flow::Normal(v))
+                })(self);
+                self.gc_unroot(mark);
+                r
             }
             Stmt::DoWhile { body, test, .. } => {
                 let label = self.pending_label.take();
                 let mut v = NanBox::undefined();
-                loop {
-                    self.agent_tick()?;
-                    let f = self.exec(body)?;
-                    match loop_step(f, &label, &mut v) {
-                        LoopAction::Next => {}
-                        LoopAction::Stop => break,
-                        LoopAction::Propagate(f) => return Ok(f),
+                let mark = self.gc_root(&[v]);
+                let r = (|s: &mut Self| -> Result<Flow, ExecError> {
+                    loop {
+                        s.agent_tick()?;
+                        let f = s.exec(body)?;
+                        match loop_step(f, &label, &mut v) {
+                            LoopAction::Next => s.gc_reroot(mark, &[v]),
+                            LoopAction::Stop => break,
+                            LoopAction::Propagate(f) => return Ok(f),
+                        }
+                        if !s.eval_truthy(test)? {
+                            break;
+                        }
                     }
-                    if !self.eval_truthy(test)? {
-                        break;
-                    }
-                }
-                Ok(Flow::Normal(v))
+                    Ok(Flow::Normal(v))
+                })(self);
+                self.gc_unroot(mark);
+                r
             }
             Stmt::Labeled { label, body, .. } => {
                 // The label is handed to a *directly* labeled loop (via `pending_label`)
@@ -357,6 +397,10 @@ impl<'a> Interp<'a> {
         let saved_tail_pos = self.tail_pos;
         self.tail_pos = false;
         let mut outcome = self.exec_scoped(block);
+        // The pending completion (a thrown value, or a `return`/`break` value) is a
+        // live Rust local while the catch binding and the `finally` block run —
+        // both of which reach statement safepoints. Publish it.
+        let gc_mark = self.gc_root(&[flow_value(&outcome)]);
         // A thrown value is routed to the catch clause, if any.
         if let (Err(ExecError::Throw(value)), Some(catch)) = (&outcome, handler) {
             let thrown = *value;
@@ -376,6 +420,7 @@ impl<'a> Interp<'a> {
             // initializer (`catch ([_ = () => x]) { let x; }`).
             outcome = bound.and_then(|()| self.exec_scoped(&catch.body));
             self.current = saved;
+            self.gc_reroot(gc_mark, &[flow_value(&outcome)]);
         }
         // `finally` runs regardless; an abrupt finally overrides the outcome.
         let outcome = if let Some(fin) = finalizer {
@@ -388,6 +433,7 @@ impl<'a> Interp<'a> {
             outcome
         };
         self.tail_pos = saved_tail_pos;
+        self.gc_unroot(gc_mark);
         // Spec: a `try` completion is `UpdateEmpty(result, undefined)` — it never
         // surfaces the empty-completion sentinel.
         outcome.map(empty_to_undefined)
@@ -612,22 +658,30 @@ impl<'a> Interp<'a> {
     pub(crate) fn exec_seq(&mut self, body: &'a [Stmt]) -> Result<Flow, ExecError> {
         self.hoist(body)?;
         let mut last = NanBox::empty_completion();
-        for stmt in body {
-            match self.exec(stmt)? {
-                Flow::Normal(v) => {
-                    if !v.is_empty_completion() {
-                        last = v;
+        // The accumulated (UpdateEmpty) completion value stays live across every
+        // remaining statement — a Rust local the collector cannot otherwise see.
+        let mark = self.gc_root(&[last]);
+        let r = (|s: &mut Self| -> Result<Flow, ExecError> {
+            for stmt in body {
+                match s.exec(stmt)? {
+                    Flow::Normal(v) => {
+                        if !v.is_empty_completion() {
+                            last = v;
+                            s.gc_reroot(mark, &[last]);
+                        }
                     }
+                    // An abrupt `break`/`continue` carries the StatementList's
+                    // accumulated value when its own is empty (UpdateEmpty), so a
+                    // breakable/iteration statement can surface it.
+                    Flow::Break(l, v) => return Ok(Flow::Break(l, update_empty(v, last))),
+                    Flow::Continue(l, v) => return Ok(Flow::Continue(l, update_empty(v, last))),
+                    ret @ Flow::Return(_) => return Ok(ret),
                 }
-                // An abrupt `break`/`continue` carries the StatementList's
-                // accumulated value when its own is empty (UpdateEmpty), so a
-                // breakable/iteration statement can surface it.
-                Flow::Break(l, v) => return Ok(Flow::Break(l, update_empty(v, last))),
-                Flow::Continue(l, v) => return Ok(Flow::Continue(l, update_empty(v, last))),
-                ret @ Flow::Return(_) => return Ok(ret),
             }
-        }
-        Ok(Flow::Normal(last))
+            Ok(Flow::Normal(last))
+        })(self);
+        self.gc_unroot(mark);
+        r
     }
 
     pub(crate) fn exec_var(&mut self, decl: &'a VarDecl) -> Result<(), ExecError> {
@@ -978,7 +1032,10 @@ impl<'a> Interp<'a> {
         // `next` accessor (spec: it is accessed only during the iteration prologue).
         let next_fn = self.read_member(ih, "next")?;
         let mut v = NanBox::undefined();
-        loop {
+        // The iterator, its cached `next`, the current item and the accumulated
+        // completion value are all live Rust locals across the body.
+        let gc_mark = self.gc_root(&[iterator, next_fn, v, NanBox::undefined()]);
+        let r = (|| loop {
             let res = self.call_with_this(next_fn, iterator, &[])?;
             // `IteratorNext`: a non-Object result is a TypeError. A string / symbol /
             // BigInt is heap-backed but *not* an Object, so guard with `is_object_value`
@@ -992,6 +1049,7 @@ impl<'a> Interp<'a> {
                 return Ok(Flow::Normal(v));
             }
             let item = self.read_member(rh, "value")?;
+            self.gc_reroot(gc_mark, &[iterator, next_fn, v, item]);
             let child = self.current.child();
             let saved = core::mem::replace(&mut self.current, child);
             let r = (|| {
@@ -1023,7 +1081,7 @@ impl<'a> Interp<'a> {
             self.current = saved;
             match r {
                 Ok(flow) => match loop_step(flow, &label, &mut v) {
-                    LoopAction::Next => {}
+                    LoopAction::Next => self.gc_reroot(gc_mark, &[iterator, next_fn, v, item]),
                     LoopAction::Stop => {
                         self.iterator_close(ih)?;
                         return Ok(Flow::Normal(v));
@@ -1040,7 +1098,9 @@ impl<'a> Interp<'a> {
                     return Err(e);
                 }
             }
-        }
+        })();
+        self.gc_unroot(gc_mark);
+        r
     }
 
     pub(crate) fn exec_for_each(
@@ -1066,50 +1126,73 @@ impl<'a> Interp<'a> {
         use crate::ast::ForLeft;
         let label = self.pending_label.take();
         let mut v = NanBox::undefined();
-        for item in items {
-            // `for-in`: skip a key whose property has been deleted since the key
-            // set was captured (and not yet re-added). A same-named property still
-            // reachable on the prototype chain keeps the key live.
-            if let Some(eo) = enum_obj
-                && let Some(raw) = eo.as_handle()
-            {
-                let key = self.member_key(item);
-                if !self.has_property(Handle::from_raw(raw), &key) {
-                    continue;
+        // The materialized item list, the enumerated object and the accumulated
+        // completion value stay live across every body execution, in Rust locals
+        // (the `Vec`'s buffer is on the Rust heap, invisible to the collector).
+        // Built only when a collection could actually happen: inside a function
+        // body the fence is closed, so the copy is skipped entirely.
+        let mut gc_vals: Vec<NanBox> = Vec::new();
+        if self.gc_can_collect() {
+            gc_vals.reserve(items.len() + 2);
+            gc_vals.extend_from_slice(&items);
+            gc_vals.extend(enum_obj);
+            gc_vals.push(v);
+        }
+        let gc_mark = self.gc_root(&gc_vals);
+        let r = (|| {
+            for item in items {
+                // `for-in`: skip a key whose property has been deleted since the key
+                // set was captured (and not yet re-added). A same-named property still
+                // reachable on the prototype chain keeps the key live.
+                if let Some(eo) = enum_obj
+                    && let Some(raw) = eo.as_handle()
+                {
+                    let key = self.member_key(item);
+                    if !self.has_property(Handle::from_raw(raw), &key) {
+                        continue;
+                    }
                 }
-            }
-            let child = self.current.child();
-            let saved = core::mem::replace(&mut self.current, child);
-            let r = (|| {
-                match left {
-                    ForLeft::Decl { kind, target, .. } => {
-                        self.bind_for_decl(kind, target, item)?;
-                        if matches!(
-                            kind,
-                            crate::ast::VarDeclKind::Using | crate::ast::VarDeclKind::AwaitUsing
-                        ) {
-                            let is_await = matches!(kind, crate::ast::VarDeclKind::AwaitUsing);
-                            self.record_using_resource(item, is_await)?;
+                let child = self.current.child();
+                let saved = core::mem::replace(&mut self.current, child);
+                let r = (|| {
+                    match left {
+                        ForLeft::Decl { kind, target, .. } => {
+                            self.bind_for_decl(kind, target, item)?;
+                            if matches!(
+                                kind,
+                                crate::ast::VarDeclKind::Using
+                                    | crate::ast::VarDeclKind::AwaitUsing
+                            ) {
+                                let is_await = matches!(kind, crate::ast::VarDeclKind::AwaitUsing);
+                                self.record_using_resource(item, is_await)?;
+                            }
+                        }
+                        // The head may be a plain reference or a destructuring pattern
+                        // (`for ([a, b] of …)`, `for ({ x } of …)`).
+                        ForLeft::Target(expr) => {
+                            self.assign_destructure(expr, item)?;
                         }
                     }
-                    // The head may be a plain reference or a destructuring pattern
-                    // (`for ([a, b] of …)`, `for ({ x } of …)`).
-                    ForLeft::Target(expr) => {
-                        self.assign_destructure(expr, item)?;
+                    self.exec(body)
+                })();
+                // Dispose this iteration's `using` resource (any completion).
+                let r = self.dispose_block_scope(r);
+                self.current = saved;
+                match loop_step(r?, &label, &mut v) {
+                    LoopAction::Next => {
+                        if let Some(slot) = gc_vals.last_mut() {
+                            *slot = v;
+                        }
+                        self.gc_reroot(gc_mark, &gc_vals);
                     }
+                    LoopAction::Stop => break,
+                    LoopAction::Propagate(f) => return Ok(f),
                 }
-                self.exec(body)
-            })();
-            // Dispose this iteration's `using` resource (any completion).
-            let r = self.dispose_block_scope(r);
-            self.current = saved;
-            match loop_step(r?, &label, &mut v) {
-                LoopAction::Next => {}
-                LoopAction::Stop => break,
-                LoopAction::Propagate(f) => return Ok(f),
             }
-        }
-        Ok(Flow::Normal(v))
+            Ok(Flow::Normal(v))
+        })();
+        self.gc_unroot(gc_mark);
+        r
     }
 
     /// Reads the current value of an assignment target (identifier or member).
@@ -1775,6 +1858,10 @@ impl<'a> Interp<'a> {
         // in the body — captures that block's `let`/`const`/function bindings.
         let child = self.current.child();
         let saved = core::mem::replace(&mut self.current, child);
+        // The discriminant and the accumulated fall-through completion value are
+        // live Rust locals across every case body; publish them for the safepoint.
+        // Slot 0 is the discriminant, slot 1 the accumulator (rewritten below).
+        let gc_mark = self.gc_root(&[value, NanBox::undefined()]);
         let result = (|| {
             // BlockDeclarationInstantiation for the whole CaseBlock: instantiate
             // every case's block-level function declarations and pre-declare its
@@ -1823,6 +1910,7 @@ impl<'a> Interp<'a> {
                         Flow::Normal(sv) => {
                             if !sv.is_empty_completion() {
                                 v = sv;
+                                self.gc_reroot(gc_mark, &[value, v]);
                             }
                         }
                         other => return Ok(other),
@@ -1831,6 +1919,7 @@ impl<'a> Interp<'a> {
             }
             Ok(Flow::Normal(v))
         })();
+        self.gc_unroot(gc_mark);
         self.current = saved;
         result
     }
@@ -1867,6 +1956,9 @@ impl<'a> Interp<'a> {
             }
             _ => Vec::new(),
         };
+        // Reserve the shadow-root slot for the loop's completion value outside the
+        // body closure, so it is released on every exit path.
+        let gc_mark = self.gc_root(&[NanBox::undefined()]);
         let result = (|| {
             match init {
                 Some(ForInit::Var(decl)) => self.exec_var(decl)?,
@@ -1892,7 +1984,7 @@ impl<'a> Interp<'a> {
                 }
                 let flow = self.exec(body)?;
                 match loop_step(flow, &label, &mut v) {
-                    LoopAction::Next => {}
+                    LoopAction::Next => self.gc_reroot(gc_mark, &[v]),
                     LoopAction::Stop => break,
                     LoopAction::Propagate(f) => return Ok(f),
                 }
@@ -1911,6 +2003,7 @@ impl<'a> Interp<'a> {
         // (`self.current` is still that scope here); dispose it on loop exit
         // (any completion). The non-`using` head leaves no disposers (fast path).
         let result = self.dispose_block_scope(result);
+        self.gc_unroot(gc_mark);
         self.current = saved;
         result
     }

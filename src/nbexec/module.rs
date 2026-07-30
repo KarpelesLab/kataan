@@ -397,6 +397,12 @@ pub struct ModuleRegistry {
 }
 
 impl ModuleRegistry {
+    /// Whether no module has been loaded into this registry — the GC safepoint's
+    /// "no module graph is live" check (see `nbexec::gc`).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             records: BTreeMap::new(),
@@ -1516,6 +1522,16 @@ impl<'a> Interp<'a> {
     /// `import.meta` set up. Modules are always strict. A top-level-await module
     /// goes through [`Self::execute_async_module`] instead.
     fn run_module_body(&mut self, key: &str) -> Result<(), ExecError> {
+        // Module evaluation is driven from the linker with live records in Rust
+        // locals, and a module graph's namespaces/import aliases are root sources
+        // the safepoint does not trace — fence the whole body.
+        let saved_gc = core::mem::replace(&mut self.gc_ok, false);
+        let r = self.run_module_body_inner(key);
+        self.gc_ok = saved_gc;
+        r
+    }
+
+    fn run_module_body_inner(&mut self, key: &str) -> Result<(), ExecError> {
         let (scope, program, aliases) = {
             let r = &self.modules.records[key];
             (r.scope.clone(), r.program, r.import_aliases.clone())
