@@ -6826,7 +6826,43 @@ impl Compiler {
             self.write_var(b, value_reg);
             return Ok(());
         }
-        self.bind_pattern(target, value_reg)
+        self.bind_pattern(target, value_reg)?;
+        // A `const` head's per-iteration binding is immutable, so a body that
+        // assigns to it (`for (const x of …) { x++ }`) must reach the
+        // tree-walker's TypeError rather than compile to a plain store.
+        if *kind == crate::ast::VarDeclKind::Const {
+            self.mark_pattern_const(target);
+        }
+        Ok(())
+    }
+
+    /// Marks every name a `const` binding pattern introduced immutable. The
+    /// pattern walker is shared by all declaration kinds; the kind is known only
+    /// at its call sites.
+    fn mark_pattern_const(&mut self, target: &BindingTarget) {
+        match target {
+            BindingTarget::Ident(Ident { name, .. }) => self.mark_const(name),
+            BindingTarget::Array(pat) => {
+                use crate::ast::ArrayPatternElement;
+                for el in &pat.elements {
+                    match el {
+                        ArrayPatternElement::Hole => {}
+                        ArrayPatternElement::Item { target, .. }
+                        | ArrayPatternElement::Rest { target, .. } => {
+                            self.mark_pattern_const(target);
+                        }
+                    }
+                }
+            }
+            BindingTarget::Object(pat) => {
+                for prop in &pat.properties {
+                    self.mark_pattern_const(&prop.value);
+                }
+                if let Some(rest) = &pat.rest {
+                    self.mark_pattern_const(rest);
+                }
+            }
+        }
     }
 
     fn bind_pattern(&mut self, target: &BindingTarget, value_reg: Reg) -> Result<(), CompileError> {
@@ -7216,10 +7252,8 @@ impl Compiler {
                         None => self.constant(NanBox::undefined())?,
                     };
                     self.bind_pattern(&d.target, value)?;
-                    if matches!(decl.kind, crate::ast::VarDeclKind::Const)
-                        && let BindingTarget::Ident(id) = &d.target
-                    {
-                        self.mark_const(&id.name);
+                    if matches!(decl.kind, crate::ast::VarDeclKind::Const) {
+                        self.mark_pattern_const(&d.target);
                     }
                 }
                 Ok(None)
@@ -8339,6 +8373,11 @@ impl Compiler {
                 let b = self
                     .lookup(&id.name)
                     .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
+                // `++`/`--` on a `const` binding is a TypeError; route the program
+                // to the tree-walker, which enforces it at the right point.
+                if b.konst {
+                    return Err(CompileError::Unsupported("update of const"));
+                }
                 let one = self.constant(NanBox::number(1.0))?;
                 let bop = match op {
                     crate::ast::UpdateOp::Inc => BinaryOp::Add,

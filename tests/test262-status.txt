@@ -61,50 +61,16 @@ intl402/Temporal/PlainMonthDay/from/chinese-dangi-leap-month-with-year-from-opti
 intl402/Temporal/PlainMonthDay/from/dangi-leap-month-codes-common.js  # [sloppy] expected pass, Runtime Test262Error: M08L-30 should be constrained to M08-30 Expected SameValue(«"M08L"», «"M08"») to be true
 intl402/Temporal/PlainMonthDay/prototype/toLocaleString/dateStyle.js  # [sloppy] expected pass, Runtime Test262Error: dateStyle: long writes month of Ramadan out in full
 intl402/Temporal/PlainYearMonth/prototype/toLocaleString/dateStyle.js  # [sloppy] expected pass, Runtime Test262Error: dateStyle: long writes month of Ramadan out in full
-language/arguments-object/10.6-13-a-2.js  # [sloppy] expected pass, Runtime TypeError: is not a function
-language/arguments-object/10.6-13-a-3.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/destructuring/binding/keyed-destructuring-property-reference-target-evaluation-order-with-bindings.js  # [sloppy] expected pass, Runtime Test262Error: Actual [binding::source, binding::sourceKey, sourceKey, get source, binding::defaultValue] and expected [binding::source, binding::sourceKey, sourceKey, binding::varTarget, get source, binding::defaultValue] should have the same contents. 
-language/expressions/arrow-function/syntax/arrowparameters-bindingidentifier-yield.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: expected a semicolon or newline, found Arrow (at 7114..7116)
-language/expressions/assignment/fn-name-lhs-cover.js  # [sloppy] expected pass, Runtime Test262Error: name descriptor value should be ; name value should be 
-language/expressions/call/eval-realm-indirect.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"inside"», «"outside"») to be true
-language/expressions/delete/11.4.1-4.a-8.js  # [sloppy] expected pass, Runtime Test262Error: d Expected SameValue(«false», «true») to be true
-language/expressions/division/no-magic-asi-from-block-eval.js  # [sloppy] expected pass, Runtime SyntaxError: SyntaxError: unterminated regular expression literal (at 11..13)
-language/expressions/division/no-magic-asi.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: unterminated regular expression literal (line terminator) (at 7321..7324)
-language/expressions/dynamic-import/assignment-expression/yield-assign-expr.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Expected SameValue(«[object Promise]», «42») to be true )
-language/expressions/dynamic-import/assignment-expression/yield-expr.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:TypeError: cannot read property of null or undefined )
-language/expressions/dynamic-import/import-attributes/2nd-param-evaluation-abrupt-return.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«1», «0») to be true
-language/expressions/dynamic-import/import-attributes/2nd-param-yield-expr.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«[object Promise]», «undefined») to be true
-language/expressions/import.meta/distinct-for-each-module.js  # expected pass, Runtime Test262Error: foreign import.meta accessed via function call Expected SameValue(«[object Object]», «[object Object]») to be false
-language/expressions/import.meta/import-meta-is-an-ordinary-object.js  # expected pass, Runtime Test262Error: import.meta is not callable Expected a TypeError but got a ReferenceError
-language/expressions/postfix-decrement/operator-x-postfix-decrement-calls-putvalue-lhs-newvalue-.js  # [sloppy] expected pass, Runtime Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all
-language/expressions/postfix-increment/operator-x-postfix-increment-calls-putvalue-lhs-newvalue-.js  # [sloppy] expected pass, Runtime Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all
-language/expressions/prefix-decrement/operator-prefix-decrement-x-calls-putvalue-lhs-newvalue-.js  # [sloppy] expected pass, Runtime Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all
-language/expressions/prefix-increment/operator-prefix-increment-x-calls-putvalue-lhs-newvalue-.js  # [sloppy] expected pass, Runtime Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all
-language/expressions/yield/from-with.js  # [sloppy] expected pass, Runtime Test262Error: Second result `value` Expected SameValue(«1», «2») to be true
-language/expressions/yield/rhs-template-middle.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: unexpected token TemplateMiddle (at 7300..7304)
-language/expressions/yield/star-in-rltn-expr.js  # [sloppy] expected pass, Runtime TypeError: yield* operand is not iterable
-language/function-code/10.4.3-1-104.js  # [strict] expected pass, Runtime Test262Error: (5).x === 5
-language/function-code/10.4.3-1-106.js  # [strict] expected pass, Runtime Test262Error: typeof (5).x Expected SameValue(«"object"», «"number"») to be true
-language/global-code/decl-lex-restricted-global.js  # [sloppy] expected SyntaxError but the test passed
 language/import/import-defer/errors/get-other-while-dep-evaluating-async/main.js  # async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: ns.foo while evaluating throws a TypeError )
 language/import/import-defer/errors/module-throws/defer-import-after-evaluation.js  # async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Evaluation errors are thrown for modules evaluated before getting t)
 language/literals/regexp/S7.8.5_A1.1_T2.js  # [sloppy] expected pass, Runtime Test262Error: Code unit: d800 Expected SameValue(«"�"», «"\ud800"») to be true
 language/literals/regexp/S7.8.5_A1.4_T2.js  # [sloppy] expected pass, Runtime Test262Error: Code unit: d800 Expected SameValue(«"\\�"», «"\\\ud800"») to be true
 language/literals/regexp/S7.8.5_A2.1_T2.js  # [sloppy] expected pass, Runtime Test262Error: Code unit: d800 Expected SameValue(«"nnnn�"», «"nnnn\ud800"») to be true
 language/literals/regexp/S7.8.5_A2.4_T2.js  # [sloppy] expected pass, Runtime Test262Error: Code unit: d800 Expected SameValue(«"a\\�"», «"a\\\ud800"») to be true
-language/literals/regexp/u-case-mapping.js  # [sloppy] expected pass, Runtime Test262Error: Case mapping is not applied in the absence of the `u` flag Expected SameValue(«true», «false») to be true
 language/module-code/ambiguous-export-bindings/namespace-unambiguous-if-import-source-and-export.js  # expected pass, Parse SyntaxError: SyntaxError: expected `from`, found Identifier (at 142..145)
 language/module-code/source-phase-import/import-source.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: ./import-source-binding-name_FIXTURE.js: Promise should be rejected)
 language/module-code/source-phase-import/reexport-source-binding-named-import.js  # expected pass, Parse SyntaxError: SyntaxError: expected `from`, found Identifier (at 142..143)
 language/module-code/source-phase-import/reexport-source-binding-namespace-get.js  # expected pass, Parse SyntaxError: SyntaxError: expected `from`, found Identifier (at 142..143)
 language/statements/await-using/await-using-implies-await-if-evaluated.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Expected statements following the block containing evaluated `await)
-language/statements/await-using/syntax/await-using-invalid-assignment-statement-body-for-of.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Expected a TypeError to be thrown asynchronously but no exception w)
-language/statements/const/syntax/const-invalid-assignment-statement-body-for-in.js  # [sloppy] expected pass, Runtime Test262Error: Expected a TypeError to be thrown but no exception was thrown at all
-language/statements/const/syntax/const-invalid-assignment-statement-body-for-of.js  # [sloppy] expected pass, Runtime Test262Error: Expected a TypeError to be thrown but no exception was thrown at all
-language/statements/for-in/resizable-buffer.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«""», «"012"») to be true
-language/statements/function/S13.2.2_A18_T1.js  # [sloppy] expected pass, Runtime Test262Error: #4: this.b === true. Actual: this.b ===undefined
-language/statements/function/S13.2.2_A18_T2.js  # [sloppy] expected pass, Runtime Test262Error: #4: this.b === true. Actual: this.b ===undefined
-language/statements/try/scope-catch-block-lex-open.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"inside"», «"outside"») to be true
-language/statements/using/syntax/using-invalid-assignment-statement-body-for-of.js  # [sloppy] expected pass, Runtime Test262Error: Expected a TypeError to be thrown but no exception was thrown at all
-language/statements/variable/binding-resolution.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«undefined», «true») to be true
 language/types/reference/get-value-prop-base-primitive-realm.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«undefined», «"Symbol prototype"») to be true

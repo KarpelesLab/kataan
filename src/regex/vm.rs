@@ -802,7 +802,7 @@ fn cp_eq(a: u32, b: u32, flags: Flags) -> bool {
         return false;
     }
     match (char::from_u32(a), char::from_u32(b)) {
-        (Some(ca), Some(cb)) => char_fold_eq(ca, cb),
+        (Some(ca), Some(cb)) => char_fold_eq(ca, cb, flags),
         // Lone surrogates have no case; only exact equality (handled above).
         _ => false,
     }
@@ -818,15 +818,20 @@ fn unit_eq(a: u16, b: u16, flags: Flags) -> bool {
         return false;
     }
     match (char::from_u32(a as u32), char::from_u32(b as u32)) {
-        (Some(ca), Some(cb)) => char_fold_eq(ca, cb),
+        (Some(ca), Some(cb)) => char_fold_eq(ca, cb, flags),
         _ => false,
     }
 }
 
-fn char_fold_eq(a: char, b: char) -> bool {
-    // Case-insensitive: compare by Unicode case folding (spec `Canonicalize`),
-    // which catches pairs simple lowercasing misses (e.g. the Kelvin sign
-    // U+212A ↔ `k`, long s U+017F ↔ `s`, final sigma ς ↔ σ).
+fn char_fold_eq(a: char, b: char, flags: Flags) -> bool {
+    // §22.2.2.9.1 `Canonicalize`. Under `u`/`v` it is Unicode simple case folding,
+    // which catches pairs simple lowercasing misses (the Kelvin sign U+212A ↔ `k`,
+    // long s U+017F ↔ `s`, final sigma ς ↔ σ). WITHOUT those flags it is the
+    // legacy `toUppercase` rule, which deliberately does *not* fold a non-ASCII
+    // character onto an ASCII one — so `/K/i` must not match `k`.
+    if !(flags.unicode || flags.unicode_sets) {
+        return canonicalize_legacy(a) == canonicalize_legacy(b);
+    }
     #[cfg(feature = "intl")]
     {
         intl::unicode::case::case_fold(a).eq(intl::unicode::case::case_fold(b))
@@ -835,6 +840,23 @@ fn char_fold_eq(a: char, b: char) -> bool {
     {
         a.eq_ignore_ascii_case(&b) || a.to_lowercase().eq(b.to_lowercase())
     }
+}
+
+/// `Canonicalize(ch)` for a non-`u`/`v` case-insensitive pattern: uppercase the
+/// character, keep the result only if it is a *single* UTF-16 code unit (so `ß`
+/// → "SS" is rejected), and never map a non-ASCII character onto an ASCII one.
+fn canonicalize_legacy(ch: char) -> char {
+    let mut up = ch.to_uppercase();
+    let Some(first) = up.next() else {
+        return ch;
+    };
+    if up.next().is_some() || first.len_utf16() != 1 {
+        return ch;
+    }
+    if ch as u32 >= 128 && (first as u32) < 128 {
+        return ch;
+    }
+    first
 }
 
 fn is_line_term(c: u32) -> bool {

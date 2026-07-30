@@ -907,12 +907,17 @@ impl<'a> Interp<'a> {
         }
 
         let aliases = Rc::new(aliases);
+        // `import.meta` belongs to the *module*, not to the running context, so
+        // tag the scope with it too (`Scope::module_meta`): a function defined
+        // here and called from another module must still see this module's object.
+        let meta = self.module_meta(key);
         if let Some(r) = self.modules.records.get_mut(key) {
             r.import_aliases = aliases.clone();
             // Tag the module's top-level scope with its imports so a function
             // defined here restores the right aliases when it runs (even when
             // called from another module) — see `Scope::module_imports`.
             r.scope.set_module_imports(aliases);
+            r.scope.set_module_meta(meta);
         }
         // Instantiate this module's top-level function declarations into its
         // scope *now*, at link time (the spec's InitializeEnvironment step). A
@@ -2254,6 +2259,19 @@ impl<'a> Interp<'a> {
             Some(crate::ast::Argument::Item(e)) => Some(self.eval(e)?),
             _ => None,
         };
+        Ok(self.dynamic_import_values(spec, options))
+    }
+
+    /// `ImportCall` from step 5 on, with the specifier and options arguments
+    /// already evaluated. Split out of [`Self::dynamic_import`] so the
+    /// generator/async step machine can drive a `yield`/`await` inside either
+    /// argument (`import(yield)`) and only then perform the import — so an abrupt
+    /// completion at that suspension skips it entirely.
+    pub(crate) fn dynamic_import_values(
+        &mut self,
+        spec: NanBox,
+        options: Option<NanBox>,
+    ) -> NanBox {
         let promise = self.fresh_promise();
         let referrer = self.current_module_key();
         let host = FileModuleHost;
@@ -2276,7 +2294,7 @@ impl<'a> Interp<'a> {
             Ok((dep, type_attr)) => self.start_dynamic_import(&dep, type_attr.as_deref(), promise),
             Err(e) => self.reject_dynamic_import(promise, e),
         }
-        Ok(NanBox::handle(promise.to_raw()))
+        NanBox::handle(promise.to_raw())
     }
 
     /// `FinishLoadingImportedModule` + `ContinueDynamicImport` for a resolved

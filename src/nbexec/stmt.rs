@@ -370,7 +370,11 @@ impl<'a> Interp<'a> {
             };
             // The catch body is in tail position only if no `finally` follows.
             self.tail_pos = saved_tail_pos && finalizer.is_none();
-            outcome = bound.and_then(|()| self.exec_seq(&catch.body));
+            // CatchClauseEvaluation runs the Block in a *new* declarative
+            // environment nested inside the catch-parameter environment, so a
+            // `let` in the body does not reach a closure created by a parameter
+            // initializer (`catch ([_ = () => x]) { let x; }`).
+            outcome = bound.and_then(|()| self.exec_scoped(&catch.body));
             self.current = saved;
         }
         // `finally` runs regardless; an abrupt finally overrides the outcome.
@@ -655,6 +659,15 @@ impl<'a> Interp<'a> {
         {
             self.pending_class_name = Some(&**name);
         }
+        // §14.3.2.4 step 2: `ResolveBinding(bindingId)` runs *before* the
+        // Initializer, so a `with` object that provides the name at that moment
+        // stays the write target even if the initializer removes the property
+        // (`with (o) { var p = delete o.p }` puts `true` back on `o`, leaving the
+        // hoisted `var p` undefined).
+        let with_target = match (is_var, &d.target) {
+            (true, BindingTarget::Ident(Ident { name, .. })) => self.with_binding_result(name)?,
+            _ => None,
+        };
         let value = match &d.init {
             Some(e) => self.eval(e)?,
             None => NanBox::undefined(),
@@ -673,10 +686,13 @@ impl<'a> Interp<'a> {
             let name: &str = name;
             // Inside `with (obj)`, a `var x = v` *initializer* is an ordinary
             // assignment whose target resolves through the scope chain, so when
-            // the with-object provides `x` it writes that property (via `[[Set]]`),
-            // not the hoisted binding (`with ({foo:…}) { var foo = v }` sets `obj.foo`).
-            if self.with_binding(name).is_some() {
-                self.assign_to_name(name, value)?;
+            // the with-object provided `x` it writes that property (via `[[Set]]`),
+            // not the hoisted binding (`with ({foo:…}) { var foo = v }` sets
+            // `obj.foo`). `with` is sloppy-only, so a binding deleted by the
+            // initializer still takes the `[[Set]]` (no strict ReferenceError).
+            if let Some(h) = with_target {
+                let key = self.new_str(name);
+                self.assign_member_value(h, key, value)?;
                 return Ok(());
             }
             if !self.current.set(name, value) {
@@ -714,6 +730,12 @@ impl<'a> Interp<'a> {
             return Ok(());
         }
         self.bind_pattern(&d.target, value)?;
+        // A `const` *destructuring* head (`const { a } = o`) binds through the
+        // generic pattern walker, which cannot know the declaration kind — mark
+        // every name it introduced immutable afterwards.
+        if matches!(kind, crate::ast::VarDeclKind::Const) {
+            mark_pattern_const(&self.current, &d.target);
+        }
         Ok(())
     }
 
@@ -756,7 +778,18 @@ impl<'a> Interp<'a> {
         {
             return self.assign_to_name(&id.name, value);
         }
-        self.bind_pattern(target, value)
+        self.bind_pattern(target, value)?;
+        // A `const`/`using` head's per-iteration binding is immutable, so
+        // `for (const x of …) { x++ }` is a TypeError.
+        if matches!(
+            kind,
+            crate::ast::VarDeclKind::Const
+                | crate::ast::VarDeclKind::Using
+                | crate::ast::VarDeclKind::AwaitUsing
+        ) {
+            mark_pattern_const(&self.current, target);
+        }
+        Ok(())
     }
 
     pub(crate) fn bind_pattern(
@@ -1617,7 +1650,13 @@ impl<'a> Interp<'a> {
             let m = self.new_str("Assignment to constant variable.");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
-        if !self.current.set(name, value) {
+        if self.current.set(name, value) {
+            // A global `var` is mirrored as a property of the global object; keep
+            // the two in step so `this.x` sees the assignment.
+            self.sync_global_var(name, value);
+            return Ok(());
+        }
+        {
             // A property on the global object (created via `this.x = …` /
             // `globalThis.x = …`, or a global `var`) is a *resolvable* reference:
             // assignment updates that property — in strict mode too. Only a truly
@@ -1904,5 +1943,33 @@ impl<'a> Interp<'a> {
             }
         }
         self.current = iter;
+    }
+}
+
+/// Marks every name a `const` binding pattern introduced immutable in `scope`.
+/// The pattern walker (`bind_pattern`) is shared by all declaration kinds and
+/// declares plain (mutable) bindings; the declaration kind is only known here.
+fn mark_pattern_const(scope: &crate::env::Scope, target: &BindingTarget) {
+    match target {
+        BindingTarget::Ident(Ident { name, .. }) => scope.mark_const(name),
+        BindingTarget::Array(pat) => {
+            for el in &pat.elements {
+                match el {
+                    ArrayPatternElement::Hole => {}
+                    ArrayPatternElement::Item { target, .. }
+                    | ArrayPatternElement::Rest { target, .. } => {
+                        mark_pattern_const(scope, target);
+                    }
+                }
+            }
+        }
+        BindingTarget::Object(pat) => {
+            for prop in &pat.properties {
+                mark_pattern_const(scope, &prop.value);
+            }
+            if let Some(rest) = &pat.rest {
+                mark_pattern_const(scope, rest);
+            }
+        }
     }
 }

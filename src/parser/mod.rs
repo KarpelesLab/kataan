@@ -72,6 +72,13 @@ pub struct Parser<'src> {
     /// assignment parser consults this (matching on span) to reject `({}) = 1`.
     /// Cleared at the start of every primary parse so it is never stale.
     paren_obj_arr_span: Option<Span>,
+    /// Span of the expression most recently produced by a *parenthesized*
+    /// primary (`( expr )`), i.e. the stripped inner expression's span. The AST
+    /// drops the parens, but `IsIdentifierRef` of a
+    /// `CoverParenthesizedExpression` is false, so the assignment parser consults
+    /// this (matching on span) to suppress NamedEvaluation for `(fn) = function(){}`.
+    /// Cleared at the start of every primary parse so it is never stale.
+    paren_expr_span: Option<Span>,
     /// Current recursive-descent nesting depth, bounded by [`MAX_PARSE_DEPTH`].
     depth: u32,
     /// Whether the cursor is at the **module top level** — the direct statement
@@ -116,6 +123,7 @@ impl<'src> Parser<'src> {
             in_generator: false,
             in_async: false,
             paren_obj_arr_span: None,
+            paren_expr_span: None,
             depth: 0,
             module_top_level: false,
         })
@@ -353,6 +361,11 @@ impl<'src> Parser<'src> {
                 return Err(self.err_at(left.span(), "invalid assignment target"));
             }
         }
+        // `(fn) = …` — a parenthesized target. The parens are dropped from the
+        // AST, so record (by span, set by `parse_paren` while `left` was parsed)
+        // that this LHS was covered: `IsIdentifierRef` is false for it, so no
+        // NamedEvaluation.
+        let paren_target = self.paren_expr_span == Some(left.span());
         self.bump();
         let value = self.parse_assignment()?;
         let span = left.span().to(value.span());
@@ -360,6 +373,7 @@ impl<'src> Parser<'src> {
             op,
             target: Box::new(left),
             value: Box::new(value),
+            paren_target,
             span,
         })
     }
@@ -982,6 +996,7 @@ impl<'src> Parser<'src> {
         // Reset the parenthesized-object/array marker; only `parse_paren` re-sets
         // it, so it never lingers past the primary it describes.
         self.paren_obj_arr_span = None;
+        self.paren_expr_span = None;
         let tok = self.peek_tok();
         match tok.kind {
             TokenKind::Number => {
@@ -1269,6 +1284,7 @@ impl<'src> Parser<'src> {
             Expr::Object { span, .. } | Expr::Array { span, .. } => Some(*span),
             _ => None,
         };
+        self.paren_expr_span = Some(expr.span());
         Ok(expr)
     }
 
@@ -1536,6 +1552,7 @@ impl<'src> Parser<'src> {
                     op: crate::ast::AssignOp::Assign,
                     target: Box::new(ident_expr),
                     value: Box::new(default),
+                    paren_target: false,
                     span,
                 }),
                 shorthand: true,
@@ -1720,6 +1737,11 @@ impl<'src> Parser<'src> {
                 | TokenKind::Comma
                 | TokenKind::Semicolon
                 | TokenKind::Colon
+                // The `}` closing a template substitution comes back as the
+                // continuation of the template (`` `1${ yield }3` ``), so a bare
+                // `yield` ends there just as it does at a plain `}`.
+                | TokenKind::TemplateMiddle
+                | TokenKind::TemplateTail
                 | TokenKind::Eof
         )
     }

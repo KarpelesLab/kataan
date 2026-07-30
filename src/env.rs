@@ -72,6 +72,12 @@ struct ScopeData {
     /// nearest module frame (`Scope::module_imports`). `None` on ordinary frames.
     #[allow(clippy::type_complexity)]
     module_imports: Option<Rc<BTreeMap<String, (Scope, String)>>>,
+    /// Set ONLY on a module's top-level scope: that module's `import.meta`
+    /// object. `import.meta` is *per module*, not per running context, so a
+    /// function defined in module A and called from module B must still see A's
+    /// meta object — `Interp::invoke_inner` restores it by walking the closure's
+    /// captured chain to the nearest module frame. `None` on ordinary frames.
+    module_meta: Option<NanBox>,
     /// Names declared *lexically* (`let`/`const`/`class`) at the top level of the
     /// function/eval/program body whose variable environment this frame is. In
     /// this engine a function body's lexical environment and variable environment
@@ -98,6 +104,7 @@ impl Scope {
             catch_scope: false,
             with_obj: None,
             module_imports: None,
+            module_meta: None,
             lexical: None,
         })))
     }
@@ -115,6 +122,7 @@ impl Scope {
             catch_scope: false,
             with_obj: None,
             module_imports: None,
+            module_meta: None,
             lexical: None,
         })))
     }
@@ -231,6 +239,27 @@ impl Scope {
         parent.and_then(|p| p.module_imports())
     }
 
+    /// Records this frame as a module's top-level scope carrying `meta` (its
+    /// `import.meta` object). Set once, at link time.
+    pub fn set_module_meta(&self, meta: NanBox) {
+        self.0.borrow_mut().module_meta = Some(meta);
+    }
+
+    /// The `import.meta` object of the nearest enclosing module scope (this frame
+    /// or an ancestor), or `None` outside module code — used to restore
+    /// `import.meta` when a module function runs, so a function defined in one
+    /// module and called from another still sees *its own* module's meta object.
+    #[must_use]
+    pub fn module_meta(&self) -> Option<NanBox> {
+        let data = self.0.borrow();
+        if let Some(m) = data.module_meta {
+            return Some(m);
+        }
+        let parent = data.parent.clone();
+        drop(data);
+        parent.and_then(|p| p.module_meta())
+    }
+
     /// Declares (or redeclares) `name` in *this* scope.
     pub fn declare(&self, name: &str, value: NanBox) {
         self.0.borrow_mut().vars.insert(String::from(name), value);
@@ -241,6 +270,16 @@ impl Scope {
         let mut data = self.0.borrow_mut();
         data.vars.insert(String::from(name), value);
         data.consts.insert(String::from(name));
+    }
+
+    /// Marks an already-declared binding of `name` in *this* scope immutable —
+    /// for the names a `const` *destructuring* pattern introduces, which are
+    /// bound by the generic pattern walker and only then known to be `const`.
+    pub fn mark_const(&self, name: &str) {
+        let mut data = self.0.borrow_mut();
+        if data.vars.contains_key(name) {
+            data.consts.insert(String::from(name));
+        }
     }
 
     /// Whether the nearest binding of `name` was declared `const`.
@@ -413,6 +452,12 @@ impl Scope {
         {
             visit(Handle::from_raw(raw));
         }
+        // A module scope roots its `import.meta` object.
+        if let Some(meta) = &data.module_meta
+            && let Some(raw) = meta.as_handle()
+        {
+            visit(Handle::from_raw(raw));
+        }
         if let Some(p) = &data.parent {
             p.for_each_handle(visit);
         }
@@ -443,6 +488,11 @@ impl Scope {
             && let Some(raw) = obj.as_handle()
         {
             *obj = NanBox::handle(forward(Handle::from_raw(raw)).to_raw());
+        }
+        if let Some(meta) = &mut data.module_meta
+            && let Some(raw) = meta.as_handle()
+        {
+            *meta = NanBox::handle(forward(Handle::from_raw(raw)).to_raw());
         }
         if let Some(p) = &data.parent {
             p.relocate_handles(forward);

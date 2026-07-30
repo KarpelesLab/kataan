@@ -656,6 +656,23 @@ impl<'a> Interp<'a> {
                                 {
                                     frame.delete_local(&id.name);
                                     result = true;
+                                } else if frame.ptr_eq(&self.global_scope)
+                                    && let Some(g) = self.global_object()
+                                    && (self.realm.has_own(g, &id.name)
+                                        || self.realm.accessor(g, &id.name).is_some())
+                                    && !self.realm.property_is_non_configurable(g, &id.name)
+                                {
+                                    // A built-in global (`JSON`, `Math`, a constructor,
+                                    // …) is a *configurable* property of the global
+                                    // object that this engine mirrors as a global-scope
+                                    // binding. `delete JSON` removes the property, so
+                                    // the mirror must go too. A global `var`/function
+                                    // declaration is non-configurable and stays.
+                                    result = self.realm.delete_property(g, &id.name);
+                                    if result {
+                                        frame.delete_local(&id.name);
+                                    }
+                                    is_property_delete = true;
                                 } else {
                                     result = false;
                                 }
@@ -834,9 +851,31 @@ impl<'a> Interp<'a> {
                 if let Expr::Ident(id) = &**argument
                     && let Some(h) = self.with_binding(&id.name)
                 {
-                    let current = self.read_member(h, &id.name)?;
+                    let name = &*id.name;
+                    // Both `GetBindingValue` (the read) and `SetMutableBinding` (the
+                    // write) of an object Environment Record re-run
+                    // `? HasProperty(bindingObject, N)` after the `HasBinding`
+                    // resolution. A getter that deletes its own property
+                    // (`get x(){ delete this.x; return 2 }`) makes the second check
+                    // fail, which is a ReferenceError for a strict reference.
+                    let current = if self.has_property_proxied(h, name)? {
+                        self.read_member(h, name)?
+                    } else if self.strict {
+                        let m = self.new_str(&alloc::format!("{name} is not defined"));
+                        return Err(ExecError::Throw(
+                            self.make_error(N_REFERENCE_ERROR, Some(m)),
+                        ));
+                    } else {
+                        NanBox::undefined()
+                    };
                     let (old, next) = self.update_value(*op, current)?;
-                    let key = self.new_str(&id.name);
+                    if !self.has_property_proxied(h, name)? && self.strict {
+                        let m = self.new_str(&alloc::format!("{name} is not defined"));
+                        return Err(ExecError::Throw(
+                            self.make_error(N_REFERENCE_ERROR, Some(m)),
+                        ));
+                    }
+                    let key = self.new_str(name);
                     self.assign_member_value(h, key, next)?;
                     return Ok(if *prefix { next } else { old });
                 }
@@ -899,8 +938,12 @@ impl<'a> Interp<'a> {
                 }
             }
             Expr::Assign {
-                op, target, value, ..
-            } => self.eval_assign(*op, target, value),
+                op,
+                target,
+                value,
+                paren_target,
+                ..
+            } => self.eval_assign(*op, target, value, *paren_target),
             Expr::Call {
                 callee,
                 arguments,
@@ -960,6 +1003,20 @@ impl<'a> Interp<'a> {
                     };
                     self.settle(p, rejection, false);
                     return Ok(NanBox::handle(p.to_raw()));
+                }
+                // `import.meta(…)` — the meta-property is an ordinary (non-callable)
+                // object, so this must be a TypeError, not a ReferenceError for the
+                // bare `import` reference. Evaluate the meta-property, then call it.
+                #[cfg(all(feature = "module", feature = "std"))]
+                if let Expr::Member {
+                    object, property, ..
+                } = &**callee
+                    && matches!(&**object, Expr::Ident(id) if id.name.as_ref() == "import")
+                    && matches!(property, PropertyKey::Ident(p) if &**p == "meta")
+                {
+                    let f = self.eval(callee)?;
+                    let args = self.eval_args(arguments)?;
+                    return self.call(f, &args);
                 }
                 // `super(args)` — invoke the base constructor on the current
                 // instance.
@@ -1262,13 +1319,19 @@ impl<'a> Interp<'a> {
                 // direct-eval syntactic form (`CallExpression : MemberExpression
                 // Arguments`), so it is always an *indirect* eval — fall through to
                 // `self.call` below.
+                // `SameValue(func, %eval%)` compares against the *running* realm's
+                // eval intrinsic, so another realm's eval (`otherRealm.global.eval`)
+                // is an ordinary — indirect — call even when spelled `eval(…)`.
+                let is_current_realm_eval = |this: &mut Self, f: NanBox| {
+                    f.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                        this.realm.native_at(h) == Some(N_EVAL)
+                            && this.get_function_realm(h) == this.cur_realm
+                    })
+                };
                 if let Expr::Ident(id) = &**callee
                     && !*call_optional
                     && id.name.as_ref() == "eval"
-                    && f.as_handle()
-                        .map(Handle::from_raw)
-                        .and_then(|h| self.realm.native_at(h))
-                        == Some(N_EVAL)
+                    && is_current_realm_eval(self, f)
                 {
                     let arg0 = args.first().copied().unwrap_or(NanBox::undefined());
                     let Some(source) = arg0
@@ -1870,7 +1933,14 @@ impl<'a> Interp<'a> {
             if matches!(obj.unpack(), Unpacked::Number(_) | Unpacked::Bool(_)) {
                 let wrapper = self.coerce_to_object(obj);
                 if let Some(wh) = wrapper.as_handle().map(Handle::from_raw) {
-                    return self.member(wh, property);
+                    // GetValue's `ToObject` supplies the *object* for `[[Get]]`,
+                    // but `GetThisValue(V)` is still the primitive — so an
+                    // inherited accessor's getter runs with the primitive as its
+                    // receiver. A strict getter therefore sees `5`; a sloppy one
+                    // is boxed by OrdinaryCallBindThis, as for any primitive
+                    // `this`.
+                    let key = self.eval_prop_key(property)?;
+                    return self.get_with_receiver(wh, &key, obj);
                 }
             }
             return Ok(NanBox::undefined());
@@ -2935,6 +3005,47 @@ impl<'a> Interp<'a> {
         self.read_member(obj, name)
     }
 
+    /// The legacy `fn.caller` value for an *ordinary, source-declared, non-strict*
+    /// function: the function that is currently invoking `f` (its nearest live
+    /// caller on the invocation stack), or `null` when there is none, when `f` is
+    /// not executing, or when the caller is strict (a strict frame is never
+    /// exposed). `None` for every other callable — bound, dynamically built,
+    /// strict, generator, async, or arrow — so those keep the spec's poisoned
+    /// `%ThrowTypeError%` accessor and throw.
+    fn legacy_caller(&mut self, f: crate::heap::Handle) -> Option<NanBox> {
+        if self.realm.get_property(f, BOUND_TARGET).is_some()
+            || self.realm.get_property(f, DYN_FN_MARKER).is_some()
+        {
+            return None;
+        }
+        let (func_id, _) = self.realm.function_at(f)?;
+        let def = &self.functions[func_id as usize];
+        if def.is_strict || def.is_generator || def.is_async || def.is_arrow {
+            return None;
+        }
+        let raw = f.to_raw();
+        let Some(idx) = self
+            .fn_stack
+            .iter()
+            .rposition(|v| v.as_handle() == Some(raw))
+        else {
+            return Some(NanBox::null());
+        };
+        let Some(caller) = self.fn_stack[..idx].last().copied() else {
+            return Some(NanBox::null());
+        };
+        let caller_is_strict = caller
+            .as_handle()
+            .map(crate::heap::Handle::from_raw)
+            .and_then(|h| self.realm.function_at(h))
+            .is_some_and(|(id, _)| self.functions[id as usize].is_strict);
+        Some(if caller_is_strict {
+            NanBox::null()
+        } else {
+            caller
+        })
+    }
+
     pub(crate) fn read_member(
         &mut self,
         handle: crate::heap::Handle,
@@ -3365,6 +3476,18 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        // The legacy `fn.caller` extension (Annex B "normative optional"): for an
+        // ordinary, source-declared *non-strict* function, reading `caller`
+        // reports the function currently invoking it instead of reaching the
+        // poisoned `%ThrowTypeError%` accessor inherited from
+        // `Function.prototype`. Every other callable (strict / generator / async /
+        // arrow / bound / dynamic, and `Function.prototype` itself) still throws.
+        if name == "caller"
+            && !self.realm.has_own(handle, "caller")
+            && let Some(v) = self.legacy_caller(handle)
+        {
+            return Ok(v);
+        }
         if let Some((getter, _)) = self.realm.accessor(handle, name) {
             if matches!(getter.unpack(), Unpacked::Undefined) {
                 return Ok(NanBox::undefined());
@@ -3753,6 +3876,7 @@ impl<'a> Interp<'a> {
         op: AssignOp,
         target: &'a Expr,
         value: &'a Expr,
+        paren_target: bool,
     ) -> Result<NanBox, ExecError> {
         // AnnexB "Runtime Errors for Function Call Assignment Targets": a direct
         // CallExpression LHS parses in sloppy code but is a runtime ReferenceError.
@@ -4063,6 +4187,8 @@ impl<'a> Interp<'a> {
             let new = self.binary(compound_op(op)?, current, rhs)?;
             if let Some(fr) = frame {
                 fr.declare(name, new);
+                // Keep a global `var`'s global-object mirror in step.
+                self.sync_global_var(name, new);
             } else if !self.current.set(name, new) {
                 if self.strict {
                     let m = self.new_str(&alloc::format!("{name} is not defined"));
@@ -4077,6 +4203,7 @@ impl<'a> Interp<'a> {
         // For `name = class {}`, hand the LHS name to `make_class` so an anonymous
         // class's `name` is set before its static initializers run.
         if op == AssignOp::Assign
+            && !paren_target
             && let Expr::Ident(id) = target
             && let Expr::Class(c) = value
             && c.id.is_none()
@@ -4204,7 +4331,12 @@ impl<'a> Interp<'a> {
                     // `x = class {}` names the anonymous definition after the LHS
                     // identifier (only for a plain `=`, and only when the RHS is an
                     // anonymous function/arrow/class).
-                    if matches!(value, Expr::Function(_) | Expr::Arrow(_) | Expr::Class(_)) {
+                    // …but only for a bare `IdentifierReference` LHS: `IsIdentifierRef`
+                    // of a parenthesized target is false, so `(fn) = function(){}`
+                    // leaves the function anonymous.
+                    if !paren_target
+                        && matches!(value, Expr::Function(_) | Expr::Arrow(_) | Expr::Class(_))
+                    {
                         self.set_fn_name(rhs, name);
                     }
                     rhs
@@ -4223,6 +4355,11 @@ impl<'a> Interp<'a> {
                     Some(sc) => sc.set(name, new),
                     None => self.current.set(name, new),
                 };
+                if stored {
+                    // A global `var` is also an own property of the global object;
+                    // keep the mirror in step (`var b; b = 1` → `this.b === 1`).
+                    self.sync_global_var(name, new);
+                }
                 if !stored {
                     // A property on the global object (created via `this.x = …` /
                     // `globalThis.x = …`, or a global `var`) is a *resolvable*

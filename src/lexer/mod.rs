@@ -103,6 +103,14 @@ pub struct Lexer<'src> {
     class_stack: Vec<(bool, usize, u32)>,
     /// Nesting depth of `(`/`[`, tracked only to place a class body `{`.
     paren_depth: u32,
+    /// The `paren_depth` of each currently-open `for ( … )` head. `of` is the
+    /// `for-of` keyword — and so precedes an expression, making a following `/`
+    /// a regex — only directly inside such a head; everywhere else it is an
+    /// ordinary identifier and `/` is division (`instance/of/g`).
+    for_head_parens: Vec<u32>,
+    /// Whether the tokens seen so far end in `for` or `for await`, so the next
+    /// `(` opens a `for` head.
+    pending_for: bool,
     /// Set while scanning an identifier (or private name) that contained a
     /// `\u` escape; consumed and cleared by [`Lexer::make`].
     cur_had_escape: bool,
@@ -133,6 +141,8 @@ impl<'src> Lexer<'src> {
             func_stmt_stack: Vec::new(),
             class_stack: Vec::new(),
             paren_depth: 0,
+            for_head_parens: Vec::new(),
+            pending_for: false,
             cur_had_escape: false,
             module,
         }
@@ -209,9 +219,17 @@ impl<'src> Lexer<'src> {
             }
             b'(' => {
                 self.paren_depth += 1;
+                // `for (` / `for await (` opens a head in which `of` is the
+                // `for-of` keyword rather than an identifier.
+                if self.pending_for {
+                    self.for_head_parens.push(self.paren_depth);
+                }
                 self.single(TokenKind::LParen)
             }
             b')' => {
+                if self.for_head_parens.last() == Some(&self.paren_depth) {
+                    self.for_head_parens.pop();
+                }
                 self.paren_depth = self.paren_depth.saturating_sub(1);
                 self.single(TokenKind::RParen)
             }
@@ -1366,6 +1384,17 @@ impl<'src> Lexer<'src> {
                 // an object literal leaves a value (division). The brace stack
                 // recorded which it was when the `}` was emitted.
                 TokenKind::RBrace => self.last_rbrace_closed_block,
+                // `of` precedes an expression only as the `for-of` keyword, i.e.
+                // directly inside a `for (` head. Elsewhere it is an ordinary
+                // identifier that ends an expression, so `instance/of/g` is two
+                // divisions, not a regex.
+                TokenKind::Keyword(Keyword::Of) => {
+                    self.for_head_parens.last() == Some(&self.paren_depth)
+                }
+                // The other contextual keywords (`as`, `async`, `from`, `get`,
+                // `set`, `target`, `accessor`) are usable as plain identifiers and
+                // never directly precede a regex, so a following `/` is division.
+                TokenKind::Keyword(kw) if kw.is_contextual() => false,
                 // Keywords that produce/precede a value vs. those that precede
                 // an expression.
                 TokenKind::Keyword(kw) => kw.before_expression(),
@@ -1451,6 +1480,17 @@ impl<'src> Lexer<'src> {
                 .push((is_decl, self.brace_stack.len(), self.paren_depth));
         }
         if kind != TokenKind::Eof {
+            // `for` (optionally followed by `await`) arms the next `(` as a
+            // for-head. A `for` in member position (`a.for(…)`) is a property
+            // name, not the statement keyword.
+            self.pending_for = match kind {
+                TokenKind::Keyword(Keyword::For) => !matches!(
+                    self.prev_significant,
+                    Some(TokenKind::Dot | TokenKind::QuestionDot)
+                ),
+                TokenKind::Keyword(Keyword::Await) => self.pending_for,
+                _ => false,
+            };
             self.prev_significant = Some(kind);
         }
         let had_escape = core::mem::take(&mut self.cur_had_escape);

@@ -1784,6 +1784,10 @@ impl<'a> Interp<'a> {
         let saved_module_imports = captured
             .module_imports()
             .map(|mi| core::mem::replace(&mut self.module_imports, mi));
+        // Likewise `import.meta`: it is the *defining* module's object, so a
+        // function exported from module A and called from B still reads A's.
+        #[cfg(all(feature = "module", feature = "std"))]
+        let saved_import_meta = captured.module_meta().map(|m| self.import_meta.replace(m));
         // The callee body opens a new variable environment (set by `hoist_with`);
         // remember the caller's so it is restored on return.
         let saved_var_scope = self.var_scope.clone();
@@ -1906,6 +1910,10 @@ impl<'a> Interp<'a> {
         // Cleared for this call so a nested call / the body never inherits an
         // outer function's parameter set; restored after the call returns.
         let saved_eval_param_names = core::mem::take(&mut self.eval_param_names);
+        // Record this invocation so the legacy `fn.caller` extension can report
+        // who is calling. Popped unconditionally below (the whole body runs inside
+        // the closure, so no early return can skip it).
+        self.fn_stack.push(callee);
         let result = (|| {
             // A non-arrow function gets an `arguments` array-like of its call
             // arguments. (Arrows inherit the enclosing `arguments`.) Bound *before*
@@ -2076,11 +2084,16 @@ impl<'a> Interp<'a> {
             self.tail_pos = saved_tail_pos;
             r
         })();
+        self.fn_stack.pop();
         self.current = saved;
         self.leave_realm(realm_guard);
         #[cfg(all(feature = "module", feature = "std"))]
         if let Some(mi) = saved_module_imports {
             self.module_imports = mi;
+        }
+        #[cfg(all(feature = "module", feature = "std"))]
+        if let Some(m) = saved_import_meta {
+            self.import_meta = m;
         }
         self.var_scope = saved_var_scope;
         self.annexb_block_fns = saved_annexb;

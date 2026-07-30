@@ -167,6 +167,11 @@ pub enum Expr {
         op: AssignOp,
         target: Box<Expr>,
         value: Box<Expr>,
+        /// Whether the target was written *parenthesized* (`(x) = …`). The parens
+        /// are otherwise transparent, but `IsIdentifierRef` of a
+        /// `CoverParenthesizedExpression` is false, so such a target does NOT
+        /// trigger NamedEvaluation: `(fn) = function(){}` leaves `fn.name` empty.
+        paren_target: bool,
         span: Span,
     },
     /// A comma sequence: `a, b, c`.

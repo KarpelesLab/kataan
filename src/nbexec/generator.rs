@@ -297,6 +297,30 @@ enum Step<'a> {
         acc: Vec<NanBox>,
         spread: bool,
     },
+    /// `import(specifier, options)` — the specifier is on the value stack;
+    /// evaluate the (optional) second argument next, then perform the import.
+    #[cfg(all(feature = "module", feature = "std"))]
+    DynamicImportOptions {
+        arguments: &'a [crate::ast::Argument],
+    },
+    /// Perform `import(…)` with its arguments evaluated: pops the options value
+    /// (when `has_options`) and the specifier, pushing the resulting promise.
+    #[cfg(all(feature = "module", feature = "std"))]
+    DynamicImportCall { has_options: bool },
+    /// Build a template literal: append quasi `idx`, then evaluate substitution
+    /// `idx` (which may suspend). `acc` holds the bytes gathered so far.
+    TemplateLit {
+        tpl: &'a crate::ast::TemplateLiteral,
+        idx: usize,
+        acc: Vec<u8>,
+    },
+    /// `ToString` the top value into a template-literal accumulator, then continue
+    /// with the next quasi.
+    TemplateAppend {
+        tpl: &'a crate::ast::TemplateLiteral,
+        idx: usize,
+        acc: Vec<u8>,
+    },
     /// Build an object literal step-by-step onto `target`: `members[idx..]` remain.
     /// Handles every member form — data / method / accessor / spread / `__proto__`
     /// and computed keys whose expression may `yield`/`await`. Entered for any
@@ -2751,6 +2775,64 @@ impl<'a> Interp<'a> {
                 });
                 Ok(StepOut::Continue)
             }
+            #[cfg(all(feature = "module", feature = "std"))]
+            Step::DynamicImportOptions { arguments } => match arguments.get(1) {
+                Some(crate::ast::Argument::Item(e)) => {
+                    stack.push(Step::DynamicImportCall { has_options: true });
+                    self.gen_eval_expr(e, stack, values)
+                }
+                _ => {
+                    stack.push(Step::DynamicImportCall { has_options: false });
+                    Ok(StepOut::Continue)
+                }
+            },
+            #[cfg(all(feature = "module", feature = "std"))]
+            Step::DynamicImportCall { has_options } => {
+                let options = if has_options { values.pop() } else { None };
+                let spec = values.pop().unwrap_or(NanBox::undefined());
+                let p = self.dynamic_import_values(spec, options);
+                values.push(p);
+                Ok(StepOut::Continue)
+            }
+            Step::TemplateLit { tpl, idx, mut acc } => {
+                let Some(quasi) = tpl.quasis.get(idx) else {
+                    values.push(self.new_str_bytes(acc));
+                    return Ok(StepOut::Continue);
+                };
+                match &quasi.cooked {
+                    Some(cooked) => acc.extend_from_slice(cooked),
+                    // An invalid escape is allowed only in a *tagged* template.
+                    None => {
+                        let m = self.new_str("Invalid escape sequence in template literal");
+                        return Err(GenAbrupt::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))));
+                    }
+                }
+                match tpl.expressions.get(idx) {
+                    Some(e) => {
+                        stack.push(Step::TemplateAppend { tpl, idx, acc });
+                        self.gen_eval_expr(e, stack, values)
+                    }
+                    None => {
+                        stack.push(Step::TemplateLit {
+                            tpl,
+                            idx: idx + 1,
+                            acc,
+                        });
+                        Ok(StepOut::Continue)
+                    }
+                }
+            }
+            Step::TemplateAppend { tpl, idx, mut acc } => {
+                let v = values.pop().unwrap_or(NanBox::undefined());
+                let bytes = self.coerce_to_string_bytes(v).map_err(GenAbrupt::from)?;
+                acc.extend_from_slice(&bytes);
+                stack.push(Step::TemplateLit {
+                    tpl,
+                    idx: idx + 1,
+                    acc,
+                });
+                Ok(StepOut::Continue)
+            }
             Step::CallArgs {
                 func,
                 arguments,
@@ -3843,17 +3925,14 @@ impl<'a> Interp<'a> {
                     self.coerce_to_object(obj)
                 };
                 // Run the body in a child scope carrying the `with` object (so the
-                // object is captured lexically). A PopScope step restores the
-                // parent scope for the suspended case.
+                // object is captured lexically). `gen_exec_stmt` only *pushes* the
+                // body's steps, so the scope must stay current until they have all
+                // run — the `PopScope` step beneath them restores it, on the
+                // suspended path as well as the synchronous one.
                 let child = self.current.child_with(obj);
                 let saved = core::mem::replace(&mut self.current, child);
-                stack.push(Step::PopScope {
-                    scope: saved.clone(),
-                });
-                let r = self.gen_exec_stmt(body, stack, values, &None);
-                // Restore eagerly on the synchronous path.
-                self.current = saved;
-                r
+                stack.push(Step::PopScope { scope: saved });
+                self.gen_exec_stmt(body, stack, values, &None)
             }
             // Module top-level statements reached when a module body with
             // top-level `await` is driven on this coroutine engine. An `import`
@@ -4176,6 +4255,35 @@ impl<'a> Interp<'a> {
                 stack.push(Step::BinaryOp { op: *op });
                 stack.push(Step::EvalThen { expr: right });
                 self.gen_eval_expr(left, stack, values)
+            }
+            // `import(yield)` / `import('', yield)` — step both arguments so a
+            // suspension parks *before* the import is issued: an abrupt completion
+            // at that point must skip the import entirely.
+            #[cfg(all(feature = "module", feature = "std"))]
+            Expr::Call {
+                callee,
+                arguments,
+                optional: false,
+                ..
+            } if matches!(&**callee, Expr::Ident(id) if id.name.as_ref() == "import") => {
+                stack.push(Step::DynamicImportOptions { arguments });
+                match arguments.first() {
+                    Some(crate::ast::Argument::Item(e)) => self.gen_eval_expr(e, stack, values),
+                    _ => {
+                        values.push(NanBox::undefined());
+                        Ok(StepOut::Continue)
+                    }
+                }
+            }
+            // `` `a${yield}b` `` — append each quasi and step each substitution, so
+            // a `yield`/`await` in any of them suspends mid-string.
+            Expr::Template(tpl) => {
+                stack.push(Step::TemplateLit {
+                    tpl,
+                    idx: 0,
+                    acc: Vec::new(),
+                });
+                Ok(StepOut::Continue)
             }
             // `[a, yield b, ...yield c]` — evaluate each element step-by-step so a
             // yield in any position (including a spread operand) suspends.
@@ -4710,8 +4818,20 @@ impl<'a> Interp<'a> {
     /// is driven as an AsyncFromSyncIterator: each result value is unwrapped
     /// (awaited) per step in `gen_yield_star_step`.
     fn gen_delegate_iter(&mut self, operand: NanBox) -> Result<(Handle, bool), ExecError> {
-        let Some(h) = operand.as_handle().map(Handle::from_raw) else {
-            return Err(self.type_error("yield* operand is not iterable"));
+        // GetIterator reads `[Symbol.iterator]` off the *value*, so a primitive
+        // operand resolves the method through its wrapper prototype
+        // (`Boolean.prototype[Symbol.iterator] = …; yield* true`). Only `null` /
+        // `undefined` have no wrapper. The method is still called with the
+        // original primitive as its receiver.
+        let h = match operand.as_handle() {
+            Some(raw) => Handle::from_raw(raw),
+            None if !(operand.is_null() || operand.is_undefined()) => {
+                match self.coerce_to_object(operand).as_handle() {
+                    Some(raw) => Handle::from_raw(raw),
+                    None => return Err(self.type_error("yield* operand is not iterable")),
+                }
+            }
+            None => return Err(self.type_error("yield* operand is not iterable")),
         };
         // In an async generator, `yield*` uses GetIterator(operand, async): a
         // callable `[Symbol.asyncIterator]` is used directly; a non-callable (but

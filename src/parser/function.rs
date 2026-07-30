@@ -135,14 +135,19 @@ impl<'src> Parser<'src> {
                 TokenKind::LParen => self.paren_arrow_at(1),
                 // `async =>` — `async` itself is the parameter name.
                 TokenKind::Arrow => true,
-                // `async of => …` — a contextual keyword (`of`, `as`, `get`, …) is a
-                // valid single async-arrow parameter name.
-                TokenKind::Keyword(kw) if kw.is_contextual() => {
+                // `async of => …` — any keyword usable as a `BindingIdentifier`
+                // here (`of`, `as`, `get`, sloppy `yield`/`let`, …) is a valid
+                // single async-arrow parameter name.
+                TokenKind::Keyword(kw) if self.keyword_is_binding_ident(kw) => {
                     self.nth_kind(2) == TokenKind::Arrow
                 }
                 _ => false,
             },
-            TokenKind::Keyword(kw) if kw.is_contextual() => self.nth_kind(1) == TokenKind::Arrow,
+            // `yield => 1` / `of => 1` — a single parameter spelled with a keyword
+            // that is an ordinary identifier in this context.
+            TokenKind::Keyword(kw) if self.keyword_is_binding_ident(kw) => {
+                self.nth_kind(1) == TokenKind::Arrow
+            }
             _ => false,
         }
     }

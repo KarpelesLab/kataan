@@ -2750,6 +2750,17 @@ impl Realm {
     /// the array carries no aux object.
     #[must_use]
     pub fn array_enumerable_indices(&self, handle: Handle) -> Option<Vec<usize>> {
+        // An integer-indexed exotic object (a typed array) keeps its elements in
+        // the backing buffer rather than an element `Vec`, but its own enumerable
+        // keys are still `"0".."length-1"` — so `Object.keys(ta)` and `for (k in
+        // ta)` list them. A detached or out-of-bounds view reports length 0.
+        if self
+            .heap
+            .get(handle)
+            .is_some_and(|c| c.as_typed_array().is_some())
+        {
+            return Some((0..self.typed_len(handle).unwrap_or(0)).collect());
+        }
         let a = self.heap.get(handle).and_then(Cell::as_array)?;
         // No aux object ⇒ no index was ever demoted ⇒ every present index enumerates.
         let hidden_owner = self

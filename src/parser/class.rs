@@ -269,6 +269,7 @@ impl<'src> Parser<'src> {
                     op: AssignOp::Assign,
                     target: Box::new(backing_member(span)),
                     value: Box::new(Expr::Ident(Ident::new(param_name, span))),
+                    paren_target: false,
                     span,
                 }),
                 span,

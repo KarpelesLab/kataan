@@ -618,6 +618,11 @@ pub struct Interp<'a> {
     /// parameter-default evaluation; cleared across function boundaries so a
     /// nested call / the body never sees the outer parameter set.
     eval_param_names: Option<Vec<String>>,
+    /// The stack of currently-executing user closures (innermost last), one entry
+    /// per live `invoke_inner`. Only used to serve the legacy `fn.caller`
+    /// extension (Annex B "normative optional"): the caller of a live invocation
+    /// of `fn` is the entry directly below its innermost occurrence.
+    fn_stack: Vec<NanBox>,
     /// A label attached to the next loop (for `break`/`continue label`).
     pending_label: Option<String>,
     /// The promise-reaction microtask queue, drained after the script.
@@ -3172,6 +3177,7 @@ impl<'a> Interp<'a> {
             current_home_object: None,
             in_field_initializer: false,
             eval_param_names: None,
+            fn_stack: Vec::new(),
             current_home_static: false,
             pending_label: None,
             microtasks: Vec::new(),
@@ -5792,6 +5798,38 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Mirrors an assignment to a global `var` binding onto the global object.
+    ///
+    /// The spec has one storage location: a global `var` *is* a property of the
+    /// global object. This engine keeps the binding in the global scope frame and
+    /// publishes a same-named property (see
+    /// [`publish_global_var`](Self::publish_global_var)), so every later write
+    /// through the identifier must refresh the property too — otherwise
+    /// `var b; b = 1;` leaves `globalThis.b` at its declaration-time value.
+    /// Restricted to names the global scope itself binds *and* the global object
+    /// already carries, so a local/`let`/`const` write never touches the object.
+    pub(crate) fn sync_global_var(&mut self, name: &str, value: NanBox) {
+        if !self.global_scope.has_local(name) {
+            return;
+        }
+        let Some(g) = self.global_this.as_handle().map(Handle::from_raw) else {
+            return;
+        };
+        if !self.realm.has_own(g, name) {
+            return;
+        }
+        // An inner frame may shadow the global binding — then the write did not
+        // land on the global one.
+        if !self
+            .current
+            .owner_frame(name)
+            .is_some_and(|f| f.ptr_eq(&self.global_scope))
+        {
+            return;
+        }
+        self.realm.set_property(g, name, value);
+    }
+
     /// Captures the object graph reachable from `roots` (the heap objects among
     /// them — primitives are skipped) and serializes it to portable bytes: a D′
     /// snapshot of live values that can later be reloaded into a fresh interpreter
@@ -5837,6 +5875,14 @@ impl<'a> Interp<'a> {
         // and `this === globalThis` behave per spec.
         if matches!(self.this_val.unpack(), Unpacked::Undefined) {
             self.this_val = self.global_this;
+        }
+        // GlobalDeclarationInstantiation runs for a Script *before* any of its
+        // bindings are created: a top-level `let`/`const`/`class` may not collide
+        // with an existing global lexical binding, a global var/function, or a
+        // restricted (non-configurable) global property — `let undefined;` is a
+        // SyntaxError. Same checks as the `$262.evalScript` path.
+        if self.current.ptr_eq(&self.global_scope) {
+            self.global_declaration_checks(program)?;
         }
         self.hoist_with(&program.body, true)?;
         let mut last = NanBox::undefined();
