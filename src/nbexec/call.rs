@@ -1326,6 +1326,16 @@ impl<'a> Interp<'a> {
                 // `Segments.prototype.containing(index)`: `target` is the segments
                 // array; return the segment-data object whose `[index, index+len)`
                 // range covers `index` (undefined out of range / non-integer).
+                // `Segments.prototype[@@iterator]()`: a Segment Iterator over the
+                // segments array `target` holds.
+                N_INTL_SEGMENTS_ITER => {
+                    let values = self
+                        .realm
+                        .array_elements(target)
+                        .map(<[_]>::to_vec)
+                        .unwrap_or_default();
+                    return Ok(self.make_builtin_iterator(values, "Segmenter String Iterator"));
+                }
                 N_INTL_SEGMENTS_CONTAINING => {
                     // `RequireInternalSlot(this, [[SegmentsSegmenter]])`: `this` must
                     // be a genuine Segments object (a foreign receiver — via

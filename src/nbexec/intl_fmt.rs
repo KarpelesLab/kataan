@@ -1658,6 +1658,28 @@ fn canonicalize_locale_id_structural(tag: &str) -> Option<String> {
         idx += 1;
     }
     variants.sort();
+    // UTS-35 canonicalizes the *syntax* first (variants sorted) and only then
+    // applies `languageAlias`, so a regular grandfathered tag whose second half
+    // has been re-sorted away from the language still has to be recognized:
+    // `art-lojban-fonipa` sorts to `art-fonipa-lojban`, and its `lojban` variant
+    // is what the alias rule matches (→ `jbo-fonipa`).
+    if let Some(pos) = variants
+        .iter()
+        .position(|v| grandfathered_canonical(&alloc::format!("{language}-{v}")).is_some())
+    {
+        let repl = grandfathered_canonical(&alloc::format!("{language}-{}", variants[pos]))?;
+        let mut rebuilt = String::from(repl);
+        for (i, p) in parts.iter().enumerate() {
+            // Drop the original language subtag and the matched variant; every
+            // other subtag (script/region/other variants/extensions) rides along.
+            if i == 0 || p.eq_ignore_ascii_case(&variants[pos]) {
+                continue;
+            }
+            rebuilt.push('-');
+            rebuilt.push_str(p);
+        }
+        return canonicalize_locale_id_structural(&rebuilt);
+    }
 
     // Extensions and private use: singleton (alphanum) followed by subtags.
     // Each singleton may appear once; `u`/`t` have their own subtag grammars but
@@ -2608,9 +2630,8 @@ impl<'a> Interp<'a> {
         // the default. A malformed tag raises a RangeError here.
         let requested =
             self.canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?;
-        let locale = requested
-            .into_iter()
-            .next()
+        let locale = self
+            .lookup_available_locale(&requested)
             .unwrap_or_else(|| String::from("en-US"));
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
@@ -3280,7 +3301,7 @@ impl<'a> Interp<'a> {
     /// (possibly shifted) epoch milliseconds to decompose.
     #[cfg(feature = "intl")]
     fn dtf_apply_temporal_zone(
-        &self,
+        &mut self,
         handle: Handle,
         ms: f64,
         kind: crate::temporal_iso::TemporalKind,
@@ -3289,9 +3310,19 @@ impl<'a> Interp<'a> {
         use crate::temporal_iso::TemporalKind;
         if matches!(kind, TemporalKind::Instant | TemporalKind::ZonedDateTime) {
             let off = self.dtf_zone_offset_ms(handle, ms as i64);
-            if o.time_zone_name.is_some() {
-                o.tz_offset_minutes = Some((off / 60_000) as i32);
+            // Only an exact instant carries a zone; the plain types leave both
+            // fields unset so the crate strips the pattern's zone field instead of
+            // filling it (a `timeStyle: "long"` PlainDateTime shows no zone name).
+            if let Some(tz) = self
+                .realm
+                .get_property(handle, "timeZone")
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .map(|v| self.realm.to_display_string(v))
+                .filter(|t| !t.is_empty())
+            {
+                o.time_zone = Some(self.intern_static(&tz));
             }
+            o.tz_offset_minutes = Some((off / 60_000) as i32);
             ms + off as f64
         } else {
             ms
@@ -4348,9 +4379,8 @@ impl<'a> Interp<'a> {
         // 1. CanonicalizeLocaleList(locales) — a malformed tag raises a RangeError.
         let requested =
             self.canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?;
-        let locale = requested
-            .into_iter()
-            .next()
+        let locale = self
+            .lookup_available_locale(&requested)
             .unwrap_or_else(|| String::from("en-US"));
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
@@ -4456,9 +4486,8 @@ impl<'a> Interp<'a> {
         // TypeError/RangeError); the resolved locale is the first requested tag.
         let requested =
             self.canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?;
-        let locale = requested
-            .into_iter()
-            .next()
+        let locale = self
+            .lookup_available_locale(&requested)
             .unwrap_or_else(|| String::from("en"));
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
@@ -4544,10 +4573,10 @@ impl<'a> Interp<'a> {
         let marker = self.new_str("collator");
         self.realm.set_hidden_property(obj, "\u{0}intl", marker);
         // 1. CanonicalizeLocaleList(locales) — a malformed tag raises a RangeError.
+        let requested =
+            self.canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?;
         let locale = self
-            .canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?
-            .into_iter()
-            .next()
+            .lookup_available_locale(&requested)
             .unwrap_or_else(|| String::from("en"));
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
@@ -4762,9 +4791,8 @@ impl<'a> Interp<'a> {
         // 1. CanonicalizeLocaleList(locales) — a malformed tag raises a RangeError.
         let requested =
             self.canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?;
-        let locale = requested
-            .into_iter()
-            .next()
+        let locale = self
+            .lookup_available_locale(&requested)
             .unwrap_or_else(|| String::from("en-US"));
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
@@ -4951,9 +4979,8 @@ impl<'a> Interp<'a> {
         // resolved locale is the first requested tag, else the default.
         let requested =
             self.canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?;
-        let locale = requested
-            .into_iter()
-            .next()
+        let locale = self
+            .lookup_available_locale(&requested)
             .unwrap_or_else(|| String::from("en"));
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
@@ -5124,10 +5151,10 @@ impl<'a> Interp<'a> {
     pub(crate) fn init_segmenter(&mut self, obj: Handle, args: &[NanBox]) -> Result<(), ExecError> {
         // 1. CanonicalizeLocaleList(locales) — a malformed tag / non-string,
         //    non-object element raises a RangeError/TypeError.
+        let requested =
+            self.canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?;
         let locale = self
-            .canonicalize_locale_list(args.first().copied().unwrap_or(NanBox::undefined()))?
-            .into_iter()
-            .next()
+            .lookup_available_locale(&requested)
             .unwrap_or_else(|| String::from("en"));
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
@@ -5183,7 +5210,78 @@ impl<'a> Interp<'a> {
         if let Some(p) = self.lunisolar_parts(handle, &locale, &dt, &o) {
             return p;
         }
-        Self::dtf_crate_parts(&locale, &dt, &o)
+        let mut parts = Self::dtf_crate_parts(&locale, &dt, &o);
+        self.rewrite_calendar_numerics(handle, &dt, &o, &mut parts);
+        parts
+    }
+
+    /// Re-express the numeric `year`/`month`/`day` parts in the instance's
+    /// resolved calendar. The `intl` crate renders only proleptic Gregorian
+    /// fields, so a `calendar: "buddhist"` formatter would otherwise report the
+    /// ISO year (2050 rather than 2593) — and the same for every other arithmetic
+    /// calendar the engine already implements for Temporal. Only *numeric*
+    /// renderings are rewritten: a month **name** is CLDR data the crate does not
+    /// expose per calendar, so it is left as it came.
+    ///
+    /// The year is the era-relative one when the calendar has eras
+    /// (`date.eraYear ?? date.year`, as `Temporal.PlainDate` reports it).
+    #[cfg(feature = "intl")]
+    fn rewrite_calendar_numerics(
+        &self,
+        handle: Handle,
+        dt: &intl::datetime::DateTime,
+        o: &intl::datetime::DateTimeFormatOptions,
+        parts: &mut [(&'static str, String)],
+    ) {
+        use crate::temporal_iso::IsoDate;
+        use intl::datetime::Numeric2Digit;
+        let cal = self.dtf_resolved_calendar(handle);
+        // ISO/Gregorian already agree with the crate; the lunisolar calendars are
+        // rendered by `lunisolar_parts`, which never reaches here.
+        if matches!(cal.as_str(), "gregory" | "iso8601" | "chinese" | "dangi") {
+            return;
+        }
+        let f = crate::nbexec::temporal_calendar::iso_to_fields(
+            &cal,
+            IsoDate {
+                year: dt.year,
+                month: dt.month,
+                day: dt.day,
+            },
+        );
+        let two_digit = |v: i64| alloc::format!("{:02}", v.rem_euclid(100));
+        for (kind, value) in parts.iter_mut() {
+            // A field the crate rendered non-numerically (a month name, an era) is
+            // left alone — there is no per-calendar CLDR text to replace it with.
+            if !value.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            match *kind {
+                "year" => {
+                    let y = f.era_year.unwrap_or(f.year);
+                    *value = if o.year == Some(Numeric2Digit::TwoDigit) {
+                        two_digit(y)
+                    } else {
+                        alloc::format!("{y}")
+                    };
+                }
+                "month" => {
+                    *value = if value.len() == 2 {
+                        two_digit(f.month)
+                    } else {
+                        alloc::format!("{}", f.month)
+                    };
+                }
+                "day" => {
+                    *value = if value.len() == 2 {
+                        two_digit(f.day)
+                    } else {
+                        alloc::format!("{}", f.day)
+                    };
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Runs the `intl` crate's CLDR date-time formatter and repairs the shapes it
@@ -5210,6 +5308,9 @@ impl<'a> Interp<'a> {
                 None => Vec::new(),
             };
         }
+        // An explicit hour cycle has to reach a `timeStyle` pattern too.
+        let synthesized = Self::time_style_cycle_options(locale, dt, o);
+        let o = synthesized.as_ref().unwrap_or(o);
         let mut parts = match intl::datetime::format_to_parts(locale, dt, o) {
             Ok(parts) => dtf_pad_time_parts(parts),
             Err(_) => Vec::new(),
@@ -5219,6 +5320,7 @@ impl<'a> Interp<'a> {
         {
             return p;
         }
+        Self::widen_pattern_hour(locale, o, &mut parts);
         // Midnight correction (see [`day_period_text`]).
         if o.day_period.is_some()
             && dt.hour == 0
@@ -5233,6 +5335,113 @@ impl<'a> Interp<'a> {
         }
         Self::fix_bce_era_year(dt, &mut parts);
         parts
+    }
+
+    /// The crate honours `hour_cycle`/`hour12` only on the skeleton path, so a
+    /// `timeStyle` pattern keeps the locale's own clock:
+    /// `new Intl.DateTimeFormat("en-US-u-hc-h23", { timeStyle: "medium" })` renders
+    /// `2:12:47 PM` instead of `14:12:47`. When an explicit cycle disagrees with the
+    /// clock the style pattern actually used, re-express the style as the equivalent
+    /// component options — which the crate *does* apply the cycle to. Returns `None`
+    /// (keep the style) when there is no explicit cycle, no disagreement, or a
+    /// `dateStyle` is also in play (its date+time glue pattern is crate-internal).
+    #[cfg(feature = "intl")]
+    fn time_style_cycle_options(
+        locale: &str,
+        dt: &intl::datetime::DateTime,
+        o: &intl::datetime::DateTimeFormatOptions,
+    ) -> Option<intl::datetime::DateTimeFormatOptions> {
+        use intl::datetime::{
+            DateStyle, DateTimeFormatOptions, DateTimePartType, HourCycle, Numeric2Digit,
+            TimeZoneNameStyle,
+        };
+        let ts = o.time_style?;
+        if o.date_style.is_some() {
+            return None;
+        }
+        let want12 = match (o.hour_cycle, o.hour12) {
+            (Some(HourCycle::H11 | HourCycle::H12), _) => true,
+            (Some(HourCycle::H23 | HourCycle::H24), _) => false,
+            (None, Some(b)) => b,
+            (None, None) => return None,
+        };
+        let styled = intl::datetime::format_to_parts(locale, dt, o).ok()?;
+        if styled.iter().any(|p| p.kind == DateTimePartType::DayPeriod) == want12 {
+            return None;
+        }
+        // UTS #35's four time styles are hour+minute (+second above `short`), with
+        // the zone name the pattern's own `z`/`zzzz` field carries.
+        let mut n = DateTimeFormatOptions::default();
+        n.hour_cycle = o.hour_cycle;
+        n.hour12 = o.hour12;
+        n.hour = Some(Numeric2Digit::Numeric);
+        n.minute = Some(Numeric2Digit::TwoDigit);
+        if !matches!(ts, DateStyle::Short) {
+            n.second = Some(Numeric2Digit::TwoDigit);
+        }
+        n.fractional_second_digits = o.fractional_second_digits;
+        n.time_zone = o.time_zone;
+        n.tz_offset_minutes = o.tz_offset_minutes;
+        n.time_zone_name = match ts {
+            DateStyle::Full => Some(TimeZoneNameStyle::Long),
+            DateStyle::Long => Some(TimeZoneNameStyle::Short),
+            _ => None,
+        };
+        Some(n)
+    }
+
+    /// ECMA-402 takes the *pattern's* hour width, only widening it when the caller
+    /// asked for `2-digit`: `{hour: "numeric", hourCycle: "h23"}` renders `09:30` in
+    /// `en` (CLDR `Hm` is `HH:mm`) but `9:30` in `he`/`fi`/`hu`/`cs`/`vi` (`H:mm`).
+    /// The crate instead forces the hour run to the requested length, so a
+    /// `numeric` request loses the pattern's leading zero. Recover the pattern's own
+    /// width from the matching CLDR skeleton (`H`/`Hm`/`Hms`) and pad to it.
+    ///
+    /// Only the 24-hour patterns need this — every CLDR 12-hour pattern uses a
+    /// single `h` — so the rendered parts having no `dayPeriod` is the test for
+    /// "this is the `H` family".
+    #[cfg(feature = "intl")]
+    fn widen_pattern_hour(
+        locale: &str,
+        o: &intl::datetime::DateTimeFormatOptions,
+        parts: &mut [(&'static str, String)],
+    ) {
+        use intl::datetime::{DateTime, Numeric2Digit};
+        if o.hour != Some(Numeric2Digit::Numeric) {
+            return;
+        }
+        if parts.iter().any(|(t, _)| *t == "dayPeriod") {
+            return;
+        }
+        let Some(hour) = parts
+            .iter_mut()
+            .find(|(t, v)| *t == "hour" && v.len() == 1 && v.as_bytes()[0].is_ascii_digit())
+        else {
+            return;
+        };
+        let mut skeleton = String::from("H");
+        if o.minute.is_some() {
+            skeleton.push('m');
+        }
+        if o.second.is_some() {
+            skeleton.push('s');
+        }
+        // A single-digit hour in the probe date exposes whether the pattern pads.
+        let probe = DateTime {
+            year: 2000,
+            month: 1,
+            day: 1,
+            hour: 9,
+            minute: 30,
+            second: 45,
+            millisecond: 0,
+        };
+        let padded = intl::datetime::format_skeleton_to_parts(locale, &probe, &skeleton)
+            .into_iter()
+            .any(|p| p.kind == intl::datetime::DateTimePartType::Hour && p.value == "09");
+        if padded {
+            hour.1.insert(0, '0');
+        }
     }
 
     /// The proleptic Gregorian calendar has no year 0, so UTS #35's `y` field is
@@ -5492,13 +5701,33 @@ impl<'a> Interp<'a> {
                 Unpacked::Bool(b) => Some(b),
                 _ => None,
             });
-        o.hour_cycle = opt(self, "hourCycle").as_deref().and_then(|s| match s {
-            "h11" => Some(HourCycle::H11),
-            "h12" => Some(HourCycle::H12),
-            "h23" => Some(HourCycle::H23),
-            "h24" => Some(HourCycle::H24),
-            _ => None,
-        });
+        // `ResolveLocale`: the `hourCycle` option outranks the tag's `-u-hc-`
+        // keyword, and `hour12` outranks both (ECMA-402 sets `[[HourCycle]]` from
+        // `hour12` and discards the cycle). The crate resolves neither from the tag,
+        // so the keyword has to be lifted into the option here.
+        let hc_ext = split_u_keyword(&locale, "hc").1;
+        o.hour_cycle = if o.hour12.is_some() {
+            None
+        } else {
+            opt(self, "hourCycle")
+                .or(hc_ext)
+                .as_deref()
+                .and_then(|s| match s {
+                    "h11" => Some(HourCycle::H11),
+                    "h12" => Some(HourCycle::H12),
+                    "h23" => Some(HourCycle::H23),
+                    "h24" => Some(HourCycle::H24),
+                    _ => None,
+                })
+        };
+        // The zone is supplied unconditionally, not just when `timeZoneName` was
+        // requested: a `timeStyle: "full"`/`"long"` pattern carries its own zone
+        // field (`h:mm:ss a zzzz`), and the crate fills it from `time_zone` /
+        // `tz_offset_minutes` — with neither, it strips the field instead.
+        if let Some(tz) = opt(self, "timeZone").filter(|t| !t.is_empty()) {
+            o.time_zone = Some(self.intern_static(&tz));
+        }
+        o.tz_offset_minutes = Some((zone_off_ms / 60_000) as i32);
         if let Some(tzn) = opt(self, "timeZoneName") {
             o.time_zone_name = match tzn.as_str() {
                 "long" => Some(TimeZoneNameStyle::Long),
@@ -5509,7 +5738,6 @@ impl<'a> Interp<'a> {
                 "longGeneric" => Some(TimeZoneNameStyle::LongGeneric),
                 _ => None,
             };
-            o.tz_offset_minutes = Some((zone_off_ms / 60_000) as i32);
         }
         (locale, dt, o)
     }
@@ -5843,6 +6071,29 @@ impl<'a> Interp<'a> {
             _ => MonthStyle::Numeric,
         };
 
+        // `GetDateTimeFormat(dtf, required, defaults, inherit)` with `inherit` =
+        // ~all~ (the `Temporal.<Type>.prototype.toLocaleString` entry point) keeps
+        // every option, so a style outside the type's data model makes the format
+        // *null*: a date-only type rejects `timeStyle`, `PlainTime` rejects
+        // `dateStyle`. `Intl.DateTimeFormat.prototype.format` passes ~relevant~
+        // instead, which simply drops the out-of-model style.
+        let inherit_all = self
+            .realm
+            .get_property(handle, "\u{0}dtf_inherit_all")
+            .and_then(|v| v.as_boolean())
+            .unwrap_or(false);
+        let style_mismatch = inherit_all
+            && match kind {
+                TemporalKind::PlainDate
+                | TemporalKind::PlainYearMonth
+                | TemporalKind::PlainMonthDay => ts,
+                TemporalKind::PlainTime => ds,
+                _ => false,
+            };
+        if style_mismatch {
+            return None;
+        }
+
         let mut o = DateTimeFormatOptions::default();
         match kind {
             TemporalKind::PlainDate => {
@@ -5978,7 +6229,6 @@ impl<'a> Interp<'a> {
                     o.second = Some(Numeric2Digit::Numeric);
                     if kind == TemporalKind::ZonedDateTime && tz_name.is_none() {
                         o.time_zone_name = Some(TimeZoneNameStyle::Short);
-                        o.tz_offset_minutes = Some(0); // engine is UTC-only
                     }
                 } else {
                     if ds {
@@ -6011,7 +6261,6 @@ impl<'a> Interp<'a> {
                         "longGeneric" => Some(TimeZoneNameStyle::LongGeneric),
                         _ => None,
                     };
-                    o.tz_offset_minutes = Some(0); // engine is UTC-only
                 }
                 return Some(o);
             }
@@ -6061,7 +6310,9 @@ impl<'a> Interp<'a> {
         if let Some(alt) = self.alt_calendar_date_parts(handle, &locale, &dt, o) {
             return alt;
         }
-        Self::dtf_crate_parts(&locale, &dt, o)
+        let mut parts = Self::dtf_crate_parts(&locale, &dt, o);
+        self.rewrite_calendar_numerics(handle, &dt, o, &mut parts);
+        parts
     }
 
     /// Renders the date portion of a Temporal object whose resolved `Intl`
@@ -6194,15 +6445,65 @@ impl<'a> Interp<'a> {
     ) -> Result<NanBox, ExecError> {
         let locales = args.first().copied().unwrap_or(NanBox::undefined());
         let options = args.get(1).copied().unwrap_or(NanBox::undefined());
+        // `Temporal.ZonedDateTime.prototype.toLocaleString` formats in the
+        // *instance's* zone, so the options bag may not carry a `timeZone` of its
+        // own — even one that agrees with the instance's.
+        let zdt_zone = this
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.temporal_at(h))
+            .filter(|d| d.kind == crate::temporal_iso::TemporalKind::ZonedDateTime)
+            .and_then(|d| d.tz.clone());
+        if zdt_zone.is_some()
+            && let Some(oh) = options.as_handle().map(Handle::from_raw)
+            && self.is_object_value(options)
+            && !matches!(
+                self.read_member(oh, "timeZone")?.unpack(),
+                Unpacked::Undefined
+            )
+        {
+            return Err(self.type_error(
+                "Temporal.ZonedDateTime.prototype.toLocaleString does not accept a timeZone option",
+            ));
+        }
         let fmt_args = [locales, options];
         let inst = self.make_intl_formatter(N_INTL_DATETIME_FORMAT, &fmt_args)?;
         let Some(h) = inst.as_handle().map(Handle::from_raw) else {
             return Ok(self.new_str(""));
         };
+        // `toLocaleString` inherits *all* of the options bag (see
+        // `temporal_plain_options`), unlike `Intl.DateTimeFormat.prototype.format`.
+        self.realm
+            .set_hidden_property(h, "\u{0}dtf_inherit_all", NanBox::boolean(true));
+        // The instance's zone replaces the formatter's resolved (default) one.
+        if let Some(tz) = zdt_zone {
+            let tzv = self.new_str(&tz);
+            self.realm.set_hidden_property(h, "timeZone", tzv);
+        }
         // `toLocaleString` accepts a `ZonedDateTime` (unlike `format`).
         let s = self
             .temporal_format_flat(h, this, true)?
             .unwrap_or_default();
+        Ok(self.new_str(&s))
+    }
+
+    /// `Temporal.Duration.prototype.toLocaleString(locales, options)`: identical to
+    /// `new Intl.DurationFormat(locales, options).format(this)`.
+    #[cfg(feature = "intl")]
+    pub(crate) fn duration_to_locale_string(
+        &mut self,
+        this: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let locales = args.first().copied().unwrap_or(NanBox::undefined());
+        let options = args.get(1).copied().unwrap_or(NanBox::undefined());
+        let df = self.make_duration_format(&[locales, options])?;
+        let Some(h) = df.as_handle().map(Handle::from_raw) else {
+            return Ok(self.new_str(""));
+        };
+        let rec = self.read_duration_record(this)?;
+        let parts = self.partition_duration(h, &rec);
+        let s: String = parts.into_iter().map(|(_, v, _)| v).collect();
         Ok(self.new_str(&s))
     }
 
@@ -6696,21 +6997,6 @@ impl<'a> Interp<'a> {
         o
     }
 
-    /// Whether an `Intl.NumberFormat` instance must use the hand-rolled path rather than the
-    /// `intl` crate: `style: "unit"` isn't yet faithfully rendered by `intl::number::format`
-    /// (narrow unit patterns are missing). `notation: "compact"` goes through the crate now,
-    /// with its mantissa re-rounded by [`compact_reround_parts`] to the ECMA-402 default.
-    #[cfg(feature = "intl")]
-    pub(crate) fn number_uses_handrolled(&mut self, handle: Handle) -> bool {
-        let get = |this: &mut Self, k: &str| -> Option<String> {
-            this.realm
-                .get_property(handle, k)
-                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
-                .map(|v| this.realm.to_display_string(v))
-        };
-        get(self, "style").as_deref() == Some("unit")
-    }
-
     /// Formats `n` per an `Intl.NumberFormat` instance. With the `intl` crate, all styles
     /// except those in [`number_uses_handrolled`](Self::number_uses_handrolled) go through
     /// `intl::number::format` (CLDR, locale-aware, full ECMA-402 options); the rest, and the
@@ -7068,118 +7354,123 @@ impl<'a> Interp<'a> {
         rounded
     }
 
+    #[cfg(feature = "intl")]
     fn intl_format_number_inner(&mut self, handle: Handle, n: f64) -> String {
-        #[cfg(feature = "intl")]
-        if !self.number_uses_handrolled(handle) {
-            let locale = self
+        let locale = self
+            .realm
+            .get_property(handle, "\u{0}locale")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("en"));
+        let mut opts = self.number_format_options(handle);
+        // Round the value's shortest round-trip decimal ourselves (ECMA-402 /
+        // ICU rounding) and hand the crate a "clean" value — this fixes the
+        // crate's binary-expansion rounding boundary (`1.15` → `1.2`, not `1.1`)
+        // and applies `roundingIncrement` (which the crate has no option for).
+        let n = self.number_precision_round(handle, &mut opts, n);
+        // `trailingZeroDisplay: "stripIfInteger"`: an integer value drops its
+        // forced trailing fraction (and significant) zeros. The intl crate has
+        // no such option, so lower the minimum digit counts for this value.
+        if n.is_finite() && n.fract() == 0.0 {
+            let tzd = self
                 .realm
-                .get_property(handle, "\u{0}locale")
+                .get_property(handle, "trailingZeroDisplay")
                 .map(|v| self.realm.to_display_string(v))
-                .unwrap_or_else(|| String::from("en"));
-            let mut opts = self.number_format_options(handle);
-            // Round the value's shortest round-trip decimal ourselves (ECMA-402 /
-            // ICU rounding) and hand the crate a "clean" value — this fixes the
-            // crate's binary-expansion rounding boundary (`1.15` → `1.2`, not `1.1`)
-            // and applies `roundingIncrement` (which the crate has no option for).
-            let n = self.number_precision_round(handle, &mut opts, n);
-            // `trailingZeroDisplay: "stripIfInteger"`: an integer value drops its
-            // forced trailing fraction (and significant) zeros. The intl crate has
-            // no such option, so lower the minimum digit counts for this value.
-            if n.is_finite() && n.fract() == 0.0 {
-                let tzd = self
-                    .realm
-                    .get_property(handle, "trailingZeroDisplay")
-                    .map(|v| self.realm.to_display_string(v))
-                    .unwrap_or_default();
-                if tzd == "stripIfInteger" {
-                    opts.minimum_fraction_digits = Some(0);
-                    if opts.minimum_significant_digits.is_some() {
-                        opts.minimum_significant_digits = Some(1);
-                    }
+                .unwrap_or_default();
+            if tzd == "stripIfInteger" {
+                opts.minimum_fraction_digits = Some(0);
+                if opts.minimum_significant_digits.is_some() {
+                    opts.minimum_significant_digits = Some(1);
                 }
             }
-            // `intl` 0.5 panics formatting a true negative zero. Substitute the
-            // smallest negative subnormal (which rounds to a displayed zero) so the
-            // crate applies the locale's negative affix (e.g. ar's U+200E mark) and
-            // the resolved `signDisplay` logic uniformly, instead of us hand-rolling
-            // the sign and losing locale marks.
-            let n = if n == 0.0 && n.is_sign_negative() {
-                -f64::from_bits(1)
-            } else {
-                n
-            };
-            // Default compact notation: render via the tagged parts so the mantissa
-            // can be re-rounded to the ECMA-402 default precision (the crate's plain
-            // string path keeps a single fraction digit — `987654321` → `987.7M`
-            // instead of `988M`). NaN/∞ carry no mantissa and fall through.
-            if n.is_finite() && compact_wants_reround(&opts) {
-                let mut o = opts;
-                o.maximum_fraction_digits = Some(6);
-                let mut parts: Vec<(&'static str, String)> =
-                    intl::number::format_to_parts(&locale, n, &o)
-                        .into_iter()
-                        .map(|p| (p.kind.as_str(), p.value))
-                        .collect();
-                compact_reround_parts(&mut parts, opts.rounding_mode);
-                // Return latn digits; the caller (`intl_format_number`) applies the
-                // numbering system.
-                return parts.into_iter().map(|(_, v)| v).collect();
-            }
-            let formatted = intl::number::format(&locale, n, &opts);
-            // A small-magnitude negative that rounds to a displayed zero
-            // (e.g. -0.0001 → "0", or -0.004 currency → "$0.00") carries no sign
-            // under signDisplay "negative"/"never"/"exceptZero" — only "auto"/
-            // "always" sign a zero. The intl crate keeps the input value's minus,
-            // so strip it when every rendered digit is zero. (A literal -0 is
-            // handled by the negative-zero branch above; -∞/NaN have no digits.)
-            if formatted.starts_with('-') && n.is_finite() {
-                let digits = formatted.bytes().filter(u8::is_ascii_digit);
-                let mut any = false;
-                let all_zero = digits.inspect(|_| any = true).all(|b| b == b'0');
-                if any && all_zero {
-                    let sd = self
-                        .realm
-                        .get_property(handle, "signDisplay")
-                        .map(|v| self.realm.to_display_string(v))
-                        .unwrap_or_default();
-                    if matches!(sd.as_str(), "negative" | "never" | "exceptZero") {
-                        return String::from(&formatted[1..]);
-                    }
-                }
-            }
-            // `signDisplay: "always"` signs a NaN as non-negative ("+NaN"); the
-            // intl crate leaves NaN unsigned (it signs ±∞ but not NaN). Only
-            // "always" signs NaN — "auto"/"never"/"exceptZero"/"negative" do not.
-            if n.is_nan()
-                && !formatted.starts_with(['+', '-'])
-                && self
+        }
+        // `intl` 0.5 panics formatting a true negative zero. Substitute the
+        // smallest negative subnormal (which rounds to a displayed zero) so the
+        // crate applies the locale's negative affix (e.g. ar's U+200E mark) and
+        // the resolved `signDisplay` logic uniformly, instead of us hand-rolling
+        // the sign and losing locale marks.
+        let n = if n == 0.0 && n.is_sign_negative() {
+            -f64::from_bits(1)
+        } else {
+            n
+        };
+        // Default compact notation: render via the tagged parts so the mantissa
+        // can be re-rounded to the ECMA-402 default precision (the crate's plain
+        // string path keeps a single fraction digit — `987654321` → `987.7M`
+        // instead of `988M`). NaN/∞ carry no mantissa and fall through.
+        if n.is_finite() && compact_wants_reround(&opts) {
+            let mut o = opts;
+            o.maximum_fraction_digits = Some(6);
+            let mut parts: Vec<(&'static str, String)> =
+                intl::number::format_to_parts(&locale, n, &o)
+                    .into_iter()
+                    .map(|p| (p.kind.as_str(), p.value))
+                    .collect();
+            compact_reround_parts(&mut parts, opts.rounding_mode);
+            // Return latn digits; the caller (`intl_format_number`) applies the
+            // numbering system.
+            return parts.into_iter().map(|(_, v)| v).collect();
+        }
+        let formatted = intl::number::format(&locale, n, &opts);
+        // A small-magnitude negative that rounds to a displayed zero
+        // (e.g. -0.0001 → "0", or -0.004 currency → "$0.00") carries no sign
+        // under signDisplay "negative"/"never"/"exceptZero" — only "auto"/
+        // "always" sign a zero. The intl crate keeps the input value's minus,
+        // so strip it when every rendered digit is zero. (A literal -0 is
+        // handled by the negative-zero branch above; -∞/NaN have no digits.)
+        if formatted.starts_with('-') && n.is_finite() {
+            let digits = formatted.bytes().filter(u8::is_ascii_digit);
+            let mut any = false;
+            let all_zero = digits.inspect(|_| any = true).all(|b| b == b'0');
+            if any && all_zero {
+                let sd = self
                     .realm
                     .get_property(handle, "signDisplay")
                     .map(|v| self.realm.to_display_string(v))
-                    .as_deref()
-                    == Some("always")
-            {
-                return alloc::format!("+{formatted}");
+                    .unwrap_or_default();
+                if matches!(sd.as_str(), "negative" | "never" | "exceptZero") {
+                    return String::from(&formatted[1..]);
+                }
             }
-            // `currencySign: "accounting"` renders a negative currency amount in the
-            // locale's accounting pattern. That pattern is CLDR-locale data: most
-            // locales inherit the root's parenthesized form (`($5.00)`), but some
-            // (e.g. de-DE: `-987,00 $`) keep the minus. The intl crate has no
-            // currencySign field, so approximate the parenthesizing locales here and
-            // leave the minus-locales on the crate's output.
-            if accounting_uses_parens(&locale)
-                && formatted.starts_with('-')
-                && self
-                    .realm
-                    .get_property(handle, "currencySign")
-                    .map(|v| self.realm.to_display_string(v))
-                    .as_deref()
-                    == Some("accounting")
-            {
-                return alloc::format!("({})", &formatted[1..]);
-            }
-            return formatted;
         }
+        // `signDisplay: "always"` signs a NaN as non-negative ("+NaN"); the
+        // intl crate leaves NaN unsigned (it signs ±∞ but not NaN). Only
+        // "always" signs NaN — "auto"/"never"/"exceptZero"/"negative" do not.
+        if n.is_nan()
+            && !formatted.starts_with(['+', '-'])
+            && self
+                .realm
+                .get_property(handle, "signDisplay")
+                .map(|v| self.realm.to_display_string(v))
+                .as_deref()
+                == Some("always")
+        {
+            return alloc::format!("+{formatted}");
+        }
+        // `currencySign: "accounting"` renders a negative currency amount in the
+        // locale's accounting pattern. That pattern is CLDR-locale data: most
+        // locales inherit the root's parenthesized form (`($5.00)`), but some
+        // (e.g. de-DE: `-987,00 $`) keep the minus. The intl crate has no
+        // currencySign field, so approximate the parenthesizing locales here and
+        // leave the minus-locales on the crate's output.
+        if accounting_uses_parens(&locale)
+            && formatted.starts_with('-')
+            && self
+                .realm
+                .get_property(handle, "currencySign")
+                .map(|v| self.realm.to_display_string(v))
+                .as_deref()
+                == Some("accounting")
+        {
+            return alloc::format!("({})", &formatted[1..]);
+        }
+        formatted
+    }
+
+    /// The no-`intl` fallback formatter: an en-US-shaped renderer covering the
+    /// `decimal`/`percent`/`currency`/`unit` styles, grouping, fraction digits and
+    /// `signDisplay`, with no CLDR data behind it.
+    #[cfg(not(feature = "intl"))]
+    fn intl_format_number_inner(&mut self, handle: Handle, n: f64) -> String {
         let opt_str = |this: &mut Self, k: &str| -> Option<String> {
             this.realm
                 .get_property(handle, k)
@@ -7521,6 +7812,30 @@ impl<'a> Interp<'a> {
         Ok(seen)
     }
 
+    /// ECMA-402 `ResolveLocale`'s LookupMatcher: the first requested tag whose
+    /// language CLDR actually has data for, else the default locale. Without it a
+    /// service would report an unsupported tag it cannot serve
+    /// (`new Intl.Segmenter(["xyz", "ar"]).resolvedOptions().locale` must be `"ar"`).
+    /// `[[AvailableLocales]]` is implementation-defined; ours is "CLDR knows this
+    /// language subtag", which is exactly the data the formatters fall back over.
+    pub(crate) fn lookup_available_locale(&self, requested: &[String]) -> Option<String> {
+        #[cfg(feature = "intl")]
+        {
+            requested
+                .iter()
+                .find(|tag| {
+                    let lang = tag.split(['-', '_']).next().unwrap_or("");
+                    lang.eq_ignore_ascii_case("und")
+                        || intl::display::language_name("en", lang).is_some()
+                })
+                .cloned()
+        }
+        #[cfg(not(feature = "intl"))]
+        {
+            requested.first().cloned()
+        }
+    }
+
     /// `Intl.getCanonicalLocales(locales)` — a fresh, mutable Array of the
     /// canonicalized tags.
     pub(crate) fn intl_get_canonical_locales(
@@ -7562,7 +7877,23 @@ impl<'a> Interp<'a> {
                 "VES", "VND", "VUV", "WST", "XAF", "XCD", "XOF", "XPF", "YER", "ZAR", "ZMW", "ZWL",
             ],
             "numberingSystem" => NUMBERING_SYSTEMS,
-            "timeZone" => &["UTC"],
+            // AvailablePrimaryTimeZoneIdentifiers: every IANA zone the embedded
+            // tzdb ships that is its own primary identifier (links resolve to
+            // their target and are therefore not reported), plus "UTC".
+            "timeZone" => {
+                let mut zones: Vec<String> = timezone_data::names()
+                    .filter(|n| {
+                        crate::nbexec::temporal_zoneddatetime::tz_primary(n) == *n
+                            && n.contains('/')
+                    })
+                    .map(String::from)
+                    .collect();
+                zones.push(String::from("UTC"));
+                zones.sort_unstable();
+                zones.dedup();
+                let elems: Vec<NanBox> = zones.iter().map(|s| self.new_str(s)).collect();
+                return Ok(NanBox::handle(self.realm.new_array(elems).to_raw()));
+            }
             "unit" => SANCTIONED_UNITS,
             _ => {
                 let m = self.new_str(&alloc::format!("invalid key: {k}"));
@@ -7803,12 +8134,13 @@ impl<'a> Interp<'a> {
         if let Some(fw) = &first_day {
             parsed.set_keyword("fw", fw);
         }
-        // Applying the options may turn the base into a regular grandfathered
-        // form (`cel` + variant `gaulish` → `cel-gaulish` → `xtg`); re-canonicalize
-        // and re-derive the components so the accessors reflect the replacement.
-        if grandfathered_canonical(&parsed.base_name()).is_some()
-            && let Some(canon) = canonicalize_locale_id(&parsed.to_tag())
-        {
+        // `ApplyOptionsToTag` ends in `CanonicalizeUnicodeLocaleId(tag)`: the
+        // option-assembled tag goes through the alias corpus again, so a numeric
+        // region becomes its alpha-2 form (`{region: "554"}` → `en-NZ`) and a base
+        // that the options turned into a regular grandfathered form gets replaced
+        // (`cel` + variant `gaulish` → `cel-gaulish` → `xtg`). Re-derive the
+        // components too, so the accessors reflect the replacement.
+        if let Some(canon) = canonicalize_locale_id(&parsed.to_tag()) {
             parsed = ParsedLocale::from_canonical(&canon);
         }
         let final_tag = parsed.to_tag();
@@ -7973,8 +8305,22 @@ impl<'a> Interp<'a> {
                 let mut pl = ParsedLocale::from_canonical(&tag);
                 #[cfg(feature = "intl")]
                 {
-                    let base = pl.base_name();
-                    if let Ok(loc) = intl::locale::Locale::parse(&base) {
+                    // Likely-subtags is a language/script/region operation; the
+                    // variant subtags ride along untouched. They are stripped from
+                    // the tag handed to the crate because its `minimize` builds its
+                    // trial candidates without variants, so a tag that has any
+                    // never matches its own maximization and is returned unchanged
+                    // (`en-Latn-US-fonipa` would not minimize to `en-fonipa`).
+                    let mut lsr = pl.language.clone();
+                    if let Some(sc) = &pl.script {
+                        lsr.push('-');
+                        lsr.push_str(sc);
+                    }
+                    if let Some(rg) = &pl.region {
+                        lsr.push('-');
+                        lsr.push_str(rg);
+                    }
+                    if let Ok(loc) = intl::locale::Locale::parse(&lsr) {
                         let result = if name == "maximize" {
                             loc.maximize()
                         } else {
@@ -7987,7 +8333,6 @@ impl<'a> Interp<'a> {
                         };
                         pl.script = result.script.clone();
                         pl.region = result.region.clone();
-                        pl.variants = result.variants.clone();
                     }
                 }
                 let new_tag = pl.to_tag();
@@ -8032,97 +8377,106 @@ impl<'a> Interp<'a> {
         parts
     }
 
+    #[cfg(feature = "intl")]
     fn number_handle_parts_inner(
         &mut self,
         handle: Handle,
         value: NanBox,
     ) -> Vec<(&'static str, String)> {
-        #[cfg(feature = "intl")]
-        if !self.number_uses_handrolled(handle) {
-            let n = self.realm.to_number(value);
-            let locale = self
-                .realm
-                .get_property(handle, "\u{0}locale")
-                .map(|v| self.realm.to_display_string(v))
-                .unwrap_or_else(|| String::from("en"));
-            let mut opts = self.number_format_options(handle);
-            // Pre-round to the ECMA-402 / ICU decimal (matches the `format` path).
-            let n = self.number_precision_round(handle, &mut opts, n);
-            // `intl` 0.5 panics formatting a true negative zero; feed the smallest
-            // negative subnormal (rounds to a displayed zero) so the crate emits the
-            // proper minusSign / locale marks and applies `signDisplay` itself.
-            let feed = if n == 0.0 && n.is_sign_negative() {
-                -f64::from_bits(1)
-            } else {
-                n
-            };
-            // Default compact notation: request full mantissa precision from the
-            // crate, then re-round to the ECMA-402 default (see the `format` path
-            // and [`compact_reround_parts`]).
-            let reround = feed.is_finite() && compact_wants_reround(&opts);
-            if reround {
-                opts.maximum_fraction_digits = Some(6);
-            }
-            let mut parts: Vec<(&'static str, String)> =
-                intl::number::format_to_parts(&locale, feed, &opts)
-                    .into_iter()
-                    .map(|p| (p.kind.as_str(), p.value))
-                    .collect();
-            if reround {
-                compact_reround_parts(&mut parts, opts.rounding_mode);
-            }
-            // Compact suffixes carry a separator space fused into the `compact`
-            // token; peel it into a `literal` part per ECMA-402 (applies whether or
-            // not the mantissa was re-rounded).
-            if matches!(opts.notation, intl::number::Notation::Compact) {
-                split_compact_affix_parts(&mut parts);
-            }
-            let sd = self
-                .realm
-                .get_property(handle, "signDisplay")
-                .map(|v| self.realm.to_display_string(v))
-                .unwrap_or_default();
-            // The crate leaves NaN unsigned; `signDisplay: "always"` prefixes a
-            // plusSign part ("+NaN"), matching the string `format` path.
-            if n.is_nan()
-                && sd == "always"
-                && !parts
-                    .iter()
-                    .any(|(t, _)| *t == "minusSign" || *t == "plusSign")
-            {
-                parts.insert(0, ("plusSign", String::from("+")));
-            }
-            // The crate aliases `signDisplay: "negative"` to `"auto"`, so it wrongly
-            // signs a value that rounds to a displayed zero; "negative"/"never"/
-            // "exceptZero" must not sign zero. Drop the minusSign in that case.
-            if matches!(sd.as_str(), "negative" | "never" | "exceptZero")
-                && parts.iter().any(|(t, _)| *t == "minusSign")
-                && !parts.iter().any(|(t, v)| {
-                    matches!(*t, "integer" | "fraction") && v.chars().any(|c| c != '0')
-                })
-                && !parts.iter().any(|(t, _)| matches!(*t, "nan" | "infinity"))
-            {
-                parts.retain(|(t, _)| *t != "minusSign");
-            }
-            // `currencySign: "accounting"` parenthesizes a negative amount in the
-            // parenthesizing locales (see `accounting_uses_parens`): the minusSign
-            // part becomes a leading `literal "("` and a trailing `literal ")"`.
-            let accounting = self
-                .realm
-                .get_property(handle, "currencySign")
-                .map(|v| self.realm.to_display_string(v))
-                .as_deref()
-                == Some("accounting");
-            if accounting
-                && accounting_uses_parens(&locale)
-                && parts.iter().any(|(t, _)| *t == "minusSign")
-            {
-                parts.retain(|(t, _)| *t != "minusSign");
-                parts.insert(0, ("literal", String::from("(")));
-                parts.push(("literal", String::from(")")));
-            }
-            return parts;
+        let n = self.realm.to_number(value);
+        let locale = self
+            .realm
+            .get_property(handle, "\u{0}locale")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("en"));
+        let mut opts = self.number_format_options(handle);
+        // Pre-round to the ECMA-402 / ICU decimal (matches the `format` path).
+        let n = self.number_precision_round(handle, &mut opts, n);
+        // `intl` 0.5 panics formatting a true negative zero; feed the smallest
+        // negative subnormal (rounds to a displayed zero) so the crate emits the
+        // proper minusSign / locale marks and applies `signDisplay` itself.
+        let feed = if n == 0.0 && n.is_sign_negative() {
+            -f64::from_bits(1)
+        } else {
+            n
+        };
+        // Default compact notation: request full mantissa precision from the
+        // crate, then re-round to the ECMA-402 default (see the `format` path
+        // and [`compact_reround_parts`]).
+        let reround = feed.is_finite() && compact_wants_reround(&opts);
+        if reround {
+            opts.maximum_fraction_digits = Some(6);
         }
+        let mut parts: Vec<(&'static str, String)> =
+            intl::number::format_to_parts(&locale, feed, &opts)
+                .into_iter()
+                .map(|p| (p.kind.as_str(), p.value))
+                .collect();
+        if reround {
+            compact_reround_parts(&mut parts, opts.rounding_mode);
+        }
+        // Compact suffixes carry a separator space fused into the `compact`
+        // token; peel it into a `literal` part per ECMA-402 (applies whether or
+        // not the mantissa was re-rounded).
+        if matches!(opts.notation, intl::number::Notation::Compact) {
+            split_compact_affix_parts(&mut parts);
+        }
+        let sd = self
+            .realm
+            .get_property(handle, "signDisplay")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_default();
+        // The crate leaves NaN unsigned; `signDisplay: "always"` prefixes a
+        // plusSign part ("+NaN"), matching the string `format` path.
+        if n.is_nan()
+            && sd == "always"
+            && !parts
+                .iter()
+                .any(|(t, _)| *t == "minusSign" || *t == "plusSign")
+        {
+            parts.insert(0, ("plusSign", String::from("+")));
+        }
+        // The crate aliases `signDisplay: "negative"` to `"auto"`, so it wrongly
+        // signs a value that rounds to a displayed zero; "negative"/"never"/
+        // "exceptZero" must not sign zero. Drop the minusSign in that case.
+        if matches!(sd.as_str(), "negative" | "never" | "exceptZero")
+            && parts.iter().any(|(t, _)| *t == "minusSign")
+            && !parts
+                .iter()
+                .any(|(t, v)| matches!(*t, "integer" | "fraction") && v.chars().any(|c| c != '0'))
+            && !parts.iter().any(|(t, _)| matches!(*t, "nan" | "infinity"))
+        {
+            parts.retain(|(t, _)| *t != "minusSign");
+        }
+        // `currencySign: "accounting"` parenthesizes a negative amount in the
+        // parenthesizing locales (see `accounting_uses_parens`): the minusSign
+        // part becomes a leading `literal "("` and a trailing `literal ")"`.
+        let accounting = self
+            .realm
+            .get_property(handle, "currencySign")
+            .map(|v| self.realm.to_display_string(v))
+            .as_deref()
+            == Some("accounting");
+        if accounting
+            && accounting_uses_parens(&locale)
+            && parts.iter().any(|(t, _)| *t == "minusSign")
+        {
+            parts.retain(|(t, _)| *t != "minusSign");
+            parts.insert(0, ("literal", String::from("(")));
+            parts.push(("literal", String::from(")")));
+        }
+        parts
+    }
+
+    /// The no-`intl` fallback for [`number_handle_parts`]: re-derives the parts
+    /// from the formatted string's structure (sign / integer-groups / decimal /
+    /// fraction / affixes), since there is no CLDR data to tag them with.
+    #[cfg(not(feature = "intl"))]
+    fn number_handle_parts_inner(
+        &mut self,
+        handle: Handle,
+        value: NanBox,
+    ) -> Vec<(&'static str, String)> {
         // Hand-rolled path: re-derive parts from the formatted string.
         let formatted = self.intl_format_value(handle, value);
         let style = self
@@ -8282,8 +8636,10 @@ impl<'a> Interp<'a> {
             let m = self.new_str("invalid numberingSystem");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
-        let (locale, numbering) =
-            self.resolve_duration_locale(requested.first().map(String::as_str), nu_opt.as_deref());
+        let (locale, numbering) = {
+            let picked = self.lookup_available_locale(&requested);
+            self.resolve_duration_locale(picked.as_deref(), nu_opt.as_deref())
+        };
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
         let nuv = self.new_str(&numbering);
@@ -8769,6 +9125,15 @@ impl<'a> Interp<'a> {
             .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_else(|| String::from("latn"));
+        // PartitionDurationFormatPattern composes the *instance's* locale into the
+        // per-unit NumberFormats and the joining ListFormat; using "en" here made
+        // every duration render with English unit names whatever the locale.
+        let df_locale = self
+            .realm
+            .get_property(h, "\u{0}locale")
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("en"));
         let fractional_digits = self
             .realm
             .get_property(h, "fractionalDigits")
@@ -8850,7 +9215,7 @@ impl<'a> Interp<'a> {
                 let nf = self.realm.new_object();
                 let marker = self.new_str("number");
                 self.realm.set_hidden_property(nf, "\u{0}intl", marker);
-                let loc = self.new_str("en");
+                let loc = self.new_str(&df_locale);
                 self.realm.set_hidden_property(nf, "\u{0}locale", loc);
                 let nuv = self.new_str(&numbering);
                 self.realm.set_hidden_property(nf, "numberingSystem", nuv);
@@ -8936,7 +9301,7 @@ impl<'a> Interp<'a> {
         let lf = self.realm.new_object();
         let lm = self.new_str("list");
         self.realm.set_hidden_property(lf, "\u{0}intl", lm);
-        let llo = self.new_str("en");
+        let llo = self.new_str(&df_locale);
         self.realm.set_hidden_property(lf, "\u{0}locale", llo);
         let lt = self.new_str("unit");
         self.realm.set_hidden_property(lf, "type", lt);

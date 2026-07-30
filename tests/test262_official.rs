@@ -874,25 +874,21 @@ fn manage_shard(
         if scan.done {
             break;
         }
-        match scan.crashed {
-            Some((idx, rel)) => {
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(outpath)
-                {
-                    let reason = if killed {
-                        hung_reason(IDLE_TIMEOUT_SECS)
-                    } else {
-                        String::from(
-                            "worker exited mid-test (native abort — a failed allocation \
-                             under the address-space cap, or a stack overflow)",
-                        )
-                    };
-                    let _ = writeln!(f, "R\t{idx}\t{rel}\tFAIL\t{reason}");
-                }
-            }
-            None => {}
+        if let Some((idx, rel)) = scan.crashed
+            && let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(outpath)
+        {
+            let reason = if killed {
+                hung_reason(IDLE_TIMEOUT_SECS)
+            } else {
+                String::from(
+                    "worker exited mid-test (native abort — a failed allocation \
+                     under the address-space cap, or a stack overflow)",
+                )
+            };
+            let _ = writeln!(f, "R\t{idx}\t{rel}\tFAIL\t{reason}");
         }
         // Resume at the first test in this shard with no result yet. Bumping
         // `start` blindly (what this used to do) both re-ran work and could step

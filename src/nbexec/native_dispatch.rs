@@ -3339,6 +3339,16 @@ impl<'a> Interp<'a> {
                 self.install_fn_name_length(containing, "containing", 1);
                 self.realm
                     .set_property(arr, "containing", NanBox::handle(containing.to_raw()));
+                // `%SegmentsPrototype%[@@iterator]` is its own function, named
+                // "[Symbol.iterator]" — not the inherited `Array.prototype.values`
+                // (whose `name` is "values").
+                let seg_iter = self.realm.new_bound_native(N_INTL_SEGMENTS_ITER, arr);
+                self.install_fn_name_length(seg_iter, "[Symbol.iterator]", 0);
+                let iter_sym = self.well_known_symbol("iterator");
+                let iter_key = self.member_key(iter_sym);
+                self.realm
+                    .set_property(arr, &iter_key, NanBox::handle(seg_iter.to_raw()));
+                self.realm.mark_hidden(arr, &iter_key);
                 NanBox::handle(arr.to_raw())
             }
             // `Intl.Collator.prototype.compare(a, b)` — code-point order (no locale

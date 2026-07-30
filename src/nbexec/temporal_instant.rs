@@ -693,23 +693,21 @@ impl<'a> Interp<'a> {
         Ok(NanBox::handle(h.to_raw()))
     }
 
-    /// Formats an offset (ns east of UTC) as `±HH:MM[:SS]`.
+    /// `FormatDateTimeUTCOffsetRounded(off)` — the offset (ns east of UTC) as
+    /// `±HH:MM`, **rounded to the nearest minute** (ties away from zero). A
+    /// sub-minute historical offset therefore serializes as minutes:
+    /// `Africa/Monrovia` at the epoch is −00:44:30 and renders `-00:45`, while the
+    /// wall clock it produced (23:15:30) keeps the exact offset.
     fn format_offset(off: i128) -> alloc::string::String {
         let sign = if off < 0 { '-' } else { '+' };
         let a = off.abs();
-        let h = a / temporal_iso::NS_PER_HOUR;
-        let m = (a % temporal_iso::NS_PER_HOUR) / temporal_iso::NS_PER_MINUTE;
-        let s = (a % temporal_iso::NS_PER_MINUTE) / temporal_iso::NS_PER_SEC;
-        if s != 0 {
-            alloc::format!(
-                "{sign}{}:{}:{}",
-                pad(h as u64, 2),
-                pad(m as u64, 2),
-                pad(s as u64, 2)
-            )
-        } else {
-            alloc::format!("{sign}{}:{}", pad(h as u64, 2), pad(m as u64, 2))
-        }
+        // Round-half-up on the absolute value == halfExpand on the signed one.
+        let minutes = (a + temporal_iso::NS_PER_MINUTE / 2).div_euclid(temporal_iso::NS_PER_MINUTE);
+        alloc::format!(
+            "{sign}{}:{}",
+            pad((minutes / 60) as u64, 2),
+            pad((minutes % 60) as u64, 2)
+        )
     }
 
     // --- option-reading helpers -------------------------------------------

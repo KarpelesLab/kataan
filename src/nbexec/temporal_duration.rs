@@ -710,7 +710,16 @@ impl<'a> Interp<'a> {
                 let s = self.duration_to_string(d, arg0)?;
                 Ok(self.new_str(&s))
             }
-            "toJSON" | "toLocaleString" => {
+            // `toLocaleString` is `Intl.DurationFormat`-backed (the ISO string is
+            // only the no-`intl` fallback); `toJSON` is always the ISO string.
+            #[cfg(feature = "intl")]
+            "toLocaleString" => self.duration_to_locale_string(this, args),
+            #[cfg(not(feature = "intl"))]
+            "toLocaleString" => {
+                let s = self.duration_to_string(d, NanBox::undefined())?;
+                Ok(self.new_str(&s))
+            }
+            "toJSON" => {
                 let s = self.duration_to_string(d, NanBox::undefined())?;
                 Ok(self.new_str(&s))
             }

@@ -330,9 +330,7 @@ impl Compiler<'_> {
                     self.emit_clear_captures(inner);
                     self.compile(inner)?;
                 }
-                for _ in min..max {
-                    self.compile_optional(inner, greedy)?;
-                }
+                self.compile_optional_chain(inner, max - min, greedy)?;
             }
         }
         Ok(())
@@ -374,25 +372,50 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    /// `inner?` — `Split(mark, exit); mark; clear; body; empty-fail; exit:`.
-    fn compile_optional(&mut self, inner: &Node, greedy: bool) -> Result<(), RegexError> {
+    /// The `(max - min)` optional copies of a bounded `{min,max}` quantifier, as a
+    /// **nested** chain — `(?:x(?:x(?:x)?)?)?`, not `x?x?x?`.
+    ///
+    /// The two accept the same language, but not with the same search space. In the
+    /// flat form each copy is skippable independently, so a subject that matches `k`
+    /// of `n` copies and then fails later gives the backtracker `C(n, k)` distinct
+    /// ways to place those `k` matches — `[A-Za-z]{0,12}/[A-Za-z]{0,12}` against
+    /// `"Etc/GMT-1"` explores ~48 000 of them, exhausts the step budget, and the
+    /// whole find gives up (so `/^(?:[A-Za-z]{0,12}\/[A-Za-z]{0,12}|Etc\/GMT-1)$/`
+    /// never reaches its second alternative). Nesting makes a skip commit: skipping
+    /// copy `k` skips every later copy too, so there is exactly one path per match
+    /// count and the search is linear.
+    ///
+    /// Emitted iteratively (a copy's exit is the end of the *whole* chain, which is
+    /// what nesting amounts to) so a large bound costs no compiler recursion.
+    fn compile_optional_chain(
+        &mut self,
+        inner: &Node,
+        count: usize,
+        greedy: bool,
+    ) -> Result<(), RegexError> {
         let nullable = can_match_empty(inner);
-        let split = self.emit(Inst::Split(0, 0));
-        let body = self.here();
-        if nullable {
-            self.emit(Inst::Mark);
-        }
-        self.emit_clear_captures(inner);
-        self.compile(inner)?;
-        if nullable {
-            self.emit(Inst::EmptyFail);
+        let mut splits: Vec<(usize, usize)> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let split = self.emit(Inst::Split(0, 0));
+            let body = self.here();
+            if nullable {
+                self.emit(Inst::Mark);
+            }
+            self.emit_clear_captures(inner);
+            self.compile(inner)?;
+            if nullable {
+                self.emit(Inst::EmptyFail);
+            }
+            splits.push((split, body));
         }
         let exit = self.here();
-        self.prog[split] = if greedy {
-            Inst::Split(body, exit)
-        } else {
-            Inst::Split(exit, body)
-        };
+        for (split, body) in splits {
+            self.prog[split] = if greedy {
+                Inst::Split(body, exit)
+            } else {
+                Inst::Split(exit, body)
+            };
+        }
         Ok(())
     }
 

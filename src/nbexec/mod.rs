@@ -1736,6 +1736,10 @@ const N_FUNCTION_TO_STRING: u16 = 965;
 /// `%Segments.prototype%.containing(index)` — a bound native on the object
 /// returned by `Intl.Segmenter.prototype.segment`.
 const N_INTL_SEGMENTS_CONTAINING: u16 = 676;
+/// `%Segments.prototype%[@@iterator]()` — a bound native on that same object.
+/// It exists separately from `Array.prototype.values` only so the function's
+/// `name` is the spec's `"[Symbol.iterator]"`.
+const N_INTL_SEGMENTS_ITER: u16 = 967;
 /// `Atomics.*` methods (single-agent semantics over an integer `TypedArray`;
 /// atomicity is trivial without concurrent agents).
 const N_ATOMICS_ADD: u16 = 677;
@@ -8163,8 +8167,10 @@ fn display_name(ty: &str, code: &str) -> alloc::string::String {
 }
 
 /// The CLDR "short" symbol for an `Intl.NumberFormat` `style: "unit"` measurement unit
-/// (a common subset). An unrecognized unit renders by its own name. (Used for `style: "unit"`
-/// in both builds — the `intl` crate's `number::format` doesn't render units yet.)
+/// (a common subset, English only). An unrecognized unit renders by its own name.
+/// Only the no-`intl` build needs it: with the crate, `style: "unit"` is rendered from
+/// CLDR's own unit patterns (all 45 sanctioned units × 3 widths × every locale).
+#[cfg(not(feature = "intl"))]
 fn unit_symbol(unit: &str) -> &str {
     match unit {
         "kilometer" => "km",

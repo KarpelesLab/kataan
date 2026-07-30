@@ -20,46 +20,27 @@ built-ins/ThrowTypeError/distinct-cross-realm.js  # [sloppy] expected pass, Runt
 built-ins/TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js  # [sloppy] expected pass, Runtime TypeError: Cannot modify an immutable ArrayBuffer (Testing with Float64Array and makeImmutableArrayBuffer.)
 built-ins/decodeURI/S15.1.3.1_A2.5_T1.js  # crash or timeout (native abort / hang)
 built-ins/decodeURIComponent/S15.1.3.2_A2.5_T1.js  # crash or timeout (native abort / hang)
-intl402/Array/prototype/toLocaleString/calls-toLocaleString-number-elements.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"0"», «"๐.๐๐๐"») to be true
-intl402/Array/prototype/toLocaleString/invoke-element-tolocalestring.js  # [sloppy] expected pass, Runtime Test262Error: Actual [] and expected [undefined, undefined] should have the same contents. must invoke element toLocaleString with expected arguments when provided no arguments
 intl402/Collator/prototype/compare/non-normative-phonebook.js  # [sloppy] expected pass, Runtime Test262Error: Actual [A, Ä, Ab, Af, b, ö, od, off] and expected [A, Ab, Ä, Af, b, od, ö, off] should have the same contents. 
 intl402/Collator/prototype/compare/non-normative-sensitivity.js  # [sloppy] expected pass, Runtime Test262Error: Actual [Aa] and expected [Aa, Aã] should have the same contents. 
 intl402/Collator/prototype/resolvedOptions/resolved-collation-unicode-extensions-and-options.js  # [sloppy] expected pass, Runtime Test262Error: Resolved locale for locale=de-u-co-phonebk with collation=pinyin Expected SameValue(«"de"», «"de-u-co-phonebk"») to be true
 intl402/Collator/usage-de.js  # [sloppy] expected pass, Runtime Test262Error: Actual [Ä, AE] and expected [AE, Ä] should have the same contents. search
 intl402/DateTimeFormat/prototype/format/numbering-system.js  # [sloppy] expected pass, Runtime Test262Error: en-US: display one numeric-styled unit Expected SameValue(«false», «true») to be true
 intl402/DateTimeFormat/prototype/format/temporal-objects-no-time-clip-non-latin-numerals.js  # [sloppy] expected pass, Runtime Test262Error: max date should include day 13 in Arabic-Indic digits, got: 13‏/9‏/275760
-intl402/DateTimeFormat/prototype/format/timedatestyle-en.js  # [sloppy] expected pass, Runtime Test262Error: Result for full with {} Expected SameValue(«"2:12:47 PM "», «"2:12:47 PM Coordinated Universal Time"») to be true
 intl402/DateTimeFormat/prototype/formatToParts/compare-to-temporal-lunisolar.js  # [sloppy] expected pass, Runtime Test262Error: date = 2047-07-22[u-ca=chinese], monthCode Expected SameValue(«"M05"», «"M05L"») to be true
-intl402/DateTimeFormat/prototype/formatToParts/compare-to-temporal.js  # [sloppy] expected pass, Runtime Test262Error: date = 2050-01-31[u-ca=buddhist], year Expected SameValue(«2050», «2593») to be true
 intl402/DateTimeFormat/prototype/formatToParts/era.js  # [sloppy] expected pass, Runtime Test262Error: islamic-civil eras (Anno Domini,Anno Domini) should be unique Expected SameValue(«1», «2») to be true
-intl402/DurationFormat/prototype/format/digital-style-with-hours-display-auto-with-zero-hour.js  # [sloppy] expected pass, Runtime Test262Error: Duration is {"days":1,"hours":0,"minutes":1,"seconds":2} Expected SameValue(«"1 d, 01:02"», «"1 day, 01:02"») to be true
-intl402/DurationFormat/prototype/format/style-digital-largenumber-en.js  # [sloppy] expected pass, Runtime Test262Error: useGrouping set to false applies to time units but not days Expected SameValue(«"1,234,567 d, 3:20:45"», «"1,234,567 days, 3:20:45"») to be true
 intl402/Intl/getCanonicalLocales/non-iana-canon.js  # [sloppy] expected pass, Runtime Test262Error: The value of Intl.getCanonicalLocales(tag)[0] equals the value of `canonical` Expected SameValue(«"hy-arevela"», «"hy"») to be true
 intl402/Intl/getCanonicalLocales/preferred-variant.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"ja-Latn-alalc97-hepburn"», «"ja-Latn-alalc97"») to be true
 intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-timezone.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"und-u-tz-eire"», «"und-u-tz-iedub"») to be true
 intl402/Intl/supportedValuesOf/currencies-accepted-by-DisplayNames.js  # [sloppy] expected pass, Runtime Test262Error: AAA supported but not returned by supportedValuesOf
-intl402/Intl/supportedValuesOf/timeZones-include-non-continental.js  # [sloppy] expected pass, Runtime Test262Error: non-continental timezone Etc/GMT+1 is not supported
 intl402/ListFormat/prototype/format/es-es-long.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"foo, bar"», «"foo y bar"») to be true
 intl402/ListFormat/prototype/format/es-es-short.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"foo, bar"», «"foo y bar"») to be true
 intl402/ListFormat/prototype/formatToParts/es-es-long.js  # [sloppy] expected pass, Runtime Test262Error: undefined: parts[1].value Expected SameValue(«", "», «" y "») to be true
 intl402/ListFormat/prototype/formatToParts/es-es-short.js  # [sloppy] expected pass, Runtime Test262Error: undefined: parts[1].value Expected SameValue(«", "», «" y "») to be true
 intl402/Locale/constructor-non-iana-canon.js  # [sloppy] expected pass, Runtime Test262Error: new Intl.Locale("es-ES-preeuro").minimize().toString() returns "es-preeuro" Expected SameValue(«"es-Latn-ES-preeuro"», «"es-preeuro"») to be true
-intl402/Locale/constructor-options-region-valid.js  # [sloppy] expected pass, Runtime Test262Error: new Intl.Locale('en', {region: "554"}).toString() returns "en-NZ" Expected SameValue(«"en-554"», «"en-NZ"») to be true
-intl402/Locale/likely-subtags-grandfathered.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"art-fonipa-lojban"», «"jbo-fonipa"») to be true
-intl402/Locale/likely-subtags.js  # [sloppy] expected pass, Runtime Test262Error: "en-fonipa".minimize() should be "en-fonipa" Expected SameValue(«"en-Latn-US-fonipa"», «"en-fonipa"») to be true
-intl402/NumberFormat/prototype/format/unit-de-DE.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"-987 km/h"», «"-987 km/h"») to be true
-intl402/NumberFormat/prototype/format/unit-en-US.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"-987 km/h"», «"-987 km/h"») to be true
-intl402/NumberFormat/prototype/format/unit-ja-JP.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"-987 km/h"», «"-987 km/h"») to be true
-intl402/NumberFormat/prototype/format/unit-ko-KR.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"-987 km/h"», «"-987km/h"») to be true
 intl402/NumberFormat/prototype/format/unit-zh-TW.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"-987 km/h"», «"-987 公里/小時"») to be true
 intl402/NumberFormat/prototype/formatRange/en-US.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"$3.00–$5.00"», «"$3 – $5"») to be true
 intl402/NumberFormat/prototype/formatRange/pt-PT.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"€ 3,00–€ 5,00"», «"3 - 5 €"») to be true
 intl402/NumberFormat/prototype/formatRangeToParts/en-US.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«3», «5») to be true
-intl402/NumberFormat/prototype/formatToParts/percent-en-US.js  # [sloppy] expected pass, Runtime Test262Error: unit: length Expected SameValue(«4», «3») to be true
-intl402/NumberFormat/prototype/formatToParts/unit-de-DE.js  # [sloppy] expected pass, Runtime Test262Error: undefined: parts[2].value Expected SameValue(«" "», «" "») to be true
-intl402/NumberFormat/prototype/formatToParts/unit-en-US.js  # [sloppy] expected pass, Runtime Test262Error: undefined: parts[2].value Expected SameValue(«" "», «" "») to be true
-intl402/NumberFormat/prototype/formatToParts/unit-ja-JP.js  # [sloppy] expected pass, Runtime Test262Error: undefined: parts[2].value Expected SameValue(«" "», «" "») to be true
-intl402/NumberFormat/prototype/formatToParts/unit-ko-KR.js  # [sloppy] expected pass, Runtime Test262Error: undefined: length Expected SameValue(«4», «3») to be true
 intl402/NumberFormat/prototype/formatToParts/unit-zh-TW.js  # [sloppy] expected pass, Runtime Test262Error: undefined: parts[2].value Expected SameValue(«" "», «" "») to be true
 intl402/RelativeTimeFormat/prototype/format/pl-pl-style-long.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"in 1,000 seconds"», «"za 1000 sekund"») to be true
 intl402/RelativeTimeFormat/prototype/format/pl-pl-style-narrow.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"in 1,000 sec."», «"za 1000 s"») to be true
@@ -67,41 +48,19 @@ intl402/RelativeTimeFormat/prototype/format/pl-pl-style-short.js  # [sloppy] exp
 intl402/RelativeTimeFormat/prototype/formatToParts/pl-pl-style-long.js  # [sloppy] expected pass, Runtime Test262Error: formatToParts(1000, second): length Expected SameValue(«5», «3») to be true
 intl402/RelativeTimeFormat/prototype/formatToParts/pl-pl-style-narrow.js  # [sloppy] expected pass, Runtime Test262Error: formatToParts(1000, second): length Expected SameValue(«5», «3») to be true
 intl402/RelativeTimeFormat/prototype/formatToParts/pl-pl-style-short.js  # [sloppy] expected pass, Runtime Test262Error: formatToParts(1000, second): length Expected SameValue(«5», «3») to be true
-intl402/Segmenter/constructor/constructor/locales-valid.js  # [sloppy] expected pass, Runtime Test262Error: Two-element array with unknown code: expected one of ar, found xyz
 intl402/Segmenter/prototype/segment/containing/breakable-input.js  # [sloppy] expected pass, Runtime Test262Error: granularity: undefined input: �� containing(0) input Expected SameValue(«"\udc00\ud800"», «"��"») to be true
 intl402/Segmenter/prototype/segment/containing/unbreakable-input.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"\ud800"», «"�"») to be true
-intl402/Segmenter/prototype/segment/name_of_symbol_iterator.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"[Symbol.iterator]"», «"values"») to be true
 intl402/String/prototype/toLocaleLowerCase/special_casing_Azeri.js  # [sloppy] expected pass, Runtime Test262Error: LATIN CAPITAL LETTER I followed by COMBINING DOT ABOVE Expected SameValue(«"ı̇"», «"i"») to be true
 intl402/String/prototype/toLocaleLowerCase/special_casing_Turkish.js  # [sloppy] expected pass, Runtime Test262Error: LATIN CAPITAL LETTER I followed by COMBINING DOT ABOVE Expected SameValue(«"ı̇"», «"i"») to be true
 intl402/String/prototype/toLocaleUpperCase/special_casing_Lithuanian.js  # [sloppy] expected pass, Runtime Test262Error: COMBINING DOT ABOVE preceded by Soft_Dotted (U+0069) Expected SameValue(«"İ"», «"I"») to be true
 intl402/Temporal/Duration/prototype/round/relativeto-infinity-throws-rangeerror.js  # [sloppy] expected pass, Runtime Test262Error: Actual [] and expected [get eraYear.valueOf, call eraYear.valueOf] should have the same contents. it fails after fetching the primitive value
-intl402/Temporal/Duration/prototype/toLocaleString/returns-same-results-as-DurationFormat.js  # [sloppy] expected pass, Runtime Test262Error: locale="undefined", options="undefined", duration=""P1Y2M3W4DT5H6M7.00800901S"" Expected SameValue(«"P1Y2M3W4DT5H6M7.00800901S"», «"1 yr, 2 mth, 3 wk, 4 d, 5 h, 6 min, 7 s, 8 ms, 9 microsecond, 10 nanosecond"») to be true
 intl402/Temporal/Duration/prototype/total/relativeto-infinity-throws-rangeerror.js  # [sloppy] expected pass, Runtime Test262Error: Actual [] and expected [get eraYear.valueOf, call eraYear.valueOf] should have the same contents. it fails after fetching the primitive value
-intl402/Temporal/Instant/prototype/toLocaleString/hourcycle.js  # [sloppy] expected pass, Runtime Test262Error: output for hour12: false should include 00:00:00 Expected SameValue(«false», «true») to be true
-intl402/Temporal/Instant/prototype/toString/timezone-offset.js  # [sloppy] expected pass, Runtime Test262Error: sub-minute offset Expected SameValue(«"1969-12-31T23:15:30-00:44:30"», «"1969-12-31T23:15:30-00:45"») to be true
-intl402/Temporal/PlainDate/prototype/toLocaleString/datestyle-and-timestyle.js  # [sloppy] expected pass, Runtime Test262Error: Expected a TypeError to be thrown but no exception was thrown at all
-intl402/Temporal/PlainDateTime/prototype/since/different-calendars-throws.js  # [sloppy] expected pass, Runtime Test262Error: different calendars not allowed Expected a RangeError to be thrown but no exception was thrown at all
-intl402/Temporal/PlainDateTime/prototype/toLocaleString/hourcycle.js  # [sloppy] expected pass, Runtime Test262Error: output for hour12: false should include 00:00:00 Expected SameValue(«false», «true») to be true
-intl402/Temporal/PlainDateTime/prototype/toLocaleString/resolved-time-zone.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"8/4/2021, 0:30:45"», «"8/4/2021, 00:30:45"») to be true
-intl402/Temporal/PlainDateTime/prototype/until/different-calendars-throws.js  # [sloppy] expected pass, Runtime Test262Error: cannot use until with PDTs having different calendars Expected a RangeError to be thrown but no exception was thrown at all
 intl402/Temporal/PlainMonthDay/from/chinese-dangi-constrain-rare-leap-months.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«false», «true») to be true
 intl402/Temporal/PlainMonthDay/from/chinese-dangi-leap-month-with-year-from-options-bag-overflow-reject.js  # [sloppy] expected pass, Runtime Test262Error: 1718, M08L, 30 should not be valid with reject overflow Expected a RangeError to be thrown but no exception was thrown at all
 intl402/Temporal/PlainMonthDay/from/chinese-dangi-leap-month-with-year-from-options-bag.js  # [sloppy] expected pass, Runtime RangeError: PlainMonthDay: monthCode/day does not exist
 intl402/Temporal/PlainMonthDay/from/dangi-leap-month-codes-common.js  # [sloppy] expected pass, Runtime Test262Error: M08L-30 should be constrained to M08-30 Expected SameValue(«"M08L"», «"M08"») to be true
 intl402/Temporal/PlainMonthDay/prototype/toLocaleString/dateStyle.js  # [sloppy] expected pass, Runtime Test262Error: dateStyle: long writes month of Ramadan out in full
-intl402/Temporal/PlainMonthDay/prototype/toLocaleString/datestyle-and-timestyle.js  # [sloppy] expected pass, Runtime Test262Error: Expected a TypeError to be thrown but no exception was thrown at all
-intl402/Temporal/PlainMonthDay/prototype/toString/calendarname-never.js  # [sloppy] expected pass, Runtime Test262Error: built-in Gregorian calendar for calendarName = never Expected SameValue(«"1972-05-02[u-ca=gregory]"», «"1972-05-02"») to be true
-intl402/Temporal/PlainTime/prototype/toLocaleString/datestyle-and-timestyle.js  # [sloppy] expected pass, Runtime Test262Error: Expected a TypeError to be thrown but no exception was thrown at all
-intl402/Temporal/PlainTime/prototype/toLocaleString/hourcycle.js  # [sloppy] expected pass, Runtime Test262Error: output for hour12: false should include 00:00:00 Expected SameValue(«false», «true») to be true
-intl402/Temporal/PlainTime/prototype/toLocaleString/resolved-time-zone.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"0:30:45"», «"00:30:45"») to be true
 intl402/Temporal/PlainYearMonth/prototype/toLocaleString/dateStyle.js  # [sloppy] expected pass, Runtime Test262Error: dateStyle: long writes month of Ramadan out in full
-intl402/Temporal/PlainYearMonth/prototype/toLocaleString/datestyle-and-timestyle.js  # [sloppy] expected pass, Runtime Test262Error: Expected a TypeError to be thrown but no exception was thrown at all
-intl402/Temporal/ZonedDateTime/prototype/toLocaleString/default-includes-time-and-time-zone-name.js  # [sloppy] expected pass, Runtime Test262Error: ZonedDateTime formatted with no options 12/26/2024, 11:46:40 AM GMT should include time zone name
-intl402/Temporal/ZonedDateTime/prototype/toLocaleString/hourcycle.js  # [sloppy] expected pass, Runtime Test262Error: output for hour12: false should include 00:00:00 Expected SameValue(«false», «true») to be true
-intl402/Temporal/ZonedDateTime/prototype/toLocaleString/offset-time-zones.js  # [sloppy] expected pass, Runtime Test262Error: Expected true but got false
-intl402/Temporal/ZonedDateTime/prototype/toLocaleString/options-timeZone.js  # [sloppy] expected pass, Runtime Test262Error: timeZone option disallowed Expected a TypeError to be thrown but no exception was thrown at all
-intl402/Temporal/ZonedDateTime/prototype/toLocaleString/options-timeZoneName-affects-instance-time-zone.js  # [sloppy] expected pass, Runtime Test262Error: formats with different timeZoneName options should be different Expected SameValue(«"1/1/1970, 12:00:00 AM GMT"», «"1/1/1970, 12:00:00 AM GMT"») to be false
-intl402/TypedArray/prototype/toLocaleString/calls-toLocaleString-number-elements.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"0"», «"๐.๐๐๐"») to be true (Testing with Float64Array and makePassthrough.)
 language/arguments-object/10.6-13-a-2.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/arguments-object/10.6-13-a-3.js  # [sloppy] expected pass, Runtime TypeError: is not a function
 language/destructuring/binding/keyed-destructuring-property-reference-target-evaluation-order-with-bindings.js  # [sloppy] expected pass, Runtime Test262Error: Actual [binding::source, binding::sourceKey, sourceKey, get source, binding::defaultValue] and expected [binding::source, binding::sourceKey, sourceKey, binding::varTarget, get source, binding::defaultValue] should have the same contents. 

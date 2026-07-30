@@ -765,7 +765,7 @@ fn intl_number_to_locale_string_all_options() {
     );
     assert_eq!(
         run("(5).toLocaleString('en-US',{style:'unit',unit:'kilometer-per-hour'})"),
-        "5\u{a0}km/h"
+        "5 km/h"
     );
     assert_eq!(
         run("(1).toLocaleString('en-US',{minimumSignificantDigits:3})"),
@@ -838,10 +838,9 @@ fn intl_datetime_is_locale_aware() {
 /// `fractionalSecondDigits`. `intl` 0.5.3 synthesizes a pattern for these rather
 /// than falling back to a date pattern and stripping it to nothing.
 ///
-/// A lone `second: "2-digit"` gives `06`, which is where we part company with
-/// V8/node — they render `6` for both widths. ECMA-402's format matcher adjusts
-/// the chosen pattern's field widths to the *requested* width, so honouring
-/// `2-digit` is the better reading, and no Test262 test covers the case.
+/// A lone `second: "2-digit"` gives `6`, matching V8/node: ECMA-402's format
+/// matcher reports back the *chosen pattern's* field width, and the synthesized
+/// pattern for a lone second is `s`.
 #[cfg(feature = "intl")]
 #[test]
 fn intl_datetime_lone_field_options() {
@@ -851,7 +850,7 @@ fn intl_datetime_lone_field_options() {
         console.log([f({dayPeriod:"long"}), f({minute:"numeric"}), f({second:"2-digit"}),
                      f({fractionalSecondDigits:3}), f({second:"numeric",fractionalSecondDigits:2})].join("|"))
     "#;
-    assert_eq!(out(src), "in the morning|35|06|789|6.78\n");
+    assert_eq!(out(src), "in the morning|35|6|789|6.78\n");
     // CLDR dropped the `midnight` day-period *format* rule; 00:00 is `morning1`.
     assert_eq!(
         out(

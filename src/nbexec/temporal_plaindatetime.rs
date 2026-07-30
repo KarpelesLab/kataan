@@ -1273,9 +1273,10 @@ impl<'a> Interp<'a> {
         negate: bool,
     ) -> Result<NanBox, ExecError> {
         let (d2, t2, other_cal) = self.pdt_to_datetime(other, NanBox::undefined())?;
-        // A non-ISO receiver requires both operands to share the same calendar
-        // (the ISO fast path keeps its original, calendar-agnostic behaviour).
-        if !tcal::is_iso(&data.calendar) && other_cal != data.calendar {
+        // Both operands must share one calendar — including when the receiver is
+        // ISO and the argument is not (`iso.until(gregory)` is a RangeError too).
+        if !(tcal::is_iso(&data.calendar) && tcal::is_iso(&other_cal)) && other_cal != data.calendar
+        {
             return Err(self
                 .pdt_range("cannot compute the difference between dates of different calendars"));
         }

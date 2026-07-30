@@ -1070,7 +1070,10 @@ impl<'a> Interp<'a> {
         match show {
             "always" => result.push_str(&alloc::format!("[u-ca={cal}]")),
             "critical" => result.push_str(&alloc::format!("[!u-ca={cal}]")),
-            _ if !is_iso => result.push_str(&alloc::format!("[u-ca={cal}]")),
+            // "never" suppresses the annotation even for a non-ISO calendar (the
+            // reference year is still emitted, since the month-day alone would be
+            // ambiguous).
+            "auto" if !is_iso => result.push_str(&alloc::format!("[u-ca={cal}]")),
             _ => {}
         }
         result

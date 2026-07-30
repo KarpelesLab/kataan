@@ -3778,7 +3778,7 @@ impl<'a> Interp<'a> {
                             let boxed = self.coerce_to_object(e);
                             let bh = boxed.as_handle().map(Handle::from_raw).unwrap();
                             let m = self.read_member(bh, "toLocaleString")?;
-                            let r = self.call_with_this(m, e, &[])?;
+                            let r = self.call_with_this(m, e, &[arg(0), arg(1)])?;
                             parts.push(self.coerce_to_string(r)?);
                         }
                         return Ok(Some(self.new_str(&parts.join(","))));
@@ -3797,41 +3797,31 @@ impl<'a> Interp<'a> {
                         let s = match e.unpack() {
                             Unpacked::Null | Unpacked::Undefined => String::new(),
                             Unpacked::Handle(raw) if raw == handle.to_raw() => String::new(),
-                            // Numbers/BigInts render via the engine's grouped locale
-                            // form directly (no Intl) — matches the curated gate.
-                            Unpacked::Number(n) => group_thousands(n),
+                            // `S = ToString(Invoke(element, "toLocaleString",
+                            // « locales, options »))` for every other element — the
+                            // two arguments are forwarded verbatim (and exactly two,
+                            // whatever the caller passed), and a primitive is boxed
+                            // to resolve a possibly user-overridden method while the
+                            // *primitive* stays the `this` value (so an override
+                            // observing a strict `this` sees `"number"`/`"boolean"`,
+                            // not the wrapper).
                             _ => {
-                                if let Some(big) = e
-                                    .as_handle()
-                                    .and_then(|r| self.realm.bigint_at(Handle::from_raw(r)))
-                                {
-                                    group_thousands_str(&bigint_to_radix(&big, 10))
-                                } else if e.as_handle().map(Handle::from_raw).is_some_and(|h| {
-                                    self.realm.object_keys(h).is_some()
-                                        || self.realm.is_array(h)
-                                        || self.realm.typed_kind(h).is_some()
-                                }) {
-                                    // A real object element: call its own
-                                    // `toLocaleString()`, ToString the result
-                                    // (abrupt completions propagate).
-                                    let h = e.as_handle().map(Handle::from_raw).unwrap();
-                                    let m = self.read_member(h, "toLocaleString")?;
-                                    let r = self.call_with_this(m, e, &[])?;
-                                    self.coerce_to_string(r)?
-                                } else {
-                                    // A string/boolean/symbol (or other) primitive
-                                    // element: `Invoke(element, "toLocaleString")` —
-                                    // box it (ToObject) to resolve the possibly
-                                    // user-overridden method, then call it with the
-                                    // *primitive* as `this` (so an override observing a
-                                    // strict primitive `this` — e.g. `typeof this` —
-                                    // sees `"boolean"`/`"string"`, not the wrapper).
-                                    let boxed = self.coerce_to_object(e);
-                                    let bh = boxed.as_handle().map(Handle::from_raw).unwrap();
-                                    let m = self.read_member(bh, "toLocaleString")?;
-                                    let r = self.call_with_this(m, e, &[])?;
-                                    self.coerce_to_string(r)?
-                                }
+                                let h = match e.as_handle().map(Handle::from_raw) {
+                                    Some(h)
+                                        if self.realm.object_keys(h).is_some()
+                                            || self.realm.is_array(h)
+                                            || self.realm.typed_kind(h).is_some() =>
+                                    {
+                                        h
+                                    }
+                                    _ => {
+                                        let boxed = self.coerce_to_object(e);
+                                        boxed.as_handle().map(Handle::from_raw).unwrap()
+                                    }
+                                };
+                                let m = self.read_member(h, "toLocaleString")?;
+                                let r = self.call_with_this(m, e, &[arg(0), arg(1)])?;
+                                self.coerce_to_string(r)?
                             }
                         };
                         parts.push(s);
