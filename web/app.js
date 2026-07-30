@@ -18,16 +18,16 @@ const STAGES = [
 // cluster bars. `ran` is the one number a run reports rather than the ledger, so
 // it is the only literal to touch by hand, when the corpus itself changes size.
 const CONFORMANCE = {
-  rate: '99.71%',
-  passing: '51,739',
+  rate: '99.86%',
+  passing: '51,816',
   ran: '51,890',
-  ledger: 151,
+  ledger: 74,
   clusters: [
-    { name: 'intl402/Temporal', count: 27 },
-    { name: 'language/expressions', count: 19 },
-    { name: 'intl402/NumberFormat', count: 14 },
-    { name: 'language/statements', count: 10 },
     { name: 'annexB/built-ins', count: 8 },
+    { name: 'intl402/Temporal', count: 8 },
+    { name: 'intl402/RelativeTimeFormat', count: 6 },
+    { name: 'intl402/NumberFormat', count: 5 },
+    { name: 'intl402/Collator', count: 4 },
   ],
 };
 CONFORMANCE.worst = Math.max(...CONFORMANCE.clusters.map((c) => c.count));
