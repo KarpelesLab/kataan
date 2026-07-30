@@ -699,10 +699,11 @@ impl<'a> Interp<'a> {
                 let radix = match args.get(1) {
                     Some(r) if !matches!(r.unpack(), Unpacked::Undefined) => {
                         let n = self.coerce_to_number(*r)?;
-                        let n = self.realm.to_number(n);
-                        // Keep the sign (a `… as u32` cast saturates a negative
-                        // radix to 0, which would wrongly default to base 10).
-                        if n.is_finite() { n as i64 } else { 0 }
+                        // `ToInt32`, not a plain truncation: the radix wraps modulo
+                        // 2^32, so `parseInt("11", 4294967298)` is base 2, not an
+                        // out-of-range radix. Keeps the sign, which a `… as u32`
+                        // cast would saturate away.
+                        i64::from(self.realm.to_int32(n))
                     }
                     _ => 0,
                 };

@@ -8975,7 +8975,18 @@ fn parse_float_prefix(s: &str) -> f64 {
         }
         end += 1;
     }
-    s[..end].parse::<f64>().unwrap_or(f64::NAN)
+    // The greedy scan above accepts characters that *could* continue a decimal
+    // literal, so it can overshoot: `"1ex"` consumes `1e`, which is not a valid
+    // literal. `StrDecimalLiteral` is the longest **valid** prefix, so give back
+    // the trailing characters until what remains parses (`1e` -> `1`). At most a
+    // few, since only a dangling exponent (`e`, `e+`, `e-`) or `.` can overshoot.
+    while end > 0 {
+        if let Ok(v) = s[..end].parse::<f64>() {
+            return v;
+        }
+        end -= 1;
+    }
+    f64::NAN
 }
 
 /// Advances `pos` past JSON whitespace.

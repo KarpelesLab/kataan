@@ -4934,11 +4934,12 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             // Keep the sign: a `… as u32` cast saturates a negative radix to 0,
             // which would wrongly default to base 10. A nonzero radix outside
             // [2, 36] is invalid → NaN.
+            // `ToInt32`: the radix wraps modulo 2^32, so `parseInt("11",
+            // 4294967298)` is base 2 rather than an out-of-range radix.
             let radix = args
                 .get(1)
-                .and_then(|r| r.as_number())
-                .filter(|n| n.is_finite())
-                .map_or(0i64, |n| n as i64);
+                .filter(|r| !r.is_undefined())
+                .map_or(0i64, |r| i64::from(ctx.realm.to_int32(*r)));
             if radix != 0 && !(2..=36).contains(&radix) {
                 NanBox::number(f64::NAN)
             } else {
@@ -5075,11 +5076,12 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
                 .realm
                 .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
             // See NB_PARSE_INT: preserve the sign and reject an out-of-range radix.
+            // `ToInt32`: the radix wraps modulo 2^32, so `parseInt("11",
+            // 4294967298)` is base 2 rather than an out-of-range radix.
             let radix = args
                 .get(1)
-                .and_then(|r| r.as_number())
-                .filter(|n| n.is_finite())
-                .map_or(0i64, |n| n as i64);
+                .filter(|r| !r.is_undefined())
+                .map_or(0i64, |r| i64::from(ctx.realm.to_int32(*r)));
             if radix != 0 && !(2..=36).contains(&radix) {
                 NanBox::number(f64::NAN)
             } else {
@@ -5252,7 +5254,18 @@ fn parse_float_prefix(s: &str) -> f64 {
         }
         end += 1;
     }
-    s[..end].parse::<f64>().unwrap_or(f64::NAN)
+    // The greedy scan above accepts characters that *could* continue a decimal
+    // literal, so it can overshoot: `"1ex"` consumes `1e`, which is not a valid
+    // literal. `StrDecimalLiteral` is the longest **valid** prefix, so give back
+    // the trailing characters until what remains parses (`1e` -> `1`). At most a
+    // few, since only a dangling exponent (`e`, `e+`, `e-`) or `.` can overshoot.
+    while end > 0 {
+        if let Ok(v) = s[..end].parse::<f64>() {
+            return v;
+        }
+        end -= 1;
+    }
+    f64::NAN
 }
 
 /// A minimal `parseInt`: leading sign, optional `0x` (radix 0 or 16), then the

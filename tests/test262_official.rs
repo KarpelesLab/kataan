@@ -643,6 +643,23 @@ fn coordinate() {
         },
     );
 
+    // A run that did not reach every test cannot be compared against the ledger:
+    // a test that never ran is absent from `fails`, and the "now PASS" list below
+    // is computed as `ledger - fails`, so an incomplete run reports un-run entries
+    // as newly passing. Acting on that would silently delete valid ledger lines.
+    // Shards can end early (a worker killed, a coordinator guard tripped), so this
+    // is a real state, not a theoretical one — fail loudly instead of reporting
+    // numbers that read as authoritative.
+    let accounted = ran + skip;
+    assert!(
+        accounted >= total,
+        "incomplete run: {accounted} of {total} tests accounted for \
+         ({ran} ran + {skip} skipped) — {} never executed. The pass/fail counts \
+         and the \"now PASS\" list below are NOT comparable to the ledger; \
+         re-run before drawing any conclusion.",
+        total - accounted
+    );
+
     // Per-area failure breakdown (first two path components).
     let mut areas: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for (rel, _) in &fails {
@@ -720,6 +737,9 @@ struct Scan {
     done: bool,
     /// An in-flight test (`S` with no matching `R`) — the crasher, if any.
     crashed: Option<(usize, String)>,
+    /// Every index that already has a result, so a relaunch can resume at the
+    /// first test still missing one rather than guessing.
+    resolved: HashSet<usize>,
 }
 
 fn scan_progress(path: &Path) -> Scan {
@@ -748,7 +768,11 @@ fn scan_progress(path: &Path) -> Scan {
         }
     }
     let crashed = started.into_iter().find(|(i, _)| !resolved.contains(i));
-    Scan { done, crashed }
+    Scan {
+        done,
+        crashed,
+        resolved,
+    }
 }
 
 /// Drives one shard to completion: spawn the worker child, and on a native crash
@@ -867,12 +891,21 @@ fn manage_shard(
                     };
                     let _ = writeln!(f, "R\t{idx}\t{rel}\tFAIL\t{reason}");
                 }
-                start = idx + workers;
             }
-            // Child died without an in-flight test and without DONE — advance to
-            // avoid spinning on the same spot.
-            None => start += workers,
+            None => {}
         }
+        // Resume at the first test in this shard with no result yet. Bumping
+        // `start` blindly (what this used to do) both re-ran work and could step
+        // over a test entirely — which surfaced much later as a run that quietly
+        // covered fewer tests than the corpus holds. The crasher was just recorded
+        // as a FAIL above, so it counts as resolved and cannot be retried forever.
+        let resolved = scan_progress(outpath).resolved;
+        let mut next = w;
+        while next < total && resolved.contains(&next) {
+            next += workers;
+        }
+        // Guarantee forward progress even if nothing new resolved this round.
+        start = if next > start { next } else { start + workers };
     }
     tally_file(outpath)
 }
