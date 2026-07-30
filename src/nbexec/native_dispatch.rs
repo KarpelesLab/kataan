@@ -883,10 +883,16 @@ impl<'a> Interp<'a> {
                 }
                 let h = Handle::from_raw(this.as_handle().unwrap());
                 // SameValue(this, %Error.prototype%) — assignment to the home object
-                // emulates a non-writable data property and throws.
+                // emulates a non-writable data property and throws. The home is the
+                // **setter's own realm's** `%Error.prototype%`, so it is resolved from
+                // `global_scope` (which `enter_realm` swaps to the running realm's),
+                // not from the caller's lexical scope: reading the latter pinned every
+                // realm's setter to the *main* realm's home, and step 5 then re-entered
+                // realm B's setter on realm B's `Error.prototype` forever.
                 let error_proto = self
-                    .current
+                    .global_scope
                     .get("Error")
+                    .or_else(|| self.current.get("Error"))
                     .and_then(|c| c.as_handle())
                     .map(Handle::from_raw)
                     .and_then(|c| self.realm.get_property(c, "prototype"))

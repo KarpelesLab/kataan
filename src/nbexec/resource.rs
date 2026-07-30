@@ -848,12 +848,32 @@ impl<'a> Interp<'a> {
         // rather than throwing synchronously.
         if method == "disposeAsync" {
             let p = self.fresh_promise();
+            // `DisposeResources` step 4: if any resource had *no* dispose method
+            // (only reachable for the async-dispose hint, i.e. a `null`/`undefined`
+            // resource) and no real `Await` was performed, the algorithm still
+            // performs `Await(undefined)` — one observable microtask turn before
+            // the returned promise settles.
+            let mut needs_await = false;
             match self.require_dstack(brand, what) {
-                Ok(obj) => match self.dstack_run_dispose(obj, list_key, disposed_key, true) {
-                    Ok(_) => self.resolve_with(p, NanBox::undefined()),
-                    Err(ExecError::Throw(e)) => self.settle(p, e, false),
-                    Err(other) => return Err(other),
-                },
+                Ok(obj) => {
+                    match self.dstack_run_dispose(
+                        obj,
+                        list_key,
+                        disposed_key,
+                        true,
+                        &mut needs_await,
+                    ) {
+                        Ok(_) if needs_await => {
+                            self.settle_after_tick(p, NanBox::undefined(), true)
+                        }
+                        Ok(_) => self.resolve_with(p, NanBox::undefined()),
+                        Err(ExecError::Throw(e)) if needs_await => {
+                            self.settle_after_tick(p, e, false);
+                        }
+                        Err(ExecError::Throw(e)) => self.settle(p, e, false),
+                        Err(other) => return Err(other),
+                    }
+                }
                 Err(ExecError::Throw(e)) => self.settle(p, e, false),
                 Err(other) => return Err(other),
             }
@@ -867,9 +887,16 @@ impl<'a> Interp<'a> {
                     return Err(self.reference_disposed());
                 }
                 let value = arg(0);
-                // `null`/`undefined` is added with no dispose method (a no-op on
-                // disposal), and returned as-is.
-                if !matches!(value.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                // `AddDisposableResource`: a `null`/`undefined` resource is
+                // dropped outright for the *sync-dispose* hint, but for the
+                // *async-dispose* hint it is still recorded — with no dispose
+                // method — because `DisposeResources` must then perform an
+                // `Await(undefined)`. Either way `use` returns it as-is.
+                if matches!(value.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    if is_async {
+                        self.dstack_push(obj, list_key, alloc::vec![value, NanBox::undefined()]);
+                    }
+                } else {
                     let m = self.resource_dispose_method(value, is_async)?;
                     self.dstack_push(obj, list_key, alloc::vec![value, m]);
                 }
@@ -931,7 +958,7 @@ impl<'a> Interp<'a> {
                     .set_hidden_property(obj, disposed_key, NanBox::boolean(true));
                 Ok(NanBox::handle(new_obj.to_raw()))
             }
-            "dispose" => self.dstack_run_dispose(obj, list_key, disposed_key, false),
+            "dispose" => self.dstack_run_dispose(obj, list_key, disposed_key, false, &mut false),
             // `disposeAsync` is handled before the brand check above.
             _ => Err(self.type_error("unknown DisposableStack method")),
         }
@@ -1112,12 +1139,17 @@ impl<'a> Interp<'a> {
     /// stack disposed. Idempotent: a disposed stack is a no-op. Throwing disposers
     /// are aggregated into a chain of `SuppressedError`s (the most recent error is
     /// `.error`, the prior accumulated completion is `.suppressed`).
+    ///
+    /// `needs_await` reports `DisposeResources`' *needsAwait ∧ ¬hasAwaited*: some
+    /// resource had no dispose method (an async-hint `null`/`undefined`) and no
+    /// real `Await` ran, so the caller still owes one `Await(undefined)` turn.
     fn dstack_run_dispose(
         &mut self,
         obj: Handle,
         list_key: &str,
         disposed_key: &str,
         is_async: bool,
+        needs_await: &mut bool,
     ) -> Result<NanBox, ExecError> {
         if self.dstack_is_disposed(obj, disposed_key) {
             return Ok(NanBox::undefined());
@@ -1137,6 +1169,8 @@ impl<'a> Interp<'a> {
         // A completion threaded through the reverse iteration: `None` = normal so
         // far; `Some(err)` = a pending thrown value to be (possibly) suppressed.
         let mut pending: Option<NanBox> = None;
+        // `DisposeResources` *needsAwait* / *hasAwaited*.
+        let (mut wants_await, mut has_awaited) = (false, false);
         for entry in entries.into_iter().rev() {
             let pair = entry
                 .as_handle()
@@ -1146,12 +1180,18 @@ impl<'a> Interp<'a> {
             let value = pair.first().copied().unwrap_or(NanBox::undefined());
             let m = pair.get(1).copied().unwrap_or(NanBox::undefined());
             if matches!(m.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                // Step 3.f: no dispose method — only possible for async-dispose,
+                // where an `Await(undefined)` is still owed.
+                wants_await |= is_async;
                 continue;
             }
             let result = self.call_with_this(m, value, &[]);
             // For the async stack, await a returned promise (eagerly).
             let result = match result {
-                Ok(v) if is_async => self.await_value(v),
+                Ok(v) if is_async => {
+                    has_awaited = true;
+                    self.await_value(v)
+                }
                 other => other,
             };
             if let Err(ExecError::Throw(e)) = result {
@@ -1164,10 +1204,27 @@ impl<'a> Interp<'a> {
                 result?;
             }
         }
+        *needs_await = wants_await && !has_awaited;
         match pending {
             None => Ok(NanBox::undefined()),
             Some(e) => Err(ExecError::Throw(e)),
         }
+    }
+
+    /// Settles `p` after exactly one microtask turn: a pass-through reaction job
+    /// (`handler` is `undefined`) queued as if `p` were chained off an
+    /// already-settled promise. This is the observable cost of the
+    /// `Await(undefined)` that `DisposeResources` performs for a resource with no
+    /// dispose method.
+    fn settle_after_tick(&mut self, p: Handle, value: NanBox, fulfilled: bool) {
+        self.microtasks.push(super::Job {
+            handler: NanBox::undefined(),
+            value,
+            result: p,
+            fulfilled,
+            finally: false,
+            thenable: None,
+        });
     }
 
     /// A `ReferenceError` for operating on a disposed stack.

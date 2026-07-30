@@ -1652,8 +1652,14 @@ impl<'a> Interp<'a> {
             N_BIGINT => Some("BigInt"),
             _ => None,
         };
+        // Resolved from the **running realm's** global scope (which `enter_realm`
+        // swaps), not the current lexical scope: `otherRealm.Object(1n)` runs with
+        // realm B as the current Realm Record, so `ToObject` must reach realm B's
+        // `%BigInt.prototype%`. Reading the scope *chain* would also let a local
+        // named `Number` stand in for the intrinsic. `current` remains the fallback
+        // for the setup window, before the bindings are published.
         if let Some(proto) = ctor_name
-            .and_then(|n| self.current.get(n))
+            .and_then(|n| self.global_scope.get(n).or_else(|| self.current.get(n)))
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .and_then(|c| self.realm.get_property(c, "prototype"))

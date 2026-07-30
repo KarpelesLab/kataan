@@ -129,12 +129,20 @@ impl<'a> Interp<'a> {
                 ))
             }
             "toPlainMonthDay" => {
-                // A PlainMonthDay stores a reference ISO year; for the ISO
-                // calendar the canonical reference year is 1972 (a leap year).
-                let mut d = data.date;
-                if tcal::is_iso(&cal) {
-                    d.year = 1972;
-                }
+                // `CalendarMonthDayFromFields(calendar, fields, constrain)`: a
+                // PlainMonthDay stores a *reference* date, not this date. For the
+                // ISO calendar the canonical reference year is a fixed 1972 (a
+                // leap year); every other calendar re-anchors (monthCode, day)
+                // onto the reference year its own rules pick.
+                let d = if tcal::is_iso(&cal) {
+                    IsoDate {
+                        year: 1972,
+                        ..data.date
+                    }
+                } else {
+                    let f = tcal::iso_to_fields(&cal, data.date);
+                    self.pmd_reference(&cal, &f.month_code, f.day, Overflow::Constrain)?
+                };
                 Ok(self.pd_new_kind_cal(
                     TemporalKind::PlainMonthDay,
                     d,

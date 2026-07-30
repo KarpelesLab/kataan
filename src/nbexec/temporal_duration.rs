@@ -2,6 +2,7 @@
 //! `Duration` lives here (its method/getter name tables plus the construct/
 //! method/getter/static logic), so it can be implemented independently of the
 //! other Temporal types and of the shared wiring in `temporal.rs`.
+use super::temporal_calendar as tcal;
 use super::*;
 #[cfg(not(feature = "std"))]
 use crate::common::FloatExt;
@@ -81,6 +82,31 @@ struct DurAnchor {
     /// re-disambiguating the wall time, preserves the correct occurrence within a
     /// fall-back overlap (`AddZonedDateTime`/`ComputeNudgeWindow` use it directly).
     epoch_ns: i128,
+    /// The anchor's calendar id. Year/month/week arithmetic against the anchor is
+    /// performed in *this* calendar (`AddDate`/`DifferenceDate` are calendar
+    /// operations), so a non-ISO `relativeTo` rounds by its own month lengths.
+    cal: String,
+}
+
+impl DurAnchor {
+    /// `CalendarDateAdd(anchor.calendar, …)`, i.e. this anchor's own calendar.
+    fn date_add(&self, y: i64, m: i64, w: i64, d: i64, overflow: Overflow) -> Option<IsoDate> {
+        if tcal::is_iso(&self.cal) {
+            add_iso_date(self.date, y, m, w, d, overflow)
+        } else {
+            tcal::calendar_date_add(&self.cal, self.date, y, m, w, d, overflow).ok()
+        }
+    }
+
+    /// `CalendarDateUntil(anchor.calendar, anchor.date, to, largest)`.
+    fn date_until(&self, to: IsoDate, largest: Unit) -> (i64, i64, i64, i64) {
+        if tcal::is_iso(&self.cal) {
+            difference_iso_date(self.date, to, largest)
+        } else {
+            let p = tcal::calendar_date_until(&self.cal, self.date, to, largest);
+            (p.years, p.months, p.weeks, p.days)
+        }
+    }
 }
 
 /// The instant an anchor+duration lands on: its wall `date`, wall time-of-day
@@ -99,6 +125,16 @@ enum UnsignedMode {
     HalfZero,
     HalfInfinity,
     HalfEven,
+}
+
+/// A Temporal object's `[[Calendar]]` as an anchor calendar id, defaulting an
+/// unset slot to ISO-8601 so the anchor's arithmetic always has a real calendar.
+fn anchor_calendar(cal: &str) -> String {
+    if cal.is_empty() {
+        String::from("iso8601")
+    } else {
+        String::from(cal)
+    }
 }
 
 /// `GetUnsignedRoundingMode(mode, isNegative)`.
@@ -1048,6 +1084,7 @@ impl<'a> Interp<'a> {
                 time_ns: t1.tod,
                 tz: a.tz.clone(),
                 epoch_ns: a.epoch_ns + t1.dest_rel,
+                cal: a.cal.clone(),
             };
             let t2 = self.dur_apply(
                 &a2,
@@ -1323,15 +1360,18 @@ impl<'a> Interp<'a> {
                         time_ns: 0,
                         tz: None,
                         epoch_ns: iso_to_epoch_days(td.date) as i128 * NS_PER_DAY,
+                        cal: anchor_calendar(&td.calendar),
                     })),
                     TemporalKind::ZonedDateTime => {
                         let tz = td.tz.clone().unwrap_or_else(|| String::from("UTC"));
+                        let cal = anchor_calendar(&td.calendar);
                         let (date, time) = self.dur_local_of(&tz, td.epoch_ns);
                         Ok(Some(DurAnchor {
                             date,
                             time_ns: time_to_nanos(time),
                             tz: Some(tz),
                             epoch_ns: td.epoch_ns,
+                            cal,
                         }))
                     }
                     _ => Err(self.type_error("relativeTo must be a date, datetime, or string")),
@@ -1360,11 +1400,15 @@ impl<'a> Interp<'a> {
         let Some(date) = p.date else {
             return Err(self.dur_range_error("relativeTo string has no date"));
         };
-        if let Some(c) = &p.calendar
-            && !(c.is_ascii() && c.eq_ignore_ascii_case("iso8601"))
-        {
-            return Err(self.dur_range_error("relativeTo calendar must be iso8601"));
-        }
+        // A `[u-ca=…]` annotation names the anchor's calendar; any calendar the
+        // engine implements is accepted (the anchor's own arithmetic honours it).
+        let cal = match &p.calendar {
+            None => String::from("iso8601"),
+            Some(c) => match tcal::canonicalize_calendar(c) {
+                Some(id) => String::from(id),
+                None => return Err(self.dur_range_error("unsupported relativeTo calendar")),
+            },
+        };
         if !iso_date_in_range(date) {
             return Err(self.dur_range_error("relativeTo date out of range"));
         }
@@ -1396,6 +1440,7 @@ impl<'a> Interp<'a> {
                 time_ns: time_to_nanos(ltime),
                 tz: Some(tz),
                 epoch_ns: epoch,
+                cal,
             });
         }
         // A plain (non-zoned) relativeTo string may not carry a bare UTC
@@ -1410,38 +1455,36 @@ impl<'a> Interp<'a> {
             time_ns: 0,
             tz: None,
             epoch_ns: iso_to_epoch_days(date) as i128 * NS_PER_DAY,
+            cal,
         })
     }
 
     /// Reads a `relativeTo` property bag (`{ year, month|monthCode, day, … }`),
     /// optionally with `timeZone` (→ zoned), `offset`, and `calendar`.
     fn dur_relative_bag(&mut self, h: Handle) -> Result<DurAnchor, ExecError> {
-        // calendar
-        let cal_v = self.read_member(h, "calendar")?;
-        if !cal_v.is_undefined() {
-            let ok = if let Some(c) = self.temporal_object_calendar(cal_v) {
-                c.is_ascii() && c.eq_ignore_ascii_case("iso8601")
-            } else {
-                let Some(s) = cal_v
-                    .as_handle()
-                    .map(Handle::from_raw)
-                    .and_then(|ch| self.realm.string_value(ch))
-                else {
-                    return Err(self.type_error("calendar must be a string"));
-                };
-                (s.is_ascii() && s.eq_ignore_ascii_case("iso8601"))
-                    || parse_iso_datetime(&s).is_some_and(|p| {
-                        p.calendar
-                            .as_ref()
-                            .is_none_or(|c| c.is_ascii() && c.eq_ignore_ascii_case("iso8601"))
-                    })
-            };
-            if !ok {
-                return Err(self.dur_range_error("relativeTo calendar must be iso8601"));
-            }
-        }
-        // Date fields, read in alphabetical order.
+        // `GetTemporalCalendarIdentifierWithISODefault`.
+        let cal = self.dur_bag_calendar(h)?;
+        // `PrepareCalendarFields` reads every field name — the calendar's own date
+        // fields plus the time/offset/zone ones — in a single alphabetical pass.
+        // `era`/`eraYear` join that list only for a calendar that has eras, which
+        // is why an iso8601 bag never observes a read of them.
         let day = self.dur_bag_field(h, "day")?;
+        let has_eras = tcal::has_eras(&cal);
+        let era = if has_eras {
+            let v = self.read_member(h, "era")?;
+            if v.is_undefined() {
+                None
+            } else {
+                Some(self.coerce_to_string(v)?)
+            }
+        } else {
+            None
+        };
+        let era_year = if has_eras {
+            self.dur_bag_field(h, "eraYear")?
+        } else {
+            None
+        };
         let hour = self.dur_bag_field(h, "hour")?.unwrap_or(0);
         let microsecond = self.dur_bag_field(h, "microsecond")?.unwrap_or(0);
         let millisecond = self.dur_bag_field(h, "millisecond")?.unwrap_or(0);
@@ -1452,7 +1495,13 @@ impl<'a> Interp<'a> {
             None
         } else {
             let s = self.coerce_to_string(month_code_v)?;
-            Some(self.dur_parse_month_code(&s)?)
+            // ISO-8601 has no leap months and resolves the code to its ordinal
+            // right here; every other calendar keeps the code and lets its own
+            // layer interpret it (`M05L` is meaningful there).
+            if tcal::is_iso(&cal) {
+                self.dur_parse_month_code(&s)?;
+            }
+            Some(s)
         };
         let nanosecond = self.dur_bag_field(h, "nanosecond")?.unwrap_or(0);
         // offset (validated for format only): read, then `ToPrimitive(string)`
@@ -1495,14 +1544,49 @@ impl<'a> Interp<'a> {
         };
         let year = self.dur_bag_field(h, "year")?;
 
-        let (Some(year), Some(day)) = (year, day) else {
+        // `CalendarDateFromFields` requires a day, plus a year — which an era
+        // calendar may instead receive as an era/eraYear pair.
+        let Some(day) = day else {
             return Err(self.type_error("relativeTo bag missing required year/day"));
         };
-        let month = self.dur_resolve_month(month, month_code)?;
-        let Some(date) =
-            crate::temporal_iso::regulate_iso_date(year as i32, month, day, Overflow::Constrain)
-        else {
-            return Err(self.dur_range_error("relativeTo bag is not a valid date"));
+        let date = match (tcal::is_iso(&cal), year) {
+            // ISO-8601: months are fixed-length and there are no eras, so the
+            // fields regulate directly (unchanged fast path).
+            (true, Some(year)) => {
+                let month_code = match &month_code {
+                    Some(s) => Some(self.dur_parse_month_code(s)?),
+                    None => None,
+                };
+                let month = self.dur_resolve_month(month, month_code)?;
+                let Some(date) = crate::temporal_iso::regulate_iso_date(
+                    year as i32,
+                    month,
+                    day,
+                    Overflow::Constrain,
+                ) else {
+                    return Err(self.dur_range_error("relativeTo bag is not a valid date"));
+                };
+                date
+            }
+            (true, None) => {
+                return Err(self.type_error("relativeTo bag missing required year/day"));
+            }
+            // Any other calendar resolves its own fields (the layer raises the
+            // missing-year / missing-month TypeErrors itself).
+            (false, _) => {
+                let input = tcal::FieldsInput {
+                    era,
+                    era_year,
+                    year,
+                    month,
+                    month_code,
+                    day,
+                };
+                match tcal::fields_to_iso(&cal, &input, Overflow::Constrain) {
+                    Ok(d) => d,
+                    Err(e) => return Err(self.dur_cal_error(e)),
+                }
+            }
         };
         if !iso_date_in_range(date) {
             return Err(self.dur_range_error("relativeTo date out of range"));
@@ -1528,6 +1612,7 @@ impl<'a> Interp<'a> {
                 time_ns: time_to_nanos(ltime),
                 tz: Some(tz_name),
                 epoch_ns: epoch,
+                cal,
             });
         }
         Ok(DurAnchor {
@@ -1535,6 +1620,7 @@ impl<'a> Interp<'a> {
             time_ns: 0,
             tz: None,
             epoch_ns: iso_to_epoch_days(date) as i128 * NS_PER_DAY,
+            cal,
         })
     }
 
@@ -1550,6 +1636,47 @@ impl<'a> Interp<'a> {
             return Err(self.dur_range_error("relativeTo field must be finite"));
         }
         Ok(Some(n as i64))
+    }
+
+    /// `GetTemporalCalendarIdentifierWithISODefault` for a `relativeTo` bag: the
+    /// canonical id of `bag.calendar` (absent → iso8601). A calendared Temporal
+    /// object supplies its own id; a string is either a bare identifier or an ISO
+    /// string carrying a `[u-ca=…]` annotation.
+    fn dur_bag_calendar(&mut self, h: Handle) -> Result<String, ExecError> {
+        let v = self.read_member(h, "calendar")?;
+        if v.is_undefined() {
+            return Ok(String::from("iso8601"));
+        }
+        let id = if let Some(c) = self.temporal_object_calendar(v) {
+            c
+        } else {
+            let Some(s) = v
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|ch| self.realm.string_value(ch))
+            else {
+                return Err(self.type_error("calendar must be a string"));
+            };
+            match parse_iso_datetime(&s) {
+                // A bare identifier wins over the ISO-string reading.
+                _ if tcal::canonicalize_calendar(&s).is_some() => s,
+                Some(p) => p.calendar.unwrap_or_else(|| String::from("iso8601")),
+                None => s,
+            }
+        };
+        match tcal::canonicalize_calendar(&id) {
+            Some(c) => Ok(String::from(c)),
+            None => Err(self.dur_range_error("unsupported relativeTo calendar")),
+        }
+    }
+
+    /// A calendar-layer error, as the throw the caller owes: a missing required
+    /// field is a TypeError, everything else a RangeError.
+    fn dur_cal_error(&mut self, e: tcal::CalError) -> ExecError {
+        match e {
+            tcal::CalError::Range(msg) => self.dur_range_error(&msg),
+            tcal::CalError::MissingFields(msg) => self.type_error(&msg),
+        }
     }
 
     /// Parses a `monthCode` (`M##` optionally with a trailing `L`) → month number.
@@ -1625,15 +1752,15 @@ impl<'a> Interp<'a> {
         days: i128,
         norm: i128,
     ) -> Result<DurTarget, ExecError> {
-        let d1 = add_iso_date(
-            a.date,
-            years as i64,
-            months as i64,
-            weeks as i64,
-            days as i64,
-            Overflow::Constrain,
-        )
-        .ok_or_else(|| self.dur_range_error("relativeTo date arithmetic out of range"))?;
+        let d1 = a
+            .date_add(
+                years as i64,
+                months as i64,
+                weeks as i64,
+                days as i64,
+                Overflow::Constrain,
+            )
+            .ok_or_else(|| self.dur_range_error("relativeTo date arithmetic out of range"))?;
         match &a.tz {
             None => {
                 let combined = a.time_ns + norm;
@@ -1741,7 +1868,7 @@ impl<'a> Interp<'a> {
                 adj = epoch_days_to_iso(iso_to_epoch_days(adj) + 1);
                 subday -= NS_PER_DAY;
             }
-            let (cy, cm, cw, cd) = difference_iso_date(a.date, adj, diff_unit);
+            let (cy, cm, cw, cd) = a.date_until(adj, diff_unit);
             (cy, cm, cw, cd, subday, adj)
         };
 
@@ -1855,7 +1982,7 @@ impl<'a> Interp<'a> {
             }
             day_corr += 1;
         }
-        let (cy, cm, cw, cd) = difference_iso_date(a.date, inter_date, diff_unit);
+        let (cy, cm, cw, cd) = a.date_until(inter_date, diff_unit);
         (cy, cm, cw, cd, time_rem, inter_date)
     }
 
@@ -1900,16 +2027,11 @@ impl<'a> Interp<'a> {
                 (r, (cy, cm, cw, r), (cy, cm, cw, r + step))
             }
         };
-        let start_date = add_iso_date(
-            a.date,
-            start.0,
-            start.1,
-            start.2,
-            start.3,
-            Overflow::Constrain,
-        )
-        .ok_or_else(|| self.dur_range_error("calendar rounding out of range"))?;
-        let end_date = add_iso_date(a.date, end.0, end.1, end.2, end.3, Overflow::Constrain)
+        let start_date = a
+            .date_add(start.0, start.1, start.2, start.3, Overflow::Constrain)
+            .ok_or_else(|| self.dur_range_error("calendar rounding out of range"))?;
+        let end_date = a
+            .date_add(end.0, end.1, end.2, end.3, Overflow::Constrain)
             .ok_or_else(|| self.dur_range_error("calendar rounding out of range"))?;
         let start_rel = self.dur_wall_rel(a, start_date);
         let end_rel = self.dur_wall_rel(a, end_date);
@@ -2125,9 +2247,9 @@ impl<'a> Interp<'a> {
                     Unit::Month => (y, m + sign, 0, 0),
                     _ => (y, m, w + sign, 0),
                 };
-                let end_date =
-                    add_iso_date(a.date, end.0, end.1, end.2, end.3, Overflow::Constrain)
-                        .ok_or_else(|| self.dur_range_error("bubble out of range"))?;
+                let end_date = a
+                    .date_add(end.0, end.1, end.2, end.3, Overflow::Constrain)
+                    .ok_or_else(|| self.dur_range_error("bubble out of range"))?;
                 let end_rel = self.dur_wall_rel(a, end_date);
                 let beyond = if sign < 0 {
                     nudged_rel <= end_rel
@@ -2182,9 +2304,11 @@ impl<'a> Interp<'a> {
             // (`anchor + r1 days` … `anchor + (r1±1) days`, wall-time preserved).
             let (_, _, _, cd, _, _) =
                 self.dur_zoned_difference(a, t.date, t.tod, t.dest_rel, Unit::Day);
-            let start_date = add_iso_date(a.date, 0, 0, 0, cd, Overflow::Constrain)
+            let start_date = a
+                .date_add(0, 0, 0, cd, Overflow::Constrain)
                 .ok_or_else(|| self.dur_range_error("total out of range"))?;
-            let end_date = add_iso_date(a.date, 0, 0, 0, cd + eff_sign, Overflow::Constrain)
+            let end_date = a
+                .date_add(0, 0, 0, cd + eff_sign, Overflow::Constrain)
                 .ok_or_else(|| self.dur_range_error("total out of range"))?;
             let start_rel = self.dur_wall_rel_checked(a, start_date)?;
             let end_rel = self.dur_wall_rel_checked(a, end_date)?;
@@ -2205,7 +2329,7 @@ impl<'a> Interp<'a> {
             } else if sign < 0 && subday > 0 {
                 adj = epoch_days_to_iso(iso_to_epoch_days(adj) + 1);
             }
-            let (cy, cm, cw, cd) = difference_iso_date(a.date, adj, unit);
+            let (cy, cm, cw, cd) = a.date_until(adj, unit);
             let inc = 1_i64;
             let step = sign;
             let (r1, start, end): (i64, DateFields, DateFields) = match unit {
@@ -2214,16 +2338,11 @@ impl<'a> Interp<'a> {
                 _ => (cw, (cy, cm, cw, 0), (cy, cm, cw + step, 0)),
             };
             let _ = (cd, inc);
-            let start_date = add_iso_date(
-                a.date,
-                start.0,
-                start.1,
-                start.2,
-                start.3,
-                Overflow::Constrain,
-            )
-            .ok_or_else(|| self.dur_range_error("total out of range"))?;
-            let end_date = add_iso_date(a.date, end.0, end.1, end.2, end.3, Overflow::Constrain)
+            let start_date = a
+                .date_add(start.0, start.1, start.2, start.3, Overflow::Constrain)
+                .ok_or_else(|| self.dur_range_error("total out of range"))?;
+            let end_date = a
+                .date_add(end.0, end.1, end.2, end.3, Overflow::Constrain)
                 .ok_or_else(|| self.dur_range_error("total out of range"))?;
             let start_rel = self.dur_wall_rel(a, start_date);
             let end_rel = self.dur_wall_rel(a, end_date);

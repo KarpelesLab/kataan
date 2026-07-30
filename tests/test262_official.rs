@@ -673,6 +673,17 @@ fn coordinate() {
         eprintln!("  {n:>5}  {area}");
     }
 
+    // `KATAAN_T262_SHOW_FAILS=1` lists *every* failure with its reason, ledgered
+    // or not. The gate below only explains regressions, so working on a ledgered
+    // failure otherwise means re-deriving its reason by hand. A local aid; unset
+    // in CI.
+    if std::env::var("KATAAN_T262_SHOW_FAILS").is_ok() {
+        eprintln!("\nall {} failures:", fails.len());
+        for (rel, reason) in &fails {
+            eprintln!("  * {rel}  ({reason})");
+        }
+    }
+
     let fail_set: HashSet<String> = fails.iter().map(|(r, _)| r.clone()).collect();
 
     // Bless mode: (re)write the ledger from the current failures.

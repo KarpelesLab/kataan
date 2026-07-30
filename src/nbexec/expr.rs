@@ -97,12 +97,15 @@ impl<'a> Interp<'a> {
                 ))
             }
             Some(v) => Ok(v),
-            // Not in the lexical scope chain: a property added directly to the
-            // global object (`this.x = …` / `globalThis.x = …` at script level) is
-            // a global binding, so fall back to a global-object own property.
+            // Not in the lexical scope chain: the global environment record's
+            // *object* record still binds every name the global object has — a
+            // property added directly to it (`this.x = …` / `globalThis.x = …` at
+            // script level) and, since `HasBinding` is `HasProperty`, an inherited
+            // one such as `%Object.prototype%`'s `toString` / `valueOf` /
+            // `hasOwnProperty`.
             None => {
                 if let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
-                    && self.realm.has_own(g, name)
+                    && self.global_object_provides(name)
                 {
                     return self.read_member(g, name);
                 }
@@ -728,15 +731,12 @@ impl<'a> Interp<'a> {
                             && self.current.get(&id.name).is_none()
                             && self.with_binding(&id.name).is_none()
                             && !matches!(&*id.name, "undefined" | "NaN" | "Infinity")
-                            // A binding may live only as a global-object own property
-                            // (e.g. `globalThis.x = …`, or a built-in declared onto the
-                            // global object rather than the lexical scope) — `typeof`
-                            // must see it, not report "undefined".
-                            && !self
-                                .global_this
-                                .as_handle()
-                                .map(Handle::from_raw)
-                                .is_some_and(|g| self.realm.has_own(g, &id.name))
+                            // A binding may live only on the global object (e.g.
+                            // `globalThis.x = …`, a built-in declared onto the global
+                            // object rather than the lexical scope, or a member
+                            // *inherited* from `%Object.prototype%`) — `typeof` must
+                            // see it, not report "undefined".
+                            && !self.global_object_provides(&id.name)
                         {
                             return Ok(self.new_str("undefined"));
                         }

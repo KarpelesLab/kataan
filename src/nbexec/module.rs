@@ -1847,10 +1847,13 @@ impl<'a> Interp<'a> {
             r.deferred_namespace = Some(ns);
         }
         // Only arm the lazy-evaluation trigger when the module has not already
-        // run (a defer of an already-evaluated module is just a namespace view).
+        // run *successfully* (a defer of an already-evaluated module is just a
+        // namespace view). A module that already evaluated and **threw** stays
+        // armed: `EnsureDeferredNamespaceEvaluation` always performs
+        // `EvaluateSync`, which rethrows the cached `[[EvaluationError]]`.
         let already = matches!(
-            self.modules.records.get(key).map(|r| r.status),
-            Some(Status::Evaluated)
+            self.modules.records.get(key),
+            Some(r) if r.status == Status::Evaluated && r.eval_error.is_none()
         );
         #[cfg(all(feature = "module", feature = "std"))]
         if !already {
@@ -2119,13 +2122,16 @@ impl<'a> Interp<'a> {
         let Some(dep) = self.deferred_namespaces.get(&handle.to_raw()).cloned() else {
             return Ok(());
         };
-        // Accessing a deferred namespace whose synchronous evaluation would
-        // require running a module that is *currently* on the evaluation stack
-        // (a cycle reached through the deferred edge) is a TypeError — those
-        // bindings are not yet initialized (import-defer). We must detect this
-        // over the whole transitive (non-deferred) closure *before* evaluating
-        // anything, so no side effects of the subgraph run.
-        if self.deferred_closure_has_evaluating(&dep) {
+        // `EnsureDeferredNamespaceEvaluation` step 2: unless the module already
+        // evaluated, its whole requested-module graph must be able to run
+        // *synchronously* right now (`ReadyForSyncExecution`); otherwise the
+        // access is a TypeError. This is checked over the whole closure *before*
+        // evaluating anything, so no side effects of the subgraph run.
+        let evaluated = matches!(
+            self.modules.records.get(&dep).map(|r| r.status),
+            Some(Status::Evaluated)
+        );
+        if !evaluated && !self.ready_for_sync_execution(&dep, &mut BTreeSet::new()) {
             return Err(self.type_error(
                 "Cannot access a deferred module namespace while the module is being evaluated",
             ));
@@ -2155,41 +2161,38 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
-    /// True if any module in `key`'s transitive *non-deferred* dependency
-    /// closure (the set `evaluate_module` would synchronously run) is currently
-    /// `Evaluating` — i.e. on the active evaluation stack. Used to reject a
-    /// deferred-namespace force that would re-enter an in-flight module.
-    fn deferred_closure_has_evaluating(&self, key: &str) -> bool {
-        let mut stack = alloc::vec![key.to_string()];
-        let mut seen = BTreeSet::new();
-        while let Some(k) = stack.pop() {
-            if !seen.insert(k.clone()) {
-                continue;
-            }
-            let Some(r) = self.modules.records.get(&k) else {
-                continue;
-            };
-            // `evaluating-async` counts too: such a module has started but its
-            // bindings are not all initialized (it may not have run at all yet).
-            if matches!(r.status, Status::Evaluating | Status::EvaluatingAsync) {
-                return true;
-            }
-            // Don't descend into an already-evaluated module: its subgraph ran
-            // to completion and is no longer on the stack.
-            if r.status == Status::Evaluated {
-                continue;
-            }
-            for dep in r
-                .imports
-                .iter()
-                .filter(|i| !i.deferred)
-                .map(|i| i.key.clone())
-                .chain(r.reexports.iter().map(reexport_key))
-            {
-                stack.push(dep);
+    /// `ReadyForSyncExecution(module, seen)` (import-defer) — whether forcing
+    /// `key` can complete synchronously: every module in its `[[RequestedModules]]`
+    /// closure (deferred requests included — the spec walks *all* of them) must be
+    /// `evaluated`, or still `linked` with no top-level `await`. A module that is
+    /// `evaluating` / `evaluating-async` is on the active evaluation stack with
+    /// uninitialized bindings, and one with `[[HasTLA]]` cannot finish before the
+    /// access returns; either makes the force a TypeError. `seen` breaks cycles
+    /// (a module already being considered answers `true`).
+    fn ready_for_sync_execution(&self, key: &str, seen: &mut BTreeSet<String>) -> bool {
+        if !seen.insert(key.to_string()) {
+            return true;
+        }
+        let Some(r) = self.modules.records.get(key) else {
+            return true;
+        };
+        // An already-evaluated module's subgraph ran to completion; don't descend.
+        if r.status == Status::Evaluated {
+            return true;
+        }
+        if matches!(r.status, Status::Evaluating | Status::EvaluatingAsync) {
+            return false;
+        }
+        if r.has_tla {
+            return false;
+        }
+        let requested: Vec<String> = r.requested.iter().map(|(k, _)| k.clone()).collect();
+        for dep in requested {
+            if !self.ready_for_sync_execution(&dep, seen) {
+                return false;
             }
         }
-        false
+        true
     }
 
     /// `GetExportedNames(module)` — the sorted set of export names a namespace
@@ -2840,7 +2843,7 @@ pub(crate) struct ModuleContextSave {
     module_imports: Rc<BTreeMap<String, (Scope, String)>>,
     import_meta: Option<NanBox>,
     active_module_key: Option<String>,
-    annexb_block_fns: Vec<String>,
+    annexb_block_fns: Vec<(String, crate::common::Span)>,
 }
 
 /// Whether a module body's top-level statements contain a reachable `await` (or
@@ -2871,15 +2874,6 @@ struct DepBinds {
     dep: String,
     binds: Vec<(String, ImportKind)>,
     deferred: bool,
-}
-
-/// The resolved dependency key of a re-export.
-fn reexport_key(re: &ReExport) -> String {
-    match re {
-        ReExport::Named { key, .. } | ReExport::Star { key, .. } | ReExport::StarAs { key, .. } => {
-            key.clone()
-        }
-    }
 }
 
 /// The resolved dependency key of a re-export paired with its `type` import

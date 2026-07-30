@@ -259,6 +259,27 @@ impl Interp<'_> {
             .into_iter()
             .flatten(),
         );
+        // The main realm's intrinsic slots. While a cross-realm call is running,
+        // `Realm`'s own slots hold the *callee* realm's, so this snapshot is the
+        // only field naming the main realm's — trace it rather than rely on them
+        // also being reachable from `main_global_scope`. (Today `gc_world_is_simple`
+        // refuses to collect at all once a second realm exists, so this is
+        // belt-and-braces for when it stops doing so.)
+        let m = &self.main_intrinsics;
+        out.extend(
+            [
+                m.default_object_proto,
+                m.array_proto,
+                m.promise_proto,
+                m.function_proto,
+                m.symbol_proto,
+                m.bigint_proto,
+                m.typed_array,
+                m.throw_type_error,
+            ]
+            .into_iter()
+            .flatten(),
+        );
         out.extend(self.builtin_iter_protos.values().copied());
         out.extend(self.temporal_protos.iter().copied().flatten());
         out.extend(self.wasm_mem_objs.values().copied());

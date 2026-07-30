@@ -28,6 +28,7 @@ use crate::ast::{
     BindingTarget, Class, ClassMember, Expr, ForInit, Function, Ident, LogicalOp, MethodKind,
     ObjectMember, Param, Program, PropertyKey, Stmt, UnaryOp, VarDecl,
 };
+use crate::common::Span;
 use crate::env::Scope;
 use crate::heap::Handle;
 use crate::nanbox::{NanBox, Unpacked};
@@ -327,12 +328,20 @@ pub struct Interp<'a> {
     /// `var`/function bindings are configurable/deletable). It otherwise shares
     /// the eval-body machinery (`run_eval_body`).
     script_eval_globals: bool,
-    /// The names of block-level function declarations that the Annex B.3.3
-    /// legacy extension var-hoists into the current variable environment — i.e.
-    /// the only names whose outer `var` binding is updated when a block function
-    /// declaration is *executed*. Excludes names that conflict with a parameter
-    /// or an already-present binding (where the extension does not apply).
-    annexb_block_fns: Vec<String>,
+    /// The block-level function declarations that the Annex B.3.3 legacy
+    /// extension var-hoists into the current variable environment — i.e. the only
+    /// declarations whose outer `var` binding is updated when they are *executed*.
+    /// Excludes names that conflict with a parameter or an already-present binding
+    /// (where the extension does not apply).
+    ///
+    /// Each entry is `(name, declaration span)`. The span is what makes it a
+    /// *declaration* set rather than a name set: applicability is decided per
+    /// declaration, so a nested block that redeclares an applicable name — where
+    /// the enclosing block's lexical binding makes the inner one inapplicable —
+    /// must not trigger the update on the outer declaration's behalf. Spans are
+    /// unique within one program, and the list is saved/restored per invocation
+    /// and per `eval`, so it only ever holds one program's declarations.
+    annexb_block_fns: Vec<(String, Span)>,
     /// Function-AST table; a closure cell holds an index into this.
     functions: Vec<FnDef<'a>>,
     /// Class-AST table; a class cell holds an index into this.
@@ -703,6 +712,11 @@ pub struct Interp<'a> {
     /// when execution returns to a main-realm function (`cur_realm` = `None`).
     main_global_this: NanBox,
     main_global_scope: Scope,
+    /// The main realm's realm-wide intrinsic slots, captured alongside them. Those
+    /// slots are a single set of `Realm` fields that [`Self::enter_realm`] swaps to
+    /// the running realm's, so returning to the main realm needs its own snapshot
+    /// to restore (a created realm's lives in `created_realms[i].intrinsics`).
+    main_intrinsics: crate::realm::RealmIntrinsics,
     /// Programs parsed at runtime by `eval` / the `Function` constructor, keyed by
     /// source string. The interpreter's function/AST tables hold `&'a` references
     /// into the running program; a dynamically-parsed `Program` must therefore
@@ -3210,6 +3224,7 @@ impl<'a> Interp<'a> {
             construct_caller_realm: None,
             main_global_this: NanBox::undefined(),
             main_global_scope: Scope::root(),
+            main_intrinsics: crate::realm::RealmIntrinsics::default(),
             eval_programs: alloc::collections::BTreeMap::new(),
             #[cfg(all(feature = "module", feature = "std"))]
             modules: module::ModuleRegistry::new(),
@@ -3241,6 +3256,7 @@ impl<'a> Interp<'a> {
         // when execution returns to a main-realm function (`cur_realm` = `None`).
         interp.main_global_this = interp.global_this;
         interp.main_global_scope = interp.global_scope.clone();
+        interp.main_intrinsics = interp.realm.intrinsics_snapshot();
         interp.main_regexp_proto = interp.regexp_proto;
         interp
     }
@@ -5510,6 +5526,24 @@ impl<'a> Interp<'a> {
         self.global_this.as_handle().map(Handle::from_raw)
     }
 
+    /// `HasBinding(name)` for the global environment record's **object** record:
+    /// `HasProperty(globalObject, name)`, which walks the prototype chain. So the
+    /// members the global object inherits from `%Object.prototype%` — `toString`,
+    /// `valueOf`, `hasOwnProperty`, `constructor`, … — are resolvable as bare
+    /// identifiers (`typeof toString === "function"`), exactly as in a host engine.
+    /// An own-property-only test would report them unresolvable and throw a
+    /// ReferenceError.
+    ///
+    /// Read-side only: it can add resolutions where the engine previously threw,
+    /// never divert a name that the lexical scope chain already binds — so a
+    /// tampered global cannot displace an intrinsic the engine resolves by name.
+    pub(crate) fn global_object_provides(&mut self, name: &str) -> bool {
+        match self.global_object() {
+            Some(g) => self.has_property(g, name),
+            None => false,
+        }
+    }
+
     /// The underlying realm (e.g. to render a result with `to_display_string`).
     #[must_use]
     pub fn realm(&self) -> &Realm {
@@ -6134,14 +6168,14 @@ impl<'a> Interp<'a> {
         }
         // Block-level function names that Annex B var-hoists also participate in
         // VarDeclaredNames for the lexical-collision walks.
-        let mut block_fns: Vec<&str> = Vec::new();
+        let mut block_fns: Vec<(&str, Span)> = Vec::new();
         collect_block_function_names(&program.body, &mut block_fns);
 
         let all_var_names: Vec<&str> = var_names
             .iter()
             .chain(fn_names.iter())
-            .chain(block_fns.iter())
             .copied()
+            .chain(block_fns.iter().map(|(n, _)| *n))
             .collect();
 
         // Walk lexical environments from the caller's lexical env up to (but not
@@ -6204,7 +6238,11 @@ impl<'a> Interp<'a> {
         }
         // CanDeclareGlobalFunction for each function name, then CanDeclareGlobalVar
         // for each pure `var` name — all validated before any is created.
-        for name in fn_names.iter().chain(block_fns.iter()) {
+        for name in fn_names
+            .iter()
+            .copied()
+            .chain(block_fns.iter().map(|(n, _)| *n))
+        {
             if !self.can_declare_global_function(g, name) {
                 let m = self.new_str(&alloc::format!("Cannot declare global function '{name}'"));
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
@@ -6251,7 +6289,7 @@ impl<'a> Interp<'a> {
                 fn_names.push(&id.name);
             }
         }
-        let mut block_fns: Vec<&str> = Vec::new();
+        let mut block_fns: Vec<(&str, Span)> = Vec::new();
         collect_block_function_names(&program.body, &mut block_fns);
 
         // A global lexical binding lives in the global scope frame but, unlike a
@@ -6283,7 +6321,8 @@ impl<'a> Interp<'a> {
         for name in var_names
             .iter()
             .chain(fn_names.iter())
-            .chain(block_fns.iter())
+            .copied()
+            .chain(block_fns.iter().map(|(n, _)| *n))
         {
             if has_global_lexical(g, name, self) {
                 return Err(syntax_err(self, name));
@@ -6292,7 +6331,11 @@ impl<'a> Interp<'a> {
 
         // CanDeclareGlobalFunction / CanDeclareGlobalVar — validated before any
         // binding is created.
-        for name in fn_names.iter().chain(block_fns.iter()) {
+        for name in fn_names
+            .iter()
+            .copied()
+            .chain(block_fns.iter().map(|(n, _)| *n))
+        {
             if !self.can_declare_global_function(g, name) {
                 let m = self.new_str(&alloc::format!("Cannot declare global function '{name}'"));
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
@@ -6379,11 +6422,11 @@ impl<'a> Interp<'a> {
         {
             let mut var_names: Vec<&str> = Vec::new();
             collect_var_names(&program.body, &mut var_names);
-            let mut block_fns: Vec<&str> = Vec::new();
+            let mut block_fns: Vec<(&str, Span)> = Vec::new();
             collect_block_function_names(&program.body, &mut block_fns);
             if var_names
                 .iter()
-                .chain(block_fns.iter())
+                .chain(block_fns.iter().map(|(n, _)| n))
                 .any(|n| param_names.iter().any(|p| p == n))
             {
                 let m =
@@ -6684,7 +6727,7 @@ impl<'a> Interp<'a> {
             // lexical declaration of that block, so its name must not appear in
             // the variable environment at all and a reference outside the block is
             // a ReferenceError.
-            let mut block_fn_names: Vec<&str> = Vec::new();
+            let mut block_fn_names: Vec<(&str, Span)> = Vec::new();
             if !self.strict {
                 collect_block_function_names(stmts, &mut block_fn_names);
             }
@@ -6693,12 +6736,12 @@ impl<'a> Interp<'a> {
             // variable environment (where the function-code extension B.3.3.2 does
             // not apply). In eval code (B.3.3.3) such a collision is permitted, so
             // the binding is still updated.
-            for name in &block_fn_names {
+            for (name, span) in &block_fn_names {
                 if eval_code || !self.var_scope.has_local(name) {
-                    self.annexb_block_fns.push(String::from(*name));
+                    self.annexb_block_fns.push((String::from(*name), *span));
                 }
             }
-            var_names.extend_from_slice(&block_fn_names);
+            var_names.extend(block_fn_names.iter().map(|(n, _)| *n));
             let at_global = self.var_scope.ptr_eq(&self.global_scope);
             let global_obj = self.global_this.as_handle().map(Handle::from_raw);
             for name in var_names {
@@ -7376,15 +7419,38 @@ fn collect_binding_idents<'a>(target: &'a BindingTarget, out: &mut Vec<&'a str>)
 /// and including the function/eval top-level lexical scope). In that case the
 /// legacy var-hoisting extension is skipped. The immediate top-level functions
 /// are excluded — they are bound directly by the hoisting loop.
-fn collect_block_function_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
+fn collect_block_function_names<'a>(stmts: &'a [Stmt], out: &mut Vec<(&'a str, Span)>) {
     use core::slice::from_ref;
     // `blocked` is the set of names lexically declared in any enclosing block on
     // the current path; a block function with such a name is not var-hoisted.
-    fn walk<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>, in_block: bool, blocked: &[&'a str]) {
+    fn walk<'a>(
+        stmts: &'a [Stmt],
+        out: &mut Vec<(&'a str, Span)>,
+        in_block: bool,
+        blocked: &[&'a str],
+    ) {
         // Lexical names declared directly in this statement list shadow a
         // same-named block function nested deeper (Annex B early-error guard).
         let mut blocked_here: Vec<&str> = blocked.to_vec();
         collect_lexical_names(stmts, &mut blocked_here);
+        // A *block's* own function declarations are lexical declarations of that
+        // block, so they block a same-named declaration nested deeper: replacing
+        // the inner one with `var f` would collide with the outer block's lexical
+        // `f` and be an early error, which is exactly what B.3.3.1's "would not
+        // produce any Early Errors" test rejects. (At a function/eval/program top
+        // level — `in_block` false — function declarations are *var*-scoped, so
+        // they block nothing.) The block's own declarations are still applicable:
+        // the per-statement test below reads the enclosing `blocked`, and the
+        // hypothetical replacement removes the very declaration being tested.
+        if in_block {
+            for stmt in stmts {
+                if let Stmt::Function(f) = stmt
+                    && let Some(id) = &f.id
+                {
+                    blocked_here.push(&id.name);
+                }
+            }
+        }
 
         for stmt in stmts {
             match stmt {
@@ -7395,7 +7461,11 @@ fn collect_block_function_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
                     if let Some(id) = &f.id
                         && !blocked.contains(&&*id.name)
                     {
-                        out.push(&id.name);
+                        // The declaration's own span, not just its name: a *nested*
+                        // block may redeclare the same name without qualifying (the
+                        // outer block's lexical `f` blocks it), and the runtime
+                        // update must fire only for the qualifying declaration.
+                        out.push((&id.name, f.span));
                     }
                 }
                 Stmt::Block { body, .. } => walk(body, out, true, &blocked_here),

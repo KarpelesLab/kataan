@@ -9,6 +9,10 @@ pub(crate) enum RealmGuard {
         realm: Option<usize>,
         global_this: NanBox,
         global_scope: Scope,
+        /// The caller realm's realm-wide intrinsic slots (`%Object.prototype%`,
+        /// `%Symbol.prototype%`, `%ThrowTypeError%`, …), which live in one set of
+        /// `Realm` fields rather than per-realm ones.
+        intrinsics: RealmIntrinsics,
     },
 }
 
@@ -225,21 +229,35 @@ impl<'a> Interp<'a> {
         if realm == self.cur_realm {
             return RealmGuard::Unchanged;
         }
-        let (gt, gs) = match realm {
+        let (gt, gs, intr) = match realm {
             Some(idx) if idx < self.created_realms.len() => (
                 self.created_realms[idx].global_this,
                 self.created_realms[idx].global_scope.clone(),
+                self.created_realms[idx].intrinsics,
             ),
-            _ => (self.main_global_this, self.main_global_scope.clone()),
+            _ => (
+                self.main_global_this,
+                self.main_global_scope.clone(),
+                self.main_intrinsics,
+            ),
         };
         let guard = RealmGuard::Swapped {
             realm: self.cur_realm,
             global_this: self.global_this,
             global_scope: self.global_scope.clone(),
+            intrinsics: self.realm.intrinsics_snapshot(),
         };
         self.cur_realm = realm;
         self.global_this = gt;
         self.global_scope = gs;
+        // The realm-wide intrinsic slots are a *single* set of `Realm` fields, so
+        // entering a realm must swap them: they are what a primitive's
+        // `[[Prototype]]` (`%Symbol.prototype%`, `%BigInt.prototype%`), an ordinary
+        // object literal's proto, and the one-per-realm `%ThrowTypeError%` resolve
+        // through — none of which take a realm parameter. Leaving them pinned to
+        // whichever realm was built last is what made `ToObject(sym)` inside a
+        // cross-realm `eval` reach the *main* realm's `%Symbol.prototype%`.
+        self.realm.restore_intrinsics(intr);
         guard
     }
 
@@ -249,11 +267,13 @@ impl<'a> Interp<'a> {
             realm,
             global_this,
             global_scope,
+            intrinsics,
         } = guard
         {
             self.cur_realm = realm;
             self.global_this = global_this;
             self.global_scope = global_scope;
+            self.realm.restore_intrinsics(intrinsics);
         }
     }
 

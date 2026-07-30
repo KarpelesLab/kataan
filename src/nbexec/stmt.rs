@@ -137,7 +137,7 @@ impl<'a> Interp<'a> {
                     && self
                         .annexb_block_fns
                         .iter()
-                        .any(|n| n.as_str() == &*id.name)
+                        .any(|(n, sp)| n.as_str() == &*id.name && *sp == func.span)
                     && let Some(value) = self.current.get(&id.name)
                 {
                     self.annexb_update_var(&id.name, value);
@@ -641,7 +641,7 @@ impl<'a> Interp<'a> {
             if self
                 .annexb_block_fns
                 .iter()
-                .any(|n| n.as_str() == &*id.name)
+                .any(|(n, sp)| n.as_str() == &*id.name && *sp == func.span)
             {
                 self.annexb_update_var(&id.name, value);
             }
@@ -947,6 +947,18 @@ impl<'a> Interp<'a> {
                 for prop in &pat.properties {
                     // A computed key (`{ [expr]: t }`) is evaluated here.
                     let key = self.eval_prop_key(&prop.key)?;
+                    // KeyedBindingInitialization step 2 resolves the *binding* —
+                    // `ResolveBinding(bindingId, environment)` — **before** step 3's
+                    // `GetV(value, propertyName)`. That order is observable inside a
+                    // `with`: resolving the binding runs `HasBinding` on each object
+                    // environment record, firing a proxy `has` trap (and propagating a
+                    // throwing one) before the source property is read. Declaring the
+                    // binding straight into the current scope skipped the probe
+                    // entirely. Only a `SingleNameBinding` leaf has a bindingId; a
+                    // nested pattern recurses and resolves its own leaves later.
+                    if let BindingTarget::Ident(Ident { name, .. }) = &prop.value {
+                        self.with_binding_result(name)?;
+                    }
                     // Read through `read_member` so accessors fire and inherited /
                     // string-length / array-length properties resolve (not just own
                     // data slots).

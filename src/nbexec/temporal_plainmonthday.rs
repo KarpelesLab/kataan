@@ -351,13 +351,41 @@ impl<'a> Interp<'a> {
 
     /// Resolves a calendar `(monthCode, day)` to its ISO reference date, honoring
     /// `overflow` for a day that does not occur in any candidate year.
-    fn pmd_reference(
+    pub(crate) fn pmd_reference(
         &mut self,
         cal: &str,
         mc: &str,
         day: i64,
         overflow: Overflow,
     ) -> Result<IsoDate, ExecError> {
+        // Chinese/Dangi take the tabulated path of
+        // `NonISOMonthDayToISOReferenceDate` steps 4.c / 4.f-g: whether a leap
+        // month-day has a reference year at all is fixed by Table 6, not by a
+        // free ephemeris search (see `chinese_table6_has_reference`).
+        if matches!(cal, "chinese" | "dangi") {
+            // 4.c: a lunisolar month never exceeds 30 days.
+            let mut day = day;
+            if day > 30 {
+                if overflow == Overflow::Reject {
+                    return Err(self.pmd_range_error("PlainMonthDay: day is out of range"));
+                }
+                day = 30;
+            }
+            // 4.f-g: a "—" cell collapses the leap code onto its base month.
+            let mut code = String::from(mc);
+            if !chinese_table6_has_reference(&code, day) {
+                if overflow == Overflow::Reject {
+                    return Err(self.pmd_range_error("PlainMonthDay: monthCode/day does not exist"));
+                }
+                if let Some(base) = tcal::constrain_leap_base_code(cal, &code) {
+                    code = base;
+                }
+            }
+            return match self.pmd_ref_search(cal, &code, day) {
+                Some(iso) => Ok(iso),
+                None => Err(self.pmd_range_error("PlainMonthDay: monthCode/day does not exist")),
+            };
+        }
         if let Some(iso) = self.pmd_ref_search(cal, mc, day) {
             return Ok(iso);
         }
@@ -619,7 +647,15 @@ impl<'a> Interp<'a> {
                 }
             }
             let f = tcal::iso_to_fields(cal, iso);
-            self.pmd_reference(cal, &f.month_code, f.day, Overflow::Reject)
+            // The year context only resolved the ordinal and clamped the day;
+            // re-anchoring that (monthCode, day) onto its reference year is still
+            // `NonISOMonthDayToISOReferenceDate`, and it runs under the *caller's*
+            // overflow. A Chinese/Dangi leap month-day that exists in the given
+            // year but has no Table 6 reference year (e.g. `M08L`-30) therefore
+            // collapses onto the base month under `constrain` and throws a
+            // RangeError under `reject`, instead of the year silently vouching
+            // for it.
+            self.pmd_reference(cal, &f.month_code, f.day, overflow)
         } else {
             // monthCode + day only: the reference search does the constraining.
             let mc = month_code.unwrap();
@@ -929,7 +965,10 @@ impl<'a> Interp<'a> {
         };
         let iso = self.pmd_layer_fields(cal, &input, overflow)?;
         let f = tcal::iso_to_fields(cal, iso);
-        let result = self.pmd_reference(cal, &f.month_code, f.day, Overflow::Reject)?;
+        // Re-anchoring onto the reference year is still
+        // `NonISOMonthDayToISOReferenceDate`, so it runs under the caller's
+        // overflow (see the matching note in `pmd_fields_to_iso_cal`).
+        let result = self.pmd_reference(cal, &f.month_code, f.day, overflow)?;
         Ok(self.pmd_new(result, cal))
     }
 
@@ -1083,6 +1122,40 @@ impl<'a> Interp<'a> {
 /// The nth argument, or `undefined`.
 fn arg_or_undef(args: &[NanBox], i: usize) -> NanBox {
     args.get(i).copied().unwrap_or_else(NanBox::undefined)
+}
+
+/// Table 6 of `NonISOMonthDayToISOReferenceDate`: does the Chinese/Dangi
+/// `month_code` have a reference year for `day`?
+///
+/// The table has two columns — "Reference Year (Days 1-29)" and "Reference Year
+/// (Day 30)" — and a `"—"` cell means *no reference year exists*, which the
+/// algorithm turns into a RangeError under `reject` and a collapse onto the base
+/// (non-leap) month under `constrain`.
+///
+/// The table is normative and shared by both calendars, so it is spelled out
+/// here rather than derived from the ephemeris. Deriving it would be wrong twice
+/// over: the "never occurs" cells mean "not within the range in which these
+/// calendars are considered accurately computable", which no bounded search can
+/// express, and the Chinese and Dangi meridians disagree about some of them (the
+/// Korean meridian really does put a 30-day `M08L` in 2052, yet Table 6 lists
+/// `M08L` day 30 as `"—"` for *both* calendars).
+///
+/// Non-leap codes always have both reference years; of the leap codes, `M01L`
+/// and `M12L` have neither, and only `M03L`..`M07L` reach day 30.
+fn chinese_table6_has_reference(month_code: &str, day: i64) -> bool {
+    let Some(num) = month_code
+        .strip_prefix('M')
+        .and_then(|r| r.strip_suffix('L'))
+        .and_then(|n| n.parse::<u8>().ok())
+    else {
+        // A regular `M01`..`M12` (or a malformed code, left to the search).
+        return true;
+    };
+    if day >= 30 {
+        (3..=7).contains(&num)
+    } else {
+        (2..=11).contains(&num)
+    }
 }
 
 /// Whether `date` is within the ISO plain-date range (noon-based bounds, no
