@@ -19,9 +19,9 @@ const STAGES = [
 // it is the only literal to touch by hand, when the corpus itself changes size.
 const CONFORMANCE = {
   rate: '99.86%',
-  passing: '51,816',
+  passing: '51,818',
   ran: '51,890',
-  ledger: 74,
+  ledger: 72,
   clusters: [
     { name: 'annexB/built-ins', count: 8 },
     { name: 'intl402/Temporal', count: 8 },
