@@ -2,14 +2,7 @@
 # Regenerate with KATAAN_TEST262_BLESS=1. Target: empty (literal 100%).
 annexB/built-ins/RegExp/RegExp-leading-escape-BMP.js  # [sloppy] expected pass, Runtime Test262Error: Code unit: d800 Expected SameValue(«"\\�"», «"\\\ud800"») to be true
 annexB/built-ins/RegExp/RegExp-trailing-escape-BMP.js  # [sloppy] expected pass, Runtime Test262Error: Code unit: d800 Expected SameValue(«"a\\�"», «"a\\\ud800"») to be true
-annexB/built-ins/RegExp/legacy-accessors/index/this-cross-realm-constructor.js  # [sloppy] expected pass, Runtime Test262Error: RegExp.$1 getter throws for cross-realm receiver Expected a TypeError to be thrown but no exception was thrown at all
-annexB/built-ins/RegExp/legacy-accessors/input/this-cross-realm-constructor.js  # [sloppy] expected pass, Runtime Test262Error: RegExp.input getter throws for cross-realm receiver Expected a TypeError to be thrown but no exception was thrown at all
-annexB/built-ins/RegExp/legacy-accessors/lastMatch/this-cross-realm-constructor.js  # [sloppy] expected pass, Runtime Test262Error: RegExp.lastMatch getter throws for cross-realm receiver Expected a TypeError to be thrown but no exception was thrown at all
-annexB/built-ins/RegExp/legacy-accessors/lastParen/this-cross-realm-constructor.js  # [sloppy] expected pass, Runtime Test262Error: RegExp.lastParen getter throws for cross-realm receiver Expected a TypeError to be thrown but no exception was thrown at all
-annexB/built-ins/RegExp/legacy-accessors/leftContext/this-cross-realm-constructor.js  # [sloppy] expected pass, Runtime Test262Error: RegExp.leftContext getter throws for cross-realm receiver Expected a TypeError to be thrown but no exception was thrown at all
-annexB/built-ins/RegExp/legacy-accessors/rightContext/this-cross-realm-constructor.js  # [sloppy] expected pass, Runtime Test262Error: RegExp.rightContext getter throws for cross-realm receiver Expected a TypeError to be thrown but no exception was thrown at all
 annexB/language/function-code/block-decl-nested-blocks-with-fun-decl.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«2», «1») to be true
-annexB/language/statements/for-in/nonstrict-initializer.js  # [sloppy] expected pass, Parse SyntaxError: SyntaxError: expected Semicolon, found Keyword(In) (at 7116..7118)
 built-ins/AsyncDisposableStack/prototype/disposeAsync/explicit-await-for-null.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [dispose, job 1, job 2] and expected [job 1, dispose, job 2])
 built-ins/AsyncDisposableStack/prototype/disposeAsync/explicit-await-for-undefined.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Actual [dispose, job 1, job 2] and expected [job 1, dispose, job 2])
 built-ins/Error/prototype/stack/setter-cross-realm.js  # crash or timeout (native abort / hang)

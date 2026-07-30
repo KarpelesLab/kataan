@@ -66,6 +66,11 @@ pub enum Stmt {
         left: ForLeft,
         right: Box<Expr>,
         body: Box<Stmt>,
+        /// The head carried an Annex B.3.5 initializer (`for (var x = 1 in o)`),
+        /// which the initializer's assignment has already been desugared out of.
+        /// Retained only so the validator can reject the form in strict code,
+        /// where B.3.5 does not apply.
+        annexb_init: bool,
         span: Span,
     },
     /// A `for (left of right) body` loop. `is_await` marks `for await (…)`, which

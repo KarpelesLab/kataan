@@ -333,6 +333,19 @@ impl Validator {
             | Stmt::ForOf {
                 left, right, body, ..
             } => {
+                // Annex B.3.5 (`for (var x = <expr> in obj)`) is a sloppy-mode-only
+                // web-compatibility extension; the grammar proper has no
+                // initializer here, so strict code must reject it.
+                if let Stmt::ForIn {
+                    annexb_init: true, ..
+                } = stmt
+                    && ctx.strict
+                {
+                    return Err(self.err(
+                        stmt.span(),
+                        "a `for-in` head may not have an initializer in strict mode",
+                    ));
+                }
                 self.for_left(left, ctx)?;
                 // It is a Syntax Error if any element of the BoundNames of a
                 // `let`/`const`/`using`/`await using` ForDeclaration also occurs

@@ -273,10 +273,24 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// The `%RegExp%` intrinsic constructor handle (recorded at setup), used to
-    /// brand-check the Annex B.2.5 legacy static accessors.
+    /// The **running realm's** `%RegExp%` constructor, used to brand-check the
+    /// Annex B.2.5 legacy static accessors.
+    ///
+    /// Resolved from `global_scope` — which `enter_realm` swaps — rather than from
+    /// the `regexp_ctor` field, which is a single slot that realm setup overwrites:
+    /// creating a second realm left the brand check comparing against whichever
+    /// realm was built last, so a cross-realm receiver silently passed a check
+    /// whose entire purpose is to reject it. The global *scope* is used rather than
+    /// the scope chain so a local named `RegExp` cannot stand in for the intrinsic.
+    ///
+    /// `regexp_ctor` remains as the fallback for the pre-realm setup window, where
+    /// the binding is not published yet.
     pub(crate) fn regexp_constructor_handle(&mut self) -> Result<Handle, ExecError> {
-        self.regexp_ctor
+        self.global_scope
+            .get("RegExp")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .or(self.regexp_ctor)
             .ok_or_else(|| self.type_error("RegExp constructor is not available"))
     }
 

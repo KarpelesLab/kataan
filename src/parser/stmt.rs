@@ -22,8 +22,14 @@ enum ForHead {
     Empty,
     /// `for (init;` — a classic C-style loop (the first `;` is consumed).
     Classic(Option<ForInit>),
-    /// `for (left in/of` — an iteration loop.
-    InOf { left: ForLeft, is_of: bool },
+    /// `for (left in/of` — an iteration loop. `b35_init` is the Annex B.3.5
+    /// initializer of a sloppy `for (var x = <expr> in obj)`, which the grammar
+    /// otherwise forbids.
+    InOf {
+        left: ForLeft,
+        is_of: bool,
+        b35_init: Option<(Box<str>, Expr)>,
+    },
 }
 
 impl<'src> Parser<'src> {
@@ -797,7 +803,42 @@ impl<'src> Parser<'src> {
         match head {
             ForHead::Empty => self.finish_for_classic(start, None),
             ForHead::Classic(init) => self.finish_for_classic(start, init),
-            ForHead::InOf { left, is_of } => self.finish_for_in_of(start, left, is_of, is_await),
+            ForHead::InOf {
+                left,
+                is_of,
+                b35_init,
+            } => {
+                let loop_stmt = self.finish_for_in_of(start, left, is_of, is_await)?;
+                // Annex B.3.5 evaluates the initializer once, *before* the loop's
+                // right-hand side. Desugaring to `{ var x = <init>; for (var x in
+                // obj) … }` gives exactly that: `var` hoists out of the block, so
+                // the binding is unchanged, and the assignment statement has an
+                // empty completion so the block's completion is still the loop's.
+                match b35_init {
+                    None => Ok(loop_stmt),
+                    Some((name, init)) => {
+                        let mut loop_stmt = loop_stmt;
+                        if let Stmt::ForIn { annexb_init, .. } = &mut loop_stmt {
+                            *annexb_init = true;
+                        }
+                        let span = init.span();
+                        let assign = Stmt::Expr {
+                            expression: Box::new(Expr::Assign {
+                                op: crate::ast::AssignOp::Assign,
+                                target: Box::new(Expr::Ident(Ident { name, span })),
+                                value: Box::new(init),
+                                paren_target: false,
+                                span,
+                            }),
+                            span,
+                        };
+                        Ok(Stmt::Block {
+                            body: alloc::vec![assign, loop_stmt],
+                            span: start.to(self.prev_span()),
+                        })
+                    }
+                }
+            }
         }
     }
 
@@ -859,6 +900,31 @@ impl<'src> Parser<'src> {
             } else {
                 None
             };
+            // Annex B.3.5: `for (var x = <expr> in obj)` is legal in sloppy code.
+            // Only for `var`, only a plain binding identifier (not a pattern), and
+            // never for `for-of` or `for await`. The head reaches here because the
+            // `=` was consumed as a classic-loop initializer; an `in` now means it
+            // was really this production.
+            if kind == VarDeclKind::Var
+                && init.is_some()
+                && !is_await
+                && self.at(TokenKind::Keyword(Kw::In))
+                && let crate::ast::BindingTarget::Ident(id) = &target
+            {
+                let name = id.name.clone();
+                let init = init.expect("checked above");
+                self.bump(); // `in`
+                let ForHead::InOf { left, is_of, .. } =
+                    self.decl_for_left(kind, target, kw.span, false)
+                else {
+                    unreachable!("decl_for_left returns InOf")
+                };
+                return Ok(ForHead::InOf {
+                    left,
+                    is_of,
+                    b35_init: Some((name, init)),
+                });
+            }
             let first = VarDeclarator {
                 target,
                 init,
@@ -907,6 +973,7 @@ impl<'src> Parser<'src> {
                     span: start.to(self.prev_span()),
                 },
                 is_of: true,
+                b35_init: None,
             });
         }
         // Classic loop: `using x = e [, y = e2 …] ;`.
@@ -956,6 +1023,7 @@ impl<'src> Parser<'src> {
                 span: kw_span.to(self.prev_span()),
             },
             is_of,
+            b35_init: None,
         }
     }
 
@@ -972,6 +1040,7 @@ impl<'src> Parser<'src> {
         Ok(ForHead::InOf {
             left: ForLeft::Target(Box::new(expr)),
             is_of,
+            b35_init: None,
         })
     }
 
@@ -1034,6 +1103,7 @@ impl<'src> Parser<'src> {
                 right,
                 body,
                 span,
+                annexb_init: false,
             }
         })
     }
