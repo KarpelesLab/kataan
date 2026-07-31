@@ -4907,55 +4907,74 @@ impl<'a> Interp<'a> {
         (get("type", "conjunction"), get("style", "long"))
     }
 
-    /// The number separators for an `Intl.RelativeTimeFormat` instance's resolved
-    /// locale and numbering system. `(",", ".")` without the `intl` feature.
-    pub(crate) fn rel_time_separators(&mut self, fmt: Option<Handle>) -> (String, String) {
+    /// `PartitionRelativeTimePattern` for a formatter instance: CLDR-backed when
+    /// the `intl` feature is on, else the English fallback.
+    pub(crate) fn rel_time_partition(
+        &mut self,
+        fmt: Option<Handle>,
+        value: f64,
+        unit: &str,
+        numeric: &str,
+        style: &str,
+    ) -> Vec<(&'static str, String, bool)> {
         #[cfg(feature = "intl")]
         {
             let locale = fmt
                 .and_then(|h| self.realm.get_property(h, "\u{0}locale"))
                 .map(|v| self.realm.to_display_string(v))
                 .unwrap_or_else(|| String::from("en"));
-            let nu = fmt
-                .and_then(|h| self.realm.get_property(h, "numberingSystem"))
-                .map(|v| self.realm.to_display_string(v))
-                .unwrap_or_default();
-            self.number_separators(&locale, &nu)
+            self.rel_time_parts_cldr(&locale, value, unit, numeric, style)
         }
         #[cfg(not(feature = "intl"))]
         {
             let _ = fmt;
-            (String::from(","), String::from("."))
+            crate::nbexec::rel_time_parts(value, unit, numeric, style, ",", ".")
         }
     }
 
-    /// The group and decimal separators the locale's `%NumberFormat%` would use.
+    /// `PartitionRelativeTimePattern` — the `(type, value, has_unit)` parts of an
+    /// `Intl.RelativeTimeFormat` `format`/`formatToParts`, from CLDR.
     ///
-    /// `PartitionRelativeTimePattern` step 11 formats the magnitude through the
-    /// instance's `[[NumberFormat]]`, so the separators must be the locale's, not
-    /// ASCII: `en-US-u-nu-arab` groups with U+066C. Recovered by formatting a
-    /// probe and reading the non-digit runs out of it, which is exact because the
-    /// probe's digit positions are known.
+    /// The crate splices `NumberFormat` parts into the locale's relative-time
+    /// pattern, which is exactly ECMA-402's construction, so the unit wording, the
+    /// `numeric: "auto"` literals ("yesterday", "übermorgen"), the short/narrow
+    /// widths and the number's own separators and numbering system all come from
+    /// the locale rather than from an English table.
     #[cfg(feature = "intl")]
-    pub(crate) fn number_separators(&self, locale: &str, nu: &str) -> (String, String) {
-        // Two probes: a grouped one for the group separator, and an *ungrouped*
-        // one for the decimal. `split_number_scaffold` returns the separator after
-        // the first digit run, which in `1,111.5` is the group separator — reading
-        // the decimal off the same probe silently yields the group one.
-        let group = extract_group_sep(&intl::number::format_decimal(locale, 1111.0), nu);
-        let (_, decimal, _) = split_number_scaffold(&intl::number::format_decimal(locale, 1.5), nu);
-        (
-            if group.is_empty() {
-                String::from(",")
-            } else {
-                group
-            },
-            if decimal.is_empty() {
-                String::from(".")
-            } else {
-                decimal
-            },
-        )
+    pub(crate) fn rel_time_parts_cldr(
+        &self,
+        locale: &str,
+        value: f64,
+        unit: &str,
+        numeric: &str,
+        style: &str,
+    ) -> Vec<(&'static str, String, bool)> {
+        use intl::relative::{RelativeNumeric, RelativeUnit, RelativeWidth};
+        let ru = match unit {
+            "second" => RelativeUnit::Second,
+            "minute" => RelativeUnit::Minute,
+            "hour" => RelativeUnit::Hour,
+            "day" => RelativeUnit::Day,
+            "week" => RelativeUnit::Week,
+            "month" => RelativeUnit::Month,
+            "quarter" => RelativeUnit::Quarter,
+            _ => RelativeUnit::Year,
+        };
+        let mut opts = intl::relative::RelativeTimeFormatOptions::default();
+        opts.numeric = if numeric == "auto" {
+            RelativeNumeric::Auto
+        } else {
+            RelativeNumeric::Always
+        };
+        opts.width = match style {
+            "short" => RelativeWidth::Short,
+            "narrow" => RelativeWidth::Narrow,
+            _ => RelativeWidth::Long,
+        };
+        intl::relative::format_relative_to_parts(locale, value, ru, &opts)
+            .into_iter()
+            .map(|p| (p.kind.as_str(), p.value, p.unit.is_some()))
+            .collect()
     }
 
     /// Maps ECMA-402 `type`/`style` onto the crate's list options.

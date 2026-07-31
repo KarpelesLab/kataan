@@ -799,12 +799,15 @@ fn manage_shard(
     // loop or catastrophic backtracking) — the child is killed and the in-flight
     // test recorded as a failure, exactly like a native crash.
     //
-    // A hang costs this much wall clock every time one is hit, and the suite hits
-    // ~20 by design (the `$262.agent` tests that need true interleaving), so it
-    // wants to be as small as is safely possible. It is *not* the knob for
-    // spurious failures: those came from workers crossing the address-space cap
-    // below, which aborts rather than stalls — see `KillReason`.
-    const IDLE_TIMEOUT_SECS: u64 = 30;
+    // Generous, because nothing in the suite hangs deliberately any more: the
+    // `$262.agent` tests that used to (~20 of them) now run on real agent threads
+    // and pass. So the only cost of a long bound is how quickly a genuine hang is
+    // detected, whereas a short one manufactures failures — progress is written
+    // per *test*, and the slowest tests here run both sloppy and strict modes at
+    // ~7s each, which exceeds a 30s bound under load. That is a false positive on
+    // a test that passes in isolation, which is the most misleading result the
+    // harness can produce.
+    const IDLE_TIMEOUT_SECS: u64 = 120;
     // Hard per-worker address-space cap (KiB) enforced via `ulimit -v`. A test
     // with an unbounded allocation (e.g. a typed array / ArrayBuffer / string of
     // pathological size) hits this ceiling, its allocation is refused, the worker

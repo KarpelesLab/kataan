@@ -3204,17 +3204,11 @@ impl<'a> Interp<'a> {
                     let m = self.new_str("value must be finite");
                     return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                 }
-                let (group_sep, decimal_sep) = self.rel_time_separators(fmt);
-                let parts =
-                    rel_time_parts(value, &unit, &numeric, &style, &group_sep, &decimal_sep);
+                // The crate splices `NumberFormat` parts into the locale's
+                // relative-time pattern, so the numbering system and separators
+                // are already applied — no post-substitution here.
+                let parts = self.rel_time_partition(fmt, value, &unit, &numeric, &style);
                 let out: String = parts.into_iter().map(|(_, v, _)| v).collect();
-                // PartitionRelativeTimePattern formats the magnitude through the
-                // instance's [[NumberFormat]], so the resolved numbering system's
-                // digits apply (e.g. an `-u-nu-arab` locale renders Arabic-Indic).
-                let out = match fmt {
-                    Some(h) => self.apply_numbering_digits(h, out),
-                    None => out,
-                };
                 self.new_str(&out)
             }
             // `Intl.DisplayNames(...)` without `new`.
@@ -3524,9 +3518,7 @@ impl<'a> Interp<'a> {
                         let m = self.new_str("value must be finite");
                         return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                     }
-                    let (group_sep, decimal_sep) = self.rel_time_separators(fmt);
-                    let parts =
-                        rel_time_parts(value, &unit, &numeric, &style, &group_sep, &decimal_sep);
+                    let parts = self.rel_time_partition(fmt, value, &unit, &numeric, &style);
                     let mut arr_elems = Vec::with_capacity(parts.len());
                     for (ty, val, with_unit) in parts {
                         let o = self.realm.new_object();
