@@ -3172,31 +3172,15 @@ impl<'a> Interp<'a> {
                 // The `intl` crate supplies locale-aware conjunction/disjunction
                 // connectors (e.g. Spanish "y"/"o"); `unit` (and the non-intl
                 // build) use the hardcoded en list patterns.
-                #[cfg(feature = "intl")]
-                {
-                    // The crate is locale-aware only for conjunction/disjunction
-                    // in the *long* style; short/narrow and `unit` route through
-                    // the (English) CLDR pattern table below so `format` and
-                    // `formatToParts` agree.
-                    let crate_style = match (list_type.as_str(), style.as_str()) {
-                        ("disjunction", "long") => Some(intl::list::ListStyle::Or),
-                        ("conjunction", "long") => Some(intl::list::ListStyle::And),
-                        _ => None,
-                    };
-                    if let Some(crate_style) = crate_style {
-                        let locale = fmt
-                            .and_then(|h| self.realm.get_property(h, "\u{0}locale"))
-                            .map(|v| self.realm.to_display_string(v))
-                            .unwrap_or_else(|| String::from("en"));
-                        let refs: Vec<&str> = items.iter().map(String::as_str).collect();
-                        return Ok(self.new_str(&intl::list::format_list(
-                            &locale,
-                            &refs,
-                            crate_style,
-                        )));
-                    }
-                }
-                let parts = self.list_format_parts(&items, &list_type, &style);
+                // `format` is the concatenation of `formatToParts`, so both go
+                // through one path — the crate now covers all nine `type` x
+                // `style` combinations, and deriving one from the other is what
+                // keeps them from disagreeing.
+                let locale = fmt
+                    .and_then(|h| self.realm.get_property(h, "\u{0}locale"))
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_else(|| String::from("en"));
+                let parts = self.list_format_parts(&items, &list_type, &style, &locale);
                 let out: String = parts.into_iter().map(|(_, v)| v).collect();
                 self.new_str(&out)
             }
@@ -3220,7 +3204,9 @@ impl<'a> Interp<'a> {
                     let m = self.new_str("value must be finite");
                     return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                 }
-                let parts = rel_time_parts(value, &unit, &numeric, &style);
+                let (group_sep, decimal_sep) = self.rel_time_separators(fmt);
+                let parts =
+                    rel_time_parts(value, &unit, &numeric, &style, &group_sep, &decimal_sep);
                 let out: String = parts.into_iter().map(|(_, v, _)| v).collect();
                 // PartitionRelativeTimePattern formats the magnitude through the
                 // instance's [[NumberFormat]], so the resolved numbering system's
@@ -3502,7 +3488,11 @@ impl<'a> Interp<'a> {
                 {
                     let (list_type, style) = self.list_format_type_style(Some(h));
                     let items = self.string_list_from_iterable(arg(0))?;
-                    let parts = self.list_format_parts(&items, &list_type, &style);
+                    let locale = fmt
+                        .and_then(|h| self.realm.get_property(h, "\u{0}locale"))
+                        .map(|v| self.realm.to_display_string(v))
+                        .unwrap_or_else(|| String::from("en"));
+                    let parts = self.list_format_parts(&items, &list_type, &style, &locale);
                     let mut arr_elems = Vec::with_capacity(parts.len());
                     for (ty, val) in parts {
                         let o = self.realm.new_object();
@@ -3534,7 +3524,9 @@ impl<'a> Interp<'a> {
                         let m = self.new_str("value must be finite");
                         return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                     }
-                    let parts = rel_time_parts(value, &unit, &numeric, &style);
+                    let (group_sep, decimal_sep) = self.rel_time_separators(fmt);
+                    let parts =
+                        rel_time_parts(value, &unit, &numeric, &style, &group_sep, &decimal_sep);
                     let mut arr_elems = Vec::with_capacity(parts.len());
                     for (ty, val, with_unit) in parts {
                         let o = self.realm.new_object();

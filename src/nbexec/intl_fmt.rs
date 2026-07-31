@@ -4907,16 +4907,132 @@ impl<'a> Interp<'a> {
         (get("type", "conjunction"), get("style", "long"))
     }
 
-    /// The `(literal-or-element, value)` parts of an `Intl.ListFormat` `format`/
-    /// `formatToParts` over `items`, for the given `type` and `style`. The English
-    /// CLDR patterns are hardcoded (the `intl` 0.4 crate exposes only and/or
-    /// connectors, not the per-`type`/`style` list patterns, nor `unit`); these
-    /// match the en-US output the conformance tests require.
+    /// The number separators for an `Intl.RelativeTimeFormat` instance's resolved
+    /// locale and numbering system. `(",", ".")` without the `intl` feature.
+    pub(crate) fn rel_time_separators(&mut self, fmt: Option<Handle>) -> (String, String) {
+        #[cfg(feature = "intl")]
+        {
+            let locale = fmt
+                .and_then(|h| self.realm.get_property(h, "\u{0}locale"))
+                .map(|v| self.realm.to_display_string(v))
+                .unwrap_or_else(|| String::from("en"));
+            let nu = fmt
+                .and_then(|h| self.realm.get_property(h, "numberingSystem"))
+                .map(|v| self.realm.to_display_string(v))
+                .unwrap_or_default();
+            self.number_separators(&locale, &nu)
+        }
+        #[cfg(not(feature = "intl"))]
+        {
+            let _ = fmt;
+            (String::from(","), String::from("."))
+        }
+    }
+
+    /// The group and decimal separators the locale's `%NumberFormat%` would use.
+    ///
+    /// `PartitionRelativeTimePattern` step 11 formats the magnitude through the
+    /// instance's `[[NumberFormat]]`, so the separators must be the locale's, not
+    /// ASCII: `en-US-u-nu-arab` groups with U+066C. Recovered by formatting a
+    /// probe and reading the non-digit runs out of it, which is exact because the
+    /// probe's digit positions are known.
+    #[cfg(feature = "intl")]
+    pub(crate) fn number_separators(&self, locale: &str, nu: &str) -> (String, String) {
+        // Two probes: a grouped one for the group separator, and an *ungrouped*
+        // one for the decimal. `split_number_scaffold` returns the separator after
+        // the first digit run, which in `1,111.5` is the group separator — reading
+        // the decimal off the same probe silently yields the group one.
+        let group = extract_group_sep(&intl::number::format_decimal(locale, 1111.0), nu);
+        let (_, decimal, _) = split_number_scaffold(&intl::number::format_decimal(locale, 1.5), nu);
+        (
+            if group.is_empty() {
+                String::from(",")
+            } else {
+                group
+            },
+            if decimal.is_empty() {
+                String::from(".")
+            } else {
+                decimal
+            },
+        )
+    }
+
+    /// Maps ECMA-402 `type`/`style` onto the crate's list options.
+    #[cfg(feature = "intl")]
+    fn list_format_options(list_type: &str, style: &str) -> intl::list::ListFormatOptions {
+        use intl::list::{ListType, ListWidth};
+        // `#[non_exhaustive]`: build from `Default` and assign, rather than a
+        // struct literal.
+        let mut opts = intl::list::ListFormatOptions::default();
+        opts.list_type = match list_type {
+            "disjunction" => ListType::Disjunction,
+            "unit" => ListType::Unit,
+            _ => ListType::Conjunction,
+        };
+        opts.width = match style {
+            "short" => ListWidth::Short,
+            "narrow" => ListWidth::Narrow,
+            _ => ListWidth::Long,
+        };
+        opts
+    }
+
+    /// The `(literal-or-element, value)` parts of an `Intl.ListFormat` `format` /
+    /// `formatToParts`, from the crate's CLDR `listPattern`s for all nine
+    /// `type` x `style` combinations.
+    ///
+    /// The crate formats a whole list and exposes no parts API, so the literals
+    /// are recovered by formatting **sentinels** in place of the elements and
+    /// splitting on those. Splitting on the elements themselves would be wrong:
+    /// `es` joins with `" y "`, so a list containing the element `"y"` has the
+    /// connector's `y` occurring before the element's, and the split lands in the
+    /// wrong place. A sentinel cannot collide with pattern text.
+    #[cfg(feature = "intl")]
     pub(crate) fn list_format_parts(
         &self,
         items: &[String],
         list_type: &str,
         style: &str,
+        locale: &str,
+    ) -> Vec<(&'static str, String)> {
+        let n = items.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let opts = Self::list_format_options(list_type, style);
+        // U+0000-delimited indices: not producible by CLDR pattern text.
+        let sentinels: Vec<String> = (0..n).map(|i| alloc::format!("\u{0}{i}\u{0}")).collect();
+        let refs: Vec<&str> = sentinels.iter().map(String::as_str).collect();
+        let shaped = intl::list::format_list(locale, &refs, &opts);
+        let mut parts: Vec<(&'static str, String)> = Vec::new();
+        let mut rest = shaped.as_str();
+        for (i, sentinel) in sentinels.iter().enumerate() {
+            let Some(at) = rest.find(sentinel.as_str()) else {
+                // The pattern dropped an element (never happens for CLDR data);
+                // fall back to emitting it unseparated rather than losing it.
+                parts.push(("element", items[i].clone()));
+                continue;
+            };
+            if at > 0 {
+                parts.push(("literal", String::from(&rest[..at])));
+            }
+            parts.push(("element", items[i].clone()));
+            rest = &rest[at + sentinel.len()..];
+        }
+        if !rest.is_empty() {
+            parts.push(("literal", String::from(rest)));
+        }
+        parts
+    }
+
+    #[cfg(not(feature = "intl"))]
+    pub(crate) fn list_format_parts(
+        &self,
+        items: &[String],
+        list_type: &str,
+        style: &str,
+        locale: &str,
     ) -> Vec<(&'static str, String)> {
         let n = items.len();
         let mut parts: Vec<(&'static str, String)> = Vec::new();
@@ -9307,7 +9423,7 @@ impl<'a> Interp<'a> {
         self.realm.set_hidden_property(lf, "type", lt);
         let ls = self.new_str(&list_style);
         self.realm.set_hidden_property(lf, "style", ls);
-        let list_parts = self.list_format_parts(&strings, "unit", &list_style);
+        let list_parts = self.list_format_parts(&strings, "unit", &list_style, &df_locale);
         // Flatten: an "element" splices in the next unit's parts; a "literal" passes through.
         let mut flattened: Vec<(&'static str, String, Option<&'static str>)> = Vec::new();
         let mut iter = result.into_iter();

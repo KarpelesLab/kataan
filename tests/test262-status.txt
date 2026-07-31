@@ -4,28 +4,17 @@ annexB/built-ins/RegExp/RegExp-leading-escape-BMP.js  # [sloppy] expected pass, 
 annexB/built-ins/RegExp/RegExp-trailing-escape-BMP.js  # [sloppy] expected pass, Runtime Test262Error: Code unit: d800 Expected SameValue(«"a\\�"», «"a\\\ud800"») to be true
 built-ins/String/prototype/match/regexp-prototype-match-v-u-flag.js  # [sloppy] expected pass, Runtime Test262Error: Actual [�, �, a, �, �, b, �, �, c, �, �, ‍, �, �, ‍, �, �, ‍, �, �, d] and expected [�, �, a, �, �, b, �, �, c, �, �, ‍, �, �, ‍, �, �, ‍, �, �, d] should have the same contents. Dot without u or v flag
 built-ins/TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js  # [sloppy] expected pass, Runtime TypeError: Cannot modify an immutable ArrayBuffer (Testing with Float64Array and makeImmutableArrayBuffer.)
-intl402/Collator/prototype/compare/non-normative-phonebook.js  # [sloppy] expected pass, Runtime Test262Error: Actual [A, Ä, Ab, Af, b, ö, od, off] and expected [A, Ab, Ä, Af, b, od, ö, off] should have the same contents. 
 intl402/Collator/prototype/compare/non-normative-sensitivity.js  # [sloppy] expected pass, Runtime Test262Error: Actual [Aa] and expected [Aa, Aã] should have the same contents. 
 intl402/Collator/prototype/resolvedOptions/resolved-collation-unicode-extensions-and-options.js  # [sloppy] expected pass, Runtime Test262Error: Resolved locale for locale=de-u-co-phonebk with collation=pinyin Expected SameValue(«"de"», «"de-u-co-phonebk"») to be true
 intl402/Collator/usage-de.js  # [sloppy] expected pass, Runtime Test262Error: Actual [Ä, AE] and expected [AE, Ä] should have the same contents. search
 intl402/DateTimeFormat/prototype/format/numbering-system.js  # [sloppy] expected pass, Runtime Test262Error: en-US: display one numeric-styled unit Expected SameValue(«false», «true») to be true
-intl402/DateTimeFormat/prototype/format/temporal-objects-no-time-clip-non-latin-numerals.js  # [sloppy] expected pass, Runtime Test262Error: max date should include day 13 in Arabic-Indic digits, got: 13‏/9‏/275760
 intl402/DateTimeFormat/prototype/formatToParts/compare-to-temporal-lunisolar.js  # [sloppy] expected pass, Runtime Test262Error: date = 2047-07-22[u-ca=chinese], monthCode Expected SameValue(«"M05"», «"M05L"») to be true
 intl402/DateTimeFormat/prototype/formatToParts/era.js  # [sloppy] expected pass, Runtime Test262Error: islamic-civil eras (Anno Domini,Anno Domini) should be unique Expected SameValue(«1», «2») to be true
-intl402/Intl/getCanonicalLocales/non-iana-canon.js  # [sloppy] expected pass, Runtime Test262Error: The value of Intl.getCanonicalLocales(tag)[0] equals the value of `canonical` Expected SameValue(«"hy-arevela"», «"hy"») to be true
-intl402/Intl/getCanonicalLocales/preferred-variant.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"ja-Latn-alalc97-hepburn"», «"ja-Latn-alalc97"») to be true
 intl402/Intl/getCanonicalLocales/unicode-ext-canonicalize-timezone.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"und-u-tz-eire"», «"und-u-tz-iedub"») to be true
 intl402/Intl/supportedValuesOf/currencies-accepted-by-DisplayNames.js  # [sloppy] expected pass, Runtime Test262Error: AAA supported but not returned by supportedValuesOf
-intl402/ListFormat/prototype/format/es-es-long.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"foo, bar"», «"foo y bar"») to be true
-intl402/ListFormat/prototype/format/es-es-short.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"foo, bar"», «"foo y bar"») to be true
-intl402/ListFormat/prototype/formatToParts/es-es-long.js  # [sloppy] expected pass, Runtime Test262Error: undefined: parts[1].value Expected SameValue(«", "», «" y "») to be true
-intl402/ListFormat/prototype/formatToParts/es-es-short.js  # [sloppy] expected pass, Runtime Test262Error: undefined: parts[1].value Expected SameValue(«", "», «" y "») to be true
-intl402/Locale/constructor-non-iana-canon.js  # [sloppy] expected pass, Runtime Test262Error: new Intl.Locale("es-ES-preeuro").minimize().toString() returns "es-preeuro" Expected SameValue(«"es-Latn-ES-preeuro"», «"es-preeuro"») to be true
-intl402/NumberFormat/prototype/format/unit-zh-TW.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"-987 km/h"», «"-987 公里/小時"») to be true
 intl402/NumberFormat/prototype/formatRange/en-US.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"$3.00–$5.00"», «"$3 – $5"») to be true
 intl402/NumberFormat/prototype/formatRange/pt-PT.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"€ 3,00–€ 5,00"», «"3 - 5 €"») to be true
 intl402/NumberFormat/prototype/formatRangeToParts/en-US.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«3», «5») to be true
-intl402/NumberFormat/prototype/formatToParts/unit-zh-TW.js  # [sloppy] expected pass, Runtime Test262Error: undefined: parts[2].value Expected SameValue(«" "», «" "») to be true
 intl402/RelativeTimeFormat/prototype/format/pl-pl-style-long.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"in 1,000 seconds"», «"za 1000 sekund"») to be true
 intl402/RelativeTimeFormat/prototype/format/pl-pl-style-narrow.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"in 1,000 sec."», «"za 1000 s"») to be true
 intl402/RelativeTimeFormat/prototype/format/pl-pl-style-short.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"in 1,000 sec."», «"za 1000 sek."») to be true
@@ -34,9 +23,6 @@ intl402/RelativeTimeFormat/prototype/formatToParts/pl-pl-style-narrow.js  # [slo
 intl402/RelativeTimeFormat/prototype/formatToParts/pl-pl-style-short.js  # [sloppy] expected pass, Runtime Test262Error: formatToParts(1000, second): length Expected SameValue(«5», «3») to be true
 intl402/Segmenter/prototype/segment/containing/breakable-input.js  # [sloppy] expected pass, Runtime Test262Error: granularity: undefined input: �� containing(0) input Expected SameValue(«"\udc00\ud800"», «"��"») to be true
 intl402/Segmenter/prototype/segment/containing/unbreakable-input.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"\ud800"», «"�"») to be true
-intl402/String/prototype/toLocaleLowerCase/special_casing_Azeri.js  # [sloppy] expected pass, Runtime Test262Error: LATIN CAPITAL LETTER I followed by COMBINING DOT ABOVE Expected SameValue(«"ı̇"», «"i"») to be true
-intl402/String/prototype/toLocaleLowerCase/special_casing_Turkish.js  # [sloppy] expected pass, Runtime Test262Error: LATIN CAPITAL LETTER I followed by COMBINING DOT ABOVE Expected SameValue(«"ı̇"», «"i"») to be true
-intl402/String/prototype/toLocaleUpperCase/special_casing_Lithuanian.js  # [sloppy] expected pass, Runtime Test262Error: COMBINING DOT ABOVE preceded by Soft_Dotted (U+0069) Expected SameValue(«"İ"», «"I"») to be true
 intl402/Temporal/PlainMonthDay/prototype/toLocaleString/dateStyle.js  # [sloppy] expected pass, Runtime Test262Error: dateStyle: long writes month of Ramadan out in full
 intl402/Temporal/PlainYearMonth/prototype/toLocaleString/dateStyle.js  # [sloppy] expected pass, Runtime Test262Error: dateStyle: long writes month of Ramadan out in full
 language/literals/regexp/S7.8.5_A1.1_T2.js  # [sloppy] expected pass, Runtime Test262Error: Code unit: d800 Expected SameValue(«"�"», «"\ud800"») to be true

@@ -8063,7 +8063,11 @@ fn rel_time_auto_phrase(unit: &str, v: i64) -> Option<&'static str> {
 /// number parts: `(type, value, with_unit=true)` triples of `integer`/`group`/
 /// `decimal`/`fraction` (latn digits, `,` grouping, `.` decimal — matching
 /// `Intl.NumberFormat("en-US")`). The integer part is grouped in threes from the right.
-fn rel_time_number_parts(n: f64) -> alloc::vec::Vec<(&'static str, alloc::string::String, bool)> {
+fn rel_time_number_parts(
+    n: f64,
+    group_sep: &str,
+    decimal_sep: &str,
+) -> alloc::vec::Vec<(&'static str, alloc::string::String, bool)> {
     // Render with the default NumberFormat shape (max 3 fraction digits, no trailing
     // zeros) by formatting then trimming; `n` is finite and non-negative here.
     let s = alloc::format!("{n}");
@@ -8088,13 +8092,13 @@ fn rel_time_number_parts(n: f64) -> alloc::vec::Vec<(&'static str, alloc::string
         emit(&digits[..first], &mut parts);
         let mut idx = first;
         while idx < len {
-            parts.push(("group", alloc::string::String::from(","), true));
+            parts.push(("group", alloc::string::String::from(group_sep), true));
             emit(&digits[idx..idx + 3], &mut parts);
             idx += 3;
         }
     }
     if !frac_str.is_empty() {
-        parts.push(("decimal", alloc::string::String::from("."), true));
+        parts.push(("decimal", alloc::string::String::from(decimal_sep), true));
         parts.push(("fraction", alloc::string::String::from(frac_str), true));
     }
     parts
@@ -8111,6 +8115,8 @@ fn rel_time_parts(
     unit: &str,
     numeric: &str,
     style: &str,
+    group_sep: &str,
+    decimal_sep: &str,
 ) -> alloc::vec::Vec<(&'static str, alloc::string::String, bool)> {
     // numeric:"auto" idiomatic phrases (integer offsets only, `long` style).
     if numeric == "auto"
@@ -8130,11 +8136,11 @@ fn rel_time_parts(
     let mut parts: alloc::vec::Vec<(&'static str, alloc::string::String, bool)> =
         alloc::vec::Vec::new();
     if is_past {
-        parts.extend(rel_time_number_parts(n));
+        parts.extend(rel_time_number_parts(n, group_sep, decimal_sep));
         parts.push(("literal", alloc::format!(" {unit_disp} ago"), false));
     } else {
         parts.push(("literal", alloc::string::String::from("in "), false));
-        parts.extend(rel_time_number_parts(n));
+        parts.extend(rel_time_number_parts(n, group_sep, decimal_sep));
         parts.push(("literal", alloc::format!(" {unit_disp}"), false));
     }
     parts
