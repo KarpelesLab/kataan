@@ -1359,8 +1359,9 @@ pub(crate) fn default_numbering_for_locale_str(locale: &str) -> String {
         // The locale's *default* numbering system — what `ResolveLocale` resolves
         // and what `Intl.NumberFormat(locale)` uses. Not
         // `otherNumberingSystems.native`: CLDR gives `ar` a default of `latn` and a
-        // native of `arab`, and ECMA-402 wants the former.
-        let zero = intl::number::format_decimal_default_numbering(locale, 0.0);
+        // native of `arab`, and ECMA-402 wants the former — which since 0.6.1 is
+        // `format_decimal`'s own behaviour.
+        let zero = intl::number::format_decimal(locale, 0.0);
         if let Some(c) = zero.chars().next()
             && let Some(name) = numbering_system_name_from_zero(c)
         {

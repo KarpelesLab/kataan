@@ -15,12 +15,6 @@ intl402/Intl/supportedValuesOf/currencies-accepted-by-DisplayNames.js  # [sloppy
 intl402/NumberFormat/prototype/formatRange/en-US.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"$3.00–$5.00"», «"$3 – $5"») to be true
 intl402/NumberFormat/prototype/formatRange/pt-PT.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"€ 3,00–€ 5,00"», «"3 - 5 €"») to be true
 intl402/NumberFormat/prototype/formatRangeToParts/en-US.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«3», «5») to be true
-intl402/RelativeTimeFormat/prototype/format/pl-pl-style-long.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"in 1,000 seconds"», «"za 1000 sekund"») to be true
-intl402/RelativeTimeFormat/prototype/format/pl-pl-style-narrow.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"in 1,000 sec."», «"za 1000 s"») to be true
-intl402/RelativeTimeFormat/prototype/format/pl-pl-style-short.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"in 1,000 sec."», «"za 1000 sek."») to be true
-intl402/RelativeTimeFormat/prototype/formatToParts/pl-pl-style-long.js  # [sloppy] expected pass, Runtime Test262Error: formatToParts(1000, second): length Expected SameValue(«5», «3») to be true
-intl402/RelativeTimeFormat/prototype/formatToParts/pl-pl-style-narrow.js  # [sloppy] expected pass, Runtime Test262Error: formatToParts(1000, second): length Expected SameValue(«5», «3») to be true
-intl402/RelativeTimeFormat/prototype/formatToParts/pl-pl-style-short.js  # [sloppy] expected pass, Runtime Test262Error: formatToParts(1000, second): length Expected SameValue(«5», «3») to be true
 intl402/Segmenter/prototype/segment/containing/breakable-input.js  # [sloppy] expected pass, Runtime Test262Error: granularity: undefined input: �� containing(0) input Expected SameValue(«"\udc00\ud800"», «"��"») to be true
 intl402/Segmenter/prototype/segment/containing/unbreakable-input.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"\ud800"», «"�"») to be true
 intl402/Temporal/PlainMonthDay/prototype/toLocaleString/dateStyle.js  # [sloppy] expected pass, Runtime Test262Error: dateStyle: long writes month of Ramadan out in full
