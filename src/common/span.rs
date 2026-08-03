@@ -72,6 +72,21 @@ impl Span {
     pub fn slice(self, source: &str) -> &str {
         &source[self.start as usize..self.end as usize]
     }
+
+    /// Slices the **WTF-8** `source` bytes this span covers.
+    ///
+    /// Program text is scanned as WTF-8 (a JS string handed to `eval` may hold
+    /// lone surrogates, which `str` cannot represent), so the byte form is the
+    /// lossless one. Spans always fall on code-point boundaries.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the span is out of bounds for `source`.
+    #[inline]
+    #[must_use]
+    pub fn slice_bytes(self, source: &[u8]) -> &[u8] {
+        &source[self.start as usize..self.end as usize]
+    }
 }
 
 impl fmt::Debug for Span {

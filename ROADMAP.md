@@ -432,16 +432,43 @@ Residual (2 tests): a Chinese leap month at 1718 comes out a day long — a
 sub-day ephemeris difference ~200 years outside the pinned range, in a test
 whose own comment notes ICU4X and ICU4C disagree there.
 
-### 3.11 WTF-8 program text (lone surrogates through the parser)
+### 3.11 WTF-8 program text (lone surrogates through the parser) — **landed**
 
-`Parser::parse_program` takes `&'src str`, so a lone surrogate in program text —
-`eval("/" + String.fromCharCode(0xD800) + "/")` — is folded to U+FFFD *before*
-any AST node exists. This is why `RegExp.prototype.source` cannot round-trip one
-(~7 ledgered tests: the `RegExp-*-escape-BMP` and `S7.8.5_*` families,
-`RegExp/escape/escaped-surrogates`). It is **not** a `Cell::RegExp` storage
-problem — that cell is downstream of the loss. The fix is a WTF-8 input path for
-the lexer/parser (source as `&[u8]`, string/regex literal payloads carried as
-WTF-8), which also removes the last lossy boundary in `eval`/`Function`.
+`Parser::parse_program` took `&'src str`, so a lone surrogate in program text —
+`eval("/" + String.fromCharCode(0xD800) + "/")` — was folded to U+FFFD *before*
+any AST node existed. That, not `Cell::RegExp` storage, is why
+`RegExp.prototype.source` could not round-trip one.
+
+The input path is now WTF-8 bytes end to end. `Lexer`/`Parser` hold
+`&'src [u8]`; the scan was already byte-wise (all ECMAScript punctuation is
+ASCII), so only `peek_char` (which decodes a stored surrogate to U+FFFD — same
+length, and a surrogate is neither whitespace nor an `IdentifierPart`, so every
+predicate answers identically) and the identifier slice needed touching. The
+`&str` constructors remain as wrappers over `*_bytes` entry points, so the ~200
+existing `parse_program` call sites are unchanged.
+
+The literal payloads that can hold a surrogate carry bytes: `Expr::Regex.pattern`
+is `Box<[u8]>`, `cook::string`/`decode_escapes` decode WTF-8 (so a *raw*
+surrogate in a string literal or template is preserved, not just a `\uD800`
+escape), and `Cell::RegExp.source` is `Box<[u8]>` — with the bytecode and
+snapshot encoders carrying it as a length-prefixed blob. `eval`, direct eval and
+the `Function` constructor all hand the parser the JS string's bytes.
+
+Three `&str` boundaries remain, none of them ledgered:
+
+- The regex engine parses `&str`, so a lone surrogate in a *pattern* compiles
+  (and therefore matches) as U+FFFD. `.source` still reports the exact bytes;
+  only what such a pattern matches is affected.
+- `Program.source` — retained only for `Function.prototype.toString` reslicing —
+  is the lossy rendering, so `fn.toString()` of a surrogate-bearing body shows
+  U+FFFD. It is byte-length preserving, so every span stays aligned.
+- `RegExp.prototype[@@replace]` still round-trips the matched text and each
+  capture through a `String`: `"𠮷".replace(/./g, m => m)` yields `"��"`
+  where the spec (and every other engine) reproduces the input, because a
+  non-`u` `.` matches one code unit. `regexp_symbol_replace` and
+  `get_substitution` in `src/nbexec/regexp.rs` are `String`/`char`-based
+  throughout — the same conversion the `@@match` loop just had, but on the
+  hottest string builtin, so it wants its own change and its own corpus run.
 
 ### 3.12 `Array.fromAsync` as a suspendable frame — **landed**
 

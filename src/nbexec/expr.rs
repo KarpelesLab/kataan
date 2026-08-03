@@ -1334,9 +1334,12 @@ impl<'a> Interp<'a> {
                     && is_current_realm_eval(self, f)
                 {
                     let arg0 = args.first().copied().unwrap_or(NanBox::undefined());
+                    // WTF-8 bytes, not a lossy `&str`: the program text is a JS
+                    // string and may hold lone surrogates that a literal in it must
+                    // reproduce (`eval("/" + String.fromCharCode(0xD800) + "/")`).
                     let Some(source) = arg0
                         .as_handle()
-                        .and_then(|raw| self.realm.string_value(Handle::from_raw(raw)))
+                        .and_then(|raw| self.realm.string_bytes(Handle::from_raw(raw)))
                     else {
                         // A non-string argument is returned unchanged (per spec).
                         return Ok(arg0);

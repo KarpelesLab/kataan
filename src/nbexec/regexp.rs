@@ -326,7 +326,7 @@ impl<'a> Interp<'a> {
 
     /// Allocates a RegExp instance and links its `[[Prototype]]` to
     /// `RegExp.prototype`. `lastIndex` starts at 0.
-    pub(crate) fn new_regexp_instance(&mut self, source: &str, flags: &str) -> Handle {
+    pub(crate) fn new_regexp_instance(&mut self, source: &[u8], flags: &str) -> Handle {
         let h = self.realm.new_regexp(source, flags);
         if let Some(proto) = self.regexp_proto {
             self.realm.set_native_proto(h, proto);
@@ -521,11 +521,17 @@ impl<'a> Interp<'a> {
                 };
                 // `"/" + source + "/" + flags`, reading both via Get (so a
                 // subclass overriding `source`/`flags` is honored).
+                // The source is concatenated as WTF-8 so a lone surrogate in it
+                // reaches the result string intact.
                 let src = self.read_member(h, "source")?;
-                let src_s = self.coerce_to_string(src)?;
+                let src_b = self.coerce_to_string_bytes(src)?;
                 let fl = self.read_member(h, "flags")?;
                 let fl_s = self.coerce_to_string(fl)?;
-                Ok(self.new_str(&alloc::format!("/{src_s}/{fl_s}")))
+                let mut out = alloc::vec![b'/'];
+                out.extend_from_slice(&src_b);
+                out.push(b'/');
+                out.extend_from_slice(fl_s.as_bytes());
+                Ok(self.new_str_bytes(out))
             }
             "match" => self.regexp_symbol_match(this_val, arg(0)),
             "matchAll" => self.regexp_symbol_match_all(this_val, arg(0)),
@@ -564,13 +570,17 @@ impl<'a> Interp<'a> {
                 "RegExp.prototype.{name} getter called on a non-RegExp object"
             )));
         };
-        let (source, flags) = self.realm.regexp_at(h).unwrap_or_default();
+        let (_, flags) = self.realm.regexp_at(h).unwrap_or_default();
         Ok(match name {
             "source" => {
+                // Served from the exact WTF-8 bytes so a lone surrogate written
+                // into the program text (`eval("/\uD800/")`) comes back intact.
+                let source = self.realm.regexp_source_bytes(h).unwrap_or_default();
                 if source.is_empty() {
                     self.new_str("(?:)")
                 } else {
-                    self.new_str(&escape_regexp_source(&source))
+                    let escaped = escape_regexp_source(&source);
+                    self.new_str_bytes(escaped)
                 }
             }
             "global" => NanBox::boolean(flags.contains('g')),
@@ -642,19 +652,21 @@ impl<'a> Interp<'a> {
         }
         // `compile(re)` copies `re`'s source/flags; supplying flags too is a
         // TypeError.
+        // The pattern stays WTF-8 so a lone surrogate in the copied/`ToString`d
+        // source survives into `.source`.
         let (pat_s, flags_s) = if let Some(ph) = pattern.as_handle().map(Handle::from_raw)
-            && let Some((ps, fs)) = self.realm.regexp_at(ph)
+            && let Some((_, fs)) = self.realm.regexp_at(ph)
         {
             if !matches!(flags.unpack(), Unpacked::Undefined) {
                 return Err(self
                     .type_error("Cannot supply flags when constructing one RegExp from another"));
             }
-            (ps, fs)
+            (self.realm.regexp_source_bytes(ph).unwrap_or_default(), fs)
         } else {
             let p = if matches!(pattern.unpack(), Unpacked::Undefined) {
-                String::new()
+                alloc::vec::Vec::new()
             } else {
-                self.coerce_to_string(pattern)?
+                self.coerce_to_string_bytes(pattern)?
             };
             let f = if matches!(flags.unpack(), Unpacked::Undefined) {
                 String::new()
@@ -664,9 +676,14 @@ impl<'a> Interp<'a> {
             (p, f)
         };
         #[cfg(feature = "regex")]
-        if crate::regex::Regex::new(&pat_s, &flags_s).is_err() {
-            let e = self.regexp_syntax_error(&pat_s, &flags_s);
-            return Err(ExecError::Throw(e));
+        {
+            // Validated (and later matched) through the `&str` engine — see the
+            // `RegExp` constructor for why that is lossy but `.source` is not.
+            let lossy = crate::wtf8::to_string_lossy(&pat_s);
+            if crate::regex::Regex::new(&lossy, &flags_s).is_err() {
+                let e = self.regexp_syntax_error(&lossy, &flags_s);
+                return Err(ExecError::Throw(e));
+            }
         }
         // RegExpInitialize replaces source/flags, then performs
         // `Set(R, "lastIndex", 0, true)` — the *throwing* form. A non-writable
@@ -932,9 +949,14 @@ impl<'a> Interp<'a> {
                 break;
             };
             let match0 = self.read_member(rh, "0")?;
-            let m_str = self.coerce_to_string(match0)?;
-            results.push(self.new_str(&m_str));
-            if m_str.is_empty() {
+            // `ToString(Get(result, "0"))` losslessly: a non-unicode `/./g` matches
+            // one *code unit*, so each half of an astral pair is a lone surrogate
+            // that a `String` round-trip would collapse to U+FFFD.
+            let m_bytes = self.coerce_to_string_bytes(match0)?;
+            let empty = m_bytes.is_empty();
+            let m_v = self.new_str_bytes(m_bytes);
+            results.push(m_v);
+            if empty {
                 // Advance lastIndex to avoid an infinite loop.
                 let li_v = self.read_member(h, "lastIndex")?;
                 let li = self.last_index_to_length(li_v)?;
@@ -1405,28 +1427,29 @@ impl<'a> Interp<'a> {
 /// the result is a valid pattern between two `/` delimiters and re-parses to the
 /// same source. Other characters are passed through unchanged.
 #[cfg(feature = "regex")]
-fn escape_regexp_source(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let chars: Vec<char> = source.chars().collect();
+fn escape_regexp_source(source: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::with_capacity(source.len());
+    // WTF-8 code points, not `char`s: the pattern may hold a lone surrogate,
+    // which `source` must reproduce verbatim (it is none of the escaped cases).
+    let cps: Vec<u32> = crate::wtf8::code_points(source).collect();
     let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        match c {
-            '\\' => {
+    while i < cps.len() {
+        match cps[i] {
+            0x5C => {
                 // Keep an existing escape as-is (don't double it).
-                out.push('\\');
-                if i + 1 < chars.len() {
-                    out.push(chars[i + 1]);
+                out.push(b'\\');
+                if i + 1 < cps.len() {
+                    crate::wtf8::encode_code_point(cps[i + 1], &mut out);
                     i += 2;
                     continue;
                 }
             }
-            '/' => out.push_str("\\/"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            _ => out.push(c),
+            0x2F => out.extend_from_slice(b"\\/"),
+            0x0A => out.extend_from_slice(b"\\n"),
+            0x0D => out.extend_from_slice(b"\\r"),
+            0x2028 => out.extend_from_slice(b"\\u2028"),
+            0x2029 => out.extend_from_slice(b"\\u2029"),
+            cp => crate::wtf8::encode_code_point(cp, &mut out),
         }
         i += 1;
     }
@@ -1434,6 +1457,6 @@ fn escape_regexp_source(source: &str) -> String {
 }
 
 #[cfg(not(feature = "regex"))]
-fn escape_regexp_source(source: &str) -> String {
-    String::from(source)
+fn escape_regexp_source(source: &[u8]) -> alloc::vec::Vec<u8> {
+    source.to_vec()
 }

@@ -52,7 +52,11 @@ const MAX_PARSE_DEPTH: u32 = crate::limits::DEFAULT_MAX_PARSE_DEPTH;
 
 /// A recursive-descent parser over a borrowed source string.
 pub struct Parser<'src> {
-    source: &'src str,
+    /// The program text, as **WTF-8 bytes**. `eval`/`Function` may be handed a JS
+    /// string containing lone surrogates, which `str` cannot hold; keeping the
+    /// raw bytes lets a literal's value (notably a regex literal's `source`)
+    /// round-trip them instead of being folded to U+FFFD at the boundary.
+    source: &'src [u8],
     tokens: Vec<Token>,
     /// Index of the current token in `tokens`. Never advances past the final
     /// [`TokenKind::Eof`].
@@ -114,7 +118,14 @@ impl<'src> Parser<'src> {
     /// Like [`Parser::new`] but for the given goal — a `module` parser lexes
     /// without the script-only Annex B HTML-like comments.
     pub fn with_goal(source: &'src str, module: bool) -> Result<Self> {
-        let tokens = Lexer::with_goal(source, module).tokenize()?;
+        Self::with_goal_bytes(source.as_bytes(), module)
+    }
+
+    /// Like [`Parser::with_goal`] but over **WTF-8** program-text bytes — the
+    /// lossless entry point for source that came from a JS string (`eval`, the
+    /// `Function` constructor), which may contain lone surrogates.
+    pub fn with_goal_bytes(source: &'src [u8], module: bool) -> Result<Self> {
+        let tokens = Lexer::with_goal_bytes(source, module).tokenize()?;
         Ok(Self {
             source,
             tokens,
@@ -230,7 +241,7 @@ impl<'src> Parser<'src> {
     /// allocates. Use this everywhere an identifier *name* is read so that, e.g.
     /// `a` and `a` denote the same binding/property.
     fn ident_name(&self, tok: Token) -> alloc::borrow::Cow<'src, str> {
-        let text = tok.span.slice(self.source);
+        let text = tok.ascii_text(self.source);
         if tok.had_escape {
             alloc::borrow::Cow::Owned(cook::identifier_name(text))
         } else {
@@ -270,7 +281,7 @@ impl<'src> Parser<'src> {
     /// The cooked name of a `PrivateName` token (`#x`): the text after the `#`,
     /// with any `\u` escapes decoded.
     fn private_name(&self, tok: Token) -> Box<str> {
-        let text = &tok.span.slice(self.source)[1..]; // drop leading `#`
+        let text = &tok.ascii_text(self.source)[1..]; // drop leading `#`
         if tok.had_escape {
             cook::identifier_name(text).into()
         } else {
@@ -744,7 +755,9 @@ impl<'src> Parser<'src> {
                 || (self.nth_kind(1) == TokenKind::Dot
                     && self.nth_kind(2) == TokenKind::Identifier
                     && matches!(
-                        self.tokens.get(self.pos + 2).map(|t| t.text(self.source)),
+                        self.tokens
+                            .get(self.pos + 2)
+                            .map(|t| t.ascii_text(self.source)),
                         Some("source" | "defer")
                     )
                     && self.nth_kind(3) == TokenKind::LParen);
@@ -1001,7 +1014,7 @@ impl<'src> Parser<'src> {
         match tok.kind {
             TokenKind::Number => {
                 self.bump();
-                let text = tok.text(self.source);
+                let text = tok.ascii_text(self.source);
                 Ok(Expr::Number {
                     value: cook::number(text),
                     span: tok.span,
@@ -1011,7 +1024,7 @@ impl<'src> Parser<'src> {
             TokenKind::BigInt => {
                 self.bump();
                 Ok(Expr::BigInt {
-                    digits: cook::bigint(tok.text(self.source)).into(),
+                    digits: cook::bigint(tok.ascii_text(self.source)).into(),
                     span: tok.span,
                 })
             }
@@ -1027,6 +1040,17 @@ impl<'src> Parser<'src> {
             TokenKind::Regex => {
                 self.bump();
                 let (pattern, flags) = split_regex(tok.text(self.source));
+                // Flags are `RegularExpressionFlags` — `IdentifierPart`s, never a
+                // surrogate — so the `str` view is lossless. The *pattern* is kept
+                // as bytes: it may hold a lone surrogate that `.source` must
+                // reproduce exactly.
+                let flags = crate::wtf8::as_str(flags).unwrap_or("");
+                // The regex engine parses `&str`; a lone surrogate in the pattern
+                // cannot be expressed as a `char`, so validation (and later
+                // matching) sees U+FFFD in its place. That only affects what such
+                // a pattern *matches*, never the `source` text reported back.
+                #[cfg(feature = "regex")]
+                let pattern_str = crate::wtf8::to_string_lossy(pattern);
                 // A regex *literal* is validated at parse time: an invalid pattern
                 // or invalid/duplicate flags is an early (parse-phase) SyntaxError,
                 // per `RegExp` literal evaluation. Running the regex engine's own
@@ -1040,7 +1064,7 @@ impl<'src> Parser<'src> {
                 // rejecting the literal at parse, so a never-matched such literal
                 // keeps working. Only genuine syntax errors fail the parse.
                 #[cfg(feature = "regex")]
-                if let Err(e) = crate::regex::Regex::new(pattern, flags)
+                if let Err(e) = crate::regex::Regex::new(&pattern_str, flags)
                     && !e.is_unsupported()
                 {
                     return Err(self.err_at(tok.span, alloc::format!("{e}")));
@@ -1188,7 +1212,7 @@ impl<'src> Parser<'src> {
                     return Err(self.err("expected `meta` after `import.`"));
                 }
                 let prop = self.peek_tok();
-                match prop.text(self.source) {
+                match prop.ascii_text(self.source) {
                     "meta" => {
                         self.bump(); // `meta`
                         Ok(Expr::Member {
@@ -1463,9 +1487,9 @@ impl<'src> Parser<'src> {
                     PropertyKey::Str(cook::string_key(tok.text(self.source), tok.span)?.into())
                 }
                 TokenKind::BigInt => {
-                    PropertyKey::Str(cook::bigint_property_key(tok.text(self.source)).into())
+                    PropertyKey::Str(cook::bigint_property_key(tok.ascii_text(self.source)).into())
                 }
-                _ => PropertyKey::Number(cook::number(tok.text(self.source))),
+                _ => PropertyKey::Number(cook::number(tok.ascii_text(self.source))),
             };
             // `key() { … }` — a method with a literal key.
             if self.at(TokenKind::LParen) {
@@ -1646,8 +1670,8 @@ impl<'src> Parser<'src> {
         // values (`<LF>`/`<LS>`/`<PS>` are left as-is). So `` String.raw`\r\n` ``
         // over literal CRLF/CR source yields "\n", not the original bytes.
         let normalized;
-        let inner: &str = if inner.contains('\r') {
-            normalized = inner.replace("\r\n", "\n").replace('\r', "\n");
+        let inner: &[u8] = if inner.contains(&b'\r') {
+            normalized = normalize_line_terminators(inner);
             &normalized
         } else {
             inner
@@ -1662,14 +1686,14 @@ impl<'src> Parser<'src> {
                 return Err(e);
             }
             return Ok(TemplateElement {
-                raw: inner.into(),
+                raw: crate::wtf8::to_string_lossy(inner).into(),
                 cooked: None,
                 span: tok.span,
             });
         }
         let cooked = cook::decode_escapes(inner, tok.span).ok().map(Into::into);
         Ok(TemplateElement {
-            raw: inner.into(),
+            raw: crate::wtf8::to_string_lossy(inner).into(),
             cooked,
             span: tok.span,
         })
@@ -1844,11 +1868,37 @@ fn update_op(kind: TokenKind) -> Option<UpdateOp> {
     }
 }
 
+/// Rewrites `<CR><LF>` and a lone `<CR>` to a single `<LF>` (ECMA-262 TRV/TV
+/// line-terminator normalization in template segments). `\r` is ASCII and a
+/// WTF-8 continuation byte is always ≥ 0x80, so the byte-wise scan can never
+/// split a multi-byte code point.
+fn normalize_line_terminators(inner: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::with_capacity(inner.len());
+    let mut i = 0;
+    while i < inner.len() {
+        if inner[i] == b'\r' {
+            out.push(b'\n');
+            i += if inner.get(i + 1) == Some(&b'\n') {
+                2
+            } else {
+                1
+            };
+        } else {
+            out.push(inner[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Splits a regex token's text `/pattern/flags` into its pattern and flags.
 /// The closing slash is the last `/` in the token, since flag characters never
 /// include `/`.
-fn split_regex(text: &str) -> (&str, &str) {
-    let close = text.rfind('/').unwrap_or(text.len() - 1);
+fn split_regex(text: &[u8]) -> (&[u8], &[u8]) {
+    let close = text
+        .iter()
+        .rposition(|b| *b == b'/')
+        .unwrap_or(text.len() - 1);
     (&text[1..close], &text[close + 1..])
 }
 

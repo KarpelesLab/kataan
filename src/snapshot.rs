@@ -98,8 +98,8 @@ pub enum SnapCell {
     },
     /// a `RegExp`: its source, flags, and current `lastIndex`.
     RegExp {
-        /// the pattern source
-        source: String,
+        /// the pattern source, as WTF-8 bytes (it may hold lone surrogates)
+        source: Vec<u8>,
         /// the flag string (e.g. `"gi"`)
         flags: String,
         /// the stateful `lastIndex` search position
@@ -256,9 +256,10 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
                 &mut intern,
             );
             SnapCell::Proxy { target, handler }
-        } else if let Some((source, flags)) = realm.regexp_at(h) {
+        } else if let Some((_, flags)) = realm.regexp_at(h) {
             SnapCell::RegExp {
-                source,
+                // WTF-8, so a surrogate-bearing pattern survives the round trip.
+                source: realm.regexp_source_bytes(h).unwrap_or_default(),
                 flags,
                 last_index: realm.regex_last_index(h),
             }
@@ -624,6 +625,12 @@ fn w_str(s: &str, out: &mut Vec<u8>) {
     w_u32(s.len() as u32, out);
     out.extend_from_slice(s.as_bytes());
 }
+/// A length-prefixed byte blob — the same wire shape as [`w_str`], but for a
+/// payload that is WTF-8 rather than UTF-8 (a `RegExp`'s pattern source).
+fn w_bytes(s: &[u8], out: &mut Vec<u8>) {
+    w_u32(s.len() as u32, out);
+    out.extend_from_slice(s);
+}
 fn w_val(v: &SnapVal, out: &mut Vec<u8>) {
     match v {
         SnapVal::Undefined => out.push(0),
@@ -752,7 +759,7 @@ pub fn serialize(snap: &Snapshot) -> Vec<u8> {
                 last_index,
             } => {
                 out.push(9);
-                w_str(source, &mut out);
+                w_bytes(source, &mut out);
                 w_str(flags, &mut out);
                 w_u32(*last_index as u32, &mut out);
             }
@@ -823,6 +830,11 @@ impl R<'_> {
         core::str::from_utf8(bytes)
             .map(String::from)
             .map_err(|_| SnapError::BadString)
+    }
+    /// A length-prefixed byte blob written by `w_bytes` (WTF-8, kept verbatim).
+    fn byte_string(&mut self) -> Result<Vec<u8>, SnapError> {
+        let n = self.u32()? as usize;
+        Ok(self.take(n)?.to_vec())
     }
     fn val(&mut self) -> Result<SnapVal, SnapError> {
         Ok(match self.u8()? {
@@ -939,7 +951,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
                 SnapCell::Proxy { target, handler }
             }
             9 => {
-                let source = r.string()?;
+                let source = r.byte_string()?;
                 let flags = r.string()?;
                 let last_index = r.u32()? as usize;
                 SnapCell::RegExp {
@@ -1932,7 +1944,7 @@ mod tests {
     fn snapshots_regexps() {
         let mut realm = Realm::new();
         // A RegExp with flags and an advanced lastIndex, reachable from an object.
-        let re = realm.new_regexp("\\d+", "gi");
+        let re = realm.new_regexp(b"\\d+", "gi");
         realm.set_regex_last_index(re, 7);
         let obj = realm.new_object();
         realm.set_property(obj, "re", NanBox::handle(re.to_raw()));

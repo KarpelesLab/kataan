@@ -47,7 +47,12 @@ pub enum Expr {
     /// A regular-expression literal `/pattern/flags` (kept as source text; the
     /// pattern is compiled by the regex engine, not here).
     Regex {
-        pattern: Box<str>,
+        /// The pattern text as **WTF-8 bytes**. A regex literal's `source` must
+        /// round-trip whatever code units the program text held, including lone
+        /// surrogates (`eval("/" + String.fromCharCode(0xD800) + "/").source`),
+        /// which a `str` cannot represent.
+        pattern: Box<[u8]>,
+        /// The flags. These are always ASCII letters, so `str` is lossless.
         flags: Box<str>,
         span: Span,
     },

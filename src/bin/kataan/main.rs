@@ -116,7 +116,7 @@ fn run_lex(source: &str, origin: &str) -> ExitCode {
                     tok.span.start,
                     tok.span.end,
                     format!("{:?}", tok.kind),
-                    tok.text(source),
+                    tok.text(source.as_bytes()),
                 );
             }
             ExitCode::SUCCESS

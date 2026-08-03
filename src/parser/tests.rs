@@ -89,7 +89,9 @@ fn sexpr(e: &Expr) -> String {
         Expr::Number { value, .. } => format!("{value}"),
         Expr::BigInt { digits, .. } => format!("{digits}n"),
         Expr::Str { value, .. } => format!("{:?}", crate::wtf8::to_string_lossy(value)),
-        Expr::Regex { pattern, flags, .. } => format!("/{pattern}/{flags}"),
+        Expr::Regex { pattern, flags, .. } => {
+            format!("/{}/{flags}", crate::wtf8::to_string_lossy(pattern))
+        }
         Expr::Ident(id) => id.name.clone().into_string(),
         Expr::PrivateName(name, _) => format!("#{name}"),
         Expr::This(_) => "this".into(),

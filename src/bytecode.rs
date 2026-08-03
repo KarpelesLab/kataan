@@ -69,6 +69,12 @@ fn w_str(s: &str, out: &mut Vec<u8>) {
     w_u32(s.len() as u32, out);
     out.extend_from_slice(s.as_bytes());
 }
+/// A length-prefixed byte blob — the same wire shape as [`w_str`], but for
+/// payloads that are WTF-8 rather than UTF-8 (a regex literal's source).
+fn w_bytes(s: &[u8], out: &mut Vec<u8>) {
+    w_u32(s.len() as u32, out);
+    out.extend_from_slice(s);
+}
 fn w_regs(rs: &[Reg], out: &mut Vec<u8>) {
     w_u32(rs.len() as u32, out);
     for r in rs {
@@ -154,6 +160,11 @@ impl<'a> Reader<'a> {
         let len = self.u32()? as usize;
         let bytes = self.take(len)?;
         Ok(String::from_utf8_lossy(bytes).into_owned())
+    }
+    /// A length-prefixed byte blob written by `w_bytes` (WTF-8, kept verbatim).
+    fn byte_string(&mut self) -> Result<Vec<u8>, DecodeError> {
+        let len = self.u32()? as usize;
+        Ok(self.take(len)?.to_vec())
     }
     fn regs(&mut self) -> Result<Vec<Reg>, DecodeError> {
         let n = self.u32()? as usize;
@@ -763,7 +774,7 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
         Op::NewRegExp { dst, source, flags } => {
             w_u8(38, out);
             w_reg(*dst, out);
-            w_str(source, out);
+            w_bytes(source, out);
             w_str(flags, out);
         }
         Op::NewObject { dst } => {
@@ -1061,7 +1072,7 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         },
         38 => Op::NewRegExp {
             dst: r.reg()?,
-            source: r.string()?,
+            source: r.byte_string()?,
             flags: r.string()?,
         },
         39 => Op::NewObject { dst: r.reg()? },

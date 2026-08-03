@@ -326,12 +326,14 @@ impl<'src> Parser<'src> {
             }
             TokenKind::Number => {
                 self.bump();
-                Ok(PropertyKey::Number(cook::number(tok.text(self.source))))
+                Ok(PropertyKey::Number(cook::number(
+                    tok.ascii_text(self.source),
+                )))
             }
             TokenKind::BigInt => {
                 self.bump();
                 Ok(PropertyKey::Str(
-                    cook::bigint_property_key(tok.text(self.source)).into(),
+                    cook::bigint_property_key(tok.ascii_text(self.source)).into(),
                 ))
             }
             TokenKind::Identifier => {

@@ -230,7 +230,7 @@ fn unicode_identifiers() {
     assert_eq!(kinds("café"), &[Identifier]);
     assert_eq!(kinds("π = 3.14"), &[Identifier, Eq, Number]);
     let toks = Lexer::new("café").tokenize().unwrap();
-    assert_eq!(toks[0].text("café"), "café");
+    assert_eq!(toks[0].text("café".as_bytes()), "café".as_bytes());
     // Letters from various scripts and combining marks continue identifiers.
     assert_eq!(
         kinds("日本語 λ naïve _x$"),
@@ -254,11 +254,11 @@ fn rejects_non_identifier_unicode() {
 fn spans_point_at_source() {
     let src = "let answer = 42;";
     let toks = Lexer::new(src).tokenize().unwrap();
-    assert_eq!(toks[0].text(src), "let");
-    assert_eq!(toks[1].text(src), "answer");
-    assert_eq!(toks[2].text(src), "=");
-    assert_eq!(toks[3].text(src), "42");
-    assert_eq!(toks[4].text(src), ";");
+    assert_eq!(toks[0].text(src.as_bytes()), "let".as_bytes());
+    assert_eq!(toks[1].text(src.as_bytes()), "answer".as_bytes());
+    assert_eq!(toks[2].text(src.as_bytes()), "=".as_bytes());
+    assert_eq!(toks[3].text(src.as_bytes()), "42".as_bytes());
+    assert_eq!(toks[4].text(src.as_bytes()), ";".as_bytes());
 }
 
 #[test]

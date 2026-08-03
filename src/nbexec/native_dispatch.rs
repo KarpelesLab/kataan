@@ -683,9 +683,10 @@ impl<'a> Interp<'a> {
                 // direct eval is intercepted at the call site (see `Expr::Call`).
                 // `eval(x)` returns `x` unchanged when it isn't a string.
                 let v = arg(0);
+                // WTF-8 bytes — see the direct-eval path in `nbexec/expr.rs`.
                 let Some(source) = v
                     .as_handle()
-                    .and_then(|raw| self.realm.string_value(Handle::from_raw(raw)))
+                    .and_then(|raw| self.realm.string_bytes(Handle::from_raw(raw)))
                 else {
                     return Ok(v);
                 };
@@ -3297,16 +3298,19 @@ impl<'a> Interp<'a> {
                     .unwrap_or_else(|| String::from("grapheme"));
                 // `segment(string)` does `? ToString(string)` (a Symbol throws a
                 // TypeError; a missing argument yields "undefined").
-                let input = self.coerce_to_string(arg(0))?;
+                // WTF-8 bytes, not a lossy `&str`: a JS string may hold lone
+                // surrogates, and both the reported `segment` and `input` must
+                // round-trip them (`containing(i).input === input`).
+                let input = self.coerce_to_string_bytes(arg(0))?;
                 let segs = segment_text(&input, &gran);
                 let mut elems = Vec::with_capacity(segs.len());
                 for (index, seg, is_word_like) in segs {
                     let o = self.realm.new_object();
-                    let sv = self.new_str(&seg);
+                    let sv = self.new_str_bytes(seg);
                     self.realm.set_property(o, "segment", sv);
                     self.realm
                         .set_property(o, "index", NanBox::number(index as f64));
-                    let iv = self.new_str(&input);
+                    let iv = self.new_str_bytes(input.clone());
                     self.realm.set_property(o, "input", iv);
                     if let Some(w) = is_word_like {
                         self.realm.set_property(o, "isWordLike", NanBox::boolean(w));

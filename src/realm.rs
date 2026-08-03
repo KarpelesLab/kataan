@@ -1936,8 +1936,8 @@ impl Realm {
         }
     }
 
-    /// Allocates a `RegExp` from its source and flags.
-    pub fn new_regexp(&mut self, source: &str, flags: &str) -> Handle {
+    /// Allocates a `RegExp` from its WTF-8 source bytes and flags.
+    pub fn new_regexp(&mut self, source: &[u8], flags: &str) -> Handle {
         self.heap.alloc(Cell::RegExp {
             source: alloc::boxed::Box::from(source),
             flags: alloc::boxed::Box::from(flags),
@@ -1950,7 +1950,7 @@ impl Realm {
     /// Recompiles the `RegExp` at `handle` in place (`RegExp.prototype.compile`):
     /// replaces its source/flags, drops the cached compiled program, and resets
     /// `lastIndex` to 0. A no-op if `handle` is not a RegExp.
-    pub fn recompile_regexp(&mut self, handle: Handle, source: &str, flags: &str) {
+    pub fn recompile_regexp(&mut self, handle: Handle, source: &[u8], flags: &str) {
         if let Some(Cell::RegExp {
             source: s,
             flags: f,
@@ -1993,7 +1993,12 @@ impl Realm {
         if let Some(rc) = compiled.borrow().as_ref() {
             return Some(rc.clone());
         }
-        let re = alloc::rc::Rc::new(crate::regex::Regex::new(source, flags).ok()?);
+        // The regex engine parses `&str`; a lone surrogate in the pattern has no
+        // `char` form, so it compiles as U+FFFD. That affects only what such a
+        // pattern matches — `source` is served from the exact bytes above.
+        let re = alloc::rc::Rc::new(
+            crate::regex::Regex::new(&crate::wtf8::to_string_lossy(source), flags).ok()?,
+        );
         *compiled.borrow_mut() = Some(re.clone());
         Some(re)
     }
@@ -2030,6 +2035,12 @@ impl Realm {
     }
 
     /// The `(source, flags)` of the `RegExp` at `handle` (owned), if it is one.
+    ///
+    /// The source is rendered lossily (a lone surrogate → U+FFFD) because it
+    /// feeds `&str`-typed consumers — the regex engine, `toString`-style display,
+    /// and the many `is_some()` brand checks. The observable
+    /// `RegExp.prototype.source` reads [`Realm::regexp_source_bytes`] instead,
+    /// which round-trips exactly.
     #[must_use]
     pub fn regexp_at(
         &self,
@@ -2037,9 +2048,17 @@ impl Realm {
     ) -> Option<(alloc::string::String, alloc::string::String)> {
         let (s, f) = self.heap.get(handle)?.as_regexp()?;
         Some((
-            alloc::string::String::from(s),
+            crate::wtf8::to_string_lossy(s),
             alloc::string::String::from(f),
         ))
+    }
+
+    /// The `RegExp` at `handle`'s pattern source as **WTF-8 bytes** — lossless,
+    /// so `eval("/" + String.fromCharCode(0xD800) + "/").source` reproduces the
+    /// lone surrogate the program text held.
+    #[must_use]
+    pub fn regexp_source_bytes(&self, handle: Handle) -> Option<alloc::vec::Vec<u8>> {
+        Some(self.heap.get(handle)?.as_regexp()?.0.to_vec())
     }
 
     /// Allocates a pending `Promise`.
@@ -4893,7 +4912,9 @@ impl Realm {
                 Some(Cell::TemporalData(t)) => {
                     alloc::format!("[object Temporal.{}]", t.kind.type_name())
                 }
-                Some(Cell::RegExp { source, flags, .. }) => alloc::format!("/{source}/{flags}"),
+                Some(Cell::RegExp { source, flags, .. }) => {
+                    alloc::format!("/{}/{flags}", crate::wtf8::to_string_lossy(source))
+                }
                 Some(Cell::Symbol { description, .. }) => {
                     // A no-argument `Symbol()` carries a `\0`-sentinel description
                     // (an undefined `.description`); render it as `Symbol()`.

@@ -725,7 +725,7 @@ pub struct Interp<'a> {
     /// loop calling `eval` on the same string (or repeated `Function` bodies) does
     /// not re-leak. The leak is bounded by the number of *distinct* eval/Function
     /// sources a program produces.
-    eval_programs: alloc::collections::BTreeMap<String, &'static Program>,
+    eval_programs: alloc::collections::BTreeMap<alloc::vec::Vec<u8>, &'static Program>,
     /// The ES-module loader/linker/evaluator state, present only while running a
     /// module graph (or after a dynamic `import()` has loaded one). `None` for a
     /// plain script — module support is purely additive. See [`module`].
@@ -5991,7 +5991,7 @@ impl<'a> Interp<'a> {
     #[allow(clippy::too_many_arguments)]
     fn parse_eval_program(
         &mut self,
-        source: &str,
+        source: &[u8],
         allow_super_property: bool,
         allow_super_call: bool,
         allow_new_target: bool,
@@ -6010,15 +6010,19 @@ impl<'a> Interp<'a> {
         // `"public = 1"` / `"this.#x"` / `"arguments"` is a SyntaxError in one
         // caller and valid in another, so they must not share a cached AST. A
         // flag prefix (outside the JS source grammar) keeps it unambiguous.
-        let key = alloc::format!(
-            "{}{}{}{}{}{}\0{source}",
+        // Keyed on the raw *bytes*: two sources that differ only in a lone
+        // surrogate (vs. U+FFFD) are different programs and must not share an AST.
+        let mut key = alloc::format!(
+            "{}{}{}{}{}{}\0",
             u8::from(allow_super_property),
             u8::from(allow_super_call),
             u8::from(allow_new_target),
             u8::from(inherited_strict),
             u8::from(in_field_initializer),
             outer_private_names.join(","),
-        );
+        )
+        .into_bytes();
+        key.extend_from_slice(source);
         if let Some(p) = self.eval_programs.get(&key) {
             return Ok(p);
         }
@@ -6363,7 +6367,7 @@ impl<'a> Interp<'a> {
     /// - **Direct strict** eval (caller strict OR code `"use strict"`) gets its
     ///   own child scope for its lexical + var declarations, but still reads the
     ///   surrounding scope.
-    fn eval_string(&mut self, source: &str, direct: bool) -> Result<NanBox, ExecError> {
+    fn eval_string(&mut self, source: &[u8], direct: bool) -> Result<NanBox, ExecError> {
         // A direct eval inherits the caller's `super` context: `super.prop` is
         // legal in the eval code when the calling code has a home object (a
         // method / accessor / constructor / class field initializer / static
@@ -6559,17 +6563,25 @@ impl<'a> Interp<'a> {
                 // — `new Function({toString(){throw 1}}, "")` throws `1`, it does
                 // not stringify to `"[object Object]"` and fail to parse. Parameter
                 // pieces are ToString'd before the body.
-                let mut parts: Vec<String> = Vec::with_capacity(rest.len());
+                //
+                // Kept as WTF-8 bytes so a lone surrogate in a parameter piece or
+                // in the body survives into the assembled program text, exactly as
+                // it does for `eval`.
+                let mut parts: Vec<alloc::vec::Vec<u8>> = Vec::with_capacity(rest.len());
                 for a in rest {
-                    parts.push(self.coerce_to_string(*a)?);
+                    parts.push(self.coerce_to_string_bytes(*a)?);
                 }
-                let body = self.coerce_to_string(*last)?;
-                (parts.join(","), body)
+                let body = self.coerce_to_string_bytes(*last)?;
+                (parts.join(&b','), body)
             }
             // `Function()` with no arguments → an empty-body anonymous function.
-            None => (String::new(), String::new()),
+            None => (alloc::vec::Vec::new(), alloc::vec::Vec::new()),
         };
-        let source = alloc::format!("({keyword} anonymous({params}\n) {{\n{body}\n}})");
+        let mut source = alloc::format!("({keyword} anonymous(").into_bytes();
+        source.extend_from_slice(&params);
+        source.extend_from_slice(b"\n) {\n");
+        source.extend_from_slice(&body);
+        source.extend_from_slice(b"\n})");
 
         // A `Function(…)` body is global-scoped — no inherited `super`. (Its body
         // is wrapped in a function expression, so `new.target` inside is enabled by
@@ -8007,55 +8019,96 @@ pub(crate) fn coerce_typed(kind: u16, n: f64) -> f64 {
     }
 }
 
-/// Segments `input` per an `Intl.Segmenter` granularity, returning `(index, segment,
-/// isWordLike)` triples (`index` is a code-point offset). `grapheme` is per code point;
-/// `word` alternates alphanumeric "word-like" runs with separators; `sentence` splits after
-/// terminating punctuation followed by a space.
-#[cfg(feature = "intl")]
+/// Segments a WTF-8 `input` per an `Intl.Segmenter` granularity, returning
+/// `(index, segment, isWordLike)` triples where `index` is a **UTF-16 code-unit**
+/// offset (the spec's string index — `segment.containing(i)` and `.index` are
+/// defined over `String.prototype.length`, so an astral character advances by 2).
+///
+/// A JS string may hold **lone surrogates**, which no `&str`-based segmenter can
+/// accept. The input is therefore cut into maximal valid-UTF-8 runs separated by
+/// lone surrogate code points: each run is segmented normally, and each lone
+/// surrogate becomes a segment of its own. That matches UAX-29, where a
+/// surrogate is `Grapheme_Cluster_Break=Control` (and word-break `Other`), so it
+/// always breaks on both sides — the boundaries are the same ones a
+/// surrogate-aware segmenter would find.
 fn segment_text(
-    input: &str,
+    input: &[u8],
     granularity: &str,
-) -> Vec<(usize, alloc::string::String, Option<bool>)> {
-    use intl::unicode::segment;
-    // `index` is a code-point offset (kataan strings index by code point, e.g.
-    // `"\u{1F600}".length === 1`), so accumulate `chars().count()` per segment.
-    let mut out: Vec<(usize, alloc::string::String, Option<bool>)> = Vec::new();
+) -> Vec<(usize, alloc::vec::Vec<u8>, Option<bool>)> {
+    let mut out: Vec<(usize, alloc::vec::Vec<u8>, Option<bool>)> = Vec::new();
     let mut index = 0usize;
-    let push = |seg: &str, is_word_like: Option<bool>, out: &mut Vec<_>, index: &mut usize| {
-        out.push((*index, alloc::string::String::from(seg), is_word_like));
-        *index += seg.chars().count();
+    let mut push = |seg: &[u8], is_word_like: Option<bool>| {
+        let units = crate::wtf8::utf16_len(seg);
+        out.push((index, seg.to_vec(), is_word_like));
+        index += units;
     };
-    match granularity {
-        "word" => {
-            for w in segment::words(input) {
-                let wl = Some(w.chars().any(char::is_alphanumeric));
-                push(w, wl, &mut out, &mut index);
+    // Walk the WTF-8 bytes, flushing each maximal UTF-8 run through the
+    // granularity segmenter and emitting every lone surrogate on its own.
+    let mut run_start = 0usize;
+    let mut i = 0usize;
+    while i <= input.len() {
+        // A lone surrogate is stored as the 3-byte form `ED A0..BF 80..BF`.
+        let surrogate = i + 3 <= input.len() && input[i] == 0xED && input[i + 1] >= 0xA0;
+        if i == input.len() || surrogate {
+            if run_start < i
+                && let Some(run) = crate::wtf8::as_str(&input[run_start..i])
+            {
+                for (seg, wl) in segment_str(run, granularity) {
+                    push(seg.as_bytes(), wl);
+                }
             }
-        }
-        "sentence" => {
-            for s in segment::sentences(input) {
-                push(s, None, &mut out, &mut index);
+            if i == input.len() {
+                break;
             }
-        }
-        // "grapheme" (default): UAX-29 extended grapheme clusters.
-        _ => {
-            for g in segment::graphemes(input) {
-                push(g, None, &mut out, &mut index);
-            }
+            let wl = (granularity == "word").then_some(false);
+            push(&input[i..i + 3], wl);
+            i += 3;
+            run_start = i;
+        } else {
+            i += 1;
         }
     }
     out
 }
 
+/// Segments a valid-UTF-8 run into `(segment, isWordLike)` pairs. `grapheme` is
+/// per extended grapheme cluster; `word` alternates alphanumeric "word-like" runs
+/// with separators; `sentence` splits after terminating punctuation.
+#[cfg(feature = "intl")]
+fn segment_str(input: &str, granularity: &str) -> Vec<(alloc::string::String, Option<bool>)> {
+    use intl::unicode::segment;
+    match granularity {
+        "word" => segment::words(input)
+            .map(|w| {
+                let wl = Some(w.chars().any(char::is_alphanumeric));
+                (alloc::string::String::from(w), wl)
+            })
+            .collect(),
+        "sentence" => segment::sentences(input)
+            .map(|s| (alloc::string::String::from(s), None))
+            .collect(),
+        // "grapheme" (default): UAX-29 extended grapheme clusters.
+        _ => segment::graphemes(input)
+            .map(|g| (alloc::string::String::from(g), None))
+            .collect(),
+    }
+}
+
+/// Hand-rolled en-US fallback used when the `intl` crate is unavailable.
+#[cfg(not(feature = "intl"))]
+fn segment_str(input: &str, granularity: &str) -> Vec<(alloc::string::String, Option<bool>)> {
+    segment_text_fallback(input, granularity)
+}
+
 /// Hand-rolled en-US fallback used when the `intl` crate is unavailable: per-code-point
 /// graphemes, alphanumeric word runs, and `.`/`!`/`?`-plus-space sentence splits.
 #[cfg(not(feature = "intl"))]
-fn segment_text(
+fn segment_text_fallback(
     input: &str,
     granularity: &str,
-) -> Vec<(usize, alloc::string::String, Option<bool>)> {
+) -> Vec<(alloc::string::String, Option<bool>)> {
     let chars: Vec<char> = input.chars().collect();
-    let mut out: Vec<(usize, alloc::string::String, Option<bool>)> = Vec::new();
+    let mut out: Vec<(alloc::string::String, Option<bool>)> = Vec::new();
     // Approximate UAX-29 word boundaries: group runs of one class — alphanumeric (word-like),
     // whitespace, or other — so punctuation and spaces become distinct segments (matching the
     // `intl` crate, e.g. `","` and `" "` split apart).
@@ -8077,7 +8130,7 @@ fn segment_text(
                 while i < chars.len() && class(chars[i]) == cls {
                     i += 1;
                 }
-                out.push((start, chars[start..i].iter().collect(), Some(cls == 0)));
+                out.push((chars[start..i].iter().collect(), Some(cls == 0)));
             }
         }
         "sentence" => {
@@ -8091,18 +8144,18 @@ fn segment_text(
                     while i < chars.len() && chars[i].is_whitespace() {
                         i += 1;
                     }
-                    out.push((start, chars[start..i].iter().collect(), None));
+                    out.push((chars[start..i].iter().collect(), None));
                     start = i;
                 }
             }
             if start < chars.len() {
-                out.push((start, chars[start..].iter().collect(), None));
+                out.push((chars[start..].iter().collect(), None));
             }
         }
         // "grapheme" (default): one code point per segment.
         _ => {
-            for (i, c) in chars.iter().enumerate() {
-                out.push((i, alloc::string::String::from(*c), None));
+            for c in &chars {
+                out.push((alloc::string::String::from(*c), None));
             }
         }
     }

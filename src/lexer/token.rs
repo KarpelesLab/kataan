@@ -25,11 +25,24 @@ pub struct Token {
 }
 
 impl Token {
-    /// The raw source text of this token.
+    /// The raw source text of this token, as **WTF-8 bytes** — program text may
+    /// hold lone surrogates (from `eval` of a surrogate-bearing string), so the
+    /// byte form is the lossless one.
     #[inline]
     #[must_use]
-    pub fn text<'s>(&self, source: &'s str) -> &'s str {
-        self.span.slice(source)
+    pub fn text<'s>(&self, source: &'s [u8]) -> &'s [u8] {
+        self.span.slice_bytes(source)
+    }
+
+    /// The raw source text of this token as `&str` — for the token kinds that
+    /// provably cannot contain a surrogate (identifiers, numbers, keywords: a
+    /// surrogate code point is not an `IdentifierPart` and not a digit). Falls
+    /// back to the empty string on the impossible non-UTF-8 case rather than
+    /// panicking.
+    #[inline]
+    #[must_use]
+    pub fn ascii_text<'s>(&self, source: &'s [u8]) -> &'s str {
+        crate::wtf8::as_str(self.text(source)).unwrap_or("")
     }
 }
 

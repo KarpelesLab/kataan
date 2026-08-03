@@ -38,7 +38,14 @@ impl<'src> Parser<'src> {
     /// script. (Strict-mode and top-level-only semantics are validated in a
     /// later phase.)
     pub fn parse_program(source: &'src str) -> Result<Program> {
-        let mut p = Parser::new(source)?;
+        Self::parse_program_bytes(source.as_bytes())
+    }
+
+    /// Like [`Parser::parse_program`] but over **WTF-8** program-text bytes — the
+    /// lossless entry point for source that came from a JS string (`eval`, the
+    /// `Function` constructor), which may contain lone surrogates.
+    pub fn parse_program_bytes(source: &'src [u8]) -> Result<Program> {
+        let mut p = Parser::with_goal_bytes(source, false)?;
         // The program top level is a `ModuleItem` position (a top-level
         // `import`/`export` makes the unit a module); nested `import`/`export`
         // remain illegal. A pure script has no such tokens, so the flag is inert.
@@ -57,7 +64,10 @@ impl<'src> Parser<'src> {
             body,
             source_type,
             span: Span::new(0, source.len() as u32),
-            source: source.into(),
+            // The retained copy is for `Function.prototype.toString` reslicing, a
+            // `&str`-typed sink, so a lone surrogate renders as U+FFFD. Both are
+            // three bytes, so every recorded byte-offset span stays aligned.
+            source: crate::wtf8::to_string_lossy(source).into(),
         };
         // Static-semantics early errors (private names, lexical redeclaration,
         // strict-mode rules, …) are enforced as a post-parse pass so they surface
@@ -76,7 +86,7 @@ impl<'src> Parser<'src> {
     /// # Errors
     /// Returns a parse-phase `SyntaxError` on malformed input.
     pub fn parse_eval_program(
-        source: &'src str,
+        source: &'src [u8],
         allow_super_property: bool,
         allow_super_call: bool,
         allow_new_target: bool,
@@ -88,7 +98,7 @@ impl<'src> Parser<'src> {
         // block (activates the ContainsArguments early error for `arguments`).
         in_field_initializer: bool,
     ) -> Result<Program> {
-        let mut p = Parser::new(source)?;
+        let mut p = Parser::with_goal_bytes(source, false)?;
         p.module_top_level = true;
         let body = p.parse_statement_list(TokenKind::Eof)?;
         p.expect(TokenKind::Eof)?;
@@ -106,7 +116,9 @@ impl<'src> Parser<'src> {
             body,
             source_type: SourceType::Script,
             span: Span::new(0, source.len() as u32),
-            source: source.into(),
+            // Lossy for the same reason (and with the same span alignment) as in
+            // `parse_program_bytes`.
+            source: crate::wtf8::to_string_lossy(source).into(),
         };
         super::validate::validate_program_with(
             &program,
@@ -359,7 +371,7 @@ impl<'src> Parser<'src> {
     /// and not itself `using`; a bare `using` (e.g. `using;`, `using = 1`,
     /// `using\n x`) remains an ordinary identifier expression.
     fn at_using_decl(&self) -> bool {
-        self.peek_tok().text(self.source) == "using"
+        self.peek_tok().ascii_text(self.source) == "using"
             && !self.nth_newline(1)
             && self.nth_is_binding_ident(1)
     }
@@ -372,7 +384,7 @@ impl<'src> Parser<'src> {
             && self
                 .tokens
                 .get(self.pos + 1)
-                .is_some_and(|t| t.text(self.source) == "using")
+                .is_some_and(|t| t.ascii_text(self.source) == "using")
             && !self.nth_newline(2)
             && self.nth_is_binding_ident(2)
     }
@@ -426,7 +438,7 @@ impl<'src> Parser<'src> {
     fn nth_is_named(&self, n: usize, name: &str) -> bool {
         self.tokens
             .get(self.pos + n)
-            .is_some_and(|t| t.text(self.source) == name)
+            .is_some_and(|t| t.ascii_text(self.source) == name)
     }
 
     /// Whether the token `n` ahead is a `BindingIdentifier` that may follow
@@ -456,7 +468,7 @@ impl<'src> Parser<'src> {
             TokenKind::Identifier => self
                 .tokens
                 .get(self.pos + n)
-                .is_some_and(|t| t.text(self.source) != "using"),
+                .is_some_and(|t| t.ascii_text(self.source) != "using"),
             TokenKind::Keyword(kw) => self.keyword_is_binding_ident(kw),
             _ => false,
         }
@@ -673,9 +685,9 @@ impl<'src> Parser<'src> {
                     PropertyKey::Str(cook::string_key(tok.text(self.source), tok.span)?.into())
                 }
                 TokenKind::BigInt => {
-                    PropertyKey::Str(cook::bigint_property_key(tok.text(self.source)).into())
+                    PropertyKey::Str(cook::bigint_property_key(tok.ascii_text(self.source)).into())
                 }
-                _ => PropertyKey::Number(cook::number(tok.text(self.source))),
+                _ => PropertyKey::Number(cook::number(tok.ascii_text(self.source))),
             };
             self.expect(TokenKind::Colon)?;
             let value = self.parse_binding_target()?;
@@ -859,7 +871,7 @@ impl<'src> Parser<'src> {
         // (`async (of) => …`) used as a classic-`for` initializer; the following
         // `=>` disambiguates it, so it is not the forbidden `for-of` LHS.
         if !is_await
-            && self.peek_tok().text(self.source) == "async"
+            && self.peek_tok().ascii_text(self.source) == "async"
             && self.nth_is_named(1, "of")
             && self.nth_kind(2) != TokenKind::Arrow
         {

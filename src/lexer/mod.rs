@@ -63,12 +63,13 @@ enum BraceKind {
 /// Drive it with [`Lexer::next_token`] until it yields [`TokenKind::Eof`], or
 /// collect everything at once with [`Lexer::tokenize`].
 pub struct Lexer<'src> {
-    /// The full source text.
-    source: &'src str,
-    /// Remaining bytes, as raw bytes for fast ASCII dispatch. Always a valid
-    /// UTF-8 boundary at `pos`.
+    /// The full source text, as **WTF-8 bytes**. Program text is not necessarily
+    /// valid UTF-8: `eval` of a JS string may carry lone surrogates, which must
+    /// survive into a regex/string literal's value (`eval("/\uD800/").source`).
+    /// Scanning is byte-wise anyway (all of ECMAScript's punctuation is ASCII),
+    /// so the byte form costs nothing and loses nothing.
     bytes: &'src [u8],
-    /// Current byte offset into `source`.
+    /// Current byte offset into `bytes`.
     pos: usize,
     /// The kind of the previous significant (non-trivia) token, used to
     /// resolve the `/` regex-vs-division ambiguity. `None` at start of input.
@@ -131,9 +132,16 @@ impl<'src> Lexer<'src> {
     /// script-only Annex B HTML-like comments).
     #[must_use]
     pub fn with_goal(source: &'src str, module: bool) -> Self {
+        Self::with_goal_bytes(source.as_bytes(), module)
+    }
+
+    /// Creates a lexer over **WTF-8** source bytes — the lossless entry point,
+    /// used when the program text comes from a JS string that may hold lone
+    /// surrogates (`eval`, the `Function` constructor).
+    #[must_use]
+    pub fn with_goal_bytes(bytes: &'src [u8], module: bool) -> Self {
         Self {
-            source,
-            bytes: source.as_bytes(),
+            bytes,
             pos: 0,
             prev_significant: None,
             brace_stack: Vec::new(),
@@ -148,11 +156,11 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    /// The source text this lexer is scanning.
+    /// The source text this lexer is scanning, as WTF-8 bytes.
     #[inline]
     #[must_use]
-    pub fn source(&self) -> &'src str {
-        self.source
+    pub fn source(&self) -> &'src [u8] {
+        self.bytes
     }
 
     /// Tokenizes the entire input into a vector ending with an
@@ -1159,7 +1167,9 @@ impl<'src> Lexer<'src> {
             self.cur_had_escape = true;
             return Ok(TokenKind::Identifier);
         }
-        let text = &self.source[start..self.pos];
+        // An escape-free identifier is by definition all `IdentifierPart` code
+        // points, none of which is a surrogate — so this is always valid UTF-8.
+        let text = crate::wtf8::as_str(&self.bytes[start..self.pos]).unwrap_or("");
         Ok(match Keyword::from_str(text) {
             Some(kw) => TokenKind::Keyword(kw),
             None => TokenKind::Identifier,
@@ -1418,9 +1428,19 @@ impl<'src> Lexer<'src> {
     }
 
     /// Decodes the full Unicode scalar at `pos` (for the non-ASCII paths).
+    ///
+    /// A stored **lone surrogate** is not a `char`; it decodes to U+FFFD, which
+    /// is exactly as good here — a surrogate is neither whitespace, nor a line
+    /// terminator, nor an `IdentifierStart`/`IdentifierPart`, so every predicate
+    /// this feeds answers the same for both, and U+FFFD's UTF-8 length (3) equals
+    /// the surrogate's WTF-8 length, so [`Lexer::advance_any`] still steps
+    /// exactly one code point. The literal's *value* is taken from the raw bytes,
+    /// never from this.
     #[inline]
     fn peek_char(&self) -> Option<char> {
-        self.source[self.pos..].chars().next()
+        crate::wtf8::code_points(&self.bytes[self.pos..])
+            .next()
+            .map(|cp| char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER))
     }
 
     /// Advances one ASCII byte. Must not be called on a multi-byte lead byte.

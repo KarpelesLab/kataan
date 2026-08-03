@@ -160,7 +160,9 @@ pub enum Op {
     /// `dst = /source/flags` — a new `RegExp` value.
     NewRegExp {
         dst: Reg,
-        source: String,
+        /// The pattern source as WTF-8 bytes — it may hold a lone surrogate,
+        /// which `RegExp.prototype.source` must reproduce exactly.
+        source: Vec<u8>,
         flags: String,
     },
     /// `dst = a new empty object` (allocated in the realm's heap).
@@ -8529,7 +8531,7 @@ impl Compiler {
                 let dst = self.alloc();
                 self.ops.push(Op::NewRegExp {
                     dst,
-                    source: String::from(&**pattern),
+                    source: pattern.to_vec(),
                     flags: String::from(&**flags),
                 });
                 Ok(dst)
@@ -8658,7 +8660,11 @@ impl Compiler {
                         (lit(arguments.first()), lit(arguments.get(1)))
                     {
                         let dst = self.alloc();
-                        self.ops.push(Op::NewRegExp { dst, source, flags });
+                        self.ops.push(Op::NewRegExp {
+                            dst,
+                            source: source.into_bytes(),
+                            flags,
+                        });
                         return Ok(dst);
                     }
                     return Err(CompileError::Unsupported("new RegExp with dynamic args"));

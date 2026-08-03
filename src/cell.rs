@@ -302,8 +302,11 @@ pub enum Cell {
     /// A `RegExp`: its source pattern and flags (compiled on demand by the
     /// `regex` engine, so the variant itself carries no feature-gated type).
     RegExp {
-        /// The pattern source.
-        source: alloc::boxed::Box<str>,
+        /// The pattern source, as **WTF-8 bytes**. A regex literal's `source`
+        /// must reproduce the program text's code units exactly, and program
+        /// text (from `eval` of a JS string) may hold lone surrogates, which
+        /// `str` cannot represent.
+        source: alloc::boxed::Box<[u8]>,
         /// The flags (e.g. `"gi"`).
         flags: alloc::boxed::Box<str>,
         /// The mutable `lastIndex` (where the next `g`/`y` search resumes).
@@ -567,9 +570,10 @@ impl Cell {
         }
     }
 
-    /// The `(source, flags)` if this cell is a `RegExp`.
+    /// The `(source, flags)` if this cell is a `RegExp` — the source as WTF-8
+    /// bytes (lossless; see [`Cell::RegExp`]).
     #[must_use]
-    pub fn as_regexp(&self) -> Option<(&str, &str)> {
+    pub fn as_regexp(&self) -> Option<(&[u8], &str)> {
         match self {
             Cell::RegExp { source, flags, .. } => Some((source, flags)),
             _ => None,

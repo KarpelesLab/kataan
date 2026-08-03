@@ -12,6 +12,10 @@ use crate::wtf8;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+/// A one-code-point-lookahead cursor over WTF-8 program text. Yields `u32` code
+/// points rather than `char` so a lone surrogate survives the scan.
+type CodePointCursor<'a> = core::iter::Peekable<wtf8::CodePoints<'a>>;
+
 /// Decodes a numeric-literal token's text into an `f64`.
 ///
 /// Handles decimal integers and floats with exponents, the `0x` / `0o` / `0b`
@@ -169,8 +173,9 @@ pub(super) fn bigint_property_key(text: &str) -> String {
 }
 
 /// Decodes a string-literal token (including its surrounding quotes) into its
-/// runtime value — WTF-8 bytes preserving any lone UTF-16 surrogates.
-pub(super) fn string(raw: &str, span: Span) -> Result<Vec<u8>> {
+/// runtime value — WTF-8 bytes preserving any lone UTF-16 surrogates, whether
+/// they were written as `\uD800` escapes or appear raw in the program text.
+pub(super) fn string(raw: &[u8], span: Span) -> Result<Vec<u8>> {
     // The first and last bytes are the ASCII quote characters.
     let inner = &raw[1..raw.len() - 1];
     decode_escapes(inner, span)
@@ -186,8 +191,7 @@ pub(super) fn string(raw: &str, span: Span) -> Result<Vec<u8>> {
 /// digits are all ASCII, and a UTF-8 continuation byte is always ≥ 0x80, so a
 /// multi-byte scalar inside the literal can never be mistaken for an escape.
 #[must_use]
-pub(super) fn string_has_legacy_octal_escape(raw: &str) -> bool {
-    let b = raw.as_bytes();
+pub(super) fn string_has_legacy_octal_escape(b: &[u8]) -> bool {
     let mut i = 0;
     while i < b.len() {
         if b[i] != b'\\' {
@@ -224,7 +228,7 @@ pub(super) fn string_has_legacy_octal_escape(raw: &str) -> bool {
 /// a lone surrogate in a key is decoded lossily (→ U+FFFD); a non-surrogate key
 /// — the overwhelmingly common case — is unchanged. (Surrogate-correct *string
 /// values* go through [`string`], which keeps the WTF-8 bytes.)
-pub(super) fn string_key(raw: &str, span: Span) -> Result<String> {
+pub(super) fn string_key(raw: &[u8], span: Span) -> Result<String> {
     Ok(wtf8::to_string_lossy(&string(raw, span)?))
 }
 
@@ -238,36 +242,43 @@ pub(super) fn string_key(raw: &str, span: Span) -> Result<String> {
 /// [`wtf8::encode_utf16_unit`]); an adjacent `\u` high+low pair is combined into
 /// the astral scalar it denotes. A string with no surrogates is byte-identical
 /// to its UTF-8, so the common case is unchanged.
-pub(super) fn decode_escapes(body: &str, span: Span) -> Result<Vec<u8>> {
+///
+/// `body` is WTF-8, so a surrogate may also appear **raw** in the program text
+/// (`eval('"' + String.fromCharCode(0xD800) + '"')`); it is copied through
+/// unchanged. Every character of escape *syntax* is ASCII, so the scan works on
+/// code points and only ever needs `char` for the ASCII selectors.
+pub(super) fn decode_escapes(body: &[u8], span: Span) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(body.len());
-    let mut chars = body.chars().peekable();
+    let mut chars = wtf8::code_points(body).peekable();
 
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            push_char(&mut out, c);
+    while let Some(cp) = chars.next() {
+        if cp != u32::from(b'\\') {
+            wtf8::encode_code_point(cp, &mut out);
             continue;
         }
-        let Some(esc) = chars.next() else {
+        let Some(esc_cp) = chars.next() else {
             return Err(Error::syntax("unterminated escape sequence", span));
         };
-        match esc {
-            'n' => out.push(b'\n'),
-            't' => out.push(b'\t'),
-            'r' => out.push(b'\r'),
-            'b' => out.push(0x08),
-            'f' => out.push(0x0C),
-            'v' => out.push(0x0B),
-            '0' if !chars.peek().is_some_and(|c| c.is_ascii_digit()) => out.push(0),
+        // `None` for a lone surrogate — never an escape selector, so it falls to
+        // the identity branch below and stands for itself.
+        match char::from_u32(esc_cp) {
+            Some('n') => out.push(b'\n'),
+            Some('t') => out.push(b'\t'),
+            Some('r') => out.push(b'\r'),
+            Some('b') => out.push(0x08),
+            Some('f') => out.push(0x0C),
+            Some('v') => out.push(0x0B),
+            Some('0') if !chars.peek().is_some_and(|c| is_ascii_digit_cp(*c)) => out.push(0),
             // Legacy octal escape (Annex B B.1.2). Only reached in sloppy mode — a
             // strict-mode string with such an escape is rejected before cooking. A
             // leading `0`–`3` admits up to three octal digits; a leading `4`–`7`,
             // two (value ≤ 255). `\8` / `\9` are not octal (the identity branch).
-            '0'..='7' => {
+            Some(esc @ '0'..='7') => {
                 let mut val = esc as u32 - '0' as u32;
                 let max_more = if esc <= '3' { 2 } else { 1 };
                 for _ in 0..max_more {
-                    match chars.peek() {
-                        Some(&d @ '0'..='7') => {
+                    match chars.peek().copied().and_then(char::from_u32) {
+                        Some(d @ '0'..='7') => {
                             chars.next();
                             val = val * 8 + (d as u32 - '0' as u32);
                         }
@@ -277,25 +288,32 @@ pub(super) fn decode_escapes(body: &str, span: Span) -> Result<Vec<u8>> {
                 // `val` ≤ 0o377 = 255, so it is a valid Latin-1 code point.
                 push_char(&mut out, char::from_u32(val).unwrap_or('\0'));
             }
-            'x' => {
+            Some('x') => {
                 let hi = hex_digit(chars.next(), span)?;
                 let lo = hex_digit(chars.next(), span)?;
                 push_char(&mut out, char::from(hi * 16 + lo));
             }
-            'u' => decode_unicode_escape(&mut chars, &mut out, span)?,
+            Some('u') => decode_unicode_escape(&mut chars, &mut out, span)?,
             // Line continuation: a backslash before a line terminator is elided.
-            '\n' | '\u{2028}' | '\u{2029}' => {}
-            '\r' => {
-                if chars.peek() == Some(&'\n') {
+            Some('\n' | '\u{2028}' | '\u{2029}') => {}
+            Some('\r') => {
+                if chars.peek() == Some(&u32::from(b'\n')) {
                     chars.next();
                 }
             }
             // Any other escaped character stands for itself (covers `\\`, `\'`,
-            // `\"`, `` \` ``, `\$`, `\/`, and the identity escapes).
-            other => push_char(&mut out, other),
+            // `\"`, `` \` ``, `\$`, `\/`, the identity escapes — and a raw lone
+            // surrogate).
+            _ => wtf8::encode_code_point(esc_cp, &mut out),
         }
     }
     Ok(out)
+}
+
+/// Whether a code point is an ASCII decimal digit.
+#[inline]
+fn is_ascii_digit_cp(cp: u32) -> bool {
+    (u32::from(b'0')..=u32::from(b'9')).contains(&cp)
 }
 
 /// Validates the escape sequences of an *untagged* template segment, returning
@@ -315,23 +333,25 @@ pub(super) fn decode_escapes(body: &str, span: Span) -> Result<Vec<u8>> {
 /// a legacy octal escape (`\1`–`\7`, `\00`, …) and `\8` / `\9` are *never* legal
 /// in a template and so are rejected here regardless of strict mode. (Tagged
 /// templates skip this check: their cooked value is simply `undefined`.)
-pub(super) fn validate_template_escapes(body: &str, span: Span) -> Result<()> {
-    let mut chars = body.chars().peekable();
+pub(super) fn validate_template_escapes(body: &[u8], span: Span) -> Result<()> {
+    let mut chars = wtf8::code_points(body).peekable();
     while let Some(c) = chars.next() {
-        if c != '\\' {
+        if c != u32::from(b'\\') {
             continue;
         }
-        let Some(esc) = chars.next() else {
+        let Some(esc_cp) = chars.next() else {
             // A trailing `\` cannot occur: the lexer requires the closing
             // delimiter, so a `\` is always followed by at least one char.
             return Err(Error::syntax("invalid template escape sequence", span));
         };
-        match esc {
+        // A lone surrogate (`None`) is never an escape selector; like any other
+        // escaped character it stands for itself and needs no validation.
+        match char::from_u32(esc_cp) {
             // `\0` is only an escape when not followed by a decimal digit; a
             // following digit makes it a legacy octal escape (`\00`), which is
             // not a TemplateEscapeSequence.
-            '0' => {
-                if chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+            Some('0') => {
+                if chars.peek().is_some_and(|c| is_ascii_digit_cp(*c)) {
                     return Err(Error::syntax(
                         "octal escape sequences are not allowed in template literals",
                         span,
@@ -339,13 +359,13 @@ pub(super) fn validate_template_escapes(body: &str, span: Span) -> Result<()> {
                 }
             }
             // Legacy octal (`\1`–`\7`) and the non-octal decimals `\8` / `\9`.
-            '1'..='9' => {
+            Some('1'..='9') => {
                 return Err(Error::syntax(
                     "octal escape sequences are not allowed in template literals",
                     span,
                 ));
             }
-            'x' => {
+            Some('x') => {
                 if !next_is_hex(&mut chars) || !next_is_hex(&mut chars) {
                     return Err(Error::syntax(
                         "invalid hexadecimal escape sequence in template literal",
@@ -353,7 +373,7 @@ pub(super) fn validate_template_escapes(body: &str, span: Span) -> Result<()> {
                     ));
                 }
             }
-            'u' => validate_template_unicode_escape(&mut chars, span)?,
+            Some('u') => validate_template_unicode_escape(&mut chars, span)?,
             // Any other escaped char (incl. line continuations) is valid.
             _ => {}
         }
@@ -364,19 +384,16 @@ pub(super) fn validate_template_escapes(body: &str, span: Span) -> Result<()> {
 /// Validates a `\u` escape body in a template (the `u` already consumed):
 /// either `\uHHHH` or `\u{ CodePoint }` with `CodePoint` ≤ U+10FFFF and no
 /// numeric separators.
-fn validate_template_unicode_escape(
-    chars: &mut core::iter::Peekable<core::str::Chars<'_>>,
-    span: Span,
-) -> Result<()> {
+fn validate_template_unicode_escape(chars: &mut CodePointCursor<'_>, span: Span) -> Result<()> {
     let invalid = || Error::syntax("invalid Unicode escape sequence in template literal", span);
-    if chars.peek() == Some(&'{') {
+    if chars.peek() == Some(&u32::from(b'{')) {
         chars.next(); // `{`
         let mut value: u32 = 0;
         let mut any = false;
         loop {
-            match chars.peek() {
+            match chars.peek().copied().and_then(char::from_u32) {
                 Some('}') => break,
-                Some(&d) if d.is_ascii_hexdigit() => {
+                Some(d) if d.is_ascii_hexdigit() => {
                     any = true;
                     value = value
                         .saturating_mul(16)
@@ -401,9 +418,14 @@ fn validate_template_unicode_escape(
     Ok(())
 }
 
-/// Consumes one char if it is an ASCII hex digit, reporting whether it was.
-fn next_is_hex(chars: &mut core::iter::Peekable<core::str::Chars<'_>>) -> bool {
-    if chars.peek().is_some_and(char::is_ascii_hexdigit) {
+/// Consumes one code point if it is an ASCII hex digit, reporting whether it was.
+fn next_is_hex(chars: &mut CodePointCursor<'_>) -> bool {
+    if chars
+        .peek()
+        .copied()
+        .and_then(char::from_u32)
+        .is_some_and(|c| c.is_ascii_hexdigit())
+    {
         chars.next();
         true
     } else {
@@ -424,15 +446,15 @@ fn push_char(out: &mut Vec<u8>, c: char) {
 /// `\uXXXX\uXXXX` surrogate pairs (combined into one astral scalar) and
 /// preserves a lone surrogate as a surrogate code point.
 fn decode_unicode_escape(
-    chars: &mut core::iter::Peekable<core::str::Chars<'_>>,
+    chars: &mut CodePointCursor<'_>,
     out: &mut Vec<u8>,
     span: Span,
 ) -> Result<()> {
-    if chars.peek() == Some(&'{') {
+    if chars.peek() == Some(&u32::from(b'{')) {
         chars.next(); // `{`
         let mut value: u32 = 0;
         while let Some(&c) = chars.peek() {
-            if c == '}' {
+            if c == u32::from(b'}') {
                 break;
             }
             value = value
@@ -453,7 +475,7 @@ fn decode_unicode_escape(
     if (0xD800..=0xDBFF).contains(&hi) {
         // Possible surrogate pair: look for a following `\uXXXX` low surrogate.
         let mut clone = chars.clone();
-        if clone.next() == Some('\\') && clone.next() == Some('u') {
+        if clone.next() == Some(u32::from(b'\\')) && clone.next() == Some(u32::from(b'u')) {
             let lo = read_u16_hex(&mut clone, span)?;
             if (0xDC00..=0xDFFF).contains(&lo) {
                 *chars = clone;
@@ -469,7 +491,7 @@ fn decode_unicode_escape(
 }
 
 /// Reads exactly four hex digits into a `u16`.
-fn read_u16_hex(chars: &mut core::iter::Peekable<core::str::Chars<'_>>, span: Span) -> Result<u16> {
+fn read_u16_hex(chars: &mut CodePointCursor<'_>, span: Span) -> Result<u16> {
     let mut v: u16 = 0;
     for _ in 0..4 {
         v = v * 16 + u16::from(hex_digit(chars.next(), span)?);
@@ -477,10 +499,10 @@ fn read_u16_hex(chars: &mut core::iter::Peekable<core::str::Chars<'_>>, span: Sp
     Ok(v)
 }
 
-/// Converts an expected hex-digit char to its value, erroring if missing or
-/// non-hex.
-fn hex_digit(c: Option<char>, span: Span) -> Result<u8> {
-    match c.and_then(|c| c.to_digit(16)) {
+/// Converts an expected hex-digit code point to its value, erroring if missing
+/// or non-hex.
+fn hex_digit(c: Option<u32>, span: Span) -> Result<u8> {
+    match c.and_then(char::from_u32).and_then(|c| c.to_digit(16)) {
         Some(d) => Ok(d as u8),
         None => Err(Error::syntax("invalid escape sequence", span)),
     }
@@ -536,7 +558,7 @@ mod tests {
             r"\w",
         ] {
             assert!(
-                validate_template_escapes(ok, sp()).is_ok(),
+                validate_template_escapes(ok.as_bytes(), sp()).is_ok(),
                 "should accept: {ok:?}"
             );
         }
@@ -555,7 +577,7 @@ mod tests {
             r"\9",         // \9
         ] {
             assert!(
-                validate_template_escapes(bad, sp()).is_err(),
+                validate_template_escapes(bad.as_bytes(), sp()).is_err(),
                 "should reject: {bad:?}"
             );
         }
@@ -565,19 +587,22 @@ mod tests {
     fn string_escapes() {
         // Cooked values are WTF-8 bytes; a non-surrogate string is byte-identical
         // to its UTF-8.
-        assert_eq!(string(r#""hello""#, sp()).unwrap(), b"hello");
-        assert_eq!(string(r#""a\tb\nc""#, sp()).unwrap(), b"a\tb\nc");
-        assert_eq!(string(r#""\x41\x42""#, sp()).unwrap(), b"AB");
-        assert_eq!(string(r#""A""#, sp()).unwrap(), b"A");
+        assert_eq!(string(r#""hello""#.as_bytes(), sp()).unwrap(), b"hello");
+        assert_eq!(string(r#""a\tb\nc""#.as_bytes(), sp()).unwrap(), b"a\tb\nc");
+        assert_eq!(string(r#""\x41\x42""#.as_bytes(), sp()).unwrap(), b"AB");
+        assert_eq!(string(r#""A""#.as_bytes(), sp()).unwrap(), b"A");
         assert_eq!(
-            string(r#""\u{1F600}""#, sp()).unwrap(),
+            string(r#""\u{1F600}""#.as_bytes(), sp()).unwrap(),
             "\u{1F600}".as_bytes()
         );
-        assert_eq!(string(r"'it\'s'", sp()).unwrap(), b"it's");
+        assert_eq!(string(r"'it\'s'".as_bytes(), sp()).unwrap(), b"it's");
         // Surrogate pair for U+1F600.
-        assert_eq!(string(r#""😀""#, sp()).unwrap(), "\u{1F600}".as_bytes());
+        assert_eq!(
+            string(r#""😀""#.as_bytes(), sp()).unwrap(),
+            "\u{1F600}".as_bytes()
+        );
         // Line continuation.
-        assert_eq!(string("\"a\\\nb\"", sp()).unwrap(), b"ab");
+        assert_eq!(string("\"a\\\nb\"".as_bytes(), sp()).unwrap(), b"ab");
     }
 
     #[test]
@@ -585,24 +610,24 @@ mod tests {
         // A lone high surrogate via `\uXXXX` is kept as a WTF-8 surrogate code
         // point (3 bytes ED A0 80), not collapsed to U+FFFD.
         assert_eq!(
-            string(r#""\uD800""#, sp()).unwrap(),
+            string(r#""\uD800""#.as_bytes(), sp()).unwrap(),
             wtf8::from_utf16(&[0xD800])
         );
         // `\u{D800}` (brace form) likewise.
         assert_eq!(
-            string(r#""\u{D800}""#, sp()).unwrap(),
+            string(r#""\u{D800}""#.as_bytes(), sp()).unwrap(),
             wtf8::from_utf16(&[0xD800])
         );
         // A lone low surrogate.
         assert_eq!(
-            string(r#""\uDC00""#, sp()).unwrap(),
+            string(r#""\uDC00""#.as_bytes(), sp()).unwrap(),
             wtf8::from_utf16(&[0xDC00])
         );
         // High + low across two escapes pair into the astral scalar.
-        assert_eq!(string(r#""😀""#, sp()).unwrap(), "😀".as_bytes());
+        assert_eq!(string(r#""😀""#.as_bytes(), sp()).unwrap(), "😀".as_bytes());
         // A high surrogate followed by a non-low stays lone, then the next char.
         let mut expected = wtf8::from_utf16(&[0xD800]);
         expected.push(b'x');
-        assert_eq!(string(r#""\uD800x""#, sp()).unwrap(), expected);
+        assert_eq!(string(r#""\uD800x""#.as_bytes(), sp()).unwrap(), expected);
     }
 }

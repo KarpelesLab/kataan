@@ -1386,8 +1386,8 @@ impl<'a> Interp<'a> {
                                 .and_then(|h| self.realm.get_property(h, "input"))
                                 .and_then(|v| v.as_handle())
                                 .map(Handle::from_raw)
-                                .and_then(|ih| self.realm.string_value(ih))
-                                .map_or(0, |s| s.encode_utf16().count());
+                                .and_then(|ih| self.realm.string_bytes(ih))
+                                .map_or(0, |b| crate::wtf8::utf16_len(&b));
                             if idx < input_len {
                                 for e in &elems {
                                     let start = e
@@ -3125,8 +3125,13 @@ impl<'a> Interp<'a> {
             // accessor propagates before any other observable step).
             let pattern_is_regexp = self.try_is_regexp(pattern)?;
             let pat_h = pattern.as_handle().map(Handle::from_raw);
-            let (pat, flags) = if let Some((src, fl)) = pat_h.and_then(|h| self.realm.regexp_at(h))
-            {
+            // The pattern is kept as WTF-8 bytes throughout: a lone surrogate in
+            // the source (copied from another RegExp, or from a string argument)
+            // must survive into `.source`.
+            let (pat, flags) = if let Some((_, fl)) = pat_h.and_then(|h| self.realm.regexp_at(h)) {
+                let src = pat_h
+                    .and_then(|h| self.realm.regexp_source_bytes(h))
+                    .unwrap_or_default();
                 let flags = if matches!(flags_arg.unpack(), Unpacked::Undefined) {
                     fl
                 } else {
@@ -3137,7 +3142,7 @@ impl<'a> Interp<'a> {
                 // A non-RegExp object with a truthy `@@match` (IsRegExp): use its
                 // `.source`/`.flags` when no flags argument is supplied.
                 let src_v = self.read_member(ph, "source")?;
-                let src = self.coerce_to_string(src_v)?;
+                let src = self.coerce_to_string_bytes(src_v)?;
                 let flags = if matches!(flags_arg.unpack(), Unpacked::Undefined) {
                     let fv = self.read_member(ph, "flags")?;
                     self.coerce_to_string(fv)?
@@ -3147,9 +3152,9 @@ impl<'a> Interp<'a> {
                 (src, flags)
             } else {
                 let pat = if matches!(pattern.unpack(), Unpacked::Undefined) {
-                    String::new()
+                    alloc::vec::Vec::new()
                 } else {
-                    self.coerce_to_string(pattern)?
+                    self.coerce_to_string_bytes(pattern)?
                 };
                 let flags = if matches!(flags_arg.unpack(), Unpacked::Undefined) {
                     String::new()
@@ -3159,13 +3164,18 @@ impl<'a> Interp<'a> {
                 (pat, flags)
             };
             // Validate the pattern/flags up front: an invalid regular expression is
-            // a `SyntaxError` at construction, not a silent broken object.
+            // a `SyntaxError` at construction, not a silent broken object. (The
+            // engine parses `&str`, so a lone surrogate is validated — and later
+            // matched — as U+FFFD; only `.source` reports the exact bytes.)
             #[cfg(feature = "regex")]
-            if crate::regex::Regex::new(&pat, &flags).is_err() {
-                let m = self.new_str(&alloc::format!(
-                    "Invalid regular expression: /{pat}/{flags}"
-                ));
-                return Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))));
+            {
+                let pat_s = crate::wtf8::to_string_lossy(&pat);
+                if crate::regex::Regex::new(&pat_s, &flags).is_err() {
+                    let m = self.new_str(&alloc::format!(
+                        "Invalid regular expression: /{pat_s}/{flags}"
+                    ));
+                    return Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))));
+                }
             }
             let r = self.new_regexp_instance(&pat, &flags);
             // `RegExpAlloc`: link `[[Prototype]]` via

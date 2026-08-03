@@ -1,8 +1,5 @@
 # Test262 known-failures ledger (paths relative to vendor/test262/test/).
 # Regenerate with KATAAN_TEST262_BLESS=1. Target: empty (literal 100%).
-annexB/built-ins/RegExp/RegExp-leading-escape-BMP.js  # [sloppy] expected pass, Runtime Test262Error: Code unit: d800 Expected SameValue(«"\\�"», «"\\\ud800"») to be true
-annexB/built-ins/RegExp/RegExp-trailing-escape-BMP.js  # [sloppy] expected pass, Runtime Test262Error: Code unit: d800 Expected SameValue(«"a\\�"», «"a\\\ud800"») to be true
-built-ins/String/prototype/match/regexp-prototype-match-v-u-flag.js  # [sloppy] expected pass, Runtime Test262Error: Actual [�, �, a, �, �, b, �, �, c, �, �, ‍, �, �, ‍, �, �, ‍, �, �, d] and expected [�, �, a, �, �, b, �, �, c, �, �, ‍, �, �, ‍, �, �, ‍, �, �, d] should have the same contents. Dot without u or v flag
 built-ins/TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js  # [sloppy] expected pass, Runtime TypeError: Cannot modify an immutable ArrayBuffer (Testing with Float64Array and makeImmutableArrayBuffer.)
 intl402/Collator/prototype/compare/non-normative-sensitivity.js  # [sloppy] expected pass, Runtime Test262Error: Actual [Aa] and expected [Aa, Aã] should have the same contents. 
 intl402/Collator/prototype/resolvedOptions/resolved-collation-unicode-extensions-and-options.js  # [sloppy] expected pass, Runtime Test262Error: Resolved locale for locale=de-u-co-phonebk with collation=pinyin Expected SameValue(«"de"», «"de-u-co-phonebk"») to be true
@@ -15,14 +12,8 @@ intl402/Intl/supportedValuesOf/currencies-accepted-by-DisplayNames.js  # [sloppy
 intl402/NumberFormat/prototype/formatRange/en-US.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"$3.00–$5.00"», «"$3 – $5"») to be true
 intl402/NumberFormat/prototype/formatRange/pt-PT.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"€ 3,00–€ 5,00"», «"3 - 5 €"») to be true
 intl402/NumberFormat/prototype/formatRangeToParts/en-US.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«3», «5») to be true
-intl402/Segmenter/prototype/segment/containing/breakable-input.js  # [sloppy] expected pass, Runtime Test262Error: granularity: undefined input: �� containing(0) input Expected SameValue(«"\udc00\ud800"», «"��"») to be true
-intl402/Segmenter/prototype/segment/containing/unbreakable-input.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"\ud800"», «"�"») to be true
 intl402/Temporal/PlainMonthDay/prototype/toLocaleString/dateStyle.js  # [sloppy] expected pass, Runtime Test262Error: dateStyle: long writes month of Ramadan out in full
 intl402/Temporal/PlainYearMonth/prototype/toLocaleString/dateStyle.js  # [sloppy] expected pass, Runtime Test262Error: dateStyle: long writes month of Ramadan out in full
-language/literals/regexp/S7.8.5_A1.1_T2.js  # [sloppy] expected pass, Runtime Test262Error: Code unit: d800 Expected SameValue(«"�"», «"\ud800"») to be true
-language/literals/regexp/S7.8.5_A1.4_T2.js  # [sloppy] expected pass, Runtime Test262Error: Code unit: d800 Expected SameValue(«"\\�"», «"\\\ud800"») to be true
-language/literals/regexp/S7.8.5_A2.1_T2.js  # [sloppy] expected pass, Runtime Test262Error: Code unit: d800 Expected SameValue(«"nnnn�"», «"nnnn\ud800"») to be true
-language/literals/regexp/S7.8.5_A2.4_T2.js  # [sloppy] expected pass, Runtime Test262Error: Code unit: d800 Expected SameValue(«"a\\�"», «"a\\\ud800"») to be true
 language/module-code/ambiguous-export-bindings/namespace-unambiguous-if-import-source-and-export.js  # expected pass, Parse SyntaxError: SyntaxError: expected `from`, found Identifier (at 142..145)
 language/module-code/source-phase-import/import-source.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: ./import-source-binding-name_FIXTURE.js: Promise should be rejected)
 language/module-code/source-phase-import/reexport-source-binding-named-import.js  # expected pass, Parse SyntaxError: SyntaxError: expected `from`, found Identifier (at 142..143)
