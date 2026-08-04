@@ -677,10 +677,42 @@ Re-measured 2026-08-05: `Map`/`Set` insert scales linearly to 200 000 (Map
 14/27/91 and 18/21/271). The residual is a **~4–9× constant factor**, which is
 interpreter dispatch and boxing — §5.1, not a scaling bug.
 
+**The string cluster (2026-08-05) — six more, all fixed.** A second sweep found
+that essentially every string operation was O(n) per call:
+
+| n=40 000, n calls | before | after | node |
+| --- | --- | --- | --- |
+| `s.length` | 3838 ms | 35 ms | ~0 |
+| `s.foo` (a *miss*) | 814 ms | 36 ms | ~0 |
+| `charCodeAt(i)` | 5534 ms | 46 ms | ~0 |
+| `charCodeAt` on a `+=`-built string | 59044 ms | 49 ms | 1 ms |
+| `slice(i, i+1)` | 3739 ms | 39 ms | 1 ms |
+| `indexOf(x, i)` | 2006 ms | 31 ms | 1 ms |
+
+The causes, in rough order of blast radius: `Realm::string_object_len`
+materialized *and* rescanned the string, and is consulted on every property
+access (String exotic objects own `length` and their indices); `utf16_len` was
+recomputed per call rather than memoized on the rope; UTF-8's variable width
+made every indexed read O(i); a `Concat` was re-walked per read; and `concat`
+and template literals copied into a flat buffer instead of rope-joining.
+
+Two general tools came out of it. `Rope::is_ascii` — `byte_len == utf16_len`,
+exact and O(1) once both are memoized — turns unit indices into byte indices
+for the common case. And `Realm::flatten_string` is the **flatten in place**
+this section asked for, done at the *cell* level: one flat copy replaces the
+tree, so it does not repeat the reverted per-node cache's O(n²) memory (peak
+RSS 2.3 MB on the append-and-read-at-every-stage pattern that took 1.5 GB).
+
 What remains here:
 
 - **Residual `push` superlinearity** (~×3.7 after the snapshot fix) and the rest
   of the per-dispatch work in `call_method`.
+- **Not yet swept**: `obj delete`, `arr.join`, `Array.from(str)` and
+  `JSON.stringify` all show ratios of 8–11 per ×4 in the scaling probe where
+  linear is 4. The absolute times are small (tens of ms), so some of that is
+  measurement noise, but they have not been diagnosed.
+- **Inherently quadratic, not bugs**: `arr.unshift` and `arr.indexOf` in a loop
+  are O(n) per operation by construction (node's `indexOf` ratio is 17.8 too).
 - **Rope reads.** `charCodeAt` on a `+=`-built string re-walks and re-copies the
   whole tree per call. **A plain memo on the `Concat` node is the wrong fix and
   was tried and reverted:** it makes repeated indexing ~7× faster but costs
