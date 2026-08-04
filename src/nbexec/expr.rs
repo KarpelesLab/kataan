@@ -3107,26 +3107,22 @@ impl<'a> Interp<'a> {
         // `Concat` tree (no contiguous leaf) falls back to the owned
         // `string_bytes`; a non-string receiver makes both return `None`, so the
         // fast numeric-index path is skipped without any allocation.
-        if let Ok(i) = name.parse::<usize>() {
-            if let Some(leaf) = self.realm.string_leaf_bytes(handle) {
-                if let Some(u) = crate::wtf8::utf16_index(leaf, i) {
-                    return Ok(self.new_str_bytes(crate::wtf8::from_utf16(&[u])));
-                }
-                // Out of range: a String *wrapper* object can still carry an
-                // ordinary own property at that index (`Object.defineProperty(new
-                // String("s"), "4", …)`) — String-exotic `[[GetOwnProperty]]` falls
-                // back to OrdinaryGetOwnProperty. Only shortcut to `undefined` when
-                // there is no such own property (the common primitive-string case).
-                if !self.realm.has_own(handle, name) {
-                    return Ok(NanBox::undefined());
-                }
-            } else if let Some(bytes) = self.realm.string_bytes(handle) {
-                if let Some(u) = crate::wtf8::utf16_index(&bytes, i) {
-                    return Ok(self.new_str_bytes(crate::wtf8::from_utf16(&[u])));
-                }
-                if !self.realm.has_own(handle, name) {
-                    return Ok(NanBox::undefined());
-                }
+        if let Ok(i) = name.parse::<usize>()
+            && self.realm.is_string_handle(handle)
+        {
+            // Collapse a `Concat` once so repeated `s[i]` on a `+=`-built string
+            // stops re-walking the tree per read.
+            self.realm.flatten_string(handle);
+            if let Some(u) = self.realm.string_unit_at(handle, i) {
+                return Ok(self.new_str_bytes(crate::wtf8::from_utf16(&[u])));
+            }
+            // Out of range: a String *wrapper* object can still carry an
+            // ordinary own property at that index (`Object.defineProperty(new
+            // String("s"), "4", …)`) — String-exotic `[[GetOwnProperty]]` falls
+            // back to OrdinaryGetOwnProperty. Only shortcut to `undefined` when
+            // there is no such own property (the common primitive-string case).
+            if !self.realm.has_own(handle, name) {
+                return Ok(NanBox::undefined());
             }
         }
         // A canonical numeric string key on an array (`arr["0"]`) reads the

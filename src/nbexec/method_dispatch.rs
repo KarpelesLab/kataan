@@ -2155,6 +2155,11 @@ impl<'a> Interp<'a> {
         // --- string methods ---
         // (Skipped when a generic `Array.prototype.<m>` is being applied to a
         // String primitive/wrapper, which must run the array-like path instead.)
+        if !force_array_like {
+            // Collapse a `Concat` to a leaf once, so this and every later string
+            // method reads it without walking and copying the tree.
+            self.realm.flatten_string(handle);
+        }
         if let Some(rope) = self.realm.string_rope(handle).filter(|_| !force_array_like) {
             // Borrow the bytes rather than copying them. `string_bytes` used to
             // materialize the whole string here on *every* string-method call, so
@@ -2168,6 +2173,17 @@ impl<'a> Interp<'a> {
                 None => {
                     materialized = rope.materialize_bytes();
                     &materialized
+                }
+            };
+            // An all-ASCII string indexes in O(1) (unit index == byte index);
+            // otherwise UTF-8's variable width forces a scan from the start, which
+            // is what made `for (i…) s.charCodeAt(i)` quadratic.
+            let ascii = rope.is_ascii();
+            let unit_at = |i: usize| -> Option<u16> {
+                if ascii {
+                    bytes.get(i).map(|b| u16::from(*b))
+                } else {
+                    crate::wtf8::utf16_index(bytes, i)
                 }
             };
             // The lossless WTF-8 bytes — used by the UTF-16-unit-correct ops
@@ -2228,7 +2244,7 @@ impl<'a> Interp<'a> {
                     // index is out of range (`NaN`/no-arg → 0).
                     let idx = self.coerce_to_integer_or_infinity(arg(0))?;
                     let out = match str_char_index(idx) {
-                        Some(i) => crate::wtf8::utf16_index(bytes, i)
+                        Some(i) => unit_at(i)
                             .map(|u| crate::wtf8::from_utf16(&[u]))
                             .unwrap_or_default(),
                         None => Vec::new(),
@@ -2520,12 +2536,10 @@ impl<'a> Interp<'a> {
                     // UTF-16-indexed with negative-from-end support.
                     let units = crate::wtf8::utf16_len(bytes);
                     let idx = if i < 0.0 { units as f64 + i } else { i };
-                    Some(
-                        match as_index(idx).and_then(|u| crate::wtf8::utf16_index(bytes, u)) {
-                            Some(u) => self.new_str_bytes(crate::wtf8::from_utf16(&[u])),
-                            None => NanBox::undefined(),
-                        },
-                    )
+                    Some(match as_index(idx).and_then(&unit_at) {
+                        Some(u) => self.new_str_bytes(crate::wtf8::from_utf16(&[u])),
+                        None => NanBox::undefined(),
+                    })
                 }
                 "substring" => {
                     let len = crate::wtf8::utf16_len(bytes);
@@ -2631,7 +2645,7 @@ impl<'a> Interp<'a> {
                 "charCodeAt" => {
                     // A negative or out-of-range index is `NaN` (`NaN`/no-arg → 0).
                     let idx = self.coerce_to_integer_or_infinity(arg(0))?;
-                    let unit = str_char_index(idx).and_then(|i| crate::wtf8::utf16_index(bytes, i));
+                    let unit = str_char_index(idx).and_then(&unit_at);
                     Some(unit.map_or(NanBox::number(f64::NAN), |u| NanBox::number(f64::from(u))))
                 }
                 // `codePointAt(i)` combines a surrogate pair at UTF-16 index `i`.
@@ -2640,18 +2654,16 @@ impl<'a> Interp<'a> {
                     let Some(i) = str_char_index(idx) else {
                         return Ok(Some(NanBox::undefined()));
                     };
-                    Some(match crate::wtf8::utf16_index(bytes, i) {
-                        Some(u) if (0xD800..0xDC00).contains(&u) => {
-                            match crate::wtf8::utf16_index(bytes, i + 1) {
-                                Some(low) if (0xDC00..0xE000).contains(&low) => {
-                                    let cp = 0x1_0000
-                                        + ((u32::from(u) - 0xD800) << 10)
-                                        + (u32::from(low) - 0xDC00);
-                                    NanBox::number(f64::from(cp))
-                                }
-                                _ => NanBox::number(f64::from(u)),
+                    Some(match unit_at(i) {
+                        Some(u) if (0xD800..0xDC00).contains(&u) => match unit_at(i + 1) {
+                            Some(low) if (0xDC00..0xE000).contains(&low) => {
+                                let cp = 0x1_0000
+                                    + ((u32::from(u) - 0xD800) << 10)
+                                    + (u32::from(low) - 0xDC00);
+                                NanBox::number(f64::from(cp))
                             }
-                        }
+                            _ => NanBox::number(f64::from(u)),
+                        },
                         Some(u) => NanBox::number(f64::from(u)),
                         None => NanBox::undefined(),
                     })

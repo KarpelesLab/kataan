@@ -864,6 +864,50 @@ impl Realm {
         Some(self.heap.get(handle)?.as_str()?.utf16_len())
     }
 
+    /// Flattens a `Concat` rope at `handle` into a single leaf, in place.
+    ///
+    /// A rope makes concatenation O(1) but every *read* of a `Concat` has to
+    /// walk and copy the tree, so repeated indexed reads of a `+=`-built string
+    /// are quadratic. Collapsing the cell to a leaf on first read makes every
+    /// later read O(1) and releases the interior nodes.
+    ///
+    /// Unobservable: a string value is immutable, and this replaces its
+    /// representation with one holding identical bytes. Note this is a
+    /// *cell-level* flatten — storing one flat copy — deliberately not a cache
+    /// on each rope node, which costs O(n²) memory because every growth stage
+    /// retains a full copy (tried and reverted; see ROADMAP §5.0).
+    pub fn flatten_string(&mut self, handle: Handle) {
+        let Some(rope) = self.heap.get(handle).and_then(Cell::as_str) else {
+            return;
+        };
+        if rope.as_leaf_bytes().is_some() {
+            return;
+        }
+        let flat = Rope::from_wtf8(rope.materialize_bytes());
+        if let Some(Cell::Str(slot)) = self.heap.get_mut(handle) {
+            *slot = flat;
+        }
+    }
+
+    /// The UTF-16 code unit at index `i` of the string at `handle`, or `None` if
+    /// the cell is not a string or `i` is past the end.
+    ///
+    /// Takes an O(1) path for the overwhelmingly common case — an all-ASCII flat
+    /// leaf, where the unit index *is* the byte index. Otherwise the units have
+    /// to be walked, since UTF-8 is variable width; that is what made
+    /// `for (i…) c = s[i]` quadratic even after the per-call copy was removed.
+    #[must_use]
+    pub fn string_unit_at(&self, handle: Handle, i: usize) -> Option<u16> {
+        let rope = self.heap.get(handle)?.as_str()?;
+        if let Some(leaf) = rope.as_leaf_bytes() {
+            if rope.is_ascii() {
+                return leaf.get(i).map(|b| u16::from(*b));
+            }
+            return crate::wtf8::utf16_index(leaf, i);
+        }
+        crate::wtf8::utf16_index(&rope.materialize_bytes(), i)
+    }
+
     /// The string at `handle` widened to UTF-16 code units — the subject form the
     /// regex matcher consumes — reusing the previous result when it is the same
     /// string. See [`regex_subject_units`](Realm::regex_subject_units) (the field)

@@ -163,6 +163,19 @@ impl Rope {
         total
     }
 
+    /// Whether every code point is ASCII — in which case byte index, code-point
+    /// index and UTF-16 unit index all coincide, so an indexed read is O(1)
+    /// instead of a scan from the start of the string.
+    ///
+    /// The test is exact and costs nothing after the first call: a UTF-8 byte
+    /// length equals the UTF-16 unit length precisely when every character
+    /// encodes as one byte (2- and 3-byte forms are 1 unit, the 4-byte form is
+    /// 2), and both lengths are memoized.
+    #[must_use]
+    pub fn is_ascii(&self) -> bool {
+        self.len() == self.utf16_len()
+    }
+
     /// The node's UTF-16 length cache slot (see [`Rope::utf16_len`]).
     fn u16_len_cell(&self) -> &core::cell::Cell<usize> {
         match &*self.0 {
