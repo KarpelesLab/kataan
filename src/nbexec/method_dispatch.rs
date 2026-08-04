@@ -2155,6 +2155,33 @@ impl<'a> Interp<'a> {
         // --- string methods ---
         // (Skipped when a generic `Array.prototype.<m>` is being applied to a
         // String primitive/wrapper, which must run the array-like path instead.)
+        // `concat` is handled *before* the block below, which borrows the
+        // receiver's contiguous bytes: going through those bytes would copy the
+        // whole receiver per call (O(n) each, quadratic in a loop), where the
+        // rope concatenation `+` uses is O(1). Only a String primitive takes
+        // this path; a wrapper falls through to the generic one.
+        if method == "concat" && !force_array_like && self.realm.is_string_handle(handle) {
+            let mut acc = NanBox::handle(handle.to_raw());
+            for a in args {
+                let p = self.coerce_object(*a, "string")?;
+                // Already a string: concatenate the value itself rather than
+                // materializing its bytes (O(1) rope join vs an O(n) copy).
+                let piece_v = if self.realm.is_string(p) {
+                    p
+                } else {
+                    let piece = self.arg_string_bytes(p);
+                    self.new_str_bytes(piece)
+                };
+                match self.realm.add_checked(acc, piece_v) {
+                    Some(v) => acc = v,
+                    None => {
+                        let m = self.new_str("Invalid string length");
+                        return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                    }
+                }
+            }
+            return Ok(Some(acc));
+        }
         if !force_array_like {
             // Collapse a `Concat` to a leaf once, so this and every later string
             // method reads it without walking and copying the tree.

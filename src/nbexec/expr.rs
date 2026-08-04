@@ -390,10 +390,19 @@ impl<'a> Interp<'a> {
             // Built as WTF-8 bytes so a surrogate-bearing quasi (`` `\uD800` ``)
             // round-trips.
             Expr::Template(t) => {
-                let mut out: Vec<u8> = Vec::new();
+                // Joined with the same O(1) rope concatenation `+` uses, rather
+                // than copied into one flat buffer: accumulating a template
+                // (`s = `${s}x`` in a loop) copied the whole substitution every
+                // iteration, which is quadratic. Empty quasis — the common
+                // `${a}${b}` shape — are skipped so this costs no extra cells.
+                let mut acc = self.new_str_bytes(Vec::new());
                 for (i, quasi) in t.quasis.iter().enumerate() {
                     match &quasi.cooked {
-                        Some(cooked) => out.extend_from_slice(cooked),
+                        Some(cooked) if cooked.is_empty() => {}
+                        Some(cooked) => {
+                            let part = self.new_str_bytes(cooked.to_vec());
+                            acc = self.concat_or_throw(acc, part)?;
+                        }
                         // An invalid escape is allowed only in a *tagged* template; in a
                         // plain template literal it is a SyntaxError.
                         None => {
@@ -403,10 +412,25 @@ impl<'a> Interp<'a> {
                     }
                     if let Some(e) = t.expressions.get(i) {
                         let v = self.eval(e)?;
-                        out.extend_from_slice(&self.coerce_to_string_bytes(v)?);
+                        // A value that is *already* a string is concatenated as-is.
+                        // Going through `coerce_to_string_bytes` would materialize
+                        // its rope — O(n) per substitution, which is what kept the
+                        // accumulating form quadratic even after the join became
+                        // O(1). ToString is the identity here, so nothing is
+                        // skipped.
+                        let part = if self.realm.is_string(v) {
+                            v
+                        } else {
+                            let bytes = self.coerce_to_string_bytes(v)?;
+                            if bytes.is_empty() {
+                                continue;
+                            }
+                            self.new_str_bytes(bytes)
+                        };
+                        acc = self.concat_or_throw(acc, part)?;
                     }
                 }
-                Ok(self.new_str_bytes(out))
+                Ok(acc)
             }
             // The comma operator: evaluate all, yield the last.
             Expr::Sequence { expressions, .. } => {
@@ -3047,6 +3071,19 @@ impl<'a> Interp<'a> {
         } else {
             caller
         })
+    }
+
+    /// `a + b` for two string values, throwing the spec `RangeError` when the
+    /// result would exceed the maximum string length. Shares the O(1) rope
+    /// concatenation `+` uses.
+    fn concat_or_throw(&mut self, a: NanBox, b: NanBox) -> Result<NanBox, ExecError> {
+        match self.realm.add_checked(a, b) {
+            Some(v) => Ok(v),
+            None => {
+                let m = self.new_str("Invalid string length");
+                Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))))
+            }
+        }
     }
 
     pub(crate) fn read_member(

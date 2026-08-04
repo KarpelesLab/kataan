@@ -4840,7 +4840,7 @@ impl Realm {
 
     /// Whether `v` is a heap string.
     #[must_use]
-    fn is_string(&self, v: NanBox) -> bool {
+    pub(crate) fn is_string(&self, v: NanBox) -> bool {
         v.as_handle()
             .and_then(|raw| self.heap.get(Handle::from_raw(raw)))
             .is_some_and(|c| c.as_str().is_some())
