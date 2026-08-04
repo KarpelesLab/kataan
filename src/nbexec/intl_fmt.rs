@@ -1236,6 +1236,60 @@ pub(crate) fn is_supported_collation(base: &str, co: &str) -> bool {
     langs.iter().any(|l| lang.eq_ignore_ascii_case(l))
 }
 
+/// `PartitionRelativeTimePattern` without CLDR: the English "in N units" /
+/// "N units ago" shape, with the integer part grouped in threes.
+///
+/// Only reachable in a build without the `intl` feature, which has no locale
+/// data at all — the CLDR path ([`Interp::rel_time_parts_cldr`]) is the real
+/// implementation. This exists because the non-`intl` build otherwise does not
+/// compile: the previous fallback called `crate::nbexec::rel_time_parts`, which
+/// was deleted along with three English tables when relative time moved to CLDR
+/// (737cb2fc), leaving a dangling call no CI job builds.
+///
+/// The sign *bit* picks the pattern, so `-0` formats as past ("0 units ago")
+/// while `+0` is future, matching the spec's `PartitionRelativeTimePattern`.
+#[cfg(not(feature = "intl"))]
+fn rel_time_parts_en(value: f64, unit: &str) -> Vec<(&'static str, String, bool)> {
+    let n = value.abs();
+    let s = alloc::format!("{n}");
+    let (int_str, frac_str) = s.split_once('.').unwrap_or((s.as_str(), ""));
+    let mut parts: Vec<(&'static str, String, bool)> = Vec::new();
+    if !value.is_sign_negative() {
+        parts.push(("literal", String::from("in "), false));
+    }
+    // Group the integer digits in threes from the right.
+    let digits: Vec<char> = int_str.chars().collect();
+    let head = match digits.len() % 3 {
+        0 => 3.min(digits.len()),
+        r => r,
+    };
+    for (i, chunk) in core::iter::once(&digits[..head])
+        .chain(digits[head..].chunks(3))
+        .enumerate()
+    {
+        if i > 0 {
+            parts.push(("group", String::from(","), true));
+        }
+        parts.push(("integer", chunk.iter().collect(), true));
+    }
+    if !frac_str.is_empty() {
+        parts.push(("decimal", String::from("."), true));
+        parts.push(("fraction", String::from(frac_str), true));
+    }
+    // `1 day`, but `0 days` / `2 days` — English pluralizes everything but one.
+    let plural = if n == 1.0 { "" } else { "s" };
+    parts.push((
+        "literal",
+        if value.is_sign_negative() {
+            alloc::format!(" {unit}{plural} ago")
+        } else {
+            alloc::format!(" {unit}{plural}")
+        },
+        true,
+    ));
+    parts
+}
+
 /// Zero-pads the minute/second fields of crate-produced `DateTimePart`s to two
 /// digits when combined with another time field, and maps each to its ECMA-402
 /// `(type, value)` part. CLDR/ICU has no single-digit `m`/`s` time format:
@@ -5216,7 +5270,7 @@ impl<'a> Interp<'a> {
     }
 
     /// `PartitionRelativeTimePattern` for a formatter instance: CLDR-backed when
-    /// the `intl` feature is on, else the English fallback.
+    /// the `intl` feature is on, else [`rel_time_parts_en`].
     pub(crate) fn rel_time_partition(
         &mut self,
         fmt: Option<Handle>,
@@ -5235,8 +5289,8 @@ impl<'a> Interp<'a> {
         }
         #[cfg(not(feature = "intl"))]
         {
-            let _ = fmt;
-            crate::nbexec::rel_time_parts(value, unit, numeric, style, ",", ".")
+            let _ = (fmt, numeric, style);
+            rel_time_parts_en(value, unit)
         }
     }
 
@@ -5361,6 +5415,9 @@ impl<'a> Interp<'a> {
         style: &str,
         locale: &str,
     ) -> Vec<(&'static str, String)> {
+        // Signature kept parallel to the `intl` variant; this fallback has no
+        // locale data, so everything below is English.
+        let _ = locale;
         let n = items.len();
         let mut parts: Vec<(&'static str, String)> = Vec::new();
         if n == 0 {

@@ -179,9 +179,11 @@
             </li>
           </ul>
           <p class="remaining__note">
-            Nearly all of what remains is CLDR locale data the underlying
-            Unicode crate does not carry yet, and each gap is filed upstream.
-            The language itself is done.
+            What is left is locale collation and number data in the underlying
+            Unicode crate — a missing German search collation, and region
+            subtags being dropped when picking number symbols — plus one test
+            whose own harness contradicts it. Each is filed upstream. The
+            language itself is done.
           </p>
         </div>
       </section>

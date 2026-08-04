@@ -2,9 +2,4 @@
 # Regenerate with KATAAN_TEST262_BLESS=1. Target: empty (literal 100%).
 built-ins/TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js  # [sloppy] expected pass, Runtime TypeError: Cannot modify an immutable ArrayBuffer (Testing with Float64Array and makeImmutableArrayBuffer.)
 intl402/Collator/usage-de.js  # [sloppy] expected pass, Runtime Test262Error: Actual [Ä, AE] and expected [AE, Ä] should have the same contents. search
-intl402/DateTimeFormat/prototype/format/numbering-system.js  # [sloppy] expected pass, Runtime Test262Error: en-US: display one numeric-styled unit Expected SameValue(«false», «true») to be true
-intl402/DateTimeFormat/prototype/formatToParts/compare-to-temporal-lunisolar.js  # [sloppy] expected pass, Runtime Test262Error: date = 2047-07-22[u-ca=chinese], monthCode Expected SameValue(«"M05"», «"M05L"») to be true
-intl402/DateTimeFormat/prototype/formatToParts/era.js  # [sloppy] expected pass, Runtime Test262Error: islamic-civil eras (Anno Domini,Anno Domini) should be unique Expected SameValue(«1», «2») to be true
 intl402/NumberFormat/prototype/formatRange/pt-PT.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«"€ 3–5"», «"3 - 5 €"») to be true
-intl402/Temporal/PlainMonthDay/prototype/toLocaleString/dateStyle.js  # [sloppy] expected pass, Runtime Test262Error: dateStyle: long writes month of Ramadan out in full
-intl402/Temporal/PlainYearMonth/prototype/toLocaleString/dateStyle.js  # [sloppy] expected pass, Runtime Test262Error: dateStyle: long writes month of Ramadan out in full
