@@ -666,18 +666,19 @@ piece.
 ### 5.0 Algorithmic complexity of the core data structures
 
 Scaling probes (time a construct at *n*, *2n*, *4n*; a ~×4-per-doubling ratio is
-quadratic) found several O(n²) paths in constructs that must be linear. Four are
-fixed — per-iteration `let` environments, the string `+=` type test, the global
-regex match/replace/split path, and `Array.prototype.push`/`pop`. What remains:
+quadratic) found several O(n²) paths in constructs that must be linear. **All
+five are now fixed** — per-iteration `let` environments, the string `+=` type
+test, the global regex match/replace/split path, `Array.prototype.push`/`pop`,
+and `Map`/`Set` insert (a lazily-built index from a `SameValueZero`-compatible
+key hash to candidate entry indices, dropped on `Relocate`/`delete`/`clear`).
 
-- **`Map`/`Set` are O(n) per operation.** `Cell::Collection` is a plain
-  `Vec<(NanBox, NanBox)>`; `collection_set`/`get`/`has`/`delete` all linear-scan
-  it with `same_value_zero`, so building a map is quadratic (40 000 inserts ≈
-  1.1 s) and every lookup is proportional to size. Needs a hash index whose hash
-  agrees with `SameValueZero` (numbers: `-0` ≡ `+0`, `NaN` ≡ `NaN`; strings and
-  BigInts by value; objects/symbols by handle identity), sited so it does not
-  disturb `Cell`'s `Trace`/`Relocate`/snapshot impls, and kept correct across the
-  live-iteration key cursor.
+Re-measured 2026-08-05: `Map`/`Set` insert scales linearly to 200 000 (Map
+50k/100k/200k = 129/164/368 ms, `Set` of strings 131/222/404 ms, against node
+14/27/91 and 18/21/271). The residual is a **~4–9× constant factor**, which is
+interpreter dispatch and boxing — §5.1, not a scaling bug.
+
+What remains here:
+
 - **Residual `push` superlinearity** (~×3.7 after the snapshot fix) and the rest
   of the per-dispatch work in `call_method`.
 - **Rope reads.** `charCodeAt` on a `+=`-built string re-walks and re-copies the
@@ -724,12 +725,22 @@ of work (600 KB: split 7 ms vs 565 ms, replace 16 ms vs 201 ms, exec loop 5 ms v
 185 ms). That is match-object construction, string allocation and interpreter
 dispatch, so it belongs to §5.1 and the JIT rather than here.
 
-Two contained pieces of headroom are still specific to the matcher:
+**The start filter now covers classes** (`StartSet`, a 256-bit Latin-1 map
+unioned over the first-consuming instruction on every path, with membership
+taken from the matcher's own `single_consume_matches` so the two cannot
+disagree). On a 1 MB subject with no match, 200 scans: `/[0-9]+/` 2393 ms → 74
+ms, `/\s+/` 2455 ms → 73 ms, `/[xyz]q/` 2475 ms → 72 ms, against node's 78/70/36
+— parity on the first two.
 
-- **Extend the start filter to classes.** `program_first_unit` only fires on a
-  single required literal, so `/\s+/` — the `split` case above — filters nothing.
-  A first-unit *set* (a 256-bit map for Latin-1, plus a fallback predicate) would
-  cover classes and character-class-led alternations.
+It is worth being precise about what that did *not* fix, because the obvious
+benchmark misleads: `"word ".repeat(120_000).split(/\s+/)` is unchanged at ~2.3 s
+against node's 27 ms. There a match starts every fifth offset, so the filter can
+only skip 4 in 5, and the cost is ~19 µs *per match* — match-object
+construction, capture allocation and interpreter dispatch. The start filter
+helps sparse matches; dense-match throughput is §5.1.
+
+One contained piece of matcher headroom is left:
+
 - **Widen the filter to a literal prefix.** Matching `abc` at an offset whose
   next two units cannot continue it still starts the matcher; a short memcmp
   first would cut that.
