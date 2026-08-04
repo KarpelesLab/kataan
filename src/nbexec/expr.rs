@@ -3733,14 +3733,10 @@ impl<'a> Interp<'a> {
         // owned bytes only for a `Concat` rope.
         if let Some(prim) = self.realm.get_property(handle, PRIM_WRAP)
             && let Some(ph) = prim.as_handle().map(Handle::from_raw)
-            && self.realm.string_bytes(ph).is_some()
+            && self.realm.is_string_handle(ph)
         {
             if name == "length" {
-                let len = if let Some(leaf) = self.realm.string_leaf_bytes(ph) {
-                    crate::wtf8::utf16_len(leaf)
-                } else {
-                    crate::wtf8::utf16_len(&self.realm.string_bytes(ph).unwrap_or_default())
-                };
+                let len = self.realm.string_utf16_len(ph).unwrap_or(0);
                 return Ok(NanBox::number(len as f64));
             }
             if let Ok(i) = name.parse::<usize>() {
@@ -5046,7 +5042,7 @@ impl<'a> Interp<'a> {
         if matches!(op, BinaryOp::Add) {
             let is_str = |this: &Self, v: NanBox| {
                 v.as_handle()
-                    .is_some_and(|raw| this.realm.string_value(Handle::from_raw(raw)).is_some())
+                    .is_some_and(|raw| this.realm.is_string_handle(Handle::from_raw(raw)))
             };
             if is_str(self, a) || is_str(self, b) {
                 return Ok(None);

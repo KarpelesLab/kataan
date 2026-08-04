@@ -206,7 +206,7 @@ impl<'a> Interp<'a> {
         {
             return Ok(match prim.unpack() {
                 Unpacked::Number(_) => self.coerce_to_number(v)?,
-                Unpacked::Handle(r) if self.realm.string_value(Handle::from_raw(r)).is_some() => {
+                Unpacked::Handle(r) if self.realm.is_string_handle(Handle::from_raw(r)) => {
                     let s = self.coerce_to_string(v)?;
                     self.new_str(&s)
                 }
@@ -278,9 +278,7 @@ impl<'a> Interp<'a> {
                 // boxed primitive directly.
                 match prim.unpack() {
                     Unpacked::Number(_) => self.coerce_to_number(value)?,
-                    Unpacked::Handle(r)
-                        if self.realm.string_value(Handle::from_raw(r)).is_some() =>
-                    {
+                    Unpacked::Handle(r) if self.realm.is_string_handle(Handle::from_raw(r)) => {
                         let s = self.coerce_to_string(value)?;
                         self.new_str(&s)
                     }

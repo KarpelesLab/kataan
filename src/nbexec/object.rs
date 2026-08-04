@@ -2808,11 +2808,8 @@ impl<'a> Interp<'a> {
             // `String.length` counts UTF-16 code units (astral chars = 2, a lone
             // surrogate = 1). P3: borrow the leaf when possible so `.length` in a
             // loop does not flatten the rope into an owned `Vec` on every read.
-            if let Some(leaf) = self.realm.string_leaf_bytes(handle) {
-                return NanBox::number(crate::wtf8::utf16_len(leaf) as f64);
-            }
-            if let Some(bytes) = self.realm.string_bytes(handle) {
-                return NanBox::number(crate::wtf8::utf16_len(&bytes) as f64);
+            if let Some(units) = self.realm.string_utf16_len(handle) {
+                return NanBox::number(units as f64);
             }
         }
         // `Map`/`Set` expose `size`.
@@ -2844,8 +2841,7 @@ impl<'a> Interp<'a> {
         } else {
             h
         };
-        let bytes = self.realm.string_bytes(sh)?;
-        Some(crate::wtf8::utf16_len(&bytes))
+        self.realm.string_utf16_len(sh)
     }
 
     /// `Set(O, key, value, true)` — a [[Set]] whose `Throw` is true regardless of

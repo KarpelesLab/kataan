@@ -2155,11 +2155,21 @@ impl<'a> Interp<'a> {
         // --- string methods ---
         // (Skipped when a generic `Array.prototype.<m>` is being applied to a
         // String primitive/wrapper, which must run the array-like path instead.)
-        if let Some(bytes) = self
-            .realm
-            .string_bytes(handle)
-            .filter(|_| !force_array_like)
-        {
+        if let Some(rope) = self.realm.string_rope(handle).filter(|_| !force_array_like) {
+            // Borrow the bytes rather than copying them. `string_bytes` used to
+            // materialize the whole string here on *every* string-method call, so
+            // `s.charCodeAt(0)` was O(n) and a loop over a string was O(n²)
+            // (80 000 chars: 3.5 s for a constant-index read). `rope` is an `Rc`
+            // clone, so this borrow is independent of the `&mut self` uses below.
+            // Only a `Concat` still pays to materialize — ROADMAP §5.0.
+            let materialized;
+            let bytes: &[u8] = match rope.as_leaf_bytes() {
+                Some(b) => b,
+                None => {
+                    materialized = rope.materialize_bytes();
+                    &materialized
+                }
+            };
             // The lossless WTF-8 bytes — used by the UTF-16-unit-correct ops
             // (length/index/slice/search/pad/for-of) and the surrogate-aware
             // case/normalize ops. Most methods read only `bytes`; the few that take
@@ -2174,8 +2184,8 @@ impl<'a> Interp<'a> {
                 // surrogate-bearing string maps case over the code-point view,
                 // passing lone surrogates through unchanged (a surrogate has no
                 // case) so they survive the round-trip.
-                "toUpperCase" => Some(self.new_str_bytes(case_map_wtf8(&bytes, true))),
-                "toLowerCase" => Some(self.new_str_bytes(case_map_wtf8(&bytes, false))),
+                "toUpperCase" => Some(self.new_str_bytes(case_map_wtf8(bytes, true))),
+                "toLowerCase" => Some(self.new_str_bytes(case_map_wtf8(bytes, false))),
                 "toLocaleUpperCase" | "toLocaleLowerCase" => {
                     // The `locales` argument is `CanonicalizeLocaleList`-validated
                     // (a malformed tag is a RangeError).
@@ -2191,7 +2201,7 @@ impl<'a> Interp<'a> {
                         let lang = locales.first().map(String::as_str).unwrap_or("");
                         let primary = lang.split('-').next().unwrap_or("");
                         let special = matches!(primary, "tr" | "az" | "lt");
-                        if special && let Ok(s) = core::str::from_utf8(&bytes) {
+                        if special && let Ok(s) = core::str::from_utf8(bytes) {
                             let out = if upper {
                                 intl::unicode::uppercase_str_lang(s, lang)
                             } else {
@@ -2199,7 +2209,7 @@ impl<'a> Interp<'a> {
                             };
                             Some(self.new_str(&out))
                         } else {
-                            Some(self.new_str_bytes(case_map_wtf8(&bytes, upper)))
+                            Some(self.new_str_bytes(case_map_wtf8(bytes, upper)))
                         }
                     }
                     #[cfg(not(feature = "intl"))]
@@ -2209,7 +2219,7 @@ impl<'a> Interp<'a> {
                     }
                 }
                 "trim" => {
-                    let s = crate::wtf8::to_string_lossy(&bytes);
+                    let s = crate::wtf8::to_string_lossy(bytes);
                     Some(self.new_str(s.trim_matches(is_js_whitespace)))
                 }
                 "charAt" => {
@@ -2218,7 +2228,7 @@ impl<'a> Interp<'a> {
                     // index is out of range (`NaN`/no-arg → 0).
                     let idx = self.coerce_to_integer_or_infinity(arg(0))?;
                     let out = match str_char_index(idx) {
-                        Some(i) => crate::wtf8::utf16_index(&bytes, i)
+                        Some(i) => crate::wtf8::utf16_index(bytes, i)
                             .map(|u| crate::wtf8::from_utf16(&[u]))
                             .unwrap_or_default(),
                         None => Vec::new(),
@@ -2234,24 +2244,24 @@ impl<'a> Interp<'a> {
                         ));
                     }
                     let needle = self.arg_string_bytes_fallible(arg(0))?;
-                    let units = crate::wtf8::utf16_len(&bytes);
+                    let units = crate::wtf8::utf16_len(bytes);
                     let pos = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         0
                     } else {
                         (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize).min(units)
                     };
-                    Some(NanBox::boolean(index_of_units(&bytes, &needle, pos) >= 0.0))
+                    Some(NanBox::boolean(index_of_units(bytes, &needle, pos) >= 0.0))
                 }
                 "indexOf" => {
                     let needle = self.arg_string_bytes_fallible(arg(0))?;
                     // An optional `fromIndex` (UTF-16 unit offset) starts the search.
-                    let units = crate::wtf8::utf16_len(&bytes);
+                    let units = crate::wtf8::utf16_len(bytes);
                     let from = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         0
                     } else {
                         (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize).min(units)
                     };
-                    Some(NanBox::number(index_of_units(&bytes, &needle, from)))
+                    Some(NanBox::number(index_of_units(bytes, &needle, from)))
                 }
                 "repeat" => {
                     // ToIntegerOrInfinity(count) (a Symbol / abrupt valueOf throws).
@@ -2279,14 +2289,14 @@ impl<'a> Interp<'a> {
                         ));
                     }
                     let needle = self.arg_string_bytes_fallible(arg(0))?;
-                    let units = crate::wtf8::utf16_len(&bytes);
+                    let units = crate::wtf8::utf16_len(bytes);
                     let pos = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         0
                     } else {
                         (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize).min(units)
                     };
                     // A prefix match at exactly `pos` units.
-                    let start_byte = unit_to_byte(&bytes, pos);
+                    let start_byte = unit_to_byte(bytes, pos);
                     let matched = bytes.len() - start_byte >= needle.len()
                         && bytes[start_byte..start_byte + needle.len()] == needle[..];
                     Some(NanBox::boolean(matched))
@@ -2298,14 +2308,14 @@ impl<'a> Interp<'a> {
                         ));
                     }
                     let needle = self.arg_string_bytes_fallible(arg(0))?;
-                    let units = crate::wtf8::utf16_len(&bytes);
+                    let units = crate::wtf8::utf16_len(bytes);
                     // `endPosition` defaults to the full length.
                     let end = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         units
                     } else {
                         (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize).min(units)
                     };
-                    let end_byte = unit_to_byte(&bytes, end);
+                    let end_byte = unit_to_byte(bytes, end);
                     let matched = end_byte >= needle.len()
                         && bytes[end_byte - needle.len()..end_byte] == needle[..];
                     Some(NanBox::boolean(matched))
@@ -2313,7 +2323,7 @@ impl<'a> Interp<'a> {
                 "slice" => {
                     // UTF-16-unit range, surrogate-boundary correct. Both indices are
                     // ToIntegerOrInfinity (each runs `valueOf`, propagating throws).
-                    let units = crate::wtf8::utf16_len(&bytes);
+                    let units = crate::wtf8::utf16_len(bytes);
                     let start = self.coerce_to_integer_or_infinity(arg(0))?;
                     let end = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         units as f64
@@ -2330,7 +2340,7 @@ impl<'a> Interp<'a> {
                     let a = idx(start);
                     let b = idx(end);
                     let (a, b) = if a < b { (a, b) } else { (a, a) };
-                    Some(self.new_str_bytes(crate::wtf8::slice_utf16(&bytes, a, b)))
+                    Some(self.new_str_bytes(crate::wtf8::slice_utf16(bytes, a, b)))
                 }
                 "split" => {
                     // `limit` is ToUint32 (undefined → 2^32-1). A limit of 0 yields
@@ -2366,20 +2376,20 @@ impl<'a> Interp<'a> {
                         )));
                     }
                     let Some(sep) = sep else {
-                        let whole = self.new_str_bytes(bytes.clone());
+                        let whole = self.new_str_bytes(bytes.to_vec());
                         let arr = self.realm.new_array(alloc::vec![whole]);
                         return Ok(Some(NanBox::handle(arr.to_raw())));
                     };
                     let mut parts: Vec<NanBox> = if sep.is_empty() {
                         // Empty separator → one entry per UTF-16 code unit (a lone
                         // surrogate is its own one-unit entry).
-                        let units = crate::wtf8::utf16_len(&bytes);
+                        let units = crate::wtf8::utf16_len(bytes);
                         (0..units)
-                            .map(|i| crate::wtf8::slice_utf16(&bytes, i, i + 1))
+                            .map(|i| crate::wtf8::slice_utf16(bytes, i, i + 1))
                             .map(|b| self.new_str_bytes(b))
                             .collect()
                     } else {
-                        split_units(&bytes, &sep)
+                        split_units(bytes, &sep)
                             .into_iter()
                             .map(|b| self.new_str_bytes(b))
                             .collect()
@@ -2388,7 +2398,7 @@ impl<'a> Interp<'a> {
                     Some(NanBox::handle(self.realm.new_array(parts).to_raw()))
                 }
                 "replace" => {
-                    let s = crate::wtf8::to_string_lossy(&bytes);
+                    let s = crate::wtf8::to_string_lossy(bytes);
                     // ToString the searchValue, propagating a throwing user
                     // `toString` (the RegExp-argument form is not modeled here).
                     let from = self.coerce_to_string(arg(0))?;
@@ -2430,7 +2440,7 @@ impl<'a> Interp<'a> {
                     }
                 }
                 "replaceAll" => {
-                    let s = crate::wtf8::to_string_lossy(&bytes);
+                    let s = crate::wtf8::to_string_lossy(bytes);
                     let from = self.coerce_to_string(arg(0))?;
                     let repl = arg(1);
                     let is_fn = repl
@@ -2508,17 +2518,17 @@ impl<'a> Interp<'a> {
                 "at" => {
                     let i = self.coerce_to_integer_or_infinity(arg(0))?;
                     // UTF-16-indexed with negative-from-end support.
-                    let units = crate::wtf8::utf16_len(&bytes);
+                    let units = crate::wtf8::utf16_len(bytes);
                     let idx = if i < 0.0 { units as f64 + i } else { i };
                     Some(
-                        match as_index(idx).and_then(|u| crate::wtf8::utf16_index(&bytes, u)) {
+                        match as_index(idx).and_then(|u| crate::wtf8::utf16_index(bytes, u)) {
                             Some(u) => self.new_str_bytes(crate::wtf8::from_utf16(&[u])),
                             None => NanBox::undefined(),
                         },
                     )
                 }
                 "substring" => {
-                    let len = crate::wtf8::utf16_len(&bytes);
+                    let len = crate::wtf8::utf16_len(bytes);
                     let clamp = |n: f64| (n.max(0.0) as usize).min(len);
                     let mut a = clamp(self.coerce_to_integer_or_infinity(arg(0))?);
                     let mut b = if matches!(arg(1).unpack(), Unpacked::Undefined) {
@@ -2529,10 +2539,10 @@ impl<'a> Interp<'a> {
                     if a > b {
                         core::mem::swap(&mut a, &mut b);
                     }
-                    Some(self.new_str_bytes(crate::wtf8::slice_utf16(&bytes, a, b)))
+                    Some(self.new_str_bytes(crate::wtf8::slice_utf16(bytes, a, b)))
                 }
                 "substr" => {
-                    let len = crate::wtf8::utf16_len(&bytes);
+                    let len = crate::wtf8::utf16_len(bytes);
                     let lenf = len as f64;
                     let start = self.coerce_to_integer_or_infinity(arg(0))?;
                     let start = if start < 0.0 {
@@ -2546,24 +2556,24 @@ impl<'a> Interp<'a> {
                         (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize)
                             .min(len - start)
                     };
-                    Some(self.new_str_bytes(crate::wtf8::slice_utf16(&bytes, start, start + count)))
+                    Some(self.new_str_bytes(crate::wtf8::slice_utf16(bytes, start, start + count)))
                 }
                 "trimStart" => {
-                    let s = crate::wtf8::to_string_lossy(&bytes);
+                    let s = crate::wtf8::to_string_lossy(bytes);
                     Some(self.new_str(s.trim_start_matches(is_js_whitespace)))
                 }
                 "trimEnd" => {
-                    let s = crate::wtf8::to_string_lossy(&bytes);
+                    let s = crate::wtf8::to_string_lossy(bytes);
                     Some(self.new_str(s.trim_end_matches(is_js_whitespace)))
                 }
                 // Annex B.2.3: `trimLeft`/`trimRight` are legacy aliases of
                 // `trimStart`/`trimEnd`.
                 "trimLeft" => {
-                    let s = crate::wtf8::to_string_lossy(&bytes);
+                    let s = crate::wtf8::to_string_lossy(bytes);
                     Some(self.new_str(s.trim_start_matches(is_js_whitespace)))
                 }
                 "trimRight" => {
-                    let s = crate::wtf8::to_string_lossy(&bytes);
+                    let s = crate::wtf8::to_string_lossy(bytes);
                     Some(self.new_str(s.trim_end_matches(is_js_whitespace)))
                 }
                 // Annex B.2.3 legacy HTML wrapper methods. `CreateHTML(S, tag,
@@ -2571,30 +2581,30 @@ impl<'a> Interp<'a> {
                 // `<tag …>S</tag>`, optionally emitting `attribute="value"` with
                 // the value's `"` escaped as `&quot;`. The attribute value is
                 // ToString-coerced (its error must propagate).
-                "anchor" => Some(self.create_html(&bytes, "a", "name", Some(arg(0)))?),
-                "big" => Some(self.create_html(&bytes, "big", "", None)?),
-                "blink" => Some(self.create_html(&bytes, "blink", "", None)?),
-                "bold" => Some(self.create_html(&bytes, "b", "", None)?),
-                "fixed" => Some(self.create_html(&bytes, "tt", "", None)?),
-                "fontcolor" => Some(self.create_html(&bytes, "font", "color", Some(arg(0)))?),
-                "fontsize" => Some(self.create_html(&bytes, "font", "size", Some(arg(0)))?),
-                "italics" => Some(self.create_html(&bytes, "i", "", None)?),
-                "link" => Some(self.create_html(&bytes, "a", "href", Some(arg(0)))?),
-                "small" => Some(self.create_html(&bytes, "small", "", None)?),
-                "strike" => Some(self.create_html(&bytes, "strike", "", None)?),
-                "sub" => Some(self.create_html(&bytes, "sub", "", None)?),
-                "sup" => Some(self.create_html(&bytes, "sup", "", None)?),
+                "anchor" => Some(self.create_html(bytes, "a", "name", Some(arg(0)))?),
+                "big" => Some(self.create_html(bytes, "big", "", None)?),
+                "blink" => Some(self.create_html(bytes, "blink", "", None)?),
+                "bold" => Some(self.create_html(bytes, "b", "", None)?),
+                "fixed" => Some(self.create_html(bytes, "tt", "", None)?),
+                "fontcolor" => Some(self.create_html(bytes, "font", "color", Some(arg(0)))?),
+                "fontsize" => Some(self.create_html(bytes, "font", "size", Some(arg(0)))?),
+                "italics" => Some(self.create_html(bytes, "i", "", None)?),
+                "link" => Some(self.create_html(bytes, "a", "href", Some(arg(0)))?),
+                "small" => Some(self.create_html(bytes, "small", "", None)?),
+                "strike" => Some(self.create_html(bytes, "strike", "", None)?),
+                "sub" => Some(self.create_html(bytes, "sub", "", None)?),
+                "sup" => Some(self.create_html(bytes, "sup", "", None)?),
                 // A string's `toString`/`valueOf` is the string itself.
                 "toString" | "valueOf" => Some(recv),
                 // `isWellFormed`/`toWellFormed`: a string is well-formed iff it has
                 // no lone surrogate. The WTF-8 bytes are valid UTF-8 exactly then.
-                "isWellFormed" => Some(NanBox::boolean(crate::wtf8::is_well_formed_utf16(&bytes))),
+                "isWellFormed" => Some(NanBox::boolean(crate::wtf8::is_well_formed_utf16(bytes))),
                 "toWellFormed" => {
                     // Scan UTF-16 units: keep valid surrogate pairs (even when they
                     // span WTF-8 leaves), replace only *unpaired* surrogates with
                     // U+FFFD. A plain lossy decode would mangle a pair split across
                     // leaves, so rebuild from the code-unit sequence.
-                    let units: Vec<u16> = crate::wtf8::utf16_units(&bytes).collect();
+                    let units: Vec<u16> = crate::wtf8::utf16_units(bytes).collect();
                     let mut out: Vec<u16> = Vec::with_capacity(units.len());
                     let mut i = 0;
                     while i < units.len() {
@@ -2621,8 +2631,7 @@ impl<'a> Interp<'a> {
                 "charCodeAt" => {
                     // A negative or out-of-range index is `NaN` (`NaN`/no-arg → 0).
                     let idx = self.coerce_to_integer_or_infinity(arg(0))?;
-                    let unit =
-                        str_char_index(idx).and_then(|i| crate::wtf8::utf16_index(&bytes, i));
+                    let unit = str_char_index(idx).and_then(|i| crate::wtf8::utf16_index(bytes, i));
                     Some(unit.map_or(NanBox::number(f64::NAN), |u| NanBox::number(f64::from(u))))
                 }
                 // `codePointAt(i)` combines a surrogate pair at UTF-16 index `i`.
@@ -2631,9 +2640,9 @@ impl<'a> Interp<'a> {
                     let Some(i) = str_char_index(idx) else {
                         return Ok(Some(NanBox::undefined()));
                     };
-                    Some(match crate::wtf8::utf16_index(&bytes, i) {
+                    Some(match crate::wtf8::utf16_index(bytes, i) {
                         Some(u) if (0xD800..0xDC00).contains(&u) => {
-                            match crate::wtf8::utf16_index(&bytes, i + 1) {
+                            match crate::wtf8::utf16_index(bytes, i + 1) {
                                 Some(low) if (0xDC00..0xE000).contains(&low) => {
                                     let cp = 0x1_0000
                                         + ((u32::from(u) - 0xD800) << 10)
@@ -2656,7 +2665,7 @@ impl<'a> Interp<'a> {
                     } else {
                         self.arg_string_bytes_fallible(arg(1))?
                     };
-                    Some(self.new_str_bytes(pad_units(&bytes, target, &pad, true)))
+                    Some(self.new_str_bytes(pad_units(bytes, target, &pad, true)))
                 }
                 "padEnd" => {
                     let tn = self.coerce_to_integer_or_infinity(arg(0))?;
@@ -2666,7 +2675,7 @@ impl<'a> Interp<'a> {
                     } else {
                         self.arg_string_bytes_fallible(arg(1))?
                     };
-                    Some(self.new_str_bytes(pad_units(&bytes, target, &pad, false)))
+                    Some(self.new_str_bytes(pad_units(bytes, target, &pad, false)))
                 }
                 "lastIndexOf" => {
                     let needle = self.arg_string_bytes_fallible(arg(0))?;
@@ -2680,12 +2689,12 @@ impl<'a> Interp<'a> {
                     } else {
                         n.max(0.0).min(usize::MAX as f64) as usize
                     };
-                    Some(NanBox::number(last_index_of_units(&bytes, &needle, from)))
+                    Some(NanBox::number(last_index_of_units(bytes, &needle, from)))
                 }
                 // `concat` appends each argument's string form (WTF-8 bytes, so a
                 // surrogate-bearing receiver or argument concatenates losslessly).
                 "concat" => {
-                    let mut out = bytes.clone();
+                    let mut out = bytes.to_vec();
                     for a in args {
                         // ToString each argument, honoring a user `toString`.
                         let p = self.coerce_object(*a, "string")?;
@@ -2695,7 +2704,7 @@ impl<'a> Interp<'a> {
                 }
                 // `search(str)` — index of the first match (string needle).
                 "search" => {
-                    let s = crate::wtf8::to_string_lossy(&bytes);
+                    let s = crate::wtf8::to_string_lossy(bytes);
                     // A non-RegExp argument is ToString'd (running a user `toString`,
                     // which may throw) and matched literally.
                     let needle_bytes = if matches!(arg(0).unpack(), Unpacked::Undefined) {
@@ -2736,7 +2745,7 @@ impl<'a> Interp<'a> {
                                 self.make_error(N_ERROR_BASE + 2, Some(m)),
                             ));
                         }
-                        Some(self.new_str_bytes(normalize_wtf8(&bytes, &form)))
+                        Some(self.new_str_bytes(normalize_wtf8(bytes, &form)))
                     }
                     #[cfg(not(feature = "intl"))]
                     {
@@ -2749,7 +2758,7 @@ impl<'a> Interp<'a> {
                 // `localeCompare(other)` — ordering sign (code-point order; no
                 // locale tailoring).
                 "localeCompare" => {
-                    let s = crate::wtf8::to_string_lossy(&bytes);
+                    let s = crate::wtf8::to_string_lossy(bytes);
                     // ToString(that) — unwraps a String wrapper and runs a user
                     // toString (abrupt-propagating), rather than the raw display form.
                     let other = self.coerce_to_string(arg(0))?;

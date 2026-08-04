@@ -836,6 +836,34 @@ impl Realm {
         Some(self.heap.get(handle)?.as_str()?.materialize_bytes())
     }
 
+    /// The string at `handle` as a [`Rope`] handle — an `Rc` bump, not a copy.
+    ///
+    /// [`string_bytes`](Realm::string_bytes) materializes the whole string into a
+    /// fresh `Vec` on every call, which makes an O(1) operation like
+    /// `s.charCodeAt(0)` cost O(n) and a loop over a string O(n²). A caller that
+    /// only needs to *read* the bytes can take this instead and borrow from the
+    /// returned rope: it owns an `Rc` to the same nodes, so the borrow is
+    /// independent of `self` and does not block the mutable use that follows.
+    ///
+    /// A flat string then costs nothing to read; only a `Concat` still has to be
+    /// materialized (ROADMAP §5.0).
+    #[must_use]
+    pub fn string_rope(&self, handle: Handle) -> Option<Rope> {
+        self.heap.get(handle)?.as_str().cloned()
+    }
+
+    /// The UTF-16 code-unit length of the string at `handle` — JavaScript's
+    /// `String.prototype.length` — or `None` if it is not a string.
+    ///
+    /// Memoized on the rope, so repeated reads are O(1). Computing it as
+    /// `string_bytes(h).map(|b| wtf8::utf16_len(&b))` copies the whole string
+    /// *and* rescans it every time, which made `for (i = 0; i < s.length; i++)`
+    /// quadratic.
+    #[must_use]
+    pub fn string_utf16_len(&self, handle: Handle) -> Option<usize> {
+        Some(self.heap.get(handle)?.as_str()?.utf16_len())
+    }
+
     /// The string at `handle` widened to UTF-16 code units — the subject form the
     /// regex matcher consumes — reusing the previous result when it is the same
     /// string. See [`regex_subject_units`](Realm::regex_subject_units) (the field)
@@ -3632,7 +3660,11 @@ impl Realm {
             Some(prim) => Handle::from_raw(prim.as_handle()?),
             None => handle,
         };
-        Some(crate::wtf8::utf16_len(&self.string_bytes(sh)?))
+        // Memoized on the rope. This is consulted on *every* property access on
+        // a string (String exotic objects own `length` and their indices), so
+        // materializing the whole string and rescanning it here made every such
+        // access O(n) — `s.length` in a loop, and even a miss like `s.foo`.
+        self.string_utf16_len(sh)
     }
 
     /// Whether the object at `handle` has an own property `key` (including

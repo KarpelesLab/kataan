@@ -1386,8 +1386,8 @@ impl<'a> Interp<'a> {
                                 .and_then(|h| self.realm.get_property(h, "input"))
                                 .and_then(|v| v.as_handle())
                                 .map(Handle::from_raw)
-                                .and_then(|ih| self.realm.string_bytes(ih))
-                                .map_or(0, |b| crate::wtf8::utf16_len(&b));
+                                .and_then(|ih| self.realm.string_utf16_len(ih))
+                                .unwrap_or(0);
                             if idx < input_len {
                                 for e in &elems {
                                     let start = e

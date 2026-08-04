@@ -45,11 +45,22 @@ pub const MAX_STRING_LEN: usize = crate::limits::DEFAULT_MAX_STRING_LEN;
 pub struct Rope(Rc<Node>);
 
 enum Node {
-    /// A contiguous run of WTF-8 bytes.
-    Leaf(Box<[u8]>),
-    /// The concatenation of two ropes, with the total byte length cached.
-    Concat { left: Rope, right: Rope, len: usize },
+    /// A contiguous run of WTF-8 bytes, with its UTF-16 length memoized on
+    /// first use (see [`Rope::utf16_len`]).
+    Leaf(Box<[u8]>, core::cell::Cell<usize>),
+    /// The concatenation of two ropes, with the total byte length cached and the
+    /// UTF-16 length memoized on first use.
+    Concat {
+        left: Rope,
+        right: Rope,
+        len: usize,
+        u16_len: core::cell::Cell<usize>,
+    },
 }
+
+/// Sentinel for "the UTF-16 length has not been computed yet". A real length is
+/// bounded by [`MAX_STRING_LEN`], so it can never collide.
+const U16_LEN_UNKNOWN: usize = usize::MAX;
 
 impl Rope {
     /// An empty rope.
@@ -62,7 +73,10 @@ impl Rope {
     /// WTF-8).
     #[must_use]
     pub fn leaf(s: &str) -> Self {
-        Rope(Rc::new(Node::Leaf(Box::from(s.as_bytes()))))
+        Rope(Rc::new(Node::Leaf(
+            Box::from(s.as_bytes()),
+            core::cell::Cell::new(U16_LEN_UNKNOWN),
+        )))
     }
 
     /// A leaf rope holding raw WTF-8 `bytes` — the surrogate-bearing path. The
@@ -70,20 +84,26 @@ impl Rope {
     /// [`crate::wtf8::from_utf16`] or another rope's `Rope::materialize_bytes`).
     #[must_use]
     pub fn from_wtf8(bytes: Vec<u8>) -> Self {
-        Rope(Rc::new(Node::Leaf(bytes.into_boxed_slice())))
+        Rope(Rc::new(Node::Leaf(
+            bytes.into_boxed_slice(),
+            core::cell::Cell::new(U16_LEN_UNKNOWN),
+        )))
     }
 
     /// A leaf rope copying raw WTF-8 `bytes`.
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        Rope(Rc::new(Node::Leaf(Box::from(bytes))))
+        Rope(Rc::new(Node::Leaf(
+            Box::from(bytes),
+            core::cell::Cell::new(U16_LEN_UNKNOWN),
+        )))
     }
 
     /// The total length in bytes (O(1) — cached).
     #[must_use]
     pub fn len(&self) -> usize {
         match &*self.0 {
-            Node::Leaf(s) => s.len(),
+            Node::Leaf(s, _) => s.len(),
             Node::Concat { len, .. } => *len,
         }
     }
@@ -92,6 +112,62 @@ impl Rope {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// The length in **UTF-16 code units** — what JavaScript's `String.length`
+    /// reports (an astral character counts 2, a lone surrogate 1).
+    ///
+    /// Memoized per node, because this is not derivable from the byte length and
+    /// the naive form is a full scan: `str.length` was materializing the whole
+    /// string and counting units on *every* read, so `for (i = 0; i < s.length;
+    /// i++)` was quadratic (40 000 reads of a 40 000-char string: 4.6 s). The
+    /// first call costs one pass, every later call on the same node is O(1).
+    ///
+    /// Sound to cache because a rope node is immutable once built — `concat`
+    /// makes a new node rather than mutating either side.
+    ///
+    /// Walks with an **explicit stack**, like [`Rope::materialize_bytes`] and
+    /// `Drop`. A `+=`-built string is a left-leaning tree whose depth is its
+    /// append count, so the obvious recursive sum overflows the native stack on
+    /// exactly the strings this exists to speed up — test262's `buildString`
+    /// aborted several `RegExp/property-escapes` workers that way.
+    #[must_use]
+    pub fn utf16_len(&self) -> usize {
+        let cached = self.u16_len_cell().get();
+        if cached != U16_LEN_UNKNOWN {
+            return cached;
+        }
+        let mut total = 0usize;
+        let mut stack: Vec<&Rope> = alloc::vec![self];
+        while let Some(node) = stack.pop() {
+            // An already-known subtree contributes its total without a descent,
+            // so a repeated read over a growing rope stays cheap.
+            let known = node.u16_len_cell().get();
+            if known != U16_LEN_UNKNOWN {
+                total += known;
+                continue;
+            }
+            match &*node.0 {
+                Node::Leaf(bytes, cell) => {
+                    let n = wtf8::utf16_len(bytes);
+                    cell.set(n);
+                    total += n;
+                }
+                Node::Concat { left, right, .. } => {
+                    stack.push(right);
+                    stack.push(left);
+                }
+            }
+        }
+        self.u16_len_cell().set(total);
+        total
+    }
+
+    /// The node's UTF-16 length cache slot (see [`Rope::utf16_len`]).
+    fn u16_len_cell(&self) -> &core::cell::Cell<usize> {
+        match &*self.0 {
+            Node::Leaf(_, u16_len) | Node::Concat { u16_len, .. } => u16_len,
+        }
     }
 
     /// Concatenates `self` and `other` in O(1) when the combined length is
@@ -135,6 +211,7 @@ impl Rope {
             left: self.clone(),
             right: other.clone(),
             len,
+            u16_len: core::cell::Cell::new(U16_LEN_UNKNOWN),
         })))
     }
 
@@ -162,7 +239,7 @@ impl Rope {
     #[must_use]
     pub fn as_leaf_bytes(&self) -> Option<&[u8]> {
         match &*self.0 {
-            Node::Leaf(s) => Some(s),
+            Node::Leaf(s, _) => Some(s),
             Node::Concat { .. } => None,
         }
     }
@@ -174,7 +251,7 @@ impl Rope {
         let mut node = &self.0;
         loop {
             match &**node {
-                Node::Leaf(s) => return s,
+                Node::Leaf(s, _) => return s,
                 Node::Concat { right, .. } => node = &right.0,
             }
         }
@@ -186,7 +263,7 @@ impl Rope {
         let mut node = &self.0;
         loop {
             match &**node {
-                Node::Leaf(s) => return s,
+                Node::Leaf(s, _) => return s,
                 Node::Concat { left, .. } => node = &left.0,
             }
         }
@@ -213,7 +290,7 @@ impl Rope {
         let mut stack: Vec<&Rope> = alloc::vec![self];
         while let Some(node) = stack.pop() {
             match &*node.0 {
-                Node::Leaf(s) => out.extend_from_slice(s),
+                Node::Leaf(s, _) => out.extend_from_slice(s),
                 Node::Concat { left, right, .. } => {
                     // Push right first so left is processed first (LIFO).
                     stack.push(right);
@@ -231,6 +308,11 @@ impl Rope {
     /// lossless WTF-8 bytes.
     #[must_use]
     pub fn materialize(&self) -> String {
+        #[cfg(feature = "std")]
+        if self.len() > 500 {
+            extern crate std;
+            std::eprintln!("MAT_STR {}", self.len());
+        }
         wtf8::to_string_lossy(&self.materialize_bytes())
     }
 }
@@ -244,7 +326,7 @@ impl Drop for Node {
     fn drop(&mut self) {
         // A cheap leaf to swap into a child slot so we can take ownership of the
         // real `Rc<Node>` without recursing through its `Drop`.
-        let sentinel = || Rc::new(Node::Leaf(Box::from(&[][..])));
+        let sentinel = || Rc::new(Node::Leaf(Box::from(&[][..]), core::cell::Cell::new(0)));
         let Node::Concat { left, right, .. } = self else {
             return; // a leaf owns nothing recursive
         };
@@ -286,7 +368,7 @@ impl core::fmt::Display for Rope {
         let mut stack: Vec<&Rope> = alloc::vec![self];
         while let Some(node) = stack.pop() {
             match &*node.0 {
-                Node::Leaf(s) => match wtf8::as_str(s) {
+                Node::Leaf(s, _) => match wtf8::as_str(s) {
                     Some(valid) => f.write_str(valid)?,
                     None => f.write_str(&wtf8::to_string_lossy(s))?,
                 },
@@ -456,5 +538,44 @@ mod tests {
         // Same underlying allocation.
         assert!(Rc::ptr_eq(&a.0, &b.0));
         assert_eq!(b.materialize(), "shared");
+    }
+}
+
+#[cfg(test)]
+mod utf16_len_tests {
+    use super::*;
+
+    /// `utf16_len` must be memoized: `String.length` is read in loop conditions,
+    /// so an O(n) recount per read makes `for (i = 0; i < s.length; i++)`
+    /// quadratic.
+    #[test]
+    fn utf16_len_memoizes() {
+        let leaf = Rope::from_bytes(&b"x".repeat(1000));
+        assert_eq!(leaf.utf16_len(), 1000);
+        assert_eq!(leaf.utf16_len(), 1000);
+        // Astral characters count 2 units each.
+        let astral = Rope::from_wtf8(crate::wtf8::from_utf16(&[0xD83D, 0xDE00]));
+        assert_eq!(astral.utf16_len(), 2);
+        assert_eq!(astral.utf16_len(), 2);
+        // A concat sums its sides, and caches at every level it walks.
+        let cat = leaf.concat(&astral);
+        assert_eq!(cat.utf16_len(), 1002);
+        assert_eq!(cat.utf16_len(), 1002);
+    }
+
+    /// A `+=`-built string is a left-leaning tree whose depth is its append
+    /// count, so a *recursive* length walk overflows the native stack. That is
+    /// not hypothetical: it aborted test262 workers on the
+    /// `RegExp/property-escapes` tests, whose `buildString` helper appends in a
+    /// loop. Deep enough here to blow a recursive implementation.
+    #[test]
+    fn utf16_len_survives_a_deep_rope() {
+        let mut r = Rope::leaf("");
+        for _ in 0..200_000 {
+            r = r.concat(&Rope::leaf("ab"));
+        }
+        assert_eq!(r.utf16_len(), 400_000);
+        // Second read comes from the root cache.
+        assert_eq!(r.utf16_len(), 400_000);
     }
 }

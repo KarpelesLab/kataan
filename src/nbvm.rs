@@ -3735,9 +3735,7 @@ fn vm_get_elem(
                 && let Some(len) = ctx.realm.array_length(handle).or_else(|| {
                     // String length counts UTF-16 code units (astral chars = 2, a
                     // lone surrogate = 1).
-                    ctx.realm
-                        .string_bytes(handle)
-                        .map(|b| crate::wtf8::utf16_len(&b))
+                    ctx.realm.string_utf16_len(handle)
                 })
             {
                 // Computed `arr["length"]` / `str["length"]`.
@@ -3891,11 +3889,10 @@ fn vm_array_len(ctx: &mut Ctx, funcs: &[FnProto], recv: NanBox) -> Result<NanBox
     } else {
         // `.length` on an array, or a string's UTF-16 code-unit count (astral
         // chars = 2, a lone surrogate = 1).
-        let len = ctx.realm.array_length(handle).or_else(|| {
-            ctx.realm
-                .string_bytes(handle)
-                .map(|b| crate::wtf8::utf16_len(&b))
-        });
+        let len = ctx
+            .realm
+            .array_length(handle)
+            .or_else(|| ctx.realm.string_utf16_len(handle));
         Ok(match len {
             Some(n) => NanBox::number(n as f64),
             // Otherwise an explicit `length` data property (e.g. a regex match
