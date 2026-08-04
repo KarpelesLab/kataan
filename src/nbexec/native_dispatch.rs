@@ -3580,6 +3580,14 @@ impl<'a> Interp<'a> {
                         let o = self.realm.new_object();
                         let tv = self.new_str(ty);
                         self.realm.set_property(o, "type", tv);
+                        // Substitute the resolved numbering system's digits, as
+                        // `format` already does — without this, `formatToParts`
+                        // returned Latin digits for a formatter whose `format`
+                        // returned Arabic-Indic ones, so the parts did not
+                        // reassemble into the formatted string. Only ASCII digits
+                        // are rewritten, so doing it per-part is equivalent to
+                        // doing it once over the concatenation.
+                        let val = self.apply_numbering_digits(h, val);
                         let vv = self.new_str(&val);
                         self.realm.set_property(o, "value", vv);
                         arr_elems.push(NanBox::handle(o.to_raw()));

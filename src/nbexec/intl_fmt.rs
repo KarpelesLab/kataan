@@ -1298,6 +1298,97 @@ fn sexagenary_year_name(cyclic1: i64) -> String {
     )
 }
 
+/// Parses a Temporal month code (`"M05"` / `"M05L"`) into `(number, is_leap)`.
+#[cfg(feature = "intl")]
+fn month_code_parts(code: &str) -> Option<(u32, bool)> {
+    let b = code.as_bytes();
+    let leap = b.len() == 4 && b[3] == b'L';
+    if !((b.len() == 3 || leap) && b[0] == b'M' && b[1].is_ascii_digit() && b[2].is_ascii_digit()) {
+        return None;
+    }
+    Some((u32::from(b[1] - b'0') * 10 + u32::from(b[2] - b'0'), leap))
+}
+
+/// The `intl` crate calendar + CLDR era **index** naming the Temporal era code
+/// `era` in calendar `cal`.
+///
+/// UTS #35 numbers a calendar's `<eras>` positionally and the numbering is not
+/// uniform, so this is a table rather than a computation: Gregorian is 0 = BC /
+/// 1 = AD, Coptic's *only* era is index 1, the Islamic calendars put Anno
+/// Hegirae at 0 and Before Hijrah at 1 (the reverse of the "negative years come
+/// first" intuition), and the Japanese nengō run 0 (Taika) … 236 (Reiwa) — of
+/// which the engine's Temporal calendar only ever reports the five modern ones,
+/// falling back to the Gregorian era codes before Meiji.
+#[cfg(feature = "intl")]
+fn cldr_era_index(cal: &str, era: &str) -> Option<(intl::datetime::Calendar, u32)> {
+    use intl::datetime::Calendar;
+    // The five modern nengō occupy the tail of the Japanese era table.
+    let modern_nengo = match era {
+        "meiji" => Some(232),
+        "taisho" => Some(233),
+        "showa" => Some(234),
+        "heisei" => Some(235),
+        "reiwa" => Some(236),
+        _ => None,
+    };
+    if let Some(i) = modern_nengo {
+        return Some((Calendar::Japanese, i));
+    }
+    match era {
+        "bce" => return Some((Calendar::Gregory, 0)),
+        "ce" => return Some((Calendar::Gregory, 1)),
+        _ => {}
+    }
+    let c = Calendar::from_bcp47(cal)?;
+    let idx = match (cal, era) {
+        (_, "ah") => 0,
+        (_, "bh") => 1,
+        ("roc", "broc") => 0,
+        ("roc", "roc") => 1,
+        ("ethiopic", "aa") => 0,
+        ("ethiopic", "am") => 1,
+        // Coptic has a single era and CLDR indexes it 1, not 0.
+        ("coptic", _) => 1,
+        // Every other calendar the engine implements is single-era at index 0
+        // (`buddhist` BE, `persian` AP, `hebrew` AM, `indian` Śaka, `ethioaa` AA).
+        _ => 0,
+    };
+    Some((c, idx))
+}
+
+/// The CLDR month **index** (and leap-name flag) naming the month a Temporal
+/// `month_code` identifies in `cal`'s year.
+///
+/// CLDR numbers a lunisolar calendar's months by *name slot*, not by ordinal
+/// position in the year, and the two disagree exactly where a leap month is
+/// involved:
+/// * Hebrew reserves slot 6 for Adar I and slot 7 for Adar (Adar II in a leap
+///   year), so an ordinary month after Shevat sits one slot above its ordinal in
+///   a common year (`M06` Adar is ordinal 6 but slot 7);
+/// * Chinese/`dangi` keep the slot equal to the code's number and mark the
+///   intercalary month with the `leap` flag instead (`M05L` → slot 5, leap).
+///
+/// The `leap` flag is what selects between UTS #35's two leap renderings: the
+/// `monthPatterns` wrapper (`"5bis"`) for Chinese/`dangi`, and the
+/// `yeartype="leap"` alternate name (Adar → Adar II) for Hebrew — which is a
+/// property of the *year*, not of the month, hence `leap_year`.
+#[cfg(feature = "intl")]
+fn cldr_month_index(cal: &str, month_code: &str, ordinal: i64, leap_year: bool) -> (u32, bool) {
+    match cal {
+        "hebrew" => match month_code_parts(month_code) {
+            // `M05L` (Adar I) is slot 6; `M06`..`M12` shift up one past it.
+            Some((n, leap)) if leap || n > 5 => (n + 1, leap_year),
+            Some((n, _)) => (n, leap_year),
+            None => (ordinal.clamp(1, 13) as u32, leap_year),
+        },
+        "chinese" | "dangi" => match month_code_parts(month_code) {
+            Some((n, leap)) => (n, leap),
+            None => (ordinal.clamp(1, 12) as u32, false),
+        },
+        _ => (ordinal.clamp(1, 13) as u32, false),
+    }
+}
+
 /// The complete set of CLDR numbering-system identifiers (BCP-47 `nu` types).
 /// Mirrors ECMA-402's `AvailableNumberingSystems`; used by
 /// `Intl.supportedValuesOf("numberingSystem")` and to validate the
@@ -5559,24 +5650,75 @@ impl<'a> Interp<'a> {
         // Chinese/Dangi lunisolar calendars: the crate's `format_to_parts` renders
         // only proleptic Gregorian, so derive the `relatedYear`/`yearName` (+ numeric
         // month/day) parts these calendars require ourselves.
-        if let Some(p) = self.lunisolar_parts(handle, &locale, &dt, &o) {
-            return p;
-        }
-        let mut parts = Self::dtf_crate_parts(&locale, &dt, &o);
-        self.rewrite_calendar_numerics(handle, &dt, &o, &mut parts);
+        let mut parts = match self.lunisolar_parts(handle, &locale, &dt, &o) {
+            Some(p) => p,
+            None => {
+                let mut parts = Self::dtf_crate_parts(&locale, &dt, &o);
+                self.rewrite_calendar_numerics(handle, &dt, &o, &mut parts);
+                parts
+            }
+        };
+        self.fix_fractional_separator(handle, &locale, &mut parts);
         parts
     }
 
-    /// Re-express the numeric `year`/`month`/`day` parts in the instance's
-    /// resolved calendar. The `intl` crate renders only proleptic Gregorian
-    /// fields, so a `calendar: "buddhist"` formatter would otherwise report the
-    /// ISO year (2050 rather than 2593) — and the same for every other arithmetic
-    /// calendar the engine already implements for Temporal. Only *numeric*
-    /// renderings are rewritten: a month **name** is CLDR data the crate does not
-    /// expose per calendar, so it is left as it came.
+    /// Re-express the separator in front of a `fractionalSecond` part in the
+    /// formatter's resolved numbering system.
     ///
-    /// The year is the era-relative one when the calendar has eras
-    /// (`date.eraYear ?? date.year`, as `Temporal.PlainDate` reports it).
+    /// ECMA-402's `FormatDateTimePattern` formats the fractional seconds through
+    /// an `Intl.NumberFormat` carrying the DateTimeFormat's `[[NumberingSystem]]`,
+    /// so the *separator* is numbering-system data and not just the digits:
+    /// `en-US-u-nu-arab` renders `٢:٣٥:٠٦٫٧٨٩` with U+066B, while `en-US-u-nu-deva`
+    /// keeps the locale's own `.`. The crate's date formatter only ever emits the
+    /// locale's Latin-numbering separator, so it is patched here — probing an
+    /// `intl` decimal format in the same locale + numbering system, which is
+    /// exactly the nested `NumberFormat` the spec describes.
+    #[cfg(feature = "intl")]
+    fn fix_fractional_separator(
+        &self,
+        handle: Handle,
+        locale: &str,
+        parts: &mut [(&'static str, String)],
+    ) {
+        let Some(i) = parts.iter().position(|(k, _)| *k == "fractionalSecond") else {
+            return;
+        };
+        if i == 0 || parts[i - 1].0 != "literal" {
+            return;
+        }
+        let nu = self
+            .realm
+            .get_property(handle, "numberingSystem")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_default();
+        // `latn` is what the crate already rendered the pattern with.
+        if nu.is_empty() || nu == "latn" {
+            return;
+        }
+        let probe_locale =
+            alloc::format!("{}-u-nu-{}", strip_unicode_extension(locale).as_str(), nu);
+        let (_, sep, _) =
+            split_number_scaffold(&intl::number::format_decimal(&probe_locale, 1.1), &nu);
+        if !sep.is_empty() {
+            parts[i - 1].1 = sep;
+        }
+    }
+
+    /// Re-express the `era`/`year`/`month`/`day` parts in the instance's resolved
+    /// calendar. The `intl` crate's `format_to_parts` renders only proleptic
+    /// Gregorian fields, so a `calendar: "buddhist"` formatter would otherwise
+    /// report the ISO year (2050 rather than 2593) and a `calendar: "japanese"`
+    /// one "Anno Domini" rather than "Reiwa" — and the same for every other
+    /// arithmetic calendar the engine already implements for Temporal.
+    ///
+    /// The era and the month *name* come from the crate's per-calendar CLDR
+    /// tables ([`era_name`](intl::datetime::era_name) /
+    /// [`month_name`](intl::datetime::month_name)), keyed off the era code and
+    /// month code the engine's own Temporal calendar reports — so
+    /// `Intl.DateTimeFormat` and `Temporal.PlainDate` cannot disagree about which
+    /// era or month a date falls in. The year is the era-relative one when the
+    /// calendar has eras (`date.eraYear ?? date.year`, as `Temporal.PlainDate`
+    /// reports it).
     #[cfg(feature = "intl")]
     fn rewrite_calendar_numerics(
         &self,
@@ -5585,31 +5727,48 @@ impl<'a> Interp<'a> {
         o: &intl::datetime::DateTimeFormatOptions,
         parts: &mut [(&'static str, String)],
     ) {
+        use crate::nbexec::temporal_calendar;
         use crate::temporal_iso::IsoDate;
-        use intl::datetime::Numeric2Digit;
+        use intl::datetime::{NameStyle, Numeric2Digit};
         let cal = self.dtf_resolved_calendar(handle);
         // ISO/Gregorian already agree with the crate; the lunisolar calendars are
         // rendered by `lunisolar_parts`, which never reaches here.
         if matches!(cal.as_str(), "gregory" | "iso8601" | "chinese" | "dangi") {
             return;
         }
-        let f = crate::nbexec::temporal_calendar::iso_to_fields(
-            &cal,
-            IsoDate {
-                year: dt.year,
-                month: dt.month,
-                day: dt.day,
-            },
-        );
+        let iso = IsoDate {
+            year: dt.year,
+            month: dt.month,
+            day: dt.day,
+        };
+        let f = temporal_calendar::iso_to_fields(&cal, iso);
+        // CLDR names are keyed by language; the `-u-` keywords (`ca`/`nu`/`hc`)
+        // are the formatter's own resolution, not part of the lookup.
+        let lang = strip_unicode_extension(&self.dtf_locale(handle));
+        let leap_year = temporal_calendar::months_in_year(&cal, iso) == 13;
+        let (midx, mleap) = cldr_month_index(&cal, &f.month_code, f.month, leap_year);
         let two_digit = |v: i64| alloc::format!("{:02}", v.rem_euclid(100));
         for (kind, value) in parts.iter_mut() {
-            // A field the crate rendered non-numerically (a month name, an era) is
-            // left alone — there is no per-calendar CLDR text to replace it with.
-            if !value.bytes().all(|b| b.is_ascii_digit()) {
-                continue;
-            }
             match *kind {
-                "year" => {
+                "era" => {
+                    if let Some(code) = f.era.as_deref()
+                        && let Some((c, idx)) = cldr_era_index(&cal, code)
+                        && let Some(name) = intl::datetime::era_name(
+                            &lang,
+                            c,
+                            idx,
+                            // A `dateStyle` pattern's era field is UTS #35 `G`,
+                            // i.e. the abbreviated width.
+                            o.era.unwrap_or(NameStyle::Short),
+                        )
+                    {
+                        *value = String::from(name);
+                    }
+                }
+                "month" => Self::rewrite_month_part(&cal, &lang, o, midx, mleap, value),
+                // A field the crate rendered non-numerically is left alone — there
+                // is no per-calendar CLDR text to replace it with.
+                "year" if value.bytes().all(|b| b.is_ascii_digit()) => {
                     let y = f.era_year.unwrap_or(f.year);
                     *value = if o.year == Some(Numeric2Digit::TwoDigit) {
                         two_digit(y)
@@ -5617,14 +5776,7 @@ impl<'a> Interp<'a> {
                         alloc::format!("{y}")
                     };
                 }
-                "month" => {
-                    *value = if value.len() == 2 {
-                        two_digit(f.month)
-                    } else {
-                        alloc::format!("{}", f.month)
-                    };
-                }
-                "day" => {
+                "day" if value.bytes().all(|b| b.is_ascii_digit()) => {
                     *value = if value.len() == 2 {
                         two_digit(f.day)
                     } else {
@@ -5634,6 +5786,59 @@ impl<'a> Interp<'a> {
                 _ => {}
             }
         }
+    }
+
+    /// Re-expresses one `month` part in calendar `cal` at CLDR month slot `midx`.
+    ///
+    /// The requested `month` option is the width; with none (the part came out of
+    /// a `dateStyle` pattern, whose width is the pattern's own) only a numeric
+    /// rendering is rewritten, and the name is left as the crate produced it.
+    ///
+    /// Hebrew is the exception ECMA-402 inherits from CLDR-15510: its months are
+    /// *never* rendered as numbers at the numeric/2-digit widths (only `narrow`
+    /// gives a number), so a `month: "numeric"` Hebrew formatter renders "Sivan".
+    #[cfg(feature = "intl")]
+    fn rewrite_month_part(
+        cal: &str,
+        lang: &str,
+        o: &intl::datetime::DateTimeFormatOptions,
+        midx: u32,
+        mleap: bool,
+        value: &mut String,
+    ) {
+        use intl::datetime::{Calendar, MonthStyle};
+        let numeric = value.bytes().all(|b| b.is_ascii_digit());
+        let Some(c) = Calendar::from_bcp47(cal) else {
+            return;
+        };
+        let style = match o.month {
+            Some(MonthStyle::Numeric | MonthStyle::TwoDigit) | None if cal == "hebrew" => {
+                MonthStyle::Long
+            }
+            Some(s) => s,
+            // A `dateStyle` month: only a numeric one can be re-expressed safely.
+            None if numeric => {
+                if value.len() == 2 {
+                    MonthStyle::TwoDigit
+                } else {
+                    MonthStyle::Numeric
+                }
+            }
+            None => return,
+        };
+        if let Some(name) = intl::datetime::month_name(lang, c, midx, mleap, style) {
+            *value = name;
+        }
+    }
+
+    /// The `Intl.DateTimeFormat` instance's resolved locale tag.
+    #[cfg(feature = "intl")]
+    fn dtf_locale(&self, handle: Handle) -> String {
+        self.realm
+            .get_property(handle, "\u{0}locale")
+            .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("en"))
     }
 
     /// Runs the `intl` crate's CLDR date-time formatter and repairs the shapes it
@@ -6096,12 +6301,19 @@ impl<'a> Interp<'a> {
 
     /// Chinese/Dangi lunisolar `formatToParts` output for `handle` (returns `None`
     /// unless the resolved calendar is `chinese`/`dangi` and the Gregorian date is
-    /// within the crate's supported lunisolar range). Produces `relatedYear` (the
-    /// Gregorian year the lunisolar year began), `yearName` (the sexagenary cyclic
-    /// name), and numeric `month`/`day` parts; the localized lunisolar month names
-    /// are not reachable through the `intl` crate's public API, so months render
-    /// numerically. Any requested time components are appended via the crate's
-    /// (calendar-independent) time formatter.
+    /// within the supported lunisolar range). Produces `relatedYear` (the
+    /// Gregorian year the lunisolar year began), `yearName` (the localized
+    /// sexagenary cycle name) and `month`/`day` parts; no `era` part, because
+    /// CLDR gives these calendars no eras.
+    ///
+    /// The calendar fields come from the engine's own Temporal calendar rather
+    /// than from the `intl` crate's tables, so `dtf.formatToParts(instant)` and
+    /// `Temporal.PlainDate.withCalendar(cal)` cannot report different months for
+    /// the same instant. Only the *range check* is the crate's, since falling
+    /// outside it is what makes this path decline (and render Gregorian instead).
+    /// A leap month carries UTS #35's `monthPatterns` marker at the requested
+    /// width (`"5bis"` in `en`, `"闰五月"` in `zh`). Any requested time components
+    /// are appended via the crate's (calendar-independent) time formatter.
     #[cfg(feature = "intl")]
     fn lunisolar_parts(
         &self,
@@ -6110,25 +6322,38 @@ impl<'a> Interp<'a> {
         dt: &intl::datetime::DateTime,
         o: &intl::datetime::DateTimeFormatOptions,
     ) -> Option<Vec<(&'static str, String)>> {
+        use crate::nbexec::temporal_calendar;
+        use crate::temporal_iso::IsoDate;
         use intl::calendar;
-        use intl::datetime::{self, DateTimeFormatOptions, MonthStyle, Numeric2Digit};
+        use intl::datetime::{self, Calendar, DateTimeFormatOptions, MonthStyle, Numeric2Digit};
         let cal = self.dtf_resolved_calendar(handle);
         let (y, m, d) = (dt.year as i64, dt.month as i64, dt.day as i64);
-        let (cyear, cmonth, cday, _leap) = match cal.as_str() {
-            "chinese" => calendar::gregorian_to_chinese(y, m, d)?,
-            "dangi" => calendar::gregorian_to_dangi(y, m, d)?,
+        let crate_cal = match cal.as_str() {
+            "chinese" => {
+                calendar::gregorian_to_chinese(y, m, d)?;
+                Calendar::Chinese
+            }
+            "dangi" => {
+                calendar::gregorian_to_dangi(y, m, d)?;
+                Calendar::Dangi
+            }
             _ => return None,
         };
-        // The related Gregorian year (the year the lunisolar year began) and the
-        // 1-based sexagenary index, exactly as the crate's `format_chinese_date`
-        // derives them.
-        let related = if cal == "dangi" {
-            calendar::dangi_to_gregorian(cyear, 1, 1, false)
-        } else {
-            calendar::chinese_to_gregorian(cyear, 1, 1, false)
-        }
-        .map_or(cyear, |g| g.0);
+        let iso = IsoDate {
+            year: dt.year,
+            month: dt.month,
+            day: dt.day,
+        };
+        let f = temporal_calendar::iso_to_fields(&cal, iso);
+        // The lunisolar year is named by its position in the 60-year sexagenary
+        // cycle; `Temporal`'s `.year` for these calendars *is* the related
+        // Gregorian year (the year the lunisolar year began), which anchors it.
+        let related = f.year;
         let cyclic1 = (related - 4).rem_euclid(60) + 1;
+        let (midx, mleap) = cldr_month_index(&cal, &f.month_code, f.month, false);
+        // CLDR names are keyed by language; the `-u-` keywords are the formatter's
+        // own resolution, not part of the lookup.
+        let lang = strip_unicode_extension(locale);
         // zh renders the year/month/day with trailing `年`/`月`/`日` field markers;
         // other locales separate the numeric fields with plain literals.
         let zh = locale.starts_with("zh");
@@ -6136,7 +6361,11 @@ impl<'a> Interp<'a> {
         let mut parts: Vec<(&'static str, String)> = Vec::new();
         if o.year.is_some() {
             parts.push(("relatedYear", alloc::format!("{related}")));
-            parts.push(("yearName", sexagenary_year_name(cyclic1)));
+            parts.push((
+                "yearName",
+                datetime::cyclic_year_name(&lang, crate_cal, cyclic1 as u32)
+                    .map_or_else(|| sexagenary_year_name(cyclic1), String::from),
+            ));
             if zh {
                 parts.push(("literal", String::from("年")));
             }
@@ -6145,12 +6374,14 @@ impl<'a> Interp<'a> {
             if !zh && !parts.is_empty() {
                 parts.push(("literal", String::from(", ")));
             }
+            let fallback = || match mstyle {
+                MonthStyle::TwoDigit => two(i64::from(midx)),
+                _ => alloc::format!("{midx}"),
+            };
             parts.push((
                 "month",
-                match mstyle {
-                    MonthStyle::TwoDigit => two(cmonth),
-                    _ => alloc::format!("{cmonth}"),
-                },
+                datetime::month_name(&lang, crate_cal, midx, mleap, mstyle)
+                    .unwrap_or_else(fallback),
             ));
             if zh {
                 parts.push(("literal", String::from("月")));
@@ -6163,8 +6394,8 @@ impl<'a> Interp<'a> {
             parts.push((
                 "day",
                 match dstyle {
-                    Numeric2Digit::TwoDigit => two(cday),
-                    _ => alloc::format!("{cday}"),
+                    Numeric2Digit::TwoDigit => two(f.day),
+                    _ => alloc::format!("{}", f.day),
                 },
             ));
             if zh {
@@ -6664,6 +6895,7 @@ impl<'a> Interp<'a> {
         }
         let mut parts = Self::dtf_crate_parts(&locale, &dt, o);
         self.rewrite_calendar_numerics(handle, &dt, o, &mut parts);
+        self.fix_fractional_separator(handle, &locale, &mut parts);
         parts
     }
 
