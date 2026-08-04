@@ -7650,15 +7650,23 @@ fn wtf8_code_point_iter(bytes: &[u8]) -> impl Iterator<Item = (u32, usize, usize
 /// `String.prototype.indexOf` over UTF-16 units: searches the WTF-8 `hay` for
 /// the WTF-8 `needle` starting at UTF-16 unit `from`, returning the unit index
 /// of the match (or `-1`). Mirrors JS: an empty needle matches at `from`.
-fn index_of_units(hay: &[u8], needle: &[u8], from: usize) -> f64 {
-    let start_byte = unit_to_byte(hay, from);
+fn index_of_units(hay: &[u8], needle: &[u8], from: usize, ascii: bool) -> f64 {
+    // For an all-ASCII haystack a unit index *is* a byte index, so both
+    // conversions are the identity. Walking them made `s.indexOf(x, i)` O(i),
+    // and a loop over the string quadratic.
+    let start_byte = if ascii {
+        from.min(hay.len())
+    } else {
+        unit_to_byte(hay, from)
+    };
+    let to_unit = |b: usize| -> usize { if ascii { b } else { byte_to_unit(hay, b) } };
     if needle.is_empty() {
-        return byte_to_unit(hay, start_byte) as f64;
+        return to_unit(start_byte) as f64;
     }
     let mut i = start_byte;
     while i + needle.len() <= hay.len() {
         if &hay[i..i + needle.len()] == needle {
-            return byte_to_unit(hay, i) as f64;
+            return to_unit(i) as f64;
         }
         i += 1;
     }
@@ -7668,14 +7676,19 @@ fn index_of_units(hay: &[u8], needle: &[u8], from: usize) -> f64 {
 /// `String.prototype.lastIndexOf` over UTF-16 units: the last match of `needle`
 /// in `hay` at or before unit `from` (`usize::MAX` for "anywhere"), as a unit
 /// index, or `-1`.
-fn last_index_of_units(hay: &[u8], needle: &[u8], from: usize) -> f64 {
+fn last_index_of_units(hay: &[u8], needle: &[u8], from: usize, ascii: bool) -> f64 {
+    // See `index_of_units`: for an all-ASCII haystack, unit and byte indices
+    // coincide, so neither conversion needs a walk.
     let limit_byte = if from == usize::MAX {
         hay.len()
+    } else if ascii {
+        from.min(hay.len())
     } else {
         unit_to_byte(hay, from)
     };
+    let to_unit = |b: usize| -> usize { if ascii { b } else { byte_to_unit(hay, b) } };
     if needle.is_empty() {
-        return byte_to_unit(hay, limit_byte.min(hay.len())) as f64;
+        return to_unit(limit_byte.min(hay.len())) as f64;
     }
     // A needle longer than the haystack can never match.
     if needle.len() > hay.len() {
@@ -7686,7 +7699,7 @@ fn last_index_of_units(hay: &[u8], needle: &[u8], from: usize) -> f64 {
     let upper = limit_byte.min(max_start);
     for i in (0..=upper).rev() {
         if &hay[i..i + needle.len()] == needle {
-            return byte_to_unit(hay, i) as f64;
+            return to_unit(i) as f64;
         }
     }
     -1.0

@@ -334,6 +334,32 @@ fn byte_offset_of_unit(bytes: &[u8], unit: usize, round_up: bool) -> usize {
 /// `"💩".slice(0, 1)` yields the lone leading surrogate. The astral character's
 /// halves are re-encoded as lone surrogate code points (3 bytes each); non-astral
 /// characters are copied byte-for-byte.
+/// [`slice_utf16`], with the caller's knowledge of whether `bytes` is all-ASCII.
+///
+/// When it is, a UTF-16 unit index *is* a byte index, so the slice is a plain
+/// sub-slice — no length scan and no walk to find each boundary. Without this,
+/// `slice`/`substring`/`substr` were O(n) per call however short the result, so
+/// slicing in a loop was quadratic. `ascii` must be accurate; pass `false` when
+/// unknown (`Rope::is_ascii` computes it in O(1) from memoized lengths).
+#[must_use]
+pub fn slice_utf16_ascii(bytes: &[u8], start_unit: usize, end_unit: usize, ascii: bool) -> Vec<u8> {
+    if !ascii {
+        return slice_utf16(bytes, start_unit, end_unit);
+    }
+    let s = start_unit.min(bytes.len());
+    let e = end_unit.min(bytes.len());
+    if s >= e {
+        return Vec::new();
+    }
+    bytes[s..e].to_vec()
+}
+
+/// Extracts the WTF-8 bytes for the UTF-16 unit range `[start_unit, end_unit)`.
+///
+/// Indices are clamped to `[0, utf16_len]`, and `start > end` yields an empty
+/// slice (mirroring JS `slice`-style clamping). A boundary that falls **inside**
+/// an astral character's surrogate pair splits it, exactly like JavaScript.
+/// Prefer [`slice_utf16_ascii`] when the caller knows the string is ASCII.
 #[must_use]
 pub fn slice_utf16(bytes: &[u8], start_unit: usize, end_unit: usize) -> Vec<u8> {
     let len = utf16_len(bytes);

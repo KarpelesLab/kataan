@@ -2206,6 +2206,10 @@ impl<'a> Interp<'a> {
             // otherwise UTF-8's variable width forces a scan from the start, which
             // is what made `for (i…) s.charCodeAt(i)` quadratic.
             let ascii = rope.is_ascii();
+            // The receiver's UTF-16 length, from the rope's memo. Recomputing it
+            // per method (`wtf8::utf16_len(bytes)`) is a full scan, which left
+            // `slice`/`substring`/`at`/`padStart` O(n) however small the result.
+            let units_len = rope.utf16_len();
             let unit_at = |i: usize| -> Option<u16> {
                 if ascii {
                     bytes.get(i).map(|b| u16::from(*b))
@@ -2287,24 +2291,26 @@ impl<'a> Interp<'a> {
                         ));
                     }
                     let needle = self.arg_string_bytes_fallible(arg(0))?;
-                    let units = crate::wtf8::utf16_len(bytes);
+                    let units = units_len;
                     let pos = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         0
                     } else {
                         (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize).min(units)
                     };
-                    Some(NanBox::boolean(index_of_units(bytes, &needle, pos) >= 0.0))
+                    Some(NanBox::boolean(
+                        index_of_units(bytes, &needle, pos, ascii) >= 0.0,
+                    ))
                 }
                 "indexOf" => {
                     let needle = self.arg_string_bytes_fallible(arg(0))?;
                     // An optional `fromIndex` (UTF-16 unit offset) starts the search.
-                    let units = crate::wtf8::utf16_len(bytes);
+                    let units = units_len;
                     let from = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         0
                     } else {
                         (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize).min(units)
                     };
-                    Some(NanBox::number(index_of_units(bytes, &needle, from)))
+                    Some(NanBox::number(index_of_units(bytes, &needle, from, ascii)))
                 }
                 "repeat" => {
                     // ToIntegerOrInfinity(count) (a Symbol / abrupt valueOf throws).
@@ -2332,7 +2338,7 @@ impl<'a> Interp<'a> {
                         ));
                     }
                     let needle = self.arg_string_bytes_fallible(arg(0))?;
-                    let units = crate::wtf8::utf16_len(bytes);
+                    let units = units_len;
                     let pos = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         0
                     } else {
@@ -2351,7 +2357,7 @@ impl<'a> Interp<'a> {
                         ));
                     }
                     let needle = self.arg_string_bytes_fallible(arg(0))?;
-                    let units = crate::wtf8::utf16_len(bytes);
+                    let units = units_len;
                     // `endPosition` defaults to the full length.
                     let end = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         units
@@ -2366,7 +2372,7 @@ impl<'a> Interp<'a> {
                 "slice" => {
                     // UTF-16-unit range, surrogate-boundary correct. Both indices are
                     // ToIntegerOrInfinity (each runs `valueOf`, propagating throws).
-                    let units = crate::wtf8::utf16_len(bytes);
+                    let units = units_len;
                     let start = self.coerce_to_integer_or_infinity(arg(0))?;
                     let end = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         units as f64
@@ -2383,7 +2389,7 @@ impl<'a> Interp<'a> {
                     let a = idx(start);
                     let b = idx(end);
                     let (a, b) = if a < b { (a, b) } else { (a, a) };
-                    Some(self.new_str_bytes(crate::wtf8::slice_utf16(bytes, a, b)))
+                    Some(self.new_str_bytes(crate::wtf8::slice_utf16_ascii(bytes, a, b, ascii)))
                 }
                 "split" => {
                     // `limit` is ToUint32 (undefined → 2^32-1). A limit of 0 yields
@@ -2426,9 +2432,9 @@ impl<'a> Interp<'a> {
                     let mut parts: Vec<NanBox> = if sep.is_empty() {
                         // Empty separator → one entry per UTF-16 code unit (a lone
                         // surrogate is its own one-unit entry).
-                        let units = crate::wtf8::utf16_len(bytes);
+                        let units = units_len;
                         (0..units)
-                            .map(|i| crate::wtf8::slice_utf16(bytes, i, i + 1))
+                            .map(|i| crate::wtf8::slice_utf16_ascii(bytes, i, i + 1, ascii))
                             .map(|b| self.new_str_bytes(b))
                             .collect()
                     } else {
@@ -2561,7 +2567,7 @@ impl<'a> Interp<'a> {
                 "at" => {
                     let i = self.coerce_to_integer_or_infinity(arg(0))?;
                     // UTF-16-indexed with negative-from-end support.
-                    let units = crate::wtf8::utf16_len(bytes);
+                    let units = units_len;
                     let idx = if i < 0.0 { units as f64 + i } else { i };
                     Some(match as_index(idx).and_then(&unit_at) {
                         Some(u) => self.new_str_bytes(crate::wtf8::from_utf16(&[u])),
@@ -2569,7 +2575,7 @@ impl<'a> Interp<'a> {
                     })
                 }
                 "substring" => {
-                    let len = crate::wtf8::utf16_len(bytes);
+                    let len = units_len;
                     let clamp = |n: f64| (n.max(0.0) as usize).min(len);
                     let mut a = clamp(self.coerce_to_integer_or_infinity(arg(0))?);
                     let mut b = if matches!(arg(1).unpack(), Unpacked::Undefined) {
@@ -2580,10 +2586,10 @@ impl<'a> Interp<'a> {
                     if a > b {
                         core::mem::swap(&mut a, &mut b);
                     }
-                    Some(self.new_str_bytes(crate::wtf8::slice_utf16(bytes, a, b)))
+                    Some(self.new_str_bytes(crate::wtf8::slice_utf16_ascii(bytes, a, b, ascii)))
                 }
                 "substr" => {
-                    let len = crate::wtf8::utf16_len(bytes);
+                    let len = units_len;
                     let lenf = len as f64;
                     let start = self.coerce_to_integer_or_infinity(arg(0))?;
                     let start = if start < 0.0 {
@@ -2597,7 +2603,12 @@ impl<'a> Interp<'a> {
                         (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize)
                             .min(len - start)
                     };
-                    Some(self.new_str_bytes(crate::wtf8::slice_utf16(bytes, start, start + count)))
+                    Some(self.new_str_bytes(crate::wtf8::slice_utf16_ascii(
+                        bytes,
+                        start,
+                        start + count,
+                        ascii,
+                    )))
                 }
                 "trimStart" => {
                     let s = crate::wtf8::to_string_lossy(bytes);
@@ -2728,7 +2739,9 @@ impl<'a> Interp<'a> {
                     } else {
                         n.max(0.0).min(usize::MAX as f64) as usize
                     };
-                    Some(NanBox::number(last_index_of_units(bytes, &needle, from)))
+                    Some(NanBox::number(last_index_of_units(
+                        bytes, &needle, from, ascii,
+                    )))
                 }
                 // `concat` appends each argument's string form (WTF-8 bytes, so a
                 // surrogate-bearing receiver or argument concatenates losslessly).
