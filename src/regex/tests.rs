@@ -912,3 +912,36 @@ fn emoji_property_of_strings_tables() {
     assert!(Regex::new(r"\P{RGI_Emoji}", "v").is_err());
     assert!(Regex::new(r"\p{RGI_Emoji}", "u").is_err());
 }
+
+/// The class-led start filter may only skip offsets that genuinely cannot
+/// begin a match. A wrong filter here fails *silently* — a skipped offset is
+/// indistinguishable from "no match" — so pin the exact spans, including the
+/// cases most likely to be mishandled: Latin-1 and astral class members, `i`
+/// folding (which lives in the matcher predicate the filter is built from),
+/// alternation branches, and a leading zero-width assertion.
+#[test]
+fn class_start_filter_finds_the_same_matches() {
+    for (pat, flags, subject, want) in [
+        (r"\s+", "", "word word", Some((4, 5))),
+        (r"\s+", "", "word\u{2028}x", Some((4, 5))),
+        (r"[0-9]+", "", "abc123def", Some((3, 6))),
+        (r"[a-c]x", "", "zzdx zzbx", Some((7, 9))),
+        (r"[0-9]+", "", "no digits here", None),
+        // Latin-1 and astral members must survive a 256-unit map.
+        (r"[\u{e9}]", "", "abc\u{e9}d", Some((3, 4))),
+        (r"[\u{2603}]", "", "ab\u{2603}c", Some((2, 3))),
+        (r"[\u{1F600}]", "u", "aa\u{1F600}b", Some((2, 3))),
+        // Under `i` the fold is inside the predicate the filter is built from.
+        (r"[a-c]+", "i", "ZZABCzz", Some((2, 5))),
+        // Alternations union their branches' first units.
+        (r"(?:[0-9]|[A-F])z", "", "qz 7z", Some((3, 5))),
+        // A leading assertion is zero-width: the filter applies to what follows.
+        (r"\b[0-9]+", "", "ab 12 cd", Some((3, 5))),
+        // `.` accepts nearly everything, so no filter should be installed.
+        (r".x", "", "aax", Some((1, 3))),
+    ] {
+        let r = re(pat, flags);
+        let chars: alloc::vec::Vec<char> = subject.chars().collect();
+        assert_eq!(r.find_in(&chars, 0), want, "/{pat}/{flags} on {subject:?}");
+    }
+}

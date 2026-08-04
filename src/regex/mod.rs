@@ -92,6 +92,10 @@ pub struct Regex {
     /// A scan can then skip straight to the next occurrence instead of running
     /// the matcher at every offset. See [`program_first_unit`].
     first_unit: Option<u16>,
+    /// The Latin-1 code units that can begin a match, when no *single* unit is
+    /// required — the class-led case (`/\s+/`, `/[0-9]+/`) that `first_unit`
+    /// cannot express. See [`program_start_set`].
+    start_set: Option<StartSet>,
     /// Number of capturing groups (excluding the whole-match group 0).
     group_count: usize,
     /// `(group index, name)` pairs for named capture groups (`(?<name>…)`).
@@ -208,9 +212,17 @@ impl Regex {
         // path, so this is the only compile that runs for real callers.
         let (ast, _, group_names) = parser::parse(pattern, flags.unicode, flags.unicode_sets)?;
         let (prog, group_count) = compile::compile(&ast, &group_names, flags.unicode)?;
+        let first_unit = program_first_unit(&prog);
         Ok(Regex {
             anchored: program_is_anchored(&prog),
-            first_unit: program_first_unit(&prog),
+            // The single-unit filter is a specialized equality scan, so it stays
+            // the fast path; the set only covers what it cannot express.
+            start_set: if first_unit.is_some() {
+                None
+            } else {
+                program_start_set(&prog, flags)
+            },
+            first_unit,
             prog,
             scalar_prog: core::cell::OnceCell::new(),
             source: alloc::string::String::from(pattern),
@@ -426,6 +438,17 @@ impl Regex {
                     s += 1;
                     continue;
                 }
+            } else if let Some(set) = &self.start_set {
+                // No single required unit, but a known set of possible ones (a
+                // class-led pattern): skip offsets the set rules out.
+                s += units[s..].iter().position(|&u| set.allows(u))?;
+                if s > last {
+                    return None;
+                }
+                if flags.unicode && !is_char_boundary(units, s) {
+                    s += 1;
+                    continue;
+                }
             }
             if let Some(groups) = vm::run_with(
                 &mut scratch,
@@ -569,6 +592,88 @@ fn program_is_anchored(prog: &[vm::Inst]) -> bool {
 ///
 /// The result holds only when `i` is off — the caller checks that, since under
 /// case folding the literal stands for a class rather than one unit.
+/// The set of Latin-1 code units that can begin a match.
+///
+/// `first_unit` only fires when *one* literal is required, so a class-led
+/// pattern (`/\s+/`) filtered nothing and started the matcher at every offset —
+/// which is what made `"word ".repeat(120_000).split(/\s+/)` ~95× slower than
+/// node. This covers the class case with a 256-bit map.
+///
+/// Only units below 256 are represented. A code unit at or above 256 may be a
+/// lone surrogate, or the lead of a pair standing for an astral code point, so
+/// deciding it would mean reasoning about the decode as well as the class;
+/// those units are conservatively always allowed. That costs nothing on the
+/// ASCII-dominated subjects this exists to speed up, and keeps the filter a
+/// pure subset of what the matcher accepts.
+struct StartSet {
+    /// Bit `u` set iff code unit `u` can begin a match.
+    latin1: [u64; 4],
+}
+
+impl StartSet {
+    fn allows(&self, unit: u16) -> bool {
+        // Units >= 256 are not represented and are always candidates.
+        unit >= 256 || self.latin1[usize::from(unit >> 6)] & (1u64 << (unit & 63)) != 0
+    }
+}
+
+/// Builds the [`StartSet`] for a program, or `None` when no useful filter
+/// exists (a reachable `Match`, a backreference, or a first instruction that
+/// accepts every Latin-1 unit anyway).
+///
+/// Walks the same CFG as [`program_first_unit`], but instead of demanding one
+/// shared literal it unions the accepted units of every first-consuming
+/// instruction on any path. Membership comes from
+/// [`vm::single_consume_matches`] — the matcher's own predicate — so the filter
+/// cannot disagree with it and skip an offset that would have matched. That
+/// also means `i` needs no special case here: the folding is inside the
+/// predicate, unlike the raw equality `first_unit` does.
+fn program_start_set(prog: &[vm::Inst], flags: Flags) -> Option<StartSet> {
+    use vm::Inst;
+    let mut set = StartSet { latin1: [0; 4] };
+    let mut seen = alloc::vec![false; prog.len()];
+    let mut stack = alloc::vec![0usize];
+    while let Some(pc) = stack.pop() {
+        let inst = prog.get(pc)?;
+        if core::mem::replace(&mut seen[pc], true) {
+            continue;
+        }
+        match inst {
+            Inst::Char(_) | Inst::Any | Inst::Class(_) | Inst::ClassSet { .. } => {
+                for u in 0u32..256 {
+                    if vm::single_consume_matches(inst, u, flags) {
+                        set.latin1[(u >> 6) as usize] |= 1u64 << (u & 63);
+                    }
+                }
+            }
+            Inst::Jmp(t) => stack.push(*t),
+            Inst::Split(a, b) => {
+                stack.push(*a);
+                stack.push(*b);
+            }
+            // Zero-width: whatever a match must start with is still ahead.
+            Inst::Save(_)
+            | Inst::ClearCaptures { .. }
+            | Inst::Mark
+            | Inst::EmptyFail
+            | Inst::Assert(_)
+            | Inst::Look { .. }
+            | Inst::LookBehind { .. } => stack.push(pc + 1),
+            // Never matches: contributes no path.
+            Inst::Fail => {}
+            // A reachable `Match` means the empty string matches anywhere, and a
+            // backreference's text is not known until run time.
+            _ => return None,
+        }
+    }
+    // The filter costs a bitmap test per offset, so it only pays if it rejects
+    // a worthwhile share of them. A `.`-led pattern accepts all but the line
+    // terminators — technically a filter, practically pure overhead. Require it
+    // to rule out at least a quarter of the Latin-1 range.
+    let accepted: u32 = set.latin1.iter().map(|w| w.count_ones()).sum();
+    (accepted <= 192).then_some(set)
+}
+
 fn program_first_unit(prog: &[vm::Inst]) -> Option<u16> {
     use vm::Inst;
     let mut seen = alloc::vec![false; prog.len()];

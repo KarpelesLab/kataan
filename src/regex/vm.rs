@@ -760,14 +760,23 @@ fn consume_one(
     reverse: bool,
 ) -> Option<usize> {
     let (cp, nsp) = read_dir(input, sp, flags.unicode, reverse)?;
-    let ok = match inst {
+    single_consume_matches(inst, cp, flags).then_some(nsp)
+}
+
+/// Whether a single-consume `inst` accepts code point `cp` under `flags`.
+///
+/// Split out of [`consume_one`] so the start-of-match filter
+/// (`Regex::start_set`) can be built from the *same* predicate the matcher
+/// applies, rather than a parallel reimplementation that could disagree and
+/// skip an offset that would have matched.
+pub(crate) fn single_consume_matches(inst: &Inst, cp: u32, flags: Flags) -> bool {
+    match inst {
         Inst::Char(c) => cp_eq(cp, *c, flags),
         Inst::Any => flags.dotall || !is_line_term(cp),
         Inst::Class(class) => class_matches(class, cp, flags),
         Inst::ClassSet { neg, matcher } => matcher.matches(cp, flags) ^ *neg,
         _ => false,
-    };
-    ok.then_some(nsp)
+    }
 }
 
 /// Matches a backreference to the captured span `[s, e)` at position `sp` in the
