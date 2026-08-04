@@ -3944,9 +3944,9 @@ impl<'a> Interp<'a> {
         Ok((inst, x, y))
     }
 
-    /// `Intl.NumberFormat/DateTimeFormat.prototype.formatRange(x, y)`: formats each
-    /// endpoint and joins them with an en-dash range separator (a basic
-    /// `FormatNumericRange`; `x === y` collapses to the single formatted value).
+    /// `Intl.NumberFormat/DateTimeFormat.prototype.formatRange(x, y)`
+    /// (`FormatNumericRange` / `FormatDateTimeRange`): the flat string is the
+    /// concatenation of the tagged range parts.
     pub(crate) fn intl_format_range(
         &mut self,
         this: NanBox,
@@ -3968,12 +3968,8 @@ impl<'a> Interp<'a> {
             return Ok(parts.iter().map(|(_, v, _)| v.as_str()).collect());
         }
         let (inst, x, y) = self.intl_range_operands(this, start, end)?;
-        let fx = self.intl_format_value(inst, NanBox::number(x));
-        if x == y {
-            return Ok(fx);
-        }
-        let fy = self.intl_format_value(inst, NanBox::number(y));
-        Ok(alloc::format!("{fx}\u{2013}{fy}"))
+        let parts = self.nf_range_parts(inst, start, end, x, y);
+        Ok(parts.iter().map(|(_, v, _)| v.as_str()).collect())
     }
 
     /// Whether the `\0intl`-branded instance `inst` is an `Intl.DateTimeFormat`.
@@ -4010,17 +4006,194 @@ impl<'a> Interp<'a> {
             let tagged = self.dtf_range_dispatch(inst, start, end)?;
             return Ok(self.intl_build_source_parts(tagged));
         }
-        // `Intl.NumberFormat`: format each endpoint as a single value joined by a
-        // shared range separator (`x === y` collapses to the lone start value).
         let (inst, x, y) = self.intl_range_operands(this, start, end)?;
+        let parts = self.nf_range_parts(inst, start, end, x, y);
+        Ok(self.intl_build_source_parts(parts))
+    }
+
+    /// The tagged `(type, value, source)` parts of an `Intl.NumberFormat` range —
+    /// `PartitionNumberRangePattern` — shared by `formatRange` (concatenated) and
+    /// `formatRangeToParts`.
+    ///
+    /// The rendering is the `intl` crate's `format_range_to_parts`: the locale's
+    /// CLDR `miscPatterns` `range` form, the `approximately` form when both ends
+    /// render alike (every part `shared`), and ICU's `AUTO`-level collapsing of the
+    /// affixes the two ends have in common (`"+$2.90–3.10"`, but `"$3 – $5"`).
+    /// `start`/`end` are the *original* operands, needed for the exact-decimal path;
+    /// `x`/`y` are their `f64` coercions.
+    #[cfg(feature = "intl")]
+    fn nf_range_parts(
+        &mut self,
+        inst: Handle,
+        start: NanBox,
+        end: NanBox,
+        x: f64,
+        y: f64,
+    ) -> Vec<(&'static str, String, &'static str)> {
+        // ECMA-402 `ToIntlMathematicalValue` keeps a high-precision string / BigInt
+        // endpoint exact; the crate takes `f64`s, which would round both ends of
+        // `"987654321987654321"`–`"987654321987654322"` to the same value (and so
+        // collapse the range to the `approximately` form).
+        if let Some(p) = self.nf_range_exact_parts(inst, start, end, x, y) {
+            return p;
+        }
+        let locale = self
+            .realm
+            .get_property(inst, "\u{0}locale")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("en"));
+        let base = self.number_format_options(inst);
+        // Pre-round each endpoint to the ECMA-402 / ICU decimal exactly as the
+        // `format` path does. `number_precision_round` also swaps in `halfExpand`
+        // for a value it pre-rounded (so the crate won't re-round the f64 noise),
+        // hence a private copy of the options per endpoint plus a merge.
+        let mut ox = base;
+        let rx = self.number_precision_round(inst, &mut ox, x);
+        let mut oy = base;
+        let ry = self.number_precision_round(inst, &mut oy, y);
+        let mut opts = base;
+        opts.rounding_mode = if ox.rounding_mode != base.rounding_mode {
+            ox.rounding_mode
+        } else {
+            oy.rounding_mode
+        };
+        // `intl` panics formatting a true negative zero; the smallest negative
+        // subnormal renders as a signed displayed zero (see the `format` path).
+        let feed = |n: f64| {
+            if n == 0.0 && n.is_sign_negative() {
+                -f64::from_bits(1)
+            } else {
+                n
+            }
+        };
+        let mut parts: Vec<(&'static str, String, &'static str)> =
+            intl::number::format_range_to_parts(&locale, feed(rx), feed(ry), &opts)
+                .into_iter()
+                .map(|p| (p.kind.as_str(), p.value, p.source.as_str()))
+                .collect();
+        self.apply_numbering_digits_to_parts(inst, &mut parts);
+        parts
+    }
+
+    /// Rewrites each part's ASCII digits into the formatter's resolved numbering
+    /// system (see [`apply_numbering_digits`](Self::apply_numbering_digits)).
+    #[cfg(feature = "intl")]
+    fn apply_numbering_digits_to_parts(
+        &mut self,
+        inst: Handle,
+        parts: &mut [(&'static str, String, &'static str)],
+    ) {
+        let nu = self
+            .realm
+            .get_property(inst, "numberingSystem")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_default();
+        if !numbering_system_digit_base(&nu).is_some_and(|b| b != 0x0030) && nu != "hanidec" {
+            return;
+        }
+        for (_, v, _) in parts.iter_mut() {
+            if v.chars().any(|c| c.is_ascii_digit()) {
+                *v = substitute_numbering_digits(&nu, core::mem::take(v));
+            }
+        }
+    }
+
+    /// The range parts when at least one endpoint is a high-precision string /
+    /// BigInt that `format`'s exact-decimal path renders (see
+    /// [`try_exact_decimal_format`](Self::try_exact_decimal_format)); `None` when
+    /// neither endpoint needs it, so the caller uses the crate's `f64` range.
+    ///
+    /// The endpoints are rendered exactly, and the crate is consulted only for the
+    /// glue: the `range` / `approximately` pattern's prefix, infix and suffix at
+    /// this option set, recovered by formatting a probe pair through the very same
+    /// code path and splitting the range rendering around the two endpoint
+    /// renderings. (The exact path is reached only for standard-notation decimal
+    /// style, which carries no unit/currency modifier, so the range is exactly
+    /// `prefix + start + infix + end + suffix`.) Like `formatToParts`, the exact
+    /// renderer produces a flat string rather than tagged digit runs, so each
+    /// endpoint contributes a single `literal` part.
+    #[cfg(feature = "intl")]
+    fn nf_range_exact_parts(
+        &mut self,
+        inst: Handle,
+        start: NanBox,
+        end: NanBox,
+        x: f64,
+        y: f64,
+    ) -> Option<Vec<(&'static str, String, &'static str)>> {
+        let exact_start = self.try_exact_decimal_format(inst, start);
+        let exact_end = self.try_exact_decimal_format(inst, end);
+        if exact_start.is_none() && exact_end.is_none() {
+            return None;
+        }
+        let a = match exact_start {
+            Some(s) => s,
+            None => self.intl_format_value(inst, NanBox::number(x)),
+        };
+        let b = match exact_end {
+            Some(s) => s,
+            None => self.intl_format_value(inst, NanBox::number(y)),
+        };
+        let locale = self
+            .realm
+            .get_property(inst, "\u{0}locale")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("en"));
+        let opts = self.number_format_options(inst);
+        // The probe keeps each end's sign (which is a modifier, so it drives the
+        // separator's spacing heuristic) but is otherwise a trivially distinct pair.
+        let px = if x.is_sign_negative() { -1.0 } else { 1.0 };
+        let py = if y.is_sign_negative() { -2.0 } else { 2.0 };
+        let mut out: Vec<(&'static str, String, &'static str)> = Vec::new();
+        let lit = |text: &str, out: &mut Vec<(&'static str, String, &'static str)>| {
+            if !text.is_empty() {
+                out.push(("literal", String::from(text), "shared"));
+            }
+        };
+        if a == b {
+            // Both ends render alike: the locale's `approximately` form, all shared.
+            let one = intl::number::format(&locale, px, &opts);
+            let approx = intl::number::format_range(&locale, px, px, &opts);
+            let (pre, post) = approx.split_once(one.as_str())?;
+            lit(pre, &mut out);
+            out.push(("literal", a, "shared"));
+            lit(post, &mut out);
+            return Some(out);
+        }
+        let fx = intl::number::format(&locale, px, &opts);
+        let fy = intl::number::format(&locale, py, &opts);
+        let range = intl::number::format_range(&locale, px, py, &opts);
+        let (pre, rest) = range.split_once(fx.as_str())?;
+        let (sep, post) = rest.rsplit_once(fy.as_str())?;
+        lit(pre, &mut out);
+        out.push(("literal", a, "startRange"));
+        lit(sep, &mut out);
+        out.push(("literal", b, "endRange"));
+        lit(post, &mut out);
+        Some(out)
+    }
+
+    /// The tagged `(type, value, source)` parts of an `Intl.NumberFormat` range
+    /// without the `intl` crate: each endpoint's hand-rolled rendering, joined by an
+    /// en-dash (`x === y` collapses to the lone value).
+    #[cfg(not(feature = "intl"))]
+    fn nf_range_parts(
+        &mut self,
+        inst: Handle,
+        _start: NanBox,
+        _end: NanBox,
+        x: f64,
+        y: f64,
+    ) -> Vec<(&'static str, String, &'static str)> {
         let fx = self.intl_format_value(inst, NanBox::number(x));
-        let mut parts: Vec<(&str, String, &str)> = alloc::vec![("literal", fx, "startRange")];
+        let mut parts: Vec<(&'static str, String, &'static str)> =
+            alloc::vec![("literal", fx, "startRange")];
         if x != y {
             let fy = self.intl_format_value(inst, NanBox::number(y));
             parts.push(("literal", String::from("\u{2013}"), "shared"));
             parts.push(("literal", fy, "endRange"));
         }
-        Ok(self.intl_build_source_parts(parts))
+        parts
     }
 
     /// Resolves and validates a `DateTimeFormat` range's two endpoints, returning

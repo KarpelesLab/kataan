@@ -8956,15 +8956,33 @@ fn intl_number_format_signdisplay_negative_zero() {
 
 #[test]
 fn intl_number_format_range() {
-    // formatRange formats each endpoint and joins with an en-dash; x===y collapses.
+    // formatRange splices both endpoints into the locale's CLDR `range` pattern;
+    // two ends that render alike collapse to the `approximately` form instead.
     assert_eq!(
         run("new Intl.NumberFormat('en-US').formatRange(3,5)"),
         "3\u{2013}5"
     );
-    assert_eq!(run("new Intl.NumberFormat('en-US').formatRange(5,5)"), "5");
+    assert_eq!(run("new Intl.NumberFormat('en-US').formatRange(5,5)"), "~5");
+    // The `$` affix is one code point, so ICU's AUTO collapse repeats it on both
+    // ends and pads the separator.
     assert_eq!(
         run("new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).formatRange(3,5)"),
-        "$3.00\u{2013}$5.00"
+        "$3.00 \u{2013} $5.00"
+    );
+    // A longer shared affix is factored out instead: "+$2.90–3.10".
+    assert_eq!(
+        run(
+            "new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',signDisplay:'always'}).formatRange(2.9,3.1)"
+        ),
+        "+$2.90\u{2013}3.10"
+    );
+    // ToIntlMathematicalValue keeps a high-precision string endpoint exact (the
+    // two values below are the same f64, so an f64 range would collapse them).
+    assert_eq!(
+        run(
+            "new Intl.NumberFormat('en-US').formatRange('987654321987654321','987654321987654322')"
+        ),
+        "987,654,321,987,654,321\u{2013}987,654,321,987,654,322"
     );
     // Both arguments are required and finite.
     assert_eq!(
@@ -8993,6 +9011,20 @@ fn intl_number_format_range() {
     assert_eq!(
         run("new Intl.NumberFormat('en').formatRangeToParts(3,5).map(x=>x.source).join('|')"),
         "startRange|shared|endRange"
+    );
+    // …over *field-level* number parts, not one opaque literal per endpoint.
+    assert_eq!(
+        run(
+            "new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:0}).formatRangeToParts(3,5).map(x=>x.type+':'+x.value+':'+x.source).join('|')"
+        ),
+        "currency:$:startRange|integer:3:startRange|literal: \u{2013} :shared|currency:$:endRange|integer:5:endRange"
+    );
+    // Two ends that render alike collapse to the all-shared `approximately` form.
+    assert_eq!(
+        run(
+            "new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:0}).formatRangeToParts(2.999,3.001).map(x=>x.type+':'+x.value+':'+x.source).join('|')"
+        ),
+        "approximatelySign:~:shared|currency:$:shared|integer:3:shared"
     );
 }
 
