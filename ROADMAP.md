@@ -454,7 +454,7 @@ escape), and `Cell::RegExp.source` is `Box<[u8]>` — with the bytecode and
 snapshot encoders carrying it as a length-prefixed blob. `eval`, direct eval and
 the `Function` constructor all hand the parser the JS string's bytes.
 
-Three `&str` boundaries remain, none of them ledgered:
+Two `&str` boundaries remain, neither ledgered:
 
 - The regex engine parses `&str`, so a lone surrogate in a *pattern* compiles
   (and therefore matches) as U+FFFD. `.source` still reports the exact bytes;
@@ -462,13 +462,15 @@ Three `&str` boundaries remain, none of them ledgered:
 - `Program.source` — retained only for `Function.prototype.toString` reslicing —
   is the lossy rendering, so `fn.toString()` of a surrogate-bearing body shows
   U+FFFD. It is byte-length preserving, so every span stays aligned.
-- `RegExp.prototype[@@replace]` still round-trips the matched text and each
-  capture through a `String`: `"𠮷".replace(/./g, m => m)` yields `"��"`
-  where the spec (and every other engine) reproduces the input, because a
-  non-`u` `.` matches one code unit. `regexp_symbol_replace` and
-  `get_substitution` in `src/nbexec/regexp.rs` are `String`/`char`-based
-  throughout — the same conversion the `@@match` loop just had, but on the
-  hottest string builtin, so it wants its own change and its own corpus run.
+`RegExp.prototype[@@replace]` was the third and is now fixed (`f3e001eb`): the
+matched text, the captures, the replacer's result and all of `get_substitution`
+carry WTF-8. It needed one thing the others did not — canonical *concatenation*.
+Reassembling a result from per-match fragments can join a trailing high surrogate
+to a leading low one, and the two halves must recombine into the 4-byte astral
+form or the result is a different byte sequence for the same UTF-16 units:
+unequal on comparison, two code points instead of one, not well-formed.
+`Rope::concat` already did this; it is now `wtf8::append`, and **any** code that
+assembles a string from fragments should use it rather than `extend_from_slice`.
 
 ### 3.12 `Array.fromAsync` as a suspendable frame — **landed**
 
