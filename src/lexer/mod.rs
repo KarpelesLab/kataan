@@ -112,6 +112,18 @@ pub struct Lexer<'src> {
     /// Whether the tokens seen so far end in `for` or `for await`, so the next
     /// `(` opens a `for` head.
     pending_for: bool,
+    /// The `paren_depth` of each currently-open `if (`/`for (`/`while (`/`with (`
+    /// head. Such a `)` is followed by a *statement*, so a `/` after it starts a
+    /// regex — unlike the `)` of a call or a parenthesized expression, which
+    /// leaves a value and makes `/` division.
+    stmt_head_parens: Vec<u32>,
+    /// Whether the tokens seen so far end in a keyword whose `(` opens one of
+    /// those statement heads.
+    pending_stmt_head: bool,
+    /// Whether the `)` just emitted closed a statement head (see
+    /// [`Lexer::stmt_head_parens`]). Consulted by [`Lexer::regex_allowed`], in
+    /// the same way `last_rbrace_closed_block` disambiguates `}`.
+    last_rparen_closed_head: bool,
     /// Set while scanning an identifier (or private name) that contained a
     /// `\u` escape; consumed and cleared by [`Lexer::make`].
     cur_had_escape: bool,
@@ -151,6 +163,9 @@ impl<'src> Lexer<'src> {
             paren_depth: 0,
             for_head_parens: Vec::new(),
             pending_for: false,
+            stmt_head_parens: Vec::new(),
+            pending_stmt_head: false,
+            last_rparen_closed_head: false,
             cur_had_escape: false,
             module,
         }
@@ -232,12 +247,22 @@ impl<'src> Lexer<'src> {
                 if self.pending_for {
                     self.for_head_parens.push(self.paren_depth);
                 }
+                if self.pending_stmt_head {
+                    self.stmt_head_parens.push(self.paren_depth);
+                }
                 self.single(TokenKind::LParen)
             }
             b')' => {
                 if self.for_head_parens.last() == Some(&self.paren_depth) {
                     self.for_head_parens.pop();
                 }
+                self.last_rparen_closed_head =
+                    if self.stmt_head_parens.last() == Some(&self.paren_depth) {
+                        self.stmt_head_parens.pop();
+                        true
+                    } else {
+                        false
+                    };
                 self.paren_depth = self.paren_depth.saturating_sub(1);
                 self.single(TokenKind::RParen)
             }
@@ -1385,10 +1410,15 @@ impl<'src> Lexer<'src> {
                 | TokenKind::Regex
                 | TokenKind::NoSubstitutionTemplate
                 | TokenKind::TemplateTail
-                | TokenKind::RParen
                 | TokenKind::RBracket
                 | TokenKind::PlusPlus
                 | TokenKind::MinusMinus => false,
+                // A `)` is ambiguous the same way `}` is: closing an `if`/`for`/
+                // `while`/`with` head puts the cursor at the start of that
+                // statement's body (regex position), while closing a call or a
+                // parenthesized expression leaves a value (division). Without
+                // this, `if (x) /re/.test(s)` failed to parse.
+                TokenKind::RParen => self.last_rparen_closed_head,
                 // A `}` is ambiguous: closing a statement block puts the cursor
                 // at the start of a new statement (regex position), while closing
                 // an object literal leaves a value (division). The brace stack
@@ -1503,12 +1533,24 @@ impl<'src> Lexer<'src> {
             // `for` (optionally followed by `await`) arms the next `(` as a
             // for-head. A `for` in member position (`a.for(…)`) is a property
             // name, not the statement keyword.
+            let after_dot = matches!(
+                self.prev_significant,
+                Some(TokenKind::Dot | TokenKind::QuestionDot)
+            );
             self.pending_for = match kind {
-                TokenKind::Keyword(Keyword::For) => !matches!(
-                    self.prev_significant,
-                    Some(TokenKind::Dot | TokenKind::QuestionDot)
-                ),
+                TokenKind::Keyword(Keyword::For) => !after_dot,
                 TokenKind::Keyword(Keyword::Await) => self.pending_for,
+                _ => false,
+            };
+            // `if`/`for`/`while`/`with` arm the next `(` as a statement head, so
+            // its `)` is followed by a statement rather than by an operator. In
+            // member position (`a.while(…)`) these are property names, not
+            // keywords, and the `)` closes an ordinary call.
+            self.pending_stmt_head = match kind {
+                TokenKind::Keyword(Keyword::If | Keyword::For | Keyword::While | Keyword::With) => {
+                    !after_dot
+                }
+                TokenKind::Keyword(Keyword::Await) => self.pending_stmt_head,
                 _ => false,
             };
             self.prev_significant = Some(kind);

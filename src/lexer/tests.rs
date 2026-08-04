@@ -194,6 +194,38 @@ fn regex_vs_division() {
     );
 }
 
+/// The `)` closing an `if`/`for`/`while`/`with` head is followed by that
+/// statement's body, so a `/` there starts a regex — unlike the `)` of a call or
+/// a parenthesized expression, which leaves a value. Both readings of `)` have
+/// to keep working; treating every `)` as a value made `if (x) /re/.test(s)` a
+/// syntax error.
+#[test]
+fn regex_after_statement_head_paren() {
+    use TokenKind::*;
+    for src in [
+        "if (a) /x/.test(s)",
+        "for (;;) /x/.test(s)",
+        "for (const v of l) /x/.test(s)",
+        "while (a) /x/.test(s)",
+        "with (a) /x/.test(s)",
+        "do {} while (a) /x/.test(s)",
+    ] {
+        assert!(
+            kinds(src).contains(&Regex),
+            "expected a regex literal in {src:?}"
+        );
+    }
+    // …and a `)` that closes a value still divides.
+    for src in ["f(a) / b", "(a) / b", "a[0] / b", "(a + b) / c"] {
+        assert!(
+            kinds(src).contains(&Slash) && !kinds(src).contains(&Regex),
+            "expected division in {src:?}"
+        );
+    }
+    // A property named like a statement keyword is a call, not a head.
+    assert!(!kinds("a.while(b) / c").contains(&Regex));
+}
+
 #[test]
 fn comments_are_trivia() {
     use TokenKind::*;
