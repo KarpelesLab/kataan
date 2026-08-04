@@ -928,7 +928,7 @@ impl<'a> Interp<'a> {
         // `RegExpExec` so a surrogate-bearing subject matches and slices correctly.
         let s_bytes = self.coerce_to_string_bytes(string)?;
         let str_v = self.new_str_bytes(s_bytes.clone());
-        let s = crate::wtf8::to_string_lossy(&s_bytes);
+
         let flags_v = self.read_member(h, "flags")?;
         let flags = self.coerce_to_string(flags_v)?;
         let global = flags.contains('g');
@@ -939,6 +939,14 @@ impl<'a> Interp<'a> {
         // Reset lastIndex to 0 (`Set(rx, "lastIndex", 0, true)`); the receiver is
         // generic, so the property is created/written via the throwing `[[Set]]`.
         self.set_prop_throwing(h, "lastIndex", NanBox::number(0.0))?;
+        // Transcoded once, not per iteration: for a pattern that matches empty
+        // (`/\s*/g`) the advance below runs at *every* position, so doing it in
+        // the loop makes the whole match quadratic in the subject.
+        let units: Vec<u16> = if unicode {
+            crate::wtf8::utf16_units(&s_bytes).collect()
+        } else {
+            Vec::new()
+        };
         let mut results: Vec<NanBox> = Vec::new();
         loop {
             let result = self.regexp_exec(rx, str_v)?;
@@ -960,7 +968,7 @@ impl<'a> Interp<'a> {
                 // Advance lastIndex to avoid an infinite loop.
                 let li_v = self.read_member(h, "lastIndex")?;
                 let li = self.last_index_to_length(li_v)?;
-                let next = self.advance_string_index(&s, li, unicode);
+                let next = self.advance_string_index(&units, li, unicode);
                 self.set_prop_throwing(h, "lastIndex", NanBox::number(next as f64))?;
             }
         }
@@ -1054,9 +1062,11 @@ impl<'a> Interp<'a> {
             {
                 let cli_v = self.read_member(matcher, "lastIndex")?;
                 let cli = self.coerce_to_integer_or_infinity(cli_v)?.max(0.0) as usize;
-                let s_bytes = self.coerce_to_string_bytes(str_v)?;
-                let s = crate::wtf8::to_string_lossy(&s_bytes);
-                let next = self.advance_string_index(&s, cli, unicode);
+                // This runs inside the iterator's `next`, once per step, so the
+                // transcode has to come from the memo — collecting it here made
+                // `[...s.matchAll(/\s*/ug)]` quadratic in the subject.
+                let (_, units) = self.subject_units_cached(str_v)?;
+                let next = self.advance_string_index(&units, cli, unicode);
                 self.set_prop_throwing(matcher, "lastIndex", NanBox::number(next as f64))?;
             }
         }
@@ -1065,12 +1075,11 @@ impl<'a> Interp<'a> {
 
     /// `AdvanceStringIndex(S, index, unicode)` over the `&str` subject. Returns the
     /// next code-unit index, stepping a whole surrogate pair under `unicode`.
-    fn advance_string_index(&self, s: &str, index: usize, unicode: bool) -> usize {
+    fn advance_string_index(&self, units: &[u16], index: usize, unicode: bool) -> usize {
         if !unicode {
             return index + 1;
         }
-        let units: Vec<u16> = s.encode_utf16().collect();
-        advance_index_u16(&units, index, true)
+        advance_index_u16(units, index, true)
     }
 
     /// SameValue for two NanBoxes (used by the lastIndex save/restore dance).
@@ -1091,7 +1100,7 @@ impl<'a> Interp<'a> {
         let h = rx.as_handle().map(Handle::from_raw).unwrap();
         let s_bytes = self.coerce_to_string_bytes(string)?;
         let units: Vec<u16> = crate::wtf8::utf16_units(&s_bytes).collect();
-        let s = crate::wtf8::to_string_lossy(&s_bytes);
+
         let str_v = self.new_str_bytes(s_bytes);
         // SpeciesConstructor(rx, %RegExp%) — read *before* `flags` per spec order.
         let ctor = self.regex_species_constructor(h)?;
@@ -1153,13 +1162,13 @@ impl<'a> Interp<'a> {
             self.set_prop_throwing(splitter, "lastIndex", NanBox::number(q as f64))?;
             let z = self.regexp_exec(splitter_v, str_v)?;
             if matches!(z.unpack(), Unpacked::Null) {
-                q = self.advance_string_index(&s, q, unicode);
+                q = self.advance_string_index(&units, q, unicode);
                 continue;
             }
             let li_v = self.read_member(splitter, "lastIndex")?;
             let e = (self.coerce_to_integer_or_infinity(li_v)?.max(0.0) as usize).min(size);
             if e == p {
-                q = self.advance_string_index(&s, q, unicode);
+                q = self.advance_string_index(&units, q, unicode);
                 continue;
             }
             // Push S[p..q].
@@ -1200,7 +1209,7 @@ impl<'a> Interp<'a> {
         let h = rx.as_handle().map(Handle::from_raw).unwrap();
         let s_bytes = self.coerce_to_string_bytes(string)?;
         let units: Vec<u16> = crate::wtf8::utf16_units(&s_bytes).collect();
-        let s = crate::wtf8::to_string_lossy(&s_bytes);
+
         // The lossless subject string value passed to every `RegExpExec`.
         let str_v = self.new_str_bytes(s_bytes);
         let length = units.len();
@@ -1239,7 +1248,7 @@ impl<'a> Interp<'a> {
             if m_str.is_empty() {
                 let li_v = self.read_member(h, "lastIndex")?;
                 let li = self.last_index_to_length(li_v)?;
-                let next = self.advance_string_index(&s, li, unicode);
+                let next = self.advance_string_index(&units, li, unicode);
                 self.set_prop_throwing(h, "lastIndex", NanBox::number(next as f64))?;
             }
         }
