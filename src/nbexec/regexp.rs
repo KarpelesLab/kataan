@@ -1254,28 +1254,31 @@ impl<'a> Interp<'a> {
             let n_captures =
                 (self.coerce_to_integer_or_infinity(n_v)?.max(0.0) as usize).saturating_sub(1);
             let matched_v = self.read_member(rh, "0")?;
-            let (matched, matched_units) = self.subject_units(matched_v)?;
+            let (_, matched_units) = self.subject_units(matched_v)?;
             let m_len = matched_units.len();
             let pos_v = self.read_member(rh, "index")?;
             let pos = (self.coerce_to_integer_or_infinity(pos_v)?.max(0.0) as usize).min(length);
             // Collect captures.
-            let mut captures: Vec<Option<String>> = Vec::with_capacity(n_captures);
+            // Captures are carried as WTF-8 bytes, not `String`: a capture can be a
+            // lone surrogate (`/./g` matches each half of an astral pair), and a
+            // `String` round-trip folds it to U+FFFD.
+            let mut captures: Vec<Option<Vec<u8>>> = Vec::with_capacity(n_captures);
             for i in 1..=n_captures {
                 let cap = self.read_member(rh, &alloc::format!("{i}"))?;
                 if matches!(cap.unpack(), Unpacked::Undefined) {
                     captures.push(None);
                 } else {
-                    captures.push(Some(self.coerce_to_string(cap)?));
+                    captures.push(Some(self.coerce_to_string_bytes(cap)?));
                 }
             }
             let named = self.read_member(rh, "groups")?;
             let replacement = if func_replace {
                 // Call(replace, undefined, [matched, ...captures, position, S, groups?]).
                 let mut call_args: Vec<NanBox> = Vec::with_capacity(n_captures + 4);
-                call_args.push(self.new_str(&matched));
+                call_args.push(self.new_str_bytes(crate::wtf8::from_utf16(&matched_units)));
                 for c in &captures {
                     call_args.push(match c {
-                        Some(cs) => self.new_str(cs),
+                        Some(cs) => self.new_str_bytes(cs.clone()),
                         None => NanBox::undefined(),
                     });
                 }
@@ -1285,7 +1288,7 @@ impl<'a> Interp<'a> {
                     call_args.push(named);
                 }
                 let r = self.call(replace, &call_args)?;
-                self.coerce_to_string(r)?
+                self.coerce_to_string_bytes(r)?
             } else {
                 // ES2018 named captures: a non-undefined `groups` is `ToObject`'d
                 // before substitution (`groups: null` therefore throws a TypeError).
@@ -1301,7 +1304,7 @@ impl<'a> Interp<'a> {
             // replacement and advance next to pos + m_len.
             if pos >= next_source_position {
                 accumulated.extend_from_slice(&u16_slice(&units, next_source_position, pos));
-                accumulated.extend_from_slice(replacement.as_bytes());
+                crate::wtf8::append(&mut accumulated, &replacement);
                 next_source_position = pos + m_len;
             }
         }
@@ -1319,42 +1322,39 @@ impl<'a> Interp<'a> {
         matched_units: &[u16],
         str_units: &[u16],
         position: usize,
-        captures: &[Option<String>],
+        captures: &[Option<Vec<u8>>],
         named: NanBox,
         replacement: &str,
-    ) -> Result<String, ExecError> {
+    ) -> Result<Vec<u8>, ExecError> {
         let m_len = matched_units.len();
         let tail_pos = position + m_len;
         let t: Vec<char> = replacement.chars().collect();
-        let mut out = String::new();
+        // WTF-8 bytes, not a `String`: `$&` and `$n` can expand to a lone
+        // surrogate (`/./g` matches each half of an astral pair), which a
+        // `String` cannot hold and would fold to U+FFFD.
+        let mut out: Vec<u8> = Vec::new();
         let mut i = 0;
         while i < t.len() {
             if t[i] == '$' && i + 1 < t.len() {
                 let c = t[i + 1];
                 match c {
                     '$' => {
-                        out.push('$');
+                        out.push(b'$');
                         i += 2;
                         continue;
                     }
                     '&' => {
-                        out.push_str(&crate::wtf8::to_string_lossy(&crate::wtf8::from_utf16(
-                            matched_units,
-                        )));
+                        crate::wtf8::append(&mut out, &crate::wtf8::from_utf16(matched_units));
                         i += 2;
                         continue;
                     }
                     '`' => {
-                        out.push_str(&crate::wtf8::to_string_lossy(&u16_slice(
-                            str_units, 0, position,
-                        )));
+                        crate::wtf8::append(&mut out, &u16_slice(str_units, 0, position));
                         i += 2;
                         continue;
                     }
                     '\'' => {
-                        out.push_str(&crate::wtf8::to_string_lossy(&u16_slice_from(
-                            str_units, tail_pos,
-                        )));
+                        crate::wtf8::append(&mut out, &u16_slice_from(str_units, tail_pos));
                         i += 2;
                         continue;
                     }
@@ -1362,7 +1362,7 @@ impl<'a> Interp<'a> {
                         // `$<name>` named-capture reference. With no named
                         // captures it is a literal `$<`.
                         if matches!(named.unpack(), Unpacked::Undefined) {
-                            out.push('$');
+                            out.push(b'$');
                             i += 1;
                             continue;
                         }
@@ -1371,14 +1371,14 @@ impl<'a> Interp<'a> {
                             if let Some(nh) = named.as_handle().map(Handle::from_raw) {
                                 let v = self.read_member(nh, &name)?;
                                 if !matches!(v.unpack(), Unpacked::Undefined) {
-                                    let vs = self.coerce_to_string(v)?;
-                                    out.push_str(&vs);
+                                    let vs = self.coerce_to_string_bytes(v)?;
+                                    crate::wtf8::append(&mut out, &vs);
                                 }
                             }
                             i += 2 + close + 1;
                             continue;
                         }
-                        out.push('$');
+                        out.push(b'$');
                         i += 1;
                         continue;
                     }
@@ -1396,27 +1396,27 @@ impl<'a> Interp<'a> {
                             && two_n <= n
                         {
                             if let Some(Some(cs)) = captures.get(two_n - 1) {
-                                out.push_str(cs);
+                                crate::wtf8::append(&mut out, cs);
                             }
                             i += 3;
                             continue;
                         }
                         if d1 >= 1 && d1 <= n {
                             if let Some(Some(cs)) = captures.get(d1 - 1) {
-                                out.push_str(cs);
+                                crate::wtf8::append(&mut out, cs);
                             }
                             i += 2;
                             continue;
                         }
                         // Not a valid group reference: literal `$`.
-                        out.push('$');
+                        out.push(b'$');
                         i += 1;
                         continue;
                     }
                     _ => {}
                 }
             }
-            out.push(t[i]);
+            crate::wtf8::encode_code_point(t[i] as u32, &mut out);
             i += 1;
         }
         Ok(out)

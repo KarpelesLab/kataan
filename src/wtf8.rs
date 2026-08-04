@@ -184,6 +184,32 @@ fn decode_code_point(bytes: &[u8], i: usize) -> (u32, usize) {
 /// An iterator over the **code points** of a WTF-8 slice: scalar values plus any
 /// stored lone surrogate code points (yielded as themselves). This is the
 /// `for…of` / `codePointAt` view — astral characters are single code points.
+/// Appends `add` to `out` in **canonical** WTF-8: if `out` ends with a lone high
+/// surrogate and `add` opens with a lone low surrogate, the pair is recombined
+/// into the 4-byte astral form rather than left as two unpaired encodings.
+///
+/// Two byte sequences that encode the same UTF-16 units must be byte-equal, or
+/// they compare unequal, iterate as a different number of code points, and stop
+/// being well-formed. Anywhere pieces of a string are concatenated — a `replace`
+/// result assembled from per-match fragments, for instance — has to go through
+/// this rather than a plain `extend_from_slice`. `Rope::concat` applies the same
+/// rule for the string type.
+pub fn append(out: &mut Vec<u8>, add: &[u8]) {
+    if let Some(hi) = trailing_high_surrogate(out)
+        && let Some(lo) = leading_low_surrogate(add)
+    {
+        out.truncate(out.len() - 3); // drop the lone high surrogate
+        let cp = 0x1_0000 + ((u32::from(hi) - 0xD800) << 10) + (u32::from(lo) - 0xDC00);
+        encode_code_point(cp, out);
+        out.extend_from_slice(&add[3..]); // drop the lone low surrogate
+        return;
+    }
+    out.extend_from_slice(add);
+}
+
+/// An iterator over the **code points** of a WTF-8 slice: scalar values plus any
+/// stored lone surrogate code points (yielded as themselves). This is the
+/// `for…of` / `codePointAt` view — astral characters are single code points.
 pub fn code_points(bytes: &[u8]) -> CodePoints<'_> {
     CodePoints { bytes, i: 0 }
 }
