@@ -3247,11 +3247,21 @@ impl<'a> Interp<'a> {
                         "region" => intl::display::region_name(&locale, &code),
                         _ => None,
                     };
+                    // A currency is "named" exactly when it is one the
+                    // implementation supports — `supportedValuesOf("currency")` and
+                    // `DisplayNames` must agree in *both* directions, and a
+                    // supported code with no localized name displays as the code,
+                    // which is CLDR's own behaviour for an absent `displayName`.
+                    let unknown_currency = ty == "currency"
+                        && !crate::nbexec::intl_fmt::SUPPORTED_CURRENCIES
+                            .contains(&code.to_ascii_uppercase().as_str());
                     match crate_name {
                         Some(n) => self.new_str(n),
-                        // A crate-backed type (language/region) with no match honors
-                        // `fallback`: "none" → undefined, "code" → the code itself.
-                        None if matches!(ty.as_str(), "language" | "region") => {
+                        // No name available: honor `fallback` — "none" → undefined,
+                        // "code" → the code itself.
+                        None if matches!(ty.as_str(), "language" | "region")
+                            || unknown_currency =>
+                        {
                             let fallback = fmt
                                 .and_then(|h| self.realm.get_property(h, "fallback"))
                                 .map(|v| self.realm.to_display_string(v))

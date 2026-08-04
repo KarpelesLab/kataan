@@ -18,7 +18,18 @@ pub(crate) fn lookup(table: &[(&'static str, &'static str)], key: &str) -> Optio
         .map(|i| table[i].1)
 }
 
-/// `-u-tz-` deprecated time-zone ids — 22 aliases.
+/// `-u-tz-` time-zone id aliases.
+///
+/// Two kinds, both from CLDR `common/bcp47/timezone.xml`: a `<type>` marked
+/// `deprecated="true"` maps to its `preferred=` id, and a `<type>`'s `alias=`
+/// attribute lists IANA names that map to its `name=` id. Only the alias names
+/// that match the BCP-47 `uvalue` production (3–8 alphanumerics, so
+/// `Europe/Dublin` cannot appear but `Eire` can) are reachable through a
+/// `-u-tz-` keyword.
+///
+/// The alias half below covers the reachable single-token names; the table as a
+/// whole should be generated from `timezone.xml` rather than extended by hand,
+/// since CLDR adds to both halves over time.
 pub(crate) static TIMEZONE: &[(&str, &str)] = &[
     ("aqams", "aqmcm"),
     ("aukns", "auhba"),
@@ -32,16 +43,21 @@ pub(crate) static TIMEZONE: &[(&str, &str)] = &[
     ("cnhrb", "cnsha"),
     ("cnkhg", "cnurc"),
     ("cst6cdt", "uschi"),
+    ("eire", "iedub"),
+    ("est", "papty"),
     ("est5edt", "usnyc"),
     ("gaza", "gazastrp"),
+    ("gmt0", "gmt"),
     ("mncoq", "mnuln"),
     ("mst7mdt", "usden"),
     ("mxstis", "mxtij"),
     ("pst8pdt", "uslax"),
     ("uaozh", "uaiev"),
     ("uauzh", "uaiev"),
+    ("uct", "utc"),
     ("umjon", "ushnl"),
     ("usnavajo", "usden"),
+    ("zulu", "utc"),
 ];
 
 /// `-t-` deprecated tvalue subtags — 2 aliases.
