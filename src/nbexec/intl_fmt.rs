@@ -1204,22 +1204,36 @@ pub(crate) fn locale_unicode_bool_keyword(locale: &str, key: &str) -> Option<boo
 /// Whether `co` is a collation type the engine treats as a supported
 /// `Intl.Collator` collation (the CLDR collation identifiers, excluding the
 /// reserved `standard`/`search` values that are never valid `-u-co-` types).
-pub(crate) fn is_supported_collation(co: &str) -> bool {
-    matches!(
-        co,
-        "compat"
-            | "dict"
-            | "emoji"
-            | "eor"
-            | "phonebk"
-            | "phonetic"
-            | "pinyin"
-            | "searchjl"
-            | "stroke"
-            | "trad"
-            | "unihan"
-            | "zhuyin"
-    )
+pub(crate) fn is_supported_collation(base: &str, co: &str) -> bool {
+    // `emoji` and `eor` are root collations: they tailor the root order rather
+    // than a language's, so every locale offers them.
+    if matches!(co, "emoji" | "eor") {
+        return true;
+    }
+    // Every other collation belongs to specific languages, and asking for one
+    // outside them is simply not a supported request — it must be ignored, not
+    // reported back. This list was read off ICU (`resolvedOptions().collation`
+    // over each collation × a spread of 59 languages) and matches CLDR's
+    // per-locale `collations`, with one deliberate divergence: ICU reports
+    // `zh` + `pinyin` as `"default"` (pinyin *is* Chinese's default, so it
+    // canonicalizes the request away), yet still lists `pinyin` in
+    // `supportedValuesOf("collation")` — which contradicts
+    // `collations-accepted-by-Collator.js`, and node fails that test as a
+    // result. Accepting it for `zh` keeps the two consistent, which is what the
+    // test actually requires.
+    let langs: &[&str] = match co {
+        "compat" => &["ar"],
+        "dict" => &["si"],
+        "phonebk" => &["de"],
+        "phonetic" => &["ln"],
+        "searchjl" => &["ko"],
+        "pinyin" | "stroke" | "zhuyin" => &["zh"],
+        "trad" => &["bn", "es", "fi", "kn", "sv", "vi"],
+        "unihan" => &["ja", "ko", "zh"],
+        _ => return false,
+    };
+    let lang = base.split(['-', '_']).next().unwrap_or(base);
+    langs.iter().any(|l| lang.eq_ignore_ascii_case(l))
 }
 
 /// Zero-pads the minute/second fields of crate-produced `DateTimePart`s to two
@@ -4837,13 +4851,13 @@ impl<'a> Interp<'a> {
         // co (collation): default "default".
         let mut co_value = String::from("default");
         if let Some(ext) = locale_unicode_keyword(&locale, "co")
-            && is_supported_collation(&ext)
+            && is_supported_collation(&base, &ext)
         {
             co_value = ext.clone();
             additions.push(alloc::format!("-co-{ext}"));
         }
         if let Some(opt) = &collation
-            && is_supported_collation(opt)
+            && is_supported_collation(&base, opt)
             && *opt != co_value
         {
             co_value = opt.clone();
