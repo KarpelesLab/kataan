@@ -1,7 +1,6 @@
 # Test262 known-failures ledger (paths relative to vendor/test262/test/).
 # Regenerate with KATAAN_TEST262_BLESS=1. Target: empty (literal 100%).
 built-ins/TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js  # [sloppy] expected pass, Runtime TypeError: Cannot modify an immutable ArrayBuffer (Testing with Float64Array and makeImmutableArrayBuffer.)
-intl402/Collator/prototype/compare/non-normative-sensitivity.js  # [sloppy] expected pass, Runtime Test262Error: Actual [Aa] and expected [Aa, Aã] should have the same contents. 
 intl402/Collator/prototype/resolvedOptions/resolved-collation-unicode-extensions-and-options.js  # [sloppy] expected pass, Runtime Test262Error: Resolved locale for locale=de-u-co-phonebk with collation=pinyin Expected SameValue(«"de"», «"de-u-co-phonebk"») to be true
 intl402/Collator/usage-de.js  # [sloppy] expected pass, Runtime Test262Error: Actual [Ä, AE] and expected [AE, Ä] should have the same contents. search
 intl402/DateTimeFormat/prototype/format/numbering-system.js  # [sloppy] expected pass, Runtime Test262Error: en-US: display one numeric-styled unit Expected SameValue(«false», «true») to be true

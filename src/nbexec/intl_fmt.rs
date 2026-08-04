@@ -4744,14 +4744,19 @@ impl<'a> Interp<'a> {
         b: &str,
     ) -> core::cmp::Ordering {
         use intl::unicode::collate::{AlternateHandling, Collator, Strength};
-        let strength = match ch
+        // `sensitivity` selects the comparison strength. "case" is the odd one: it
+        // ignores accents but *not* case, which is not a strength level at all —
+        // it is primary strength with the UCA case level switched on. Folding it
+        // into the tertiary default (as this did) made `case` behave like
+        // `variant`, so "Aa" and "Aã" compared unequal.
+        let sensitivity = ch
             .and_then(|h| self.realm.get_property(h, "sensitivity"))
-            .map(|v| self.realm.to_display_string(v))
-            .as_deref()
-        {
-            Some("base") => Strength::Primary,
-            Some("accent") => Strength::Secondary,
-            _ => Strength::Tertiary,
+            .map(|v| self.realm.to_display_string(v));
+        let (strength, case_level) = match sensitivity.as_deref() {
+            Some("base") => (Strength::Primary, false),
+            Some("accent") => (Strength::Secondary, false),
+            Some("case") => (Strength::Primary, true),
+            _ => (Strength::Tertiary, false),
         };
         let numeric = matches!(
             ch.and_then(|h| self.realm.get_property(h, "numeric"))
@@ -4778,6 +4783,7 @@ impl<'a> Interp<'a> {
         // set keeps the option-aware root collator, which is what every locale got
         // before — so this only ever adds tailoring, never removes an option.
         if strength == Strength::Tertiary
+            && !case_level
             && !numeric
             && alternate == AlternateHandling::NonIgnorable
             && let Some(locale) = ch
@@ -4789,6 +4795,7 @@ impl<'a> Interp<'a> {
         }
         Collator::new(alternate)
             .with_strength(strength)
+            .with_case_level(case_level)
             .with_numeric(numeric)
             .compare(a, b)
     }

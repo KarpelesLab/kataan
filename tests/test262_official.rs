@@ -688,6 +688,17 @@ fn coordinate() {
 
     // Bless mode: (re)write the ledger from the current failures.
     if std::env::var("KATAAN_TEST262_BLESS").is_ok() {
+        // The ledger is rewritten wholesale from `fails`, so blessing a filtered
+        // run would delete every entry outside the filter. Refuse rather than
+        // silently discard them.
+        assert!(
+            std::env::var("KATAAN_TEST262_FILTER")
+                .unwrap_or_default()
+                .is_empty(),
+            "refusing to bless a filtered run: the ledger is rewritten from this \
+             run's failures, so every entry outside KATAAN_TEST262_FILTER would be \
+             deleted. Bless from a full-corpus run."
+        );
         let mut body = String::from(
             "# Test262 known-failures ledger (paths relative to vendor/test262/test/).\n\
              # Regenerate with KATAAN_TEST262_BLESS=1. Target: empty (literal 100%).\n",
@@ -704,9 +715,24 @@ fn coordinate() {
     }
 
     // Gate mode: compare against the ledger.
+    //
+    // "Now passing" is computed as `ledger - fails`, which is only meaningful for
+    // entries this run actually executed. Under `KATAAN_TEST262_FILTER` the run is
+    // a subset, so every ledger entry outside the filter is absent from `fails`
+    // and would be reported as newly passing — a filtered `intl402/Collator` run
+    // claimed ten, nine of which never ran. Restrict the comparison to the same
+    // subset. (The whole-corpus case is guarded separately by the `accounted`
+    // assertion above, which catches a run that ended early.)
     let ledger = read_ledger();
+    let subset = std::env::var("KATAAN_TEST262_FILTER")
+        .ok()
+        .filter(|f| !f.is_empty());
+    let in_subset = |r: &str| subset.as_ref().is_none_or(|f| r.contains(f.as_str()));
     let regressions: Vec<&String> = fail_set.iter().filter(|r| !ledger.contains(*r)).collect();
-    let newly_passing: Vec<&String> = ledger.iter().filter(|r| !fail_set.contains(*r)).collect();
+    let newly_passing: Vec<&String> = ledger
+        .iter()
+        .filter(|r| !fail_set.contains(*r) && in_subset(r))
+        .collect();
 
     if !newly_passing.is_empty() {
         eprintln!(
