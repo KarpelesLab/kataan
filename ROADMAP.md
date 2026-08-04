@@ -7,21 +7,32 @@ JS + WASM engine, and a runtime that stands beside Node.js / Bun / Deno. Finishe
 foundations are summarized once (§1) and not re-litigated; everything after is
 forward-looking.
 
-> **Headline status (2026-07-27):** the official tc39/Test262 corpus (~53k tests)
-> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 99.45 %**
-> — 51,603 of the 51,890 *ran* tests, **287 ledgered failures** (the ~1.5k
+> **Headline status (2026-08-05):** the official tc39/Test262 corpus (~53k tests)
+> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 99.98 %**
+> — 51,879 of the 51,890 *ran* tests, **11 ledgered failures** (the ~1.5k
 > skipped are host-specific or unimplemented proposals; Temporal / Atomics /
-> agents / cross-realm are no longer skip-gated — see §3.9). The largest
-> remaining clusters are CLDR output data in Intl (NumberFormat 27,
-> DateTimeFormat 18) and the Atomics multi-agent scheduler (§3.8).
-> **ES modules + dynamic `import()` now run** (the
-> module-flagged suite is no longer skipped — §3.1). The remaining headline
-> language gap is the **Intl services** (now almost entirely the CLDR locale-*data*
-> output in the external `intl` crate — unit long/narrow forms, compact-long,
-> DurationFormat unit styles, likely-subtags; the *structure* — subclassing,
-> `formatRange`, `formatToParts` incl. unit/compact, `resolvedOptions`, Segmenter
-> `containing`, `localeCompare`/`toLocaleString`/`Date.toLocale*` option plumbing —
-> is done); the long tail is per-builtin and per-construct edges (§3).
+> agents / cross-realm are no longer skip-gated — see §3.9). Every subsystem
+> that was previously skip-gated now runs, and the Atomics multi-agent
+> scheduler is complete (§3.8).
+>
+> **What the last 11 are.** All but one are Intl locale *output*, and they split
+> cleanly by owner. **Upstream in the `intl` crate (5):** it drops the region
+> subtag when picking number symbols, so `pt-PT`/`es-MX`/`de-CH`/`en-ZA`/`it-CH`
+> format like their base language — this hits plain `format()`, not just
+> `formatRange` (1 test); and it ships no `de` *search* collation and no `eor`
+> collation, nor any way to enumerate a locale's available collations (2 tests).
+> **Ours (5):** non-Gregorian era and month names, the `-u-nu-` numbering system
+> reaching DateTimeFormat's numeric fields, and `formatRange` — which does not
+> use the crate's range support at all, so it misses the locale separator, the
+> approximately-sign form, and shared-affix collapsing. **Deliberate (1):**
+> `TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js`
+> is an upstream harness bug; passing it would mean writing through an immutable
+> buffer and breaking 47 sibling tests.
+>
+> The Intl *structure* — subclassing, `formatToParts` incl. unit/compact,
+> `resolvedOptions`, Segmenter `containing`, `localeCompare` / `toLocaleString` /
+> `Date.toLocale*` option plumbing — is done, as are **ES modules + dynamic
+> `import()`** (§3.1).
 >
 > Recently converted (ledger-verified): the **live-iteration** cluster (Set/Map +
 > typed-array observe mutation mid-iteration), the **class element** cluster
