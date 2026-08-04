@@ -22,6 +22,16 @@ impl<'src> Parser<'src> {
         self.peek() == TokenKind::Identifier && self.ident_name(self.peek_tok()) == word
     }
 
+    /// Whether the token `n` positions ahead could start a `BindingIdentifier`
+    /// (the lookahead form of [`Parser::at_binding_ident`]).
+    fn nth_starts_binding_ident(&self, n: usize) -> bool {
+        match self.nth_kind(n) {
+            TokenKind::Identifier => true,
+            TokenKind::Keyword(kw) => self.keyword_is_binding_ident(kw),
+            _ => false,
+        }
+    }
+
     // --- import ---------------------------------------------------------
 
     /// Parses an `import` declaration (the cursor is at `import`).
@@ -58,7 +68,27 @@ impl<'src> Parser<'src> {
         let deferred = self.at_contextual_ident("defer")
             && !self.peek_tok().had_escape
             && self.nth_kind(1) == TokenKind::Star;
-        if deferred {
+        // `import source x from "mod";` (source-phase-imports proposal). Like
+        // `defer`, `source` is contextual and unescaped-only, but it is *not*
+        // disambiguated by a following `*`: the phase form takes a plain
+        // `ImportedBinding`. The clashing shapes are
+        //   `import source from "mod";`      — a default binding named `source`
+        //   `import source, { x } from "m";` — ditto, with a named clause
+        //   `import source x    from "mod";` — the source phase, binding `x`
+        //   `import source from from "mod";` — the source phase, binding `from`
+        // so it is the source phase exactly when a `BindingIdentifier` follows,
+        // *except* when that identifier is the `from` of a `FromClause` — i.e.
+        // `from` immediately followed by the module specifier string.
+        let source_phase = self.at_contextual_ident("source")
+            && !self.peek_tok().had_escape
+            && self.nth_starts_binding_ident(1)
+            && !(self.nth_kind(1) == TokenKind::Keyword(Kw::From)
+                && self.nth_kind(2) == TokenKind::String);
+        if source_phase {
+            self.bump(); // `source`
+            let local = self.parse_binding_ident()?;
+            specifiers.push(ImportSpecifier::Source(local));
+        } else if deferred {
             self.bump(); // `defer`
             self.parse_import_tail(&mut specifiers)?; // requires `* as ns`
         } else if self.at_binding_ident() {

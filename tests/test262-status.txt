@@ -14,8 +14,3 @@ intl402/NumberFormat/prototype/formatRange/pt-PT.js  # [sloppy] expected pass, R
 intl402/NumberFormat/prototype/formatRangeToParts/en-US.js  # [sloppy] expected pass, Runtime Test262Error: Expected SameValue(«3», «5») to be true
 intl402/Temporal/PlainMonthDay/prototype/toLocaleString/dateStyle.js  # [sloppy] expected pass, Runtime Test262Error: dateStyle: long writes month of Ramadan out in full
 intl402/Temporal/PlainYearMonth/prototype/toLocaleString/dateStyle.js  # [sloppy] expected pass, Runtime Test262Error: dateStyle: long writes month of Ramadan out in full
-language/module-code/ambiguous-export-bindings/namespace-unambiguous-if-import-source-and-export.js  # expected pass, Parse SyntaxError: SyntaxError: expected `from`, found Identifier (at 142..145)
-language/module-code/source-phase-import/import-source.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: ./import-source-binding-name_FIXTURE.js: Promise should be rejected)
-language/module-code/source-phase-import/reexport-source-binding-named-import.js  # expected pass, Parse SyntaxError: SyntaxError: expected `from`, found Identifier (at 142..143)
-language/module-code/source-phase-import/reexport-source-binding-namespace-get.js  # expected pass, Parse SyntaxError: SyntaxError: expected `from`, found Identifier (at 142..143)
-language/statements/await-using/await-using-implies-await-if-evaluated.js  # [sloppy] async did not complete (output: Test262:AsyncTestFailure:Test262Error: Test262Error: Expected statements following the block containing evaluated `await)

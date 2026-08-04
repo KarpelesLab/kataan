@@ -568,6 +568,12 @@ pub struct Interp<'a> {
     /// brand-check the receiver of the Annex B.2.5 legacy static accessors
     /// (`RegExp.$1`/`input`/`lastMatch`/…), which require `this === RegExp`.
     regexp_ctor: Option<Handle>,
+    /// `(%AbstractModuleSource%, %AbstractModuleSource.prototype%)`, built on
+    /// first use (source-phase-imports). Memoized because the intrinsic must be
+    /// *one* object: a module source bound by `import source x from …` has to be
+    /// an `instanceof` the very constructor a host hook (`$262.AbstractModuleSource`)
+    /// handed out earlier.
+    module_source_intrinsic: Option<(Handle, Handle)>,
     /// Leak-once cache interning `Intl.NumberFormat` currency/unit codes to `&'static str`
     /// (the `intl` crate's options take `'static`); bounded by the distinct codes a program
     /// uses.
@@ -3195,6 +3201,7 @@ impl<'a> Interp<'a> {
             regexp_proto: None,
             main_regexp_proto: None,
             regexp_ctor: None,
+            module_source_intrinsic: None,
             #[cfg(feature = "intl")]
             intl_intern: alloc::collections::BTreeMap::new(),
             method_name_intern: alloc::collections::BTreeMap::new(),

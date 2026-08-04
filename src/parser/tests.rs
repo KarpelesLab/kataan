@@ -693,6 +693,7 @@ fn sexpr_stmt(s: &Stmt) -> String {
                     ImportSpecifier::Named { imported, local } => {
                         format!("{}as {}", mod_name(imported), local.name)
                     }
+                    ImportSpecifier::Source(id) => format!("source {}", id.name),
                 })
                 .collect();
             format!("(import [{}] {:?})", specs.join(" "), i.source)
@@ -1148,6 +1149,66 @@ fn imports() {
     assert_eq!(
         prog("import def, * as ns from \"m\";"),
         "(import [def *as ns] \"m\")"
+    );
+}
+
+/// `import source x from "m"` (source-phase-imports). `source` is contextual:
+/// the phase form is taken only when a `BindingIdentifier` follows *and* that
+/// identifier is not the `from` of the `FromClause`.
+#[test]
+fn import_source_phase() {
+    assert_eq!(
+        prog("import source x from \"m\";"),
+        "(import [source x] \"m\")"
+    );
+    // Line terminators are allowed throughout (no [no LineTerminator here]).
+    assert_eq!(
+        prog("import\n\nsource\n\ny from \"m\";"),
+        "(import [source y] \"m\")"
+    );
+    // `source` is also a legal ImportedBinding of the phase form…
+    assert_eq!(
+        prog("import source source from \"m\";"),
+        "(import [source source] \"m\")"
+    );
+    // …and so is `from`.
+    assert_eq!(
+        prog("import source from from \"m\";"),
+        "(import [source from] \"m\")"
+    );
+    // Without a following binding, `source` is an ordinary default import.
+    assert_eq!(prog("import source from \"m\";"), "(import [source] \"m\")");
+    assert_eq!(
+        prog("import source, { a } from \"m\";"),
+        "(import [source aas a] \"m\")"
+    );
+    // An escaped spelling is never the phase keyword, so this is a default
+    // import named `source` and the following `x` is a syntax error.
+    sperr("import so\\u0075rce x from \"m\";");
+    // The phase form takes exactly one plain binding — no namespace/named clause.
+    sperr("import source * as ns from \"m\";");
+    sperr("import source x, { a } from \"m\";");
+}
+
+/// The BoundNames of an `ImportDeclaration` are module LexicallyDeclaredNames,
+/// so a duplicate among them — or a clash with another top-level lexical
+/// declaration — is an early error (§16.2.1.1).
+#[test]
+fn import_bound_names_are_lexical_declarations() {
+    sperr("import { x, y as x } from \"m\";");
+    sperr("import x, * as x from \"m\";");
+    sperr("import source x from \"m\"; import { x } from \"n\";");
+    sperr("import { x } from \"m\"; let x = 1;");
+    sperr("import { x } from \"m\"; class x {}");
+    sperr("import { x } from \"m\"; var x;");
+    // Distinct names are fine, and a bare import binds nothing.
+    assert_eq!(
+        prog("import { x, y as z } from \"m\";"),
+        "(import [xas x yas z] \"m\")"
+    );
+    assert_eq!(
+        prog("import \"m\"; let x = 1;"),
+        "(import [] \"m\") (let (x 1))"
     );
 }
 

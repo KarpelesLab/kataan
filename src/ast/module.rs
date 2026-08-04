@@ -42,6 +42,12 @@ pub enum ImportSpecifier {
         imported: ModuleExportName,
         local: Ident,
     },
+    /// `import source x from …` — the *source* phase (source-phase-imports
+    /// proposal): the binding holds the dependency's `[[ModuleSource]]` object
+    /// rather than any of its exports. It is always the only specifier of its
+    /// declaration (the grammar takes a bare `ImportedBinding`, with no default,
+    /// namespace, or named clause alongside it).
+    Source(Ident),
 }
 
 /// A name used in an import/export clause — either an identifier name or a

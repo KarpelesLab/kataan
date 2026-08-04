@@ -530,17 +530,39 @@ impl<'a> Interp<'a> {
         Ok(NanBox::handle(realm_obj.to_raw()))
     }
 
-    /// `$262.AbstractModuleSource` — build the `%AbstractModuleSource%` intrinsic
-    /// (source-phase-imports proposal §28) and return its constructor. Only the
-    /// *intrinsic shape* is materialized (no loadable module-source objects exist
-    /// yet): the abstract constructor (throws on `[[Call]]`/`[[Construct]]`,
-    /// `name` = "AbstractModuleSource", `length` = 0, `[[Prototype]]` =
-    /// %FunctionPrototype%) and `%AbstractModuleSource.prototype%` (its
-    /// `[[Prototype]]` is %Object.prototype%, a `constructor` data property back to
-    /// the ctor, and a `@@toStringTag` accessor getter returning the receiver's
-    /// `[[ModuleSourceClassName]]` — always `undefined` here since no receiver
-    /// carries that slot).
+    /// `$262.AbstractModuleSource` — the `%AbstractModuleSource%` intrinsic
+    /// (source-phase-imports proposal §28) constructor. Built on first use and
+    /// then memoized in `module_source_intrinsic`, because the intrinsic must be
+    /// a single object per agent: a module source bound by `import source x from
+    /// …` is an `instanceof` the constructor this hook already handed out.
     pub(crate) fn abstract_module_source(&mut self) -> Result<NanBox, ExecError> {
+        let (ctor, _) = self.module_source_intrinsic();
+        Ok(NanBox::handle(ctor.to_raw()))
+    }
+
+    /// A fresh `[[ModuleSource]]` object: an ordinary object whose
+    /// `[[Prototype]]` is `%AbstractModuleSource.prototype%`, so
+    /// `src instanceof $262.AbstractModuleSource` holds. Handed to a module
+    /// record that has a source-phase representation (see
+    /// `module::MODULE_SOURCE_KEY`).
+    pub(crate) fn module_source_object(&mut self) -> NanBox {
+        let (_, proto) = self.module_source_intrinsic();
+        let obj = self.realm.new_object_with_proto(Some(proto));
+        NanBox::handle(obj.to_raw())
+    }
+
+    /// Builds (once) `(%AbstractModuleSource%, %AbstractModuleSource.prototype%)`:
+    /// the abstract constructor (throws on `[[Call]]`/`[[Construct]]`, `name` =
+    /// "AbstractModuleSource", `length` = 0, `[[Prototype]]` =
+    /// %FunctionPrototype%) and its prototype (its `[[Prototype]]` is
+    /// %Object.prototype%, a `constructor` data property back to the ctor, and a
+    /// `@@toStringTag` accessor getter returning the receiver's
+    /// `[[ModuleSourceClassName]]` — always `undefined` here, since the module
+    /// sources this engine can produce carry no class name).
+    fn module_source_intrinsic(&mut self) -> (Handle, Handle) {
+        if let Some(pair) = self.module_source_intrinsic {
+            return pair;
+        }
         // The abstract constructor: `new`/call both throw a TypeError.
         let ctor = self.realm.new_native(N_ABSTRACT_MODULE_SOURCE_CTOR);
         self.install_fn_name_length(ctor, "AbstractModuleSource", 0);
@@ -568,7 +590,8 @@ impl<'a> Interp<'a> {
         // `%AbstractModuleSource%.prototype` — { writable: false, enumerable:
         // false, configurable: false }.
         self.install_fn_prototype(ctor, proto, false);
-        Ok(NanBox::handle(ctor.to_raw()))
+        self.module_source_intrinsic = Some((ctor, proto));
+        (ctor, proto)
     }
 
     /// `realm.evalScript(src)` — evaluate `src` in the receiver realm's global
@@ -1057,6 +1080,21 @@ impl<'a> Interp<'a> {
         disposers: alloc::vec::Vec<(NanBox, NanBox, bool)>,
         completion: Result<NanBox, ExecError>,
     ) -> Result<NanBox, ExecError> {
+        self.dispose_resources_tracked(disposers, completion, &mut false)
+    }
+
+    /// [`Self::dispose_resources`] plus `DisposeResources`' *needsAwait ∧
+    /// ¬hasAwaited* bookkeeping: `needs_await` is set when some `await using`
+    /// resource had **no** dispose method (a `null`/`undefined` resource) and no
+    /// real `Await` ran for any other resource, so step 4 still owes one
+    /// `Await(undefined)` — an observable microtask turn. Only a caller that can
+    /// actually suspend (the coroutine step machine) acts on it.
+    pub(crate) fn dispose_resources_tracked(
+        &mut self,
+        disposers: alloc::vec::Vec<(NanBox, NanBox, bool)>,
+        completion: Result<NanBox, ExecError>,
+        needs_await: &mut bool,
+    ) -> Result<NanBox, ExecError> {
         // Start from the incoming completion: a normal one, or the in-flight throw.
         let (ok_value, mut pending): (NanBox, Option<NanBox>) = match completion {
             Ok(v) => (v, None),
@@ -1065,14 +1103,22 @@ impl<'a> Interp<'a> {
             // running disposers' aggregation against it.
             Err(other) => return Err(other),
         };
+        // `DisposeResources` *needsAwait* / *hasAwaited*.
+        let (mut wants_await, mut has_awaited) = (false, false);
         for (value, method, is_async) in disposers.into_iter().rev() {
             if matches!(method.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                // Step 3.f: no dispose method — only reachable for the
+                // async-dispose hint, which still owes an `Await(undefined)`.
+                wants_await |= is_async;
                 continue;
             }
             let result = self.call_with_this(method, value, &[]);
             // For an `await using`, await the dispose result (eagerly).
             let result = match result {
-                Ok(v) if is_async => self.await_value(v),
+                Ok(v) if is_async => {
+                    has_awaited = true;
+                    self.await_value(v)
+                }
                 other => other,
             };
             if let Err(ExecError::Throw(e)) = result {
@@ -1085,6 +1131,7 @@ impl<'a> Interp<'a> {
                 result?;
             }
         }
+        *needs_await = wants_await && !has_awaited;
         match pending {
             None => Ok(ok_value),
             Some(e) => Err(ExecError::Throw(e)),

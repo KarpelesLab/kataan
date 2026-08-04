@@ -25,7 +25,7 @@
 //! the no_std language core does not pull this in.
 
 use super::{
-    DYN_DEFER, DYN_KEY, DYN_PROMISE, DYN_TYPE, ExecError, Interp, N_REFERENCE_ERROR,
+    DYN_DEFER, DYN_KEY, DYN_PROMISE, DYN_TYPE, ExecError, Interp, N_ERROR_BASE, N_REFERENCE_ERROR,
     N_SYNTAX_ERROR, NanBox, SAFE_ALL_REMAINING, SAFE_ALL_TARGET, Thrown,
 };
 use crate::ast::{ExportDecl, ImportSpecifier, ModuleExportName, Program, Stmt};
@@ -195,9 +195,26 @@ pub trait ModuleHost {
 /// directory and canonicalised so the same file is deduped under one key.
 pub struct FileModuleHost;
 
+/// The host-defined module specifier that denotes "a module which provides a
+/// valid [Module Source]" (source-phase-imports). Test262's `INTERPRETING.md`
+/// mandates that a host resolve the literal specifier `<module source>` to such
+/// a module; real hosts use e.g. a WebAssembly Module Record. There is no
+/// JavaScript module that qualifies (a Source Text Module Record's
+/// `GetModuleSource` always throws), so this engine synthesizes one: a body-less,
+/// export-less record whose `[[ModuleSource]]` is an `%AbstractModuleSource%`
+/// instance.
+///
+/// [Module Source]: https://tc39.es/proposal-source-phase-imports/#sec-module-source-objects
+pub const MODULE_SOURCE_KEY: &str = "<module source>";
+
 impl ModuleHost for FileModuleHost {
     fn resolve(&self, specifier: &str, referrer: Option<&str>) -> Result<String, String> {
         use std::path::{Path, PathBuf};
+        // `<module source>` is not a path: it names the host's module-source
+        // module and is its own canonical key (see [`MODULE_SOURCE_KEY`]).
+        if specifier == MODULE_SOURCE_KEY {
+            return Ok(MODULE_SOURCE_KEY.to_string());
+        }
         let base: PathBuf = match referrer {
             Some(r) => Path::new(r)
                 .parent()
@@ -282,6 +299,11 @@ enum ModuleKind {
     /// `with { type: "text" }` — the file's raw text becomes the `default`
     /// export (the import-text proposal).
     Text,
+    /// A host-provided **module source** module (source-phase-imports): it has no
+    /// exports and no body, but it *does* have a `[[ModuleSource]]` — an
+    /// `%AbstractModuleSource%` instance — so `import source x from …` binds it.
+    /// See [`MODULE_SOURCE_KEY`].
+    ModuleSource,
 }
 
 /// A single binding introduced by an import declaration.
@@ -292,6 +314,19 @@ enum ImportBind {
     Namespace(String),
     /// `import { imported as local } from "m"`.
     Named { imported: String, local: String },
+    /// `import source x from "m"` — bind the local name to `m`'s
+    /// `[[ModuleSource]]` object (source-phase-imports). Like a namespace import
+    /// this is a real immutable slot in the *importing* module's own scope, not
+    /// an alias into the dependency, which is what makes a re-export of it
+    /// (`import source x from "m"; export { x }`) resolve to the module source
+    /// itself — the spec's `[[BindingName]]: source` resolved binding.
+    ///
+    /// Deviation: the request still contributes to `[[RequestedModules]]`, so the
+    /// dependency is linked and evaluated. The proposal loads only its source. The
+    /// only specifier this engine resolves to a module *with* a source phase is
+    /// [`MODULE_SOURCE_KEY`], whose record has no body, so the difference is not
+    /// observable today.
+    Source(String),
 }
 
 /// A re-export request (`export { x } from "m"` / `export * [as ns] from "m"`).
@@ -357,6 +392,12 @@ struct ModuleRecord {
     /// JavaScript / JSON / text (import-attributes). A synthetic (JSON/text)
     /// module has an empty `program` and a single `default` export.
     kind: ModuleKind,
+    /// `[[ModuleSource]]` — the module's source-phase representation, an
+    /// `%AbstractModuleSource%` instance. Only a host-provided *module source*
+    /// module has one (a Source Text Module Record's `GetModuleSource` always
+    /// throws), so this is `None` for every ordinary JavaScript / JSON / text
+    /// module and `import source` of one is a link-time SyntaxError.
+    module_source: Option<NanBox>,
     /// For a synthetic (JSON/text) module: the already-built `default` export
     /// value (JSON parsed / text string), materialised at load time so a JSON
     /// parse failure surfaces in the load/resolution phase.
@@ -536,13 +577,27 @@ impl<'a> Interp<'a> {
         if self.modules.records.contains_key(key) {
             return Ok(());
         }
+        // The host-provided module-source module has no file behind it: it is
+        // synthesized here rather than loaded (source-phase-imports).
+        if key == MODULE_SOURCE_KEY {
+            let record = self.build_module_source_module(key);
+            self.modules.records.insert(key.to_string(), record);
+            if let Some(r) = self.modules.records.get_mut(key) {
+                r.status = Status::Loaded;
+            }
+            return Ok(());
+        }
         // The map key of a JSON / text module is suffixed with its type (so the
         // same file imported both as JavaScript and as text/JSON is two distinct
         // modules, per the spec's `(specifier, attributes)` module map key). The
-        // host loads the underlying file, so strip the suffix first.
+        // host loads the underlying file, so strip the suffix first. A load
+        // failure is *host*-defined, not a syntax error: `HostLoadImportedModule`
+        // may complete with any error value, and code that probes for a module
+        // needs to tell "the host could not supply this module" apart from "the
+        // module is not valid JavaScript", so it surfaces as a plain `Error`.
         let source = host
             .load(module_load_path(key))
-            .map_err(|e| self.syntax_error(&e))?;
+            .map_err(|e| self.module_load_error(&e))?;
         // A `type` attribute selects a synthetic (JSON / text) module; otherwise
         // the file is an ordinary JavaScript module. A JSON parse error here is a
         // load/resolution-phase failure (a SyntaxError), matching the tests'
@@ -570,24 +625,50 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// A host module-*loading* failure (the file could not be read / the host has
+    /// no such module) as a plain `Error`. Distinct from the `SyntaxError`s the
+    /// parse and link phases raise.
+    fn module_load_error(&mut self, message: &str) -> ExecError {
+        let m = self.new_str(message);
+        ExecError::Throw(self.make_error(N_ERROR_BASE, Some(m)))
+    }
+
     /// Builds a synthetic **JSON module** record for `key`: `JSON.parse(source)`
     /// becomes the sole `default` export. An empty AST body drives (no) link /
     /// evaluation. A malformed source propagates as a SyntaxError.
     fn build_json_module(&mut self, key: &str, source: &str) -> Result<ModuleRecord, ExecError> {
         let value = self.parse_json_source(source)?;
-        Ok(self.synthetic_module(key, ModuleKind::Json, value))
+        Ok(self.synthetic_module(key, ModuleKind::Json, Some(value)))
     }
 
     /// Builds a synthetic **text module** record for `key`: the raw source text
     /// becomes the `default` export (import-text proposal).
     fn build_text_module(&mut self, key: &str, source: &str) -> ModuleRecord {
         let value = self.new_str(source);
-        self.synthetic_module(key, ModuleKind::Text, value)
+        self.synthetic_module(key, ModuleKind::Text, Some(value))
     }
 
-    /// Assembles a synthetic module record (JSON / text): an empty program, a
-    /// single local `default` export, and the pre-built export `value`.
-    fn synthetic_module(&mut self, key: &str, kind: ModuleKind, value: NanBox) -> ModuleRecord {
+    /// Builds the host-provided **module source** module (source-phase-imports):
+    /// no body and no exports, but a `[[ModuleSource]]` — a fresh
+    /// `%AbstractModuleSource%` instance — so `import source x from
+    /// "<module source>"` has something to bind. See [`MODULE_SOURCE_KEY`].
+    fn build_module_source_module(&mut self, key: &str) -> ModuleRecord {
+        let src = self.module_source_object();
+        let mut record = self.synthetic_module(key, ModuleKind::ModuleSource, None);
+        record.local_exports.clear();
+        record.module_source = Some(src);
+        record
+    }
+
+    /// Assembles a synthetic module record (JSON / text / module source): an empty
+    /// program plus, when `value` is present, a single local `default` export
+    /// bound to it.
+    fn synthetic_module(
+        &mut self,
+        key: &str,
+        kind: ModuleKind,
+        value: Option<NanBox>,
+    ) -> ModuleRecord {
         // A leaked empty program so the record's `&'static Program` invariant
         // holds (link/instantiate iterate an empty body — no-ops).
         let empty = Program {
@@ -614,7 +695,8 @@ impl<'a> Interp<'a> {
             status: Status::New,
             eval_error: None,
             kind,
-            default_value: Some(value),
+            module_source: None,
+            default_value: value,
             has_tla: false,
             dfs_index: 0,
             dfs_ancestor_index: 0,
@@ -683,6 +765,9 @@ impl<'a> Interp<'a> {
                                     imported: export_name(imported),
                                     local: local.name.to_string(),
                                 });
+                            }
+                            ImportSpecifier::Source(id) => {
+                                binds.push(ImportBind::Source(id.name.to_string()));
                             }
                         }
                     }
@@ -793,6 +878,7 @@ impl<'a> Interp<'a> {
             status: Status::New,
             eval_error: None,
             kind: ModuleKind::JavaScript,
+            module_source: None,
             default_value: None,
             has_tla: module_body_has_await(&program.body),
             dfs_index: 0,
@@ -849,6 +935,7 @@ impl<'a> Interp<'a> {
                             ImportBind::Named { imported, local } => {
                                 (local.clone(), ImportKind::Named(imported.clone()))
                             }
+                            ImportBind::Source(local) => (local.clone(), ImportKind::Source),
                         })
                         .collect();
                     DepBinds {
@@ -892,6 +979,25 @@ impl<'a> Interp<'a> {
                         };
                         let r = &self.modules.records[key];
                         r.scope.declare_const(local, ns);
+                    }
+                    ImportKind::Source => {
+                        // InitializeEnvironment step 7.c (source-phase-imports):
+                        // bind the local name to the dependency's
+                        // `[[ModuleSource]]`, or throw a SyntaxError when it has
+                        // none (`GetModuleSource` of a Source Text Module Record
+                        // always returns an abrupt completion).
+                        let Some(src) = self
+                            .modules
+                            .records
+                            .get(dep_key)
+                            .and_then(|r| r.module_source)
+                        else {
+                            return Err(self.syntax_error(&alloc::format!(
+                                "module {dep_key} has no source phase representation"
+                            )));
+                        };
+                        let r = &self.modules.records[key];
+                        r.scope.declare_const(local, src);
                     }
                 }
             }
@@ -2866,6 +2972,7 @@ enum ImportKind {
     Default,
     Namespace,
     Named(String),
+    Source,
 }
 
 /// A dependency key paired with the `(local name, kind)` bindings an import from

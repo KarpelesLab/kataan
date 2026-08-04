@@ -1907,10 +1907,20 @@ fn stmt_has_yield(s: &Stmt) -> bool {
         // A class declaration with a `yield`-bearing computed member key must be
         // driven through the machine so the key suspends (`class C { get [yield](){} }`).
         Stmt::Class(c) => class_computed_key_has_yield(c),
-        Stmt::Var(decl) => decl
-            .declarations
-            .iter()
-            .any(|d| d.init.as_ref().is_some_and(expr_has_yield)),
+        // An `await using` declaration is itself a suspension point of the async
+        // coroutine: leaving the scope it belongs to performs `DisposeResources`,
+        // whose step 4 `Await`s even when every resource was `null`/`undefined`
+        // (so there was nothing to call). The declaration must therefore be lowered
+        // into the machine — otherwise its whole enclosing block runs in one shot
+        // through the eager walker, which cannot suspend, and the statements after
+        // the block wrongly observe the same microtask.
+        Stmt::Var(decl) => {
+            matches!(decl.kind, crate::ast::VarDeclKind::AwaitUsing)
+                || decl
+                    .declarations
+                    .iter()
+                    .any(|d| d.init.as_ref().is_some_and(expr_has_yield))
+        }
         Stmt::If {
             test,
             consequent,
@@ -2141,16 +2151,20 @@ impl<'a> Interp<'a> {
     /// Disposes the `using` / `await using` resources recorded in `self.current`
     /// (a coroutine block / body scope leaving *normally*), in reverse order. A
     /// scope with no disposers does nothing (the fast path). A throwing disposer
-    /// is surfaced as a `GenAbrupt::Throw`. An `await using` disposer's result is
-    /// awaited eagerly (via `await_value`) — the documented eager-async-dispose
-    /// model for the coroutine path.
-    fn gen_dispose_scope_resources(&mut self) -> Result<(), GenAbrupt> {
+    /// is surfaced as a `GenAbrupt::Throw`. A disposer that *returns* a promise is
+    /// still awaited eagerly (via `await_value`) — the documented
+    /// eager-async-dispose model for the coroutine path — but `DisposeResources`
+    /// step 4's own `Await(undefined)`, owed when an `await using` resource had no
+    /// dispose method at all, is reported back as `true` so the caller can reify it
+    /// as a real coroutine suspension.
+    fn gen_dispose_scope_resources(&mut self) -> Result<bool, GenAbrupt> {
         if !self.current.has_disposers() {
-            return Ok(());
+            return Ok(false);
         }
         let disposers = self.current.take_disposers();
-        match self.dispose_resources(disposers, Ok(NanBox::undefined())) {
-            Ok(_) => Ok(()),
+        let mut needs_await = false;
+        match self.dispose_resources_tracked(disposers, Ok(NanBox::undefined()), &mut needs_await) {
+            Ok(_) => Ok(needs_await),
             Err(e) => Err(GenAbrupt::from(e)),
         }
     }
@@ -2161,6 +2175,14 @@ impl<'a> Interp<'a> {
     /// pending throw (SuppressedError chain) or, against a non-throw completion
     /// (`return`/`break`/`continue`), replaces it with the disposer's throw. A
     /// scope with no disposers returns the completion unchanged (fast path).
+    ///
+    /// Unlike the normal-exit path
+    /// ([`gen_dispose_scope_resources`](Self::gen_dispose_scope_resources)), an
+    /// `Await(undefined)` owed by `DisposeResources` step 4 is **not** reified as
+    /// a coroutine suspension here: the unwinder has an in-flight completion to
+    /// carry across the suspension, which would need a step that re-raises it on
+    /// resume. So leaving an `await using` scope by `return`/`break`/`throw` still
+    /// costs no microtask turn when every resource lacked a dispose method.
     fn gen_dispose_unwind(&mut self, completion: Completion) -> Completion {
         if !self.current.has_disposers() {
             return completion;
@@ -2356,9 +2378,18 @@ impl<'a> Interp<'a> {
                     // `using` resources recorded in the just-completed scope
                     // (`self.current`), in reverse order, before restoring the
                     // enclosing scope. A throwing disposer becomes a throw.
-                    self.gen_dispose_scope_resources()?;
+                    let needs_await = self.gen_dispose_scope_resources()?;
                     if let Some(s) = scope {
                         self.current = s;
+                    }
+                    if needs_await {
+                        // `DisposeResources` step 4: an `await using` resource with
+                        // no dispose method still costs one `Await(undefined)`, so
+                        // suspend the coroutine here for real. `Discard` drops the
+                        // fulfilment value the resumption pushes.
+                        stack.push(Step::Discard);
+                        stack.push(Step::AwaitExpr);
+                        values.push(NanBox::undefined());
                     }
                     return Ok(StepOut::Continue);
                 }
@@ -2370,7 +2401,13 @@ impl<'a> Interp<'a> {
                     scope,
                     label: label.clone(),
                 });
-                self.gen_exec_stmt(stmt, stack, values, &label)
+                // The sequence's `label` belongs to the *block* (`outer: { … }`),
+                // not to its elements: it is consumed by the unwinder's `Step::Seq`
+                // arm, which is what makes `break outer` leave the block. Passing it
+                // down would let an element statement swallow that break — the
+                // `Flow::Break(l) if l == label` arm of `gen_exec_stmt` — and the
+                // sequence would then wrongly carry on with the following statement.
+                self.gen_exec_stmt(stmt, stack, values, &None)
             }
             Step::While { test, body, label } => {
                 let t = self.eval(test).map_err(GenAbrupt::from)?;

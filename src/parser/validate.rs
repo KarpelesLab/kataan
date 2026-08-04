@@ -1733,7 +1733,8 @@ impl Validator {
                 for s in &decl.specifiers {
                     let (name, span) = match s {
                         crate::ast::ImportSpecifier::Default(id)
-                        | crate::ast::ImportSpecifier::Namespace(id) => (id.name.clone(), id.span),
+                        | crate::ast::ImportSpecifier::Namespace(id)
+                        | crate::ast::ImportSpecifier::Source(id) => (id.name.clone(), id.span),
                         crate::ast::ImportSpecifier::Named { local, .. } => {
                             (local.name.clone(), local.span)
                         }
@@ -2061,6 +2062,21 @@ fn collect_module_top_lexical(stmt: &Stmt, out: &mut Vec<(Box<str>, Span)>) {
                 for (n, span) in names {
                     out.push((n.into(), span));
                 }
+            }
+        }
+        // The BoundNames of an `ImportDeclaration` are LexicallyDeclaredNames of
+        // the module, so `import { x, y as x } from "m"` — or an imported name
+        // that clashes with a top-level `let`/`class`/function — is an early
+        // error just like two `let`s of one name.
+        Stmt::Import(decl) => {
+            for s in &decl.specifiers {
+                let id = match s {
+                    crate::ast::ImportSpecifier::Default(id)
+                    | crate::ast::ImportSpecifier::Namespace(id)
+                    | crate::ast::ImportSpecifier::Source(id)
+                    | crate::ast::ImportSpecifier::Named { local: id, .. } => id,
+                };
+                out.push((id.name.clone(), id.span));
             }
         }
         Stmt::Export(decl) => {

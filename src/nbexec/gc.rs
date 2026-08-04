@@ -281,6 +281,13 @@ impl Interp<'_> {
             .flatten(),
         );
         out.extend(self.builtin_iter_protos.values().copied());
+        // `%AbstractModuleSource%` + its prototype: memoized on the interpreter,
+        // so they must stay live even after the program drops every reference the
+        // host hook handed out.
+        if let Some((ctor, proto)) = self.module_source_intrinsic {
+            out.push(ctor);
+            out.push(proto);
+        }
         out.extend(self.temporal_protos.iter().copied().flatten());
         out.extend(self.wasm_mem_objs.values().copied());
 
