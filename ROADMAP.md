@@ -8,30 +8,29 @@ foundations are summarized once (§1) and not re-litigated; everything after is
 forward-looking.
 
 > **Headline status (2026-08-05):** the official tc39/Test262 corpus (~53k tests)
-> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 99.98 %**
-> — 51,879 of the 51,890 *ran* tests, **11 ledgered failures** (the ~1.5k
-> skipped are host-specific or unimplemented proposals; Temporal / Atomics /
-> agents / cross-realm are no longer skip-gated — see §3.9). Every subsystem
-> that was previously skip-gated now runs, and the Atomics multi-agent
-> scheduler is complete (§3.8).
+> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 99.99 %**
+> — 51,887 of the 51,890 *ran* tests, **3 ledgered failures** (the ~1.5k skipped
+> are host-specific or unimplemented proposals; Temporal / Atomics / agents /
+> cross-realm are no longer skip-gated — see §3.9). Every subsystem that was
+> previously skip-gated now runs, and the Atomics multi-agent scheduler is
+> complete (§3.8).
 >
-> **What the last 11 are.** All but one are Intl locale *output*, and they split
-> cleanly by owner. **Upstream in the `intl` crate (5):** it drops the region
+> **What the last 3 are — none of them ours to fix.** Two are upstream gaps in
+> the `intl` crate, filed as **KarpelesLab/intlrs#32**: it drops the region
 > subtag when picking number symbols, so `pt-PT`/`es-MX`/`de-CH`/`en-ZA`/`it-CH`
-> format like their base language — this hits plain `format()`, not just
-> `formatRange` (1 test); and it ships no `de` *search* collation and no `eor`
-> collation, nor any way to enumerate a locale's available collations (2 tests).
-> **Ours (5):** non-Gregorian era and month names, the `-u-nu-` numbering system
-> reaching DateTimeFormat's numeric fields, and `formatRange` — which does not
-> use the crate's range support at all, so it misses the locale separator, the
-> approximately-sign form, and shared-affix collapsing. **Deliberate (1):**
-> `TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js`
-> is an upstream harness bug; passing it would mean writing through an immutable
-> buffer and breaking 47 sibling tests.
+> format like their base language (this hits plain `format()`, not just
+> `formatRange`); and it vendors no `de` *search* collation — `collation.bin`
+> holds exactly six `-u-co-` keys, and `search`/`searchjl`/`eor` are not among
+> them. The third is deliberate:
+> `TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js` is
+> an upstream harness bug, and passing it would mean writing through an
+> immutable buffer and breaking 47 sibling tests. Each is annotated inline in
+> the ledger with its owner.
 >
 > The Intl *structure* — subclassing, `formatToParts` incl. unit/compact,
 > `resolvedOptions`, Segmenter `containing`, `localeCompare` / `toLocaleString` /
-> `Date.toLocale*` option plumbing — is done, as are **ES modules + dynamic
+> `Date.toLocale*` option plumbing — is done, as are per-calendar eras and month
+> names, `formatRange` via the crate's range support, and **ES modules + dynamic
 > `import()`** (§3.1).
 >
 > Recently converted (ledger-verified): the **live-iteration** cluster (Set/Map +
@@ -724,43 +723,19 @@ What remains here:
   it either, so some other dispatch path serves it. Finding that path is the
   next step; the array iterator, which *does* go through `gen_iter_next`, is
   linear.
-- **Array methods copy the whole array on every call — the biggest one left.**
-  What looked like slow *closure capture* was not closures at all: the `push`
-  in the probe was the cost. `Realm::elements_vec` does `a.to_vec()`, and every
-  array method except `push`/`pop` (which have a fast path above it) goes
-  through it, so an O(1) call is O(n). On an 80 000-element array, 80 000 calls:
+- **Array methods — fixed (2026-08-05).** `at`/`indexOf`/`lastIndexOf`/`push`
+  were each O(n) per call on an 80 000-element array: 3880 / 5573 / 1043 ms
+  across 80 000 calls, now 78 / 77 / 78. Three separate causes, each hidden
+  behind the previous — a whole-array hole mask built before the `push`/`pop`
+  fast path, the `elements_vec` snapshot, and a `HOLE_AWARE_ITER` pre-scan
+  ahead of the new fast path. The last was resolved by making hole handling
+  *exact* (`HasProperty` + `[[Get]]`) rather than by skipping the scan, which
+  also fixed a pre-existing bug where `[,,].at(1)` ignored an inherited
+  `Array.prototype[1]` accessor.
 
-  | | kataan | node |
-  | --- | --- | --- |
-  | `a.at(0)` | 3880 ms | ~0 |
-  | `a.indexOf(0)` | 5573 ms | ~0 |
-  | `a.push(i)` (growing) | 1043 ms | 1 ms |
-  | plain function call | 52 ms | — |
-  | `a[i] = i` | 27 ms | — |
-
-  Indexed assignment and plain calls are linear, so this is specific to the
-  array-method dispatch. The fix is per-method: `at` / `indexOf` /
-  `lastIndexOf` / `includes` need only `array_length` + `get_element`, never a
-  snapshot; methods that genuinely iterate (`map`, `sort`, …) can keep it. Note
-  the `precise_array` hole scan (`elems.iter().any(is_hole)`) is a *second*
-  O(n) per call and has to be addressed with it.
-
-  **`push` is superlinear for a different, unlocated reason**: it returns from
-  its own fast path well before `elements_vec`, and `Realm::array_push` is
-  amortized O(1). Something else in the dispatch is O(n) for an array receiver.
-- **Inherently quadratic, not bugs**: `arr.unshift` and `arr.indexOf` in a loop
-  are O(n) per operation by construction (node's `indexOf` ratio is 17.8 too).
-- **Rope reads.** `charCodeAt` on a `+=`-built string re-walks and re-copies the
-  whole tree per call. **A plain memo on the `Concat` node is the wrong fix and
-  was tried and reverted:** it makes repeated indexing ~7× faster but costs
-  O(n²) *memory*, because a rope read at every growth stage caches a full copy
-  at each level and the old roots stay alive as left children — 1.5 GB peak RSS
-  for a 128 KB string, against 17.6 MB before. The fix has to **flatten in
-  place**, replacing the node's children with the flattened bytes so the
-  intermediate nodes are released (which also makes that pattern linear in
-  time). That means putting the children behind the same interior-mutability
-  cell as the cache, so `as_leaf_bytes`/`last_leaf_bytes`/`first_leaf_bytes`
-  must stop handing out borrows into the tree first.
+  Methods that genuinely iterate (`map`, `filter`, `sort`, …) still take the
+  snapshot; that is O(n) work anyway, so it is a constant factor rather than a
+  scaling bug.
 
 ### 5.1 Long-standing performance work
 
