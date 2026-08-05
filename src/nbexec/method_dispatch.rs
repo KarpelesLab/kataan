@@ -3104,6 +3104,101 @@ impl<'a> Interp<'a> {
                 self.array_like_present = Some(present);
             }
         }
+        // Read-only lookups on a plain dense array need no snapshot: they read
+        // `length` and then individual elements. Routing them through
+        // `elements_vec` copies the entire array on every call, so `a.at(0)` on
+        // an 80 000-element array was O(n) — 80 000 calls took 3.9 s, and
+        // `indexOf` 5.6 s, against ~0 for node.
+        //
+        // Restricted to a *simple* position argument (absent, or a value whose
+        // ToIntegerOrInfinity runs no user code). That is the overwhelmingly
+        // common shape, and it means nothing here can re-enter the interpreter:
+        // the array cannot be mutated, resized or have its guards invalidated
+        // part-way, so reading elements live is sound without re-checking.
+        let simple_pos = |v: NanBox| {
+            matches!(
+                v.unpack(),
+                Unpacked::Undefined | Unpacked::Null | Unpacked::Bool(_) | Unpacked::Number(_)
+            )
+        };
+        if matches!(method, "at" | "indexOf" | "lastIndexOf")
+            && array_like.is_none()
+            && self.realm.typed_kind(handle).is_none()
+            && !self.realm.array_has_index_overrides(handle)
+            && !self.realm.proto_index_accessor_dirty()
+            && let Some(len) = self.realm.array_elements(handle).map(<[_]>::len)
+            && self.realm.array_length(handle) == Some(len)
+            && simple_pos(arg(if method == "at" { 0 } else { 1 }))
+        {
+            // A hole reads `undefined` via `[[Get]]`; the guards above rule out an
+            // inherited index accessor, so no prototype walk is observable.
+            // `None` = the index is genuinely absent (`HasProperty` false), which
+            // `indexOf`/`lastIndexOf` skip. A hole is *not* automatically absent:
+            // the prototype may carry that index, and it may be an accessor, so a
+            // hole falls back to the real `HasProperty` + `[[Get]]`. Only holes
+            // pay for that, so a dense array stays O(1) per element — and because
+            // this is exact, the fast path can run before the whole-array hole
+            // scan rather than behind it.
+            let read = |this: &mut Self, i: usize| -> Result<Option<NanBox>, ExecError> {
+                if !this.realm.array_hole_at(handle, i) {
+                    return Ok(Some(this.realm.get_element(handle, i)));
+                }
+                let key = alloc::format!("{i}");
+                if !this.has_property(handle, &key) {
+                    return Ok(None);
+                }
+                this.read_member(handle, &key).map(Some)
+            };
+            match method {
+                "at" => {
+                    let i = self.coerce_to_integer_or_infinity(arg(0))?;
+                    let idx = if i < 0.0 { len as f64 + i } else { i };
+                    let v = match as_index(idx).filter(|&u| u < len) {
+                        Some(u) => read(self, u)?.unwrap_or(NanBox::undefined()),
+                        None => NanBox::undefined(),
+                    };
+                    return Ok(Some(v));
+                }
+                "indexOf" => {
+                    let target = arg(0);
+                    // Length is checked before the fromIndex coercion.
+                    if len == 0 {
+                        return Ok(Some(NanBox::number(-1.0)));
+                    }
+                    let from = self.array_from_index_checked(arg(1), len)?;
+                    for i in from..len {
+                        let Some(e) = read(self, i)? else { continue };
+                        if self.realm.strict_equals(e, target) {
+                            return Ok(Some(NanBox::number(i as f64)));
+                        }
+                    }
+                    return Ok(Some(NanBox::number(-1.0)));
+                }
+                _ => {
+                    let target = arg(0);
+                    if len == 0 {
+                        return Ok(Some(NanBox::number(-1.0)));
+                    }
+                    let from = if args.len() >= 2 {
+                        let n = self.coerce_to_integer_or_infinity(arg(1))?;
+                        let n = if n < 0.0 { len as f64 + n } else { n };
+                        if n < 0.0 {
+                            return Ok(Some(NanBox::number(-1.0)));
+                        }
+                        (n as usize).min(len - 1)
+                    } else {
+                        len - 1
+                    };
+                    for i in (0..=from).rev() {
+                        let Some(e) = read(self, i)? else { continue };
+                        if self.realm.strict_equals(e, target) {
+                            return Ok(Some(NanBox::number(i as f64)));
+                        }
+                    }
+                    return Ok(Some(NanBox::number(-1.0)));
+                }
+            }
+        }
         // A *real* array receiver (no generic mask) that contains at least one
         // hole is materialized like a generic array-like for the callback methods:
         // presence is `HasProperty` (own or inherited) and each present value is
@@ -3142,36 +3237,6 @@ impl<'a> Interp<'a> {
         // Take the per-index presence mask (set above for a materialized generic
         // array-like); the iteration arms below consult it to skip holes.
         let array_like_present = self.array_like_present.take();
-        // For a *real* array receiver (no generic mask), record which dense slots
-        // are genuine holes so the iteration arms skip them too (HasProperty is
-        // false for a hole). `None` when the receiver carries a generic mask.
-        let real_holes: Option<Vec<bool>> = if array_like_present.is_some() {
-            None
-        } else {
-            self.realm
-                .array_elements(handle)
-                .map(|a| a.iter().map(|e| e.is_hole()).collect())
-        };
-        // Whether the receiver reaching the element arms is a *real* dense array
-        // (not a materialized generic array-like snapshot, nor a typed array). Only
-        // such a receiver may be read *live* via `[[Get]]`/`HasProperty` (so a
-        // callback mutating a later index is observed); a materialized generic
-        // snapshot must instead consult the recorded presence mask, since its absent
-        // indices were filled with `undefined` (which `HasProperty` would report as
-        // present).
-        let receiver_is_real_array = real_holes.is_some();
-        // `true` if index `i` is *present* (not a hole): the recorded
-        // `HasProperty` for a materialized generic array-like, or the dense
-        // hole check for a real array (and unconditionally `true` for any other
-        // receiver kind, e.g. a typed array, which has no holes).
-        let is_present = |i: usize| -> bool {
-            if let Some(m) = array_like_present.as_ref() {
-                return m.get(i).copied().unwrap_or(false);
-            }
-            real_holes
-                .as_ref()
-                .is_none_or(|h| !h.get(i).copied().unwrap_or(false))
-        };
         // For a generic array-like `this`, the callback receives the *original*
         // object as its 3rd argument (`O`), not the materialized snapshot — so
         // `(v, i, arr) => arr === O` and `arr instanceof Boolean` hold.
@@ -3529,6 +3594,40 @@ impl<'a> Interp<'a> {
             }
             return Ok(Some(self.realm.array_pop(handle)));
         }
+        // Deferred until after the `push`/`pop` fast path above: building the
+        // hole mask walks and allocates over the whole array, and those two
+        // methods never consult it, so computing it eagerly made every `push`
+        // O(n) — 80 000 pushes took 1043 ms against node's 1 ms.
+        // For a *real* array receiver (no generic mask), record which dense slots
+        // are genuine holes so the iteration arms skip them too (HasProperty is
+        // false for a hole). `None` when the receiver carries a generic mask.
+        let real_holes: Option<Vec<bool>> = if array_like_present.is_some() {
+            None
+        } else {
+            self.realm
+                .array_elements(handle)
+                .map(|a| a.iter().map(|e| e.is_hole()).collect())
+        };
+        // Whether the receiver reaching the element arms is a *real* dense array
+        // (not a materialized generic array-like snapshot, nor a typed array). Only
+        // such a receiver may be read *live* via `[[Get]]`/`HasProperty` (so a
+        // callback mutating a later index is observed); a materialized generic
+        // snapshot must instead consult the recorded presence mask, since its absent
+        // indices were filled with `undefined` (which `HasProperty` would report as
+        // present).
+        let receiver_is_real_array = real_holes.is_some();
+        // `true` if index `i` is *present* (not a hole): the recorded
+        // `HasProperty` for a materialized generic array-like, or the dense
+        // hole check for a real array (and unconditionally `true` for any other
+        // receiver kind, e.g. a typed array, which has no holes).
+        let is_present = |i: usize| -> bool {
+            if let Some(m) = array_like_present.as_ref() {
+                return m.get(i).copied().unwrap_or(false);
+            }
+            real_holes
+                .as_ref()
+                .is_none_or(|h| !h.get(i).copied().unwrap_or(false))
+        };
         if let Some(elems) = self.realm.elements_vec(handle) {
             // Methods whose integer-position arguments go through
             // ToIntegerOrInfinity (→ ToNumber): a Symbol argument must throw a
@@ -4809,12 +4908,19 @@ impl<'a> Interp<'a> {
                                 .unwrap_or(NanBox::undefined()),
                         ));
                     }
-                    // Plain array: `at` reads via `[[Get]]`, so a hole reads `undefined`.
-                    let v = as_index(idx)
-                        .and_then(|u| elems.get(u))
-                        .copied()
-                        .unwrap_or(NanBox::undefined());
-                    return Ok(Some(if v.is_hole() { NanBox::undefined() } else { v }));
+                    // Plain array: `at` reads via `[[Get]]`. A hole is not an own
+                    // property, so the read walks the prototype rather than
+                    // yielding `undefined` outright — `Array.prototype[1]` may be
+                    // an accessor, and node returns its value here.
+                    let Some(u) = as_index(idx).filter(|&u| u < elems.len()) else {
+                        return Ok(Some(NanBox::undefined()));
+                    };
+                    let v = elems[u];
+                    return Ok(Some(if v.is_hole() {
+                        self.read_member(handle, &alloc::format!("{u}"))?
+                    } else {
+                        v
+                    }));
                 }
                 "lastIndexOf" => {
                     let target = arg(0);
