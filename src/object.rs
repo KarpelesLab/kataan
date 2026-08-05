@@ -61,8 +61,19 @@ enum ObjectData {
     },
     /// Dictionary representation: values keyed by name, with a parallel list
     /// preserving insertion order. Carries no live `Rc<Shape>`, so it creates no
-    /// transitions; `order` and `map` are kept in sync (every key in `order` is
-    /// a key in `map` and vice versa).
+    /// transitions.
+    ///
+    /// `map` is authoritative for *membership*; `order` only records positions
+    /// and is allowed to drift from it:
+    ///
+    /// - a **stale** entry (deleted key) may remain, and
+    /// - a key may appear **more than once** (deleted, then re-added).
+    ///
+    /// The last occurrence present in `map` gives the key's position, which is
+    /// exactly the spec's "a re-created property is chronologically new". This
+    /// drift is what makes `delete` O(log n): removing from `order` eagerly is a
+    /// linear `retain`, so deleting n keys was O(n²) — 20 000 deletes took 9.7 s
+    /// against node's 2 ms. `compact_order` bounds the slack.
     Dict {
         order: Vec<Box<str>>,
         map: BTreeMap<Box<str>, NanBox>,
@@ -294,7 +305,7 @@ impl Object {
     pub fn len(&self) -> u32 {
         match &self.data {
             ObjectData::Shaped { shape, .. } => shape.len(),
-            ObjectData::Dict { order, .. } => order.len() as u32,
+            ObjectData::Dict { map, .. } => map.len() as u32,
         }
     }
 
@@ -303,7 +314,7 @@ impl Object {
     pub fn is_empty(&self) -> bool {
         match &self.data {
             ObjectData::Shaped { shape, .. } => shape.is_empty(),
-            ObjectData::Dict { order, .. } => order.is_empty(),
+            ObjectData::Dict { map, .. } => map.is_empty(),
         }
     }
 
@@ -495,6 +506,27 @@ impl Object {
     /// Converts a shaped object to dictionary mode in place, preserving the
     /// current properties in insertion order and dropping the live `Rc<Shape>`
     /// so no further transitions are created. A no-op if already a dictionary.
+    /// Rebuilds `Dict.order` from the live keys when it has accumulated more
+    /// slack than live entries.
+    ///
+    /// Deletion leaves stale entries behind (see [`ObjectData::Dict`]), so
+    /// without this a long-lived object that is repeatedly added to and deleted
+    /// from would grow `order` without bound and slow every enumeration. Halving
+    /// the slack costs O(n) but only after n deletions, so deletion stays
+    /// amortized O(log n).
+    fn compact_order(&mut self) {
+        let ObjectData::Dict { order, map } = &self.data else {
+            return;
+        };
+        if order.len() <= 2 * map.len() + 16 {
+            return;
+        }
+        let live: Vec<Box<str>> = self.keys().into_iter().map(Box::from).collect();
+        if let ObjectData::Dict { order, .. } = &mut self.data {
+            *order = live;
+        }
+    }
+
     fn convert_to_dict(&mut self) {
         let ObjectData::Shaped { shape, slots } = &self.data else {
             return;
@@ -519,7 +551,21 @@ impl Object {
     pub fn keys(&self) -> Vec<&str> {
         match &self.data {
             ObjectData::Shaped { shape, .. } => shape.keys(),
-            ObjectData::Dict { order, .. } => order.iter().map(Box::as_ref).collect(),
+            ObjectData::Dict { order, map } => {
+                // Walk backwards keeping the first sighting of each key that is
+                // still present, then restore order: that selects the *last*
+                // occurrence, so a deleted-then-re-added key reads as new.
+                let mut seen: alloc::collections::BTreeSet<&str> = Default::default();
+                let mut out: Vec<&str> = Vec::with_capacity(map.len());
+                for k in order.iter().rev() {
+                    let k = k.as_ref();
+                    if map.contains_key(k) && seen.insert(k) {
+                        out.push(k);
+                    }
+                }
+                out.reverse();
+                out
+            }
         }
     }
 
@@ -705,10 +751,8 @@ impl Object {
                 *shape = new_shape;
                 *slots = new_slots;
             }
-            ObjectData::Dict { order, map } => {
-                if map.remove(key).is_some() {
-                    order.retain(|k| k.as_ref() != key);
-                }
+            ObjectData::Dict { map, .. } => {
+                map.remove(key);
             }
         }
     }
@@ -757,11 +801,11 @@ impl Object {
                 *slots = new_slots;
                 true
             }
-            ObjectData::Dict { order, map } => {
+            ObjectData::Dict { map, .. } => {
                 if map.remove(key).is_none() {
                     return had_accessor;
                 }
-                order.retain(|k| k.as_ref() != key);
+                self.compact_order();
                 true
             }
         }
@@ -1030,6 +1074,52 @@ mod tests {
     fn add(o: &mut Object, key: &str, value: NanBox, threshold: usize) {
         o.maybe_convert_to_dict(key, threshold);
         o.set(key, value);
+    }
+
+    /// `Dict.order` is allowed to hold stale and duplicate entries so that
+    /// `delete` need not scan it (deleting n keys was O(n²)). Enumeration must
+    /// still report each live key exactly once, at the position of its *last*
+    /// insertion — a deleted-then-re-added property is chronologically new — and
+    /// `order` must not grow without bound under churn.
+    #[test]
+    fn dictionary_delete_keeps_enumeration_order_and_is_bounded() {
+        let threshold = 4;
+        let mut o = Object::new(Shape::root());
+        for i in 0..10 {
+            add(&mut o, &alloc::format!("k{i}"), n(f64::from(i)), threshold);
+        }
+        assert_eq!(o.len(), 10);
+
+        // A delete removes the key from enumeration and from the count.
+        o.delete(Shape::root(), "k3");
+        assert_eq!(o.len(), 9);
+        assert!(!o.keys().contains(&"k3"));
+
+        // Re-adding puts it back at the END, and exactly once.
+        add(&mut o, "k3", n(99.0), threshold);
+        assert_eq!(o.len(), 10);
+        assert_eq!(*o.keys().last().unwrap(), "k3");
+        assert_eq!(o.keys().iter().filter(|k| **k == "k3").count(), 1);
+        assert_eq!(o.get("k3").unwrap().unpack(), Unpacked::Number(99.0));
+
+        // Heavy churn on one key: order stays correct and `order` stays bounded
+        // (compaction), rather than accumulating one stale entry per delete.
+        for r in 0..500 {
+            o.delete(Shape::root(), "k0");
+            add(&mut o, "k0", n(f64::from(r)), threshold);
+        }
+        assert_eq!(o.len(), 10);
+        assert_eq!(o.keys().iter().filter(|k| **k == "k0").count(), 1);
+        assert_eq!(*o.keys().last().unwrap(), "k0");
+        assert_eq!(o.keys().len(), 10);
+
+        // Deleting everything leaves an empty, self-consistent object.
+        for i in 0..10 {
+            o.delete(Shape::root(), &alloc::format!("k{i}"));
+        }
+        assert_eq!(o.len(), 0);
+        assert!(o.keys().is_empty());
+        assert!(o.is_empty());
     }
 
     #[test]

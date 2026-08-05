@@ -272,13 +272,16 @@ impl<'a> Interp<'a> {
             .get_property(h, GEN_IDX)
             .and_then(|n| n.as_number())
             .unwrap_or(0.0) as usize;
-        let elems = self.realm.array_elements(buf).map(<[_]>::to_vec);
-        let len = elems.as_ref().map_or(0, Vec::len);
-        let (value, done) = match elems.as_ref().and_then(|e| e.get(idx)) {
+        // Read the one element, never a copy of the whole buffer: cloning it
+        // per step made every built-in iterator O(n) per `next()`, so driving one
+        // to completion was O(n²) (`Array.from("x".repeat(80000))` took 891 ms
+        // against node's ~0, while the eager `[...s]` path was 3 ms).
+        let len = self.realm.array_length(buf).unwrap_or(0);
+        let (value, done) = match (idx < len).then(|| self.realm.get_element(buf, idx)) {
             Some(v) => {
                 self.realm
                     .set_hidden_property(h, GEN_IDX, NanBox::number((idx + 1) as f64));
-                (*v, false)
+                (v, false)
             }
             None => {
                 let v = if idx == len {
