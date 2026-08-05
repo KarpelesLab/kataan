@@ -707,10 +707,25 @@ What remains here:
 
 - **Residual `push` superlinearity** (~×3.7 after the snapshot fix) and the rest
   of the per-dispatch work in `call_method`.
-- **Not yet swept**: `obj delete`, `arr.join`, `Array.from(str)` and
-  `JSON.stringify` all show ratios of 8–11 per ×4 in the scaling probe where
-  linear is 4. The absolute times are small (tens of ms), so some of that is
-  measurement noise, but they have not been diagnosed.
+- **Swept (2026-08-05).** Re-measured at 20k/40k/80k, which separated two real
+  quadratics from two false positives — `arr.join` and `JSON.stringify` were
+  measurement noise at the smaller sizes. Fixed: **`delete`** was a linear
+  `retain` over the dictionary's insertion-order vector (9682 ms → 91 ms for 80k
+  deletes), and **built-in iterator `next`** cloned its whole backing buffer
+  every step (`Array.from` on an 80 000-char string, 891 ms → 46 ms).
+- **Open, and deliberately not guessed at further: the string iterator's drain.**
+  Draining `"x".repeat(80000)[Symbol.iterator]()` takes ~830 ms, where draining
+  an `Array.from` of the very same characters takes ~144 ms. Ruled out by
+  measurement, so do not re-test these: it is **not** GC (identical with
+  `KATAAN_GC_THRESHOLD` effectively disabling collection), **not** heap-cell
+  locality (arrays of 80k strings and 80k objects drain exactly as fast as
+  arrays of numbers), and **not** `gen_iter_next` — instrumentation shows a
+  string iterator's `next()` never reaches it, and `call_native` never fires for
+  it either, so some other dispatch path serves it. Finding that path is the
+  next step; the array iterator, which *does* go through `gen_iter_next`, is
+  linear.
+- **Closure capture** (`for (…) f.push(() => i)`) also shows ~×12 per ×4 and has
+  not been diagnosed.
 - **Inherently quadratic, not bugs**: `arr.unshift` and `arr.indexOf` in a loop
   are O(n) per operation by construction (node's `indexOf` ratio is 17.8 too).
 - **Rope reads.** `charCodeAt` on a `+=`-built string re-walks and re-copies the
