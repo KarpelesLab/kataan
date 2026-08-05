@@ -724,8 +724,30 @@ What remains here:
   it either, so some other dispatch path serves it. Finding that path is the
   next step; the array iterator, which *does* go through `gen_iter_next`, is
   linear.
-- **Closure capture** (`for (…) f.push(() => i)`) also shows ~×12 per ×4 and has
-  not been diagnosed.
+- **Array methods copy the whole array on every call — the biggest one left.**
+  What looked like slow *closure capture* was not closures at all: the `push`
+  in the probe was the cost. `Realm::elements_vec` does `a.to_vec()`, and every
+  array method except `push`/`pop` (which have a fast path above it) goes
+  through it, so an O(1) call is O(n). On an 80 000-element array, 80 000 calls:
+
+  | | kataan | node |
+  | --- | --- | --- |
+  | `a.at(0)` | 3880 ms | ~0 |
+  | `a.indexOf(0)` | 5573 ms | ~0 |
+  | `a.push(i)` (growing) | 1043 ms | 1 ms |
+  | plain function call | 52 ms | — |
+  | `a[i] = i` | 27 ms | — |
+
+  Indexed assignment and plain calls are linear, so this is specific to the
+  array-method dispatch. The fix is per-method: `at` / `indexOf` /
+  `lastIndexOf` / `includes` need only `array_length` + `get_element`, never a
+  snapshot; methods that genuinely iterate (`map`, `sort`, …) can keep it. Note
+  the `precise_array` hole scan (`elems.iter().any(is_hole)`) is a *second*
+  O(n) per call and has to be addressed with it.
+
+  **`push` is superlinear for a different, unlocated reason**: it returns from
+  its own fast path well before `elements_vec`, and `Realm::array_push` is
+  amortized O(1). Something else in the dispatch is O(n) for an array receiver.
 - **Inherently quadratic, not bugs**: `arr.unshift` and `arr.indexOf` in a loop
   are O(n) per operation by construction (node's `indexOf` ratio is 17.8 too).
 - **Rope reads.** `charCodeAt` on a `+=`-built string re-walks and re-copies the
