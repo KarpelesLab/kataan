@@ -712,17 +712,20 @@ What remains here:
   `retain` over the dictionary's insertion-order vector (9682 ms → 91 ms for 80k
   deletes), and **built-in iterator `next`** cloned its whole backing buffer
   every step (`Array.from` on an 80 000-char string, 891 ms → 46 ms).
-- **Open, and deliberately not guessed at further: the string iterator's drain.**
-  Draining `"x".repeat(80000)[Symbol.iterator]()` takes ~830 ms, where draining
-  an `Array.from` of the very same characters takes ~144 ms. Ruled out by
-  measurement, so do not re-test these: it is **not** GC (identical with
-  `KATAAN_GC_THRESHOLD` effectively disabling collection), **not** heap-cell
-  locality (arrays of 80k strings and 80k objects drain exactly as fast as
-  arrays of numbers), and **not** `gen_iter_next` — instrumentation shows a
-  string iterator's `next()` never reaches it, and `call_native` never fires for
-  it either, so some other dispatch path serves it. Finding that path is the
-  next step; the array iterator, which *does* go through `gen_iter_next`, is
-  linear.
+- **String iterator drain — fixed (2026-08-23).** 784 ms -> 58 ms for an
+  80 000-char drain, now linear. There are **two** implementations of the
+  built-in iterator's `next`: `Interp::gen_iter_next` and an arm in
+  `call_method`. They diverge by receiver — an array iterator carries `GEN_ARR`
+  and reaches the native path, a `GEN_BUF` iterator (a string's) is intercepted
+  by the method-name dispatch first — so fixing the whole-buffer copy in one
+  left the other O(n) per step.
+
+  Worth keeping: the four hypotheses eliminated on the way (GC, heap-cell
+  locality, `gen_iter_next`, `call_native`) were all *correct* observations that
+  led nowhere, because the unexamined assumption was that there was a single
+  implementation. The dual-builder rule is usually stated for nbvm vs nbexec; it
+  holds within nbexec too.
+
 - **Array methods — fixed (2026-08-05).** `at`/`indexOf`/`lastIndexOf`/`push`
   were each O(n) per call on an 80 000-element array: 3880 / 5573 / 1043 ms
   across 80 000 calls, now 78 / 77 / 78. Three separate causes, each hidden
