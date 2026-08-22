@@ -761,16 +761,23 @@ impl<'a> Interp<'a> {
                         .get_property(handle, GEN_IDX)
                         .and_then(|n| n.as_number())
                         .unwrap_or(0.0) as usize;
-                    let elems = self.realm.array_elements(buf).map(<[_]>::to_vec);
-                    let len = elems.as_ref().map_or(0, Vec::len);
-                    let (value, done) = match elems.as_ref().and_then(|e| e.get(idx)) {
+                    // Read the single element, never a copy of the whole buffer.
+                    // This is a *second* implementation of the built-in iterator
+                    // `next`, alongside `Interp::gen_iter_next`; the array iterator
+                    // reaches that one (it carries `GEN_ARR`) while a `GEN_BUF`
+                    // iterator — a string's, notably — is intercepted here, so
+                    // fixing only the other copy left string iteration O(n) per
+                    // step. Draining an 80 000-char string: 784 ms -> see below.
+                    let len = self.realm.array_length(buf).unwrap_or(0);
+                    let (value, done) = match (idx < len).then(|| self.realm.get_element(buf, idx))
+                    {
                         Some(v) => {
                             self.realm.set_hidden_property(
                                 handle,
                                 GEN_IDX,
                                 NanBox::number((idx + 1) as f64),
                             );
-                            (*v, false)
+                            (v, false)
                         }
                         // The first call past the yields surfaces the `return`
                         // value (with `done: true`); later calls yield undefined.
