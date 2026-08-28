@@ -745,6 +745,16 @@ What remains here:
 - **Interpreter:** IC tuning, array element-kind fast paths, rope tuning, finish
   the generational nursery + write barriers on the existing moving GC for
   bump-allocation throughput.
+
+  A constant-factor sweep (2026-08-28) puts most operations within ~1.2x of the
+  engine's own empty loop; **closure allocation was the one outlier at 12x** and
+  is now ~8x, after dropping the eager `name`/`length` materialization in nbvm
+  (58% of the cost, of which the per-closure `new_string` for the function name
+  was 37%). What is left is the heap allocation itself — the `\0vmfn` tag was
+  measured and is not significant. Measure this sweep **externally**: a
+  `Date.now()` in the harness forces whole-program fallback to the tree-walker,
+  so an in-script timer benchmarks the wrong tier, and this box's variance is
+  wide enough to need best-of-N.
 - **Optimizing JIT (after the 2.1 baseline tier):** an SSA IR with inlining,
   escape analysis, range/redundancy elimination, type-feedback speculation with
   guard-based deopt — through the shared backend. The point where we contend with
