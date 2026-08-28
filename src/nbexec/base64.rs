@@ -288,15 +288,17 @@ pub(crate) fn to_base64(bytes: &[u8], alphabet: B64Alphabet, omit_padding: bool)
         B64Alphabet::Url => B64_URL,
     };
     let mut out = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut chunks = bytes.chunks_exact(3);
-    for c in &mut chunks {
+    // `as_chunks::<3>` over `chunks_exact(3)`: same split, but the fixed-size
+    // array lets the indexing below be bounds-check-free (and rustc 1.98's
+    // clippy asks for it).
+    let (triples, rem) = bytes.as_chunks::<3>();
+    for c in triples {
         let n = (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
         out.push(tbl[(n >> 18) as usize & 63]);
         out.push(tbl[(n >> 12) as usize & 63]);
         out.push(tbl[(n >> 6) as usize & 63]);
         out.push(tbl[n as usize & 63]);
     }
-    let rem = chunks.remainder();
     match rem.len() {
         1 => {
             let n = u32::from(rem[0]) << 16;
