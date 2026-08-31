@@ -321,11 +321,6 @@ impl Rope {
     /// lossless WTF-8 bytes.
     #[must_use]
     pub fn materialize(&self) -> String {
-        #[cfg(feature = "std")]
-        if self.len() > 500 {
-            extern crate std;
-            std::eprintln!("MAT_STR {}", self.len());
-        }
         wtf8::to_string_lossy(&self.materialize_bytes())
     }
 }
