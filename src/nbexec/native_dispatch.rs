@@ -1052,12 +1052,27 @@ impl<'a> Interp<'a> {
                 }
                 if let Some(raw) = arg(0).as_handle() {
                     let h = Handle::from_raw(raw);
-                    // SetIntegrityLevel step 3 (see `N_OBJECT_FREEZE`). Sealing
-                    // only makes the own keys non-configurable, which an
-                    // integer-indexed exotic object accepts, so there is no
-                    // element-count restriction here.
-                    if self.is_object_value(arg(0)) && !self.prevent_extensions_of(h)? {
-                        return Err(self.type_error("Object.seal failed"));
+                    // SetIntegrityLevel step 3 (see `N_OBJECT_FREEZE`).
+                    if self.is_object_value(arg(0)) {
+                        if !self.prevent_extensions_of(h)? {
+                            return Err(self.type_error("Object.seal failed"));
+                        }
+                        // …and step 5.b defines every own key `configurable:
+                        // false`, which an integer-indexed exotic object rejects
+                        // — exactly as for `freeze` above. The previous comment
+                        // here claimed the opposite ("which an integer-indexed
+                        // exotic object accepts"), which contradicted both the
+                        // spec and this engine's own `[[DefineOwnProperty]]`:
+                        // `Object.defineProperty(ta, "0", {configurable: false})`
+                        // already threw, while `Object.seal(ta)` — the same
+                        // operation per index — did not.
+                        if self.realm.typed_kind(h).is_some()
+                            && self.realm.typed_len(h).is_some_and(|n| n > 0)
+                        {
+                            return Err(self.type_error(
+                                "Cannot redefine an index of an integer-indexed exotic object",
+                            ));
+                        }
                     }
                     self.realm.seal_object(h);
                 }
