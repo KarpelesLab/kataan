@@ -740,6 +740,37 @@ What remains here:
   snapshot; that is O(n) work anyway, so it is a constant factor rather than a
   scaling bug.
 
+### 3.14 `await using`: disposal must suspend per resource
+
+`DisposeResources` awaits the result of **each** async disposer. That await has
+to be a real coroutine suspension, so the disposers of one scope are separated
+by microtask turns and an observer between them sees only the first.
+
+Today the disposal loop (`dispose_resources_tracked`, `src/nbexec/resource.rs`)
+runs to completion inside one Rust call and awaits via `Interp::await_value`,
+which resolves eagerly and cannot suspend the frame. Only step 4's owed
+`Await(undefined)` — the case where a resource has *no* dispose method — is
+reified as a suspension, by `gen_dispose_scope_resources` pushing
+`Step::AwaitExpr`. So:
+
+```js
+async function f() {
+  await using x = { [Symbol.asyncDispose]() { v.push(42) } };
+  await using y = { [Symbol.asyncDispose]() { v.push(43) } };
+}
+f();                       // not awaited
+v;                         // spec: [43]   kataan: [43, 42]
+```
+
+Fixing it means making the disposal loop a **resumable state machine** driven by
+the coroutine engine (one `Step::AwaitExpr` per async disposer) rather than a
+Rust `for` loop, while preserving reverse order, the `SuppressedError`
+aggregation chain, and the sync/async mixed-stack rules. That is the same shape
+as the other suspendable-native work (see the native-continuation pattern used
+for `Array.fromAsync`).
+
+Failing: `staging/explicit-resource-management/await-using-in-async-function-call-without-await.js` (the rest of that directory is 52/53).
+
 ### 5.1 Long-standing performance work
 
 - **Interpreter:** IC tuning, array element-kind fast paths, rope tuning, finish
