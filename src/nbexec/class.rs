@@ -652,6 +652,16 @@ impl<'a> Interp<'a> {
                                 }
                                 Ok(())
                             })();
+                            // A static block is *function code*, so its body is a
+                            // disposal scope: a `using` declared directly in it must
+                            // dispose when the block finishes. Without this the
+                            // disposers were registered on the block scope and then
+                            // dropped unrun — a nested `{ … }` inside the block
+                            // disposed correctly, which is what made the omission
+                            // easy to miss. Runs before the scope is restored,
+                            // because it reads the disposers off `self.current`.
+                            let r = self
+                                .dispose_block_scope(r.map(|()| Flow::Normal(NanBox::undefined())));
                             self.current = saved_cur;
                             self.var_scope = saved_vs;
                             r?;

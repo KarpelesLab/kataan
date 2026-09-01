@@ -571,7 +571,10 @@ impl<'a> Interp<'a> {
     /// no allocation, no behavior change). The block's *value* completion is
     /// preserved when disposal does not throw; a throwing disposer replaces the
     /// completion with the (possibly SuppressedError-chained) throw.
-    fn dispose_block_scope(&mut self, result: Result<Flow, ExecError>) -> Result<Flow, ExecError> {
+    pub(crate) fn dispose_block_scope(
+        &mut self,
+        result: Result<Flow, ExecError>,
+    ) -> Result<Flow, ExecError> {
         if !self.current.has_disposers() {
             return result;
         }
