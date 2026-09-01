@@ -4861,17 +4861,33 @@ impl<'a> Interp<'a> {
                     // is the `this` value for each callback invocation.
                     let this_arg = arg(1);
                     let mut k = 0usize;
-                    for (i, e) in elems.iter().enumerate() {
-                        // Only *present* elements are mapped (HasProperty); an
-                        // absent generic-array-like index (or a real-array hole) is
-                        // skipped, so a poisoned getter past `length` is never read.
-                        if !is_present(i) {
+                    // Read through `array_cb_read` like `map`/`filter`/`forEach`,
+                    // rather than off the snapshot: `len` is captured once, but each
+                    // index is then `HasProperty`-gated and `[[Get]]`-read live, so
+                    // a callback that shrinks the array is observed. Iterating the
+                    // snapshot made `[0,1,2,3].flatMap(e => { a.length = 3; … })`
+                    // yield 4 elements where the spec (and every other method here)
+                    // yields 3.
+                    let live = receiver_is_real_array;
+                    for i in 0..elems.len() {
+                        let present = is_present(i);
+                        let Some(e) = self.array_cb_read(
+                            handle,
+                            i,
+                            false,
+                            live,
+                            &elems,
+                            present,
+                            true,
+                            array_proto_generic,
+                        )?
+                        else {
                             continue;
-                        }
+                        };
                         let r = self.call_with_this(
                             f,
                             this_arg,
-                            &[*e, NanBox::number(i as f64), callback_recv],
+                            &[e, NanBox::number(i as f64), callback_recv],
                         )?;
                         // Flatten one level: a mapped array spreads its *present*
                         // elements (holes skipped), a non-array is appended.

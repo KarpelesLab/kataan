@@ -268,7 +268,16 @@ fn assemble(
 
 /// Decides whether a test is out of scope for the current engine/build.
 fn skip_reason(rel: &str, meta: &Meta) -> Option<&'static str> {
-    if rel.starts_with("staging/") {
+    // `staging/` holds tests not yet promoted into the main suite (mostly the
+    // donated SpiderMonkey corpus). It is excluded from the gate by default, as
+    // most engines do — but the exclusion is opt-out, not invisible:
+    // `KATAAN_T262_STAGING=1` runs it. Measured 2026-09-01: 1129/1482 pass, 353
+    // fail. 348 of those are `staging/sm/`; the rest are real conformance bugs
+    // (flatMap side-effect ordering, `Object.seal` on a length-tracking typed
+    // array, two disposal-ordering cases, one source-phase-import rejection).
+    // Do not quote a corpus pass-rate as "100%" without saying which side of
+    // this line it is on.
+    if rel.starts_with("staging/") && std::env::var("KATAAN_T262_STAGING").is_err() {
         return Some("staging");
     }
     // Temporal is implemented for the plain/instant/duration types; ZonedDateTime
