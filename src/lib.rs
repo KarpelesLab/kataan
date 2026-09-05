@@ -95,6 +95,7 @@ pub mod wtf8;
 /// Rope strings: lazy O(1) concatenation so building a string piecewise is not
 /// quadratic. Needs `alloc`.
 #[cfg(feature = "alloc")]
+pub mod interrupt;
 pub mod rope;
 
 /// The object-model context (`Realm`) bundling the heap, the shared root shape,

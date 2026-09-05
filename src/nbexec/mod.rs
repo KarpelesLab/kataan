@@ -47,6 +47,13 @@ pub enum ExecError {
     NotCallable,
     /// A thrown JS value, propagating until a `catch` handles it.
     Throw(NanBox),
+    /// The host's watchdog tripped (see [`crate::interrupt`]). Like
+    /// [`Self::OptShortCircuit`] this is *not* a throw, so `try`/`catch` never
+    /// sees it — otherwise `while (true) { try {} catch (e) {} }` would swallow
+    /// the deadline and the watchdog would be advisory rather than enforced.
+    /// `finally` and `using` disposal are skipped for the same reason: a hard
+    /// deadline cannot promise to run cleanup that may itself loop forever.
+    Interrupted,
     /// An optional-chain short-circuit: a `?.` link found a nullish base. It
     /// propagates (past intervening non-optional links) up to the enclosing
     /// `Expr::OptChain` boundary, which turns it into `undefined`. It is *not* a
@@ -5854,6 +5861,14 @@ impl<'a> Interp<'a> {
                 self.make_error(N_ERROR_BASE, Some(m))
             }
             ExecError::OptShortCircuit => NanBox::undefined(),
+            // An interrupt should never reach the host boundary as a *value* —
+            // the entry points surface it as a distinct outcome. Materialize a
+            // plain Error defensively rather than silently yielding `undefined`,
+            // which would read as a normal completion.
+            ExecError::Interrupted => {
+                let m = self.new_str("execution interrupted by the host");
+                self.make_error(N_ERROR_BASE, Some(m))
+            }
             // A tail call is always consumed by the enclosing `invoke` trampoline,
             // so it never reaches the host boundary; defensively perform it here.
             ExecError::TailCall {
@@ -9412,6 +9427,19 @@ pub fn eval_source_typed(
     source: &str,
     limits: crate::limits::Limits,
 ) -> Result<(String, String), Thrown> {
+    eval_source_typed_interruptible(source, limits, None)
+}
+
+/// [`eval_source_typed`] with a host watchdog installed.
+///
+/// The flag is not a field of [`Limits`](crate::limits::Limits) because that
+/// type is `Copy` and an [`Interrupt`](crate::interrupt::Interrupt) owns an
+/// `Arc`; threading it separately keeps `Limits` cheap to pass by value.
+pub fn eval_source_typed_interruptible(
+    source: &str,
+    limits: crate::limits::Limits,
+    interrupt: Option<crate::interrupt::Interrupt>,
+) -> Result<(String, String), Thrown> {
     let program = match crate::parser::Parser::parse_program(source) {
         Ok(p) => p,
         Err(e) => {
@@ -9434,6 +9462,7 @@ pub fn eval_source_typed(
         });
     }
     let mut interp = Interp::new_with_limits(limits);
+    interp.realm.interrupt = interrupt;
     match interp.run(&program) {
         Ok(value) => {
             let completion = interp.display(value);

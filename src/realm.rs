@@ -280,6 +280,10 @@ pub struct Realm {
     /// Tunable resource limits for work driven in this realm. Defaults to
     /// [`crate::limits::Limits::default`]; override with [`Realm::with_limits`].
     pub limits: crate::limits::Limits,
+    /// Host watchdog flag, when the embedder installed one. `None` — the
+    /// default — makes every check point a null test on this `Option`.
+    /// See [`crate::interrupt`].
+    pub interrupt: Option<crate::interrupt::Interrupt>,
     /// Allocation-pressure trigger: the number of objects that may be allocated
     /// after the last collection before [`maybe_collect`](Realm::maybe_collect)
     /// runs another one. Re-armed after every cycle to
@@ -482,6 +486,7 @@ impl Realm {
         #[cfg(not(feature = "std"))]
         let pinned: Option<usize> = None;
         Self {
+            interrupt: None,
             heap,
             root_shape: Shape::root(),
             atoms: AtomTable::new(),

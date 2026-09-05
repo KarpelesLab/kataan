@@ -1161,6 +1161,8 @@ impl<'a> Interp<'a> {
         let v_mark = self.gc_root(&[v]);
         let r = (|| {
             for item in items {
+                // Loop back-edge: observe a host interrupt (crate::interrupt).
+                self.check_interrupt()?;
                 // `for-in`: skip a key whose property has been deleted since the key
                 // set was captured (and not yet re-added). A same-named property still
                 // reachable on the prototype chain keeps the key live.

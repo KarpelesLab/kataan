@@ -121,7 +121,25 @@ impl<'a> Interp<'a> {
     /// unwinds the agent's whole stack (a `catch` never sees it) so its thread
     /// can exit even from an unbounded spin loop.
     #[inline]
+    /// Observes a host interrupt at a loop back-edge (see [`crate::interrupt`]).
+    ///
+    /// Returns the non-catchable [`ExecError::Interrupted`], so a `try`/`catch`
+    /// around the loop body cannot swallow the deadline. Costs a null test on an
+    /// `Option` when no watchdog is installed.
+    pub(crate) fn check_interrupt(&self) -> Result<(), ExecError> {
+        if self
+            .realm
+            .interrupt
+            .as_ref()
+            .is_some_and(crate::interrupt::Interrupt::is_tripped)
+        {
+            return Err(ExecError::Interrupted);
+        }
+        Ok(())
+    }
+
     pub(crate) fn agent_tick(&mut self) -> Result<(), ExecError> {
+        self.check_interrupt()?;
         #[cfg(feature = "std")]
         if let Some(pool) = &self.agent.pool
             && pool.yield_baton()

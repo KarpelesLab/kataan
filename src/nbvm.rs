@@ -880,6 +880,11 @@ pub enum VmError {
     Unsupported,
     /// An uncaught `throw` propagating out of the call stack (the thrown value).
     Thrown(NanBox),
+    /// The host's watchdog tripped (see [`crate::interrupt`]). Unwinds without
+    /// running `catch`/`finally`, and — unlike every other `VmError` — must
+    /// **not** fall back to re-running the program on the tree-walker, which
+    /// would restart the very loop the interrupt was raised to stop.
+    Interrupted,
 }
 
 /// Runs `program` with a register file of `register_count` slots (initialized to
@@ -2822,8 +2827,17 @@ fn run_frame(
             Op::Jump { target } => {
                 // A backward jump is a loop back-edge — the one point in the
                 // dispatch loop where no partially-evaluated opcode state exists,
-                // so it is where an allocation-triggered collection can run.
+                // so it is where an allocation-triggered collection can run, and
+                // where a host interrupt is observed (see `crate::interrupt`).
                 if *target <= pc {
+                    if ctx
+                        .realm
+                        .interrupt
+                        .as_ref()
+                        .is_some_and(crate::interrupt::Interrupt::is_tripped)
+                    {
+                        return Err(VmError::Interrupted);
+                    }
                     vm_safepoint(ctx, funcs, program, regs);
                 }
                 pc = *target;
@@ -5656,6 +5670,23 @@ pub fn execute_typed(
     source: &str,
     limits: crate::limits::Limits,
 ) -> Result<(String, String), crate::nbexec::Thrown> {
+    execute_typed_interruptible(source, limits, None)
+}
+
+/// [`execute_typed`] with a host watchdog installed (see [`crate::interrupt`]).
+///
+/// The handle is threaded separately rather than living in
+/// [`Limits`](crate::limits::Limits), which is `Copy` while an
+/// [`Interrupt`](crate::interrupt::Interrupt) owns an `Arc`.
+///
+/// Note the interrupt is passed on to the tree-walker fallback too: a program
+/// that faults out of the bytecode tier for an unlowered construct must still
+/// be interruptible.
+pub fn execute_typed_interruptible(
+    source: &str,
+    limits: crate::limits::Limits,
+    interrupt: Option<crate::interrupt::Interrupt>,
+) -> Result<(String, String), crate::nbexec::Thrown> {
     let program = match crate::parser::Parser::parse_program(source) {
         Ok(p) => p,
         Err(e) => {
@@ -5671,15 +5702,24 @@ pub fn execute_typed(
     // declarations are legal only at a Module's top level. (Module tests use the
     // module loader.) Defer to nbexec, which reports the same parse-phase error.
     if program.source_type == crate::ast::SourceType::Module {
-        return crate::nbexec::eval_source_typed(source, limits);
+        return crate::nbexec::eval_source_typed_interruptible(source, limits, interrupt);
     }
     let Ok(protos) = compile_program(&program) else {
-        return crate::nbexec::eval_source_typed(source, limits);
+        return crate::nbexec::eval_source_typed_interruptible(source, limits, interrupt);
     };
     let mut realm = Realm::with_limits(limits);
+    realm.interrupt = interrupt.clone();
     match run_program_capturing(&mut realm, &protos, 0, &[]) {
         Ok((value, output)) => Ok((output, realm.to_display_string(value))),
-        Err(_) => crate::nbexec::eval_source_typed(source, limits),
+        // An interrupt is a *deadline*, not a construct the VM cannot lower:
+        // re-running on the tree-walker would restart the runaway program from
+        // the top, so it propagates instead of taking the fallback below.
+        Err(VmError::Interrupted) => Err(crate::nbexec::Thrown {
+            phase: crate::nbexec::ErrorPhase::Runtime,
+            name: alloc::string::String::from("Interrupted"),
+            message: alloc::string::String::from("execution interrupted by the host"),
+        }),
+        Err(_) => crate::nbexec::eval_source_typed_interruptible(source, limits, interrupt),
     }
 }
 
