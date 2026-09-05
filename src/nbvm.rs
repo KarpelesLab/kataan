@@ -8277,6 +8277,39 @@ impl Compiler {
                 Ok(dst)
             }
             Expr::Object { members, .. } => {
+                // A data property whose key duplicates an accessor defined earlier
+                // in the same literal (`{get x(){}, x: 1}`) is a CreateDataProperty
+                // that must *replace* the getter/setter — `Op::SetProp`/`Op::SetKey`
+                // are `[[Set]]`s and would run the setter instead. That is rare
+                // enough to hand the whole literal to the tree-walker (which
+                // clears the accessor first). An accessor with a computed key
+                // already deopts via `static_key` below, so only static accessor
+                // keys can be present here; a computed *data* key is treated
+                // conservatively.
+                let accessor_keys: Vec<&PropertyKey> = members
+                    .iter()
+                    .filter_map(|m| match m {
+                        ObjectMember::Accessor { key, .. } => Some(key),
+                        _ => None,
+                    })
+                    .collect();
+                if !accessor_keys.is_empty() {
+                    for m in members {
+                        if let ObjectMember::Property { key, .. } = m {
+                            let collides = match key {
+                                PropertyKey::Computed(_) => true,
+                                _ => accessor_keys.iter().any(|a| {
+                                    matches!((static_key(a), static_key(key)), (Ok(x), Ok(y)) if x == y)
+                                }),
+                            };
+                            if collides {
+                                return Err(CompileError::Unsupported(
+                                    "object literal: data property duplicating an accessor key",
+                                ));
+                            }
+                        }
+                    }
+                }
                 let dst = self.alloc();
                 self.ops.push(Op::NewObject { dst });
                 for m in members {

@@ -1719,6 +1719,9 @@ impl<'a> Interp<'a> {
         let saved_home_static = core::mem::replace(&mut self.current_home_static, home_static);
         let saved_home_obj = core::mem::replace(&mut self.current_home_object, home_object);
         let saved_strict = core::mem::replace(&mut self.strict, strict);
+        // A generator/async body is function code: `new.target` is in lexical
+        // scope there, so a direct `eval('new.target')` inside it is legal.
+        let saved_nt_scope = core::mem::replace(&mut self.new_target_in_scope, true);
         self.gen_frames[id].as_mut().unwrap().running = true;
 
         let outcome = self.gen_drive(id, how, started);
@@ -1737,6 +1740,7 @@ impl<'a> Interp<'a> {
         self.current_home_static = saved_home_static;
         self.current_home_object = saved_home_obj;
         self.strict = saved_strict;
+        self.new_target_in_scope = saved_nt_scope;
 
         match &outcome {
             Ok(GenStep::Done(_)) | Err(_) => {

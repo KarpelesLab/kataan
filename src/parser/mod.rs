@@ -101,6 +101,10 @@ pub struct Parser<'src> {
     /// Set true only while [`Parser::parse_module`] parses the top list, and
     /// cleared on entry to any nested statement context.
     module_top_level: bool,
+    /// Whether the goal symbol is `Module`. In module code `await` is *always*
+    /// reserved — it may never be an IdentifierReference or binding name, even
+    /// in a `[~Await]` sub-context such as a class field Initializer.
+    module_goal: bool,
 }
 
 /// RAII guard that decrements [`Parser::depth`] when dropped, keeping the count
@@ -147,6 +151,7 @@ impl<'src> Parser<'src> {
             paren_invalid_target_spans: alloc::collections::BTreeSet::new(),
             depth: 0,
             module_top_level: false,
+            module_goal: module,
         })
     }
 
@@ -1207,6 +1212,13 @@ impl<'src> Parser<'src> {
                 self.bump();
                 Ok(Expr::Ident(Ident::new(Kw::Yield.as_str(), tok.span)))
             }
+            // In module code `await` is reserved everywhere, including inside a
+            // `[~Await]` sub-context such as a class field Initializer.
+            TokenKind::Keyword(Kw::Await) if !self.in_async && self.module_goal => Err(self
+                .err_at(
+                    tok.span,
+                    "`await` may not be used as an identifier in module code",
+                )),
             TokenKind::Keyword(Kw::Await) if !self.in_async => {
                 self.bump();
                 Ok(Expr::Ident(Ident::new(Kw::Await.as_str(), tok.span)))

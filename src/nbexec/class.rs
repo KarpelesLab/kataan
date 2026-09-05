@@ -260,6 +260,14 @@ impl<'a> Interp<'a> {
         // builders below instead of re-evaluating the expression.
         {
             let saved = core::mem::replace(&mut self.current, class_env.clone());
+            // A ClassBody is *always* strict code, and that includes its computed
+            // ClassElementNames: `class C { [obj.prop = 1]() {} }` on a frozen
+            // `obj` throws a TypeError rather than failing silently.
+            let saved_strict = core::mem::replace(&mut self.strict, true);
+            // Computed keys are evaluated inside the class's *private* environment,
+            // so `A.#x` (or a closure capturing it) written in a key expression can
+            // see this class's private names.
+            let saved_lex_home = self.current_lexical_home.replace(class_id);
             let r = (|| -> Result<(), ExecError> {
                 for (idx, member) in class.body.iter().enumerate() {
                     let (key, is_static) = match member {
@@ -291,6 +299,8 @@ impl<'a> Interp<'a> {
                 }
                 Ok(())
             })();
+            self.current_lexical_home = saved_lex_home;
+            self.strict = saved_strict;
             self.current = saved;
             r?;
         }
@@ -626,6 +636,9 @@ impl<'a> Interp<'a> {
             // `[[NewTarget]]` of undefined: `new.target` inside (e.g. via a direct
             // eval) is a valid token that evaluates to undefined.
             let saved_nt_scope = core::mem::replace(&mut self.new_target_in_scope, true);
+            // A static block / static field initializer is not a derived
+            // constructor: `super(...)` there is a SyntaxError.
+            let saved_sc_scope = core::mem::replace(&mut self.super_call_in_scope, false);
             let saved_target = core::mem::replace(&mut self.new_target, NanBox::undefined());
             // Static blocks and static field initializers are field-initializer
             // context: a nested direct `eval` referencing `arguments` is an early
@@ -724,6 +737,7 @@ impl<'a> Interp<'a> {
             self.current_home_static = saved_home_static;
             self.current_home_object = saved_home_obj;
             self.new_target_in_scope = saved_nt_scope;
+            self.super_call_in_scope = saved_sc_scope;
             self.new_target = saved_target;
             r?;
         }
@@ -875,7 +889,12 @@ impl<'a> Interp<'a> {
         // direct `eval` inside it may use `new.target`. Construction does not flow
         // through `invoke`, so mark `new.target` as lexically in scope here.
         let saved_nt_scope = core::mem::replace(&mut self.new_target_in_scope, true);
+        // A *derived* constructor's body may contain `super(...)` — including in a
+        // direct `eval` and in arrows defined there — so mark it in lexical scope.
+        let is_derived_ctor = self.classes[class_id as usize].super_class.is_some();
+        let saved_sc_scope = core::mem::replace(&mut self.super_call_in_scope, is_derived_ctor);
         let result = self.run_constructor(class_id, env, instance, args);
+        self.super_call_in_scope = saved_sc_scope;
         self.new_target_in_scope = saved_nt_scope;
         self.this_val = saved_this;
         self.new_target = saved_target;
@@ -1184,6 +1203,11 @@ impl<'a> Interp<'a> {
             }
             match m.kind {
                 MethodKind::Method => {
+                    // MethodDefinitionEvaluation defines a *data* property: a
+                    // later `m(){}` replaces an earlier `get m(){}` / `set m(v){}`
+                    // of the same name outright (`class C { get m(){} m(){} }`
+                    // exposes the method), so the accessor must be dropped first.
+                    self.realm.clear_accessor(proto, &key);
                     self.realm.set_hidden_property(proto, &key, f);
                 }
                 MethodKind::Get => {
@@ -1363,11 +1387,16 @@ impl<'a> Interp<'a> {
                     let key = self.class_member_key(class_id, idx, &field.key)?;
                     // A field initializer is field-initializer context: a nested
                     // direct `eval` that references `arguments` is an early error.
+                    // It is also its own function-like body, *not* the derived
+                    // constructor: `super(...)` inside it (including through a
+                    // direct eval or an arrow) is a SyntaxError.
                     let saved_fi = core::mem::replace(&mut self.in_field_initializer, true);
+                    let saved_sc = core::mem::replace(&mut self.super_call_in_scope, false);
                     let v = match &field.value {
                         Some(e) => self.eval(e),
                         None => Ok(NanBox::undefined()),
                     };
+                    self.super_call_in_scope = saved_sc;
                     self.in_field_initializer = saved_fi;
                     let v = v?;
                     // DefineField step 7: an anonymous function/arrow/class
@@ -1467,6 +1496,18 @@ impl<'a> Interp<'a> {
         args: &[NanBox],
     ) -> Result<Option<NanBox>, ExecError> {
         let class = self.classes[class_id as usize];
+        // GetSuperConstructor for this class: the *live* `[[GetPrototypeOf]]` of
+        // its constructor object (`null` when there is none).
+        let live_super: Option<NanBox> = self
+            .class_handles
+            .get(class_id as usize)
+            .copied()
+            .and_then(|cv| cv.as_handle().map(Handle::from_raw))
+            .map(|ch| {
+                self.realm
+                    .object_proto(ch)
+                    .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw()))
+            });
         let parent = self.resolve_super(class, env)?;
         let saved_super = core::mem::replace(&mut self.pending_super, parent.clone());
         let native_parent = self.class_native_super[class_id as usize];
@@ -1523,6 +1564,16 @@ impl<'a> Interp<'a> {
                         let cell = self.realm.new_object();
                         self.realm
                             .set_hidden_property(cell, THIS_CELL_SLOT, NanBox::tdz());
+                        // Record what a still-pending `super(...)` must initialize,
+                        // so an arrow that captured this cell can complete the
+                        // binding even after the constructor has returned.
+                        self.realm
+                            .set_hidden_property(cell, THIS_CELL_INSTANCE, inst);
+                        self.realm.set_hidden_property(
+                            cell,
+                            THIS_CELL_CLASS,
+                            NanBox::number(f64::from(class_id)),
+                        );
                         self.this_cell = Some(cell);
                         (
                             Some(core::mem::replace(&mut self.this_val, NanBox::tdz())),
@@ -1622,38 +1673,51 @@ impl<'a> Interp<'a> {
                     }
                     Ok(r)
                 }
-                // No own constructor but a base: implicit `super(args)`, then
-                // this class's own field initializers. A super constructor that
-                // returns an Object rebinds `this`, so the fields target it.
-                (None, Some((pid, penv))) => {
-                    let ret = self.run_constructor(*pid, &penv.clone(), instance, args)?;
-                    let target = self.constructor_return_handle(ret).unwrap_or(instance);
-                    self.init_instance_fields(class_id, target)?;
-                    Ok(ret)
-                }
-                (None, None) => {
-                    // A constructor-less class extending a *native* superclass
-                    // (`class X extends Error {}`) performs the implicit
-                    // `super(...args)` into the native constructor, so e.g. the
-                    // error message is forwarded.
-                    if let Some(nid) = native_parent {
+                // No own constructor but a heritage: the *implicit* derived
+                // constructor `constructor(...args) { super(...args); }`. Its
+                // GetSuperConstructor is the live `[[GetPrototypeOf]]` of this
+                // class's constructor object — so `Object.setPrototypeOf(C, Other)`
+                // redirects it, and `class C extends null {}` reaches
+                // `%Function.prototype%` (not a constructor) and throws.
+                (None, _) if class.super_class.is_some() => {
+                    let sc = live_super.unwrap_or_else(NanBox::null);
+                    if !self.is_constructor_value(sc) {
+                        let m = self.new_str("Super constructor is not a constructor");
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
+                    let sh = sc
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .expect("a constructor is an object");
+                    if let Some((pid, penv)) = self.realm.class_at(sh) {
+                        // A super constructor that returns an Object rebinds
+                        // `this`, so this class's fields target it.
+                        let ret = self.run_constructor(pid, &penv, instance, args)?;
+                        let target = self.constructor_return_handle(ret).unwrap_or(instance);
+                        self.init_instance_fields(class_id, target)?;
+                        Ok(ret)
+                    } else if let Some(nid) = self.native_base_kind(sh) {
+                        // A *native* superclass (`class X extends Error {}`):
+                        // forward the arguments so e.g. the message is kept.
                         self.apply_native_super(nid, instance, args)?;
                         self.init_instance_fields(class_id, instance)?;
                         Ok(None)
-                    } else if let Some(fnp) = fn_parent {
-                        // Constructor-less class extending a function: implicit
-                        // `super(...args)` calls the function with `this` = instance.
-                        // A returned Object becomes the result and the field target.
+                    } else {
+                        // An ordinary-function superclass: the implicit
+                        // `super(...args)` calls it with `this` = the instance. A
+                        // returned Object becomes the result and the field target.
+                        self.pending_new_target = Some(self.new_target);
                         let ret =
-                            self.call_with_this(fnp, NanBox::handle(instance.to_raw()), args)?;
+                            self.call_with_this(sc, NanBox::handle(instance.to_raw()), args)?;
                         let returned = self.constructor_return_handle(Some(ret));
                         let target = returned.unwrap_or(instance);
                         self.init_instance_fields(class_id, target)?;
                         Ok(returned.map(|h| NanBox::handle(h.to_raw())))
-                    } else {
-                        self.init_instance_fields(class_id, instance)?;
-                        Ok(None)
                     }
+                }
+                (None, _) => {
+                    self.init_instance_fields(class_id, instance)?;
+                    Ok(None)
                 }
             }
         })();
@@ -1701,178 +1765,25 @@ impl<'a> Interp<'a> {
         None
     }
 
-    /// `super.name` read against an already-captured object-literal super base
-    /// `proto` (`base.[[Get]](name, this)`): an inherited getter runs with the
-    /// current `this` as the receiver; otherwise the data property is read.
-    pub(crate) fn read_super_member_object(
-        &mut self,
-        proto: Handle,
-        name: &str,
-    ) -> Result<NanBox, ExecError> {
-        if let Some((getter, _)) = self.realm.accessor(proto, name) {
-            if matches!(getter.unpack(), Unpacked::Undefined) {
-                return Ok(NanBox::undefined());
-            }
-            return self.call_with_this(getter, self.this_val, &[]);
-        }
-        self.read_member(proto, name)
-    }
-
-    /// `super.name = value` against an already-captured object-literal super base
-    /// `proto` (`base.[[Set]](name, value, this)`): an inherited setter runs with
-    /// the current `this` as the receiver; otherwise the write lands on `this`
-    /// through the strict-aware member path (so a frozen receiver throws in strict).
-    pub(crate) fn assign_super_member_object(
-        &mut self,
-        proto: Handle,
-        name: &str,
-        value: NanBox,
-    ) -> Result<(), ExecError> {
-        if let Some((_, setter)) = self.realm.accessor(proto, name)
-            && !matches!(setter.unpack(), Unpacked::Undefined)
-        {
-            self.call_with_this(setter, self.this_val, &[value])?;
-            return Ok(());
-        }
-        if let Some(th) = self.this_val.as_handle().map(Handle::from_raw) {
-            let key = self.new_str(name);
-            self.assign_member_value(th, key, value)?;
-        }
-        Ok(())
-    }
-
-    /// Finds `name` as a method in the superclass chain of the currently-running
-    /// method's home class, returning a callable bound to the base definition.
-    pub(crate) fn resolve_super_method(&mut self, name: &str) -> Result<NanBox, ExecError> {
-        // An object-literal method: `super.m()` is `HomeObject.[[Prototype]].m`,
-        // called (by the caller) with the current `this`.
-        if self.current_home.is_none()
-            && let Some(home) = self.current_home_object
-        {
-            if let Some(proto) = self.realm.object_proto(home) {
-                let f = self.read_member(proto, name)?;
-                if f.as_handle()
-                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-                {
-                    return Ok(f);
-                }
-            }
-            return Err(ExecError::Throw(
-                self.new_str(&alloc::format!("super method {name} not found")),
-            ));
-        }
-        let home = self
-            .current_home
-            .ok_or(ExecError::Unsupported("super outside a method"))?;
-        let mut cur = self.resolve_super(
-            self.classes[home as usize],
-            &self.class_envs[home as usize].clone(),
-        )?;
-        while let Some((pid, penv)) = cur {
-            let class = self.classes[pid as usize];
-            for member in &class.body {
-                if let ClassMember::Method(m) = member
-                    && m.is_static == self.current_home_static
-                    && m.kind == MethodKind::Method
-                    && static_key(&m.key).ok().as_deref() == Some(name)
-                {
-                    let saved = core::mem::replace(&mut self.current, penv.clone());
-                    let f = self.make_method(
-                        &m.value.params,
-                        Body::Block(&m.value.body),
-                        m.value.is_async,
-                        m.value.is_generator,
-                        Some(pid),
-                        self.current_home_static,
-                    );
-                    self.current = saved;
-                    return Ok(f);
-                }
-            }
-            // A function superclass (`extends fn`) is not in the class chain;
-            // resolve `super.m` through `fn.prototype` (and its chain).
-            if let Some(fn_super) = self.class_fn_super[pid as usize]
-                && let Some(sh) = fn_super.as_handle().map(Handle::from_raw)
-                && let Ok(sp) = self.read_member(sh, "prototype")
-                && let Some(spp) = sp.as_handle().map(Handle::from_raw)
-            {
-                let f = self.read_member(spp, name)?;
-                if f.as_handle()
-                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-                {
-                    return Ok(f);
-                }
-            }
-            cur = self.resolve_super(class, &penv)?;
-        }
-        // The home class itself may directly extend a function (no intermediate
-        // class level), so check its function super's prototype too.
-        if let Some(fn_super) = self.class_fn_super[home as usize]
-            && let Some(sh) = fn_super.as_handle().map(Handle::from_raw)
-            && let Ok(sp) = self.read_member(sh, "prototype")
-            && let Some(spp) = sp.as_handle().map(Handle::from_raw)
-        {
-            let f = self.read_member(spp, name)?;
-            if f.as_handle()
-                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-            {
-                return Ok(f);
-            }
-        }
-        // Fallback: resolve the method off the real prototype chain of the
-        // HomeObject (the defining class's `.prototype`). Catches a method added
-        // dynamically to a superclass prototype AND a native superclass's method
-        // (`class MyMap extends Map { … super.set() }` → `Map.prototype.set`),
-        // neither of which is a declared class-body method.
-        if !self.current_home_static {
-            let home_proto = self.class_prototype_by_id(home);
-            if let Some(super_base) = self.realm.object_proto(home_proto)
-                && self.has_property(super_base, name)
-            {
-                let f = self.read_member(super_base, name)?;
-                if f.as_handle()
-                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-                {
-                    return Ok(f);
-                }
-            }
-        }
-        Err(ExecError::Throw(
-            self.new_str(&alloc::format!("super method {name} not found")),
-        ))
-    }
-
-    /// `super.name` as a value read: a super getter is invoked (with the current
-    /// `this`); a super method is returned as a bound function.
-    /// `super.name = value`: invoke an inherited setter (found on the home's parent
-    /// chain) with `this` = the current receiver; if there is none, assign the property
-    /// directly on the receiver.
-    pub(crate) fn assign_super_member(
-        &mut self,
-        name: &str,
-        value: NanBox,
-    ) -> Result<(), ExecError> {
-        // An object-literal method: `super.x = v` uses `HomeObject.[[Prototype]]`.
-        // GetSuperBase = HomeObject.[[GetPrototypeOf]](); PutValue on a
-        // SuperProperty performs RequireObjectCoercible, so a null super base
-        // (e.g. `Object.setPrototypeOf(obj, null)`) is a TypeError.
-        if self.current_home.is_none()
-            && let Some(home) = self.current_home_object
-        {
-            let Some(proto) = self.realm.object_proto(home) else {
-                return Err(self.type_error("Cannot set property on null (super)"));
+    /// `GetSuperBase()` (ECMA-262 9.1.1.3.5) for the currently-running method:
+    /// `HomeObject.[[GetPrototypeOf]]()`. The home object is the object literal
+    /// (an object-literal method), the class constructor (a static class member)
+    /// or the class prototype (an instance member). `Ok(None)` means the base is
+    /// `null` — the caller raises the RequireObjectCoercible `TypeError`.
+    ///
+    /// Note this is a lookup over the *live* prototype chain, not over the class
+    /// declaration hierarchy: `Object.setPrototypeOf(C.prototype, other)` is
+    /// immediately observable through `super.x`, exactly as the spec requires.
+    pub(crate) fn super_base(&mut self) -> Result<Option<Handle>, ExecError> {
+        if self.current_home.is_none() {
+            let Some(home) = self.current_home_object else {
+                return Err(ExecError::Unsupported("super outside a method"));
             };
-            return self.assign_super_member_object(proto, name, value);
+            return Ok(self.realm.object_proto(home));
         }
         let home = self
             .current_home
             .ok_or(ExecError::Unsupported("super outside a method"))?;
-        // GetSuperBase = HomeObject.[[GetPrototypeOf]](). For a class the home object
-        // is the constructor (static method) or the class prototype (instance method).
-        // PutValue on a SuperProperty performs ToObject(GetSuperBase), so a null super
-        // base — e.g. after `Object.setPrototypeOf(C, null)` — is a TypeError, thrown
-        // *after* the RHS has been evaluated and regardless of whether an inherited
-        // setter exists.
         let home_obj = if self.current_home_static {
             self.class_handles
                 .get(home as usize)
@@ -1880,250 +1791,98 @@ impl<'a> Interp<'a> {
         } else {
             Some(self.class_prototype_by_id(home))
         };
-        if let Some(ho) = home_obj
-            && self.realm.object_proto(ho).is_none()
+        let Some(ho) = home_obj else {
+            return Err(ExecError::Unsupported("super outside a method"));
+        };
+        Ok(self.realm.object_proto(ho))
+    }
+
+    /// `super.name` read against an already-captured super base `proto`:
+    /// `base.[[Get]](name, this)` — an inherited getter (or a proxy `get` trap)
+    /// anywhere on the base's prototype chain runs with the current `this` as the
+    /// Receiver, so `super.accessor` sees the instance, not the prototype.
+    pub(crate) fn read_super_member_object(
+        &mut self,
+        proto: Handle,
+        name: &str,
+    ) -> Result<NanBox, ExecError> {
+        let recv = self.this_val;
+        self.get_with_receiver(proto, name, recv)
+    }
+
+    /// `super.name = value` against an already-captured super base `proto`:
+    /// `base.[[Set]](name, value, this)`. OrdinarySetWithOwnDescriptor starts at
+    /// the *super base* (so an own property of `this` never shadows the lookup)
+    /// but writes to the Receiver — creating or updating an own property of
+    /// `this`, or rejecting when `this` already has a non-writable own data
+    /// property / an own accessor. A rejected `[[Set]]` is a `TypeError` in
+    /// strict code (which every class body is).
+    pub(crate) fn assign_super_member_object(
+        &mut self,
+        proto: Handle,
+        name: &str,
+        value: NanBox,
+    ) -> Result<(), ExecError> {
+        // A Deferred Module Namespace receiver forces evaluation
+        // ([[Set]]/[[Define]]), and an export still in its TDZ makes the
+        // Receiver's [[GetOwnProperty]] throw a ReferenceError — but only when the
+        // write actually reaches the Receiver. An *accessor* found on the super
+        // base's chain short-circuits OrdinarySetWithOwnDescriptor first, so the
+        // namespace is never consulted then.
+        #[cfg(all(feature = "module", feature = "std"))]
         {
-            return Err(self.type_error("Cannot set property on null (super)"));
-        }
-        let mut cur = self.resolve_super(
-            self.classes[home as usize],
-            &self.class_envs[home as usize].clone(),
-        )?;
-        while let Some((pid, penv)) = cur {
-            let class = self.classes[pid as usize];
-            for member in &class.body {
-                if let ClassMember::Method(m) = member
-                    && m.is_static == self.current_home_static
-                    && m.kind == MethodKind::Set
-                    && static_key(&m.key).ok().as_deref() == Some(name)
-                {
-                    let saved = core::mem::replace(&mut self.current, penv.clone());
-                    let f = self.make_method(
-                        &m.value.params,
-                        Body::Block(&m.value.body),
-                        m.value.is_async,
-                        m.value.is_generator,
-                        Some(pid),
-                        self.current_home_static,
-                    );
-                    self.current = saved;
-                    self.call_with_this(f, self.this_val, &[value])?;
-                    return Ok(());
+            let mut cur = Some(proto);
+            let mut accessor_wins = false;
+            while let Some(c) = cur {
+                if self.realm.accessor(c, name).is_some() {
+                    accessor_wins = true;
+                    break;
                 }
+                if self.realm.has_own(c, name) {
+                    break;
+                }
+                cur = self.realm.object_proto(c);
             }
-            cur = self.resolve_super(class, &penv)?;
+            if !accessor_wins && let Some(th) = self.this_val.as_handle().map(Handle::from_raw) {
+                self.trigger_deferred_namespace(th, name)?;
+                self.namespace_binding_tdz(th, name)?;
+            }
         }
-        // Fallback, mirroring the read path: the class-body walk above only matches
-        // methods with a *static* (literal) key, so a computed-key accessor
-        // (`class Z { set [k](v) {…} }`) — or one added dynamically to a superclass
-        // prototype — is invisible to it. Resolve the setter the spec way, over the
-        // real prototype chain: GetPrototypeOf(HomeObject).[[Set]](name, v, this).
-        // Without this the write below re-enters the *receiver's* own setter (the
-        // one currently running) and recurses until the stack is exhausted.
-        if let Some(ho) = home_obj
-            && let Some(super_base) = self.realm.object_proto(ho)
-            && let Some((_, setter)) = self.realm.accessor(super_base, name)
-            && !matches!(setter.unpack(), Unpacked::Undefined)
-        {
-            self.call_with_this(setter, self.this_val, &[value])?;
-            return Ok(());
-        }
-        // No inherited setter — the write lands on the receiver (`this`). A
-        // Deferred Module Namespace receiver forces evaluation ([[Set]]/[[Define]]).
-        if let Some(th) = self.this_val.as_handle().map(Handle::from_raw) {
-            #[cfg(all(feature = "module", feature = "std"))]
-            self.trigger_deferred_namespace(th, name)?;
-            // `super.x = v` is `superBase.[[Set]](x, v, this)`; OrdinarySet reads
-            // `Receiver.[[GetOwnProperty]](x)` before writing, so a namespace
-            // receiver whose export `x` is still in its TDZ throws a ReferenceError.
-            #[cfg(all(feature = "module", feature = "std"))]
-            self.namespace_binding_tdz(th, name)?;
-            // `super.x = v` is `superBase.[[Set]](x, v, this)` — the write lands on
-            // the receiver. Route it through the strict-aware member-assignment path
-            // so a failed set (frozen/non-extensible/non-writable receiver) throws a
-            // TypeError, since a class method body is always strict.
-            let key = self.new_str(name);
-            self.assign_member_value(th, key, value)?;
+        let recv = self.this_val;
+        let ok = self.proxy_set_bool(proto, name, value, recv)?;
+        if !ok && self.strict {
+            return Err(self.type_error(&alloc::format!(
+                "Cannot assign to read only property '{name}' of super"
+            )));
         }
         Ok(())
     }
 
-    pub(crate) fn resolve_super_member(&mut self, name: &str) -> Result<NanBox, ExecError> {
-        // An object-literal method: `super.x` reads `HomeObject.[[Prototype]].x`.
-        // A data property is returned directly; an inherited *getter* is invoked
-        // with the current `this` (the receiver), not the prototype — so
-        // `super.accessor` in `obj.method()` sees `obj` as `this`.
-        if self.current_home.is_none()
-            && let Some(home) = self.current_home_object
-        {
-            // GetSuperBase = HomeObject.[[GetPrototypeOf]](); ? RequireObjectCoercible
-            // throws a TypeError when the home object's prototype is null (e.g.
-            // `Object.setPrototypeOf(obj, null)` before `super.x` in `obj.method`).
-            let Some(proto) = self.realm.object_proto(home) else {
-                return Err(self.type_error("Cannot read property of null (super)"));
-            };
-            return self.read_super_member_object(proto, name);
-        }
-        let home = self
-            .current_home
-            .ok_or(ExecError::Unsupported("super outside a method"))?;
-        // GetSuperBase for a class instance method = GetPrototypeOf(class.prototype).
-        // `class C extends null` leaves that prototype's `[[Prototype]]` null, so
-        // `? RequireObjectCoercible(GetSuperBase())` throws a TypeError (rather than
-        // silently reading `undefined`).
-        if !self.current_home_static {
-            let home_proto = self.class_prototype_by_id(home);
-            if self.realm.object_proto(home_proto).is_none() {
-                return Err(self.type_error("Cannot read property of null (super)"));
-            }
-        }
-        let mut cur = self.resolve_super(
-            self.classes[home as usize],
-            &self.class_envs[home as usize].clone(),
-        )?;
-        while let Some((pid, penv)) = cur {
-            let class = self.classes[pid as usize];
-            for member in &class.body {
-                if let ClassMember::Method(m) = member
-                    && m.is_static == self.current_home_static
-                    && matches!(m.kind, MethodKind::Method | MethodKind::Get)
-                    && static_key(&m.key).ok().as_deref() == Some(name)
-                {
-                    let saved = core::mem::replace(&mut self.current, penv.clone());
-                    let f = self.make_method(
-                        &m.value.params,
-                        Body::Block(&m.value.body),
-                        m.value.is_async,
-                        m.value.is_generator,
-                        Some(pid),
-                        self.current_home_static,
-                    );
-                    self.current = saved;
-                    return if m.kind == MethodKind::Get {
-                        self.call_with_this(f, self.this_val, &[])
-                    } else {
-                        // `make_method` leaves `name` empty; a method's own
-                        // `name` own-property is its key (SetFunctionName at class
-                        // definition), so `super.m.name === "m"` — install it on
-                        // this freshly synthesized method value.
-                        self.set_fn_name_owned(f, name);
-                        Ok(f)
-                    };
-                }
-            }
-            // A function superclass at this level: for a static member, `super.x`
-            // reads from the superclass *constructor* object directly; for an
-            // instance member, through `fn.prototype`.
-            if self.current_home_static {
-                if let Some(v) = self.fn_super_static_member(pid, name)? {
-                    return Ok(v);
-                }
-            } else if let Some(v) = self.fn_super_member(pid, name)? {
-                return Ok(v);
-            }
-            cur = self.resolve_super(class, &penv)?;
-        }
-        // The home class may directly extend a function (no class parent level).
-        if self.current_home_static {
-            if let Some(v) = self.fn_super_static_member(home, name)? {
-                return Ok(v);
-            }
-        } else if let Some(v) = self.fn_super_member(home, name)? {
-            return Ok(v);
-        }
-        // Fallback for a non-static member: the class-body walk above only matches
-        // *declared* methods/getters, so a property added dynamically to a
-        // superclass prototype (`A.prototype.p = …`) is missed. Resolve it the
-        // spec way — GetPrototypeOf(HomeObject).[[Get]](name, this) — over the real
-        // prototype chain (HomeObject = the defining class's `.prototype`).
-        if !self.current_home_static {
-            let home_proto = self.class_prototype_by_id(home);
-            if let Some(super_base) = self.realm.object_proto(home_proto)
-                && self.has_property(super_base, name)
-            {
-                if let Some((getter, _)) = self.realm.accessor(super_base, name) {
-                    if matches!(getter.unpack(), Unpacked::Undefined) {
-                        return Ok(NanBox::undefined());
-                    }
-                    return self.call_with_this(getter, self.this_val, &[]);
-                }
-                return self.read_member(super_base, name);
-            }
-        }
-        Ok(NanBox::undefined())
+    /// Resolves `super.name` as the callee of a `super.name(...)` call. This is
+    /// just the ordinary super-property read — a non-callable result is a
+    /// `TypeError` raised by the call itself.
+    pub(crate) fn resolve_super_method(&mut self, name: &str) -> Result<NanBox, ExecError> {
+        self.resolve_super_member(name)
     }
 
-    /// Reads `super.name` for a *static* member through class `cid`'s function
-    /// superclass *constructor object* (`class C extends fn { static {...} }`): a
-    /// data property is returned directly; a getter anywhere on the constructor's
-    /// prototype chain is invoked with the current `this`. `None` if `cid` has no
-    /// function super or the constructor lacks the name.
-    fn fn_super_static_member(
+    /// `super.name = value`: `GetSuperBase().[[Set]](name, value, this)`.
+    pub(crate) fn assign_super_member(
         &mut self,
-        cid: u32,
         name: &str,
-    ) -> Result<Option<NanBox>, ExecError> {
-        let Some(fn_super) = self.class_fn_super[cid as usize] else {
-            return Ok(None);
+        value: NanBox,
+    ) -> Result<(), ExecError> {
+        let Some(base) = self.super_base()? else {
+            return Err(self.type_error("Cannot set property on null (super)"));
         };
-        let Some(sh) = fn_super.as_handle().map(Handle::from_raw) else {
-            return Ok(None);
-        };
-        if !self.has_property(sh, name) {
-            return Ok(None);
-        }
-        let mut cur = Some(sh);
-        while let Some(h) = cur {
-            if let Some((getter, _)) = self.realm.accessor(h, name) {
-                if matches!(getter.unpack(), Unpacked::Undefined) {
-                    return Ok(Some(NanBox::undefined()));
-                }
-                return Ok(Some(self.call_with_this(getter, self.this_val, &[])?));
-            }
-            if self.realm.has_own(h, name) {
-                return Ok(Some(self.read_member(h, name)?));
-            }
-            cur = self.realm.object_proto(h);
-        }
-        Ok(Some(self.read_member(sh, name)?))
+        self.assign_super_member_object(base, name, value)
     }
 
-    /// Reads `super.name` through class `cid`'s function superclass prototype
-    /// (`class C extends fn {}`): a data property is returned directly; a getter
-    /// is invoked with the current `this`. `None` if `cid` has no function super
-    /// or the prototype lacks the name.
-    fn fn_super_member(&mut self, cid: u32, name: &str) -> Result<Option<NanBox>, ExecError> {
-        let Some(fn_super) = self.class_fn_super[cid as usize] else {
-            return Ok(None);
+    /// `super.name`: `GetSuperBase().[[Get]](name, this)`.
+    pub(crate) fn resolve_super_member(&mut self, name: &str) -> Result<NanBox, ExecError> {
+        let Some(base) = self.super_base()? else {
+            return Err(self.type_error("Cannot read property of null (super)"));
         };
-        let Some(sh) = fn_super.as_handle().map(Handle::from_raw) else {
-            return Ok(None);
-        };
-        let Ok(sp) = self.read_member(sh, "prototype") else {
-            return Ok(None);
-        };
-        let Some(spp) = sp.as_handle().map(Handle::from_raw) else {
-            return Ok(None);
-        };
-        if !self.has_property(spp, name) {
-            return Ok(None);
-        }
-        // An accessor anywhere on the prototype chain is invoked with the current
-        // `this`; otherwise the data property is read directly.
-        let mut cur = Some(spp);
-        while let Some(h) = cur {
-            if let Some((getter, _)) = self.realm.accessor(h, name) {
-                if matches!(getter.unpack(), Unpacked::Undefined) {
-                    return Ok(Some(NanBox::undefined()));
-                }
-                return Ok(Some(self.call_with_this(getter, self.this_val, &[])?));
-            }
-            if self.realm.has_own(h, name) {
-                break;
-            }
-            cur = self.realm.object_proto(h);
-        }
-        Ok(Some(self.read_member(spp, name)?))
+        self.read_super_member_object(base, name)
     }
 }
 

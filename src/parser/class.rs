@@ -138,8 +138,9 @@ impl<'src> Parser<'src> {
         {
             self.bump(); // `accessor`
             let key = self.parse_class_key()?;
+            // Like a plain field Initializer, an auto-accessor's is [~Yield, ~Await].
             let value = if self.eat(TokenKind::Eq) {
-                Some(self.parse_assignment()?)
+                Some(self.in_function_context(false, false, Self::parse_assignment)?)
             } else {
                 None
             };
@@ -203,8 +204,12 @@ impl<'src> Parser<'src> {
         if accessor.is_some() || is_async || is_generator {
             return Err(self.err_at(start, "expected `(` after method modifier"));
         }
+        // A field Initializer is parsed with [~Yield, ~Await]: it is its own
+        // function-ish context, so `await` / `yield` there are plain identifiers
+        // even inside an `async`/generator enclosing function (`async function f(){
+        // return class { x = await; } }` is legal, `x = await 1` is not).
         let value = if self.eat(TokenKind::Eq) {
-            Some(self.parse_assignment()?)
+            Some(self.in_function_context(false, false, Self::parse_assignment)?)
         } else {
             None
         };
@@ -385,10 +390,14 @@ fn is_constructor_key(
     is_async: bool,
     is_generator: bool,
 ) -> bool {
+    // ConstructorMethod matches on the ClassElementName's *PropName*, so a
+    // string-literal key (`"constructor"(){}`) names the constructor exactly as
+    // the identifier form does. Only a computed key has an empty PropName and
+    // therefore never becomes the constructor.
     !is_static
         && !is_async
         && !is_generator
-        && matches!(key, PropertyKey::Ident(name) if &**name == "constructor")
+        && matches!(key, PropertyKey::Ident(name) | PropertyKey::Str(name) if &**name == "constructor")
 }
 
 impl<'src> Parser<'src> {

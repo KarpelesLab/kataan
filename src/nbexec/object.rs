@@ -560,7 +560,10 @@ impl<'a> Interp<'a> {
         desc: Handle,
     ) -> Result<Handle, ExecError> {
         let out = self.realm.new_object();
-        for field in ["enumerable", "configurable", "writable"] {
+        // Field order is observable through a proxy descriptor (`has`/`get` traps):
+        // ToPropertyDescriptor reads enumerable, configurable, value, writable,
+        // get, set — in exactly that order.
+        for field in ["enumerable", "configurable"] {
             if self.has_property(desc, field) {
                 let v = self.read_member(desc, field)?;
                 self.realm
@@ -570,6 +573,11 @@ impl<'a> Interp<'a> {
         if self.has_property(desc, "value") {
             let v = self.read_member(desc, "value")?;
             self.realm.set_property(out, "value", v);
+        }
+        if self.has_property(desc, "writable") {
+            let v = self.read_member(desc, "writable")?;
+            self.realm
+                .set_property(out, "writable", NanBox::boolean(self.realm.truthy(v)));
         }
         for field in ["get", "set"] {
             if self.has_property(desc, field) {
@@ -585,6 +593,32 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// FromPropertyDescriptor (ECMA-262 6.2.6.4): a fresh plain object carrying the
+    /// fields the *normalized* descriptor `nd` has, created in spec order — value,
+    /// writable, get, set, enumerable, configurable. The order is observable
+    /// (`Object.getOwnPropertyNames` on the descriptor a proxy `defineProperty`
+    /// trap receives), so it must not simply mirror `nd`'s own insertion order.
+    pub(crate) fn descriptor_object_from(&mut self, nd: Handle) -> Handle {
+        let out = self.realm.new_object();
+        for field in [
+            "value",
+            "writable",
+            "get",
+            "set",
+            "enumerable",
+            "configurable",
+        ] {
+            if self.realm.has_own(nd, field) {
+                let v = self
+                    .realm
+                    .get_property(nd, field)
+                    .unwrap_or(NanBox::undefined());
+                self.realm.set_property(out, field, v);
+            }
+        }
+        out
     }
 
     /// `IsCompatiblePropertyDescriptor(Extensible, Desc, Current)` — the
@@ -727,7 +761,16 @@ impl<'a> Interp<'a> {
                 // attributes object instead leaked `configurable: 17` (and an
                 // `enumerable: undefined` that should have become `false`) into the
                 // trap, and let the trap see object identity it must not.
+                // Normalized exactly once: ToPropertyDescriptor's reads of the
+                // caller's descriptor are observable, so running it a second time
+                // for the invariant checks below would re-invoke their getters.
                 let nd = self.normalize_property_descriptor(desc)?;
+                // The trap receives `FromPropertyDescriptor(Desc)` — a *fresh*
+                // object whose fields are created in spec order (value, writable,
+                // get, set, enumerable, configurable). That order is observable via
+                // `Object.getOwnPropertyNames` on the descriptor the trap is handed,
+                // so passing `nd` directly leaked the *caller's* insertion order.
+                let desc_obj = self.descriptor_object_from(nd);
                 let key_v = self.key_to_value(key);
                 let handler_box = NanBox::handle(handler.to_raw());
                 let r = self.call_with_this(
@@ -736,7 +779,7 @@ impl<'a> Interp<'a> {
                     &[
                         NanBox::handle(target.to_raw()),
                         key_v,
-                        NanBox::handle(nd.to_raw()),
+                        NanBox::handle(desc_obj.to_raw()),
                     ],
                 )?;
                 // A falsy trap result is a failed [[DefineOwnProperty]]:

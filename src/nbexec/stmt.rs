@@ -1820,7 +1820,7 @@ impl<'a> Interp<'a> {
             // Sloppy mode: assigning to an unresolvable reference creates a property
             // on the *global* object (not a binding in the current scope), so it is
             // visible after a block/loop scope is popped.
-            self.declare_sloppy_global(name, value);
+            self.declare_sloppy_global(name, value)?;
         }
         Ok(())
     }

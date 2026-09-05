@@ -21,6 +21,11 @@ impl<'a> Interp<'a> {
         self.realm.native_at(handle).is_some()
             || self.realm.host_fn_at(handle).is_some()
             || self.realm.function_at(handle).is_some()
+            // A class constructor HAS a `[[Call]]` — one that unconditionally
+            // throws a TypeError. `IsCallable` is therefore true for it, which is
+            // observable: `"a".replace(/a/, SomeClass)` takes the *functional*
+            // replace path and throws, rather than stringifying the class.
+            || self.realm.class_at(handle).is_some()
             || self.realm.bound_native_at(handle).is_some()
             // A class constructor has a `[[Call]]` (it throws "cannot be invoked
             // without 'new'"), so `IsCallable` is true for it — `typeof C` is
@@ -299,6 +304,13 @@ impl<'a> Interp<'a> {
         // accepts any arguments and returns `undefined` (ECMA-262 20.2.3).
         if self.realm.is_function_proto_intrinsic(handle) {
             return Ok(NanBox::undefined());
+        }
+        // A class constructor's `[[Call]]` always throws (ECMA-262 10.2.1 step 2):
+        // `C()` without `new` — including reaching it as a callback that a
+        // built-in invokes — is a TypeError.
+        if self.realm.class_at(handle).is_some() {
+            let m = self.new_str("Class constructor cannot be invoked without 'new'");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
         // An [[IsHTMLDDA]] exotic object's `[[Call]]` (Annex B `document.all`):
         // return `null` when called with no arguments, or when the first argument
@@ -1628,9 +1640,16 @@ impl<'a> Interp<'a> {
             let saved_home_obj = self.current_home_object;
             let saved_home = self.current_home;
             let saved_home_static = self.current_home_static;
+            let saved_lexical_home = self.current_lexical_home;
             // An arrow captured in a derived constructor before `super(...)` reads
             // its lexical `this` live from the constructor's this-binding cell (still
             // `tdz()` until `super()` runs); otherwise it uses the snapshot.
+            let saved_this_cell = self.this_cell;
+            // Set only when this arrow *revives* its outlived constructor's pending
+            // this-binding (see below); an ordinary arrow leaves
+            // `pending_this_init` alone, so a `super()` it performs for the
+            // constructor still running underneath stays consumed on return.
+            let mut revived_pending = false;
             if let Some(cell) = self
                 .realm
                 .get_property(handle, ARROW_THIS_CELL)
@@ -1641,6 +1660,24 @@ impl<'a> Interp<'a> {
                     .realm
                     .get_property(cell, THIS_CELL_SLOT)
                     .unwrap_or_else(NanBox::tdz);
+                // The arrow carries its derived constructor's this-binding: a
+                // `super()` inside it writes through this cell, and — when the
+                // binding is still uninitialized and no constructor is currently
+                // pending (the arrow outlived its constructor) — it is still that
+                // constructor's binding, so restore what `super()` needs to
+                // complete it.
+                self.this_cell = Some(cell);
+                if self.pending_this_init.is_none()
+                    && self.this_val.is_tdz()
+                    && let Some(inst) = self.realm.get_property(cell, THIS_CELL_INSTANCE)
+                    && let Some(cid) = self
+                        .realm
+                        .get_property(cell, THIS_CELL_CLASS)
+                        .and_then(|v| v.as_number())
+                {
+                    self.pending_this_init = Some((inst, cid as u32));
+                    revived_pending = true;
+                }
             } else if let Some(t) = self.realm.get_property(handle, ARROW_THIS) {
                 self.this_val = t;
             }
@@ -1665,6 +1702,14 @@ impl<'a> Interp<'a> {
                     .get_property(handle, ARROW_HOME_STATIC)
                     .is_some_and(|v| self.realm.truthy(v));
             }
+            // The definition site's lexical class, for private-name resolution.
+            if let Some(lc) = self
+                .realm
+                .get_property(handle, ARROW_LEXICAL_CLASS)
+                .and_then(|v| v.as_number())
+            {
+                self.current_lexical_home = Some(lc as u32);
+            }
             let r = self.invoke(
                 def,
                 captured,
@@ -1672,11 +1717,22 @@ impl<'a> Interp<'a> {
                 args,
                 NanBox::handle(handle.to_raw()),
             );
-            self.this_val = saved_this;
+            // `super()` inside the arrow performs BindThisValue for the enclosing
+            // *derived constructor*: the constructor's `this` was uninitialized
+            // (TDZ) when the arrow was entered and is bound now, so that binding
+            // must survive the arrow's return rather than being restored away.
+            if !(saved_this.is_tdz() && !self.this_val.is_tdz()) {
+                self.this_val = saved_this;
+            }
             self.new_target = saved_nt;
             self.current_home_object = saved_home_obj;
             self.current_home = saved_home;
             self.current_home_static = saved_home_static;
+            self.current_lexical_home = saved_lexical_home;
+            self.this_cell = saved_this_cell;
+            if revived_pending {
+                self.pending_this_init = None;
+            }
             return r;
         }
         let home_obj = self
@@ -1829,41 +1885,47 @@ impl<'a> Interp<'a> {
         let saved_annexb = core::mem::take(&mut self.annexb_block_fns);
         // An arrow has no own `this` — it inherits the enclosing one lexically,
         // so leave `self.this_val` unchanged.
-        let saved_this = if def.is_arrow {
-            self.this_val
+        // An arrow inherits `this` from its enclosing function and must NOT
+        // restore it on exit: an arrow whose body runs `super()` in a derived
+        // constructor performs BindThisValue for that constructor, and restoring
+        // the pre-call (still-uninitialized) `this` would undo the binding.
+        let saved_this: Option<NanBox> = if def.is_arrow {
+            None
         } else {
-            // Sloppy-mode `this` coercion (OrdinaryCallBindThis): a strict
-            // function keeps `this` as-is; a sloppy function maps `undefined`/
-            // `null` to the global object and `ToObject`-boxes a primitive
-            // receiver (a number/string/boolean/symbol/bigint) into its wrapper,
-            // so `(function(){ this.x = 1; return this; }).apply(1)` mutates and
-            // returns a `Number` wrapper.
-            let bound = if def.is_strict {
-                this_val
-            } else if matches!(this_val.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                self.global_this
-            } else if this_val.as_handle().is_none() {
-                // A primitive immediate (number/boolean) — box it.
-                self.coerce_to_object(this_val)
-            } else if self
-                .realm
-                .string_value(this_val.as_handle().map(Handle::from_raw).unwrap())
-                .is_some()
-                || self
+            Some({
+                // Sloppy-mode `this` coercion (OrdinaryCallBindThis): a strict
+                // function keeps `this` as-is; a sloppy function maps `undefined`/
+                // `null` to the global object and `ToObject`-boxes a primitive
+                // receiver (a number/string/boolean/symbol/bigint) into its wrapper,
+                // so `(function(){ this.x = 1; return this; }).apply(1)` mutates and
+                // returns a `Number` wrapper.
+                let bound = if def.is_strict {
+                    this_val
+                } else if matches!(this_val.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    self.global_this
+                } else if this_val.as_handle().is_none() {
+                    // A primitive immediate (number/boolean) — box it.
+                    self.coerce_to_object(this_val)
+                } else if self
                     .realm
-                    .symbol_at(this_val.as_handle().map(Handle::from_raw).unwrap())
+                    .string_value(this_val.as_handle().map(Handle::from_raw).unwrap())
                     .is_some()
-                || self
-                    .realm
-                    .bigint_at(this_val.as_handle().map(Handle::from_raw).unwrap())
-                    .is_some()
-            {
-                // A primitive stored as a heap cell (string/symbol/bigint) — box it.
-                self.coerce_to_object(this_val)
-            } else {
-                this_val
-            };
-            core::mem::replace(&mut self.this_val, bound)
+                    || self
+                        .realm
+                        .symbol_at(this_val.as_handle().map(Handle::from_raw).unwrap())
+                        .is_some()
+                    || self
+                        .realm
+                        .bigint_at(this_val.as_handle().map(Handle::from_raw).unwrap())
+                        .is_some()
+                {
+                    // A primitive stored as a heap cell (string/symbol/bigint) — box it.
+                    self.coerce_to_object(this_val)
+                } else {
+                    this_val
+                };
+                core::mem::replace(&mut self.this_val, bound)
+            })
         };
         // An arrow has no own home: like `this`, it inherits the enclosing
         // method's `super` binding (home class/static and object-literal home),
@@ -1903,9 +1965,21 @@ impl<'a> Interp<'a> {
         // transparent and inherits the enclosing flag (so an arrow defined at the
         // top level still has no `new.target` in scope).
         let saved_nt_scope = if def.is_arrow {
-            self.new_target_in_scope
+            // An arrow is transparent to `new.target`, so the flag is the one
+            // captured where the arrow was *written* — not wherever it is called
+            // from. (`assert.throws(SyntaxError, () => eval('new.target'))` at the
+            // top level must still be a SyntaxError even though `assert.throws`
+            // invokes the arrow from inside a function.)
+            core::mem::replace(&mut self.new_target_in_scope, def.nt_in_scope)
         } else {
             core::mem::replace(&mut self.new_target_in_scope, true)
+        };
+        // `super(...)` is likewise transparent through arrows and shielded by any
+        // other function body.
+        let saved_sc_scope = if def.is_arrow {
+            core::mem::replace(&mut self.super_call_in_scope, def.sc_in_scope)
+        } else {
+            core::mem::replace(&mut self.super_call_in_scope, false)
         };
         // The "inside a class field initializer" context (for the ContainsArguments
         // early error on a nested direct `eval`) is lexical: an arrow restores the
@@ -2125,12 +2199,15 @@ impl<'a> Interp<'a> {
         }
         self.var_scope = saved_var_scope;
         self.annexb_block_fns = saved_annexb;
-        self.this_val = saved_this;
+        if let Some(t) = saved_this {
+            self.this_val = t;
+        }
         self.current_home = saved_home;
         self.current_lexical_home = saved_lexical_home;
         self.current_home_static = saved_home_static;
         self.new_target = saved_target;
         self.new_target_in_scope = saved_nt_scope;
+        self.super_call_in_scope = saved_sc_scope;
         self.in_field_initializer = saved_field_init;
         self.eval_depth = saved_eval_depth;
         self.eval_param_names = saved_eval_param_names;

@@ -1872,7 +1872,11 @@ impl<'a> Interp<'a> {
                 }
                 let mut syms = Vec::new();
                 if let Some(raw) = arg(0).as_handle() {
-                    let h = Handle::from_raw(raw);
+                    // A proxy *without* an `ownKeys` trap forwards
+                    // `[[OwnPropertyKeys]]` to its target (recursing through nested
+                    // proxies) — its own symbol keys are the target's, not the
+                    // (empty) proxy object's.
+                    let h = self.proxy_key_target(Handle::from_raw(raw));
                     // All own symbol keys, including non-enumerable ones (e.g. a
                     // symbol defined via `Object.defineProperty`). Symbol keys on a
                     // genuine object cell live in `object_all_keys`; on a non-object

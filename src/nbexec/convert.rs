@@ -198,8 +198,13 @@ impl<'a> Interp<'a> {
             // boxes) have no `object_keys` but must still run ToPrimitive so their
             // boxed primitive surfaces (a bare return-as-is would leave the wrapper
             // object, coercing to `NaN` and skipping the Symbol/BigInt TypeError).
+            // A Proxy also has no `object_keys` of its own, but ToPrimitive on it
+            // runs `Get(O, @@toPrimitive)` / `valueOf` / `toString` through its
+            // traps (or the target) — returning it as-is would make `proxy == 0`
+            // skip the coercion entirely.
             if self.realm.object_keys(h).is_some()
                 || self.realm.get_property(h, PRIM_WRAP).is_some()
+                || self.realm.proxy_at(h).is_some()
             {
                 return self.coerce_primitive(v, hint);
             }
@@ -286,7 +291,12 @@ impl<'a> Interp<'a> {
                     // A Temporal instance is an ordinary object for ToPrimitive:
                     // it must run OrdinaryToPrimitive so its `valueOf` (which
                     // always throws a TypeError) fires under `<`/`+`/etc.
-                    && self.realm.temporal_at(h).is_none()))
+                    && self.realm.temporal_at(h).is_none()
+                    // A Proxy is an ordinary object for ToPrimitive: `Get(O,
+                    // @@toPrimitive)` and the `valueOf`/`toString` reads all run
+                    // through its traps (or forward to the target). Returning the
+                    // proxy as-is would coerce it to `"[object Object]"`.
+                    && self.realm.proxy_at(h).is_none()))
         {
             return Ok(v);
         }

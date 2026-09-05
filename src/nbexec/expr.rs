@@ -560,8 +560,15 @@ impl<'a> Interp<'a> {
                         {
                             is_property_delete = true;
                             // `delete super.prop` / `delete super[expr]` is a runtime
-                            // ReferenceError (a super reference is never deletable).
+                            // ReferenceError (a super reference is never deletable) —
+                            // but the *reference* is evaluated first: GetThisBinding,
+                            // then the key expression, whose side effects therefore
+                            // still run (`delete super[sideEffect = 1]`).
                             if matches!(&**object, Expr::Super(_)) {
+                                self.require_super_this()?;
+                                if let PropertyKey::Computed(key_expr) = property {
+                                    self.eval(key_expr)?;
+                                }
                                 let m = self.new_str("Cannot delete a super property");
                                 return Err(ExecError::Throw(
                                     self.make_error(N_REFERENCE_ERROR, Some(m)),
@@ -1074,10 +1081,12 @@ impl<'a> Interp<'a> {
                 // `super(args)` — invoke the base constructor on the current
                 // instance.
                 if matches!(&**callee, Expr::Super(_)) {
-                    let args = self.eval_args(arguments)?;
-                    // SuperCall evaluation order: after ArgumentListEvaluation,
-                    // GetSuperConstructor + its IsConstructor check, then
-                    // `Construct(superCtor, args, newTarget)`, and only *then*
+                    // SuperCall evaluation order (ECMA-262 13.3.7.1):
+                    // `func` = GetSuperConstructor() — the *live*
+                    // `[[GetPrototypeOf]]` of the running constructor's function
+                    // object — is captured FIRST, then ArgumentListEvaluation, then
+                    // the IsConstructor check, then
+                    // `Construct(func, args, newTarget)`, and only *then*
                     // `BindThisValue` — whose "already initialized" check (a second
                     // `super()`) is a ReferenceError thrown *after* the base
                     // constructor has run. So even a doomed second `super()` still
@@ -1086,24 +1095,49 @@ impl<'a> Interp<'a> {
                     //
                     // The instance + this class's id are stashed in
                     // `pending_this_init` while `this` is in its TDZ (set by the
-                    // derived constructor). A second `super()` leaves it `None`.
+                    // derived constructor). A second `super()` leaves it `None` — the
+                    // running class is then recovered from the lexical home (an arrow
+                    // `() => super()` may outlive its constructor).
+                    let home_cid = self.pending_this_init.map(|(_, c)| c).or(self.current_home);
+                    let live_super = home_cid
+                        .and_then(|c| self.class_handles.get(c as usize).copied())
+                        .and_then(|cv| cv.as_handle().map(Handle::from_raw))
+                        .map(|ch| {
+                            self.realm
+                                .object_proto(ch)
+                                .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw()))
+                        });
+                    let args = self.eval_args(arguments)?;
+                    // Re-read the pending this-binding *after* the arguments: a
+                    // nested `super()` among them (`super(super())`) already
+                    // consumed it, which makes this the second SuperCall.
                     let pending = self.pending_this_init;
-                    // GetSuperConstructor reassigned-to-non-constructor check (only the
-                    // first, binding, `super()` reaches BindThisValue without throwing
-                    // for another reason; a second one is a ReferenceError regardless).
-                    if let Some((_, derived_cid)) = pending
-                        && let Some(cval) = self.class_handles.get(derived_cid as usize).copied()
-                        && let Some(ch) = cval.as_handle().map(Handle::from_raw)
+                    // GetSuperConstructor's IsConstructor check — *after* the
+                    // arguments, so an argument that throws (or that re-points the
+                    // constructor's `[[Prototype]]`) is observed first.
+                    if let Some(sc) = live_super
+                        && !self.is_constructor_value(sc)
                     {
-                        let super_ctor = self
-                            .realm
-                            .object_proto(ch)
-                            .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw()));
-                        if !self.is_constructor_value(super_ctor) {
-                            let m = self.new_str("Super constructor is not a constructor");
-                            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-                        }
+                        let m = self.new_str("Super constructor is not a constructor");
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                     }
+                    // Dispatch off the captured live super constructor, so
+                    // `Object.setPrototypeOf(Derived, Other)` really redirects
+                    // `super()` (the declaration-time binding below is only a
+                    // fallback for the shapes this cannot classify).
+                    let live_dispatch = live_super
+                        .and_then(|sc| sc.as_handle().map(Handle::from_raw))
+                        .and_then(|sh| {
+                            if let Some((cid, cenv)) = self.realm.class_at(sh) {
+                                Some((Some((cid, cenv)), None, None))
+                            } else if let Some(nid) = self.native_base_kind(sh) {
+                                Some((None, Some(nid), None))
+                            } else if self.is_callable(sh) {
+                                Some((None, None, Some(NanBox::handle(sh.to_raw()))))
+                            } else {
+                                None
+                            }
+                        });
                     // Resolve the super-constructor binding. Normally it is the
                     // transient `pending_super*` set while the enclosing derived
                     // constructor runs. But an arrow `() => super()` can be invoked
@@ -1114,7 +1148,9 @@ impl<'a> Interp<'a> {
                     let have_pending = self.pending_super.is_some()
                         || self.pending_super_native.is_some()
                         || self.pending_super_fn.is_some();
-                    let (eff_super, eff_native, eff_fn) = if have_pending {
+                    let (eff_super, eff_native, eff_fn) = if let Some(d) = live_dispatch {
+                        d
+                    } else if have_pending {
                         (
                             self.pending_super.clone(),
                             self.pending_super_native,
@@ -1257,8 +1293,12 @@ impl<'a> Interp<'a> {
                     // ReferenceError if `this` is uninitialized (a derived
                     // constructor before `super(...)`).
                     self.require_super_this()?;
-                    let args = self.eval_args(arguments)?;
+                    // EvaluateCall: the *callee* is read from the super reference
+                    // (GetSuperBase + `[[Get]]`) before ArgumentListEvaluation, so
+                    // an argument that mutates the home object's prototype cannot
+                    // affect which method is invoked.
                     let f = self.resolve_super_method(&name)?;
+                    let args = self.eval_args(arguments)?;
                     return self.call_with_this(f, self.this_val, &args);
                 }
                 // A **parenthesized** optional chain used as a call target, e.g.
@@ -2174,6 +2214,16 @@ impl<'a> Interp<'a> {
                 self.realm
                     .set_hidden_property(h, ARROW_HOME_CLASS, NanBox::number(f64::from(hc)));
             }
+            // Private names are lexically scoped and survive paths that establish
+            // no home class (a class's computed ClassElementName), so capture the
+            // lexical class separately.
+            if let Some(lc) = self.current_lexical_home {
+                self.realm.set_hidden_property(
+                    h,
+                    ARROW_LEXICAL_CLASS,
+                    NanBox::number(f64::from(lc)),
+                );
+            }
             self.realm.set_hidden_property(
                 h,
                 ARROW_HOME_STATIC,
@@ -2625,6 +2675,9 @@ impl<'a> Interp<'a> {
             // (with the Receiver as `this`) and succeeds; otherwise the write lands
             // on the *Receiver* (OrdinarySetWithOwnDescriptor).
             let mut cur = Some(handle);
+            // The object whose own data property terminated the chain walk (`O` in
+            // OrdinarySetWithOwnDescriptor), if any.
+            let mut owner: Option<crate::heap::Handle> = None;
             while let Some(c) = cur {
                 // A **proxy** reached while walking the prototype chain: its own
                 // `[[Set]]` internal method takes over (OrdinarySetWithOwnDescriptor
@@ -2689,12 +2742,23 @@ impl<'a> Interp<'a> {
                     return Ok(true);
                 }
                 if self.realm.has_own(c, key) {
+                    owner = Some(c);
                     break;
                 }
                 cur = self.realm.object_proto(c);
             }
             // No accessor on the chain: the own descriptor (if any) is a data
-            // descriptor. The value is written to the **Receiver**, not to `O`.
+            // descriptor. OrdinarySetWithOwnDescriptor step 2.a rejects outright
+            // when *that* descriptor is non-writable — before the Receiver is even
+            // consulted — so `super.x = v` through a non-writable inherited data
+            // property fails (a TypeError in strict code) rather than shadowing it
+            // on the Receiver.
+            if let Some(o) = owner
+                && !self.can_write_property(o, key)
+            {
+                return Ok(false);
+            }
+            // The value is written to the **Receiver**, not to `O`.
             let Some(recv_h) = receiver.as_handle().map(Handle::from_raw) else {
                 return Ok(false);
             };
@@ -2739,20 +2803,36 @@ impl<'a> Interp<'a> {
             }
             // Ordinary Receiver distinct from O: an own accessor / non-writable
             // own data property rejects; otherwise create/update the own data
-            // property on the Receiver.
+            // property on the Receiver. Only the Receiver's **own** property
+            // matters — OrdinarySetWithOwnDescriptor finishes with
+            // `CreateDataProperty(Receiver, P, V)` / a value-only
+            // `[[DefineOwnProperty]]`, never another `[[Set]]` — so an inherited
+            // non-writable data property or setter of the Receiver is irrelevant
+            // here (this is what makes `super.x = v` able to shadow a
+            // non-writable property inherited from the *derived* prototype).
             if self.realm.accessor(recv_h, key).is_some() {
                 return Ok(false);
             }
-            if self.realm.has_own(recv_h, key) {
+            let recv_has_own = self.realm.has_own(recv_h, key);
+            if recv_has_own {
                 if !self.can_write_property(recv_h, key) {
                     return Ok(false);
                 }
             } else if !self.realm.is_extensible(recv_h) {
                 return Ok(false);
             }
-            let key_box = self.new_str(key);
-            self.assign_member_value(recv_h, key_box, value)?;
-            return Ok(true);
+            let desc = self.realm.new_object();
+            self.realm.set_property(desc, "value", value);
+            if !recv_has_own {
+                self.realm
+                    .set_property(desc, "writable", NanBox::boolean(true));
+                self.realm
+                    .set_property(desc, "enumerable", NanBox::boolean(true));
+                self.realm
+                    .set_property(desc, "configurable", NanBox::boolean(true));
+            }
+            let ok = self.apply_descriptor(recv_h, key, desc, true)?;
+            return Ok(ok);
         };
         self.guard_revoked(handle)?;
         if let Some(trap) = self.proxy_trap(handler, "set")? {
@@ -4235,6 +4315,53 @@ impl<'a> Interp<'a> {
             self.assign_to(target, rhs)?;
             return Ok(rhs);
         }
+        // A `super.x` / `super[expr]` target: MakeSuperPropertyReference performs
+        // GetThisBinding, evaluates the key expression, and captures GetSuperBase —
+        // all *before* the RHS. So `super[x] = (() => (x = "other", 0))()` writes
+        // the original key, and `super["p"] = ruin()` still writes through the base
+        // captured before `ruin()` re-pointed the home object's prototype.
+        if let Expr::Member {
+            object, property, ..
+        } = target
+            && matches!(&**object, Expr::Super(_))
+        {
+            self.require_super_this()?;
+            // The key *expression* is evaluated to a value here; `ToPropertyKey`
+            // is part of GetValue/PutValue and therefore runs after the RHS for a
+            // plain assignment (and after GetSuperBase in every case).
+            let key_val = match property {
+                PropertyKey::Computed(key_expr) => Some(self.eval(key_expr)?),
+                _ => None,
+            };
+            let base = self.super_base()?;
+            let to_key = |this: &mut Self| -> Result<String, ExecError> {
+                match key_val {
+                    Some(k) => this.coerce_property_key(k),
+                    None => this.eval_prop_key(property),
+                }
+            };
+            let (name, new) = if op == AssignOp::Assign {
+                let rhs = self.eval(value)?;
+                let name = to_key(self)?;
+                (name, rhs)
+            } else {
+                // A compound assignment's `GetValue` on the super reference runs
+                // before the RHS (and needs a non-null base); its `ToPropertyKey`
+                // is part of that GetValue.
+                let name = to_key(self)?;
+                let Some(b) = base else {
+                    return Err(self.type_error("Cannot read property of null (super)"));
+                };
+                let current = self.read_super_member_object(b, &name)?;
+                let rhs = self.eval(value)?;
+                (name, self.binary(compound_op(op)?, current, rhs)?)
+            };
+            let Some(b) = base else {
+                return Err(self.type_error("Cannot set property on null (super)"));
+            };
+            self.assign_super_member_object(b, &name, new)?;
+            return Ok(new);
+        }
         // A computed-member target evaluates the object and key *before* the RHS
         // (spec order): `arr[i] = i = 1` writes the original `arr[i]`. A computed
         // `super[expr]` target is excluded here — it has no evaluable base object
@@ -4482,7 +4609,7 @@ impl<'a> Interp<'a> {
                         self.make_error(N_REFERENCE_ERROR, Some(m)),
                     ));
                 }
-                self.declare_sloppy_global(name, new);
+                self.declare_sloppy_global(name, new)?;
             }
             return Ok(new);
         }
@@ -4712,7 +4839,7 @@ impl<'a> Interp<'a> {
                         ));
                     }
                     // Sloppy implicit global: bind on the global scope + object.
-                    self.declare_sloppy_global(name, new);
+                    self.declare_sloppy_global(name, new)?;
                 }
                 Ok(new)
             }

@@ -194,6 +194,16 @@ pub(crate) struct FnDef<'a> {
     /// transparent to the ContainsArguments early error on a nested direct
     /// `eval`); a non-arrow resets the runtime flag to `false` on entry.
     field_init: bool,
+    /// Whether `new.target` was in lexical scope where this function was
+    /// *defined*. Only consulted for arrows: an arrow is transparent to
+    /// `new.target`, so a direct `eval('new.target')` inside one is a SyntaxError
+    /// exactly when the arrow was written outside function code — regardless of
+    /// where the arrow is later called from.
+    nt_in_scope: bool,
+    /// Whether `super(...)` was in lexical scope where this function was
+    /// *defined* (i.e. inside a derived class constructor). Only consulted for
+    /// arrows, which are transparent to `super()`.
+    sc_in_scope: bool,
 }
 
 /// One SplitMix64 step: scrambles an input word into a well-distributed output.
@@ -451,6 +461,10 @@ pub struct Interp<'a> {
     /// the eval code (the dynamic call depth is wrong here because an arrow defined
     /// at the top level is on the call stack but has no `new.target` in scope).
     new_target_in_scope: bool,
+    /// Whether `super(...)` is lexically in scope for a *direct* `eval` at the
+    /// current point — true inside a derived class constructor, transparently
+    /// inherited by arrows defined there, reset by any other non-arrow function.
+    super_call_in_scope: bool,
     /// C2: current *tree-walk* recursion depth — `eval`/`exec` descend on the
     /// native stack for nested expressions/statements, and the precedence loop in
     /// the parser flattens `a + a + a + …` into a shallow AST that nonetheless
@@ -2577,6 +2591,12 @@ const ARROW_NEW_TARGET: &str = "\u{0}antgt";
 const ARROW_HOME_OBJ: &str = "\u{0}ahome";
 const ARROW_HOME_CLASS: &str = "\u{0}ahcls";
 const ARROW_HOME_STATIC: &str = "\u{0}ahsta";
+/// The lexically-enclosing class at an arrow's *definition* site, used only to
+/// resolve private names (`#x`). `ARROW_HOME_CLASS` covers the paths that set a
+/// home class, but a class's computed ClassElementName runs inside the class's
+/// private environment with no home object — so an arrow written there needs the
+/// lexical class captured separately.
+const ARROW_LEXICAL_CLASS: &str = "\u{0}alcls";
 /// Hidden slot on an arrow defined in a derived constructor *before* `super(...)`:
 /// a handle to the enclosing constructor's this-binding cell (see `THIS_CELL_SLOT`).
 /// The arrow's lexical `this` is a *live* reference to that binding, still in its
@@ -2588,6 +2608,14 @@ const ARROW_THIS_CELL: &str = "\u{0}acell";
 /// `this` value (`tdz()` until `super(...)` runs). Read by arrows that captured the
 /// cell (`ARROW_THIS_CELL`).
 const THIS_CELL_SLOT: &str = "\u{0}tcell";
+/// Hidden slots on a derived constructor's this-binding cell recording the
+/// instance the pending `super(...)` must initialize and the class that owns it.
+/// They let an arrow that captured the cell perform the constructor's
+/// BindThisValue even after the constructor itself has returned
+/// (`superArrow = () => super(); superArrow()`), which is exactly what the spec's
+/// environment-record-held this-binding allows.
+const THIS_CELL_INSTANCE: &str = "\u{0}tcinst";
+const THIS_CELL_CLASS: &str = "\u{0}tccls";
 /// Reserved hidden keys for an eager generator's result object: the buffer of
 /// yielded values and the current `next()` cursor.
 /// Sentinel description for a `Symbol()` created with no argument (so its
@@ -3183,6 +3211,7 @@ impl<'a> Interp<'a> {
             tail_pos: false,
             return_had_expr: false,
             new_target_in_scope: false,
+            super_call_in_scope: false,
             eval_depth: 0,
             rng_state: math_random_seed(),
             this_val: NanBox::undefined(),
@@ -5841,7 +5870,11 @@ impl<'a> Interp<'a> {
     /// binding for `x`): creates a property on the *global* object and a binding
     /// in the global scope — never in the current (function/block) scope, so the
     /// new global outlives the enclosing frame. (Strict mode throws instead.)
-    pub(crate) fn declare_sloppy_global(&mut self, name: &str, value: NanBox) {
+    pub(crate) fn declare_sloppy_global(
+        &mut self,
+        name: &str,
+        value: NanBox,
+    ) -> Result<(), ExecError> {
         // A sloppy assignment to an *unresolvable* reference (`x = 1` with no `x`
         // binding) creates an ordinary, **configurable** data property on the
         // global object — *not* a binding in the global environment record's
@@ -5851,12 +5884,25 @@ impl<'a> Interp<'a> {
         // via `read_ident_ref`'s global-object fallback, so no declarative binding
         // is needed.
         if let Some(g) = self.global_this.as_handle().map(Handle::from_raw) {
+            // PutValue on such a reference is `Set(globalObj, N, V, false)`, an
+            // OrdinarySet over the global object's whole prototype chain: an
+            // *inherited* accessor's setter runs, and an inherited non-writable
+            // data property makes the write a silent no-op — neither creates an
+            // own property. Only when nothing on the chain owns the name does the
+            // write fall through to a fresh own data property (the common case,
+            // kept on the cheap path).
+            if !self.realm.has_own(g, name) && self.has_property(g, name) {
+                let recv = NanBox::handle(g.to_raw());
+                self.proxy_set_bool(g, name, value, recv)?;
+                return Ok(());
+            }
             self.realm.set_property(g, name, value);
         } else {
             // No global object (an unusual embedding): fall back to a declarative
             // binding so the write is not simply lost.
             self.global_scope.declare(name, value);
         }
+        Ok(())
     }
 
     /// Mirrors a global `var`/function declaration's binding onto the global
@@ -6407,6 +6453,10 @@ impl<'a> Interp<'a> {
         // inherited by arrows — so a direct eval inside a top-level arrow (no
         // `new.target` in scope) and any indirect eval keep `new.target` disallowed.
         let allow_new_target = direct && self.new_target_in_scope;
+        // `super(...)` is syntactically valid in a *direct* eval contained in a
+        // derived class constructor (the eval inherits the caller's this-binding
+        // and super-constructor). Tracked lexically like `new.target`.
+        let allow_super_call = direct && self.super_call_in_scope;
         // A direct eval inside strict code is strict even without its own
         // directive; an indirect eval starts sloppy (its strictness comes only
         // from a `"use strict"` in the code itself).
@@ -6428,7 +6478,7 @@ impl<'a> Interp<'a> {
         let program = self.parse_eval_program(
             source,
             allow_super_property,
-            false,
+            allow_super_call,
             allow_new_target,
             inherited_strict,
             &outer_private_names,
@@ -6540,7 +6590,13 @@ impl<'a> Interp<'a> {
         self.eval_var_scope = None;
         self.annexb_block_fns = saved_annexb;
         self.strict = saved_strict;
-        self.this_val = saved_this;
+        // A *direct* eval shares the caller's this-binding: `eval("super()")` in a
+        // derived constructor performs BindThisValue for that constructor, so a
+        // `this` that went from uninitialized (TDZ) to bound during the eval must
+        // keep its new value rather than be restored away.
+        if !(saved_this.is_tdz() && !self.this_val.is_tdz()) {
+            self.this_val = saved_this;
+        }
         self.new_target = saved_new_target;
         result
     }
@@ -7047,6 +7103,8 @@ impl<'a> Interp<'a> {
             // initializer still gets the ContainsArguments early error); a
             // non-arrow shields it (its own `arguments` binding).
             field_init: self.in_field_initializer,
+            nt_in_scope: self.new_target_in_scope,
+            sc_in_scope: self.super_call_in_scope,
         });
         let handle = self.realm.new_function(func_id, self.current.clone());
         // `GetFunctionRealm` tagging: a closure created while executing in a
