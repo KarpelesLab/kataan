@@ -573,15 +573,46 @@ impl<'a> Interp<'a> {
                 Ok(NanBox::handle(obj.to_raw()))
             }
             '-' | '0'..='9' => {
+                // The JSON `Number` production, exactly:
+                //   `-`? ( `0` | [1-9][0-9]* ) ( `.` [0-9]+ )? ( [eE] [+-]? [0-9]+ )?
+                // Scanning "any run of digits/`.`/`e`/`+`/`-`" and handing it to
+                // Rust's `f64` parser accepted forms JSON forbids — a leading zero
+                // (`00`, `013`), a bare trailing point (`1.`), and a leading point
+                // (`.1`) all parse in Rust but must be SyntaxErrors here.
                 let start = *pos;
+                let digit = |c: &[char], p: usize| c.get(p).is_some_and(char::is_ascii_digit);
                 if c.get(*pos) == Some(&'-') {
                     *pos += 1;
                 }
-                while c
-                    .get(*pos)
-                    .is_some_and(|d| d.is_ascii_digit() || matches!(d, '.' | 'e' | 'E' | '+' | '-'))
-                {
+                if c.get(*pos) == Some(&'0') {
                     *pos += 1;
+                } else if digit(c, *pos) {
+                    while digit(c, *pos) {
+                        *pos += 1;
+                    }
+                } else {
+                    return Err(self.json_error("Invalid number in JSON"));
+                }
+                if c.get(*pos) == Some(&'.') {
+                    *pos += 1;
+                    if !digit(c, *pos) {
+                        return Err(self.json_error("Invalid number in JSON"));
+                    }
+                    while digit(c, *pos) {
+                        *pos += 1;
+                    }
+                }
+                if matches!(c.get(*pos), Some('e' | 'E')) {
+                    *pos += 1;
+                    if matches!(c.get(*pos), Some('+' | '-')) {
+                        *pos += 1;
+                    }
+                    if !digit(c, *pos) {
+                        return Err(self.json_error("Invalid number in JSON"));
+                    }
+                    while digit(c, *pos) {
+                        *pos += 1;
+                    }
                 }
                 let text: String = c[start..*pos].iter().collect();
                 text.parse::<f64>()

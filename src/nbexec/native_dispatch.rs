@@ -3,6 +3,44 @@ use super::*;
 impl<'a> Interp<'a> {
     /// Invokes a built-in by id.
     pub(crate) fn call_native(&mut self, id: u16, args: &[NanBox]) -> Result<NanBox, ExecError> {
+        // Every `Math` function applies `ToNumber` to each of its arguments, in
+        // order, before doing anything else — so a user `valueOf`/`@@toPrimitive`
+        // runs (and its throw propagates), and a Symbol/BigInt argument is a
+        // TypeError. The arms below reach for `Realm::to_number`, which is `&self`
+        // and cannot call into JS, so coerce up front and re-dispatch on plain
+        // Numbers. (`max`/`min` coerce themselves — they must ToNumber *all*
+        // arguments even past a NaN — and `sumPrecise` takes an iterable, so both
+        // stay out of this.) The recursion terminates: coerced arguments are
+        // immediates, never handles.
+        if (matches!(
+            id,
+            N_MATH_ABS
+                | N_MATH_FLOOR
+                | N_MATH_CEIL
+                | N_MATH_ROUND
+                | N_MATH_SQRT
+                | N_MATH_POW
+                | N_MATH_SIGN
+                | N_MATH_TRUNC
+                | N_MATH_HYPOT
+                | N_MATH_CBRT
+                | N_MATH_LOG2
+                | N_MATH_LOG10
+                | N_MATH_EXP
+                | N_MATH_LOG
+                | N_MATH_FROUND
+                | N_MATH_F16ROUND
+                | N_MATH_CLZ32
+                | N_MATH_IMUL
+        ) || (N_MATH_SIN..=N_MATH_LOG1P).contains(&id))
+            && args.iter().any(|a| a.as_handle().is_some())
+        {
+            let mut coerced = Vec::with_capacity(args.len());
+            for a in args {
+                coerced.push(self.coerce_to_number(*a)?);
+            }
+            return self.call_native(id, &coerced);
+        }
         let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
         Ok(match id {
             // `Date.prototype[Symbol.toPrimitive](hint)`: requires an object `this`,
@@ -14,7 +52,15 @@ impl<'a> Interp<'a> {
                         self.type_error("Date.prototype[Symbol.toPrimitive] called on non-object")
                     );
                 }
-                let hint = self.realm.to_display_string(arg(0));
+                // The hint is compared as a **String value** — no ToString. A
+                // non-string (`undefined`, `["number"]`, an object with a throwing
+                // `toString`) is a TypeError, and the object's `toString` must not
+                // run at all.
+                let hint = arg(0)
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.realm.string_value(h))
+                    .unwrap_or_default();
                 let try_hint = match hint.as_str() {
                     "string" | "default" => "string",
                     "number" => "number",
@@ -617,10 +663,24 @@ impl<'a> Interp<'a> {
                         if num.abs() < 1.7e38 {
                             crate::bignum::BigInt::from_i128(num as i128)
                         } else {
-                            // Exact integers beyond i128's range are reconstructed
-                            // from their decimal text (Rust prints integer-valued
-                            // f64 exactly with the default formatter).
-                            parse_bigint(&alloc::format!("{num}"))
+                            // Exact reconstruction from the IEEE-754 fields
+                            // (`num = m · 2^e`, `m` the 53-bit significand). Rust's
+                            // `Display` prints the *shortest round-tripping* decimal,
+                            // not the exact value, so formatting zeroed every digit
+                            // past the 17th significant one — `BigInt(Number
+                            // .MAX_VALUE)` came out as 17976931348623157·10^292
+                            // instead of the exact 2^1024 − 2^971.
+                            let bits = num.to_bits();
+                            let mant =
+                                i128::from((bits & 0x000f_ffff_ffff_ffff) | 0x0010_0000_0000_0000);
+                            // Values this large are always normal, so the biased
+                            // exponent is nonzero and `e` is positive.
+                            let e = (((bits >> 52) & 0x7ff) as i64) - 1075;
+                            let mut b = crate::bignum::BigInt::from_i128(mant);
+                            if e > 0 {
+                                b = b.mul(&crate::bignum::BigInt::from_i128(2).pow(e as u64));
+                            }
+                            if num < 0.0 { b.neg() } else { b }
                         }
                     }
                     _ => {
@@ -1272,24 +1332,13 @@ impl<'a> Interp<'a> {
             N_REFLECT_GET => {
                 let h = self.reflect_object_target(arg(0), "get")?;
                 let key = self.coerce_property_key(arg(1))?;
-                // With an explicit `receiver` (3rd arg), a getter found on the
-                // prototype chain runs with `receiver` as its `this` (a data
-                // property ignores the receiver — handled by `read_member`).
+                // With an explicit `receiver` (3rd arg), `[[Get]](P, Receiver)` runs a
+                // prototype-chain getter — *and a proxy `get` trap, at the target or
+                // anywhere on the chain* — with that Receiver. The open-coded walk
+                // this replaced never looked for a proxy, so a trap saw the target as
+                // its receiver. A data / exotic property is receiver-independent.
                 if args.len() > 2 {
-                    let receiver = arg(2);
-                    let mut cur = Some(h);
-                    while let Some(c) = cur {
-                        if let Some((getter, _)) = self.realm.accessor(c, &key) {
-                            if matches!(getter.unpack(), Unpacked::Undefined) {
-                                return Ok(NanBox::undefined());
-                            }
-                            return self.call_with_this(getter, receiver, &[]);
-                        }
-                        if self.realm.has_own(c, &key) {
-                            break;
-                        }
-                        cur = self.realm.object_proto(c);
-                    }
+                    return self.get_with_receiver(h, &key, arg(2));
                 }
                 return self.read_member(h, &key);
             }
@@ -1360,6 +1409,16 @@ impl<'a> Interp<'a> {
                         }
                         // Different receiver + valid index: ordinary set on receiver.
                     }
+                    // The **target itself** is a proxy: its `[[Set]]` *is* the `set`
+                    // trap (or a trapless forward), whatever the Receiver — including
+                    // a primitive one (`Reflect.set(p, k, v, undefined)`), which the
+                    // "write on the receiver" fallback below rejects outright without
+                    // ever firing the trap. A falsy trap result is `false` here, not a
+                    // throw.
+                    if self.realm.proxy_at(h).is_some() {
+                        let ok = self.proxy_set_bool(h, &key, value, receiver)?;
+                        return Ok(NanBox::boolean(ok));
+                    }
                     // A setter accessor found on the chain runs with `receiver` as
                     // `this` (an accessor with no setter fails).
                     let mut cur = Some(h);
@@ -1429,6 +1488,14 @@ impl<'a> Interp<'a> {
                             return Ok(NanBox::boolean(true));
                         }
                         if self.realm.has_own(c, &key) {
+                            // OrdinarySetWithOwnDescriptor step 2: the resolved own
+                            // descriptor is a *data* descriptor, and a non-writable
+                            // one fails the whole `[[Set]]` — including when it was
+                            // found on the prototype, where the receiver must NOT
+                            // shadow it with a new own property.
+                            if !self.can_write_property(c, &key) {
+                                return Ok(NanBox::boolean(false));
+                            }
                             break;
                         }
                         cur = self.realm.object_proto(c);
@@ -1443,16 +1510,10 @@ impl<'a> Interp<'a> {
                     // reads it as non-extensible and would reject every write, so
                     // route through the proxy protocol per OrdinarySetWithOwnDescriptor.
                     if self.realm.proxy_at(rh).is_some() {
-                        if receiver.as_handle() == Some(h.to_raw()) {
-                            // receiver == target: `[[Set]]` on the proxy *is* the
-                            // set trap (or trapless forward) — return its actual
-                            // boolean result (a falsy trap result is `false`, not a
-                            // throw, for `Reflect.set`).
-                            let ok = self.proxy_set_bool(rh, &key, value, receiver)?;
-                            return Ok(NanBox::boolean(ok));
-                        }
-                        // receiver != target (the canonical passthrough
-                        // `set(t,k,v,r){ Reflect.set(t,k,v,r) }`): the write goes to
+                        // (A proxy *target* already returned above, so here the
+                        // receiver is a proxy distinct from the target.)
+                        // The canonical passthrough
+                        // `set(t,k,v,r){ Reflect.set(t,k,v,r) }`: the write goes to
                         // the receiver via `[[DefineOwnProperty]]` (CreateDataProperty
                         // / value update) — NOT `[[Set]]`, which would re-enter the
                         // set trap and recurse forever.
@@ -1653,12 +1714,13 @@ impl<'a> Interp<'a> {
                 if !self.is_constructor_value(arg(0)) {
                     return Err(self.type_error("Reflect.construct target is not a constructor"));
                 }
-                // An explicit `newTarget` (3rd arg), if present, must also be a
-                // constructor (`Reflect.construct(t, a, newTarget)`); else `newTarget`
-                // defaults to `target`.
-                let has_new_target =
-                    args.len() > 2 && !matches!(arg(2).unpack(), Unpacked::Undefined);
-                if has_new_target && !self.is_constructor_value(arg(2)) {
+                // `newTarget` defaults to `target` only when the argument is *absent*
+                // — a **present** `undefined` (`Reflect.construct(f, [], undefined)`)
+                // still goes through step 3's IsConstructor check and is a TypeError.
+                let has_new_target = args.len() > 2;
+                if has_new_target
+                    && (!self.is_constructor_value(arg(2)) || !self.is_constructor(arg(2)))
+                {
                     return Err(self.type_error("Reflect.construct newTarget is not a constructor"));
                 }
                 let list = self.create_list_from_array_like(arg(1))?;
@@ -1667,14 +1729,8 @@ impl<'a> Interp<'a> {
                     let m = self.new_str("Reflect.construct target is not a constructor");
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
-                // An explicit `newTarget` (3rd arg) becomes `new.target` inside the
-                // constructor (else it is the target itself); it too must be a
-                // constructor.
-                if args.len() > 2 && !matches!(arg(2).unpack(), Unpacked::Undefined) {
-                    if !self.is_constructor(arg(2)) {
-                        let m = self.new_str("Reflect.construct newTarget is not a constructor");
-                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-                    }
+                // An explicit `newTarget` becomes `new.target` inside the constructor.
+                if has_new_target {
                     self.reflect_new_target = Some(arg(2));
                 }
                 return self.construct(arg(0), &list);
@@ -2876,7 +2932,21 @@ impl<'a> Interp<'a> {
                     N_MATH_TANH => n.tanh(),
                     N_MATH_ASINH => n.asinh(),
                     N_MATH_ACOSH => n.acosh(),
-                    N_MATH_ATANH => n.atanh(),
+                    // Rust's `f64::atanh` is `0.5 · ln_1p(2x / (1 − x))`, which loses
+                    // ~400 ulp as `x → −1`: the quotient lands just above −1, where
+                    // `ln_1p`'s argument has no precision left. fdlibm's form folds
+                    // the sign out first, so the quotient becomes a *large positive*
+                    // number and `1 − |x|` is exact (Sterbenz).
+                    N_MATH_ATANH => {
+                        let a = n.abs();
+                        let t = if a < 0.5 {
+                            let d = a + a;
+                            0.5 * (d + d * a / (1.0 - a)).ln_1p()
+                        } else {
+                            0.5 * ((a + a) / (1.0 - a)).ln_1p()
+                        };
+                        if n.is_sign_negative() { -t } else { t }
+                    }
                     N_MATH_EXPM1 => n.exp_m1(),
                     _ => n.ln_1p(), // N_MATH_LOG1P
                 };
@@ -4023,7 +4093,18 @@ impl<'a> Interp<'a> {
                 // and throwing a TypeError for a Symbol) before it becomes the
                 // non-enumerable `message` property — unlike the raw
                 // `to_display_string` `make_error` falls back to.
-                let msg = match args.first().copied() {
+                // `AggregateError(errors, message, options)` takes its message
+                // *second*, and calling it as a plain function is identical to
+                // `new` — so it must also drain the (mandatory) `errors` iterable.
+                // Treating `args[0]` as the message left `AggregateError()`
+                // succeeding with no `.errors` instead of throwing a TypeError.
+                let is_aggregate = id == N_ERROR_BASE + 5;
+                let (msg_arg, opts_arg) = if is_aggregate {
+                    (args.get(1).copied(), args.get(2).copied())
+                } else {
+                    (args.first().copied(), args.get(1).copied())
+                };
+                let msg = match msg_arg {
                     Some(m) if !matches!(m.unpack(), Unpacked::Undefined) => {
                         let s = self.coerce_to_string(m)?;
                         Some(self.new_str(&s))
@@ -4031,16 +4112,21 @@ impl<'a> Interp<'a> {
                     _ => None,
                 };
                 let err = self.make_error(id, msg);
-                if let Some(opts) = args
-                    .get(1)
-                    .and_then(|v| v.as_handle())
-                    .map(Handle::from_raw)
+                if let Some(opts) = opts_arg.and_then(|v| v.as_handle()).map(Handle::from_raw)
                     && let Some(cause) = self.realm.get_property(opts, "cause")
                     && let Some(eh) = err.as_handle()
                 {
                     self.realm
                         .set_property(Handle::from_raw(eh), "cause", cause);
                     self.realm.mark_hidden(Handle::from_raw(eh), "cause");
+                }
+                if is_aggregate && let Some(eh) = err.as_handle().map(Handle::from_raw) {
+                    let errors = args.first().copied().unwrap_or(NanBox::undefined());
+                    let list = self.iterate_values(errors)?;
+                    let arr = self.realm.new_array(list);
+                    self.realm
+                        .set_property(eh, "errors", NanBox::handle(arr.to_raw()));
+                    self.realm.mark_hidden(eh, "errors");
                 }
                 err
             }

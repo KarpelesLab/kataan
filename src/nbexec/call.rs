@@ -2248,8 +2248,18 @@ impl<'a> Interp<'a> {
         arg_count: usize,
     ) -> Result<f64, ExecError> {
         let Some(t) = target else { return Ok(0.0) };
-        let has_own = self.realm.has_own(t, "length")
-            || (self.realm.is_callable_cell(t) && self.fn_meta_synthesizable(t, "length"));
+        // `HasOwnProperty(Target, "length")` is `[[GetOwnProperty]]` — on a proxy
+        // that is the `getOwnPropertyDescriptor` trap, which the physical `has_own`
+        // never fires, so a proxy target always reported length 0.
+        let has_own = if self.realm.proxy_at(t).is_some() {
+            !matches!(
+                self.descriptor_of(t, "length")?.unpack(),
+                Unpacked::Undefined
+            )
+        } else {
+            self.realm.has_own(t, "length")
+                || (self.realm.is_callable_cell(t) && self.fn_meta_synthesizable(t, "length"))
+        };
         if !has_own {
             return Ok(0.0);
         }
@@ -3223,29 +3233,36 @@ impl<'a> Interp<'a> {
             } else {
                 (args.first().copied(), args.get(1))
             };
+            // Step 1 is `OrdinaryCreateFromConstructor(newTarget,
+            // "%…Error.prototype%")`, whose `Get(newTarget, "prototype")` is
+            // therefore observable **before** `ToString(message)` — a
+            // `prototype`-trapping proxy newTarget sees its `get` run first.
+            let err = self.make_error(id, None);
+            if native_new_target.as_handle() != callee.as_handle()
+                && let Some(eh) = err.as_handle().map(Handle::from_raw)
+            {
+                let default = self.realm.object_proto(eh);
+                // GetPrototypeFromConstructor performs `Get(newTarget,
+                // "prototype")` — firing a `prototype` accessor / proxy `get`
+                // trap (so a custom-newTarget proxy supplies its trapped
+                // prototype), propagating an abrupt getter.
+                if let Some(proto) =
+                    self.instance_proto_checked(native_new_target, callee, default)?
+                {
+                    self.realm.set_object_proto(eh, Some(proto));
+                }
+            }
             // `message`, if not undefined, is `ToString`'d (running a user
             // `toString`/`valueOf`, propagating an abrupt one, throwing for a
             // Symbol) — the raw `to_display_string` `make_error` uses would not.
-            let msg = match msg_arg {
-                Some(m) if !matches!(m.unpack(), Unpacked::Undefined) => {
-                    let s = self.coerce_to_string(m)?;
-                    Some(self.new_str(&s))
-                }
-                _ => None,
-            };
-            let err = self.make_error(id, msg);
-            if is_aggregate && let Some(eh) = err.as_handle() {
-                // IterableToList(errors): a non-iterable, an absent/throwing
-                // `@@iterator`, or an abrupt `next` propagates (was swallowed by
-                // `unwrap_or_default`).
-                let errors = args.first().copied().unwrap_or(NanBox::undefined());
-                let list = self.iterate_values(errors)?;
-                let arr = self.realm.new_array(list);
-                self.realm.set_property(
-                    Handle::from_raw(eh),
-                    "errors",
-                    NanBox::handle(arr.to_raw()),
-                );
+            if let Some(m) = msg_arg
+                && !matches!(m.unpack(), Unpacked::Undefined)
+                && let Some(eh) = err.as_handle().map(Handle::from_raw)
+            {
+                let s = self.coerce_to_string(m)?;
+                let msg = self.new_str(&s);
+                self.realm.set_property(eh, "message", msg);
+                self.realm.mark_hidden(eh, "message");
             }
             // InstallErrorCause(O, options): only when `options` is an Object and
             // `HasProperty(options, "cause")` is true (firing a proxy `has` trap,
@@ -3263,25 +3280,18 @@ impl<'a> Interp<'a> {
                 self.realm.set_property(eh, "cause", cause);
                 self.realm.mark_hidden(eh, "cause");
             }
-            // `Reflect.construct(Error, …, newTarget)`: link the error to
-            // `GetPrototypeFromConstructor(newTarget, %ErrorType.prototype%)` — the
-            // newTarget's `.prototype` (when an Object), else that constructor's
-            // realm's `%ErrorType.prototype%` (`make_error` installed the current
-            // realm's default). A plain `new Error()` (newTarget == callee) is left
-            // untouched.
-            if native_new_target.as_handle() != callee.as_handle()
-                && let Some(eh) = err.as_handle().map(Handle::from_raw)
-            {
-                let default = self.realm.object_proto(eh);
-                // GetPrototypeFromConstructor performs `Get(newTarget,
-                // "prototype")` — firing a `prototype` accessor / proxy `get`
-                // trap (so a custom-newTarget proxy supplies its trapped
-                // prototype), propagating an abrupt getter.
-                if let Some(proto) =
-                    self.instance_proto_checked(native_new_target, callee, default)?
-                {
-                    self.realm.set_object_proto(eh, Some(proto));
-                }
+            // AggregateError step 4 — after the message and the cause:
+            // IterableToList(errors). A non-iterable (including the `undefined` of a
+            // no-argument `new AggregateError()`), an absent/throwing `@@iterator`,
+            // or an abrupt `next` propagates. The resulting `errors` own property is
+            // writable + configurable but **not** enumerable.
+            if is_aggregate && let Some(eh) = err.as_handle().map(Handle::from_raw) {
+                let errors = args.first().copied().unwrap_or(NanBox::undefined());
+                let list = self.iterate_values(errors)?;
+                let arr = self.realm.new_array(list);
+                self.realm
+                    .set_property(eh, "errors", NanBox::handle(arr.to_raw()));
+                self.realm.mark_hidden(eh, "errors");
             }
             return Ok(err);
         }

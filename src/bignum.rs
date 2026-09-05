@@ -49,10 +49,58 @@ impl BigInt {
     /// fallback for the rare > 2^127 magnitudes.
     #[must_use]
     pub fn to_f64(&self) -> f64 {
-        match self.to_i128() {
-            Some(v) => v as f64,
-            None => self.0.to_f64(),
+        if let Some(v) = self.to_i128() {
+            return v as f64;
         }
+        // Beyond `i128`: assemble the IEEE-754 double by hand from the top 54
+        // magnitude bits plus a sticky bit, rounding half-to-even. (The backend's
+        // own `to_f64` rounds the wrong way on some ties' neighbours, which is
+        // observable as `BigInt(Number(x)) !== x` for exactly-representable `x`.)
+        let neg = self.is_negative();
+        let mag = if neg { self.neg() } else { self.clone() };
+        let bits = mag.bit_len();
+        debug_assert!(bits > 127);
+        // A magnitude of more than 1024 bits is at least 2^1024 — always ±∞. Taking
+        // it first keeps the `2^shift` divisor below 2^970, so an astronomically
+        // large BigInt costs no big-integer work here.
+        if bits > 1024 {
+            return if neg {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            };
+        }
+        // Split off all but the top 54 bits; `rem != 0` is the sticky bit.
+        let shift = bits - 54;
+        let (q, rem) = match mag.divmod(&Self::from_i128(2).pow(shift)) {
+            Some(qr) => qr,
+            None => return f64::NAN,
+        };
+        // `q` has exactly 54 bits, so it fits an `i128` comfortably.
+        let mut m = q.to_i128().unwrap_or(0) as u64;
+        let sticky = !rem.is_zero();
+        let round_bit = m & 1;
+        m >>= 1; // the 53-bit significand
+        let mut exp = shift + 1; // value ≈ m · 2^exp
+        if round_bit == 1 && (sticky || (m & 1) == 1) {
+            m += 1;
+            if m == 1 << 53 {
+                m >>= 1;
+                exp += 1;
+            }
+        }
+        // IEEE-754 binary64: `m` is normalized in [2^52, 2^53), so the biased
+        // exponent is `exp + 52 + 1023`; at or past 2047 the value overflows.
+        let biased = exp + 52 + 1023;
+        if biased >= 2047 {
+            return if neg {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            };
+        }
+        let raw = (u64::from(neg) << 63) | (biased << 52) | (m & 0x000f_ffff_ffff_ffff);
+        f64::from_bits(raw)
     }
 
     /// Converts to an `i128` if it fits, else `None`.

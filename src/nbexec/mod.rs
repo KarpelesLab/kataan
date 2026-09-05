@@ -2595,7 +2595,7 @@ const THIS_CELL_SLOT: &str = "\u{0}tcell";
 // The call-depth, allocation-length, string-length, native-recursion,
 // BigInt-size, and JSON-depth caps now live in [`crate::limits::Limits`] and are
 // read live from `self.realm.limits`, so an embedder can tune them per realm.
-const SYMBOL_NO_DESC: &str = "\u{0}nodesc";
+pub(crate) const SYMBOL_NO_DESC: &str = "\u{0}nodesc";
 /// Hidden key holding a `WeakRef`'s target (returned by `deref`).
 const WEAKREF_TARGET: &str = "\u{0}wrtarget";
 /// Hidden marker tagging a `FinalizationRegistry` instance.
@@ -3702,12 +3702,15 @@ impl<'a> Interp<'a> {
         let species_sym = self.well_known_symbol("species");
         let species_key = self.member_key(species_sym);
         let species_get = self.new_named_native("get [Symbol.species]", N_TYPED_ARRAY_SPECIES);
+        self.install_fn_name_length(species_get, "get [Symbol.species]", 0);
         self.realm.define_accessor(
             ta,
             &species_key,
             NanBox::handle(species_get.to_raw()),
             NanBox::undefined(),
         );
+        // Every well-known-symbol accessor on a built-in is `enumerable: false`.
+        self.realm.mark_hidden(ta, &species_key);
         // Install the `%TypedArray%.prototype` methods as first-class own data
         // properties (each a bound native re-dispatched through `call_method` with
         // the call's typed-array `this`), so `typeof ta.map === "function"`, the
@@ -5451,7 +5454,10 @@ impl<'a> Interp<'a> {
         // `verifyProperty` on e.g. `Object.length`/`Array.name` matches the spec.
         // (`Object.name` was already installed above.) `Object.length === 1`,
         // `Array.length === 1`.
-        for (ctor, ctor_name) in [("Array", "Array"), ("Reflect", "Reflect")] {
+        // `Reflect` is NOT in this list: it is an ordinary (non-callable) namespace
+        // object whose only own properties are the 13 methods and `@@toStringTag` —
+        // it has no `name` and no `length`.
+        for (ctor, ctor_name) in [("Array", "Array")] {
             if let Some(h) = self.current.get(ctor).and_then(NanBox::as_handle) {
                 let h = Handle::from_raw(h);
                 let nv = self.new_str(ctor_name);
@@ -6596,6 +6602,20 @@ impl<'a> Interp<'a> {
         source.extend_from_slice(b"\n) {\n");
         source.extend_from_slice(&body);
         source.extend_from_slice(b"\n})");
+
+        // CreateDynamicFunction steps 15-18: the parameter text and the body text
+        // must each parse **on their own**, before the assembled source is parsed.
+        // Without that, a parameter list that escapes into the body reassembles into
+        // a perfectly legal program — `new Function("/*", "*/) {")` becomes
+        // `function anonymous() {}` — instead of the required SyntaxError.
+        let mut params_only = alloc::format!("({keyword} anonymous(").into_bytes();
+        params_only.extend_from_slice(&params);
+        params_only.extend_from_slice(b"\n) {\n\n})");
+        self.parse_eval_program(&params_only, false, false, false, false, &[], false)?;
+        let mut body_only = alloc::format!("({keyword} anonymous(\n) {{\n").into_bytes();
+        body_only.extend_from_slice(&body);
+        body_only.extend_from_slice(b"\n})");
+        self.parse_eval_program(&body_only, false, false, false, false, &[], false)?;
 
         // A `Function(…)` body is global-scoped — no inherited `super`. (Its body
         // is wrapped in a function expression, so `new.target` inside is enabled by
@@ -8764,6 +8784,14 @@ pub(crate) fn make_date_ms(
     let m_floor = crate::common::FloatExt::floor(m / 12.0);
     let ym = y + m_floor;
     let mn = m - m_floor * 12.0; // 0.0..=11.0
+    // MakeDay step 5: "if ym is not finite, return NaN". Adding two finite but
+    // huge components (`Date.UTC(Number.MAX_VALUE, Number.MAX_VALUE)`) overflows
+    // to ±∞ here, and `∞ as i64` saturates to `i64::MAX` — which would silently
+    // produce a bogus finite timestamp. Anything past ±1e6 is likewise far outside
+    // the representable year range (±275760), so it can never survive TimeClip.
+    if !ym.is_finite() || !mn.is_finite() || !(-1.0e6..=1.0e6).contains(&ym) {
+        return f64::NAN;
+    }
     let day_base = crate::realm::days_from_civil(ym as i64, mn as u32 + 1, 1) as f64;
     let day_number = day_base + (dt - 1.0);
     // MakeTime: ((h·msPerHour + m·msPerMinute) + s·msPerSecond) + milli.

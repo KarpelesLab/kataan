@@ -2240,6 +2240,25 @@ impl Realm {
             .collect()
     }
 
+    /// Own **enumerable** Symbol keys (the `\0sym:` internal names) held in a
+    /// handle's auxiliary object — the aux-store counterpart of
+    /// [`Self::object_keys_with_symbols`], for the non-object exotics (array,
+    /// function, typed array) that keep their symbol properties there.
+    #[must_use]
+    pub fn aux_enumerable_symbol_keys(&self, handle: Handle) -> Vec<alloc::string::String> {
+        let Some(aux) = self.aux_props.get(&handle.to_raw()) else {
+            return alloc::vec::Vec::new();
+        };
+        let Some(obj) = self.heap.get(*aux).and_then(Cell::as_object) else {
+            return alloc::vec::Vec::new();
+        };
+        obj.enumerable_keys()
+            .iter()
+            .filter(|s| s.starts_with("\u{0}sym:"))
+            .map(|s| alloc::string::String::from(*s))
+            .collect()
+    }
+
     /// Own enumerable keys **including** symbol keys (the `\0sym:` internal
     /// names), excluding only private (`#`) fields — for `Object.assign` and
     /// spread, which copy own enumerable string *and* symbol properties.
@@ -4993,9 +5012,12 @@ impl Realm {
                     alloc::format!("/{}/{flags}", crate::wtf8::to_string_lossy(source))
                 }
                 Some(Cell::Symbol { description, .. }) => {
-                    // A no-argument `Symbol()` carries a `\0`-sentinel description
-                    // (an undefined `.description`); render it as `Symbol()`.
-                    if description.starts_with('\u{0}') {
+                    // A no-argument `Symbol()` carries the reserved `\0nodesc`
+                    // sentinel description (an undefined `.description`); render it
+                    // as `Symbol()`. The test is for that exact sentinel, not merely
+                    // a leading NUL — `Symbol("\0")` has the one-character
+                    // description `"\0"` and stringifies as `Symbol(\0)`.
+                    if &**description == crate::nbexec::SYMBOL_NO_DESC {
                         alloc::string::String::from("Symbol()")
                     } else {
                         alloc::format!("Symbol({description})")

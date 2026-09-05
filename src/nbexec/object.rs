@@ -720,6 +720,13 @@ impl<'a> Interp<'a> {
         if let Some((target, handler)) = self.realm.proxy_at(obj) {
             self.guard_revoked(obj)?;
             if let Some(trap) = self.proxy_trap(handler, "defineProperty")? {
+                // 10.5.6 step 7: the trap receives `FromPropertyDescriptor(Desc)` —
+                // a *fresh* object holding only the fields ToPropertyDescriptor kept,
+                // with the booleans already coerced. Forwarding the caller's raw
+                // attributes object instead leaked `configurable: 17` (and an
+                // `enumerable: undefined` that should have become `false`) into the
+                // trap, and let the trap see object identity it must not.
+                let nd = self.normalize_property_descriptor(desc)?;
                 let key_v = self.key_to_value(key);
                 let handler_box = NanBox::handle(handler.to_raw());
                 let r = self.call_with_this(
@@ -728,7 +735,7 @@ impl<'a> Interp<'a> {
                     &[
                         NanBox::handle(target.to_raw()),
                         key_v,
-                        NanBox::handle(desc.to_raw()),
+                        NanBox::handle(nd.to_raw()),
                     ],
                 )?;
                 // A falsy trap result is a failed [[DefineOwnProperty]]:
@@ -742,10 +749,10 @@ impl<'a> Interp<'a> {
                         "proxy 'defineProperty' trap returned falsish for property '{key}'"
                     )));
                 }
-                // Invariants (10.5.6 steps 14-18) on a successful define. Normalize
-                // the incoming descriptor to inspect what was requested, and read the
-                // target's current own descriptor (proxy-aware) + extensibility.
-                let nd = self.normalize_property_descriptor(desc)?;
+                // Invariants (10.5.6 steps 14-18) on a successful define, checked
+                // against the same normalized descriptor the trap was handed (so the
+                // caller's getters are not re-run), plus the target's current own
+                // descriptor (proxy-aware) + extensibility.
                 let setting_nonconf = self.realm.has_own(nd, "configurable")
                     && !self
                         .realm
@@ -2663,6 +2670,20 @@ impl<'a> Interp<'a> {
         } else {
             keys.extend(self.realm.aux_named_keys(descs));
         }
+        // `[[OwnPropertyKeys]]` lists Symbols after Strings, and
+        // ObjectDefineProperties keeps every *enumerable* one — so a symbol-keyed
+        // descriptor (`Object.create(p, {[Symbol.toStringTag]: {value: "x"}})`)
+        // installs a symbol property. Scanning only string keys silently dropped it.
+        for k in self
+            .realm
+            .object_keys_with_symbols(descs)
+            .into_iter()
+            .chain(self.realm.aux_enumerable_symbol_keys(descs))
+        {
+            if k.starts_with("\u{0}sym:") && !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
         for key in keys {
             // Get(props, key) invokes a getter (the descriptor value may be
             // computed); the result must be an object (ToPropertyDescriptor).
@@ -2908,6 +2929,12 @@ impl<'a> Interp<'a> {
         if let Ok(i) = key.parse::<usize>()
             && self.string_index_count(handle).is_some_and(|n| i < n)
         {
+            return false;
+        }
+        // A String exotic object's `length` is likewise a non-writable,
+        // non-configurable own data property (`new String("hi").length = 700`
+        // fails; `Reflect.set` reports `false`).
+        if key == "length" && self.realm.string_object_len(handle).is_some() {
             return false;
         }
         let add_to_non_extensible =

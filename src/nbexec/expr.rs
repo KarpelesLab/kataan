@@ -239,7 +239,12 @@ impl<'a> Interp<'a> {
             self.realm.symbol_at(h).is_none() && !self.realm.is_string_handle(h)
         });
         if is_object_key {
-            let p = self.coerce_object(k, "string")?;
+            // Full `ToPrimitive(key, string)` — `@@toPrimitive`, then
+            // `toString`/`valueOf` (inherited included). `coerce_object` returned a
+            // keyless exotic (a Date, most visibly) unchanged, so the key became its
+            // raw display form — a Date keyed on its ISO text instead of on
+            // `Date.prototype.toString`.
+            let p = self.coerce_primitive(k, "string")?;
             // ToPropertyKey: if ToPrimitive produced a Symbol, it is the key as-is
             // (do NOT ToString it). Otherwise ToString the primitive.
             if let Some(raw) = p.as_handle()
@@ -1415,8 +1420,13 @@ impl<'a> Interp<'a> {
                             // form (not `"__proto__":`, computed, shorthand, or a
                             // method) sets the prototype; a quoted/computed key makes
                             // an ordinary own `__proto__` data property.
+                            // The exclusion is *method definitions* (`__proto__() {}`,
+                            // which is not the `PropertyName : AssignmentExpression`
+                            // production) — NOT every function-valued right-hand side:
+                            // `__proto__: function () {}` is still the prototype
+                            // setter, and its function is therefore left anonymous.
                             if !shorthand
-                                && !matches!(&**value, Expr::Function(_))
+                                && !*method
                                 && let PropertyKey::Ident(s) = key
                                 && &**s == "__proto__"
                             {
@@ -1449,6 +1459,13 @@ impl<'a> Interp<'a> {
                                 match key {
                                     PropertyKey::Ident(s) | PropertyKey::Str(s) => {
                                         self.set_fn_name(v, s);
+                                    }
+                                    // A *numeric* literal key names the function after
+                                    // its ToString form (`{5: function(){}}` → "5",
+                                    // `{0.4: …}` → "0.4"); `k` already holds it.
+                                    PropertyKey::Number(_) => {
+                                        let name = k.clone();
+                                        self.set_fn_name_owned(v, &name);
                                     }
                                     PropertyKey::Computed(_) => {
                                         // `k` is the storage key (a `\0sym:` key for a
@@ -1994,7 +2011,13 @@ impl<'a> Interp<'a> {
         let Some(wh) = wrapper.as_handle().map(Handle::from_raw) else {
             return Ok(());
         };
-        if self.set_through_proto_chain(wh, &key, new)?.is_some() {
+        // `[[Set]]` runs on the transient wrapper, but the *Receiver* is the
+        // primitive — an inherited (strict) setter must see `this` as the
+        // primitive value, matching the getter path.
+        if self
+            .set_through_proto_chain_for(wh, prim, &key, new)?
+            .is_some()
+        {
             return Ok(());
         }
         if self.strict {
@@ -2116,6 +2139,7 @@ impl<'a> Interp<'a> {
                 // own body declares a `static name` element (which set the real
                 // value). Only overwrite the placeholder — never an explicit one.
                 && !self.class_declares_static_name(cid)
+                && !self.class_has_own_name_element(handle)
             {
                 let name_v = self.new_str(name);
                 self.realm.clear_readonly_property(handle, "name");
@@ -2158,6 +2182,7 @@ impl<'a> Interp<'a> {
                 // own body declares a `static name` element (which set the real
                 // value). Only overwrite the placeholder — never an explicit one.
                 && !self.class_declares_static_name(cid)
+                && !self.class_has_own_name_element(handle)
             {
                 let name_v = self.new_str(name);
                 self.realm.clear_readonly_property(handle, "name");
@@ -2168,11 +2193,34 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Whether the class constructor object *already carries* a `name` supplied by
+    /// one of its own elements — the runtime counterpart of
+    /// [`class_declares_static_name`](Self::class_declares_static_name), which sees
+    /// only literal keys. A **computed** `static [k]() {}` with `k === "name"`
+    /// installs the method before NamedEvaluation runs, and must not be clobbered
+    /// by it. An anonymous class's untouched placeholder is exactly the empty
+    /// string (or an accessor, which is always a real element).
+    fn class_has_own_name_element(&self, handle: crate::heap::Handle) -> bool {
+        if self.realm.accessor(handle, "name").is_some() {
+            return true;
+        }
+        match self.realm.get_property(handle, "name") {
+            Some(v) => !v
+                .as_handle()
+                .map(Handle::from_raw)
+                .and_then(|nh| self.realm.string_value(nh))
+                .is_some_and(|s| s.is_empty()),
+            None => false,
+        }
+    }
+
     /// Whether class `cid`'s body declares a `static name` member (a method,
     /// accessor, or field with the literal key `name`) — which supplies the
     /// constructor's `name` own property and therefore blocks NamedEvaluation
     /// from overwriting it. A computed `static [x]` key is not statically known,
-    /// so it is conservatively ignored here.
+    /// so it is conservatively ignored here (see
+    /// [`class_has_own_name_element`](Self::class_has_own_name_element), which
+    /// catches it at runtime).
     fn class_declares_static_name(&self, cid: u32) -> bool {
         self.classes[cid as usize].body.iter().any(|m| {
             let (is_static, key) = match m {
@@ -2367,6 +2415,23 @@ impl<'a> Interp<'a> {
         key: &str,
         new: NanBox,
     ) -> Result<Option<()>, ExecError> {
+        let recv_value = NanBox::handle(receiver.to_raw());
+        self.set_through_proto_chain_for(receiver, recv_value, key, new)
+    }
+
+    /// [`Self::set_through_proto_chain`] with an explicit **Receiver value**: the
+    /// `this` an inherited setter (or the proxy `set` trap's fourth argument) sees.
+    /// It differs from the walked object only for a write through a primitive
+    /// receiver (`sym.prop = v`), where `[[Set]]` runs on the transient wrapper but
+    /// Receiver is the *primitive* — a strict setter must see `typeof this ===
+    /// "symbol"`, not the box.
+    pub(crate) fn set_through_proto_chain_for(
+        &mut self,
+        receiver: crate::heap::Handle,
+        recv_value: NanBox,
+        key: &str,
+        new: NanBox,
+    ) -> Result<Option<()>, ExecError> {
         let mut cur = self.realm.object_proto(receiver);
         while let Some(c) = cur {
             // A proxy above the receiver handles the write through its own
@@ -2376,12 +2441,11 @@ impl<'a> Interp<'a> {
                 self.guard_revoked(c)?;
                 if let Some(trap) = self.proxy_trap(p_handler, "set")? {
                     let key_box = self.new_str(key);
-                    let recv = NanBox::handle(receiver.to_raw());
                     let handler_box = NanBox::handle(p_handler.to_raw());
                     let r = self.call_with_this(
                         trap,
                         handler_box,
-                        &[NanBox::handle(target.to_raw()), key_box, new, recv],
+                        &[NanBox::handle(target.to_raw()), key_box, new, recv_value],
                     )?;
                     if self.strict && !self.realm.truthy(r) {
                         let m = self.new_str(&alloc::format!(
@@ -2394,8 +2458,7 @@ impl<'a> Interp<'a> {
                 if let Some((_, setter)) = self.realm.accessor(target, key)
                     && !matches!(setter.unpack(), Unpacked::Undefined)
                 {
-                    let this = NanBox::handle(receiver.to_raw());
-                    self.call_with_this(setter, this, &[new])?;
+                    self.call_with_this(setter, recv_value, &[new])?;
                     return Ok(Some(()));
                 }
                 return Ok(None);
@@ -2426,12 +2489,19 @@ impl<'a> Interp<'a> {
             }
             if let Some((_, setter)) = self.realm.accessor(c, key) {
                 if !matches!(setter.unpack(), Unpacked::Undefined) {
-                    let this = NanBox::handle(receiver.to_raw());
-                    self.call_with_this(setter, this, &[new])?;
+                    self.call_with_this(setter, recv_value, &[new])?;
+                } else if self.strict {
+                    // OrdinarySetWithOwnDescriptor: an accessor descriptor whose
+                    // [[Set]] is undefined makes the whole `[[Set]]` return false —
+                    // the throwing form raises a TypeError, sloppy drops the write.
+                    // (The dot-key path already did this; the computed-key path
+                    // silently dropped it.)
+                    let m = self.new_str(&alloc::format!(
+                        "Cannot assign to read only property '{key}' (accessor has no setter)"
+                    ));
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
-                // A getter-only inherited accessor shadows the data write (the
-                // existing computed-path behavior; strict-throw is not introduced
-                // here to avoid changing unrelated cases).
+                // A getter-only inherited accessor shadows the data write.
                 return Ok(Some(()));
             }
             // An own data property below shadows an inherited accessor/proxy.
@@ -2849,11 +2919,24 @@ impl<'a> Interp<'a> {
     /// `globalThis.foo = 1` is created by the ordinary global-object fallback that
     /// identifier resolution already consults.
     fn sync_global_object_write(&mut self, handle: Handle, name: &str, new: NanBox) {
-        if self.global_this.as_handle() != Some(handle.to_raw()) {
+        if self.global_this.as_handle() == Some(handle.to_raw()) {
+            if self.global_scope.get(name).is_some() {
+                self.global_scope.set(name, new);
+            }
             return;
         }
-        if self.global_scope.get(name).is_some() {
-            self.global_scope.set(name, new);
+        // The same mirroring for **another realm's** global object: a
+        // `$262.createRealm()` realm hands its `global` back to this one, and
+        // `g.x = v` has to reach *that* realm's binding `x` — code running inside
+        // it reads the declarative binding, not the object, so without this the
+        // write is invisible there.
+        if let Some(r) = self
+            .created_realms
+            .iter()
+            .find(|r| r.global_this.as_handle() == Some(handle.to_raw()))
+            && r.global_scope.get(name).is_some()
+        {
+            r.global_scope.set(name, new);
         }
     }
 
@@ -4305,6 +4388,14 @@ impl<'a> Interp<'a> {
                 // the RHS (`ident_with_ref`), per PutValue's reference order.
                 if let Some(h) = ident_with_ref {
                     let new = if op == AssignOp::Assign {
+                        // NamedEvaluation applies to *any* IdentifierReference target,
+                        // an object-environment (`with`) one included:
+                        // `with (o) { dynamic = function(){} }` names it "dynamic".
+                        if !paren_target
+                            && matches!(value, Expr::Function(_) | Expr::Arrow(_) | Expr::Class(_))
+                        {
+                            self.set_fn_name(rhs, name);
+                        }
                         rhs
                     } else {
                         let current = self.read_member(h, name)?;
@@ -4350,6 +4441,16 @@ impl<'a> Interp<'a> {
                     if self.strict {
                         let m = self.new_str("Assignment to constant variable.");
                         return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
+                    // NamedEvaluation happens while evaluating the *right-hand side*,
+                    // before PutValue — so the function is named even though the write
+                    // itself is a silent no-op (`namedLambda = function(){}` inside
+                    // `namedLambda` yields a function named "namedLambda").
+                    if !paren_target
+                        && op == AssignOp::Assign
+                        && matches!(value, Expr::Function(_) | Expr::Arrow(_) | Expr::Class(_))
+                    {
+                        self.set_fn_name(rhs, name);
                     }
                     return Ok(if op == AssignOp::Assign {
                         rhs
@@ -5219,6 +5320,45 @@ impl<'a> Interp<'a> {
         {
             return Ok(r);
         }
+        // IsLooselyEqual with exactly one **Object** operand (the other a
+        // non-nullish primitive) runs `ToPrimitive(obj)` with the *default* hint and
+        // retries, so a user `valueOf`/`toString`/`@@toPrimitive` is honored
+        // (`new Number() == 0`, `new Date == true` → the Date's `toString`).
+        // `Realm::loose_equals` is `&self` and cannot call into JS, so it is done
+        // here. An Object-vs-Object comparison is identity (no coercion), and
+        // `null`/`undefined` never coerce — that keeps the `IsHTMLDDA` special case
+        // in `loose_equals` reachable.
+        if matches!(op, BinaryOp::EqEq | BinaryOp::NotEq) {
+            let nullish = |v: NanBox| matches!(v.unpack(), Unpacked::Undefined | Unpacked::Null);
+            let (a, b) = if self.is_object_value(a) && !self.is_object_value(b) && !nullish(b) {
+                (self.coerce_primitive(a, "default")?, b)
+            } else if self.is_object_value(b) && !self.is_object_value(a) && !nullish(a) {
+                (a, self.coerce_primitive(b, "default")?)
+            } else {
+                (a, b)
+            };
+            // The coercion may have produced a String (or Number) facing a BigInt —
+            // `0n == {toString(){return "0"}}`. That pairing is StringToBigInt /
+            // mathematical-value equality, which `loose_equals` (a `&self` reference
+            // comparison) cannot do; the BigInt path above ran too early to see it.
+            let abig = a
+                .as_handle()
+                .and_then(|raw| self.realm.bigint_at(Handle::from_raw(raw)));
+            let bbig = b
+                .as_handle()
+                .and_then(|raw| self.realm.bigint_at(Handle::from_raw(raw)));
+            if (abig.is_some() || bbig.is_some())
+                && let Some(r) = self.bigint_binary(op, abig, bbig, a, b)?
+            {
+                return Ok(r);
+            }
+            let eq = self.realm.loose_equals(a, b);
+            return Ok(NanBox::boolean(if matches!(op, BinaryOp::EqEq) {
+                eq
+            } else {
+                !eq
+            }));
+        }
         // Arithmetic and relational operators apply ToPrimitive to object
         // operands (`valueOf`/`toString`); equality/`instanceof`/`in` do not.
         let coerces = matches!(
@@ -5408,9 +5548,11 @@ impl<'a> Interp<'a> {
                     let m = self.new_str("Cannot use 'in' operator to search in a non-object");
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
-                // `ToPropertyKey(a)`: an object left operand runs ToPrimitive with
-                // the string hint, so `new String("x") in obj` (and any object with
-                // a `toString`) keys on the converted value, not on a display form.
+                // `ToPropertyKey(a)`: an object left operand goes through
+                // ToPrimitive, so a Symbol *wrapper* (`Object(sym) in obj`) keys on
+                // the wrapped symbol, and `new String("x") in obj` (or any object
+                // with a `toString`) keys on the converted value — `member_key`
+                // alone would key on the display string.
                 let key = self.coerce_property_key(a)?;
                 // A Deferred Module Namespace (`import defer`) evaluates its target
                 // on a `[[HasProperty]]` with a String (non-"then") key — directly
@@ -5468,16 +5610,25 @@ impl<'a> Interp<'a> {
             let sym = self.well_known_symbol("hasInstance");
             let key = self.member_key(sym);
             let method = self.read_member(ch, &key)?;
-            if let Some(mh) = method.as_handle().map(Handle::from_raw)
-                && self.is_callable(mh)
+            let callable_h = method
+                .as_handle()
+                .map(Handle::from_raw)
+                .filter(|mh| self.is_callable(*mh));
+            if let Some(mh) = callable_h {
                 // Skip the *default* `Function.prototype[Symbol.hasInstance]`
                 // (every function inherits it): it just performs OrdinaryHasInstance,
                 // which is exactly the ordinary path below — calling it here would
                 // recurse. Only a *user* `[Symbol.hasInstance]` override is honored.
-                && self.realm.native_at(mh) != Some(N_FN_HAS_INSTANCE)
-            {
-                let result = self.call_with_this(method, ctor, &[obj])?;
-                return Ok(self.realm.truthy(result));
+                if self.realm.native_at(mh) != Some(N_FN_HAS_INSTANCE) {
+                    let result = self.call_with_this(method, ctor, &[obj])?;
+                    return Ok(self.realm.truthy(result));
+                }
+            } else if !matches!(method.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                // `GetMethod(target, @@hasInstance)`: a *present* but non-callable
+                // value is a TypeError — it is never silently ignored (a proxy `get`
+                // trap returning a RegExp, say).
+                let m = self.new_str("Symbol.hasInstance is not a function");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
         }
         // The RHS must be a callable object (without a `[Symbol.hasInstance]`); a

@@ -1203,8 +1203,29 @@ fn vm_value_bin(
 ) -> Result<NanBox, VmError> {
     match op {
         VB_LOOSE_EQ | VB_LOOSE_NEQ => {
-            // `obj == primitive` converts the object with ToPrimitive (toString)
-            // before comparing, so e.g. `[] == 0` is true.
+            // `obj == primitive` runs `ToPrimitive(obj)` with the **default** hint —
+            // its `@@toPrimitive`/`valueOf`/`toString`, any of which the program may
+            // have overridden (and any of which may throw). `loose_eq_coerce` below
+            // only knows the intrinsic display form, so hand those to the
+            // tree-walker. Object-vs-object (identity) and the `null`/`undefined`
+            // cases need no conversion and stay on the fast path.
+            let real_obj = |v: NanBox| {
+                v.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                    !ctx.realm.is_string_handle(h)
+                        && ctx.realm.symbol_at(h).is_none()
+                        && ctx.realm.bigint_at(h).is_none()
+                })
+            };
+            let bare_prim = |v: NanBox| {
+                !real_obj(v)
+                    && !matches!(
+                        v.unpack(),
+                        crate::nanbox::Unpacked::Undefined | crate::nanbox::Unpacked::Null
+                    )
+            };
+            if (real_obj(a) && bare_prim(b)) || (real_obj(b) && bare_prim(a)) {
+                return Err(VmError::Unsupported);
+            }
             let (xc, yc) = loose_eq_coerce(ctx.realm, a, b);
             let r = ctx.realm.loose_equals(xc, yc);
             Ok(NanBox::boolean(if op == VB_LOOSE_EQ { r } else { !r }))
@@ -2647,14 +2668,35 @@ fn run_frame(
             Op::HasProp { dst, key, obj } => {
                 let present = match regs[*obj as usize].as_handle().map(Handle::from_raw) {
                     Some(h) => {
-                        let k = ctx.realm.to_display_string(regs[*key as usize]);
+                        // ToPropertyKey + `[[HasProperty]]`: a proxy `has` trap
+                        // anywhere on the chain, and an *object* left operand
+                        // (ToPrimitive, e.g. a Symbol wrapper) are the tree-walker's
+                        // — fault the program over rather than key on a display
+                        // string. A primitive Symbol keys on its `\0sym:` name.
+                        let kv = regs[*key as usize];
+                        let k = match kv.as_handle().map(Handle::from_raw) {
+                            Some(kh) => match ctx.realm.symbol_at(kh) {
+                                Some((_, id)) => alloc::format!("\u{0}sym:{id}"),
+                                None if ctx.realm.string_value(kh).is_some() => {
+                                    ctx.realm.to_display_string(kv)
+                                }
+                                None => return Err(VmError::Unsupported),
+                            },
+                            None => ctx.realm.to_display_string(kv),
+                        };
+                        if ctx.realm.proxy_at(h).is_some() {
+                            return Err(VmError::Unsupported);
+                        }
                         // Own or inherited (walk the prototype chain). `has_own`
                         // already reports an array's in-range non-hole indices and
                         // `length`, so a hole is correctly absent unless inherited.
                         let mut found = false;
                         let mut cur = Some(h);
                         while let Some(c) = cur {
-                            if ctx.realm.has_own(c, &k) {
+                            if ctx.realm.proxy_at(c).is_some() {
+                                return Err(VmError::Unsupported);
+                            }
+                            if ctx.realm.has_own(c, &k) || ctx.realm.accessor(c, &k).is_some() {
                                 found = true;
                                 break;
                             }
@@ -2662,7 +2704,8 @@ fn run_frame(
                         }
                         found
                     }
-                    None => false,
+                    // `x in <primitive>` is a TypeError — the tree-walker raises it.
+                    None => return Err(VmError::Unsupported),
                 };
                 regs[*dst as usize] = NanBox::boolean(present);
             }
@@ -3701,6 +3744,26 @@ fn vm_array_index_get(
     Ok(NanBox::undefined())
 }
 
+/// `ToPropertyKey(key)` as the VM's internal storage-key string. A primitive
+/// Symbol becomes the `"\0sym:<id>"` name the object layer stores symbol-keyed
+/// properties under; a String / Number / Boolean / null / undefined is its display
+/// form. Any **other** heap object is `Err(VmError::Unsupported)`: its key comes
+/// from `ToPrimitive(key, string)` — an `@@toPrimitive` / inherited `toString`
+/// only the tree-walker resolves. (A Date, for one, keys on its
+/// `Date.prototype.toString` text, not the ISO form `to_display_string` produces.)
+fn vm_property_key(ctx: &Ctx, key: NanBox) -> Result<String, VmError> {
+    if let Some(raw) = key.as_handle() {
+        let h = Handle::from_raw(raw);
+        if let Some((_, id)) = ctx.realm.symbol_at(h) {
+            return Ok(alloc::format!("\u{0}sym:{id}"));
+        }
+        if ctx.realm.string_value(h).is_none() {
+            return Err(VmError::Unsupported);
+        }
+    }
+    Ok(ctx.realm.to_display_string(key))
+}
+
 /// The interpreter's real computed element **get** `obj[key]` (`Op::GetKey`'s
 /// semantics), factored out so the bytecode VM **and** the generic-JIT runtime
 /// helper ([`jit_helper_get_elem`]) share one code path and can never diverge: a
@@ -3736,9 +3799,10 @@ fn vm_get_elem(
             vm_array_index_get(ctx, funcs, handle, n as usize, recv)
         }
         _ => {
-            // ToPropertyKey: an object key uses its `toString`.
-            let pk = to_primitive(ctx, funcs, key, false);
-            let ks = ctx.realm.to_display_string(pk);
+            // ToPropertyKey: a Symbol keys on its `\0sym:` name; any other object
+            // key needs the full ToPrimitive (its `@@toPrimitive`/`toString`, which
+            // may be inherited or user-written), which the tree-walker owns.
+            let ks = vm_property_key(ctx, key)?;
             // A canonical numeric string key on an array (`arr["0"]`) reads the
             // element, like `arr[0]` — for a valid array index [0, 2**32−1); the
             // boundary value is an ordinary property.
@@ -3785,7 +3849,7 @@ fn vm_get_elem(
 /// and `Err(Thrown)` for a `RangeError` / a BigInt-coercion `TypeError`.
 fn vm_set_elem(
     ctx: &mut Ctx,
-    funcs: &[FnProto],
+    _funcs: &[FnProto],
     recv: NanBox,
     key: NanBox,
     value: NanBox,
@@ -3833,9 +3897,10 @@ fn vm_set_elem(
             Ok(())
         }
         _ => {
-            // ToPropertyKey: an object key uses its `toString`.
-            let pk = to_primitive(ctx, funcs, key, false);
-            let ks = ctx.realm.to_display_string(pk);
+            // ToPropertyKey: a Symbol keys on its `\0sym:` name; any other object
+            // key needs the full ToPrimitive (its `@@toPrimitive`/`toString`, which
+            // may be inherited or user-written), which the tree-walker owns.
+            let ks = vm_property_key(ctx, key)?;
             // C1: a computed `arr["length"] = n` (numeric string key) on an array
             // resizes; `ToUint32(v)` must equal `ToNumber(v)` (else a catchable
             // `RangeError`).
@@ -4482,6 +4547,21 @@ fn builtin_method(
             }
             "pop" => ctx.realm.array_pop(h),
             "join" => {
+                // `ToString` of the separator and of every element: a Symbol has no
+                // string conversion and must throw a TypeError — `to_display_string`
+                // would render `Symbol(x)`. Defer to the tree-walker, which raises it.
+                let is_symbol = |v: NanBox| {
+                    v.as_handle()
+                        .is_some_and(|raw| ctx.realm.symbol_at(Handle::from_raw(raw)).is_some())
+                };
+                if is_symbol(arg0())
+                    || ctx
+                        .realm
+                        .array_elements(h)
+                        .is_some_and(|elems| elems.iter().copied().any(is_symbol))
+                {
+                    return None;
+                }
                 let sep = if matches!(arg0().unpack(), Unpacked::Undefined) {
                     String::from(",")
                 } else {
@@ -10089,11 +10169,23 @@ mod tests {
 
     #[test]
     fn bytecode_loose_eq_object_coercion() {
-        assert_eq!(bc("String([] == false)"), "true");
-        assert_eq!(bc("String([] == 0)"), "true");
-        assert_eq!(bc("String({} == 0)"), "false");
+        // `obj == primitive` needs `ToPrimitive(obj)` with the *default* hint — a
+        // user-overridable `@@toPrimitive`/`valueOf`/`toString` that can throw — so
+        // the VM faults those to the tree-walker rather than using the intrinsic
+        // display form. Exercised through the production `execute` entry (VM with
+        // the tree-walker fallback), which is where the semantics are observable.
+        // Object-vs-object stays on the VM's identity fast path.
+        for (src, want) in [
+            ("String([] == false)", "true"),
+            ("String([] == 0)", "true"),
+            ("String({} == 0)", "false"),
+            ("String([1,2] == '1,2')", "true"),
+            ("String({valueOf(){return 7}} == 7)", "true"),
+        ] {
+            let (_, completion) = execute(src).expect("ok");
+            assert_eq!(completion, want, "{src}");
+        }
         assert_eq!(bc("String({} == {})"), "false");
-        assert_eq!(bc("String([1,2] == '1,2')"), "true");
     }
 
     #[test]

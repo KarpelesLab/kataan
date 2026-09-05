@@ -266,10 +266,15 @@ impl<'a> Interp<'a> {
         // run OrdinaryToPrimitive — not be returned as-is (which would make
         // `Date.prototype.toJSON.call(date)` see the Date object rather than its
         // numeric time, and call `toISOString` even on an invalid date).
+        // An Array is an ordinary object for ToPrimitive: it must run
+        // OrdinaryToPrimitive so `Array.prototype.toString` (→ `join`, which
+        // ToString's each element and therefore throws on a Symbol) or a
+        // user-installed `toString`/`valueOf`/`@@toPrimitive` is honored.
+        // Short-circuiting to the raw display string skipped both.
         if !is_wrapper
             && (self.realm.is_string_handle(h)
-                || self.realm.is_array(h)
                 || (self.realm.object_keys(h).is_none()
+                    && !self.realm.is_array(h)
                     // A function is an ordinary object for ToPrimitive: it must run
                     // OrdinaryToPrimitive so a user-installed `valueOf`/`toString`
                     // is honored (`f.valueOf = () => 1; 1 + f` is `2`, not string

@@ -514,10 +514,12 @@ impl<'a> Interp<'a> {
                             s
                         } else {
                             let mut s = alloc::format!("{n:.digits$}");
-                            // A zero result never carries a sign (`(-0).toFixed(2)`).
-                            if s.starts_with('-')
-                                && s.bytes().all(|b| matches!(b, b'-' | b'0' | b'.'))
-                            {
+                            // The spec takes the sign from `x < 0`, *not* from the
+                            // rounded digits: `(-0).toFixed(2)` is "0.00" (`-0 < 0`
+                            // is false), while a tiny negative that rounds to zero
+                            // keeps its sign — `(-Number.MIN_VALUE).toFixed(0)` is
+                            // "-0". So strip the sign only for an actual ±0.
+                            if n == 0.0 && s.starts_with('-') {
                                 s.remove(0);
                             }
                             s
@@ -1008,8 +1010,14 @@ impl<'a> Interp<'a> {
         if let Some((desc, _)) = self.realm.symbol_at(handle)
             && method == "toString"
         {
-            // A no-argument `Symbol()` has an empty (undefined) description.
-            let shown = if desc.starts_with('\u{0}') { "" } else { &desc };
+            // A no-argument `Symbol()` has an empty (undefined) description, marked
+            // by the exact `\0nodesc` sentinel — a description that merely *starts*
+            // with NUL (`Symbol("\0")`) is a real description and must show.
+            let shown = if &*desc == crate::nbexec::SYMBOL_NO_DESC {
+                ""
+            } else {
+                &desc
+            };
             return Ok(Some(self.new_str(&alloc::format!("Symbol({shown})"))));
         }
         // --- BigInt instance: `toString(radix)` / `valueOf` ---
@@ -1860,41 +1868,54 @@ impl<'a> Interp<'a> {
                     }
                     // Any NaN component makes the whole result NaN (TimeClip).
                     let mut any_nan = false;
-                    let mut comp = |slot: &mut i64, idx: usize| {
+                    // `limit` bounds each component so the `i64` combination below
+                    // cannot silently wrap. A finite-but-astronomical argument
+                    // (`setUTCFullYear(Number.MAX_VALUE, …)`) otherwise saturates on
+                    // `as i64` and yields a bogus finite timestamp; every limit here
+                    // is far outside the representable range (|t| ≤ 8.64e15 ms), so
+                    // exceeding one is exactly the spec's MakeDay/TimeClip NaN.
+                    let mut comp = |slot: &mut i64, idx: usize, limit: f64| {
                         if let Some(&v) = comps.get(idx) {
-                            if v.is_nan() || !v.is_finite() {
+                            if v.is_nan() || !v.is_finite() || v > limit || v < -limit {
                                 any_nan = true;
                             }
                             *slot = v as i64;
                         }
                     };
+                    const YEAR_MAX: f64 = 1.0e7;
+                    const MONTH_MAX: f64 = 1.0e8;
+                    const DATE_MAX: f64 = 1.0e10;
+                    const HOUR_MAX: f64 = 1.0e11;
+                    const MIN_MAX: f64 = 1.0e13;
+                    const SEC_MAX: f64 = 1.0e14;
+                    const MS_MAX: f64 = 1.0e17;
                     match method {
                         "setFullYear" | "setUTCFullYear" => {
-                            comp(&mut yy, 0);
-                            comp(&mut mo0, 1);
-                            comp(&mut dd, 2);
+                            comp(&mut yy, 0, YEAR_MAX);
+                            comp(&mut mo0, 1, MONTH_MAX);
+                            comp(&mut dd, 2, DATE_MAX);
                         }
                         "setMonth" | "setUTCMonth" => {
-                            comp(&mut mo0, 0);
-                            comp(&mut dd, 1);
+                            comp(&mut mo0, 0, MONTH_MAX);
+                            comp(&mut dd, 1, DATE_MAX);
                         }
-                        "setDate" | "setUTCDate" => comp(&mut dd, 0),
+                        "setDate" | "setUTCDate" => comp(&mut dd, 0, DATE_MAX),
                         "setHours" | "setUTCHours" => {
-                            comp(&mut hh, 0);
-                            comp(&mut mi, 1);
-                            comp(&mut ss, 2);
-                            comp(&mut mss, 3);
+                            comp(&mut hh, 0, HOUR_MAX);
+                            comp(&mut mi, 1, MIN_MAX);
+                            comp(&mut ss, 2, SEC_MAX);
+                            comp(&mut mss, 3, MS_MAX);
                         }
                         "setMinutes" | "setUTCMinutes" => {
-                            comp(&mut mi, 0);
-                            comp(&mut ss, 1);
-                            comp(&mut mss, 2);
+                            comp(&mut mi, 0, MIN_MAX);
+                            comp(&mut ss, 1, SEC_MAX);
+                            comp(&mut mss, 2, MS_MAX);
                         }
                         "setSeconds" | "setUTCSeconds" => {
-                            comp(&mut ss, 0);
-                            comp(&mut mss, 1);
+                            comp(&mut ss, 0, SEC_MAX);
+                            comp(&mut mss, 1, MS_MAX);
                         }
-                        _ => comp(&mut mss, 0), // setMilliseconds
+                        _ => comp(&mut mss, 0, MS_MAX), // setMilliseconds
                     }
                     if any_nan {
                         self.realm.set_date_ms(handle, f64::NAN);
@@ -3915,10 +3936,10 @@ impl<'a> Interp<'a> {
                             // A direct self-reference back to the receiver renders
                             // empty (per `Array.prototype.join`), without recursing.
                             Unpacked::Handle(raw) if raw == handle.to_raw() => String::new(),
-                            _ => {
-                                let p = self.coerce_object(e, "string")?;
-                                self.realm.to_display_string(p)
-                            }
+                            // `ToString(element)` — a Symbol element has no string
+                            // conversion and throws a TypeError (the raw display
+                            // string would render `Symbol(x)` instead).
+                            _ => self.coerce_to_string(e)?,
                         };
                         parts.push(s);
                     }
