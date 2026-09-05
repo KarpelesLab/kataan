@@ -5502,8 +5502,13 @@ impl Realm {
         }
     }
 
-    /// ECMAScript `ToInt32`. Needs `std` for the `trunc` float intrinsic.
-    #[cfg(feature = "std")]
+    /// ECMAScript `ToInt32`.
+    ///
+    /// Available in the `no_std` build: `trunc` comes from
+    /// [`crate::common::FloatExt`] rather than `std`, and the modulo is written
+    /// out because `f64::rem_euclid` is std-only too. Both were the reason this
+    /// used to be `#[cfg(feature = "std")]`, which broke the `alloc`-only build
+    /// as soon as anything on the bytecode path called it.
     #[must_use]
     pub fn to_int32(&self, v: NanBox) -> i32 {
         let n = self.to_number(v);
@@ -5511,12 +5516,17 @@ impl Realm {
             return 0;
         }
         // Reduce trunc(n) modulo 2^32 into [0, 2^32), then reinterpret as i32.
-        let m = n.trunc().rem_euclid(4_294_967_296.0);
+        // `FloatExt::trunc` is called by path, not through the trait in scope:
+        // under `std` the inherent `f64::trunc` would shadow it and the import
+        // would read as unused (which CI denies).
+        const TWO32: f64 = 4_294_967_296.0;
+        let t = crate::common::FloatExt::trunc(n);
+        let m = t % TWO32;
+        let m = if m < 0.0 { m + TWO32 } else { m };
         m as u32 as i32
     }
 
-    /// ECMAScript `ToUint32`. Needs `std` for the `trunc` float intrinsic.
-    #[cfg(feature = "std")]
+    /// ECMAScript `ToUint32`.
     #[must_use]
     pub fn to_uint32(&self, v: NanBox) -> u32 {
         self.to_int32(v) as u32

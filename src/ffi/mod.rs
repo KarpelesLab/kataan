@@ -239,7 +239,10 @@ pub unsafe extern "C" fn kt_lex(
                     tok.span.start,
                     tok.span.end,
                     alloc::format!("{:?}", tok.kind),
-                    tok.text(src),
+                    // The lexer works over WTF-8 *bytes* now, and this dump is a
+                    // human-readable diagnostic, so render the lossy text form
+                    // rather than a byte slice.
+                    crate::wtf8::to_string_lossy(tok.text(src.as_bytes())),
                 );
             }
             Ok(dump)

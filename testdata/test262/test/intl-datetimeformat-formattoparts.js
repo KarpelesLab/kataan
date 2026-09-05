@@ -5,7 +5,9 @@ features: [Intl.DateTimeFormat]
 var d = new Date(Date.UTC(2024, 0, 15, 14, 30, 45)); // Mon Jan 15 2024 14:30:45 UTC
 function parts(o) { return new Intl.DateTimeFormat("en-US", Object.assign({ timeZone: "UTC" }, o)).formatToParts(d); }
 function flat(o) { return parts(o).map(function (p) { return p.type + ":" + p.value; }).join("|"); }
-var NN = String.fromCharCode(0x202f); // CLDR narrow no-break space before AM/PM
+// en-US puts an ordinary space before AM/PM. CLDR 42 briefly used
+// U+202F there and later reverted it; match current CLDR.
+var NN = " ";
 
 // Numeric date breaks into month/literal/day/literal/year.
 assert.sameValue(flat({ year: "numeric", month: "2-digit", day: "2-digit" }),
@@ -21,7 +23,7 @@ assert.sameValue(flat({ hour: "numeric", minute: "2-digit", hour12: true }),
 
 // A full date+time is a single flat list of typed parts.
 assert.sameValue(flat({ weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "2-digit", minute: "2-digit" }),
-  "weekday:Monday|literal:, |month:January|literal: |day:15|literal:, |year:2024|literal:, |hour:02|literal::|minute:30|literal:" + NN + "|dayPeriod:PM",
+  "weekday:Monday|literal:, |month:January|literal: |day:15|literal:, |year:2024|literal: at |hour:02|literal::|minute:30|literal:" + NN + "|dayPeriod:PM",
   "full date+time parts");
 
 // Each part is an object with string type/value, and joining the values reproduces format().

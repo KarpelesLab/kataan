@@ -18,9 +18,11 @@ assert.sameValue(Array.prototype.slice.call([1, 2, 3, 4], 1, 3).join(","), "2,3"
 // apply form.
 assert.sameValue(Array.prototype.concat.apply([1], [[2, 3]]).join(","), "1,2,3", "concat.apply");
 
-// Array.prototype is a plain (non-array) object; its methods are non-enumerable.
+// Array.prototype is itself an Array exotic object (ECMA-262 23.1.3), so
+// `Array.isArray` reports true for it even though it holds no elements.
 assert.sameValue(typeof Array.prototype, "object", "Array.prototype is an object");
-assert.sameValue(Array.isArray(Array.prototype), false, "not an array");
+assert.sameValue(Array.isArray(Array.prototype), true, "is an array exotic object");
+assert.sameValue(Array.prototype.length, 0, "empty");
 assert.sameValue(Object.keys(Array.prototype).length, 0, "methods are non-enumerable");
 assert.sameValue(Array.prototype.constructor, Array, "constructor link");
 

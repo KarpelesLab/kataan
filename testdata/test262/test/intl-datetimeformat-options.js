@@ -4,7 +4,9 @@ features: [Intl.DateTimeFormat]
 ---*/
 var d = new Date(Date.UTC(2024, 0, 15, 14, 30, 45)); // Mon Jan 15 2024 14:30:45 UTC
 function dtf(o) { return new Intl.DateTimeFormat("en-US", Object.assign({ timeZone: "UTC" }, o)).format(d); }
-var NN = " "; // CLDR narrow no-break space before AM/PM
+// en-US puts an ordinary space before AM/PM. CLDR 42 briefly used
+// U+202F there and later reverted it; match current CLDR.
+var NN = " ";
 
 // Default is the numeric date.
 assert.sameValue(dtf({}), "1/15/2024", "default numeric date");
@@ -29,7 +31,7 @@ assert.sameValue(h12(Date.UTC(2024, 0, 1, 12, 0)), "12" + NN + "PM", "noon -> 12
 
 // Combined date + time joins with the CLDR ", " connector.
 assert.sameValue(dtf({ weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "2-digit", minute: "2-digit" }),
-  "Monday, January 15, 2024, 02:30" + NN + "PM", "full date + time");
+  "Monday, January 15, 2024 at 02:30" + NN + "PM", "full date + time");
 
 // dateStyle / timeStyle presets.
 assert.sameValue(dtf({ dateStyle: "full" }), "Monday, January 15, 2024", "dateStyle full");

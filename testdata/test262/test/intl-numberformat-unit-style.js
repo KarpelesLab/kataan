@@ -1,9 +1,12 @@
 /*---
-description: Intl.NumberFormat style:"unit" appends the unit's short symbol (NBSP-separated; temperature attaches directly)
+description: Intl.NumberFormat style:"unit" appends the unit's short symbol (space-separated in en-US; temperature attaches directly)
 features: [Intl.NumberFormat]
 ---*/
 function nf(o, v) { return new Intl.NumberFormat("en-US", o).format(v); }
-var NBSP = " ";
+// en-US unit patterns separate value and symbol with an ordinary space.
+// (CLDR 42 briefly used U+202F here; that was reverted.) Locales that do
+// use a no-break space, such as fr-FR, are covered elsewhere.
+var NBSP = " ";
 
 // Common units render with a non-breaking space before the short symbol.
 assert.sameValue(nf({ style: "unit", unit: "kilometer" }, 5), "5" + NBSP + "km", "kilometer");

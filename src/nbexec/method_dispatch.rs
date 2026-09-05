@@ -2852,7 +2852,7 @@ impl<'a> Interp<'a> {
                         let _ = &form;
                         // No `intl`: normalization is a no-op, but still preserve
                         // surrogates by round-tripping the lossless bytes.
-                        Some(self.new_str_bytes(bytes.clone()))
+                        Some(self.new_str_bytes(bytes.to_vec()))
                     }
                 }
                 // `localeCompare(other)` — ordering sign (code-point order; no
