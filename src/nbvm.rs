@@ -2076,8 +2076,14 @@ fn call_generic(
 /// time, not at assignment). A non-writable own `lastIndex` is honored by the
 /// slow tree-walker path; the VM hot path follows the common writable case.
 fn set_regex_last_index_value(realm: &mut Realm, handle: Handle, v: NanBox) {
+    // `-0` is *not* canonical: the compact `usize` field cannot carry its sign,
+    // and a non-global `exec` must leave `re.lastIndex` exactly as written.
     let canonical = v.as_number().filter(|n| {
-        n.is_finite() && *n >= 0.0 && *n == (*n as u64 as f64) && *n <= u32::MAX as f64
+        n.is_finite()
+            && *n >= 0.0
+            && n.is_sign_positive()
+            && *n == (*n as u64 as f64)
+            && *n <= u32::MAX as f64
     });
     match canonical {
         Some(n) => {
@@ -2087,7 +2093,11 @@ fn set_regex_last_index_value(realm: &mut Realm, handle: Handle, v: NanBox) {
             realm.set_regex_last_index(handle, n as usize);
         }
         None => {
+            // The materialized aux slot is the *same* own property as the
+            // synthesized one: `{ enumerable: false, configurable: false }`.
             realm.set_property(handle, "lastIndex", v);
+            realm.mark_hidden(handle, "lastIndex");
+            realm.set_non_configurable_property(handle, "lastIndex");
             let n = realm.to_number(v);
             realm.set_regex_last_index(
                 handle,

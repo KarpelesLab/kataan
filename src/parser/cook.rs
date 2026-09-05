@@ -475,14 +475,18 @@ fn decode_unicode_escape(
     if (0xD800..=0xDBFF).contains(&hi) {
         // Possible surrogate pair: look for a following `\uXXXX` low surrogate.
         let mut clone = chars.clone();
-        if clone.next() == Some(u32::from(b'\\')) && clone.next() == Some(u32::from(b'u')) {
-            let lo = read_u16_hex(&mut clone, span)?;
-            if (0xDC00..=0xDFFF).contains(&lo) {
-                *chars = clone;
-                let cp = 0x10000 + ((u32::from(hi) - 0xD800) << 10) + (u32::from(lo) - 0xDC00);
-                wtf8::encode_code_point(cp, out);
-                return Ok(());
-            }
+        // Only the four-hex-digit form pairs: `"\uD83D\u{1F438}"` is a lone lead
+        // followed by a separate code-point escape, so a failed read here must
+        // rewind (the `clone` is discarded) rather than reject the whole literal.
+        if clone.next() == Some(u32::from(b'\\'))
+            && clone.next() == Some(u32::from(b'u'))
+            && let Ok(lo) = read_u16_hex(&mut clone, span)
+            && (0xDC00..=0xDFFF).contains(&lo)
+        {
+            *chars = clone;
+            let cp = 0x10000 + ((u32::from(hi) - 0xD800) << 10) + (u32::from(lo) - 0xDC00);
+            wtf8::encode_code_point(cp, out);
+            return Ok(());
         }
     }
     // A BMP scalar, or a lone surrogate kept as a surrogate code point.

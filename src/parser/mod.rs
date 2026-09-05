@@ -1047,10 +1047,10 @@ impl<'src> Parser<'src> {
                 let flags = crate::wtf8::as_str(flags).unwrap_or("");
                 // The regex engine parses `&str`; a lone surrogate in the pattern
                 // cannot be expressed as a `char`, so validation (and later
-                // matching) sees U+FFFD in its place. That only affects what such
-                // a pattern *matches*, never the `source` text reported back.
+                // matching) sees the equivalent `\u` escape in its place (see
+                // `regex::pattern_from_wtf8`) — never the `source` text reported back.
                 #[cfg(feature = "regex")]
-                let pattern_str = crate::wtf8::to_string_lossy(pattern);
+                let pattern_str = crate::regex::pattern_from_wtf8(pattern, flags);
                 // A regex *literal* is validated at parse time: an invalid pattern
                 // or invalid/duplicate flags is an early (parse-phase) SyntaxError,
                 // per `RegExp` literal evaluation. Running the regex engine's own

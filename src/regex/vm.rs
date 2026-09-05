@@ -181,7 +181,7 @@ fn leaf_members_match(members: &[ClassMember], c: u32, flags: Flags) -> bool {
         let matched = match m {
             ClassMember::Char(ch) => cp_eq(c, *ch, flags),
             ClassMember::Range(lo, hi) => {
-                (c >= *lo && c <= *hi) || (flags.ignore_case && range_fold_hit(c, *lo, *hi))
+                (c >= *lo && c <= *hi) || (flags.ignore_case && range_fold_hit(c, *lo, *hi, flags))
             }
             ClassMember::Shorthand(s) => shorthand_matches(*s, c, flags),
         };
@@ -786,8 +786,17 @@ pub(crate) fn single_consume_matches(inst: &Inst, cp: u32, flags: Flags) -> bool
 /// run off the subject.
 fn match_backref(ctx: &Ctx, sp: usize, s: usize, e: usize, flags: Flags) -> Option<usize> {
     let len = e - s;
+    // Under `u`/`v` a backreference matches a list of *code points*, so the span it
+    // consumes may not stop in the middle of a surrogate pair: a captured lone lead
+    // must not match the lead half of a real pair (`/foo(.+)bar\1/u` on
+    // `"foo\uD834bar\uD834\uDC00"` is `null`).
+    let cp_ok = |end: usize| {
+        !(flags.unicode || flags.unicode_sets) || is_code_point_boundary(ctx.input, end)
+    };
     if ctx.reverse {
-        if sp >= len && (0..len).all(|i| unit_eq(ctx.input[sp - len + i], ctx.input[s + i], flags))
+        if sp >= len
+            && (0..len).all(|i| unit_eq(ctx.input[sp - len + i], ctx.input[s + i], flags))
+            && cp_ok(sp - len)
         {
             Some(sp - len)
         } else {
@@ -795,11 +804,20 @@ fn match_backref(ctx: &Ctx, sp: usize, s: usize, e: usize, flags: Flags) -> Opti
         }
     } else if sp + len <= ctx.input.len()
         && (0..len).all(|i| unit_eq(ctx.input[sp + i], ctx.input[s + i], flags))
+        && cp_ok(sp + len)
     {
         Some(sp + len)
     } else {
         None
     }
+}
+
+/// Whether `i` is a code-point boundary in `units` — i.e. not wedged between a
+/// lead surrogate and its trail.
+fn is_code_point_boundary(units: &[u16], i: usize) -> bool {
+    i == 0
+        || i >= units.len()
+        || !((0xD800..=0xDBFF).contains(&units[i - 1]) && (0xDC00..=0xDFFF).contains(&units[i]))
 }
 
 /// Compares two scalar code points for equality, honoring the `i` flag.
@@ -895,16 +913,28 @@ fn class_matches(class: &Class, c: u32, flags: Flags) -> bool {
     leaf_members_match(&class.members, c, flags) ^ class.neg
 }
 
-/// Case-insensitive class-range membership: a character matches `[lo-hi]` under
-/// `i` if either case variant lands in the range. Restricted to ASCII letters,
-/// matching the historical behavior.
-fn range_fold_hit(c: u32, lo: u32, hi: u32) -> bool {
+/// Case-insensitive class-range membership: `c` matches `[lo-hi]` under `i` when
+/// some code point in the range canonicalizes to the same thing `c` does. The
+/// search runs over `c`'s own case variants (the same approximation
+/// `prop_matches_ci` uses) and keeps only those that really share `c`'s
+/// canonical form under the active flags — so `/[a-z]/iu` matches the Kelvin
+/// sign while the legacy (non-`u`) `/[a-z]/i` does not.
+///
+/// ASCII takes a branch-free fast path: for an ASCII `c` the two ASCII case
+/// variants are exactly its canonical partners in both modes, and this predicate
+/// runs per character on the matching hot path.
+fn range_fold_hit(c: u32, lo: u32, hi: u32, flags: Flags) -> bool {
     let Some(ch) = char::from_u32(c) else {
         return false;
     };
-    let cl = ch.to_ascii_lowercase() as u32;
-    let cu = ch.to_ascii_uppercase() as u32;
-    (cl >= lo && cl <= hi) || (cu >= lo && cu <= hi)
+    if ch.is_ascii() {
+        let cl = ch.to_ascii_lowercase() as u32;
+        let cu = ch.to_ascii_uppercase() as u32;
+        return (cl >= lo && cl <= hi) || (cu >= lo && cu <= hi);
+    }
+    case_variants(ch).any(|v| {
+        v >= lo && v <= hi && char::from_u32(v).is_some_and(|cv| char_fold_eq(cv, ch, flags))
+    })
 }
 
 fn shorthand_matches(s: Shorthand, c: u32, flags: Flags) -> bool {

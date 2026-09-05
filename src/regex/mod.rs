@@ -61,6 +61,47 @@ use alloc::vec::Vec;
 
 pub use parser::RegexError;
 
+/// Renders a WTF-8 regex *pattern* as a `&str` the parser can consume.
+///
+/// The parser works over `char`s, and a lone surrogate has no `char` form — it
+/// used to be flattened to U+FFFD, so `new RegExp("\uD83D\\uDC38")` (a raw lone
+/// lead beside an escaped trail) matched nothing. Rewrite each *unescaped* lone
+/// surrogate to the equivalent escape instead: `\uXXXX` without `u`/`v`, and the
+/// braced `\u{XXXX}` with them — braced because in `u` mode the four-digit form
+/// would pair up with an adjacent `\uXXXX` trail escape and silently fuse two
+/// lone surrogates into one astral code point.
+///
+/// A surrogate directly behind an odd run of backslashes is the operand of an
+/// Annex B IdentityEscape (`/\<lone>/`); rewriting it there would change what the
+/// backslash escapes, so it keeps the old U+FFFD rendering.
+#[must_use]
+pub fn pattern_from_wtf8(bytes: &[u8], flags: &str) -> String {
+    // The overwhelmingly common case: plain UTF-8, i.e. no lone surrogate at all.
+    if let Some(s) = crate::wtf8::as_str(bytes) {
+        return String::from(s);
+    }
+    let braced = flags.contains('u') || flags.contains('v');
+    let mut out = String::with_capacity(bytes.len());
+    let mut escaped = false;
+    for cp in crate::wtf8::code_points(bytes) {
+        if !escaped && (0xD800..=0xDFFF).contains(&cp) {
+            out.push_str(if braced { "\\u{" } else { "\\u" });
+            for shift in [12u32, 8, 4, 0] {
+                let d = (cp >> shift) & 0xF;
+                out.push(char::from_digit(d, 16).unwrap_or('0'));
+            }
+            if braced {
+                out.push('}');
+            }
+            continue;
+        }
+        let ch = char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER);
+        escaped = ch == '\\' && !escaped;
+        out.push(ch);
+    }
+    out
+}
+
 /// A compiled regular expression.
 pub struct Regex {
     /// The program for the native UTF-16 entry points, compiled per `flags`
@@ -424,13 +465,21 @@ impl Regex {
         };
         // One set of working buffers for the whole scan (see `vm::Scratch`).
         let mut scratch = vm::Scratch::default();
+        // Only offsets in `s..=last` are candidate starts, so both filters below
+        // search *that* range, not the rest of the subject. An anchored or sticky
+        // pattern has `last == start`, and scanning megabytes for a start unit
+        // that could never be used is pure waste: `/^(?:(?:a)+|(?:b)+)/` over a
+        // 10 MB subject went from one O(1) attempt to a full scan per call —
+        // 4000 calls, 19 ms to 13 s.
+        let candidate_end = |units: &[u16]| last.saturating_add(1).min(units.len());
         let mut s = start;
         while s <= last {
             if let Some(want) = filter {
-                s += units[s..].iter().position(|&u| u == want)?;
-                if s > last {
+                let end = candidate_end(units);
+                if s >= end {
                     return None;
                 }
+                s += units[s..end].iter().position(|&u| u == want)?;
                 // In `u` mode a match can only begin on a character boundary, so a
                 // hit in the middle of a surrogate pair is not a candidate — step
                 // over it and look for the next occurrence.
@@ -441,10 +490,11 @@ impl Regex {
             } else if let Some(set) = &self.start_set {
                 // No single required unit, but a known set of possible ones (a
                 // class-led pattern): skip offsets the set rules out.
-                s += units[s..].iter().position(|&u| set.allows(u))?;
-                if s > last {
+                let end = candidate_end(units);
+                if s >= end {
                     return None;
                 }
+                s += units[s..end].iter().position(|&u| set.allows(u))?;
                 if flags.unicode && !is_char_boundary(units, s) {
                     s += 1;
                     continue;

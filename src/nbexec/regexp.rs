@@ -96,22 +96,6 @@ impl<'a> Interp<'a> {
         NanBox::handle(obj.to_raw())
     }
 
-    /// `IsRegExp(value)`: a value with a truthy `@@match` property, or (absent that
-    /// property) a RegExp instance. A non-object is not a RegExp.
-    pub(crate) fn is_regexp_arg(&mut self, v: NanBox) -> bool {
-        let Some(h) = v.as_handle().map(Handle::from_raw) else {
-            return false;
-        };
-        let sym = self.well_known_symbol("match");
-        let key = self.member_key(sym);
-        if let Some(m) = self.realm.get_property(h, &key)
-            && !matches!(m.unpack(), Unpacked::Undefined)
-        {
-            return self.realm.truthy(m);
-        }
-        self.realm.regexp_at(h).is_some()
-    }
-
     /// `IsRegExp(argument)` (ECMA-262 22.2.7.2), spec-faithful: for an object, read
     /// `argument[@@match]` via `[[Get]]` (invoking an accessor getter, propagating a
     /// throw); if not `undefined`, return `ToBoolean` of it; otherwise return whether
@@ -328,7 +312,13 @@ impl<'a> Interp<'a> {
     /// `RegExp.prototype`. `lastIndex` starts at 0.
     pub(crate) fn new_regexp_instance(&mut self, source: &[u8], flags: &str) -> Handle {
         let h = self.realm.new_regexp(source, flags);
-        if let Some(proto) = self.regexp_proto {
+        // The *running* realm's `%RegExp.prototype%`: a literal (or `new RegExp`)
+        // evaluated inside a `$262.createRealm()` realm must inherit from that
+        // realm's prototype, so its `.constructor` is that realm's `RegExp` and the
+        // cross-realm identity checks (`RegExp(foreignRe) !== foreignRe`) hold.
+        // `self.regexp_proto` remains the fallback for the bootstrap window before
+        // `main_regexp_proto` is recorded.
+        if let Some(proto) = self.current_regexp_proto().or(self.regexp_proto) {
             self.realm.set_native_proto(h, proto);
         }
         h
@@ -363,8 +353,14 @@ impl<'a> Interp<'a> {
         // with a `valueOf`, a non-integer, a negative, `NaN`, a string, …) is
         // preserved verbatim in an aux data slot so a later `Get` returns it
         // unchanged (and its `valueOf` runs at `exec` time, not assignment time).
+        // `-0` is *not* canonical: the compact `usize` field cannot carry its sign,
+        // and a non-global `exec` must leave `re.lastIndex` exactly as written.
         let is_canonical = new.as_number().is_some_and(|v| {
-            v.is_finite() && v >= 0.0 && v == (v as u64 as f64) && v <= u32::MAX as f64
+            v.is_finite()
+                && v >= 0.0
+                && v.is_sign_positive()
+                && v == (v as u64 as f64)
+                && v <= u32::MAX as f64
         });
         if is_canonical {
             // Drop any stale aux mirror so the compact cell field is authoritative.
@@ -373,8 +369,13 @@ impl<'a> Interp<'a> {
             }
             self.realm.set_regex_last_index(handle, n as usize);
         } else {
-            // Materialize (or update) the aux slot to hold the exact value.
+            // Materialize (or update) the aux slot to hold the exact value. It is
+            // the *same* own property as the synthesized one, so it keeps
+            // `{ enumerable: false, configurable: false }`.
             self.realm.set_property(handle, "lastIndex", new);
+            self.realm.mark_hidden(handle, "lastIndex");
+            self.realm
+                .set_non_configurable_property(handle, "lastIndex");
             self.realm.set_regex_last_index(
                 handle,
                 if n.is_finite() && n >= 0.0 {
@@ -516,7 +517,15 @@ impl<'a> Interp<'a> {
             }
             "compile" => self.regexp_compile(this_val, arg(0), arg(1)),
             "toString" => {
-                let Some(h) = this_val.as_handle().map(Handle::from_raw) else {
+                // Step 1 is `If R is not an Object, throw a TypeError`. A string or
+                // symbol primitive is also a heap handle in this engine, so
+                // `as_handle` alone would let `RegExp.prototype.toString.call("")`
+                // through — ask whether the value is an *object*.
+                let Some(h) = this_val
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .filter(|_| self.is_object_value(this_val))
+                else {
                     return Err(self.type_error("RegExp.prototype.toString called on a non-object"));
                 };
                 // `"/" + source + "/" + flags`, reading both via Get (so a
@@ -678,8 +687,8 @@ impl<'a> Interp<'a> {
         #[cfg(feature = "regex")]
         {
             // Validated (and later matched) through the `&str` engine — see the
-            // `RegExp` constructor for why that is lossy but `.source` is not.
-            let lossy = crate::wtf8::to_string_lossy(&pat_s);
+            // `RegExp` constructor for how a lone surrogate survives that.
+            let lossy = crate::regex::pattern_from_wtf8(&pat_s, &flags_s);
             if crate::regex::Regex::new(&lossy, &flags_s).is_err() {
                 let e = self.regexp_syntax_error(&lossy, &flags_s);
                 return Err(ExecError::Throw(e));
@@ -718,15 +727,18 @@ impl<'a> Interp<'a> {
         // `while ((m = re.exec(s)))`) re-execs against the same string, and
         // redoing this per match is what made those operations quadratic.
         let (input, units) = self.subject_units_cached(s_value)?;
+        // `lastIndex` is read via Get and ToLength'd (so a throwing valueOf
+        // surfaces) — this is step 2, *before* the flags are read in step 3. The
+        // order is observable: a `lastIndex.valueOf` may call `re.compile(…)`,
+        // and the new flags then govern this very match.
+        let last_index_v = self.read_member(h, "lastIndex")?;
+        let li = self.coerce_to_integer_or_infinity(last_index_v)?;
+        let li = if li < 0.0 { 0usize } else { li as usize };
         let (_source, flags) = self.realm.regexp_at(h).unwrap_or_default();
         let global = flags.contains('g');
         let sticky = flags.contains('y');
         let unicode = flags.contains('u') || flags.contains('v');
-        // `lastIndex` is read via Get and ToLength'd (so a throwing valueOf
-        // surfaces). For a non-global, non-sticky regex it is ignored (start 0).
-        let last_index_v = self.read_member(h, "lastIndex")?;
-        let li = self.coerce_to_integer_or_infinity(last_index_v)?;
-        let li = if li < 0.0 { 0usize } else { li as usize };
+        // For a non-global, non-sticky regex `lastIndex` is ignored (start 0).
         let start = if global || sticky { li } else { 0 };
 
         let Some(re) = self.realm.regex_compiled(h) else {
@@ -1315,6 +1327,10 @@ impl<'a> Interp<'a> {
                 accumulated.extend_from_slice(&u16_slice(&units, next_source_position, pos));
                 crate::wtf8::append(&mut accumulated, &replacement);
                 next_source_position = pos + m_len;
+                if accumulated.len() > crate::rope::MAX_STRING_LEN {
+                    let m = self.new_str("Invalid string length");
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
             }
         }
         if next_source_position < length {
@@ -1344,6 +1360,14 @@ impl<'a> Interp<'a> {
         let mut out: Vec<u8> = Vec::new();
         let mut i = 0;
         while i < t.len() {
+            // `$&`/`` $` ``/`$'`/`$n` each splice in a whole subject-sized run, so a
+            // template of `$1`s over a large subject multiplies without bound. Stop
+            // at the engine's string ceiling with the same `RangeError` a runaway
+            // concatenation raises, rather than letting the allocator abort.
+            if out.len() > crate::rope::MAX_STRING_LEN {
+                let m = self.new_str("Invalid string length");
+                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            }
             if t[i] == '$' && i + 1 < t.len() {
                 let c = t[i + 1];
                 match c {
@@ -1442,18 +1466,38 @@ fn escape_regexp_source(source: &[u8]) -> alloc::vec::Vec<u8> {
     // which `source` must reproduce verbatim (it is none of the escaped cases).
     let cps: Vec<u32> = crate::wtf8::code_points(source).collect();
     let mut i = 0;
+    // A `/` inside a character class cannot end the literal, so it is left alone
+    // (`new RegExp("[/]").source` is `[/]`, not `[\/]`). Only an unescaped `/`
+    // outside a class needs the backslash.
+    let mut in_class = false;
     while i < cps.len() {
         match cps[i] {
             0x5C => {
-                // Keep an existing escape as-is (don't double it).
+                // Keep an existing escape as-is (don't double it) — except that a
+                // LineTerminator may never appear literally in `source`, even
+                // behind a backslash: `RegExp("\\\n").source` is `\n`.
                 out.push(b'\\');
                 if i + 1 < cps.len() {
-                    crate::wtf8::encode_code_point(cps[i + 1], &mut out);
+                    match cps[i + 1] {
+                        0x0A => out.push(b'n'),
+                        0x0D => out.push(b'r'),
+                        0x2028 => out.extend_from_slice(b"u2028"),
+                        0x2029 => out.extend_from_slice(b"u2029"),
+                        cp => crate::wtf8::encode_code_point(cp, &mut out),
+                    }
                     i += 2;
                     continue;
                 }
             }
-            0x2F => out.extend_from_slice(b"\\/"),
+            0x5B => {
+                in_class = true;
+                out.push(b'[');
+            }
+            0x5D => {
+                in_class = false;
+                out.push(b']');
+            }
+            0x2F if !in_class => out.extend_from_slice(b"\\/"),
             0x0A => out.extend_from_slice(b"\\n"),
             0x0D => out.extend_from_slice(b"\\r"),
             0x2028 => out.extend_from_slice(b"\\u2028"),

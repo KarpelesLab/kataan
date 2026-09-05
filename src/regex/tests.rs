@@ -28,8 +28,11 @@ fn unicode_and_hex_escapes() {
     assert!(re("\\u0041", "").is_match("A"));
     assert!(re("\\u03c3", "").is_match("\u{03c3}"));
     assert!(!re("\\u0041", "").is_match("B"));
-    // `\u{…}` code-point form (supplementary planes).
-    assert!(re(r"\u{1F600}", "").is_match("\u{1F600}"));
+    // `\u{…}` code-point form (supplementary planes) — only under `u`/`v`. Without
+    // the flag `\u` is the Annex B IdentityEscape `u` and `{1F600}` is literal.
+    assert!(re(r"\u{1F600}", "u").is_match("\u{1F600}"));
+    assert!(!re(r"\u{1F600}", "").is_match("\u{1F600}"));
+    assert!(re(r"\u{1F600}", "").is_match("u{1F600}"));
     // Inside a character class.
     assert!(re(r"[A-Z]+", "").is_match("HELLO"));
     assert!(re(r"[\x61\x62]", "").is_match("b"));
@@ -369,8 +372,9 @@ fn u16_unicode_escape_astral_in_u_mode() {
     let units = u16s("😀");
     let r = re(r"\u{1F600}", "u");
     assert_eq!(r.find_in_u16(&units, 0), Some((0, 2)));
-    // The non-u engine matches it via the surrogate-pair code units too.
-    let r2 = re(r"\u{1F600}", "");
+    // The non-u engine matches it via the surrogate-pair escapes too (the braced
+    // form is not a code-point escape without the flag).
+    let r2 = re(r"\uD83D\uDE00", "");
     assert_eq!(r2.find_in_u16(&units, 0), Some((0, 2)));
 }
 
@@ -928,8 +932,8 @@ fn class_start_filter_finds_the_same_matches() {
         (r"[a-c]x", "", "zzdx zzbx", Some((7, 9))),
         (r"[0-9]+", "", "no digits here", None),
         // Latin-1 and astral members must survive a 256-unit map.
-        (r"[\u{e9}]", "", "abc\u{e9}d", Some((3, 4))),
-        (r"[\u{2603}]", "", "ab\u{2603}c", Some((2, 3))),
+        (r"[\u00e9]", "", "abc\u{e9}d", Some((3, 4))),
+        (r"[\u2603]", "", "ab\u{2603}c", Some((2, 3))),
         (r"[\u{1F600}]", "u", "aa\u{1F600}b", Some((2, 3))),
         // Under `i` the fold is inside the predicate the filter is built from.
         (r"[a-c]+", "i", "ZZABCzz", Some((2, 5))),

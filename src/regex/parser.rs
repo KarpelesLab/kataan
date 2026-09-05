@@ -476,6 +476,27 @@ impl Parser {
             }
             _ => {}
         }
+        // Without `u`/`v` the pattern is a sequence of UTF-16 *code units*, so an
+        // astral literal is two PatternCharacters and a quantifier binds only to
+        // the second: `/😀?/` is `\uD83D` followed by an optional `\uDC38`, and so
+        // does not match the empty string. (Under `u` it is one code point and the
+        // quantifier covers the whole thing.)
+        if !(self.unicode || self.unicode_sets)
+            && let Node::Char(c) = atom
+            && c > 0xFFFF
+        {
+            let hi = 0xD800 + ((c - 0x10000) >> 10);
+            let lo = 0xDC00 + ((c - 0x10000) & 0x3FF);
+            return Ok(Node::Concat(alloc::vec![
+                Node::Char(hi),
+                Node::Repeat {
+                    inner: Box::new(Node::Char(lo)),
+                    min,
+                    max,
+                    greedy,
+                },
+            ]));
+        }
         Ok(Node::Repeat {
             inner: Box::new(atom),
             min,
@@ -1209,10 +1230,19 @@ impl Parser {
         let hi = self.parse_hex_digits(4)?;
         // In `u` mode, fold a leading high surrogate together with a following
         // `\u`-escaped low surrogate into one astral code point.
+        // Only the `u Hex4Digits` form is a HexTrailSurrogate: `\uD83D\u{DC38}` is
+        // a lone lead followed by a separate code-point escape, not a pair — so
+        // require four hex digits before committing (and never error out of the
+        // probe, which would reject a perfectly legal `\uD83D\u{DC38}`).
         if self.unicode
             && (0xD800..=0xDBFF).contains(&hi)
             && self.chars.get(self.pos) == Some(&'\\')
             && self.chars.get(self.pos + 1) == Some(&'u')
+            && (0..4).all(|i| {
+                self.chars
+                    .get(self.pos + 2 + i)
+                    .is_some_and(char::is_ascii_hexdigit)
+            })
         {
             let save = self.pos;
             self.pos += 2; // `\u`
@@ -1245,6 +1275,13 @@ impl Parser {
     /// escape: `\uHHHH` or `\u{H…}`. Non-consuming (Annex B fallback probe).
     fn peek_unicode_escape(&self) -> bool {
         if self.chars.get(self.pos) == Some(&'{') {
+            // The braced code-point form is `RegExpUnicodeEscapeSequence[+UnicodeMode]`
+            // only. Without `u`/`v` a `\u{…}` is *not* an escape at all: `\u` is the
+            // Annex B IdentityEscape `u` and `{…}` is a quantifier (or literal), so
+            // `/\u{41}/` matches 41 `u`s rather than `A`.
+            if !(self.unicode || self.unicode_sets) {
+                return false;
+            }
             let mut i = self.pos + 1;
             let mut any = false;
             while let Some(&c) = self.chars.get(i) {
@@ -1338,13 +1375,24 @@ impl Parser {
                             )));
                             self.reject_property_range_endpoint()?;
                         }
+                        // `\u` / `\x` inside a class: well-formed under `u`/`v`, and
+                        // otherwise (Annex B) an ill-formed one is the IdentityEscape
+                        // `u`/`x` — `[\u{41}]` is `u`, `{`, `4`, `1`, `}`.
                         'u' => {
-                            let ch = self.parse_unicode_escape()?;
-                            self.push_class_member(&mut items, ch)?;
+                            if self.unicode || self.unicode_sets || self.peek_unicode_escape() {
+                                let ch = self.parse_unicode_escape()?;
+                                self.push_class_member(&mut items, ch)?;
+                            } else {
+                                self.push_class_member(&mut items, 'u' as u32)?;
+                            }
                         }
                         'x' => {
-                            let ch = self.parse_hex_escape(2)?;
-                            self.push_class_member(&mut items, ch)?;
+                            if self.unicode || self.unicode_sets || self.peek_n_hex(2) {
+                                let ch = self.parse_hex_escape(2)?;
+                                self.push_class_member(&mut items, ch)?;
+                            } else {
+                                self.push_class_member(&mut items, 'x' as u32)?;
+                            }
                         }
                         // Inside a character class, `\b` is a backspace (U+0008),
                         // not a word boundary (ClassEscape :: `b`).
@@ -1356,6 +1404,18 @@ impl Parser {
                         d @ '0'..='7' if !self.unicode => {
                             let val = self.read_legacy_octal(d);
                             self.push_class_member(&mut items, val)?;
+                        }
+                        // Under `u` there is no legacy octal, but `CharacterEscape ::
+                        // `0` [lookahead ∉ DecimalDigit]` still yields U+0000, so
+                        // `[\0]` is the NUL character. `\0` followed by a digit
+                        // (`[\01]`) is a Syntax Error.
+                        '0' if self.unicode || self.unicode_sets => {
+                            if self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                                return Err(RegexError::new(
+                                    "invalid decimal escape in unicode mode",
+                                ));
+                            }
+                            self.push_class_member(&mut items, 0)?;
                         }
                         // `\cX` — a control escape inside a class. `X` is an ASCII
                         // letter in every mode; Annex B (non-`u`) additionally
@@ -1383,7 +1443,14 @@ impl Parser {
                         // this way (an arbitrary `\M` is a Syntax Error); without `u`,
                         // Annex B allows escaping any source character.
                         other => {
-                            if self.unicode && !is_u_identity_escape(other) && other != '-' {
+                            // `\f \n \r \t \v` are ControlEscapes, not identity
+                            // escapes: they are legal in every mode (`[\n]/u`).
+                            let is_control_escape = matches!(other, 'f' | 'n' | 'r' | 't' | 'v');
+                            if self.unicode
+                                && !is_control_escape
+                                && !is_u_identity_escape(other)
+                                && other != '-'
+                            {
                                 return Err(RegexError::new(
                                     "invalid identity escape in unicode mode",
                                 ));
@@ -1475,8 +1542,18 @@ impl Parser {
             let hi = if self.peek() == Some('\\') {
                 self.pos += 1;
                 match self.bump() {
-                    Some('u') => self.parse_unicode_escape().unwrap_or(c),
-                    Some('x') => self.parse_hex_escape(2).unwrap_or(c),
+                    // Annex B: an ill-formed `\u`/`\x` high endpoint is the
+                    // IdentityEscape `u`/`x` (`[a-\u{5}]` ranges `a`-`u`).
+                    Some('u')
+                        if self.unicode || self.unicode_sets || self.peek_unicode_escape() =>
+                    {
+                        self.parse_unicode_escape().unwrap_or(c)
+                    }
+                    Some('u') => 'u' as u32,
+                    Some('x') if self.unicode || self.unicode_sets || self.peek_n_hex(2) => {
+                        self.parse_hex_escape(2).unwrap_or(c)
+                    }
+                    Some('x') => 'x' as u32,
                     // Annex B legacy octal (non-`u`) as a range high endpoint.
                     Some(d @ '0'..='7') if !self.unicode => self.read_legacy_octal(d),
                     Some('b') => 0x08, // `\b` is a backspace inside a class.

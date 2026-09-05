@@ -5408,7 +5408,10 @@ impl<'a> Interp<'a> {
                     let m = self.new_str("Cannot use 'in' operator to search in a non-object");
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
-                let key = self.member_key(a);
+                // `ToPropertyKey(a)`: an object left operand runs ToPrimitive with
+                // the string hint, so `new String("x") in obj` (and any object with
+                // a `toString`) keys on the converted value, not on a display form.
+                let key = self.coerce_property_key(a)?;
                 // A Deferred Module Namespace (`import defer`) evaluates its target
                 // on a `[[HasProperty]]` with a String (non-"then") key — directly
                 // or anywhere in the prototype chain.

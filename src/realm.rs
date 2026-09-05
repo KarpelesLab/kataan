@@ -2066,10 +2066,11 @@ impl Realm {
             return Some(rc.clone());
         }
         // The regex engine parses `&str`; a lone surrogate in the pattern has no
-        // `char` form, so it compiles as U+FFFD. That affects only what such a
-        // pattern matches — `source` is served from the exact bytes above.
+        // `char` form, so it is rewritten to the equivalent `\u` escape (see
+        // `regex::pattern_from_wtf8`). `source` is served from the exact bytes above.
         let re = alloc::rc::Rc::new(
-            crate::regex::Regex::new(&crate::wtf8::to_string_lossy(source), flags).ok()?,
+            crate::regex::Regex::new(&crate::regex::pattern_from_wtf8(source, flags), flags)
+                .ok()?,
         );
         *compiled.borrow_mut() = Some(re.clone());
         Some(re)

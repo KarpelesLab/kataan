@@ -3132,48 +3132,74 @@ impl<'a> Interp<'a> {
             // The pattern is kept as WTF-8 bytes throughout: a lone surrogate in
             // the source (copied from another RegExp, or from a string argument)
             // must survive into `.source`.
-            let (pat, flags) = if let Some((_, fl)) = pat_h.and_then(|h| self.realm.regexp_at(h)) {
-                let src = pat_h
-                    .and_then(|h| self.realm.regexp_source_bytes(h))
-                    .unwrap_or_default();
-                let flags = if matches!(flags_arg.unpack(), Unpacked::Undefined) {
-                    fl
+            //
+            // Steps 4-6 only *select* the values of P and F (running any `Get` on
+            // an IsRegExp pattern); `ToString` on them belongs to
+            // `RegExpInitialize` (step 8), which runs **after** `RegExpAlloc`
+            // (step 7). So a `newTarget.prototype` getter must be observed before
+            // a `flags.toString()`. `Some(..)` below means the value already came
+            // out of an internal slot as a string and needs no coercion.
+            let (pat_pre, pat_v, flags_pre, flags_v) =
+                if let Some((_, fl)) = pat_h.and_then(|h| self.realm.regexp_at(h)) {
+                    let src = pat_h
+                        .and_then(|h| self.realm.regexp_source_bytes(h))
+                        .unwrap_or_default();
+                    if matches!(flags_arg.unpack(), Unpacked::Undefined) {
+                        (
+                            Some(src),
+                            NanBox::undefined(),
+                            Some(fl),
+                            NanBox::undefined(),
+                        )
+                    } else {
+                        (Some(src), NanBox::undefined(), None, flags_arg)
+                    }
+                } else if let Some(ph) = pat_h.filter(|_| pattern_is_regexp) {
+                    // A non-RegExp object with a truthy `@@match` (IsRegExp): use its
+                    // `.source`/`.flags` when no flags argument is supplied.
+                    let src_v = self.read_member(ph, "source")?;
+                    if matches!(flags_arg.unpack(), Unpacked::Undefined) {
+                        let fv = self.read_member(ph, "flags")?;
+                        (None, src_v, None, fv)
+                    } else {
+                        (None, src_v, None, flags_arg)
+                    }
                 } else {
-                    self.coerce_to_string(flags_arg)?
+                    (None, pattern, None, flags_arg)
                 };
-                (src, flags)
-            } else if let Some(ph) = pat_h.filter(|_| pattern_is_regexp) {
-                // A non-RegExp object with a truthy `@@match` (IsRegExp): use its
-                // `.source`/`.flags` when no flags argument is supplied.
-                let src_v = self.read_member(ph, "source")?;
-                let src = self.coerce_to_string_bytes(src_v)?;
-                let flags = if matches!(flags_arg.unpack(), Unpacked::Undefined) {
-                    let fv = self.read_member(ph, "flags")?;
-                    self.coerce_to_string(fv)?
-                } else {
-                    self.coerce_to_string(flags_arg)?
-                };
-                (src, flags)
-            } else {
-                let pat = if matches!(pattern.unpack(), Unpacked::Undefined) {
-                    alloc::vec::Vec::new()
-                } else {
-                    self.coerce_to_string_bytes(pattern)?
-                };
-                let flags = if matches!(flags_arg.unpack(), Unpacked::Undefined) {
-                    String::new()
-                } else {
-                    self.coerce_to_string(flags_arg)?
-                };
-                (pat, flags)
+            // `RegExpAlloc` (step 7): resolve `[[Prototype]]` via
+            // `GetPrototypeFromConstructor(newTarget, "%RegExp.prototype%")`. A
+            // subclass (`class S extends RegExp {}` / `Reflect.construct`) uses
+            // `newTarget.prototype`; a *cross-realm* `new other.RegExp()` (where
+            // `newTarget === callee` but the callee belongs to another realm) must
+            // still read the callee's own `.prototype` — that realm's
+            // `%RegExp.prototype%` — rather than this realm's default, so read it
+            // directly instead of taking `instance_proto_checked`'s `nt == callee`
+            // shortcut. This precedes every `ToString` below.
+            let default = self.intrinsic_proto("RegExp");
+            let proto = match native_new_target.as_handle().map(Handle::from_raw) {
+                Some(nt) => self.get_proto_from_constructor(nt, default)?,
+                None => default,
             };
-            // Validate the pattern/flags up front: an invalid regular expression is
-            // a `SyntaxError` at construction, not a silent broken object. (The
-            // engine parses `&str`, so a lone surrogate is validated — and later
-            // matched — as U+FFFD; only `.source` reports the exact bytes.)
+            // `RegExpInitialize` (step 8): `undefined` becomes the empty string,
+            // anything else is `ToString`'d.
+            let pat = match pat_pre {
+                Some(b) => b,
+                None if matches!(pat_v.unpack(), Unpacked::Undefined) => alloc::vec::Vec::new(),
+                None => self.coerce_to_string_bytes(pat_v)?,
+            };
+            let flags = match flags_pre {
+                Some(f) => f,
+                None if matches!(flags_v.unpack(), Unpacked::Undefined) => String::new(),
+                None => self.coerce_to_string(flags_v)?,
+            };
+            // Validate the pattern/flags: an invalid regular expression is a
+            // `SyntaxError` at construction, not a silent broken object. (The
+            // engine parses `&str`, so a lone surrogate is rewritten to its `\u`
+            // escape; only `.source` reports the exact original bytes.)
             #[cfg(feature = "regex")]
             {
-                let pat_s = crate::wtf8::to_string_lossy(&pat);
+                let pat_s = crate::regex::pattern_from_wtf8(&pat, &flags);
                 if crate::regex::Regex::new(&pat_s, &flags).is_err() {
                     let m = self.new_str(&alloc::format!(
                         "Invalid regular expression: /{pat_s}/{flags}"
@@ -3182,20 +3208,6 @@ impl<'a> Interp<'a> {
                 }
             }
             let r = self.new_regexp_instance(&pat, &flags);
-            // `RegExpAlloc`: link `[[Prototype]]` via
-            // `GetPrototypeFromConstructor(newTarget, "%RegExp.prototype%")`. A
-            // subclass (`class S extends RegExp {}` / `Reflect.construct`) uses
-            // `newTarget.prototype`; a *cross-realm* `new other.RegExp()` (where
-            // `newTarget === callee` but the callee belongs to another realm) must
-            // still read the callee's own `.prototype` — that realm's
-            // `%RegExp.prototype%` — rather than this realm's default, so read it
-            // directly instead of taking `instance_proto_checked`'s `nt == callee`
-            // shortcut.
-            let default = self.intrinsic_proto("RegExp");
-            let proto = match native_new_target.as_handle().map(Handle::from_raw) {
-                Some(nt) => self.get_proto_from_constructor(nt, default)?,
-                None => default,
-            };
             if let Some(proto) = proto {
                 self.realm.set_native_proto(r, proto);
             }

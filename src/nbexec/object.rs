@@ -2159,6 +2159,17 @@ impl<'a> Interp<'a> {
         if self.typed_array_is_fixed_length(obj) == Some(false) {
             return Ok(false);
         }
+        // A RegExp's `lastIndex` is an own data property that this engine keeps in a
+        // compact cell field until something needs it as a real property. Integrity
+        // levels are exactly that: `Object.freeze(re)` must turn `lastIndex`
+        // non-writable (and `TestIntegrityLevel` must see it), so materialize the
+        // aux slot before the object goes rigid.
+        if self.realm.regexp_at(obj).is_some() && !self.realm.regex_aux_last_index_defined(obj) {
+            let cur = NanBox::number(self.realm.regex_last_index(obj) as f64);
+            self.realm.set_property(obj, "lastIndex", cur);
+            self.realm.mark_hidden(obj, "lastIndex");
+            self.realm.set_non_configurable_property(obj, "lastIndex");
+        }
         self.realm.prevent_extensions(obj);
         Ok(true)
     }

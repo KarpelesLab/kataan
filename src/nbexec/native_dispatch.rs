@@ -436,8 +436,11 @@ impl<'a> Interp<'a> {
                 let flags_arg = arg(1);
                 // `RegExp(re)` (no flags) where `re` is a RegExp with the default
                 // constructor returns `re` itself.
+                // Step 1 is `IsRegExp(pattern)` — the spec operation, which reads
+                // `pattern[@@match]` through `[[Get]]` (so an accessor or a proxy
+                // trap runs). `is_regexp_arg`'s raw slot peek missed both.
                 if matches!(flags_arg.unpack(), Unpacked::Undefined)
-                    && self.is_regexp_arg(pattern)
+                    && self.try_is_regexp(pattern)?
                     && let Some(ph) = pattern.as_handle().map(Handle::from_raw)
                 {
                     let ctor = self.current.get("RegExp").unwrap_or(NanBox::undefined());

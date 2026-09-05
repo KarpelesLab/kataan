@@ -2555,7 +2555,23 @@ impl<'a> Interp<'a> {
                         // step 6): a custom `toString`/`@@toPrimitive` runs and a
                         // throw propagates, rather than rendering "[object Object]".
                         let to = self.coerce_to_string(repl)?;
-                        Some(self.new_str(&s.replace(&from, &to)))
+                        // An empty search matches at every boundary `0..=length`, and
+                        // `GetSubstitution` still runs at each one — `$$`, `` $` ``
+                        // and `$'` are expanded against that position (`$&` is the
+                        // empty match). `str::replace` skipped all of that.
+                        let mut out = String::new();
+                        let mut idx = 0usize;
+                        loop {
+                            out.push_str(&expand_dollar(&to, "", &s[..idx], &s[idx..]));
+                            match s[idx..].chars().next() {
+                                Some(ch) => {
+                                    out.push(ch);
+                                    idx += ch.len_utf8();
+                                }
+                                None => break,
+                            }
+                        }
+                        Some(self.new_str(&out))
                     } else {
                         let to = self.coerce_to_string(repl)?;
                         let mut out = String::new();
@@ -6633,7 +6649,7 @@ impl<'a> Interp<'a> {
         // `replaceAll`/`matchAll` first require that a RegExp `searchValue` be
         // global (`IsRegExp` + `Get(flags)` not containing "g" → TypeError),
         // checked *before* dispatching the symbol method.
-        if matches!(method, "replaceAll" | "matchAll") && self.is_regexp_arg(search) {
+        if matches!(method, "replaceAll" | "matchAll") && self.try_is_regexp(search)? {
             let flags_v = self.read_member(argh, "flags")?;
             if matches!(flags_v.unpack(), Unpacked::Undefined | Unpacked::Null) {
                 return Err(self.type_error(&alloc::format!(
@@ -6650,14 +6666,24 @@ impl<'a> Interp<'a> {
         let sym = self.well_known_symbol(sym_name);
         let key = self.member_key(sym);
         let m = self.read_member(argh, &key)?;
-        if m.as_handle()
+        // `GetMethod(V, P)`: `undefined`/`null` means "no method" — fall through to
+        // the plain-string algorithm. Any *other* non-callable value is a
+        // TypeError, not a silent fall-through (`"a-a".replace({[Symbol.replace]:
+        // 1})` must throw).
+        if matches!(m.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            return Ok(None);
+        }
+        if !m
+            .as_handle()
             .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
         {
-            let mut call_args = alloc::vec![o];
-            call_args.extend_from_slice(&args[1.min(args.len())..]);
-            return Ok(Some(self.call_with_this(m, search, &call_args)?));
+            return Err(self.type_error(&alloc::format!(
+                "Symbol.{sym_name} of the argument to String.prototype.{method} is not a function"
+            )));
         }
-        Ok(None)
+        let mut call_args = alloc::vec![o];
+        call_args.extend_from_slice(&args[1.min(args.len())..]);
+        Ok(Some(self.call_with_this(m, search, &call_args)?))
     }
 
     /// One step of a **live**, delete-tolerant cursor over collection `coll`'s

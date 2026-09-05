@@ -400,6 +400,12 @@ impl<'a> Interp<'a> {
         let saved_new_target = self.new_target;
         let saved_strict = self.strict;
         let saved_intrinsics = self.realm.intrinsics_snapshot();
+        // `regexp_proto` is an interpreter field, not part of the realm intrinsics
+        // snapshot, and `install_globals` below overwrites it with the child's
+        // `%RegExp.prototype%`. Left unrestored, every RegExp the *parent* creates
+        // afterwards would inherit from the child realm's prototype — so a
+        // `RegExp.prototype[@@match]` installed in the parent stopped being seen.
+        let saved_regexp_proto = self.regexp_proto;
 
         // Install a fresh global environment into a brand-new root scope. Because
         // `install_globals` allocates a fresh cell for every intrinsic, the new
@@ -440,6 +446,7 @@ impl<'a> Interp<'a> {
         self.this_val = saved_this;
         self.new_target = saved_new_target;
         self.strict = saved_strict;
+        self.regexp_proto = saved_regexp_proto;
         self.realm.restore_intrinsics(saved_intrinsics);
 
         let idx = self.created_realms.len();
