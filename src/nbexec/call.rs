@@ -2009,6 +2009,15 @@ impl<'a> Interp<'a> {
         // would wrongly parse as strict.
         let saved_strict = self.strict;
         self.strict = def.is_strict;
+        // Slice nested definitions out of the source this function was defined
+        // in, not whatever program happens to be running (see `FnDef::def_src`).
+        // An empty `def_src` means no source was retained at definition time;
+        // leave the ambient one alone so the NativeFunction fallback applies.
+        let saved_src = if def.def_src.is_empty() {
+            None
+        } else {
+            Some(core::mem::replace(&mut self.src, def.def_src))
+        };
         // Cleared for this call so a nested call / the body never inherits an
         // outer function's parameter set; restored after the call returns.
         let saved_eval_param_names = core::mem::take(&mut self.eval_param_names);
@@ -2212,6 +2221,9 @@ impl<'a> Interp<'a> {
         self.eval_depth = saved_eval_depth;
         self.eval_param_names = saved_eval_param_names;
         self.strict = saved_strict;
+        if let Some(src) = saved_src {
+            self.src = src;
+        }
         // An `async` (non-generator) function: now that the caller's ambient state
         // is restored, drive the coroutine's first synchronous burst (the body up
         // to the first `await` or completion). The coroutine captured its own

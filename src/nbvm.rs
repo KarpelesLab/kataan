@@ -5723,6 +5723,63 @@ pub fn execute_typed_interruptible(
     }
 }
 
+/// Evaluates `sources` as consecutive **Scripts** sharing one realm, returning
+/// the concatenated output and the completion value of the last one.
+///
+/// Test262's INTERPRETING.md specifies exactly this shape: the harness files and
+/// the test file are separate Scripts over a shared global, and in the strict
+/// variant only the *test file* carries the `"use strict"` prefix. Concatenating
+/// them into a single source makes the harness strict too, which silently
+/// changes what a direct `eval` inside a harness function does.
+///
+/// Tier selection is all-or-nothing. If any script fails to lower to bytecode
+/// the whole sequence re-runs on the tree-walker from a fresh realm, because a
+/// partially-executed [`Realm`] cannot be handed to `nbexec`.
+///
+/// # Errors
+/// Returns [`Thrown`](crate::nbexec::Thrown) for the first script that fails to
+/// parse or throws.
+pub fn execute_scripts_typed(
+    sources: &[&str],
+    limits: crate::limits::Limits,
+) -> Result<(String, String), crate::nbexec::Thrown> {
+    let mut compiled = Vec::with_capacity(sources.len());
+    for source in sources {
+        let program = match crate::parser::Parser::parse_program(source) {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(crate::nbexec::Thrown {
+                    phase: crate::nbexec::ErrorPhase::Parse,
+                    name: String::from("SyntaxError"),
+                    message: alloc::format!("{e}"),
+                });
+            }
+        };
+        // `import`/`export` at a Script's top level is an early SyntaxError;
+        // nbexec reports it with the same wording.
+        if program.source_type == crate::ast::SourceType::Module {
+            return crate::nbexec::eval_scripts_typed(sources, limits);
+        }
+        let Ok(protos) = compile_program(&program) else {
+            return crate::nbexec::eval_scripts_typed(sources, limits);
+        };
+        compiled.push(protos);
+    }
+    let mut realm = Realm::with_limits(limits);
+    let mut output = String::new();
+    let mut completion = String::new();
+    for protos in &compiled {
+        match run_program_capturing(&mut realm, protos, 0, &[]) {
+            Ok((value, out)) => {
+                output.push_str(&out);
+                completion = realm.to_display_string(value);
+            }
+            Err(_) => return crate::nbexec::eval_scripts_typed(sources, limits),
+        }
+    }
+    Ok((output, completion))
+}
+
 /// Loads, links, and evaluates the ES-module graph rooted at the resolved
 /// `entry_key` through `host`, returning `(console_output, completion_string)`
 /// or a structured [`Thrown`](crate::nbexec::Thrown). Modules run on the

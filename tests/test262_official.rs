@@ -249,35 +249,68 @@ fn assemble(
     harness: &std::collections::HashMap<String, String>,
     meta: &Meta,
     src: &str,
-) -> String {
-    let mut out = String::new();
+) -> Vec<String> {
     if meta.has_flag("raw") {
-        out.push_str(src);
-        return out;
+        return vec![String::from(src)];
     }
-    if strict {
-        out.push_str("\"use strict\";\n");
-    }
-    out.push_str(HOST_PRELUDE);
+    // INTERPRETING.md: the prelude/harness files and the test file are *separate
+    // Scripts* over one global, and the `"use strict"` prefix goes on the test
+    // file only. Concatenating them would make the harness strict too, which
+    // changes what a direct `eval` inside a harness function does — the
+    // `staging/sm/strict/` tests turn on precisely that (`completesNormally`
+    // must stay sloppy so `eval("undeclared = 1")` succeeds).
+    //
+    // Callers that can only take a single Script must therefore re-join with
+    // `flatten`, not `concat`: the directive has to stay at the very front to
+    // still be a directive at all.
+    let mut prelude = String::from(HOST_PRELUDE);
     for h in ["sta.js", "assert.js"] {
         if let Some(s) = harness.get(h) {
-            out.push_str(s);
-            out.push('\n');
+            prelude.push_str(s);
+            prelude.push('\n');
         }
     }
     if meta.has_flag("async")
         && let Some(s) = harness.get("doneprintHandle.js")
     {
-        out.push_str(s);
-        out.push('\n');
+        prelude.push_str(s);
+        prelude.push('\n');
     }
     for inc in &meta.includes {
         if let Some(s) = harness.get(inc) {
-            out.push_str(s);
-            out.push('\n');
+            prelude.push_str(s);
+            prelude.push('\n');
         }
     }
-    out.push_str(src);
+    let mut test = String::new();
+    if strict {
+        test.push_str("\"use strict\";\n");
+    }
+    test.push_str(src);
+    vec![prelude, test]
+}
+
+/// Collapses the scripts from [`assemble`] back into one Script, for the entry
+/// points that take a single source. The `"use strict"` directive lives at the
+/// front of the *last* script, so it is lifted to the front of the whole
+/// program — left in place it would sit mid-program and stop being a directive,
+/// silently running the strict variant sloppily.
+fn flatten(scripts: &[String]) -> String {
+    const DIRECTIVE: &str = "\"use strict\";\n";
+    let strict = scripts.last().is_some_and(|s| s.starts_with(DIRECTIVE));
+    let mut out = String::new();
+    if strict {
+        out.push_str(DIRECTIVE);
+    }
+    for (i, s) in scripts.iter().enumerate() {
+        let body = if strict && i + 1 == scripts.len() {
+            &s[DIRECTIVE.len()..]
+        } else {
+            s.as_str()
+        };
+        out.push_str(body);
+        out.push('\n');
+    }
     out
 }
 
@@ -406,9 +439,10 @@ fn classify(
 
 /// Runs one assembled program through the production engine path and classifies
 /// it against the test's expectation.
-fn run_mode(combined: &str, meta: &Meta) -> Result<(), String> {
+fn run_mode(scripts: &[String], meta: &Meta) -> Result<(), String> {
+    let refs: Vec<&str> = scripts.iter().map(String::as_str).collect();
     classify(
-        kataan::nbvm::execute_typed(combined, Limits::default()),
+        kataan::nbvm::execute_scripts_typed(&refs, Limits::default()),
         meta,
     )
 }
@@ -436,18 +470,20 @@ fn run_test(
     let base = std::fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string_lossy().into_owned());
-    let run = |combined: &str| -> Result<(), String> {
+    let run = |scripts: &[String]| -> Result<(), String> {
         if dynamic_import {
+            // The import-base entry takes a single Script, so the dynamic-import
+            // tests run the flattened form.
             classify(
                 kataan::nbvm::execute_script_typed_with_import_base(
-                    combined,
+                    &flatten(scripts),
                     &base,
                     Limits::default(),
                 ),
                 meta,
             )
         } else {
-            run_mode(combined, meta)
+            run_mode(scripts, meta)
         }
     };
     let raw = meta.has_flag("raw");

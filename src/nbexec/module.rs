@@ -528,37 +528,7 @@ impl<'a> Interp<'a> {
     /// [`Thrown`], tagging it with `phase` (Parse for load/link, Runtime for
     /// evaluation). Mirrors `eval_source_typed`'s error rendering.
     pub fn exec_error_to_thrown(&self, e: ExecError, phase: super::ErrorPhase) -> Thrown {
-        match e {
-            ExecError::Throw(thrown) => {
-                let (name, message) =
-                    super::error_name_message(self, thrown).unwrap_or_else(|| {
-                        // A throw lacking a `name` property (e.g. Test262Error, which
-                        // carries only `message`): surface its `message` so the failure
-                        // is diagnosable rather than the opaque `[object Object]`.
-                        if let Some(raw) = thrown.as_handle()
-                            && let Some(m) = self
-                                .realm()
-                                .get_property(crate::heap::Handle::from_raw(raw), "message")
-                        {
-                            let s = self.realm().to_display_string(m);
-                            if !s.is_empty() {
-                                return (String::from("Test262Error"), s);
-                            }
-                        }
-                        (self.display(thrown), String::new())
-                    });
-                Thrown {
-                    phase,
-                    name,
-                    message,
-                }
-            }
-            other => Thrown {
-                phase,
-                name: String::from("Error"),
-                message: alloc::format!("{other:?}"),
-            },
-        }
+        super::thrown_from_exec_error(self, e, phase)
     }
 
     // --- Load -----------------------------------------------------------

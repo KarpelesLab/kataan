@@ -211,6 +211,18 @@ pub(crate) struct FnDef<'a> {
     /// *defined* (i.e. inside a derived class constructor). Only consulted for
     /// arrows, which are transparent to `super()`.
     sc_in_scope: bool,
+    /// The source text this function's AST spans index into — the program,
+    /// `eval` body, or dynamic-`Function` body it was *defined* in.
+    ///
+    /// `Interp::src` tracks the code being defined, and it is set at each
+    /// run/eval entry. That is not enough on its own: a function defined inside
+    /// an `eval` but *called* after the eval returned would evaluate its nested
+    /// definitions while `src` pointed at the enclosing program, and slice a
+    /// nonsense substring of unrelated text into their
+    /// `Function.prototype.toString`. Capturing the defining source here and
+    /// restoring it for the duration of the call keeps every nested definition
+    /// slicing the text it was actually written in.
+    def_src: &'a str,
 }
 
 /// One SplitMix64 step: scrambles an input word into a well-distributed output.
@@ -6715,20 +6727,34 @@ impl<'a> Interp<'a> {
         let saved_scope = core::mem::replace(&mut self.current, self.global_scope.clone());
         let saved_strict = self.strict;
         self.strict = has_use_strict(&func.body);
-        // A `Function`/`GeneratorFunction`/`AsyncFunction`/`AsyncGeneratorFunction`
-        // constructor result deliberately keeps NO retained source, so
-        // `Function.prototype.toString` renders the NativeFunction form. The dynamic
-        // wrapper's `async`/`*` prefix sits outside the extracted `func` span, so a
-        // sliced source would drop it and no longer be valid NativeFunction syntax
-        // (which the `AsyncFunction`/`GeneratorFunction` toString tests require).
+        // Definitions *inside* the dynamic body — `new Function("return function
+        // g(){}")` — carry spans into the assembled source, not the caller's
+        // program. Retain it for the duration so `FnDef::def_src` captures the
+        // right text (otherwise their `toString` slices unrelated source).
+        let saved_src = core::mem::replace(&mut self.src, &program.source);
         let f = self.make_function(
             &func.params,
             Body::Block(&func.body),
             func.is_async,
             func.is_generator,
         );
+        self.src = saved_src;
         self.strict = saved_strict;
         self.current = saved_scope;
+        // CreateDynamicFunction step 20 sets `[[SourceText]]` to the *assembled*
+        // text, so `toString` reproduces `function anonymous(a,b\n) {\nbody\n}`.
+        // Slice it off the parsed program rather than the extracted `func` span:
+        // the wrapper's `async` / `*` prefix sits outside that span, and dropping
+        // it would yield text that no longer round-trips through `eval`.
+        // `program.source` is the wrapper `(<sourceText>)`; strip the parens.
+        if let Some(text) = program
+            .source
+            .strip_prefix('(')
+            .and_then(|t| t.strip_suffix(')'))
+            && let Some(h) = f.as_handle().map(Handle::from_raw)
+        {
+            self.realm.set_fn_source(h, alloc::rc::Rc::from(text));
+        }
 
         // `Function`-created functions are named "anonymous".
         self.set_fn_name(f, "anonymous");
@@ -7120,6 +7146,7 @@ impl<'a> Interp<'a> {
             field_init: self.in_field_initializer,
             nt_in_scope: self.new_target_in_scope,
             sc_in_scope: self.super_call_in_scope,
+            def_src: self.src,
         });
         let handle = self.realm.new_function(func_id, self.current.clone());
         // `GetFunctionRealm` tagging: a closure created while executing in a
@@ -9468,11 +9495,21 @@ pub fn eval_source_typed_interruptible(
             let completion = interp.display(value);
             Ok((String::from(interp.output()), completion))
         }
-        Err(ExecError::Throw(thrown)) => {
-            let (name, message) = error_name_message(&interp, thrown).unwrap_or_else(|| {
-                // A throw lacking a `name` property (e.g. Test262Error, which carries
-                // only `message`): surface its `message` so the failure is
-                // diagnosable rather than the opaque `[object Object]`.
+        Err(e) => Err(thrown_from_exec_error(&interp, e, ErrorPhase::Runtime)),
+    }
+}
+
+/// Converts an [`ExecError`] into the structured [`Thrown`] the typed entry
+/// points report, attributing it to `phase`.
+///
+/// A thrown value with no `name` property gets special handling: Test262's own
+/// `Test262Error` carries only `message`, and reporting it as the bare
+/// `[object Object]` makes every assertion failure in the corpus
+/// indistinguishable. Surface the message instead.
+pub(crate) fn thrown_from_exec_error(interp: &Interp, e: ExecError, phase: ErrorPhase) -> Thrown {
+    match e {
+        ExecError::Throw(thrown) => {
+            let (name, message) = error_name_message(interp, thrown).unwrap_or_else(|| {
                 if let Some(raw) = thrown.as_handle()
                     && let Some(m) = interp
                         .realm()
@@ -9485,18 +9522,73 @@ pub fn eval_source_typed_interruptible(
                 }
                 (interp.display(thrown), String::new())
             });
-            Err(Thrown {
-                phase: ErrorPhase::Runtime,
+            Thrown {
+                phase,
                 name,
                 message,
-            })
+            }
         }
-        Err(other) => Err(Thrown {
-            phase: ErrorPhase::Runtime,
+        other => Thrown {
+            phase,
             name: String::from("Error"),
             message: alloc::format!("{other:?}"),
-        }),
+        },
     }
+}
+
+/// Evaluates `sources` as consecutive **Scripts** in one realm, returning the
+/// concatenated output and the completion value of the last one.
+///
+/// Test262's INTERPRETING.md requires exactly this: the harness files and the
+/// test file are separate Scripts sharing a global, and for the strict variant
+/// only the *test file* gets the `"use strict"` prefix. Concatenating them into
+/// one source instead makes the harness strict too, which changes what a direct
+/// `eval` inside a harness function does — `staging/sm/strict/` turns on that
+/// distinction.
+///
+/// # Errors
+/// Returns [`Thrown`] for the first script that fails to parse or throws.
+pub fn eval_scripts_typed(
+    sources: &[&str],
+    limits: crate::limits::Limits,
+) -> Result<(String, String), Thrown> {
+    // Every script is parsed up front so the ASTs outlive the interpreter that
+    // borrows them. Parsing eagerly also means a syntax error anywhere is
+    // reported before anything runs; that is not the spec's order, but the only
+    // observable difference is output produced by an earlier script before a
+    // later one fails to parse, which is discarded on an error result anyway.
+    let mut programs = alloc::vec::Vec::with_capacity(sources.len());
+    for source in sources {
+        let program = match crate::parser::Parser::parse_program(source) {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(Thrown {
+                    phase: ErrorPhase::Parse,
+                    name: String::from("SyntaxError"),
+                    message: alloc::format!("{e}"),
+                });
+            }
+        };
+        if program.source_type == crate::ast::SourceType::Module {
+            return Err(Thrown {
+                phase: ErrorPhase::Parse,
+                name: String::from("SyntaxError"),
+                message: String::from(
+                    "`import`/`export` may only appear at the top level of a module",
+                ),
+            });
+        }
+        programs.push(program);
+    }
+    let mut interp = Interp::new_with_limits(limits);
+    let mut completion = String::new();
+    for program in &programs {
+        match interp.run(program) {
+            Ok(value) => completion = interp.display(value),
+            Err(e) => return Err(thrown_from_exec_error(&interp, e, ErrorPhase::Runtime)),
+        }
+    }
+    Ok((String::from(interp.output()), completion))
 }
 
 /// The current time in milliseconds since the Unix epoch, or `0.0` on a target

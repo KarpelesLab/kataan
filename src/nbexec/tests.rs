@@ -10271,19 +10271,23 @@ fn to_string_proxy_of_callable_is_native_syntax() {
 
 #[test]
 fn to_string_dynamic_and_builtin_functions_are_native_syntax() {
-    // The `Function` constructor / built-ins retain no source → NativeFunction form.
+    // CreateDynamicFunction step 20 sets `[[SourceText]]` to the *assembled*
+    // source, so a dynamically-built function stringifies to that text — not the
+    // NativeFunction form.
     assert_eq!(
         run("'' + Function('a', 'return a')"),
-        "function anonymous() { [native code] }"
+        "function anonymous(a\n) {\nreturn a\n}"
     );
-    // An `async function` built dynamically stays valid NativeFunction syntax
-    // (no dangling `async` from a partial slice).
+    // The keyword comes from the assembled wrapper, so an `async function` keeps
+    // its prefix and the text stays valid syntax (slicing the extracted function
+    // node instead would drop the `async`).
     assert_eq!(
         run(
             "var AsyncFunction = (async function(){}).constructor; '' + (new AsyncFunction('return 1'))"
         ),
-        "function anonymous() { [native code] }"
+        "async function anonymous(\n) {\nreturn 1\n}"
     );
+    // A real built-in retains no source, so it still takes the NativeFunction form.
     assert_eq!(run("'' + Math.max"), "function max() { [native code] }");
 }
 
