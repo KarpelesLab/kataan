@@ -210,17 +210,32 @@ fn parse_list(same_line: &str, lines: &[&str], i: &mut usize) -> Vec<String> {
     out
 }
 
-/// Reads every harness file once into memory.
+/// Reads every harness file once into memory, keyed by its path *relative to
+/// `harness/`.
+///
+/// Subdirectories matter: the donated SpiderMonkey tests under `staging/sm/`
+/// declare `includes: [sm/non262-strict-shell.js]`, and those helpers live in
+/// `harness/sm/`. Keying by bare file name (and not descending) left every one
+/// of them unresolved, so ~200 staging tests failed with
+/// `ReferenceError: testLenientAndStrict is not defined` and friends — harness
+/// gaps that read exactly like engine bugs.
 fn load_harness(root: &Path) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     let dir = root.join("harness");
-    if let Ok(entries) = std::fs::read_dir(&dir) {
+    let mut stack = vec![dir.clone()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in entries.flatten() {
             let p = e.path();
-            if p.extension().is_some_and(|x| x == "js")
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "js")
                 && let Ok(s) = std::fs::read_to_string(&p)
+                && let Ok(rel) = p.strip_prefix(&dir)
             {
-                map.insert(p.file_name().unwrap().to_string_lossy().into_owned(), s);
+                map.insert(rel.to_string_lossy().replace('\\', "/"), s);
             }
         }
     }
