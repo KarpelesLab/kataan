@@ -1913,6 +1913,21 @@ impl<'a> Interp<'a> {
             }
             cur = self.resolve_super(class, &penv)?;
         }
+        // Fallback, mirroring the read path: the class-body walk above only matches
+        // methods with a *static* (literal) key, so a computed-key accessor
+        // (`class Z { set [k](v) {…} }`) — or one added dynamically to a superclass
+        // prototype — is invisible to it. Resolve the setter the spec way, over the
+        // real prototype chain: GetPrototypeOf(HomeObject).[[Set]](name, v, this).
+        // Without this the write below re-enters the *receiver's* own setter (the
+        // one currently running) and recurses until the stack is exhausted.
+        if let Some(ho) = home_obj
+            && let Some(super_base) = self.realm.object_proto(ho)
+            && let Some((_, setter)) = self.realm.accessor(super_base, name)
+            && !matches!(setter.unpack(), Unpacked::Undefined)
+        {
+            self.call_with_this(setter, self.this_val, &[value])?;
+            return Ok(());
+        }
         // No inherited setter — the write lands on the receiver (`this`). A
         // Deferred Module Namespace receiver forces evaluation ([[Set]]/[[Define]]).
         if let Some(th) = self.this_val.as_handle().map(Handle::from_raw) {

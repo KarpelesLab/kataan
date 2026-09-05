@@ -2800,6 +2800,12 @@ impl<'a> Interp<'a> {
                     .is_some_and(|fh| self.is_callable(fh))
             {
                 let iterator = self.call_with_this(f, v, &[])?;
+                // `GetIterator` step 4: a non-Object result is a TypeError. A
+                // string / symbol / BigInt is heap-backed but not an Object, so
+                // test `is_object_value`, not a bare `as_handle`.
+                if !self.is_object_value(iterator) {
+                    return Err(self.type_error("iterator is not an object"));
+                }
                 return match iterator.as_handle().map(Handle::from_raw) {
                     Some(ih) => Ok(Some(ih)),
                     None => Err(self.type_error("iterator is not an object")),
@@ -2842,6 +2848,11 @@ impl<'a> Interp<'a> {
             return Ok(None);
         }
         let iterator = self.call_with_this(f, v, &[])?;
+        // `GetIterator` step 4: a non-Object result is a TypeError — including a
+        // string / symbol / BigInt, which are heap-backed here but not Objects.
+        if !self.is_object_value(iterator) {
+            return Err(self.type_error("iterator is not an object"));
+        }
         match iterator.as_handle().map(Handle::from_raw) {
             Some(ih) => Ok(Some(ih)),
             None => Err(self.type_error("iterator is not an object")),

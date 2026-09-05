@@ -83,6 +83,15 @@ pub struct Parser<'src> {
     /// this (matching on span) to suppress NamedEvaluation for `(fn) = function(){}`.
     /// Cleared at the start of every primary parse so it is never stale.
     paren_expr_span: Option<Span>,
+    /// Spans of every *parenthesized* expression whose stripped inner node is an
+    /// object/array literal or an assignment — the three shapes whose
+    /// `AssignmentTargetType` is `invalid` once the parens are dropped from the
+    /// AST. A `DestructuringAssignmentTarget` nested in a pattern must be either
+    /// a refinable object/array literal or a *simple* target, so
+    /// `[(a = 5)] = […]`, `({ a: ({ b }) } = …)` and `({ a: (b = 7) } = …)` are
+    /// early Syntax Errors while their unparenthesized forms are legal. Only
+    /// these three shapes are recorded, so the set stays small.
+    paren_invalid_target_spans: alloc::collections::BTreeSet<(u32, u32)>,
     /// Current recursive-descent nesting depth, bounded by [`MAX_PARSE_DEPTH`].
     depth: u32,
     /// Whether the cursor is at the **module top level** — the direct statement
@@ -135,6 +144,7 @@ impl<'src> Parser<'src> {
             in_async: false,
             paren_obj_arr_span: None,
             paren_expr_span: None,
+            paren_invalid_target_spans: alloc::collections::BTreeSet::new(),
             depth: 0,
             module_top_level: false,
         })
@@ -353,6 +363,20 @@ impl<'src> Parser<'src> {
             return Err(self.err_at(
                 left.span(),
                 "a parenthesized object or array literal is not a valid assignment target",
+            ));
+        }
+        // An object/array literal on the left of `=` is refined into an
+        // `AssignmentPattern`; a nested target that was written parenthesized and
+        // is itself a literal or an assignment (`[(a = 5)] = […]`,
+        // `({ a: ({ b }) } = …)`) has a non-simple `AssignmentTargetType`, an
+        // early Syntax Error.
+        if op == AssignOp::Assign
+            && matches!(&left, Expr::Object { .. } | Expr::Array { .. })
+            && let Some(bad) = self.find_paren_target(&left)
+        {
+            return Err(self.err_at(
+                bad,
+                "a parenthesized destructuring target must be a simple assignment target",
             ));
         }
         if !left.is_assignment_target() {
@@ -619,6 +643,13 @@ impl<'src> Parser<'src> {
     /// Whether the current token begins a prefix *unary* operator (not the
     /// `++`/`--` update operators, which are permitted before `**`).
     fn at_unary_operator(&self) -> bool {
+        // `UnaryExpression : AwaitExpression`, so `await a ** 0` needs the same
+        // parenthesization as `-a ** 0` — but only where `await` actually starts
+        // an AwaitExpression (in sloppy non-async code it is a plain identifier,
+        // and `await ** 0` is a legal multiplication of that binding).
+        if self.in_async && self.peek() == TokenKind::Keyword(Kw::Await) {
+            return true;
+        }
         matches!(
             self.peek(),
             TokenKind::Plus
@@ -816,6 +847,14 @@ impl<'src> Parser<'src> {
                     };
                 }
                 TokenKind::QuestionDot => {
+                    // A `new` callee is a `MemberExpression`, and the grammar has
+                    // no production taking an `OptionalExpression` there — so
+                    // `new o?.C()` / `new o?.["C"]()` / `new C?.()` are early
+                    // SyntaxErrors. Parentheses break the chain (`new (o?.C)()`
+                    // is fine) because that reparses through `parse_primary`.
+                    if !allow_call {
+                        return Err(self.err("an optional chain is not a valid `new` callee"));
+                    }
                     self.bump();
                     saw_optional = true;
                     expr = self.parse_optional_tail(expr, allow_call)?;
@@ -1102,6 +1141,17 @@ impl<'src> Parser<'src> {
             }
             TokenKind::Keyword(Kw::Super) => {
                 self.bump();
+                // `super` is only ever the head of a SuperProperty
+                // (`super.x` / `super[e]`) or a SuperCall (`super(…)`). Anything
+                // else — a bare `super`, or an optional link (`super?.x`,
+                // `super?.()`), which the grammar cannot produce — is an early
+                // SyntaxError.
+                if !matches!(
+                    self.peek(),
+                    TokenKind::Dot | TokenKind::LBracket | TokenKind::LParen
+                ) {
+                    return Err(self.err("`super` must be followed by `.`, `[`, or `(`"));
+                }
                 Ok(Expr::Super(tok.span))
             }
             TokenKind::Identifier => {
@@ -1309,7 +1359,59 @@ impl<'src> Parser<'src> {
             _ => None,
         };
         self.paren_expr_span = Some(expr.span());
+        // Remember the shapes that a *nested* destructuring target may not have
+        // once the parens are stripped (see `paren_invalid_target_spans`).
+        if matches!(
+            &expr,
+            Expr::Object { .. } | Expr::Array { .. } | Expr::Assign { .. }
+        ) {
+            let s = expr.span();
+            self.paren_invalid_target_spans.insert((s.start, s.end));
+        }
         Ok(expr)
+    }
+
+    /// Whether `e`, used as a `DestructuringAssignmentTarget`, was written
+    /// parenthesized while being an object/array literal or an assignment — the
+    /// early error of `sec-destructuring-assignment-static-semantics-early-errors`
+    /// ("If `DestructuringAssignmentTarget` is neither an `ObjectLiteral` nor an
+    /// `ArrayLiteral`, it is a Syntax Error if `AssignmentTargetType` is not
+    /// simple"; a parenthesized literal or assignment is neither).
+    fn is_paren_wrapped(&self, e: &Expr) -> bool {
+        let s = e.span();
+        matches!(
+            e,
+            Expr::Object { .. } | Expr::Array { .. } | Expr::Assign { .. }
+        ) && self.paren_invalid_target_spans.contains(&(s.start, s.end))
+    }
+
+    /// Walks an object/array literal being reinterpreted as an
+    /// `AssignmentPattern` and returns the span of the first nested target that
+    /// was illegally parenthesized (see [`Self::is_paren_wrapped`]).
+    fn find_paren_target(&self, e: &Expr) -> Option<Span> {
+        if self.is_paren_wrapped(e) {
+            return Some(e.span());
+        }
+        match e {
+            Expr::Array { elements, .. } => elements.iter().find_map(|el| match el {
+                ArrayElement::Hole => None,
+                ArrayElement::Item(x) | ArrayElement::Spread(x) => self.find_paren_target(x),
+            }),
+            Expr::Object { members, .. } => members.iter().find_map(|m| match m {
+                ObjectMember::Property { value, .. } | ObjectMember::Spread { value, .. } => {
+                    self.find_paren_target(value)
+                }
+                ObjectMember::Accessor { .. } => None,
+            }),
+            // `[a = 1]`: the element's *target* is the destructuring target; the
+            // initializer is an ordinary expression and is not walked.
+            Expr::Assign {
+                op: AssignOp::Assign,
+                target,
+                ..
+            } => self.find_paren_target(target),
+            _ => None,
+        }
     }
 
     fn parse_array(&mut self) -> Result<Expr> {

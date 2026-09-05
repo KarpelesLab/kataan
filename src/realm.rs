@@ -3496,6 +3496,27 @@ impl Realm {
                 return false;
             }
         }
+        // A **primitive string** cell has the same String-exotic own properties as
+        // the wrapper above: a non-configurable `length` and a non-configurable
+        // index for every code unit. `delete "foo".length` / `delete "foo"[0]`
+        // therefore return false (and throw in strict code).
+        if let Some(len) = self.string_utf16_len(handle) {
+            if key == "length" {
+                return false;
+            }
+            if let Ok(i) = key.parse::<usize>()
+                && alloc::format!("{i}") == key
+                && i < len
+            {
+                return false;
+            }
+        }
+        // A RegExp's `lastIndex` is defined by RegExpAlloc as
+        // `{ writable: true, enumerable: false, configurable: false }`, so it can
+        // never be deleted.
+        if key == "lastIndex" && matches!(self.heap.get(handle), Some(Cell::RegExp { .. })) {
+            return false;
+        }
         // An array index is an element of the dense store (or a hole carrying an aux
         // accessor), not a named slot — `delete arr[i]` must punch a hole there, not
         // merely touch the aux object.

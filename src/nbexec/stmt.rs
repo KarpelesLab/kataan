@@ -1243,6 +1243,18 @@ impl<'a> Interp<'a> {
         iterator: NanBox,
     ) -> Result<Option<NanBox>, ExecError> {
         let next_fn = self.read_member(ih, "next")?;
+        self.dstr_iter_step_with(next_fn, iterator)
+    }
+
+    /// [`Self::dstr_iter_step`] with `iteratorRecord.[[NextMethod]]` supplied.
+    /// `GetIterator` reads `next` **once**, in the iteration prologue — before any
+    /// target reference in the pattern is evaluated — so a caller that owns the
+    /// whole iteration reads it up front and reuses it for every step.
+    pub(crate) fn dstr_iter_step_with(
+        &mut self,
+        next_fn: NanBox,
+        iterator: NanBox,
+    ) -> Result<Option<NanBox>, ExecError> {
         let res = self.call_with_this(next_fn, iterator, &[])?;
         if !self.is_object_value(res) {
             return Err(self.type_error("iterator result is not an object"));
@@ -1267,6 +1279,11 @@ impl<'a> Interp<'a> {
         ih: Handle,
     ) -> Result<(), ExecError> {
         let iterator = NanBox::handle(ih.to_raw());
+        // `GetIterator` reads `next` **once**, as part of forming the iterator
+        // record — before the first element's target reference is evaluated. A
+        // per-step read would run a `next` accessor (or proxy `get` trap) at the
+        // wrong point in the observable order.
+        let next_fn = self.read_member(ih, "next")?;
         // `exhausted` mirrors `iteratorRecord.[[done]]`: once the iterator finishes
         // or a step completes abruptly it is done and must not be closed. Only an
         // error from a *target* (reference eval or assignment) with the iterator not
@@ -1290,7 +1307,7 @@ impl<'a> Interp<'a> {
                     // `IteratorStep`, so `next` side effects are observed).
                     let mut rest = Vec::new();
                     while !exhausted {
-                        match self.dstr_iter_step(ih, iterator) {
+                        match self.dstr_iter_step_with(next_fn, iterator) {
                             Ok(Some(v)) => rest.push(v),
                             Ok(None) => exhausted = true,
                             Err(err) => {
@@ -1323,7 +1340,7 @@ impl<'a> Interp<'a> {
                 let v = if exhausted {
                     NanBox::undefined()
                 } else {
-                    let step = self.dstr_iter_step(ih, iterator);
+                    let step = self.dstr_iter_step_with(next_fn, iterator);
                     exhausted = !matches!(step, Ok(Some(_)));
                     match step {
                         Ok(opt) => opt.unwrap_or(NanBox::undefined()),
@@ -1748,6 +1765,16 @@ impl<'a> Interp<'a> {
             let m = self.new_str("Assignment to constant variable.");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
+        // A named-function-expression name is a soft immutable binding: strict
+        // reassignment throws, sloppy silently drops the write (`function fn() {
+        // fn &&= 1; }` leaves `fn` bound to the function).
+        if self.current.is_soft_const(name) {
+            if self.strict {
+                let m = self.new_str("Assignment to constant variable.");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            return Ok(());
+        }
         if self.current.set(name, value) {
             // A global `var` is mirrored as a property of the global object; keep
             // the two in step so `this.x` sees the assignment.
@@ -1961,13 +1988,14 @@ impl<'a> Interp<'a> {
                 ) =>
             {
                 per_iter_const = decl.kind == crate::ast::VarDeclKind::Const;
-                decl.declarations
-                    .iter()
-                    .filter_map(|d| match &d.target {
-                        BindingTarget::Ident(Ident { name, .. }) => Some(String::from(&**name)),
-                        _ => None,
-                    })
-                    .collect()
+                // Every bound name of the head, including those introduced by a
+                // destructuring pattern (`for (let [i, j] = …; …)`) — the spec's
+                // `BoundNames of LexicalDeclaration`, not just the simple ones.
+                let mut names: Vec<&str> = Vec::new();
+                for d in &decl.declarations {
+                    collect_binding_idents(&d.target, &mut names);
+                }
+                names.into_iter().map(String::from).collect()
             }
             _ => Vec::new(),
         };

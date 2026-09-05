@@ -6782,6 +6782,18 @@ impl<'a> Interp<'a> {
             // variable environment (where the function-code extension B.3.3.2 does
             // not apply). In eval code (B.3.3.3) such a collision is permitted, so
             // the binding is still updated.
+            // NB: `arguments` is deliberately *not* special-cased here.
+            // FunctionDeclarationInstantiation step 22.f appends "arguments" to
+            // `parameterNames` whenever an arguments object is created, and
+            // B.3.2.1 applies only when `F` is not in `parameterNames` — so
+            // `(function(){ { function arguments(){} } })` must leave `arguments`
+            // bound to the arguments object. (`annexB/language/function-code/
+            // block-decl-func-skip-arguments.js` is normative here;
+            // `staging/sm/lexical-environment/block-scoped-functions-annex-b-\
+            // arguments.js` encodes the older SpiderMonkey behaviour and
+            // contradicts it — V8 still fails that test262 test.) The `has_local`
+            // test below covers this: the arguments object already occupies the
+            // binding.
             for (name, span) in &block_fn_names {
                 if eval_code || !self.var_scope.has_local(name) {
                     self.annexb_block_fns.push((String::from(*name), *span));
@@ -6860,7 +6872,11 @@ impl<'a> Interp<'a> {
             // A module's `export function f(){}` / `export default function f(){}`
             // hoists `f` exactly like a bare function declaration: unwrap the
             // export wrapper to reach the inner function declaration.
-            let stmt = unwrap_exported_function(stmt);
+            // A *labelled* function declaration (`l: function f(){}`,
+            // `l0: l: function f(){}`) is a `LabelledItem : FunctionDeclaration`
+            // and instantiates exactly like the bare form — var-scoped at a
+            // function/script top level, block-scoped inside a Block.
+            let stmt = unwrap_labelled(unwrap_exported_function(stmt));
             if let Stmt::Function(func) = stmt
                 && let Some(id) = &func.id
             {
@@ -7294,6 +7310,19 @@ fn unwrap_exported_function(stmt: &Stmt) -> &Stmt {
     stmt
 }
 
+/// Peels any `LabelledStatement` wrappers off `stmt`. A labelled function
+/// declaration (`l: function f(){}`, `l0: l: function f(){}`) is a
+/// `LabelledItem : FunctionDeclaration`, so it is a var-scoped declaration at a
+/// function/script top level and a lexically-scoped declaration of an enclosing
+/// Block — in both cases it must be instantiated like the bare form.
+fn unwrap_labelled(stmt: &Stmt) -> &Stmt {
+    let mut cur = stmt;
+    while let Stmt::Labeled { body, .. } = cur {
+        cur = body;
+    }
+    cur
+}
+
 fn collect_var_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
     use crate::ast::VarDeclKind;
     fn from_decl<'a>(decl: &'a crate::ast::VarDecl, out: &mut Vec<&'a str>) {
@@ -7525,8 +7554,13 @@ fn collect_block_function_names<'a>(stmts: &'a [Stmt], out: &mut Vec<(&'a str, S
                         walk(from_ref(a), out, true, &blocked_here);
                     }
                 }
+                // A `with` body is an ordinary nested Statement for B.3.3: a
+                // function declared in `with (o) { function f(){} }` still gains
+                // the outer `var` binding (the object environment record is not a
+                // variable environment).
                 Stmt::While { body, .. }
                 | Stmt::DoWhile { body, .. }
+                | Stmt::With { body, .. }
                 | Stmt::Labeled { body, .. } => walk(from_ref(body), out, true, &blocked_here),
                 Stmt::For { init, body, .. } => {
                     // A `for (let/const …; …)` head introduces a lexical scope

@@ -239,12 +239,17 @@ impl<'a> Interp<'a> {
             self.realm.symbol_at(h).is_none() && !self.realm.is_string_handle(h)
         });
         if is_object_key {
-            // Full `ToPrimitive(key, string)` — `@@toPrimitive`, then
-            // `toString`/`valueOf` (inherited included). `coerce_object` returned a
-            // keyless exotic (a Date, most visibly) unchanged, so the key became its
-            // raw display form — a Date keyed on its ISO text instead of on
-            // `Date.prototype.toString`.
-            let p = self.coerce_primitive(k, "string")?;
+            // ToPrimitive(k, string) in full: `@@toPrimitive` if present, else
+            // OrdinaryToPrimitive (`toString` then `valueOf`). Deliberately *not*
+            // `coerce_object`, whose fast paths return exotics (RegExp, Date, Map,
+            // a function, …) unchanged and then stringify them internally — which
+            // silently skips a user-visible `toString`, so
+            // `RegExp.prototype.toString = () => { throw 42 }; ({ [/re/]: 0 })`
+            // must throw 42 rather than key on `"/re/"`.
+            let p = match self.symbol_to_primitive(k, "string")? {
+                Some(v) => v,
+                None => self.ordinary_to_primitive(k, "string")?,
+            };
             // ToPropertyKey: if ToPrimitive produced a Symbol, it is the key as-is
             // (do NOT ToString it). Otherwise ToString the primitive.
             if let Some(raw) = p.as_handle()
@@ -540,10 +545,15 @@ impl<'a> Interp<'a> {
                         // A *plain* member whose base is nullish is NOT a short-circuit —
                         // `delete u.x` / `delete n[0]` does ToObject(base), which throws a
                         // TypeError — so track whether the target was optional.
-                        let (argument, base_optional): (&Expr, bool) = match &**argument {
-                            Expr::OptChain { expr, .. } => (expr, true),
-                            other => (other, false),
+                        let argument: &Expr = match &**argument {
+                            Expr::OptChain { expr, .. } => expr,
+                            other => other,
                         };
+                        // Only the *last* link's own `?.` short-circuits the
+                        // delete: in `delete [1]?.r[k]` the chain does not
+                        // short-circuit (the base is non-nullish), so the final
+                        // `[k]` reference is formed on `undefined` and throws.
+                        let base_optional = matches!(argument, Expr::Member { optional: true, .. });
                         if let Expr::Member {
                             object, property, ..
                         } = argument
@@ -585,8 +595,13 @@ impl<'a> Interp<'a> {
                                         Some(String::from(&**s))
                                     }
                                     PropertyKey::Computed(e) => {
+                                        // ToPropertyKey, not ToString: an object key
+                                        // runs ToPrimitive (so a user `toString`
+                                        // fires), and a Symbol result keeps its
+                                        // identity — `delete o[{toString(){return
+                                        // sym}}]` removes `o[sym]`.
                                         let k = self.eval(e)?;
-                                        Some(self.member_key(k))
+                                        Some(self.coerce_property_key(k)?)
                                     }
                                     _ => None,
                                 };
@@ -730,8 +745,17 @@ impl<'a> Interp<'a> {
                         } else {
                             // `delete <non-Reference>` (e.g. `delete foo()`): the operand
                             // is still evaluated for its side effects, then `true` is
-                            // returned (there is no binding/property to remove).
-                            self.eval(argument)?;
+                            // returned (there is no binding/property to remove). A
+                            // short-circuiting optional call (`delete null?.()`,
+                            // `delete o.f?.()`) yields `undefined`, which is likewise
+                            // not a Reference — so the `delete` still returns `true`.
+                            match self.eval(argument) {
+                                Ok(_) => {}
+                                Err(ExecError::OptShortCircuit) => {
+                                    return Ok(NanBox::boolean(true));
+                                }
+                                Err(e) => return Err(e),
+                            }
                         }
                         // A failed delete of a non-configurable property throws in strict
                         // mode (rather than silently returning `false`).
@@ -1301,6 +1325,12 @@ impl<'a> Interp<'a> {
                 // `this`=`o`) and the callee read re-checks `HasProperty`
                 // (`GetBindingValue`); otherwise finish the read against the lexical
                 // / global scope without re-consulting the `with` chain.
+                // Set when a `with` object supplied the callee *and* it is the
+                // built-in `eval`: the reference is still the syntactic direct-eval
+                // form, so the call must fall through to the direct-eval path below
+                // rather than being dispatched as an ordinary method of the `with`
+                // object (which would run it as an *indirect* eval, in global scope).
+                let mut with_eval: Option<NanBox> = None;
                 if let Expr::Ident(id) = &**callee {
                     let name = &*id.name;
                     if let Some(h) = self.with_binding_result(name)? {
@@ -1322,11 +1352,23 @@ impl<'a> Interp<'a> {
                         {
                             return Err(ExecError::OptShortCircuit);
                         }
-                        let args = self.eval_args(arguments)?;
-                        return self.call_with_this(f, NanBox::handle(h.to_raw()), &args);
+                        let is_eval = !*call_optional
+                            && name == "eval"
+                            && f.as_handle().map(Handle::from_raw).is_some_and(|fh| {
+                                self.realm.native_at(fh) == Some(N_EVAL)
+                                    && self.get_function_realm(fh) == self.cur_realm
+                            });
+                        if is_eval {
+                            with_eval = Some(f);
+                        } else {
+                            let args = self.eval_args(arguments)?;
+                            return self.call_with_this(f, NanBox::handle(h.to_raw()), &args);
+                        }
                     }
                 }
-                let f = if let Expr::Ident(id) = &**callee {
+                let f = if let Some(f) = with_eval {
+                    f
+                } else if let Expr::Ident(id) = &**callee {
                     // The `with` chain was already consulted above (no match); finish
                     // against the lexical / global scope so its `has` trap is not
                     // re-run.
@@ -1536,6 +1578,13 @@ impl<'a> Interp<'a> {
                                     }
                                 }
                             }
+                            // PropertyDefinitionEvaluation uses
+                            // CreateDataPropertyOrThrow — a *define*, not a set — so
+                            // a later data member replaces an accessor defined
+                            // earlier in the same literal
+                            // (`{ get x() { … }, ['x']: null }` ends up with a data
+                            // `x`), rather than invoking (or being swallowed by) it.
+                            self.realm.clear_accessor(handle, &k);
                             self.realm.set_property(handle, &k, v);
                         }
                         // `{ ...src }` — copy own enumerable properties.
@@ -1848,6 +1897,22 @@ impl<'a> Interp<'a> {
                     let kind = if is_set { 1 } else { 2 };
                     return Ok(self.make_live_collection_iterator(h, kind, tag));
                 }
+                // None of the built-in iterable shapes above matched. Before
+                // re-deriving iteration from the receiver's contents, honour a
+                // *user* `[Symbol.iterator]()` — a class or object-literal method,
+                // or a monkey-patched prototype entry: `obj[Symbol.iterator]()` is
+                // an ordinary method call and must run that body (the derived
+                // fallback would silently ignore it).
+                if let Some(rh) = recv.as_handle().map(Handle::from_raw) {
+                    let iter_key = self.member_key(iter_sym);
+                    let f = self.read_member(rh, &iter_key)?;
+                    if let Some(fh) = f.as_handle().map(Handle::from_raw)
+                        && self.is_callable(fh)
+                        && self.realm.native_at(fh).is_none()
+                    {
+                        return self.call_with_this(f, recv, args);
+                    }
+                }
                 let vals = self.iterate_values(recv)?;
                 // Tag the iterator with the receiver's kind so its
                 // prototype is the real `%ArrayIteratorPrototype%` /
@@ -2007,6 +2072,17 @@ impl<'a> Interp<'a> {
         new: NanBox,
     ) -> Result<(), ExecError> {
         let key = self.eval_prop_key(property)?;
+        self.write_primitive_member_key(prim, &key, new)
+    }
+
+    /// [`Self::write_primitive_member`] with the property key already computed
+    /// (a computed-member target evaluates its key before the RHS).
+    pub(crate) fn write_primitive_member_key(
+        &mut self,
+        prim: NanBox,
+        key: &str,
+        new: NanBox,
+    ) -> Result<(), ExecError> {
         let wrapper = self.coerce_to_object(prim);
         let Some(wh) = wrapper.as_handle().map(Handle::from_raw) else {
             return Ok(());
@@ -2015,7 +2091,7 @@ impl<'a> Interp<'a> {
         // primitive — an inherited (strict) setter must see `this` as the
         // primitive value, matching the getter path.
         if self
-            .set_through_proto_chain_for(wh, prim, &key, new)?
+            .set_through_proto_chain_for(wh, prim, key, new)?
             .is_some()
         {
             return Ok(());
@@ -3885,6 +3961,17 @@ impl<'a> Interp<'a> {
         // Otherwise walk the `[[Prototype]]` chain for an inherited property or
         // accessor (the receiver stays `handle`).
         let mut cur = self.realm.object_proto(handle);
+        // A built-in primitive/exotic cell (a string, an array, a function, a
+        // Map/Set) carries no explicit `[[Prototype]]` link — its chain starts at
+        // the matching intrinsic prototype. Seeding the walk there (rather than
+        // leaving it to the own-property-only `builtin_proto_method` fallback
+        // below) makes an inherited *accessor* run with the primitive as `this`
+        // and lets the walk continue up to `%Object.prototype%`, so
+        // `String.prototype.p` defined as a getter, or a method installed on
+        // `Object.prototype`, is visible on `"str"`.
+        if cur.is_none() {
+            cur = self.builtin_proto_of(handle);
+        }
         while let Some(p) = cur {
             // A proxy in the prototype chain handles the read via its own `[[Get]]`
             // (a `get` trap, or forwarding to the target and its prototype chain),
@@ -3951,6 +4038,15 @@ impl<'a> Interp<'a> {
     /// For a built-in array/string/function value, the first-class method `name`
     /// from its constructor's prototype (`Array.prototype` etc.), or `None`.
     pub(crate) fn builtin_proto_method(&mut self, handle: Handle, name: &str) -> Option<NanBox> {
+        let proto = self.builtin_proto_of(handle)?;
+        let m = self.realm.get_property(proto, name)?;
+        (!matches!(m.unpack(), Unpacked::Undefined)).then_some(m)
+    }
+
+    /// The intrinsic prototype a built-in cell with no explicit `[[Prototype]]`
+    /// link inherits from (`%String.prototype%` for a string cell,
+    /// `%Array.prototype%` for an array, …), or `None` for anything else.
+    pub(crate) fn builtin_proto_of(&mut self, handle: Handle) -> Option<Handle> {
         let ctor_name = if self.realm.is_string_handle(handle) {
             "String"
         } else if self.realm.is_array_like(handle) {
@@ -3974,16 +4070,13 @@ impl<'a> Interp<'a> {
         } else {
             return None;
         };
-        let proto = self
-            .current
+        self.current
             .get(ctor_name)
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .and_then(|ns| self.realm.get_property(ns, "prototype"))
             .and_then(|p| p.as_handle())
-            .map(Handle::from_raw)?;
-        let m = self.realm.get_property(proto, name)?;
-        (!matches!(m.unpack(), Unpacked::Undefined)).then_some(m)
+            .map(Handle::from_raw)
     }
 
     pub(crate) fn eval_assign(
@@ -4012,6 +4105,53 @@ impl<'a> Interp<'a> {
             op,
             AssignOp::AndAssign | AssignOp::OrAssign | AssignOp::NullishAssign
         ) {
+            // A `super.x &&= …` / `super[k] ??= …` target: the SuperProperty
+            // reference is evaluated once (GetThisBinding, then — for a computed
+            // key — the key expression + GetSuperBase, captured before
+            // ToPropertyKey), and GetValue/PutValue share it. The RHS runs only
+            // when the short circuit does not take.
+            if let Expr::Member {
+                object, property, ..
+            } = target
+                && matches!(&**object, Expr::Super(_))
+            {
+                self.require_super_this()?;
+                let (name, obj_base) = match property {
+                    PropertyKey::Computed(key_expr) => {
+                        let k = self.eval(key_expr)?;
+                        let obj_base = self.object_super_base();
+                        (self.coerce_property_key(k)?, obj_base)
+                    }
+                    _ => {
+                        let name = self.eval_prop_key(property)?;
+                        (name, self.object_super_base())
+                    }
+                };
+                let current = match obj_base {
+                    Some(Some(proto)) => self.read_super_member_object(proto, &name)?,
+                    Some(None) => {
+                        return Err(self.type_error("Cannot read property of null (super)"));
+                    }
+                    None => self.resolve_super_member(&name)?,
+                };
+                let assign = match op {
+                    AssignOp::AndAssign => self.realm.truthy(current),
+                    AssignOp::OrAssign => !self.realm.truthy(current),
+                    _ => matches!(current.unpack(), Unpacked::Undefined | Unpacked::Null),
+                };
+                if !assign {
+                    return Ok(current);
+                }
+                let rhs = self.eval(value)?;
+                match obj_base {
+                    Some(Some(proto)) => self.assign_super_member_object(proto, &name, rhs)?,
+                    Some(None) => {
+                        return Err(self.type_error("Cannot set property on null (super)"));
+                    }
+                    None => self.assign_super_member(&name, rhs)?,
+                }
+                return Ok(rhs);
+            }
             // A computed-member target (non-super): evaluate base + key ONCE,
             // shared by the read and the write — this both avoids the key
             // double-eval (`obj[f()] &&= g()` calls `f()` once) and evaluates the
@@ -4074,7 +4214,11 @@ impl<'a> Interp<'a> {
             // NamedEvaluation: `x &&= function(){}` / `x ||= () => {}` /
             // `x ??= class {}` names the anonymous RHS after the LHS *identifier*
             // (only a simple identifier target, only an anonymous fn/arrow/class).
-            if let Expr::Ident(id) = target
+            // …and only for a bare `IdentifierReference`: `IsIdentifierRef` of a
+            // parenthesized target is false, so `(a) ??= function(){}` leaves the
+            // function anonymous.
+            if !paren_target
+                && let Expr::Ident(id) = target
                 && matches!(value, Expr::Function(_) | Expr::Arrow(_) | Expr::Class(_))
             {
                 self.set_fn_name(rhs, &id.name);
@@ -4113,7 +4257,25 @@ impl<'a> Interp<'a> {
                 if is_nullish {
                     return Err(self.type_error("Cannot set property of null or undefined"));
                 }
-                return Ok(rhs);
+                // A number/boolean primitive base: PutValue boxes it and performs
+                // `[[Set]](key, v, primitiveReceiver)` — an inherited setter runs,
+                // otherwise creating an own property on a non-object receiver fails
+                // (a strict TypeError, a sloppy no-op). This is the same rule the
+                // static-member path applies via `write_primitive_member`; skipping
+                // it here made `(function(){"use strict"; true[k] = 1})()` silent.
+                let k = self.coerce_property_key(key)?;
+                let new = if op == AssignOp::Assign {
+                    rhs
+                } else {
+                    let boxed = self.coerce_to_object(obj);
+                    let current = match boxed.as_handle() {
+                        Some(br) => self.read_member(crate::heap::Handle::from_raw(br), &k)?,
+                        None => NanBox::undefined(),
+                    };
+                    self.binary(compound_op(op)?, current, rhs)?
+                };
+                self.write_primitive_member_key(obj, &k, new)?;
+                return Ok(new);
             };
             let handle = crate::heap::Handle::from_raw(raw);
             let mut key = key;

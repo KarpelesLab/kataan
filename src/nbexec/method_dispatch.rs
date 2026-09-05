@@ -3832,6 +3832,14 @@ impl<'a> Interp<'a> {
                     return Ok(Some(NanBox::number(len as f64)));
                 }
                 "splice" => {
+                    // Precise: every element move is `Get`/`Set(…, true)` /
+                    // `DeletePropertyOrThrow`, so a non-writable or non-configurable
+                    // index throws instead of being bulk-overwritten, an inherited
+                    // accessor fires, and holes are preserved. The dense rewrite
+                    // below is only valid for an ordinary hole-free array.
+                    if precise_array {
+                        return Ok(Some(self.array_like_mutate(method, handle, args)?));
+                    }
                     let len = elems.len();
                     // `relativeStart = ToIntegerOrInfinity(start)` then
                     // `ToIntegerOrInfinity(deleteCount)` — object args coerce via
@@ -4734,12 +4742,15 @@ impl<'a> Interp<'a> {
                                     self.set_or_throw(handle, lkb, &lk, up)?;
                                     self.set_or_throw(handle, ukb, &uk, lo)?;
                                 }
+                                // The spec's `DeletePropertyOrThrow`: a failed
+                                // `[[Delete]]` (a non-configurable index) is a
+                                // TypeError, not a silent drop.
                                 (false, true) => {
                                     self.set_or_throw(handle, lkb, &lk, up)?;
-                                    self.delete_property_of(handle, &uk)?;
+                                    self.delete_or_throw(handle, &uk)?;
                                 }
                                 (true, false) => {
-                                    self.delete_property_of(handle, &lk)?;
+                                    self.delete_or_throw(handle, &lk)?;
                                     self.set_or_throw(handle, ukb, &uk, lo)?;
                                 }
                                 (false, false) => {}
@@ -5983,6 +5994,15 @@ impl<'a> Interp<'a> {
     fn array_like_set(&mut self, handle: Handle, i: usize, v: NanBox) -> Result<(), ExecError> {
         let key = self.new_str(&alloc::format!("{i}"));
         self.assign_member_value(handle, key, v)
+    }
+
+    /// `DeletePropertyOrThrow(O, key)` (ECMA-262 7.3.9): a `[[Delete]]` that
+    /// returns `false` (a non-configurable own property) is a TypeError.
+    pub(crate) fn delete_or_throw(&mut self, handle: Handle, key: &str) -> Result<(), ExecError> {
+        if !self.delete_property_of(handle, key)? {
+            return Err(self.type_error(&alloc::format!("Cannot delete property '{key}'")));
+        }
+        Ok(())
     }
 
     fn array_like_delete(&mut self, handle: Handle, i: usize) -> Result<(), ExecError> {

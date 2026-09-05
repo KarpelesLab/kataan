@@ -312,6 +312,11 @@ impl Validator {
                                 for decl in &d.declarations {
                                     collect_bound_names(&decl.target, &mut bound);
                                 }
+                                // The head's whole LexicalDeclaration is one
+                                // declaration list, so a name bound twice across
+                                // it — `for (let [z, z] = …; …)`, and equally
+                                // `for (let a, [a] = …; …)` — is an early error.
+                                self.check_no_dup_bound_names(&bound)?;
                                 self.check_no_var_redeclare(&bound, body)?;
                             }
                         }

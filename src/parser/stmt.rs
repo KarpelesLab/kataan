@@ -243,6 +243,15 @@ impl<'src> Parser<'src> {
             // x`. (`let [` is always a declaration per the grammar lookahead.)
             // Strict-mode misuse of bare `let` is caught by the post-parse
             // identifier-reference validator.
+            // `let:` is a *labeled statement* whose `LabelIdentifier` is the sloppy
+            // identifier `let` (never a declaration — no `let` declaration can be
+            // followed by `:`). Checked before the declaration/expression arms
+            // below, which would otherwise consume the `let` and choke on the
+            // colon. Strict mode rejects it, via the post-parse validator's
+            // reserved-word-as-label check.
+            TokenKind::Keyword(Kw::Let) if self.nth_kind(1) == TokenKind::Colon => {
+                self.parse_labeled()
+            }
             TokenKind::Keyword(Kw::Let) if self.let_binding_follows() => self.parse_var_statement(),
             TokenKind::Keyword(Kw::Let) => self.parse_expression_statement(),
             // `using x = …` / `await using x = …` — explicit-resource-management
