@@ -701,6 +701,10 @@ impl<'a> Interp<'a> {
             if id == N_DSTACK_ADOPT_CALL {
                 return self.dstack_adopt_call(target);
             }
+            // `GetDisposeMethod(V, async-dispose)`'s `@@dispose` fallback wrapper.
+            if id == N_DISPOSE_SYNC_WRAP {
+                return self.dispose_sync_wrap_call(target, this_val);
+            }
             // A `ShadowRealm.prototype.<method>` (`evaluate`/`importValue`).
             if id == N_SHADOW_REALM_PROTO {
                 let saved = core::mem::replace(&mut self.this_val, this_val);

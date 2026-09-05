@@ -1052,7 +1052,7 @@ impl<'a> Interp<'a> {
             if !self.is_callable_value(m) {
                 return Err(self.type_error("@@dispose is not callable"));
             }
-            return Ok(m);
+            return Ok(self.make_async_dispose_wrapper(m));
         }
         let sym = self.well_known_symbol("dispose");
         let key = self.member_key(sym);
@@ -1073,27 +1073,20 @@ impl<'a> Interp<'a> {
     /// throwing disposer is aggregated with the in-flight completion into a
     /// `SuppressedError` chain (the newer error becomes `.error`, the prior
     /// completion `.suppressed`); a non-throw abrupt completion from a disposer is
-    /// propagated as-is. An `await using` disposer's result is awaited **eagerly**
-    /// (driving the event loop via `await_value`) — see the module note.
+    /// propagated as-is.
+    ///
+    /// This is the **non-suspending** driver, used by the eager tree-walker (a
+    /// plain function body / block, which has no coroutine to park) and by the
+    /// coroutine machine for a scope that holds only synchronous `using`
+    /// resources. A scope holding an `await using` resource is instead disposed by
+    /// the resumable `Step::Dispose` state machine in `generator.rs`, which turns
+    /// each async disposer's `Await` into a real suspension; the eager
+    /// `await_value` fallback below only survives for a stray `await using` the
+    /// walker somehow reaches (it resolves the result without a microtask turn).
     pub(crate) fn dispose_resources(
         &mut self,
         disposers: alloc::vec::Vec<(NanBox, NanBox, bool)>,
         completion: Result<NanBox, ExecError>,
-    ) -> Result<NanBox, ExecError> {
-        self.dispose_resources_tracked(disposers, completion, &mut false)
-    }
-
-    /// [`Self::dispose_resources`] plus `DisposeResources`' *needsAwait ∧
-    /// ¬hasAwaited* bookkeeping: `needs_await` is set when some `await using`
-    /// resource had **no** dispose method (a `null`/`undefined` resource) and no
-    /// real `Await` ran for any other resource, so step 4 still owes one
-    /// `Await(undefined)` — an observable microtask turn. Only a caller that can
-    /// actually suspend (the coroutine step machine) acts on it.
-    pub(crate) fn dispose_resources_tracked(
-        &mut self,
-        disposers: alloc::vec::Vec<(NanBox, NanBox, bool)>,
-        completion: Result<NanBox, ExecError>,
-        needs_await: &mut bool,
     ) -> Result<NanBox, ExecError> {
         // Start from the incoming completion: a normal one, or the in-flight throw.
         let (ok_value, mut pending): (NanBox, Option<NanBox>) = match completion {
@@ -1103,22 +1096,17 @@ impl<'a> Interp<'a> {
             // running disposers' aggregation against it.
             Err(other) => return Err(other),
         };
-        // `DisposeResources` *needsAwait* / *hasAwaited*.
-        let (mut wants_await, mut has_awaited) = (false, false);
         for (value, method, is_async) in disposers.into_iter().rev() {
             if matches!(method.unpack(), Unpacked::Undefined | Unpacked::Null) {
                 // Step 3.f: no dispose method — only reachable for the
-                // async-dispose hint, which still owes an `Await(undefined)`.
-                wants_await |= is_async;
+                // async-dispose hint, whose owed `Await(undefined)` (steps 3.d / 4)
+                // the suspending driver reifies; there is nothing to park on here.
                 continue;
             }
             let result = self.call_with_this(method, value, &[]);
             // For an `await using`, await the dispose result (eagerly).
             let result = match result {
-                Ok(v) if is_async => {
-                    has_awaited = true;
-                    self.await_value(v)
-                }
+                Ok(v) if is_async => self.await_value(v),
                 other => other,
             };
             if let Err(ExecError::Throw(e)) = result {
@@ -1131,7 +1119,6 @@ impl<'a> Interp<'a> {
                 result?;
             }
         }
-        *needs_await = wants_await && !has_awaited;
         match pending {
             None => Ok(ok_value),
             Some(e) => Err(ExecError::Throw(e)),
@@ -1152,7 +1139,9 @@ impl<'a> Interp<'a> {
                 return Ok(m);
             }
             if let Some(m) = self.get_dispose_method(value, "dispose")? {
-                return Ok(m);
+                // `GetDisposeMethod(V, async-dispose)` step 1.b.ii: the sync
+                // `@@dispose` fallback is wrapped so its return value is discarded.
+                return Ok(self.make_async_dispose_wrapper(m));
             }
             return Err(self.type_error("value is not an async disposable"));
         }
@@ -1160,6 +1149,39 @@ impl<'a> Interp<'a> {
             return Ok(m);
         }
         Err(self.type_error("value is not disposable"))
+    }
+
+    /// `GetDisposeMethod(V, async-dispose)` step 1.b.ii: wraps a resource's
+    /// *synchronous* `[Symbol.dispose]` method (used because it has no
+    /// `[Symbol.asyncDispose]`) in the spec's abstract closure. The wrapper calls
+    /// the method on the receiver and returns a promise **resolved with
+    /// undefined** — a throw becomes a rejection — so the sync method's own return
+    /// value is discarded. That matters: a `[Symbol.dispose]` that returns a
+    /// never-settling promise must not park the `await using` disposal forever.
+    fn make_async_dispose_wrapper(&mut self, method: NanBox) -> NanBox {
+        let Some(h) = method.as_handle().map(Handle::from_raw) else {
+            return method;
+        };
+        let f = self.realm.new_bound_native(N_DISPOSE_SYNC_WRAP, h);
+        NanBox::handle(f.to_raw())
+    }
+
+    /// Dispatches an `N_DISPOSE_SYNC_WRAP` call: `target` is the wrapped sync
+    /// `[Symbol.dispose]` method, `this_val` the resource it belongs to.
+    pub(crate) fn dispose_sync_wrap_call(
+        &mut self,
+        target: Handle,
+        this_val: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let method = NanBox::handle(target.to_raw());
+        let promise = self.fresh_promise();
+        match self.call_with_this(method, this_val, &[]) {
+            Ok(_) => self.settle(promise, NanBox::undefined(), true),
+            Err(ExecError::Throw(e)) => self.settle(promise, e, false),
+            // A non-throw abrupt completion (engine-internal) is not a rejection.
+            Err(other) => return Err(other),
+        }
+        Ok(NanBox::handle(promise.to_raw()))
     }
 
     /// Builds the dispose callback for `adopt(value, onDispose)`: a bound native
@@ -1287,7 +1309,7 @@ impl<'a> Interp<'a> {
     /// constructor is called with `(error, suppressed, "An error was suppressed
     /// during disposal.")`, so the instance is a real `SuppressedError` (with the
     /// proper `[[Prototype]]`, `error`/`suppressed`, and message).
-    fn make_suppressed_error(&mut self, error: NanBox, suppressed: NanBox) -> NanBox {
+    pub(crate) fn make_suppressed_error(&mut self, error: NanBox, suppressed: NanBox) -> NanBox {
         let msg = self.new_str("An error was suppressed during disposal.");
         let callee = self
             .current

@@ -2917,6 +2917,13 @@ const N_DSTACK_ADOPT_CALL: u16 = 549;
 /// The `SuppressedError` constructor (ES2025) — thrown when multiple disposers
 /// throw during `DisposableStack`/`AsyncDisposableStack` disposal.
 const N_SUPPRESSED_ERROR: u16 = 550;
+/// `GetDisposeMethod(V, async-dispose)`'s `@@dispose` fallback wrapper: `target`
+/// is the resource's *synchronous* `[Symbol.dispose]` method. Calling it invokes
+/// that method on the receiver and returns a promise **resolved with undefined**
+/// (a throw becomes a rejection), so the sync method's own return value — which
+/// may be a promise that never settles — is deliberately discarded rather than
+/// awaited.
+const N_DISPOSE_SYNC_WRAP: u16 = 551;
 
 // --- Promise combinator helper natives (resolve/reject element closures). ---
 // Each is a *bound* native whose target is a per-call state object carrying the

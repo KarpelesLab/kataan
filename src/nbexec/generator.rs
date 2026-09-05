@@ -540,6 +540,50 @@ enum Step<'a> {
         base: Handle,
         property: &'a PropertyKey,
     },
+    /// A resumable `DisposeResources` run for a scope that is being left and holds
+    /// at least one `await using` resource. Each async disposer's result is
+    /// `Await`ed as a *real* coroutine suspension (a `Step::AwaitExpr` pushed above
+    /// this step), so the disposers of one scope are separated by microtask turns.
+    /// See [`DisposeState`].
+    Dispose(alloc::boxed::Box<DisposeState>),
+}
+
+/// The resumable state of one `DisposeResources` run (7.5.5), driven by
+/// [`Step::Dispose`]. Resources are disposed in **reverse** declaration order (the
+/// back of `rest` is the next one), and every async-hint disposer's result is
+/// awaited as a real coroutine suspension.
+struct DisposeState {
+    /// Not-yet-disposed resources, in declaration order: `(value, method,
+    /// isAsyncHint)`. The next resource to dispose is the **last** element.
+    rest: alloc::vec::Vec<(NanBox, NanBox, bool)>,
+    /// The accumulated throw completion (`completion` in the spec): a later
+    /// disposer throw suppresses it into a `SuppressedError` chain.
+    pending: Option<NanBox>,
+    /// The abrupt completion the scope was already unwinding, restored when
+    /// disposal ends without a throw. `None` = the scope was leaving normally.
+    restore: Option<Completion>,
+    /// The enclosing scope to restore once disposal is over (`None` = a body-level
+    /// scope, which the frame itself owns).
+    scope: Option<Scope>,
+    /// The label of the block being left (only set on the unwind path): a
+    /// `break <label>` targeting it is consumed once disposal is done.
+    label: Option<String>,
+    /// `DisposeResources`' *needsAwait*: an async-hint resource had no dispose
+    /// method, so an `Await(undefined)` is still owed (step 3.d or step 4).
+    needs_await: bool,
+    /// `DisposeResources`' *hasAwaited*: a real `Await` already ran for some
+    /// resource, which retires the owed step-3.d / step-4 `Await`.
+    has_awaited: bool,
+}
+
+/// What [`Interp::gen_begin_dispose`] did with a scope's `using` resources.
+enum DisposeStart {
+    /// A [`Step::Dispose`] was pushed: the step machine drives the rest (and will
+    /// re-raise / consume the completion itself).
+    Stepped,
+    /// Disposal finished inline (no `await using` resource in the scope); this is
+    /// the resulting completion, `None` meaning "resume normally".
+    Inline(Option<Completion>),
 }
 
 /// Which method an async `yield*` delegation step is servicing (mirrors the
@@ -2145,61 +2189,173 @@ fn method_call_reifiable(callee: &Expr) -> bool {
 // --- the stepping machine ----------------------------------------------------
 
 impl<'a> Interp<'a> {
-    /// Executes one step of the generator machine: pops the top [`Step`] and
-    /// processes it, pushing follow-up steps and/or leaving values on the value
-    /// stack. Returns `Yield(v)` when a `yield` is reached.
-    /// Disposes the `using` / `await using` resources recorded in `self.current`
-    /// (a coroutine block / body scope leaving *normally*), in reverse order. A
-    /// scope with no disposers does nothing (the fast path). A throwing disposer
-    /// is surfaced as a `GenAbrupt::Throw`. A disposer that *returns* a promise is
-    /// still awaited eagerly (via `await_value`) — the documented
-    /// eager-async-dispose model for the coroutine path — but `DisposeResources`
-    /// step 4's own `Await(undefined)`, owed when an `await using` resource had no
-    /// dispose method at all, is reported back as `true` so the caller can reify it
-    /// as a real coroutine suspension.
-    fn gen_dispose_scope_resources(&mut self) -> Result<bool, GenAbrupt> {
-        if !self.current.has_disposers() {
-            return Ok(false);
+    /// Begins `DisposeResources` (7.5.5) for the coroutine scope being left, whose
+    /// recorded `using` / `await using` disposers live in `self.current`.
+    ///
+    /// `restore` is the abrupt completion already being unwound (`None` when the
+    /// scope is leaving normally); `scope` is the enclosing scope to reinstate
+    /// afterwards; `label` is the label of the block being left, so a
+    /// `break <label>` targeting it is consumed once disposal is done.
+    ///
+    /// A scope holding at least one **async-hint** (`await using`) resource is
+    /// disposed by the resumable [`Step::Dispose`] machine — every async disposer's
+    /// result becomes a real coroutine suspension, so the disposers of one scope
+    /// are separated by microtask turns — and `Stepped` is returned: the caller
+    /// must hand control back to the step loop, which re-raises the completion (or
+    /// consumes the label) when disposal finishes.
+    ///
+    /// A scope with only synchronous `using` resources cannot suspend
+    /// (`needsAwait` is only ever set by an async-hint resource), so it is disposed
+    /// inline by the shared driver and its completion returned as `Inline`.
+    fn gen_begin_dispose(
+        &mut self,
+        stack: &mut Vec<Step<'a>>,
+        restore: Option<Completion>,
+        scope: Option<Scope>,
+        label: Option<String>,
+    ) -> DisposeStart {
+        let disposers = if self.current.has_disposers() {
+            self.current.take_disposers()
+        } else {
+            alloc::vec::Vec::new()
+        };
+        if disposers.iter().any(|(_, _, is_async)| *is_async) {
+            // A `Throw` being unwound is the run's initial *pending* completion (it
+            // is what a later disposer throw suppresses); any other abrupt
+            // completion is merely buffered and restored if nothing throws.
+            let (pending, restore) = match restore {
+                Some(Completion::Throw(e)) => (Some(e), None),
+                other => (None, other),
+            };
+            stack.push(Step::Dispose(alloc::boxed::Box::new(DisposeState {
+                rest: disposers,
+                pending,
+                restore,
+                scope,
+                label,
+                needs_await: false,
+                has_awaited: false,
+            })));
+            return DisposeStart::Stepped;
         }
-        let disposers = self.current.take_disposers();
-        let mut needs_await = false;
-        match self.dispose_resources_tracked(disposers, Ok(NanBox::undefined()), &mut needs_await) {
-            Ok(_) => Ok(needs_await),
-            Err(e) => Err(GenAbrupt::from(e)),
+        // Sync-only (or empty): run the shared driver in one shot. Only a `Throw`
+        // participates in suppression; a `return`/`break`/`continue` is preserved
+        // unless a disposer throws, in which case the throw replaces it.
+        let mut completion = restore;
+        if !disposers.is_empty() {
+            let threaded = match &completion {
+                Some(Completion::Throw(e)) => Err(ExecError::Throw(*e)),
+                _ => Ok(NanBox::undefined()),
+            };
+            if let Err(e) = self.dispose_resources(disposers, threaded) {
+                completion = Some(Completion::Throw(throw_value(e)));
+            }
         }
+        if let Some(s) = scope {
+            self.current = s;
+        }
+        DisposeStart::Inline(consume_block_label(completion, label.as_deref()))
     }
 
-    /// Disposes the `using` resources of `self.current` while *unwinding* an
-    /// abrupt `completion`, returning the (possibly updated) completion. A
-    /// throwing disposer is aggregated into the completion: it suppresses a
-    /// pending throw (SuppressedError chain) or, against a non-throw completion
-    /// (`return`/`break`/`continue`), replaces it with the disposer's throw. A
-    /// scope with no disposers returns the completion unchanged (fast path).
-    ///
-    /// Unlike the normal-exit path
-    /// ([`gen_dispose_scope_resources`](Self::gen_dispose_scope_resources)), an
-    /// `Await(undefined)` owed by `DisposeResources` step 4 is **not** reified as
-    /// a coroutine suspension here: the unwinder has an in-flight completion to
-    /// carry across the suspension, which would need a step that re-raises it on
-    /// resume. So leaving an `await using` scope by `return`/`break`/`throw` still
-    /// costs no microtask turn when every resource lacked a dispose method.
-    fn gen_dispose_unwind(&mut self, completion: Completion) -> Completion {
-        if !self.current.has_disposers() {
-            return completion;
+    /// Runs (or resumes) a [`Step::Dispose`] state machine: disposes resources in
+    /// reverse order, suspending the coroutine on each async-hint disposer's result
+    /// (`Await`, spec step 3.e.ii) and on the `Await(undefined)` owed by step 3.d /
+    /// step 4 when an async-hint resource had no dispose method. A throwing
+    /// disposer is aggregated into `pending` as a `SuppressedError` chain.
+    fn gen_dispose_step(
+        &mut self,
+        mut st: alloc::boxed::Box<DisposeState>,
+        stack: &mut Vec<Step<'a>>,
+        values: &mut Vec<NanBox>,
+    ) -> StepResult {
+        while let Some((value, method, is_async)) = st.rest.pop() {
+            // Step 3.d: a sync-dispose resource reached while an `Await` is owed
+            // pays it *before* its dispose method runs.
+            if !is_async && st.needs_await && !st.has_awaited {
+                st.needs_await = false;
+                st.rest.push((value, method, is_async));
+                Self::push_dispose_await(st, stack, values, NanBox::undefined());
+                return Ok(StepOut::Continue);
+            }
+            if matches!(method.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                // Step 3.f: no dispose method — only reachable for the async-dispose
+                // hint, which still owes an `Await(undefined)`.
+                st.needs_await |= is_async;
+                continue;
+            }
+            match self.call_with_this(method, value, &[]) {
+                // Step 3.e.ii: an `await using` disposer's result is awaited as a
+                // real suspension; the resumption re-enters this step.
+                Ok(v) if is_async => {
+                    st.has_awaited = true;
+                    Self::push_dispose_await(st, stack, values, v);
+                    return Ok(StepOut::Continue);
+                }
+                Ok(_) => {}
+                Err(ExecError::Throw(e)) => self.dispose_suppress(&mut st, e),
+                // A non-throw abrupt completion (engine-internal) aborts the run.
+                Err(other) => return Err(GenAbrupt::Fatal(other)),
+            }
         }
-        let disposers = self.current.take_disposers();
-        // Map the in-flight completion to a value-completion the disposal driver
-        // can thread: only a `Throw` participates in suppression; a
-        // `return`/`break`/`continue` is preserved unless a disposer throws.
-        let threaded = match &completion {
-            Completion::Throw(e) => Err(ExecError::Throw(*e)),
-            _ => Ok(NanBox::undefined()),
+        // Step 4: an owed `Await(undefined)` that no real `Await` retired.
+        if st.needs_await && !st.has_awaited {
+            st.needs_await = false;
+            st.has_awaited = true;
+            Self::push_dispose_await(st, stack, values, NanBox::undefined());
+            return Ok(StepOut::Continue);
+        }
+        self.gen_dispose_finish(*st)
+    }
+
+    /// Parks a [`Step::Dispose`] run on `operand`'s settlement: the `AwaitExpr`
+    /// suspends the coroutine, `Discard` drops the fulfilment value the resumption
+    /// pushes, and the re-pushed `Dispose` continues with the next resource. A
+    /// *rejection* instead unwinds into this step's `gen_unwind` arm, which folds
+    /// the thrown value into the pending completion and resumes the run.
+    fn push_dispose_await(
+        st: alloc::boxed::Box<DisposeState>,
+        stack: &mut Vec<Step<'a>>,
+        values: &mut Vec<NanBox>,
+        operand: NanBox,
+    ) {
+        stack.push(Step::Dispose(st));
+        stack.push(Step::Discard);
+        stack.push(Step::AwaitExpr);
+        values.push(operand);
+    }
+
+    /// Folds a disposer's thrown value `e` into a dispose run's pending completion:
+    /// the newest error becomes `.error` and the prior completion `.suppressed` of a
+    /// `SuppressedError` chain.
+    fn dispose_suppress(&mut self, st: &mut DisposeState, e: NanBox) {
+        st.pending = Some(match st.pending.take() {
+            None => e,
+            Some(prev) => self.make_suppressed_error(e, prev),
+        });
+    }
+
+    /// Concludes a [`Step::Dispose`] run: restores the enclosing scope, then
+    /// re-raises the resulting completion — a disposer throw (which replaces any
+    /// non-throw completion the scope was unwinding), else the buffered completion,
+    /// unless it is a `break` targeting the block that was being left.
+    fn gen_dispose_finish(&mut self, st: DisposeState) -> StepResult {
+        let DisposeState {
+            pending,
+            restore,
+            scope,
+            label,
+            ..
+        } = st;
+        if let Some(s) = scope {
+            self.current = s;
+        }
+        let completion = match pending {
+            Some(e) => Some(Completion::Throw(e)),
+            None => restore,
         };
-        match self.dispose_resources(disposers, threaded) {
-            // Disposal did not throw: keep the original completion.
-            Ok(_) => completion,
-            // A disposer threw: it becomes the (possibly aggregated) completion.
-            Err(e) => Completion::Throw(throw_value(e)),
+        match consume_block_label(completion, label.as_deref()) {
+            None => Ok(StepOut::Continue),
+            Some(c) => Err(abrupt_of(c)),
         }
     }
 
@@ -2361,6 +2517,9 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// Executes one step of the generator machine: pops the top [`Step`] and
+    /// processes it, pushing follow-up steps and/or leaving values on the value
+    /// stack. Returns `Yield(v)` when a `yield` is reached.
     fn gen_step(&mut self, stack: &mut Vec<Step<'a>>, values: &mut Vec<NanBox>) -> StepResult {
         let Some(step) = stack.pop() else {
             // The stack is empty: the body completed normally.
@@ -2377,21 +2536,15 @@ impl<'a> Interp<'a> {
                     // Block / body sequence finished normally: dispose any
                     // `using` resources recorded in the just-completed scope
                     // (`self.current`), in reverse order, before restoring the
-                    // enclosing scope. A throwing disposer becomes a throw.
-                    let needs_await = self.gen_dispose_scope_resources()?;
-                    if let Some(s) = scope {
-                        self.current = s;
-                    }
-                    if needs_await {
-                        // `DisposeResources` step 4: an `await using` resource with
-                        // no dispose method still costs one `Await(undefined)`, so
-                        // suspend the coroutine here for real. `Discard` drops the
-                        // fulfilment value the resumption pushes.
-                        stack.push(Step::Discard);
-                        stack.push(Step::AwaitExpr);
-                        values.push(NanBox::undefined());
-                    }
-                    return Ok(StepOut::Continue);
+                    // enclosing scope. A throwing disposer becomes a throw; a
+                    // scope holding an `await using` resource is disposed by the
+                    // resumable `Step::Dispose` machine (one suspension per async
+                    // disposer). The block's own label is not consumable here (a
+                    // normal exit carries no `break`), so it is not passed on.
+                    return match self.gen_begin_dispose(stack, None, scope, None) {
+                        DisposeStart::Stepped | DisposeStart::Inline(None) => Ok(StepOut::Continue),
+                        DisposeStart::Inline(Some(c)) => Err(abrupt_of(c)),
+                    };
                 }
                 let stmt = &body[idx];
                 // Re-push the continuation of this sequence first.
@@ -2693,12 +2846,7 @@ impl<'a> Interp<'a> {
             }
             // A `finally` block finished normally: re-apply the completion it
             // had buffered (a `return`/`throw`/`break`/`continue` in flight).
-            Step::Finally { pending } => Err(match pending {
-                Completion::Return(v) => GenAbrupt::Return(v),
-                Completion::Throw(e) => GenAbrupt::Throw(e),
-                Completion::Break(l) => GenAbrupt::Break(l),
-                Completion::Continue(l) => GenAbrupt::Continue(l),
-            }),
+            Step::Finally { pending } => Err(abrupt_of(pending)),
             Step::Discard => {
                 values.pop();
                 Ok(StepOut::Continue)
@@ -3713,6 +3861,7 @@ impl<'a> Interp<'a> {
                 let operand = values.pop().unwrap_or(NanBox::undefined());
                 Ok(StepOut::Await(operand))
             }
+            Step::Dispose(st) => self.gen_dispose_step(st, stack, values),
         }
     }
 }
@@ -4523,8 +4672,17 @@ impl<'a> Interp<'a> {
                 // Nothing caught it: the body itself is unwinding out. Dispose any
                 // body-level `using` resources (recorded in the frame scope,
                 // `self.current`) before the generator completes abnormally,
-                // aggregating a disposer throw into the completion.
-                completion = self.gen_dispose_unwind(completion);
+                // aggregating a disposer throw into the completion. With an
+                // `await using` among them the disposal is stepped (it suspends per
+                // resource) and re-raises the completion when it is done — landing
+                // back here with the resources already taken.
+                match self.gen_begin_dispose(stack, Some(completion), None, None) {
+                    DisposeStart::Stepped => return Ok(None),
+                    DisposeStart::Inline(Some(c)) => completion = c,
+                    DisposeStart::Inline(None) => {
+                        return Ok(Some(Ok(GenStep::Done(NanBox::undefined()))));
+                    }
+                }
                 // The generator completes abnormally.
                 return Ok(Some(match completion {
                     Completion::Return(v) => Ok(GenStep::Done(v)),
@@ -4540,23 +4698,40 @@ impl<'a> Interp<'a> {
                     // Leaving this scope abruptly: dispose its `using` resources,
                     // aggregating any disposer throw into the in-flight completion
                     // (SuppressedError chain) before continuing to unwind.
-                    completion = self.gen_dispose_unwind(completion);
-                    self.current = scope;
+                    match self.gen_begin_dispose(stack, Some(completion), Some(scope), None) {
+                        DisposeStart::Stepped | DisposeStart::Inline(None) => return Ok(None),
+                        DisposeStart::Inline(Some(c)) => completion = c,
+                    }
                 }
                 Step::Seq { scope, label, .. } => {
                     // The block scope (`self.current`) is leaving abruptly: dispose
-                    // its `using` resources, aggregating against the completion.
-                    completion = self.gen_dispose_unwind(completion);
-                    if let Some(s) = scope {
-                        self.current = s;
+                    // its `using` resources, aggregating against the completion. A
+                    // labeled break/continue targeting this block's label is consumed
+                    // once disposal is done (a labeled *block* only matches `break`) —
+                    // `gen_begin_dispose` does that on both the inline and the stepped
+                    // path, so an `await using` scope keeps the same label semantics
+                    // across its suspensions.
+                    match self.gen_begin_dispose(stack, Some(completion), scope, label) {
+                        DisposeStart::Stepped | DisposeStart::Inline(None) => return Ok(None),
+                        DisposeStart::Inline(Some(c)) => completion = c,
                     }
-                    // A labeled break/continue targeting this block's label is
-                    // consumed here (a labeled *block* only matches `break`).
-                    if let Completion::Break(Some(l)) = &completion
-                        && label.as_ref() == Some(l)
-                    {
-                        return Ok(None);
+                }
+                Step::Dispose(mut st) => {
+                    // A dispose run parked on an async disposer's `Await` was
+                    // resumed abruptly: a rejected disposal promise is folded into
+                    // the run's pending throw (SuppressedError chain), and any other
+                    // injected completion is buffered as the one to restore. Either
+                    // way `DisposeResources` must still finish, so the run resumes.
+                    match completion {
+                        Completion::Throw(e) => self.dispose_suppress(&mut st, e),
+                        other => {
+                            if st.pending.is_none() {
+                                st.restore = Some(other);
+                            }
+                        }
                     }
+                    stack.push(Step::Dispose(st));
+                    return Ok(None);
                 }
                 Step::TryRegion {
                     handler,
@@ -4838,6 +5013,27 @@ impl<'a> Interp<'a> {
                 Ok(StepOut::Continue)
             }
         }
+    }
+}
+
+/// Re-raises an unwinder [`Completion`] as a stepping [`GenAbrupt`].
+fn abrupt_of(completion: Completion) -> GenAbrupt {
+    match completion {
+        Completion::Return(v) => GenAbrupt::Return(v),
+        Completion::Throw(e) => GenAbrupt::Throw(e),
+        Completion::Break(l) => GenAbrupt::Break(l),
+        Completion::Continue(l) => GenAbrupt::Continue(l),
+    }
+}
+
+/// Consumes a `break <label>` that targets the labeled *block* being left
+/// (`outer: { … }`): such a break stops here, so `None` (resume normally) is
+/// returned. Any other completion — and any completion at all when the block is
+/// unlabeled — passes through untouched.
+fn consume_block_label(completion: Option<Completion>, label: Option<&str>) -> Option<Completion> {
+    match (&completion, label) {
+        (Some(Completion::Break(Some(l))), Some(name)) if l == name => None,
+        _ => completion,
     }
 }
 
