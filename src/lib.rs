@@ -92,10 +92,14 @@ pub mod limits;
 #[cfg(feature = "alloc")]
 pub mod wtf8;
 
+/// A cooperative interrupt flag a host watchdog trips to stop a runaway script.
+/// Needs `alloc` (the flag lives in a shared `Arc`).
+#[cfg(feature = "alloc")]
+pub mod interrupt;
+
 /// Rope strings: lazy O(1) concatenation so building a string piecewise is not
 /// quadratic. Needs `alloc`.
 #[cfg(feature = "alloc")]
-pub mod interrupt;
 pub mod rope;
 
 /// The object-model context (`Realm`) bundling the heap, the shared root shape,

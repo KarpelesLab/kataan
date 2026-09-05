@@ -10,8 +10,9 @@
 //!
 //! `Interp` and `Realm` hold `Rc`s, so they are `!Send`/`!Sync` and a watchdog
 //! thread can never touch them. The flag therefore lives in its own shared
-//! allocation: the engine keeps one [`Interrupt`] handle and the watchdog keeps
-//! a clone, and only the `AtomicBool` inside crosses the thread boundary. An
+//! allocation: the engine keeps one [`Interrupt`](crate::interrupt::Interrupt)
+//! handle and the watchdog keeps a clone, and only the `AtomicBool` inside
+//! crosses the thread boundary. An
 //! `AtomicBool` *field* on `Interp` would be unreachable from the watchdog and
 //! would not compile as `Send` anyway.
 //!
