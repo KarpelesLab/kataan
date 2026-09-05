@@ -7,6 +7,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/KarpelesLab/kataan/compare/v0.0.8...v0.0.9) - 2026-09-05
+
+### Added
+
+- *(interrupt)* cooperative host interrupt for watchdog deadlines
+- *(disposal)* `await using` suspends per resource (ROADMAP §3.14)
+- *(intl)* per-calendar eras and month names; corpus at 99.99%
+- *(module)* source-phase imports; await-using owes a tick (+5)
+- *(intl)* intl 0.6.0 — all nine list combinations, locale separators (+14)
+- *(gc)* collect during execution at bounded safepoints (+2)
+- *(intl)* CLDR units, calendar fields, hour cycle, locale negotiation (+41)
+- *(atomics)* real multi-agent execution — built-ins/Atomics is green (+21)
+- *(module)* real asynchronous module evaluation (+6)
+- *(intl)* legacy constructor mode, dayPeriod, era year, formatRange (+17)
+- *(web)* documentation and playground published to GitHub Pages
+
+### Fixed
+
+- *(lib)* restore rope's doc comment and alloc gate, fix interrupt intra-doc link
+- *(ci)* repair --all-features and no_std builds, refresh stale Intl/array expectations
+- *(class)* super resolves over the live prototype chain, not the AST
+- *(array,iterator)* 38 conformance bugs; Array.prototype.sort was O(n^2)
+- *(parser,expr)* 19 conformance bugs in strict/expressions/lexical areas
+- *(builtins)* ~25 conformance bugs across Symbol/Reflect/Date/JSON/BigInt
+- *(regex,string)* 31 conformance bugs; bound the start-filter scan
+- *(test262)* resolve harness includes in subdirectories
+- *(class)* a `using` in a static block never disposed
+- *(typed-array)* Object.seal on a non-empty typed array must throw
+- *(array)* flatMap iterated a snapshot; make staging measurable
+- *(rope)* remove a debug print left in `materialize`
+- *(lexer)* a regex may follow the `)` of a statement head
+- *(intl)* DateTimeFormat formatToParts was missing numbering-system digits
+- *(intl)* collation support is per-language, not a global name list
+- *(intl)* route NumberFormat formatRange through the crate's range support
+- *(intl)* sensitivity "case" is primary strength + case level
+- *(intl)* DisplayNames/supportedValuesOf agreement; -u-tz- alias names (+2)
+- *(regexp)* @@replace must carry WTF-8, and concatenate it canonically
+- *(parser)* carry program text as WTF-8 so lone surrogates survive (+9)
+- *(realm/temporal)* swap intrinsics on realm entry; Table 6 month-day (+17)
+- *(annexB)* per-realm RegExp brand check; B.3.5 for-in initializer (+7)
+- *(language)* const bindings, `of` lexing, import.meta, generator steps (+34)
+- *(parse)* longest *valid* prefix in parseFloat; ToInt32 radix in parseInt (+2)
+- *(web)* refresh the conformance figures and derive them all from the ledger
+- *(builtins)* RegExp RepeatMatcher, function metadata, realms, integrity (+31)
+- *(async)* PromiseResolve must observe `constructor`; async-generator ticks (+13)
+- *(scope)* Annex B.3.3 block-function hoisting is sloppy-only (+6)
+- *(lexer)* a class body's `}` ends a statement, so `/` after it is a regex (+4)
+- *(module)* evaluate a deferred import's async dependencies (+8)
+- *(intl)* apply the locale's collation tailoring
+- *(shape)* break the parent/transition reference cycle
+- *(array)* Array.fromAsync suspends at each Await (+4)
+- *(array)* Array.prototype is an Array exotic object (+4)
+- *(array)* ArraySetLength coercion order and [[Set]] result (+2)
+- *(engine)* honour replaced built-in prototype methods (+4)
+- *(array)* generic Array.prototype methods on typed arrays (+6)
+- *(ci)* drop --locked from the Pages build
+- *(nbvm)* sync KNOWN_GLOBALS with the installed global set (+ wasm32 support)
+
+### Other
+
+- *(for-of)* re-rooting the whole item list per iteration was O(n^2)
+- *(roadmap)* §3.14 `await using` disposal must suspend per resource
+- *(roadmap)* §5.1 record the constant-factor sweep and closure result
+- *(nbvm)* stop materializing fn name/length on every closure allocation
+- *(roadmap)* §5.0 string iterator drain fixed — it was a duplicate `next`
+- *(iterator)* the string iterator had a second, unfixed copy of `next`
+- *(roadmap)* array methods fixed; headline back in step with the ledger
+- *(array)* at/indexOf/lastIndexOf/push were O(n) per call
+- *(roadmap)* §5.0 array methods copy the whole array per call
+- *(roadmap)* §5.0 record the delete/iterator fixes and one open item
+- delete was O(n) per call; built-in iterators copied their buffer per step
+- *(roadmap)* §5.0 record the string cluster; name what is still unswept
+- *(string)* slice/substring/indexOf were O(n) per call
+- *(string)* rope-join `concat` and template literals
+- *(string)* O(1) indexed reads — ASCII fast path + in-place rope flattening
+- *(string)* every property access on a string materialized it
+- *(regex)* AdvanceStringIndex re-transcoded the subject on every call
+- *(roadmap)* §5.2 start filter now covers classes; §5.0 Map/Set is not quadratic
+- *(regex)* extend the start-of-match filter to character classes
+- *(test262)* record why each of the last three failures is not ours
+- *(roadmap)* refresh the headline from 287 ledgered failures to 11
+- *(web)* 99.98% — 51,878 of 51,890, 12 known failures
+- *(web)* 99.97% — 51,876 of 51,890, 14 known failures
+- *(roadmap)* §3.11 — @@replace closed, and the concatenation rule
+- *(web)* 99.96% — 51,871 of 51,890, 19 known failures
+- *(web)* 99.95% — 51,862 of 51,890, 28 known failures
+- *(deps)* intl 0.6.1 — minimumGroupingDigits (+6)
+- *(intl)* relative time is CLDR-backed; raise the harness idle bound
+- *(web)* 99.93% — 51,856 of 51,890, 34 known failures
+- *(web)* 99.91% — 51,842 of 51,890, 48 known failures
+- *(web)* 99.87% — 51,825 of 51,890, 65 known failures
+- *(web)* 99.86% — 51,818 of 51,890, 72 known failures
+- *(web)* 99.86% — 51,816 of 51,890, 74 known failures
+- *(web)* refresh the committed conformance figures
+- *(deps)* intl 0.5.3; fix our numbering-system probe (+10)
+- *(roadmap)* §3.7 records the global-object write-side design
+- *(roadmap)* §5.2 rewritten — regex algorithmic gaps are closed
+- *(regex)* reuse the matcher's working buffers across a scan
+- *(regex)* skip offsets that cannot start a match
+- *(regex)* memoize the subject; fix two nbvm correctness bugs found doing it
+- *(roadmap)* §5.2, the per-call regex subject buffer
+- *(regex)* stop rescanning every position for an anchored pattern
+- *(deps)* intl 0.5.1 -> 0.5.2
+- *(test262)* tell an aborted worker from a hung one; timeout back to 30s
+- *(test262)* raise the hang timeout from 20s to 90s
+
 ## [0.0.8](https://github.com/KarpelesLab/kataan/compare/v0.0.7...v0.0.8) - 2026-07-27
 
 ### Added
