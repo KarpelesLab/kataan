@@ -534,6 +534,22 @@ impl<'a> Interp<'a> {
         let cr_fn = self.new_named_native("createRealm", N_262_CREATE_REALM);
         self.realm
             .set_property(realm_obj, "createRealm", NanBox::handle(cr_fn.to_raw()));
+        // `.detachArrayBuffer(buffer)` — the detach hook is realm-independent
+        // (it clears the buffer's data block), so the same native serves the
+        // child realm.
+        let detach_fn = self.new_named_native("detachArrayBuffer", N_DETACH_ARRAY_BUFFER);
+        self.realm.set_property(
+            realm_obj,
+            "detachArrayBuffer",
+            NanBox::handle(detach_fn.to_raw()),
+        );
+        // Install the realm object as the *child* global's own `$262`, the way a
+        // Test262 host does: a test that reaches across realms
+        // (`otherGlobal.$262.detachArrayBuffer(buf)`) must find one there.
+        if let Some(gh) = new_global_this.as_handle().map(Handle::from_raw) {
+            self.realm
+                .set_property(gh, "$262", NanBox::handle(realm_obj.to_raw()));
+        }
         Ok(NanBox::handle(realm_obj.to_raw()))
     }
 

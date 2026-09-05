@@ -2109,6 +2109,10 @@ impl<'a> Interp<'a> {
                 } else {
                     self.coerce_to_object(items_box)
                 };
+                // `usingIterator` is read **once** (`GetMethod(items, @@iterator)`)
+                // and reused for `GetIteratorFromMethod` — re-reading it below
+                // would fire a Proxy `get` trap / accessor a second time.
+                let mut using_iterator = None;
                 let is_iterable = match items_box.as_handle().map(Handle::from_raw) {
                     Some(h) => {
                         // A user/inherited callable `@@iterator` (its getter fires,
@@ -2116,16 +2120,27 @@ impl<'a> Interp<'a> {
                         // iteration `iterate_values` handles directly without a
                         // readable `@@iterator` method (arrays, strings, Set/Map,
                         // generators).
-                        let has_iter = self
-                            .find_iterator_fn(h)?
-                            .filter(|f| {
-                                f.as_handle()
-                                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-                            })
-                            .is_some();
+                        // GetMethod: a *present* `@@iterator` that is neither
+                        // `undefined`/`null` (both filtered out by
+                        // `find_iterator_fn_recv`) nor callable is a TypeError —
+                        // it never silently falls back to the array-like path.
+                        let found = self.find_iterator_fn_recv(h, arg(0))?;
+                        if let Some(f) = found
+                            && !f
+                                .as_handle()
+                                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                        {
+                            return Err(self.type_error("items[Symbol.iterator] is not a function"));
+                        }
+                        using_iterator = found;
+                        let has_iter = using_iterator.is_some();
+                        // A String exposes a real, deletable
+                        // `String.prototype[@@iterator]`, so it must NOT be forced
+                        // down the iterator path here: with that method deleted a
+                        // string is a plain array-like and `Array.from("𝄞")`
+                        // yields the two lone surrogates, not one code point.
                         has_iter
                             || self.realm.is_array_like(h)
-                            || self.realm.is_string_handle(h)
                             || self.realm.collection_is_set(h).is_some()
                             || self.realm.get_property(h, GEN_BUF).is_some()
                     }
@@ -2166,7 +2181,23 @@ impl<'a> Interp<'a> {
                     // Iterate LAZILY, applying mapFn per element interleaved with
                     // IteratorStep, so an abrupt mapFn completion IteratorCloses the
                     // still-open iterator (a `next`/getter throw propagates directly).
-                    let it = self.get_iter_object(items_box)?;
+                    let it = match using_iterator {
+                        // GetIteratorFromMethod(items, usingIterator): the method is
+                        // called with the **original** `items` value as its `this`
+                        // (a primitive stays a primitive for a strict method).
+                        Some(f) => {
+                            let iterator = self.call_with_this(f, arg(0), &[])?;
+                            match iterator.as_handle().map(Handle::from_raw) {
+                                Some(ih) => ih,
+                                None => {
+                                    return Err(self
+                                        .type_error("[Symbol.iterator] did not return an object"));
+                                }
+                            }
+                        }
+                        // A built-in iterable with no readable `@@iterator`.
+                        None => self.get_iter_object(items_box)?,
+                    };
                     let next = self.read_member(it, "next")?;
                     let mut out = Vec::new();
                     let mut k = 0usize;
@@ -2198,8 +2229,10 @@ impl<'a> Interp<'a> {
                         k += 1;
                     }
                     if let Some(th) = target_h {
-                        let len_key = self.new_str("length");
-                        self.assign_member_value(th, len_key, NanBox::number(k as f64))?;
+                        // `Set(A, "length", k, true)` — the *throwing* form: a
+                        // read-only / getter-only / un-addable `length` on the
+                        // constructed target is a TypeError even in sloppy code.
+                        self.set_length_or_throw(th, k)?;
                         NanBox::handle(th.to_raw())
                     } else {
                         NanBox::handle(self.realm.new_array(out).to_raw())
@@ -2257,9 +2290,8 @@ impl<'a> Interp<'a> {
                         }
                     }
                     if let Some(th) = target_h {
-                        // `Set(A, "length", len, true)`.
-                        let len_key = self.new_str("length");
-                        self.assign_member_value(th, len_key, NanBox::number(final_len as f64))?;
+                        // `Set(A, "length", len, true)` — throwing form (see above).
+                        self.set_length_or_throw(th, final_len)?;
                         NanBox::handle(th.to_raw())
                     } else {
                         NanBox::handle(self.realm.new_array(out).to_raw())

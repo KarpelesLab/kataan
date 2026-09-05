@@ -234,6 +234,11 @@ pub struct Realm {
     /// `Object.getPrototypeOf(Symbol())` resolves to `Symbol.prototype`. Symbol
     /// primitives are immutable, so this is never overridden per-instance.
     symbol_proto_intrinsic: Option<Handle>,
+    /// `%String.prototype%` — the `[[Prototype]]` a String *primitive* cell
+    /// exposes, so an inherited property added to `String.prototype` is visible
+    /// through `"str".foo` (GetV boxes the primitive, but the engine reads the
+    /// primitive cell directly).
+    string_proto_intrinsic: Option<Handle>,
     /// The realm's `%BigInt.prototype%` intrinsic — the `[[Prototype]]` of
     /// every `Cell::BigInt` primitive (BigInt primitives are immutable).
     bigint_proto_intrinsic: Option<Handle>,
@@ -432,6 +437,8 @@ pub struct RealmIntrinsics {
     pub function_proto: Option<Handle>,
     /// `%Symbol.prototype%` — the `[[Prototype]]` of a `Symbol` primitive.
     pub symbol_proto: Option<Handle>,
+    /// `%String.prototype%` — the `[[Prototype]]` of a `String` primitive.
+    pub string_proto: Option<Handle>,
     /// `%BigInt.prototype%` — the `[[Prototype]]` of a `BigInt` primitive.
     pub bigint_proto: Option<Handle>,
     /// The shared abstract `%TypedArray%` intrinsic constructor.
@@ -505,6 +512,7 @@ impl Realm {
             array_proto_intrinsic: None,
             promise_proto_intrinsic: None,
             symbol_proto_intrinsic: None,
+            string_proto_intrinsic: None,
             bigint_proto_intrinsic: None,
             intl_protos: alloc::collections::BTreeMap::new(),
             host_persistent: Vec::new(),
@@ -607,6 +615,7 @@ impl Realm {
             promise_proto: self.promise_proto_intrinsic,
             function_proto: self.function_proto_intrinsic,
             symbol_proto: self.symbol_proto_intrinsic,
+            string_proto: self.string_proto_intrinsic,
             bigint_proto: self.bigint_proto_intrinsic,
             typed_array: self.typed_array_intrinsic,
             throw_type_error: self.throw_type_error_intrinsic,
@@ -621,6 +630,7 @@ impl Realm {
         self.promise_proto_intrinsic = s.promise_proto;
         self.function_proto_intrinsic = s.function_proto;
         self.symbol_proto_intrinsic = s.symbol_proto;
+        self.string_proto_intrinsic = s.string_proto;
         self.bigint_proto_intrinsic = s.bigint_proto;
         self.typed_array_intrinsic = s.typed_array;
         self.throw_type_error_intrinsic = s.throw_type_error;
@@ -630,6 +640,12 @@ impl Realm {
     /// for every `Cell::Symbol` primitive.
     pub fn set_symbol_proto_intrinsic(&mut self, handle: Handle) {
         self.symbol_proto_intrinsic = Some(handle);
+    }
+
+    /// Records the realm's `%String.prototype%` intrinsic — the `[[Prototype]]`
+    /// for every `Cell::Str` primitive.
+    pub fn set_string_proto_intrinsic(&mut self, handle: Handle) {
+        self.string_proto_intrinsic = Some(handle);
     }
 
     /// Records the realm's `%BigInt.prototype%` intrinsic — the `[[Prototype]]`
@@ -2536,6 +2552,14 @@ impl Realm {
         if matches!(self.heap.get(handle), Some(Cell::Symbol { .. })) {
             return self.symbol_proto_intrinsic;
         }
+        // A String primitive's `[[Prototype]]` is `%String.prototype%`, so a
+        // property the program adds there (`String.prototype.foo = …`, or an
+        // accessor installed with `Object.defineProperty`) resolves through
+        // `"s".foo` — `GetV` boxes the primitive, and the box's chain starts at
+        // `%String.prototype%`.
+        if self.is_string_handle(handle) {
+            return self.string_proto_intrinsic;
+        }
         // A BigInt primitive's `[[Prototype]]` is `%BigInt.prototype%` (so
         // `Object.prototype.toString.call(1n)` reads its `@@toStringTag` →
         // "BigInt", and `(1n).toString`/`valueOf` resolve).
@@ -3185,8 +3209,15 @@ impl Realm {
                     o.all_keys()
                         .iter()
                         .filter(|k| {
-                            k.parse::<usize>()
-                                .is_ok_and(|i| i >= len && alloc::format!("{i}") == **k)
+                            // Only *array index* properties (0 <= i < 2**32-1) are
+                            // swept by ArraySetLength. `"4294967295"` (2**32-1) and
+                            // `"4294967296"` are ordinary named properties that a
+                            // `length` shrink must leave untouched.
+                            k.parse::<usize>().is_ok_and(|i| {
+                                i >= len
+                                    && (i as u64) < u64::from(u32::MAX)
+                                    && alloc::format!("{i}") == **k
+                            })
                         })
                         .map(|s| alloc::string::String::from(*s))
                         .collect()

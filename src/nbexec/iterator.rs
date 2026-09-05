@@ -513,6 +513,16 @@ impl<'a> Interp<'a> {
         NanBox::handle(r.to_raw())
     }
 
+    /// Whether `h` carries the `[[UnderlyingIterator]]`-bearing internal state of
+    /// an Iterator Helper (a `map`/`filter`/`take`/`drop`/`flatMap` result, or an
+    /// `Iterator.zip`/`zipKeyed` result — both share `%IteratorHelperPrototype%`).
+    /// A helper already marked done keeps its brand.
+    fn is_iter_helper(&mut self, h: Handle) -> bool {
+        self.realm.get_property(h, HELPER_KIND).is_some()
+            || self.realm.get_property(h, ZIP_ITERS).is_some()
+            || self.realm.get_property(h, HELPER_DONE).is_some()
+    }
+
     /// `%IteratorHelperPrototype%.next` — advances a lazy helper one step,
     /// pulling from the underlying iterator on demand.
     pub(crate) fn iter_helper_next(&mut self, this: NanBox) -> Result<NanBox, ExecError> {
@@ -546,6 +556,12 @@ impl<'a> Interp<'a> {
         let Some(h) = this.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("Iterator Helper next called on non-object"));
         };
+        // GeneratorValidate / RequireInternalSlot: `%IteratorHelperPrototype%.next`
+        // is branded — calling it on anything that is not an Iterator Helper (a
+        // generator object, say) is a TypeError, never a silent forward.
+        if !self.is_iter_helper(h) {
+            return Err(self.type_error("next called on a non-Iterator-Helper object"));
+        }
         // A helper marked done returns `{ value: undefined, done: true }`.
         if self.realm.get_property(h, HELPER_DONE).is_some() {
             return Ok(self.iter_result(NanBox::undefined(), true));
@@ -669,7 +685,18 @@ impl<'a> Interp<'a> {
                             .realm
                             .get_property(h, HELPER_INNER_NEXT)
                             .unwrap_or(NanBox::undefined());
-                        match self.iter_step(inner, inner_next)? {
+                        // `IfAbruptCloseIterator(innerNext, iterated)`: anything the
+                        // inner step throws — a non-callable `next`, a throwing
+                        // `next`, or a throwing `done`/`value` getter on its result
+                        // — closes the **outer** iterator before propagating.
+                        let stepped = match self.iter_step(inner, inner_next) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _ = self.iterator_close(src_h);
+                                return Err(e);
+                            }
+                        };
+                        match stepped {
                             Some(v) => return Ok(Some(v)),
                             None => {
                                 self.realm.set_hidden_property(
@@ -687,7 +714,16 @@ impl<'a> Interp<'a> {
                             let c = self.helper_counter_incr(h);
                             let mapped = self.call_helper_cb(src_h, f, &[v, NanBox::number(c)])?;
                             let inner = self.get_iterator_flattenable(mapped, src_h)?;
-                            let inner_next = self.read_member(inner, "next")?;
+                            // `GetV(innerIterator, "next")` is part of
+                            // GetIteratorFlattenable — a throwing accessor there also
+                            // closes the outer iterator.
+                            let inner_next = match self.read_member(inner, "next") {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = self.iterator_close(src_h);
+                                    return Err(e);
+                                }
+                            };
                             self.realm.set_hidden_property(
                                 h,
                                 HELPER_INNER,
@@ -810,6 +846,11 @@ impl<'a> Interp<'a> {
 
     /// `%IteratorHelperPrototype%.return` — closes the helper (and its source).
     pub(crate) fn iter_helper_return(&mut self, this: NanBox) -> Result<NanBox, ExecError> {
+        // Branded like `next`: a non-Iterator-Helper receiver is a TypeError.
+        match this.as_handle().map(Handle::from_raw) {
+            Some(h) if self.is_iter_helper(h) => {}
+            _ => return Err(self.type_error("return called on a non-Iterator-Helper object")),
+        }
         if let Some(h) = this.as_handle().map(Handle::from_raw) {
             // Zip/zipKeyed results share this prototype — close all sub-iterators.
             if self.realm.get_property(h, ZIP_ITERS).is_some() {
@@ -959,18 +1000,51 @@ impl<'a> Interp<'a> {
             return Err(self.type_error("Iterator.from: not an iterator"));
         }
         let ih = iterator.as_handle().map(Handle::from_raw).unwrap();
-        // If the iterator already inherits `%IteratorPrototype%`, return it as-is.
-        if self.inherits_iterator_proto(ih) {
+        // `GetIteratorDirect(iterator)` — the tail of GetIteratorFlattenable —
+        // reads `next` **before** the `%Iterator%` brand check below, so a Proxy
+        // iterator observes `get next` then `getPrototypeOf` in that order (the
+        // value is discarded when the iterator is returned unwrapped).
+        let next = self.read_member(ih, "next")?;
+        // `OrdinaryHasInstance(%Iterator%, iterator)`: walk the `[[Prototype]]`
+        // chain through `get_proto_of`, so a Proxy's `getPrototypeOf` trap fires
+        // (bounded against a trap returning a cycle).
+        if self.iterator_proto_in_chain(ih)? {
             return Ok(iterator);
         }
-        self.wrap_iterator_value(iterator)
+        self.wrap_iterator_value(iterator, next)
+    }
+
+    /// `OrdinaryHasInstance(%Iterator%, h)`: whether `%Iterator.prototype%` is on
+    /// `h`'s `[[Prototype]]` chain, walked through the proxy-aware `get_proto_of`.
+    fn iterator_proto_in_chain(&mut self, h: Handle) -> Result<bool, ExecError> {
+        let Some(iter_proto) = self
+            .current
+            .get("Iterator")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw)
+        else {
+            return Ok(false);
+        };
+        let mut cur = h;
+        for _ in 0..100_000 {
+            let Some(p) = self.get_proto_of(cur)?.as_handle().map(Handle::from_raw) else {
+                return Ok(false);
+            };
+            if p == iter_proto {
+                return Ok(true);
+            }
+            cur = p;
+        }
+        Ok(false)
     }
 
     /// Wraps an iterator object in a fresh `%WrapForValidIterator%` whose
-    /// `next`/`return` forward to the wrapped iterator.
-    fn wrap_iterator_value(&mut self, iterator: NanBox) -> Result<NanBox, ExecError> {
-        let ih = iterator.as_handle().map(Handle::from_raw).unwrap();
-        let next = self.read_member(ih, "next")?;
+    /// `next`/`return` forward to the wrapped iterator. `next` is the already-read
+    /// `[[NextMethod]]` from GetIteratorDirect.
+    fn wrap_iterator_value(&mut self, iterator: NanBox, next: NanBox) -> Result<NanBox, ExecError> {
         let proto = self.iter_ctor_slot(ITER_WRAP_PROTO_SLOT);
         let h = self.realm.new_object_with_proto(proto);
         self.realm.set_hidden_property(h, HELPER_SOURCE, iterator);
@@ -1148,7 +1222,30 @@ impl<'a> Interp<'a> {
     /// into a fresh generator. Errors if `value` is not iterable.
     pub(crate) fn get_iter_object(&mut self, value: NanBox) -> Result<Handle, ExecError> {
         let Some(vh) = value.as_handle().map(Handle::from_raw) else {
-            return Err(self.type_error("value is not iterable"));
+            // A **primitive** (number/boolean) is still iterable when its wrapper
+            // prototype carries `@@iterator`: `GetMethod(V, @@iterator)` is
+            // `GetV(V, P)` = `ToObject(V).[[Get]](P, V)`, and the method is then
+            // called with the *primitive* as its `this` — so a strict
+            // `Number.prototype[@@iterator]` sees `typeof this === "number"`.
+            if matches!(value.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                return Err(self.type_error("value is not iterable"));
+            }
+            let boxed = self.coerce_to_object(value);
+            let Some(bh) = boxed.as_handle().map(Handle::from_raw) else {
+                return Err(self.type_error("value is not iterable"));
+            };
+            let f = self.find_iterator_fn_recv(bh, value)?.filter(|f| {
+                f.as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            });
+            let Some(fv) = f else {
+                return Err(self.type_error("value is not iterable"));
+            };
+            let it = self.call_with_this(fv, value, &[])?;
+            return match it.as_handle().map(Handle::from_raw) {
+                Some(ih) => Ok(ih),
+                None => Err(self.type_error("[Symbol.iterator] did not return an object")),
+            };
         };
         let iter_fn = self.find_iterator_fn(vh)?;
         if let Some(fv) = iter_fn
@@ -2311,10 +2408,11 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
-    /// `Set(A, "length", n, true)` for the `Array.fromAsync` result: the throwing
-    /// form of `[[Set]]`, so a non-writable `length` on a custom `this`-value's
-    /// instance rejects the promise with a `TypeError` regardless of strict mode.
-    fn set_length_or_throw(&mut self, th: Handle, len: usize) -> Result<(), ExecError> {
+    /// `Set(A, "length", n, true)` for an `Array.from`/`Array.fromAsync` result:
+    /// the *throwing* form of `[[Set]]`, so a non-writable / getter-only / absent
+    /// `length` on a custom `this`-value's instance is a `TypeError` regardless of
+    /// the strictness of the calling code.
+    pub(crate) fn set_length_or_throw(&mut self, th: Handle, len: usize) -> Result<(), ExecError> {
         let key = self.new_str("length");
         let saved = self.strict;
         self.strict = true;
@@ -2625,11 +2723,30 @@ impl<'a> Interp<'a> {
         &mut self,
         h: crate::heap::Handle,
     ) -> Result<Option<NanBox>, ExecError> {
+        self.find_iterator_fn_recv(h, NanBox::handle(h.to_raw()))
+    }
+
+    /// As [`Self::find_iterator_fn`], but performs the `[[Get]]` with an explicit
+    /// **receiver**. `GetMethod(V, @@iterator)` is `GetV(V, P)` =
+    /// `ToObject(V).[[Get]](P, V)`: when `V` is a primitive (a number/boolean
+    /// boxed into `h`), an inherited strict accessor must still see the *primitive*
+    /// as its `this`, not the throwaway wrapper.
+    pub(crate) fn find_iterator_fn_recv(
+        &mut self,
+        h: crate::heap::Handle,
+        receiver: NanBox,
+    ) -> Result<Option<NanBox>, ExecError> {
         let iter_sym = self.well_known_symbol("iterator");
         let iter_key = self.member_key(iter_sym);
-        // `read_member` walks the prototype chain (and fires inherited accessors),
-        // so an inherited `Symbol.iterator` resolves here.
-        let fn_val = self.read_member(h, &iter_key)?;
+        // Both walk the prototype chain (and fire inherited accessors), so an
+        // inherited `Symbol.iterator` resolves here. `read_member` is the ordinary
+        // path (it also covers the exotic String/primitive cells); the explicit
+        // receiver is only needed when it differs from the object being read.
+        let fn_val = if receiver.as_handle() == Some(h.to_raw()) {
+            self.read_member(h, &iter_key)?
+        } else {
+            self.get_with_receiver(h, &iter_key, receiver)?
+        };
         if !matches!(fn_val.unpack(), Unpacked::Undefined | Unpacked::Null) {
             return Ok(Some(fn_val));
         }

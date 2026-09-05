@@ -66,6 +66,10 @@ impl<'a> Interp<'a> {
         // empty array). `subarray` (builds a fresh view) is exempt. `toString` is
         // *not* exempt: it is `Array.prototype.toString`, which delegates to
         // `%TypedArray%.prototype.join`, so ValidateTypedArray applies to it too.
+        // `set` is exempt as well: 23.2.3.26 only does `RequireInternalSlot` up
+        // front, and the detached/out-of-bounds check happens *after*
+        // `ToIntegerOrInfinity(offset)` (so a throwing `offset.valueOf` wins) — the
+        // `set` arm itself re-validates at that point.
         //
         // This validation is specific to the *branded* `%TypedArray%.prototype`
         // entry points; a **generic** `Array.prototype.<m>.call(ta)` (the
@@ -74,7 +78,7 @@ impl<'a> Interp<'a> {
         if let Some(h) = recv.as_handle().map(Handle::from_raw)
             && !self.array_proto_generic
             && self.realm.typed_kind(h).is_some()
-            && !matches!(method, "subarray" | "constructor")
+            && !matches!(method, "subarray" | "set" | "constructor")
             && TYPED_ARRAY_PROTO_METHODS.iter().any(|(n, _)| *n == method)
             && self.typed_array_detached(h)
         {
@@ -89,7 +93,7 @@ impl<'a> Interp<'a> {
         if let Some(h) = recv.as_handle().map(Handle::from_raw)
             && !self.array_proto_generic
             && self.realm.typed_kind(h).is_some()
-            && !matches!(method, "subarray" | "constructor")
+            && !matches!(method, "subarray" | "set" | "constructor")
             && TYPED_ARRAY_PROTO_METHODS.iter().any(|(n, _)| *n == method)
             && self.realm.typed_array_out_of_bounds(h)
         {
@@ -1951,7 +1955,7 @@ impl<'a> Interp<'a> {
             let cb = arg(1);
             self.require_callable(cb, "Map.groupBy callback")?;
             let items = self.iterate_values(arg(0))?;
-            let map = self.realm.new_collection(false);
+            let map = self.new_collection_object(false);
             for (i, item) in items.iter().enumerate() {
                 let key = self.call(cb, &[*item, NanBox::number(i as f64)])?;
                 let bucket = match self
@@ -3052,6 +3056,25 @@ impl<'a> Interp<'a> {
         {
             return Ok(Some(self.array_map_filter_generic(method, handle, args)?));
         }
+        // `values`/`keys`/`entries` on a *generic* array-like receiver build a
+        // **live** `%ArrayIterator%` over the receiver, exactly as they do for a
+        // real array: `CreateArrayIterator` reads nothing at call time, and each
+        // `next()` does `Get(O, "length")` then `Get(O, k)`. Materializing the
+        // array-like up front (a `HasProperty` + `Get` per index) is observable
+        // through a Proxy receiver, and reads `length` only once.
+        if self.realm.is_generic_array_like_target(handle)
+            && matches!(method, "values" | "keys" | "entries")
+            && (array_proto_generic || self.inherits_array_proto(handle))
+            && !self.inherits_iterator_proto(handle)
+            && self.realm.typed_kind(handle).is_none()
+        {
+            let kind = match method {
+                "keys" => 0,
+                "entries" => 2,
+                _ => 1,
+            };
+            return Ok(Some(self.make_live_array_iterator(handle, kind)));
+        }
         let mut array_like = None;
         if self.realm.is_generic_array_like_target(handle)
             && ARRAY_LIKE_METHODS.contains(&method)
@@ -3113,6 +3136,16 @@ impl<'a> Interp<'a> {
             // whose ToLength is 2^53-1) cannot be materialized/allocated — throw a
             // catchable RangeError rather than silently skipping (and never attempt
             // a multi-gigabyte allocation).
+            //
+            // `map` performs `ArraySpeciesCreate(O, len)` *before* touching any
+            // element, so a user `@@species` constructor observes the full
+            // `LengthOfArrayLike` — and may throw — ahead of the engine's own cap.
+            // Run it first so that ordering is preserved (the default species then
+            // raises the very same "Invalid array length" RangeError from
+            // `ArrayCreate`).
+            if len_f > self.realm.limits.max_array_len as f64 && method == "map" {
+                self.array_species_create(handle, len_f as usize)?;
+            }
             if len_f > self.realm.limits.max_array_len as f64 {
                 let m = self.new_str("Invalid array length");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
@@ -3129,6 +3162,27 @@ impl<'a> Interp<'a> {
                         .and_then(|p| p.as_handle())
                         .map(Handle::from_raw)
                         .is_some_and(|p| self.realm.is_string_handle(p));
+                // Only the built-ins whose spec algorithm actually performs
+                // `HasProperty(O, k)` may probe the receiver that way. `join`,
+                // `at`, `includes`, `find`/`findIndex`/`findLast`/`findLastIndex`,
+                // `toLocaleString` and the ES2023 copies (`with`, `toReversed`,
+                // `toSorted`, `toSpliced`) read every index with a plain `[[Get]]`
+                // — a Proxy receiver must not see a `has` trap for them.
+                let uses_has_property = matches!(
+                    method,
+                    "map"
+                        | "filter"
+                        | "forEach"
+                        | "some"
+                        | "every"
+                        | "reduce"
+                        | "reduceRight"
+                        | "indexOf"
+                        | "lastIndexOf"
+                        | "slice"
+                        | "flat"
+                        | "flatMap"
+                );
                 let mut tmp = Vec::with_capacity(len);
                 let mut present = Vec::with_capacity(len);
                 for i in 0..len {
@@ -3136,7 +3190,8 @@ impl<'a> Interp<'a> {
                     // HasProperty(O, idx) — a hole (absent index) is skipped by the
                     // iteration methods; Get(O, idx) walks the prototype chain and
                     // invokes getters only for a present index.
-                    let here = is_string_like || self.has_property(handle, &key);
+                    let here =
+                        is_string_like || !uses_has_property || self.has_property(handle, &key);
                     present.push(here);
                     tmp.push(if here {
                         self.read_member(handle, &key)?
@@ -3308,6 +3363,33 @@ impl<'a> Interp<'a> {
                     // A fill onto a view over an immutable buffer is a TypeError,
                     // verified before any argument coercion runs.
                     self.guard_view_immutable(handle)?;
+                    // A *generic* `Array.prototype.fill.call(ta)` is the ordinary
+                    // array-like algorithm: it never pre-coerces `value`, and every
+                    // `Set(O, k, value, true)` runs the integer-indexed `[[Set]]`,
+                    // which does its own ToNumber/ToBigInt — so an object value's
+                    // `valueOf` fires once *per index*, not once for the whole fill.
+                    if array_proto_generic {
+                        let start = self.typed_clamp_index_checked(arg(1), 0, tlen)?;
+                        let end = self.typed_clamp_index_checked(arg(2), tlen, tlen)?;
+                        for i in start..end {
+                            // The integer-indexed `[[Set]]` coerces per write:
+                            // ToBigInt for a BigInt view, ToNumber otherwise (both
+                            // run user `valueOf`/`@@toPrimitive` code).
+                            let v = if self.realm.typed_kind(handle).is_some_and(is_bigint_kind) {
+                                self.coerce_typed_array_write(handle, arg(0))?
+                            } else {
+                                self.coerce_to_number(arg(0))?
+                            };
+                            // A coercion may have detached or shrunk the buffer; a
+                            // `Set` to an index that is now out of bounds is a
+                            // silent no-op on the generic path.
+                            let live = self.realm.typed_len(handle).unwrap_or(0);
+                            if i < live {
+                                self.realm.typed_fill_range(handle, v, i, i + 1);
+                            }
+                        }
+                        return Ok(Some(NanBox::handle(handle.to_raw())));
+                    }
                     // For a non-BigInt view a Number fill still goes through
                     // ToNumber (a Symbol value throws); `coerce_typed_array_write`
                     // handles the BigInt case. Coerce the value to a Number for a
@@ -3889,6 +3971,14 @@ impl<'a> Interp<'a> {
                     if new_len != len && self.realm.array_length_is_readonly(handle) {
                         return Err(length_readonly_throw(self));
                     }
+                    // Every element move splice performs is `Set(O, k, v, true)` or
+                    // `DeletePropertyOrThrow(O, k)`. On a frozen array those indices
+                    // are non-writable and non-configurable, so the first one throws
+                    // — before anything is moved.
+                    if (delete > 0 || insert_count > 0) && self.realm.is_frozen(handle) {
+                        let m = self.new_str("Cannot assign to read only property '0'");
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
                     let mut next: Vec<NanBox> = elems[..start].to_vec();
                     next.extend_from_slice(&args[2.min(args.len())..]);
                     next.extend_from_slice(&elems[start + delete..]);
@@ -3989,7 +4079,10 @@ impl<'a> Interp<'a> {
                             // completions (a throwing override) propagate.
                             let boxed = self.coerce_to_object(e);
                             let bh = boxed.as_handle().map(Handle::from_raw).unwrap();
-                            let m = self.read_member(bh, "toLocaleString")?;
+                            // `GetV(element, "toLocaleString")` keeps the *primitive*
+                            // as the [[Get]] receiver, so a strict accessor on
+                            // `Number.prototype` sees `typeof this === "number"`.
+                            let m = self.get_with_receiver(bh, "toLocaleString", e)?;
                             let r = self.call_with_this(m, e, &[arg(0), arg(1)])?;
                             parts.push(self.coerce_to_string(r)?);
                         }
@@ -4018,20 +4111,19 @@ impl<'a> Interp<'a> {
                             // observing a strict `this` sees `"number"`/`"boolean"`,
                             // not the wrapper).
                             _ => {
-                                let h = match e.as_handle().map(Handle::from_raw) {
-                                    Some(h)
-                                        if self.realm.object_keys(h).is_some()
-                                            || self.realm.is_array(h)
-                                            || self.realm.typed_kind(h).is_some() =>
-                                    {
-                                        h
-                                    }
-                                    _ => {
+                                // `GetV(element, P)` = `ToObject(element).[[Get]](P,
+                                // element)`: the receiver stays the *primitive*, so a
+                                // strict accessor installed on `String.prototype` /
+                                // `Number.prototype` sees `typeof this === "string"` /
+                                // `"number"` rather than the throwaway wrapper.
+                                let m = match e.as_handle().map(Handle::from_raw) {
+                                    Some(h) => self.read_member(h, "toLocaleString")?,
+                                    None => {
                                         let boxed = self.coerce_to_object(e);
-                                        boxed.as_handle().map(Handle::from_raw).unwrap()
+                                        let bh = boxed.as_handle().map(Handle::from_raw).unwrap();
+                                        self.get_with_receiver(bh, "toLocaleString", e)?
                                     }
                                 };
-                                let m = self.read_member(h, "toLocaleString")?;
                                 let r = self.call_with_this(m, e, &[arg(0), arg(1)])?;
                                 self.coerce_to_string(r)?
                             }
@@ -4281,6 +4373,25 @@ impl<'a> Interp<'a> {
                         return Ok(Some(NanBox::number(-1.0)));
                     }
                     let from = self.array_from_index_checked(arg(1), elems.len())?;
+                    // The `fromIndex` coercion can run user code that mutates the
+                    // receiver — deleting elements, truncating `length`, swapping the
+                    // prototype. The spec scans live from there: `HasProperty(O, k)`
+                    // (which walks the prototype chain once the own index is gone),
+                    // then `Get(O, k)`. `len` stays the value read before the
+                    // coercion. Only a non-simple `fromIndex` can run that code, so
+                    // the dense snapshot below remains the fast path.
+                    if receiver_is_real_array && !simple_pos(arg(1)) {
+                        for i in from..elems.len() {
+                            let key = alloc::format!("{i}");
+                            if self.has_property(handle, &key) {
+                                let e = self.read_member(handle, &key)?;
+                                if self.realm.strict_equals(e, target) {
+                                    return Ok(Some(NanBox::number(i as f64)));
+                                }
+                            }
+                        }
+                        return Ok(Some(NanBox::number(-1.0)));
+                    }
                     let mut idx = -1.0;
                     for (i, e) in elems.iter().enumerate().skip(from) {
                         // `indexOf` skips holes (HasProperty is false).
@@ -4792,9 +4903,22 @@ impl<'a> Interp<'a> {
                         }
                     };
                     for i in start..end {
-                        // `set_element_coerced` applies typed-array coercion + buffer
-                        // write-through (a plain `set_element` for an ordinary array).
-                        self.set_element_coerced(handle, i, value);
+                        // `Set(O, k, value, true)`: an index carrying a non-default
+                        // attribute (a frozen array's non-writable elements) or an
+                        // accessor must be honoured, and a failed write is a
+                        // TypeError. The plain dense store is the fast path.
+                        if self.realm.typed_kind(handle).is_none()
+                            && self.realm.array_index_has_override(handle, i)
+                        {
+                            let key = alloc::format!("{i}");
+                            let kb = self.new_str(&key);
+                            self.set_or_throw(handle, kb, &key, value)?;
+                        } else {
+                            // `set_element_coerced` applies typed-array coercion +
+                            // buffer write-through (a plain `set_element` for an
+                            // ordinary array).
+                            self.set_element_coerced(handle, i, value);
+                        }
                     }
                     return Ok(Some(NanBox::handle(handle.to_raw())));
                 }
@@ -5025,6 +5149,21 @@ impl<'a> Interp<'a> {
                         && (self.typed_array_detached(handle)
                             || self.realm.typed_array_out_of_bounds(handle))
                     {
+                        return Ok(Some(NanBox::number(-1.0)));
+                    }
+                    // As for `indexOf`: a non-simple `fromIndex` may have mutated
+                    // the receiver during its coercion, so scan live with
+                    // `HasProperty` + `Get` descending from `from`.
+                    if !typed && receiver_is_real_array && args.len() >= 2 && !simple_pos(arg(1)) {
+                        for i in (0..=from).rev() {
+                            let key = alloc::format!("{i}");
+                            if self.has_property(handle, &key) {
+                                let e = self.read_member(handle, &key)?;
+                                if self.realm.strict_equals(e, target) {
+                                    return Ok(Some(NanBox::number(i as f64)));
+                                }
+                            }
+                        }
                         return Ok(Some(NanBox::number(-1.0)));
                     }
                     // A sparse array (logical length beyond the dense store) is walked
@@ -5272,7 +5411,13 @@ impl<'a> Interp<'a> {
                     // *not* be blitted back into the store.
                     let precise_len =
                         if array_proto_generic && self.realm.typed_kind(handle).is_some() {
-                            Some(elems.len())
+                            // The generic algorithm's `len` is
+                            // `LengthOfArrayLike(O)` = `ToLength(Get(O, "length"))`,
+                            // so an own `length` defined on the view
+                            // (`defineProperty(ta, "length", {value: 2})`) bounds the
+                            // sort — it is not the view's element count. Clamp to the
+                            // element count so the write-back stays in range.
+                            Some(self.array_like_length(handle)?.min(elems.len()))
                         } else if !numeric
                             && let Some(len) = self.realm.array_length(handle)
                             && (self.realm.array_has_index_overrides(handle)
@@ -6645,21 +6790,6 @@ impl<'a> Interp<'a> {
         Ok((ih, next))
     }
 
-    fn set_record_keys(&mut self, obj: Handle, keys: NanBox) -> Result<Vec<NanBox>, ExecError> {
-        let (ih, next) = self.open_set_keys(obj, keys)?;
-        let mut out = Vec::new();
-        while let Some(v) = self.iter_step(ih, next)? {
-            // CanonicalizeKeyedCollectionKey: `-0` is stored/compared as `+0`.
-            let v = if v.as_number() == Some(0.0) {
-                NanBox::number(0.0)
-            } else {
-                v
-            };
-            out.push(v);
-        }
-        Ok(out)
-    }
-
     /// `String.prototype.{match,matchAll,search,replace,replaceAll,split}` delegate
     /// to a `searchValue`/`separator` object's `@@match`/`@@replace`/… method when
     /// present: `Return ? Call(replacer, searchValue, « O, replaceValue »)`. `o` is
@@ -6775,8 +6905,11 @@ impl<'a> Interp<'a> {
             let r = this.call_with_this(has, NanBox::handle(obj.to_raw()), &[v])?;
             Ok(this.realm.truthy(r))
         };
-        let in_mine =
-            |this: &Self, v: NanBox| mine.iter().any(|m| this.realm.same_value_zero(*m, v));
+        // `SetDataHas(O.[[SetData]], v)` — tested against the **live** receiver, not
+        // the `mine` snapshot: the argument's `keys` iterator (or a `value` getter on
+        // its results) may add to / delete from `this` between steps, and
+        // `isSupersetOf`/`isDisjointFrom` must see those changes.
+        let in_mine = |this: &mut Self, v: NanBox| this.realm.collection_has(handle, v);
 
         match method {
             "isSubsetOf" => {
@@ -6848,25 +6981,53 @@ impl<'a> Interp<'a> {
                 Ok(NanBox::boolean(true))
             }
             "union" => {
-                let result = self.realm.new_collection(true);
-                for m in &mine {
-                    self.realm.collection_set(result, *m, *m);
+                // 24.2.4.22 steps 4-5: `GetKeysIterator(otherRec)` — which calls
+                // `keys()` and reads its `next` — runs **before** `resultSetData` is
+                // copied from `O.[[SetData]]`. A `keys()` / `get next` that mutates
+                // the receiver is therefore reflected in the copy.
+                let (ih, next) = self.open_set_keys(obj, keys)?;
+                let result = self.new_collection_object(true);
+                for (m, _) in self.realm.collection_entries(handle).unwrap_or_default() {
+                    self.realm.collection_set(result, m, m);
                 }
-                for k in self.set_record_keys(obj, keys)? {
+                while let Some(k) = self.iter_step(ih, next)? {
+                    // CanonicalizeKeyedCollectionKey: `-0` is stored as `+0`.
+                    let k = if k.as_number() == Some(0.0) {
+                        NanBox::number(0.0)
+                    } else {
+                        k
+                    };
                     self.realm.collection_set(result, k, k);
                 }
                 Ok(NanBox::handle(result.to_raw()))
             }
             "intersection" => {
-                let result = self.realm.new_collection(true);
+                let result = self.new_collection_object(true);
                 if my_size <= other_size {
-                    for m in &mine {
-                        if other_has(self, *m)? {
-                            self.realm.collection_set(result, *m, *m);
+                    // 24.2.4.9 step 4: walk `O.[[SetData]]` LIVE by index. A
+                    // `has` that deletes and re-adds an element moves it to the
+                    // end of the set data, so the index walk visits it a second
+                    // time (and `thisSize` is re-read each step) — a snapshot of
+                    // `this` would miss that. `resultSetData` dedupes.
+                    let mut last = None;
+                    while let Some((e, idx)) = self.collection_live_step(handle, last) {
+                        last = Some((e, idx));
+                        if other_has(self, e)? {
+                            self.realm.collection_set(result, e, e);
                         }
                     }
                 } else {
-                    for k in self.set_record_keys(obj, keys)? {
+                    // 24.2.4.9 step 5: the argument's keys are consumed one at a
+                    // time and each is tested against the **live** `O.[[SetData]]`
+                    // (the iterator may mutate `this` between steps), then appended
+                    // to `resultSetData` if absent from it.
+                    let (ih, next) = self.open_set_keys(obj, keys)?;
+                    while let Some(k) = self.iter_step(ih, next)? {
+                        let k = if k.as_number() == Some(0.0) {
+                            NanBox::number(0.0)
+                        } else {
+                            k
+                        };
                         if in_mine(self, k) {
                             self.realm.collection_set(result, k, k);
                         }
@@ -6875,21 +7036,35 @@ impl<'a> Interp<'a> {
                 Ok(NanBox::handle(result.to_raw()))
             }
             "difference" => {
-                let result = self.realm.new_collection(true);
+                // 24.2.4.5 step 2: `resultSetData` is a copy of `O.[[SetData]]`
+                // taken before anything else runs; every membership test below is
+                // against that **copy**, never against the live receiver.
+                let result = self.new_collection_object(true);
                 for m in &mine {
                     self.realm.collection_set(result, *m, *m);
                 }
                 if my_size <= other_size {
+                    // Step 4 walks `O.[[SetData]]` by index. The snapshot taken at
+                    // entry is used rather than a live cursor: a `has` that calls
+                    // `this.clear()` starts a *fresh* backing store, and the walk
+                    // must still visit the original members (never the ones added
+                    // afterwards) — which is what every other engine does too.
                     for m in &mine {
                         if other_has(self, *m)? {
                             self.realm.collection_delete(result, *m);
                         }
                     }
                 } else {
-                    for k in self.set_record_keys(obj, keys)? {
-                        if in_mine(self, k) {
-                            self.realm.collection_delete(result, k);
-                        }
+                    // Step 5: consume the argument's keys one at a time, removing
+                    // each from the copy.
+                    let (ih, next) = self.open_set_keys(obj, keys)?;
+                    while let Some(k) = self.iter_step(ih, next)? {
+                        let k = if k.as_number() == Some(0.0) {
+                            NanBox::number(0.0)
+                        } else {
+                            k
+                        };
+                        self.realm.collection_delete(result, k);
                     }
                 }
                 Ok(NanBox::handle(result.to_raw()))
@@ -6899,11 +7074,18 @@ impl<'a> Interp<'a> {
             // `this` (which the argument's `keys` iterator may mutate), per
             // ECMA-262 24.2.4.19 — not against the `resultSetData` copy.
             _ => {
-                let result = self.realm.new_collection(true);
-                for m in &mine {
-                    self.realm.collection_set(result, *m, *m);
+                // As for `union`, the keys iterator is opened before the copy.
+                let (ih, next) = self.open_set_keys(obj, keys)?;
+                let result = self.new_collection_object(true);
+                for (m, _) in self.realm.collection_entries(handle).unwrap_or_default() {
+                    self.realm.collection_set(result, m, m);
                 }
-                for k in self.set_record_keys(obj, keys)? {
+                while let Some(k) = self.iter_step(ih, next)? {
+                    let k = if k.as_number() == Some(0.0) {
+                        NanBox::number(0.0)
+                    } else {
+                        k
+                    };
                     let in_o = self.realm.collection_has(handle, k);
                     let in_result = self.realm.collection_has(result, k);
                     if in_o {

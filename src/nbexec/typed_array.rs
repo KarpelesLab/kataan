@@ -147,21 +147,36 @@ impl<'a> Interp<'a> {
         // undefined/null → array-like path; a present non-callable is a TypeError.
         let iter_sym = self.well_known_symbol("iterator");
         let iter_key = self.member_key(iter_sym);
-        let using_iterator = match source.as_handle().map(Handle::from_raw) {
-            Some(sh) => {
-                let m = self.read_member(sh, &iter_key)?;
-                if matches!(m.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                    None
-                } else if !m
-                    .as_handle()
-                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-                {
-                    return Err(self.type_error("source is not iterable"));
-                } else {
-                    Some(m)
+        let raw_method = match source.as_handle().map(Handle::from_raw) {
+            Some(sh) => self.read_member(sh, &iter_key)?,
+            None => {
+                // `GetMethod(source, @@iterator)` is `GetV(source, P)` =
+                // `ToObject(source).[[Get]](P, source)`: `undefined`/`null` cannot
+                // be ToObject'd, so `%TypedArray%.from()` is a TypeError rather
+                // than an empty result. Any other primitive boxes, with the
+                // primitive kept as the `[[Get]]` receiver.
+                if matches!(source.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    return Err(
+                        self.type_error("TypedArray.from source cannot be null or undefined")
+                    );
+                }
+                let boxed = self.coerce_to_object(source);
+                match boxed.as_handle().map(Handle::from_raw) {
+                    Some(bh) => self.get_with_receiver(bh, &iter_key, source)?,
+                    None => NanBox::undefined(),
                 }
             }
-            None => None,
+        };
+        let using_iterator = if matches!(raw_method.unpack(), Unpacked::Undefined | Unpacked::Null)
+        {
+            None
+        } else if !raw_method
+            .as_handle()
+            .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+        {
+            return Err(self.type_error("source is not iterable"));
+        } else {
+            Some(raw_method)
         };
         let target = if let Some(method) = using_iterator {
             // Steps 5.a–5.c: drain the iterator to a list first, then
@@ -314,12 +329,6 @@ impl<'a> Interp<'a> {
             return Err(self.type_error("constructor property is not an object"));
         }
         let ch = ctor.as_handle().map(Handle::from_raw).unwrap();
-        // Default concrete TypedArray constructor → fast path.
-        if self.realm.native_at(ch).is_some_and(|id| {
-            (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16).contains(&id)
-        }) {
-            return Ok(None);
-        }
         let species_sym = self.well_known_symbol("species");
         let species_key = self.member_key(species_sym);
         let species = self.read_member(ch, &species_key)?;
@@ -328,6 +337,17 @@ impl<'a> Interp<'a> {
         }
         if !self.is_constructor_value(species) {
             return Err(self.type_error("Symbol.species is not a constructor"));
+        }
+        // The species resolved back to the receiver's **own** default constructor:
+        // `Construct` would rebuild exactly the view the caller builds directly, so
+        // take the fast path. A *different* concrete TypedArray constructor
+        // (`int8.constructor = Uint16Array`) must NOT short-circuit — the result has
+        // that constructor's element type, not the receiver's.
+        let own_kind = self.realm.typed_kind(recv).unwrap_or(0);
+        if species.as_handle().map(Handle::from_raw).is_some_and(|sh| {
+            self.realm.native_at(sh) == Some(N_TYPED_ARRAY_BASE + u16::from(own_kind))
+        }) {
+            return Ok(None);
         }
         // Per 23.2.3.30 step 15: when O's [[ArrayLength]] is *auto* (a
         // length-tracking view) and `end` is undefined, the argument list is

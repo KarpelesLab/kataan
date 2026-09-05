@@ -424,13 +424,14 @@ impl<'a> Interp<'a> {
                         self.type_error("proxy getPrototypeOf trap must return an object or null")
                     );
                 }
-                // Invariant (10.5.1 step 9): a non-extensible target must report its
-                // actual [[Prototype]].
-                if !self.realm.is_extensible(target) {
-                    let actual = self
-                        .realm
-                        .object_proto(target)
-                        .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw()));
+                // Invariant (10.5.1 steps 9-11): a non-extensible target must report
+                // its actual [[Prototype]]. Both `IsExtensible(target)` and
+                // `target.[[GetPrototypeOf]]()` are the *internal methods* — a target
+                // that is itself a Proxy runs its own traps (reading the raw cell
+                // would report every proxy as non-extensible with a null prototype).
+                let ext = self.is_extensible_of(target)?;
+                if !self.realm.truthy(ext) {
+                    let actual = self.get_proto_of(target)?;
                     if !self.realm.strict_equals(r, actual) {
                         return Err(self.type_error(
                             "proxy 'getPrototypeOf' returned a different prototype for a non-extensible target",
@@ -2935,6 +2936,26 @@ impl<'a> Interp<'a> {
         // non-configurable own data property (`new String("hi").length = 700`
         // fails; `Reflect.set` reports `false`).
         if key == "length" && self.realm.string_object_len(handle).is_some() {
+            return false;
+        }
+        // A typed array's `length` is an accessor on `%TypedArray%.prototype` with
+        // no setter — an integer-indexed exotic object has no own `length` — so
+        // `Set(ta, "length", v, true)` always fails (a strict assignment throws, a
+        // sloppy one is dropped). The engine materializes a `length` slot on the
+        // view for fast reads, which would otherwise read as a writable data
+        // property.
+        if key == "length" && self.realm.typed_kind(handle).is_some() {
+            return false;
+        }
+        // A *frozen* array's indices are non-writable data properties, but they
+        // live in the dense element store rather than the property table, so the
+        // `get_property` probe below never sees them — `arr[0] = v` on
+        // `Object.freeze([...])` would report the write as permitted (it is then
+        // silently dropped downstream, so strict mode never threw).
+        if let Ok(i) = key.parse::<usize>()
+            && self.realm.is_frozen(handle)
+            && self.realm.array_length(handle).is_some_and(|n| i < n)
+        {
             return false;
         }
         let add_to_non_extensible =

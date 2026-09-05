@@ -2916,8 +2916,17 @@ impl<'a> Interp<'a> {
         if let Some((scope, param)) = self.arg_map_binding(handle, &name) {
             scope.set(&param, new);
         }
-        // A typed array's `length` is fixed (non-writable): ignore the assignment.
+        // A typed array's `length` is an accessor on `%TypedArray%.prototype` with
+        // no setter (an integer-indexed exotic object has no own `length`), so
+        // `[[Set]]` reports failure: strict code throws, sloppy code drops the
+        // write. The view's stored length is never changed either way.
         if name == "length" && self.realm.typed_len(handle).is_some() {
+            if self.strict {
+                let m = self.new_str(
+                    "Cannot assign to read only property 'length' (accessor has no setter)",
+                );
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
             return Ok(());
         }
         // `regex.lastIndex = n` updates the RegExp's stateful search position

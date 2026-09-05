@@ -4851,6 +4851,10 @@ impl<'a> Interp<'a> {
             self.realm
                 .set_property(str_proto, &iter_key, NanBox::handle(str_iter.to_raw()));
             self.realm.mark_hidden(str_proto, &iter_key);
+            // Register as the intrinsic `[[Prototype]]` of String primitives, so a
+            // user-added `String.prototype` property/accessor is reachable from a
+            // primitive receiver (`"s".foo`).
+            self.realm.set_string_proto_intrinsic(str_proto);
         }
         self.setup_first_class_prototype_id("Number", NUMBER_PROTO_METHODS, N_NUMBER_PROTO_FN);
         // `Number.prototype.toString ( [ radix ] )` has `length` 1 (the generic

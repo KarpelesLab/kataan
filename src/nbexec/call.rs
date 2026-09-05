@@ -22,6 +22,10 @@ impl<'a> Interp<'a> {
             || self.realm.host_fn_at(handle).is_some()
             || self.realm.function_at(handle).is_some()
             || self.realm.bound_native_at(handle).is_some()
+            // A class constructor has a `[[Call]]` (it throws "cannot be invoked
+            // without 'new'"), so `IsCallable` is true for it — `typeof C` is
+            // "function" and `[].sort(class {})` must not be rejected up front.
+            || self.realm.class_at(handle).is_some()
             // `%Function.prototype%` is itself a callable function object (its
             // `[[Call]]` returns `undefined`), even though it is an ordinary
             // object cell rather than a native.
@@ -2533,6 +2537,21 @@ impl<'a> Interp<'a> {
 
     /// The intrinsic `.prototype` object handle for a constructor bound at the
     /// given global `name` (e.g. `"Map"` → `Map.prototype`).
+    /// A fresh `Map`/`Set` cell whose `[[Prototype]]` is the realm's
+    /// `%Map.prototype%` / `%Set.prototype%`. `Realm::new_collection` alone leaves
+    /// the cell proto-less (`Object.getPrototypeOf` on it reads `null`), so every
+    /// engine-built collection — `Set.prototype.union`/`intersection`/`difference`/
+    /// `symmetricDifference`, `Map.groupBy` — must link the prototype the way the
+    /// `Map`/`Set` constructor does. Per spec these results are always plain
+    /// `%Set.prototype%`-based objects (no `@@species`, no subclass).
+    pub(crate) fn new_collection_object(&mut self, is_set: bool) -> Handle {
+        let handle = self.realm.new_collection(is_set);
+        if let Some(proto) = self.intrinsic_proto(if is_set { "Set" } else { "Map" }) {
+            self.realm.set_native_proto(handle, proto);
+        }
+        handle
+    }
+
     pub(crate) fn intrinsic_proto(&mut self, name: &str) -> Option<Handle> {
         self.current
             .get(name)
@@ -4435,58 +4454,128 @@ impl<'a> Interp<'a> {
             .into_iter()
             .filter(|e| !matches!(e.unpack(), Unpacked::Undefined))
             .collect();
-        for i in 1..elems.len() {
-            let mut j = i;
-            while j > 0 {
-                let order = if has_cmp {
-                    // `v = ? ToNumber(? Call(comparefn, …))`: the comparator result is
-                    // ToNumber-coerced *invoking `@@toPrimitive`/`valueOf`* (whose side
-                    // effects and abrupt completion are observable), not read with the
-                    // infallible `to_number` (which would yield `NaN` for an object
-                    // without running user code).
-                    let r = self.call(cmp, &[elems[j - 1], elems[j]])?;
-                    let n = self.coerce_to_number(r)?;
-                    self.realm.to_number(n)
-                } else if numeric {
-                    // A typed array's default comparison is numeric ascending (with
-                    // `NaN` sorting to the end).
-                    let a = self.realm.to_number(elems[j - 1]);
-                    let b = self.realm.to_number(elems[j]);
-                    if a < b || b.is_nan() {
-                        -1.0
-                    } else if a > b || a.is_nan() {
-                        1.0
-                    } else if a == 0.0 && b == 0.0 && a.is_sign_negative() != b.is_sign_negative() {
-                        // `CompareTypedArrayElements`: -0 sorts before +0.
-                        if a.is_sign_negative() { -1.0 } else { 1.0 }
-                    } else {
-                        0.0
-                    }
-                } else {
-                    // The default comparator orders by `ToString` of each element
-                    // (which invokes a user `toString`/`valueOf`, so abrupt
-                    // completions propagate), compared by code units.
-                    let a = self.coerce_to_string(elems[j - 1])?;
-                    let b = self.coerce_to_string(elems[j])?;
-                    if a < b {
-                        -1.0
-                    } else if a > b {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                };
-                if order > 0.0 {
-                    elems.swap(j - 1, j);
-                    j -= 1;
-                } else {
-                    break;
-                }
-            }
-        }
+        // A **stable merge sort**. The spec requires SortCompare to be applied
+        // stably; a plain insertion sort satisfies that but is O(n^2), and that
+        // cost is real: sorting a 262 144-element `Uint16Array` took 23 s against
+        // node's 1 ms. Merge sort keeps the stability and makes it O(n log n),
+        // with short runs still finished by insertion sort (fewer comparator
+        // calls, and each one may re-enter the interpreter).
+        let n = elems.len();
+        let mut scratch = alloc::vec![NanBox::undefined(); n];
+        self.sort_run(&mut elems, &mut scratch, cmp, has_cmp, numeric)?;
         // Re-append the `undefined` holes after the ordered defined values.
         elems.extend(core::iter::repeat_n(NanBox::undefined(), undefined_count));
         Ok(elems)
+    }
+
+    /// One `SortCompare(x, y)` step: the user comparator (its result ToNumber'd
+    /// through `@@toPrimitive`/`valueOf`, so side effects and abrupt completions
+    /// are observable), the typed-array numeric order, or the default
+    /// ToString/code-unit order. A `NaN` comparator result is normalized to `+0`
+    /// (spec: "If v is NaN, return +0"), so the pair keeps its relative order.
+    fn sort_compare(
+        &mut self,
+        x: NanBox,
+        y: NanBox,
+        cmp: NanBox,
+        has_cmp: bool,
+        numeric: bool,
+    ) -> Result<f64, ExecError> {
+        let order = if has_cmp {
+            let r = self.call(cmp, &[x, y])?;
+            let n = self.coerce_to_number(r)?;
+            self.realm.to_number(n)
+        } else if numeric {
+            // A typed array's default comparison is numeric ascending (with
+            // `NaN` sorting to the end).
+            let a = self.realm.to_number(x);
+            let b = self.realm.to_number(y);
+            if a < b || b.is_nan() {
+                -1.0
+            } else if a > b || a.is_nan() {
+                1.0
+            } else if a == 0.0 && b == 0.0 && a.is_sign_negative() != b.is_sign_negative() {
+                // `CompareTypedArrayElements`: -0 sorts before +0.
+                if a.is_sign_negative() { -1.0 } else { 1.0 }
+            } else {
+                0.0
+            }
+        } else {
+            // The default comparator orders by `ToString` of each element
+            // (which invokes a user `toString`/`valueOf`, so abrupt
+            // completions propagate), compared by code units.
+            let a = self.coerce_to_string(x)?;
+            let b = self.coerce_to_string(y)?;
+            if a < b {
+                -1.0
+            } else if a > b {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        Ok(if order.is_nan() { 0.0 } else { order })
+    }
+
+    /// Stable merge sort of `v` using `buf` (same length) as scratch. Short runs
+    /// use insertion sort; the merge takes from the left half on ties, which is
+    /// what makes the whole sort stable.
+    fn sort_run(
+        &mut self,
+        v: &mut [NanBox],
+        buf: &mut [NanBox],
+        cmp: NanBox,
+        has_cmp: bool,
+        numeric: bool,
+    ) -> Result<(), ExecError> {
+        let n = v.len();
+        if n <= 1 {
+            return Ok(());
+        }
+        if n <= 16 {
+            for i in 1..n {
+                let mut j = i;
+                while j > 0 {
+                    if self.sort_compare(v[j - 1], v[j], cmp, has_cmp, numeric)? > 0.0 {
+                        v.swap(j - 1, j);
+                        j -= 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let mid = n / 2;
+        {
+            let (left, right) = v.split_at_mut(mid);
+            let (bl, br) = buf.split_at_mut(mid);
+            self.sort_run(left, bl, cmp, has_cmp, numeric)?;
+            self.sort_run(right, br, cmp, has_cmp, numeric)?;
+        }
+        let (mut i, mut j, mut k) = (0usize, mid, 0usize);
+        while i < mid && j < n {
+            if self.sort_compare(v[i], v[j], cmp, has_cmp, numeric)? <= 0.0 {
+                buf[k] = v[i];
+                i += 1;
+            } else {
+                buf[k] = v[j];
+                j += 1;
+            }
+            k += 1;
+        }
+        while i < mid {
+            buf[k] = v[i];
+            i += 1;
+            k += 1;
+        }
+        while j < n {
+            buf[k] = v[j];
+            j += 1;
+            k += 1;
+        }
+        v.copy_from_slice(&buf[..n]);
+        Ok(())
     }
 }
 
