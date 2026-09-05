@@ -1148,12 +1148,17 @@ impl<'a> Interp<'a> {
         // body the fence is closed, so the copy is skipped entirely.
         let mut gc_vals: Vec<NanBox> = Vec::new();
         if self.gc_can_collect() {
-            gc_vals.reserve(items.len() + 2);
+            gc_vals.reserve(items.len() + 1);
             gc_vals.extend_from_slice(&items);
             gc_vals.extend(enum_obj);
-            gc_vals.push(v);
         }
         let gc_mark = self.gc_root(&gc_vals);
+        // The completion value is the only root that changes per iteration, so it
+        // gets its own one-slot mark *after* the item list. Re-publishing the whole
+        // list each time (truncate + extend of n entries) made every `for-of` over a
+        // materialized iterable O(n^2): 80 000 characters took 688 ms against 36 ms
+        // for 20 000. The items never change, so they are published once.
+        let v_mark = self.gc_root(&[v]);
         let r = (|| {
             for item in items {
                 // `for-in`: skip a key whose property has been deleted since the key
@@ -1194,12 +1199,7 @@ impl<'a> Interp<'a> {
                 let r = self.dispose_block_scope(r);
                 self.current = saved;
                 match loop_step(r?, &label, &mut v) {
-                    LoopAction::Next => {
-                        if let Some(slot) = gc_vals.last_mut() {
-                            *slot = v;
-                        }
-                        self.gc_reroot(gc_mark, &gc_vals);
-                    }
+                    LoopAction::Next => self.gc_reroot(v_mark, &[v]),
                     LoopAction::Stop => break,
                     LoopAction::Propagate(f) => return Ok(f),
                 }
