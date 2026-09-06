@@ -2929,7 +2929,14 @@ impl<'a> Interp<'a> {
         // accessor setter (e.g. `Object.prototype.__proto__`) runs with `this` =
         // the proxy, and a nested proxy target re-enters its own trap. A `false`
         // result is a failed [[Set]]: strict code throws, sloppy code is silent.
-        if self.realm.proxy_at(handle).is_some() {
+        // A private element is the exception: PrivateSet never performs `[[Set]]`,
+        // so a proxy is transparent to it and the element lives on the proxy
+        // object itself, where the field initializer stamped it. Forwarding it to
+        // the target would also hand the write to a *different* object, which a
+        // frozen target then refuses.
+        if self.realm.proxy_at(handle).is_some()
+            && !crate::realm::is_private_key(&self.member_key(key))
+        {
             let name = self.member_key(key);
             let recv = NanBox::handle(handle.to_raw());
             let ok = self.proxy_set_bool(handle, &name, new, recv)?;
@@ -3578,7 +3585,11 @@ impl<'a> Interp<'a> {
         // preserves the Receiver (so an inherited accessor getter runs with `this`
         // = the proxy). Routed through `get_with_receiver` with Receiver = the
         // proxy itself.
-        if self.realm.proxy_at(handle).is_some() {
+        // A private element is the exception, symmetrically with PrivateSet:
+        // PrivateGet never performs `[[Get]]`, so the element is read off the
+        // proxy object itself rather than forwarded to the target (which does not
+        // have it — the field initializer stamped the proxy).
+        if self.realm.proxy_at(handle).is_some() && !crate::realm::is_private_key(name) {
             return self.get_with_receiver(handle, name, NanBox::handle(handle.to_raw()));
         }
         // An error object's `.constructor` is its specific error global — its

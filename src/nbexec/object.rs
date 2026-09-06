@@ -2942,7 +2942,12 @@ impl<'a> Interp<'a> {
         // and reads as non-extensible — so it would wrongly reject every write
         // (e.g. `Object.assign(new Proxy({},{}), {x:1})`). Delegate straight to
         // `[[Set]]`, which enforces the real invariants.
-        if self.realm.proxy_at(target).is_some() {
+        // A private element is the exception: PrivateSet never performs `[[Set]]`,
+        // so a proxy is transparent to it and the element lives on the proxy
+        // object itself, where the field initializer stamped it. Routing it
+        // through the trapless forward would hand the write to the *target* — and
+        // a frozen target then refuses it.
+        if self.realm.proxy_at(target).is_some() && !crate::realm::is_private_key(key_name) {
             return self.assign_member_value(target, key_box, value);
         }
         // An own accessor takes precedence: its setter runs (and a frozen object's
