@@ -1426,29 +1426,91 @@ impl Realm {
     /// the generic path) if either is not a view, the kinds differ, or the copy
     /// would not fit. `offset + src.len() <= dst.len()` must already hold.
     pub fn typed_set_same_kind(&mut self, dst: Handle, src: Handle, offset: usize) -> bool {
+        let Some(slen) = self
+            .heap
+            .get(src)
+            .and_then(Cell::as_typed_array)
+            .map(|t| t.2)
+        else {
+            return false;
+        };
+        // `SetTypedArrayFromTypedArray` *clones* the source buffer when the two
+        // views share one, so an overlapping `set` behaves as a move.
+        self.typed_copy_same_kind_impl(dst, offset, src, 0, slen, true)
+    }
+
+    /// Copies `count` elements from `src[src_index..]` into `dst[dst_index..]` at
+    /// the **byte** level, when both views have the same element kind. This is the
+    /// spec's "the transfer must be performed in a manner that preserves the
+    /// bit-level encoding of the source data" rule (`%TypedArray%.prototype.slice`
+    /// and `.set` with a same-type source): a `decode → NanBox → encode` round-trip
+    /// would canonicalize a NaN's payload, which is observable through an aliasing
+    /// integer view. Returns `false` (caller falls back to the element-wise path)
+    /// if either handle is not a view, the kinds differ, or the ranges do not fit.
+    ///
+    /// Overlap inside one buffer follows `slice`'s spec loop — a **forward,
+    /// byte-by-byte** copy, which smears the source when the destination starts
+    /// later (a species constructor handing back a view over the same buffer at a
+    /// higher offset is exactly that case) rather than behaving as a `memmove`.
+    pub fn typed_copy_same_kind(
+        &mut self,
+        dst: Handle,
+        dst_index: usize,
+        src: Handle,
+        src_index: usize,
+        count: usize,
+    ) -> bool {
+        self.typed_copy_same_kind_impl(dst, dst_index, src, src_index, count, false)
+    }
+
+    /// Shared body of [`Self::typed_copy_same_kind`] and
+    /// [`Self::typed_set_same_kind`]. `memmove` selects the overlap rule for a
+    /// shared backing buffer: `true` moves the range (the source is conceptually
+    /// cloned first), `false` copies byte-by-byte forward.
+    fn typed_copy_same_kind_impl(
+        &mut self,
+        dst: Handle,
+        dst_index: usize,
+        src: Handle,
+        src_index: usize,
+        count: usize,
+        memmove: bool,
+    ) -> bool {
         let (Some((dbuf, doff, dlen, dkind)), Some((sbuf, soff, slen, skind))) = (
             self.heap.get(dst).and_then(Cell::as_typed_array),
             self.heap.get(src).and_then(Cell::as_typed_array),
         ) else {
             return false;
         };
-        if dkind != skind || offset.checked_add(slen).is_none_or(|e| e > dlen) {
+        if dkind != skind
+            || dst_index.checked_add(count).is_none_or(|e| e > dlen)
+            || src_index.checked_add(count).is_none_or(|e| e > slen)
+        {
             return false;
         }
         let size = typed_elem_size(dkind);
         let (Some(dst_byte), Some(src_byte), Some(byte_count)) = (
-            doff.checked_add(offset * size),
-            Some(soff),
-            slen.checked_mul(size),
+            dst_index
+                .checked_mul(size)
+                .and_then(|o| doff.checked_add(o)),
+            src_index
+                .checked_mul(size)
+                .and_then(|o| soff.checked_add(o)),
+            count.checked_mul(size),
         ) else {
             return false;
         };
         if dbuf == sbuf {
-            // Same backing buffer: overlap-safe move within one byte slice.
             if let Some(bytes) = self.bytes_at_mut(dbuf) {
                 let hi = src_byte.max(dst_byte) + byte_count;
                 if hi <= bytes.len() {
-                    bytes.copy_within(src_byte..src_byte + byte_count, dst_byte);
+                    if memmove {
+                        bytes.copy_within(src_byte..src_byte + byte_count, dst_byte);
+                    } else {
+                        for i in 0..byte_count {
+                            bytes[dst_byte + i] = bytes[src_byte + i];
+                        }
+                    }
                 }
             }
             return true;
@@ -5874,28 +5936,106 @@ pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// Parses an ISO-8601 date/time string (`YYYY-MM-DD`, optionally
-/// `THH:MM[:SS[.sss]]` and a trailing `Z`) into milliseconds since the epoch.
-/// Returns `None` for anything it cannot parse (the caller yields `NaN`).
-#[must_use]
-pub fn parse_iso_date(s: &str) -> Option<f64> {
-    let s = s.trim();
-    let (date, time) = match s.split_once('T') {
-        Some((d, t)) => (d, Some(t)),
-        None => (s, None),
+/// A run of exactly `n` ASCII digits, as an integer. `None` if the field has a
+/// different length or holds a non-digit (so `"1e2"`/`"+1"`/`""` never sneak
+/// through `str::parse`).
+fn fixed_digits(s: &str, n: usize) -> Option<i64> {
+    if s.len() != n || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// A date/time field of `n` digits (strict, the ECMAScript Date Time String
+/// Format) or of `1..=n` digits (lenient, the non-ISO forms below).
+fn field_digits(s: &str, n: usize, strict: bool) -> Option<i64> {
+    if strict {
+        return fixed_digits(s, n);
+    }
+    if s.is_empty() || s.len() > n || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// Splits a trailing timezone designator off a time component, returning the
+/// remaining `HH:MM…` text and the offset in minutes east of UTC.
+///
+/// Strict (ECMAScript Date Time String Format) accepts only `Z`, `±HH:MM` and
+/// the widely-supported `±HHMM`; the lenient non-ISO form additionally accepts a
+/// one- or two-digit hour-only offset (`-07`, `+7`) and `±H:MM`.
+fn split_time_offset(t: &str, strict: bool) -> Option<(&str, i64)> {
+    if let Some(rest) = t.strip_suffix('Z') {
+        return Some((rest, 0));
+    }
+    if !strict && let Some(rest) = t.strip_suffix('z') {
+        return Some((rest, 0));
+    }
+    // The sign must not be the first character of the time component (a leading
+    // `+`/`-` there is malformed, not an offset). `char_indices` yields valid
+    // char-boundary byte indices, so the slices below never split a multi-byte
+    // sequence on untrusted input.
+    let Some(pos) = t
+        .char_indices()
+        .find(|&(i, c)| i > 0 && (c == '+' || c == '-'))
+        .map(|(i, _)| i)
+    else {
+        return Some((t, 0));
     };
-    // An expanded year has a leading sign (`+YYYYYY` / `-YYYYYY`); preserve it so
-    // the year split below doesn't treat a leading `-` as an empty field.
-    let (year_sign, date_body): (i64, &str) = if let Some(rest) = date.strip_prefix('-') {
-        (-1, rest)
-    } else if let Some(rest) = date.strip_prefix('+') {
-        (1, rest)
+    let off = &t[pos..];
+    let sign: i64 = if off.starts_with('-') { -1 } else { 1 };
+    // The sign is a single ASCII byte, so `off[1..]` is a valid boundary.
+    let body = &off[1..];
+    let (oh, om): (i64, i64) = match body.split_once(':') {
+        Some((a, b)) => (field_digits(a, 2, strict)?, fixed_digits(b, 2)?),
+        // `HHMM` with no separator.
+        None if body.len() == 4 => (fixed_digits(&body[..2], 2)?, fixed_digits(&body[2..], 2)?),
+        // Hour-only (`-07`): non-ISO only.
+        None if !strict => (field_digits(body, 2, false)?, 0),
+        None => return None,
+    };
+    if oh > 23 || om > 59 {
+        return None;
+    }
+    Some((&t[..pos], sign * (oh * 60 + om)))
+}
+
+/// Parses one date string, either as the strict ECMAScript **Date Time String
+/// Format** (`±YYYYYY`/`YYYY`, `-MM`, `-DD`, `THH:MM[:SS[.sss]]`, `Z`/`±HH:MM`)
+/// or — when `strict` is false — as the implementation-defined non-ISO variant
+/// every major engine also accepts: the `T` is written as a space and the month,
+/// day, hour, minute and second fields may be one *or* two digits, so
+/// `"1997-3-8 1:1:1"` parses while `"1997-3-8T1:1:1"` (which claims to be ISO)
+/// does not.
+fn parse_date_time_string(s: &str, strict: bool) -> Option<f64> {
+    let (date, time) = if strict {
+        match s.split_once('T') {
+            Some((d, t)) => (d, Some(t)),
+            None => (s, None),
+        }
     } else {
-        (1, date)
+        // The non-ISO form is space-separated; a `T` here means the author asked
+        // for the ISO grammar, which the strict pass already rejected.
+        if s.contains('T') {
+            return None;
+        }
+        match s.split_once(' ') {
+            Some((d, t)) => (d, Some(t)),
+            None => (s, None),
+        }
     };
+    // An expanded year has a leading sign and exactly six digits
+    // (`+YYYYYY` / `-YYYYYY`); otherwise the year is exactly four digits.
+    let (year_sign, date_body, year_len): (i64, &str, usize) =
+        if let Some(rest) = date.strip_prefix('-') {
+            (-1, rest, 6)
+        } else if let Some(rest) = date.strip_prefix('+') {
+            (1, rest, 6)
+        } else {
+            (1, date, 4)
+        };
     let mut dp = date_body.split('-');
-    let year_field = dp.next()?;
-    let y_mag: i64 = year_field.parse::<i64>().ok()?;
+    let y_mag = fixed_digits(dp.next()?, year_len)?;
     // `-000000` (negative zero as an expanded year) is invalid per spec.
     if year_sign < 0 && y_mag == 0 {
         return None;
@@ -5903,77 +6043,79 @@ pub fn parse_iso_date(s: &str) -> Option<f64> {
     let y: i64 = year_sign * y_mag;
     // Month and day are optional: `YYYY` and `YYYY-MM` are valid ISO date forms
     // (defaulting the omitted fields to 1), per Date Time String Format.
-    let mo: u32 = match dp.next() {
-        Some(m) => m.parse().ok()?,
+    let mo = match dp.next() {
+        Some(m) => field_digits(m, 2, strict)?,
         None => 1,
     };
-    let d: u32 = match dp.next() {
-        Some(day) => day.parse().ok()?,
+    let d = match dp.next() {
+        Some(day) => field_digits(day, 2, strict)?,
         None => 1,
     };
     if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || dp.next().is_some() {
         return None;
     }
-    let mut ms: i64 = days_from_civil(y, mo, d) * 86_400_000;
+    let mut ms: i64 = days_from_civil(y, mo as u32, d as u32) * 86_400_000;
     if let Some(t) = time {
-        // A trailing timezone designator: `Z` (UTC), or a numeric `+HH:MM` / `-HH:MM`
-        // offset. The offset is subtracted to convert the wall-clock time to UTC. With no
-        // designator the time is taken as UTC (this engine has no local timezone).
-        let (t, offset_min): (&str, i64) = if let Some(rest) = t.strip_suffix('Z') {
-            (rest, 0)
-        } else if let Some(pos) = t
-            .char_indices()
-            // The sign must not be the first character of the time component (a
-            // leading `+`/`-` there is malformed, not an offset). `char_indices`
-            // yields valid char-boundary byte indices, so the slices below never
-            // split a multi-byte sequence on untrusted input.
-            .find(|&(i, c)| i > 0 && (c == '+' || c == '-'))
-            .map(|(i, _)| i)
-        {
-            let off = &t[pos..];
-            let sign: i64 = if off.starts_with('-') { -1 } else { 1 };
-            // The sign is a single ASCII byte, so `off[1..]` is a valid boundary.
-            let body = &off[1..];
-            let (oh, om): (i64, i64) = match body.split_once(':') {
-                Some((a, b)) => (a.parse().ok()?, b.parse().ok()?),
-                // `HHMM` with no separator: split after two ASCII digits. A
-                // non-ASCII body fails the digit check and yields `None` (NaN)
-                // rather than panicking on a char-boundary slice.
-                None if body.len() == 4 && body.is_char_boundary(2) => {
-                    (body[..2].parse().ok()?, body[2..].parse().ok()?)
-                }
-                None => (body.parse().ok()?, 0),
-            };
-            (&t[..pos], sign * (oh * 60 + om))
-        } else {
-            (t, 0)
-        };
+        // A trailing timezone designator converts the wall-clock time to UTC. With
+        // no designator the time is taken as UTC (this engine has no local
+        // timezone).
+        let (t, offset_min) = split_time_offset(t, strict)?;
         let (hms, frac) = match t.split_once('.') {
             Some((a, b)) => (a, Some(b)),
             None => (t, None),
         };
         let mut tp = hms.split(':');
-        let h: i64 = tp.next()?.parse().ok()?;
-        let mi: i64 = tp.next().unwrap_or("0").parse().ok()?;
-        let sec: i64 = tp.next().unwrap_or("0").parse().ok()?;
-        ms += h * 3_600_000 + mi * 60_000 + sec * 1000;
-        if let Some(f) = frac {
-            let digits: alloc::string::String = f.chars().take(3).collect();
-            // Pad to exactly three digits (milliseconds).
-            let padded = alloc::format!("{digits:0<3}");
-            ms += padded.parse::<i64>().ok()?;
+        // Hours *and* minutes are both required — `"1997-03-08T11"` is not a
+        // valid time component in either grammar.
+        let h = field_digits(tp.next()?, 2, strict)?;
+        let mi = field_digits(tp.next()?, 2, strict)?;
+        let sec = match tp.next() {
+            Some(x) => field_digits(x, 2, strict)?,
+            // A fractional part only follows a seconds field.
+            None if frac.is_some() => return None,
+            None => 0,
+        };
+        if tp.next().is_some() {
+            return None;
         }
+        let mut milli = 0;
+        if let Some(f) = frac {
+            if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            // Truncate to milliseconds, padding a short fraction on the right.
+            let digits: alloc::string::String = f.chars().take(3).collect();
+            milli = alloc::format!("{digits:0<3}").parse::<i64>().ok()?;
+        }
+        // `24:00:00.000` is the one hour-24 time the grammar allows.
+        if mi > 59 || sec > 59 || h > 24 || (h == 24 && (mi | sec | milli) != 0) {
+            return None;
+        }
+        ms += h * 3_600_000 + mi * 60_000 + sec * 1000 + milli;
         ms -= offset_min * 60_000;
     }
     Some(ms as f64)
 }
 
+/// Parses an ECMAScript Date Time String Format string (`YYYY-MM-DD`, optionally
+/// `THH:MM[:SS[.sss]]` and a `Z`/`±HH:MM` designator) into milliseconds since the
+/// epoch. Returns `None` for anything it cannot parse (the caller yields `NaN`).
+#[must_use]
+pub fn parse_iso_date(s: &str) -> Option<f64> {
+    parse_date_time_string(s.trim(), true)
+}
+
 /// Parses a date string for `Date.parse`/`new Date(string)`: the ISO-8601 form
-/// first, then the implementation-defined human-readable forms this engine emits
-/// (`toString` and `toUTCString`, both UTC). Returns `None` on failure.
+/// first, then the space-separated non-ISO form other engines accept, then the
+/// implementation-defined human-readable forms this engine emits (`toString` and
+/// `toUTCString`, both UTC). Returns `None` on failure.
 #[must_use]
 pub fn parse_date_string(s: &str) -> Option<f64> {
-    if let Some(ms) = parse_iso_date(s) {
+    let s = s.trim();
+    if let Some(ms) = parse_date_time_string(s, true) {
+        return Some(ms);
+    }
+    if let Some(ms) = parse_date_time_string(s, false) {
         return Some(ms);
     }
     parse_human_date(s)
@@ -6085,21 +6227,39 @@ fn is_identifier_name(s: &str) -> bool {
     chars.all(|c| c == '$' || c == '_' || c.is_alphanumeric())
 }
 
+/// Whether `s` is the bracketed form a symbol-keyed method's `name` takes
+/// (`"[Symbol.split]"`, `"[foo]"`): a `ComputedPropertyName` in the
+/// `NativeFunction` grammar, which the `PropertyName` production allows verbatim
+/// between the `function` keyword and the parameter list. The interior must be
+/// non-empty and bracket-free so the rendered text stays unambiguous.
+fn is_bracketed_property_name(s: &str) -> bool {
+    let Some(inner) = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')) else {
+        return false;
+    };
+    !inner.is_empty() && !inner.contains('[') && !inner.contains(']')
+}
+
+/// Whether `s` may stand alone as the `PropertyName` of a `NativeFunction`.
+fn is_native_name_segment(s: &str) -> bool {
+    is_identifier_name(s) || is_bracketed_property_name(s)
+}
+
 /// The `name` segment to emit inside `function <seg>() { [native code] }` for a
 /// function whose engine `name` is given (the engine retains no source text).
 /// Returns the name — optionally keeping a `get `/`set ` accessor prefix — only
-/// when it is a valid `IdentifierName`; otherwise the empty string, so the
-/// synthesized `toString` is always valid `NativeFunction` syntax (a
-/// private-method name like `#f`, a bracketed symbol name, or one with
-/// punctuation cannot appear as an identifier there).
+/// when it is a valid `PropertyName` (an `IdentifierName`, or the bracketed
+/// `[Symbol.split]` form a well-known-symbol-keyed built-in carries); otherwise
+/// the empty string, so the synthesized `toString` is always valid
+/// `NativeFunction` syntax (a private-method name like `#f`, or one with
+/// punctuation, cannot appear there).
 pub(crate) fn native_fn_name_segment(name: &str) -> &str {
-    if is_identifier_name(name) {
+    if is_native_name_segment(name) {
         return name;
     }
     if let Some(rest) = name
         .strip_prefix("get ")
         .or_else(|| name.strip_prefix("set "))
-        && is_identifier_name(rest)
+        && is_native_name_segment(rest)
     {
         return name;
     }

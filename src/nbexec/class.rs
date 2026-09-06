@@ -831,6 +831,19 @@ impl<'a> Interp<'a> {
         let mut chain: Vec<(u32, Scope)> = Vec::new();
         let mut cur = Some((class_id, env.clone()));
         while let Some((cid, cenv)) = cur {
+            // A heritage expression is re-evaluated here, so a class whose
+            // `extends` binding was *reassigned to the class itself* (the classic
+            // `C = class extends C {}` chain builder) resolves to its own class
+            // again and the walk would never terminate — a hang, or a native stack
+            // overflow in the walks further down. Reaching the same
+            // `(class, captured scope)` pair twice is exactly that cycle: report it
+            // as a catchable TypeError instead.
+            if chain
+                .iter()
+                .any(|(pid, penv)| *pid == cid && penv.ptr_eq(&cenv))
+            {
+                return Err(self.type_error("Cyclic class extends chain"));
+            }
             chain.push((cid, cenv.clone()));
             cur = self.resolve_super(self.classes[cid as usize], &cenv)?;
         }

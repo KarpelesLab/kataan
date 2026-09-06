@@ -301,14 +301,48 @@ impl<'a> Interp<'a> {
         Ok(None)
     }
 
+    /// A `TypeError` for a branded built-in accessor (`get DataView.prototype.buffer`,
+    /// `get %TypedArray%.prototype.length`, …) read off a receiver that lacks the
+    /// matching internal slot. The accessor is inherited, so `GetFunctionRealm` of
+    /// its getter — not the running realm — supplies the `%TypeError%`: a receiver
+    /// whose `[[Prototype]]` is *another realm's* view must throw that realm's
+    /// `TypeError`, exactly as calling the getter function directly would.
+    fn branded_accessor_type_error(
+        &mut self,
+        handle: Handle,
+        brand: &str,
+        name: &str,
+        msg: &str,
+    ) -> ExecError {
+        let getter = self
+            .brand_owner_on_chain(handle, brand)
+            .and_then(|owner| self.realm.accessor(owner, name))
+            .and_then(|(g, _)| g.as_handle())
+            .map(Handle::from_raw);
+        let saved = self.cur_realm;
+        if let Some(g) = getter {
+            self.cur_realm = self.get_function_realm(g);
+        }
+        let e = self.type_error(msg);
+        self.cur_realm = saved;
+        e
+    }
+
     /// Whether `v` is an object (a non-primitive heap value: object/array/function/…)
     /// rather than a string/symbol/bigint primitive or an immediate.
     pub(crate) fn is_object_value(&self, v: NanBox) -> bool {
-        v.as_handle().map(Handle::from_raw).is_some_and(|h| {
-            !self.realm.is_string_handle(h)
-                && self.realm.symbol_at(h).is_none()
-                && self.realm.bigint_at(h).is_none()
-        })
+        self.as_object_handle(v).is_some()
+    }
+
+    /// `v` as an **object** handle. Unlike a bare `as_handle`, this rejects the
+    /// heap-backed *primitives* (string, symbol, BigInt), so a spec step phrased
+    /// "if Type(x) is not Object, throw a TypeError" can be written directly.
+    pub(crate) fn as_object_handle(&self, v: NanBox) -> Option<Handle> {
+        let h = v.as_handle().map(Handle::from_raw)?;
+        (!self.realm.is_string_handle(h)
+            && self.realm.symbol_at(h).is_none()
+            && self.realm.bigint_at(h).is_none())
+        .then_some(h)
     }
 
     /// Builds a tagged template's argument list `[stringsObject, ...substitutions]`.
@@ -3910,16 +3944,23 @@ impl<'a> Interp<'a> {
             )
             && self.brand_on_chain(handle, ARRAY_BUFFER_PROTO_BRAND)
         {
-            return Err(self
-                .type_error("ArrayBuffer.prototype accessor called on a non-ArrayBuffer object"));
+            return Err(self.branded_accessor_type_error(
+                handle,
+                ARRAY_BUFFER_PROTO_BRAND,
+                name,
+                "ArrayBuffer.prototype accessor called on a non-ArrayBuffer object",
+            ));
         }
         if self.realm.get_property(handle, DATA_VIEW_BUF).is_none()
             && matches!(name, "buffer" | "byteLength" | "byteOffset")
             && self.brand_on_chain(handle, DATA_VIEW_PROTO_BRAND)
         {
-            return Err(
-                self.type_error("DataView.prototype accessor called on a non-DataView object")
-            );
+            return Err(self.branded_accessor_type_error(
+                handle,
+                DATA_VIEW_PROTO_BRAND,
+                name,
+                "DataView.prototype accessor called on a non-DataView object",
+            ));
         }
         if self.realm.typed_kind(handle).is_none()
             && matches!(name, "buffer" | "byteLength" | "byteOffset" | "length")
@@ -3933,9 +3974,12 @@ impl<'a> Interp<'a> {
                     || self.realm.string_object_len(handle).is_some()))
             && self.brand_on_chain(handle, TYPED_ARRAY_PROTO_BRAND)
         {
-            return Err(
-                self.type_error("TypedArray.prototype accessor called on a non-TypedArray object")
-            );
+            return Err(self.branded_accessor_type_error(
+                handle,
+                TYPED_ARRAY_PROTO_BRAND,
+                name,
+                "TypedArray.prototype accessor called on a non-TypedArray object",
+            ));
         }
         // `ArrayBuffer.prototype` methods (`slice`/`resize`/`transfer`/
         // `transferToFixedLength`) are installed as real first-class own properties on

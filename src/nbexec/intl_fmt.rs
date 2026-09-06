@@ -5212,7 +5212,7 @@ impl<'a> Interp<'a> {
             loop {
                 let next_fn = self.read_member(ih, "next")?;
                 let res = self.call_with_this(next_fn, NanBox::handle(ih.to_raw()), &[])?;
-                let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+                let Some(rh) = self.as_object_handle(res) else {
                     return Err(self.type_error("iterator result is not an object"));
                 };
                 let done = self.read_member(rh, "done")?;

@@ -4682,6 +4682,13 @@ impl<'a> Interp<'a> {
                         // TypedArraySpeciesCreate(O, «count») runs first (it may itself
                         // read a custom constructor that detaches the source).
                         let dest = self.typed_species_create(handle, count)?;
+                        // TypedArrayCreateFromConstructor(…, ~write~) validates the
+                        // result with `ValidateTypedArray(…, write)`: a species
+                        // constructor handing back a view over an *immutable* buffer
+                        // is a TypeError here, before any element is copied (the
+                        // byte-level copy below never goes through the per-element
+                        // write that would otherwise have raised it).
+                        self.guard_view_immutable(dest)?;
                         // Spec: if count > 0, re-check the source — a start/end valueOf
                         // or the species constructor may have detached / shrunk it; that
                         // is a TypeError (the snapshot `elems` would otherwise copy
@@ -4700,15 +4707,24 @@ impl<'a> Interp<'a> {
                         // are copied — the rest keep the destination's zero fill (a
                         // read past the end would coerce to NaN, which is wrong).
                         let live = self.realm.typed_len(handle).unwrap_or(0);
-                        for (k, i) in (a..b).enumerate() {
-                            if i >= live {
-                                break;
+                        let n = count.min(live.saturating_sub(a));
+                        // Spec step: when the source and target element types are the
+                        // same, the transfer is byte-level and "must be performed in a
+                        // manner that preserves the bit-level encoding of the source
+                        // data" — a `decode → f64 → encode` round-trip would collapse
+                        // every NaN payload to the canonical quiet NaN, which an
+                        // aliasing integer view over the result observes.
+                        if n == 0 || !self.realm.typed_copy_same_kind(dest, 0, handle, a, n) {
+                            for (k, i) in (a..b).enumerate() {
+                                if i >= live {
+                                    break;
+                                }
+                                let v = self
+                                    .realm
+                                    .typed_get(handle, i)
+                                    .unwrap_or_else(NanBox::undefined);
+                                self.set_element_checked(dest, k, v)?;
                             }
-                            let v = self
-                                .realm
-                                .typed_get(handle, i)
-                                .unwrap_or_else(NanBox::undefined);
-                            self.set_element_checked(dest, k, v)?;
                         }
                         return Ok(Some(NanBox::handle(dest.to_raw())));
                     }

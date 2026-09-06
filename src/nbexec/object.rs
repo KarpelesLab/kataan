@@ -2416,19 +2416,23 @@ impl<'a> Interp<'a> {
     /// prototype (`ArrayBuffer.prototype`, `%TypedArray%.prototype`, …) whose
     /// slot-requiring accessors must throw when no internal slot is present.
     pub(crate) fn brand_on_chain(&self, handle: Handle, brand: &str) -> bool {
+        self.brand_owner_on_chain(handle, brand).is_some()
+    }
+
+    /// As [`Self::brand_on_chain`], but returns the object on the chain that
+    /// actually carries the marker — the branded built-in *prototype*. Its realm
+    /// (via the accessor it holds) is the realm whose `%TypeError%` a failed brand
+    /// check must throw.
+    pub(crate) fn brand_owner_on_chain(&self, handle: Handle, brand: &str) -> Option<Handle> {
         let mut cur = Some(handle);
-        let mut guard = 0;
-        while let Some(h) = cur {
+        for _ in 0..1000 {
+            let h = cur?;
             if self.realm.has_own(h, brand) {
-                return true;
-            }
-            guard += 1;
-            if guard > 1000 {
-                break;
+                return Some(h);
             }
             cur = self.realm.object_proto(h);
         }
-        false
+        None
     }
 
     pub(crate) fn object_string_tag(

@@ -143,6 +143,11 @@ impl<'a> Interp<'a> {
                 if matches!(kind, 2 | 7 | 8 | 11) {
                     return Err(self.type_error("Atomics operand must be an integer TypedArray"));
                 }
+                // `ValidateIntegerTypedArray` also runs `ValidateTypedArray`: an
+                // already-detached (or out-of-bounds) view is a TypeError *before*
+                // the index is coerced — not the RangeError a zero length would
+                // otherwise produce from the range check below.
+                self.revalidate_atomic_access(ta)?;
                 // A *writing* atomic op (every one but `load`) on an immutable
                 // ArrayBuffer is a TypeError, raised before the index/value
                 // `valueOf` coercions run (the immutable-arraybuffer proposal).
@@ -156,6 +161,10 @@ impl<'a> Interp<'a> {
                     return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
                 }
                 let idx = idx_f as usize;
+                // `RevalidateAtomicAccess` — the index `valueOf` above may have
+                // detached the buffer, which is a TypeError even though the
+                // (pre-coercion) length made the index in range.
+                self.revalidate_atomic_access(ta)?;
                 // BigInt64Array / BigUint64Array: the element and the operands are
                 // BigInts (ToBigInt, not ToIntegerOrInfinity). Work in the low 64
                 // bits (what the element encoding keeps); `store` returns the
@@ -175,6 +184,7 @@ impl<'a> Interp<'a> {
                     if id == N_ATOMICS_COMPARE_EXCHANGE {
                         let expected = self.coerce_to_bigint(arg(2))?.to_u64_wrapping();
                         let replacement = self.coerce_to_bigint(arg(3))?.to_u64_wrapping();
+                        self.revalidate_atomic_access(ta)?;
                         if old == expected {
                             let nb = NanBox::handle(
                                 self.realm
@@ -186,6 +196,7 @@ impl<'a> Interp<'a> {
                         return Ok(old_box);
                     }
                     let v_big = self.coerce_to_bigint(arg(2))?;
+                    self.revalidate_atomic_access(ta)?;
                     let v = v_big.to_u64_wrapping();
                     let new_u = match id {
                         N_ATOMICS_STORE | N_ATOMICS_EXCHANGE => v,
@@ -222,6 +233,7 @@ impl<'a> Interp<'a> {
                 if id == N_ATOMICS_COMPARE_EXCHANGE {
                     let expected = self.coerce_to_integer_or_infinity(arg(2))?;
                     let replacement = self.coerce_to_integer_or_infinity(arg(3))?;
+                    self.revalidate_atomic_access(ta)?;
                     // Compare against the stored (already type-coerced) value.
                     let expected_stored = coerce_typed(u16::from(kind), expected);
                     if old == expected_stored {
@@ -230,6 +242,7 @@ impl<'a> Interp<'a> {
                     return Ok(NanBox::number(old));
                 }
                 let v = self.coerce_to_integer_or_infinity(arg(2))?;
+                self.revalidate_atomic_access(ta)?;
                 let new = match id {
                     N_ATOMICS_STORE | N_ATOMICS_EXCHANGE => v,
                     N_ATOMICS_ADD => old + v,

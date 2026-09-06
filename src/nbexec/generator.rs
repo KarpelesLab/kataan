@@ -171,6 +171,20 @@ enum Step<'a> {
         label: Option<String>,
         async_inner: bool,
     },
+    /// The lazy plain `for (left of right)` driver (14.7.5 ForIn/OfBodyEvaluation,
+    /// sync) used when the iterable exposes a **user-visible** `[Symbol.iterator]`.
+    /// One `next()` is pulled per iteration, so a `yield` in the body suspends
+    /// between pulls and an infinite source with a `break` terminates (calling the
+    /// iterator's `return`) instead of draining eagerly. Like [`Step::ForAwaitLoop`]
+    /// this is a loop marker the unwinder recognizes: a body break/return/throw
+    /// triggers `IteratorClose`; a matching `continue` re-loops without closing.
+    ForOfLoop {
+        ih: Handle,
+        next: NanBox,
+        left: &'a ForLeft,
+        body: &'a Stmt,
+        label: Option<String>,
+    },
     /// (`for await`) After awaiting the per-iteration `next()` result (native
     /// async) or the unwrapped `value` (sync-wrapped), bind it and run the body.
     ForAwaitBind {
@@ -1150,7 +1164,7 @@ impl<'a> Interp<'a> {
         result: Result<NanBox, ExecError>,
     ) -> Result<Handle, ExecError> {
         let result = result?;
-        let Some(rh) = result.as_handle().map(Handle::from_raw) else {
+        let Some(rh) = self.as_object_handle(result) else {
             return Err(self.type_error("iterator result is not an object"));
         };
         let done = self.read_member(rh, "done")?;
@@ -2734,6 +2748,66 @@ impl<'a> Interp<'a> {
                 }
                 self.gen_exec_loop_body(body, stack, values, &label)
             }
+            Step::ForOfLoop {
+                ih,
+                next,
+                left,
+                body,
+                label,
+            } => {
+                // Pull exactly one `next()`. The loop marker is re-pushed only once
+                // a non-done value is in hand, so an error raised *before* the body
+                // (a throwing `next`, a non-object result, a throwing `done`/`value`
+                // getter) does not run `IteratorClose` — spec 14.7.5 only closes on
+                // an abrupt completion of the binding or the body.
+                let res = self
+                    .call_with_this(next, NanBox::handle(ih.to_raw()), &[])
+                    .map_err(GenAbrupt::from)?;
+                let Some(rh) = self.as_object_handle(res) else {
+                    return Err(GenAbrupt::Throw(
+                        self.make_type_error("iterator result is not an object"),
+                    ));
+                };
+                let done = self.read_member(rh, "done").map_err(GenAbrupt::from)?;
+                if self.realm.truthy(done) {
+                    return Ok(StepOut::Continue);
+                }
+                let value = self.read_member(rh, "value").map_err(GenAbrupt::from)?;
+                stack.push(Step::ForOfLoop {
+                    ih,
+                    next,
+                    left,
+                    body,
+                    label: label.clone(),
+                });
+                // Bind the loop variable in a fresh per-iteration scope.
+                let child = self.current.child();
+                let prev = core::mem::replace(&mut self.current, child);
+                stack.push(Step::PopScope { scope: prev });
+                // `for ([ x = yield ] of …)` — an assignment-target pattern whose
+                // default/computed key yields: destructure through the step machine
+                // (so the yield suspends), then run the body via a deferred step.
+                if let ForLeft::Target(expr) = left
+                    && expr_has_yield(expr)
+                {
+                    stack.push(Step::RunLoopBody { body, label });
+                    stack.push(Step::Destructure {
+                        target: expr,
+                        value,
+                    });
+                    return Ok(StepOut::Continue);
+                }
+                match left {
+                    ForLeft::Decl { target, .. } => {
+                        self.bind_pattern(target, value).map_err(GenAbrupt::from)?;
+                    }
+                    ForLeft::Target(expr) => {
+                        self.assign_destructure(expr, value)
+                            .map_err(GenAbrupt::from)?;
+                    }
+                }
+                self.gen_exec_loop_body(body, stack, values, &label)
+            }
             Step::ForAwaitLoop {
                 ih,
                 next,
@@ -2796,7 +2870,7 @@ impl<'a> Interp<'a> {
                 // or the AsyncFromSyncIterator continuation's).
                 let awaited = values.pop().unwrap_or(NanBox::undefined());
                 let value = {
-                    let Some(rh) = awaited.as_handle().map(Handle::from_raw) else {
+                    let Some(rh) = self.as_object_handle(awaited) else {
                         return Err(GenAbrupt::Throw(
                             self.make_type_error("iterator result is not an object"),
                         ));
@@ -4028,8 +4102,10 @@ impl<'a> Interp<'a> {
                 // `next()` per iteration, parked on `await`, closing the iterator
                 // (`IteratorClose`) on a `break`/`return`/`throw` out of the body —
                 // so an infinite source with a `break` terminates instead of being
-                // eagerly drained. A plain `for-of` still materializes an eager list
-                // of values (a documented simplification for yield-bearing bodies).
+                // eagerly drained. A plain `for-of` over a **user** iterable is
+                // driven the same way (`ForOfLoop`); only a built-in iterable whose
+                // `Symbol.iterator` is built-in dispatch rather than a readable
+                // property still materializes an eager (always finite) value list.
                 if *is_await {
                     let (ih, next, async_inner) = self
                         .for_await_iter_record(iterable)
@@ -4041,6 +4117,19 @@ impl<'a> Interp<'a> {
                         body,
                         label: label.clone(),
                         async_inner,
+                    });
+                    return Ok(StepOut::Continue);
+                }
+                if let Some((ih, next)) = self
+                    .for_of_user_iter_record(iterable)
+                    .map_err(GenAbrupt::from)?
+                {
+                    stack.push(Step::ForOfLoop {
+                        ih,
+                        next,
+                        left,
+                        body,
+                        label: label.clone(),
                     });
                     return Ok(StepOut::Continue);
                 }
@@ -4236,7 +4325,8 @@ fn loop_label<'a>(step: &'a Step<'_>) -> Option<&'a String> {
         | Step::DoWhile { label, .. }
         | Step::ForLoop { label, .. }
         | Step::ForEach { label, .. }
-        | Step::ForAwaitLoop { label, .. } => label.as_ref(),
+        | Step::ForAwaitLoop { label, .. }
+        | Step::ForOfLoop { label, .. } => label.as_ref(),
         _ => None,
     }
 }
@@ -4832,17 +4922,19 @@ impl<'a> Interp<'a> {
                         _ => {}
                     }
                 }
-                Step::ForAwaitLoop { .. } => {
-                    // The `for await` loop marker is being unwound by a body-abrupt
-                    // completion. A matching `continue` re-loops WITHOUT closing; any
-                    // other completion (break/return/throw, or a non-matching label)
-                    // runs `IteratorClose` (14.7.5: not-LoopContinues → close), then
-                    // consumes a matching break or keeps propagating.
-                    let (ih, label) = if let Step::ForAwaitLoop { ih, label, .. } = &step {
-                        (*ih, label.clone())
-                    } else {
+                Step::ForAwaitLoop { .. } | Step::ForOfLoop { .. } => {
+                    // A lazy `for-of` / `for await` loop marker is being unwound by a
+                    // body-abrupt completion. A matching `continue` re-loops WITHOUT
+                    // closing; any other completion (break/return/throw, or a
+                    // non-matching label) runs `IteratorClose` (14.7.5:
+                    // not-LoopContinues → close), then consumes a matching break or
+                    // keeps propagating.
+                    let (Step::ForAwaitLoop { ih, label, .. } | Step::ForOfLoop { ih, label, .. }) =
+                        &step
+                    else {
                         unreachable!()
                     };
+                    let (ih, label) = (*ih, label.clone());
                     match &completion {
                         Completion::Continue(None) => {
                             stack.push(step);
@@ -5145,6 +5237,38 @@ impl<'a> Interp<'a> {
     /// GetIterator(iterable, async) for a `for await` loop: the iterator handle,
     /// its cached `[[NextMethod]]`, and whether it is a native async iterator
     /// (`[Symbol.asyncIterator]`) or a sync iterator wrapped as AsyncFromSyncIterator.
+    /// `GetIterator(iterable, sync)` for a plain `for-of` in a generator body,
+    /// but only when the iterable exposes a **callable, user-visible**
+    /// `[Symbol.iterator]`. Returns `(iterator, [[NextMethod]])`, or `None` when
+    /// the value is a built-in iterable driven by built-in dispatch (an array,
+    /// string, Map, Set, …) — those are always finite, so the caller keeps the
+    /// cheaper eager value-list path rather than allocating an iterator object per
+    /// loop.
+    pub(crate) fn for_of_user_iter_record(
+        &mut self,
+        iterable: NanBox,
+    ) -> Result<Option<(Handle, NanBox)>, ExecError> {
+        let Some(h) = iterable.as_handle().map(Handle::from_raw) else {
+            return Ok(None);
+        };
+        let Some(f) = self.find_iterator_fn(h)? else {
+            return Ok(None);
+        };
+        if !f
+            .as_handle()
+            .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+        {
+            return Ok(None);
+        }
+        let it = self.call_with_this(f, iterable, &[])?;
+        // GetIterator: the result must be an Object.
+        let Some(ih) = self.as_object_handle(it) else {
+            return Err(self.type_error("iterator is not an object"));
+        };
+        let next = self.read_member(ih, "next")?;
+        Ok(Some((ih, next)))
+    }
+
     pub(crate) fn for_await_iter_record(
         &mut self,
         iterable: NanBox,
@@ -5265,7 +5389,7 @@ impl<'a> Interp<'a> {
             .map_err(GenAbrupt::from)?;
         if !self.gen_is_async {
             // --- Sync generator `yield*` (unchanged) --------------------------
-            let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+            let Some(rh) = self.as_object_handle(res) else {
                 return Err(GenAbrupt::Throw(
                     self.make_type_error("iterator result is not an object"),
                 ));
@@ -5300,7 +5424,7 @@ impl<'a> Interp<'a> {
         // A sync inner iterator wrapped as async (AsyncFromSyncIterator): its result
         // is a plain object; read `done`/`value`, then `Await` the value (unwrap /
         // AsyncGeneratorYield) before re-yielding or completing.
-        let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+        let Some(rh) = self.as_object_handle(res) else {
             return Err(GenAbrupt::Throw(
                 self.make_type_error("iterator result is not an object"),
             ));
@@ -5342,7 +5466,7 @@ impl<'a> Interp<'a> {
     ) -> StepResult {
         // Only reached for a native-async inner iterator (from `YieldStarResult`).
         let async_inner = true;
-        let Some(rh) = res.as_handle().map(Handle::from_raw) else {
+        let Some(rh) = self.as_object_handle(res) else {
             return Err(GenAbrupt::Throw(
                 self.make_type_error("iterator result is not an object"),
             ));

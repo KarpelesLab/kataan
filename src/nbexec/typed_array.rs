@@ -992,6 +992,21 @@ impl<'a> Interp<'a> {
         })
     }
 
+    /// `RevalidateAtomicAccess(typedArray, byteIndexInBuffer)` (ECMA-262 25.4.2.2):
+    /// re-runs `ValidateIntegerTypedArray` after the index and value operands have
+    /// been coerced, because a `valueOf` hook may have detached (or resized out of
+    /// bounds) the buffer the atomic op is about to touch. Throws `TypeError` in
+    /// that case; the in-bounds check is redundant here because the caller already
+    /// clamped the index against the pre-coercion length.
+    pub(crate) fn revalidate_atomic_access(&mut self, handle: Handle) -> Result<(), ExecError> {
+        if self.typed_array_detached(handle) || self.realm.typed_array_out_of_bounds(handle) {
+            return Err(self.type_error(
+                "Atomics operand is backed by a detached or out-of-bounds ArrayBuffer",
+            ));
+        }
+        Ok(())
+    }
+
     /// Performs the abstract `DetachArrayBuffer(buf)`: zero-lengths the backing
     /// store, empties every typed-array view over it (length 0), and flags the
     /// buffer detached so subsequent operations throw / read 0. Idempotent.
