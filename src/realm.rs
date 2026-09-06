@@ -2237,7 +2237,7 @@ impl Realm {
                 // (`\0`-prefixed) are never enumerable, so they stay out of
                 // `Object.keys`, spread, `for-in`, and JSON. Methods are marked
                 // hidden via `enumerable_keys`.
-                .filter(|s| !s.starts_with('\u{0}'))
+                .filter(|s| !is_internal_key(s))
                 .map(|s| alloc::string::String::from(*s))
                 .collect(),
         )
@@ -2256,7 +2256,7 @@ impl Realm {
         };
         obj.enumerable_keys()
             .iter()
-            .filter(|s| !s.starts_with('\u{0}'))
+            .filter(|s| !is_internal_key(s))
             .map(|s| alloc::string::String::from(*s))
             .collect()
     }
@@ -2295,7 +2295,7 @@ impl Realm {
                     // `#`, e.g. a computed `["#x"]` field) and Symbol keys (the
                     // `\u{0}sym:` sentinel), but drop every other engine-internal
                     // slot (private elements, generator state, wrapper boxes, …).
-                    .filter(|s| !s.starts_with('\u{0}') || s.starts_with("\u{0}sym:"))
+                    .filter(|s| !is_internal_key(s) || s.starts_with("\u{0}sym:"))
                     .map(|s| alloc::string::String::from(*s))
                     .collect()
             })
@@ -2370,7 +2370,7 @@ impl Realm {
             let mut named: Vec<alloc::string::String> = Vec::new();
             if let Some(obj) = self.heap.get(handle).and_then(Cell::as_object) {
                 for k in obj.ordered_keys() {
-                    if k.starts_with('\u{0}') || k == "length" {
+                    if is_internal_key(k) || k == "length" {
                         continue;
                     }
                     if let Ok(n) = k.parse::<u32>()
@@ -2398,7 +2398,7 @@ impl Realm {
             return Some(
                 obj.ordered_keys()
                     .iter()
-                    .filter(|s| !s.starts_with('\u{0}'))
+                    .filter(|s| !is_internal_key(s))
                     .map(|s| alloc::string::String::from(*s))
                     .collect(),
             );
@@ -2424,7 +2424,7 @@ impl Realm {
                 .and_then(|h| self.heap.get(*h))
                 .and_then(Cell::as_object)
             {
-                for k in aux.all_keys().iter().filter(|s| !s.starts_with('\u{0}')) {
+                for k in aux.all_keys().iter().filter(|s| !is_internal_key(s)) {
                     // A canonical array-index key (`"0".."4294967294"`, no leading
                     // zeros) is an element key; anything else is a named key.
                     if let Ok(n) = k.parse::<u32>()
@@ -2458,11 +2458,7 @@ impl Realm {
                 .and_then(|h| self.heap.get(*h))
                 .and_then(Cell::as_object)
             {
-                for k in aux
-                    .ordered_keys()
-                    .iter()
-                    .filter(|s| !s.starts_with('\u{0}'))
-                {
+                for k in aux.ordered_keys().iter().filter(|s| !is_internal_key(s)) {
                     names.push(alloc::string::String::from(*k));
                 }
             }
@@ -2481,11 +2477,7 @@ impl Realm {
                 .and_then(|h| self.heap.get(*h))
                 .and_then(Cell::as_object)
             {
-                for k in aux
-                    .ordered_keys()
-                    .iter()
-                    .filter(|s| !s.starts_with('\u{0}'))
-                {
+                for k in aux.ordered_keys().iter().filter(|s| !is_internal_key(s)) {
                     if let Ok(n) = k.parse::<u32>()
                         && n != u32::MAX
                         && alloc::format!("{n}") == **k
@@ -2527,11 +2519,7 @@ impl Realm {
                 // `[[OwnPropertyKeys]]` order: integer indices ascending, then the
                 // rest in insertion order. `name`/`length` are stored as ordinary
                 // named keys, so `ordered_keys` already yields the spec order.
-                for k in aux
-                    .ordered_keys()
-                    .iter()
-                    .filter(|s| !s.starts_with('\u{0}'))
-                {
+                for k in aux.ordered_keys().iter().filter(|s| !is_internal_key(s)) {
                     names.push(alloc::string::String::from(*k));
                 }
             }
@@ -2589,6 +2577,18 @@ impl Realm {
             return self.array_proto_intrinsic;
         }
         None
+    }
+
+    /// Whether the realm's `Object.prototype` still carries the Annex B
+    /// `__proto__` accessor pair. `delete Object.prototype.__proto__` (or
+    /// redefining it as a data property) removes it, after which `obj.__proto__`
+    /// is an ordinary property in every respect — reads yield `undefined` and
+    /// writes create an own data property.
+    pub fn proto_accessor_installed(&self) -> bool {
+        let Some(target) = self.default_object_proto else {
+            return true; // realm not fully wired; preserve legacy behaviour
+        };
+        self.accessor(target, "__proto__").is_some()
     }
 
     /// Whether `handle`'s prototype chain reaches the realm's `Object.prototype`
@@ -6068,6 +6068,19 @@ pub(crate) fn native_fn_name_segment(name: &str) -> &str {
         return name;
     }
     ""
+}
+
+/// Whether `key` is an engine-internal storage slot rather than a JavaScript
+/// property name. Internal slots are namespaced by a leading NUL followed by an
+/// ASCII alphanumeric or `#` (`"\0sym:<id>"` for a Symbol key, `"\0#<name>@<scope>"`
+/// for a private element, `"\0prim"`, `"\0gbuf"`, …), so they never collide with
+/// a *user* key such as `obj["\0\v"]`, which must still enumerate and serialize
+/// like any other string key.
+#[must_use]
+pub fn is_internal_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars.next() == Some('\u{0}')
+        && matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric() || c == '#')
 }
 
 #[cfg(test)]

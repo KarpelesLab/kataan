@@ -7459,9 +7459,10 @@ fn collect_var_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
     fn from_decl<'a>(decl: &'a crate::ast::VarDecl, out: &mut Vec<&'a str>) {
         if matches!(decl.kind, VarDeclKind::Var) {
             for d in &decl.declarations {
-                if let BindingTarget::Ident(id) = &d.target {
-                    out.push(&id.name);
-                }
+                // Every name bound by the target hoists, including the ones
+                // inside a destructuring pattern (`var { a, b: [c] } = o;`
+                // var-declares `a`, `c`) — BoundNames of a BindingPattern.
+                collect_binding_idents(&d.target, out);
             }
         }
     }
@@ -7500,11 +7501,11 @@ fn collect_var_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
             Stmt::ForIn { left, body, .. } | Stmt::ForOf { left, body, .. } => {
                 if let crate::ast::ForLeft::Decl {
                     kind: VarDeclKind::Var,
-                    target: BindingTarget::Ident(id),
+                    target,
                     ..
                 } = left
                 {
-                    out.push(&id.name);
+                    collect_binding_idents(target, out);
                 }
                 collect_var_names(core::slice::from_ref(body), out);
             }

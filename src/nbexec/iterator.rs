@@ -2562,14 +2562,19 @@ impl<'a> Interp<'a> {
             return self.iterate_values(prim);
         }
         if let Some(mut elems) = self.realm.elements_vec(h) {
-            // The %ArrayIteratorPrototype% `next` does `Get(array, index)`, so a hole
-            // reads as `undefined` (not the internal hole sentinel). Normalize so
-            // for-of / spread / `Array.from` over a sparse array yield real
-            // `undefined` values.
-            for e in &mut elems {
+            // The %ArrayIteratorPrototype% `next` does `Get(array, index)`, so a
+            // hole is *not* the internal sentinel: the read walks the prototype
+            // chain, and `Array.prototype[1] = 'y'` makes `[ , ][1]` yield `'y'`.
+            // Only holes take the (rare) chain lookup; dense elements are kept.
+            let mut holes: Vec<usize> = Vec::new();
+            for (i, e) in elems.iter_mut().enumerate() {
                 if e.is_hole() {
                     *e = NanBox::undefined();
+                    holes.push(i);
                 }
+            }
+            for i in holes {
+                elems[i] = self.read_member(h, &alloc::format!("{i}"))?;
             }
             return Ok(elems);
         }
@@ -2816,7 +2821,7 @@ impl<'a> Interp<'a> {
             for k in all {
                 // Symbol/internal (`\0`-prefixed) slots never participate in the
                 // string-key `for-in` namespace.
-                if !k.starts_with('\u{0}') {
+                if !crate::realm::is_internal_key(&k) {
                     seen.insert(k);
                 }
             }

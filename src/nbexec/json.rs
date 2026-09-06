@@ -47,9 +47,16 @@ impl<'a> Interp<'a> {
                         self.apply_descriptor(vh, &ks, desc, true)?;
                     }
                 }
-            } else if self.realm.object_keys(vh).is_some() || self.realm.proxy_at(vh).is_some() {
+            } else {
+                // EnumerableOwnPropertyNames(val, KEY) for any other object. A
+                // typed array is *not* a plain object cell but does own its
+                // integer indices, so a reviver that substitutes one mid-walk
+                // (`this[1] = new Int8Array(1)`) must still be re-entered for
+                // each of its elements.
                 let keys = if let Some(pk) = self.proxy_own_enumerable_keys(vh)? {
                     pk
+                } else if let Some(len) = self.realm.typed_len(vh) {
+                    (0..len).map(|i| alloc::format!("{i}")).collect()
                 } else {
                     self.realm
                         .object_keys(self.proxy_key_target(vh))
@@ -367,7 +374,7 @@ impl<'a> Interp<'a> {
                     let mut ks = Vec::new();
                     for key in self.own_property_keys_values(h)? {
                         let name = self.member_key(key);
-                        if name.starts_with('\u{0}') {
+                        if crate::realm::is_internal_key(&name) {
                             continue; // a symbol key (internal `\0sym:` form)
                         }
                         let desc = self.descriptor_of(h, &name)?;

@@ -75,6 +75,12 @@ pub(crate) struct GenFrame<'a> {
     /// to evaluate and return; `body` is then empty. `None` for a block body.
     concise: Option<&'a Expr>,
     scope: Scope,
+    /// The coroutine's *variable* environment (`Interp::var_scope`) — where its
+    /// `var`s and top-level function declarations bind. Saved and restored across
+    /// every suspend/resume: without it, a resumed generator left the interpreter's
+    /// `var_scope` pointing at the coroutine's frame, so a later direct `eval("var
+    /// x")` in the *caller* declared into the dead generator scope.
+    var_scope: Scope,
     this_val: NanBox,
     new_target: NanBox,
     home_class: Option<u32>,
@@ -658,6 +664,7 @@ impl<'a> Interp<'a> {
         let frame = GenFrame {
             body,
             concise: None,
+            var_scope: scope.clone(),
             scope,
             this_val: self.this_val,
             new_target: self.new_target,
@@ -1529,6 +1536,7 @@ impl<'a> Interp<'a> {
         let frame = GenFrame {
             body,
             concise,
+            var_scope: scope.clone(),
             scope,
             this_val: self.this_val,
             new_target: self.new_target,
@@ -1689,10 +1697,11 @@ impl<'a> Interp<'a> {
             }
         }
 
-        let (scope, this_val, new_target, home_class, home_static, home_object, strict) = {
+        let (scope, var_scope, this_val, new_target, home_class, home_static, home_object, strict) = {
             let f = self.gen_frames[id].as_ref().expect("frame present");
             (
                 f.scope.clone(),
+                f.var_scope.clone(),
                 f.this_val,
                 f.new_target,
                 f.home_class,
@@ -1710,6 +1719,9 @@ impl<'a> Interp<'a> {
         let gen_realm = self.realm_of_scope(&scope);
         let realm_guard = self.enter_realm(gen_realm);
         let saved_scope = core::mem::replace(&mut self.current, scope);
+        // The coroutine's variable environment travels with it (see
+        // `GenFrame::var_scope`); the caller's is restored on suspend/return.
+        let saved_var_scope = core::mem::replace(&mut self.var_scope, var_scope);
         let saved_this = core::mem::replace(&mut self.this_val, this_val);
         let saved_target = core::mem::replace(&mut self.new_target, new_target);
         let saved_home = core::mem::replace(&mut self.current_home, home_class);
@@ -1728,9 +1740,11 @@ impl<'a> Interp<'a> {
 
         if let Some(f) = self.gen_frames[id].as_mut() {
             f.scope = core::mem::replace(&mut self.current, saved_scope);
+            f.var_scope = core::mem::replace(&mut self.var_scope, saved_var_scope);
             f.running = false;
         } else {
             self.current = saved_scope;
+            self.var_scope = saved_var_scope;
         }
         self.leave_realm(realm_guard);
         self.this_val = saved_this;

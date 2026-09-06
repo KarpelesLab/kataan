@@ -3686,6 +3686,7 @@ impl<'a> Interp<'a> {
         // `Object.create(null)`) reads it as an ordinary absent property.
         if name == "__proto__"
             && !self.realm.has_own(handle, "__proto__")
+            && self.realm.proto_accessor_installed()
             && self.realm.inherits_object_proto(handle)
         {
             return Ok(match self.realm.object_proto(handle) {
@@ -5082,6 +5083,7 @@ impl<'a> Interp<'a> {
         if let PropertyKey::Ident(s) | PropertyKey::Str(s) = property
             && &**s == "__proto__"
             && !self.realm.has_own(handle, "__proto__")
+            && self.realm.proto_accessor_installed()
             && self.realm.inherits_object_proto(handle)
         {
             let proto = match new.unpack() {

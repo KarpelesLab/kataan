@@ -985,14 +985,41 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
 /// non-iterable. The caller turns that into a `VmError` so the whole program
 /// re-runs on the reference tree-walker ([`crate::nbexec`]), which drives the
 /// full iterator protocol (including iterator-close and user `.next()`).
+/// Whether index `i` is an own property of anything on `h`'s prototype chain —
+/// i.e. whether a hole at `i` would read something other than `undefined`.
+fn proto_chain_has_index(ctx: &Ctx, h: Handle, i: usize) -> bool {
+    let key = alloc::format!("{i}");
+    let mut cur = ctx.realm.object_proto(h);
+    let mut guard = 0u32;
+    while let Some(p) = cur {
+        if ctx.realm.has_own(p, &key) {
+            return true;
+        }
+        guard += 1;
+        if guard > 1000 {
+            return true; // pathological chain: let the tree-walker sort it out
+        }
+        cur = ctx.realm.object_proto(p);
+    }
+    false
+}
+
 fn vm_iterable_values(ctx: &mut Ctx, v: NanBox) -> Option<Vec<NanBox>> {
     let h = v.as_handle().map(Handle::from_raw)?;
     // A real array or typed-array view: snapshot its elements. A hole reads as
     // `undefined` (the array iterator does `Get(array, index)`), not the internal
     // hole sentinel.
     if let Some(mut elems) = ctx.realm.elements_vec(h) {
-        for e in &mut elems {
+        for (i, e) in elems.iter_mut().enumerate() {
             if e.is_hole() {
+                // A hole is not `undefined`: the iterator's `Get(array, index)`
+                // walks the prototype chain, so `Array.prototype[1] = 'y'` makes
+                // `[ , ][1]` yield `'y'`. That lookup may run an inherited getter,
+                // which this fast path cannot do — hand the (rare) case to the
+                // tree-walker.
+                if proto_chain_has_index(ctx, h, i) {
+                    return None;
+                }
                 *e = NanBox::undefined();
             }
         }
@@ -5206,7 +5233,7 @@ fn vm_object_kv(
                 // elements, generator state, wrapper boxes, …) are hidden; a public
                 // property whose *name* legitimately starts with `#` (e.g. a computed
                 // field `["#x"]`) enumerates normally.
-                if k.starts_with('\u{0}') {
+                if crate::realm::is_internal_key(&k) {
                     continue;
                 }
                 // Live `[[GetOwnProperty]]` — an ordinary object has no observable
