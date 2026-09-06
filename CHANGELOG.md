@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/KarpelesLab/kataan/compare/v0.0.9...v0.0.10) - 2026-09-06
+
+### Fixed
+
+- *(instanceof)* decide built-in instanceof by the prototype chain, not the cell brand
+- *(class)* a proxy is transparent to private elements, on read as well as write
+- *(builtins)* preserve NaN bit patterns in typed-array slice, tighten Date parsing, close yield* iterators
+- *(realm)* give arrays a real per-object realm, and resolve intrinsics from the running realm
+- *(realm)* repair is_internal_key's doc comment and escape an intra-doc link
+- *(class)* integrity levels must not reach private elements
+- *(nbexec)* var-hoist destructuring patterns, stop hiding user NUL keys, revive typed arrays
+- *(nbexec)* legacy `fn.arguments`, `with`-scoped delete, and global accessor redefinition
+- *(proxy)* observe traps through [[Get]], guard function realms, and keep private names off [[Set]]
+- *(lexer)* `await` and `yield` are contextual, so `/` after them is not always a regex
+- *(nbvm)* collect garbage inside function bodies, not just the outermost frame
+- *(nbexec)* slice Function.prototype.toString from the defining source; run harness as its own Script
+
 ## [0.0.9](https://github.com/KarpelesLab/kataan/compare/v0.0.8...v0.0.9) - 2026-09-05
 
 ### Added
