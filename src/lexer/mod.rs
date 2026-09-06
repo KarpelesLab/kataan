@@ -131,6 +131,42 @@ pub struct Lexer<'src> {
     /// HTML-like comments (`<!--`/`-->`) are a script-only web-compat feature and
     /// are NOT recognized in module code.
     module: bool,
+    /// Stack of enclosing function contexts, innermost last. `await` is an
+    /// operator (so `await /re/` is a regex) only in an async context, and
+    /// `yield` only in a generator; everywhere else they are plain identifiers
+    /// and a following `/` is division (`await/r/g`, `yield/a/g`). See
+    /// [`FnCtx`].
+    fn_ctx_stack: Vec<FnCtx>,
+    /// Running "function head" flags: whether an `async` marker and/or a
+    /// generator `*` have been seen for the function head currently being
+    /// scanned. Captured at the head's parameter-list `(` (see
+    /// `bracket_flags`) and applied at the body `{`.
+    pend_async: bool,
+    pend_gen: bool,
+    /// The head flags in force at each currently-open `(`/`[`, so the flags of
+    /// a parameter list survive the parameters themselves.
+    bracket_flags: Vec<(bool, bool)>,
+    /// The head flags recorded at the `(` of the most recently closed paren —
+    /// the flags of a function head whose body `{` is about to be seen.
+    last_paren_flags: (bool, bool),
+}
+
+/// One entry of [`Lexer::fn_ctx_stack`]: the `await`/`yield` context of a
+/// function body being lexed.
+struct FnCtx {
+    /// `brace_stack` depth at which this context's body `{` was pushed; the
+    /// matching `}` pops the context. For an expression-bodied arrow (which has
+    /// no braces) this is the depth at the `=>`.
+    braces: usize,
+    /// `Some(paren_depth)` for the *concise* (expression) body of an arrow,
+    /// which is not delimited by braces: the context also ends at the first
+    /// `,`/`;` at that depth, or when the enclosing bracket closes. `None` for
+    /// an ordinary brace-delimited body.
+    expr_arrow_parens: Option<u32>,
+    /// Whether `await` is an operator here (an async function/arrow body).
+    is_async: bool,
+    /// Whether `yield` is an operator here (a generator body).
+    is_gen: bool,
 }
 
 impl<'src> Lexer<'src> {
@@ -168,6 +204,11 @@ impl<'src> Lexer<'src> {
             last_rparen_closed_head: false,
             cur_had_escape: false,
             module,
+            fn_ctx_stack: Vec::new(),
+            pend_async: false,
+            pend_gen: false,
+            bracket_flags: Vec::new(),
+            last_paren_flags: (false, false),
         }
     }
 
@@ -219,6 +260,7 @@ impl<'src> Lexer<'src> {
                     BraceKind::ExprObject
                 };
                 self.brace_stack.push(kind);
+                self.open_fn_body_brace();
                 TokenKind::LBrace
             }
             b'}' => {
@@ -229,6 +271,7 @@ impl<'src> Lexer<'src> {
                     Some(BraceKind::TemplateSubstitution)
                 ) {
                     self.brace_stack.pop();
+                    self.close_fn_ctx();
                     return self.read_template_continuation(start, newline_before);
                 }
                 self.advance();
@@ -238,9 +281,11 @@ impl<'src> Lexer<'src> {
                 // is a syntax error the parser will report; default to non-block.
                 self.last_rbrace_closed_block =
                     matches!(self.brace_stack.pop(), Some(BraceKind::Block));
+                self.close_fn_ctx();
                 TokenKind::RBrace
             }
             b'(' => {
+                self.bracket_flags.push((self.pend_async, self.pend_gen));
                 self.paren_depth += 1;
                 // `for (` / `for await (` opens a head in which `of` is the
                 // `for-of` keyword rather than an identifier.
@@ -264,18 +309,33 @@ impl<'src> Lexer<'src> {
                         false
                     };
                 self.paren_depth = self.paren_depth.saturating_sub(1);
+                self.last_paren_flags = self.bracket_flags.pop().unwrap_or((false, false));
+                self.close_expr_arrow_ctx();
                 self.single(TokenKind::RParen)
             }
             b'[' => {
+                self.bracket_flags.push((self.pend_async, self.pend_gen));
                 self.paren_depth += 1;
                 self.single(TokenKind::LBracket)
             }
             b']' => {
                 self.paren_depth = self.paren_depth.saturating_sub(1);
+                // A computed method key (`async ["m"]() {}`) sits between the
+                // `async`/`*` marker and the parameter list, so the head flags
+                // recorded at the `[` are restored rather than discarded.
+                (self.pend_async, self.pend_gen) =
+                    self.bracket_flags.pop().unwrap_or((false, false));
+                self.close_expr_arrow_ctx();
                 self.single(TokenKind::RBracket)
             }
-            b';' => self.single(TokenKind::Semicolon),
-            b',' => self.single(TokenKind::Comma),
+            b';' => {
+                self.end_expr_arrow_ctx();
+                self.single(TokenKind::Semicolon)
+            }
+            b',' => {
+                self.end_expr_arrow_ctx();
+                self.single(TokenKind::Comma)
+            }
             b'~' => self.single(TokenKind::Tilde),
             b'@' => self.single(TokenKind::At),
             b':' => self.single(TokenKind::Colon),
@@ -1393,6 +1453,114 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    // --- `await` / `yield` context tracking ------------------------------
+
+    /// Called just after a `{` has been pushed onto the brace stack: if that
+    /// brace opens a *function body*, record the body's `await`/`yield`
+    /// context. A function body `{` is one that directly follows the parameter
+    /// list `)` of a function/method (as opposed to the `)` of an `if`/`for`/
+    /// `while`/`with`/`switch`/`catch` head, which is followed by a *statement*
+    /// and keeps the enclosing context), or the `=>` of an arrow.
+    fn open_fn_body_brace(&mut self) {
+        let braces = self.brace_stack.len();
+        match self.prev_significant {
+            Some(TokenKind::Arrow) => {
+                // The `=>` pushed a tentative concise-body context; this brace
+                // turns it into an ordinary brace-delimited body.
+                let is_async = match self.fn_ctx_stack.last() {
+                    Some(ctx) if ctx.expr_arrow_parens.is_some() => {
+                        let is_async = ctx.is_async;
+                        self.fn_ctx_stack.pop();
+                        is_async
+                    }
+                    _ => false,
+                };
+                self.fn_ctx_stack.push(FnCtx {
+                    braces,
+                    expr_arrow_parens: None,
+                    is_async,
+                    is_gen: false,
+                });
+            }
+            Some(TokenKind::RParen) if !self.last_rparen_closed_head => {
+                let (is_async, is_gen) = self.last_paren_flags;
+                self.fn_ctx_stack.push(FnCtx {
+                    braces,
+                    expr_arrow_parens: None,
+                    is_async,
+                    is_gen,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Drops every function context whose body brace has just been closed.
+    fn close_fn_ctx(&mut self) {
+        while self
+            .fn_ctx_stack
+            .last()
+            .is_some_and(|c| c.braces > self.brace_stack.len())
+        {
+            self.fn_ctx_stack.pop();
+        }
+    }
+
+    /// Drops every concise-arrow-body context whose enclosing bracket has just
+    /// been closed (called after `paren_depth` is decremented for `)`/`]`).
+    fn close_expr_arrow_ctx(&mut self) {
+        while self
+            .fn_ctx_stack
+            .last()
+            .is_some_and(|c| c.expr_arrow_parens.is_some_and(|d| d > self.paren_depth))
+        {
+            self.fn_ctx_stack.pop();
+        }
+    }
+
+    /// Drops a concise-arrow-body context ended by a `,`/`;` at its own depth
+    /// (`f(async x => await y, z)`, `var g = async x => await y;`).
+    fn end_expr_arrow_ctx(&mut self) {
+        while self.fn_ctx_stack.last().is_some_and(|c| {
+            c.braces == self.brace_stack.len() && c.expr_arrow_parens == Some(self.paren_depth)
+        }) {
+            self.fn_ctx_stack.pop();
+        }
+    }
+
+    /// Whether `await` is the `AwaitExpression` operator here (so a following
+    /// `/` starts a regex) rather than an ordinary identifier (division). Only
+    /// inside an async function/arrow body, or at the top level of a Module.
+    fn await_is_operator(&self) -> bool {
+        self.fn_ctx_stack.last().map_or(self.module, |c| c.is_async)
+    }
+
+    /// Whether `yield` is the `YieldExpression` operator here (so a following
+    /// `/` starts a regex) rather than an ordinary identifier (division). Only
+    /// inside a generator body.
+    fn yield_is_operator(&self) -> bool {
+        self.fn_ctx_stack.last().is_some_and(|c| c.is_gen)
+    }
+
+    /// Whether a `*` about to be emitted is a generator marker (`function *`,
+    /// `async *`, or the start of a `*method(){}` in a class/object body)
+    /// rather than multiplication.
+    fn star_is_generator_marker(&self) -> bool {
+        use TokenKind as T;
+        match self.prev_significant {
+            None => true,
+            Some(kind) => matches!(
+                kind,
+                T::LBrace
+                    | T::RBrace
+                    | T::Semicolon
+                    | T::Comma
+                    | T::At
+                    | T::Keyword(Keyword::Function | Keyword::Async | Keyword::Static)
+            ),
+        }
+    }
+
     /// Whether a `/` at the current position should begin a regex literal,
     /// based on the previous significant token. This is the standard heuristic
     /// used by hand-written JS lexers.
@@ -1431,6 +1599,12 @@ impl<'src> Lexer<'src> {
                 TokenKind::Keyword(Keyword::Of) => {
                     self.for_head_parens.last() == Some(&self.paren_depth)
                 }
+                // `await` and `yield` precede an expression only where they are
+                // *operators*: `await` in an async context, `yield` in a
+                // generator. Elsewhere they are ordinary identifiers that end an
+                // expression, so `await/r/g` and `yield/a/g` are two divisions.
+                TokenKind::Keyword(Keyword::Await) => self.await_is_operator(),
+                TokenKind::Keyword(Keyword::Yield) => self.yield_is_operator(),
                 // The other contextual keywords (`as`, `async`, `from`, `get`,
                 // `set`, `target`, `accessor`) are usable as plain identifiers and
                 // never directly precede a regex, so a following `/` is division.
@@ -1546,13 +1720,70 @@ impl<'src> Lexer<'src> {
             // its `)` is followed by a statement rather than by an operator. In
             // member position (`a.while(…)`) these are property names, not
             // keywords, and the `)` closes an ordinary call.
+            // `switch` and `catch` are listed too: their `)` is likewise
+            // followed by a *block* rather than by a function body, so the
+            // enclosing `await`/`yield` context must carry into it (see
+            // `open_fn_body_brace`). A `/` can never follow either `)`, so the
+            // regex heuristic is unaffected.
             self.pending_stmt_head = match kind {
-                TokenKind::Keyword(Keyword::If | Keyword::For | Keyword::While | Keyword::With) => {
-                    !after_dot
-                }
+                TokenKind::Keyword(
+                    Keyword::If
+                    | Keyword::For
+                    | Keyword::While
+                    | Keyword::With
+                    | Keyword::Switch
+                    | Keyword::Catch,
+                ) => !after_dot,
                 TokenKind::Keyword(Keyword::Await) => self.pending_stmt_head,
                 _ => false,
             };
+            // Running `async`/`*` markers for a function head being scanned;
+            // captured at the head's `(` and applied at its body `{`.
+            match kind {
+                TokenKind::Keyword(Keyword::Async) if !after_dot => {
+                    self.pend_async = true;
+                    self.pend_gen = false;
+                }
+                TokenKind::Keyword(Keyword::Function) => {
+                    self.pend_async =
+                        self.prev_significant == Some(TokenKind::Keyword(Keyword::Async));
+                    self.pend_gen = false;
+                }
+                TokenKind::Star if self.star_is_generator_marker() => self.pend_gen = true,
+                TokenKind::Arrow => {
+                    // An arrow's concise body has no braces, so record a
+                    // tentative context here; a `{` next turns it into the
+                    // body's own context (see `open_fn_body_brace`).
+                    let is_async = if self.prev_significant == Some(TokenKind::RParen) {
+                        self.last_paren_flags.0
+                    } else {
+                        self.pend_async
+                    };
+                    self.fn_ctx_stack.push(FnCtx {
+                        braces: self.brace_stack.len(),
+                        expr_arrow_parens: Some(self.paren_depth),
+                        is_async,
+                        is_gen: false,
+                    });
+                    self.pend_async = false;
+                    self.pend_gen = false;
+                }
+                // A method name (identifier, private name, literal, keyword
+                // used as a name) or a computed key's brackets may sit between
+                // the marker and the parameter list; they leave the flags be.
+                TokenKind::Identifier
+                | TokenKind::PrivateName
+                | TokenKind::String
+                | TokenKind::Number
+                | TokenKind::BigInt
+                | TokenKind::LBracket
+                | TokenKind::RBracket
+                | TokenKind::Keyword(_) => {}
+                _ => {
+                    self.pend_async = false;
+                    self.pend_gen = false;
+                }
+            }
             self.prev_significant = Some(kind);
         }
         let had_escape = core::mem::take(&mut self.cur_had_escape);

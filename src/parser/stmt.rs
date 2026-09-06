@@ -816,11 +816,33 @@ impl<'src> Parser<'src> {
 
     fn parse_for(&mut self) -> Result<Stmt> {
         let start = self.bump().span; // `for`
-        // `for await (… of …)` — async iteration.
+        // `for await (… of …)` — async iteration. The `[+Await]` production is
+        // only reachable inside an async function/generator (or at the top
+        // level of a Module); elsewhere `for await` is an early Syntax Error.
         let is_await = self.eat(TokenKind::Keyword(Kw::Await));
+        if is_await && !self.in_async {
+            return Err(
+                self.err("`for await (… of …)` is only valid in async functions and modules")
+            );
+        }
         self.expect(TokenKind::LParen)?;
         // The header is parsed with the `in`-as-operator restriction in force.
         let head = self.with_no_in(|p| p.parse_for_head(is_await))?;
+        // `for await` has only the `for-of` production: the C-style
+        // (`for await (;;)`, `for await (var i = 0; …; …)`) and `for-in`
+        // (`for await (x in y)`) heads are Syntax Errors.
+        if is_await
+            && !matches!(
+                head,
+                ForHead::InOf {
+                    is_of: true,
+                    b35_init: None,
+                    ..
+                }
+            )
+        {
+            return Err(self.err("`for await` requires an `of` iteration head"));
+        }
         match head {
             ForHead::Empty => self.finish_for_classic(start, None),
             ForHead::Classic(init) => self.finish_for_classic(start, init),

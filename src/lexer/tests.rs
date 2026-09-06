@@ -226,6 +226,68 @@ fn regex_after_statement_head_paren() {
     assert!(!kinds("a.while(b) / c").contains(&Regex));
 }
 
+/// `await` and `yield` precede an expression only where they are *operators* —
+/// `await` in an async context, `yield` in a generator. Everywhere else they are
+/// ordinary identifiers, so `await/r/g` and `yield/a/g` are two divisions.
+#[test]
+fn regex_after_await_and_yield() {
+    use TokenKind::*;
+    // Operator position → the `/` starts a regex.
+    for src in [
+        "async function f() { await /r/g }",
+        "async function* f() { await /r/g }",
+        "var f = async function () { await /r/g };",
+        "({ async m() { await /r/g } })",
+        "class C { async m() { await /r/g } }",
+        "class C { static async m() { await /r/g } }",
+        "class C { async ['m']() { await /r/g } }",
+        "async () => { await /r/g }",
+        "async () => await /r/g",
+        "async x => await /r/g",
+        "async function f() { if (a) { await /r/g } }",
+        "async function f() { switch (a) { case 1: await /r/g } }",
+        "async function f() { try {} catch (e) { await /r/g } }",
+        "async function f() { for (;;) { await /r/g } }",
+        "function* g() { yield /a/g }",
+        "var g = function* () { yield /a/g };",
+        "({ *m() { yield /a/g } })",
+        "({ a: 1, *m() { yield /a/g } })",
+        "class C { *m() { yield /a/g } }",
+        "class C { static *m() { yield /a/g } }",
+        "async function* g() { yield /a/g }",
+        "function* g() { try {} catch (e) { yield /a/g } }",
+    ] {
+        assert!(
+            kinds(src).contains(&Regex),
+            "expected a regex literal in {src:?}"
+        );
+    }
+    // Identifier position → the `/` divides.
+    for src in [
+        "await /r/g",
+        "yield /a/g",
+        "function f(x = await/r/g) {}",
+        "function f() { await /r/g }",
+        "function f() { yield /a/g }",
+        "function* g() { await /r/g }",
+        "async function f() { function g() { await /r/g } }",
+        "async function f() { yield /a/g }",
+        "class C { m() { await /r/g } }",
+        "({ m() { yield /a/g } })",
+    ] {
+        let k = kinds(src);
+        assert!(
+            k.contains(&Slash) && !k.contains(&Regex),
+            "expected division in {src:?}"
+        );
+    }
+    // In a Module the top level is an async context.
+    let module = Lexer::with_goal("await /r/g", true)
+        .tokenize()
+        .expect("lex ok");
+    assert!(module.iter().any(|t| t.kind == Regex));
+}
+
 #[test]
 fn comments_are_trivia() {
     use TokenKind::*;
