@@ -671,6 +671,11 @@ pub struct Interp<'a> {
     /// extension (Annex B "normative optional"): the caller of a live invocation
     /// of `fn` is the entry directly below its innermost occurrence.
     fn_stack: Vec<NanBox>,
+    /// The `arguments` object of each live invocation in [`Self::fn_stack`], index
+    /// for index (`null` for an arrow, which creates none). Serves the legacy
+    /// `fn.arguments` extension, whose value is the arguments object of the
+    /// function's nearest live activation.
+    fn_args_stack: Vec<NanBox>,
     /// A label attached to the next loop (for `break`/`continue label`).
     pending_label: Option<String>,
     /// The promise-reaction microtask queue, drained after the script.
@@ -3269,6 +3274,7 @@ impl<'a> Interp<'a> {
             in_field_initializer: false,
             eval_param_names: None,
             fn_stack: Vec::new(),
+            fn_args_stack: Vec::new(),
             current_home_static: false,
             pending_label: None,
             microtasks: Vec::new(),
@@ -6224,13 +6230,18 @@ impl<'a> Interp<'a> {
     /// enumerable data property. A non-configurable accessor / non-writable /
     /// non-enumerable property (e.g. `NaN`, `undefined`, `Infinity`) blocks it.
     fn can_declare_global_function(&self, g: Handle, name: &str) -> bool {
-        if !self.realm.has_own(g, name) {
+        // NB: `has_own` only reports *data* properties, so an accessor installed
+        // with `Object.defineProperty(globalThis, name, {get…})` must be probed
+        // separately — it is an own property too, and a non-configurable one
+        // blocks the declaration.
+        let is_accessor = self.realm.accessor(g, name).is_some();
+        if !is_accessor && !self.realm.has_own(g, name) {
             return self.realm.is_extensible(g);
         }
         if !self.realm.property_is_non_configurable(g, name) {
             return true;
         }
-        self.realm.accessor(g, name).is_none()
+        !is_accessor
             && !self.realm.property_is_readonly(g, name)
             && self.realm.property_is_enumerable(g, name)
     }
@@ -6913,8 +6924,13 @@ impl<'a> Interp<'a> {
                 // and the property's attributes; an identifier read falls back to
                 // the global-object property — see `read_ident_ref`). This is the
                 // EvalDeclarationInstantiation "binding is not reinitialized" rule.
-                let global_has =
-                    at_global && global_obj.is_some_and(|g| self.realm.has_own(g, name));
+                // An existing *accessor* property counts as the binding too (it
+                // is an own property of the global object), so a `var` of that
+                // name must neither shadow nor overwrite it.
+                let global_has = at_global
+                    && global_obj.is_some_and(|g| {
+                        self.realm.has_own(g, name) || self.realm.accessor(g, name).is_some()
+                    });
                 if !self.var_scope.has_local(name) && !global_has {
                     // A sloppy `eval`'s `var` in a *non-global* variable
                     // environment is a deletable binding (`delete` removes it);
@@ -6996,20 +7012,20 @@ impl<'a> Interp<'a> {
                 self.set_fn_name(value, &id.name);
                 self.set_fn_source(value, func.span);
                 if hoist_vars {
+                    let at_global_var = self.var_scope.ptr_eq(&self.global_scope);
+                    let global_obj = self.global_this.as_handle().map(Handle::from_raw);
                     // A function/program top-level declaration binds in the
                     // variable environment (for an eval body, the outer `varEnv`).
                     // A sloppy `eval`'s function declaration in a non-global
                     // variable environment is a deletable binding.
-                    if eval_code && !self.var_scope.ptr_eq(&self.global_scope) {
+                    if eval_code && !at_global_var {
                         self.var_scope.declare_deletable(&id.name, value);
                     } else {
                         self.var_scope.declare(&id.name, value);
                     }
                     // A global function declaration also publishes on the global
                     // object (`function f(){}; this.f === f`).
-                    if self.var_scope.ptr_eq(&self.global_scope)
-                        && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
-                    {
+                    if at_global_var && let Some(g) = global_obj {
                         // CreateGlobalFunctionBinding. When there is no existing own
                         // property, or it is configurable, (re)define with full data
                         // attributes: writable, enumerable, and configurable set to
@@ -7018,11 +7034,19 @@ impl<'a> Interp<'a> {
                         // non-configurable (deletable = false); one created by global
                         // `eval` code is configurable (deletable = true). When the
                         // existing property is non-configurable (but declarable —
-                        // validated by CanDeclareGlobalFunction), update only the
-                        // value and preserve its attributes.
+                        // validated by CanDeclareGlobalFunction above), update only
+                        // the value and preserve its attributes.
                         let deletable = eval_code && !self.script_eval_globals;
-                        let redefine_attrs = !self.realm.has_own(g, &id.name)
-                            || !self.realm.property_is_non_configurable(g, &id.name);
+                        let has_own = self.realm.has_own(g, &id.name)
+                            || self.realm.accessor(g, &id.name).is_some();
+                        let redefine_attrs =
+                            !has_own || !self.realm.property_is_non_configurable(g, &id.name);
+                        if redefine_attrs {
+                            // A configurable *accessor* is fully replaced by the
+                            // function's data property (its getter/setter must not
+                            // survive, and must not run).
+                            self.realm.clear_accessor(g, &id.name);
+                        }
                         self.realm.force_set_property(g, &id.name, value);
                         if redefine_attrs {
                             self.realm.clear_readonly_property(g, &id.name);

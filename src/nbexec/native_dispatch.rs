@@ -3167,21 +3167,17 @@ impl<'a> Interp<'a> {
             // (Test262 `caller` feature): reading them yields `null` rather than
             // throwing, matching mainstream engines.
             N_THROW_TYPE_ERROR => {
+                // Only an *ordinary*, source-declared non-strict function keeps the
+                // legacy benign read (returns `null`); every restricted shape —
+                // strict, generator, async, arrow, class constructor, concise
+                // method / `get`/`set` accessor, bound, and dynamically-built —
+                // throws a TypeError per 16.2 (Forbidden Extensions). (Those
+                // functions have no own `caller`/`arguments` and so inherit this
+                // poisoned accessor from `Function.prototype`.)
                 if let Some(h) = self.this_val.as_handle().map(Handle::from_raw)
-                    && self.realm.get_property(h, BOUND_TARGET).is_none()
-                    && self.realm.get_property(h, DYN_FN_MARKER).is_none()
-                    && let Some((func_id, _)) = self.realm.function_at(h)
+                    && self.is_legacy_fn(h)
                 {
-                    let def = &self.functions[func_id as usize];
-                    // Only an *ordinary*, source-declared non-strict function keeps
-                    // the legacy benign read (returns `null`); strict, generator,
-                    // async, arrow, bound, and dynamically-built functions are
-                    // restricted and their `.caller`/`.arguments` always throw a
-                    // TypeError (an arrow has no own `caller`/`arguments` and
-                    // inherits the poisoned accessor).
-                    if !def.is_strict && !def.is_generator && !def.is_async && !def.is_arrow {
-                        return Ok(NanBox::null());
-                    }
+                    return Ok(NanBox::null());
                 }
                 return Err(self.type_error(
                     "'caller', 'callee', and 'arguments' may not be accessed on strict mode \

@@ -2018,6 +2018,10 @@ impl<'a> Interp<'a> {
         // who is calling. Popped unconditionally below (the whole body runs inside
         // the closure, so no early return can skip it).
         self.fn_stack.push(callee);
+        // The parallel `arguments`-object slot for this activation (filled in
+        // below once the object exists; an arrow leaves it `null`), which serves
+        // the legacy `fn.arguments` extension.
+        self.fn_args_stack.push(NanBox::null());
         let result = (|| {
             // A non-arrow function gets an `arguments` array-like of its call
             // arguments. (Arrows inherit the enclosing `arguments`.) Bound *before*
@@ -2042,6 +2046,9 @@ impl<'a> Interp<'a> {
                 });
                 let arguments = self.make_arguments_object(args, callee, mapped_names.as_deref());
                 self.current.declare("arguments", arguments);
+                if let Some(slot) = self.fn_args_stack.last_mut() {
+                    *slot = arguments;
+                }
             }
             // While evaluating parameter defaults, expose the formal parameter
             // BoundNames (+ `arguments`) so a sloppy direct `eval("var X")` whose
@@ -2189,6 +2196,7 @@ impl<'a> Interp<'a> {
             r
         })();
         self.fn_stack.pop();
+        self.fn_args_stack.pop();
         self.current = saved;
         self.leave_realm(realm_guard);
         #[cfg(all(feature = "module", feature = "std"))]

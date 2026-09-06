@@ -696,7 +696,25 @@ impl<'a> Interp<'a> {
                                 }
                             }
                         } else if let Expr::Ident(id) = argument {
-                            if let Some(frame) = self.current.owner_frame(&id.name) {
+                            // Resolve the bare name the way the spec's environment
+                            // chain does: an enclosing `with` object's environment
+                            // record sits *between* the reference and any outer
+                            // declarative binding, so it is consulted first.
+                            // `with_binding` already reports `None` when an inner
+                            // lexical/var binding shadows the object, so the
+                            // declarative arms below still win in that case. (Only
+                            // the object-record arm can actually delete anything —
+                            // `with (o) { delete arguments }` removes `o.arguments`
+                            // rather than reporting `false` for the function's own
+                            // `arguments` binding.)
+                            if let Some(h) = self.with_binding(&id.name) {
+                                // A bare name that resolves through a `with` object's
+                                // environment deletes that object's property — not the
+                                // similarly-named global (`with (o) { delete p }`
+                                // removes `o.p`, leaving any global `p` intact).
+                                result = self.realm.delete_property(h, &id.name);
+                                is_property_delete = true;
+                            } else if let Some(frame) = self.current.owner_frame(&id.name) {
                                 // A resolvable lexical/var binding is non-deletable
                                 // (a no-op returning `false`) EXCEPT a binding a
                                 // sloppy `eval` introduced as deletable into a
@@ -730,13 +748,6 @@ impl<'a> Interp<'a> {
                                 } else {
                                     result = false;
                                 }
-                            } else if let Some(h) = self.with_binding(&id.name) {
-                                // A bare name that resolves through a `with` object's
-                                // environment deletes that object's property — not the
-                                // similarly-named global (`with (o) { delete p }`
-                                // removes `o.p`, leaving any global `p` intact).
-                                result = self.realm.delete_property(h, &id.name);
-                                is_property_delete = true;
                             } else if let Some(g) = self.global_object()
                                 && (self.realm.has_own(g, &id.name)
                                     || self.realm.accessor(g, &id.name).is_some())
@@ -3296,22 +3307,45 @@ impl<'a> Interp<'a> {
         self.read_member(obj, name)
     }
 
+    /// Whether `f` is one of the *legacy* callables for which the
+    /// implementation-defined `fn.caller` / `fn.arguments` reads stay benign: an
+    /// ordinary, source-declared, **non-strict** FunctionDeclaration or
+    /// FunctionExpression.
+    ///
+    /// ECMA-262 16.2 (Forbidden Extensions) restricts every other function form —
+    /// strict functions, generators, async functions, arrows, class
+    /// constructors/methods, concise methods and `get`/`set` accessors, bound
+    /// functions, and built-ins — so those must reach the inherited
+    /// `%ThrowTypeError%` accessor on `Function.prototype` and throw a TypeError.
+    /// (A `new Function(...)` body is also excluded here; it is a legacy-eligible
+    /// shape in mainstream engines but this engine keeps it restricted.)
+    pub(crate) fn is_legacy_fn(&self, f: crate::heap::Handle) -> bool {
+        if self.realm.get_property(f, BOUND_TARGET).is_some()
+            || self.realm.get_property(f, DYN_FN_MARKER).is_some()
+        {
+            return false;
+        }
+        let Some((func_id, _)) = self.realm.function_at(f) else {
+            return false;
+        };
+        let def = &self.functions[func_id as usize];
+        !(def.is_strict
+            || def.is_generator
+            || def.is_async
+            || def.is_arrow
+            || def.is_method
+            || def.home_class.is_some())
+    }
+
     /// The legacy `fn.caller` value for an *ordinary, source-declared, non-strict*
     /// function: the function that is currently invoking `f` (its nearest live
     /// caller on the invocation stack), or `null` when there is none, when `f` is
     /// not executing, or when the caller is strict (a strict frame is never
     /// exposed). `None` for every other callable — bound, dynamically built,
-    /// strict, generator, async, or arrow — so those keep the spec's poisoned
-    /// `%ThrowTypeError%` accessor and throw.
+    /// strict, generator, async, arrow, or a method — so those keep the spec's
+    /// poisoned `%ThrowTypeError%` accessor and throw.
     fn legacy_caller(&mut self, f: crate::heap::Handle) -> Option<NanBox> {
-        if self.realm.get_property(f, BOUND_TARGET).is_some()
-            || self.realm.get_property(f, DYN_FN_MARKER).is_some()
-        {
-            return None;
-        }
-        let (func_id, _) = self.realm.function_at(f)?;
-        let def = &self.functions[func_id as usize];
-        if def.is_strict || def.is_generator || def.is_async || def.is_arrow {
+        if !self.is_legacy_fn(f) {
             return None;
         }
         let raw = f.to_raw();
@@ -3335,6 +3369,32 @@ impl<'a> Interp<'a> {
         } else {
             caller
         })
+    }
+
+    /// The legacy `fn.arguments` value for an *ordinary, source-declared,
+    /// non-strict* function: the `arguments` object of its nearest live activation
+    /// (`function f(){ return f.arguments; }`), or `null` when `f` is not
+    /// currently executing. `None` for every other callable, which then reaches
+    /// the poisoned `%ThrowTypeError%` accessor and throws (16.2 Forbidden
+    /// Extensions).
+    fn legacy_arguments(&mut self, f: crate::heap::Handle) -> Option<NanBox> {
+        if !self.is_legacy_fn(f) {
+            return None;
+        }
+        let raw = f.to_raw();
+        let Some(idx) = self
+            .fn_stack
+            .iter()
+            .rposition(|v| v.as_handle() == Some(raw))
+        else {
+            return Some(NanBox::null());
+        };
+        Some(
+            self.fn_args_stack
+                .get(idx)
+                .copied()
+                .unwrap_or_else(NanBox::null),
+        )
     }
 
     /// `a + b` for two string values, throwing the spec `RangeError` when the
@@ -3785,6 +3845,15 @@ impl<'a> Interp<'a> {
         if name == "caller"
             && !self.realm.has_own(handle, "caller")
             && let Some(v) = self.legacy_caller(handle)
+        {
+            return Ok(v);
+        }
+        // The matching legacy `fn.arguments` extension: an ordinary non-strict
+        // function reports the `arguments` object of its nearest live activation
+        // (`null` when it is not executing) instead of throwing.
+        if name == "arguments"
+            && !self.realm.has_own(handle, "arguments")
+            && let Some(v) = self.legacy_arguments(handle)
         {
             return Ok(v);
         }
