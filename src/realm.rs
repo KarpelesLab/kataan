@@ -224,6 +224,21 @@ pub struct Realm {
     /// override is recorded in [`native_protos`](Realm::native_protos) /
     /// [`callable_null_protos`](Realm::callable_null_protos).
     array_proto_intrinsic: Option<Handle>,
+    /// The **first** realm's `%Array.prototype%` — the one installed by the very
+    /// first `install_globals` on this heap, never replaced when
+    /// [`restore_intrinsics`](Realm::restore_intrinsics) swaps
+    /// [`array_proto_intrinsic`](Realm::array_proto_intrinsic) to another realm's.
+    ///
+    /// A dense array carries no inline `[[Prototype]]`, so `object_proto` has to
+    /// *derive* it. Deriving it from the live `array_proto_intrinsic` makes an
+    /// array's prototype depend on which realm happens to be running when it is
+    /// asked — so `$262.createRealm().global.eval("[1,2]")` reported the *main*
+    /// realm's `%Array.prototype%`. Instead the derived default is this fixed
+    /// first-realm prototype, and [`new_array`](Realm::new_array) stamps an
+    /// explicit `native_protos` entry on any array allocated while some *other*
+    /// realm's intrinsics are active. Costs one `Option<Handle>` compare per array
+    /// allocation and nothing at all until a second realm exists.
+    root_array_proto: Option<Handle>,
     /// `%Promise.prototype%` — the `[[Prototype]]` of every engine-created promise.
     /// Captured at install time so an engine-internal promise (dynamic `import()`,
     /// an async function's result, a microtask reaction) never picks up a *tampered*
@@ -515,6 +530,7 @@ impl Realm {
             function_proto_intrinsic: None,
             throw_type_error_intrinsic: None,
             array_proto_intrinsic: None,
+            root_array_proto: None,
             promise_proto_intrinsic: None,
             symbol_proto_intrinsic: None,
             string_proto_intrinsic: None,
@@ -585,6 +601,12 @@ impl Realm {
     /// `[[Prototype]]` for every dense `Cell::Array`.
     pub fn set_array_proto_intrinsic(&mut self, handle: Handle) {
         self.array_proto_intrinsic = Some(handle);
+        // The first realm installed on this heap fixes the *derived* default for
+        // every dense array (see `root_array_proto`); a later
+        // `$262.createRealm()` realm's `install_globals` must not move it.
+        if self.root_array_proto.is_none() {
+            self.root_array_proto = Some(handle);
+        }
     }
 
     /// The realm's `%Array.prototype%` intrinsic, if installed — the default
@@ -1616,7 +1638,17 @@ impl Realm {
 
     /// Allocates an array of `elements` in the heap and returns its handle.
     pub fn new_array(&mut self, elements: Vec<NanBox>) -> Handle {
-        self.heap.alloc(Cell::Array(elements))
+        let h = self.heap.alloc(Cell::Array(elements));
+        // An array created while a `$262.createRealm()` realm is running belongs to
+        // *that* realm: record its `%Array.prototype%` explicitly, since the derived
+        // default (`object_proto`) is the first realm's. No-op in the single-realm
+        // case, which is every program that never calls `$262.createRealm`.
+        if let Some(p) = self.array_proto_intrinsic
+            && Some(p) != self.root_array_proto
+        {
+            self.native_protos.insert(h.to_raw(), p);
+        }
+        h
     }
 
     /// Allocates a closure: a function-table index plus its captured scope.
@@ -2574,7 +2606,10 @@ impl Realm {
             if self.callable_null_protos.contains(&handle.to_raw()) {
                 return None;
             }
-            return self.array_proto_intrinsic;
+            // The *first* realm's `%Array.prototype%`, not whichever realm happens
+            // to be running: an array created in another realm carries an explicit
+            // `native_protos` stamp (checked above) instead.
+            return self.root_array_proto;
         }
         None
     }
@@ -4319,6 +4354,7 @@ impl Realm {
                 self.function_proto_intrinsic,
                 self.throw_type_error_intrinsic,
                 self.array_proto_intrinsic,
+                self.root_array_proto,
                 self.promise_proto_intrinsic,
                 self.symbol_proto_intrinsic,
                 self.bigint_proto_intrinsic,

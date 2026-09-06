@@ -2178,8 +2178,16 @@ impl<'a> Interp<'a> {
                 // `«len»`. Only the default `%Array%` / a non-constructor `this`
                 // builds a plain dense array.
                 let this_c = self.this_val;
-                let is_array_ctor =
-                    self.current.get("Array").and_then(|v| v.as_handle()) == this_c.as_handle();
+                // Skipping `Construct(C)` for the plain `%Array%` is only
+                // equivalent when that `%Array%` belongs to the *running* realm: a
+                // cross-realm `Array` (`g.Array.from.call(Array, …)`, or
+                // `Array.from.call(g.Array, …)`) must produce an array in *its*
+                // realm, so route it through `construct`, which enters that realm.
+                let this_realm = this_c
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.get_function_realm(h));
+                let is_array_ctor = self.is_array_ctor(this_c) && this_realm == self.cur_realm;
                 let use_ctor = self.is_constructor_value(this_c) && !is_array_ctor;
                 // Helper: unwrap a freshly-`Construct`ed target to its handle.
                 if is_iterable {

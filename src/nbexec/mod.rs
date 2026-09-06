@@ -4743,6 +4743,11 @@ impl<'a> Interp<'a> {
         // A minimal `Object.prototype` carrying the methods commonly invoked via
         // `Object.prototype.<m>.call(x)`. The receiver arrives as `this`.
         let obj_proto = self.realm.new_object();
+        // `%Object.prototype%.[[Prototype]]` is **null** (20.1.3). `new_object`
+        // links `default_object_proto`, which in a `$262.createRealm()` realm still
+        // points at the *parent* realm's `Object.prototype` at this point — leaving
+        // it would chain the child realm's whole object graph onto the parent's.
+        self.realm.set_object_proto(obj_proto, None);
         for (name, id, arity) in [
             ("toString", N_OBJ_PROTO_TOSTRING, 0u32),
             ("toLocaleString", N_OBJ_PROTO_TOLOCALESTRING, 0),

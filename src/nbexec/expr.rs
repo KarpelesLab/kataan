@@ -3117,6 +3117,17 @@ impl<'a> Interp<'a> {
             }
             return;
         }
+        // The **main** realm's global object, written from *inside* another realm
+        // (a `$262.createRealm()` realm is routinely handed the parent's
+        // `globalThis`, as `h.mainGlobal = this; h.eval("mainGlobal.x = 1")`).
+        // `self.global_this`/`global_scope` are the *running* realm's while that
+        // code runs, so the main realm needs its own arm.
+        if self.main_global_this.as_handle() == Some(handle.to_raw()) {
+            if self.main_global_scope.get(name).is_some() {
+                self.main_global_scope.set(name, new);
+            }
+            return;
+        }
         // The same mirroring for **another realm's** global object: a
         // `$262.createRealm()` realm hands its `global` back to this one, and
         // `g.x = v` has to reach *that* realm's binding `x` — code running inside
@@ -6109,13 +6120,12 @@ impl<'a> Interp<'a> {
             {
                 return Ok(true);
             }
-            // A typed array matches its constructor (kind index == id − base).
-            if (N_TYPED_ARRAY_BASE..N_TYPED_ARRAY_BASE + TYPED_ARRAY_KINDS.len() as u16)
-                .contains(&id)
-                && self.realm.typed_kind(oh) == Some((id - N_TYPED_ARRAY_BASE) as u8)
-            {
-                return Ok(true);
-            }
+            // A typed array is matched by OrdinaryHasInstance (the generic
+            // `[[Prototype]]`-chain walk at the end of this block), *not* by its
+            // element-kind brand: a brand match ignores which realm the constructor
+            // belongs to, so `otherRealm.Int8Array.of() instanceof Int8Array` was
+            // wrongly true — and it also ignores an explicit
+            // `Object.setPrototypeOf(ta, null)`.
             // The `WebAssembly.*` boundary objects match by their marker slot.
             let wasm_marker = match id {
                 N_WASM_GLOBAL => Some(WASM_GLOBAL_VALUE),

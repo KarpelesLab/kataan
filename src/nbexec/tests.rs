@@ -4497,6 +4497,191 @@ fn cross_realm_new_non_constructor_throws_current_realm_type_error() {
 }
 
 #[test]
+fn cross_realm_array_literal_keeps_its_own_realms_array_prototype() {
+    // A dense array carries no inline `[[Prototype]]`; it must still report the
+    // prototype of the realm it was *created* in, not the running one.
+    assert_eq!(
+        run262(
+            "var g = $262.createRealm().global;\
+             Object.getPrototypeOf(g.eval('[1,2]')) === g.Array.prototype"
+        ),
+        "true",
+    );
+    assert_eq!(
+        run262(
+            "var g = $262.createRealm().global;\
+             g.eval('[1,2].map(function (x) { return x; })') instanceof g.Array"
+        ),
+        "true",
+    );
+    // And a main-realm array keeps the main realm's prototype when inspected from
+    // inside the other realm.
+    assert_eq!(
+        run262(
+            "var g = $262.createRealm().global;\
+             g.mainArr = [1,2];\
+             g.eval('Object.getPrototypeOf(mainArr) === Array.prototype')"
+        ),
+        "false",
+    );
+}
+
+#[test]
+fn cross_realm_array_from_follows_the_constructor_realm() {
+    // `Array.from` builds in the realm of the `this` constructor, whichever realm
+    // the `from` function itself came from.
+    assert_eq!(
+        run262(
+            "var g = $262.createRealm().global;\
+             g.Array.from([1,2,3]) instanceof g.Array"
+        ),
+        "true",
+    );
+    assert_eq!(
+        run262(
+            "var g = $262.createRealm().global;\
+             Array.from.call(g.Array, [1,2,3]) instanceof g.Array"
+        ),
+        "true",
+    );
+    assert_eq!(
+        run262(
+            "var g = $262.createRealm().global;\
+             g.Array.from.call(Array, [3,4,5]) instanceof Array"
+        ),
+        "true",
+    );
+}
+
+#[test]
+fn cross_realm_builtin_instances_link_their_own_realms_prototype() {
+    for (expr, ctor) in [
+        ("new g.Map()", "Map"),
+        ("new g.Set()", "Set"),
+        ("new g.Date()", "Date"),
+        ("new g.ArrayBuffer(8)", "ArrayBuffer"),
+        ("new g.Int8Array(2)", "Int8Array"),
+    ] {
+        assert_eq!(
+            run262(&alloc::format!(
+                "var g = $262.createRealm().global;\
+                 Object.getPrototypeOf({expr}) === g.{ctor}.prototype"
+            )),
+            "true",
+            "{expr}",
+        );
+    }
+    // A typed array's `[[Prototype]]` decides `instanceof`, not its element-kind
+    // brand — so a cross-realm view is not an instance of this realm's ctor.
+    assert_eq!(
+        run262(
+            "var g = $262.createRealm().global;\
+             g.Int8Array.of() instanceof Int8Array"
+        ),
+        "false",
+    );
+    // Nor is the intrinsic prototype re-resolved through the *global binding*,
+    // which user code may have replaced.
+    assert_eq!(
+        run("var Real = Int8Array;\
+             this.Int8Array = function () {};\
+             var ok = Object.getPrototypeOf(Real.from([1])) === Real.prototype;\
+             this.Int8Array = Real; ok"),
+        "true",
+    );
+}
+
+#[test]
+fn created_realm_object_prototype_has_a_null_prototype() {
+    assert_eq!(
+        run262(
+            "var g = $262.createRealm().global;\
+             Object.getPrototypeOf(g.Object.prototype) === null"
+        ),
+        "true",
+    );
+}
+
+#[test]
+fn cross_realm_array_buffer_slice_species_builds_in_the_species_realm() {
+    assert_eq!(
+        run262(
+            "var g = $262.createRealm().global;\
+             var a = new Int8Array(16).buffer;\
+             a.constructor = { [Symbol.species]: g.ArrayBuffer };\
+             a.slice(8, 16).constructor === g.ArrayBuffer"
+        ),
+        "true",
+    );
+}
+
+#[test]
+fn cross_realm_iterator_from_wraps_a_foreign_iterator() {
+    // `Iterator.from` compares against the *running* realm's `%Iterator%`, so the
+    // other realm's `from` must wrap a main-realm iterator rather than return it.
+    assert_eq!(
+        run262(
+            "var g = $262.createRealm().global;\
+             var it = [1,2,3].values();\
+             it === Iterator.from(it)"
+        ),
+        "true",
+    );
+    assert_eq!(
+        run262(
+            "var g = $262.createRealm().global;\
+             var it = [1,2,3].values();\
+             it === g.Iterator.from(it)"
+        ),
+        "false",
+    );
+}
+
+#[test]
+fn cross_realm_global_object_write_reaches_the_main_realms_binding() {
+    // `mainGlobal.x = v` performed from inside another realm must update the main
+    // realm's *declarative* binding, which a bare `x` there reads.
+    assert_eq!(
+        run262(
+            "var g = $262.createRealm().global;\
+             var result;\
+             g.mainGlobal = this;\
+             g.eval('mainGlobal.result = 42');\
+             result"
+        ),
+        "42",
+    );
+}
+
+#[test]
+fn proxy_apply_trap_arg_array_is_created_in_the_calling_realm() {
+    // `CreateArrayFromList(argumentsList)` happens in the realm of the current
+    // execution context, not the proxy target's.
+    assert_eq!(
+        run262(
+            "var f = $262.createRealm().global.eval(\
+               'new Proxy(function () {}, { apply: function (_, __, args) { return args; } })');\
+             f().constructor === Array"
+        ),
+        "true",
+    );
+}
+
+#[test]
+fn array_map_filter_over_a_proxy_are_live_and_species_first() {
+    // `map`/`filter` over a Proxy-of-array must do ArraySpeciesCreate *before* the
+    // element reads, interleave `Get` with `CreateDataPropertyOrThrow`, and never
+    // `Set(A, "length", …)`.
+    assert_eq!(
+        run("var logs = '';\
+             var a = new Proxy([1,2,3], { get: function (t, k) { logs += 'g:' + String(k) + ','; return t[k]; } });\
+             a.map(function (x) { return x; });\
+             logs"),
+        "g:map,g:length,g:constructor,g:0,g:1,g:2,",
+    );
+}
+
+#[test]
 fn global_this_object() {
     assert_eq!(run("typeof globalThis"), "object");
     assert_eq!(run("globalThis.globalThis === globalThis"), "true");

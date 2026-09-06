@@ -795,7 +795,7 @@ impl<'a> Interp<'a> {
         self.realm
             .set_hidden_property(obj, SHARED_ARRAY_BUFFER_BRAND, NanBox::boolean(true));
         if let Some(proto) = self
-            .current
+            .global_scope
             .get("SharedArrayBuffer")
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
@@ -850,7 +850,11 @@ impl<'a> Interp<'a> {
             );
         }
         let is_default = matches!(c.unpack(), Unpacked::Undefined)
-            || self.current.get("ArrayBuffer").and_then(|v| v.as_handle()) == c.as_handle();
+            || self
+                .global_scope
+                .get("ArrayBuffer")
+                .and_then(|v| v.as_handle())
+                == c.as_handle();
         if is_default {
             return Ok(self.make_array_buffer_from_bytes(data));
         }
@@ -919,7 +923,10 @@ impl<'a> Interp<'a> {
     /// inherits (so its methods, accessors, and `Symbol.toStringTag` resolve through
     /// the chain). `None` only before `install_globals` has run.
     pub(crate) fn array_buffer_proto(&mut self) -> Option<Handle> {
-        self.current
+        // The **running realm's** `%ArrayBuffer.prototype%` (`enter_realm` swaps
+        // `global_scope`), so a buffer built while a `$262.createRealm()` realm is
+        // running inherits that realm's prototype.
+        self.global_scope
             .get("ArrayBuffer")
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
@@ -956,8 +963,21 @@ impl<'a> Interp<'a> {
         callee: NanBox,
         new_target: NanBox,
     ) -> Result<Option<Handle>, ExecError> {
-        let kind_name = TYPED_ARRAY_KINDS[kind as usize].0;
-        let default = self.intrinsic_proto(kind_name);
+        // `%TAKind.prototype%` is read off the **constructor object being invoked**,
+        // not re-resolved from the global binding `<Kind>`: the binding may have been
+        // replaced (`this.Int8Array = NotArray`), and in a `$262.createRealm()` realm
+        // it names whichever realm's globals are in scope rather than the callee's.
+        let ctor_proto = callee
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|c| self.realm.get_property(c, "prototype"))
+            .filter(|p| self.is_object_value(*p))
+            .and_then(|p| p.as_handle())
+            .map(Handle::from_raw);
+        let default = match ctor_proto {
+            Some(p) => Some(p),
+            None => self.intrinsic_proto(TYPED_ARRAY_KINDS[kind as usize].0),
+        };
         self.instance_proto_checked(new_target, callee, default)
     }
 

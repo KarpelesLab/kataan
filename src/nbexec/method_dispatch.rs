@@ -1282,7 +1282,7 @@ impl<'a> Interp<'a> {
                     self.realm.make_bytes_shared(bytes);
                 }
                 if let Some(proto) = self
-                    .current
+                    .global_scope
                     .get("SharedArrayBuffer")
                     .and_then(|v| v.as_handle())
                     .map(Handle::from_raw)
@@ -3036,9 +3036,8 @@ impl<'a> Interp<'a> {
             self.flatten_into_array(a_h, handle, source_len, 0, depth, mapper, this_arg)?;
             return Ok(Some(a_v));
         }
-        // `map`/`filter` on a *plain* generic array-like (not a proxy whose target is
-        // an array — those still need `@@species` from the materialize path) read each
-        // element live per iteration (`HasProperty` then `Get`) so a callback that
+        // `map`/`filter` on a generic array-like (including a proxy whose target is
+        // an array) read each element live per iteration (`HasProperty` then `Get`) so a callback that
         // mutates a later index is observed; the result is built via
         // `ArraySpeciesCreate` → `CreateDataPropertyOrThrow` (an out-of-range `length`
         // throws a RangeError before any callback, matching `ArrayCreate`).
@@ -3052,7 +3051,6 @@ impl<'a> Interp<'a> {
             && (array_proto_generic || self.inherits_array_proto(handle))
             && !self.inherits_iterator_proto(handle)
             && !is_string_receiver
-            && !self.is_array_unwrap_proxy(NanBox::handle(handle.to_raw()))?
         {
             return Ok(Some(self.array_map_filter_generic(method, handle, args)?));
         }

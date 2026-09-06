@@ -216,10 +216,20 @@ impl<'a> Interp<'a> {
         this_val: NanBox,
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
-        let realm = callee
-            .as_handle()
-            .map(Handle::from_raw)
-            .and_then(|h| self.get_function_realm(h));
+        let callee_h = callee.as_handle().map(Handle::from_raw);
+        // A Proxy's `[[Call]]` pushes no execution context of its own — the `apply`
+        // trap (or, trapless, the target's own `[[Call]]`, both re-entered through
+        // this same function) establishes the running realm, so the proxy step
+        // stays in the *caller's*. Entering the target's realm here would build the
+        // `argArray` of `CreateArrayFromList(argumentsList)` in the wrong realm,
+        // which the spec fixes to "the Realm of the current execution context" —
+        // and would make a revoked proxy throw the target's `%TypeError%` instead
+        // of the running context's.
+        let realm = if callee_h.is_some_and(|h| self.realm.proxy_at(h).is_some()) {
+            self.cur_realm
+        } else {
+            callee_h.and_then(|h| self.get_function_realm(h))
+        };
         let guard = self.enter_realm(realm);
         let r = self.call_with_this_inner(callee, this_val, args);
         self.leave_realm(guard);
@@ -2646,7 +2656,11 @@ impl<'a> Interp<'a> {
     }
 
     pub(crate) fn intrinsic_proto(&mut self, name: &str) -> Option<Handle> {
-        self.current
+        // Resolved from the **running realm's** global scope (which `enter_realm`
+        // swaps), not the caller's lexical scope: a built-in constructing a value
+        // while a `$262.createRealm()` realm is running must link *that* realm's
+        // prototype, and must never see a user's block-scoped `let Map = …`.
+        self.global_scope
             .get(name)
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
@@ -2705,13 +2719,15 @@ impl<'a> Interp<'a> {
         // (a non-constructor) must throw the *current* realm's `%TypeError%` — the
         // "not a constructor" check is performed by the running execution context,
         // before any [[Construct]] would consult the callee's realm.
-        let realm = if self.is_constructor_value(callee) {
-            callee
-                .as_handle()
-                .map(Handle::from_raw)
-                .and_then(|h| self.get_function_realm(h))
-        } else {
+        let callee_h = callee.as_handle().map(Handle::from_raw);
+        let realm = if !self.is_constructor_value(callee)
+            // See `call_with_this`: a Proxy's `[[Construct]]` runs in the caller's
+            // realm, so its `construct` trap's `argArray` is created there.
+            || callee_h.is_some_and(|h| self.realm.proxy_at(h).is_some())
+        {
             self.cur_realm
+        } else {
+            callee_h.and_then(|h| self.get_function_realm(h))
         };
         // `[[Construct]]`'s post-body steps run after the callee context is removed,
         // so remember which realm issued this construction (see

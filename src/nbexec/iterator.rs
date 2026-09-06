@@ -889,7 +889,10 @@ impl<'a> Interp<'a> {
     }
 
     fn iter_ctor_slot(&mut self, slot: &str) -> Option<Handle> {
-        self.current
+        // The **running realm's** `Iterator` (`enter_realm` swaps `global_scope`):
+        // `otherRealm.Iterator.from(x)` must wrap in *that* realm's
+        // `%WrapForValidIteratorPrototype%`.
+        self.global_scope
             .get("Iterator")
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
@@ -1017,8 +1020,10 @@ impl<'a> Interp<'a> {
     /// `OrdinaryHasInstance(%Iterator%, h)`: whether `%Iterator.prototype%` is on
     /// `h`'s `[[Prototype]]` chain, walked through the proxy-aware `get_proto_of`.
     fn iterator_proto_in_chain(&mut self, h: Handle) -> Result<bool, ExecError> {
+        // `%Iterator%` is the intrinsic of the realm running `Iterator.from`, not
+        // the caller's — `otherRealm.Iterator.from(mainRealmIterator)` must wrap.
         let Some(iter_proto) = self
-            .current
+            .global_scope
             .get("Iterator")
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
