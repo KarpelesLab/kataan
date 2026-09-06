@@ -2968,6 +2968,19 @@ impl<'a> Interp<'a> {
     }
 
     pub(crate) fn can_write_property(&self, handle: crate::heap::Handle, key: &str) -> bool {
+        // A **private element** is not an ordinary property. It lives in
+        // [[PrivateElements]], so extensibility and integrity levels do not gate
+        // it: `Object.freeze(o)` must not stop `o.#x++` (PrivateSet has no
+        // writability check at all). It is also deliberately invisible to the key
+        // enumeration the tests below rely on, which is what made this wrong in a
+        // second way — an object whose only content is a private field has an
+        // empty *visible* own-key set, so once it is non-extensible it reads as
+        // vacuously frozen, and the `is_frozen` arm then rejected the write as an
+        // overwrite of a read-only property. Even `Object.preventExtensions` was
+        // enough to trigger it.
+        if crate::realm::is_private_key(key) {
+            return true;
+        }
         // A string's index properties (`"abc"[0]`, or `new String("abc")[0]`) are
         // non-writable own data properties, so a write to an in-range index fails.
         if let Ok(i) = key.parse::<usize>()

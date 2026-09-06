@@ -383,7 +383,10 @@ impl Object {
         value: NanBox,
         cache: &mut crate::ic::PropertyCache,
     ) -> bool {
-        if self.frozen || self.is_readonly(key) {
+        // A private element (`#x`) is stored as a property but is not one: it
+        // is [[PrivateElements]], which `Object.freeze` does not reach, so the
+        // integrity flags must not silently drop the write.
+        if !crate::realm::is_private_key(key) && (self.frozen || self.is_readonly(key)) {
             return false;
         }
         match &mut self.data {
@@ -421,7 +424,10 @@ impl Object {
     /// before adding a new property; once converted, this method appends into the
     /// dictionary and creates no shape transitions.
     pub fn set(&mut self, key: &str, value: NanBox) {
-        if self.frozen || self.is_readonly(key) {
+        // A private element (`#x`) is stored as a property but is not one: it
+        // is [[PrivateElements]], which `Object.freeze` does not reach, so the
+        // integrity flags must not silently drop the write.
+        if !crate::realm::is_private_key(key) && (self.frozen || self.is_readonly(key)) {
             return;
         }
         let mut added = false;

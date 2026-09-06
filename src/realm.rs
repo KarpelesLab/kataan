@@ -6077,6 +6077,20 @@ pub(crate) fn native_fn_name_segment(name: &str) -> &str {
 /// a *user* key such as `obj["\0\v"]`, which must still enumerate and serialize
 /// like any other string key.
 #[must_use]
+/// Whether `key` is the storage key of a **private element** (`#x`).
+///
+/// Property keys are how the engine stores [[PrivateElements]], so every rule
+/// that must *not* apply to them tests for this. Private elements are not
+/// ordinary properties: `Object.freeze(o)` does not stop `o.#x++`, and
+/// extensibility does not gate an existing one.
+///
+/// A user-written key cannot collide — the leading NUL is exactly what makes the
+/// internal namespace unreachable from JS source.
+#[must_use]
+pub fn is_private_key(key: &str) -> bool {
+    key.as_bytes().starts_with(b"\0#")
+}
+
 pub fn is_internal_key(key: &str) -> bool {
     let mut chars = key.chars();
     chars.next() == Some('\u{0}')
