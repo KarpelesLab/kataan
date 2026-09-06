@@ -495,6 +495,26 @@ struct Ctx<'a> {
     /// drain, which pops a job into a local before invoking its handler).
     /// [`vm_safepoint`] refuses to collect while it is set.
     gc_lock: usize,
+    /// Registers and activation inputs of every *suspended ancestor* frame whose
+    /// descent into the current one is fully published.
+    ///
+    /// A frame's registers live in a `Vec` on the Rust stack, invisible to the
+    /// collector, which is why collection was once confined to the outermost
+    /// activation. Publishing a snapshot lifts that: the collector is non-moving,
+    /// so a copy of the register file is a perfectly good root set — it only has
+    /// to keep objects alive, never to be updated. A suspended frame cannot
+    /// mutate its registers, so the snapshot cannot go stale.
+    frame_shadow: alloc::vec::Vec<NanBox>,
+    /// How many ancestor frames published their registers on the way here.
+    ///
+    /// Only the audited JS-to-JS call sites in [`run_frame`] publish. Any other
+    /// re-entry — a getter, a `valueOf`, an iterator step, a native builtin
+    /// calling back — leaves live values in Rust locals this pass cannot see, and
+    /// simply does not increment this. [`vm_safepoint`] then sees
+    /// `frames_published + 1 != call_depth` and declines to collect, so an
+    /// unaudited path is refused automatically rather than by remembering to add
+    /// a lock to it.
+    frames_published: usize,
     /// The activation inputs of the **outermost** frame — its `args`, `captures`
     /// and `this` — which live in [`call_with_inner`]'s Rust locals rather than in
     /// the register window. Republished here on every (re)binding of that frame so
@@ -541,6 +561,8 @@ pub fn run_program(
         call_depth: 0,
         gc_enabled: true,
         gc_lock: 0,
+        frame_shadow: alloc::vec::Vec::new(),
+        frames_published: 0,
         top_frame_roots: Vec::new(),
     };
     let value = call(&mut ctx, funcs, id, args)?;
@@ -576,6 +598,8 @@ pub fn run_program_capturing(
         call_depth: 0,
         gc_enabled: true,
         gc_lock: 0,
+        frame_shadow: alloc::vec::Vec::new(),
+        frames_published: 0,
         top_frame_roots: Vec::new(),
     };
     let value = call(&mut ctx, funcs, id, args)?;
@@ -622,7 +646,16 @@ fn call_with(
         return Err(VmError::Thrown(e));
     }
     ctx.call_depth += 1;
+    // Brackets the activation-input roots `call_with_inner` publishes, on every
+    // exit path (it returns from several places inside its tail-call loop).
+    // Restoring the publish counter here makes the whole scheme exception-safe:
+    // a `?` in the caller's publish site skips its own decrement, and this
+    // restores the count the enclosing frame saw on the way in.
+    let mark = ctx.frame_shadow.len();
+    let published = ctx.frames_published;
     let result = call_with_inner(ctx, funcs, id, args, captures, this_val);
+    ctx.frames_published = published;
+    ctx.frame_shadow.truncate(mark);
     ctx.call_depth -= 1;
     result
 }
@@ -642,6 +675,9 @@ fn call_with_inner(
     let mut args: Vec<NanBox> = args.to_vec();
     let mut captures: Vec<NanBox> = captures.to_vec();
     let mut this_val = this_val;
+    // Where this activation's published inputs start; reset on every tail-call
+    // rebinding and truncated back to on return.
+    let inputs_mark = ctx.frame_shadow.len();
     loop {
         // `id` can originate from a runtime value (an indirect call reads it out of
         // a callee array's slot 0), so a hostile script can make it point past the
@@ -679,12 +715,21 @@ fn call_with_inner(
         }
         // Republish the outermost activation's inputs for the GC safepoint: they
         // live in this function's Rust locals, which the collector cannot see.
-        // Only depth 1 can collect, so deeper frames skip the copy entirely.
         if ctx.gc_enabled && ctx.call_depth == 1 {
             ctx.top_frame_roots.clear();
             ctx.top_frame_roots.extend_from_slice(&args);
             ctx.top_frame_roots.extend_from_slice(&captures);
             ctx.top_frame_roots.push(this_val);
+        }
+        // The same inputs for a *nested* activation. Most are mirrored into the
+        // register window below, but not all: arguments past `n_params` are kept
+        // only here. A proper tail call re-enters this loop with new inputs, so
+        // the previous iteration's entries are dropped first.
+        ctx.frame_shadow.truncate(inputs_mark);
+        if ctx.gc_enabled && ctx.call_depth > 1 {
+            ctx.frame_shadow.extend_from_slice(&args);
+            ctx.frame_shadow.extend_from_slice(&captures);
+            ctx.frame_shadow.push(this_val);
         }
         // Tier-up: count this activation, optimize the body once the function gets
         // hot, and run the optimized bytecode thereafter.
@@ -913,6 +958,8 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
         // this entry point cannot enumerate, so it never collects.
         gc_enabled: false,
         gc_lock: 0,
+        frame_shadow: alloc::vec::Vec::new(),
+        frames_published: 0,
         top_frame_roots: Vec::new(),
     };
     match run_frame(&mut ctx, &[], program, &mut regs)? {
@@ -2515,17 +2562,27 @@ fn fold2(dst: Reg, a: Option<f64>, b: Option<f64>, f: impl Fn(f64, f64) -> NanBo
 /// * `gc_enabled` — this `Ctx` came from a `run_program*` entry, whose bytecode
 ///   was compiled before the realm existed (so no `LoadConst` can be a handle
 ///   from a table we don't scan; we scan them anyway, belt and braces).
-/// * `call_depth == 1` — no other activation, native, or JIT frame is below us,
-///   so no other register window or Rust-local value exists.
+/// * `frames_published + 1 == call_depth` — every frame below us is a plain
+///   JS activation that published its register window into
+///   [`Ctx::frame_shadow`]. A descent through anything else (a getter, a
+///   `valueOf`, an iterator step, a native builtin re-entering JS) leaves live
+///   values in Rust locals this pass cannot see; such a path does not publish,
+///   the equality fails, and collection is declined. Unaudited paths are
+///   therefore refused by construction rather than by remembering to lock them.
 /// * `gc_lock == 0` — no VM-owned Rust frame (the microtask drain) is holding
 ///   values outside a register window.
 ///
-/// Roots handed over: this frame's registers, the outermost activation's
-/// `args`/`captures`/`this` ([`Ctx::top_frame_roots`]), the pending microtask
-/// queue, and every handle-valued bytecode constant. The realm adds its own
-/// intrinsics in [`Realm::maybe_collect`].
+/// Roots handed over: this frame's registers, every published ancestor frame's
+/// registers and activation inputs ([`Ctx::frame_shadow`]), the outermost
+/// activation's `args`/`captures`/`this` ([`Ctx::top_frame_roots`]), the pending
+/// microtask queue, and every handle-valued bytecode constant. The realm adds
+/// its own intrinsics in [`Realm::maybe_collect`].
+///
+/// Collecting below the outermost frame is what keeps a long-running loop
+/// *inside a function* — which is to say nearly every real program — from
+/// growing without bound.
 fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox]) {
-    if !ctx.gc_enabled || ctx.call_depth != 1 || ctx.gc_lock != 0 {
+    if !ctx.gc_enabled || ctx.frames_published + 1 != ctx.call_depth || ctx.gc_lock != 0 {
         return;
     }
     // Cheap pre-check: skip building the root vector unless a cycle is due.
@@ -2538,7 +2595,11 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
             roots.push(Handle::from_raw(raw));
         }
     }
-    for r in regs.iter().chain(ctx.top_frame_roots.iter()) {
+    for r in regs
+        .iter()
+        .chain(ctx.frame_shadow.iter())
+        .chain(ctx.top_frame_roots.iter())
+    {
         push(&mut roots, *r);
     }
     for t in &ctx.microtasks {
@@ -3040,7 +3101,15 @@ fn run_frame(
                             if let Some((getter, _)) = ctx.realm.accessor(sh, &k)
                                 && getter.as_handle().is_some()
                             {
-                                let v = call_closure(ctx, funcs, getter, &[], recv)?;
+                                // Publish this frame's registers so a collection at a back-edge inside
+                                // the callee can see them (see `Ctx::frame_shadow`).
+                                let pub_mark = ctx.frame_shadow.len();
+                                ctx.frame_shadow.extend_from_slice(regs);
+                                ctx.frames_published += 1;
+                                let pub_r = call_closure(ctx, funcs, getter, &[], recv);
+                                ctx.frames_published -= 1;
+                                ctx.frame_shadow.truncate(pub_mark);
+                                let v = pub_r?;
                                 ctx.realm.set_property(target, &k, v);
                             }
                         }
@@ -3186,7 +3255,15 @@ fn run_frame(
                 // A throw from the callee is caught by this frame's nearest
                 // handler, else it keeps unwinding. Shared with the generic-JIT
                 // helper via `vm_call` so the two tiers can't diverge.
-                match vm_call(ctx, funcs, *func as usize, NanBox::undefined(), &argv) {
+                // Publish this frame's registers so a collection at a back-edge inside
+                // the callee can see them (see `Ctx::frame_shadow`).
+                let pub_mark = ctx.frame_shadow.len();
+                ctx.frame_shadow.extend_from_slice(regs);
+                ctx.frames_published += 1;
+                let pub_r = vm_call(ctx, funcs, *func as usize, NanBox::undefined(), &argv);
+                ctx.frames_published -= 1;
+                ctx.frame_shadow.truncate(pub_mark);
+                match pub_r {
                     Ok(ret) => regs[*dst as usize] = ret,
                     Err(VmError::Thrown(v)) => match handlers.pop() {
                         Some((target, reg)) => {
@@ -3242,7 +3319,15 @@ fn run_frame(
                     .map(|i| ctx.realm.get_element(handle, i + 1))
                     .collect();
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
-                match call_with(ctx, funcs, id, &argv, &caps, NanBox::undefined()) {
+                // Publish this frame's registers so a collection at a back-edge inside
+                // the callee can see them (see `Ctx::frame_shadow`).
+                let pub_mark = ctx.frame_shadow.len();
+                ctx.frame_shadow.extend_from_slice(regs);
+                ctx.frames_published += 1;
+                let pub_r = call_with(ctx, funcs, id, &argv, &caps, NanBox::undefined());
+                ctx.frames_published -= 1;
+                ctx.frame_shadow.truncate(pub_mark);
+                match pub_r {
                     Ok(ret) => regs[*dst as usize] = ret,
                     Err(VmError::Thrown(v)) => match handlers.pop() {
                         Some((target, reg)) => {
@@ -3272,7 +3357,15 @@ fn run_frame(
                     while let Some(c) = cur {
                         if let Some((getter, _)) = ctx.realm.accessor(c, key) {
                             if getter.as_handle().is_some() {
-                                match call_closure(ctx, funcs, getter, &[], recv_val) {
+                                // Publish this frame's registers so a collection at a back-edge inside
+                                // the callee can see them (see `Ctx::frame_shadow`).
+                                let pub_mark = ctx.frame_shadow.len();
+                                ctx.frame_shadow.extend_from_slice(regs);
+                                ctx.frames_published += 1;
+                                let pub_r = call_closure(ctx, funcs, getter, &[], recv_val);
+                                ctx.frames_published -= 1;
+                                ctx.frame_shadow.truncate(pub_mark);
+                                match pub_r {
                                     Ok(v) => return v.as_handle().map(|_| v),
                                     Err(e) => {
                                         accessor_err = Some(e);
@@ -3293,7 +3386,17 @@ fn run_frame(
                     handle_throw!(e);
                 }
                 let outcome = match user_method {
-                    Some(closure) => call_closure(ctx, funcs, closure, &argv, recv_val),
+                    Some(closure) => {
+                        // Publish this frame's registers so a collection at a back-edge inside
+                        // the callee can see them (see `Ctx::frame_shadow`).
+                        let pub_mark = ctx.frame_shadow.len();
+                        ctx.frame_shadow.extend_from_slice(regs);
+                        ctx.frames_published += 1;
+                        let pub_r = call_closure(ctx, funcs, closure, &argv, recv_val);
+                        ctx.frames_published -= 1;
+                        ctx.frame_shadow.truncate(pub_mark);
+                        pub_r
+                    }
                     None => match builtin_method(ctx, funcs, recv_val, key, &argv) {
                         Some(r) => r,
                         // Unknown method → fall back to the tree-walker.
@@ -3321,7 +3424,15 @@ fn run_frame(
                 let closure = regs[*callee as usize];
                 let recv_val = regs[*recv as usize];
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
-                match call_closure(ctx, funcs, closure, &argv, recv_val) {
+                // Publish this frame's registers so a collection at a back-edge inside
+                // the callee can see them (see `Ctx::frame_shadow`).
+                let pub_mark = ctx.frame_shadow.len();
+                ctx.frame_shadow.extend_from_slice(regs);
+                ctx.frames_published += 1;
+                let pub_r = call_closure(ctx, funcs, closure, &argv, recv_val);
+                ctx.frames_published -= 1;
+                ctx.frame_shadow.truncate(pub_mark);
+                match pub_r {
                     Ok(ret) => regs[*dst as usize] = ret,
                     Err(e) => handle_throw!(e),
                 }
@@ -3329,7 +3440,15 @@ fn run_frame(
             Op::CallCtor { ctor, recv, args } => {
                 let recv_val = regs[*recv as usize];
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
-                match call_with(ctx, funcs, *ctor as usize, &argv, &[], recv_val) {
+                // Publish this frame's registers so a collection at a back-edge inside
+                // the callee can see them (see `Ctx::frame_shadow`).
+                let pub_mark = ctx.frame_shadow.len();
+                ctx.frame_shadow.extend_from_slice(regs);
+                ctx.frames_published += 1;
+                let pub_r = call_with(ctx, funcs, *ctor as usize, &argv, &[], recv_val);
+                ctx.frames_published -= 1;
+                ctx.frame_shadow.truncate(pub_mark);
+                match pub_r {
                     Ok(_) => {}
                     Err(VmError::Thrown(v)) => match handlers.pop() {
                         Some((target, reg)) => {
@@ -3415,7 +3534,15 @@ fn run_frame(
                     _ => {}
                 }
                 // Not a VM closure: fall back to an ordinary call.
-                match call_closure(ctx, funcs, val, &argv, NanBox::undefined()) {
+                // Publish this frame's registers so a collection at a back-edge inside
+                // the callee can see them (see `Ctx::frame_shadow`).
+                let pub_mark = ctx.frame_shadow.len();
+                ctx.frame_shadow.extend_from_slice(regs);
+                ctx.frames_published += 1;
+                let pub_r = call_closure(ctx, funcs, val, &argv, NanBox::undefined());
+                ctx.frames_published -= 1;
+                ctx.frame_shadow.truncate(pub_mark);
+                match pub_r {
                     Ok(v) => return Ok(FrameExit::Return(Some(v))),
                     Err(e) => handle_throw!(e),
                 }
@@ -12172,6 +12299,8 @@ mod generic_jit_tests {
             call_depth: 0,
             gc_enabled: false,
             gc_lock: 0,
+            frame_shadow: alloc::vec::Vec::new(),
+            frames_published: 0,
             top_frame_roots: Vec::new(),
         }
     }
