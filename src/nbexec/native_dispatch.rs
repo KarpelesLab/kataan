@@ -1587,15 +1587,34 @@ impl<'a> Interp<'a> {
                         if self.realm.accessor(rh, &key).is_some() {
                             return Ok(NanBox::boolean(false));
                         }
-                        if self.realm.has_own(rh, &key) {
+                        let recv_has_own = self.realm.has_own(rh, &key);
+                        if recv_has_own {
                             if !self.can_write_property(rh, &key) {
                                 return Ok(NanBox::boolean(false));
                             }
                         } else if !self.realm.is_extensible(rh) {
                             return Ok(NanBox::boolean(false));
                         }
-                        self.assign_member_value(rh, arg(1), value)?;
-                        return Ok(NanBox::boolean(true));
+                        // OrdinarySetWithOwnDescriptor finishes with
+                        // `CreateDataProperty(Receiver, P, V)` / a value-only
+                        // `[[DefineOwnProperty]]` — **never** another `[[Set]]` on
+                        // the Receiver. Going through `[[Set]]` would re-walk the
+                        // Receiver's prototype chain and re-enter any proxy `set`
+                        // trap sitting on it, so the canonical passthrough
+                        // `set(t,k,v,r){ return Reflect.set(t,k,v,r) }` recursed
+                        // forever whenever `r`'s chain contained the proxy itself.
+                        let desc = self.realm.new_object();
+                        self.realm.set_property(desc, "value", value);
+                        if !recv_has_own {
+                            self.realm
+                                .set_property(desc, "writable", NanBox::boolean(true));
+                            self.realm
+                                .set_property(desc, "enumerable", NanBox::boolean(true));
+                            self.realm
+                                .set_property(desc, "configurable", NanBox::boolean(true));
+                        }
+                        let ok = self.apply_descriptor(rh, &key, desc, true)?;
+                        return Ok(NanBox::boolean(ok));
                     }
                     // `Reflect.set(array, "length", v)` is ArraySetLength, whose
                     // order matters: `v` is coerced *first* (twice, observably), and

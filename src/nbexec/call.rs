@@ -362,18 +362,11 @@ impl<'a> Interp<'a> {
         // A callable proxy: route through its `apply` trap, or call the target.
         if let Some((target, handler)) = self.realm.proxy_at(handle) {
             self.guard_revoked(handle)?;
-            let trap = self
-                .realm
-                .get_property(handler, "apply")
-                .unwrap_or(NanBox::undefined());
-            // A present but non-callable `apply` trap is a TypeError.
-            if !matches!(trap.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                if !trap
-                    .as_handle()
-                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-                {
-                    return Err(self.type_error("proxy apply trap is not a function"));
-                }
+            // `GetMethod(handler, "apply")` is a full `[[Get]]` — the handler may
+            // itself be a proxy (its `get` trap must observe the "apply" read) or
+            // expose the trap through an inherited accessor. A present but
+            // non-callable trap is a TypeError.
+            if let Some(trap) = self.proxy_trap(handler, "apply")? {
                 let arr = self.realm.new_array(args.to_vec());
                 let handler_box = NanBox::handle(handler.to_raw());
                 return self.call_with_this(
@@ -2438,10 +2431,13 @@ impl<'a> Interp<'a> {
             return Ok(proto.as_handle().map(Handle::from_raw));
         }
         // Non-object `.prototype` → the `%Intl.<ctor>.prototype%` intrinsic of
-        // `GetFunctionRealm(newTarget)`'s realm. The generic `realm_default_proto`
+        // `GetFunctionRealm(newTarget)`'s realm, which itself throws a TypeError
+        // when the newTarget chain reaches a revoked proxy. The generic
+        // `realm_default_proto`
         // cannot resolve these (an `Intl` service constructor is nested under the
         // `Intl` namespace, not a bare global), so consult the target realm's own
         // captured Intl prototype cache directly.
+        self.guard_function_realm(nt)?;
         Ok(self.realm_intl_default_proto(ctor_id, default, nt))
     }
 
@@ -2744,24 +2740,17 @@ impl<'a> Interp<'a> {
         // the target.
         if let Some((target, handler)) = self.realm.proxy_at(handle) {
             self.guard_revoked(handle)?;
-            let trap = self
-                .realm
-                .get_property(handler, "construct")
-                .unwrap_or(NanBox::undefined());
-            // A present but non-callable `construct` trap is a TypeError.
-            if !matches!(trap.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                if !trap
-                    .as_handle()
-                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-                {
-                    return Err(self.type_error("proxy construct trap is not a function"));
-                }
+            // newTarget is an explicit `Reflect.construct` newTarget if present,
+            // else the proxy itself. It is captured *before* the trap lookup, which
+            // can run arbitrary JS (a proxy handler / an accessor) and would
+            // otherwise consume or overwrite the pending value.
+            let new_target = self.reflect_new_target.take().unwrap_or(callee);
+            // `GetMethod(handler, "construct")` is a full `[[Get]]` — see the
+            // `apply` trap in `call_with_this` for why the raw slot read is wrong.
+            if let Some(trap) = self.proxy_trap(handler, "construct")? {
                 let arr = self.realm.new_array(args.to_vec());
                 let target_box = NanBox::handle(target.to_raw());
                 let handler_box = NanBox::handle(handler.to_raw());
-                // newTarget is an explicit `Reflect.construct` newTarget if present,
-                // else the proxy itself.
-                let new_target = self.reflect_new_target.take().unwrap_or(callee);
                 let result = self.call_with_this(
                     trap,
                     handler_box,
@@ -2777,8 +2766,7 @@ impl<'a> Interp<'a> {
             // `newTarget` stays the *proxy* (or the explicit `Reflect.construct`
             // one), never the target. That is what makes the target read
             // `proxy.prototype` through the `get` trap.
-            let nt = self.reflect_new_target.take().unwrap_or(callee);
-            self.reflect_new_target = Some(nt);
+            self.reflect_new_target = Some(new_target);
             return self.construct(NanBox::handle(target.to_raw()), args);
         }
         // `new boundFn(...)`: construct the bound target with the bound arguments
@@ -3601,7 +3589,12 @@ impl<'a> Interp<'a> {
                 // newTarget's realm (GetPrototypeFromConstructor step 4).
                 match p {
                     Some(x) => Some(x),
-                    None => self.realm_default_proto(default_proto, nt),
+                    None => {
+                        // Step 4 goes through `GetFunctionRealm(newTarget)`, which
+                        // throws when the chain reaches a revoked proxy.
+                        self.guard_function_realm(nt)?;
+                        self.realm_default_proto(default_proto, nt)
+                    }
                 }
             } else {
                 default_proto
@@ -4151,6 +4144,9 @@ impl<'a> Interp<'a> {
                 if self.is_object_value(p) {
                     p.as_handle().map(Handle::from_raw)
                 } else {
+                    // Step 4 goes through `GetFunctionRealm(newTarget)`, which
+                    // throws when the chain reaches a revoked proxy.
+                    self.guard_function_realm(nt)?;
                     self.realm_named_proto("Iterator", default, nt)
                 }
             };

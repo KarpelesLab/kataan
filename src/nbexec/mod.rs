@@ -6804,6 +6804,9 @@ impl<'a> Interp<'a> {
                 if self.is_object_value(ntp) {
                     ntp.as_handle().map(Handle::from_raw)
                 } else {
+                    // Step 4 goes through `GetFunctionRealm(newTarget)`, which
+                    // throws when the chain reaches a revoked proxy.
+                    self.guard_function_realm(nt)?;
                     self.realm_family_fn_proto(nt, keyword, default)
                 }
             } else {

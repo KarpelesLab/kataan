@@ -1214,6 +1214,22 @@ impl<'a> Interp<'a> {
                             // (so a `Reflect.construct(Derived, …, NT)` threads `NT`
                             // into the base function's `new.target`). Its object return
                             // overrides `this`.
+                            //
+                            // A **Proxy** superclass needs the real
+                            // `[[Construct]]`: a `[[Call]]` never consults the
+                            // `construct` trap and, for a trapless proxy wrapping a
+                            // class, lands on the "class constructor cannot be
+                            // invoked without 'new'" guard. `Construct` allocates
+                            // the instance itself (from `newTarget.prototype`), and
+                            // its object result rebinds `this` below.
+                            if fnp
+                                .as_handle()
+                                .map(Handle::from_raw)
+                                .is_some_and(|h| self.realm.proxy_at(h).is_some())
+                            {
+                                self.reflect_new_target = Some(self.new_target);
+                                return self.construct(fnp, &args).map(Some);
+                            }
                             self.pending_new_target = Some(self.new_target);
                             self.call_with_this(fnp, inst_val, &args).map(Some)
                         } else {
@@ -4636,6 +4652,24 @@ impl<'a> Interp<'a> {
         } else {
             false
         };
+        // `ObjectEnvironmentRecord.HasBinding` for the global object record is
+        // `HasProperty(globalObj, N)` — the global object's **prototype chain**
+        // counts too, so `Object.setPrototypeOf(globalThis, new Proxy(…, { has }))`
+        // makes a bare name a *resolvable* reference (no strict ReferenceError) and
+        // the write goes through that chain's `set` trap. Practically every program
+        // leaves the global object's `[[Prototype]]` at `%Object.prototype%`, where
+        // no engine treats an inherited name as a global binding, so the chain walk
+        // is gated on that prototype having been replaced — the ordinary path keeps
+        // the single own-property probe.
+        let ident_pre_proto_global = if let Expr::Ident(id) = target
+            && !ident_pre_own_global
+            && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
+            && self.realm.object_proto(g) != self.realm.default_object_proto()
+        {
+            self.has_property_proxied(g, &id.name)?
+        } else {
+            false
+        };
         // PutValue also resolves *which* binding the LHS names before the RHS runs.
         // Capture that base now — the `with`-object frame that provides the name, or
         // else the scope frame that owns it — so a RHS that mutates the binding
@@ -4828,6 +4862,25 @@ impl<'a> Interp<'a> {
                             return Ok(new);
                         }
                         self.realm.set_property(g, name, new);
+                        return Ok(new);
+                    }
+                    // Resolvable only through the global object's (replaced)
+                    // prototype chain: `SetMutableBinding` is `Set(globalObj, N, V,
+                    // strict)` — an OrdinarySet with the global object as the
+                    // Receiver, so the inherited setter / proxy `set` trap runs and
+                    // the value lands as an own property of the global object. The
+                    // sloppy path reaches the same code via `declare_sloppy_global`.
+                    if ident_pre_proto_global
+                        && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
+                    {
+                        let recv = NanBox::handle(g.to_raw());
+                        let ok = self.proxy_set_bool(g, name, new, recv)?;
+                        if !ok && self.strict {
+                            let m = self.new_str(&alloc::format!(
+                                "Cannot assign to read only property '{name}'"
+                            ));
+                            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                        }
                         return Ok(new);
                     }
                     // A strict write whose global-object property the RHS deleted
@@ -5065,7 +5118,13 @@ impl<'a> Interp<'a> {
         // inherited accessor setter (e.g. `Object.prototype.__proto__`) runs with
         // `this` = the proxy and a nested proxy target re-enters its own trap. A
         // `false` result is a failed [[Set]]: strict code throws, sloppy is silent.
-        if self.realm.proxy_at(handle).is_some() {
+        //
+        // A **private** reference is exempt: `PrivateSet` (7.3.32) operates on the
+        // object's `[[PrivateElements]]` list directly and is never routed through
+        // `[[Set]]`, so a proxy is fully transparent to it — the element lives on
+        // the proxy object itself (that is where the field initializer stamped it),
+        // never on the target, and no trap is consulted.
+        if self.realm.proxy_at(handle).is_some() && !matches!(property, PropertyKey::Private(_)) {
             let key = self.eval_prop_key(property)?;
             let recv = NanBox::handle(handle.to_raw());
             let ok = self.proxy_set_bool(handle, &key, new, recv)?;
