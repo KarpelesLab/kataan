@@ -4592,6 +4592,75 @@ fn cross_realm_builtin_instances_link_their_own_realms_prototype() {
 }
 
 #[test]
+fn cross_realm_builtin_instanceof_follows_the_prototype_chain_not_the_brand() {
+    // Every one of these was matched by its cell kind / marker slot, which records
+    // *what* the object is and not which realm built it — so an instance from a
+    // `$262.createRealm()` realm was an instance of this realm's constructor too.
+    for expr in [
+        "new Map()",
+        "new Set()",
+        "new WeakMap()",
+        "new WeakSet()",
+        "new Date(0)",
+        "/a/",
+        "new RegExp('a')",
+        "Promise.resolve(1)",
+        "new ArrayBuffer(4)",
+        "new DataView(new ArrayBuffer(4))",
+        "new Number(1)",
+        "new String('a')",
+        "new Boolean(1)",
+        "new Error('e')",
+        "new TypeError('e')",
+    ] {
+        let ctor = match expr {
+            "/a/" | "new RegExp('a')" => "RegExp",
+            "new DataView(new ArrayBuffer(4))" => "DataView",
+            "Promise.resolve(1)" => "Promise",
+            other => other
+                .trim_start_matches("new ")
+                .split(['(', ' '])
+                .next()
+                .unwrap(),
+        };
+        // Cross-realm: not an instance of *this* realm's constructor …
+        assert_eq!(
+            run262(&alloc::format!(
+                "var g = $262.createRealm().global;\
+                 g.eval({expr:?}) instanceof {ctor}"
+            )),
+            "false",
+            "cross-realm {expr} instanceof {ctor}",
+        );
+        // … but still an instance of its own realm's, and of this realm's when it
+        // was built here.
+        assert_eq!(
+            run262(&alloc::format!(
+                "var g = $262.createRealm().global;\
+                 g.eval({expr:?}) instanceof g.{ctor}"
+            )),
+            "true",
+            "own-realm {expr} instanceof g.{ctor}",
+        );
+        assert_eq!(
+            run(&alloc::format!("({expr}) instanceof {ctor}")),
+            "true",
+            "same-realm {expr} instanceof {ctor}",
+        );
+    }
+    // A subclass instance still matches the base constructor, and `Object.create`
+    // of the prototype now does too (the brand check answered "false" for it).
+    assert_eq!(run("class M extends Map {} new M() instanceof Map"), "true");
+    assert_eq!(run("Object.create(Map.prototype) instanceof Map"), "true");
+    // The four collections share one `Cell::Collection`, so the brand could not
+    // tell them apart.
+    assert_eq!(run("new Map() instanceof Set"), "false");
+    assert_eq!(run("new WeakMap() instanceof WeakSet"), "false");
+    // An error is no longer recognized by its (realm-independent) `name`.
+    assert_eq!(run("({ name: 'TypeError' }) instanceof TypeError"), "false");
+}
+
+#[test]
 fn created_realm_object_prototype_has_a_null_prototype() {
     assert_eq!(
         run262(

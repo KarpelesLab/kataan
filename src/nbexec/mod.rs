@@ -5408,10 +5408,16 @@ impl<'a> Interp<'a> {
             let mut subclass_names: Vec<&str> = ERROR_NAMES[1..N_GLOBAL_ERROR_COUNT].to_vec();
             subclass_names.push("URIError");
             subclass_names.push("EvalError");
+            // The `WebAssembly.*` error subclasses are namespaced rather than global,
+            // but they are error constructors like any other and need the same
+            // `.prototype` — `instanceof` is the `[[Prototype]]`-chain walk, so
+            // without one a `CompileError` would be an instance of nothing.
+            subclass_names.push("CompileError");
+            subclass_names.push("LinkError");
+            subclass_names.push("RuntimeError");
             for name in subclass_names {
                 if let Some(ctor) = self
-                    .current
-                    .get(name)
+                    .error_ctor_by_name(name)
                     .and_then(|v| v.as_handle())
                     .map(Handle::from_raw)
                 {
@@ -7299,6 +7305,30 @@ impl<'a> Interp<'a> {
         ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m)))
     }
 
+    /// The constructor for an [`ERROR_NAMES`] entry. Most are global bindings;
+    /// `CompileError`/`LinkError`/`RuntimeError` are reachable only through the
+    /// `WebAssembly` namespace object, so a plain scope lookup misses them.
+    ///
+    /// The global binding is read from `global_scope` first so a *local* shadow
+    /// (`function TypeError() {}` inside a function body) cannot divert an
+    /// engine-created error onto the user function's `prototype`; `current` is the
+    /// fallback for early bootstrap, before the constructors are bound.
+    fn error_ctor_by_name(&mut self, name: &str) -> Option<NanBox> {
+        if let Some(v) = self
+            .global_scope
+            .get(name)
+            .or_else(|| self.current.get(name))
+        {
+            return Some(v);
+        }
+        self.global_scope
+            .get("WebAssembly")
+            .or_else(|| self.current.get("WebAssembly"))
+            .and_then(|ns| ns.as_handle())
+            .map(Handle::from_raw)
+            .and_then(|ns| self.realm.get_property(ns, name))
+    }
+
     fn make_error(&mut self, id: u16, message: Option<NanBox>) -> NanBox {
         let name = ERROR_NAMES[(id - N_ERROR_BASE) as usize];
         let obj = self.realm.new_object();
@@ -7318,15 +7348,27 @@ impl<'a> Interp<'a> {
         // method from a class evaluated in another realm hitting a brand-check
         // failure), the thrown error must be that realm's `%TypeError%` — resolve
         // the constructor from *that realm's* global object, not the main realm's.
-        let realm_ctor = self
+        let realm_global = self
             .cur_realm
             .filter(|i| *i < self.created_realms.len())
             .and_then(|i| self.created_realms[i].global_this.as_handle())
-            .map(Handle::from_raw)
-            .and_then(|gt| self.realm.get_property(gt, name));
-        if let Some(proto) = realm_ctor
-            .or_else(|| self.global_scope.get(name))
-            .or_else(|| self.current.get(name))
+            .map(Handle::from_raw);
+        // The `WebAssembly.*` error subclasses are namespaced, not global, in every
+        // realm — hence the second lookup through the namespace object.
+        let realm_ctor = realm_global.and_then(|gt| {
+            self.realm.get_property(gt, name).or_else(|| {
+                self.realm
+                    .get_property(gt, "WebAssembly")
+                    .and_then(|ns| ns.as_handle())
+                    .map(Handle::from_raw)
+                    .and_then(|ns| self.realm.get_property(ns, name))
+            })
+        });
+        let ctor = match realm_ctor {
+            Some(c) => Some(c),
+            None => self.error_ctor_by_name(name),
+        };
+        if let Some(proto) = ctor
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .and_then(|c| self.realm.get_property(c, "prototype"))

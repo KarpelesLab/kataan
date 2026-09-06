@@ -6167,14 +6167,16 @@ impl<'a> Interp<'a> {
         {
             return Ok(false);
         }
-        // Built-in constructors: check the cell kind directly.
+        // Built-in constructors. Only the few kinds whose instances carry *no*
+        // usable `[[Prototype]]` link are still matched by their cell kind or marker
+        // slot (`WebAssembly.*`, `Temporal.*`, `Function`); everything else falls
+        // through to the OrdinaryHasInstance walk at the end of this block, because a
+        // brand says what an object *is*, never which realm's constructor made it.
         if let Some(id) = self.realm.native_at(ch) {
-            // A primitive wrapper (`new Number(…)`) matches its constructor.
-            if let Some(wt) = self.realm.get_property(oh, PRIM_WRAP_TYPE)
-                && wt.as_number() == Some(f64::from(id))
-            {
-                return Ok(true);
-            }
+            // A primitive wrapper (`new Number(…)`) is matched by OrdinaryHasInstance
+            // like everything else: its `[[NumberData]]` brand says *what* it wraps,
+            // not which realm's `Number` produced it, so
+            // `otherRealm.eval("new Number(1)") instanceof Number` was wrongly true.
             // A typed array is matched by OrdinaryHasInstance (the generic
             // `[[Prototype]]`-chain walk at the end of this block), *not* by its
             // element-kind brand: a brand match ignores which realm the constructor
@@ -6195,15 +6197,11 @@ impl<'a> Interp<'a> {
             {
                 return Ok(true);
             }
-            // `ArrayBuffer` / `DataView` match by their marker slot. (A typed array is
-            // a `Cell::TypedArray`, not an object with `ARRAY_BUFFER_BYTES`, so
-            // `typedArray instanceof ArrayBuffer` is correctly false.)
-            if id == N_ARRAY_BUFFER && self.realm.get_property(oh, ARRAY_BUFFER_BYTES).is_some() {
-                return Ok(true);
-            }
-            if id == N_DATA_VIEW && self.realm.get_property(oh, DATA_VIEW_BUF).is_some() {
-                return Ok(true);
-            }
+            // `ArrayBuffer` / `DataView` are matched by OrdinaryHasInstance too: the
+            // `ARRAY_BUFFER_BYTES` / `DATA_VIEW_BUF` marker slot records the internal
+            // slot, not the owning realm, so a buffer or view built in a
+            // `$262.createRealm()` realm was an instance of *every* realm's
+            // constructor.
             // The `Error` family: an error instance now links to its constructor's
             // `.prototype`, so OrdinaryHasInstance (the prototype-chain walk) is the
             // authoritative check — robust against `name` being reassigned.
@@ -6250,30 +6248,27 @@ impl<'a> Interp<'a> {
                             .map(|(p, _)| p);
                     }
                 }
-                // Plain error objects: match by the `name` property.
-                let obj_name = self
-                    .realm
-                    .get_property(oh, "name")
-                    .map(|v| self.realm.to_display_string(v))
-                    .unwrap_or_default();
-                if !ERROR_NAMES.contains(&obj_name.as_str()) {
-                    return Ok(false);
-                }
-                return Ok(want == "Error" || obj_name == want);
+                // No `name`-property fallback: `name` is an ordinary inherited
+                // property, identical in every realm, so matching on it made an
+                // error from a `$262.createRealm()` realm an instance of *this*
+                // realm's `Error` (and made any `{ name: "TypeError" }` one too).
+                return Ok(false);
             }
+            // `RegExp`, the four collections, `Date` and `Promise` are matched by
+            // OrdinaryHasInstance (the `[[Prototype]]`-chain walk at the end of this
+            // block), *not* by their cell kind. A brand match ignores which realm the
+            // constructor belongs to (`otherRealm.eval("new Map()") instanceof Map`
+            // was wrongly true), cannot tell the four collections apart from one
+            // another (`new Map() instanceof Set` was true — they share
+            // `Cell::Collection`), and ignores both an explicit
+            // `Object.setPrototypeOf(x, null)` and an `Object.create(Map.prototype)`.
             match id {
-                N_REGEXP => return Ok(self.realm.regexp_at(oh).is_some()),
-                N_MAP | N_SET | N_WEAKMAP | N_WEAKSET => {
-                    return Ok(self.realm.collection_is_set(oh).is_some());
-                }
-                N_DATE => return Ok(self.realm.date_at(oh).is_some()),
                 id if crate::nbexec::temporal::is_temporal_ctor_id(id) => {
                     // `x instanceof Temporal.<Type>` — a branded instance of that
                     // exact kind.
                     return Ok(self.realm.temporal_at(oh).map(|d| d.kind)
                         == crate::nbexec::temporal::kind_for_ctor_id(id));
                 }
-                N_PROMISE => return Ok(self.realm.promise_state(oh).is_some()),
                 // Every callable (function, native, bound) and every class is a
                 // `Function`.
                 N_FUNCTION => {
