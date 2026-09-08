@@ -944,23 +944,90 @@ fn to_raw_precision(
     (int_out, frac_out)
 }
 
-/// Group `int_str` (latn digits, no sign) into thousands with `sep`.
+/// From a nine-digit probe — `"123,456,789"`, en-IN's `"12,34,56,789"`, either
+/// with affixes or a `dec_sep`-led fraction — the group separator and the
+/// primary and secondary group sizes; `("", 0, 0)` when the integer part isn't
+/// grouped at all.
 #[cfg(feature = "intl")]
-fn group_thousands_sep(int_str: &str, sep: &str) -> String {
-    if sep.is_empty() || int_str.len() <= 3 {
+fn extract_grouping(probe: &str, nu: &str, dec_sep: &str) -> (String, usize, usize) {
+    let chars: alloc::vec::Vec<char> = probe.chars().collect();
+    let mut i = 0;
+    while i < chars.len() && !is_digit_of_numbering_system(nu, chars[i]) {
+        i += 1; // skip prefix
+    }
+    // Integer digit runs and the separator runs between them, stopping at the
+    // decimal separator (or the suffix / end of the probe).
+    let mut groups: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    let mut seps: alloc::vec::Vec<String> = alloc::vec::Vec::new();
+    loop {
+        let start = i;
+        while i < chars.len() && is_digit_of_numbering_system(nu, chars[i]) {
+            i += 1;
+        }
+        if i == start {
+            break;
+        }
+        groups.push(i - start);
+        let mut sep = String::new();
+        while i < chars.len() && !is_digit_of_numbering_system(nu, chars[i]) {
+            sep.push(chars[i]);
+            i += 1;
+        }
+        if i >= chars.len() || sep.is_empty() || sep == dec_sep {
+            break;
+        }
+        seps.push(sep);
+    }
+    // `groups` has one entry more than `seps`; the last group is the primary
+    // one (`789`), the one before it the secondary size (`56` in en-IN, `456`
+    // elsewhere).
+    match (seps.last(), groups.len()) {
+        (Some(sep), n) if n >= 2 => {
+            let primary = groups[n - 1];
+            let secondary = if n >= 3 { groups[n - 2] } else { primary };
+            (sep.clone(), primary, secondary)
+        }
+        _ => (String::new(), 0, 0),
+    }
+}
+
+/// Group `int_str` (latn digits, no sign) with `sep`: the last `primary` digits
+/// form the first group from the right and `secondary`-sized groups precede it
+/// (en-IN's `9,87,65,43,21,98,76,54,321`). No separator is emitted unless the
+/// integer carries at least `min_grouping` digits beyond the primary group —
+/// CLDR's `minimumGroupingDigits`, which is 2 for `pt-PT`, `es` and `pl`
+/// (`1234` but `12 345`) and what `useGrouping: "min2"` requests everywhere.
+#[cfg(feature = "intl")]
+fn group_digits(
+    int_str: &str,
+    sep: &str,
+    primary: usize,
+    secondary: usize,
+    min_grouping: usize,
+) -> String {
+    if sep.is_empty()
+        || primary == 0
+        || secondary == 0
+        || int_str.len() < primary + min_grouping.max(1)
+    {
         return String::from(int_str);
     }
-    let bytes = int_str.as_bytes();
-    let mut out = String::new();
-    let first = bytes.len() % 3;
-    let first = if first == 0 { 3 } else { first };
-    out.push_str(&int_str[..first]);
-    let mut i = first;
-    while i < bytes.len() {
-        out.push_str(sep);
-        out.push_str(&int_str[i..i + 3]);
-        i += 3;
+    // Byte offsets (the digits are ASCII) at which a separator goes, right to left.
+    let mut cuts: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    let mut i = int_str.len() - primary;
+    cuts.push(i);
+    while i > secondary {
+        i -= secondary;
+        cuts.push(i);
     }
+    let mut out = String::new();
+    let mut prev = 0;
+    for &c in cuts.iter().rev() {
+        out.push_str(&int_str[prev..c]);
+        out.push_str(sep);
+        prev = c;
+    }
+    out.push_str(&int_str[prev..]);
     out
 }
 
@@ -5114,6 +5181,15 @@ impl<'a> Interp<'a> {
         // it can only serve a collator that asked for the defaults. Any other option
         // set keeps the option-aware root collator, which is what every locale got
         // before — so this only ever adds tailoring, never removes an option.
+        //
+        // `usage: "search"` selects the locale's CLDR `search` collation instead
+        // of its sort order — the crate keys it `<locale>-u-co-search` and falls
+        // back to root's `search` rule where the locale has none, as ICU does. It
+        // is keyed off the extension-free locale: `co`/`kn`/`kf` keywords on the
+        // tag do not apply to search (ICU reports `collation: "default"` for
+        // `new Intl.Collator("de-u-co-phonebk", {usage: "search"})`). German's
+        // search rule folds `ä` with `ae`, so `["AE", "Ä"]` sorts as-is there
+        // where plain `de` (root order) puts the single letter `Ä` first.
         if strength == Strength::Tertiary
             && !case_level
             && !numeric
@@ -5121,7 +5197,18 @@ impl<'a> Interp<'a> {
             && let Some(locale) = ch
                 .and_then(|h| self.realm.get_property(h, "\u{0}locale"))
                 .map(|v| self.realm.to_display_string(v))
-            && let Some(tailoring) = locale_tailoring(&locale)
+            && let Some(tailoring) = {
+                let search = ch
+                    .and_then(|h| self.realm.get_property(h, "usage"))
+                    .map(|v| self.realm.to_display_string(v))
+                    .is_some_and(|u| u == "search");
+                if search {
+                    let base = strip_unicode_extension(&locale);
+                    locale_tailoring(&alloc::format!("{base}-u-co-search"))
+                } else {
+                    locale_tailoring(&locale)
+                }
+            }
         {
             return tailoring.compare(a, b);
         }
@@ -7802,9 +7889,25 @@ impl<'a> Interp<'a> {
         let probe = self.intl_format_number_inner(handle, if neg { -1.1 } else { 1.1 });
         let (prefix, dec_sep, suffix) = split_number_scaffold(&probe, &nu);
         let grouped = if grouping {
-            let gp = self.intl_format_number_inner(handle, if neg { -1111.0 } else { 1111.0 });
-            let group_sep = extract_group_sep(&gp, &nu);
-            group_thousands_sep(&int_str, &group_sep)
+            // Two probes stand in for the locale's grouping pattern. A nine-digit
+            // one exposes the separator and the group sizes — `123,456,789` for
+            // most locales, `12,34,56,789` for en-IN — and a four-digit one says
+            // whether a lone group is separated at all: `pt-PT`, `es` and `pl`
+            // carry CLDR `minimumGroupingDigits` 2 (`1234` but `12 345`), and
+            // `useGrouping: "min2"` asks for the same everywhere. Probing 1111
+            // alone read those locales as ungrouped and rendered an 18-digit
+            // integer with no separators.
+            let nine =
+                self.intl_format_number_inner(handle, if neg { -123456789.0 } else { 123456789.0 });
+            let (group_sep, primary, secondary) = extract_grouping(&nine, &nu, &dec_sep);
+            let four = self.intl_format_number_inner(handle, if neg { -1111.0 } else { 1111.0 });
+            let lone = extract_group_sep(&four, &nu);
+            let min_grouping = if lone.is_empty() || lone == dec_sep {
+                2
+            } else {
+                1
+            };
+            group_digits(&int_str, &group_sep, primary, secondary, min_grouping)
         } else {
             int_str
         };
@@ -10450,12 +10553,49 @@ mod exact_decimal_tests {
 
     #[test]
     fn group_thousands() {
-        assert_eq!(group_thousands_sep("100000", ","), "100,000");
+        assert_eq!(group_digits("100000", ",", 3, 3, 1), "100,000");
         assert_eq!(
-            group_thousands_sep("987654321987654321", ","),
+            group_digits("987654321987654321", ",", 3, 3, 1),
             "987,654,321,987,654,321"
         );
-        assert_eq!(group_thousands_sep("12", ","), "12");
+        assert_eq!(group_digits("12", ",", 3, 3, 1), "12");
+        assert_eq!(group_digits("1234", ",", 3, 3, 1), "1,234");
+        // Indian grouping: a primary group of three, then twos.
+        assert_eq!(
+            group_digits("987654321987654321", ",", 3, 2, 1),
+            "9,87,65,43,21,98,76,54,321"
+        );
+        assert_eq!(group_digits("1234", ",", 3, 2, 1), "1,234");
+        // `minimumGroupingDigits` 2 (pt-PT, es, pl) / `useGrouping: "min2"`: a
+        // lone group stays unseparated.
+        assert_eq!(group_digits("1234", "\u{a0}", 3, 3, 2), "1234");
+        assert_eq!(group_digits("12345", "\u{a0}", 3, 3, 2), "12\u{a0}345");
+        assert_eq!(group_digits("1234", "", 0, 0, 1), "1234");
+    }
+
+    #[test]
+    fn grouping_from_probe() {
+        assert_eq!(
+            extract_grouping("123,456,789", "latn", "."),
+            (String::from(","), 3, 3)
+        );
+        assert_eq!(
+            extract_grouping("12,34,56,789", "latn", "."),
+            (String::from(","), 3, 2)
+        );
+        // A fraction and affixes around the integer part are stepped over.
+        assert_eq!(
+            extract_grouping("-123.456.789,00\u{a0}", "latn", ","),
+            (String::from("."), 3, 3)
+        );
+        assert_eq!(
+            extract_grouping("123456789", "latn", "."),
+            (String::new(), 0, 0)
+        );
+        assert_eq!(
+            extract_grouping("123456789.00", "latn", "."),
+            (String::new(), 0, 0)
+        );
     }
 }
 
