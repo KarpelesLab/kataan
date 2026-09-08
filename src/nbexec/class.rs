@@ -1,5 +1,11 @@
 use super::*;
 
+/// The hidden binding in a class's own `class_env` holding its *evaluated*
+/// `extends` value (`null` for `extends null`), pinned at definition time so the
+/// superclass is resolved from the class object rather than by re-evaluating the
+/// heritage expression. A NUL-prefixed name cannot collide with source text.
+const CLASS_SUPER_SLOT: &str = "\u{0}super";
+
 impl<'a> Interp<'a> {
     /// The spec `name` of a method/accessor whose property key (already evaluated
     /// to its storage form) is `key`, given the accessor `kind`. A string/number
@@ -416,6 +422,14 @@ impl<'a> Interp<'a> {
             // `extends null` makes a base-ish class with a null prototype; any other
             // non-object, or a non-constructor object (arrow/generator/async fn,
             // a plain object), is a TypeError (the superclass must be a constructor).
+            // Pin the *evaluated* heritage on this class object (its own
+            // `class_env`, which nothing else shares) so `resolve_super` can find
+            // the superclass without re-evaluating the expression. Re-evaluation
+            // is wrong once the binding it named moves on: the classic chain
+            // builder `C = class extends C {}` would then resolve to the class
+            // itself and report a cycle, and a heritage with side effects would
+            // re-run them.
+            class_env.declare_const(CLASS_SUPER_SLOT, sval);
             if matches!(sval.unpack(), Unpacked::Null) {
                 // ClassDefinitionEvaluation: `extends null` → protoParent = null.
                 self.class_proto_parent[class_id as usize] = Some(NanBox::null());
@@ -753,10 +767,19 @@ impl<'a> Interp<'a> {
         let Some(expr) = &class.super_class else {
             return Ok(None);
         };
-        let saved = core::mem::replace(&mut self.current, env.clone());
-        let value = self.eval(expr);
-        self.current = saved;
-        let resolved = value?;
+        // The heritage was evaluated exactly once, at definition, and pinned on
+        // the class env (see `make_class_with_keys_inner`); read that. An env
+        // without the slot (a class whose definition did not get that far) falls
+        // back to evaluating the expression.
+        let resolved = match env.get(CLASS_SUPER_SLOT) {
+            Some(v) => v,
+            None => {
+                let saved = core::mem::replace(&mut self.current, env.clone());
+                let value = self.eval(expr);
+                self.current = saved;
+                value?
+            }
+        };
         // `extends null` is valid (a base class with a null prototype).
         if matches!(resolved.unpack(), Unpacked::Null) {
             return Ok(None);
