@@ -32,10 +32,9 @@ tri-modal model proven out in the sibling projects
 > `staging/` included), run in CI and gated by a known-failures ledger that only
 > ever shrinks. The current pass-rate is **≈ 99.99 %** — 53,372 of the 53,377
 > tests run (only the two `CanBlockIsFalse` tests are skipped, as a host choice).
-> The 5 ledgered failures are all documented as not ours to fix: two upstream
-> `intl`-crate data gaps (fixed in KarpelesLab/intlrs, pending a release), one
-> upstream harness bug, and two SpiderMonkey staging tests that contradict the
-> normative Annex B test.
+> The 3 ledgered failures are deliberate and documented inline: one upstream
+> harness bug, and two SpiderMonkey staging tests that contradict the normative
+> Annex B test.
 > Working areas include **ES modules** (static `import`/`export`, live bindings,
 > re-exports, cycles, top-level `await`, `import.meta`) and **dynamic `import()`**,
 > explicit resource management (`using`/`await using`), spec **statement

@@ -9,21 +9,20 @@ forward-looking.
 
 > **Headline status (2026-09-08):** the official tc39/Test262 corpus (~53k
 > tests, **`staging/` now included** in the gate) runs in CI gated by
-> `tests/test262-status.txt`. Current pass-rate **≈ 99.99 %** — 53,372 of the
-> 53,377 *ran* tests, **5 ledgered failures**, 2 skipped (the `CanBlockIsFalse`
+> `tests/test262-status.txt`. Current pass-rate **≈ 99.99 %** — 53,374 of the
+> 53,377 *ran* tests, **3 ledgered failures**, 2 skipped (the `CanBlockIsFalse`
 > pair: this host's main thread can block). Nothing is feature-gated any more:
 > `import-bytes` landed, and Temporal / Atomics / agents / cross-realm run
 > (§3.9). The Atomics multi-agent scheduler is complete (§3.8).
 >
-> **What the last 5 are — none of them ours to fix in this repo.** Two are
-> upstream gaps in the `intl` crate, filed as **KarpelesLab/intlrs#32** (region
-> subtag dropped for number symbols; no `de` *search* collation) — both are
-> **fixed in intlrs master** (region `numbers.json` files vendored; CLDR
-> `search` collations bundled as `<locale>-u-co-search`) and the kataan wiring
-> is in; they flip once the crate is released and the dependency bumped. One is
-> deliberate: `TypedArray/prototype/slice/speciesctor-return-same-buffer-with-
-> offset.js` is an upstream harness bug, and passing it would mean writing
-> through an immutable buffer and breaking 47 sibling tests. Two are
+> **What the last 3 are — all deliberate.** The two `intl`-crate gaps once
+> filed as **KarpelesLab/intlrs#32** (region subtag dropped for number symbols;
+> no `de` *search* collation) are closed: `intl` 0.6.2 vendors the region
+> `numbers.json` files and bundles the CLDR `search` collations as
+> `<locale>-u-co-search`, and `intl402/` is 3,341/3,341. One remaining failure
+> is `TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js`,
+> an upstream harness bug: passing it would mean writing through an immutable
+> buffer and breaking 47 sibling tests. Two are
 > `staging/sm/` Annex B tests expecting `{ function arguments(){} }` to
 > override the arguments object, which the normative
 > `annexB/language/function-code/block-decl-func-skip-arguments.js` forbids
