@@ -505,6 +505,7 @@ fn run_test(
         run(&assemble(false, harness, meta, src)).map_err(|e| format!("[sloppy] {e}"))?;
     }
     if do_strict {
+        heartbeat();
         run(&assemble(true, harness, meta, src)).map_err(|e| format!("[strict] {e}"))?;
     }
     Ok(())
@@ -602,6 +603,11 @@ fn run_worker(spec: &str) {
         .append(true)
         .open(outpath)
         .expect("open out");
+    if let Ok(hb) = std::fs::OpenOptions::new().append(true).open(outpath)
+        && let Ok(mut guard) = HEARTBEAT.lock()
+    {
+        *guard = Some(hb);
+    }
 
     let sanitize = |s: &str| s.replace(['\t', '\n', '\r'], " ");
     let mut idx = start;
@@ -826,6 +832,25 @@ fn coordinate() {
         "{} new Test262 failures not in the ledger (see above)",
         regressions.len()
     );
+}
+
+/// The worker's progress file, for [`heartbeat`]. Set once by `run_worker`;
+/// `None` in the coordinator and in unit tests.
+static HEARTBEAT: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+/// Appends a heartbeat record (`H`) to the progress file. The coordinator's
+/// hang detector watches the file *grow*, and a test's `R` record lands only
+/// after both its sloppy and strict runs — so a legitimately slow test that
+/// needs most of the idle bound for each mode would be killed between them. A
+/// heartbeat at each mode boundary keeps the bound per mode. `scan_progress`
+/// ignores the record.
+fn heartbeat() {
+    if let Ok(mut guard) = HEARTBEAT.lock()
+        && let Some(f) = guard.as_mut()
+    {
+        let _ = writeln!(f, "H");
+        let _ = f.flush();
+    }
 }
 
 /// The recorded reason for a worker killed after making no progress.
