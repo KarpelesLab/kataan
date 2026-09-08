@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/KarpelesLab/kataan/compare/v0.0.9...v0.0.10) - 2026-09-08
+
+### Added
+
+- *(gc)* collect inside function bodies reached through audited calls
+- *(module)* import … with { type: "bytes" } (import-bytes), and give embedder typed-array views a prototype
+
+### Fixed
+
+- *(intl)* bump intl to 0.6.2 — region number symbols and CLDR search collations
+- *(intl)* select the CLDR search collation for usage:"search", and group exact decimals by the locale's real pattern
+- *(test262)* give every script that calls import() its file as the import base
+- *(class)* resolve a class's superclass from the class object, not by re-evaluating `extends`
+- *(instanceof)* decide built-in instanceof by the prototype chain, not the cell brand
+- *(class)* a proxy is transparent to private elements, on read as well as write
+- *(builtins)* preserve NaN bit patterns in typed-array slice, tighten Date parsing, close yield* iterators
+- *(realm)* give arrays a real per-object realm, and resolve intrinsics from the running realm
+- *(realm)* repair is_internal_key's doc comment and escape an intra-doc link
+- *(class)* integrity levels must not reach private elements
+- *(nbexec)* var-hoist destructuring patterns, stop hiding user NUL keys, revive typed arrays
+- *(nbexec)* legacy `fn.arguments`, `with`-scoped delete, and global accessor redefinition
+- *(proxy)* observe traps through [[Get]], guard function realms, and keep private names off [[Set]]
+- *(lexer)* `await` and `yield` are contextual, so `/` after them is not always a regex
+- *(nbvm)* collect garbage inside function bodies, not just the outermost frame
+- *(nbexec)* slice Function.prototype.toString from the defining source; run harness as its own Script
+
+### Other
+
+- *(test262)* heartbeat the progress file between a test's sloppy and strict runs
+- headline status — 53,372/53,377 with staging gated, 5 ledgered failures, in-function GC
+- *(test262)* gate staging/ in the nightly corpus run and the bless workflow
+
 ## [0.0.9](https://github.com/KarpelesLab/kataan/compare/v0.0.8...v0.0.9) - 2026-09-05
 
 ### Added
