@@ -56,6 +56,8 @@ jobs:
       - name: Re-bless the ledger
         env:
           KATAAN_TEST262_BLESS: "1"
+          # Same corpus as the nightly gate (`staging/` included).
+          KATAAN_T262_STAGING: "1"
         run: cargo test --release --test test262_official -- --ignored --nocapture
 
       - name: Commit the regenerated ledger

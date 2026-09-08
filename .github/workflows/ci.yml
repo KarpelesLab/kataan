@@ -144,4 +144,7 @@ jobs:
       # Gates against tests/test262-status.txt: fails if any test regresses
       # (fails while not listed in the ledger). Prints the measured pass-rate.
       - name: Run the official Test262 corpus
+        env:
+          # The gate covers `staging/` too (see `skip_reason` in the runner).
+          KATAAN_T262_STAGING: "1"
         run: cargo test --release --test test262_official -- --ignored --nocapture
