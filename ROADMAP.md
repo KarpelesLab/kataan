@@ -7,25 +7,32 @@ JS + WASM engine, and a runtime that stands beside Node.js / Bun / Deno. Finishe
 foundations are summarized once (§1) and not re-litigated; everything after is
 forward-looking.
 
-> **Headline status (2026-08-05):** the official tc39/Test262 corpus (~53k tests)
-> runs in CI gated by `tests/test262-status.txt`. Current pass-rate **≈ 99.99 %**
-> — 51,887 of the 51,890 *ran* tests, **3 ledgered failures** (the ~1.5k skipped
-> are host-specific or unimplemented proposals; Temporal / Atomics / agents /
-> cross-realm are no longer skip-gated — see §3.9). Every subsystem that was
-> previously skip-gated now runs, and the Atomics multi-agent scheduler is
-> complete (§3.8).
+> **Headline status (2026-09-08):** the official tc39/Test262 corpus (~53k
+> tests, **`staging/` now included** in the gate) runs in CI gated by
+> `tests/test262-status.txt`. Current pass-rate **≈ 99.99 %** — 53,372 of the
+> 53,377 *ran* tests, **5 ledgered failures**, 2 skipped (the `CanBlockIsFalse`
+> pair: this host's main thread can block). Nothing is feature-gated any more:
+> `import-bytes` landed, and Temporal / Atomics / agents / cross-realm run
+> (§3.9). The Atomics multi-agent scheduler is complete (§3.8).
 >
-> **What the last 3 are — none of them ours to fix.** Two are upstream gaps in
-> the `intl` crate, filed as **KarpelesLab/intlrs#32**: it drops the region
-> subtag when picking number symbols, so `pt-PT`/`es-MX`/`de-CH`/`en-ZA`/`it-CH`
-> format like their base language (this hits plain `format()`, not just
-> `formatRange`); and it vendors no `de` *search* collation — `collation.bin`
-> holds exactly six `-u-co-` keys, and `search`/`searchjl`/`eor` are not among
-> them. The third is deliberate:
-> `TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js` is
-> an upstream harness bug, and passing it would mean writing through an
-> immutable buffer and breaking 47 sibling tests. Each is annotated inline in
-> the ledger with its owner.
+> **What the last 5 are — none of them ours to fix in this repo.** Two are
+> upstream gaps in the `intl` crate, filed as **KarpelesLab/intlrs#32** (region
+> subtag dropped for number symbols; no `de` *search* collation) — both are
+> **fixed in intlrs master** (region `numbers.json` files vendored; CLDR
+> `search` collations bundled as `<locale>-u-co-search`) and the kataan wiring
+> is in; they flip once the crate is released and the dependency bumped. One is
+> deliberate: `TypedArray/prototype/slice/speciesctor-return-same-buffer-with-
+> offset.js` is an upstream harness bug, and passing it would mean writing
+> through an immutable buffer and breaking 47 sibling tests. Two are
+> `staging/sm/` Annex B tests expecting `{ function arguments(){} }` to
+> override the arguments object, which the normative
+> `annexB/language/function-code/block-decl-func-skip-arguments.js` forbids
+> (V8 fails them too). Each is annotated inline in the ledger with its owner.
+>
+> The tree-walker now **collects garbage inside function bodies** reached
+> through audited calls (`f();`, `var x = f();`, `x = f();`, `return f();`, and
+> `Array.prototype.forEach` callbacks) — see the `nbexec::gc` module docs; the
+> staging Date tests went from an 8GB abort to 14s.
 >
 > The Intl *structure* — subclassing, `formatToParts` incl. unit/compact,
 > `resolvedOptions`, Segmenter `containing`, `localeCompare` / `toLocaleString` /

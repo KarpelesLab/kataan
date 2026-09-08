@@ -28,12 +28,14 @@ tri-modal model proven out in the sibling projects
 >   ordering) — faulting to the tree-walker for the handful of constructs it
 >   doesn't yet compile.
 >
-> Conformance is measured against the **full upstream tc39/Test262** (~53k tests),
-> run in CI and gated by a known-failures ledger that only ever shrinks. The
-> current pass-rate is **≈ 99.45 %** — 51,603 of the 51,890 applicable tests run
-> (the ~1.5k skipped are host-specific or still-unimplemented proposals; the 287
-> remaining failures are mostly CLDR output data in Intl and the Atomics
-> multi-agent scheduler).
+> Conformance is measured against the **full upstream tc39/Test262** (~53k tests,
+> `staging/` included), run in CI and gated by a known-failures ledger that only
+> ever shrinks. The current pass-rate is **≈ 99.99 %** — 53,372 of the 53,377
+> tests run (only the two `CanBlockIsFalse` tests are skipped, as a host choice).
+> The 5 ledgered failures are all documented as not ours to fix: two upstream
+> `intl`-crate data gaps (fixed in KarpelesLab/intlrs, pending a release), one
+> upstream harness bug, and two SpiderMonkey staging tests that contradict the
+> normative Annex B test.
 > Working areas include **ES modules** (static `import`/`export`, live bindings,
 > re-exports, cycles, top-level `await`, `import.meta`) and **dynamic `import()`**,
 > explicit resource management (`using`/`await using`), spec **statement
