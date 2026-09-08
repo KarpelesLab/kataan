@@ -302,6 +302,10 @@ impl<'a> Interp<'a> {
         this_val: NanBox,
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
+        // Take the GC audit token unconditionally, first thing: whatever this
+        // call turns out to be, no call it makes in turn may inherit it. It is
+        // honoured only at the plain-closure dispatch below (see the `gc` module).
+        let gc_token = self.gc_audit_call.take();
         let Some(raw) = callee.as_handle() else {
             // Calling a non-object (a primitive `undefined`/`null`/number/…) is a
             // JS `TypeError` — catchable by user `try/catch` — not an internal
@@ -1719,6 +1723,7 @@ impl<'a> Interp<'a> {
                 this_val,
                 args,
                 NanBox::handle(handle.to_raw()),
+                false,
             );
             // `super()` inside the arrow performs BindThisValue for the enclosing
             // *derived constructor*: the constructor's `this` was uninitialized
@@ -1744,13 +1749,26 @@ impl<'a> Interp<'a> {
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw);
         let saved_home_obj = core::mem::replace(&mut self.current_home_object, home_obj);
+        // The audit token names the argument buffer of the call the `Call` arm
+        // dispatched; a match means this plain closure *is* that callee, so its
+        // body may collect once `invoke_inner` has published the rest. The one
+        // value this frame keeps in a Rust local — the caller's home object — is
+        // published here.
+        let audited = gc_token == Some((args.as_ptr() as usize, args.len()));
+        let mark = if audited {
+            self.gc_root(&[home_object_value(saved_home_obj)])
+        } else {
+            super::gc::NO_MARK
+        };
         let r = self.invoke(
             def,
             captured,
             this_val,
             args,
             NanBox::handle(handle.to_raw()),
+            audited,
         );
+        self.gc_unroot(mark);
         self.current_home_object = saved_home_obj;
         r
     }
@@ -1767,6 +1785,7 @@ impl<'a> Interp<'a> {
         this_val: NanBox,
         args: &[NanBox],
         callee: NanBox,
+        audited: bool,
     ) -> Result<NanBox, ExecError> {
         if self.call_depth >= self.realm.limits.max_call_depth {
             let msg = self.new_str("Maximum call stack size exceeded");
@@ -1776,7 +1795,7 @@ impl<'a> Interp<'a> {
             return Err(ExecError::Throw(err));
         }
         self.call_depth += 1;
-        let mut r = self.invoke_inner(def, captured, this_val, args, callee);
+        let mut r = self.invoke_inner(def, captured, this_val, args, callee, audited);
         // Proper-tail-call trampoline: a `return f(...)` in tail position unwinds
         // to here as `ExecError::TailCall` (the current frame already torn down by
         // `invoke_inner`), and we re-dispatch it *in place* — no new `invoke`, so
@@ -1788,7 +1807,7 @@ impl<'a> Interp<'a> {
             args: a,
         }) = r
         {
-            r = self.dispatch_tail(c, t, &a);
+            r = self.dispatch_tail(c, t, &a, audited);
         }
         self.call_depth -= 1;
         r
@@ -1807,6 +1826,7 @@ impl<'a> Interp<'a> {
         callee: NanBox,
         this_val: NanBox,
         args: &[NanBox],
+        audited: bool,
     ) -> Result<NanBox, ExecError> {
         if let Some(raw) = callee.as_handle() {
             let handle = Handle::from_raw(raw);
@@ -1832,7 +1852,16 @@ impl<'a> Interp<'a> {
                         .map(Handle::from_raw);
                     let saved_home_obj =
                         core::mem::replace(&mut self.current_home_object, home_obj);
-                    let r = self.invoke_inner(def, captured, this_val, args, callee);
+                    // The trampoline inherits the original call's audit: the frame
+                    // it replaced is gone, and this one holds only the values
+                    // published below (plus the home object, published here).
+                    let mark = if audited {
+                        self.gc_root(&[home_object_value(saved_home_obj)])
+                    } else {
+                        super::gc::NO_MARK
+                    };
+                    let r = self.invoke_inner(def, captured, this_val, args, callee, audited);
+                    self.gc_unroot(mark);
                     self.current_home_object = saved_home_obj;
                     return r;
                 }
@@ -1848,6 +1877,7 @@ impl<'a> Interp<'a> {
         this_val: NanBox,
         args: &[NanBox],
         callee: NanBox,
+        audited: bool,
     ) -> Result<NanBox, ExecError> {
         let call_scope = captured.child();
         // Enter the closure's realm: a function defined in a `$262.createRealm()`
@@ -2201,7 +2231,34 @@ impl<'a> Interp<'a> {
                 &mut self.tail_pos,
                 self.strict && !def.is_async && !def.is_generator && !constructing,
             );
-            let r = self.run_body(def.body);
+            // An audited call (see the `gc` module): publish what this frame and
+            // the `Call` arm above keep in Rust locals — the callee, receiver and
+            // arguments, the caller's `this` / `new.target`, and the scopes swapped
+            // out above — then run the body with the fence open. Only when the
+            // fence is open here to begin with: an audited call inside a fenced
+            // extent stays fenced.
+            let collect = audited && self.gc_ok;
+            let (val_mark, scope_mark) = if collect {
+                let mut published: Vec<NanBox> = Vec::with_capacity(args.len() + 4);
+                published.push(callee);
+                published.push(this_val);
+                published.extend_from_slice(args);
+                published.extend(saved_this);
+                published.push(saved_target);
+                let m = self.gc_root(&published);
+                let s = self.gc_scope_shadow.len();
+                self.gc_scope_shadow.push(saved.clone());
+                self.gc_scope_shadow.push(saved_var_scope.clone());
+                self.gc_scope_shadow.push(captured.clone());
+                (m, s)
+            } else {
+                (super::gc::NO_MARK, usize::MAX)
+            };
+            let r = self.run_body_audited(def.body, collect);
+            self.gc_unroot(val_mark);
+            if scope_mark != usize::MAX {
+                self.gc_scope_shadow.truncate(scope_mark);
+            }
             self.tail_pos = saved_tail_pos;
             r
         })();
@@ -4724,4 +4781,9 @@ fn target_contains_expression(target: &crate::ast::BindingTarget) -> bool {
                 .is_some_and(|r| target_contains_expression(r))
         }
     }
+}
+
+/// A home-object slot as a publishable GC root (`undefined` when unset).
+fn home_object_value(home: Option<Handle>) -> NanBox {
+    home.map_or(NanBox::undefined(), |h| NanBox::handle(h.to_raw()))
 }

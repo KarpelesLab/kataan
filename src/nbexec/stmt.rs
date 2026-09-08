@@ -39,13 +39,22 @@ fn flow_value(outcome: &Result<Flow, ExecError>) -> NanBox {
 }
 
 impl<'a> Interp<'a> {
-    pub(crate) fn run_body(&mut self, body: Body<'a>) -> Result<NanBox, ExecError> {
-        // A function / `eval` / module / generator body is reached through a Rust
-        // frame that holds live values the collector cannot see (the caller's
-        // argument vector, a native's temporaries, the callee lookup). Close the
-        // GC fence for its whole extent — statement boundaries inside a body never
-        // collect. See the `gc` module.
+    /// Runs a function body. The GC fence is left **open** when `collect` is
+    /// set: the caller (an audited `invoke_inner`) has published
+    /// every live value its own and its callers' Rust frames hold, so statement
+    /// boundaries inside the body may collect. Otherwise — an `eval` / module /
+    /// generator / class body, or a function reached through a frame that holds
+    /// unpublished values (the caller's argument vector, a native's temporaries,
+    /// the callee lookup) — the fence is closed for the body's whole extent. An
+    /// open fence never outlives a closed one above it (`gc_ok && collect`). See
+    /// the `gc` module.
+    pub(crate) fn run_body_audited(
+        &mut self,
+        body: Body<'a>,
+        collect: bool,
+    ) -> Result<NanBox, ExecError> {
         let saved_gc = core::mem::replace(&mut self.gc_ok, false);
+        self.gc_ok = saved_gc && collect;
         let r = self.run_body_inner(body);
         self.gc_ok = saved_gc;
         r
@@ -102,9 +111,15 @@ impl<'a> Interp<'a> {
             let err = self.make_error(N_ERROR_BASE + 2, Some(msg));
             return Err(ExecError::Throw(err));
         }
-        // GC safepoint. Only fires in the top-level statement chain, where every
-        // enclosing Rust frame is a statement executor that has published its live
-        // locals (see the `gc` module). Two loads and a compare otherwise.
+        // A statement boundary ends any audited call the previous statement
+        // armed but never dispatched (a callee that turned out not to be a
+        // function): the token must not survive to an unrelated call.
+        self.gc_audit_call = None;
+        self.gc_audit_expr = None;
+        // GC safepoint. Fires in the top-level statement chain and inside bodies
+        // reached through audited calls, where every enclosing Rust frame has
+        // published its live locals (see the `gc` module). Two loads and a
+        // compare otherwise.
         self.gc_safepoint();
         self.eval_depth += 1;
         let r = self.exec_inner(stmt);
@@ -119,7 +134,10 @@ impl<'a> Interp<'a> {
             // non-empty value in a StatementList / switch / block. `eval` reports
             // the last non-empty value (see `exec_seq`'s UpdateEmpty).
             Stmt::Empty { .. } => Ok(Flow::Normal(NanBox::empty_completion())),
-            Stmt::Expr { expression, .. } => Ok(Flow::Normal(self.eval(expression)?)),
+            Stmt::Expr { expression, .. } => {
+                self.gc_flag_audited_call(expression);
+                Ok(Flow::Normal(self.eval(expression)?))
+            }
             Stmt::Var(decl) => {
                 self.exec_var(decl)?;
                 Ok(Flow::Normal(NanBox::empty_completion()))
@@ -261,6 +279,7 @@ impl<'a> Interp<'a> {
                 // in `return f();` runs its own `return`s first and would
                 // otherwise leave the flag describing the callee.
                 Some(e) => {
+                    self.gc_flag_audited_call(e);
                     let v = self.eval(e)?;
                     self.return_had_expr = true;
                     Ok(Flow::Return(v))
@@ -726,7 +745,10 @@ impl<'a> Interp<'a> {
             _ => None,
         };
         let value = match &d.init {
-            Some(e) => self.eval(e)?,
+            Some(e) => {
+                self.gc_flag_audited_call(e);
+                self.eval(e)?
+            }
             None => NanBox::undefined(),
         };
         self.pending_class_name = None;

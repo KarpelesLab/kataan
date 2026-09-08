@@ -4517,13 +4517,37 @@ impl<'a> Interp<'a> {
                     let arr = callback_recv;
                     let typed = self.realm.typed_kind(handle).is_some();
                     let live = !typed && self.realm.is_array(handle);
+                    // `forEach` over a real array / typed array is an *audited*
+                    // native (see the `gc` module): everything this frame and the
+                    // dispatch frames above it hold — callback, `thisArg`, the
+                    // receiver (original and materialized), the element snapshot —
+                    // is published, and each callback invocation carries the audit
+                    // token, so the callback body may collect. A primitive or
+                    // generic array-like receiver is boxed / materialized in frames
+                    // this arm cannot see, so it stays fenced.
+                    let audit = typed || self.realm.is_array(species_recv);
+                    let mark = if audit {
+                        let mut published: Vec<NanBox> = Vec::with_capacity(elems.len() + 5);
+                        published.extend([
+                            f,
+                            this_arg,
+                            arr,
+                            NanBox::handle(handle.to_raw()),
+                            NanBox::handle(species_recv.to_raw()),
+                        ]);
+                        published.extend_from_slice(&elems);
+                        self.gc_root(&published)
+                    } else {
+                        super::gc::NO_MARK
+                    };
                     // A typed array / real array re-reads each element live by index
                     // (a callback mutation is observed); a materialized generic
                     // array-like reads its snapshot. Holes are skipped.
+                    let mut failed: Option<ExecError> = None;
                     #[allow(clippy::needless_range_loop)]
                     for i in 0..elems.len() {
                         let present = is_present(i);
-                        let Some(e) = self.array_cb_read(
+                        let e = match self.array_cb_read(
                             handle,
                             i,
                             typed,
@@ -4532,12 +4556,26 @@ impl<'a> Interp<'a> {
                             present,
                             true,
                             array_proto_generic,
-                        )?
-                        else {
-                            continue;
+                        ) {
+                            Ok(Some(e)) => e,
+                            Ok(None) => continue,
+                            Err(err) => {
+                                failed = Some(err);
+                                break;
+                            }
                         };
                         let cb_args = [e, NanBox::number(i as f64), arr];
-                        self.call_with_this(f, this_arg, &cb_args)?;
+                        if audit {
+                            self.gc_audit_call = Some((cb_args.as_ptr() as usize, cb_args.len()));
+                        }
+                        if let Err(err) = self.call_with_this(f, this_arg, &cb_args) {
+                            failed = Some(err);
+                            break;
+                        }
+                    }
+                    self.gc_unroot(mark);
+                    if let Some(err) = failed {
+                        return Err(err);
                     }
                     return Ok(Some(NanBox::undefined()));
                 }

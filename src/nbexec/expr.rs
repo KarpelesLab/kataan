@@ -1055,6 +1055,10 @@ impl<'a> Interp<'a> {
                 optional: call_optional,
                 ..
             } => {
+                // Whether a statement executor armed the GC audit for exactly this
+                // node (see the `gc` module). Taken first thing so no nested
+                // expression — the callee, an argument — can inherit it.
+                let gc_audited = self.gc_audit_expr.take() == Some(expr as *const Expr);
                 // Dynamic `import(specifier)`. The parser desugars it to a call of
                 // the bare `import` reference; intercept it here (before that
                 // reference would throw) and return a promise of the requested
@@ -1120,7 +1124,7 @@ impl<'a> Interp<'a> {
                     && matches!(property, PropertyKey::Ident(p) if &**p == "meta")
                 {
                     let f = self.eval(callee)?;
-                    let args = self.eval_args(arguments)?;
+                    let args = self.gc_audit_args(arguments, gc_audited)?;
                     return self.call(f, &args);
                 }
                 // `super(args)` — invoke the base constructor on the current
@@ -1152,7 +1156,7 @@ impl<'a> Interp<'a> {
                                 .object_proto(ch)
                                 .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw()))
                         });
-                    let args = self.eval_args(arguments)?;
+                    let args = self.gc_audit_args(arguments, gc_audited)?;
                     // Re-read the pending this-binding *after* the arguments: a
                     // nested `super()` among them (`super(super())`) already
                     // consumed it, which makes this the second SuperCall.
@@ -1359,7 +1363,7 @@ impl<'a> Interp<'a> {
                     // an argument that mutates the home object's prototype cannot
                     // affect which method is invoked.
                     let f = self.resolve_super_method(&name)?;
-                    let args = self.eval_args(arguments)?;
+                    let args = self.gc_audit_args(arguments, gc_audited)?;
                     return self.call_with_this(f, self.this_val, &args);
                 }
                 // A **parenthesized** optional chain used as a call target, e.g.
@@ -1385,7 +1389,7 @@ impl<'a> Interp<'a> {
                             if *call_optional {
                                 return Err(ExecError::OptShortCircuit);
                             }
-                            let args = self.eval_args(arguments)?;
+                            let args = self.gc_audit_args(arguments, gc_audited)?;
                             return self.call(NanBox::undefined(), &args);
                         }
                         Err(e) => return Err(e),
@@ -1394,11 +1398,11 @@ impl<'a> Interp<'a> {
                         if *call_optional {
                             return Err(ExecError::OptShortCircuit);
                         }
-                        let args = self.eval_args(arguments)?;
+                        let args = self.gc_audit_args(arguments, gc_audited)?;
                         return self.call(NanBox::undefined(), &args);
                     }
                     self.method_recv_check(recv, property, *optional)?;
-                    let args = self.eval_args(arguments)?;
+                    let args = self.gc_audit_args(arguments, gc_audited)?;
                     return self.call_member_dispatch(recv, property, *call_optional, &args);
                 }
                 // A `recv.method(args)` call: try a built-in method on the
@@ -1416,7 +1420,7 @@ impl<'a> Interp<'a> {
                     // thrown *before* the arguments are evaluated (spec reference
                     // order): `o.bar.gar(foo())` throws before `foo()`.
                     self.method_recv_check(recv, property, *optional)?;
-                    let args = self.eval_args(arguments)?;
+                    let args = self.gc_audit_args(arguments, gc_audited)?;
                     return self.call_member_dispatch(recv, property, *call_optional, &args);
                 }
                 // A bare-identifier callee: resolve the reference **once** (a single
@@ -1462,7 +1466,7 @@ impl<'a> Interp<'a> {
                         if is_eval {
                             with_eval = Some(f);
                         } else {
-                            let args = self.eval_args(arguments)?;
+                            let args = self.gc_audit_args(arguments, gc_audited)?;
                             return self.call_with_this(f, NanBox::handle(h.to_raw()), &args);
                         }
                     }
@@ -1480,7 +1484,7 @@ impl<'a> Interp<'a> {
                 if *call_optional && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null) {
                     return Err(ExecError::OptShortCircuit);
                 }
-                let args = self.eval_args(arguments)?;
+                let args = self.gc_audit_args(arguments, gc_audited)?;
                 // Direct eval: the callee is the literal identifier `eval` and it
                 // still resolves to the built-in `eval`. Such a call runs in the
                 // caller's scope (so it can read/modify locals and hoist `var`s),

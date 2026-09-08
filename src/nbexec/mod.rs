@@ -857,6 +857,23 @@ pub struct Interp<'a> {
     /// completion. These sit in Rust locals the collector cannot otherwise see;
     /// see [`Interp::gc_root`].
     gc_shadow: Vec<NanBox>,
+    /// The `Expr::Call` node a statement executor is about to evaluate at an
+    /// **audited position** — one where the executor's own Rust frame holds no
+    /// live heap value besides what it has published (`f();`, `var x = f();`,
+    /// `x = f();`, `return f();`). The `Call` arm of `eval` takes it (only a
+    /// matching node counts) and, once the arguments are evaluated, hands the
+    /// callee an audit token via `gc_audit_call`. See the `gc` module.
+    gc_audit_expr: Option<*const crate::ast::Expr>,
+    /// The `(pointer, length)` of the argument slice of the audited call in
+    /// flight. `call_with_this_inner` takes it on entry and honours it only when
+    /// its own `args` slice is that very buffer — so a native that receives it
+    /// and calls back into JS with its own argument vector can never pass the
+    /// audit on to the callback. Cleared at every statement boundary.
+    gc_audit_call: Option<(usize, usize)>,
+    /// Scopes published by audited calls for their dynamic extent: the caller's
+    /// lexical and variable scopes, which `invoke_inner` keeps in Rust locals
+    /// while the callee runs. Traced by `gc_roots`.
+    gc_scope_shadow: Vec<Scope>,
 }
 
 /// The `[[ParameterMap]]` of one mapped `arguments` object: the shared parameter
@@ -3313,6 +3330,9 @@ impl<'a> Interp<'a> {
             arg_maps: alloc::collections::BTreeMap::new(),
             gc_ok: false,
             gc_shadow: Vec::new(),
+            gc_audit_expr: None,
+            gc_audit_call: None,
+            gc_scope_shadow: Vec::new(),
         };
         // The constructor's `current` IS the root scope; capture it as the global
         // scope before `install_globals` populates it, so indirect eval can run

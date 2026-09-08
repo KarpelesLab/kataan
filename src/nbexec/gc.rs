@@ -31,10 +31,34 @@
 //! for that body's dynamic extent, so a statement boundary nested inside any of
 //! them never collects — regardless of what its callers hold.
 //!
+//! # Audited calls: collecting inside a function body
+//!
+//! A function body is *also* collectable when every Rust frame between the
+//! top-level chain and its statement boundaries has published its live values —
+//! the same rule the bytecode VM applies with its published frame windows. That
+//! holds for a call at an **audited position**: an expression statement that is
+//! a bare call (`f();`), a declarator initializer (`var x = f();`), a plain
+//! identifier assignment (`x = f();`) or a `return f();`. There the statement
+//! executor holds nothing unpublished, the `Call` arm of `eval` holds only the
+//! callee, receiver and argument vector — all handed to `invoke_inner`, which
+//! publishes them together with the caller state it swaps out (scopes, `this`,
+//! `new.target`, home object) before running the body with the fence *open*.
+//!
+//! The audit is carried by identity, never by ambient state: the executor names
+//! the exact `Call` node ([`Interp::gc_audit_expr`]), the arm names the exact
+//! argument buffer ([`Interp::gc_audit_call`]), and `call_with_this_inner`
+//! honours it only for a plain (non-arrow) closure called with that buffer. Any
+//! other path — a native, a bound function, a proxy trap, an arrow, a getter run
+//! while resolving the callee, a callback a native issues with its own argument
+//! vector — takes the token without matching it, so the body it runs stays
+//! fenced. Every nested unaudited call re-closes the fence for its own extent;
+//! an audited call inside a fenced extent stays fenced (`gc_ok && audited`).
+//!
 //! # What this deliberately does not reclaim
 //!
-//! Garbage produced inside function bodies is not reclaimed *while the function
-//! runs*; it is reclaimed at the next top-level safepoint. And
+//! Garbage produced inside a function body reached through any *other* call
+//! shape (an argument position, an operand, a native callback) is not reclaimed
+//! *while that function runs*; it is reclaimed at the next open safepoint. And
 //! [`Interp::gc_world_is_simple`] refuses to collect at all while the program
 //! has state this pass does not trace — suspended generators, pending
 //! jobs/timers, extra realms, modules, host functions, mapped `arguments`
@@ -50,9 +74,9 @@ use alloc::vec::Vec;
 /// A [`gc_root`](Interp::gc_root) mark meaning "nothing was pushed" — returned
 /// when the safepoint is fenced off anyway, so the registration is skipped
 /// entirely and costs one predictable branch.
-const NO_MARK: usize = usize::MAX;
+pub(crate) const NO_MARK: usize = usize::MAX;
 
-impl Interp<'_> {
+impl<'a> Interp<'a> {
     /// Publishes `vals` as GC roots for the dynamic extent of a statement
     /// executor's recursion. Returns a mark to hand to
     /// [`gc_unroot`](Self::gc_unroot); pair the two on **every** exit path
@@ -67,6 +91,46 @@ impl Interp<'_> {
         let mark = self.gc_shadow.len();
         self.gc_shadow.extend_from_slice(vals);
         mark
+    }
+
+    /// Arms the audit for `e` when it is a call at an audited position (see the
+    /// module docs): the `Call` node itself, or the call on the right of a plain
+    /// identifier assignment. Any other expression disarms it. Called by the
+    /// statement executors right before they evaluate `e`.
+    pub(crate) fn gc_flag_audited_call(&mut self, e: &crate::ast::Expr) {
+        use crate::ast::{AssignOp, Expr};
+        self.gc_audit_expr = match e {
+            Expr::Call { .. } => Some(e as *const Expr),
+            Expr::Assign {
+                op: AssignOp::Assign,
+                target,
+                value,
+                ..
+            } if matches!(&**target, Expr::Ident(_)) && matches!(&**value, Expr::Call { .. }) => {
+                Some(&**value as *const Expr)
+            }
+            _ => None,
+        };
+    }
+
+    /// `eval_args` for the `Call` arm: evaluates `arguments` and, when the call
+    /// is `audited`, hands the callee the audit token — the identity of the
+    /// returned buffer. An empty argument list still gets a real allocation so
+    /// its address is unique among live buffers (an empty `Vec` and a `&[]` share
+    /// one dangling pointer, which a token must never match).
+    pub(crate) fn gc_audit_args(
+        &mut self,
+        arguments: &'a [crate::ast::Argument],
+        audited: bool,
+    ) -> Result<Vec<NanBox>, super::ExecError> {
+        let mut args = self.eval_args(arguments)?;
+        if audited {
+            if args.capacity() == 0 {
+                args.reserve_exact(1);
+            }
+            self.gc_audit_call = Some((args.as_ptr() as usize, args.len()));
+        }
+        Ok(args)
     }
 
     /// Replaces the values published at `mark` (for a loop local that changes
@@ -208,6 +272,11 @@ impl Interp<'_> {
         for v in &self.gc_shadow {
             push(out, *v);
         }
+        // Live activations: each callee and its `arguments` object (the legacy
+        // `fn.caller` / `fn.arguments` extensions read them back).
+        for v in self.fn_stack.iter().chain(&self.fn_args_stack) {
+            push(out, *v);
+        }
 
         // --- scope chains (each walks to its root, so enclosing frames are covered) ---
         let visit_scope = |s: &crate::env::Scope, out: &mut Vec<Handle>| {
@@ -215,6 +284,10 @@ impl Interp<'_> {
         };
         visit_scope(&self.current, out);
         visit_scope(&self.var_scope, out);
+        // Caller scopes swapped out by audited calls in flight.
+        for s in &self.gc_scope_shadow {
+            visit_scope(s, out);
+        }
         visit_scope(&self.global_scope, out);
         visit_scope(&self.main_global_scope, out);
         if let Some(s) = &self.eval_var_scope {
