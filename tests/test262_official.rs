@@ -464,8 +464,14 @@ fn run_test(
     // Dynamic-import tests are scripts that call `import("./x_FIXTURE.js")`; the
     // specifier must resolve relative to the test file, so run them with the
     // file as the import base (still strict/sloppy dual mode + harness).
+    // Any script that calls `import()` / `import.source()` / `import.defer()`
+    // needs the file as its import base, not just the `dynamic-import`
+    // directories: `staging/source-phase-imports/` resolves siblings too, and
+    // without a base its imports resolved against the working directory (a
+    // host load failure — a plain `Error` — where the test expects a
+    // SyntaxError).
     let dynamic_import =
-        path.to_string_lossy().contains("dynamic-import") && src.contains("import(");
+        src.contains("import(") || src.contains("import.source(") || src.contains("import.defer(");
     let base = std::fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string_lossy().into_owned());
