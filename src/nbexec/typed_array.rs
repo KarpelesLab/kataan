@@ -68,6 +68,9 @@ impl<'a> Interp<'a> {
     /// [`typed_elem_size`](crate::realm::typed_elem_size); e.g. `1` = `Uint8`,
     /// `8` = `Float64`). Returns `None` if `buffer` is not an `ArrayBuffer` object.
     /// `.buffer` on the view returns `buffer` itself (SameValue-stable, shared).
+    /// The view's `[[Prototype]]` is the kind's intrinsic prototype
+    /// (`%Uint8Array.prototype%` for kind 1), so it passes `instanceof` and
+    /// carries the prototype methods like a constructed one.
     pub fn typed_array_over(
         &mut self,
         buffer: Handle,
@@ -76,10 +79,16 @@ impl<'a> Interp<'a> {
         length: usize,
     ) -> Option<Handle> {
         let bytes_h = self.array_buffer_bytes(buffer)?;
-        Some(
-            self.realm
-                .new_typed_array(bytes_h, buffer, offset, length, kind),
-        )
+        let view = self
+            .realm
+            .new_typed_array(bytes_h, buffer, offset, length, kind);
+        if let Some(proto) = TYPED_ARRAY_KINDS
+            .get(kind as usize)
+            .and_then(|(name, _)| self.intrinsic_proto(name))
+        {
+            self.realm.set_native_proto(view, proto);
+        }
+        Some(view)
     }
 
     /// Writes `value` to element `i` of `handle`. For a typed-array view this

@@ -187,6 +187,18 @@ pub trait ModuleHost {
     /// # Errors
     /// Returns a human-readable message if the source cannot be read.
     fn load(&self, key: &str) -> Result<String, String>;
+
+    /// Loads the raw bytes of a resolved key, for `import … with { type:
+    /// "bytes" }` (the import-bytes proposal). The default reads the key as
+    /// source text and returns its UTF-8 encoding, so a host that only serves
+    /// text still works for text files; a host with real files should override
+    /// it to serve binary content verbatim.
+    ///
+    /// # Errors
+    /// Returns a human-readable message if the bytes cannot be read.
+    fn load_bytes(&self, key: &str) -> Result<Vec<u8>, String> {
+        self.load(key).map(String::into_bytes)
+    }
 }
 
 /// A [`ModuleHost`] that resolves `import` specifiers as paths relative to the
@@ -233,6 +245,10 @@ impl ModuleHost for FileModuleHost {
 
     fn load(&self, key: &str) -> Result<String, String> {
         std::fs::read_to_string(key).map_err(|e| alloc::format!("cannot load module {key}: {e}"))
+    }
+
+    fn load_bytes(&self, key: &str) -> Result<Vec<u8>, String> {
+        std::fs::read(key).map_err(|e| alloc::format!("cannot load module {key}: {e}"))
     }
 }
 
@@ -299,6 +315,10 @@ enum ModuleKind {
     /// `with { type: "text" }` — the file's raw text becomes the `default`
     /// export (the import-text proposal).
     Text,
+    /// `with { type: "bytes" }` — the file's raw bytes become the `default`
+    /// export, as a `Uint8Array` over an immutable `ArrayBuffer` (the
+    /// import-bytes proposal's `CreateBytesModule`).
+    Bytes,
     /// A host-provided **module source** module (source-phase-imports): it has no
     /// exports and no body, but it *does* have a `[[ModuleSource]]` — an
     /// `%AbstractModuleSource%` instance — so `import source x from …` binds it.
@@ -565,17 +585,25 @@ impl<'a> Interp<'a> {
         // may complete with any error value, and code that probes for a module
         // needs to tell "the host could not supply this module" apart from "the
         // module is not valid JavaScript", so it surfaces as a plain `Error`.
-        let source = host
-            .load(module_load_path(key))
-            .map_err(|e| self.module_load_error(&e))?;
-        // A `type` attribute selects a synthetic (JSON / text) module; otherwise
-        // the file is an ordinary JavaScript module. A JSON parse error here is a
-        // load/resolution-phase failure (a SyntaxError), matching the tests'
-        // `negative: { phase: resolution }` expectation.
-        let record = match type_attr {
-            Some("json") => self.build_json_module(key, &source)?,
-            Some("text") => self.build_text_module(key, &source),
-            _ => self.parse_module(key, &source, host)?,
+        // A `type` attribute selects a synthetic (JSON / text / bytes) module;
+        // otherwise the file is an ordinary JavaScript module. A JSON parse error
+        // here is a load/resolution-phase failure (a SyntaxError), matching the
+        // tests' `negative: { phase: resolution }` expectation. A bytes module is
+        // loaded as raw bytes — its file (an image, say) need not be text at all.
+        let record = if type_attr == Some("bytes") {
+            let bytes = host
+                .load_bytes(module_load_path(key))
+                .map_err(|e| self.module_load_error(&e))?;
+            self.build_bytes_module(key, &bytes)
+        } else {
+            let source = host
+                .load(module_load_path(key))
+                .map_err(|e| self.module_load_error(&e))?;
+            match type_attr {
+                Some("json") => self.build_json_module(key, &source)?,
+                Some("text") => self.build_text_module(key, &source),
+                _ => self.parse_module(key, &source, host)?,
+            }
         };
         // Collect dependency keys (with their own `type` attributes) before
         // recursing — the borrow of `record` ends here.
@@ -616,6 +644,25 @@ impl<'a> Interp<'a> {
     fn build_text_module(&mut self, key: &str, source: &str) -> ModuleRecord {
         let value = self.new_str(source);
         self.synthetic_module(key, ModuleKind::Text, Some(value))
+    }
+
+    /// Builds a synthetic **bytes module** record for `key` (import-bytes
+    /// proposal, `CreateBytesModule`): the file's raw bytes become the `default`
+    /// export as a `Uint8Array` spanning a fresh *immutable* `ArrayBuffer` — so
+    /// the view is read-only and the buffer can be neither resized nor
+    /// transferred.
+    fn build_bytes_module(&mut self, key: &str, bytes: &[u8]) -> ModuleRecord {
+        let buffer = self.make_array_buffer_from_bytes(bytes);
+        self.realm.set_hidden_property(
+            buffer,
+            super::ARRAY_BUFFER_IMMUTABLE,
+            NanBox::boolean(true),
+        );
+        // Kind 1 is `Uint8Array` (see `TYPED_ARRAY_KINDS`).
+        let view = self
+            .typed_array_over(buffer, 1, 0, bytes.len())
+            .expect("a fresh ArrayBuffer backs the bytes module");
+        self.synthetic_module(key, ModuleKind::Bytes, Some(NanBox::handle(view.to_raw())))
     }
 
     /// Builds the host-provided **module source** module (source-phase-imports):
@@ -2964,13 +3011,13 @@ fn reexport_key_type(re: &ReExport) -> (String, Option<String>) {
 }
 
 /// The internal module-map key for a resolved specifier under a `type` import
-/// attribute. A JSON / text module is keyed by `<path>\0type=<t>` so the same
-/// file imported both as JavaScript and as JSON/text is two distinct module
+/// attribute. A JSON / text / bytes module is keyed by `<path>\0type=<t>` so the
+/// same file imported both as JavaScript and as JSON/text is two distinct module
 /// records (the spec keys the module map by `(specifier, attributes)`). A
 /// plain JavaScript import keeps the bare resolved path as its key.
 fn module_map_key(resolved: &str, type_attr: Option<&str>) -> String {
     match type_attr {
-        Some(t @ ("json" | "text")) => alloc::format!("{resolved}\u{0}type={t}"),
+        Some(t @ ("json" | "text" | "bytes")) => alloc::format!("{resolved}\u{0}type={t}"),
         _ => resolved.to_string(),
     }
 }

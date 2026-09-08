@@ -88,10 +88,9 @@ const SKIP_FEATURES: &[&str] = &[
     // tail-call-optimization (PTC) is implemented on the bytecode VM (strict-mode
     // frame-reuse trampoline); the eval/`with`/cross-realm variants that fall back
     // to the recursive tree-walker are ledgered in tests/test262-status.txt.
-    // Import attributes are implemented (JSON + text modules); `type: "bytes"`
-    // additionally needs a Uint8Array-over-immutable-ArrayBuffer default export
-    // (the import-bytes proposal), which is unimplemented — skip that feature.
-    "import-bytes",
+    // Import attributes are implemented (JSON + text + bytes modules), so
+    // `import-bytes` is no longer gated. Nothing is gated at present; the list
+    // stays so a future proposal can be gated in one place.
     // Atomics / SharedArrayBuffer + `$262.agent`: the cooperative single-threaded
     // scheduler is now implemented (see `nbexec::agent`) — workers run eagerly to
     // completion in a fresh realm, reports flow through a shared queue, and
@@ -1060,15 +1059,19 @@ fn mode_selection_and_skips() {
     let module = parse_meta("/*---\nflags: [module]\n---*/\n");
     assert_eq!(skip_reason("language/module-code/x.js", &module), None);
 
-    // Temporal is implemented now, so it is no longer skipped as an unimplemented
-    // feature. `import-bytes` is still gated, so it stands in as the skip probe.
+    // Temporal and import-bytes are implemented now, so neither is skipped as an
+    // unimplemented feature; every feature the corpus tags runs.
     let temporal = parse_meta("/*---\nfeatures: [Temporal]\n---*/\n");
     assert_eq!(skip_reason("built-ins/Temporal/x.js", &temporal), None);
-    let unimpl = parse_meta("/*---\nfeatures: [import-bytes]\n---*/\n");
-    assert_eq!(
-        skip_reason("built-ins/x.js", &unimpl),
-        Some("unimplemented feature")
-    );
+    let bytes = parse_meta("/*---\nfeatures: [import-bytes]\n---*/\n");
+    assert_eq!(skip_reason("language/import/x.js", &bytes), None);
+    for f in SKIP_FEATURES {
+        let gated = parse_meta(&format!("/*---\nfeatures: [{f}]\n---*/\n"));
+        assert_eq!(
+            skip_reason("built-ins/x.js", &gated),
+            Some("unimplemented feature")
+        );
+    }
 
     let plain = parse_meta("/*---\ndescription: x\n---*/\n");
     assert_eq!(skip_reason("language/types/x.js", &plain), None);

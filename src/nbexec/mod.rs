@@ -2796,7 +2796,7 @@ const ARRAY_BUFFER_MAXLEN: &str = "\u{0}abmaxlen";
 /// Marks an `ArrayBuffer` as immutable (produced by `transferToImmutable` /
 /// `sliceToImmutable`): its bytes may not be modified, and it cannot be resized
 /// or transferred. The `immutable` getter reports `true` (unless detached).
-const ARRAY_BUFFER_IMMUTABLE: &str = "\u{0}abimmutable";
+pub(crate) const ARRAY_BUFFER_IMMUTABLE: &str = "\u{0}abimmutable";
 /// Marks a buffer as a `SharedArrayBuffer` (vs a plain `ArrayBuffer`): drives its
 /// `[Symbol.toStringTag]`, the `growable`/`maxByteLength` accessors, and `grow`.
 const SHARED_ARRAY_BUFFER_BRAND: &str = "\u{0}sab";
