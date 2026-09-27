@@ -145,6 +145,56 @@ The rest of this document is the gap between that base and "complete."
 
 ---
 
+## 2.0 One engine: the bytecode VM as a tier of the interpreter — **in progress**
+
+> **Why this comes first (measured 2026-09-28).** Test262 is at 100 % of its
+> non-deliberate ledger — but only on the tree-walker. The register VM (`nbvm`),
+> which is the path for `kataan run`, the C ABI and the JIT, is a *second, separate
+> engine*: it has no global object (names resolve at compile time; built-ins exist
+> only as recognized call shapes like `Math.floor(x)` mapped to a 34-entry native
+> table), function values are arrays tagged `\0vmfn` (not callable by the
+> interpreter, not constructible), errors are plain objects (not `Error`
+> instances), and it keeps its own promise/microtask queue, console buffer and
+> name-dispatched built-in methods. Any program it cannot run is silently re-run
+> from the start on the tree-walker — even after a plain uncaught exception.
+>
+> `KATAAN_VM_STRICT=1` turns that fallback into a `VmFallback` error so a corpus
+> run measures the tier. **Baseline: 1,834 / 53,377** pass on the VM path (and
+> those are the module/dynamic-import tests the tree-walker runs anyway); 42,193
+> are refused on `new Test262Error(...)` in the harness, 5,265 on `eval`/`Function`.
+> The JIT therefore never sees most real code.
+
+**Design.** Do not grow a second built-in library in the VM. The VM runs *inside*
+an `Interp`: the interpreter owns the one realm, global environment, intrinsics,
+built-ins, promise machinery and console; the VM compiles what it can to registers
+and delegates the rest. Borrow structure: the VM keeps its `realm: &mut Realm`
+(so the VM and the JIT's layout-probed offsets are untouched) — the interpreter's
+realm is *moved* into the VM run and swapped back only for the duration of a
+delegated call. Globals are read through the interpreter's global scope, which
+needs no swap.
+
+**Stages** (each gated by the ordinary corpus ledger, and measured by a
+`KATAAN_VM_STRICT` corpus run):
+
+1. **Run inside an `Interp`** — the script entries build an `Interp`, move its
+   realm into the VM, and route console output and errors through it; VM errors
+   become real `Error` instances.
+2. **Global environment** — unknown identifiers read/write the global scope at
+   runtime (`LoadGlobal`/`StoreGlobal`, `typeof` on undeclared), top-level
+   declarations become global bindings, so a later script sees an earlier one's
+   functions (the harness is a separate script from the test).
+3. **Cross-tier calls** — the VM calls and constructs any interpreter callable,
+   and the interpreter calls VM closures (a VM callback handed to a built-in).
+   VM function values become real function cells carrying their program.
+4. **`new` on plain functions**, `prototype`, `new.target`; then the
+   **`arguments`** object.
+5. Retire the VM-private runtime pieces (`builtin_method`, the native table, the
+   VM microtask queue) in favour of the interpreter's, keeping only fast paths
+   proven equal by differential tests; then per-*function* fallback instead of
+   whole-program re-runs.
+
+Exit: the corpus runs on the VM with `KATAAN_VM_STRICT` and the same ledger.
+
 ## 2. The three headline engine deliverables
 
 These make Kataan more than a fast interpreter. They are *engine* capabilities
