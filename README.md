@@ -14,9 +14,10 @@ tri-modal model proven out in the sibling projects
 
 > **Status: running and broadly conformant; advanced tiers in active build-out.**
 > The lexer and the full ECMAScript parser are complete, and **two execution
-> engines** run real programs and are checked to agree on every test:
+> engines** run real programs, cross-checked by differential test suites:
 >
-> - a **tree-walking interpreter** (the default / corpus engine), and
+> - a **tree-walking interpreter** — the reference engine, and the one the
+>   Test262 corpus exercises; and
 > - a **register bytecode VM** (the primary path for `kataan run` and the C ABI),
 >   compiling nearly all of the common language directly — every operator,
 >   objects/arrays, method calls with `call`/`apply`/`bind`, `new`/`new.target`,
@@ -25,13 +26,16 @@ tri-modal model proven out in the sibling projects
 >   with `extends`/`super` and getters/setters, and **lazy, truly-suspendable
 >   generators and `async`/`await`** (`yield`/`next(v)`/`.throw()`, async
 >   generators, `for await`, and `await` resuming as a microtask with correct
->   ordering) — faulting to the tree-walker for the handful of constructs it
->   doesn't yet compile.
+>   ordering) — faulting to the tree-walker for what it doesn't yet compile,
+>   notably `eval`/`Function`, `new` on a plain (non-class) function, and the
+>   `arguments` object. (The Test262 harness itself uses the last two, which is
+>   why the corpus runs on the tree-walker.)
 >
 > Conformance is measured against the **full upstream tc39/Test262** (~53k tests,
 > `staging/` included), run in CI and gated by a known-failures ledger that only
-> ever shrinks. The current pass-rate is **≈ 99.99 %** — 53,372 of the 53,377
-> tests run (only the two `CanBlockIsFalse` tests are skipped, as a host choice).
+> ever shrinks. The current pass-rate is **≈ 99.99 %** — 53,374 of the 53,377
+> tests run (only the two `CanBlockIsFalse` tests are skipped, as a host choice;
+> no feature is skip-gated).
 > The 3 ledgered failures are deliberate and documented inline: one upstream
 > harness bug, and two SpiderMonkey staging tests that contradict the normative
 > Annex B test.
@@ -47,20 +51,27 @@ tri-modal model proven out in the sibling projects
 > async/await, `Proxy`/`Reflect`, typed arrays (incl. `Uint8Array` base64/hex),
 > `Date`, an in-house `RegExp` (named groups, lookbehind, `u`/`v` flags, inline
 > modifiers, property escapes), real sparse-array holes + array property
-> descriptors, and a large, growing standard library (Math, JSON, Object/Array/
-> String/Number, and the ES2024/2025 additions). Compiled bytecode can be
-> serialized, reloaded, and run without the source.
+> descriptors, **`Intl`** (all 3,341 `intl402` tests, over the pure-Rust
+> [`intl`](https://crates.io/crates/intl) crate), **Temporal**, `Atomics` with
+> real multi-agent workers, cross-realm `$262.createRealm`, and a large standard
+> library (Math, JSON, Object/Array/String/Number, and the ES2024/2025
+> additions). Compiled bytecode can be serialized, reloaded, and run without the
+> source.
 >
 > Three advanced tiers are real and tested, though each has named work remaining:
 >
 > - a **machine-code JIT** (x86-64 / Linux, behind `jit`) with an optimizing
->   integer path (four-pass optimizer + register allocator) and a float path
->   covering `+ - * / %`, comparisons, control flow, and the SSE-expressible
->   `Math` intrinsics (`sqrt`/`abs`/`min`/`max`/`floor`/`ceil`/`trunc`), emitting
->   into W^X memory via raw syscalls; object/string ops stay interpreted;
+>   integer path (four-pass optimizer + register allocator), a float path
+>   (arithmetic, comparisons, control flow, the SSE-expressible `Math`
+>   intrinsics), and a **generic value tier** that compiles non-numeric hot
+>   functions too — property and element access with inline machine-code fast
+>   paths, calls, and generic operators re-entering the interpreter's own
+>   implementations through runtime helpers — emitting into W^X memory via raw
+>   syscalls;
 > - a pure-Rust, `no_std` **WebAssembly engine** — full MVP plus sign-extension,
->   saturating conversion, bulk-memory, multi-value, and typed structured
->   control — with a JS↔WASM boundary (`validate`/`compile`/`instantiate`, the
+>   saturating conversion, bulk-memory, multi-value, reference types (multiple
+>   tables, all element-segment modes), and typed structured control — with a
+>   JS↔WASM boundary (`validate`/`compile`/`instantiate`, the
 >   `Module`/`Instance`/`Global`/`Memory` objects, host-function imports, and
 >   stateful instances), driven by a `.wast`/WAT spec harness (a spec-derived
 >   corpus, not yet the full upstream suite);
@@ -126,48 +137,65 @@ Rex barks
 {"ok":true,"items":[1,2,3]}
 ```
 
-It also exposes each pipeline stage, and an interactive REPL:
+It also exposes each pipeline stage, an interactive REPL, a bytecode compiler,
+and a runner with the host event loop:
 
 ```console
-$ cargo run -- lex    -e 'x => x * 2'  # token stream
-$ cargo run -- parse  -e 'x => x * 2'  # AST dump
-$ cargo run -- disasm -e '1 + 2 * 3'   # register bytecode
-$ cargo run -- repl                    # interactive session
+$ cargo run -- lex     -e 'x => x * 2'        # token stream
+$ cargo run -- parse   -e 'x => x * 2'        # AST dump
+$ cargo run -- eval    -e '[1,2,3].map(x => x * 2)'
+2,4,6
+$ cargo run -- repl                           # interactive session
+$ cargo run -- hostrun -e 'setTimeout(() => console.log("later"), 10); console.log("now")'
+now
+later
 $ cargo run -- --help
 ```
 
-The `disasm` command shows the register bytecode the compiler emits:
+Programs compile to a portable bytecode artifact that runs without the source:
 
 ```console
-$ cargo run -- disasm -e 'let s = 0; let i = 0; while (i < 3) { s += i; i += 1; } s'
-chunk #0 "<main>"  (regs=14, params=0)
-     0  LoadInt     r0, 0
-     ...
-     6  Lt          r6, r4, r5
-     7  JumpIfFalse r6, +9
-     ...
-    16  Jump        -13
-    18  Return      r13
+$ cat fib.js
+function fib(n){ return n < 2 ? n : fib(n-1) + fib(n-2) }
+console.log(fib(20));
+$ cargo run -- compile fib.js -o fib.ktbc
+kataan: wrote fib.ktbc (226 bytes)
+$ cargo run -- run fib.ktbc
+6765
 ```
 
 ## Use as a Rust library
 
 ```rust
 use kataan::parser::Parser;
-use kataan::interp::Interp;
+use kataan::{Ctx, Interp};
 
-let program = Parser::parse_program("const sq = x => x * x; sq(8)").unwrap();
 let mut interp = Interp::new();
-assert_eq!(interp.run(&program).unwrap().to_js_string(), "64");
+// Expose a Rust closure to JavaScript.
+interp.register_global_fn("hypot", 2, |cx: &mut Ctx, _this, args| {
+    let a = cx.to_number(args.first().copied().unwrap_or(cx.undefined()))?;
+    let b = cx.to_number(args.get(1).copied().unwrap_or(cx.undefined()))?;
+    Ok(cx.number(a.hypot(b)))
+});
+
+let program = Parser::parse_program("const sq = x => x * x; sq(8) + hypot(3, 4)").unwrap();
+let value = interp.run(&program).unwrap();
+assert_eq!(interp.realm().to_display_string(value), "69");
 ```
+
+The embedding API also builds objects and arrays, throws catchable JS errors,
+calls back into script functions, constructs classes, and attaches opaque Rust
+state to JS objects; [`examples/embed_host_fn.rs`](examples/embed_host_fn.rs)
+walks through all of it (`cargo run --example embed_host_fn`).
 
 The lower stages are available directly too:
 
 ```rust
 use kataan::lexer::{Lexer, TokenKind};
 
-let tokens = Lexer::new("let answer = 42;").tokenize().unwrap();
-assert_eq!(tokens.first().unwrap().text("let answer = 42;"), "let");
+let src = "let answer = 42;";
+let tokens = Lexer::new(src).tokenize().unwrap();
+assert_eq!(tokens.first().unwrap().ascii_text(src.as_bytes()), "let");
 assert_eq!(tokens.last().unwrap().kind, TokenKind::Eof);
 ```
 
@@ -178,14 +206,15 @@ assert_eq!(tokens.last().unwrap().kind, TokenKind::Eof);
 | `std`     |   ✓     | Standard library; implies `alloc`. Needed by the host runtime/CLI. |
 | `alloc`   |   ✓     | Heap-backed types; the minimum for the pure language core.         |
 | `regex`   |   ✓     | In-house regular-expression engine.                                |
-| `intl`    |   ✓     | In-house `Intl`-lite (collation, number/date formatting).          |
+| `intl`    |   ✓     | `Intl` over the pure-Rust `intl` crate (CLDR data).                |
+| `intl-tz-names` | ✓ | Localized time-zone names for `Intl.DateTimeFormat`.              |
 | `module`  |   ✓     | ESM + CommonJS module loader.                                      |
 | `host`    |   ✓     | Host runtime: event loop, timers, console, encoding, URL, streams. |
+| `crypto`  |   ✓     | `crypto.getRandomValues` / WebCrypto over `purecrypto`.            |
 | `fetch`   |         | `fetch` / Node `http(s)` over `rsurl`.                             |
-| `crypto`  |         | `crypto.getRandomValues` / WebCrypto over `purecrypto`.            |
-| `jit`     |         | Machine-code JIT (x86-64/Linux): optimizing integer + float paths. |
-| `ffi`     |         | The C ABI (the only place broad `unsafe` is allowed).             |
-| `cli`     |   ✓     | The `kataan` command-line tool.                                   |
+| `jit`     |         | Machine-code JIT (x86-64/Linux): integer, float, and generic tiers.|
+| `ffi`     |         | The C ABI (the only place broad `unsafe` is allowed).              |
+| `cli`     |   ✓     | The `kataan` command-line tool.                                    |
 
 Build the bare `no_std` language core with:
 
