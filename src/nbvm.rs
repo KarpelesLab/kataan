@@ -5897,7 +5897,10 @@ pub fn execute_scripts_typed(
     sources: &[&str],
     limits: crate::limits::Limits,
 ) -> Result<(String, String), crate::nbexec::Thrown> {
-    let mut compiled = Vec::with_capacity(sources.len());
+    // Parse every script before compiling any: a parse error in a later script
+    // is an early error of the whole run and must win over a compile refusal in
+    // an earlier one (which only matters under `KATAAN_VM_STRICT`).
+    let mut programs = Vec::with_capacity(sources.len());
     for source in sources {
         let program = match crate::parser::Parser::parse_program(source) {
             Ok(p) => p,
@@ -5914,8 +5917,14 @@ pub fn execute_scripts_typed(
         if program.source_type == crate::ast::SourceType::Module {
             return crate::nbexec::eval_scripts_typed(sources, limits);
         }
-        let Ok(protos) = compile_program(&program) else {
-            return crate::nbexec::eval_scripts_typed(sources, limits);
+        programs.push(program);
+    }
+    let mut compiled = Vec::with_capacity(programs.len());
+    for program in &programs {
+        let protos = match compile_program(program) {
+            Ok(protos) => protos,
+            Err(e) if vm_strict() => return Err(vm_fallback(&alloc::format!("compile: {e:?}"))),
+            Err(_) => return crate::nbexec::eval_scripts_typed(sources, limits),
         };
         compiled.push(protos);
     }
@@ -5928,10 +5937,53 @@ pub fn execute_scripts_typed(
                 output.push_str(&out);
                 completion = realm.to_display_string(value);
             }
+            Err(VmError::Thrown(v)) if vm_strict() => return Err(vm_thrown(&realm, v)),
+            Err(e) if vm_strict() => return Err(vm_fallback(&alloc::format!("runtime: {e:?}"))),
             Err(_) => return crate::nbexec::eval_scripts_typed(sources, limits),
         }
     }
     Ok((output, completion))
+}
+
+/// Whether `KATAAN_VM_STRICT` is set: the script entries then report a program
+/// the bytecode tier cannot run as a `VmFallback` error instead of silently
+/// re-running it on the tree-walker, and surface a VM-thrown value as-is. It
+/// exists to *measure* the tier — run the Test262 corpus with it and every
+/// failure is either a coverage gap (`VmFallback`) or a VM bug (anything else).
+fn vm_strict() -> bool {
+    #[cfg(feature = "std")]
+    {
+        std::env::var_os("KATAAN_VM_STRICT").is_some()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        false
+    }
+}
+
+/// The `VmFallback` error [`vm_strict`] reports in place of a fallback.
+fn vm_fallback(reason: &str) -> crate::nbexec::Thrown {
+    crate::nbexec::Thrown {
+        phase: crate::nbexec::ErrorPhase::Runtime,
+        name: String::from("VmFallback"),
+        message: String::from(reason),
+    }
+}
+
+/// A value thrown out of the bytecode tier as a [`Thrown`](crate::nbexec::Thrown):
+/// an object's own `name`/`message` (how the VM builds its errors), or the
+/// display string of a thrown primitive.
+fn vm_thrown(realm: &Realm, v: NanBox) -> crate::nbexec::Thrown {
+    let field = |key: &str| {
+        v.as_handle()
+            .and_then(|raw| realm.get_property(Handle::from_raw(raw), key))
+            .map(|f| realm.to_display_string(f))
+    };
+    crate::nbexec::Thrown {
+        phase: crate::nbexec::ErrorPhase::Runtime,
+        name: field("name").unwrap_or_default(),
+        message: field("message").unwrap_or_else(|| realm.to_display_string(v)),
+    }
 }
 
 /// Loads, links, and evaluates the ES-module graph rooted at the resolved
