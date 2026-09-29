@@ -148,6 +148,18 @@ pub enum Op {
     /// register: the host deletes a configurable global property or an
     /// `eval`-introduced binding.
     DeleteGlobal { dst: Reg, name: String },
+    /// `dst` = the template object of the tagged-template site `site` (its
+    /// cooked strings — `None` for an invalid escape — and raw strings), made
+    /// once per site by the host and reused (hosted runs only).
+    TemplateObject {
+        dst: Reg,
+        site: u64,
+        cooked: Vec<Option<Vec<u8>>>,
+        raw: Vec<String>,
+    },
+    /// `dst = ToString(src)` for an object or symbol (a template substitution),
+    /// via the host; a string is copied, other primitives stringify directly.
+    ToStr { dst: Reg, src: Reg },
     /// Throws a `TypeError` if `src` is `null` or `undefined` (an object
     /// destructuring pattern's `RequireObjectCoercible`).
     RequireObjectCoercible { src: Reg },
@@ -709,6 +721,15 @@ pub trait VmHost {
     /// # Errors
     /// A throw from `return` or a non-object result, or a host fault.
     fn iter_close(&mut self, iter: NanBox) -> Result<(), HostError>;
+    /// The frozen template object (with its frozen `.raw`) of tagged-template
+    /// site `site`, created on first use and cached per site.
+    fn template_object(&mut self, site: u64, cooked: &[Option<Vec<u8>>], raw: &[String]) -> NanBox;
+    /// `ToString(v)` (a symbol throws a `TypeError`; an object's string-hint
+    /// `ToPrimitive` runs user code).
+    ///
+    /// # Errors
+    /// A throw from the conversion, or a host fault.
+    fn to_string(&mut self, v: NanBox) -> Result<NanBox, HostError>;
     /// `delete obj[key]`: `true`/`false` per the operation.
     ///
     /// # Errors
@@ -977,14 +998,16 @@ fn vm_set_elem_mode(
         return vm_set_elem(ctx, funcs, recv, key, value);
     }
     let mut to_host = read_needs_host(ctx, recv);
-    if !to_host
-        && key.as_number().is_none()
-        && let Some(h) = recv.as_handle().map(Handle::from_raw)
-    {
-        to_host = match vm_property_key(ctx, key) {
-            Ok(ks) => !plain_write_ok(ctx.realm, h, &ks),
-            Err(_) => true,
-        };
+    if !to_host && key.as_number().is_none() {
+        // A string (or symbol) key is an ordinary property write: the static-key
+        // store handles its setter, read-only and host cases.
+        match vm_property_key(ctx, key) {
+            Ok(ks) => {
+                let mut cache = PropertyCache::new();
+                return vm_set_prop_mode(ctx, funcs, recv, &ks, value, &mut cache, strict);
+            }
+            Err(_) => to_host = true,
+        }
     }
     if !to_host {
         match vm_set_elem(ctx, funcs, recv, key, value) {
@@ -3813,6 +3836,33 @@ fn run_frame(
                 Some(b) => regs[*dst as usize] = NanBox::boolean(b),
                 None => return Err(VmError::Unsupported),
             },
+            Op::TemplateObject {
+                dst,
+                site,
+                cooked,
+                raw,
+            } => match with_host(ctx, |h| h.template_object(*site, cooked, raw)) {
+                Some(v) => regs[*dst as usize] = v,
+                None => return Err(VmError::Unsupported),
+            },
+            Op::ToStr { dst, src } => {
+                let v = regs[*src as usize];
+                let is_string = v
+                    .as_handle()
+                    .is_some_and(|h| ctx.realm.is_string_handle(Handle::from_raw(h)));
+                if is_string {
+                    regs[*dst as usize] = v;
+                } else if v.as_handle().is_some() {
+                    match with_host(ctx, |h| h.to_string(v)) {
+                        Some(Ok(s)) => regs[*dst as usize] = s,
+                        Some(Err(e)) => handle_throw!(VmError::from(e)),
+                        None => return Err(VmError::Unsupported),
+                    }
+                } else {
+                    let s = ctx.realm.to_display_string(v);
+                    regs[*dst as usize] = NanBox::handle(ctx.realm.new_string(&s).to_raw());
+                }
+            }
             Op::RequireObjectCoercible { src } => {
                 if matches!(
                     regs[*src as usize].unpack(),
@@ -8321,6 +8371,14 @@ struct Binding {
 /// register and either a computed key register (`Ok`) or a static key (`Err`).
 type MemberPlace = (Reg, Result<Reg, String>);
 
+/// How a hosted tagged template calls its tag: as a method (keeping the
+/// receiver as `this`), through a computed key, or as a plain value.
+enum TagCall {
+    Method(Reg, String),
+    Key(Reg, Reg),
+    Value(Reg),
+}
+
 /// One element of an array destructuring (see
 /// `Compiler::array_destructure_hosted`): a binding-pattern element, an
 /// assignment-pattern element, or a hole.
@@ -9608,6 +9666,12 @@ impl Compiler {
                             .last_mut()
                             .expect("a scope")
                             .insert(String::from(&**name), b);
+                    } else if let Some(pattern) = &catch.param {
+                        // A destructuring catch parameter (`catch ([x])`).
+                        let saved = self.decl_kind.take();
+                        let r = self.bind_pattern(pattern, catch_reg);
+                        self.decl_kind = saved;
+                        r?;
                     }
                     // A `catch` body is in tail position only when no `finally`
                     // follows (otherwise the `finally` runs after it).
@@ -10042,6 +10106,13 @@ impl Compiler {
                     let src = self.expr(e)?;
                     self.ops.push(Op::Return { src });
                 }
+                Ok(())
+            }
+            // Hosted, a tagged template compiles as an ordinary call (its template
+            // object comes from the host).
+            Expr::TaggedTemplate { .. } if self.hosted => {
+                let src = self.expr(e)?;
+                self.ops.push(Op::Return { src });
                 Ok(())
             }
             // A tagged template's tag is invoked in tail position.
@@ -11067,6 +11138,61 @@ impl Compiler {
                 }
                 Ok(last)
             }
+            // Hosted: the tag (and a member tag's receiver) is evaluated first, the
+            // per-site template object comes from the host (frozen, with `.raw`,
+            // the same object on every evaluation), then the substitutions.
+            Expr::TaggedTemplate { tag, quasi, .. } if self.hosted => {
+                let call = match &**tag {
+                    Expr::Member {
+                        object,
+                        property: PropertyKey::Ident(k) | PropertyKey::Str(k),
+                        ..
+                    } if !matches!(&**object, Expr::Super(_)) => {
+                        TagCall::Method(self.expr(object)?, String::from(&**k))
+                    }
+                    Expr::Member {
+                        object,
+                        property: PropertyKey::Computed(k),
+                        ..
+                    } if !matches!(&**object, Expr::Super(_)) => {
+                        let recv = self.expr(object)?;
+                        TagCall::Key(recv, self.expr(k)?)
+                    }
+                    other => TagCall::Value(self.expr(other)?),
+                };
+                let strings = self.alloc();
+                self.ops.push(Op::TemplateObject {
+                    dst: strings,
+                    site: core::ptr::from_ref(quasi) as u64,
+                    cooked: quasi
+                        .quasis
+                        .iter()
+                        .map(|q| q.cooked.as_deref().map(<[u8]>::to_vec))
+                        .collect(),
+                    raw: quasi.quasis.iter().map(|q| String::from(&*q.raw)).collect(),
+                });
+                let mut args = alloc::vec![strings];
+                for ex in &quasi.expressions {
+                    args.push(self.expr(ex)?);
+                }
+                let dst = self.alloc();
+                self.ops.push(match call {
+                    TagCall::Method(recv, key) => Op::CallMethod {
+                        dst,
+                        recv,
+                        key,
+                        args,
+                    },
+                    TagCall::Key(recv, key) => Op::CallKey {
+                        dst,
+                        recv,
+                        key,
+                        args,
+                    },
+                    TagCall::Value(callee) => Op::CallValue { dst, callee, args },
+                });
+                Ok(dst)
+            }
             // A tagged template `tag`a${x}b`` → `tag(strings, x, …)`.
             Expr::TaggedTemplate { tag, quasi, .. } => {
                 // A surrogate-bearing cooked/raw quasi can't round-trip through the
@@ -11371,7 +11497,14 @@ impl Compiler {
                     value: t.quasis.first().map(cooked).unwrap_or_default(),
                 });
                 for (i, e) in t.expressions.iter().enumerate() {
-                    let v = self.expr(e)?;
+                    let mut v = self.expr(e)?;
+                    // A substitution is `ToString`ed (string hint), not `+`-added
+                    // (default hint, which would call `valueOf` first).
+                    if self.hosted {
+                        let s = self.alloc();
+                        self.ops.push(Op::ToStr { dst: s, src: v });
+                        v = s;
+                    }
                     let s1 = self.alloc();
                     self.ops.push(Op::AddValue {
                         dst: s1,

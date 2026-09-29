@@ -497,6 +497,11 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
         }
         Op::DeleteGlobal { dst, .. } => reg(*dst),
         Op::RequireObjectCoercible { src } => reg(*src),
+        Op::ToStr { dst, src } => {
+            reg(*dst)?;
+            reg(*src)
+        }
+        Op::TemplateObject { dst, .. } => reg(*dst),
         Op::IterOpen { iter, next, src } => {
             reg(*iter)?;
             reg(*next)?;
@@ -1035,6 +1040,28 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u8(80, out);
             w_reg(*src, out);
         }
+        Op::ToStr { dst, src } => {
+            w_u8(81, out);
+            w_reg(*dst, out);
+            w_reg(*src, out);
+        }
+        Op::TemplateObject {
+            dst,
+            site,
+            cooked,
+            raw,
+        } => {
+            w_u8(82, out);
+            w_reg(*dst, out);
+            w_u32((*site >> 32) as u32, out);
+            w_u32(*site as u32, out);
+            w_u32(cooked.len() as u32, out);
+            for c in cooked {
+                w_bool(c.is_some(), out);
+                w_bytes(c.as_deref().unwrap_or(&[]), out);
+            }
+            w_strs(raw, out);
+        }
         Op::IterOpen { iter, next, src } => {
             w_u8(74, out);
             w_reg(*iter, out);
@@ -1430,6 +1457,27 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             name: r.string()?,
         },
         80 => Op::RequireObjectCoercible { src: r.reg()? },
+        81 => Op::ToStr {
+            dst: r.reg()?,
+            src: r.reg()?,
+        },
+        82 => {
+            let dst = r.reg()?;
+            let site = (u64::from(r.u32()?) << 32) | u64::from(r.u32()?);
+            let n = r.u32()? as usize;
+            let mut cooked = Vec::with_capacity(n.min(r.remaining()));
+            for _ in 0..n {
+                let present = r.boolean()?;
+                let bytes = r.byte_string()?;
+                cooked.push(present.then_some(bytes));
+            }
+            Op::TemplateObject {
+                dst,
+                site,
+                cooked,
+                raw: r.strings()?,
+            }
+        }
         74 => Op::IterOpen {
             iter: r.reg()?,
             next: r.reg()?,

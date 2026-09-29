@@ -345,6 +345,43 @@ impl<'a> Interp<'a> {
         .then_some(h)
     }
 
+    /// The frozen template object (strings plus a frozen, non-enumerable `.raw`)
+    /// of the tagged-template site `site`, created on its first evaluation and
+    /// reused on every later one — its identity is observable to the tag. A
+    /// quasi with an invalid escape has no cooked value (`undefined`), while its
+    /// `.raw` is still preserved (ES2018).
+    pub(crate) fn template_object_for_site(
+        &mut self,
+        site: usize,
+        cooked: &[Option<Vec<u8>>],
+        raw: &[String],
+    ) -> NanBox {
+        let cache_key = (site, self.eval_site_epoch);
+        if let Some(cached) = self.tagged_template_cache.get(&cache_key) {
+            return *cached;
+        }
+        let strings: Vec<NanBox> = cooked
+            .iter()
+            .map(|c| match c {
+                Some(b) => self.new_str_bytes(b.clone()),
+                None => NanBox::undefined(),
+            })
+            .collect();
+        let raw: Vec<NanBox> = raw.iter().map(|r| self.new_str(r)).collect();
+        let strings_h = self.realm.new_array(strings);
+        // Both arrays are frozen, per spec — freeze `.raw` first and `strings`
+        // last so the property write lands; `raw` is non-enumerable.
+        let raw_h = self.realm.new_array(raw);
+        self.realm.freeze_object(raw_h);
+        self.realm
+            .set_property(strings_h, "raw", NanBox::handle(raw_h.to_raw()));
+        self.realm.mark_hidden(strings_h, "raw");
+        self.realm.freeze_object(strings_h);
+        let arr = NanBox::handle(strings_h.to_raw());
+        self.tagged_template_cache.insert(cache_key, arr);
+        arr
+    }
+
     /// Builds a tagged template's argument list `[stringsObject, ...substitutions]`.
     /// The frozen strings object (with its `.raw` array) is created once per
     /// template-literal site and reused on every evaluation — its identity is
@@ -355,39 +392,14 @@ impl<'a> Interp<'a> {
         &mut self,
         quasi: &'a crate::ast::TemplateLiteral,
     ) -> Result<Vec<NanBox>, ExecError> {
-        let cache_key = (core::ptr::from_ref(quasi) as usize, self.eval_site_epoch);
-        let strings_arr = if let Some(cached) = self.tagged_template_cache.get(&cache_key) {
-            *cached
-        } else {
-            // A quasi with an invalid escape sequence has no cooked value
-            // (`undefined`), while its `.raw` is still preserved (ES2018).
-            let strings: Vec<NanBox> = quasi
-                .quasis
-                .iter()
-                .map(|q| match q.cooked.as_deref() {
-                    Some(s) => self.new_str_bytes(s.to_vec()),
-                    None => NanBox::undefined(),
-                })
-                .collect();
-            let raw: Vec<NanBox> = quasi.quasis.iter().map(|q| self.new_str(&q.raw)).collect();
-            let strings_h = self.realm.new_array(strings);
-            // The strings object carries a `.raw` array (for `String.raw` and tags
-            // reading `strings.raw`). Both arrays are frozen, per spec — freeze
-            // `.raw` first and `strings` last so the property write lands.
-            let raw_h = self.realm.new_array(raw);
-            self.realm.freeze_object(raw_h);
-            self.realm
-                .set_property(strings_h, "raw", NanBox::handle(raw_h.to_raw()));
-            // Per spec the template object's `raw` is
-            // `{ writable:false, enumerable:false, configurable:false }` — mark it
-            // non-enumerable *before* freezing (freeze then locks writable /
-            // configurable). Without this it enumerates in `for-in`/`Object.keys`.
-            self.realm.mark_hidden(strings_h, "raw");
-            self.realm.freeze_object(strings_h);
-            let arr = NanBox::handle(strings_h.to_raw());
-            self.tagged_template_cache.insert(cache_key, arr);
-            arr
-        };
+        let cooked: Vec<Option<Vec<u8>>> = quasi
+            .quasis
+            .iter()
+            .map(|q| q.cooked.as_deref().map(<[u8]>::to_vec))
+            .collect();
+        let raw: Vec<String> = quasi.quasis.iter().map(|q| String::from(&*q.raw)).collect();
+        let strings_arr =
+            self.template_object_for_site(core::ptr::from_ref(quasi) as usize, &cooked, &raw);
         let mut args = alloc::vec![strings_arr];
         for e in &quasi.expressions {
             args.push(self.eval(e)?);

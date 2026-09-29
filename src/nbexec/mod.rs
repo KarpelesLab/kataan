@@ -9839,6 +9839,15 @@ impl crate::nbvm::VmHost for Interp<'_> {
         Ok(result)
     }
 
+    fn template_object(&mut self, site: u64, cooked: &[Option<Vec<u8>>], raw: &[String]) -> NanBox {
+        self.template_object_for_site(site as usize, cooked, raw)
+    }
+
+    fn to_string(&mut self, v: NanBox) -> Result<NanBox, crate::nbvm::HostError> {
+        let b = self.coerce_to_string_bytes(v).map_err(exec_to_host)?;
+        Ok(self.new_str_bytes(b))
+    }
+
     fn delete_global(&mut self, name: &str) -> bool {
         self.delete_identifier(name).0
     }
