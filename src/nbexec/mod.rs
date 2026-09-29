@@ -874,6 +874,10 @@ pub struct Interp<'a> {
     /// lexical and variable scopes, which `invoke_inner` keeps in Rust locals
     /// while the callee runs. Traced by `gc_roots`.
     gc_scope_shadow: Vec<Scope>,
+    /// While this interpreter hosts a bytecode-VM run (`ROADMAP.md` §2.0), the
+    /// run's function table, so a VM function value the interpreter is asked to
+    /// call (a callback handed to a built-in) runs on the VM.
+    vm_table: Option<alloc::rc::Rc<[crate::nbvm::FnProto]>>,
 }
 
 /// The `[[ParameterMap]]` of one mapped `arguments` object: the shared parameter
@@ -3333,6 +3337,7 @@ impl<'a> Interp<'a> {
             gc_audit_expr: None,
             gc_audit_call: None,
             gc_scope_shadow: Vec::new(),
+            vm_table: None,
         };
         // The constructor's `current` IS the root scope; capture it as the global
         // scope before `install_globals` populates it, so indirect eval can run
@@ -9689,6 +9694,80 @@ impl crate::nbvm::VmHost for Interp<'_> {
             self.global_scope.declare(name, value);
         }
         Ok(())
+    }
+
+    fn call(
+        &mut self,
+        callee: NanBox,
+        this: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, crate::nbvm::HostError> {
+        self.call_with_this(callee, this, args)
+            .map_err(exec_to_host)
+    }
+
+    fn construct(
+        &mut self,
+        ctor: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, crate::nbvm::HostError> {
+        self.construct(ctor, args).map_err(exec_to_host)
+    }
+
+    fn call_method(
+        &mut self,
+        recv: NanBox,
+        name: &str,
+        args: &[NanBox],
+    ) -> Result<NanBox, crate::nbvm::HostError> {
+        self.call_member_named(recv, name, false, args)
+            .map_err(exec_to_host)
+    }
+
+    fn relational(
+        &mut self,
+        instanceof: bool,
+        a: NanBox,
+        b: NanBox,
+    ) -> Result<NanBox, crate::nbvm::HostError> {
+        let op = if instanceof {
+            crate::ast::BinaryOp::Instanceof
+        } else {
+            crate::ast::BinaryOp::In
+        };
+        self.binary(op, a, b).map_err(exec_to_host)
+    }
+
+    fn global_exists(&mut self, name: &str) -> bool {
+        self.current.get(name).is_some()
+            || self.with_binding(name).is_some()
+            || self.global_object_provides(name)
+    }
+
+    fn run_jobs(&mut self) -> Result<(), crate::nbvm::HostError> {
+        self.run_event_loop().map_err(exec_to_host)
+    }
+
+    fn new_regexp(&mut self, source: &[u8], flags: &str) -> NanBox {
+        NanBox::handle(self.new_regexp_instance(source, flags).to_raw())
+    }
+
+    fn set_vm_table(
+        &mut self,
+        table: Option<alloc::rc::Rc<[crate::nbvm::FnProto]>>,
+    ) -> Option<alloc::rc::Rc<[crate::nbvm::FnProto]>> {
+        core::mem::replace(&mut self.vm_table, table)
+    }
+}
+
+/// A bytecode-VM completion as an interpreter one: a VM throw is a JS throw;
+/// any other VM fault surfaces as an internal fault, which unwinds to the VM
+/// run that delegated here and faults it (the whole program then re-runs on
+/// the tree-walker).
+pub(crate) fn vm_to_exec(e: crate::nbvm::VmError) -> ExecError {
+    match e {
+        crate::nbvm::VmError::Thrown(v) => ExecError::Throw(v),
+        _ => ExecError::Unsupported("bytecode VM fault"),
     }
 }
 

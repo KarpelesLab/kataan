@@ -98,10 +98,29 @@ pub enum Op {
         name: String,
         src: Reg,
         strict: bool,
+        /// For a strict assignment, a register holding whether `name` was
+        /// resolvable when the *reference* was evaluated — before the right-hand
+        /// side, which may create it (`x = (this.x = 1)` still throws).
+        resolved: Option<Reg>,
     },
+    /// `dst = true` iff the global-environment name `name` currently resolves.
+    GlobalExists { dst: Reg, name: String },
     /// Initializes the hoisted global lexical binding `name` (a top-level
     /// `let`/`const`/`class`), ending its temporal dead zone.
     InitGlobal { name: String, src: Reg, konst: bool },
+    /// `dst = new ctor(...args)` for a constructor that is not a class this
+    /// program compiled — a built-in, another script's function — through the
+    /// host's `[[Construct]]` (hosted runs only).
+    Construct { dst: Reg, ctor: Reg, args: Vec<Reg> },
+    /// `dst = a in b` (`instanceof: false`) or `dst = a instanceof b`
+    /// (`instanceof: true`) with the host's full semantics — `Symbol.hasInstance`,
+    /// bound functions, proxies, the prototype chain (hosted runs only).
+    Relational {
+        dst: Reg,
+        instanceof: bool,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = ~a` (bitwise NOT, `i32` semantics).
     BitNot { dst: Reg, a: Reg },
     /// `dst = -a` (numeric negation).
@@ -516,6 +535,142 @@ pub trait VmHost {
         value: NanBox,
         konst: bool,
     ) -> Result<(), HostError>;
+    /// `callee.call(this, ...args)` for any callable the host understands (a
+    /// VM function value included — the host runs it on the VM).
+    ///
+    /// # Errors
+    /// The callee's throw (a `TypeError` for a non-callable), or a host fault.
+    fn call(&mut self, callee: NanBox, this: NanBox, args: &[NanBox]) -> Result<NanBox, HostError>;
+    /// `new ctor(...args)` with the host's `[[Construct]]`.
+    ///
+    /// # Errors
+    /// The constructor's throw (a `TypeError` for a non-constructor), or a host
+    /// fault.
+    fn construct(&mut self, ctor: NanBox, args: &[NanBox]) -> Result<NanBox, HostError>;
+    /// `recv.name(...args)` with the host's method-call semantics (own-property
+    /// precedence, primitive boxing, accessors, the built-in library).
+    ///
+    /// # Errors
+    /// The method's throw (a `TypeError` for a missing method), or a host fault.
+    fn call_method(
+        &mut self,
+        recv: NanBox,
+        name: &str,
+        args: &[NanBox],
+    ) -> Result<NanBox, HostError>;
+    /// `a in b` (`instanceof: false`) or `a instanceof b` (`instanceof: true`).
+    ///
+    /// # Errors
+    /// The operator's `TypeError` (a non-object right side), a throwing trap
+    /// or `Symbol.hasInstance`, or a host fault.
+    fn relational(&mut self, instanceof: bool, a: NanBox, b: NanBox) -> Result<NanBox, HostError>;
+    /// Whether the global-environment name `name` currently resolves (a
+    /// binding, a global-object property, or a `with`-object one).
+    fn global_exists(&mut self, name: &str) -> bool;
+    /// Runs the host's pending jobs (promise reactions, due timers) to
+    /// quiescence, as the end of a script does.
+    ///
+    /// # Errors
+    /// An uncaught error from a job, or a host fault.
+    fn run_jobs(&mut self) -> Result<(), HostError>;
+    /// A regular-expression literal `/source/flags`, built by the host.
+    fn new_regexp(&mut self, source: &[u8], flags: &str) -> NanBox;
+    /// Installs the running VM program's function table (returning the previous
+    /// one), so VM function values handed to the host stay callable.
+    fn set_vm_table(
+        &mut self,
+        table: Option<alloc::rc::Rc<[FnProto]>>,
+    ) -> Option<alloc::rc::Rc<[FnProto]>>;
+}
+
+/// Calls the VM function value `f` for the host (a VM callback a built-in
+/// invokes), running it in a nested VM context over the host's realm.
+///
+/// Promise jobs are still queued per VM context (the host's and the VM's queues
+/// are unified in `ROADMAP.md` §2.0 stage 5), so a callback that leaves jobs
+/// behind faults the run rather than dropping them.
+///
+/// # Errors
+/// The callee's throw, or a VM fault.
+pub(crate) fn call_vm_function(
+    host: &mut dyn VmHost,
+    table: &alloc::rc::Rc<[FnProto]>,
+    f: NanBox,
+    this: NanBox,
+    args: &[NanBox],
+) -> Result<NanBox, VmError> {
+    let mut realm = core::mem::take(host.realm_slot());
+    let result = {
+        let mut ctx = hosted_ctx(&mut realm, host);
+        let r = call_closure(&mut ctx, table, f, args, this);
+        if r.is_ok() && !ctx.microtasks.is_empty() {
+            Err(VmError::Unsupported)
+        } else {
+            r
+        }
+    };
+    *host.realm_slot() = realm;
+    result
+}
+
+/// A fresh [`Ctx`] for a run over `realm` inside `host`. Allocation-triggered
+/// collection is off: the host holds roots (its global environment, class
+/// tables, …) the VM safepoint does not enumerate.
+fn hosted_ctx<'a>(realm: &'a mut Realm, host: &'a mut dyn VmHost) -> Ctx<'a> {
+    Ctx {
+        realm,
+        host: Some(host),
+        output: String::new(),
+        microtasks: alloc::collections::VecDeque::new(),
+        tiers: alloc::collections::BTreeMap::new(),
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_cache: alloc::collections::BTreeMap::new(),
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_pending: None,
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_pending_fault: None,
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_funcs: None,
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_shadow: alloc::vec::Vec::new(),
+        call_depth: 0,
+        gc_enabled: false,
+        gc_lock: 0,
+        frame_shadow: alloc::vec::Vec::new(),
+        frames_published: 0,
+        top_frame_roots: Vec::new(),
+    }
+}
+
+/// The VM function `recv.key` resolves to — a *data* property holding a VM
+/// function, found on the receiver or its prototype chain — if any. An
+/// accessor, a non-VM value, a non-object receiver or a proxy on the way yields
+/// `None`: the host resolves those.
+fn vm_method_of(ctx: &Ctx, recv: NanBox, key: &str) -> Option<NanBox> {
+    let mut cur = recv.as_handle().map(Handle::from_raw);
+    while let Some(c) = cur {
+        if ctx.realm.proxy_at(c).is_some() || ctx.realm.accessor(c, key).is_some() {
+            return None;
+        }
+        if let Some(v) = ctx.realm.get_property(c, key) {
+            return v
+                .as_handle()
+                .filter(|h| ctx.realm.is_vm_function(Handle::from_raw(*h)))
+                .map(|_| v);
+        }
+        cur = ctx.realm.object_proto(c);
+    }
+    None
+}
+
+/// The `[[Prototype]]` a hosted VM closure gets: `%Function.prototype%`, so
+/// `f.call`/`apply`/`bind` and friends resolve through the host's library.
+fn link_function_proto(ctx: &mut Ctx, f: Handle) {
+    if ctx.host.is_some()
+        && let Some(proto) = ctx.realm.intrinsics_snapshot().function_proto
+    {
+        ctx.realm.set_native_proto(f, proto);
+    }
 }
 
 /// `GetValue` of a global-environment name. The common case — a plain,
@@ -759,44 +914,36 @@ pub fn run_program_capturing(
 /// Propagates a [`VmError`] from any faulting instruction.
 pub fn run_program_hosted(
     host: &mut dyn VmHost,
-    funcs: &[FnProto],
+    funcs: &alloc::rc::Rc<[FnProto]>,
     id: usize,
     args: &[NanBox],
 ) -> Result<NanBox, VmError> {
+    let previous = host.set_vm_table(Some(alloc::rc::Rc::clone(funcs)));
     let mut realm = core::mem::take(host.realm_slot());
     let result = {
-        let mut ctx = Ctx {
-            realm: &mut realm,
-            host: Some(&mut *host),
-            output: String::new(),
-            microtasks: alloc::collections::VecDeque::new(),
-            tiers: alloc::collections::BTreeMap::new(),
-            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-            jit_cache: alloc::collections::BTreeMap::new(),
-            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-            jit_pending: None,
-            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-            jit_pending_fault: None,
-            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-            jit_funcs: None,
-            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-            jit_shadow: alloc::vec::Vec::new(),
-            call_depth: 0,
-            gc_enabled: false,
-            gc_lock: 0,
-            frame_shadow: alloc::vec::Vec::new(),
-            frames_published: 0,
-            top_frame_roots: Vec::new(),
-        };
+        let mut ctx = hosted_ctx(&mut realm, host);
         // A script body runs with `this` = the global object.
         let this = ctx
             .host
             .as_deref()
             .map_or(NanBox::undefined(), VmHost::global_this);
-        call_with(&mut ctx, funcs, id, args, &[], this)
-            .and_then(|v| drain_microtasks(&mut ctx, funcs).map(|()| v))
+        call_with(&mut ctx, funcs, id, args, &[], this).and_then(|v| {
+            // Both job queues run to quiescence: the VM's own promise jobs and
+            // the host's (reactions to promises its built-ins created, timers).
+            // Each may enqueue work on the other.
+            loop {
+                drain_microtasks(&mut ctx, funcs)?;
+                with_host(&mut ctx, |h| h.run_jobs())
+                    .unwrap_or(Ok(()))
+                    .map_err(VmError::from)?;
+                if ctx.microtasks.is_empty() {
+                    return Ok(v);
+                }
+            }
+        })
     };
     *host.realm_slot() = realm;
+    host.set_vm_table(previous);
     result
 }
 
@@ -3057,10 +3204,59 @@ fn run_frame(
                 Some(Err(e)) => handle_throw!(VmError::from(e)),
                 None => return Err(VmError::Unsupported),
             },
-            Op::StoreGlobal { name, src, strict } => {
+            Op::StoreGlobal {
+                name,
+                src,
+                strict,
+                resolved,
+            } => {
+                if let Some(r) = resolved
+                    && *strict
+                    && regs[*r as usize].as_boolean() != Some(true)
+                {
+                    let e = vm_error(
+                        ctx,
+                        "ReferenceError",
+                        &alloc::format!("{name} is not defined"),
+                    );
+                    handle_throw!(VmError::Thrown(e));
+                    continue;
+                }
                 let v = regs[*src as usize];
                 match with_host(ctx, |h| h.write_global(name, v, *strict)) {
                     Some(Ok(())) => {}
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
+            }
+            Op::GlobalExists { dst, name } => match with_host(ctx, |h| h.global_exists(name)) {
+                Some(b) => regs[*dst as usize] = NanBox::boolean(b),
+                None => return Err(VmError::Unsupported),
+            },
+            Op::Construct { dst, ctor, args } => {
+                let c = regs[*ctor as usize];
+                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                // Constructing a VM function is stage 4 of `ROADMAP.md` §2.0.
+                if c.as_handle()
+                    .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
+                {
+                    return Err(VmError::Unsupported);
+                }
+                match with_host(ctx, |h| h.construct(c, &argv)) {
+                    Some(Ok(v)) => regs[*dst as usize] = v,
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
+            }
+            Op::Relational {
+                dst,
+                instanceof,
+                a,
+                b,
+            } => {
+                let (x, y) = (regs[*a as usize], regs[*b as usize]);
+                match with_host(ctx, |h| h.relational(*instanceof, x, y)) {
+                    Some(Ok(v)) => regs[*dst as usize] = v,
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
                     None => return Err(VmError::Unsupported),
                 }
@@ -3451,8 +3647,10 @@ fn run_frame(
                 regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(rest).to_raw());
             }
             Op::NewRegExp { dst, source, flags } => {
-                let h = ctx.realm.new_regexp(source, flags);
-                regs[*dst as usize] = NanBox::handle(h.to_raw());
+                regs[*dst as usize] = match with_host(ctx, |h| h.new_regexp(source, flags)) {
+                    Some(v) => v,
+                    None => NanBox::handle(ctx.realm.new_regexp(source, flags).to_raw()),
+                };
             }
             Op::NewObject { dst } => {
                 let handle = ctx.realm.new_object();
@@ -3528,6 +3726,7 @@ fn run_frame(
                 ctx.realm
                     .set_hidden_property(handle, "\u{0}vmfn", NanBox::boolean(true));
                 install_fn_name_length(ctx.realm, handle, funcs.get(*func as usize));
+                link_function_proto(ctx, handle);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::MakeClosure {
@@ -3543,7 +3742,26 @@ fn run_frame(
                 ctx.realm
                     .set_hidden_property(handle, "\u{0}vmfn", NanBox::boolean(true));
                 install_fn_name_length(ctx.realm, handle, funcs.get(*func as usize));
+                link_function_proto(ctx, handle);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
+            }
+            Op::CallValue { dst, callee, args }
+                if ctx.host.is_some()
+                    && !regs[*callee as usize]
+                        .as_handle()
+                        .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h))) =>
+            {
+                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                match call_closure(
+                    ctx,
+                    funcs,
+                    regs[*callee as usize],
+                    &argv,
+                    NanBox::undefined(),
+                ) {
+                    Ok(ret) => regs[*dst as usize] = ret,
+                    Err(e) => handle_throw!(e),
+                }
             }
             Op::CallValue { dst, callee, args } => {
                 let handle = object_handle(regs[*callee as usize])?;
@@ -3590,6 +3808,33 @@ fn run_frame(
             } => {
                 let recv_val = regs[*recv as usize];
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                // Hosted: a method that is a VM function (a data property on the
+                // receiver's chain) runs here; any other method call — a built-in,
+                // an accessor, a primitive receiver, a missing method's TypeError —
+                // is the host's, with its exact semantics.
+                if ctx.host.is_some() {
+                    let outcome = match vm_method_of(ctx, recv_val, key) {
+                        Some(closure) => {
+                            // Publish this frame's registers so a collection at a
+                            // back-edge inside the callee can see them.
+                            let pub_mark = ctx.frame_shadow.len();
+                            ctx.frame_shadow.extend_from_slice(regs);
+                            ctx.frames_published += 1;
+                            let r = call_closure(ctx, funcs, closure, &argv, recv_val);
+                            ctx.frames_published -= 1;
+                            ctx.frame_shadow.truncate(pub_mark);
+                            r
+                        }
+                        None => with_host(ctx, |h| h.call_method(recv_val, key, &argv))
+                            .unwrap_or(Err(HostError::Fault))
+                            .map_err(VmError::from),
+                    };
+                    match outcome {
+                        Ok(ret) => regs[*dst as usize] = ret,
+                        Err(e) => handle_throw!(e),
+                    }
+                    continue;
+                }
                 // A user method is a callable property reached on the receiver or
                 // anywhere along its `[[Prototype]]` chain (an inherited accessor is
                 // invoked with the receiver as `this`); otherwise try a built-in
@@ -4389,6 +4634,17 @@ fn call_closure(
     args: &[NanBox],
     this_val: NanBox,
 ) -> Result<NanBox, VmError> {
+    // Anything but a VM function — a native, an interpreter closure, a bound or
+    // proxied function, a non-callable (a `TypeError`) — is the host's to call.
+    if ctx.host.is_some()
+        && !closure
+            .as_handle()
+            .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
+    {
+        return with_host(ctx, |h| h.call(closure, this_val, args))
+            .unwrap_or(Err(HostError::Fault))
+            .map_err(VmError::from);
+    }
     let fh = closure
         .as_handle()
         .map(Handle::from_raw)
@@ -6109,6 +6365,7 @@ pub fn execute_typed_interruptible(
             crate::nbexec::ErrorPhase::Runtime,
         ));
     }
+    let protos: alloc::rc::Rc<[FnProto]> = protos.into();
     match run_program_hosted(&mut interp, &protos, main as usize, &[]) {
         Ok(value) => Ok((String::from(interp.output()), interp.display(value))),
         // An interrupt is a *deadline*, not a construct the VM cannot lower:
@@ -6186,6 +6443,7 @@ pub fn execute_scripts_typed(
     // global environment, intrinsics and console serve the VM. Each script's
     // global declarations are instantiated by the interpreter just before its
     // body runs.
+    let table: alloc::rc::Rc<[FnProto]> = table.into();
     let mut interp = crate::nbexec::Interp::new_with_limits(limits);
     let mut completion = String::new();
     for (program, main) in programs.iter().zip(&mains) {
@@ -7477,6 +7735,7 @@ impl Compiler {
                             name: String::from(&*id.name),
                             src: reg,
                             strict: false,
+                            resolved: None,
                         });
                     } else {
                         c.fn_value_regs.insert(String::from(&*id.name), reg);
@@ -7598,10 +7857,23 @@ impl Compiler {
         }
     }
 
+    /// Whether `name` denotes something the VM does not model *and* must not be
+    /// mistaken for a global lookup: inside a function, an unbound `arguments`
+    /// is the function's arguments object. Resolving it as a global would turn
+    /// a construct the VM cannot run into a JS-visible `ReferenceError` — one
+    /// that, thrown inside a promise job, nobody would ever see. Such a name is
+    /// a compile refusal instead (the program runs on the tree-walker).
+    fn models_not(&self, name: &str) -> bool {
+        name == "arguments" && !self.is_main && self.lookup(name).is_none()
+    }
+
     /// The binding a *reference* to `name` resolves to: a lexical one, else (in
     /// a hosted compile) the global environment's; `None` when the name cannot
     /// be resolved at compile time and there is no host to ask at run time.
     fn resolve(&mut self, name: &str) -> Option<Binding> {
+        if self.models_not(name) {
+            return None;
+        }
         match self.lookup(name) {
             Some(b) => Some(b),
             None if self.hosted => Some(self.global_binding(name, GlobalWrite::Put)),
@@ -7956,6 +8228,7 @@ impl Compiler {
                     name,
                     src,
                     strict: self.strict,
+                    resolved: None,
                 },
                 GlobalWrite::InitLet => Op::InitGlobal {
                     name,
@@ -8784,6 +9057,8 @@ impl Compiler {
             Expr::Ident(id) => {
                 if let Some(b) = self.lookup(&id.name) {
                     Ok(self.read_var(b))
+                } else if self.models_not(&id.name) {
+                    Err(CompileError::Unsupported("arguments object"))
                 } else if self.hosted && !matches!(&*id.name, "undefined" | "NaN" | "Infinity") {
                     // Hosted: every other name — a built-in, another script's
                     // declaration, this script's own top-level ones (hoisted into
@@ -8849,6 +9124,12 @@ impl Compiler {
                 // `undefined`) or a known builtin (`Math`, `BigInt`, …) — instead
                 // goes through the normal path (the builtin bails to the
                 // tree-walker), so `typeof Math` is `"object"`, not `"undefined"`.
+                if matches!(op, UnaryOp::Typeof)
+                    && let Expr::Ident(id) = &**argument
+                    && self.models_not(&id.name)
+                {
+                    return Err(CompileError::Unsupported("arguments object"));
+                }
                 if self.hosted
                     && matches!(op, UnaryOp::Typeof)
                     && let Expr::Ident(id) = &**argument
@@ -8899,6 +9180,20 @@ impl Compiler {
             Expr::Binary {
                 op, left, right, ..
             } => {
+                // Hosted: `in` / `instanceof` are the host's operators (the
+                // special cases below are the VM's own approximations).
+                if self.hosted && matches!(op, BinaryOp::In | BinaryOp::Instanceof) {
+                    let a = self.expr(left)?;
+                    let b = self.expr(right)?;
+                    let dst = self.alloc();
+                    self.ops.push(Op::Relational {
+                        dst,
+                        instanceof: matches!(op, BinaryOp::Instanceof),
+                        a,
+                        b,
+                    });
+                    return Ok(dst);
+                }
                 // `x instanceof Class` for a known class: true iff `x`'s class
                 // tag is the class or one of its subclasses (computed here).
                 if matches!(op, BinaryOp::Instanceof)
@@ -9204,7 +9499,11 @@ impl Compiler {
                     return Ok(self.this_reg);
                 }
                 // A built-in call (`console.log`, `Math.max`, `String`, …).
-                if let Some(native) = native_call(callee).or_else(|| native_global(callee)) {
+                // The static built-in shortcuts are the VM's own stand-ins; a hosted
+                // run calls the real built-ins through the host instead.
+                if !self.hosted
+                    && let Some(native) = native_call(callee).or_else(|| native_global(callee))
+                {
                     let dst = self.alloc();
                     self.ops.push(Op::CallNative { dst, native, args });
                     return Ok(dst);
@@ -9371,14 +9670,33 @@ impl Compiler {
                         let b = self
                             .resolve(&id.name)
                             .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
-                        let v = self.expr(value)?;
-                        let src = if compound {
-                            let cur = self.read_var(b);
-                            self.emit_binop(Self::compound_binop(*op)?, cur, v)?
+                        // The reference — and for `op=` its current value — is
+                        // taken *before* the right-hand side runs.
+                        let cur = compound.then(|| self.read_var(b));
+                        let resolved = if b.global.is_some() && self.strict && !compound {
+                            let dst = self.alloc();
+                            self.ops.push(Op::GlobalExists {
+                                dst,
+                                name: String::from(&*id.name),
+                            });
+                            Some(dst)
                         } else {
-                            v
+                            None
                         };
-                        self.write_var(b, src);
+                        let v = self.expr(value)?;
+                        let src = match cur {
+                            Some(cur) => self.emit_binop(Self::compound_binop(*op)?, cur, v)?,
+                            None => v,
+                        };
+                        match resolved {
+                            Some(r) => self.ops.push(Op::StoreGlobal {
+                                name: String::from(&*id.name),
+                                src,
+                                strict: true,
+                                resolved: Some(r),
+                            }),
+                            None => self.write_var(b, src),
+                        }
                         Ok(src)
                     }
                     // `obj.k (op)= v` / `arr[i] (op)= v`.
@@ -9515,6 +9833,25 @@ impl Compiler {
             Expr::New {
                 callee, arguments, ..
             } => {
+                // Hosted: `new` on anything but a class this program compiled is the
+                // host's `[[Construct]]` — the real built-in constructors, not the
+                // VM's stand-ins below.
+                if self.hosted
+                    && !matches!(&**callee, Expr::Ident(id)
+                        if self.lookup(&id.name).is_none() && self.classes.contains_key(&*id.name))
+                {
+                    let ctor = self.expr(callee)?;
+                    let mut args = Vec::with_capacity(arguments.len());
+                    for a in arguments {
+                        let crate::ast::Argument::Item(e) = a else {
+                            return Err(CompileError::Unsupported("spread argument"));
+                        };
+                        args.push(self.expr(e)?);
+                    }
+                    let dst = self.alloc();
+                    self.ops.push(Op::Construct { dst, ctor, args });
+                    return Ok(dst);
+                }
                 let Expr::Ident(id) = &**callee else {
                     return Err(CompileError::Unsupported("new on non-class"));
                 };
@@ -9621,11 +9958,16 @@ impl Compiler {
                 }
                 let instance = self.alloc();
                 self.ops.push(Op::NewObject { dst: instance });
-                // Tag the instance with its class (for `instanceof`).
-                self.ops.push(Op::SetClassTag {
-                    obj: instance,
-                    class_id: info.class_id,
-                });
+                // Tag the instance with its class (for the VM's own `instanceof`
+                // shortcut). A hosted run uses the host's operator instead, and
+                // the host reads class tags as *its own* class ids — it must not
+                // see VM ones.
+                if !self.hosted {
+                    self.ops.push(Op::SetClassTag {
+                        obj: instance,
+                        class_id: info.class_id,
+                    });
+                }
                 // Link the instance to the class's `.prototype` (built in
                 // `materialize_class`), so public methods/accessors are inherited
                 // (`instance.m === C.prototype.m`, no own `m`) rather than copied.

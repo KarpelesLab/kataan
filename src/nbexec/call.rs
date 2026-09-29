@@ -27,6 +27,8 @@ impl<'a> Interp<'a> {
             // replace path and throws, rather than stringifying the class.
             || self.realm.class_at(handle).is_some()
             || self.realm.bound_native_at(handle).is_some()
+            // A bytecode-VM function value, while a VM run is hosted here.
+            || (self.vm_table.is_some() && self.realm.is_vm_function(handle))
             // A class constructor has a `[[Call]]` (it throws "cannot be invoked
             // without 'new'"), so `IsCallable` is true for it — `typeof C` is
             // "function" and `[].sort(class {})` must not be rejected up front.
@@ -314,6 +316,14 @@ impl<'a> Interp<'a> {
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         };
         let handle = Handle::from_raw(raw);
+        // A bytecode-VM function value (a callback a hosted VM run handed to a
+        // built-in) runs on the VM.
+        if let Some(table) = self.vm_table.clone()
+            && self.realm.is_vm_function(handle)
+        {
+            return crate::nbvm::call_vm_function(self, &table, callee, this_val, args)
+                .map_err(super::vm_to_exec);
+        }
         // `%Function.prototype%` is itself a function object whose `[[Call]]`
         // accepts any arguments and returns `undefined` (ECMA-262 20.2.3).
         if self.realm.is_function_proto_intrinsic(handle) {
@@ -2777,6 +2787,11 @@ impl<'a> Interp<'a> {
         // "not a constructor" check is performed by the running execution context,
         // before any [[Construct]] would consult the callee's realm.
         let callee_h = callee.as_handle().map(Handle::from_raw);
+        // Constructing a bytecode-VM function is not modelled across the tiers
+        // yet (`ROADMAP.md` §2.0 stage 4): fault the hosted run.
+        if self.vm_table.is_some() && callee_h.is_some_and(|h| self.realm.is_vm_function(h)) {
+            return Err(ExecError::Unsupported("construct a bytecode-VM function"));
+        }
         let realm = if !self.is_constructor_value(callee)
             // See `call_with_this`: a Proxy's `[[Construct]]` runs in the caller's
             // realm, so its `construct` trap's `argArray` is created there.

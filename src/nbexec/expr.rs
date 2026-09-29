@@ -1882,6 +1882,11 @@ impl<'a> Interp<'a> {
         call_optional: bool,
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
+        // A named key takes the shared by-name path (which the bytecode VM also
+        // delegates to — `ROADMAP.md` §2.0).
+        if let PropertyKey::Ident(name) | PropertyKey::Str(name) = property {
+            return self.call_member_named(recv, name, call_optional, args);
+        }
         // The built-in name-based dispatch (`call_method`) is an
         // optimization for *unshadowed* built-in methods. If the
         // receiver carries an *own* property of this name (e.g.
@@ -2104,6 +2109,76 @@ impl<'a> Interp<'a> {
             return Err(ExecError::OptShortCircuit);
         }
         // Method call: `this` is the receiver.
+        self.call_with_this(f, recv, args)
+    }
+
+    /// `recv.name(...args)` for a *named* key: the method-call semantics of
+    /// [`call_member_dispatch`](Self::call_member_dispatch) for an identifier or
+    /// string key, without an AST key. An own property of that name wins over
+    /// the built-in by-name dispatch (so a reassigned method keeps its own
+    /// `this`-validation), a user-patched `Promise.prototype.then`/`catch`/
+    /// `finally` is honoured, a primitive receiver is boxed to find the method
+    /// but stays `this`, and anything else is an ordinary `[[Get]]` + call.
+    pub(crate) fn call_member_named(
+        &mut self,
+        recv: NanBox,
+        name: &str,
+        call_optional: bool,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        if let Some(rh) = recv.as_handle().map(Handle::from_raw)
+            && self.realm.has_own(rh, name)
+        {
+            let f = self.read_member(rh, name)?;
+            if f.as_handle()
+                .map(Handle::from_raw)
+                .is_some_and(|fh| self.is_callable(fh))
+            {
+                return self.call_with_this(f, recv, args);
+            }
+        }
+        if matches!(name, "then" | "catch" | "finally")
+            && let Some(rh) = recv.as_handle().map(Handle::from_raw)
+            && self.realm.promise_state(rh).is_some()
+        {
+            let f = self.read_member(rh, name)?;
+            if let Some(fh) = f.as_handle().map(Handle::from_raw)
+                && self.is_callable(fh)
+                && self.realm.native_at(fh).is_none()
+            {
+                return self.call_with_this(f, recv, args);
+            }
+        }
+        if let Some(result) = self.call_method(recv, name, args)? {
+            return Ok(result);
+        }
+        let Some(raw) = recv.as_handle() else {
+            if call_optional {
+                return Err(ExecError::OptShortCircuit);
+            }
+            if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                let m = self.new_str("cannot read property of null or undefined");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            let boxed = self.coerce_to_object(recv);
+            if let Some(bh) = boxed.as_handle().map(Handle::from_raw) {
+                let f = self.read_member(bh, name)?;
+                if call_optional && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    return Err(ExecError::OptShortCircuit);
+                }
+                if f.as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    return self.call_with_this(f, recv, args);
+                }
+            }
+            let m = self.new_str("is not a function");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        };
+        let f = self.read_member(Handle::from_raw(raw), name)?;
+        if call_optional && matches!(f.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            return Err(ExecError::OptShortCircuit);
+        }
         self.call_with_this(f, recv, args)
     }
 

@@ -477,7 +477,24 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             regs(args)
         }
         Op::LoadGlobal { dst, .. } | Op::TypeofGlobal { dst, .. } => reg(*dst),
-        Op::StoreGlobal { src, .. } | Op::InitGlobal { src, .. } => reg(*src),
+        Op::StoreGlobal { src, resolved, .. } => {
+            if let Some(r) = resolved {
+                reg(*r)?;
+            }
+            reg(*src)
+        }
+        Op::InitGlobal { src, .. } => reg(*src),
+        Op::GlobalExists { dst, .. } => reg(*dst),
+        Op::Construct { dst, ctor, args } => {
+            reg(*dst)?;
+            reg(*ctor)?;
+            regs(args)
+        }
+        Op::Relational { dst, a, b, .. } => {
+            reg(*dst)?;
+            reg(*a)?;
+            reg(*b)
+        }
         Op::PopHandler => Ok(()),
     }
 }
@@ -903,17 +920,47 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*dst, out);
             w_str(name, out);
         }
-        Op::StoreGlobal { name, src, strict } => {
+        Op::StoreGlobal {
+            name,
+            src,
+            strict,
+            resolved,
+        } => {
             w_u8(62, out);
             w_str(name, out);
             w_reg(*src, out);
             w_bool(*strict, out);
+            w_bool(resolved.is_some(), out);
+            w_reg(resolved.unwrap_or(0), out);
+        }
+        Op::GlobalExists { dst, name } => {
+            w_u8(66, out);
+            w_reg(*dst, out);
+            w_str(name, out);
         }
         Op::InitGlobal { name, src, konst } => {
             w_u8(63, out);
             w_str(name, out);
             w_reg(*src, out);
             w_bool(*konst, out);
+        }
+        Op::Construct { dst, ctor, args } => {
+            w_u8(64, out);
+            w_reg(*dst, out);
+            w_reg(*ctor, out);
+            w_regs(args, out);
+        }
+        Op::Relational {
+            dst,
+            instanceof,
+            a,
+            b,
+        } => {
+            w_u8(65, out);
+            w_reg(*dst, out);
+            w_bool(*instanceof, out);
+            w_reg(*a, out);
+            w_reg(*b, out);
         }
     }
 }
@@ -1195,11 +1242,31 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             name: r.string()?,
             src: r.reg()?,
             strict: r.boolean()?,
+            resolved: {
+                let has = r.boolean()?;
+                let reg = r.reg()?;
+                has.then_some(reg)
+            },
+        },
+        66 => Op::GlobalExists {
+            dst: r.reg()?,
+            name: r.string()?,
         },
         63 => Op::InitGlobal {
             name: r.string()?,
             src: r.reg()?,
             konst: r.boolean()?,
+        },
+        64 => Op::Construct {
+            dst: r.reg()?,
+            ctor: r.reg()?,
+            args: r.regs()?,
+        },
+        65 => Op::Relational {
+            dst: r.reg()?,
+            instanceof: r.boolean()?,
+            a: r.reg()?,
+            b: r.reg()?,
         },
         t => return Err(DecodeError::BadTag(t)),
     })
