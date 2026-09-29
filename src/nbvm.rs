@@ -215,6 +215,9 @@ pub enum Op {
     /// A derived constructor's completion value `src`: an object is the
     /// result, `undefined` is the (bound) `this`, anything else a `TypeError`.
     DerivedResult { dst: Reg, src: Reg, this: Reg },
+    /// An object literal's `__proto__: src`: sets `obj`'s `[[Prototype]]` when
+    /// `src` is an object or `null` (anything else is ignored).
+    SetProtoIfObject { obj: Reg, src: Reg },
     /// `dst = new.target`. Always among a function's first two ops (after any
     /// `MakeArguments`); filled in by `call_with_inner` on entry.
     LoadNewTarget { dst: Reg },
@@ -4336,6 +4339,16 @@ fn run_frame(
                         NanBox::number(if *dec { n - 1.0 } else { n + 1.0 })
                     }
                 };
+            }
+            Op::SetProtoIfObject { obj, src } => {
+                let v = regs[*src as usize];
+                let o = object_handle(regs[*obj as usize])?;
+                if matches!(v.unpack(), crate::nanbox::Unpacked::Null) {
+                    ctx.realm.set_object_proto(o, None);
+                } else if is_object_value(ctx.realm, v) {
+                    ctx.realm
+                        .set_object_proto(o, v.as_handle().map(Handle::from_raw));
+                }
             }
             Op::MakeClass { dst, f, sup } => {
                 let fv = regs[*f as usize];
@@ -8860,6 +8873,20 @@ const CTOR_NAME: &str = "\0ctor";
 /// The hidden binding holding a class's prototype (instance elements' home).
 const PROTO_NAME: &str = "\0proto";
 
+/// The hidden binding holding an object literal (its methods' `super` home).
+const OBJ_HOME_NAME: &str = "\0objhome";
+
+/// IsAnonymousFunctionDefinition: a function, arrow or class expression with no
+/// own name (NamedEvaluation gives it the name of what it is assigned to).
+fn is_anonymous_fn_def(e: &Expr) -> bool {
+    match e {
+        Expr::Function(f) => f.id.is_none(),
+        Expr::Arrow(_) => true,
+        Expr::Class(c) => c.id.is_none(),
+        _ => false,
+    }
+}
+
 /// The rest parameter of a synthesized default derived constructor.
 const DEFAULT_ARGS: &str = "\0args";
 
@@ -11750,6 +11777,7 @@ impl Compiler {
                 }
                 Ok(dst)
             }
+            Expr::Object { members, .. } if self.hosted => self.object_literal_hosted(members),
             Expr::Object { members, .. } => {
                 // A data property whose key duplicates an accessor defined earlier
                 // in the same literal (`{get x(){}, x: 1}`) is a CreateDataProperty
@@ -13786,6 +13814,119 @@ impl Compiler {
         })();
         self.scopes.pop();
         self.strict = saved_strict;
+        r
+    }
+
+    /// A hosted object literal: members are *defined* (CreateDataProperty /
+    /// accessor definitions through the host, so a later data property
+    /// replaces an accessor), computed keys run `ToPropertyKey` in order, an
+    /// anonymous function value is named after its key, `__proto__: v` sets
+    /// the prototype, and methods get the object as their `super` home.
+    fn object_literal_hosted(&mut self, members: &[ObjectMember]) -> Result<Reg, CompileError> {
+        let dst = self.alloc();
+        self.ops.push(Op::NewObject { dst });
+        self.scopes.push(alloc::collections::BTreeMap::new());
+        let r = (|| -> Result<(), CompileError> {
+            let hb = self.bind_hidden_cell(OBJ_HOME_NAME, true, false)?;
+            self.write_var(hb, dst);
+            for m in members {
+                match m {
+                    ObjectMember::Property {
+                        key: PropertyKey::Ident(k) | PropertyKey::Str(k),
+                        value,
+                        shorthand: false,
+                        method: false,
+                        ..
+                    } if &**k == "__proto__" => {
+                        let v = self.expr(value)?;
+                        self.ops.push(Op::SetProtoIfObject { obj: dst, src: v });
+                    }
+                    ObjectMember::Property {
+                        key, value, method, ..
+                    } => {
+                        let k = self.class_key(key)?;
+                        let named = *method || is_anonymous_fn_def(value);
+                        let v = self.with_home(OBJ_HOME_NAME, |c| {
+                            c.next_closure_is_method = *method;
+                            let v = c.expr(value);
+                            c.next_closure_is_method = false;
+                            v
+                        })?;
+                        if named {
+                            self.ops.push(Op::DefineMethod {
+                                obj: dst,
+                                key: k,
+                                func: v,
+                                kind: 4,
+                            });
+                        } else {
+                            self.ops.push(Op::DefineData {
+                                obj: dst,
+                                key: k,
+                                src: v,
+                                attrs: 7,
+                            });
+                        }
+                    }
+                    ObjectMember::Spread { value, .. } => {
+                        let src = self.expr(value)?;
+                        self.ops.push(Op::ObjectSpread { dst, src });
+                    }
+                    ObjectMember::Accessor {
+                        is_getter,
+                        key,
+                        value,
+                        ..
+                    } => {
+                        refuse_generator(value)?;
+                        let k = self.class_key(key)?;
+                        let f = self.with_home(OBJ_HOME_NAME, |c| {
+                            c.next_closure_is_method = true;
+                            let f = c.make_closure(&value.params, &value.body, false, "", false);
+                            c.next_closure_is_method = false;
+                            f
+                        })?;
+                        self.ops.push(Op::DefineMethod {
+                            obj: dst,
+                            key: k,
+                            func: f,
+                            kind: if *is_getter { 5 } else { 6 },
+                        });
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.scopes.pop();
+        r?;
+        Ok(dst)
+    }
+
+    /// Runs `f` with [`HOME_NAME`] aliased to the hidden binding `home` (the
+    /// `super` home object of the functions `f` creates).
+    fn with_home<T>(
+        &mut self,
+        home: &str,
+        f: impl FnOnce(&mut Self) -> Result<T, CompileError>,
+    ) -> Result<T, CompileError> {
+        let hb = self
+            .lookup(home)
+            .ok_or(CompileError::Unsupported("home object"))?;
+        let saved = self
+            .scopes
+            .last_mut()
+            .expect("a scope")
+            .insert(String::from(HOME_NAME), hb);
+        let r = f(self);
+        let scope = self.scopes.last_mut().expect("a scope");
+        match saved {
+            Some(b) => {
+                scope.insert(String::from(HOME_NAME), b);
+            }
+            None => {
+                scope.remove(HOME_NAME);
+            }
+        }
         r
     }
 

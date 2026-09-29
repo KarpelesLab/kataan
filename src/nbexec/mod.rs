@@ -9875,6 +9875,9 @@ impl crate::nbvm::VmHost for Interp<'_> {
             Some((d, _)) => alloc::format!("[{d}]"),
             None => self.realm.to_display_string(key),
         };
+        // Bit 4: an object literal's (enumerable) definition.
+        let enumerable = kind & 4 != 0;
+        let kind = kind & 3;
         let fname = match kind {
             1 => alloc::format!("get {base}"),
             2 => alloc::format!("set {base}"),
@@ -9906,7 +9909,7 @@ impl crate::nbvm::VmHost for Interp<'_> {
             }
         }
         self.realm
-            .set_property(desc, "enumerable", NanBox::boolean(false));
+            .set_property(desc, "enumerable", NanBox::boolean(enumerable));
         self.realm
             .set_property(desc, "configurable", NanBox::boolean(true));
         if !self

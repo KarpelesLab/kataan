@@ -556,6 +556,10 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*src)?;
             reg(*this)
         }
+        Op::SetProtoIfObject { obj, src } => {
+            reg(*obj)?;
+            reg(*src)
+        }
         Op::CallSpread {
             dst,
             callee,
@@ -1223,6 +1227,11 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
                 w_reg(*r, out);
             }
         }
+        Op::SetProtoIfObject { obj, src } => {
+            w_u8(97, out);
+            w_reg(*obj, out);
+            w_reg(*src, out);
+        }
         Op::DerivedResult { dst, src, this } => {
             w_u8(96, out);
             for r in [dst, src, this] {
@@ -1712,6 +1721,10 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             key: r.reg()?,
             src: r.reg()?,
             this: r.reg()?,
+        },
+        97 => Op::SetProtoIfObject {
+            obj: r.reg()?,
+            src: r.reg()?,
         },
         96 => Op::DerivedResult {
             dst: r.reg()?,
