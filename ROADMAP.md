@@ -201,8 +201,8 @@ calls and construction across the tiers, the `arguments` object, `new` on
 plain functions, and real `Cell::VmFunction` closures — **26,378 / 53,377** on
 the VM with the fallback disabled.
 
-**Progress (2026-09-30).** **51,328 / 53,377** on the VM (`KATAAN_VM_STRICT=1`),
-232 wrong results, gate unchanged. Since stage 4: lexical `this`/`new.target`,
+**Progress (2026-09-30).** **51,404 / 53,377** on the VM (`KATAAN_VM_STRICT=1`),
+~180 wrong results, gate unchanged. Since stage 4: lexical `this`/`new.target`,
 TDZ cells, BigInt, spread, host `Function`/indirect `eval`, top-level direct
 `eval`, mapped `arguments` (real parameter-cell aliasing when observable),
 object literals that *define* members, **runtime classes** (incl. private
