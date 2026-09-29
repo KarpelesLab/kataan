@@ -112,6 +112,9 @@ pub enum Op {
     /// itself is then a no-op. `mapped` selects a sloppy-mode (mapped) object;
     /// it is only compiled for a function with no parameters to alias.
     MakeArguments { dst: Reg, mapped: bool },
+    /// `dst = ToPropertyKey(src)` for an object key (its `toString` /
+    /// `Symbol.toPrimitive` runs, via the host); a primitive key is copied as-is.
+    ToKey { dst: Reg, src: Reg },
     /// `obj.key = src` in strict code: like [`Op::SetProp`], but a failed write
     /// throws (hosted runs only).
     SetPropStrict { obj: Reg, key: String, src: Reg },
@@ -633,6 +636,29 @@ pub trait VmHost {
     /// enumerable. Called only from the outermost hosted run's safepoint, when
     /// no delegated host call is in flight.
     fn collect_garbage(&mut self, vm_roots: &[Handle]);
+    /// The binary operator `op` over `a` and `b` with the host's semantics
+    /// (`ToPrimitive` with `Symbol.toPrimitive` and user `valueOf`/`toString`,
+    /// whose throws propagate).
+    ///
+    /// # Errors
+    /// A throw from a coercion or the operator itself, or a host fault.
+    fn binary(
+        &mut self,
+        op: crate::ast::BinaryOp,
+        a: NanBox,
+        b: NanBox,
+    ) -> Result<NanBox, HostError>;
+    /// The unary operator `op` over `v` with the host's semantics.
+    ///
+    /// # Errors
+    /// A throw from a coercion, or a host fault.
+    fn unary(&mut self, op: crate::ast::UnaryOp, v: NanBox) -> Result<NanBox, HostError>;
+    /// `ToPropertyKey(v)` of an object key: a string (a symbol's internal key
+    /// form included).
+    ///
+    /// # Errors
+    /// A throw from the key's conversion, or a host fault.
+    fn to_property_key(&mut self, v: NanBox) -> Result<NanBox, HostError>;
     /// `ToObject(v)` (the value itself when it is already an object).
     fn to_object(&mut self, v: NanBox) -> NanBox;
     /// A regular-expression literal `/source/flags`, built by the host.
@@ -734,6 +760,43 @@ fn host_get(ctx: &mut Ctx, recv: NanBox, key: NanBox) -> Result<NanBox, VmError>
 fn host_get_str(ctx: &mut Ctx, recv: NanBox, key: &str) -> Result<NanBox, VmError> {
     let k = NanBox::handle(ctx.realm.new_string(key).to_raw());
     host_get(ctx, recv, k)
+}
+
+/// In a hosted run, an operator with an *object* operand is the host's: that is
+/// where `ToPrimitive` runs user code (`Symbol.toPrimitive`, an inherited
+/// `valueOf`, a `Date`'s string hint), and where its throws must propagate —
+/// the VM's own coercion looks only at own methods and swallows errors.
+/// `None` when the VM's own (primitive-only) path applies.
+fn host_binary(
+    ctx: &mut Ctx,
+    op: crate::ast::BinaryOp,
+    a: NanBox,
+    b: NanBox,
+) -> Option<Result<NanBox, VmError>> {
+    if ctx.host.is_none() || !(is_object_value(ctx.realm, a) || is_object_value(ctx.realm, b)) {
+        return None;
+    }
+    Some(
+        with_host(ctx, |h| h.binary(op, a, b))
+            .unwrap_or(Err(HostError::Fault))
+            .map_err(VmError::from),
+    )
+}
+
+/// [`host_binary`] for a unary operator.
+fn host_unary(
+    ctx: &mut Ctx,
+    op: crate::ast::UnaryOp,
+    v: NanBox,
+) -> Option<Result<NanBox, VmError>> {
+    if ctx.host.is_none() || !is_object_value(ctx.realm, v) {
+        return None;
+    }
+    Some(
+        with_host(ctx, |h| h.unary(op, v))
+            .unwrap_or(Err(HostError::Fault))
+            .map_err(VmError::from),
+    )
 }
 
 /// The host's `[[Set]]` of `recv[key] = value` (see [`VmHost::set_member`]).
@@ -1780,6 +1843,9 @@ fn to_primitive(ctx: &mut Ctx, funcs: &[FnProto], v: NanBox, number_hint: bool) 
 /// numeric addition from the resulting primitives). Any observable side effect (a
 /// user `valueOf`) therefore runs exactly once per evaluation.
 fn vm_add(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanBox, VmError> {
+    if let Some(r) = host_binary(ctx, crate::ast::BinaryOp::Add, a, b) {
+        return r;
+    }
     let x = to_primitive(ctx, funcs, a, true);
     let y = to_primitive(ctx, funcs, b, true);
     if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_STR_ERR) {
@@ -1844,6 +1910,11 @@ fn vm_call_native(
         // `valueOf`/`toString` — which can call a JS closure; a Symbol/BigInt
         // operand throws a TypeError.
         let arg = args.first().copied().unwrap_or(NanBox::undefined());
+        // Hosted: `+obj` is the host's ToNumber (`Symbol.toPrimitive`, inherited
+        // `valueOf`, a throw that propagates).
+        if let Some(r) = host_unary(ctx, crate::ast::UnaryOp::Plus, arg) {
+            return r;
+        }
         let prim = to_primitive(ctx, funcs, arg, true);
         let bad = prim.as_handle().map(Handle::from_raw).and_then(|h| {
             if ctx.realm.symbol_at(h).is_some() {
@@ -1877,6 +1948,15 @@ fn vm_arith(
     b: NanBox,
     op: u8,
 ) -> Result<NanBox, VmError> {
+    let bop = match op {
+        GA_SUB => crate::ast::BinaryOp::Sub,
+        GA_MUL => crate::ast::BinaryOp::Mul,
+        GA_DIV => crate::ast::BinaryOp::Div,
+        _ => crate::ast::BinaryOp::Mod,
+    };
+    if let Some(r) = host_binary(ctx, bop, a, b) {
+        return r;
+    }
     let x = to_primitive(ctx, funcs, a, true);
     let y = to_primitive(ctx, funcs, b, true);
     if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_NUM_ERR) {
@@ -1898,6 +1978,9 @@ fn vm_arith(
 /// so this single primitive backs all four relational operators. Returns a boolean
 /// `NanBox`.
 fn vm_lt(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanBox, VmError> {
+    if let Some(r) = host_binary(ctx, crate::ast::BinaryOp::Lt, a, b) {
+        return r;
+    }
     let x = to_primitive(ctx, funcs, a, true);
     let y = to_primitive(ctx, funcs, b, true);
     if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_NUM_ERR) {
@@ -1928,6 +2011,23 @@ fn vm_value_bin(
     b: NanBox,
     op: u8,
 ) -> Result<NanBox, VmError> {
+    {
+        use crate::ast::BinaryOp as B;
+        let bop = match op {
+            VB_POW => B::Exp,
+            VB_BIT_AND => B::BitAnd,
+            VB_BIT_OR => B::BitOr,
+            VB_BIT_XOR => B::BitXor,
+            VB_SHL => B::Shl,
+            VB_SHR => B::Shr,
+            VB_USHR => B::Ushr,
+            VB_LOOSE_EQ => B::EqEq,
+            _ => B::NotEq,
+        };
+        if let Some(r) = host_binary(ctx, bop, a, b) {
+            return r;
+        }
+    }
     match op {
         VB_LOOSE_EQ | VB_LOOSE_NEQ => {
             // `obj == primitive` runs `ToPrimitive(obj)` with the **default** hint —
@@ -3548,6 +3648,18 @@ fn run_frame(
             }
             // Filled in by `call_with_inner` on entry.
             Op::MakeArguments { .. } => {}
+            Op::ToKey { dst, src } => {
+                let v = regs[*src as usize];
+                if is_object_value(ctx.realm, v) {
+                    match with_host(ctx, |h| h.to_property_key(v)) {
+                        Some(Ok(k)) => regs[*dst as usize] = k,
+                        Some(Err(e)) => handle_throw!(VmError::from(e)),
+                        None => return Err(VmError::Unsupported),
+                    }
+                } else {
+                    regs[*dst as usize] = v;
+                }
+            }
             Op::BindThis { this } => {
                 let t = regs[*this as usize];
                 if let Some(bound) = with_host(ctx, |h| {
@@ -3639,6 +3751,13 @@ fn run_frame(
             }
             #[cfg(feature = "std")]
             Op::BitNot { dst, a } => {
+                if let Some(r) = host_unary(ctx, crate::ast::UnaryOp::BitNot, regs[*a as usize]) {
+                    match r {
+                        Ok(v) => regs[*dst as usize] = v,
+                        Err(e) => handle_throw!(e),
+                    }
+                    continue;
+                }
                 let x = to_primitive(ctx, funcs, regs[*a as usize], true);
                 if let Some(e) = symbol_coercion_error(ctx.realm, x, x, SYM_NUM_ERR) {
                     handle_throw!(VmError::Thrown(e));
@@ -3655,6 +3774,13 @@ fn run_frame(
                 }
             }
             Op::Neg { dst, a } => {
+                if let Some(r) = host_unary(ctx, crate::ast::UnaryOp::Minus, regs[*a as usize]) {
+                    match r {
+                        Ok(v) => regs[*dst as usize] = v,
+                        Err(e) => handle_throw!(e),
+                    }
+                    continue;
+                }
                 let x = to_primitive(ctx, funcs, regs[*a as usize], true);
                 if let Some(e) = symbol_coercion_error(ctx.realm, x, x, SYM_NUM_ERR) {
                     handle_throw!(VmError::Thrown(e));
@@ -10399,15 +10525,44 @@ impl Compiler {
                     Expr::Member {
                         object, property, ..
                     } => {
+                        // The base and a computed key expression are evaluated once,
+                        // before the right-hand side.
                         let obj = self.expr(object)?;
-                        let v = self.expr(value)?;
+                        let mut key = match property {
+                            PropertyKey::Computed(e) => Some(self.expr(e)?),
+                            _ => None,
+                        };
                         let src = if compound {
-                            let cur = self.member_read(obj, property)?;
+                            // `op=`: the reference's GetValue — with ToPropertyKey,
+                            // exactly once — runs before the right-hand side, and the
+                            // converted key serves the write too.
+                            let cur = match key {
+                                Some(k) => {
+                                    let kc = if self.hosted {
+                                        let kc = self.alloc();
+                                        self.ops.push(Op::ToKey { dst: kc, src: k });
+                                        key = Some(kc);
+                                        kc
+                                    } else {
+                                        k
+                                    };
+                                    let dst = self.alloc();
+                                    self.ops.push(Op::GetKey { dst, obj, key: kc });
+                                    dst
+                                }
+                                None => self.member_read(obj, property)?,
+                            };
+                            let v = self.expr(value)?;
                             self.emit_binop(Self::compound_binop(*op)?, cur, v)?
                         } else {
-                            v
+                            // `=`: ToPropertyKey is deferred to PutValue, after the
+                            // right-hand side.
+                            self.expr(value)?
                         };
-                        self.member_write(obj, property, src)?;
+                        match key {
+                            Some(k) => self.store_key(obj, k, src),
+                            None => self.member_write(obj, property, src)?,
+                        }
                         Ok(src)
                     }
                     // Destructuring assignment (`[a, b] = …`, `({ x } = …)`).
@@ -11376,6 +11531,15 @@ impl Compiler {
         let b = self.declare(name);
         self.write_var(b, cobj);
         Ok(())
+    }
+
+    /// Writes `src` to `obj[key]` for an already-evaluated key register.
+    fn store_key(&mut self, obj: Reg, key: Reg, src: Reg) {
+        self.ops.push(if self.hosted && self.strict {
+            Op::SetKeyStrict { obj, key, src }
+        } else {
+            Op::SetKey { obj, key, src }
+        });
     }
 
     /// Writes `src` to `obj.key` / `obj[i]` (the mirror of `member_read`).

@@ -9738,6 +9738,19 @@ impl crate::nbvm::VmHost for Interp<'_> {
         self.binary(op, a, b).map_err(exec_to_host)
     }
 
+    fn binary(
+        &mut self,
+        op: crate::ast::BinaryOp,
+        a: NanBox,
+        b: NanBox,
+    ) -> Result<NanBox, crate::nbvm::HostError> {
+        Interp::binary(self, op, a, b).map_err(exec_to_host)
+    }
+
+    fn unary(&mut self, op: UnaryOp, v: NanBox) -> Result<NanBox, crate::nbvm::HostError> {
+        Interp::unary(self, op, v).map_err(exec_to_host)
+    }
+
     fn global_exists(&mut self, name: &str) -> bool {
         self.current.get(name).is_some()
             || self.with_binding(name).is_some()
@@ -9769,6 +9782,11 @@ impl crate::nbvm::VmHost for Interp<'_> {
 
     fn collect_garbage(&mut self, vm_roots: &[Handle]) {
         self.collect_with_roots(vm_roots);
+    }
+
+    fn to_property_key(&mut self, v: NanBox) -> Result<NanBox, crate::nbvm::HostError> {
+        let k = self.coerce_property_key(v).map_err(exec_to_host)?;
+        Ok(self.new_str(&k))
     }
 
     fn to_object(&mut self, v: NanBox) -> NanBox {

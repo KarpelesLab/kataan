@@ -486,6 +486,10 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
         Op::InitGlobal { src, .. } => reg(*src),
         Op::GlobalExists { dst, .. } | Op::MakeArguments { dst, .. } => reg(*dst),
         Op::InitFnPrototype { f } | Op::BindThis { this: f } => reg(*f),
+        Op::ToKey { dst, src } => {
+            reg(*dst)?;
+            reg(*src)
+        }
         Op::SetPropStrict { obj, src, .. } => {
             reg(*obj)?;
             reg(*src)
@@ -972,6 +976,11 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u8(70, out);
             w_reg(*this, out);
         }
+        Op::ToKey { dst, src } => {
+            w_u8(73, out);
+            w_reg(*dst, out);
+            w_reg(*src, out);
+        }
         Op::SetPropStrict { obj, key, src } => {
             w_u8(71, out);
             w_reg(*obj, out);
@@ -1316,6 +1325,10 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         },
         68 => Op::InitFnPrototype { f: r.reg()? },
         70 => Op::BindThis { this: r.reg()? },
+        73 => Op::ToKey {
+            dst: r.reg()?,
+            src: r.reg()?,
+        },
         71 => Op::SetPropStrict {
             obj: r.reg()?,
             key: r.string()?,
