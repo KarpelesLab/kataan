@@ -1232,6 +1232,26 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// [`Self::async_from_sync_next`] passing `args` to the sync `next`.
+    pub(crate) fn async_from_sync_next_args(
+        &mut self,
+        iter: Handle,
+        next: NanBox,
+        args: &[NanBox],
+    ) -> Result<Handle, ExecError> {
+        let iter_val = NanBox::handle(iter.to_raw());
+        let result = self.call_with_this(next, iter_val, args);
+        match self.async_from_sync_continuation(iter, result) {
+            Ok(p) => Ok(p),
+            Err(ExecError::Throw(e)) => {
+                let p = self.fresh_promise();
+                self.settle(p, e, false);
+                Ok(p)
+            }
+            Err(other) => Err(other),
+        }
+    }
+
     /// [`Self::async_from_sync_next`] for the bytecode VM's `for await`.
     pub(crate) fn async_from_sync_next_pub(
         &mut self,

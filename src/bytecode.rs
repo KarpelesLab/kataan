@@ -600,6 +600,26 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*sync)
         }
         Op::CheckObject { src } => reg(*src),
+        Op::YieldResume { dst, mode, src } => {
+            reg(*dst)?;
+            reg(*mode)?;
+            reg(*src)
+        }
+        Op::AsyncDelegateCall {
+            dst,
+            act,
+            iter,
+            next,
+            sync,
+            mode,
+            val,
+        } => {
+            for r in [dst, act, iter, next, sync, mode, val] {
+                reg(*r)?;
+            }
+            Ok(())
+        }
+        Op::ThrowTypeError { .. } => Ok(()),
         Op::YieldDelegate {
             dst,
             iter,
@@ -1344,6 +1364,30 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u8(112, out);
             w_reg(*src, out);
         }
+        Op::YieldResume { dst, mode, src } => {
+            w_u8(113, out);
+            for r in [dst, mode, src] {
+                w_reg(*r, out);
+            }
+        }
+        Op::AsyncDelegateCall {
+            dst,
+            act,
+            iter,
+            next,
+            sync,
+            mode,
+            val,
+        } => {
+            w_u8(114, out);
+            for r in [dst, act, iter, next, sync, mode, val] {
+                w_reg(*r, out);
+            }
+        }
+        Op::ThrowTypeError { msg } => {
+            w_u8(115, out);
+            w_str(msg, out);
+        }
         Op::YieldDelegate {
             dst,
             iter,
@@ -1924,6 +1968,21 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             sync: r.reg()?,
         },
         112 => Op::CheckObject { src: r.reg()? },
+        113 => Op::YieldResume {
+            dst: r.reg()?,
+            mode: r.reg()?,
+            src: r.reg()?,
+        },
+        114 => Op::AsyncDelegateCall {
+            dst: r.reg()?,
+            act: r.reg()?,
+            iter: r.reg()?,
+            next: r.reg()?,
+            sync: r.reg()?,
+            mode: r.reg()?,
+            val: r.reg()?,
+        },
+        115 => Op::ThrowTypeError { msg: r.string()? },
         108 => Op::YieldDelegate {
             dst: r.reg()?,
             iter: r.reg()?,

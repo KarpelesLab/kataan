@@ -9987,9 +9987,35 @@ impl crate::nbvm::VmHost for Interp<'_> {
         &mut self,
         v: NanBox,
     ) -> Result<(NanBox, NanBox, bool), crate::nbvm::HostError> {
-        if let Some(ih) = self.async_iterator_of(v).map_err(exec_to_host)? {
+        // GetMethod(v, @@asyncIterator), read once: absent → the sync
+        // protocol; present but not callable → a TypeError.
+        if matches!(v.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            return Err(exec_to_host(self.type_error("value is not async iterable")));
+        }
+        let sym = self.well_known_symbol("asyncIterator");
+        let key = self.member_key(sym);
+        let obj = self.coerce_to_object(v);
+        let m = match obj.as_handle().map(Handle::from_raw) {
+            Some(h) => self.get_with_receiver(h, &key, v).map_err(exec_to_host)?,
+            None => NanBox::undefined(),
+        };
+        if !matches!(m.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            if !m
+                .as_handle()
+                .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            {
+                return Err(exec_to_host(
+                    self.type_error("Symbol.asyncIterator is not a function"),
+                ));
+            }
+            let it = self.call_with_this(m, v, &[]).map_err(exec_to_host)?;
+            let Some(ih) = it.as_handle().map(Handle::from_raw) else {
+                return Err(exec_to_host(
+                    self.type_error("async iterator is not an object"),
+                ));
+            };
             let next = self.read_member(ih, "next").map_err(exec_to_host)?;
-            return Ok((NanBox::handle(ih.to_raw()), next, false));
+            return Ok((it, next, false));
         }
         self.require_iterator_method(v).map_err(exec_to_host)?;
         let it = self.get_iter_object(v).map_err(exec_to_host)?;
@@ -10007,6 +10033,21 @@ impl crate::nbvm::VmHost for Interp<'_> {
         };
         let p = self
             .async_from_sync_next_pub(ih, next)
+            .map_err(exec_to_host)?;
+        Ok(NanBox::handle(p.to_raw()))
+    }
+
+    fn async_from_sync_next_with(
+        &mut self,
+        iter: NanBox,
+        next: NanBox,
+        v: NanBox,
+    ) -> Result<NanBox, crate::nbvm::HostError> {
+        let Some(ih) = iter.as_handle().map(Handle::from_raw) else {
+            return Err(crate::nbvm::HostError::Fault);
+        };
+        let p = self
+            .async_from_sync_next_args(ih, next, &[v])
             .map_err(exec_to_host)?;
         Ok(NanBox::handle(p.to_raw()))
     }
