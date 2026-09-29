@@ -620,6 +620,11 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             Ok(())
         }
         Op::ThrowTypeError { .. } => Ok(()),
+        Op::Compare { dst, a, b, .. } => {
+            reg(*dst)?;
+            reg(*a)?;
+            reg(*b)
+        }
         Op::AnnexBGlobal { src, .. } => reg(*src),
         Op::ObjectRestDyn { dst, src, keys, .. } => {
             reg(*dst)?;
@@ -1411,6 +1416,13 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u8(115, out);
             w_str(msg, out);
         }
+        Op::Compare { dst, op, a, b } => {
+            w_u8(120, out);
+            w_reg(*dst, out);
+            w_u8(*op, out);
+            w_reg(*a, out);
+            w_reg(*b, out);
+        }
         Op::ObjectRestDyn {
             dst,
             src,
@@ -2054,6 +2066,12 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             val: r.reg()?,
         },
         115 => Op::ThrowTypeError { msg: r.string()? },
+        120 => Op::Compare {
+            dst: r.reg()?,
+            op: r.u8()?,
+            a: r.reg()?,
+            b: r.reg()?,
+        },
         119 => {
             let dst = r.reg()?;
             let src = r.reg()?;

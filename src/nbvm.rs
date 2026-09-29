@@ -293,6 +293,9 @@ pub enum Op {
     },
     /// Throws a `TypeError` with `msg`.
     ThrowTypeError { msg: String },
+    /// `dst = a <op> b` for `op` 0 `<`, 1 `>`, 2 `<=`, 3 `>=` (hosted): numbers
+    /// directly, anything else through the host's operator.
+    Compare { dst: Reg, op: u8, a: Reg, b: Reg },
     /// Hosted object rest with computed keys: `dst = { ...src }` without the
     /// `exclude` names and the property keys held in `keys`.
     ObjectRestDyn {
@@ -1334,6 +1337,12 @@ fn vm_set_prop_mode(
     // bindings (the host mirrors it), so it is the host's.
     let to_host = read_needs_host(ctx, recv)
         || ctx.host.as_ref().is_some_and(|h| h.global_this() == recv)
+        // An array's `length` write (ToUint32 + ToNumber of any value, the
+        // RangeError, truncation) is the host's ArraySetLength.
+        || (key == "length"
+            && recv
+                .as_handle()
+                .is_some_and(|h| ctx.realm.array_elements(Handle::from_raw(h)).is_some()))
         || recv
             .as_handle()
             .is_some_and(|h| !plain_write_ok(ctx.realm, Handle::from_raw(h), key));
@@ -1361,7 +1370,15 @@ fn vm_set_elem_mode(
     }
     // An indexed write on a VM function (an ordinary object's index keys) is
     // the host's; the VM's element store is for arrays.
+    // An index write past an array's end (other than an append) makes holes
+    // or a huge length: the host's (sparse) array.
+    let past_end = key.as_number().is_some_and(|n| {
+        recv.as_handle()
+            .and_then(|h| ctx.realm.array_length(Handle::from_raw(h)))
+            .is_some_and(|len| n > len as f64)
+    });
     let mut to_host = read_needs_host(ctx, recv)
+        || past_end
         || is_mapped_arguments(ctx.realm, recv)
         || (key.as_number().is_some()
             && recv
@@ -5939,6 +5956,29 @@ fn run_frame_at(
                     Some(Ok(())) => regs[*dst as usize] = t,
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
                     None => return Err(VmError::Unsupported),
+                }
+            }
+            Op::Compare { dst, op, a, b } => {
+                let (x, y) = (regs[*a as usize], regs[*b as usize]);
+                if let (Some(p), Some(q)) = (x.as_number(), y.as_number()) {
+                    regs[*dst as usize] = NanBox::boolean(match op {
+                        0 => p < q,
+                        1 => p > q,
+                        2 => p <= q,
+                        _ => p >= q,
+                    });
+                } else {
+                    let bop = match op {
+                        0 => crate::ast::BinaryOp::Lt,
+                        1 => crate::ast::BinaryOp::Gt,
+                        2 => crate::ast::BinaryOp::LtEq,
+                        _ => crate::ast::BinaryOp::GtEq,
+                    };
+                    match with_host(ctx, |h| h.binary(bop, x, y)) {
+                        Some(Ok(v)) => regs[*dst as usize] = v,
+                        Some(Err(e)) => handle_throw!(VmError::from(e)),
+                        None => return Err(VmError::Unsupported),
+                    }
                 }
             }
             Op::ThrowTypeError { msg } => {
@@ -11546,6 +11586,12 @@ impl Compiler {
                         seen.extend(free_of_function(&f.params, &f.body));
                     }
                 }
+                // Hosted: any captured lexical binding — a closure created before
+                // the declaration runs (a class method naming a later class, an
+                // arrow) must close over the binding itself.
+                if hosted {
+                    seen.extend(c.cell_names.iter().cloned());
+                }
                 // A hosted class declaration binds through `declare`, like `let`.
                 if hosted {
                     lexical.extend(core::mem::take(&mut classes));
@@ -12901,7 +12947,8 @@ impl Compiler {
             Stmt::Block { body, .. } => {
                 self.scopes.push(alloc::collections::BTreeMap::new());
                 let r = self
-                    .hoist_block_functions(body)
+                    .prebind_block_lexicals(body, &BTreeSet::new())
+                    .and_then(|()| self.hoist_block_functions(body))
                     .and_then(|()| body.iter().try_for_each(|s| self.stmt(s).map(|_| ())));
                 self.scopes.pop();
                 r?;
@@ -15485,6 +15532,21 @@ impl Compiler {
     /// Emits the op(s) for `a <op> b` into a fresh register, returning it.
     fn emit_binop(&mut self, op: BinaryOp, a: Reg, b: Reg) -> Result<Reg, CompileError> {
         let dst = self.alloc();
+        // Hosted relational comparisons: operands in source order, `undefined`/
+        // NaN comparisons false both ways, BigInt/string mixes — the host's.
+        if self.hosted {
+            let cmp = match op {
+                BinaryOp::Lt => Some(0),
+                BinaryOp::Gt => Some(1),
+                BinaryOp::LtEq => Some(2),
+                BinaryOp::GtEq => Some(3),
+                _ => None,
+            };
+            if let Some(op) = cmp {
+                self.ops.push(Op::Compare { dst, op, a, b });
+                return Ok(dst);
+            }
+        }
         match op {
             BinaryOp::Add => self.ops.push(Op::AddValue { dst, a, b }),
             BinaryOp::Sub => self.ops.push(Op::Sub { dst, a, b }),
@@ -16405,27 +16467,17 @@ impl Compiler {
         })
     }
 
-    /// Block-level function declarations (hosted): each is bound in the block's
-    /// scope and instantiated at block entry (all names first, so they can
-    /// close over each other).
-    fn hoist_block_functions(&mut self, body: &[Stmt]) -> Result<(), CompileError> {
-        let fns: Vec<&crate::ast::Function> = body
-            .iter()
-            .filter_map(|s| match s {
-                Stmt::Function(f) if f.id.is_some() => Some(f),
-                _ => None,
-            })
-            .collect();
-        if fns.is_empty() {
+    /// A block's own `let`/`const`/`class` names that closures capture (the
+    /// block's cell names, plus `extra`) are pre-bound as TDZ cells at block
+    /// entry; their declarations initialize them (hosted only).
+    fn prebind_block_lexicals(
+        &mut self,
+        body: &[Stmt],
+        extra: &BTreeSet<String>,
+    ) -> Result<(), CompileError> {
+        if !self.hosted {
             return Ok(());
         }
-        if !self.hosted {
-            return Err(CompileError::Unsupported(
-                "block-level function declaration",
-            ));
-        }
-        // The block's own `let`/`const`/`class` names these functions close over
-        // are pre-bound as TDZ cells (their declarations initialize them).
         let mut lexical = BTreeSet::new();
         let mut consts = BTreeSet::new();
         for stmt in body {
@@ -16446,15 +16498,43 @@ impl Compiler {
                 _ => {}
             }
         }
+        let depth = self.scopes.len() - 1;
+        for name in &lexical {
+            if !(self.cell_names.contains(name) || extra.contains(name))
+                || self.scopes[depth].contains_key(name.as_str())
+            {
+                continue;
+            }
+            self.bind_hidden_cell(name, consts.contains(name), true)?;
+            self.tdz_pending.insert((depth, name.clone()));
+        }
+        Ok(())
+    }
+
+    /// Block-level function declarations (hosted): each is bound in the block's
+    /// scope and instantiated at block entry (all names first, so they can
+    /// close over each other).
+    fn hoist_block_functions(&mut self, body: &[Stmt]) -> Result<(), CompileError> {
+        let fns: Vec<&crate::ast::Function> = body
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Function(f) if f.id.is_some() => Some(f),
+                _ => None,
+            })
+            .collect();
+        if fns.is_empty() {
+            return Ok(());
+        }
+        if !self.hosted {
+            return Err(CompileError::Unsupported(
+                "block-level function declaration",
+            ));
+        }
         let mut seen = BTreeSet::new();
         for f in &fns {
             seen.extend(free_of_nonarrow(&f.params, &f.body));
         }
-        let depth = self.scopes.len() - 1;
-        for name in lexical.intersection(&seen) {
-            self.bind_hidden_cell(name, consts.contains(name), true)?;
-            self.tdz_pending.insert((depth, name.clone()));
-        }
+        self.prebind_block_lexicals(body, &seen)?;
         for f in &fns {
             let name = &f.id.as_ref().expect("named").name;
             if !self.scopes.last().is_some_and(|s| s.contains_key(&**name)) {
