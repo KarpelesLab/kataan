@@ -293,6 +293,13 @@ pub enum Op {
     },
     /// Throws a `TypeError` with `msg`.
     ThrowTypeError { msg: String },
+    /// `dst = eval(...args)` at a hosted script's top level (see
+    /// [`VmHost::direct_eval`]).
+    DirectEval {
+        dst: Reg,
+        args: Vec<Reg>,
+        strict: bool,
+    },
     /// `dst = await src` in a hosted async function: suspends the frame until
     /// the awaited value settles.
     Await { dst: Reg, src: Reg },
@@ -985,6 +992,19 @@ pub trait VmHost {
     /// # Errors
     /// A fatal (non-JS) error; JS errors reject the promise.
     fn async_from_sync_next(&mut self, iter: NanBox, next: NanBox) -> Result<NanBox, HostError>;
+    /// `eval(...args)` spelled directly at a hosted script's top level (no VM
+    /// locals in scope): a direct eval in the host's current (global) scope with
+    /// the caller's strictness when `callee` is the running realm's %eval%,
+    /// else an ordinary call.
+    ///
+    /// # Errors
+    /// The eval code's (or the callee's) throw.
+    fn direct_eval(
+        &mut self,
+        callee: NanBox,
+        args: &[NanBox],
+        strict: bool,
+    ) -> Result<NanBox, HostError>;
     /// [`VmHost::async_from_sync_next`] passing `v` to the sync `next`.
     ///
     /// # Errors
@@ -5802,6 +5822,28 @@ fn run_frame_at(
                 match r {
                     Ok(res) => regs[*dst as usize] = res,
                     Err(e) => handle_throw!(e),
+                }
+            }
+            Op::DirectEval { dst, args, strict } => {
+                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                let callee = match with_host(ctx, |h| h.read_global("eval")) {
+                    Some(Ok(f)) => f,
+                    Some(Err(e)) => {
+                        handle_throw!(VmError::from(e));
+                        continue;
+                    }
+                    None => return Err(VmError::Unsupported),
+                };
+                let pub_mark = ctx.frame_shadow.len();
+                ctx.frame_shadow.extend_from_slice(regs);
+                ctx.frames_published += 1;
+                let r = with_host(ctx, |h| h.direct_eval(callee, &argv, *strict));
+                ctx.frames_published -= 1;
+                ctx.frame_shadow.truncate(pub_mark);
+                match r {
+                    Some(Ok(v)) => regs[*dst as usize] = v,
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
                 }
             }
             Op::ThrowTypeError { msg } => {
@@ -13701,6 +13743,18 @@ impl Compiler {
             Expr::Call {
                 callee, arguments, ..
             } => {
+                if matches!(&**callee, Expr::Ident(id) if &*id.name == "eval")
+                    && self.top_level_direct_eval_ok()
+                    && arguments
+                        .iter()
+                        .all(|a| matches!(a, crate::ast::Argument::Item(_)))
+                {
+                    let args = self.call_args(arguments)?;
+                    let dst = self.alloc();
+                    let strict = self.strict;
+                    self.ops.push(Op::DirectEval { dst, args, strict });
+                    return Ok(dst);
+                }
                 self.refuse_direct_eval(callee)?;
                 // Every branch below evaluates the callee (and its receiver) *before*
                 // the arguments, as `EvaluateCall` does.
@@ -14773,6 +14827,20 @@ impl Compiler {
             }
             _ => Ok(()),
         }
+    }
+
+    /// Whether a direct `eval` here can run in the host's global scope: a
+    /// hosted script's top level with no VM-held binding a script could name
+    /// (top-level declarations are globals; hidden `\0` bindings are not
+    /// nameable).
+    fn top_level_direct_eval_ok(&self) -> bool {
+        self.hosted
+            && self.is_main
+            && self.lookup("eval").is_none()
+            && self
+                .scopes
+                .iter()
+                .all(|sc| sc.keys().all(|k| k.starts_with('\0')))
     }
 
     /// Drains the iterable in `src` through the host's iterator protocol into

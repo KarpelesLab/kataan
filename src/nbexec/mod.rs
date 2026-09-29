@@ -10037,6 +10037,31 @@ impl crate::nbvm::VmHost for Interp<'_> {
         Ok(NanBox::handle(p.to_raw()))
     }
 
+    fn direct_eval(
+        &mut self,
+        callee: NanBox,
+        args: &[NanBox],
+        strict: bool,
+    ) -> Result<NanBox, crate::nbvm::HostError> {
+        let is_eval = callee.as_handle().map(Handle::from_raw).is_some_and(|h| {
+            self.realm.native_at(h) == Some(N_EVAL) && self.get_function_realm(h) == self.cur_realm
+        });
+        if !is_eval {
+            return self.call(callee, args).map_err(exec_to_host);
+        }
+        let arg0 = args.first().copied().unwrap_or(NanBox::undefined());
+        let Some(source) = arg0
+            .as_handle()
+            .and_then(|raw| self.realm.string_bytes(Handle::from_raw(raw)))
+        else {
+            return Ok(arg0);
+        };
+        let saved = core::mem::replace(&mut self.strict, strict);
+        let r = self.eval_string(&source, true);
+        self.strict = saved;
+        r.map_err(exec_to_host)
+    }
+
     fn async_from_sync_next_with(
         &mut self,
         iter: NanBox,

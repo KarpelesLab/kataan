@@ -620,6 +620,13 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             Ok(())
         }
         Op::ThrowTypeError { .. } => Ok(()),
+        Op::DirectEval { dst, args, .. } => {
+            reg(*dst)?;
+            for a in args {
+                reg(*a)?;
+            }
+            Ok(())
+        }
         Op::YieldDelegate {
             dst,
             iter,
@@ -1388,6 +1395,15 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u8(115, out);
             w_str(msg, out);
         }
+        Op::DirectEval { dst, args, strict } => {
+            w_u8(116, out);
+            w_reg(*dst, out);
+            w_u32(args.len() as u32, out);
+            for a in args {
+                w_reg(*a, out);
+            }
+            w_bool(*strict, out);
+        }
         Op::YieldDelegate {
             dst,
             iter,
@@ -1983,6 +1999,19 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             val: r.reg()?,
         },
         115 => Op::ThrowTypeError { msg: r.string()? },
+        116 => {
+            let dst = r.reg()?;
+            let n = r.u32()? as usize;
+            let mut args = Vec::with_capacity(n.min(r.remaining()));
+            for _ in 0..n {
+                args.push(r.reg()?);
+            }
+            Op::DirectEval {
+                dst,
+                args,
+                strict: r.boolean()?,
+            }
+        }
         108 => Op::YieldDelegate {
             dst: r.reg()?,
             iter: r.reg()?,
