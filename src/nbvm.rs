@@ -1585,7 +1585,25 @@ fn call_with_inner(
             let c = match (callee, *mapped) {
                 (Some(c), _) => c,
                 (None, false) => NanBox::undefined(),
-                (None, true) => return Err(VmError::Unsupported),
+                // A direct call to a hoisted function by id: its callee is the
+                // canonical closure its name is bound to (a hosted script's
+                // top-level function is a global binding).
+                (None, true) => {
+                    let name = proto.name.clone();
+                    let g = with_host(ctx, |h| h.read_global(&name).ok()).flatten();
+                    match g {
+                        Some(v)
+                            if v.as_handle().is_some_and(|h| {
+                                ctx.realm
+                                    .vm_function(Handle::from_raw(h))
+                                    .is_some_and(|(f, _)| f as usize == id)
+                            }) =>
+                        {
+                            v
+                        }
+                        _ => return Err(VmError::Unsupported),
+                    }
+                }
             };
             let v = with_host(ctx, |h| h.make_arguments(&args, c, *mapped))
                 .ok_or(VmError::Unsupported)?;
@@ -8594,6 +8612,11 @@ struct Binding {
     /// A cell that may still hold the TDZ sentinel: a body-level `let`/`const`
     /// that a hoisted function declaration closes over, so every access checks.
     tdz: bool,
+    /// A parameter of a function with a *mapped* `arguments` object (or that
+    /// `arguments` binding itself): the VM's `arguments` does not alias the
+    /// parameters, so a write to such a parameter — or any use of `arguments`
+    /// beyond `arguments.length` / `arguments[i]` reads — refuses the program.
+    mapped: bool,
 }
 
 /// A member assignment target evaluated ahead of its value: the object
@@ -8717,6 +8740,11 @@ struct Compiler {
     /// Body-level lexical names pre-bound as TDZ cells whose declaration has not
     /// been compiled yet (see [`Binding::tdz`]).
     tdz_pending: BTreeSet<String>,
+    /// Set while compiling the object of an `arguments.x` / `arguments[i]` read
+    /// (the one use of a mapped `arguments` the VM models).
+    args_member_read: bool,
+    /// A mapped parameter was written, or a mapped `arguments` escaped.
+    mapped_violation: bool,
 }
 
 impl Compiler {
@@ -8771,7 +8799,7 @@ impl Compiler {
         strict: bool,
         hosted: bool,
         is_arrow: bool,
-        cap_flags: &alloc::collections::BTreeMap<String, (bool, bool)>,
+        cap_flags: &alloc::collections::BTreeMap<String, (bool, bool, bool)>,
     ) -> Result<FnProto, CompileError> {
         // The VM's `async` functions settle its *own* promise implementation,
         // which is not yet unified with the host's (`ROADMAP.md` §2.0 stage 5):
@@ -8838,16 +8866,14 @@ impl Compiler {
         // `Op::MakeArguments`). A sloppy function with simple parameters gets a
         // *mapped* object whose elements alias the parameters; the VM does not
         // model that aliasing, so such a function with parameters is refused.
+        let mapped_args = uses_arguments
+            && !strict
+            && !params.is_empty()
+            && params.iter().all(|p| {
+                !p.rest && p.default.is_none() && matches!(p.target, BindingTarget::Ident(_))
+            });
         let arguments_reg = if uses_arguments {
-            let mapped = !strict
-                && params.iter().all(|p| {
-                    !p.rest && p.default.is_none() && matches!(p.target, BindingTarget::Ident(_))
-                });
-            if mapped && !params.is_empty() {
-                return Err(CompileError::Unsupported(
-                    "mapped arguments with parameters",
-                ));
-            }
+            let mapped = mapped_args || (!strict && params.is_empty());
             let dst = c.alloc();
             c.ops.push(Op::MakeArguments { dst, mapped });
             Some(dst)
@@ -8869,6 +8895,7 @@ impl Compiler {
                             konst: false,
                             global: None,
                             tdz: false,
+                            mapped: false,
                         };
                         c.write_var(bind, arg_regs[i]);
                         bind
@@ -8879,6 +8906,7 @@ impl Compiler {
                             konst: false,
                             global: None,
                             tdz: false,
+                            mapped: false,
                         }
                     };
                     c.scopes
@@ -8907,6 +8935,7 @@ impl Compiler {
                     konst: cap_flags.get(name).is_some_and(|f| f.1),
                     global: None,
                     tdz: cap_flags.get(name).is_some_and(|f| f.0),
+                    mapped: cap_flags.get(name).is_some_and(|f| f.2),
                 },
             );
         }
@@ -8921,6 +8950,22 @@ impl Compiler {
         if let Some(r) = arguments_reg {
             let b = c.declare("arguments");
             c.write_var(b, r);
+        }
+        // A mapped `arguments` aliases the parameters; the VM's does not. That is
+        // unobservable while no parameter is written and `arguments` is only read
+        // through (`arguments.length`, `arguments[i]`) — enforced by `mapped`.
+        if mapped_args {
+            let mut names: Vec<&str> = alloc::vec!["arguments"];
+            for p in params {
+                if let BindingTarget::Ident(Ident { name, .. }) = &p.target {
+                    names.push(name);
+                }
+            }
+            for n in names {
+                if let Some(b) = c.scopes[0].get_mut(n) {
+                    b.mapped = true;
+                }
+            }
         }
         // Apply `= default` to any (non-rest) parameter left `undefined` — after
         // binding, so a default may reference earlier parameters; written back
@@ -9012,6 +9057,7 @@ impl Compiler {
                             konst: consts.contains(name),
                             global: None,
                             tdz: true,
+                            mapped: false,
                         },
                     );
                     c.tdz_pending.insert(name.clone());
@@ -9098,6 +9144,11 @@ impl Compiler {
         if c.reg_overflow {
             return Err(CompileError::Unsupported("too many registers"));
         }
+        if c.mapped_violation {
+            return Err(CompileError::Unsupported(
+                "mapped arguments with parameters",
+            ));
+        }
         // `fn.length`: params before the first default value or the rest param.
         let length = params
             .iter()
@@ -9164,6 +9215,7 @@ impl Compiler {
             konst: false,
             global: None,
             tdz: false,
+            mapped: false,
         };
         self.scopes
             .last_mut()
@@ -9202,6 +9254,7 @@ impl Compiler {
             konst: false,
             global: Some((idx, write)),
             tdz: false,
+            mapped: false,
         }
     }
 
@@ -9763,6 +9816,9 @@ impl Compiler {
     /// Emits a write of `src` into the variable bound by `b` (a cell write goes
     /// through `SetElem`).
     fn write_var(&mut self, b: Binding, src: Reg) {
+        if b.mapped {
+            self.mapped_violation = true;
+        }
         if b.tdz {
             // An assignment before the declaration is a ReferenceError too.
             let unchecked = Binding { tdz: false, ..b };
@@ -9976,6 +10032,7 @@ impl Compiler {
                                 konst: false,
                                 global: None,
                                 tdz: false,
+                                mapped: false,
                             };
                             self.write_var(bind, catch_reg);
                             bind
@@ -9986,6 +10043,7 @@ impl Compiler {
                                 konst: false,
                                 global: None,
                                 tdz: false,
+                                mapped: false,
                             }
                         };
                         self.scopes
@@ -10634,6 +10692,9 @@ impl Compiler {
             }
             Expr::Ident(id) => {
                 if let Some(b) = self.lookup(&id.name) {
+                    if b.mapped && &*id.name == "arguments" && !self.args_member_read {
+                        self.mapped_violation = true;
+                    }
                     Ok(self.read_var(b))
                 } else if self.models_not(&id.name) {
                     Err(CompileError::Unsupported("arguments object"))
@@ -11086,7 +11147,14 @@ impl Compiler {
                 optional,
                 ..
             } => {
-                let obj = self.expr(object)?;
+                let obj = if matches!(&**object, Expr::Ident(id) if &*id.name == "arguments") {
+                    self.args_member_read = true;
+                    let r = self.expr(object);
+                    self.args_member_read = false;
+                    r?
+                } else {
+                    self.expr(object)?
+                };
                 if *optional {
                     let go = self.emit_not_nullish(obj)?;
                     let jf = self.emit_jump_if_false(go); // jump when nullish
@@ -12151,11 +12219,11 @@ impl Compiler {
             (p.len() - 1) as u32
         };
         // Each capture keeps its binding's TDZ check and `const`-ness.
-        let flags: alloc::collections::BTreeMap<String, (bool, bool)> = captures
+        let flags: alloc::collections::BTreeMap<String, (bool, bool, bool)> = captures
             .iter()
             .filter_map(|n| {
                 let b = self.lookup(n)?;
-                (b.tdz || b.konst).then(|| (n.clone(), (b.tdz, b.konst)))
+                (b.tdz || b.konst || b.mapped).then(|| (n.clone(), (b.tdz, b.konst, b.mapped)))
             })
             .collect();
         let proto = Compiler::compile_fn_inner(
