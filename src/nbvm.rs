@@ -2018,6 +2018,11 @@ fn agen_drain(ctx: &mut Ctx, funcs: &[FnProto], generator: NanBox) -> Result<(),
         // generator returns (no enclosing finally: refused at compile);
         // rejected, the reason is thrown at the `yield`.
         if status == GEN_SUSPENDED_YIELD && kind == 2 && captured.is_none() {
+            // Cleanup of an enclosing try / for-of / destructuring region on a
+            // `return` is the tree-walker's (see `vm_generator_resume`).
+            if !load_frame(ctx, st.state).1.is_empty() {
+                return Err(VmError::Unsupported);
+            }
             ctx.realm
                 .set_element(st.state, 1, NanBox::number(GEN_RETURN_AWAIT));
             match with_host(ctx, |h| h.await_value(v, generator)) {
@@ -2290,6 +2295,18 @@ fn vm_generator_resume(
             Op::YieldDelegate { dst, mode, .. } => Some((*dst, *mode)),
             _ => None,
         });
+    // A `return(v)` at a `yield` inside a try / for-of / destructuring region
+    // must run that region's cleanup (iterator closes) — the tree-walker's.
+    if delegate.is_none()
+        && mode == 2
+        && state == GEN_SUSPENDED_YIELD
+        && e.get(5)
+            .and_then(|h| h.as_handle())
+            .and_then(|h| ctx.realm.array_length(Handle::from_raw(h)))
+            .is_some_and(|n| n > 0)
+    {
+        return Err(VmError::Unsupported);
+    }
     if delegate.is_none()
         && (state == GEN_COMPLETED || (state == GEN_SUSPENDED_START && mode != 0) || mode == 2)
     {
@@ -5722,6 +5739,10 @@ fn run_frame_at(
                         });
                     }
                     Ok(DelegateStep::Done(value)) => regs[*dst as usize] = value,
+                    // A forwarded return leaving an active region: the tree-walker's.
+                    Ok(DelegateStep::Return(_)) if !handlers.is_empty() => {
+                        return Err(VmError::Unsupported);
+                    }
                     Ok(DelegateStep::Return(value)) => return Ok(FrameExit::Return(Some(value))),
                     Err(e) => handle_throw!(e),
                 }
@@ -10670,6 +10691,13 @@ struct Binding {
     mapped: bool,
 }
 
+/// A `for-of`/`for-in` head: a declaration or an assignment target.
+#[derive(Clone, Copy)]
+enum ForBind<'a> {
+    Decl(&'a crate::ast::VarDeclKind, &'a BindingTarget),
+    Target(&'a Expr),
+}
+
 /// See [`Compiler::loop_frames`].
 #[derive(Clone, Copy)]
 struct LoopFrame {
@@ -12663,8 +12691,17 @@ impl Compiler {
                 if *is_await && !(self.hosted && self.in_async) {
                     return Err(CompileError::Unsupported("for await"));
                 }
-                let ForLeft::Decl { kind, target, .. } = left else {
-                    return Err(CompileError::Unsupported("for-of binding"));
+                let (kind, target) = match left {
+                    ForLeft::Decl { kind, target, .. } => (kind, target),
+                    ForLeft::Target(t) if self.hosted => {
+                        let bind = ForBind::Target(t);
+                        return if *is_await {
+                            self.for_await_hosted(bind, right, body)
+                        } else {
+                            self.for_of_hosted(bind, right, body)
+                        };
+                    }
+                    ForLeft::Target(_) => return Err(CompileError::Unsupported("for-of binding")),
                 };
                 // A `for (using x of …)` / `for (await using x of …)` head needs
                 // per-iteration explicit-resource-management disposal; bail to the
@@ -12676,10 +12713,10 @@ impl Compiler {
                     return Err(CompileError::Unsupported("using in for-of head"));
                 }
                 if *is_await {
-                    return self.for_await_hosted(kind, target, right, body);
+                    return self.for_await_hosted(ForBind::Decl(kind, target), right, body);
                 }
                 if self.hosted {
-                    return self.for_of_hosted(kind, target, right, body);
+                    return self.for_of_hosted(ForBind::Decl(kind, target), right, body);
                 }
                 self.scopes.push(alloc::collections::BTreeMap::new());
                 let src = self.expr(right)?;
@@ -12732,8 +12769,10 @@ impl Compiler {
                 left, right, body, ..
             } => {
                 use crate::ast::ForLeft;
-                let ForLeft::Decl { kind, target, .. } = left else {
-                    return Err(CompileError::Unsupported("for-in binding"));
+                let bind = match left {
+                    ForLeft::Decl { kind, target, .. } => ForBind::Decl(kind, target),
+                    ForLeft::Target(t) if self.hosted => ForBind::Target(t),
+                    ForLeft::Target(_) => return Err(CompileError::Unsupported("for-in binding")),
                 };
                 self.scopes.push(alloc::collections::BTreeMap::new());
                 let obj = self.expr(right)?;
@@ -12760,7 +12799,7 @@ impl Compiler {
                     arr,
                     index: i,
                 });
-                self.bind_for_decl(kind, target, cur)?;
+                self.for_bind(bind, cur)?;
                 self.enter_loop();
                 self.stmt(body)?;
                 let cont = self.ops.len();
@@ -16117,8 +16156,7 @@ impl Compiler {
     /// `break`/`return`/outer `continue` closes it (see [`Self::emit_unwind`]).
     fn for_of_hosted(
         &mut self,
-        kind: &crate::ast::VarDeclKind,
-        target: &BindingTarget,
+        bind: ForBind<'_>,
         right: &Expr,
         body: &Stmt,
     ) -> Result<Option<Reg>, CompileError> {
@@ -16154,7 +16192,7 @@ impl Compiler {
         });
         self.handler_depth += 1;
         let r = self
-            .bind_for_decl(kind, target, cur)
+            .for_bind(bind, cur)
             .and_then(|()| self.stmt(body).map(|_| ()));
         self.handler_depth -= 1;
         r?;
@@ -16180,8 +16218,7 @@ impl Compiler {
     /// iterable); leaving the loop abruptly awaits the iterator's `return()`.
     fn for_await_hosted(
         &mut self,
-        kind: &crate::ast::VarDeclKind,
-        target: &BindingTarget,
+        bind: ForBind<'_>,
         right: &Expr,
         body: &Stmt,
     ) -> Result<Option<Reg>, CompileError> {
@@ -16236,7 +16273,7 @@ impl Compiler {
         });
         self.handler_depth += 1;
         let r = self
-            .bind_for_decl(kind, target, cur)
+            .for_bind(bind, cur)
             .and_then(|()| self.stmt(body).map(|_| ()));
         self.handler_depth -= 1;
         r?;
@@ -16388,6 +16425,22 @@ impl Compiler {
         self.ops.push(Op::Jump { target: top });
         self.patch(jend);
         Ok(out)
+    }
+
+    /// Binds one `for-of`/`for-in` iteration's value: a declaration head, or
+    /// an assignment target (evaluated anew each iteration, after the value).
+    fn for_bind(&mut self, bind: ForBind<'_>, value: Reg) -> Result<(), CompileError> {
+        match bind {
+            ForBind::Decl(kind, target) => self.bind_for_decl(kind, target, value),
+            ForBind::Target(t) => {
+                if let Expr::Ident(id) = t
+                    && self.lookup(&id.name).is_some_and(|b| b.konst)
+                {
+                    return Err(CompileError::Unsupported("assignment to const"));
+                }
+                self.assign_pattern(t, value)
+            }
+        }
     }
 
     /// AsyncIteratorClose of a `for await` iterator: awaits `return()`'s result
