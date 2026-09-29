@@ -293,6 +293,14 @@ pub enum Op {
     },
     /// Throws a `TypeError` with `msg`.
     ThrowTypeError { msg: String },
+    /// Hosted object rest with computed keys: `dst = { ...src }` without the
+    /// `exclude` names and the property keys held in `keys`.
+    ObjectRestDyn {
+        dst: Reg,
+        src: Reg,
+        exclude: Vec<String>,
+        keys: Vec<Reg>,
+    },
     /// Annex B.3.3 evaluation of a block function declaration at a hosted
     /// script's top level (see [`VmHost::annexb_global`]).
     AnnexBGlobal {
@@ -5906,6 +5914,24 @@ fn run_frame_at(
                         ARGS_MAPPED,
                         NanBox::boolean(true),
                     );
+                }
+            }
+            Op::ObjectRestDyn {
+                dst,
+                src,
+                exclude,
+                keys,
+            } => {
+                let mut ex = exclude.clone();
+                for k in keys {
+                    ex.push(vm_property_key(ctx, regs[*k as usize])?);
+                }
+                let v = regs[*src as usize];
+                let t = NanBox::handle(ctx.realm.new_object().to_raw());
+                match with_host(ctx, |h| h.copy_data_properties(t, v, &ex)) {
+                    Some(Ok(())) => regs[*dst as usize] = t,
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
                 }
             }
             Op::ThrowTypeError { msg } => {
@@ -11945,26 +11971,17 @@ impl Compiler {
             Expr::Object { members, .. } => {
                 self.ops.push(Op::RequireObjectCoercible { src: value_reg });
                 let mut named: Vec<String> = Vec::new();
+                let mut dyn_keys: Vec<Reg> = Vec::new();
                 for m in members {
                     match m {
                         ObjectMember::Property { key, value, .. } => {
-                            let key = static_key(key)?;
-                            let v = self.alloc();
-                            self.ops.push(Op::GetProp {
-                                dst: v,
-                                obj: value_reg,
-                                key: key.clone(),
-                            });
+                            let v =
+                                self.pattern_key_read(value_reg, key, &mut named, &mut dyn_keys)?;
                             self.assign_target_with_default(value, v)?;
-                            named.push(key);
                         }
                         ObjectMember::Spread { value, .. } => {
                             let r = self.alloc();
-                            self.ops.push(Op::ObjectRest {
-                                dst: r,
-                                src: value_reg,
-                                exclude: named.clone().into(),
-                            });
+                            self.emit_object_rest(r, value_reg, &named, &dyn_keys);
                             self.assign_pattern(value, r)?;
                         }
                         ObjectMember::Accessor { .. } => {
@@ -12136,26 +12153,17 @@ impl Compiler {
             BindingTarget::Object(pat) => {
                 self.ops.push(Op::RequireObjectCoercible { src: value_reg });
                 let mut named: Vec<String> = Vec::new();
+                let mut dyn_keys: Vec<Reg> = Vec::new();
                 for prop in &pat.properties {
-                    let key = static_key(&prop.key)?;
-                    let v = self.alloc();
-                    self.ops.push(Op::GetProp {
-                        dst: v,
-                        obj: value_reg,
-                        key: key.clone(),
-                    });
+                    let v =
+                        self.pattern_key_read(value_reg, &prop.key, &mut named, &mut dyn_keys)?;
                     self.apply_default_named(v, prop.default.as_ref(), Some(&prop.value))?;
                     self.bind_pattern(&prop.value, v)?;
-                    named.push(key);
                 }
                 // `...rest` = a new object of the remaining own properties.
                 if let Some(rest) = &pat.rest {
                     let r = self.alloc();
-                    self.ops.push(Op::ObjectRest {
-                        dst: r,
-                        src: value_reg,
-                        exclude: named.into(),
-                    });
+                    self.emit_object_rest(r, value_reg, &named, &dyn_keys);
                     self.bind_pattern(rest, r)?;
                 }
                 Ok(())
@@ -16399,6 +16407,60 @@ impl Compiler {
             return r;
         }
         self.stmt(s).map(|_| ())
+    }
+
+    /// One object-pattern property read `obj[key]`: a static key, or (hosted) a
+    /// computed one evaluated with ToPropertyKey now; records the key for a
+    /// later `...rest`.
+    fn pattern_key_read(
+        &mut self,
+        obj: Reg,
+        key: &PropertyKey,
+        named: &mut Vec<String>,
+        dyn_keys: &mut Vec<Reg>,
+    ) -> Result<Reg, CompileError> {
+        let v = self.alloc();
+        match key {
+            PropertyKey::Computed(e) if self.hosted => {
+                let k = self.expr(e)?;
+                let kc = self.alloc();
+                self.ops.push(Op::ToKey { dst: kc, src: k });
+                self.ops.push(Op::GetKey {
+                    dst: v,
+                    obj,
+                    key: kc,
+                });
+                dyn_keys.push(kc);
+            }
+            other => {
+                let k = static_key(other)?;
+                self.ops.push(Op::GetProp {
+                    dst: v,
+                    obj,
+                    key: k.clone(),
+                });
+                named.push(k);
+            }
+        }
+        Ok(v)
+    }
+
+    /// `dst = { ...src }` minus the pattern's already-destructured keys.
+    fn emit_object_rest(&mut self, dst: Reg, src: Reg, named: &[String], dyn_keys: &[Reg]) {
+        if dyn_keys.is_empty() {
+            self.ops.push(Op::ObjectRest {
+                dst,
+                src,
+                exclude: named.to_vec().into(),
+            });
+        } else {
+            self.ops.push(Op::ObjectRestDyn {
+                dst,
+                src,
+                exclude: named.to_vec(),
+                keys: dyn_keys.to_vec(),
+            });
+        }
     }
 
     /// Reads the hidden binding `n`.

@@ -621,6 +621,14 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
         }
         Op::ThrowTypeError { .. } => Ok(()),
         Op::AnnexBGlobal { src, .. } => reg(*src),
+        Op::ObjectRestDyn { dst, src, keys, .. } => {
+            reg(*dst)?;
+            reg(*src)?;
+            for k in keys {
+                reg(*k)?;
+            }
+            Ok(())
+        }
         Op::MapArguments { args, cells } => {
             reg(*args)?;
             for (_, r) in cells {
@@ -1403,6 +1411,24 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u8(115, out);
             w_str(msg, out);
         }
+        Op::ObjectRestDyn {
+            dst,
+            src,
+            exclude,
+            keys,
+        } => {
+            w_u8(119, out);
+            w_reg(*dst, out);
+            w_reg(*src, out);
+            w_u32(exclude.len() as u32, out);
+            for e in exclude {
+                w_str(e, out);
+            }
+            w_u32(keys.len() as u32, out);
+            for k in keys {
+                w_reg(*k, out);
+            }
+        }
         Op::AnnexBGlobal {
             name,
             start,
@@ -2028,6 +2054,26 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             val: r.reg()?,
         },
         115 => Op::ThrowTypeError { msg: r.string()? },
+        119 => {
+            let dst = r.reg()?;
+            let src = r.reg()?;
+            let n = r.u32()? as usize;
+            let mut exclude = Vec::with_capacity(n.min(r.remaining()));
+            for _ in 0..n {
+                exclude.push(r.string()?);
+            }
+            let m = r.u32()? as usize;
+            let mut keys = Vec::with_capacity(m.min(r.remaining()));
+            for _ in 0..m {
+                keys.push(r.reg()?);
+            }
+            Op::ObjectRestDyn {
+                dst,
+                src,
+                exclude,
+                keys,
+            }
+        }
         118 => Op::AnnexBGlobal {
             name: r.string()?,
             start: r.u32()?,
