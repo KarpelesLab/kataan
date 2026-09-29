@@ -215,6 +215,26 @@ pub enum Op {
     /// A derived constructor's completion value `src`: an object is the
     /// result, `undefined` is the (bound) `this`, anything else a `TypeError`.
     DerivedResult { dst: Reg, src: Reg, this: Reg },
+    /// `dst` = a fresh private name for `#name` of the given kind (a string
+    /// key in the realm's private-element namespace, unique per evaluation).
+    NewPrivateName { dst: Reg, name: String, kind: u8 },
+    /// `dst = obj.#k` (brand-checked; an accessor calls its getter).
+    PrivateGet { dst: Reg, obj: Reg, key: Reg },
+    /// `obj.#k = src` (brand-checked; a method is read-only, an accessor calls
+    /// its setter).
+    PrivateSet { obj: Reg, key: Reg, src: Reg },
+    /// `dst = #k in obj`.
+    PrivateIn { dst: Reg, obj: Reg, key: Reg },
+    /// Adds private field/method `#k` = `src` to `obj` (a `TypeError` if
+    /// already present).
+    PrivateDefine { obj: Reg, key: Reg, src: Reg },
+    /// Adds private accessor `#k` (`getter`/`setter` may be `undefined`).
+    PrivateDefineAccessor {
+        obj: Reg,
+        key: Reg,
+        getter: Reg,
+        setter: Reg,
+    },
     /// An object literal's `__proto__: src`: sets `obj`'s `[[Prototype]]` when
     /// `src` is an object or `null` (anything else is ignored).
     SetProtoIfObject { obj: Reg, src: Reg },
@@ -1236,6 +1256,130 @@ fn init_fn_prototype(realm: &mut Realm, f: Handle) {
     realm.set_hidden_property(f, "prototype", NanBox::handle(proto.to_raw()));
     realm.set_non_configurable_property(f, "prototype");
     realm.set_hidden_property(f, VM_CTOR, NanBox::boolean(true));
+}
+
+/// The private key string of `k`, its kind byte, and the object `o`'s handle
+/// (a `TypeError` for a non-object).
+fn private_parts(ctx: &mut Ctx, o: NanBox, k: NanBox) -> Result<(Handle, String, u8), VmError> {
+    let key = ctx.realm.to_display_string(k);
+    let kind = key.as_bytes().last().copied().unwrap_or(PRIV_FIELD);
+    match o
+        .as_handle()
+        .map(Handle::from_raw)
+        .filter(|_| is_object_value(ctx.realm, o))
+    {
+        Some(h) => Ok((h, key, kind)),
+        None => {
+            let e = vm_error(
+                ctx,
+                "TypeError",
+                "Cannot access a private member of a non-object",
+            );
+            Err(VmError::Thrown(e))
+        }
+    }
+}
+
+/// The brand check of a private access: `TypeError` unless `h` has `key`.
+fn private_brand(ctx: &mut Ctx, h: Handle, key: &str) -> Result<(), VmError> {
+    if ctx.realm.has_own(h, key) {
+        return Ok(());
+    }
+    let name = key.split('@').next().unwrap_or("").trim_start_matches('\0');
+    let e = vm_error(
+        ctx,
+        "TypeError",
+        &alloc::format!(
+            "Cannot access private member {name} from an object whose class did not declare it"
+        ),
+    );
+    Err(VmError::Thrown(e))
+}
+
+/// `o.#k` (PrivateGet).
+fn private_get(ctx: &mut Ctx, funcs: &[FnProto], o: NanBox, k: NanBox) -> Result<NanBox, VmError> {
+    let (h, key, kind) = private_parts(ctx, o, k)?;
+    private_brand(ctx, h, &key)?;
+    if kind == PRIV_ACCESSOR {
+        let g = ctx
+            .realm
+            .get_property(h, &alloc::format!("{key}:g"))
+            .unwrap_or(NanBox::undefined());
+        if g.as_handle().is_none() {
+            let e = vm_error(
+                ctx,
+                "TypeError",
+                "'#' accessor was defined without a getter",
+            );
+            return Err(VmError::Thrown(e));
+        }
+        return call_closure(ctx, funcs, g, &[], o);
+    }
+    Ok(ctx
+        .realm
+        .get_property(h, &key)
+        .unwrap_or(NanBox::undefined()))
+}
+
+/// `o.#k = v` (PrivateSet).
+fn private_set(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    o: NanBox,
+    k: NanBox,
+    v: NanBox,
+) -> Result<(), VmError> {
+    let (h, key, kind) = private_parts(ctx, o, k)?;
+    private_brand(ctx, h, &key)?;
+    match kind {
+        PRIV_METHOD => {
+            let e = vm_error(ctx, "TypeError", "Private method is not writable");
+            Err(VmError::Thrown(e))
+        }
+        PRIV_ACCESSOR => {
+            let st = ctx
+                .realm
+                .get_property(h, &alloc::format!("{key}:s"))
+                .unwrap_or(NanBox::undefined());
+            if st.as_handle().is_none() {
+                let e = vm_error(
+                    ctx,
+                    "TypeError",
+                    "'#' accessor was defined without a setter",
+                );
+                return Err(VmError::Thrown(e));
+            }
+            call_closure(ctx, funcs, st, &[v], o).map(|_| ())
+        }
+        _ => {
+            ctx.realm.set_hidden_property(h, &key, v);
+            Ok(())
+        }
+    }
+}
+
+/// PrivateFieldAdd / PrivateMethodOrAccessorAdd: the slots `key + suffix`
+/// (a `TypeError` if the element is already present).
+fn private_define(
+    ctx: &mut Ctx,
+    o: NanBox,
+    k: NanBox,
+    slots: &[(&str, NanBox)],
+) -> Result<(), VmError> {
+    let (h, key, _) = private_parts(ctx, o, k)?;
+    if ctx.realm.has_own(h, &key) {
+        let e = vm_error(
+            ctx,
+            "TypeError",
+            "Cannot initialize a private element twice on the same object",
+        );
+        return Err(VmError::Thrown(e));
+    }
+    for (suffix, v) in slots {
+        ctx.realm
+            .set_hidden_property(h, &alloc::format!("{key}{suffix}"), *v);
+    }
+    Ok(())
 }
 
 /// `IsConstructor(v)`: a VM constructor, or (hosted) whatever the host says.
@@ -4339,6 +4483,77 @@ fn run_frame(
                         NanBox::number(if *dec { n - 1.0 } else { n + 1.0 })
                     }
                 };
+            }
+            Op::NewPrivateName { dst, name, kind } => {
+                static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+                let id = NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                let k = alloc::format!("\0#{name}@v{id}{}", char::from(*kind));
+                regs[*dst as usize] = NanBox::handle(ctx.realm.new_string(&k).to_raw());
+            }
+            Op::PrivateGet { dst, obj, key } => {
+                let (o, k) = (regs[*obj as usize], regs[*key as usize]);
+                match private_get(ctx, funcs, o, k) {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
+                }
+            }
+            Op::PrivateSet { obj, key, src } => {
+                let (o, k, v) = (
+                    regs[*obj as usize],
+                    regs[*key as usize],
+                    regs[*src as usize],
+                );
+                if let Err(e) = private_set(ctx, funcs, o, k, v) {
+                    handle_throw!(e);
+                }
+            }
+            Op::PrivateIn { dst, obj, key } => {
+                let (o, k) = (regs[*obj as usize], regs[*key as usize]);
+                match o
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .filter(|_| is_object_value(ctx.realm, o))
+                {
+                    Some(h) => {
+                        let ks = ctx.realm.to_display_string(k);
+                        regs[*dst as usize] = NanBox::boolean(ctx.realm.has_own(h, &ks));
+                    }
+                    None => {
+                        let e = vm_error(
+                            ctx,
+                            "TypeError",
+                            "Cannot use 'in' operator to search for a private field in a non-object",
+                        );
+                        handle_throw!(VmError::Thrown(e));
+                    }
+                }
+            }
+            Op::PrivateDefine { obj, key, src } => {
+                let (o, k, v) = (
+                    regs[*obj as usize],
+                    regs[*key as usize],
+                    regs[*src as usize],
+                );
+                if let Err(e) = private_define(ctx, o, k, &[("", v)]) {
+                    handle_throw!(e);
+                }
+            }
+            Op::PrivateDefineAccessor {
+                obj,
+                key,
+                getter,
+                setter,
+            } => {
+                let (o, k) = (regs[*obj as usize], regs[*key as usize]);
+                let (g, st) = (regs[*getter as usize], regs[*setter as usize]);
+                if let Err(e) = private_define(
+                    ctx,
+                    o,
+                    k,
+                    &[("", NanBox::boolean(true)), (":g", g), (":s", st)],
+                ) {
+                    handle_throw!(e);
+                }
             }
             Op::SetProtoIfObject { obj, src } => {
                 let v = regs[*src as usize];
@@ -8781,8 +8996,12 @@ fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
             object, property, ..
         } => {
             refs_expr(object, direct, nested);
-            if let PropertyKey::Computed(e) = property {
-                refs_expr(e, direct, nested);
+            match property {
+                PropertyKey::Computed(e) => refs_expr(e, direct, nested),
+                PropertyKey::Private(n) => {
+                    direct.insert(private_binding(n));
+                }
+                _ => {}
             }
         }
         Expr::OptChain { expr, .. } => refs_expr(expr, direct, nested),
@@ -8838,8 +9057,10 @@ fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
         | Expr::Number { .. }
         | Expr::BigInt { .. }
         | Expr::Str { .. }
-        | Expr::Regex { .. }
-        | Expr::PrivateName(..) => {}
+        | Expr::Regex { .. } => {}
+        Expr::PrivateName(n, _) => {
+            direct.insert(private_binding(n));
+        }
         // `new.target` is lexical for an arrow, like `this`.
         Expr::NewTarget(_) => {
             direct.insert(String::from(NT_NAME));
@@ -8875,6 +9096,17 @@ const PROTO_NAME: &str = "\0proto";
 
 /// The hidden binding holding an object literal (its methods' `super` home).
 const OBJ_HOME_NAME: &str = "\0objhome";
+
+/// The hidden binding holding the runtime key of private name `#name` (one
+/// per class evaluation; see [`Op::NewPrivateName`]).
+fn private_binding(name: &str) -> String {
+    alloc::format!("\0#{name}")
+}
+
+/// Private-element kinds, encoded as the last byte of a runtime private key.
+const PRIV_FIELD: u8 = b'f';
+const PRIV_METHOD: u8 = b'm';
+const PRIV_ACCESSOR: u8 = b'a';
 
 /// IsAnonymousFunctionDefinition: a function, arrow or class expression with no
 /// own name (NamedEvaluation gives it the name of what it is assigned to).
@@ -9219,6 +9451,12 @@ enum FieldKey {
     /// A computed key, evaluated at class definition into the cell of this
     /// hidden binding.
     Hidden(String),
+    /// A private field; the hidden binding of its private name.
+    Private(String),
+    /// A private method: its name's binding and the method closure's cell.
+    PrivateMethod(String, String),
+    /// A private accessor: its name's binding and the getter/setter cells.
+    PrivateAccessor(String, Option<String>, Option<String>),
 }
 
 /// A member assignment target evaluated ahead of its value: the object
@@ -9774,13 +10012,56 @@ impl Compiler {
         }
         // A class field-initializer function: define each field on `this`.
         for fd in field_defs {
+            let read = |c: &mut Compiler, n: &str| -> Result<Reg, CompileError> {
+                let b = c
+                    .lookup(n)
+                    .ok_or(CompileError::Unsupported("class field key"))?;
+                Ok(c.read_var(b))
+            };
+            let this = c.this_reg;
             let key = match &fd.key {
                 FieldKey::Static(k) => c.constant_str(k),
-                FieldKey::Hidden(n) => {
-                    let b = c
-                        .lookup(n)
-                        .ok_or(CompileError::Unsupported("class field key"))?;
-                    c.read_var(b)
+                FieldKey::Hidden(n) => read(&mut c, n)?,
+                FieldKey::Private(n) => {
+                    let key = read(&mut c, n)?;
+                    let v = match fd.init {
+                        Some(e) => c.expr(e)?,
+                        None => c.constant(NanBox::undefined())?,
+                    };
+                    c.ops.push(Op::PrivateDefine {
+                        obj: this,
+                        key,
+                        src: v,
+                    });
+                    continue;
+                }
+                FieldKey::PrivateMethod(n, f) => {
+                    let key = read(&mut c, n)?;
+                    let src = read(&mut c, f)?;
+                    c.ops.push(Op::PrivateDefine {
+                        obj: this,
+                        key,
+                        src,
+                    });
+                    continue;
+                }
+                FieldKey::PrivateAccessor(n, g, st) => {
+                    let key = read(&mut c, n)?;
+                    let getter = match g {
+                        Some(g) => read(&mut c, g)?,
+                        None => c.constant(NanBox::undefined())?,
+                    };
+                    let setter = match st {
+                        Some(x) => read(&mut c, x)?,
+                        None => c.constant(NanBox::undefined())?,
+                    };
+                    c.ops.push(Op::PrivateDefineAccessor {
+                        obj: this,
+                        key,
+                        getter,
+                        setter,
+                    });
+                    continue;
                 }
             };
             let v = match fd.init {
@@ -11596,6 +11877,17 @@ impl Compiler {
             } => {
                 // Hosted: `in` / `instanceof` are the host's operators (the
                 // special cases below are the VM's own approximations).
+                // `#x in obj`.
+                if self.hosted
+                    && matches!(op, BinaryOp::In)
+                    && let Expr::PrivateName(n, _) = &**left
+                {
+                    let key = self.private_key(n)?;
+                    let obj = self.expr(right)?;
+                    let dst = self.alloc();
+                    self.ops.push(Op::PrivateIn { dst, obj, key });
+                    return Ok(dst);
+                }
                 if self.hosted && matches!(op, BinaryOp::In | BinaryOp::Instanceof) {
                     let a = self.expr(left)?;
                     let b = self.expr(right)?;
@@ -12125,6 +12417,33 @@ impl Compiler {
                         dst,
                         recv,
                         key,
+                        args,
+                    });
+                    return Ok(dst);
+                }
+                // `recv.#m(args)`: the receiver is `this`.
+                if self.hosted
+                    && let Expr::Member {
+                        object,
+                        property: PropertyKey::Private(n),
+                        optional: false,
+                        ..
+                    } = &**callee
+                {
+                    let recv = self.expr(object)?;
+                    let key = self.private_key(n)?;
+                    let f = self.alloc();
+                    self.ops.push(Op::PrivateGet {
+                        dst: f,
+                        obj: recv,
+                        key,
+                    });
+                    let args = self.spread_args(arguments)?;
+                    let dst = self.alloc();
+                    self.ops.push(Op::CallSpread {
+                        dst,
+                        callee: f,
+                        this: recv,
                         args,
                     });
                     return Ok(dst);
@@ -13315,6 +13634,14 @@ impl Compiler {
     /// Compiles a member read `obj.key` / `obj[i]` (with `.length` mapped to the
     /// array-length op).
     fn member_read(&mut self, obj: Reg, property: &PropertyKey) -> Result<Reg, CompileError> {
+        if let PropertyKey::Private(n) = property
+            && self.hosted
+        {
+            let key = self.private_key(n)?;
+            let dst = self.alloc();
+            self.ops.push(Op::PrivateGet { dst, obj, key });
+            return Ok(dst);
+        }
         let dst = self.alloc();
         match property {
             PropertyKey::Computed(e) => {
@@ -13497,6 +13824,13 @@ impl Compiler {
         property: &PropertyKey,
         src: Reg,
     ) -> Result<(), CompileError> {
+        if let PropertyKey::Private(n) = property
+            && self.hosted
+        {
+            let key = self.private_key(n)?;
+            self.ops.push(Op::PrivateSet { obj, key, src });
+            return Ok(());
+        }
         match property {
             // Strict hosted code uses the store that throws on a failed write.
             PropertyKey::Computed(e) => {
@@ -13618,26 +13952,52 @@ impl Compiler {
             };
             let ctor_b = self.bind_hidden_cell(CTOR_NAME, true, false)?;
             let proto_b = self.bind_hidden_cell(PROTO_NAME, true, false)?;
+            // A fresh private name per `#name` the body declares.
+            let mut private_kinds: Vec<(String, u8)> = Vec::new();
+            for m in &class.body {
+                let (n, kind) = match m {
+                    ClassMember::Method(m) => match &m.key {
+                        PropertyKey::Private(n) => (
+                            n,
+                            if matches!(m.kind, MethodKind::Get | MethodKind::Set) {
+                                PRIV_ACCESSOR
+                            } else {
+                                PRIV_METHOD
+                            },
+                        ),
+                        _ => continue,
+                    },
+                    ClassMember::Field(f) => match &f.key {
+                        PropertyKey::Private(n) => (n, PRIV_FIELD),
+                        _ => continue,
+                    },
+                    ClassMember::StaticBlock { .. } => continue,
+                };
+                if !private_kinds.iter().any(|(x, _)| x == &**n) {
+                    private_kinds.push((String::from(&**n), kind));
+                }
+            }
+            for (n, kind) in &private_kinds {
+                let b = self.bind_hidden_cell(&private_binding(n), true, false)?;
+                let k = self.alloc();
+                self.ops.push(Op::NewPrivateName {
+                    dst: k,
+                    name: n.clone(),
+                    kind: *kind,
+                });
+                self.write_var(b, k);
+            }
             let sup = match &class.super_class {
                 Some(e) => Some(self.expr(e)?),
                 None => None,
             };
             let derived = sup.is_some();
             for m in &class.body {
-                match m {
-                    ClassMember::Method(m) => {
-                        if matches!(m.key, PropertyKey::Private(_)) {
-                            return Err(CompileError::Unsupported("private class element"));
-                        }
-                        refuse_generator(&m.value)?;
-                        if m.value.is_async {
-                            return Err(CompileError::Unsupported("async class method"));
-                        }
+                if let ClassMember::Method(m) = m {
+                    refuse_generator(&m.value)?;
+                    if m.value.is_async {
+                        return Err(CompileError::Unsupported("async class method"));
                     }
-                    ClassMember::Field(f) if matches!(f.key, PropertyKey::Private(_)) => {
-                        return Err(CompileError::Unsupported("private class element"));
-                    }
-                    _ => {}
                 }
             }
             // The constructor (declared, or the default one).
@@ -13693,14 +14053,78 @@ impl Compiler {
             // them; instance fields are gathered into the initializer.
             enum Static<'c> {
                 Field(Reg, Option<&'c Expr>),
+                PrivateField(String, Option<&'c Expr>),
                 Block(&'c [Stmt]),
             }
+            // Private methods/accessors (name binding + method cells), installed
+            // on instances or, static, on the constructor.
+            let mut static_private: Vec<FieldKey> = Vec::new();
+            let mut field_keys_scratch: Vec<FieldKey> = Vec::new();
             let mut statics: Vec<Static<'_>> = Vec::new();
             let mut fields: Vec<FieldDef<'_>> = Vec::new();
             let mut field_free: BTreeSet<String> = BTreeSet::new();
             for m in &class.body {
                 match m {
                     ClassMember::Method(m) if !m.is_static && m.kind == MethodKind::Constructor => {
+                    }
+                    ClassMember::Method(m) if matches!(m.key, PropertyKey::Private(_)) => {
+                        let PropertyKey::Private(n) = &m.key else {
+                            continue;
+                        };
+                        let home = if m.is_static { CTOR_NAME } else { PROTO_NAME };
+                        let func = self.class_element_closure(
+                            home,
+                            ClosureSpec::class_element(
+                                &m.value.params,
+                                &m.value.body,
+                                "",
+                                None,
+                                &[],
+                                BTreeSet::new(),
+                            ),
+                        )?;
+                        let fname = match m.kind {
+                            MethodKind::Get => alloc::format!("get #{n}"),
+                            MethodKind::Set => alloc::format!("set #{n}"),
+                            _ => alloc::format!("#{n}"),
+                        };
+                        let nk = self.constant_str("name");
+                        let nv = self.constant_str(&fname);
+                        self.ops.push(Op::DefineData {
+                            obj: func,
+                            key: nk,
+                            src: nv,
+                            attrs: 4,
+                        });
+                        let cell =
+                            alloc::format!("\0pm{}{}", if m.is_static { "s" } else { "i" }, fname);
+                        let cb = self.bind_hidden_cell(&cell, true, false)?;
+                        self.write_var(cb, func);
+                        let pb = private_binding(n);
+                        let list = if m.is_static {
+                            &mut static_private
+                        } else {
+                            &mut field_keys_scratch
+                        };
+                        match m.kind {
+                            MethodKind::Get | MethodKind::Set => {
+                                let is_get = m.kind == MethodKind::Get;
+                                if let Some(FieldKey::PrivateAccessor(_, g, st)) = list.iter_mut().find(
+                                    |k| matches!(k, FieldKey::PrivateAccessor(x, _, _) if *x == pb),
+                                ) {
+                                    if is_get {
+                                        *g = Some(cell);
+                                    } else {
+                                        *st = Some(cell);
+                                    }
+                                } else if is_get {
+                                    list.push(FieldKey::PrivateAccessor(pb, Some(cell), None));
+                                } else {
+                                    list.push(FieldKey::PrivateAccessor(pb, None, Some(cell)));
+                                }
+                            }
+                            _ => list.push(FieldKey::PrivateMethod(pb, cell)),
+                        }
                     }
                     ClassMember::Method(m) => {
                         let key = self.class_key(&m.key)?;
@@ -13733,11 +14157,21 @@ impl Compiler {
                         });
                     }
                     ClassMember::Field(fd) if fd.is_static => {
-                        let key = self.class_key(&fd.key)?;
-                        statics.push(Static::Field(key, fd.value.as_ref()));
+                        if let PropertyKey::Private(n) = &fd.key {
+                            statics
+                                .push(Static::PrivateField(String::from(&**n), fd.value.as_ref()));
+                        } else {
+                            let key = self.class_key(&fd.key)?;
+                            statics.push(Static::Field(key, fd.value.as_ref()));
+                        }
                     }
                     ClassMember::Field(fd) => {
                         let key = match &fd.key {
+                            PropertyKey::Private(n) => {
+                                let b = private_binding(n);
+                                field_free.insert(b.clone());
+                                FieldKey::Private(b)
+                            }
                             PropertyKey::Computed(_) => {
                                 let k = self.class_key(&fd.key)?;
                                 let name = alloc::format!("\0fk{}", fields.len());
@@ -13763,6 +14197,54 @@ impl Compiler {
                     ClassMember::StaticBlock { body, .. } => statics.push(Static::Block(body)),
                 }
             }
+            // InitializeInstanceElements: private methods/accessors first, then
+            // fields in order.
+            let mut init_defs: Vec<FieldDef<'_>> = Vec::new();
+            for k in field_keys_scratch {
+                match &k {
+                    FieldKey::PrivateMethod(n, c) => {
+                        field_free.insert(n.clone());
+                        field_free.insert(c.clone());
+                    }
+                    FieldKey::PrivateAccessor(n, g, st) => {
+                        field_free.insert(n.clone());
+                        field_free.extend(g.iter().cloned());
+                        field_free.extend(st.iter().cloned());
+                    }
+                    _ => {}
+                }
+                init_defs.push(FieldDef { key: k, init: None });
+            }
+            init_defs.extend(fields);
+            let fields = init_defs;
+            // Static private methods/accessors go on the constructor now.
+            for k in &static_private {
+                match k {
+                    FieldKey::PrivateMethod(n, c) => {
+                        let key = self.read_hidden(n)?;
+                        let src = self.read_hidden(c)?;
+                        self.ops.push(Op::PrivateDefine { obj: f, key, src });
+                    }
+                    FieldKey::PrivateAccessor(n, g, st) => {
+                        let key = self.read_hidden(n)?;
+                        let getter = match g {
+                            Some(g) => self.read_hidden(g)?,
+                            None => self.constant(NanBox::undefined())?,
+                        };
+                        let setter = match st {
+                            Some(x) => self.read_hidden(x)?,
+                            None => self.constant(NanBox::undefined())?,
+                        };
+                        self.ops.push(Op::PrivateDefineAccessor {
+                            obj: f,
+                            key,
+                            getter,
+                            setter,
+                        });
+                    }
+                    _ => {}
+                }
+            }
             if !fields.is_empty() {
                 field_free.remove(THIS_NAME);
                 field_free.remove(NT_NAME);
@@ -13780,12 +14262,14 @@ impl Compiler {
                 self.write_var(Binding { tdz: false, ..b }, f);
             }
             for st in statics {
-                let body: Vec<Stmt> = match st {
-                    Static::Field(_, Some(e)) => alloc::vec![Stmt::Return {
-                        argument: Some(Box::new(e.clone())),
-                        span,
-                    }],
-                    Static::Field(_, None) => Vec::new(),
+                let body: Vec<Stmt> = match &st {
+                    Static::Field(_, Some(e)) | Static::PrivateField(_, Some(e)) => {
+                        alloc::vec![Stmt::Return {
+                            argument: Some(Box::new((*e).clone())),
+                            span,
+                        }]
+                    }
+                    Static::Field(_, None) | Static::PrivateField(_, None) => Vec::new(),
                     Static::Block(b) => b.to_vec(),
                 };
                 let thunk = self.class_element_closure(
@@ -13801,13 +14285,22 @@ impl Compiler {
                     this: f,
                     args: none,
                 });
-                if let Static::Field(key, _) = st {
-                    self.ops.push(Op::DefineData {
+                match st {
+                    Static::Field(key, _) => self.ops.push(Op::DefineData {
                         obj: f,
                         key,
                         src: v,
                         attrs: 7,
-                    });
+                    }),
+                    Static::PrivateField(n, _) => {
+                        let key = self.private_key(&n)?;
+                        self.ops.push(Op::PrivateDefine {
+                            obj: f,
+                            key,
+                            src: v,
+                        });
+                    }
+                    Static::Block(_) => {}
                 }
             }
             Ok(f)
@@ -13946,6 +14439,22 @@ impl Compiler {
                 self.constant_str(&k)
             }
         })
+    }
+
+    /// Reads the hidden binding `n`.
+    fn read_hidden(&mut self, n: &str) -> Result<Reg, CompileError> {
+        let b = self
+            .lookup(n)
+            .ok_or(CompileError::Unsupported("hidden binding"))?;
+        Ok(self.read_var(b))
+    }
+
+    /// The runtime key of private name `#n`, from its class's hidden binding.
+    fn private_key(&mut self, n: &str) -> Result<Reg, CompileError> {
+        let b = self
+            .lookup(&private_binding(n))
+            .ok_or(CompileError::Unsupported("unresolved private name"))?;
+        Ok(self.read_var(b))
     }
 
     /// The current `this`: an arrow's captured one, a derived constructor's

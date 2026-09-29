@@ -560,6 +560,28 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*obj)?;
             reg(*src)
         }
+        Op::NewPrivateName { dst, .. } => reg(*dst),
+        Op::PrivateGet { dst, obj, key } | Op::PrivateIn { dst, obj, key } => {
+            reg(*dst)?;
+            reg(*obj)?;
+            reg(*key)
+        }
+        Op::PrivateSet { obj, key, src } | Op::PrivateDefine { obj, key, src } => {
+            reg(*obj)?;
+            reg(*key)?;
+            reg(*src)
+        }
+        Op::PrivateDefineAccessor {
+            obj,
+            key,
+            getter,
+            setter,
+        } => {
+            reg(*obj)?;
+            reg(*key)?;
+            reg(*getter)?;
+            reg(*setter)
+        }
         Op::CallSpread {
             dst,
             callee,
@@ -1227,6 +1249,47 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
                 w_reg(*r, out);
             }
         }
+        Op::NewPrivateName { dst, name, kind } => {
+            w_u8(98, out);
+            w_reg(*dst, out);
+            w_str(name, out);
+            w_u8(*kind, out);
+        }
+        Op::PrivateGet { dst, obj, key } => {
+            w_u8(99, out);
+            for r in [dst, obj, key] {
+                w_reg(*r, out);
+            }
+        }
+        Op::PrivateSet { obj, key, src } => {
+            w_u8(100, out);
+            for r in [obj, key, src] {
+                w_reg(*r, out);
+            }
+        }
+        Op::PrivateIn { dst, obj, key } => {
+            w_u8(101, out);
+            for r in [dst, obj, key] {
+                w_reg(*r, out);
+            }
+        }
+        Op::PrivateDefine { obj, key, src } => {
+            w_u8(102, out);
+            for r in [obj, key, src] {
+                w_reg(*r, out);
+            }
+        }
+        Op::PrivateDefineAccessor {
+            obj,
+            key,
+            getter,
+            setter,
+        } => {
+            w_u8(103, out);
+            for r in [obj, key, getter, setter] {
+                w_reg(*r, out);
+            }
+        }
         Op::SetProtoIfObject { obj, src } => {
             w_u8(97, out);
             w_reg(*obj, out);
@@ -1721,6 +1784,37 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             key: r.reg()?,
             src: r.reg()?,
             this: r.reg()?,
+        },
+        98 => Op::NewPrivateName {
+            dst: r.reg()?,
+            name: r.string()?,
+            kind: r.u8()?,
+        },
+        99 => Op::PrivateGet {
+            dst: r.reg()?,
+            obj: r.reg()?,
+            key: r.reg()?,
+        },
+        100 => Op::PrivateSet {
+            obj: r.reg()?,
+            key: r.reg()?,
+            src: r.reg()?,
+        },
+        101 => Op::PrivateIn {
+            dst: r.reg()?,
+            obj: r.reg()?,
+            key: r.reg()?,
+        },
+        102 => Op::PrivateDefine {
+            obj: r.reg()?,
+            key: r.reg()?,
+            src: r.reg()?,
+        },
+        103 => Op::PrivateDefineAccessor {
+            obj: r.reg()?,
+            key: r.reg()?,
+            getter: r.reg()?,
+            setter: r.reg()?,
         },
         97 => Op::SetProtoIfObject {
             obj: r.reg()?,
