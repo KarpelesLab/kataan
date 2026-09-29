@@ -497,7 +497,65 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
         }
         Op::DeleteGlobal { dst, .. } => reg(*dst),
         Op::RequireObjectCoercible { src } | Op::CheckTdz { src } => reg(*src),
-        Op::NewBigInt { dst, .. } => reg(*dst),
+        Op::NewBigInt { dst, .. } | Op::LoadNewTarget { dst } => reg(*dst),
+        Op::MakeClass { dst, f, sup } => {
+            reg(*dst)?;
+            reg(*f)?;
+            if let Some(r) = sup {
+                reg(*r)?;
+            }
+            Ok(())
+        }
+        Op::DefineMethod { obj, key, func, .. } => {
+            reg(*obj)?;
+            reg(*key)?;
+            reg(*func)
+        }
+        Op::DefineData { obj, key, src, .. } => {
+            reg(*obj)?;
+            reg(*key)?;
+            reg(*src)
+        }
+        Op::SuperCall {
+            dst,
+            ctor,
+            new_target,
+            args,
+            this,
+        } => {
+            reg(*dst)?;
+            reg(*ctor)?;
+            reg(*new_target)?;
+            reg(*args)?;
+            reg(*this)
+        }
+        Op::SuperGet {
+            dst,
+            home,
+            key,
+            this,
+        } => {
+            reg(*dst)?;
+            reg(*home)?;
+            reg(*key)?;
+            reg(*this)
+        }
+        Op::SuperSet {
+            home,
+            key,
+            src,
+            this,
+        } => {
+            reg(*home)?;
+            reg(*key)?;
+            reg(*src)?;
+            reg(*this)
+        }
+        Op::DerivedResult { dst, src, this } => {
+            reg(*dst)?;
+            reg(*src)?;
+            reg(*this)
+        }
         Op::CallSpread {
             dst,
             callee,
@@ -745,6 +803,8 @@ pub fn deserialize(bytes: &[u8]) -> Result<Vec<FnProto>, DecodeError> {
             length,
             name,
             legacy: false,
+            class_ctor: false,
+            derived: false,
         });
     }
     Ok(protos)
@@ -1093,6 +1153,81 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*callee, out);
             w_reg(*this, out);
             w_reg(*args, out);
+        }
+        Op::LoadNewTarget { dst } => {
+            w_u8(89, out);
+            w_reg(*dst, out);
+        }
+        Op::MakeClass { dst, f, sup } => {
+            w_u8(90, out);
+            w_reg(*dst, out);
+            w_reg(*f, out);
+            w_bool(sup.is_some(), out);
+            w_reg(sup.unwrap_or(0), out);
+        }
+        Op::DefineMethod {
+            obj,
+            key,
+            func,
+            kind,
+        } => {
+            w_u8(91, out);
+            w_reg(*obj, out);
+            w_reg(*key, out);
+            w_reg(*func, out);
+            w_u8(*kind, out);
+        }
+        Op::DefineData {
+            obj,
+            key,
+            src,
+            attrs,
+        } => {
+            w_u8(92, out);
+            w_reg(*obj, out);
+            w_reg(*key, out);
+            w_reg(*src, out);
+            w_u8(*attrs, out);
+        }
+        Op::SuperCall {
+            dst,
+            ctor,
+            new_target,
+            args,
+            this,
+        } => {
+            w_u8(93, out);
+            for r in [dst, ctor, new_target, args, this] {
+                w_reg(*r, out);
+            }
+        }
+        Op::SuperGet {
+            dst,
+            home,
+            key,
+            this,
+        } => {
+            w_u8(94, out);
+            for r in [dst, home, key, this] {
+                w_reg(*r, out);
+            }
+        }
+        Op::SuperSet {
+            home,
+            key,
+            src,
+            this,
+        } => {
+            w_u8(95, out);
+            for r in [home, key, src, this] {
+                w_reg(*r, out);
+            }
+        }
+        Op::DerivedResult { dst, src, this } => {
+            w_u8(96, out);
+            for r in [dst, src, this] {
+                w_reg(*r, out);
+            }
         }
         Op::ConstructSpread { dst, ctor, args } => {
             w_u8(88, out);
@@ -1537,6 +1672,52 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             this: r.reg()?,
             args: r.reg()?,
         },
+        89 => Op::LoadNewTarget { dst: r.reg()? },
+        90 => Op::MakeClass {
+            dst: r.reg()?,
+            f: r.reg()?,
+            sup: {
+                let has = r.boolean()?;
+                let reg = r.reg()?;
+                has.then_some(reg)
+            },
+        },
+        91 => Op::DefineMethod {
+            obj: r.reg()?,
+            key: r.reg()?,
+            func: r.reg()?,
+            kind: r.u8()?,
+        },
+        92 => Op::DefineData {
+            obj: r.reg()?,
+            key: r.reg()?,
+            src: r.reg()?,
+            attrs: r.u8()?,
+        },
+        93 => Op::SuperCall {
+            dst: r.reg()?,
+            ctor: r.reg()?,
+            new_target: r.reg()?,
+            args: r.reg()?,
+            this: r.reg()?,
+        },
+        94 => Op::SuperGet {
+            dst: r.reg()?,
+            home: r.reg()?,
+            key: r.reg()?,
+            this: r.reg()?,
+        },
+        95 => Op::SuperSet {
+            home: r.reg()?,
+            key: r.reg()?,
+            src: r.reg()?,
+            this: r.reg()?,
+        },
+        96 => Op::DerivedResult {
+            dst: r.reg()?,
+            src: r.reg()?,
+            this: r.reg()?,
+        },
         88 => Op::ConstructSpread {
             dst: r.reg()?,
             ctor: r.reg()?,
@@ -1876,6 +2057,8 @@ mod tests {
             length: 0,
             name: String::new(),
             legacy: false,
+            class_ctor: false,
+            derived: false,
         };
         let bytes = serialize(&[proto]);
 

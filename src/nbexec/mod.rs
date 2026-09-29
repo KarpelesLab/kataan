@@ -9714,6 +9714,18 @@ impl crate::nbvm::VmHost for Interp<'_> {
         self.construct(ctor, args).map_err(exec_to_host)
     }
 
+    fn construct_with_target(
+        &mut self,
+        ctor: NanBox,
+        args: &[NanBox],
+        new_target: NanBox,
+    ) -> Result<NanBox, crate::nbvm::HostError> {
+        self.reflect_new_target = Some(new_target);
+        let r = self.construct(ctor, args).map_err(exec_to_host);
+        self.reflect_new_target = None;
+        r
+    }
+
     fn call_method(
         &mut self,
         recv: NanBox,
@@ -9838,6 +9850,141 @@ impl crate::nbvm::VmHost for Interp<'_> {
             ));
         }
         Ok(result)
+    }
+
+    fn define_method(
+        &mut self,
+        obj: NanBox,
+        key: NanBox,
+        func: NanBox,
+        kind: u8,
+    ) -> Result<(), crate::nbvm::HostError> {
+        let (Some(o), Some(f)) = (
+            obj.as_handle().map(Handle::from_raw),
+            func.as_handle().map(Handle::from_raw),
+        ) else {
+            return Err(crate::nbvm::HostError::Fault);
+        };
+        let name = self.member_key(key);
+        // SetFunctionName: a symbol key names the function `[description]`.
+        let base = match key
+            .as_handle()
+            .and_then(|h| self.realm.symbol_at(Handle::from_raw(h)))
+        {
+            Some((d, _)) if d.is_empty() || d == SYMBOL_NO_DESC => String::new(),
+            Some((d, _)) => alloc::format!("[{d}]"),
+            None => self.realm.to_display_string(key),
+        };
+        let fname = match kind {
+            1 => alloc::format!("get {base}"),
+            2 => alloc::format!("set {base}"),
+            _ => base.clone(),
+        };
+        let nd = self.realm.new_object();
+        let nv = self.new_str(&fname);
+        self.realm.set_property(nd, "value", nv);
+        self.realm
+            .set_property(nd, "writable", NanBox::boolean(false));
+        self.realm
+            .set_property(nd, "enumerable", NanBox::boolean(false));
+        self.realm
+            .set_property(nd, "configurable", NanBox::boolean(true));
+        self.apply_descriptor(f, "name", nd, true)
+            .map_err(exec_to_host)?;
+        let desc = self.realm.new_object();
+        match kind {
+            1 => {
+                self.realm.set_property(desc, "get", func);
+            }
+            2 => {
+                self.realm.set_property(desc, "set", func);
+            }
+            _ => {
+                self.realm.set_property(desc, "value", func);
+                self.realm
+                    .set_property(desc, "writable", NanBox::boolean(true));
+            }
+        }
+        self.realm
+            .set_property(desc, "enumerable", NanBox::boolean(false));
+        self.realm
+            .set_property(desc, "configurable", NanBox::boolean(true));
+        if !self
+            .apply_descriptor(o, &name, desc, true)
+            .map_err(exec_to_host)?
+        {
+            let e = self.type_error(&alloc::format!("Cannot redefine property: {base}"));
+            return Err(exec_to_host(e));
+        }
+        Ok(())
+    }
+
+    fn define_data(
+        &mut self,
+        obj: NanBox,
+        key: NanBox,
+        value: NanBox,
+        attrs: u8,
+    ) -> Result<(), crate::nbvm::HostError> {
+        let Some(o) = obj.as_handle().map(Handle::from_raw) else {
+            return Err(crate::nbvm::HostError::Fault);
+        };
+        let name = self.member_key(key);
+        let desc = self.realm.new_object();
+        self.realm.set_property(desc, "value", value);
+        for (bit, f) in [(1, "writable"), (2, "enumerable"), (4, "configurable")] {
+            self.realm
+                .set_property(desc, f, NanBox::boolean(attrs & bit != 0));
+        }
+        if !self
+            .apply_descriptor(o, &name, desc, true)
+            .map_err(exec_to_host)?
+        {
+            let e = self.type_error(&alloc::format!("Cannot define property {name}"));
+            return Err(exec_to_host(e));
+        }
+        Ok(())
+    }
+
+    fn is_constructor(&mut self, v: NanBox) -> bool {
+        self.is_constructor_value(v)
+    }
+
+    fn get_with_receiver(
+        &mut self,
+        obj: NanBox,
+        key: NanBox,
+        receiver: NanBox,
+    ) -> Result<NanBox, crate::nbvm::HostError> {
+        let Some(o) = obj.as_handle().map(Handle::from_raw) else {
+            return Err(crate::nbvm::HostError::Fault);
+        };
+        let name = self.member_key(key);
+        self.get_with_receiver(o, &name, receiver)
+            .map_err(exec_to_host)
+    }
+
+    fn set_with_receiver(
+        &mut self,
+        obj: NanBox,
+        key: NanBox,
+        value: NanBox,
+        receiver: NanBox,
+    ) -> Result<(), crate::nbvm::HostError> {
+        let Some(o) = obj.as_handle().map(Handle::from_raw) else {
+            return Err(crate::nbvm::HostError::Fault);
+        };
+        let name = self.member_key(key);
+        if !self
+            .proxy_set_bool(o, &name, value, receiver)
+            .map_err(exec_to_host)?
+        {
+            let e = self.type_error(&alloc::format!(
+                "Cannot assign to read only property '{name}' of super"
+            ));
+            return Err(exec_to_host(e));
+        }
+        Ok(())
     }
 
     fn copy_data_properties(

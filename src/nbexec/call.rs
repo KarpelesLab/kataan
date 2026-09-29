@@ -2800,14 +2800,13 @@ impl<'a> Interp<'a> {
         if let Some(table) = self.vm_table.clone()
             && callee_h.is_some_and(|h| self.realm.is_vm_function(h))
         {
-            let distinct_target = [self.pending_new_target, self.reflect_new_target]
-                .into_iter()
-                .flatten()
-                .any(|nt| nt.as_handle() != callee.as_handle());
-            if distinct_target {
-                return Err(ExecError::Unsupported("construct a bytecode-VM function"));
-            }
-            return crate::nbvm::construct_vm_function(self, &table, callee, args)
+            // `new.target`: a `Reflect.construct`/`super()` one, else the callee.
+            let new_target = self
+                .reflect_new_target
+                .take()
+                .or_else(|| self.pending_new_target.take())
+                .unwrap_or(callee);
+            return crate::nbvm::construct_vm_function(self, &table, callee, args, new_target)
                 .map_err(super::vm_to_exec);
         }
         let realm = if !self.is_constructor_value(callee)

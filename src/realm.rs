@@ -2752,6 +2752,7 @@ impl Realm {
         // reflects it (and `[[HasProperty]]`/`[[Get]]` walk the new chain). Typed
         // arrays already store their intrinsic proto here via `set_native_proto`.
         if self.is_callable_cell(handle)
+            || self.is_vm_function(handle)
             || matches!(self.heap.get(handle), Some(Cell::Array(_)))
             || self.typed_kind(handle).is_some()
         {

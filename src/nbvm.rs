@@ -166,6 +166,58 @@ pub enum Op {
     /// Throws a `ReferenceError` if `src` is the TDZ sentinel (a lexical binding
     /// read or written by a hoisted function before its declaration ran).
     CheckTdz { src: Reg },
+    /// ClassDefinitionEvaluation's object plumbing for the constructor closure
+    /// `f`: validates the heritage `sup` (`null` or a constructor whose
+    /// `prototype` is an object or `null`), creates `dst` = the prototype
+    /// object, links `f.prototype`/`dst.constructor`, `f`'s own
+    /// `[[Prototype]]`, and makes `f` a constructor.
+    MakeClass { dst: Reg, f: Reg, sup: Option<Reg> },
+    /// Defines class method/getter/setter `func` (`kind` 0/1/2) on `obj` under
+    /// the property key `key` (see [`VmHost::define_method`]).
+    DefineMethod {
+        obj: Reg,
+        key: Reg,
+        func: Reg,
+        kind: u8,
+    },
+    /// `DefinePropertyOrThrow(obj, key, {value: src, ...attrs})` (see
+    /// [`VmHost::define_data`]).
+    DefineData {
+        obj: Reg,
+        key: Reg,
+        src: Reg,
+        attrs: u8,
+    },
+    /// `super(...args)` in a derived constructor whose function is `ctor`:
+    /// `Construct(ctor.[[Prototype]], args, new_target)`, then binds `this`
+    /// (a `ReferenceError` if already bound) and initializes the fields.
+    SuperCall {
+        dst: Reg,
+        ctor: Reg,
+        new_target: Reg,
+        args: Reg,
+        this: Reg,
+    },
+    /// `dst = home.[[Prototype]].[[Get]](key, this)` (`super[key]`).
+    SuperGet {
+        dst: Reg,
+        home: Reg,
+        key: Reg,
+        this: Reg,
+    },
+    /// `home.[[Prototype]].[[Set]](key, src, this)` (`super[key] = src`).
+    SuperSet {
+        home: Reg,
+        key: Reg,
+        src: Reg,
+        this: Reg,
+    },
+    /// A derived constructor's completion value `src`: an object is the
+    /// result, `undefined` is the (bound) `this`, anything else a `TypeError`.
+    DerivedResult { dst: Reg, src: Reg, this: Reg },
+    /// `dst = new.target`. Always among a function's first two ops (after any
+    /// `MakeArguments`); filled in by `call_with_inner` on entry.
+    LoadNewTarget { dst: Reg },
     /// `dst = <BigInt literal>` from its normalized digit string (radix prefix
     /// kept). Hosted runs only: BigInt arithmetic is the host's.
     NewBigInt { dst: Reg, digits: String },
@@ -572,6 +624,12 @@ pub struct FnProto {
     /// benign (`null`) instead of the poisoned `%ThrowTypeError%`. Not part of
     /// the portable artifact (decodes as `false`).
     pub legacy: bool,
+    /// A class constructor: `[[Call]]` without `new` is a `TypeError`, and a
+    /// base one initializes the instance's fields before its body.
+    pub class_ctor: bool,
+    /// A derived class constructor: `this` starts uninitialized (bound by
+    /// `super(...)`), and the body produces the construct result itself.
+    pub derived: bool,
 }
 
 /// A queued promise reaction: run `handler(value)` then settle `result` with
@@ -656,6 +714,17 @@ pub trait VmHost {
     /// The constructor's throw (a `TypeError` for a non-constructor), or a host
     /// fault.
     fn construct(&mut self, ctor: NanBox, args: &[NanBox]) -> Result<NanBox, HostError>;
+    /// `Construct(ctor, args, newTarget)` with an explicit `new.target` (a VM
+    /// subclass's `super(...)`, a VM construct forwarded to the host).
+    ///
+    /// # Errors
+    /// As [`VmHost::construct`].
+    fn construct_with_target(
+        &mut self,
+        ctor: NanBox,
+        args: &[NanBox],
+        new_target: NanBox,
+    ) -> Result<NanBox, HostError>;
     /// `recv.name(...args)` with the host's method-call semantics (own-property
     /// precedence, primitive boxing, accessors, the built-in library).
     ///
@@ -763,6 +832,60 @@ pub trait VmHost {
         source: NanBox,
         excluded: &[String],
     ) -> Result<(), HostError>;
+    /// A class element definition on `obj` under the property key `key` (a
+    /// string or symbol): `kind` 0 = method (a writable, non-enumerable data
+    /// property), 1 = getter, 2 = setter (merged into the accessor pair), each
+    /// configurable; `func` gets its `name` from the key (SetFunctionName, with
+    /// a `get `/`set ` prefix for accessors).
+    ///
+    /// # Errors
+    /// A failed definition (a non-configurable existing property) is a
+    /// `TypeError`.
+    fn define_method(
+        &mut self,
+        obj: NanBox,
+        key: NanBox,
+        func: NanBox,
+        kind: u8,
+    ) -> Result<(), HostError>;
+    /// `DefinePropertyOrThrow(obj, key, {value, ...attrs})` — `attrs` bits:
+    /// 1 writable, 2 enumerable, 4 configurable (7 = CreateDataPropertyOrThrow,
+    /// a class field).
+    ///
+    /// # Errors
+    /// A `TypeError` when the definition fails (a frozen or non-extensible
+    /// object, a proxy trap that refuses).
+    fn define_data(
+        &mut self,
+        obj: NanBox,
+        key: NanBox,
+        value: NanBox,
+        attrs: u8,
+    ) -> Result<(), HostError>;
+    /// `IsConstructor(v)`.
+    fn is_constructor(&mut self, v: NanBox) -> bool;
+    /// `obj.[[Get]](key, receiver)` (a `super.x` read).
+    ///
+    /// # Errors
+    /// A getter's or trap's throw.
+    fn get_with_receiver(
+        &mut self,
+        obj: NanBox,
+        key: NanBox,
+        receiver: NanBox,
+    ) -> Result<NanBox, HostError>;
+    /// `obj.[[Set]](key, value, receiver)` in strict code (a `super.x = v`):
+    /// a `false` result is a `TypeError`.
+    ///
+    /// # Errors
+    /// A setter's or trap's throw, or the failed-write `TypeError`.
+    fn set_with_receiver(
+        &mut self,
+        obj: NanBox,
+        key: NanBox,
+        value: NanBox,
+        receiver: NanBox,
+    ) -> Result<(), HostError>;
     /// `ToString(v)` (a symbol throws a `TypeError`; an object's string-hint
     /// `ToPrimitive` runs user code).
     ///
@@ -852,6 +975,7 @@ fn hosted_ctx<'a>(realm: &'a mut Realm, host: &'a mut dyn VmHost) -> Ctx<'a> {
         frames_published: 0,
         top_frame_roots: Vec::new(),
         pending_callee: None,
+        pending_new_target: None,
     }
 }
 
@@ -1111,6 +1235,144 @@ fn init_fn_prototype(realm: &mut Realm, f: Handle) {
     realm.set_hidden_property(f, VM_CTOR, NanBox::boolean(true));
 }
 
+/// `IsConstructor(v)`: a VM constructor, or (hosted) whatever the host says.
+fn vm_is_constructor(ctx: &mut Ctx, v: NanBox) -> bool {
+    let Some(h) = v.as_handle().map(Handle::from_raw) else {
+        return false;
+    };
+    if ctx.realm.is_vm_function(h) {
+        return ctx.realm.get_property(h, VM_CTOR).is_some();
+    }
+    with_host(ctx, |host| host.is_constructor(v)).unwrap_or(false)
+}
+
+/// The class-definition plumbing of [`Op::MakeClass`]; returns the prototype.
+fn make_class(ctx: &mut Ctx, f: NanBox, sup: Option<NanBox>) -> Result<NanBox, VmError> {
+    let fh = f
+        .as_handle()
+        .map(Handle::from_raw)
+        .ok_or(VmError::NotAnObject)?;
+    let proto = ctx.realm.new_object();
+    if let Some(s) = sup {
+        if matches!(s.unpack(), crate::nanbox::Unpacked::Null) {
+            ctx.realm.set_object_proto(proto, None);
+        } else {
+            if !vm_is_constructor(ctx, s) {
+                let e = vm_error(
+                    ctx,
+                    "TypeError",
+                    "Class extends value is not a constructor or null",
+                );
+                return Err(VmError::Thrown(e));
+            }
+            let pp = if s
+                .as_handle()
+                .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
+            {
+                vm_get_prop(ctx, &[], s, "prototype", &mut PropertyCache::default())?
+            } else {
+                host_get_str(ctx, s, "prototype")?
+            };
+            match pp.unpack() {
+                crate::nanbox::Unpacked::Null => {
+                    ctx.realm.set_object_proto(proto, None);
+                }
+                _ if is_object_value(ctx.realm, pp) => {
+                    ctx.realm
+                        .set_object_proto(proto, pp.as_handle().map(Handle::from_raw));
+                }
+                _ => {
+                    let e = vm_error(
+                        ctx,
+                        "TypeError",
+                        "Class extends value does not have valid prototype property",
+                    );
+                    return Err(VmError::Thrown(e));
+                }
+            }
+            ctx.realm
+                .set_object_proto(fh, s.as_handle().map(Handle::from_raw));
+        }
+    }
+    let pv = NanBox::handle(proto.to_raw());
+    ctx.realm.set_hidden_property(proto, "constructor", f);
+    // `F.prototype`: non-writable, non-enumerable, non-configurable.
+    let key = NanBox::handle(ctx.realm.new_string("prototype").to_raw());
+    match with_host(ctx, |h| h.define_data(f, key, pv, 0)) {
+        Some(Ok(())) => {}
+        Some(Err(e)) => return Err(VmError::from(e)),
+        None => return Err(VmError::Unsupported),
+    }
+    ctx.realm
+        .set_hidden_property(fh, VM_CTOR, NanBox::boolean(true));
+    Ok(pv)
+}
+
+/// `super(...)`'s `[[Construct]]` of the constructor `f`'s own
+/// `[[Prototype]]` (the parent class) with `new_target`.
+fn super_construct(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    f: NanBox,
+    args: &[NanBox],
+    new_target: NanBox,
+) -> Result<NanBox, VmError> {
+    let fh = f
+        .as_handle()
+        .map(Handle::from_raw)
+        .ok_or(VmError::NotAnObject)?;
+    let parent = ctx
+        .realm
+        .object_proto(fh)
+        .map(|h| NanBox::handle(h.to_raw()))
+        .unwrap_or(NanBox::null());
+    if !vm_is_constructor(ctx, parent) {
+        let e = vm_error(ctx, "TypeError", "Super constructor is not a constructor");
+        return Err(VmError::Thrown(e));
+    }
+    if parent
+        .as_handle()
+        .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
+    {
+        return vm_construct(ctx, funcs, parent, args, new_target);
+    }
+    with_host(ctx, |h| h.construct_with_target(parent, args, new_target))
+        .unwrap_or(Err(HostError::Fault))
+        .map_err(VmError::from)
+}
+
+/// InitializeInstanceElements: runs class `f`'s field initializer (the hidden
+/// `\0fields` closure, if any) with `this` = `obj`.
+fn run_fields(ctx: &mut Ctx, funcs: &[FnProto], f: NanBox, obj: NanBox) -> Result<(), VmError> {
+    let init = f
+        .as_handle()
+        .and_then(|h| ctx.realm.get_property(Handle::from_raw(h), FIELDS_KEY));
+    if let Some(init) = init {
+        call_closure(ctx, funcs, init, &[], obj)?;
+    }
+    Ok(())
+}
+
+/// The hidden slot of a VM class constructor holding its instance-field
+/// initializer closure.
+const FIELDS_KEY: &str = "\0fields";
+
+/// GetSuperBase: the `[[Prototype]]` of the method's home object `home` (a
+/// `TypeError` when it is `null`).
+fn super_base(ctx: &mut Ctx, home: NanBox) -> Result<NanBox, VmError> {
+    let h = home
+        .as_handle()
+        .map(Handle::from_raw)
+        .ok_or(VmError::NotAnObject)?;
+    match ctx.realm.object_proto(h) {
+        Some(p) => Ok(NanBox::handle(p.to_raw())),
+        None => {
+            let e = vm_error(ctx, "TypeError", "Cannot access super property of null");
+            Err(VmError::Thrown(e))
+        }
+    }
+}
+
 /// `new f(...args)` for a VM function `f` (`[[Construct]]` of an ordinary
 /// function whose `new.target` is itself): a new object inheriting from
 /// `f.prototype` (or `%Object.prototype%` when that is not an object) is `this`
@@ -1120,6 +1382,7 @@ fn vm_construct(
     funcs: &[FnProto],
     f: NanBox,
     args: &[NanBox],
+    new_target: NanBox,
 ) -> Result<NanBox, VmError> {
     let Some(fh) = f.as_handle().map(Handle::from_raw) else {
         return Err(VmError::Unsupported);
@@ -1128,17 +1391,62 @@ fn vm_construct(
         let e = vm_error(ctx, "TypeError", "not a constructor");
         return Err(VmError::Thrown(e));
     }
-    let obj = ctx.realm.new_object();
-    if let Some(p) = ctx
+    let (class_ctor, derived) = ctx
         .realm
-        .get_property(fh, "prototype")
+        .vm_function(fh)
+        .and_then(|(id, _)| funcs.get(id as usize))
+        .map_or((false, false), |p| (p.class_ctor, p.derived));
+    if derived {
+        // `this` is bound by `super(...)`; the body yields the result (see
+        // `Op::DerivedResult`), validated here.
+        ctx.pending_new_target = Some(new_target);
+        let r = call_closure(ctx, funcs, f, args, NanBox::tdz());
+        ctx.pending_new_target = None;
+        let r = r?;
+        if r.is_tdz() {
+            let e = vm_error(
+                ctx,
+                "ReferenceError",
+                "Must call super constructor in derived class before returning",
+            );
+            return Err(VmError::Thrown(e));
+        }
+        if !is_object_value(ctx.realm, r) {
+            let e = vm_error(
+                ctx,
+                "TypeError",
+                "Derived constructors may only return object or undefined",
+            );
+            return Err(VmError::Thrown(e));
+        }
+        return Ok(r);
+    }
+    let obj = ctx.realm.new_object();
+    // OrdinaryCreateFromConstructor: `new.target.prototype` (read through the
+    // host when `new.target` is not a VM function — it may be a getter).
+    let nt_is_vm = new_target
+        .as_handle()
+        .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)));
+    let proto = if nt_is_vm || ctx.host.is_none() {
+        let nth = new_target.as_handle().map(Handle::from_raw).unwrap_or(fh);
+        ctx.realm.get_property(nth, "prototype")
+    } else {
+        Some(host_get_str(ctx, new_target, "prototype")?)
+    };
+    if let Some(p) = proto
         .filter(|p| is_object_value(ctx.realm, *p))
         .and_then(|p| p.as_handle())
     {
         ctx.realm.set_object_proto(obj, Some(Handle::from_raw(p)));
     }
     let this = NanBox::handle(obj.to_raw());
-    let r = call_closure(ctx, funcs, f, args, this)?;
+    if class_ctor {
+        run_fields(ctx, funcs, f, this)?;
+    }
+    ctx.pending_new_target = Some(new_target);
+    let r = call_closure(ctx, funcs, f, args, this);
+    ctx.pending_new_target = None;
+    let r = r?;
     Ok(if is_object_value(ctx.realm, r) {
         r
     } else {
@@ -1149,7 +1457,8 @@ fn vm_construct(
 /// Whether `v` is an Object (not a primitive — note strings are heap handles
 /// too).
 fn is_object_value(realm: &Realm, v: NanBox) -> bool {
-    v.as_handle().is_some() && matches!(realm.type_of_value(v), "object" | "function")
+    // A handle whose `typeof` is "undefined" is an [[IsHTMLDDA]] object.
+    v.as_handle().is_some() && matches!(realm.type_of_value(v), "object" | "function" | "undefined")
 }
 
 /// `new f(...args)` of the VM function `f` for the host (a `Reflect.construct`,
@@ -1163,11 +1472,12 @@ pub(crate) fn construct_vm_function(
     table: &alloc::rc::Rc<[FnProto]>,
     f: NanBox,
     args: &[NanBox],
+    new_target: NanBox,
 ) -> Result<NanBox, VmError> {
     let mut realm = core::mem::take(host.realm_slot());
     let result = {
         let mut ctx = hosted_ctx(&mut realm, host);
-        let r = vm_construct(&mut ctx, table, f, args);
+        let r = vm_construct(&mut ctx, table, f, args, new_target);
         if r.is_ok() && !ctx.microtasks.is_empty() {
             Err(VmError::Unsupported)
         } else {
@@ -1334,6 +1644,9 @@ struct Ctx<'a> {
     /// (a call through a closure value): the callee of a function's `arguments`
     /// object. Taken on entry, so it never leaks into a later call.
     pending_callee: Option<NanBox>,
+    /// The `new.target` of the next `call_with` activation when it is a
+    /// `[[Construct]]` (`None` for an ordinary call). Taken on entry.
+    pending_new_target: Option<NanBox>,
 }
 
 // The recursion-guard, handler-stack, JSON-depth, and string-length caps now
@@ -1379,6 +1692,7 @@ pub fn run_program(
         frames_published: 0,
         top_frame_roots: Vec::new(),
         pending_callee: None,
+        pending_new_target: None,
     };
     let value = call(&mut ctx, funcs, id, args)?;
     drain_microtasks(&mut ctx, funcs)?;
@@ -1418,6 +1732,7 @@ pub fn run_program_capturing(
         frames_published: 0,
         top_frame_roots: Vec::new(),
         pending_callee: None,
+        pending_new_target: None,
     };
     let value = call(&mut ctx, funcs, id, args)?;
     // Run the promise event loop before returning (then-callbacks, async tails).
@@ -1541,6 +1856,7 @@ fn call_with_inner(
     // The callee value, if the caller knew it (the `arguments` object's
     // `callee`). Taken now so it cannot leak into a later call.
     let mut callee = ctx.pending_callee.take();
+    let mut new_target = ctx.pending_new_target.take();
     // Where this activation's published inputs start; reset on every tail-call
     // rebinding and truncated back to on return.
     let inputs_mark = ctx.frame_shadow.len();
@@ -1552,6 +1868,14 @@ fn call_with_inner(
             let e = vm_error(ctx, "TypeError", "not a function");
             return Err(VmError::Thrown(e));
         };
+        if proto.class_ctor && new_target.is_none() {
+            let e = vm_error(
+                ctx,
+                "TypeError",
+                "Class constructor cannot be invoked without 'new'",
+            );
+            return Err(VmError::Thrown(e));
+        }
         let mut regs: Vec<NanBox> = vec![NanBox::undefined(); proto.n_regs];
         match proto.rest_from {
             // A rest parameter: fixed args fill `0..fixed`, the remainder becomes an
@@ -1610,6 +1934,16 @@ fn call_with_inner(
             if let Some(slot) = regs.get_mut(*dst as usize) {
                 *slot = v;
             }
+        }
+        // `new.target` (see `Op::LoadNewTarget`): the construct's, else undefined.
+        if let Some(Op::LoadNewTarget { dst }) = proto
+            .ops
+            .iter()
+            .take(2)
+            .find(|op| matches!(op, Op::LoadNewTarget { .. }))
+            && let Some(slot) = regs.get_mut(*dst as usize)
+        {
+            *slot = new_target.unwrap_or(NanBox::undefined());
         }
         // Republish the outermost activation's inputs for the GC safepoint: they
         // live in this function's Rust locals, which the collector cannot see.
@@ -1715,6 +2049,7 @@ fn call_with_inner(
                 captures = tcaps;
                 this_val = this;
                 callee = None;
+                new_target = None;
             }
         }
     }
@@ -1862,6 +2197,7 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
         frames_published: 0,
         top_frame_roots: Vec::new(),
         pending_callee: None,
+        pending_new_target: None,
     };
     match run_frame(&mut ctx, &[], program, &mut regs)? {
         FrameExit::Return(v) => Ok(v.unwrap_or(NanBox::undefined())),
@@ -3845,7 +4181,7 @@ fn run_frame(
                 }
             }
             // Filled in by `call_with_inner` on entry.
-            Op::MakeArguments { .. } => {}
+            Op::MakeArguments { .. } | Op::LoadNewTarget { .. } => {}
             Op::IterOpen { iter, next, src } => {
                 let v = regs[*src as usize];
                 match with_host(ctx, |h| h.get_iterator(v)) {
@@ -4001,6 +4337,133 @@ fn run_frame(
                     }
                 };
             }
+            Op::MakeClass { dst, f, sup } => {
+                let fv = regs[*f as usize];
+                let sup_v = sup.map(|r| regs[r as usize]);
+                match make_class(ctx, fv, sup_v) {
+                    Ok(p) => regs[*dst as usize] = p,
+                    Err(e) => handle_throw!(e),
+                }
+            }
+            Op::DefineMethod {
+                obj,
+                key,
+                func,
+                kind,
+            } => {
+                let (o, k, f) = (
+                    regs[*obj as usize],
+                    regs[*key as usize],
+                    regs[*func as usize],
+                );
+                match with_host(ctx, |h| h.define_method(o, k, f, *kind)) {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
+            }
+            Op::DefineData {
+                obj,
+                key,
+                src,
+                attrs,
+            } => {
+                let (o, k, v) = (
+                    regs[*obj as usize],
+                    regs[*key as usize],
+                    regs[*src as usize],
+                );
+                match with_host(ctx, |h| h.define_data(o, k, v, *attrs)) {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
+            }
+            Op::SuperCall {
+                dst,
+                ctor,
+                new_target,
+                args,
+                this,
+            } => {
+                let argv = spread_argv(ctx, regs[*args as usize])?;
+                let (f, nt) = (regs[*ctor as usize], regs[*new_target as usize]);
+                let pub_mark = ctx.frame_shadow.len();
+                ctx.frame_shadow.extend_from_slice(regs);
+                ctx.frames_published += 1;
+                let r = super_construct(ctx, funcs, f, &argv, nt);
+                ctx.frames_published -= 1;
+                ctx.frame_shadow.truncate(pub_mark);
+                let obj = match r {
+                    Ok(v) => v,
+                    Err(e) => {
+                        handle_throw!(e);
+                        continue;
+                    }
+                };
+                if !regs[*this as usize].is_tdz() {
+                    let e = vm_error(
+                        ctx,
+                        "ReferenceError",
+                        "Super constructor may only be called once",
+                    );
+                    handle_throw!(VmError::Thrown(e));
+                    continue;
+                }
+                regs[*this as usize] = obj;
+                regs[*dst as usize] = obj;
+                if let Err(e) = run_fields(ctx, funcs, f, obj) {
+                    handle_throw!(e);
+                }
+            }
+            Op::SuperGet {
+                dst,
+                home,
+                key,
+                this,
+            } => {
+                let (k, t) = (regs[*key as usize], regs[*this as usize]);
+                match super_base(ctx, regs[*home as usize]) {
+                    Ok(base) => match with_host(ctx, |h| h.get_with_receiver(base, k, t)) {
+                        Some(Ok(v)) => regs[*dst as usize] = v,
+                        Some(Err(e)) => handle_throw!(VmError::from(e)),
+                        None => return Err(VmError::Unsupported),
+                    },
+                    Err(e) => handle_throw!(e),
+                }
+            }
+            Op::SuperSet {
+                home,
+                key,
+                src,
+                this,
+            } => {
+                let (k, v, t) = (
+                    regs[*key as usize],
+                    regs[*src as usize],
+                    regs[*this as usize],
+                );
+                match super_base(ctx, regs[*home as usize]) {
+                    Ok(base) => match with_host(ctx, |h| h.set_with_receiver(base, k, v, t)) {
+                        Some(Ok(())) => {}
+                        Some(Err(e)) => handle_throw!(VmError::from(e)),
+                        None => return Err(VmError::Unsupported),
+                    },
+                    Err(e) => handle_throw!(e),
+                }
+            }
+            Op::DerivedResult { dst, src, this } => {
+                // `undefined` becomes the bound `this` (possibly still the TDZ
+                // sentinel); the checks run in `vm_construct`, after the body —
+                // outside any `try` in it.
+                let v = regs[*src as usize];
+                regs[*dst as usize] =
+                    if matches!(v.unpack(), crate::nanbox::Unpacked::Undefined) && !v.is_tdz() {
+                        regs[*this as usize]
+                    } else {
+                        v
+                    };
+            }
             Op::CheckTdz { src } => {
                 if regs[*src as usize].is_tdz() {
                     let e = vm_error(
@@ -4098,7 +4561,7 @@ fn run_frame(
                 if c.as_handle()
                     .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
                 {
-                    match vm_construct(ctx, funcs, c, &argv) {
+                    match vm_construct(ctx, funcs, c, &argv, c) {
                         Ok(v) => regs[*dst as usize] = v,
                         Err(e) => handle_throw!(e),
                     }
@@ -4116,7 +4579,7 @@ fn run_frame(
                 if c.as_handle()
                     .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
                 {
-                    match vm_construct(ctx, funcs, c, &argv) {
+                    match vm_construct(ctx, funcs, c, &argv, c) {
                         Ok(v) => regs[*dst as usize] = v,
                         Err(e) => handle_throw!(e),
                     }
@@ -7602,7 +8065,8 @@ pub fn compile_program_into(
     let mut class_map = alloc::collections::BTreeMap::new();
     let mut class_jobs: Vec<ClassJob> = Vec::new();
     let mut class_id = 0u32;
-    for s in &program.body {
+    // A hosted run defines classes at run time (`Compiler::class_value`).
+    for s in program.body.iter().filter(|_| !hosted) {
         // A class declaration, or a top-level `const Name = class {…}` (treated
         // as a named class so `new Name(...)` resolves).
         let named = match s {
@@ -7649,6 +8113,8 @@ pub fn compile_program_into(
         length: 0,
         name: alloc::string::String::new(),
         legacy: false,
+        class_ctor: false,
+        derived: false,
     };
     // Reserve slots: main (0), top-level functions (1..=N), then class members
     // (N+1..next_id). Nested function expressions append beyond `next_id`.
@@ -7689,6 +8155,8 @@ pub fn compile_program_into(
                 hosted,
                 false,
                 &alloc::collections::BTreeMap::new(),
+                None,
+                &[],
             )?;
             // A function declaration's `name` is its declared identifier.
             if let Some(id) = &f.id {
@@ -7720,6 +8188,8 @@ pub fn compile_program_into(
                 hosted,
                 false,
                 &alloc::collections::BTreeMap::new(),
+                None,
+                &[],
             )?;
             protos.borrow_mut()[job.id as usize] = proto;
         }
@@ -7951,6 +8421,11 @@ fn declared_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
         }
         Stmt::Function(f) => {
             if let Some(id) = &f.id {
+                out.insert(String::from(&*id.name));
+            }
+        }
+        Stmt::Class(c) => {
+            if let Some(id) = &c.id {
                 out.insert(String::from(&*id.name));
             }
         }
@@ -8217,6 +8692,7 @@ fn refs_class(c: &crate::ast::Class, direct: &mut BTreeSet<String>, nested: &mut
                     refs_expr(v, &mut inner, &mut inner_nested);
                     inner.extend(inner_nested);
                     inner.remove(THIS_NAME);
+                    inner.remove(NT_NAME);
                     nested.extend(inner);
                 }
             }
@@ -8350,13 +8826,21 @@ fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
         | Expr::BigInt { .. }
         | Expr::Str { .. }
         | Expr::Regex { .. }
-        | Expr::PrivateName(..)
-        | Expr::NewTarget(_) => {}
+        | Expr::PrivateName(..) => {}
+        // `new.target` is lexical for an arrow, like `this`.
+        Expr::NewTarget(_) => {
+            direct.insert(String::from(NT_NAME));
+        }
         // `this` (and `super`, whose receiver is `this`) is a lexical reference
         // for an arrow: the hidden binding [`THIS_NAME`] of the nearest
         // non-arrow function.
-        Expr::This(_) | Expr::Super(_) => {
+        Expr::This(_) => {
             direct.insert(String::from(THIS_NAME));
+        }
+        Expr::Super(_) => {
+            for n in [THIS_NAME, HOME_NAME, CTOR_NAME, NT_NAME] {
+                direct.insert(String::from(n));
+            }
         }
     }
 }
@@ -8365,11 +8849,29 @@ fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
 /// `this` (a function whose nested arrows use `this` boxes it into a cell).
 const THIS_NAME: &str = "\0this";
 
+/// The hidden binding holding a class element's home object (`super`'s base
+/// is its `[[Prototype]]`).
+const HOME_NAME: &str = "\0home";
+
+/// The hidden binding holding a class's constructor (the active function of
+/// its `super(...)` calls, and static elements' home object).
+const CTOR_NAME: &str = "\0ctor";
+
+/// The hidden binding holding a class's prototype (instance elements' home).
+const PROTO_NAME: &str = "\0proto";
+
+/// The rest parameter of a synthesized default derived constructor.
+const DEFAULT_ARGS: &str = "\0args";
+
+/// The hidden binding holding a non-arrow function's `new.target`.
+const NT_NAME: &str = "\0newtarget";
+
 /// [`free_of_function`] for a function with its *own* `this` (anything but an
 /// arrow): `this` inside it is not a reference to the enclosing one.
 fn free_of_nonarrow(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<String> {
     let mut free = free_of_function(params, body);
     free.remove(THIS_NAME);
+    free.remove(NT_NAME);
     free
 }
 
@@ -8639,6 +9141,59 @@ struct Binding {
     mapped: bool,
 }
 
+/// The inputs of [`Compiler::make_closure_ext`].
+struct ClosureSpec<'p, 'f> {
+    params: &'p [crate::ast::Param],
+    body: &'p [Stmt],
+    is_async: bool,
+    name: &'p str,
+    is_arrow: bool,
+    strict: bool,
+    class_ctor: Option<bool>,
+    field_defs: &'f [FieldDef<'f>],
+    extra_free: BTreeSet<String>,
+}
+
+impl<'p, 'f> ClosureSpec<'p, 'f> {
+    /// A class element's function: strict, not an arrow, not async.
+    fn class_element(
+        params: &'p [crate::ast::Param],
+        body: &'p [Stmt],
+        name: &'p str,
+        class_ctor: Option<bool>,
+        field_defs: &'f [FieldDef<'f>],
+        extra_free: BTreeSet<String>,
+    ) -> Self {
+        ClosureSpec {
+            params,
+            body,
+            is_async: false,
+            name,
+            is_arrow: false,
+            strict: true,
+            class_ctor,
+            field_defs,
+            extra_free,
+        }
+    }
+}
+
+/// A class field for a field-initializer function (see
+/// [`Compiler::class_value`]): its key and optional initializer.
+struct FieldDef<'a> {
+    key: FieldKey,
+    init: Option<&'a Expr>,
+}
+
+/// Where a class field's key comes from.
+enum FieldKey {
+    /// A static key (identifier, string or number literal), as its string.
+    Static(String),
+    /// A computed key, evaluated at class definition into the cell of this
+    /// hidden binding.
+    Hidden(String),
+}
+
 /// A member assignment target evaluated ahead of its value: the object
 /// register and either a computed key register (`Ok`) or a static key (`Err`).
 type MemberPlace = (Reg, Result<Reg, String>);
@@ -8763,6 +9318,9 @@ struct Compiler {
     /// Set while compiling the object of an `arguments.x` / `arguments[i]` read
     /// (the one use of a mapped `arguments` the VM models).
     args_member_read: bool,
+    /// Compiling a derived class constructor's own body: `this` starts in its
+    /// TDZ, `super(...)` binds it, and returns go through `DerivedResult`.
+    derived_ctor: bool,
     /// A mapped parameter was written, or a mapped `arguments` escaped.
     mapped_violation: bool,
 }
@@ -8800,6 +9358,8 @@ impl Compiler {
             hosted,
             false,
             &alloc::collections::BTreeMap::new(),
+            None,
+            &[],
         )
     }
 
@@ -8820,6 +9380,8 @@ impl Compiler {
         hosted: bool,
         is_arrow: bool,
         cap_flags: &alloc::collections::BTreeMap<String, (bool, bool, bool)>,
+        class_ctor: Option<bool>,
+        field_defs: &[FieldDef<'_>],
     ) -> Result<FnProto, CompileError> {
         // The VM's `async` functions settle its *own* promise implementation,
         // which is not yet unified with the host's (`ROADMAP.md` §2.0 stage 5):
@@ -8830,7 +9392,28 @@ impl Compiler {
         }
         // Which of this function's own names are captured by nested functions →
         // must be cells.
+        // A parameter default that reads its own or a later parameter hits
+        // that binding's TDZ (a ReferenceError the VM does not model).
+        for (i, p) in params.iter().enumerate() {
+            if let Some(d) = &p.default {
+                let mut later = BTreeSet::new();
+                for q in &params[i..] {
+                    pattern_names(&q.target, &mut later);
+                }
+                let mut direct = BTreeSet::new();
+                let mut nested = BTreeSet::new();
+                refs_expr(d, &mut direct, &mut nested);
+                if direct
+                    .iter()
+                    .chain(nested.iter())
+                    .any(|n| later.contains(n))
+                {
+                    return Err(CompileError::Unsupported("parameter default TDZ"));
+                }
+            }
+        }
         let mut cell_names = captured_names(params, body);
+        let mut uses_new_target = false;
         // A non-arrow function whose nested arrows use `this` boxes it.
         if !is_arrow {
             let mut direct = BTreeSet::new();
@@ -8846,6 +9429,11 @@ impl Compiler {
             if nested.contains(THIS_NAME) {
                 cell_names.insert(String::from(THIS_NAME));
             }
+            if nested.contains(NT_NAME) {
+                cell_names.insert(String::from(NT_NAME));
+            }
+            uses_new_target = !is_main
+                && (class_ctor.is_some() || direct.contains(NT_NAME) || nested.contains(NT_NAME));
         }
         // Whether this function needs its own `arguments` object: it is not an
         // arrow (which sees its parent's) or a script body, no parameter takes the
@@ -8879,7 +9467,8 @@ impl Compiler {
             cell_names,
             super_ctor,
             super_class,
-            tail_ok: strict && !is_async,
+            tail_ok: strict && !is_async && class_ctor.is_none(),
+            derived_ctor: class_ctor == Some(true),
             strict,
             hosted,
             is_main,
@@ -8916,6 +9505,12 @@ impl Compiler {
         } else {
             None
         };
+        // `new.target`, filled on entry (it must be among the first two ops).
+        let new_target_reg = uses_new_target.then(|| {
+            let dst = c.alloc();
+            c.ops.push(Op::LoadNewTarget { dst });
+            dst
+        });
         // …then bind. A captured parameter is boxed into a fresh cell (preserving
         // the incoming argument value); a captured local that's a parameter must
         // share the cell so mutations are visible.
@@ -8985,6 +9580,16 @@ impl Compiler {
             let b = c.declare(THIS_NAME);
             let this = c.this_reg;
             c.write_var(b, this);
+            // A derived constructor's `this` is in its TDZ until `super()`.
+            if c.derived_ctor
+                && let Some(b) = c.scopes[0].get_mut(THIS_NAME)
+            {
+                b.tdz = true;
+            }
+        }
+        if let Some(r) = new_target_reg {
+            let b = c.declare(NT_NAME);
+            c.write_var(b, r);
         }
         // Bind `arguments` before any parameter default runs (a default may read
         // it).
@@ -9069,6 +9674,10 @@ impl Compiler {
                         seen.extend(free_of_function(&f.params, &f.body));
                     }
                 }
+                // A hosted class declaration binds through `declare`, like `let`.
+                if hosted {
+                    lexical.extend(core::mem::take(&mut classes));
+                }
                 if seen.iter().any(|n| classes.contains(n))
                     || (!hosted && seen.iter().any(|n| lexical.contains(n)))
                 {
@@ -9136,6 +9745,29 @@ impl Compiler {
                 src: v,
             });
         }
+        // A class field-initializer function: define each field on `this`.
+        for fd in field_defs {
+            let key = match &fd.key {
+                FieldKey::Static(k) => c.constant_str(k),
+                FieldKey::Hidden(n) => {
+                    let b = c
+                        .lookup(n)
+                        .ok_or(CompileError::Unsupported("class field key"))?;
+                    c.read_var(b)
+                }
+            };
+            let v = match fd.init {
+                Some(e) => c.expr(e)?,
+                None => c.constant(NanBox::undefined())?,
+            };
+            let this = c.this_reg;
+            c.ops.push(Op::DefineData {
+                obj: this,
+                key,
+                src: v,
+                attrs: 7,
+            });
+        }
         // In `main`, materialize one canonical closure per top-level function
         // declaration so referencing it as a value has a stable identity (and can
         // hold assigned properties). Calls still dispatch directly by id.
@@ -9180,6 +9812,11 @@ impl Compiler {
             };
             c.ops.push(Op::Return { src });
         }
+        // Falling off a derived constructor's body returns the bound `this`.
+        if c.derived_ctor {
+            let u = c.constant(NanBox::undefined())?;
+            c.emit_derived_return(u);
+        }
         // Reject a program that exhausted the `Reg` width during allocation
         // rather than returning a proto with wrapped/aliased register indices.
         if c.reg_overflow {
@@ -9205,6 +9842,8 @@ impl Compiler {
             ops: c.ops,
             name: alloc::string::String::new(),
             legacy: !strict && !is_arrow && !is_async && !is_main,
+            class_ctor: class_ctor.is_some(),
+            derived: class_ctor == Some(true),
         })
     }
 }
@@ -9922,6 +10561,18 @@ impl Compiler {
             // Methods/constructors are compiled up front; here we materialize the
             // class's *static* side as a value object bound to the class name, so
             // `ClassName.staticMethod()` / `ClassName.staticField` work.
+            Stmt::Class(class) if self.hosted => {
+                let f = self.class_value(class, "")?;
+                if let Some(cid) = &class.id {
+                    // A class declaration binds like `let` (so a hosted script's
+                    // top-level class lands in the global environment).
+                    let saved = self.decl_kind.replace(crate::ast::VarDeclKind::Let);
+                    let b = self.declare(&cid.name);
+                    self.decl_kind = saved;
+                    self.write_var(b, f);
+                }
+                Ok(None)
+            }
             Stmt::Class(class) => {
                 // A class with an `extends` clause that is not a known compiled
                 // class must validate the superclass is a constructor/null at
@@ -9941,6 +10592,14 @@ impl Compiler {
                     self.decl_kind = saved;
                     r?;
                 }
+                Ok(None)
+            }
+            Stmt::Return { argument, .. } if self.derived_ctor => {
+                let v = match argument {
+                    Some(e) => self.expr(e)?,
+                    None => self.constant(NanBox::undefined())?,
+                };
+                self.emit_derived_return(v);
                 Ok(None)
             }
             Stmt::Return { argument, .. } => {
@@ -11182,6 +11841,20 @@ impl Compiler {
                 }
                 Ok(dst)
             }
+            // `super.x` / `super[k]` in a hosted class element.
+            Expr::Member {
+                object, property, ..
+            } if self.hosted && matches!(&**object, Expr::Super(_)) => {
+                let (home, this, key) = self.super_reference(property)?;
+                let dst = self.alloc();
+                self.ops.push(Op::SuperGet {
+                    dst,
+                    home,
+                    key,
+                    this,
+                });
+                Ok(dst)
+            }
             Expr::Member {
                 object,
                 property,
@@ -11270,6 +11943,26 @@ impl Compiler {
                 self.refuse_direct_eval(callee)?;
                 // Every branch below evaluates the callee (and its receiver) *before*
                 // the arguments, as `EvaluateCall` does.
+                // Hosted `super(args)` in a derived constructor.
+                if self.hosted && matches!(&**callee, Expr::Super(_)) {
+                    return self.super_call(arguments);
+                }
+                // Hosted `super.m(args)`: `this` is the receiver.
+                if self.hosted
+                    && matches!(&**callee, Expr::Member { object, .. } if matches!(&**object, Expr::Super(_)))
+                {
+                    let f = self.expr(callee)?;
+                    let this = self.this_value();
+                    let args = self.spread_args(arguments)?;
+                    let dst = self.alloc();
+                    self.ops.push(Op::CallSpread {
+                        dst,
+                        callee: f,
+                        this,
+                        args,
+                    });
+                    return Ok(dst);
+                }
                 // `super(args)` — run the base constructor on the current `this`.
                 // A subclass whose base has no explicit constructor: a no-op.
                 if matches!(&**callee, Expr::Super(_)) {
@@ -11486,6 +12179,22 @@ impl Compiler {
                 }
                 let compound = !matches!(op, AssignOp::Assign);
                 match &**target {
+                    Expr::Member {
+                        object, property, ..
+                    } if self.hosted && matches!(&**object, Expr::Super(_)) => {
+                        if compound {
+                            return Err(CompileError::Unsupported("compound super assignment"));
+                        }
+                        let (home, this, key) = self.super_reference(property)?;
+                        let src = self.expr(value)?;
+                        self.ops.push(Op::SuperSet {
+                            home,
+                            key,
+                            src,
+                            this,
+                        });
+                        Ok(src)
+                    }
                     Expr::Ident(id) => {
                         let b = self
                             .resolve(&id.name)
@@ -11628,11 +12337,13 @@ impl Compiler {
                 self.write_var(b, next);
                 Ok(if *prefix { next } else { old })
             }
-            // In an arrow, `this` is the enclosing function's (captured).
-            Expr::This(_) => match self.lookup(THIS_NAME) {
+            Expr::Class(c) if self.hosted => self.class_value(c, ""),
+            Expr::NewTarget(_) => match self.lookup(NT_NAME) {
                 Some(b) => Ok(self.read_var(b)),
-                None => Ok(self.this_reg),
+                None => Err(CompileError::Unsupported("new.target")),
             },
+            // In an arrow, `this` is the enclosing function's (captured).
+            Expr::This(_) => Ok(self.this_value()),
             // A regex literal `/source/flags`.
             Expr::Regex { pattern, flags, .. } => {
                 let dst = self.alloc();
@@ -12108,6 +12819,9 @@ impl Compiler {
     fn expr_named(&mut self, e: &Expr, target: &BindingTarget) -> Result<Reg, CompileError> {
         if let BindingTarget::Ident(id) = target {
             match e {
+                Expr::Class(c) if self.hosted && c.id.is_none() => {
+                    return self.class_value(c, &id.name);
+                }
                 Expr::Function(f) if f.id.is_none() => {
                     refuse_generator(f)?;
                     return self.make_closure(
@@ -12225,13 +12939,44 @@ impl Compiler {
         name: &str,
         is_arrow: bool,
     ) -> Result<Reg, CompileError> {
+        let strict = self.strict;
+        self.make_closure_ext(ClosureSpec {
+            params,
+            body,
+            is_async,
+            name,
+            is_arrow,
+            strict,
+            class_ctor: None,
+            field_defs: &[],
+            extra_free: BTreeSet::new(),
+        })
+    }
+
+    /// [`Self::make_closure_inner`] with the class-element knobs: a class
+    /// constructor kind, field definitions (a field-initializer function), extra
+    /// free names (those its field initializers and hidden keys reference), and
+    /// strictness (class code is always strict).
+    fn make_closure_ext(&mut self, spec: ClosureSpec<'_, '_>) -> Result<Reg, CompileError> {
+        let ClosureSpec {
+            params,
+            body,
+            is_async,
+            name,
+            is_arrow,
+            strict,
+            class_ctor,
+            field_defs,
+            extra_free,
+        } = spec;
         // Captures = free variables that resolve to an enclosing binding (others
         // are top-level functions / globals, reached directly).
-        let free = if is_arrow {
+        let mut free = if is_arrow {
             free_of_function(params, body)
         } else {
             free_of_nonarrow(params, body)
         };
+        free.extend(extra_free);
         // A *named function expression* binds its own name inside its body (to the
         // function itself). If that name is referenced, thread it as a trailing
         // "self" capture: a cell we create here and backfill with the finished
@@ -12264,6 +13009,8 @@ impl Compiler {
                 length: 0,
                 name: alloc::string::String::new(),
                 legacy: false,
+                class_ctor: false,
+                derived: false,
             });
             (p.len() - 1) as u32
         };
@@ -12287,10 +13034,12 @@ impl Compiler {
             &[],
             None,
             is_async,
-            self.strict,
+            strict,
             self.hosted,
             is_arrow,
             &flags,
+            class_ctor,
+            field_defs,
         )?;
         let mut proto = proto;
         proto.name = alloc::string::String::from(name);
@@ -12307,7 +13056,13 @@ impl Compiler {
                 self_cell = Some(cell);
                 capture_regs.push(cell);
             } else {
-                capture_regs.push(self.lookup(n).expect("captured binding").reg);
+                let b = self.lookup(n).expect("captured binding");
+                // The callee reads every capture as a cell; a plain register
+                // binding here is a missed cell analysis — refuse, never alias.
+                if !b.cell {
+                    return Err(CompileError::Unsupported("capture of a non-cell binding"));
+                }
+                capture_regs.push(b.reg);
             }
         }
         let dst = self.alloc();
@@ -12734,6 +13489,412 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// A fresh cell binding `name` in the innermost scope (holding the TDZ
+    /// sentinel when `tdz`).
+    fn bind_hidden_cell(
+        &mut self,
+        name: &str,
+        konst: bool,
+        tdz: bool,
+    ) -> Result<Binding, CompileError> {
+        let reg = self.alloc();
+        self.ops.push(Op::NewArray { dst: reg, len: 1 });
+        if tdz {
+            let t = self.constant(NanBox::tdz())?;
+            let idx = self.constant(NanBox::number(0.0))?;
+            self.ops.push(Op::SetElem {
+                arr: reg,
+                index: idx,
+                src: t,
+            });
+        }
+        let b = Binding {
+            reg,
+            cell: true,
+            konst,
+            global: None,
+            tdz,
+            mapped: false,
+        };
+        self.scopes
+            .last_mut()
+            .expect("a scope")
+            .insert(String::from(name), b);
+        Ok(b)
+    }
+
+    /// Compiles a class element's function as a closure whose `super` home is
+    /// the hidden binding `home` (strict, a method: no `prototype`).
+    fn class_element_closure(
+        &mut self,
+        home: &str,
+        spec: ClosureSpec<'_, '_>,
+    ) -> Result<Reg, CompileError> {
+        let class_ctor = spec.class_ctor;
+        let hb = self
+            .lookup(home)
+            .ok_or(CompileError::Unsupported("class home object"))?;
+        let saved = self
+            .scopes
+            .last_mut()
+            .expect("a scope")
+            .insert(String::from(HOME_NAME), hb);
+        let r = self.make_closure_ext(spec);
+        let scope = self.scopes.last_mut().expect("a scope");
+        match saved {
+            Some(b) => {
+                scope.insert(String::from(HOME_NAME), b);
+            }
+            None => {
+                scope.remove(HOME_NAME);
+            }
+        }
+        let r = r?;
+        // A method is not a constructor and has no legacy `caller`.
+        if class_ctor.is_none()
+            && let Some(Op::MakeClosure { func, .. }) = self
+                .ops
+                .iter()
+                .rev()
+                .find(|op| matches!(op, Op::MakeClosure { dst, .. } if *dst == r))
+        {
+            let func = *func as usize;
+            self.protos.borrow_mut()[func].legacy = false;
+        }
+        Ok(r)
+    }
+
+    /// ClassDefinitionEvaluation in a hosted run (`ROADMAP.md` §2.0): the
+    /// constructor is a VM closure made a class by [`Op::MakeClass`], elements
+    /// are defined in source order through the host ([`Op::DefineMethod`],
+    /// [`Op::DefineData`]), instance fields run from a hidden initializer
+    /// closure, and `super` reaches its home object through hidden bindings.
+    /// Returns the constructor.
+    fn class_value(
+        &mut self,
+        class: &crate::ast::Class,
+        name_hint: &str,
+    ) -> Result<Reg, CompileError> {
+        use crate::ast::{ClassMember, MethodKind};
+        let span = crate::common::Span::point(0);
+        let saved_strict = self.strict;
+        self.strict = true;
+        self.scopes.push(alloc::collections::BTreeMap::new());
+        let r = (|| -> Result<Reg, CompileError> {
+            let inner = class.id.as_ref().map(|id| String::from(&*id.name));
+            let inner_b = match &inner {
+                Some(n) => Some(self.bind_hidden_cell(n, true, true)?),
+                None => None,
+            };
+            let ctor_b = self.bind_hidden_cell(CTOR_NAME, true, false)?;
+            let proto_b = self.bind_hidden_cell(PROTO_NAME, true, false)?;
+            let sup = match &class.super_class {
+                Some(e) => Some(self.expr(e)?),
+                None => None,
+            };
+            let derived = sup.is_some();
+            for m in &class.body {
+                match m {
+                    ClassMember::Method(m) => {
+                        if matches!(m.key, PropertyKey::Private(_)) {
+                            return Err(CompileError::Unsupported("private class element"));
+                        }
+                        refuse_generator(&m.value)?;
+                        if m.value.is_async {
+                            return Err(CompileError::Unsupported("async class method"));
+                        }
+                    }
+                    ClassMember::Field(f) if matches!(f.key, PropertyKey::Private(_)) => {
+                        return Err(CompileError::Unsupported("private class element"));
+                    }
+                    _ => {}
+                }
+            }
+            // The constructor (declared, or the default one).
+            let fname = inner.clone().unwrap_or_else(|| String::from(name_hint));
+            let declared = class.body.iter().find_map(|m| match m {
+                ClassMember::Method(m) if !m.is_static && m.kind == MethodKind::Constructor => {
+                    Some(m)
+                }
+                _ => None,
+            });
+            let default_params = alloc::vec![crate::ast::Param {
+                target: BindingTarget::Ident(Ident {
+                    name: DEFAULT_ARGS.into(),
+                    span,
+                }),
+                default: None,
+                rest: true,
+                span,
+            }];
+            let default_body = alloc::vec![Stmt::Expr {
+                expression: Box::new(Expr::Call {
+                    callee: Box::new(Expr::Super(span)),
+                    arguments: alloc::vec![crate::ast::Argument::Spread(Expr::Ident(Ident {
+                        name: DEFAULT_ARGS.into(),
+                        span,
+                    }))],
+                    optional: false,
+                    span,
+                }),
+                span,
+            }];
+            let (cparams, cbody): (&[crate::ast::Param], &[Stmt]) = match declared {
+                Some(m) => (&m.value.params, &m.value.body),
+                None if derived => (&default_params, &default_body),
+                None => (&[], &[]),
+            };
+            let f = self.class_element_closure(
+                PROTO_NAME,
+                ClosureSpec::class_element(
+                    cparams,
+                    cbody,
+                    &fname,
+                    Some(derived),
+                    &[],
+                    BTreeSet::new(),
+                ),
+            )?;
+            let proto = self.alloc();
+            self.ops.push(Op::MakeClass { dst: proto, f, sup });
+            self.write_var(ctor_b, f);
+            self.write_var(proto_b, proto);
+            // Elements, in order. Static fields and blocks run after all of
+            // them; instance fields are gathered into the initializer.
+            enum Static<'c> {
+                Field(Reg, Option<&'c Expr>),
+                Block(&'c [Stmt]),
+            }
+            let mut statics: Vec<Static<'_>> = Vec::new();
+            let mut fields: Vec<FieldDef<'_>> = Vec::new();
+            let mut field_free: BTreeSet<String> = BTreeSet::new();
+            for m in &class.body {
+                match m {
+                    ClassMember::Method(m) if !m.is_static && m.kind == MethodKind::Constructor => {
+                    }
+                    ClassMember::Method(m) => {
+                        let key = self.class_key(&m.key)?;
+                        let (obj, home) = if m.is_static {
+                            (f, CTOR_NAME)
+                        } else {
+                            (proto, PROTO_NAME)
+                        };
+                        let func = self.class_element_closure(
+                            home,
+                            ClosureSpec::class_element(
+                                &m.value.params,
+                                &m.value.body,
+                                "",
+                                None,
+                                &[],
+                                BTreeSet::new(),
+                            ),
+                        )?;
+                        let kind = match m.kind {
+                            MethodKind::Get => 1,
+                            MethodKind::Set => 2,
+                            _ => 0,
+                        };
+                        self.ops.push(Op::DefineMethod {
+                            obj,
+                            key,
+                            func,
+                            kind,
+                        });
+                    }
+                    ClassMember::Field(fd) if fd.is_static => {
+                        let key = self.class_key(&fd.key)?;
+                        statics.push(Static::Field(key, fd.value.as_ref()));
+                    }
+                    ClassMember::Field(fd) => {
+                        let key = match &fd.key {
+                            PropertyKey::Computed(_) => {
+                                let k = self.class_key(&fd.key)?;
+                                let name = alloc::format!("\0fk{}", fields.len());
+                                let b = self.bind_hidden_cell(&name, true, false)?;
+                                self.write_var(b, k);
+                                field_free.insert(name.clone());
+                                FieldKey::Hidden(name)
+                            }
+                            other => FieldKey::Static(static_key(other)?),
+                        };
+                        if let Some(e) = &fd.value {
+                            let mut d = BTreeSet::new();
+                            let mut n = BTreeSet::new();
+                            refs_expr(e, &mut d, &mut n);
+                            field_free.extend(d);
+                            field_free.extend(n);
+                        }
+                        fields.push(FieldDef {
+                            key,
+                            init: fd.value.as_ref(),
+                        });
+                    }
+                    ClassMember::StaticBlock { body, .. } => statics.push(Static::Block(body)),
+                }
+            }
+            if !fields.is_empty() {
+                field_free.remove(THIS_NAME);
+                field_free.remove(NT_NAME);
+                let init = self.class_element_closure(
+                    PROTO_NAME,
+                    ClosureSpec::class_element(&[], &[], "", None, &fields, field_free),
+                )?;
+                self.ops.push(Op::SetHidden {
+                    obj: f,
+                    key: String::from(FIELDS_KEY),
+                    src: init,
+                });
+            }
+            if let Some(b) = inner_b {
+                self.write_var(Binding { tdz: false, ..b }, f);
+            }
+            for st in statics {
+                let body: Vec<Stmt> = match st {
+                    Static::Field(_, Some(e)) => alloc::vec![Stmt::Return {
+                        argument: Some(Box::new(e.clone())),
+                        span,
+                    }],
+                    Static::Field(_, None) => Vec::new(),
+                    Static::Block(b) => b.to_vec(),
+                };
+                let thunk = self.class_element_closure(
+                    CTOR_NAME,
+                    ClosureSpec::class_element(&[], &body, "", None, &[], BTreeSet::new()),
+                )?;
+                let none = self.alloc();
+                self.ops.push(Op::NewArray { dst: none, len: 0 });
+                let v = self.alloc();
+                self.ops.push(Op::CallSpread {
+                    dst: v,
+                    callee: thunk,
+                    this: f,
+                    args: none,
+                });
+                if let Static::Field(key, _) = st {
+                    self.ops.push(Op::DefineData {
+                        obj: f,
+                        key,
+                        src: v,
+                        attrs: 7,
+                    });
+                }
+            }
+            Ok(f)
+        })();
+        self.scopes.pop();
+        self.strict = saved_strict;
+        r
+    }
+
+    /// A class element's property key as a value: a static name's string, or
+    /// a computed key's `ToPropertyKey` (evaluated now, in element order).
+    fn class_key(&mut self, key: &PropertyKey) -> Result<Reg, CompileError> {
+        Ok(match key {
+            PropertyKey::Computed(e) => {
+                let k = self.expr(e)?;
+                let kc = self.alloc();
+                self.ops.push(Op::ToKey { dst: kc, src: k });
+                kc
+            }
+            PropertyKey::Private(_) => return Err(CompileError::Unsupported("private name")),
+            other => {
+                let k = static_key(other)?;
+                self.constant_str(&k)
+            }
+        })
+    }
+
+    /// The current `this`: an arrow's captured one, a derived constructor's
+    /// (checked against its TDZ), or the frame's.
+    fn this_value(&mut self) -> Reg {
+        match self.lookup(THIS_NAME) {
+            Some(b) => self.read_var(b),
+            None if self.derived_ctor => {
+                let t = self.this_reg;
+                self.ops.push(Op::CheckTdz { src: t });
+                t
+            }
+            None => self.this_reg,
+        }
+    }
+
+    /// A `super[key]` reference in a hosted class element: its home object,
+    /// the `this` value (read first, as `MakeSuperPropertyReference` does), and
+    /// the property key.
+    fn super_reference(&mut self, property: &PropertyKey) -> Result<(Reg, Reg, Reg), CompileError> {
+        let hb = self
+            .lookup(HOME_NAME)
+            .ok_or(CompileError::Unsupported("super outside a class element"))?;
+        let this = self.this_value();
+        let key = match property {
+            PropertyKey::Computed(e) => {
+                let k = self.expr(e)?;
+                let kc = self.alloc();
+                self.ops.push(Op::ToKey { dst: kc, src: k });
+                kc
+            }
+            PropertyKey::Private(_) => return Err(CompileError::Unsupported("private name")),
+            other => {
+                let k = static_key(other)?;
+                self.constant_str(&k)
+            }
+        };
+        let home = self.read_var(hb);
+        Ok((home, this, key))
+    }
+
+    /// Hosted `super(...args)`: only in a derived constructor's own body.
+    fn super_call(&mut self, arguments: &[crate::ast::Argument]) -> Result<Reg, CompileError> {
+        if !self.derived_ctor {
+            return Err(CompileError::Unsupported(
+                "super call outside a derived constructor",
+            ));
+        }
+        let cb = self
+            .lookup(CTOR_NAME)
+            .ok_or(CompileError::Unsupported("super call outside a class"))?;
+        let ctor = self.read_var(cb);
+        let nb = self
+            .lookup(NT_NAME)
+            .ok_or(CompileError::Unsupported("super call without new.target"))?;
+        let new_target = self.read_var(nb);
+        // A default derived constructor forwards its arguments list as is (no
+        // iteration of the rest array).
+        let args = match arguments {
+            [crate::ast::Argument::Spread(Expr::Ident(id))] if &*id.name == DEFAULT_ARGS => {
+                let b = self
+                    .lookup(DEFAULT_ARGS)
+                    .ok_or(CompileError::Unsupported("default constructor"))?;
+                self.read_var(b)
+            }
+            _ => self.spread_args(arguments)?,
+        };
+        let dst = self.alloc();
+        let this = self.this_reg;
+        self.ops.push(Op::SuperCall {
+            dst,
+            ctor,
+            new_target,
+            args,
+            this,
+        });
+        // Arrows that captured `this` see the bound value from now on.
+        if let Some(b) = self.scopes[0].get(THIS_NAME).copied() {
+            self.write_var(Binding { tdz: false, ..b }, this);
+        }
+        Ok(dst)
+    }
+
+    /// A derived constructor's `return src`: the construct result per
+    /// [`Op::DerivedResult`].
+    fn emit_derived_return(&mut self, src: Reg) {
+        let dst = self.alloc();
+        let this = self.this_reg;
+        self.ops.push(Op::DerivedResult { dst, src, this });
+        self.ops.push(Op::Return { src: dst });
     }
 
     /// Emits a `JumpIfFalse` with a placeholder target; returns its index.
@@ -15291,6 +16452,7 @@ mod generic_jit_tests {
             frames_published: 0,
             top_frame_roots: Vec::new(),
             pending_callee: None,
+            pending_new_target: None,
         }
     }
 
@@ -15314,6 +16476,8 @@ mod generic_jit_tests {
             length: 2,
             name: alloc::string::String::from("f"),
             legacy: false,
+            class_ctor: false,
+            derived: false,
         });
         (funcs, f_id)
     }
@@ -15511,6 +16675,8 @@ mod generic_jit_tests {
             length: n_params,
             name: alloc::string::String::from(name),
             legacy: false,
+            class_ctor: false,
+            derived: false,
         });
         id
     }
