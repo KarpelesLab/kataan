@@ -9601,6 +9601,43 @@ pub fn eval_source_typed_interruptible(
 /// `Test262Error` carries only `message`, and reporting it as the bare
 /// `[object Object]` makes every assertion failure in the corpus
 /// indistinguishable. Surface the message instead.
+/// The interpreter as the host of a bytecode-VM run (`ROADMAP.md` §2.0): the VM
+/// borrows its realm, reads its globals, and delegates errors and console output
+/// to it so both tiers share one runtime.
+impl crate::nbvm::VmHost for Interp<'_> {
+    fn realm_slot(&mut self) -> &mut crate::realm::Realm {
+        &mut self.realm
+    }
+
+    fn global(&self, name: &str) -> Option<NanBox> {
+        self.global_scope.get(name)
+    }
+
+    fn make_error(&mut self, name: &str, message: &str) -> NanBox {
+        let idx = ERROR_NAMES.iter().position(|n| *n == name).unwrap_or(0);
+        let m = self.new_str(message);
+        self.make_error(N_ERROR_BASE + idx as u16, Some(m))
+    }
+
+    fn console_log(&mut self, args: &[NanBox]) -> Result<(), crate::nbvm::HostError> {
+        use crate::nbvm::HostError;
+        let console = self
+            .global_scope
+            .get("console")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+            .ok_or(HostError::Fault)?;
+        let to_host = |e: ExecError| match e {
+            ExecError::Throw(v) => HostError::Thrown(v),
+            _ => HostError::Fault,
+        };
+        let log = self.read_member(console, "log").map_err(to_host)?;
+        self.call_with_this(log, NanBox::handle(console.to_raw()), args)
+            .map(|_| ())
+            .map_err(to_host)
+    }
+}
+
 pub(crate) fn thrown_from_exec_error(interp: &Interp, e: ExecError, phase: ErrorPhase) -> Thrown {
     match e {
         ExecError::Throw(thrown) => {

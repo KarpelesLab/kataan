@@ -438,10 +438,77 @@ struct Microtask {
     fulfilled: bool,
 }
 
+/// The interpreter a VM run executes inside (`ROADMAP.md` §2.0): it owns the one
+/// realm, the global environment, the intrinsics and the built-in library, and
+/// the VM delegates to it rather than re-implementing them.
+///
+/// For the duration of a hosted run the host's realm is *moved into* the VM
+/// ([`run_program_hosted`]) — the VM and the JIT keep addressing it through
+/// `Ctx::realm` exactly as before — and it is swapped back into the host only
+/// while a delegated call runs (`with_host`). So every method here except
+/// [`realm_slot`](VmHost::realm_slot) and [`global`](VmHost::global) is called
+/// with the realm *in the host*.
+pub trait VmHost {
+    /// The host's realm slot: taken for a VM run, swapped back for a delegated
+    /// call.
+    fn realm_slot(&mut self) -> &mut Realm;
+    /// The value of the global binding `name`, if any. Reads the host's global
+    /// environment only — it needs no realm, so the VM may call it directly.
+    fn global(&self, name: &str) -> Option<NanBox>;
+    /// A real `name` error instance (`TypeError`, …) with `message`, linked to
+    /// the intrinsic prototype exactly as the interpreter's own errors are.
+    fn make_error(&mut self, name: &str, message: &str) -> NanBox;
+    /// `console.log(...args)` through the host's own console, so output is
+    /// formatted — and interleaved with host-side logging — identically.
+    ///
+    /// # Errors
+    /// A throw from `console.log` (a throwing `toString`, say), or a host fault.
+    fn console_log(&mut self, args: &[NanBox]) -> Result<(), HostError>;
+}
+
+/// Why a delegated host operation did not produce a value.
+#[derive(Debug)]
+pub enum HostError {
+    /// The operation threw this JS value; the VM rethrows it as its own.
+    Thrown(NanBox),
+    /// An internal host fault (not a JS exception); the VM faults the run.
+    Fault,
+}
+
+impl From<HostError> for VmError {
+    fn from(e: HostError) -> Self {
+        match e {
+            HostError::Thrown(v) => VmError::Thrown(v),
+            HostError::Fault => VmError::Unsupported,
+        }
+    }
+}
+
+/// Runs `f` against the host with the realm swapped back into it, then takes
+/// the realm again. `None` when this run has no host.
+fn with_host<R>(ctx: &mut Ctx, f: impl FnOnce(&mut dyn VmHost) -> R) -> Option<R> {
+    let host = ctx.host.as_deref_mut()?;
+    core::mem::swap(&mut *ctx.realm, host.realm_slot());
+    let r = f(host);
+    core::mem::swap(&mut *ctx.realm, host.realm_slot());
+    Some(r)
+}
+
+/// A `name` error with `message`: a real error instance built by the host when
+/// the run has one, else the VM's own plain `{ name, message }` object.
+fn vm_error(ctx: &mut Ctx, name: &str, message: &str) -> NanBox {
+    match with_host(ctx, |h| h.make_error(name, message)) {
+        Some(e) => e,
+        None => make_error(ctx.realm, name, message),
+    }
+}
+
 /// Execution context shared across activations: the heap, the captured
 /// `console` output sink, and the promise microtask queue (the event loop).
 struct Ctx<'a> {
     realm: &'a mut Realm,
+    /// The interpreter this run executes inside, if any (see [`VmHost`]).
+    host: Option<&'a mut dyn VmHost>,
     output: String,
     microtasks: alloc::collections::VecDeque<Microtask>,
     /// Per-function tiering state, keyed by function id.
@@ -545,6 +612,7 @@ pub fn run_program(
 ) -> Result<NanBox, VmError> {
     let mut ctx = Ctx {
         realm,
+        host: None,
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
         tiers: alloc::collections::BTreeMap::new(),
@@ -582,6 +650,7 @@ pub fn run_program_capturing(
 ) -> Result<(NanBox, String), VmError> {
     let mut ctx = Ctx {
         realm,
+        host: None,
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
         tiers: alloc::collections::BTreeMap::new(),
@@ -606,6 +675,51 @@ pub fn run_program_capturing(
     // Run the promise event loop before returning (then-callbacks, async tails).
     drain_microtasks(&mut ctx, funcs)?;
     Ok((value, ctx.output))
+}
+
+/// Runs function `id` of `funcs` inside `host` (see [`VmHost`]): the host's realm
+/// is moved into the VM for the run and restored afterwards on every path, and
+/// console output goes to the host. Allocation-triggered collection is off for
+/// now: the host holds roots (its global environment, class tables, …) the VM
+/// safepoint does not enumerate.
+///
+/// # Errors
+/// Propagates a [`VmError`] from any faulting instruction.
+pub fn run_program_hosted(
+    host: &mut dyn VmHost,
+    funcs: &[FnProto],
+    id: usize,
+    args: &[NanBox],
+) -> Result<NanBox, VmError> {
+    let mut realm = core::mem::take(host.realm_slot());
+    let result = {
+        let mut ctx = Ctx {
+            realm: &mut realm,
+            host: Some(&mut *host),
+            output: String::new(),
+            microtasks: alloc::collections::VecDeque::new(),
+            tiers: alloc::collections::BTreeMap::new(),
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_cache: alloc::collections::BTreeMap::new(),
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_pending: None,
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_pending_fault: None,
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_funcs: None,
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_shadow: alloc::vec::Vec::new(),
+            call_depth: 0,
+            gc_enabled: false,
+            gc_lock: 0,
+            frame_shadow: alloc::vec::Vec::new(),
+            frames_published: 0,
+            top_frame_roots: Vec::new(),
+        };
+        call(&mut ctx, funcs, id, args).and_then(|v| drain_microtasks(&mut ctx, funcs).map(|()| v))
+    };
+    *host.realm_slot() = realm;
+    result
 }
 
 fn call(ctx: &mut Ctx, funcs: &[FnProto], id: usize, args: &[NanBox]) -> Result<NanBox, VmError> {
@@ -642,7 +756,7 @@ fn call_with(
 ) -> Result<NanBox, VmError> {
     // Recursion guard: throw a catchable `RangeError` rather than overflowing.
     if ctx.call_depth >= ctx.realm.limits.max_call_depth {
-        let e = make_error(ctx.realm, "RangeError", "Maximum call stack size exceeded");
+        let e = vm_error(ctx, "RangeError", "Maximum call stack size exceeded");
         return Err(VmError::Thrown(e));
     }
     ctx.call_depth += 1;
@@ -683,7 +797,7 @@ fn call_with_inner(
         // a callee array's slot 0), so a hostile script can make it point past the
         // function table. Surface a catchable TypeError instead of indexing OOB.
         let Some(proto) = funcs.get(id) else {
-            let e = make_error(ctx.realm, "TypeError", "not a function");
+            let e = vm_error(ctx, "TypeError", "not a function");
             return Err(VmError::Thrown(e));
         };
         let mut regs: Vec<NanBox> = vec![NanBox::undefined(); proto.n_regs];
@@ -940,6 +1054,7 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
     let mut regs: Vec<NanBox> = vec![NanBox::undefined(); register_count];
     let mut ctx = Ctx {
         realm,
+        host: None,
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
         tiers: alloc::collections::BTreeMap::new(),
@@ -1207,7 +1322,7 @@ fn vm_call_native(
             }
         });
         if let Some(msg) = bad {
-            let e = make_error(ctx.realm, "TypeError", msg);
+            let e = vm_error(ctx, "TypeError", msg);
             return Err(VmError::Thrown(e));
         }
         Ok(NanBox::number(ctx.realm.to_number(prim)))
@@ -1362,8 +1477,8 @@ fn vm_get_prop(
                     } else {
                         "undefined"
                     };
-                    let e = make_error(
-                        ctx.realm,
+                    let e = vm_error(
+                        ctx,
                         "TypeError",
                         &alloc::format!("Cannot read properties of {what} (reading '{key}')"),
                     );
@@ -1522,7 +1637,7 @@ fn vm_set_prop(
             }
             ctx.realm.set_array_length(handle, n as usize);
         } else {
-            let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+            let e = vm_error(ctx, "RangeError", "Invalid array length");
             return Err(VmError::Thrown(e));
         }
         return Ok(());
@@ -1534,7 +1649,7 @@ fn vm_set_prop(
         && (i as u64) < u64::from(u32::MAX)
     {
         if i >= ctx.realm.limits.max_array_len {
-            let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+            let e = vm_error(ctx, "RangeError", "Invalid array length");
             return Err(VmError::Thrown(e));
         }
         if ctx.realm.array_index_has_override(handle, i) {
@@ -1883,7 +1998,7 @@ fn jit_finish(ctx: &mut Ctx, r: Result<NanBox, VmError>) -> u64 {
             NanBox::jit_throw_bits()
         }
         Err(_) => {
-            let e = make_error(ctx.realm, "Error", "JIT bin fault");
+            let e = vm_error(ctx, "Error", "JIT bin fault");
             ctx.jit_pending = Some(e);
             NanBox::jit_throw_bits()
         }
@@ -2022,7 +2137,7 @@ pub(crate) extern "C" fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64, b: 
         // `vm_add` only ever yields `Ok` or `Thrown`; a non-throw fault can't be
         // carried through a NanBox, so surface it as a thrown generic error.
         Err(_) => {
-            let e = make_error(ctx.realm, "Error", "JIT add fault");
+            let e = vm_error(ctx, "Error", "JIT add fault");
             ctx.jit_pending = Some(e);
             NanBox::jit_throw_bits()
         }
@@ -2156,11 +2271,7 @@ fn call_generic(
             .take()
             .or_else(|| ctx.jit_pending.take().map(VmError::Thrown))
             .unwrap_or_else(|| {
-                VmError::Thrown(make_error(
-                    ctx.realm,
-                    "Error",
-                    "JIT throw without pending value",
-                ))
+                VmError::Thrown(vm_error(ctx, "Error", "JIT throw without pending value"))
             });
         Some(Err(err))
     } else {
@@ -2938,7 +3049,7 @@ fn run_frame(
                 // Defence in depth: the verifier rejects oversized lengths, but the
                 // call-free `run` entrypoint runs unverified ops, so cap here too.
                 if *len > ctx.realm.limits.max_array_len {
-                    let e = make_error(ctx.realm, "RangeError", "Array length too large");
+                    let e = vm_error(ctx, "RangeError", "Array length too large");
                     return Err(VmError::Thrown(e));
                 }
                 let handle = ctx.realm.new_array(vec![NanBox::undefined(); *len]);
@@ -2950,7 +3061,7 @@ fn run_frame(
                     // A number is the length: must be a non-negative integer that
                     // fits uint32 (and, to avoid OOM in this dense model, a sane cap).
                     if n < 0.0 || n > f64::from(u32::MAX) || n != f64::from(n as u32) {
-                        let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+                        let e = vm_error(ctx, "RangeError", "Invalid array length");
                         return Err(VmError::Thrown(e));
                     }
                     // The array is *sparse*: its indices are holes (absent),
@@ -3383,7 +3494,13 @@ fn run_frame(
                     let mut cur = Some(h);
                     while let Some(c) = cur {
                         if let Some((getter, _)) = ctx.realm.accessor(c, key) {
-                            if getter.as_handle().is_some() {
+                            // A *native* getter (an intrinsic prototype's, reached now
+                            // that hosted objects have real prototypes) is not a user
+                            // method: leave it to the by-name built-ins below.
+                            if getter
+                                .as_handle()
+                                .is_some_and(|g| !ctx.realm.is_callable_cell(Handle::from_raw(g)))
+                            {
                                 // Publish this frame's registers so a collection at a back-edge inside
                                 // the callee can see them (see `Ctx::frame_shadow`).
                                 let pub_mark = ctx.frame_shadow.len();
@@ -3403,7 +3520,12 @@ fn run_frame(
                             return None;
                         }
                         if let Some(v) = ctx.realm.get_property(c, key) {
-                            return v.as_handle().map(|_| v);
+                            // Likewise a native method (`Object.prototype.hasOwnProperty`
+                            // on a hosted object): the VM's by-name dispatch still
+                            // serves it, exactly as when there was no prototype.
+                            return v.as_handle().and_then(|h| {
+                                (!ctx.realm.is_callable_cell(Handle::from_raw(h))).then_some(v)
+                            });
                         }
                         cur = ctx.realm.object_proto(c);
                     }
@@ -3503,7 +3625,7 @@ fn run_frame(
                 // handler stack so it can't grow without limit (OOM). Surface a
                 // catchable RangeError rather than aborting.
                 if handlers.len() >= ctx.realm.limits.max_handler_depth {
-                    let e = make_error(ctx.realm, "RangeError", "Handler stack overflow");
+                    let e = vm_error(ctx, "RangeError", "Handler stack overflow");
                     handle_throw!(VmError::Thrown(e));
                 } else {
                     handlers.push((*target, *reg));
@@ -3648,7 +3770,7 @@ fn json_parse(ctx: &mut Ctx, funcs: &[FnProto], args: &[NanBox]) -> Result<NanBo
         .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
     let value = match crate::json::parse(ctx.realm, &s) {
         Ok(v) => v,
-        Err(msg) => return Err(VmError::Thrown(make_error(ctx.realm, "SyntaxError", &msg))),
+        Err(msg) => return Err(VmError::Thrown(vm_error(ctx, "SyntaxError", &msg))),
     };
     let reviver = args.get(1).copied().unwrap_or(NanBox::undefined());
     if reviver
@@ -3675,8 +3797,8 @@ fn json_revive(
     depth: usize,
 ) -> Result<NanBox, VmError> {
     if depth >= ctx.realm.limits.max_json_depth {
-        return Err(VmError::Thrown(make_error(
-            ctx.realm,
+        return Err(VmError::Thrown(vm_error(
+            ctx,
             "RangeError",
             "Maximum JSON nesting depth exceeded",
         )));
@@ -3760,8 +3882,8 @@ fn json_normalize(
     depth: usize,
 ) -> Result<NanBox, VmError> {
     if depth >= ctx.realm.limits.max_json_depth {
-        return Err(VmError::Thrown(make_error(
-            ctx.realm,
+        return Err(VmError::Thrown(vm_error(
+            ctx,
             "RangeError",
             "Maximum JSON nesting depth exceeded",
         )));
@@ -3798,8 +3920,8 @@ fn json_normalize(
     {
         if let Some(elems) = ctx.realm.array_elements(h).map(<[_]>::to_vec) {
             if seen.contains(&h) {
-                return Err(VmError::Thrown(make_error(
-                    ctx.realm,
+                return Err(VmError::Thrown(vm_error(
+                    ctx,
                     "TypeError",
                     "Converting circular structure to JSON",
                 )));
@@ -3825,8 +3947,8 @@ fn json_normalize(
         }
         if let Some(keys) = ctx.realm.object_keys(h) {
             if seen.contains(&h) {
-                return Err(VmError::Thrown(make_error(
-                    ctx.realm,
+                return Err(VmError::Thrown(vm_error(
+                    ctx,
                     "TypeError",
                     "Converting circular structure to JSON",
                 )));
@@ -4053,7 +4175,7 @@ fn vm_set_elem(
             // `Op::SetElem`).
             let i = n as usize;
             if i >= ctx.realm.limits.max_array_len {
-                let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+                let e = vm_error(ctx, "RangeError", "Invalid array length");
                 return Err(VmError::Thrown(e));
             }
             // A demoted / accessor index (or frozen/sealed array) needs the
@@ -4082,7 +4204,7 @@ fn vm_set_elem(
                     }
                     ctx.realm.set_array_length(handle, n as usize);
                 } else {
-                    let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+                    let e = vm_error(ctx, "RangeError", "Invalid array length");
                     return Err(VmError::Thrown(e));
                 }
                 return Ok(());
@@ -4100,7 +4222,7 @@ fn vm_set_elem(
                 && (i as u64) < u64::from(u32::MAX)
             {
                 if i >= ctx.realm.limits.max_array_len {
-                    let e = make_error(ctx.realm, "RangeError", "Invalid array length");
+                    let e = vm_error(ctx, "RangeError", "Invalid array length");
                     return Err(VmError::Thrown(e));
                 }
                 if ctx.realm.array_index_has_override(handle, i) {
@@ -4373,8 +4495,8 @@ fn regex_method(
     let unicode = flags.contains('u');
     // `replaceAll` requires a global RegExp.
     if !global && key == "replaceAll" {
-        return Some(Err(VmError::Thrown(make_error(
-            ctx.realm,
+        return Some(Err(VmError::Thrown(vm_error(
+            ctx,
             "TypeError",
             "replaceAll must be called with a global RegExp",
         ))));
@@ -4643,8 +4765,8 @@ fn builtin_method(
         if matches!(key, "push" | "pop" | "shift" | "unshift")
             && ctx.realm.array_length_is_readonly(h)
         {
-            let e = make_error(
-                ctx.realm,
+            let e = vm_error(
+                ctx,
                 "TypeError",
                 "Cannot assign to read only property 'length' of object '[object Array]'",
             );
@@ -4835,8 +4957,8 @@ fn builtin_method(
                 let mut acc = args.get(1).copied();
                 // Empty array with no seed is a TypeError.
                 if acc.is_none() && elems(ctx).is_empty() {
-                    let e = make_error(
-                        ctx.realm,
+                    let e = vm_error(
+                        ctx,
                         "TypeError",
                         "Reduce of empty array with no initial value",
                     );
@@ -4961,7 +5083,7 @@ fn builtin_method(
                     || !nf.is_finite()
                     || total.is_none_or(|t| t > ctx.realm.limits.max_string_len)
                 {
-                    let e = make_error(ctx.realm, "RangeError", "Invalid string length");
+                    let e = vm_error(ctx, "RangeError", "Invalid string length");
                     return Some(Err(VmError::Thrown(e)));
                 }
                 NanBox::handle(ctx.realm.new_string(&s.repeat(n)).to_raw())
@@ -5104,16 +5226,16 @@ fn vm_array_from(ctx: &mut Ctx, funcs: &[FnProto], args: &[NanBox]) -> Result<Na
             .map(Handle::from_raw)
             .is_some_and(|h| ctx.realm.is_vm_function(h) || ctx.realm.is_callable_cell(h))
     {
-        return Err(VmError::Thrown(make_error(
-            ctx.realm,
+        return Err(VmError::Thrown(vm_error(
+            ctx,
             "TypeError",
             "Array.from mapFn is not a function",
         )));
     }
     // items is ToObject'd — null/undefined is a TypeError.
     if matches!(items_box.unpack(), Unpacked::Undefined | Unpacked::Null) {
-        return Err(VmError::Thrown(make_error(
-            ctx.realm,
+        return Err(VmError::Thrown(vm_error(
+            ctx,
             "TypeError",
             "Array.from requires an array-like or iterable object, not null/undefined",
         )));
@@ -5158,8 +5280,8 @@ fn vm_array_from(ctx: &mut Ctx, funcs: &[FnProto], args: &[NanBox]) -> Result<Na
                 .map(|v| ctx.realm.to_number(v))
                 .unwrap_or(0.0);
             if len_raw > ctx.realm.limits.max_array_len as f64 {
-                return Err(VmError::Thrown(make_error(
-                    ctx.realm,
+                return Err(VmError::Thrown(vm_error(
+                    ctx,
                     "RangeError",
                     "Invalid array length",
                 )));
@@ -5211,8 +5333,8 @@ fn vm_object_kv(
     use crate::nanbox::Unpacked;
     let recv = args.first().copied().unwrap_or(NanBox::undefined());
     if matches!(recv.unpack(), Unpacked::Null | Unpacked::Undefined) {
-        let e = make_error(
-            ctx.realm,
+        let e = vm_error(
+            ctx,
             "TypeError",
             "Object.keys/values/entries called on null or undefined",
         );
@@ -5271,6 +5393,13 @@ fn vm_object_kv(
 fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
     match native {
         NB_CONSOLE_LOG => {
+            // A hosted run logs through the host's console: same formatting as
+            // the interpreter, one output stream. (A throw from it is dropped
+            // here — this native path has no throw channel — as the VM's own
+            // formatter never threw either.)
+            if with_host(ctx, |h| h.console_log(args)).is_some() {
+                return NanBox::undefined();
+            }
             let line: Vec<String> = args
                 .iter()
                 .map(|a| ctx.realm.to_display_string(*a))
@@ -5861,10 +5990,12 @@ pub fn execute_typed_interruptible(
     let Ok(protos) = compile_program(&program) else {
         return crate::nbexec::eval_source_typed_interruptible(source, limits, interrupt);
     };
-    let mut realm = Realm::with_limits(limits);
-    realm.interrupt = interrupt.clone();
-    match run_program_capturing(&mut realm, &protos, 0, &[]) {
-        Ok((value, output)) => Ok((output, realm.to_display_string(value))),
+    // Run inside an interpreter (`ROADMAP.md` §2.0), as the multi-script entry
+    // does: one realm, one global environment, one console.
+    let mut interp = crate::nbexec::Interp::new_with_limits(limits);
+    interp.realm_mut().interrupt = interrupt.clone();
+    match run_program_hosted(&mut interp, &protos, 0, &[]) {
+        Ok(value) => Ok((String::from(interp.output()), interp.display(value))),
         // An interrupt is a *deadline*, not a construct the VM cannot lower:
         // re-running on the tree-walker would restart the runaway program from
         // the top, so it propagates instead of taking the fallback below.
@@ -5928,21 +6059,25 @@ pub fn execute_scripts_typed(
         };
         compiled.push(protos);
     }
-    let mut realm = Realm::with_limits(limits);
-    let mut output = String::new();
+    // The scripts run inside one interpreter (`ROADMAP.md` §2.0): its realm,
+    // global environment, intrinsics and console serve the VM.
+    let mut interp = crate::nbexec::Interp::new_with_limits(limits);
     let mut completion = String::new();
     for protos in &compiled {
-        match run_program_capturing(&mut realm, protos, 0, &[]) {
-            Ok((value, out)) => {
-                output.push_str(&out);
-                completion = realm.to_display_string(value);
+        match run_program_hosted(&mut interp, protos, 0, &[]) {
+            Ok(value) => completion = interp.display(value),
+            Err(VmError::Thrown(v)) if vm_strict() => {
+                return Err(crate::nbexec::thrown_from_exec_error(
+                    &interp,
+                    crate::nbexec::ExecError::Throw(v),
+                    crate::nbexec::ErrorPhase::Runtime,
+                ));
             }
-            Err(VmError::Thrown(v)) if vm_strict() => return Err(vm_thrown(&realm, v)),
             Err(e) if vm_strict() => return Err(vm_fallback(&alloc::format!("runtime: {e:?}"))),
             Err(_) => return crate::nbexec::eval_scripts_typed(sources, limits),
         }
     }
-    Ok((output, completion))
+    Ok((String::from(interp.output()), completion))
 }
 
 /// Whether `KATAAN_VM_STRICT` is set: the script entries then report a program
@@ -5967,22 +6102,6 @@ fn vm_fallback(reason: &str) -> crate::nbexec::Thrown {
         phase: crate::nbexec::ErrorPhase::Runtime,
         name: String::from("VmFallback"),
         message: String::from(reason),
-    }
-}
-
-/// A value thrown out of the bytecode tier as a [`Thrown`](crate::nbexec::Thrown):
-/// an object's own `name`/`message` (how the VM builds its errors), or the
-/// display string of a thrown primitive.
-fn vm_thrown(realm: &Realm, v: NanBox) -> crate::nbexec::Thrown {
-    let field = |key: &str| {
-        v.as_handle()
-            .and_then(|raw| realm.get_property(Handle::from_raw(raw), key))
-            .map(|f| realm.to_display_string(f))
-    };
-    crate::nbexec::Thrown {
-        phase: crate::nbexec::ErrorPhase::Runtime,
-        name: field("name").unwrap_or_default(),
-        message: field("message").unwrap_or_else(|| realm.to_display_string(v)),
     }
 }
 
@@ -12366,6 +12485,7 @@ mod generic_jit_tests {
     fn mk_ctx(realm: &mut Realm) -> Ctx<'_> {
         Ctx {
             realm,
+            host: None,
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
             tiers: alloc::collections::BTreeMap::new(),
