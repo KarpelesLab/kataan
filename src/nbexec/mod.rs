@@ -7521,7 +7521,7 @@ fn unwrap_labelled(stmt: &Stmt) -> &Stmt {
     cur
 }
 
-fn collect_var_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
+pub(crate) fn collect_var_names<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a str>) {
     use crate::ast::VarDeclKind;
     fn from_decl<'a>(decl: &'a crate::ast::VarDecl, out: &mut Vec<&'a str>) {
         if matches!(decl.kind, VarDeclKind::Var) {
@@ -9635,6 +9635,110 @@ impl crate::nbvm::VmHost for Interp<'_> {
         self.call_with_this(log, NanBox::handle(console.to_raw()), args)
             .map(|_| ())
             .map_err(to_host)
+    }
+
+    fn global_this(&self) -> NanBox {
+        self.global_this
+    }
+
+    fn read_global(&mut self, name: &str) -> Result<NanBox, crate::nbvm::HostError> {
+        self.read_ident_ref(name).map_err(exec_to_host)
+    }
+
+    fn typeof_global(&mut self, name: &str) -> Result<&'static str, crate::nbvm::HostError> {
+        // Mirrors the `typeof` identifier shortcut in `eval`: an unresolvable
+        // name is "undefined", never a ReferenceError.
+        if self.current.get(name).is_none()
+            && self.with_binding(name).is_none()
+            && !matches!(name, "undefined" | "NaN" | "Infinity")
+            && !self.global_object_provides(name)
+        {
+            return Ok("undefined");
+        }
+        let v = self.read_ident_ref(name).map_err(exec_to_host)?;
+        let t = self.unary(UnaryOp::Typeof, v).map_err(exec_to_host)?;
+        let t = self.realm.to_display_string(t);
+        Ok(TYPEOF_NAMES
+            .iter()
+            .copied()
+            .find(|n| *n == t)
+            .unwrap_or("object"))
+    }
+
+    fn write_global(
+        &mut self,
+        name: &str,
+        value: NanBox,
+        strict: bool,
+    ) -> Result<(), crate::nbvm::HostError> {
+        let saved = core::mem::replace(&mut self.strict, strict);
+        let r = self.assign_to_name(name, value);
+        self.strict = saved;
+        r.map_err(exec_to_host)
+    }
+
+    fn init_global_lexical(
+        &mut self,
+        name: &str,
+        value: NanBox,
+        konst: bool,
+    ) -> Result<(), crate::nbvm::HostError> {
+        if konst {
+            self.global_scope.declare_const(name, value);
+        } else {
+            self.global_scope.declare(name, value);
+        }
+        Ok(())
+    }
+}
+
+/// Every string `typeof` can produce, so a host reply can be a `&'static str`.
+const TYPEOF_NAMES: [&str; 8] = [
+    "undefined",
+    "object",
+    "boolean",
+    "number",
+    "bigint",
+    "string",
+    "symbol",
+    "function",
+];
+
+/// An interpreter completion as a VM host error: a JS throw keeps its value,
+/// anything else (an internal fault, a control-flow signal) faults the VM run.
+fn exec_to_host(e: ExecError) -> crate::nbvm::HostError {
+    match e {
+        ExecError::Throw(v) => crate::nbvm::HostError::Thrown(v),
+        _ => crate::nbvm::HostError::Fault,
+    }
+}
+
+impl<'a> Interp<'a> {
+    /// Prepares the interpreter to host a bytecode-VM run of `program`
+    /// (`ROADMAP.md` §2.0): the script's `GlobalDeclarationInstantiation` —
+    /// early redeclaration errors, `var`/function bindings on the global object,
+    /// lexical bindings in their temporal dead zone — done by the interpreter
+    /// itself, so both tiers agree exactly. Top-level functions are hoisted as
+    /// interpreter closures here; the VM's script body replaces each with its own
+    /// closure before any user code runs.
+    ///
+    /// # Errors
+    /// The script's early errors (a `SyntaxError` for a conflicting global
+    /// declaration).
+    pub(crate) fn prepare_script_for_vm(&mut self, program: &'a Program) -> Result<(), ExecError> {
+        self.src = &program.source;
+        if matches!(self.this_val.unpack(), Unpacked::Undefined) {
+            self.this_val = self.global_this;
+        }
+        let saved_strict = core::mem::replace(&mut self.strict, has_use_strict(&program.body));
+        let r = (|| {
+            if self.current.ptr_eq(&self.global_scope) {
+                self.global_declaration_checks(program)?;
+            }
+            self.hoist_with(&program.body, true)
+        })();
+        self.strict = saved_strict;
+        r
     }
 }
 

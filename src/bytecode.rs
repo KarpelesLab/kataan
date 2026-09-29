@@ -476,6 +476,8 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*callee)?;
             regs(args)
         }
+        Op::LoadGlobal { dst, .. } | Op::TypeofGlobal { dst, .. } => reg(*dst),
+        Op::StoreGlobal { src, .. } | Op::InitGlobal { src, .. } => reg(*src),
         Op::PopHandler => Ok(()),
     }
 }
@@ -891,6 +893,28 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*callee, out);
             w_regs(args, out);
         }
+        Op::LoadGlobal { dst, name } => {
+            w_u8(60, out);
+            w_reg(*dst, out);
+            w_str(name, out);
+        }
+        Op::TypeofGlobal { dst, name } => {
+            w_u8(61, out);
+            w_reg(*dst, out);
+            w_str(name, out);
+        }
+        Op::StoreGlobal { name, src, strict } => {
+            w_u8(62, out);
+            w_str(name, out);
+            w_reg(*src, out);
+            w_bool(*strict, out);
+        }
+        Op::InitGlobal { name, src, konst } => {
+            w_u8(63, out);
+            w_str(name, out);
+            w_reg(*src, out);
+            w_bool(*konst, out);
+        }
     }
 }
 
@@ -1158,6 +1182,24 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         59 => Op::TailCallValue {
             callee: r.reg()?,
             args: r.regs()?,
+        },
+        60 => Op::LoadGlobal {
+            dst: r.reg()?,
+            name: r.string()?,
+        },
+        61 => Op::TypeofGlobal {
+            dst: r.reg()?,
+            name: r.string()?,
+        },
+        62 => Op::StoreGlobal {
+            name: r.string()?,
+            src: r.reg()?,
+            strict: r.boolean()?,
+        },
+        63 => Op::InitGlobal {
+            name: r.string()?,
+            src: r.reg()?,
+            konst: r.boolean()?,
         },
         t => return Err(DecodeError::BadTag(t)),
     })

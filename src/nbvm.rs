@@ -84,6 +84,24 @@ pub enum Op {
     },
     /// `dst = typeof a` (a heap string).
     TypeOf { dst: Reg, a: Reg },
+    /// `dst = name` for a name bound in the global environment rather than a
+    /// register (a script's top-level declaration, a later script's reference to
+    /// an earlier one's, a built-in): resolved at run time through the host
+    /// (`ROADMAP.md` §2.0). An unresolvable name throws a `ReferenceError`.
+    LoadGlobal { dst: Reg, name: String },
+    /// `dst = typeof name` for a global-environment name: `"undefined"` rather
+    /// than a `ReferenceError` when it is unresolvable.
+    TypeofGlobal { dst: Reg, name: String },
+    /// `name = src` for a global-environment name (`PutValue`): a sloppy write
+    /// to an unresolvable name creates a global, a strict one throws.
+    StoreGlobal {
+        name: String,
+        src: Reg,
+        strict: bool,
+    },
+    /// Initializes the hoisted global lexical binding `name` (a top-level
+    /// `let`/`const`/`class`), ending its temporal dead zone.
+    InitGlobal { name: String, src: Reg, konst: bool },
     /// `dst = ~a` (bitwise NOT, `i32` semantics).
     BitNot { dst: Reg, a: Reg },
     /// `dst = -a` (numeric negation).
@@ -464,6 +482,60 @@ pub trait VmHost {
     /// # Errors
     /// A throw from `console.log` (a throwing `toString`, say), or a host fault.
     fn console_log(&mut self, args: &[NanBox]) -> Result<(), HostError>;
+    /// The global `this` value (the global object) a script's top level runs
+    /// with. Needs no realm.
+    fn global_this(&self) -> NanBox;
+    /// `GetValue` of the global-environment reference `name`, with the host's
+    /// full resolution (lexical declarations, the global object and its
+    /// accessors, the temporal dead zone).
+    ///
+    /// # Errors
+    /// `ReferenceError` for an unresolvable or uninitialized name; a throwing
+    /// accessor's value; or a host fault.
+    fn read_global(&mut self, name: &str) -> Result<NanBox, HostError>;
+    /// `typeof name` for a global-environment reference: `"undefined"` when it
+    /// is unresolvable (no `ReferenceError`), else the value's type.
+    ///
+    /// # Errors
+    /// A throw while reading a resolvable name (an accessor, the TDZ).
+    fn typeof_global(&mut self, name: &str) -> Result<&'static str, HostError>;
+    /// `PutValue` of the global-environment reference `name` in strict or
+    /// sloppy code.
+    ///
+    /// # Errors
+    /// A strict write to an unresolvable name, a write to a `const`, a throwing
+    /// setter, or a host fault.
+    fn write_global(&mut self, name: &str, value: NanBox, strict: bool) -> Result<(), HostError>;
+    /// Initializes the hoisted global lexical binding `name`.
+    ///
+    /// # Errors
+    /// A host fault (the binding was hoisted by the host beforehand).
+    fn init_global_lexical(
+        &mut self,
+        name: &str,
+        value: NanBox,
+        konst: bool,
+    ) -> Result<(), HostError>;
+}
+
+/// `GetValue` of a global-environment name. The common case — a plain,
+/// initialized binding in the host's global scope — is read without swapping
+/// the realm; anything else (an absent name, the TDZ, a global-object accessor)
+/// takes the host's full resolution. Without a host the run cannot resolve
+/// globals at all, so it faults to the tree-walker.
+fn vm_load_global(ctx: &mut Ctx, name: &str) -> Result<NanBox, VmError> {
+    if let Some(v) = ctx
+        .host
+        .as_deref()
+        .and_then(|h| h.global(name))
+        .filter(|v| !v.is_tdz())
+    {
+        return Ok(v);
+    }
+    match with_host(ctx, |h| h.read_global(name)) {
+        Some(r) => r.map_err(VmError::from),
+        None => Err(VmError::Unsupported),
+    }
 }
 
 /// Why a delegated host operation did not produce a value.
@@ -716,7 +788,13 @@ pub fn run_program_hosted(
             frames_published: 0,
             top_frame_roots: Vec::new(),
         };
-        call(&mut ctx, funcs, id, args).and_then(|v| drain_microtasks(&mut ctx, funcs).map(|()| v))
+        // A script body runs with `this` = the global object.
+        let this = ctx
+            .host
+            .as_deref()
+            .map_or(NanBox::undefined(), VmHost::global_this);
+        call_with(&mut ctx, funcs, id, args, &[], this)
+            .and_then(|v| drain_microtasks(&mut ctx, funcs).map(|()| v))
     };
     *host.realm_slot() = realm;
     result
@@ -2967,6 +3045,33 @@ fn run_frame(
             Op::TypeOf { dst, a } => {
                 let t = ctx.realm.type_of_value(regs[*a as usize]);
                 regs[*dst as usize] = NanBox::handle(ctx.realm.new_string(t).to_raw());
+            }
+            Op::LoadGlobal { dst, name } => match vm_load_global(ctx, name) {
+                Ok(v) => regs[*dst as usize] = v,
+                Err(e) => handle_throw!(e),
+            },
+            Op::TypeofGlobal { dst, name } => match with_host(ctx, |h| h.typeof_global(name)) {
+                Some(Ok(t)) => {
+                    regs[*dst as usize] = NanBox::handle(ctx.realm.new_string(t).to_raw());
+                }
+                Some(Err(e)) => handle_throw!(VmError::from(e)),
+                None => return Err(VmError::Unsupported),
+            },
+            Op::StoreGlobal { name, src, strict } => {
+                let v = regs[*src as usize];
+                match with_host(ctx, |h| h.write_global(name, v, *strict)) {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
+            }
+            Op::InitGlobal { name, src, konst } => {
+                let v = regs[*src as usize];
+                match with_host(ctx, |h| h.init_global_lexical(name, v, *konst)) {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
             }
             #[cfg(feature = "std")]
             Op::BitNot { dst, a } => {
@@ -5987,14 +6092,24 @@ pub fn execute_typed_interruptible(
     if program.source_type == crate::ast::SourceType::Module {
         return crate::nbexec::eval_source_typed_interruptible(source, limits, interrupt);
     }
-    let Ok(protos) = compile_program(&program) else {
-        return crate::nbexec::eval_source_typed_interruptible(source, limits, interrupt);
+    let mut protos = Vec::new();
+    let main = match compile_program_into(&program, true, &mut protos) {
+        Ok(main) => main,
+        Err(e) if vm_strict() => return Err(vm_fallback(&alloc::format!("compile: {e:?}"))),
+        Err(_) => return crate::nbexec::eval_source_typed_interruptible(source, limits, interrupt),
     };
     // Run inside an interpreter (`ROADMAP.md` §2.0), as the multi-script entry
     // does: one realm, one global environment, one console.
     let mut interp = crate::nbexec::Interp::new_with_limits(limits);
     interp.realm_mut().interrupt = interrupt.clone();
-    match run_program_hosted(&mut interp, &protos, 0, &[]) {
+    if let Err(e) = interp.prepare_script_for_vm(&program) {
+        return Err(crate::nbexec::thrown_from_exec_error(
+            &interp,
+            e,
+            crate::nbexec::ErrorPhase::Runtime,
+        ));
+    }
+    match run_program_hosted(&mut interp, &protos, main as usize, &[]) {
         Ok(value) => Ok((String::from(interp.output()), interp.display(value))),
         // An interrupt is a *deadline*, not a construct the VM cannot lower:
         // re-running on the tree-walker would restart the runaway program from
@@ -6004,6 +6119,12 @@ pub fn execute_typed_interruptible(
             name: alloc::string::String::from("Interrupted"),
             message: alloc::string::String::from("execution interrupted by the host"),
         }),
+        Err(VmError::Thrown(v)) if vm_strict() => Err(crate::nbexec::thrown_from_exec_error(
+            &interp,
+            crate::nbexec::ExecError::Throw(v),
+            crate::nbexec::ErrorPhase::Runtime,
+        )),
+        Err(e) if vm_strict() => Err(vm_fallback(&alloc::format!("runtime: {e:?}"))),
         Err(_) => crate::nbexec::eval_source_typed_interruptible(source, limits, interrupt),
     }
 }
@@ -6050,21 +6171,32 @@ pub fn execute_scripts_typed(
         }
         programs.push(program);
     }
-    let mut compiled = Vec::with_capacity(programs.len());
+    // One function table for all the scripts, so a closure one script creates
+    // (the harness's `assert`) stays callable from the next.
+    let mut table = Vec::new();
+    let mut mains = Vec::with_capacity(programs.len());
     for program in &programs {
-        let protos = match compile_program(program) {
-            Ok(protos) => protos,
+        match compile_program_into(program, true, &mut table) {
+            Ok(main) => mains.push(main),
             Err(e) if vm_strict() => return Err(vm_fallback(&alloc::format!("compile: {e:?}"))),
             Err(_) => return crate::nbexec::eval_scripts_typed(sources, limits),
-        };
-        compiled.push(protos);
+        }
     }
     // The scripts run inside one interpreter (`ROADMAP.md` §2.0): its realm,
-    // global environment, intrinsics and console serve the VM.
+    // global environment, intrinsics and console serve the VM. Each script's
+    // global declarations are instantiated by the interpreter just before its
+    // body runs.
     let mut interp = crate::nbexec::Interp::new_with_limits(limits);
     let mut completion = String::new();
-    for protos in &compiled {
-        match run_program_hosted(&mut interp, protos, 0, &[]) {
+    for (program, main) in programs.iter().zip(&mains) {
+        if let Err(e) = interp.prepare_script_for_vm(program) {
+            return Err(crate::nbexec::thrown_from_exec_error(
+                &interp,
+                e,
+                crate::nbexec::ErrorPhase::Runtime,
+            ));
+        }
+        match run_program_hosted(&mut interp, &table, *main as usize, &[]) {
             Ok(value) => completion = interp.display(value),
             Err(VmError::Thrown(v)) if vm_strict() => {
                 return Err(crate::nbexec::thrown_from_exec_error(
@@ -6217,6 +6349,30 @@ fn body_starts_strict(body: &[Stmt]) -> bool {
 /// # Errors
 /// Returns [`CompileError`] for unsupported constructs.
 pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> {
+    let mut table = Vec::new();
+    compile_program_into(program, false, &mut table)?;
+    Ok(table)
+}
+
+/// Compiles `program` into the shared function `table`, after any functions
+/// already there, and returns the id of its top-level body.
+///
+/// Several scripts running over one global environment share one table
+/// (`ROADMAP.md` §2.0): a function value records only its table index, so a
+/// closure one script creates stays callable from the next. `hosted` compiles
+/// for a run inside a host interpreter (see `Compiler::hosted`); a hosted
+/// script's top-level declarations must first be instantiated by the host
+/// (`Interp::prepare_script_for_vm`).
+///
+/// # Errors
+/// [`CompileError`] for a construct the bytecode compiler does not handle; the
+/// table is left unchanged.
+pub fn compile_program_into(
+    program: &Program,
+    hosted: bool,
+    table: &mut Vec<FnProto>,
+) -> Result<u32, CompileError> {
+    let base = table.len() as u32;
     // Dynamic code (`eval` / `Function`) needs the tree-walker (it accesses the
     // live lexical scope and parses source at runtime). Bail before any codegen
     // so the whole program runs on the reference engine with no partial output.
@@ -6234,13 +6390,13 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
     let mut fn_ids = alloc::collections::BTreeMap::new();
     for (i, f) in decls.iter().enumerate() {
         if let Some(id) = &f.id {
-            fn_ids.insert(String::from(&*id.name), (i + 1) as u32);
+            fn_ids.insert(String::from(&*id.name), base + (i + 1) as u32);
         }
     }
     let fn_ids = alloc::rc::Rc::new(fn_ids);
     // Scan top-level classes, reserving constructor/method ids after the
     // functions. Each `(id, params, body)` is compiled below.
-    let mut next_id = (decls.len() + 1) as u32;
+    let mut next_id = base + (decls.len() + 1) as u32;
     let mut class_map = alloc::collections::BTreeMap::new();
     let mut class_jobs: Vec<ClassJob> = Vec::new();
     let mut class_id = 0u32;
@@ -6280,7 +6436,7 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
     }
     let classes = alloc::rc::Rc::new(class_map);
 
-    let protos = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+    let protos = alloc::rc::Rc::new(core::cell::RefCell::new(core::mem::take(table)));
     let placeholder = || FnProto {
         ops: Vec::new(),
         n_regs: 0,
@@ -6295,7 +6451,7 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
     // (N+1..next_id). Nested function expressions append beyond `next_id`.
     protos
         .borrow_mut()
-        .extend((0..next_id).map(|_| placeholder()));
+        .extend((base..next_id).map(|_| placeholder()));
     // The top-level program is strict iff it opens with a `"use strict"`
     // directive; a strict program makes its top-level functions strict too.
     let program_strict = body_starts_strict(&program.body);
@@ -6309,56 +6465,70 @@ pub fn compile_program(program: &Program) -> Result<Vec<FnProto>, CompileError> 
         &program.body,
         true,
         program_strict,
-    )?;
-    protos.borrow_mut()[0] = main;
-    for (i, f) in decls.iter().enumerate() {
-        let mut proto = Compiler::compile_fn_inner(
-            &fn_ids,
-            &classes,
-            &protos,
-            &f.params,
-            &[],
-            &f.body,
-            false,
-            None,
-            &[],
-            None,
-            f.is_async,
-            program_strict,
-        )?;
-        // A function declaration's `name` is its declared identifier.
-        if let Some(id) = &f.id {
-            proto.name = alloc::string::String::from(id.name.as_ref());
+        hosted,
+    );
+    let compiled = main.and_then(|main| {
+        protos.borrow_mut()[base as usize] = main;
+        for (i, f) in decls.iter().enumerate() {
+            let mut proto = Compiler::compile_fn_inner(
+                &fn_ids,
+                &classes,
+                &protos,
+                &f.params,
+                &[],
+                &f.body,
+                false,
+                None,
+                &[],
+                None,
+                f.is_async,
+                program_strict,
+                hosted,
+            )?;
+            // A function declaration's `name` is its declared identifier.
+            if let Some(id) = &f.id {
+                proto.name = alloc::string::String::from(id.name.as_ref());
+            }
+            protos.borrow_mut()[base as usize + i + 1] = proto;
         }
-        protos.borrow_mut()[i + 1] = proto;
-    }
-    for job in &class_jobs {
-        // A subclass constructor resolves `super(...)` to the nearest ancestor
-        // constructor.
-        let super_ctor = job
-            .super_of
-            .as_deref()
-            .and_then(|name| nearest_ctor(name, &classes));
-        let proto = Compiler::compile_fn_inner(
-            &fn_ids,
-            &classes,
-            &protos,
-            job.params,
-            &[],
-            job.body,
-            false,
-            super_ctor,
-            &job.fields,
-            job.super_of.clone(),
-            false,
-            // Class bodies are always strict.
-            true,
-        )?;
-        protos.borrow_mut()[job.id as usize] = proto;
-    }
-    Ok(alloc::rc::Rc::try_unwrap(protos)
+        for job in &class_jobs {
+            // A subclass constructor resolves `super(...)` to the nearest ancestor
+            // constructor.
+            let super_ctor = job
+                .super_of
+                .as_deref()
+                .and_then(|name| nearest_ctor(name, &classes));
+            let proto = Compiler::compile_fn_inner(
+                &fn_ids,
+                &classes,
+                &protos,
+                job.params,
+                &[],
+                job.body,
+                false,
+                super_ctor,
+                &job.fields,
+                job.super_of.clone(),
+                false,
+                // Class bodies are always strict.
+                true,
+                hosted,
+            )?;
+            protos.borrow_mut()[job.id as usize] = proto;
+        }
+        Ok(())
+    });
+    // Hand the table back; on a refusal, without this program's entries.
+    *table = alloc::rc::Rc::try_unwrap(protos)
         .expect("unique proto table")
-        .into_inner())
+        .into_inner();
+    match compiled {
+        Ok(()) => Ok(base),
+        Err(e) => {
+            table.truncate(base as usize);
+            Err(e)
+        }
+    }
 }
 
 /// Maps a built-in namespace member call (`console.log`, `Math.max`/`min`/
@@ -7023,6 +7193,21 @@ struct Binding {
     cell: bool,
     /// Declared `const` (reassignment is a TypeError — routed to the tree-walker).
     konst: bool,
+    /// A binding in the *global* environment rather than a register (hosted
+    /// compilation only — see [`Compiler::hosted`]): the index of its name in
+    /// [`Compiler::global_names`] and how a write reaches it.
+    global: Option<(u32, GlobalWrite)>,
+}
+
+/// How a write to a [`Binding::global`] binding is emitted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GlobalWrite {
+    /// `PutValue` — an assignment, or a `var` initializer.
+    Put,
+    /// The initialization of a hoisted `let` / `class` binding.
+    InitLet,
+    /// The initialization of a hoisted `const` binding.
+    InitConst,
 }
 
 /// A single-pass register-allocating compiler from the AST to [`Op`]s.
@@ -7086,6 +7271,21 @@ struct Compiler {
     /// context). Nested functions inherit it (strict code's inner functions are
     /// strict). Distinct from [`Self::tail_ok`], which is mutated during `try`.
     strict: bool,
+    /// Compiling for a run inside a host interpreter (`ROADMAP.md` §2.0): names
+    /// that do not resolve lexically — built-ins, another script's declarations,
+    /// and *this* script's top-level declarations, which the host hoists into
+    /// the global environment — are read and written by name at run time
+    /// (`LoadGlobal`/`StoreGlobal`/…) instead of being refused or thrown at
+    /// compile time.
+    hosted: bool,
+    /// Whether this is a script's top-level body (`main`).
+    is_main: bool,
+    /// The declaration kind of the `var`/`let`/`const` statement whose targets
+    /// are being bound, so [`Self::declare`] can place a hosted script's
+    /// top-level declarations in the global environment.
+    decl_kind: Option<crate::ast::VarDeclKind>,
+    /// Names of the global bindings referenced by [`Binding::global`].
+    global_names: Vec<String>,
 }
 
 impl Compiler {
@@ -7103,6 +7303,7 @@ impl Compiler {
         body: &[Stmt],
         is_main: bool,
         strict: bool,
+        hosted: bool,
     ) -> Result<FnProto, CompileError> {
         Self::compile_fn_inner(
             fn_ids,
@@ -7117,6 +7318,7 @@ impl Compiler {
             None,
             false,
             strict,
+            hosted,
         )
     }
 
@@ -7134,6 +7336,7 @@ impl Compiler {
         super_class: Option<String>,
         is_async: bool,
         strict: bool,
+        hosted: bool,
     ) -> Result<FnProto, CompileError> {
         // Which of this function's own names are captured by nested functions →
         // must be cells.
@@ -7152,6 +7355,8 @@ impl Compiler {
             super_class,
             tail_ok: strict && !is_async,
             strict,
+            hosted,
+            is_main,
             ..Compiler::default()
         };
         c.scopes.push(alloc::collections::BTreeMap::new());
@@ -7180,6 +7385,7 @@ impl Compiler {
                             reg: cell,
                             cell: true,
                             konst: false,
+                            global: None,
                         };
                         c.write_var(bind, arg_regs[i]);
                         bind
@@ -7188,6 +7394,7 @@ impl Compiler {
                             reg: arg_regs[i],
                             cell: false,
                             konst: false,
+                            global: None,
                         }
                     };
                     c.scopes
@@ -7207,6 +7414,7 @@ impl Compiler {
                     reg: cap_regs[j],
                     cell: true,
                     konst: false,
+                    global: None,
                 },
             );
         }
@@ -7219,6 +7427,21 @@ impl Compiler {
                 let cur = c.read_var(b);
                 c.apply_default_named(cur, Some(def), Some(&p.target))?;
                 c.write_var(b, cur);
+            }
+        }
+        // VarDeclarationInstantiation: every `var` name in the body — however
+        // deeply it sits in blocks, loops, `try` or `switch` — is *one*
+        // function-scope binding, `undefined` until assigned, so it is readable
+        // after the block that declares it. (A parameter or capture of the same
+        // name is that binding already. A hosted script's top level hoists into
+        // the global environment instead — the host did that.)
+        if !(hosted && is_main) {
+            let mut names = Vec::new();
+            crate::nbexec::collect_var_names(body, &mut names);
+            for name in names {
+                if !c.scopes[0].contains_key(name) {
+                    c.declare(name);
+                }
             }
         }
         // Field initializers run first (constructors only): `this.field = init`.
@@ -7245,7 +7468,19 @@ impl Compiler {
                 {
                     let reg = c.alloc();
                     c.ops.push(Op::LoadFunc { dst: reg, func });
-                    c.fn_value_regs.insert(String::from(&*id.name), reg);
+                    if hosted {
+                        // The host hoisted the binding (as its own closure); make
+                        // it this function before any user code runs, so every
+                        // reader — this script, a later one, `globalThis.f` — sees
+                        // the one canonical VM closure.
+                        c.ops.push(Op::StoreGlobal {
+                            name: String::from(&*id.name),
+                            src: reg,
+                            strict: false,
+                        });
+                    } else {
+                        c.fn_value_regs.insert(String::from(&*id.name), reg);
+                    }
                 }
             }
         }
@@ -7302,6 +7537,16 @@ impl Compiler {
     /// Declares `name`, allocating a register (and a backing cell if the name is
     /// captured). Returns the binding.
     fn declare(&mut self, name: &str) -> Binding {
+        if let Some(b) = self.global_declaration(name) {
+            return b;
+        }
+        // A `var` statement binds the function-scope binding hoisted at entry,
+        // not a fresh one in the enclosing block.
+        if self.decl_kind == Some(crate::ast::VarDeclKind::Var)
+            && let Some(b) = self.scopes.first().and_then(|s| s.get(name)).copied()
+        {
+            return b;
+        }
         let reg = self.alloc();
         let cell = self.cell_names.contains(name);
         if cell {
@@ -7312,12 +7557,56 @@ impl Compiler {
             reg,
             cell,
             konst: false,
+            global: None,
         };
         self.scopes
             .last_mut()
             .expect("a scope")
             .insert(String::from(name), b);
         b
+    }
+
+    /// In a hosted script's top level, the binding `name` lives in the global
+    /// environment (the host hoisted it): a `var` anywhere in the body (it hoists
+    /// out of blocks), a `let`/`const`/`class` directly at the top. Such a
+    /// binding is *not* entered in `scopes`, so every later reference falls
+    /// through to the global environment by name.
+    fn global_declaration(&mut self, name: &str) -> Option<Binding> {
+        use crate::ast::VarDeclKind;
+        if !self.hosted || !self.is_main {
+            return None;
+        }
+        let top = self.scopes.len() == 1;
+        let write = match self.decl_kind {
+            Some(VarDeclKind::Var) => GlobalWrite::Put,
+            Some(VarDeclKind::Let) if top => GlobalWrite::InitLet,
+            Some(VarDeclKind::Const) if top => GlobalWrite::InitConst,
+            _ => return None,
+        };
+        Some(self.global_binding(name, write))
+    }
+
+    /// A [`Binding::global`] binding for `name`.
+    fn global_binding(&mut self, name: &str, write: GlobalWrite) -> Binding {
+        let idx = self.global_names.len() as u32;
+        self.global_names.push(String::from(name));
+        Binding {
+            reg: 0,
+            cell: false,
+            konst: false,
+            global: Some((idx, write)),
+        }
+    }
+
+    /// The binding a *reference* to `name` resolves to: a lexical one, else (in
+    /// a hosted compile) the global environment's; `None` when the name cannot
+    /// be resolved at compile time and there is no host to ask at run time.
+    fn resolve(&mut self, name: &str) -> Option<Binding> {
+        match self.lookup(name) {
+            Some(b) => Some(b),
+            None if self.hosted => Some(self.global_binding(name, GlobalWrite::Put)),
+            None => None,
+        }
     }
 
     /// Marks the just-declared local `name` as `const`.
@@ -7342,7 +7631,7 @@ impl Compiler {
         match target {
             Expr::Ident(id) => {
                 let b = self
-                    .lookup(&id.name)
+                    .resolve(&id.name)
                     .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
                 self.write_var(b, value_reg);
                 Ok(())
@@ -7468,7 +7757,16 @@ impl Compiler {
             self.write_var(b, value_reg);
             return Ok(());
         }
-        self.bind_pattern(target, value_reg)?;
+        // A `var` head binds the (hoisted) variable — in a hosted script's top
+        // level, the global one. A `let`/`const` head is always loop-local.
+        let saved = if *kind == crate::ast::VarDeclKind::Var {
+            self.decl_kind.replace(*kind)
+        } else {
+            self.decl_kind.take()
+        };
+        let bound = self.bind_pattern(target, value_reg);
+        self.decl_kind = saved;
+        bound?;
         // A `const` head's per-iteration binding is immutable, so a body that
         // assigns to it (`for (const x of …) { x++ }`) must reach the
         // tree-walker's TypeError rather than compile to a plain store.
@@ -7628,6 +7926,12 @@ impl Compiler {
     }
 
     fn read_var(&mut self, b: Binding) -> Reg {
+        if let Some((idx, _)) = b.global {
+            let dst = self.alloc();
+            let name = self.global_names[idx as usize].clone();
+            self.ops.push(Op::LoadGlobal { dst, name });
+            return dst;
+        }
         if b.cell {
             let dst = self.alloc();
             let idx = self.constant(NanBox::number(0.0)).expect("const");
@@ -7645,6 +7949,27 @@ impl Compiler {
     /// Emits a write of `src` into the variable bound by `b` (a cell write goes
     /// through `SetElem`).
     fn write_var(&mut self, b: Binding, src: Reg) {
+        if let Some((idx, write)) = b.global {
+            let name = self.global_names[idx as usize].clone();
+            self.ops.push(match write {
+                GlobalWrite::Put => Op::StoreGlobal {
+                    name,
+                    src,
+                    strict: self.strict,
+                },
+                GlobalWrite::InitLet => Op::InitGlobal {
+                    name,
+                    src,
+                    konst: false,
+                },
+                GlobalWrite::InitConst => Op::InitGlobal {
+                    name,
+                    src,
+                    konst: true,
+                },
+            });
+            return;
+        }
         if b.cell {
             let idx = self.constant(NanBox::number(0.0)).expect("const");
             self.ops.push(Op::SetElem {
@@ -7680,7 +8005,12 @@ impl Compiler {
                     }
                 }
                 if let Some(cid) = &class.id {
-                    self.materialize_class(&cid.name, class)?;
+                    // A class declaration binds like `let` (so a hosted script's
+                    // top-level class lands in the global environment).
+                    let saved = self.decl_kind.replace(crate::ast::VarDeclKind::Let);
+                    let r = self.materialize_class(&cid.name, class);
+                    self.decl_kind = saved;
+                    r?;
                 }
                 Ok(None)
             }
@@ -7812,6 +8142,7 @@ impl Compiler {
                                 reg: cell,
                                 cell: true,
                                 konst: false,
+                                global: None,
                             };
                             self.write_var(bind, catch_reg);
                             bind
@@ -7820,6 +8151,7 @@ impl Compiler {
                                 reg: catch_reg,
                                 cell: false,
                                 konst: false,
+                                global: None,
                             }
                         };
                         self.scopes
@@ -7870,7 +8202,10 @@ impl Compiler {
                         (&d.target, &d.init)
                         && self.classes.contains_key(&*id.name)
                     {
-                        self.materialize_class(&id.name, class)?;
+                        let saved = self.decl_kind.replace(decl.kind);
+                        let r = self.materialize_class(&id.name, class);
+                        self.decl_kind = saved;
+                        r?;
                         continue;
                     }
                     // A bare `var x;` (no initializer) that re-declares a name
@@ -7884,8 +8219,17 @@ impl Compiler {
                         && let BindingTarget::Ident(id) = &d.target
                         && self
                             .scopes
-                            .last()
+                            .first()
                             .is_some_and(|s| s.contains_key(&*id.name))
+                    {
+                        continue;
+                    }
+                    // Likewise a hosted script's top-level `var x;`: the host
+                    // hoisted the global binding, which it must not reset.
+                    if d.init.is_none()
+                        && matches!(decl.kind, crate::ast::VarDeclKind::Var)
+                        && self.hosted
+                        && self.is_main
                     {
                         continue;
                     }
@@ -7893,7 +8237,10 @@ impl Compiler {
                         Some(e) => self.expr_named(e, &d.target)?,
                         None => self.constant(NanBox::undefined())?,
                     };
-                    self.bind_pattern(&d.target, value)?;
+                    let saved_kind = self.decl_kind.replace(decl.kind);
+                    let bound = self.bind_pattern(&d.target, value);
+                    self.decl_kind = saved_kind;
+                    bound?;
                     if matches!(decl.kind, crate::ast::VarDeclKind::Const) {
                         self.mark_pattern_const(&d.target);
                     }
@@ -8437,6 +8784,16 @@ impl Compiler {
             Expr::Ident(id) => {
                 if let Some(b) = self.lookup(&id.name) {
                     Ok(self.read_var(b))
+                } else if self.hosted && !matches!(&*id.name, "undefined" | "NaN" | "Infinity") {
+                    // Hosted: every other name — a built-in, another script's
+                    // declaration, this script's own top-level ones (hoisted into
+                    // the global environment) — resolves by name at run time.
+                    let dst = self.alloc();
+                    self.ops.push(Op::LoadGlobal {
+                        dst,
+                        name: String::from(&*id.name),
+                    });
+                    Ok(dst)
                 } else if let Some(&reg) = self.fn_value_regs.get(&*id.name) {
                     // A top-level function used as a value: its one canonical
                     // closure (same handle each time → stable identity, holds
@@ -8492,6 +8849,19 @@ impl Compiler {
                 // `undefined`) or a known builtin (`Math`, `BigInt`, …) — instead
                 // goes through the normal path (the builtin bails to the
                 // tree-walker), so `typeof Math` is `"object"`, not `"undefined"`.
+                if self.hosted
+                    && matches!(op, UnaryOp::Typeof)
+                    && let Expr::Ident(id) = &**argument
+                    && self.lookup(&id.name).is_none()
+                    && !matches!(&*id.name, "undefined" | "NaN" | "Infinity")
+                {
+                    let dst = self.alloc();
+                    self.ops.push(Op::TypeofGlobal {
+                        dst,
+                        name: String::from(&*id.name),
+                    });
+                    return Ok(dst);
+                }
                 if matches!(op, UnaryOp::Typeof)
                     && let Expr::Ident(id) = &**argument
                     && self.lookup(&id.name).is_none()
@@ -8967,7 +9337,7 @@ impl Compiler {
                     match &**target {
                         Expr::Ident(id) => {
                             let b = self
-                                .lookup(&id.name)
+                                .resolve(&id.name)
                                 .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
                             let cur = self.read_var(b);
                             let c = cond(self, cur)?;
@@ -8999,7 +9369,7 @@ impl Compiler {
                 match &**target {
                     Expr::Ident(id) => {
                         let b = self
-                            .lookup(&id.name)
+                            .resolve(&id.name)
                             .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
                         let v = self.expr(value)?;
                         let src = if compound {
@@ -9046,7 +9416,7 @@ impl Compiler {
                     return Err(CompileError::Unsupported("update target"));
                 };
                 let b = self
-                    .lookup(&id.name)
+                    .resolve(&id.name)
                     .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
                 // `++`/`--` on a `const` binding is a TypeError; route the program
                 // to the tree-walker, which enforces it at the right point.
@@ -9259,7 +9629,9 @@ impl Compiler {
                 // Link the instance to the class's `.prototype` (built in
                 // `materialize_class`), so public methods/accessors are inherited
                 // (`instance.m === C.prototype.m`, no own `m`) rather than copied.
-                if let Some(cb) = self.lookup(&id.name) {
+                // The class object — a register, or (a hosted script's top-level
+                // class) the global binding — supplies `C.prototype`.
+                if let Some(cb) = self.resolve(&id.name) {
                     let cval = self.read_var(cb);
                     let proto = self.alloc();
                     self.ops.push(Op::GetProp {
@@ -9520,6 +9892,7 @@ impl Compiler {
             None,
             is_async,
             self.strict,
+            self.hosted,
         )?;
         let mut proto = proto;
         proto.name = alloc::string::String::from(name);
