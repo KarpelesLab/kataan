@@ -2349,13 +2349,19 @@ fn vm_generator_resume(
         let e = vm_error(ctx, "TypeError", "Generator is already running");
         return Err(VmError::Thrown(e));
     }
-    // Suspended inside a `yield*`: the delegation step takes every resumption.
+    // Suspended inside a `yield*` (the delegation step) or at a capturing
+    // `YieldResume`: every resumption kind lands in registers.
     let delegate = (state == GEN_SUSPENDED_YIELD)
-        .then(|| funcs.get(id).and_then(|p| p.ops.get(pc)))
+        .then(|| funcs.get(id))
         .flatten()
-        .and_then(|op| match op {
-            Op::YieldDelegate { dst, mode, .. } => Some((*dst, *mode)),
-            _ => None,
+        .and_then(|p| {
+            if let Some(Op::YieldDelegate { dst, mode, .. }) = p.ops.get(pc) {
+                return Some((*dst, *mode));
+            }
+            match pc.checked_sub(1).and_then(|i| p.ops.get(i)) {
+                Some(Op::YieldResume { dst, mode, .. }) => Some((*dst, *mode)),
+                _ => None,
+            }
         });
     // A `return(v)` at a `yield` inside a try / for-of / destructuring region
     // must run that region's cleanup (iterator closes) — the tree-walker's.
@@ -5801,11 +5807,12 @@ fn run_frame_at(
                         });
                     }
                     Ok(DelegateStep::Done(value)) => regs[*dst as usize] = value,
-                    // A forwarded return leaving an active region: the tree-walker's.
-                    Ok(DelegateStep::Return(_)) if !handlers.is_empty() => {
-                        return Err(VmError::Unsupported);
+                    // A forwarded return: the compiled code after this op
+                    // returns (running finally blocks / iterator closes).
+                    Ok(DelegateStep::Return(value)) => {
+                        regs[*dst as usize] = value;
+                        regs[*mode as usize] = NanBox::number(3.0);
                     }
-                    Ok(DelegateStep::Return(value)) => return Ok(FrameExit::Return(Some(value))),
                     Err(e) => handle_throw!(e),
                 }
             }
@@ -10840,7 +10847,16 @@ struct FinallyFrame {
     labels_len: usize,
     scope_len: usize,
     handler_depth: usize,
-    finalizer: Vec<Stmt>,
+    action: FinalAction,
+}
+
+/// What leaving a [`FinallyFrame`] abruptly runs.
+#[derive(Clone)]
+enum FinalAction {
+    /// A `finally` block.
+    Stmts(Vec<Stmt>),
+    /// IteratorClose of an array destructuring's iterator (`(iter, done)`).
+    Close(Reg, Reg),
 }
 
 /// See [`Compiler::loop_frames`].
@@ -12244,10 +12260,21 @@ impl Compiler {
         self.ops.push(Op::Move { dst: done, src: f });
         let exc = self.alloc();
         let handler = self.ops.len();
+        // A `return` leaving the destructuring (a generator resumed with
+        // `return()` at a `yield` in a default) closes its iterator.
+        self.finally_frames.push(FinallyFrame {
+            loop_len: self.loop_frames.len(),
+            cont_len: self.continue_sites.len(),
+            labels_len: self.labels.len(),
+            scope_len: self.scopes.len(),
+            handler_depth: self.handler_depth,
+            action: FinalAction::Close(iter, done),
+        });
         self.ops.push(Op::PushHandler {
             target: 0,
             reg: exc,
         });
+        self.handler_depth += 1;
         for el in els {
             match el {
                 ArrayDstr::Hole => {
@@ -12324,6 +12351,8 @@ impl Compiler {
                 }
             }
         }
+        self.handler_depth -= 1;
+        self.finally_frames.pop();
         self.ops.push(Op::PopHandler);
         self.ops.push(Op::IterClose {
             iter,
@@ -12690,7 +12719,7 @@ impl Compiler {
                     labels_len: self.labels.len(),
                     scope_len: self.scopes.len(),
                     handler_depth: self.handler_depth,
-                    finalizer: fin.to_vec(),
+                    action: FinalAction::Stmts(fin.to_vec()),
                 });
                 if let Some(f) = &frame {
                     self.finally_frames.push(f.clone());
@@ -14524,9 +14553,6 @@ impl Compiler {
                     return Err(CompileError::Unsupported("yield"));
                 }
                 if *delegate {
-                    if self.finally_depth > 0 {
-                        return Err(CompileError::Unsupported("yield inside try/finally"));
-                    }
                     if self.in_async {
                         return self.async_yield_star(argument.as_deref());
                     }
@@ -14552,10 +14578,20 @@ impl Compiler {
                         next,
                         mode,
                     });
+                    // A forwarded `return` finished (mode 3): the generator
+                    // returns the value, leaving its regions properly.
+                    let three = self.constant(NanBox::number(3.0))?;
+                    let isret = self.alloc();
+                    self.ops.push(Op::StrictEq {
+                        dst: isret,
+                        a: mode,
+                        b: three,
+                    });
+                    let skip = self.emit_jump_if_false(isret);
+                    self.emit_unwind(0, true, 0)?;
+                    self.ops.push(Op::Return { src: dst });
+                    self.patch(skip);
                     return Ok(dst);
-                }
-                if self.finally_depth > 0 {
-                    return Err(CompileError::Unsupported("yield inside try/finally"));
                 }
                 let mut src = match argument {
                     Some(e) => self.expr(e)?,
@@ -14567,9 +14603,7 @@ impl Compiler {
                     self.ops.push(Op::Await { dst: t, src });
                     src = t;
                 }
-                let dst = self.alloc();
-                self.ops.push(Op::Yield { dst, src });
-                Ok(dst)
+                self.emit_resumable_yield(src)
             }
             Expr::NewTarget(_) => match self.lookup(NT_NAME) {
                 Some(b) => Ok(self.read_var(b)),
@@ -16522,6 +16556,65 @@ impl Compiler {
         Ok(self.read_var(b))
     }
 
+    /// A generator's `yield src`: the resumption kind is captured
+    /// (`YieldResume`); `throw(e)` throws at the yield, `return(v)` returns
+    /// through the normal unwinding (finally blocks, iterator closes) — after
+    /// awaiting `v` in an async generator (a rejection throws instead).
+    fn emit_resumable_yield(&mut self, src: Reg) -> Result<Reg, CompileError> {
+        let recv = self.alloc();
+        let mode = self.alloc();
+        self.ops.push(Op::YieldResume {
+            dst: recv,
+            mode,
+            src,
+        });
+        let one = self.constant(NanBox::number(1.0))?;
+        let two = self.constant(NanBox::number(2.0))?;
+        let isret = self.alloc();
+        self.ops.push(Op::StrictEq {
+            dst: isret,
+            a: mode,
+            b: two,
+        });
+        let not_ret = self.emit_jump_if_false(isret);
+        let mut to_throw = None;
+        if self.in_async {
+            let h = self.ops.len();
+            self.ops.push(Op::PushHandler {
+                target: 0,
+                reg: recv,
+            });
+            let t = self.alloc();
+            self.ops.push(Op::Await { dst: t, src: recv });
+            self.ops.push(Op::Move { dst: recv, src: t });
+            self.ops.push(Op::PopHandler);
+            let ok = self.emit_jump();
+            self.patch_to(h, self.ops.len());
+            self.ops.push(Op::Move {
+                dst: mode,
+                src: one,
+            });
+            to_throw = Some(self.emit_jump());
+            self.patch(ok);
+        }
+        self.emit_unwind(0, true, 0)?;
+        self.ops.push(Op::Return { src: recv });
+        self.patch(not_ret);
+        if let Some(j) = to_throw {
+            self.patch(j);
+        }
+        let isthr = self.alloc();
+        self.ops.push(Op::StrictEq {
+            dst: isthr,
+            a: mode,
+            b: one,
+        });
+        let not_thr = self.emit_jump_if_false(isthr);
+        self.ops.push(Op::Throw { src: recv });
+        self.patch(not_thr);
+        Ok(recv)
+    }
+
     /// The runtime key of private name `#n`, from its class's hidden binding.
     fn private_key(&mut self, n: &str) -> Result<Reg, CompileError> {
         let b = self
@@ -17047,6 +17140,17 @@ impl Compiler {
     /// enclosing finally blocks), so its own names and jumps resolve there.
     fn inline_finalizer(&mut self, k: usize) -> Result<(), CompileError> {
         let fr = self.finally_frames[k].clone();
+        let finalizer = match fr.action {
+            FinalAction::Close(iter, done) => {
+                self.ops.push(Op::IterClose {
+                    iter,
+                    done,
+                    quiet: false,
+                });
+                return Ok(());
+            }
+            FinalAction::Stmts(ref v) => v.clone(),
+        };
         let scopes = self.scopes.split_off(fr.scope_len);
         let loops = self.loop_frames.split_off(fr.loop_len);
         let breaks = self.break_sites.split_off(fr.loop_len);
@@ -17055,7 +17159,7 @@ impl Compiler {
         let fins = self.finally_frames.split_off(k);
         let hd = core::mem::replace(&mut self.handler_depth, fr.handler_depth);
         let tail = core::mem::replace(&mut self.tail_ok, false);
-        let r = self.block_stmts(&fr.finalizer);
+        let r = self.block_stmts(&finalizer);
         self.tail_ok = tail;
         self.handler_depth = hd;
         self.finally_frames.extend(fins);
