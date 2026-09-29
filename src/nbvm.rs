@@ -293,6 +293,9 @@ pub enum Op {
     },
     /// Throws a `TypeError` with `msg`.
     ThrowTypeError { msg: String },
+    /// Maps the arguments object `args`: index `i` aliases the parameter cell
+    /// in register `reg` for each `(i, reg)` (see [`VmHost::map_arguments`]).
+    MapArguments { args: Reg, cells: Vec<(u32, Reg)> },
     /// `dst = eval(...args)` at a hosted script's top level (see
     /// [`VmHost::direct_eval`]).
     DirectEval {
@@ -965,6 +968,10 @@ pub trait VmHost {
     ) -> Result<(), HostError>;
     /// `IsConstructor(v)`.
     fn is_constructor(&mut self, v: NanBox) -> bool;
+    /// CreateMappedArgumentsObject's parameter map for a VM function: index
+    /// `i` of `args_obj` aliases the parameter cell `cell` (a one-element
+    /// array) for each `(i, cell)`.
+    fn map_arguments(&mut self, args_obj: NanBox, cells: &[(usize, NanBox)]);
     /// `(%GeneratorFunction.prototype%, %GeneratorPrototype%)`, or the async
     /// generator ones.
     fn generator_intrinsics(&mut self, is_async: bool) -> Option<(NanBox, NanBox)>;
@@ -1334,6 +1341,7 @@ fn vm_set_elem_mode(
     // An indexed write on a VM function (an ordinary object's index keys) is
     // the host's; the VM's element store is for arrays.
     let mut to_host = read_needs_host(ctx, recv)
+        || is_mapped_arguments(ctx.realm, recv)
         || (key.as_number().is_some()
             && recv
                 .as_handle()
@@ -1692,6 +1700,19 @@ fn yield_delegate_step(
         DelegateStep::Return(value)
     } else {
         DelegateStep::Done(value)
+    })
+}
+
+/// Marks an arguments object whose indices alias VM parameter cells: its
+/// computed reads and writes are the host's (the parameter map).
+const ARGS_MAPPED: &str = "\0argsmapped";
+
+/// Whether `v` is a mapped arguments object (see [`ARGS_MAPPED`]).
+fn is_mapped_arguments(realm: &Realm, v: NanBox) -> bool {
+    v.as_handle().is_some_and(|h| {
+        realm
+            .get_property(Handle::from_raw(h), ARGS_MAPPED)
+            .is_some()
     })
 }
 
@@ -5846,6 +5867,23 @@ fn run_frame_at(
                     None => return Err(VmError::Unsupported),
                 }
             }
+            Op::MapArguments { args, cells } => {
+                let a = regs[*args as usize];
+                let cs: Vec<(usize, NanBox)> = cells
+                    .iter()
+                    .map(|(i, r)| (*i as usize, regs[*r as usize]))
+                    .collect();
+                if with_host(ctx, |h| h.map_arguments(a, &cs)).is_none() {
+                    return Err(VmError::Unsupported);
+                }
+                if let Some(h) = a.as_handle() {
+                    ctx.realm.set_hidden_property(
+                        Handle::from_raw(h),
+                        ARGS_MAPPED,
+                        NanBox::boolean(true),
+                    );
+                }
+            }
             Op::ThrowTypeError { msg } => {
                 let e = vm_error(ctx, "TypeError", msg);
                 handle_throw!(VmError::Thrown(e));
@@ -7344,6 +7382,7 @@ fn vm_get_elem(
     key: NanBox,
 ) -> Result<NanBox, VmError> {
     if read_needs_host(ctx, recv)
+        || (ctx.host.is_some() && is_mapped_arguments(ctx.realm, recv))
         || (ctx.host.is_some()
             && (key
                 .as_handle()
@@ -9717,6 +9756,7 @@ pub fn compile_program_into(
                 None,
                 &[],
                 f.is_generator,
+                false,
             )?;
             // A function declaration's `name` is its declared identifier.
             if let Some(id) = &f.id {
@@ -9750,6 +9790,7 @@ pub fn compile_program_into(
                 &alloc::collections::BTreeMap::new(),
                 None,
                 &[],
+                false,
                 false,
             )?;
             protos.borrow_mut()[job.id as usize] = proto;
@@ -10997,9 +11038,15 @@ impl Compiler {
             None,
             &[],
             false,
+            false,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    /// [`Self::compile_fn_inner_impl`], retried with real parameter mapping
+    /// when a mapped `arguments` object's aliasing turns out to be observable
+    /// (a parameter write, or `arguments` escaping — here or in a nested
+    /// closure).
     #[allow(clippy::too_many_arguments)]
     fn compile_fn_inner(
         fn_ids: &alloc::rc::Rc<alloc::collections::BTreeMap<String, u32>>,
@@ -11020,6 +11067,80 @@ impl Compiler {
         class_ctor: Option<bool>,
         field_defs: &[FieldDef<'_>],
         is_generator: bool,
+        real_mapping: bool,
+    ) -> Result<FnProto, CompileError> {
+        let r = Self::compile_fn_inner_impl(
+            fn_ids,
+            classes,
+            protos,
+            params,
+            captures,
+            body,
+            is_main,
+            super_ctor,
+            fields,
+            super_class.clone(),
+            is_async,
+            strict,
+            hosted,
+            is_arrow,
+            cap_flags,
+            class_ctor,
+            field_defs,
+            is_generator,
+            real_mapping,
+        );
+        match r {
+            Err(CompileError::Unsupported("mapped arguments with parameters"))
+                if !real_mapping && hosted =>
+            {
+                Self::compile_fn_inner_impl(
+                    fn_ids,
+                    classes,
+                    protos,
+                    params,
+                    captures,
+                    body,
+                    is_main,
+                    super_ctor,
+                    fields,
+                    super_class,
+                    is_async,
+                    strict,
+                    hosted,
+                    is_arrow,
+                    cap_flags,
+                    class_ctor,
+                    field_defs,
+                    is_generator,
+                    true,
+                )
+            }
+            other => other,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compile_fn_inner_impl(
+        fn_ids: &alloc::rc::Rc<alloc::collections::BTreeMap<String, u32>>,
+        classes: &alloc::rc::Rc<alloc::collections::BTreeMap<String, ClassInfo>>,
+        protos: &alloc::rc::Rc<core::cell::RefCell<Vec<FnProto>>>,
+        params: &[crate::ast::Param],
+        captures: &[String],
+        body: &[Stmt],
+        is_main: bool,
+        super_ctor: Option<u32>,
+        fields: &[(String, Option<&crate::ast::Expr>)],
+        super_class: Option<String>,
+        is_async: bool,
+        strict: bool,
+        hosted: bool,
+        is_arrow: bool,
+        cap_flags: &alloc::collections::BTreeMap<String, (bool, bool, bool)>,
+        class_ctor: Option<bool>,
+        field_defs: &[FieldDef<'_>],
+        is_generator: bool,
+        real_mapping: bool,
     ) -> Result<FnProto, CompileError> {
         // The VM's `async` functions settle its *own* promise implementation,
         // which is not yet unified with the host's (`ROADMAP.md` §2.0 stage 5):
@@ -11048,6 +11169,13 @@ impl Compiler {
             }
         }
         let mut cell_names = captured_names(params, body);
+        // Real parameter mapping (see `MapArguments`): every parameter is a cell
+        // the arguments object aliases.
+        if real_mapping {
+            for p in params {
+                pattern_names(&p.target, &mut cell_names);
+            }
+        }
         let mut uses_new_target = false;
         // A non-arrow function whose nested arrows use `this` boxes it.
         if !is_arrow {
@@ -11101,7 +11229,7 @@ impl Compiler {
             protos: alloc::rc::Rc::clone(protos),
             cell_names,
             super_ctor,
-            super_class,
+            super_class: super_class.clone(),
             tail_ok: strict && !is_async && class_ctor.is_none() && !is_generator,
             in_generator: is_generator,
             in_async: is_async && hosted,
@@ -11237,7 +11365,26 @@ impl Compiler {
         // A mapped `arguments` aliases the parameters; the VM's does not. That is
         // unobservable while no parameter is written and `arguments` is only read
         // through (`arguments.length`, `arguments[i]`) — enforced by `mapped`.
-        if mapped_args {
+        if mapped_args && real_mapping {
+            // CreateMappedArgumentsObject's map: index i aliases parameter i's
+            // cell (a duplicated name maps only its last occurrence).
+            let mut cells = Vec::new();
+            for (i, p) in params.iter().enumerate() {
+                if let BindingTarget::Ident(Ident { name, .. }) = &p.target
+                    && !params[i + 1..]
+                        .iter()
+                        .any(|q| matches!(&q.target, BindingTarget::Ident(Ident { name: n, .. }) if n == name))
+                    && let Some(b) = c.scopes[0].get(&**name).copied()
+                    && b.cell
+                {
+                    cells.push((i as u32, b.reg));
+                }
+            }
+            if let Some(ab) = c.scopes[0].get("arguments").copied() {
+                let args = c.read_var(ab);
+                c.ops.push(Op::MapArguments { args, cells });
+            }
+        } else if mapped_args {
             let mut names: Vec<&str> = alloc::vec!["arguments"];
             for p in params {
                 if let BindingTarget::Ident(Ident { name, .. }) = &p.target {
@@ -15019,6 +15166,7 @@ impl Compiler {
             class_ctor,
             field_defs,
             is_generator,
+            false,
         )?;
         let mut proto = proto;
         proto.name = alloc::string::String::from(name);

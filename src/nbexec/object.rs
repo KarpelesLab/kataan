@@ -80,8 +80,8 @@ impl<'a> Interp<'a> {
         // reported `[[Value]]` is the live parameter binding it aliases. Refresh the
         // stored own data property from that binding before the generic path reads
         // it (the property is always writable while mapped, so the write succeeds).
-        if let Some((scope, param)) = self.arg_map_binding(obj, key) {
-            let value = scope.get(&param).unwrap_or_else(NanBox::undefined);
+        if let Some(r) = self.arg_map_binding(obj, key) {
+            let value = self.arg_ref_get(&r);
             self.realm.set_property(obj, key, value);
         }
         // A **String exotic object**'s own index / `length` (StringGetOwnProperty):
@@ -891,7 +891,7 @@ impl<'a> Interp<'a> {
         // preserved after the mapping breaks. The post-store mapping update (accessor
         // / value / non-writable) runs at the end, once the define has succeeded.
         let arg_binding = self.arg_map_binding(obj, key);
-        if let Some((scope, param)) = &arg_binding
+        if let Some(r) = &arg_binding
             && has_data_field
             && !self.realm.has_own(desc, "value")
             && self.realm.has_own(desc, "writable")
@@ -900,7 +900,7 @@ impl<'a> Interp<'a> {
                 .get_property(desc, "writable")
                 .is_some_and(|v| self.realm.truthy(v))
         {
-            let cur = scope.get(param).unwrap_or_else(NanBox::undefined);
+            let cur = self.arg_ref_get(r);
             self.realm.set_property(desc, "value", cur);
         }
         // Integer-indexed exotic `[[DefineOwnProperty]]` (ECMA-262 10.4.5.3): when
@@ -1299,7 +1299,7 @@ impl<'a> Interp<'a> {
         }
         // Mapped `arguments` `[[DefineOwnProperty]]` step 6: after a successful
         // define, keep the parameter binding in sync and/or break the mapping.
-        if let Some((scope, param)) = &arg_binding {
+        if let Some(r) = &arg_binding {
             if desc_is_accessor {
                 // Redefining the index as an accessor severs the alias.
                 self.arg_map_break(obj, key);
@@ -1311,7 +1311,7 @@ impl<'a> Interp<'a> {
                         .realm
                         .get_property(desc, "value")
                         .unwrap_or(NanBox::undefined());
-                    scope.set(param, v);
+                    self.arg_ref_set(r, v);
                 }
                 // Demoting the index to non-writable severs the alias.
                 if self.realm.has_own(desc, "writable")
@@ -1839,6 +1839,7 @@ impl<'a> Interp<'a> {
                     super::ArgMap {
                         scope: self.current.clone(),
                         slots,
+                        cells: alloc::collections::BTreeMap::new(),
                     },
                 );
             }
@@ -1849,14 +1850,41 @@ impl<'a> Interp<'a> {
     /// The `(scope, parameter name)` a mapped `arguments` index currently aliases,
     /// or `None` if `handle` is not a mapped arguments object or `key` is not (or
     /// no longer) a mapped index. `key` must be a canonical integer string.
-    pub(crate) fn arg_map_binding(&self, handle: Handle, key: &str) -> Option<(Scope, String)> {
+    pub(crate) fn arg_map_binding(&self, handle: Handle, key: &str) -> Option<super::ArgRef> {
         let map = self.arg_maps.get(&handle.to_raw())?;
         let i = key.parse::<usize>().ok()?;
         if alloc::format!("{i}") != key {
             return None;
         }
+        if let Some(c) = map.cells.get(&i) {
+            return Some(super::ArgRef::Cell(*c));
+        }
         let name = map.slots.get(&i)?;
-        Some((map.scope.clone(), name.clone()))
+        Some(super::ArgRef::Scope(map.scope.clone(), name.clone()))
+    }
+
+    /// The current value of the binding a mapped index aliases.
+    pub(crate) fn arg_ref_get(&self, r: &super::ArgRef) -> NanBox {
+        match r {
+            super::ArgRef::Scope(scope, name) => scope.get(name).unwrap_or_else(NanBox::undefined),
+            super::ArgRef::Cell(c) => self
+                .realm
+                .array_elements(*c)
+                .and_then(|e| e.first().copied())
+                .unwrap_or(NanBox::undefined()),
+        }
+    }
+
+    /// Writes the binding a mapped index aliases.
+    pub(crate) fn arg_ref_set(&mut self, r: &super::ArgRef, v: NanBox) {
+        match r {
+            super::ArgRef::Scope(scope, name) => {
+                scope.set(name, v);
+            }
+            super::ArgRef::Cell(c) => {
+                self.realm.set_element(*c, 0, v);
+            }
+        }
     }
 
     /// Breaks the mapping of index `key` on a mapped `arguments` object (drops its
@@ -1868,6 +1896,7 @@ impl<'a> Interp<'a> {
             && alloc::format!("{i}") == key
         {
             map.slots.remove(&i);
+            map.cells.remove(&i);
         }
     }
 

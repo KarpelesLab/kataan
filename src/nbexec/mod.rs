@@ -888,6 +888,16 @@ struct ArgMap {
     /// Currently-mapped `index → parameter name`. An index is removed when its
     /// mapping breaks (delete / accessor or non-writable redefine).
     slots: alloc::collections::BTreeMap<usize, String>,
+    /// For a bytecode-VM function's arguments object: `index → parameter cell`
+    /// (a one-element array the VM reads and writes the parameter through).
+    cells: alloc::collections::BTreeMap<usize, Handle>,
+}
+
+/// What a mapped `arguments` index aliases: an interpreter binding or a VM
+/// parameter cell.
+pub(crate) enum ArgRef {
+    Scope(Scope, String),
+    Cell(Handle),
 }
 
 /// This agent's slice of the Test262 `$262.agent` model (see the `agent` and
@@ -10075,6 +10085,34 @@ impl crate::nbvm::VmHost for Interp<'_> {
             .async_from_sync_next_args(ih, next, &[v])
             .map_err(exec_to_host)?;
         Ok(NanBox::handle(p.to_raw()))
+    }
+
+    fn map_arguments(&mut self, args_obj: NanBox, cells: &[(usize, NanBox)]) {
+        let Some(obj) = args_obj.as_handle().map(Handle::from_raw) else {
+            return;
+        };
+        // Only indices bound by an actual argument are mapped.
+        let argc = self
+            .realm
+            .get_property(obj, "length")
+            .and_then(|l| l.as_number())
+            .unwrap_or(0.0) as usize;
+        let map: alloc::collections::BTreeMap<usize, Handle> = cells
+            .iter()
+            .filter(|(i, _)| *i < argc)
+            .filter_map(|(i, c)| c.as_handle().map(|h| (*i, Handle::from_raw(h))))
+            .collect();
+        if map.is_empty() {
+            return;
+        }
+        self.arg_maps.insert(
+            obj.to_raw(),
+            ArgMap {
+                scope: self.current.clone(),
+                slots: alloc::collections::BTreeMap::new(),
+                cells: map,
+            },
+        );
     }
 
     fn generator_intrinsics(&mut self, is_async: bool) -> Option<(NanBox, NanBox)> {

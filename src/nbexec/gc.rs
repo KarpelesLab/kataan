@@ -198,6 +198,7 @@ impl<'a> Interp<'a> {
                 for (key, map) in arg_maps.borrow().iter() {
                     if marked.contains(&Handle::from_raw(*key)) {
                         map.scope.for_each_handle(&mut |h| extra.push(h));
+                        extra.extend(map.cells.values().copied());
                     }
                 }
             },

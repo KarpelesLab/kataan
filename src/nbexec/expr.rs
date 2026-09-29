@@ -3169,8 +3169,8 @@ impl<'a> Interp<'a> {
         // parameter binding it aliases (`arguments[i] = v` updates the i-th
         // parameter). Fall through to the ordinary store so the own property's
         // value stays in sync for a subsequent `getOwnPropertyDescriptor`.
-        if let Some((scope, param)) = self.arg_map_binding(handle, &name) {
-            scope.set(&param, new);
+        if let Some(r) = self.arg_map_binding(handle, &name) {
+            self.arg_ref_set(&r, new);
         }
         // A typed array's `length` is an accessor on `%TypedArray%.prototype` with
         // no setter (an integer-indexed exotic object has no own `length`), so
@@ -3620,8 +3620,8 @@ impl<'a> Interp<'a> {
         // A **mapped `arguments` index** (10.4.4.3 `[[Get]]`): the value is the live
         // parameter binding it aliases. Refresh the stored data property too so a
         // later `getOwnPropertyDescriptor` reports the current value.
-        if let Some((scope, param)) = self.arg_map_binding(handle, name) {
-            let value = scope.get(&param).unwrap_or_else(NanBox::undefined);
+        if let Some(r) = self.arg_map_binding(handle, name) {
+            let value = self.arg_ref_get(&r);
             self.realm.set_property(handle, name, value);
             return Ok(value);
         }
