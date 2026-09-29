@@ -9779,6 +9779,28 @@ impl crate::nbvm::VmHost for Interp<'_> {
         }
     }
 
+    fn set_member(
+        &mut self,
+        recv: NanBox,
+        key: NanBox,
+        value: NanBox,
+        strict: bool,
+    ) -> Result<(), crate::nbvm::HostError> {
+        let saved = core::mem::replace(&mut self.strict, strict);
+        let r = match recv.as_handle().map(Handle::from_raw) {
+            Some(h) if !self.realm.is_string_handle(h) => self.assign_member_value(h, key, value),
+            _ if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) => {
+                let m = self.new_str("Cannot set properties of null or undefined");
+                Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
+            }
+            _ => self
+                .coerce_property_key(key)
+                .and_then(|k| self.write_primitive_member_key(recv, &k, value)),
+        };
+        self.strict = saved;
+        r.map_err(exec_to_host)
+    }
+
     fn make_arguments(&mut self, args: &[NanBox], callee: NanBox, mapped: bool) -> NanBox {
         self.make_arguments_object(args, callee, mapped.then_some(&[][..]))
     }

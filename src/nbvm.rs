@@ -112,6 +112,12 @@ pub enum Op {
     /// itself is then a no-op. `mapped` selects a sloppy-mode (mapped) object;
     /// it is only compiled for a function with no parameters to alias.
     MakeArguments { dst: Reg, mapped: bool },
+    /// `obj.key = src` in strict code: like [`Op::SetProp`], but a failed write
+    /// throws (hosted runs only).
+    SetPropStrict { obj: Reg, key: String, src: Reg },
+    /// `obj[key] = src` in strict code: like [`Op::SetKey`], but a failed write
+    /// throws (hosted runs only).
+    SetKeyStrict { obj: Reg, key: Reg, src: Reg },
     /// `OrdinaryCallBindThis` for a sloppy function: an `undefined`/`null`
     /// `this` becomes the global object, a primitive one is boxed (hosted runs
     /// only).
@@ -604,6 +610,20 @@ pub trait VmHost {
     /// The read's throw (a `TypeError` for a `null`/`undefined` receiver, a
     /// throwing getter or trap), or a host fault.
     fn get_member(&mut self, recv: NanBox, key: NanBox) -> Result<NanBox, HostError>;
+    /// `PutValue` of the property reference `recv[key] = value` in strict or
+    /// sloppy code, with the host's full `[[Set]]` — proxy traps, setters,
+    /// read-only and non-extensible targets (a strict failure throws), and
+    /// primitive receivers.
+    ///
+    /// # Errors
+    /// The write's throw, or a host fault.
+    fn set_member(
+        &mut self,
+        recv: NanBox,
+        key: NanBox,
+        value: NanBox,
+        strict: bool,
+    ) -> Result<(), HostError>;
     /// A function's `arguments` object over `args` (unmapped when `mapped` is
     /// false; mapped but with no parameter aliases otherwise).
     fn make_arguments(&mut self, args: &[NanBox], callee: NanBox, mapped: bool) -> NanBox;
@@ -714,6 +734,109 @@ fn host_get(ctx: &mut Ctx, recv: NanBox, key: NanBox) -> Result<NanBox, VmError>
 fn host_get_str(ctx: &mut Ctx, recv: NanBox, key: &str) -> Result<NanBox, VmError> {
     let k = NanBox::handle(ctx.realm.new_string(key).to_raw());
     host_get(ctx, recv, k)
+}
+
+/// The host's `[[Set]]` of `recv[key] = value` (see [`VmHost::set_member`]).
+fn host_set(
+    ctx: &mut Ctx,
+    recv: NanBox,
+    key: NanBox,
+    value: NanBox,
+    strict: bool,
+) -> Result<(), VmError> {
+    with_host(ctx, |h| h.set_member(recv, key, value, strict))
+        .unwrap_or(Err(HostError::Fault))
+        .map_err(VmError::from)
+}
+
+/// Whether a hosted write of `key` on the ordinary object `h` is one the VM's
+/// own store gets exactly right: an existing writable own property, or a new
+/// one on an extensible object whose prototype chain holds neither a read-only
+/// property of that name nor a proxy. (Accessors are handled by the VM's own
+/// setter path.)
+fn plain_write_ok(realm: &Realm, h: Handle, key: &str) -> bool {
+    if realm.has_own(h, key) || realm.accessor(h, key).is_some() {
+        return !realm.property_is_readonly(h, key);
+    }
+    if !realm.is_extensible(h) {
+        return false;
+    }
+    let mut cur = realm.object_proto(h);
+    while let Some(p) = cur {
+        if realm.proxy_at(p).is_some() {
+            return false;
+        }
+        if realm.accessor(p, key).is_some() {
+            return true;
+        }
+        if realm.has_own(p, key) {
+            return !realm.property_is_readonly(p, key);
+        }
+        cur = realm.object_proto(p);
+    }
+    true
+}
+
+/// [`vm_set_prop`] with the hosted write rules: a primitive, string or proxy
+/// receiver, or a write the VM's store would get wrong (read-only, a
+/// non-extensible target, a proxy on the chain), goes to the host's `[[Set]]`
+/// with `strict` deciding whether a failed write throws — as does any case the
+/// VM declines as descriptor-sensitive.
+fn vm_set_prop_mode(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    recv: NanBox,
+    key: &str,
+    value: NanBox,
+    cache: &mut PropertyCache,
+    strict: bool,
+) -> Result<(), VmError> {
+    if ctx.host.is_none() {
+        return vm_set_prop(ctx, funcs, recv, key, value, cache);
+    }
+    let to_host = read_needs_host(ctx, recv)
+        || recv
+            .as_handle()
+            .is_some_and(|h| !plain_write_ok(ctx.realm, Handle::from_raw(h), key));
+    if !to_host {
+        match vm_set_prop(ctx, funcs, recv, key, value, cache) {
+            Err(VmError::Unsupported) => {}
+            r => return r,
+        }
+    }
+    let k = NanBox::handle(ctx.realm.new_string(key).to_raw());
+    host_set(ctx, recv, k, value, strict)
+}
+
+/// [`vm_set_elem`] with the hosted write rules of [`vm_set_prop_mode`].
+fn vm_set_elem_mode(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    recv: NanBox,
+    key: NanBox,
+    value: NanBox,
+    strict: bool,
+) -> Result<(), VmError> {
+    if ctx.host.is_none() {
+        return vm_set_elem(ctx, funcs, recv, key, value);
+    }
+    let mut to_host = read_needs_host(ctx, recv);
+    if !to_host
+        && key.as_number().is_none()
+        && let Some(h) = recv.as_handle().map(Handle::from_raw)
+    {
+        to_host = match vm_property_key(ctx, key) {
+            Ok(ks) => !plain_write_ok(ctx.realm, h, &ks),
+            Err(_) => true,
+        };
+    }
+    if !to_host {
+        match vm_set_elem(ctx, funcs, recv, key, value) {
+            Err(VmError::Unsupported) => {}
+            r => return r,
+        }
+    }
+    host_set(ctx, recv, key, value, strict)
 }
 
 /// The VM function `recv.key` resolves to — a *data* property holding a VM
@@ -3719,12 +3842,26 @@ fn run_frame(
                 // `obj[key] = v` write). A descriptor-aware case (demoted/frozen
                 // index, non-writable `length`) returns `Err(Unsupported)` to fault
                 // to the tree-walker, exactly as before.
-                match vm_set_elem(
+                match vm_set_elem_mode(
                     ctx,
                     funcs,
                     regs[*obj as usize],
                     regs[*key as usize],
                     regs[*src as usize],
+                    false,
+                ) {
+                    Ok(()) => {}
+                    Err(e) => handle_throw!(e),
+                }
+            }
+            Op::SetKeyStrict { obj, key, src } => {
+                match vm_set_elem_mode(
+                    ctx,
+                    funcs,
+                    regs[*obj as usize],
+                    regs[*key as usize],
+                    regs[*src as usize],
+                    true,
                 ) {
                     Ok(()) => {}
                     Err(e) => handle_throw!(e),
@@ -3908,7 +4045,16 @@ fn run_frame(
                 // Shared with the generic-JIT helper via `vm_set_prop` so the two
                 // tiers can never diverge (regex lastIndex, array length/index,
                 // accessor setter, IC in-place write, descriptor-aware fault).
-                match vm_set_prop(ctx, funcs, recv, key, value, cache) {
+                match vm_set_prop_mode(ctx, funcs, recv, key, value, cache, false) {
+                    Ok(()) => {}
+                    Err(e) => handle_throw!(e),
+                }
+            }
+            Op::SetPropStrict { obj, key, src } => {
+                let recv = regs[*obj as usize];
+                let value = regs[*src as usize];
+                let cache = site_cache!(site);
+                match vm_set_prop_mode(ctx, funcs, recv, key, value, cache, true) {
                     Ok(()) => {}
                     Err(e) => handle_throw!(e),
                 }
@@ -11240,13 +11386,22 @@ impl Compiler {
         src: Reg,
     ) -> Result<(), CompileError> {
         match property {
+            // Strict hosted code uses the store that throws on a failed write.
             PropertyKey::Computed(e) => {
                 let key = self.expr(e)?;
-                self.ops.push(Op::SetKey { obj, key, src });
+                self.ops.push(if self.hosted && self.strict {
+                    Op::SetKeyStrict { obj, key, src }
+                } else {
+                    Op::SetKey { obj, key, src }
+                });
             }
             _ => {
                 let key = static_key(property)?;
-                self.ops.push(Op::SetProp { obj, key, src });
+                self.ops.push(if self.hosted && self.strict {
+                    Op::SetPropStrict { obj, key, src }
+                } else {
+                    Op::SetProp { obj, key, src }
+                });
             }
         }
         Ok(())

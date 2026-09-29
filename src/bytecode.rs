@@ -486,6 +486,15 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
         Op::InitGlobal { src, .. } => reg(*src),
         Op::GlobalExists { dst, .. } | Op::MakeArguments { dst, .. } => reg(*dst),
         Op::InitFnPrototype { f } | Op::BindThis { this: f } => reg(*f),
+        Op::SetPropStrict { obj, src, .. } => {
+            reg(*obj)?;
+            reg(*src)
+        }
+        Op::SetKeyStrict { obj, key, src } => {
+            reg(*obj)?;
+            reg(*key)?;
+            reg(*src)
+        }
         Op::CallKey {
             dst,
             recv,
@@ -963,6 +972,18 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u8(70, out);
             w_reg(*this, out);
         }
+        Op::SetPropStrict { obj, key, src } => {
+            w_u8(71, out);
+            w_reg(*obj, out);
+            w_str(key, out);
+            w_reg(*src, out);
+        }
+        Op::SetKeyStrict { obj, key, src } => {
+            w_u8(72, out);
+            w_reg(*obj, out);
+            w_reg(*key, out);
+            w_reg(*src, out);
+        }
         Op::CallKey {
             dst,
             recv,
@@ -1295,6 +1316,16 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         },
         68 => Op::InitFnPrototype { f: r.reg()? },
         70 => Op::BindThis { this: r.reg()? },
+        71 => Op::SetPropStrict {
+            obj: r.reg()?,
+            key: r.string()?,
+            src: r.reg()?,
+        },
+        72 => Op::SetKeyStrict {
+            obj: r.reg()?,
+            key: r.reg()?,
+            src: r.reg()?,
+        },
         69 => Op::CallKey {
             dst: r.reg()?,
             recv: r.reg()?,
