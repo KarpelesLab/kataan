@@ -9785,6 +9785,7 @@ impl crate::nbvm::VmHost for Interp<'_> {
     }
 
     fn get_iterator(&mut self, v: NanBox) -> Result<(NanBox, NanBox), crate::nbvm::HostError> {
+        self.require_iterator_method(v).map_err(exec_to_host)?;
         let it = self.get_iter_object(v).map_err(exec_to_host)?;
         let next = self.read_member(it, "next").map_err(exec_to_host)?;
         Ok((NanBox::handle(it.to_raw()), next))

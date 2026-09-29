@@ -496,7 +496,7 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*key)
         }
         Op::DeleteGlobal { dst, .. } => reg(*dst),
-        Op::RequireObjectCoercible { src } => reg(*src),
+        Op::RequireObjectCoercible { src } | Op::CheckTdz { src } => reg(*src),
         Op::ToStr { dst, src } => {
             reg(*dst)?;
             reg(*src)
@@ -723,6 +723,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<Vec<FnProto>, DecodeError> {
             is_async,
             length,
             name,
+            legacy: false,
         });
     }
     Ok(protos)
@@ -1038,6 +1039,10 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
         }
         Op::RequireObjectCoercible { src } => {
             w_u8(80, out);
+            w_reg(*src, out);
+        }
+        Op::CheckTdz { src } => {
+            w_u8(83, out);
             w_reg(*src, out);
         }
         Op::ToStr { dst, src } => {
@@ -1457,6 +1462,7 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             name: r.string()?,
         },
         80 => Op::RequireObjectCoercible { src: r.reg()? },
+        83 => Op::CheckTdz { src: r.reg()? },
         81 => Op::ToStr {
             dst: r.reg()?,
             src: r.reg()?,
@@ -1790,6 +1796,7 @@ mod tests {
             is_async: false,
             length: 0,
             name: String::new(),
+            legacy: false,
         };
         let bytes = serialize(&[proto]);
 

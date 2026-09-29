@@ -163,6 +163,9 @@ pub enum Op {
     /// Throws a `TypeError` if `src` is `null` or `undefined` (an object
     /// destructuring pattern's `RequireObjectCoercible`).
     RequireObjectCoercible { src: Reg },
+    /// Throws a `ReferenceError` if `src` is the TDZ sentinel (a lexical binding
+    /// read or written by a hoisted function before its declaration ran).
+    CheckTdz { src: Reg },
     /// `dst = ToPropertyKey(src)` for an object key (its `toString` /
     /// `Symbol.toPrimitive` runs, via the host); a primitive key is copied as-is.
     ToKey { dst: Reg, src: Reg },
@@ -546,6 +549,11 @@ pub struct FnProto {
     /// `Function.prototype.name`: the function's own name, or a name inferred from
     /// the binding/property it was assigned to (empty for a truly anonymous one).
     pub name: alloc::string::String,
+    /// A sloppy, ordinary function (not strict, arrow, method, class code,
+    /// async or generator): its legacy `fn.caller`/`fn.arguments` reads are
+    /// benign (`null`) instead of the poisoned `%ThrowTypeError%`. Not part of
+    /// the portable artifact (decodes as `false`).
+    pub legacy: bool,
 }
 
 /// A queued promise reaction: run `handler(value)` then settle `result` with
@@ -2215,7 +2223,15 @@ fn vm_get_prop(
     key: &str,
     cache: &mut PropertyCache,
 ) -> Result<NanBox, VmError> {
-    if read_needs_host(ctx, recv) {
+    // A static-key read of an array's `length` or an index (`let {length} = a`,
+    // `{0: x} = a`) lives in the element store, not the named properties.
+    if read_needs_host(ctx, recv)
+        || (ctx.host.is_some()
+            && (key == "length" || key.bytes().next().is_some_and(|c| c.is_ascii_digit()))
+            && recv
+                .as_handle()
+                .is_some_and(|h| ctx.realm.array_elements(Handle::from_raw(h)).is_some()))
+    {
         return host_get_str(ctx, recv, key);
     }
     match recv.as_handle().map(Handle::from_raw) {
@@ -3869,6 +3885,16 @@ fn run_frame(
                     crate::nanbox::Unpacked::Undefined | crate::nanbox::Unpacked::Null
                 ) {
                     let e = vm_error(ctx, "TypeError", "Cannot destructure 'undefined' or 'null'");
+                    handle_throw!(VmError::Thrown(e));
+                }
+            }
+            Op::CheckTdz { src } => {
+                if regs[*src as usize].is_tdz() {
+                    let e = vm_error(
+                        ctx,
+                        "ReferenceError",
+                        "Cannot access a lexical binding before initialization",
+                    );
                     handle_throw!(VmError::Thrown(e));
                 }
             }
@@ -7433,6 +7459,7 @@ pub fn compile_program_into(
         is_async: false,
         length: 0,
         name: alloc::string::String::new(),
+        legacy: false,
     };
     // Reserve slots: main (0), top-level functions (1..=N), then class members
     // (N+1..next_id). Nested function expressions append beyond `next_id`.
@@ -7472,6 +7499,7 @@ pub fn compile_program_into(
                 program_strict,
                 hosted,
                 false,
+                &alloc::collections::BTreeMap::new(),
             )?;
             // A function declaration's `name` is its declared identifier.
             if let Some(id) = &f.id {
@@ -7502,6 +7530,7 @@ pub fn compile_program_into(
                 true,
                 hosted,
                 false,
+                &alloc::collections::BTreeMap::new(),
             )?;
             protos.borrow_mut()[job.id as usize] = proto;
         }
@@ -7626,9 +7655,7 @@ fn free_of_function(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<Str
 fn bound_names(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for p in params {
-        if let BindingTarget::Ident(Ident { name, .. }) = &p.target {
-            out.insert(String::from(&**name));
-        }
+        pattern_names(&p.target, &mut out);
     }
     for s in body {
         declared_in_stmt(s, &mut out);
@@ -7696,14 +7723,37 @@ fn captured_names(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<Strin
     bound.intersection(&nested).cloned().collect()
 }
 
+/// Collects every name a binding pattern binds (`x`, `[a, ...b]`, `{k: c = 1}`).
+fn pattern_names(t: &BindingTarget, out: &mut BTreeSet<String>) {
+    use crate::ast::ArrayPatternElement;
+    match t {
+        BindingTarget::Ident(Ident { name, .. }) => {
+            out.insert(String::from(&**name));
+        }
+        BindingTarget::Array(pat) => {
+            for el in &pat.elements {
+                match el {
+                    ArrayPatternElement::Hole => {}
+                    ArrayPatternElement::Item { target, .. }
+                    | ArrayPatternElement::Rest { target, .. } => pattern_names(target, out),
+                }
+            }
+        }
+        BindingTarget::Object(pat) => {
+            for prop in &pat.properties {
+                pattern_names(&prop.value, out);
+            }
+            if let Some(rest) = &pat.rest {
+                pattern_names(rest, out);
+            }
+        }
+    }
+}
+
 /// Collects the names declared by `s` (let/const/var/function/catch/for-head),
 /// not descending into nested functions or expressions.
 fn declared_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
-    let decl_target = |t: &BindingTarget, out: &mut BTreeSet<String>| {
-        if let BindingTarget::Ident(Ident { name, .. }) = t {
-            out.insert(String::from(&**name));
-        }
-    };
+    let decl_target = pattern_names;
     match s {
         Stmt::Var(d) => {
             for dr in &d.declarations {
@@ -8139,6 +8189,11 @@ fn scan_class<'a>(
     for m in &class.body {
         if let ClassMember::Method(m) = m {
             refuse_generator(&m.value)?;
+            // Class jobs compile as ordinary functions; an async method would
+            // lose its promise wrapper.
+            if m.value.is_async {
+                return Err(CompileError::Unsupported("async class method"));
+            }
         }
     }
     // `extends Identifier` is supported; a computed superclass falls back.
@@ -8365,6 +8420,9 @@ struct Binding {
     /// compilation only — see [`Compiler::hosted`]): the index of its name in
     /// [`Compiler::global_names`] and how a write reaches it.
     global: Option<(u32, GlobalWrite)>,
+    /// A cell that may still hold the TDZ sentinel: a body-level `let`/`const`
+    /// that a hoisted function declaration closes over, so every access checks.
+    tdz: bool,
 }
 
 /// A member assignment target evaluated ahead of its value: the object
@@ -8485,6 +8543,9 @@ struct Compiler {
     /// Annex B semantics the VM does not model, and is refused rather than
     /// silently dropped.
     hoisted_fns: BTreeSet<usize>,
+    /// Body-level lexical names pre-bound as TDZ cells whose declaration has not
+    /// been compiled yet (see [`Binding::tdz`]).
+    tdz_pending: BTreeSet<String>,
 }
 
 impl Compiler {
@@ -8519,6 +8580,7 @@ impl Compiler {
             strict,
             hosted,
             false,
+            &alloc::collections::BTreeMap::new(),
         )
     }
 
@@ -8538,6 +8600,7 @@ impl Compiler {
         strict: bool,
         hosted: bool,
         is_arrow: bool,
+        cap_flags: &alloc::collections::BTreeMap<String, (bool, bool)>,
     ) -> Result<FnProto, CompileError> {
         // The VM's `async` functions settle its *own* promise implementation,
         // which is not yet unified with the host's (`ROADMAP.md` §2.0 stage 5):
@@ -8634,6 +8697,7 @@ impl Compiler {
                             cell: true,
                             konst: false,
                             global: None,
+                            tdz: false,
                         };
                         c.write_var(bind, arg_regs[i]);
                         bind
@@ -8643,6 +8707,7 @@ impl Compiler {
                             cell: false,
                             konst: false,
                             global: None,
+                            tdz: false,
                         }
                     };
                     c.scopes
@@ -8668,8 +8733,9 @@ impl Compiler {
                 Binding {
                     reg: cap_regs[j],
                     cell: true,
-                    konst: false,
+                    konst: cap_flags.get(name).is_some_and(|f| f.1),
                     global: None,
+                    tdz: cap_flags.get(name).is_some_and(|f| f.0),
                 },
             );
         }
@@ -8714,6 +8780,73 @@ impl Compiler {
         // Function declarations directly in the body are instantiated before any
         // statement runs (they override a parameter or `var` of the same name).
         // A script body's are compiled into the function table up front.
+        // One that closes over a body-level `let`/`const` would capture it before
+        // its declaration runs: pre-bind such names as cells holding the TDZ
+        // sentinel (a hosted run; checked on every access), and refuse a class.
+        if !is_main {
+            let mut lexical = BTreeSet::new();
+            let mut consts = BTreeSet::new();
+            let mut classes = BTreeSet::new();
+            for stmt in body {
+                match stmt {
+                    Stmt::Var(d) if d.kind != crate::ast::VarDeclKind::Var => {
+                        for dr in &d.declarations {
+                            pattern_names(&dr.target, &mut lexical);
+                            if d.kind == crate::ast::VarDeclKind::Const {
+                                pattern_names(&dr.target, &mut consts);
+                            }
+                        }
+                    }
+                    Stmt::Class(class) => {
+                        if let Some(id) = &class.id {
+                            classes.insert(String::from(&*id.name));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !lexical.is_empty() || !classes.is_empty() {
+                let mut seen = BTreeSet::new();
+                for stmt in body {
+                    if let Stmt::Function(f) = stmt {
+                        seen.extend(free_of_function(&f.params, &f.body));
+                    }
+                }
+                if seen.iter().any(|n| classes.contains(n))
+                    || (!hosted && seen.iter().any(|n| lexical.contains(n)))
+                {
+                    return Err(CompileError::Unsupported(
+                        "hoisted function closing over a lexical binding",
+                    ));
+                }
+                for name in lexical.intersection(&seen) {
+                    if c.scopes[0].contains_key(name.as_str()) {
+                        // A parameter of the same name: an early error anyway.
+                        continue;
+                    }
+                    let reg = c.alloc();
+                    c.ops.push(Op::NewArray { dst: reg, len: 1 });
+                    let t = c.constant(NanBox::tdz())?;
+                    let idx = c.constant(NanBox::number(0.0))?;
+                    c.ops.push(Op::SetElem {
+                        arr: reg,
+                        index: idx,
+                        src: t,
+                    });
+                    c.scopes[0].insert(
+                        name.clone(),
+                        Binding {
+                            reg,
+                            cell: true,
+                            konst: consts.contains(name),
+                            global: None,
+                            tdz: true,
+                        },
+                    );
+                    c.tdz_pending.insert(name.clone());
+                }
+            }
+        }
         for stmt in body {
             if let Stmt::Function(f) = stmt {
                 c.hoisted_fns
@@ -8808,6 +8941,7 @@ impl Compiler {
             length,
             ops: c.ops,
             name: alloc::string::String::new(),
+            legacy: !strict && !is_arrow && !is_async && !is_main,
         })
     }
 }
@@ -8839,6 +8973,14 @@ impl Compiler {
         {
             return b;
         }
+        // A body-level `let`/`const` pre-bound as a TDZ cell (a hoisted function
+        // closes over it): its declaration initializes that cell, unchecked.
+        if self.scopes.len() == 1
+            && self.tdz_pending.remove(name)
+            && let Some(b) = self.scopes[0].get(name).copied()
+        {
+            return Binding { tdz: false, ..b };
+        }
         let reg = self.alloc();
         let cell = self.cell_names.contains(name);
         if cell {
@@ -8850,6 +8992,7 @@ impl Compiler {
             cell,
             konst: false,
             global: None,
+            tdz: false,
         };
         self.scopes
             .last_mut()
@@ -8887,6 +9030,7 @@ impl Compiler {
             cell: false,
             konst: false,
             global: Some((idx, write)),
+            tdz: false,
         }
     }
 
@@ -9436,6 +9580,9 @@ impl Compiler {
                 arr: b.reg,
                 index: idx,
             });
+            if b.tdz {
+                self.ops.push(Op::CheckTdz { src: dst });
+            }
             dst
         } else {
             b.reg
@@ -9445,6 +9592,12 @@ impl Compiler {
     /// Emits a write of `src` into the variable bound by `b` (a cell write goes
     /// through `SetElem`).
     fn write_var(&mut self, b: Binding, src: Reg) {
+        if b.tdz {
+            // An assignment before the declaration is a ReferenceError too.
+            let unchecked = Binding { tdz: false, ..b };
+            let cur = self.read_var(unchecked);
+            self.ops.push(Op::CheckTdz { src: cur });
+        }
         if let Some((idx, write)) = b.global {
             let name = self.global_names[idx as usize].clone();
             self.ops.push(match write {
@@ -9651,6 +9804,7 @@ impl Compiler {
                                 cell: true,
                                 konst: false,
                                 global: None,
+                                tdz: false,
                             };
                             self.write_var(bind, catch_reg);
                             bind
@@ -9660,6 +9814,7 @@ impl Compiler {
                                 cell: false,
                                 konst: false,
                                 global: None,
+                                tdz: false,
                             }
                         };
                         self.scopes
@@ -11045,6 +11200,9 @@ impl Compiler {
                             let cur = match key {
                                 Some(k) => {
                                     let kc = if self.hosted {
+                                        // GetValue's ToObject(base) throws before
+                                        // the key's ToPropertyKey runs.
+                                        self.ops.push(Op::RequireObjectCoercible { src: obj });
                                         let kc = self.alloc();
                                         self.ops.push(Op::ToKey { dst: kc, src: k });
                                         key = Some(kc);
@@ -11628,6 +11786,16 @@ impl Compiler {
         let is_method = core::mem::take(&mut self.next_closure_is_method);
         let constructor = self.hosted && !is_arrow && !is_async && !is_method;
         let r = self.make_closure_inner(params, body, is_async, name, is_arrow)?;
+        if is_method
+            && let Some(Op::MakeClosure { func, .. }) = self
+                .ops
+                .iter()
+                .rev()
+                .find(|op| matches!(op, Op::MakeClosure { dst, .. } if *dst == r))
+        {
+            let func = *func as usize;
+            self.protos.borrow_mut()[func].legacy = false;
+        }
         if constructor {
             self.ops.push(Op::InitFnPrototype { f: r });
         }
@@ -11676,9 +11844,18 @@ impl Compiler {
                 is_async: false,
                 length: 0,
                 name: alloc::string::String::new(),
+                legacy: false,
             });
             (p.len() - 1) as u32
         };
+        // Each capture keeps its binding's TDZ check and `const`-ness.
+        let flags: alloc::collections::BTreeMap<String, (bool, bool)> = captures
+            .iter()
+            .filter_map(|n| {
+                let b = self.lookup(n)?;
+                (b.tdz || b.konst).then(|| (n.clone(), (b.tdz, b.konst)))
+            })
+            .collect();
         let proto = Compiler::compile_fn_inner(
             &self.fn_ids,
             &self.classes,
@@ -11694,6 +11871,7 @@ impl Compiler {
             self.strict,
             self.hosted,
             is_arrow,
+            &flags,
         )?;
         let mut proto = proto;
         proto.name = alloc::string::String::from(name);
@@ -14716,6 +14894,7 @@ mod generic_jit_tests {
             is_async: false,
             length: 2,
             name: alloc::string::String::from("f"),
+            legacy: false,
         });
         (funcs, f_id)
     }
@@ -14912,6 +15091,7 @@ mod generic_jit_tests {
             is_async: false,
             length: n_params,
             name: alloc::string::String::from(name),
+            legacy: false,
         });
         id
     }

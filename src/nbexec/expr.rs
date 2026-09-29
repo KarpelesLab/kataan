@@ -3485,6 +3485,13 @@ impl<'a> Interp<'a> {
         {
             return false;
         }
+        if let Some((vm_id, _)) = self.realm.vm_function(f) {
+            return self
+                .vm_table
+                .as_ref()
+                .and_then(|t| t.get(vm_id as usize))
+                .is_some_and(|p| p.legacy);
+        }
         let Some((func_id, _)) = self.realm.function_at(f) else {
             return false;
         };
