@@ -174,6 +174,16 @@ pub enum Op {
     ToNumeric { dst: Reg, src: Reg },
     /// `dst = src ± 1` for a numeric `src` (a Number or a BigInt) — `++`/`--`.
     Step { dst: Reg, src: Reg, dec: bool },
+    /// `dst = callee.call(this, ...args)` where `args` is an array built by the
+    /// compiler (a call with spread arguments).
+    CallSpread {
+        dst: Reg,
+        callee: Reg,
+        this: Reg,
+        args: Reg,
+    },
+    /// `dst = new ctor(...args)` where `args` is a compiler-built array.
+    ConstructSpread { dst: Reg, ctor: Reg, args: Reg },
     /// `dst = ToPropertyKey(src)` for an object key (its `toString` /
     /// `Symbol.toPrimitive` runs, via the host); a primitive key is copied as-is.
     ToKey { dst: Reg, src: Reg },
@@ -740,6 +750,19 @@ pub trait VmHost {
     /// The frozen template object (with its frozen `.raw`) of tagged-template
     /// site `site`, created on first use and cached per site.
     fn template_object(&mut self, site: u64, cooked: &[Option<Vec<u8>>], raw: &[String]) -> NanBox;
+    /// `CopyDataProperties(target, source, excluded)` (object spread / object
+    /// rest): a nullish `source` copies nothing, a primitive is boxed; every own
+    /// enumerable String and Symbol key not in `excluded` is read (getters and
+    /// proxy traps fire) and defined on `target` as a data property.
+    ///
+    /// # Errors
+    /// A getter's or trap's throw.
+    fn copy_data_properties(
+        &mut self,
+        target: NanBox,
+        source: NanBox,
+        excluded: &[String],
+    ) -> Result<(), HostError>;
     /// `ToString(v)` (a symbol throws a `TypeError`; an object's string-hint
     /// `ToPrimitive` runs user code).
     ///
@@ -3909,7 +3932,11 @@ fn run_frame(
                     regs[*src as usize].unpack(),
                     crate::nanbox::Unpacked::Undefined | crate::nanbox::Unpacked::Null
                 ) {
-                    let e = vm_error(ctx, "TypeError", "Cannot destructure 'undefined' or 'null'");
+                    let e = vm_error(
+                        ctx,
+                        "TypeError",
+                        "Cannot read properties of null or undefined",
+                    );
                     handle_throw!(VmError::Thrown(e));
                 }
             }
@@ -4028,6 +4055,43 @@ fn run_frame(
                 Some(b) => regs[*dst as usize] = NanBox::boolean(b),
                 None => return Err(VmError::Unsupported),
             },
+            Op::CallSpread {
+                dst,
+                callee,
+                this,
+                args,
+            } => {
+                let argv = spread_argv(ctx, regs[*args as usize])?;
+                let (f, t) = (regs[*callee as usize], regs[*this as usize]);
+                let pub_mark = ctx.frame_shadow.len();
+                ctx.frame_shadow.extend_from_slice(regs);
+                ctx.frames_published += 1;
+                let r = call_closure(ctx, funcs, f, &argv, t);
+                ctx.frames_published -= 1;
+                ctx.frame_shadow.truncate(pub_mark);
+                match r {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
+                }
+            }
+            Op::ConstructSpread { dst, ctor, args } => {
+                let argv = spread_argv(ctx, regs[*args as usize])?;
+                let c = regs[*ctor as usize];
+                if c.as_handle()
+                    .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
+                {
+                    match vm_construct(ctx, funcs, c, &argv) {
+                        Ok(v) => regs[*dst as usize] = v,
+                        Err(e) => handle_throw!(e),
+                    }
+                    continue;
+                }
+                match with_host(ctx, |h| h.construct(c, &argv)) {
+                    Some(Ok(v)) => regs[*dst as usize] = v,
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
+            }
             Op::Construct { dst, ctor, args } => {
                 let c = regs[*ctor as usize];
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
@@ -4344,6 +4408,23 @@ fn run_frame(
                 }
                 let keys = out;
                 regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(keys).to_raw());
+            }
+            Op::ObjectSpread { dst, src } if ctx.host.is_some() => {
+                let (t, v) = (regs[*dst as usize], regs[*src as usize]);
+                match with_host(ctx, |h| h.copy_data_properties(t, v, &[])) {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
+            }
+            Op::ObjectRest { dst, src, exclude } if ctx.host.is_some() => {
+                let v = regs[*src as usize];
+                let t = NanBox::handle(ctx.realm.new_object().to_raw());
+                match with_host(ctx, |h| h.copy_data_properties(t, v, exclude)) {
+                    Some(Ok(())) => regs[*dst as usize] = t,
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
             }
             Op::ObjectSpread { dst, src } => {
                 let target = object_handle(regs[*dst as usize])?;
@@ -5451,6 +5532,20 @@ fn vm_array_len(ctx: &mut Ctx, funcs: &[FnProto], recv: NanBox) -> Result<NanBox
                 .unwrap_or(NanBox::undefined()),
         })
     }
+}
+
+/// The argument list of a spread call: the elements of the array the compiler
+/// built (holes cannot occur — spread fills every slot).
+fn spread_argv(ctx: &Ctx, args: NanBox) -> Result<Vec<NanBox>, VmError> {
+    let h = args
+        .as_handle()
+        .map(Handle::from_raw)
+        .ok_or(VmError::NotAnObject)?;
+    Ok(ctx
+        .realm
+        .array_elements(h)
+        .ok_or(VmError::NotAnObject)?
+        .to_vec())
 }
 
 fn call_closure(
@@ -7457,7 +7552,10 @@ pub fn compile_program_into(
     // Dynamic code (`eval` / `Function`) needs the tree-walker (it accesses the
     // live lexical scope and parses source at runtime). Bail before any codegen
     // so the whole program runs on the reference engine with no partial output.
-    if uses_dynamic_code(program) {
+    // A hosted run reaches `Function`/indirect `eval` through the host (they
+    // build global-scope interpreter code); only a *direct* `eval(…)` call, which
+    // needs the caller's scope, is refused — at its call site.
+    if !hosted && uses_dynamic_code(program) {
         return Err(CompileError::Unsupported("dynamic code (eval/Function)"));
     }
     for s in &program.body {
@@ -10472,6 +10570,10 @@ impl Compiler {
         {
             return Ok(false);
         }
+        if matches!(callee, Expr::Ident(id) if &*id.name == "eval") && self.lookup("eval").is_none()
+        {
+            return Ok(false);
+        }
         if matches!(callee, Expr::Super(_)) {
             return Ok(false);
         }
@@ -11011,8 +11113,52 @@ impl Compiler {
                 }
             }
             Expr::Call {
+                callee,
+                arguments,
+                optional,
+                ..
+            } if self.hosted
+                && !*optional
+                && !matches!(&**callee, Expr::Super(_))
+                && arguments
+                    .iter()
+                    .any(|a| matches!(a, crate::ast::Argument::Spread(_))) =>
+            {
+                // A spread call: the callee (and a member callee's receiver, which
+                // becomes `this`) first, then the argument list.
+                self.refuse_direct_eval(callee)?;
+                let (f, this) = match &**callee {
+                    Expr::Member {
+                        object,
+                        property,
+                        optional: false,
+                        ..
+                    } if !matches!(&**object, Expr::Super(_)) => {
+                        let recv = self.expr(object)?;
+                        (self.member_read(recv, property)?, recv)
+                    }
+                    Expr::Member { .. } | Expr::OptChain { .. } => {
+                        return Err(CompileError::Unsupported("spread argument"));
+                    }
+                    other => {
+                        let f = self.expr(other)?;
+                        (f, self.constant(NanBox::undefined())?)
+                    }
+                };
+                let args = self.spread_args(arguments)?;
+                let dst = self.alloc();
+                self.ops.push(Op::CallSpread {
+                    dst,
+                    callee: f,
+                    this,
+                    args,
+                });
+                Ok(dst)
+            }
+            Expr::Call {
                 callee, arguments, ..
             } => {
+                self.refuse_direct_eval(callee)?;
                 // Every branch below evaluates the callee (and its receiver) *before*
                 // the arguments, as `EvaluateCall` does.
                 // `super(args)` — run the base constructor on the current `this`.
@@ -11109,10 +11255,16 @@ impl Compiler {
                 if let Expr::Member {
                     object,
                     property: PropertyKey::Ident(key) | PropertyKey::Str(key),
+                    optional,
                     ..
                 } = &**callee
                 {
                     let recv = self.expr(object)?;
+                    // GetValue of the callee (a TypeError on a nullish base)
+                    // precedes the arguments.
+                    if self.hosted && !*optional {
+                        self.ops.push(Op::RequireObjectCoercible { src: recv });
+                    }
                     let args = self.call_args(arguments)?;
                     let dst = self.alloc();
                     self.ops.push(Op::CallMethod {
@@ -11134,6 +11286,9 @@ impl Compiler {
                 {
                     let recv = self.expr(object)?;
                     let key = self.expr(k)?;
+                    if self.hosted && !matches!(&**callee, Expr::Member { optional: true, .. }) {
+                        self.ops.push(Op::RequireObjectCoercible { src: recv });
+                    }
                     let args = self.call_args(arguments)?;
                     let dst = self.alloc();
                     self.ops.push(Op::CallKey {
@@ -11498,6 +11653,15 @@ impl Compiler {
                         if self.lookup(&id.name).is_none() && self.classes.contains_key(&*id.name))
                 {
                     let ctor = self.expr(callee)?;
+                    if arguments
+                        .iter()
+                        .any(|a| matches!(a, crate::ast::Argument::Spread(_)))
+                    {
+                        let args = self.spread_args(arguments)?;
+                        let dst = self.alloc();
+                        self.ops.push(Op::ConstructSpread { dst, ctor, args });
+                        return Ok(dst);
+                    }
                     let mut args = Vec::with_capacity(arguments.len());
                     for a in arguments {
                         let crate::ast::Argument::Item(e) = a else {
@@ -11859,6 +12023,49 @@ impl Compiler {
 
     /// Compiles call arguments left to right into registers (spreads are not
     /// compiled).
+    /// A hosted call's argument list with spreads, as a fresh array: each
+    /// `...x` runs the full iterator protocol through the host.
+    fn spread_args(&mut self, arguments: &[crate::ast::Argument]) -> Result<Reg, CompileError> {
+        let arr = self.alloc();
+        self.ops.push(Op::NewArray { dst: arr, len: 0 });
+        for a in arguments {
+            match a {
+                crate::ast::Argument::Item(e) => {
+                    let v = self.expr(e)?;
+                    self.ops.push(Op::ArrayPush { arr, src: v });
+                }
+                crate::ast::Argument::Spread(e) => {
+                    let src = self.expr(e)?;
+                    let (iter, next, done) = (self.alloc(), self.alloc(), self.alloc());
+                    self.ops.push(Op::IterOpen { iter, next, src });
+                    let f = self.constant(NanBox::boolean(false))?;
+                    self.ops.push(Op::Move { dst: done, src: f });
+                    let rest = self.alloc();
+                    self.ops.push(Op::IterRest {
+                        dst: rest,
+                        done,
+                        iter,
+                        next,
+                    });
+                    self.ops.push(Op::ArrayExtend { arr, src: rest });
+                }
+            }
+        }
+        Ok(arr)
+    }
+
+    /// A direct `eval(…)` call reads and writes the caller's scope, which lives
+    /// in VM registers the host cannot see: the tree-walker runs such a
+    /// program. (A locally bound `eval` is an ordinary call, as before.)
+    fn refuse_direct_eval(&self, callee: &Expr) -> Result<(), CompileError> {
+        match callee {
+            Expr::Ident(id) if &*id.name == "eval" && self.lookup("eval").is_none() => {
+                Err(CompileError::Unsupported("dynamic code (eval/Function)"))
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn call_args(&mut self, arguments: &[crate::ast::Argument]) -> Result<Vec<Reg>, CompileError> {
         let mut args = Vec::with_capacity(arguments.len());
         for a in arguments {

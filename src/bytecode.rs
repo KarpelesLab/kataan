@@ -498,6 +498,22 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
         Op::DeleteGlobal { dst, .. } => reg(*dst),
         Op::RequireObjectCoercible { src } | Op::CheckTdz { src } => reg(*src),
         Op::NewBigInt { dst, .. } => reg(*dst),
+        Op::CallSpread {
+            dst,
+            callee,
+            this,
+            args,
+        } => {
+            reg(*dst)?;
+            reg(*callee)?;
+            reg(*this)?;
+            reg(*args)
+        }
+        Op::ConstructSpread { dst, ctor, args } => {
+            reg(*dst)?;
+            reg(*ctor)?;
+            reg(*args)
+        }
         Op::ToNumeric { dst, src } | Op::Step { dst, src, .. } => {
             reg(*dst)?;
             reg(*src)
@@ -1066,6 +1082,24 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*src, out);
             w_bool(*dec, out);
         }
+        Op::CallSpread {
+            dst,
+            callee,
+            this,
+            args,
+        } => {
+            w_u8(87, out);
+            w_reg(*dst, out);
+            w_reg(*callee, out);
+            w_reg(*this, out);
+            w_reg(*args, out);
+        }
+        Op::ConstructSpread { dst, ctor, args } => {
+            w_u8(88, out);
+            w_reg(*dst, out);
+            w_reg(*ctor, out);
+            w_reg(*args, out);
+        }
         Op::ToStr { dst, src } => {
             w_u8(81, out);
             w_reg(*dst, out);
@@ -1496,6 +1530,17 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             dst: r.reg()?,
             src: r.reg()?,
             dec: r.boolean()?,
+        },
+        87 => Op::CallSpread {
+            dst: r.reg()?,
+            callee: r.reg()?,
+            this: r.reg()?,
+            args: r.reg()?,
+        },
+        88 => Op::ConstructSpread {
+            dst: r.reg()?,
+            ctor: r.reg()?,
+            args: r.reg()?,
         },
         81 => Op::ToStr {
             dst: r.reg()?,

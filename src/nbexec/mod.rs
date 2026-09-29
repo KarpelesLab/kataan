@@ -9840,6 +9840,27 @@ impl crate::nbvm::VmHost for Interp<'_> {
         Ok(result)
     }
 
+    fn copy_data_properties(
+        &mut self,
+        target: NanBox,
+        source: NanBox,
+        excluded: &[String],
+    ) -> Result<(), crate::nbvm::HostError> {
+        if matches!(source.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            return Ok(());
+        }
+        let (Some(t), Some(src)) = (
+            target.as_handle().map(Handle::from_raw),
+            self.coerce_to_object(source)
+                .as_handle()
+                .map(Handle::from_raw),
+        ) else {
+            return Err(crate::nbvm::HostError::Fault);
+        };
+        self.copy_data_properties(t, src, excluded)
+            .map_err(exec_to_host)
+    }
+
     fn template_object(&mut self, site: u64, cooked: &[Option<Vec<u8>>], raw: &[String]) -> NanBox {
         self.template_object_for_site(site as usize, cooked, raw)
     }
