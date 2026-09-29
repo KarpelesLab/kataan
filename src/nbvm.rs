@@ -237,6 +237,43 @@ pub enum Op {
     },
     /// `dst = yield src` in a generator: suspends the frame.
     Yield { dst: Reg, src: Reg },
+    /// `for await` GetIterator(src, async): `sync` records whether `iter` is a
+    /// sync iterator stepped through AsyncFromSyncIterator.
+    AsyncIterOpen {
+        iter: Reg,
+        next: Reg,
+        sync: Reg,
+        src: Reg,
+    },
+    /// `dst` = the promise of `for await`'s next iterator result (to `Await`).
+    AsyncIterStep {
+        dst: Reg,
+        iter: Reg,
+        next: Reg,
+        sync: Reg,
+    },
+    /// Starts AsyncIteratorClose: a sync-wrapped iterator is closed now
+    /// (`do_await` false); an async one's `return()` result lands in `dst` with
+    /// `do_await` true (absent `return`: false).
+    AsyncIterClose {
+        dst: Reg,
+        do_await: Reg,
+        iter: Reg,
+        sync: Reg,
+    },
+    /// A `TypeError` unless `src` is an object (an iterator result).
+    CheckObject { src: Reg },
+    /// One step of `yield*` over the iterator `iter` (with `next`): per the
+    /// resumption mode in `mode` (0 next, 1 throw, 2 return), calls the inner
+    /// iterator's method with `dst`; a not-done result is yielded as is and
+    /// this op re-runs on resumption, a done one leaves its value in `dst` and
+    /// falls through (or, for a `return`, returns it from the generator).
+    YieldDelegate {
+        dst: Reg,
+        iter: Reg,
+        next: Reg,
+        mode: Reg,
+    },
     /// `dst = await src` in a hosted async function: suspends the frame until
     /// the awaited value settles.
     Await { dst: Reg, src: Reg },
@@ -916,6 +953,19 @@ pub trait VmHost {
     /// # Errors
     /// The abrupt completion of PromiseResolve (thrown at the `await`).
     fn await_value(&mut self, v: NanBox, controller: NanBox) -> Result<(), HostError>;
+    /// GetIterator(v, async) for `for await`: `(iterator, next, sync)` — a sync
+    /// iterator (no callable `@@asyncIterator`) is stepped through
+    /// [`VmHost::async_from_sync_next`].
+    ///
+    /// # Errors
+    /// A non-iterable, or a throwing getter/method.
+    fn get_async_iterator(&mut self, v: NanBox) -> Result<(NanBox, NanBox, bool), HostError>;
+    /// %AsyncFromSyncIteratorPrototype%.next over the sync iterator `iter`: a
+    /// promise of the next iterator result.
+    ///
+    /// # Errors
+    /// A fatal (non-JS) error; JS errors reject the promise.
+    fn async_from_sync_next(&mut self, iter: NanBox, next: NanBox) -> Result<NanBox, HostError>;
     /// `obj.[[Get]](key, receiver)` (a `super.x` read).
     ///
     /// # Errors
@@ -1525,6 +1575,77 @@ fn gen_state_array(
     NanBox::handle(arr.to_raw())
 }
 
+/// The outcome of one [`Op::YieldDelegate`] step.
+enum DelegateStep {
+    /// A not-done inner result object, yielded as is.
+    Yield(NanBox),
+    /// The inner iterator is done: the `yield*` expression's value.
+    Done(NanBox),
+    /// A forwarded `return(v)` finished: the generator returns this value.
+    Return(NanBox),
+}
+
+/// One `yield*` step (ECMA-262 14.4.14, sync generators): forwards the
+/// resumption `mode` (0 next, 1 throw, 2 return) with `v` to the inner
+/// iterator `iter`.
+fn yield_delegate_step(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    iter: NanBox,
+    next: NanBox,
+    mode: u8,
+    v: NanBox,
+) -> Result<DelegateStep, VmError> {
+    let res = match mode {
+        0 => call_closure(ctx, funcs, next, &[v], iter)?,
+        1 => {
+            let m = host_get_str(ctx, iter, "throw")?;
+            if matches!(
+                m.unpack(),
+                crate::nanbox::Unpacked::Undefined | crate::nanbox::Unpacked::Null
+            ) {
+                // No `throw`: close the iterator, then a TypeError.
+                match with_host(ctx, |h| h.iter_close(iter)) {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => return Err(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
+                let e = vm_error(
+                    ctx,
+                    "TypeError",
+                    "The iterator does not provide a 'throw' method",
+                );
+                return Err(VmError::Thrown(e));
+            }
+            call_closure(ctx, funcs, m, &[v], iter)?
+        }
+        _ => {
+            let m = host_get_str(ctx, iter, "return")?;
+            if matches!(
+                m.unpack(),
+                crate::nanbox::Unpacked::Undefined | crate::nanbox::Unpacked::Null
+            ) {
+                return Ok(DelegateStep::Return(v));
+            }
+            call_closure(ctx, funcs, m, &[v], iter)?
+        }
+    };
+    if !is_object_value(ctx.realm, res) {
+        let e = vm_error(ctx, "TypeError", "Iterator result is not an object");
+        return Err(VmError::Thrown(e));
+    }
+    let done = host_get_str(ctx, res, "done")?;
+    if !ctx.realm.truthy(done) {
+        return Ok(DelegateStep::Yield(res));
+    }
+    let value = host_get_str(ctx, res, "value")?;
+    Ok(if mode == 2 {
+        DelegateStep::Return(value)
+    } else {
+        DelegateStep::Done(value)
+    })
+}
+
 /// The hidden slot of a VM async function's controller object: the array
 /// `[func id, result promise, pc, dst, registers, handlers]`.
 pub(crate) const VM_ASYNC: &str = "\0vmasync";
@@ -2113,7 +2234,17 @@ fn vm_generator_resume(
         let e = vm_error(ctx, "TypeError", "Generator is already running");
         return Err(VmError::Thrown(e));
     }
-    if state == GEN_COMPLETED || (state == GEN_SUSPENDED_START && mode != 0) || mode == 2 {
+    // Suspended inside a `yield*`: the delegation step takes every resumption.
+    let delegate = (state == GEN_SUSPENDED_YIELD)
+        .then(|| funcs.get(id).and_then(|p| p.ops.get(pc)))
+        .flatten()
+        .and_then(|op| match op {
+            Op::YieldDelegate { dst, mode, .. } => Some((*dst, *mode)),
+            _ => None,
+        });
+    if delegate.is_none()
+        && (state == GEN_COMPLETED || (state == GEN_SUSPENDED_START && mode != 0) || mode == 2)
+    {
         set_state(ctx, GEN_COMPLETED);
         return match mode {
             1 => Err(VmError::Thrown(v)),
@@ -2142,13 +2273,19 @@ fn vm_generator_resume(
                 .collect()
         })
         .unwrap_or_default();
-    if mode == 0
-        && state == GEN_SUSPENDED_YIELD
-        && let Some(slot) = regs.get_mut(dst as usize)
-    {
-        *slot = v;
-    }
-    let inject = (mode == 1).then_some(v);
+    let inject = if let Some((ddst, dmode)) = delegate {
+        regs[ddst as usize] = v;
+        regs[dmode as usize] = NanBox::number(f64::from(mode));
+        None
+    } else {
+        if mode == 0
+            && state == GEN_SUSPENDED_YIELD
+            && let Some(slot) = regs.get_mut(dst as usize)
+        {
+            *slot = v;
+        }
+        (mode == 1).then_some(v)
+    };
     let Some(proto) = funcs.get(id) else {
         return Err(VmError::Unsupported);
     };
@@ -2163,7 +2300,12 @@ fn vm_generator_resume(
         }) => {
             let st = gen_state_array(ctx, id, GEN_SUSPENDED_YIELD, pc, dst, regs, &handlers);
             ctx.realm.set_hidden_property(gh, VM_GEN, st);
-            Ok(iter_result(ctx, value, false))
+            // A `yield*` step hands the inner result object through as is.
+            if matches!(proto.ops.get(pc), Some(Op::YieldDelegate { .. })) {
+                Ok(value)
+            } else {
+                Ok(iter_result(ctx, value, false))
+            }
         }
         Ok(FrameExit::Return(ret)) => {
             set_state(ctx, GEN_COMPLETED);
@@ -5434,6 +5576,106 @@ fn run_frame_at(
                     &[("", NanBox::boolean(true)), (":g", g), (":s", st)],
                 ) {
                     handle_throw!(e);
+                }
+            }
+            Op::AsyncIterOpen {
+                iter,
+                next,
+                sync,
+                src,
+            } => {
+                let v = regs[*src as usize];
+                match with_host(ctx, |h| h.get_async_iterator(v)) {
+                    Some(Ok((i, n, sy))) => {
+                        regs[*iter as usize] = i;
+                        regs[*next as usize] = n;
+                        regs[*sync as usize] = NanBox::boolean(sy);
+                    }
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
+            }
+            Op::AsyncIterStep {
+                dst,
+                iter,
+                next,
+                sync,
+            } => {
+                let (it, nx) = (regs[*iter as usize], regs[*next as usize]);
+                let r = if regs[*sync as usize].as_boolean() == Some(true) {
+                    with_host(ctx, |h| h.async_from_sync_next(it, nx))
+                        .unwrap_or(Err(HostError::Fault))
+                        .map_err(VmError::from)
+                } else {
+                    call_closure(ctx, funcs, nx, &[], it)
+                };
+                match r {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
+                }
+            }
+            Op::AsyncIterClose {
+                dst,
+                do_await,
+                iter,
+                sync,
+            } => {
+                let it = regs[*iter as usize];
+                regs[*do_await as usize] = NanBox::boolean(false);
+                if regs[*sync as usize].as_boolean() == Some(true) {
+                    match with_host(ctx, |h| h.iter_close(it)) {
+                        Some(Ok(())) => {}
+                        Some(Err(e)) => handle_throw!(VmError::from(e)),
+                        None => return Err(VmError::Unsupported),
+                    }
+                } else {
+                    let r = host_get_str(ctx, it, "return").and_then(|m| {
+                        if matches!(
+                            m.unpack(),
+                            crate::nanbox::Unpacked::Undefined | crate::nanbox::Unpacked::Null
+                        ) {
+                            Ok(None)
+                        } else {
+                            call_closure(ctx, funcs, m, &[], it).map(Some)
+                        }
+                    });
+                    match r {
+                        Ok(Some(v)) => {
+                            regs[*dst as usize] = v;
+                            regs[*do_await as usize] = NanBox::boolean(true);
+                        }
+                        Ok(None) => {}
+                        Err(e) => handle_throw!(e),
+                    }
+                }
+            }
+            Op::CheckObject { src } => {
+                if !is_object_value(ctx.realm, regs[*src as usize]) {
+                    let e = vm_error(ctx, "TypeError", "Iterator result is not an object");
+                    handle_throw!(VmError::Thrown(e));
+                }
+            }
+            Op::YieldDelegate {
+                dst,
+                iter,
+                next,
+                mode,
+            } => {
+                let (it, nx) = (regs[*iter as usize], regs[*next as usize]);
+                let m = regs[*mode as usize].as_number().unwrap_or(0.0) as u8;
+                let v = regs[*dst as usize];
+                match yield_delegate_step(ctx, funcs, it, nx, m, v) {
+                    Ok(DelegateStep::Yield(res)) => {
+                        return Ok(FrameExit::Yield {
+                            value: res,
+                            pc: pc - 1,
+                            handlers: core::mem::take(&mut handlers),
+                            dst: *dst,
+                        });
+                    }
+                    Ok(DelegateStep::Done(value)) => regs[*dst as usize] = value,
+                    Ok(DelegateStep::Return(value)) => return Ok(FrameExit::Return(Some(value))),
+                    Err(e) => handle_throw!(e),
                 }
             }
             Op::Yield { dst, src } | Op::Await { dst, src } => {
@@ -10323,8 +10565,11 @@ struct Binding {
 #[derive(Clone, Copy)]
 struct LoopFrame {
     handler_depth: usize,
-    /// A hosted `for-of`'s `(iterator, done)` registers.
+    /// A hosted `for-of`'s `(iterator, done)` registers — for a `for await`,
+    /// `(iterator, sync)`.
     iter: Option<(Reg, Reg)>,
+    /// A `for await` loop (its close awaits `return()`).
+    async_iter: bool,
     /// A loop (a `continue` target), not a `switch` or labeled block.
     is_loop: bool,
 }
@@ -10924,6 +11169,18 @@ impl Compiler {
                         },
                     );
                     c.tdz_pending.insert(name.clone());
+                }
+            }
+        }
+        // Bind every hoisted function's name first, so a function can close over
+        // a sibling declared after it.
+        if !is_main {
+            for stmt in body {
+                if let Stmt::Function(f) = stmt
+                    && let Some(id) = &f.id
+                    && !c.scopes[0].contains_key(&*id.name)
+                {
+                    c.declare(&id.name);
                 }
             }
         }
@@ -11916,6 +12173,7 @@ impl Compiler {
                 self.loop_frames.push(LoopFrame {
                     handler_depth: self.handler_depth,
                     iter: None,
+                    async_iter: false,
                     is_loop: false,
                 });
                 // Dispatch: jump to the first matching `case` body (else default,
@@ -12252,6 +12510,7 @@ impl Compiler {
                     self.loop_frames.push(LoopFrame {
                         handler_depth: self.handler_depth,
                         iter: None,
+                        async_iter: false,
                         is_loop: false,
                     });
                     let r = self.stmt(body);
@@ -12292,7 +12551,7 @@ impl Compiler {
                 // awaited). The bytecode VM has no await machinery, so route any
                 // program containing one to the reference tree-walker, which drives
                 // it through the lazy async coroutine engine.
-                if *is_await {
+                if *is_await && !(self.hosted && self.in_async) {
                     return Err(CompileError::Unsupported("for await"));
                 }
                 let ForLeft::Decl { kind, target, .. } = left else {
@@ -12306,6 +12565,9 @@ impl Compiler {
                     crate::ast::VarDeclKind::Using | crate::ast::VarDeclKind::AwaitUsing
                 ) {
                     return Err(CompileError::Unsupported("using in for-of head"));
+                }
+                if *is_await {
+                    return self.for_await_hosted(kind, target, right, body);
                 }
                 if self.hosted {
                     return self.for_of_hosted(kind, target, right, body);
@@ -13673,6 +13935,44 @@ impl Compiler {
                 argument,
                 ..
             } => {
+                // Hosted `o.k++` / `o[k]--` / `o.#p++`: one GetValue (the key's
+                // ToPropertyKey once), ToNumeric, then the PutValue.
+                if self.hosted
+                    && let Expr::Member {
+                        object,
+                        property,
+                        optional: false,
+                        ..
+                    } = &**argument
+                    && !matches!(&**object, Expr::Super(_))
+                {
+                    let obj = self.expr(object)?;
+                    let (raw, key) = match property {
+                        PropertyKey::Computed(e) => {
+                            let k = self.expr(e)?;
+                            self.ops.push(Op::RequireObjectCoercible { src: obj });
+                            let kc = self.alloc();
+                            self.ops.push(Op::ToKey { dst: kc, src: k });
+                            let dst = self.alloc();
+                            self.ops.push(Op::GetKey { dst, obj, key: kc });
+                            (dst, Some(kc))
+                        }
+                        other => (self.member_read(obj, other)?, None),
+                    };
+                    let old = self.alloc();
+                    self.ops.push(Op::ToNumeric { dst: old, src: raw });
+                    let next = self.alloc();
+                    self.ops.push(Op::Step {
+                        dst: next,
+                        src: old,
+                        dec: matches!(op, crate::ast::UpdateOp::Dec),
+                    });
+                    match key {
+                        Some(k) => self.store_key(obj, k, next),
+                        None => self.member_write(obj, property, next)?,
+                    }
+                    return Ok(if *prefix { next } else { old });
+                }
                 let Expr::Ident(id) = &**argument else {
                     return Err(CompileError::Unsupported("update target"));
                 };
@@ -13733,7 +14033,35 @@ impl Compiler {
                     return Err(CompileError::Unsupported("yield"));
                 }
                 if *delegate {
-                    return Err(CompileError::Unsupported("yield*"));
+                    if self.in_async {
+                        return Err(CompileError::Unsupported("yield* in an async generator"));
+                    }
+                    if self.finally_depth > 0 {
+                        return Err(CompileError::Unsupported("yield inside try/finally"));
+                    }
+                    let src = match argument {
+                        Some(e) => self.expr(e)?,
+                        None => self.constant(NanBox::undefined())?,
+                    };
+                    let (iter, next) = (self.alloc(), self.alloc());
+                    self.ops.push(Op::IterOpen { iter, next, src });
+                    let dst = self.alloc();
+                    self.ops.push(Op::LoadConst {
+                        dst,
+                        value: NanBox::undefined(),
+                    });
+                    let mode = self.alloc();
+                    self.ops.push(Op::LoadConst {
+                        dst: mode,
+                        value: NanBox::number(0.0),
+                    });
+                    self.ops.push(Op::YieldDelegate {
+                        dst,
+                        iter,
+                        next,
+                        mode,
+                    });
+                    return Ok(dst);
                 }
                 if self.finally_depth > 0 {
                     return Err(CompileError::Unsupported("yield inside try/finally"));
@@ -15669,6 +15997,7 @@ impl Compiler {
         self.loop_frames.push(LoopFrame {
             handler_depth: self.handler_depth,
             iter: None,
+            async_iter: false,
             is_loop: true,
         });
     }
@@ -15737,6 +16066,119 @@ impl Compiler {
         Ok(None)
     }
 
+    /// A hosted `for await (decl of iterable)` in an async function: each step
+    /// awaits the next iterator result (AsyncFromSyncIterator for a sync
+    /// iterable); leaving the loop abruptly awaits the iterator's `return()`.
+    fn for_await_hosted(
+        &mut self,
+        kind: &crate::ast::VarDeclKind,
+        target: &BindingTarget,
+        right: &Expr,
+        body: &Stmt,
+    ) -> Result<Option<Reg>, CompileError> {
+        self.scopes.push(alloc::collections::BTreeMap::new());
+        let src = self.expr(right)?;
+        let (iter, next, sync) = (self.alloc(), self.alloc(), self.alloc());
+        self.ops.push(Op::AsyncIterOpen {
+            iter,
+            next,
+            sync,
+            src,
+        });
+        self.enter_loop();
+        if let Some(fr) = self.loop_frames.last_mut() {
+            fr.iter = Some((iter, sync));
+            fr.async_iter = true;
+        }
+        let top = self.ops.len();
+        let p = self.alloc();
+        self.ops.push(Op::AsyncIterStep {
+            dst: p,
+            iter,
+            next,
+            sync,
+        });
+        let res = self.alloc();
+        self.ops.push(Op::Await { dst: res, src: p });
+        self.ops.push(Op::CheckObject { src: res });
+        let done = self.alloc();
+        self.ops.push(Op::GetProp {
+            dst: done,
+            obj: res,
+            key: String::from("done"),
+        });
+        let not_done = self.alloc();
+        self.ops.push(Op::Not {
+            dst: not_done,
+            a: done,
+        });
+        let jf = self.emit_jump_if_false(not_done);
+        let cur = self.alloc();
+        self.ops.push(Op::GetProp {
+            dst: cur,
+            obj: res,
+            key: String::from("value"),
+        });
+        let exc = self.alloc();
+        let handler = self.ops.len();
+        self.ops.push(Op::PushHandler {
+            target: 0,
+            reg: exc,
+        });
+        self.handler_depth += 1;
+        let r = self
+            .bind_for_decl(kind, target, cur)
+            .and_then(|()| self.stmt(body).map(|_| ()));
+        self.handler_depth -= 1;
+        r?;
+        self.ops.push(Op::PopHandler);
+        self.ops.push(Op::Jump { target: top });
+        // A throw from the binding or the body: close quietly, rethrow.
+        let at = self.ops.len();
+        self.patch_to(handler, at);
+        self.emit_async_close(iter, sync, true);
+        self.ops.push(Op::Throw { src: exc });
+        self.patch(jf);
+        self.exit_loop(top);
+        self.scopes.pop();
+        Ok(None)
+    }
+
+    /// AsyncIteratorClose of a `for await` iterator: awaits `return()`'s result
+    /// (a non-object is a `TypeError`); `quiet` (under a throw) swallows any
+    /// error so the original throw wins.
+    fn emit_async_close(&mut self, iter: Reg, sync: Reg, quiet: bool) {
+        let exc = self.alloc();
+        let guard = quiet.then(|| {
+            let at = self.ops.len();
+            self.ops.push(Op::PushHandler {
+                target: 0,
+                reg: exc,
+            });
+            at
+        });
+        let (dst, do_await) = (self.alloc(), self.alloc());
+        self.ops.push(Op::AsyncIterClose {
+            dst,
+            do_await,
+            iter,
+            sync,
+        });
+        let skip = self.emit_jump_if_false(do_await);
+        let aw = self.alloc();
+        self.ops.push(Op::Await { dst: aw, src: dst });
+        if !quiet {
+            self.ops.push(Op::CheckObject { src: aw });
+        }
+        self.patch(skip);
+        if let Some(at) = guard {
+            self.ops.push(Op::PopHandler);
+            let end = self.emit_jump();
+            self.patch_to(at, self.ops.len());
+            self.patch(end);
+        }
+    }
+
     /// Before a jump out of the `loop_frames[target..]` (inclusive of `target`
     /// for a `break`, exclusive for a `continue`), innermost first: pops the
     /// handlers they pushed and closes their `for-of` iterators (a throwing
@@ -15755,11 +16197,15 @@ impl Compiler {
                 cur -= 1;
             }
             if let Some((iter, done)) = f.iter {
-                self.ops.push(Op::IterClose {
-                    iter,
-                    done,
-                    quiet: false,
-                });
+                if f.async_iter {
+                    self.emit_async_close(iter, done, false);
+                } else {
+                    self.ops.push(Op::IterClose {
+                        iter,
+                        done,
+                        quiet: false,
+                    });
+                }
             }
         }
         if !inclusive && let Some(f) = self.loop_frames.get(target).copied() {

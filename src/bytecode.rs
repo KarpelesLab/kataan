@@ -566,6 +566,51 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*src)
         }
         Op::GeneratorStart => Ok(()),
+        Op::AsyncIterOpen {
+            iter,
+            next,
+            sync,
+            src,
+        } => {
+            reg(*iter)?;
+            reg(*next)?;
+            reg(*sync)?;
+            reg(*src)
+        }
+        Op::AsyncIterStep {
+            dst,
+            iter,
+            next,
+            sync,
+        } => {
+            reg(*dst)?;
+            reg(*iter)?;
+            reg(*next)?;
+            reg(*sync)
+        }
+        Op::AsyncIterClose {
+            dst,
+            do_await,
+            iter,
+            sync,
+        } => {
+            reg(*dst)?;
+            reg(*do_await)?;
+            reg(*iter)?;
+            reg(*sync)
+        }
+        Op::CheckObject { src } => reg(*src),
+        Op::YieldDelegate {
+            dst,
+            iter,
+            next,
+            mode,
+        } => {
+            reg(*dst)?;
+            reg(*iter)?;
+            reg(*next)?;
+            reg(*mode)
+        }
         Op::InitGenerator { f } => reg(*f),
         Op::PrivateGet { dst, obj, key } | Op::PrivateIn { dst, obj, key } => {
             reg(*dst)?;
@@ -1262,6 +1307,54 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*src, out);
         }
         Op::GeneratorStart => w_u8(105, out),
+        Op::AsyncIterOpen {
+            iter,
+            next,
+            sync,
+            src,
+        } => {
+            w_u8(109, out);
+            for r in [iter, next, sync, src] {
+                w_reg(*r, out);
+            }
+        }
+        Op::AsyncIterStep {
+            dst,
+            iter,
+            next,
+            sync,
+        } => {
+            w_u8(110, out);
+            for r in [dst, iter, next, sync] {
+                w_reg(*r, out);
+            }
+        }
+        Op::AsyncIterClose {
+            dst,
+            do_await,
+            iter,
+            sync,
+        } => {
+            w_u8(111, out);
+            for r in [dst, do_await, iter, sync] {
+                w_reg(*r, out);
+            }
+        }
+        Op::CheckObject { src } => {
+            w_u8(112, out);
+            w_reg(*src, out);
+        }
+        Op::YieldDelegate {
+            dst,
+            iter,
+            next,
+            mode,
+        } => {
+            w_u8(108, out);
+            for r in [dst, iter, next, mode] {
+                w_reg(*r, out);
+            }
+        }
         Op::Await { dst, src } => {
             w_u8(107, out);
             w_reg(*dst, out);
@@ -1812,6 +1905,31 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             src: r.reg()?,
         },
         105 => Op::GeneratorStart,
+        109 => Op::AsyncIterOpen {
+            iter: r.reg()?,
+            next: r.reg()?,
+            sync: r.reg()?,
+            src: r.reg()?,
+        },
+        110 => Op::AsyncIterStep {
+            dst: r.reg()?,
+            iter: r.reg()?,
+            next: r.reg()?,
+            sync: r.reg()?,
+        },
+        111 => Op::AsyncIterClose {
+            dst: r.reg()?,
+            do_await: r.reg()?,
+            iter: r.reg()?,
+            sync: r.reg()?,
+        },
+        112 => Op::CheckObject { src: r.reg()? },
+        108 => Op::YieldDelegate {
+            dst: r.reg()?,
+            iter: r.reg()?,
+            next: r.reg()?,
+            mode: r.reg()?,
+        },
         107 => Op::Await {
             dst: r.reg()?,
             src: r.reg()?,

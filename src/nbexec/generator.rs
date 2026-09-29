@@ -1232,6 +1232,15 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// [`Self::async_from_sync_next`] for the bytecode VM's `for await`.
+    pub(crate) fn async_from_sync_next_pub(
+        &mut self,
+        iter: Handle,
+        next: NanBox,
+    ) -> Result<Handle, ExecError> {
+        self.async_from_sync_next(iter, next)
+    }
+
     /// A fresh promise already rejected with a `TypeError` carrying `msg`.
     fn rejected_type_error(&mut self, msg: &str) -> NanBox {
         let p = self.fresh_promise();

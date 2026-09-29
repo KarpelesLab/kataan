@@ -9983,6 +9983,34 @@ impl crate::nbvm::VmHost for Interp<'_> {
         Ok(())
     }
 
+    fn get_async_iterator(
+        &mut self,
+        v: NanBox,
+    ) -> Result<(NanBox, NanBox, bool), crate::nbvm::HostError> {
+        if let Some(ih) = self.async_iterator_of(v).map_err(exec_to_host)? {
+            let next = self.read_member(ih, "next").map_err(exec_to_host)?;
+            return Ok((NanBox::handle(ih.to_raw()), next, false));
+        }
+        self.require_iterator_method(v).map_err(exec_to_host)?;
+        let it = self.get_iter_object(v).map_err(exec_to_host)?;
+        let next = self.read_member(it, "next").map_err(exec_to_host)?;
+        Ok((NanBox::handle(it.to_raw()), next, true))
+    }
+
+    fn async_from_sync_next(
+        &mut self,
+        iter: NanBox,
+        next: NanBox,
+    ) -> Result<NanBox, crate::nbvm::HostError> {
+        let Some(ih) = iter.as_handle().map(Handle::from_raw) else {
+            return Err(crate::nbvm::HostError::Fault);
+        };
+        let p = self
+            .async_from_sync_next_pub(ih, next)
+            .map_err(exec_to_host)?;
+        Ok(NanBox::handle(p.to_raw()))
+    }
+
     fn generator_intrinsics(&mut self, is_async: bool) -> Option<(NanBox, NanBox)> {
         let (gf, g) = if is_async {
             (
