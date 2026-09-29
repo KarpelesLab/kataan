@@ -620,6 +620,7 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             Ok(())
         }
         Op::ThrowTypeError { .. } => Ok(()),
+        Op::AnnexBGlobal { src, .. } => reg(*src),
         Op::MapArguments { args, cells } => {
             reg(*args)?;
             for (_, r) in cells {
@@ -1402,6 +1403,18 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u8(115, out);
             w_str(msg, out);
         }
+        Op::AnnexBGlobal {
+            name,
+            start,
+            end,
+            src,
+        } => {
+            w_u8(118, out);
+            w_str(name, out);
+            w_u32(*start, out);
+            w_u32(*end, out);
+            w_reg(*src, out);
+        }
         Op::MapArguments { args, cells } => {
             w_u8(117, out);
             w_reg(*args, out);
@@ -2015,6 +2028,12 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             val: r.reg()?,
         },
         115 => Op::ThrowTypeError { msg: r.string()? },
+        118 => Op::AnnexBGlobal {
+            name: r.string()?,
+            start: r.u32()?,
+            end: r.u32()?,
+            src: r.reg()?,
+        },
         117 => {
             let args = r.reg()?;
             let n = r.u32()? as usize;

@@ -7708,7 +7708,7 @@ fn collect_binding_idents<'a>(target: &'a BindingTarget, out: &mut Vec<&'a str>)
 /// and including the function/eval top-level lexical scope). In that case the
 /// legacy var-hoisting extension is skipped. The immediate top-level functions
 /// are excluded — they are bound directly by the hoisting loop.
-fn collect_block_function_names<'a>(stmts: &'a [Stmt], out: &mut Vec<(&'a str, Span)>) {
+pub(crate) fn collect_block_function_names<'a>(stmts: &'a [Stmt], out: &mut Vec<(&'a str, Span)>) {
     use core::slice::from_ref;
     // `blocked` is the set of names lexically declared in any enclosing block on
     // the current path; a block function with such a name is not var-hoisted.
@@ -10085,6 +10085,17 @@ impl crate::nbvm::VmHost for Interp<'_> {
             .async_from_sync_next_args(ih, next, &[v])
             .map_err(exec_to_host)?;
         Ok(NanBox::handle(p.to_raw()))
+    }
+
+    fn annexb_global(&mut self, name: &str, start: u32, end: u32, value: NanBox) {
+        let span = Span { start, end };
+        if self
+            .annexb_block_fns
+            .iter()
+            .any(|(n, sp)| n.as_str() == name && *sp == span)
+        {
+            self.annexb_update_var(name, value);
+        }
     }
 
     fn map_arguments(&mut self, args_obj: NanBox, cells: &[(usize, NanBox)]) {

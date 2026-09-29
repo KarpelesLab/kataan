@@ -624,7 +624,7 @@ impl<'a> Interp<'a> {
     /// current variable environment (Annex B.3.3 / B.3.4 runtime update). When the
     /// variable environment is the global scope, the global object property is
     /// updated too (where global `var`/function bindings live).
-    fn annexb_update_var(&mut self, name: &str, value: NanBox) {
+    pub(crate) fn annexb_update_var(&mut self, name: &str, value: NanBox) {
         self.var_scope.declare(name, value);
         if self.var_scope.ptr_eq(&self.global_scope)
             && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)

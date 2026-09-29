@@ -293,6 +293,14 @@ pub enum Op {
     },
     /// Throws a `TypeError` with `msg`.
     ThrowTypeError { msg: String },
+    /// Annex B.3.3 evaluation of a block function declaration at a hosted
+    /// script's top level (see [`VmHost::annexb_global`]).
+    AnnexBGlobal {
+        name: String,
+        start: u32,
+        end: u32,
+        src: Reg,
+    },
     /// Maps the arguments object `args`: index `i` aliases the parameter cell
     /// in register `reg` for each `(i, reg)` (see [`VmHost::map_arguments`]).
     MapArguments { args: Reg, cells: Vec<(u32, Reg)> },
@@ -972,6 +980,11 @@ pub trait VmHost {
     /// `i` of `args_obj` aliases the parameter cell `cell` (a one-element
     /// array) for each `(i, cell)`.
     fn map_arguments(&mut self, args_obj: NanBox, cells: &[(usize, NanBox)]);
+    /// Annex B.3.3 at a hosted script's top level: when the block function
+    /// declaration `name` spanning `start..end` qualifies (the host decided at
+    /// GlobalDeclarationInstantiation), its value `value` also updates the
+    /// global `var` binding.
+    fn annexb_global(&mut self, name: &str, start: u32, end: u32, value: NanBox);
     /// `(%GeneratorFunction.prototype%, %GeneratorPrototype%)`, or the async
     /// generator ones.
     fn generator_intrinsics(&mut self, is_async: bool) -> Option<(NanBox, NanBox)>;
@@ -5865,6 +5878,17 @@ fn run_frame_at(
                     Some(Ok(v)) => regs[*dst as usize] = v,
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
                     None => return Err(VmError::Unsupported),
+                }
+            }
+            Op::AnnexBGlobal {
+                name,
+                start,
+                end,
+                src,
+            } => {
+                let v = regs[*src as usize];
+                if with_host(ctx, |h| h.annexb_global(name, *start, *end, v)).is_none() {
+                    return Err(VmError::Unsupported);
                 }
             }
             Op::MapArguments { args, cells } => {
@@ -10980,9 +11004,16 @@ struct Compiler {
     /// Annex B semantics the VM does not model, and is refused rather than
     /// silently dropped.
     hoisted_fns: BTreeSet<usize>,
+    /// Block-level function declarations hoisted to the top of their block.
+    block_fns: BTreeSet<usize>,
+    /// Annex B.3.3 (function code): the spans of block function declarations
+    /// whose evaluation also updates the function-scope `var` binding.
+    annexb_spans: Vec<crate::common::Span>,
+    /// Annex B.3.3 at a hosted script's top level: the host decides.
+    annexb_host: bool,
     /// Body-level lexical names pre-bound as TDZ cells whose declaration has not
     /// been compiled yet (see [`Binding::tdz`]).
-    tdz_pending: BTreeSet<String>,
+    tdz_pending: BTreeSet<(usize, String)>,
     /// Set while compiling the object of an `arguments.x` / `arguments[i]` read
     /// (the one use of a mapped `arguments` the VM models).
     args_member_read: bool,
@@ -11494,7 +11525,37 @@ impl Compiler {
                             mapped: false,
                         },
                     );
-                    c.tdz_pending.insert(name.clone());
+                    c.tdz_pending.insert((0, name.clone()));
+                }
+            }
+        }
+        // Annex B.3.3 (sloppy): a block-level function declaration also gets a
+        // function-scope `var` binding (undefined until the declaration is
+        // evaluated), unless that would clash (a parameter, the `arguments`
+        // object, or an enclosing lexical declaration — `collect_block_…`).
+        if hosted && !strict {
+            let mut cands = Vec::new();
+            crate::nbexec::collect_block_function_names(body, &mut cands);
+            if is_main {
+                c.annexb_host = !cands.is_empty();
+            } else {
+                let mut param_names = BTreeSet::new();
+                for p in params {
+                    pattern_names(&p.target, &mut param_names);
+                }
+                let has_args_obj = c.scopes[0].contains_key("arguments");
+                for (name, span) in cands {
+                    if param_names.contains(name) || (has_args_obj && name == "arguments") {
+                        continue;
+                    }
+                    if !c.scopes[0].contains_key(name) {
+                        let saved = c.decl_kind.replace(crate::ast::VarDeclKind::Var);
+                        let b = c.declare(name);
+                        c.decl_kind = saved;
+                        let u = c.constant(NanBox::undefined())?;
+                        c.write_var(b, u);
+                    }
+                    c.annexb_spans.push(span);
                 }
             }
         }
@@ -11724,9 +11785,9 @@ impl Compiler {
         }
         // A body-level `let`/`const` pre-bound as a TDZ cell (a hoisted function
         // closes over it): its declaration initializes that cell, unchecked.
-        if self.scopes.len() == 1
-            && self.tdz_pending.remove(name)
-            && let Some(b) = self.scopes[0].get(name).copied()
+        let depth = self.scopes.len() - 1;
+        if self.tdz_pending.remove(&(depth, String::from(name)))
+            && let Some(b) = self.scopes[depth].get(name).copied()
         {
             return Binding { tdz: false, ..b };
         }
@@ -12394,10 +12455,31 @@ impl Compiler {
             // Function and (top-level) class declarations are compiled into the
             // table up front; nothing to emit at the declaration site.
             Stmt::Function(f) => {
-                if self
-                    .hoisted_fns
-                    .contains(&(f as *const crate::ast::Function as usize))
-                {
+                let key = f as *const crate::ast::Function as usize;
+                if self.hoisted_fns.contains(&key) {
+                    Ok(None)
+                } else if self.block_fns.contains(&key) {
+                    // Annex B.3.3: evaluating a qualifying block function
+                    // declaration copies its block binding to the `var` one.
+                    let Some(id) = &f.id else { return Ok(None) };
+                    if self.annexb_host {
+                        let b = self
+                            .lookup(&id.name)
+                            .ok_or(CompileError::Unsupported("block function"))?;
+                        let src = self.read_var(b);
+                        self.ops.push(Op::AnnexBGlobal {
+                            name: String::from(&*id.name),
+                            start: f.span.start,
+                            end: f.span.end,
+                            src,
+                        });
+                    } else if self.annexb_spans.contains(&f.span)
+                        && let Some(var_b) = self.scopes[0].get(&*id.name).copied()
+                        && let Some(b) = self.lookup(&id.name)
+                    {
+                        let v = self.read_var(b);
+                        self.write_var(var_b, v);
+                    }
                     Ok(None)
                 } else {
                     Err(CompileError::Unsupported(
@@ -12730,10 +12812,11 @@ impl Compiler {
             }
             Stmt::Block { body, .. } => {
                 self.scopes.push(alloc::collections::BTreeMap::new());
-                for s in body {
-                    self.stmt(s)?;
-                }
+                let r = self
+                    .hoist_block_functions(body)
+                    .and_then(|()| body.iter().try_for_each(|s| self.stmt(s).map(|_| ())));
                 self.scopes.pop();
+                r?;
                 Ok(None)
             }
             Stmt::If {
@@ -12744,11 +12827,11 @@ impl Compiler {
             } => {
                 let cond = self.expr(test)?;
                 let jf = self.emit_jump_if_false(cond);
-                self.stmt(consequent)?;
+                self.if_branch(consequent)?;
                 if let Some(alt) = alternate {
                     let jend = self.emit_jump();
                     self.patch(jf);
-                    self.stmt(alt)?;
+                    self.if_branch(alt)?;
                     self.patch(jend);
                 } else {
                     self.patch(jf);
@@ -16227,6 +16310,95 @@ impl Compiler {
                 self.constant_str(&k)
             }
         })
+    }
+
+    /// Block-level function declarations (hosted): each is bound in the block's
+    /// scope and instantiated at block entry (all names first, so they can
+    /// close over each other).
+    fn hoist_block_functions(&mut self, body: &[Stmt]) -> Result<(), CompileError> {
+        let fns: Vec<&crate::ast::Function> = body
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Function(f) if f.id.is_some() => Some(f),
+                _ => None,
+            })
+            .collect();
+        if fns.is_empty() {
+            return Ok(());
+        }
+        if !self.hosted {
+            return Err(CompileError::Unsupported(
+                "block-level function declaration",
+            ));
+        }
+        // The block's own `let`/`const`/`class` names these functions close over
+        // are pre-bound as TDZ cells (their declarations initialize them).
+        let mut lexical = BTreeSet::new();
+        let mut consts = BTreeSet::new();
+        for stmt in body {
+            match stmt {
+                Stmt::Var(d) if d.kind != crate::ast::VarDeclKind::Var => {
+                    for dr in &d.declarations {
+                        pattern_names(&dr.target, &mut lexical);
+                        if d.kind == crate::ast::VarDeclKind::Const {
+                            pattern_names(&dr.target, &mut consts);
+                        }
+                    }
+                }
+                Stmt::Class(class) => {
+                    if let Some(id) = &class.id {
+                        lexical.insert(String::from(&*id.name));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut seen = BTreeSet::new();
+        for f in &fns {
+            seen.extend(free_of_nonarrow(&f.params, &f.body));
+        }
+        let depth = self.scopes.len() - 1;
+        for name in lexical.intersection(&seen) {
+            self.bind_hidden_cell(name, consts.contains(name), true)?;
+            self.tdz_pending.insert((depth, name.clone()));
+        }
+        for f in &fns {
+            let name = &f.id.as_ref().expect("named").name;
+            if !self.scopes.last().is_some_and(|s| s.contains_key(&**name)) {
+                self.declare(name);
+            }
+        }
+        for f in fns {
+            let name = &f.id.as_ref().expect("named").name;
+            refuse_generator(f, self.hosted)?;
+            self.next_closure_is_generator = f.is_generator;
+            let closure = self.make_closure(&f.params, &f.body, f.is_async, name, false)?;
+            let b = self
+                .scopes
+                .last()
+                .and_then(|s| s.get(&**name))
+                .copied()
+                .ok_or(CompileError::Unsupported("block function"))?;
+            self.write_var(b, closure);
+            self.block_fns
+                .insert(f as *const crate::ast::Function as usize);
+        }
+        Ok(())
+    }
+
+    /// An `if` branch; Annex B.3.4's bare `if (x) function f(){}` is compiled
+    /// as if wrapped in a block.
+    fn if_branch(&mut self, s: &Stmt) -> Result<(), CompileError> {
+        if matches!(s, Stmt::Function(_)) {
+            self.scopes.push(alloc::collections::BTreeMap::new());
+            let body = core::slice::from_ref(s);
+            let r = self
+                .hoist_block_functions(body)
+                .and_then(|()| self.stmt(s).map(|_| ()));
+            self.scopes.pop();
+            return r;
+        }
+        self.stmt(s).map(|_| ())
     }
 
     /// Reads the hidden binding `n`.
