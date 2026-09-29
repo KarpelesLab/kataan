@@ -9748,6 +9748,37 @@ impl crate::nbvm::VmHost for Interp<'_> {
         self.run_event_loop().map_err(exec_to_host)
     }
 
+    fn get_member(&mut self, recv: NanBox, key: NanBox) -> Result<NanBox, crate::nbvm::HostError> {
+        let target = match recv.as_handle().map(Handle::from_raw) {
+            Some(h) if !self.realm.is_string_handle(h) => h,
+            _ => {
+                if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    let m = self.new_str("Cannot read properties of null or undefined");
+                    return Err(crate::nbvm::HostError::Thrown(
+                        self.make_error(N_TYPE_ERROR, Some(m)),
+                    ));
+                }
+                match self.coerce_to_object(recv).as_handle() {
+                    Some(b) => Handle::from_raw(b),
+                    None => return Err(crate::nbvm::HostError::Fault),
+                }
+            }
+        };
+        self.read_member_value(target, key).map_err(exec_to_host)
+    }
+
+    fn collect_garbage(&mut self, vm_roots: &[Handle]) {
+        self.collect_with_roots(vm_roots);
+    }
+
+    fn to_object(&mut self, v: NanBox) -> NanBox {
+        if self.is_object_value(v) {
+            v
+        } else {
+            self.coerce_to_object(v)
+        }
+    }
+
     fn make_arguments(&mut self, args: &[NanBox], callee: NanBox, mapped: bool) -> NanBox {
         self.make_arguments_object(args, callee, mapped.then_some(&[][..]))
     }

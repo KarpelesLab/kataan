@@ -112,6 +112,18 @@ pub enum Op {
     /// itself is then a no-op. `mapped` selects a sloppy-mode (mapped) object;
     /// it is only compiled for a function with no parameters to alias.
     MakeArguments { dst: Reg, mapped: bool },
+    /// `OrdinaryCallBindThis` for a sloppy function: an `undefined`/`null`
+    /// `this` becomes the global object, a primitive one is boxed (hosted runs
+    /// only).
+    BindThis { this: Reg },
+    /// `dst = recv[key](...args)`: a computed-key method call, with `this` =
+    /// `recv`.
+    CallKey {
+        dst: Reg,
+        recv: Reg,
+        key: Reg,
+        args: Vec<Reg>,
+    },
     /// Gives the freshly created constructor function `f` its `prototype`
     /// object (with the `constructor` back-link) and marks it constructible
     /// (hosted runs only).
@@ -584,9 +596,25 @@ pub trait VmHost {
     /// # Errors
     /// An uncaught error from a job, or a host fault.
     fn run_jobs(&mut self) -> Result<(), HostError>;
+    /// `GetValue` of the property reference `recv[key]` with the host's full
+    /// `[[Get]]` — a primitive receiver is boxed to find the property, and
+    /// proxies, typed arrays, string indices and inherited accessors all apply.
+    ///
+    /// # Errors
+    /// The read's throw (a `TypeError` for a `null`/`undefined` receiver, a
+    /// throwing getter or trap), or a host fault.
+    fn get_member(&mut self, recv: NanBox, key: NanBox) -> Result<NanBox, HostError>;
     /// A function's `arguments` object over `args` (unmapped when `mapped` is
     /// false; mapped but with no parameter aliases otherwise).
     fn make_arguments(&mut self, args: &[NanBox], callee: NanBox, mapped: bool) -> NanBox;
+    /// Collects garbage now, rooting `vm_roots` (every live value the VM run
+    /// holds) plus everything the host keeps alive — with the host's own weak
+    /// tables pruned. The host declines when its own state is not fully
+    /// enumerable. Called only from the outermost hosted run's safepoint, when
+    /// no delegated host call is in flight.
+    fn collect_garbage(&mut self, vm_roots: &[Handle]);
+    /// `ToObject(v)` (the value itself when it is already an object).
+    fn to_object(&mut self, v: NanBox) -> NanBox;
     /// A regular-expression literal `/source/flags`, built by the host.
     fn new_regexp(&mut self, source: &[u8], flags: &str) -> NanBox;
     /// Installs the running VM program's function table (returning the previous
@@ -627,9 +655,9 @@ pub(crate) fn call_vm_function(
     result
 }
 
-/// A fresh [`Ctx`] for a run over `realm` inside `host`. Allocation-triggered
-/// collection is off: the host holds roots (its global environment, class
-/// tables, …) the VM safepoint does not enumerate.
+/// A fresh [`Ctx`] for a run over `realm` inside `host`, with
+/// allocation-triggered collection off (a nested run must not collect; the
+/// outermost one switches it on — see [`run_program_hosted`]).
 fn hosted_ctx<'a>(realm: &'a mut Realm, host: &'a mut dyn VmHost) -> Ctx<'a> {
     Ctx {
         realm,
@@ -655,6 +683,37 @@ fn hosted_ctx<'a>(realm: &'a mut Realm, host: &'a mut dyn VmHost) -> Ctx<'a> {
         top_frame_roots: Vec::new(),
         pending_callee: None,
     }
+}
+
+/// Whether a hosted read of `recv`'s properties must go to the host rather than
+/// the VM's own lookup: a primitive (strings included — they are heap handles),
+/// or an exotic object whose properties the plain realm lookup misreports (a
+/// proxy's traps, a typed array's indices).
+fn read_needs_host(ctx: &Ctx, recv: NanBox) -> bool {
+    if ctx.host.is_none() {
+        return false;
+    }
+    match recv.as_handle().map(Handle::from_raw) {
+        None => true,
+        Some(h) => {
+            ctx.realm.is_string_handle(h)
+                || ctx.realm.proxy_at(h).is_some()
+                || ctx.realm.typed_len(h).is_some()
+        }
+    }
+}
+
+/// The host's `[[Get]]` of `recv[key]` (see [`VmHost::get_member`]).
+fn host_get(ctx: &mut Ctx, recv: NanBox, key: NanBox) -> Result<NanBox, VmError> {
+    with_host(ctx, |h| h.get_member(recv, key))
+        .unwrap_or(Err(HostError::Fault))
+        .map_err(VmError::from)
+}
+
+/// [`host_get`] for a static string key.
+fn host_get_str(ctx: &mut Ctx, recv: NanBox, key: &str) -> Result<NanBox, VmError> {
+    let k = NanBox::handle(ctx.realm.new_string(key).to_raw());
+    host_get(ctx, recv, k)
 }
 
 /// The VM function `recv.key` resolves to — a *data* property holding a VM
@@ -1010,9 +1069,8 @@ pub fn run_program_capturing(
 
 /// Runs function `id` of `funcs` inside `host` (see [`VmHost`]): the host's realm
 /// is moved into the VM for the run and restored afterwards on every path, and
-/// console output goes to the host. Allocation-triggered collection is off for
-/// now: the host holds roots (its global environment, class tables, …) the VM
-/// safepoint does not enumerate.
+/// console output goes to the host. Allocation-triggered collection runs through
+/// the host (`VmHost::collect_garbage`), which adds the roots only it can see.
 ///
 /// # Errors
 /// Propagates a [`VmError`] from any faulting instruction.
@@ -1026,6 +1084,10 @@ pub fn run_program_hosted(
     let mut realm = core::mem::take(host.realm_slot());
     let result = {
         let mut ctx = hosted_ctx(&mut realm, host);
+        // The outermost hosted run may collect (through the host, which roots
+        // its own state); a nested one — a VM callback inside a host call — may
+        // not, as the host's Rust frames below it hold unpublished values.
+        ctx.gc_enabled = true;
         // A script body runs with `this` = the global object.
         let this = ctx
             .host
@@ -1814,6 +1876,9 @@ fn vm_get_prop(
     key: &str,
     cache: &mut PropertyCache,
 ) -> Result<NanBox, VmError> {
+    if read_needs_host(ctx, recv) {
+        return host_get_str(ctx, recv, key);
+    }
     match recv.as_handle().map(Handle::from_raw) {
         None => {
             use crate::nanbox::Unpacked;
@@ -1922,6 +1987,11 @@ fn vm_get_prop(
                 let mut found = NanBox::undefined();
                 let mut cur = ctx.realm.object_proto(handle);
                 while let Some(p) = cur {
+                    // An exotic object on the chain (a proxy's `get` trap) is the
+                    // host's to read.
+                    if ctx.host.is_some() && ctx.realm.proxy_at(p).is_some() {
+                        return host_get_str(ctx, recv, key);
+                    }
                     if let Some((getter, _)) = ctx.realm.accessor(p, key) {
                         if getter.as_handle().is_some() {
                             found = call_closure(ctx, funcs, getter, &[], recv)?;
@@ -3106,6 +3176,12 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
             }
         }
     }
+    // A hosted run collects through the host, which adds the roots only it can
+    // see (its global environment, class tables, …) and prunes its weak tables.
+    if ctx.host.is_some() {
+        with_host(ctx, |h| h.collect_garbage(&roots));
+        return;
+    }
     ctx.realm.maybe_collect(&roots);
 }
 
@@ -3349,6 +3425,47 @@ fn run_frame(
             }
             // Filled in by `call_with_inner` on entry.
             Op::MakeArguments { .. } => {}
+            Op::BindThis { this } => {
+                let t = regs[*this as usize];
+                if let Some(bound) = with_host(ctx, |h| {
+                    if matches!(
+                        t.unpack(),
+                        crate::nanbox::Unpacked::Undefined | crate::nanbox::Unpacked::Null
+                    ) {
+                        h.global_this()
+                    } else {
+                        h.to_object(t)
+                    }
+                }) {
+                    regs[*this as usize] = bound;
+                }
+            }
+            Op::CallKey {
+                dst,
+                recv,
+                key,
+                args,
+            } => {
+                let recv_val = regs[*recv as usize];
+                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                let method = match vm_get_elem(ctx, funcs, recv_val, regs[*key as usize]) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        handle_throw!(e);
+                        continue;
+                    }
+                };
+                let pub_mark = ctx.frame_shadow.len();
+                ctx.frame_shadow.extend_from_slice(regs);
+                ctx.frames_published += 1;
+                let r = call_closure(ctx, funcs, method, &argv, recv_val);
+                ctx.frames_published -= 1;
+                ctx.frame_shadow.truncate(pub_mark);
+                match r {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
+                }
+            }
             Op::InitFnPrototype { f } => {
                 if let Some(fh) = regs[*f as usize].as_handle().map(Handle::from_raw) {
                     init_fn_prototype(ctx.realm, fh);
@@ -4529,6 +4646,9 @@ fn vm_get_elem(
     recv: NanBox,
     key: NanBox,
 ) -> Result<NanBox, VmError> {
+    if read_needs_host(ctx, recv) {
+        return host_get(ctx, recv, key);
+    }
     let handle = recv
         .as_handle()
         .map(Handle::from_raw)
@@ -4575,11 +4695,15 @@ fn vm_get_elem(
                 // A getter accessor under a (possibly numeric) string key — invoke
                 // it with the receiver as `this`.
                 call_closure(ctx, funcs, getter, &[], recv)
+            } else if let Some(v) = ctx.realm.get_property(handle, &ks) {
+                Ok(v)
+            } else if ctx.host.is_some() {
+                // Not an own property: the host walks the prototype chain (with
+                // its accessors and exotic objects) — `arr[Symbol.iterator]`,
+                // an inherited method reached by a computed key.
+                host_get(ctx, recv, key)
             } else {
-                Ok(ctx
-                    .realm
-                    .get_property(handle, &ks)
-                    .unwrap_or(NanBox::undefined()))
+                Ok(NanBox::undefined())
             }
         }
     }
@@ -6741,6 +6865,11 @@ pub fn compile_program_into(
     if uses_dynamic_code(program) {
         return Err(CompileError::Unsupported("dynamic code (eval/Function)"));
     }
+    for s in &program.body {
+        if let Stmt::Function(f) = s {
+            refuse_generator(f)?;
+        }
+    }
     let decls: Vec<&crate::ast::Function> = program
         .body
         .iter()
@@ -7489,6 +7618,18 @@ fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
     }
 }
 
+/// A generator function is not something the VM compiles (it cannot suspend
+/// at `yield`); refuse it *by kind* — a generator with no `yield` in its body
+/// would otherwise compile as an ordinary function and return `undefined`
+/// instead of a generator object.
+fn refuse_generator(f: &crate::ast::Function) -> Result<(), CompileError> {
+    if f.is_generator {
+        Err(CompileError::Unsupported("generator function"))
+    } else {
+        Ok(())
+    }
+}
+
 /// Scans a *plain* class (no `extends`, fields, statics, or accessors — those
 /// fall back to the tree-walker), reserving function ids for its constructor and
 /// methods and queueing them for compilation.
@@ -7499,6 +7640,11 @@ fn scan_class<'a>(
     jobs: &mut Vec<ClassJob<'a>>,
 ) -> Result<ClassInfo, CompileError> {
     use crate::ast::{ClassMember, Expr, MethodKind};
+    for m in &class.body {
+        if let ClassMember::Method(m) = m {
+            refuse_generator(&m.value)?;
+        }
+    }
     // `extends Identifier` is supported; a computed superclass falls back.
     let super_name = match &class.super_class {
         None => None,
@@ -8001,6 +8147,12 @@ impl Compiler {
                 },
             );
         }
+        // A sloppy function's `this` is bound per `OrdinaryCallBindThis` before
+        // any of its code (a parameter default included) can read it.
+        if hosted && !strict && !is_arrow && !is_main {
+            let this = c.this_reg;
+            c.ops.push(Op::BindThis { this });
+        }
         // Bind `arguments` before any parameter default runs (a default may read
         // it).
         if let Some(r) = arguments_reg {
@@ -8044,6 +8196,7 @@ impl Compiler {
                     continue;
                 }
                 let Some(id) = &f.id else { continue };
+                refuse_generator(f)?;
                 let closure =
                     c.make_closure(&f.params, &f.body, f.is_async, id.name.as_ref(), false)?;
                 let b = match c.scopes[0].get(&*id.name).copied() {
@@ -9854,17 +10007,12 @@ impl Compiler {
             Expr::Call {
                 callee, arguments, ..
             } => {
-                // Evaluate the argument registers (no spreads).
-                let mut args = Vec::with_capacity(arguments.len());
-                for a in arguments {
-                    let crate::ast::Argument::Item(e) = a else {
-                        return Err(CompileError::Unsupported("spread argument"));
-                    };
-                    args.push(self.expr(e)?);
-                }
+                // Every branch below evaluates the callee (and its receiver) *before*
+                // the arguments, as `EvaluateCall` does.
                 // `super(args)` — run the base constructor on the current `this`.
                 // A subclass whose base has no explicit constructor: a no-op.
                 if matches!(&**callee, Expr::Super(_)) {
+                    let args = self.call_args(arguments)?;
                     if let Some(ctor) = self.super_ctor {
                         let recv = self.this_reg;
                         self.ops.push(Op::CallCtor { ctor, recv, args });
@@ -9879,6 +10027,7 @@ impl Compiler {
                 if !self.hosted
                     && let Some(native) = native_call(callee).or_else(|| native_global(callee))
                 {
+                    let args = self.call_args(arguments)?;
                     let dst = self.alloc();
                     self.ops.push(Op::CallNative { dst, native, args });
                     return Ok(dst);
@@ -9889,6 +10038,7 @@ impl Compiler {
                     && self.lookup(&id.name).is_none()
                     && let Some(&func) = self.fn_ids.get(&*id.name)
                 {
+                    let args = self.call_args(arguments)?;
                     let dst = self.alloc();
                     self.ops.push(Op::Call { dst, func, args });
                     return Ok(dst);
@@ -9912,6 +10062,7 @@ impl Compiler {
                     let m = self.alloc();
                     self.ops.push(Op::LoadFunc { dst: m, func });
                     let recv = self.this_reg;
+                    let args = self.call_args(arguments)?;
                     let dst = self.alloc();
                     self.ops.push(Op::CallValueThis {
                         dst,
@@ -9938,6 +10089,7 @@ impl Compiler {
                             .map(|(_, id)| *id)
                     })
                 {
+                    let args = self.call_args(arguments)?;
                     let dst = self.alloc();
                     self.ops.push(Op::Call {
                         dst,
@@ -9955,6 +10107,7 @@ impl Compiler {
                 } = &**callee
                 {
                     let recv = self.expr(object)?;
+                    let args = self.call_args(arguments)?;
                     let dst = self.alloc();
                     self.ops.push(Op::CallMethod {
                         dst,
@@ -9964,9 +10117,31 @@ impl Compiler {
                     });
                     return Ok(dst);
                 }
+                // `recv[key](args)` — a computed-key method call also binds `this`
+                // to the receiver.
+                if let Expr::Member {
+                    object,
+                    property: PropertyKey::Computed(k),
+                    ..
+                } = &**callee
+                    && !matches!(&**object, Expr::Super(_))
+                {
+                    let recv = self.expr(object)?;
+                    let key = self.expr(k)?;
+                    let args = self.call_args(arguments)?;
+                    let dst = self.alloc();
+                    self.ops.push(Op::CallKey {
+                        dst,
+                        recv,
+                        key,
+                        args,
+                    });
+                    return Ok(dst);
+                }
                 // Otherwise an indirect call through a function *value* (a local
                 // holding a function, or any callee expression).
                 let callee_reg = self.expr(callee)?;
+                let args = self.call_args(arguments)?;
                 let dst = self.alloc();
                 self.ops.push(Op::CallValue {
                     dst,
@@ -10484,6 +10659,7 @@ impl Compiler {
             // A function expression / arrow → a closure capturing its free
             // variables (as shared cells).
             Expr::Function(f) => {
+                refuse_generator(f)?;
                 let nm = f.id.as_ref().map_or("", |i| i.name.as_ref());
                 self.make_closure(&f.params, &f.body, f.is_async, nm, false)
             }
@@ -10534,6 +10710,7 @@ impl Compiler {
         if let BindingTarget::Ident(id) = target {
             match e {
                 Expr::Function(f) if f.id.is_none() => {
+                    refuse_generator(f)?;
                     return self.make_closure(
                         &f.params,
                         &f.body,
@@ -10556,6 +10733,19 @@ impl Compiler {
             }
         }
         self.expr(e)
+    }
+
+    /// Compiles call arguments left to right into registers (spreads are not
+    /// compiled).
+    fn call_args(&mut self, arguments: &[crate::ast::Argument]) -> Result<Vec<Reg>, CompileError> {
+        let mut args = Vec::with_capacity(arguments.len());
+        for a in arguments {
+            let crate::ast::Argument::Item(e) = a else {
+                return Err(CompileError::Unsupported("spread argument"));
+            };
+            args.push(self.expr(e)?);
+        }
+        Ok(args)
     }
 
     fn make_closure(

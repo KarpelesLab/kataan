@@ -164,10 +164,23 @@ impl<'a> Interp<'a> {
         if !self.gc_ok || self.realm.gc_pressure() < self.realm.gc_next_threshold() {
             return;
         }
+        self.collect_with_roots(&[]);
+    }
+
+    /// Runs a collection now (if allocation pressure warrants one and the
+    /// interpreter's world is simple), rooting everything the interpreter keeps
+    /// alive plus `extra` — the live values of a hosted bytecode-VM run
+    /// (`ROADMAP.md` §2.0), which only the VM can enumerate. Returns whether the
+    /// interpreter's state allowed it.
+    ///
+    /// Only sound when no interpreter frame holds unpublished values: the
+    /// statement-boundary safepoint, or a VM safepoint in the outermost hosted run
+    /// (no delegated host call in flight).
+    pub(crate) fn collect_with_roots(&mut self, extra: &[Handle]) -> bool {
         if !self.gc_world_is_simple() {
-            return;
+            return false;
         }
-        let mut roots: Vec<Handle> = Vec::new();
+        let mut roots: Vec<Handle> = extra.to_vec();
         self.gc_roots(&mut roots);
         // `arg_maps` and `fn_realm` are keyed by an object handle and are **weak**:
         // an entry lives only while its arguments object / callable does. Moved out
@@ -199,6 +212,7 @@ impl<'a> Interp<'a> {
         );
         self.arg_maps = arg_maps.into_inner();
         self.fn_realm = fn_realm.into_inner();
+        true
     }
 
     /// Whether the interpreter's state is confined to what [`gc_roots`](Self::gc_roots)

@@ -485,7 +485,18 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
         }
         Op::InitGlobal { src, .. } => reg(*src),
         Op::GlobalExists { dst, .. } | Op::MakeArguments { dst, .. } => reg(*dst),
-        Op::InitFnPrototype { f } => reg(*f),
+        Op::InitFnPrototype { f } | Op::BindThis { this: f } => reg(*f),
+        Op::CallKey {
+            dst,
+            recv,
+            key,
+            args,
+        } => {
+            reg(*dst)?;
+            reg(*recv)?;
+            reg(*key)?;
+            regs(args)
+        }
         Op::Construct { dst, ctor, args } => {
             reg(*dst)?;
             reg(*ctor)?;
@@ -948,6 +959,22 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u8(68, out);
             w_reg(*f, out);
         }
+        Op::BindThis { this } => {
+            w_u8(70, out);
+            w_reg(*this, out);
+        }
+        Op::CallKey {
+            dst,
+            recv,
+            key,
+            args,
+        } => {
+            w_u8(69, out);
+            w_reg(*dst, out);
+            w_reg(*recv, out);
+            w_reg(*key, out);
+            w_regs(args, out);
+        }
         Op::InitGlobal { name, src, konst } => {
             w_u8(63, out);
             w_str(name, out);
@@ -1267,6 +1294,13 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             mapped: r.boolean()?,
         },
         68 => Op::InitFnPrototype { f: r.reg()? },
+        70 => Op::BindThis { this: r.reg()? },
+        69 => Op::CallKey {
+            dst: r.reg()?,
+            recv: r.reg()?,
+            key: r.reg()?,
+            args: r.regs()?,
+        },
         63 => Op::InitGlobal {
             name: r.string()?,
             src: r.reg()?,
