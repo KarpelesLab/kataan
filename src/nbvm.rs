@@ -166,6 +166,14 @@ pub enum Op {
     /// Throws a `ReferenceError` if `src` is the TDZ sentinel (a lexical binding
     /// read or written by a hoisted function before its declaration ran).
     CheckTdz { src: Reg },
+    /// `dst = <BigInt literal>` from its normalized digit string (radix prefix
+    /// kept). Hosted runs only: BigInt arithmetic is the host's.
+    NewBigInt { dst: Reg, digits: String },
+    /// `dst = ToNumeric(src)`: a BigInt is kept, an object goes through its
+    /// `valueOf`/`@@toPrimitive` (via the host), anything else is `ToNumber`.
+    ToNumeric { dst: Reg, src: Reg },
+    /// `dst = src ± 1` for a numeric `src` (a Number or a BigInt) — `++`/`--`.
+    Step { dst: Reg, src: Reg, dec: bool },
     /// `dst = ToPropertyKey(src)` for an object key (its `toString` /
     /// `Symbol.toPrimitive` runs, via the host); a primitive key is copied as-is.
     ToKey { dst: Reg, src: Reg },
@@ -866,7 +874,7 @@ fn host_binary(
     a: NanBox,
     b: NanBox,
 ) -> Option<Result<NanBox, VmError>> {
-    if ctx.host.is_none() || !(is_object_value(ctx.realm, a) || is_object_value(ctx.realm, b)) {
+    if ctx.host.is_none() || !(host_operand(ctx.realm, a) || host_operand(ctx.realm, b)) {
         return None;
     }
     Some(
@@ -882,14 +890,31 @@ fn host_unary(
     op: crate::ast::UnaryOp,
     v: NanBox,
 ) -> Option<Result<NanBox, VmError>> {
-    if ctx.host.is_none() || !is_object_value(ctx.realm, v) {
+    if ctx.host.is_none() || !host_operand(ctx.realm, v) {
         return None;
     }
-    Some(
-        with_host(ctx, |h| h.unary(op, v))
-            .unwrap_or(Err(HostError::Fault))
-            .map_err(VmError::from),
-    )
+    Some(host_unary_any(ctx, op, v))
+}
+
+/// The host's unary operator `op` on `v`, whatever `v` is.
+fn host_unary_any(ctx: &mut Ctx, op: crate::ast::UnaryOp, v: NanBox) -> Result<NanBox, VmError> {
+    with_host(ctx, |h| h.unary(op, v))
+        .unwrap_or(Err(HostError::Fault))
+        .map_err(VmError::from)
+}
+
+/// Whether a hosted operator with operand `v` is the host's: an object (its
+/// `ToPrimitive` runs user code) or a BigInt (the VM has no BigInt arithmetic).
+fn host_operand(realm: &Realm, v: NanBox) -> bool {
+    is_object_value(realm, v)
+        || v.as_handle()
+            .is_some_and(|h| realm.bigint_at(Handle::from_raw(h)).is_some())
+}
+
+/// Whether `v` is a string (a heap handle, but a primitive).
+fn is_string_value(realm: &Realm, v: NanBox) -> bool {
+    v.as_handle()
+        .is_some_and(|h| realm.is_string_handle(Handle::from_raw(h)))
 }
 
 /// One `IteratorStep` for [`Op::IterNext`] / [`Op::IterRest`]: `Ok(None)` once
@@ -3888,6 +3913,49 @@ fn run_frame(
                     handle_throw!(VmError::Thrown(e));
                 }
             }
+            Op::NewBigInt { dst, digits } => {
+                let n = crate::nbexec::parse_bigint(digits);
+                regs[*dst as usize] = NanBox::handle(ctx.realm.new_bigint(n).to_raw());
+            }
+            Op::ToNumeric { dst, src } => {
+                let v = regs[*src as usize];
+                let is_big = v
+                    .as_handle()
+                    .is_some_and(|h| ctx.realm.bigint_at(Handle::from_raw(h)).is_some());
+                if is_big || v.as_number().is_some() {
+                    regs[*dst as usize] = v;
+                } else if ctx.host.is_some()
+                    && v.as_handle().is_some()
+                    && !is_string_value(ctx.realm, v)
+                {
+                    // An object (ToPrimitive, number hint) or a Symbol (a
+                    // TypeError): the host's unary `-` performs ToNumeric, and
+                    // negating its primitive result back is exact.
+                    match host_unary_any(ctx, crate::ast::UnaryOp::Minus, v) {
+                        Ok(r) => regs[*dst as usize] = ctx.realm.neg(r),
+                        Err(e) => handle_throw!(e),
+                    }
+                } else {
+                    regs[*dst as usize] = NanBox::number(ctx.realm.to_number(v));
+                }
+            }
+            Op::Step { dst, src, dec } => {
+                let v = regs[*src as usize];
+                let big = v
+                    .as_handle()
+                    .and_then(|h| ctx.realm.bigint_at(Handle::from_raw(h)));
+                regs[*dst as usize] = match big {
+                    Some(n) => {
+                        let one = crate::bignum::BigInt::from_i128(1);
+                        let r = if *dec { n.sub(&one) } else { n.add(&one) };
+                        NanBox::handle(ctx.realm.new_bigint(r).to_raw())
+                    }
+                    None => {
+                        let n = v.as_number().unwrap_or(f64::NAN);
+                        NanBox::number(if *dec { n - 1.0 } else { n + 1.0 })
+                    }
+                };
+            }
             Op::CheckTdz { src } => {
                 if regs[*src as usize].is_tdz() {
                     let e = vm_error(
@@ -5168,7 +5236,12 @@ fn vm_get_elem(
     recv: NanBox,
     key: NanBox,
 ) -> Result<NanBox, VmError> {
-    if read_needs_host(ctx, recv) {
+    if read_needs_host(ctx, recv)
+        || (ctx.host.is_some()
+            && key
+                .as_handle()
+                .is_some_and(|h| ctx.realm.bigint_at(Handle::from_raw(h)).is_some()))
+    {
         return host_get(ctx, recv, key);
     }
     let handle = recv
@@ -11256,6 +11329,20 @@ impl Compiler {
                 if b.konst {
                     return Err(CompileError::Unsupported("update of const"));
                 }
+                if self.hosted {
+                    // `++`/`--` on ToNumeric(x): a BigInt steps by `1n`.
+                    let raw = self.read_var(b);
+                    let old = self.alloc();
+                    self.ops.push(Op::ToNumeric { dst: old, src: raw });
+                    let next = self.alloc();
+                    self.ops.push(Op::Step {
+                        dst: next,
+                        src: old,
+                        dec: matches!(op, crate::ast::UpdateOp::Dec),
+                    });
+                    self.write_var(b, next);
+                    return Ok(if *prefix { next } else { old });
+                }
                 let one = self.constant(NanBox::number(1.0))?;
                 let bop = match op {
                     crate::ast::UpdateOp::Inc => BinaryOp::Add,
@@ -11723,6 +11810,14 @@ impl Compiler {
                     self.patch_to(s, end);
                 }
                 Ok(result)
+            }
+            Expr::BigInt { digits, .. } if self.hosted => {
+                let dst = self.alloc();
+                self.ops.push(Op::NewBigInt {
+                    dst,
+                    digits: String::from(&**digits),
+                });
+                Ok(dst)
             }
             _ => Err(CompileError::Unsupported("expression")),
         }

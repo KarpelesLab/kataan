@@ -10127,7 +10127,7 @@ fn bigint_to_radix(n: &crate::bignum::BigInt, radix: u32) -> String {
 
 /// Parses a normalized `BigInt` digit string (decimal, or `0x`/`0o`/`0b`
 /// prefixed) into the arbitrary-precision representation.
-fn parse_bigint(digits: &str) -> crate::bignum::BigInt {
+pub(crate) fn parse_bigint(digits: &str) -> crate::bignum::BigInt {
     let (radix, body) = match digits.get(0..2) {
         Some("0x" | "0X") => (16, &digits[2..]),
         Some("0o" | "0O") => (8, &digits[2..]),

@@ -497,6 +497,11 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
         }
         Op::DeleteGlobal { dst, .. } => reg(*dst),
         Op::RequireObjectCoercible { src } | Op::CheckTdz { src } => reg(*src),
+        Op::NewBigInt { dst, .. } => reg(*dst),
+        Op::ToNumeric { dst, src } | Op::Step { dst, src, .. } => {
+            reg(*dst)?;
+            reg(*src)
+        }
         Op::ToStr { dst, src } => {
             reg(*dst)?;
             reg(*src)
@@ -1045,6 +1050,22 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u8(83, out);
             w_reg(*src, out);
         }
+        Op::NewBigInt { dst, digits } => {
+            w_u8(84, out);
+            w_reg(*dst, out);
+            w_str(digits, out);
+        }
+        Op::ToNumeric { dst, src } => {
+            w_u8(85, out);
+            w_reg(*dst, out);
+            w_reg(*src, out);
+        }
+        Op::Step { dst, src, dec } => {
+            w_u8(86, out);
+            w_reg(*dst, out);
+            w_reg(*src, out);
+            w_bool(*dec, out);
+        }
         Op::ToStr { dst, src } => {
             w_u8(81, out);
             w_reg(*dst, out);
@@ -1463,6 +1484,19 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         },
         80 => Op::RequireObjectCoercible { src: r.reg()? },
         83 => Op::CheckTdz { src: r.reg()? },
+        84 => Op::NewBigInt {
+            dst: r.reg()?,
+            digits: r.string()?,
+        },
+        85 => Op::ToNumeric {
+            dst: r.reg()?,
+            src: r.reg()?,
+        },
+        86 => Op::Step {
+            dst: r.reg()?,
+            src: r.reg()?,
+            dec: r.boolean()?,
+        },
         81 => Op::ToStr {
             dst: r.reg()?,
             src: r.reg()?,
