@@ -235,6 +235,15 @@ pub enum Op {
         getter: Reg,
         setter: Reg,
     },
+    /// `dst = yield src` in a generator: suspends the frame.
+    Yield { dst: Reg, src: Reg },
+    /// The end of a generator's prologue (parameters, hoisting): its call
+    /// returns the suspended generator object here.
+    GeneratorStart,
+    /// Makes the closure `f` a generator function: `[[Prototype]]` =
+    /// %GeneratorFunction.prototype%, and an own `prototype` object inheriting
+    /// %GeneratorPrototype%.
+    InitGenerator { f: Reg },
     /// An object literal's `__proto__: src`: sets `obj`'s `[[Prototype]]` when
     /// `src` is an object or `null` (anything else is ignored).
     SetProtoIfObject { obj: Reg, src: Reg },
@@ -653,6 +662,9 @@ pub struct FnProto {
     /// A derived class constructor: `this` starts uninitialized (bound by
     /// `super(...)`), and the body produces the construct result itself.
     pub derived: bool,
+    /// A generator function: a call runs the prologue up to
+    /// [`Op::GeneratorStart`] and returns a suspended generator object.
+    pub is_generator: bool,
 }
 
 /// A queued promise reaction: run `handler(value)` then settle `result` with
@@ -887,6 +899,8 @@ pub trait VmHost {
     ) -> Result<(), HostError>;
     /// `IsConstructor(v)`.
     fn is_constructor(&mut self, v: NanBox) -> bool;
+    /// `(%GeneratorFunction.prototype%, %GeneratorPrototype%)`.
+    fn generator_intrinsics(&mut self) -> Option<(NanBox, NanBox)>;
     /// `obj.[[Get]](key, receiver)` (a `super.x` read).
     ///
     /// # Errors
@@ -1380,6 +1394,228 @@ fn private_define(
             .set_hidden_property(h, &alloc::format!("{key}{suffix}"), *v);
     }
     Ok(())
+}
+
+/// The hidden slot of a VM generator object: its suspended frame, as the array
+/// `[func id, state, pc, dst, registers, handlers (flat catch-pc/reg pairs)]`.
+pub(crate) const VM_GEN: &str = "\0vmgen";
+
+const GEN_SUSPENDED_START: f64 = 0.0;
+const GEN_SUSPENDED_YIELD: f64 = 1.0;
+const GEN_EXECUTING: f64 = 2.0;
+const GEN_COMPLETED: f64 = 3.0;
+
+/// [`Op::InitGenerator`].
+fn init_generator(ctx: &mut Ctx, f: NanBox) -> Result<(), VmError> {
+    let fh = f
+        .as_handle()
+        .map(Handle::from_raw)
+        .ok_or(VmError::NotAnObject)?;
+    let (gf_proto, g_proto) = with_host(ctx, |h| h.generator_intrinsics())
+        .flatten()
+        .ok_or(VmError::Unsupported)?;
+    ctx.realm
+        .set_object_proto(fh, gf_proto.as_handle().map(Handle::from_raw));
+    let p = ctx
+        .realm
+        .new_object_with_proto(g_proto.as_handle().map(Handle::from_raw));
+    let key = NanBox::handle(ctx.realm.new_string("prototype").to_raw());
+    let pv = NanBox::handle(p.to_raw());
+    match with_host(ctx, |h| h.define_data(f, key, pv, 1)) {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(VmError::from(e)),
+        None => Err(VmError::Unsupported),
+    }
+}
+
+/// A generator call's result: an object inheriting `callee.prototype` (else
+/// %GeneratorPrototype%) holding the suspended frame.
+fn make_generator(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    id: usize,
+    callee: Option<NanBox>,
+    regs: Vec<NanBox>,
+    pc: usize,
+    handlers: Vec<(usize, Reg)>,
+) -> Result<NanBox, VmError> {
+    let proto = match callee {
+        Some(c) => vm_get_prop(ctx, funcs, c, "prototype", &mut PropertyCache::default())?,
+        None => NanBox::undefined(),
+    };
+    let proto = if is_object_value(ctx.realm, proto) {
+        proto
+    } else {
+        with_host(ctx, |h| h.generator_intrinsics())
+            .flatten()
+            .ok_or(VmError::Unsupported)?
+            .1
+    };
+    let g = ctx
+        .realm
+        .new_object_with_proto(proto.as_handle().map(Handle::from_raw));
+    let state = gen_state_array(ctx, id, GEN_SUSPENDED_START, pc, 0, regs, &handlers);
+    ctx.realm.set_hidden_property(g, VM_GEN, state);
+    Ok(NanBox::handle(g.to_raw()))
+}
+
+/// Packs a suspended frame into its state array (see [`VM_GEN`]).
+fn gen_state_array(
+    ctx: &mut Ctx,
+    id: usize,
+    state: f64,
+    pc: usize,
+    dst: Reg,
+    regs: Vec<NanBox>,
+    handlers: &[(usize, Reg)],
+) -> NanBox {
+    let r = ctx.realm.new_array(regs);
+    let hs: Vec<NanBox> = handlers
+        .iter()
+        .flat_map(|(t, reg)| [NanBox::number(*t as f64), NanBox::number(f64::from(*reg))])
+        .collect();
+    let h = ctx.realm.new_array(hs);
+    let arr = ctx.realm.new_array(alloc::vec![
+        NanBox::number(id as f64),
+        NanBox::number(state),
+        NanBox::number(pc as f64),
+        NanBox::number(f64::from(dst)),
+        NanBox::handle(r.to_raw()),
+        NanBox::handle(h.to_raw()),
+    ]);
+    NanBox::handle(arr.to_raw())
+}
+
+/// CreateIterResultObject(value, done).
+fn iter_result(ctx: &mut Ctx, value: NanBox, done: bool) -> NanBox {
+    let o = ctx.realm.new_object();
+    ctx.realm.set_property(o, "value", value);
+    ctx.realm.set_property(o, "done", NanBox::boolean(done));
+    NanBox::handle(o.to_raw())
+}
+
+/// GeneratorResume / GeneratorResumeAbrupt of the VM generator `gen`: `mode`
+/// 0 = `next(v)`, 1 = `throw(v)`, 2 = `return(v)`. Returns the iterator result.
+fn vm_generator_resume(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    generator: NanBox,
+    mode: u8,
+    v: NanBox,
+) -> Result<NanBox, VmError> {
+    let gh = generator
+        .as_handle()
+        .map(Handle::from_raw)
+        .ok_or(VmError::NotAnObject)?;
+    let sh = ctx
+        .realm
+        .get_property(gh, VM_GEN)
+        .and_then(|s| s.as_handle())
+        .map(Handle::from_raw)
+        .ok_or(VmError::NotAnObject)?;
+    let e = ctx
+        .realm
+        .array_elements(sh)
+        .map(<[_]>::to_vec)
+        .unwrap_or_default();
+    let num = |i: usize| e.get(i).and_then(|x| x.as_number()).unwrap_or(0.0);
+    let (id, state, pc, dst) = (num(0) as usize, num(1), num(2) as usize, num(3) as Reg);
+    let set_state = |ctx: &mut Ctx, st: f64| ctx.realm.set_element(sh, 1, NanBox::number(st));
+    if state == GEN_EXECUTING {
+        let e = vm_error(ctx, "TypeError", "Generator is already running");
+        return Err(VmError::Thrown(e));
+    }
+    if state == GEN_COMPLETED || (state == GEN_SUSPENDED_START && mode != 0) || mode == 2 {
+        set_state(ctx, GEN_COMPLETED);
+        return match mode {
+            1 => Err(VmError::Thrown(v)),
+            2 => Ok(iter_result(ctx, v, true)),
+            _ => Ok(iter_result(ctx, NanBox::undefined(), true)),
+        };
+    }
+    let mut regs: Vec<NanBox> = e
+        .get(4)
+        .and_then(|r| r.as_handle())
+        .and_then(|r| ctx.realm.array_elements(Handle::from_raw(r)))
+        .map(<[_]>::to_vec)
+        .unwrap_or_default();
+    let handlers: Vec<(usize, Reg)> = e
+        .get(5)
+        .and_then(|r| r.as_handle())
+        .and_then(|r| ctx.realm.array_elements(Handle::from_raw(r)))
+        .map(|hs| {
+            hs.chunks(2)
+                .map(|c| {
+                    (
+                        c[0].as_number().unwrap_or(0.0) as usize,
+                        c.get(1).and_then(|x| x.as_number()).unwrap_or(0.0) as Reg,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if mode == 0
+        && state == GEN_SUSPENDED_YIELD
+        && let Some(slot) = regs.get_mut(dst as usize)
+    {
+        *slot = v;
+    }
+    let inject = (mode == 1).then_some(v);
+    let Some(proto) = funcs.get(id) else {
+        return Err(VmError::Unsupported);
+    };
+    set_state(ctx, GEN_EXECUTING);
+    let r = run_frame_at(ctx, funcs, &proto.ops, &mut regs, pc, handlers, inject);
+    match r {
+        Ok(FrameExit::Yield {
+            value,
+            pc,
+            handlers,
+            dst,
+        }) => {
+            let st = gen_state_array(ctx, id, GEN_SUSPENDED_YIELD, pc, dst, regs, &handlers);
+            ctx.realm.set_hidden_property(gh, VM_GEN, st);
+            Ok(iter_result(ctx, value, false))
+        }
+        Ok(FrameExit::Return(ret)) => {
+            set_state(ctx, GEN_COMPLETED);
+            Ok(iter_result(ctx, ret.unwrap_or(NanBox::undefined()), true))
+        }
+        Ok(FrameExit::Tail { .. }) => {
+            set_state(ctx, GEN_COMPLETED);
+            Err(VmError::Unsupported)
+        }
+        Err(err) => {
+            set_state(ctx, GEN_COMPLETED);
+            Err(err)
+        }
+    }
+}
+
+/// [`vm_generator_resume`] for the host (a %GeneratorPrototype% method called
+/// on a VM generator).
+///
+/// # Errors
+/// The generator body's throw, or a VM fault.
+pub(crate) fn resume_vm_generator(
+    host: &mut dyn VmHost,
+    table: &alloc::rc::Rc<[FnProto]>,
+    generator: NanBox,
+    mode: u8,
+    v: NanBox,
+) -> Result<NanBox, VmError> {
+    let mut realm = core::mem::take(host.realm_slot());
+    let result = {
+        let mut ctx = hosted_ctx(&mut realm, host);
+        let r = vm_generator_resume(&mut ctx, table, generator, mode, v);
+        if r.is_ok() && !ctx.microtasks.is_empty() {
+            Err(VmError::Unsupported)
+        } else {
+            r
+        }
+    };
+    *host.realm_slot() = realm;
+    result
 }
 
 /// `IsConstructor(v)`: a VM constructor, or (hosted) whatever the host says.
@@ -2177,6 +2413,7 @@ fn call_with_inner(
                     Err(VmError::Thrown(e)) => settle(ctx, p, e, false),
                     Err(other) => return Err(other),
                 },
+                Ok(FrameExit::Yield { .. }) => return Err(VmError::Unsupported),
                 Err(VmError::Thrown(e)) => settle(ctx, p, e, false),
                 Err(other) => return Err(other),
             }
@@ -2184,6 +2421,18 @@ fn call_with_inner(
         }
         match run_frame(ctx, funcs, body, &mut regs)? {
             FrameExit::Return(v) => return Ok(v.unwrap_or(NanBox::undefined())),
+            // A generator's prologue ran: hand back the suspended generator.
+            FrameExit::Yield { pc, handlers, .. } if proto.is_generator => {
+                let callee = match callee {
+                    Some(c) => Some(c),
+                    None => {
+                        let name = proto.name.clone();
+                        with_host(ctx, |h| h.read_global(&name).ok()).flatten()
+                    }
+                };
+                return make_generator(ctx, funcs, id, callee, regs, pc, handlers);
+            }
+            FrameExit::Yield { .. } => return Err(VmError::Unsupported),
             // Proper tail call: rebind the activation inputs and reuse this frame.
             FrameExit::Tail {
                 id: tid,
@@ -2282,6 +2531,15 @@ fn ensure_jit(
 enum FrameExit {
     /// A `return value;` (or falling off the end → `None`).
     Return(Option<NanBox>),
+    /// A generator suspended at `Yield`/`GeneratorStart`: `value` is yielded,
+    /// execution resumes at `pc` with `handlers`, and the value sent by the
+    /// resuming `next(v)` lands in register `dst`.
+    Yield {
+        value: NanBox,
+        pc: usize,
+        handlers: Vec<(usize, Reg)>,
+        dst: Reg,
+    },
     /// A proper tail call: run function `id` next, in this same activation.
     Tail {
         id: usize,
@@ -2356,6 +2614,7 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
             captures,
             this,
         } => call_with(&mut ctx, &[], id, &args, &captures, this),
+        FrameExit::Yield { .. } => Err(VmError::Unsupported),
     }
 }
 
@@ -4099,9 +4358,32 @@ fn run_frame(
     program: &[Op],
     regs: &mut [NanBox],
 ) -> Result<FrameExit, VmError> {
-    let mut pc = 0;
+    run_frame_at(ctx, funcs, program, regs, 0, Vec::new(), None)
+}
+
+/// [`run_frame`] from `pc` with an existing handler stack (a resumed
+/// generator), optionally throwing `inject` at that point first.
+fn run_frame_at(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    program: &[Op],
+    regs: &mut [NanBox],
+    start: usize,
+    start_handlers: Vec<(usize, Reg)>,
+    inject: Option<NanBox>,
+) -> Result<FrameExit, VmError> {
+    let mut pc = start;
     // Active exception handlers: `(catch_pc, catch_reg)`, innermost last.
-    let mut handlers: Vec<(usize, Reg)> = Vec::new();
+    let mut handlers: Vec<(usize, Reg)> = start_handlers;
+    if let Some(v) = inject {
+        match handlers.pop() {
+            Some((target, reg)) => {
+                regs[reg as usize] = v;
+                pc = target;
+            }
+            None => return Err(VmError::Thrown(v)),
+        }
+    }
 
     // Per-frame monomorphic inline caches, one slot per instruction index, keyed
     // by pc. A `GetProp`/`SetProp` site that runs repeatedly in a hot loop within
@@ -4552,6 +4834,28 @@ fn run_frame(
                     k,
                     &[("", NanBox::boolean(true)), (":g", g), (":s", st)],
                 ) {
+                    handle_throw!(e);
+                }
+            }
+            Op::Yield { dst, src } => {
+                return Ok(FrameExit::Yield {
+                    value: regs[*src as usize],
+                    pc,
+                    handlers: core::mem::take(&mut handlers),
+                    dst: *dst,
+                });
+            }
+            Op::GeneratorStart => {
+                return Ok(FrameExit::Yield {
+                    value: NanBox::undefined(),
+                    pc,
+                    handlers: core::mem::take(&mut handlers),
+                    dst: 0,
+                });
+            }
+            Op::InitGenerator { f } => {
+                let fv = regs[*f as usize];
+                if let Err(e) = init_generator(ctx, fv) {
                     handle_throw!(e);
                 }
             }
@@ -8269,7 +8573,7 @@ pub fn compile_program_into(
     }
     for s in &program.body {
         if let Stmt::Function(f) = s {
-            refuse_generator(f)?;
+            refuse_generator(f, hosted)?;
         }
     }
     let decls: Vec<&crate::ast::Function> = program
@@ -8343,6 +8647,7 @@ pub fn compile_program_into(
         legacy: false,
         class_ctor: false,
         derived: false,
+        is_generator: false,
     };
     // Reserve slots: main (0), top-level functions (1..=N), then class members
     // (N+1..next_id). Nested function expressions append beyond `next_id`.
@@ -8385,6 +8690,7 @@ pub fn compile_program_into(
                 &alloc::collections::BTreeMap::new(),
                 None,
                 &[],
+                f.is_generator,
             )?;
             // A function declaration's `name` is its declared identifier.
             if let Some(id) = &f.id {
@@ -8418,6 +8724,7 @@ pub fn compile_program_into(
                 &alloc::collections::BTreeMap::new(),
                 None,
                 &[],
+                false,
             )?;
             protos.borrow_mut()[job.id as usize] = proto;
         }
@@ -9138,8 +9445,8 @@ fn free_of_nonarrow(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<Str
 /// at `yield`); refuse it *by kind* — a generator with no `yield` in its body
 /// would otherwise compile as an ordinary function and return `undefined`
 /// instead of a generator object.
-fn refuse_generator(f: &crate::ast::Function) -> Result<(), CompileError> {
-    if f.is_generator {
+fn refuse_generator(f: &crate::ast::Function, hosted: bool) -> Result<(), CompileError> {
+    if f.is_generator && (!hosted || f.is_async) {
         Err(CompileError::Unsupported("generator function"))
     } else {
         Ok(())
@@ -9158,7 +9465,7 @@ fn scan_class<'a>(
     use crate::ast::{ClassMember, Expr, MethodKind};
     for m in &class.body {
         if let ClassMember::Method(m) = m {
-            refuse_generator(&m.value)?;
+            refuse_generator(&m.value, false)?;
             // Class jobs compile as ordinary functions; an async method would
             // lose its promise wrapper.
             if m.value.is_async {
@@ -9400,6 +9707,16 @@ struct Binding {
     mapped: bool,
 }
 
+/// See [`Compiler::loop_frames`].
+#[derive(Clone, Copy)]
+struct LoopFrame {
+    handler_depth: usize,
+    /// A hosted `for-of`'s `(iterator, done)` registers.
+    iter: Option<(Reg, Reg)>,
+    /// A loop (a `continue` target), not a `switch` or labeled block.
+    is_loop: bool,
+}
+
 /// The inputs of [`Compiler::make_closure_ext`].
 struct ClosureSpec<'p, 'f> {
     params: &'p [crate::ast::Param],
@@ -9411,6 +9728,7 @@ struct ClosureSpec<'p, 'f> {
     class_ctor: Option<bool>,
     field_defs: &'f [FieldDef<'f>],
     extra_free: BTreeSet<String>,
+    is_generator: bool,
 }
 
 impl<'p, 'f> ClosureSpec<'p, 'f> {
@@ -9433,6 +9751,7 @@ impl<'p, 'f> ClosureSpec<'p, 'f> {
             class_ctor,
             field_defs,
             extra_free,
+            is_generator: false,
         }
     }
 }
@@ -9531,6 +9850,13 @@ struct Compiler {
     /// Active statement labels → the `break_sites`/`continue_sites` stack index
     /// of the loop they label (for `break label` / `continue label`).
     labels: Vec<(String, usize)>,
+    /// Parallel to `break_sites`: each enclosing loop/switch/labeled block's
+    /// handler depth at entry and, for a hosted `for-of`, its iterator — what a
+    /// `break`/`continue`/`return` leaving it must pop and close.
+    loop_frames: Vec<LoopFrame>,
+    /// Exception handlers pushed by enclosing (lexically structured) `try`s
+    /// and `for-of`s in this function.
+    handler_depth: usize,
     /// In `main`: a top-level function declaration name → the register holding its
     /// one canonical closure (materialized once at entry). Reading the function as
     /// a *value* uses this register, so it has a stable identity (`f === f`) and
@@ -9583,6 +9909,13 @@ struct Compiler {
     /// Set while compiling the object of an `arguments.x` / `arguments[i]` read
     /// (the one use of a mapped `arguments` the VM models).
     args_member_read: bool,
+    /// The next closure `make_closure_inner` builds is a generator function.
+    next_closure_is_generator: bool,
+    /// Compiling a generator function's body (`yield` suspends it).
+    in_generator: bool,
+    /// Nesting depth of `try` statements with a `finally` (a `yield` there
+    /// would need the finally to run on `return()` — refused).
+    finally_depth: u32,
     /// Compiling a derived class constructor's own body: `this` starts in its
     /// TDZ, `super(...)` binds it, and returns go through `DerivedResult`.
     derived_ctor: bool,
@@ -9625,6 +9958,7 @@ impl Compiler {
             &alloc::collections::BTreeMap::new(),
             None,
             &[],
+            false,
         )
     }
 
@@ -9647,6 +9981,7 @@ impl Compiler {
         cap_flags: &alloc::collections::BTreeMap<String, (bool, bool, bool)>,
         class_ctor: Option<bool>,
         field_defs: &[FieldDef<'_>],
+        is_generator: bool,
     ) -> Result<FnProto, CompileError> {
         // The VM's `async` functions settle its *own* promise implementation,
         // which is not yet unified with the host's (`ROADMAP.md` §2.0 stage 5):
@@ -9732,7 +10067,8 @@ impl Compiler {
             cell_names,
             super_ctor,
             super_class,
-            tail_ok: strict && !is_async && class_ctor.is_none(),
+            tail_ok: strict && !is_async && class_ctor.is_none() && !is_generator,
+            in_generator: is_generator,
             derived_ctor: class_ctor == Some(true),
             strict,
             hosted,
@@ -9987,7 +10323,8 @@ impl Compiler {
                     continue;
                 }
                 let Some(id) = &f.id else { continue };
-                refuse_generator(f)?;
+                refuse_generator(f, hosted)?;
+                c.next_closure_is_generator = f.is_generator;
                 let closure =
                     c.make_closure(&f.params, &f.body, f.is_async, id.name.as_ref(), false)?;
                 let b = match c.scopes[0].get(&*id.name).copied() {
@@ -10089,6 +10426,8 @@ impl Compiler {
                     c.ops.push(Op::LoadFunc { dst: reg, func });
                     if hosted && !f.is_async && !f.is_generator {
                         c.ops.push(Op::InitFnPrototype { f: reg });
+                    } else if hosted && f.is_generator {
+                        c.ops.push(Op::InitGenerator { f: reg });
                     }
                     if hosted {
                         // The host hoisted the binding (as its own closure); make
@@ -10106,6 +10445,10 @@ impl Compiler {
                     }
                 }
             }
+        }
+        // A generator's call ends here: the body runs on the first `next()`.
+        if is_generator {
+            c.ops.push(Op::GeneratorStart);
         }
         let mut last: Option<Reg> = None;
         for stmt in body {
@@ -10149,9 +10492,10 @@ impl Compiler {
             length,
             ops: c.ops,
             name: alloc::string::String::new(),
-            legacy: !strict && !is_arrow && !is_async && !is_main,
+            legacy: !strict && !is_arrow && !is_async && !is_main && !is_generator,
             class_ctor: class_ctor.is_some(),
             derived: class_ctor == Some(true),
+            is_generator,
         })
     }
 }
@@ -10907,7 +11251,18 @@ impl Compiler {
                     Some(e) => self.expr(e)?,
                     None => self.constant(NanBox::undefined())?,
                 };
+                self.emit_unwind(0, true);
                 self.emit_derived_return(v);
+                Ok(None)
+            }
+            // Leaving `for-of` loops: close their iterators after the value.
+            Stmt::Return { argument, .. } if self.in_for_of() => {
+                let v = match argument {
+                    Some(e) => self.expr(e)?,
+                    None => self.constant(NanBox::undefined())?,
+                };
+                self.emit_unwind(0, true);
+                self.ops.push(Op::Return { src: v });
                 Ok(None)
             }
             Stmt::Return { argument, .. } => {
@@ -10935,6 +11290,11 @@ impl Compiler {
                 let d = self.expr(discriminant)?;
                 // Only `break` targets a switch; `continue` skips to the loop.
                 self.break_sites.push(Vec::new());
+                self.loop_frames.push(LoopFrame {
+                    handler_depth: self.handler_depth,
+                    iter: None,
+                    is_loop: false,
+                });
                 // Dispatch: jump to the first matching `case` body (else default,
                 // else the end). Bodies (compiled next) fall through.
                 let mut case_jumps: Vec<(usize, usize)> = Vec::new();
@@ -10971,6 +11331,7 @@ impl Compiler {
                     Some(di) => self.patch_to(exit_dispatch, entries[di]),
                     None => self.patch(exit_dispatch), // no default → end
                 }
+                self.loop_frames.pop();
                 let breaks = self.break_sites.pop().unwrap_or_default();
                 let end = self.ops.len();
                 for b in breaks {
@@ -11014,7 +11375,13 @@ impl Compiler {
                     reg: catch_reg,
                 });
                 self.tail_ok = false;
+                // A `yield` anywhere in a try-with-finally is refused (see
+                // `finally_depth`); an error abandons this compiler anyway.
+                let has_finally = finalizer.is_some();
+                self.finally_depth += u32::from(has_finally);
+                self.handler_depth += 1;
                 self.block_stmts(block)?;
+                self.handler_depth -= 1;
                 self.ops.push(Op::PopHandler);
                 // Normal completion: run `finally` (in tail position), then jump
                 // past the handler.
@@ -11087,6 +11454,7 @@ impl Compiler {
                 }
                 self.tail_ok = saved_tail;
                 self.patch(jend);
+                self.finally_depth -= u32::from(has_finally);
                 Ok(None)
             }
             Stmt::Expr { expression, .. } => Ok(Some(self.expr(expression)?)),
@@ -11181,6 +11549,12 @@ impl Compiler {
                 Ok(None)
             }
             Stmt::Break { label: None, .. } => {
+                let t = self
+                    .break_sites
+                    .len()
+                    .checked_sub(1)
+                    .ok_or(CompileError::Unsupported("break outside loop/switch"))?;
+                self.emit_unwind(t, true);
                 let j = self.emit_jump();
                 self.break_sites
                     .last_mut()
@@ -11189,6 +11563,9 @@ impl Compiler {
                 Ok(None)
             }
             Stmt::Continue { label: None, .. } => {
+                if let Some(t) = self.loop_frames.iter().rposition(|f| f.is_loop) {
+                    self.emit_unwind(t, false);
+                }
                 let j = self.emit_jump();
                 self.continue_sites
                     .last_mut()
@@ -11206,6 +11583,7 @@ impl Compiler {
                     .find(|(n, _)| n == &*label.name)
                     .map(|(_, i)| *i)
                     .ok_or(CompileError::Unsupported("break to unknown label"))?;
+                self.emit_unwind(idx, true);
                 let j = self.emit_jump();
                 self.break_sites[idx].push(j);
                 Ok(None)
@@ -11220,6 +11598,7 @@ impl Compiler {
                     .find(|(n, _)| n == &*label.name)
                     .map(|(_, i)| *i)
                     .ok_or(CompileError::Unsupported("continue to unknown label"))?;
+                self.emit_unwind(idx, false);
                 let j = self.emit_jump();
                 self.continue_sites[idx].push(j);
                 Ok(None)
@@ -11247,7 +11626,13 @@ impl Compiler {
                     // break target so `break label` jumps past the body.
                     self.break_sites.push(Vec::new());
                     self.continue_sites.push(Vec::new());
+                    self.loop_frames.push(LoopFrame {
+                        handler_depth: self.handler_depth,
+                        iter: None,
+                        is_loop: false,
+                    });
                     let r = self.stmt(body);
+                    self.loop_frames.pop();
                     self.labels.pop();
                     let end = self.ops.len();
                     for b in self.break_sites.pop().unwrap_or_default() {
@@ -11298,6 +11683,9 @@ impl Compiler {
                     crate::ast::VarDeclKind::Using | crate::ast::VarDeclKind::AwaitUsing
                 ) {
                     return Err(CompileError::Unsupported("using in for-of head"));
+                }
+                if self.hosted {
+                    return self.for_of_hosted(kind, target, right, body);
                 }
                 self.scopes.push(alloc::collections::BTreeMap::new());
                 let src = self.expr(right)?;
@@ -12061,6 +12449,14 @@ impl Compiler {
                             let u = self.constant(NanBox::hole())?;
                             self.ops.push(Op::ArrayPush { arr: dst, src: u });
                         }
+                        ArrayElement::Spread(e) if self.hosted => {
+                            let s = self.expr(e)?;
+                            let rest = self.iterate_to_array(s)?;
+                            self.ops.push(Op::ArrayExtend {
+                                arr: dst,
+                                src: rest,
+                            });
+                        }
                         ArrayElement::Spread(e) => {
                             let s = self.expr(e)?;
                             self.ops.push(Op::ArrayExtend { arr: dst, src: s });
@@ -12685,6 +13081,26 @@ impl Compiler {
                 Ok(if *prefix { next } else { old })
             }
             Expr::Class(c) if self.hosted => self.class_value(c, ""),
+            Expr::Yield {
+                argument, delegate, ..
+            } => {
+                if !self.in_generator {
+                    return Err(CompileError::Unsupported("yield"));
+                }
+                if *delegate {
+                    return Err(CompileError::Unsupported("yield*"));
+                }
+                if self.finally_depth > 0 {
+                    return Err(CompileError::Unsupported("yield inside try/finally"));
+                }
+                let src = match argument {
+                    Some(e) => self.expr(e)?,
+                    None => self.constant(NanBox::undefined())?,
+                };
+                let dst = self.alloc();
+                self.ops.push(Op::Yield { dst, src });
+                Ok(dst)
+            }
             Expr::NewTarget(_) => match self.lookup(NT_NAME) {
                 Some(b) => Ok(self.read_var(b)),
                 None => Err(CompileError::Unsupported("new.target")),
@@ -13108,7 +13524,8 @@ impl Compiler {
             // A function expression / arrow → a closure capturing its free
             // variables (as shared cells).
             Expr::Function(f) => {
-                refuse_generator(f)?;
+                refuse_generator(f, self.hosted)?;
+                self.next_closure_is_generator = f.is_generator;
                 let nm = f.id.as_ref().map_or("", |i| i.name.as_ref());
                 self.make_closure(&f.params, &f.body, f.is_async, nm, false)
             }
@@ -13170,7 +13587,8 @@ impl Compiler {
                     return self.class_value(c, &id.name);
                 }
                 Expr::Function(f) if f.id.is_none() => {
-                    refuse_generator(f)?;
+                    refuse_generator(f, self.hosted)?;
+                    self.next_closure_is_generator = f.is_generator;
                     return self.make_closure(
                         &f.params,
                         &f.body,
@@ -13210,17 +13628,7 @@ impl Compiler {
                 }
                 crate::ast::Argument::Spread(e) => {
                     let src = self.expr(e)?;
-                    let (iter, next, done) = (self.alloc(), self.alloc(), self.alloc());
-                    self.ops.push(Op::IterOpen { iter, next, src });
-                    let f = self.constant(NanBox::boolean(false))?;
-                    self.ops.push(Op::Move { dst: done, src: f });
-                    let rest = self.alloc();
-                    self.ops.push(Op::IterRest {
-                        dst: rest,
-                        done,
-                        iter,
-                        next,
-                    });
+                    let rest = self.iterate_to_array(src)?;
                     self.ops.push(Op::ArrayExtend { arr, src: rest });
                 }
             }
@@ -13238,6 +13646,23 @@ impl Compiler {
             }
             _ => Ok(()),
         }
+    }
+
+    /// Drains the iterable in `src` through the host's iterator protocol into
+    /// a fresh array (a spread).
+    fn iterate_to_array(&mut self, src: Reg) -> Result<Reg, CompileError> {
+        let (iter, next, done) = (self.alloc(), self.alloc(), self.alloc());
+        self.ops.push(Op::IterOpen { iter, next, src });
+        let f = self.constant(NanBox::boolean(false))?;
+        self.ops.push(Op::Move { dst: done, src: f });
+        let rest = self.alloc();
+        self.ops.push(Op::IterRest {
+            dst: rest,
+            done,
+            iter,
+            next,
+        });
+        Ok(rest)
     }
 
     fn call_args(&mut self, arguments: &[crate::ast::Argument]) -> Result<Vec<Reg>, CompileError> {
@@ -13260,7 +13685,8 @@ impl Compiler {
         is_arrow: bool,
     ) -> Result<Reg, CompileError> {
         let is_method = core::mem::take(&mut self.next_closure_is_method);
-        let constructor = self.hosted && !is_arrow && !is_async && !is_method;
+        let constructor =
+            self.hosted && !is_arrow && !is_async && !is_method && !self.next_closure_is_generator;
         let r = self.make_closure_inner(params, body, is_async, name, is_arrow)?;
         if is_method
             && let Some(Op::MakeClosure { func, .. }) = self
@@ -13287,6 +13713,7 @@ impl Compiler {
         is_arrow: bool,
     ) -> Result<Reg, CompileError> {
         let strict = self.strict;
+        let is_generator = core::mem::take(&mut self.next_closure_is_generator);
         self.make_closure_ext(ClosureSpec {
             params,
             body,
@@ -13297,6 +13724,7 @@ impl Compiler {
             class_ctor: None,
             field_defs: &[],
             extra_free: BTreeSet::new(),
+            is_generator,
         })
     }
 
@@ -13315,6 +13743,7 @@ impl Compiler {
             class_ctor,
             field_defs,
             extra_free,
+            is_generator,
         } = spec;
         // Captures = free variables that resolve to an enclosing binding (others
         // are top-level functions / globals, reached directly).
@@ -13358,6 +13787,7 @@ impl Compiler {
                 legacy: false,
                 class_ctor: false,
                 derived: false,
+                is_generator: false,
             });
             (p.len() - 1) as u32
         };
@@ -13387,6 +13817,7 @@ impl Compiler {
             &flags,
             class_ctor,
             field_defs,
+            is_generator,
         )?;
         let mut proto = proto;
         proto.name = alloc::string::String::from(name);
@@ -13426,6 +13857,9 @@ impl Compiler {
                 index: idx,
                 src: dst,
             });
+        }
+        if is_generator {
+            self.ops.push(Op::InitGenerator { f: dst });
         }
         Ok(dst)
     }
@@ -13994,7 +14428,7 @@ impl Compiler {
             let derived = sup.is_some();
             for m in &class.body {
                 if let ClassMember::Method(m) = m {
-                    refuse_generator(&m.value)?;
+                    refuse_generator(&m.value, true)?;
                     if m.value.is_async {
                         return Err(CompileError::Unsupported("async class method"));
                     }
@@ -14074,14 +14508,17 @@ impl Compiler {
                         let home = if m.is_static { CTOR_NAME } else { PROTO_NAME };
                         let func = self.class_element_closure(
                             home,
-                            ClosureSpec::class_element(
-                                &m.value.params,
-                                &m.value.body,
-                                "",
-                                None,
-                                &[],
-                                BTreeSet::new(),
-                            ),
+                            ClosureSpec {
+                                is_generator: m.value.is_generator,
+                                ..ClosureSpec::class_element(
+                                    &m.value.params,
+                                    &m.value.body,
+                                    "",
+                                    None,
+                                    &[],
+                                    BTreeSet::new(),
+                                )
+                            },
                         )?;
                         let fname = match m.kind {
                             MethodKind::Get => alloc::format!("get #{n}"),
@@ -14135,14 +14572,17 @@ impl Compiler {
                         };
                         let func = self.class_element_closure(
                             home,
-                            ClosureSpec::class_element(
-                                &m.value.params,
-                                &m.value.body,
-                                "",
-                                None,
-                                &[],
-                                BTreeSet::new(),
-                            ),
+                            ClosureSpec {
+                                is_generator: m.value.is_generator,
+                                ..ClosureSpec::class_element(
+                                    &m.value.params,
+                                    &m.value.body,
+                                    "",
+                                    None,
+                                    &[],
+                                    BTreeSet::new(),
+                                )
+                            },
                         )?;
                         let kind = match m.kind {
                             MethodKind::Get => 1,
@@ -14371,7 +14811,7 @@ impl Compiler {
                         value,
                         ..
                     } => {
-                        refuse_generator(value)?;
+                        refuse_generator(value, self.hosted)?;
                         let k = self.class_key(key)?;
                         let f = self.with_home(OBJ_HOME_NAME, |c| {
                             c.next_closure_is_method = true;
@@ -14570,11 +15010,119 @@ impl Compiler {
     fn enter_loop(&mut self) {
         self.break_sites.push(Vec::new());
         self.continue_sites.push(Vec::new());
+        self.loop_frames.push(LoopFrame {
+            handler_depth: self.handler_depth,
+            iter: None,
+            is_loop: true,
+        });
+    }
+
+    /// A hosted `for (decl of iterable)` over the host's iterator protocol:
+    /// one `IteratorStep` per iteration; the binding and body run under a
+    /// handler that closes the iterator quietly before rethrowing, and a
+    /// `break`/`return`/outer `continue` closes it (see [`Self::emit_unwind`]).
+    fn for_of_hosted(
+        &mut self,
+        kind: &crate::ast::VarDeclKind,
+        target: &BindingTarget,
+        right: &Expr,
+        body: &Stmt,
+    ) -> Result<Option<Reg>, CompileError> {
+        self.scopes.push(alloc::collections::BTreeMap::new());
+        let src = self.expr(right)?;
+        let (iter, next, done) = (self.alloc(), self.alloc(), self.alloc());
+        self.ops.push(Op::IterOpen { iter, next, src });
+        let f = self.constant(NanBox::boolean(false))?;
+        self.ops.push(Op::Move { dst: done, src: f });
+        self.enter_loop();
+        if let Some(fr) = self.loop_frames.last_mut() {
+            fr.iter = Some((iter, done));
+        }
+        let top = self.ops.len();
+        let cur = self.alloc();
+        self.ops.push(Op::IterNext {
+            dst: cur,
+            done,
+            iter,
+            next,
+        });
+        let not_done = self.alloc();
+        self.ops.push(Op::Not {
+            dst: not_done,
+            a: done,
+        });
+        let jf = self.emit_jump_if_false(not_done);
+        let exc = self.alloc();
+        let handler = self.ops.len();
+        self.ops.push(Op::PushHandler {
+            target: 0,
+            reg: exc,
+        });
+        self.handler_depth += 1;
+        let r = self
+            .bind_for_decl(kind, target, cur)
+            .and_then(|()| self.stmt(body).map(|_| ()));
+        self.handler_depth -= 1;
+        r?;
+        self.ops.push(Op::PopHandler);
+        self.ops.push(Op::Jump { target: top });
+        // A throw from the binding or the body: close quietly, rethrow.
+        let at = self.ops.len();
+        self.patch_to(handler, at);
+        self.ops.push(Op::IterClose {
+            iter,
+            done,
+            quiet: true,
+        });
+        self.ops.push(Op::Throw { src: exc });
+        self.patch(jf);
+        self.exit_loop(top);
+        self.scopes.pop();
+        Ok(None)
+    }
+
+    /// Before a jump out of the `loop_frames[target..]` (inclusive of `target`
+    /// for a `break`, exclusive for a `continue`), innermost first: pops the
+    /// handlers they pushed and closes their `for-of` iterators (a throwing
+    /// `return()` reaches the next outer handler — an outer `for-of` then closes
+    /// its own iterator quietly). A `continue` also pops the target loop's
+    /// per-iteration handlers.
+    fn emit_unwind(&mut self, target: usize, inclusive: bool) {
+        let mut cur = self.handler_depth;
+        for i in (target..self.loop_frames.len()).rev() {
+            if !inclusive && i == target {
+                break;
+            }
+            let f = self.loop_frames[i];
+            while cur > f.handler_depth {
+                self.ops.push(Op::PopHandler);
+                cur -= 1;
+            }
+            if let Some((iter, done)) = f.iter {
+                self.ops.push(Op::IterClose {
+                    iter,
+                    done,
+                    quiet: false,
+                });
+            }
+        }
+        if !inclusive && let Some(f) = self.loop_frames.get(target).copied() {
+            while cur > f.handler_depth {
+                self.ops.push(Op::PopHandler);
+                cur -= 1;
+            }
+        }
+    }
+
+    /// Whether a `return` must first close enclosing `for-of` iterators.
+    fn in_for_of(&self) -> bool {
+        self.loop_frames.iter().any(|f| f.iter.is_some())
     }
 
     /// Closes a loop scope: `break`s jump past the loop (here), `continue`s jump
     /// to `continue_target`.
     fn exit_loop(&mut self, continue_target: usize) {
+        self.loop_frames.pop();
         let breaks = self.break_sites.pop().unwrap_or_default();
         let continues = self.continue_sites.pop().unwrap_or_default();
         let end = self.ops.len();
@@ -17128,6 +17676,7 @@ mod generic_jit_tests {
             legacy: false,
             class_ctor: false,
             derived: false,
+            is_generator: false,
         });
         (funcs, f_id)
     }
@@ -17327,6 +17876,7 @@ mod generic_jit_tests {
             legacy: false,
             class_ctor: false,
             derived: false,
+            is_generator: false,
         });
         id
     }

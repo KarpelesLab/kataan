@@ -1094,6 +1094,18 @@ impl<'a> Interp<'a> {
         let Some(h) = this.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("Generator method called on non-object"));
         };
+        // A bytecode-VM generator resumes on the VM.
+        if self.realm.get_property(h, crate::nbvm::VM_GEN).is_some()
+            && let Some(table) = self.vm_table.clone()
+        {
+            let (mode, v) = match how {
+                Resumption::Next(v) => (0, v),
+                Resumption::Throw(v) => (1, v),
+                Resumption::Return(v) => (2, v),
+            };
+            return crate::nbvm::resume_vm_generator(self, &table, this, mode, v)
+                .map_err(super::vm_to_exec);
+        }
         let Some(id) = self.gen_frame_id(h) else {
             return Err(self.type_error("Generator method called on a non-generator"));
         };

@@ -9953,6 +9953,12 @@ impl crate::nbvm::VmHost for Interp<'_> {
         self.is_constructor_value(v)
     }
 
+    fn generator_intrinsics(&mut self) -> Option<(NanBox, NanBox)> {
+        let gf = self.generator_function_prototype()?;
+        let g = self.generator_prototype()?;
+        Some((NanBox::handle(gf.to_raw()), NanBox::handle(g.to_raw())))
+    }
+
     fn get_with_receiver(
         &mut self,
         obj: NanBox,
