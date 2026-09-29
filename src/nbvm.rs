@@ -8265,6 +8265,10 @@ struct Binding {
     global: Option<(u32, GlobalWrite)>,
 }
 
+/// A member assignment target evaluated ahead of its value: the object
+/// register and either a computed key register (`Ok`) or a static key (`Err`).
+type MemberPlace = (Reg, Result<Reg, String>);
+
 /// One element of an array destructuring (see
 /// `Compiler::array_destructure_hosted`): a binding-pattern element, an
 /// assignment-pattern element, or a hole.
@@ -9094,10 +9098,7 @@ impl Compiler {
     /// For a member assignment target (`o.k`, `o[k]`), evaluates its object and
     /// key now — a destructuring target's reference precedes the value it
     /// receives — and returns where to store; `None` for any other target.
-    fn member_place(
-        &mut self,
-        target: &Expr,
-    ) -> Result<Option<(Reg, Result<Reg, String>)>, CompileError> {
+    fn member_place(&mut self, target: &Expr) -> Result<Option<MemberPlace>, CompileError> {
         let Expr::Member {
             object, property, ..
         } = target
@@ -9118,7 +9119,7 @@ impl Compiler {
     }
 
     /// Stores `src` to a place from [`Self::member_place`].
-    fn store_place(&mut self, place: (Reg, Result<Reg, String>), src: Reg) {
+    fn store_place(&mut self, place: MemberPlace, src: Reg) {
         let (obj, key) = place;
         match key {
             Ok(k) => self.store_key(obj, k, src),
