@@ -201,25 +201,26 @@ calls and construction across the tiers, the `arguments` object, `new` on
 plain functions, and real `Cell::VmFunction` closures — **26,378 / 53,377** on
 the VM with the fallback disabled.
 
-**Progress (2026-09-30).** **39,933 / 53,377** on the VM (`KATAAN_VM_STRICT=1`),
-335 wrong results. Since stage 4: lexical `this`/`new.target` in arrows, TDZ
-cells for hoisted functions, BigInt, spread calls, host `Function`/indirect
-`eval` (only a direct `eval` falls back), mapped `arguments` when aliasing is
-unobservable, host CopyDataProperties, object literals that *define* their
-members, and **runtime classes** (ClassDefinitionEvaluation on the VM:
-`MakeClass`/`DefineMethod`/`SuperCall`, derived-constructor TDZ, fields,
-`super` home objects, `extends` of any constructor). Several harness files
-(`propertyHelper.js`, `temporalHelpers.js`) gated thousands of tests each.
+**Progress (2026-09-30).** **50,604 / 53,377** on the VM (`KATAAN_VM_STRICT=1`),
+229 wrong results, gate unchanged. Since stage 4: lexical `this`/`new.target`,
+TDZ cells, BigInt, spread, host `Function`/indirect `eval`, top-level direct
+`eval`, mapped `arguments` when aliasing is unobservable, object literals that
+*define* members, **runtime classes** (incl. private elements), and
+**suspended frames**: generators, `yield*`, async functions, async
+generators and `for await` are VM frames whose registers/pc/handlers are
+saved on `yield`/`await` and resumed by the host's own promise reactions
+(ordering identical to the tree-walker). Harness files (`propertyHelper.js`,
+`temporalHelpers.js`, `asyncHelpers.js`) gated thousands of tests each.
 Remaining refusals, largest first:
 
-- generator functions 6,184 (the VM cannot suspend a frame);
-- private class elements 2,881;
-- direct `eval` 1,131;
-- `async` functions/methods ~1,230 (needs the promise-queue unification);
-- block-level function declarations 400; misc. statements/targets ~900.
-- Known gap: `name`/`length` of a VM closure are synthesized only on the VM's
-  own read paths — an interpreter-side `getOwnPropertyDescriptor(f, "length")`
-  does not see them.
+- direct `eval` inside functions/blocks 825; `with` (~150);
+- block-level function declarations (Annex B) 408;
+- mapped `arguments` whose aliasing is observable 238;
+- `using` declarations 124; `$262.agent` (agent baton handoff) 112;
+- `return()` into a generator suspended inside try/for-of/destructuring
+  (region cleanup) and `yield` inside try/finally.
+- Then stage 5: per-function (not whole-program) fallback, and retiring the
+  VM-private runtime pieces.
 
 ## 2. The three headline engine deliverables
 
