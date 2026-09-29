@@ -10831,6 +10831,18 @@ enum ForBind<'a> {
     Target(&'a Expr),
 }
 
+/// An enclosing `try … finally` (see [`Compiler::finally_frames`]): the
+/// compile context outside it and its finalizer, inlined on every abrupt exit.
+#[derive(Clone)]
+struct FinallyFrame {
+    loop_len: usize,
+    cont_len: usize,
+    labels_len: usize,
+    scope_len: usize,
+    handler_depth: usize,
+    finalizer: Vec<Stmt>,
+}
+
 /// See [`Compiler::loop_frames`].
 #[derive(Clone, Copy)]
 struct LoopFrame {
@@ -10984,6 +10996,9 @@ struct Compiler {
     /// Exception handlers pushed by enclosing (lexically structured) `try`s
     /// and `for-of`s in this function.
     handler_depth: usize,
+    /// Enclosing `try … finally` statements whose `finally` a
+    /// `return`/`break`/`continue` leaving them must run (innermost last).
+    finally_frames: Vec<FinallyFrame>,
     /// In `main`: a top-level function declaration name → the register holding its
     /// one canonical closure (materialized once at entry). Reading the function as
     /// a *value* uses this register, so it has a stable identity (`f === f`) and
@@ -12536,7 +12551,7 @@ impl Compiler {
                     Some(e) => self.expr(e)?,
                     None => self.constant(NanBox::undefined())?,
                 };
-                self.emit_unwind(0, true);
+                self.emit_unwind(0, true, 0)?;
                 self.emit_derived_return(v);
                 Ok(None)
             }
@@ -12547,17 +12562,17 @@ impl Compiler {
                 let v = self.expr(e)?;
                 let t = self.alloc();
                 self.ops.push(Op::Await { dst: t, src: v });
-                self.emit_unwind(0, true);
+                self.emit_unwind(0, true, 0)?;
                 self.ops.push(Op::Return { src: t });
                 Ok(None)
             }
             // Leaving `for-of` loops: close their iterators after the value.
-            Stmt::Return { argument, .. } if self.in_for_of() => {
+            Stmt::Return { argument, .. } if self.needs_unwind() => {
                 let v = match argument {
                     Some(e) => self.expr(e)?,
                     None => self.constant(NanBox::undefined())?,
                 };
-                self.emit_unwind(0, true);
+                self.emit_unwind(0, true, 0)?;
                 self.ops.push(Op::Return { src: v });
                 Ok(None)
             }
@@ -12649,7 +12664,9 @@ impl Compiler {
                 // `return`/`break`/`continue`, but the emitter only runs it on the
                 // normal/throw paths. When the body can exit abruptly, defer the
                 // whole program to the tree-walker (which handles it correctly).
-                if finalizer.is_some()
+                // A non-hosted run keeps refusing a `finally` a jump could skip.
+                if !self.hosted
+                    && finalizer.is_some()
                     && (block_can_exit_abruptly(block)
                         || handler
                             .as_ref()
@@ -12666,6 +12683,18 @@ impl Compiler {
                 // The register the thrown value lands in (and the catch binding,
                 // if any, names it).
                 let catch_reg = self.alloc();
+                // Abrupt exits from the `try` (and a `catch`) run the finalizer.
+                let frame = finalizer.as_ref().map(|fin| FinallyFrame {
+                    loop_len: self.loop_frames.len(),
+                    cont_len: self.continue_sites.len(),
+                    labels_len: self.labels.len(),
+                    scope_len: self.scopes.len(),
+                    handler_depth: self.handler_depth,
+                    finalizer: fin.to_vec(),
+                });
+                if let Some(f) = &frame {
+                    self.finally_frames.push(f.clone());
+                }
                 let push = self.ops.len();
                 self.ops.push(Op::PushHandler {
                     target: 0,
@@ -12680,6 +12709,9 @@ impl Compiler {
                 self.block_stmts(block)?;
                 self.handler_depth -= 1;
                 self.ops.push(Op::PopHandler);
+                if frame.is_some() {
+                    self.finally_frames.pop();
+                }
                 // Normal completion: run `finally` (in tail position), then jump
                 // past the handler.
                 if let Some(fin) = finalizer {
@@ -12732,13 +12764,32 @@ impl Compiler {
                     // A `catch` body is in tail position only when no `finally`
                     // follows (otherwise the `finally` runs after it).
                     self.tail_ok = saved_tail && finalizer.is_none();
+                    // With a `finally`, a throw from the catch body runs it too.
+                    let guard = frame.as_ref().map(|f| {
+                        self.finally_frames.push(f.clone());
+                        let r = self.alloc();
+                        let at = self.ops.len();
+                        self.ops.push(Op::PushHandler { target: 0, reg: r });
+                        self.handler_depth += 1;
+                        (at, r)
+                    });
                     for s in &catch.body {
                         self.stmt(s)?;
                     }
                     self.scopes.pop();
                     if let Some(fin) = finalizer {
+                        let (at, r) = guard.expect("guarded");
+                        self.handler_depth -= 1;
+                        self.ops.push(Op::PopHandler);
+                        self.finally_frames.pop();
                         self.tail_ok = saved_tail;
                         self.block_stmts(fin)?;
+                        let skip = self.emit_jump();
+                        self.patch_to(at, self.ops.len());
+                        self.tail_ok = false;
+                        self.block_stmts(fin)?;
+                        self.ops.push(Op::Throw { src: r });
+                        self.patch(skip);
                     }
                 } else {
                     // `try { } finally { }`: run `finally` (in tail position), then
@@ -12852,7 +12903,7 @@ impl Compiler {
                     .len()
                     .checked_sub(1)
                     .ok_or(CompileError::Unsupported("break outside loop/switch"))?;
-                self.emit_unwind(t, true);
+                self.emit_unwind(t, true, t + 1)?;
                 let j = self.emit_jump();
                 self.break_sites
                     .last_mut()
@@ -12862,7 +12913,7 @@ impl Compiler {
             }
             Stmt::Continue { label: None, .. } => {
                 if let Some(t) = self.loop_frames.iter().rposition(|f| f.is_loop) {
-                    self.emit_unwind(t, false);
+                    self.emit_unwind(t, false, t + 1)?;
                 }
                 let j = self.emit_jump();
                 self.continue_sites
@@ -12881,7 +12932,7 @@ impl Compiler {
                     .find(|(n, _)| n == &*label.name)
                     .map(|(_, i)| *i)
                     .ok_or(CompileError::Unsupported("break to unknown label"))?;
-                self.emit_unwind(idx, true);
+                self.emit_unwind(idx, true, idx + 1)?;
                 let j = self.emit_jump();
                 self.break_sites[idx].push(j);
                 Ok(None)
@@ -12896,7 +12947,7 @@ impl Compiler {
                     .find(|(n, _)| n == &*label.name)
                     .map(|(_, i)| *i)
                     .ok_or(CompileError::Unsupported("continue to unknown label"))?;
-                self.emit_unwind(idx, false);
+                self.emit_unwind(idx, false, idx + 1)?;
                 let j = self.emit_jump();
                 self.continue_sites[idx].push(j);
                 Ok(None)
@@ -16782,7 +16833,7 @@ impl Compiler {
         let j1 = self.emit_jump_if_false(is1);
         let t = self.alloc();
         self.ops.push(Op::Await { dst: t, src: recv });
-        self.emit_unwind(0, true);
+        self.emit_unwind(0, true, 0)?;
         self.ops.push(Op::Return { src: t });
         self.patch(j1);
         // act 2: a `throw` it has no method for — close it, then a TypeError.
@@ -16823,7 +16874,7 @@ impl Compiler {
             b: two,
         });
         let jr = self.emit_jump_if_false(isret);
-        self.emit_unwind(0, true);
+        self.emit_unwind(0, true, 0)?;
         self.ops.push(Op::Return { src: val });
         self.patch(jr);
         self.ops.push(Op::Move { dst: out, src: val });
@@ -16934,9 +16985,34 @@ impl Compiler {
     /// `return()` reaches the next outer handler — an outer `for-of` then closes
     /// its own iterator quietly). A `continue` also pops the target loop's
     /// per-iteration handlers.
-    fn emit_unwind(&mut self, target: usize, inclusive: bool) {
+    fn emit_unwind(
+        &mut self,
+        target: usize,
+        inclusive: bool,
+        fin_min: usize,
+    ) -> Result<(), CompileError> {
         let mut cur = self.handler_depth;
-        for i in (target..self.loop_frames.len()).rev() {
+        let len = self.loop_frames.len();
+        for level in (target..=len).rev() {
+            // `finally` blocks entered at this loop depth (innermost first).
+            if level >= fin_min {
+                let idxs: Vec<usize> = (0..self.finally_frames.len())
+                    .rev()
+                    .filter(|&k| self.finally_frames[k].loop_len == level)
+                    .collect();
+                for k in idxs {
+                    let hd = self.finally_frames[k].handler_depth;
+                    while cur > hd {
+                        self.ops.push(Op::PopHandler);
+                        cur -= 1;
+                    }
+                    self.inline_finalizer(k)?;
+                }
+            }
+            if level == target {
+                break;
+            }
+            let i = level - 1;
             if !inclusive && i == target {
                 break;
             }
@@ -16963,11 +17039,38 @@ impl Compiler {
                 cur -= 1;
             }
         }
+        Ok(())
     }
 
-    /// Whether a `return` must first close enclosing `for-of` iterators.
-    fn in_for_of(&self) -> bool {
-        self.loop_frames.iter().any(|f| f.iter.is_some())
+    /// Compiles the `finally` block of `finally_frames[k]` in place, in the
+    /// compile context outside its `try` (scopes, loops, labels, handlers,
+    /// enclosing finally blocks), so its own names and jumps resolve there.
+    fn inline_finalizer(&mut self, k: usize) -> Result<(), CompileError> {
+        let fr = self.finally_frames[k].clone();
+        let scopes = self.scopes.split_off(fr.scope_len);
+        let loops = self.loop_frames.split_off(fr.loop_len);
+        let breaks = self.break_sites.split_off(fr.loop_len);
+        let conts = self.continue_sites.split_off(fr.cont_len);
+        let labels = self.labels.split_off(fr.labels_len);
+        let fins = self.finally_frames.split_off(k);
+        let hd = core::mem::replace(&mut self.handler_depth, fr.handler_depth);
+        let tail = core::mem::replace(&mut self.tail_ok, false);
+        let r = self.block_stmts(&fr.finalizer);
+        self.tail_ok = tail;
+        self.handler_depth = hd;
+        self.finally_frames.extend(fins);
+        self.labels.extend(labels);
+        self.continue_sites.extend(conts);
+        self.break_sites.extend(breaks);
+        self.loop_frames.extend(loops);
+        self.scopes.extend(scopes);
+        r
+    }
+
+    /// Whether a `return` must first close enclosing `for-of` iterators or run
+    /// enclosing `finally` blocks.
+    fn needs_unwind(&self) -> bool {
+        !self.finally_frames.is_empty() || self.loop_frames.iter().any(|f| f.iter.is_some())
     }
 
     /// Closes a loop scope: `break`s jump past the loop (here), `continue`s jump
