@@ -9784,6 +9784,32 @@ impl crate::nbvm::VmHost for Interp<'_> {
         self.collect_with_roots(vm_roots);
     }
 
+    fn get_iterator(&mut self, v: NanBox) -> Result<(NanBox, NanBox), crate::nbvm::HostError> {
+        let it = self.get_iter_object(v).map_err(exec_to_host)?;
+        let next = self.read_member(it, "next").map_err(exec_to_host)?;
+        Ok((NanBox::handle(it.to_raw()), next))
+    }
+
+    fn iter_step(
+        &mut self,
+        iter: NanBox,
+        next: NanBox,
+    ) -> Result<Option<NanBox>, crate::nbvm::HostError> {
+        let it = iter
+            .as_handle()
+            .map(Handle::from_raw)
+            .ok_or(crate::nbvm::HostError::Fault)?;
+        Interp::iter_step(self, it, next).map_err(exec_to_host)
+    }
+
+    fn iter_close(&mut self, iter: NanBox) -> Result<(), crate::nbvm::HostError> {
+        let it = iter
+            .as_handle()
+            .map(Handle::from_raw)
+            .ok_or(crate::nbvm::HostError::Fault)?;
+        self.iterator_close(it).map_err(exec_to_host)
+    }
+
     fn to_property_key(&mut self, v: NanBox) -> Result<NanBox, crate::nbvm::HostError> {
         let k = self.coerce_property_key(v).map_err(exec_to_host)?;
         Ok(self.new_str(&k))

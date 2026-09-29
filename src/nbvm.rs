@@ -112,6 +112,30 @@ pub enum Op {
     /// itself is then a no-op. `mapped` selects a sloppy-mode (mapped) object;
     /// it is only compiled for a function with no parameters to alias.
     MakeArguments { dst: Reg, mapped: bool },
+    /// `GetIterator(src)`: the iterator object into `iter` and its `next`
+    /// method into `next`, through the host's protocol (hosted runs only).
+    IterOpen { iter: Reg, next: Reg, src: Reg },
+    /// One `IteratorStep`: unless `done` is already true, calls `next`; on a
+    /// value, `dst` = the value and `done` = false; on exhaustion, `dst` =
+    /// `undefined` and `done` = true. `done` is set *before* the call, so a
+    /// throwing `next` leaves the iterator marked done (it must not be closed).
+    IterNext {
+        dst: Reg,
+        done: Reg,
+        iter: Reg,
+        next: Reg,
+    },
+    /// `dst` = an array of every remaining value (a rest element).
+    IterRest {
+        dst: Reg,
+        done: Reg,
+        iter: Reg,
+        next: Reg,
+    },
+    /// `IteratorClose` unless `done`: calls the iterator's `return`. `quiet`
+    /// closes on an abrupt completion, whose own error wins over any from
+    /// `return`.
+    IterClose { iter: Reg, done: Reg, quiet: bool },
     /// `dst = ToPropertyKey(src)` for an object key (its `toString` /
     /// `Symbol.toPrimitive` runs, via the host); a primitive key is copied as-is.
     ToKey { dst: Reg, src: Reg },
@@ -653,6 +677,23 @@ pub trait VmHost {
     /// # Errors
     /// A throw from a coercion, or a host fault.
     fn unary(&mut self, op: crate::ast::UnaryOp, v: NanBox) -> Result<NanBox, HostError>;
+    /// `GetIterator(v)`: the iterator object and its `next` method.
+    ///
+    /// # Errors
+    /// A `TypeError` for a non-iterable, a throwing `@@iterator`, or a host
+    /// fault.
+    fn get_iterator(&mut self, v: NanBox) -> Result<(NanBox, NanBox), HostError>;
+    /// `IteratorStep` + `IteratorValue`: `None` once the iterator is done.
+    ///
+    /// # Errors
+    /// A throw from `next`, a non-object result, a throwing `done`/`value`
+    /// getter, or a host fault.
+    fn iter_step(&mut self, iter: NanBox, next: NanBox) -> Result<Option<NanBox>, HostError>;
+    /// `IteratorClose` on a normal completion: calls `return`, if any.
+    ///
+    /// # Errors
+    /// A throw from `return` or a non-object result, or a host fault.
+    fn iter_close(&mut self, iter: NanBox) -> Result<(), HostError>;
     /// `ToPropertyKey(v)` of an object key: a string (a symbol's internal key
     /// form included).
     ///
@@ -797,6 +838,32 @@ fn host_unary(
             .unwrap_or(Err(HostError::Fault))
             .map_err(VmError::from),
     )
+}
+
+/// One `IteratorStep` for [`Op::IterNext`] / [`Op::IterRest`]: `Ok(None)` once
+/// the iterator is (or already was) exhausted. `done` is set before the call so
+/// a throwing `next` leaves the iterator marked done.
+fn vm_iter_step(
+    ctx: &mut Ctx,
+    regs: &mut [NanBox],
+    done: Reg,
+    iter: Reg,
+    next: Reg,
+) -> Result<Option<NanBox>, VmError> {
+    if regs[done as usize].as_boolean() == Some(true) {
+        return Ok(None);
+    }
+    regs[done as usize] = NanBox::boolean(true);
+    let (it, nx) = (regs[iter as usize], regs[next as usize]);
+    match with_host(ctx, |h| h.iter_step(it, nx)) {
+        Some(Ok(Some(v))) => {
+            regs[done as usize] = NanBox::boolean(false);
+            Ok(Some(v))
+        }
+        Some(Ok(None)) => Ok(None),
+        Some(Err(e)) => Err(e.into()),
+        None => Err(VmError::Unsupported),
+    }
 }
 
 /// The host's `[[Set]]` of `recv[key] = value` (see [`VmHost::set_member`]).
@@ -3648,6 +3715,61 @@ fn run_frame(
             }
             // Filled in by `call_with_inner` on entry.
             Op::MakeArguments { .. } => {}
+            Op::IterOpen { iter, next, src } => {
+                let v = regs[*src as usize];
+                match with_host(ctx, |h| h.get_iterator(v)) {
+                    Some(Ok((i, n))) => {
+                        regs[*iter as usize] = i;
+                        regs[*next as usize] = n;
+                    }
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
+            }
+            Op::IterNext {
+                dst,
+                done,
+                iter,
+                next,
+            } => match vm_iter_step(ctx, regs, *done, *iter, *next) {
+                Ok(v) => regs[*dst as usize] = v.unwrap_or(NanBox::undefined()),
+                Err(e) => handle_throw!(e),
+            },
+            Op::IterRest {
+                dst,
+                done,
+                iter,
+                next,
+            } => {
+                let mut out = Vec::new();
+                let mut failed = None;
+                while regs[*done as usize].as_boolean() != Some(true) {
+                    match vm_iter_step(ctx, regs, *done, *iter, *next) {
+                        Ok(Some(v)) => out.push(v),
+                        Ok(None) => {}
+                        Err(e) => {
+                            failed = Some(e);
+                            break;
+                        }
+                    }
+                }
+                match failed {
+                    None => regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(out).to_raw()),
+                    Some(e) => handle_throw!(e),
+                }
+            }
+            Op::IterClose { iter, done, quiet } => {
+                if regs[*done as usize].as_boolean() != Some(true) {
+                    regs[*done as usize] = NanBox::boolean(true);
+                    let it = regs[*iter as usize];
+                    let r = with_host(ctx, |h| h.iter_close(it)).unwrap_or(Err(HostError::Fault));
+                    match r {
+                        Err(HostError::Fault) => return Err(VmError::Unsupported),
+                        Err(HostError::Thrown(e)) if !*quiet => handle_throw!(VmError::Thrown(e)),
+                        _ => {}
+                    }
+                }
+            }
             Op::ToKey { dst, src } => {
                 let v = regs[*src as usize];
                 if is_object_value(ctx.realm, v) {
@@ -8143,6 +8265,17 @@ struct Binding {
     global: Option<(u32, GlobalWrite)>,
 }
 
+/// One element of an array destructuring (see
+/// `Compiler::array_destructure_hosted`): a binding-pattern element, an
+/// assignment-pattern element, or a hole.
+enum ArrayDstr<'e> {
+    Hole,
+    Bind(&'e BindingTarget, Option<&'e Expr>),
+    Assign(&'e Expr),
+    BindRest(&'e BindingTarget),
+    AssignRest(&'e Expr),
+}
+
 /// How a write to a [`Binding::global`] binding is emitted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GlobalWrite {
@@ -8403,8 +8536,15 @@ impl Compiler {
                         .expect("a scope")
                         .insert(String::from(&**name), b);
                 }
-                // A destructuring parameter binds from the incoming arg register.
-                other => c.bind_pattern(other, arg_regs[i])?,
+                // A destructuring parameter binds from the incoming arg register —
+                // after its own `= default` applies (an `undefined` argument is
+                // replaced first; the pattern then destructures the default).
+                other => {
+                    if let Some(def) = &p.default {
+                        c.apply_default_named(arg_regs[i], Some(def), None)?;
+                    }
+                    c.bind_pattern(other, arg_regs[i])?;
+                }
             }
         }
         // Captured cells arrive already boxed (the closure passes the cell).
@@ -8693,6 +8833,17 @@ impl Compiler {
                 let obj = self.expr(object)?;
                 self.member_write(obj, property, value_reg)
             }
+            Expr::Array { elements, .. } if self.hosted => {
+                let els = elements
+                    .iter()
+                    .map(|el| match el {
+                        ArrayElement::Hole => ArrayDstr::Hole,
+                        ArrayElement::Item(e) => ArrayDstr::Assign(e),
+                        ArrayElement::Spread(e) => ArrayDstr::AssignRest(e),
+                    })
+                    .collect();
+                self.array_destructure_hosted(value_reg, els)
+            }
             Expr::Array { elements, .. } => {
                 for (i, el) in elements.iter().enumerate() {
                     match el {
@@ -8863,6 +9014,21 @@ impl Compiler {
                 self.write_var(b, value_reg);
                 Ok(())
             }
+            BindingTarget::Array(pat) if self.hosted => {
+                use crate::ast::ArrayPatternElement;
+                let els = pat
+                    .elements
+                    .iter()
+                    .map(|el| match el {
+                        ArrayPatternElement::Hole => ArrayDstr::Hole,
+                        ArrayPatternElement::Item {
+                            target, default, ..
+                        } => ArrayDstr::Bind(target, default.as_ref()),
+                        ArrayPatternElement::Rest { target, .. } => ArrayDstr::BindRest(target),
+                    })
+                    .collect();
+                self.array_destructure_hosted(value_reg, els)
+            }
             BindingTarget::Array(pat) => {
                 use crate::ast::ArrayPatternElement;
                 for (i, el) in pat.elements.iter().enumerate() {
@@ -8923,6 +9089,172 @@ impl Compiler {
                 Ok(())
             }
         }
+    }
+
+    /// For a member assignment target (`o.k`, `o[k]`), evaluates its object and
+    /// key now — a destructuring target's reference precedes the value it
+    /// receives — and returns where to store; `None` for any other target.
+    fn member_place(
+        &mut self,
+        target: &Expr,
+    ) -> Result<Option<(Reg, Result<Reg, String>)>, CompileError> {
+        let Expr::Member {
+            object, property, ..
+        } = target
+        else {
+            return Ok(None);
+        };
+        if matches!(&**object, Expr::Super(_)) {
+            return Err(CompileError::Unsupported(
+                "super member destructuring target",
+            ));
+        }
+        let obj = self.expr(object)?;
+        let key = match property {
+            PropertyKey::Computed(e) => Ok(self.expr(e)?),
+            other => Err(static_key(other)?),
+        };
+        Ok(Some((obj, key)))
+    }
+
+    /// Stores `src` to a place from [`Self::member_place`].
+    fn store_place(&mut self, place: (Reg, Result<Reg, String>), src: Reg) {
+        let (obj, key) = place;
+        match key {
+            Ok(k) => self.store_key(obj, k, src),
+            Err(key) => self.ops.push(if self.hosted && self.strict {
+                Op::SetPropStrict { obj, key, src }
+            } else {
+                Op::SetProp { obj, key, src }
+            }),
+        }
+    }
+
+    /// Array destructuring of the iterable in `value_reg` through the host's
+    /// iterator protocol (`ROADMAP.md` §2.0): one `IteratorStep` per element,
+    /// the iterator closed afterwards unless exhausted, and closed quietly
+    /// before an exception from a default, a nested pattern or a target
+    /// propagates (a throwing `next` itself leaves it unclosed).
+    fn array_destructure_hosted(
+        &mut self,
+        value_reg: Reg,
+        els: Vec<ArrayDstr<'_>>,
+    ) -> Result<(), CompileError> {
+        let iter = self.alloc();
+        let next = self.alloc();
+        let done = self.alloc();
+        self.ops.push(Op::IterOpen {
+            iter,
+            next,
+            src: value_reg,
+        });
+        let f = self.constant(NanBox::boolean(false))?;
+        self.ops.push(Op::Move { dst: done, src: f });
+        let exc = self.alloc();
+        let handler = self.ops.len();
+        self.ops.push(Op::PushHandler {
+            target: 0,
+            reg: exc,
+        });
+        for el in els {
+            match el {
+                ArrayDstr::Hole => {
+                    let t = self.alloc();
+                    self.ops.push(Op::IterNext {
+                        dst: t,
+                        done,
+                        iter,
+                        next,
+                    });
+                }
+                ArrayDstr::Bind(target, default) => {
+                    let v = self.alloc();
+                    self.ops.push(Op::IterNext {
+                        dst: v,
+                        done,
+                        iter,
+                        next,
+                    });
+                    self.apply_default_named(v, default, Some(target))?;
+                    self.bind_pattern(target, v)?;
+                }
+                ArrayDstr::Assign(e) => {
+                    // The target's reference (a member's object and key) is
+                    // evaluated before the iterator is stepped.
+                    let (inner, default) = match e {
+                        Expr::Assign {
+                            op: crate::ast::AssignOp::Assign,
+                            target,
+                            value,
+                            ..
+                        } => (&**target, Some(&**value)),
+                        _ => (e, None),
+                    };
+                    let place = self.member_place(inner)?;
+                    let v = self.alloc();
+                    self.ops.push(Op::IterNext {
+                        dst: v,
+                        done,
+                        iter,
+                        next,
+                    });
+                    match place {
+                        Some(place) => {
+                            self.apply_default(v, default)?;
+                            self.store_place(place, v);
+                        }
+                        None => self.assign_target_with_default(e, v)?,
+                    }
+                }
+                ArrayDstr::BindRest(target) => {
+                    let r = self.alloc();
+                    self.ops.push(Op::IterRest {
+                        dst: r,
+                        done,
+                        iter,
+                        next,
+                    });
+                    self.bind_pattern(target, r)?;
+                }
+                ArrayDstr::AssignRest(e) => {
+                    let place = self.member_place(e)?;
+                    let r = self.alloc();
+                    self.ops.push(Op::IterRest {
+                        dst: r,
+                        done,
+                        iter,
+                        next,
+                    });
+                    match place {
+                        Some(place) => self.store_place(place, r),
+                        None => self.assign_pattern(e, r)?,
+                    }
+                }
+            }
+        }
+        self.ops.push(Op::PopHandler);
+        self.ops.push(Op::IterClose {
+            iter,
+            done,
+            quiet: false,
+        });
+        let skip = self.ops.len();
+        self.ops.push(Op::Jump { target: 0 });
+        let at = self.ops.len();
+        if let Op::PushHandler { target, .. } = &mut self.ops[handler] {
+            *target = at;
+        }
+        self.ops.push(Op::IterClose {
+            iter,
+            done,
+            quiet: true,
+        });
+        self.ops.push(Op::Throw { src: exc });
+        let end = self.ops.len();
+        if let Op::Jump { target } = &mut self.ops[skip] {
+            *target = end;
+        }
+        Ok(())
     }
 
     /// If `reg` holds `undefined` and a `default` exists, overwrites `reg` with

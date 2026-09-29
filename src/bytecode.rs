@@ -490,6 +490,32 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*dst)?;
             reg(*src)
         }
+        Op::IterOpen { iter, next, src } => {
+            reg(*iter)?;
+            reg(*next)?;
+            reg(*src)
+        }
+        Op::IterNext {
+            dst,
+            done,
+            iter,
+            next,
+        }
+        | Op::IterRest {
+            dst,
+            done,
+            iter,
+            next,
+        } => {
+            reg(*dst)?;
+            reg(*done)?;
+            reg(*iter)?;
+            reg(*next)
+        }
+        Op::IterClose { iter, done, .. } => {
+            reg(*iter)?;
+            reg(*done)
+        }
         Op::SetPropStrict { obj, src, .. } => {
             reg(*obj)?;
             reg(*src)
@@ -981,6 +1007,42 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*dst, out);
             w_reg(*src, out);
         }
+        Op::IterOpen { iter, next, src } => {
+            w_u8(74, out);
+            w_reg(*iter, out);
+            w_reg(*next, out);
+            w_reg(*src, out);
+        }
+        Op::IterNext {
+            dst,
+            done,
+            iter,
+            next,
+        } => {
+            w_u8(75, out);
+            w_reg(*dst, out);
+            w_reg(*done, out);
+            w_reg(*iter, out);
+            w_reg(*next, out);
+        }
+        Op::IterRest {
+            dst,
+            done,
+            iter,
+            next,
+        } => {
+            w_u8(76, out);
+            w_reg(*dst, out);
+            w_reg(*done, out);
+            w_reg(*iter, out);
+            w_reg(*next, out);
+        }
+        Op::IterClose { iter, done, quiet } => {
+            w_u8(77, out);
+            w_reg(*iter, out);
+            w_reg(*done, out);
+            w_bool(*quiet, out);
+        }
         Op::SetPropStrict { obj, key, src } => {
             w_u8(71, out);
             w_reg(*obj, out);
@@ -1328,6 +1390,28 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         73 => Op::ToKey {
             dst: r.reg()?,
             src: r.reg()?,
+        },
+        74 => Op::IterOpen {
+            iter: r.reg()?,
+            next: r.reg()?,
+            src: r.reg()?,
+        },
+        75 => Op::IterNext {
+            dst: r.reg()?,
+            done: r.reg()?,
+            iter: r.reg()?,
+            next: r.reg()?,
+        },
+        76 => Op::IterRest {
+            dst: r.reg()?,
+            done: r.reg()?,
+            iter: r.reg()?,
+            next: r.reg()?,
+        },
+        77 => Op::IterClose {
+            iter: r.reg()?,
+            done: r.reg()?,
+            quiet: r.boolean()?,
         },
         71 => Op::SetPropStrict {
             obj: r.reg()?,
