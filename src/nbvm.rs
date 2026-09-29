@@ -1235,9 +1235,9 @@ fn host_unary_any(ctx: &mut Ctx, op: crate::ast::UnaryOp, v: NanBox) -> Result<N
 /// Whether a hosted operator with operand `v` is the host's: an object (its
 /// `ToPrimitive` runs user code) or a BigInt (the VM has no BigInt arithmetic).
 fn host_operand(realm: &Realm, v: NanBox) -> bool {
-    is_object_value(realm, v)
-        || v.as_handle()
-            .is_some_and(|h| realm.bigint_at(Handle::from_raw(h)).is_some())
+    // Every heap value but a string: an object (ToPrimitive), a BigInt, or a
+    // Symbol (its TypeErrors are the host's, real `TypeError` instances).
+    v.as_handle().is_some() && realm.type_of_value(v) != "string"
 }
 
 /// Whether `v` is a string (a heap handle, but a primitive).
@@ -1380,6 +1380,7 @@ fn vm_set_elem_mode(
     let mut to_host = read_needs_host(ctx, recv)
         || past_end
         || is_mapped_arguments(ctx.realm, recv)
+        || is_string_wrapper(ctx.realm, recv)
         || (key.as_number().is_some()
             && recv
                 .as_handle()
@@ -1744,6 +1745,15 @@ fn yield_delegate_step(
 /// Marks an arguments object whose indices alias VM parameter cells: its
 /// computed reads and writes are the host's (the parameter map).
 const ARGS_MAPPED: &str = "\0argsmapped";
+
+/// Whether `v` is a String wrapper object (its `length` and indices are
+/// String exotic own properties — the host's).
+fn is_string_wrapper(realm: &Realm, v: NanBox) -> bool {
+    v.as_handle().is_some_and(|h| {
+        let h = Handle::from_raw(h);
+        !realm.is_string_handle(h) && realm.string_object_len(h).is_some()
+    })
+}
 
 /// Whether `v` is a mapped arguments object (see [`ARGS_MAPPED`]).
 fn is_mapped_arguments(realm: &Realm, v: NanBox) -> bool {
@@ -3927,9 +3937,10 @@ fn vm_get_prop(
     if read_needs_host(ctx, recv)
         || (ctx.host.is_some()
             && (key == "length" || key.bytes().next().is_some_and(|c| c.is_ascii_digit()))
-            && recv
+            && (recv
                 .as_handle()
-                .is_some_and(|h| ctx.realm.array_elements(Handle::from_raw(h)).is_some()))
+                .is_some_and(|h| ctx.realm.array_elements(Handle::from_raw(h)).is_some())
+                || is_string_wrapper(ctx.realm, recv)))
     {
         return host_get_str(ctx, recv, key);
     }
@@ -7480,6 +7491,7 @@ fn vm_get_elem(
 ) -> Result<NanBox, VmError> {
     if read_needs_host(ctx, recv)
         || (ctx.host.is_some() && is_mapped_arguments(ctx.realm, recv))
+        || (ctx.host.is_some() && is_string_wrapper(ctx.realm, recv))
         || (ctx.host.is_some()
             && (key
                 .as_handle()
@@ -7679,6 +7691,9 @@ fn vm_array_len(ctx: &mut Ctx, funcs: &[FnProto], recv: NanBox) -> Result<NanBox
         && ctx.realm.array_length(handle).is_none()
         && !ctx.realm.is_string_handle(handle)
     {
+        if is_string_wrapper(ctx.realm, recv) {
+            return host_get_str(ctx, recv, "length");
+        }
         return vm_get_prop(ctx, funcs, recv, "length", &mut PropertyCache::default());
     }
     // A VM function (a tagged closure array) reports its parameter count from the
@@ -11721,7 +11736,11 @@ impl Compiler {
                 FieldKey::Private(n) => {
                     let key = read(&mut c, n)?;
                     let v = match fd.init {
-                        Some(e) => c.expr(e)?,
+                        // `#f = function () {}` names the function `#f`.
+                        Some(e) => {
+                            let nm = alloc::format!("#{}", n.trim_start_matches("\0#"));
+                            c.named_field_value(e, &nm)?
+                        }
                         None => c.constant(NanBox::undefined())?,
                     };
                     c.ops.push(Op::PrivateDefine {
@@ -11760,9 +11779,10 @@ impl Compiler {
                     continue;
                 }
             };
-            let v = match fd.init {
-                Some(e) => c.expr(e)?,
-                None => c.constant(NanBox::undefined())?,
+            let v = match (&fd.key, fd.init) {
+                (FieldKey::Static(k), Some(e)) => c.named_field_value(e, k)?,
+                (_, Some(e)) => c.expr(e)?,
+                (_, None) => c.constant(NanBox::undefined())?,
             };
             let this = c.this_reg;
             c.ops.push(Op::DefineData {
@@ -14325,7 +14345,11 @@ impl Compiler {
                 Ok(dst)
             }
             Expr::Assign {
-                op, target, value, ..
+                op,
+                target,
+                value,
+                paren_target,
+                ..
             } => {
                 use crate::ast::AssignOp;
                 // Reassigning a `const` binding is a TypeError; route the program
@@ -14368,7 +14392,12 @@ impl Compiler {
                             // NamedEvaluation: `x &&= function(){}` / `x ??= () => {}`
                             // names the anonymous RHS after the LHS identifier.
                             let bt = crate::ast::BindingTarget::Ident((*id).clone());
-                            let v = self.expr_named(value, &bt)?;
+                            // `(x) ??= function(){}` is not a NamedEvaluation.
+                            let v = if *paren_target {
+                                self.expr(value)?
+                            } else {
+                                self.expr_named(value, &bt)?
+                            };
                             self.write_var(b, v);
                             self.patch(jf);
                             return Ok(self.read_var(b));
@@ -14423,7 +14452,13 @@ impl Compiler {
                         } else {
                             None
                         };
-                        let v = self.expr(value)?;
+                        // `x = function () {}` names the function `x`.
+                        let v = if compound || *paren_target {
+                            self.expr(value)?
+                        } else {
+                            let bt = crate::ast::BindingTarget::Ident(id.clone());
+                            self.expr_named(value, &bt)?
+                        };
                         let src = match cur {
                             Some(cur) => self.emit_binop(Self::compound_binop(*op)?, cur, v)?,
                             None => v,
@@ -16625,6 +16660,20 @@ impl Compiler {
                 exclude: named.to_vec(),
                 keys: dyn_keys.to_vec(),
             });
+        }
+    }
+
+    /// A class field initializer's value, an anonymous function named `name`
+    /// (NamedEvaluation).
+    fn named_field_value(&mut self, e: &Expr, name: &str) -> Result<Reg, CompileError> {
+        if is_anonymous_fn_def(e) {
+            let bt = BindingTarget::Ident(Ident {
+                name: name.into(),
+                span: crate::common::Span::point(0),
+            });
+            self.expr_named(e, &bt)
+        } else {
+            self.expr(e)
         }
     }
 
