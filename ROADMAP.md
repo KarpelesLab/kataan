@@ -201,24 +201,23 @@ calls and construction across the tiers, the `arguments` object, `new` on
 plain functions, and real `Cell::VmFunction` closures — **26,378 / 53,377** on
 the VM with the fallback disabled.
 
-**Progress (2026-09-30).** **50,604 / 53,377** on the VM (`KATAAN_VM_STRICT=1`),
-229 wrong results, gate unchanged. Since stage 4: lexical `this`/`new.target`,
+**Progress (2026-09-30).** **51,328 / 53,377** on the VM (`KATAAN_VM_STRICT=1`),
+232 wrong results, gate unchanged. Since stage 4: lexical `this`/`new.target`,
 TDZ cells, BigInt, spread, host `Function`/indirect `eval`, top-level direct
-`eval`, mapped `arguments` when aliasing is unobservable, object literals that
-*define* members, **runtime classes** (incl. private elements), and
-**suspended frames**: generators, `yield*`, async functions, async
-generators and `for await` are VM frames whose registers/pc/handlers are
-saved on `yield`/`await` and resumed by the host's own promise reactions
-(ordering identical to the tree-walker). Harness files (`propertyHelper.js`,
+`eval`, mapped `arguments` (real parameter-cell aliasing when observable),
+object literals that *define* members, **runtime classes** (incl. private
+elements), block functions + Annex B.3.3, `finally` on every exit path, and
+**suspended frames**: generators, `yield*`, async functions, async generators
+and `for await` are VM frames whose registers/pc/handlers are saved on
+`yield`/`await` and resumed by the host's own promise reactions (ordering
+identical to the tree-walker); generator `return()`/`throw()` run finally
+blocks and iterator closes. Harness files (`propertyHelper.js`,
 `temporalHelpers.js`, `asyncHelpers.js`) gated thousands of tests each.
 Remaining refusals, largest first:
 
-- direct `eval` inside functions/blocks 825; `with` (~150);
-- block-level function declarations (Annex B) 408;
-- mapped `arguments` whose aliasing is observable 238;
-- `using` declarations 124; `$262.agent` (agent baton handoff) 112;
-- `return()` into a generator suspended inside try/for-of/destructuring
-  (region cleanup) and `yield` inside try/finally.
+- direct `eval` inside functions/blocks 832; `with` (~150);
+- `using` declarations 126; `$262.agent` (agent baton handoff) 112;
+- `switch`-case function declarations ~84; parameter-default TDZ 66;
 - Then stage 5: per-function (not whole-program) fallback, and retiring the
   VM-private runtime pieces.
 
