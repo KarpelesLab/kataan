@@ -902,8 +902,9 @@ pub trait VmHost {
     ) -> Result<(), HostError>;
     /// `IsConstructor(v)`.
     fn is_constructor(&mut self, v: NanBox) -> bool;
-    /// `(%GeneratorFunction.prototype%, %GeneratorPrototype%)`.
-    fn generator_intrinsics(&mut self) -> Option<(NanBox, NanBox)>;
+    /// `(%GeneratorFunction.prototype%, %GeneratorPrototype%)`, or the async
+    /// generator ones.
+    fn generator_intrinsics(&mut self, is_async: bool) -> Option<(NanBox, NanBox)>;
     /// A fresh pending host promise (an async function's result).
     fn new_promise(&mut self) -> NanBox;
     /// Resolves (`fulfilled`) or rejects the host promise `p` with `v`.
@@ -1429,12 +1430,17 @@ const GEN_EXECUTING: f64 = 2.0;
 const GEN_COMPLETED: f64 = 3.0;
 
 /// [`Op::InitGenerator`].
-fn init_generator(ctx: &mut Ctx, f: NanBox) -> Result<(), VmError> {
+fn init_generator(ctx: &mut Ctx, funcs: &[FnProto], f: NanBox) -> Result<(), VmError> {
     let fh = f
         .as_handle()
         .map(Handle::from_raw)
         .ok_or(VmError::NotAnObject)?;
-    let (gf_proto, g_proto) = with_host(ctx, |h| h.generator_intrinsics())
+    let is_async = ctx
+        .realm
+        .vm_function(fh)
+        .and_then(|(id, _)| funcs.get(id as usize))
+        .is_some_and(|p| p.is_async);
+    let (gf_proto, g_proto) = with_host(ctx, |h| h.generator_intrinsics(is_async))
         .flatten()
         .ok_or(VmError::Unsupported)?;
     ctx.realm
@@ -1466,10 +1472,11 @@ fn make_generator(
         Some(c) => vm_get_prop(ctx, funcs, c, "prototype", &mut PropertyCache::default())?,
         None => NanBox::undefined(),
     };
+    let is_async = funcs.get(id).is_some_and(|p| p.is_async);
     let proto = if is_object_value(ctx.realm, proto) {
         proto
     } else {
-        with_host(ctx, |h| h.generator_intrinsics())
+        with_host(ctx, |h| h.generator_intrinsics(is_async))
             .flatten()
             .ok_or(VmError::Unsupported)?
             .1
@@ -1478,7 +1485,16 @@ fn make_generator(
         .realm
         .new_object_with_proto(proto.as_handle().map(Handle::from_raw));
     let state = gen_state_array(ctx, id, GEN_SUSPENDED_START, pc, 0, regs, &handlers);
-    ctx.realm.set_hidden_property(g, VM_GEN, state);
+    if is_async {
+        // An async generator also carries its request queue (state slot 6).
+        let q = ctx.realm.new_array(Vec::new());
+        if let Some(sh) = state.as_handle().map(Handle::from_raw) {
+            ctx.realm.array_push(sh, NanBox::handle(q.to_raw()));
+        }
+        ctx.realm.set_hidden_property(g, VM_AGEN, state);
+    } else {
+        ctx.realm.set_hidden_property(g, VM_GEN, state);
+    }
     Ok(NanBox::handle(g.to_raw()))
 }
 
@@ -1649,6 +1665,409 @@ pub(crate) fn resume_vm_async(
             Err(VmError::Unsupported)
         } else {
             r
+        }
+    })();
+    *host.realm_slot() = realm;
+    result
+}
+
+/// The hidden slot of a VM async generator: its [`VM_GEN`]-shaped state plus
+/// the request queue (slot 6: an array of `[kind, value, promise]`).
+pub(crate) const VM_AGEN: &str = "\0vmagen";
+
+/// An async generator whose `return` request awaits its value (completed).
+const GEN_AWAITING_RETURN: f64 = 4.0;
+/// An async generator resumed by `return(v)` at a `yield`: awaiting `v` in
+/// the body (a rejection throws at the `yield`).
+const GEN_RETURN_AWAIT: f64 = 5.0;
+
+/// The pieces of an async generator's state array.
+struct AgenState {
+    state: Handle,
+    id: usize,
+    status: f64,
+    pc: usize,
+    dst: Reg,
+    queue: Handle,
+}
+
+fn agen_state(ctx: &Ctx, generator: NanBox) -> Result<AgenState, VmError> {
+    let gh = generator
+        .as_handle()
+        .map(Handle::from_raw)
+        .ok_or(VmError::NotAnObject)?;
+    let sh = ctx
+        .realm
+        .get_property(gh, VM_AGEN)
+        .and_then(|s| s.as_handle())
+        .map(Handle::from_raw)
+        .ok_or(VmError::NotAnObject)?;
+    let e = ctx
+        .realm
+        .array_elements(sh)
+        .map(<[_]>::to_vec)
+        .unwrap_or_default();
+    let num = |i: usize| e.get(i).and_then(|x| x.as_number()).unwrap_or(0.0);
+    let queue = e
+        .get(6)
+        .and_then(|q| q.as_handle())
+        .map(Handle::from_raw)
+        .ok_or(VmError::NotAnObject)?;
+    Ok(AgenState {
+        state: sh,
+        id: num(0) as usize,
+        status: num(1),
+        pc: num(2) as usize,
+        dst: num(3) as Reg,
+        queue,
+    })
+}
+
+/// Loads the suspended frame (registers, handlers) of state array `sh`.
+fn load_frame(ctx: &Ctx, sh: Handle) -> (Vec<NanBox>, Vec<(usize, Reg)>) {
+    let e = ctx
+        .realm
+        .array_elements(sh)
+        .map(<[_]>::to_vec)
+        .unwrap_or_default();
+    let regs: Vec<NanBox> = e
+        .get(4)
+        .and_then(|r| r.as_handle())
+        .and_then(|r| ctx.realm.array_elements(Handle::from_raw(r)))
+        .map(<[_]>::to_vec)
+        .unwrap_or_default();
+    let handlers = e
+        .get(5)
+        .and_then(|r| r.as_handle())
+        .and_then(|r| ctx.realm.array_elements(Handle::from_raw(r)))
+        .map(|hs| {
+            hs.chunks(2)
+                .map(|c| {
+                    (
+                        c[0].as_number().unwrap_or(0.0) as usize,
+                        c.get(1).and_then(|x| x.as_number()).unwrap_or(0.0) as Reg,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (regs, handlers)
+}
+
+/// Saves a suspended frame into state array `sh` with status `status`.
+fn save_frame(
+    ctx: &mut Ctx,
+    sh: Handle,
+    status: f64,
+    pc: usize,
+    dst: Reg,
+    regs: Vec<NanBox>,
+    handlers: &[(usize, Reg)],
+) {
+    let r = ctx.realm.new_array(regs);
+    let hs: Vec<NanBox> = handlers
+        .iter()
+        .flat_map(|(t, reg)| [NanBox::number(*t as f64), NanBox::number(f64::from(*reg))])
+        .collect();
+    let h = ctx.realm.new_array(hs);
+    ctx.realm.set_element(sh, 1, NanBox::number(status));
+    ctx.realm.set_element(sh, 2, NanBox::number(pc as f64));
+    ctx.realm.set_element(sh, 3, NanBox::number(f64::from(dst)));
+    ctx.realm.set_element(sh, 4, NanBox::handle(r.to_raw()));
+    ctx.realm.set_element(sh, 5, NanBox::handle(h.to_raw()));
+}
+
+/// Settles the front request's promise and dequeues it (the queue in slot 6
+/// of state array `state` is replaced by the rest).
+fn agen_settle_front(ctx: &mut Ctx, state: Handle, queue: Handle, v: NanBox, fulfilled: bool) {
+    let items = ctx
+        .realm
+        .array_elements(queue)
+        .map(<[_]>::to_vec)
+        .unwrap_or_default();
+    let Some(front) = items
+        .first()
+        .and_then(|f| f.as_handle())
+        .map(Handle::from_raw)
+    else {
+        return;
+    };
+    let p = ctx
+        .realm
+        .array_elements(front)
+        .and_then(|r| r.get(2).copied())
+        .unwrap_or(NanBox::undefined());
+    let rest = ctx.realm.new_array(items[1..].to_vec());
+    ctx.realm
+        .set_element(state, 6, NanBox::handle(rest.to_raw()));
+    with_host(ctx, |h| h.settle_promise(p, v, fulfilled));
+}
+
+/// The front request `(kind, value)` of `queue`, if any.
+fn agen_front(ctx: &Ctx, queue: Handle) -> Option<(u8, NanBox)> {
+    let items = ctx.realm.array_elements(queue)?;
+    let front = items.first()?.as_handle().map(Handle::from_raw)?;
+    let r = ctx.realm.array_elements(front)?;
+    Some((
+        r.first().and_then(|k| k.as_number()).unwrap_or(0.0) as u8,
+        r.get(1).copied().unwrap_or(NanBox::undefined()),
+    ))
+}
+
+/// AsyncGeneratorEnqueue: queues `kind` (0 next, 1 throw, 2 return) with `v`,
+/// returns its promise, and drains the queue when the generator is idle.
+fn vm_agen_enqueue(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    generator: NanBox,
+    kind: u8,
+    v: NanBox,
+) -> Result<NanBox, VmError> {
+    let st = agen_state(ctx, generator)?;
+    let p = with_host(ctx, |h| h.new_promise()).ok_or(VmError::Unsupported)?;
+    let req = ctx
+        .realm
+        .new_array(alloc::vec![NanBox::number(f64::from(kind)), v, p]);
+    ctx.realm.array_push(st.queue, NanBox::handle(req.to_raw()));
+    if st.status != GEN_EXECUTING
+        && st.status != GEN_AWAITING_RETURN
+        && st.status != GEN_RETURN_AWAIT
+    {
+        agen_drain(ctx, funcs, generator)?;
+    }
+    Ok(p)
+}
+
+/// Services queued requests until the queue empties or the generator parks
+/// on an `await` (AsyncGeneratorResume / AsyncGeneratorDrainQueue).
+fn agen_drain(ctx: &mut Ctx, funcs: &[FnProto], generator: NanBox) -> Result<(), VmError> {
+    loop {
+        let st = agen_state(ctx, generator)?;
+        let Some((kind, v)) = agen_front(ctx, st.queue) else {
+            return Ok(());
+        };
+        let mut status = st.status;
+        if status == GEN_SUSPENDED_START && kind != 0 {
+            status = GEN_COMPLETED;
+            ctx.realm.set_element(st.state, 1, NanBox::number(status));
+        }
+        // `return(v)` at a `yield`: `Await(v)` in the body — fulfilled, the
+        // generator returns (no enclosing finally: refused at compile);
+        // rejected, the reason is thrown at the `yield`.
+        if status == GEN_SUSPENDED_YIELD && kind == 2 {
+            ctx.realm
+                .set_element(st.state, 1, NanBox::number(GEN_RETURN_AWAIT));
+            match with_host(ctx, |h| h.await_value(v, generator)) {
+                Some(Ok(())) => return Ok(()),
+                Some(Err(HostError::Thrown(e))) => {
+                    ctx.realm
+                        .set_element(st.state, 1, NanBox::number(GEN_EXECUTING));
+                    let (mut regs, handlers) = load_frame(ctx, st.state);
+                    let proto = funcs.get(st.id).ok_or(VmError::Unsupported)?;
+                    let r =
+                        run_frame_at(ctx, funcs, &proto.ops, &mut regs, st.pc, handlers, Some(e));
+                    if !agen_step(ctx, funcs, generator, st.id, regs, r)? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                _ => return Err(VmError::Unsupported),
+            }
+        }
+        if status == GEN_COMPLETED {
+            match kind {
+                0 => {
+                    let r = iter_result(ctx, NanBox::undefined(), true);
+                    agen_settle_front(ctx, st.state, st.queue, r, true);
+                    continue;
+                }
+                1 => {
+                    ctx.realm
+                        .set_element(st.state, 1, NanBox::number(GEN_COMPLETED));
+                    agen_settle_front(ctx, st.state, st.queue, v, false);
+                    continue;
+                }
+                _ => {
+                    ctx.realm
+                        .set_element(st.state, 1, NanBox::number(GEN_AWAITING_RETURN));
+                    match with_host(ctx, |h| h.await_value(v, generator)) {
+                        Some(Ok(())) => return Ok(()),
+                        Some(Err(HostError::Thrown(e))) => {
+                            ctx.realm
+                                .set_element(st.state, 1, NanBox::number(GEN_COMPLETED));
+                            agen_settle_front(ctx, st.state, st.queue, e, false);
+                            continue;
+                        }
+                        _ => return Err(VmError::Unsupported),
+                    }
+                }
+            }
+        }
+        // Resume the body.
+        let (mut regs, handlers) = load_frame(ctx, st.state);
+        let inject = match kind {
+            1 => Some(v),
+            _ => {
+                if status == GEN_SUSPENDED_YIELD
+                    && let Some(slot) = regs.get_mut(st.dst as usize)
+                {
+                    *slot = v;
+                }
+                None
+            }
+        };
+        ctx.realm
+            .set_element(st.state, 1, NanBox::number(GEN_EXECUTING));
+        let proto = funcs.get(st.id).ok_or(VmError::Unsupported)?;
+        let r = run_frame_at(ctx, funcs, &proto.ops, &mut regs, st.pc, handlers, inject);
+        if !agen_step(ctx, funcs, generator, st.id, regs, r)? {
+            return Ok(());
+        }
+    }
+}
+
+/// Handles one run of an async generator's body: a `yield` settles the front
+/// request (→ `true`: keep draining), an `await` parks the frame (→ `false`),
+/// a return/throw completes it (→ `true`).
+fn agen_step(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    generator: NanBox,
+    id: usize,
+    mut regs: Vec<NanBox>,
+    mut r: Result<FrameExit, VmError>,
+) -> Result<bool, VmError> {
+    let st = agen_state(ctx, generator)?;
+    let proto = funcs.get(id).ok_or(VmError::Unsupported)?;
+    loop {
+        match r {
+            Ok(FrameExit::Yield {
+                value,
+                pc,
+                handlers,
+                dst,
+            }) => {
+                let is_await = pc
+                    .checked_sub(1)
+                    .and_then(|i| proto.ops.get(i))
+                    .is_some_and(|op| matches!(op, Op::Await { .. }));
+                if is_await {
+                    save_frame(ctx, st.state, GEN_EXECUTING, pc, dst, regs, &handlers);
+                    match with_host(ctx, |h| h.await_value(value, generator)) {
+                        Some(Ok(())) => return Ok(false),
+                        Some(Err(HostError::Thrown(e))) => {
+                            let (mut rg, hs) = load_frame(ctx, st.state);
+                            r = run_frame_at(ctx, funcs, &proto.ops, &mut rg, pc, hs, Some(e));
+                            regs = rg;
+                            continue;
+                        }
+                        _ => return Err(VmError::Unsupported),
+                    }
+                }
+                save_frame(ctx, st.state, GEN_SUSPENDED_YIELD, pc, dst, regs, &handlers);
+                let res = iter_result(ctx, value, false);
+                agen_settle_front(ctx, st.state, st.queue, res, true);
+                return Ok(true);
+            }
+            Ok(FrameExit::Return(v)) => {
+                ctx.realm
+                    .set_element(st.state, 1, NanBox::number(GEN_COMPLETED));
+                let res = iter_result(ctx, v.unwrap_or(NanBox::undefined()), true);
+                agen_settle_front(ctx, st.state, st.queue, res, true);
+                return Ok(true);
+            }
+            Err(VmError::Thrown(e)) => {
+                ctx.realm
+                    .set_element(st.state, 1, NanBox::number(GEN_COMPLETED));
+                agen_settle_front(ctx, st.state, st.queue, e, false);
+                return Ok(true);
+            }
+            Ok(FrameExit::Tail { .. }) => return Err(VmError::Unsupported),
+            Err(other) => return Err(other),
+        }
+    }
+}
+
+/// The host's `%AsyncGeneratorPrototype%` `next`/`throw`/`return` (`kind` 0/1/2)
+/// on a VM async generator: AsyncGeneratorEnqueue. Returns the promise.
+///
+/// # Errors
+/// A VM fault.
+pub(crate) fn vm_agen_request(
+    host: &mut dyn VmHost,
+    table: &alloc::rc::Rc<[FnProto]>,
+    generator: NanBox,
+    kind: u8,
+    v: NanBox,
+) -> Result<NanBox, VmError> {
+    let mut realm = core::mem::take(host.realm_slot());
+    let result = {
+        let mut ctx = hosted_ctx(&mut realm, host);
+        let r = vm_agen_enqueue(&mut ctx, table, generator, kind, v);
+        if r.is_ok() && !ctx.microtasks.is_empty() {
+            Err(VmError::Unsupported)
+        } else {
+            r
+        }
+    };
+    *host.realm_slot() = realm;
+    result
+}
+
+/// An await reaction for a VM async generator: resumes the body parked on an
+/// `await` (or settles an awaited `return` request), then keeps draining.
+///
+/// # Errors
+/// A VM fault.
+pub(crate) fn resume_vm_agen(
+    host: &mut dyn VmHost,
+    table: &alloc::rc::Rc<[FnProto]>,
+    generator: NanBox,
+    fulfilled: bool,
+    v: NanBox,
+) -> Result<(), VmError> {
+    let mut realm = core::mem::take(host.realm_slot());
+    let result = (|| {
+        let mut ctx = hosted_ctx(&mut realm, host);
+        let ctx = &mut ctx;
+        let st = agen_state(ctx, generator)?;
+        if st.status == GEN_RETURN_AWAIT && fulfilled {
+            ctx.realm
+                .set_element(st.state, 1, NanBox::number(GEN_COMPLETED));
+            let res = iter_result(ctx, v, true);
+            agen_settle_front(ctx, st.state, st.queue, res, true);
+        } else if st.status == GEN_AWAITING_RETURN {
+            ctx.realm
+                .set_element(st.state, 1, NanBox::number(GEN_COMPLETED));
+            if fulfilled {
+                let res = iter_result(ctx, v, true);
+                agen_settle_front(ctx, st.state, st.queue, res, true);
+            } else {
+                agen_settle_front(ctx, st.state, st.queue, v, false);
+            }
+        } else {
+            ctx.realm
+                .set_element(st.state, 1, NanBox::number(GEN_EXECUTING));
+            let (mut regs, handlers) = load_frame(ctx, st.state);
+            let inject = if fulfilled {
+                if let Some(slot) = regs.get_mut(st.dst as usize) {
+                    *slot = v;
+                }
+                None
+            } else {
+                Some(v)
+            };
+            let proto = table.get(st.id).ok_or(VmError::Unsupported)?;
+            let r = run_frame_at(ctx, table, &proto.ops, &mut regs, st.pc, handlers, inject);
+            if !agen_step(ctx, table, generator, st.id, regs, r)? {
+                return Ok(());
+            }
+        }
+        agen_drain(ctx, table, generator)?;
+        if ctx.microtasks.is_empty() {
+            Ok(())
+        } else {
+            Err(VmError::Unsupported)
         }
     })();
     *host.realm_slot() = realm;
@@ -2566,13 +2985,13 @@ fn call_with_inner(
         // a body that awaits falls back at compile time.)
         // A hosted async function: its result is a host promise, and each `await`
         // parks the frame on a controller the host's reactions resume.
-        if proto.is_async && ctx.host.is_some() {
+        if proto.is_async && !proto.is_generator && ctx.host.is_some() {
             let p = with_host(ctx, |h| h.new_promise()).ok_or(VmError::Unsupported)?;
             let r = run_frame(ctx, funcs, body, &mut regs);
             drive_async(ctx, funcs, id, None, p, regs, r)?;
             return Ok(p);
         }
-        if proto.is_async {
+        if proto.is_async && !proto.is_generator {
             let p = ctx.realm.new_promise();
             // The returned promise is a Rust local across the body; a safepoint
             // inside would otherwise not see it.
@@ -5035,7 +5454,7 @@ fn run_frame_at(
             }
             Op::InitGenerator { f } => {
                 let fv = regs[*f as usize];
-                if let Err(e) = init_generator(ctx, fv) {
+                if let Err(e) = init_generator(ctx, funcs, fv) {
                     handle_throw!(e);
                 }
             }
@@ -9639,7 +10058,7 @@ fn free_of_nonarrow(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<Str
 /// would otherwise compile as an ordinary function and return `undefined`
 /// instead of a generator object.
 fn refuse_generator(f: &crate::ast::Function, hosted: bool) -> Result<(), CompileError> {
-    if f.is_generator && (!hosted || f.is_async) {
+    if f.is_generator && !hosted {
         Err(CompileError::Unsupported("generator function"))
     } else {
         Ok(())
@@ -10182,10 +10601,6 @@ impl Compiler {
         // which is not yet unified with the host's (`ROADMAP.md` §2.0 stage 5):
         // mixed with the host's promises their ordering and rejection semantics
         // diverge. A hosted run leaves them to the tree-walker.
-        // A hosted async generator is not modelled (its request queue).
-        if hosted && is_async && is_generator {
-            return Err(CompileError::Unsupported("async generator"));
-        }
         // Which of this function's own names are captured by nested functions →
         // must be cells.
         // A parameter default that reads its own or a later parameter hits
@@ -11450,6 +11865,17 @@ impl Compiler {
                 };
                 self.emit_unwind(0, true);
                 self.emit_derived_return(v);
+                Ok(None)
+            }
+            // An async generator's `return v` returns `await v`.
+            Stmt::Return {
+                argument: Some(e), ..
+            } if self.in_generator && self.in_async => {
+                let v = self.expr(e)?;
+                let t = self.alloc();
+                self.ops.push(Op::Await { dst: t, src: v });
+                self.emit_unwind(0, true);
+                self.ops.push(Op::Return { src: t });
                 Ok(None)
             }
             // Leaving `for-of` loops: close their iterators after the value.
@@ -13312,10 +13738,16 @@ impl Compiler {
                 if self.finally_depth > 0 {
                     return Err(CompileError::Unsupported("yield inside try/finally"));
                 }
-                let src = match argument {
+                let mut src = match argument {
                     Some(e) => self.expr(e)?,
                     None => self.constant(NanBox::undefined())?,
                 };
+                // An async generator's `yield v` yields `await v`.
+                if self.in_async {
+                    let t = self.alloc();
+                    self.ops.push(Op::Await { dst: t, src });
+                    src = t;
+                }
                 let dst = self.alloc();
                 self.ops.push(Op::Yield { dst, src });
                 Ok(dst)

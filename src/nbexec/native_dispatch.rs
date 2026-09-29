@@ -2723,6 +2723,24 @@ impl<'a> Interp<'a> {
             }
             // Async-generator `next`/`return`/`throw`: these ALWAYS return a
             // promise, so a brand-check failure rejects rather than throwing.
+            // A bytecode-VM async generator services its queue on the VM.
+            N_ASYNC_GEN_NEXT | N_ASYNC_GEN_THROW | N_ASYNC_GEN_RETURN
+                if self.this_val.as_handle().is_some_and(|h| {
+                    self.realm
+                        .get_property(Handle::from_raw(h), crate::nbvm::VM_AGEN)
+                        .is_some()
+                }) && self.vm_table.is_some() =>
+            {
+                let table = self.vm_table.clone().expect("checked");
+                let kind = match id {
+                    N_ASYNC_GEN_THROW => 1,
+                    N_ASYNC_GEN_RETURN => 2,
+                    _ => 0,
+                };
+                let this = self.this_val;
+                crate::nbvm::vm_agen_request(self, &table, this, kind, arg(0))
+                    .map_err(super::vm_to_exec)?
+            }
             N_ASYNC_GEN_NEXT => {
                 let this = self.this_val;
                 self.async_gen_resume(this, generator::Resumption::Next(arg(0)))

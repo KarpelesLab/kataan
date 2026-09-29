@@ -9983,9 +9983,18 @@ impl crate::nbvm::VmHost for Interp<'_> {
         Ok(())
     }
 
-    fn generator_intrinsics(&mut self) -> Option<(NanBox, NanBox)> {
-        let gf = self.generator_function_prototype()?;
-        let g = self.generator_prototype()?;
+    fn generator_intrinsics(&mut self, is_async: bool) -> Option<(NanBox, NanBox)> {
+        let (gf, g) = if is_async {
+            (
+                self.async_generator_function_prototype()?,
+                self.async_generator_prototype()?,
+            )
+        } else {
+            (
+                self.generator_function_prototype()?,
+                self.generator_prototype()?,
+            )
+        };
         Some((NanBox::handle(gf.to_raw()), NanBox::handle(g.to_raw())))
     }
 
