@@ -8120,7 +8120,7 @@ fn refs_stmt(s: &Stmt, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
             refs_expr(object, direct, nested);
             refs_stmt(body, direct, nested);
         }
-        Stmt::Function(f) => nested.extend(free_of_function(&f.params, &f.body)),
+        Stmt::Function(f) => nested.extend(free_of_nonarrow(&f.params, &f.body)),
         Stmt::Class(c) => refs_class(c, direct, nested),
         Stmt::Export(crate::ast::ExportDecl::Decl { declaration, .. })
         | Stmt::Export(crate::ast::ExportDecl::Default { declaration, .. }) => {
@@ -8204,19 +8204,23 @@ fn refs_class(c: &crate::ast::Class, direct: &mut BTreeSet<String>, nested: &mut
                 if let PropertyKey::Computed(e) = &m.key {
                     refs_expr(e, direct, nested);
                 }
-                nested.extend(free_of_function(&m.value.params, &m.value.body));
+                nested.extend(free_of_nonarrow(&m.value.params, &m.value.body));
             }
             ClassMember::Field(f) => {
                 if let PropertyKey::Computed(e) = &f.key {
                     refs_expr(e, direct, nested);
                 }
                 if let Some(v) = &f.value {
+                    // A field initializer's `this` is the instance.
                     let mut inner = BTreeSet::new();
-                    refs_expr(v, &mut inner, nested);
+                    let mut inner_nested = BTreeSet::new();
+                    refs_expr(v, &mut inner, &mut inner_nested);
+                    inner.extend(inner_nested);
+                    inner.remove(THIS_NAME);
                     nested.extend(inner);
                 }
             }
-            ClassMember::StaticBlock { body, .. } => nested.extend(free_of_function(&[], body)),
+            ClassMember::StaticBlock { body, .. } => nested.extend(free_of_nonarrow(&[], body)),
         }
     }
 }
@@ -8240,7 +8244,7 @@ fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
         Expr::Ident(id) => {
             direct.insert(String::from(&*id.name));
         }
-        Expr::Function(f) => nested.extend(free_of_function(&f.params, &f.body)),
+        Expr::Function(f) => nested.extend(free_of_nonarrow(&f.params, &f.body)),
         Expr::Arrow(a) => {
             let body: Vec<Stmt> = match &a.body {
                 crate::ast::ArrowBody::Block(b) => b.clone(),
@@ -8335,7 +8339,7 @@ fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
                         if let PropertyKey::Computed(e) = key {
                             refs_expr(e, direct, nested);
                         }
-                        nested.extend(free_of_function(&value.params, &value.body));
+                        nested.extend(free_of_nonarrow(&value.params, &value.body));
                     }
                 }
             }
@@ -8347,10 +8351,26 @@ fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
         | Expr::Str { .. }
         | Expr::Regex { .. }
         | Expr::PrivateName(..)
-        | Expr::This(_)
-        | Expr::Super(_)
         | Expr::NewTarget(_) => {}
+        // `this` (and `super`, whose receiver is `this`) is a lexical reference
+        // for an arrow: the hidden binding [`THIS_NAME`] of the nearest
+        // non-arrow function.
+        Expr::This(_) | Expr::Super(_) => {
+            direct.insert(String::from(THIS_NAME));
+        }
     }
+}
+
+/// The hidden binding through which arrows reach their enclosing function's
+/// `this` (a function whose nested arrows use `this` boxes it into a cell).
+const THIS_NAME: &str = "\0this";
+
+/// [`free_of_function`] for a function with its *own* `this` (anything but an
+/// arrow): `this` inside it is not a reference to the enclosing one.
+fn free_of_nonarrow(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<String> {
+    let mut free = free_of_function(params, body);
+    free.remove(THIS_NAME);
+    free
 }
 
 /// A generator function is not something the VM compiles (it cannot suspend
@@ -8811,6 +8831,22 @@ impl Compiler {
         // Which of this function's own names are captured by nested functions →
         // must be cells.
         let mut cell_names = captured_names(params, body);
+        // A non-arrow function whose nested arrows use `this` boxes it.
+        if !is_arrow {
+            let mut direct = BTreeSet::new();
+            let mut nested = BTreeSet::new();
+            for s in body {
+                refs_stmt(s, &mut direct, &mut nested);
+            }
+            for p in params {
+                if let Some(d) = &p.default {
+                    refs_expr(d, &mut direct, &mut nested);
+                }
+            }
+            if nested.contains(THIS_NAME) {
+                cell_names.insert(String::from(THIS_NAME));
+            }
+        }
         // Whether this function needs its own `arguments` object: it is not an
         // arrow (which sees its parent's) or a script body, no parameter takes the
         // name, and the body — or a nested arrow — can refer to it.
@@ -8944,6 +8980,11 @@ impl Compiler {
         if hosted && !strict && !is_arrow && !is_main {
             let this = c.this_reg;
             c.ops.push(Op::BindThis { this });
+        }
+        if c.cell_names.contains(THIS_NAME) {
+            let b = c.declare(THIS_NAME);
+            let this = c.this_reg;
+            c.write_var(b, this);
         }
         // Bind `arguments` before any parameter default runs (a default may read
         // it).
@@ -11587,7 +11628,11 @@ impl Compiler {
                 self.write_var(b, next);
                 Ok(if *prefix { next } else { old })
             }
-            Expr::This(_) => Ok(self.this_reg),
+            // In an arrow, `this` is the enclosing function's (captured).
+            Expr::This(_) => match self.lookup(THIS_NAME) {
+                Some(b) => Ok(self.read_var(b)),
+                None => Ok(self.this_reg),
+            },
             // A regex literal `/source/flags`.
             Expr::Regex { pattern, flags, .. } => {
                 let dst = self.alloc();
@@ -12182,7 +12227,11 @@ impl Compiler {
     ) -> Result<Reg, CompileError> {
         // Captures = free variables that resolve to an enclosing binding (others
         // are top-level functions / globals, reached directly).
-        let free = free_of_function(params, body);
+        let free = if is_arrow {
+            free_of_function(params, body)
+        } else {
+            free_of_nonarrow(params, body)
+        };
         // A *named function expression* binds its own name inside its body (to the
         // function itself). If that name is referenced, thread it as a trailing
         // "self" capture: a cell we create here and backfill with the finished
