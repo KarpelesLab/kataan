@@ -23,13 +23,13 @@ tri-modal model proven out in the sibling projects
 >   objects/arrays, method calls with `call`/`apply`/`bind`, `new`/`new.target`,
 >   all loops + `for-of`/`for-in`/`switch`/`try`-`catch`-`finally`,
 >   closures (incl. mutual recursion), destructuring, rest/spread, **classes**
->   with `extends`/`super` and getters/setters, and **lazy, truly-suspendable
->   generators and `async`/`await`** (`yield`/`next(v)`/`.throw()`, async
->   generators, `for await`, and `await` resuming as a microtask with correct
->   ordering) — faulting to the tree-walker for what it doesn't yet compile,
->   notably `eval`/`Function`, `new` on a plain (non-class) function, and the
->   `arguments` object. (The Test262 harness itself uses the last two, which is
->   why the corpus runs on the tree-walker.)
+>   with `extends`/`super` and getters/setters, `new` on plain functions, the
+>   `arguments` object, and `async`/`await` — running inside the tree-walker's
+>   runtime (one realm, global environment and built-in library) and faulting
+>   to the tree-walker for what it doesn't yet compile, notably generators,
+>   `eval`/`Function` and computed class keys. About half of the Test262 corpus
+>   (26,378 tests) now runs entirely on the VM; the rest re-runs on the
+>   tree-walker (see ROADMAP §2.0).
 >
 > Conformance is measured against the **full upstream tc39/Test262** (~53k tests,
 > `staging/` included), run in CI and gated by a known-failures ledger that only

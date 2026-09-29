@@ -195,6 +195,26 @@ needs no swap.
 
 Exit: the corpus runs on the VM with `KATAAN_VM_STRICT` and the same ledger.
 
+**Progress (2026-09-29).** Stages 1–4 landed (`dc64202`, `7bce553`, `ed02c69`,
+`94da4ef`): hosted runs, the global environment and a shared function table,
+calls and construction across the tiers, the `arguments` object, `new` on
+plain functions, and real `Cell::VmFunction` closures. With the fallback
+disabled **26,378 / 53,377** now pass on the VM (the harness itself runs there).
+Measured next steps, largest first:
+
+- **4,352 wrong results** (not refusals): VM paths that throw where the
+  interpreter does not — mostly property reads and calls on values from the
+  host (`cannot read property of null or undefined`, `is not a function`),
+  and expected exceptions the VM does not raise. Masked in normal mode by the
+  whole-program re-run; fix these before widening coverage.
+- Refusals: `eval`/`Function` 7,912; unsupported expression kinds 5,491;
+  computed/private class keys 2,920; `async` functions 2,555 (needs the
+  promise-queue unification); `extends` of a non-class 534; block-level
+  function declarations 332; mapped `arguments` with parameters 254.
+- Known gap: `name`/`length` of a VM closure are synthesized only on the VM's
+  own read paths — an interpreter-side `getOwnPropertyDescriptor(f, "length")`
+  does not see them.
+
 ## 2. The three headline engine deliverables
 
 These make Kataan more than a fast interpreter. They are *engine* capabilities
