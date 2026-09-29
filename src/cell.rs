@@ -269,6 +269,17 @@ pub enum Cell {
         /// The captured lexical environment.
         env: Scope,
     },
+    /// A bytecode-VM closure: an index into the running VM program's function
+    /// table plus the captured cells (one-element arrays) it closes over. Its
+    /// properties (`prototype`, user-assigned ones, …) live in the auxiliary
+    /// object, as for [`Cell::Function`]; `name` and `length` are synthesized
+    /// from the table entry.
+    VmFunction {
+        /// Index into the VM program's function table.
+        func: u32,
+        /// The captured cells, in the order the function's compiled body expects.
+        captures: Vec<NanBox>,
+    },
     /// A built-in (native) function, identified by an id the interpreter maps to
     /// a Rust implementation.
     Native(u16),
@@ -618,6 +629,7 @@ impl Cell {
         match self {
             Cell::Str(_) => "string",
             Cell::Function { .. }
+            | Cell::VmFunction { .. }
             | Cell::Native(_)
             | Cell::HostFn(_)
             | Cell::BoundNative { .. }
@@ -706,6 +718,14 @@ impl Trace for Cell {
             }
             // A closure (or class) keeps its captured environment alive.
             Cell::Function { env, .. } | Cell::Class { env, .. } => env.for_each_handle(visit),
+            // A VM closure keeps its captured cells alive.
+            Cell::VmFunction { captures, .. } => {
+                for c in captures {
+                    if let Some(raw) = c.as_handle() {
+                        visit(Handle::from_raw(raw));
+                    }
+                }
+            }
             // A collection's keys and values are reachable.
             Cell::Collection { entries, .. } => {
                 for (k, v) in entries {
@@ -778,6 +798,7 @@ impl crate::gc::Relocate for Cell {
             Cell::Object(o) => o.relocate_handles(forward),
             Cell::Array(elems) => elems.iter_mut().for_each(fwd),
             Cell::Function { env, .. } | Cell::Class { env, .. } => env.relocate_handles(forward),
+            Cell::VmFunction { captures, .. } => captures.iter_mut().for_each(fwd),
             Cell::Collection { entries, index, .. } => {
                 for (k, v) in entries {
                     fwd(k);

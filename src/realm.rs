@@ -2311,12 +2311,35 @@ impl Realm {
         self.heap.get(handle).and_then(Cell::as_array).is_some()
     }
 
-    /// Whether `handle` is a bytecode-VM function value — a closure represented as
-    /// an array tagged with the reserved `\0vmfn` marker. Such a value backs onto
-    /// an array cell but is a function, so `Array.isArray` must reject it.
+    /// Whether `handle` is a bytecode-VM closure ([`Cell::VmFunction`]).
     #[must_use]
     pub fn is_vm_function(&self, handle: Handle) -> bool {
-        self.get_property(handle, "\u{0}vmfn").is_some()
+        matches!(self.heap.get(handle), Some(Cell::VmFunction { .. }))
+    }
+
+    /// Whether `handle` is a bytecode-VM function *value*: a closure
+    /// ([`Cell::VmFunction`]) or a VM class constructor — an ordinary object the
+    /// VM tags with the reserved `\0vmfn` marker so it reports `typeof`
+    /// `"function"`.
+    #[must_use]
+    pub fn is_vm_function_value(&self, handle: Handle) -> bool {
+        self.is_vm_function(handle) || self.get_property(handle, "\u{0}vmfn").is_some()
+    }
+
+    /// Allocates a bytecode-VM closure over function-table entry `func`
+    /// capturing `captures`.
+    pub fn new_vm_function(&mut self, func: u32, captures: Vec<NanBox>) -> Handle {
+        self.heap.alloc(Cell::VmFunction { func, captures })
+    }
+
+    /// The function-table index and captured cells of the VM closure at
+    /// `handle`, if it is one.
+    #[must_use]
+    pub fn vm_function(&self, handle: Handle) -> Option<(u32, &[NanBox])> {
+        match self.heap.get(handle) {
+            Some(Cell::VmFunction { func, captures }) => Some((*func, captures)),
+            _ => None,
+        }
     }
 
     /// The own property names of the object at `handle`, in insertion order, or
@@ -2600,6 +2623,7 @@ impl Realm {
                     | Cell::HostFn(_)
                     | Cell::BoundNative { .. }
                     | Cell::Function { .. }
+                    | Cell::VmFunction { .. }
                     | Cell::Class { .. }
             )
         ) {
@@ -2899,6 +2923,7 @@ impl Realm {
                     | Cell::Collection { .. }
                     | Cell::Promise(_)
                     | Cell::Function { .. }
+                    | Cell::VmFunction { .. }
                     | Cell::Class { .. }
                     | Cell::Native(_)
                     | Cell::HostFn(_)
@@ -3813,6 +3838,7 @@ impl Realm {
             self.heap.get(handle),
             Some(
                 Cell::Function { .. }
+                    | Cell::VmFunction { .. }
                     | Cell::Class { .. }
                     | Cell::Native(_)
                     | Cell::HostFn(_)
@@ -4113,7 +4139,7 @@ impl Realm {
                 // A registered host function carries auxiliary named properties
                 // too (its `prototype` when `register_constructor`ed, and any own
                 // props an embedder sets on it).
-                || matches!(c, Cell::HostFn(_))
+                || matches!(c, Cell::HostFn(_) | Cell::VmFunction { .. })
                 || matches!(c, Cell::TypedArray { .. })
                 // A RegExp instance carries no inline object part, but a script may
                 // set own properties on it (`re.exec = fn`, a custom `lastIndex`
@@ -5106,7 +5132,12 @@ impl Realm {
                 // name is read from the own `name` property when materialized (else
                 // empty). This keeps `"" + fn` / `String(fn)` consistent with
                 // `fn.toString()`.
-                Some(Cell::Function { .. } | Cell::Native(_) | Cell::HostFn(_)) => {
+                Some(
+                    Cell::Function { .. }
+                    | Cell::VmFunction { .. }
+                    | Cell::Native(_)
+                    | Cell::HostFn(_),
+                ) => {
                     let h = Handle::from_raw(raw);
                     if let Some(src) = self.fn_source(h) {
                         return src.into();

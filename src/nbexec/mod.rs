@@ -9748,6 +9748,10 @@ impl crate::nbvm::VmHost for Interp<'_> {
         self.run_event_loop().map_err(exec_to_host)
     }
 
+    fn make_arguments(&mut self, args: &[NanBox], callee: NanBox, mapped: bool) -> NanBox {
+        self.make_arguments_object(args, callee, mapped.then_some(&[][..]))
+    }
+
     fn new_regexp(&mut self, source: &[u8], flags: &str) -> NanBox {
         NanBox::handle(self.new_regexp_instance(source, flags).to_raw())
     }

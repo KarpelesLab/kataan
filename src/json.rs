@@ -56,7 +56,7 @@ fn stringify_seen(
                 return Ok(Some(quote_wtf8(&bytes)));
             }
             // A bytecode-VM closure is a tagged array but a function — omitted.
-            if realm.is_vm_function(h) {
+            if realm.is_vm_function_value(h) {
                 return Ok(None);
             }
             let is_container = realm.array_elements(h).is_some() || realm.object_keys(h).is_some();
@@ -130,7 +130,7 @@ fn stringify_at(
                 return Ok(Some(quote_wtf8(&bytes)));
             }
             // A bytecode-VM closure is a tagged array but a function — omitted.
-            if realm.is_vm_function(h) {
+            if realm.is_vm_function_value(h) {
                 return Ok(None);
             }
             let inner = alloc::format!("{cur}{indent}");

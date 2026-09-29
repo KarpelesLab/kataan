@@ -28,7 +28,7 @@ impl<'a> Interp<'a> {
             || self.realm.class_at(handle).is_some()
             || self.realm.bound_native_at(handle).is_some()
             // A bytecode-VM function value, while a VM run is hosted here.
-            || (self.vm_table.is_some() && self.realm.is_vm_function(handle))
+            || (self.vm_table.is_some() && self.realm.is_vm_function_value(handle))
             // A class constructor has a `[[Call]]` (it throws "cannot be invoked
             // without 'new'"), so `IsCallable` is true for it — `typeof C` is
             // "function" and `[].sort(class {})` must not be rejected up front.
@@ -81,6 +81,13 @@ impl<'a> Interp<'a> {
         // A proxy constructs iff its target does.
         if let Some((target, _)) = self.realm.proxy_at(handle) {
             return self.is_constructor_value(NanBox::handle(target.to_raw()));
+        }
+        // A bytecode-VM function constructs iff the VM marked it constructible.
+        if self.vm_table.is_some() && self.realm.is_vm_function(handle) {
+            return self
+                .realm
+                .get_property(handle, crate::nbvm::VM_CTOR)
+                .is_some();
         }
         // A user class always constructs.
         if self.realm.class_at(handle).is_some() {
@@ -2787,10 +2794,21 @@ impl<'a> Interp<'a> {
         // "not a constructor" check is performed by the running execution context,
         // before any [[Construct]] would consult the callee's realm.
         let callee_h = callee.as_handle().map(Handle::from_raw);
-        // Constructing a bytecode-VM function is not modelled across the tiers
-        // yet (`ROADMAP.md` §2.0 stage 4): fault the hosted run.
-        if self.vm_table.is_some() && callee_h.is_some_and(|h| self.realm.is_vm_function(h)) {
-            return Err(ExecError::Unsupported("construct a bytecode-VM function"));
+        // A bytecode-VM function is constructed on the VM — when `new.target` is
+        // the function itself. A distinct one (`Reflect.construct(F, a, NT)`, a
+        // subclass `super()`) is not modelled across the tiers yet: fault the run.
+        if let Some(table) = self.vm_table.clone()
+            && callee_h.is_some_and(|h| self.realm.is_vm_function(h))
+        {
+            let distinct_target = [self.pending_new_target, self.reflect_new_target]
+                .into_iter()
+                .flatten()
+                .any(|nt| nt.as_handle() != callee.as_handle());
+            if distinct_target {
+                return Err(ExecError::Unsupported("construct a bytecode-VM function"));
+            }
+            return crate::nbvm::construct_vm_function(self, &table, callee, args)
+                .map_err(super::vm_to_exec);
         }
         let realm = if !self.is_constructor_value(callee)
             // See `call_with_this`: a Proxy's `[[Construct]]` runs in the caller's

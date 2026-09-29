@@ -105,6 +105,17 @@ pub enum Op {
     },
     /// `dst = true` iff the global-environment name `name` currently resolves.
     GlobalExists { dst: Reg, name: String },
+    /// The function's `arguments` object, built by the host from *every*
+    /// argument passed (not just the declared parameters) and the callee.
+    /// Always a function's first instruction: the call path fills `dst` on
+    /// entry, where all the arguments are still at hand, and the instruction
+    /// itself is then a no-op. `mapped` selects a sloppy-mode (mapped) object;
+    /// it is only compiled for a function with no parameters to alias.
+    MakeArguments { dst: Reg, mapped: bool },
+    /// Gives the freshly created constructor function `f` its `prototype`
+    /// object (with the `constructor` back-link) and marks it constructible
+    /// (hosted runs only).
+    InitFnPrototype { f: Reg },
     /// Initializes the hoisted global lexical binding `name` (a top-level
     /// `let`/`const`/`class`), ending its temporal dead zone.
     InitGlobal { name: String, src: Reg, konst: bool },
@@ -573,6 +584,9 @@ pub trait VmHost {
     /// # Errors
     /// An uncaught error from a job, or a host fault.
     fn run_jobs(&mut self) -> Result<(), HostError>;
+    /// A function's `arguments` object over `args` (unmapped when `mapped` is
+    /// false; mapped but with no parameter aliases otherwise).
+    fn make_arguments(&mut self, args: &[NanBox], callee: NanBox, mapped: bool) -> NanBox;
     /// A regular-expression literal `/source/flags`, built by the host.
     fn new_regexp(&mut self, source: &[u8], flags: &str) -> NanBox;
     /// Installs the running VM program's function table (returning the previous
@@ -639,6 +653,7 @@ fn hosted_ctx<'a>(realm: &'a mut Realm, host: &'a mut dyn VmHost) -> Ctx<'a> {
         frame_shadow: alloc::vec::Vec::new(),
         frames_published: 0,
         top_frame_roots: Vec::new(),
+        pending_callee: None,
     }
 }
 
@@ -661,6 +676,89 @@ fn vm_method_of(ctx: &Ctx, recv: NanBox, key: &str) -> Option<NanBox> {
         cur = ctx.realm.object_proto(c);
     }
     None
+}
+
+/// The hidden marker a constructible VM function carries (see
+/// [`init_fn_prototype`]); arrows, methods and async functions lack it.
+pub(crate) const VM_CTOR: &str = "\u{0}vmctor";
+
+/// Gives the VM function `f` its own `prototype` — a fresh object whose
+/// non-enumerable `constructor` links back to `f` — as a writable,
+/// non-enumerable, non-configurable property (ordinary function objects,
+/// ECMA-262 `MakeConstructor`), and marks `f` constructible.
+fn init_fn_prototype(realm: &mut Realm, f: Handle) {
+    let proto = realm.new_object();
+    realm.set_hidden_property(proto, "constructor", NanBox::handle(f.to_raw()));
+    realm.set_hidden_property(f, "prototype", NanBox::handle(proto.to_raw()));
+    realm.set_non_configurable_property(f, "prototype");
+    realm.set_hidden_property(f, VM_CTOR, NanBox::boolean(true));
+}
+
+/// `new f(...args)` for a VM function `f` (`[[Construct]]` of an ordinary
+/// function whose `new.target` is itself): a new object inheriting from
+/// `f.prototype` (or `%Object.prototype%` when that is not an object) is `this`
+/// for the body, and is the result unless the body returns an object.
+fn vm_construct(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    f: NanBox,
+    args: &[NanBox],
+) -> Result<NanBox, VmError> {
+    let Some(fh) = f.as_handle().map(Handle::from_raw) else {
+        return Err(VmError::Unsupported);
+    };
+    if ctx.realm.get_property(fh, VM_CTOR).is_none() {
+        let e = vm_error(ctx, "TypeError", "not a constructor");
+        return Err(VmError::Thrown(e));
+    }
+    let obj = ctx.realm.new_object();
+    if let Some(p) = ctx
+        .realm
+        .get_property(fh, "prototype")
+        .filter(|p| is_object_value(ctx.realm, *p))
+        .and_then(|p| p.as_handle())
+    {
+        ctx.realm.set_object_proto(obj, Some(Handle::from_raw(p)));
+    }
+    let this = NanBox::handle(obj.to_raw());
+    let r = call_closure(ctx, funcs, f, args, this)?;
+    Ok(if is_object_value(ctx.realm, r) {
+        r
+    } else {
+        this
+    })
+}
+
+/// Whether `v` is an Object (not a primitive — note strings are heap handles
+/// too).
+fn is_object_value(realm: &Realm, v: NanBox) -> bool {
+    v.as_handle().is_some() && matches!(realm.type_of_value(v), "object" | "function")
+}
+
+/// `new f(...args)` of the VM function `f` for the host (a `Reflect.construct`,
+/// or a `new` in interpreter code).
+///
+/// # Errors
+/// The constructor's throw (a `TypeError` for a non-constructor), or a VM
+/// fault.
+pub(crate) fn construct_vm_function(
+    host: &mut dyn VmHost,
+    table: &alloc::rc::Rc<[FnProto]>,
+    f: NanBox,
+    args: &[NanBox],
+) -> Result<NanBox, VmError> {
+    let mut realm = core::mem::take(host.realm_slot());
+    let result = {
+        let mut ctx = hosted_ctx(&mut realm, host);
+        let r = vm_construct(&mut ctx, table, f, args);
+        if r.is_ok() && !ctx.microtasks.is_empty() {
+            Err(VmError::Unsupported)
+        } else {
+            r
+        }
+    };
+    *host.realm_slot() = realm;
+    result
 }
 
 /// The `[[Prototype]]` a hosted VM closure gets: `%Function.prototype%`, so
@@ -815,6 +913,10 @@ struct Ctx<'a> {
     /// [`vm_safepoint`] can root them. Only maintained at `call_depth == 1`, the
     /// only depth that can collect.
     top_frame_roots: Vec<NanBox>,
+    /// The function value the next `call_with` invokes, when the caller knows it
+    /// (a call through a closure value): the callee of a function's `arguments`
+    /// object. Taken on entry, so it never leaks into a later call.
+    pending_callee: Option<NanBox>,
 }
 
 // The recursion-guard, handler-stack, JSON-depth, and string-length caps now
@@ -859,6 +961,7 @@ pub fn run_program(
         frame_shadow: alloc::vec::Vec::new(),
         frames_published: 0,
         top_frame_roots: Vec::new(),
+        pending_callee: None,
     };
     let value = call(&mut ctx, funcs, id, args)?;
     drain_microtasks(&mut ctx, funcs)?;
@@ -897,6 +1000,7 @@ pub fn run_program_capturing(
         frame_shadow: alloc::vec::Vec::new(),
         frames_published: 0,
         top_frame_roots: Vec::new(),
+        pending_callee: None,
     };
     let value = call(&mut ctx, funcs, id, args)?;
     // Run the promise event loop before returning (then-callbacks, async tails).
@@ -1014,6 +1118,9 @@ fn call_with_inner(
     let mut args: Vec<NanBox> = args.to_vec();
     let mut captures: Vec<NanBox> = captures.to_vec();
     let mut this_val = this_val;
+    // The callee value, if the caller knew it (the `arguments` object's
+    // `callee`). Taken now so it cannot leak into a later call.
+    let mut callee = ctx.pending_callee.take();
     // Where this activation's published inputs start; reset on every tail-call
     // rebinding and truncated back to on return.
     let inputs_mark = ctx.frame_shadow.len();
@@ -1051,6 +1158,20 @@ fn call_with_inner(
         // The `this` slot sits right after the captures.
         if let Some(slot) = regs.get_mut(proto.n_params + proto.n_captures) {
             *slot = this_val;
+        }
+        // The `arguments` object, over *every* argument passed (the registers
+        // hold only the declared parameters). A mapped object needs its callee.
+        if let Some(Op::MakeArguments { dst, mapped }) = proto.ops.first() {
+            let c = match (callee, *mapped) {
+                (Some(c), _) => c,
+                (None, false) => NanBox::undefined(),
+                (None, true) => return Err(VmError::Unsupported),
+            };
+            let v = with_host(ctx, |h| h.make_arguments(&args, c, *mapped))
+                .ok_or(VmError::Unsupported)?;
+            if let Some(slot) = regs.get_mut(*dst as usize) {
+                *slot = v;
+            }
         }
         // Republish the outermost activation's inputs for the GC safepoint: they
         // live in this function's Rust locals, which the collector cannot see.
@@ -1155,6 +1276,7 @@ fn call_with_inner(
                 args = targs;
                 captures = tcaps;
                 this_val = this;
+                callee = None;
             }
         }
     }
@@ -1301,6 +1423,7 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
         frame_shadow: alloc::vec::Vec::new(),
         frames_published: 0,
         top_frame_roots: Vec::new(),
+        pending_callee: None,
     };
     match run_frame(&mut ctx, &[], program, &mut regs)? {
         FrameExit::Return(v) => Ok(v.unwrap_or(NanBox::undefined())),
@@ -1722,9 +1845,8 @@ fn vm_get_prop(
             {
                 let nm = ctx
                     .realm
-                    .get_element(handle, 0)
-                    .as_number()
-                    .and_then(|f| funcs.get(f as usize))
+                    .vm_function(handle)
+                    .and_then(|(f, _)| funcs.get(f as usize))
                     .map_or("", |p| p.name.as_str());
                 let s = ctx.realm.new_string(nm);
                 return Ok(NanBox::handle(s.to_raw()));
@@ -1734,11 +1856,7 @@ fn vm_get_prop(
             if key == "prototype"
                 && ctx.realm.is_vm_function(handle)
                 && !ctx.realm.has_own(handle, "prototype")
-                && let Some(func_id) = ctx
-                    .realm
-                    .get_element(handle, 0)
-                    .as_number()
-                    .map(|f| f as u32)
+                && let Some((func_id, _)) = ctx.realm.vm_function(handle)
             {
                 let proto = ctx.realm.function_prototype(func_id);
                 return Ok(NanBox::handle(proto.to_raw()));
@@ -3229,6 +3347,13 @@ fn run_frame(
                     None => return Err(VmError::Unsupported),
                 }
             }
+            // Filled in by `call_with_inner` on entry.
+            Op::MakeArguments { .. } => {}
+            Op::InitFnPrototype { f } => {
+                if let Some(fh) = regs[*f as usize].as_handle().map(Handle::from_raw) {
+                    init_fn_prototype(ctx.realm, fh);
+                }
+            }
             Op::GlobalExists { dst, name } => match with_host(ctx, |h| h.global_exists(name)) {
                 Some(b) => regs[*dst as usize] = NanBox::boolean(b),
                 None => return Err(VmError::Unsupported),
@@ -3236,11 +3361,14 @@ fn run_frame(
             Op::Construct { dst, ctor, args } => {
                 let c = regs[*ctor as usize];
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
-                // Constructing a VM function is stage 4 of `ROADMAP.md` §2.0.
                 if c.as_handle()
                     .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
                 {
-                    return Err(VmError::Unsupported);
+                    match vm_construct(ctx, funcs, c, &argv) {
+                        Ok(v) => regs[*dst as usize] = v,
+                        Err(e) => handle_throw!(e),
+                    }
+                    continue;
                 }
                 match with_host(ctx, |h| h.construct(c, &argv)) {
                     Some(Ok(v)) => regs[*dst as usize] = v,
@@ -3720,11 +3848,7 @@ fn run_frame(
                 // A function value is a one-element heap array holding the
                 // function-table index (as a number), tagged `\0vmfn` so `typeof`
                 // and friends see a function rather than the backing array.
-                let handle = ctx
-                    .realm
-                    .new_array(alloc::vec![NanBox::number(*func as f64)]);
-                ctx.realm
-                    .set_hidden_property(handle, "\u{0}vmfn", NanBox::boolean(true));
+                let handle = ctx.realm.new_vm_function(*func, Vec::new());
                 install_fn_name_length(ctx.realm, handle, funcs.get(*func as usize));
                 link_function_proto(ctx, handle);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
@@ -3734,13 +3858,8 @@ fn run_frame(
                 func,
                 captures,
             } => {
-                // `[func_id, cell0, cell1, …]`, tagged so `typeof` and friends see
-                // a function rather than the backing array.
-                let mut elems = alloc::vec![NanBox::number(*func as f64)];
-                elems.extend(captures.iter().map(|r| regs[*r as usize]));
-                let handle = ctx.realm.new_array(elems);
-                ctx.realm
-                    .set_hidden_property(handle, "\u{0}vmfn", NanBox::boolean(true));
+                let cells: Vec<NanBox> = captures.iter().map(|r| regs[*r as usize]).collect();
+                let handle = ctx.realm.new_vm_function(*func, cells);
                 install_fn_name_length(ctx.realm, handle, funcs.get(*func as usize));
                 link_function_proto(ctx, handle);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
@@ -3765,21 +3884,13 @@ fn run_frame(
             }
             Op::CallValue { dst, callee, args } => {
                 let handle = object_handle(regs[*callee as usize])?;
-                let id = ctx
+                let (id, caps) = ctx
                     .realm
-                    .get_element(handle, 0)
-                    .as_number()
-                    .ok_or(VmError::NotAnObject)? as usize;
-                // Captured cells live in array slots `1..`.
-                let n_caps = ctx
-                    .realm
-                    .array_length(handle)
-                    .unwrap_or(1)
-                    .saturating_sub(1);
-                let caps: Vec<NanBox> = (0..n_caps)
-                    .map(|i| ctx.realm.get_element(handle, i + 1))
-                    .collect();
+                    .vm_function(handle)
+                    .map(|(f, c)| (f as usize, c.to_vec()))
+                    .ok_or(VmError::NotAnObject)?;
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                ctx.pending_callee = Some(regs[*callee as usize]);
                 // Publish this frame's registers so a collection at a back-edge inside
                 // the callee can see them (see `Ctx::frame_shadow`).
                 let pub_mark = ctx.frame_shadow.len();
@@ -4016,12 +4127,9 @@ fn run_frame(
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
                 match val.as_handle().map(Handle::from_raw) {
                     Some(h) if ctx.realm.is_vm_function(h) => {
-                        let fid = ctx.realm.get_element(h, 0).as_number().unwrap_or(-1.0);
-                        let n_caps = ctx.realm.array_length(h).unwrap_or(1).saturating_sub(1);
-                        let caps: Vec<NanBox> = (0..n_caps)
-                            .map(|i| ctx.realm.get_element(h, i + 1))
-                            .collect();
-                        if fid >= 0.0 {
+                        if let Some((fid, caps)) =
+                            ctx.realm.vm_function(h).map(|(f, c)| (f, c.to_vec()))
+                        {
                             return Ok(FrameExit::Tail {
                                 id: fid as usize,
                                 args: argv,
@@ -4603,9 +4711,8 @@ fn vm_array_len(ctx: &mut Ctx, funcs: &[FnProto], recv: NanBox) -> Result<NanBox
     if ctx.realm.is_vm_function(handle) {
         let n = ctx
             .realm
-            .get_element(handle, 0)
-            .as_number()
-            .and_then(|f| funcs.get(f as usize))
+            .vm_function(handle)
+            .and_then(|(f, _)| funcs.get(f as usize))
             .map_or(0, |p| p.length);
         Ok(NanBox::number(n as f64))
     } else {
@@ -4649,15 +4756,12 @@ fn call_closure(
         .as_handle()
         .map(Handle::from_raw)
         .ok_or(VmError::NotAnObject)?;
-    let id = ctx
+    let (id, caps) = ctx
         .realm
-        .get_element(fh, 0)
-        .as_number()
-        .ok_or(VmError::NotAnObject)? as usize;
-    let n_caps = ctx.realm.array_length(fh).unwrap_or(1).saturating_sub(1);
-    let caps: Vec<NanBox> = (0..n_caps)
-        .map(|i| ctx.realm.get_element(fh, i + 1))
-        .collect();
+        .vm_function(fh)
+        .map(|(f, c)| (f as usize, c.to_vec()))
+        .ok_or(VmError::NotAnObject)?;
+    ctx.pending_callee = Some(closure);
     call_with(ctx, funcs, id, args, &caps, this_val)
 }
 
@@ -6742,6 +6846,7 @@ pub fn compile_program_into(
                 f.is_async,
                 program_strict,
                 hosted,
+                false,
             )?;
             // A function declaration's `name` is its declared identifier.
             if let Some(id) = &f.id {
@@ -6771,6 +6876,7 @@ pub fn compile_program_into(
                 // Class bodies are always strict.
                 true,
                 hosted,
+                false,
             )?;
             protos.borrow_mut()[job.id as usize] = proto;
         }
@@ -6872,6 +6978,14 @@ fn free_of_function(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<Str
     let bound = bound_names(params, body);
     let mut direct = BTreeSet::new();
     let mut nested = BTreeSet::new();
+    // Parameter defaults (and the defaults inside destructuring parameters) can
+    // reference enclosing names too: `(a = x) => a`.
+    for p in params {
+        refs_pattern(&p.target, &mut direct, &mut nested);
+        if let Some(d) = &p.default {
+            refs_expr(d, &mut direct, &mut nested);
+        }
+    }
     for s in body {
         refs_stmt(s, &mut direct, &mut nested);
     }
@@ -7043,20 +7157,21 @@ fn declared_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
 /// Walks `s` collecting direct identifier references (`direct`) and the free
 /// variables of any nested function expression (`nested`).
 fn refs_stmt(s: &Stmt, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<String>) {
+    // Exhaustive on purpose (no `_` arm): a statement kind the scan skipped would
+    // silently drop the captures of every closure inside it.
+    let block = |b: &[Stmt], direct: &mut BTreeSet<String>, nested: &mut BTreeSet<String>| {
+        b.iter().for_each(|s| refs_stmt(s, direct, nested));
+    };
     match s {
         Stmt::Expr { expression, .. } => refs_expr(expression, direct, nested),
-        Stmt::Var(d) => {
-            for dr in &d.declarations {
-                if let Some(e) = &dr.init {
-                    refs_expr(e, direct, nested);
-                }
+        Stmt::Var(d) => refs_var_decl(d, direct, nested),
+        Stmt::Return { argument, .. } => {
+            if let Some(e) = argument {
+                refs_expr(e, direct, nested);
             }
         }
-        Stmt::Return {
-            argument: Some(e), ..
-        }
-        | Stmt::Throw { argument: e, .. } => refs_expr(e, direct, nested),
-        Stmt::Block { body, .. } => body.iter().for_each(|s| refs_stmt(s, direct, nested)),
+        Stmt::Throw { argument: e, .. } => refs_expr(e, direct, nested),
+        Stmt::Block { body, .. } => block(body, direct, nested),
         Stmt::If {
             test,
             consequent,
@@ -7081,13 +7196,7 @@ fn refs_stmt(s: &Stmt, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
             ..
         } => {
             match init {
-                Some(ForInit::Var(d)) => {
-                    for dr in &d.declarations {
-                        if let Some(e) = &dr.init {
-                            refs_expr(e, direct, nested);
-                        }
-                    }
-                }
+                Some(ForInit::Var(d)) => refs_var_decl(d, direct, nested),
                 Some(ForInit::Expr(e)) => refs_expr(e, direct, nested),
                 None => {}
             }
@@ -7105,24 +7214,28 @@ fn refs_stmt(s: &Stmt, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
         | Stmt::ForIn {
             left, right, body, ..
         } => {
-            if let crate::ast::ForLeft::Target(e) = left {
-                refs_expr(e, direct, nested);
+            match left {
+                crate::ast::ForLeft::Target(e) => refs_expr(e, direct, nested),
+                crate::ast::ForLeft::Decl { target, .. } => refs_pattern(target, direct, nested),
             }
             refs_expr(right, direct, nested);
             refs_stmt(body, direct, nested);
         }
         Stmt::Try {
-            block,
+            block: b,
             handler,
             finalizer,
             ..
         } => {
-            block.iter().for_each(|s| refs_stmt(s, direct, nested));
+            block(b, direct, nested);
             if let Some(h) = handler {
-                h.body.iter().for_each(|s| refs_stmt(s, direct, nested));
+                if let Some(p) = &h.param {
+                    refs_pattern(p, direct, nested);
+                }
+                block(&h.body, direct, nested);
             }
             if let Some(f) = finalizer {
-                f.iter().for_each(|s| refs_stmt(s, direct, nested));
+                block(f, direct, nested);
             }
         }
         Stmt::Switch {
@@ -7135,10 +7248,112 @@ fn refs_stmt(s: &Stmt, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
                 if let Some(t) = &c.test {
                     refs_expr(t, direct, nested);
                 }
-                c.body.iter().for_each(|s| refs_stmt(s, direct, nested));
+                block(&c.body, direct, nested);
             }
         }
-        _ => {}
+        Stmt::Labeled { body, .. } => refs_stmt(body, direct, nested),
+        Stmt::With { object, body, .. } => {
+            refs_expr(object, direct, nested);
+            refs_stmt(body, direct, nested);
+        }
+        Stmt::Function(f) => nested.extend(free_of_function(&f.params, &f.body)),
+        Stmt::Class(c) => refs_class(c, direct, nested),
+        Stmt::Export(crate::ast::ExportDecl::Decl { declaration, .. })
+        | Stmt::Export(crate::ast::ExportDecl::Default { declaration, .. }) => {
+            refs_stmt(declaration, direct, nested);
+        }
+        Stmt::Export(_)
+        | Stmt::Import(_)
+        | Stmt::Empty { .. }
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Debugger { .. } => {}
+    }
+}
+
+/// [`refs_stmt`] for a `var`/`let`/`const` declaration: initializers and the
+/// defaults inside destructuring targets.
+fn refs_var_decl(
+    d: &crate::ast::VarDecl,
+    direct: &mut BTreeSet<String>,
+    nested: &mut BTreeSet<String>,
+) {
+    for dr in &d.declarations {
+        refs_pattern(&dr.target, direct, nested);
+        if let Some(e) = &dr.init {
+            refs_expr(e, direct, nested);
+        }
+    }
+}
+
+/// The references inside a binding pattern: its `= default` expressions and
+/// computed keys (the bound names themselves are declarations, not references).
+fn refs_pattern(t: &BindingTarget, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<String>) {
+    match t {
+        BindingTarget::Ident(_) => {}
+        BindingTarget::Array(pat) => {
+            for el in &pat.elements {
+                match el {
+                    crate::ast::ArrayPatternElement::Hole => {}
+                    crate::ast::ArrayPatternElement::Item {
+                        target, default, ..
+                    } => {
+                        refs_pattern(target, direct, nested);
+                        if let Some(d) = default {
+                            refs_expr(d, direct, nested);
+                        }
+                    }
+                    crate::ast::ArrayPatternElement::Rest { target, .. } => {
+                        refs_pattern(target, direct, nested);
+                    }
+                }
+            }
+        }
+        BindingTarget::Object(pat) => {
+            for prop in &pat.properties {
+                if let PropertyKey::Computed(e) = &prop.key {
+                    refs_expr(e, direct, nested);
+                }
+                refs_pattern(&prop.value, direct, nested);
+                if let Some(d) = &prop.default {
+                    refs_expr(d, direct, nested);
+                }
+            }
+            if let Some(r) = &pat.rest {
+                refs_pattern(r, direct, nested);
+            }
+        }
+    }
+}
+
+/// [`refs_expr`] for a class: the heritage and computed keys are evaluated in
+/// the enclosing scope; method bodies, field initializers and static blocks are
+/// nested functions.
+fn refs_class(c: &crate::ast::Class, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<String>) {
+    use crate::ast::ClassMember;
+    if let Some(sup) = &c.super_class {
+        refs_expr(sup, direct, nested);
+    }
+    for m in &c.body {
+        match m {
+            ClassMember::Method(m) => {
+                if let PropertyKey::Computed(e) = &m.key {
+                    refs_expr(e, direct, nested);
+                }
+                nested.extend(free_of_function(&m.value.params, &m.value.body));
+            }
+            ClassMember::Field(f) => {
+                if let PropertyKey::Computed(e) = &f.key {
+                    refs_expr(e, direct, nested);
+                }
+                if let Some(v) = &f.value {
+                    let mut inner = BTreeSet::new();
+                    refs_expr(v, &mut inner, nested);
+                    nested.extend(inner);
+                }
+            }
+            ClassMember::StaticBlock { body, .. } => nested.extend(free_of_function(&[], body)),
+        }
     }
 }
 
@@ -7146,6 +7361,17 @@ fn refs_stmt(s: &Stmt, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
 /// expression, collects *its* free variables into `nested` (without descending
 /// for direct refs).
 fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<String>) {
+    // Exhaustive on purpose (no `_` arm): an expression kind the scan skipped
+    // would silently drop the captures of every closure that references a name
+    // only through it (`() => new C(x)`, `` () => `${x}` ``, `() => a?.b`).
+    let args = |a: &[crate::ast::Argument],
+                direct: &mut BTreeSet<String>,
+                nested: &mut BTreeSet<String>| {
+        for a in a {
+            let (crate::ast::Argument::Item(e) | crate::ast::Argument::Spread(e)) = a;
+            refs_expr(e, direct, nested);
+        }
+    };
     match e {
         Expr::Ident(id) => {
             direct.insert(String::from(&*id.name));
@@ -7161,8 +7387,15 @@ fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
             };
             nested.extend(free_of_function(&a.params, &body));
         }
+        Expr::Class(c) => refs_class(c, direct, nested),
         Expr::Unary { argument, .. } | Expr::Update { argument, .. } => {
             refs_expr(argument, direct, nested);
+        }
+        Expr::Await { argument, .. } => refs_expr(argument, direct, nested),
+        Expr::Yield { argument, .. } => {
+            if let Some(a) = argument {
+                refs_expr(a, direct, nested);
+            }
         }
         Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
             refs_expr(left, direct, nested);
@@ -7182,6 +7415,11 @@ fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
             refs_expr(target, direct, nested);
             refs_expr(value, direct, nested);
         }
+        Expr::Sequence { expressions, .. } => {
+            for x in expressions {
+                refs_expr(x, direct, nested);
+            }
+        }
         Expr::Member {
             object, property, ..
         } => {
@@ -7190,34 +7428,64 @@ fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
                 refs_expr(e, direct, nested);
             }
         }
+        Expr::OptChain { expr, .. } => refs_expr(expr, direct, nested),
         Expr::Call {
+            callee, arguments, ..
+        }
+        | Expr::New {
             callee, arguments, ..
         } => {
             refs_expr(callee, direct, nested);
-            for a in arguments {
-                if let crate::ast::Argument::Item(e) = a {
-                    refs_expr(e, direct, nested);
-                }
+            args(arguments, direct, nested);
+        }
+        Expr::Template(t) => {
+            for x in &t.expressions {
+                refs_expr(x, direct, nested);
+            }
+        }
+        Expr::TaggedTemplate { tag, quasi, .. } => {
+            refs_expr(tag, direct, nested);
+            for x in &quasi.expressions {
+                refs_expr(x, direct, nested);
             }
         }
         Expr::Array { elements, .. } => {
             for el in elements {
-                if let ArrayElement::Item(e) = el {
-                    refs_expr(e, direct, nested);
+                match el {
+                    ArrayElement::Item(e) | ArrayElement::Spread(e) => refs_expr(e, direct, nested),
+                    ArrayElement::Hole => {}
                 }
             }
         }
         Expr::Object { members, .. } => {
             for m in members {
-                if let ObjectMember::Property { key, value, .. } = m {
-                    if let PropertyKey::Computed(e) = key {
-                        refs_expr(e, direct, nested);
+                match m {
+                    ObjectMember::Property { key, value, .. } => {
+                        if let PropertyKey::Computed(e) = key {
+                            refs_expr(e, direct, nested);
+                        }
+                        refs_expr(value, direct, nested);
                     }
-                    refs_expr(value, direct, nested);
+                    ObjectMember::Spread { value, .. } => refs_expr(value, direct, nested),
+                    ObjectMember::Accessor { key, value, .. } => {
+                        if let PropertyKey::Computed(e) = key {
+                            refs_expr(e, direct, nested);
+                        }
+                        nested.extend(free_of_function(&value.params, &value.body));
+                    }
                 }
             }
         }
-        _ => {}
+        Expr::Null(_)
+        | Expr::Bool { .. }
+        | Expr::Number { .. }
+        | Expr::BigInt { .. }
+        | Expr::Str { .. }
+        | Expr::Regex { .. }
+        | Expr::PrivateName(..)
+        | Expr::This(_)
+        | Expr::Super(_)
+        | Expr::NewTarget(_) => {}
     }
 }
 
@@ -7544,6 +7812,14 @@ struct Compiler {
     decl_kind: Option<crate::ast::VarDeclKind>,
     /// Names of the global bindings referenced by [`Binding::global`].
     global_names: Vec<String>,
+    /// Set by an object literal just before it compiles a *method definition*'s
+    /// function, so [`Self::make_closure`] does not make it a constructor.
+    next_closure_is_method: bool,
+    /// The function declarations this function hoisted (by address): a
+    /// declaration found anywhere else — in a block, a `switch`, a label — has
+    /// Annex B semantics the VM does not model, and is refused rather than
+    /// silently dropped.
+    hoisted_fns: BTreeSet<usize>,
 }
 
 impl Compiler {
@@ -7577,6 +7853,7 @@ impl Compiler {
             false,
             strict,
             hosted,
+            false,
         )
     }
 
@@ -7595,10 +7872,38 @@ impl Compiler {
         is_async: bool,
         strict: bool,
         hosted: bool,
+        is_arrow: bool,
     ) -> Result<FnProto, CompileError> {
+        // The VM's `async` functions settle its *own* promise implementation,
+        // which is not yet unified with the host's (`ROADMAP.md` §2.0 stage 5):
+        // mixed with the host's promises their ordering and rejection semantics
+        // diverge. A hosted run leaves them to the tree-walker.
+        if hosted && is_async {
+            return Err(CompileError::Unsupported("async function in a hosted run"));
+        }
         // Which of this function's own names are captured by nested functions →
         // must be cells.
-        let cell_names = captured_names(params, body);
+        let mut cell_names = captured_names(params, body);
+        // Whether this function needs its own `arguments` object: it is not an
+        // arrow (which sees its parent's) or a script body, no parameter takes the
+        // name, and the body — or a nested arrow — can refer to it.
+        let (args_direct, args_nested) = {
+            let mut direct = BTreeSet::new();
+            let mut nested = BTreeSet::new();
+            for s in body {
+                refs_stmt(s, &mut direct, &mut nested);
+            }
+            (direct.contains("arguments"), nested.contains("arguments"))
+        };
+        let uses_arguments = !is_arrow
+            && !is_main
+            && (args_direct || args_nested)
+            && !params
+                .iter()
+                .any(|p| matches!(&p.target, BindingTarget::Ident(Ident { name, .. }) if &**name == "arguments"));
+        if uses_arguments && args_nested {
+            cell_names.insert(String::from("arguments"));
+        }
         // Strict mode enables proper tail calls (PTC). A function is strict if its
         // lexical context is strict or its own directive prologue says `"use
         // strict"`. Async functions are excluded (their body settles a promise, so
@@ -7627,6 +7932,26 @@ impl Compiler {
         // A trailing rest parameter: the caller fills its register with an array.
         let rest_from = if params.last().is_some_and(|p| p.rest) {
             Some(params.len() - 1)
+        } else {
+            None
+        };
+        // The `arguments` object is the function's first instruction (see
+        // `Op::MakeArguments`). A sloppy function with simple parameters gets a
+        // *mapped* object whose elements alias the parameters; the VM does not
+        // model that aliasing, so such a function with parameters is refused.
+        let arguments_reg = if uses_arguments {
+            let mapped = !strict
+                && params.iter().all(|p| {
+                    !p.rest && p.default.is_none() && matches!(p.target, BindingTarget::Ident(_))
+                });
+            if mapped && !params.is_empty() {
+                return Err(CompileError::Unsupported(
+                    "mapped arguments with parameters",
+                ));
+            }
+            let dst = c.alloc();
+            c.ops.push(Op::MakeArguments { dst, mapped });
+            Some(dst)
         } else {
             None
         };
@@ -7676,6 +8001,12 @@ impl Compiler {
                 },
             );
         }
+        // Bind `arguments` before any parameter default runs (a default may read
+        // it).
+        if let Some(r) = arguments_reg {
+            let b = c.declare("arguments");
+            c.write_var(b, r);
+        }
         // Apply `= default` to any (non-rest) parameter left `undefined` — after
         // binding, so a default may reference earlier parameters; written back
         // through the binding (honoring cells).
@@ -7702,6 +8033,26 @@ impl Compiler {
                 }
             }
         }
+        // Function declarations directly in the body are instantiated before any
+        // statement runs (they override a parameter or `var` of the same name).
+        // A script body's are compiled into the function table up front.
+        for stmt in body {
+            if let Stmt::Function(f) = stmt {
+                c.hoisted_fns
+                    .insert(f as *const crate::ast::Function as usize);
+                if is_main {
+                    continue;
+                }
+                let Some(id) = &f.id else { continue };
+                let closure =
+                    c.make_closure(&f.params, &f.body, f.is_async, id.name.as_ref(), false)?;
+                let b = match c.scopes[0].get(&*id.name).copied() {
+                    Some(b) => b,
+                    None => c.declare(&id.name),
+                };
+                c.write_var(b, closure);
+            }
+        }
         // Field initializers run first (constructors only): `this.field = init`.
         for (name, init) in fields {
             let v = match init {
@@ -7726,6 +8077,9 @@ impl Compiler {
                 {
                     let reg = c.alloc();
                     c.ops.push(Op::LoadFunc { dst: reg, func });
+                    if hosted && !f.is_async && !f.is_generator {
+                        c.ops.push(Op::InitFnPrototype { f: reg });
+                    }
                     if hosted {
                         // The host hoisted the binding (as its own closure); make
                         // it this function before any user code runs, so every
@@ -8262,7 +8616,18 @@ impl Compiler {
             Stmt::Empty { .. } => Ok(None),
             // Function and (top-level) class declarations are compiled into the
             // table up front; nothing to emit at the declaration site.
-            Stmt::Function(_) => Ok(None),
+            Stmt::Function(f) => {
+                if self
+                    .hoisted_fns
+                    .contains(&(f as *const crate::ast::Function as usize))
+                {
+                    Ok(None)
+                } else {
+                    Err(CompileError::Unsupported(
+                        "block-level function declaration",
+                    ))
+                }
+            }
             // Methods/constructors are compiled up front; here we materialize the
             // class's *static* side as a value object bound to the class name, so
             // `ClassName.staticMethod()` / `ClassName.staticField` work.
@@ -9401,14 +9766,23 @@ impl Compiler {
                 self.ops.push(Op::NewObject { dst });
                 for m in members {
                     match m {
-                        ObjectMember::Property { key, value, .. } => {
-                            let v = self.expr(value)?;
+                        ObjectMember::Property {
+                            key, value, method, ..
+                        } => {
+                            // A computed key is evaluated before the value.
+                            let k = match key {
+                                PropertyKey::Computed(e) => Some(self.expr(e)?),
+                                _ => None,
+                            };
+                            self.next_closure_is_method = *method;
+                            let v = self.expr(value);
+                            self.next_closure_is_method = false;
+                            let v = v?;
                             match key {
-                                PropertyKey::Computed(e) => {
-                                    let k = self.expr(e)?;
+                                PropertyKey::Computed(_) => {
                                     self.ops.push(Op::SetKey {
                                         obj: dst,
-                                        key: k,
+                                        key: k.expect("computed key"),
                                         src: v,
                                     });
                                 }
@@ -9430,7 +9804,8 @@ impl Compiler {
                             ..
                         } => {
                             let key = static_key(key)?;
-                            let f = self.make_closure(&value.params, &value.body, false, "")?;
+                            let f =
+                                self.make_closure(&value.params, &value.body, false, "", false)?;
                             let undef = self.constant(NanBox::undefined())?;
                             let (getter, setter) = if *is_getter { (f, undef) } else { (undef, f) };
                             self.ops.push(Op::DefineAccessor {
@@ -10110,7 +10485,7 @@ impl Compiler {
             // variables (as shared cells).
             Expr::Function(f) => {
                 let nm = f.id.as_ref().map_or("", |i| i.name.as_ref());
-                self.make_closure(&f.params, &f.body, f.is_async, nm)
+                self.make_closure(&f.params, &f.body, f.is_async, nm, false)
             }
             Expr::Arrow(a) => {
                 let body: Vec<Stmt> = match &a.body {
@@ -10120,7 +10495,7 @@ impl Compiler {
                         span: crate::common::Span::point(0),
                     }],
                 };
-                self.make_closure(&a.params, &body, a.is_async, "")
+                self.make_closure(&a.params, &body, a.is_async, "", true)
             }
             // The optional-chain boundary. Allocate the result (defaulting to
             // `undefined`), then compile the inner chain: each `?.` link with a
@@ -10159,7 +10534,13 @@ impl Compiler {
         if let BindingTarget::Ident(id) = target {
             match e {
                 Expr::Function(f) if f.id.is_none() => {
-                    return self.make_closure(&f.params, &f.body, f.is_async, id.name.as_ref());
+                    return self.make_closure(
+                        &f.params,
+                        &f.body,
+                        f.is_async,
+                        id.name.as_ref(),
+                        false,
+                    );
                 }
                 Expr::Arrow(a) => {
                     let body: Vec<Stmt> = match &a.body {
@@ -10169,7 +10550,7 @@ impl Compiler {
                             span: crate::common::Span::point(0),
                         }],
                     };
-                    return self.make_closure(&a.params, &body, a.is_async, id.name.as_ref());
+                    return self.make_closure(&a.params, &body, a.is_async, id.name.as_ref(), true);
                 }
                 _ => {}
             }
@@ -10183,6 +10564,24 @@ impl Compiler {
         body: &[Stmt],
         is_async: bool,
         name: &str,
+        is_arrow: bool,
+    ) -> Result<Reg, CompileError> {
+        let is_method = core::mem::take(&mut self.next_closure_is_method);
+        let constructor = self.hosted && !is_arrow && !is_async && !is_method;
+        let r = self.make_closure_inner(params, body, is_async, name, is_arrow)?;
+        if constructor {
+            self.ops.push(Op::InitFnPrototype { f: r });
+        }
+        Ok(r)
+    }
+
+    fn make_closure_inner(
+        &mut self,
+        params: &[crate::ast::Param],
+        body: &[Stmt],
+        is_async: bool,
+        name: &str,
+        is_arrow: bool,
     ) -> Result<Reg, CompileError> {
         // Captures = free variables that resolve to an enclosing binding (others
         // are top-level functions / globals, reached directly).
@@ -10235,6 +10634,7 @@ impl Compiler {
             is_async,
             self.strict,
             self.hosted,
+            is_arrow,
         )?;
         let mut proto = proto;
         proto.name = alloc::string::String::from(name);
@@ -13216,6 +13616,7 @@ mod generic_jit_tests {
             frame_shadow: alloc::vec::Vec::new(),
             frames_published: 0,
             top_frame_roots: Vec::new(),
+            pending_callee: None,
         }
     }
 
