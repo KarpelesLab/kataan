@@ -9953,6 +9953,36 @@ impl crate::nbvm::VmHost for Interp<'_> {
         self.is_constructor_value(v)
     }
 
+    fn new_promise(&mut self) -> NanBox {
+        NanBox::handle(self.fresh_promise().to_raw())
+    }
+
+    fn settle_promise(&mut self, p: NanBox, v: NanBox, fulfilled: bool) {
+        if let Some(h) = p.as_handle().map(Handle::from_raw) {
+            if fulfilled {
+                self.resolve_with(h, v);
+            } else {
+                self.settle(h, v, false);
+            }
+        }
+    }
+
+    fn await_value(&mut self, v: NanBox, controller: NanBox) -> Result<(), crate::nbvm::HostError> {
+        let Some(c) = controller.as_handle().map(Handle::from_raw) else {
+            return Err(crate::nbvm::HostError::Fault);
+        };
+        let inner = self.promise_resolve_checked(v).map_err(exec_to_host)?;
+        let on_f = self.realm.new_bound_native(N_ASYNC_RESUME_FULFILL, c);
+        let on_r = self.realm.new_bound_native(N_ASYNC_RESUME_REJECT, c);
+        self.register_then(
+            inner,
+            NanBox::handle(on_f.to_raw()),
+            NanBox::handle(on_r.to_raw()),
+            false,
+        );
+        Ok(())
+    }
+
     fn generator_intrinsics(&mut self) -> Option<(NanBox, NanBox)> {
         let gf = self.generator_function_prototype()?;
         let g = self.generator_prototype()?;

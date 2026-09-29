@@ -237,6 +237,9 @@ pub enum Op {
     },
     /// `dst = yield src` in a generator: suspends the frame.
     Yield { dst: Reg, src: Reg },
+    /// `dst = await src` in a hosted async function: suspends the frame until
+    /// the awaited value settles.
+    Await { dst: Reg, src: Reg },
     /// The end of a generator's prologue (parameters, hoisting): its call
     /// returns the suspended generator object here.
     GeneratorStart,
@@ -901,6 +904,17 @@ pub trait VmHost {
     fn is_constructor(&mut self, v: NanBox) -> bool;
     /// `(%GeneratorFunction.prototype%, %GeneratorPrototype%)`.
     fn generator_intrinsics(&mut self) -> Option<(NanBox, NanBox)>;
+    /// A fresh pending host promise (an async function's result).
+    fn new_promise(&mut self) -> NanBox;
+    /// Resolves (`fulfilled`) or rejects the host promise `p` with `v`.
+    fn settle_promise(&mut self, p: NanBox, v: NanBox, fulfilled: bool);
+    /// `Await(v)` for a suspended VM async frame held by `controller`:
+    /// PromiseResolve(v) and reactions that resume the frame (see
+    /// `resume_vm_async`).
+    ///
+    /// # Errors
+    /// The abrupt completion of PromiseResolve (thrown at the `await`).
+    fn await_value(&mut self, v: NanBox, controller: NanBox) -> Result<(), HostError>;
     /// `obj.[[Get]](key, receiver)` (a `super.x` read).
     ///
     /// # Errors
@@ -1188,7 +1202,10 @@ fn vm_set_prop_mode(
     if ctx.host.is_none() {
         return vm_set_prop(ctx, funcs, recv, key, value, cache);
     }
+    // A write to the global object also updates the global environment's
+    // bindings (the host mirrors it), so it is the host's.
     let to_host = read_needs_host(ctx, recv)
+        || ctx.host.as_ref().is_some_and(|h| h.global_this() == recv)
         || recv
             .as_handle()
             .is_some_and(|h| !plain_write_ok(ctx.realm, Handle::from_raw(h), key));
@@ -1214,7 +1231,13 @@ fn vm_set_elem_mode(
     if ctx.host.is_none() {
         return vm_set_elem(ctx, funcs, recv, key, value);
     }
-    let mut to_host = read_needs_host(ctx, recv);
+    // An indexed write on a VM function (an ordinary object's index keys) is
+    // the host's; the VM's element store is for arrays.
+    let mut to_host = read_needs_host(ctx, recv)
+        || (key.as_number().is_some()
+            && recv
+                .as_handle()
+                .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h))));
     if !to_host && key.as_number().is_none() {
         // A string (or symbol) key is an ordinary property write: the static-key
         // store handles its setter, read-only and host cases.
@@ -1484,6 +1507,152 @@ fn gen_state_array(
         NanBox::handle(h.to_raw()),
     ]);
     NanBox::handle(arr.to_raw())
+}
+
+/// The hidden slot of a VM async function's controller object: the array
+/// `[func id, result promise, pc, dst, registers, handlers]`.
+pub(crate) const VM_ASYNC: &str = "\0vmasync";
+
+/// Runs a hosted async frame's outcome to its next suspension: settles the
+/// result promise `p` on completion, or parks the frame on `controller`
+/// (created on the first `await`) and registers the host's resume reactions.
+fn drive_async(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    id: usize,
+    mut controller: Option<Handle>,
+    p: NanBox,
+    mut regs: Vec<NanBox>,
+    mut r: Result<FrameExit, VmError>,
+) -> Result<(), VmError> {
+    loop {
+        match r {
+            Ok(FrameExit::Return(v)) => {
+                let v = v.unwrap_or(NanBox::undefined());
+                with_host(ctx, |h| h.settle_promise(p, v, true));
+                return Ok(());
+            }
+            Err(VmError::Thrown(e)) => {
+                with_host(ctx, |h| h.settle_promise(p, e, false));
+                return Ok(());
+            }
+            Ok(FrameExit::Yield {
+                value,
+                pc,
+                handlers,
+                dst,
+            }) => {
+                let c = *controller.get_or_insert_with(|| ctx.realm.new_object());
+                let r_arr = ctx.realm.new_array(regs.clone());
+                let hs: Vec<NanBox> = handlers
+                    .iter()
+                    .flat_map(|(t, reg)| {
+                        [NanBox::number(*t as f64), NanBox::number(f64::from(*reg))]
+                    })
+                    .collect();
+                let h_arr = ctx.realm.new_array(hs);
+                let st = ctx.realm.new_array(alloc::vec![
+                    NanBox::number(id as f64),
+                    p,
+                    NanBox::number(pc as f64),
+                    NanBox::number(f64::from(dst)),
+                    NanBox::handle(r_arr.to_raw()),
+                    NanBox::handle(h_arr.to_raw()),
+                ]);
+                ctx.realm
+                    .set_hidden_property(c, VM_ASYNC, NanBox::handle(st.to_raw()));
+                let cv = NanBox::handle(c.to_raw());
+                match with_host(ctx, |h| h.await_value(value, cv)) {
+                    Some(Ok(())) => return Ok(()),
+                    // PromiseResolve threw: that throw happens at the `await`.
+                    Some(Err(HostError::Thrown(e))) => {
+                        let proto = funcs.get(id).ok_or(VmError::Unsupported)?;
+                        r = run_frame_at(ctx, funcs, &proto.ops, &mut regs, pc, handlers, Some(e));
+                    }
+                    _ => return Err(VmError::Unsupported),
+                }
+            }
+            Ok(FrameExit::Tail { .. }) => return Err(VmError::Unsupported),
+            Err(other) => return Err(other),
+        }
+    }
+}
+
+/// Resumes the hosted async frame parked on `controller` with the settled
+/// awaited value (`fulfilled`) or by throwing the rejection reason at the
+/// `await` — the host's `N_ASYNC_RESUME_*` reaction for a VM frame.
+///
+/// # Errors
+/// A VM fault (the body's own throw rejects its promise instead).
+pub(crate) fn resume_vm_async(
+    host: &mut dyn VmHost,
+    table: &alloc::rc::Rc<[FnProto]>,
+    controller: NanBox,
+    fulfilled: bool,
+    v: NanBox,
+) -> Result<(), VmError> {
+    let mut realm = core::mem::take(host.realm_slot());
+    let result = (|| {
+        let mut ctx = hosted_ctx(&mut realm, host);
+        let ctx = &mut ctx;
+        let ch = controller
+            .as_handle()
+            .map(Handle::from_raw)
+            .ok_or(VmError::NotAnObject)?;
+        let sh = ctx
+            .realm
+            .get_property(ch, VM_ASYNC)
+            .and_then(|s| s.as_handle())
+            .map(Handle::from_raw)
+            .ok_or(VmError::NotAnObject)?;
+        let e = ctx
+            .realm
+            .array_elements(sh)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        let num = |i: usize| e.get(i).and_then(|x| x.as_number()).unwrap_or(0.0);
+        let (id, pc, dst) = (num(0) as usize, num(2) as usize, num(3) as Reg);
+        let p = e.get(1).copied().unwrap_or(NanBox::undefined());
+        let mut regs: Vec<NanBox> = e
+            .get(4)
+            .and_then(|r| r.as_handle())
+            .and_then(|r| ctx.realm.array_elements(Handle::from_raw(r)))
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        let handlers: Vec<(usize, Reg)> = e
+            .get(5)
+            .and_then(|r| r.as_handle())
+            .and_then(|r| ctx.realm.array_elements(Handle::from_raw(r)))
+            .map(|hs| {
+                hs.chunks(2)
+                    .map(|c| {
+                        (
+                            c[0].as_number().unwrap_or(0.0) as usize,
+                            c.get(1).and_then(|x| x.as_number()).unwrap_or(0.0) as Reg,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let inject = if fulfilled {
+            if let Some(slot) = regs.get_mut(dst as usize) {
+                *slot = v;
+            }
+            None
+        } else {
+            Some(v)
+        };
+        let proto = table.get(id).ok_or(VmError::Unsupported)?;
+        let r = run_frame_at(ctx, table, &proto.ops, &mut regs, pc, handlers, inject);
+        let r = drive_async(ctx, table, id, Some(ch), p, regs, r);
+        if r.is_ok() && !ctx.microtasks.is_empty() {
+            Err(VmError::Unsupported)
+        } else {
+            r
+        }
+    })();
+    *host.realm_slot() = realm;
+    result
 }
 
 /// CreateIterResultObject(value, done).
@@ -2137,6 +2306,9 @@ pub fn run_program_hosted(
     args: &[NanBox],
 ) -> Result<NanBox, VmError> {
     let previous = host.set_vm_table(Some(alloc::rc::Rc::clone(funcs)));
+    // VM closures' own `name`/`length` are synthesized by the realm from this.
+    host.realm_slot()
+        .register_vm_fn_meta(funcs.iter().map(|p| (p.name.as_str(), p.length as u32)));
     let mut realm = core::mem::take(host.realm_slot());
     let result = {
         let mut ctx = hosted_ctx(&mut realm, host);
@@ -2392,6 +2564,14 @@ fn call_with_inner(
         // An `async` function: its synchronous body runs to completion, and its
         // result (or thrown value) settles a returned `Promise`. (No `await` yet —
         // a body that awaits falls back at compile time.)
+        // A hosted async function: its result is a host promise, and each `await`
+        // parks the frame on a controller the host's reactions resume.
+        if proto.is_async && ctx.host.is_some() {
+            let p = with_host(ctx, |h| h.new_promise()).ok_or(VmError::Unsupported)?;
+            let r = run_frame(ctx, funcs, body, &mut regs);
+            drive_async(ctx, funcs, id, None, p, regs, r)?;
+            return Ok(p);
+        }
         if proto.is_async {
             let p = ctx.realm.new_promise();
             // The returned promise is a Rust local across the body; a safepoint
@@ -4837,7 +5017,7 @@ fn run_frame_at(
                     handle_throw!(e);
                 }
             }
-            Op::Yield { dst, src } => {
+            Op::Yield { dst, src } | Op::Await { dst, src } => {
                 return Ok(FrameExit::Yield {
                     value: regs[*src as usize],
                     pc,
@@ -6332,9 +6512,13 @@ fn vm_get_elem(
 ) -> Result<NanBox, VmError> {
     if read_needs_host(ctx, recv)
         || (ctx.host.is_some()
-            && key
+            && (key
                 .as_handle()
-                .is_some_and(|h| ctx.realm.bigint_at(Handle::from_raw(h)).is_some()))
+                .is_some_and(|h| ctx.realm.bigint_at(Handle::from_raw(h)).is_some())
+                || (key.as_number().is_some()
+                    && recv
+                        .as_handle()
+                        .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h))))))
     {
         return host_get(ctx, recv, key);
     }
@@ -6519,6 +6703,15 @@ fn vm_array_len(ctx: &mut Ctx, funcs: &[FnProto], recv: NanBox) -> Result<NanBox
         .as_handle()
         .map(Handle::from_raw)
         .ok_or(VmError::NotAnObject)?;
+    // Hosted: anything but an array or a string is an ordinary `[[Get]]` (an
+    // accessor, an inherited `length`, a VM function's own — maybe deleted —
+    // `length`).
+    if ctx.host.is_some()
+        && ctx.realm.array_length(handle).is_none()
+        && !ctx.realm.is_string_handle(handle)
+    {
+        return vm_get_prop(ctx, funcs, recv, "length", &mut PropertyCache::default());
+    }
     // A VM function (a tagged closure array) reports its parameter count from the
     // proto, not the backing array's length.
     if ctx.realm.is_vm_function(handle) {
@@ -9913,6 +10106,8 @@ struct Compiler {
     next_closure_is_generator: bool,
     /// Compiling a generator function's body (`yield` suspends it).
     in_generator: bool,
+    /// Compiling a hosted async function's body (`await` suspends it).
+    in_async: bool,
     /// Nesting depth of `try` statements with a `finally` (a `yield` there
     /// would need the finally to run on `return()` — refused).
     finally_depth: u32,
@@ -9987,8 +10182,9 @@ impl Compiler {
         // which is not yet unified with the host's (`ROADMAP.md` §2.0 stage 5):
         // mixed with the host's promises their ordering and rejection semantics
         // diverge. A hosted run leaves them to the tree-walker.
-        if hosted && is_async {
-            return Err(CompileError::Unsupported("async function in a hosted run"));
+        // A hosted async generator is not modelled (its request queue).
+        if hosted && is_async && is_generator {
+            return Err(CompileError::Unsupported("async generator"));
         }
         // Which of this function's own names are captured by nested functions →
         // must be cells.
@@ -10069,6 +10265,7 @@ impl Compiler {
             super_class,
             tail_ok: strict && !is_async && class_ctor.is_none() && !is_generator,
             in_generator: is_generator,
+            in_async: is_async && hosted,
             derived_ctor: class_ctor == Some(true),
             strict,
             hosted,
@@ -12052,7 +12249,10 @@ impl Compiler {
         }
         // A direct call to a hoisted function by name reuses the frame in place;
         // any other callee is an indirect call through a function value.
+        // (Hosted: a top-level function is a global binding a script may
+        // reassign, so it is called through its current value.)
         if let Expr::Ident(id) = callee
+            && !self.hosted
             && self.lookup(&id.name).is_none()
             && let Some(&func) = self.fn_ids.get(&*id.name)
         {
@@ -12557,6 +12757,15 @@ impl Compiler {
                 }
                 Ok(dst)
             }
+            // `$262.agent` (Atomics agents): the agents' baton handoff happens
+            // on the tree-walker's spin loops, which the VM's do not perform.
+            Expr::Member {
+                object,
+                property: PropertyKey::Ident(k),
+                ..
+            } if &**k == "agent" && matches!(&**object, Expr::Ident(id) if &*id.name == "$262") => {
+                Err(CompileError::Unsupported("$262.agent"))
+            }
             // `super.x` / `super[k]` in a hosted class element.
             Expr::Member {
                 object, property, ..
@@ -12704,7 +12913,11 @@ impl Compiler {
                 }
                 // A direct call to a hoisted function by name (static dispatch +
                 // recursion), when the name isn't shadowed by a local.
+                // (Hosted: a top-level function is a global binding a script
+                // may reassign — `globalThis.f = …` — so it is called through
+                // its current value.)
                 if let Expr::Ident(id) = &**callee
+                    && !self.hosted
                     && self.lookup(&id.name).is_none()
                     && let Some(&func) = self.fn_ids.get(&*id.name)
                 {
@@ -13081,6 +13294,12 @@ impl Compiler {
                 Ok(if *prefix { next } else { old })
             }
             Expr::Class(c) if self.hosted => self.class_value(c, ""),
+            Expr::Await { argument, .. } if self.in_async => {
+                let src = self.expr(argument)?;
+                let dst = self.alloc();
+                self.ops.push(Op::Await { dst, src });
+                Ok(dst)
+            }
             Expr::Yield {
                 argument, delegate, ..
             } => {
@@ -13792,13 +14011,19 @@ impl Compiler {
             (p.len() - 1) as u32
         };
         // Each capture keeps its binding's TDZ check and `const`-ness.
-        let flags: alloc::collections::BTreeMap<String, (bool, bool, bool)> = captures
+        let mut flags: alloc::collections::BTreeMap<String, (bool, bool, bool)> = captures
             .iter()
+            .filter(|n| Some(n.as_str()) != self_name)
             .filter_map(|n| {
                 let b = self.lookup(n)?;
                 (b.tdz || b.konst || b.mapped).then(|| (n.clone(), (b.tdz, b.konst, b.mapped)))
             })
             .collect();
+        // A named function expression's own name is immutable in its body (a
+        // write is ignored, or a TypeError in strict code): refuse such writes.
+        if let Some(sn) = self_name {
+            flags.insert(String::from(sn), (false, true, false));
+        }
         let proto = Compiler::compile_fn_inner(
             &self.fn_ids,
             &self.classes,
@@ -14429,9 +14654,6 @@ impl Compiler {
             for m in &class.body {
                 if let ClassMember::Method(m) = m {
                     refuse_generator(&m.value, true)?;
-                    if m.value.is_async {
-                        return Err(CompileError::Unsupported("async class method"));
-                    }
                 }
             }
             // The constructor (declared, or the default one).
@@ -14510,6 +14732,7 @@ impl Compiler {
                             home,
                             ClosureSpec {
                                 is_generator: m.value.is_generator,
+                                is_async: m.value.is_async,
                                 ..ClosureSpec::class_element(
                                     &m.value.params,
                                     &m.value.body,
@@ -14574,6 +14797,7 @@ impl Compiler {
                             home,
                             ClosureSpec {
                                 is_generator: m.value.is_generator,
+                                is_async: m.value.is_async,
                                 ..ClosureSpec::class_element(
                                     &m.value.params,
                                     &m.value.body,

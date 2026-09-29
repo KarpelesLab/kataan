@@ -1075,7 +1075,7 @@ impl<'a> Interp<'a> {
         // properties with their intrinsic attributes so a redefine merges over the
         // spec defaults (and the second redefine sees them as configurable).
         let is_intrinsic_callable_prop = (key == "length" || key == "name")
-            && self.realm.is_callable_cell(obj)
+            && (self.realm.is_callable_cell(obj) || self.realm.is_vm_function(obj))
             && self.fn_meta_synthesizable(obj, key)
             && self.realm.accessor(obj, key).is_none();
         let is_own = self.realm.has_own(obj, key)

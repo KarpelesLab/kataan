@@ -211,6 +211,10 @@ pub struct Realm {
     /// still be overridden explicitly (`Object.setPrototypeOf(fn, p)`), recorded
     /// in [`native_protos`](Realm::native_protos).
     function_proto_intrinsic: Option<Handle>,
+    /// Per bytecode-VM function id: its `name` (a string handle) and `length`,
+    /// from which a VM closure's own `name`/`length` data properties are
+    /// synthesized (no per-closure storage; see [`Realm::vm_fn_meta_value`]).
+    vm_fn_meta: Vec<(Handle, u32)>,
     /// The realm's single `%ThrowTypeError%` intrinsic — the poisoned accessor
     /// shared by `Function.prototype.caller`/`.arguments` and a strict
     /// `arguments` object's `callee`. There is exactly one per realm (ECMA-262
@@ -528,6 +532,7 @@ impl Realm {
             native_class_tags: alloc::collections::BTreeMap::new(),
             typed_array_intrinsic: None,
             function_proto_intrinsic: None,
+            vm_fn_meta: Vec::new(),
             throw_type_error_intrinsic: None,
             array_proto_intrinsic: None,
             root_array_proto: None,
@@ -2332,6 +2337,47 @@ impl Realm {
         self.heap.alloc(Cell::VmFunction { func, captures })
     }
 
+    /// Records the `name`/`length` of VM function ids `self.vm_fn_meta.len()..`
+    /// (a shared function table only grows).
+    pub fn register_vm_fn_meta<'n>(&mut self, metas: impl Iterator<Item = (&'n str, u32)>) {
+        let have = self.vm_fn_meta.len();
+        for (name, len) in metas.skip(have) {
+            let h = self.new_string(name);
+            self.vm_fn_meta.push((h, len));
+        }
+    }
+
+    /// The synthesized own `length`/`name` of the VM closure at `handle`: a
+    /// non-writable, non-enumerable, configurable data property — unless a
+    /// physical own slot shadows it or it was deleted.
+    #[must_use]
+    pub fn vm_fn_meta_value(&self, handle: Handle, key: &str) -> Option<NanBox> {
+        if key != "length" && key != "name" {
+            return None;
+        }
+        let Some(Cell::VmFunction { func, .. }) = self.heap.get(handle) else {
+            return None;
+        };
+        let aux = self
+            .aux_props
+            .get(&handle.to_raw())
+            .and_then(|h| self.heap.get(*h))
+            .and_then(Cell::as_object);
+        if let Some(o) = aux
+            && (o.contains(key)
+                || o.accessor(key).is_some()
+                || fn_meta_tombstone(key).is_some_and(|t| o.contains(t)))
+        {
+            return None;
+        }
+        let (name, len) = self.vm_fn_meta.get(*func as usize)?;
+        Some(if key == "length" {
+            NanBox::number(f64::from(*len))
+        } else {
+            NanBox::handle(name.to_raw())
+        })
+    }
+
     /// The function-table index and captured cells of the VM closure at
     /// `handle`, if it is one.
     #[must_use]
@@ -2628,6 +2674,12 @@ impl Realm {
             )
         ) {
             let mut names = Vec::new();
+            // A VM closure's synthesized `length`/`name` come first (spec order).
+            for k in ["length", "name"] {
+                if self.vm_fn_meta_value(handle, k).is_some() {
+                    names.push(alloc::string::String::from(k));
+                }
+            }
             if let Some(aux) = self
                 .aux_props
                 .get(&handle.to_raw())
@@ -3503,6 +3555,9 @@ impl Realm {
         if let Some(o) = self.heap.get(handle)?.as_object() {
             return o.get(key);
         }
+        if let Some(v) = self.vm_fn_meta_value(handle, key) {
+            return Some(v);
+        }
         // A non-object cell (array/function): look in its auxiliary props.
         let aux = self.aux_props.get(&handle.to_raw())?;
         self.heap.get(*aux)?.as_object()?.get(key)
@@ -3749,7 +3804,7 @@ impl Realm {
         // definition, so removing the physical slot is not enough to make the
         // property go away — record that it was deleted.
         if let Some(tomb) = fn_meta_tombstone(key)
-            && self.is_callable_cell(handle)
+            && (self.is_callable_cell(handle) || self.is_vm_function(handle))
         {
             self.set_hidden_property(handle, tomb, NanBox::boolean(true));
         }
@@ -3916,6 +3971,9 @@ impl Realm {
     /// accessors) — the `in` operator.
     #[must_use]
     pub fn has_own(&self, handle: Handle, key: &str) -> bool {
+        if self.vm_fn_meta_value(handle, key).is_some() {
+            return true;
+        }
         // A **String exotic object** (a String primitive or wrapper) has own
         // `length` and index (`"0".."length-1"`) properties (StringGetOwnProperty),
         // so `"abc".hasOwnProperty(0)` / `0 in new String("abc")` are true. A
@@ -4237,6 +4295,9 @@ impl Realm {
     /// Whether own property `key` is non-writable (frozen or read-only).
     #[must_use]
     pub fn property_is_readonly(&self, handle: Handle, key: &str) -> bool {
+        if self.vm_fn_meta_value(handle, key).is_some() {
+            return true;
+        }
         self.props_object(handle)
             .is_some_and(|o| o.is_frozen() || o.is_readonly(key))
     }
@@ -4259,6 +4320,9 @@ impl Realm {
     /// Whether own property `key` is enumerable (not marked hidden).
     #[must_use]
     pub fn property_is_enumerable(&self, handle: Handle, key: &str) -> bool {
+        if self.vm_fn_meta_value(handle, key).is_some() {
+            return false;
+        }
         // A String exotic object's index properties (`"0".."length-1"`) are
         // enumerable, writable:false, configurable:false; `length` is
         // non-enumerable. Checked before the generic object branch (a String
@@ -4455,6 +4519,7 @@ impl Realm {
         // class prototypes: both are keyed by an identity the heap graph does not
         // reach, so their values are strong roots.
         out.extend(self.native_protos.values().copied());
+        out.extend(self.vm_fn_meta.iter().map(|(n, _)| *n));
         out.extend(self.class_protos.values().copied());
         out.extend(self.intl_protos.values().copied());
         // Host-pinned values and the JIT's spilled temporaries.

@@ -561,7 +561,7 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*src)
         }
         Op::NewPrivateName { dst, .. } => reg(*dst),
-        Op::Yield { dst, src } => {
+        Op::Yield { dst, src } | Op::Await { dst, src } => {
             reg(*dst)?;
             reg(*src)
         }
@@ -1262,6 +1262,11 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*src, out);
         }
         Op::GeneratorStart => w_u8(105, out),
+        Op::Await { dst, src } => {
+            w_u8(107, out);
+            w_reg(*dst, out);
+            w_reg(*src, out);
+        }
         Op::InitGenerator { f } => {
             w_u8(106, out);
             w_reg(*f, out);
@@ -1807,6 +1812,10 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             src: r.reg()?,
         },
         105 => Op::GeneratorStart,
+        107 => Op::Await {
+            dst: r.reg()?,
+            src: r.reg()?,
+        },
         106 => Op::InitGenerator { f: r.reg()? },
         98 => Op::NewPrivateName {
             dst: r.reg()?,
