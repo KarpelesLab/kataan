@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/KarpelesLab/kataan/compare/v0.0.9...v0.0.10) - 2026-09-29
+
+### Added
+
+- *(nbvm)* spec generator return()/throw() through finally and iterator closes
+- *(nbvm)* finally runs on every exit from try/catch
+- *(nbvm)* computed keys in hosted object patterns
+- *(nbvm)* block-level function declarations and Annex B.3.3
+- *(nbvm)* observable mapped arguments via parameter cells
+- *(nbvm)* direct eval at a hosted script's top level
+- *(nbvm)* assignment-target for-of/for-in heads; safe generator return()
+- *(nbvm)* yield* in async generators
+- *(nbvm)* yield*, for await, member updates; hoisted sibling functions
+- *(nbvm)* hosted async generators
+- *(nbvm)* hosted async functions; realm-synthesized VM fn name/length
+- *(nbvm)* generators as suspended VM frames; for-of over the iterator protocol
+- *(nbvm)* private class elements in hosted runs
+- *(nbvm)* hosted object literals define their members
+- *(nbvm)* runtime classes and new.target in hosted runs
+- *(nbvm)* allow mapped arguments when aliasing is unobservable
+- *(nbvm)* spread calls, host Function/indirect eval, CopyDataProperties
+- *(nbvm)* BigInt literals and BigInt-aware operators in hosted runs
+- *(nbvm)* arguments, new on plain functions, and real function cells (ROADMAP §2.0 stage 4)
+- *(nbvm)* calls across the VM and the interpreter (ROADMAP §2.0 stage 3)
+- *(nbvm)* a global environment for hosted VM runs (ROADMAP §2.0 stage 2)
+- *(nbvm)* run bytecode programs inside an Interp (ROADMAP §2.0 stage 1)
+- *(nbvm)* KATAAN_VM_STRICT reports VM refusals instead of silently falling back
+- *(gc)* collect inside function bodies reached through audited calls
+- *(module)* import … with { type: "bytes" } (import-bytes), and give embedder typed-array views a prototype
+
+### Fixed
+
+- *(nbvm)* symbol operands, String wrapper properties, NamedEvaluation
+- *(nbvm)* relational operators, array length/sparse writes, captured lexical TDZ
+- *(nbvm)* lexical this in arrow functions
+- *(nbvm)* TDZ cells for hoisted-fn captures, const captures, legacy caller, pattern cells
+- *(nbvm)* catch patterns, template ToString, computed-key setters, tagged templates
+- *(nbvm)* hosted delete, object-pattern coercibility, getter-only writes
+- *(nbvm)* name the destructuring member-place type (clippy type_complexity)
+- *(nbvm)* array destructuring through the iterator protocol in hosted runs
+- *(nbvm)* hosted operators coerce objects through the interpreter; member assignment order
+- *(nbvm)* hosted writes use the interpreter's [[Set]] where the VM store is wrong
+- *(nbvm)* VM correctness — reads, calls, this, generators, and GC in hosted runs
+- *(intl)* bump intl to 0.6.2 — region number symbols and CLDR search collations
+- *(intl)* select the CLDR search collation for usage:"search", and group exact decimals by the locale's real pattern
+- *(test262)* give every script that calls import() its file as the import base
+- *(class)* resolve a class's superclass from the class object, not by re-evaluating `extends`
+- *(instanceof)* decide built-in instanceof by the prototype chain, not the cell brand
+- *(class)* a proxy is transparent to private elements, on read as well as write
+- *(builtins)* preserve NaN bit patterns in typed-array slice, tighten Date parsing, close yield* iterators
+- *(realm)* give arrays a real per-object realm, and resolve intrinsics from the running realm
+- *(realm)* repair is_internal_key's doc comment and escape an intra-doc link
+- *(class)* integrity levels must not reach private elements
+- *(nbexec)* var-hoist destructuring patterns, stop hiding user NUL keys, revive typed arrays
+- *(nbexec)* legacy `fn.arguments`, `with`-scoped delete, and global accessor redefinition
+- *(proxy)* observe traps through [[Get]], guard function realms, and keep private names off [[Set]]
+- *(lexer)* `await` and `yield` are contextual, so `/` after them is not always a regex
+- *(nbvm)* collect garbage inside function bodies, not just the outermost frame
+- *(nbexec)* slice Function.prototype.toString from the defining source; run harness as its own Script
+
+### Other
+
+- *(roadmap)* §2.0 progress — 51,404 of the corpus on the VM
+- *(roadmap)* §2.0 progress — 51,328 of the corpus on the VM
+- *(roadmap)* §2.0 progress — 50,604 of the corpus on the VM
+- *(roadmap)* §2.0 progress — 39,933 of the corpus on the VM
+- record the VM-coverage progress; the VM does not compile generators
+- *(roadmap)* §2.0 one engine — the bytecode VM as a tier of the interpreter
+- *(readme)* bring the README in line with the code
+- *(test262)* heartbeat the progress file between a test's sloppy and strict runs
+- headline status — 53,372/53,377 with staging gated, 5 ledgered failures, in-function GC
+- *(test262)* gate staging/ in the nightly corpus run and the bless workflow
+
 ## [0.0.9](https://github.com/KarpelesLab/kataan/compare/v0.0.8...v0.0.9) - 2026-09-05
 
 ### Added
