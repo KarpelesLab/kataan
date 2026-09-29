@@ -9810,6 +9810,39 @@ impl crate::nbvm::VmHost for Interp<'_> {
         self.iterator_close(it).map_err(exec_to_host)
     }
 
+    fn delete_member(
+        &mut self,
+        obj: NanBox,
+        key: NanBox,
+        strict: bool,
+    ) -> Result<bool, crate::nbvm::HostError> {
+        if matches!(obj.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            let m = self.new_str("Cannot convert undefined or null to object");
+            return Err(crate::nbvm::HostError::Thrown(
+                self.make_error(N_TYPE_ERROR, Some(m)),
+            ));
+        }
+        let Some(h) = obj.as_handle().map(Handle::from_raw) else {
+            // A property of a number/boolean primitive: nothing own to delete.
+            return Ok(true);
+        };
+        let name = self.coerce_property_key(key).map_err(exec_to_host)?;
+        let result = self
+            .delete_named_on_handle(h, &name)
+            .map_err(exec_to_host)?;
+        if strict && !result {
+            let m = self.new_str("Cannot delete property of a non-configurable object");
+            return Err(crate::nbvm::HostError::Thrown(
+                self.make_error(N_TYPE_ERROR, Some(m)),
+            ));
+        }
+        Ok(result)
+    }
+
+    fn delete_global(&mut self, name: &str) -> bool {
+        self.delete_identifier(name).0
+    }
+
     fn to_property_key(&mut self, v: NanBox) -> Result<NanBox, crate::nbvm::HostError> {
         let k = self.coerce_property_key(v).map_err(exec_to_host)?;
         Ok(self.new_str(&k))

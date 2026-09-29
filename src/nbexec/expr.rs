@@ -647,153 +647,11 @@ impl<'a> Interp<'a> {
                                     _ => None,
                                 };
                                 if let Some(name) = name {
-                                    // A Deferred Module Namespace (`import defer`)
-                                    // evaluates its target on a `[[Delete]]` with a
-                                    // String (non-"then") key.
-                                    #[cfg(all(feature = "module", feature = "std"))]
-                                    self.trigger_deferred_namespace(h, &name)?;
-                                    // Proxy `deleteProperty` trap, or forward.
-                                    if let Some((target, handler)) = self.realm.proxy_at(h) {
-                                        self.guard_revoked(h)?;
-                                        if let Some(trap) =
-                                            self.proxy_trap(handler, "deleteProperty")?
-                                        {
-                                            let kb = self.key_to_value(&name);
-                                            let handler_box = NanBox::handle(handler.to_raw());
-                                            let r = self.call_with_this(
-                                                trap,
-                                                handler_box,
-                                                &[NanBox::handle(target.to_raw()), kb],
-                                            )?;
-                                            result = self.realm.truthy(r);
-                                            // Invariant (10.5.10): a true result is
-                                            // illegal if the property exists as a
-                                            // non-configurable own property of the
-                                            // target, or the target is non-extensible
-                                            // and the property is present.
-                                            if result {
-                                                let present = self.realm.has_own(target, &name)
-                                                    || self.realm.accessor(target, &name).is_some();
-                                                if present
-                                                    && self
-                                                        .realm
-                                                        .property_is_non_configurable(target, &name)
-                                                {
-                                                    return Err(self.type_error(
-                                                        "proxy 'deleteProperty' trap removed a non-configurable property",
-                                                    ));
-                                                }
-                                                if present && !self.realm.is_extensible(target) {
-                                                    return Err(self.type_error(
-                                                        "proxy 'deleteProperty' trap removed a property of a non-extensible target",
-                                                    ));
-                                                }
-                                            }
-                                        } else {
-                                            // No `deleteProperty` trap: forward
-                                            // `[[Delete]]` to the target — which may
-                                            // itself be a proxy, so recurse rather than
-                                            // doing an ordinary delete on it.
-                                            result = self.delete_property_of(target, &name)?;
-                                        }
-                                    } else if self.realm.typed_kind(h).is_some()
-                                        && let Some(n) = canonical_numeric_index(&name)
-                                    {
-                                        // Integer-indexed exotic `[[Delete]]`: deleting a
-                                        // *valid* index fails (`false`); any other
-                                        // canonical numeric index succeeds (`true`), and
-                                        // the prototype chain is never consulted.
-                                        let is_neg_zero = n == 0.0 && n.is_sign_negative();
-                                        let detached = self.typed_array_detached(h);
-                                        let valid = !detached
-                                            && !is_neg_zero
-                                            && n == (n as i64) as f64
-                                            && n >= 0.0
-                                            && self
-                                                .realm
-                                                .typed_len(h)
-                                                .is_some_and(|len| (n as usize) < len);
-                                        result = !valid;
-                                    } else {
-                                        // `delete arr[i]` punches a hole in the dense
-                                        // store (and rejects a non-configurable index
-                                        // or `length`); all other deletes route the
-                                        // same way. `delete_property` handles arrays,
-                                        // objects, and aux-bearing cells uniformly.
-                                        result = self.realm.delete_property(h, &name);
-                                        // A successful delete of a mapped `arguments`
-                                        // index breaks its aliasing (10.4.4.5).
-                                        if result {
-                                            self.arg_map_break(h, &name);
-                                        }
-                                    }
+                                    result = self.delete_named_on_handle(h, &name)?;
                                 }
                             }
                         } else if let Expr::Ident(id) = argument {
-                            // Resolve the bare name the way the spec's environment
-                            // chain does: an enclosing `with` object's environment
-                            // record sits *between* the reference and any outer
-                            // declarative binding, so it is consulted first.
-                            // `with_binding` already reports `None` when an inner
-                            // lexical/var binding shadows the object, so the
-                            // declarative arms below still win in that case. (Only
-                            // the object-record arm can actually delete anything —
-                            // `with (o) { delete arguments }` removes `o.arguments`
-                            // rather than reporting `false` for the function's own
-                            // `arguments` binding.)
-                            if let Some(h) = self.with_binding(&id.name) {
-                                // A bare name that resolves through a `with` object's
-                                // environment deletes that object's property — not the
-                                // similarly-named global (`with (o) { delete p }`
-                                // removes `o.p`, leaving any global `p` intact).
-                                result = self.realm.delete_property(h, &id.name);
-                                is_property_delete = true;
-                            } else if let Some(frame) = self.current.owner_frame(&id.name) {
-                                // A resolvable lexical/var binding is non-deletable
-                                // (a no-op returning `false`) EXCEPT a binding a
-                                // sloppy `eval` introduced as deletable into a
-                                // non-global variable environment
-                                // (EvalDeclarationInstantiation
-                                // `CreateMutableBinding(name, true)`): those are
-                                // removed and return `true`, after which the name
-                                // resolves to a ReferenceError.
-                                if !frame.ptr_eq(&self.global_scope)
-                                    && frame.is_local_deletable(&id.name)
-                                {
-                                    frame.delete_local(&id.name);
-                                    result = true;
-                                } else if frame.ptr_eq(&self.global_scope)
-                                    && let Some(g) = self.global_object()
-                                    && (self.realm.has_own(g, &id.name)
-                                        || self.realm.accessor(g, &id.name).is_some())
-                                    && !self.realm.property_is_non_configurable(g, &id.name)
-                                {
-                                    // A built-in global (`JSON`, `Math`, a constructor,
-                                    // …) is a *configurable* property of the global
-                                    // object that this engine mirrors as a global-scope
-                                    // binding. `delete JSON` removes the property, so
-                                    // the mirror must go too. A global `var`/function
-                                    // declaration is non-configurable and stays.
-                                    result = self.realm.delete_property(g, &id.name);
-                                    if result {
-                                        frame.delete_local(&id.name);
-                                    }
-                                    is_property_delete = true;
-                                } else {
-                                    result = false;
-                                }
-                            } else if let Some(g) = self.global_object()
-                                && (self.realm.has_own(g, &id.name)
-                                    || self.realm.accessor(g, &id.name).is_some())
-                            {
-                                // `delete name` where `name` resolves to a property of the
-                                // global object: succeeds only if that property is
-                                // configurable (e.g. `delete NaN`/`Infinity`/`undefined`
-                                // — non-configurable — returns `false`).
-                                result = self.realm.delete_property(g, &id.name);
-                                is_property_delete = true;
-                            }
-                            // An unresolvable name (`delete notDefined`) returns `true`.
+                            (result, is_property_delete) = self.delete_identifier(&id.name);
                         } else {
                             // `delete <non-Reference>` (e.g. `delete foo()`): the operand
                             // is still evaluated for its side effects, then `true` is
@@ -2180,6 +2038,165 @@ impl<'a> Interp<'a> {
             return Err(ExecError::OptShortCircuit);
         }
         self.call_with_this(f, recv, args)
+    }
+
+    /// `delete name` for an identifier in sloppy code: a `with`-object property,
+    /// a deletable local (an `eval`-introduced `var`), or a configurable global
+    /// property; anything else is not deletable. Returns `(result,
+    /// is_property_delete)` — the latter decides whether a strict-mode `false`
+    /// would be a `TypeError`.
+    pub(crate) fn delete_identifier(&mut self, name: &str) -> (bool, bool) {
+        let mut result = true;
+        let mut is_property_delete = false;
+        // Resolve the bare name the way the spec's environment
+        // chain does: an enclosing `with` object's environment
+        // record sits *between* the reference and any outer
+        // declarative binding, so it is consulted first.
+        // `with_binding` already reports `None` when an inner
+        // lexical/var binding shadows the object, so the
+        // declarative arms below still win in that case. (Only
+        // the object-record arm can actually delete anything —
+        // `with (o) { delete arguments }` removes `o.arguments`
+        // rather than reporting `false` for the function's own
+        // `arguments` binding.)
+        if let Some(h) = self.with_binding(name) {
+            // A bare name that resolves through a `with` object's
+            // environment deletes that object's property — not the
+            // similarly-named global (`with (o) { delete p }`
+            // removes `o.p`, leaving any global `p` intact).
+            result = self.realm.delete_property(h, name);
+            is_property_delete = true;
+        } else if let Some(frame) = self.current.owner_frame(name) {
+            // A resolvable lexical/var binding is non-deletable
+            // (a no-op returning `false`) EXCEPT a binding a
+            // sloppy `eval` introduced as deletable into a
+            // non-global variable environment
+            // (EvalDeclarationInstantiation
+            // `CreateMutableBinding(name, true)`): those are
+            // removed and return `true`, after which the name
+            // resolves to a ReferenceError.
+            if !frame.ptr_eq(&self.global_scope) && frame.is_local_deletable(name) {
+                frame.delete_local(name);
+                result = true;
+            } else if frame.ptr_eq(&self.global_scope)
+                && let Some(g) = self.global_object()
+                && (self.realm.has_own(g, name) || self.realm.accessor(g, name).is_some())
+                && !self.realm.property_is_non_configurable(g, name)
+            {
+                // A built-in global (`JSON`, `Math`, a constructor,
+                // …) is a *configurable* property of the global
+                // object that this engine mirrors as a global-scope
+                // binding. `delete JSON` removes the property, so
+                // the mirror must go too. A global `var`/function
+                // declaration is non-configurable and stays.
+                result = self.realm.delete_property(g, name);
+                if result {
+                    frame.delete_local(name);
+                }
+                is_property_delete = true;
+            } else {
+                result = false;
+            }
+        } else if let Some(g) = self.global_object()
+            && (self.realm.has_own(g, name) || self.realm.accessor(g, name).is_some())
+        {
+            // `delete name` where `name` resolves to a property of the
+            // global object: succeeds only if that property is
+            // configurable (e.g. `delete NaN`/`Infinity`/`undefined`
+            // — non-configurable — returns `false`).
+            result = self.realm.delete_property(g, name);
+            is_property_delete = true;
+        }
+        // An unresolvable name (`delete notDefined`) returns `true`.
+
+        (result, is_property_delete)
+    }
+
+    /// `delete h[name]` on an object handle: a proxy's `deleteProperty` trap
+    /// (with its invariant checks), a typed array's integer index, or an
+    /// ordinary property (breaking a mapped `arguments` alias). Returns the
+    /// operation's boolean result; the strict-mode `TypeError` for `false` is
+    /// the caller's.
+    pub(crate) fn delete_named_on_handle(
+        &mut self,
+        h: Handle,
+        name: &str,
+    ) -> Result<bool, ExecError> {
+        let result;
+        let name = String::from(name);
+        // A Deferred Module Namespace (`import defer`)
+        // evaluates its target on a `[[Delete]]` with a
+        // String (non-"then") key.
+        #[cfg(all(feature = "module", feature = "std"))]
+        self.trigger_deferred_namespace(h, &name)?;
+        // Proxy `deleteProperty` trap, or forward.
+        if let Some((target, handler)) = self.realm.proxy_at(h) {
+            self.guard_revoked(h)?;
+            if let Some(trap) = self.proxy_trap(handler, "deleteProperty")? {
+                let kb = self.key_to_value(&name);
+                let handler_box = NanBox::handle(handler.to_raw());
+                let r =
+                    self.call_with_this(trap, handler_box, &[NanBox::handle(target.to_raw()), kb])?;
+                result = self.realm.truthy(r);
+                // Invariant (10.5.10): a true result is
+                // illegal if the property exists as a
+                // non-configurable own property of the
+                // target, or the target is non-extensible
+                // and the property is present.
+                if result {
+                    let present = self.realm.has_own(target, &name)
+                        || self.realm.accessor(target, &name).is_some();
+                    if present && self.realm.property_is_non_configurable(target, &name) {
+                        return Err(self.type_error(
+                            "proxy 'deleteProperty' trap removed a non-configurable property",
+                        ));
+                    }
+                    if present && !self.realm.is_extensible(target) {
+                        return Err(self.type_error(
+                            "proxy 'deleteProperty' trap removed a property of a non-extensible target",
+                        ));
+                    }
+                }
+            } else {
+                // No `deleteProperty` trap: forward
+                // `[[Delete]]` to the target — which may
+                // itself be a proxy, so recurse rather than
+                // doing an ordinary delete on it.
+                result = self.delete_property_of(target, &name)?;
+            }
+        } else if self.realm.typed_kind(h).is_some()
+            && let Some(n) = canonical_numeric_index(&name)
+        {
+            // Integer-indexed exotic `[[Delete]]`: deleting a
+            // *valid* index fails (`false`); any other
+            // canonical numeric index succeeds (`true`), and
+            // the prototype chain is never consulted.
+            let is_neg_zero = n == 0.0 && n.is_sign_negative();
+            let detached = self.typed_array_detached(h);
+            let valid = !detached
+                && !is_neg_zero
+                && n == (n as i64) as f64
+                && n >= 0.0
+                && self
+                    .realm
+                    .typed_len(h)
+                    .is_some_and(|len| (n as usize) < len);
+            result = !valid;
+        } else {
+            // `delete arr[i]` punches a hole in the dense
+            // store (and rejects a non-configurable index
+            // or `length`); all other deletes route the
+            // same way. `delete_property` handles arrays,
+            // objects, and aux-bearing cells uniformly.
+            result = self.realm.delete_property(h, &name);
+            // A successful delete of a mapped `arguments`
+            // index breaks its aliasing (10.4.4.5).
+            if result {
+                self.arg_map_break(h, &name);
+            }
+        }
+
+        Ok(result)
     }
 
     /// Reads `property` off the already-evaluated member base `obj` — the tail of

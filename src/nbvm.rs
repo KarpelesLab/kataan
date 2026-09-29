@@ -136,6 +136,21 @@ pub enum Op {
     /// closes on an abrupt completion, whose own error wins over any from
     /// `return`.
     IterClose { iter: Reg, done: Reg, quiet: bool },
+    /// `dst = delete obj[key]` with the host's semantics (proxy traps, typed
+    /// arrays; a strict-mode failure throws) — hosted runs only.
+    HostDelete {
+        dst: Reg,
+        obj: Reg,
+        key: Reg,
+        strict: bool,
+    },
+    /// `dst = delete name` for a sloppy-mode identifier not bound in a
+    /// register: the host deletes a configurable global property or an
+    /// `eval`-introduced binding.
+    DeleteGlobal { dst: Reg, name: String },
+    /// Throws a `TypeError` if `src` is `null` or `undefined` (an object
+    /// destructuring pattern's `RequireObjectCoercible`).
+    RequireObjectCoercible { src: Reg },
     /// `dst = ToPropertyKey(src)` for an object key (its `toString` /
     /// `Symbol.toPrimitive` runs, via the host); a primitive key is copied as-is.
     ToKey { dst: Reg, src: Reg },
@@ -694,6 +709,14 @@ pub trait VmHost {
     /// # Errors
     /// A throw from `return` or a non-object result, or a host fault.
     fn iter_close(&mut self, iter: NanBox) -> Result<(), HostError>;
+    /// `delete obj[key]`: `true`/`false` per the operation.
+    ///
+    /// # Errors
+    /// A `TypeError` for a `null`/`undefined` base or a strict-mode failure, a
+    /// throwing proxy trap or key conversion, or a host fault.
+    fn delete_member(&mut self, obj: NanBox, key: NanBox, strict: bool) -> Result<bool, HostError>;
+    /// `delete name` for a sloppy-mode identifier.
+    fn delete_global(&mut self, name: &str) -> bool;
     /// `ToPropertyKey(v)` of an object key: a string (a symbol's internal key
     /// form included).
     ///
@@ -885,7 +908,10 @@ fn host_set(
 /// property of that name nor a proxy. (Accessors are handled by the VM's own
 /// setter path.)
 fn plain_write_ok(realm: &Realm, h: Handle, key: &str) -> bool {
-    if realm.has_own(h, key) || realm.accessor(h, key).is_some() {
+    if let Some((_, setter)) = realm.accessor(h, key) {
+        return setter.as_handle().is_some();
+    }
+    if realm.has_own(h, key) {
         return !realm.property_is_readonly(h, key);
     }
     if !realm.is_extensible(h) {
@@ -896,8 +922,8 @@ fn plain_write_ok(realm: &Realm, h: Handle, key: &str) -> bool {
         if realm.proxy_at(p).is_some() {
             return false;
         }
-        if realm.accessor(p, key).is_some() {
-            return true;
+        if let Some((_, setter)) = realm.accessor(p, key) {
+            return setter.as_handle().is_some();
         }
         if realm.has_own(p, key) {
             return !realm.property_is_readonly(p, key);
@@ -3768,6 +3794,32 @@ fn run_frame(
                         Err(HostError::Thrown(e)) if !*quiet => handle_throw!(VmError::Thrown(e)),
                         _ => {}
                     }
+                }
+            }
+            Op::HostDelete {
+                dst,
+                obj,
+                key,
+                strict,
+            } => {
+                let (o, k) = (regs[*obj as usize], regs[*key as usize]);
+                match with_host(ctx, |h| h.delete_member(o, k, *strict)) {
+                    Some(Ok(b)) => regs[*dst as usize] = NanBox::boolean(b),
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
+            }
+            Op::DeleteGlobal { dst, name } => match with_host(ctx, |h| h.delete_global(name)) {
+                Some(b) => regs[*dst as usize] = NanBox::boolean(b),
+                None => return Err(VmError::Unsupported),
+            },
+            Op::RequireObjectCoercible { src } => {
+                if matches!(
+                    regs[*src as usize].unpack(),
+                    crate::nanbox::Unpacked::Undefined | crate::nanbox::Unpacked::Null
+                ) {
+                    let e = vm_error(ctx, "TypeError", "Cannot destructure 'undefined' or 'null'");
+                    handle_throw!(VmError::Thrown(e));
                 }
             }
             Op::ToKey { dst, src } => {
@@ -8877,6 +8929,7 @@ impl Compiler {
                 Ok(())
             }
             Expr::Object { members, .. } => {
+                self.ops.push(Op::RequireObjectCoercible { src: value_reg });
                 let mut named: Vec<String> = Vec::new();
                 for m in members {
                     match m {
@@ -9067,6 +9120,7 @@ impl Compiler {
                 Ok(())
             }
             BindingTarget::Object(pat) => {
+                self.ops.push(Op::RequireObjectCoercible { src: value_reg });
                 let mut named: Vec<String> = Vec::new();
                 for prop in &pat.properties {
                     let key = static_key(&prop.key)?;
@@ -10225,6 +10279,54 @@ impl Compiler {
             }
             Expr::Unary { op, argument, .. } => {
                 // `delete obj.k` / `delete obj[k]` removes an own property.
+                if matches!(op, UnaryOp::Delete) && self.hosted {
+                    match &**argument {
+                        Expr::Member {
+                            object, property, ..
+                        } => {
+                            if matches!(&**object, Expr::Super(_)) {
+                                return Err(CompileError::Unsupported(
+                                    "delete of a super property",
+                                ));
+                            }
+                            let obj = self.expr(object)?;
+                            let key = match property {
+                                PropertyKey::Computed(e) => self.expr(e)?,
+                                _ => self.constant_str(&static_key(property)?),
+                            };
+                            let dst = self.alloc();
+                            self.ops.push(Op::HostDelete {
+                                dst,
+                                obj,
+                                key,
+                                strict: self.strict,
+                            });
+                            return Ok(dst);
+                        }
+                        // A register-bound name is not deletable (strict code
+                        // rejects `delete name` at parse time).
+                        Expr::Ident(id) if self.lookup(&id.name).is_some() => {
+                            return self.constant(NanBox::boolean(false));
+                        }
+                        Expr::Ident(id) => {
+                            let dst = self.alloc();
+                            self.ops.push(Op::DeleteGlobal {
+                                dst,
+                                name: String::from(&*id.name),
+                            });
+                            return Ok(dst);
+                        }
+                        Expr::OptChain { .. } => {
+                            return Err(CompileError::Unsupported("delete of an optional chain"));
+                        }
+                        // Any other operand is evaluated (for its effects); the
+                        // result is `true`.
+                        other => {
+                            self.expr(other)?;
+                            return self.constant(NanBox::boolean(true));
+                        }
+                    }
+                }
                 if matches!(op, UnaryOp::Delete) {
                     if let Expr::Member {
                         object, property, ..

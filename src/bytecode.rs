@@ -490,6 +490,13 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*dst)?;
             reg(*src)
         }
+        Op::HostDelete { dst, obj, key, .. } => {
+            reg(*dst)?;
+            reg(*obj)?;
+            reg(*key)
+        }
+        Op::DeleteGlobal { dst, .. } => reg(*dst),
+        Op::RequireObjectCoercible { src } => reg(*src),
         Op::IterOpen { iter, next, src } => {
             reg(*iter)?;
             reg(*next)?;
@@ -1007,6 +1014,27 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*dst, out);
             w_reg(*src, out);
         }
+        Op::HostDelete {
+            dst,
+            obj,
+            key,
+            strict,
+        } => {
+            w_u8(78, out);
+            w_reg(*dst, out);
+            w_reg(*obj, out);
+            w_reg(*key, out);
+            w_bool(*strict, out);
+        }
+        Op::DeleteGlobal { dst, name } => {
+            w_u8(79, out);
+            w_reg(*dst, out);
+            w_str(name, out);
+        }
+        Op::RequireObjectCoercible { src } => {
+            w_u8(80, out);
+            w_reg(*src, out);
+        }
         Op::IterOpen { iter, next, src } => {
             w_u8(74, out);
             w_reg(*iter, out);
@@ -1391,6 +1419,17 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             dst: r.reg()?,
             src: r.reg()?,
         },
+        78 => Op::HostDelete {
+            dst: r.reg()?,
+            obj: r.reg()?,
+            key: r.reg()?,
+            strict: r.boolean()?,
+        },
+        79 => Op::DeleteGlobal {
+            dst: r.reg()?,
+            name: r.string()?,
+        },
+        80 => Op::RequireObjectCoercible { src: r.reg()? },
         74 => Op::IterOpen {
             iter: r.reg()?,
             next: r.reg()?,
