@@ -423,6 +423,9 @@ pub enum Op {
     StrictEq { dst: Reg, a: Reg, b: Reg },
     /// `dst = a new heap string`.
     NewString { dst: Reg, value: String },
+    /// `dst = a new heap string` from raw WTF-8 bytes — a literal that holds a
+    /// lone surrogate (which a `String` can't carry).
+    NewStringWtf8 { dst: Reg, bytes: Vec<u8> },
     /// `dst = a new array of `len` `undefined` elements`.
     NewArray { dst: Reg, len: usize },
     /// `new Array(arg)` with a single argument: a number is the new array's
@@ -6454,6 +6457,10 @@ fn run_frame_at(
             }
             Op::NewString { dst, value } => {
                 let handle = ctx.realm.new_string(value);
+                regs[*dst as usize] = NanBox::handle(handle.to_raw());
+            }
+            Op::NewStringWtf8 { dst, bytes } => {
+                let handle = ctx.realm.new_string_wtf8(bytes.clone());
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::NewArray { dst, len } => {
@@ -13574,18 +13581,6 @@ impl Compiler {
             }
             // A tagged template's tag is invoked in tail position.
             Expr::TaggedTemplate { tag, quasi, .. } => {
-                // A lone surrogate in a quasi can't round-trip the constant pool;
-                // let the ordinary (surrogate-correct) path handle it.
-                let surrogate = quasi.quasis.iter().any(|q| {
-                    q.cooked
-                        .as_deref()
-                        .is_some_and(|b| crate::wtf8::as_str(b).is_none())
-                });
-                if surrogate {
-                    let src = self.expr(e)?;
-                    self.ops.push(Op::Return { src });
-                    return Ok(());
-                }
                 let strings = self.alloc();
                 self.ops.push(Op::NewArray {
                     dst: strings,
@@ -13593,7 +13588,7 @@ impl Compiler {
                 });
                 for q in &quasi.quasis {
                     let s = match q.cooked.as_deref() {
-                        Some(c) => self.constant_str(&crate::wtf8::to_string_lossy(c)),
+                        Some(c) => self.wtf8_string(c),
                         None => self.constant(NanBox::undefined())?,
                     };
                     self.ops.push(Op::ArrayPush {
@@ -13747,25 +13742,29 @@ impl Compiler {
         Ok(true)
     }
 
+    /// A fresh string register from WTF-8 literal bytes: `NewString` normally,
+    /// `NewStringWtf8` when the literal holds a lone surrogate.
+    fn wtf8_string(&mut self, bytes: &[u8]) -> Reg {
+        let r = self.alloc();
+        self.ops.push(match crate::wtf8::as_str(bytes) {
+            Some(v) => Op::NewString {
+                dst: r,
+                value: String::from(v),
+            },
+            None => Op::NewStringWtf8 {
+                dst: r,
+                bytes: bytes.to_vec(),
+            },
+        });
+        r
+    }
+
     fn expr(&mut self, expr: &Expr) -> Result<Reg, CompileError> {
         match expr {
             Expr::Number { value, .. } => self.constant(NanBox::number(*value)),
             Expr::Bool { value, .. } => self.constant(NanBox::boolean(*value)),
             Expr::Null(_) => self.constant(NanBox::null()),
-            Expr::Str { value, .. } => {
-                // The bytecode `NewString` op is `String`-typed; a literal bearing
-                // a lone surrogate (rare) can't round-trip through it, so defer to
-                // the (surrogate-correct) tree-walker rather than lose data.
-                let value = crate::wtf8::as_str(value).ok_or(CompileError::Unsupported(
-                    "lone surrogate in string literal",
-                ))?;
-                let r = self.alloc();
-                self.ops.push(Op::NewString {
-                    dst: r,
-                    value: String::from(value),
-                });
-                Ok(r)
-            }
+            Expr::Str { value, .. } => Ok(self.wtf8_string(value)),
             Expr::Ident(id) => {
                 if let Some(b) = self.lookup(&id.name) {
                     if b.mapped && &*id.name == "arguments" && !self.args_member_read {
@@ -14981,17 +14980,6 @@ impl Compiler {
             }
             // A tagged template `tag`a${x}b`` → `tag(strings, x, …)`.
             Expr::TaggedTemplate { tag, quasi, .. } => {
-                // A surrogate-bearing cooked/raw quasi can't round-trip through the
-                // `String`-typed constant pool; defer to the (correct) tree-walker.
-                if quasi.quasis.iter().any(|q| {
-                    q.cooked
-                        .as_deref()
-                        .is_some_and(|b| crate::wtf8::as_str(b).is_none())
-                }) {
-                    return Err(CompileError::Unsupported(
-                        "lone surrogate in tagged template",
-                    ));
-                }
                 let strings = self.alloc();
                 self.ops.push(Op::NewArray {
                     dst: strings,
@@ -15001,7 +14989,7 @@ impl Compiler {
                     // An invalid escape yields no cooked value (`undefined`); `.raw`
                     // still preserves it (ES2018 tagged-template revision).
                     let s = match q.cooked.as_deref() {
-                        Some(c) => self.constant_str(&crate::wtf8::to_string_lossy(c)),
+                        Some(c) => self.wtf8_string(c),
                         None => self.constant(NanBox::undefined())?,
                     };
                     self.ops.push(Op::ArrayPush {
@@ -15269,28 +15257,12 @@ impl Compiler {
                         "invalid escape in template literal",
                     ));
                 }
-                // A surrogate-bearing quasi can't round-trip through the
-                // `String`-typed bytecode; defer to the (correct) tree-walker.
-                if t.quasis.iter().any(|q| {
-                    q.cooked
-                        .as_deref()
-                        .is_some_and(|b| crate::wtf8::as_str(b).is_none())
-                }) {
-                    return Err(CompileError::Unsupported(
-                        "lone surrogate in template literal",
-                    ));
-                }
-                let cooked = |q: &crate::ast::TemplateElement| -> String {
-                    q.cooked
-                        .as_deref()
-                        .map(crate::wtf8::to_string_lossy)
+                let cooked = |q: Option<&crate::ast::TemplateElement>| -> Vec<u8> {
+                    q.and_then(|q| q.cooked.as_deref())
+                        .map(<[u8]>::to_vec)
                         .unwrap_or_default()
                 };
-                let mut acc = self.alloc();
-                self.ops.push(Op::NewString {
-                    dst: acc,
-                    value: t.quasis.first().map(cooked).unwrap_or_default(),
-                });
+                let mut acc = self.wtf8_string(&cooked(t.quasis.first()));
                 for (i, e) in t.expressions.iter().enumerate() {
                     let mut v = self.expr(e)?;
                     // A substitution is `ToString`ed (string hint), not `+`-added
@@ -15306,11 +15278,7 @@ impl Compiler {
                         a: acc,
                         b: v,
                     });
-                    let q = self.alloc();
-                    self.ops.push(Op::NewString {
-                        dst: q,
-                        value: t.quasis.get(i + 1).map(cooked).unwrap_or_default(),
-                    });
+                    let q = self.wtf8_string(&cooked(t.quasis.get(i + 1)));
                     acc = self.alloc();
                     self.ops.push(Op::AddValue {
                         dst: acc,

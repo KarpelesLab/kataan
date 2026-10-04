@@ -369,7 +369,10 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             }
             Ok(())
         }
-        Op::NewString { dst, .. } | Op::NewRegExp { dst, .. } | Op::NewObject { dst } => reg(*dst),
+        Op::NewString { dst, .. }
+        | Op::NewStringWtf8 { dst, .. }
+        | Op::NewRegExp { dst, .. }
+        | Op::NewObject { dst } => reg(*dst),
         Op::IsBuiltin { dst, obj, .. }
         | Op::InstanceOf { dst, obj, .. }
         | Op::ObjectSpread { dst, src: obj }
@@ -1071,6 +1074,11 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
                 }
                 None => w_u8(0, out),
             }
+        }
+        Op::NewStringWtf8 { dst, bytes } => {
+            w_u8(150, out);
+            w_reg(*dst, out);
+            w_bytes(bytes, out);
         }
         Op::NewRegExp { dst, source, flags } => {
             w_u8(38, out);
@@ -1855,6 +1863,10 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             dst: r.reg()?,
             is_set: r.boolean()?,
             seed: if r.u8()? == 1 { Some(r.reg()?) } else { None },
+        },
+        150 => Op::NewStringWtf8 {
+            dst: r.reg()?,
+            bytes: r.byte_string()?,
         },
         38 => Op::NewRegExp {
             dst: r.reg()?,
