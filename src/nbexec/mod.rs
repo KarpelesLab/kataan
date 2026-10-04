@@ -9988,6 +9988,11 @@ impl crate::nbvm::VmHost for Interp<'_> {
             return Err(crate::nbvm::HostError::Fault);
         };
         let name = self.member_key(key);
+        // A field defined on a Deferred Module Namespace (a base constructor
+        // returned one) forces its evaluation, as in the tree-walker.
+        #[cfg(all(feature = "module", feature = "std"))]
+        self.trigger_deferred_namespace(o, &name)
+            .map_err(exec_to_host)?;
         let desc = self.realm.new_object();
         self.realm.set_property(desc, "value", value);
         for (bit, f) in [(1, "writable"), (2, "enumerable"), (4, "configurable")] {
@@ -10408,6 +10413,9 @@ impl crate::nbvm::VmHost for Interp<'_> {
         };
         let key = self.vm_object_key(key).map_err(exec_to_host)?;
         let name = self.member_key(key);
+        #[cfg(all(feature = "module", feature = "std"))]
+        self.vm_super_set_namespace(o, &name, receiver)
+            .map_err(exec_to_host)?;
         if !self
             .proxy_set_bool(o, &name, value, receiver)
             .map_err(exec_to_host)?

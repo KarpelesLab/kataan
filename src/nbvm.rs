@@ -1732,6 +1732,17 @@ fn private_define(
         );
         return Err(VmError::Thrown(e));
     }
+    // PrivateFieldAdd / PrivateMethodOrAccessorAdd on a non-extensible object
+    // (a frozen one, a module namespace) is a TypeError — as the tree-walker
+    // (`nonextensible-applies-to-private`).
+    if ctx.host.is_some() && ctx.realm.proxy_at(h).is_none() && !ctx.realm.is_extensible(h) {
+        let e = vm_error(
+            ctx,
+            "TypeError",
+            "Cannot add private field to a non-extensible object",
+        );
+        return Err(VmError::Thrown(e));
+    }
     for (suffix, v) in slots {
         ctx.realm
             .set_hidden_property(h, &alloc::format!("{key}{suffix}"), *v);
@@ -11391,7 +11402,7 @@ fn is_import_form(e: &Expr) -> bool {
         Expr::Member { .. } => import_member(e) == Some("meta"),
         Expr::Call { callee, .. } => {
             matches!(&**callee, Expr::Ident(id) if &*id.name == "import")
-                || matches!(import_member(callee), Some("defer" | "source"))
+                || matches!(import_member(callee), Some("defer" | "source" | "meta"))
         }
         _ => false,
     }
@@ -11418,6 +11429,18 @@ impl Compiler {
         let phase = match import_member(callee) {
             Some("defer") => 1,
             Some("source") => 2,
+            // `import.meta(…)`: an ordinary call of the (non-callable) object.
+            Some("meta") => {
+                let f = self.import_form(callee)?;
+                let args = self.call_args(arguments)?;
+                let dst = self.alloc();
+                self.ops.push(Op::CallValue {
+                    dst,
+                    callee: f,
+                    args,
+                });
+                return Ok(dst);
+            }
             _ => 0,
         };
         let mut regs = Vec::with_capacity(arguments.len());

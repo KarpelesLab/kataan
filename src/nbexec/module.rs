@@ -2901,9 +2901,6 @@ impl<'a> Interp<'a> {
         self.realm.restore_intrinsics(intrinsics);
         let saved_intl = self.realm.replace_intl_protos(child_intl);
 
-        // The module code runs in the ShadowRealm's swapped-in global state,
-        // which the VM's hosted run does not model: keep it on the tree-walker.
-        let saved_vm = core::mem::replace(&mut self.modules.vm_enabled, false);
         let outcome = (|this: &mut Self| -> Result<NanBox, ExecError> {
             // Load is the parse/resolution phase (a SyntaxError in the fixture
             // surfaces here); link wires imports; evaluate runs the body.
@@ -2937,7 +2934,6 @@ impl<'a> Interp<'a> {
                 .unwrap_or_else(NanBox::undefined))
         })(self);
 
-        self.modules.vm_enabled = saved_vm;
         self.created_realms[realm_idx].intl_protos = self.realm.replace_intl_protos(saved_intl);
         self.current = saved_current;
         self.global_scope = saved_global_scope;
@@ -3328,6 +3324,36 @@ impl Interp<'_> {
         }
         let keys = self.iterate_keys(obj);
         Ok(NanBox::handle(self.realm.new_array(keys).to_raw()))
+    }
+
+    /// `super[name] = v` from VM code whose receiver is a module namespace:
+    /// unless an accessor on the home object's chain takes the write, the
+    /// receiver's `[[DefineOwnProperty]]` runs — forcing a deferred namespace
+    /// and checking the binding's TDZ (as the tree-walker's super set).
+    pub(crate) fn vm_super_set_namespace(
+        &mut self,
+        home: crate::heap::Handle,
+        name: &str,
+        receiver: NanBox,
+    ) -> Result<(), ExecError> {
+        let Some(th) = receiver.as_handle().map(crate::heap::Handle::from_raw) else {
+            return Ok(());
+        };
+        if !self.realm.is_host_exotic(th) {
+            return Ok(());
+        }
+        let mut cur = Some(home);
+        while let Some(c) = cur {
+            if self.realm.accessor(c, name).is_some() {
+                return Ok(());
+            }
+            if self.realm.has_own(c, name) {
+                break;
+            }
+            cur = self.realm.object_proto(c);
+        }
+        self.trigger_deferred_namespace(th, name)?;
+        self.namespace_binding_tdz(th, name)
     }
 
     /// `import.meta` of VM module `index`.
