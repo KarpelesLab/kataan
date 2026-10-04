@@ -10718,6 +10718,67 @@ fn vm_function_of_another_realm_runs_in_its_realm() {
 }
 
 #[test]
+fn a_strict_tail_call_into_another_realm_runs_in_that_realm() {
+    // A proper tail call reuses the caller's VM activation — but not across
+    // realms: the callee must still run with its own realm current, so the
+    // `TypeError` calling `null` raises is the other realm's.
+    let src = r#"
+        "use strict";
+        var other = $262_createRealm();
+        var H = other.evalScript(`(function () { "use strict"; return null(); })`);
+        var o = { h: H };
+        function viaValue() { return H(); }
+        function viaThis() { return o.h(); }
+        var ok = [];
+        try { viaValue(); } catch (e) { ok.push(e.constructor === other.global.TypeError); }
+        try { viaThis(); } catch (e) { ok.push(e.constructor === other.global.TypeError); }
+        // Code compiled after `H` (a newer function table holds both).
+        var later = (0, eval)('(function () { "use strict"; return H(); })');
+        try { later(); } catch (e) { ok.push(e.constructor === other.global.TypeError); }
+        ok.join()
+    "#;
+    assert_eq!(run(src), "true,true,true");
+}
+
+#[test]
+fn a_resumed_generator_of_another_realm_runs_in_that_realm() {
+    // Resuming a suspended generator (or async function) re-enters its
+    // function's realm: the code after the `yield` / `await` raises that
+    // realm's errors and sees its globals.
+    let src = r#"
+        var other = $262_createRealm();
+        other.global.tag = "other";
+        var tag = "main";
+        var G = other.evalScript(`(function* () { yield 1; yield tag; null(); })`);
+        var it = G();
+        var ok = [];
+        it.next();
+        ok.push(it.next().value === "other");
+        try { it.next(); } catch (e) { ok.push(e.constructor === other.global.TypeError); }
+        ok.join()
+    "#;
+    assert_eq!(run(src), "true,true");
+}
+
+#[test]
+fn a_resumed_async_function_of_another_realm_runs_in_that_realm() {
+    assert_eq!(
+        out(r#"
+            var other = $262_createRealm();
+            other.global.tag = "other";
+            var tag = "main";
+            var A = other.evalScript(`(async function () { await 0; null(); })`);
+            var B = other.evalScript(`(async function* () { await 0; yield tag; })`);
+            A().catch(function (e) {
+                console.log("async: " + (e.constructor === other.global.TypeError));
+            });
+            B().next().then(function (r) { console.log("agen: " + r.value); });
+        "#),
+        "async: true\nagen: other\n"
+    );
+}
+
+#[test]
 fn virtual_clock_set_timeout_fires_in_delay_order_and_advances() {
     // Macrotasks fire earliest-virtual-fire-time first, and dispatching one
     // advances the virtual clock read by `monotonicNow()`.

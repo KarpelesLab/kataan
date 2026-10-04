@@ -1902,6 +1902,36 @@ const GEN_COMPLETED: f64 = 3.0;
 /// %GeneratorPrototype% / %AsyncGeneratorPrototype%.
 const GEN_PROTO_KEY: &str = "\0genproto";
 
+/// The hidden slot of a suspended VM frame's holder (a generator object, an
+/// async function's controller) naming the function it is an activation of,
+/// recorded once a second realm exists: resuming the frame re-enters that
+/// function's realm (see [`enter_frame_realm`]).
+const FRAME_CALLEE: &str = "\0framefn";
+
+/// Records `callee` as the function whose suspended frame `holder` keeps
+/// (only while several realms exist — the single-realm case never switches).
+fn note_frame_callee(ctx: &mut Ctx, holder: Handle, callee: Option<NanBox>) {
+    if ctx.realm.multi_realm
+        && let Some(c) = callee.filter(|c| c.as_handle().is_some())
+    {
+        ctx.realm.set_hidden_property(holder, FRAME_CALLEE, c);
+    }
+}
+
+/// A host entry resuming the suspended frame kept by `holder`: makes the
+/// frame's function realm the running one, as calling the function did
+/// (`true`: the caller must [`VmHost::leave_fn_realm`] afterwards).
+fn enter_frame_realm(host: &mut dyn VmHost, holder: NanBox) -> bool {
+    if !host.realm_slot().multi_realm {
+        return false;
+    }
+    let callee = holder.as_handle().and_then(|h| {
+        host.realm_slot()
+            .get_property(Handle::from_raw(h), FRAME_CALLEE)
+    });
+    callee.is_some_and(|c| host.enter_fn_realm(c))
+}
+
 /// [`Op::InitGenerator`].
 fn init_generator(ctx: &mut Ctx, funcs: &[FnProto], f: NanBox) -> Result<(), VmError> {
     let fh = f
@@ -1965,6 +1995,7 @@ fn make_generator(
     let g = ctx
         .realm
         .new_object_with_proto(proto.as_handle().map(Handle::from_raw));
+    note_frame_callee(ctx, g, callee);
     let state = gen_state_array(ctx, id, GEN_SUSPENDED_START, pc, 0, regs, &handlers);
     if is_async {
         // An async generator also carries its request queue (state slot 6).
@@ -2132,7 +2163,18 @@ fn drive_async(
                 handlers,
                 dst,
             }) => {
-                let c = *controller.get_or_insert_with(|| ctx.realm.new_object());
+                let c = match controller {
+                    Some(c) => c,
+                    None => {
+                        let c = ctx.realm.new_object();
+                        // The async function's own activation is the innermost
+                        // VM callee here (its first `await`).
+                        let callee = ctx.realm.vm_callee_stack.last().copied();
+                        note_frame_callee(ctx, c, callee);
+                        controller = Some(c);
+                        c
+                    }
+                };
                 let r_arr = ctx.realm.new_array(regs.clone());
                 let hs: Vec<NanBox> = handlers
                     .iter()
@@ -2181,6 +2223,7 @@ pub(crate) fn resume_vm_async(
     fulfilled: bool,
     v: NanBox,
 ) -> Result<(), VmError> {
+    let entered = enter_frame_realm(host, controller);
     let mut realm = core::mem::take(host.realm_slot());
     let result = (|| {
         let mut ctx = hosted_ctx(&mut realm, host);
@@ -2242,6 +2285,9 @@ pub(crate) fn resume_vm_async(
         }
     })();
     *host.realm_slot() = realm;
+    if entered {
+        host.leave_fn_realm();
+    }
     result
 }
 
@@ -2598,6 +2644,7 @@ pub(crate) fn vm_agen_request(
     kind: u8,
     v: NanBox,
 ) -> Result<NanBox, VmError> {
+    let entered = enter_frame_realm(host, generator);
     let mut realm = core::mem::take(host.realm_slot());
     let result = {
         let mut ctx = hosted_ctx(&mut realm, host);
@@ -2609,6 +2656,9 @@ pub(crate) fn vm_agen_request(
         }
     };
     *host.realm_slot() = realm;
+    if entered {
+        host.leave_fn_realm();
+    }
     result
 }
 
@@ -2624,6 +2674,7 @@ pub(crate) fn resume_vm_agen(
     fulfilled: bool,
     v: NanBox,
 ) -> Result<(), VmError> {
+    let entered = enter_frame_realm(host, generator);
     let mut realm = core::mem::take(host.realm_slot());
     let result = (|| {
         let mut ctx = hosted_ctx(&mut realm, host);
@@ -2669,6 +2720,9 @@ pub(crate) fn resume_vm_agen(
         }
     })();
     *host.realm_slot() = realm;
+    if entered {
+        host.leave_fn_realm();
+    }
     result
 }
 
@@ -2829,6 +2883,7 @@ pub(crate) fn resume_vm_generator(
     mode: u8,
     v: NanBox,
 ) -> Result<NanBox, VmError> {
+    let entered = enter_frame_realm(host, generator);
     let mut realm = core::mem::take(host.realm_slot());
     let result = {
         let mut ctx = hosted_ctx(&mut realm, host);
@@ -2840,6 +2895,9 @@ pub(crate) fn resume_vm_generator(
         }
     };
     *host.realm_slot() = realm;
+    if entered {
+        host.leave_fn_realm();
+    }
     result
 }
 
@@ -8128,6 +8186,7 @@ fn run_frame_at(
                     .as_handle()
                     .map(Handle::from_raw)
                     .and_then(|h| ctx.realm.vm_function(h).map(|(f, c)| (f, c.to_vec())))
+                    .filter(|_| !tail_call_changes_realm(ctx, val))
                 {
                     return Ok(FrameExit::Tail {
                         id: fid as usize,
@@ -8159,6 +8218,7 @@ fn run_frame_at(
                             .vm_function(h)
                             .filter(|(f, _)| (*f as usize) < funcs.len())
                             .map(|(f, c)| (f, c.to_vec()))
+                            .filter(|_| !tail_call_changes_realm(ctx, val))
                         {
                             return Ok(FrameExit::Tail {
                                 id: fid as usize,
@@ -8187,6 +8247,19 @@ fn run_frame_at(
         }
     }
     Ok(FrameExit::Return(None))
+}
+
+/// Whether a proper tail call to the VM function `callee` would leave the
+/// running realm: the trampoline reuses the caller's activation, which does
+/// not switch realms, so such a call is made the ordinary way (it then runs
+/// with its own realm current, at the cost of one native frame). One flag
+/// test while only one realm exists.
+fn tail_call_changes_realm(ctx: &Ctx, callee: NanBox) -> bool {
+    ctx.realm.multi_realm
+        && ctx
+            .host
+            .as_deref()
+            .is_some_and(|h| h.fn_realm_index(callee) != h.realm_index())
 }
 
 /// Interpreter-aware `JSON.stringify(value, replacer?, space?)`: normalizes the
