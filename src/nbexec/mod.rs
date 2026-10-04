@@ -9826,12 +9826,23 @@ impl crate::nbvm::VmHost for Interp<'_> {
                         self.make_error(N_TYPE_ERROR, Some(m)),
                     ));
                 }
-                match self.coerce_to_object(recv).as_handle() {
+                let wrapper = match self.coerce_to_object(recv).as_handle() {
                     Some(b) => Handle::from_raw(b),
                     None => return Err(crate::nbvm::HostError::Fault),
+                };
+                // A non-string primitive: `[[Get]]` on its wrapper with the
+                // primitive itself as the receiver (a getter's `this`).
+                if recv.as_handle().is_none() {
+                    let key = self.vm_object_key(key).map_err(exec_to_host)?;
+                    let name = self.member_key(key);
+                    return self
+                        .get_with_receiver(wrapper, &name, recv)
+                        .map_err(exec_to_host);
                 }
+                wrapper
             }
         };
+        let key = self.vm_object_key(key).map_err(exec_to_host)?;
         self.read_member_value(target, key).map_err(exec_to_host)
     }
 
@@ -10120,6 +10131,53 @@ impl crate::nbvm::VmHost for Interp<'_> {
         Ok(NanBox::handle(p.to_raw()))
     }
 
+    fn for_in_enumerate(
+        &mut self,
+        obj: NanBox,
+    ) -> Result<(NanBox, NanBox), crate::nbvm::HostError> {
+        #[cfg(all(feature = "module", feature = "std"))]
+        if let Some(raw) = obj.as_handle() {
+            self.namespace_enumeration_tdz(Handle::from_raw(raw))
+                .map_err(exec_to_host)?;
+        }
+        let trap_keys = match obj.as_handle() {
+            Some(raw) => self
+                .proxy_own_enumerable_keys(Handle::from_raw(raw))
+                .map_err(exec_to_host)?,
+            None => None,
+        };
+        let (keys, live) = match trap_keys {
+            Some(ks) => (
+                ks.iter().map(|k| self.new_str(k)).collect(),
+                NanBox::undefined(),
+            ),
+            None => {
+                let live = if self.is_object_value(obj) {
+                    obj
+                } else {
+                    NanBox::undefined()
+                };
+                (self.iterate_keys(obj), live)
+            }
+        };
+        Ok((NanBox::handle(self.realm.new_array(keys).to_raw()), live))
+    }
+
+    fn async_from_sync_throw_return(
+        &mut self,
+        iter: NanBox,
+        is_throw: bool,
+        v: NanBox,
+    ) -> Result<NanBox, crate::nbvm::HostError> {
+        let Some(ih) = iter.as_handle().map(Handle::from_raw) else {
+            return Err(crate::nbvm::HostError::Fault);
+        };
+        let p = self
+            .async_from_sync_resume(ih, is_throw, v)
+            .map_err(exec_to_host)?;
+        Ok(NanBox::handle(p.to_raw()))
+    }
+
     fn annexb_global(&mut self, name: &str, start: u32, end: u32, value: NanBox) {
         let span = Span { start, end };
         if self
@@ -10316,6 +10374,11 @@ impl crate::nbvm::VmHost for Interp<'_> {
         Some((NanBox::handle(gf.to_raw()), NanBox::handle(g.to_raw())))
     }
 
+    fn async_function_proto(&mut self) -> Option<NanBox> {
+        self.async_function_prototype()
+            .map(|h| NanBox::handle(h.to_raw()))
+    }
+
     fn get_with_receiver(
         &mut self,
         obj: NanBox,
@@ -10325,6 +10388,7 @@ impl crate::nbvm::VmHost for Interp<'_> {
         let Some(o) = obj.as_handle().map(Handle::from_raw) else {
             return Err(crate::nbvm::HostError::Fault);
         };
+        let key = self.vm_object_key(key).map_err(exec_to_host)?;
         let name = self.member_key(key);
         self.get_with_receiver(o, &name, receiver)
             .map_err(exec_to_host)
@@ -10336,14 +10400,17 @@ impl crate::nbvm::VmHost for Interp<'_> {
         key: NanBox,
         value: NanBox,
         receiver: NanBox,
+        strict: bool,
     ) -> Result<(), crate::nbvm::HostError> {
         let Some(o) = obj.as_handle().map(Handle::from_raw) else {
             return Err(crate::nbvm::HostError::Fault);
         };
+        let key = self.vm_object_key(key).map_err(exec_to_host)?;
         let name = self.member_key(key);
         if !self
             .proxy_set_bool(o, &name, value, receiver)
             .map_err(exec_to_host)?
+            && strict
         {
             let e = self.type_error(&alloc::format!(
                 "Cannot assign to read only property '{name}' of super"
@@ -10410,7 +10477,9 @@ impl crate::nbvm::VmHost for Interp<'_> {
     ) -> Result<(), crate::nbvm::HostError> {
         let saved = core::mem::replace(&mut self.strict, strict);
         let r = match recv.as_handle().map(Handle::from_raw) {
-            Some(h) if !self.realm.is_string_handle(h) => self.assign_member_value(h, key, value),
+            Some(h) if !self.realm.is_string_handle(h) => self
+                .vm_object_key(key)
+                .and_then(|key| self.assign_member_value(h, key, value)),
             _ if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) => {
                 let m = self.new_str("Cannot set properties of null or undefined");
                 Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
@@ -10804,3 +10873,20 @@ pub(crate) fn private_storage_key(name: &str, scope: u32) -> String {
 
 #[cfg(test)]
 mod tests;
+
+impl Interp<'_> {
+    /// A VM-supplied member key: an *object* key runs its full ToPropertyKey
+    /// here (once), so the member operation sees the resulting string/symbol
+    /// key; any other key is passed through.
+    fn vm_object_key(&mut self, key: NanBox) -> Result<NanBox, ExecError> {
+        let is_object_key = key.as_handle().is_some_and(|raw| {
+            let h = Handle::from_raw(raw);
+            self.realm.symbol_at(h).is_none() && !self.realm.is_string_handle(h)
+        });
+        if !is_object_key {
+            return Ok(key);
+        }
+        let k = self.coerce_property_key(key)?;
+        Ok(self.new_str(&k))
+    }
+}

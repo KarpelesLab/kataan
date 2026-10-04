@@ -556,6 +556,7 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             key,
             src,
             this,
+            ..
         } => {
             reg(*home)?;
             reg(*key)?;
@@ -1375,11 +1376,13 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             key,
             src,
             this,
+            strict,
         } => {
             w_u8(95, out);
             for r in [home, key, src, this] {
                 w_reg(*r, out);
             }
+            w_bool(*strict, out);
         }
         Op::Yield { dst, src } => {
             w_u8(104, out);
@@ -2104,6 +2107,7 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             key: r.reg()?,
             src: r.reg()?,
             this: r.reg()?,
+            strict: r.boolean()?,
         },
         104 => Op::Yield {
             dst: r.reg()?,

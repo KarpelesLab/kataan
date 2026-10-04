@@ -1175,6 +1175,17 @@ impl<'a> Interp<'a> {
         iter: Handle,
         result: Result<NanBox, ExecError>,
     ) -> Result<Handle, ExecError> {
+        self.async_from_sync_continuation_with(iter, result, true)
+    }
+
+    /// [`Self::async_from_sync_continuation`] with an explicit
+    /// `closeOnRejection` (false for `return`).
+    fn async_from_sync_continuation_with(
+        &mut self,
+        iter: Handle,
+        result: Result<NanBox, ExecError>,
+        close_on_rejection: bool,
+    ) -> Result<Handle, ExecError> {
         let result = result?;
         let Some(rh) = self.as_object_handle(result) else {
             return Err(self.type_error("iterator result is not an object"));
@@ -1187,7 +1198,7 @@ impl<'a> Interp<'a> {
             Err(e) => {
                 // `closeOnRejection` is true here (this is `next`, not `return`):
                 // a non-done result closes the sync iterator before rejecting.
-                if !done {
+                if !done && close_on_rejection {
                     let _ = self.iterator_close(iter);
                 }
                 return Err(e);
@@ -1200,7 +1211,7 @@ impl<'a> Interp<'a> {
         let on_f = self.realm.new_bound_native(N_ASYNC_FROM_SYNC_UNWRAP, state);
         // Step 10: `onRejected` exists only for a non-done result; for a done one
         // the rejection simply passes through to the capability.
-        let on_r = if done {
+        let on_r = if done || !close_on_rejection {
             NanBox::undefined()
         } else {
             let f = self.realm.new_bound_native(N_ASYNC_FROM_SYNC_CLOSE, state);
@@ -1250,6 +1261,54 @@ impl<'a> Interp<'a> {
             }
             Err(other) => Err(other),
         }
+    }
+
+    /// `%AsyncFromSyncIteratorPrototype%.throw` (`is_throw`) / `.return`
+    /// (27.1.4.2.2–3) over the sync iterator `iter` for the bytecode VM's async
+    /// `yield*`: always a promise; abrupt completions reject it.
+    pub(crate) fn async_from_sync_resume(
+        &mut self,
+        iter: Handle,
+        is_throw: bool,
+        value: NanBox,
+    ) -> Result<Handle, ExecError> {
+        let r = self.async_from_sync_resume_inner(iter, is_throw, value);
+        match r {
+            Ok(p) => Ok(p),
+            Err(ExecError::Throw(e)) => {
+                let p = self.fresh_promise();
+                self.settle(p, e, false);
+                Ok(p)
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    fn async_from_sync_resume_inner(
+        &mut self,
+        iter: Handle,
+        is_throw: bool,
+        value: NanBox,
+    ) -> Result<Handle, ExecError> {
+        let iter_val = NanBox::handle(iter.to_raw());
+        let method = self.read_member(iter, if is_throw { "throw" } else { "return" })?;
+        if method.is_undefined() || method.is_null() {
+            if is_throw {
+                // No `throw`: close the sync iterator (a normal completion), then
+                // reject with a TypeError.
+                self.iterator_close(iter)?;
+                return Err(self.type_error("The iterator does not provide a 'throw' method"));
+            }
+            let res = self.gen_result(value, true);
+            let p = self.fresh_promise();
+            self.settle(p, res, true);
+            return Ok(p);
+        }
+        let result = self.call_with_this(method, iter_val, &[value])?;
+        if self.as_object_handle(result).is_none() {
+            return Err(self.type_error("iterator result is not an object"));
+        }
+        self.async_from_sync_continuation_with(iter, Ok(result), is_throw)
     }
 
     /// [`Self::async_from_sync_next`] for the bytecode VM's `for await`.

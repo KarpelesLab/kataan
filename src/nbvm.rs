@@ -210,12 +210,14 @@ pub enum Op {
         key: Reg,
         this: Reg,
     },
-    /// `home.[[Prototype]].[[Set]](key, src, this)` (`super[key] = src`).
+    /// `home.[[Prototype]].[[Set]](key, src, this)` (`super[key] = src`); a
+    /// failed write throws only in `strict` code.
     SuperSet {
         home: Reg,
         key: Reg,
         src: Reg,
         this: Reg,
+        strict: bool,
     },
     /// A derived constructor's completion value `src`: an object is the
     /// result, `undefined` is the (bound) `this`, anything else a `TypeError`.
@@ -1066,6 +1068,8 @@ pub trait VmHost {
     /// `(%GeneratorFunction.prototype%, %GeneratorPrototype%)`, or the async
     /// generator ones.
     fn generator_intrinsics(&mut self, is_async: bool) -> Option<(NanBox, NanBox)>;
+    /// `%AsyncFunction.prototype%`, an async function's `[[Prototype]]`.
+    fn async_function_proto(&mut self) -> Option<NanBox>;
     /// A fresh pending host promise (an async function's result).
     fn new_promise(&mut self) -> NanBox;
     /// Resolves (`fulfilled`) or rejects the host promise `p` with `v`.
@@ -1113,6 +1117,24 @@ pub trait VmHost {
         next: NanBox,
         v: NanBox,
     ) -> Result<NanBox, HostError>;
+    /// `for (k in obj)`'s key list (EnumerateObjectProperties, a proxy's
+    /// `ownKeys` trap included) as an array, and the object each key's
+    /// liveness is re-checked against before its iteration (`undefined`: none).
+    ///
+    /// # Errors
+    /// A trap's throw, or a module namespace's TDZ export.
+    fn for_in_enumerate(&mut self, obj: NanBox) -> Result<(NanBox, NanBox), HostError>;
+    /// %AsyncFromSyncIteratorPrototype%.throw (`is_throw`) / .return over the
+    /// sync iterator `iter`: a promise of the iterator result.
+    ///
+    /// # Errors
+    /// A fatal (non-JS) error; JS errors reject the promise.
+    fn async_from_sync_throw_return(
+        &mut self,
+        iter: NanBox,
+        is_throw: bool,
+        v: NanBox,
+    ) -> Result<NanBox, HostError>;
     /// `obj.[[Get]](key, receiver)` (a `super.x` read).
     ///
     /// # Errors
@@ -1123,8 +1145,9 @@ pub trait VmHost {
         key: NanBox,
         receiver: NanBox,
     ) -> Result<NanBox, HostError>;
-    /// `obj.[[Set]](key, value, receiver)` in strict code (a `super.x = v`):
-    /// a `false` result is a `TypeError`.
+    /// `obj.[[Set]](key, value, receiver)` (a `super.x = v`): in `strict`
+    /// code a `false` result is a `TypeError`. An object `key` is converted
+    /// (ToPropertyKey) here, after the caller's GetSuperBase.
     ///
     /// # Errors
     /// A setter's or trap's throw, or the failed-write `TypeError`.
@@ -1134,6 +1157,7 @@ pub trait VmHost {
         key: NanBox,
         value: NanBox,
         receiver: NanBox,
+        strict: bool,
     ) -> Result<(), HostError>;
     /// `ToString(v)` (a symbol throws a `TypeError`; an object's string-hint
     /// `ToPrimitive` runs user code).
@@ -1476,10 +1500,16 @@ fn vm_set_elem_mode(
     // the host's; the VM's element store is for arrays.
     // An index write past an array's end (other than an append) makes holes
     // or a huge length: the host's (sparse) array.
+    // An append (`arr[arr.length] = v`) whose index an object on the
+    // prototype chain owns (a setter / read-only element) is the host's too.
     let past_end = key.as_number().is_some_and(|n| {
         recv.as_handle()
-            .and_then(|h| ctx.realm.array_length(Handle::from_raw(h)))
-            .is_some_and(|len| n > len as f64)
+            .map(Handle::from_raw)
+            .and_then(|h| ctx.realm.array_length(h).map(|len| (h, len)))
+            .is_some_and(|(h, len)| {
+                n > len as f64
+                    || (n == len as f64 && proto_owns_key(ctx.realm, h, &alloc::format!("{len}")))
+            })
     });
     let mut to_host = read_needs_host(ctx, recv)
         || past_end
@@ -1497,6 +1527,7 @@ fn vm_set_elem_mode(
                 let mut cache = PropertyCache::new();
                 return vm_set_prop_mode(ctx, funcs, recv, &ks, value, &mut cache, strict);
             }
+            Err(e @ VmError::Thrown(_)) => return Err(e),
             Err(_) => to_host = true,
         }
     }
@@ -1507,6 +1538,20 @@ fn vm_set_elem_mode(
         }
     }
     host_set(ctx, recv, key, value, strict)
+}
+
+/// Whether an object on `h`'s prototype chain (not `h` itself) has an own
+/// property `key`, or the chain holds a proxy.
+fn proto_owns_key(realm: &Realm, h: Handle, key: &str) -> bool {
+    let mut cur = realm.object_proto(h);
+    while let Some(c) = cur {
+        if realm.proxy_at(c).is_some() || realm.has_own(c, key) || realm.accessor(c, key).is_some()
+        {
+            return true;
+        }
+        cur = realm.object_proto(c);
+    }
+    false
 }
 
 /// The VM function `recv.key` resolves to — a *data* property holding a VM
@@ -2878,6 +2923,19 @@ pub(crate) fn construct_vm_function(
 
 /// The `[[Prototype]]` a hosted VM closure gets: `%Function.prototype%`, so
 /// `f.call`/`apply`/`bind` and friends resolve through the host's library.
+/// Hosted: a (non-generator) async function inherits
+/// %AsyncFunction.prototype%.
+fn link_async_proto(ctx: &mut Ctx, proto: Option<&FnProto>, f: Handle) {
+    if ctx.host.is_some()
+        && proto.is_some_and(|p| p.is_async && !p.is_generator)
+        && let Some(afp) = with_host(ctx, |h| h.async_function_proto())
+            .flatten()
+            .and_then(|v| v.as_handle())
+    {
+        ctx.realm.set_native_proto(f, Handle::from_raw(afp));
+    }
+}
+
 fn link_function_proto(ctx: &mut Ctx, f: Handle) {
     if ctx.host.is_some()
         && let Some(proto) = ctx.realm.intrinsics_snapshot().function_proto
@@ -4081,6 +4139,9 @@ fn vm_get_prop(
                     );
                     Err(VmError::Thrown(e))
                 }
+                // Hosted: a primitive's property comes from its wrapper's
+                // prototype chain (a getter sees the primitive `this`).
+                _ if ctx.host.is_some() => host_get_str(ctx, recv, key),
                 // Other primitives: a missing property reads `undefined`.
                 _ => Ok(NanBox::undefined()),
             }
@@ -4102,7 +4163,10 @@ fn vm_get_prop(
             }
             // A VM function's `.prototype` is a lazily-created object (keyed by
             // function id, with a `constructor` back-link).
+            // (Hosted, a constructible function gets an own one at creation;
+            // arrows, methods and async functions have none.)
             if key == "prototype"
+                && ctx.host.is_none()
                 && ctx.realm.is_vm_function(handle)
                 && !ctx.realm.has_own(handle, "prototype")
                 && let Some((func_id, _)) = ctx.realm.vm_function(handle)
@@ -5997,8 +6061,9 @@ fn run_frame_at(
                         call_closure(ctx, funcs, nx, &[v], it)
                     }
                 } else if is_sync {
-                    // AsyncFromSyncIterator's throw/return: the tree-walker's.
-                    return Err(VmError::Unsupported);
+                    with_host(ctx, |h| h.async_from_sync_throw_return(it, m == 1, v))
+                        .unwrap_or(Err(HostError::Fault))
+                        .map_err(VmError::from)
                 } else {
                     let name = if m == 1 { "throw" } else { "return" };
                     match host_get_str(ctx, it, name) {
@@ -6309,6 +6374,7 @@ fn run_frame_at(
                 key,
                 src,
                 this,
+                strict,
             } => {
                 let (k, v, t) = (
                     regs[*key as usize],
@@ -6316,11 +6382,13 @@ fn run_frame_at(
                     regs[*this as usize],
                 );
                 match super_base(ctx, regs[*home as usize]) {
-                    Ok(base) => match with_host(ctx, |h| h.set_with_receiver(base, k, v, t)) {
-                        Some(Ok(())) => {}
-                        Some(Err(e)) => handle_throw!(VmError::from(e)),
-                        None => return Err(VmError::Unsupported),
-                    },
+                    Ok(base) => {
+                        match with_host(ctx, |h| h.set_with_receiver(base, k, v, t, *strict)) {
+                            Some(Ok(())) => {}
+                            Some(Err(e)) => handle_throw!(VmError::from(e)),
+                            None => return Err(VmError::Unsupported),
+                        }
+                    }
                     Err(e) => handle_throw!(e),
                 }
             }
@@ -6752,6 +6820,19 @@ fn run_frame_at(
                     Err(e) => handle_throw!(e),
                 }
             }
+            // Hosted: the host's key list; `obj` is replaced by the object
+            // whose properties keep a key live (or `undefined`).
+            Op::EnumKeys { dst, obj } if ctx.host.is_some() => {
+                let o = regs[*obj as usize];
+                match with_host(ctx, |h| h.for_in_enumerate(o)) {
+                    Some(Ok((keys, live))) => {
+                        regs[*dst as usize] = keys;
+                        regs[*obj as usize] = live;
+                    }
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
+            }
             Op::EnumKeys { dst, obj } => {
                 let h = object_handle(regs[*obj as usize])?;
                 if ctx.host.is_some() && ctx.realm.is_host_exotic(h) {
@@ -7025,6 +7106,7 @@ fn run_frame_at(
                 let handle = ctx.realm.new_vm_function(*func, Vec::new());
                 install_fn_name_length(ctx.realm, handle, funcs.get(*func as usize));
                 link_function_proto(ctx, handle);
+                link_async_proto(ctx, funcs.get(*func as usize), handle);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::MakeClosure {
@@ -7036,6 +7118,7 @@ fn run_frame_at(
                 let handle = ctx.realm.new_vm_function(*func, cells);
                 install_fn_name_length(ctx.realm, handle, funcs.get(*func as usize));
                 link_function_proto(ctx, handle);
+                link_async_proto(ctx, funcs.get(*func as usize), handle);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::CallValue { dst, callee, args }
@@ -7673,14 +7756,22 @@ fn vm_array_index_get(
 /// from `ToPrimitive(key, string)` — an `@@toPrimitive` / inherited `toString`
 /// only the tree-walker resolves. (A Date, for one, keys on its
 /// `Date.prototype.toString` text, not the ISO form `to_display_string` produces.)
-fn vm_property_key(ctx: &Ctx, key: NanBox) -> Result<String, VmError> {
+fn vm_property_key(ctx: &mut Ctx, key: NanBox) -> Result<String, VmError> {
     if let Some(raw) = key.as_handle() {
         let h = Handle::from_raw(raw);
         if let Some((_, id)) = ctx.realm.symbol_at(h) {
             return Ok(alloc::format!("\u{0}sym:{id}"));
         }
         if ctx.realm.string_value(h).is_none() {
-            return Err(VmError::Unsupported);
+            // Hosted: the host runs the full ToPrimitive(key, string) once.
+            let k = match with_host(ctx, |hst| hst.to_property_key(key)) {
+                Some(r) => r.map_err(VmError::from)?,
+                None => return Err(VmError::Unsupported),
+            };
+            return k
+                .as_handle()
+                .and_then(|r| ctx.realm.string_value(Handle::from_raw(r)))
+                .ok_or(VmError::Unsupported);
         }
     }
     Ok(ctx.realm.to_display_string(key))
@@ -7768,7 +7859,13 @@ fn vm_get_elem(
             } else if ctx.host.is_some() {
                 // Not an own property: the host walks the prototype chain (with
                 // its accessors and exotic objects) — `arr[Symbol.iterator]`,
-                // an inherited method reached by a computed key.
+                // an inherited method reached by a computed key. An object key
+                // was already converted (its ToPropertyKey runs once).
+                let key = if is_object_value(ctx.realm, key) {
+                    NanBox::handle(ctx.realm.new_string(&ks).to_raw())
+                } else {
+                    key
+                };
                 host_get(ctx, recv, key)
             } else {
                 Ok(NanBox::undefined())
@@ -7894,6 +7991,11 @@ fn vm_set_elem(
 /// code-unit count, else an explicit `length` data property (e.g. a regex match
 /// result). `Err(NotAnObject)` when `recv` is not a heap object.
 fn vm_array_len(ctx: &mut Ctx, funcs: &[FnProto], recv: NanBox) -> Result<NanBox, VmError> {
+    // Hosted: a primitive receiver (`null.length` throws a TypeError,
+    // `(5).length` reads Number.prototype) is an ordinary `[[Get]]`.
+    if ctx.host.is_some() && recv.as_handle().is_none() {
+        return vm_get_prop(ctx, funcs, recv, "length", &mut PropertyCache::default());
+    }
     let handle = recv
         .as_handle()
         .map(Handle::from_raw)
@@ -11505,6 +11607,10 @@ struct Compiler {
     args_member_read: bool,
     /// The next closure `make_closure_inner` builds is a generator function.
     next_closure_is_generator: bool,
+    /// Set by a *named function expression* just before its closure is made:
+    /// only it binds its own name inside its body (a declaration, or a
+    /// NamedEvaluation name, does not).
+    next_closure_self_bind: bool,
     /// Compiling a generator function's body (`yield` suspends it).
     in_generator: bool,
     /// Compiling a hosted async function's body (`await` suspends it).
@@ -12361,6 +12467,19 @@ impl Compiler {
     /// Declares `name`, allocating a register (and a backing cell if the name is
     /// captured). Returns the binding.
     fn declare(&mut self, name: &str) -> Binding {
+        // Annex B.3.5: a `var` re-declaring an enclosing catch parameter
+        // initializes the parameter (its PutValue resolves to the nearest
+        // binding) — the var binding itself is only hoisted.
+        if self.hosted
+            && self.decl_kind == Some(crate::ast::VarDeclKind::Var)
+            && let Some(b) = self.scopes[1..]
+                .iter()
+                .rev()
+                .find_map(|s| s.get(name))
+                .copied()
+        {
+            return b;
+        }
         if let Some(b) = self.global_declaration(name) {
             return b;
         }
@@ -13445,9 +13564,8 @@ impl Compiler {
                         self.handler_depth += 1;
                         (at, r)
                     });
-                    self.using_scope(&catch.body, |c| {
-                        catch.body.iter().try_for_each(|s| c.stmt(s).map(|_| ()))
-                    })?;
+                    // The catch Block is its own scope inside the parameter's.
+                    self.block_stmts(&catch.body)?;
                     self.scopes.pop();
                     if let Some(fin) = finalizer {
                         let (at, r) = guard.expect("guarded");
@@ -13807,7 +13925,14 @@ impl Compiler {
                     ForLeft::Target(_) => return Err(CompileError::Unsupported("for-in binding")),
                 };
                 self.scopes.push(alloc::collections::BTreeMap::new());
-                let obj = self.for_head_expr(&bind, right)?;
+                let mut obj = self.for_head_expr(&bind, right)?;
+                if self.hosted {
+                    // A hosted `EnumKeys` overwrites `obj` with the liveness
+                    // object: never a variable's own register.
+                    let t = self.alloc();
+                    self.ops.push(Op::Move { dst: t, src: obj });
+                    obj = t;
+                }
                 let arr = self.alloc();
                 self.ops.push(Op::EnumKeys { dst: arr, obj });
                 let len = self.alloc();
@@ -13831,10 +13956,37 @@ impl Compiler {
                     arr,
                     index: i,
                 });
+                // Hosted: a key whose property was deleted since the list was
+                // taken (and is not inherited) is skipped.
+                let mut dead = None;
+                if self.hosted {
+                    let undef = self.constant(NanBox::undefined())?;
+                    let none = self.alloc();
+                    self.ops.push(Op::StrictEq {
+                        dst: none,
+                        a: obj,
+                        b: undef,
+                    });
+                    let to_check = self.emit_jump_if_false(none);
+                    let to_bind = self.emit_jump();
+                    self.patch(to_check);
+                    let live = self.alloc();
+                    self.ops.push(Op::Relational {
+                        dst: live,
+                        instanceof: false,
+                        a: cur,
+                        b: obj,
+                    });
+                    dead = Some(self.emit_jump_if_false(live));
+                    self.patch(to_bind);
+                }
                 self.for_bind(bind, cur)?;
                 self.enter_loop();
                 self.stmt(body)?;
                 let cont = self.ops.len();
+                if let Some(d) = dead {
+                    self.patch_to(d, cont);
+                }
                 let one = self.alloc();
                 self.ops.push(Op::LoadConst {
                     dst: one,
@@ -13914,6 +14066,11 @@ impl Compiler {
                         .collect(),
                     _ => Vec::new(),
                 };
+                // CreatePerIterationEnvironment also runs once before the first
+                // test: a closure in the head keeps the initial copy.
+                if self.hosted {
+                    self.refresh_loop_cells(&per_iter);
+                }
                 let top = self.ops.len();
                 let exit = match test {
                     Some(t) => {
@@ -15022,14 +15179,45 @@ impl Compiler {
                         Expr::Member {
                             object, property, ..
                         } => {
+                            // The base and a computed key are evaluated once (the
+                            // key's ToPropertyKey too); the result is the
+                            // assigned value, or the current one on a
+                            // short-circuit.
                             let obj = self.expr(object)?;
-                            let cur = self.member_read(obj, property)?;
+                            let key = match property {
+                                PropertyKey::Computed(e) => {
+                                    let k = self.expr(e)?;
+                                    if self.hosted {
+                                        self.ops.push(Op::RequireObjectCoercible { src: obj });
+                                        let kc = self.alloc();
+                                        self.ops.push(Op::ToKey { dst: kc, src: k });
+                                        Some(kc)
+                                    } else {
+                                        Some(k)
+                                    }
+                                }
+                                _ => None,
+                            };
+                            let cur = match key {
+                                Some(k) => {
+                                    let dst = self.alloc();
+                                    self.ops.push(Op::GetKey { dst, obj, key: k });
+                                    dst
+                                }
+                                None => self.member_read(obj, property)?,
+                            };
+                            let out = self.alloc();
+                            self.ops.push(Op::Move { dst: out, src: cur });
                             let c = cond(self, cur)?;
                             let jf = self.emit_jump_if_false(c);
                             let v = self.expr(value)?;
-                            self.member_write(obj, property, v)?;
+                            match key {
+                                Some(k) => self.store_key(obj, k, v),
+                                None => self.member_write(obj, property, v)?,
+                            }
+                            self.ops.push(Op::Move { dst: out, src: v });
                             self.patch(jf);
-                            return self.member_read(obj, property);
+                            return Ok(out);
                         }
                         _ => return Err(CompileError::Unsupported("logical assign target")),
                     }
@@ -15049,6 +15237,7 @@ impl Compiler {
                             key,
                             src,
                             this,
+                            strict: self.strict,
                         });
                         Ok(src)
                     }
@@ -15699,6 +15888,7 @@ impl Compiler {
                 refuse_generator(f, self.hosted)?;
                 self.next_closure_is_generator = f.is_generator;
                 let nm = f.id.as_ref().map_or("", |i| i.name.as_ref());
+                self.next_closure_self_bind = f.id.is_some();
                 self.make_closure(&f.params, &f.body, f.is_async, nm, false)
             }
             Expr::Arrow(a) => {
@@ -15957,7 +16147,8 @@ impl Compiler {
         // closure, so a recursive call (`return f(n-1)`) reaches the function
         // *with its own captures* — which also makes it eligible for a proper
         // tail call. The name is invisible outside the body.
-        let self_name: Option<&str> = if !name.is_empty() && free.contains(name) {
+        let self_bind = core::mem::take(&mut self.next_closure_self_bind);
+        let self_name: Option<&str> = if self_bind && !name.is_empty() && free.contains(name) {
             Some(name)
         } else {
             None
@@ -16157,6 +16348,9 @@ impl Compiler {
     fn block_stmts(&mut self, stmts: &'_ [Stmt]) -> Result<(), CompileError> {
         self.scopes.push(alloc::collections::BTreeMap::new());
         let r = self.using_scope(stmts, |c| {
+            // The block's lexicals start in their TDZ.
+            let refs: Vec<&Stmt> = stmts.iter().collect();
+            c.prebind_block_lexicals(&refs, &BTreeSet::new(), false)?;
             stmts.iter().try_for_each(|s| c.stmt(s).map(|_| ()))
         });
         self.scopes.pop();
@@ -16923,6 +17117,13 @@ impl Compiler {
                 self.write_var(Binding { tdz: false, ..b }, f);
             }
             for st in statics {
+                // `static f = function () {}` names the function after its
+                // field (SetFunctionName once the value exists).
+                let named = matches!(
+                    &st,
+                    Static::Field(_, Some(e)) | Static::PrivateField(_, Some(e))
+                        if is_anonymous_fn_def(e)
+                );
                 let body: Vec<Stmt> = match &st {
                     Static::Field(_, Some(e)) | Static::PrivateField(_, Some(e)) => {
                         alloc::vec![Stmt::Return {
@@ -16947,6 +17148,12 @@ impl Compiler {
                     args: none,
                 });
                 match st {
+                    Static::Field(key, _) if named => self.ops.push(Op::DefineMethod {
+                        obj: f,
+                        key,
+                        func: v,
+                        kind: 4,
+                    }),
                     Static::Field(key, _) => self.ops.push(Op::DefineData {
                         obj: f,
                         key,
@@ -16954,6 +17161,19 @@ impl Compiler {
                         attrs: 7,
                     }),
                     Static::PrivateField(n, _) => {
+                        if named {
+                            // Name it `#n` (defined on a scratch object).
+                            let scratch = self.alloc();
+                            self.ops.push(Op::NewObject { dst: scratch });
+                            let nm = alloc::format!("#{}", n.trim_start_matches("\0#"));
+                            let k = self.constant_str(&nm);
+                            self.ops.push(Op::DefineMethod {
+                                obj: scratch,
+                                key: k,
+                                func: v,
+                                kind: 0,
+                            });
+                        }
                         let key = self.private_key(&n)?;
                         self.ops.push(Op::PrivateDefine {
                             obj: f,
@@ -17515,12 +17735,9 @@ impl Compiler {
             .ok_or(CompileError::Unsupported("super outside a class element"))?;
         let this = self.this_value();
         let key = match property {
-            PropertyKey::Computed(e) => {
-                let k = self.expr(e)?;
-                let kc = self.alloc();
-                self.ops.push(Op::ToKey { dst: kc, src: k });
-                kc
-            }
+            // ToPropertyKey runs in the access (after GetSuperBase, and after
+            // an assignment's right-hand side).
+            PropertyKey::Computed(e) => self.expr(e)?,
             PropertyKey::Private(_) => return Err(CompileError::Unsupported("private name")),
             other => {
                 let k = static_key(other)?;
