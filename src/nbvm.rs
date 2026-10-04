@@ -11727,6 +11727,13 @@ impl Compiler {
                     );
                     c.tdz_pending.insert((0, name.clone()));
                 }
+                if hosted {
+                    for name in lexical.difference(&seen) {
+                        if !c.scopes[0].contains_key(name.as_str()) {
+                            c.bind_tdz_reg(name, 0)?;
+                        }
+                    }
+                }
             }
         }
         // Annex B.3.3 (sloppy): a block-level function declaration also gets a
@@ -12086,6 +12093,29 @@ impl Compiler {
             None if self.hosted => Some(self.global_binding(name, GlobalWrite::Put)),
             None => None,
         }
+    }
+
+    /// An uncaptured lexical `name` at scope `depth`, before its declaration:
+    /// a register holding the TDZ sentinel, so a reference compiled before the
+    /// declaration (always executed before it, outside `switch`) throws. The
+    /// declaration's `declare` replaces the entry with an ordinary binding.
+    fn bind_tdz_reg(&mut self, name: &str, depth: usize) -> Result<(), CompileError> {
+        let t = self.constant(NanBox::tdz())?;
+        let reg = self.alloc();
+        self.ops.push(Op::Move { dst: reg, src: t });
+        self.scopes[depth].insert(
+            String::from(name),
+            Binding {
+                reg,
+                cell: false,
+                konst: false,
+                global: None,
+                tdz: true,
+                mapped: false,
+                fn_name: false,
+            },
+        );
+        Ok(())
     }
 
     /// Marks the just-declared local `name` as `const`.
@@ -12609,6 +12639,9 @@ impl Compiler {
             }
             dst
         } else {
+            if b.tdz {
+                self.ops.push(Op::CheckTdz { src: b.reg });
+            }
             b.reg
         }
     }
@@ -12812,56 +12845,66 @@ impl Compiler {
                 ..
             } => {
                 let d = self.expr(discriminant)?;
-                // Only `break` targets a switch; `continue` skips to the loop.
-                self.break_sites.push(Vec::new());
-                self.loop_frames.push(LoopFrame {
-                    handler_depth: self.handler_depth,
-                    iter: None,
-                    async_iter: false,
-                    is_loop: false,
-                });
-                // Dispatch: jump to the first matching `case` body (else default,
-                // else the end). Bodies (compiled next) fall through.
-                let mut case_jumps: Vec<(usize, usize)> = Vec::new();
-                for (i, case) in cases.iter().enumerate() {
-                    if let Some(test) = &case.test {
-                        let t = self.expr(test)?;
-                        let eq = self.alloc();
-                        self.ops.push(Op::StrictEq {
-                            dst: eq,
-                            a: d,
-                            b: t,
-                        });
-                        let skip = self.emit_jump_if_false(eq);
-                        let to_body = self.emit_jump();
-                        case_jumps.push((i, to_body));
-                        self.patch(skip); // not this case → next test
+                // The case block is ONE scope, entered after the discriminant and
+                // before the tests. A jump to a later case can skip a lexical
+                // declaration, so every lexical keeps its TDZ check.
+                self.scopes.push(alloc::collections::BTreeMap::new());
+                let all: Vec<&Stmt> = cases.iter().flat_map(|c| c.body.iter()).collect();
+                let r = (|c: &mut Self| -> Result<(), CompileError> {
+                    c.prebind_block_lexicals(&all, &BTreeSet::new(), true)?;
+                    c.hoist_block_functions(&all)?;
+                    // Only `break` targets a switch; `continue` skips to the loop.
+                    c.break_sites.push(Vec::new());
+                    c.loop_frames.push(LoopFrame {
+                        handler_depth: c.handler_depth,
+                        iter: None,
+                        async_iter: false,
+                        is_loop: false,
+                    });
+                    // Dispatch: jump to the first matching `case` body (else default,
+                    // else the end). Bodies (compiled next) fall through.
+                    let mut case_jumps: Vec<(usize, usize)> = Vec::new();
+                    for (i, case) in cases.iter().enumerate() {
+                        if let Some(test) = &case.test {
+                            let t = c.expr(test)?;
+                            let eq = c.alloc();
+                            c.ops.push(Op::StrictEq {
+                                dst: eq,
+                                a: d,
+                                b: t,
+                            });
+                            let skip = c.emit_jump_if_false(eq);
+                            let to_body = c.emit_jump();
+                            case_jumps.push((i, to_body));
+                            c.patch(skip); // not this case → next test
+                        }
                     }
-                }
-                let exit_dispatch = self.emit_jump(); // → default body, else end
-                // Bodies, in order, falling through.
-                let mut entries = alloc::vec![0usize; cases.len()];
-                for (i, case) in cases.iter().enumerate() {
-                    entries[i] = self.ops.len();
-                    self.scopes.push(alloc::collections::BTreeMap::new());
-                    for s in &case.body {
-                        self.stmt(s)?;
+                    let exit_dispatch = c.emit_jump(); // → default body, else end
+                    // Bodies, in order, falling through.
+                    let mut entries = alloc::vec![0usize; cases.len()];
+                    for (i, case) in cases.iter().enumerate() {
+                        entries[i] = c.ops.len();
+                        for s in &case.body {
+                            c.stmt(s)?;
+                        }
                     }
-                    self.scopes.pop();
-                }
-                for (i, j) in case_jumps {
-                    self.patch_to(j, entries[i]);
-                }
-                match cases.iter().position(|c| c.test.is_none()) {
-                    Some(di) => self.patch_to(exit_dispatch, entries[di]),
-                    None => self.patch(exit_dispatch), // no default → end
-                }
-                self.loop_frames.pop();
-                let breaks = self.break_sites.pop().unwrap_or_default();
-                let end = self.ops.len();
-                for b in breaks {
-                    self.patch_to(b, end);
-                }
+                    for (i, j) in case_jumps {
+                        c.patch_to(j, entries[i]);
+                    }
+                    match cases.iter().position(|c| c.test.is_none()) {
+                        Some(di) => c.patch_to(exit_dispatch, entries[di]),
+                        None => c.patch(exit_dispatch), // no default → end
+                    }
+                    c.loop_frames.pop();
+                    let breaks = c.break_sites.pop().unwrap_or_default();
+                    let end = c.ops.len();
+                    for b in breaks {
+                        c.patch_to(b, end);
+                    }
+                    Ok(())
+                })(self);
+                self.scopes.pop();
+                r?;
                 Ok(None)
             }
             Stmt::Try {
@@ -13104,8 +13147,9 @@ impl Compiler {
             Stmt::Block { body, .. } => {
                 self.scopes.push(alloc::collections::BTreeMap::new());
                 let r = self.using_scope(body, |c| {
-                    c.prebind_block_lexicals(body, &BTreeSet::new())?;
-                    c.hoist_block_functions(body)?;
+                    let stmts: Vec<&Stmt> = body.iter().collect();
+                    c.prebind_block_lexicals(&stmts, &BTreeSet::new(), false)?;
+                    c.hoist_block_functions(&stmts)?;
                     body.iter().try_for_each(|s| c.stmt(s).map(|_| ()))
                 });
                 self.scopes.pop();
@@ -16643,8 +16687,9 @@ impl Compiler {
     /// entry; their declarations initialize them (hosted only).
     fn prebind_block_lexicals(
         &mut self,
-        body: &[Stmt],
+        body: &[&Stmt],
         extra: &BTreeSet<String>,
+        all: bool,
     ) -> Result<(), CompileError> {
         if !self.hosted {
             return Ok(());
@@ -16671,9 +16716,11 @@ impl Compiler {
         }
         let depth = self.scopes.len() - 1;
         for name in &lexical {
-            if !(self.cell_names.contains(name) || extra.contains(name))
-                || self.scopes[depth].contains_key(name.as_str())
-            {
+            if self.scopes[depth].contains_key(name.as_str()) {
+                continue;
+            }
+            if !(all || self.cell_names.contains(name) || extra.contains(name)) {
+                self.bind_tdz_reg(name, depth)?;
                 continue;
             }
             self.bind_hidden_cell(name, consts.contains(name), true)?;
@@ -16685,10 +16732,10 @@ impl Compiler {
     /// Block-level function declarations (hosted): each is bound in the block's
     /// scope and instantiated at block entry (all names first, so they can
     /// close over each other).
-    fn hoist_block_functions(&mut self, body: &[Stmt]) -> Result<(), CompileError> {
+    fn hoist_block_functions(&mut self, body: &[&Stmt]) -> Result<(), CompileError> {
         let fns: Vec<&crate::ast::Function> = body
             .iter()
-            .filter_map(|s| match s {
+            .filter_map(|s| match *s {
                 Stmt::Function(f) if f.id.is_some() => Some(f),
                 _ => None,
             })
@@ -16705,7 +16752,7 @@ impl Compiler {
         for f in &fns {
             seen.extend(free_of_nonarrow(&f.params, &f.body));
         }
-        self.prebind_block_lexicals(body, &seen)?;
+        self.prebind_block_lexicals(body, &seen, false)?;
         for f in &fns {
             let name = &f.id.as_ref().expect("named").name;
             if !self.scopes.last().is_some_and(|s| s.contains_key(&**name)) {
@@ -16735,9 +16782,8 @@ impl Compiler {
     fn if_branch(&mut self, s: &Stmt) -> Result<(), CompileError> {
         if matches!(s, Stmt::Function(_)) {
             self.scopes.push(alloc::collections::BTreeMap::new());
-            let body = core::slice::from_ref(s);
             let r = self
-                .hoist_block_functions(body)
+                .hoist_block_functions(&[s])
                 .and_then(|()| self.stmt(s).map(|_| ()));
             self.scopes.pop();
             return r;
