@@ -12422,7 +12422,21 @@ impl Compiler {
             c.ops.push(Op::GeneratorStart);
         }
         let mut last: Option<Reg> = None;
-        if is_main {
+        if is_main
+            && hosted
+            && body.iter().any(|s| {
+                matches!(s, Stmt::Var(d) if matches!(
+                    d.kind,
+                    crate::ast::VarDeclKind::Using | crate::ast::VarDeclKind::AwaitUsing
+                ))
+            })
+        {
+            // A module body declaring `using` resources disposes them when its
+            // evaluation ends.
+            c.using_scope(body, |c| {
+                body.iter().try_for_each(|s| c.stmt(s).map(|_| ()))
+            })?;
+        } else if is_main {
             for stmt in body {
                 if let Some(r) = c.stmt(stmt)? {
                     last = Some(r);

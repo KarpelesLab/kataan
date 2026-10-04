@@ -3427,12 +3427,15 @@ fn stmt_has_tla(s: &Stmt) -> bool {
                 alternate,
                 ..
             } => stmt_has_tla(consequent) || alternate.as_deref().is_some_and(stmt_has_tla),
+            // An `await using` head awaits its disposal.
             Stmt::For { init, body, .. } => {
-                matches!(init, Some(ForInit::Var(d)) if d.declarations.iter().any(|x| pattern_has_tla(&x.target)))
+                matches!(init, Some(ForInit::Var(d)) if d.kind == crate::ast::VarDeclKind::AwaitUsing
+                    || d.declarations.iter().any(|x| pattern_has_tla(&x.target)))
                     || stmt_has_tla(body)
             }
             Stmt::ForIn { left, body, .. } | Stmt::ForOf { left, body, .. } => {
-                matches!(left, ForLeft::Decl { target, .. } if pattern_has_tla(target))
+                matches!(left, ForLeft::Decl { kind, target, .. }
+                    if *kind == crate::ast::VarDeclKind::AwaitUsing || pattern_has_tla(target))
                     || stmt_has_tla(body)
             }
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => stmt_has_tla(body),
