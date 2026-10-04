@@ -9974,7 +9974,7 @@ impl crate::nbvm::VmHost for Interp<'_> {
             .as_handle()
             .and_then(|h| self.realm.symbol_at(Handle::from_raw(h)))
         {
-            Some((d, _)) if d.is_empty() || d == SYMBOL_NO_DESC => String::new(),
+            Some((d, _)) if d == SYMBOL_NO_DESC => String::new(),
             Some((d, _)) => alloc::format!("[{d}]"),
             None => self.realm.to_display_string(key),
         };

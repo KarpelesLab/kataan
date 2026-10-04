@@ -1523,6 +1523,8 @@ fn vm_set_prop_mode(
     // bindings (the host mirrors it), so it is the host's.
     let to_host = read_needs_host(ctx, recv)
         || ctx.host.as_ref().is_some_and(|h| h.global_this() == recv)
+        // A String wrapper's own `length` / indices are read-only.
+        || is_string_wrapper(ctx.realm, recv)
         // An array's `length` write (ToUint32 + ToNumber of any value, the
         // RangeError, truncation) is the host's ArraySetLength.
         || (key == "length"
@@ -7900,8 +7902,13 @@ fn run_frame_at(
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
                 match val.as_handle().map(Handle::from_raw) {
                     Some(h) if ctx.realm.is_vm_function(h) => {
-                        if let Some((fid, caps)) =
-                            ctx.realm.vm_function(h).map(|(f, c)| (f, c.to_vec()))
+                        // (A function of a newer table — eval / `Function`
+                        // code — is called the ordinary way below.)
+                        if let Some((fid, caps)) = ctx
+                            .realm
+                            .vm_function(h)
+                            .filter(|(f, _)| (*f as usize) < funcs.len())
+                            .map(|(f, c)| (f, c.to_vec()))
                         {
                             return Ok(FrameExit::Tail {
                                 id: fid as usize,
