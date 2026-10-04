@@ -10203,6 +10203,13 @@ fn captured_names(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<Strin
     let bound = bound_names(params, body);
     let mut direct = BTreeSet::new();
     let mut nested = BTreeSet::new();
+    // A closure in a parameter default captures too: `(a, g = () => a) => …`.
+    for p in params {
+        refs_pattern(&p.target, &mut direct, &mut nested);
+        if let Some(d) = &p.default {
+            refs_expr(d, &mut direct, &mut nested);
+        }
+    }
     for s in body {
         refs_stmt(s, &mut direct, &mut nested);
     }
@@ -11413,24 +11420,34 @@ impl Compiler {
         // must be cells.
         // A parameter default that reads its own or a later parameter hits
         // that binding's TDZ (a ReferenceError the VM does not model).
+        // Such a parameter list binds every name in its TDZ first and initializes
+        // them strictly left to right (`param_tdz`).
+        let mut param_tdz = false;
         for (i, p) in params.iter().enumerate() {
+            let mut later = BTreeSet::new();
+            for q in &params[i..] {
+                pattern_names(&q.target, &mut later);
+            }
+            let mut direct = BTreeSet::new();
+            let mut nested = BTreeSet::new();
+            refs_pattern(&p.target, &mut direct, &mut nested);
             if let Some(d) = &p.default {
-                let mut later = BTreeSet::new();
-                for q in &params[i..] {
-                    pattern_names(&q.target, &mut later);
-                }
-                let mut direct = BTreeSet::new();
-                let mut nested = BTreeSet::new();
                 refs_expr(d, &mut direct, &mut nested);
-                if direct
-                    .iter()
-                    .chain(nested.iter())
-                    .any(|n| later.contains(n))
-                {
-                    return Err(CompileError::Unsupported("parameter default TDZ"));
-                }
+            }
+            if direct
+                .iter()
+                .chain(nested.iter())
+                .any(|n| later.contains(n))
+            {
+                param_tdz = true;
             }
         }
+        // `hasParameterExpressions`: the body's `var`s live in an environment of
+        // their own, so a body `var` named like a parameter is a fresh binding
+        // (initialized from the parameter) that closures in defaults don't see.
+        let param_exprs = params
+            .iter()
+            .any(|p| p.default.is_some() || !matches!(p.target, BindingTarget::Ident(_)));
         let mut cell_names = captured_names(params, body);
         // Real parameter mapping (see `MapArguments`): every parameter is a cell
         // the arguments object aliases.
@@ -11467,6 +11484,12 @@ impl Compiler {
         let (args_direct, args_nested) = {
             let mut direct = BTreeSet::new();
             let mut nested = BTreeSet::new();
+            for p in params {
+                refs_pattern(&p.target, &mut direct, &mut nested);
+                if let Some(d) = &p.default {
+                    refs_expr(d, &mut direct, &mut nested);
+                }
+            }
             for s in body {
                 refs_stmt(s, &mut direct, &mut nested);
             }
@@ -11544,6 +11567,14 @@ impl Compiler {
         // share the cell so mutations are visible.
         for (i, p) in params.iter().enumerate() {
             match &p.target {
+                // A TDZ parameter list: every name starts uninitialized.
+                target if param_tdz => {
+                    let mut names = BTreeSet::new();
+                    pattern_names(target, &mut names);
+                    for name in names {
+                        c.bind_param_tdz(&name)?;
+                    }
+                }
                 BindingTarget::Ident(Ident { name, .. }) => {
                     let b = if c.cell_names.contains(&**name) {
                         let cell = c.alloc();
@@ -11575,15 +11606,9 @@ impl Compiler {
                         .expect("a scope")
                         .insert(String::from(&**name), b);
                 }
-                // A destructuring parameter binds from the incoming arg register —
-                // after its own `= default` applies (an `undefined` argument is
-                // replaced first; the pattern then destructures the default).
-                other => {
-                    if let Some(def) = &p.default {
-                        c.apply_default_named(arg_regs[i], Some(def), None)?;
-                    }
-                    c.bind_pattern(other, arg_regs[i])?;
-                }
+                // A destructuring parameter binds in order with the defaults,
+                // below.
+                _ => {}
             }
         }
         // Captured cells arrive already boxed (the closure passes the cell).
@@ -11663,15 +11688,70 @@ impl Compiler {
                 }
             }
         }
-        // Apply `= default` to any (non-rest) parameter left `undefined` — after
-        // binding, so a default may reference earlier parameters; written back
-        // through the binding (honoring cells).
-        for p in params {
-            if let (Some(def), BindingTarget::Ident(Ident { name, .. })) = (&p.default, &p.target) {
-                let b = c.lookup(name).expect("a bound param");
-                let cur = c.read_var(b);
-                c.apply_default_named(cur, Some(def), Some(&p.target))?;
-                c.write_var(b, cur);
+        // Left to right (IteratorBindingInitialization): apply `= default` to a
+        // (non-rest) parameter left `undefined` — so a default may reference
+        // earlier parameters; written back through the binding (honoring cells) —
+        // and destructure a pattern parameter from its argument (after its own
+        // default). A TDZ list initializes each name here.
+        for (i, p) in params.iter().enumerate() {
+            match &p.target {
+                BindingTarget::Ident(Ident { name, .. }) if param_tdz => {
+                    let v = arg_regs[i];
+                    if let Some(def) = &p.default {
+                        c.apply_default_named(v, Some(def), Some(&p.target))?;
+                    }
+                    let b = c.scopes[0][&**name];
+                    c.write_var(Binding { tdz: false, ..b }, v);
+                    c.finish_param_tdz(&p.target);
+                }
+                BindingTarget::Ident(Ident { name, .. }) => {
+                    if let Some(def) = &p.default {
+                        let b = c.lookup(name).expect("a bound param");
+                        let cur = c.read_var(b);
+                        c.apply_default_named(cur, Some(def), Some(&p.target))?;
+                        c.write_var(b, cur);
+                    }
+                }
+                other => {
+                    if let Some(def) = &p.default {
+                        c.apply_default_named(arg_regs[i], Some(def), None)?;
+                    }
+                    c.bind_pattern(other, arg_regs[i])?;
+                    if param_tdz {
+                        c.finish_param_tdz(other);
+                    }
+                }
+            }
+        }
+        // A body `var` (or function) named like a parameter, with parameter
+        // expressions: a fresh body binding holding the parameter's value.
+        if param_exprs && !is_main {
+            let mut names = Vec::new();
+            crate::nbexec::collect_var_names(body, &mut names);
+            for stmt in body {
+                if let Stmt::Function(f) = stmt
+                    && let Some(id) = &f.id
+                {
+                    names.push(&id.name);
+                }
+            }
+            let mut seen = BTreeSet::new();
+            for name in names {
+                if !seen.insert(name) {
+                    continue;
+                }
+                let Some(pb) = c.scopes[0].get(name).copied() else {
+                    continue;
+                };
+                if !c.cell_names.contains(name) {
+                    // Nothing captured it in the parameters: one binding is
+                    // indistinguishable.
+                    continue;
+                }
+                let v = c.read_var(pb);
+                c.scopes[0].remove(name);
+                let b = c.declare(name);
+                c.write_var(b, v);
             }
         }
         // VarDeclarationInstantiation: every `var` name in the body — however
@@ -12158,6 +12238,51 @@ impl Compiler {
             },
         );
         Ok(())
+    }
+
+    /// Binds parameter `name` in its TDZ (a `param_tdz` list): a cell holding
+    /// the TDZ sentinel when captured, else a TDZ register.
+    fn bind_param_tdz(&mut self, name: &str) -> Result<(), CompileError> {
+        if self.cell_names.contains(name) {
+            let reg = self.alloc();
+            self.ops.push(Op::NewArray { dst: reg, len: 1 });
+            let t = self.constant(NanBox::tdz())?;
+            let idx = self.constant(NanBox::number(0.0))?;
+            self.ops.push(Op::SetElem {
+                arr: reg,
+                index: idx,
+                src: t,
+            });
+            self.scopes[0].insert(
+                String::from(name),
+                Binding {
+                    reg,
+                    cell: true,
+                    konst: false,
+                    global: None,
+                    tdz: true,
+                    mapped: false,
+                    fn_name: false,
+                },
+            );
+        } else {
+            self.bind_tdz_reg(name, 0)?;
+        }
+        self.tdz_pending.insert((0, String::from(name)));
+        Ok(())
+    }
+
+    /// The names of parameter `target` are initialized: later code reads them
+    /// unchecked.
+    fn finish_param_tdz(&mut self, target: &BindingTarget) {
+        let mut names = BTreeSet::new();
+        pattern_names(target, &mut names);
+        for name in names {
+            self.tdz_pending.remove(&(0, name.clone()));
+            if let Some(b) = self.scopes[0].get_mut(name.as_str()) {
+                b.tdz = false;
+            }
+        }
     }
 
     /// Marks the just-declared local `name` as `const`.
