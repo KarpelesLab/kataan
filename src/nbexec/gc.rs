@@ -335,6 +335,15 @@ impl<'a> Interp<'a> {
         {
             push(out, v);
         }
+        // A VM direct eval's context (see `vm_env`).
+        for v in self
+            .vm_eval_home
+            .into_iter()
+            .chain(self.vm_eval_privates.iter().map(|(_, k)| *k))
+            .chain(self.vm_eval_derived.into_iter().flat_map(|(a, b)| [a, b]))
+        {
+            push(out, v);
+        }
         out.extend(
             [
                 self.regexp_proto,

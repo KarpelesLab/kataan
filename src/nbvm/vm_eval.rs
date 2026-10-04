@@ -176,7 +176,7 @@ fn compile_eval_body(
     // any statement runs.
     let script = flags & EVAL_SCRIPT;
     for stmt in body {
-        if let Stmt::Function(func) = stmt {
+        if let Some(func) = super::fn_decl(stmt) {
             c.hoisted_fns
                 .insert(func as *const crate::ast::Function as usize);
             let Some(id) = &func.id else { continue };

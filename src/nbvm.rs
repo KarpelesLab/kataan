@@ -1118,6 +1118,13 @@ pub trait VmHost {
     /// Records that the function `f` belongs to realm `idx` (GetFunctionRealm).
     /// Must not touch the realm.
     fn tag_fn_realm(&mut self, f: NanBox, idx: usize);
+    /// The `$262.createRealm()` realm the function `f` was tagged with (see
+    /// [`VmHost::tag_fn_realm`]). Must not touch the realm.
+    fn fn_realm_index(&self, f: NanBox) -> Option<usize>;
+    /// Makes the fresh VM closure `f` an object of realm `idx`: tagged, and
+    /// its `[[Prototype]]` that realm's `%Function.prototype%` (when it was
+    /// the running realm's).
+    fn adopt_fn_realm(&mut self, f: NanBox, idx: usize);
     /// An error of the built-in constructor `name` from the realm of the
     /// function `callee` (GetFunctionRealm).
     fn make_error_in(&mut self, name: &str, message: &str, callee: NanBox) -> NanBox;
@@ -3035,7 +3042,7 @@ fn vm_construct(
     let proto = match proto.filter(|p| is_object_value(ctx.realm, *p)) {
         Some(p) => Some(p),
         // Not an object: the intrinsic default of newTarget's realm.
-        None if !nt_is_vm && ctx.host.is_some() && new_target.as_handle().is_some() => {
+        None if ctx.host.is_some() && new_target.as_handle().is_some() => {
             with_host(ctx, |h| h.ordinary_object_proto_for(new_target))
                 .unwrap_or(Ok(None))
                 .map_err(VmError::from)?
@@ -7795,6 +7802,13 @@ fn run_frame_at(
                     && let Some(h) = ctx.host.as_deref_mut()
                 {
                     h.tag_fn_realm(NanBox::handle(handle.to_raw()), idx);
+                } else if let Some(running) = ctx.realm.vm_callee_stack.last().copied()
+                    && let Some(idx) = ctx.host.as_deref().and_then(|h| h.fn_realm_index(running))
+                {
+                    // A closure a `$262.createRealm()` realm's function creates
+                    // belongs to that realm.
+                    let f = NanBox::handle(handle.to_raw());
+                    with_host(ctx, |h| h.adopt_fn_realm(f, idx));
                 }
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
@@ -12737,6 +12751,7 @@ impl Compiler {
                 refs_stmt(s, &mut direct, &mut nested);
             }
             for p in params {
+                refs_pattern(&p.target, &mut direct, &mut nested);
                 if let Some(d) = &p.default {
                     refs_expr(d, &mut direct, &mut nested);
                 }
@@ -14434,6 +14449,23 @@ impl Compiler {
                                 } => (&**target, Some(&**d)),
                                 other => (other, None),
                             };
+                            if let Expr::Ident(id) = inner
+                                && self.env_resolves(&id.name)
+                            {
+                                let (v, b) = self.pattern_key_read_ref(
+                                    value_reg,
+                                    key,
+                                    &mut named,
+                                    &mut dyn_keys,
+                                    &id.name,
+                                )?;
+                                if def.is_some() {
+                                    let bt = BindingTarget::Ident(id.clone());
+                                    self.apply_default_named(v, def, Some(&bt))?;
+                                }
+                                self.assign_var(b, v)?;
+                                continue;
+                            }
                             if !matches!(inner, Expr::Member { .. }) {
                                 let v = self.pattern_key_read(
                                     value_reg,
@@ -14659,6 +14691,23 @@ impl Compiler {
                 let mut named: Vec<String> = Vec::new();
                 let mut dyn_keys: Vec<Reg> = Vec::new();
                 for prop in &pat.properties {
+                    // Dynamic scoping: a `var` leaf's reference is resolved after
+                    // the key and before the property read.
+                    if self.dyn_fn
+                        && self.decl_kind == Some(crate::ast::VarDeclKind::Var)
+                        && let BindingTarget::Ident(id) = &prop.value
+                    {
+                        let (v, b) = self.pattern_key_read_ref(
+                            value_reg,
+                            &prop.key,
+                            &mut named,
+                            &mut dyn_keys,
+                            &id.name,
+                        )?;
+                        self.apply_default_named(v, prop.default.as_ref(), Some(&prop.value))?;
+                        self.write_var(b, v);
+                        continue;
+                    }
                     let v =
                         self.pattern_key_read(value_reg, &prop.key, &mut named, &mut dyn_keys)?;
                     self.apply_default_named(v, prop.default.as_ref(), Some(&prop.value))?;
@@ -19976,6 +20025,45 @@ impl Compiler {
             }
         }
         Ok(v)
+    }
+
+    /// [`Self::pattern_key_read`] for an identifier target resolved through the
+    /// environment: the key, then the reference to `name`, then the read.
+    fn pattern_key_read_ref(
+        &mut self,
+        obj: Reg,
+        key: &PropertyKey,
+        named: &mut Vec<String>,
+        dyn_keys: &mut Vec<Reg>,
+        name: &str,
+    ) -> Result<(Reg, Binding), CompileError> {
+        let v = self.alloc();
+        match key {
+            PropertyKey::Computed(e) => {
+                let k = self.expr(e)?;
+                let kc = self.alloc();
+                self.ops.push(Op::ToKey { dst: kc, src: k });
+                let b = self.env_ref(name);
+                self.ops.push(Op::GetKey {
+                    dst: v,
+                    obj,
+                    key: kc,
+                });
+                dyn_keys.push(kc);
+                Ok((v, b))
+            }
+            other => {
+                let k = static_key(other)?;
+                let b = self.env_ref(name);
+                self.ops.push(Op::GetProp {
+                    dst: v,
+                    obj,
+                    key: k.clone(),
+                });
+                named.push(k);
+                Ok((v, b))
+            }
+        }
     }
 
     /// `dst = { ...src }` minus the pattern's already-destructured keys.

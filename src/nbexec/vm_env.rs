@@ -262,6 +262,7 @@ impl<'a> Interp<'a> {
                 };
                 let lex = self.env_scope(env)?;
                 let var = self.env_scope(var_env)?;
+                let realm_guard = self.enter_scope_realm(&lex);
                 #[cfg(all(feature = "module", feature = "std"))]
                 let saved_imports = lex
                     .module_imports()
@@ -324,6 +325,9 @@ impl<'a> Interp<'a> {
                 #[cfg(all(feature = "module", feature = "std"))]
                 if let Some(mi) = saved_imports {
                     self.module_imports = mi;
+                }
+                if let Some(g) = realm_guard {
+                    self.leave_realm(g);
                 }
                 r.map(|v| (v, undef))
             }
@@ -484,12 +488,21 @@ impl<'a> Interp<'a> {
         &mut self,
         program: &'a Program,
         strict: bool,
+        realm: Option<usize>,
     ) -> Option<Result<NanBox, ExecError>> {
         let (table, proto) = self.vm_eval_proto(program, strict, crate::nbvm::EVAL_DYN_FN, &[])?;
-        let g = self.global_scope.clone();
+        // The function closes over its realm's global environment.
+        let (g, this) = match realm.and_then(|i| self.created_realms.get(i)) {
+            Some(r) => (r.global_scope.clone(), r.global_this),
+            None => (self.global_scope.clone(), self.global_this),
+        };
         let env = self.env_value(g);
-        let caps = [env, env, self.global_this];
-        Some(crate::nbvm::run_eval_code(self, &table, &proto, &caps, false).map_err(vm_to_exec))
+        let caps = [env, env, this];
+        // Built in its realm: the closure (and what it creates) belongs there.
+        let guard = self.enter_realm(realm);
+        let r = crate::nbvm::run_eval_code(self, &table, &proto, &caps, false).map_err(vm_to_exec);
+        self.leave_realm(guard);
+        Some(r)
     }
 
     /// Eval code compiled for the VM (cached per program and flags), with the
@@ -518,7 +531,13 @@ impl<'a> Interp<'a> {
                 let first =
                     crate::nbvm::compile_eval_code(program, &mut scratch, strict, flags, privates);
                 let proto = match first {
-                    Err(_) => return None,
+                    Err(e) => {
+                        #[cfg(feature = "std")]
+                        if std::env::var_os("KATAAN_DEBUG_EVAL").is_some() {
+                            std::eprintln!("eval compile: {e:?}: {}", program.source);
+                        }
+                        return None;
+                    }
                     Ok(p) if scratch.is_empty() => p,
                     Ok(_) => {
                         let mut full: Vec<crate::nbvm::FnProto> = table.to_vec();
@@ -572,6 +591,16 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Enters the realm whose global environment roots `scope`, when realms
+    /// were created and it is not the running one.
+    fn enter_scope_realm(&mut self, scope: &Scope) -> Option<super::call::RealmGuard> {
+        if self.created_realms.is_empty() {
+            return None;
+        }
+        let realm = self.realm_of_scope(scope);
+        (realm != self.cur_realm).then(|| self.enter_realm(realm))
+    }
+
     /// Runs `f` with `scope` as the current lexical environment in strict or
     /// sloppy code.
     fn in_env<T>(
@@ -585,11 +614,17 @@ impl<'a> Interp<'a> {
         let saved_imports = scope
             .module_imports()
             .map(|mi| core::mem::replace(&mut self.module_imports, mi));
+        // An environment of a `$262.createRealm()` realm resolves against
+        // that realm's global object.
+        let guard = self.enter_scope_realm(&scope);
         let saved = core::mem::replace(&mut self.current, scope);
         let saved_strict = core::mem::replace(&mut self.strict, strict);
         let r = f(self);
         self.current = saved;
         self.strict = saved_strict;
+        if let Some(g) = guard {
+            self.leave_realm(g);
+        }
         #[cfg(all(feature = "module", feature = "std"))]
         if let Some(mi) = saved_imports {
             self.module_imports = mi;

@@ -6933,16 +6933,12 @@ impl<'a> Interp<'a> {
         // another realm's constructor builds stays the interpreter's, which
         // tracks function realms).
         let strict = self.strict;
-        let same_realm = self.cur_realm.is_none()
-            && callee
-                .as_handle()
-                .map(Handle::from_raw)
-                .is_none_or(|ch| self.get_function_realm(ch).is_none());
-        let vm = if same_realm {
-            self.vm_dynamic_function(program, strict)
-        } else {
-            None
-        };
+        let fn_realm = callee
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|ch| self.get_function_realm(ch))
+            .or(self.cur_realm);
+        let vm = self.vm_dynamic_function(program, strict, fn_realm);
         let f = match vm {
             Some(r) => r?,
             None => self.make_function(
@@ -10614,6 +10610,27 @@ impl crate::nbvm::VmHost for Interp<'_> {
         }
     }
 
+    fn fn_realm_index(&self, f: NanBox) -> Option<usize> {
+        if self.created_realms.is_empty() {
+            return None;
+        }
+        f.as_handle()
+            .and_then(|raw| self.fn_realm.get(&raw).copied())
+    }
+
+    fn adopt_fn_realm(&mut self, f: NanBox, idx: usize) {
+        let Some(h) = f.as_handle().map(Handle::from_raw) else {
+            return;
+        };
+        self.fn_realm.insert(h.to_raw(), idx);
+        let cur = self.realm_function_prototype(self.cur_realm);
+        if self.realm.object_proto(h) == cur
+            && let Some(p) = self.realm_function_prototype(Some(idx))
+        {
+            self.realm.set_object_proto(h, Some(p));
+        }
+    }
+
     fn make_error_in(&mut self, name: &str, message: &str, callee: NanBox) -> NanBox {
         let realm = callee
             .as_handle()
@@ -10746,7 +10763,21 @@ impl crate::nbvm::VmHost for Interp<'_> {
     }
 
     fn make_arguments(&mut self, args: &[NanBox], callee: NanBox, mapped: bool) -> NanBox {
-        self.make_arguments_object(args, callee, mapped.then_some(&[][..]))
+        // The object (its `%ThrowTypeError%` `callee`) is of the function's realm.
+        let realm = if self.created_realms.is_empty() {
+            self.cur_realm
+        } else {
+            callee
+                .as_handle()
+                .and_then(|h| self.get_function_realm(Handle::from_raw(h)))
+        };
+        let guard = self.enter_realm(realm);
+        let g = self.global_scope.clone();
+        let saved = core::mem::replace(&mut self.current, g);
+        let r = self.make_arguments_object(args, callee, mapped.then_some(&[][..]));
+        self.current = saved;
+        self.leave_realm(guard);
+        r
     }
 
     fn new_regexp(&mut self, source: &[u8], flags: &str) -> NanBox {

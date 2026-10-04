@@ -1669,7 +1669,7 @@ impl<'a> Interp<'a> {
     /// realm's (`None` / out of range). Resolved through the realm's `globalThis`,
     /// so it is the correct heap cell for that realm even though intrinsics are not
     /// currently swapped in.
-    fn realm_function_prototype(&mut self, realm: Option<usize>) -> Option<Handle> {
+    pub(crate) fn realm_function_prototype(&mut self, realm: Option<usize>) -> Option<Handle> {
         let gt = match realm {
             Some(idx) if idx < self.created_realms.len() => self.created_realms[idx].global_this,
             _ => self.main_global_this,
