@@ -86,8 +86,7 @@ var $262 = {
 const SKIP_FEATURES: &[&str] = &[
     // "Temporal", // implemented (ZonedDateTime/Now skipped via path-check above)
     // tail-call-optimization (PTC) is implemented on the bytecode VM (strict-mode
-    // frame-reuse trampoline); the eval/`with`/cross-realm variants that fall back
-    // to the recursive tree-walker are ledgered in tests/test262-status.txt.
+    // frame-reuse trampoline).
     // Import attributes are implemented (JSON + text + bytes modules), so
     // `import-bytes` is no longer gated. Nothing is gated at present; the list
     // stays so a future proposal can be gated in one place.

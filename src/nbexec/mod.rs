@@ -6169,8 +6169,8 @@ impl Interp {
             self.install_fn_name_length(h, "anonymous", len as u32);
             // `GetPrototypeFromConstructor(newTarget, fallbackProto)`
             // (CreateDynamicFunction step 22/18): the built function's
-            // `[[Prototype]]` derives from `newTarget`'s realm. `make_function`
-            // already set the current realm's kind-appropriate fallback
+            // `[[Prototype]]` derives from `newTarget`'s realm. The VM already
+            // set the function's realm's kind-appropriate fallback
             // (`%Function.prototype%` / `%GeneratorFunction.prototype%` / …); a
             // cross-realm `newTarget` (`Reflect.construct(Function, …, otherRealmC)`)
             // whose `.prototype` is a non-Object re-links to *its* realm's

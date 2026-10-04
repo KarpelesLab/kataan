@@ -1,17 +1,10 @@
-//! New-model conformance harness: runs each self-checking `.js` fixture in
-//! `testdata/conformance/` through the **new representation** interpreter
-//! (`kataan::nbexec`, over `Realm`/`NanBox`) rather than the production
-//! tree-walker.
+//! Embedding-API conformance harness: runs each self-checking `.js` fixture in
+//! `testdata/conformance/` through [`Interp::run`] (the hosted bytecode VM, as
+//! an embedder uses it). A fixture passes if it runs to completion without an
+//! uncaught throw; the `assert`/`assertEq` helpers are supplied as a small JS
+//! prelude.
 //!
-//! This quantifies how much of real JavaScript the new model executes — the
-//! concrete coverage metric behind the Phase-D migration (see `ROADMAP.md`). A
-//! fixture passes if it runs to completion without an uncaught throw; the
-//! `assert`/`assertEq` helpers are supplied as a small JS prelude (the new-model
-//! interpreter has no host-native injection yet, but it has functions, `throw`,
-//! and strict equality, which is all the harness needs).
-//!
-//! The asserted threshold ratchets up as the new model gains coverage; the
-//! per-fixture breakdown is printed so regressions and new passes are visible.
+//! The per-fixture breakdown is printed so regressions are visible.
 
 use kataan::nbexec::Interp;
 use kataan::parser::Parser;

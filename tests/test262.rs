@@ -115,7 +115,7 @@ fn run(combined: &str) -> Result<(), (String, String)> {
     if let Err(e) = Parser::parse_program(combined) {
         return Err(("parse".into(), format!("{e}")));
     }
-    // Execution phase (bytecode VM with tree-walker fallback).
+    // Execution phase (the hosted bytecode VM).
     match kataan::nbvm::execute(combined) {
         Ok(_) => Ok(()),
         Err(e) => Err(("runtime".into(), e)),

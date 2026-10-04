@@ -1,8 +1,7 @@
 //! Bytecode-VM coverage harness: runs each self-checking `.js` fixture in
-//! `testdata/conformance/` through the **bytecode VM** (`kataan::nbvm::execute`,
-//! the primary engine with a tree-walker fallback), and separately measures how
-//! many fixtures the bytecode compiler handles *fully* — i.e. compile without
-//! routing to the tree-walker.
+//! `testdata/conformance/` through the **hosted bytecode VM**
+//! (`kataan::nbvm::execute`), and separately measures how many fixtures the
+//! *bare* bytecode compiler (no host interpreter) handles fully.
 //!
 //! The first assertion guards correctness (the cutover must not change results);
 //! the second is a ratcheting coverage metric for the fold — as more of the
@@ -68,9 +67,7 @@ fn bytecode_runs_and_compiles_real_fixtures() {
         results.join("\n"),
     );
 
-    // Every fixture must still run correctly via the bytecode-first engine —
-    // the cutover's safety net (bytecode where it compiles, tree-walker
-    // otherwise).
+    // Every fixture must run correctly on the hosted VM.
     assert_eq!(ran_ok, FIXTURES.len(), "a fixture failed to run");
     // Ratchet: at least this many whole real-world programs compile fully to
     // bytecode (no fallback). Raise as the fold widens; never let it regress.

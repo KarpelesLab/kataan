@@ -1,10 +1,7 @@
 //! The product entry points run user code on the **hosted bytecode VM**
-//! (`ROADMAP.md` §2.0), not on the tree-walker: `Interp::run` (the embedding
-//! API, the REPL, `hostrun`, snapshots, the buffer-sharing C ABI) and
-//! `nbvm::execute*` (`kataan run`, `kt_eval`, the web build).
-//!
-//! `Interp::tree_walked` counts the user statements the tree-walker executed;
-//! every test here asserts it stays zero.
+//! (`ROADMAP.md` §2.0): `Interp::run` (the embedding API, the REPL, `hostrun`,
+//! snapshots, the buffer-sharing C ABI) and `nbvm::execute*` (`kataan run`,
+//! `kt_eval`, the web build) — the only engine there is.
 
 use kataan::nbexec::Interp;
 use kataan::parser::Parser;

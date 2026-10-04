@@ -192,9 +192,7 @@ impl Interp {
     /// cross-realm intrinsic throws *that realm's* `%TypeError%` (see `make_error`)
     /// and `ArraySpeciesCreate` sees the correct current Realm Record — regardless
     /// of which of the many dispatch branches (native / bound-native / host /
-    /// user-closure) ultimately runs the body. A nested user-closure entry
-    /// (`invoke_inner`) refines this from the closure's captured scope, so an
-    /// eval-created cross-realm closure is attributed correctly too.
+    /// VM function) ultimately runs the body.
     pub(crate) fn call_with_this(
         &mut self,
         callee: NanBox,

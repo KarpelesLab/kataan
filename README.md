@@ -13,23 +13,15 @@ tri-modal model proven out in the sibling projects
 [`rsurl`](https://github.com/KarpelesLab/rsurl) (HTTP/curl).
 
 > **Status: running and broadly conformant; advanced tiers in active build-out.**
-> The lexer and the full ECMAScript parser are complete, and **two execution
-> engines** run real programs, cross-checked by differential test suites:
->
-> - a **tree-walking interpreter** — the reference engine, and the one the
->   Test262 corpus exercises; and
-> - a **register bytecode VM** (the primary path for `kataan run` and the C ABI),
->   compiling nearly all of the common language directly — every operator,
->   objects/arrays, method calls with `call`/`apply`/`bind`, `new`/`new.target`,
->   all loops + `for-of`/`for-in`/`switch`/`try`-`catch`-`finally`,
->   closures (incl. mutual recursion), destructuring, rest/spread, **classes**
->   with `extends`/`super` and getters/setters, `new` on plain functions, the
->   `arguments` object, and `async`/`await` — running inside the tree-walker's
->   runtime (one realm, global environment and built-in library) and faulting
->   to the tree-walker for what it doesn't yet compile, notably generators,
->   `eval`/`Function` and computed class keys. About half of the Test262 corpus
->   (26,378 tests) now runs entirely on the VM; the rest re-runs on the
->   tree-walker (see ROADMAP §2.0).
+> The lexer and the full ECMAScript parser are complete, and **one execution
+> engine** runs every program: a **register bytecode VM** hosted by the
+> interpreter runtime (`nbexec`), which owns the realm, the global environment,
+> the built-in library, the job queues and the module loader. Scripts, modules,
+> `eval`/`Function` code, generators, async functions, classes and `with` all
+> compile to bytecode; every entry point — `kataan run`, the REPL, the C ABI,
+> the web build, the embedding API and the Test262 runner — runs on it. (The
+> tree-walking interpreter Kataan started with was retired once the VM ran the
+> whole corpus; see ROADMAP §2.0.)
 >
 > Conformance is measured against the **full upstream tc39/Test262** (~53k tests,
 > `staging/` included), run in CI and gated by a known-failures ledger that only

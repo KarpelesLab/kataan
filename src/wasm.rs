@@ -1,6 +1,6 @@
 //! A WebAssembly backend — the **WASM peer engine** (`ROADMAP.md`).
 //!
-//! Alongside the tree-walker and the register VM, this lowers the *numeric*
+//! Alongside the register VM, this lowers the *numeric*
 //! subset of JavaScript functions to WebAssembly text (WAT): a function over
 //! `f64` parameters whose body is `let` bindings, arithmetic, comparisons,
 //! ternaries, and `return` becomes a `(func …)` in a `(module …)`. The output is

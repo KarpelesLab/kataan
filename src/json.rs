@@ -1,7 +1,7 @@
 //! Pure, `alloc`-only `JSON.parse` / `JSON.stringify` over realm values.
 //!
 //! These are free functions operating on a `Realm` and `NanBox` values so
-//! both the tree-walker and the bytecode VM can share one implementation
+//! both the interpreter's built-ins and the bare bytecode VM can share one implementation
 //! (`ROADMAP.md` stdlib). `stringify` mirrors `JSON.stringify` (dropping
 //! `undefined`/functions, rendering non-finite numbers as `null`); `parse` is a
 //! recursive-descent reader returning a realm value, or an error message.

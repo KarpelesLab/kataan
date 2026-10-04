@@ -28,10 +28,11 @@ forward-looking.
 > `annexB/language/function-code/block-decl-func-skip-arguments.js` forbids
 > (V8 fails them too). Each is annotated inline in the ledger with its owner.
 >
-> The tree-walker now **collects garbage inside function bodies** reached
-> through audited calls (`f();`, `var x = f();`, `x = f();`, `return f();`, and
-> `Array.prototype.forEach` callbacks) — see the `nbexec::gc` module docs; the
-> staging Date tests went from an 8GB abort to 14s.
+> **One engine (2026-10-05):** the bytecode VM, hosted by the interpreter
+> runtime, runs every program — scripts, modules, eval code, `Function`
+> bodies, `$262.agent` workers — and the tree-walker is gone as an executor
+> (§2.0). Garbage is collected inside function bodies at the VM's published
+> safepoints — see the `nbexec::gc` and `nbvm::vm_safepoint` docs.
 >
 > The Intl *structure* — subclassing, `formatToParts` incl. unit/compact,
 > `resolvedOptions`, Segmenter `containing`, `localeCompare` / `toLocaleString` /
@@ -87,12 +88,12 @@ Treat this as done; build on it.
 
 - **Front end:** complete lexer + full ECMAScript parser + AST, with parse-time
   early-error validation (incl. regex literals).
-- **Two execution engines that agree:** a tree-walking interpreter (`nbexec`, the
-  reference/corpus engine) and a **register bytecode VM** (`nbvm`, the primary
-  path for `kataan run` / `eval` / the C ABI). `nbvm` compiles the common
-  language and **faults to `nbexec`** for constructs it doesn't lower (a clean
-  whole-program fallback via `execute_typed`). A curated dual-path corpus plus
-  754 in-crate unit tests gate every change.
+- **One execution engine:** a **register bytecode VM** (`nbvm`) hosted by the
+  interpreter runtime (`nbexec`: realm, built-ins, job queues, modules, realms,
+  agents). Every entry point — `kataan run` / `eval`, the REPL, the C ABI, the
+  web build, `Interp::run` and the Test262 runner — compiles to bytecode; a
+  compile refusal or VM fault is an error, never a re-run (§2.0). The bare VM
+  tier (no host) backs `.ktbc` artifacts and the JIT tests.
 - **Object model in production:** NaN-boxed values, hidden classes/shapes +
   transition tree, interned atoms, rope strings, inline-cache slots, a
   generational handle table, and a moving/compacting tracing GC — all behind
@@ -145,7 +146,38 @@ The rest of this document is the gap between that base and "complete."
 
 ---
 
-## 2.0 One engine: the bytecode VM as a tier of the interpreter — **in progress**
+## 2.0 One engine: the bytecode VM as a tier of the interpreter — **done (2026-10-05)**
+
+**Done (2026-10-05).** The tree-walker is retired as an execution engine.
+`KATAAN_VM_PURE` reached the gate (53,374 / 53,377, the 3 ledgered failures),
+then, in three commits: the whole-run and per-unit fallbacks were removed (a
+compile refusal or VM fault is an `InternalError` / `ExecError::Unsupported`,
+never a re-run; `KATAAN_VM_STRICT` / `KATAAN_VM_PURE` are gone and the runner
+is always pure), script hoisting stopped minting interpreter closures, and the
+AST executor was deleted — statements, expressions, interpreter closures
+(`Cell::Function` / `Cell::Class`, `invoke`), AST classes, the step-machine
+generators/async, module statement execution, the reference-engine API
+(`nbexec::eval_source*`, `eval_scripts_typed`, `eval_module_typed*`,
+`Interp::run_tree_walk`, `src/nbeval.rs`) and the tree-walker's GC audit
+protocol: about 17.9k lines. `nbexec` is now the runtime the VM is hosted by
+(realm, built-ins, natives, environments for `eval`/`with`, declaration
+instantiation, job queues, modules, realms, agents), and `Interp` lost its AST
+lifetime (`Interp::run(&Program)`). Gate unchanged at 53,374 at every step.
+
+Left, none of it a tree-walk path:
+
+- **Bare tier:** `.ktbc` artifacts / `compile_program` + `run_program` run the
+  VM with no host, so constructs that need the interpreter are compile
+  refusals or `VmError::Unsupported` faults there (see *Bare tier, kept
+  deliberately* below).
+- **Cross-realm corners** (reported by the realm work, `bd000a1`) are
+  closed: a strict tail call into *another realm's* VM function is made as an
+  ordinary call (so the callee runs with its realm current), and resuming a
+  suspended generator / async function / async generator re-enters its
+  function's realm.
+- `$262.agent` without `std` (no threads): workers run cooperatively through
+  `eval_source_in_realm`, i.e. on the VM like `$262.evalScript` — it cannot
+  express a worker that blocks in `Atomics.wait`, as before.
 
 > **Why this comes first (measured 2026-09-28).** Test262 is at 100 % of its
 > non-deliberate ledger — but only on the tree-walker. The register VM (`nbvm`),
@@ -248,11 +280,9 @@ only has to shrink one fallback:
   hosted `.size` reads, `return` values fixed before a `finally` runs,
   `(a?.b)()` keeping `this`, host-function `name`/`length`, and cross-realm
   `newTarget` prototypes.
-- **Reference tier, kept on the tree-walker:** `nbexec::eval_source*` /
-  `eval_scripts_typed` / `eval_module_typed*` and `$262.agent` workers. They are
-  the differential oracle the VM tests compare against and the fallback the
-  corpus runner's `execute_typed*` uses outside `KATAAN_VM_STRICT`; they go when
-  the tree-walker's statement executor goes.
+- **Reference tier, kept on the tree-walker** (until 2026-10-05, then
+  deleted): `nbexec::eval_source*` / `eval_scripts_typed` /
+  `eval_module_typed*`; `$262.agent` workers moved to the VM first.
 - **Bare tier, kept deliberately:** `compile_program` + `run_program`/
   `run_program_capturing`, the `.ktbc` artifact format (`kataan compile`/`run
   x.ktbc`, `kt_compile`/`kt_load_bytecode`) and the JIT's tests run the VM over
@@ -263,7 +293,8 @@ only has to shrink one fallback:
   serializing the script's declaration lists alongside the table — future work
   if `.ktbc` is to run the full language.
 
-**Retiring the tree-walker: inventory (2026-10-05).** `KATAAN_VM_PURE`
+**Retiring the tree-walker: inventory (2026-10-05)** — all of it removed, see
+*Done* at the top of this section. `KATAAN_VM_PURE`
 (53,372 / 53,377) is now the truth, so the tree-walker stops being an
 *execution* engine. What `nbexec` keeps is the realm, built-ins, natives and
 host services the VM calls through `VmHost`; what goes is every path that can
@@ -310,8 +341,8 @@ still execute AST statements or expressions:
   AST), the `FnDef`/class tables and the `Cell::Function`/`Cell::Class` heap
   variants (and their snapshot encoding).
 - **Naming:** the CLI's `nbrun` ("the new-representation engine") is an alias
-  of `run`; `hostrun` is `run` plus the host event loop — kept, help text to be
-  reworded once the tree-walker is gone.
+  of `run`; `hostrun` is `run` plus the host event loop — kept (`nbrun` as an
+  undocumented alias), help text reworded.
 
 Kept: `Scope`/`env.rs` (the global environment and the `Cell::Env`
 environments of VM direct `eval`/`with`), declaration instantiation
@@ -463,8 +494,8 @@ ES2024/25 builtin tail) are intentionally not relisted — see §1.
 The module record / link / evaluate pipeline, live import bindings + TDZ,
 re-exports (`export {x} from`, `export *`, `export * as`, default), cycles,
 top-level `await`, `import.meta.url`, module namespace exotic objects, and
-**dynamic `import()`** (promise of the namespace) are implemented (tree-walker,
-`src/nbexec/module.rs`), and the runner now executes `flags:[module]` +
+**dynamic `import()`** (promise of the namespace) are implemented (the loader in
+`src/nbexec/module.rs`, module code on the VM in `src/nbvm/vm_module.rs`), and the runner now executes `flags:[module]` +
 dynamic-import tests with file-relative resolution. Most module early errors are
 parse-phase. **Residual:**
 
@@ -475,8 +506,6 @@ parse-phase. **Residual:**
   with the async/generator model — §3.5).
 - **`import.source` / `import.defer`** (source-phase + deferred-import proposals)
   and **import attributes/assertions** — unimplemented (rejected as SyntaxError).
-- **Bytecode tier:** modules run on the tree-walker only; nbvm has no module
-  support (it faults to nbexec).
 - **CLI:** no first-class `kataan run x.mjs` module entry (§4.6).
 
 ### 3.2 `class` edge cases (~550)
@@ -750,7 +779,7 @@ Milestone order: (1) dynamic native registry + `Cell::HostFn` + Rust
 host constructors/finalizers. Once (1)–(2) land, migrate a couple of existing
 sentinel builtins onto the registry to prove the path end-to-end.
 
-**Status:** the Rust core of (1) + most of (2) has **landed** (tree-walker). A
+**Status:** the Rust core of (1) + most of (2) has **landed**. A
 `Cell::HostFn(u32)` names an entry in an `Interp` host-function registry;
 `Interp::register_fn(name, length, closure)` / `register_global_fn` create a
 first-class callable (spec-shaped own `name`/`length`, `typeof === "function"`,
@@ -963,10 +992,8 @@ neverSettles }}` parks forever.
   is now ~8x, after dropping the eager `name`/`length` materialization in nbvm
   (58% of the cost, of which the per-closure `new_string` for the function name
   was 37%). What is left is the heap allocation itself — the `\0vmfn` tag was
-  measured and is not significant. Measure this sweep **externally**: a
-  `Date.now()` in the harness forces whole-program fallback to the tree-walker,
-  so an in-script timer benchmarks the wrong tier, and this box's variance is
-  wide enough to need best-of-N.
+  measured and is not significant. Measure this sweep **externally** (this
+  box's variance is wide enough to need best-of-N).
 - **Optimizing JIT (after the 2.1 baseline tier):** an SSA IR with inlining,
   escape analysis, range/redundancy elimination, type-feedback speculation with
   guard-based deopt — through the shared backend. The point where we contend with

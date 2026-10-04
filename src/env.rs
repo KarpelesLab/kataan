@@ -57,18 +57,18 @@ struct ScopeData {
     /// merely *called* inside the `with` does not see the object.
     with_obj: Option<NanBox>,
     /// Set ONLY on a module's top-level scope: that module's import-alias table
-    /// (`local name → (exporting module scope, exported local name)`). A function
-    /// defined in the module captures this scope, so `Interp::invoke_inner` can
-    /// restore the correct `module_imports` when the function runs — even when
-    /// called from *another* module — by walking the closure's scope chain to the
-    /// nearest module frame (`Scope::module_imports`). `None` on ordinary frames.
+    /// (`local name → (exporting module scope, exported local name)`). Code
+    /// whose environment chain reaches this frame (a direct `eval` inside the
+    /// module) restores the module's `module_imports` from it — even when
+    /// reached from *another* module — by walking to the nearest module frame
+    /// (`Scope::module_imports`). `None` on ordinary frames.
     #[allow(clippy::type_complexity)]
     module_imports: Option<Rc<BTreeMap<String, (Scope, String)>>>,
     /// Set ONLY on a module's top-level scope: that module's `import.meta`
     /// object. `import.meta` is *per module*, not per running context, so a
     /// function defined in module A and called from module B must still see A's
-    /// meta object — `Interp::invoke_inner` restores it by walking the closure's
-    /// captured chain to the nearest module frame. `None` on ordinary frames.
+    /// meta object — found by walking the environment chain to the nearest
+    /// module frame. `None` on ordinary frames.
     module_meta: Option<NanBox>,
     /// Names declared *lexically* (`let`/`const`/`class`) at the top level of the
     /// function/eval/program body whose variable environment this frame is. In

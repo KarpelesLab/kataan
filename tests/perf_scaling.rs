@@ -33,11 +33,6 @@
 //! the second reported `delete` as quadratic when direct measurement showed it
 //! linear.
 //!
-//! Note this pins the workloads to the tree-walker: an in-script `Date.now()`
-//! makes the whole program fall back from the bytecode VM. That is fine here —
-//! an asymptotic bug shows in either tier, and the alternative measures setup
-//! rather than the operation.
-//!
 //! Bounds are deliberately slack: they catch a *category* error (linear became
 //! quadratic, O(1) became O(n)), not constant-factor drift.
 

@@ -451,7 +451,7 @@ impl Interp {
 
     /// Converts an [`ExecError`] surfaced from the module pipeline into a typed
     /// [`Thrown`], tagging it with `phase` (Parse for load/link, Runtime for
-    /// evaluation). Mirrors `eval_source_typed`'s error rendering.
+    /// evaluation), as the script entries render errors.
     pub fn exec_error_to_thrown(&self, e: ExecError, phase: super::ErrorPhase) -> Thrown {
         super::thrown_from_exec_error(self, e, phase)
     }

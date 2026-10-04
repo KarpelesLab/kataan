@@ -70,7 +70,7 @@ fn run_main() -> ExitCode {
         },
         // Compile JS to a portable `.ktbc` bytecode artifact (Phase D′).
         ["compile", path, "-o", out] | ["compile", "-o", out, path] => run_compile(path, out),
-        // Run through the new-representation engine (`ROADMAP.md` §3).
+        // `nbrun` is a legacy alias of `run` (there is one engine).
         ["nbrun", "-e", source] => run_eval_nb(source, "<argv>"),
         ["nbrun", path] => match std::fs::read_to_string(path) {
             Ok(source) => run_eval_nb(&source, path),
@@ -79,10 +79,10 @@ fn run_main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        // Run through the new-representation engine *with the §4.1 host runtime*
-        // (timers / event loop): after the top-level script completes, drive the
-        // event loop so `setTimeout`/`setInterval`/`process.nextTick` work runs
-        // before the process exits.
+        // Run *with the §4.1 host runtime* (timers / event loop): after the
+        // top-level script completes, drive the event loop so
+        // `setTimeout`/`setInterval`/`process.nextTick` work runs before the
+        // process exits.
         ["hostrun", "-e", source] => run_host(source, "<argv>"),
         ["hostrun", path] => match std::fs::read_to_string(path) {
             Ok(source) => run_host(&source, path),
@@ -345,13 +345,12 @@ fn print_usage() {
          kataan lex -e <SOURCE>    tokenize a source string\n    \
          kataan parse <FILE>       parse a program and dump its AST\n    \
          kataan parse -e <SOURCE>  parse a source string and dump its AST\n    \
-         kataan eval <FILE>        evaluate a program (prints completion value)\n    \
-         kataan eval -e <SOURCE>   evaluate a source string\n    \
+         kataan run <FILE>         run a script or a compiled .ktbc artifact\n    \
+         kataan run -e <SOURCE>    run a source string\n    \
+         kataan eval <FILE>        alias for `run`\n    \
+         kataan eval -e <SOURCE>   alias for `run -e`\n    \
          kataan repl               start an interactive REPL\n    \
          kataan compile <FILE> -o <OUT.ktbc>  compile JS to a bytecode artifact\n    \
-         kataan run <FILE.ktbc>    run a compiled bytecode artifact\n    \
-         kataan nbrun <FILE>       alias for `run` (the new-representation engine)\n    \
-         kataan nbrun -e <SOURCE>  run a source string on the new engine\n    \
          kataan hostrun <FILE>     run with the host runtime (timers / event loop)\n    \
          kataan hostrun -e <SRC>   run a source string with the host event loop\n    \
          kataan --version          print the version\n    \

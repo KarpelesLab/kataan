@@ -8931,7 +8931,7 @@ fn call_closure(
     args: &[NanBox],
     this_val: NanBox,
 ) -> Result<NanBox, VmError> {
-    // Anything but a VM function — a native, an interpreter closure, a bound or
+    // Anything but a VM function — a native, a host function, a bound or
     // proxied function, a non-callable (a `TypeError`) — is the host's to call.
     if ctx.host.is_some()
         && !closure
@@ -9205,7 +9205,6 @@ fn regex_method(
             let repl_val = args.get(1).copied().unwrap_or(NanBox::undefined());
             // A non-string replacement (a function/closure, called per match) is
             // handled by the interpreter; defer instead of stringifying it.
-            // (nbvm closures are arrays, so this can't use `function_at`.)
             if repl_val
                 .as_handle()
                 .is_some_and(|raw| ctx.realm.string_value(Handle::from_raw(raw)).is_none())

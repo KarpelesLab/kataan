@@ -1225,9 +1225,8 @@ impl<'src> Parser<'src> {
             }
             // `import(specifier)` (dynamic import) and `import.meta` (the module
             // meta-property). Both are expression forms accepted in script *and*
-            // module code. There is no first-class AST node for either, and the
-            // tree-walker's `Expr` match is closed, so we desugar to a node the
-            // evaluators already understand: a call of / member on the reference
+            // module code. There is no first-class AST node for either, so we
+            // desugar to a node the compiler already understands: a call of / member on the reference
             // `import`. That reference is unbound at runtime, so evaluation fails
             // with a `ReferenceError` — the failure moves from the parse phase to
             // the runtime phase (full dynamic-import semantics are a separate,
