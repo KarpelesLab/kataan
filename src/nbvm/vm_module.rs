@@ -43,7 +43,7 @@ fn tagged(module: u32, name: &str) -> String {
     alloc::format!("{TAG}{module}:{name}")
 }
 
-/// Splits a [`tagged`] module-environment name into its module index and the
+/// Splits a `tagged` module-environment name into its module index and the
 /// plain name; `None` for an ordinary (global-environment) name.
 #[must_use]
 pub fn split_module_name(name: &str) -> Option<(u32, &str)> {
