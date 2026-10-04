@@ -547,6 +547,14 @@ fn collect_tests(root: &Path) -> Vec<(String, PathBuf)> {
     {
         out.retain(|(rel, _)| rel.contains(&filter));
     }
+    // `KATAAN_TEST262_LIST=file` restricts the run to the exact test paths listed
+    // in `file`, one per line (re-running a bucket from a previous run's results).
+    if let Ok(list) = std::env::var("KATAAN_TEST262_LIST")
+        && let Ok(text) = std::fs::read_to_string(&list)
+    {
+        let keep: HashSet<&str> = text.lines().map(str::trim).collect();
+        out.retain(|(rel, _)| keep.contains(rel.as_str()));
+    }
     out
 }
 
@@ -765,7 +773,8 @@ fn coordinate() {
         assert!(
             std::env::var("KATAAN_TEST262_FILTER")
                 .unwrap_or_default()
-                .is_empty(),
+                .is_empty()
+                && std::env::var("KATAAN_TEST262_LIST").is_err(),
             "refusing to bless a filtered run: the ledger is rewritten from this \
              run's failures, so every entry outside KATAAN_TEST262_FILTER would be \
              deleted. Bless from a full-corpus run."
