@@ -10717,6 +10717,40 @@ fn agent_broadcast_shares_the_same_data_block() {
 }
 
 #[test]
+#[cfg(feature = "std")]
+fn agent_worker_runs_on_the_vm_and_spins_with_the_baton() {
+    // A worker's source and broadcast callback run on the hosted bytecode VM
+    // (nothing tree-walks, on either side), and a worker *spinning* on shared
+    // memory hands the baton over at its VM loop back-edges — without that the
+    // main agent's store below would never run and this would deadlock.
+    let src = alloc::format!(
+        r#"{AGENT_WAIT_UNTIL}
+        $262_agent_start(`
+          $262.agent.receiveBroadcast(function (sab) {{
+            var a = new Int32Array(sab);
+            Atomics.add(a, 1, 1);
+            while (Atomics.load(a, 0) === 0) ;
+            var n = 0;
+            do {{ n++; }} while (Atomics.load(a, 2) === 0);
+            $262.agent.report("seen " + Atomics.load(a, 0) + " " + (n > 0));
+          }});
+        `);
+        var i32 = new Int32Array(new SharedArrayBuffer(12));
+        $262_agent_broadcast(i32.buffer);
+        waitUntil(i32, 1, 1);
+        Atomics.store(i32, 0, 7);
+        Atomics.store(i32, 2, 1);
+        console.log(report());
+    "#
+    );
+    let program = Parser::parse_program(&src).expect("parse");
+    let mut interp = Interp::new();
+    interp.run(&program).expect("exec");
+    assert_eq!(interp.output(), "seen 7 true\n");
+    assert_eq!(interp.tree_walked(), 0, "a worker tree-walked");
+}
+
+#[test]
 fn virtual_clock_set_timeout_fires_in_delay_order_and_advances() {
     // Macrotasks fire earliest-virtual-fire-time first, and dispatching one
     // advances the virtual clock read by `monotonicNow()`.

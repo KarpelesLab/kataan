@@ -3253,9 +3253,17 @@ impl<'a> Interp<'a> {
     }
 
     /// How many statements the tree-walker has executed in this interpreter
-    /// (user code that did not run on the bytecode VM).
+    /// (user code that did not run on the bytecode VM) — including, for the main
+    /// agent of a program that started `$262.agent` workers, every statement
+    /// those workers tree-walked so far.
     #[must_use]
     pub fn tree_walked(&self) -> u64 {
+        #[cfg(feature = "std")]
+        if self.agent.id == 0
+            && let Some(pool) = &self.agent.pool
+        {
+            return self.tree_walked + pool.worker_tree_walked();
+        }
         self.tree_walked
     }
 

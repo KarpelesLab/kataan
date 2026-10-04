@@ -48,6 +48,7 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -173,6 +174,11 @@ impl PoolState {
 pub(crate) struct AgentPool {
     state: Mutex<PoolState>,
     cv: Condvar,
+    /// Statements the workers' tree-walkers executed (the main agent folds it
+    /// into its own `Interp::tree_walked`). A worker bumps it only while it
+    /// holds the baton, and the main agent reads it only while *it* holds it, so
+    /// the baton's release/acquire pairs order every increment before a read.
+    worker_tree_walked: AtomicU64,
 }
 
 impl AgentPool {
@@ -192,7 +198,18 @@ impl AgentPool {
                 shutdown: false,
             }),
             cv: Condvar::new(),
+            worker_tree_walked: AtomicU64::new(0),
         }
+    }
+
+    /// A worker agent's tree-walker executed one statement.
+    pub(crate) fn note_worker_tree_walk(&self) {
+        self.worker_tree_walked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many statements the workers have tree-walked so far.
+    pub(crate) fn worker_tree_walked(&self) -> u64 {
+        self.worker_tree_walked.load(Ordering::Relaxed)
     }
 
     /// Registers a new worker agent, returning its id.

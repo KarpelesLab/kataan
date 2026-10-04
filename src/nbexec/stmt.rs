@@ -103,6 +103,14 @@ impl<'a> Interp<'a> {
 
     pub(crate) fn exec(&mut self, stmt: &'a Stmt) -> Result<Flow, ExecError> {
         self.tree_walked += 1;
+        // A worker agent's tree-walked statements count against the main agent
+        // (see `tree_walked`), which is the one a harness asks.
+        #[cfg(feature = "std")]
+        if self.agent.id != 0
+            && let Some(pool) = &self.agent.pool
+        {
+            pool.note_worker_tree_walk();
+        }
         // C2: share the tree-walk recursion budget with `eval` so deeply nested
         // statements (or expressions reached through them) throw a catchable
         // `RangeError` rather than overflowing the host stack. Bounded by the

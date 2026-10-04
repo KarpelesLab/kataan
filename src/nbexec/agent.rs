@@ -51,8 +51,9 @@ var $262 = {
 };
 "#;
 
-/// Native stack for a worker agent's thread. A worker runs a full `Interp` and
-/// the tree-walker recurses per AST node, so it needs real headroom — but the
+/// Native stack for a worker agent's thread. A worker runs a full `Interp`
+/// (whose compiler and any tree-walked fallback recurse per AST node), so it
+/// needs real headroom — but the
 /// reservation counts against the process's *address space*, and a program may
 /// start many agents, so this is deliberately well below what an embedder gives
 /// the main thread.
@@ -81,10 +82,13 @@ fn worker_main(pool: alloc::sync::Arc<super::agent_pool::AgentPool>, id: usize, 
     let mut interp = Interp::new();
     interp.agent.pool = Some(pool.clone());
     interp.agent.id = id;
+    // The worker's VM loop back-edges are scheduling points too: a worker that
+    // spins on shared memory must hand the baton on like the main agent does.
+    interp.realm.agents_active = true;
     // A throw escaping the worker source is the worker's own business — a real
     // agent runs independently and the main agent observes it only as a missing
-    // report.
-    let _ = interp.run_tree_walk(&program);
+    // report. The source runs on the hosted bytecode VM, like the main script.
+    let _ = interp.run(&program);
     // Serve broadcasts. `recv_broadcast` releases the baton while idle and
     // returns `None` once the pool is shutting down.
     while let Some(block) = pool.recv_broadcast(id) {
