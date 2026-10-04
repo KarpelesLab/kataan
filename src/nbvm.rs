@@ -1357,6 +1357,8 @@ fn hosted_ctx<'a>(realm: &'a mut Realm, host: &'a mut dyn VmHost) -> Ctx<'a> {
         top_frame_roots: Vec::new(),
         pending_callee: None,
         callee_stack: Vec::new(),
+        args_buf: Vec::new(),
+        callee_args: Vec::new(),
         pending_new_target: None,
     }
 }
@@ -3422,6 +3424,11 @@ struct Ctx<'a> {
     /// The callee of each active activation of this run (`undefined` when the
     /// call site did not know it), innermost last — the legacy `fn.caller`.
     callee_stack: Vec<NanBox>,
+    /// Each [`Self::callee_stack`] activation's arguments, concatenated;
+    /// `callee_args[i]` is where activation `i`'s start (the legacy
+    /// `fn.arguments`).
+    args_buf: Vec<NanBox>,
+    callee_args: Vec<usize>,
 }
 
 // The recursion-guard, handler-stack, JSON-depth, and string-length caps now
@@ -3468,6 +3475,8 @@ pub fn run_program(
         top_frame_roots: Vec::new(),
         pending_callee: None,
         callee_stack: Vec::new(),
+        args_buf: Vec::new(),
+        callee_args: Vec::new(),
         pending_new_target: None,
     };
     let value = call(&mut ctx, funcs, id, args)?;
@@ -3509,6 +3518,8 @@ pub fn run_program_capturing(
         top_frame_roots: Vec::new(),
         pending_callee: None,
         callee_stack: Vec::new(),
+        args_buf: Vec::new(),
+        callee_args: Vec::new(),
         pending_new_target: None,
     };
     let value = call(&mut ctx, funcs, id, args)?;
@@ -3629,10 +3640,15 @@ fn call_with(
     };
     let funcs = newer.as_deref().unwrap_or(funcs);
     let callee_mark = ctx.callee_stack.len();
+    let args_mark = ctx.args_buf.len();
     ctx.callee_stack
         .push(ctx.pending_callee.unwrap_or(NanBox::undefined()));
+    ctx.callee_args.push(args_mark);
+    ctx.args_buf.extend_from_slice(args);
     let result = call_with_inner(ctx, funcs, id, args, captures, this_val);
     ctx.callee_stack.truncate(callee_mark);
+    ctx.callee_args.truncate(callee_mark);
+    ctx.args_buf.truncate(args_mark);
     ctx.frames_published = published;
     ctx.frame_shadow.truncate(mark);
     ctx.call_depth -= 1;
@@ -4030,6 +4046,8 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
         top_frame_roots: Vec::new(),
         pending_callee: None,
         callee_stack: Vec::new(),
+        args_buf: Vec::new(),
+        callee_args: Vec::new(),
         pending_new_target: None,
     };
     match run_frame(&mut ctx, &[], program, &mut regs)? {
@@ -4503,6 +4521,32 @@ fn vm_get_prop(
             // function that invoked its innermost live activation in this run
             // (`null` when not executing, called from elsewhere, or by a
             // non-legacy function).
+            // The legacy `f.arguments`: an arguments object over the
+            // innermost live activation's arguments (`null` when not running).
+            if key == "arguments"
+                && ctx.host.is_some()
+                && !ctx.realm.has_own(handle, "arguments")
+                && let Some((id, _)) = ctx.realm.vm_function(handle)
+                && funcs.get(id as usize).is_some_and(|p| p.legacy)
+            {
+                let Some(i) = ctx
+                    .callee_stack
+                    .iter()
+                    .rposition(|c| c.as_handle() == Some(handle.to_raw()))
+                else {
+                    return Ok(NanBox::null());
+                };
+                let start = ctx.callee_args[i];
+                let end = ctx
+                    .callee_args
+                    .get(i + 1)
+                    .copied()
+                    .unwrap_or(ctx.args_buf.len());
+                let argv = ctx.args_buf[start..end].to_vec();
+                let callee = NanBox::handle(handle.to_raw());
+                return with_host(ctx, |h| h.make_arguments(&argv, callee, false))
+                    .ok_or(VmError::Unsupported);
+            }
             if key == "caller"
                 && ctx.host.is_some()
                 && !ctx.realm.has_own(handle, "caller")
@@ -5792,6 +5836,7 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
         .chain(ctx.frame_shadow.iter())
         .chain(ctx.top_frame_roots.iter())
         .chain(ctx.callee_stack.iter())
+        .chain(ctx.args_buf.iter())
     {
         push(&mut roots, *r);
     }
@@ -14916,7 +14961,7 @@ impl Compiler {
 
     fn stmt_inner(&mut self, stmt: &Stmt) -> Result<Option<Reg>, CompileError> {
         match stmt {
-            Stmt::Empty { .. } => Ok(None),
+            Stmt::Empty { .. } | Stmt::Debugger { .. } => Ok(None),
             // Function and (top-level) class declarations are compiled into the
             // table up front; nothing to emit at the declaration site.
             Stmt::Function(f) => {
@@ -15829,8 +15874,6 @@ impl Compiler {
                 self.scopes.pop();
                 Ok(None)
             }
-            // `debugger;` with no debugger attached does nothing.
-            Stmt::Debugger { .. } => Ok(None),
             // `with (obj) body` (only in a dynamic-scope function): the body
             // runs in an object environment nested in the current one.
             Stmt::With { object, body, .. } if self.dyn_fn => {
@@ -23294,6 +23337,8 @@ mod generic_jit_tests {
             top_frame_roots: Vec::new(),
             pending_callee: None,
             callee_stack: Vec::new(),
+            args_buf: Vec::new(),
+            callee_args: Vec::new(),
             pending_new_target: None,
         }
     }
