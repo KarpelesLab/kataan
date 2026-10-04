@@ -2451,11 +2451,45 @@ impl Realm {
         let Some(obj) = self.heap.get(*aux).and_then(Cell::as_object) else {
             return alloc::vec::Vec::new();
         };
-        obj.enumerable_keys()
+        let mut keys: Vec<alloc::string::String> = obj
+            .enumerable_keys()
             .iter()
             .filter(|s| !is_internal_key(s))
             .map(|s| alloc::string::String::from(*s))
-            .collect()
+            .collect();
+        self.order_vm_fn_keys(handle, &mut keys);
+        keys
+    }
+
+    /// A VM closure's own-key order: integer indices first, then `length` and
+    /// `name` — synthesized, or a physical slot that redefined them in place
+    /// (one deleted and re-added keeps its later position) — then the rest.
+    fn order_vm_fn_keys(&self, handle: Handle, keys: &mut Vec<alloc::string::String>) {
+        if !matches!(self.heap.get(handle), Some(Cell::VmFunction { .. })) {
+            return;
+        }
+        let aux = self
+            .aux_props
+            .get(&handle.to_raw())
+            .and_then(|h| self.heap.get(*h))
+            .and_then(Cell::as_object);
+        let mut front = Vec::new();
+        for k in ["length", "name"] {
+            let deleted = aux.is_some_and(|o| fn_meta_tombstone(k).is_some_and(|t| o.contains(t)));
+            if !deleted && let Some(i) = keys.iter().position(|x| x == k) {
+                front.push(keys.remove(i));
+            }
+        }
+        let at = keys
+            .iter()
+            .position(|k| {
+                k.parse::<u32>()
+                    .map_or(true, |n| alloc::format!("{n}") != *k)
+            })
+            .unwrap_or(keys.len());
+        for (j, k) in front.into_iter().enumerate() {
+            keys.insert(at + j, k);
+        }
     }
 
     /// Own **enumerable** Symbol keys (the `\0sym:` internal names) held in a
@@ -2727,6 +2761,7 @@ impl Realm {
                     names.push(alloc::string::String::from(*k));
                 }
             }
+            self.order_vm_fn_keys(handle, &mut names);
             return Some(names);
         }
         None

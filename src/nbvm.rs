@@ -1432,6 +1432,15 @@ fn host_set(
     value: NanBox,
     strict: bool,
 ) -> Result<(), VmError> {
+    // A number that is not an array index (2**32−1 and up, negative,
+    // fractional) keys on its string form.
+    let key = match key.as_number() {
+        Some(n) if !((0.0..4_294_967_295.0).contains(&n) && n == (n as u64) as f64) => {
+            let s = ctx.realm.to_display_string(key);
+            NanBox::handle(ctx.realm.new_string(&s).to_raw())
+        }
+        _ => key,
+    };
     with_host(ctx, |h| h.set_member(recv, key, value, strict))
         .unwrap_or(Err(HostError::Fault))
         .map_err(VmError::from)
@@ -1531,7 +1540,10 @@ fn vm_set_elem_mode(
             .map(Handle::from_raw)
             .and_then(|h| ctx.realm.array_length(h).map(|len| (h, len)))
             .is_some_and(|(h, len)| {
+                // (Past the dense storage of a sparse array, too.)
+                let dense = ctx.realm.array_elements(h).map_or(0, <[_]>::len);
                 n > len as f64
+                    || n > dense as f64
                     || (n == len as f64 && proto_owns_key(ctx.realm, h, &alloc::format!("{len}")))
             })
     });
@@ -1542,7 +1554,20 @@ fn vm_set_elem_mode(
         || (key.as_number().is_some()
             && recv
                 .as_handle()
-                .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h))));
+                .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h))))
+        // An index write on an ordinary object that is non-extensible, or whose
+        // prototype chain owns the index (a typed array, a setter), is the
+        // host's OrdinarySet.
+        || key.as_number().is_some_and(|n| {
+            recv.as_handle().map(Handle::from_raw).is_some_and(|h| {
+                let k = ctx.realm.to_display_string(NanBox::number(n));
+                ctx.realm.array_length(h).is_none()
+                    && ctx.realm.typed_len(h).is_none()
+                    && (!plain_write_ok(ctx.realm, h, &k)
+                        || ctx.realm.accessor(h, &k).is_some()
+                        || proto_owns_key(ctx.realm, h, &k))
+            })
+        });
     if !to_host && key.as_number().is_none() {
         // A string (or symbol) key is an ordinary property write: the static-key
         // store handles its setter, read-only and host cases.
@@ -4343,6 +4368,7 @@ fn vm_get_prop(
             // A VM function's `.name` comes from its proto (the closure is a tagged
             // array whose element 0 is the function id).
             if key == "name"
+                && ctx.host.is_none()
                 && ctx.realm.is_vm_function(handle)
                 && !ctx.realm.has_own(handle, "name")
             {
@@ -4375,6 +4401,11 @@ fn vm_get_prop(
             if is_regexp_introspection_key(key)
                 && let Some((src, flags)) = ctx.realm.regexp_at(handle)
             {
+                // Hosted, `source`/`flags`/the flag getters are the host's
+                // `RegExp.prototype` accessors (escaping, flag order, overrides).
+                if ctx.host.is_some() && key != "lastIndex" {
+                    return host_get_str(ctx, recv, key);
+                }
                 match key {
                     // EscapeRegExpPattern (line terminators, `/`) is the host's.
                     "source" if ctx.host.is_some() => {
@@ -8041,8 +8072,20 @@ fn vm_array_index_get(
     recv: NanBox,
 ) -> Result<NanBox, VmError> {
     // A present own element wins.
-    if i < ctx.realm.array_length(handle).unwrap_or(0) && !ctx.realm.array_hole_at(handle, i) {
+    // (Within the dense storage: a logical `length` past it is sparse.)
+    if i < ctx.realm.array_length(handle).unwrap_or(0)
+        && ctx
+            .realm
+            .array_elements(handle)
+            .is_some_and(|e| i < e.len())
+        && !ctx.realm.array_hole_at(handle, i)
+    {
         return Ok(ctx.realm.get_element(handle, i));
+    }
+    // Hosted: a hole or an index past the end (sparse storage, accessors,
+    // the prototype chain) is the host's `[[Get]]`.
+    if ctx.host.is_some() {
+        return host_get_str(ctx, recv, &alloc::format!("{i}"));
     }
     // An OWN accessor installed at this index (`defineProperty(arr, i, {get})`)
     // lives in the aux object over a hole — invoke its getter before the chain.
@@ -11368,6 +11411,17 @@ const PRIV_ACCESSOR: u8 = b'a';
 
 /// IsAnonymousFunctionDefinition: a function, arrow or class expression with no
 /// own name (NamedEvaluation gives it the name of what it is assigned to).
+/// A call's callee carrying an optional link the call must honor:
+/// `a?.m` / `a?.[k]`, or a parenthesized chain ending in a member
+/// (`(a?.m)` — whose reference keeps `a` as `this`).
+fn is_optional_callee(callee: &Expr) -> bool {
+    match callee {
+        Expr::Member { optional, .. } => *optional,
+        Expr::OptChain { expr, .. } => matches!(&**expr, Expr::Member { .. }),
+        _ => false,
+    }
+}
+
 fn is_anonymous_fn_def(e: &Expr) -> bool {
     match e {
         Expr::Function(f) => f.id.is_none(),
@@ -12819,6 +12873,21 @@ impl Compiler {
                     continue;
                 }
             };
+            // `[k] = function () {}` names the function after the computed key
+            // (SetFunctionName in the definition).
+            if let (FieldKey::Hidden(_), Some(e)) = (&fd.key, fd.init)
+                && is_anonymous_fn_def(e)
+            {
+                let v = c.expr(e)?;
+                let this = c.this_reg;
+                c.ops.push(Op::DefineMethod {
+                    obj: this,
+                    key,
+                    func: v,
+                    kind: 4,
+                });
+                continue;
+            }
             let v = match (&fd.key, fd.init) {
                 (FieldKey::Static(k), Some(e)) => c.named_field_value(e, k)?,
                 (_, Some(e)) => c.expr(e)?,
@@ -16207,7 +16276,10 @@ impl Compiler {
                 arguments,
                 optional: true,
                 ..
-            } if self.hosted && !self.optchain_ends.is_empty() => {
+            } if self.hosted
+                && !self.optchain_ends.is_empty()
+                && !matches!(&**callee, Expr::OptChain { .. }) =>
+            {
                 self.refuse_direct_eval(callee)?;
                 let (f, this) = match &**callee {
                     Expr::Member {
@@ -16284,6 +16356,7 @@ impl Compiler {
                 ..
             } if self.hosted
                 && !*optional
+                && !is_optional_callee(callee)
                 && !matches!(&**callee, Expr::Super(_))
                 && !matches!(&**callee, Expr::Member { object, .. } if matches!(&**object, Expr::Super(_)))
                 && arguments
@@ -16327,6 +16400,15 @@ impl Compiler {
                     args,
                 });
                 Ok(dst)
+            }
+            Expr::Call {
+                callee,
+                arguments,
+                optional,
+                ..
+            } if self.hosted && (*optional || is_optional_callee(callee)) => {
+                self.refuse_direct_eval(callee)?;
+                self.optional_call(callee, arguments, *optional)
             }
             Expr::Call {
                 callee, arguments, ..
@@ -17830,6 +17912,110 @@ impl Compiler {
     }
 
     /// Emits `!(v === null || v === undefined)` into a fresh register.
+    /// A `?.` link on `v`: a nullish value short-circuits the enclosing
+    /// optional chain (its result stays `undefined`).
+    fn opt_link(&mut self, v: Reg) -> Result<(), CompileError> {
+        if self.optchain_ends.is_empty() {
+            return Err(CompileError::Unsupported("optional link outside a chain"));
+        }
+        let go = self.emit_not_nullish(v)?;
+        let jf = self.emit_jump_if_false(go);
+        if let Some(ends) = self.optchain_ends.last_mut() {
+            ends.push(jf);
+        }
+        Ok(())
+    }
+
+    /// Hosted calls with an optional link: `a?.m()`, `f?.()`, `a.m?.()`,
+    /// `(a?.m)()` — the callee (and, for a member callee, its receiver as
+    /// `this`) first, a nullish link short-circuiting the chain, then the
+    /// arguments.
+    fn optional_call(
+        &mut self,
+        callee: &Expr,
+        arguments: &[crate::ast::Argument],
+        call_optional: bool,
+    ) -> Result<Reg, CompileError> {
+        let (f, this) = match callee {
+            Expr::Member {
+                object,
+                property,
+                optional,
+                ..
+            } if !matches!(&**object, Expr::Super(_)) => {
+                let recv = self.expr(object)?;
+                if *optional {
+                    self.opt_link(recv)?;
+                }
+                let f = self.member_read(recv, property)?;
+                (f, recv)
+            }
+            // `super.m?.()`: `this` is the receiver.
+            Expr::Member { object, .. } if matches!(&**object, Expr::Super(_)) => {
+                let f = self.expr(callee)?;
+                (f, self.this_value())
+            }
+            // `(a?.b)()`: the parenthesized chain is its own boundary, and
+            // its member reference keeps `a` as `this`.
+            Expr::OptChain { expr, .. } if matches!(&**expr, Expr::Member { object, .. } if !matches!(&**object, Expr::Super(_))) =>
+            {
+                let Expr::Member {
+                    object,
+                    property,
+                    optional,
+                    ..
+                } = &**expr
+                else {
+                    unreachable!("matched above")
+                };
+                let (fo, to) = (self.alloc(), self.alloc());
+                let undef = self.constant(NanBox::undefined())?;
+                self.ops.push(Op::Move {
+                    dst: fo,
+                    src: undef,
+                });
+                self.ops.push(Op::Move {
+                    dst: to,
+                    src: undef,
+                });
+                self.optchain_ends.push(Vec::new());
+                let r = (|c: &mut Self| -> Result<(), CompileError> {
+                    let recv = c.expr(object)?;
+                    if *optional {
+                        c.opt_link(recv)?;
+                    }
+                    let f = c.member_read(recv, property)?;
+                    c.ops.push(Op::Move { dst: fo, src: f });
+                    c.ops.push(Op::Move { dst: to, src: recv });
+                    Ok(())
+                })(self);
+                let sites = self.optchain_ends.pop().unwrap_or_default();
+                r?;
+                let end = self.ops.len();
+                for site in sites {
+                    self.patch_to(site, end);
+                }
+                (fo, to)
+            }
+            other => {
+                let f = self.expr(other)?;
+                (f, self.constant(NanBox::undefined())?)
+            }
+        };
+        if call_optional {
+            self.opt_link(f)?;
+        }
+        let args = self.spread_args(arguments)?;
+        let dst = self.alloc();
+        self.ops.push(Op::CallSpread {
+            dst,
+            callee: f,
+            this,
+            args,
+        });
+        Ok(dst)
+    }
+
     fn emit_not_nullish(&mut self, v: Reg) -> Result<Reg, CompileError> {
         let null = self.constant(NanBox::null())?;
         let undef = self.constant(NanBox::undefined())?;

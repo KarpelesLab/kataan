@@ -738,6 +738,16 @@ impl<'a> Interp<'a> {
         desc: Handle,
         reflect: bool,
     ) -> Result<bool, ExecError> {
+        // A VM closure's synthesized `length`/`name` become a physical slot
+        // (same value and attributes, same key position) before being
+        // redefined, so a partial descriptor updates a real property.
+        if matches!(key, "length" | "name")
+            && let Some(v) = self.realm.vm_fn_meta_value(obj, key)
+        {
+            self.realm.set_property(obj, key, v);
+            self.realm.mark_hidden(obj, key);
+            self.realm.set_readonly_property(obj, key);
+        }
         // A module namespace exotic object has its own `[[DefineOwnProperty]]`
         // (§10.4.6.11): a String key can only be redefined inertly; a non-export
         // or shape-altering request fails (Reflect → false, Object → TypeError).
