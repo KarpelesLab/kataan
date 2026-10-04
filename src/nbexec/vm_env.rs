@@ -238,6 +238,10 @@ impl<'a> Interp<'a> {
                 new_target,
                 new_target_in_scope,
                 param_names,
+                home,
+                field_init,
+                private_names,
+                private_keys,
             } => {
                 let is_eval = callee.as_handle().map(Handle::from_raw).is_some_and(|h| {
                     self.realm.native_at(h) == Some(N_EVAL)
@@ -270,9 +274,20 @@ impl<'a> Interp<'a> {
                     core::mem::replace(&mut self.new_target_in_scope, new_target_in_scope);
                 let saved_sc_scope = core::mem::replace(&mut self.super_call_in_scope, false);
                 let saved_home = self.current_home.take();
-                let saved_home_object = self.current_home_object.take();
+                let saved_home_object = core::mem::replace(
+                    &mut self.current_home_object,
+                    home.and_then(|h| h.as_handle()).map(Handle::from_raw),
+                );
                 let saved_lexical_home = self.current_lexical_home.take();
-                let saved_field_init = core::mem::replace(&mut self.in_field_initializer, false);
+                let saved_field_init =
+                    core::mem::replace(&mut self.in_field_initializer, field_init);
+                let saved_vm_home = core::mem::replace(&mut self.vm_eval_home, home);
+                let privates: Vec<(String, NanBox)> = private_names
+                    .iter()
+                    .zip(private_keys)
+                    .map(|(n, k)| (String::from(*n), *k))
+                    .collect();
+                let saved_privates = core::mem::replace(&mut self.vm_eval_privates, privates);
                 let saved_param_names = core::mem::replace(
                     &mut self.eval_param_names,
                     param_names.map(|ns| ns.iter().map(|n| String::from(*n)).collect()),
@@ -289,6 +304,8 @@ impl<'a> Interp<'a> {
                 self.current_home_object = saved_home_object;
                 self.current_lexical_home = saved_lexical_home;
                 self.in_field_initializer = saved_field_init;
+                self.vm_eval_home = saved_vm_home;
+                self.vm_eval_privates = saved_privates;
                 self.eval_param_names = saved_param_names;
                 #[cfg(all(feature = "module", feature = "std"))]
                 if let Some(mi) = saved_imports {
@@ -390,7 +407,20 @@ impl<'a> Interp<'a> {
         if new_target.is_some() {
             flags |= crate::nbvm::EVAL_NEW_TARGET;
         }
-        let (table, proto) = self.vm_eval_proto(program, strict, flags)?;
+        let home = self.vm_eval_home.filter(|_| !script);
+        if home.is_some() {
+            flags |= crate::nbvm::EVAL_HOME;
+        }
+        if self.in_field_initializer && !script {
+            flags |= crate::nbvm::EVAL_FIELD_INIT;
+        }
+        let privates: Vec<(String, NanBox)> = if script {
+            Vec::new()
+        } else {
+            self.vm_eval_privates.clone()
+        };
+        let names: Vec<&str> = privates.iter().map(|(n, _)| n.as_str()).collect();
+        let (table, proto) = self.vm_eval_proto(program, strict, flags, &names)?;
         // EvalDeclarationInstantiation's bindings (the VM code instantiates the
         // function declarations itself).
         let saved_gc = core::mem::replace(&mut self.gc_ok, false);
@@ -412,6 +442,11 @@ impl<'a> Interp<'a> {
             let var = self.env_value(self.var_scope.clone());
             let mut caps = alloc::vec![lex, var, self.this_val];
             caps.extend(new_target);
+            caps.extend(home);
+            if flags & crate::nbvm::EVAL_FIELD_INIT != 0 {
+                caps.push(NanBox::boolean(true));
+            }
+            caps.extend(privates.iter().map(|(_, k)| *k));
             let table = self.vm_newest_table().unwrap_or(table);
             crate::nbvm::run_eval_code(self, &table, &proto, &caps).map_err(vm_to_exec)
         });
@@ -429,7 +464,7 @@ impl<'a> Interp<'a> {
         program: &'a Program,
         strict: bool,
     ) -> Option<Result<NanBox, ExecError>> {
-        let (table, proto) = self.vm_eval_proto(program, strict, crate::nbvm::EVAL_DYN_FN)?;
+        let (table, proto) = self.vm_eval_proto(program, strict, crate::nbvm::EVAL_DYN_FN, &[])?;
         let g = self.global_scope.clone();
         let env = self.env_value(g);
         let caps = [env, env, self.global_this];
@@ -443,6 +478,7 @@ impl<'a> Interp<'a> {
         program: &'a Program,
         strict: bool,
         flags: u8,
+        privates: &[&str],
     ) -> Option<(
         alloc::rc::Rc<[crate::nbvm::FnProto]>,
         alloc::rc::Rc<crate::nbvm::FnProto>,
@@ -450,22 +486,26 @@ impl<'a> Interp<'a> {
         let table = self.vm_newest_table()?;
         let key = (
             core::ptr::from_ref(program) as usize,
-            flags | (u8::from(strict) << 4),
+            u16::from(flags) | (u16::from(strict) << 8),
+            privates.join("\n"),
         );
         let proto = match self.vm_eval_cache.get(&key) {
             Some(p) => alloc::rc::Rc::clone(p),
             None => {
                 // Without nested functions the body needs no table slots.
                 let mut scratch = Vec::new();
-                let first = crate::nbvm::compile_eval_code(program, &mut scratch, strict, flags);
+                let first =
+                    crate::nbvm::compile_eval_code(program, &mut scratch, strict, flags, privates);
                 let proto = match first {
                     Err(_) => return None,
                     Ok(p) if scratch.is_empty() => p,
                     Ok(_) => {
                         let mut full: Vec<crate::nbvm::FnProto> = table.to_vec();
                         let base = full.len();
-                        let p = crate::nbvm::compile_eval_code(program, &mut full, strict, flags)
-                            .ok()?;
+                        let p = crate::nbvm::compile_eval_code(
+                            program, &mut full, strict, flags, privates,
+                        )
+                        .ok()?;
                         crate::nbvm::resolve_source_text(&mut full[base..], &program.source);
                         // One growth chain with scripts and dynamic imports.
                         self.install_vm_table(full.into());

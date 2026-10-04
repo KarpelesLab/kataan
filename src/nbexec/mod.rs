@@ -886,10 +886,17 @@ pub struct Interp<'a> {
     vm_ext_table: Option<alloc::rc::Rc<[crate::nbvm::FnProto]>>,
     /// Compiled eval code by (program address, flags): an eval of the same
     /// source in the same kind of context reuses it.
-    vm_eval_cache: alloc::collections::BTreeMap<(usize, u8), alloc::rc::Rc<crate::nbvm::FnProto>>,
+    vm_eval_cache:
+        alloc::collections::BTreeMap<(usize, u16, String), alloc::rc::Rc<crate::nbvm::FnProto>>,
     /// Set while EvalDeclarationInstantiation runs for VM-compiled eval code:
     /// its function declarations are instantiated by the VM code itself.
     hoist_skip_fns: bool,
+    /// The home object of the VM method whose direct eval is running (its
+    /// eval code's `super`).
+    vm_eval_home: Option<NanBox>,
+    /// The private names (and keys) in scope at the VM direct eval that is
+    /// running.
+    vm_eval_privates: Vec<(String, NanBox)>,
 }
 
 /// The `[[ParameterMap]]` of one mapped `arguments` object: the shared parameter
@@ -3372,6 +3379,8 @@ impl<'a> Interp<'a> {
             vm_ext_table: None,
             vm_eval_cache: alloc::collections::BTreeMap::new(),
             hoist_skip_fns: false,
+            vm_eval_home: None,
+            vm_eval_privates: Vec::new(),
         };
         // The constructor's `current` IS the root scope; capture it as the global
         // scope before `install_globals` populates it, so indirect eval can run
@@ -6659,7 +6668,12 @@ impl<'a> Interp<'a> {
         // parser with these lets the eval body reference `this.#x` (which resolves
         // at runtime against the unchanged `current_lexical_home`). An indirect
         // eval runs in the global scope and sees none.
-        let outer_private_names = if direct {
+        let outer_private_names = if direct && !self.vm_eval_privates.is_empty() {
+            self.vm_eval_privates
+                .iter()
+                .map(|(n, _)| alloc::boxed::Box::from(n.as_str()))
+                .collect()
+        } else if direct {
             self.visible_private_names()
         } else {
             Vec::new()

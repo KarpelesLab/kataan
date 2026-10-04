@@ -1645,7 +1645,11 @@ impl<'a> Interp<'a> {
         let child_intl = core::mem::take(&mut self.created_realms[realm_idx].intl_protos);
         let saved_intl = self.realm.replace_intl_protos(child_intl);
         self.eval_depth += 1;
-        let result = self.run_eval_body(program);
+        let strict = self.strict;
+        let result = match self.vm_eval_program(program, strict, None, false) {
+            Some(r) => r,
+            None => self.run_eval_body(program),
+        };
         self.eval_depth -= 1;
 
         self.created_realms[realm_idx].intl_protos = self.realm.replace_intl_protos(saved_intl);

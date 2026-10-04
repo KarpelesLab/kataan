@@ -37,7 +37,8 @@ use alloc::vec::Vec;
 
 mod vm_eval;
 pub(crate) use vm_eval::{
-    EVAL_DYN_FN, EVAL_NEW_TARGET, EVAL_SCRIPT, compile_eval_code, run_eval_code,
+    EVAL_DYN_FN, EVAL_FIELD_INIT, EVAL_HOME, EVAL_NEW_TARGET, EVAL_SCRIPT, compile_eval_code,
+    run_eval_code,
 };
 #[cfg(all(feature = "std", feature = "module"))]
 mod vm_module;
@@ -3199,6 +3200,13 @@ pub enum EnvReq<'r> {
         /// In a parameter list: the names the eval code may not declare as
         /// `var`s.
         param_names: Option<&'r [&'r str]>,
+        /// The calling method's home object (`super` in the eval code).
+        home: Option<NanBox>,
+        /// In a class field initializer (`arguments` is an early error).
+        field_init: bool,
+        /// The private names in scope (bare, `x` for `#x`) and their keys.
+        private_names: &'r [&'r str],
+        private_keys: &'r [NanBox],
     },
     /// Whether `callee` is the running realm's %eval% (a direct eval).
     IsEval { callee: NanBox },
@@ -3248,8 +3256,11 @@ pub(crate) const EK_REF_GET: u8 = 12;
 /// `PutValue(regs[1], regs[2])` (environment `regs[0]`).
 pub(crate) const EK_REF_PUT: u8 = 13;
 /// `dst` = `eval(...)`: `regs` = `[env, var_env, callee, this_call, args array,
-/// this, new.target]`; `flags` bit 0 strict, bit 1 `new.target` in scope, bit 2
-/// in a parameter list (`name` = the parameter names joined by `\n`).
+/// this, new.target, home?]`; `flags` bit 0 strict, bit 1 `new.target` in
+/// scope, bit 2 in a parameter list (the parameter names, joined by `\n`,
+/// start `name`), bit 3 a home object (`regs[7]`), bit 4 in a class field
+/// initializer, bit 5 private names in scope (their keys follow; `name`'s part
+/// after a `\u{1}` lists them).
 pub(crate) const EK_EVAL: u8 = 14;
 /// Maps the arguments object `regs[0]` over `regs[1]`'s parameter bindings,
 /// `name` = the parameter names joined by `\n`.
@@ -6504,12 +6515,26 @@ fn run_frame_at(
                 } else {
                     Vec::new()
                 };
+                // An eval's `name` is `params\u{1}privates` (see `EK_EVAL`).
+                let (params_part, privates_part) = match name.split_once('\u{1}') {
+                    Some((a, b)) => (a, b),
+                    None => (name.as_str(), ""),
+                };
                 let names: Vec<&str> =
                     if *kind == EK_MAP_ARGS || (*kind == EK_EVAL && *flags & 4 != 0) {
-                        name.split('\n').filter(|n| !n.is_empty()).collect()
+                        params_part.split('\n').filter(|n| !n.is_empty()).collect()
                     } else {
                         Vec::new()
                     };
+                let private_names: Vec<&str> = if *kind == EK_EVAL && *flags & 32 != 0 {
+                    privates_part.split('\n').collect()
+                } else {
+                    Vec::new()
+                };
+                let first_private = 7 + usize::from(*flags & 8 != 0);
+                let private_keys: Vec<NanBox> = (0..private_names.len())
+                    .map(|i| regs[rs[first_private + i] as usize])
+                    .collect();
                 let req = match *kind {
                     EK_ROOT => EnvReq::Root { name },
                     EK_CHILD => EnvReq::Child {
@@ -6575,6 +6600,10 @@ fn run_frame_at(
                         new_target: r(6),
                         new_target_in_scope: *flags & 2 != 0,
                         param_names: (*flags & 4 != 0).then_some(&names[..]),
+                        home: (*flags & 8 != 0).then(|| r(7)),
+                        field_init: *flags & 16 != 0,
+                        private_names: &private_names,
+                        private_keys: &private_keys,
                     },
                     EK_IS_EVAL => EnvReq::IsEval { callee: r(0) },
                     EK_DECL_FN => EnvReq::DeclFn {
@@ -10707,18 +10736,6 @@ pub fn compile_program_into(
             refuse_generator(f, hosted)?;
         }
     }
-    // A direct eval inside a class body (it must see the class's private names
-    // and home object) is not modelled yet.
-    if hosted {
-        let mut direct = BTreeSet::new();
-        let mut nested = BTreeSet::new();
-        for s in &program.body {
-            refs_stmt(s, &mut direct, &mut nested);
-        }
-        if nested.contains(DYN_EVAL_CLASS) {
-            return Err(CompileError::Unsupported("direct eval in a class"));
-        }
-    }
     let decls: Vec<&crate::ast::Function> = program.body.iter().filter_map(fn_decl).collect();
     let mut fn_ids = alloc::collections::BTreeMap::new();
     for (i, f) in decls.iter().enumerate() {
@@ -12339,6 +12356,9 @@ struct Compiler {
     /// whose completion is `undefined` when their body's is empty (`if`,
     /// loops, `switch`, `try`, `with`) reset it.
     completion: Option<Reg>,
+    /// The closure `make_closure_ext` builds next is a method (its home object
+    /// is in scope as `HOME_NAME`).
+    closure_is_method: bool,
     /// While a dynamic-scope function's parameter list compiles: the names a
     /// direct eval there may not declare as `var`s (the parameters and
     /// `arguments`), joined by `\n`.
@@ -12543,7 +12563,16 @@ impl Compiler {
         // Dynamic scoping (a direct eval / `with` in this function or a nested
         // one): bindings live in host environments; `this` and `new.target`
         // stay hidden cells a nested dynamic arrow (or eval code) may need.
-        let dyn_fn = hosted && uses_dynamic_scope(params, body);
+        let dyn_fn = hosted
+            && (uses_dynamic_scope(params, body)
+                || field_defs.iter().filter_map(|fd| fd.init).any(|e| {
+                    let mut direct = BTreeSet::new();
+                    let mut nested = BTreeSet::new();
+                    refs_expr(e, &mut direct, &mut nested);
+                    [DYN_EVAL, DYN_WITH]
+                        .iter()
+                        .any(|m| direct.contains(*m) || nested.contains(*m))
+                }));
         if dyn_fn && !is_arrow {
             cell_names.insert(String::from(THIS_NAME));
             if !is_main {
@@ -12640,9 +12669,10 @@ impl Compiler {
             None
         };
         if dyn_fn {
-            if class_ctor.is_some() || !fields.is_empty() || !field_defs.is_empty() {
+            // `super()` in eval code is not modelled.
+            if class_ctor == Some(true) || !fields.is_empty() {
                 return Err(CompileError::Unsupported(
-                    "dynamic scope in a class element",
+                    "dynamic scope in a derived constructor",
                 ));
             }
             c.dyn_fn = true;
@@ -12657,6 +12687,8 @@ impl Compiler {
                 is_async,
                 is_generator,
                 rest_from,
+                field_defs,
+                class_ctor: class_ctor.is_some(),
             });
         }
         // The `arguments` object is the function's first instruction (see
@@ -13055,91 +13087,7 @@ impl Compiler {
             });
         }
         // A class field-initializer function: define each field on `this`.
-        for fd in field_defs {
-            let read = |c: &mut Compiler, n: &str| -> Result<Reg, CompileError> {
-                let b = c
-                    .lookup(n)
-                    .ok_or(CompileError::Unsupported("class field key"))?;
-                Ok(c.read_var(b))
-            };
-            let this = c.this_reg;
-            let key = match &fd.key {
-                FieldKey::Static(k) => c.constant_str(k),
-                FieldKey::Hidden(n) => read(&mut c, n)?,
-                FieldKey::Private(n) => {
-                    let key = read(&mut c, n)?;
-                    let v = match fd.init {
-                        // `#f = function () {}` names the function `#f`.
-                        Some(e) => {
-                            let nm = alloc::format!("#{}", n.trim_start_matches("\0#"));
-                            c.named_field_value(e, &nm)?
-                        }
-                        None => c.constant(NanBox::undefined())?,
-                    };
-                    c.ops.push(Op::PrivateDefine {
-                        obj: this,
-                        key,
-                        src: v,
-                    });
-                    continue;
-                }
-                FieldKey::PrivateMethod(n, f) => {
-                    let key = read(&mut c, n)?;
-                    let src = read(&mut c, f)?;
-                    c.ops.push(Op::PrivateDefine {
-                        obj: this,
-                        key,
-                        src,
-                    });
-                    continue;
-                }
-                FieldKey::PrivateAccessor(n, g, st) => {
-                    let key = read(&mut c, n)?;
-                    let getter = match g {
-                        Some(g) => read(&mut c, g)?,
-                        None => c.constant(NanBox::undefined())?,
-                    };
-                    let setter = match st {
-                        Some(x) => read(&mut c, x)?,
-                        None => c.constant(NanBox::undefined())?,
-                    };
-                    c.ops.push(Op::PrivateDefineAccessor {
-                        obj: this,
-                        key,
-                        getter,
-                        setter,
-                    });
-                    continue;
-                }
-            };
-            // `[k] = function () {}` names the function after the computed key
-            // (SetFunctionName in the definition).
-            if let (FieldKey::Hidden(_), Some(e)) = (&fd.key, fd.init)
-                && is_anonymous_fn_def(e)
-            {
-                let v = c.expr(e)?;
-                let this = c.this_reg;
-                c.ops.push(Op::DefineMethod {
-                    obj: this,
-                    key,
-                    func: v,
-                    kind: 4,
-                });
-                continue;
-            }
-            let v = match (&fd.key, fd.init) {
-                (FieldKey::Static(k), Some(e)) => c.named_field_value(e, k)?,
-                (_, Some(e)) => c.expr(e)?,
-                (_, None) => c.constant(NanBox::undefined())?,
-            };
-            let this = c.this_reg;
-            c.ops.push(Op::DefineData {
-                obj: this,
-                key,
-                src: v,
-                attrs: 7,
-            });
-        }
+        c.emit_field_defs(field_defs)?;
         // In `main`, materialize one canonical closure per top-level function
         // declaration so referencing it as a value has a stable identity (and can
         // hold assigned properties). Calls still dispatch directly by id.
@@ -13272,7 +13220,13 @@ struct DynFn<'a> {
     is_async: bool,
     is_generator: bool,
     rest_from: Option<usize>,
+    field_defs: &'a [FieldDef<'a>],
+    class_ctor: bool,
 }
+
+/// The hidden binding marking a class field initializer (a direct eval in
+/// it, or in an arrow inside it, may not contain `arguments`).
+const FIELD_INIT_NAME: &str = "\0fieldinit";
 
 impl Compiler {
     /// Compiles a function that uses dynamic scoping (see [`Compiler::dyn_fn`]):
@@ -13292,6 +13246,8 @@ impl Compiler {
             is_async,
             is_generator,
             rest_from,
+            field_defs,
+            class_ctor,
         } = f;
         let c = &mut self;
         let strict = c.strict;
@@ -13537,6 +13493,13 @@ impl Compiler {
                 }
             }
         }
+        // A class field initializer: the fields, defined on `this`.
+        if !field_defs.is_empty() {
+            let mark = c.bind_hidden_cell(FIELD_INIT_NAME, true, false)?;
+            let t = c.constant(NanBox::boolean(true))?;
+            c.write_var(mark, t);
+            c.emit_field_defs(field_defs)?;
+        }
         // A script's top-level functions: one canonical closure each, stored
         // into the global bindings the host hoisted.
         if is_main {
@@ -13597,12 +13560,116 @@ impl Compiler {
             ops: core::mem::take(&mut c.ops),
             name: alloc::string::String::new(),
             legacy: !strict && !is_arrow && !is_async && !is_main && !is_generator,
-            class_ctor: false,
+            class_ctor,
             derived: false,
             is_generator,
             source_span: None,
             source: None,
         })
+    }
+
+    /// A class field-initializer function's body: defines each field (and
+    /// private method/accessor) on `this`.
+    fn emit_field_defs(&mut self, field_defs: &[FieldDef<'_>]) -> Result<(), CompileError> {
+        for fd in field_defs {
+            let read = |c: &mut Compiler, n: &str| -> Result<Reg, CompileError> {
+                let b = c
+                    .lookup(n)
+                    .ok_or(CompileError::Unsupported("class field key"))?;
+                Ok(c.read_var(b))
+            };
+            let this = self.this_reg;
+            let key = match &fd.key {
+                FieldKey::Static(k) => self.constant_str(k),
+                FieldKey::Hidden(n) => read(self, n)?,
+                FieldKey::Private(n) => {
+                    let key = read(self, n)?;
+                    let v = match fd.init {
+                        // `#f = function () {}` names the function `#f`.
+                        Some(e) => {
+                            let nm = alloc::format!("#{}", n.trim_start_matches("\0#"));
+                            self.named_field_value(e, &nm)?
+                        }
+                        None => self.constant(NanBox::undefined())?,
+                    };
+                    self.ops.push(Op::PrivateDefine {
+                        obj: this,
+                        key,
+                        src: v,
+                    });
+                    continue;
+                }
+                FieldKey::PrivateMethod(n, f) => {
+                    let key = read(self, n)?;
+                    let src = read(self, f)?;
+                    self.ops.push(Op::PrivateDefine {
+                        obj: this,
+                        key,
+                        src,
+                    });
+                    continue;
+                }
+                FieldKey::PrivateAccessor(n, g, st) => {
+                    let key = read(self, n)?;
+                    let getter = match g {
+                        Some(g) => read(self, g)?,
+                        None => self.constant(NanBox::undefined())?,
+                    };
+                    let setter = match st {
+                        Some(x) => read(self, x)?,
+                        None => self.constant(NanBox::undefined())?,
+                    };
+                    self.ops.push(Op::PrivateDefineAccessor {
+                        obj: this,
+                        key,
+                        getter,
+                        setter,
+                    });
+                    continue;
+                }
+            };
+            // `[k] = function () {}` names the function after the computed key
+            // (SetFunctionName in the definition).
+            if let (FieldKey::Hidden(_), Some(e)) = (&fd.key, fd.init)
+                && is_anonymous_fn_def(e)
+            {
+                let v = self.expr(e)?;
+                let this = self.this_reg;
+                self.ops.push(Op::DefineMethod {
+                    obj: this,
+                    key,
+                    func: v,
+                    kind: 4,
+                });
+                continue;
+            }
+            let v = match (&fd.key, fd.init) {
+                (FieldKey::Static(k), Some(e)) => self.named_field_value(e, k)?,
+                (_, Some(e)) => self.expr(e)?,
+                (_, None) => self.constant(NanBox::undefined())?,
+            };
+            let this = self.this_reg;
+            self.ops.push(Op::DefineData {
+                obj: this,
+                key,
+                src: v,
+                attrs: 7,
+            });
+        }
+        Ok(())
+    }
+
+    /// The hidden bindings (`\0#name`) of every private name in scope.
+    fn visible_private_bindings(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for scope in self.scopes.iter().rev() {
+            for k in scope.keys() {
+                if k.starts_with("\0#") && !out.contains(k) {
+                    out.push(k.clone());
+                }
+            }
+        }
+        out
     }
 
     /// Whether names that are not bound in registers resolve through a host
@@ -13795,13 +13862,33 @@ impl Compiler {
         if self.eval_params.is_some() {
             flags |= 4;
         }
-        self.env_op(
-            EK_EVAL,
-            dst,
-            alloc::vec![env, var_env, f, this, args, this_v, nt],
-            &names,
-            flags,
-        );
+        let mut regs = alloc::vec![env, var_env, f, this, args, this_v, nt];
+        if let Some(hb) = self.lookup(HOME_NAME) {
+            regs.push(self.read_var(hb));
+            flags |= 8;
+        }
+        if self.lookup(FIELD_INIT_NAME).is_some() {
+            flags |= 16;
+        }
+        // The private names in scope (their keys follow the home object), for
+        // the eval code's `#name`s.
+        let privates = self.visible_private_bindings();
+        let mut names = names;
+        if !privates.is_empty() {
+            flags |= 32;
+            names.push('\u{1}');
+            let mut first = true;
+            for p in &privates {
+                let b = self.lookup(p).expect("a visible private binding");
+                regs.push(self.read_var(b));
+                if !first {
+                    names.push('\n');
+                }
+                first = false;
+                names.push_str(p.trim_start_matches("\0#"));
+            }
+        }
+        self.env_op(EK_EVAL, dst, regs, &names, flags);
         Ok(dst)
     }
 
@@ -15105,6 +15192,13 @@ impl Compiler {
                 // Handler entry: the thrown value is in `catch_reg`.
                 self.patch(push);
                 if let Some(catch) = handler {
+                    // The catch block's own completion value replaces the try's.
+                    if let Some(c) = self.completion {
+                        self.ops.push(Op::LoadConst {
+                            dst: c,
+                            value: NanBox::undefined(),
+                        });
+                    }
                     self.scopes.push(alloc::collections::BTreeMap::new());
                     // Dynamic scoping: the parameter lives in a `catch`
                     // environment of its own.
@@ -15267,6 +15361,14 @@ impl Compiler {
                             .scopes
                             .first()
                             .is_some_and(|s| s.contains_key(&*id.name))
+                    {
+                        continue;
+                    }
+                    // In a dynamic-scope function (or eval code) the `var` was
+                    // bound at entry (by the host for eval code).
+                    if d.init.is_none()
+                        && matches!(decl.kind, crate::ast::VarDeclKind::Var)
+                        && self.dyn_fn
                     {
                         continue;
                     }
@@ -15727,6 +15829,8 @@ impl Compiler {
                 self.scopes.pop();
                 Ok(None)
             }
+            // `debugger;` with no debugger attached does nothing.
+            Stmt::Debugger { .. } => Ok(None),
             // `with (obj) body` (only in a dynamic-scope function): the body
             // runs in an object environment nested in the current one.
             Stmt::With { object, body, .. } if self.dyn_fn => {
@@ -18095,6 +18199,7 @@ impl Compiler {
         is_arrow: bool,
     ) -> Result<Reg, CompileError> {
         let is_method = core::mem::take(&mut self.next_closure_is_method);
+        self.closure_is_method = is_method;
         let constructor =
             self.hosted && !is_arrow && !is_async && !is_method && !self.next_closure_is_generator;
         let r = self.make_closure_inner(params, body, is_async, name, is_arrow)?;
@@ -18164,6 +18269,7 @@ impl Compiler {
             free_of_nonarrow(params, body)
         };
         free.extend(extra_free);
+        let home_method = core::mem::take(&mut self.closure_is_method);
         // Dynamic scoping: a closure made where names resolve through a host
         // environment closes over that environment. A dynamic-scope closure may
         // also need — through eval code — its own name (a named expression's),
@@ -18171,13 +18277,19 @@ impl Compiler {
         if self.env_on() {
             free.insert(String::from(ENV_NAME));
         }
-        if self.hosted && uses_dynamic_scope(params, body) {
+        if self.hosted && (free.contains(DYN_EVAL) || free.contains(DYN_WITH)) {
             if self.next_closure_self_bind && !name.is_empty() {
                 free.insert(String::from(name));
             }
+            // A method's own home object, or an arrow's enclosing one.
+            if is_arrow || home_method {
+                free.insert(String::from(HOME_NAME));
+            }
+            free.extend(self.visible_private_bindings());
             if is_arrow {
                 free.insert(String::from(THIS_NAME));
                 free.insert(String::from(NT_NAME));
+                free.insert(String::from(FIELD_INIT_NAME));
             }
         }
         // A *named function expression* binds its own name inside its body (to the
@@ -18501,6 +18613,11 @@ impl Compiler {
         };
         let saved = self.alloc();
         self.ops.push(Op::Move { dst: saved, src: c });
+        // A `break`/`continue` leaving the `finally` carries its own value.
+        self.ops.push(Op::LoadConst {
+            dst: c,
+            value: NanBox::undefined(),
+        });
         self.block_stmts(stmts)?;
         self.ops.push(Op::Move { dst: c, src: saved });
         Ok(())
@@ -18919,7 +19036,9 @@ impl Compiler {
             .last_mut()
             .expect("a scope")
             .insert(String::from(HOME_NAME), hb);
+        self.closure_is_method = true;
         let r = self.make_closure_ext(spec);
+        self.closure_is_method = false;
         let scope = self.scopes.last_mut().expect("a scope");
         match saved {
             Some(b) => {
@@ -18966,6 +19085,16 @@ impl Compiler {
                 Some(n) => Some(self.bind_hidden_cell(n, true, true)?),
                 None => None,
             };
+            // Dynamic scoping: eval code in the class body sees the class's
+            // own name through a class environment.
+            if self.dyn_fn
+                && let Some(n) = &inner
+            {
+                let envb = self.ensure_env()?;
+                let env = self.read_var(envb);
+                let u = self.constant(NanBox::undefined())?;
+                self.env_op(EK_INIT, 0, alloc::vec![env, u], n, ENV_INIT_TDZ);
+            }
             let ctor_b = self.bind_hidden_cell(CTOR_NAME, true, false)?;
             let proto_b = self.bind_hidden_cell(PROTO_NAME, true, false)?;
             // A fresh private name per `#name` the body declares.
@@ -19287,6 +19416,13 @@ impl Compiler {
             }
             if let Some(b) = inner_b {
                 self.write_var(Binding { tdz: false, ..b }, f);
+                if self.dyn_fn
+                    && let Some(n) = &inner
+                    && let Some(envb) = self.scopes.last().and_then(|s| s.get(ENV_NAME)).copied()
+                {
+                    let env = self.read_var(envb);
+                    self.env_op(EK_INIT, 0, alloc::vec![env, f], n, ENV_INIT_CONST);
+                }
             }
             for st in statics {
                 // `static f = function () {}` names the function after its

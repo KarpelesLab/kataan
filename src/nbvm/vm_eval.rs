@@ -37,6 +37,11 @@ pub(crate) const EVAL_NEW_TARGET: u8 = 2;
 /// `(function anonymous(…) {…})` wrapper; the body returns the function
 /// (named `anonymous`, with no binding of that name in its body).
 pub(crate) const EVAL_DYN_FN: u8 = 4;
+/// [`compile_eval_code`] flag: a home object (`super`) is captured, after
+/// `new.target`.
+pub(crate) const EVAL_HOME: u8 = 8;
+/// [`compile_eval_code`] flag: the eval is in a class field initializer.
+pub(crate) const EVAL_FIELD_INIT: u8 = 16;
 
 /// Compiles eval code `program` (strict or sloppy as the host decided).
 /// Functions it defines are appended to `table` (their ids follow the
@@ -50,10 +55,11 @@ pub(crate) fn compile_eval_code(
     table: &mut Vec<FnProto>,
     strict: bool,
     flags: u8,
+    privates: &[&str],
 ) -> Result<FnProto, CompileError> {
     let base = table.len();
     let protos = alloc::rc::Rc::new(core::cell::RefCell::new(core::mem::take(table)));
-    let r = compile_eval_body(program, &protos, strict, flags);
+    let r = compile_eval_body(program, &protos, strict, flags, privates);
     *table = alloc::rc::Rc::try_unwrap(protos)
         .expect("unique proto table")
         .into_inner();
@@ -70,6 +76,7 @@ fn compile_eval_body(
     protos: &alloc::rc::Rc<core::cell::RefCell<Vec<FnProto>>>,
     strict: bool,
     flags: u8,
+    privates: &[&str],
 ) -> Result<FnProto, CompileError> {
     let body = &program.body;
     let strict = strict || super::body_starts_strict(body);
@@ -83,15 +90,25 @@ fn compile_eval_body(
         ..Compiler::default()
     };
     c.scopes.push(alloc::collections::BTreeMap::new());
-    let mut names: Vec<&str> = alloc::vec![ENV_NAME, VARENV_NAME, THIS_NAME];
+    let mut names: Vec<String> = [ENV_NAME, VARENV_NAME, THIS_NAME]
+        .iter()
+        .map(|n| String::from(*n))
+        .collect();
     if flags & EVAL_NEW_TARGET != 0 {
-        names.push(NT_NAME);
+        names.push(String::from(NT_NAME));
     }
+    if flags & EVAL_HOME != 0 {
+        names.push(String::from(super::HOME_NAME));
+    }
+    if flags & EVAL_FIELD_INIT != 0 {
+        names.push(String::from(super::FIELD_INIT_NAME));
+    }
+    names.extend(privates.iter().map(|n| super::private_binding(n)));
     let cap_regs: Vec<_> = names.iter().map(|_| c.alloc()).collect();
     c.this_reg = c.alloc();
     for (j, n) in names.iter().enumerate() {
         c.scopes[0].insert(
-            String::from(*n),
+            n.clone(),
             Binding {
                 reg: cap_regs[j],
                 cell: true,
