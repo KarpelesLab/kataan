@@ -487,6 +487,14 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*src)
         }
         Op::InitGlobal { src, .. } => reg(*src),
+        Op::ImportMeta { dst, .. } => reg(*dst),
+        Op::DynImport {
+            dst, spec, opts, ..
+        } => {
+            reg(*dst)?;
+            reg(*spec)?;
+            opts.map_or(Ok(()), reg)
+        }
         Op::GlobalExists { dst, .. } | Op::MakeArguments { dst, .. } => reg(*dst),
         Op::InitFnPrototype { f } | Op::BindThis { this: f } => reg(*f),
         Op::ToKey { dst, src } => {
@@ -1487,6 +1495,26 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_bool(exc.is_some(), out);
             w_reg(exc.unwrap_or(0), out);
         }
+        Op::ImportMeta { dst, module } => {
+            w_u8(140, out);
+            w_reg(*dst, out);
+            w_u32(*module, out);
+        }
+        Op::DynImport {
+            dst,
+            spec,
+            opts,
+            module,
+            phase,
+        } => {
+            w_u8(141, out);
+            w_reg(*dst, out);
+            w_reg(*spec, out);
+            w_bool(opts.is_some(), out);
+            w_reg(opts.unwrap_or(0), out);
+            w_u32(*module, out);
+            w_u8(*phase, out);
+        }
         Op::AnnexBGlobal {
             name,
             start,
@@ -2154,6 +2182,21 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             state: r.reg()?,
             dst: r.reg()?,
             done: r.reg()?,
+        },
+        140 => Op::ImportMeta {
+            dst: r.reg()?,
+            module: r.u32()?,
+        },
+        141 => Op::DynImport {
+            dst: r.reg()?,
+            spec: r.reg()?,
+            opts: {
+                let has = r.boolean()?;
+                let reg = r.reg()?;
+                has.then_some(reg)
+            },
+            module: r.u32()?,
+            phase: r.u8()?,
         },
         122 => Op::DisposeResources {
             stack: r.reg()?,

@@ -9668,10 +9668,18 @@ impl crate::nbvm::VmHost for Interp<'_> {
     }
 
     fn read_global(&mut self, name: &str) -> Result<NanBox, crate::nbvm::HostError> {
+        #[cfg(all(feature = "module", feature = "std"))]
+        if let Some((m, n)) = crate::nbvm::split_module_name(name) {
+            return self.vm_module_read(m, n).map_err(exec_to_host);
+        }
         self.read_ident_ref(name).map_err(exec_to_host)
     }
 
     fn typeof_global(&mut self, name: &str) -> Result<&'static str, crate::nbvm::HostError> {
+        #[cfg(all(feature = "module", feature = "std"))]
+        if let Some((m, n)) = crate::nbvm::split_module_name(name) {
+            return self.vm_module_typeof(m, n);
+        }
         // Mirrors the `typeof` identifier shortcut in `eval`: an unresolvable
         // name is "undefined", never a ReferenceError.
         if self.current.get(name).is_none()
@@ -9697,6 +9705,10 @@ impl crate::nbvm::VmHost for Interp<'_> {
         value: NanBox,
         strict: bool,
     ) -> Result<(), crate::nbvm::HostError> {
+        #[cfg(all(feature = "module", feature = "std"))]
+        if let Some((m, n)) = crate::nbvm::split_module_name(name) {
+            return self.vm_module_write(m, n, value).map_err(exec_to_host);
+        }
         let saved = core::mem::replace(&mut self.strict, strict);
         let r = self.assign_to_name(name, value);
         self.strict = saved;
@@ -9709,6 +9721,12 @@ impl crate::nbvm::VmHost for Interp<'_> {
         value: NanBox,
         konst: bool,
     ) -> Result<(), crate::nbvm::HostError> {
+        #[cfg(all(feature = "module", feature = "std"))]
+        if let Some((m, n)) = crate::nbvm::split_module_name(name) {
+            return self
+                .vm_module_init(m, n, value, konst)
+                .map_err(exec_to_host);
+        }
         if konst {
             self.global_scope.declare_const(name, value);
         } else {
@@ -9785,6 +9803,10 @@ impl crate::nbvm::VmHost for Interp<'_> {
     }
 
     fn global_exists(&mut self, name: &str) -> bool {
+        #[cfg(all(feature = "module", feature = "std"))]
+        if let Some((m, n)) = crate::nbvm::split_module_name(name) {
+            return self.vm_module_exists(m, n);
+        }
         self.current.get(name).is_some()
             || self.with_binding(name).is_some()
             || self.global_object_provides(name)
@@ -10362,6 +10384,7 @@ impl crate::nbvm::VmHost for Interp<'_> {
     }
 
     fn delete_global(&mut self, name: &str) -> bool {
+        // Module code is strict: `delete identifier` is an early error there.
         self.delete_identifier(name).0
     }
 
@@ -10412,7 +10435,33 @@ impl crate::nbvm::VmHost for Interp<'_> {
         &mut self,
         table: Option<alloc::rc::Rc<[crate::nbvm::FnProto]>>,
     ) -> Option<alloc::rc::Rc<[crate::nbvm::FnProto]>> {
+        // Modules a dynamic `import()` compiled mid-run extend the table.
+        #[cfg(all(feature = "module", feature = "std"))]
+        let table = self.modules.prefer_module_table(table);
         core::mem::replace(&mut self.vm_table, table)
+    }
+
+    #[cfg(all(feature = "module", feature = "std"))]
+    fn for_in_keys(&mut self, obj: NanBox) -> Result<NanBox, crate::nbvm::HostError> {
+        self.vm_for_in_keys(obj).map_err(exec_to_host)
+    }
+
+    #[cfg(all(feature = "module", feature = "std"))]
+    fn import_meta(&mut self, module: u32) -> Result<NanBox, crate::nbvm::HostError> {
+        self.vm_import_meta(module)
+            .ok_or(crate::nbvm::HostError::Fault)
+    }
+
+    #[cfg(all(feature = "module", feature = "std"))]
+    fn dynamic_import(
+        &mut self,
+        module: u32,
+        spec: NanBox,
+        opts: Option<NanBox>,
+        phase: u8,
+    ) -> Result<NanBox, crate::nbvm::HostError> {
+        self.vm_dynamic_import(module, spec, opts, phase)
+            .map_err(exec_to_host)
     }
 }
 

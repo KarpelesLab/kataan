@@ -35,6 +35,11 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+#[cfg(all(feature = "std", feature = "module"))]
+mod vm_module;
+#[cfg(all(feature = "std", feature = "module"))]
+pub use vm_module::{ModuleProtos, compile_module_into, split_module_name};
+
 /// A register index.
 pub type Reg = u16;
 
@@ -399,6 +404,18 @@ pub enum Op {
     /// Initializes the hoisted global lexical binding `name` (a top-level
     /// `let`/`const`/`class`), ending its temporal dead zone.
     InitGlobal { name: String, src: Reg, konst: bool },
+    /// `dst = import.meta` of VM module `module` (see [`VmHost::import_meta`]).
+    ImportMeta { dst: Reg, module: u32 },
+    /// `dst = import(spec, opts)` (`phase` 0), `import.defer(spec)` (1) or
+    /// `import.source(spec)` (2) from VM module `module`, or from script code
+    /// when `module` is [`SCRIPT_REFERRER`] (see [`VmHost::dynamic_import`]).
+    DynImport {
+        dst: Reg,
+        spec: Reg,
+        opts: Option<Reg>,
+        module: u32,
+        phase: u8,
+    },
     /// `dst = new ctor(...args)` for a constructor that is not a class this
     /// program compiled — a built-in, another script's function — through the
     /// host's `[[Construct]]` (hosted runs only).
@@ -1148,7 +1165,43 @@ pub trait VmHost {
         &mut self,
         table: Option<alloc::rc::Rc<[FnProto]>>,
     ) -> Option<alloc::rc::Rc<[FnProto]>>;
+    /// `import.meta` of the VM module `module` (an index the host assigned
+    /// when it compiled the module — see `compile_module_into`).
+    ///
+    /// # Errors
+    /// A host fault (no such module, or no module support).
+    fn import_meta(&mut self, _module: u32) -> Result<NanBox, HostError> {
+        Err(HostError::Fault)
+    }
+    /// `ImportCall` from step 5 on, the specifier and options already
+    /// evaluated: the promise of the requested module's namespace. `module` is
+    /// the referrer (a VM module index, or [`SCRIPT_REFERRER`]); `phase` 0 is
+    /// `import()`, 1 `import.defer()`, 2 `import.source()`.
+    ///
+    /// # Errors
+    /// A host fault (no module support).
+    fn dynamic_import(
+        &mut self,
+        _module: u32,
+        _spec: NanBox,
+        _opts: Option<NanBox>,
+        _phase: u8,
+    ) -> Result<NanBox, HostError> {
+        Err(HostError::Fault)
+    }
+    /// The `for-in` keys of an object only the host models (see
+    /// [`Realm::is_host_exotic`]), as an array of strings.
+    ///
+    /// # Errors
+    /// The enumeration's throw (a namespace binding in its temporal dead
+    /// zone), or a host fault.
+    fn for_in_keys(&mut self, _obj: NanBox) -> Result<NanBox, HostError> {
+        Err(HostError::Fault)
+    }
 }
+
+/// The [`Op::DynImport`] referrer of script (non-module) code.
+pub const SCRIPT_REFERRER: u32 = u32::MAX;
 
 /// Calls the VM function value `f` for the host (a VM callback a built-in
 /// invokes), running it in a nested VM context over the host's realm.
@@ -1225,6 +1278,7 @@ fn read_needs_host(ctx: &Ctx, recv: NanBox) -> bool {
             ctx.realm.is_string_handle(h)
                 || ctx.realm.proxy_at(h).is_some()
                 || ctx.realm.typed_len(h).is_some()
+                || ctx.realm.is_host_exotic(h)
         }
     }
 }
@@ -2710,6 +2764,17 @@ fn vm_construct(
     let Some(fh) = f.as_handle().map(Handle::from_raw) else {
         return Err(VmError::Unsupported);
     };
+    // Compiled after this run's table was captured (see `call_closure`).
+    if ctx.host.is_some()
+        && ctx
+            .realm
+            .vm_function(fh)
+            .is_some_and(|(id, _)| id as usize >= funcs.len())
+    {
+        return with_host(ctx, |h| h.construct_with_target(f, args, new_target))
+            .unwrap_or(Err(HostError::Fault))
+            .map_err(VmError::from);
+    }
     if ctx.realm.get_property(fh, VM_CTOR).is_none() {
         let e = vm_error(ctx, "TypeError", "not a constructor");
         return Err(VmError::Thrown(e));
@@ -6419,6 +6484,26 @@ fn run_frame_at(
                     None => return Err(VmError::Unsupported),
                 }
             }
+            Op::ImportMeta { dst, module } => match with_host(ctx, |h| h.import_meta(*module)) {
+                Some(Ok(v)) => regs[*dst as usize] = v,
+                Some(Err(e)) => handle_throw!(VmError::from(e)),
+                None => return Err(VmError::Unsupported),
+            },
+            Op::DynImport {
+                dst,
+                spec,
+                opts,
+                module,
+                phase,
+            } => {
+                let s = regs[*spec as usize];
+                let o = opts.map(|r| regs[r as usize]);
+                match with_host(ctx, |h| h.dynamic_import(*module, s, o, *phase)) {
+                    Some(Ok(v)) => regs[*dst as usize] = v,
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
+            }
             #[cfg(feature = "std")]
             Op::BitNot { dst, a } => {
                 if let Some(r) = host_unary(ctx, crate::ast::UnaryOp::BitNot, regs[*a as usize]) {
@@ -6669,6 +6754,15 @@ fn run_frame_at(
             }
             Op::EnumKeys { dst, obj } => {
                 let h = object_handle(regs[*obj as usize])?;
+                if ctx.host.is_some() && ctx.realm.is_host_exotic(h) {
+                    let o = regs[*obj as usize];
+                    match with_host(ctx, |host| host.for_in_keys(o)) {
+                        Some(Ok(keys)) => regs[*dst as usize] = keys,
+                        Some(Err(e)) => handle_throw!(VmError::from(e)),
+                        None => return Err(VmError::Unsupported),
+                    }
+                    continue;
+                }
                 let mut seen = alloc::collections::BTreeSet::new();
                 let mut out = Vec::new();
                 // An array leads with its integer indices (a VM closure's backing
@@ -7885,6 +7979,13 @@ fn call_closure(
         .vm_function(fh)
         .map(|(f, c)| (f as usize, c.to_vec()))
         .ok_or(VmError::NotAnObject)?;
+    // A function compiled after this run's table was captured (a module that
+    // a dynamic `import()` loaded mid-run): the host holds the grown table.
+    if id >= funcs.len() && ctx.host.is_some() {
+        return with_host(ctx, |h| h.call(closure, this_val, args))
+            .unwrap_or(Err(HostError::Fault))
+            .map_err(VmError::from);
+    }
     ctx.pending_callee = Some(closure);
     call_with(ctx, funcs, id, args, &caps, this_val)
 }
@@ -9585,6 +9686,9 @@ pub fn execute_typed_interruptible(
     // Run inside an interpreter (`ROADMAP.md` §2.0), as the multi-script entry
     // does: one realm, one global environment, one console.
     let mut interp = crate::nbexec::Interp::new_with_limits(limits);
+    // Modules a dynamic `import()` loads run on the VM too.
+    #[cfg(all(feature = "std", feature = "module"))]
+    interp.enable_vm_modules();
     interp.realm_mut().interrupt = interrupt.clone();
     if let Err(e) = interp.prepare_script_for_vm(&program) {
         return Err(crate::nbexec::thrown_from_exec_error(
@@ -9676,6 +9780,9 @@ pub fn execute_scripts_typed(
     // body runs.
     let table: alloc::rc::Rc<[FnProto]> = table.into();
     let mut interp = crate::nbexec::Interp::new_with_limits(limits);
+    // Modules a dynamic `import()` loads run on the VM too.
+    #[cfg(all(feature = "std", feature = "module"))]
+    interp.enable_vm_modules();
     let mut completion = String::new();
     for (program, main) in programs.iter().zip(&mains) {
         if let Err(e) = interp.prepare_script_for_vm(program) {
@@ -9751,8 +9858,9 @@ fn vm_fallback(reason: &str) -> crate::nbexec::Thrown {
 
 /// Loads, links, and evaluates the ES-module graph rooted at the resolved
 /// `entry_key` through `host`, returning `(console_output, completion_string)`
-/// or a structured [`Thrown`](crate::nbexec::Thrown). Modules run on the
-/// reference tree-walker (the bytecode tier has no module support yet); this is
+/// or a structured [`Thrown`](crate::nbexec::Thrown). Module code runs on the
+/// bytecode VM inside the interpreter's module loader (falling back to the
+/// tree-walker for what the VM cannot compile); this is
 /// the entry the Test262 runner uses for `flags: [module]` tests.
 ///
 /// # Errors
@@ -9763,10 +9871,7 @@ pub fn execute_module_typed(
     host: &dyn crate::nbexec::module::ModuleHost,
     limits: crate::limits::Limits,
 ) -> Result<(String, String), crate::nbexec::Thrown> {
-    if vm_pure() {
-        return Err(vm_fallback("module: tree-walker"));
-    }
-    crate::nbexec::module::eval_module_typed(entry_key, host, limits)
+    vm_module::execute_module_entry(entry_key, host, None, limits)
 }
 
 /// Like [`execute_module_typed`] but with a flattened error message (for the CLI
@@ -9780,7 +9885,13 @@ pub fn execute_module(
     host: &dyn crate::nbexec::module::ModuleHost,
     limits: crate::limits::Limits,
 ) -> Result<(String, String), String> {
-    crate::nbexec::module::eval_module(entry_key, host, limits)
+    execute_module_typed(entry_key, host, limits).map_err(|t| {
+        if t.message.is_empty() {
+            t.name
+        } else {
+            alloc::format!("{}: {}", t.name, t.message)
+        }
+    })
 }
 
 /// Evaluates `prelude` (script) into the realm global, then runs the module
@@ -9796,10 +9907,7 @@ pub fn execute_module_typed_with_prelude(
     prelude: &str,
     limits: crate::limits::Limits,
 ) -> Result<(String, String), crate::nbexec::Thrown> {
-    if vm_pure() {
-        return Err(vm_fallback("module: tree-walker"));
-    }
-    crate::nbexec::module::eval_module_typed_with_prelude(entry_key, host, prelude, limits)
+    vm_module::execute_module_entry(entry_key, host, Some(prelude), limits)
 }
 
 /// Runs `source` as an ordinary **script** but sets a base path so a dynamic
@@ -9816,10 +9924,7 @@ pub fn execute_script_typed_with_import_base(
     base_path: &str,
     limits: crate::limits::Limits,
 ) -> Result<(String, String), crate::nbexec::Thrown> {
-    if vm_pure() {
-        return Err(vm_fallback("module: tree-walker"));
-    }
-    crate::nbexec::module::eval_script_typed_with_import_base(source, base_path, limits)
+    vm_module::execute_script_with_import_base(source, base_path, limits)
 }
 
 /// Whether `program` references the dynamic-code intrinsics `eval` or `Function`
@@ -10773,6 +10878,93 @@ fn is_anonymous_fn_def(e: &Expr) -> bool {
         Expr::Arrow(_) => true,
         Expr::Class(c) => c.id.is_none(),
         _ => false,
+    }
+}
+
+/// The module binding an anonymous `export default` initializes (the module
+/// loader's `DEFAULT_LOCAL`); a function bound to it is named `"default"`.
+const MODULE_DEFAULT_SLOT: &str = "*default*";
+
+/// `import.<prop>` — the parser spells the meta-properties and the
+/// `import.defer`/`import.source` callees as a member of the reserved name
+/// `import` (no binding can have that name).
+fn import_member(e: &Expr) -> Option<&str> {
+    let Expr::Member {
+        object,
+        property: PropertyKey::Ident(p),
+        ..
+    } = e
+    else {
+        return None;
+    };
+    matches!(&**object, Expr::Ident(id) if &*id.name == "import").then_some(&**p)
+}
+
+/// `import.meta`, or a dynamic `import(…)` / `import.defer(…)` /
+/// `import.source(…)` call (see `Compiler::import_form`).
+fn is_import_form(e: &Expr) -> bool {
+    match e {
+        Expr::Member { .. } => import_member(e) == Some("meta"),
+        Expr::Call { callee, .. } => {
+            matches!(&**callee, Expr::Ident(id) if &*id.name == "import")
+                || matches!(import_member(callee), Some("defer" | "source"))
+        }
+        _ => false,
+    }
+}
+
+impl Compiler {
+    /// Compiles an [`is_import_form`] expression: `import.meta` reads the
+    /// module's meta object, a dynamic import evaluates its arguments in order
+    /// and asks the host for the namespace promise. The referrer module is
+    /// stamped in later (`vm_module::compile_module_into`); script code keeps
+    /// [`SCRIPT_REFERRER`].
+    fn import_form(&mut self, e: &Expr) -> Result<Reg, CompileError> {
+        let Expr::Call {
+            callee, arguments, ..
+        } = e
+        else {
+            let dst = self.alloc();
+            self.ops.push(Op::ImportMeta {
+                dst,
+                module: SCRIPT_REFERRER,
+            });
+            return Ok(dst);
+        };
+        let phase = match import_member(callee) {
+            Some("defer") => 1,
+            Some("source") => 2,
+            _ => 0,
+        };
+        let mut regs = Vec::with_capacity(arguments.len());
+        for a in arguments {
+            let crate::ast::Argument::Item(x) = a else {
+                return Err(CompileError::Unsupported("spread in import()"));
+            };
+            // A copy, so a later argument cannot rebind an earlier one's value.
+            let v = self.expr(x)?;
+            let r = self.alloc();
+            self.ops.push(Op::Move { dst: r, src: v });
+            regs.push(r);
+        }
+        let spec = match regs.first() {
+            Some(r) => *r,
+            None => self.constant(NanBox::undefined())?,
+        };
+        let opts = if phase == 0 {
+            regs.get(1).copied()
+        } else {
+            None
+        };
+        let dst = self.alloc();
+        self.ops.push(Op::DynImport {
+            dst,
+            spec,
+            opts,
+            module: SCRIPT_REFERRER,
+            phase,
+        });
+        Ok(dst)
     }
 }
 
@@ -13772,7 +13964,9 @@ impl Compiler {
                 optional,
                 ..
             } if !*optional => {
-                if !self.try_emit_tail_call(callee, arguments)? {
+                if (self.hosted && is_import_form(e))
+                    || !self.try_emit_tail_call(callee, arguments)?
+                {
                     let src = self.expr(e)?;
                     self.ops.push(Op::Return { src });
                 }
@@ -13967,6 +14161,11 @@ impl Compiler {
 
     fn expr(&mut self, expr: &Expr) -> Result<Reg, CompileError> {
         match expr {
+            // `import(…)`, `import.defer/source(…)`, `import.meta` (the parser
+            // spells them through the reserved name `import`).
+            Expr::Call { .. } | Expr::Member { .. } if self.hosted && is_import_form(expr) => {
+                self.import_form(expr)
+            }
             Expr::Number { value, .. } => self.constant(NanBox::number(*value)),
             Expr::Bool { value, .. } => self.constant(NanBox::boolean(*value)),
             Expr::Null(_) => self.constant(NanBox::null()),
@@ -15555,6 +15754,18 @@ impl Compiler {
     /// (NamedEvaluation: `const f = () => {}` ⇒ `f.name === "f"`).
     fn expr_named(&mut self, e: &Expr, target: &BindingTarget) -> Result<Reg, CompileError> {
         if let BindingTarget::Ident(id) = target {
+            // `export default <anonymous function>` binds the module's
+            // `*default*` slot but is named "default" (NamedEvaluation).
+            let renamed;
+            let id = if &*id.name == MODULE_DEFAULT_SLOT {
+                renamed = Ident {
+                    name: "default".into(),
+                    span: id.span,
+                };
+                &renamed
+            } else {
+                id
+            };
             match e {
                 Expr::Class(c) if self.hosted && c.id.is_none() => {
                     return self.class_value(c, &id.name);

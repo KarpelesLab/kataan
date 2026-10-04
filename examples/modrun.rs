@@ -10,7 +10,27 @@ use std::path::Path;
 
 const HOST_PRELUDE: &str = r#"
 var print = function () { var s = ''; for (var i = 0; i < arguments.length; i++) { if (i) s += ' '; s += arguments[i]; } console.log(s); };
-var $262 = { global: this, gc: function () {}, evalScript: function (src) { return eval(src); }, detachArrayBuffer: function (b) { return $262_detachArrayBuffer(b); }, createRealm: function () { throw new TypeError('no'); }, IsHTMLDDA: undefined };
+var $262 = {
+  global: this,
+  gc: function () {},
+  evalScript: function (src) { return $262_evalScript(src); },
+  detachArrayBuffer: function (b) { return $262_detachArrayBuffer(b); },
+  createRealm: function () { return $262_createRealm(); },
+  AbstractModuleSource: $262_AbstractModuleSource(),
+  IsHTMLDDA: $262_IsHTMLDDA(),
+  agent: {
+    start: function (src) { return $262_agent_start(src); },
+    broadcast: function (sab) { return $262_agent_broadcast(sab); },
+    safeBroadcast: function (ta) { return $262_agent_broadcast(ta.buffer); },
+    getReport: function () { return $262_agent_getReport(); },
+    getReportAsync: function () { return $262_agent_getReportAsync(); },
+    report: function (m) { return $262_agent_report(m); },
+    receiveBroadcast: function (f) { return $262_agent_receiveBroadcast(f); },
+    leaving: function () {},
+    sleep: function (ms) { return $262_agent_sleep(ms); },
+    monotonicNow: function () { return $262_agent_monotonicNow(); }
+  }
+};
 "#;
 
 fn main() {

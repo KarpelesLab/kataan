@@ -134,6 +134,10 @@ pub struct Realm {
     /// and instead becomes *out of bounds* when the buffer can no longer hold it.
     /// Non-GC-root: a stale entry for a dead handle is harmless.
     length_tracking_views: alloc::collections::BTreeSet<u64>,
+    /// Objects whose properties only the host models (module namespace exotic
+    /// objects): a hosted VM run sends every property access on them to the
+    /// host. Never pruned — such an object lives as long as its module record.
+    host_exotic: alloc::collections::BTreeSet<u64>,
     /// Handles of arrays whose `length` property was made non-writable
     /// (`Object.defineProperty(arr, "length", {writable:false})`). An array's
     /// `length` is writable by default; this records the explicit demotion so the
@@ -522,6 +526,7 @@ impl Realm {
             aux_props: alloc::collections::BTreeMap::new(),
             fn_source: alloc::collections::BTreeMap::new(),
             length_tracking_views: alloc::collections::BTreeSet::new(),
+            host_exotic: alloc::collections::BTreeSet::new(),
             frozen_arrays: alloc::collections::BTreeSet::new(),
             sealed_arrays: alloc::collections::BTreeSet::new(),
             non_extensible_arrays: alloc::collections::BTreeSet::new(),
@@ -775,6 +780,19 @@ impl Realm {
     /// with no explicit length over a resizable buffer).
     pub fn mark_length_tracking(&mut self, handle: Handle) {
         self.length_tracking_views.insert(handle.to_raw());
+    }
+
+    /// Marks `handle` as an object whose properties only the host models (see
+    /// [`Realm::is_host_exotic`]).
+    pub fn mark_host_exotic(&mut self, handle: Handle) {
+        self.host_exotic.insert(handle.to_raw());
+    }
+
+    /// Whether every property access on `handle` must go to the host (a module
+    /// namespace exotic object).
+    #[must_use]
+    pub fn is_host_exotic(&self, handle: Handle) -> bool {
+        !self.host_exotic.is_empty() && self.host_exotic.contains(&handle.to_raw())
     }
 
     /// Whether the typed-array view at `handle` auto-tracks its buffer's length.

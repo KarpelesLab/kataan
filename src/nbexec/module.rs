@@ -442,6 +442,12 @@ struct ModuleRecord {
     /// `[[TopLevelCapability]]` — the promise `Evaluate()` handed out (only ever
     /// set on a cycle root, or on a module whose evaluation failed outright).
     top_level_capability: Option<crate::heap::Handle>,
+    /// The module's code on the bytecode VM: its VM module index and function
+    /// table entries (see `crate::nbvm::compile_module_into`); `None` runs it
+    /// on the tree-walker.
+    vm: Option<(u32, crate::nbvm::ModuleProtos)>,
+    /// Whether compiling for the VM was already attempted.
+    vm_tried: bool,
 }
 
 /// The set of loaded modules, keyed by resolved key, plus the active host.
@@ -455,7 +461,26 @@ pub struct ModuleRegistry {
     /// with another `Evaluate` in the same agent, so a dynamic `import()` reached
     /// from a module body must defer its own link/evaluate to a job.
     evaluating_depth: u32,
+    /// Module code runs on the bytecode VM (`ROADMAP.md` §2.0) — set by the
+    /// VM entry points.
+    vm_enabled: bool,
+    /// VM module index → module key.
+    vm_keys: Vec<String>,
+    /// VM module index → the module's environment and import aliases, set at
+    /// link time (what a VM environment access resolves against).
+    vm_envs: Vec<Option<VmEnv>>,
+    /// The function table holding every VM-compiled module (and the code
+    /// compiled before them); it only grows.
+    vm_table: Option<Rc<[crate::nbvm::FnProto]>>,
+    /// Why the first module the VM refused runs on the tree-walker.
+    vm_note: Option<String>,
+    /// A VM fault happened where it could not propagate (see
+    /// `Interp::vm_module_faulted`).
+    vm_fault: bool,
 }
+
+/// A VM module's environment: its scope and its import alias table.
+type VmEnv = (Scope, Rc<BTreeMap<String, (Scope, String)>>);
 
 impl ModuleRegistry {
     /// Whether no module has been loaded into this registry — the GC safepoint's
@@ -469,6 +494,25 @@ impl ModuleRegistry {
             records: BTreeMap::new(),
             async_order_counter: 0,
             evaluating_depth: 0,
+            vm_enabled: false,
+            vm_keys: Vec::new(),
+            vm_envs: Vec::new(),
+            vm_table: None,
+            vm_note: None,
+            vm_fault: false,
+        }
+    }
+
+    /// The table a VM run should install: `table`, unless the module table
+    /// has outgrown it (a dynamic `import()` compiled modules mid-run) — every
+    /// table of one interpreter is a prefix of the next.
+    pub(crate) fn prefer_module_table(
+        &self,
+        table: Option<Rc<[crate::nbvm::FnProto]>>,
+    ) -> Option<Rc<[crate::nbvm::FnProto]>> {
+        match (table, &self.vm_table) {
+            (Some(t), Some(m)) if m.len() > t.len() => Some(Rc::clone(m)),
+            (t, _) => t,
         }
     }
 }
@@ -722,6 +766,8 @@ impl<'a> Interp<'a> {
             cycle_root: None,
             async_parents: Vec::new(),
             top_level_capability: None,
+            vm: None,
+            vm_tried: true,
         }
     }
 
@@ -905,6 +951,8 @@ impl<'a> Interp<'a> {
             cycle_root: None,
             async_parents: Vec::new(),
             top_level_capability: None,
+            vm: None,
+            vm_tried: false,
         })
     }
 
@@ -919,6 +967,9 @@ impl<'a> Interp<'a> {
             // Already linked/evaluated (or a cycle's back-edge): nothing to do.
             _ => return Ok(()),
         }
+        // Compile what the loader just added (this module and its graph) for
+        // the VM, before any of it is instantiated.
+        self.vm_compile_pending();
         // Allocate this module's scope and mark Linked *before* recursing so an
         // import cycle terminates.
         let scope = self.global_scope.child();
@@ -1045,8 +1096,12 @@ impl<'a> Interp<'a> {
             // Tag the module's top-level scope with its imports so a function
             // defined here restores the right aliases when it runs (even when
             // called from another module) — see `Scope::module_imports`.
-            r.scope.set_module_imports(aliases);
+            r.scope.set_module_imports(aliases.clone());
             r.scope.set_module_meta(meta);
+            if let Some((index, _)) = r.vm {
+                let env = Some((r.scope.clone(), aliases));
+                self.modules.vm_envs[index as usize] = env;
+            }
         }
         // Instantiate this module's top-level function declarations into its
         // scope *now*, at link time (the spec's InitializeEnvironment step). A
@@ -1072,6 +1127,9 @@ impl<'a> Interp<'a> {
     /// scope as their closure environment — the link-time function instantiation
     /// that makes functions usable across import cycles.
     fn instantiate_module_functions(&mut self, key: &str) -> Result<(), ExecError> {
+        if let Some((_, protos)) = self.modules.records[key].vm {
+            return self.vm_instantiate(key, protos);
+        }
         let (scope, program) = {
             let r = &self.modules.records[key];
             (r.scope.clone(), r.program)
@@ -1466,6 +1524,10 @@ impl<'a> Interp<'a> {
     /// continuations. Returns immediately: the graph walk continues while the body
     /// is parked on its `await`.
     fn execute_async_module(&mut self, key: &str) {
+        if let Some((_, protos)) = self.modules.records[key].vm {
+            self.vm_execute_async_module(key, protos);
+            return;
+        }
         let (promise, id, controller) = self.start_module_coroutine(key);
         let state = self.new_str(key);
         let Some(state) = state.as_handle().map(crate::heap::Handle::from_raw) else {
@@ -1655,6 +1717,9 @@ impl<'a> Interp<'a> {
     }
 
     fn run_module_body_inner(&mut self, key: &str) -> Result<(), ExecError> {
+        if let Some((_, protos)) = self.modules.records[key].vm {
+            return self.vm_call_proto(protos.main).map(|_| ());
+        }
         let (scope, program, aliases) = {
             let r = &self.modules.records[key];
             (r.scope.clone(), r.program, r.import_aliases.clone())
@@ -2024,6 +2089,8 @@ impl<'a> Interp<'a> {
             .map(|(n, s, l)| (n.clone(), (s.clone(), l.clone())))
             .collect();
         self.module_namespaces.insert(obj.to_raw(), binding_map);
+        // The VM's own property access cannot see the live bindings.
+        self.realm.mark_host_exotic(obj);
         // `@@toStringTag` = "Module" (or "Deferred Module" for a deferred
         // namespace), non-enumerable, non-writable, non-configurable.
         let tag_sym = self.well_known_symbol("toStringTag");
@@ -2414,8 +2481,19 @@ impl<'a> Interp<'a> {
         spec: NanBox,
         options: Option<NanBox>,
     ) -> NanBox {
-        let promise = self.fresh_promise();
         let referrer = self.current_module_key();
+        self.dynamic_import_from(referrer, spec, options)
+    }
+
+    /// [`Self::dynamic_import_values`] with the referrer (the importing
+    /// module's key, or a script's import base) given.
+    fn dynamic_import_from(
+        &mut self,
+        referrer: Option<String>,
+        spec: NanBox,
+        options: Option<NanBox>,
+    ) -> NanBox {
+        let promise = self.fresh_promise();
         let host = FileModuleHost;
         let resolved: Result<(String, Option<String>), ExecError> = (|this: &mut Self| {
             // `ToString(specifier)` is part of the ImportCall steps, so a throwing
@@ -2823,6 +2901,9 @@ impl<'a> Interp<'a> {
         self.realm.restore_intrinsics(intrinsics);
         let saved_intl = self.realm.replace_intl_protos(child_intl);
 
+        // The module code runs in the ShadowRealm's swapped-in global state,
+        // which the VM's hosted run does not model: keep it on the tree-walker.
+        let saved_vm = core::mem::replace(&mut self.modules.vm_enabled, false);
         let outcome = (|this: &mut Self| -> Result<NanBox, ExecError> {
             // Load is the parse/resolution phase (a SyntaxError in the fixture
             // surfaces here); link wires imports; evaluate runs the body.
@@ -2856,6 +2937,7 @@ impl<'a> Interp<'a> {
                 .unwrap_or_else(NanBox::undefined))
         })(self);
 
+        self.modules.vm_enabled = saved_vm;
         self.created_realms[realm_idx].intl_protos = self.realm.replace_intl_protos(saved_intl);
         self.current = saved_current;
         self.global_scope = saved_global_scope;
@@ -2958,6 +3040,349 @@ impl<'a> Interp<'a> {
     }
 }
 
+/// Module code on the bytecode VM (`ROADMAP.md` §2.0): compilation into the
+/// growing VM function table, link-time instantiation, running the bodies, and
+/// the environment services VM module code calls back for (see
+/// `crate::nbvm::compile_module_into` for the VM side).
+impl Interp<'_> {
+    /// Runs module code on the bytecode VM from now on.
+    pub(crate) fn enable_vm_modules(&mut self) {
+        self.modules.vm_enabled = true;
+    }
+
+    /// The VM function table modules are compiled into, if any yet.
+    pub(crate) fn module_vm_table(&self) -> Option<Rc<[crate::nbvm::FnProto]>> {
+        self.modules.prefer_module_table(self.vm_table.clone())
+    }
+
+    /// Installs `table` — the previous table plus newly compiled code — as the
+    /// VM function table, for the running VM code and for later runs.
+    pub(crate) fn install_module_vm_table(&mut self, table: Rc<[crate::nbvm::FnProto]>) {
+        self.realm
+            .register_vm_fn_meta(table.iter().map(|p| (p.name.as_str(), p.length as u32)));
+        self.vm_table = Some(Rc::clone(&table));
+        self.modules.vm_table = Some(table);
+    }
+
+    /// Why a module ran on the tree-walker instead of the VM (the first one).
+    pub(crate) fn vm_module_note(&self) -> Option<&str> {
+        self.modules.vm_note.as_deref()
+    }
+
+    /// Whether a VM fault happened where it could not propagate (an async
+    /// module body): the entry must not trust the run.
+    pub(crate) fn vm_module_faulted(&self) -> bool {
+        self.modules.vm_fault
+    }
+
+    /// Compiles every loaded JavaScript module not yet tried for the VM. A
+    /// module the VM refuses keeps running on the tree-walker (its functions
+    /// are interpreter closures; the two tiers interoperate through the host).
+    fn vm_compile_pending(&mut self) {
+        if !self.modules.vm_enabled {
+            return;
+        }
+        let pending: Vec<String> = self
+            .modules
+            .records
+            .values()
+            .filter(|r| {
+                !r.vm_tried
+                    && matches!(r.kind, ModuleKind::JavaScript)
+                    && matches!(r.status, Status::New | Status::Loaded)
+            })
+            .map(|r| r.key.clone())
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let mut table: Vec<crate::nbvm::FnProto> = self
+            .module_vm_table()
+            .map(|t| t.to_vec())
+            .unwrap_or_default();
+        for key in pending {
+            let index = self.modules.vm_keys.len() as u32;
+            self.modules.vm_keys.push(key.clone());
+            self.modules.vm_envs.push(None);
+            let Some(r) = self.modules.records.get_mut(&key) else {
+                continue;
+            };
+            r.vm_tried = true;
+            match crate::nbvm::compile_module_into(r.program, index, r.has_tla, &mut table) {
+                Ok(protos) => r.vm = Some((index, protos)),
+                Err(e) => {
+                    if self.modules.vm_note.is_none() {
+                        self.modules.vm_note = Some(alloc::format!("module compile: {e:?}"));
+                    }
+                }
+            }
+        }
+        self.install_module_vm_table(table.into());
+    }
+
+    /// `InitializeEnvironment` for a VM module: `var` bindings start
+    /// `undefined`, lexical ones (and an anonymous default's `*default*`) in
+    /// their temporal dead zone, and the init function binds the top-level
+    /// function declarations.
+    fn vm_instantiate(
+        &mut self,
+        key: &str,
+        protos: crate::nbvm::ModuleProtos,
+    ) -> Result<(), ExecError> {
+        let (scope, program) = {
+            let r = &self.modules.records[key];
+            (r.scope.clone(), r.program)
+        };
+        let mut vars = Vec::new();
+        super::collect_var_names(&program.body, &mut vars);
+        for name in vars {
+            if !scope.has_local(name) {
+                scope.declare(name, NanBox::undefined());
+            }
+        }
+        for stmt in &program.body {
+            let inner = match stmt {
+                Stmt::Export(
+                    ExportDecl::Decl { declaration, .. } | ExportDecl::Default { declaration, .. },
+                ) => &**declaration,
+                other => other,
+            };
+            let lexical = match inner {
+                Stmt::Var(d) => matches!(
+                    d.kind,
+                    crate::ast::VarDeclKind::Let | crate::ast::VarDeclKind::Const
+                ),
+                Stmt::Class(c) => c.id.is_some(),
+                _ => false,
+            };
+            let mut names = if lexical {
+                declared_names(inner)
+            } else {
+                Vec::new()
+            };
+            if matches!(stmt, Stmt::Export(ExportDecl::Default { .. }))
+                && decl_name(inner).is_none()
+            {
+                names.push(DEFAULT_LOCAL.to_string());
+            }
+            for name in names {
+                if !scope.has_local(&name) {
+                    scope.declare(&name, NanBox::tdz());
+                }
+            }
+        }
+        self.vm_call_proto(protos.init).map(|_| ())
+    }
+
+    /// Calls the VM function-table entry `id` (a module body or init function)
+    /// with `this` undefined.
+    fn vm_call_proto(&mut self, id: u32) -> Result<NanBox, ExecError> {
+        let f = self.realm.new_vm_function(id, Vec::new());
+        self.call_with_this(NanBox::handle(f.to_raw()), NanBox::undefined(), &[])
+    }
+
+    /// `ExecuteAsyncModule` for a VM module: its body is an async function, so
+    /// the call runs the first synchronous burst and returns the evaluation
+    /// promise the loader's continuations chain on.
+    fn vm_execute_async_module(&mut self, key: &str, protos: crate::nbvm::ModuleProtos) {
+        let promise = match self.vm_call_proto(protos.main) {
+            Ok(p) => p,
+            Err(ExecError::Throw(v)) => {
+                self.async_module_execution_rejected(key, v);
+                return;
+            }
+            Err(other) => {
+                // A VM fault has no JS value: record it so the entry falls
+                // back, and fail the module so nothing waits on it.
+                self.modules.vm_note = Some(alloc::format!("module runtime: {other:?}"));
+                self.modules.vm_fault = true;
+                let m = self.new_str("bytecode VM fault");
+                let err = self.make_error(super::N_TYPE_ERROR, Some(m));
+                self.async_module_execution_rejected(key, err);
+                return;
+            }
+        };
+        let Some(promise) = promise.as_handle().map(crate::heap::Handle::from_raw) else {
+            return;
+        };
+        let state = self.new_str(key);
+        let Some(state) = state.as_handle().map(crate::heap::Handle::from_raw) else {
+            return;
+        };
+        let on_f = self
+            .realm
+            .new_bound_native(super::N_MODULE_FULFILLED, state);
+        let on_r = self.realm.new_bound_native(super::N_MODULE_REJECTED, state);
+        self.register_then(
+            promise,
+            NanBox::handle(on_f.to_raw()),
+            NanBox::handle(on_r.to_raw()),
+            false,
+        );
+    }
+
+    /// Runs `f` with VM module `index`'s environment as the current one (its
+    /// scope, its import aliases, strict mode) — how the host resolves a
+    /// module-environment name of VM code. `None` for an unknown module.
+    fn in_vm_module<R>(&mut self, index: u32, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        let (scope, aliases) = self.modules.vm_envs.get(index as usize)?.clone()?;
+        let saved_current = core::mem::replace(&mut self.current, scope);
+        let saved_imports = core::mem::replace(&mut self.module_imports, aliases);
+        let saved_strict = core::mem::replace(&mut self.strict, true);
+        let r = f(self);
+        self.current = saved_current;
+        self.module_imports = saved_imports;
+        self.strict = saved_strict;
+        Some(r)
+    }
+
+    /// The fault for an environment access of an unknown VM module.
+    fn no_vm_module() -> ExecError {
+        ExecError::Unsupported("unknown VM module")
+    }
+
+    /// `GetValue` of `name` in VM module `index`'s environment.
+    pub(crate) fn vm_module_read(&mut self, index: u32, name: &str) -> Result<NanBox, ExecError> {
+        self.in_vm_module(index, |this| this.read_ident_ref(name))
+            .unwrap_or_else(|| Err(Self::no_vm_module()))
+    }
+
+    /// `typeof name` in VM module `index`'s environment: an import is always
+    /// resolvable (and may be in its temporal dead zone).
+    pub(crate) fn vm_module_typeof(
+        &mut self,
+        index: u32,
+        name: &str,
+    ) -> Result<&'static str, crate::nbvm::HostError> {
+        self.in_vm_module(index, |this| {
+            if this.module_imports.contains_key(name) {
+                let v = this.read_ident_ref(name).map_err(super::exec_to_host)?;
+                let t = this
+                    .unary(crate::ast::UnaryOp::Typeof, v)
+                    .map_err(super::exec_to_host)?;
+                let t = this.realm.to_display_string(t);
+                return Ok(super::TYPEOF_NAMES
+                    .iter()
+                    .copied()
+                    .find(|n| *n == t)
+                    .unwrap_or("object"));
+            }
+            crate::nbvm::VmHost::typeof_global(this, name)
+        })
+        .unwrap_or(Err(crate::nbvm::HostError::Fault))
+    }
+
+    /// `PutValue` of `name` in VM module `index`'s environment (module code is
+    /// strict; an import is an immutable binding).
+    pub(crate) fn vm_module_write(
+        &mut self,
+        index: u32,
+        name: &str,
+        value: NanBox,
+    ) -> Result<(), ExecError> {
+        self.in_vm_module(index, |this| {
+            if this.module_imports.contains_key(name) {
+                let m = this.new_str("Assignment to constant variable.");
+                return Err(ExecError::Throw(
+                    this.make_error(super::N_TYPE_ERROR, Some(m)),
+                ));
+            }
+            this.assign_to_name(name, value)
+        })
+        .unwrap_or_else(|| Err(Self::no_vm_module()))
+    }
+
+    /// Initializes the module binding `name` (a top-level `let`/`const`/
+    /// `class`, or a function the init function made).
+    pub(crate) fn vm_module_init(
+        &mut self,
+        index: u32,
+        name: &str,
+        value: NanBox,
+        konst: bool,
+    ) -> Result<(), ExecError> {
+        let Some(Some((scope, _))) = self.modules.vm_envs.get(index as usize) else {
+            return Err(Self::no_vm_module());
+        };
+        if konst {
+            scope.declare_const(name, value);
+        } else {
+            scope.declare(name, value);
+        }
+        Ok(())
+    }
+
+    /// Whether `name` resolves in VM module `index`'s environment.
+    pub(crate) fn vm_module_exists(&mut self, index: u32, name: &str) -> bool {
+        self.in_vm_module(index, |this| {
+            this.module_imports.contains_key(name) || crate::nbvm::VmHost::global_exists(this, name)
+        })
+        .unwrap_or(false)
+    }
+
+    /// `for-in` over a module namespace from VM code: a binding in its
+    /// temporal dead zone throws before any key is produced.
+    pub(crate) fn vm_for_in_keys(&mut self, obj: NanBox) -> Result<NanBox, ExecError> {
+        if let Some(raw) = obj.as_handle() {
+            self.namespace_enumeration_tdz(crate::heap::Handle::from_raw(raw))?;
+        }
+        let keys = self.iterate_keys(obj);
+        Ok(NanBox::handle(self.realm.new_array(keys).to_raw()))
+    }
+
+    /// `import.meta` of VM module `index`.
+    pub(crate) fn vm_import_meta(&mut self, index: u32) -> Option<NanBox> {
+        let key = self.modules.vm_keys.get(index as usize)?.clone();
+        Some(self.module_meta(&key))
+    }
+
+    /// A dynamic import from VM code (see `crate::nbvm::VmHost::dynamic_import`).
+    pub(crate) fn vm_dynamic_import(
+        &mut self,
+        index: u32,
+        spec: NanBox,
+        options: Option<NanBox>,
+        phase: u8,
+    ) -> Result<NanBox, ExecError> {
+        let referrer = match self.modules.vm_keys.get(index as usize) {
+            Some(k) => Some(k.clone()),
+            None => self.current_module_key(),
+        };
+        match phase {
+            0 => Ok(self.dynamic_import_from(referrer, spec, options)),
+            1 => {
+                let promise = self.fresh_promise();
+                let host = FileModuleHost;
+                let resolved: Result<String, ExecError> = (|this: &mut Self| {
+                    let spec_str = this.coerce_to_string(spec)?;
+                    host.resolve(&spec_str, referrer.as_deref())
+                        .map_err(|e| this.type_error(&e))
+                })(self);
+                match resolved {
+                    Ok(dep) => self.start_dynamic_import_deferred(&dep, promise),
+                    Err(e) => self.reject_dynamic_import(promise, e),
+                }
+                Ok(NanBox::handle(promise.to_raw()))
+            }
+            _ => {
+                // `import.source(x)`: ToString the specifier (a throw rejects
+                // with it), then reject with a SyntaxError, as the tree-walker.
+                let p = self.fresh_promise();
+                let rejection = match self.coerce_to_string(spec) {
+                    Ok(_) => {
+                        let m = self.new_str("source-phase / deferred import is not supported");
+                        self.make_error(N_SYNTAX_ERROR, Some(m))
+                    }
+                    Err(ExecError::Throw(t)) => t,
+                    Err(other) => return Err(other),
+                };
+                self.settle(p, rejection, false);
+                Ok(NanBox::handle(p.to_raw()))
+            }
+        }
+    }
+}
+
 /// The ambient module-evaluation state saved while an async module coroutine
 /// runs (restored after each `async_step`). See
 /// [`Interp::enter_module_context_for_controller`].
@@ -2975,13 +3400,99 @@ pub(crate) struct ModuleContextSave {
 /// declaration (`export const x = await f()`), which is otherwise opaque to the
 /// statement walker.
 fn module_body_has_await(stmts: &[Stmt]) -> bool {
-    stmts.iter().any(|s| match s {
-        Stmt::Export(ExportDecl::Decl { declaration, .. })
-        | Stmt::Export(ExportDecl::Default { declaration, .. }) => {
-            super::generator::stmt_has_await(declaration)
+    stmts.iter().any(stmt_has_tla)
+}
+
+/// [`super::generator::stmt_has_await`], extended to the places that walker
+/// leaves to its eager path but that still make a module asynchronous
+/// (`[[HasTLA]]`): binding-pattern defaults (`let { x = await y } = …`, a
+/// `catch` parameter, a `for` head) and a class heritage (`class C extends
+/// f(await x)`).
+fn stmt_has_tla(s: &Stmt) -> bool {
+    use crate::ast::{ForInit, ForLeft};
+    let any = |b: &[Stmt]| b.iter().any(stmt_has_tla);
+    super::generator::stmt_has_await(s)
+        || match s {
+            Stmt::Export(ExportDecl::Decl { declaration, .. })
+            | Stmt::Export(ExportDecl::Default { declaration, .. }) => stmt_has_tla(declaration),
+            Stmt::Class(c) => c.super_class.as_deref().is_some_and(expr_awaits),
+            Stmt::Expr { expression, .. } => expr_has_tla(expression),
+            Stmt::Var(d) => d
+                .declarations
+                .iter()
+                .any(|x| pattern_has_tla(&x.target) || x.init.as_ref().is_some_and(expr_has_tla)),
+            Stmt::Block { body, .. } => any(body),
+            Stmt::If {
+                consequent,
+                alternate,
+                ..
+            } => stmt_has_tla(consequent) || alternate.as_deref().is_some_and(stmt_has_tla),
+            Stmt::For { init, body, .. } => {
+                matches!(init, Some(ForInit::Var(d)) if d.declarations.iter().any(|x| pattern_has_tla(&x.target)))
+                    || stmt_has_tla(body)
+            }
+            Stmt::ForIn { left, body, .. } | Stmt::ForOf { left, body, .. } => {
+                matches!(left, ForLeft::Decl { target, .. } if pattern_has_tla(target))
+                    || stmt_has_tla(body)
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => stmt_has_tla(body),
+            Stmt::Labeled { body, .. } | Stmt::With { body, .. } => stmt_has_tla(body),
+            Stmt::Switch { cases, .. } => cases.iter().any(|c| any(&c.body)),
+            Stmt::Try {
+                block,
+                handler,
+                finalizer,
+                ..
+            } => {
+                any(block)
+                    || handler.as_ref().is_some_and(|h| {
+                        h.param.as_ref().is_some_and(pattern_has_tla) || any(&h.body)
+                    })
+                    || finalizer.as_deref().is_some_and(any)
+            }
+            _ => false,
         }
-        other => super::generator::stmt_has_await(other),
-    })
+}
+
+/// What [`stmt_has_tla`] adds for an expression: a class expression's
+/// heritage.
+fn expr_has_tla(e: &crate::ast::Expr) -> bool {
+    match e {
+        crate::ast::Expr::Class(c) => c.super_class.as_deref().is_some_and(expr_awaits),
+        _ => false,
+    }
+}
+
+/// Whether evaluating `e` may `await` (per [`stmt_has_tla`]).
+fn expr_awaits(e: &crate::ast::Expr) -> bool {
+    let s = Stmt::Expr {
+        expression: alloc::boxed::Box::new(e.clone()),
+        span: crate::common::Span::point(0),
+    };
+    super::generator::stmt_has_await(&s) || expr_has_tla(e)
+}
+
+/// Whether a binding pattern's defaults or computed keys hold an `await`.
+fn pattern_has_tla(t: &crate::ast::BindingTarget) -> bool {
+    use crate::ast::{ArrayPatternElement, BindingTarget, PropertyKey};
+    let has = expr_awaits;
+    match t {
+        BindingTarget::Ident(_) => false,
+        BindingTarget::Array(p) => p.elements.iter().any(|el| match el {
+            ArrayPatternElement::Hole => false,
+            ArrayPatternElement::Item {
+                target, default, ..
+            } => pattern_has_tla(target) || default.as_ref().is_some_and(has),
+            ArrayPatternElement::Rest { target, .. } => pattern_has_tla(target),
+        }),
+        BindingTarget::Object(p) => {
+            p.properties.iter().any(|prop| {
+                matches!(&prop.key, PropertyKey::Computed(k) if has(k))
+                    || pattern_has_tla(&prop.value)
+                    || prop.default.as_ref().is_some_and(has)
+            }) || p.rest.as_deref().is_some_and(pattern_has_tla)
+        }
+    }
 }
 
 /// What kind of slot an import binding maps to.
