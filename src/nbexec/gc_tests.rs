@@ -2,6 +2,10 @@
 //! VM's safepoints root its frames; the interpreter's state is rooted by
 //! [`gc`](super::gc)).
 //!
+//! Stress the same programs with a tiny pinned trigger and use-after-free
+//! detection: `KATAAN_GC_THRESHOLD=256 KATAAN_GC_VERIFY=panic cargo test
+//! --release --lib nbexec` (any collected object used again panics).
+//!
 //! Each one builds a deliberately awkward live set — a reference cycle, a
 //! `WeakMap` value reachable only through a live key, a suspended generator, a
 //! pending promise chain, an in-flight `for-of` iterator, a `try`/`finally`
@@ -29,6 +33,19 @@ fn run_with_live(src: &str) -> (String, usize) {
     (text, interp.realm().object_count())
 }
 
+/// Whether `KATAAN_GC_VERIFY` is on: swept objects are then kept (to catch a
+/// later use), so live counts say nothing about reclamation.
+fn verifying() -> bool {
+    #[cfg(feature = "std")]
+    {
+        std::env::var_os("KATAAN_GC_VERIFY").is_some()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        false
+    }
+}
+
 /// Enough top-level allocation to cross the collector's trigger many times over,
 /// so every test below really collects rather than merely not crashing.
 const CHURN: &str = "for (var _i = 0; _i < 400000; _i++) { var _t = { k: _i }; }";
@@ -40,7 +57,7 @@ fn top_level_churn_is_reclaimed_not_retained() {
     // The collector triggers every ~65k allocations (`GC_MIN_THRESHOLD`), so at
     // most that much garbage is live at the end — never the 400k the loop made.
     assert!(
-        live < 100_000,
+        verifying() || live < 100_000,
         "top-level garbage was retained: {live} live objects"
     );
 }
@@ -240,5 +257,66 @@ fn regexp_and_string_state_survive() {
              m[1] + '/' + RegExp.$2 + '/' + re.exec(subject)[1]"
         )),
         "alice/example/bob"
+    );
+}
+
+// --- collection inside function bodies (published VM frames) ---
+
+/// The same churn as [`CHURN`], inside a function body: the VM collects at
+/// safepoints below the outermost frame when every frame on the way down
+/// published its registers (an ordinary JS-to-JS call does).
+const FN_CHURN: &str =
+    "function churn() { for (var i = 0; i < 400000; i++) { var t = { k: i }; } return 'churned'; }";
+
+#[test]
+fn churn_inside_a_function_body_is_reclaimed() {
+    let (v, live) = run_with_live(&format!(
+        "{FN_CHURN}
+         function outer() {{ return churn(); }}
+         outer()"
+    ));
+    assert_eq!(v, "churned");
+    assert!(
+        verifying() || live < 100_000,
+        "garbage made inside a function body was retained: {live} live objects"
+    );
+}
+
+#[test]
+fn caller_frames_keep_their_registers_across_a_collection() {
+    // `held` lives only in `outer`'s register window (and a closure's captured
+    // cell) while `churn` collects underneath it.
+    assert_eq!(
+        run(&format!(
+            "{FN_CHURN}
+             function outer() {{
+               var held = {{ deep: {{ v: 'reg' }} }};
+               var cell = {{ v: 'cell' }};
+               var get = function () {{ return cell.v; }};
+               var r = churn();
+               return held.deep.v + '/' + get() + '/' + r;
+             }}
+             outer()"
+        )),
+        "reg/cell/churned"
+    );
+}
+
+#[test]
+fn a_suspended_vm_generator_frame_survives_collections_in_a_function() {
+    // The generator's suspended registers live in its hidden state array; the
+    // collection runs inside a function called between two resumptions.
+    assert_eq!(
+        run(&format!(
+            "{FN_CHURN}
+             function* g() {{ var held = {{ v: 'held' }}; yield 1; yield held.v; }}
+             function drive() {{
+               var it = g(); it.next();
+               churn();
+               return it.next().value;
+             }}
+             drive()"
+        )),
+        "held"
     );
 }
