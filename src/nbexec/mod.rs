@@ -9819,7 +9819,7 @@ impl crate::nbvm::VmHost for Interp<'_> {
 
     fn get_member(&mut self, recv: NanBox, key: NanBox) -> Result<NanBox, crate::nbvm::HostError> {
         let target = match recv.as_handle().map(Handle::from_raw) {
-            Some(h) if !self.realm.is_string_handle(h) => h,
+            Some(h) if !self.realm.is_string_handle(h) && self.realm.symbol_at(h).is_none() => h,
             _ => {
                 if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
                     let m = self.new_str("Cannot read properties of null or undefined");
@@ -9831,11 +9831,19 @@ impl crate::nbvm::VmHost for Interp<'_> {
                     Some(b) => Handle::from_raw(b),
                     None => return Err(crate::nbvm::HostError::Fault),
                 };
-                // A non-string primitive: `[[Get]]` on its wrapper with the
-                // primitive itself as the receiver (a getter's `this`).
-                if recv.as_handle().is_none() {
-                    let key = self.vm_object_key(key).map_err(exec_to_host)?;
-                    let name = self.member_key(key);
+                // A primitive: `[[Get]]` on its wrapper with the primitive
+                // itself as the receiver (a getter's `this`) — except a
+                // string's own `length` / index properties.
+                let key = self.vm_object_key(key).map_err(exec_to_host)?;
+                let name = self.member_key(key);
+                let string_own = recv
+                    .as_handle()
+                    .is_some_and(|h| self.realm.is_string_handle(Handle::from_raw(h)))
+                    && (name == "length"
+                        || name
+                            .parse::<u32>()
+                            .is_ok_and(|n| alloc::format!("{n}") == name));
+                if !string_own {
                     return self
                         .get_with_receiver(wrapper, &name, recv)
                         .map_err(exec_to_host);
@@ -9854,6 +9862,12 @@ impl crate::nbvm::VmHost for Interp<'_> {
     fn get_iterator(&mut self, v: NanBox) -> Result<(NanBox, NanBox), crate::nbvm::HostError> {
         self.require_iterator_method(v).map_err(exec_to_host)?;
         let it = self.get_iter_object(v).map_err(exec_to_host)?;
+        // GetIteratorFromMethod: the iterator must be an Object (a string or
+        // symbol `@@iterator` result is a TypeError).
+        if !self.is_object_value(NanBox::handle(it.to_raw())) {
+            let e = self.type_error("[Symbol.iterator] did not return an object");
+            return Err(exec_to_host(e));
+        }
         let next = self.read_member(it, "next").map_err(exec_to_host)?;
         Ok((NanBox::handle(it.to_raw()), next))
     }

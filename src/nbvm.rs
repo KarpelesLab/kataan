@@ -1511,7 +1511,12 @@ fn vm_set_prop_mode(
                 .is_some_and(|h| ctx.realm.array_elements(Handle::from_raw(h)).is_some()))
         || recv
             .as_handle()
-            .is_some_and(|h| !plain_write_ok(ctx.realm, Handle::from_raw(h), key));
+            .is_some_and(|h| !plain_write_ok(ctx.realm, Handle::from_raw(h), key))
+        // Replacing a method of %Array.prototype% / %Function.prototype% must be
+        // recorded (the host's by-name built-in dispatch consults it).
+        || recv
+            .as_handle()
+            .is_some_and(|h| ctx.realm.is_dispatch_tracked_proto(Handle::from_raw(h)));
     if !to_host {
         match vm_set_prop(ctx, funcs, recv, key, value, cache) {
             Err(VmError::Unsupported) => {}
@@ -4477,6 +4482,14 @@ fn vm_get_prop(
                     // An exotic object on the chain (a proxy's `get` trap) is the
                     // host's to read.
                     if ctx.host.is_some() && ctx.realm.proxy_at(p).is_some() {
+                        return host_get_str(ctx, recv, key);
+                    }
+                    // So is an array's own `length` / element (its storage is
+                    // not a property slot).
+                    if ctx.host.is_some()
+                        && ctx.realm.array_length(p).is_some()
+                        && ctx.realm.has_own(p, key)
+                    {
                         return host_get_str(ctx, recv, key);
                     }
                     if let Some((getter, _)) = ctx.realm.accessor(p, key) {
@@ -15362,7 +15375,11 @@ impl Compiler {
                 self.scopes.push(alloc::collections::BTreeMap::new());
                 match init {
                     Some(ForInit::Var(decl)) => {
-                        self.stmt(&Stmt::Var(decl.clone()))?;
+                        let st = Stmt::Var(decl.clone());
+                        // A `let`/`const` head's names are in their TDZ while
+                        // the initializers run (a closure there sees them).
+                        self.prebind_block_lexicals(&[&st], &BTreeSet::new(), false)?;
+                        self.stmt(&st)?;
                     }
                     Some(ForInit::Expr(e)) => {
                         self.expr(e)?;
@@ -15372,15 +15389,18 @@ impl Compiler {
                 // A `let`/`const` head gives each iteration a fresh binding for any
                 // captured loop variable (so closures capture per-iteration values).
                 let per_iter: Vec<Binding> = match init {
-                    Some(ForInit::Var(decl)) if decl.kind != crate::ast::VarDeclKind::Var => decl
-                        .declarations
-                        .iter()
-                        .filter_map(|d| match &d.target {
-                            BindingTarget::Ident(id) => self.lookup(&id.name),
-                            _ => None,
-                        })
-                        .filter(|b| b.cell)
-                        .collect(),
+                    // (Every bound name, destructuring patterns included.)
+                    Some(ForInit::Var(decl)) if decl.kind != crate::ast::VarDeclKind::Var => {
+                        let mut names = BTreeSet::new();
+                        for d in &decl.declarations {
+                            pattern_names(&d.target, &mut names);
+                        }
+                        names
+                            .iter()
+                            .filter_map(|n| self.lookup(n))
+                            .filter(|b| b.cell)
+                            .collect()
+                    }
                     _ => Vec::new(),
                 };
                 // CreatePerIterationEnvironment also runs once before the first

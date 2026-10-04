@@ -3103,6 +3103,13 @@ impl Realm {
         !self.proto_replaced.is_empty() && self.proto_replaced.contains(key)
     }
 
+    /// Whether `handle` is a built-in prototype whose method overwrites are
+    /// recorded for by-name dispatch (see [`Self::proto_replaced`]).
+    #[must_use]
+    pub fn is_dispatch_tracked_proto(&self, handle: Handle) -> bool {
+        Some(handle) == self.array_proto_intrinsic || Some(handle) == self.function_proto_intrinsic
+    }
+
     /// Records an overwrite of an existing named property on a tracked built-in
     /// prototype.
     fn note_proto_write(&mut self, handle: Handle, key: &str, value: NanBox) {
