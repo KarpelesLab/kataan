@@ -894,6 +894,10 @@ pub struct Interp<'a> {
     /// Set while EvalDeclarationInstantiation runs for VM-compiled eval code:
     /// its function declarations are instantiated by the VM code itself.
     hoist_skip_fns: bool,
+    /// Set while GlobalDeclarationInstantiation runs for a VM script: its
+    /// top-level function bindings are created holding `undefined`, and the
+    /// script body stores each function's VM closure before any user code.
+    hoist_fn_placeholders: bool,
     /// The home object of the VM method whose direct eval is running (its
     /// eval code's `super`).
     vm_eval_home: Option<NanBox>,
@@ -3394,6 +3398,7 @@ impl<'a> Interp<'a> {
             vm_realm_guards: Vec::new(),
             vm_eval_cache: alloc::collections::BTreeMap::new(),
             hoist_skip_fns: false,
+            hoist_fn_placeholders: false,
             vm_eval_home: None,
             vm_eval_privates: Vec::new(),
             vm_eval_derived: None,
@@ -6144,7 +6149,12 @@ impl<'a> Interp<'a> {
         #[cfg(all(feature = "std", feature = "module"))]
         self.enable_vm_modules();
         self.prepare_script_for_vm(program)?;
-        crate::nbvm::run_program_hosted(self, &table, main as usize, &[]).map_err(vm_to_exec)
+        let r =
+            crate::nbvm::run_program_hosted(self, &table, main as usize, &[]).map_err(vm_to_exec);
+        // Every function user code can obtain is a VM function: nothing runs
+        // on the tree-walker.
+        debug_assert_eq!(self.tree_walked(), 0, "a VM run tree-walked user code");
+        r
     }
 
     /// The function table VM code compiled into this interpreter lives in (a
@@ -7121,14 +7131,19 @@ impl<'a> Interp<'a> {
                 if module_top_level || (hoist_vars && self.hoist_skip_fns) {
                     continue;
                 }
-                let value = self.make_function(
-                    &func.params,
-                    Body::Block(&func.body),
-                    func.is_async,
-                    func.is_generator,
-                );
-                self.set_fn_name(value, &id.name);
-                self.set_fn_source(value, func.span);
+                let value = if hoist_vars && self.hoist_fn_placeholders {
+                    NanBox::undefined()
+                } else {
+                    let value = self.make_function(
+                        &func.params,
+                        Body::Block(&func.body),
+                        func.is_async,
+                        func.is_generator,
+                    );
+                    self.set_fn_name(value, &id.name);
+                    self.set_fn_source(value, func.span);
+                    value
+                };
                 if hoist_vars {
                     let at_global_var = self.var_scope.ptr_eq(&self.global_scope);
                     let global_obj = self.global_this.as_handle().map(Handle::from_raw);
@@ -10833,9 +10848,9 @@ impl<'a> Interp<'a> {
     /// (`ROADMAP.md` §2.0): the script's `GlobalDeclarationInstantiation` —
     /// early redeclaration errors, `var`/function bindings on the global object,
     /// lexical bindings in their temporal dead zone — done by the interpreter
-    /// itself, so both tiers agree exactly. Top-level functions are hoisted as
-    /// interpreter closures here; the VM's script body replaces each with its own
-    /// closure before any user code runs.
+    /// itself. Top-level function bindings are created holding `undefined`; the
+    /// VM's script body stores each function's closure before any user code
+    /// runs.
     ///
     /// # Errors
     /// The script's early errors (a `SyntaxError` for a conflicting global
@@ -10850,7 +10865,10 @@ impl<'a> Interp<'a> {
             if self.current.ptr_eq(&self.global_scope) {
                 self.global_declaration_checks(program)?;
             }
-            self.hoist_with(&program.body, true)
+            self.hoist_fn_placeholders = true;
+            let r = self.hoist_with(&program.body, true);
+            self.hoist_fn_placeholders = false;
+            r
         })();
         self.strict = saved_strict;
         r

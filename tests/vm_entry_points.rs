@@ -177,3 +177,44 @@ fn labelled_function_declarations_run_on_the_vm() {
     assert_eq!(interp.display(v), "6");
     assert_eq!(interp.tree_walked(), 0);
 }
+
+#[test]
+fn every_function_user_code_obtains_is_a_vm_function() {
+    // One function from each way user code can make one: declarations (the
+    // script's hoisted bindings included), expressions, arrows, methods,
+    // accessors, classes, generators, async functions, `Function` and its
+    // generator/async siblings, and direct and indirect `eval`.
+    let mut interp = Interp::new();
+    let v = interp
+        .run(leak(
+            "function decl() {}\n\
+             async function* agen() {}\n\
+             class C { m() {} static s() {} get g() { return 1; } }\n\
+             var fns = [decl, agen, C, C.prototype.m, C.s,\n\
+               Object.getOwnPropertyDescriptor(C.prototype, 'g').get,\n\
+               function () {}, () => 1, function* () {}, async () => {},\n\
+               ({ m() {} }).m,\n\
+               Function('return 1'),\n\
+               Object.getPrototypeOf(function* () {}).constructor('yield 1'),\n\
+               Object.getPrototypeOf(async function () {}).constructor('await 1'),\n\
+               eval('(function () {})'), (0, eval)('(function () {})'),\n\
+               eval('function inEval() {} inEval')];\n\
+             fns",
+        ))
+        .expect("run");
+    let arr = kataan::heap::Handle::from_raw(v.as_handle().expect("array"));
+    let elems = interp
+        .realm()
+        .array_elements(arr)
+        .expect("elements")
+        .to_vec();
+    assert_eq!(elems.len(), 17);
+    for (i, f) in elems.iter().enumerate() {
+        let h = kataan::heap::Handle::from_raw(f.as_handle().expect("function"));
+        assert!(
+            interp.realm().is_vm_function_value(h),
+            "function #{i} is not a VM function"
+        );
+    }
+    assert_eq!(interp.tree_walked(), 0);
+}
