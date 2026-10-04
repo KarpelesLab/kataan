@@ -680,6 +680,13 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             }
             Ok(())
         }
+        Op::Env { dst, regs, .. } => {
+            reg(*dst)?;
+            for a in regs {
+                reg(*a)?;
+            }
+            Ok(())
+        }
         Op::YieldDelegate {
             dst,
             iter,
@@ -1552,6 +1559,20 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
                 w_reg(*r, out);
             }
         }
+        Op::Env {
+            kind,
+            dst,
+            regs,
+            name,
+            flags,
+        } => {
+            w_u8(200, out);
+            w_u8(*kind, out);
+            w_reg(*dst, out);
+            w_regs(regs, out);
+            w_str(name, out);
+            w_u8(*flags, out);
+        }
         Op::DirectEval { dst, args, strict } => {
             w_u8(116, out);
             w_reg(*dst, out);
@@ -2243,6 +2264,13 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             }
             Op::MapArguments { args, cells }
         }
+        200 => Op::Env {
+            kind: r.u8()?,
+            dst: r.reg()?,
+            regs: r.regs()?,
+            name: r.string()?,
+            flags: r.u8()?,
+        },
         116 => {
             let dst = r.reg()?;
             let n = r.u32()? as usize;

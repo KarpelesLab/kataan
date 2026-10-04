@@ -3198,6 +3198,7 @@ mod temporal_plaintime;
 mod temporal_plainyearmonth;
 mod temporal_zoneddatetime;
 mod typed_array;
+mod vm_env;
 mod wasm;
 
 /// A second global environment created by `$262.createRealm` — a genuinely
@@ -10498,6 +10499,13 @@ impl crate::nbvm::VmHost for Interp<'_> {
 
     fn new_regexp(&mut self, source: &[u8], flags: &str) -> NanBox {
         NanBox::handle(self.new_regexp_instance(source, flags).to_raw())
+    }
+
+    fn env_op(
+        &mut self,
+        req: crate::nbvm::EnvReq<'_>,
+    ) -> Result<(NanBox, NanBox), crate::nbvm::HostError> {
+        self.vm_env_op(req).map_err(exec_to_host)
     }
 
     fn set_vm_table(

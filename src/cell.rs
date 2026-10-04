@@ -280,6 +280,10 @@ pub enum Cell {
         /// The captured cells, in the order the function's compiled body expects.
         captures: Vec<NanBox>,
     },
+    /// A host lexical environment held by a bytecode-VM function that uses
+    /// dynamic scoping (a direct `eval` or `with`, `ROADMAP.md` §2.0). Never a
+    /// user-visible value: it lives only in the VM's hidden bindings.
+    Env(Scope),
     /// A built-in (native) function, identified by an id the interpreter maps to
     /// a Rust implementation.
     Native(u16),
@@ -535,6 +539,15 @@ impl Cell {
         }
     }
 
+    /// The host environment, if this cell is a VM-held [`Cell::Env`].
+    #[must_use]
+    pub fn as_env(&self) -> Option<&Scope> {
+        match self {
+            Cell::Env(env) => Some(env),
+            _ => None,
+        }
+    }
+
     /// The built-in id, if this cell is a native function.
     #[must_use]
     pub fn as_native(&self) -> Option<u16> {
@@ -646,7 +659,7 @@ impl Cell {
             | Cell::Proxy { .. } => "object",
             // An internal byte backing store, or a Temporal data carrier, is never
             // a user-visible value; it is reached only through its owning object.
-            Cell::Bytes(_) | Cell::TemporalData(_) => "object",
+            Cell::Bytes(_) | Cell::TemporalData(_) | Cell::Env(_) => "object",
         }
     }
 
@@ -717,7 +730,9 @@ impl Trace for Cell {
                 }
             }
             // A closure (or class) keeps its captured environment alive.
-            Cell::Function { env, .. } | Cell::Class { env, .. } => env.for_each_handle(visit),
+            Cell::Function { env, .. } | Cell::Class { env, .. } | Cell::Env(env) => {
+                env.for_each_handle(visit);
+            }
             // A VM closure keeps its captured cells alive.
             Cell::VmFunction { captures, .. } => {
                 for c in captures {
@@ -797,7 +812,9 @@ impl crate::gc::Relocate for Cell {
         match self {
             Cell::Object(o) => o.relocate_handles(forward),
             Cell::Array(elems) => elems.iter_mut().for_each(fwd),
-            Cell::Function { env, .. } | Cell::Class { env, .. } => env.relocate_handles(forward),
+            Cell::Function { env, .. } | Cell::Class { env, .. } | Cell::Env(env) => {
+                env.relocate_handles(forward);
+            }
             Cell::VmFunction { captures, .. } => captures.iter_mut().for_each(fwd),
             Cell::Collection { entries, index, .. } => {
                 for (k, v) in entries {

@@ -352,6 +352,15 @@ pub enum Op {
         args: Vec<Reg>,
         strict: bool,
     },
+    /// A dynamic-scoping operation through the host (`EK_*` kind; see
+    /// [`EnvReq`] and `Compiler::env_op` for each kind's operands).
+    Env {
+        kind: u8,
+        dst: Reg,
+        regs: Vec<Reg>,
+        name: String,
+        flags: u8,
+    },
     /// `dst = await src` in a hosted async function: suspends the frame until
     /// the awaited value settles.
     Await { dst: Reg, src: Reg },
@@ -1191,6 +1200,13 @@ pub trait VmHost {
     fn to_object(&mut self, v: NanBox) -> NanBox;
     /// A regular-expression literal `/source/flags`, built by the host.
     fn new_regexp(&mut self, source: &[u8], flags: &str) -> NanBox;
+    /// A dynamic-scoping operation ([`EnvReq`]): `(value, second)` — `second`
+    /// is the `this` of [`EnvReq::Callee`], else `undefined`.
+    ///
+    /// # Errors
+    /// The operation's throw (`ReferenceError`, `TypeError`, a getter's or the
+    /// eval code's throw), or a host fault.
+    fn env_op(&mut self, req: EnvReq<'_>) -> Result<(NanBox, NanBox), HostError>;
     /// Installs the running VM program's function table (returning the previous
     /// one), so VM function values handed to the host stay callable.
     fn set_vm_table(
@@ -2972,6 +2988,163 @@ fn vm_load_global(ctx: &mut Ctx, name: &str) -> Result<NanBox, VmError> {
     }
 }
 
+/// A dynamic-scoping request to the host ([`VmHost::env_op`]): a function that
+/// contains a direct `eval` or a `with` statement (`ROADMAP.md` §2.0) keeps its
+/// bindings in host environments (`Cell::Env` values held in hidden VM
+/// bindings), resolved by name at run time with the host's own semantics.
+// The variant docs describe their fields.
+#[allow(missing_docs)]
+#[derive(Clone, Copy)]
+pub enum EnvReq<'r> {
+    /// The global environment.
+    Root,
+    /// A new declarative environment nested in `parent` (a `catch` clause's
+    /// when `catch` is set).
+    Child { parent: NanBox, catch: bool },
+    /// A `with (obj)` object environment nested in `parent` (`obj` is
+    /// `ToObject`ed: `null`/`undefined` throw).
+    With { parent: NanBox, obj: NanBox },
+    /// CreatePerIterationEnvironment: a sibling of `src` holding copies of its
+    /// bindings.
+    Clone { src: NanBox },
+    /// A function body's variable environment nested in its parameter
+    /// environment `src`, seeded with copies of the parameter bindings.
+    Seed { src: NanBox },
+    /// A frame-local binding operation on `env` (`ENV_INIT_*`).
+    Init {
+        env: NanBox,
+        name: &'r str,
+        value: NanBox,
+        mode: u8,
+    },
+    /// `GetValue` of the identifier reference `name` resolved from `env`.
+    Load {
+        env: NanBox,
+        name: &'r str,
+        strict: bool,
+    },
+    /// `PutValue` of the identifier reference `name` resolved from `env`.
+    Store {
+        env: NanBox,
+        name: &'r str,
+        value: NanBox,
+        strict: bool,
+    },
+    /// `typeof name` (an unresolvable name is `"undefined"`).
+    Typeof { env: NanBox, name: &'r str },
+    /// `delete name` (sloppy code).
+    Delete { env: NanBox, name: &'r str },
+    /// A bare-identifier callee: `(function, this)` — `this` is the `with`
+    /// object that supplied it, else `undefined`.
+    Callee {
+        env: NanBox,
+        name: &'r str,
+        strict: bool,
+    },
+    /// ResolveBinding: an opaque reference to `name` for [`EnvReq::RefGet`] /
+    /// [`EnvReq::RefPut`] (a compound assignment resolves once).
+    Ref {
+        env: NanBox,
+        name: &'r str,
+        strict: bool,
+    },
+    /// `GetValue` of a reference from [`EnvReq::Ref`].
+    RefGet {
+        env: NanBox,
+        reference: NanBox,
+        name: &'r str,
+        strict: bool,
+    },
+    /// `PutValue` of a reference from [`EnvReq::Ref`].
+    RefPut {
+        env: NanBox,
+        reference: NanBox,
+        name: &'r str,
+        value: NanBox,
+        strict: bool,
+    },
+    /// `callee(...args)` spelled `eval(...)`: a direct eval in `env` (variable
+    /// environment `var_env`) when `callee` is the realm's %eval%, else an
+    /// ordinary call with `this_call`.
+    Eval {
+        env: NanBox,
+        var_env: NanBox,
+        callee: NanBox,
+        this_call: NanBox,
+        args: &'r [NanBox],
+        strict: bool,
+        this: NanBox,
+        new_target: NanBox,
+        new_target_in_scope: bool,
+        /// In a parameter list: the names the eval code may not declare as
+        /// `var`s.
+        param_names: Option<&'r [&'r str]>,
+    },
+    /// Whether `callee` is the running realm's %eval% (a direct eval).
+    IsEval { callee: NanBox },
+    /// CreateMappedArgumentsObject's parameter map over `env`: index `i` of
+    /// `args_obj` aliases the binding `names[i]`.
+    MapArgs {
+        args_obj: NanBox,
+        env: NanBox,
+        names: &'r [&'r str],
+    },
+}
+
+/// [`Op::Env`] kinds: `dst` = the global environment.
+pub(crate) const EK_ROOT: u8 = 0;
+/// `dst` = a child of `regs[0]` (`flags` 1: a `catch` environment).
+pub(crate) const EK_CHILD: u8 = 1;
+/// `dst` = a `with (regs[1])` environment nested in `regs[0]`.
+pub(crate) const EK_WITH: u8 = 2;
+/// `dst` = a per-iteration copy of `regs[0]`.
+pub(crate) const EK_CLONE: u8 = 3;
+/// `dst` = a body environment seeded from the parameter environment `regs[0]`.
+pub(crate) const EK_SEED: u8 = 4;
+/// Binds `name` in `regs[0]` to `regs[1]` (`flags` = an `ENV_INIT_*` mode).
+pub(crate) const EK_INIT: u8 = 5;
+/// `dst` = the value of `name` from `regs[0]` (`flags` 1: strict).
+pub(crate) const EK_LOAD: u8 = 6;
+/// Assigns `regs[1]` to `name` from `regs[0]`.
+pub(crate) const EK_STORE: u8 = 7;
+/// `dst` = `typeof name` from `regs[0]`.
+pub(crate) const EK_TYPEOF: u8 = 8;
+/// `dst` = `delete name` from `regs[0]`.
+pub(crate) const EK_DELETE: u8 = 9;
+/// `dst` = the callee `name` from `regs[0]`, `regs[1]` = its `this`.
+pub(crate) const EK_CALLEE: u8 = 10;
+/// `dst` = a reference to `name` from `regs[0]`.
+pub(crate) const EK_REF: u8 = 11;
+/// `dst` = `GetValue` of the reference `regs[1]` (environment `regs[0]`).
+pub(crate) const EK_REF_GET: u8 = 12;
+/// `PutValue(regs[1], regs[2])` (environment `regs[0]`).
+pub(crate) const EK_REF_PUT: u8 = 13;
+/// `dst` = `eval(...)`: `regs` = `[env, var_env, callee, this_call, args array,
+/// this, new.target]`; `flags` bit 0 strict, bit 1 `new.target` in scope, bit 2
+/// in a parameter list (`name` = the parameter names joined by `\n`).
+pub(crate) const EK_EVAL: u8 = 14;
+/// Maps the arguments object `regs[0]` over `regs[1]`'s parameter bindings,
+/// `name` = the parameter names joined by `\n`.
+pub(crate) const EK_MAP_ARGS: u8 = 15;
+/// `dst` = whether `regs[0]` is the running realm's %eval%.
+pub(crate) const EK_IS_EVAL: u8 = 16;
+
+/// [`EnvReq::Init`] modes.
+pub const ENV_INIT_LET: u8 = 0;
+/// Initializes a `const` binding.
+pub const ENV_INIT_CONST: u8 = 1;
+/// Creates an uninitialized (TDZ) binding.
+pub const ENV_INIT_TDZ: u8 = 2;
+/// Creates an uninitialized binding of a function body's top-level lexical
+/// declaration (recorded for EvalDeclarationInstantiation).
+pub const ENV_INIT_TDZ_LEXICAL: u8 = 3;
+/// A hoisted `var`: `undefined` unless the frame already binds the name.
+pub const ENV_INIT_VAR: u8 = 4;
+/// A named function expression's own name (a soft immutable binding).
+pub const ENV_INIT_SOFT_CONST: u8 = 5;
+/// Marks an existing binding `const`.
+pub const ENV_INIT_MARK_CONST: u8 = 6;
+
 /// Why a delegated host operation did not produce a value.
 #[derive(Debug)]
 pub enum HostError {
@@ -4191,6 +4364,10 @@ fn vm_get_prop(
                 && let Some((src, flags)) = ctx.realm.regexp_at(handle)
             {
                 match key {
+                    // EscapeRegExpPattern (line terminators, `/`) is the host's.
+                    "source" if ctx.host.is_some() => {
+                        return host_get_str(ctx, NanBox::handle(handle.to_raw()), "source");
+                    }
                     "source" => {
                         let s = ctx.realm.new_string(&src);
                         result = NanBox::handle(s.to_raw());
@@ -6115,6 +6292,129 @@ fn run_frame_at(
                     None => return Err(VmError::Unsupported),
                 }
             }
+            Op::Env {
+                kind,
+                dst,
+                regs: rs,
+                name,
+                flags,
+            } => {
+                let r = |i: usize| regs[rs[i] as usize];
+                let strict = *flags & 1 != 0;
+                let argv: Vec<NanBox> = if *kind == EK_EVAL {
+                    spread_argv(ctx, r(4))?
+                } else {
+                    Vec::new()
+                };
+                let names: Vec<&str> =
+                    if *kind == EK_MAP_ARGS || (*kind == EK_EVAL && *flags & 4 != 0) {
+                        name.split('\n').filter(|n| !n.is_empty()).collect()
+                    } else {
+                        Vec::new()
+                    };
+                let req = match *kind {
+                    EK_ROOT => EnvReq::Root,
+                    EK_CHILD => EnvReq::Child {
+                        parent: r(0),
+                        catch: *flags & 1 != 0,
+                    },
+                    EK_WITH => EnvReq::With {
+                        parent: r(0),
+                        obj: r(1),
+                    },
+                    EK_CLONE => EnvReq::Clone { src: r(0) },
+                    EK_SEED => EnvReq::Seed { src: r(0) },
+                    EK_INIT => EnvReq::Init {
+                        env: r(0),
+                        name,
+                        value: r(1),
+                        mode: *flags,
+                    },
+                    EK_LOAD => EnvReq::Load {
+                        env: r(0),
+                        name,
+                        strict,
+                    },
+                    EK_STORE => EnvReq::Store {
+                        env: r(0),
+                        name,
+                        value: r(1),
+                        strict,
+                    },
+                    EK_TYPEOF => EnvReq::Typeof { env: r(0), name },
+                    EK_DELETE => EnvReq::Delete { env: r(0), name },
+                    EK_CALLEE => EnvReq::Callee {
+                        env: r(0),
+                        name,
+                        strict,
+                    },
+                    EK_REF => EnvReq::Ref {
+                        env: r(0),
+                        name,
+                        strict,
+                    },
+                    EK_REF_GET => EnvReq::RefGet {
+                        env: r(0),
+                        reference: r(1),
+                        name,
+                        strict,
+                    },
+                    EK_REF_PUT => EnvReq::RefPut {
+                        env: r(0),
+                        reference: r(1),
+                        name,
+                        value: r(2),
+                        strict,
+                    },
+                    EK_EVAL => EnvReq::Eval {
+                        env: r(0),
+                        var_env: r(1),
+                        callee: r(2),
+                        this_call: r(3),
+                        args: &argv,
+                        strict,
+                        this: r(5),
+                        new_target: r(6),
+                        new_target_in_scope: *flags & 2 != 0,
+                        param_names: (*flags & 4 != 0).then_some(&names[..]),
+                    },
+                    EK_IS_EVAL => EnvReq::IsEval { callee: r(0) },
+                    EK_MAP_ARGS => EnvReq::MapArgs {
+                        args_obj: r(0),
+                        env: r(1),
+                        names: &names,
+                    },
+                    _ => return Err(VmError::Unsupported),
+                };
+                let pub_mark = ctx.frame_shadow.len();
+                ctx.frame_shadow.extend_from_slice(regs);
+                ctx.frames_published += 1;
+                let res = with_host(ctx, |h| h.env_op(req));
+                ctx.frames_published -= 1;
+                ctx.frame_shadow.truncate(pub_mark);
+                match res {
+                    Some(Ok((v, second))) => {
+                        if !matches!(*kind, EK_INIT | EK_STORE | EK_REF_PUT | EK_MAP_ARGS) {
+                            regs[*dst as usize] = v;
+                        }
+                        if *kind == EK_CALLEE {
+                            regs[rs[1] as usize] = second;
+                        }
+                        // Its computed reads and writes are now the host's.
+                        if *kind == EK_MAP_ARGS
+                            && let Some(h) = regs[rs[0] as usize].as_handle()
+                        {
+                            ctx.realm.set_hidden_property(
+                                Handle::from_raw(h),
+                                ARGS_MAPPED,
+                                NanBox::boolean(true),
+                            );
+                        }
+                    }
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
+            }
             Op::AnnexBGlobal {
                 name,
                 start,
@@ -7848,7 +8148,12 @@ fn vm_get_elem(
             // ToPropertyKey: a Symbol keys on its `\0sym:` name; any other object
             // key needs the full ToPrimitive (its `@@toPrimitive`/`toString`, which
             // may be inherited or user-written), which the tree-walker owns.
-            let ks = vm_property_key(ctx, key)?;
+            let ks = match vm_property_key(ctx, key) {
+                Ok(ks) => ks,
+                // A hosted run hands the whole read to the host.
+                Err(_) if ctx.host.is_some() => return host_get(ctx, recv, key),
+                Err(e) => return Err(e),
+            };
             // A canonical numeric string key on an array (`arr["0"]`) reads the
             // element, like `arr[0]` — for a valid array index [0, 2**32−1); the
             // boundary value is an ordinary property.
@@ -10134,19 +10439,22 @@ pub fn compile_program_into(
             refuse_generator(f, hosted)?;
         }
     }
-    // Hosted: a top-level function declaration that refers to `eval` stays the
-    // interpreter closure the host's GlobalDeclarationInstantiation made (its
-    // outer scope is the global environment, so a direct eval in it sees
-    // exactly what it should); the VM neither compiles nor rebinds it.
+    // A direct eval inside a class body (it must see the class's private names
+    // and home object) is not modelled yet.
+    if hosted {
+        let mut direct = BTreeSet::new();
+        let mut nested = BTreeSet::new();
+        for s in &program.body {
+            refs_stmt(s, &mut direct, &mut nested);
+        }
+        if nested.contains(DYN_EVAL_CLASS) {
+            return Err(CompileError::Unsupported("direct eval in a class"));
+        }
+    }
     let decls: Vec<&crate::ast::Function> = program
         .body
         .iter()
         .filter_map(|s| match s {
-            Stmt::Function(f)
-                if hosted && free_of_nonarrow(&f.params, &f.body).contains("eval") =>
-            {
-                None
-            }
             Stmt::Function(f) => Some(f),
             _ => None,
         })
@@ -10411,6 +10719,35 @@ fn free_of_function(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<Str
         .chain(nested)
         .filter(|n| !bound.contains(n))
         .collect()
+}
+
+/// Marker "names" the free-variable scans record (they propagate outward like
+/// free variables and never resolve to a binding): a direct `eval(…)` call
+/// site, a `with` statement, and a direct eval inside a class body.
+const DYN_EVAL: &str = "\0dyn:eval";
+/// See [`DYN_EVAL`].
+const DYN_WITH: &str = "\0dyn:with";
+/// See [`DYN_EVAL`].
+const DYN_EVAL_CLASS: &str = "\0dyn:evalclass";
+
+/// Whether a function with `params` and `body` uses dynamic scoping — a direct
+/// `eval` or a `with` statement anywhere in it, nested functions included (an
+/// enclosing function's bindings must be visible to the eval code too).
+fn uses_dynamic_scope(params: &[crate::ast::Param], body: &[Stmt]) -> bool {
+    let mut direct = BTreeSet::new();
+    let mut nested = BTreeSet::new();
+    for p in params {
+        refs_pattern(&p.target, &mut direct, &mut nested);
+        if let Some(d) = &p.default {
+            refs_expr(d, &mut direct, &mut nested);
+        }
+    }
+    for s in body {
+        refs_stmt(s, &mut direct, &mut nested);
+    }
+    [DYN_EVAL, DYN_WITH]
+        .iter()
+        .any(|m| direct.contains(*m) || nested.contains(*m))
 }
 
 /// The names a function declares (parameters + local declarations), *not*
@@ -10703,6 +11040,7 @@ fn refs_stmt(s: &Stmt, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
         }
         Stmt::Labeled { body, .. } => refs_stmt(body, direct, nested),
         Stmt::With { object, body, .. } => {
+            direct.insert(String::from(DYN_WITH));
             refs_expr(object, direct, nested);
             refs_stmt(body, direct, nested);
         }
@@ -10780,6 +11118,23 @@ fn refs_pattern(t: &BindingTarget, direct: &mut BTreeSet<String>, nested: &mut B
 /// the enclosing scope; method bodies, field initializers and static blocks are
 /// nested functions.
 fn refs_class(c: &crate::ast::Class, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<String>) {
+    let mut d = BTreeSet::new();
+    let mut n = BTreeSet::new();
+    refs_class_inner(c, &mut d, &mut n);
+    // A direct eval anywhere in a class body sees its private names and home
+    // object (see `DYN_EVAL_CLASS`).
+    if d.contains(DYN_EVAL) || n.contains(DYN_EVAL) {
+        n.insert(String::from(DYN_EVAL_CLASS));
+    }
+    direct.extend(d);
+    nested.extend(n);
+}
+
+fn refs_class_inner(
+    c: &crate::ast::Class,
+    direct: &mut BTreeSet<String>,
+    nested: &mut BTreeSet<String>,
+) {
     use crate::ast::ClassMember;
     if let Some(sup) = &c.super_class {
         refs_expr(sup, direct, nested);
@@ -10894,6 +11249,14 @@ fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
         | Expr::New {
             callee, arguments, ..
         } => {
+            // A direct `eval(…)` call site (see `DYN_EVAL`).
+            if let Expr::Call {
+                optional: false, ..
+            } = e
+                && matches!(&**callee, Expr::Ident(id) if &*id.name == "eval")
+            {
+                direct.insert(String::from(DYN_EVAL));
+            }
             refs_expr(callee, direct, nested);
             args(arguments, direct, nested);
         }
@@ -11651,6 +12014,37 @@ struct Compiler {
     derived_ctor: bool,
     /// A mapped parameter was written, or a mapped `arguments` escaped.
     mapped_violation: bool,
+    /// This function uses dynamic scoping (`uses_dynamic_scope`): its own
+    /// bindings live in host environments (`ENV_NAME`), not registers.
+    dyn_fn: bool,
+    /// The environment behaviour of [`Binding::global`] bindings that resolve
+    /// through a host environment, by their `global_names` index.
+    env_sites: alloc::collections::BTreeMap<u32, EnvSite>,
+    /// A dynamic-scope function's variable environment (where a sloppy direct
+    /// eval's `var`s land).
+    var_env: Option<Reg>,
+    /// While a dynamic-scope function's parameter list compiles: the names a
+    /// direct eval there may not declare as `var`s (the parameters and
+    /// `arguments`), joined by `\n`.
+    eval_params: Option<String>,
+}
+
+/// The hidden binding holding the innermost host environment of a function
+/// that uses dynamic scoping, or that is nested in one (see
+/// [`Compiler::dyn_fn`]).
+const ENV_NAME: &str = "\0env";
+
+/// How a [`Binding::global`] binding listed in [`Compiler::env_sites`] reaches
+/// its host environment.
+#[derive(Clone, Copy)]
+enum EnvSite {
+    /// Resolved by name from the innermost environment at each access.
+    Dyn,
+    /// A reference resolved once into this register (`EK_REF`).
+    Ref(Reg),
+    /// A declaration's initialization in the environment held by this
+    /// (`ENV_NAME`) binding; `const` when set.
+    Init(Binding, bool),
 }
 
 impl Compiler {
@@ -11830,6 +12224,16 @@ impl Compiler {
             .iter()
             .any(|p| p.default.is_some() || !matches!(p.target, BindingTarget::Ident(_)));
         let mut cell_names = captured_names(params, body);
+        // Dynamic scoping (a direct eval / `with` in this function or a nested
+        // one): bindings live in host environments; `this` and `new.target`
+        // stay hidden cells a nested dynamic arrow (or eval code) may need.
+        let dyn_fn = hosted && uses_dynamic_scope(params, body);
+        if dyn_fn && !is_arrow {
+            cell_names.insert(String::from(THIS_NAME));
+            if !is_main {
+                cell_names.insert(String::from(NT_NAME));
+            }
+        }
         // Real parameter mapping (see `MapArguments`): every parameter is a cell
         // the arguments object aliases.
         if real_mapping {
@@ -11919,6 +12323,26 @@ impl Compiler {
         } else {
             None
         };
+        if dyn_fn {
+            if class_ctor.is_some() || !fields.is_empty() || !field_defs.is_empty() {
+                return Err(CompileError::Unsupported(
+                    "dynamic scope in a class element",
+                ));
+            }
+            c.dyn_fn = true;
+            return c.compile_dyn_fn(DynFn {
+                params,
+                captures,
+                cap_regs: &cap_regs,
+                arg_regs: &arg_regs,
+                body,
+                is_main,
+                is_arrow,
+                is_async,
+                is_generator,
+                rest_from,
+            });
+        }
         // The `arguments` object is the function's first instruction (see
         // `Op::MakeArguments`). A sloppy function with simple parameters gets a
         // *mapped* object whose elements alias the parameters; the VM does not
@@ -12492,7 +12916,570 @@ impl Compiler {
     }
 }
 
+/// The inputs of [`Compiler::compile_dyn_fn`].
+struct DynFn<'a> {
+    params: &'a [crate::ast::Param],
+    captures: &'a [String],
+    cap_regs: &'a [Reg],
+    arg_regs: &'a [Reg],
+    body: &'a [Stmt],
+    is_main: bool,
+    is_arrow: bool,
+    is_async: bool,
+    is_generator: bool,
+    rest_from: Option<usize>,
+}
+
 impl Compiler {
+    /// Compiles a function that uses dynamic scoping (see [`Compiler::dyn_fn`]):
+    /// FunctionDeclarationInstantiation into a fresh host environment — the
+    /// `arguments` object, the parameters, the `var`s, the hoisted functions and
+    /// the body's lexical declarations are all bindings of it — then the body,
+    /// whose names resolve through the environment chain at run time.
+    fn compile_dyn_fn(mut self, f: DynFn<'_>) -> Result<FnProto, CompileError> {
+        let DynFn {
+            params,
+            captures,
+            cap_regs,
+            arg_regs,
+            body,
+            is_main,
+            is_arrow,
+            is_async,
+            is_generator,
+            rest_from,
+        } = f;
+        let c = &mut self;
+        let strict = c.strict;
+        let hosted = c.hosted;
+        let plain = !is_arrow && !is_main;
+        let simple = params
+            .iter()
+            .all(|p| !p.rest && p.default.is_none() && matches!(p.target, BindingTarget::Ident(_)));
+        let param_named_arguments = params.iter().any(
+            |p| matches!(&p.target, BindingTarget::Ident(Ident { name, .. }) if &**name == "arguments"),
+        );
+        // The `arguments` object and `new.target` must be the first ops.
+        let arguments_reg = (plain && !param_named_arguments).then(|| {
+            let dst = c.alloc();
+            c.ops.push(Op::MakeArguments {
+                dst,
+                mapped: !strict && simple,
+            });
+            dst
+        });
+        let new_target_reg = plain.then(|| {
+            let dst = c.alloc();
+            c.ops.push(Op::LoadNewTarget { dst });
+            dst
+        });
+        // Captured cells arrive boxed. The only source-level name a dynamic
+        // function captures is a named function expression's own name.
+        let mut self_name: Option<(String, Binding)> = None;
+        for (j, name) in captures.iter().enumerate() {
+            let b = Binding {
+                reg: cap_regs[j],
+                cell: true,
+                konst: false,
+                global: None,
+                tdz: false,
+                mapped: false,
+                fn_name: false,
+            };
+            if name.starts_with('\0') {
+                c.scopes[0].insert(name.clone(), b);
+            } else {
+                self_name = Some((name.clone(), b));
+            }
+        }
+        if hosted && !strict && plain {
+            let this = c.this_reg;
+            c.ops.push(Op::BindThis { this });
+        }
+        if c.cell_names.contains(THIS_NAME) {
+            let b = c.declare(THIS_NAME);
+            let this = c.this_reg;
+            c.write_var(b, this);
+        }
+        if let Some(r) = new_target_reg {
+            let b = c.declare(NT_NAME);
+            c.write_var(b, r);
+        }
+        // The environment chain: the closure's (else the global one), then the
+        // own-name scope of a named function expression, then the function's.
+        let mut parent = match c.lookup(ENV_NAME) {
+            Some(b) => c.read_var(b),
+            None => {
+                let r = c.alloc();
+                c.env_op(EK_ROOT, r, Vec::new(), "", 0);
+                r
+            }
+        };
+        if let Some((name, b)) = self_name {
+            let v = c.read_var(b);
+            let e = c.alloc();
+            c.env_op(EK_CHILD, e, alloc::vec![parent], "", 0);
+            c.env_op(EK_INIT, 0, alloc::vec![e, v], &name, ENV_INIT_SOFT_CONST);
+            parent = e;
+        }
+        let fenv = if is_main {
+            parent
+        } else {
+            let e = c.alloc();
+            c.env_op(EK_CHILD, e, alloc::vec![parent], "", 0);
+            e
+        };
+        c.bind_env_value(fenv)?;
+        c.var_env = Some(fenv);
+        let undef = c.constant(NanBox::undefined())?;
+        if let Some(a) = arguments_reg {
+            c.env_op(EK_INIT, 0, alloc::vec![fenv, a], "arguments", ENV_INIT_LET);
+            if !strict && simple && !params.is_empty() {
+                let names: Vec<&str> = params
+                    .iter()
+                    .filter_map(|p| match &p.target {
+                        BindingTarget::Ident(Ident { name, .. }) => Some(&**name),
+                        _ => None,
+                    })
+                    .collect();
+                c.env_op(EK_MAP_ARGS, 0, alloc::vec![a, fenv], &names.join("\n"), 0);
+            }
+        }
+        // A direct eval in a default may not `var`-declare a parameter's name.
+        if params.iter().any(|p| p.default.is_some()) {
+            let mut names: Vec<String> = Vec::new();
+            if !is_arrow {
+                names.push(String::from("arguments"));
+            }
+            for p in params {
+                let mut bound = BTreeSet::new();
+                pattern_names(&p.target, &mut bound);
+                names.extend(bound);
+            }
+            c.eval_params = Some(names.join("\n"));
+        }
+        // Parameters, left to right (a list with expressions binds every simple
+        // name in its TDZ first, so a default reading a later one throws).
+        if !simple {
+            for p in params {
+                if !p.rest
+                    && let BindingTarget::Ident(Ident { name, .. }) = &p.target
+                {
+                    c.env_op(EK_INIT, 0, alloc::vec![fenv, undef], name, ENV_INIT_TDZ);
+                }
+            }
+        }
+        for (i, p) in params.iter().enumerate() {
+            let v = arg_regs[i];
+            if let Some(def) = &p.default {
+                c.apply_default_named(v, Some(def), Some(&p.target))?;
+            }
+            match &p.target {
+                BindingTarget::Ident(Ident { name, .. }) => {
+                    c.env_op(EK_INIT, 0, alloc::vec![fenv, v], name, ENV_INIT_LET);
+                    let b = c.env_site_binding(name, EnvSite::Dyn, GlobalWrite::Put);
+                    c.scopes[0].insert(String::from(&**name), b);
+                }
+                other => c.bind_pattern(other, v)?,
+            }
+        }
+        c.eval_params = None;
+        // With parameter expressions the body gets its own variable
+        // environment, seeded from the parameters.
+        let venv = if !simple && !is_main {
+            let e = c.alloc();
+            c.env_op(EK_SEED, e, alloc::vec![fenv], "", 0);
+            c.bind_env_value(e)?;
+            c.var_env = Some(e);
+            e
+        } else {
+            fenv
+        };
+        if !is_main {
+            // VarDeclarationInstantiation.
+            let mut names = Vec::new();
+            crate::nbexec::collect_var_names(body, &mut names);
+            for name in names {
+                c.env_op(EK_INIT, 0, alloc::vec![venv, undef], name, ENV_INIT_VAR);
+                if !c.scopes[0].contains_key(name) {
+                    let b = c.env_site_binding(name, EnvSite::Dyn, GlobalWrite::Put);
+                    c.scopes[0].insert(String::from(name), b);
+                }
+            }
+            // The body's top-level lexical declarations, in their TDZ.
+            let mut lexical = BTreeSet::new();
+            for stmt in body {
+                match stmt {
+                    Stmt::Var(d) if d.kind != crate::ast::VarDeclKind::Var => {
+                        for dr in &d.declarations {
+                            pattern_names(&dr.target, &mut lexical);
+                        }
+                    }
+                    Stmt::Class(class) => {
+                        if let Some(id) = &class.id {
+                            lexical.insert(String::from(&*id.name));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for name in &lexical {
+                c.env_op(
+                    EK_INIT,
+                    0,
+                    alloc::vec![venv, undef],
+                    name,
+                    ENV_INIT_TDZ_LEXICAL,
+                );
+                let b = c.env_site_binding(name, EnvSite::Dyn, GlobalWrite::Put);
+                c.scopes[0].insert(name.clone(), b);
+            }
+        }
+        // Annex B.3.3: a qualifying block function also gets a `var` binding.
+        if hosted && !strict {
+            let mut cands = Vec::new();
+            crate::nbexec::collect_block_function_names(body, &mut cands);
+            if is_main {
+                c.annexb_host = !cands.is_empty();
+            } else {
+                let mut param_names = BTreeSet::new();
+                for p in params {
+                    pattern_names(&p.target, &mut param_names);
+                }
+                for (name, span) in cands {
+                    if param_names.contains(name)
+                        || (arguments_reg.is_some() && name == "arguments")
+                    {
+                        continue;
+                    }
+                    c.env_op(EK_INIT, 0, alloc::vec![venv, undef], name, ENV_INIT_VAR);
+                    if !c.scopes[0].contains_key(name) {
+                        let b = c.env_site_binding(name, EnvSite::Dyn, GlobalWrite::Put);
+                        c.scopes[0].insert(String::from(name), b);
+                    }
+                    c.annexb_spans.push(span);
+                }
+            }
+        }
+        // Hoisted function declarations, instantiated before the body.
+        for stmt in body {
+            if let Stmt::Function(func) = stmt {
+                c.hoisted_fns
+                    .insert(func as *const crate::ast::Function as usize);
+                if is_main {
+                    continue;
+                }
+                let Some(id) = &func.id else { continue };
+                refuse_generator(func, hosted)?;
+                c.next_closure_is_generator = func.is_generator;
+                let closure = c.make_closure(
+                    &func.params,
+                    &func.body,
+                    func.is_async,
+                    id.name.as_ref(),
+                    false,
+                )?;
+                c.env_op(
+                    EK_INIT,
+                    0,
+                    alloc::vec![venv, closure],
+                    &id.name,
+                    ENV_INIT_LET,
+                );
+                if !c.scopes[0].contains_key(&*id.name) {
+                    let b = c.env_site_binding(&id.name, EnvSite::Dyn, GlobalWrite::Put);
+                    c.scopes[0].insert(String::from(&*id.name), b);
+                }
+            }
+        }
+        // A script's top-level functions: one canonical closure each, stored
+        // into the global bindings the host hoisted.
+        if is_main {
+            for stmt in body {
+                if let Stmt::Function(func) = stmt
+                    && let Some(id) = &func.id
+                    && let Some(&fid) = c.fn_ids.get(&*id.name)
+                {
+                    let reg = c.alloc();
+                    c.ops.push(Op::LoadFunc {
+                        dst: reg,
+                        func: fid,
+                    });
+                    if !func.is_async && !func.is_generator {
+                        c.ops.push(Op::InitFnPrototype { f: reg });
+                    } else if func.is_generator {
+                        c.ops.push(Op::InitGenerator { f: reg });
+                    }
+                    c.ops.push(Op::StoreGlobal {
+                        name: String::from(&*id.name),
+                        src: reg,
+                        strict: false,
+                        resolved: None,
+                    });
+                }
+            }
+        }
+        if is_generator {
+            c.ops.push(Op::GeneratorStart);
+        }
+        let mut last: Option<Reg> = None;
+        if is_main {
+            for stmt in body {
+                if let Some(r) = c.stmt(stmt)? {
+                    last = Some(r);
+                }
+            }
+            let src = match last {
+                Some(r) => r,
+                None => c.constant(NanBox::undefined())?,
+            };
+            c.ops.push(Op::Return { src });
+        } else {
+            c.using_scope(body, |c| {
+                body.iter().try_for_each(|s| c.stmt(s).map(|_| ()))
+            })?;
+        }
+        if c.reg_overflow {
+            return Err(CompileError::Unsupported("too many registers"));
+        }
+        let length = params
+            .iter()
+            .take_while(|p| !p.rest && p.default.is_none())
+            .count();
+        Ok(FnProto {
+            n_regs: c.next_reg as usize,
+            n_params: params.len(),
+            n_captures: captures.len(),
+            rest_from,
+            is_async,
+            length,
+            ops: core::mem::take(&mut c.ops),
+            name: alloc::string::String::new(),
+            legacy: !strict && !is_arrow && !is_async && !is_main && !is_generator,
+            class_ctor: false,
+            derived: false,
+            is_generator,
+        })
+    }
+
+    /// Whether names that are not bound in registers resolve through a host
+    /// environment (this function, or an enclosing one, uses dynamic scoping).
+    fn env_on(&self) -> bool {
+        self.lookup(ENV_NAME).is_some()
+    }
+
+    /// Whether `b` is a binding that lives in a host environment.
+    fn is_env_binding(&self, b: &Binding) -> bool {
+        b.global
+            .is_some_and(|(i, _)| self.env_sites.contains_key(&i))
+    }
+
+    /// Whether a reference to the source name `name` resolves through the host
+    /// environment chain rather than a register.
+    fn env_resolves(&self, name: &str) -> bool {
+        if name.starts_with('\0') || !self.env_on() {
+            return false;
+        }
+        match self.lookup(name) {
+            None => true,
+            Some(b) => self.is_env_binding(&b),
+        }
+    }
+
+    /// The innermost host environment, read into a register.
+    fn cur_env(&mut self) -> Reg {
+        let b = self.lookup(ENV_NAME).expect("an environment binding");
+        self.read_var(b)
+    }
+
+    /// Emits an [`Op::Env`].
+    fn env_op(&mut self, kind: u8, dst: Reg, regs: Vec<Reg>, name: &str, flags: u8) {
+        self.ops.push(Op::Env {
+            kind,
+            dst,
+            regs,
+            name: String::from(name),
+            flags,
+        });
+    }
+
+    /// A [`Binding::global`] binding of `name` with environment behaviour `site`.
+    fn env_site_binding(&mut self, name: &str, site: EnvSite, write: GlobalWrite) -> Binding {
+        let idx = self.global_names.len() as u32;
+        self.global_names.push(String::from(name));
+        self.env_sites.insert(idx, site);
+        Binding {
+            reg: 0,
+            cell: false,
+            konst: false,
+            global: Some((idx, write)),
+            tdz: false,
+            mapped: false,
+            fn_name: false,
+        }
+    }
+
+    /// Makes the environment value in `env` the innermost one for the current
+    /// scope (a fresh `ENV_NAME` cell, so closures made earlier keep theirs).
+    fn bind_env_value(&mut self, env: Reg) -> Result<Binding, CompileError> {
+        let b = self.bind_hidden_cell(ENV_NAME, false, false)?;
+        self.write_var(b, env);
+        Ok(b)
+    }
+
+    /// The environment binding of the current scope, creating a child of the
+    /// enclosing environment when the scope has none yet.
+    fn ensure_env(&mut self) -> Result<Binding, CompileError> {
+        if let Some(b) = self.scopes.last().and_then(|s| s.get(ENV_NAME)).copied() {
+            return Ok(b);
+        }
+        let parent = self.cur_env();
+        let e = self.alloc();
+        self.env_op(EK_CHILD, e, alloc::vec![parent], "", 0);
+        self.bind_env_value(e)
+    }
+
+    /// A dynamic-scope declaration of `name` in the current scope: binds it
+    /// (initialized to `undefined` unless already bound, e.g. in its TDZ) and
+    /// returns the binding its initialization writes through.
+    fn env_declare(&mut self, name: &str) -> Result<Binding, CompileError> {
+        let depth = self.scopes.len() - 1;
+        let envb = self.ensure_env()?;
+        if !self.scopes[depth].contains_key(name) {
+            let env = self.read_var(envb);
+            let u = self.constant(NanBox::undefined())?;
+            self.env_op(EK_INIT, 0, alloc::vec![env, u], name, ENV_INIT_LET);
+            let b = self.env_site_binding(name, EnvSite::Dyn, GlobalWrite::Put);
+            self.scopes[depth].insert(String::from(name), b);
+        }
+        let konst = self.decl_kind == Some(crate::ast::VarDeclKind::Const);
+        Ok(self.env_site_binding(name, EnvSite::Init(envb, konst), GlobalWrite::InitLet))
+    }
+
+    /// Binds `name` uninitialized (TDZ) in the current scope's environment.
+    fn env_declare_tdz(&mut self, name: &str, lexical: bool) -> Result<(), CompileError> {
+        let depth = self.scopes.len() - 1;
+        let envb = self.ensure_env()?;
+        let env = self.read_var(envb);
+        let u = self.constant(NanBox::undefined())?;
+        let mode = if lexical {
+            ENV_INIT_TDZ_LEXICAL
+        } else {
+            ENV_INIT_TDZ
+        };
+        self.env_op(EK_INIT, 0, alloc::vec![env, u], name, mode);
+        let b = self.env_site_binding(name, EnvSite::Dyn, GlobalWrite::Put);
+        self.scopes[depth].insert(String::from(name), b);
+        Ok(())
+    }
+
+    /// A reference to `name` resolved now from the innermost environment (read
+    /// and written later through [`EnvSite::Ref`]).
+    fn env_ref(&mut self, name: &str) -> Binding {
+        let env = self.cur_env();
+        let r = self.alloc();
+        let strict = u8::from(self.strict);
+        self.env_op(EK_REF, r, alloc::vec![env], name, strict);
+        self.env_site_binding(name, EnvSite::Ref(r), GlobalWrite::Put)
+    }
+
+    /// `return name(args)` in tail position where `name` resolves through the
+    /// environment: a proper tail call unless the reference supplies a `this`
+    /// (a `with` object) or it is a direct eval (which is no call at all).
+    fn env_tail_call(
+        &mut self,
+        name: &str,
+        arguments: &[crate::ast::Argument],
+    ) -> Result<bool, CompileError> {
+        let (f, this) = self.env_callee(name);
+        let mut args = Vec::with_capacity(arguments.len());
+        for a in arguments {
+            let crate::ast::Argument::Item(e) = a else {
+                return Err(CompileError::Unsupported("tail call argument"));
+            };
+            args.push(self.expr(e)?);
+        }
+        let arr = self.alloc();
+        self.ops.push(Op::NewArray { dst: arr, len: 0 });
+        for a in &args {
+            self.ops.push(Op::ArrayPush { arr, src: *a });
+        }
+        if name == "eval" {
+            let is = self.alloc();
+            self.env_op(EK_IS_EVAL, is, alloc::vec![f], "", 0);
+            let not_eval = self.emit_jump_if_false(is);
+            let dst = self.emit_direct_eval(f, this, arr)?;
+            self.ops.push(Op::Return { src: dst });
+            self.patch(not_eval);
+        }
+        let u = self.constant(NanBox::undefined())?;
+        let no_this = self.alloc();
+        self.ops.push(Op::StrictEq {
+            dst: no_this,
+            a: this,
+            b: u,
+        });
+        let with_this = self.emit_jump_if_false(no_this);
+        self.ops.push(Op::TailCallValue { callee: f, args });
+        self.patch(with_this);
+        let dst = self.alloc();
+        self.ops.push(Op::CallSpread {
+            dst,
+            callee: f,
+            this,
+            args: arr,
+        });
+        self.ops.push(Op::Return { src: dst });
+        Ok(true)
+    }
+
+    /// `dst = callee(...args)` spelled `eval(...)`: a direct eval in the
+    /// innermost environment when `callee` is %eval%, else an ordinary call.
+    fn emit_direct_eval(&mut self, f: Reg, this: Reg, args: Reg) -> Result<Reg, CompileError> {
+        let dst = self.alloc();
+        let env = self.cur_env();
+        let var_env = self.var_env.ok_or(CompileError::Unsupported(
+            "direct eval outside a dynamic scope",
+        ))?;
+        let this_v = self.this_value();
+        let nt_b = self.lookup(NT_NAME);
+        let nt = match nt_b {
+            Some(b) => self.read_var(b),
+            None => self.constant(NanBox::undefined())?,
+        };
+        let mut flags = u8::from(self.strict) | (u8::from(nt_b.is_some()) << 1);
+        let names = self.eval_params.clone().unwrap_or_default();
+        if self.eval_params.is_some() {
+            flags |= 4;
+        }
+        self.env_op(
+            EK_EVAL,
+            dst,
+            alloc::vec![env, var_env, f, this, args, this_v, nt],
+            &names,
+            flags,
+        );
+        Ok(dst)
+    }
+
+    /// `GetValue` of the identifier `name` from the innermost environment.
+    fn env_load(&mut self, name: &str) -> Reg {
+        let env = self.cur_env();
+        let dst = self.alloc();
+        let strict = u8::from(self.strict);
+        self.env_op(EK_LOAD, dst, alloc::vec![env], name, strict);
+        dst
+    }
+
+    /// The callee `name` and its `this` (a `with` object, else `undefined`).
+    fn env_callee(&mut self, name: &str) -> (Reg, Reg) {
+        let env = self.cur_env();
+        let (f, this) = (self.alloc(), self.alloc());
+        let strict = u8::from(self.strict);
+        self.env_op(EK_CALLEE, f, alloc::vec![env, this], name, strict);
+        (f, this)
+    }
+
     fn alloc(&mut self) -> Reg {
         let r = self.next_reg;
         // A program that needs more than `Reg::MAX` registers (e.g. an enormous
@@ -12524,6 +13511,16 @@ impl Compiler {
         }
         if let Some(b) = self.global_declaration(name) {
             return b;
+        }
+        // Dynamic scoping: a source-level name binds in the scope's environment
+        // (a `var` in the function's, hoisted at entry).
+        if self.dyn_fn && !name.starts_with('\0') {
+            if self.decl_kind == Some(crate::ast::VarDeclKind::Var) {
+                return self.env_site_binding(name, EnvSite::Dyn, GlobalWrite::Put);
+            }
+            if let Ok(b) = self.env_declare(name) {
+                return b;
+            }
         }
         // A `var` statement binds the function-scope binding hoisted at entry,
         // not a fresh one in the enclosing block.
@@ -12576,6 +13573,10 @@ impl Compiler {
         if !self.hosted || !self.is_main {
             return None;
         }
+        // A `var` initializer is a PutValue that a `with` object may capture.
+        if self.dyn_fn && self.decl_kind == Some(VarDeclKind::Var) {
+            return Some(self.env_site_binding(name, EnvSite::Dyn, GlobalWrite::Put));
+        }
         let top = self.scopes.len() == 1;
         let write = match self.decl_kind {
             Some(VarDeclKind::Var) => GlobalWrite::Put,
@@ -12608,7 +13609,7 @@ impl Compiler {
     /// that, thrown inside a promise job, nobody would ever see. Such a name is
     /// a compile refusal instead (the program runs on the tree-walker).
     fn models_not(&self, name: &str) -> bool {
-        name == "arguments" && !self.is_main && self.lookup(name).is_none()
+        name == "arguments" && !self.is_main && self.lookup(name).is_none() && !self.env_on()
     }
 
     /// The binding a *reference* to `name` resolves to: a lexical one, else (in
@@ -12617,6 +13618,9 @@ impl Compiler {
     fn resolve(&mut self, name: &str) -> Option<Binding> {
         if self.models_not(name) {
             return None;
+        }
+        if self.env_resolves(name) {
+            return Some(self.env_ref(name));
         }
         match self.lookup(name) {
             Some(b) => Some(b),
@@ -12695,6 +13699,17 @@ impl Compiler {
 
     /// Marks the just-declared local `name` as `const`.
     fn mark_const(&mut self, name: &str) {
+        if self.dyn_fn
+            && let Some(b) = self.scopes.last().and_then(|s| s.get(name)).copied()
+            && self.is_env_binding(&b)
+        {
+            if let Some(envb) = self.scopes.last().and_then(|s| s.get(ENV_NAME)).copied() {
+                let env = self.read_var(envb);
+                let u = self.constant(NanBox::undefined()).expect("const");
+                self.env_op(EK_INIT, 0, alloc::vec![env, u], name, ENV_INIT_MARK_CONST);
+            }
+            return;
+        }
         if let Some(b) = self.scopes.last_mut().and_then(|s| s.get_mut(name)) {
             b.konst = true;
         }
@@ -13287,6 +14302,21 @@ impl Compiler {
     }
 
     fn read_var(&mut self, b: Binding) -> Reg {
+        if let Some((idx, _)) = b.global
+            && let Some(site) = self.env_sites.get(&idx).copied()
+        {
+            let name = self.global_names[idx as usize].clone();
+            return match site {
+                EnvSite::Ref(r) => {
+                    let env = self.cur_env();
+                    let dst = self.alloc();
+                    let strict = u8::from(self.strict);
+                    self.env_op(EK_REF_GET, dst, alloc::vec![env, r], &name, strict);
+                    dst
+                }
+                EnvSite::Dyn | EnvSite::Init(..) => self.env_load(&name),
+            };
+        }
         if let Some((idx, _)) = b.global {
             let dst = self.alloc();
             let name = self.global_names[idx as usize].clone();
@@ -13349,6 +14379,28 @@ impl Compiler {
             let cur = self.read_var(unchecked);
             self.ops.push(Op::CheckTdz { src: cur });
         }
+        if let Some((idx, _)) = b.global
+            && let Some(site) = self.env_sites.get(&idx).copied()
+        {
+            let name = self.global_names[idx as usize].clone();
+            let strict = u8::from(self.strict);
+            match site {
+                EnvSite::Ref(r) => {
+                    let env = self.cur_env();
+                    self.env_op(EK_REF_PUT, 0, alloc::vec![env, r, src], &name, strict);
+                }
+                EnvSite::Dyn => {
+                    let env = self.cur_env();
+                    self.env_op(EK_STORE, 0, alloc::vec![env, src], &name, strict);
+                }
+                EnvSite::Init(envb, konst) => {
+                    let env = self.read_var(envb);
+                    let mode = if konst { ENV_INIT_CONST } else { ENV_INIT_LET };
+                    self.env_op(EK_INIT, 0, alloc::vec![env, src], &name, mode);
+                }
+            }
+            return;
+        }
         if let Some((idx, write)) = b.global {
             let name = self.global_names[idx as usize].clone();
             self.ops.push(match write {
@@ -13409,6 +14461,13 @@ impl Compiler {
                             end: f.span.end,
                             src,
                         });
+                    } else if self.dyn_fn && self.annexb_spans.contains(&f.span) {
+                        // The block binding's value, into the `var` binding of
+                        // the function's variable environment.
+                        let v = self.env_load(&id.name);
+                        if let Some(venv) = self.var_env {
+                            self.env_op(EK_INIT, 0, alloc::vec![venv, v], &id.name, ENV_INIT_LET);
+                        }
                     } else if self.annexb_spans.contains(&f.span)
                         && let Some(var_b) = self.scopes[0].get(&*id.name).copied()
                         && let Some(b) = self.lookup(&id.name)
@@ -13647,7 +14706,20 @@ impl Compiler {
                 self.patch(push);
                 if let Some(catch) = handler {
                     self.scopes.push(alloc::collections::BTreeMap::new());
-                    if let Some(BindingTarget::Ident(Ident { name, .. })) = &catch.param {
+                    // Dynamic scoping: the parameter lives in a `catch`
+                    // environment of its own.
+                    if self.dyn_fn && catch.param.is_some() {
+                        let parent = self.cur_env();
+                        let e = self.alloc();
+                        self.env_op(EK_CHILD, e, alloc::vec![parent], "", 1);
+                        self.bind_env_value(e)?;
+                    }
+                    if self.dyn_fn
+                        && let Some(BindingTarget::Ident(Ident { name, .. })) = &catch.param
+                    {
+                        let b = self.declare(name);
+                        self.write_var(b, catch_reg);
+                    } else if let Some(BindingTarget::Ident(Ident { name, .. })) = &catch.param {
                         // The thrown value is in `catch_reg`; box it into a cell
                         // if the binding is captured.
                         let b = if self.cell_names.contains(&**name) {
@@ -14218,6 +15290,21 @@ impl Compiler {
                 // `continue` runs the per-iteration copy and then the update.
                 let cont = self.ops.len();
                 self.refresh_loop_cells(&per_iter);
+                // Dynamic scoping: a `let`/`const` head's environment is copied
+                // per iteration (CreatePerIterationEnvironment).
+                if self.dyn_fn
+                    && matches!(init, Some(ForInit::Var(d)) if d.kind != crate::ast::VarDeclKind::Var)
+                    && let Some(eb) = self.scopes.last().and_then(|s| s.get(ENV_NAME)).copied()
+                {
+                    let cur = self.read_var(eb);
+                    let n = self.alloc();
+                    self.env_op(EK_CLONE, n, alloc::vec![cur], "", 0);
+                    self.ops.push(Op::NewArray {
+                        dst: eb.reg,
+                        len: 1,
+                    });
+                    self.write_var(eb, n);
+                }
                 if let Some(u) = update {
                     self.expr(u)?;
                 }
@@ -14228,6 +15315,18 @@ impl Compiler {
                 self.exit_loop(cont);
                 self.scopes.pop();
                 Ok(None)
+            }
+            // `with (obj) body` (only in a dynamic-scope function): the body
+            // runs in an object environment nested in the current one.
+            Stmt::With { object, body, .. } if self.dyn_fn => {
+                let o = self.expr(object)?;
+                let parent = self.cur_env();
+                let e = self.alloc();
+                self.env_op(EK_WITH, e, alloc::vec![parent, o], "", 0);
+                self.scopes.push(alloc::collections::BTreeMap::new());
+                let r = self.bind_env_value(e).and_then(|_| self.stmt(body));
+                self.scopes.pop();
+                r
             }
             _ => Err(CompileError::Unsupported("statement")),
         }
@@ -14387,6 +15486,11 @@ impl Compiler {
         {
             return Ok(false);
         }
+        if let Expr::Ident(id) = callee
+            && self.env_resolves(&id.name)
+        {
+            return self.env_tail_call(&id.name, arguments);
+        }
         if matches!(callee, Expr::Ident(id) if &*id.name == "eval") && self.lookup("eval").is_none()
         {
             return Ok(false);
@@ -14461,6 +15565,7 @@ impl Compiler {
             Expr::Bool { value, .. } => self.constant(NanBox::boolean(*value)),
             Expr::Null(_) => self.constant(NanBox::null()),
             Expr::Str { value, .. } => Ok(self.wtf8_string(value)),
+            Expr::Ident(id) if self.env_resolves(&id.name) => Ok(self.env_load(&id.name)),
             Expr::Ident(id) => {
                 if let Some(b) = self.lookup(&id.name) {
                     if b.mapped && &*id.name == "arguments" && !self.args_member_read {
@@ -14541,6 +15646,12 @@ impl Compiler {
                                 key,
                                 strict: self.strict,
                             });
+                            return Ok(dst);
+                        }
+                        Expr::Ident(id) if self.env_resolves(&id.name) => {
+                            let env = self.cur_env();
+                            let dst = self.alloc();
+                            self.env_op(EK_DELETE, dst, alloc::vec![env], &id.name, 0);
                             return Ok(dst);
                         }
                         // A register-bound name is not deletable (strict code
@@ -14644,6 +15755,15 @@ impl Compiler {
                 // `undefined`) or a known builtin (`Math`, `BigInt`, …) — instead
                 // goes through the normal path (the builtin bails to the
                 // tree-walker), so `typeof Math` is `"object"`, not `"undefined"`.
+                if matches!(op, UnaryOp::Typeof)
+                    && let Expr::Ident(id) = &**argument
+                    && self.env_resolves(&id.name)
+                {
+                    let env = self.cur_env();
+                    let dst = self.alloc();
+                    self.env_op(EK_TYPEOF, dst, alloc::vec![env], &id.name, 0);
+                    return Ok(dst);
+                }
                 if matches!(op, UnaryOp::Typeof)
                     && let Expr::Ident(id) = &**argument
                     && self.models_not(&id.name)
@@ -15107,6 +16227,32 @@ impl Compiler {
                 });
                 Ok(dst)
             }
+            // A bare-identifier callee resolved through the environment: the
+            // reference supplies `this` (a `with` object), and `eval(…)` is a
+            // direct eval when it resolves to %eval%.
+            Expr::Call {
+                callee,
+                arguments,
+                optional: false,
+                ..
+            } if matches!(&**callee, Expr::Ident(id) if self.env_resolves(&id.name)) => {
+                let Expr::Ident(id) = &**callee else {
+                    return Err(CompileError::Unsupported("callee"));
+                };
+                let (f, this) = self.env_callee(&id.name);
+                let args = self.spread_args(arguments)?;
+                if &*id.name == "eval" {
+                    return self.emit_direct_eval(f, this, args);
+                }
+                let dst = self.alloc();
+                self.ops.push(Op::CallSpread {
+                    dst,
+                    callee: f,
+                    this,
+                    args,
+                });
+                Ok(dst)
+            }
             Expr::Call {
                 callee,
                 arguments,
@@ -15549,7 +16695,11 @@ impl Compiler {
                         // The reference — and for `op=` its current value — is
                         // taken *before* the right-hand side runs.
                         let cur = compound.then(|| self.read_var(b));
-                        let resolved = if b.global.is_some() && self.strict && !compound {
+                        let resolved = if b.global.is_some()
+                            && !self.is_env_binding(&b)
+                            && self.strict
+                            && !compound
+                        {
                             let dst = self.alloc();
                             self.ops.push(Op::GlobalExists {
                                 dst,
@@ -16478,6 +17628,22 @@ impl Compiler {
             free_of_nonarrow(params, body)
         };
         free.extend(extra_free);
+        // Dynamic scoping: a closure made where names resolve through a host
+        // environment closes over that environment. A dynamic-scope closure may
+        // also need — through eval code — its own name (a named expression's),
+        // and an arrow its enclosing `this` / `new.target`.
+        if self.env_on() {
+            free.insert(String::from(ENV_NAME));
+        }
+        if self.hosted && uses_dynamic_scope(params, body) {
+            if self.next_closure_self_bind && !name.is_empty() {
+                free.insert(String::from(name));
+            }
+            if is_arrow {
+                free.insert(String::from(THIS_NAME));
+                free.insert(String::from(NT_NAME));
+            }
+        }
         // A *named function expression* binds its own name inside its body (to the
         // function itself). If that name is referenced, thread it as a trailing
         // "self" capture: a cell we create here and backfill with the finished
@@ -16492,7 +17658,10 @@ impl Compiler {
         };
         let mut captures: Vec<String> = free
             .into_iter()
-            .filter(|n| self.lookup(n).is_some() && Some(n.as_str()) != self_name)
+            .filter(|n| {
+                self.lookup(n).is_some_and(|b| !self.is_env_binding(&b))
+                    && Some(n.as_str()) != self_name
+            })
             .collect();
         if let Some(sn) = self_name {
             // Bound last → its capture register is the self-cell below.
@@ -16685,9 +17854,13 @@ impl Compiler {
     fn block_stmts(&mut self, stmts: &'_ [Stmt]) -> Result<(), CompileError> {
         self.scopes.push(alloc::collections::BTreeMap::new());
         let r = self.using_scope(stmts, |c| {
-            // The block's lexicals start in their TDZ.
+            // Like a block statement: lexicals start in their TDZ and
+            // block-level functions are instantiated at entry.
             let refs: Vec<&Stmt> = stmts.iter().collect();
             c.prebind_block_lexicals(&refs, &BTreeSet::new(), false)?;
+            if c.hosted {
+                c.hoist_block_functions(&refs)?;
+            }
             stmts.iter().try_for_each(|s| c.stmt(s).map(|_| ()))
         });
         self.scopes.pop();
@@ -17692,6 +18865,14 @@ impl Compiler {
             }
         }
         let depth = self.scopes.len() - 1;
+        if self.dyn_fn {
+            for name in &lexical {
+                if !self.scopes[depth].contains_key(name.as_str()) {
+                    self.env_declare_tdz(name, false)?;
+                }
+            }
+            return Ok(());
+        }
         for name in &lexical {
             if self.scopes[depth].contains_key(name.as_str()) {
                 continue;

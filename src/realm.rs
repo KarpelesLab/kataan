@@ -1762,6 +1762,17 @@ impl Realm {
         Some((id, env.clone()))
     }
 
+    /// Allocates a VM-held host environment cell (see [`Cell::Env`]).
+    pub fn new_env(&mut self, env: crate::env::Scope) -> Handle {
+        self.heap.alloc(Cell::Env(env))
+    }
+
+    /// The host environment held by the [`Cell::Env`] at `handle`, if it is one.
+    #[must_use]
+    pub fn env_at(&self, handle: Handle) -> Option<crate::env::Scope> {
+        self.heap.get(handle)?.as_env().cloned()
+    }
+
     /// Allocates a built-in (native) function with the given id.
     pub fn new_native(&mut self, id: u16) -> Handle {
         self.heap.alloc(Cell::Native(id))
@@ -5211,7 +5222,7 @@ impl Realm {
                         None => "[object Object]".into(),
                     }
                 }
-                Some(Cell::Object(_)) => "[object Object]".into(),
+                Some(Cell::Object(_) | Cell::Env(_)) => "[object Object]".into(),
                 // A callable stringifies as `Function.prototype.toString` would —
                 // the retained literal source text (ECMA-262 20.2.3.5) when the
                 // function was defined from source, else the NativeFunction form
