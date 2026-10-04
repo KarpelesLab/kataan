@@ -9870,6 +9870,22 @@ impl crate::nbvm::VmHost for Interp<'_> {
         if let Some((m, n)) = crate::nbvm::split_module_name(name) {
             return self.vm_module_write(m, n, value).map_err(exec_to_host);
         }
+        // Strict: a name the global object provides only through its
+        // prototype chain (an inherited property, a proxy's `has` trap) is a
+        // resolvable reference — `[[Set]]` on the global object.
+        if strict
+            && self.current.get(name).is_none()
+            && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
+            && !self.realm.has_own(g, name)
+            && self.with_binding(name).is_none()
+            && self.global_object_provides(name)
+        {
+            let key = self.new_str(name);
+            let saved = core::mem::replace(&mut self.strict, true);
+            let r = self.assign_member_value(g, key, value);
+            self.strict = saved;
+            return r.map_err(exec_to_host);
+        }
         let saved = core::mem::replace(&mut self.strict, strict);
         let r = self.assign_to_name(name, value);
         self.strict = saved;
