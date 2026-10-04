@@ -458,6 +458,9 @@ pub struct Interp<'a> {
     pending_class_name: Option<&'a str>,
     /// Current function-call nesting depth (recursion guard).
     call_depth: usize,
+    /// Statements the tree-walker has executed — the measure behind
+    /// `KATAAN_VM_PURE` (a hosted VM run must leave it at 0).
+    tree_walked: u64,
     /// Whether a `return` evaluated *right now* is a proper-tail-call candidate:
     /// set true only while running a strict, non-async function body (in
     /// [`Interp::invoke_inner`]); cleared inside a `try` Block (and a `catch`
@@ -3229,6 +3232,13 @@ impl<'a> Interp<'a> {
         Self::new_with_limits(crate::limits::Limits::default())
     }
 
+    /// How many statements the tree-walker has executed in this interpreter
+    /// (user code that did not run on the bytecode VM).
+    #[must_use]
+    pub fn tree_walked(&self) -> u64 {
+        self.tree_walked
+    }
+
     /// A fresh interpreter with the given resource [`Limits`](crate::limits::Limits).
     #[must_use]
     pub fn new_with_limits(limits: crate::limits::Limits) -> Self {
@@ -3263,6 +3273,7 @@ impl<'a> Interp<'a> {
             temporal_protos: Vec::new(),
             pending_class_name: None,
             call_depth: 0,
+            tree_walked: 0,
             tail_pos: false,
             return_had_expr: false,
             new_target_in_scope: false,

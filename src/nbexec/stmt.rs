@@ -102,6 +102,7 @@ impl<'a> Interp<'a> {
     // --- statements ---
 
     pub(crate) fn exec(&mut self, stmt: &'a Stmt) -> Result<Flow, ExecError> {
+        self.tree_walked += 1;
         // C2: share the tree-walk recursion budget with `eval` so deeply nested
         // statements (or expressions reached through them) throw a catchable
         // `RangeError` rather than overflowing the host stack. Bounded by the

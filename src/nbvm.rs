@@ -9537,7 +9537,10 @@ pub fn execute_typed_interruptible(
     }
     let protos: alloc::rc::Rc<[FnProto]> = protos.into();
     match run_program_hosted(&mut interp, &protos, main as usize, &[]) {
-        Ok(value) => Ok((String::from(interp.output()), interp.display(value))),
+        Ok(value) => {
+            tree_walk_check(&interp)?;
+            Ok((String::from(interp.output()), interp.display(value)))
+        }
         // An interrupt is a *deadline*, not a construct the VM cannot lower:
         // re-running on the tree-walker would restart the runaway program from
         // the top, so it propagates instead of taking the fallback below.
@@ -9637,6 +9640,7 @@ pub fn execute_scripts_typed(
             Err(_) => return crate::nbexec::eval_scripts_typed(sources, limits),
         }
     }
+    tree_walk_check(&interp)?;
     Ok((String::from(interp.output()), completion))
 }
 
@@ -9648,11 +9652,33 @@ pub fn execute_scripts_typed(
 fn vm_strict() -> bool {
     #[cfg(feature = "std")]
     {
-        std::env::var_os("KATAAN_VM_STRICT").is_some()
+        std::env::var_os("KATAAN_VM_STRICT").is_some() || vm_pure()
     }
     #[cfg(not(feature = "std"))]
     {
         false
+    }
+}
+
+/// Whether `KATAAN_VM_PURE` is set: [`vm_strict`], and additionally a run in
+/// which the tree-walker executed *any* user statement (dynamic code, modules,
+/// interpreter-made closures) reports `VmFallback` — "100% on the VM".
+fn vm_pure() -> bool {
+    #[cfg(feature = "std")]
+    {
+        std::env::var_os("KATAAN_VM_PURE").is_some()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        false
+    }
+}
+
+/// Under [`vm_pure`], the `VmFallback` for a run that tree-walked user code.
+fn tree_walk_check(interp: &crate::nbexec::Interp) -> Result<(), crate::nbexec::Thrown> {
+    match interp.tree_walked() {
+        n if n > 0 && vm_pure() => Err(vm_fallback(&alloc::format!("tree-walk: {n} statements"))),
+        _ => Ok(()),
     }
 }
 
@@ -9679,6 +9705,9 @@ pub fn execute_module_typed(
     host: &dyn crate::nbexec::module::ModuleHost,
     limits: crate::limits::Limits,
 ) -> Result<(String, String), crate::nbexec::Thrown> {
+    if vm_pure() {
+        return Err(vm_fallback("module: tree-walker"));
+    }
     crate::nbexec::module::eval_module_typed(entry_key, host, limits)
 }
 
@@ -9709,6 +9738,9 @@ pub fn execute_module_typed_with_prelude(
     prelude: &str,
     limits: crate::limits::Limits,
 ) -> Result<(String, String), crate::nbexec::Thrown> {
+    if vm_pure() {
+        return Err(vm_fallback("module: tree-walker"));
+    }
     crate::nbexec::module::eval_module_typed_with_prelude(entry_key, host, prelude, limits)
 }
 
@@ -9726,6 +9758,9 @@ pub fn execute_script_typed_with_import_base(
     base_path: &str,
     limits: crate::limits::Limits,
 ) -> Result<(String, String), crate::nbexec::Thrown> {
+    if vm_pure() {
+        return Err(vm_fallback("module: tree-walker"));
+    }
     crate::nbexec::module::eval_script_typed_with_import_base(source, base_path, limits)
 }
 
