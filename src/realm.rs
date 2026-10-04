@@ -219,6 +219,9 @@ pub struct Realm {
     /// from which a VM closure's own `name`/`length` data properties are
     /// synthesized (no per-closure storage; see [`Realm::vm_fn_meta_value`]).
     vm_fn_meta: Vec<(Handle, u32)>,
+    /// The source text of VM function ids (index = function id), for
+    /// `Function.prototype.toString` (see [`Realm::fn_source`]).
+    vm_fn_src: Vec<Option<alloc::rc::Rc<str>>>,
     /// Live bytecode-VM activations across *all* nested VM contexts. A hosted
     /// VM run nests a fresh `Ctx` (call depth 0) for every host→VM call, so
     /// recursion bouncing between the tiers is bounded here, not per context.
@@ -547,6 +550,7 @@ impl Realm {
             typed_array_intrinsic: None,
             function_proto_intrinsic: None,
             vm_fn_meta: Vec::new(),
+            vm_fn_src: Vec::new(),
             vm_total_depth: 0,
             throw_type_error_intrinsic: None,
             array_proto_intrinsic: None,
@@ -1831,7 +1835,23 @@ impl Realm {
     /// The retained literal source text of the callable at `handle`, if any.
     #[must_use]
     pub fn fn_source(&self, handle: Handle) -> Option<&str> {
-        self.fn_source.get(&handle.to_raw()).map(|s| &**s)
+        if let Some(s) = self.fn_source.get(&handle.to_raw()) {
+            return Some(s);
+        }
+        let Some(Cell::VmFunction { func, .. }) = self.heap.get(handle) else {
+            return None;
+        };
+        self.vm_fn_src.get(*func as usize)?.as_deref()
+    }
+
+    /// Records the source text of VM function ids `self.vm_fn_src.len()..`
+    /// (one entry per function of the table, in order).
+    pub fn register_vm_fn_sources(
+        &mut self,
+        sources: impl Iterator<Item = Option<alloc::rc::Rc<str>>>,
+    ) {
+        let have = self.vm_fn_src.len();
+        self.vm_fn_src.extend(sources.skip(have));
     }
 
     /// Allocates an empty `Map` (`is_set = false`) or `Set` (`is_set = true`).

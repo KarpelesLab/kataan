@@ -164,6 +164,8 @@ pub fn compile_module_into(
         class_ctor: false,
         derived: false,
         is_generator: false,
+        source_span: None,
+        source: None,
     };
     protos
         .borrow_mut()
@@ -281,9 +283,12 @@ pub fn compile_module_into(
         .expect("unique proto table")
         .into_inner();
     match compiled {
-        Ok(()) => Ok(ModuleProtos {
-            main: base,
-            init: init_id,
+        Ok(()) => Ok({
+            crate::nbvm::resolve_fn_sources(&mut table[base as usize..], &program.source);
+            ModuleProtos {
+                main: base,
+                init: init_id,
+            }
         }),
         Err(e) => {
             table.truncate(base as usize);

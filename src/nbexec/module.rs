@@ -3056,6 +3056,8 @@ impl Interp<'_> {
     pub(crate) fn install_module_vm_table(&mut self, table: Rc<[crate::nbvm::FnProto]>) {
         self.realm
             .register_vm_fn_meta(table.iter().map(|p| (p.name.as_str(), p.length as u32)));
+        self.realm
+            .register_vm_fn_sources(table.iter().map(|p| p.source.clone()));
         self.vm_table = Some(Rc::clone(&table));
         self.modules.vm_table = Some(table);
     }

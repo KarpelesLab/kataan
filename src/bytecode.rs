@@ -970,6 +970,8 @@ pub fn deserialize(bytes: &[u8]) -> Result<Vec<FnProto>, DecodeError> {
             class_ctor: false,
             derived: false,
             is_generator: false,
+            source_span: None,
+            source: None,
         });
     }
     Ok(protos)
@@ -2677,6 +2679,8 @@ mod tests {
             class_ctor: false,
             derived: false,
             is_generator: false,
+            source_span: None,
+            source: None,
         };
         let bytes = serialize(&[proto]);
 

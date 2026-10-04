@@ -469,6 +469,8 @@ impl<'a> Interp<'a> {
                         self.realm.register_vm_fn_meta(
                             ext.iter().map(|p| (p.name.as_str(), p.length as u32)),
                         );
+                        self.realm
+                            .register_vm_fn_sources(ext.iter().map(|p| p.source.clone()));
                         self.vm_ext_table = Some(alloc::rc::Rc::clone(&ext));
                         // One growth chain with dynamically imported modules.
                         #[cfg(all(feature = "module", feature = "std"))]

@@ -811,6 +811,12 @@ pub struct FnProto {
     /// A generator function: a call runs the prologue up to
     /// [`Op::GeneratorStart`] and returns a suspended generator object.
     pub is_generator: bool,
+    /// The byte span of the function's source text in its program (for
+    /// `Function.prototype.toString`); resolved into [`Self::source`] once the
+    /// program is compiled. Not part of the portable artifact.
+    pub source_span: Option<(u32, u32)>,
+    /// The function's source text (see [`Self::source_span`]).
+    pub source: Option<alloc::rc::Rc<str>>,
 }
 
 /// A queued promise reaction: run `handler(value)` then settle `result` with
@@ -3488,6 +3494,8 @@ pub fn run_program_hosted(
     // VM closures' own `name`/`length` are synthesized by the realm from this.
     host.realm_slot()
         .register_vm_fn_meta(funcs.iter().map(|p| (p.name.as_str(), p.length as u32)));
+    host.realm_slot()
+        .register_vm_fn_sources(funcs.iter().map(|p| p.source.clone()));
     let mut realm = core::mem::take(host.realm_slot());
     let result = {
         let mut ctx = hosted_ctx(&mut realm, host);
@@ -10720,6 +10728,8 @@ pub fn compile_program_into(
         class_ctor: false,
         derived: false,
         is_generator: false,
+        source_span: None,
+        source: None,
     };
     // Reserve slots: main (0), top-level functions (1..=N), then class members
     // (N+1..next_id). Nested function expressions append beyond `next_id`.
@@ -10769,6 +10779,7 @@ pub fn compile_program_into(
             if let Some(id) = &f.id {
                 proto.name = alloc::string::String::from(id.name.as_ref());
             }
+            proto.source_span = Some((f.span.start, f.span.end));
             protos.borrow_mut()[base as usize + i + 1] = proto;
         }
         for job in &class_jobs {
@@ -10809,10 +10820,25 @@ pub fn compile_program_into(
         .expect("unique proto table")
         .into_inner();
     match compiled {
-        Ok(()) => Ok(base),
+        Ok(()) => {
+            resolve_fn_sources(&mut table[base as usize..], &program.source);
+            Ok(base)
+        }
         Err(e) => {
             table.truncate(base as usize);
             Err(e)
+        }
+    }
+}
+
+/// Fills each new function's [`FnProto::source`] from its span in the
+/// program text `source`.
+pub(crate) fn resolve_fn_sources(protos: &mut [FnProto], source: &str) {
+    for p in protos {
+        if p.source.is_none()
+            && let Some((s, e)) = p.source_span
+        {
+            p.source = source.get(s as usize..e as usize).map(alloc::rc::Rc::from);
         }
     }
 }
@@ -12222,6 +12248,8 @@ struct Compiler {
     /// only it binds its own name inside its body (a declaration, or a
     /// NamedEvaluation name, does not).
     next_closure_self_bind: bool,
+    /// The source span of the next closure [`Self::make_closure_ext`] builds.
+    next_closure_span: Option<crate::common::Span>,
     /// Compiling a generator function's body (`yield` suspends it).
     in_generator: bool,
     /// Compiling a hosted async function's body (`await` suspends it).
@@ -12939,6 +12967,7 @@ impl Compiler {
                 let Some(id) = &f.id else { continue };
                 refuse_generator(f, hosted)?;
                 c.next_closure_is_generator = f.is_generator;
+                c.next_closure_span = Some(f.span);
                 let closure =
                     c.make_closure(&f.params, &f.body, f.is_async, id.name.as_ref(), false)?;
                 let b = match c.scopes[0].get(&*id.name).copied() {
@@ -13151,6 +13180,8 @@ impl Compiler {
             class_ctor: class_ctor.is_some(),
             derived: class_ctor == Some(true),
             is_generator,
+            source_span: None,
+            source: None,
         })
     }
 }
@@ -13411,6 +13442,7 @@ impl Compiler {
                 let Some(id) = &func.id else { continue };
                 refuse_generator(func, hosted)?;
                 c.next_closure_is_generator = func.is_generator;
+                c.next_closure_span = Some(func.span);
                 let closure = c.make_closure(
                     &func.params,
                     &func.body,
@@ -13498,6 +13530,8 @@ impl Compiler {
             class_ctor: false,
             derived: false,
             is_generator,
+            source_span: None,
+            source: None,
         })
     }
 
@@ -17701,6 +17735,9 @@ impl Compiler {
                 self.next_closure_is_generator = f.is_generator;
                 let nm = f.id.as_ref().map_or("", |i| i.name.as_ref());
                 self.next_closure_self_bind = f.id.is_some();
+                if self.next_closure_span.is_none() {
+                    self.next_closure_span = Some(f.span);
+                }
                 self.make_closure(&f.params, &f.body, f.is_async, nm, false)
             }
             Expr::Arrow(a) => {
@@ -17711,6 +17748,7 @@ impl Compiler {
                         span: crate::common::Span::point(0),
                     }],
                 };
+                self.next_closure_span = Some(a.span);
                 self.make_closure(&a.params, &body, a.is_async, "", true)
             }
             // The optional-chain boundary. Allocate the result (defaulting to
@@ -17775,6 +17813,7 @@ impl Compiler {
                 Expr::Function(f) if f.id.is_none() => {
                     refuse_generator(f, self.hosted)?;
                     self.next_closure_is_generator = f.is_generator;
+                    self.next_closure_span = Some(f.span);
                     return self.make_closure(
                         &f.params,
                         &f.body,
@@ -17791,6 +17830,7 @@ impl Compiler {
                             span: crate::common::Span::point(0),
                         }],
                     };
+                    self.next_closure_span = Some(a.span);
                     return self.make_closure(&a.params, &body, a.is_async, id.name.as_ref(), true);
                 }
                 _ => {}
@@ -17933,6 +17973,7 @@ impl Compiler {
     /// free names (those its field initializers and hidden keys reference), and
     /// strictness (class code is always strict).
     fn make_closure_ext(&mut self, spec: ClosureSpec<'_, '_>) -> Result<Reg, CompileError> {
+        let span = self.next_closure_span.take();
         let ClosureSpec {
             params,
             body,
@@ -18008,6 +18049,8 @@ impl Compiler {
                 class_ctor: false,
                 derived: false,
                 is_generator: false,
+                source_span: None,
+                source: None,
             });
             (p.len() - 1) as u32
         };
@@ -18049,6 +18092,7 @@ impl Compiler {
         )?;
         let mut proto = proto;
         proto.name = alloc::string::String::from(name);
+        proto.source_span = span.map(|sp| (sp.start, sp.end));
         self.protos.borrow_mut()[id as usize] = proto;
         // Capture the cell registers for each free variable (in the same order the
         // callee binds them). The self-name (if any) gets a fresh cell here,
@@ -18833,6 +18877,7 @@ impl Compiler {
                 None if derived => (&default_params, &default_body),
                 None => (&[], &[]),
             };
+            self.next_closure_span = Some(class.span);
             let f = self.class_element_closure(
                 PROTO_NAME,
                 ClosureSpec::class_element(
@@ -18871,6 +18916,7 @@ impl Compiler {
                             continue;
                         };
                         let home = if m.is_static { CTOR_NAME } else { PROTO_NAME };
+                        self.next_closure_span = (!m.is_static).then_some(m.span);
                         let func = self.class_element_closure(
                             home,
                             ClosureSpec {
@@ -18936,6 +18982,7 @@ impl Compiler {
                         } else {
                             (proto, PROTO_NAME)
                         };
+                        self.next_closure_span = (!m.is_static).then_some(m.span);
                         let func = self.class_element_closure(
                             home,
                             ClosureSpec {
@@ -19168,12 +19215,19 @@ impl Compiler {
                         self.ops.push(Op::SetProtoIfObject { obj: dst, src: v });
                     }
                     ObjectMember::Property {
-                        key, value, method, ..
+                        key,
+                        value,
+                        method,
+                        span,
+                        ..
                     } => {
                         let k = self.class_key(key)?;
                         let named = *method || is_anonymous_fn_def(value);
                         let v = self.with_home(OBJ_HOME_NAME, |c| {
                             c.next_closure_is_method = *method;
+                            if *method {
+                                c.next_closure_span = Some(*span);
+                            }
                             let v = c.expr(value);
                             c.next_closure_is_method = false;
                             v
@@ -19202,12 +19256,13 @@ impl Compiler {
                         is_getter,
                         key,
                         value,
-                        ..
+                        span,
                     } => {
                         refuse_generator(value, self.hosted)?;
                         let k = self.class_key(key)?;
                         let f = self.with_home(OBJ_HOME_NAME, |c| {
                             c.next_closure_is_method = true;
+                            c.next_closure_span = Some(*span);
                             let f = c.make_closure(&value.params, &value.body, false, "", false);
                             c.next_closure_is_method = false;
                             f
@@ -19363,6 +19418,7 @@ impl Compiler {
             let name = &f.id.as_ref().expect("named").name;
             refuse_generator(f, self.hosted)?;
             self.next_closure_is_generator = f.is_generator;
+            self.next_closure_span = Some(f.span);
             let closure = self.make_closure(&f.params, &f.body, f.is_async, name, false)?;
             let b = self
                 .scopes
@@ -22949,6 +23005,8 @@ mod generic_jit_tests {
             class_ctor: false,
             derived: false,
             is_generator: false,
+            source_span: None,
+            source: None,
         });
         (funcs, f_id)
     }
@@ -23149,6 +23207,8 @@ mod generic_jit_tests {
             class_ctor: false,
             derived: false,
             is_generator: false,
+            source_span: None,
+            source: None,
         });
         id
     }

@@ -59,6 +59,8 @@ pub(crate) fn compile_eval_code(
         .into_inner();
     if r.is_err() {
         table.truncate(base);
+    } else {
+        super::resolve_fn_sources(&mut table[base..], &program.source);
     }
     r
 }
@@ -191,6 +193,8 @@ fn finish_eval_proto(mut c: Compiler, n_captures: usize) -> FnProto {
         class_ctor: false,
         derived: false,
         is_generator: false,
+        source_span: None,
+        source: None,
     }
 }
 
