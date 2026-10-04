@@ -4719,9 +4719,12 @@ impl Realm {
         self.gc_roots(&mut all);
         let stats = self.collect_with(&all, extern_expand, extern_prune);
         self.heap.reset_alloc_pressure();
-        self.gc_threshold = self
-            .gc_threshold_pinned
-            .unwrap_or_else(|| GC_MIN_THRESHOLD.max(self.heap.len().saturating_mul(GC_GROWTH)));
+        self.gc_threshold = self.gc_threshold_pinned.unwrap_or_else(|| {
+            // Scaled by the live set's tracing weight, not just its object
+            // count: the next cycle re-traces all of it.
+            let live = self.heap.len().max(stats.weight);
+            GC_MIN_THRESHOLD.max(live.saturating_mul(GC_GROWTH))
+        });
         Some(stats)
     }
 
@@ -4831,14 +4834,14 @@ impl Realm {
         // objects' keys for referenced ids and root those symbols.
         for h in marked {
             if let Some(obj) = heap.get(*h).and_then(Cell::as_object) {
-                for k in obj.all_keys() {
+                obj.for_each_symbol_key(|k| {
                     if let Some(idstr) = k.strip_prefix("\u{0}sym:")
                         && let Ok(id) = idstr.parse::<u64>()
                         && let Some(sym) = symbols_by_id.get(&id)
                     {
                         extra.push(*sym);
                     }
-                }
+                });
             }
         }
     }
@@ -5197,6 +5200,7 @@ impl Realm {
         Stats {
             marked: before - swept,
             swept,
+            weight: before - swept,
         }
     }
 
@@ -5234,6 +5238,7 @@ impl Realm {
         Stats {
             marked: before - swept,
             swept,
+            weight: before - swept,
         }
     }
 

@@ -719,6 +719,15 @@ impl Cell {
 }
 
 impl Trace for Cell {
+    fn weight(&self) -> usize {
+        1 + match self {
+            Cell::Object(o) => o.slot_count(),
+            Cell::Array(elems) => elems.len(),
+            Cell::Collection { entries, .. } => entries.len(),
+            _ => 0,
+        }
+    }
+
     fn trace(&self, visit: &mut dyn FnMut(Handle)) {
         match self {
             Cell::Object(o) => o.trace_handles(visit),

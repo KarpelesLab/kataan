@@ -26,6 +26,15 @@ use alloc::vec::Vec;
 pub trait Trace {
     /// Calls `visit` once for every handle this object refers to.
     fn trace(&self, visit: &mut dyn FnMut(Handle));
+
+    /// How much tracing work this object costs — roughly its slot count. A
+    /// collection's cost is the *weight* of the live set, not its object
+    /// count, so the allocation trigger is scaled by weight: one object with
+    /// a million properties must not be re-traced every few thousand
+    /// allocations.
+    fn weight(&self) -> usize {
+        1
+    }
 }
 
 /// A heap object whose outgoing handles can be **rewritten** — needed by a
@@ -43,6 +52,9 @@ pub struct Stats {
     pub marked: usize,
     /// Objects swept (freed) this cycle.
     pub swept: usize,
+    /// The summed [`Trace::weight`] of the kept objects (computed by
+    /// [`sweep_full`]; the object count elsewhere).
+    pub weight: usize,
 }
 
 /// The age at which an object is considered part of the **old** generation
@@ -155,6 +167,7 @@ pub fn collect<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
     Stats {
         marked: marked.len(),
         swept,
+        weight: marked.len(),
     }
 }
 
@@ -170,8 +183,10 @@ pub fn collect<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
 /// it only stops the table from holding a now-dangling handle.
 pub fn sweep_full<T: Trace>(heap: &mut Heap<T>, marked: &BTreeSet<Handle>) -> Stats {
     let mut swept = 0;
+    let mut weight = 0usize;
     for handle in heap.live_handles() {
         if marked.contains(&handle) {
+            weight = weight.saturating_add(heap.get(handle).map_or(1, Trace::weight));
             heap.tenure(handle);
         } else {
             heap.free(handle);
@@ -182,6 +197,7 @@ pub fn sweep_full<T: Trace>(heap: &mut Heap<T>, marked: &BTreeSet<Handle>) -> St
     Stats {
         marked: marked.len(),
         swept,
+        weight,
     }
 }
 
@@ -215,6 +231,7 @@ pub fn collect_minor<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
     Stats {
         marked: marked.len(),
         swept,
+        weight: marked.len(),
     }
 }
 
@@ -258,6 +275,7 @@ pub fn compact_with<T: Trace + Relocate>(
     Stats {
         marked: marked.len(),
         swept: before - marked.len(),
+        weight: marked.len(),
     }
 }
 

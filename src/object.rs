@@ -63,21 +63,25 @@ enum ObjectData {
     /// preserving insertion order. Carries no live `Rc<Shape>`, so it creates no
     /// transitions.
     ///
-    /// `map` is authoritative for *membership*; `order` only records positions
-    /// and is allowed to drift from it:
-    ///
-    /// - a **stale** entry (deleted key) may remain, and
-    /// - a key may appear **more than once** (deleted, then re-added).
-    ///
-    /// The last occurrence present in `map` gives the key's position, which is
-    /// exactly the spec's "a re-created property is chronologically new". This
-    /// drift is what makes `delete` O(log n): removing from `order` eagerly is a
-    /// linear `retain`, so deleting n keys was O(n²) — 20 000 deletes took 9.7 s
-    /// against node's 2 ms. `compact_order` bounds the slack.
+    /// Each map entry records its key's index in `order`. `delete` leaves a
+    /// `None` **tombstone** at that index instead of removing it (an eager
+    /// removal is a linear `retain`, so deleting n keys was O(n²) — 20 000
+    /// deletes took 9.7 s against node's 2 ms); a re-added key is appended,
+    /// which is exactly the spec's "a re-created property is chronologically
+    /// new". Enumeration skips tombstones without consulting the map, and
+    /// `compact_order` drops them once they outnumber the live keys.
     Dict {
-        order: Vec<Box<str>>,
-        map: BTreeMap<Box<str>, NanBox>,
+        order: Vec<Option<Box<str>>>,
+        map: BTreeMap<Box<str>, DictSlot>,
     },
+}
+
+/// A dictionary-mode property: its value and its key's index in the insertion
+/// `order` (see [`ObjectData::Dict`]).
+#[derive(Clone, Copy)]
+struct DictSlot {
+    value: NanBox,
+    pos: usize,
 }
 
 /// A property-bearing object: a hidden-class shape plus its value slots (or a
@@ -326,7 +330,7 @@ impl Object {
                 let slot = shape.lookup(key)?;
                 slots.get(slot as usize).copied()
             }
-            ObjectData::Dict { map, .. } => map.get(key).copied(),
+            ObjectData::Dict { map, .. } => map.get(key).map(|d| d.value),
         }
     }
 
@@ -363,7 +367,7 @@ impl Object {
             // Dictionary mode carries an empty sentinel shape; route around the
             // cache entirely so it never binds (and never goes stale on a later
             // dictionary mutation that does not change the sentinel pointer).
-            ObjectData::Dict { map, .. } => map.get(key).copied(),
+            ObjectData::Dict { map, .. } => map.get(key).map(|d| d.value),
         }
     }
 
@@ -443,11 +447,17 @@ impl Object {
                 // A non-extensible object silently ignores new keys.
             }
             ObjectData::Dict { order, map } => {
-                if let Some(v) = map.get_mut(key) {
-                    *v = value;
+                if let Some(d) = map.get_mut(key) {
+                    d.value = value;
                 } else if self.extensible {
-                    order.push(Box::from(key));
-                    map.insert(Box::from(key), value);
+                    map.insert(
+                        Box::from(key),
+                        DictSlot {
+                            value,
+                            pos: order.len(),
+                        },
+                    );
+                    order.push(Some(Box::from(key)));
                     added = true;
                 }
             }
@@ -476,11 +486,17 @@ impl Object {
                 }
             }
             ObjectData::Dict { order, map } => {
-                if let Some(v) = map.get_mut(key) {
-                    *v = value;
+                if let Some(d) = map.get_mut(key) {
+                    d.value = value;
                 } else {
-                    order.push(Box::from(key));
-                    map.insert(Box::from(key), value);
+                    map.insert(
+                        Box::from(key),
+                        DictSlot {
+                            value,
+                            pos: order.len(),
+                        },
+                    );
+                    order.push(Some(Box::from(key)));
                     added = true;
                 }
             }
@@ -515,21 +531,32 @@ impl Object {
     /// Rebuilds `Dict.order` from the live keys when it has accumulated more
     /// slack than live entries.
     ///
-    /// Deletion leaves stale entries behind (see [`ObjectData::Dict`]), so
+    /// Deletion leaves tombstones behind (see [`ObjectData::Dict`]), so
     /// without this a long-lived object that is repeatedly added to and deleted
-    /// from would grow `order` without bound and slow every enumeration. Halving
-    /// the slack costs O(n) but only after n deletions, so deletion stays
+    /// from would grow `order` without bound and slow every enumeration.
+    /// Dropping the tombstones is one linear pass over `order` plus one over the
+    /// map (renumbering each entry's position — no key lookups), and runs only
+    /// after as many deletions as there are live keys, so deletion stays
     /// amortized O(log n).
     fn compact_order(&mut self) {
-        let ObjectData::Dict { order, map } = &self.data else {
+        let ObjectData::Dict { order, map } = &mut self.data else {
             return;
         };
         if order.len() <= 2 * map.len() + 16 {
             return;
         }
-        let live: Vec<Box<str>> = self.keys().into_iter().map(Box::from).collect();
-        if let ObjectData::Dict { order, .. } = &mut self.data {
-            *order = live;
+        // `renumber[i]`: the new index of the live key at old index `i`.
+        let mut renumber: Vec<usize> = Vec::with_capacity(order.len());
+        let mut next = 0;
+        for k in order.iter() {
+            renumber.push(next);
+            if k.is_some() {
+                next += 1;
+            }
+        }
+        order.retain(Option::is_some);
+        for d in map.values_mut() {
+            d.pos = renumber[d.pos];
         }
     }
 
@@ -538,13 +565,19 @@ impl Object {
             return;
         };
         let keys = shape.keys();
-        let mut order: Vec<Box<str>> = Vec::with_capacity(keys.len());
-        let mut map: BTreeMap<Box<str>, NanBox> = BTreeMap::new();
+        let mut order: Vec<Option<Box<str>>> = Vec::with_capacity(keys.len());
+        let mut map: BTreeMap<Box<str>, DictSlot> = BTreeMap::new();
         for k in keys {
             let slot = shape.lookup(k).expect("shape key resolves");
-            let v = slots[slot as usize];
-            order.push(Box::from(k));
-            map.insert(Box::from(k), v);
+            let value = slots[slot as usize];
+            map.insert(
+                Box::from(k),
+                DictSlot {
+                    value,
+                    pos: order.len(),
+                },
+            );
+            order.push(Some(Box::from(k)));
         }
         // A fresh empty shape so `shape()` returns a pointer that resolves no
         // key (inline caches keyed on it always miss for this object).
@@ -557,20 +590,49 @@ impl Object {
     pub fn keys(&self) -> Vec<&str> {
         match &self.data {
             ObjectData::Shaped { shape, .. } => shape.keys(),
-            ObjectData::Dict { order, map } => {
-                // Walk backwards keeping the first sighting of each key that is
-                // still present, then restore order: that selects the *last*
-                // occurrence, so a deleted-then-re-added key reads as new.
-                let mut seen: alloc::collections::BTreeSet<&str> = Default::default();
-                let mut out: Vec<&str> = Vec::with_capacity(map.len());
-                for k in order.iter().rev() {
-                    let k = k.as_ref();
-                    if map.contains_key(k) && seen.insert(k) {
-                        out.push(k);
+            ObjectData::Dict { order, .. } => order.iter().flatten().map(AsRef::as_ref).collect(),
+        }
+    }
+
+    /// How many own properties (data and accessor) this object stores.
+    #[must_use]
+    pub fn slot_count(&self) -> usize {
+        let data = match &self.data {
+            ObjectData::Shaped { slots, .. } => slots.len(),
+            ObjectData::Dict { map, .. } => map.len(),
+        };
+        data + self.accessors.len()
+    }
+
+    /// Calls `f` with every own key that encodes a Symbol (the `\0sym:{id}`
+    /// form), data or accessor, in no particular order and possibly more than
+    /// once. The collector's symbol-liveness scan: unlike [`Self::all_keys`] it
+    /// neither allocates nor orders, and a dictionary object answers from its
+    /// sorted map in O(log n + symbols) — `\0` sorts first, so the symbol keys
+    /// are its smallest — rather than walking every key on every collection.
+    pub fn for_each_symbol_key(&self, mut f: impl FnMut(&str)) {
+        const SYM: &str = "\u{0}sym:";
+        match &self.data {
+            ObjectData::Shaped { shape, .. } => {
+                for k in shape.keys() {
+                    if k.starts_with(SYM) {
+                        f(k);
                     }
                 }
-                out.reverse();
-                out
+            }
+            ObjectData::Dict { map, .. } => {
+                use core::ops::Bound;
+                for (k, _) in map.range::<str, _>((Bound::Included(SYM), Bound::Unbounded)) {
+                    if !k.starts_with(SYM) {
+                        break;
+                    }
+                    f(k);
+                }
+            }
+        }
+        for (k, _, _) in &self.accessors {
+            if k.starts_with(SYM) {
+                f(k);
             }
         }
     }
@@ -757,8 +819,10 @@ impl Object {
                 *shape = new_shape;
                 *slots = new_slots;
             }
-            ObjectData::Dict { map, .. } => {
-                map.remove(key);
+            ObjectData::Dict { order, map } => {
+                if let Some(d) = map.remove(key) {
+                    order[d.pos] = None;
+                }
             }
         }
     }
@@ -807,10 +871,11 @@ impl Object {
                 *slots = new_slots;
                 true
             }
-            ObjectData::Dict { map, .. } => {
-                if map.remove(key).is_none() {
+            ObjectData::Dict { order, map } => {
+                let Some(d) = map.remove(key) else {
                     return had_accessor;
-                }
+                };
+                order[d.pos] = None;
                 self.compact_order();
                 true
             }
@@ -836,8 +901,8 @@ impl Object {
                 }
             }
             ObjectData::Dict { map, .. } => {
-                for v in map.values_mut() {
-                    fwd(v);
+                for d in map.values_mut() {
+                    fwd(&mut d.value);
                 }
             }
         }
@@ -866,8 +931,8 @@ impl Object {
                 }
             }
             ObjectData::Dict { map, .. } => {
-                for v in map.values() {
-                    trace_value(v, &mut visit);
+                for d in map.values() {
+                    trace_value(&d.value, &mut visit);
                 }
             }
         }
@@ -1082,11 +1147,11 @@ mod tests {
         o.set(key, value);
     }
 
-    /// `Dict.order` is allowed to hold stale and duplicate entries so that
-    /// `delete` need not scan it (deleting n keys was O(n²)). Enumeration must
-    /// still report each live key exactly once, at the position of its *last*
-    /// insertion — a deleted-then-re-added property is chronologically new — and
-    /// `order` must not grow without bound under churn.
+    /// `delete` leaves a tombstone in `Dict.order` so that it need not scan it
+    /// (deleting n keys was O(n²)). Enumeration must still report each live key
+    /// exactly once, at the position of its *last* insertion — a
+    /// deleted-then-re-added property is chronologically new — and `order` must
+    /// not grow without bound under churn.
     #[test]
     fn dictionary_delete_keeps_enumeration_order_and_is_bounded() {
         let threshold = 4;
@@ -1118,6 +1183,17 @@ mod tests {
         assert_eq!(o.keys().iter().filter(|k| **k == "k0").count(), 1);
         assert_eq!(*o.keys().last().unwrap(), "k0");
         assert_eq!(o.keys().len(), 10);
+        if let ObjectData::Dict { order, .. } = &o.data {
+            assert!(
+                order.len() <= 2 * 10 + 16,
+                "tombstones were never compacted"
+            );
+        }
+        // Compaction renumbered every survivor: each still deletes cleanly.
+        assert_eq!(
+            o.keys(),
+            ["k1", "k2", "k4", "k5", "k6", "k7", "k8", "k9", "k3", "k0"]
+        );
 
         // Deleting everything leaves an empty, self-consistent object.
         for i in 0..10 {
@@ -1126,6 +1202,30 @@ mod tests {
         assert_eq!(o.len(), 0);
         assert!(o.keys().is_empty());
         assert!(o.is_empty());
+    }
+
+    /// The collector's symbol-key scan sees exactly the `\0sym:` keys, data
+    /// and accessor, in both storage modes.
+    #[test]
+    fn symbol_key_scan_finds_only_symbol_keys() {
+        for threshold in [2, 64] {
+            let mut o = Object::new(Shape::root());
+            for k in [
+                "a",
+                "\u{0}sym:7",
+                "\u{0}hidden",
+                "z",
+                "\u{0}sym:3",
+                "\u{1}x",
+            ] {
+                add(&mut o, k, n(1.0), threshold);
+            }
+            o.define_accessor("\u{0}sym:9", NanBox::undefined(), NanBox::undefined());
+            let mut seen = Vec::new();
+            o.for_each_symbol_key(|k| seen.push(alloc::string::String::from(k)));
+            seen.sort();
+            assert_eq!(seen, ["\u{0}sym:3", "\u{0}sym:7", "\u{0}sym:9"]);
+        }
     }
 
     #[test]

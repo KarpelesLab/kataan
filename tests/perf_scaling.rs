@@ -129,13 +129,33 @@ fn string_index_is_constant_time() {
 }
 
 /// Tearing down a dictionary-mode object is linear. `delete` was a linear scan
-/// of the insertion-order vector, so this was quadratic.
+/// of the insertion-order vector, so this was quadratic; later the collections
+/// the key strings trigger re-traced the whole dictionary (see
+/// `allocation_beside_a_large_object_is_linear`), and periodic tombstone
+/// compaction rebuilt the key order through an ordered set, which kept the
+/// ratio near its bound.
 #[test]
 fn property_delete_is_linear() {
     assert_scaling("delete", 20_000, 8.0, |n| {
         timed(
             &format!("const o={{}}; for(let i=0;i<{n};i++)o['k'+i]=i;"),
             &format!("for(let i=0;i<{n};i++)delete o['k'+i];"),
+        )
+    });
+}
+
+/// Allocating beside one large live object is linear. The collector's
+/// trigger counted live *objects*, so a single dictionary with n properties
+/// kept the threshold at its minimum and was re-traced every few thousand
+/// allocations — and each trace rebuilt its ordered key list to look for
+/// symbol keys. That made `delete o['k'+i]` (and any loop allocating next to a
+/// big dictionary) quadratic.
+#[test]
+fn allocation_beside_a_large_object_is_linear() {
+    assert_scaling("allocation beside a large object", 80_000, 8.0, |n| {
+        timed(
+            &format!("const o={{}}; for(let i=0;i<{n};i++)o['k'+i]=i;"),
+            &format!("let c=0; for(let i=0;i<{n};i++) c+=('k'+i).length;"),
         )
     });
 }
