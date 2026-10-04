@@ -311,6 +311,10 @@ pub struct Realm {
     /// default — makes every check point a null test on this `Option`.
     /// See [`crate::interrupt`].
     pub interrupt: Option<crate::interrupt::Interrupt>,
+    /// Set by the host once a `$262.agent` worker exists: the bytecode VM's
+    /// loop back-edges then hand the agents' execution baton over (as the
+    /// tree-walker's do), so a spin loop waiting on another agent progresses.
+    pub agents_active: bool,
     /// Allocation-pressure trigger: the number of objects that may be allocated
     /// after the last collection before [`maybe_collect`](Realm::maybe_collect)
     /// runs another one. Re-armed after every cycle to
@@ -514,6 +518,7 @@ impl Realm {
         let pinned: Option<usize> = None;
         Self {
             interrupt: None,
+            agents_active: false,
             heap,
             root_shape: Shape::root(),
             atoms: AtomTable::new(),

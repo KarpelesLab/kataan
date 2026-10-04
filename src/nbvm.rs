@@ -1087,6 +1087,11 @@ pub trait VmHost {
     fn generator_intrinsics(&mut self, is_async: bool) -> Option<(NanBox, NanBox)>;
     /// `%AsyncFunction.prototype%`, an async function's `[[Prototype]]`.
     fn async_function_proto(&mut self) -> Option<NanBox>;
+    /// A `$262.agent` scheduling point at a loop back-edge (see
+    /// [`Realm::agents_active`]): hand the baton on and take it back. `true`
+    /// when the run must stop (the agent pool is shutting down, or the host
+    /// interrupt tripped).
+    fn agent_tick(&mut self) -> bool;
     /// A fresh pending host promise (an async function's result).
     fn new_promise(&mut self) -> NanBox;
     /// Resolves (`fulfilled`) or rejects the host promise `p` with `v`.
@@ -2983,6 +2988,12 @@ pub(crate) fn construct_vm_function(
 
 /// The `[[Prototype]]` a hosted VM closure gets: `%Function.prototype%`, so
 /// `f.call`/`apply`/`bind` and friends resolve through the host's library.
+/// [`VmHost::agent_tick`] (`true`: stop the run).
+#[cold]
+fn vm_agent_tick(ctx: &mut Ctx) -> bool {
+    with_host(ctx, |h| h.agent_tick()).unwrap_or(false)
+}
+
 /// Hosted: a (non-generator) async function inherits
 /// %AsyncFunction.prototype%.
 fn link_async_proto(ctx: &mut Ctx, proto: Option<&FnProto>, f: Handle) {
@@ -7000,6 +7011,10 @@ fn run_frame_at(
             }
             Op::JumpIfFalse { cond, target } => {
                 if !ctx.realm.truthy(regs[*cond as usize]) {
+                    // (A `do … while` back-edge: an agent scheduling point.)
+                    if *target <= pc && ctx.realm.agents_active && vm_agent_tick(ctx) {
+                        return Err(VmError::Interrupted);
+                    }
                     pc = *target;
                 }
             }
@@ -7015,6 +7030,9 @@ fn run_frame_at(
                         .as_ref()
                         .is_some_and(crate::interrupt::Interrupt::is_tripped)
                     {
+                        return Err(VmError::Interrupted);
+                    }
+                    if ctx.realm.agents_active && vm_agent_tick(ctx) {
                         return Err(VmError::Interrupted);
                     }
                     vm_safepoint(ctx, funcs, program, regs);
@@ -15455,8 +15473,31 @@ impl Compiler {
                 }
                 Ok(())
             }
-            // Hosted, a tagged template compiles as an ordinary call (its template
-            // object comes from the host).
+            // Hosted, a tagged template with a plain (non-member) tag is a
+            // proper tail call of the tag (its template object comes from the
+            // host); a member tag keeps the ordinary receiver-binding call.
+            Expr::TaggedTemplate { tag, quasi, .. }
+                if self.hosted && !matches!(&**tag, Expr::Member { .. } | Expr::Super(_)) =>
+            {
+                let callee = self.expr(tag)?;
+                let strings = self.alloc();
+                self.ops.push(Op::TemplateObject {
+                    dst: strings,
+                    site: core::ptr::from_ref(quasi) as u64,
+                    cooked: quasi
+                        .quasis
+                        .iter()
+                        .map(|q| q.cooked.as_deref().map(<[u8]>::to_vec))
+                        .collect(),
+                    raw: quasi.quasis.iter().map(|q| String::from(&*q.raw)).collect(),
+                });
+                let mut args = alloc::vec![strings];
+                for ex in &quasi.expressions {
+                    args.push(self.expr(ex)?);
+                }
+                self.ops.push(Op::TailCallValue { callee, args });
+                Ok(())
+            }
             Expr::TaggedTemplate { .. } if self.hosted => {
                 let src = self.expr(e)?;
                 self.ops.push(Op::Return { src });
@@ -16207,15 +16248,6 @@ impl Compiler {
                 }
                 Ok(dst)
             }
-            // `$262.agent` (Atomics agents): the agents' baton handoff happens
-            // on the tree-walker's spin loops, which the VM's do not perform.
-            Expr::Member {
-                object,
-                property: PropertyKey::Ident(k),
-                ..
-            } if &**k == "agent" && matches!(&**object, Expr::Ident(id) if &*id.name == "$262") => {
-                Err(CompileError::Unsupported("$262.agent"))
-            }
             // `super.x` / `super[k]` in a hosted class element.
             Expr::Member {
                 object, property, ..
@@ -16619,7 +16651,17 @@ impl Compiler {
                 }
                 // Otherwise an indirect call through a function *value* (a local
                 // holding a function, or any callee expression).
-                let callee_reg = self.expr(callee)?;
+                let mut callee_reg = self.expr(callee)?;
+                // A local's register is the binding itself: an argument that
+                // reassigns it must not change the callee already evaluated.
+                if self.hosted && matches!(&**callee, Expr::Ident(_)) && !arguments.is_empty() {
+                    let t = self.alloc();
+                    self.ops.push(Op::Move {
+                        dst: t,
+                        src: callee_reg,
+                    });
+                    callee_reg = t;
+                }
                 let args = self.call_args(arguments)?;
                 let dst = self.alloc();
                 self.ops.push(Op::CallValue {
@@ -17213,7 +17255,14 @@ impl Compiler {
                     && !matches!(&**callee, Expr::Ident(id)
                         if self.lookup(&id.name).is_none() && self.classes.contains_key(&*id.name))
                 {
-                    let ctor = self.expr(callee)?;
+                    let mut ctor = self.expr(callee)?;
+                    // (The callee is evaluated before the arguments: copy a
+                    // local's binding register an argument may reassign.)
+                    if matches!(&**callee, Expr::Ident(_)) && !arguments.is_empty() {
+                        let t = self.alloc();
+                        self.ops.push(Op::Move { dst: t, src: ctor });
+                        ctor = t;
+                    }
                     if arguments
                         .iter()
                         .any(|a| matches!(a, crate::ast::Argument::Spread(_)))

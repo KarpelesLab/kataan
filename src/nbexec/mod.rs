@@ -10380,6 +10380,10 @@ impl crate::nbvm::VmHost for Interp<'_> {
         Some((NanBox::handle(gf.to_raw()), NanBox::handle(g.to_raw())))
     }
 
+    fn agent_tick(&mut self) -> bool {
+        Interp::agent_tick(self).is_err()
+    }
+
     fn async_function_proto(&mut self) -> Option<NanBox> {
         self.async_function_prototype()
             .map(|h| NanBox::handle(h.to_raw()))

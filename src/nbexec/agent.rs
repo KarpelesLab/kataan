@@ -107,6 +107,7 @@ impl<'a> Interp<'a> {
         pool.acquire();
         self.agent.pool = Some(pool.clone());
         self.agent.id = 0;
+        self.realm.agents_active = true;
         pool
     }
 
