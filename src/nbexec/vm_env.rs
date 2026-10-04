@@ -242,6 +242,7 @@ impl<'a> Interp<'a> {
                 field_init,
                 private_names,
                 private_keys,
+                derived,
             } => {
                 let is_eval = callee.as_handle().map(Handle::from_raw).is_some_and(|h| {
                     self.realm.native_at(h) == Some(N_EVAL)
@@ -268,11 +269,23 @@ impl<'a> Interp<'a> {
                 let saved_current = core::mem::replace(&mut self.current, lex);
                 let saved_var = core::mem::replace(&mut self.var_scope, var);
                 let saved_strict = core::mem::replace(&mut self.strict, strict);
+                // The tree-walker's `this` (a fallback): in a derived
+                // constructor, the cell's value.
+                let this = match derived.and_then(|(c, _)| c.as_handle()) {
+                    Some(h) => self
+                        .realm
+                        .array_elements(Handle::from_raw(h))
+                        .and_then(|e| e.first().copied())
+                        .unwrap_or(NanBox::tdz()),
+                    None => this,
+                };
                 let saved_this = core::mem::replace(&mut self.this_val, this);
                 let saved_nt = core::mem::replace(&mut self.new_target, new_target);
                 let saved_nt_scope =
                     core::mem::replace(&mut self.new_target_in_scope, new_target_in_scope);
-                let saved_sc_scope = core::mem::replace(&mut self.super_call_in_scope, false);
+                let saved_sc_scope =
+                    core::mem::replace(&mut self.super_call_in_scope, derived.is_some());
+                let saved_derived = core::mem::replace(&mut self.vm_eval_derived, derived);
                 let saved_home = self.current_home.take();
                 let saved_home_object = core::mem::replace(
                     &mut self.current_home_object,
@@ -306,6 +319,7 @@ impl<'a> Interp<'a> {
                 self.in_field_initializer = saved_field_init;
                 self.vm_eval_home = saved_vm_home;
                 self.vm_eval_privates = saved_privates;
+                self.vm_eval_derived = saved_derived;
                 self.eval_param_names = saved_param_names;
                 #[cfg(all(feature = "module", feature = "std"))]
                 if let Some(mi) = saved_imports {
@@ -420,6 +434,10 @@ impl<'a> Interp<'a> {
             self.vm_eval_privates.clone()
         };
         let names: Vec<&str> = privates.iter().map(|(n, _)| n.as_str()).collect();
+        let derived = self.vm_eval_derived.filter(|_| !script);
+        if derived.is_some() {
+            flags |= crate::nbvm::EVAL_DERIVED;
+        }
         let (table, proto) = self.vm_eval_proto(program, strict, flags, &names)?;
         // EvalDeclarationInstantiation's bindings (the VM code instantiates the
         // function declarations itself).
@@ -440,15 +458,18 @@ impl<'a> Interp<'a> {
         let result = hoisted.and_then(|()| {
             let lex = self.env_value(self.current.clone());
             let var = self.env_value(self.var_scope.clone());
-            let mut caps = alloc::vec![lex, var, self.this_val];
+            let this_cap = derived.map_or(self.this_val, |(cell, _)| cell);
+            let mut caps = alloc::vec![lex, var, this_cap];
             caps.extend(new_target);
             caps.extend(home);
             if flags & crate::nbvm::EVAL_FIELD_INIT != 0 {
                 caps.push(NanBox::boolean(true));
             }
             caps.extend(privates.iter().map(|(_, k)| *k));
+            caps.extend(derived.map(|(_, ctor)| ctor));
             let table = self.vm_newest_table().unwrap_or(table);
-            crate::nbvm::run_eval_code(self, &table, &proto, &caps).map_err(vm_to_exec)
+            crate::nbvm::run_eval_code(self, &table, &proto, &caps, derived.is_some())
+                .map_err(vm_to_exec)
         });
         self.eval_site_epoch = saved_epoch;
         self.src = saved_src;
@@ -468,7 +489,7 @@ impl<'a> Interp<'a> {
         let g = self.global_scope.clone();
         let env = self.env_value(g);
         let caps = [env, env, self.global_this];
-        Some(crate::nbvm::run_eval_code(self, &table, &proto, &caps).map_err(vm_to_exec))
+        Some(crate::nbvm::run_eval_code(self, &table, &proto, &caps, false).map_err(vm_to_exec))
     }
 
     /// Eval code compiled for the VM (cached per program and flags), with the

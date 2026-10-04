@@ -897,6 +897,9 @@ pub struct Interp<'a> {
     /// The private names (and keys) in scope at the VM direct eval that is
     /// running.
     vm_eval_privates: Vec<(String, NanBox)>,
+    /// The running VM direct eval's derived-constructor `this` cell and
+    /// constructor, when it is inside one before `super()` may have run.
+    vm_eval_derived: Option<(NanBox, NanBox)>,
 }
 
 /// The `[[ParameterMap]]` of one mapped `arguments` object: the shared parameter
@@ -3381,6 +3384,7 @@ impl<'a> Interp<'a> {
             hoist_skip_fns: false,
             vm_eval_home: None,
             vm_eval_privates: Vec::new(),
+            vm_eval_derived: None,
         };
         // The constructor's `current` IS the root scope; capture it as the global
         // scope before `install_globals` populates it, so indirect eval can run

@@ -479,6 +479,11 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*callee)?;
             regs(args)
         }
+        Op::TailCallThis { callee, this, args } => {
+            reg(*callee)?;
+            reg(*this)?;
+            regs(args)
+        }
         Op::LoadGlobal { dst, .. } | Op::TypeofGlobal { dst, .. } => reg(*dst),
         Op::StoreGlobal { src, resolved, .. } => {
             if let Some(r) = resolved {
@@ -1233,6 +1238,12 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
         Op::TailCallValue { callee, args } => {
             w_u8(59, out);
             w_reg(*callee, out);
+            w_regs(args, out);
+        }
+        Op::TailCallThis { callee, this, args } => {
+            w_u8(201, out);
+            w_reg(*callee, out);
+            w_reg(*this, out);
             w_regs(args, out);
         }
         Op::LoadGlobal { dst, name } => {
@@ -2056,6 +2067,11 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         },
         59 => Op::TailCallValue {
             callee: r.reg()?,
+            args: r.regs()?,
+        },
+        201 => Op::TailCallThis {
+            callee: r.reg()?,
+            this: r.reg()?,
             args: r.regs()?,
         },
         60 => Op::LoadGlobal {

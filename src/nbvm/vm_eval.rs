@@ -42,6 +42,10 @@ pub(crate) const EVAL_DYN_FN: u8 = 4;
 pub(crate) const EVAL_HOME: u8 = 8;
 /// [`compile_eval_code`] flag: the eval is in a class field initializer.
 pub(crate) const EVAL_FIELD_INIT: u8 = 16;
+/// [`compile_eval_code`] flag: in a derived constructor — the `this` capture
+/// is the constructor's own `this` cell (TDZ until `super()`), and the
+/// constructor follows the private names.
+pub(crate) const EVAL_DERIVED: u8 = 32;
 
 /// Compiles eval code `program` (strict or sloppy as the host decided).
 /// Functions it defines are appended to `table` (their ids follow the
@@ -104,6 +108,9 @@ fn compile_eval_body(
         names.push(String::from(super::FIELD_INIT_NAME));
     }
     names.extend(privates.iter().map(|n| super::private_binding(n)));
+    if flags & EVAL_DERIVED != 0 {
+        names.push(String::from(super::CTOR_NAME));
+    }
     let cap_regs: Vec<_> = names.iter().map(|_| c.alloc()).collect();
     c.this_reg = c.alloc();
     for (j, n) in names.iter().enumerate() {
@@ -114,7 +121,7 @@ fn compile_eval_body(
                 cell: true,
                 konst: false,
                 global: None,
-                tdz: false,
+                tdz: flags & EVAL_DERIVED != 0 && n == THIS_NAME,
                 mapped: false,
                 fn_name: false,
             },
@@ -226,11 +233,12 @@ pub(crate) fn run_eval_code(
     table: &alloc::rc::Rc<[FnProto]>,
     proto: &FnProto,
     captures: &[NanBox],
+    this_cell: bool,
 ) -> Result<NanBox, VmError> {
     let mut realm = core::mem::take(host.realm_slot());
     let result = {
         let mut ctx = hosted_ctx(&mut realm, host);
-        let r = run_eval_frame(&mut ctx, table, proto, captures);
+        let r = run_eval_frame(&mut ctx, table, proto, captures, this_cell);
         if r.is_ok() && !ctx.microtasks.is_empty() {
             Err(VmError::Unsupported)
         } else {
@@ -246,6 +254,7 @@ fn run_eval_frame(
     table: &[FnProto],
     proto: &FnProto,
     captures: &[NanBox],
+    this_cell: bool,
 ) -> Result<NanBox, VmError> {
     if ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth {
         let e = super::vm_error(ctx, "RangeError", "Maximum call stack size exceeded");
@@ -253,8 +262,12 @@ fn run_eval_frame(
     }
     let mut regs: Vec<NanBox> = alloc::vec![NanBox::undefined(); proto.n_regs];
     for (j, v) in captures.iter().enumerate().take(proto.n_captures) {
-        let cell = ctx.realm.new_array(alloc::vec![*v]);
-        regs[proto.n_params + j] = NanBox::handle(cell.to_raw());
+        // Capture 2 (`this`) may already be the caller's cell.
+        regs[proto.n_params + j] = if j == 2 && this_cell {
+            *v
+        } else {
+            NanBox::handle(ctx.realm.new_array(alloc::vec![*v]).to_raw())
+        };
     }
     ctx.realm.vm_total_depth += 1;
     let r = run_frame(ctx, table, &proto.ops, &mut regs);

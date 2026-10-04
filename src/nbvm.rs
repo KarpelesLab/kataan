@@ -37,8 +37,8 @@ use alloc::vec::Vec;
 
 mod vm_eval;
 pub(crate) use vm_eval::{
-    EVAL_DYN_FN, EVAL_FIELD_INIT, EVAL_HOME, EVAL_NEW_TARGET, EVAL_SCRIPT, compile_eval_code,
-    run_eval_code,
+    EVAL_DERIVED, EVAL_DYN_FN, EVAL_FIELD_INIT, EVAL_HOME, EVAL_NEW_TARGET, EVAL_SCRIPT,
+    compile_eval_code, run_eval_code,
 };
 #[cfg(all(feature = "std", feature = "module"))]
 mod vm_module;
@@ -627,6 +627,13 @@ pub enum Op {
     /// is not a plain VM function, it degrades to an ordinary call whose result
     /// is returned.
     TailCallValue { callee: Reg, args: Vec<Reg> },
+    /// [`Op::TailCallValue`] with an explicit `this` (a callee a `with` object
+    /// supplied).
+    TailCallThis {
+        callee: Reg,
+        this: Reg,
+        args: Vec<Reg>,
+    },
 }
 
 // `Op::ValueBin` op codes.
@@ -3226,6 +3233,9 @@ pub enum EnvReq<'r> {
         /// The private names in scope (bare, `x` for `#x`) and their keys.
         private_names: &'r [&'r str],
         private_keys: &'r [NanBox],
+        /// In a derived constructor: its `this` cell (a one-element array,
+        /// TDZ until `super()`) and the constructor (`super()` in the eval code).
+        derived: Option<(NanBox, NanBox)>,
     },
     /// Whether `callee` is the running realm's %eval% (a direct eval).
     IsEval { callee: NanBox },
@@ -3279,7 +3289,8 @@ pub(crate) const EK_REF_PUT: u8 = 13;
 /// scope, bit 2 in a parameter list (the parameter names, joined by `\n`,
 /// start `name`), bit 3 a home object (`regs[7]`), bit 4 in a class field
 /// initializer, bit 5 private names in scope (their keys follow; `name`'s part
-/// after a `\u{1}` lists them).
+/// after a `\u{1}` lists them), bit 6 in a derived constructor (its `this`
+/// cell and the constructor follow).
 pub(crate) const EK_EVAL: u8 = 14;
 /// Maps the arguments object `regs[0]` over `regs[1]`'s parameter bindings,
 /// `name` = the parameter names joined by `\n`.
@@ -6613,6 +6624,10 @@ fn run_frame_at(
                 let private_keys: Vec<NanBox> = (0..private_names.len())
                     .map(|i| regs[rs[first_private + i] as usize])
                     .collect();
+                let derived = (*kind == EK_EVAL && *flags & 64 != 0).then(|| {
+                    let at = first_private + private_names.len();
+                    (regs[rs[at] as usize], regs[rs[at + 1] as usize])
+                });
                 let req = match *kind {
                     EK_ROOT => EnvReq::Root { name },
                     EK_CHILD => EnvReq::Child {
@@ -6682,6 +6697,7 @@ fn run_frame_at(
                         field_init: *flags & 16 != 0,
                         private_names: &private_names,
                         private_keys: &private_keys,
+                        derived,
                     },
                     EK_IS_EVAL => EnvReq::IsEval { callee: r(0) },
                     EK_DECL_FN => EnvReq::DeclFn {
@@ -8056,6 +8072,33 @@ fn run_frame_at(
             // Proper tail call through a function *value*: if it is a plain VM
             // closure, trampoline (reusing the frame); otherwise degrade to an
             // ordinary call and return its result (semantically `return callee()`).
+            Op::TailCallThis { callee, this, args } => {
+                let val = regs[*callee as usize];
+                let this_v = regs[*this as usize];
+                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                if let Some((fid, caps)) = val
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| ctx.realm.vm_function(h).map(|(f, c)| (f, c.to_vec())))
+                {
+                    return Ok(FrameExit::Tail {
+                        id: fid as usize,
+                        args: argv,
+                        captures: caps,
+                        this: this_v,
+                    });
+                }
+                let pub_mark = ctx.frame_shadow.len();
+                ctx.frame_shadow.extend_from_slice(regs);
+                ctx.frames_published += 1;
+                let pub_r = call_closure(ctx, funcs, val, &argv, this_v);
+                ctx.frames_published -= 1;
+                ctx.frame_shadow.truncate(pub_mark);
+                match pub_r {
+                    Ok(v) => return Ok(FrameExit::Return(Some(v))),
+                    Err(e) => handle_throw!(e),
+                }
+            }
             Op::TailCallValue { callee, args } => {
                 let val = regs[*callee as usize];
                 let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
@@ -12771,9 +12814,9 @@ impl Compiler {
         };
         if dyn_fn {
             // `super()` in eval code is not modelled.
-            if class_ctor == Some(true) || !fields.is_empty() {
+            if !fields.is_empty() {
                 return Err(CompileError::Unsupported(
-                    "dynamic scope in a derived constructor",
+                    "dynamic scope with static fields",
                 ));
             }
             c.dyn_fn = true;
@@ -12790,6 +12833,7 @@ impl Compiler {
                 rest_from,
                 field_defs,
                 class_ctor: class_ctor.is_some(),
+                cap_flags,
             });
         }
         // The `arguments` object is the function's first instruction (see
@@ -13323,6 +13367,7 @@ struct DynFn<'a> {
     rest_from: Option<usize>,
     field_defs: &'a [FieldDef<'a>],
     class_ctor: bool,
+    cap_flags: &'a alloc::collections::BTreeMap<String, (bool, bool, bool, bool)>,
 }
 
 /// The hidden binding marking a class field initializer (a direct eval in
@@ -13349,6 +13394,7 @@ impl Compiler {
             rest_from,
             field_defs,
             class_ctor,
+            cap_flags,
         } = f;
         let c = &mut self;
         let strict = c.strict;
@@ -13383,7 +13429,8 @@ impl Compiler {
                 cell: true,
                 konst: false,
                 global: None,
-                tdz: false,
+                // A captured derived-constructor `this` keeps its TDZ check.
+                tdz: name.starts_with('\0') && cap_flags.get(name).is_some_and(|f| f.0),
                 mapped: false,
                 fn_name: false,
             };
@@ -13401,6 +13448,12 @@ impl Compiler {
             let b = c.declare(THIS_NAME);
             let this = c.this_reg;
             c.write_var(b, this);
+            // A derived constructor's `this` is in its TDZ until `super()`.
+            if c.derived_ctor
+                && let Some(b) = c.scopes[0].get_mut(THIS_NAME)
+            {
+                b.tdz = true;
+            }
         }
         if let Some(r) = new_target_reg {
             let b = c.declare(NT_NAME);
@@ -13643,6 +13696,11 @@ impl Compiler {
             c.using_scope(body, |c| {
                 body.iter().try_for_each(|s| c.stmt(s).map(|_| ()))
             })?;
+            // Falling off a derived constructor's body returns the bound `this`.
+            if c.derived_ctor {
+                let u = c.constant(NanBox::undefined())?;
+                c.emit_derived_return(u);
+            }
         }
         if c.reg_overflow {
             return Err(CompileError::Unsupported("too many registers"));
@@ -13662,7 +13720,7 @@ impl Compiler {
             name: alloc::string::String::new(),
             legacy: !strict && !is_arrow && !is_async && !is_main && !is_generator,
             class_ctor,
-            derived: false,
+            derived: c.derived_ctor,
             is_generator,
             source_span: None,
             source: None,
@@ -13931,16 +13989,16 @@ impl Compiler {
             b: u,
         });
         let with_this = self.emit_jump_if_false(no_this);
-        self.ops.push(Op::TailCallValue { callee: f, args });
+        self.ops.push(Op::TailCallValue {
+            callee: f,
+            args: args.clone(),
+        });
         self.patch(with_this);
-        let dst = self.alloc();
-        self.ops.push(Op::CallSpread {
-            dst,
+        self.ops.push(Op::TailCallThis {
             callee: f,
             this,
-            args: arr,
+            args,
         });
-        self.ops.push(Op::Return { src: dst });
         Ok(true)
     }
 
@@ -13952,7 +14010,18 @@ impl Compiler {
         let var_env = self.var_env.ok_or(CompileError::Unsupported(
             "direct eval outside a dynamic scope",
         ))?;
-        let this_v = self.this_value();
+        // In a derived constructor (or an arrow / eval code inside one) before
+        // `super()`: the eval code shares the `this` cell and may call
+        // `super()` itself.
+        let derived = match (self.lookup(THIS_NAME), self.lookup(CTOR_NAME)) {
+            (Some(tb), Some(cb)) if tb.cell && tb.tdz => Some((tb, cb)),
+            _ => None,
+        };
+        let this_v = if derived.is_some() {
+            self.constant(NanBox::undefined())?
+        } else {
+            self.this_value()
+        };
         let nt_b = self.lookup(NT_NAME);
         let nt = match nt_b {
             Some(b) => self.read_var(b),
@@ -13989,7 +14058,15 @@ impl Compiler {
                 names.push_str(p.trim_start_matches("\0#"));
             }
         }
+        if let Some((tb, cb)) = derived {
+            // The derived constructor's `this` sync: refresh it from the cell
+            // the eval code may have bound.
+            regs.push(tb.reg);
+            regs.push(self.read_var(cb));
+            flags |= 64;
+        }
         self.env_op(EK_EVAL, dst, regs, &names, flags);
+        self.sync_this_from_cell();
         Ok(dst)
     }
 
@@ -15482,6 +15559,18 @@ impl Compiler {
                     {
                         continue;
                     }
+                    // Dynamic scoping: a `var` initializer's reference is
+                    // resolved before the initializer runs (a `with` object
+                    // that provides the name keeps the write).
+                    if self.dyn_fn
+                        && matches!(decl.kind, crate::ast::VarDeclKind::Var)
+                        && let (BindingTarget::Ident(id), Some(e)) = (&d.target, &d.init)
+                    {
+                        let b = self.env_ref(&id.name);
+                        let value = self.expr_named(e, &d.target)?;
+                        self.write_var(b, value);
+                        continue;
+                    }
                     let value = match &d.init {
                         Some(e) => self.expr_named(e, &d.target)?,
                         None => self.constant(NanBox::undefined())?,
@@ -16887,7 +16976,7 @@ impl Compiler {
                 && !self.optchain_ends.is_empty()
                 && !matches!(&**callee, Expr::OptChain { .. }) =>
             {
-                self.refuse_direct_eval(callee)?;
+                // `eval?.(…)` is an ordinary call (an indirect eval).
                 let (f, this) = match &**callee {
                     Expr::Member {
                         object,
@@ -17016,7 +17105,9 @@ impl Compiler {
                 optional,
                 ..
             } if self.hosted && (*optional || is_optional_callee(callee)) => {
-                self.refuse_direct_eval(callee)?;
+                if !*optional {
+                    self.refuse_direct_eval(callee)?;
+                }
                 self.optional_call(callee, arguments, *optional)
             }
             Expr::Call {
@@ -18385,6 +18476,8 @@ impl Compiler {
                 free.insert(String::from(HOME_NAME));
             }
             free.extend(self.visible_private_bindings());
+            // A derived constructor's (eval code may call `super()`).
+            free.insert(String::from(CTOR_NAME));
             if is_arrow {
                 free.insert(String::from(THIS_NAME));
                 free.insert(String::from(NT_NAME));
