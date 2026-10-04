@@ -1388,9 +1388,6 @@ fn hosted_ctx_in<'a>(realm: &'a mut Realm, host: &'a mut dyn VmHost) -> Ctx<'a> 
         frames_published: 0,
         top_frame_roots: Vec::new(),
         pending_callee: None,
-        callee_stack: Vec::new(),
-        args_buf: Vec::new(),
-        callee_args: Vec::new(),
         pending_new_target: None,
         in_realm: None,
     }
@@ -1884,6 +1881,10 @@ const GEN_SUSPENDED_YIELD: f64 = 1.0;
 const GEN_EXECUTING: f64 = 2.0;
 const GEN_COMPLETED: f64 = 3.0;
 
+/// The hidden slot of a VM generator function holding its realm's
+/// %GeneratorPrototype% / %AsyncGeneratorPrototype%.
+const GEN_PROTO_KEY: &str = "\0genproto";
+
 /// [`Op::InitGenerator`].
 fn init_generator(ctx: &mut Ctx, funcs: &[FnProto], f: NanBox) -> Result<(), VmError> {
     let fh = f
@@ -1903,6 +1904,9 @@ fn init_generator(ctx: &mut Ctx, funcs: &[FnProto], f: NanBox) -> Result<(), VmE
     let p = ctx
         .realm
         .new_object_with_proto(g_proto.as_handle().map(Handle::from_raw));
+    // The function realm's %GeneratorPrototype% (the fallback when its
+    // `prototype` is later not an object).
+    ctx.realm.set_hidden_property(fh, GEN_PROTO_KEY, g_proto);
     let key = NanBox::handle(ctx.realm.new_string("prototype").to_raw());
     let pv = NanBox::handle(p.to_raw());
     match with_host(ctx, |h| h.define_data(f, key, pv, 1)) {
@@ -1928,8 +1932,13 @@ fn make_generator(
         None => NanBox::undefined(),
     };
     let is_async = funcs.get(id).is_some_and(|p| p.is_async);
+    let realm_default = callee
+        .and_then(|c| c.as_handle())
+        .and_then(|h| ctx.realm.get_property(Handle::from_raw(h), GEN_PROTO_KEY));
     let proto = if is_object_value(ctx.realm, proto) {
         proto
+    } else if let Some(p) = realm_default {
+        p
     } else {
         with_host(ctx, |h| h.generator_intrinsics(is_async))
             .flatten()
@@ -3353,7 +3362,8 @@ fn with_host<R>(ctx: &mut Ctx, f: impl FnOnce(&mut dyn VmHost) -> R) -> Option<R
 fn vm_error(ctx: &mut Ctx, name: &str, message: &str) -> NanBox {
     // The running function's realm supplies the constructor.
     if let Some(callee) = ctx
-        .callee_stack
+        .realm
+        .vm_callee_stack
         .last()
         .copied()
         .filter(|c| c.as_handle().is_some())
@@ -3462,14 +3472,6 @@ struct Ctx<'a> {
     /// The host realm (a `$262.createRealm()` index) this run executes in,
     /// when not the main one: closures it creates belong to that realm.
     in_realm: Option<usize>,
-    /// The callee of each active activation of this run (`undefined` when the
-    /// call site did not know it), innermost last — the legacy `fn.caller`.
-    callee_stack: Vec<NanBox>,
-    /// Each [`Self::callee_stack`] activation's arguments, concatenated;
-    /// `callee_args[i]` is where activation `i`'s start (the legacy
-    /// `fn.arguments`).
-    args_buf: Vec<NanBox>,
-    callee_args: Vec<usize>,
 }
 
 // The recursion-guard, handler-stack, JSON-depth, and string-length caps now
@@ -3515,9 +3517,6 @@ pub fn run_program(
         frames_published: 0,
         top_frame_roots: Vec::new(),
         pending_callee: None,
-        callee_stack: Vec::new(),
-        args_buf: Vec::new(),
-        callee_args: Vec::new(),
         pending_new_target: None,
         in_realm: None,
     };
@@ -3559,9 +3558,6 @@ pub fn run_program_capturing(
         frames_published: 0,
         top_frame_roots: Vec::new(),
         pending_callee: None,
-        callee_stack: Vec::new(),
-        args_buf: Vec::new(),
-        callee_args: Vec::new(),
         pending_new_target: None,
         in_realm: None,
     };
@@ -3682,16 +3678,17 @@ fn call_with(
         None
     };
     let funcs = newer.as_deref().unwrap_or(funcs);
-    let callee_mark = ctx.callee_stack.len();
-    let args_mark = ctx.args_buf.len();
-    ctx.callee_stack
+    let callee_mark = ctx.realm.vm_callee_stack.len();
+    let args_mark = ctx.realm.vm_args_buf.len();
+    ctx.realm
+        .vm_callee_stack
         .push(ctx.pending_callee.unwrap_or(NanBox::undefined()));
-    ctx.callee_args.push(args_mark);
-    ctx.args_buf.extend_from_slice(args);
+    ctx.realm.vm_callee_args.push(args_mark);
+    ctx.realm.vm_args_buf.extend_from_slice(args);
     let result = call_with_inner(ctx, funcs, id, args, captures, this_val);
-    ctx.callee_stack.truncate(callee_mark);
-    ctx.callee_args.truncate(callee_mark);
-    ctx.args_buf.truncate(args_mark);
+    ctx.realm.vm_callee_stack.truncate(callee_mark);
+    ctx.realm.vm_callee_args.truncate(callee_mark);
+    ctx.realm.vm_args_buf.truncate(args_mark);
     ctx.frames_published = published;
     ctx.frame_shadow.truncate(mark);
     ctx.call_depth -= 1;
@@ -4088,9 +4085,6 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
         frames_published: 0,
         top_frame_roots: Vec::new(),
         pending_callee: None,
-        callee_stack: Vec::new(),
-        args_buf: Vec::new(),
-        callee_args: Vec::new(),
         pending_new_target: None,
         in_realm: None,
     };
@@ -4574,19 +4568,21 @@ fn vm_get_prop(
                 && funcs.get(id as usize).is_some_and(|p| p.legacy)
             {
                 let Some(i) = ctx
-                    .callee_stack
+                    .realm
+                    .vm_callee_stack
                     .iter()
                     .rposition(|c| c.as_handle() == Some(handle.to_raw()))
                 else {
                     return Ok(NanBox::null());
                 };
-                let start = ctx.callee_args[i];
+                let start = ctx.realm.vm_callee_args[i];
                 let end = ctx
-                    .callee_args
+                    .realm
+                    .vm_callee_args
                     .get(i + 1)
                     .copied()
-                    .unwrap_or(ctx.args_buf.len());
-                let argv = ctx.args_buf[start..end].to_vec();
+                    .unwrap_or(ctx.realm.vm_args_buf.len());
+                let argv = ctx.realm.vm_args_buf[start..end].to_vec();
                 let callee = NanBox::handle(handle.to_raw());
                 return with_host(ctx, |h| h.make_arguments(&argv, callee, false))
                     .ok_or(VmError::Unsupported);
@@ -4598,11 +4594,12 @@ fn vm_get_prop(
                 && funcs.get(id as usize).is_some_and(|p| p.legacy)
             {
                 let caller = ctx
-                    .callee_stack
+                    .realm
+                    .vm_callee_stack
                     .iter()
                     .rposition(|c| c.as_handle() == Some(handle.to_raw()))
                     .and_then(|i| i.checked_sub(1))
-                    .map(|i| ctx.callee_stack[i])
+                    .map(|i| ctx.realm.vm_callee_stack[i])
                     .filter(|c| {
                         c.as_handle()
                             .and_then(|h| ctx.realm.vm_function(Handle::from_raw(h)))
@@ -5879,8 +5876,8 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
         .iter()
         .chain(ctx.frame_shadow.iter())
         .chain(ctx.top_frame_roots.iter())
-        .chain(ctx.callee_stack.iter())
-        .chain(ctx.args_buf.iter())
+        .chain(ctx.realm.vm_callee_stack.iter())
+        .chain(ctx.realm.vm_args_buf.iter())
     {
         push(&mut roots, *r);
     }
@@ -7088,7 +7085,8 @@ fn run_frame_at(
             Op::BindThis { this } => {
                 let t = regs[*this as usize];
                 let callee = ctx
-                    .callee_stack
+                    .realm
+                    .vm_callee_stack
                     .last()
                     .copied()
                     .filter(|c| c.as_handle().is_some());
@@ -23492,9 +23490,6 @@ mod generic_jit_tests {
             frames_published: 0,
             top_frame_roots: Vec::new(),
             pending_callee: None,
-            callee_stack: Vec::new(),
-            args_buf: Vec::new(),
-            callee_args: Vec::new(),
             pending_new_target: None,
             in_realm: None,
         }

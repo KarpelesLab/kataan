@@ -318,6 +318,16 @@ pub struct Realm {
     /// loop back-edges then hand the agents' execution baton over (as the
     /// tree-walker's do), so a spin loop waiting on another agent progresses.
     pub agents_active: bool,
+    /// The callee of each active bytecode-VM activation (`undefined` when the
+    /// call site did not know it), innermost last — across nested VM runs, so
+    /// eval code and host callbacks see the enclosing activations (the legacy
+    /// `fn.caller`). Rooted by the VM's safepoints.
+    pub vm_callee_stack: Vec<NanBox>,
+    /// Each [`Self::vm_callee_stack`] activation's arguments, concatenated;
+    /// `vm_callee_args[i]` is where activation `i`'s start (`fn.arguments`).
+    pub vm_args_buf: Vec<NanBox>,
+    /// See [`Self::vm_args_buf`].
+    pub vm_callee_args: Vec<usize>,
     /// Allocation-pressure trigger: the number of objects that may be allocated
     /// after the last collection before [`maybe_collect`](Realm::maybe_collect)
     /// runs another one. Re-armed after every cycle to
@@ -522,6 +532,9 @@ impl Realm {
         Self {
             interrupt: None,
             agents_active: false,
+            vm_callee_stack: Vec::new(),
+            vm_args_buf: Vec::new(),
+            vm_callee_args: Vec::new(),
             heap,
             root_shape: Shape::root(),
             atoms: AtomTable::new(),
