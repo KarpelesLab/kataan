@@ -10432,6 +10432,20 @@ impl crate::nbvm::VmHost for Interp<'_> {
         Interp::agent_tick(self).is_err()
     }
 
+    fn proto_from_constructor(
+        &mut self,
+        new_target: NanBox,
+    ) -> Result<NanBox, crate::nbvm::HostError> {
+        let Some(nt) = new_target.as_handle().map(Handle::from_raw) else {
+            return Err(crate::nbvm::HostError::Fault);
+        };
+        let default = self.realm.intrinsics_snapshot().default_object_proto;
+        let p = self
+            .get_proto_from_constructor(nt, default)
+            .map_err(exec_to_host)?;
+        Ok(p.map_or(NanBox::null(), |h| NanBox::handle(h.to_raw())))
+    }
+
     fn async_function_proto(&mut self) -> Option<NanBox> {
         self.async_function_prototype()
             .map(|h| NanBox::handle(h.to_raw()))

@@ -1091,6 +1091,12 @@ pub trait VmHost {
     fn generator_intrinsics(&mut self, is_async: bool) -> Option<(NanBox, NanBox)>;
     /// `%AsyncFunction.prototype%`, an async function's `[[Prototype]]`.
     fn async_function_proto(&mut self) -> Option<NanBox>;
+    /// GetPrototypeFromConstructor(`new_target`, %Object.prototype%): its
+    /// `prototype` when an Object, else the intrinsic of its function realm.
+    ///
+    /// # Errors
+    /// A throwing `prototype` getter / trap, or a revoked proxy's TypeError.
+    fn proto_from_constructor(&mut self, new_target: NanBox) -> Result<NanBox, HostError>;
     /// A `$262.agent` scheduling point at a loop back-edge (see
     /// [`Realm::agents_active`]): hand the baton on and take it back. `true`
     /// when the run must stop (the agent pool is shutting down, or the host
@@ -1320,6 +1326,7 @@ fn hosted_ctx<'a>(realm: &'a mut Realm, host: &'a mut dyn VmHost) -> Ctx<'a> {
         frames_published: 0,
         top_frame_roots: Vec::new(),
         pending_callee: None,
+        callee_stack: Vec::new(),
         pending_new_target: None,
     }
 }
@@ -1562,6 +1569,13 @@ fn vm_set_elem_mode(
                 n > len as f64
                     || n > dense as f64
                     || (n == len as f64 && proto_owns_key(ctx.realm, h, &alloc::format!("{len}")))
+                    // A hole whose index the prototype chain owns (a setter,
+                    // a proxy's `set` trap).
+                    || (n >= 0.0
+                        && n < dense as f64
+                        && n == (n as usize) as f64
+                        && ctx.realm.array_hole_at(h, n as usize)
+                        && proto_owns_key(ctx.realm, h, &alloc::format!("{}", n as usize)))
             })
     });
     let mut to_host = read_needs_host(ctx, recv)
@@ -2944,7 +2958,10 @@ fn vm_construct(
         let nth = new_target.as_handle().map(Handle::from_raw).unwrap_or(fh);
         ctx.realm.get_property(nth, "prototype")
     } else {
-        Some(host_get_str(ctx, new_target, "prototype")?)
+        match with_host(ctx, |h| h.proto_from_constructor(new_target)) {
+            Some(r) => Some(r.map_err(VmError::from)?),
+            None => return Err(VmError::Unsupported),
+        }
     };
     if let Some(p) = proto
         .filter(|p| is_object_value(ctx.realm, *p))
@@ -3351,6 +3368,9 @@ struct Ctx<'a> {
     /// The `new.target` of the next `call_with` activation when it is a
     /// `[[Construct]]` (`None` for an ordinary call). Taken on entry.
     pending_new_target: Option<NanBox>,
+    /// The callee of each active activation of this run (`undefined` when the
+    /// call site did not know it), innermost last — the legacy `fn.caller`.
+    callee_stack: Vec<NanBox>,
 }
 
 // The recursion-guard, handler-stack, JSON-depth, and string-length caps now
@@ -3396,6 +3416,7 @@ pub fn run_program(
         frames_published: 0,
         top_frame_roots: Vec::new(),
         pending_callee: None,
+        callee_stack: Vec::new(),
         pending_new_target: None,
     };
     let value = call(&mut ctx, funcs, id, args)?;
@@ -3436,6 +3457,7 @@ pub fn run_program_capturing(
         frames_published: 0,
         top_frame_roots: Vec::new(),
         pending_callee: None,
+        callee_stack: Vec::new(),
         pending_new_target: None,
     };
     let value = call(&mut ctx, funcs, id, args)?;
@@ -3556,7 +3578,11 @@ fn call_with(
         None
     };
     let funcs = newer.as_deref().unwrap_or(funcs);
+    let callee_mark = ctx.callee_stack.len();
+    ctx.callee_stack
+        .push(ctx.pending_callee.unwrap_or(NanBox::undefined()));
     let result = call_with_inner(ctx, funcs, id, args, captures, this_val);
+    ctx.callee_stack.truncate(callee_mark);
     ctx.frames_published = published;
     ctx.frame_shadow.truncate(mark);
     ctx.call_depth -= 1;
@@ -3953,6 +3979,7 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
         frames_published: 0,
         top_frame_roots: Vec::new(),
         pending_callee: None,
+        callee_stack: Vec::new(),
         pending_new_target: None,
     };
     match run_frame(&mut ctx, &[], program, &mut regs)? {
@@ -4422,6 +4449,31 @@ fn vm_get_prop(
         Some(handle) => {
             // A VM function's `.name` comes from its proto (the closure is a tagged
             // array whose element 0 is the function id).
+            // The legacy `f.caller` of a sloppy ordinary VM function: the
+            // function that invoked its innermost live activation in this run
+            // (`null` when not executing, called from elsewhere, or by a
+            // non-legacy function).
+            if key == "caller"
+                && ctx.host.is_some()
+                && !ctx.realm.has_own(handle, "caller")
+                && let Some((id, _)) = ctx.realm.vm_function(handle)
+                && funcs.get(id as usize).is_some_and(|p| p.legacy)
+            {
+                let caller = ctx
+                    .callee_stack
+                    .iter()
+                    .rposition(|c| c.as_handle() == Some(handle.to_raw()))
+                    .and_then(|i| i.checked_sub(1))
+                    .map(|i| ctx.callee_stack[i])
+                    .filter(|c| {
+                        c.as_handle()
+                            .and_then(|h| ctx.realm.vm_function(Handle::from_raw(h)))
+                            .and_then(|(cid, _)| funcs.get(cid as usize))
+                            .is_some_and(|p| p.legacy)
+                    })
+                    .unwrap_or(NanBox::null());
+                return Ok(caller);
+            }
             if key == "name"
                 && ctx.host.is_none()
                 && ctx.realm.is_vm_function(handle)
@@ -5689,6 +5741,7 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
         .iter()
         .chain(ctx.frame_shadow.iter())
         .chain(ctx.top_frame_roots.iter())
+        .chain(ctx.callee_stack.iter())
     {
         push(&mut roots, *r);
     }
@@ -7622,7 +7675,21 @@ fn run_frame_at(
                 // an accessor, a primitive receiver, a missing method's TypeError —
                 // is the host's, with its exact semantics.
                 if ctx.host.is_some() {
-                    let outcome = match vm_method_of(ctx, recv_val, key) {
+                    // `f.caller(…)`: the legacy `caller` is the VM's to resolve.
+                    let legacy_caller = (key == "caller"
+                        && recv_val.as_handle().is_some_and(|h| {
+                            ctx.realm
+                                .vm_function(Handle::from_raw(h))
+                                .and_then(|(id, _)| funcs.get(id as usize))
+                                .is_some_and(|p| p.legacy)
+                        }))
+                    .then(|| vm_get_prop(ctx, funcs, recv_val, key, &mut PropertyCache::default()))
+                    .and_then(Result::ok)
+                    .filter(|f| {
+                        f.as_handle()
+                            .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
+                    });
+                    let outcome = match legacy_caller.or_else(|| vm_method_of(ctx, recv_val, key)) {
                         Some(closure) => {
                             // Publish this frame's registers so a collection at a
                             // back-edge inside the callee can see them.
@@ -22854,6 +22921,7 @@ mod generic_jit_tests {
             frames_published: 0,
             top_frame_roots: Vec::new(),
             pending_callee: None,
+            callee_stack: Vec::new(),
             pending_new_target: None,
         }
     }
