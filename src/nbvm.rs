@@ -300,6 +300,14 @@ pub enum Op {
     },
     /// Throws a `TypeError` with `msg`.
     ThrowTypeError { msg: String },
+    /// Throws a new `ReferenceError` with message `msg` (`delete super.x`, an
+    /// assignment to a call).
+    ThrowReferenceError { msg: String },
+    /// `dst` = a fresh object whose `[[Prototype]]` is `home.[[Prototype]]`:
+    /// a `super[key]` reference's base, captured once (GetSuperBase) for a
+    /// compound assignment, update or destructuring target, used as the
+    /// `home` of later `SuperGet`/`SuperSet`s.
+    SuperSnapshot { dst: Reg, home: Reg },
     /// `dst = a <op> b` for `op` 0 `<`, 1 `>`, 2 `<=`, 3 `>=` (hosted): numbers
     /// directly, anything else through the host's operator.
     Compare { dst: Reg, op: u8, a: Reg, b: Reg },
@@ -6242,6 +6250,17 @@ fn run_frame_at(
                 let e = vm_error(ctx, "TypeError", msg);
                 handle_throw!(VmError::Thrown(e));
             }
+            Op::ThrowReferenceError { msg } => {
+                let e = vm_error(ctx, "ReferenceError", msg);
+                handle_throw!(VmError::Thrown(e));
+            }
+            Op::SuperSnapshot { dst, home } => {
+                let h = object_handle(regs[*home as usize])?;
+                let proto = ctx.realm.object_proto(h);
+                let snap = ctx.realm.new_object();
+                ctx.realm.set_object_proto(snap, proto);
+                regs[*dst as usize] = NanBox::handle(snap.to_raw());
+            }
             Op::Yield { dst, src } | Op::Await { dst, src } => {
                 return Ok(FrameExit::Yield {
                     value: regs[*src as usize],
@@ -11461,7 +11480,16 @@ enum FieldKey {
 
 /// A member assignment target evaluated ahead of its value: the object
 /// register and either a computed key register (`Ok`) or a static key (`Err`).
-type MemberPlace = (Reg, Result<Reg, String>);
+enum MemberPlace {
+    /// `obj[key]` (key evaluated, not yet converted).
+    Key(Reg, Reg),
+    /// `obj.name`.
+    Named(Reg, String),
+    /// `obj.#name` (the private key).
+    Private(Reg, Reg),
+    /// `super[key]`: `(home snapshot, this, key)`.
+    Super(Reg, Reg, Reg),
+}
 
 /// How a hosted tagged template calls its tag: as a method (keeping the
 /// receiver as `this`), through a computed key, or as a plain value.
@@ -12679,6 +12707,19 @@ impl Compiler {
             }
             Expr::Member {
                 object, property, ..
+            } if self.hosted && matches!(&**object, Expr::Super(_)) => {
+                let (home, this, key) = self.super_reference(property)?;
+                self.ops.push(Op::SuperSet {
+                    home,
+                    key,
+                    src: value_reg,
+                    this,
+                    strict: self.strict,
+                });
+                Ok(())
+            }
+            Expr::Member {
+                object, property, ..
             } => {
                 let obj = self.expr(object)?;
                 self.member_write(obj, property, value_reg)
@@ -12728,6 +12769,71 @@ impl Compiler {
                 let mut dyn_keys: Vec<Reg> = Vec::new();
                 for m in members {
                     match m {
+                        // KeyedDestructuringAssignmentEvaluation: the key, then a
+                        // member target's reference, then the property read.
+                        ObjectMember::Property { key, value, .. }
+                            if self.hosted
+                                && matches!(
+                                    &**value,
+                                    Expr::Member { .. }
+                                        | Expr::Assign {
+                                            op: crate::ast::AssignOp::Assign,
+                                            ..
+                                        }
+                                ) =>
+                        {
+                            let (inner, def) = match &**value {
+                                Expr::Assign {
+                                    op: crate::ast::AssignOp::Assign,
+                                    target,
+                                    value: d,
+                                    ..
+                                } => (&**target, Some(&**d)),
+                                other => (other, None),
+                            };
+                            if !matches!(inner, Expr::Member { .. }) {
+                                let v = self.pattern_key_read(
+                                    value_reg,
+                                    key,
+                                    &mut named,
+                                    &mut dyn_keys,
+                                )?;
+                                self.assign_target_with_default(value, v)?;
+                                continue;
+                            }
+                            let k = match key {
+                                PropertyKey::Computed(e) => {
+                                    let k = self.expr(e)?;
+                                    let kc = self.alloc();
+                                    self.ops.push(Op::ToKey { dst: kc, src: k });
+                                    dyn_keys.push(kc);
+                                    Ok(kc)
+                                }
+                                other => {
+                                    let k = static_key(other)?;
+                                    named.push(k.clone());
+                                    Err(k)
+                                }
+                            };
+                            let place = self.member_place(inner)?.expect("a member target");
+                            let v = self.alloc();
+                            self.ops.push(match k {
+                                Ok(kc) => Op::GetKey {
+                                    dst: v,
+                                    obj: value_reg,
+                                    key: kc,
+                                },
+                                Err(key) => Op::GetProp {
+                                    dst: v,
+                                    obj: value_reg,
+                                    key,
+                                },
+                            });
+                            if def.is_some() {
+                                self.apply_default(v, def)?;
+                            }
+                            self.store_place(place, v);
+                        }
                         ObjectMember::Property { key, value, .. } => {
                             let v =
                                 self.pattern_key_read(value_reg, key, &mut named, &mut dyn_keys)?;
@@ -12747,6 +12853,7 @@ impl Compiler {
                 }
                 Ok(())
             }
+            Expr::Call { .. } if self.hosted => self.assign_to_call(target).map(|_| ()),
             _ => Err(CompileError::Unsupported("assignment pattern target")),
         }
     }
@@ -12936,27 +13043,40 @@ impl Compiler {
             return Ok(None);
         };
         if matches!(&**object, Expr::Super(_)) {
-            return Err(CompileError::Unsupported(
-                "super member destructuring target",
-            ));
+            if !self.hosted {
+                return Err(CompileError::Unsupported(
+                    "super member destructuring target",
+                ));
+            }
+            let (home, this, key) = self.super_place(property, false)?;
+            return Ok(Some(MemberPlace::Super(home, this, key)));
         }
         let obj = self.expr(object)?;
-        let key = match property {
-            PropertyKey::Computed(e) => Ok(self.expr(e)?),
-            other => Err(static_key(other)?),
-        };
-        Ok(Some((obj, key)))
+        Ok(Some(match property {
+            PropertyKey::Computed(e) => MemberPlace::Key(obj, self.expr(e)?),
+            PropertyKey::Private(n) if self.hosted => {
+                MemberPlace::Private(obj, self.private_key(n)?)
+            }
+            other => MemberPlace::Named(obj, static_key(other)?),
+        }))
     }
 
     /// Stores `src` to a place from [`Self::member_place`].
     fn store_place(&mut self, place: MemberPlace, src: Reg) {
-        let (obj, key) = place;
-        match key {
-            Ok(k) => self.store_key(obj, k, src),
-            Err(key) => self.ops.push(if self.hosted && self.strict {
+        match place {
+            MemberPlace::Key(obj, k) => self.store_key(obj, k, src),
+            MemberPlace::Named(obj, key) => self.ops.push(if self.hosted && self.strict {
                 Op::SetPropStrict { obj, key, src }
             } else {
                 Op::SetProp { obj, key, src }
+            }),
+            MemberPlace::Private(obj, key) => self.ops.push(Op::PrivateSet { obj, key, src }),
+            MemberPlace::Super(home, this, key) => self.ops.push(Op::SuperSet {
+                home,
+                key,
+                src,
+                this,
+                strict: self.strict,
             }),
         }
     }
@@ -14383,10 +14503,17 @@ impl Compiler {
                         Expr::Member {
                             object, property, ..
                         } => {
+                            // `delete super[k]`: the `this` binding and the key
+                            // expression are evaluated, then a ReferenceError.
                             if matches!(&**object, Expr::Super(_)) {
-                                return Err(CompileError::Unsupported(
-                                    "delete of a super property",
-                                ));
+                                self.this_value();
+                                if let PropertyKey::Computed(e) = property {
+                                    self.expr(e)?;
+                                }
+                                self.ops.push(Op::ThrowReferenceError {
+                                    msg: String::from("Unsupported reference to 'super'"),
+                                });
+                                return self.constant(NanBox::boolean(true));
                             }
                             let obj = self.expr(object)?;
                             let key = match property {
@@ -14415,8 +14542,63 @@ impl Compiler {
                             });
                             return Ok(dst);
                         }
-                        Expr::OptChain { .. } => {
-                            return Err(CompileError::Unsupported("delete of an optional chain"));
+                        // `delete a?.b`: `true` when the chain short-circuits.
+                        Expr::OptChain { expr, .. } => {
+                            let result = self.constant(NanBox::boolean(true))?;
+                            self.optchain_ends.push(Vec::new());
+                            let r = (|| -> Result<(), CompileError> {
+                                match &**expr {
+                                    Expr::Member {
+                                        object,
+                                        property,
+                                        optional,
+                                        ..
+                                    } if !matches!(&**object, Expr::Super(_))
+                                        && !matches!(property, PropertyKey::Private(_)) =>
+                                    {
+                                        let obj = self.expr(object)?;
+                                        if *optional {
+                                            let go = self.emit_not_nullish(obj)?;
+                                            let jf = self.emit_jump_if_false(go);
+                                            self.optchain_ends
+                                                .last_mut()
+                                                .expect("a chain")
+                                                .push(jf);
+                                        }
+                                        let key = match property {
+                                            PropertyKey::Computed(e) => self.expr(e)?,
+                                            _ => self.constant_str(&static_key(property)?),
+                                        };
+                                        let dst = self.alloc();
+                                        self.ops.push(Op::HostDelete {
+                                            dst,
+                                            obj,
+                                            key,
+                                            strict: self.strict,
+                                        });
+                                        self.ops.push(Op::Move {
+                                            dst: result,
+                                            src: dst,
+                                        });
+                                    }
+                                    Expr::Member { .. } => {
+                                        return Err(CompileError::Unsupported(
+                                            "delete of an optional chain",
+                                        ));
+                                    }
+                                    other => {
+                                        self.expr(other)?;
+                                    }
+                                }
+                                Ok(())
+                            })();
+                            let sites = self.optchain_ends.pop().unwrap_or_default();
+                            r?;
+                            let end = self.ops.len();
+                            for s in sites {
+                                self.patch_to(s, end);
+                            }
+                            return Ok(result);
                         }
                         // Any other operand is evaluated (for its effects); the
                         // result is `true`.
@@ -14860,6 +15042,57 @@ impl Compiler {
                     self.member_read(obj, property)
                 }
             }
+            // `f?.(args)` / `o.m?.(args)`: a nullish callee short-circuits the
+            // whole chain (to its `OptChain` end) before the arguments run.
+            Expr::Call {
+                callee,
+                arguments,
+                optional: true,
+                ..
+            } if self.hosted && !self.optchain_ends.is_empty() => {
+                self.refuse_direct_eval(callee)?;
+                let (f, this) = match &**callee {
+                    Expr::Member {
+                        object,
+                        property,
+                        optional,
+                        ..
+                    } if !matches!(&**object, Expr::Super(_))
+                        && !matches!(property, PropertyKey::Private(_)) =>
+                    {
+                        let recv = self.expr(object)?;
+                        if *optional {
+                            let go = self.emit_not_nullish(recv)?;
+                            let jf = self.emit_jump_if_false(go);
+                            self.optchain_ends.last_mut().expect("a chain").push(jf);
+                        }
+                        (self.member_read(recv, property)?, recv)
+                    }
+                    Expr::Member { object, .. } if matches!(&**object, Expr::Super(_)) => {
+                        let f = self.expr(callee)?;
+                        (f, self.this_value())
+                    }
+                    Expr::Member { .. } => {
+                        return Err(CompileError::Unsupported("optional private call"));
+                    }
+                    other => {
+                        let f = self.expr(other)?;
+                        (f, self.constant(NanBox::undefined())?)
+                    }
+                };
+                let go = self.emit_not_nullish(f)?;
+                let jf = self.emit_jump_if_false(go);
+                self.optchain_ends.last_mut().expect("a chain").push(jf);
+                let args = self.spread_args(arguments)?;
+                let dst = self.alloc();
+                self.ops.push(Op::CallSpread {
+                    dst,
+                    callee: f,
+                    this,
+                    args,
+                });
+                Ok(dst)
+            }
             Expr::Call {
                 callee,
                 arguments,
@@ -14868,6 +15101,7 @@ impl Compiler {
             } if self.hosted
                 && !*optional
                 && !matches!(&**callee, Expr::Super(_))
+                && !matches!(&**callee, Expr::Member { object, .. } if matches!(&**object, Expr::Super(_)))
                 && arguments
                     .iter()
                     .any(|a| matches!(a, crate::ast::Argument::Spread(_))) =>
@@ -14879,10 +15113,17 @@ impl Compiler {
                     Expr::Member {
                         object,
                         property,
-                        optional: false,
+                        optional,
                         ..
-                    } if !matches!(&**object, Expr::Super(_)) => {
+                    } if !matches!(&**object, Expr::Super(_))
+                        && (!*optional || !self.optchain_ends.is_empty()) =>
+                    {
                         let recv = self.expr(object)?;
+                        if *optional {
+                            let go = self.emit_not_nullish(recv)?;
+                            let jf = self.emit_jump_if_false(go);
+                            self.optchain_ends.last_mut().expect("a chain").push(jf);
+                        }
                         (self.member_read(recv, property)?, recv)
                     }
                     Expr::Member { .. } | Expr::OptChain { .. } => {
@@ -15157,11 +15398,13 @@ impl Compiler {
                             let b = self
                                 .resolve(&id.name)
                                 .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
-                            if b.fn_name && !self.strict {
-                                return Err(CompileError::Unsupported("assignment to const"));
-                            }
+                            // The expression's value: the current one, or the
+                            // assigned one (even where the write is a sloppy no-op
+                            // to a function's own name).
                             let cur = self.read_var(b);
-                            let c = cond(self, cur)?;
+                            let dst = self.alloc();
+                            self.ops.push(Op::Move { dst, src: cur });
+                            let c = cond(self, dst)?;
                             let jf = self.emit_jump_if_false(c);
                             // NamedEvaluation: `x &&= function(){}` / `x ??= () => {}`
                             // names the anonymous RHS after the LHS identifier.
@@ -15173,8 +15416,34 @@ impl Compiler {
                                 self.expr_named(value, &bt)?
                             };
                             self.assign_var(b, v)?;
+                            self.ops.push(Op::Move { dst, src: v });
                             self.patch(jf);
-                            return Ok(self.read_var(b));
+                            return Ok(dst);
+                        }
+                        Expr::Member {
+                            object, property, ..
+                        } if self.hosted && matches!(&**object, Expr::Super(_)) => {
+                            let (home, this, key) = self.super_place(property, true)?;
+                            let dst = self.alloc();
+                            self.ops.push(Op::SuperGet {
+                                dst,
+                                home,
+                                key,
+                                this,
+                            });
+                            let c = cond(self, dst)?;
+                            let jf = self.emit_jump_if_false(c);
+                            let v = self.expr(value)?;
+                            self.ops.push(Op::SuperSet {
+                                home,
+                                key,
+                                src: v,
+                                this,
+                                strict: self.strict,
+                            });
+                            self.ops.push(Op::Move { dst, src: v });
+                            self.patch(jf);
+                            return Ok(dst);
                         }
                         Expr::Member {
                             object, property, ..
@@ -15219,6 +15488,7 @@ impl Compiler {
                             self.patch(jf);
                             return Ok(out);
                         }
+                        Expr::Call { .. } if self.hosted => return self.assign_to_call(target),
                         _ => return Err(CompileError::Unsupported("logical assign target")),
                     }
                 }
@@ -15228,9 +15498,26 @@ impl Compiler {
                         object, property, ..
                     } if self.hosted && matches!(&**object, Expr::Super(_)) => {
                         if compound {
-                            return Err(CompileError::Unsupported("compound super assignment"));
+                            let (home, this, key) = self.super_place(property, true)?;
+                            let cur = self.alloc();
+                            self.ops.push(Op::SuperGet {
+                                dst: cur,
+                                home,
+                                key,
+                                this,
+                            });
+                            let v = self.expr(value)?;
+                            let src = self.emit_binop(Self::compound_binop(*op)?, cur, v)?;
+                            self.ops.push(Op::SuperSet {
+                                home,
+                                key,
+                                src,
+                                this,
+                                strict: self.strict,
+                            });
+                            return Ok(src);
                         }
-                        let (home, this, key) = self.super_reference(property)?;
+                        let (home, this, key) = self.super_place(property, false)?;
                         let src = self.expr(value)?;
                         self.ops.push(Op::SuperSet {
                             home,
@@ -15333,6 +15620,7 @@ impl Compiler {
                         self.assign_pattern(target, v)?;
                         Ok(v)
                     }
+                    Expr::Call { .. } if self.hosted => self.assign_to_call(target),
                     _ => Err(CompileError::Unsupported("assignment target")),
                 }
             }
@@ -15380,6 +15668,41 @@ impl Compiler {
                         None => self.member_write(obj, property, next)?,
                     }
                     return Ok(if *prefix { next } else { old });
+                }
+                // Hosted `super.k++` / `super[k]--`.
+                if self.hosted
+                    && let Expr::Member {
+                        object, property, ..
+                    } = &**argument
+                    && matches!(&**object, Expr::Super(_))
+                {
+                    let (home, this, key) = self.super_place(property, true)?;
+                    let raw = self.alloc();
+                    self.ops.push(Op::SuperGet {
+                        dst: raw,
+                        home,
+                        key,
+                        this,
+                    });
+                    let old = self.alloc();
+                    self.ops.push(Op::ToNumeric { dst: old, src: raw });
+                    let next = self.alloc();
+                    self.ops.push(Op::Step {
+                        dst: next,
+                        src: old,
+                        dec: matches!(op, crate::ast::UpdateOp::Dec),
+                    });
+                    self.ops.push(Op::SuperSet {
+                        home,
+                        key,
+                        src: next,
+                        this,
+                        strict: self.strict,
+                    });
+                    return Ok(if *prefix { next } else { old });
+                }
+                if self.hosted && matches!(&**argument, Expr::Call { .. }) {
+                    return self.assign_to_call(argument);
                 }
                 let Expr::Ident(id) = &**argument else {
                     return Err(CompileError::Unsupported("update target"));
@@ -17748,13 +18071,69 @@ impl Compiler {
         Ok((home, this, key))
     }
 
+    /// A `super[key]` reference that is read *and* written (compound / logical
+    /// assignment, update, destructuring target): `this` first, then the key
+    /// expression, then the base captured once (a [`Op::SuperSnapshot`]), then
+    /// (when `convert`: a GetValue comes first) ToPropertyKey — returns
+    /// `(home snapshot, this, key)`. Unconverted, the store converts the key.
+    fn super_place(
+        &mut self,
+        property: &PropertyKey,
+        convert: bool,
+    ) -> Result<(Reg, Reg, Reg), CompileError> {
+        let hb = self
+            .lookup(HOME_NAME)
+            .ok_or(CompileError::Unsupported("super outside a class element"))?;
+        let this = self.this_value();
+        let raw = match property {
+            PropertyKey::Computed(e) => Some(self.expr(e)?),
+            PropertyKey::Private(_) => return Err(CompileError::Unsupported("private name")),
+            _ => None,
+        };
+        let home = self.read_var(hb);
+        let snap = self.alloc();
+        self.ops.push(Op::SuperSnapshot { dst: snap, home });
+        let key = match raw {
+            Some(k) if !convert => k,
+            Some(k) => {
+                let kc = self.alloc();
+                self.ops.push(Op::ToKey { dst: kc, src: k });
+                kc
+            }
+            None => {
+                let k = static_key(property)?;
+                self.constant_str(&k)
+            }
+        };
+        Ok((snap, this, key))
+    }
+
+    /// An assignment to a call (`f() = v`, `f()++`, `for (f() in …)`; Annex B
+    /// web compatibility): the call runs, then a `ReferenceError`.
+    fn assign_to_call(&mut self, call: &Expr) -> Result<Reg, CompileError> {
+        self.expr(call)?;
+        self.ops.push(Op::ThrowReferenceError {
+            msg: String::from("Invalid assignment target"),
+        });
+        self.constant(NanBox::undefined())
+    }
+
     /// Hosted `super(...args)`: only in a derived constructor's own body.
     fn super_call(&mut self, arguments: &[crate::ast::Argument]) -> Result<Reg, CompileError> {
-        if !self.derived_ctor {
-            return Err(CompileError::Unsupported(
-                "super call outside a derived constructor",
-            ));
-        }
+        // An arrow inside a derived constructor binds the constructor's `this`
+        // through the captured (TDZ-flagged) cell.
+        let arrow_this = if self.derived_ctor {
+            None
+        } else {
+            match self.lookup(THIS_NAME) {
+                Some(b) if b.cell && b.tdz => Some(b),
+                _ => {
+                    return Err(CompileError::Unsupported(
+                        "super call outside a derived constructor",
+                    ));
+                }
+            }
+        };
         let cb = self
             .lookup(CTOR_NAME)
             .ok_or(CompileError::Unsupported("super call outside a class"))?;
@@ -17775,7 +18154,27 @@ impl Compiler {
             _ => self.spread_args(arguments)?,
         };
         let dst = self.alloc();
+        if let Some(tb) = arrow_this {
+            let this = self.alloc();
+            let cur = self.read_var(Binding { tdz: false, ..tb });
+            self.ops.push(Op::Move {
+                dst: this,
+                src: cur,
+            });
+            self.ops.push(Op::SuperCall {
+                dst,
+                ctor,
+                new_target,
+                args,
+                this,
+            });
+            self.write_var(Binding { tdz: false, ..tb }, this);
+            return Ok(dst);
+        }
         let this = self.this_reg;
+        // With arrows sharing `this` (which may call `super()` themselves), the
+        // cell is the binding: refresh the register from it first.
+        self.sync_this_from_cell();
         self.ops.push(Op::SuperCall {
             dst,
             ctor,
@@ -17790,9 +18189,26 @@ impl Compiler {
         Ok(dst)
     }
 
+    /// A derived constructor whose `this` is a cell shared with arrows:
+    /// `this_reg` = the cell's current value.
+    fn sync_this_from_cell(&mut self) {
+        if self.derived_ctor
+            && let Some(b) = self.scopes[0].get(THIS_NAME).copied()
+            && b.cell
+        {
+            let cur = self.read_var(Binding { tdz: false, ..b });
+            let this = self.this_reg;
+            self.ops.push(Op::Move {
+                dst: this,
+                src: cur,
+            });
+        }
+    }
+
     /// A derived constructor's `return src`: the construct result per
     /// [`Op::DerivedResult`].
     fn emit_derived_return(&mut self, src: Reg) {
+        self.sync_this_from_cell();
         let dst = self.alloc();
         let this = self.this_reg;
         self.ops.push(Op::DerivedResult { dst, src, this });

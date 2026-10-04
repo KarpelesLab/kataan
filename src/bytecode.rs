@@ -631,7 +631,11 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             }
             Ok(())
         }
-        Op::ThrowTypeError { .. } => Ok(()),
+        Op::ThrowTypeError { .. } | Op::ThrowReferenceError { .. } => Ok(()),
+        Op::SuperSnapshot { dst, home } => {
+            reg(*dst)?;
+            reg(*home)
+        }
         Op::Compare { dst, a, b, .. } => {
             reg(*dst)?;
             reg(*a)?;
@@ -1486,6 +1490,15 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*stack, out);
             w_reg(*src, out);
         }
+        Op::ThrowReferenceError { msg } => {
+            w_u8(170, out);
+            w_str(msg, out);
+        }
+        Op::SuperSnapshot { dst, home } => {
+            w_u8(171, out);
+            w_reg(*dst, out);
+            w_reg(*home, out);
+        }
         Op::AsyncDisposeStep { state, dst, done } => {
             w_u8(152, out);
             w_reg(*state, out);
@@ -2181,6 +2194,11 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         151 => Op::AddAsyncDisposable {
             stack: r.reg()?,
             src: r.reg()?,
+        },
+        170 => Op::ThrowReferenceError { msg: r.string()? },
+        171 => Op::SuperSnapshot {
+            dst: r.reg()?,
+            home: r.reg()?,
         },
         152 => Op::AsyncDisposeStep {
             state: r.reg()?,
