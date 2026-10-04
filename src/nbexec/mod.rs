@@ -881,6 +881,15 @@ pub struct Interp<'a> {
     /// run's function table, so a VM function value the interpreter is asked to
     /// call (a callback handed to a built-in) runs on the VM.
     vm_table: Option<alloc::rc::Rc<[crate::nbvm::FnProto]>>,
+    /// The function table eval code extended (functions it defined appended to
+    /// the run's table; see `vm_env`).
+    vm_ext_table: Option<alloc::rc::Rc<[crate::nbvm::FnProto]>>,
+    /// Compiled eval code by (program address, flags): an eval of the same
+    /// source in the same kind of context reuses it.
+    vm_eval_cache: alloc::collections::BTreeMap<(usize, u8), alloc::rc::Rc<crate::nbvm::FnProto>>,
+    /// Set while EvalDeclarationInstantiation runs for VM-compiled eval code:
+    /// its function declarations are instantiated by the VM code itself.
+    hoist_skip_fns: bool,
 }
 
 /// The `[[ParameterMap]]` of one mapped `arguments` object: the shared parameter
@@ -3360,6 +3369,9 @@ impl<'a> Interp<'a> {
             gc_audit_call: None,
             gc_scope_shadow: Vec::new(),
             vm_table: None,
+            vm_ext_table: None,
+            vm_eval_cache: alloc::collections::BTreeMap::new(),
+            hoist_skip_fns: false,
         };
         // The constructor's `current` IS the root scope; capture it as the global
         // scope before `install_globals` populates it, so indirect eval can run
@@ -6678,7 +6690,12 @@ impl<'a> Interp<'a> {
         }
 
         self.eval_depth += 1;
-        let result = self.run_eval_body(program);
+        // While hosting a bytecode-VM run, eval code runs on the VM too.
+        let nt = allow_new_target.then_some(saved_new_target);
+        let result = match self.vm_eval_program(program, eval_strict, nt, false) {
+            Some(r) => r,
+            None => self.run_eval_body(program),
+        };
         self.eval_depth -= 1;
 
         self.current = saved_scope;
@@ -6801,12 +6818,29 @@ impl<'a> Interp<'a> {
         // program. Retain it for the duration so `FnDef::def_src` captures the
         // right text (otherwise their `toString` slices unrelated source).
         let saved_src = core::mem::replace(&mut self.src, &program.source);
-        let f = self.make_function(
-            &func.params,
-            Body::Block(&func.body),
-            func.is_async,
-            func.is_generator,
-        );
+        // While hosting a bytecode-VM run, the function is a VM function (one
+        // another realm's constructor builds stays the interpreter's, which
+        // tracks function realms).
+        let strict = self.strict;
+        let same_realm = self.cur_realm.is_none()
+            && callee
+                .as_handle()
+                .map(Handle::from_raw)
+                .is_none_or(|ch| self.get_function_realm(ch).is_none());
+        let vm = if same_realm {
+            self.vm_dynamic_function(program, strict)
+        } else {
+            None
+        };
+        let f = match vm {
+            Some(r) => r?,
+            None => self.make_function(
+                &func.params,
+                Body::Block(&func.body),
+                func.is_async,
+                func.is_generator,
+            ),
+        };
         self.src = saved_src;
         self.strict = saved_strict;
         self.current = saved_scope;
@@ -7058,7 +7092,7 @@ impl<'a> Interp<'a> {
             if let Stmt::Function(func) = stmt
                 && let Some(id) = &func.id
             {
-                if module_top_level {
+                if module_top_level || (hoist_vars && self.hoist_skip_fns) {
                     continue;
                 }
                 let value = self.make_function(
@@ -10532,6 +10566,10 @@ impl crate::nbvm::VmHost for Interp<'_> {
         req: crate::nbvm::EnvReq<'_>,
     ) -> Result<(NanBox, NanBox), crate::nbvm::HostError> {
         self.vm_env_op(req).map_err(exec_to_host)
+    }
+
+    fn vm_table_now(&mut self) -> Option<alloc::rc::Rc<[crate::nbvm::FnProto]>> {
+        self.vm_newest_table()
     }
 
     fn set_vm_table(

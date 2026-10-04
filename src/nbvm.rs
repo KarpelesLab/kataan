@@ -35,6 +35,10 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+mod vm_eval;
+pub(crate) use vm_eval::{
+    EVAL_DYN_FN, EVAL_NEW_TARGET, EVAL_SCRIPT, compile_eval_code, run_eval_code,
+};
 #[cfg(all(feature = "std", feature = "module"))]
 mod vm_module;
 #[cfg(all(feature = "std", feature = "module"))]
@@ -1218,6 +1222,9 @@ pub trait VmHost {
         &mut self,
         table: Option<alloc::rc::Rc<[FnProto]>>,
     ) -> Option<alloc::rc::Rc<[FnProto]>>;
+    /// The newest function table: the running one, or the one eval code
+    /// extended (a superset — functions are only ever appended).
+    fn vm_table_now(&mut self) -> Option<alloc::rc::Rc<[FnProto]>>;
     /// `import.meta` of the VM module `module` (an index the host assigned
     /// when it compiled the module — see `compile_module_into`).
     ///
@@ -2879,16 +2886,19 @@ fn vm_construct(
     let Some(fh) = f.as_handle().map(Handle::from_raw) else {
         return Err(VmError::Unsupported);
     };
-    // Compiled after this run's table was captured (see `call_closure`).
-    if ctx.host.is_some()
-        && ctx
-            .realm
-            .vm_function(fh)
-            .is_some_and(|(id, _)| id as usize >= funcs.len())
+    // Compiled after this run's table was captured (a dynamically imported
+    // module, eval code): the host's newest table has it.
+    if let Some((id, _)) = ctx.realm.vm_function(fh)
+        && id as usize >= funcs.len()
     {
-        return with_host(ctx, |h| h.construct_with_target(f, args, new_target))
-            .unwrap_or(Err(HostError::Fault))
-            .map_err(VmError::from);
+        let newer = with_host(ctx, |h| h.vm_table_now())
+            .flatten()
+            .filter(|t| (id as usize) < t.len());
+        let Some(t) = newer else {
+            let e = vm_error(ctx, "TypeError", "not a constructor");
+            return Err(VmError::Thrown(e));
+        };
+        return vm_construct(ctx, &t, f, args, new_target);
     }
     if ctx.realm.get_property(fh, VM_CTOR).is_none() {
         let e = vm_error(ctx, "TypeError", "not a constructor");
@@ -3135,6 +3145,14 @@ pub enum EnvReq<'r> {
     },
     /// Whether `callee` is the running realm's %eval% (a direct eval).
     IsEval { callee: NanBox },
+    /// Eval code's (or a Script's, `script`) top-level function declaration:
+    /// binds `name` to `value` in the variable environment `var_env`.
+    DeclFn {
+        var_env: NanBox,
+        name: &'r str,
+        value: NanBox,
+        script: bool,
+    },
     /// CreateMappedArgumentsObject's parameter map over `env`: index `i` of
     /// `args_obj` aliases the binding `names[i]`.
     MapArgs {
@@ -3181,6 +3199,9 @@ pub(crate) const EK_EVAL: u8 = 14;
 pub(crate) const EK_MAP_ARGS: u8 = 15;
 /// `dst` = whether `regs[0]` is the running realm's %eval%.
 pub(crate) const EK_IS_EVAL: u8 = 16;
+/// Eval code's function declaration `name` = `regs[1]` in the variable
+/// environment `regs[0]` (`flags` 1: a Script's, non-deletable).
+pub(crate) const EK_DECL_FN: u8 = 17;
 
 /// [`EnvReq::Init`] modes.
 pub const ENV_INIT_LET: u8 = 0;
@@ -3197,6 +3218,9 @@ pub const ENV_INIT_VAR: u8 = 4;
 pub const ENV_INIT_SOFT_CONST: u8 = 5;
 /// Marks an existing binding `const`.
 pub const ENV_INIT_MARK_CONST: u8 = 6;
+/// Sets the binding in this very frame (a `var` mirrored on the global object
+/// when the frame is the global environment) — Annex B.3.3's update.
+pub const ENV_INIT_VAR_SET: u8 = 7;
 
 /// Why a delegated host operation did not produce a value.
 #[derive(Debug)]
@@ -3433,6 +3457,11 @@ pub fn run_program_hosted(
     id: usize,
     args: &[NanBox],
 ) -> Result<NanBox, VmError> {
+    // A table grown since `funcs` was compiled (eval code or a dynamic import
+    // appended functions in an earlier script) supersedes it: every table of
+    // one host is a prefix of the next.
+    let grown = host.vm_table_now().filter(|t| t.len() > funcs.len());
+    let funcs = grown.as_ref().unwrap_or(funcs);
     let previous = host.set_vm_table(Some(alloc::rc::Rc::clone(funcs)));
     // VM closures' own `name`/`length` are synthesized by the realm from this.
     host.realm_slot()
@@ -3517,6 +3546,16 @@ fn call_with(
     // restores the count the enclosing frame saw on the way in.
     let mark = ctx.frame_shadow.len();
     let published = ctx.frames_published;
+    // A function eval code defined after this table was taken lives in the
+    // host's newer (extended) table.
+    let newer = if id >= funcs.len() {
+        with_host(ctx, |h| h.vm_table_now())
+            .flatten()
+            .filter(|t| id < t.len())
+    } else {
+        None
+    };
+    let funcs = newer.as_deref().unwrap_or(funcs);
     let result = call_with_inner(ctx, funcs, id, args, captures, this_val);
     ctx.frames_published = published;
     ctx.frame_shadow.truncate(mark);
@@ -6446,6 +6485,12 @@ fn run_frame_at(
                         param_names: (*flags & 4 != 0).then_some(&names[..]),
                     },
                     EK_IS_EVAL => EnvReq::IsEval { callee: r(0) },
+                    EK_DECL_FN => EnvReq::DeclFn {
+                        var_env: r(0),
+                        name,
+                        value: r(1),
+                        script: *flags & 1 != 0,
+                    },
                     EK_MAP_ARGS => EnvReq::MapArgs {
                         args_obj: r(0),
                         env: r(1),
@@ -6461,7 +6506,10 @@ fn run_frame_at(
                 ctx.frame_shadow.truncate(pub_mark);
                 match res {
                     Some(Ok((v, second))) => {
-                        if !matches!(*kind, EK_INIT | EK_STORE | EK_REF_PUT | EK_MAP_ARGS) {
+                        if !matches!(
+                            *kind,
+                            EK_INIT | EK_STORE | EK_REF_PUT | EK_MAP_ARGS | EK_DECL_FN
+                        ) {
                             regs[*dst as usize] = v;
                         }
                         if *kind == EK_CALLEE {
@@ -8492,12 +8540,8 @@ fn call_closure(
         .map(|(f, c)| (f as usize, c.to_vec()))
         .ok_or(VmError::NotAnObject)?;
     // A function compiled after this run's table was captured (a module that
-    // a dynamic `import()` loaded mid-run): the host holds the grown table.
-    if id >= funcs.len() && ctx.host.is_some() {
-        return with_host(ctx, |h| h.call(closure, this_val, args))
-            .unwrap_or(Err(HostError::Fault))
-            .map_err(VmError::from);
-    }
+    // a dynamic `import()` loaded, eval code) is in the host's grown table,
+    // which `call_with` takes up.
     ctx.pending_callee = Some(closure);
     call_with(ctx, funcs, id, args, &caps, this_val)
 }
@@ -12132,6 +12176,10 @@ struct Compiler {
     /// A dynamic-scope function's variable environment (where a sloppy direct
     /// eval's `var`s land).
     var_env: Option<Reg>,
+    /// Eval code's completion value register (see `vm_eval`): expression
+    /// statements write it, and statements whose completion is `undefined` when
+    /// their body's is empty (`if`, loops, `switch`, `try`, `with`) reset it.
+    completion: Option<Reg>,
     /// While a dynamic-scope function's parameter list compiles: the names a
     /// direct eval there may not declare as `var`s (the parameters and
     /// `arguments`), joined by `\n`.
@@ -14562,6 +14610,33 @@ impl Compiler {
     /// Compiles a statement; returns the register of its value if it is an
     /// expression statement (for the program's completion value).
     fn stmt(&mut self, stmt: &Stmt) -> Result<Option<Reg>, CompileError> {
+        // Eval code's completion value (UpdateEmpty): an expression statement
+        // sets it; a statement whose value is `undefined` unless its body
+        // produces one starts it over.
+        if let Some(c) = self.completion {
+            match stmt {
+                Stmt::Expr { expression, .. } => {
+                    let r = self.expr(expression)?;
+                    self.ops.push(Op::Move { dst: c, src: r });
+                    return Ok(Some(r));
+                }
+                Stmt::If { .. }
+                | Stmt::While { .. }
+                | Stmt::DoWhile { .. }
+                | Stmt::For { .. }
+                | Stmt::ForIn { .. }
+                | Stmt::ForOf { .. }
+                | Stmt::Switch { .. }
+                | Stmt::Try { .. }
+                | Stmt::With { .. } => {
+                    self.ops.push(Op::LoadConst {
+                        dst: c,
+                        value: NanBox::undefined(),
+                    });
+                }
+                _ => {}
+            }
+        }
         match stmt {
             Stmt::Empty { .. } => Ok(None),
             // Function and (top-level) class declarations are compiled into the
@@ -14590,7 +14665,13 @@ impl Compiler {
                         // the function's variable environment.
                         let v = self.env_load(&id.name);
                         if let Some(venv) = self.var_env {
-                            self.env_op(EK_INIT, 0, alloc::vec![venv, v], &id.name, ENV_INIT_LET);
+                            self.env_op(
+                                EK_INIT,
+                                0,
+                                alloc::vec![venv, v],
+                                &id.name,
+                                ENV_INIT_VAR_SET,
+                            );
                         }
                     } else if self.annexb_spans.contains(&f.span)
                         && let Some(var_b) = self.scopes[0].get(&*id.name).copied()
@@ -14822,7 +14903,7 @@ impl Compiler {
                 // past the handler.
                 if let Some(fin) = finalizer {
                     self.tail_ok = saved_tail;
-                    self.block_stmts(fin)?;
+                    self.finally_stmts(fin)?;
                 }
                 let jend = self.emit_jump();
 
@@ -14903,11 +14984,11 @@ impl Compiler {
                         self.ops.push(Op::PopHandler);
                         self.finally_frames.pop();
                         self.tail_ok = saved_tail;
-                        self.block_stmts(fin)?;
+                        self.finally_stmts(fin)?;
                         let skip = self.emit_jump();
                         self.patch_to(at, self.ops.len());
                         self.tail_ok = false;
-                        self.block_stmts(fin)?;
+                        self.finally_stmts(fin)?;
                         self.ops.push(Op::Throw { src: r });
                         self.patch(skip);
                     }
@@ -14916,7 +14997,7 @@ impl Compiler {
                     // re-raise.
                     if let Some(fin) = finalizer {
                         self.tail_ok = saved_tail;
-                        self.block_stmts(fin)?;
+                        self.finally_stmts(fin)?;
                     }
                     self.ops.push(Op::Throw { src: catch_reg });
                 }
@@ -16357,6 +16438,8 @@ impl Compiler {
                     Expr::Member { .. } => {
                         return Err(CompileError::Unsupported("optional private call"));
                     }
+                    // Through the environment: a `with` object supplies `this`.
+                    Expr::Ident(id) if self.env_resolves(&id.name) => self.env_callee(&id.name),
                     other => {
                         let f = self.expr(other)?;
                         (f, self.constant(NanBox::undefined())?)
@@ -18127,6 +18210,19 @@ impl Compiler {
         });
         self.patch(jf);
         Ok(go)
+    }
+
+    /// A `finally` block: its normal completion keeps the `try`'s completion
+    /// value.
+    fn finally_stmts(&mut self, stmts: &'_ [Stmt]) -> Result<(), CompileError> {
+        let Some(c) = self.completion else {
+            return self.block_stmts(stmts);
+        };
+        let saved = self.alloc();
+        self.ops.push(Op::Move { dst: saved, src: c });
+        self.block_stmts(stmts)?;
+        self.ops.push(Op::Move { dst: c, src: saved });
+        Ok(())
     }
 
     /// Compiles a statement list in a fresh lexical scope.
@@ -20209,7 +20305,7 @@ impl Compiler {
         let fins = self.finally_frames.split_off(k);
         let hd = core::mem::replace(&mut self.handler_depth, fr.handler_depth);
         let tail = core::mem::replace(&mut self.tail_ok, false);
-        let r = self.block_stmts(&finalizer);
+        let r = self.finally_stmts(&finalizer);
         self.tail_ok = tail;
         self.handler_depth = hd;
         self.finally_frames.extend(fins);

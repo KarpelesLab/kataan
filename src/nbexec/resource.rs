@@ -676,7 +676,11 @@ impl<'a> Interp<'a> {
         // `run_eval_body`.
         let saved_script_eval = self.script_eval_globals;
         self.script_eval_globals = true;
-        let result = self.run_eval_body(program);
+        let strict = self.strict;
+        let result = match self.vm_eval_program(program, strict, None, true) {
+            Some(r) => r,
+            None => self.run_eval_body(program),
+        };
         self.script_eval_globals = saved_script_eval;
         self.eval_depth -= 1;
 
@@ -739,7 +743,11 @@ impl<'a> Interp<'a> {
         let child_intl = core::mem::take(&mut self.created_realms[idx].intl_protos);
         let saved_intl = self.realm.replace_intl_protos(child_intl);
         self.eval_depth += 1;
-        let result = self.run_eval_body(program);
+        let strict = self.strict;
+        let result = match self.vm_eval_program(program, strict, None, true) {
+            Some(r) => r,
+            None => self.run_eval_body(program),
+        };
         self.eval_depth -= 1;
 
         self.created_realms[idx].intl_protos = self.realm.replace_intl_protos(saved_intl);

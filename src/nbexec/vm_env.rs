@@ -9,7 +9,7 @@
 use super::*;
 use crate::nbvm::{
     ENV_INIT_CONST, ENV_INIT_LET, ENV_INIT_MARK_CONST, ENV_INIT_SOFT_CONST, ENV_INIT_TDZ,
-    ENV_INIT_TDZ_LEXICAL, ENV_INIT_VAR, EnvReq,
+    ENV_INIT_TDZ_LEXICAL, ENV_INIT_VAR, ENV_INIT_VAR_SET, EnvReq,
 };
 
 impl<'a> Interp<'a> {
@@ -119,6 +119,14 @@ impl<'a> Interp<'a> {
                     }
                     ENV_INIT_SOFT_CONST => s.declare_soft_const(name, value),
                     ENV_INIT_MARK_CONST => s.mark_const(name),
+                    ENV_INIT_VAR_SET => {
+                        s.declare(name, value);
+                        if s.ptr_eq(&self.global_scope)
+                            && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
+                        {
+                            self.realm.set_property(g, name, value);
+                        }
+                    }
                     _ => return Err(ExecError::Unsupported("environment init mode")),
                 }
                 Ok((undef, undef))
@@ -288,6 +296,16 @@ impl<'a> Interp<'a> {
                 }
                 r.map(|v| (v, undef))
             }
+            EnvReq::DeclFn {
+                var_env,
+                name,
+                value,
+                script,
+            } => {
+                let vs = self.env_scope(var_env)?;
+                self.bind_eval_function(&vs, name, value, !script);
+                Ok((undef, undef))
+            }
             EnvReq::IsEval { callee } => {
                 let is_eval = callee.as_handle().map(Handle::from_raw).is_some_and(|h| {
                     self.realm.native_at(h) == Some(N_EVAL)
@@ -327,6 +345,173 @@ impl<'a> Interp<'a> {
                     );
                 }
                 Ok((undef, undef))
+            }
+        }
+    }
+
+    /// The newest function table of the VM run this interpreter hosts: the
+    /// running one, or the one eval code extended from it.
+    /// (Every table of one interpreter is a prefix of the next: eval code and
+    /// dynamically imported modules only ever append to the longest.)
+    pub(crate) fn vm_newest_table(&self) -> Option<alloc::rc::Rc<[crate::nbvm::FnProto]>> {
+        let mut best = self.vm_table.clone();
+        let mut consider = |t: alloc::rc::Rc<[crate::nbvm::FnProto]>| {
+            if best.as_ref().is_none_or(|b| t.len() > b.len()) {
+                best = Some(t);
+            }
+        };
+        if let Some(ext) = &self.vm_ext_table {
+            consider(alloc::rc::Rc::clone(ext));
+        }
+        #[cfg(all(feature = "module", feature = "std"))]
+        if let Some(m) = self.module_vm_table() {
+            consider(m);
+        }
+        best
+    }
+
+    /// Eval code `program` (a direct or indirect eval's, or a `$262.evalScript`
+    /// script's when `script`) compiled to and run on the VM, when this
+    /// interpreter hosts a VM run — with the eval's environments already set up
+    /// (`current` its lexical, `eval_var_scope`/`current` its variable one) and
+    /// `new_target` the `new.target` in scope, if any. `None` when there is no
+    /// VM run, or the code does not compile (the caller tree-walks it then).
+    pub(crate) fn vm_eval_program(
+        &mut self,
+        program: &'a Program,
+        strict: bool,
+        new_target: Option<NanBox>,
+        script: bool,
+    ) -> Option<Result<NanBox, ExecError>> {
+        let mut flags = 0u8;
+        if script {
+            flags |= crate::nbvm::EVAL_SCRIPT;
+        }
+        if new_target.is_some() {
+            flags |= crate::nbvm::EVAL_NEW_TARGET;
+        }
+        let (table, proto) = self.vm_eval_proto(program, strict, flags)?;
+        // EvalDeclarationInstantiation's bindings (the VM code instantiates the
+        // function declarations itself).
+        let saved_gc = core::mem::replace(&mut self.gc_ok, false);
+        let saved_src = core::mem::replace(&mut self.src, &program.source);
+        let saved_epoch = self.eval_site_epoch;
+        self.eval_site_counter += 1;
+        self.eval_site_epoch = self.eval_site_counter;
+        // A Script's GlobalDeclarationInstantiation checks.
+        let checked = if self.script_eval_globals && self.var_scope.ptr_eq(&self.global_scope) {
+            self.global_declaration_checks(program)
+        } else {
+            Ok(())
+        };
+        self.hoist_skip_fns = true;
+        let hoisted = checked.and_then(|()| self.hoist_with_kind(&program.body, true, true));
+        self.hoist_skip_fns = false;
+        let result = hoisted.and_then(|()| {
+            let lex = self.env_value(self.current.clone());
+            let var = self.env_value(self.var_scope.clone());
+            let mut caps = alloc::vec![lex, var, self.this_val];
+            caps.extend(new_target);
+            let table = self.vm_newest_table().unwrap_or(table);
+            crate::nbvm::run_eval_code(self, &table, &proto, &caps).map_err(vm_to_exec)
+        });
+        self.eval_site_epoch = saved_epoch;
+        self.src = saved_src;
+        self.gc_ok = saved_gc;
+        Some(result)
+    }
+
+    /// CreateDynamicFunction's function, built on the VM from the parsed
+    /// `(function anonymous(…) {…})` wrapper `program` in the global
+    /// environment; `None` when there is no VM run or it does not compile.
+    pub(crate) fn vm_dynamic_function(
+        &mut self,
+        program: &'a Program,
+        strict: bool,
+    ) -> Option<Result<NanBox, ExecError>> {
+        let (table, proto) = self.vm_eval_proto(program, strict, crate::nbvm::EVAL_DYN_FN)?;
+        let g = self.global_scope.clone();
+        let env = self.env_value(g);
+        let caps = [env, env, self.global_this];
+        Some(crate::nbvm::run_eval_code(self, &table, &proto, &caps).map_err(vm_to_exec))
+    }
+
+    /// Eval code compiled for the VM (cached per program and flags), with the
+    /// newest function table — extended when the code defines functions.
+    fn vm_eval_proto(
+        &mut self,
+        program: &'a Program,
+        strict: bool,
+        flags: u8,
+    ) -> Option<(
+        alloc::rc::Rc<[crate::nbvm::FnProto]>,
+        alloc::rc::Rc<crate::nbvm::FnProto>,
+    )> {
+        let table = self.vm_newest_table()?;
+        let key = (
+            core::ptr::from_ref(program) as usize,
+            flags | (u8::from(strict) << 4),
+        );
+        let proto = match self.vm_eval_cache.get(&key) {
+            Some(p) => alloc::rc::Rc::clone(p),
+            None => {
+                // Without nested functions the body needs no table slots.
+                let mut scratch = Vec::new();
+                let first = crate::nbvm::compile_eval_code(program, &mut scratch, strict, flags);
+                let proto = match first {
+                    Err(_) => return None,
+                    Ok(p) if scratch.is_empty() => p,
+                    Ok(_) => {
+                        let mut full: Vec<crate::nbvm::FnProto> = table.to_vec();
+                        let p = crate::nbvm::compile_eval_code(program, &mut full, strict, flags)
+                            .ok()?;
+                        let ext: alloc::rc::Rc<[crate::nbvm::FnProto]> = full.into();
+                        self.realm.register_vm_fn_meta(
+                            ext.iter().map(|p| (p.name.as_str(), p.length as u32)),
+                        );
+                        self.vm_ext_table = Some(alloc::rc::Rc::clone(&ext));
+                        // One growth chain with dynamically imported modules.
+                        #[cfg(all(feature = "module", feature = "std"))]
+                        self.install_module_vm_table(alloc::rc::Rc::clone(&ext));
+                        self.vm_table = Some(ext);
+                        p
+                    }
+                };
+                let rc = alloc::rc::Rc::new(proto);
+                self.vm_eval_cache.insert(key, alloc::rc::Rc::clone(&rc));
+                rc
+            }
+        };
+        let table = self.vm_newest_table().unwrap_or(table);
+        Some((table, proto))
+    }
+
+    /// Binds eval code's (`eval_code`) or a Script's function declaration
+    /// `name` = `value` in the variable environment `vs` (CreateGlobalFunctionBinding
+    /// at the global one).
+    fn bind_eval_function(&mut self, vs: &Scope, name: &str, value: NanBox, eval_code: bool) {
+        let at_global = vs.ptr_eq(&self.global_scope);
+        if eval_code && !at_global {
+            vs.declare_deletable(name, value);
+        } else {
+            vs.declare(name, value);
+        }
+        if at_global && let Some(g) = self.global_this.as_handle().map(Handle::from_raw) {
+            let deletable = eval_code;
+            let has_own = self.realm.has_own(g, name) || self.realm.accessor(g, name).is_some();
+            let redefine_attrs = !has_own || !self.realm.property_is_non_configurable(g, name);
+            if redefine_attrs {
+                self.realm.clear_accessor(g, name);
+            }
+            self.realm.force_set_property(g, name, value);
+            if redefine_attrs {
+                self.realm.clear_readonly_property(g, name);
+                self.realm.clear_hidden_property(g, name);
+                if deletable {
+                    self.realm.clear_non_configurable_property(g, name);
+                } else {
+                    self.realm.set_non_configurable_property(g, name);
+                }
             }
         }
     }
