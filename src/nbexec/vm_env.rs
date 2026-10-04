@@ -46,7 +46,13 @@ impl<'a> Interp<'a> {
     pub(crate) fn vm_env_op(&mut self, req: EnvReq<'_>) -> Result<(NanBox, NanBox), ExecError> {
         let undef = NanBox::undefined();
         match req {
-            EnvReq::Root => {
+            EnvReq::Root { name } => {
+                #[cfg(all(feature = "module", feature = "std"))]
+                if let Some((m, _)) = crate::nbvm::split_module_name(name) {
+                    let s = self.vm_module_scope(m)?;
+                    return Ok((self.env_value(s), undef));
+                }
+                let _ = name;
                 let g = self.global_scope.clone();
                 Ok((self.env_value(g), undef))
             }
@@ -243,6 +249,10 @@ impl<'a> Interp<'a> {
                 };
                 let lex = self.env_scope(env)?;
                 let var = self.env_scope(var_env)?;
+                #[cfg(all(feature = "module", feature = "std"))]
+                let saved_imports = lex
+                    .module_imports()
+                    .map(|mi| core::mem::replace(&mut self.module_imports, mi));
                 let saved_current = core::mem::replace(&mut self.current, lex);
                 let saved_var = core::mem::replace(&mut self.var_scope, var);
                 let saved_strict = core::mem::replace(&mut self.strict, strict);
@@ -272,6 +282,10 @@ impl<'a> Interp<'a> {
                 self.current_lexical_home = saved_lexical_home;
                 self.in_field_initializer = saved_field_init;
                 self.eval_param_names = saved_param_names;
+                #[cfg(all(feature = "module", feature = "std"))]
+                if let Some(mi) = saved_imports {
+                    self.module_imports = mi;
+                }
                 r.map(|v| (v, undef))
             }
             EnvReq::IsEval { callee } => {
@@ -325,11 +339,20 @@ impl<'a> Interp<'a> {
         strict: bool,
         f: impl FnOnce(&mut Self) -> Result<T, ExecError>,
     ) -> Result<T, ExecError> {
+        // Module code's environments see its imports.
+        #[cfg(all(feature = "module", feature = "std"))]
+        let saved_imports = scope
+            .module_imports()
+            .map(|mi| core::mem::replace(&mut self.module_imports, mi));
         let saved = core::mem::replace(&mut self.current, scope);
         let saved_strict = core::mem::replace(&mut self.strict, strict);
         let r = f(self);
         self.current = saved;
         self.strict = saved_strict;
+        #[cfg(all(feature = "module", feature = "std"))]
+        if let Some(mi) = saved_imports {
+            self.module_imports = mi;
+        }
         r
     }
 

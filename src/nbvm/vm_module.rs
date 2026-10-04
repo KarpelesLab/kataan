@@ -258,6 +258,11 @@ pub fn compile_module_into(
                     | Op::GlobalExists { name, .. }
                     | Op::DeleteGlobal { name, .. }
                     | Op::InitGlobal { name, .. } => *name = tagged(module, name),
+                    // A dynamic-scope function's outermost environment is the
+                    // module's.
+                    Op::Env { kind, name, .. } if *kind == super::EK_ROOT => {
+                        *name = tagged(module, "");
+                    }
                     Op::ImportMeta { module: m, .. } | Op::DynImport { module: m, .. } => {
                         *m = module;
                     }

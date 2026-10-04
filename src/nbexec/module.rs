@@ -3232,6 +3232,15 @@ impl Interp<'_> {
         Some(r)
     }
 
+    /// VM module `index`'s environment (a dynamic-scope function's outermost
+    /// one — see `crate::nbvm::EnvReq::Root`).
+    pub(crate) fn vm_module_scope(&self, index: u32) -> Result<Scope, ExecError> {
+        match self.modules.vm_envs.get(index as usize) {
+            Some(Some((scope, _))) => Ok(scope.clone()),
+            _ => Err(Self::no_vm_module()),
+        }
+    }
+
     /// The fault for an environment access of an unknown VM module.
     fn no_vm_module() -> ExecError {
         ExecError::Unsupported("unknown VM module")

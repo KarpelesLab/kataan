@@ -3007,8 +3007,9 @@ fn vm_load_global(ctx: &mut Ctx, name: &str) -> Result<NanBox, VmError> {
 #[allow(missing_docs)]
 #[derive(Clone, Copy)]
 pub enum EnvReq<'r> {
-    /// The global environment.
-    Root,
+    /// The outermost environment of the code: the global one, or — `name`
+    /// a module-tagged name (see `split_module_name`) — that VM module's.
+    Root { name: &'r str },
     /// A new declarative environment nested in `parent` (a `catch` clause's
     /// when `catch` is set).
     Child { parent: NanBox, catch: bool },
@@ -6324,7 +6325,7 @@ fn run_frame_at(
                         Vec::new()
                     };
                 let req = match *kind {
-                    EK_ROOT => EnvReq::Root,
+                    EK_ROOT => EnvReq::Root { name },
                     EK_CHILD => EnvReq::Child {
                         parent: r(0),
                         catch: *flags & 1 != 0,
