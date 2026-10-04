@@ -198,9 +198,9 @@ pub enum Op {
         src: Reg,
         attrs: u8,
     },
-    /// `super(...args)` in a derived constructor whose function is `ctor`:
-    /// `Construct(ctor.[[Prototype]], args, new_target)`, then binds `this`
-    /// (a `ReferenceError` if already bound) and initializes the fields.
+    /// `super(...args)`: `Construct(ctor, args, new_target)` where `ctor` is
+    /// the super constructor read by [`Op::SuperCtor`], then binds `this` (a
+    /// `ReferenceError` if already bound); [`Op::InitFields`] follows.
     SuperCall {
         dst: Reg,
         ctor: Reg,
@@ -227,6 +227,12 @@ pub enum Op {
     /// A derived constructor's completion value `src`: an object is the
     /// result, `undefined` is the (bound) `this`, anything else a `TypeError`.
     DerivedResult { dst: Reg, src: Reg, this: Reg },
+    /// GetSuperConstructor: `dst = f.[[GetPrototypeOf]]()` (read before the
+    /// `super(...)` arguments are evaluated).
+    SuperCtor { dst: Reg, f: Reg },
+    /// InitializeInstanceElements of the class constructor `ctor` on `this`
+    /// (after a `super(...)` call has bound `this`).
+    InitFields { ctor: Reg, this: Reg },
     /// `dst` = a fresh private name for `#name` of the given kind (a string
     /// key in the realm's private-element namespace, unique per evaluation).
     NewPrivateName { dst: Reg, name: String, kind: u8 },
@@ -1099,6 +1105,18 @@ pub trait VmHost {
     fn generator_intrinsics(&mut self, is_async: bool) -> Option<(NanBox, NanBox)>;
     /// `%AsyncFunction.prototype%`, an async function's `[[Prototype]]`.
     fn async_function_proto(&mut self) -> Option<NanBox>;
+    /// The `$262.createRealm()` realm the host is executing in (`None`: the
+    /// main realm). Must not touch the realm (it may be lent to the VM).
+    fn realm_index(&self) -> Option<usize>;
+    /// Records that the function `f` belongs to realm `idx` (GetFunctionRealm).
+    /// Must not touch the realm.
+    fn tag_fn_realm(&mut self, f: NanBox, idx: usize);
+    /// An error of the built-in constructor `name` from the realm of the
+    /// function `callee` (GetFunctionRealm).
+    fn make_error_in(&mut self, name: &str, message: &str, callee: NanBox) -> NanBox;
+    /// The global object of the realm of the function `callee`
+    /// (GetFunctionRealm) — a sloppy function's `this` for `undefined`.
+    fn global_this_of(&mut self, callee: NanBox) -> NanBox;
     /// GetPrototypeFromConstructor(`new_target`, %Object.prototype%): its
     /// `prototype` when an Object, else the intrinsic of its function realm.
     ///
@@ -1333,6 +1351,13 @@ pub(crate) fn call_vm_function(
 /// allocation-triggered collection off (a nested run must not collect; the
 /// outermost one switches it on — see [`run_program_hosted`]).
 fn hosted_ctx<'a>(realm: &'a mut Realm, host: &'a mut dyn VmHost) -> Ctx<'a> {
+    let in_realm = host.realm_index();
+    let mut ctx = hosted_ctx_in(realm, host);
+    ctx.in_realm = in_realm;
+    ctx
+}
+
+fn hosted_ctx_in<'a>(realm: &'a mut Realm, host: &'a mut dyn VmHost) -> Ctx<'a> {
     Ctx {
         realm,
         host: Some(host),
@@ -1360,6 +1385,7 @@ fn hosted_ctx<'a>(realm: &'a mut Realm, host: &'a mut dyn VmHost) -> Ctx<'a> {
         args_buf: Vec::new(),
         callee_args: Vec::new(),
         pending_new_target: None,
+        in_realm: None,
     }
 }
 
@@ -2859,22 +2885,13 @@ fn make_class(ctx: &mut Ctx, f: NanBox, sup: Option<NanBox>) -> Result<NanBox, V
 
 /// `super(...)`'s `[[Construct]]` of the constructor `f`'s own
 /// `[[Prototype]]` (the parent class) with `new_target`.
-fn super_construct(
+fn super_construct_parent(
     ctx: &mut Ctx,
     funcs: &[FnProto],
-    f: NanBox,
+    parent: NanBox,
     args: &[NanBox],
     new_target: NanBox,
 ) -> Result<NanBox, VmError> {
-    let fh = f
-        .as_handle()
-        .map(Handle::from_raw)
-        .ok_or(VmError::NotAnObject)?;
-    let parent = ctx
-        .realm
-        .object_proto(fh)
-        .map(|h| NanBox::handle(h.to_raw()))
-        .unwrap_or(NanBox::null());
     if !vm_is_constructor(ctx, parent) {
         let e = vm_error(ctx, "TypeError", "Super constructor is not a constructor");
         return Err(VmError::Thrown(e));
@@ -3323,6 +3340,16 @@ fn with_host<R>(ctx: &mut Ctx, f: impl FnOnce(&mut dyn VmHost) -> R) -> Option<R
 /// A `name` error with `message`: a real error instance built by the host when
 /// the run has one, else the VM's own plain `{ name, message }` object.
 fn vm_error(ctx: &mut Ctx, name: &str, message: &str) -> NanBox {
+    // The running function's realm supplies the constructor.
+    if let Some(callee) = ctx
+        .callee_stack
+        .last()
+        .copied()
+        .filter(|c| c.as_handle().is_some())
+        && let Some(e) = with_host(ctx, |h| h.make_error_in(name, message, callee))
+    {
+        return e;
+    }
     match with_host(ctx, |h| h.make_error(name, message)) {
         Some(e) => e,
         None => make_error(ctx.realm, name, message),
@@ -3421,6 +3448,9 @@ struct Ctx<'a> {
     /// The `new.target` of the next `call_with` activation when it is a
     /// `[[Construct]]` (`None` for an ordinary call). Taken on entry.
     pending_new_target: Option<NanBox>,
+    /// The host realm (a `$262.createRealm()` index) this run executes in,
+    /// when not the main one: closures it creates belong to that realm.
+    in_realm: Option<usize>,
     /// The callee of each active activation of this run (`undefined` when the
     /// call site did not know it), innermost last — the legacy `fn.caller`.
     callee_stack: Vec<NanBox>,
@@ -3478,6 +3508,7 @@ pub fn run_program(
         args_buf: Vec::new(),
         callee_args: Vec::new(),
         pending_new_target: None,
+        in_realm: None,
     };
     let value = call(&mut ctx, funcs, id, args)?;
     drain_microtasks(&mut ctx, funcs)?;
@@ -3521,6 +3552,7 @@ pub fn run_program_capturing(
         args_buf: Vec::new(),
         callee_args: Vec::new(),
         pending_new_target: None,
+        in_realm: None,
     };
     let value = call(&mut ctx, funcs, id, args)?;
     // Run the promise event loop before returning (then-callbacks, async tails).
@@ -4049,6 +4081,7 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
         args_buf: Vec::new(),
         callee_args: Vec::new(),
         pending_new_target: None,
+        in_realm: None,
     };
     match run_frame(&mut ctx, &[], program, &mut regs)? {
         FrameExit::Return(v) => Ok(v.unwrap_or(NanBox::undefined())),
@@ -6928,7 +6961,7 @@ fn run_frame_at(
                 let pub_mark = ctx.frame_shadow.len();
                 ctx.frame_shadow.extend_from_slice(regs);
                 ctx.frames_published += 1;
-                let r = super_construct(ctx, funcs, f, &argv, nt);
+                let r = super_construct_parent(ctx, funcs, f, &argv, nt);
                 ctx.frames_published -= 1;
                 ctx.frame_shadow.truncate(pub_mark);
                 let obj = match r {
@@ -6949,6 +6982,16 @@ fn run_frame_at(
                 }
                 regs[*this as usize] = obj;
                 regs[*dst as usize] = obj;
+            }
+            Op::SuperCtor { dst, f } => {
+                let fh = object_handle(regs[*f as usize])?;
+                regs[*dst as usize] = ctx
+                    .realm
+                    .object_proto(fh)
+                    .map_or(NanBox::null(), |h| NanBox::handle(h.to_raw()));
+            }
+            Op::InitFields { ctor, this } => {
+                let (f, obj) = (regs[*ctor as usize], regs[*this as usize]);
                 if let Err(e) = run_fields(ctx, funcs, f, obj) {
                     handle_throw!(e);
                 }
@@ -7028,12 +7071,20 @@ fn run_frame_at(
             }
             Op::BindThis { this } => {
                 let t = regs[*this as usize];
+                let callee = ctx
+                    .callee_stack
+                    .last()
+                    .copied()
+                    .filter(|c| c.as_handle().is_some());
                 if let Some(bound) = with_host(ctx, |h| {
                     if matches!(
                         t.unpack(),
                         crate::nanbox::Unpacked::Undefined | crate::nanbox::Unpacked::Null
                     ) {
-                        h.global_this()
+                        match callee {
+                            Some(c) => h.global_this_of(c),
+                            None => h.global_this(),
+                        }
                     } else {
                         h.to_object(t)
                     }
@@ -7726,6 +7777,11 @@ fn run_frame_at(
                 install_fn_name_length(ctx.realm, handle, funcs.get(*func as usize));
                 link_function_proto(ctx, handle);
                 link_async_proto(ctx, funcs.get(*func as usize), handle);
+                if let Some(idx) = ctx.in_realm
+                    && let Some(h) = ctx.host.as_deref_mut()
+                {
+                    h.tag_fn_realm(NanBox::handle(handle.to_raw()), idx);
+                }
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::CallValue { dst, callee, args }
@@ -20179,6 +20235,11 @@ impl Compiler {
             .lookup(CTOR_NAME)
             .ok_or(CompileError::Unsupported("super call outside a class"))?;
         let ctor = self.read_var(cb);
+        let parent = self.alloc();
+        self.ops.push(Op::SuperCtor {
+            dst: parent,
+            f: ctor,
+        });
         let nb = self
             .lookup(NT_NAME)
             .ok_or(CompileError::Unsupported("super call without new.target"))?;
@@ -20204,12 +20265,13 @@ impl Compiler {
             });
             self.ops.push(Op::SuperCall {
                 dst,
-                ctor,
+                ctor: parent,
                 new_target,
                 args,
                 this,
             });
             self.write_var(Binding { tdz: false, ..tb }, this);
+            self.ops.push(Op::InitFields { ctor, this });
             return Ok(dst);
         }
         let this = self.this_reg;
@@ -20218,7 +20280,7 @@ impl Compiler {
         self.sync_this_from_cell();
         self.ops.push(Op::SuperCall {
             dst,
-            ctor,
+            ctor: parent,
             new_target,
             args,
             this,
@@ -20227,6 +20289,7 @@ impl Compiler {
         if let Some(b) = self.scopes[0].get(THIS_NAME).copied() {
             self.write_var(Binding { tdz: false, ..b }, this);
         }
+        self.ops.push(Op::InitFields { ctor, this });
         Ok(dst)
     }
 
@@ -23340,6 +23403,7 @@ mod generic_jit_tests {
             args_buf: Vec::new(),
             callee_args: Vec::new(),
             pending_new_target: None,
+            in_realm: None,
         }
     }
 

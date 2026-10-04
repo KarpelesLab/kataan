@@ -10568,6 +10568,34 @@ impl crate::nbvm::VmHost for Interp<'_> {
         Ok(p.map_or(NanBox::null(), |h| NanBox::handle(h.to_raw())))
     }
 
+    fn global_this_of(&mut self, callee: NanBox) -> NanBox {
+        callee
+            .as_handle()
+            .and_then(|h| self.get_function_realm(Handle::from_raw(h)))
+            .filter(|i| *i < self.created_realms.len())
+            .map_or(self.global_this, |i| self.created_realms[i].global_this)
+    }
+
+    fn realm_index(&self) -> Option<usize> {
+        self.cur_realm
+    }
+
+    fn tag_fn_realm(&mut self, f: NanBox, idx: usize) {
+        if let Some(raw) = f.as_handle() {
+            self.fn_realm.insert(raw, idx);
+        }
+    }
+
+    fn make_error_in(&mut self, name: &str, message: &str, callee: NanBox) -> NanBox {
+        let realm = callee
+            .as_handle()
+            .and_then(|h| self.get_function_realm(Handle::from_raw(h)));
+        let saved = core::mem::replace(&mut self.cur_realm, realm);
+        let e = crate::nbvm::VmHost::make_error(self, name, message);
+        self.cur_realm = saved;
+        e
+    }
+
     fn async_function_proto(&mut self) -> Option<NanBox> {
         self.async_function_prototype()
             .map(|h| NanBox::handle(h.to_raw()))

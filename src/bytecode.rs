@@ -563,6 +563,14 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*src)?;
             reg(*this)
         }
+        Op::SuperCtor { dst, f } => {
+            reg(*dst)?;
+            reg(*f)
+        }
+        Op::InitFields { ctor, this } => {
+            reg(*ctor)?;
+            reg(*this)
+        }
         Op::DerivedResult { dst, src, this } => {
             reg(*dst)?;
             reg(*src)?;
@@ -1650,6 +1658,16 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*obj, out);
             w_reg(*src, out);
         }
+        Op::SuperCtor { dst, f } => {
+            w_u8(211, out);
+            w_reg(*dst, out);
+            w_reg(*f, out);
+        }
+        Op::InitFields { ctor, this } => {
+            w_u8(210, out);
+            w_reg(*ctor, out);
+            w_reg(*this, out);
+        }
         Op::DerivedResult { dst, src, this } => {
             w_u8(96, out);
             for r in [dst, src, this] {
@@ -2331,6 +2349,14 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         97 => Op::SetProtoIfObject {
             obj: r.reg()?,
             src: r.reg()?,
+        },
+        211 => Op::SuperCtor {
+            dst: r.reg()?,
+            f: r.reg()?,
+        },
+        210 => Op::InitFields {
+            ctor: r.reg()?,
+            this: r.reg()?,
         },
         96 => Op::DerivedResult {
             dst: r.reg()?,
