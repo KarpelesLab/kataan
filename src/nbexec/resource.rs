@@ -679,10 +679,7 @@ impl<'a> Interp<'a> {
         let saved_script_eval = self.script_eval_globals;
         self.script_eval_globals = true;
         let strict = self.strict;
-        let result = match self.vm_eval_program(program, strict, None, true) {
-            Some(r) => r,
-            None => self.run_eval_body(program),
-        };
+        let result = self.vm_eval_program(program, strict, None, true);
         self.script_eval_globals = saved_script_eval;
         self.eval_depth -= 1;
 
@@ -750,10 +747,7 @@ impl<'a> Interp<'a> {
         let saved_intl = self.realm.replace_intl_protos(child_intl);
         self.eval_depth += 1;
         let strict = self.strict;
-        let result = match self.vm_eval_program(program, strict, None, true) {
-            Some(r) => r,
-            None => self.run_eval_body(program),
-        };
+        let result = self.vm_eval_program(program, strict, None, true);
         self.eval_depth -= 1;
 
         self.created_realms[idx].intl_protos = self.realm.replace_intl_protos(saved_intl);
@@ -1653,10 +1647,7 @@ impl<'a> Interp<'a> {
         let saved_intl = self.realm.replace_intl_protos(child_intl);
         self.eval_depth += 1;
         let strict = self.strict;
-        let result = match self.vm_eval_program(program, strict, None, false) {
-            Some(r) => r,
-            None => self.run_eval_body(program),
-        };
+        let result = self.vm_eval_program(program, strict, None, false);
         self.eval_depth -= 1;
 
         self.created_realms[realm_idx].intl_protos = self.realm.replace_intl_protos(saved_intl);

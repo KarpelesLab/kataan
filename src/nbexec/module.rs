@@ -1130,6 +1130,15 @@ impl<'a> Interp<'a> {
         if let Some((_, protos)) = self.modules.records[key].vm {
             return self.vm_instantiate(key, protos);
         }
+        // A module the bytecode compiler refused fails to link: module code
+        // runs only on the VM.
+        if self.modules.vm_enabled
+            && matches!(self.modules.records[key].kind, ModuleKind::JavaScript)
+        {
+            return Err(ExecError::Unsupported(
+                "the bytecode compiler refused this module",
+            ));
+        }
         let (scope, program) = {
             let r = &self.modules.records[key];
             (r.scope.clone(), r.program)

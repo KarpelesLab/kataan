@@ -7,17 +7,11 @@ fn main() {
     let path = std::env::args().nth(1).expect("usage: srun <file.js>");
     let src = std::fs::read_to_string(&path).expect("read");
     let combined = format!("{PRELUDE}\n{src}");
-    // `KATAAN_SRUN_TIER=nbexec` pins the reference tree-walker, so a snippet can be
-    // checked on both tiers (the default entry silently falls back to nbexec, which
-    // otherwise hides which tier produced a result).
-    let force_nbexec = std::env::var("KATAAN_SRUN_TIER").is_ok_and(|v| v == "nbexec");
     // A file holding several scripts separated by `//---SCRIPT---` lines runs
     // them as consecutive Scripts over one realm (as the Test262 runner does).
     let scripts: Vec<&str> = combined.split("//---SCRIPT---\n").collect();
-    let result = if scripts.len() > 1 && !force_nbexec {
+    let result = if scripts.len() > 1 {
         kataan::nbvm::execute_scripts_typed(&scripts, kataan::limits::Limits::default())
-    } else if force_nbexec {
-        kataan::nbexec::eval_source_typed(&combined, kataan::limits::Limits::default())
     } else {
         kataan::nbvm::execute_typed(&combined, kataan::limits::Limits::default())
     };

@@ -409,15 +409,18 @@ impl<'a> Interp<'a> {
     /// script's when `script`) compiled to and run on the VM, when this
     /// interpreter hosts a VM run — with the eval's environments already set up
     /// (`current` its lexical, `eval_var_scope`/`current` its variable one) and
-    /// `new_target` the `new.target` in scope, if any. `None` when there is no
-    /// VM run, or the code does not compile (the caller tree-walks it then).
+    /// `new_target` the `new.target` in scope, if any.
+    ///
+    /// # Errors
+    /// The code's own throw, or [`ExecError::Unsupported`] when the bytecode
+    /// compiler refuses it.
     pub(crate) fn vm_eval_program(
         &mut self,
         program: &'a Program,
         strict: bool,
         new_target: Option<NanBox>,
         script: bool,
-    ) -> Option<Result<NanBox, ExecError>> {
+    ) -> Result<NanBox, ExecError> {
         let mut flags = 0u8;
         if script {
             flags |= crate::nbvm::EVAL_SCRIPT;
@@ -478,18 +481,21 @@ impl<'a> Interp<'a> {
         self.eval_site_epoch = saved_epoch;
         self.src = saved_src;
         self.gc_ok = saved_gc;
-        Some(result)
+        result
     }
 
     /// CreateDynamicFunction's function, built on the VM from the parsed
     /// `(function anonymous(…) {…})` wrapper `program` in the global
-    /// environment; `None` when there is no VM run or it does not compile.
+    /// environment.
+    ///
+    /// # Errors
+    /// As [`vm_eval_program`](Self::vm_eval_program).
     pub(crate) fn vm_dynamic_function(
         &mut self,
         program: &'a Program,
         strict: bool,
         realm: Option<usize>,
-    ) -> Option<Result<NanBox, ExecError>> {
+    ) -> Result<NanBox, ExecError> {
         let (table, proto) = self.vm_eval_proto(program, strict, crate::nbvm::EVAL_DYN_FN, &[])?;
         // The function closes over its realm's global environment.
         let (g, this) = match realm.and_then(|i| self.created_realms.get(i)) {
@@ -502,7 +508,7 @@ impl<'a> Interp<'a> {
         let guard = self.enter_realm(realm);
         let r = crate::nbvm::run_eval_code(self, &table, &proto, &caps, false).map_err(vm_to_exec);
         self.leave_realm(guard);
-        Some(r)
+        r
     }
 
     /// Eval code compiled for the VM (cached per program and flags), with the
@@ -513,11 +519,18 @@ impl<'a> Interp<'a> {
         strict: bool,
         flags: u8,
         privates: &[&str],
-    ) -> Option<(
-        alloc::rc::Rc<[crate::nbvm::FnProto]>,
-        alloc::rc::Rc<crate::nbvm::FnProto>,
-    )> {
-        let table = self.vm_newest_table()?;
+    ) -> Result<
+        (
+            alloc::rc::Rc<[crate::nbvm::FnProto]>,
+            alloc::rc::Rc<crate::nbvm::FnProto>,
+        ),
+        ExecError,
+    > {
+        // Before any VM run (a host calling `eval` on a fresh interpreter)
+        // the table is empty.
+        let table = self
+            .vm_newest_table()
+            .unwrap_or_else(|| alloc::rc::Rc::from(Vec::new()));
         let key = (
             core::ptr::from_ref(program) as usize,
             u16::from(flags) | (u16::from(strict) << 8),
@@ -536,7 +549,9 @@ impl<'a> Interp<'a> {
                         if std::env::var_os("KATAAN_DEBUG_EVAL").is_some() {
                             std::eprintln!("eval compile: {e:?}: {}", program.source);
                         }
-                        return None;
+                        return Err(ExecError::Unsupported(
+                            "the bytecode compiler refused this eval code",
+                        ));
                     }
                     Ok(p) if scratch.is_empty() => p,
                     Ok(_) => {
@@ -545,7 +560,9 @@ impl<'a> Interp<'a> {
                         let p = crate::nbvm::compile_eval_code(
                             program, &mut full, strict, flags, privates,
                         )
-                        .ok()?;
+                        .map_err(|_| {
+                            ExecError::Unsupported("the bytecode compiler refused this eval code")
+                        })?;
                         crate::nbvm::resolve_source_text(&mut full[base..], &program.source);
                         // One growth chain with scripts and dynamic imports.
                         self.install_vm_table(full.into());
@@ -558,7 +575,7 @@ impl<'a> Interp<'a> {
             }
         };
         let table = self.vm_newest_table().unwrap_or(table);
-        Some((table, proto))
+        Ok((table, proto))
     }
 
     /// Binds eval code's (`eval_code`) or a Script's function declaration

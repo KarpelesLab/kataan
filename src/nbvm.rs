@@ -10494,9 +10494,8 @@ pub fn execute_capturing(
 /// Like [`execute_with_limits`], but on failure returns a structured
 /// [`Thrown`](crate::nbexec::Thrown) carrying the error's JS *type* — the entry
 /// point the Test262 conformance runner uses to verify a `negative` test fails
-/// with the declared error type. Runs the production bytecode path; any fault
-/// (an unsupported construct or a genuine JS throw) re-runs on the reference
-/// tree-walker, which surfaces the typed throw with complete semantics.
+/// with the declared error type. Runs on the production bytecode path, hosted
+/// by an interpreter.
 ///
 /// # Errors
 /// Returns [`Thrown`](crate::nbexec::Thrown) for a parse failure or uncaught throw.
@@ -10514,9 +10513,6 @@ pub fn execute_typed(
 /// [`Limits`](crate::limits::Limits), which is `Copy` while an
 /// [`Interrupt`](crate::interrupt::Interrupt) owns an `Arc`.
 ///
-/// Note the interrupt is passed on to the tree-walker fallback too: a program
-/// that faults out of the bytecode tier for an unlowered construct must still
-/// be interruptible.
 pub fn execute_typed_interruptible(
     source: &str,
     limits: crate::limits::Limits,
@@ -10535,15 +10531,14 @@ pub fn execute_typed_interruptible(
     // Run as a *Script*: a unit `parse_program` promoted to a Module (because it
     // has a top-level `import`/`export`) is an early SyntaxError here — those
     // declarations are legal only at a Module's top level. (Module tests use the
-    // module loader.) Defer to nbexec, which reports the same parse-phase error.
+    // module loader.)
     if program.source_type == crate::ast::SourceType::Module {
-        return crate::nbexec::eval_source_typed_interruptible(source, limits, interrupt);
+        return Err(import_export_in_script());
     }
     let mut protos = Vec::new();
     let main = match compile_program_into(&program, true, &mut protos) {
         Ok(main) => main,
-        Err(e) if vm_strict() => return Err(vm_fallback(&alloc::format!("compile: {e:?}"))),
-        Err(_) => return crate::nbexec::eval_source_typed_interruptible(source, limits, interrupt),
+        Err(e) => return Err(compile_refused(&e)),
     };
     // Run inside an interpreter (`ROADMAP.md` §2.0), as the multi-script entry
     // does: one realm, one global environment, one console.
@@ -10565,21 +10560,56 @@ pub fn execute_typed_interruptible(
             tree_walk_check(&interp)?;
             Ok((String::from(interp.output()), interp.display(value)))
         }
-        // An interrupt is a *deadline*, not a construct the VM cannot lower:
-        // re-running on the tree-walker would restart the runaway program from
-        // the top, so it propagates instead of taking the fallback below.
-        Err(VmError::Interrupted) => Err(crate::nbexec::Thrown {
-            phase: crate::nbexec::ErrorPhase::Runtime,
-            name: alloc::string::String::from("Interrupted"),
-            message: alloc::string::String::from("execution interrupted by the host"),
-        }),
-        Err(VmError::Thrown(v)) if vm_strict() => Err(crate::nbexec::thrown_from_exec_error(
-            &interp,
+        Err(e) => Err(vm_thrown(&interp, e)),
+    }
+}
+
+/// The `Thrown` a hosted script run reports for VM error `e`: a JS throw as
+/// its error type, a host interrupt as `Interrupted`, and a VM fault (a
+/// construct the VM cannot run with correct semantics) as `InternalError`.
+pub(crate) fn vm_thrown(interp: &crate::nbexec::Interp, e: VmError) -> crate::nbexec::Thrown {
+    match e {
+        VmError::Thrown(v) => crate::nbexec::thrown_from_exec_error(
+            interp,
             crate::nbexec::ExecError::Throw(v),
             crate::nbexec::ErrorPhase::Runtime,
-        )),
-        Err(e) if vm_strict() => Err(vm_fallback(&alloc::format!("runtime: {e:?}"))),
-        Err(_) => crate::nbexec::eval_source_typed_interruptible(source, limits, interrupt),
+        ),
+        VmError::Interrupted => vm_thrown_interrupted(),
+        other => internal_error(&alloc::format!("bytecode VM fault: {other:?}")),
+    }
+}
+
+/// The `Thrown` for a run the host's watchdog interrupted.
+pub(crate) fn vm_thrown_interrupted() -> crate::nbexec::Thrown {
+    crate::nbexec::Thrown {
+        phase: crate::nbexec::ErrorPhase::Runtime,
+        name: String::from("Interrupted"),
+        message: String::from("execution interrupted by the host"),
+    }
+}
+
+/// The parse-phase `SyntaxError` for `import`/`export` in a Script.
+pub(crate) fn import_export_in_script() -> crate::nbexec::Thrown {
+    crate::nbexec::Thrown {
+        phase: crate::nbexec::ErrorPhase::Parse,
+        name: String::from("SyntaxError"),
+        message: String::from("`import`/`export` may only appear at the top level of a module"),
+    }
+}
+
+/// The error for a program the bytecode compiler refuses.
+pub(crate) fn compile_refused(e: &CompileError) -> crate::nbexec::Thrown {
+    internal_error(&alloc::format!(
+        "the bytecode compiler refused this program: {e:?}"
+    ))
+}
+
+/// An engine-limitation error (not a JS throw).
+pub(crate) fn internal_error(message: &str) -> crate::nbexec::Thrown {
+    crate::nbexec::Thrown {
+        phase: crate::nbexec::ErrorPhase::Runtime,
+        name: String::from("InternalError"),
+        message: String::from(message),
     }
 }
 
@@ -10592,9 +10622,8 @@ pub fn execute_typed_interruptible(
 /// them into a single source makes the harness strict too, which silently
 /// changes what a direct `eval` inside a harness function does.
 ///
-/// Tier selection is all-or-nothing. If any script fails to lower to bytecode
-/// the whole sequence re-runs on the tree-walker from a fresh realm, because a
-/// partially-executed [`Realm`] cannot be handed to `nbexec`.
+/// Every script is compiled before any runs, so a program the bytecode
+/// compiler refuses fails before any code has run.
 ///
 /// # Errors
 /// Returns [`Thrown`](crate::nbexec::Thrown) for the first script that fails to
@@ -10605,7 +10634,7 @@ pub fn execute_scripts_typed(
 ) -> Result<(String, String), crate::nbexec::Thrown> {
     // Parse every script before compiling any: a parse error in a later script
     // is an early error of the whole run and must win over a compile refusal in
-    // an earlier one (which only matters under `KATAAN_VM_STRICT`).
+    // an earlier one.
     let mut programs = Vec::with_capacity(sources.len());
     for source in sources {
         let program = match crate::parser::Parser::parse_program(source) {
@@ -10618,10 +10647,9 @@ pub fn execute_scripts_typed(
                 });
             }
         };
-        // `import`/`export` at a Script's top level is an early SyntaxError;
-        // nbexec reports it with the same wording.
+        // `import`/`export` at a Script's top level is an early SyntaxError.
         if program.source_type == crate::ast::SourceType::Module {
-            return crate::nbexec::eval_scripts_typed(sources, limits);
+            return Err(import_export_in_script());
         }
         programs.push(program);
     }
@@ -10632,8 +10660,7 @@ pub fn execute_scripts_typed(
     for program in &programs {
         match compile_program_into(program, true, &mut table) {
             Ok(main) => mains.push(main),
-            Err(e) if vm_strict() => return Err(vm_fallback(&alloc::format!("compile: {e:?}"))),
-            Err(_) => return crate::nbexec::eval_scripts_typed(sources, limits),
+            Err(e) => return Err(compile_refused(&e)),
         }
     }
     // The scripts run inside one interpreter (`ROADMAP.md` §2.0): its realm,
@@ -10656,65 +10683,22 @@ pub fn execute_scripts_typed(
         }
         match run_program_hosted(&mut interp, &table, *main as usize, &[]) {
             Ok(value) => completion = interp.display(value),
-            Err(VmError::Thrown(v)) if vm_strict() => {
-                return Err(crate::nbexec::thrown_from_exec_error(
-                    &interp,
-                    crate::nbexec::ExecError::Throw(v),
-                    crate::nbexec::ErrorPhase::Runtime,
-                ));
-            }
-            Err(e) if vm_strict() => return Err(vm_fallback(&alloc::format!("runtime: {e:?}"))),
-            Err(_) => return crate::nbexec::eval_scripts_typed(sources, limits),
+            Err(e) => return Err(vm_thrown(&interp, e)),
         }
     }
     tree_walk_check(&interp)?;
     Ok((String::from(interp.output()), completion))
 }
 
-/// Whether `KATAAN_VM_STRICT` is set: the script entries then report a program
-/// the bytecode tier cannot run as a `VmFallback` error instead of silently
-/// re-running it on the tree-walker, and surface a VM-thrown value as-is. It
-/// exists to *measure* the tier — run the Test262 corpus with it and every
-/// failure is either a coverage gap (`VmFallback`) or a VM bug (anything else).
-fn vm_strict() -> bool {
-    #[cfg(feature = "std")]
-    {
-        std::env::var_os("KATAAN_VM_STRICT").is_some() || vm_pure()
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        false
-    }
-}
-
-/// Whether `KATAAN_VM_PURE` is set: [`vm_strict`], and additionally a run in
-/// which the tree-walker executed *any* user statement (dynamic code, modules,
-/// interpreter-made closures) reports `VmFallback` — "100% on the VM".
-fn vm_pure() -> bool {
-    #[cfg(feature = "std")]
-    {
-        std::env::var_os("KATAAN_VM_PURE").is_some()
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        false
-    }
-}
-
-/// Under [`vm_pure`], the `VmFallback` for a run that tree-walked user code.
-fn tree_walk_check(interp: &crate::nbexec::Interp) -> Result<(), crate::nbexec::Thrown> {
+/// The error for a run in which the tree-walker executed a user statement —
+/// none can, now that every unit runs on the VM; kept as a safety net while
+/// the tree-walker's executor still exists.
+pub(crate) fn tree_walk_check(interp: &crate::nbexec::Interp) -> Result<(), crate::nbexec::Thrown> {
     match interp.tree_walked() {
-        n if n > 0 && vm_pure() => Err(vm_fallback(&alloc::format!("tree-walk: {n} statements"))),
-        _ => Ok(()),
-    }
-}
-
-/// The `VmFallback` error [`vm_strict`] reports in place of a fallback.
-fn vm_fallback(reason: &str) -> crate::nbexec::Thrown {
-    crate::nbexec::Thrown {
-        phase: crate::nbexec::ErrorPhase::Runtime,
-        name: String::from("VmFallback"),
-        message: String::from(reason),
+        0 => Ok(()),
+        n => Err(internal_error(&alloc::format!(
+            "tree-walked {n} statements"
+        ))),
     }
 }
 

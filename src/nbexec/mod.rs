@@ -6119,31 +6119,23 @@ impl<'a> Interp<'a> {
     /// (`ROADMAP.md` §2.0): it is compiled into the interpreter's persistent
     /// function table, so consecutive `run` calls on one interpreter (a REPL, an
     /// embedder feeding scripts) share the global environment *and* the closures
-    /// earlier runs created. A program the bytecode compiler refuses runs on the
-    /// tree-walker instead ([`run_tree_walk`](Self::run_tree_walk)); compilation
-    /// happens before any user code, so that choice is clean. How many user
-    /// statements the tree-walker executed is [`tree_walked`](Self::tree_walked).
+    /// earlier runs created. Compilation happens before any user code runs.
     ///
     /// # Errors
-    /// An early error of the script (a conflicting global declaration), an
-    /// uncaught throw ([`ExecError::Throw`]), or a host interrupt.
+    /// An early error of the script (a conflicting global declaration, or
+    /// `import`/`export` outside a module), an uncaught throw
+    /// ([`ExecError::Throw`]), a host interrupt, or
+    /// [`ExecError::Unsupported`] for a program the bytecode compiler refuses.
     pub fn run(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
-        match self.run_on_vm(program) {
-            Some(result) => result,
-            None => self.run_tree_walk(program),
-        }
-    }
-
-    /// The bytecode-VM half of [`run`](Self::run): `None` when the compiler
-    /// refuses `program` (nothing has run).
-    fn run_on_vm(&mut self, program: &'a Program) -> Option<Result<NanBox, ExecError>> {
         // A unit with a top-level `import`/`export` is a Module; this entry runs
         // Scripts (modules go through the module loader).
         if program.source_type == crate::ast::SourceType::Module {
-            return None;
+            let m = self.new_str("`import`/`export` may only appear at the top level of a module");
+            return Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))));
         }
         let mut table = self.vm_table_vec();
-        let main = crate::nbvm::compile_program_into(program, true, &mut table).ok()?;
+        let main = crate::nbvm::compile_program_into(program, true, &mut table)
+            .map_err(|_| ExecError::Unsupported("the bytecode compiler refused this program"))?;
         let table: alloc::rc::Rc<[crate::nbvm::FnProto]> = table.into();
         // Installed for good, not just for this run: closures the script leaves
         // behind (in globals, timers, promise reactions) stay callable after it.
@@ -6151,18 +6143,8 @@ impl<'a> Interp<'a> {
         // Modules a dynamic `import()` loads run on the VM too.
         #[cfg(all(feature = "std", feature = "module"))]
         self.enable_vm_modules();
-        if let Err(e) = self.prepare_script_for_vm(program) {
-            return Some(Err(e));
-        }
-        Some(
-            crate::nbvm::run_program_hosted(self, &table, main as usize, &[]).map_err(
-                |e| match e {
-                    crate::nbvm::VmError::Thrown(v) => ExecError::Throw(v),
-                    crate::nbvm::VmError::Interrupted => ExecError::Interrupted,
-                    _ => ExecError::Unsupported("bytecode VM fault"),
-                },
-            ),
-        )
+        self.prepare_script_for_vm(program)?;
+        crate::nbvm::run_program_hosted(self, &table, main as usize, &[]).map_err(vm_to_exec)
     }
 
     /// The function table VM code compiled into this interpreter lives in (a
@@ -6331,70 +6313,6 @@ impl<'a> Interp<'a> {
                 Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))))
             }
         }
-    }
-
-    /// Executes a parsed eval `program`'s statements in the current scope,
-    /// returning the completion value (the value of the last value-producing
-    /// statement, else `undefined`). Strict-mode and scope setup are the caller's
-    /// responsibility; this is the shared statement loop. Unlike `run`, it does
-    /// NOT drain the event loop — eval runs synchronously within the surrounding
-    /// execution, which drains microtasks at its own top level.
-    fn run_eval_body(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
-        // The eval body's function/class spans index into the eval program's own
-        // (leaked) source; retain it for `Function.prototype.toString` while its
-        // statements run, then restore the enclosing source so a subsequent
-        // definition in the surrounding code slices the right text.
-        // An `eval` body is reached from a native call frame holding live Rust
-        // locals, so its statement boundaries are not GC-safe.
-        let saved_gc = core::mem::replace(&mut self.gc_ok, false);
-        let saved_src = core::mem::replace(&mut self.src, &program.source);
-        // Mint a fresh eval-site epoch for this invocation so its tagged-template
-        // sites are distinct from any other eval of the same (deduplicated) source:
-        // each `eval` call is a different site, while a loop inside this body reuses
-        // the epoch and so shares one cached template object.
-        let saved_epoch = self.eval_site_epoch;
-        self.eval_site_counter += 1;
-        self.eval_site_epoch = self.eval_site_counter;
-        let result = self.run_eval_body_inner(program);
-        self.eval_site_epoch = saved_epoch;
-        self.src = saved_src;
-        self.gc_ok = saved_gc;
-        result
-    }
-
-    fn run_eval_body_inner(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
-        // GlobalDeclarationInstantiation for a *Script* (`$262.evalScript` /
-        // `createRealm().evalScript`) running directly in the global environment
-        // (sloppy scripts only; a strict script declares into a discarded child
-        // env). Rejects — before any binding is created — a lexical decl that
-        // collides with an existing global var/lexical/restricted-global, a
-        // var/function decl that collides with a global lexical, and a
-        // var/function the global object refuses to define. An indirect/direct
-        // `eval` (which runs its own EvalDeclarationInstantiation before this)
-        // has `script_eval_globals` false and is unaffected.
-        if self.script_eval_globals && self.var_scope.ptr_eq(&self.global_scope) {
-            self.global_declaration_checks(program)?;
-        }
-        self.hoist_with_kind(&program.body, true, true)?;
-        let mut last = NanBox::undefined();
-        for stmt in &program.body {
-            match self.exec(stmt)? {
-                // UpdateEmpty + the `eval` rule that a trailing empty completion
-                // becomes `undefined`: track the last *non-empty* value (`last`
-                // starts at undefined, so an all-empty body yields undefined).
-                Flow::Normal(v) => {
-                    if !v.is_empty_completion() {
-                        last = v;
-                    }
-                }
-                // A `return` is a SyntaxError at parse time at the top level, so
-                // it cannot reach here; `break`/`continue` likewise. Treat any
-                // such residue as completing normally.
-                Flow::Return(v) => return Ok(v),
-                Flow::Break(..) | Flow::Continue(..) => {}
-            }
-        }
-        Ok(last)
     }
 
     /// CanDeclareGlobalVar: a global `var` binding may be created for `name`
@@ -6807,10 +6725,7 @@ impl<'a> Interp<'a> {
         self.eval_depth += 1;
         // While hosting a bytecode-VM run, eval code runs on the VM too.
         let nt = allow_new_target.then_some(saved_new_target);
-        let result = match self.vm_eval_program(program, eval_strict, nt, false) {
-            Some(r) => r,
-            None => self.run_eval_body(program),
-        };
+        let result = self.vm_eval_program(program, eval_strict, nt, false);
         self.eval_depth -= 1;
 
         self.current = saved_scope;
@@ -6942,15 +6857,15 @@ impl<'a> Interp<'a> {
             .map(Handle::from_raw)
             .and_then(|ch| self.get_function_realm(ch))
             .or(self.cur_realm);
-        let vm = self.vm_dynamic_function(program, strict, fn_realm);
-        let f = match vm {
-            Some(r) => r?,
-            None => self.make_function(
-                &func.params,
-                Body::Block(&func.body),
-                func.is_async,
-                func.is_generator,
-            ),
+        let f = self.vm_dynamic_function(program, strict, fn_realm);
+        let f = match f {
+            Ok(f) => f,
+            Err(e) => {
+                self.src = saved_src;
+                self.strict = saved_strict;
+                self.current = saved_scope;
+                return Err(e);
+            }
         };
         self.src = saved_src;
         self.strict = saved_strict;
@@ -10887,6 +10802,7 @@ impl crate::nbvm::VmHost for Interp<'_> {
 pub(crate) fn vm_to_exec(e: crate::nbvm::VmError) -> ExecError {
     match e {
         crate::nbvm::VmError::Thrown(v) => ExecError::Throw(v),
+        crate::nbvm::VmError::Interrupted => ExecError::Interrupted,
         _ => ExecError::Unsupported("bytecode VM fault"),
     }
 }

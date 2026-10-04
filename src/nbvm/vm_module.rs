@@ -25,7 +25,7 @@
 //!   module index (the referrer).
 
 use super::{
-    BindingTarget, CompileError, Compiler, FnProto, MODULE_DEFAULT_SLOT, Op, Program, Stmt, VmError,
+    BindingTarget, CompileError, Compiler, FnProto, MODULE_DEFAULT_SLOT, Op, Program, Stmt,
 };
 use crate::ast::{ExportDecl, Function, Ident, VarDecl, VarDeclKind, VarDeclarator};
 use crate::nanbox::NanBox;
@@ -312,150 +312,92 @@ fn parse_script(source: &str) -> Result<Program, crate::nbexec::Thrown> {
     })
 }
 
-/// How a VM attempt at an entry ended when it did not produce the answer.
-enum Attempt {
-    /// A JS-level result to report as-is.
-    Done(Result<(String, String), crate::nbexec::Thrown>),
-    /// The VM could not run it: re-run on the tree-walker (or, under
-    /// `KATAAN_VM_STRICT`, report this reason).
-    Fallback(String),
-}
-
 /// Runs `program` as a hosted script inside `interp` over the module-growable
 /// function table.
 fn run_hosted_script<'p>(
     interp: &mut crate::nbexec::Interp<'p>,
     program: &'p Program,
-) -> Result<NanBox, Attempt> {
+) -> Result<NanBox, crate::nbexec::Thrown> {
     let mut table: Vec<FnProto> = interp
         .module_vm_table()
         .map(|t| t.to_vec())
         .unwrap_or_default();
-    let main = match super::compile_program_into(program, true, &mut table) {
-        Ok(main) => main,
-        Err(e) => return Err(Attempt::Fallback(alloc::format!("compile: {e:?}"))),
-    };
+    let main = super::compile_program_into(program, true, &mut table)
+        .map_err(|e| super::compile_refused(&e))?;
     let table: Rc<[FnProto]> = table.into();
     interp.install_module_vm_table(Rc::clone(&table));
     if let Err(e) = interp.prepare_script_for_vm(program) {
-        return Err(Attempt::Done(Err(crate::nbexec::thrown_from_exec_error(
+        return Err(crate::nbexec::thrown_from_exec_error(
             interp,
             e,
             crate::nbexec::ErrorPhase::Runtime,
-        ))));
-    }
-    match super::run_program_hosted(interp, &table, main as usize, &[]) {
-        Ok(v) => Ok(v),
-        Err(VmError::Thrown(v)) if super::vm_strict() => {
-            Err(Attempt::Done(Err(crate::nbexec::thrown_from_exec_error(
-                interp,
-                crate::nbexec::ExecError::Throw(v),
-                crate::nbexec::ErrorPhase::Runtime,
-            ))))
-        }
-        Err(e) => Err(Attempt::Fallback(alloc::format!("runtime: {e:?}"))),
-    }
-}
-
-/// The VM attempt at a module entry (see [`execute_module_entry`]).
-fn attempt_module(
-    entry_key: &str,
-    host: &dyn crate::nbexec::module::ModuleHost,
-    prelude: Option<&Program>,
-    limits: crate::limits::Limits,
-) -> Attempt {
-    use crate::nbexec::ErrorPhase;
-    let mut interp = crate::nbexec::Interp::new_with_limits(limits);
-    if let Some(program) = prelude
-        && let Err(a) = run_hosted_script(&mut interp, program)
-    {
-        return a;
-    }
-    interp.enable_vm_modules();
-    let linked = interp
-        .load_module_pub(entry_key, host)
-        .and_then(|()| interp.link_module_pub(entry_key));
-    let result = match linked {
-        Err(e) if is_fault(&e) => return Attempt::Fallback(alloc::format!("link: {e:?}")),
-        Err(e) => Err(interp.exec_error_to_thrown(e, ErrorPhase::Parse)),
-        Ok(()) => match interp.evaluate_entry(entry_key) {
-            Ok(ns) => Ok((String::from(interp.output()), interp.display(ns))),
-            Err(e) if is_fault(&e) => return Attempt::Fallback(alloc::format!("runtime: {e:?}")),
-            Err(e) => Err(interp.exec_error_to_thrown(e, ErrorPhase::Runtime)),
-        },
-    };
-    finish(&interp, result)
-}
-
-/// The end of a successful VM attempt: a module the VM refused to compile ran
-/// on the tree-walker, which `KATAAN_VM_STRICT` reports; under
-/// `KATAAN_VM_PURE` so does any tree-walked statement. Outside strict mode a
-/// throw re-runs the entry on the tree-walker, as the script entries do.
-fn finish(
-    interp: &crate::nbexec::Interp,
-    result: Result<(String, String), crate::nbexec::Thrown>,
-) -> Attempt {
-    if interp.vm_module_faulted() {
-        return Attempt::Fallback(String::from(
-            interp.vm_module_note().unwrap_or("async module fault"),
         ));
     }
-    if super::vm_strict()
-        && let Some(note) = interp.vm_module_note()
-    {
-        return Attempt::Done(Err(super::vm_fallback(note)));
-    }
-    if let Err(t) = super::tree_walk_check(interp) {
-        return Attempt::Done(Err(t));
-    }
-    match result {
-        Err(t) if !super::vm_strict() => Attempt::Fallback(alloc::format!("throw: {}", t.name)),
-        r => Attempt::Done(r),
-    }
+    super::run_program_hosted(interp, &table, main as usize, &[])
+        .map_err(|e| super::vm_thrown(interp, e))
 }
 
-/// Settles an [`Attempt`]: its result, or the tree-walker's (`fallback`) — a
-/// `VmFallback` error under `KATAAN_VM_STRICT`.
-fn settle(
-    attempt: Attempt,
-    fallback: impl FnOnce() -> Result<(String, String), crate::nbexec::Thrown>,
-) -> Result<(String, String), crate::nbexec::Thrown> {
-    match attempt {
-        Attempt::Done(r) => r,
-        Attempt::Fallback(reason) if super::vm_strict() => {
-            Err(super::vm_fallback(&alloc::format!("module: {reason}")))
-        }
-        Attempt::Fallback(_) => fallback(),
+/// The error an entry reports for a VM fault `e` surfaced through the
+/// interpreter (not a JS throw).
+fn fault(e: &crate::nbexec::ExecError) -> crate::nbexec::Thrown {
+    match e {
+        crate::nbexec::ExecError::Interrupted => super::vm_thrown_interrupted(),
+        other => super::internal_error(&alloc::format!("{other:?}")),
     }
 }
 
 /// [`super::execute_module_typed`] / [`super::execute_module_typed_with_prelude`]:
 /// the prelude and every module of the graph run on the VM inside one
 /// interpreter (which keeps the module records, environments and namespaces).
-/// A failed attempt re-runs the whole entry on the tree-walker from a fresh
-/// realm — only console output, which is discarded, was observable.
 pub(super) fn execute_module_entry(
     entry_key: &str,
     host: &dyn crate::nbexec::module::ModuleHost,
     prelude: Option<&str>,
     limits: crate::limits::Limits,
 ) -> Result<(String, String), crate::nbexec::Thrown> {
-    let fallback = || match prelude {
-        Some(p) => {
-            crate::nbexec::module::eval_module_typed_with_prelude(entry_key, host, p, limits)
-        }
-        None => crate::nbexec::module::eval_module_typed(entry_key, host, limits),
-    };
+    use crate::nbexec::ErrorPhase;
     let program = match prelude.filter(|p| !p.is_empty()).map(parse_script) {
-        Some(Ok(p)) if p.source_type == crate::ast::SourceType::Module => return fallback(),
+        Some(Ok(p)) if p.source_type == crate::ast::SourceType::Module => {
+            return Err(super::import_export_in_script());
+        }
         Some(Ok(p)) => Some(p),
         Some(Err(t)) => return Err(t),
         None => None,
     };
-    settle(
-        attempt_module(entry_key, host, program.as_ref(), limits),
-        fallback,
-    )
+    let mut interp = crate::nbexec::Interp::new_with_limits(limits);
+    if let Some(program) = &program {
+        run_hosted_script(&mut interp, program)?;
+    }
+    interp.enable_vm_modules();
+    let linked = interp
+        .load_module_pub(entry_key, host)
+        .and_then(|()| interp.link_module_pub(entry_key));
+    let result = match linked {
+        Err(e) if is_fault(&e) => Err(fault(&e)),
+        Err(e) => Err(interp.exec_error_to_thrown(e, ErrorPhase::Parse)),
+        Ok(()) => match interp.evaluate_entry(entry_key) {
+            Ok(ns) => Ok((String::from(interp.output()), interp.display(ns))),
+            Err(e) if is_fault(&e) => Err(fault(&e)),
+            Err(e) => Err(interp.exec_error_to_thrown(e, ErrorPhase::Runtime)),
+        },
+    };
+    finish(&interp, result)
+}
+
+/// The end of an entry's run: a module the VM refused to compile, or a VM
+/// fault where it could not propagate (an async module body), fails the run.
+fn finish(
+    interp: &crate::nbexec::Interp,
+    result: Result<(String, String), crate::nbexec::Thrown>,
+) -> Result<(String, String), crate::nbexec::Thrown> {
+    if let Some(note) = interp.vm_module_note() {
+        return Err(super::internal_error(note));
+    }
+    if interp.vm_module_faulted() {
+        return Err(super::internal_error("async module fault"));
+    }
+    super::tree_walk_check(interp)?;
+    result
 }
 
 /// [`super::execute_script_typed_with_import_base`] on the VM: a script whose
@@ -466,23 +408,16 @@ pub(super) fn execute_script_with_import_base(
     base_path: &str,
     limits: crate::limits::Limits,
 ) -> Result<(String, String), crate::nbexec::Thrown> {
-    let fallback =
-        || crate::nbexec::module::eval_script_typed_with_import_base(source, base_path, limits);
     let program = parse_script(source)?;
     if program.source_type == crate::ast::SourceType::Module {
-        return fallback();
+        return Err(super::import_export_in_script());
     }
-    let attempt = (|| {
-        let mut interp = crate::nbexec::Interp::new_with_limits(limits);
-        interp.set_script_import_base(Some(String::from(base_path)));
-        interp.enable_vm_modules();
-        let result = match run_hosted_script(&mut interp, &program) {
-            Ok(v) => Ok((String::from(interp.output()), interp.display(v))),
-            Err(a) => return a,
-        };
-        finish(&interp, result)
-    })();
-    settle(attempt, fallback)
+    let mut interp = crate::nbexec::Interp::new_with_limits(limits);
+    interp.set_script_import_base(Some(String::from(base_path)));
+    interp.enable_vm_modules();
+    let result = run_hosted_script(&mut interp, &program)
+        .map(|v| (String::from(interp.output()), interp.display(v)));
+    finish(&interp, result)
 }
 
 #[cfg(test)]
