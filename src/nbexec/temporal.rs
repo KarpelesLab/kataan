@@ -146,7 +146,7 @@ fn tables_for(kind: TemporalKind) -> (&'static [&'static str], &'static [&'stati
     }
 }
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// Installs the `Temporal` namespace object and every type's constructor,
     /// prototype (methods + getters + `Symbol.toStringTag`), into the global
     /// scope. Statics (`from`/`compare`/…) are recognised dynamically in

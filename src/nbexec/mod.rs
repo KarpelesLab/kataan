@@ -1,33 +1,24 @@
-//! Executing real **statements and functions** over the [`Realm`]/[`NanBox`]
-//! model (`ROADMAP.md` §3 → Phase D migration).
+//! The **interpreter**: the runtime the bytecode VM ([`crate::nbvm`]) runs in
+//! (`ROADMAP.md` §2.0).
+//!
+//! [`Interp`] owns one [`Realm`] (the GC heap and its intrinsics), the global
+//! environment, every built-in object and native function, the promise job
+//! and timer queues, the module loader, created realms / ShadowRealms,
+//! `$262.agent` workers, and the console. User code — scripts, modules, eval
+//! code, `Function` bodies — is compiled to bytecode and runs on the VM
+//! *hosted* by the interpreter through [`crate::nbvm::VmHost`]: the VM keeps
+//! its values in registers and delegates everything else (property access on
+//! exotic objects, built-ins, coercions, environments of `eval`/`with`,
+//! declaration instantiation, job queues) to the interpreter. There is no
+//! second execution engine: the interpreter never evaluates AST statements or
+//! expressions itself (the tree-walker it started as was retired once the VM
+//! ran the whole Test262 corpus).
 //!
 //! [`Realm`]: crate::realm::Realm
-//! [`NanBox`]: crate::nanbox::NanBox
 //!
-//! A small tree-walking interpreter whose values are NaN-boxed and whose
-//! objects/strings/arrays/functions live in the realm's GC heap — the
-//! imperative *and procedural* core of the language on the performance
-//! representation. It has:
-//! - lexical variable scope ([`Scope`](crate::env::Scope) chains), assignment
-//!   (incl. compound and member targets), block scoping, and control flow
-//!   (`if`/`while`/`for`, `return`/`break`/`continue`);
-//! - **functions and closures**: declarations (hoisted), expressions, and arrows
-//!   become heap closures capturing their defining scope, so a returned inner
-//!   function still sees its enclosing variables — and calls bind arguments in a
-//!   fresh child scope;
-//! - **exceptions** (`try`/`catch`/`finally`/`throw`); and
-//! - a **starter stdlib**: native globals (`Math`, `String`/`Number`/`parseInt`)
-//!   and built-in String/Array methods, including the higher-order
-//!   `map`/`filter`/`reduce`/`forEach` that call back into closures.
-//!
-//! The *full* stdlib port and folding back into the bytecode VM are the
-//! remaining migration work. Pure, safe `alloc`-only Rust.
+//! Pure, safe `alloc`-only Rust.
 
-use crate::ast::{
-    Argument, ArrayElement, ArrayPatternElement, Arrow, ArrowBody, AssignOp, BinaryOp,
-    BindingTarget, Class, ClassMember, Expr, ForInit, Function, Ident, LogicalOp, MethodKind,
-    ObjectMember, Param, Program, PropertyKey, Stmt, UnaryOp, VarDecl,
-};
+use crate::ast::{BinaryOp, BindingTarget, Expr, Program, Stmt, UnaryOp};
 use crate::common::Span;
 use crate::env::Scope;
 use crate::heap::Handle;
@@ -39,190 +30,19 @@ use alloc::vec::Vec;
 /// Why execution stopped.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ExecError {
-    /// A construct outside the supported subset (generators, classes, …).
+    /// Something the engine cannot run with correct semantics: a program the
+    /// bytecode compiler refuses, or a fault of the bytecode VM. Not a JS throw
+    /// (`try`/`catch` never sees it).
     Unsupported(&'static str),
-    /// A reference to an undeclared variable.
-    NotDefined(String),
-    /// A call of a non-function value.
-    NotCallable,
     /// A thrown JS value, propagating until a `catch` handles it.
     Throw(NanBox),
-    /// The host's watchdog tripped (see [`crate::interrupt`]). Like
-    /// [`Self::OptShortCircuit`] this is *not* a throw, so `try`/`catch` never
-    /// sees it — otherwise `while (true) { try {} catch (e) {} }` would swallow
-    /// the deadline and the watchdog would be advisory rather than enforced.
-    /// `finally` and `using` disposal are skipped for the same reason: a hard
-    /// deadline cannot promise to run cleanup that may itself loop forever.
+    /// The host's watchdog tripped (see [`crate::interrupt`]). It is *not* a
+    /// throw, so `try`/`catch` never sees it — otherwise `while (true) { try {}
+    /// catch (e) {} }` would swallow the deadline and the watchdog would be
+    /// advisory rather than enforced. `finally` and `using` disposal are skipped
+    /// for the same reason: a hard deadline cannot promise to run cleanup that
+    /// may itself loop forever.
     Interrupted,
-    /// An optional-chain short-circuit: a `?.` link found a nullish base. It
-    /// propagates (past intervening non-optional links) up to the enclosing
-    /// `Expr::OptChain` boundary, which turns it into `undefined`. It is *not* a
-    /// throw, so `try`/`catch` never sees it.
-    OptShortCircuit,
-    /// A **proper tail call** (strict-mode PTC): a `return f(args)` in genuine
-    /// tail position hands the resolved callee/`this`/args back to the enclosing
-    /// `Interp::invoke` instead of calling recursively. `invoke`'s trampoline
-    /// re-dispatches it in place, so unbounded tail recursion runs in O(1) native
-    /// stack. Produced only where `self.tail_pos` holds (a strict, non-async
-    /// function body, outside any `try` Block), so it never escapes the `invoke`
-    /// that must consume it, and a `catch` (which only matches `Throw`) ignores it.
-    TailCall {
-        /// The already-evaluated callee (a function value) to invoke.
-        callee: NanBox,
-        /// The `this` binding for the call (`undefined` for a plain call).
-        this_val: NanBox,
-        /// The already-evaluated arguments.
-        args: alloc::vec::Vec<NanBox>,
-    },
-}
-
-/// The control-flow outcome of a statement.
-#[derive(Clone)]
-pub(crate) enum Flow {
-    /// Fell through normally, carrying the last expression value (for `run`).
-    Normal(NanBox),
-    /// A `return` (value).
-    Return(NanBox),
-    /// A `break`, optionally targeting a label. The carried `NanBox` is the
-    /// completion value propagated by `UpdateEmpty` (the empty-completion
-    /// sentinel for a bare `break`); it becomes the value of the breakable
-    /// statement the `break` resolves to (`x: { 1; break x; }` evaluates to 1).
-    Break(Option<String>, NanBox),
-    /// A `continue`, optionally targeting a label. Carries its `UpdateEmpty`
-    /// completion value like [`Flow::Break`].
-    Continue(Option<String>, NanBox),
-}
-
-/// What a loop should do with a `Flow` produced by its body, given the loop's
-/// own label (if any).
-enum LoopAction {
-    /// Proceed to the next iteration (fall through to the update).
-    Next,
-    /// Stop this loop.
-    Stop,
-    /// Not for this loop — bubble it up to an enclosing loop / labeled block.
-    Propagate(Flow),
-}
-
-/// Folds an empty completion value to `undefined` (spec `UpdateEmpty(_,
-/// undefined)`), used where a construct must never surface the empty-completion
-/// sentinel (an `if`, `try`, `with`, …). Applies to the value carried by an
-/// abrupt `break`/`continue` too: e.g. the `break` in `if (c) { break; }`
-/// resolves with value `undefined`, not the surrounding list's value.
-fn empty_to_undefined(flow: Flow) -> Flow {
-    match flow {
-        Flow::Normal(v) if v.is_empty_completion() => Flow::Normal(NanBox::undefined()),
-        Flow::Break(l, v) if v.is_empty_completion() => Flow::Break(l, NanBox::undefined()),
-        Flow::Continue(l, v) if v.is_empty_completion() => Flow::Continue(l, NanBox::undefined()),
-        other => other,
-    }
-}
-
-/// Classifies a loop body's `flow` *and* threads its completion value into the
-/// loop's running value `v` (spec ForBodyEvaluation / loop evaluation):
-/// - a `Normal` or caught `continue` updates `v` when its value is non-empty;
-/// - a caught `break` sets `v` to `UpdateEmpty(break, v)` and stops;
-/// - anything else propagates unchanged.
-fn loop_step(flow: Flow, label: &Option<String>, v: &mut NanBox) -> LoopAction {
-    let matches = |l: &Option<String>| l.is_none() || l.as_deref() == label.as_deref();
-    match flow {
-        Flow::Normal(bv) => {
-            if !bv.is_empty_completion() {
-                *v = bv;
-            }
-            LoopAction::Next
-        }
-        Flow::Continue(l, bv) if matches(&l) => {
-            if !bv.is_empty_completion() {
-                *v = bv;
-            }
-            LoopAction::Next
-        }
-        Flow::Break(l, bv) if matches(&l) => {
-            *v = update_empty(bv, *v);
-            LoopAction::Stop
-        }
-        other => LoopAction::Propagate(other),
-    }
-}
-
-/// The spec `UpdateEmpty(completionValue, fallback)`: an empty completion value
-/// takes the surrounding StatementList's accumulated value, otherwise keeps its
-/// own.
-fn update_empty(value: NanBox, fallback: NanBox) -> NanBox {
-    if value.is_empty_completion() {
-        fallback
-    } else {
-        value
-    }
-}
-
-/// The body of a registered function: a block, or a concise arrow expression.
-#[derive(Clone, Copy)]
-pub(crate) enum Body<'a> {
-    Block(&'a [Stmt]),
-    Expr(&'a Expr),
-}
-
-/// A registered function definition (its AST, held by the interpreter; the heap
-/// closure stores only an index into the table plus the captured scope).
-#[derive(Clone, Copy)]
-pub(crate) struct FnDef<'a> {
-    params: &'a [Param],
-    body: Body<'a>,
-    is_async: bool,
-    /// Whether this is a generator (`function*`) — run eagerly into an iterator.
-    is_generator: bool,
-    /// Whether this is an arrow function (no own `arguments` binding).
-    is_arrow: bool,
-    /// Whether the function is strict (its own `"use strict"`, or defined inside
-    /// strict code) — strict functions keep an `undefined`/`null` `this`.
-    is_strict: bool,
-    /// The function's name (`fn.name`); empty for anonymous functions.
-    name: &'a str,
-    /// The class this is a method of (for `super.method()`), if any.
-    home_class: Option<u32>,
-    /// Whether the home is entered as a *static* method, so `super.x` resolves
-    /// against the superclass's static members rather than its prototype's.
-    home_static: bool,
-    /// The lexically-enclosing class at *definition* time — used ONLY to resolve
-    /// private names (`#x`), which are lexically scoped and visible inside nested
-    /// ordinary functions (where `home_class`/`super` are intentionally `None`).
-    /// For a method this is its `home_class`; for an ordinary function it is the
-    /// class textually enclosing it (or `None` outside any class).
-    lexical_class: Option<u32>,
-    /// Whether this is a concise method / accessor (object-literal `{m(){}}` /
-    /// `get`/`set`) — such functions have no `[[Construct]]` (`new m()` throws).
-    /// Set post-creation like `is_arrow`. Class methods are detected via
-    /// `home_class` instead.
-    is_method: bool,
-    /// Whether this function was defined lexically inside a class field
-    /// initializer / static block. Only consulted for arrows (which are
-    /// transparent to the ContainsArguments early error on a nested direct
-    /// `eval`); a non-arrow resets the runtime flag to `false` on entry.
-    field_init: bool,
-    /// Whether `new.target` was in lexical scope where this function was
-    /// *defined*. Only consulted for arrows: an arrow is transparent to
-    /// `new.target`, so a direct `eval('new.target')` inside one is a SyntaxError
-    /// exactly when the arrow was written outside function code — regardless of
-    /// where the arrow is later called from.
-    nt_in_scope: bool,
-    /// Whether `super(...)` was in lexical scope where this function was
-    /// *defined* (i.e. inside a derived class constructor). Only consulted for
-    /// arrows, which are transparent to `super()`.
-    sc_in_scope: bool,
-    /// The source text this function's AST spans index into — the program,
-    /// `eval` body, or dynamic-`Function` body it was *defined* in.
-    ///
-    /// `Interp::src` tracks the code being defined, and it is set at each
-    /// run/eval entry. That is not enough on its own: a function defined inside
-    /// an `eval` but *called* after the eval returned would evaluate its nested
-    /// definitions while `src` pointed at the enclosing program, and slice a
-    /// nonsense substring of unrelated text into their
-    /// `Function.prototype.toString`. Capturing the defining source here and
-    /// restoring it for the duration of the call keeps every nested definition
-    /// slicing the text it was actually written in.
-    def_src: &'a str,
 }
 
 /// One SplitMix64 step: scrambles an input word into a well-distributed output.
@@ -333,8 +153,10 @@ fn math_random_seed() -> [u64; 2] {
     [s0, s1]
 }
 
-/// A tree-walking interpreter over the performance object model.
-pub struct Interp<'a> {
+/// The interpreter: the realm, built-ins and host services the bytecode VM
+/// runs in. [`Interp::run`] compiles and runs a Script; values are
+/// [`NanBox`]es over the realm's GC heap.
+pub struct Interp {
     realm: Realm,
     /// The current lexical scope (innermost).
     current: Scope,
@@ -371,110 +193,14 @@ pub struct Interp<'a> {
     /// unique within one program, and the list is saved/restored per invocation
     /// and per `eval`, so it only ever holds one program's declarations.
     annexb_block_fns: Vec<(String, Span)>,
-    /// Function-AST table; a closure cell holds an index into this.
-    functions: Vec<FnDef<'a>>,
-    /// Class-AST table; a class cell holds an index into this.
-    classes: Vec<&'a Class>,
-    /// The source text of the code region currently being *defined* — the program
-    /// (or `eval`/`Function` body) whose AST is executing. Set by the run/eval
-    /// entry points; `class.span` / `function.span` byte offsets index into it, so
-    /// `set_fn_source` / `make_class` can slice a function/class's literal source
-    /// for `Function.prototype.toString`. Empty until the first program runs (and
-    /// for internal callers that don't set it — those functions then use the
-    /// NativeFunction fallback).
-    src: &'a str,
-    /// Per-class evaluated *computed* member keys, by `class.body` index. Filled
-    /// eagerly at class definition (ClassDefinitionEvaluation evaluates every
-    /// computed `PropertyName` in source order, so a throwing key is a
-    /// definition-time error and side effects run exactly once); the lazy
-    /// prototype / private-member / static builders read the stored key instead
-    /// of re-evaluating the expression.
-    class_member_keys: Vec<alloc::collections::BTreeMap<usize, String>>,
     /// Lazily-created built-in iterator prototypes keyed by `@@toStringTag`
     /// (`"Array Iterator"`, `"String Iterator"`, `"Map Iterator"`, …). Each is an
     /// object chained to `%IteratorPrototype%` with an inherited `next` and the
     /// tag, so `Object.getPrototypeOf(arr.values())` is a real
     /// `%ArrayIteratorPrototype%` (reflection tests).
     builtin_iter_protos: alloc::collections::BTreeMap<&'static str, Handle>,
-    /// Per-class static members (`Class.foo`), parallel to `classes`.
-    class_statics: Vec<alloc::collections::BTreeMap<String, NanBox>>,
-    /// Per-class static *field* names in declaration order — the enumerable own
-    /// keys of the constructor (static methods are non-enumerable), for
-    /// `Object.keys`/`values`/`entries` of a class.
-    class_static_fields: Vec<Vec<String>>,
-    /// Per-class static getter functions (`static get x() {}`), called on read.
-    class_static_get: Vec<alloc::collections::BTreeMap<String, NanBox>>,
-    /// Per-class static setter functions (`static set x(v) {}`), called on write.
-    class_static_set: Vec<alloc::collections::BTreeMap<String, NanBox>>,
-    /// Per-class captured definition scope, parallel to `classes`.
-    class_envs: Vec<Scope>,
-    /// Per-class native-constructor superclass id (`class X extends Error`),
-    /// parallel to `classes`; `None` when the parent is a class or absent.
-    class_native_super: Vec<Option<u16>>,
-    /// Per-class ordinary-function superclass handle (`class X extends fn {}`
-    /// where `fn` is a plain user function, not a class or native), parallel to
-    /// `classes`; `None` otherwise.
-    class_fn_super: Vec<Option<NanBox>>,
-    /// Per-class **class** superclass id (`class D extends C {}` where `C` is a
-    /// class), parallel to `classes`; `None` when the parent is native, an
-    /// ordinary function, `null`, or absent. Cached at class-definition time (the
-    /// heritage is evaluated exactly once per spec) so the eager `.prototype`
-    /// materialization does not re-evaluate the `extends` expression.
-    class_super_id: Vec<Option<u32>>,
-    /// Per-class resolved `protoParent` — `Get(superclass, "prototype")` captured
-    /// once at class-definition time (ECMA-262 ClassDefinitionEvaluation reads it
-    /// exactly once, so re-reading in the lazy `.prototype` build would double-fire
-    /// a `prototype` getter). `Some(obj)` for an object protoParent, `Some(null)`
-    /// for `extends null`, `None` for a class with no heritage (defaults to
-    /// `Object.prototype`).
-    class_proto_parent: Vec<Option<NanBox>>,
-    /// Per-class constructor handle (the class value), parallel to `classes`, so
-    /// the lazily-materialized `.prototype` can install a `constructor` back-link
-    /// and link a derived prototype to its base's prototype.
-    class_handles: Vec<NanBox>,
-    /// Cache of a class's private *method/accessor* function values, keyed by
-    /// `(class_id, storage_key)`. A private method is defined once per class
-    /// evaluation and shared by every instance (so `c1.#m === c2.#m`), so it is
-    /// created lazily on first instantiation and reused thereafter.
-    private_method_cache: alloc::collections::BTreeMap<(u32, String), NanBox>,
-    /// Per-class lexically-enclosing class id, parallel to `classes`. Captured
-    /// from `current_home` when the class is set up (the home class of the code
-    /// that evaluates the class definition is its lexical parent). Drives
-    /// private-name resolution: a private reference `#x` resolves to the nearest
-    /// enclosing class that *declares* `#x`, so two classes with `#x` never
-    /// collide and a nested class can shadow an outer one's `#x`.
-    class_lexical_parent: Vec<Option<u32>>,
-    /// Per-class set of bare private names (`x` for `#x`) declared in the class
-    /// body — instance and static fields/methods/accessors — parallel to
-    /// `classes`. Used with `class_lexical_parent` to resolve a private
-    /// reference to its declaring class.
-    class_private_names: Vec<alloc::collections::BTreeSet<alloc::boxed::Box<str>>>,
     /// Intrinsic `Temporal.<Type>.prototype` handles, indexed by `TemporalKind`.
     temporal_protos: Vec<Option<Handle>>,
-    /// One-shot binding name for NamedEvaluation of an anonymous class
-    /// expression (`var C = class {}`, `x = class {}`): the name the class will
-    /// receive. `make_class` consumes it so the class's `name` is set *before*
-    /// static initializers run (which may read `this.name` / the class name).
-    pending_class_name: Option<&'a str>,
-    /// Current function-call nesting depth (recursion guard).
-    call_depth: usize,
-    /// Statements the tree-walker has executed — the measure behind
-    /// `KATAAN_VM_PURE` (a hosted VM run must leave it at 0).
-    tree_walked: u64,
-    /// Whether a `return` evaluated *right now* is a proper-tail-call candidate:
-    /// set true only while running a strict, non-async function body (in
-    /// [`Interp::invoke_inner`]); cleared inside a `try` Block (and a `catch`
-    /// that a `finally` follows) by [`Interp::exec_try`]. When true (and the
-    /// callee is a plain JS function), `return f(...)` yields
-    /// [`ExecError::TailCall`] for `invoke`'s trampoline instead of recursing.
-    tail_pos: bool,
-    /// Whether the `Flow::Return` most recently produced by the one-shot walker
-    /// came from `return <Expression>;` rather than a bare `return;`. Only the
-    /// former is `Await`ed in an async generator (14.10.1 step 3), and the two are
-    /// indistinguishable from the [`Flow::Return`] value alone (both can carry
-    /// `undefined`). Written where the completion is produced, read immediately by
-    /// the coroutine walker's yield-free fast path.
-    return_had_expr: bool,
     /// Whether `new.target` is lexically in scope at the current execution point —
     /// true inside a non-arrow function/method/constructor body, a class field
     /// initializer, or a static block; false at top-level script/module code. An
@@ -487,15 +213,9 @@ pub struct Interp<'a> {
     /// current point — true inside a derived class constructor, transparently
     /// inherited by arrows defined there, reset by any other non-arrow function.
     super_call_in_scope: bool,
-    /// C2: current *tree-walk* recursion depth — `eval`/`exec` descend on the
-    /// native stack for nested expressions/statements, and the precedence loop in
-    /// the parser flattens `a + a + a + …` into a shallow AST that nonetheless
-    /// drives thousands of nested `eval` calls. The function-call `call_depth`
-    /// guard does not count these, so a deep expression would overflow the host
-    /// stack and abort. This counter is checked against `limits.max_eval_depth`
-    /// (a dedicated knob, separate from `max_call_depth`, because each tree-walk
-    /// level burns far more native stack than a bytecode call frame) at the
-    /// `eval`/`exec` hubs and throws a catchable `RangeError` past the cap.
+    /// How many `eval` / `$262.evalScript` bodies are running nested: each one
+    /// parses, compiles and enters a VM run on the native stack. Checked
+    /// against `limits.max_eval_depth` (a catchable `RangeError` past the cap).
     eval_depth: usize,
     /// `xorshift128+` PRNG state backing `Math.random` (pure Rust, no foreign
     /// code). Two 64-bit words give a 2^128-1 period; seeded by
@@ -506,9 +226,6 @@ pub struct Interp<'a> {
     /// `new.target` for the current invocation (the constructor when reached via
     /// `new`, else `undefined`; arrows inherit the enclosing value).
     new_target: NanBox,
-    /// One-shot: a pending `new.target` set by `construct`, consumed by the next
-    /// non-arrow invocation (so `new.target` is the constructor inside it).
-    pending_new_target: Option<NanBox>,
     /// One-shot `newTarget` override for the next `construct` (set by
     /// `Reflect.construct(target, args, newTarget)`); else `new.target` is the callee.
     reflect_new_target: Option<NanBox>,
@@ -554,25 +271,6 @@ pub struct Interp<'a> {
     wasm_mem_objs: alloc::collections::BTreeMap<u32, crate::heap::Handle>,
     /// Next WASM-instance id to hand out.
     wasm_next_id: u32,
-    /// When running a generator body eagerly, the buffer `yield` appends to.
-    /// (Retained for built-in eager iterables — Map/Set entries, regexp matches —
-    /// and as the degraded fallback for complex yield-bearing operands the lazy
-    /// machine does not reify.)
-    gen_sink: Option<Vec<NanBox>>,
-    /// Suspended lazy-generator activations, indexed by the `GEN_FRAME` id stored
-    /// on the generator object. A vacated slot (a finished generator) is `None`
-    /// and may be reused by the next generator call.
-    gen_frames: Vec<Option<generator::GenFrame<'a>>>,
-    /// One-shot: an async coroutine `(frame id, controller handle)` whose first
-    /// synchronous burst must run once the caller's ambient state is restored
-    /// (set while building the frame in `invoke_inner`, consumed immediately
-    /// after). See the async path in `call.rs`.
-    pending_async_start: Option<(usize, Handle)>,
-    /// Whether the coroutine currently being driven (in `gen_drive`) is an *async*
-    /// generator. Read by `yield*` delegation to use the async-iterator protocol
-    /// (`[Symbol.asyncIterator]`, awaiting each `next()` result). Saved/restored
-    /// around `gen_drive` so a reentrant resume (via the event loop) is balanced.
-    gen_is_async: bool,
     /// The `Symbol.for` global registry: shared symbols keyed by string.
     symbol_registry: alloc::collections::BTreeMap<String, NanBox>,
     /// Cached well-known symbols (e.g. `Symbol.iterator`), created on first use.
@@ -615,30 +313,10 @@ pub struct Interp<'a> {
     /// uses.
     #[cfg(feature = "intl")]
     intl_intern: alloc::collections::BTreeMap<String, &'static str>,
-    /// Leak-once cache interning method names (derived from runtime property keys
-    /// or accessor prefixes) to `&'a str` for storage as `FnDef::name`.
-    method_name_intern: alloc::collections::BTreeMap<String, &'static str>,
-    /// The superclass to invoke for `super(...)` inside the running constructor.
-    pending_super: Option<(u32, Scope)>,
-    /// The native-constructor superclass for `super(...)` (e.g. extending Error).
-    pending_super_native: Option<u16>,
-    /// The ordinary-function superclass for `super(...)` (`extends fn`).
-    pending_super_fn: Option<NanBox>,
-    /// The class of the currently-running method (for `super.method()`).
-    current_home: Option<u32>,
-    /// The lexically-enclosing class of the currently-running function, for
-    /// **private-name** resolution. Unlike `current_home` (which an ordinary
-    /// function resets to `None`, so `super` is unavailable), this preserves the
-    /// class a nested ordinary `function` was textually defined in, so `#x` inside
-    /// it still resolves. Set from each function's `FnDef::lexical_class`.
-    current_lexical_home: Option<u32>,
     /// The `[[HomeObject]]` of the currently-running object-literal method — the
     /// object the method was defined on — so its `super.x` resolves through that
     /// object's prototype (when there is no enclosing class home).
     current_home_object: Option<Handle>,
-    /// Whether the currently-running method was entered as a static method, so
-    /// `super.x` resolves against the superclass's static members.
-    current_home_static: bool,
     /// Whether execution is directly inside a class field initializer or static
     /// initialization block (with no intervening non-arrow function boundary). A
     /// *direct* `eval` here inherits the ContainsArguments early error: an
@@ -646,20 +324,6 @@ pub struct Interp<'a> {
     /// across ordinary function/method calls (an arrow keeps it, matching the
     /// lexical `arguments` inheritance).
     in_field_initializer: bool,
-    /// While a *derived* class constructor body runs before `super(...)`, holds
-    /// `(instanceValue, classId)`: `this` is in its temporal dead zone
-    /// (`this_val` is `tdz()`), and the stashed instance + class let `super(...)`
-    /// initialize `this` and run this class's field initializers on return.
-    /// `None` once `super` has run (or outside a derived constructor). A
-    /// derived constructor that completes with this still set never called
-    /// `super` — accessing `this` / the implicit return is a ReferenceError.
-    pending_this_init: Option<(NanBox, u32)>,
-    /// The this-binding cell of the *derived* class constructor currently running
-    /// (a small realm object whose `THIS_CELL_SLOT` holds the live `this` value,
-    /// `tdz()` until `super(...)` binds it). Arrows created before `super(...)`
-    /// capture this handle so their lexical `this` tracks the binding rather than
-    /// snapshotting a dead-zone value. `None` outside a derived constructor.
-    this_cell: Option<Handle>,
     /// While a *parameter default value* is being evaluated, the BoundNames of
     /// the enclosing function's formal parameters (plus `arguments` for a
     /// non-arrow). A sloppy direct `eval("var X")` running here is an
@@ -669,18 +333,6 @@ pub struct Interp<'a> {
     /// parameter-default evaluation; cleared across function boundaries so a
     /// nested call / the body never sees the outer parameter set.
     eval_param_names: Option<Vec<String>>,
-    /// The stack of currently-executing user closures (innermost last), one entry
-    /// per live `invoke_inner`. Only used to serve the legacy `fn.caller`
-    /// extension (Annex B "normative optional"): the caller of a live invocation
-    /// of `fn` is the entry directly below its innermost occurrence.
-    fn_stack: Vec<NanBox>,
-    /// The `arguments` object of each live invocation in [`Self::fn_stack`], index
-    /// for index (`null` for an arrow, which creates none). Serves the legacy
-    /// `fn.arguments` extension, whose value is the arguments object of the
-    /// function's nearest live activation.
-    fn_args_stack: Vec<NanBox>,
-    /// A label attached to the next loop (for `break`/`continue label`).
-    pending_label: Option<String>,
     /// The promise-reaction microtask queue, drained after the script.
     microtasks: Vec<Job>,
     /// Pending `setTimeout` callbacks (macrotasks), run after the microtask queue
@@ -741,16 +393,6 @@ pub struct Interp<'a> {
     /// [`Interp::array_species_create`] to identify the current Realm Record for the
     /// `SameValue(C, realmC.[[%Array%]])` cross-realm nullification step.
     cur_realm: Option<usize>,
-    /// The realm that was running when the innermost in-flight `[[Construct]]` was
-    /// issued — i.e. the realm of *callerContext*.
-    ///
-    /// `[[Construct]]` removes the callee context (step 11) *before* checking the
-    /// constructor's completion, so the two errors those later steps raise — a
-    /// derived constructor returning a non-object (step 13.c) and one that never
-    /// ran `super()` (step 15's `GetThisBinding`) — belong to the caller's realm,
-    /// not the constructor's. Every other error inside a construction is raised
-    /// while the callee context is live and uses [`Self::cur_realm`].
-    construct_caller_realm: Option<usize>,
     /// The *main* realm's global object and global (root) lexical scope, captured
     /// once after the main `install_globals`. `global_this`/`global_scope` are
     /// swapped to a `$262.createRealm()` realm's while a cross-realm function
@@ -848,35 +490,6 @@ pub struct Interp<'a> {
     /// *breaks* the mapping for that index (drops the slot). Empty for strict
     /// functions and any non-simple parameter list (which are unmapped).
     arg_maps: alloc::collections::BTreeMap<u64, ArgMap>,
-    /// Whether a collection may run at the next statement boundary — the
-    /// tree-walker's GC fence (see the [`gc`] module). `false` by default and for
-    /// the dynamic extent of every function / `eval` / module / generator / class
-    /// body; `true` only while the top-level script statement chain runs, which is
-    /// the one place the live set is fully enumerable.
-    gc_ok: bool,
-    /// Live [`NanBox`]es published by the statement executors for the duration of
-    /// their sub-statement recursion — a loop's completion value, a `for-of`
-    /// iterator and current item, a `for-in` key list, a `try`'s pending
-    /// completion. These sit in Rust locals the collector cannot otherwise see;
-    /// see [`Interp::gc_root`].
-    gc_shadow: Vec<NanBox>,
-    /// The `Expr::Call` node a statement executor is about to evaluate at an
-    /// **audited position** — one where the executor's own Rust frame holds no
-    /// live heap value besides what it has published (`f();`, `var x = f();`,
-    /// `x = f();`, `return f();`). The `Call` arm of `eval` takes it (only a
-    /// matching node counts) and, once the arguments are evaluated, hands the
-    /// callee an audit token via `gc_audit_call`. See the `gc` module.
-    gc_audit_expr: Option<*const crate::ast::Expr>,
-    /// The `(pointer, length)` of the argument slice of the audited call in
-    /// flight. `call_with_this_inner` takes it on entry and honours it only when
-    /// its own `args` slice is that very buffer — so a native that receives it
-    /// and calls back into JS with its own argument vector can never pass the
-    /// audit on to the callback. Cleared at every statement boundary.
-    gc_audit_call: Option<(usize, usize)>,
-    /// Scopes published by audited calls for their dynamic extent: the caller's
-    /// lexical and variable scopes, which `invoke_inner` keeps in Rust locals
-    /// while the callee runs. Traced by `gc_roots`.
-    gc_scope_shadow: Vec<Scope>,
     /// While this interpreter hosts a bytecode-VM run (`ROADMAP.md` §2.0), the
     /// run's function table, so a VM function value the interpreter is asked to
     /// call (a callback handed to a built-in) runs on the VM.
@@ -894,10 +507,6 @@ pub struct Interp<'a> {
     /// Set while EvalDeclarationInstantiation runs for VM-compiled eval code:
     /// its function declarations are instantiated by the VM code itself.
     hoist_skip_fns: bool,
-    /// Set while GlobalDeclarationInstantiation runs for a VM script: its
-    /// top-level function bindings are created holding `undefined`, and the
-    /// script body stores each function's VM closure before any user code.
-    hoist_fn_placeholders: bool,
     /// The home object of the VM method whose direct eval is running (its
     /// eval code's `super`).
     vm_eval_home: Option<NanBox>,
@@ -1023,7 +632,7 @@ pub struct HostFn {
 /// (captured state must outlive the interpreter's runs) and `FnMut` (it may hold
 /// mutable host state between calls).
 pub type HostCallback =
-    alloc::boxed::Box<dyn FnMut(&mut Ctx<'_, '_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox>>;
+    alloc::boxed::Box<dyn FnMut(&mut Ctx<'_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox>>;
 
 /// The context handle a registered host function ([`Interp::register_fn`]) uses
 /// to talk back to the engine: construct values, read/write properties, throw
@@ -1032,11 +641,11 @@ pub type HostCallback =
 /// call; values it hands out are ordinary [`NanBox`] handles that stay valid
 /// while the call runs (the host must not stash a bare handle across calls — a
 /// rooted handle scope for that is future §4.0 work).
-pub struct Ctx<'c, 'a> {
-    interp: &'c mut Interp<'a>,
+pub struct Ctx<'c> {
+    interp: &'c mut Interp,
 }
 
-impl<'c, 'a> Ctx<'c, 'a> {
+impl<'c> Ctx<'c> {
     /// The JS `undefined` value.
     #[must_use]
     pub fn undefined(&self) -> NanBox {
@@ -1427,7 +1036,7 @@ struct Timer {
     args: Vec<NanBox>,
 }
 
-impl Default for Interp<'_> {
+impl Default for Interp {
     fn default() -> Self {
         Self::new()
     }
@@ -1668,26 +1277,6 @@ const N_ASYNC_RESUME_FULFILL: u16 = 560;
 /// a microtask reaction when an awaited promise rejects — resumes the parked async
 /// body by throwing the rejection reason at the `await` point.
 const N_ASYNC_RESUME_REJECT: u16 = 561;
-/// Async-generator resume on an awaited value fulfilling: bound to the async
-/// generator object, called as a microtask reaction to resume the parked body at
-/// the `await` point with the settled value.
-const N_ASYNC_GEN_AWAIT_FULFILL: u16 = 562;
-/// Async-generator resume on an awaited value rejecting: resumes the parked body
-/// by throwing the rejection reason at the `await` point.
-const N_ASYNC_GEN_AWAIT_REJECT: u16 = 563;
-/// `AsyncGeneratorAwaitReturn` fulfilment: the awaited `return(v)` value settled;
-/// resolve the front request with `{value, done:true}` and drain the queue.
-const N_ASYNC_GEN_RETURN_FULFILL: u16 = 564;
-/// `AsyncGeneratorAwaitReturn` rejection: the awaited `return(v)` value rejected;
-/// reject the front request with the reason and drain the queue.
-const N_ASYNC_GEN_RETURN_REJECT: u16 = 565;
-/// `AsyncGeneratorUnwrapYieldResumption` fulfilment: a `return(v)` delivered to a
-/// generator suspended at a `yield` awaits `v` first; resume the body with a
-/// `return` completion carrying the settled value.
-const N_ASYNC_GEN_YIELD_RETURN_FULFILL: u16 = 566;
-/// `AsyncGeneratorUnwrapYieldResumption` rejection: the awaited `return(v)` value
-/// rejected; throw the reason at the `yield` point instead.
-const N_ASYNC_GEN_YIELD_RETURN_REJECT: u16 = 567;
 /// `AsyncFromSyncIteratorContinuation`'s value-unwrap closure (27.1.4.4 step 8):
 /// bound to a `[done, syncIterator]` state array, it turns the settled
 /// `valueWrapper` into `CreateIterResultObject(value, done)`.
@@ -2663,43 +2252,6 @@ const CTOR_KEY: &str = "\u{0}ctor";
 /// Like `CTOR_KEY` it uses a `\u{0}` prefix so it is non-enumerable / invisible to
 /// `Object.keys`, `getOwnPropertyNames`, `for-in`, and `JSON.stringify`.
 const ERROR_DATA: &str = "\u{0}errordata";
-/// Hidden slot on an object-literal concise method recording its `[[HomeObject]]`
-/// (the object it was defined on), for `super` resolution.
-const HOME_OBJECT: &str = "\u{0}home";
-/// Hidden slots on an arrow function capturing its *lexical* environment at
-/// definition: the enclosing `this`, `new.target`, object-literal home object,
-/// and class-home (id + static flag). Restored on every call so the arrow's
-/// `this`/`super`/`new.target` follow definition site, not the call site.
-const ARROW_THIS: &str = "\u{0}athis";
-const ARROW_NEW_TARGET: &str = "\u{0}antgt";
-const ARROW_HOME_OBJ: &str = "\u{0}ahome";
-const ARROW_HOME_CLASS: &str = "\u{0}ahcls";
-const ARROW_HOME_STATIC: &str = "\u{0}ahsta";
-/// The lexically-enclosing class at an arrow's *definition* site, used only to
-/// resolve private names (`#x`). `ARROW_HOME_CLASS` covers the paths that set a
-/// home class, but a class's computed ClassElementName runs inside the class's
-/// private environment with no home object — so an arrow written there needs the
-/// lexical class captured separately.
-const ARROW_LEXICAL_CLASS: &str = "\u{0}alcls";
-/// Hidden slot on an arrow defined in a derived constructor *before* `super(...)`:
-/// a handle to the enclosing constructor's this-binding cell (see `THIS_CELL_SLOT`).
-/// The arrow's lexical `this` is a *live* reference to that binding, still in its
-/// temporal dead zone at definition, so the value is resolved through the cell on
-/// every call — throwing while `this` is unbound, yielding the instance after
-/// `super()` binds it. Present only when `ARROW_THIS` would have snapshotted a TDZ.
-const ARROW_THIS_CELL: &str = "\u{0}acell";
-/// Hidden slot on a derived constructor's this-binding cell holding the current
-/// `this` value (`tdz()` until `super(...)` runs). Read by arrows that captured the
-/// cell (`ARROW_THIS_CELL`).
-const THIS_CELL_SLOT: &str = "\u{0}tcell";
-/// Hidden slots on a derived constructor's this-binding cell recording the
-/// instance the pending `super(...)` must initialize and the class that owns it.
-/// They let an arrow that captured the cell perform the constructor's
-/// BindThisValue even after the constructor itself has returned
-/// (`superArrow = () => super(); superArrow()`), which is exactly what the spec's
-/// environment-record-held this-binding allows.
-const THIS_CELL_INSTANCE: &str = "\u{0}tcinst";
-const THIS_CELL_CLASS: &str = "\u{0}tccls";
 /// Reserved hidden keys for an eager generator's result object: the buffer of
 /// yielded values and the current `next()` cursor.
 /// Sentinel description for a `Symbol()` created with no argument (so its
@@ -2750,20 +2302,6 @@ const GEN_ARR: &str = "\u{0}garr";
 const RSI_MATCHER: &str = "\u{0}rsim";
 const RSI_STR: &str = "\u{0}rsis";
 const RSI_FLAGS: &str = "\u{0}rsif";
-/// Hidden slot on a *lazy* generator object: the index of its suspended
-/// [`generator::GenFrame`] in `Interp::gen_frames`.
-const GEN_FRAME: &str = "\u{0}gframe";
-/// Hidden slot on an *async* coroutine controller object: the raw handle of the
-/// promise the async function call returned (settled when the body completes).
-const ASYNC_PROMISE: &str = "\u{0}aprom";
-/// Hidden slot on an async coroutine controller driving a **module body** with
-/// top-level `await`: the resolved key of that module. Its presence marks the
-/// coroutine as a module evaluation, so each resume re-establishes the module's
-/// ambient state (import aliases, `import.meta`, the active-module key, and the
-/// module top-level variable environment) before the body runs. Absent on an
-/// ordinary async-function controller.
-#[cfg(all(feature = "module", feature = "std"))]
-const MODULE_KEY: &str = "\u{0}modkey";
 /// Hidden slots of a dynamic-import continuation's bound state object: the
 /// resolved module key, the `type` import attribute (absent when none), the
 /// `import()` promise to settle, and whether the request is `import.defer`.
@@ -3192,7 +2730,6 @@ mod agent;
 mod agent_pool;
 mod base64;
 mod call;
-mod class;
 mod convert;
 mod expr;
 mod gc;
@@ -3211,7 +2748,6 @@ mod object;
 mod promise;
 mod regexp;
 mod resource;
-mod stmt;
 mod temporal;
 mod temporal_astro;
 mod temporal_calendar;
@@ -3251,27 +2787,12 @@ struct CreatedRealm {
     intl_protos: alloc::collections::BTreeMap<u16, Handle>,
 }
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// A fresh interpreter with a single (global) scope and a starter stdlib,
     /// using default [`Limits`](crate::limits::Limits).
     #[must_use]
     pub fn new() -> Self {
         Self::new_with_limits(crate::limits::Limits::default())
-    }
-
-    /// How many statements the tree-walker has executed in this interpreter
-    /// (user code that did not run on the bytecode VM) — including, for the main
-    /// agent of a program that started `$262.agent` workers, every statement
-    /// those workers tree-walked so far.
-    #[must_use]
-    pub fn tree_walked(&self) -> u64 {
-        #[cfg(feature = "std")]
-        if self.agent.id == 0
-            && let Some(pool) = &self.agent.pool
-        {
-            return self.tree_walked + pool.worker_tree_walked();
-        }
-        self.tree_walked
     }
 
     /// A fresh interpreter with the given resource [`Limits`](crate::limits::Limits).
@@ -3285,39 +2806,14 @@ impl<'a> Interp<'a> {
             eval_var_scope: None,
             script_eval_globals: false,
             annexb_block_fns: Vec::new(),
-            functions: Vec::new(),
-            classes: Vec::new(),
-            src: "",
-            pending_this_init: None,
-            this_cell: None,
-            class_member_keys: Vec::new(),
             builtin_iter_protos: alloc::collections::BTreeMap::new(),
-            class_statics: Vec::new(),
-            class_static_fields: Vec::new(),
-            class_static_get: Vec::new(),
-            class_static_set: Vec::new(),
-            class_envs: Vec::new(),
-            class_native_super: Vec::new(),
-            class_fn_super: Vec::new(),
-            class_super_id: Vec::new(),
-            class_proto_parent: Vec::new(),
-            class_handles: Vec::new(),
-            private_method_cache: alloc::collections::BTreeMap::new(),
-            class_lexical_parent: Vec::new(),
-            class_private_names: Vec::new(),
             temporal_protos: Vec::new(),
-            pending_class_name: None,
-            call_depth: 0,
-            tree_walked: 0,
-            tail_pos: false,
-            return_had_expr: false,
             new_target_in_scope: false,
             super_call_in_scope: false,
             eval_depth: 0,
             rng_state: math_random_seed(),
             this_val: NanBox::undefined(),
             new_target: NanBox::undefined(),
-            pending_new_target: None,
             reflect_new_target: None,
             array_proto_generic: false,
             replaced_dispatch: Vec::new(),
@@ -3326,10 +2822,6 @@ impl<'a> Interp<'a> {
             wasm_modules: alloc::collections::BTreeMap::new(),
             wasm_mem_objs: alloc::collections::BTreeMap::new(),
             wasm_next_id: 0,
-            gen_sink: None,
-            gen_frames: Vec::new(),
-            pending_async_start: None,
-            gen_is_async: false,
             symbol_registry: alloc::collections::BTreeMap::new(),
             well_known_symbols: alloc::collections::BTreeMap::new(),
             tagged_template_cache: alloc::collections::BTreeMap::new(),
@@ -3341,19 +2833,9 @@ impl<'a> Interp<'a> {
             module_source_intrinsic: None,
             #[cfg(feature = "intl")]
             intl_intern: alloc::collections::BTreeMap::new(),
-            method_name_intern: alloc::collections::BTreeMap::new(),
-            pending_super: None,
-            pending_super_native: None,
-            pending_super_fn: None,
-            current_home: None,
-            current_lexical_home: None,
             current_home_object: None,
             in_field_initializer: false,
             eval_param_names: None,
-            fn_stack: Vec::new(),
-            fn_args_stack: Vec::new(),
-            current_home_static: false,
-            pending_label: None,
             microtasks: Vec::new(),
             macrotasks: Vec::new(),
             timer_next_id: 1,
@@ -3366,7 +2848,6 @@ impl<'a> Interp<'a> {
             created_realms: Vec::new(),
             fn_realm: alloc::collections::BTreeMap::new(),
             cur_realm: None,
-            construct_caller_realm: None,
             main_global_this: NanBox::undefined(),
             main_global_scope: Scope::root(),
             main_intrinsics: crate::realm::RealmIntrinsics::default(),
@@ -3388,17 +2869,11 @@ impl<'a> Interp<'a> {
             host_fns: Vec::new(),
             agent: AgentState::default(),
             arg_maps: alloc::collections::BTreeMap::new(),
-            gc_ok: false,
-            gc_shadow: Vec::new(),
-            gc_audit_expr: None,
-            gc_audit_call: None,
-            gc_scope_shadow: Vec::new(),
             vm_table: None,
             vm_ext_table: None,
             vm_realm_guards: Vec::new(),
             vm_eval_cache: alloc::collections::BTreeMap::new(),
             hoist_skip_fns: false,
-            hoist_fn_placeholders: false,
             vm_eval_home: None,
             vm_eval_privates: Vec::new(),
             vm_eval_derived: None,
@@ -3454,24 +2929,6 @@ impl<'a> Interp<'a> {
         self.realm.set_readonly_property(f, "name");
     }
 
-    /// Whether the user function with id `func_id` carries a `prototype` own
-    /// property (i.e. is `[[Construct]]`-able as an ordinary function or a
-    /// generator). Per spec, ordinary function declarations/expressions and
-    /// generator functions/methods (sync + async) have a `prototype`; arrow
-    /// functions, `async` non-generator functions, concise methods, and
-    /// getters/setters do **not**.
-    ///
-    /// NOTE: `is_arrow` / `is_method` are stamped onto the `FnDef` *after*
-    /// `make_method` returns, so calling this at creation time over-includes
-    /// arrows/plain-methods (they read `is_arrow == false` there). Those callers
-    /// rely on [`Self::demote_fn_prototype`] to strip the property once the flag
-    /// is set. At read time (the synthesis gate) the flags are settled, so this
-    /// is exact.
-    pub(crate) fn fn_has_prototype(&self, func_id: u32) -> bool {
-        let d = &self.functions[func_id as usize];
-        d.is_generator || (!d.is_arrow && !d.is_async && !d.is_method && d.home_class.is_none())
-    }
-
     /// Installs the own `prototype` data property on the constructable function
     /// `f` with value `proto`. Per spec it is `{ enumerable: false, configurable:
     /// false }`; `writable` is `true` for ordinary/generator functions and
@@ -3485,78 +2942,6 @@ impl<'a> Interp<'a> {
         if !writable {
             self.realm.set_readonly_property(f, "prototype");
         }
-    }
-
-    /// Strips a `prototype` own property that [`Self::make_method`] materialized
-    /// on a function later discovered to be non-constructable (an arrow, a
-    /// concise method, or an accessor) — such functions must expose no
-    /// `prototype` at all. Also clears the descriptor flags so a subsequent user
-    /// assignment (`arrow.prototype = x`) creates an ordinary property.
-    pub(crate) fn demote_fn_prototype(&mut self, h: Handle) {
-        self.realm.delete_data_slot(h, "prototype");
-        self.realm.clear_readonly_property(h, "prototype");
-        self.realm.clear_non_configurable_property(h, "prototype");
-        self.realm.clear_hidden_property(h, "prototype");
-    }
-
-    /// Whether a function's `name` is still the empty-string placeholder (or
-    /// absent) — the signal that a NamedEvaluation / property-key inference may
-    /// still set it. Functions now materialize `name` "" at creation, so a bare
-    /// `has_own("name")` no longer distinguishes "named yet".
-    pub(crate) fn fn_name_unset(&self, h: Handle) -> bool {
-        match self.realm.get_property(h, "name") {
-            None => true,
-            Some(v) => v
-                .as_handle()
-                .map(Handle::from_raw)
-                .and_then(|nh| self.realm.string_value(nh))
-                .is_none_or(|s| s.is_empty()),
-        }
-    }
-
-    /// Installs the own `name`/`length` data properties on a freshly created
-    /// user method/accessor `f` (a class member or object-literal method). Per
-    /// spec these are `{ writable: false, enumerable: false, configurable: true }`
-    /// own properties — exactly what Test262's `verifyProperty` checks. `length`
-    /// is the count of parameters before the first one with a default or rest;
-    /// `name` is the property key (prefixed with `get `/`set ` for accessors).
-    fn install_method_meta(&mut self, f: NanBox, name: &str, params: &'a [Param]) {
-        let Some(raw) = f.as_handle() else { return };
-        let handle = Handle::from_raw(raw);
-        // Record the name on the FnDef too (so `fn.name` reads / inference align),
-        // but only if the function does not already carry one.
-        if let Some((func_id, _)) = self.realm.function_at(handle)
-            && self.functions[func_id as usize].name.is_empty()
-        {
-            self.functions[func_id as usize].name = self.intern_method_name(name);
-        }
-        // Overwrite the `name` "" placeholder installed at creation with the
-        // resolved name: a named function-expression value keeps its own
-        // `FnDef::name`; a plain method takes the property key `name`.
-        let install_name = match self.realm.function_at(handle) {
-            Some((func_id, _)) if !self.functions[func_id as usize].name.is_empty() => {
-                self.functions[func_id as usize].name
-            }
-            _ => name,
-        };
-        let len = params
-            .iter()
-            .take_while(|p| p.default.is_none() && !p.rest)
-            .count() as u32;
-        self.install_fn_name_length(handle, install_name, len);
-    }
-
-    /// Interns `s` to a `&'a str` for storing as a `FnDef::name`. Method names are
-    /// derived from runtime property keys (computed keys, accessor prefixes), so
-    /// they are not always borrowable from the source; leak-once dedup keeps the
-    /// `'a` lifetime sound without `unsafe`.
-    fn intern_method_name(&mut self, s: &str) -> &'a str {
-        if let Some(&v) = self.method_name_intern.get(s) {
-            return v;
-        }
-        let leaked: &'static str = alloc::boxed::Box::leak(String::from(s).into_boxed_str());
-        self.method_name_intern.insert(String::from(s), leaked);
-        leaked
     }
 
     /// Creates a native function carrying its own `name`/`length` data properties,
@@ -5768,7 +5153,7 @@ impl<'a> Interp<'a> {
     /// interpreter, exactly as it does for any native.
     pub fn register_fn<F>(&mut self, name: &str, length: u32, f: F) -> NanBox
     where
-        F: FnMut(&mut Ctx<'_, '_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
+        F: FnMut(&mut Ctx<'_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
     {
         self.register_host_fn(name, length, false, f)
     }
@@ -5782,7 +5167,7 @@ impl<'a> Interp<'a> {
     /// A plain call `f(...)` (no `new`) still runs the closure normally.
     pub fn register_constructor<F>(&mut self, name: &str, length: u32, f: F) -> NanBox
     where
-        F: FnMut(&mut Ctx<'_, '_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
+        F: FnMut(&mut Ctx<'_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
     {
         let ctor = self.register_host_fn(name, length, true, f);
         // Give it a `prototype` object with a back-reference `constructor`.
@@ -5800,7 +5185,7 @@ impl<'a> Interp<'a> {
     /// binds it as a global named `name`.
     pub fn register_global_constructor<F>(&mut self, name: &str, length: u32, f: F) -> NanBox
     where
-        F: FnMut(&mut Ctx<'_, '_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
+        F: FnMut(&mut Ctx<'_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
     {
         let v = self.register_constructor(name, length, f);
         self.declare_global(name, v);
@@ -5809,7 +5194,7 @@ impl<'a> Interp<'a> {
 
     fn register_host_fn<F>(&mut self, name: &str, length: u32, is_constructor: bool, f: F) -> NanBox
     where
-        F: FnMut(&mut Ctx<'_, '_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
+        F: FnMut(&mut Ctx<'_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
     {
         let id = self.host_fns.len() as u32;
         self.host_fns.push(Some(HostFn {
@@ -5892,7 +5277,7 @@ impl<'a> Interp<'a> {
     /// subsequently-`run` script can call it directly.
     pub fn register_global_fn<F>(&mut self, name: &str, length: u32, f: F) -> NanBox
     where
-        F: FnMut(&mut Ctx<'_, '_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
+        F: FnMut(&mut Ctx<'_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
     {
         let v = self.register_fn(name, length, f);
         self.declare_global(name, v);
@@ -5966,19 +5351,10 @@ impl<'a> Interp<'a> {
     pub(crate) fn exec_error_value(&mut self, e: ExecError) -> NanBox {
         match e {
             ExecError::Throw(v) => v,
-            ExecError::NotCallable => {
-                let m = self.new_str("is not a function");
-                self.make_error(N_TYPE_ERROR, Some(m))
-            }
-            ExecError::NotDefined(name) => {
-                let m = self.new_str(&alloc::format!("{name} is not defined"));
-                self.make_error(N_REFERENCE_ERROR, Some(m))
-            }
             ExecError::Unsupported(s) => {
                 let m = self.new_str(s);
                 self.make_error(N_ERROR_BASE, Some(m))
             }
-            ExecError::OptShortCircuit => NanBox::undefined(),
             // An interrupt should never reach the host boundary as a *value* —
             // the entry points surface it as a distinct outcome. Materialize a
             // plain Error defensively rather than silently yielding `undefined`,
@@ -5987,15 +5363,6 @@ impl<'a> Interp<'a> {
                 let m = self.new_str("execution interrupted by the host");
                 self.make_error(N_ERROR_BASE, Some(m))
             }
-            // A tail call is always consumed by the enclosing `invoke` trampoline,
-            // so it never reaches the host boundary; defensively perform it here.
-            ExecError::TailCall {
-                callee,
-                this_val,
-                args,
-            } => self
-                .call_with_this(callee, this_val, &args)
-                .unwrap_or(NanBox::undefined()),
         }
     }
 
@@ -6036,20 +5403,6 @@ impl<'a> Interp<'a> {
             self.global_scope.declare(name, value);
         }
         Ok(())
-    }
-
-    /// Mirrors a global `var`/function declaration's binding onto the global
-    /// object, so `var x = 1; this.x` (and `globalThis.x`) see it. Only applies
-    /// when execution is running directly in the global scope (a `var` inside a
-    /// function binds in that function, not on the global object). Per spec a
-    /// global `var` property is writable + enumerable but non-configurable.
-    fn publish_global_var(&mut self, name: &str, value: NanBox) {
-        if !self.var_scope.ptr_eq(&self.global_scope) {
-            return;
-        }
-        if let Some(g) = self.global_this.as_handle().map(Handle::from_raw) {
-            self.realm.set_property(g, name, value);
-        }
     }
 
     /// Mirrors an assignment to a global `var` binding onto the global object.
@@ -6131,7 +5484,7 @@ impl<'a> Interp<'a> {
     /// `import`/`export` outside a module), an uncaught throw
     /// ([`ExecError::Throw`]), a host interrupt, or
     /// [`ExecError::Unsupported`] for a program the bytecode compiler refuses.
-    pub fn run(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
+    pub fn run(&mut self, program: &Program) -> Result<NanBox, ExecError> {
         // A unit with a top-level `import`/`export` is a Module; this entry runs
         // Scripts (modules go through the module loader).
         if program.source_type == crate::ast::SourceType::Module {
@@ -6145,16 +5498,8 @@ impl<'a> Interp<'a> {
         // Installed for good, not just for this run: closures the script leaves
         // behind (in globals, timers, promise reactions) stay callable after it.
         self.install_vm_table(alloc::rc::Rc::clone(&table));
-        // Modules a dynamic `import()` loads run on the VM too.
-        #[cfg(all(feature = "std", feature = "module"))]
-        self.enable_vm_modules();
         self.prepare_script_for_vm(program)?;
-        let r =
-            crate::nbvm::run_program_hosted(self, &table, main as usize, &[]).map_err(vm_to_exec);
-        // Every function user code can obtain is a VM function: nothing runs
-        // on the tree-walker.
-        debug_assert_eq!(self.tree_walked(), 0, "a VM run tree-walked user code");
-        r
+        crate::nbvm::run_program_hosted(self, &table, main as usize, &[]).map_err(vm_to_exec)
     }
 
     /// The function table VM code compiled into this interpreter lives in (a
@@ -6181,81 +5526,6 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Runs a whole program on the **tree-walker** (the reference engine),
-    /// returning the value of its last expression statement (or `undefined`).
-    ///
-    /// This is the execution tier being retired (`ROADMAP.md` §2.0); it remains
-    /// the fallback for what the bytecode compiler refuses and the differential
-    /// oracle the VM is tested against. Embedders want [`run`](Self::run).
-    ///
-    /// # Errors
-    /// As [`run`](Self::run).
-    pub fn run_tree_walk(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
-        // Retain the program's source so function/class definitions can slice
-        // their literal text for `Function.prototype.toString` (AST spans are byte
-        // offsets into this source).
-        self.src = &program.source;
-        self.strict = self.strict || has_use_strict(&program.body);
-        // Script-level `this` is the global object (the realm's `globalThis`),
-        // regardless of strictness — so a top-level `this.x = …` (sloppy globals)
-        // and `this === globalThis` behave per spec.
-        if matches!(self.this_val.unpack(), Unpacked::Undefined) {
-            self.this_val = self.global_this;
-        }
-        // GlobalDeclarationInstantiation runs for a Script *before* any of its
-        // bindings are created: a top-level `let`/`const`/`class` may not collide
-        // with an existing global lexical binding, a global var/function, or a
-        // restricted (non-configurable) global property — `let undefined;` is a
-        // SyntaxError. Same checks as the `$262.evalScript` path.
-        if self.current.ptr_eq(&self.global_scope) {
-            self.global_declaration_checks(program)?;
-        }
-        self.hoist_with(&program.body, true)?;
-        // This statement chain is the *only* GC-safe region in the tree-walker:
-        // nothing is on the Rust stack below it but the driver. Open the fence
-        // here; every nested body (function, `eval`, class, module, generator)
-        // closes it again for its own extent.
-        let saved_gc = core::mem::replace(&mut self.gc_ok, true);
-        let r = self.run_toplevel_body(&program.body);
-        self.gc_ok = saved_gc;
-        let last = r?;
-        // Run the event loop (microtasks + `setTimeout`) before returning.
-        self.run_event_loop()?;
-        Ok(last)
-    }
-
-    /// The top-level statement loop of [`run`](Self::run), split out so the GC
-    /// fence is restored on every exit path. The running completion value is a
-    /// live Rust local across each statement, so it is published as a GC root.
-    fn run_toplevel_body(&mut self, body: &'a [Stmt]) -> Result<NanBox, ExecError> {
-        let mut last = NanBox::undefined();
-        let mark = self.gc_root(&[last]);
-        for stmt in body {
-            match self.exec(stmt) {
-                // UpdateEmpty: an empty completion (declaration / empty statement)
-                // never replaces a preceding non-empty value; the script's value
-                // is the last non-empty statement value (undefined if none).
-                Ok(Flow::Normal(v)) => {
-                    if !v.is_empty_completion() {
-                        last = v;
-                        self.gc_reroot(mark, &[last]);
-                    }
-                }
-                Ok(Flow::Return(v)) => {
-                    self.gc_unroot(mark);
-                    return Ok(v);
-                }
-                Ok(Flow::Break(..) | Flow::Continue(..)) => {}
-                Err(e) => {
-                    self.gc_unroot(mark);
-                    return Err(e);
-                }
-            }
-        }
-        self.gc_unroot(mark);
-        Ok(last)
-    }
-
     // --- dynamic code (`eval` / `Function`) ---
 
     /// Parses `source` as a Script and returns a `&'a` reference to the resulting
@@ -6278,7 +5548,7 @@ impl<'a> Interp<'a> {
         // Whether the direct eval runs inside a class field initializer / static
         // block (activates the ContainsArguments early error for `arguments`).
         in_field_initializer: bool,
-    ) -> Result<&'a Program, ExecError> {
+    ) -> Result<&'static Program, ExecError> {
         // The cache is keyed by source *and* the inherited `super`/`new.target`
         // context *and* inherited strictness *and* the visible private names /
         // field-initializer flag: the same text `"super.x"` / `"new.target"` /
@@ -6590,8 +5860,7 @@ impl<'a> Interp<'a> {
         // block). An indirect eval always runs in the global scope, where
         // `super` is never permitted. (`super(…)` needs a derived-constructor
         // context that is not tracked separately, so it stays disallowed.)
-        let allow_super_property =
-            direct && (self.current_home.is_some() || self.current_home_object.is_some());
+        let allow_super_property = direct && self.current_home_object.is_some();
         // `new.target` is syntactically valid in a *direct* eval that is contained
         // in function code (the eval inherits the caller's `[[NewTarget]]`).
         // `new_target_in_scope` tracks this lexically — true inside a non-arrow
@@ -6612,13 +5881,11 @@ impl<'a> Interp<'a> {
         // parser with these lets the eval body reference `this.#x` (which resolves
         // at runtime against the unchanged `current_lexical_home`). An indirect
         // eval runs in the global scope and sees none.
-        let outer_private_names = if direct && !self.vm_eval_privates.is_empty() {
+        let outer_private_names = if direct {
             self.vm_eval_privates
                 .iter()
                 .map(|(n, _)| alloc::boxed::Box::from(n.as_str()))
                 .collect()
-        } else if direct {
-            self.visible_private_names()
         } else {
             Vec::new()
         };
@@ -6667,7 +5934,7 @@ impl<'a> Interp<'a> {
             self.eval_param_names = Some(param_names);
         }
 
-        // Recursion guard shared with the tree-walk budget.
+        // Nested-eval guard.
         if self.eval_depth >= self.realm.limits.max_eval_depth {
             let msg = self.new_str("Maximum call stack size exceeded");
             return Err(ExecError::Throw(
@@ -6853,14 +6120,7 @@ impl<'a> Interp<'a> {
         let saved_scope = core::mem::replace(&mut self.current, self.global_scope.clone());
         let saved_strict = self.strict;
         self.strict = has_use_strict(&func.body);
-        // Definitions *inside* the dynamic body — `new Function("return function
-        // g(){}")` — carry spans into the assembled source, not the caller's
-        // program. Retain it for the duration so `FnDef::def_src` captures the
-        // right text (otherwise their `toString` slices unrelated source).
-        let saved_src = core::mem::replace(&mut self.src, &program.source);
-        // While hosting a bytecode-VM run, the function is a VM function (one
-        // another realm's constructor builds stays the interpreter's, which
-        // tracks function realms).
+        // The function is a VM function, built in its constructor's realm.
         let strict = self.strict;
         let fn_realm = callee
             .as_handle()
@@ -6871,13 +6131,11 @@ impl<'a> Interp<'a> {
         let f = match f {
             Ok(f) => f,
             Err(e) => {
-                self.src = saved_src;
                 self.strict = saved_strict;
                 self.current = saved_scope;
                 return Err(e);
             }
         };
-        self.src = saved_src;
         self.strict = saved_strict;
         self.current = saved_scope;
         // CreateDynamicFunction step 20 sets `[[SourceText]]` to the *assembled*
@@ -6896,7 +6154,6 @@ impl<'a> Interp<'a> {
         }
 
         // `Function`-created functions are named "anonymous".
-        self.set_fn_name(f, "anonymous");
         if let Some(h) = f.as_handle().map(Handle::from_raw) {
             // Tag it so the `%ThrowTypeError%` poison stays conservative for a
             // dynamically-built function (a dynamic generator must still throw).
@@ -6971,151 +6228,132 @@ impl<'a> Interp<'a> {
 
     // --- functions ---
 
-    /// Pre-declares hoisted `function` declarations in the current scope, so a
-    /// declaration is callable before its textual position (and mutual
-    /// recursion works).
-    /// Hoists a statement sequence. Function declarations are always hoisted;
-    /// `var` names hoist only at a function/program boundary (`hoist_vars`), not
-    /// per-block, since `var` is function-scoped.
-    fn hoist_with(&mut self, stmts: &'a [Stmt], hoist_vars: bool) -> Result<(), ExecError> {
-        self.hoist_with_kind(stmts, hoist_vars, false)
-    }
-
-    /// Hoists a statement sequence. `eval_code` is true for an eval body, where
-    /// the Annex B.3.3.3 rule differs from function code (B.3.3.2): a block
-    /// function whose name matches an enclosing parameter still updates that
-    /// binding in eval code, but not in function code.
-    fn hoist_with_kind(
+    /// Declaration instantiation for a Script (GlobalDeclarationInstantiation)
+    /// or eval code (`eval_code`, EvalDeclarationInstantiation) about to run on
+    /// the VM: `var` and Annex B block-function names bind as `undefined` in the
+    /// variable environment (the global object's properties too, at global
+    /// scope), top-level function declarations bind as `undefined` (the VM code
+    /// stores each function's closure before any user code runs — eval code
+    /// declares them itself, `hoist_skip_fns`), and the top-level lexical names
+    /// enter their temporal dead zone. The Annex B.3.3.3 rule differs for eval
+    /// code (B.3.3.2): a block function whose name matches an enclosing
+    /// parameter still updates that binding in eval code.
+    fn declaration_instantiation(
         &mut self,
-        stmts: &'a [Stmt],
-        hoist_vars: bool,
+        stmts: &[Stmt],
         eval_code: bool,
     ) -> Result<(), ExecError> {
         // `var` names hoist to the function/program scope as `undefined` (so a
         // read before the declaration yields `undefined`, not a ReferenceError).
         // Done first; a same-named function declaration then overwrites it.
-        if hoist_vars {
-            // This is a function/program/eval variable-environment boundary: the
-            // variable scope is where `var`/top-level functions hoist, and where
-            // the Annex B.3.3 runtime update for a block function writes. For an
-            // eval body this may be an OUTER environment (the spec `varEnv`,
-            // supplied via `eval_var_scope`) distinct from the fresh lexical
-            // `self.current`; otherwise it is `self.current` itself.
-            self.var_scope = self
-                .eval_var_scope
-                .take()
-                .unwrap_or_else(|| self.current.clone());
-            self.annexb_block_fns = Vec::new();
-            let mut var_names: Vec<&str> = Vec::new();
-            collect_var_names(stmts, &mut var_names);
-            // Annex B: a function declared inside a block also var-hoists its name
-            // to the enclosing function scope (initially `undefined`).
-            //
-            // B.3.3 is a **sloppy-mode** web-compatibility extension only. In
-            // strict code a block-level function declaration is an ordinary
-            // lexical declaration of that block, so its name must not appear in
-            // the variable environment at all and a reference outside the block is
-            // a ReferenceError.
-            let mut block_fn_names: Vec<(&str, Span)> = Vec::new();
-            if !self.strict {
-                collect_block_function_names(stmts, &mut block_fn_names);
-            }
-            // A block-function name qualifies for the B.3.3 runtime update unless
-            // it collides with a parameter or other binding already present in the
-            // variable environment (where the function-code extension B.3.3.2 does
-            // not apply). In eval code (B.3.3.3) such a collision is permitted, so
-            // the binding is still updated.
-            // NB: `arguments` is deliberately *not* special-cased here.
-            // FunctionDeclarationInstantiation step 22.f appends "arguments" to
-            // `parameterNames` whenever an arguments object is created, and
-            // B.3.2.1 applies only when `F` is not in `parameterNames` — so
-            // `(function(){ { function arguments(){} } })` must leave `arguments`
-            // bound to the arguments object. (`annexB/language/function-code/
-            // block-decl-func-skip-arguments.js` is normative here;
-            // `staging/sm/lexical-environment/block-scoped-functions-annex-b-\
-            // arguments.js` encodes the older SpiderMonkey behaviour and
-            // contradicts it — V8 still fails that test262 test.) The `has_local`
-            // test below covers this: the arguments object already occupies the
-            // binding.
-            for (name, span) in &block_fn_names {
-                if eval_code || !self.var_scope.has_local(name) {
-                    self.annexb_block_fns.push((String::from(*name), *span));
-                }
-            }
-            var_names.extend(block_fn_names.iter().map(|(n, _)| *n));
-            let at_global = self.var_scope.ptr_eq(&self.global_scope);
-            let global_obj = self.global_this.as_handle().map(Handle::from_raw);
-            for name in var_names {
-                // At global scope a `var`/Annex-B name that *already* exists as a
-                // global-object own property IS that binding: don't shadow it with
-                // a fresh `undefined` scope binding (it must keep its current value
-                // and the property's attributes; an identifier read falls back to
-                // the global-object property — see `read_ident_ref`). This is the
-                // EvalDeclarationInstantiation "binding is not reinitialized" rule.
-                // An existing *accessor* property counts as the binding too (it
-                // is an own property of the global object), so a `var` of that
-                // name must neither shadow nor overwrite it.
-                let global_has = at_global
-                    && global_obj.is_some_and(|g| {
-                        self.realm.has_own(g, name) || self.realm.accessor(g, name).is_some()
-                    });
-                if !self.var_scope.has_local(name) && !global_has {
-                    // A sloppy `eval`'s `var` in a *non-global* variable
-                    // environment is a deletable binding (`delete` removes it);
-                    // ordinary and global `var` bindings are not.
-                    if eval_code && !at_global {
-                        self.var_scope.declare_deletable(name, NanBox::undefined());
-                    } else {
-                        self.var_scope.declare(name, NanBox::undefined());
-                    }
-                }
-                // A global `var` reserves an own property on the global object
-                // (initially `undefined` until the declaration's initializer runs),
-                // so `typeof x` / `this.x` see the hoisted binding. Don't clobber a
-                // pre-existing global property (e.g. a built-in of the same name).
-                if at_global
-                    && !global_has
-                    && let Some(g) = global_obj
-                {
-                    self.realm.set_property(g, name, NanBox::undefined());
-                    // A global `var`/function binding created by *script* code is
-                    // non-configurable (CreateGlobalVarBinding with deletable
-                    // false). Bindings created by global *eval* code are deletable
-                    // (configurable), so only lock script-scope ones — a
-                    // `$262.evalScript` body is a Script, so it locks too.
-                    if !eval_code || self.script_eval_globals {
-                        self.realm.set_non_configurable_property(g, name);
-                    }
-                }
-            }
-            // Record this body's top-level lexical (`let`/`const`/`class`) names on
-            // the (shared) variable-environment frame. In the spec a non-strict
-            // function body keeps a lexical Environment Record distinct from its
-            // variable Environment Record; this engine merges them into one frame,
-            // so the recorded set is what EvalDeclarationInstantiation consults to
-            // reject a sloppy direct `eval("var x")` that collides with a top-level
-            // `let`/`const`/`class` of the enclosing body. Marked on `self.current`
-            // (where those declarations bind: the function body scope, or an eval's
-            // fresh lexical env), not on `var_scope` (which, for an eval, is the
-            // outer variable environment).
-            let mut lex_names: Vec<&str> = Vec::new();
-            collect_lexical_names(stmts, &mut lex_names);
-            for name in lex_names {
-                self.current.mark_lexical(name);
+        // This is a function/program/eval variable-environment boundary: the
+        // variable scope is where `var`/top-level functions hoist, and where
+        // the Annex B.3.3 runtime update for a block function writes. For an
+        // eval body this may be an OUTER environment (the spec `varEnv`,
+        // supplied via `eval_var_scope`) distinct from the fresh lexical
+        // `self.current`; otherwise it is `self.current` itself.
+        self.var_scope = self
+            .eval_var_scope
+            .take()
+            .unwrap_or_else(|| self.current.clone());
+        self.annexb_block_fns = Vec::new();
+        let mut var_names: Vec<&str> = Vec::new();
+        collect_var_names(stmts, &mut var_names);
+        // Annex B: a function declared inside a block also var-hoists its name
+        // to the enclosing function scope (initially `undefined`).
+        //
+        // B.3.3 is a **sloppy-mode** web-compatibility extension only. In
+        // strict code a block-level function declaration is an ordinary
+        // lexical declaration of that block, so its name must not appear in
+        // the variable environment at all and a reference outside the block is
+        // a ReferenceError.
+        let mut block_fn_names: Vec<(&str, Span)> = Vec::new();
+        if !self.strict {
+            collect_block_function_names(stmts, &mut block_fn_names);
+        }
+        // A block-function name qualifies for the B.3.3 runtime update unless
+        // it collides with a parameter or other binding already present in the
+        // variable environment (where the function-code extension B.3.3.2 does
+        // not apply). In eval code (B.3.3.3) such a collision is permitted, so
+        // the binding is still updated.
+        // NB: `arguments` is deliberately *not* special-cased here.
+        // FunctionDeclarationInstantiation step 22.f appends "arguments" to
+        // `parameterNames` whenever an arguments object is created, and
+        // B.3.2.1 applies only when `F` is not in `parameterNames` — so
+        // `(function(){ { function arguments(){} } })` must leave `arguments`
+        // bound to the arguments object. (`annexB/language/function-code/
+        // block-decl-func-skip-arguments.js` is normative here;
+        // `staging/sm/lexical-environment/block-scoped-functions-annex-b-\
+        // arguments.js` encodes the older SpiderMonkey behaviour and
+        // contradicts it — V8 still fails that test262 test.) The `has_local`
+        // test below covers this: the arguments object already occupies the
+        // binding.
+        for (name, span) in &block_fn_names {
+            if eval_code || !self.var_scope.has_local(name) {
+                self.annexb_block_fns.push((String::from(*name), *span));
             }
         }
-        // A **module** body's top-level function declarations were already
-        // instantiated by InitializeEnvironment (link time), so that an importer —
-        // or a cyclic dependency evaluated first — can call them before this body
-        // runs. Re-creating them here would replace those very objects, so a
-        // property an earlier module put on one (or the `*default*` binding of
-        // `export default function f`) would be lost. Skip them; every other part
-        // of hoisting (`var`, Annex B, lexical TDZ) still applies. Direct `eval`
-        // at module top level is *not* module code and still declares its own.
-        #[cfg(all(feature = "module", feature = "std"))]
-        let module_top_level = hoist_vars && !eval_code && self.at_module_top_level();
-        #[cfg(not(all(feature = "module", feature = "std")))]
-        let module_top_level = false;
+        var_names.extend(block_fn_names.iter().map(|(n, _)| *n));
+        let at_global = self.var_scope.ptr_eq(&self.global_scope);
+        let global_obj = self.global_this.as_handle().map(Handle::from_raw);
+        for name in var_names {
+            // At global scope a `var`/Annex-B name that *already* exists as a
+            // global-object own property IS that binding: don't shadow it with
+            // a fresh `undefined` scope binding (it must keep its current value
+            // and the property's attributes; an identifier read falls back to
+            // the global-object property — see `read_ident_ref`). This is the
+            // EvalDeclarationInstantiation "binding is not reinitialized" rule.
+            // An existing *accessor* property counts as the binding too (it
+            // is an own property of the global object), so a `var` of that
+            // name must neither shadow nor overwrite it.
+            let global_has = at_global
+                && global_obj.is_some_and(|g| {
+                    self.realm.has_own(g, name) || self.realm.accessor(g, name).is_some()
+                });
+            if !self.var_scope.has_local(name) && !global_has {
+                // A sloppy `eval`'s `var` in a *non-global* variable
+                // environment is a deletable binding (`delete` removes it);
+                // ordinary and global `var` bindings are not.
+                if eval_code && !at_global {
+                    self.var_scope.declare_deletable(name, NanBox::undefined());
+                } else {
+                    self.var_scope.declare(name, NanBox::undefined());
+                }
+            }
+            // A global `var` reserves an own property on the global object
+            // (initially `undefined` until the declaration's initializer runs),
+            // so `typeof x` / `this.x` see the hoisted binding. Don't clobber a
+            // pre-existing global property (e.g. a built-in of the same name).
+            if at_global
+                && !global_has
+                && let Some(g) = global_obj
+            {
+                self.realm.set_property(g, name, NanBox::undefined());
+                // A global `var`/function binding created by *script* code is
+                // non-configurable (CreateGlobalVarBinding with deletable
+                // false). Bindings created by global *eval* code are deletable
+                // (configurable), so only lock script-scope ones — a
+                // `$262.evalScript` body is a Script, so it locks too.
+                if !eval_code || self.script_eval_globals {
+                    self.realm.set_non_configurable_property(g, name);
+                }
+            }
+        }
+        // Record this body's top-level lexical (`let`/`const`/`class`) names on
+        // the (shared) variable-environment frame. In the spec a non-strict
+        // function body keeps a lexical Environment Record distinct from its
+        // variable Environment Record; this engine merges them into one frame,
+        // so the recorded set is what EvalDeclarationInstantiation consults to
+        // reject a sloppy direct `eval("var x")` that collides with a top-level
+        // `let`/`const`/`class` of the enclosing body. Marked on `self.current`
+        // (where those declarations bind: the function body scope, or an eval's
+        // fresh lexical env), not on `var_scope` (which, for an eval, is the
+        // outer variable environment).
+        let mut lex_names: Vec<&str> = Vec::new();
+        collect_lexical_names(stmts, &mut lex_names);
+        for name in lex_names {
+            self.current.mark_lexical(name);
+        }
         for stmt in stmts {
             // A module's `export function f(){}` / `export default function f(){}`
             // hoists `f` exactly like a bare function declaration: unwrap the
@@ -7128,77 +6366,57 @@ impl<'a> Interp<'a> {
             if let Stmt::Function(func) = stmt
                 && let Some(id) = &func.id
             {
-                if module_top_level || (hoist_vars && self.hoist_skip_fns) {
+                if self.hoist_skip_fns {
                     continue;
                 }
-                let value = if hoist_vars && self.hoist_fn_placeholders {
-                    NanBox::undefined()
+                // The binding is created holding `undefined`: the VM code
+                // stores the function's closure before any user code runs.
+                let value = NanBox::undefined();
+                let at_global_var = self.var_scope.ptr_eq(&self.global_scope);
+                let global_obj = self.global_this.as_handle().map(Handle::from_raw);
+                // A function/program top-level declaration binds in the
+                // variable environment (for an eval body, the outer `varEnv`).
+                // A sloppy `eval`'s function declaration in a non-global
+                // variable environment is a deletable binding.
+                if eval_code && !at_global_var {
+                    self.var_scope.declare_deletable(&id.name, value);
                 } else {
-                    let value = self.make_function(
-                        &func.params,
-                        Body::Block(&func.body),
-                        func.is_async,
-                        func.is_generator,
-                    );
-                    self.set_fn_name(value, &id.name);
-                    self.set_fn_source(value, func.span);
-                    value
-                };
-                if hoist_vars {
-                    let at_global_var = self.var_scope.ptr_eq(&self.global_scope);
-                    let global_obj = self.global_this.as_handle().map(Handle::from_raw);
-                    // A function/program top-level declaration binds in the
-                    // variable environment (for an eval body, the outer `varEnv`).
-                    // A sloppy `eval`'s function declaration in a non-global
-                    // variable environment is a deletable binding.
-                    if eval_code && !at_global_var {
-                        self.var_scope.declare_deletable(&id.name, value);
-                    } else {
-                        self.var_scope.declare(&id.name, value);
+                    self.var_scope.declare(&id.name, value);
+                }
+                // A global function declaration also publishes on the global
+                // object (`function f(){}; this.f === f`).
+                if at_global_var && let Some(g) = global_obj {
+                    // CreateGlobalFunctionBinding. When there is no existing own
+                    // property, or it is configurable, (re)define with full data
+                    // attributes: writable, enumerable, and configurable set to
+                    // the binding's *deletable* flag. A binding created by
+                    // *script* code (top-level program or `$262.evalScript`) is
+                    // non-configurable (deletable = false); one created by global
+                    // `eval` code is configurable (deletable = true). When the
+                    // existing property is non-configurable (but declarable —
+                    // validated by CanDeclareGlobalFunction above), update only
+                    // the value and preserve its attributes.
+                    let deletable = eval_code && !self.script_eval_globals;
+                    let has_own = self.realm.has_own(g, &id.name)
+                        || self.realm.accessor(g, &id.name).is_some();
+                    let redefine_attrs =
+                        !has_own || !self.realm.property_is_non_configurable(g, &id.name);
+                    if redefine_attrs {
+                        // A configurable *accessor* is fully replaced by the
+                        // function's data property (its getter/setter must not
+                        // survive, and must not run).
+                        self.realm.clear_accessor(g, &id.name);
                     }
-                    // A global function declaration also publishes on the global
-                    // object (`function f(){}; this.f === f`).
-                    if at_global_var && let Some(g) = global_obj {
-                        // CreateGlobalFunctionBinding. When there is no existing own
-                        // property, or it is configurable, (re)define with full data
-                        // attributes: writable, enumerable, and configurable set to
-                        // the binding's *deletable* flag. A binding created by
-                        // *script* code (top-level program or `$262.evalScript`) is
-                        // non-configurable (deletable = false); one created by global
-                        // `eval` code is configurable (deletable = true). When the
-                        // existing property is non-configurable (but declarable —
-                        // validated by CanDeclareGlobalFunction above), update only
-                        // the value and preserve its attributes.
-                        let deletable = eval_code && !self.script_eval_globals;
-                        let has_own = self.realm.has_own(g, &id.name)
-                            || self.realm.accessor(g, &id.name).is_some();
-                        let redefine_attrs =
-                            !has_own || !self.realm.property_is_non_configurable(g, &id.name);
-                        if redefine_attrs {
-                            // A configurable *accessor* is fully replaced by the
-                            // function's data property (its getter/setter must not
-                            // survive, and must not run).
-                            self.realm.clear_accessor(g, &id.name);
-                        }
-                        self.realm.force_set_property(g, &id.name, value);
-                        if redefine_attrs {
-                            self.realm.clear_readonly_property(g, &id.name);
-                            self.realm.clear_hidden_property(g, &id.name);
-                            if deletable {
-                                self.realm.clear_non_configurable_property(g, &id.name);
-                            } else {
-                                self.realm.set_non_configurable_property(g, &id.name);
-                            }
+                    self.realm.force_set_property(g, &id.name, value);
+                    if redefine_attrs {
+                        self.realm.clear_readonly_property(g, &id.name);
+                        self.realm.clear_hidden_property(g, &id.name);
+                        if deletable {
+                            self.realm.clear_non_configurable_property(g, &id.name);
+                        } else {
+                            self.realm.set_non_configurable_property(g, &id.name);
                         }
                     }
-                } else {
-                    // A block-level declaration binds *locally* in the block
-                    // scope (block scoping). Its name was also `var`-hoisted to
-                    // the function scope by `collect_block_function_names` when
-                    // the Annex B.3.3 extension applies; the runtime update of
-                    // that outer `var` binding happens when the function-decl
-                    // statement is evaluated (see `exec_inner`'s `Stmt::Function`).
-                    self.current.declare(&id.name, value);
                 }
             }
         }
@@ -7221,186 +6439,6 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(())
-    }
-
-    /// Block-level hoisting: function declarations only (`var` is function-scoped
-    /// and hoisted at the function/program boundary instead).
-    fn hoist(&mut self, stmts: &'a [Stmt]) -> Result<(), ExecError> {
-        self.hoist_with(stmts, false)
-    }
-
-    /// The literal source slice for AST `span`, from the current source region
-    /// (`self.src`), or `None` if no source is retained or the span is out of
-    /// range / not on a UTF-8 boundary. The parser's spans are byte offsets into
-    /// the source the AST was parsed from, so this reproduces the exact original
-    /// text (comments and whitespace included).
-    fn src_slice(&self, span: crate::common::Span) -> Option<&'a str> {
-        self.src.get(span.start as usize..span.end as usize)
-    }
-
-    /// Stamps the literal source text of `span` onto the function/class `value`,
-    /// so `Function.prototype.toString` (and `String(fn)` / `"" + fn`) reproduce
-    /// it. Stored in the realm keyed by the value's handle, so both the display
-    /// path (`Realm::to_display_string`) and the method path
-    /// (`function_to_string_repr`) — and both engine tiers — share one source of
-    /// truth. A no-op if `value` is not a heap handle or no source is retained.
-    fn set_fn_source(&mut self, value: NanBox, span: crate::common::Span) {
-        if let Some(slice) = self.src_slice(span)
-            && let Some(h) = value.as_handle().map(Handle::from_raw)
-        {
-            self.realm.set_fn_source(h, alloc::rc::Rc::from(slice));
-        }
-    }
-
-    /// Registers a function definition and allocates a closure capturing the
-    /// current scope.
-    fn make_function(
-        &mut self,
-        params: &'a [Param],
-        body: Body<'a>,
-        is_async: bool,
-        is_generator: bool,
-    ) -> NanBox {
-        self.make_method(params, body, is_async, is_generator, None, false)
-    }
-
-    fn make_method(
-        &mut self,
-        params: &'a [Param],
-        body: Body<'a>,
-        is_async: bool,
-        is_generator: bool,
-        home_class: Option<u32>,
-        home_static: bool,
-    ) -> NanBox {
-        // Strict mode is lexical: inherited from the defining context, or set by
-        // the function body's own `"use strict"` directive prologue. A *class*
-        // member (it carries a home class) is always strict — all class bodies are
-        // strict code per spec, with no directive required.
-        let is_strict = self.strict
-            || home_class.is_some()
-            || matches!(body, Body::Block(stmts) if has_use_strict(stmts));
-        let func_id = self.functions.len() as u32;
-        // A method's lexical class is its home; any other function captures the
-        // *lexical* class enclosing its definition. Use `current_lexical_home`
-        // (not `current_home`, which is `None` inside an ordinary function) so a
-        // function nested inside a nested ordinary function still sees the class.
-        let lexical_class = home_class.or(self.current_lexical_home);
-        self.functions.push(FnDef {
-            params,
-            body,
-            is_async,
-            is_generator,
-            is_arrow: false,
-            is_strict,
-            name: "",
-            home_class,
-            home_static,
-            lexical_class,
-            is_method: false,
-            // Capture whether this function is *lexically* inside a class field
-            // initializer / static block. An arrow inherits this on invocation (so
-            // a direct `eval` reached through nested arrows defined in a field
-            // initializer still gets the ContainsArguments early error); a
-            // non-arrow shields it (its own `arguments` binding).
-            field_init: self.in_field_initializer,
-            nt_in_scope: self.new_target_in_scope,
-            sc_in_scope: self.super_call_in_scope,
-            def_src: self.src,
-        });
-        let handle = self.realm.new_function(func_id, self.current.clone());
-        // `GetFunctionRealm` tagging: a closure created while executing in a
-        // `$262.createRealm()` realm (e.g. a class method built by that realm's
-        // `eval`) belongs to that realm, so a brand-check / type error it later
-        // throws carries *that realm's* `%TypeError%` (see `make_error`). The
-        // closure's captured scope may root at the main global scope (an indirect
-        // eval runs there), so scope-walking alone would miss it — record it
-        // explicitly. `None` (main realm) leaves the fast path untouched.
-        if let Some(idx) = self.cur_realm {
-            self.fn_realm.insert(handle.to_raw(), idx);
-        }
-        // Materialize `name` ("" until a later NamedEvaluation / method key sets
-        // it) and `length` as own data properties so `hasOwnProperty("name")` and
-        // `verifyProperty` behave per spec even for anonymous functions. A named
-        // context (`set_fn_name`/`install_method_meta`) overwrites the name after.
-        let length = params
-            .iter()
-            .take_while(|p| p.default.is_none() && !p.rest)
-            .count() as u32;
-        self.install_fn_name_length(handle, "", length);
-        // A sync generator function's `[[Prototype]]` is `%GeneratorFunction.prototype%`
-        // (distinct from `%Function.prototype%`), so `Object.getPrototypeOf(g).prototype`
-        // resolves to `%GeneratorPrototype%`. `object_proto` honors this override.
-        if is_generator
-            && !is_async
-            && let Some(gfp) = self.generator_function_prototype()
-        {
-            self.realm.set_native_proto(handle, gfp);
-            // `g.prototype` inherits `%GeneratorPrototype%` (so a produced generator
-            // reaches it, and `getPrototypeOf(getPrototypeOf(g.prototype))` is
-            // `%IteratorPrototype%`).
-            if let Some(gp) = self.generator_prototype() {
-                let proto = self.realm.new_object_with_proto(Some(gp));
-                self.realm.set_function_prototype(func_id, proto);
-            }
-        }
-        // A (non-generator) `async function`'s `[[Prototype]]` is
-        // `%AsyncFunction.prototype%` (distinct from `%Function.prototype%`, which
-        // it inherits), so `Object.prototype.toString` reports "[object AsyncFunction]"
-        // and the `@@toStringTag` is observable even through a Proxy wrapper.
-        if is_async
-            && !is_generator
-            && let Some(afp) = self.async_function_prototype()
-        {
-            self.realm.set_native_proto(handle, afp);
-        }
-        // An `async function*`'s `[[Prototype]]` is `%AsyncGeneratorFunction.prototype%`.
-        if is_generator
-            && is_async
-            && let Some(agfp) = self.async_generator_function_prototype()
-        {
-            self.realm.set_native_proto(handle, agfp);
-            // `ag.prototype` inherits `%AsyncGeneratorPrototype%`, whose prototype is
-            // `%AsyncIteratorPrototype%`.
-            if let Some(agp) = self.async_generator_prototype() {
-                let proto = self.realm.new_object_with_proto(Some(agp));
-                self.realm.set_function_prototype(func_id, proto);
-            }
-        }
-        // Materialize the own `prototype` data property for constructable kinds
-        // (ordinary functions + generators). `is_arrow`/`is_method` are not yet
-        // set here, so this over-includes arrows and concise methods; those
-        // callers call `demote_fn_prototype` once the flag is stamped. For a
-        // generator the proto was created above (`set_function_prototype`), so
-        // `function_prototype` returns it without adding a `constructor`
-        // back-link; for a plain function it lazily builds the default proto
-        // (with the back-link) here. `prototype` is `writable: true` for both.
-        if self.fn_has_prototype(func_id) {
-            let existed = self.realm.function_prototype_cached(func_id).is_some();
-            let proto = self.realm.function_prototype(func_id);
-            // MakeConstructor step 7.a builds the `prototype` object from the
-            // *current* Realm Record's `%Object.prototype%` — for a cross-realm
-            // `Reflect.construct(otherRealm.Function, …)` that is the constructor's
-            // realm, not the main one (whose intrinsic `new_object` defaults to).
-            // Only for a freshly-built proto: an already-materialized one keeps
-            // whatever link it has.
-            if !existed && let Some(op) = self.running_realm_object_proto() {
-                self.realm.set_object_proto(proto, Some(op));
-            }
-            self.install_fn_prototype(handle, proto, true);
-        }
-        NanBox::handle(handle.to_raw())
-    }
-
-    /// `%Object.prototype%` of the *running* realm ([`Self::cur_realm`]), or `None`
-    /// when that is the main realm (whose intrinsic is already the heap default, so
-    /// nothing needs re-linking).
-    fn running_realm_object_proto(&self) -> Option<Handle> {
-        let idx = self.cur_realm?;
-        self.created_realms
-            .get(idx)?
-            .intrinsics
-            .default_object_proto
     }
 
     /// Calls `callee` with `args`.
@@ -7525,21 +6563,6 @@ impl<'a> Interp<'a> {
         self.realm
             .set_hidden_property(obj, ERROR_DATA, NanBox::boolean(true));
         NanBox::handle(obj.to_raw())
-    }
-
-    /// Evaluates a call's arguments.
-    fn eval_args(&mut self, arguments: &'a [Argument]) -> Result<Vec<NanBox>, ExecError> {
-        let mut args = Vec::with_capacity(arguments.len());
-        for a in arguments {
-            match a {
-                Argument::Item(e) => args.push(self.eval(e)?),
-                Argument::Spread(e) => {
-                    let v = self.eval(e)?;
-                    args.extend(self.iterate_values(v)?);
-                }
-            }
-        }
-        Ok(args)
     }
 
     /// Allocates a heap string and returns its boxed handle.
@@ -7937,25 +6960,6 @@ pub(crate) fn collect_block_function_names<'a>(stmts: &'a [Stmt], out: &mut Vec<
     let mut top_lex: Vec<&str> = Vec::new();
     collect_lexical_names(stmts, &mut top_lex);
     walk(stmts, out, false, &top_lex);
-}
-
-/// The binary operator underlying a compound assignment (`+=` → `+`).
-fn compound_op(op: AssignOp) -> Result<BinaryOp, ExecError> {
-    Ok(match op {
-        AssignOp::AddAssign => BinaryOp::Add,
-        AssignOp::SubAssign => BinaryOp::Sub,
-        AssignOp::MulAssign => BinaryOp::Mul,
-        AssignOp::DivAssign => BinaryOp::Div,
-        AssignOp::ModAssign => BinaryOp::Mod,
-        AssignOp::ExpAssign => BinaryOp::Exp,
-        AssignOp::ShlAssign => BinaryOp::Shl,
-        AssignOp::ShrAssign => BinaryOp::Shr,
-        AssignOp::UshrAssign => BinaryOp::Ushr,
-        AssignOp::BitAndAssign => BinaryOp::BitAnd,
-        AssignOp::BitOrAssign => BinaryOp::BitOr,
-        AssignOp::BitXorAssign => BinaryOp::BitXor,
-        _ => return Err(ExecError::Unsupported("logical assignment")),
-    })
 }
 
 /// The byte offset in WTF-8 `bytes` immediately after the first `unit` UTF-16
@@ -9474,44 +8478,22 @@ fn skip_ws(c: &[char], pos: &mut usize) {
     }
 }
 
-/// Parses and runs `source` on the new representation, returning the captured
-/// `console` output and the program's completion value (as a display string).
-///
-/// This is the high-level entry point to the new-model engine — the bridge the
-/// production pipeline migrates onto.
-///
-/// # Errors
-/// Returns a parse or execution error message on failure.
-pub fn eval_source(source: &str) -> Result<(String, String), String> {
-    eval_source_with_limits(source, crate::limits::Limits::default())
-}
-
-/// Like [`eval_source`], but with caller-supplied resource
-/// [`Limits`](crate::limits::Limits).
+/// Parses and runs `source` as a Script on a fresh interpreter
+/// ([`Interp::run`]), returning the captured `console` output and the
+/// program's completion value (as a display string). Backs
+/// [`crate::nbvm::execute_with_limits`].
 ///
 /// # Errors
 /// Returns a parse or execution error message on failure.
-pub fn eval_source_with_limits(
-    source: &str,
-    limits: crate::limits::Limits,
-) -> Result<(String, String), String> {
-    eval_source_on(source, limits, |i, p| i.run_tree_walk(p))
-}
-
-/// How a source-string entry runs its parsed program: [`Interp::run`] (the
-/// bytecode VM) or [`Interp::run_tree_walk`] (the reference tree-walker).
-pub(crate) type RunFn = for<'p> fn(&mut Interp<'p>, &'p Program) -> Result<NanBox, ExecError>;
-
-/// [`eval_source_with_limits`] over the tier `run` picks.
+#[cfg(feature = "std")]
 pub(crate) fn eval_source_on(
     source: &str,
     limits: crate::limits::Limits,
-    run: RunFn,
 ) -> Result<(String, String), String> {
     let program =
         crate::parser::Parser::parse_program(source).map_err(|e| alloc::format!("{e}"))?;
     let mut interp = Interp::new_with_limits(limits);
-    let value = match run(&mut interp, &program) {
+    let value = match interp.run(&program) {
         Ok(v) => v,
         // Render an uncaught throw readably: an error object as `name: message`,
         // any other thrown value via its display string.
@@ -9522,38 +8504,20 @@ pub(crate) fn eval_source_on(
     Ok((String::from(interp.output()), completion))
 }
 
-/// Like [`eval_source_with_limits`], but the captured output is returned on the
-/// error path too.
-///
-/// An uncaught throw does not un-print what the script already printed, and a
-/// host running untrusted code generally wants to show both — the output up to
-/// the fault, and the fault. The `Result` is the completion value, or the
-/// rendered error.
-///
-/// # Errors
-/// The inner `Result` carries a parse or execution error message; a parse
-/// failure produces no output.
-#[cfg(feature = "std")]
-pub fn eval_source_capturing(
-    source: &str,
-    limits: crate::limits::Limits,
-) -> (String, Result<String, String>) {
-    eval_source_capturing_on(source, limits, |i, p| i.run_tree_walk(p))
-}
-
-/// [`eval_source_capturing`] over the tier `run` picks.
+/// Like [`eval_source_on`], but the captured output is returned on the error
+/// path too: an uncaught throw does not un-print what the script already
+/// printed. Backs [`crate::nbvm::execute_capturing`].
 #[cfg(feature = "std")]
 pub(crate) fn eval_source_capturing_on(
     source: &str,
     limits: crate::limits::Limits,
-    run: RunFn,
 ) -> (String, Result<String, String>) {
     let program = match crate::parser::Parser::parse_program(source) {
         Ok(program) => program,
         Err(e) => return (String::new(), Err(alloc::format!("{e}"))),
     };
     let mut interp = Interp::new_with_limits(limits);
-    let outcome = match run(&mut interp, &program) {
+    let outcome = match interp.run(&program) {
         Ok(value) => Ok(interp.display(value)),
         Err(ExecError::Throw(thrown)) => Err(format_thrown(&interp, thrown)),
         Err(other) => Err(alloc::format!("{other:?}")),
@@ -9563,6 +8527,7 @@ pub(crate) fn eval_source_capturing_on(
 
 /// Formats an uncaught thrown value for an error message: `name: message` for an
 /// error-shaped object, otherwise the value's display string.
+#[cfg(feature = "std")]
 fn format_thrown(interp: &Interp, thrown: NanBox) -> String {
     if let Some((name, message)) = error_name_message(interp, thrown) {
         return if message.is_empty() {
@@ -9623,18 +8588,10 @@ pub(crate) fn error_name_message(interp: &Interp, thrown: NanBox) -> Option<(Str
     let ctor = inherited("constructor")
         .and_then(|c| c.as_handle())
         .map(Handle::from_raw)?;
-    let ctor_name = if let Some(n) = realm.get_property(ctor, "name") {
-        realm.to_display_string(n)
-    } else if let Some((cid, _)) = realm.class_at(ctor) {
-        interp.classes[cid as usize]
-            .id
-            .as_ref()
-            .map_or_else(String::new, |i| String::from(&*i.name))
-    } else if let Some((fid, _)) = realm.function_at(ctor) {
-        String::from(interp.functions[fid as usize].name)
-    } else {
-        String::new()
-    };
+    let ctor_name = realm
+        .get_property(ctor, "name")
+        .map(|n| realm.to_display_string(n))
+        .unwrap_or_default();
     if ctor_name.is_empty() {
         return None;
     }
@@ -9664,61 +8621,6 @@ pub struct Thrown {
     pub message: String,
 }
 
-/// Like [`eval_source_with_limits`], but on failure returns a structured
-/// [`Thrown`] carrying the error's *type* (for Test262 negative-test checking)
-/// instead of a flattened message string.
-///
-/// # Errors
-/// Returns [`Thrown`] for a parse failure (`SyntaxError`) or an uncaught throw.
-pub fn eval_source_typed(
-    source: &str,
-    limits: crate::limits::Limits,
-) -> Result<(String, String), Thrown> {
-    eval_source_typed_interruptible(source, limits, None)
-}
-
-/// [`eval_source_typed`] with a host watchdog installed.
-///
-/// The flag is not a field of [`Limits`](crate::limits::Limits) because that
-/// type is `Copy` and an [`Interrupt`](crate::interrupt::Interrupt) owns an
-/// `Arc`; threading it separately keeps `Limits` cheap to pass by value.
-pub fn eval_source_typed_interruptible(
-    source: &str,
-    limits: crate::limits::Limits,
-    interrupt: Option<crate::interrupt::Interrupt>,
-) -> Result<(String, String), Thrown> {
-    let program = match crate::parser::Parser::parse_program(source) {
-        Ok(p) => p,
-        Err(e) => {
-            return Err(Thrown {
-                phase: ErrorPhase::Parse,
-                name: String::from("SyntaxError"),
-                message: alloc::format!("{e}"),
-            });
-        }
-    };
-    // `parse_program` infers the goal symbol, promoting a unit with a top-level
-    // `import`/`export` to a Module. Run as a *Script* (this entry), such a
-    // declaration is an early SyntaxError — `import`/`export` are legal only at a
-    // Module's top level. (Module tests go through the module loader instead.)
-    if program.source_type == crate::ast::SourceType::Module {
-        return Err(Thrown {
-            phase: ErrorPhase::Parse,
-            name: String::from("SyntaxError"),
-            message: String::from("`import`/`export` may only appear at the top level of a module"),
-        });
-    }
-    let mut interp = Interp::new_with_limits(limits);
-    interp.realm.interrupt = interrupt;
-    match interp.run_tree_walk(&program) {
-        Ok(value) => {
-            let completion = interp.display(value);
-            Ok((String::from(interp.output()), completion))
-        }
-        Err(e) => Err(thrown_from_exec_error(&interp, e, ErrorPhase::Runtime)),
-    }
-}
-
 /// Converts an [`ExecError`] into the structured [`Thrown`] the typed entry
 /// points report, attributing it to `phase`.
 ///
@@ -9729,7 +8631,7 @@ pub fn eval_source_typed_interruptible(
 /// The interpreter as the host of a bytecode-VM run (`ROADMAP.md` §2.0): the VM
 /// borrows its realm, reads its globals, and delegates errors and console output
 /// to it so both tiers share one runtime.
-impl crate::nbvm::VmHost for Interp<'_> {
+impl crate::nbvm::VmHost for Interp {
     fn realm_slot(&mut self) -> &mut crate::realm::Realm {
         &mut self.realm
     }
@@ -9886,7 +8788,7 @@ impl crate::nbvm::VmHost for Interp<'_> {
         name: &str,
         args: &[NanBox],
     ) -> Result<NanBox, crate::nbvm::HostError> {
-        self.call_member_named(recv, name, false, args)
+        self.call_member_named(recv, name, args)
             .map_err(exec_to_host)
     }
 
@@ -10117,7 +9019,7 @@ impl crate::nbvm::VmHost for Interp<'_> {
         };
         let name = self.member_key(key);
         // A field defined on a Deferred Module Namespace (a base constructor
-        // returned one) forces its evaluation, as in the tree-walker.
+        // returned one) forces its evaluation.
         #[cfg(all(feature = "module", feature = "std"))]
         self.trigger_deferred_namespace(o, &name)
             .map_err(exec_to_host)?;
@@ -10810,10 +9712,10 @@ impl crate::nbvm::VmHost for Interp<'_> {
     }
 }
 
-/// A bytecode-VM completion as an interpreter one: a VM throw is a JS throw;
-/// any other VM fault surfaces as an internal fault, which unwinds to the VM
-/// run that delegated here and faults it (the whole program then re-runs on
-/// the tree-walker).
+/// A bytecode-VM completion as an interpreter one: a VM throw is a JS throw,
+/// an interrupt stays an interrupt, and any other VM fault surfaces as
+/// [`ExecError::Unsupported`], which unwinds to the VM run that delegated here
+/// and faults it (reported as an `InternalError`).
 pub(crate) fn vm_to_exec(e: crate::nbvm::VmError) -> ExecError {
     match e {
         crate::nbvm::VmError::Thrown(v) => ExecError::Throw(v),
@@ -10843,7 +9745,7 @@ fn exec_to_host(e: ExecError) -> crate::nbvm::HostError {
     }
 }
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// Prepares the interpreter to host a bytecode-VM run of `program`
     /// (`ROADMAP.md` §2.0): the script's `GlobalDeclarationInstantiation` —
     /// early redeclaration errors, `var`/function bindings on the global object,
@@ -10855,8 +9757,7 @@ impl<'a> Interp<'a> {
     /// # Errors
     /// The script's early errors (a `SyntaxError` for a conflicting global
     /// declaration).
-    pub(crate) fn prepare_script_for_vm(&mut self, program: &'a Program) -> Result<(), ExecError> {
-        self.src = &program.source;
+    pub(crate) fn prepare_script_for_vm(&mut self, program: &Program) -> Result<(), ExecError> {
         if matches!(self.this_val.unpack(), Unpacked::Undefined) {
             self.this_val = self.global_this;
         }
@@ -10865,10 +9766,7 @@ impl<'a> Interp<'a> {
             if self.current.ptr_eq(&self.global_scope) {
                 self.global_declaration_checks(program)?;
             }
-            self.hoist_fn_placeholders = true;
-            let r = self.hoist_with(&program.body, true);
-            self.hoist_fn_placeholders = false;
-            r
+            self.declaration_instantiation(&program.body, false)
         })();
         self.strict = saved_strict;
         r
@@ -10903,61 +9801,6 @@ pub(crate) fn thrown_from_exec_error(interp: &Interp, e: ExecError, phase: Error
             message: alloc::format!("{other:?}"),
         },
     }
-}
-
-/// Evaluates `sources` as consecutive **Scripts** in one realm, returning the
-/// concatenated output and the completion value of the last one.
-///
-/// Test262's INTERPRETING.md requires exactly this: the harness files and the
-/// test file are separate Scripts sharing a global, and for the strict variant
-/// only the *test file* gets the `"use strict"` prefix. Concatenating them into
-/// one source instead makes the harness strict too, which changes what a direct
-/// `eval` inside a harness function does — `staging/sm/strict/` turns on that
-/// distinction.
-///
-/// # Errors
-/// Returns [`Thrown`] for the first script that fails to parse or throws.
-pub fn eval_scripts_typed(
-    sources: &[&str],
-    limits: crate::limits::Limits,
-) -> Result<(String, String), Thrown> {
-    // Every script is parsed up front so the ASTs outlive the interpreter that
-    // borrows them. Parsing eagerly also means a syntax error anywhere is
-    // reported before anything runs; that is not the spec's order, but the only
-    // observable difference is output produced by an earlier script before a
-    // later one fails to parse, which is discarded on an error result anyway.
-    let mut programs = alloc::vec::Vec::with_capacity(sources.len());
-    for source in sources {
-        let program = match crate::parser::Parser::parse_program(source) {
-            Ok(p) => p,
-            Err(e) => {
-                return Err(Thrown {
-                    phase: ErrorPhase::Parse,
-                    name: String::from("SyntaxError"),
-                    message: alloc::format!("{e}"),
-                });
-            }
-        };
-        if program.source_type == crate::ast::SourceType::Module {
-            return Err(Thrown {
-                phase: ErrorPhase::Parse,
-                name: String::from("SyntaxError"),
-                message: String::from(
-                    "`import`/`export` may only appear at the top level of a module",
-                ),
-            });
-        }
-        programs.push(program);
-    }
-    let mut interp = Interp::new_with_limits(limits);
-    let mut completion = String::new();
-    for program in &programs {
-        match interp.run_tree_walk(program) {
-            Ok(value) => completion = interp.display(value),
-            Err(e) => return Err(thrown_from_exec_error(&interp, e, ErrorPhase::Runtime)),
-        }
-    }
-    Ok((String::from(interp.output()), completion))
 }
 
 /// The current time in milliseconds since the Unix epoch, or `0.0` on a target
@@ -11120,41 +9963,10 @@ fn expand_dollar(template: &str, m: &str, before: &str, after: &str) -> String {
     out
 }
 
-fn static_key(key: &PropertyKey) -> Result<String, ExecError> {
-    match key {
-        PropertyKey::Ident(s) | PropertyKey::Str(s) => Ok(String::from(&**s)),
-        // A numeric literal key is the ECMAScript `ToString(Number)` of its value,
-        // so a non-canonical literal (`0.0000001`, `0x10`, `1.0`) keys under its
-        // canonical form (`"1e-7"`, `"16"`, `"1"`) — matching `obj[n]` access.
-        PropertyKey::Number(n) => Ok(crate::realm::js_number_string(*n)),
-        // A private name needs its declaring-class scope to form a storage key,
-        // which a free function cannot resolve — callers that may see a private
-        // key (class member declaration / access) handle it explicitly.
-        PropertyKey::Private(_) => Err(ExecError::Unsupported("private key in static_key")),
-        PropertyKey::Computed(_) => Err(ExecError::Unsupported("computed key")),
-    }
-}
-
-/// The internal storage key for a private element `#name` *declared in the class
-/// whose id is `scope`*. Prefixed with `\0` so it is a true *internal slot*:
-/// filtered from every reflection surface (`Object.keys`,
-/// `getOwnPropertyNames`, `for-in`, `JSON`, …) like other engine internals,
-/// and — crucially — invisible to `hasOwnProperty("#name")` /
-/// `getOwnPropertyDescriptor`, since a user string can never equal it. (Storing
-/// under the bare `#name` would collide with a real `obj["#name"]` string key.)
-///
-/// The trailing `@<scope>` ties the key to the *declaration site* of the private
-/// name: per spec each `#x` is a distinct private name bound to its lexically
-/// enclosing class, so two classes that both declare `#x` get different keys and
-/// never collide (a nested class can shadow an outer one's `#x`).
-pub(crate) fn private_storage_key(name: &str, scope: u32) -> String {
-    alloc::format!("\u{0}#{name}@{scope}")
-}
-
 #[cfg(test)]
 mod tests;
 
-impl Interp<'_> {
+impl Interp {
     /// A VM-supplied member key: an *object* key runs its full ToPropertyKey
     /// here (once), so the member operation sees the resulting string/symbol
     /// key; any other key is passed through.

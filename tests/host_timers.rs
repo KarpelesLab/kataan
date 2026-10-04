@@ -25,7 +25,6 @@ fn run(src: &str) -> Vec<String> {
     interp.run(&program).expect("run snippet");
     timers::run_event_loop(&mut interp).expect("event loop drains cleanly");
     // The snippet, the timers prelude and every callback ran on the VM.
-    assert_eq!(interp.tree_walked(), 0, "tree-walked: {src}");
     interp
         .output()
         .lines()

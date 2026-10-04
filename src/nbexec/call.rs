@@ -19,23 +19,13 @@ pub(crate) enum RealmGuard {
     },
 }
 
-impl<'a> Interp<'a> {
+impl Interp {
     pub(crate) fn is_callable(&self, handle: Handle) -> bool {
         self.realm.native_at(handle).is_some()
             || self.realm.host_fn_at(handle).is_some()
-            || self.realm.function_at(handle).is_some()
-            // A class constructor HAS a `[[Call]]` — one that unconditionally
-            // throws a TypeError. `IsCallable` is therefore true for it, which is
-            // observable: `"a".replace(/a/, SomeClass)` takes the *functional*
-            // replace path and throws, rather than stringifying the class.
-            || self.realm.class_at(handle).is_some()
             || self.realm.bound_native_at(handle).is_some()
             // A bytecode-VM function value, while a VM run is hosted here.
             || (self.vm_table.is_some() && self.realm.is_vm_function_value(handle))
-            // A class constructor has a `[[Call]]` (it throws "cannot be invoked
-            // without 'new'"), so `IsCallable` is true for it — `typeof C` is
-            // "function" and `[].sort(class {})` must not be rejected up front.
-            || self.realm.class_at(handle).is_some()
             // `%Function.prototype%` is itself a callable function object (its
             // `[[Call]]` returns `undefined`), even though it is an ordinary
             // object cell rather than a native.
@@ -91,23 +81,6 @@ impl<'a> Interp<'a> {
                 .realm
                 .get_property(handle, crate::nbvm::VM_CTOR)
                 .is_some();
-        }
-        // A user class always constructs.
-        if self.realm.class_at(handle).is_some() {
-            return true;
-        }
-        // A user function constructs unless it is an arrow / generator / async
-        // function, or a concise method / accessor: object-literal `{m(){}}` /
-        // `get`/`set` (flagged `is_method`) and class methods (which carry a
-        // `home_class`) all lack `[[Construct]]`. (A class *constructor* is caught
-        // earlier via `class_at`.)
-        if let Some((func_id, _)) = self.realm.function_at(handle) {
-            let def = self.functions[func_id as usize];
-            return !(def.is_arrow
-                || def.is_generator
-                || def.is_async
-                || def.is_method
-                || def.home_class.is_some());
         }
         // `Object` / `Array` are namespace objects callable as constructors
         // (including a cross-realm `Object`/`Array`).
@@ -323,10 +296,6 @@ impl<'a> Interp<'a> {
         this_val: NanBox,
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
-        // Take the GC audit token unconditionally, first thing: whatever this
-        // call turns out to be, no call it makes in turn may inherit it. It is
-        // honoured only at the plain-closure dispatch below (see the `gc` module).
-        let gc_token = self.gc_audit_call.take();
         let Some(raw) = callee.as_handle() else {
             // Calling a non-object (a primitive `undefined`/`null`/number/…) is a
             // JS `TypeError` — catchable by user `try/catch` — not an internal
@@ -347,13 +316,6 @@ impl<'a> Interp<'a> {
         // accepts any arguments and returns `undefined` (ECMA-262 20.2.3).
         if self.realm.is_function_proto_intrinsic(handle) {
             return Ok(NanBox::undefined());
-        }
-        // A class constructor's `[[Call]]` always throws (ECMA-262 10.2.1 step 2):
-        // `C()` without `new` — including reaching it as a callback that a
-        // built-in invokes — is a TypeError.
-        if self.realm.class_at(handle).is_some() {
-            let m = self.new_str("Class constructor cannot be invoked without 'new'");
-            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
         // An [[IsHTMLDDA]] exotic object's `[[Call]]` (Annex B `document.all`):
         // return `null` when called with no arguments, or when the first argument
@@ -1513,43 +1475,6 @@ impl<'a> Interp<'a> {
                             .map_err(super::vm_to_exec)?;
                     }
                 }
-                N_ASYNC_RESUME_FULFILL => {
-                    if let Some(fid) = self.async_frame_id(target) {
-                        self.async_step(fid, target, generator::Resumption::Next(arg0));
-                    }
-                }
-                N_ASYNC_RESUME_REJECT => {
-                    if let Some(fid) = self.async_frame_id(target) {
-                        self.async_step(fid, target, generator::Resumption::Throw(arg0));
-                    }
-                }
-                // Async-generator resume reactions: `target` is the async generator
-                // object. Resume its parked body at the `await` point with the
-                // settled value (fulfil) or by throwing the reason (reject).
-                N_ASYNC_GEN_AWAIT_FULFILL => {
-                    self.async_gen_resume_await(target, generator::Resumption::Next(arg0));
-                }
-                N_ASYNC_GEN_AWAIT_REJECT => {
-                    self.async_gen_resume_await(target, generator::Resumption::Throw(arg0));
-                }
-                // `AsyncGeneratorAwaitReturn` reactions: settle the front request
-                // with the awaited return value, then drain the request queue.
-                N_ASYNC_GEN_RETURN_FULFILL => {
-                    self.async_gen_return_settled(target, arg0, true);
-                }
-                N_ASYNC_GEN_RETURN_REJECT => {
-                    self.async_gen_return_settled(target, arg0, false);
-                }
-                // `AsyncGeneratorUnwrapYieldResumption` reactions: the `return(v)`
-                // value delivered to a generator suspended at a `yield` has been
-                // awaited — resume the body with it (fulfil) or throw it at the
-                // `yield` point (reject).
-                N_ASYNC_GEN_YIELD_RETURN_FULFILL => {
-                    self.async_gen_yield_return_settled(target, arg0, true);
-                }
-                N_ASYNC_GEN_YIELD_RETURN_REJECT => {
-                    self.async_gen_yield_return_settled(target, arg0, false);
-                }
                 // `AsyncFromSyncIteratorContinuation` reactions on the settled
                 // `valueWrapper`: `target` is the `[done, syncIterator]` state.
                 N_ASYNC_FROM_SYNC_UNWRAP => {
@@ -1683,703 +1608,10 @@ impl<'a> Interp<'a> {
             }
             return Ok(NanBox::undefined());
         }
-        let Some((func_id, captured)) = self.realm.function_at(handle) else {
-            // A handle that is not any kind of callable (an ordinary object, an
-            // array, …): calling it is a catchable JS `TypeError`.
-            let m = self.new_str("is not a function");
-            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-        };
-        let def = self.functions[func_id as usize];
-        // An object-literal concise method carries its `[[HomeObject]]`; bind it for
-        // the duration of the call so `super.x` in the body resolves through it. An
-        // arrow has no own home object — it inherits the enclosing one (so an arrow
-        // inside a concise method can use `super`), matching its lexical `this`.
-        if def.is_arrow {
-            // An arrow restores the *lexical* `this`/`new.target`/home it captured at
-            // definition (hidden slots), so a call from any site — including via
-            // `call`/`apply`/`bind` — sees the defining environment. `invoke_inner`
-            // then inherits these `self.*` fields for the arrow body.
-            let saved_this = self.this_val;
-            let saved_nt = self.new_target;
-            let saved_home_obj = self.current_home_object;
-            let saved_home = self.current_home;
-            let saved_home_static = self.current_home_static;
-            let saved_lexical_home = self.current_lexical_home;
-            // An arrow captured in a derived constructor before `super(...)` reads
-            // its lexical `this` live from the constructor's this-binding cell (still
-            // `tdz()` until `super()` runs); otherwise it uses the snapshot.
-            let saved_this_cell = self.this_cell;
-            // Set only when this arrow *revives* its outlived constructor's pending
-            // this-binding (see below); an ordinary arrow leaves
-            // `pending_this_init` alone, so a `super()` it performs for the
-            // constructor still running underneath stays consumed on return.
-            let mut revived_pending = false;
-            if let Some(cell) = self
-                .realm
-                .get_property(handle, ARROW_THIS_CELL)
-                .and_then(|v| v.as_handle())
-                .map(Handle::from_raw)
-            {
-                self.this_val = self
-                    .realm
-                    .get_property(cell, THIS_CELL_SLOT)
-                    .unwrap_or_else(NanBox::tdz);
-                // The arrow carries its derived constructor's this-binding: a
-                // `super()` inside it writes through this cell, and — when the
-                // binding is still uninitialized and no constructor is currently
-                // pending (the arrow outlived its constructor) — it is still that
-                // constructor's binding, so restore what `super()` needs to
-                // complete it.
-                self.this_cell = Some(cell);
-                if self.pending_this_init.is_none()
-                    && self.this_val.is_tdz()
-                    && let Some(inst) = self.realm.get_property(cell, THIS_CELL_INSTANCE)
-                    && let Some(cid) = self
-                        .realm
-                        .get_property(cell, THIS_CELL_CLASS)
-                        .and_then(|v| v.as_number())
-                {
-                    self.pending_this_init = Some((inst, cid as u32));
-                    revived_pending = true;
-                }
-            } else if let Some(t) = self.realm.get_property(handle, ARROW_THIS) {
-                self.this_val = t;
-            }
-            if let Some(nt) = self.realm.get_property(handle, ARROW_NEW_TARGET) {
-                self.new_target = nt;
-            }
-            // Restore the captured home context only when one was recorded at
-            // definition; an arrow defined without a home (e.g. some field-initializer
-            // / direct-eval contexts) keeps inheriting the caller's home so its
-            // `super` still resolves.
-            if let Some(home_obj) = self.realm.get_property(handle, ARROW_HOME_OBJ) {
-                self.current_home_object = home_obj.as_handle().map(Handle::from_raw);
-            }
-            if let Some(hc) = self
-                .realm
-                .get_property(handle, ARROW_HOME_CLASS)
-                .and_then(|v| v.as_number())
-            {
-                self.current_home = Some(hc as u32);
-                self.current_home_static = self
-                    .realm
-                    .get_property(handle, ARROW_HOME_STATIC)
-                    .is_some_and(|v| self.realm.truthy(v));
-            }
-            // The definition site's lexical class, for private-name resolution.
-            if let Some(lc) = self
-                .realm
-                .get_property(handle, ARROW_LEXICAL_CLASS)
-                .and_then(|v| v.as_number())
-            {
-                self.current_lexical_home = Some(lc as u32);
-            }
-            let r = self.invoke(
-                def,
-                captured,
-                this_val,
-                args,
-                NanBox::handle(handle.to_raw()),
-                false,
-            );
-            // `super()` inside the arrow performs BindThisValue for the enclosing
-            // *derived constructor*: the constructor's `this` was uninitialized
-            // (TDZ) when the arrow was entered and is bound now, so that binding
-            // must survive the arrow's return rather than being restored away.
-            if !(saved_this.is_tdz() && !self.this_val.is_tdz()) {
-                self.this_val = saved_this;
-            }
-            self.new_target = saved_nt;
-            self.current_home_object = saved_home_obj;
-            self.current_home = saved_home;
-            self.current_home_static = saved_home_static;
-            self.current_lexical_home = saved_lexical_home;
-            self.this_cell = saved_this_cell;
-            if revived_pending {
-                self.pending_this_init = None;
-            }
-            return r;
-        }
-        let home_obj = self
-            .realm
-            .get_property(handle, HOME_OBJECT)
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw);
-        let saved_home_obj = core::mem::replace(&mut self.current_home_object, home_obj);
-        // The audit token names the argument buffer of the call the `Call` arm
-        // dispatched; a match means this plain closure *is* that callee, so its
-        // body may collect once `invoke_inner` has published the rest. The one
-        // value this frame keeps in a Rust local — the caller's home object — is
-        // published here.
-        let audited = gc_token == Some((args.as_ptr() as usize, args.len()));
-        let mark = if audited {
-            self.gc_root(&[home_object_value(saved_home_obj)])
-        } else {
-            super::gc::NO_MARK
-        };
-        let r = self.invoke(
-            def,
-            captured,
-            this_val,
-            args,
-            NanBox::handle(handle.to_raw()),
-            audited,
-        );
-        self.gc_unroot(mark);
-        self.current_home_object = saved_home_obj;
-        r
-    }
-
-    /// Runs a function body with `this` and the parameters bound in a fresh
-    /// child of `captured`.
-    /// Invokes a function, guarding against unbounded recursion: beyond
-    /// `MAX_CALL_DEPTH` nested calls it throws a `RangeError` instead of letting
-    /// the host stack overflow.
-    pub(crate) fn invoke(
-        &mut self,
-        def: FnDef<'a>,
-        captured: Scope,
-        this_val: NanBox,
-        args: &[NanBox],
-        callee: NanBox,
-        audited: bool,
-    ) -> Result<NanBox, ExecError> {
-        if self.call_depth >= self.realm.limits.max_call_depth {
-            let msg = self.new_str("Maximum call stack size exceeded");
-            // A proper `RangeError` object (id 2 in `ERROR_NAMES`) so `instanceof
-            // RangeError`/`Error` and `.name` work on the caught value.
-            let err = self.make_error(N_ERROR_BASE + 2, Some(msg));
-            return Err(ExecError::Throw(err));
-        }
-        self.call_depth += 1;
-        let mut r = self.invoke_inner(def, captured, this_val, args, callee, audited);
-        // Proper-tail-call trampoline: a `return f(...)` in tail position unwinds
-        // to here as `ExecError::TailCall` (the current frame already torn down by
-        // `invoke_inner`), and we re-dispatch it *in place* — no new `invoke`, so
-        // the native stack and `call_depth` stay flat under unbounded tail
-        // recursion. A non-tail-call result (value / throw / break…) ends the loop.
-        while let Err(ExecError::TailCall {
-            callee: c,
-            this_val: t,
-            args: a,
-        }) = r
-        {
-            r = self.dispatch_tail(c, t, &a, audited);
-        }
-        self.call_depth -= 1;
-        r
-    }
-
-    /// Dispatches a trampolined tail call. When the callee is a *plain* JS
-    /// function (ordinary, non-arrow, non-exotic) its body runs via
-    /// [`Interp::invoke_inner`] directly — reusing the trampoline's frame instead
-    /// of nesting a new `invoke` — so it may itself return another
-    /// [`ExecError::TailCall`] the loop consumes. Every other callable (bound
-    /// function, proxy, native, class constructor, arrow) takes the ordinary
-    /// [`Interp::call_with_this`] path: correct, and such callees do not
-    /// deep-tail-recurse, so growing one stack frame is harmless.
-    fn dispatch_tail(
-        &mut self,
-        callee: NanBox,
-        this_val: NanBox,
-        args: &[NanBox],
-        audited: bool,
-    ) -> Result<NanBox, ExecError> {
-        if let Some(raw) = callee.as_handle() {
-            let handle = Handle::from_raw(raw);
-            let plain = self.realm.function_at(handle).is_some()
-                && self.realm.get_property(handle, BOUND_TARGET).is_none()
-                && self.realm.proxy_at(handle).is_none()
-                && self.realm.native_at(handle).is_none()
-                && self.realm.host_fn_at(handle).is_none()
-                && self.realm.bound_native_at(handle).is_none()
-                && !self.is_array_ctor(callee)
-                && !self.is_object_ctor(callee);
-            if plain {
-                let (func_id, captured) = self.realm.function_at(handle).expect("plain fn");
-                let def = self.functions[func_id as usize];
-                // Arrows need their captured lexical `this`/home restored (as
-                // `call_with_this` does); skip the in-place path for them and take
-                // the ordinary route rather than duplicate that setup.
-                if !def.is_arrow {
-                    let home_obj = self
-                        .realm
-                        .get_property(handle, HOME_OBJECT)
-                        .and_then(|v| v.as_handle())
-                        .map(Handle::from_raw);
-                    let saved_home_obj =
-                        core::mem::replace(&mut self.current_home_object, home_obj);
-                    // The trampoline inherits the original call's audit: the frame
-                    // it replaced is gone, and this one holds only the values
-                    // published below (plus the home object, published here).
-                    let mark = if audited {
-                        self.gc_root(&[home_object_value(saved_home_obj)])
-                    } else {
-                        super::gc::NO_MARK
-                    };
-                    let r = self.invoke_inner(def, captured, this_val, args, callee, audited);
-                    self.gc_unroot(mark);
-                    self.current_home_object = saved_home_obj;
-                    return r;
-                }
-            }
-        }
-        self.call_with_this(callee, this_val, args)
-    }
-
-    pub(crate) fn invoke_inner(
-        &mut self,
-        def: FnDef<'a>,
-        captured: Scope,
-        this_val: NanBox,
-        args: &[NanBox],
-        callee: NanBox,
-        audited: bool,
-    ) -> Result<NanBox, ExecError> {
-        let call_scope = captured.child();
-        // Enter the closure's realm: a function defined in a `$262.createRealm()`
-        // realm (its scope chain roots at that realm's global scope) must throw
-        // *that realm's* errors (e.g. a private-brand-check TypeError from a class
-        // evaluated cross-realm). Falls back to `GetFunctionRealm(callee)`; `None`
-        // for a main-realm closure leaves the fast path unchanged.
-        let closure_realm = self.realm_of_scope(&captured).or_else(|| {
-            callee
-                .as_handle()
-                .map(Handle::from_raw)
-                .and_then(|h| self.get_function_realm(h))
-        });
-        let realm_guard = self.enter_realm(closure_realm);
-        let saved = core::mem::replace(&mut self.current, call_scope);
-        // A function defined in a module carries that module's import aliases in
-        // its captured scope chain; restore them so a named import read inside the
-        // body resolves even when the function is called from another module (or
-        // across an import cycle). Only swap when the closure is a module function.
-        #[cfg(all(feature = "module", feature = "std"))]
-        let saved_module_imports = captured
-            .module_imports()
-            .map(|mi| core::mem::replace(&mut self.module_imports, mi));
-        // Likewise `import.meta`: it is the *defining* module's object, so a
-        // function exported from module A and called from B still reads A's.
-        #[cfg(all(feature = "module", feature = "std"))]
-        let saved_import_meta = captured.module_meta().map(|m| self.import_meta.replace(m));
-        // The callee body opens a new variable environment (set by `hoist_with`);
-        // remember the caller's so it is restored on return.
-        let saved_var_scope = self.var_scope.clone();
-        // Until the body's own hoisting runs, the current variable environment is
-        // the parameter environment (this call scope). This matters for a sloppy
-        // direct `eval("var x")` evaluated *inside a parameter default*: its `var`
-        // must hoist into the parameter environment, not the caller's (so it does
-        // not leak to the global object). `run_body`'s `hoist_with` overwrites
-        // this with the body scope before body statements run.
-        self.var_scope = self.current.clone();
-        let saved_annexb = core::mem::take(&mut self.annexb_block_fns);
-        // An arrow has no own `this` — it inherits the enclosing one lexically,
-        // so leave `self.this_val` unchanged.
-        // An arrow inherits `this` from its enclosing function and must NOT
-        // restore it on exit: an arrow whose body runs `super()` in a derived
-        // constructor performs BindThisValue for that constructor, and restoring
-        // the pre-call (still-uninitialized) `this` would undo the binding.
-        let saved_this: Option<NanBox> = if def.is_arrow {
-            None
-        } else {
-            Some({
-                // Sloppy-mode `this` coercion (OrdinaryCallBindThis): a strict
-                // function keeps `this` as-is; a sloppy function maps `undefined`/
-                // `null` to the global object and `ToObject`-boxes a primitive
-                // receiver (a number/string/boolean/symbol/bigint) into its wrapper,
-                // so `(function(){ this.x = 1; return this; }).apply(1)` mutates and
-                // returns a `Number` wrapper.
-                let bound = if def.is_strict {
-                    this_val
-                } else if matches!(this_val.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                    self.global_this
-                } else if this_val.as_handle().is_none() {
-                    // A primitive immediate (number/boolean) — box it.
-                    self.coerce_to_object(this_val)
-                } else if self
-                    .realm
-                    .string_value(this_val.as_handle().map(Handle::from_raw).unwrap())
-                    .is_some()
-                    || self
-                        .realm
-                        .symbol_at(this_val.as_handle().map(Handle::from_raw).unwrap())
-                        .is_some()
-                    || self
-                        .realm
-                        .bigint_at(this_val.as_handle().map(Handle::from_raw).unwrap())
-                        .is_some()
-                {
-                    // A primitive stored as a heap cell (string/symbol/bigint) — box it.
-                    self.coerce_to_object(this_val)
-                } else {
-                    this_val
-                };
-                core::mem::replace(&mut self.this_val, bound)
-            })
-        };
-        // An arrow has no own home: like `this`, it inherits the enclosing
-        // method's `super` binding (home class/static and object-literal home),
-        // so `() => super.m()` inside a method works. A non-arrow establishes its
-        // own home from its `FnDef`.
-        let (saved_home, saved_home_static) = if def.is_arrow {
-            (self.current_home, self.current_home_static)
-        } else {
-            (
-                core::mem::replace(&mut self.current_home, def.home_class),
-                core::mem::replace(&mut self.current_home_static, def.home_static),
-            )
-        };
-        // The lexical class for private-name resolution: an arrow inherits the
-        // enclosing one (left untouched); any other function establishes its own
-        // captured `lexical_class` — so `#x` inside a nested ordinary function
-        // still resolves to its textually-enclosing class even though `super`
-        // (driven by `current_home` above) is `None` there.
-        let saved_lexical_home = if def.is_arrow {
-            self.current_lexical_home
-        } else {
-            core::mem::replace(&mut self.current_lexical_home, def.lexical_class)
-        };
-        // A non-arrow invocation establishes its own `new.target`: the constructor
-        // when reached via `new` (passed through the one-shot `pending_new_target`),
-        // else `undefined`. An arrow inherits the enclosing `new.target`.
-        let saved_target = if def.is_arrow {
-            self.new_target
-        } else {
-            let nt = self
-                .pending_new_target
-                .take()
-                .unwrap_or(NanBox::undefined());
-            core::mem::replace(&mut self.new_target, nt)
-        };
-        // A non-arrow body brings `new.target` into lexical scope; an arrow is
-        // transparent and inherits the enclosing flag (so an arrow defined at the
-        // top level still has no `new.target` in scope).
-        let saved_nt_scope = if def.is_arrow {
-            // An arrow is transparent to `new.target`, so the flag is the one
-            // captured where the arrow was *written* — not wherever it is called
-            // from. (`assert.throws(SyntaxError, () => eval('new.target'))` at the
-            // top level must still be a SyntaxError even though `assert.throws`
-            // invokes the arrow from inside a function.)
-            core::mem::replace(&mut self.new_target_in_scope, def.nt_in_scope)
-        } else {
-            core::mem::replace(&mut self.new_target_in_scope, true)
-        };
-        // `super(...)` is likewise transparent through arrows and shielded by any
-        // other function body.
-        let saved_sc_scope = if def.is_arrow {
-            core::mem::replace(&mut self.super_call_in_scope, def.sc_in_scope)
-        } else {
-            core::mem::replace(&mut self.super_call_in_scope, false)
-        };
-        // The "inside a class field initializer" context (for the ContainsArguments
-        // early error on a nested direct `eval`) is lexical: an arrow restores the
-        // state captured at its definition (so an `eval('arguments')` reached
-        // through arrows defined in a field initializer still errors even when the
-        // arrow runs later); a non-arrow shields it (its own `arguments` binding).
-        let saved_field_init = if def.is_arrow {
-            core::mem::replace(&mut self.in_field_initializer, def.field_init)
-        } else {
-            core::mem::replace(&mut self.in_field_initializer, false)
-        };
-        // C2: the tree-walk depth counter measures native recursion *within* one
-        // function frame; reset it for the callee's body (deep function-call
-        // recursion is bounded separately by `call_depth`) so genuine recursion is
-        // not penalised by the depth accumulated in the caller's expressions.
-        let saved_eval_depth = core::mem::replace(&mut self.eval_depth, 0);
-        // Strict mode is lexical: a strict function (a class member, or one with a
-        // `"use strict"` prologue, or defined in strict code) runs its whole body —
-        // including parameter-default evaluation — in strict mode. An arrow
-        // inherits the enclosing mode (already reflected in its `is_strict`).
-        // Strict mode is *lexical*: the callee runs in its own strictness
-        // (`def.is_strict`, which already folds in inherited strict code, a
-        // `"use strict"` prologue, and class-body strictness), NOT the caller's.
-        // A strict function calling a sloppy one (e.g. a `new Function(...)`
-        // body, always sloppy unless it self-declares strict) must CLEAR strict
-        // for that call — otherwise a direct `eval` inside the sloppy callee
-        // would wrongly parse as strict.
-        let saved_strict = self.strict;
-        self.strict = def.is_strict;
-        // Slice nested definitions out of the source this function was defined
-        // in, not whatever program happens to be running (see `FnDef::def_src`).
-        // An empty `def_src` means no source was retained at definition time;
-        // leave the ambient one alone so the NativeFunction fallback applies.
-        let saved_src = if def.def_src.is_empty() {
-            None
-        } else {
-            Some(core::mem::replace(&mut self.src, def.def_src))
-        };
-        // Cleared for this call so a nested call / the body never inherits an
-        // outer function's parameter set; restored after the call returns.
-        let saved_eval_param_names = core::mem::take(&mut self.eval_param_names);
-        // Record this invocation so the legacy `fn.caller` extension can report
-        // who is calling. Popped unconditionally below (the whole body runs inside
-        // the closure, so no early return can skip it).
-        self.fn_stack.push(callee);
-        // The parallel `arguments`-object slot for this activation (filled in
-        // below once the object exists; an arrow leaves it `null`), which serves
-        // the legacy `fn.arguments` extension.
-        self.fn_args_stack.push(NanBox::null());
-        let result = (|| {
-            // A non-arrow function gets an `arguments` array-like of its call
-            // arguments. (Arrows inherit the enclosing `arguments`.) Bound *before*
-            // the parameters so a parameter default can reference `arguments`
-            // (`function f(x = arguments[0]) {}`).
-            if !def.is_arrow {
-                // A **mapped** arguments object (aliasing `arguments[i]` to the i-th
-                // parameter binding) is created only for a *sloppy* function with a
-                // *simple* parameter list — no defaults, rest, or destructuring
-                // (10.4.4). Otherwise the object is unmapped (a plain snapshot).
-                let simple_params = def.params.iter().all(|p| {
-                    !p.rest && p.default.is_none() && matches!(p.target, BindingTarget::Ident(_))
-                });
-                let mapped_names: Option<Vec<&str>> = (!self.strict && simple_params).then(|| {
-                    def.params
-                        .iter()
-                        .filter_map(|p| match &p.target {
-                            BindingTarget::Ident(id) => Some(id.name.as_ref()),
-                            _ => None,
-                        })
-                        .collect()
-                });
-                let arguments = self.make_arguments_object(args, callee, mapped_names.as_deref());
-                self.current.declare("arguments", arguments);
-                if let Some(slot) = self.fn_args_stack.last_mut() {
-                    *slot = arguments;
-                }
-            }
-            // While evaluating parameter defaults, expose the formal parameter
-            // BoundNames (+ `arguments`) so a sloppy direct `eval("var X")` whose
-            // `X` collides with one is an EvalDeclarationInstantiation early error
-            // (see `eval_string`). Only relevant when some parameter has a default.
-            if def.params.iter().any(|p| p.default.is_some()) {
-                let mut names: Vec<String> = Vec::new();
-                if !def.is_arrow {
-                    names.push(String::from("arguments"));
-                }
-                for p in def.params {
-                    let mut refs: Vec<&str> = Vec::new();
-                    collect_binding_idents(&p.target, &mut refs);
-                    names.extend(refs.into_iter().map(String::from));
-                }
-                self.eval_param_names = Some(names);
-            }
-            // Formal-parameter TDZ: when some parameter has a default (the only
-            // way a default can reference another parameter), declare every
-            // simple-ident parameter as uninitialized *before* any default runs,
-            // so a self or forward reference throws ReferenceError (`(a = a)`,
-            // `(a = b, b)`). `bind_pattern` below overwrites each with its real
-            // value left to right, lifting it out of the dead zone — so an earlier
-            // parameter is already initialized when a later default reads it.
-            if def.params.iter().any(|p| p.default.is_some()) {
-                for param in def.params {
-                    if !param.rest
-                        && let BindingTarget::Ident(id) = &param.target
-                    {
-                        self.current.declare(&id.name, NanBox::tdz());
-                    }
-                }
-            }
-            for (i, param) in def.params.iter().enumerate() {
-                let value = if param.rest {
-                    let rest = args[i.min(args.len())..].to_vec();
-                    NanBox::handle(self.realm.new_array(rest).to_raw())
-                } else {
-                    let mut v = args.get(i).copied().unwrap_or(NanBox::undefined());
-                    if matches!(v.unpack(), Unpacked::Undefined)
-                        && let Some(d) = &param.default
-                    {
-                        v = self.eval(d)?;
-                        self.infer_binding_name(&param.target, d, v);
-                    }
-                    v
-                };
-                self.bind_pattern(&param.target, value)?;
-            }
-            // Parameter binding is done; the body must not see the parameter set.
-            self.eval_param_names = None;
-            // FunctionDeclarationInstantiation: when the formal parameters
-            // *contain expressions* (a default, or a computed key in a pattern),
-            // the body runs in a separate variable environment nested inside the
-            // parameter environment. Body `var`/lexical declarations then live in
-            // that child, invisible to closures created by parameter defaults
-            // (`((p = () => x) => { var x = 'inner'; })()` — `p` still sees the
-            // outer `x`). Per spec the new env is *seeded* with the parameter
-            // (and `arguments`) values so a body `var` that names a parameter
-            // starts from its value; the two environments are then independent.
-            if params_contain_expression(def.params) {
-                let body_scope = self.current.child();
-                for (name, value, is_const) in self.current.local_bindings() {
-                    if is_const {
-                        body_scope.declare_const(&name, value);
-                    } else {
-                        body_scope.declare(&name, value);
-                    }
-                }
-                self.current = body_scope;
-            }
-            // A generator call does NOT run its body: it captures the
-            // parameter-bound scope and ambient state into a suspended
-            // [`generator::GenFrame`], returning a lazy generator object. The
-            // body runs incrementally on each `next()`.
-            if def.is_generator {
-                let body: &'a [crate::ast::Stmt] = match def.body {
-                    Body::Block(stmts) => stmts,
-                    // A generator always has a block body; an (impossible) concise
-                    // body yields an empty generator.
-                    Body::Expr(_) => &[],
-                };
-                // A body-level `"use strict"` prologue applies to the whole body.
-                if let Body::Block(stmts) = def.body
-                    && has_use_strict(stmts)
-                {
-                    self.strict = true;
-                }
-                let scope = self.current.clone();
-                // The generator object's `[[Prototype]]` is the invoked function's
-                // own `.prototype` (which chains to `%GeneratorPrototype%` /
-                // `%AsyncGeneratorPrototype%`), per `GetPrototypeFromConstructor` —
-                // but only when it is an *Object*. A non-object `.prototype`
-                // (undefined/null/String/Symbol/Number/…) falls back to the
-                // intrinsic prototype (handled by `make_lazy_generator`).
-                let ctor_proto = callee
-                    .as_handle()
-                    .map(Handle::from_raw)
-                    .and_then(|c| self.realm.get_property(c, "prototype"))
-                    .filter(|p| self.is_object_value(*p))
-                    .and_then(|p| p.as_handle())
-                    .map(Handle::from_raw);
-                return Ok(self.make_lazy_generator(body, scope, def.is_async, ctor_proto));
-            }
-            // An `async` (non-generator) function whose body may `await`: do NOT
-            // run its body synchronously. Capture the parameter-bound scope into a
-            // suspendable coroutine, return its promise immediately, and (after the
-            // caller's ambient state is restored, below) run the body up to the
-            // first `await` (or completion). At each `await` the coroutine parks
-            // and a microtask resumes it on the awaited promise's settlement — so
-            // post-`await` code runs as a microtask, not inline.
-            //
-            // An async function that *never* awaits runs synchronously via
-            // `run_body` (its result wrapped in a settled promise below): this is
-            // observationally identical (no suspension point to reorder) and reuses
-            // the ordinary walker, which fully supports forms — `with`, etc. — that
-            // the coroutine lowering only reifies on the suspending path.
-            if def.is_async && generator::body_has_await(&def.body) {
-                // A body-level `"use strict"` prologue applies to the whole body.
-                if let Body::Block(stmts) = def.body
-                    && has_use_strict(stmts)
-                {
-                    self.strict = true;
-                }
-                let scope = self.current.clone();
-                let (id, promise, controller) = self.make_async_frame(def.body, scope);
-                self.pending_async_start = Some((id, controller));
-                return Ok(NanBox::handle(promise.to_raw()));
-            }
-            // Enter tail-position tracking for the body: a `return f(...)` here is
-            // a proper-tail-call candidate iff this is a strict, non-async,
-            // non-generator function invoked as a *call* (not a constructor — a
-            // `[[Construct]]` must survive to apply the constructor-return rule, so
-            // `new`/`super()` are never PTC; `self.new_target` is set only while
-            // constructing). This is the *only* place `tail_pos` is armed, so
-            // `ExecError::TailCall` can only arise inside this `invoke_inner` and is
-            // always consumed by the enclosing `invoke` trampoline.
-            let constructing = !matches!(self.new_target.unpack(), Unpacked::Undefined);
-            let saved_tail_pos = core::mem::replace(
-                &mut self.tail_pos,
-                self.strict && !def.is_async && !def.is_generator && !constructing,
-            );
-            // An audited call (see the `gc` module): publish what this frame and
-            // the `Call` arm above keep in Rust locals — the callee, receiver and
-            // arguments, the caller's `this` / `new.target`, and the scopes swapped
-            // out above — then run the body with the fence open. Only when the
-            // fence is open here to begin with: an audited call inside a fenced
-            // extent stays fenced.
-            let collect = audited && self.gc_ok;
-            let (val_mark, scope_mark) = if collect {
-                let mut published: Vec<NanBox> = Vec::with_capacity(args.len() + 4);
-                published.push(callee);
-                published.push(this_val);
-                published.extend_from_slice(args);
-                published.extend(saved_this);
-                published.push(saved_target);
-                let m = self.gc_root(&published);
-                let s = self.gc_scope_shadow.len();
-                self.gc_scope_shadow.push(saved.clone());
-                self.gc_scope_shadow.push(saved_var_scope.clone());
-                self.gc_scope_shadow.push(captured.clone());
-                (m, s)
-            } else {
-                (super::gc::NO_MARK, usize::MAX)
-            };
-            let r = self.run_body_audited(def.body, collect);
-            self.gc_unroot(val_mark);
-            if scope_mark != usize::MAX {
-                self.gc_scope_shadow.truncate(scope_mark);
-            }
-            self.tail_pos = saved_tail_pos;
-            r
-        })();
-        self.fn_stack.pop();
-        self.fn_args_stack.pop();
-        self.current = saved;
-        self.leave_realm(realm_guard);
-        #[cfg(all(feature = "module", feature = "std"))]
-        if let Some(mi) = saved_module_imports {
-            self.module_imports = mi;
-        }
-        #[cfg(all(feature = "module", feature = "std"))]
-        if let Some(m) = saved_import_meta {
-            self.import_meta = m;
-        }
-        self.var_scope = saved_var_scope;
-        self.annexb_block_fns = saved_annexb;
-        if let Some(t) = saved_this {
-            self.this_val = t;
-        }
-        self.current_home = saved_home;
-        self.current_lexical_home = saved_lexical_home;
-        self.current_home_static = saved_home_static;
-        self.new_target = saved_target;
-        self.new_target_in_scope = saved_nt_scope;
-        self.super_call_in_scope = saved_sc_scope;
-        self.in_field_initializer = saved_field_init;
-        self.eval_depth = saved_eval_depth;
-        self.eval_param_names = saved_eval_param_names;
-        self.strict = saved_strict;
-        if let Some(src) = saved_src {
-            self.src = src;
-        }
-        // An `async` (non-generator) function: now that the caller's ambient state
-        // is restored, drive the coroutine's first synchronous burst (the body up
-        // to the first `await` or completion). The coroutine captured its own
-        // scope/`this` into its frame, so it runs independently of the restored
-        // ambient state. `async_step` settles the returned promise on completion or
-        // parks it on the first awaited value.
-        if let Some((id, controller)) = self.pending_async_start.take() {
-            self.async_step(
-                id,
-                controller,
-                generator::Resumption::Next(NanBox::undefined()),
-            );
-            return result;
-        }
-        // An `async` (non-generator) function reaching here did NOT take the
-        // coroutine path: either its body never awaits (run synchronously via
-        // `run_body`) or its parameter binding threw before the frame was built.
-        // Either way the call returns a *promise*: resolved with the body's result
-        // (adopting a returned promise) or rejected with a thrown value (including
-        // a throwing/TDZ parameter default — AsyncFunctionStart wraps argument
-        // binding too), never throwing synchronously.
-        if def.is_async && !def.is_generator {
-            let promise = self.fresh_promise();
-            match result {
-                Ok(v) => self.resolve_with(promise, v),
-                Err(ExecError::Throw(e)) => self.settle(promise, e, false),
-                Err(other) => return Err(other),
-            }
-            return Ok(NanBox::handle(promise.to_raw()));
-        }
-        result
+        // A handle that is not any kind of callable (an ordinary object, an
+        // array, …): calling it is a catchable JS `TypeError`.
+        let m = self.new_str("is not a function");
+        Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
     }
 
     /// `GetPrototypeFromConstructor(newTarget, default)` performed spec-correctly —
@@ -2432,10 +1664,6 @@ impl<'a> Interp<'a> {
         nt: Handle,
         default: Option<Handle>,
     ) -> Result<Option<Handle>, ExecError> {
-        // A class newTarget's prototype is a synthesized (non-accessor) object.
-        if let Some((class_id, _)) = self.realm.class_at(nt) {
-            return Ok(Some(self.class_prototype_by_id(class_id)));
-        }
         let proto = self.read_constructor_prototype(nt)?;
         if self.is_object_value(proto) {
             Ok(proto.as_handle().map(Handle::from_raw))
@@ -2555,10 +1783,6 @@ impl<'a> Interp<'a> {
         let Some(nt) = native_new_target.as_handle().map(Handle::from_raw) else {
             return Ok(default);
         };
-        // A class newTarget's prototype is a synthesized (non-accessor) object.
-        if let Some((class_id, _)) = self.realm.class_at(nt) {
-            return Ok(Some(self.class_prototype_by_id(class_id)));
-        }
         let proto = self.read_constructor_prototype(nt)?;
         if self.is_object_value(proto) {
             return Ok(proto.as_handle().map(Handle::from_raw));
@@ -2611,13 +1835,6 @@ impl<'a> Interp<'a> {
         }
         if let Some(idx) = self.fn_realm.get(&f.to_raw()).copied() {
             return Some(idx);
-        }
-        // A *class* value is never entered into `fn_realm` (only functions are), so
-        // fall back to the realm its captured scope roots at — otherwise a class
-        // defined in another realm reports the main realm and its errors are built
-        // from the wrong intrinsics.
-        if let Some((_, env)) = self.realm.class_at(f) {
-            return self.realm_of_scope(&env);
         }
         None
     }
@@ -2784,39 +2001,6 @@ impl<'a> Interp<'a> {
             .map(Handle::from_raw)
     }
 
-    /// Builds the cell-bearing base instance for a class that `extends` a native
-    /// (`class S extends Map {}` → a real `Map` cell). Runs the native constructor
-    /// (resolved from `root_id`) with `args` and `new.target` = the subclass
-    /// (`class_handle`), so the resulting cell carries the native internal slots and
-    /// its `[[Prototype]]` is the subclass's `.prototype` (via the `newTarget` path
-    /// in `construct`). The returned handle becomes the derived instance.
-    pub(crate) fn construct_native_base(
-        &mut self,
-        root_id: u16,
-        args: &[NanBox],
-        class_handle: NanBox,
-    ) -> Result<Handle, ExecError> {
-        // The namespace-object constructors (`Array`/`Object`) carry sentinel ids;
-        // every other base resolves to its callable native constructor.
-        let ctor = self
-            .native_ctor_by_id(root_id)
-            .map(|h| NanBox::handle(h.to_raw()))
-            .ok_or(ExecError::Unsupported(
-                "native superclass constructor not found",
-            ))?;
-        // `new.target` for the base construction is the subclass.
-        let saved = self.reflect_new_target.replace(class_handle);
-        let result = self.construct(ctor, args);
-        self.reflect_new_target = saved;
-        let value = result?;
-        value
-            .as_handle()
-            .map(Handle::from_raw)
-            .ok_or(ExecError::Unsupported(
-                "native superclass produced a non-object",
-            ))
-    }
-
     /// `new Callee(args)` — supports the built-in `Map`/`Set` constructors
     /// (optionally seeded from an iterable argument).
     pub(crate) fn construct(
@@ -2842,11 +2026,7 @@ impl<'a> Interp<'a> {
             && callee_h.is_some_and(|h| self.realm.is_vm_function(h))
         {
             // `new.target`: a `Reflect.construct`/`super()` one, else the callee.
-            let new_target = self
-                .reflect_new_target
-                .take()
-                .or_else(|| self.pending_new_target.take())
-                .unwrap_or(callee);
+            let new_target = self.reflect_new_target.take().unwrap_or(callee);
             return crate::nbvm::construct_vm_function(self, &table, callee, args, new_target)
                 .map_err(super::vm_to_exec);
         }
@@ -2859,28 +2039,10 @@ impl<'a> Interp<'a> {
         } else {
             callee_h.and_then(|h| self.get_function_realm(h))
         };
-        // `[[Construct]]`'s post-body steps run after the callee context is removed,
-        // so remember which realm issued this construction (see
-        // `Interp::construct_caller_realm`).
-        let caller_realm = self.cur_realm;
         let guard = self.enter_realm(realm);
-        let saved_caller = core::mem::replace(&mut self.construct_caller_realm, caller_realm);
         let r = self.construct_inner(callee, args);
-        self.construct_caller_realm = saved_caller;
         self.leave_realm(guard);
         r
-    }
-
-    /// Builds an error as `[[Construct]]`'s post-body steps would: in the realm of
-    /// the execution context that issued the construction. See
-    /// [`Interp::construct_caller_realm`].
-    pub(crate) fn construct_caller_error(&mut self, id: u16, message: &str) -> ExecError {
-        let realm = self.construct_caller_realm;
-        let guard = self.enter_realm(realm);
-        let m = self.new_str(message);
-        let e = ExecError::Throw(self.make_error(id, Some(m)));
-        self.leave_realm(guard);
-        e
     }
 
     fn construct_inner(&mut self, callee: NanBox, args: &[NanBox]) -> Result<NanBox, ExecError> {
@@ -2943,78 +2105,6 @@ impl<'a> Interp<'a> {
                 self.reflect_new_target = Some(target);
             }
             return self.construct(target, &all);
-        }
-        // `new UserClass(...)`.
-        if let Some((class_id, env)) = self.realm.class_at(handle) {
-            // `new.target` inside the class constructor is the class itself.
-            self.pending_new_target = Some(self.reflect_new_target.take().unwrap_or(callee));
-            // `instance.constructor` is inherited from `TheClass.prototype`'s
-            // `constructor` back-link (installed by `class_prototype`) — the
-            // instance gets no *own* `constructor` (per spec, and so a computed
-            // `["constructor"]() {}` method on the prototype is what is read).
-            return self.instantiate(class_id, &env, args);
-        }
-        // `new constructorFunction(...)`: bind a fresh object as `this`, run the
-        // body, and return it — unless the function explicitly returned an object
-        // (the spec's constructor return rule).
-        if let Some((func_id, _)) = self.realm.function_at(handle) {
-            // Arrow / generator / async functions, and concise methods / accessors
-            // (object `{m(){}}`/`get`/`set`, flagged `is_method`) and class methods
-            // (which carry a `home_class`) are not constructors.
-            let def = self.functions[func_id as usize];
-            if def.is_arrow
-                || def.is_generator
-                || def.is_async
-                || def.is_method
-                || def.home_class.is_some()
-            {
-                let m = self.new_str("is not a constructor");
-                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-            }
-            // The instance's `[[Prototype]]` is the *newTarget*'s `.prototype`
-            // (the callee's, except under `Reflect.construct(target, args, newTarget)`
-            // with a function newTarget), so inherited methods resolve correctly.
-            // `reflect_new_target` is a one-shot: *take* it up front so a nested
-            // construction inside the `prototype` getter (e.g. `throw new Err()`)
-            // does not re-observe this construction's newTarget and recurse.
-            let new_target = self.reflect_new_target.take().unwrap_or(callee);
-            // GetPrototypeFromConstructor(newTarget, %Object.prototype%): the
-            // intrinsic default proto for an ordinary function's `[[Construct]]` is
-            // always `%Object.prototype%` (spec 10.2.2 / 27.7.5 OrdinaryCallEvaluate
-            // → OrdinaryCreateFromConstructor). `get_proto_from_constructor` reads
-            // `Get(newTarget, "prototype")` directly and uses it when it is an
-            // Object; when it is not (a `.prototype` reassigned to `null`/a
-            // primitive, even for a plain `new C()`), it falls back to
-            // `%Object.prototype%` — of newTarget's *own realm* for a cross-realm
-            // newTarget (e.g. `Reflect.construct(fn, [], otherRealmCtor)` or
-            // `Construct(C)` where `C` is another realm's function).
-            let obj_default = self.realm.default_object_proto();
-            let fallback = obj_default.unwrap_or_else(|| self.realm.function_prototype(func_id));
-            let nt_handle = new_target
-                .as_handle()
-                .map(Handle::from_raw)
-                .unwrap_or(handle);
-            let proto = self
-                .get_proto_from_constructor(nt_handle, obj_default)?
-                .unwrap_or(fallback);
-            let instance = self.realm.new_object_with_proto(Some(proto));
-            let this = NanBox::handle(instance.to_raw());
-            // Record the constructor for `instanceof` (hidden, GC-traced slot).
-            self.realm.set_hidden_property(instance, CTOR_KEY, callee);
-            // `new.target` inside the constructor body is the constructor itself.
-            self.pending_new_target = Some(new_target);
-            let ret = self.call_with_this(callee, this, args)?;
-            // The constructor return rule: if the body returns an Object, that
-            // object is the result; otherwise the freshly-bound `this`. The object
-            // forms recognized are plain objects, arrays, and exotic
-            // slot-bearing objects (typed arrays, DataViews, ArrayBuffers, Maps,
-            // …) — so a constructor (or `Symbol.species`) that hands back a typed
-            // array is honored — as is a returned *function* (functions are objects,
-            // so `new (function(){ return f; })` yields `f`, per ECMA-262 10.2.2).
-            if self.is_object_value(ret) {
-                return Ok(ret);
-            }
-            return Ok(this);
         }
         // `new Object(value)` — Object is a namespace object (matched by native id,
         // so a cross-realm `Object` is also handled). With no/`null`/`undefined`
@@ -3731,14 +2821,11 @@ impl<'a> Interp<'a> {
                 .filter(|_| native_new_target.as_handle() != callee.as_handle())
                 .map(Handle::from_raw)
             {
-                let p = if let Some((class_id, _)) = self.realm.class_at(nt) {
-                    Some(self.class_prototype_by_id(class_id))
-                } else {
-                    let pv = self.read_member(nt, "prototype")?;
-                    pv.as_handle()
-                        .map(Handle::from_raw)
-                        .filter(|_| self.is_object_value(pv))
-                };
+                let pv = self.read_member(nt, "prototype")?;
+                let p = pv
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .filter(|_| self.is_object_value(pv));
                 // Non-object `prototype` → `%SharedArrayBuffer.prototype%` from the
                 // newTarget's realm (GetPrototypeFromConstructor step 4).
                 match p {
@@ -4291,18 +3378,14 @@ impl<'a> Interp<'a> {
             // `newTarget`'s realm. `%Iterator.prototype%.constructor` is an accessor,
             // so `realm_default_proto`'s name-via-`constructor` lookup cannot resolve
             // it — resolve by the known global name "Iterator" directly.
-            let proto = if let Some((class_id, _)) = self.realm.class_at(nt) {
-                Some(self.class_prototype_by_id(class_id))
+            let p = self.read_constructor_prototype(nt)?;
+            let proto = if self.is_object_value(p) {
+                p.as_handle().map(Handle::from_raw)
             } else {
-                let p = self.read_constructor_prototype(nt)?;
-                if self.is_object_value(p) {
-                    p.as_handle().map(Handle::from_raw)
-                } else {
-                    // Step 4 goes through `GetFunctionRealm(newTarget)`, which
-                    // throws when the chain reaches a revoked proxy.
-                    self.guard_function_realm(nt)?;
-                    self.realm_named_proto("Iterator", default, nt)
-                }
+                // Step 4 goes through `GetFunctionRealm(newTarget)`, which
+                // throws when the chain reaches a revoked proxy.
+                self.guard_function_realm(nt)?;
+                self.realm_named_proto("Iterator", default, nt)
             };
             let obj = self.realm.new_object_with_proto(proto.or(default));
             return Ok(NanBox::handle(obj.to_raw()));
@@ -4392,280 +3475,6 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(NanBox::handle(handle.to_raw()))
-    }
-
-    /// Builds an error object `{ name, message }` for the constructor `id`.
-    /// Applies a native superclass constructor's effect to `instance` for
-    /// `super(...)` in a class that `extends` a native (e.g. `extends Error`).
-    pub(crate) fn apply_native_super(
-        &mut self,
-        native_id: u16,
-        instance: Handle,
-        args: &[NanBox],
-    ) -> Result<(), ExecError> {
-        // A *cell-bearing* native base (Map/Set/typed array/Date/RegExp/wrapper/
-        // ArrayBuffer/DataView/Array/Temporal): `instance` is the placeholder
-        // ordinary object threaded as `this`. Build the real native cell **from
-        // the `super(...)` arguments** with `new.target` for its prototype
-        // (`GetPrototypeFromConstructor`), then transplant it into `instance` so
-        // the shared `this` handle becomes that native — seeded by the arguments
-        // actually passed to `super(...)`, not the derived constructor's outer
-        // arguments. The instance's own class tag (set at allocation) is
-        // re-applied after the transplant since the fresh cell carries none.
-        if Self::native_base_is_cell(native_id) {
-            let saved_tag = self.realm.class_tag(instance);
-            let fresh = self.construct_native_base(native_id, args, self.new_target)?;
-            self.realm.swap_cell_state(instance, fresh);
-            if let Some(tag) = saved_tag {
-                self.realm.set_class_tag(instance, tag);
-            }
-            return Ok(());
-        }
-        // `class F extends Function {}` (or the `%GeneratorFunction%` /
-        // `%AsyncFunction%` / `%AsyncGeneratorFunction%` families): `super(...args)`
-        // runs the dynamic-function constructor over the `super` arguments (the last
-        // is the body, the rest the parameter list) with `new.target` for the built
-        // function's `[[Prototype]]`, then transplants the resulting callable cell
-        // into the placeholder `instance` so the shared `this` handle *becomes* a
-        // real function — callable, with its own `.prototype`, `name`, and `length`
-        // — while keeping its identity and class tag (analogous to the cell-native
-        // path above, but the "cell" here is a function).
-        if matches!(
-            native_id,
-            N_FUNCTION
-                | N_GENERATOR_FUNCTION_CTOR
-                | N_ASYNC_FUNCTION_CTOR
-                | N_ASYNC_GENERATOR_FUNCTION_CTOR
-        ) {
-            let saved_tag = self.realm.class_tag(instance);
-            let new_target = self.new_target;
-            let fresh = match native_id {
-                N_FUNCTION => {
-                    self.build_function_constructor(args, new_target, NanBox::undefined())
-                }
-                N_GENERATOR_FUNCTION_CTOR => self.build_function_constructor_kw(
-                    args,
-                    "function*",
-                    new_target,
-                    NanBox::undefined(),
-                ),
-                N_ASYNC_FUNCTION_CTOR => self.build_function_constructor_kw(
-                    args,
-                    "async function",
-                    new_target,
-                    NanBox::undefined(),
-                ),
-                _ => self.build_function_constructor_kw(
-                    args,
-                    "async function*",
-                    new_target,
-                    NanBox::undefined(),
-                ),
-            }?;
-            if let Some(fresh_h) = fresh.as_handle().map(Handle::from_raw) {
-                self.realm.swap_cell_state(instance, fresh_h);
-            }
-            if let Some(tag) = saved_tag {
-                self.realm.set_class_tag(instance, tag);
-            }
-            return Ok(());
-        }
-        // `class S extends DisposableStack {}` (or the async variant): `super()`
-        // stamps the internal-slot brand + an empty disposer list and
-        // `disposed = false` onto the (already-allocated, class-proto-linked)
-        // instance object — the analog of the native `construct_*` initialization.
-        if native_id == N_DISPOSABLE_STACK || native_id == N_ASYNC_DISPOSABLE_STACK {
-            self.init_disposable_stack_super(native_id == N_ASYNC_DISPOSABLE_STACK, instance);
-            return Ok(());
-        }
-        // `class S extends ShadowRealm {}`: brand + allocate the persistent scope.
-        if native_id == N_SHADOW_REALM {
-            self.init_shadow_realm_super(instance);
-            return Ok(());
-        }
-        // `class S extends Intl.<Service> {}`: `super()` initializes the service's
-        // internal slots on the (already subclass-proto-linked) instance, so its
-        // methods resolve. The `init_*` helpers re-brand the object to the service
-        // prototype, so save and restore the subclass prototype around them.
-        let intl_init: bool = matches!(
-            native_id,
-            N_INTL_NUMBER_FORMAT
-                | N_INTL_DATETIME_FORMAT
-                | N_INTL_COLLATOR
-                | N_INTL_PLURAL_RULES
-                | N_INTL_LIST_FORMAT
-                | N_INTL_REL_TIME
-                | N_INTL_SEGMENTER
-                | N_INTL_LOCALE
-        );
-        if intl_init {
-            let subclass_proto = self.realm.object_proto(instance);
-            match native_id {
-                N_INTL_NUMBER_FORMAT | N_INTL_DATETIME_FORMAT => {
-                    self.init_intl_formatter_state(instance, native_id, args)?;
-                }
-                N_INTL_COLLATOR => self.init_collator(instance, args)?,
-                N_INTL_PLURAL_RULES => self.init_plural_rules(instance, args)?,
-                N_INTL_LIST_FORMAT => self.init_list_format(instance, args)?,
-                N_INTL_REL_TIME => self.init_relative_time_format(instance, args)?,
-                N_INTL_SEGMENTER => self.init_segmenter(instance, args)?,
-                N_INTL_LOCALE => self.init_locale(instance, args)?,
-                _ => unreachable!(),
-            }
-            if let Some(p) = subclass_proto {
-                self.realm.set_object_proto(instance, Some(p));
-            }
-            return Ok(());
-        }
-        // `Symbol` and `BigInt` are callable but have no `[[Construct]]`: extending
-        // them is allowed, but `new Subclass()` runs `super()` into a non-existent
-        // constructor — a TypeError (`Symbol is not a constructor`).
-        if native_id == N_SYMBOL {
-            return Err(self.type_error("Symbol is not a constructor"));
-        }
-        if native_id == N_BIGINT {
-            return Err(self.type_error("BigInt is not a constructor"));
-        }
-        // `class W extends WeakRef {}`: `super(target)` validates the (weakly
-        // holdable) target and stamps the internal slot onto the (class-proto-
-        // linked) instance, so `deref()` and the brand check resolve.
-        if native_id == N_WEAKREF {
-            let target = args.first().copied().unwrap_or(NanBox::undefined());
-            if !self.can_be_held_weakly(target) {
-                return Err(
-                    self.type_error("WeakRef: target must be an object or a non-registered symbol")
-                );
-            }
-            self.realm
-                .set_hidden_property(instance, WEAKREF_TARGET, target);
-            return Ok(());
-        }
-        // `class F extends FinalizationRegistry {}`: `super(cleanupCallback)`
-        // validates the callback and brands the instance with an empty cell list.
-        if native_id == N_FINALIZATION_REGISTRY {
-            let cb = args.first().copied().unwrap_or(NanBox::undefined());
-            if !cb
-                .as_handle()
-                .map(Handle::from_raw)
-                .is_some_and(|h| self.is_callable(h))
-            {
-                return Err(
-                    self.type_error("FinalizationRegistry: cleanup callback must be callable")
-                );
-            }
-            self.realm
-                .set_hidden_property(instance, FINREG_TAG, NanBox::boolean(true));
-            let cells = self.realm.new_array(Vec::new());
-            self.realm
-                .set_hidden_property(instance, FINREG_CELLS, NanBox::handle(cells.to_raw()));
-            return Ok(());
-        }
-        // `class S extends SuppressedError {}`: apply error/suppressed/message.
-        if native_id == N_SUPPRESSED_ERROR {
-            self.init_suppressed_error_super(instance, args);
-            return Ok(());
-        }
-        // `class P extends Promise {}`: `super(executor)` initializes the promise
-        // machinery on the (already class-proto-linked) instance. The instance is
-        // an ordinary object, so it can't hold the `Rc<PromiseState>` directly —
-        // back it with a fresh `Cell::Promise` stored in a hidden `[[PromiseState]]`
-        // slot that `Realm::promise_state` follows, then bind resolve/reject to the
-        // backing cell and run the executor (a throw rejects, per the spec).
-        if native_id == N_PROMISE {
-            let executor = args.first().copied().unwrap_or(NanBox::undefined());
-            if !self.is_callable_value(executor) {
-                return Err(self.type_error("Promise executor is not a function"));
-            }
-            let backing = self.fresh_promise();
-            self.realm.set_hidden_property(
-                instance,
-                crate::realm::PROMISE_STATE_SLOT,
-                NanBox::handle(backing.to_raw()),
-            );
-            let resolve = self.realm.new_bound_native(N_RESOLVE, backing);
-            let reject = self.realm.new_bound_native(N_REJECT, backing);
-            self.install_fn_name_length(resolve, "", 1);
-            self.install_fn_name_length(reject, "", 1);
-            let r = self.call(
-                executor,
-                &[
-                    NanBox::handle(resolve.to_raw()),
-                    NanBox::handle(reject.to_raw()),
-                ],
-            );
-            if let Err(ExecError::Throw(e)) = r {
-                // As in the base `Promise` constructor: a throw *after* `resolve(...)`
-                // is ignored ([[AlreadyResolved]] committed), so it does not reject an
-                // already-resolved subclass promise.
-                let already = self
-                    .realm
-                    .promise_state(backing)
-                    .is_some_and(|st| st.borrow().already_resolved);
-                if !already {
-                    self.settle(backing, e, false);
-                }
-            } else {
-                r?;
-            }
-            return Ok(());
-        }
-        // Error family: set `message` and the default `name` (a `this.name = …`
-        // after `super()` may override it).
-        if (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&native_id) {
-            // A subclass `super()` into an Error base inherits `[[ErrorData]]`:
-            // stamp the brand onto the (class-proto-linked) instance.
-            self.realm
-                .set_hidden_property(instance, ERROR_DATA, NanBox::boolean(true));
-            let name = ERROR_NAMES[(native_id - N_ERROR_BASE) as usize];
-            let name_v = self.new_str(name);
-            self.realm.set_property(instance, "name", name_v);
-            // `AggregateError(errors, message, options)` takes its message *second*
-            // and exposes an own `.errors` array drained from the first argument;
-            // every other error takes `(message, options)`.
-            let is_aggregate = native_id == N_ERROR_BASE + 5;
-            let (msg_arg, opts_arg) = if is_aggregate {
-                (args.get(1).copied(), args.get(2))
-            } else {
-                (args.first().copied(), args.get(1))
-            };
-            if is_aggregate {
-                let errors = args.first().copied().unwrap_or(NanBox::undefined());
-                let list = self.iterate_values(errors)?;
-                let arr = self.realm.new_array(list);
-                self.realm
-                    .set_property(instance, "errors", NanBox::handle(arr.to_raw()));
-                self.realm.mark_hidden(instance, "errors");
-            }
-            // Per the NativeError/Error constructor: an own `message` property is
-            // created ONLY when the `message` argument is not `undefined`. When it
-            // is omitted, no own `message` is installed — reads fall through to
-            // `%Error.prototype%.message` (`""`), and `hasOwnProperty("message")`
-            // is `false`.
-            if let Some(m) = msg_arg
-                && !matches!(m.unpack(), Unpacked::Undefined)
-            {
-                let s = self.realm.to_display_string(m);
-                let msg = self.new_str(&s);
-                self.realm.set_property(instance, "message", msg);
-                self.realm.mark_hidden(instance, "message");
-            }
-            // `name` is non-enumerable (out of `Object.keys`/JSON).
-            self.realm.mark_hidden(instance, "name");
-            // ES2022 `cause`: `new Error(msg, { cause })` installs a non-enumerable
-            // `cause` when the options argument has such a property (even if undefined).
-            if let Some(opts) = opts_arg
-                && let Some(raw) = opts.as_handle()
-                && self.realm.has_own(Handle::from_raw(raw), "cause")
-            {
-                let cause = self
-                    .realm
-                    .get_property(Handle::from_raw(raw), "cause")
-                    .unwrap_or(NanBox::undefined());
-                self.realm.set_property(instance, "cause", cause);
-                self.realm.mark_hidden(instance, "cause");
-            }
-        }
-        Ok(())
     }
 
     /// Sorts `elems` with a JS comparator (a negative result orders `a` before
@@ -4818,45 +3627,5 @@ impl<'a> Interp<'a> {
     }
 }
 
-/// ECMAScript `ContainsExpression` for a formal parameter list: whether any
-/// parameter has a default initializer or a computed property key in a
-/// destructuring pattern. When true, a function's body runs in a variable
-/// environment distinct from its parameter environment (FunctionDeclaration-
-/// Instantiation), so a parameter-default closure and a body `var` of the same
-/// name are independent.
-fn params_contain_expression(params: &[crate::ast::Param]) -> bool {
-    params
-        .iter()
-        .any(|p| p.default.is_some() || target_contains_expression(&p.target))
-}
-
-/// `ContainsExpression` for a single binding target (recurses through nested
-/// array/object destructuring patterns).
-fn target_contains_expression(target: &crate::ast::BindingTarget) -> bool {
-    use crate::ast::{ArrayPatternElement, BindingTarget, PropertyKey};
-    match target {
-        BindingTarget::Ident(_) => false,
-        BindingTarget::Array(arr) => arr.elements.iter().any(|el| match el {
-            ArrayPatternElement::Hole => false,
-            ArrayPatternElement::Item {
-                target, default, ..
-            } => default.is_some() || target_contains_expression(target),
-            ArrayPatternElement::Rest { target, .. } => target_contains_expression(target),
-        }),
-        BindingTarget::Object(obj) => {
-            obj.properties.iter().any(|p| {
-                p.default.is_some()
-                    || matches!(p.key, PropertyKey::Computed(_))
-                    || target_contains_expression(&p.value)
-            }) || obj
-                .rest
-                .as_ref()
-                .is_some_and(|r| target_contains_expression(r))
-        }
-    }
-}
-
-/// A home-object slot as a publishable GC root (`undefined` when unset).
-fn home_object_value(home: Option<Handle>) -> NanBox {
-    home.map_or(NanBox::undefined(), |h| NanBox::handle(h.to_raw()))
-}
+// --- native superclasses (`class extends <built-in>`) ---
+impl Interp {}

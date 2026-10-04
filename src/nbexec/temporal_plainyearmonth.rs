@@ -313,7 +313,7 @@ fn negate_round_mode(m: RoundMode) -> RoundMode {
 // Engine logic
 // ---------------------------------------------------------------------------
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// A `RangeError` throw with `msg`.
     fn pym_range(&mut self, msg: &str) -> ExecError {
         let m = self.new_str(msg);

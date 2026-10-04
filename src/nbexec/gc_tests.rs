@@ -1,5 +1,6 @@
-//! End-to-end tests for the tree-walker's GC safepoint (see the [`gc`](super::gc)
-//! module).
+//! End-to-end tests for garbage collection inside hosted bytecode-VM runs (the
+//! VM's safepoints root its frames; the interpreter's state is rooted by
+//! [`gc`](super::gc)).
 //!
 //! Each one builds a deliberately awkward live set — a reference cycle, a
 //! `WeakMap` value reachable only through a live key, a suspended generator, a
@@ -14,7 +15,7 @@ use crate::parser::Parser;
 use alloc::format;
 use alloc::string::String;
 
-/// Runs `src` through the tree-walker and renders its completion value.
+/// Runs `src` on the hosted VM and renders its completion value.
 fn run(src: &str) -> String {
     run_with_live(src).0
 }
@@ -23,7 +24,7 @@ fn run(src: &str) -> String {
 fn run_with_live(src: &str) -> (String, usize) {
     let program = Parser::parse_program(src).expect("parse");
     let mut interp = Interp::new();
-    let value = interp.run_tree_walk(&program).expect("exec");
+    let value = interp.run(&program).expect("exec");
     let text = interp.realm().to_display_string(value);
     (text, interp.realm().object_count())
 }
@@ -36,8 +37,10 @@ const CHURN: &str = "for (var _i = 0; _i < 400000; _i++) { var _t = { k: _i }; }
 fn top_level_churn_is_reclaimed_not_retained() {
     let (v, live) = run_with_live(&format!("{CHURN} 'done'"));
     assert_eq!(v, "done");
+    // The collector triggers every ~65k allocations (`GC_MIN_THRESHOLD`), so at
+    // most that much garbage is live at the end — never the 400k the loop made.
     assert!(
-        live < 20_000,
+        live < 100_000,
         "top-level garbage was retained: {live} live objects"
     );
 }

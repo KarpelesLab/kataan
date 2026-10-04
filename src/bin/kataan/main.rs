@@ -251,7 +251,7 @@ fn run_host(source: &str, origin: &str) -> ExitCode {
     // Leak the AST so its `&'static` borrow outlives values kept in globals
     // (timer callbacks pinned across the event loop).
     let program: &'static kataan::ast::Program = Box::leak(Box::new(program));
-    let mut interp: kataan::nbexec::Interp<'static> = kataan::nbexec::Interp::new();
+    let mut interp: kataan::nbexec::Interp = kataan::nbexec::Interp::new();
     kataan::host::timers::install(&mut interp);
 
     let completion = match interp.run(program) {
@@ -284,7 +284,7 @@ fn run_host(source: &str, origin: &str) -> ExitCode {
 fn run_repl() -> ExitCode {
     use std::io::{self, BufRead, Write};
 
-    let mut interp: kataan::nbexec::Interp<'static> = kataan::nbexec::Interp::new();
+    let mut interp: kataan::nbexec::Interp = kataan::nbexec::Interp::new();
     println!(
         "kataan {} REPL — type JavaScript, Ctrl-D to exit",
         kataan::VERSION

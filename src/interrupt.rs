@@ -34,8 +34,9 @@
 //!
 //! # Deliberately not catchable
 //!
-//! An interrupt unwinds as a non-throw abrupt completion, like
-//! `ExecError::OptShortCircuit`. If it surfaced as a normal exception, then
+//! An interrupt unwinds as a non-throw abrupt completion
+//! (`VmError::Interrupted` / `ExecError::Interrupted`). If it surfaced as a
+//! normal exception, then
 //!
 //! ```js
 //! while (true) { try { } catch (e) { /* swallow */ } }

@@ -39,7 +39,7 @@ struct MonthCode {
     leap: bool,
 }
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// `new Temporal.PlainMonthDay(...)`.
     pub(crate) fn plainmonthday_construct(
         &mut self,

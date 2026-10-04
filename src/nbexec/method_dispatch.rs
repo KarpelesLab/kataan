@@ -4,7 +4,7 @@ use super::*;
 // `parseFloat` and `StringToBigInt`.
 use crate::realm::is_js_whitespace;
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// `Function.prototype.toString` source-representation for the callable
     /// `handle`: `class <Name> { }` for a class, else NativeFunction syntax
     /// (`function <name>() { [native code] }` — the engine retains no source).
@@ -26,15 +26,10 @@ impl<'a> Interp<'a> {
         }
         let nm = self.read_member(handle, "name")?;
         let nm = self.realm.to_display_string(nm);
-        // A class with no retained source (e.g. a native/subclassed intrinsic)
-        // still uses the `class …` form; a Proxy or ordinary function uses the
+        // A Proxy, or a function without retained source, uses the
         // NativeFunction form.
-        Ok(if self.realm.class_at(handle).is_some() {
-            alloc::format!("class {nm} {{ }}")
-        } else {
-            let seg = crate::realm::native_fn_name_segment(&nm);
-            alloc::format!("function {seg}() {{ [native code] }}")
-        })
+        let seg = crate::realm::native_fn_name_segment(&nm);
+        Ok(alloc::format!("function {seg}() {{ [native code] }}"))
     }
 
     /// Dispatches a built-in method on a string/array receiver. Returns
@@ -672,8 +667,8 @@ impl<'a> Interp<'a> {
         }
 
         // --- `Function.prototype.call`/`apply`/`bind` on a callable receiver ---
-        // `call`/`apply`/`bind` work on any constructor, including a class.
-        if self.is_callable(handle) || self.realm.class_at(handle).is_some() {
+        // `call`/`apply`/`bind` work on any callable, including a class.
+        if self.is_callable(handle) {
             match method {
                 "call" => {
                     let this = arg(0);
@@ -4517,29 +4512,6 @@ impl<'a> Interp<'a> {
                     let arr = callback_recv;
                     let typed = self.realm.typed_kind(handle).is_some();
                     let live = !typed && self.realm.is_array(handle);
-                    // `forEach` over a real array / typed array is an *audited*
-                    // native (see the `gc` module): everything this frame and the
-                    // dispatch frames above it hold — callback, `thisArg`, the
-                    // receiver (original and materialized), the element snapshot —
-                    // is published, and each callback invocation carries the audit
-                    // token, so the callback body may collect. A primitive or
-                    // generic array-like receiver is boxed / materialized in frames
-                    // this arm cannot see, so it stays fenced.
-                    let audit = typed || self.realm.is_array(species_recv);
-                    let mark = if audit {
-                        let mut published: Vec<NanBox> = Vec::with_capacity(elems.len() + 5);
-                        published.extend([
-                            f,
-                            this_arg,
-                            arr,
-                            NanBox::handle(handle.to_raw()),
-                            NanBox::handle(species_recv.to_raw()),
-                        ]);
-                        published.extend_from_slice(&elems);
-                        self.gc_root(&published)
-                    } else {
-                        super::gc::NO_MARK
-                    };
                     // A typed array / real array re-reads each element live by index
                     // (a callback mutation is observed); a materialized generic
                     // array-like reads its snapshot. Holes are skipped.
@@ -4565,15 +4537,11 @@ impl<'a> Interp<'a> {
                             }
                         };
                         let cb_args = [e, NanBox::number(i as f64), arr];
-                        if audit {
-                            self.gc_audit_call = Some((cb_args.as_ptr() as usize, cb_args.len()));
-                        }
                         if let Err(err) = self.call_with_this(f, this_arg, &cb_args) {
                             failed = Some(err);
                             break;
                         }
                     }
-                    self.gc_unroot(mark);
                     if let Some(err) = failed {
                         return Err(err);
                     }
@@ -7181,5 +7149,43 @@ impl<'a> Interp<'a> {
         out.extend_from_slice(tag.as_bytes());
         out.push(b'>');
         Ok(self.new_str_bytes(out))
+    }
+}
+
+// --- `Array.prototype.flat` ---
+impl Interp {
+    /// Recursively flattens nested arrays up to `depth` levels (for `flat`).
+    /// `rec` is the current recursion depth; nesting past
+    /// `limits.max_display_depth` throws rather than overflowing the host stack
+    /// (`flat(Infinity)` on a pathologically deep array).
+    pub(crate) fn flatten(
+        &mut self,
+        elems: &[NanBox],
+        depth: i32,
+        rec: usize,
+    ) -> Result<Vec<NanBox>, ExecError> {
+        if rec >= self.realm.limits.max_display_depth {
+            let m = self.new_str("Maximum call stack size exceeded");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        let mut out = Vec::new();
+        for e in elems {
+            // FlattenIntoArray only processes *present* elements: a hole
+            // (`HasProperty` false) is skipped, so the flattened result is dense.
+            if e.is_hole() {
+                continue;
+            }
+            if depth > 0
+                && let Some(inner) = e
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|h| self.realm.array_elements(h).map(<[_]>::to_vec))
+            {
+                out.extend(self.flatten(&inner, depth - 1, rec + 1)?);
+            } else {
+                out.push(*e);
+            }
+        }
+        Ok(out)
     }
 }

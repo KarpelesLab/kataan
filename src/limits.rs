@@ -21,7 +21,8 @@
 
 /// Default maximum JS-level call/recursion depth before a `RangeError`.
 pub const DEFAULT_MAX_CALL_DEPTH: usize = 3500;
-/// Default maximum *tree-walk* eval/exec recursion depth before a `RangeError`.
+/// Default maximum nesting of `eval` (and `$262.evalScript`) bodies before a
+/// `RangeError`.
 ///
 /// The `nbexec` interpreter descends the native stack once per nested
 /// expression/statement, and each level consumes far more native stack than a
@@ -117,12 +118,10 @@ impl Default for WasmLimits {
 pub struct Limits {
     /// Maximum JS call/recursion depth before a `RangeError` (live).
     pub max_call_depth: usize,
-    /// Maximum tree-walk `eval`/`exec` recursion depth before a `RangeError`
-    /// (live). Bounds how deeply the `nbexec` interpreter may recurse on the
-    /// native stack for nested expressions/statements. Kept separate from (and
-    /// below) [`Self::max_call_depth`] because each tree-walk level consumes
-    /// much more native stack than a bytecode call frame, so the JS call-depth
-    /// cap is too high to protect a small host stack on this path.
+    /// Maximum nesting of `eval` / `$262.evalScript` bodies before a
+    /// `RangeError` (live). Each level parses, compiles and enters a nested VM
+    /// run on the native stack, far more than a bytecode call frame, so it is
+    /// kept separate from (and below) [`Self::max_call_depth`].
     pub max_eval_depth: usize,
     /// Maximum try/catch handler-stack depth (live).
     pub max_handler_depth: usize,

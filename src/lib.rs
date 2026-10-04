@@ -159,15 +159,8 @@ pub mod bytecode;
 #[cfg(feature = "alloc")]
 pub mod bignum;
 
-/// Evaluates the real parser AST (the expression subset) over the
-/// `Realm`/`NanBox` model — the front-end → new-representation bridge. Needs
-/// `alloc`.
-#[cfg(feature = "alloc")]
-pub mod nbeval;
-
-/// Executes real statements (variables, scope, control flow, assignment) over
-/// the `Realm`/`NanBox` model — the imperative core on the new representation.
-/// Needs `alloc`.
+/// The interpreter: the realm, built-ins, natives and host services (job
+/// queues, modules, realms, agents) the bytecode VM runs in. Needs `alloc`.
 #[cfg(feature = "alloc")]
 pub mod nbexec;
 

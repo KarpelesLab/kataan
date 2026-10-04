@@ -28,7 +28,6 @@ fn interp_run_executes_on_the_vm() {
         ))
         .expect("run");
     assert_eq!(interp.display(v), "63");
-    assert_eq!(interp.tree_walked(), 0);
 }
 
 #[test]
@@ -55,7 +54,6 @@ fn sequential_runs_share_globals_and_closures() {
         let v = interp.run(leak(src)).expect(src);
         assert_eq!(interp.display(v), want, "{src}");
     }
-    assert_eq!(interp.tree_walked(), 0);
 }
 
 #[test]
@@ -68,7 +66,6 @@ fn a_later_run_sees_an_earlier_runs_lexical_bindings() {
     assert!(interp.run(leak("let a = 5;")).is_err());
     let v = interp.run(leak("a")).expect("still there");
     assert_eq!(interp.display(v), "3");
-    assert_eq!(interp.tree_walked(), 0);
 }
 
 #[test]
@@ -82,7 +79,6 @@ fn an_uncaught_throw_does_not_poison_later_runs() {
         .run(leak("try { f() } catch (e) { e.message }"))
         .expect("run");
     assert_eq!(interp.display(v), "x");
-    assert_eq!(interp.tree_walked(), 0);
 }
 
 #[test]
@@ -103,14 +99,12 @@ fn host_functions_and_promises_on_the_vm() {
     // The event loop ran to quiescence inside `run`.
     let v = interp.run(leak("log.join()")).expect("read");
     assert_eq!(interp.display(v), "5,2");
-    assert_eq!(interp.tree_walked(), 0);
 }
 
 #[test]
 fn host_runtime_timers_call_vm_closures() {
     let mut interp = Interp::new();
     kataan::host::timers::install(&mut interp);
-    let walked = interp.tree_walked();
     interp
         .run(leak(
             "let order = [];\n\
@@ -127,7 +121,6 @@ fn host_runtime_timers_call_vm_closures() {
         interp.output()
     );
     assert!(interp.output().contains("timeout"));
-    assert_eq!(interp.tree_walked(), walked);
 }
 
 #[test]
@@ -160,7 +153,6 @@ fn huge_literal_tables_compile() {
     let mut interp = Interp::new();
     let v = interp.run(leak(&src)).expect("run");
     assert_eq!(interp.display(v), "70000:69999");
-    assert_eq!(interp.tree_walked(), 0);
 }
 
 #[test]
@@ -175,7 +167,6 @@ fn labelled_function_declarations_run_on_the_vm() {
         ))
         .expect("run");
     assert_eq!(interp.display(v), "6");
-    assert_eq!(interp.tree_walked(), 0);
 }
 
 #[test]
@@ -216,5 +207,4 @@ fn every_function_user_code_obtains_is_a_vm_function() {
             "function #{i} is not a VM function"
         );
     }
-    assert_eq!(interp.tree_walked(), 0);
 }

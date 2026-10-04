@@ -200,7 +200,7 @@ fn parse_month_code(s: &str) -> Option<(i64, bool)> {
     ))
 }
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// `new Temporal.PlainDateTime(...)`.
     pub(crate) fn plaindatetime_construct(
         &mut self,

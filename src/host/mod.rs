@@ -12,7 +12,7 @@ pub mod web;
 
 /// Install the full host-runtime surface into `interp` (web globals, timers /
 /// event-loop scheduling primitives, and the `node:`-compat builtins).
-pub fn install_all(interp: &mut Interp<'_>) {
+pub fn install_all(interp: &mut Interp) {
     web::install(interp);
     node::install(interp);
     timers::install(interp);

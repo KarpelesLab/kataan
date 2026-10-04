@@ -1,28 +1,31 @@
-//! A minimal register VM over the [`Realm`] / [`NanBox`] representation
-//! (`ROADMAP.md` §3 → Phase D migration).
+//! The **bytecode VM**: the engine's only executor of JavaScript.
 //!
 //! [`Realm`]: crate::realm::Realm
 //! [`NanBox`]: crate::nanbox::NanBox
 //!
-//! This is the **proof of execution** for the performance object model: a small
-//! register machine whose values are [`NanBox`]s and whose objects live in a
-//! [`Realm`]'s heap under the GC. It demonstrates that the foundation actually
-//! *runs* code — arithmetic on boxed numbers, control flow off `ToBoolean`,
-//! and object property reads/writes through shapes — end to end, ahead of
-//! migrating the full bytecode VM onto this representation.
+//! An AST → register-bytecode compiler
+//! ([`compile_program_into`](crate::nbvm::compile_program_into), plus
+//! `compile_eval_code` for eval code / `Function` bodies and
+//! `compile_module_into` for modules) and the register machine that runs it.
+//! Values are single-word [`NanBox`]es and objects are GC-managed cells of a
+//! [`Realm`]'s heap.
 //!
-//! It also carries the **bytecode-VM fold**: an AST → bytecode `compile_and_run`
-//! that lowers a broad JavaScript subset (arithmetic, control flow,
-//! arrays/objects, `for`/`do-while`/`for-of`/`switch` with `break`/`continue`,
-//! compound assignment and `++`/`--`, functions with recursion via a
-//! per-activation register window, first-class function values and **closures
-//! with mutable capture** — free variables become shared heap *cells* —
-//! `try`/`catch`/`finally`/`throw` exceptions that unwind across calls, and
-//! native `console.log`/`Math.*`/`String`/`Number` calls) onto these ops, with
-//! no tree-walking — and it agrees with the tree-walker on output (a
-//! cross-engine parity test). The point is that every value flowing through it
-//! is a single 64-bit word and every object is a GC-managed heap node, exactly
-//! as the production VM will work.
+//! Two tiers share the machine:
+//! - **hosted** — the program runs inside an interpreter
+//!   ([`crate::nbexec::Interp`], through [`VmHost`](crate::nbvm::VmHost)), which owns the realm, the
+//!   global environment, every built-in and the job queues; the VM delegates
+//!   whatever it does not model in registers (exotic objects, coercions that
+//!   run user code, `eval`/`with` environments, …) to it. Every product entry
+//!   point (`Interp::run`, `nbvm::execute`, the CLI, the C ABI, the web build) and
+//!   the Test262 runner run here.
+//! - **bare** — `compile_program` + `run_program` over a `Realm` with no
+//!   host: the `.ktbc` artifact path and the JIT's tests. A construct that
+//!   needs the interpreter is a compile refusal or a `VmError::Unsupported`
+//!   fault there.
+//!
+//! Comments below that say a case "faults to" or "is left to" the
+//! interpreter describe that split: a hosted run takes the host's path, the
+//! bare tier faults.
 //!
 //! Pure, safe `alloc`-only Rust.
 
@@ -515,7 +518,7 @@ pub enum Op {
     /// built-in iteration of an array / typed array / string / `Map` / `Set`.
     /// For any other value (a user iterable whose `[Symbol.iterator]` the VM
     /// cannot resolve, or a non-iterable) this faults so the whole program
-    /// re-runs on the reference tree-walker, which drives the full iterator
+    /// faults to the interpreter, which drives the full iterator
     /// protocol. Backs `for (… of …)` and `[...iterable]` over built-ins.
     IterValues { dst: Reg, src: Reg },
     /// `dst = src.slice(from)` — a new array of `src`'s elements from index
@@ -702,9 +705,9 @@ const NB_PROMISE_RESOLVE: u16 = 30;
 const NB_PROMISE_REJECT: u16 = 31;
 pub(crate) const NB_MATH_TRUNC: u16 = 32;
 
-/// Built-in globals the tree-walker provides as bare values. An unknown
+/// Built-in globals the interpreter provides as bare values. An unknown
 /// identifier that is *not* one of these throws a `ReferenceError` at runtime
-/// (correct JS); one that *is* falls back so the tree-walker resolves it.
+/// (correct JS); one that *is* falls back so the interpreter resolves it.
 ///
 /// This mirrors the set the interpreter installs, so it goes stale whenever a
 /// global is added — and a *missing* entry is silently wrong twice over: the
@@ -1869,7 +1872,7 @@ fn private_define(
         return Err(VmError::Thrown(e));
     }
     // PrivateFieldAdd / PrivateMethodOrAccessorAdd on a non-extensible object
-    // (a frozen one, a module namespace) is a TypeError — as the tree-walker
+    // (a frozen one, a module namespace) is a TypeError — as the interpreter
     // (`nonextensible-applies-to-private`).
     if ctx.host.is_some() && ctx.realm.proxy_at(h).is_none() && !ctx.realm.is_extensible(h) {
         let e = vm_error(
@@ -2440,7 +2443,7 @@ fn agen_drain(ctx: &mut Ctx, funcs: &[FnProto], generator: NanBox) -> Result<(),
         // rejected, the reason is thrown at the `yield`.
         if status == GEN_SUSPENDED_YIELD && kind == 2 && captured.is_none() {
             // Cleanup of an enclosing try / for-of / destructuring region on a
-            // `return` is the tree-walker's (see `vm_generator_resume`).
+            // `return` is the interpreter's (see `vm_generator_resume`).
             if !load_frame(ctx, st.state).1.is_empty() {
                 return Err(VmError::Unsupported);
             }
@@ -2723,7 +2726,7 @@ fn vm_generator_resume(
             }
         });
     // A `return(v)` at a `yield` inside a try / for-of / destructuring region
-    // must run that region's cleanup (iterator closes) — the tree-walker's.
+    // must run that region's cleanup (iterator closes) — the interpreter's.
     if delegate.is_none()
         && mode == 2
         && state == GEN_SUSPENDED_YIELD
@@ -3165,7 +3168,7 @@ fn link_function_proto(ctx: &mut Ctx, f: Handle) {
 /// initialized binding in the host's global scope — is read without swapping
 /// the realm; anything else (an absent name, the TDZ, a global-object accessor)
 /// takes the host's full resolution. Without a host the run cannot resolve
-/// globals at all, so it faults to the tree-walker.
+/// globals at all, so it faults to the interpreter.
 fn vm_load_global(ctx: &mut Ctx, name: &str) -> Result<NanBox, VmError> {
     if let Some(v) = ctx
         .host
@@ -3439,7 +3442,7 @@ struct Ctx<'a> {
     /// property helper ([`jit_helper_get_prop`]/[`jit_helper_set_prop`]). Unlike
     /// `jit_pending` (which only carries a thrown `NanBox` for `+`), this carries a
     /// full [`VmError`], so a `VmError::Unsupported` from `vm_set_prop` (a
-    /// descriptor-aware case the tree-walker owns) propagates out of the JIT
+    /// descriptor-aware case the interpreter owns) propagates out of the JIT
     /// exactly as it would from the interpreter. `None` between helper faults.
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     jit_pending_fault: Option<VmError>,
@@ -4092,16 +4095,15 @@ pub enum VmError {
     NotAnObject,
     /// A construct the VM cannot evaluate with correct semantics in-place (e.g. an
     /// `arr[i] = v` write to an array index that a `defineProperty` demoted or made
-    /// an accessor, which needs the tree-walker's strict-aware / accessor-aware
-    /// store). Faults the whole VM so the program re-runs on the reference engine —
-    /// it is *not* a catchable JS error.
+    /// an accessor, which needs the interpreter's strict-aware / accessor-aware
+    /// store, in the bare tier). Faults the whole run — it is *not* a catchable
+    /// JS error.
     Unsupported,
     /// An uncaught `throw` propagating out of the call stack (the thrown value).
     Thrown(NanBox),
     /// The host's watchdog tripped (see [`crate::interrupt`]). Unwinds without
-    /// running `catch`/`finally`, and — unlike every other `VmError` — must
-    /// **not** fall back to re-running the program on the tree-walker, which
-    /// would restart the very loop the interrupt was raised to stop.
+    /// running `catch`/`finally`; entry points report it as `Interrupted`, not
+    /// as an engine fault.
     Interrupted,
 }
 
@@ -4161,7 +4163,7 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
 /// Returns `None` for anything else — a user object carrying a `[Symbol.iterator]`
 /// (whose well-known symbol key the VM does not track), a generator, or a
 /// non-iterable. The caller turns that into a `VmError` so the whole program
-/// re-runs on the reference tree-walker ([`crate::nbexec`]), which drives the
+/// faults to the interpreter ([`crate::nbexec`]), which drives the
 /// full iterator protocol (including iterator-close and user `.next()`).
 /// Whether index `i` is an own property of anything on `h`'s prototype chain —
 /// i.e. whether a hole at `i` would read something other than `undefined`.
@@ -4175,7 +4177,7 @@ fn proto_chain_has_index(ctx: &Ctx, h: Handle, i: usize) -> bool {
         }
         guard += 1;
         if guard > 1000 {
-            return true; // pathological chain: let the tree-walker sort it out
+            return true; // pathological chain: let the interpreter sort it out
         }
         cur = ctx.realm.object_proto(p);
     }
@@ -4194,7 +4196,7 @@ fn vm_iterable_values(ctx: &mut Ctx, v: NanBox) -> Option<Vec<NanBox>> {
                 // walks the prototype chain, so `Array.prototype[1] = 'y'` makes
                 // `[ , ][1]` yield `'y'`. That lookup may run an inherited getter,
                 // which this fast path cannot do — hand the (rare) case to the
-                // tree-walker.
+                // interpreter.
                 if proto_chain_has_index(ctx, h, i) {
                     return None;
                 }
@@ -4204,7 +4206,7 @@ fn vm_iterable_values(ctx: &mut Ctx, v: NanBox) -> Option<Vec<NanBox>> {
         return Some(elems);
     }
     // A string iterates one entry per Unicode code point (a lone surrogate is a
-    // single one-unit string), exactly like the tree-walker.
+    // single one-unit string), exactly like the interpreter.
     if let Some(bytes) = ctx.realm.string_bytes(h) {
         let mut out = Vec::new();
         for cp in crate::wtf8::code_points(&bytes) {
@@ -4501,7 +4503,7 @@ fn vm_value_bin(
             // its `@@toPrimitive`/`valueOf`/`toString`, any of which the program may
             // have overridden (and any of which may throw). `loose_eq_coerce` below
             // only knows the intrinsic display form, so hand those to the
-            // tree-walker. Object-vs-object (identity) and the `null`/`undefined`
+            // interpreter. Object-vs-object (identity) and the `null`/`undefined`
             // cases need no conversion and stay on the fast path.
             let real_obj = |v: NanBox| {
                 v.as_handle().map(Handle::from_raw).is_some_and(|h| {
@@ -4796,7 +4798,7 @@ fn vm_get_prop(
 /// can never diverge: `regex.lastIndex`, `arr.length` resize, a canonical array
 /// index, an own or inherited setter accessor (its setter runs exactly once, with
 /// `recv` as `this`), and the monomorphic inline-cache in-place write. Returns
-/// `Err(VmError::Unsupported)` for the descriptor-aware cases the tree-walker owns
+/// `Err(VmError::Unsupported)` for the descriptor-aware cases the interpreter owns
 /// (a non-writable `length`, a demoted/frozen array index) — the same fault the
 /// interpreter raises to fall back.
 fn vm_set_prop(
@@ -5475,7 +5477,7 @@ fn call_generic(
 /// cell's `usize` field, and any other value is kept verbatim in an aux data
 /// slot so a later `Get` returns it unchanged (its `valueOf` runs at `exec`
 /// time, not at assignment). A non-writable own `lastIndex` is honored by the
-/// slow tree-walker path; the VM hot path follows the common writable case.
+/// slow interpreter path; the VM hot path follows the common writable case.
 fn set_regex_last_index_value(realm: &mut Realm, handle: Handle, v: NanBox) {
     // `-0` is *not* canonical: the compact `usize` field cannot carry its sign,
     // and a non-global `exec` must leave `re.lastIndex` exactly as written.
@@ -5545,7 +5547,7 @@ fn install_fn_name_length(realm: &mut Realm, f: Handle, proto: Option<&FnProto>)
 
 /// ToBigInt-coerces `value` for a write to element of `target` **iff** `target`
 /// is a `BigInt64Array`/`BigUint64Array`; otherwise returns `value` unchanged.
-/// Mirrors the tree-walker's `Interp::coerce_to_bigint` for the
+/// Mirrors the interpreter's `Interp::coerce_to_bigint` for the
 /// values reachable on the bytecode path (BigInt / Boolean / String); a Number
 /// (and any other non-coercible) is `Err(TypeError)`. Keeps a Number-into-BigInt
 /// store on the VM path a throw rather than a silent no-op.
@@ -6063,7 +6065,7 @@ fn run_frame_at(
             }
             // Use the realm's arithmetic (ToNumber on each operand, which applies
             // ToPrimitive to objects) so `[5] - 2` is `3` natively, without an
-            // error-driven fall back to the tree-walker. A user `valueOf`/
+            // error-driven fall back to the interpreter. A user `valueOf`/
             // `toString` is honored first via `to_primitive`. Shared with the
             // generic-JIT helper via `vm_arith` so the two tiers can't diverge.
             Op::Sub { dst, a, b } => {
@@ -6095,7 +6097,7 @@ fn run_frame_at(
                     Some(h) => {
                         // ToPropertyKey + `[[HasProperty]]`: a proxy `has` trap
                         // anywhere on the chain, and an *object* left operand
-                        // (ToPrimitive, e.g. a Symbol wrapper) are the tree-walker's
+                        // (ToPrimitive, e.g. a Symbol wrapper) are the interpreter's
                         // — fault the program over rather than key on a display
                         // string. A primitive Symbol keys on its `\0sym:` name.
                         let kv = regs[*key as usize];
@@ -6129,7 +6131,7 @@ fn run_frame_at(
                         }
                         found
                     }
-                    // `x in <primitive>` is a TypeError — the tree-walker raises it.
+                    // `x in <primitive>` is a TypeError — the interpreter raises it.
                     None => return Err(VmError::Unsupported),
                 };
                 regs[*dst as usize] = NanBox::boolean(present);
@@ -7453,7 +7455,7 @@ fn run_frame_at(
                 // A non-canonical numeric index on an array (negative or fractional,
                 // e.g. `a[-1]` / `a[1.5]`) is an ordinary named property, NOT an
                 // element — but `as usize` would truncate it to a real index. The
-                // descriptor-aware tree-walker stores it correctly; fault to it.
+                // descriptor-aware interpreter stores it correctly; fault to it.
                 // `fi != (fi as u64) as f64` is the no_std-safe non-integer test
                 // (`f64::fract` is std-only); the leading `fi < 0.0` short-circuits
                 // so the cast only runs for non-negative values.
@@ -7468,7 +7470,7 @@ fn run_frame_at(
                 // the storage cap must store the element sparsely (as a named
                 // property) and grow the logical `length` — a plain `arr[i] = v`
                 // never raises "Invalid array length". The descriptor-aware
-                // tree-walker owns that sparse path (`set_element_checked`); fault
+                // interpreter owns that sparse path (`set_element_checked`); fault
                 // to it. A typed-array out-of-bounds write stays a spec no-op.
                 if ctx.realm.typed_len(handle).is_none()
                     && ctx.realm.is_array(handle)
@@ -7489,7 +7491,7 @@ fn run_frame_at(
                     && ctx.realm.array_index_has_override(handle, i)
                 {
                     // The index was demoted (non-writable/accessor) or the array is
-                    // frozen/sealed: the tree-walker honors the descriptor (accessor
+                    // frozen/sealed: the interpreter honors the descriptor (accessor
                     // setter, read-only no-op, strict throw). Fault to it.
                     return Err(VmError::Unsupported);
                 } else {
@@ -7517,7 +7519,7 @@ fn run_frame_at(
                 // Shared with the generic-JIT helper via `vm_set_elem` (the computed
                 // `obj[key] = v` write). A descriptor-aware case (demoted/frozen
                 // index, non-writable `length`) returns `Err(Unsupported)` to fault
-                // to the tree-walker, exactly as before.
+                // to the interpreter, exactly as before.
                 match vm_set_elem_mode(
                     ctx,
                     funcs,
@@ -7682,7 +7684,7 @@ fn run_frame_at(
             Op::ArrayExtend { arr, src } => {
                 let handle = object_handle(regs[*arr as usize])?;
                 // A spread of any built-in iterable (array / typed array / string
-                // / Map / Set); a user iterable faults to the tree-walker, which
+                // / Map / Set); a user iterable faults to the interpreter, which
                 // drives the full iterator protocol.
                 let elems =
                     vm_iterable_values(ctx, regs[*src as usize]).ok_or(VmError::NotAnObject)?;
@@ -8005,7 +8007,7 @@ fn run_frame_at(
                     }
                     None => match builtin_method(ctx, funcs, recv_val, key, &argv) {
                         Some(r) => r,
-                        // Unknown method → fall back to the tree-walker.
+                        // Unknown method → fall back to the interpreter.
                         None => return Err(VmError::NotAnObject),
                     },
                 };
@@ -8353,7 +8355,7 @@ fn json_read_prop(
 
 /// Interpreter-aware `JSON.stringify` pre-pass: applies `toJSON`, invokes getters,
 /// and runs the `replacer` (a function, or `allow` key allowlist), producing a plain
-/// value tree that `crate::json::stringify` can serialize. Mirrors the tree-walker's
+/// value tree that `crate::json::stringify` can serialize. Mirrors the interpreter's
 /// `json_to_string_seen` + `json_apply_replacer`. A cycle throws a `TypeError`.
 #[allow(clippy::too_many_arguments)]
 fn json_normalize(
@@ -8544,7 +8546,7 @@ fn vm_array_index_get(
 /// properties under; a String / Number / Boolean / null / undefined is its display
 /// form. Any **other** heap object is `Err(VmError::Unsupported)`: its key comes
 /// from `ToPrimitive(key, string)` — an `@@toPrimitive` / inherited `toString`
-/// only the tree-walker resolves. (A Date, for one, keys on its
+/// only the interpreter resolves. (A Date, for one, keys on its
 /// `Date.prototype.toString` text, not the ISO form `to_display_string` produces.)
 fn vm_property_key(ctx: &mut Ctx, key: NanBox) -> Result<String, VmError> {
     if let Some(raw) = key.as_handle() {
@@ -8618,7 +8620,7 @@ fn vm_get_elem(
         _ => {
             // ToPropertyKey: a Symbol keys on its `\0sym:` name; any other object
             // key needs the full ToPrimitive (its `@@toPrimitive`/`toString`, which
-            // may be inherited or user-written), which the tree-walker owns.
+            // may be inherited or user-written), which the interpreter owns.
             let ks = match vm_property_key(ctx, key) {
                 Ok(ks) => ks,
                 // A hosted run hands the whole read to the host.
@@ -8676,7 +8678,7 @@ fn vm_get_elem(
 /// index (with the refuse-past-cap → catchable `RangeError`), a computed
 /// `arr.length` resize, `regex.lastIndex`, a canonical numeric-string array index,
 /// else an ordinary property store. Returns `Err(VmError::Unsupported)` for the
-/// descriptor-aware cases the tree-walker owns (a demoted/frozen array index, a
+/// descriptor-aware cases the interpreter owns (a demoted/frozen array index, a
 /// non-writable `length`) — the same fault the interpreter raised to fall back —
 /// and `Err(Thrown)` for a `RangeError` / a BigInt-coercion `TypeError`.
 fn vm_set_elem(
@@ -8721,7 +8723,7 @@ fn vm_set_elem(
                 return Err(VmError::Thrown(e));
             }
             // A demoted / accessor index (or frozen/sealed array) needs the
-            // descriptor-aware tree-walker store. Fault to it.
+            // descriptor-aware interpreter store. Fault to it.
             if ctx.realm.array_index_has_override(handle, i) {
                 return Err(VmError::Unsupported);
             }
@@ -8731,7 +8733,7 @@ fn vm_set_elem(
         _ => {
             // ToPropertyKey: a Symbol keys on its `\0sym:` name; any other object
             // key needs the full ToPrimitive (its `@@toPrimitive`/`toString`, which
-            // may be inherited or user-written), which the tree-walker owns.
+            // may be inherited or user-written), which the interpreter owns.
             let ks = vm_property_key(ctx, key)?;
             // C1: a computed `arr["length"] = n` (numeric string key) on an array
             // resizes; `ToUint32(v)` must equal `ToNumber(v)` (else a catchable
@@ -8757,7 +8759,7 @@ fn vm_set_elem(
             }
             // A canonical numeric string key on an array (`arr["0"] = v`) addresses
             // element storage, like `arr[0] = v` — for a valid index in
-            // [0, 2**32−1). A demoted/accessor index faults to the tree-walker.
+            // [0, 2**32−1). A demoted/accessor index faults to the interpreter.
             if ctx.realm.is_array(handle)
                 && let Ok(i) = ks.parse::<usize>()
                 && alloc::format!("{i}") == ks
@@ -8990,7 +8992,7 @@ fn regex_method(
         if !matches!(key, "test" | "exec") {
             return None;
         }
-        // Defer to the spec-accurate tree-walker (`RegExpBuiltinExec`) for the
+        // Defer to the spec-accurate interpreter (`RegExpBuiltinExec`) for the
         // cases this fast path does not model exactly:
         //  - a non-canonical own `lastIndex` (e.g. an object whose `valueOf` must
         //    run via `ToLength`, or a value that must be read but not written for a
@@ -9089,7 +9091,7 @@ fn regex_method(
     // re-collecting per call (which made dense global matches O(n²)). All match,
     // capture, `.index`, and split positions are **code-unit** indices. (The
     // subject is surrogate-free on this path — a surrogate-bearing literal defers
-    // to the tree-walker at compile time — but the unit model is what makes an
+    // to the interpreter at compile time — but the unit model is what makes an
     // astral subject report code-unit indices.)
     let subject_bytes = ctx.realm.string_bytes(h).unwrap_or_default();
     let units: Vec<u16> = crate::wtf8::utf16_units(&subject_bytes).collect();
@@ -9129,7 +9131,7 @@ fn regex_method(
         "replace" | "replaceAll" => {
             let repl_val = args.get(1).copied().unwrap_or(NanBox::undefined());
             // A non-string replacement (a function/closure, called per match) is
-            // handled by the tree-walker; defer instead of stringifying it.
+            // handled by the interpreter; defer instead of stringifying it.
             // (nbvm closures are arrays, so this can't use `function_at`.)
             if repl_val
                 .as_handle()
@@ -9165,7 +9167,7 @@ fn regex_method(
             NanBox::handle(ctx.realm.new_string_wtf8(out).to_raw())
         }
         // "split" — splices capture groups and handles zero-width matches (kept
-        // in sync with the tree-walker's `split`).
+        // in sync with the interpreter's `split`).
         _ => {
             // An optional limit caps the segment count (args[1]).
             let limit = match args.get(1) {
@@ -9362,7 +9364,7 @@ fn builtin_method(
         // always build a plain array, so when the receiver carries an own
         // `constructor` property (the only way to reach a non-default species here)
         // they are non-conformant — defer the whole program to the spec-accurate
-        // tree-walker, which runs ArraySpeciesCreate.
+        // interpreter, which runs ArraySpeciesCreate.
         if matches!(key, "map" | "filter" | "concat") && ctx.realm.has_own(h, "constructor") {
             return None;
         }
@@ -9381,10 +9383,10 @@ fn builtin_method(
                 .unwrap_or_default()
         };
         // A *sparse* array (one with at least one hole) needs the conformant
-        // tree-walker for the callback / element-scanning methods: holes must be
+        // interpreter for the callback / element-scanning methods: holes must be
         // skipped (and inherited prototype indices observed). These VM fast paths
         // treat every slot as present, so defer (return `None` → whole-program
-        // re-run on the reference engine) when a hole is present.
+        // fault to the interpreter) when a hole is present.
         if matches!(
             key,
             "map"
@@ -9422,7 +9424,7 @@ fn builtin_method(
             "join" => {
                 // `ToString` of the separator and of every element: a Symbol has no
                 // string conversion and must throw a TypeError — `to_display_string`
-                // would render `Symbol(x)`. Defer to the tree-walker, which raises it.
+                // would render `Symbol(x)`. Defer to the interpreter, which raises it.
                 let is_symbol = |v: NanBox| {
                     v.as_handle()
                         .is_some_and(|raw| ctx.realm.symbol_at(Handle::from_raw(raw)).is_some())
@@ -9692,7 +9694,7 @@ fn builtin_method(
                 // `toString`/`@@split`), a String wrapper, or a Symbol — or an
                 // object `limit` — needs interpreter-aware coercion / delegation
                 // and the exact `ToString`-before-`limit === 0` ordering, so fault
-                // to the tree-walker's full `String.prototype.split`.
+                // to the interpreter's full `String.prototype.split`.
                 let needs_walk = |v: NanBox| {
                     v.as_handle()
                         .map(Handle::from_raw)
@@ -9904,7 +9906,7 @@ fn vm_array_from(ctx: &mut Ctx, funcs: &[FnProto], args: &[NanBox]) -> Result<Na
 /// key a live enumerability check and `[[Get]]`. A getter mutating a later key's
 /// descriptor / existence / value is therefore observed. A `null`/`undefined`
 /// receiver throws a TypeError; a Proxy has no VM trap machinery, so it defers to
-/// the tree-walker (`VmError::Unsupported`); everything else (arrays / strings /
+/// the interpreter (`VmError::Unsupported`); everything else (arrays / strings /
 /// typed arrays / functions — no getters in play) keeps the pure `call_native`
 /// enumeration.
 fn vm_object_kv(
@@ -9925,7 +9927,7 @@ fn vm_object_kv(
     }
     if let Some(h) = recv.as_handle().map(Handle::from_raw) {
         // A proxy's `ownKeys`/`getOwnPropertyDescriptor`/`get` traps are not modeled
-        // in the VM — re-run the program on the tree-walker, which drives them.
+        // in the VM — fault to the interpreter, which drives them.
         if ctx.realm.proxy_at(h).is_some() {
             return Err(VmError::Unsupported);
         }
@@ -10202,7 +10204,7 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             // lone surrogate with U+FFFD — so `String.fromCharCode(0xD800)` came
             // back as the replacement character and every downstream operation
             // (`charCodeAt`, regex matching, `indexOf`) saw the wrong string. The
-            // tree-walker has always used the WTF-8 path here.
+            // interpreter has always used the WTF-8 path here.
             let units: Vec<u16> = args
                 .iter()
                 .map(|a| {
@@ -10250,7 +10252,7 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
                     .map(|c| NanBox::handle(ctx.realm.new_string(&String::from(c)).to_raw()))
                     .collect(),
                 // An array-like object (a `length` + indexed properties). The map
-                // callback form is handled only by the tree-walker (call_native
+                // callback form is handled only by the interpreter (call_native
                 // here can't invoke a closure).
                 Some(h) => {
                     let len = ctx
@@ -10440,9 +10442,8 @@ pub fn compile_and_run(realm: &mut Realm, program: &Program) -> Result<NanBox, C
     run_program(realm, &protos, 0, &[]).map_err(|_| CompileError::Unsupported("runtime fault"))
 }
 
-/// Compiles and runs `program`, returning its completion value and captured
-/// `console` output — the bytecode path's analogue of the tree-walker's
-/// `eval_source`.
+/// Compiles and runs `program` on the bare tier, returning its completion
+/// value and captured `console` output.
 ///
 /// # Errors
 /// Returns [`CompileError`] for unsupported constructs / runtime faults.
@@ -10458,8 +10459,8 @@ pub fn compile_run_output(
 /// Runs `source` as a Script on the **bytecode VM** hosted by a fresh
 /// interpreter ([`Interp::run`](crate::nbexec::Interp::run)), returning the
 /// captured `console` output and the completion value (as a display string).
-/// A program the bytecode compiler refuses runs on the tree-walker; that choice
-/// is made before any code runs.
+/// A program the bytecode compiler refuses is an error reported before any
+/// code runs.
 ///
 /// # Errors
 /// Returns a parse error message or the rendered uncaught throw.
@@ -10478,17 +10479,18 @@ pub fn execute_with_limits(
     source: &str,
     limits: crate::limits::Limits,
 ) -> Result<(String, String), String> {
-    crate::nbexec::eval_source_on(source, limits, |i, p| i.run(p))
+    crate::nbexec::eval_source_on(source, limits)
 }
 
 /// Like [`execute_with_limits`], but the captured output is returned on the
-/// error path too — see [`crate::nbexec::eval_source_capturing`].
+/// error path too: an uncaught throw does not un-print what the script already
+/// printed.
 #[cfg(feature = "std")]
 pub fn execute_capturing(
     source: &str,
     limits: crate::limits::Limits,
 ) -> (String, Result<String, String>) {
-    crate::nbexec::eval_source_capturing_on(source, limits, |i, p| i.run(p))
+    crate::nbexec::eval_source_capturing_on(source, limits)
 }
 
 /// Like [`execute_with_limits`], but on failure returns a structured
@@ -10543,9 +10545,6 @@ pub fn execute_typed_interruptible(
     // Run inside an interpreter (`ROADMAP.md` §2.0), as the multi-script entry
     // does: one realm, one global environment, one console.
     let mut interp = crate::nbexec::Interp::new_with_limits(limits);
-    // Modules a dynamic `import()` loads run on the VM too.
-    #[cfg(all(feature = "std", feature = "module"))]
-    interp.enable_vm_modules();
     interp.realm_mut().interrupt = interrupt.clone();
     if let Err(e) = interp.prepare_script_for_vm(&program) {
         return Err(crate::nbexec::thrown_from_exec_error(
@@ -10556,10 +10555,7 @@ pub fn execute_typed_interruptible(
     }
     let protos: alloc::rc::Rc<[FnProto]> = protos.into();
     match run_program_hosted(&mut interp, &protos, main as usize, &[]) {
-        Ok(value) => {
-            tree_walk_check(&interp)?;
-            Ok((String::from(interp.output()), interp.display(value)))
-        }
+        Ok(value) => Ok((String::from(interp.output()), interp.display(value))),
         Err(e) => Err(vm_thrown(&interp, e)),
     }
 }
@@ -10669,9 +10665,6 @@ pub fn execute_scripts_typed(
     // body runs.
     let table: alloc::rc::Rc<[FnProto]> = table.into();
     let mut interp = crate::nbexec::Interp::new_with_limits(limits);
-    // Modules a dynamic `import()` loads run on the VM too.
-    #[cfg(all(feature = "std", feature = "module"))]
-    interp.enable_vm_modules();
     let mut completion = String::new();
     for (program, main) in programs.iter().zip(&mains) {
         if let Err(e) = interp.prepare_script_for_vm(program) {
@@ -10686,28 +10679,15 @@ pub fn execute_scripts_typed(
             Err(e) => return Err(vm_thrown(&interp, e)),
         }
     }
-    tree_walk_check(&interp)?;
     Ok((String::from(interp.output()), completion))
-}
-
-/// The error for a run in which the tree-walker executed a user statement —
-/// none can, now that every unit runs on the VM; kept as a safety net while
-/// the tree-walker's executor still exists.
-pub(crate) fn tree_walk_check(interp: &crate::nbexec::Interp) -> Result<(), crate::nbexec::Thrown> {
-    match interp.tree_walked() {
-        0 => Ok(()),
-        n => Err(internal_error(&alloc::format!(
-            "tree-walked {n} statements"
-        ))),
-    }
 }
 
 /// Loads, links, and evaluates the ES-module graph rooted at the resolved
 /// `entry_key` through `host`, returning `(console_output, completion_string)`
 /// or a structured [`Thrown`](crate::nbexec::Thrown). Module code runs on the
-/// bytecode VM inside the interpreter's module loader (falling back to the
-/// tree-walker for what the VM cannot compile); this is
-/// the entry the Test262 runner uses for `flags: [module]` tests.
+/// bytecode VM inside the interpreter's module loader (a module the compiler
+/// refuses fails to link); this is the entry the Test262 runner uses for
+/// `flags: [module]` tests.
 ///
 /// # Errors
 /// Returns [`Thrown`](crate::nbexec::Thrown) for any parse/link/runtime failure.
@@ -10774,11 +10754,8 @@ pub fn execute_script_typed_with_import_base(
 }
 
 /// Whether `program` references the dynamic-code intrinsics `eval` or `Function`
-/// (the `Function` constructor). The bytecode VM has no live tree-walk scope to
-/// support direct `eval`'s scope access, and dynamic code is comparatively rare,
-/// so any program touching these is routed wholesale to the reference
-/// tree-walker (`crate::nbexec`), which implements them with full semantics. The
-/// scan reuses the free-variable collector, so it sees references at any nesting
+/// (the `Function` constructor). The bare tier has no host to parse and scope
+/// dynamic code, so it refuses any program touching these. The scan reuses the free-variable collector, so it sees references at any nesting
 /// (including inside nested functions and arrows).
 fn uses_dynamic_code(program: &Program) -> bool {
     let mut direct = BTreeSet::new();
@@ -10896,10 +10873,9 @@ pub fn compile_program_into(
     table: &mut Vec<FnProto>,
 ) -> Result<u32, CompileError> {
     let base = table.len() as u32;
-    // Dynamic code (`eval` / `Function`) needs the tree-walker (it accesses the
-    // live lexical scope and parses source at runtime). Bail before any codegen
-    // so the whole program runs on the reference engine with no partial output.
-    // A hosted run reaches `Function`/indirect `eval` through the host (they
+    // Dynamic code (`eval` / `Function`) needs a host (it accesses the live
+    // lexical scope and parses source at runtime): the bare tier refuses it
+    // before any codegen. A hosted run reaches `Function`/indirect `eval` through the host (they
     // build global-scope interpreter code); only a *direct* `eval(…)` call, which
     // needs the caller's scope, is refused — at its call site.
     if !hosted && uses_dynamic_code(program) {
@@ -10947,7 +10923,7 @@ pub fn compile_program_into(
             // non-constructor (a primitive, a non-constructor function, a plain
             // object), which must throw a TypeError at definition. The bytecode
             // path cannot perform that check, so route such a class to the
-            // tree-walker (which validates the superclass).
+            // interpreter (which validates the superclass).
             if let Some(sup) = class.super_class.as_deref() {
                 let known_class = matches!(sup, crate::ast::Expr::Ident(sid) if class_map.contains_key(&*sid.name));
                 if !known_class {
@@ -11237,7 +11213,7 @@ fn bound_names(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<String> 
 /// that reaches out of an enclosing `try` block — so its `finally` must run on the
 /// way out. Conservative: it descends into control flow (over-reporting a
 /// `break`/`continue` fully contained in a nested loop is safe — it only routes the
-/// program to the tree-walker), but not into nested functions/classes, whose
+/// program to the interpreter), but not into nested functions/classes, whose
 /// abrupt statements exit *them*, not the try.
 fn block_can_exit_abruptly(stmts: &[Stmt]) -> bool {
     stmts.iter().any(stmt_can_exit_abruptly)
@@ -11972,7 +11948,7 @@ fn refuse_generator(f: &crate::ast::Function, hosted: bool) -> Result<(), Compil
 }
 
 /// Scans a *plain* class (no `extends`, fields, statics, or accessors — those
-/// fall back to the tree-walker), reserving function ids for its constructor and
+/// fall back to the interpreter), reserving function ids for its constructor and
 /// methods and queueing them for compilation.
 fn scan_class<'a>(
     class: &'a crate::ast::Class,
@@ -12089,7 +12065,7 @@ fn scan_class<'a>(
     // semantics the bytecode `CallCtor` does not model: a returned *object*
     // overrides the new instance, and a derived constructor returning a
     // non-`undefined` non-object throws a `TypeError`. Route such classes to the
-    // tree-walker, which implements the full rule.
+    // interpreter, which implements the full rule.
     if let Some(m) = ctor_member
         && stmts_return_value(&m.value.body)
     {
@@ -12209,7 +12185,7 @@ struct ClassInfo {
 struct Binding {
     reg: Reg,
     cell: bool,
-    /// Declared `const` (reassignment is a TypeError — routed to the tree-walker).
+    /// Declared `const` (reassignment is a TypeError — routed to the interpreter).
     konst: bool,
     /// A binding in the *global* environment rather than a register (hosted
     /// compilation only — see [`Compiler::hosted`]): the index of its name in
@@ -12700,7 +12676,7 @@ impl Compiler {
         // The VM's `async` functions settle its *own* promise implementation,
         // which is not yet unified with the host's (`ROADMAP.md` §2.0 stage 5):
         // mixed with the host's promises their ordering and rejection semantics
-        // diverge. A hosted run leaves them to the tree-walker.
+        // diverge. A hosted run leaves them to the interpreter.
         // Which of this function's own names are captured by nested functions →
         // must be cells.
         // A parameter default that reads its own or a later parameter hits
@@ -14254,7 +14230,7 @@ impl Compiler {
     /// is the function's arguments object. Resolving it as a global would turn
     /// a construct the VM cannot run into a JS-visible `ReferenceError` — one
     /// that, thrown inside a promise job, nobody would ever see. Such a name is
-    /// a compile refusal instead (the program runs on the tree-walker).
+    /// a compile refusal instead.
     fn models_not(&self, name: &str) -> bool {
         name == "arguments" && !self.is_main && self.lookup(name).is_none() && !self.env_on()
     }
@@ -14613,7 +14589,7 @@ impl Compiler {
         bound?;
         // A `const` head's per-iteration binding is immutable, so a body that
         // assigns to it (`for (const x of …) { x++ }`) must reach the
-        // tree-walker's TypeError rather than compile to a plain store.
+        // interpreter's TypeError rather than compile to a plain store.
         if *kind == crate::ast::VarDeclKind::Const {
             self.mark_pattern_const(target);
         }
@@ -15226,7 +15202,7 @@ impl Compiler {
             Stmt::Class(class) => {
                 // A class with an `extends` clause that is not a known compiled
                 // class must validate the superclass is a constructor/null at
-                // definition (a TypeError otherwise) — the tree-walker handles it.
+                // definition (a TypeError otherwise) — the interpreter handles it.
                 if let Some(sup) = class.super_class.as_deref() {
                     let known =
                         matches!(sup, Expr::Ident(sid) if self.classes.contains_key(&*sid.name));
@@ -15375,7 +15351,7 @@ impl Compiler {
                 // A `finally` must run even when the `try`/`catch` exits via
                 // `return`/`break`/`continue`, but the emitter only runs it on the
                 // normal/throw paths. When the body can exit abruptly, defer the
-                // whole program to the tree-walker (which handles it correctly).
+                // whole program to the interpreter (which handles it correctly).
                 // A non-hosted run keeps refusing a `finally` a jump could skip.
                 if !self.hosted
                     && finalizer.is_some()
@@ -15546,7 +15522,7 @@ impl Compiler {
             Stmt::Var(decl) => {
                 // `using` / `await using` declarations need scope-exit disposal
                 // semantics the bytecode VM does not model; bail to the
-                // tree-walker (`nbexec`), which implements them with full
+                // interpreter (`nbexec`), which implements them with full
                 // explicit-resource-management semantics.
                 if matches!(
                     decl.kind,
@@ -15790,7 +15766,7 @@ impl Compiler {
             // `for (const x of iterable)` — materialize the iterable's values into
             // an array (the built-in iteration of an array / typed array / string /
             // Map / Set; a user iterable or generator faults at `IterValues` and the
-            // program re-runs on the tree-walker), then index it by a hidden counter.
+            // program faults to the interpreter), then index it by a hidden counter.
             Stmt::ForOf {
                 left,
                 right,
@@ -15800,9 +15776,8 @@ impl Compiler {
             } => {
                 use crate::ast::ForLeft;
                 // `for await (…)` is a coroutine suspension point (each value is
-                // awaited). The bytecode VM has no await machinery, so route any
-                // program containing one to the reference tree-walker, which drives
-                // it through the lazy async coroutine engine.
+                // awaited): only a hosted async function frame can suspend for
+                // it, so anything else is a compile refusal.
                 if *is_await && !(self.hosted && self.in_async) {
                     return Err(CompileError::Unsupported("for await"));
                 }
@@ -15820,7 +15795,7 @@ impl Compiler {
                 };
                 // A `for (using x of …)` / `for (await using x of …)` head needs
                 // per-iteration explicit-resource-management disposal; bail to the
-                // tree-walker (`nbexec`).
+                // interpreter (`nbexec`).
                 if !self.hosted
                     && matches!(
                         kind,
@@ -16392,7 +16367,7 @@ impl Compiler {
                         "undefined" => self.constant(NanBox::undefined()),
                         "NaN" => self.constant(NanBox::number(f64::NAN)),
                         "Infinity" => self.constant(NanBox::number(f64::INFINITY)),
-                        // A built-in the tree-walker provides as a bare value:
+                        // A built-in the interpreter provides as a bare value:
                         // fall back so it resolves correctly.
                         n if KNOWN_GLOBALS.contains(&n) => {
                             Err(CompileError::Undefined(String::from(n)))
@@ -16545,7 +16520,7 @@ impl Compiler {
                 // A resolvable bare name — a global value (`NaN`/`Infinity`/
                 // `undefined`) or a known builtin (`Math`, `BigInt`, …) — instead
                 // goes through the normal path (the builtin bails to the
-                // tree-walker), so `typeof Math` is `"object"`, not `"undefined"`.
+                // interpreter), so `typeof Math` is `"object"`, not `"undefined"`.
                 if matches!(op, UnaryOp::Typeof)
                     && let Expr::Ident(id) = &**argument
                     && self.env_resolves(&id.name)
@@ -16827,8 +16802,9 @@ impl Compiler {
                 // in the same literal (`{get x(){}, x: 1}`) is a CreateDataProperty
                 // that must *replace* the getter/setter — `Op::SetProp`/`Op::SetKey`
                 // are `[[Set]]`s and would run the setter instead. That is rare
-                // enough to hand the whole literal to the tree-walker (which
-                // clears the accessor first). An accessor with a computed key
+                // enough to refuse the whole literal in the bare tier (a hosted
+                // run defines members through the host, which clears the
+                // accessor first). An accessor with a computed key
                 // already deopts via `static_key` below, so only static accessor
                 // keys can be present here; a computed *data* key is treated
                 // conservatively.
@@ -18163,7 +18139,7 @@ impl Compiler {
                     // A native superclass (e.g. `extends Error`/`Array`) isn't a user
                     // class; the bytecode VM can't model the native chain (`super(...)`
                     // into a native constructor), so bail the whole program to the
-                    // tree-walker, which handles it.
+                    // interpreter, which handles it.
                     let Some(cls) = self.classes.get(name) else {
                         return Err(CompileError::Unsupported("extends a native class"));
                     };
@@ -18219,7 +18195,7 @@ impl Compiler {
             // concatenating via the realm's `+` (ToString on each value).
             Expr::Template(t) => {
                 // An invalid escape is allowed only in a *tagged* template; in a plain
-                // template literal it is a SyntaxError — defer to the tree-walker, which
+                // template literal it is a SyntaxError — defer to the interpreter, which
                 // raises it at evaluation.
                 if t.quasis.iter().any(|q| q.cooked.is_none()) {
                     return Err(CompileError::Unsupported(
@@ -18392,7 +18368,7 @@ impl Compiler {
     }
 
     /// A direct `eval(…)` call reads and writes the caller's scope, which lives
-    /// in VM registers the host cannot see: the tree-walker runs such a
+    /// in VM registers the host cannot see: the interpreter runs such a
     /// program. (A locally bound `eval` is an ordinary call, as before.)
     fn refuse_direct_eval(&self, callee: &Expr) -> Result<(), CompileError> {
         match callee {
@@ -19133,7 +19109,7 @@ impl Compiler {
         self.ops.push(Op::NewObject { dst: proto });
         // `proto.constructor === C` (non-enumerable), installed *before* the
         // instance methods so `[[OwnPropertyKeys]]` order is `constructor,
-        // …methods` (per MakeConstructor; matches the tree-walker).
+        // …methods` (per MakeConstructor; matches the interpreter).
         self.ops.push(Op::SetHidden {
             obj: proto,
             key: String::from("constructor"),
@@ -19474,7 +19450,7 @@ impl Compiler {
                         };
                         let home = if m.is_static { CTOR_NAME } else { PROTO_NAME };
                         // A static method keeps the NativeFunction form (its member
-                        // text starts with `static`), as on the tree-walker.
+                        // text starts with `static`), as on the interpreter.
                         self.next_closure_span = (!m.is_static).then_some(m.span);
                         let func = self.class_element_closure(
                             home,
@@ -21106,8 +21082,7 @@ mod tests {
     #[test]
     fn globals_match_installed_set() {
         let (_, installed) =
-            crate::nbexec::eval_source("Object.getOwnPropertyNames(globalThis).join(' ')")
-                .expect("enumerate globals");
+            execute("Object.getOwnPropertyNames(globalThis).join(' ')").expect("enumerate globals");
         let missing: alloc::vec::Vec<&str> = installed
             .split(' ')
             // The `$262_*` harness hooks are not part of the language surface,
@@ -21121,8 +21096,7 @@ mod tests {
             missing.is_empty(),
             "globals installed but absent from KNOWN_GLOBALS: {missing:?}"
         );
-        // …and nothing in the list that is not actually installed, which would
-        // send a genuinely-undefined name down the slow tree-walker path.
+        // …and nothing in the list that is not actually installed.
         let stale: alloc::vec::Vec<&&str> = KNOWN_GLOBALS
             .iter()
             .filter(|n| !installed.split(' ').any(|g| g == **n))
@@ -21147,7 +21121,7 @@ mod tests {
             ("typeof FinalizationRegistry", "function"),
             ("typeof no_such_global_anywhere", "undefined"),
         ] {
-            let (_, got) = crate::nbexec::eval_source(src).expect(src);
+            let (_, got) = execute(src).expect(src);
             assert_eq!(got, want, "{src}");
         }
     }
@@ -21164,11 +21138,11 @@ mod tests {
 
     /// C1: in the bytecode VM, a dense-array element write to a valid array index
     /// (`< 2^32-1`) past the `max_array_len` cap is served *sparsely* (the VM
-    /// faults to the tree-walker, which stores it as an aux named property + a
+    /// faults to the interpreter, which stores it as an aux named property + a
     /// logical-length bump) — a plain `arr[i] = v` never throws. A `length` set to
     /// a valid uint32 above the cap is likewise a sparse length; only a length
     /// above the uint32 ceiling is invalid. Exercised through the production
-    /// `execute` entry (VM with the tree-walker fallback).
+    /// `execute` entry (the hosted VM).
     #[test]
     fn vm_oversized_array_growth_throws_range_error() {
         let v = |src: &str| -> String {
@@ -21224,7 +21198,7 @@ mod tests {
 
     // --- Inline-cache (H1) wiring: `GetProp`/`SetProp` over a per-frame
     // monomorphic shape→slot cache. Every case runs through `bc()`, which forces
-    // the pure bytecode VM (no tree-walker fallback), so the cache path is the one
+    // the bare bytecode VM (no host), so the cache path is the one
     // under test. ---
 
     /// A hot `obj.x` read loop: the same shape every iteration, so after the cold
@@ -21358,7 +21332,7 @@ mod tests {
     /// *own* data slot on the receiver, so an inherited member misses the cache
     /// and falls to the slow path (which walks the prototype chain). Uses a class
     /// — whose methods live on the prototype — so it compiles to pure bytecode
-    /// (no `Object.create` global, which is tree-walker-only).
+    /// (no `Object.create` global, which is interpreter-only).
     #[test]
     fn ic_prototype_inherited_property_resolves() {
         assert_eq!(
@@ -21720,9 +21694,9 @@ mod tests {
     fn bytecode_loose_eq_object_coercion() {
         // `obj == primitive` needs `ToPrimitive(obj)` with the *default* hint — a
         // user-overridable `@@toPrimitive`/`valueOf`/`toString` that can throw — so
-        // the VM faults those to the tree-walker rather than using the intrinsic
-        // display form. Exercised through the production `execute` entry (VM with
-        // the tree-walker fallback), which is where the semantics are observable.
+        // the VM faults those to the interpreter rather than using the intrinsic
+        // display form. Exercised through the production `execute` entry (the
+        // hosted VM), which is where the semantics are observable.
         // Object-vs-object stays on the VM's identity fast path.
         for (src, want) in [
             ("String([] == false)", "true"),
@@ -21750,7 +21724,7 @@ mod tests {
     #[test]
     fn bytecode_regex_split_matches_tree_walker() {
         // The bytecode VM's regex split splices capture groups and keeps the
-        // boundary char on zero-width (lookahead) matches, like the tree-walker.
+        // boundary char on zero-width (lookahead) matches, like the interpreter.
         assert_eq!(bc("'a1b2c3'.split(/(\\d)/).join(',')"), "a,1,b,2,c,3,");
         assert_eq!(
             bc("'camelCaseWord'.split(/(?=[A-Z])/).join('|')"),
@@ -21905,9 +21879,9 @@ mod tests {
     }
 
     #[test]
-    fn bytecode_matches_tree_walker() {
-        // Cross-engine parity: the bytecode VM and the tree-walker agree on the
-        // captured output for the same program (the migration's correctness bar).
+    fn bare_and_hosted_vm_agree() {
+        // The bare VM (over a realm, no host) and the hosted VM (inside an
+        // interpreter) agree on the captured output for the same program.
         let programs = [
             "let s = 0; for (let i = 1; i <= 10; i++) { s += i; } console.log(s);",
             "function fib(n) { if (n < 2) { return n; } return fib(n-1) + fib(n-2); } console.log(fib(15));",
@@ -21917,8 +21891,8 @@ mod tests {
             let program = crate::parser::Parser::parse_program(src).expect("parse");
             let mut realm = Realm::new();
             let (_, vm_out) = compile_run_output(&mut realm, &program).expect("bytecode");
-            let (tw_out, _) = crate::nbexec::eval_source(src).expect("tree-walker");
-            assert_eq!(vm_out, tw_out, "engines disagree on: {src}");
+            let (hosted_out, _) = execute(src).expect("hosted");
+            assert_eq!(vm_out, hosted_out, "tiers disagree on: {src}");
         }
     }
 
@@ -22031,7 +22005,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn typeof_of_a_user_function_is_function_on_the_vm() {
-        // These compile fully to bytecode (no tree-walker fallback), so they
+        // These compile fully to bytecode, so they
         // exercise the `\0vmfn` tag on `LoadFunc`/`MakeClosure` closures that makes
         // `typeof` report a function rather than the backing array.
         let (out, _) = execute(
@@ -22047,7 +22021,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_bytecode_first_with_tree_walker_fallback() {
+    fn execute_runs_on_the_hosted_vm() {
         // A program the bytecode VM compiles fully (closures, loops, output).
         let (out, _) = execute(
             "function makeCounter() { let c = 0; return function() { c += 1; return c; }; }
@@ -22065,8 +22039,7 @@ mod tests {
         .expect("ok");
         assert_eq!(out, "7\n");
 
-        // A class feature the bytecode path doesn't compile (a getter) routes
-        // the program to the tree-walker, which still runs it correctly.
+        // Accessors.
         let (out, _) = execute(
             "class Box { constructor(v) { this._v = v; } get value() { return this._v * 2; } }
              console.log(new Box(21).value);",
@@ -22078,11 +22051,13 @@ mod tests {
         let (_, completion) = execute("1 + 2 * 3").expect("ok");
         assert_eq!(completion, "7");
 
-        // Both engines agree on a shared program (sanity).
+        // The bare and hosted tiers agree on a shared program (sanity).
         let src = "let s = 0; for (let i = 1; i <= 5; i++) { s += i; } console.log(s);";
-        let (bc, _) = execute(src).expect("ok");
-        let (tw, _) = crate::nbexec::eval_source(src).expect("ok");
-        assert_eq!(bc, tw);
+        let (hosted, _) = execute(src).expect("ok");
+        let program = crate::parser::Parser::parse_program(src).expect("parse");
+        let mut realm = Realm::new();
+        let (_, bare) = compile_run_output(&mut realm, &program).expect("bytecode");
+        assert_eq!(hosted, bare);
     }
 
     #[test]
@@ -23000,7 +22975,7 @@ mod tests {
         }
         let program = crate::parser::Parser::parse_program(&src).expect("parse");
         let mut realm = Realm::new();
-        // Must return Err (routed to the tree-walker by `execute`), never panic.
+        // Must return Err (a compile refusal), never panic.
         assert!(compile_and_run(&mut realm, &program).is_err());
     }
 
@@ -25477,7 +25452,7 @@ mod generic_jit_tests {
 
         // s[0] — the bytecode `Op::GetKey` path resolves a string index as an
         // ordinary property (`str["0"]`), which this VM leaves `undefined` (char
-        // indexing is a tree-walker concern); the point is JIT-forced === interp.
+        // indexing is the interpreter's concern); the point is JIT-forced === interp.
         let idx0 = NanBox::number(0.0);
         let i_ch = call(&mut ctx, &funcs, get, &[s, idx0]).unwrap();
         let j_ch = call_generic(&mut ctx, &funcs, &jit_get, &[s, idx0])
@@ -25611,7 +25586,7 @@ mod generic_jit_tests {
         );
     }
 
-    /// A frozen-array element write faults to the tree-walker on BOTH tiers
+    /// A frozen-array element write faults to the interpreter on BOTH tiers
     /// identically (`Err(Unsupported)`) — the descriptor-aware store the JIT helper
     /// correctly declines, rather than silently mutating a frozen array.
     #[test]

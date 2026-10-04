@@ -1,6 +1,6 @@
 use super::*;
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// Builds a match-result array from a `Captures` whose spans are **code-unit**
     /// indices into the pre-collected `&[u16]` subject (the native regex model).
     /// Element `i` is capture group `i` (group 0 = whole match), sliced from the

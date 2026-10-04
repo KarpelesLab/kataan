@@ -1,6 +1,6 @@
 use super::*;
 
-impl<'a> Interp<'a> {
+impl Interp {
     // --- Embedder buffer-creation API (A6, #11) -----------------------------
     //
     // These build the *JS-visible* `ArrayBuffer` object — a heap object carrying

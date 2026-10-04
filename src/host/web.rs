@@ -29,7 +29,7 @@ use crate::nanbox::{NanBox, Unpacked};
 use crate::nbexec::{Ctx, Interp};
 
 /// Install the §4.3 web-platform globals into `interp`.
-pub fn install(interp: &mut Interp<'_>) {
+pub fn install(interp: &mut Interp) {
     install_encoding(interp);
     install_base64(interp);
     install_url(interp);
@@ -79,9 +79,9 @@ fn builtin_tag(cx: &mut Ctx, v: NanBox) -> String {
 }
 
 /// Attach a host method (`register_fn`) to `target`'s own properties.
-fn add_method<F>(interp: &mut Interp<'_>, target: NanBox, name: &str, length: u32, f: F)
+fn add_method<F>(interp: &mut Interp, target: NanBox, name: &str, length: u32, f: F)
 where
-    F: FnMut(&mut Ctx<'_, '_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
+    F: FnMut(&mut Ctx<'_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
 {
     let m = interp.register_fn(name, length, f);
     if let Some(h) = target.as_handle().map(Handle::from_raw) {
@@ -90,17 +90,17 @@ where
 }
 
 /// The `.prototype` object of a constructor value, if any.
-fn prototype_of(interp: &Interp<'_>, ctor: NanBox) -> Option<NanBox> {
+fn prototype_of(interp: &Interp, ctor: NanBox) -> Option<NanBox> {
     let h = ctor.as_handle().map(Handle::from_raw)?;
     interp.realm().get_property(h, "prototype")
 }
 
 /// Define a getter/setter accessor `name` on `proto`. `set` is a no-op-returning
 /// closure for read-only accessors.
-fn add_accessor<G, S>(interp: &mut Interp<'_>, proto: NanBox, name: &str, get: G, set: S)
+fn add_accessor<G, S>(interp: &mut Interp, proto: NanBox, name: &str, get: G, set: S)
 where
-    G: FnMut(&mut Ctx<'_, '_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
-    S: FnMut(&mut Ctx<'_, '_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
+    G: FnMut(&mut Ctx<'_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
+    S: FnMut(&mut Ctx<'_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
 {
     let g = interp.register_fn(&format!("get {name}"), 0, get);
     let s = interp.register_fn(&format!("set {name}"), 1, set);
@@ -121,7 +121,7 @@ fn named_error(cx: &mut Ctx, name: &str, message: &str) -> NanBox {
 // TextEncoder / TextDecoder
 // ===========================================================================
 
-fn install_encoding(interp: &mut Interp<'_>) {
+fn install_encoding(interp: &mut Interp) {
     // --- TextEncoder ---
     let enc_ctor = interp.register_global_constructor("TextEncoder", 0, |cx, this, _args| {
         let e = cx.string("utf-8");
@@ -423,7 +423,7 @@ fn b64_decode(input: &str) -> Result<Vec<u8>, ()> {
     Ok(out)
 }
 
-fn install_base64(interp: &mut Interp<'_>) {
+fn install_base64(interp: &mut Interp) {
     interp.register_global_fn("btoa", 1, |cx, _this, args| {
         let s = cx.to_string(arg(args, 0))?;
         let mut bytes = Vec::with_capacity(s.len());
@@ -880,7 +880,7 @@ fn usp_pairs(cx: &Ctx, this: NanBox) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-fn install_url(interp: &mut Interp<'_>) {
+fn install_url(interp: &mut Interp) {
     // Precompute the Symbol.iterator storage key so search-params can hand back
     // genuine iterators.
     let iter_sym = interp.well_known_symbol("iterator");
@@ -1238,7 +1238,7 @@ fn install_url(interp: &mut Interp<'_>) {
 /// Install a `name` getter/setter on the URL prototype backed by `get`/`set`
 /// over the instance's [`UrlState`].
 fn url_accessor(
-    interp: &mut Interp<'_>,
+    interp: &mut Interp,
     proto: NanBox,
     name: &str,
     get: fn(&UrlState) -> String,
@@ -1272,7 +1272,7 @@ fn url_accessor(
 // structuredClone
 // ===========================================================================
 
-fn install_structured_clone(interp: &mut Interp<'_>) {
+fn install_structured_clone(interp: &mut Interp) {
     interp.register_global_fn("structuredClone", 1, |cx, _this, args| {
         let mut memo: Vec<(u64, NanBox)> = Vec::new();
         clone_value(cx, arg(args, 0), &mut memo)
@@ -1434,7 +1434,7 @@ struct PerfState {
     entries: Vec<PerfEntry>,
 }
 
-fn install_performance(interp: &mut Interp<'_>) {
+fn install_performance(interp: &mut Interp) {
     let start = Instant::now();
     let time_origin = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1626,7 +1626,7 @@ struct ConsoleState {
     timers: HashMap<String, Instant>,
 }
 
-fn install_console(interp: &mut Interp<'_>) {
+fn install_console(interp: &mut Interp) {
     // Capture the engine's native `console.log` so our formatting still lands in
     // `interp.output()`. Persist it so it survives across calls and GC.
     let native_log = interp

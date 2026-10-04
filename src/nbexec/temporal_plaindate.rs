@@ -52,7 +52,7 @@ pub(crate) const GETTERS: &[&str] = &[
     "inLeapYear",
 ];
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// `new Temporal.PlainDate(...)`.
     pub(crate) fn plaindate_construct(
         &mut self,

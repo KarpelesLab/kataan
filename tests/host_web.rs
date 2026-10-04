@@ -16,7 +16,6 @@ fn run(src: &str) -> (String, String) {
     let program = Parser::parse_program(src).expect("parse");
     let result = interp.run(&program).expect("run");
     // The snippet ran on the bytecode VM.
-    assert_eq!(interp.tree_walked(), 0, "tree-walked: {src}");
     let display = interp.display(result);
     (interp.output().to_string(), display)
 }

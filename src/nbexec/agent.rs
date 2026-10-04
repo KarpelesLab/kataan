@@ -52,8 +52,8 @@ var $262 = {
 "#;
 
 /// Native stack for a worker agent's thread. A worker runs a full `Interp`
-/// (whose compiler and any tree-walked fallback recurse per AST node), so it
-/// needs real headroom — but the
+/// (whose bytecode compiler recurses per AST node), so it needs real
+/// headroom — but the
 /// reservation counts against the process's *address space*, and a program may
 /// start many agents, so this is deliberately well below what an embedder gives
 /// the main thread.
@@ -97,7 +97,7 @@ fn worker_main(pool: alloc::sync::Arc<super::agent_pool::AgentPool>, id: usize, 
     pool.finish(id);
 }
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// The shared scheduler, creating it (and taking the baton) on first use.
     /// Only the main agent reaches the creating branch: a worker's `Interp` is
     /// handed the pool before it runs any code.

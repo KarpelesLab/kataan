@@ -384,7 +384,7 @@ pub(crate) fn to_hex(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// The spec `ValidateUint8Array(this)`: returns the receiver handle if it is a
     /// `Uint8Array` (element kind 1), else a `TypeError`. Per spec this runs
     /// *before* the options getters and does **not** check for detachment — that

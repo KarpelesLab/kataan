@@ -2343,7 +2343,7 @@ fn intl_method_arity(ctor_id: u16, name: &str) -> u32 {
     }
 }
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// The underlying method native id for a branded `Intl` prototype data method.
     fn intl_underlying_native(name: &str) -> u16 {
         match name {

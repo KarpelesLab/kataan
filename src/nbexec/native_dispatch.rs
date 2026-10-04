@@ -1,6 +1,6 @@
 use super::*;
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// Invokes a built-in by id.
     pub(crate) fn call_native(&mut self, id: u16, args: &[NanBox]) -> Result<NanBox, ExecError> {
         // Every `Math` function applies `ToNumber` to each of its arguments, in
@@ -2707,51 +2707,30 @@ impl<'a> Interp<'a> {
                 let v = arg(0);
                 self.gen_iter_return(this, v)?
             }
-            // A lazy generator's `next`/`return`/`throw` — resume the suspended
+            // A generator's `next`/`return`/`throw` — resume its suspended VM
             // frame with the appropriate resumption.
             N_GEN_NEXT => {
                 let this = self.this_val;
-                self.lazy_gen_resume(this, generator::Resumption::Next(arg(0)))?
+                self.vm_gen_resume(this, 0, arg(0))?
             }
             N_GEN_RETURN => {
                 let this = self.this_val;
-                self.lazy_gen_resume(this, generator::Resumption::Return(arg(0)))?
+                self.vm_gen_resume(this, 2, arg(0))?
             }
             N_GEN_THROW => {
                 let this = self.this_val;
-                self.lazy_gen_resume(this, generator::Resumption::Throw(arg(0)))?
+                self.vm_gen_resume(this, 1, arg(0))?
             }
             // Async-generator `next`/`return`/`throw`: these ALWAYS return a
             // promise, so a brand-check failure rejects rather than throwing.
-            // A bytecode-VM async generator services its queue on the VM.
-            N_ASYNC_GEN_NEXT | N_ASYNC_GEN_THROW | N_ASYNC_GEN_RETURN
-                if self.this_val.as_handle().is_some_and(|h| {
-                    self.realm
-                        .get_property(Handle::from_raw(h), crate::nbvm::VM_AGEN)
-                        .is_some()
-                }) && self.vm_table.is_some() =>
-            {
-                let table = self.vm_table.clone().expect("checked");
+            N_ASYNC_GEN_NEXT | N_ASYNC_GEN_THROW | N_ASYNC_GEN_RETURN => {
                 let kind = match id {
                     N_ASYNC_GEN_THROW => 1,
                     N_ASYNC_GEN_RETURN => 2,
                     _ => 0,
                 };
                 let this = self.this_val;
-                crate::nbvm::vm_agen_request(self, &table, this, kind, arg(0))
-                    .map_err(super::vm_to_exec)?
-            }
-            N_ASYNC_GEN_NEXT => {
-                let this = self.this_val;
-                self.async_gen_resume(this, generator::Resumption::Next(arg(0)))
-            }
-            N_ASYNC_GEN_RETURN => {
-                let this = self.this_val;
-                self.async_gen_resume(this, generator::Resumption::Return(arg(0)))
-            }
-            N_ASYNC_GEN_THROW => {
-                let this = self.this_val;
-                self.async_gen_resume(this, generator::Resumption::Throw(arg(0)))
+                self.vm_agen_request(this, kind, arg(0))?
             }
             // The abstract `%TypedArray%` intrinsic is not callable directly.
             N_TYPED_ARRAY_ABSTRACT => {
@@ -2774,16 +2753,8 @@ impl<'a> Interp<'a> {
                 let this = self.this_val;
                 let h = this.as_handle().map(Handle::from_raw).filter(|h| {
                     // `Function.prototype.toString` requires `this` to have a
-                    // `[[Call]]` (any callable, or a class — whose `[[Call]]`
-                    // throws — or a proxy wrapping one). A proxy wrapping a class
-                    // is callable even though the bare class is modeled as a
-                    // non-`Function` cell, so accept it explicitly.
+                    // `[[Call]]` (any callable — a class constructor's throws).
                     self.is_callable(*h)
-                        || self.realm.class_at(*h).is_some()
-                        || self
-                            .realm
-                            .proxy_at(*h)
-                            .is_some_and(|(t, _)| self.realm.class_at(t).is_some())
                 });
                 let Some(h) = h else {
                     let m = self

@@ -38,7 +38,7 @@ use crate::nbexec::{ExecError, Interp};
 /// Installs the timer / event-loop globals (and `AbortController` /
 /// `AbortSignal`, `process.nextTick`) into `interp`. Additive: an existing
 /// `process` object is extended, not replaced.
-pub fn install(interp: &mut Interp<'_>) {
+pub fn install(interp: &mut Interp) {
     #[cfg(feature = "std")]
     imp::install(interp);
     #[cfg(not(feature = "std"))]
@@ -53,7 +53,7 @@ pub fn install(interp: &mut Interp<'_>) {
 /// # Errors
 /// Propagates the first uncaught [`ExecError`] a callback throws (mirroring an
 /// uncaught exception aborting the loop).
-pub fn run_event_loop(interp: &mut Interp<'_>) -> Result<(), ExecError> {
+pub fn run_event_loop(interp: &mut Interp) -> Result<(), ExecError> {
     #[cfg(feature = "std")]
     {
         imp::run_event_loop(interp)
@@ -195,7 +195,7 @@ mod imp {
 })();
 "#;
 
-    pub(super) fn install(interp: &mut Interp<'_>) {
+    pub(super) fn install(interp: &mut Interp) {
         // Fresh store per install: persistent-handle indices are only valid for
         // the interpreter that minted them, so never carry them across installs.
         STORE.with(|s| *s.borrow_mut() = TimerStore::default());
@@ -235,7 +235,7 @@ mod imp {
     /// `setTimeout(cb, delay?, ...args)` / `setInterval(cb, delay?, ...args)`.
     /// Returns the numeric timer id.
     fn schedule_timer(
-        cx: &mut Ctx<'_, '_>,
+        cx: &mut Ctx<'_>,
         args: &[NanBox],
         is_interval: bool,
     ) -> Result<NanBox, NanBox> {
@@ -279,7 +279,7 @@ mod imp {
     }
 
     /// `setImmediate(cb, ...args)` — a zero-delay one-shot macrotask.
-    fn schedule_immediate(cx: &mut Ctx<'_, '_>, args: &[NanBox]) -> Result<NanBox, NanBox> {
+    fn schedule_immediate(cx: &mut Ctx<'_>, args: &[NanBox]) -> Result<NanBox, NanBox> {
         let cb = args.first().copied().unwrap_or_else(|| cx.undefined());
         let extra: Vec<u32> = args.iter().skip(1).map(|v| cx.persist(*v)).collect();
         let cb_idx = cx.persist(cb);
@@ -305,7 +305,7 @@ mod imp {
 
     /// `clearTimeout` / `clearInterval` / `clearImmediate` — cancel by id and
     /// release the pinned callback + argument handles.
-    fn clear_timer(cx: &mut Ctx<'_, '_>, args: &[NanBox]) -> Result<NanBox, NanBox> {
+    fn clear_timer(cx: &mut Ctx<'_>, args: &[NanBox]) -> Result<NanBox, NanBox> {
         let Some(id) = args.first().and_then(|v| v.as_number()) else {
             return Ok(cx.undefined());
         };
@@ -327,7 +327,7 @@ mod imp {
 
     /// `queueMicrotask(cb)` — schedule `cb` onto the engine's existing promise-job
     /// (microtask) queue by adopting `Promise.resolve().then(cb)`.
-    fn queue_microtask(cx: &mut Ctx<'_, '_>, args: &[NanBox]) -> Result<NanBox, NanBox> {
+    fn queue_microtask(cx: &mut Ctx<'_>, args: &[NanBox]) -> Result<NanBox, NanBox> {
         let cb = args.first().copied().unwrap_or_else(|| cx.undefined());
         if !cx.is_callable(cb) {
             return Err(cx.type_error("queueMicrotask requires a callable callback"));
@@ -341,7 +341,7 @@ mod imp {
 
     /// `process.nextTick(cb, ...args)` — enqueue onto the nextTick queue, drained
     /// before microtasks each turn.
-    fn next_tick(cx: &mut Ctx<'_, '_>, args: &[NanBox]) -> Result<NanBox, NanBox> {
+    fn next_tick(cx: &mut Ctx<'_>, args: &[NanBox]) -> Result<NanBox, NanBox> {
         let cb = args.first().copied().unwrap_or_else(|| cx.undefined());
         if !cx.is_callable(cb) {
             return Err(cx.type_error("process.nextTick requires a callable callback"));
@@ -357,7 +357,7 @@ mod imp {
         Ok(cx.undefined())
     }
 
-    pub(super) fn run_event_loop(interp: &mut Interp<'_>) -> Result<(), ExecError> {
+    pub(super) fn run_event_loop(interp: &mut Interp) -> Result<(), ExecError> {
         let mut budget = 0u64;
         loop {
             // 1. nextTick jobs, then microtasks — to a joint fixpoint.
@@ -429,7 +429,7 @@ mod imp {
     /// repeating until both are empty — a nextTick may enqueue microtasks and a
     /// microtask may enqueue nextTicks, so this runs to a joint fixpoint with
     /// nextTick always taking precedence.
-    fn drain_jobs(interp: &mut Interp<'_>) -> Result<(), ExecError> {
+    fn drain_jobs(interp: &mut Interp) -> Result<(), ExecError> {
         loop {
             // All currently-queued nextTicks (draining ones they enqueue too).
             while let Some(tick) = STORE.with(|s| s.borrow_mut().ticks.pop_front()) {

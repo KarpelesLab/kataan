@@ -1,6 +1,6 @@
 use super::*;
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// Runs an ES2025 `Iterator.prototype` helper (`map`/`filter`/`take`/`drop`/
     /// `flatMap`/`reduce`/`toArray`/`forEach`/`some`/`every`/`find`) on the
     /// receiver iterator `this_val` (GetIteratorDirect: `this` must be an Object
@@ -787,18 +787,13 @@ impl<'a> Interp<'a> {
         // GetMethod(value, @@iterator).
         let iter_sym = self.well_known_symbol("iterator");
         let iter_key = self.member_key(iter_sym);
-        let mut method = match self.read_member(vh, &iter_key) {
+        let method = match self.read_member(vh, &iter_key) {
             Ok(m) => m,
             Err(e) => {
                 let _ = self.iterator_close(src_h);
                 return Err(e);
             }
         };
-        if matches!(method.unpack(), Unpacked::Undefined | Unpacked::Null)
-            && let Ok(Some(m)) = self.class_iterator_method(vh)
-        {
-            method = m;
-        }
         match method.unpack() {
             // No `@@iterator`: a built-in iterable (array / Map / Set / generator)
             // drains; any other object is used directly as the iterator.
@@ -925,7 +920,7 @@ impl<'a> Interp<'a> {
         // for a primitive, an object receiver for a wrapper).
         let iter_sym = self.well_known_symbol("iterator");
         let iter_key = self.member_key(iter_sym);
-        let mut method = if is_string_prim {
+        let method = if is_string_prim {
             // `GetV(src, @@iterator)` for a *primitive* String: walk the wrapper's
             // prototype chain (`String.prototype`) for the property, firing an
             // accessor getter with the **primitive** as the receiver — so a
@@ -956,13 +951,6 @@ impl<'a> Interp<'a> {
         } else {
             self.read_member(h, &iter_key)?
         };
-        // A class computed-key `[Symbol.iterator]() {}` may not surface as a
-        // readable property; fall back to scanning the class body.
-        if matches!(method.unpack(), Unpacked::Undefined | Unpacked::Null)
-            && let Some(m) = self.class_iterator_method(h)?
-        {
-            method = m;
-        }
         let iterator = match method.unpack() {
             Unpacked::Undefined | Unpacked::Null => {
                 // No `@@iterator` (GetMethod → undefined): a built-in iterable
@@ -1172,12 +1160,7 @@ impl<'a> Interp<'a> {
             }
             let h = it.as_handle().map(Handle::from_raw).unwrap();
             // GetMethod(item, @@iterator): the getter fires here, once.
-            let mut method = self.read_member(h, &iter_key)?;
-            if matches!(method.unpack(), Unpacked::Undefined | Unpacked::Null)
-                && let Some(m) = self.class_iterator_method(h)?
-            {
-                method = m;
-            }
+            let method = self.read_member(h, &iter_key)?;
             let has_method = match method.unpack() {
                 Unpacked::Undefined | Unpacked::Null => false,
                 _ => {
@@ -1509,12 +1492,7 @@ impl<'a> Interp<'a> {
         let vh = value.as_handle().map(Handle::from_raw).unwrap();
         let iter_sym = self.well_known_symbol("iterator");
         let iter_key = self.member_key(iter_sym);
-        let mut method = self.read_member(vh, &iter_key)?;
-        if matches!(method.unpack(), Unpacked::Undefined | Unpacked::Null)
-            && let Some(m) = self.class_iterator_method(vh)?
-        {
-            method = m;
-        }
+        let method = self.read_member(vh, &iter_key)?;
         let iterator = match method.unpack() {
             Unpacked::Undefined | Unpacked::Null => value,
             _ => {
@@ -2444,72 +2422,6 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Drains an iterable for `for await (… of …)`. An *async* iterator — an
-    /// `async function*` generator object, or any object with a callable
-    /// `[Symbol.asyncIterator]` — yields **promises of iterator results**, so each
-    /// `next()` result is awaited before its `done`/`value` is read. Any other
-    /// iterable uses the ordinary synchronous protocol with each yielded value
-    /// awaited (the `AsyncFromSyncIterator` wrapping).
-    pub(crate) fn for_await_values(&mut self, v: NanBox) -> Result<Vec<NanBox>, ExecError> {
-        if let Some(ih) = self.async_iterator_of(v)? {
-            let mut out = Vec::new();
-            loop {
-                let next_fn = self.read_member(ih, "next")?;
-                let res = self.call_with_this(next_fn, NanBox::handle(ih.to_raw()), &[])?;
-                let res = self.await_value(res)?;
-                if !self.is_object_value(res) {
-                    return Err(self.type_error("iterator result is not an object"));
-                }
-                let rh = Handle::from_raw(res.as_handle().unwrap());
-                let done = self.read_member(rh, "done")?;
-                if self.realm.truthy(done) {
-                    break;
-                }
-                out.push(self.read_member(rh, "value")?);
-                if out.len() > GEN_CAP {
-                    return Err(self.type_error("iterator did not terminate"));
-                }
-            }
-            return Ok(out);
-        }
-        // A sync iterable in `for await`: drain synchronously, then await each
-        // yielded value (a non-promise passes through unchanged).
-        let mut values = self.iterate_values(v)?;
-        for val in &mut values {
-            *val = self.await_value(*val)?;
-        }
-        Ok(values)
-    }
-
-    /// The async iterator to drive for `for await`, if `v` is an async iterable:
-    /// the async-generator object itself, or the result of calling its callable
-    /// `[Symbol.asyncIterator]`. `None` for a sync iterable (the caller falls back
-    /// to the synchronous protocol).
-    pub(crate) fn async_iterator_of(&mut self, v: NanBox) -> Result<Option<Handle>, ExecError> {
-        let Some(h) = v.as_handle().map(Handle::from_raw) else {
-            return Ok(None);
-        };
-        // A lazy generator object: an `async function*` is its own async iterator;
-        // a plain `function*` is a *sync* iterator (drained synchronously).
-        if let Some(is_async) = self.lazy_gen_is_async(h) {
-            return Ok(if is_async { Some(h) } else { None });
-        }
-        // Otherwise, an object whose `[Symbol.asyncIterator]` is callable.
-        let sym = self.well_known_symbol("asyncIterator");
-        let key = self.member_key(sym);
-        let f = self.read_member(h, &key)?;
-        if f.as_handle()
-            .is_some_and(|raw| self.is_callable(Handle::from_raw(raw)))
-        {
-            let it = self.call_with_this(f, v, &[])?;
-            let Some(ih) = it.as_handle().map(Handle::from_raw) else {
-                return Err(self.type_error("iterator is not an object"));
-            };
-            return Ok(Some(ih));
-        }
-        Ok(None)
-    }
-
     /// Drains an **already-obtained** iterator object (the result of calling
     /// `source[@@iterator]()`) to the `Vec` of its values, propagating a throwing
     /// `next` / `next().value` (`IteratorStep` / `IteratorValue`). A generator
@@ -2678,50 +2590,6 @@ impl<'a> Interp<'a> {
         Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
     }
 
-    /// Finds a class instance's `[Symbol.iterator]` method (a method whose
-    /// computed key evaluates to the well-known iterator symbol), walking the
-    /// `extends` chain. Returns the bound method value, or `None`.
-    pub(crate) fn class_iterator_method(
-        &mut self,
-        h: crate::heap::Handle,
-    ) -> Result<Option<NanBox>, ExecError> {
-        let Some(tag) = self.realm.class_tag(h) else {
-            return Ok(None);
-        };
-        let iter_sym = self.well_known_symbol("iterator");
-        let mut cur = Some(tag);
-        while let Some(cid) = cur {
-            let class = self.classes[cid as usize];
-            let env = self.class_envs[cid as usize].clone();
-            for member in &class.body {
-                if let ClassMember::Method(m) = member
-                    && !m.is_static
-                    && m.kind == MethodKind::Method
-                    && let PropertyKey::Computed(ke) = &m.key
-                {
-                    let saved = core::mem::replace(&mut self.current, env.clone());
-                    let key = self.eval(ke);
-                    self.current = saved;
-                    if self.realm.strict_equals(key?, iter_sym) {
-                        let saved = core::mem::replace(&mut self.current, env.clone());
-                        let f = self.make_method(
-                            &m.value.params,
-                            Body::Block(&m.value.body),
-                            false,
-                            m.value.is_generator,
-                            Some(cid),
-                            false,
-                        );
-                        self.current = saved;
-                        return Ok(Some(f));
-                    }
-                }
-            }
-            cur = self.resolve_super(class, &env)?.map(|(p, _)| p);
-        }
-        Ok(None)
-    }
-
     /// Resolves an object's `[Symbol.iterator]` method (`GetMethod`), looking up
     /// the property through the *entire* prototype chain — so an iterable whose
     /// `Symbol.iterator` is inherited (`Object.create(iterable)`, a subclass of
@@ -2760,9 +2628,7 @@ impl<'a> Interp<'a> {
         if !matches!(fn_val.unpack(), Unpacked::Undefined | Unpacked::Null) {
             return Ok(Some(fn_val));
         }
-        // A class instance whose `[Symbol.iterator]` is defined with a computed
-        // key may not surface as a readable prototype property; scan the class body.
-        self.class_iterator_method(h)
+        Ok(None)
     }
 
     /// The keys iterated by `for-in`: object property names or array indices,

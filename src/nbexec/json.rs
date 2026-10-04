@@ -1,6 +1,6 @@
 use super::*;
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// `InternalizeJSONProperty` — the `JSON.parse` reviver walk *with source-text
     /// access* (the `json-parse-with-source` proposal). Reads `val = Get(holder,
     /// name)` via `[[Get]]`; if `val` is an array its indices are recursed, else
@@ -322,7 +322,7 @@ impl<'a> Interp<'a> {
                 }
                 // A callable value (function or class constructor) serializes to
                 // nothing (`typeof` is "function").
-                if self.is_callable(h) || self.realm.class_at(h).is_some() {
+                if self.is_callable(h) {
                     return Ok(None);
                 }
                 // Array vs object, via `IsArray` (which unwraps a proxy chain to

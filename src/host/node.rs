@@ -34,7 +34,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 /// Install the §4.5 Node-compat surface into `interp`.
-pub fn install(interp: &mut Interp<'_>) {
+pub fn install(interp: &mut Interp) {
     install_buffer(interp);
     install_path(interp);
     install_os(interp);
@@ -49,39 +49,39 @@ pub fn install(interp: &mut Interp<'_>) {
 // ---------------------------------------------------------------------------
 
 /// A fresh namespace object handle.
-fn new_ns(interp: &mut Interp<'_>) -> Handle {
+fn new_ns(interp: &mut Interp) -> Handle {
     interp.realm_mut().new_object()
 }
 
 /// A heap string value.
-fn str_val(interp: &mut Interp<'_>, s: &str) -> NanBox {
+fn str_val(interp: &mut Interp, s: &str) -> NanBox {
     NanBox::handle(interp.realm_mut().new_string(s).to_raw())
 }
 
 /// Register a host function and install it as a property `name` of `obj`.
-fn set_fn<F>(interp: &mut Interp<'_>, obj: Handle, name: &str, length: u32, f: F)
+fn set_fn<F>(interp: &mut Interp, obj: Handle, name: &str, length: u32, f: F)
 where
-    F: FnMut(&mut Ctx<'_, '_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
+    F: FnMut(&mut Ctx<'_>, NanBox, &[NanBox]) -> Result<NanBox, NanBox> + 'static,
 {
     let v = interp.register_fn(name, length, f);
     interp.realm_mut().set_property(obj, name, v);
 }
 
 /// Install a string-valued property.
-fn set_str(interp: &mut Interp<'_>, obj: Handle, name: &str, s: &str) {
+fn set_str(interp: &mut Interp, obj: Handle, name: &str, s: &str) {
     let v = str_val(interp, s);
     interp.realm_mut().set_property(obj, name, v);
 }
 
 /// Install a number-valued property.
-fn set_num(interp: &mut Interp<'_>, obj: Handle, name: &str, n: f64) {
+fn set_num(interp: &mut Interp, obj: Handle, name: &str, n: f64) {
     interp
         .realm_mut()
         .set_property(obj, name, NanBox::number(n));
 }
 
 /// Bind `handle` as a global named `name`.
-fn declare(interp: &mut Interp<'_>, name: &str, handle: Handle) {
+fn declare(interp: &mut Interp, name: &str, handle: Handle) {
     interp.declare_global(name, NanBox::handle(handle.to_raw()));
 }
 
@@ -95,7 +95,7 @@ fn arg(args: &[NanBox], i: usize) -> NanBox {
 }
 
 /// A required string arg (coerced), defaulting to `""` when absent/undefined.
-fn str_arg(cx: &mut Ctx<'_, '_>, args: &[NanBox], i: usize) -> Result<String, NanBox> {
+fn str_arg(cx: &mut Ctx<'_>, args: &[NanBox], i: usize) -> Result<String, NanBox> {
     let v = arg(args, i);
     if v.is_undefined() {
         Ok(String::new())
@@ -105,7 +105,7 @@ fn str_arg(cx: &mut Ctx<'_, '_>, args: &[NanBox], i: usize) -> Result<String, Na
 }
 
 /// An optional numeric arg with a fallback for absent/undefined.
-fn num_arg(cx: &mut Ctx<'_, '_>, args: &[NanBox], i: usize, default: f64) -> f64 {
+fn num_arg(cx: &mut Ctx<'_>, args: &[NanBox], i: usize, default: f64) -> f64 {
     match args.get(i).copied() {
         Some(v) if !v.is_undefined() => cx.to_number(v).unwrap_or(default),
         _ => default,
@@ -144,7 +144,7 @@ impl Enc {
 }
 
 /// Parse an encoding from an optional string arg (default UTF-8).
-fn enc_arg(cx: &mut Ctx<'_, '_>, v: NanBox) -> Result<Enc, NanBox> {
+fn enc_arg(cx: &mut Ctx<'_>, v: NanBox) -> Result<Enc, NanBox> {
     if v.is_undefined() || v.is_null() {
         return Ok(Enc::Utf8);
     }
@@ -265,7 +265,7 @@ fn encode_bytes(bytes: &[u8], enc: Enc) -> String {
 }
 
 /// `(Reflect.construct, Uint8Array, Buffer)` read out of the realm globals.
-fn buffer_ctors(cx: &mut Ctx<'_, '_>) -> Result<(NanBox, NanBox, NanBox), NanBox> {
+fn buffer_ctors(cx: &mut Ctx<'_>) -> Result<(NanBox, NanBox, NanBox), NanBox> {
     let g = cx.global();
     let u8 = cx.get(g, "Uint8Array")?;
     let bctor = cx.get(g, "Buffer")?;
@@ -294,7 +294,7 @@ const OWN_OVERRIDES: [&str; 3] = ["toString", "slice", "fill"];
 
 /// Copy the collision-prone methods from `Buffer.prototype` onto `buf` as own
 /// properties, so `buf.toString()` (etc.) dispatch to the Buffer versions.
-fn attach_overrides(cx: &mut Ctx<'_, '_>, buf: NanBox) -> Result<(), NanBox> {
+fn attach_overrides(cx: &mut Ctx<'_>, buf: NanBox) -> Result<(), NanBox> {
     let g = cx.global();
     let bctor = cx.get(g, "Buffer")?;
     let bproto = cx.get(bctor, "prototype")?;
@@ -307,7 +307,7 @@ fn attach_overrides(cx: &mut Ctx<'_, '_>, buf: NanBox) -> Result<(), NanBox> {
 
 /// Build a `Buffer` (a `Uint8Array` whose `[[Prototype]]` is `Buffer.prototype`)
 /// that owns a fresh copy of `bytes`.
-fn make_buffer(cx: &mut Ctx<'_, '_>, bytes: &[u8]) -> Result<NanBox, NanBox> {
+fn make_buffer(cx: &mut Ctx<'_>, bytes: &[u8]) -> Result<NanBox, NanBox> {
     let nums: Vec<NanBox> = bytes
         .iter()
         .map(|&b| NanBox::number(f64::from(b)))
@@ -324,7 +324,7 @@ fn make_buffer(cx: &mut Ctx<'_, '_>, bytes: &[u8]) -> Result<NanBox, NanBox> {
 /// Build a `Buffer` *view* sharing an existing `ArrayBuffer`'s memory
 /// (`new Uint8Array(buffer, byteOffset, length)` with newTarget `Buffer`).
 fn make_buffer_view(
-    cx: &mut Ctx<'_, '_>,
+    cx: &mut Ctx<'_>,
     buffer: NanBox,
     off: usize,
     len: usize,
@@ -342,7 +342,7 @@ fn make_buffer_view(
 }
 
 /// Read every byte of a `Buffer`/`Uint8Array`/array-like `this` value.
-fn read_bytes(cx: &mut Ctx<'_, '_>, v: NanBox) -> Vec<u8> {
+fn read_bytes(cx: &mut Ctx<'_>, v: NanBox) -> Vec<u8> {
     let len = cx
         .get(v, "length")
         .ok()
@@ -358,22 +358,22 @@ fn read_bytes(cx: &mut Ctx<'_, '_>, v: NanBox) -> Vec<u8> {
 
 /// Read property `key` of `obj` and coerce it to a number (avoids the nested
 /// `cx.to_number(cx.get(...)?)?` double-borrow).
-fn get_num(cx: &mut Ctx<'_, '_>, obj: NanBox, key: &str) -> Result<f64, NanBox> {
+fn get_num(cx: &mut Ctx<'_>, obj: NanBox, key: &str) -> Result<f64, NanBox> {
     let v = cx.get(obj, key)?;
     cx.to_number(v)
 }
 
 /// Write `byte` at index `i` of the typed-array `buf` (routes through `[[Set]]`).
-fn write_byte(cx: &mut Ctx<'_, '_>, buf: NanBox, i: usize, byte: u8) {
+fn write_byte(cx: &mut Ctx<'_>, buf: NanBox, i: usize, byte: u8) {
     let _ = cx.set_property(buf, &i.to_string(), NanBox::number(f64::from(byte)));
 }
 
 /// Whether `v` looks like an `ArrayBuffer` (has `byteLength`, no `length`).
-fn is_array_buffer(cx: &mut Ctx<'_, '_>, v: NanBox) -> bool {
+fn is_array_buffer(cx: &mut Ctx<'_>, v: NanBox) -> bool {
     cx.is_object(v) && !cx.has(v, "length") && cx.has(v, "byteLength")
 }
 
-fn install_buffer(interp: &mut Interp<'_>) {
+fn install_buffer(interp: &mut Interp) {
     // `Buffer` itself: a constructor whose plain call / `new` both yield a proper
     // byte-backed buffer (Node's deprecated `new Buffer(...)` path).
     let buffer = interp.register_global_constructor("Buffer", 3, |cx, _this, args| {
@@ -474,7 +474,7 @@ fn install_buffer(interp: &mut Interp<'_>) {
 }
 
 /// `(Buffer.prototype, Uint8Array.prototype)` handles, if both are present.
-fn buffer_proto_pair(interp: &Interp<'_>, bctor: Handle) -> Option<(Handle, Handle)> {
+fn buffer_proto_pair(interp: &Interp, bctor: Handle) -> Option<(Handle, Handle)> {
     let g = interp.global_object()?;
     let u8ctor = interp
         .realm()
@@ -495,7 +495,7 @@ fn buffer_proto_pair(interp: &Interp<'_>, bctor: Handle) -> Option<(Handle, Hand
 }
 
 /// The shared `Buffer.from(...)` implementation (also the constructor body).
-fn buffer_from(cx: &mut Ctx<'_, '_>, args: &[NanBox]) -> Result<NanBox, NanBox> {
+fn buffer_from(cx: &mut Ctx<'_>, args: &[NanBox]) -> Result<NanBox, NanBox> {
     let a0 = arg(args, 0);
     match cx.type_of(a0) {
         "string" => {
@@ -525,13 +525,7 @@ fn buffer_from(cx: &mut Ctx<'_, '_>, args: &[NanBox]) -> Result<NanBox, NanBox> 
 }
 
 /// Normalize an optional (possibly negative) index against `len`.
-fn norm_index(
-    cx: &mut Ctx<'_, '_>,
-    args: &[NanBox],
-    i: usize,
-    len: usize,
-    default: usize,
-) -> usize {
+fn norm_index(cx: &mut Ctx<'_>, args: &[NanBox], i: usize, len: usize, default: usize) -> usize {
     match args.get(i).copied().filter(|v| !v.is_undefined()) {
         Some(v) => {
             let n = cx.to_number(v).unwrap_or(0.0);
@@ -545,7 +539,7 @@ fn norm_index(
     }
 }
 
-fn install_buffer_proto(interp: &mut Interp<'_>, proto: Handle) {
+fn install_buffer_proto(interp: &mut Interp, proto: Handle) {
     set_fn(interp, proto, "toString", 3, |cx, this, args| {
         let bytes = read_bytes(cx, this);
         let enc = enc_arg(cx, arg(args, 0))?;
@@ -694,7 +688,7 @@ fn install_buffer_proto(interp: &mut Interp<'_>, proto: Handle) {
 }
 
 fn read_uint(
-    cx: &mut Ctx<'_, '_>,
+    cx: &mut Ctx<'_>,
     this: NanBox,
     args: &[NanBox],
     width: usize,
@@ -711,7 +705,7 @@ fn read_uint(
 }
 
 fn write_uint(
-    cx: &mut Ctx<'_, '_>,
+    cx: &mut Ctx<'_>,
     this: NanBox,
     args: &[NanBox],
     width: usize,
@@ -892,7 +886,7 @@ fn path_relative(from: &str, to: &str) -> String {
     out.join("/")
 }
 
-fn install_path(interp: &mut Interp<'_>) {
+fn install_path(interp: &mut Interp) {
     let path = new_ns(interp);
     set_fn(interp, path, "join", 2, |cx, _t, args| {
         let mut parts = Vec::with_capacity(args.len());
@@ -959,7 +953,7 @@ fn install_path(interp: &mut Interp<'_>) {
     });
     set_fn(interp, path, "format", 1, |cx, _t, args| {
         let o = arg(args, 0);
-        let get = |cx: &mut Ctx<'_, '_>, k: &str| -> Result<String, NanBox> {
+        let get = |cx: &mut Ctx<'_>, k: &str| -> Result<String, NanBox> {
             let v = cx.get(o, k)?;
             if v.is_undefined() || v.is_null() {
                 Ok(String::new())
@@ -1054,7 +1048,7 @@ fn env_var(_name: &str) -> Option<String> {
     }
 }
 
-fn install_os(interp: &mut Interp<'_>) {
+fn install_os(interp: &mut Interp) {
     let os = new_ns(interp);
     set_fn(interp, os, "platform", 0, |cx, _t, _a| {
         Ok(cx.string(os_platform()))
@@ -1159,7 +1153,7 @@ fn cpu_count() -> usize {
 
 /// `Object.prototype.toString.call(v)` stripped to the tag word (`"Array"`,
 /// `"Map"`, `"Date"`, `"Object"`, …).
-fn obj_tag(cx: &mut Ctx<'_, '_>, v: NanBox) -> String {
+fn obj_tag(cx: &mut Ctx<'_>, v: NanBox) -> String {
     let g = cx.global();
     let tag = (|| -> Result<String, NanBox> {
         let obj = cx.get(g, "Object")?;
@@ -1185,7 +1179,7 @@ fn needs_quote(k: &str) -> bool {
 
 /// A depth-limited debug rendering (`util.inspect`), tracking visited objects to
 /// break cycles.
-fn inspect(cx: &mut Ctx<'_, '_>, v: NanBox, depth: i32, seen: &mut Vec<u64>) -> String {
+fn inspect(cx: &mut Ctx<'_>, v: NanBox, depth: i32, seen: &mut Vec<u64>) -> String {
     match cx.type_of(v) {
         "undefined" => "undefined".to_string(),
         "boolean" | "number" | "bigint" => cx.to_string(v).unwrap_or_default(),
@@ -1279,7 +1273,7 @@ fn inspect(cx: &mut Ctx<'_, '_>, v: NanBox, depth: i32, seen: &mut Vec<u64>) -> 
 
 /// Render a `Map`/`Set` by reflecting its entries through `Array.from`.
 fn inspect_collection(
-    cx: &mut Ctx<'_, '_>,
+    cx: &mut Ctx<'_>,
     v: NanBox,
     depth: i32,
     seen: &mut Vec<u64>,
@@ -1328,7 +1322,7 @@ fn inspect_collection(
 }
 
 /// A single `%`-less argument rendered for `util.format` / `console`.
-fn format_value(cx: &mut Ctx<'_, '_>, v: NanBox) -> String {
+fn format_value(cx: &mut Ctx<'_>, v: NanBox) -> String {
     if cx.type_of(v) == "string" {
         cx.to_string(v).unwrap_or_default()
     } else {
@@ -1338,7 +1332,7 @@ fn format_value(cx: &mut Ctx<'_, '_>, v: NanBox) -> String {
 }
 
 /// `util.format(fmt, ...args)` — the `%s/%d/%i/%f/%j/%o/%O/%c/%%` mini-language.
-fn util_format(cx: &mut Ctx<'_, '_>, args: &[NanBox]) -> Result<String, NanBox> {
+fn util_format(cx: &mut Ctx<'_>, args: &[NanBox]) -> Result<String, NanBox> {
     if args.is_empty() {
         return Ok(String::new());
     }
@@ -1425,7 +1419,7 @@ fn util_format(cx: &mut Ctx<'_, '_>, args: &[NanBox]) -> Result<String, NanBox> 
 }
 
 /// `JSON.stringify(v)` via the realm's own JSON (returns `None` for `undefined`).
-fn json_stringify(cx: &mut Ctx<'_, '_>, v: NanBox) -> Option<String> {
+fn json_stringify(cx: &mut Ctx<'_>, v: NanBox) -> Option<String> {
     let g = cx.global();
     let json = cx.get(g, "JSON").ok()?;
     let stringify = cx.get(json, "stringify").ok()?;
@@ -1437,7 +1431,7 @@ fn json_stringify(cx: &mut Ctx<'_, '_>, v: NanBox) -> Option<String> {
     }
 }
 
-fn install_util(interp: &mut Interp<'_>) {
+fn install_util(interp: &mut Interp) {
     let util = new_ns(interp);
     set_fn(interp, util, "format", 1, |cx, _t, args| {
         let s = util_format(cx, args)?;
@@ -1533,7 +1527,7 @@ fn install_util(interp: &mut Interp<'_>) {
 /// the generic Node-style callback, calls `fn(...args, callback)`, and hands the
 /// promise back. The callback settles the deferred from the pinned
 /// `[resolve, reject]` pair.
-fn install_promisify(interp: &mut Interp<'_>, util: Handle) {
+fn install_promisify(interp: &mut Interp, util: Handle) {
     // The generic `(token, err, value)` callback, stashed as a hidden util slot.
     let cb = interp.register_fn("nodeUtilPromisifyCallback", 3, |cx, _t, args| {
         let token = cx.to_number(arg(args, 0))? as u32;
@@ -1634,7 +1628,7 @@ fn qs_unescape(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn install_querystring(interp: &mut Interp<'_>) {
+fn install_querystring(interp: &mut Interp) {
     let qs = new_ns(interp);
     set_fn(interp, qs, "escape", 1, |cx, _t, args| {
         let s = str_arg(cx, args, 0)?;
@@ -1717,12 +1711,7 @@ fn install_querystring(interp: &mut Interp<'_>) {
     declare(interp, "querystring", qs);
 }
 
-fn opt_sep(
-    cx: &mut Ctx<'_, '_>,
-    args: &[NanBox],
-    i: usize,
-    default: &str,
-) -> Result<String, NanBox> {
+fn opt_sep(cx: &mut Ctx<'_>, args: &[NanBox], i: usize, default: &str) -> Result<String, NanBox> {
     match args
         .get(i)
         .copied()
@@ -1737,7 +1726,7 @@ fn opt_sep(
 // process (additive: fetch-or-create the global)
 // ===========================================================================
 
-fn install_process(interp: &mut Interp<'_>) {
+fn install_process(interp: &mut Interp) {
     let g = interp.global_object().expect("global");
     // Fetch-or-create — the timers agent also augments `process` (nextTick), so we
     // never overwrite an existing object.
@@ -1794,7 +1783,7 @@ fn install_process(interp: &mut Interp<'_>) {
 // require('node:...') shim
 // ===========================================================================
 
-fn install_require(interp: &mut Interp<'_>) {
+fn install_require(interp: &mut Interp) {
     // Only add a `require` if none exists (a real CJS loader would own it).
     let g = interp.global_object().expect("global");
     if interp

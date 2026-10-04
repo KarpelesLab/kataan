@@ -64,15 +64,6 @@ pub enum SnapCell {
     Date(f64),
     /// a `BigInt` (its base-10 digit string)
     BigInt(String),
-    /// a function/closure: its code id plus the captured scope chain (innermost
-    /// frame first; each frame's parent is the next). Restorable against the same
-    /// compiled program.
-    Function {
-        /// the function-table index (code identity)
-        func_id: u32,
-        /// the captured lexical environment, innermost frame first
-        frames: Vec<SnapFrame>,
-    },
     /// a bytecode-VM closure: its function-table index plus its captured values
     /// (the cells it closes over). Restorable against the same compiled code.
     VmFunction {
@@ -140,13 +131,6 @@ pub enum SnapCell {
     },
 }
 
-/// One captured scope frame: its `(name, value, is_const)` bindings.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SnapFrame {
-    /// the frame's own bindings
-    pub vars: Vec<(String, SnapVal, bool)>,
-}
-
 /// A captured object graph: the reachable cells (index-addressed) plus the
 /// root indices.
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -184,7 +168,6 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
         let serializable = realm.is_string_handle(*r)
             || realm.date_at(*r).is_some()
             || realm.bigint_at(*r).is_some()
-            || realm.function_at(*r).is_some()
             || realm.vm_function(*r).is_some()
             || realm.collection_is_set(*r).is_some()
             || realm.promise_state(*r).is_some()
@@ -212,20 +195,6 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
             SnapCell::Date(ms)
         } else if let Some(bi) = realm.bigint_at(h) {
             SnapCell::BigInt(bi.to_str_radix(10))
-        } else if let Some((func_id, scope)) = realm.function_at(h) {
-            // Walk the closure's scope chain, interning captured handles.
-            let mut frames = Vec::new();
-            let mut cur = Some(scope);
-            while let Some(s) = cur {
-                let vars = s
-                    .local_bindings()
-                    .into_iter()
-                    .map(|(k, v, c)| (k, snap_val(v, &mut index_of, &mut order, &mut intern), c))
-                    .collect();
-                frames.push(SnapFrame { vars });
-                cur = s.parent();
-            }
-            SnapCell::Function { func_id, frames }
         } else if let Some((func_id, caps)) = realm.vm_function(h) {
             let captures = caps
                 .iter()
@@ -401,62 +370,27 @@ fn snap_val(
 /// because all targets exist before any reference is written.
 #[must_use]
 pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
-    // Pass 1: allocate a handle per cell (strings are immutable, built now). For
-    // functions, build the (empty) scope chain now and keep it to fill in pass 2,
-    // so a closure capturing itself/its siblings resolves correctly.
+    // Pass 1: allocate a handle per cell (strings are immutable, built now).
     let mut handles: Vec<Handle> = Vec::with_capacity(snap.cells.len());
-    let mut fn_chains: Vec<Option<Vec<crate::env::Scope>>> = Vec::with_capacity(snap.cells.len());
     for c in &snap.cells {
-        let (h, chain) = match c {
-            SnapCell::Str(s) => (realm.new_string(s), None),
-            SnapCell::Date(ms) => (realm.new_date(*ms), None),
+        let h = match c {
+            SnapCell::Str(s) => realm.new_string(s),
+            SnapCell::Date(ms) => realm.new_date(*ms),
             SnapCell::BigInt(s) => {
                 let bi = crate::bignum::BigInt::from_str_radix(s, 10).unwrap_or_default();
-                (realm.new_bigint(bi), None)
+                realm.new_bigint(bi)
             }
-            SnapCell::Array(_) => (realm.new_array(Vec::new()), None),
-            SnapCell::Object { .. } => (realm.new_object(), None),
-            SnapCell::Function { func_id, frames } => {
-                // Build empty scopes outermost→innermost; the function closes over
-                // the innermost. `chain[j]` corresponds to `frames[n-1-j]`.
-                let n = frames.len();
-                let mut chain: Vec<crate::env::Scope> = Vec::with_capacity(n);
-                for j in 0..n {
-                    let s = if j == 0 {
-                        crate::env::Scope::root()
-                    } else {
-                        chain[j - 1].child()
-                    };
-                    chain.push(s);
-                }
-                let innermost = chain
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(crate::env::Scope::root);
-                // SNAP-2: `func_id` is a raw index into whatever compiled program
-                // is later run. It is validated for self-consistency at
-                // deserialize time against the snapshot's recorded `func_count`
-                // bound (see `deserialize`/`serialize`), so a corrupt or forged
-                // snapshot carrying an out-of-range index is rejected before any
-                // cell is restored — by the time we reach here, `func_id` is known
-                // to be `< func_count`. It is still a program-relative index: a
-                // restored closure must only be invoked when the matching compiled
-                // program is loaded; invoking one against a different (or absent)
-                // program is undefined. The FFI restore path never calls restored
-                // closures, so that case is currently unreachable.
-                (realm.new_function(*func_id, innermost), Some(chain))
-            }
+            SnapCell::Array(_) => realm.new_array(Vec::new()),
+            SnapCell::Object { .. } => realm.new_object(),
             // Captures are filled in pass 2 (they may reference the closure).
-            SnapCell::VmFunction { func_id, .. } => {
-                (realm.new_vm_function(*func_id, Vec::new()), None)
-            }
-            SnapCell::Collection { is_set, .. } => (realm.new_collection(*is_set), None),
-            SnapCell::Promise { .. } => (realm.new_promise(), None),
+            SnapCell::VmFunction { func_id, .. } => realm.new_vm_function(*func_id, Vec::new()),
+            SnapCell::Collection { is_set, .. } => realm.new_collection(*is_set),
+            SnapCell::Promise { .. } => realm.new_promise(),
             SnapCell::Proxy { .. } => {
                 // A placeholder proxy (a dummy object for both slots); pass 2 fills
                 // in the real target/handler once every cell's handle exists.
                 let d = realm.new_object();
-                (realm.new_proxy(d, d), None)
+                realm.new_proxy(d, d)
             }
             SnapCell::RegExp {
                 source,
@@ -465,10 +399,10 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
             } => {
                 let h = realm.new_regexp(source, flags);
                 realm.set_regex_last_index(h, *last_index);
-                (h, None)
+                h
             }
-            SnapCell::Symbol { description } => (realm.new_symbol(description), None),
-            SnapCell::Bytes(data) => (realm.new_bytes(data.clone()), None),
+            SnapCell::Symbol { description } => realm.new_symbol(description),
+            SnapCell::Bytes(data) => realm.new_bytes(data.clone()),
             SnapCell::TypedArray {
                 byte_offset,
                 length,
@@ -479,20 +413,16 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                 // real backing buffer and viewed-buffer object once every cell's
                 // handle exists.
                 let placeholder = realm.new_bytes(Vec::new());
-                (
-                    realm.new_typed_array(
-                        placeholder,
-                        placeholder,
-                        *byte_offset as usize,
-                        *length as usize,
-                        *kind,
-                    ),
-                    None,
+                realm.new_typed_array(
+                    placeholder,
+                    placeholder,
+                    *byte_offset as usize,
+                    *length as usize,
+                    *kind,
                 )
             }
         };
         handles.push(h);
-        fn_chains.push(chain);
     }
 
     // Pass 2: fill arrays and objects, resolving refs to the new handles.
@@ -507,7 +437,7 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                 .map_or(NanBox::undefined(), |h| NanBox::handle(h.to_raw())),
         }
     };
-    for (idx, (cell, h)) in snap.cells.iter().zip(&handles).enumerate() {
+    for (cell, h) in snap.cells.iter().zip(&handles) {
         match cell {
             // Reference-free cells were built fully in pass 1.
             SnapCell::Str(_) | SnapCell::Date(_) | SnapCell::BigInt(_) | SnapCell::Bytes(_) => {}
@@ -555,24 +485,6 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                     realm.set_object_proto(*h, Some(Handle::from_raw(p)));
                 }
             }
-            SnapCell::Function { frames, .. } => {
-                // Fill each frame's bindings into its (now-allocated) scope.
-                // `frames[f]` (f=0 innermost) ↔ `chain[n-1-f]`.
-                if let Some(chain) = &fn_chains[idx] {
-                    let n = frames.len();
-                    for (f, frame) in frames.iter().enumerate() {
-                        let scope = &chain[n - 1 - f];
-                        for (name, v, is_const) in &frame.vars {
-                            let val = resolve(v, &handles);
-                            if *is_const {
-                                scope.declare_const(name, val);
-                            } else {
-                                scope.declare(name, val);
-                            }
-                        }
-                    }
-                }
-            }
             SnapCell::VmFunction { captures, .. } => {
                 let caps = captures.iter().map(|v| resolve(v, &handles)).collect();
                 realm.set_vm_function_captures(*h, caps);
@@ -618,7 +530,9 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
 const MAGIC: &[u8; 4] = b"KSNP";
 /// Version 2 adds a `func_count` bound in the header (SNAP-2). Bumped from 1 so
 /// that older snapshots — which lack the bound — are rejected with [`SnapError::BadHeader`].
-const VERSION: u16 = 3;
+/// Version 4 retires cell tag 5 (the tree-walker's AST closures): every function
+/// a snapshot can hold is a bytecode-VM closure (tag 13).
+const VERSION: u16 = 4;
 
 /// Why a serialized snapshot failed to load.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -691,9 +605,7 @@ pub fn serialize(snap: &Snapshot) -> Vec<u8> {
         .cells
         .iter()
         .filter_map(|c| match c {
-            SnapCell::Function { func_id, .. } | SnapCell::VmFunction { func_id, .. } => {
-                Some(*func_id)
-            }
+            SnapCell::VmFunction { func_id, .. } => Some(*func_id),
             _ => None,
         })
         .max()
@@ -745,19 +657,6 @@ pub fn serialize(snap: &Snapshot) -> Vec<u8> {
             SnapCell::BigInt(digits) => {
                 out.push(4);
                 w_str(digits, &mut out);
-            }
-            SnapCell::Function { func_id, frames } => {
-                out.push(5);
-                w_u32(*func_id, &mut out);
-                w_u32(frames.len() as u32, &mut out);
-                for frame in frames {
-                    w_u32(frame.vars.len() as u32, &mut out);
-                    for (name, v, is_const) in &frame.vars {
-                        w_str(name, &mut out);
-                        w_val(v, &mut out);
-                        out.push(u8::from(*is_const));
-                    }
-                }
             }
             SnapCell::Collection { is_set, entries } => {
                 out.push(6);
@@ -938,30 +837,6 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
             }
             3 => SnapCell::Date(r.f64()?),
             4 => SnapCell::BigInt(r.string()?),
-            5 => {
-                let func_id = r.u32()?;
-                // SNAP-2: reject an out-of-range index before any restore runs.
-                if func_id >= func_count {
-                    return Err(SnapError::BadFuncId {
-                        func_id,
-                        count: func_count,
-                    });
-                }
-                let nf = r.u32()? as usize;
-                let mut frames = Vec::with_capacity(nf.min(r.remaining()));
-                for _ in 0..nf {
-                    let nv = r.u32()? as usize;
-                    let mut vars = Vec::with_capacity(nv.min(r.remaining()));
-                    for _ in 0..nv {
-                        let name = r.string()?;
-                        let v = r.val()?;
-                        let is_const = r.u8()? != 0;
-                        vars.push((name, v, is_const));
-                    }
-                    frames.push(SnapFrame { vars });
-                }
-                SnapCell::Function { func_id, frames }
-            }
             6 => {
                 let is_set = r.u8()? != 0;
                 let n = r.u32()? as usize;
@@ -1543,30 +1418,32 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_out_of_range_func_id() {
-        use crate::env::Scope;
         // A legitimate closure round-trips: its recorded `func_count` covers its
         // `func_id`, so it deserializes and restores cleanly.
         let mut realm = Realm::new();
-        let func = realm.new_function(3, Scope::root());
+        let func = realm.new_vm_function(3, Vec::new());
         let snap = capture(&realm, &[func]);
         let bytes = serialize(&snap);
         let reloaded = deserialize(&bytes).expect("valid closure round-trips");
         assert_eq!(reloaded, snap);
         let mut realm2 = Realm::new();
         let f2 = restore(&mut realm2, &reloaded)[0];
-        assert_eq!(realm2.function_at(f2).map(|(id, _)| id), Some(3));
+        assert_eq!(realm2.vm_function(f2).map(|(id, _)| id), Some(3));
 
         // Now corrupt the serialized `func_id` so it exceeds the recorded
         // `func_count`. Header layout: MAGIC(4) VERSION(2) func_count(4)
         // n_roots(4) roots(4*n_roots) n_cells(4) then cells. For this single-cell
-        // snapshot the lone cell is a Function: tag(1) func_id(4) ...
+        // snapshot the lone cell is a VM function: tag(1) func_id(4) ...
         let func_count = u32::from_le_bytes(bytes[6..10].try_into().unwrap());
         assert_eq!(func_count, 4, "max func_id (3) + 1");
         let n_roots = u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize;
         // offset of n_cells, then the first cell.
         let cells_off = 14 + 4 * n_roots;
         let first_cell = cells_off + 4;
-        assert_eq!(bytes[first_cell], 5, "first cell is a Function (tag 5)");
+        assert_eq!(
+            bytes[first_cell], 13,
+            "first cell is a VM function (tag 13)"
+        );
         let func_id_off = first_cell + 1;
         let mut corrupt = bytes.clone();
         // Set func_id to func_count (out of range: must be < func_count).
@@ -1580,7 +1457,7 @@ mod tests {
             "an out-of-range func_id is rejected at deserialize, with no panic"
         );
 
-        // A hand-crafted snapshot with func_count = 0 but a Function cell rejects too.
+        // A hand-crafted snapshot with func_count = 0 but a function cell rejects too.
         let mut forged = bytes.clone();
         forged[6..10].copy_from_slice(&0u32.to_le_bytes()); // func_count = 0
         assert!(
@@ -1603,9 +1480,7 @@ mod tests {
         let map = realm.new_collection(false);
         realm.collection_set(map, NanBox::number(1.0), NanBox::number(10.0));
         realm.set_property(obj, "map", NanBox::handle(map.to_raw()));
-        let scope = crate::env::Scope::root();
-        scope.declare("cap", NanBox::number(7.0));
-        let func = realm.new_function(3, scope);
+        let func = realm.new_vm_function(3, alloc::vec![NanBox::number(7.0)]);
         realm.set_property(obj, "fn", NanBox::handle(func.to_raw()));
         // The remaining cell kinds: Date, BigInt, a settled Promise, and a Proxy —
         // so the mmap reload exercises all nine reference cell kinds.
@@ -1667,9 +1542,9 @@ mod tests {
             Some(NanBox::number(10.0))
         );
         let fn2 = Handle::from_raw(realm2.get_property(r2, "fn").unwrap().as_handle().unwrap());
-        let (fid, sc) = realm2.function_at(fn2).expect("restored closure");
+        let (fid, caps) = realm2.vm_function(fn2).expect("restored closure");
         assert_eq!(fid, 3);
-        assert_eq!(sc.get("cap"), Some(NanBox::number(7.0)));
+        assert_eq!(caps, &[NanBox::number(7.0)]);
         // Date / BigInt / Promise / Proxy all came through the mmap reload.
         let date2 = Handle::from_raw(
             realm2
@@ -1794,19 +1669,15 @@ mod tests {
 
     #[test]
     fn snapshots_functions_and_closures() {
-        use crate::env::Scope;
         let mut realm = Realm::new();
-        // A closure over a 2-level scope: outer { base: 100 (const) }, inner { x: 7 },
-        // and a captured heap object { tag: "cap" } bound as `obj` in the inner frame.
-        let outer = Scope::root();
-        outer.declare_const("base", NanBox::number(100.0));
-        let inner = outer.child();
-        inner.declare("x", NanBox::number(7.0));
+        // A VM closure capturing a number and a heap object { tag: "cap" }.
         let cap = realm.new_object();
         let tag = NanBox::handle(realm.new_string("cap").to_raw());
         realm.set_property(cap, "tag", tag);
-        inner.declare("obj", NanBox::handle(cap.to_raw()));
-        let func = realm.new_function(0xABCD, inner);
+        let func = realm.new_vm_function(
+            0xABCD,
+            alloc::vec![NanBox::number(7.0), NanBox::handle(cap.to_raw())],
+        );
 
         // capture → serialize → deserialize → restore.
         let snap = capture(&realm, &[func]);
@@ -1816,14 +1687,12 @@ mod tests {
         let mut realm2 = Realm::new();
         let f2 = restore(&mut realm2, &reloaded)[0];
 
-        // The function's code id and captured environment survive.
-        let (func_id, scope) = realm2.function_at(f2).expect("restored function");
+        // The function's code id and captured values survive.
+        let (func_id, caps) = realm2.vm_function(f2).expect("restored function");
         assert_eq!(func_id, 0xABCD);
-        assert_eq!(scope.get("x"), Some(NanBox::number(7.0)));
-        assert_eq!(scope.get("base"), Some(NanBox::number(100.0)));
-        assert!(scope.is_const("base"), "const-ness preserved");
+        assert_eq!(caps[0], NanBox::number(7.0));
         // The captured object came back too, with its property.
-        let obj = scope.get("obj").unwrap().as_handle().unwrap();
+        let obj = caps[1].as_handle().unwrap();
         let obj_tag = realm2.get_property(Handle::from_raw(obj), "tag").unwrap();
         assert_eq!(
             realm2.string_value(Handle::from_raw(obj_tag.as_handle().unwrap())),
@@ -1833,12 +1702,11 @@ mod tests {
 
     #[test]
     fn snapshots_preserve_accessor_properties() {
-        use crate::env::Scope;
         let mut realm = Realm::new();
         // A getter and setter (closures over `func_id`s 11 and 12) installed as an
         // accessor property, marked non-enumerable like a class accessor.
-        let getter = realm.new_function(11, Scope::root());
-        let setter = realm.new_function(12, Scope::root());
+        let getter = realm.new_vm_function(11, Vec::new());
+        let setter = realm.new_vm_function(12, Vec::new());
         let obj = realm.new_object();
         realm.define_accessor(
             obj,
@@ -1857,14 +1725,14 @@ mod tests {
         let (g2, s2) = realm2.accessor(o2, "value").expect("accessor restored");
         assert_eq!(
             realm2
-                .function_at(Handle::from_raw(g2.as_handle().unwrap()))
+                .vm_function(Handle::from_raw(g2.as_handle().unwrap()))
                 .map(|(id, _)| id),
             Some(11),
             "getter restored"
         );
         assert_eq!(
             realm2
-                .function_at(Handle::from_raw(s2.as_handle().unwrap()))
+                .vm_function(Handle::from_raw(s2.as_handle().unwrap()))
                 .map(|(id, _)| id),
             Some(12),
             "setter restored"

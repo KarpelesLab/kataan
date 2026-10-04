@@ -2,8 +2,8 @@
 //!
 //! A VM function containing a direct `eval` or a `with` statement keeps its
 //! bindings in interpreter [`Scope`]s, held by the VM as `Cell::Env` values, so
-//! eval code and object environments resolve names exactly as the
-//! tree-walker does. Each request runs with `current` (and `strict`) switched to
+//! eval code and object environments resolve names through the same
+//! environments. Each request runs with `current` (and `strict`) switched to
 //! the VM's environment for its duration.
 
 use super::*;
@@ -12,7 +12,7 @@ use crate::nbvm::{
     ENV_INIT_TDZ_LEXICAL, ENV_INIT_VAR, ENV_INIT_VAR_SET, EnvReq,
 };
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// A VM-held environment value for `scope`.
     pub(crate) fn env_value(&mut self, scope: Scope) -> NanBox {
         NanBox::handle(self.realm.new_env(scope).to_raw())
@@ -270,8 +270,8 @@ impl<'a> Interp<'a> {
                 let saved_current = core::mem::replace(&mut self.current, lex);
                 let saved_var = core::mem::replace(&mut self.var_scope, var);
                 let saved_strict = core::mem::replace(&mut self.strict, strict);
-                // The tree-walker's `this` (a fallback): in a derived
-                // constructor, the cell's value.
+                // The interpreter's `this` for the eval: in a derived
+                // constructor, the this-cell's current value.
                 let this = match derived.and_then(|(c, _)| c.as_handle()) {
                     Some(h) => self
                         .realm
@@ -287,12 +287,10 @@ impl<'a> Interp<'a> {
                 let saved_sc_scope =
                     core::mem::replace(&mut self.super_call_in_scope, derived.is_some());
                 let saved_derived = core::mem::replace(&mut self.vm_eval_derived, derived);
-                let saved_home = self.current_home.take();
                 let saved_home_object = core::mem::replace(
                     &mut self.current_home_object,
                     home.and_then(|h| h.as_handle()).map(Handle::from_raw),
                 );
-                let saved_lexical_home = self.current_lexical_home.take();
                 let saved_field_init =
                     core::mem::replace(&mut self.in_field_initializer, field_init);
                 let saved_vm_home = core::mem::replace(&mut self.vm_eval_home, home);
@@ -314,9 +312,7 @@ impl<'a> Interp<'a> {
                 self.new_target = saved_nt;
                 self.new_target_in_scope = saved_nt_scope;
                 self.super_call_in_scope = saved_sc_scope;
-                self.current_home = saved_home;
                 self.current_home_object = saved_home_object;
-                self.current_lexical_home = saved_lexical_home;
                 self.in_field_initializer = saved_field_init;
                 self.vm_eval_home = saved_vm_home;
                 self.vm_eval_privates = saved_privates;
@@ -416,7 +412,7 @@ impl<'a> Interp<'a> {
     /// compiler refuses it.
     pub(crate) fn vm_eval_program(
         &mut self,
-        program: &'a Program,
+        program: &'static Program,
         strict: bool,
         new_target: Option<NanBox>,
         script: bool,
@@ -448,8 +444,6 @@ impl<'a> Interp<'a> {
         let (table, proto) = self.vm_eval_proto(program, strict, flags, &names)?;
         // EvalDeclarationInstantiation's bindings (the VM code instantiates the
         // function declarations itself).
-        let saved_gc = core::mem::replace(&mut self.gc_ok, false);
-        let saved_src = core::mem::replace(&mut self.src, &program.source);
         let saved_epoch = self.eval_site_epoch;
         self.eval_site_counter += 1;
         self.eval_site_epoch = self.eval_site_counter;
@@ -460,7 +454,7 @@ impl<'a> Interp<'a> {
             Ok(())
         };
         self.hoist_skip_fns = true;
-        let hoisted = checked.and_then(|()| self.hoist_with_kind(&program.body, true, true));
+        let hoisted = checked.and_then(|()| self.declaration_instantiation(&program.body, true));
         self.hoist_skip_fns = false;
         let result = hoisted.and_then(|()| {
             let lex = self.env_value(self.current.clone());
@@ -479,8 +473,6 @@ impl<'a> Interp<'a> {
                 .map_err(vm_to_exec)
         });
         self.eval_site_epoch = saved_epoch;
-        self.src = saved_src;
-        self.gc_ok = saved_gc;
         result
     }
 
@@ -492,7 +484,7 @@ impl<'a> Interp<'a> {
     /// As [`vm_eval_program`](Self::vm_eval_program).
     pub(crate) fn vm_dynamic_function(
         &mut self,
-        program: &'a Program,
+        program: &'static Program,
         strict: bool,
         realm: Option<usize>,
     ) -> Result<NanBox, ExecError> {
@@ -515,7 +507,7 @@ impl<'a> Interp<'a> {
     /// newest function table — extended when the code defines functions.
     fn vm_eval_proto(
         &mut self,
-        program: &'a Program,
+        program: &'static Program,
         strict: bool,
         flags: u8,
         privates: &[&str],
@@ -544,10 +536,10 @@ impl<'a> Interp<'a> {
                 let first =
                     crate::nbvm::compile_eval_code(program, &mut scratch, strict, flags, privates);
                 let proto = match first {
-                    Err(e) => {
+                    Err(_e) => {
                         #[cfg(feature = "std")]
                         if std::env::var_os("KATAAN_DEBUG_EVAL").is_some() {
-                            std::eprintln!("eval compile: {e:?}: {}", program.source);
+                            std::eprintln!("eval compile: {_e:?}: {}", program.source);
                         }
                         return Err(ExecError::Unsupported(
                             "the bytecode compiler refused this eval code",
@@ -707,8 +699,7 @@ impl<'a> Interp<'a> {
             return Ok(());
         }
         // Unresolvable when resolved (a binding the right-hand side created —
-        // a direct eval's `var` — still takes the write, as in the
-        // tree-walker).
+        // a direct eval's `var` — still takes the write).
         if self.current.set(name, value) {
             self.sync_global_var(name, value);
             return Ok(());
@@ -734,5 +725,207 @@ impl<'a> Interp<'a> {
             return Err(self.not_defined(name));
         }
         self.declare_sloppy_global(name, value)
+    }
+}
+
+// --- identifier references: `with` objects, assignment, Annex B ---
+impl Interp {
+    /// Assigns `value` to an existing target (an identifier or member).
+    /// Finds the innermost active `with` object whose environment record provides
+    /// `name` — i.e. it `HasProperty(name)` and `name` is not blocked by the
+    /// object's `@@unscopables`. Returns the object handle, or `None` to fall back
+    /// to the lexical scope chain.
+    pub(crate) fn with_binding(&mut self, name: &str) -> Option<Handle> {
+        // Error-swallowing wrapper (a throwing `has` trap / revoked proxy collapses
+        // to "not a with binding") used by the assignment / `typeof` / `delete`
+        // reference sites. The value-read path uses `with_binding_result` so the
+        // trap's throw (a TypeError) propagates per HasBinding's `? HasProperty`.
+        self.with_binding_result(name).unwrap_or(None)
+    }
+
+    /// `HasBinding`-aware resolution of a bare identifier against the enclosing
+    /// `with` object frames, propagating any error thrown by an object environment
+    /// record's `HasProperty` (a proxy `has` trap, a revoked proxy, or a throwing
+    /// `@@unscopables` read).
+    /// Whether execution is lexically inside at least one active `with (obj)`
+    /// object environment. When it is, a bare-identifier reference's binding is
+    /// resolved object-first (`with_binding_result`); the global-object
+    /// write fallback (which assumes the reference resolved to the *global*
+    /// environment record) must not short-circuit that — e.g. a `with`-provided
+    /// binding deleted mid-assignment must still throw in strict mode rather than
+    /// silently retargeting a like-named global property.
+    pub(crate) fn in_with_scope(&self) -> bool {
+        let mut frame = Some(self.current.clone());
+        while let Some(s) = frame {
+            if s.with_obj().is_some() {
+                return true;
+            }
+            frame = s.parent();
+        }
+        false
+    }
+
+    pub(crate) fn with_binding_result(&mut self, name: &str) -> Result<Option<Handle>, ExecError> {
+        // Walk the scope chain from innermost outward, interleaving lexical frames
+        // with `with` object frames. A local binding shadows an enclosing `with`
+        // object; a `with` object shadows a binding further out. The first frame
+        // that either binds `name` locally or whose `with` object provides it wins.
+        let mut frame = Some(self.current.clone());
+        while let Some(s) = frame {
+            if s.has_local(name) {
+                // An inner lexical binding shadows any outer `with` object.
+                return Ok(None);
+            }
+            if let Some(obj) = s.with_obj()
+                && let Some(h) = obj.as_handle().map(Handle::from_raw)
+                && let Some(found) = self.with_frame_provides(h, name)?
+            {
+                return Ok(Some(found));
+            }
+            frame = s.parent();
+        }
+        Ok(None)
+    }
+
+    /// Whether the `with` object `h` provides `name` as an environment binding:
+    /// `HasProperty(name)` and not blocked by a truthy `@@unscopables[name]`.
+    /// `Ok(Some(h))` if it provides it; `Ok(None)` to keep looking further out; an
+    /// `Err` when `HasProperty` (a proxy `has` trap) or the `@@unscopables` read
+    /// throws.
+    fn with_frame_provides(&mut self, h: Handle, name: &str) -> Result<Option<Handle>, ExecError> {
+        // HasBinding for an object environment record is `? HasProperty(bindings,
+        // N)` — proxy-aware, so `with (new Proxy(o, {has(){…}}))` consults the
+        // `has` trap to decide whether `N` is a binding (a trapless proxy forwards
+        // to its target). A throwing / revoked / non-callable `has` trap propagates
+        // as a TypeError rather than being swallowed.
+        if !self.has_property_proxied(h, name)? {
+            return Ok(None);
+        }
+        // `@@unscopables`: only an **Object** value blocks bindings (spec: `If
+        // Type(unscopables) is Object`). A non-object (`''`, a number, `null`,
+        // `undefined`) is ignored — note a heap string is a `Handle` too, so a bare
+        // `as_handle()` check would wrongly treat `@@unscopables = ''` as an object.
+        let unscopables_sym = self.well_known_symbol("unscopables");
+        let unscopables_key = self.member_key(unscopables_sym);
+        let unscopables_val = self.read_member(h, &unscopables_key)?;
+        if self.is_object_value(unscopables_val)
+            && let Some(u) = unscopables_val.as_handle().map(Handle::from_raw)
+        {
+            let blocked = self.read_member(u, name)?;
+            if self.realm.truthy(blocked) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(h))
+    }
+
+    /// Assigns `value` to the identifier reference `name`, applying `with`-object
+    /// shadowing, the `const` reassignment check, and the strict/sloppy rules for
+    /// an unresolvable reference. Shared by `assign_to` and `set_assign_ref`.
+    pub(crate) fn assign_to_name(&mut self, name: &str, value: NanBox) -> Result<(), ExecError> {
+        // A bare identifier inside `with (obj)` assigns to the with-object's
+        // property (via `[[Set]]`, so setters fire) when it provides the name.
+        if let Some(h) = self.with_binding_result(name)? {
+            // `SetMutableBinding(N, V, S)` for an object environment record re-checks
+            // `? HasProperty(bindingObject, N)` (a second `has` trap) after the
+            // `HasBinding` resolution: if the binding no longer exists and the
+            // reference is strict, throw a ReferenceError; otherwise still `[[Set]]`.
+            if !self.has_property_proxied(h, name)? && self.strict {
+                let m = self.new_str(&alloc::format!("{name} is not defined"));
+                return Err(ExecError::Throw(
+                    self.make_error(N_REFERENCE_ERROR, Some(m)),
+                ));
+            }
+            let key = self.new_str(name);
+            self.assign_member_value(h, key, value)?;
+            return Ok(());
+        }
+        // Assigning to a lexical binding still in its temporal dead zone (a
+        // destructuring-assignment target `({ x } = …)` / `[x] = …` naming a
+        // `let`/`const` before its declaration executes) is a ReferenceError.
+        if self.current.get(name).is_some_and(|v| v.is_tdz()) {
+            let msg = self.new_str(&alloc::format!(
+                "Cannot access '{name}' before initialization"
+            ));
+            return Err(ExecError::Throw(
+                self.make_error(N_REFERENCE_ERROR, Some(msg)),
+            ));
+        }
+        // Reassigning a `const` binding is a TypeError.
+        if self.current.is_const(name) {
+            let m = self.new_str("Assignment to constant variable.");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        // A named-function-expression name is a soft immutable binding: strict
+        // reassignment throws, sloppy silently drops the write (`function fn() {
+        // fn &&= 1; }` leaves `fn` bound to the function).
+        if self.current.is_soft_const(name) {
+            if self.strict {
+                let m = self.new_str("Assignment to constant variable.");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
+            return Ok(());
+        }
+        if self.current.set(name, value) {
+            // A global `var` is mirrored as a property of the global object; keep
+            // the two in step so `this.x` sees the assignment.
+            self.sync_global_var(name, value);
+            return Ok(());
+        }
+        {
+            // A property on the global object (created via `this.x = …` /
+            // `globalThis.x = …`, or a global `var`) is a *resolvable* reference:
+            // assignment updates that property — in strict mode too. Only a truly
+            // *unresolvable* reference (no binding and no global-object property)
+            // is a strict-mode ReferenceError. Mirrors the read path's
+            // global-object own-property fallback (`read_ident_ref`). Skipped
+            // inside a `with` scope, where the reference is resolved object-first
+            // and a deleted binding must still reach the strict-mode throw below.
+            if !self.in_with_scope()
+                && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
+                && self.realm.has_own(g, name)
+            {
+                // …but a *non-writable* one (`NaN`, `Infinity`, `undefined`)
+                // rejects the write. `PutValue` on a strict reference whose
+                // `[[Set]]` returns false is a TypeError; sloppy code silently
+                // ignores it.
+                if self.realm.property_is_readonly(g, name) {
+                    if self.strict {
+                        let m = self.new_str(&alloc::format!(
+                            "Cannot assign to read only property '{name}'"
+                        ));
+                        return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                    }
+                    return Ok(());
+                }
+                self.realm.set_property(g, name, value);
+                return Ok(());
+            }
+            // Strict mode forbids creating an implicit global.
+            if self.strict {
+                let m = self.new_str(&alloc::format!("{name} is not defined"));
+                return Err(ExecError::Throw(
+                    self.make_error(N_REFERENCE_ERROR, Some(m)),
+                ));
+            }
+            // Sloppy mode: assigning to an unresolvable reference creates a property
+            // on the *global* object (not a binding in the current scope), so it is
+            // visible after a block/loop scope is popped.
+            self.declare_sloppy_global(name, value)?;
+        }
+        Ok(())
+    }
+
+    /// Writes a block-level function value to its `var`-hoisted binding in the
+    /// current variable environment (Annex B.3.3 / B.3.4 runtime update). When the
+    /// variable environment is the global scope, the global object property is
+    /// updated too (where global `var`/function bindings live).
+    pub(crate) fn annexb_update_var(&mut self, name: &str, value: NanBox) {
+        self.var_scope.declare(name, value);
+        if self.var_scope.ptr_eq(&self.global_scope)
+            && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
+        {
+            self.realm.set_property(g, name, value);
+        }
     }
 }

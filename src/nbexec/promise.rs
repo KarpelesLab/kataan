@@ -9,7 +9,7 @@ pub(crate) struct PromiseCapability {
     pub reject: NanBox,
 }
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// Builds an iterator object over a generator's eagerly-collected `values`:
     /// a hidden buffer array plus a `next()` cursor, recognized by `for-of`,
     /// spread, and a `next()` method.

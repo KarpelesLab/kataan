@@ -662,7 +662,7 @@ fn distribute_frac(f: &mut [f64; 10], from_idx: usize, remaining: i128, sign: f6
     }
 }
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// `new Temporal.Duration(...)`.
     pub(crate) fn duration_construct(
         &mut self,

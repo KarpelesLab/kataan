@@ -33,7 +33,7 @@ pub(crate) const GETTERS: &[&str] = &[
     "nanosecond",
 ];
 
-impl<'a> Interp<'a> {
+impl Interp {
     // --- small shared helpers -------------------------------------------------
 
     /// Builds a `RangeError` throw with `msg`.

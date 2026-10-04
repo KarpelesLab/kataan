@@ -1,6 +1,6 @@
 use super::*;
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// The tag used by `Object.prototype.toString` (`"[object <tag>]"`): a
     /// `Symbol.toStringTag` string property if present, else the built-in tag.
     /// Invokes a WASM export wrapper: `data` carries the module bytes and the

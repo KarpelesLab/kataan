@@ -993,7 +993,7 @@ fn datetime_diff(
     dur
 }
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// A `RangeError` with `msg`.
     fn zdt_range(&mut self, msg: &str) -> ExecError {
         let m = self.new_str(msg);

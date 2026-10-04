@@ -6,7 +6,8 @@
 
 #![cfg(all(feature = "module", feature = "std"))]
 
-use kataan::nbexec::module::{ModuleHost, eval_module_typed};
+use kataan::nbexec::module::ModuleHost;
+use kataan::nbvm::execute_module_typed;
 use std::collections::HashMap;
 
 /// An in-memory module host: specifiers resolve to their own string key, sources
@@ -31,7 +32,7 @@ fn run(entry: &str, modules: &[(&str, &str)]) -> (String, String) {
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
         .collect();
     let host = MemHost(map);
-    eval_module_typed(entry, &host, kataan::Limits::default())
+    execute_module_typed(entry, &host, kataan::Limits::default())
         .unwrap_or_else(|e| panic!("module eval failed: {}: {}", e.name, e.message))
 }
 
@@ -96,7 +97,7 @@ fn tla_rejection_propagates() {
         .into_iter()
         .collect();
     let host = MemHost(map);
-    let err = eval_module_typed("entry", &host, kataan::Limits::default())
+    let err = execute_module_typed("entry", &host, kataan::Limits::default())
         .expect_err("a post-await throw must reject the module evaluation");
     assert_eq!(err.name, "TypeError");
     assert!(

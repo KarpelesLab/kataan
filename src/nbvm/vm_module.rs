@@ -314,9 +314,9 @@ fn parse_script(source: &str) -> Result<Program, crate::nbexec::Thrown> {
 
 /// Runs `program` as a hosted script inside `interp` over the module-growable
 /// function table.
-fn run_hosted_script<'p>(
-    interp: &mut crate::nbexec::Interp<'p>,
-    program: &'p Program,
+fn run_hosted_script(
+    interp: &mut crate::nbexec::Interp,
+    program: &Program,
 ) -> Result<NanBox, crate::nbexec::Thrown> {
     let mut table: Vec<FnProto> = interp
         .module_vm_table()
@@ -368,7 +368,6 @@ pub(super) fn execute_module_entry(
     if let Some(program) = &program {
         run_hosted_script(&mut interp, program)?;
     }
-    interp.enable_vm_modules();
     let linked = interp
         .load_module_pub(entry_key, host)
         .and_then(|()| interp.link_module_pub(entry_key));
@@ -396,7 +395,6 @@ fn finish(
     if interp.vm_module_faulted() {
         return Err(super::internal_error("async module fault"));
     }
-    super::tree_walk_check(interp)?;
     result
 }
 
@@ -414,7 +412,6 @@ pub(super) fn execute_script_with_import_base(
     }
     let mut interp = crate::nbexec::Interp::new_with_limits(limits);
     interp.set_script_import_base(Some(String::from(base_path)));
-    interp.enable_vm_modules();
     let result = run_hosted_script(&mut interp, &program)
         .map(|v| (String::from(interp.output()), interp.display(v)));
     finish(&interp, result)

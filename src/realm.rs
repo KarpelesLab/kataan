@@ -100,10 +100,6 @@ pub struct Realm {
     /// `Foo.prototype.constructor === Foo` (and thus `instance.constructor`). Same
     /// id-keyed, GC-quiescent caveat as `fn_protos`.
     fn_ctor: alloc::collections::BTreeMap<u32, Handle>,
-    /// Lazily-materialized `.prototype` objects for class declarations/expressions,
-    /// keyed by the class-table id. Populated on first access with the class's
-    /// instance methods/accessors and a non-enumerable `constructor` back-link.
-    class_protos: alloc::collections::BTreeMap<u32, Handle>,
     /// Auxiliary named-property objects for non-object cells (arrays, functions),
     /// which have no inline object part. Keyed by the cell's handle. Not a GC root
     /// and not relocated on a moving collection — sound only because collection is
@@ -315,8 +311,8 @@ pub struct Realm {
     /// See [`crate::interrupt`].
     pub interrupt: Option<crate::interrupt::Interrupt>,
     /// Set by the host once a `$262.agent` worker exists: the bytecode VM's
-    /// loop back-edges then hand the agents' execution baton over (as the
-    /// tree-walker's do), so a spin loop waiting on another agent progresses.
+    /// loop back-edges then hand the agents' execution baton over, so a spin
+    /// loop waiting on another agent progresses.
     pub agents_active: bool,
     /// Set by the host once a second realm (`$262.createRealm()`, a
     /// `ShadowRealm`) exists: only then can a bytecode-VM function run in a
@@ -549,7 +545,6 @@ impl Realm {
             symbols_by_id: alloc::collections::BTreeMap::new(),
             fn_protos: alloc::collections::BTreeMap::new(),
             fn_ctor: alloc::collections::BTreeMap::new(),
-            class_protos: alloc::collections::BTreeMap::new(),
             aux_props: alloc::collections::BTreeMap::new(),
             fn_source: alloc::collections::BTreeMap::new(),
             length_tracking_views: alloc::collections::BTreeSet::new(),
@@ -1769,27 +1764,6 @@ impl Realm {
         h
     }
 
-    /// Allocates a closure: a function-table index plus its captured scope.
-    pub fn new_function(&mut self, func_id: u32, env: crate::env::Scope) -> Handle {
-        let h = self.heap.alloc(Cell::Function { func_id, env });
-        // Remember this function as the `constructor` for its `.prototype` (set when
-        // the prototype is first materialized). If the prototype already exists,
-        // link it now.
-        self.fn_ctor.insert(func_id, h);
-        if let Some(proto) = self.fn_protos.get(&func_id).copied() {
-            self.set_hidden_property(proto, "constructor", NanBox::handle(h.to_raw()));
-        }
-        h
-    }
-
-    /// The `(func_id, captured env)` of the function at `handle`, or `None` if it
-    /// is not callable.
-    #[must_use]
-    pub fn function_at(&self, handle: Handle) -> Option<(u32, crate::env::Scope)> {
-        let (id, env) = self.heap.get(handle)?.as_function()?;
-        Some((id, env.clone()))
-    }
-
     /// Allocates a VM-held host environment cell (see [`Cell::Env`]).
     pub fn new_env(&mut self, env: crate::env::Scope) -> Handle {
         self.heap.alloc(Cell::Env(env))
@@ -1817,32 +1791,6 @@ impl Realm {
     #[must_use]
     pub fn host_fn_at(&self, handle: Handle) -> Option<u32> {
         self.heap.get(handle)?.as_host_fn()
-    }
-
-    /// Allocates a class value (a class-table index plus its captured scope).
-    pub fn new_class(&mut self, class_id: u32, env: crate::env::Scope) -> Handle {
-        self.heap.alloc(Cell::Class { class_id, env })
-    }
-
-    /// The cached `.prototype` object for the class with id `class_id`, if it has
-    /// already been materialized.
-    #[must_use]
-    pub fn class_prototype_cached(&self, class_id: u32) -> Option<Handle> {
-        self.class_protos.get(&class_id).copied()
-    }
-
-    /// Registers a freshly-created `.prototype` object for the class with id
-    /// `class_id` (so repeated `C.prototype` reads return the same object and the
-    /// constructor's instances can share it).
-    pub fn set_class_prototype(&mut self, class_id: u32, proto: Handle) {
-        self.class_protos.insert(class_id, proto);
-    }
-
-    /// The `(class_id, captured env)` of the class at `handle`, or `None`.
-    #[must_use]
-    pub fn class_at(&self, handle: Handle) -> Option<(u32, crate::env::Scope)> {
-        let (id, env) = self.heap.get(handle)?.as_class()?;
-        Some((id, env.clone()))
     }
 
     /// Records the literal source text of the callable at `handle` (for
@@ -2784,9 +2732,7 @@ impl Realm {
                 Cell::Native(_)
                     | Cell::HostFn(_)
                     | Cell::BoundNative { .. }
-                    | Cell::Function { .. }
                     | Cell::VmFunction { .. }
-                    | Cell::Class { .. }
             )
         ) {
             let mut names = Vec::new();
@@ -3102,9 +3048,7 @@ impl Realm {
                     | Cell::Date(_)
                     | Cell::Collection { .. }
                     | Cell::Promise(_)
-                    | Cell::Function { .. }
                     | Cell::VmFunction { .. }
-                    | Cell::Class { .. }
                     | Cell::Native(_)
                     | Cell::HostFn(_)
                     | Cell::BoundNative { .. }
@@ -3549,8 +3493,9 @@ impl Realm {
         true
     }
 
-    /// Whether an `arr.length = new_len` set needs the descriptor-aware tree-walker
-    /// rather than the VM's plain `set_array_length`. True when the array's `length`
+    /// Whether an `arr.length = new_len` set needs the interpreter's
+    /// descriptor-aware ArraySetLength rather than the VM's plain
+    /// `set_array_length`. True when the array's `length`
     /// is non-writable (the set must be rejected / strict-thrown), or when a shrink
     /// could hit a non-configurable index (ArraySetLength's stop-and-fail). Returns
     /// `false` for the common unrestricted array, so the VM keeps its fast path.
@@ -4027,9 +3972,7 @@ impl Realm {
         if matches!(
             self.heap.get(handle),
             Some(
-                Cell::Function { .. }
-                    | Cell::VmFunction { .. }
-                    | Cell::Class { .. }
+                Cell::VmFunction { .. }
                     | Cell::Native(_)
                     | Cell::HostFn(_)
                     | Cell::BoundNative { .. }
@@ -4074,13 +4017,7 @@ impl Realm {
     pub fn is_callable_cell(&self, handle: Handle) -> bool {
         matches!(
             self.heap.get(handle),
-            Some(
-                Cell::Function { .. }
-                    | Cell::Class { .. }
-                    | Cell::Native(_)
-                    | Cell::HostFn(_)
-                    | Cell::BoundNative { .. }
-            )
+            Some(Cell::Native(_) | Cell::HostFn(_) | Cell::BoundNative { .. })
         )
     }
 
@@ -4325,10 +4262,8 @@ impl Realm {
     fn aux_eligible(&self, handle: Handle) -> bool {
         self.heap.get(handle).is_some_and(|c| {
             c.as_array().is_some()
-                || c.as_function().is_some()
                 || c.as_native().is_some()
                 || c.as_bound_native().is_some()
-                || c.as_class().is_some()
                 // A registered host function carries auxiliary named properties
                 // too (its `prototype` when `register_constructor`ed, and any own
                 // props an embedder sets on it).
@@ -4654,7 +4589,6 @@ impl Realm {
         // reach, so their values are strong roots.
         out.extend(self.native_protos.values().copied());
         out.extend(self.vm_fn_meta.iter().map(|(n, _)| *n));
-        out.extend(self.class_protos.values().copied());
         out.extend(self.intl_protos.values().copied());
         // Host-pinned values and the JIT's spilled temporaries.
         out.extend(
@@ -5337,12 +5271,7 @@ impl Realm {
                 // name is read from the own `name` property when materialized (else
                 // empty). This keeps `"" + fn` / `String(fn)` consistent with
                 // `fn.toString()`.
-                Some(
-                    Cell::Function { .. }
-                    | Cell::VmFunction { .. }
-                    | Cell::Native(_)
-                    | Cell::HostFn(_),
-                ) => {
+                Some(Cell::VmFunction { .. } | Cell::Native(_) | Cell::HostFn(_)) => {
                     let h = Handle::from_raw(raw);
                     if let Some(src) = self.fn_source(h) {
                         return src.into();
@@ -5354,18 +5283,6 @@ impl Realm {
                         .unwrap_or_default();
                     let seg = native_fn_name_segment(&name);
                     alloc::format!("function {seg}() {{ [native code] }}")
-                }
-                Some(Cell::Class { .. }) => {
-                    let h = Handle::from_raw(raw);
-                    if let Some(src) = self.fn_source(h) {
-                        return src.into();
-                    }
-                    let name = self
-                        .get_property(h, "name")
-                        .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
-                        .map(|v| self.to_display_string_seen(v, seen))
-                        .unwrap_or_default();
-                    alloc::format!("class {name} {{ }}")
                 }
                 Some(Cell::Collection { is_set, .. }) => {
                     if *is_set {
@@ -7278,9 +7195,9 @@ mod tests {
             let arr = realm.new_array(alloc::vec![NanBox::number(i as f64)]);
             realm.set_property(arr, "tag", NanBox::number(i as f64));
             // fn_protos + fn_ctor: a function, with its `.prototype` materialized.
-            let f = realm.new_function(1_000_000 + i as u32, crate::env::Scope::root());
+            let f = realm.new_vm_function(1_000_000 + i as u32, Vec::new());
+            realm.fn_ctor.insert(1_000_000 + i as u32, f);
             let _proto = realm.function_prototype(1_000_000 + i as u32);
-            let _ = f;
             // symbols_by_id: a fresh symbol (not referenced anywhere afterwards).
             let _sym = realm.new_symbol("s");
             // frozen/sealed/non_extensible_arrays: freeze a throwaway array.
@@ -7325,7 +7242,8 @@ mod tests {
 
         // A function with a materialized prototype + constructor back-ref, rooted.
         let fid = 7u32;
-        let f = realm.new_function(fid, crate::env::Scope::root());
+        let f = realm.new_vm_function(fid, Vec::new());
+        realm.fn_ctor.insert(fid, f);
         let proto = realm.function_prototype(fid);
 
         // A symbol used as a property key on a rooted object (the symbol cell is

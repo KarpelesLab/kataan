@@ -47,7 +47,7 @@ const DSTACK_METHODS: &[&str] = &["use", "adopt", "defer", "dispose", "move"];
 /// `AsyncDisposableStack.prototype` method names.
 const ADSTACK_METHODS: &[&str] = &["use", "adopt", "defer", "disposeAsync", "move"];
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// Installs the `DisposableStack`, `AsyncDisposableStack`, and `ShadowRealm`
     /// global constructors with their real `.prototype` objects. Invoked from
     /// realm setup after `Object.prototype` exists.
@@ -350,24 +350,6 @@ impl<'a> Interp<'a> {
         // `GetFunctionRealm(newTarget)` (spec step 4): a cross-realm newTarget uses
         // its own realm's intrinsic.
         Ok(self.realm_default_proto(default, nt))
-    }
-
-    /// Stamps the disposable-stack internal slots onto an instance built by a
-    /// subclass's `super()` (`class S extends DisposableStack {}`): the brand, an
-    /// empty disposer list, and `disposed = false`.
-    pub(crate) fn init_disposable_stack_super(&mut self, is_async: bool, instance: Handle) {
-        let (brand, list_key, disposed_key) = if is_async {
-            (ADSTACK_BRAND, ADSTACK_LIST, ADSTACK_DISPOSED)
-        } else {
-            (DSTACK_BRAND, DSTACK_LIST, DSTACK_DISPOSED)
-        };
-        self.realm
-            .set_hidden_property(instance, brand, NanBox::boolean(true));
-        let list = self.realm.new_array(Vec::new());
-        self.realm
-            .set_hidden_property(instance, list_key, NanBox::handle(list.to_raw()));
-        self.realm
-            .set_hidden_property(instance, disposed_key, NanBox::boolean(false));
     }
 
     /// `$262.createRealm()` — the Test262 cross-realm host hook. Builds a second
@@ -763,41 +745,6 @@ impl<'a> Interp<'a> {
         result
     }
 
-    /// Stamps the `ShadowRealm` internal slots onto a subclass-built instance.
-    pub(crate) fn init_shadow_realm_super(&mut self, instance: Handle) {
-        self.realm
-            .set_hidden_property(instance, SHADOWREALM_BRAND, NanBox::boolean(true));
-        // Allocate a genuinely-distinct realm (its own global object + intrinsics)
-        // so `evaluate` runs in an isolated environment whose `globalThis` side
-        // effects never leak to the host realm.
-        let idx = self.create_realm_env();
-        self.realm
-            .set_hidden_property(instance, SHADOWREALM_SCOPE_IDX, NanBox::number(idx as f64));
-    }
-
-    /// Applies `SuppressedError(error, suppressed, message)` semantics to a
-    /// subclass-built instance.
-    pub(crate) fn init_suppressed_error_super(&mut self, instance: Handle, args: &[NanBox]) {
-        let error = args.first().copied().unwrap_or(NanBox::undefined());
-        let suppressed = args.get(1).copied().unwrap_or(NanBox::undefined());
-        let message = args.get(2).copied().unwrap_or(NanBox::undefined());
-        if !matches!(message.unpack(), Unpacked::Undefined) {
-            let s = self
-                .coerce_to_string(message)
-                .unwrap_or_else(|_| String::new());
-            let m = self.new_str(&s);
-            self.realm.set_property(instance, "message", m);
-            self.realm.mark_hidden(instance, "message");
-        }
-        self.realm.set_property(instance, "error", error);
-        self.realm.mark_hidden(instance, "error");
-        self.realm.set_property(instance, "suppressed", suppressed);
-        self.realm.mark_hidden(instance, "suppressed");
-        // A `class S extends SuppressedError {}` instance inherits `[[ErrorData]]`.
-        self.realm
-            .set_hidden_property(instance, ERROR_DATA, NanBox::boolean(true));
-    }
-
     /// RequireInternalSlot for a disposable-stack receiver: returns the receiver
     /// handle when `this` carries the brand, else a TypeError.
     fn require_dstack(&mut self, brand: &str, what: &str) -> Result<Handle, ExecError> {
@@ -1021,39 +968,6 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Records a `using` / `await using` declaration's resource in the current
-    /// lexical scope's dispose list (run, LIFO, when the scope is exited). Mirrors
-    /// `CreateDisposableResource` + `AddDisposableResource`:
-    ///
-    /// * A `null`/`undefined` resource adds a no-op disposer (`method` is
-    ///   `undefined`) — allowed for both hints (the sync-dispose null/undefined
-    ///   short-circuit and the async path both record nothing to call).
-    /// * Otherwise the resource must be an Object (a non-object primitive — number,
-    ///   string, boolean, symbol, bigint — is a **TypeError** at the declaration),
-    ///   and `GetDisposeMethod(V, hint)` is read **once**: for `await using` the
-    ///   `@@asyncDispose` method, falling back to `@@dispose`; for `using` the
-    ///   `@@dispose` method. A missing or non-callable method is a TypeError here
-    ///   (at the declaration), per spec.
-    pub(crate) fn record_using_resource(
-        &mut self,
-        value: NanBox,
-        is_await: bool,
-    ) -> Result<(), ExecError> {
-        // `null`/`undefined`: record a no-op disposer (no method read).
-        if matches!(value.unpack(), Unpacked::Undefined | Unpacked::Null) {
-            self.current
-                .add_disposer(value, NanBox::undefined(), is_await);
-            return Ok(());
-        }
-        // A non-object primitive cannot be a disposable resource.
-        if !self.is_object_value(value) {
-            return Err(self.type_error("using declaration value is not an object"));
-        }
-        let method = self.using_dispose_method(value, is_await)?;
-        self.current.add_disposer(value, method, is_await);
-        Ok(())
-    }
-
     /// `GetDisposeMethod(V, hint)` for a `using`/`await using` declaration whose
     /// resource is a non-null Object. For `await using` (async-dispose hint) the
     /// `@@asyncDispose` method is read first, falling back to `@@dispose`; for
@@ -1111,14 +1025,10 @@ impl<'a> Interp<'a> {
     /// completion `.suppressed`); a non-throw abrupt completion from a disposer is
     /// propagated as-is.
     ///
-    /// This is the **non-suspending** driver, used by the eager tree-walker (a
-    /// plain function body / block, which has no coroutine to park) and by the
-    /// coroutine machine for a scope that holds only synchronous `using`
-    /// resources. A scope holding an `await using` resource is instead disposed by
-    /// the resumable `Step::Dispose` state machine in `generator.rs`, which turns
-    /// each async disposer's `Await` into a real suspension; the eager
-    /// `await_value` fallback below only survives for a stray `await using` the
-    /// walker somehow reaches (it resolves the result without a microtask turn).
+    /// This is the **non-suspending** driver (a scope holding only synchronous
+    /// `using` resources). A scope holding an `await using` resource is disposed
+    /// by the VM's own suspending loop instead (`VmHost::async_dispose_step`),
+    /// which turns each async disposer's `Await` into a real suspension.
     pub(crate) fn dispose_resources(
         &mut self,
         disposers: alloc::vec::Vec<(NanBox, NanBox, bool)>,
@@ -1604,7 +1514,7 @@ impl<'a> Interp<'a> {
     fn shadow_realm_run_program(
         &mut self,
         realm_idx: usize,
-        program: &'a Program,
+        program: &'static Program,
     ) -> Result<NanBox, ExecError> {
         if self.eval_depth >= self.realm.limits.max_eval_depth {
             let msg = self.new_str("Maximum call stack size exceeded");

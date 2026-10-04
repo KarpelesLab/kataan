@@ -1,10 +1,8 @@
 //! The ECMAScript **module** subsystem: a module record / resolve+load /
-//! link / evaluate pipeline layered on the [`Interp`]
-//! tree-walker, plus dynamic `import()` and `import.meta`.
-//!
-//! This is the abstract-operations machinery of ECMA-262 §16.2 reduced to the
-//! shape that fits a tree-walking interpreter whose lexical environments are
-//! shared `Rc<RefCell<…>>` [`Scope`]s:
+//! link / evaluate pipeline in the [`Interp`], plus dynamic `import()` and
+//! `import.meta`. Module *code* runs on the bytecode VM (`crate::nbvm`'s
+//! `vm_module`); this is the abstract-operations machinery of ECMA-262 §16.2
+//! around it, over shared `Rc<RefCell<…>>` [`Scope`] environments:
 //!
 //! - **Parse** a source to a `ModuleRecord`: its import requests, its local /
 //!   indirect / star exports, and the (leaked) AST body.
@@ -34,140 +32,6 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-
-/// Loads, links, and evaluates the ES-module graph rooted at the resolved
-/// `entry_key` through `host`, returning `(console_output, completion_string)`
-/// on success or a structured [`Thrown`] (carrying the JS error *type*) on a
-/// parse-, link-, or evaluation-phase failure — the module analogue of
-/// [`eval_source_typed`](super::eval_source_typed), for the Test262 runner.
-///
-/// # Errors
-/// Returns [`Thrown`] for any parse, link, or runtime failure in the graph.
-pub fn eval_module_typed(
-    entry_key: &str,
-    host: &dyn ModuleHost,
-    limits: crate::limits::Limits,
-) -> Result<(String, String), Thrown> {
-    use super::ErrorPhase;
-    let mut interp = Interp::new_with_limits(limits);
-    // Load + link are the *parse/resolution* phase (a missing/ambiguous export or
-    // a malformed dependency is a parse-phase SyntaxError per the runner's
-    // `negative: { phase: parse|resolution }` expectation). Evaluation is the
-    // runtime phase.
-    let linked = interp
-        .load_module_pub(entry_key, host)
-        .and_then(|()| interp.link_module_pub(entry_key));
-    if let Err(e) = linked {
-        return Err(interp.exec_error_to_thrown(e, ErrorPhase::Parse));
-    }
-    match interp.evaluate_entry(entry_key) {
-        Ok(ns) => {
-            let completion = interp.display(ns);
-            Ok((String::from(interp.output()), completion))
-        }
-        Err(e) => Err(interp.exec_error_to_thrown(e, ErrorPhase::Runtime)),
-    }
-}
-
-/// Like [`eval_module_typed`], but first evaluates `prelude` as ordinary script
-/// code in the module realm's global (installing global functions/values such as
-/// the Test262 harness `assert`/`Test262Error`), then loads, links, and
-/// evaluates the module graph rooted at `entry_key`. The module body sees the
-/// prelude's globals (a module can read any global binding).
-///
-/// # Errors
-/// Returns [`Thrown`] for a prelude parse/throw or any graph failure.
-pub fn eval_module_typed_with_prelude(
-    entry_key: &str,
-    host: &dyn ModuleHost,
-    prelude: &str,
-    limits: crate::limits::Limits,
-) -> Result<(String, String), Thrown> {
-    use super::ErrorPhase;
-    let mut interp = Interp::new_with_limits(limits);
-    // Evaluate the prelude as a script in the global environment.
-    if !prelude.is_empty() {
-        let program = match crate::parser::Parser::parse_program(prelude) {
-            Ok(p) => alloc::boxed::Box::leak(alloc::boxed::Box::new(p)),
-            Err(e) => {
-                return Err(Thrown {
-                    phase: ErrorPhase::Parse,
-                    name: String::from("SyntaxError"),
-                    message: alloc::format!("{e}"),
-                });
-            }
-        };
-        if let Err(e) = interp.run_tree_walk(program) {
-            return Err(interp.exec_error_to_thrown(e, ErrorPhase::Runtime));
-        }
-    }
-    let linked = interp
-        .load_module_pub(entry_key, host)
-        .and_then(|()| interp.link_module_pub(entry_key));
-    if let Err(e) = linked {
-        return Err(interp.exec_error_to_thrown(e, ErrorPhase::Parse));
-    }
-    match interp.evaluate_entry(entry_key) {
-        Ok(ns) => {
-            let completion = interp.display(ns);
-            Ok((String::from(interp.output()), completion))
-        }
-        Err(e) => Err(interp.exec_error_to_thrown(e, ErrorPhase::Runtime)),
-    }
-}
-
-/// Runs `source` as a script with a dynamic-`import()` base of `base_path` (so
-/// `import("./x.js")` resolves relative to the script file). Mirrors
-/// `eval_source_typed` otherwise.
-///
-/// # Errors
-/// Returns [`Thrown`] for a parse failure or uncaught throw.
-pub fn eval_script_typed_with_import_base(
-    source: &str,
-    base_path: &str,
-    limits: crate::limits::Limits,
-) -> Result<(String, String), Thrown> {
-    use super::ErrorPhase;
-    let program = match crate::parser::Parser::parse_program(source) {
-        Ok(p) => alloc::boxed::Box::leak(alloc::boxed::Box::new(p)),
-        Err(e) => {
-            return Err(Thrown {
-                phase: ErrorPhase::Parse,
-                name: String::from("SyntaxError"),
-                message: alloc::format!("{e}"),
-            });
-        }
-    };
-    let mut interp = Interp::new_with_limits(limits);
-    interp.set_script_import_base(Some(base_path.to_string()));
-    match interp.run_tree_walk(program) {
-        Ok(value) => {
-            let completion = interp.display(value);
-            Ok((String::from(interp.output()), completion))
-        }
-        Err(e) => Err(interp.exec_error_to_thrown(e, ErrorPhase::Runtime)),
-    }
-}
-
-/// Like [`eval_module_typed`] but returns a flattened message on failure (for
-/// the CLI / embedders that do not need the structured error type).
-///
-/// # Errors
-/// Returns a human-readable message on any failure.
-pub fn eval_module(
-    entry_key: &str,
-    host: &dyn ModuleHost,
-    limits: crate::limits::Limits,
-) -> Result<(String, String), String> {
-    match eval_module_typed(entry_key, host, limits) {
-        Ok(ok) => Ok(ok),
-        Err(t) => Err(if t.message.is_empty() {
-            t.name
-        } else {
-            alloc::format!("{}: {}", t.name, t.message)
-        }),
-    }
-}
 
 /// A host hook that resolves a module specifier (relative to its referrer) to a
 /// canonical key and loads the corresponding source text. The runner and CLI
@@ -443,8 +307,9 @@ struct ModuleRecord {
     /// set on a cycle root, or on a module whose evaluation failed outright).
     top_level_capability: Option<crate::heap::Handle>,
     /// The module's code on the bytecode VM: its VM module index and function
-    /// table entries (see `crate::nbvm::compile_module_into`); `None` runs it
-    /// on the tree-walker.
+    /// table entries (see `crate::nbvm::compile_module_into`); `None` for a
+    /// synthetic (JSON / text / bytes) module, or one the compiler refused
+    /// (which fails to link).
     vm: Option<(u32, crate::nbvm::ModuleProtos)>,
     /// Whether compiling for the VM was already attempted.
     vm_tried: bool,
@@ -461,9 +326,6 @@ pub struct ModuleRegistry {
     /// with another `Evaluate` in the same agent, so a dynamic `import()` reached
     /// from a module body must defer its own link/evaluate to a job.
     evaluating_depth: u32,
-    /// Module code runs on the bytecode VM (`ROADMAP.md` §2.0) — set by the
-    /// VM entry points.
-    vm_enabled: bool,
     /// VM module index → module key.
     vm_keys: Vec<String>,
     /// VM module index → the module's environment and import aliases, set at
@@ -472,7 +334,7 @@ pub struct ModuleRegistry {
     /// The function table holding every VM-compiled module (and the code
     /// compiled before them); it only grows.
     vm_table: Option<Rc<[crate::nbvm::FnProto]>>,
-    /// Why the first module the VM refused runs on the tree-walker.
+    /// Why the first module the VM refused could not run.
     vm_note: Option<String>,
     /// A VM fault happened where it could not propagate (see
     /// `Interp::vm_module_faulted`).
@@ -494,7 +356,6 @@ impl ModuleRegistry {
             records: BTreeMap::new(),
             async_order_counter: 0,
             evaluating_depth: 0,
-            vm_enabled: false,
             vm_keys: Vec::new(),
             vm_envs: Vec::new(),
             vm_table: None,
@@ -520,7 +381,7 @@ impl ModuleRegistry {
 /// The synthetic local name an `export default` value is bound under.
 pub(crate) const DEFAULT_LOCAL: &str = "*default*";
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// Loads, links, and evaluates the module graph rooted at `entry_key`
     /// (already resolved by the host), then runs the event loop to quiescence.
     /// The host owns specifier resolution and source loading.
@@ -1127,71 +988,16 @@ impl<'a> Interp<'a> {
     /// scope as their closure environment — the link-time function instantiation
     /// that makes functions usable across import cycles.
     fn instantiate_module_functions(&mut self, key: &str) -> Result<(), ExecError> {
-        if let Some((_, protos)) = self.modules.records[key].vm {
-            return self.vm_instantiate(key, protos);
-        }
-        // A module the bytecode compiler refused fails to link: module code
-        // runs only on the VM.
-        if self.modules.vm_enabled
-            && matches!(self.modules.records[key].kind, ModuleKind::JavaScript)
-        {
-            return Err(ExecError::Unsupported(
+        match self.modules.records[key].vm {
+            Some((_, protos)) => self.vm_instantiate(key, protos),
+            // A synthetic (JSON / text / bytes) module declares no functions.
+            None if !matches!(self.modules.records[key].kind, ModuleKind::JavaScript) => Ok(()),
+            // A module the bytecode compiler refused fails to link: module code
+            // runs only on the VM.
+            None => Err(ExecError::Unsupported(
                 "the bytecode compiler refused this module",
-            ));
+            )),
         }
-        let (scope, program) = {
-            let r = &self.modules.records[key];
-            (r.scope.clone(), r.program)
-        };
-        let saved = core::mem::replace(&mut self.current, scope.clone());
-        let saved_strict = core::mem::replace(&mut self.strict, true);
-        for stmt in &program.body {
-            let inner = match stmt {
-                Stmt::Function(_) => stmt,
-                Stmt::Export(ExportDecl::Decl { declaration, .. })
-                | Stmt::Export(ExportDecl::Default { declaration, .. }) => declaration,
-                _ => continue,
-            };
-            if let Stmt::Function(func) = inner {
-                let is_default = matches!(stmt, Stmt::Export(ExportDecl::Default { .. }));
-                match &func.id {
-                    Some(id) => {
-                        let value = self.make_function(
-                            &func.params,
-                            super::Body::Block(&func.body),
-                            func.is_async,
-                            func.is_generator,
-                        );
-                        self.set_fn_name(value, &id.name);
-                        self.set_fn_source(value, func.span);
-                        scope.declare(&id.name, value);
-                        // `export default function f` also binds `*default*`.
-                        if is_default {
-                            scope.declare_const(DEFAULT_LOCAL, value);
-                        }
-                    }
-                    // `export default function() {}` / `function*() {}` (anonymous)
-                    // is a HoistableDeclaration: instantiate it now under
-                    // `*default*` with the name "default", so an importer can call
-                    // the default export before this module's body has run.
-                    None if is_default => {
-                        let value = self.make_function(
-                            &func.params,
-                            super::Body::Block(&func.body),
-                            func.is_async,
-                            func.is_generator,
-                        );
-                        self.set_fn_name(value, "default");
-                        self.set_fn_source(value, func.span);
-                        scope.declare_const(DEFAULT_LOCAL, value);
-                    }
-                    None => {}
-                }
-            }
-        }
-        self.current = saved;
-        self.strict = saved_strict;
-        Ok(())
     }
 
     /// `ResolveExport(module, name)` — finds the *binding slot* (scope + local
@@ -1533,26 +1339,10 @@ impl<'a> Interp<'a> {
     /// continuations. Returns immediately: the graph walk continues while the body
     /// is parked on its `await`.
     fn execute_async_module(&mut self, key: &str) {
+        // Only a module the VM compiled links, so it has its VM protos.
         if let Some((_, protos)) = self.modules.records[key].vm {
             self.vm_execute_async_module(key, protos);
-            return;
         }
-        let (promise, id, controller) = self.start_module_coroutine(key);
-        let state = self.new_str(key);
-        let Some(state) = state.as_handle().map(crate::heap::Handle::from_raw) else {
-            return;
-        };
-        let on_f = self
-            .realm
-            .new_bound_native(super::N_MODULE_FULFILLED, state);
-        let on_r = self.realm.new_bound_native(super::N_MODULE_REJECTED, state);
-        self.register_then(
-            promise,
-            NanBox::handle(on_f.to_raw()),
-            NanBox::handle(on_r.to_raw()),
-            false,
-        );
-        self.drive_module_coroutine(id, controller);
     }
 
     /// `AsyncModuleExecutionFulfilled(module)` (16.2.1.5.3.3) — the module's body
@@ -1716,288 +1506,10 @@ impl<'a> Interp<'a> {
     /// `import.meta` set up. Modules are always strict. A top-level-await module
     /// goes through [`Self::execute_async_module`] instead.
     fn run_module_body(&mut self, key: &str) -> Result<(), ExecError> {
-        // Module evaluation is driven from the linker with live records in Rust
-        // locals, and a module graph's namespaces/import aliases are root sources
-        // the safepoint does not trace — fence the whole body.
-        let saved_gc = core::mem::replace(&mut self.gc_ok, false);
-        let r = self.run_module_body_inner(key);
-        self.gc_ok = saved_gc;
-        r
-    }
-
-    fn run_module_body_inner(&mut self, key: &str) -> Result<(), ExecError> {
-        if let Some((_, protos)) = self.modules.records[key].vm {
-            return self.vm_call_proto(protos.main).map(|_| ());
-        }
-        let (scope, program, aliases) = {
-            let r = &self.modules.records[key];
-            (r.scope.clone(), r.program, r.import_aliases.clone())
-        };
-        // `import.meta` (built lazily, once).
-        let meta = self.module_meta(key);
-
-        let saved_scope = core::mem::replace(&mut self.current, scope.clone());
-        let saved_var = core::mem::replace(&mut self.var_scope, scope.clone());
-        let saved_strict = core::mem::replace(&mut self.strict, true);
-        let saved_imports = core::mem::replace(&mut self.module_imports, aliases);
-        let saved_meta = self.import_meta.replace(meta);
-        let saved_this = core::mem::replace(&mut self.this_val, NanBox::undefined());
-        let saved_annexb = core::mem::take(&mut self.annexb_block_fns);
-        let saved_active = self.active_module_key.replace(key.to_string());
-
-        let result = self.exec_module_stmts(&program.body);
-
-        self.current = saved_scope;
-        self.var_scope = saved_var;
-        self.strict = saved_strict;
-        self.module_imports = saved_imports;
-        self.import_meta = saved_meta;
-        self.this_val = saved_this;
-        self.annexb_block_fns = saved_annexb;
-        self.active_module_key = saved_active;
-        result
-    }
-
-    /// `ExecuteModule(capability)` for a **top-level-await** module: builds the
-    /// suspendable async coroutine over the body and returns its evaluation
-    /// promise (the spec's capability), *without* driving it — the caller hooks
-    /// the promise first (`ExecuteAsyncModule` steps 5–11 precede step 12) and
-    /// then calls [`Self::drive_module_coroutine`] to run the first synchronous
-    /// burst.
-    fn start_module_coroutine(
-        &mut self,
-        key: &str,
-    ) -> (crate::heap::Handle, usize, crate::heap::Handle) {
-        let (scope, program) = {
-            let r = &self.modules.records[key];
-            (r.scope.clone(), r.program)
-        };
-        // `import.meta` (built lazily, once) — materialised before the coroutine
-        // runs so an early `import.meta` read on the first burst sees it.
-        let _ = self.module_meta(key);
-        // Pre-declare the `*default*` lexical binding in its Temporal Dead Zone for
-        // an anonymous `export default <expr>` (as `exec_module_stmts` does), so a
-        // namespace access of `default` before the statement runs is a
-        // ReferenceError. A *named* default (`export default function f`) hoists
-        // ordinarily and is excluded.
-        for stmt in &program.body {
-            if let Stmt::Export(ExportDecl::Default { declaration, .. }) = stmt
-                && !matches!(
-                    &**declaration,
-                    Stmt::Function(crate::ast::Function { id: Some(_), .. })
-                )
-                && !scope.has_local(DEFAULT_LOCAL)
-            {
-                scope.declare(DEFAULT_LOCAL, NanBox::tdz());
-            }
-        }
-        // Capture a module-appropriate execution context into the coroutine frame:
-        // `this` is undefined, no home object / new.target, always strict. The
-        // per-resume module ambient state (import aliases, `import.meta`, active
-        // key, var environment) is installed by `async_step` from the controller's
-        // module key, so it is *not* part of the frame.
-        let saved_this = core::mem::replace(&mut self.this_val, NanBox::undefined());
-        let saved_target = core::mem::replace(&mut self.new_target, NanBox::undefined());
-        let saved_home = self.current_home.take();
-        let saved_home_static = core::mem::replace(&mut self.current_home_static, false);
-        let saved_home_obj = self.current_home_object.take();
-        let saved_strict = core::mem::replace(&mut self.strict, true);
-        let (id, promise, controller) =
-            self.make_async_frame(super::Body::Block(&program.body), scope);
-        self.this_val = saved_this;
-        self.new_target = saved_target;
-        self.current_home = saved_home;
-        self.current_home_static = saved_home_static;
-        self.current_home_object = saved_home_obj;
-        self.strict = saved_strict;
-        // Tag the controller as a module coroutine so each resume re-establishes
-        // the module's ambient state.
-        let key_val = self.new_str(key);
-        self.realm
-            .set_hidden_property(controller, super::MODULE_KEY, key_val);
-        (promise, id, controller)
-    }
-
-    /// Runs the first synchronous burst of a module coroutine built by
-    /// [`Self::start_module_coroutine`] — the body up to its first top-level
-    /// `await`, or to completion for a body whose `await` is never reached. The
-    /// module does **not** block here: control returns to the graph walk while the
-    /// body is parked.
-    fn drive_module_coroutine(&mut self, id: usize, controller: crate::heap::Handle) {
-        self.async_step(
-            id,
-            controller,
-            super::generator::Resumption::Next(NanBox::undefined()),
-        );
-    }
-
-    /// True when the statement list being hoisted is a **module body's** top
-    /// level: the active module's environment is the variable environment being
-    /// populated. (A nested function body inside the module has its own scope, so
-    /// it does not match.)
-    pub(crate) fn at_module_top_level(&self) -> bool {
-        self.active_module_key
-            .as_ref()
-            .and_then(|k| self.modules.records.get(k))
-            .is_some_and(|r| r.scope.ptr_eq(&self.var_scope))
-    }
-
-    /// If `controller` is an async coroutine driving a module body (it carries a
-    /// [`MODULE_KEY`] slot), install that module's ambient evaluation state (import
-    /// aliases, `import.meta`, active-module key, and the module top-level variable
-    /// environment), returning the prior state to restore afterwards. Returns
-    /// `None` for an ordinary async-function controller (no module context).
-    pub(crate) fn enter_module_context_for_controller(
-        &mut self,
-        controller: crate::heap::Handle,
-    ) -> Option<ModuleContextSave> {
-        let key = self
-            .realm
-            .get_property(controller, super::MODULE_KEY)
-            .and_then(|v| v.as_handle())
-            .map(crate::heap::Handle::from_raw)
-            .and_then(|h| self.realm.string_value(h))?;
-        let (var_scope, aliases) = {
-            let r = self.modules.records.get(&key)?;
-            (r.scope.clone(), r.import_aliases.clone())
-        };
-        let meta = self.module_meta(&key);
-        Some(ModuleContextSave {
-            var_scope: core::mem::replace(&mut self.var_scope, var_scope),
-            module_imports: core::mem::replace(&mut self.module_imports, aliases),
-            import_meta: self.import_meta.replace(meta),
-            active_module_key: self.active_module_key.replace(key),
-            annexb_block_fns: core::mem::take(&mut self.annexb_block_fns),
-        })
-    }
-
-    /// Restores the ambient module-evaluation state saved by
-    /// [`Self::enter_module_context_for_controller`].
-    pub(crate) fn exit_module_context(&mut self, save: ModuleContextSave) {
-        self.var_scope = save.var_scope;
-        self.module_imports = save.module_imports;
-        self.import_meta = save.import_meta;
-        self.active_module_key = save.active_module_key;
-        self.annexb_block_fns = save.annexb_block_fns;
-    }
-
-    /// Hoists then executes a module body's statements, treating `import` as a
-    /// no-op (bindings were wired at link time) and `export` by evaluating its
-    /// inner declaration / default expression.
-    fn exec_module_stmts(&mut self, stmts: &'a [Stmt]) -> Result<(), ExecError> {
-        // `var` + function-declaration hoisting at the module variable
-        // environment boundary (lexical `let`/`const`/`class` bind on execution).
-        self.hoist_with(stmts, true)?;
-        // `export default <AssignmentExpression>` (and an anonymous default
-        // function/class) binds the synthetic `*default*` lexical name, which is
-        // in its Temporal Dead Zone until the `export default` statement runs — so
-        // a namespace `[[Get]]`/`[[GetOwnProperty]]` of `default` before then
-        // throws a ReferenceError. A *named* `export default function f` hoists
-        // like an ordinary function declaration (never TDZ), so it is excluded.
-        for stmt in stmts {
-            if let Stmt::Export(ExportDecl::Default { declaration, .. }) = stmt
-                && !matches!(
-                    &**declaration,
-                    Stmt::Function(crate::ast::Function { id: Some(_), .. })
-                )
-                && !self.current.has_local(DEFAULT_LOCAL)
-            {
-                self.current.declare(DEFAULT_LOCAL, NanBox::tdz());
-            }
-        }
-        for stmt in stmts {
-            match stmt {
-                Stmt::Import(_) => {}
-                Stmt::Export(decl) => self.exec_export(decl)?,
-                other => {
-                    self.exec(other)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Evaluates an `export` declaration's payload (the binding side; the export
-    /// *slot* wiring already happened at link time).
-    pub(crate) fn exec_export(&mut self, decl: &'a ExportDecl) -> Result<(), ExecError> {
-        match decl {
-            // Re-exports and bare `export { … }` bind nothing locally.
-            ExportDecl::All { .. } => Ok(()),
-            ExportDecl::Named {
-                source: Some(_), ..
-            } => Ok(()),
-            ExportDecl::Named { source: None, .. } => Ok(()),
-            ExportDecl::Decl { declaration, .. } => {
-                self.exec(declaration)?;
-                Ok(())
-            }
-            ExportDecl::Default { declaration, .. } => {
-                // `export default function/class …` declares a *named* binding too
-                // (the `default` export resolves to it, set up in `parse_module`);
-                // `export default <expr>` binds the value under `*default*`.
-                match &**declaration {
-                    // A *named* function/class declaration: execute it (it hoists /
-                    // binds its own name), then alias `*default*` to that value so
-                    // an anonymous-export observer still sees it.
-                    Stmt::Function(crate::ast::Function { id: Some(_), .. })
-                    | Stmt::Class(crate::ast::Class { id: Some(_), .. }) => {
-                        self.exec(declaration)?;
-                        let value = decl_name(declaration)
-                            .and_then(|n| self.current.get(n))
-                            .unwrap_or_else(NanBox::undefined);
-                        self.current.declare_const(DEFAULT_LOCAL, value);
-                        Ok(())
-                    }
-                    // An *anonymous* `export default function(){}` / `class {}`:
-                    // build the value as an expression and give it the name
-                    // `"default"` (NamedEvaluation), bound under `*default*`.
-                    Stmt::Function(func) => {
-                        let value = self.make_function(
-                            &func.params,
-                            super::Body::Block(&func.body),
-                            func.is_async,
-                            func.is_generator,
-                        );
-                        self.set_fn_name(value, "default");
-                        self.set_fn_source(value, func.span);
-                        self.current.declare_const(DEFAULT_LOCAL, value);
-                        Ok(())
-                    }
-                    Stmt::Class(class) => {
-                        // NamedEvaluation gives the anonymous class the name "default"
-                        // *before* its static initializers run, so a
-                        // `static f = this.name` observes "default" (not "").
-                        self.pending_class_name = Some("default");
-                        let value = self.make_class(class);
-                        self.pending_class_name = None;
-                        let value = value?;
-                        self.set_fn_name(value, "default");
-                        self.current.declare_const(DEFAULT_LOCAL, value);
-                        Ok(())
-                    }
-                    Stmt::Expr { expression, .. } => {
-                        // `export default <expr>`: an anonymous function/class/arrow
-                        // expression is named "default" by NamedEvaluation
-                        // (`set_fn_name` is a no-op on a value that already has a
-                        // name or is not a function/class).
-                        let value = self.eval(expression)?;
-                        if matches!(
-                            &**expression,
-                            crate::ast::Expr::Function(crate::ast::Function { id: None, .. })
-                                | crate::ast::Expr::Class(crate::ast::Class { id: None, .. })
-                                | crate::ast::Expr::Arrow(_)
-                        ) {
-                            self.set_fn_name(value, "default");
-                        }
-                        self.current.declare_const(DEFAULT_LOCAL, value);
-                        Ok(())
-                    }
-                    other => {
-                        self.exec(other)?;
-                        Ok(())
-                    }
-                }
-            }
+        // A synthetic module has no body; only a module the VM compiled links.
+        match self.modules.records[key].vm {
+            Some((_, protos)) => self.vm_call_proto(protos.main).map(|_| ()),
+            None => Ok(()),
         }
     }
 
@@ -2456,44 +1968,6 @@ impl<'a> Interp<'a> {
 
     // --- Dynamic import() -----------------------------------------------
 
-    /// Evaluates `import(specifier)` — a synchronous-best-effort dynamic import
-    /// that loads, links, and evaluates the referenced module and returns a
-    /// promise fulfilled with its namespace object (or rejected on any
-    /// resolve/load/link/evaluate failure). The specifier resolves relative to
-    /// the *currently evaluating* module (or the entry, for a script).
-    pub(crate) fn dynamic_import(
-        &mut self,
-        arguments: &'a [crate::ast::Argument],
-    ) -> Result<NanBox, ExecError> {
-        // Evaluate the specifier and the optional options argument *before* the
-        // promise capability exists: a throw from either expression (or its
-        // `GetValue`) propagates synchronously per `ImportCall` steps 2–4, and
-        // both are evaluated in source order (`2nd-param-evaluation-sequence`).
-        let spec = match arguments.first() {
-            Some(crate::ast::Argument::Item(e)) => self.eval(e)?,
-            _ => NanBox::undefined(),
-        };
-        let options = match arguments.get(1) {
-            Some(crate::ast::Argument::Item(e)) => Some(self.eval(e)?),
-            _ => None,
-        };
-        Ok(self.dynamic_import_values(spec, options))
-    }
-
-    /// `ImportCall` from step 5 on, with the specifier and options arguments
-    /// already evaluated. Split out of [`Self::dynamic_import`] so the
-    /// generator/async step machine can drive a `yield`/`await` inside either
-    /// argument (`import(yield)`) and only then perform the import — so an abrupt
-    /// completion at that suspension skips it entirely.
-    pub(crate) fn dynamic_import_values(
-        &mut self,
-        spec: NanBox,
-        options: Option<NanBox>,
-    ) -> NanBox {
-        let referrer = self.current_module_key();
-        self.dynamic_import_from(referrer, spec, options)
-    }
-
     /// [`Self::dynamic_import_values`] with the referrer (the importing
     /// module's key, or a script's import base) given.
     fn dynamic_import_from(
@@ -2833,33 +2307,6 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Evaluates `import.defer(specifier)` (import-defer proposal): loads and
-    /// links the module but does *not* evaluate it, and returns a promise
-    /// fulfilled with its **Deferred Module Namespace** (which evaluates lazily on
-    /// first access — identical object to the static `import defer * as ns`).
-    pub(crate) fn dynamic_import_deferred(
-        &mut self,
-        arguments: &'a [crate::ast::Argument],
-    ) -> Result<NanBox, ExecError> {
-        let promise = self.fresh_promise();
-        let spec = match arguments.first() {
-            Some(crate::ast::Argument::Item(e)) => self.eval(e)?,
-            _ => NanBox::undefined(),
-        };
-        let referrer = self.current_module_key();
-        let host = FileModuleHost;
-        let resolved: Result<String, ExecError> = (|this: &mut Self| {
-            let spec_str = this.coerce_to_string(spec)?;
-            host.resolve(&spec_str, referrer.as_deref())
-                .map_err(|e| this.type_error(&e))
-        })(self);
-        match resolved {
-            Ok(dep) => self.start_dynamic_import_deferred(&dep, promise),
-            Err(e) => self.reject_dynamic_import(promise, e),
-        }
-        Ok(NanBox::handle(promise.to_raw()))
-    }
-
     /// `ShadowRealm.prototype.importValue` loading primitive: imports `specifier`
     /// **into** the ShadowRealm at `realm_idx` (its global scope + `globalThis` +
     /// intrinsics swapped in for the whole load / link / evaluate, so the module
@@ -3049,12 +2496,7 @@ impl<'a> Interp<'a> {
 /// growing VM function table, link-time instantiation, running the bodies, and
 /// the environment services VM module code calls back for (see
 /// `crate::nbvm::compile_module_into` for the VM side).
-impl Interp<'_> {
-    /// Runs module code on the bytecode VM from now on.
-    pub(crate) fn enable_vm_modules(&mut self) {
-        self.modules.vm_enabled = true;
-    }
-
+impl Interp {
     /// The VM function table modules are compiled into, if any yet.
     pub(crate) fn module_vm_table(&self) -> Option<Rc<[crate::nbvm::FnProto]>> {
         self.modules.prefer_module_table(self.vm_table.clone())
@@ -3068,7 +2510,7 @@ impl Interp<'_> {
         self.modules.vm_table = Some(table);
     }
 
-    /// Why a module ran on the tree-walker instead of the VM (the first one).
+    /// Why a module could not run on the VM (the first one).
     pub(crate) fn vm_module_note(&self) -> Option<&str> {
         self.modules.vm_note.as_deref()
     }
@@ -3080,12 +2522,8 @@ impl Interp<'_> {
     }
 
     /// Compiles every loaded JavaScript module not yet tried for the VM. A
-    /// module the VM refuses keeps running on the tree-walker (its functions
-    /// are interpreter closures; the two tiers interoperate through the host).
+    /// module the VM refuses fails to link (see `instantiate_module_functions`).
     fn vm_compile_pending(&mut self) {
-        if !self.modules.vm_enabled {
-            return;
-        }
         let pending: Vec<String> = self
             .modules
             .records
@@ -3346,7 +2784,7 @@ impl Interp<'_> {
     /// `super[name] = v` from VM code whose receiver is a module namespace:
     /// unless an accessor on the home object's chain takes the write, the
     /// receiver's `[[DefineOwnProperty]]` runs — forcing a deferred namespace
-    /// and checking the binding's TDZ (as the tree-walker's super set).
+    /// and checking the binding's TDZ.
     pub(crate) fn vm_super_set_namespace(
         &mut self,
         home: crate::heap::Handle,
@@ -3409,7 +2847,7 @@ impl Interp<'_> {
             }
             _ => {
                 // `import.source(x)`: ToString the specifier (a throw rejects
-                // with it), then reject with a SyntaxError, as the tree-walker.
+                // with it), then reject with a SyntaxError.
                 let p = self.fresh_promise();
                 let rejection = match self.coerce_to_string(spec) {
                     Ok(_) => {
@@ -3426,17 +2864,6 @@ impl Interp<'_> {
     }
 }
 
-/// The ambient module-evaluation state saved while an async module coroutine
-/// runs (restored after each `async_step`). See
-/// [`Interp::enter_module_context_for_controller`].
-pub(crate) struct ModuleContextSave {
-    var_scope: Scope,
-    module_imports: Rc<BTreeMap<String, (Scope, String)>>,
-    import_meta: Option<NanBox>,
-    active_module_key: Option<String>,
-    annexb_block_fns: Vec<(String, crate::common::Span)>,
-}
-
 /// Whether a module body's top-level statements contain a reachable `await` (or
 /// `for await`) — i.e. this is an async (top-level-await) module. Unlike the
 /// async-function detector, this also descends into an `export`'s inner
@@ -3446,7 +2873,7 @@ fn module_body_has_await(stmts: &[Stmt]) -> bool {
     stmts.iter().any(stmt_has_tla)
 }
 
-/// [`super::generator::stmt_has_await`], extended to the places that walker
+/// [`stmt_has_await`], extended to the places that walker
 /// leaves to its eager path but that still make a module asynchronous
 /// (`[[HasTLA]]`): binding-pattern defaults (`let { x = await y } = …`, a
 /// `catch` parameter, a `for` head) and a class heritage (`class C extends
@@ -3454,7 +2881,7 @@ fn module_body_has_await(stmts: &[Stmt]) -> bool {
 fn stmt_has_tla(s: &Stmt) -> bool {
     use crate::ast::{ForInit, ForLeft};
     let any = |b: &[Stmt]| b.iter().any(stmt_has_tla);
-    super::generator::stmt_has_await(s)
+    stmt_has_await(s)
         || match s {
             Stmt::Export(ExportDecl::Decl { declaration, .. })
             | Stmt::Export(ExportDecl::Default { declaration, .. }) => stmt_has_tla(declaration),
@@ -3515,7 +2942,7 @@ fn expr_awaits(e: &crate::ast::Expr) -> bool {
         expression: alloc::boxed::Box::new(e.clone()),
         span: crate::common::Span::point(0),
     };
-    super::generator::stmt_has_await(&s) || expr_has_tla(e)
+    stmt_has_await(&s) || expr_has_tla(e)
 }
 
 /// Whether a binding pattern's defaults or computed keys hold an `await`.
@@ -3662,4 +3089,224 @@ fn collect_pattern_names(target: &crate::ast::BindingTarget, out: &mut Vec<Strin
             }
         }
     }
+}
+
+// --- top-level `await` detection ---
+
+/// Whether a statement contains a reachable `await` (or `for await`, or an
+/// `await using` declaration) not nested inside a function/class boundary.
+/// (`yield` counts too; it cannot occur at a module's top level.)
+fn stmt_has_await(s: &Stmt) -> bool {
+    match s {
+        Stmt::Expr { expression, .. } => expr_has_await(expression),
+        Stmt::Block { body, .. } => body.iter().any(stmt_has_await),
+        Stmt::Empty { .. }
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Debugger { .. }
+        | Stmt::Function(_)
+        | Stmt::Import(_)
+        | Stmt::Export(_) => false,
+        // A class declaration with a `yield`-bearing computed member key must be
+        // driven through the machine so the key suspends (`class C { get [yield](){} }`).
+        Stmt::Class(c) => class_computed_key_has_await(c),
+        // An `await using` declaration is itself a suspension point of the async
+        // coroutine: leaving the scope it belongs to performs `DisposeResources`,
+        // whose step 4 `Await`s even when every resource was `null`/`undefined`
+        // (so there was nothing to call). The declaration must therefore be lowered
+        // into the machine — otherwise its whole enclosing block runs in one shot
+        // through the eager walker, which cannot suspend, and the statements after
+        // the block wrongly observe the same microtask.
+        Stmt::Var(decl) => {
+            matches!(decl.kind, crate::ast::VarDeclKind::AwaitUsing)
+                || decl
+                    .declarations
+                    .iter()
+                    .any(|d| d.init.as_ref().is_some_and(expr_has_await))
+        }
+        Stmt::If {
+            test,
+            consequent,
+            alternate,
+            ..
+        } => {
+            expr_has_await(test)
+                || stmt_has_await(consequent)
+                || alternate.as_deref().is_some_and(stmt_has_await)
+        }
+        Stmt::For {
+            init,
+            test,
+            update,
+            body,
+            ..
+        } => {
+            init.as_ref().is_some_and(|i| match i {
+                crate::ast::ForInit::Var(d) => d
+                    .declarations
+                    .iter()
+                    .any(|x| x.init.as_ref().is_some_and(expr_has_await)),
+                crate::ast::ForInit::Expr(e) => expr_has_await(e),
+            }) || test.as_deref().is_some_and(expr_has_await)
+                || update.as_deref().is_some_and(expr_has_await)
+                || stmt_has_await(body)
+        }
+        // A `for await` loop is itself a suspension point of the async coroutine
+        // (each iterated value is `await`ed), so it must be lowered into the
+        // machine even when its operand and body are otherwise suspension-free.
+        Stmt::ForOf {
+            right,
+            body,
+            is_await: true,
+            ..
+        } => {
+            let _ = (right, body);
+            true
+        }
+        Stmt::ForIn {
+            left, right, body, ..
+        }
+        | Stmt::ForOf {
+            left, right, body, ..
+        } => {
+            // A yield can also hide in an assignment-target pattern's default/key
+            // (`for ([ x = yield ] of …)`), which is bound per iteration.
+            matches!(left, crate::ast::ForLeft::Target(e) if expr_has_await(e))
+                || expr_has_await(right)
+                || stmt_has_await(body)
+        }
+        Stmt::While { test, body, .. } => expr_has_await(test) || stmt_has_await(body),
+        Stmt::DoWhile { body, test, .. } => stmt_has_await(body) || expr_has_await(test),
+        Stmt::Switch {
+            discriminant,
+            cases,
+            ..
+        } => {
+            expr_has_await(discriminant)
+                || cases.iter().any(|c| {
+                    c.test.as_ref().is_some_and(expr_has_await) || c.body.iter().any(stmt_has_await)
+                })
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+            ..
+        } => {
+            block.iter().any(stmt_has_await)
+                || handler
+                    .as_ref()
+                    .is_some_and(|h| h.body.iter().any(stmt_has_await))
+                || finalizer
+                    .as_ref()
+                    .is_some_and(|f| f.iter().any(stmt_has_await))
+        }
+        Stmt::Return { argument, .. } => argument.as_deref().is_some_and(expr_has_await),
+        Stmt::Throw { argument, .. } => expr_has_await(argument),
+        Stmt::Labeled { body, .. } => stmt_has_await(body),
+        Stmt::With { object, body, .. } => expr_has_await(object) || stmt_has_await(body),
+    }
+}
+
+/// Whether an expression may `await` (or `yield`) in the enclosing context.
+/// Stops at nested function/arrow/class boundaries (their bodies have their own
+/// context).
+fn expr_has_await(e: &crate::ast::Expr) -> bool {
+    match e {
+        crate::ast::Expr::Yield { .. } => true,
+        // Boundaries: a nested function/arrow introduces its own context.
+        crate::ast::Expr::Function(_) | crate::ast::Expr::Arrow(_) => false,
+        // A class body is a boundary (method bodies, field initializers have their
+        // own context), EXCEPT a *computed member key* (`class { get [yield]() {} }`)
+        // which is evaluated in the enclosing generator context at definition time.
+        crate::ast::Expr::Class(c) => class_computed_key_has_await(c),
+        crate::ast::Expr::Null(_)
+        | crate::ast::Expr::Bool { .. }
+        | crate::ast::Expr::Number { .. }
+        | crate::ast::Expr::BigInt { .. }
+        | crate::ast::Expr::Str { .. }
+        | crate::ast::Expr::Regex { .. }
+        | crate::ast::Expr::Ident(_)
+        | crate::ast::Expr::PrivateName(..)
+        | crate::ast::Expr::This(_)
+        | crate::ast::Expr::Super(_)
+        | crate::ast::Expr::NewTarget(_) => false,
+        crate::ast::Expr::Template(t) => t.expressions.iter().any(expr_has_await),
+        crate::ast::Expr::TaggedTemplate { tag, quasi, .. } => {
+            expr_has_await(tag) || quasi.expressions.iter().any(expr_has_await)
+        }
+        crate::ast::Expr::Array { elements, .. } => elements.iter().any(|el| match el {
+            crate::ast::ArrayElement::Hole => false,
+            crate::ast::ArrayElement::Item(e) | crate::ast::ArrayElement::Spread(e) => {
+                expr_has_await(e)
+            }
+        }),
+        crate::ast::Expr::Object { members, .. } => members.iter().any(|m| match m {
+            crate::ast::ObjectMember::Property { key, value, .. } => {
+                key_has_await(key) || expr_has_await(value)
+            }
+            crate::ast::ObjectMember::Spread { value, .. } => expr_has_await(value),
+            // An accessor's function body is a boundary, but its *computed* key
+            // (`get [yield]()`) is evaluated in the enclosing generator context.
+            crate::ast::ObjectMember::Accessor { key, .. } => key_has_await(key),
+        }),
+        crate::ast::Expr::Member {
+            object, property, ..
+        } => expr_has_await(object) || key_has_await(property),
+        crate::ast::Expr::Call {
+            callee, arguments, ..
+        }
+        | crate::ast::Expr::New {
+            callee, arguments, ..
+        } => {
+            expr_has_await(callee)
+                || arguments.iter().any(|a| match a {
+                    crate::ast::Argument::Item(e) | crate::ast::Argument::Spread(e) => {
+                        expr_has_await(e)
+                    }
+                })
+        }
+        // `await` is itself a suspension point of the *async* coroutine machine
+        // (the same explicit-stack engine drives async functions). It can only
+        // appear inside an async function, so treating it as a suspension point
+        // unconditionally is correct: a plain `function*` body never contains a
+        // top-level `await` (a nested async arrow's `await` is past a function
+        // boundary, which this walker already stops at).
+        crate::ast::Expr::Await { .. } => true,
+        crate::ast::Expr::OptChain { expr, .. } => expr_has_await(expr),
+        crate::ast::Expr::Unary { argument, .. } | crate::ast::Expr::Update { argument, .. } => {
+            expr_has_await(argument)
+        }
+        crate::ast::Expr::Binary { left, right, .. }
+        | crate::ast::Expr::Logical { left, right, .. } => {
+            expr_has_await(left) || expr_has_await(right)
+        }
+        crate::ast::Expr::Conditional {
+            test,
+            consequent,
+            alternate,
+            ..
+        } => expr_has_await(test) || expr_has_await(consequent) || expr_has_await(alternate),
+        crate::ast::Expr::Assign { target, value, .. } => {
+            expr_has_await(target) || expr_has_await(value)
+        }
+        crate::ast::Expr::Sequence { expressions, .. } => expressions.iter().any(expr_has_await),
+    }
+}
+
+fn key_has_await(k: &crate::ast::PropertyKey) -> bool {
+    matches!(k, crate::ast::PropertyKey::Computed(e) if expr_has_await(e))
+}
+
+/// Whether any of a class's *computed member keys* (`[expr]` on a method or
+/// field) contains a `yield`/`await` reachable in the enclosing generator/async
+/// context. Method bodies, field initializers, and the `extends` heritage are
+/// their own contexts / left to the eager fallback, so only the member keys are
+/// examined here.
+fn class_computed_key_has_await(c: &crate::ast::Class) -> bool {
+    c.body.iter().any(|m| match m {
+        crate::ast::ClassMember::Method(m) => key_has_await(&m.key),
+        crate::ast::ClassMember::Field(f) => key_has_await(&f.key),
+        crate::ast::ClassMember::StaticBlock { .. } => false,
+    })
 }

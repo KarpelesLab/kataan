@@ -168,7 +168,7 @@ fn valid_epoch(v: i128) -> bool {
     (temporal_iso::MIN_EPOCH_NS..=temporal_iso::MAX_EPOCH_NS).contains(&v)
 }
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// A `RangeError` with `msg`.
     fn range_err(&mut self, msg: &str) -> ExecError {
         let m = self.new_str(msg);

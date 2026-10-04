@@ -1,6 +1,6 @@
 use super::*;
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// Whether a callable's `name` / `length` should be *synthesized* for `handle`
     /// — i.e. there is no physical own slot **and** the property has not been
     /// deleted.
@@ -198,7 +198,7 @@ impl<'a> Interp<'a> {
         // generic data-property path below, which reads its recorded attributes.
         if matches!(key, "length" | "name")
             && self.fn_meta_synthesizable(obj, key)
-            && (self.is_callable(obj) || self.realm.class_at(obj).is_some())
+            && self.is_callable(obj)
             && !self.realm.is_array(obj)
         {
             let v = self.read_member(obj, key).unwrap_or(NanBox::undefined());
@@ -2492,7 +2492,7 @@ impl<'a> Interp<'a> {
                     cur = target;
                     continue;
                 }
-                callable = self.is_callable(cur) || self.realm.class_at(cur).is_some();
+                callable = self.is_callable(cur);
                 break;
             }
             callable

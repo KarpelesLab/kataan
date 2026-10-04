@@ -261,18 +261,10 @@ pub enum Cell {
         /// Element kind index into `TYPED_ARRAY_KINDS` (0..=8).
         kind: u8,
     },
-    /// A closure: an index into the interpreter's function table plus the
-    /// lexical scope it captured at definition.
-    Function {
-        /// Index into the owning interpreter's function table (the AST body).
-        func_id: u32,
-        /// The captured lexical environment.
-        env: Scope,
-    },
     /// A bytecode-VM closure: an index into the running VM program's function
     /// table plus the captured cells (one-element arrays) it closes over. Its
     /// properties (`prototype`, user-assigned ones, …) live in the auxiliary
-    /// object, as for [`Cell::Function`]; `name` and `length` are synthesized
+    /// object; `name` and `length` are synthesized
     /// from the table entry.
     VmFunction {
         /// Index into the VM program's function table.
@@ -335,14 +327,6 @@ pub enum Cell {
         /// `lastIndex` is separate mutable state and is unaffected by the cache.
         #[cfg(feature = "regex")]
         compiled: core::cell::RefCell<Option<alloc::rc::Rc<crate::regex::Regex>>>,
-    },
-    /// A class constructor: an index into the interpreter's class table plus the
-    /// scope it was defined in.
-    Class {
-        /// Index into the owning interpreter's class table (the AST body).
-        class_id: u32,
-        /// The captured lexical environment.
-        env: Scope,
     },
     /// A `Map` (`is_set = false`) or `Set` (`is_set = true`): insertion-ordered
     /// key/value entries (for a `Set`, the value equals the key).
@@ -530,15 +514,6 @@ impl Cell {
         }
     }
 
-    /// The function's `(func_id, captured env)`, if this cell is a function.
-    #[must_use]
-    pub fn as_function(&self) -> Option<(u32, &Scope)> {
-        match self {
-            Cell::Function { func_id, env } => Some((*func_id, env)),
-            _ => None,
-        }
-    }
-
     /// The host environment, if this cell is a VM-held [`Cell::Env`].
     #[must_use]
     pub fn as_env(&self) -> Option<&Scope> {
@@ -604,15 +579,6 @@ impl Cell {
         }
     }
 
-    /// The `(class_id, captured env)`, if this cell is a class.
-    #[must_use]
-    pub fn as_class(&self) -> Option<(u32, &Scope)> {
-        match self {
-            Cell::Class { class_id, env } => Some((*class_id, env)),
-            _ => None,
-        }
-    }
-
     /// The `(is_set, entries)` of a collection, mutably.
     pub fn as_collection_mut(&mut self) -> Option<(bool, &mut Vec<(NanBox, NanBox)>)> {
         match self {
@@ -641,12 +607,10 @@ impl Cell {
     pub fn type_of(&self) -> &'static str {
         match self {
             Cell::Str(_) => "string",
-            Cell::Function { .. }
-            | Cell::VmFunction { .. }
+            Cell::VmFunction { .. }
             | Cell::Native(_)
             | Cell::HostFn(_)
-            | Cell::BoundNative { .. }
-            | Cell::Class { .. } => "function",
+            | Cell::BoundNative { .. } => "function",
             Cell::Symbol { .. } => "symbol",
             Cell::BigInt(_) => "bigint",
             Cell::Object(_)
@@ -738,10 +702,8 @@ impl Trace for Cell {
                     }
                 }
             }
-            // A closure (or class) keeps its captured environment alive.
-            Cell::Function { env, .. } | Cell::Class { env, .. } | Cell::Env(env) => {
-                env.for_each_handle(visit);
-            }
+            // A VM-held host environment keeps its bindings alive.
+            Cell::Env(env) => env.for_each_handle(visit),
             // A VM closure keeps its captured cells alive.
             Cell::VmFunction { captures, .. } => {
                 for c in captures {
@@ -821,9 +783,7 @@ impl crate::gc::Relocate for Cell {
         match self {
             Cell::Object(o) => o.relocate_handles(forward),
             Cell::Array(elems) => elems.iter_mut().for_each(fwd),
-            Cell::Function { env, .. } | Cell::Class { env, .. } | Cell::Env(env) => {
-                env.relocate_handles(forward);
-            }
+            Cell::Env(env) => env.relocate_handles(forward),
             Cell::VmFunction { captures, .. } => captures.iter_mut().for_each(fwd),
             Cell::Collection { entries, index, .. } => {
                 for (k, v) in entries {

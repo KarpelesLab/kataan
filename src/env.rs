@@ -1,11 +1,11 @@
-//! Lexical environments (scope chains) for the tree-walker over the new model
-//! (`ROADMAP.md` §3 → Phase D migration, the function/closure piece).
+//! Lexical environments (scope chains) for the interpreter: the global
+//! environment, module environments, and the environments of bytecode-VM code
+//! that uses dynamic scoping (direct `eval`, `with`), which the VM holds as
+//! `Cell::Env` values.
 //!
 //! A `Scope` is a reference-counted frame of `name → `[`NanBox`] bindings with
-//! a link to its enclosing scope. A function **closes over** the scope it was
-//! defined in by keeping an `Rc` to it, so its captured variables stay live and
-//! shared after the defining call returns — the property a flat stack of scopes
-//! cannot provide. Resolution walks the parent chain inner-first.
+//! a link to its enclosing scope; resolution walks the parent chain
+//! inner-first.
 //!
 //! Bindings hold only [`NanBox`] values (heap references are handles), so a
 //! scope is `'static` and the GC can trace a closure's captured handles via
@@ -36,14 +36,6 @@ struct ScopeData {
     /// no-op in sloppy mode (per SetMutableBinding on an immutable binding).
     soft_consts: alloc::collections::BTreeSet<String>,
     parent: Option<Scope>,
-    /// Explicit-resource-management disposers recorded by `using` / `await using`
-    /// declarations bound *in this frame*, in declaration order. Each entry is
-    /// `(resourceValue, disposeMethod, isAsync)`; `disposeMethod` is `undefined`
-    /// for a `null`/`undefined` resource (a recorded no-op). They are run in
-    /// reverse (LIFO) order when this scope is exited (see the disposal driver in
-    /// `nbexec`). `None` until the first `using` is recorded, so an ordinary
-    /// scope carries no extra allocation (the fast path).
-    disposers: Option<alloc::vec::Vec<(NanBox, NanBox, bool)>>,
     /// Names in this frame created as *deletable* bindings — a sloppy `eval`'s
     /// `var`/function declaration hoisted into a non-global variable environment
     /// (EvalDeclarationInstantiation's `CreateMutableBinding(name, true)`). Unlike
@@ -99,7 +91,6 @@ impl Scope {
             consts: alloc::collections::BTreeSet::new(),
             soft_consts: alloc::collections::BTreeSet::new(),
             parent: None,
-            disposers: None,
             deletable: None,
             catch_scope: false,
             with_obj: None,
@@ -117,7 +108,6 @@ impl Scope {
             consts: alloc::collections::BTreeSet::new(),
             soft_consts: alloc::collections::BTreeSet::new(),
             parent: Some(self.clone()),
-            disposers: None,
             deletable: None,
             catch_scope: false,
             with_obj: None,
@@ -371,35 +361,6 @@ impl Scope {
         self.0.borrow().parent.clone()
     }
 
-    /// Records a `using` / `await using` disposer in *this* frame:
-    /// `(resourceValue, disposeMethod, isAsync)`. Disposers are run in reverse
-    /// declaration order when the scope is exited.
-    pub fn add_disposer(&self, value: NanBox, method: NanBox, is_async: bool) {
-        self.0
-            .borrow_mut()
-            .disposers
-            .get_or_insert_with(alloc::vec::Vec::new)
-            .push((value, method, is_async));
-    }
-
-    /// Whether this frame has any recorded `using` disposers.
-    #[must_use]
-    pub fn has_disposers(&self) -> bool {
-        self.0
-            .borrow()
-            .disposers
-            .as_ref()
-            .is_some_and(|d| !d.is_empty())
-    }
-
-    /// Removes and returns this frame's recorded disposers (in declaration
-    /// order), leaving the frame with none — so disposal runs exactly once even
-    /// if the scope is revisited.
-    #[must_use]
-    pub fn take_disposers(&self) -> alloc::vec::Vec<(NanBox, NanBox, bool)> {
-        self.0.borrow_mut().disposers.take().unwrap_or_default()
-    }
-
     /// Whether `self` and `other` are the *same* scope record (identity, not
     /// contents) — used to detect when execution is running directly in the
     /// global scope (so a `var`/`function` declaration there also publishes a
@@ -435,17 +396,6 @@ impl Scope {
                 visit(Handle::from_raw(raw));
             }
         }
-        // Pending `using` disposers also root their resource value and method.
-        if let Some(disposers) = &data.disposers {
-            for (value, method, _) in disposers {
-                if let Some(raw) = value.as_handle() {
-                    visit(Handle::from_raw(raw));
-                }
-                if let Some(raw) = method.as_handle() {
-                    visit(Handle::from_raw(raw));
-                }
-            }
-        }
         // A `with` object is rooted by the scope that introduced it.
         if let Some(obj) = &data.with_obj
             && let Some(raw) = obj.as_handle()
@@ -472,16 +422,6 @@ impl Scope {
         for v in data.vars.values_mut() {
             if let Some(raw) = v.as_handle() {
                 *v = NanBox::handle(forward(Handle::from_raw(raw)).to_raw());
-            }
-        }
-        if let Some(disposers) = &mut data.disposers {
-            for (value, method, _) in disposers.iter_mut() {
-                if let Some(raw) = value.as_handle() {
-                    *value = NanBox::handle(forward(Handle::from_raw(raw)).to_raw());
-                }
-                if let Some(raw) = method.as_handle() {
-                    *method = NanBox::handle(forward(Handle::from_raw(raw)).to_raw());
-                }
             }
         }
         if let Some(obj) = &mut data.with_obj

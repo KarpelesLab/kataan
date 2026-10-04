@@ -1,181 +1,44 @@
-//! The tree-walker's **GC safepoint**: where an allocation-triggered collection
-//! may run, what it roots, and why that is sound (`ROADMAP.md` §3, the GC).
-//!
-//! # Why a safepoint at all
+//! The interpreter's half of a garbage collection during a hosted bytecode-VM
+//! run (`ROADMAP.md` §2.0): what the interpreter keeps alive, and when its own
+//! state is simple enough for a collection to be sound.
 //!
 //! [`Realm::collect`](crate::realm::Realm::collect) is a non-moving mark-sweep:
 //! it frees only what the root set cannot reach, and surviving [`Handle`]s stay
 //! valid. So the *only* correctness question is whether the root set is
 //! complete at the moment it runs.
 //!
-//! In this interpreter it usually is not. The tree-walker evaluates
-//! sub-expressions into ordinary Rust locals (`let a = self.eval(x)?;` then
-//! `self.eval(y)?`, which can run arbitrary user code and allocate), and native
-//! builtins build `Vec<NanBox>` argument and result buffers on the Rust heap.
-//! None of that is reachable from the interpreter's fields, so collecting at an
-//! arbitrary point would free live objects.
+//! The VM decides *when*: its safepoint (`vm_safepoint` in `crate::nbvm`)
+//! collects only while every Rust frame between the outermost VM activation
+//! and the current one has published its registers — a descent through a
+//! native, a getter, a `valueOf` or an iterator step does not publish, so the
+//! VM declines. It then hands its live registers to
+//! [`collect_with_roots`](Interp::collect_with_roots) (through
+//! `VmHost::collect_garbage`), which adds everything the interpreter keeps
+//! alive ([`gc_roots`](Interp::gc_roots)): the global, module and eval
+//! environments, ambient values, intrinsics, registries and job queues.
 //!
-//! # What is sound
-//!
-//! There is one place where the live set *is* enumerable: a **statement
-//! boundary in the top-level script body**, reached only through statement
-//! executors. At such a point the Rust stack holds nothing but statement frames,
-//! and each of those has been audited (see the `gc_root` calls in `stmt.rs`) to
-//! publish its live [`NanBox`] locals — a loop's completion value, a `for-of`
-//! iterator, a `for-in` key list, a `try`'s pending completion — into
-//! [`Interp::gc_shadow`].
-//!
-//! Everything else is fenced off by [`Interp::gc_ok`], which is `false` by
-//! default and only `true` while the top-level statement chain is running. Every
-//! entry into a *function*, `eval`, module, generator, or class body clears it
-//! for that body's dynamic extent, so a statement boundary nested inside any of
-//! them never collects — regardless of what its callers hold.
-//!
-//! # Audited calls: collecting inside a function body
-//!
-//! A function body is *also* collectable when every Rust frame between the
-//! top-level chain and its statement boundaries has published its live values —
-//! the same rule the bytecode VM applies with its published frame windows. That
-//! holds for a call at an **audited position**: an expression statement that is
-//! a bare call (`f();`), a declarator initializer (`var x = f();`), a plain
-//! identifier assignment (`x = f();`) or a `return f();`. There the statement
-//! executor holds nothing unpublished, the `Call` arm of `eval` holds only the
-//! callee, receiver and argument vector — all handed to `invoke_inner`, which
-//! publishes them together with the caller state it swaps out (scopes, `this`,
-//! `new.target`, home object) before running the body with the fence *open*.
-//!
-//! The audit is carried by identity, never by ambient state: the executor names
-//! the exact `Call` node ([`Interp::gc_audit_expr`]), the arm names the exact
-//! argument buffer ([`Interp::gc_audit_call`]), and `call_with_this_inner`
-//! honours it only for a plain (non-arrow) closure called with that buffer. Any
-//! other path — a native, a bound function, a proxy trap, an arrow, a getter run
-//! while resolving the callee, a callback a native issues with its own argument
-//! vector — takes the token without matching it, so the body it runs stays
-//! fenced. Every nested unaudited call re-closes the fence for its own extent;
-//! an audited call inside a fenced extent stays fenced (`gc_ok && audited`).
-//!
-//! # What this deliberately does not reclaim
-//!
-//! Garbage produced inside a function body reached through any *other* call
-//! shape (an argument position, an operand, a native callback) is not reclaimed
-//! *while that function runs*; it is reclaimed at the next open safepoint. And
-//! [`Interp::gc_world_is_simple`] refuses to collect at all while the program
-//! has state this pass does not trace — suspended generators, pending
-//! jobs/timers, extra realms, modules, host functions, mapped `arguments`
-//! WASM instances, or `$262.agent` workers. Those are conservative
-//! bail-outs, not claims that collection would be wrong: each one is a root
-//! source that would have to be enumerated first.
+//! [`gc_world_is_simple`](Interp::gc_world_is_simple) refuses to collect at
+//! all while the program has state this pass does not trace — pending
+//! jobs/timers, extra realms, modules, host functions, WASM instances, or
+//! `$262.agent` workers. Those are conservative bail-outs, not claims that
+//! collection would be wrong: each one is a root source that would have to be
+//! enumerated first.
 
 use super::{Interp, Job, Timer};
 use crate::heap::Handle;
 use crate::nanbox::NanBox;
 use alloc::vec::Vec;
 
-/// A [`gc_root`](Interp::gc_root) mark meaning "nothing was pushed" — returned
-/// when the safepoint is fenced off anyway, so the registration is skipped
-/// entirely and costs one predictable branch.
-pub(crate) const NO_MARK: usize = usize::MAX;
-
-impl<'a> Interp<'a> {
-    /// Publishes `vals` as GC roots for the dynamic extent of a statement
-    /// executor's recursion. Returns a mark to hand to
-    /// [`gc_unroot`](Self::gc_unroot); pair the two on **every** exit path
-    /// (including `?`) or the shadow stack grows without bound.
-    ///
-    /// A no-op (and free) while collection is fenced off, which is the case for
-    /// all code inside a function body — the hot path.
-    pub(crate) fn gc_root(&mut self, vals: &[NanBox]) -> usize {
-        if !self.gc_ok {
-            return NO_MARK;
-        }
-        let mark = self.gc_shadow.len();
-        self.gc_shadow.extend_from_slice(vals);
-        mark
-    }
-
-    /// Arms the audit for `e` when it is a call at an audited position (see the
-    /// module docs): the `Call` node itself, or the call on the right of a plain
-    /// identifier assignment. Any other expression disarms it. Called by the
-    /// statement executors right before they evaluate `e`.
-    pub(crate) fn gc_flag_audited_call(&mut self, e: &crate::ast::Expr) {
-        use crate::ast::{AssignOp, Expr};
-        self.gc_audit_expr = match e {
-            Expr::Call { .. } => Some(e as *const Expr),
-            Expr::Assign {
-                op: AssignOp::Assign,
-                target,
-                value,
-                ..
-            } if matches!(&**target, Expr::Ident(_)) && matches!(&**value, Expr::Call { .. }) => {
-                Some(&**value as *const Expr)
-            }
-            _ => None,
-        };
-    }
-
-    /// `eval_args` for the `Call` arm: evaluates `arguments` and, when the call
-    /// is `audited`, hands the callee the audit token — the identity of the
-    /// returned buffer. An empty argument list still gets a real allocation so
-    /// its address is unique among live buffers (an empty `Vec` and a `&[]` share
-    /// one dangling pointer, which a token must never match).
-    pub(crate) fn gc_audit_args(
-        &mut self,
-        arguments: &'a [crate::ast::Argument],
-        audited: bool,
-    ) -> Result<Vec<NanBox>, super::ExecError> {
-        let mut args = self.eval_args(arguments)?;
-        if audited {
-            if args.capacity() == 0 {
-                args.reserve_exact(1);
-            }
-            self.gc_audit_call = Some((args.as_ptr() as usize, args.len()));
-        }
-        Ok(args)
-    }
-
-    /// Replaces the values published at `mark` (for a loop local that changes
-    /// each iteration, such as the accumulated completion value).
-    pub(crate) fn gc_reroot(&mut self, mark: usize, vals: &[NanBox]) {
-        if mark == NO_MARK {
-            return;
-        }
-        self.gc_shadow.truncate(mark);
-        self.gc_shadow.extend_from_slice(vals);
-    }
-
-    /// Whether a collection could fire at the next statement boundary — i.e.
-    /// whether building a root publication is worth anything at all. Lets a
-    /// statement executor skip copying a whole item list on the hot (fenced) path.
-    pub(crate) const fn gc_can_collect(&self) -> bool {
-        self.gc_ok
-    }
-
-    /// Drops everything published since `mark`.
-    pub(crate) fn gc_unroot(&mut self, mark: usize) {
-        if mark != NO_MARK {
-            self.gc_shadow.truncate(mark);
-        }
-    }
-
-    /// Runs a collection if allocation pressure warrants one and this point is
-    /// safe. Called at every statement boundary; the fenced-off and
-    /// under-pressure cases are two loads and a compare.
-    pub(crate) fn gc_safepoint(&mut self) {
-        if !self.gc_ok || self.realm.gc_pressure() < self.realm.gc_next_threshold() {
-            return;
-        }
-        self.collect_with_roots(&[]);
-    }
-
+impl Interp {
     /// Runs a collection now (if allocation pressure warrants one and the
     /// interpreter's world is simple), rooting everything the interpreter keeps
     /// alive plus `extra` — the live values of a hosted bytecode-VM run
     /// (`ROADMAP.md` §2.0), which only the VM can enumerate. Returns whether the
     /// interpreter's state allowed it.
     ///
-    /// Only sound when no interpreter frame holds unpublished values: the
-    /// statement-boundary safepoint, or a VM safepoint in the outermost hosted run
-    /// (no delegated host call in flight).
+    /// Only sound when no interpreter frame holds unpublished values: a VM
+    /// safepoint whose descent is fully published (no delegated host call in
+    /// flight).
     pub(crate) fn collect_with_roots(&mut self, extra: &[Handle]) -> bool {
         if !self.gc_world_is_simple() {
             return false;
@@ -221,11 +84,6 @@ impl<'a> Interp<'a> {
     /// refusing to collect is the safe answer, and the memory is reclaimed later
     /// (or not at all) rather than incorrectly.
     fn gc_world_is_simple(&self) -> bool {
-        // Suspended coroutine activations hold AST cursors, scopes and operand
-        // values that are not reachable from any traced field.
-        if !self.gen_frames.iter().all(Option::is_none) || self.gen_sink.is_some() {
-            return false;
-        }
         // Pending jobs and timers hold handler/value pairs; extra realms hold a
         // whole second set of globals and intrinsics.
         if !self.microtasks.is_empty()
@@ -283,35 +141,15 @@ impl<'a> Interp<'a> {
             }
         };
 
-        // --- the audited Rust-local publications of the statement executors ---
-        for v in &self.gc_shadow {
-            push(out, *v);
-        }
-        // Live activations: each callee and its `arguments` object (the legacy
-        // `fn.caller` / `fn.arguments` extensions read them back).
-        for v in self.fn_stack.iter().chain(&self.fn_args_stack) {
-            push(out, *v);
-        }
-
         // --- scope chains (each walks to its root, so enclosing frames are covered) ---
         let visit_scope = |s: &crate::env::Scope, out: &mut Vec<Handle>| {
             s.for_each_handle(&mut |h| out.push(h));
         };
         visit_scope(&self.current, out);
         visit_scope(&self.var_scope, out);
-        // Caller scopes swapped out by audited calls in flight.
-        for s in &self.gc_scope_shadow {
-            visit_scope(s, out);
-        }
         visit_scope(&self.global_scope, out);
         visit_scope(&self.main_global_scope, out);
         if let Some(s) = &self.eval_var_scope {
-            visit_scope(s, out);
-        }
-        for s in &self.class_envs {
-            visit_scope(s, out);
-        }
-        if let Some((_, s)) = &self.pending_super {
             visit_scope(s, out);
         }
 
@@ -324,15 +162,7 @@ impl<'a> Interp<'a> {
         ] {
             push(out, v);
         }
-        for v in [
-            self.pending_new_target,
-            self.reflect_new_target,
-            self.pending_super_fn,
-            self.pending_this_init.map(|(v, _)| v),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        if let Some(v) = self.reflect_new_target {
             push(out, v);
         }
         // A VM direct eval's context (see `vm_env`).
@@ -350,8 +180,6 @@ impl<'a> Interp<'a> {
                 self.main_regexp_proto,
                 self.regexp_ctor,
                 self.current_home_object,
-                self.this_cell,
-                self.pending_async_start.map(|(_, h)| h),
             ]
             .into_iter()
             .flatten(),
@@ -387,30 +215,6 @@ impl<'a> Interp<'a> {
         }
         out.extend(self.temporal_protos.iter().copied().flatten());
         out.extend(self.wasm_mem_objs.values().copied());
-
-        // --- class tables (parallel to `classes`, keyed by class id) ---
-        for m in self
-            .class_statics
-            .iter()
-            .chain(&self.class_static_get)
-            .chain(&self.class_static_set)
-        {
-            for v in m.values() {
-                push(out, *v);
-            }
-        }
-        for v in self
-            .class_handles
-            .iter()
-            .copied()
-            .chain(self.class_fn_super.iter().copied().flatten())
-            .chain(self.class_proto_parent.iter().copied().flatten())
-        {
-            push(out, v);
-        }
-        for v in self.private_method_cache.values() {
-            push(out, *v);
-        }
 
         // --- interned/registry values ---
         for v in self

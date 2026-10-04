@@ -1,13 +1,11 @@
-//! Unit tests for the tree-walk interpreter (moved out of mod.rs).
+//! Unit tests for the interpreter's runtime — realm, built-ins, natives and
+//! host services — driven through [`Interp::run`] (the hosted bytecode VM).
 use super::*;
 use crate::parser::Parser;
 
-/// [`run`] on the tree-walker, for behaviour the VM does not model yet.
-fn run_tree_walk(src: &str) -> String {
-    let program = Parser::parse_program(src).expect("parse");
-    let mut interp = Interp::new();
-    let value = interp.run_tree_walk(&program).expect("exec");
-    interp.realm().to_display_string(value)
+/// The default-limits source entry: `(console output, completion)`.
+fn eval_source(src: &str) -> Result<(String, String), String> {
+    eval_source_on(src, crate::limits::Limits::default())
 }
 
 /// Runs `src` and renders the program's final value.
@@ -232,14 +230,13 @@ fn oversized_array_growth_throws_range_error() {
     );
 }
 
-/// C2: a deeply nested expression (shallow in the AST via the precedence loop,
-/// but thousands of native `eval` recursions) throws a catchable `RangeError`
-/// rather than overflowing the host stack. Run on a generous stack so the
-/// `max_eval_depth` guard fires before the (much larger) real overflow point,
-/// exactly as the production / test262 harness threads do.
+/// A deeply nested expression (shallow in the AST via the precedence loop) is
+/// compiled and evaluated without overflowing the host stack — the VM has no
+/// per-operator native recursion. Run on a generous stack, as the production /
+/// test262 harness threads do, for the compiler's own recursion.
 #[test]
-fn deep_expression_throws_instead_of_overflowing() {
-    let handle = std::thread::Builder::new()
+fn deep_expression_evaluates_without_overflowing() {
+    let value = std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
             let src = core::iter::repeat_n("1", 20_000)
@@ -251,14 +248,14 @@ fn deep_expression_throws_instead_of_overflowing() {
                 Parser::parse_program(&src).expect("parse"),
             ));
             let mut interp = Interp::new();
-            let threw = matches!(interp.run_tree_walk(program), Err(ExecError::Throw(_)));
+            let r = interp.run(program).map(|v| interp.display(v));
             core::mem::forget(interp);
-            threw
+            r
         })
         .expect("spawn")
         .join()
         .expect("join");
-    assert!(handle, "deep expression should throw, not abort");
+    assert_eq!(value.expect("evaluates"), "20000");
 }
 
 /// L1: `ArrayBuffer.prototype.transfer(n)` with an enormous length throws a
@@ -431,7 +428,7 @@ fn limits_override_changes_runtime_caps() {
         max_string_len: 10,
         ..Limits::default()
     };
-    let err = eval_source_with_limits(src, low).expect_err("should exceed length");
+    let err = eval_source_on(src, low).expect_err("should exceed length");
     assert!(err.contains("Invalid string length"), "unexpected: {err}");
 
     // A low object→dictionary threshold forces the conversion early yet keeps
@@ -442,89 +439,34 @@ fn limits_override_changes_runtime_caps() {
     };
     let keys_src = "let o={}; for(let i=0;i<10;i++) o['k'+i]=i; [Object.keys(o).length, o.k0, o.k9, Object.keys(o)[0]].join(',')";
     assert_eq!(
-        eval_source_with_limits(keys_src, dict).expect("dict ok").1,
+        eval_source_on(keys_src, dict).expect("dict ok").1,
         "10,0,9,k0"
     );
 }
 
-/// C2 follow-up: a custom low `max_eval_depth` (via `Realm::with_limits`,
-/// threaded through `eval_source_with_limits`) is honored live. The tree-walk
-/// recursion that the interpreter performs on a deeply nested expression
-/// trips the dedicated knob — a depth the *default* realm evaluates fine is
-/// rejected once the cap is lowered, proving `max_eval_depth` bounds the
-/// eval/exec recursion independently of `max_call_depth`.
+/// A custom low `max_eval_depth` (threaded through the source entry's
+/// [`Limits`](crate::limits::Limits)) is honored live: a chain of nested direct
+/// `eval`s the default limits run fine is rejected with a catchable
+/// stack-overflow `RangeError` once the cap is lowered, while `max_call_depth`
+/// keeps its (much higher) default.
 #[test]
 fn max_eval_depth_override_honored() {
-    // Each tree-walk level burns a lot of native stack, so run on a generous
-    // stack (like the production / test262 threads) where the *guard*, not a
-    // real overflow, is the limiting factor.
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
             use crate::limits::Limits;
-            // A left-deep `1+1+…+1`: shallow allocations but `depth` nested
-            // native `eval` recursions (one per `+` term), driving
-            // `eval_depth` up by one per level within a single frame.
-            fn deep_add(depth: usize) -> String {
-                core::iter::repeat_n("1", depth)
-                    .collect::<alloc::vec::Vec<_>>()
-                    .join("+")
-            }
-
-            // 600 terms evaluate cleanly under the default cap…
-            let src = deep_add(600);
-            assert_eq!(eval_source(&src).expect("default ok").1, "600");
-
-            // …but a realm whose `max_eval_depth` is lowered below that depth
-            // rejects the very same source with a catchable stack-overflow
-            // `RangeError`, while `max_call_depth` is left at its (much
-            // higher) default — proving the dedicated knob is honored live.
+            let src = "function f(n) { return n ? eval('f(n - 1)') + 1 : 0; } \
+                       var r; try { r = f(150); } catch (e) { r = e.constructor.name; } r";
+            assert_eq!(eval_source(src).expect("default ok").1, "150");
             let low = Limits {
                 max_eval_depth: 100,
                 ..Limits::default()
             };
-            let err = eval_source_with_limits(&src, low).expect_err("should exceed eval depth");
-            assert!(
-                err.contains("Maximum call stack size exceeded"),
-                "unexpected error: {err}"
-            );
+            assert_eq!(eval_source_on(src, low).expect("caught").1, "RangeError");
         })
         .expect("spawn")
         .join()
         .expect("join");
-}
-
-/// C2 follow-up: interpreter recursion past `max_eval_depth` throws a
-/// catchable `RangeError` (caught by a JS `try/catch`, surfacing as
-/// `RangeError`) instead of crashing the host. Run on a generous native
-/// stack so the guard — not a real overflow — is what stops the recursion.
-#[test]
-fn deep_eval_recursion_throws_range_error_catchable() {
-    let kind = std::thread::Builder::new()
-        .stack_size(64 * 1024 * 1024)
-        .spawn(|| {
-            // A left-deep `1+1+…+1` far past the default `max_eval_depth`
-            // (1500): each `+` term is a native `eval` recursion, so the
-            // guard fires mid-evaluation and the throw is caught by JS.
-            let deep = core::iter::repeat_n("1", 20_000)
-                .collect::<alloc::vec::Vec<_>>()
-                .join("+");
-            let src =
-                alloc::format!("try {{ {deep}; 'noThrow' }} catch (e) {{ e.constructor.name }}");
-            // Leak the AST: dropping a 20k-deep boxed expression chain would
-            // itself recurse and is unrelated to what we are asserting.
-            let program = alloc::boxed::Box::leak(alloc::boxed::Box::new(
-                Parser::parse_program(&src).expect("parse"),
-            ));
-            let mut interp = Interp::new();
-            let res = interp.run_tree_walk(program).map(|v| interp.display(v));
-            core::mem::forget(interp);
-            res
-        })
-        .expect("spawn")
-        .join()
-        .expect("join");
-    assert_eq!(kind.expect("eval ok"), "RangeError");
 }
 
 /// Runs `src` and returns its captured `console` output.
@@ -10747,7 +10689,6 @@ fn agent_worker_runs_on_the_vm_and_spins_with_the_baton() {
     let mut interp = Interp::new();
     interp.run(&program).expect("exec");
     assert_eq!(interp.output(), "seen 7 true\n");
-    assert_eq!(interp.tree_walked(), 0, "a worker tree-walked");
 }
 
 #[test]
@@ -10824,8 +10765,7 @@ fn cross_realm_class_brand_check_throws_defining_realms_type_error() {
     // private-method brand check fails throws the *defining realm's* TypeError.
     // (Tree-walker: a VM function does not yet run in its defining realm.)
     assert_eq!(
-        run_tree_walk(
-            r#"
+        run(r#"
             var r1 = $262_createRealm();
             var C1 = r1.global.eval("(class { #m(){return 1;} access(o){ return o.#m(); } })");
             var c1 = new C1();
@@ -10833,8 +10773,7 @@ fn cross_realm_class_brand_check_throws_defining_realms_type_error() {
             var e;
             try { c1.access({}); } catch (x) { e = x; }
             okSelf && (e.constructor === r1.global.TypeError)
-        "#
-        ),
+        "#),
         "true"
     );
 }

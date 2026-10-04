@@ -1,6 +1,6 @@
 use super::*;
 
-impl<'a> Interp<'a> {
+impl Interp {
     /// ToPrimitive of an object/array for loose equality: an array becomes its
     /// `join` string; a plain object uses the default-hint ToPrimitive.
     pub(crate) fn coerce_for_eq(&mut self, v: NanBox) -> Result<NanBox, ExecError> {
