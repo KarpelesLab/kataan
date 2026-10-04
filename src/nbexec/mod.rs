@@ -10098,6 +10098,35 @@ impl crate::nbvm::VmHost for Interp<'_> {
         }
     }
 
+    fn using_resource(&mut self, value: NanBox) -> Result<NanBox, crate::nbvm::HostError> {
+        // `null`/`undefined` record a no-op disposer; any other non-object is a
+        // TypeError; an object's `@@dispose` must be callable.
+        if matches!(value.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            return Ok(NanBox::undefined());
+        }
+        if !self.is_object_value(value) {
+            let e = self.type_error("using declaration value is not an object");
+            return Err(exec_to_host(e));
+        }
+        self.using_dispose_method(value, false)
+            .map_err(exec_to_host)
+    }
+
+    fn dispose_using(
+        &mut self,
+        resources: &[(NanBox, NanBox)],
+        pending: Option<NanBox>,
+    ) -> Result<(), crate::nbvm::HostError> {
+        let disposers = resources.iter().map(|(v, m)| (*v, *m, false)).collect();
+        let completion = match pending {
+            Some(e) => Err(ExecError::Throw(e)),
+            None => Ok(NanBox::undefined()),
+        };
+        self.dispose_resources(disposers, completion)
+            .map(|_| ())
+            .map_err(exec_to_host)
+    }
+
     fn map_arguments(&mut self, args_obj: NanBox, cells: &[(usize, NanBox)]) {
         let Some(obj) = args_obj.as_handle().map(Handle::from_raw) else {
             return;

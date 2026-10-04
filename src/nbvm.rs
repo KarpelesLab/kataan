@@ -312,6 +312,12 @@ pub enum Op {
         end: u32,
         src: Reg,
     },
+    /// A `using` declaration: records `src` and its dispose method in the
+    /// scope's resource list `stack` (an array of `[value, method]` pairs).
+    AddDisposable { stack: Reg, src: Reg },
+    /// Disposes the scope's resources in `stack` (see
+    /// [`VmHost::dispose_using`]), with the in-flight throw in `exc`, if any.
+    DisposeResources { stack: Reg, exc: Option<Reg> },
     /// Maps the arguments object `args`: index `i` aliases the parameter cell
     /// in register `reg` for each `(i, reg)` (see [`VmHost::map_arguments`]).
     MapArguments { args: Reg, cells: Vec<(u32, Reg)> },
@@ -991,6 +997,22 @@ pub trait VmHost {
     /// `i` of `args_obj` aliases the parameter cell `cell` (a one-element
     /// array) for each `(i, cell)`.
     fn map_arguments(&mut self, args_obj: NanBox, cells: &[(usize, NanBox)]);
+    /// A `using` declaration's checks: the dispose method of `value`
+    /// (`undefined` for `null`/`undefined`).
+    ///
+    /// # Errors
+    /// A `TypeError` for a non-object or a missing/non-callable `@@dispose`.
+    fn using_resource(&mut self, value: NanBox) -> Result<NanBox, HostError>;
+    /// DisposeResources over a scope's `(value, method)` list (declaration
+    /// order) with the in-flight throw `pending`, if any.
+    ///
+    /// # Errors
+    /// The (SuppressedError-aggregated) throw the scope completes with.
+    fn dispose_using(
+        &mut self,
+        resources: &[(NanBox, NanBox)],
+        pending: Option<NanBox>,
+    ) -> Result<(), HostError>;
     /// Annex B.3.3 at a hosted script's top level: when the block function
     /// declaration `name` spanning `start..end` qualifies (the host decided at
     /// GlobalDeclarationInstantiation), its value `value` also updates the
@@ -5932,6 +5954,42 @@ fn run_frame_at(
                 let v = regs[*src as usize];
                 if with_host(ctx, |h| h.annexb_global(name, *start, *end, v)).is_none() {
                     return Err(VmError::Unsupported);
+                }
+            }
+            Op::AddDisposable { stack, src } => {
+                let v = regs[*src as usize];
+                match with_host(ctx, |h| h.using_resource(v)) {
+                    Some(Ok(m)) => {
+                        let pair = ctx.realm.new_array(alloc::vec![v, m]);
+                        let st = object_handle(regs[*stack as usize])?;
+                        ctx.realm.array_push(st, NanBox::handle(pair.to_raw()));
+                    }
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
+            }
+            Op::DisposeResources { stack, exc } => {
+                let st = object_handle(regs[*stack as usize])?;
+                let items = ctx
+                    .realm
+                    .array_elements(st)
+                    .map(<[_]>::to_vec)
+                    .unwrap_or_default();
+                let pairs: Vec<(NanBox, NanBox)> = items
+                    .iter()
+                    .filter_map(|p| p.as_handle())
+                    .filter_map(|p| {
+                        ctx.realm
+                            .array_elements(Handle::from_raw(p))
+                            .map(<[_]>::to_vec)
+                    })
+                    .map(|e| (e[0], e[1]))
+                    .collect();
+                let pending = exc.map(|r| regs[r as usize]);
+                match with_host(ctx, |h| h.dispose_using(&pairs, pending)) {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
                 }
             }
             Op::MapArguments { args, cells } => {
@@ -10912,6 +10970,8 @@ enum FinalAction {
     Stmts(Vec<Stmt>),
     /// IteratorClose of an array destructuring's iterator (`(iter, done)`).
     Close(Reg, Reg),
+    /// DisposeResources of a `using` scope's resource list.
+    Dispose(Reg),
 }
 
 /// See [`Compiler::loop_frames`].
@@ -11067,6 +11127,8 @@ struct Compiler {
     /// Exception handlers pushed by enclosing (lexically structured) `try`s
     /// and `for-of`s in this function.
     handler_depth: usize,
+    /// The resource list of the innermost scope holding `using` declarations.
+    using_stack: Option<Reg>,
     /// Enclosing `try … finally` statements whose `finally` a
     /// `return`/`break`/`continue` leaving them must run (innermost last).
     finally_frames: Vec<FinallyFrame>,
@@ -11830,10 +11892,17 @@ impl Compiler {
             c.ops.push(Op::GeneratorStart);
         }
         let mut last: Option<Reg> = None;
-        for stmt in body {
-            if let Some(r) = c.stmt(stmt)? {
-                last = Some(r);
+        if is_main {
+            for stmt in body {
+                if let Some(r) = c.stmt(stmt)? {
+                    last = Some(r);
+                }
             }
+        } else {
+            // A function body declaring `using` resources disposes them on exit.
+            c.using_scope(body, |c| {
+                body.iter().try_for_each(|s| c.stmt(s).map(|_| ()))
+            })?;
         }
         if is_main {
             let src = match last {
@@ -12906,6 +12975,23 @@ impl Compiler {
                 // semantics the bytecode VM does not model; bail to the
                 // tree-walker (`nbexec`), which implements them with full
                 // explicit-resource-management semantics.
+                if decl.kind == crate::ast::VarDeclKind::Using
+                    && let Some(stack) = self.using_stack
+                {
+                    for d in &decl.declarations {
+                        let value = match &d.init {
+                            Some(e) => self.expr_named(e, &d.target)?,
+                            None => self.constant(NanBox::undefined())?,
+                        };
+                        self.ops.push(Op::AddDisposable { stack, src: value });
+                        let saved = self.decl_kind.replace(crate::ast::VarDeclKind::Const);
+                        let bound = self.bind_pattern(&d.target, value);
+                        self.decl_kind = saved;
+                        bound?;
+                        self.mark_pattern_const(&d.target);
+                    }
+                    return Ok(None);
+                }
                 if matches!(
                     decl.kind,
                     crate::ast::VarDeclKind::Using | crate::ast::VarDeclKind::AwaitUsing
@@ -12966,10 +13052,11 @@ impl Compiler {
             }
             Stmt::Block { body, .. } => {
                 self.scopes.push(alloc::collections::BTreeMap::new());
-                let r = self
-                    .prebind_block_lexicals(body, &BTreeSet::new())
-                    .and_then(|()| self.hoist_block_functions(body))
-                    .and_then(|()| body.iter().try_for_each(|s| self.stmt(s).map(|_| ())));
+                let r = self.using_scope(body, |c| {
+                    c.prebind_block_lexicals(body, &BTreeSet::new())?;
+                    c.hoist_block_functions(body)?;
+                    body.iter().try_for_each(|s| c.stmt(s).map(|_| ()))
+                });
                 self.scopes.pop();
                 r?;
                 Ok(None)
@@ -16677,6 +16764,58 @@ impl Compiler {
         }
     }
 
+    /// Compiles a statement list (via `f`) as a `using` scope when it declares
+    /// sync `using` resources: a fresh resource list, disposed on every exit —
+    /// normally, by `return`/`break`/`continue` (a finally frame), or with the
+    /// in-flight throw (a handler, then rethrow). Hosted only.
+    fn using_scope(
+        &mut self,
+        body: &[Stmt],
+        f: impl FnOnce(&mut Self) -> Result<(), CompileError>,
+    ) -> Result<(), CompileError> {
+        let has_using = self.hosted
+            && body
+                .iter()
+                .any(|s| matches!(s, Stmt::Var(d) if d.kind == crate::ast::VarDeclKind::Using));
+        if !has_using {
+            return f(self);
+        }
+        let stack = self.alloc();
+        self.ops.push(Op::NewArray { dst: stack, len: 0 });
+        let saved = self.using_stack.replace(stack);
+        self.finally_frames.push(FinallyFrame {
+            loop_len: self.loop_frames.len(),
+            cont_len: self.continue_sites.len(),
+            labels_len: self.labels.len(),
+            scope_len: self.scopes.len(),
+            handler_depth: self.handler_depth,
+            action: FinalAction::Dispose(stack),
+        });
+        let exc = self.alloc();
+        let h = self.ops.len();
+        self.ops.push(Op::PushHandler {
+            target: 0,
+            reg: exc,
+        });
+        self.handler_depth += 1;
+        let r = f(self);
+        self.handler_depth -= 1;
+        self.finally_frames.pop();
+        self.using_stack = saved;
+        r?;
+        self.ops.push(Op::PopHandler);
+        self.ops.push(Op::DisposeResources { stack, exc: None });
+        let end = self.emit_jump();
+        self.patch_to(h, self.ops.len());
+        self.ops.push(Op::DisposeResources {
+            stack,
+            exc: Some(exc),
+        });
+        self.ops.push(Op::Throw { src: exc });
+        self.patch(end);
+        Ok(())
+    }
+
     /// Reads the hidden binding `n`.
     fn read_hidden(&mut self, n: &str) -> Result<Reg, CompileError> {
         let b = self
@@ -17276,6 +17415,10 @@ impl Compiler {
                     done,
                     quiet: false,
                 });
+                return Ok(());
+            }
+            FinalAction::Dispose(stack) => {
+                self.ops.push(Op::DisposeResources { stack, exc: None });
                 return Ok(());
             }
             FinalAction::Stmts(ref v) => v.clone(),

@@ -626,6 +626,17 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*b)
         }
         Op::AnnexBGlobal { src, .. } => reg(*src),
+        Op::AddDisposable { stack, src } => {
+            reg(*stack)?;
+            reg(*src)
+        }
+        Op::DisposeResources { stack, exc } => {
+            reg(*stack)?;
+            if let Some(e) = exc {
+                reg(*e)?;
+            }
+            Ok(())
+        }
         Op::ObjectRestDyn { dst, src, keys, .. } => {
             reg(*dst)?;
             reg(*src)?;
@@ -1441,6 +1452,17 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
                 w_reg(*k, out);
             }
         }
+        Op::AddDisposable { stack, src } => {
+            w_u8(121, out);
+            w_reg(*stack, out);
+            w_reg(*src, out);
+        }
+        Op::DisposeResources { stack, exc } => {
+            w_u8(122, out);
+            w_reg(*stack, out);
+            w_bool(exc.is_some(), out);
+            w_reg(exc.unwrap_or(0), out);
+        }
         Op::AnnexBGlobal {
             name,
             start,
@@ -2092,6 +2114,18 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
                 keys,
             }
         }
+        121 => Op::AddDisposable {
+            stack: r.reg()?,
+            src: r.reg()?,
+        },
+        122 => Op::DisposeResources {
+            stack: r.reg()?,
+            exc: {
+                let has = r.boolean()?;
+                let reg = r.reg()?;
+                has.then_some(reg)
+            },
+        },
         118 => Op::AnnexBGlobal {
             name: r.string()?,
             start: r.u32()?,
