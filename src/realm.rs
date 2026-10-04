@@ -215,6 +215,10 @@ pub struct Realm {
     /// from which a VM closure's own `name`/`length` data properties are
     /// synthesized (no per-closure storage; see [`Realm::vm_fn_meta_value`]).
     vm_fn_meta: Vec<(Handle, u32)>,
+    /// Live bytecode-VM activations across *all* nested VM contexts. A hosted
+    /// VM run nests a fresh `Ctx` (call depth 0) for every host→VM call, so
+    /// recursion bouncing between the tiers is bounded here, not per context.
+    pub vm_total_depth: usize,
     /// The realm's single `%ThrowTypeError%` intrinsic — the poisoned accessor
     /// shared by `Function.prototype.caller`/`.arguments` and a strict
     /// `arguments` object's `callee`. There is exactly one per realm (ECMA-262
@@ -533,6 +537,7 @@ impl Realm {
             typed_array_intrinsic: None,
             function_proto_intrinsic: None,
             vm_fn_meta: Vec::new(),
+            vm_total_depth: 0,
             throw_type_error_intrinsic: None,
             array_proto_intrinsic: None,
             root_array_proto: None,

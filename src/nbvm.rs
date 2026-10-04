@@ -3117,11 +3117,14 @@ fn call_with(
     this_val: NanBox,
 ) -> Result<NanBox, VmError> {
     // Recursion guard: throw a catchable `RangeError` rather than overflowing.
-    if ctx.call_depth >= ctx.realm.limits.max_call_depth {
+    if ctx.call_depth >= ctx.realm.limits.max_call_depth
+        || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
+    {
         let e = vm_error(ctx, "RangeError", "Maximum call stack size exceeded");
         return Err(VmError::Thrown(e));
     }
     ctx.call_depth += 1;
+    ctx.realm.vm_total_depth += 1;
     // Brackets the activation-input roots `call_with_inner` publishes, on every
     // exit path (it returns from several places inside its tail-call loop).
     // Restoring the publish counter here makes the whole scheme exception-safe:
@@ -3133,6 +3136,7 @@ fn call_with(
     ctx.frames_published = published;
     ctx.frame_shadow.truncate(mark);
     ctx.call_depth -= 1;
+    ctx.realm.vm_total_depth -= 1;
     result
 }
 
@@ -9811,10 +9815,19 @@ pub fn compile_program_into(
             refuse_generator(f, hosted)?;
         }
     }
+    // Hosted: a top-level function declaration that refers to `eval` stays the
+    // interpreter closure the host's GlobalDeclarationInstantiation made (its
+    // outer scope is the global environment, so a direct eval in it sees
+    // exactly what it should); the VM neither compiles nor rebinds it.
     let decls: Vec<&crate::ast::Function> = program
         .body
         .iter()
         .filter_map(|s| match s {
+            Stmt::Function(f)
+                if hosted && free_of_nonarrow(&f.params, &f.body).contains("eval") =>
+            {
+                None
+            }
             Stmt::Function(f) => Some(f),
             _ => None,
         })
@@ -10942,6 +10955,9 @@ struct Binding {
     /// parameters, so a write to such a parameter — or any use of `arguments`
     /// beyond `arguments.length` / `arguments[i]` reads — refuses the program.
     mapped: bool,
+    /// A named function expression's own name (with `konst`): a write is
+    /// silently ignored in sloppy code rather than a `TypeError`.
+    fn_name: bool,
 }
 
 /// A `for-of`/`for-in` head: a declaration or an assignment target.
@@ -11268,7 +11284,7 @@ impl Compiler {
         strict: bool,
         hosted: bool,
         is_arrow: bool,
-        cap_flags: &alloc::collections::BTreeMap<String, (bool, bool, bool)>,
+        cap_flags: &alloc::collections::BTreeMap<String, (bool, bool, bool, bool)>,
         class_ctor: Option<bool>,
         field_defs: &[FieldDef<'_>],
         is_generator: bool,
@@ -11341,7 +11357,7 @@ impl Compiler {
         strict: bool,
         hosted: bool,
         is_arrow: bool,
-        cap_flags: &alloc::collections::BTreeMap<String, (bool, bool, bool)>,
+        cap_flags: &alloc::collections::BTreeMap<String, (bool, bool, bool, bool)>,
         class_ctor: Option<bool>,
         field_defs: &[FieldDef<'_>],
         is_generator: bool,
@@ -11497,6 +11513,7 @@ impl Compiler {
                             global: None,
                             tdz: false,
                             mapped: false,
+                            fn_name: false,
                         };
                         c.write_var(bind, arg_regs[i]);
                         bind
@@ -11508,6 +11525,7 @@ impl Compiler {
                             global: None,
                             tdz: false,
                             mapped: false,
+                            fn_name: false,
                         }
                     };
                     c.scopes
@@ -11537,6 +11555,7 @@ impl Compiler {
                     global: None,
                     tdz: cap_flags.get(name).is_some_and(|f| f.0),
                     mapped: cap_flags.get(name).is_some_and(|f| f.2),
+                    fn_name: cap_flags.get(name).is_some_and(|f| f.3),
                 },
             );
         }
@@ -11703,6 +11722,7 @@ impl Compiler {
                             global: None,
                             tdz: true,
                             mapped: false,
+                            fn_name: false,
                         },
                     );
                     c.tdz_pending.insert((0, name.clone()));
@@ -11981,7 +12001,11 @@ impl Compiler {
         if self.tdz_pending.remove(&(depth, String::from(name)))
             && let Some(b) = self.scopes[depth].get(name).copied()
         {
-            return Binding { tdz: false, ..b };
+            return Binding {
+                tdz: false,
+                konst: false,
+                ..b
+            };
         }
         let reg = self.alloc();
         let cell = self.cell_names.contains(name);
@@ -11996,6 +12020,7 @@ impl Compiler {
             global: None,
             tdz: false,
             mapped: false,
+            fn_name: false,
         };
         self.scopes
             .last_mut()
@@ -12035,6 +12060,7 @@ impl Compiler {
             global: Some((idx, write)),
             tdz: false,
             mapped: false,
+            fn_name: false,
         }
     }
 
@@ -12086,8 +12112,7 @@ impl Compiler {
                 let b = self
                     .resolve(&id.name)
                     .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
-                self.write_var(b, value_reg);
-                Ok(())
+                self.assign_var(b, value_reg)
             }
             Expr::Member {
                 object, property, ..
@@ -12590,6 +12615,30 @@ impl Compiler {
 
     /// Emits a write of `src` into the variable bound by `b` (a cell write goes
     /// through `SetElem`).
+    /// A *user* assignment to `b` (not a declaration's initialization): a
+    /// `const` binding throws `TypeError` (after the TDZ check), or — a named
+    /// function expression's own name in sloppy code — ignores the write.
+    fn assign_var(&mut self, b: Binding, src: Reg) -> Result<(), CompileError> {
+        if !b.konst {
+            self.write_var(b, src);
+            return Ok(());
+        }
+        if !self.hosted {
+            return Err(CompileError::Unsupported("assignment to const"));
+        }
+        if b.tdz {
+            let unchecked = Binding { tdz: false, ..b };
+            let cur = self.read_var(unchecked);
+            self.ops.push(Op::CheckTdz { src: cur });
+        }
+        if !(b.fn_name && !self.strict) {
+            self.ops.push(Op::ThrowTypeError {
+                msg: String::from("Assignment to constant variable."),
+            });
+        }
+        Ok(())
+    }
+
     fn write_var(&mut self, b: Binding, src: Reg) {
         if b.mapped {
             self.mapped_violation = true;
@@ -12901,6 +12950,7 @@ impl Compiler {
                                 global: None,
                                 tdz: false,
                                 mapped: false,
+                                fn_name: false,
                             };
                             self.write_var(bind, catch_reg);
                             bind
@@ -12912,6 +12962,7 @@ impl Compiler {
                                 global: None,
                                 tdz: false,
                                 mapped: false,
+                                fn_name: false,
                             }
                         };
                         self.scopes
@@ -14439,13 +14490,6 @@ impl Compiler {
                 ..
             } => {
                 use crate::ast::AssignOp;
-                // Reassigning a `const` binding is a TypeError; route the program
-                // to the tree-walker, which enforces it at the right point.
-                if let Expr::Ident(id) = &**target
-                    && self.lookup(&id.name).is_some_and(|b| b.konst)
-                {
-                    return Err(CompileError::Unsupported("assignment to const"));
-                }
                 // Logical assignment (`&&=`/`||=`/`??=`) short-circuits.
                 if matches!(
                     op,
@@ -14473,6 +14517,9 @@ impl Compiler {
                             let b = self
                                 .resolve(&id.name)
                                 .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
+                            if b.fn_name && !self.strict {
+                                return Err(CompileError::Unsupported("assignment to const"));
+                            }
                             let cur = self.read_var(b);
                             let c = cond(self, cur)?;
                             let jf = self.emit_jump_if_false(c);
@@ -14485,7 +14532,7 @@ impl Compiler {
                             } else {
                                 self.expr_named(value, &bt)?
                             };
-                            self.write_var(b, v);
+                            self.assign_var(b, v)?;
                             self.patch(jf);
                             return Ok(self.read_var(b));
                         }
@@ -14557,7 +14604,7 @@ impl Compiler {
                                 strict: true,
                                 resolved: Some(r),
                             }),
-                            None => self.write_var(b, src),
+                            None => self.assign_var(b, src)?,
                         }
                         Ok(src)
                     }
@@ -14668,9 +14715,9 @@ impl Compiler {
                 let b = self
                     .resolve(&id.name)
                     .ok_or_else(|| CompileError::Undefined(String::from(&*id.name)))?;
-                // `++`/`--` on a `const` binding is a TypeError; route the program
-                // to the tree-walker, which enforces it at the right point.
-                if b.konst {
+                // `++`/`--` on a `const` binding is a TypeError (after the read
+                // and ToNumeric, which may run user code) — hosted only.
+                if b.konst && !self.hosted {
                     return Err(CompileError::Unsupported("update of const"));
                 }
                 if self.hosted {
@@ -14684,7 +14731,7 @@ impl Compiler {
                         src: old,
                         dec: matches!(op, crate::ast::UpdateOp::Dec),
                     });
-                    self.write_var(b, next);
+                    self.assign_var(b, next)?;
                     return Ok(if *prefix { next } else { old });
                 }
                 let one = self.constant(NanBox::number(1.0))?;
@@ -15479,18 +15526,19 @@ impl Compiler {
             (p.len() - 1) as u32
         };
         // Each capture keeps its binding's TDZ check and `const`-ness.
-        let mut flags: alloc::collections::BTreeMap<String, (bool, bool, bool)> = captures
+        let mut flags: alloc::collections::BTreeMap<String, (bool, bool, bool, bool)> = captures
             .iter()
             .filter(|n| Some(n.as_str()) != self_name)
             .filter_map(|n| {
                 let b = self.lookup(n)?;
-                (b.tdz || b.konst || b.mapped).then(|| (n.clone(), (b.tdz, b.konst, b.mapped)))
+                (b.tdz || b.konst || b.mapped)
+                    .then(|| (n.clone(), (b.tdz, b.konst, b.mapped, b.fn_name)))
             })
             .collect();
         // A named function expression's own name is immutable in its body (a
         // write is ignored, or a TypeError in strict code): refuse such writes.
         if let Some(sn) = self_name {
-            flags.insert(String::from(sn), (false, true, false));
+            flags.insert(String::from(sn), (false, true, false, true));
         }
         let proto = Compiler::compile_fn_inner(
             &self.fn_ids,
@@ -16022,6 +16070,7 @@ impl Compiler {
             global: None,
             tdz,
             mapped: false,
+            fn_name: false,
         };
         self.scopes
             .last_mut()
@@ -17294,14 +17343,7 @@ impl Compiler {
     fn for_bind(&mut self, bind: ForBind<'_>, value: Reg) -> Result<(), CompileError> {
         match bind {
             ForBind::Decl(kind, target) => self.bind_for_decl(kind, target, value),
-            ForBind::Target(t) => {
-                if let Expr::Ident(id) = t
-                    && self.lookup(&id.name).is_some_and(|b| b.konst)
-                {
-                    return Err(CompileError::Unsupported("assignment to const"));
-                }
-                self.assign_pattern(t, value)
-            }
+            ForBind::Target(t) => self.assign_pattern(t, value),
         }
     }
 
