@@ -1125,6 +1125,13 @@ pub trait VmHost {
     /// its `[[Prototype]]` that realm's `%Function.prototype%` (when it was
     /// the running realm's).
     fn adopt_fn_realm(&mut self, f: NanBox, idx: usize);
+    /// Entering an activation of the VM function `callee`: when its realm
+    /// (GetFunctionRealm) is not the running one, make it the running realm
+    /// and return `true` — the activation's exit then calls
+    /// [`VmHost::leave_fn_realm`]. Only called once a second realm exists.
+    fn enter_fn_realm(&mut self, callee: NanBox) -> bool;
+    /// Undoes the innermost [`VmHost::enter_fn_realm`] that returned `true`.
+    fn leave_fn_realm(&mut self);
     /// An error of the built-in constructor `name` from the realm of the
     /// function `callee` (GetFunctionRealm).
     fn make_error_in(&mut self, name: &str, message: &str, callee: NanBox) -> NanBox;
@@ -3109,6 +3116,30 @@ fn vm_agent_tick(ctx: &mut Ctx) -> bool {
     with_host(ctx, |h| h.agent_tick()).unwrap_or(false)
 }
 
+/// Hosted: a function value just created belongs to the running realm
+/// (GetFunctionRealm) — recorded only when that is a created one, since an
+/// untagged function is the main realm's.
+fn tag_new_fn_realm(ctx: &mut Ctx, f: Handle) {
+    let running = if ctx.realm.multi_realm {
+        ctx.host.as_deref().and_then(|h| h.realm_index())
+    } else {
+        ctx.in_realm
+    };
+    if let Some(idx) = running
+        && let Some(h) = ctx.host.as_deref_mut()
+    {
+        h.tag_fn_realm(NanBox::handle(f.to_raw()), idx);
+    } else if let Some(running) = ctx.realm.vm_callee_stack.last().copied()
+        && let Some(idx) = ctx.host.as_deref().and_then(|h| h.fn_realm_index(running))
+    {
+        // A closure a `$262.createRealm()` realm's function creates belongs to
+        // that realm (an activation the running realm did not follow, e.g. a
+        // resumed generator).
+        let f = NanBox::handle(f.to_raw());
+        with_host(ctx, |h| h.adopt_fn_realm(f, idx));
+    }
+}
+
 /// Hosted: a (non-generator) async function inherits
 /// %AsyncFunction.prototype%.
 fn link_async_proto(ctx: &mut Ctx, proto: Option<&FnProto>, f: Handle) {
@@ -3692,7 +3723,20 @@ fn call_with(
         .push(ctx.pending_callee.unwrap_or(NanBox::undefined()));
     ctx.realm.vm_callee_args.push(args_mark);
     ctx.realm.vm_args_buf.extend_from_slice(args);
+    // The running realm follows the activation (one flag test while only one
+    // realm exists): what the host does on this function's behalf — the
+    // errors it raises, a revoked proxy's `TypeError`, its global lookups —
+    // belongs to the function's realm.
+    let entered_realm = ctx.realm.multi_realm
+        && ctx
+            .pending_callee
+            .filter(|c| c.as_handle().is_some())
+            .and_then(|c| with_host(ctx, |h| h.enter_fn_realm(c)))
+            .unwrap_or(false);
     let result = call_with_inner(ctx, funcs, id, args, captures, this_val);
+    if entered_realm {
+        with_host(ctx, |h| h.leave_fn_realm());
+    }
     ctx.realm.vm_callee_stack.truncate(callee_mark);
     ctx.realm.vm_callee_args.truncate(callee_mark);
     ctx.realm.vm_args_buf.truncate(args_mark);
@@ -7786,6 +7830,7 @@ fn run_frame_at(
                 install_fn_name_length(ctx.realm, handle, funcs.get(*func as usize));
                 link_function_proto(ctx, handle);
                 link_async_proto(ctx, funcs.get(*func as usize), handle);
+                tag_new_fn_realm(ctx, handle);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::MakeClosure {
@@ -7798,18 +7843,7 @@ fn run_frame_at(
                 install_fn_name_length(ctx.realm, handle, funcs.get(*func as usize));
                 link_function_proto(ctx, handle);
                 link_async_proto(ctx, funcs.get(*func as usize), handle);
-                if let Some(idx) = ctx.in_realm
-                    && let Some(h) = ctx.host.as_deref_mut()
-                {
-                    h.tag_fn_realm(NanBox::handle(handle.to_raw()), idx);
-                } else if let Some(running) = ctx.realm.vm_callee_stack.last().copied()
-                    && let Some(idx) = ctx.host.as_deref().and_then(|h| h.fn_realm_index(running))
-                {
-                    // A closure a `$262.createRealm()` realm's function creates
-                    // belongs to that realm.
-                    let f = NanBox::handle(handle.to_raw());
-                    with_host(ctx, |h| h.adopt_fn_realm(f, idx));
-                }
+                tag_new_fn_realm(ctx, handle);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::CallValue { dst, callee, args }

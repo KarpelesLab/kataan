@@ -318,6 +318,11 @@ pub struct Realm {
     /// loop back-edges then hand the agents' execution baton over (as the
     /// tree-walker's do), so a spin loop waiting on another agent progresses.
     pub agents_active: bool,
+    /// Set by the host once a second realm (`$262.createRealm()`, a
+    /// `ShadowRealm`) exists: only then can a bytecode-VM function run in a
+    /// realm other than the host's current one, so only then does a host call
+    /// from VM code check whose realm it runs in.
+    pub multi_realm: bool,
     /// The callee of each active bytecode-VM activation (`undefined` when the
     /// call site did not know it), innermost last — across nested VM runs, so
     /// eval code and host callbacks see the enclosing activations (the legacy
@@ -532,6 +537,7 @@ impl Realm {
         Self {
             interrupt: None,
             agents_active: false,
+            multi_realm: false,
             vm_callee_stack: Vec::new(),
             vm_args_buf: Vec::new(),
             vm_callee_args: Vec::new(),

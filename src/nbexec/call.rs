@@ -9,6 +9,9 @@ pub(crate) enum RealmGuard {
         realm: Option<usize>,
         global_this: NanBox,
         global_scope: Scope,
+        /// The caller's lexical environment: a function of another realm never
+        /// sees it, so its global references resolve in its own realm.
+        current: Scope,
         /// The caller realm's realm-wide intrinsic slots (`%Object.prototype%`,
         /// `%Symbol.prototype%`, `%ThrowTypeError%`, …), which live in one set of
         /// `Realm` fields rather than per-realm ones.
@@ -234,10 +237,15 @@ impl<'a> Interp<'a> {
         // which the spec fixes to "the Realm of the current execution context" —
         // and would make a revoked proxy throw the target's `%TypeError%` instead
         // of the running context's.
-        let realm = if callee_h.is_some_and(|h| self.realm.proxy_at(h).is_some()) {
-            self.cur_realm
-        } else {
-            callee_h.and_then(|h| self.get_function_realm(h))
+        // Nor does calling a non-callable: its `TypeError` is the running
+        // realm's.
+        let realm = match callee_h {
+            Some(h) if self.realm.proxy_at(h).is_some() => self.cur_realm,
+            Some(h) => match self.get_function_realm(h) {
+                None if self.cur_realm.is_some() && !self.is_callable(h) => self.cur_realm,
+                r => r,
+            },
+            None => self.cur_realm,
         };
         let guard = self.enter_realm(realm);
         let r = self.call_with_this_inner(callee, this_val, args);
@@ -273,10 +281,12 @@ impl<'a> Interp<'a> {
             realm: self.cur_realm,
             global_this: self.global_this,
             global_scope: self.global_scope.clone(),
+            current: self.current.clone(),
             intrinsics: self.realm.intrinsics_snapshot(),
         };
         self.cur_realm = realm;
         self.global_this = gt;
+        self.current = gs.clone();
         self.global_scope = gs;
         // The realm-wide intrinsic slots are a *single* set of `Realm` fields, so
         // entering a realm must swap them: they are what a primitive's
@@ -295,12 +305,14 @@ impl<'a> Interp<'a> {
             realm,
             global_this,
             global_scope,
+            current,
             intrinsics,
         } = guard
         {
             self.cur_realm = realm;
             self.global_this = global_this;
             self.global_scope = global_scope;
+            self.current = current;
             self.realm.restore_intrinsics(intrinsics);
         }
     }

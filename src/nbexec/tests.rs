@@ -10751,6 +10751,32 @@ fn agent_worker_runs_on_the_vm_and_spins_with_the_baton() {
 }
 
 #[test]
+fn vm_function_of_another_realm_runs_in_its_realm() {
+    // A bytecode-VM function created by another realm's code runs with that
+    // realm current: the host's errors (a revoked proxy, calling `null`), its
+    // sloppy `this` and its global references are that realm's — and a
+    // main-realm callback it reaches (a proxy trap) writes the main globals.
+    let src = r#"
+        var other = $262_createRealm();
+        var ok = [];
+        var F = other.evalScript(`(function () {
+            var p = Proxy.revocable(function () {}, {}); p.revoke(); return p.proxy();
+        })`);
+        try { F(); } catch (e) { ok.push(e.constructor === other.global.TypeError); }
+        var H = other.evalScript(`(function () { return null(); })`);
+        try { H(); } catch (e) { ok.push(e.constructor === other.global.TypeError); }
+        ok.push(other.evalScript(`(function () { return this; })`)() === other.global);
+        var count = 0;
+        Object.setPrototypeOf(other.global.Number.prototype,
+            new Proxy({}, { set: function () { count += 1; return true; } }));
+        other.global.eval('0..x = null;');
+        ok.push(count === 1);
+        ok.join()
+    "#;
+    assert_eq!(run(src), "true,true,true,true");
+}
+
+#[test]
 fn virtual_clock_set_timeout_fires_in_delay_order_and_advances() {
     // Macrotasks fire earliest-virtual-fire-time first, and dispatching one
     // advances the virtual clock read by `monotonicNow()`.

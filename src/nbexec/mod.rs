@@ -884,6 +884,9 @@ pub struct Interp<'a> {
     /// The function table eval code extended (functions it defined appended to
     /// the run's table; see `vm_env`).
     vm_ext_table: Option<alloc::rc::Rc<[crate::nbvm::FnProto]>>,
+    /// The running realms bytecode-VM activations of cross-realm functions
+    /// entered (see `VmHost::enter_fn_realm`), innermost last.
+    vm_realm_guards: Vec<call::RealmGuard>,
     /// Compiled eval code by (program address, flags): an eval of the same
     /// source in the same kind of context reuses it.
     vm_eval_cache:
@@ -3388,6 +3391,7 @@ impl<'a> Interp<'a> {
             gc_scope_shadow: Vec::new(),
             vm_table: None,
             vm_ext_table: None,
+            vm_realm_guards: Vec::new(),
             vm_eval_cache: alloc::collections::BTreeMap::new(),
             hoist_skip_fns: false,
             vm_eval_home: None,
@@ -10602,6 +10606,24 @@ impl crate::nbvm::VmHost for Interp<'_> {
 
     fn realm_index(&self) -> Option<usize> {
         self.cur_realm
+    }
+
+    fn enter_fn_realm(&mut self, callee: NanBox) -> bool {
+        let realm = callee
+            .as_handle()
+            .and_then(|h| self.get_function_realm(Handle::from_raw(h)));
+        if realm == self.cur_realm {
+            return false;
+        }
+        let guard = self.enter_realm(realm);
+        self.vm_realm_guards.push(guard);
+        true
+    }
+
+    fn leave_fn_realm(&mut self) {
+        if let Some(guard) = self.vm_realm_guards.pop() {
+            self.leave_realm(guard);
+        }
     }
 
     fn tag_fn_realm(&mut self, f: NanBox, idx: usize) {

@@ -450,6 +450,8 @@ impl<'a> Interp<'a> {
         self.realm.restore_intrinsics(saved_intrinsics);
 
         let idx = self.created_realms.len();
+        // From now on bytecode-VM host calls check whose realm they run in.
+        self.realm.multi_realm = true;
         self.created_realms.push(CreatedRealm {
             global_scope: new_global_scope,
             global_this: new_global_this,
@@ -721,6 +723,10 @@ impl<'a> Interp<'a> {
         let saved_new_target = self.new_target;
         let saved_strict = self.strict;
         let saved_intrinsics = self.realm.intrinsics_snapshot();
+        // The created realm is the running one for the duration: closures the
+        // script creates (on the bytecode VM, which tags them from it) belong to
+        // it, and so do the errors it raises.
+        let saved_realm = self.cur_realm.replace(idx);
 
         self.strict = has_use_strict(&program.body);
         // A strict program gets its own child so its lexical declarations don't
@@ -758,6 +764,7 @@ impl<'a> Interp<'a> {
         self.this_val = saved_this;
         self.new_target = saved_new_target;
         self.strict = saved_strict;
+        self.cur_realm = saved_realm;
         self.realm.restore_intrinsics(saved_intrinsics);
         result
     }
