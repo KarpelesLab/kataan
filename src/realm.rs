@@ -219,9 +219,9 @@ pub struct Realm {
     /// from which a VM closure's own `name`/`length` data properties are
     /// synthesized (no per-closure storage; see [`Realm::vm_fn_meta_value`]).
     vm_fn_meta: Vec<(Handle, u32)>,
-    /// The source text of VM function ids (index = function id), for
-    /// `Function.prototype.toString` (see [`Realm::fn_source`]).
-    vm_fn_src: Vec<Option<alloc::rc::Rc<str>>>,
+    /// The source text of each VM function id (`Function.prototype.toString`),
+    /// parallel to `vm_fn_meta`.
+    vm_fn_source: Vec<Option<alloc::rc::Rc<str>>>,
     /// Live bytecode-VM activations across *all* nested VM contexts. A hosted
     /// VM run nests a fresh `Ctx` (call depth 0) for every host→VM call, so
     /// recursion bouncing between the tiers is bounded here, not per context.
@@ -550,7 +550,7 @@ impl Realm {
             typed_array_intrinsic: None,
             function_proto_intrinsic: None,
             vm_fn_meta: Vec::new(),
-            vm_fn_src: Vec::new(),
+            vm_fn_source: Vec::new(),
             vm_total_depth: 0,
             throw_type_error_intrinsic: None,
             array_proto_intrinsic: None,
@@ -1838,20 +1838,14 @@ impl Realm {
         if let Some(s) = self.fn_source.get(&handle.to_raw()) {
             return Some(s);
         }
-        let Some(Cell::VmFunction { func, .. }) = self.heap.get(handle) else {
-            return None;
-        };
-        self.vm_fn_src.get(*func as usize)?.as_deref()
-    }
-
-    /// Records the source text of VM function ids `self.vm_fn_src.len()..`
-    /// (one entry per function of the table, in order).
-    pub fn register_vm_fn_sources(
-        &mut self,
-        sources: impl Iterator<Item = Option<alloc::rc::Rc<str>>>,
-    ) {
-        let have = self.vm_fn_src.len();
-        self.vm_fn_src.extend(sources.skip(have));
+        // A VM closure's text lives with its function-table entry.
+        match self.heap.get(handle) {
+            Some(Cell::VmFunction { func, .. }) => self
+                .vm_fn_source
+                .get(*func as usize)
+                .and_then(Option::as_deref),
+            _ => None,
+        }
     }
 
     /// Allocates an empty `Map` (`is_set = false`) or `Set` (`is_set = true`).
@@ -2396,13 +2390,23 @@ impl Realm {
         self.heap.alloc(Cell::VmFunction { func, captures })
     }
 
-    /// Records the `name`/`length` of VM function ids `self.vm_fn_meta.len()..`
-    /// (a shared function table only grows).
-    pub fn register_vm_fn_meta<'n>(&mut self, metas: impl Iterator<Item = (&'n str, u32)>) {
+    /// Replaces the captured values of the VM closure at `handle` (a snapshot
+    /// restore fills them in once every referenced cell exists).
+    pub fn set_vm_function_captures(&mut self, handle: Handle, new: Vec<NanBox>) {
+        if let Some(Cell::VmFunction { captures, .. }) = self.heap.get_mut(handle) {
+            *captures = new;
+        }
+    }
+
+    /// Records the `name`/`length` and source text of VM function ids
+    /// `self.vm_fn_meta.len()..` of `protos` (a shared function table only
+    /// grows).
+    pub fn register_vm_fn_meta(&mut self, protos: &[crate::nbvm::FnProto]) {
         let have = self.vm_fn_meta.len();
-        for (name, len) in metas.skip(have) {
-            let h = self.new_string(name);
-            self.vm_fn_meta.push((h, len));
+        for p in protos.iter().skip(have) {
+            let h = self.new_string(&p.name);
+            self.vm_fn_meta.push((h, p.length as u32));
+            self.vm_fn_source.push(p.source.clone());
         }
     }
 
@@ -2767,23 +2771,33 @@ impl Realm {
             )
         ) {
             let mut names = Vec::new();
-            // A VM closure's synthesized `length`/`name` come first (spec order).
-            for k in ["length", "name"] {
-                if self.vm_fn_meta_value(handle, k).is_some() {
-                    names.push(alloc::string::String::from(k));
-                }
-            }
-            if let Some(aux) = self
+            let aux = self
                 .aux_props
                 .get(&handle.to_raw())
                 .and_then(|h| self.heap.get(*h))
-                .and_then(Cell::as_object)
-            {
+                .and_then(Cell::as_object);
+            // A VM closure's `length`/`name` come first (spec order): the
+            // synthesized ones, and a redefinition of one (`static length()`)
+            // that never deleted it keeps its original position.
+            let vm_fn = matches!(self.heap.get(handle), Some(Cell::VmFunction { .. }));
+            for k in ["length", "name"] {
+                let redefined = vm_fn
+                    && aux.is_some_and(|o| {
+                        (o.contains(k) || o.accessor(k).is_some())
+                            && !fn_meta_tombstone(k).is_some_and(|t| o.contains(t))
+                    });
+                if redefined || self.vm_fn_meta_value(handle, k).is_some() {
+                    names.push(alloc::string::String::from(k));
+                }
+            }
+            if let Some(aux) = aux {
                 // `[[OwnPropertyKeys]]` order: integer indices ascending, then the
                 // rest in insertion order. `name`/`length` are stored as ordinary
                 // named keys, so `ordered_keys` already yields the spec order.
                 for k in aux.ordered_keys().iter().filter(|s| !is_internal_key(s)) {
-                    names.push(alloc::string::String::from(*k));
+                    if !names.iter().any(|n| n == k) {
+                        names.push(alloc::string::String::from(*k));
+                    }
                 }
             }
             self.order_vm_fn_keys(handle, &mut names);

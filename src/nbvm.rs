@@ -811,11 +811,12 @@ pub struct FnProto {
     /// A generator function: a call runs the prologue up to
     /// [`Op::GeneratorStart`] and returns a suspended generator object.
     pub is_generator: bool,
-    /// The byte span of the function's source text in its program (for
-    /// `Function.prototype.toString`); resolved into [`Self::source`] once the
-    /// program is compiled. Not part of the portable artifact.
+    /// While compiling: the byte span of the function's definition in the
+    /// program's source, resolved into [`source`](Self::source) once the
+    /// whole program is compiled. Not part of the portable artifact.
     pub source_span: Option<(u32, u32)>,
-    /// The function's source text (see [`Self::source_span`]).
+    /// The function's source text, for `Function.prototype.toString`
+    /// (ECMA-262 20.2.3.5). Not part of the portable artifact.
     pub source: Option<alloc::rc::Rc<str>>,
 }
 
@@ -1228,6 +1229,28 @@ pub trait VmHost {
     /// The operation's throw (`ReferenceError`, `TypeError`, a getter's or the
     /// eval code's throw), or a host fault.
     fn env_op(&mut self, req: EnvReq<'_>) -> Result<(NanBox, NanBox), HostError>;
+    /// `GetPrototypeFromConstructor(newTarget, %Object.prototype%)`'s fallback
+    /// when `newTarget.prototype` is not an object: the `%Object.prototype%` of
+    /// `GetFunctionRealm(newTarget)` (a cross-realm `newTarget` supplies its
+    /// own realm's). `None` keeps the running realm's.
+    ///
+    /// # Errors
+    /// `GetFunctionRealm`'s `TypeError` for a revoked proxy.
+    /// Whether `v` is the global object of any realm the host runs (the
+    /// running one, the main one, a `$262.createRealm()` one): a write to it
+    /// must reach that realm's global bindings, which the host mirrors.
+    fn is_global_object(&self, v: NanBox) -> bool {
+        v == self.global_this()
+    }
+    /// GetPrototypeFromConstructor(`new_target`, %Object.prototype%) for an
+    /// ordinary object: `new_target.prototype` if it is an object, else the
+    /// default of `new_target`'s realm; `None` to use the running realm's.
+    fn ordinary_object_proto_for(
+        &mut self,
+        _new_target: NanBox,
+    ) -> Result<Option<NanBox>, HostError> {
+        Ok(None)
+    }
     /// Installs the running VM program's function table (returning the previous
     /// one), so VM function values handed to the host stay callable.
     fn set_vm_table(
@@ -1352,6 +1375,8 @@ fn read_needs_host(ctx: &Ctx, recv: NanBox) -> bool {
                 || ctx.realm.proxy_at(h).is_some()
                 || ctx.realm.typed_len(h).is_some()
                 || ctx.realm.is_host_exotic(h)
+                // An embedder's host function synthesizes `name`/`length`.
+                || ctx.realm.host_fn_at(h).is_some()
         }
     }
 }
@@ -1522,7 +1547,7 @@ fn vm_set_prop_mode(
     // A write to the global object also updates the global environment's
     // bindings (the host mirrors it), so it is the host's.
     let to_host = read_needs_host(ctx, recv)
-        || ctx.host.as_ref().is_some_and(|h| h.global_this() == recv)
+        || ctx.host.as_ref().is_some_and(|h| h.is_global_object(recv))
         // A String wrapper's own `length` / indices are read-only.
         || is_string_wrapper(ctx.realm, recv)
         // An array's `length` write (ToUint32 + ToNumber of any value, the
@@ -2971,10 +2996,17 @@ fn vm_construct(
             None => return Err(VmError::Unsupported),
         }
     };
-    if let Some(p) = proto
-        .filter(|p| is_object_value(ctx.realm, *p))
-        .and_then(|p| p.as_handle())
-    {
+    let proto = match proto.filter(|p| is_object_value(ctx.realm, *p)) {
+        Some(p) => Some(p),
+        // Not an object: the intrinsic default of newTarget's realm.
+        None if !nt_is_vm && ctx.host.is_some() && new_target.as_handle().is_some() => {
+            with_host(ctx, |h| h.ordinary_object_proto_for(new_target))
+                .unwrap_or(Ok(None))
+                .map_err(VmError::from)?
+        }
+        None => None,
+    };
+    if let Some(p) = proto.and_then(|p| p.as_handle()) {
         ctx.realm.set_object_proto(obj, Some(Handle::from_raw(p)));
     }
     let this = NanBox::handle(obj.to_raw());
@@ -3494,10 +3526,7 @@ pub fn run_program_hosted(
     let funcs = grown.as_ref().unwrap_or(funcs);
     let previous = host.set_vm_table(Some(alloc::rc::Rc::clone(funcs)));
     // VM closures' own `name`/`length` are synthesized by the realm from this.
-    host.realm_slot()
-        .register_vm_fn_meta(funcs.iter().map(|p| (p.name.as_str(), p.length as u32)));
-    host.realm_slot()
-        .register_vm_fn_sources(funcs.iter().map(|p| p.source.clone()));
+    host.realm_slot().register_vm_fn_meta(funcs);
     let mut realm = core::mem::take(host.realm_slot());
     let result = {
         let mut ctx = hosted_ctx(&mut realm, host);
@@ -8257,6 +8286,13 @@ fn vm_array_index_get(
         }
         return call_closure(ctx, funcs, getter, &[], recv);
     }
+    // An own element stored sparsely (an index past the dense-storage cap)
+    // lives in the aux object as a data property.
+    if ctx.realm.has_own(handle, &key)
+        && let Some(v) = ctx.realm.get_property(handle, &key)
+    {
+        return Ok(v);
+    }
     // Absent own index (hole or past the end): walk the prototype chain.
     let mut cur = ctx.realm.object_proto(handle);
     while let Some(p) = cur {
@@ -10200,71 +10236,40 @@ pub fn compile_run_output(
         .map_err(|_| CompileError::Unsupported("runtime fault"))
 }
 
-/// Runs `source` on the **bytecode VM**, falling back to the tree-walker
-/// ([`crate::nbexec::eval_source`]) for any construct the bytecode compiler does
-/// not yet handle — the production execution model (a fast bytecode path with a
-/// complete-semantics safety net). Returns the captured `console` output and the
-/// completion value (as a display string).
+/// Runs `source` as a Script on the **bytecode VM** hosted by a fresh
+/// interpreter ([`Interp::run`](crate::nbexec::Interp::run)), returning the
+/// captured `console` output and the completion value (as a display string).
+/// A program the bytecode compiler refuses runs on the tree-walker; that choice
+/// is made before any code runs.
 ///
 /// # Errors
-/// Returns a parse or execution error message.
+/// Returns a parse error message or the rendered uncaught throw.
 #[cfg(feature = "std")]
 pub fn execute(source: &str) -> Result<(String, String), String> {
     execute_with_limits(source, crate::limits::Limits::default())
 }
 
 /// Like [`execute`], but with caller-supplied resource
-/// [`Limits`](crate::limits::Limits). The limits flow into the realm of both the
-/// bytecode path and the tree-walker fallback.
+/// [`Limits`](crate::limits::Limits).
 ///
 /// # Errors
-/// Returns a parse or execution error message.
+/// Returns a parse error message or the rendered uncaught throw.
 #[cfg(feature = "std")]
 pub fn execute_with_limits(
     source: &str,
     limits: crate::limits::Limits,
 ) -> Result<(String, String), String> {
-    let program =
-        crate::parser::Parser::parse_program(source).map_err(|e| alloc::format!("{e}"))?;
-    // Compile to bytecode; an unsupported construct routes the whole program to
-    // the tree-walker (compilation happens before execution, so no output has
-    // been produced yet — the fallback is clean).
-    let Ok(protos) = compile_program(&program) else {
-        return crate::nbexec::eval_source_with_limits(source, limits);
-    };
-    let mut realm = Realm::with_limits(limits);
-    match run_program_capturing(&mut realm, &protos, 0, &[]) {
-        Ok((value, output)) => Ok((output, realm.to_display_string(value))),
-        // A runtime fault on the bytecode path (an unsupported coercion, etc.):
-        // re-run on the reference tree-walker.
-        Err(_) => crate::nbexec::eval_source_with_limits(source, limits),
-    }
+    crate::nbexec::eval_source_on(source, limits, |i, p| i.run(p))
 }
 
 /// Like [`execute_with_limits`], but the captured output is returned on the
 /// error path too — see [`crate::nbexec::eval_source_capturing`].
-///
-/// Compilation happens before execution, so the tree-walker fallback is still
-/// clean: nothing has been printed when it is taken.
 #[cfg(feature = "std")]
 pub fn execute_capturing(
     source: &str,
     limits: crate::limits::Limits,
 ) -> (String, Result<String, String>) {
-    let program = match crate::parser::Parser::parse_program(source) {
-        Ok(program) => program,
-        Err(e) => return (String::new(), Err(alloc::format!("{e}"))),
-    };
-    let Ok(protos) = compile_program(&program) else {
-        return crate::nbexec::eval_source_capturing(source, limits);
-    };
-    let mut realm = Realm::with_limits(limits);
-    match run_program_capturing(&mut realm, &protos, 0, &[]) {
-        Ok((value, output)) => (output, Ok(realm.to_display_string(value))),
-        // A runtime fault on the bytecode path re-runs on the reference
-        // tree-walker, which is also what surfaces the thrown value.
-        Err(_) => crate::nbexec::eval_source_capturing(source, limits),
-    }
+    crate::nbexec::eval_source_capturing_on(source, limits, |i, p| i.run(p))
 }
 
 /// Like [`execute_with_limits`], but on failure returns a structured
@@ -10583,6 +10588,57 @@ fn uses_dynamic_code(program: &Program) -> bool {
         .any(|name| direct.contains(*name) || nested.contains(*name))
 }
 
+/// The function a declaration statement declares, looking through labels: a
+/// sloppy-mode labelled function declaration (`l: function f() {}`, Annex B.3.2)
+/// declares `f` exactly like an unlabelled one.
+fn fn_decl(s: &Stmt) -> Option<&crate::ast::Function> {
+    match s {
+        Stmt::Function(f) => Some(f),
+        Stmt::Labeled { body, .. } => fn_decl(body),
+        _ => None,
+    }
+}
+
+/// Whether a script body's completion value needs a register of its own: a
+/// top-level statement other than an expression or a declaration has
+/// control-flow-dependent completion rules (see `Compiler::stmt`).
+fn needs_completion_register(body: &[Stmt]) -> bool {
+    !body.iter().all(|s| {
+        matches!(
+            s,
+            Stmt::Expr { .. }
+                | Stmt::Var(_)
+                | Stmt::Function(_)
+                | Stmt::Class(_)
+                | Stmt::Empty { .. }
+        )
+    })
+}
+
+/// Whether `e` is a tree of literals (numbers, strings, booleans, `null`, and
+/// array/object literals of those with static keys): compiling it touches no
+/// binding and leaves no register referenced once its value is consumed.
+fn is_literal_tree(e: &Expr) -> bool {
+    match e {
+        Expr::Number { .. } | Expr::Str { .. } | Expr::Bool { .. } | Expr::Null(_) => true,
+        Expr::Array { elements, .. } => elements.iter().all(|el| match el {
+            ArrayElement::Item(e) => is_literal_tree(e),
+            ArrayElement::Hole => true,
+            ArrayElement::Spread(_) => false,
+        }),
+        Expr::Object { members, .. } => members.iter().all(|m| match m {
+            ObjectMember::Property {
+                key,
+                value,
+                method: false,
+                ..
+            } => !matches!(key, PropertyKey::Computed(_)) && is_literal_tree(value),
+            _ => false,
+        }),
+        _ => false,
+    }
+}
+
 /// Whether `body`'s directive prologue opens with a literal `"use strict"`
 /// (a run of leading string-literal expression statements, one of which is
 /// `"use strict"`). Used to decide strict mode for proper-tail-call gating.
@@ -10647,7 +10703,7 @@ pub fn compile_program_into(
         return Err(CompileError::Unsupported("dynamic code (eval/Function)"));
     }
     for s in &program.body {
-        if let Stmt::Function(f) = s {
+        if let Some(f) = fn_decl(s) {
             refuse_generator(f, hosted)?;
         }
     }
@@ -10663,14 +10719,7 @@ pub fn compile_program_into(
             return Err(CompileError::Unsupported("direct eval in a class"));
         }
     }
-    let decls: Vec<&crate::ast::Function> = program
-        .body
-        .iter()
-        .filter_map(|s| match s {
-            Stmt::Function(f) => Some(f),
-            _ => None,
-        })
-        .collect();
+    let decls: Vec<&crate::ast::Function> = program.body.iter().filter_map(fn_decl).collect();
     let mut fn_ids = alloc::collections::BTreeMap::new();
     for (i, f) in decls.iter().enumerate() {
         if let Some(id) = &f.id {
@@ -10826,11 +10875,9 @@ pub fn compile_program_into(
     *table = alloc::rc::Rc::try_unwrap(protos)
         .expect("unique proto table")
         .into_inner();
+    resolve_source_text(&mut table[base as usize..], &program.source);
     match compiled {
-        Ok(()) => {
-            resolve_fn_sources(&mut table[base as usize..], &program.source);
-            Ok(base)
-        }
+        Ok(()) => Ok(base),
         Err(e) => {
             table.truncate(base as usize);
             Err(e)
@@ -10838,14 +10885,14 @@ pub fn compile_program_into(
     }
 }
 
-/// Fills each new function's [`FnProto::source`] from its span in the
-/// program text `source`.
-pub(crate) fn resolve_fn_sources(protos: &mut [FnProto], source: &str) {
+/// Resolves each newly compiled function's definition span into its source
+/// text (`Function.prototype.toString`).
+pub(crate) fn resolve_source_text(protos: &mut [FnProto], source: &str) {
     for p in protos {
-        if p.source.is_none()
-            && let Some((s, e)) = p.source_span
-        {
-            p.source = source.get(s as usize..e as usize).map(alloc::rc::Rc::from);
+        if let Some((start, end)) = p.source_span.take() {
+            p.source = source
+                .get(start as usize..end as usize)
+                .map(alloc::rc::Rc::from);
         }
     }
 }
@@ -11112,6 +11159,7 @@ fn declared_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
                 declared_in_stmt(s, out);
             }
         }
+        Stmt::Labeled { body, .. } if fn_decl(body).is_some() => declared_in_stmt(body, out),
         Stmt::If {
             consequent,
             alternate,
@@ -12202,6 +12250,16 @@ struct Compiler {
     /// turns it into a
     /// clean `CompileError` instead of emitting a corrupt proto.
     reg_overflow: bool,
+    /// The most registers ever live at once: [`Compiler::release_regs`] hands
+    /// dead temporaries back, so `next_reg` alone can under-count the frame.
+    reg_high: Reg,
+    /// The source span of the function definition the next closure is made
+    /// from (its `Function.prototype.toString` text); taken by
+    /// [`Compiler::make_closure_ext`].
+    next_closure_span: Option<crate::common::Span>,
+    /// The member span of the object-literal method whose function expression
+    /// is compiled next (its source text is the whole method definition).
+    method_span: Option<crate::common::Span>,
     /// Whether a `return` compiled *right here* is a proper-tail-call candidate:
     /// true at a strict, non-async function body's top level, and preserved
     /// through ordinary statement nesting (`if`/loops/`switch`/`block`/label).
@@ -12255,8 +12313,6 @@ struct Compiler {
     /// only it binds its own name inside its body (a declaration, or a
     /// NamedEvaluation name, does not).
     next_closure_self_bind: bool,
-    /// The source span of the next closure [`Self::make_closure_ext`] builds.
-    next_closure_span: Option<crate::common::Span>,
     /// Compiling a generator function's body (`yield` suspends it).
     in_generator: bool,
     /// Compiling a hosted async function's body (`await` suspends it).
@@ -12278,9 +12334,10 @@ struct Compiler {
     /// A dynamic-scope function's variable environment (where a sloppy direct
     /// eval's `var`s land).
     var_env: Option<Reg>,
-    /// Eval code's completion value register (see `vm_eval`): expression
-    /// statements write it, and statements whose completion is `undefined` when
-    /// their body's is empty (`if`, loops, `switch`, `try`, `with`) reset it.
+    /// The completion value register of a script body or eval code (see
+    /// [`Compiler::stmt`]): expression statements write it, and statements
+    /// whose completion is `undefined` when their body's is empty (`if`,
+    /// loops, `switch`, `try`, `with`) reset it.
     completion: Option<Reg>,
     /// While a dynamic-scope function's parameter list compiles: the names a
     /// direct eval there may not declare as `var`s (the parameters and
@@ -12793,7 +12850,7 @@ impl Compiler {
             let mut names = Vec::new();
             crate::nbexec::collect_var_names(body, &mut names);
             for stmt in body {
-                if let Stmt::Function(f) = stmt
+                if let Some(f) = fn_decl(stmt)
                     && let Some(id) = &f.id
                 {
                     names.push(&id.name);
@@ -12864,7 +12921,7 @@ impl Compiler {
             if !lexical.is_empty() || !classes.is_empty() {
                 let mut seen = BTreeSet::new();
                 for stmt in body {
-                    if let Stmt::Function(f) = stmt {
+                    if let Some(f) = fn_decl(stmt) {
                         seen.extend(free_of_function(&f.params, &f.body));
                     }
                 }
@@ -12956,7 +13013,7 @@ impl Compiler {
         // a sibling declared after it.
         if !is_main {
             for stmt in body {
-                if let Stmt::Function(f) = stmt
+                if let Some(f) = fn_decl(stmt)
                     && let Some(id) = &f.id
                     && !c.scopes[0].contains_key(&*id.name)
                 {
@@ -12965,7 +13022,7 @@ impl Compiler {
             }
         }
         for stmt in body {
-            if let Stmt::Function(f) = stmt {
+            if let Some(f) = fn_decl(stmt) {
                 c.hoisted_fns
                     .insert(f as *const crate::ast::Function as usize);
                 if is_main {
@@ -13088,7 +13145,7 @@ impl Compiler {
         // hold assigned properties). Calls still dispatch directly by id.
         if is_main {
             for stmt in body {
-                if let Stmt::Function(f) = stmt
+                if let Some(f) = fn_decl(stmt)
                     && let Some(id) = &f.id
                     && let Some(&func) = c.fn_ids.get(&*id.name)
                 {
@@ -13135,7 +13192,17 @@ impl Compiler {
             c.using_scope(body, |c| {
                 body.iter().try_for_each(|s| c.stmt(s).map(|_| ()))
             })?;
+        } else if is_main && needs_completion_register(body) {
+            let cv = c.constant(NanBox::undefined())?;
+            c.completion = Some(cv);
+            for stmt in body {
+                c.stmt(stmt)?;
+            }
+            c.completion = None;
+            last = Some(cv);
         } else if is_main {
+            // Straight-line declarations and expressions: the completion is the
+            // last expression statement's value.
             for stmt in body {
                 if let Some(r) = c.stmt(stmt)? {
                     last = Some(r);
@@ -13175,7 +13242,7 @@ impl Compiler {
             .take_while(|p| !p.rest && p.default.is_none())
             .count();
         Ok(FnProto {
-            n_regs: c.next_reg as usize,
+            n_regs: c.next_reg.max(c.reg_high) as usize,
             n_params: params.len(),
             n_captures: captures.len(),
             rest_from,
@@ -13440,7 +13507,7 @@ impl Compiler {
         }
         // Hoisted function declarations, instantiated before the body.
         for stmt in body {
-            if let Stmt::Function(func) = stmt {
+            if let Some(func) = fn_decl(stmt) {
                 c.hoisted_fns
                     .insert(func as *const crate::ast::Function as usize);
                 if is_main {
@@ -13474,7 +13541,7 @@ impl Compiler {
         // into the global bindings the host hoisted.
         if is_main {
             for stmt in body {
-                if let Stmt::Function(func) = stmt
+                if let Some(func) = fn_decl(stmt)
                     && let Some(id) = &func.id
                     && let Some(&fid) = c.fn_ids.get(&*id.name)
                 {
@@ -13500,18 +13567,14 @@ impl Compiler {
         if is_generator {
             c.ops.push(Op::GeneratorStart);
         }
-        let mut last: Option<Reg> = None;
         if is_main {
+            let cv = c.constant(NanBox::undefined())?;
+            c.completion = Some(cv);
             for stmt in body {
-                if let Some(r) = c.stmt(stmt)? {
-                    last = Some(r);
-                }
+                c.stmt(stmt)?;
             }
-            let src = match last {
-                Some(r) => r,
-                None => c.constant(NanBox::undefined())?,
-            };
-            c.ops.push(Op::Return { src });
+            c.completion = None;
+            c.ops.push(Op::Return { src: cv });
         } else {
             c.using_scope(body, |c| {
                 body.iter().try_for_each(|s| c.stmt(s).map(|_| ()))
@@ -13525,7 +13588,7 @@ impl Compiler {
             .take_while(|p| !p.rest && p.default.is_none())
             .count();
         Ok(FnProto {
-            n_regs: c.next_reg as usize,
+            n_regs: c.next_reg.max(c.reg_high) as usize,
             n_params: params.len(),
             n_captures: captures.len(),
             rest_from,
@@ -13758,6 +13821,14 @@ impl Compiler {
         let strict = u8::from(self.strict);
         self.env_op(EK_CALLEE, f, alloc::vec![env, this], name, strict);
         (f, this)
+    }
+
+    /// Frees every register allocated since `mark` (`next_reg` at that point),
+    /// for code whose temporaries are provably dead: nothing allocated after
+    /// `mark` may be referenced by a binding, a cache or a later op.
+    fn release_regs(&mut self, mark: Reg) {
+        self.reg_high = self.reg_high.max(self.next_reg);
+        self.next_reg = mark;
     }
 
     fn alloc(&mut self) -> Reg {
@@ -14716,35 +14787,47 @@ impl Compiler {
     }
 
     /// Compiles a statement; returns the register of its value if it is an
-    /// expression statement (for the program's completion value).
+    /// expression statement.
+    ///
+    /// In a script body it also maintains the completion value register: an
+    /// expression statement sets it, and the statements whose completion is
+    /// `UpdateEmpty(C, undefined)` (`if`, loops, `switch`, `with`, `try`) reset
+    /// it to `undefined` on entry, so the register always holds the value of
+    /// the last non-empty completion — the script's result.
     fn stmt(&mut self, stmt: &Stmt) -> Result<Option<Reg>, CompileError> {
-        // Eval code's completion value (UpdateEmpty): an expression statement
-        // sets it; a statement whose value is `undefined` unless its body
-        // produces one starts it over.
-        if let Some(c) = self.completion {
-            match stmt {
-                Stmt::Expr { expression, .. } => {
-                    let r = self.expr(expression)?;
-                    self.ops.push(Op::Move { dst: c, src: r });
-                    return Ok(Some(r));
-                }
-                Stmt::If { .. }
+        let Some(cv) = self.completion else {
+            return self.stmt_inner(stmt);
+        };
+        if matches!(
+            stmt,
+            Stmt::If { .. }
                 | Stmt::While { .. }
                 | Stmt::DoWhile { .. }
                 | Stmt::For { .. }
                 | Stmt::ForIn { .. }
                 | Stmt::ForOf { .. }
                 | Stmt::Switch { .. }
+                | Stmt::With { .. }
                 | Stmt::Try { .. }
-                | Stmt::With { .. } => {
-                    self.ops.push(Op::LoadConst {
-                        dst: c,
-                        value: NanBox::undefined(),
-                    });
-                }
-                _ => {}
-            }
+        ) {
+            self.reset_completion(cv);
         }
+        let r = self.stmt_inner(stmt)?;
+        if let (Stmt::Expr { .. }, Some(src)) = (stmt, r) {
+            self.ops.push(Op::Move { dst: cv, src });
+        }
+        Ok(r)
+    }
+
+    /// Sets the completion value register to `undefined`.
+    fn reset_completion(&mut self, cv: Reg) {
+        self.ops.push(Op::LoadConst {
+            dst: cv,
+            value: NanBox::undefined(),
+        });
+    }
+
+    fn stmt_inner(&mut self, stmt: &Stmt) -> Result<Option<Reg>, CompileError> {
         match stmt {
             Stmt::Empty { .. } => Ok(None),
             // Function and (top-level) class declarations are compiled into the
@@ -14836,6 +14919,7 @@ impl Compiler {
                     Some(e) => self.expr(e)?,
                     None => self.constant(NanBox::undefined())?,
                 };
+                let v = self.snapshot_reg(v);
                 self.emit_unwind(0, true, 0)?;
                 self.emit_derived_return(v);
                 Ok(None)
@@ -14857,6 +14941,9 @@ impl Compiler {
                     Some(e) => self.expr(e)?,
                     None => self.constant(NanBox::undefined())?,
                 };
+                // The value is fixed before a `finally` runs (it may assign the
+                // variable `v` names).
+                let v = self.snapshot_reg(v);
                 self.emit_unwind(0, true, 0)?;
                 self.ops.push(Op::Return { src: v });
                 Ok(None)
@@ -15083,7 +15170,11 @@ impl Compiler {
                         self.handler_depth += 1;
                         (at, r)
                     });
-                    // The catch Block is its own scope inside the parameter's.
+                    // The catch Block is its own scope inside the parameter's;
+                    // its completion is `UpdateEmpty(C, undefined)`.
+                    if let Some(cv) = self.completion {
+                        self.reset_completion(cv);
+                    }
                     self.block_stmts(&catch.body)?;
                     self.scopes.pop();
                     if let Some(fin) = finalizer {
@@ -16338,6 +16429,14 @@ impl Compiler {
                 self.ops.push(Op::NewArray { dst, len: 0 });
                 for el in elements {
                     match el {
+                        // A literal element's temporaries die at the push, so a
+                        // huge generated data table needs a bounded frame.
+                        ArrayElement::Item(e) if is_literal_tree(e) => {
+                            let mark = self.next_reg;
+                            let v = self.expr(e)?;
+                            self.ops.push(Op::ArrayPush { arr: dst, src: v });
+                            self.release_regs(mark);
+                        }
                         ArrayElement::Item(e) => {
                             let v = self.expr(e)?;
                             self.ops.push(Op::ArrayPush { arr: dst, src: v });
@@ -16509,6 +16608,70 @@ impl Compiler {
                 } else {
                     self.member_read(obj, property)
                 }
+            }
+            // `(a?.b)(args)` / `(a?.b)?.(args)`: a parenthesized optional chain
+            // ending in a member access stays a reference, so the call's `this`
+            // is the member's base (`undefined` when the chain short-circuited).
+            Expr::Call {
+                callee,
+                arguments,
+                optional,
+                ..
+            } if self.hosted
+                && (!*optional || !self.optchain_ends.is_empty())
+                && matches!(&**callee, Expr::OptChain { expr, .. } if matches!(
+                    &**expr,
+                    Expr::Member { object, property, .. }
+                        if !matches!(&**object, Expr::Super(_))
+                            && !matches!(property, PropertyKey::Private(_))
+                )) =>
+            {
+                let Expr::OptChain { expr, .. } = &**callee else {
+                    return Err(CompileError::Unsupported("callee"));
+                };
+                let Expr::Member {
+                    object,
+                    property,
+                    optional: link_optional,
+                    ..
+                } = &**expr
+                else {
+                    return Err(CompileError::Unsupported("callee"));
+                };
+                let f = self.constant(NanBox::undefined())?;
+                let this = self.constant(NanBox::undefined())?;
+                self.optchain_ends.push(Vec::new());
+                let recv = self.expr(object)?;
+                if *link_optional {
+                    let go = self.emit_not_nullish(recv)?;
+                    let jf = self.emit_jump_if_false(go);
+                    self.optchain_ends.last_mut().expect("a chain").push(jf);
+                }
+                let v = self.member_read(recv, property)?;
+                self.ops.push(Op::Move { dst: f, src: v });
+                self.ops.push(Op::Move {
+                    dst: this,
+                    src: recv,
+                });
+                let sites = self.optchain_ends.pop().unwrap_or_default();
+                let end = self.ops.len();
+                for site in sites {
+                    self.patch_to(site, end);
+                }
+                if *optional {
+                    let go = self.emit_not_nullish(f)?;
+                    let jf = self.emit_jump_if_false(go);
+                    self.optchain_ends.last_mut().expect("a chain").push(jf);
+                }
+                let args = self.spread_args(arguments)?;
+                let dst = self.alloc();
+                self.ops.push(Op::CallSpread {
+                    dst,
+                    callee: f,
+                    this,
+                    args,
+                });
+                Ok(dst)
             }
             // `f?.(args)` / `o.m?.(args)`: a nullish callee short-circuits the
             // whole chain (to its `OptChain` end) before the arguments run.
@@ -17742,12 +17905,11 @@ impl Compiler {
                 self.next_closure_is_generator = f.is_generator;
                 let nm = f.id.as_ref().map_or("", |i| i.name.as_ref());
                 self.next_closure_self_bind = f.id.is_some();
-                if self.next_closure_span.is_none() {
-                    self.next_closure_span = Some(f.span);
-                }
+                self.next_closure_span = Some(self.method_span.take().unwrap_or(f.span));
                 self.make_closure(&f.params, &f.body, f.is_async, nm, false)
             }
             Expr::Arrow(a) => {
+                self.next_closure_span = Some(a.span);
                 let body: Vec<Stmt> = match &a.body {
                     crate::ast::ArrowBody::Block(b) => b.clone(),
                     crate::ast::ArrowBody::Expr(e) => alloc::vec![Stmt::Return {
@@ -17830,6 +17992,7 @@ impl Compiler {
                     );
                 }
                 Expr::Arrow(a) => {
+                    self.next_closure_span = Some(a.span);
                     let body: Vec<Stmt> = match &a.body {
                         crate::ast::ArrowBody::Block(b) => b.clone(),
                         crate::ast::ArrowBody::Expr(ex) => alloc::vec![Stmt::Return {
@@ -18099,7 +18262,7 @@ impl Compiler {
         )?;
         let mut proto = proto;
         proto.name = alloc::string::String::from(name);
-        proto.source_span = span.map(|sp| (sp.start, sp.end));
+        proto.source_span = span.map(|s| (s.start, s.end));
         self.protos.borrow_mut()[id as usize] = proto;
         // Capture the cell registers for each free variable (in the same order the
         // callee binds them). The self-name (if any) gets a fresh cell here,
@@ -18504,7 +18667,7 @@ impl Compiler {
                 let key = static_key(property)?;
                 if key == "length" {
                     self.ops.push(Op::ArrayLen { dst, arr: obj });
-                } else if key == "size" {
+                } else if key == "size" && !self.hosted {
                     self.ops.push(Op::CollectionSize { dst, recv: obj });
                 } else {
                     self.ops.push(Op::GetProp { dst, obj, key });
@@ -18884,6 +19047,7 @@ impl Compiler {
                 None if derived => (&default_params, &default_body),
                 None => (&[], &[]),
             };
+            // The class's text is its whole definition.
             self.next_closure_span = Some(class.span);
             let f = self.class_element_closure(
                 PROTO_NAME,
@@ -18923,6 +19087,8 @@ impl Compiler {
                             continue;
                         };
                         let home = if m.is_static { CTOR_NAME } else { PROTO_NAME };
+                        // A static method keeps the NativeFunction form (its member
+                        // text starts with `static`), as on the tree-walker.
                         self.next_closure_span = (!m.is_static).then_some(m.span);
                         let func = self.class_element_closure(
                             home,
@@ -19232,9 +19398,8 @@ impl Compiler {
                         let named = *method || is_anonymous_fn_def(value);
                         let v = self.with_home(OBJ_HOME_NAME, |c| {
                             c.next_closure_is_method = *method;
-                            if *method {
-                                c.next_closure_span = Some(*span);
-                            }
+                            // A method's text is its whole definition.
+                            c.method_span = method.then_some(*span);
                             let v = c.expr(value);
                             c.next_closure_is_method = false;
                             v
@@ -19397,10 +19562,7 @@ impl Compiler {
     fn hoist_block_functions(&mut self, body: &[&Stmt]) -> Result<(), CompileError> {
         let fns: Vec<&crate::ast::Function> = body
             .iter()
-            .filter_map(|s| match *s {
-                Stmt::Function(f) if f.id.is_some() => Some(f),
-                _ => None,
-            })
+            .filter_map(|s| fn_decl(s).filter(|f| f.id.is_some()))
             .collect();
         if fns.is_empty() {
             return Ok(());
@@ -20449,6 +20611,17 @@ impl Compiler {
 
     /// Whether a `return` must first close enclosing `for-of` iterators or run
     /// enclosing `finally` blocks.
+    /// A copy of `v` in a fresh register when a `finally` block will run before
+    /// it is consumed (and could reassign the binding `v` holds).
+    fn snapshot_reg(&mut self, v: Reg) -> Reg {
+        if self.finally_frames.is_empty() {
+            return v;
+        }
+        let t = self.alloc();
+        self.ops.push(Op::Move { dst: t, src: v });
+        t
+    }
+
     fn needs_unwind(&self) -> bool {
         !self.finally_frames.is_empty() || self.loop_frames.iter().any(|f| f.iter.is_some())
     }

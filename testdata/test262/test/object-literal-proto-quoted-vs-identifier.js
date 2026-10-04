@@ -1,5 +1,5 @@
 /*---
-description: only the unquoted __proto__ identifier in an object literal sets the prototype
+description: a non-computed __proto__ key in an object literal sets the prototype
 esid: sec-__proto__-property-names-in-object-initializers
 ---*/
 var proto = { greet: function () { return "P"; } };
@@ -10,12 +10,12 @@ assert.sameValue(Object.getPrototypeOf(a), proto, "unquoted sets prototype");
 assert.sameValue(a.greet(), "P", "inherited method");
 assert.sameValue(Object.keys(a).join(","), "own", "__proto__ is not an own key");
 
-// Quoted string key creates an ordinary own data property.
+// A quoted (string-literal) key is not computed, so it is a prototype setter
+// too (PropertyDefinitionEvaluation: only IsComputedPropertyKey opts out).
 var b = { "__proto__": proto };
-assert.sameValue(Object.getPrototypeOf(b) === proto, false, "quoted does not set prototype");
-assert.sameValue(b.__proto__, proto, "own __proto__ data property readable");
-assert.sameValue(Object.keys(b).length, 1, "quoted is an own key");
-assert.sameValue(JSON.stringify({ "__proto__": 5 }), '{"__proto__":5}', "quoted serializes");
+assert.sameValue(Object.getPrototypeOf(b) === proto, true, "quoted sets prototype");
+assert.sameValue(Object.keys(b).length, 0, "quoted is not an own key");
+assert.sameValue(JSON.stringify({ "__proto__": 5 }), '{}', "a non-object value is ignored");
 
 // Computed key likewise makes a data property.
 var k = "__proto__";

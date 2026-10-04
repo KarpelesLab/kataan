@@ -15,6 +15,8 @@ fn run(src: &str) -> String {
     let mut interp = Interp::new();
     kataan::host::node::install(&mut interp);
     let v = interp.run(&program).expect("run");
+    // The snippet ran on the bytecode VM.
+    assert_eq!(interp.tree_walked(), 0, "tree-walked: {src}");
     interp.display(v)
 }
 

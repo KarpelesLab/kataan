@@ -23,7 +23,7 @@ fn run(src: &str) -> String {
 fn run_with_live(src: &str) -> (String, usize) {
     let program = Parser::parse_program(src).expect("parse");
     let mut interp = Interp::new();
-    let value = interp.run(&program).expect("exec");
+    let value = interp.run_tree_walk(&program).expect("exec");
     let text = interp.realm().to_display_string(value);
     (text, interp.realm().object_count())
 }

@@ -6086,9 +6086,94 @@ impl<'a> Interp<'a> {
             .collect())
     }
 
-    /// Runs a whole program, returning the value of its last expression
-    /// statement (or `undefined`).
+    /// Runs a whole program as a Script, returning its completion value (the
+    /// value of its last value-producing statement, or `undefined`), then runs
+    /// the event loop (promise jobs, timers) to quiescence.
+    ///
+    /// The program runs on the **bytecode VM** hosted by this interpreter
+    /// (`ROADMAP.md` §2.0): it is compiled into the interpreter's persistent
+    /// function table, so consecutive `run` calls on one interpreter (a REPL, an
+    /// embedder feeding scripts) share the global environment *and* the closures
+    /// earlier runs created. A program the bytecode compiler refuses runs on the
+    /// tree-walker instead ([`run_tree_walk`](Self::run_tree_walk)); compilation
+    /// happens before any user code, so that choice is clean. How many user
+    /// statements the tree-walker executed is [`tree_walked`](Self::tree_walked).
+    ///
+    /// # Errors
+    /// An early error of the script (a conflicting global declaration), an
+    /// uncaught throw ([`ExecError::Throw`]), or a host interrupt.
     pub fn run(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
+        match self.run_on_vm(program) {
+            Some(result) => result,
+            None => self.run_tree_walk(program),
+        }
+    }
+
+    /// The bytecode-VM half of [`run`](Self::run): `None` when the compiler
+    /// refuses `program` (nothing has run).
+    fn run_on_vm(&mut self, program: &'a Program) -> Option<Result<NanBox, ExecError>> {
+        // A unit with a top-level `import`/`export` is a Module; this entry runs
+        // Scripts (modules go through the module loader).
+        if program.source_type == crate::ast::SourceType::Module {
+            return None;
+        }
+        let mut table = self.vm_table_vec();
+        let main = crate::nbvm::compile_program_into(program, true, &mut table).ok()?;
+        let table: alloc::rc::Rc<[crate::nbvm::FnProto]> = table.into();
+        // Installed for good, not just for this run: closures the script leaves
+        // behind (in globals, timers, promise reactions) stay callable after it.
+        self.install_vm_table(alloc::rc::Rc::clone(&table));
+        // Modules a dynamic `import()` loads run on the VM too.
+        #[cfg(all(feature = "std", feature = "module"))]
+        self.enable_vm_modules();
+        if let Err(e) = self.prepare_script_for_vm(program) {
+            return Some(Err(e));
+        }
+        Some(
+            crate::nbvm::run_program_hosted(self, &table, main as usize, &[]).map_err(
+                |e| match e {
+                    crate::nbvm::VmError::Thrown(v) => ExecError::Throw(v),
+                    crate::nbvm::VmError::Interrupted => ExecError::Interrupted,
+                    _ => ExecError::Unsupported("bytecode VM fault"),
+                },
+            ),
+        )
+    }
+
+    /// The function table VM code compiled into this interpreter lives in (a
+    /// copy, to extend with more code); empty before the first VM run.
+    fn vm_table_vec(&self) -> Vec<crate::nbvm::FnProto> {
+        self.vm_newest_table()
+            .map(|t| t.to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Installs `table` (the newest table extended with new code) as this
+    /// interpreter's VM function table, for the running code and later runs.
+    /// The one growth chain every VM compilation into this interpreter extends
+    /// — scripts (`run`), eval code / `Function` bodies and dynamically
+    /// imported modules — so each table is a prefix of the next.
+    pub(crate) fn install_vm_table(&mut self, table: alloc::rc::Rc<[crate::nbvm::FnProto]>) {
+        self.vm_ext_table = Some(alloc::rc::Rc::clone(&table));
+        #[cfg(all(feature = "module", feature = "std"))]
+        self.install_module_vm_table(table);
+        #[cfg(not(all(feature = "module", feature = "std")))]
+        {
+            self.realm.register_vm_fn_meta(&table);
+            self.vm_table = Some(table);
+        }
+    }
+
+    /// Runs a whole program on the **tree-walker** (the reference engine),
+    /// returning the value of its last expression statement (or `undefined`).
+    ///
+    /// This is the execution tier being retired (`ROADMAP.md` §2.0); it remains
+    /// the fallback for what the bytecode compiler refuses and the differential
+    /// oracle the VM is tested against. Embedders want [`run`](Self::run).
+    ///
+    /// # Errors
+    /// As [`run`](Self::run).
+    pub fn run_tree_walk(&mut self, program: &'a Program) -> Result<NanBox, ExecError> {
         // Retain the program's source so function/class definitions can slice
         // their literal text for `Function.prototype.toString` (AST spans are byte
         // offsets into this source).
@@ -9454,10 +9539,23 @@ pub fn eval_source_with_limits(
     source: &str,
     limits: crate::limits::Limits,
 ) -> Result<(String, String), String> {
+    eval_source_on(source, limits, |i, p| i.run_tree_walk(p))
+}
+
+/// How a source-string entry runs its parsed program: [`Interp::run`] (the
+/// bytecode VM) or [`Interp::run_tree_walk`] (the reference tree-walker).
+pub(crate) type RunFn = for<'p> fn(&mut Interp<'p>, &'p Program) -> Result<NanBox, ExecError>;
+
+/// [`eval_source_with_limits`] over the tier `run` picks.
+pub(crate) fn eval_source_on(
+    source: &str,
+    limits: crate::limits::Limits,
+    run: RunFn,
+) -> Result<(String, String), String> {
     let program =
         crate::parser::Parser::parse_program(source).map_err(|e| alloc::format!("{e}"))?;
     let mut interp = Interp::new_with_limits(limits);
-    let value = match interp.run(&program) {
+    let value = match run(&mut interp, &program) {
         Ok(v) => v,
         // Render an uncaught throw readably: an error object as `name: message`,
         // any other thrown value via its display string.
@@ -9484,12 +9582,22 @@ pub fn eval_source_capturing(
     source: &str,
     limits: crate::limits::Limits,
 ) -> (String, Result<String, String>) {
+    eval_source_capturing_on(source, limits, |i, p| i.run_tree_walk(p))
+}
+
+/// [`eval_source_capturing`] over the tier `run` picks.
+#[cfg(feature = "std")]
+pub(crate) fn eval_source_capturing_on(
+    source: &str,
+    limits: crate::limits::Limits,
+    run: RunFn,
+) -> (String, Result<String, String>) {
     let program = match crate::parser::Parser::parse_program(source) {
         Ok(program) => program,
         Err(e) => return (String::new(), Err(alloc::format!("{e}"))),
     };
     let mut interp = Interp::new_with_limits(limits);
-    let outcome = match interp.run(&program) {
+    let outcome = match run(&mut interp, &program) {
         Ok(value) => Ok(interp.display(value)),
         Err(ExecError::Throw(thrown)) => Err(format_thrown(&interp, thrown)),
         Err(other) => Err(alloc::format!("{other:?}")),
@@ -9646,7 +9754,7 @@ pub fn eval_source_typed_interruptible(
     }
     let mut interp = Interp::new_with_limits(limits);
     interp.realm.interrupt = interrupt;
-    match interp.run(&program) {
+    match interp.run_tree_walk(&program) {
         Ok(value) => {
             let completion = interp.display(value);
             Ok((String::from(interp.output()), completion))
@@ -10586,13 +10694,42 @@ impl crate::nbvm::VmHost for Interp<'_> {
         self.vm_newest_table()
     }
 
+    fn is_global_object(&self, v: NanBox) -> bool {
+        let Some(raw) = v.as_handle() else {
+            return false;
+        };
+        self.global_this.as_handle() == Some(raw)
+            || self.main_global_this.as_handle() == Some(raw)
+            || self
+                .created_realms
+                .iter()
+                .any(|r| r.global_this.as_handle() == Some(raw))
+    }
+
+    fn ordinary_object_proto_for(
+        &mut self,
+        new_target: NanBox,
+    ) -> Result<Option<NanBox>, crate::nbvm::HostError> {
+        let Some(nt) = new_target.as_handle().map(Handle::from_raw) else {
+            return Ok(None);
+        };
+        self.guard_function_realm(nt).map_err(exec_to_host)?;
+        let default = self.realm.default_object_proto();
+        Ok(self
+            .realm_default_proto(default, nt)
+            .map(|h| NanBox::handle(h.to_raw())))
+    }
+
     fn set_vm_table(
         &mut self,
         table: Option<alloc::rc::Rc<[crate::nbvm::FnProto]>>,
     ) -> Option<alloc::rc::Rc<[crate::nbvm::FnProto]>> {
-        // Modules a dynamic `import()` compiled mid-run extend the table.
-        #[cfg(all(feature = "module", feature = "std"))]
-        let table = self.modules.prefer_module_table(table);
+        // Code compiled mid-run (eval, `Function`, a dynamic `import()`)
+        // extends the table; the newest one serves every later call.
+        let table = table.map(|t| match self.vm_newest_table() {
+            Some(n) if n.len() > t.len() => n,
+            _ => t,
+        });
         core::mem::replace(&mut self.vm_table, table)
     }
 
@@ -10758,7 +10895,7 @@ pub fn eval_scripts_typed(
     let mut interp = Interp::new_with_limits(limits);
     let mut completion = String::new();
     for program in &programs {
-        match interp.run(program) {
+        match interp.run_tree_walk(program) {
             Ok(value) => completion = interp.display(value),
             Err(e) => return Err(thrown_from_exec_error(&interp, e, ErrorPhase::Runtime)),
         }

@@ -84,7 +84,7 @@ fn worker_main(pool: alloc::sync::Arc<super::agent_pool::AgentPool>, id: usize, 
     // A throw escaping the worker source is the worker's own business — a real
     // agent runs independently and the main agent observes it only as a missing
     // report.
-    let _ = interp.run(&program);
+    let _ = interp.run_tree_walk(&program);
     // Serve broadcasts. `recv_broadcast` releases the baton while idle and
     // returns `None` once the pool is shutting down.
     while let Some(block) = pool.recv_broadcast(id) {

@@ -143,12 +143,10 @@ fn run_parse(source: &str, origin: &str) -> ExitCode {
     }
 }
 
-/// Parses and evaluates `source` through the **bytecode VM** (falling back to
-/// the tree-walker for unsupported constructs), printing the completion value.
-/// (Kept as an explicit subcommand; `run`/`eval` use the same path now.)
-/// Runs `source` through the new-representation engine — the bytecode VM with a
-/// tree-walker fallback (`kataan::nbvm::execute`) — printing its captured
-/// `console` output and a non-empty completion value.
+/// Runs `source` on the bytecode VM hosted by an interpreter
+/// (`kataan::nbvm::execute`, i.e. `Interp::run`), printing its captured
+/// `console` output and a non-empty completion value. Backs `run`, `eval` and
+/// `nbrun`.
 fn run_eval_nb(source: &str, origin: &str) -> ExitCode {
     match kataan::nbvm::execute(source) {
         Ok((output, completion)) => {
@@ -204,6 +202,10 @@ fn run_compile(path: &str, out: &str) -> ExitCode {
 
 /// Loads and runs a compiled `.ktbc` bytecode artifact (the inverse of
 /// `compile`), printing any `console` output and a non-empty completion value.
+///
+/// Artifacts run on the *bare* VM tier — a self-contained realm with no host
+/// interpreter (`ROADMAP.md` §2.0): a `.ktbc` file is untrusted, verified input
+/// compiled without the host's global-declaration pass.
 fn run_bytecode(bytes: &[u8], origin: &str) -> ExitCode {
     // Decode *and* verify — a `.ktbc` file is untrusted input.
     let protos = match kataan::bytecode::deserialize_verified(bytes) {
@@ -234,12 +236,9 @@ fn run_bytecode(bytes: &[u8], origin: &str) -> ExitCode {
     }
 }
 
-/// Runs a read-eval-print loop on the new-representation tree-walker
-/// (`nbexec::Interp`), which carries its own `console` and persists globals
-/// across lines. Each line's AST is leaked to `&'static` so values the
-/// Evaluates `source` on the new-representation interpreter with the §4.1 host
-/// runtime installed, then drives [`kataan::host::timers::run_event_loop`] so
-/// timer- and `nextTick`-scheduled callbacks run before returning. Prints any
+/// Evaluates `source` (on the hosted bytecode VM, `Interp::run`) with the §4.1
+/// host runtime installed, then drives [`kataan::host::timers::run_event_loop`]
+/// so timer- and `nextTick`-scheduled callbacks run before returning. Prints any
 /// `console` output and a non-empty completion value.
 fn run_host(source: &str, origin: &str) -> ExitCode {
     let program = match Parser::parse_program(source) {
@@ -277,7 +276,11 @@ fn run_host(source: &str, origin: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// persistent interpreter keeps in its globals can reference it.
+/// Runs a read-eval-print loop on one persistent interpreter: each line runs on
+/// the hosted bytecode VM (`Interp::run`), sharing the global environment and
+/// the function table with every earlier line. Each line's AST is leaked to
+/// `&'static` so values the persistent interpreter keeps in its globals can
+/// reference it.
 fn run_repl() -> ExitCode {
     use std::io::{self, BufRead, Write};
 

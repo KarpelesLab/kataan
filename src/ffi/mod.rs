@@ -532,7 +532,7 @@ pub unsafe extern "C" fn kt_eval_with_external_buffer(
 /// the thrown value's string on an uncaught throw / parse error.
 #[cfg(feature = "std")]
 fn eval_to_string(src: &str) -> Result<alloc::string::String, alloc::string::String> {
-    // The new-representation engine: the bytecode VM with a tree-walker fallback.
+    // The bytecode VM hosted by an interpreter (`Interp::run`).
     crate::nbvm::execute(src).map(|(_output, completion)| completion)
 }
 

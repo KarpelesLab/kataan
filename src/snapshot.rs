@@ -73,6 +73,14 @@ pub enum SnapCell {
         /// the captured lexical environment, innermost frame first
         frames: Vec<SnapFrame>,
     },
+    /// a bytecode-VM closure: its function-table index plus its captured values
+    /// (the cells it closes over). Restorable against the same compiled code.
+    VmFunction {
+        /// the VM function-table index (code identity)
+        func_id: u32,
+        /// the captured values, in capture order
+        captures: Vec<SnapVal>,
+    },
     /// a `Map` (`is_set == false`) or `Set` (`is_set == true`): its `(key, value)`
     /// entries in insertion order (a `Set` stores `value` as both).
     Collection {
@@ -177,6 +185,7 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
             || realm.date_at(*r).is_some()
             || realm.bigint_at(*r).is_some()
             || realm.function_at(*r).is_some()
+            || realm.vm_function(*r).is_some()
             || realm.collection_is_set(*r).is_some()
             || realm.promise_state(*r).is_some()
             || realm.proxy_at(*r).is_some()
@@ -217,6 +226,12 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
                 cur = s.parent();
             }
             SnapCell::Function { func_id, frames }
+        } else if let Some((func_id, caps)) = realm.vm_function(h) {
+            let captures = caps
+                .iter()
+                .map(|v| snap_val(*v, &mut index_of, &mut order, &mut intern))
+                .collect();
+            SnapCell::VmFunction { func_id, captures }
         } else if let Some(is_set) = realm.collection_is_set(h) {
             let entries = realm
                 .collection_entries(h)
@@ -431,6 +446,10 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                 // closures, so that case is currently unreachable.
                 (realm.new_function(*func_id, innermost), Some(chain))
             }
+            // Captures are filled in pass 2 (they may reference the closure).
+            SnapCell::VmFunction { func_id, .. } => {
+                (realm.new_vm_function(*func_id, Vec::new()), None)
+            }
             SnapCell::Collection { is_set, .. } => (realm.new_collection(*is_set), None),
             SnapCell::Promise { .. } => (realm.new_promise(), None),
             SnapCell::Proxy { .. } => {
@@ -554,6 +573,10 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
                     }
                 }
             }
+            SnapCell::VmFunction { captures, .. } => {
+                let caps = captures.iter().map(|v| resolve(v, &handles)).collect();
+                realm.set_vm_function_captures(*h, caps);
+            }
             SnapCell::Collection { entries, .. } => {
                 for (k, v) in entries {
                     let (key, val) = (resolve(k, &handles), resolve(v, &handles));
@@ -668,7 +691,9 @@ pub fn serialize(snap: &Snapshot) -> Vec<u8> {
         .cells
         .iter()
         .filter_map(|c| match c {
-            SnapCell::Function { func_id, .. } => Some(*func_id),
+            SnapCell::Function { func_id, .. } | SnapCell::VmFunction { func_id, .. } => {
+                Some(*func_id)
+            }
             _ => None,
         })
         .max()
@@ -785,6 +810,14 @@ pub fn serialize(snap: &Snapshot) -> Vec<u8> {
                 w_u32(*byte_offset, &mut out);
                 w_u32(*length, &mut out);
                 out.push(*kind);
+            }
+            SnapCell::VmFunction { func_id, captures } => {
+                out.push(13);
+                w_u32(*func_id, &mut out);
+                w_u32(captures.len() as u32, &mut out);
+                for v in captures {
+                    w_val(v, &mut out);
+                }
             }
         }
     }
@@ -980,6 +1013,21 @@ pub fn deserialize(bytes: &[u8]) -> Result<Snapshot, SnapError> {
                     length,
                     kind,
                 }
+            }
+            13 => {
+                let func_id = r.u32()?;
+                if func_id >= func_count {
+                    return Err(SnapError::BadFuncId {
+                        func_id,
+                        count: func_count,
+                    });
+                }
+                let n = r.u32()? as usize;
+                let mut captures = Vec::with_capacity(n.min(r.remaining()));
+                for _ in 0..n {
+                    captures.push(r.val()?);
+                }
+                SnapCell::VmFunction { func_id, captures }
             }
             t => return Err(SnapError::BadTag(t)),
         };

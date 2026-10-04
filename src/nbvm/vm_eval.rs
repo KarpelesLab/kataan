@@ -60,7 +60,7 @@ pub(crate) fn compile_eval_code(
     if r.is_err() {
         table.truncate(base);
     } else {
-        super::resolve_fn_sources(&mut table[base..], &program.source);
+        super::resolve_source_text(&mut table[base..], &program.source);
     }
     r
 }
@@ -181,7 +181,7 @@ fn compile_eval_body(
 
 fn finish_eval_proto(mut c: Compiler, n_captures: usize) -> FnProto {
     FnProto {
-        n_regs: c.next_reg as usize,
+        n_regs: c.next_reg.max(c.reg_high) as usize,
         n_params: 0,
         n_captures,
         rest_from: None,

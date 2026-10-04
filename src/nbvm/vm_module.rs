@@ -217,6 +217,7 @@ pub fn compile_module_into(
                 false,
             )?;
             proto.name.clone_from(&t.name);
+            proto.source_span = Some((t.func.span.start, t.func.span.end));
             protos.borrow_mut()[base as usize + 1 + i] = proto;
         }
         // The init function: one canonical closure per declaration, made and
@@ -282,9 +283,9 @@ pub fn compile_module_into(
     *table = Rc::try_unwrap(protos)
         .expect("unique proto table")
         .into_inner();
+    super::resolve_source_text(&mut table[base as usize..], &program.source);
     match compiled {
         Ok(()) => Ok({
-            crate::nbvm::resolve_fn_sources(&mut table[base as usize..], &program.source);
             ModuleProtos {
                 main: base,
                 init: init_id,

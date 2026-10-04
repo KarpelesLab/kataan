@@ -97,7 +97,7 @@ pub fn eval_module_typed_with_prelude(
                 });
             }
         };
-        if let Err(e) = interp.run(program) {
+        if let Err(e) = interp.run_tree_walk(program) {
             return Err(interp.exec_error_to_thrown(e, ErrorPhase::Runtime));
         }
     }
@@ -140,7 +140,7 @@ pub fn eval_script_typed_with_import_base(
     };
     let mut interp = Interp::new_with_limits(limits);
     interp.set_script_import_base(Some(base_path.to_string()));
-    match interp.run(program) {
+    match interp.run_tree_walk(program) {
         Ok(value) => {
             let completion = interp.display(value);
             Ok((String::from(interp.output()), completion))
@@ -3054,10 +3054,7 @@ impl Interp<'_> {
     /// Installs `table` — the previous table plus newly compiled code — as the
     /// VM function table, for the running VM code and for later runs.
     pub(crate) fn install_module_vm_table(&mut self, table: Rc<[crate::nbvm::FnProto]>) {
-        self.realm
-            .register_vm_fn_meta(table.iter().map(|p| (p.name.as_str(), p.length as u32)));
-        self.realm
-            .register_vm_fn_sources(table.iter().map(|p| p.source.clone()));
+        self.realm.register_vm_fn_meta(&table);
         self.vm_table = Some(Rc::clone(&table));
         self.modules.vm_table = Some(table);
     }

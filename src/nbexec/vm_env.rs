@@ -463,19 +463,12 @@ impl<'a> Interp<'a> {
                     Ok(p) if scratch.is_empty() => p,
                     Ok(_) => {
                         let mut full: Vec<crate::nbvm::FnProto> = table.to_vec();
+                        let base = full.len();
                         let p = crate::nbvm::compile_eval_code(program, &mut full, strict, flags)
                             .ok()?;
-                        let ext: alloc::rc::Rc<[crate::nbvm::FnProto]> = full.into();
-                        self.realm.register_vm_fn_meta(
-                            ext.iter().map(|p| (p.name.as_str(), p.length as u32)),
-                        );
-                        self.realm
-                            .register_vm_fn_sources(ext.iter().map(|p| p.source.clone()));
-                        self.vm_ext_table = Some(alloc::rc::Rc::clone(&ext));
-                        // One growth chain with dynamically imported modules.
-                        #[cfg(all(feature = "module", feature = "std"))]
-                        self.install_module_vm_table(alloc::rc::Rc::clone(&ext));
-                        self.vm_table = Some(ext);
+                        crate::nbvm::resolve_source_text(&mut full[base..], &program.source);
+                        // One growth chain with scripts and dynamic imports.
+                        self.install_vm_table(full.into());
                         p
                     }
                 };

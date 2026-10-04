@@ -221,6 +221,48 @@ Remaining refusals, largest first:
 - Then stage 5: per-function (not whole-program) fallback, and retiring the
   VM-private runtime pieces.
 
+**Product entry points (2026-10-04).** Every way a user runs code now goes
+through the hosted VM, so retiring the tree-walker as an *execution* engine
+only has to shrink one fallback:
+
+- **`Interp::run`** — the embedding API — compiles the script into the
+  interpreter's **persistent** function table (each run appends to it, the way
+  `execute_scripts_typed` shares one table across scripts) and runs it hosted.
+  The table stays installed after the run, so closures a script leaves in
+  globals, timers or promise reactions stay callable, and consecutive runs (a
+  REPL, an embedder feeding scripts) share globals *and* closures. Only a
+  program the compiler refuses — decided before any code runs — goes to
+  `Interp::run_tree_walk`, counted by `Interp::tree_walked`. A VM throw is final
+  (no re-run). Routed through it: the CLI's `run`/`eval`/`nbrun`, `hostrun`
+  (+ the timers prelude) and `repl`; `kt_eval`, `kt_eval_capture` (the web
+  build), `kt_eval_with_buffer`, `kt_eval_with_external_buffer`, `kt_snapshot`;
+  and `nbvm::execute`/`execute_with_limits`/`execute_capturing`, which are now
+  thin wrappers over it (the old standalone-realm VM with a whole-program
+  tree-walk re-run is gone from these entries). `tests/vm_entry_points.rs`
+  and the `host_*` suites assert `tree_walked() == 0` for them. Moving them
+  surfaced VM gaps the corpus gate cannot see (it re-runs a program on the
+  tree-walker after *any* VM throw): a script's completion value through
+  `if`/loops/`switch`/`try` (UpdateEmpty, a completion register in script
+  bodies), `Function.prototype.toString` source text for VM closures (kept per
+  function-table entry), VM closures in D′ snapshots (`SnapCell::VmFunction`),
+  hosted `.size` reads, `return` values fixed before a `finally` runs,
+  `(a?.b)()` keeping `this`, host-function `name`/`length`, and cross-realm
+  `newTarget` prototypes.
+- **Reference tier, kept on the tree-walker:** `nbexec::eval_source*` /
+  `eval_scripts_typed` / `eval_module_typed*` and `$262.agent` workers. They are
+  the differential oracle the VM tests compare against and the fallback the
+  corpus runner's `execute_typed*` uses outside `KATAAN_VM_STRICT`; they go when
+  the tree-walker's statement executor goes.
+- **Bare tier, kept deliberately:** `compile_program` + `run_program`/
+  `run_program_capturing`, the `.ktbc` artifact format (`kataan compile`/`run
+  x.ktbc`, `kt_compile`/`kt_load_bytecode`) and the JIT's tests run the VM over
+  a bare `Realm` with no host interpreter. A hosted script needs its host's
+  `GlobalDeclarationInstantiation` over the *AST* (`prepare_script_for_vm`),
+  which an artifact does not carry, and the bare tier is the sandboxed,
+  verified path for untrusted bytecode. Making artifacts hosted means
+  serializing the script's declaration lists alongside the table — future work
+  if `.ktbc` is to run the full language.
+
 ## 2. The three headline engine deliverables
 
 These make Kataan more than a fast interpreter. They are *engine* capabilities
