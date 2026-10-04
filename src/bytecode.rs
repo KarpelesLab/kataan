@@ -629,9 +629,14 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*b)
         }
         Op::AnnexBGlobal { src, .. } => reg(*src),
-        Op::AddDisposable { stack, src } => {
+        Op::AddDisposable { stack, src } | Op::AddAsyncDisposable { stack, src } => {
             reg(*stack)?;
             reg(*src)
+        }
+        Op::AsyncDisposeStep { state, dst, done } => {
+            reg(*state)?;
+            reg(*dst)?;
+            reg(*done)
         }
         Op::DisposeResources { stack, exc } => {
             reg(*stack)?;
@@ -1465,6 +1470,17 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*stack, out);
             w_reg(*src, out);
         }
+        Op::AddAsyncDisposable { stack, src } => {
+            w_u8(151, out);
+            w_reg(*stack, out);
+            w_reg(*src, out);
+        }
+        Op::AsyncDisposeStep { state, dst, done } => {
+            w_u8(152, out);
+            w_reg(*state, out);
+            w_reg(*dst, out);
+            w_reg(*done, out);
+        }
         Op::DisposeResources { stack, exc } => {
             w_u8(122, out);
             w_reg(*stack, out);
@@ -2129,6 +2145,15 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         121 => Op::AddDisposable {
             stack: r.reg()?,
             src: r.reg()?,
+        },
+        151 => Op::AddAsyncDisposable {
+            stack: r.reg()?,
+            src: r.reg()?,
+        },
+        152 => Op::AsyncDisposeStep {
+            state: r.reg()?,
+            dst: r.reg()?,
+            done: r.reg()?,
         },
         122 => Op::DisposeResources {
             stack: r.reg()?,

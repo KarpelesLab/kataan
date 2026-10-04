@@ -10138,6 +10138,119 @@ impl crate::nbvm::VmHost for Interp<'_> {
             .map_err(exec_to_host)
     }
 
+    fn using_resource_async(&mut self, value: NanBox) -> Result<NanBox, crate::nbvm::HostError> {
+        if matches!(value.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            return Ok(NanBox::undefined());
+        }
+        if !self.is_object_value(value) {
+            let e = self.type_error("using declaration value is not an object");
+            return Err(exec_to_host(e));
+        }
+        self.using_dispose_method(value, true).map_err(exec_to_host)
+    }
+
+    fn async_dispose_step(
+        &mut self,
+        state: NanBox,
+    ) -> Result<Option<NanBox>, crate::nbvm::HostError> {
+        // State slots: 0 stack, 1 has_error, 2 error, 3 await_failed,
+        // 4 await_error, then (appended here) 5 cursor, 6 needsAwait,
+        // 7 hasAwaited — DisposeResources (7.5.5) as a resumable loop.
+        let Some(sh) = state.as_handle().map(Handle::from_raw) else {
+            return Ok(None);
+        };
+        let mut st = self
+            .realm
+            .array_elements(sh)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        if st.len() < 5 {
+            return Ok(None);
+        }
+        let stack: Vec<NanBox> = st[0]
+            .as_handle()
+            .and_then(|h| self.realm.array_elements(Handle::from_raw(h)))
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        if st.len() < 8 {
+            st.truncate(5);
+            st.push(NanBox::number(stack.len() as f64));
+            st.push(NanBox::boolean(false));
+            st.push(NanBox::boolean(false));
+        }
+        let truthy = |v: NanBox| matches!(v.unpack(), Unpacked::Bool(true));
+        let mut pending = truthy(st[1]).then_some(st[2]);
+        if truthy(st[3]) {
+            let e = st[4];
+            pending = Some(match pending {
+                None => e,
+                Some(prev) => self.make_suppressed_error(e, prev),
+            });
+            st[3] = NanBox::boolean(false);
+        }
+        let mut idx = st[5].as_number().unwrap_or(0.0) as usize;
+        let mut needs_await = truthy(st[6]);
+        let mut has_awaited = truthy(st[7]);
+        let mut owed: Option<NanBox> = None;
+        while idx > 0 {
+            let entry: Vec<NanBox> = stack[idx - 1]
+                .as_handle()
+                .and_then(|h| self.realm.array_elements(Handle::from_raw(h)))
+                .map(<[_]>::to_vec)
+                .unwrap_or_default();
+            let (value, method) = (
+                entry.first().copied().unwrap_or(NanBox::undefined()),
+                entry.get(1).copied().unwrap_or(NanBox::undefined()),
+            );
+            let is_async = entry.get(2).copied().is_some_and(truthy);
+            if !is_async && needs_await && !has_awaited {
+                needs_await = false;
+                owed = Some(NanBox::undefined());
+                break;
+            }
+            idx -= 1;
+            if matches!(method.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                if is_async {
+                    needs_await = true;
+                }
+                continue;
+            }
+            match self.call_with_this(method, value, &[]) {
+                Ok(r) if is_async => {
+                    has_awaited = true;
+                    owed = Some(r);
+                    break;
+                }
+                Ok(_) => {}
+                Err(ExecError::Throw(e)) => {
+                    pending = Some(match pending {
+                        None => e,
+                        Some(prev) => self.make_suppressed_error(e, prev),
+                    });
+                }
+                Err(other) => return Err(exec_to_host(other)),
+            }
+        }
+        if owed.is_none() && idx == 0 && needs_await && !has_awaited {
+            needs_await = false;
+            has_awaited = true;
+            owed = Some(NanBox::undefined());
+        }
+        st[1] = NanBox::boolean(pending.is_some());
+        st[2] = pending.unwrap_or(NanBox::undefined());
+        st[5] = NanBox::number(idx as f64);
+        st[6] = NanBox::boolean(needs_await);
+        st[7] = NanBox::boolean(has_awaited);
+        self.realm.array_set_all(sh, st);
+        if let Some(v) = owed {
+            return Ok(Some(v));
+        }
+        match pending {
+            Some(e) => Err(exec_to_host(ExecError::Throw(e))),
+            None => Ok(None),
+        }
+    }
+
     fn map_arguments(&mut self, args_obj: NanBox, cells: &[(usize, NanBox)]) {
         let Some(obj) = args_obj.as_handle().map(Handle::from_raw) else {
             return;

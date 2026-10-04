@@ -318,6 +318,15 @@ pub enum Op {
     /// Disposes the scope's resources in `stack` (see
     /// [`VmHost::dispose_using`]), with the in-flight throw in `exc`, if any.
     DisposeResources { stack: Reg, exc: Option<Reg> },
+    /// An `await using` declaration: records `src` with its async dispose
+    /// method in `stack` as a `[value, method, true]` triple (the method is
+    /// `undefined` for a `null`/`undefined` value).
+    AddAsyncDisposable { stack: Reg, src: Reg },
+    /// One step of an `await using` scope's DisposeResources over the state
+    /// array `state` (see [`VmHost::async_dispose_step`]): `done` = whether
+    /// disposal finished (normally — a throw completion is thrown here), else
+    /// `dst` = the value to await before the next step.
+    AsyncDisposeStep { state: Reg, dst: Reg, done: Reg },
     /// Maps the arguments object `args`: index `i` aliases the parameter cell
     /// in register `reg` for each `(i, reg)` (see [`VmHost::map_arguments`]).
     MapArguments { args: Reg, cells: Vec<(u32, Reg)> },
@@ -1016,6 +1025,22 @@ pub trait VmHost {
         resources: &[(NanBox, NanBox)],
         pending: Option<NanBox>,
     ) -> Result<(), HostError>;
+    /// An `await using` declaration's resource: the async dispose method of
+    /// `value` (`@@asyncDispose`, else a wrapped `@@dispose`), or `undefined`
+    /// for `null`/`undefined`.
+    ///
+    /// # Errors
+    /// A `TypeError` for a non-object or a missing/non-callable method.
+    fn using_resource_async(&mut self, value: NanBox) -> Result<NanBox, HostError>;
+    /// One step of an async DisposeResources. `state` is an array
+    /// `[stack, has_error, error, await_failed, await_error]` (the host appends
+    /// its cursor slots on the first step): an `await_failed` rejection merges
+    /// into the completion first; then resources run in reverse until one owes
+    /// an `Await`, whose operand is returned. `None` = finished normally.
+    ///
+    /// # Errors
+    /// The (SuppressedError-aggregated) throw the scope completes with.
+    fn async_dispose_step(&mut self, state: NanBox) -> Result<Option<NanBox>, HostError>;
     /// Annex B.3.3 at a hosted script's top level: when the block function
     /// declaration `name` spanning `start..end` qualifies (the host decided at
     /// GlobalDeclarationInstantiation), its value `value` also updates the
@@ -5971,6 +5996,32 @@ fn run_frame_at(
                         let st = object_handle(regs[*stack as usize])?;
                         ctx.realm.array_push(st, NanBox::handle(pair.to_raw()));
                     }
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
+            }
+            Op::AddAsyncDisposable { stack, src } => {
+                let v = regs[*src as usize];
+                match with_host(ctx, |h| h.using_resource_async(v)) {
+                    Some(Ok(m)) => {
+                        let pair = ctx
+                            .realm
+                            .new_array(alloc::vec![v, m, NanBox::boolean(true)]);
+                        let st = object_handle(regs[*stack as usize])?;
+                        ctx.realm.array_push(st, NanBox::handle(pair.to_raw()));
+                    }
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
+            }
+            Op::AsyncDisposeStep { state, dst, done } => {
+                let st = regs[*state as usize];
+                match with_host(ctx, |h| h.async_dispose_step(st)) {
+                    Some(Ok(Some(v))) => {
+                        regs[*dst as usize] = v;
+                        regs[*done as usize] = NanBox::boolean(false);
+                    }
+                    Some(Ok(None)) => regs[*done as usize] = NanBox::boolean(true),
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
                     None => return Err(VmError::Unsupported),
                 }
@@ -11035,8 +11086,9 @@ enum FinalAction {
     Stmts(Vec<Stmt>),
     /// IteratorClose of an array destructuring's iterator (`(iter, done)`).
     Close(Reg, Reg),
-    /// DisposeResources of a `using` scope's resource list.
-    Dispose(Reg),
+    /// DisposeResources of a `using` scope's resource list (async: the scope
+    /// declares `await using` resources).
+    Dispose(Reg, bool),
 }
 
 /// See [`Compiler::loop_frames`].
@@ -11194,6 +11246,9 @@ struct Compiler {
     handler_depth: usize,
     /// The resource list of the innermost scope holding `using` declarations.
     using_stack: Option<Reg>,
+    /// Set while a `for (using … ; ; )` loop re-enters its own compile inside
+    /// the `using` scope wrapping it.
+    using_for_wrapped: bool,
     /// Enclosing `try … finally` statements whose `finally` a
     /// `return`/`break`/`continue` leaving them must run (innermost last).
     finally_frames: Vec<FinallyFrame>,
@@ -13198,9 +13253,9 @@ impl Compiler {
                         self.handler_depth += 1;
                         (at, r)
                     });
-                    for s in &catch.body {
-                        self.stmt(s)?;
-                    }
+                    self.using_scope(&catch.body, |c| {
+                        catch.body.iter().try_for_each(|s| c.stmt(s).map(|_| ()))
+                    })?;
                     self.scopes.pop();
                     if let Some(fin) = finalizer {
                         let (at, r) = guard.expect("guarded");
@@ -13236,15 +13291,22 @@ impl Compiler {
                 // semantics the bytecode VM does not model; bail to the
                 // tree-walker (`nbexec`), which implements them with full
                 // explicit-resource-management semantics.
-                if decl.kind == crate::ast::VarDeclKind::Using
-                    && let Some(stack) = self.using_stack
+                if matches!(
+                    decl.kind,
+                    crate::ast::VarDeclKind::Using | crate::ast::VarDeclKind::AwaitUsing
+                ) && let Some(stack) = self.using_stack
                 {
                     for d in &decl.declarations {
                         let value = match &d.init {
                             Some(e) => self.expr_named(e, &d.target)?,
                             None => self.constant(NanBox::undefined())?,
                         };
-                        self.ops.push(Op::AddDisposable { stack, src: value });
+                        self.ops
+                            .push(if decl.kind == crate::ast::VarDeclKind::Using {
+                                Op::AddDisposable { stack, src: value }
+                            } else {
+                                Op::AddAsyncDisposable { stack, src: value }
+                            });
                         let saved = self.decl_kind.replace(crate::ast::VarDeclKind::Const);
                         let bound = self.bind_pattern(&d.target, value);
                         self.decl_kind = saved;
@@ -13482,10 +13544,12 @@ impl Compiler {
                 // A `for (using x of …)` / `for (await using x of …)` head needs
                 // per-iteration explicit-resource-management disposal; bail to the
                 // tree-walker (`nbexec`).
-                if matches!(
-                    kind,
-                    crate::ast::VarDeclKind::Using | crate::ast::VarDeclKind::AwaitUsing
-                ) {
+                if !self.hosted
+                    && matches!(
+                        kind,
+                        crate::ast::VarDeclKind::Using | crate::ast::VarDeclKind::AwaitUsing
+                    )
+                {
                     return Err(CompileError::Unsupported("using in for-of head"));
                 }
                 if *is_await {
@@ -13551,7 +13615,7 @@ impl Compiler {
                     ForLeft::Target(_) => return Err(CompileError::Unsupported("for-in binding")),
                 };
                 self.scopes.push(alloc::collections::BTreeMap::new());
-                let obj = self.expr(right)?;
+                let obj = self.for_head_expr(&bind, right)?;
                 let arr = self.alloc();
                 self.ops.push(Op::EnumKeys { dst: arr, obj });
                 let len = self.alloc();
@@ -13617,6 +13681,23 @@ impl Compiler {
                 body,
                 ..
             } => {
+                // A `using` head's resources live as long as the whole loop.
+                let wrapped = core::mem::take(&mut self.using_for_wrapped);
+                if let Some(ForInit::Var(d)) = init
+                    && matches!(
+                        d.kind,
+                        crate::ast::VarDeclKind::Using | crate::ast::VarDeclKind::AwaitUsing
+                    )
+                    && self.hosted
+                    && !wrapped
+                {
+                    let is_async = d.kind == crate::ast::VarDeclKind::AwaitUsing;
+                    self.using_scope_forced(is_async, |c| {
+                        c.using_for_wrapped = true;
+                        c.stmt(stmt).map(|_| ())
+                    })?;
+                    return Ok(None);
+                }
                 self.scopes.push(alloc::collections::BTreeMap::new());
                 match init {
                     Some(ForInit::Var(decl)) => {
@@ -15864,11 +15945,11 @@ impl Compiler {
     /// Compiles a statement list in a fresh lexical scope.
     fn block_stmts(&mut self, stmts: &'_ [Stmt]) -> Result<(), CompileError> {
         self.scopes.push(alloc::collections::BTreeMap::new());
-        for s in stmts {
-            self.stmt(s)?;
-        }
+        let r = self.using_scope(stmts, |c| {
+            stmts.iter().try_for_each(|s| c.stmt(s).map(|_| ()))
+        });
         self.scopes.pop();
-        Ok(())
+        r
     }
 
     /// Emits the op(s) for `a <op> b` into a fresh register, returning it.
@@ -16988,20 +17069,39 @@ impl Compiler {
     }
 
     /// Compiles a statement list (via `f`) as a `using` scope when it declares
-    /// sync `using` resources: a fresh resource list, disposed on every exit —
-    /// normally, by `return`/`break`/`continue` (a finally frame), or with the
-    /// in-flight throw (a handler, then rethrow). Hosted only.
+    /// `using`/`await using` resources: a fresh resource list, disposed on
+    /// every exit — normally, by `return`/`break`/`continue` (a finally frame),
+    /// or with the in-flight throw (a handler, then rethrow). Hosted only.
     fn using_scope(
         &mut self,
         body: &[Stmt],
         f: impl FnOnce(&mut Self) -> Result<(), CompileError>,
     ) -> Result<(), CompileError> {
+        use crate::ast::VarDeclKind;
         let has_using = self.hosted
-            && body
-                .iter()
-                .any(|s| matches!(s, Stmt::Var(d) if d.kind == crate::ast::VarDeclKind::Using));
+            && body.iter().any(
+                |s| matches!(s, Stmt::Var(d) if matches!(d.kind, VarDeclKind::Using | VarDeclKind::AwaitUsing)),
+            );
         if !has_using {
             return f(self);
+        }
+        let is_async = body
+            .iter()
+            .any(|s| matches!(s, Stmt::Var(d) if d.kind == VarDeclKind::AwaitUsing));
+        self.using_scope_forced(is_async, f)
+    }
+
+    /// [`Self::using_scope`] for a scope known to declare resources (`is_async`:
+    /// some of them `await using`, so disposal awaits).
+    fn using_scope_forced(
+        &mut self,
+        is_async: bool,
+        f: impl FnOnce(&mut Self) -> Result<(), CompileError>,
+    ) -> Result<(), CompileError> {
+        if is_async && !self.in_async {
+            return Err(CompileError::Unsupported(
+                "await using outside an async function",
+            ));
         }
         let stack = self.alloc();
         self.ops.push(Op::NewArray { dst: stack, len: 0 });
@@ -17012,7 +17112,7 @@ impl Compiler {
             labels_len: self.labels.len(),
             scope_len: self.scopes.len(),
             handler_depth: self.handler_depth,
-            action: FinalAction::Dispose(stack),
+            action: FinalAction::Dispose(stack, is_async),
         });
         let exc = self.alloc();
         let h = self.ops.len();
@@ -17021,21 +17121,88 @@ impl Compiler {
             reg: exc,
         });
         self.handler_depth += 1;
+        // A call is never in tail position inside a `using` scope: the
+        // resources are disposed after it returns.
+        let saved_tail = core::mem::replace(&mut self.tail_ok, false);
         let r = f(self);
+        self.tail_ok = saved_tail;
         self.handler_depth -= 1;
         self.finally_frames.pop();
         self.using_stack = saved;
         r?;
         self.ops.push(Op::PopHandler);
-        self.ops.push(Op::DisposeResources { stack, exc: None });
+        self.emit_dispose(stack, None, is_async)?;
         let end = self.emit_jump();
         self.patch_to(h, self.ops.len());
-        self.ops.push(Op::DisposeResources {
-            stack,
-            exc: Some(exc),
-        });
+        self.emit_dispose(stack, Some(exc), is_async)?;
         self.ops.push(Op::Throw { src: exc });
         self.patch(end);
+        Ok(())
+    }
+
+    /// DisposeResources of the resource list `stack`, with the in-flight throw
+    /// `exc` (if any). An async scope runs [`Op::AsyncDisposeStep`] in a loop,
+    /// awaiting what each step owes; an awaited rejection is recorded in the
+    /// state and merged by the next step.
+    fn emit_dispose(
+        &mut self,
+        stack: Reg,
+        exc: Option<Reg>,
+        is_async: bool,
+    ) -> Result<(), CompileError> {
+        if !is_async {
+            self.ops.push(Op::DisposeResources { stack, exc });
+            return Ok(());
+        }
+        let state = self.alloc();
+        self.ops.push(Op::NewArray { dst: state, len: 0 });
+        let (has_error, error) = match exc {
+            Some(e) => (self.constant(NanBox::boolean(true))?, e),
+            None => (
+                self.constant(NanBox::boolean(false))?,
+                self.constant(NanBox::undefined())?,
+            ),
+        };
+        let f = self.constant(NanBox::boolean(false))?;
+        let u = self.constant(NanBox::undefined())?;
+        for src in [stack, has_error, error, f, u] {
+            self.ops.push(Op::ArrayPush { arr: state, src });
+        }
+        let top = self.ops.len();
+        let (dst, done) = (self.alloc(), self.alloc());
+        self.ops.push(Op::AsyncDisposeStep { state, dst, done });
+        let not_done = self.alloc();
+        self.ops.push(Op::Not {
+            dst: not_done,
+            a: done,
+        });
+        let jend = self.emit_jump_if_false(not_done);
+        let err = self.alloc();
+        let h = self.ops.len();
+        self.ops.push(Op::PushHandler {
+            target: 0,
+            reg: err,
+        });
+        let t = self.alloc();
+        self.ops.push(Op::Await { dst: t, src: dst });
+        self.ops.push(Op::PopHandler);
+        self.ops.push(Op::Jump { target: top });
+        self.patch_to(h, self.ops.len());
+        let tr = self.constant(NanBox::boolean(true))?;
+        let i3 = self.constant(NanBox::number(3.0))?;
+        let i4 = self.constant(NanBox::number(4.0))?;
+        self.ops.push(Op::SetElem {
+            arr: state,
+            index: i3,
+            src: tr,
+        });
+        self.ops.push(Op::SetElem {
+            arr: state,
+            index: i4,
+            src: err,
+        });
+        self.ops.push(Op::Jump { target: top });
+        self.patch(jend);
         Ok(())
     }
 
@@ -17246,7 +17413,7 @@ impl Compiler {
         body: &Stmt,
     ) -> Result<Option<Reg>, CompileError> {
         self.scopes.push(alloc::collections::BTreeMap::new());
-        let src = self.expr(right)?;
+        let src = self.for_head_expr(&bind, right)?;
         let (iter, next, done) = (self.alloc(), self.alloc(), self.alloc());
         self.ops.push(Op::IterOpen { iter, next, src });
         let f = self.constant(NanBox::boolean(false))?;
@@ -17276,9 +17443,7 @@ impl Compiler {
             reg: exc,
         });
         self.handler_depth += 1;
-        let r = self
-            .for_bind(bind, cur)
-            .and_then(|()| self.stmt(body).map(|_| ()));
+        let r = self.for_iteration(bind, cur, body);
         self.handler_depth -= 1;
         r?;
         self.ops.push(Op::PopHandler);
@@ -17308,7 +17473,7 @@ impl Compiler {
         body: &Stmt,
     ) -> Result<Option<Reg>, CompileError> {
         self.scopes.push(alloc::collections::BTreeMap::new());
-        let src = self.expr(right)?;
+        let src = self.for_head_expr(&bind, right)?;
         let (iter, next, sync) = (self.alloc(), self.alloc(), self.alloc());
         self.ops.push(Op::AsyncIterOpen {
             iter,
@@ -17357,9 +17522,7 @@ impl Compiler {
             reg: exc,
         });
         self.handler_depth += 1;
-        let r = self
-            .for_bind(bind, cur)
-            .and_then(|()| self.stmt(body).map(|_| ()));
+        let r = self.for_iteration(bind, cur, body);
         self.handler_depth -= 1;
         r?;
         self.ops.push(Op::PopHandler);
@@ -17514,6 +17677,88 @@ impl Compiler {
 
     /// Binds one `for-of`/`for-in` iteration's value: a declaration head, or
     /// an assignment target (evaluated anew each iteration, after the value).
+    /// A `for-in`/`for-of` head's expression. Hosted, a lexical head's names
+    /// are in their TDZ while it runs (`for (let x of [x])` throws).
+    fn for_head_expr(&mut self, bind: &ForBind<'_>, right: &Expr) -> Result<Reg, CompileError> {
+        let ForBind::Decl(kind, target) = bind else {
+            return self.expr(right);
+        };
+        // (A direct `eval` in the head keeps running in the enclosing scope —
+        // see `top_level_direct_eval_ok`.)
+        let mut direct = BTreeSet::new();
+        let mut nested = BTreeSet::new();
+        refs_expr(right, &mut direct, &mut nested);
+        if !self.hosted || **kind == crate::ast::VarDeclKind::Var || direct.contains("eval") {
+            return self.expr(right);
+        }
+        let mut names = BTreeSet::new();
+        pattern_names(target, &mut names);
+        self.scopes.push(alloc::collections::BTreeMap::new());
+        let depth = self.scopes.len() - 1;
+        for name in &names {
+            if self.cell_names.contains(name.as_str()) {
+                let reg = self.alloc();
+                self.ops.push(Op::NewArray { dst: reg, len: 1 });
+                let t = self.constant(NanBox::tdz())?;
+                let idx = self.constant(NanBox::number(0.0))?;
+                self.ops.push(Op::SetElem {
+                    arr: reg,
+                    index: idx,
+                    src: t,
+                });
+                self.scopes[depth].insert(
+                    name.clone(),
+                    Binding {
+                        reg,
+                        cell: true,
+                        konst: false,
+                        global: None,
+                        tdz: true,
+                        mapped: false,
+                        fn_name: false,
+                    },
+                );
+            } else {
+                self.bind_tdz_reg(name, depth)?;
+            }
+        }
+        let r = self.expr(right);
+        self.scopes.pop();
+        r
+    }
+
+    /// One `for-of`/`for-in` iteration: bind `cur`, run `body`. A `using` /
+    /// `await using` head makes the iteration a `using` scope owning `cur`.
+    fn for_iteration(
+        &mut self,
+        bind: ForBind<'_>,
+        cur: Reg,
+        body: &Stmt,
+    ) -> Result<(), CompileError> {
+        use crate::ast::VarDeclKind;
+        if let ForBind::Decl(kind, target) = bind
+            && matches!(kind, VarDeclKind::Using | VarDeclKind::AwaitUsing)
+        {
+            let is_async = *kind == VarDeclKind::AwaitUsing;
+            return self.using_scope_forced(is_async, |c| {
+                let stack = c.using_stack.expect("a using scope");
+                c.ops.push(if is_async {
+                    Op::AddAsyncDisposable { stack, src: cur }
+                } else {
+                    Op::AddDisposable { stack, src: cur }
+                });
+                let saved = c.decl_kind.replace(VarDeclKind::Const);
+                let bound = c.bind_pattern(target, cur);
+                c.decl_kind = saved;
+                bound?;
+                c.mark_pattern_const(target);
+                c.stmt(body).map(|_| ())
+            });
+        }
+        self.for_bind(bind, cur)?;
+        self.stmt(body).map(|_| ())
+    }
+
     fn for_bind(&mut self, bind: ForBind<'_>, value: Reg) -> Result<(), CompileError> {
         match bind {
             ForBind::Decl(kind, target) => self.bind_for_decl(kind, target, value),
@@ -17633,9 +17878,8 @@ impl Compiler {
                 });
                 return Ok(());
             }
-            FinalAction::Dispose(stack) => {
-                self.ops.push(Op::DisposeResources { stack, exc: None });
-                return Ok(());
+            FinalAction::Dispose(stack, is_async) => {
+                return self.emit_dispose(stack, None, is_async);
             }
             FinalAction::Stmts(ref v) => v.clone(),
         };
