@@ -263,6 +263,62 @@ only has to shrink one fallback:
   serializing the script's declaration lists alongside the table — future work
   if `.ktbc` is to run the full language.
 
+**Retiring the tree-walker: inventory (2026-10-05).** `KATAAN_VM_PURE`
+(53,372 / 53,377) is now the truth, so the tree-walker stops being an
+*execution* engine. What `nbexec` keeps is the realm, built-ins, natives and
+host services the VM calls through `VmHost`; what goes is every path that can
+still execute AST statements or expressions:
+
+- **Whole-run fallbacks** (a compile refusal or *any* VM error re-runs the
+  program from scratch on the tree-walker): `nbvm::execute_typed_interruptible`
+  and `execute_scripts_typed` (→ `nbexec::eval_source_typed_interruptible` /
+  `eval_scripts_typed`, also taken for a Script that parses as a Module), the
+  module entries in `nbvm/vm_module.rs` (`execute_module_entry` /
+  `execute_script_with_import_base` → `nbexec::module::eval_module_typed*` /
+  `eval_script_typed_with_import_base`; a VM *throw* re-runs too), and
+  `Interp::run`'s compile-refusal fallback to `Interp::run_tree_walk`.
+  `KATAAN_VM_STRICT`/`KATAAN_VM_PURE` exist only to switch these off.
+- **Per-unit fallbacks inside a hosted run:** `vm_eval_program` /
+  `vm_dynamic_function` returning `None` (no VM table, or eval code / a
+  `Function` body the compiler refuses) → `run_eval_body` / an interpreter
+  closure from `build_function_constructor_kw` — reached from direct/indirect
+  `eval`, `Function`/`GeneratorFunction`/`AsyncFunction` constructors,
+  `$262.evalScript`, `createRealm().evalScript`, ShadowRealm `evaluate`, and
+  `$262.agent.start` (`eval_source_in_realm`); a module the VM refuses
+  (`vm_compile_pending` → `modules.vm_note`) runs its body through
+  `exec_module_stmts` with interpreter-closure functions
+  (`instantiate_module_functions`).
+- **Interpreter closures still minted on the VM path:** `prepare_script_for_vm`
+  / `hoist_with` creates top-level `function` declarations as `Cell::Function`
+  closures that the VM script body overwrites before user code runs (and the
+  eval path skips via `hoist_skip_fns`).
+- **The reference engine API:** `nbexec::eval_source*`,
+  `eval_source_capturing*`, `eval_source_typed*`, `eval_scripts_typed`,
+  `nbexec::module::eval_module_typed*` / `eval_script_typed_with_import_base`
+  / `execute_module`, `Interp::run_tree_walk`, `examples/srun.rs`'s
+  `KATAAN_SRUN_TIER=nbexec`, and the old AST expression evaluator
+  `src/nbeval.rs`.
+- **The executor itself** (dead once the above are gone): statements
+  (`stmt.rs`, ~2.1k lines), expressions (`expr.rs`, ~6.6k), interpreter
+  closure calls / `invoke` / `invoke_inner` / tail calls and argument binding
+  (much of `call.rs`, ~4.9k), the step-machine generators, async functions and
+  async generators over the AST (`generator.rs`: `make_lazy_generator`,
+  `lazy_gen_resume`, `gen_step` … ~4.5k of 5.6k), AST class evaluation
+  (`class.rs`: `make_class`, `instantiate`, `run_constructor`, field
+  initializers), module statement execution (`exec_module_stmts`,
+  `exec_export`, `run_module_body_inner`'s AST arm, the TLA coroutine over the
+  AST), the `FnDef`/class tables and the `Cell::Function`/`Cell::Class` heap
+  variants (and their snapshot encoding).
+- **Naming:** the CLI's `nbrun` ("the new-representation engine") is an alias
+  of `run`; `hostrun` is `run` plus the host event loop — kept, help text to be
+  reworded once the tree-walker is gone.
+
+Kept: `Scope`/`env.rs` (the global environment and the `Cell::Env`
+environments of VM direct `eval`/`with`), declaration instantiation
+(`global_declaration_checks`, `eval_declaration_checks`, `hoist_with_kind`
+without function creation), the module loader/linker and namespaces, and every
+native / built-in.
+
 ## 2. The three headline engine deliverables
 
 These make Kataan more than a fast interpreter. They are *engine* capabilities
