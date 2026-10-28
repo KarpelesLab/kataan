@@ -158,6 +158,13 @@ struct Spare {
 // `Stash::with`, which holds the spin lock for its duration.
 unsafe impl Sync for Stash {}
 
+/// Per class, whether the stash may hold blocks: set (under the lock)
+/// whenever blocks are added, cleared when a thread takes the list. Read
+/// without the lock, so a thread whose list runs dry only takes the lock when
+/// there is likely something to take, rather than on every arena bump; a
+/// stale value only costs one wasted lock or one bump instead of a reuse.
+static STASH_HAS: [AtomicBool; NCLASS] = [const { AtomicBool::new(false) }; NCLASS];
+
 static STASH: Stash = Stash {
     lock: AtomicBool::new(false),
     lists: UnsafeCell::new([List::EMPTY; NCLASS]),
@@ -206,7 +213,14 @@ impl Cache {
     #[cold]
     fn refill(&mut self, c: usize) -> *mut u8 {
         let size = class_size(c);
-        let stolen = STASH.with(|lists, _| core::mem::replace(&mut lists[c], List::EMPTY));
+        let stolen = if STASH_HAS[c].load(Ordering::Relaxed) {
+            STASH.with(|lists, _| {
+                STASH_HAS[c].store(false, Ordering::Relaxed);
+                core::mem::replace(&mut lists[c], List::EMPTY)
+            })
+        } else {
+            List::EMPTY
+        };
         if !stolen.head.is_null() {
             self.lists[c] = stolen;
             return self.lists[c].pop();
@@ -268,7 +282,10 @@ impl Cache {
         l.push(p);
         if l.len * class_size(c) > SPILL_BYTES {
             let full = core::mem::replace(l, List::EMPTY);
-            STASH.with(|lists, _| lists[c].append(full));
+            STASH.with(|lists, _| {
+                lists[c].append(full);
+                STASH_HAS[c].store(true, Ordering::Relaxed);
+            });
         }
     }
 }
@@ -286,8 +303,11 @@ impl Drop for CacheSlot {
         cache.bump = ptr::null_mut();
         cache.end = ptr::null_mut();
         STASH.with(|stash, spare| {
-            for (dst, src) in stash.iter_mut().zip(lists) {
-                dst.append(src);
+            for ((dst, src), has) in stash.iter_mut().zip(lists).zip(&STASH_HAS) {
+                if !src.head.is_null() {
+                    dst.append(src);
+                    has.store(true, Ordering::Relaxed);
+                }
             }
             if (end as usize) - (bump as usize) >= SPARE_MIN {
                 let s = bump.cast::<Spare>();
@@ -370,7 +390,10 @@ fn alloc_uncached(c: usize) -> *mut u8 {
 /// Fallback free of class `c` without a thread cache.
 #[cold]
 fn dealloc_uncached(p: *mut u8, c: usize) {
-    STASH.with(|lists, _| lists[c].push(p));
+    STASH.with(|lists, _| {
+        lists[c].push(p);
+        STASH_HAS[c].store(true, Ordering::Relaxed);
+    });
 }
 
 /// The pooling allocator. A zero-sized handle; all state is per-thread or in

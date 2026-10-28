@@ -44,6 +44,35 @@ impl Realm {
         self.object_keys(handle)
     }
 
+    /// [`plain_enumerable_keys`](Self::plain_enumerable_keys) as shared ropes.
+    /// For such an object the key list is a function of its shape alone, so
+    /// the last shape's list is remembered: listing the keys of objects built
+    /// alike (a loop over records) then allocates nothing but the result's
+    /// string cells, which share these immutable ropes.
+    #[must_use]
+    pub fn plain_enumerable_key_ropes(&self, handle: Handle) -> Option<Rc<[crate::rope::Rope]>> {
+        let Some(Cell::Object(o)) = self.heap.get(handle) else {
+            return None;
+        };
+        if o.is_prim_wrapper() {
+            return None;
+        }
+        let shape = self.plain_keyed_shape(handle)?;
+        if let Some((s, keys)) = &*self.key_ropes.borrow()
+            && Rc::ptr_eq(s, shape)
+        {
+            return Some(keys.clone());
+        }
+        let shape = shape.clone();
+        let keys: Rc<[crate::rope::Rope]> = self
+            .object_keys(handle)?
+            .iter()
+            .map(|k| crate::rope::Rope::leaf(k))
+            .collect();
+        *self.key_ropes.borrow_mut() = Some((shape, keys.clone()));
+        Some(keys)
+    }
+
     /// Slot `slot` of the object at `handle`, provided the object still has
     /// shape `shape` and still satisfies
     /// [`plain_keyed_shape`](Self::plain_keyed_shape)'s conditions — so the slot
@@ -628,10 +657,19 @@ pub(crate) fn push_small_integer(out: &mut alloc::string::String, n: f64) -> boo
     let Some((buf, pos)) = small_integer_digits(n) else {
         return false;
     };
-    for &b in &buf[pos..] {
-        out.push(char::from(b));
-    }
+    // Digits are ASCII, so the slice is valid UTF-8; one reserve-and-copy.
+    out.push_str(core::str::from_utf8(&buf[pos..]).unwrap_or_default());
     true
+}
+
+/// Appends `Number::toString(n)` to the WTF-8 buffer `out` — the digits
+/// directly for a small integer, else the general rendering.
+pub(crate) fn push_number_bytes(out: &mut alloc::vec::Vec<u8>, n: f64) {
+    if let Some((buf, pos)) = small_integer_digits(n) {
+        out.extend_from_slice(&buf[pos..]);
+    } else {
+        out.extend_from_slice(super::js_number_string(n).as_bytes());
+    }
 }
 
 /// How many small non-negative integers keep a shared string rope.

@@ -199,13 +199,16 @@ impl Interp {
             gap: &gap,
             stack: Vec::new(),
             out: String::new(),
-            shape_keys: Vec::new(),
+            shape_keys: core::mem::take(&mut self.json_shape_memo),
             tojson_obj: crate::ic::PropertyCache::new(),
             tojson_arr: Default::default(),
         };
-        let value = self.read_member(holder, "")?;
-        let wrote = self.json_ser_got(&mut cx, holder, JsonKey::Str(""), value, "")?;
-        Ok(wrote.then_some(cx.out))
+        let wrote = match self.read_member(holder, "") {
+            Ok(value) => self.json_ser_got(&mut cx, holder, JsonKey::Str(""), value, ""),
+            Err(e) => Err(e),
+        };
+        self.json_shape_memo = core::mem::take(&mut cx.shape_keys);
+        Ok(wrote?.then_some(cx.out))
     }
 
     /// The `space` argument's ToPrimitive: a `[[NumberData]]` wrapper becomes
@@ -1041,7 +1044,7 @@ const JSON_SHAPE_MEMO: usize = 8;
 /// keys in `[[OwnPropertyKeys]]` order, each with its JSON-quoted form and its
 /// slot. Shape identity fixes the keys and slots, so the plan holds for any
 /// object that still has `shape` when a key is read.
-struct JsonShapeKeys {
+pub(super) struct JsonShapeKeys {
     shape: Rc<crate::shape::Shape>,
     /// `(key, "key" quoted, slot)`.
     keys: Vec<(String, String, u32)>,

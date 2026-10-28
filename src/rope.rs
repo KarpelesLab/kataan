@@ -12,8 +12,16 @@
 //! in O(n) with an explicit work stack, so even a deeply left-nested rope — the
 //! exact shape `s += x` in a loop produces — flattens without recursing.
 //!
-//! Pure, safe `alloc`-only Rust. (Small-string inlining is a later refinement;
-//! the tree already fixes the asymptotics that bite real code.)
+//! Pure, safe `alloc`-only Rust.
+//!
+//! # Small strings
+//!
+//! A flat string of at most [`SMALL_CAP`](crate::rope::SMALL_CAP) bytes is stored *inline* in its node
+//! (`Node::Small`) instead of in a separately allocated `Box<[u8]>`: the node
+//! is the size of a `Concat` anyway, so the bytes ride in space that would
+//! otherwise be padding, and creating such a string costs one allocation
+//! instead of two. Most strings a program makes (keys, numbers, words, single
+//! characters) are this short.
 //!
 //! # Storage: WTF-8 bytes
 //!
@@ -45,6 +53,14 @@ pub const MAX_STRING_LEN: usize = crate::limits::DEFAULT_MAX_STRING_LEN;
 pub struct Rope(Rc<Node>);
 
 enum Node {
+    /// A short contiguous run of WTF-8 bytes held inline: `buf[..len]`, with
+    /// its UTF-16 length memoized in `u16` on first use (`SMALL_U16_UNKNOWN`
+    /// until then).
+    Small {
+        len: u8,
+        u16: core::cell::Cell<u8>,
+        buf: [u8; SMALL_CAP],
+    },
     /// A contiguous run of WTF-8 bytes, with its UTF-16 length memoized on
     /// first use (see [`Rope::utf16_len`]).
     Leaf(Box<[u8]>, core::cell::Cell<usize>),
@@ -56,6 +72,43 @@ enum Node {
         len: usize,
         u16_len: core::cell::Cell<usize>,
     },
+}
+
+/// The longest flat string stored inline in its node (see the module docs).
+/// Chosen so that `Node::Small` (a tag, a length byte and the buffer) is no
+/// larger than `Node::Concat`, keeping every node the same size.
+pub const SMALL_CAP: usize = 37;
+
+/// `Node::Small`'s "UTF-16 length not computed yet" marker (a real one is at
+/// most [`SMALL_CAP`]).
+const SMALL_U16_UNKNOWN: u8 = u8::MAX;
+
+impl Node {
+    /// A flat node holding a copy of `bytes`: inline when short.
+    #[inline]
+    fn flat(bytes: &[u8]) -> Node {
+        if bytes.len() <= SMALL_CAP {
+            let mut buf = [0u8; SMALL_CAP];
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Node::Small {
+                len: bytes.len() as u8,
+                u16: core::cell::Cell::new(SMALL_U16_UNKNOWN),
+                buf,
+            }
+        } else {
+            Node::Leaf(Box::from(bytes), core::cell::Cell::new(U16_LEN_UNKNOWN))
+        }
+    }
+
+    /// The bytes of a flat node (`Small` or `Leaf`), or `None` for a `Concat`.
+    #[inline]
+    fn flat_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Node::Small { len, buf, .. } => Some(&buf[..usize::from(*len)]),
+            Node::Leaf(s, _) => Some(s),
+            Node::Concat { .. } => None,
+        }
+    }
 }
 
 /// Sentinel for "the UTF-16 length has not been computed yet". A real length is
@@ -77,10 +130,7 @@ impl Rope {
     /// WTF-8).
     #[must_use]
     pub fn leaf(s: &str) -> Self {
-        Rope(Rc::new(Node::Leaf(
-            Box::from(s.as_bytes()),
-            core::cell::Cell::new(U16_LEN_UNKNOWN),
-        )))
+        Rope(Rc::new(Node::flat(s.as_bytes())))
     }
 
     /// A leaf rope holding raw WTF-8 `bytes` — the surrogate-bearing path. The
@@ -88,6 +138,9 @@ impl Rope {
     /// [`crate::wtf8::from_utf16`] or another rope's `Rope::materialize_bytes`).
     #[must_use]
     pub fn from_wtf8(bytes: Vec<u8>) -> Self {
+        if bytes.len() <= SMALL_CAP {
+            return Rope(Rc::new(Node::flat(&bytes)));
+        }
         Rope(Rc::new(Node::Leaf(
             bytes.into_boxed_slice(),
             core::cell::Cell::new(U16_LEN_UNKNOWN),
@@ -97,16 +150,14 @@ impl Rope {
     /// A leaf rope copying raw WTF-8 `bytes`.
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        Rope(Rc::new(Node::Leaf(
-            Box::from(bytes),
-            core::cell::Cell::new(U16_LEN_UNKNOWN),
-        )))
+        Rope(Rc::new(Node::flat(bytes)))
     }
 
     /// The total length in bytes (O(1) — cached).
     #[must_use]
     pub fn len(&self) -> usize {
         match &*self.0 {
+            Node::Small { len, .. } => usize::from(*len),
             Node::Leaf(s, _) => s.len(),
             Node::Concat { len, .. } => *len,
         }
@@ -137,7 +188,28 @@ impl Rope {
     /// aborted several `RegExp/property-escapes` workers that way.
     #[must_use]
     pub fn utf16_len(&self) -> usize {
-        let cached = self.u16_len_cell().get();
+        let root_cell = match &*self.0 {
+            Node::Small { len, u16, buf } => {
+                let cached = u16.get();
+                if cached != SMALL_U16_UNKNOWN {
+                    return usize::from(cached);
+                }
+                let n = wtf8::utf16_len(&buf[..usize::from(*len)]);
+                u16.set(n as u8);
+                return n;
+            }
+            Node::Leaf(bytes, cell) => {
+                let cached = cell.get();
+                if cached != U16_LEN_UNKNOWN {
+                    return cached;
+                }
+                let n = wtf8::utf16_len(bytes);
+                cell.set(n);
+                return n;
+            }
+            Node::Concat { u16_len, .. } => u16_len,
+        };
+        let cached = root_cell.get();
         if cached != U16_LEN_UNKNOWN {
             return cached;
         }
@@ -146,12 +218,15 @@ impl Rope {
         while let Some(node) = stack.pop() {
             // An already-known subtree contributes its total without a descent,
             // so a repeated read over a growing rope stays cheap.
-            let known = node.u16_len_cell().get();
+            let known = node
+                .u16_len_cell()
+                .map_or(U16_LEN_UNKNOWN, core::cell::Cell::get);
             if known != U16_LEN_UNKNOWN {
                 total += known;
                 continue;
             }
             match &*node.0 {
+                Node::Small { len, buf, .. } => total += wtf8::utf16_len(&buf[..usize::from(*len)]),
                 Node::Leaf(bytes, cell) => {
                     let n = wtf8::utf16_len(bytes);
                     cell.set(n);
@@ -163,7 +238,7 @@ impl Rope {
                 }
             }
         }
-        self.u16_len_cell().set(total);
+        root_cell.set(total);
         total
     }
 
@@ -180,10 +255,12 @@ impl Rope {
         self.len() == self.utf16_len()
     }
 
-    /// The node's UTF-16 length cache slot (see [`Rope::utf16_len`]).
-    fn u16_len_cell(&self) -> &core::cell::Cell<usize> {
+    /// The node's UTF-16 length cache slot (see [`Rope::utf16_len`]); an
+    /// inline node has none (its length is recounted).
+    fn u16_len_cell(&self) -> Option<&core::cell::Cell<usize>> {
         match &*self.0 {
-            Node::Leaf(_, u16_len) | Node::Concat { u16_len, .. } => u16_len,
+            Node::Small { .. } => None,
+            Node::Leaf(_, u16_len) | Node::Concat { u16_len, .. } => Some(u16_len),
         }
     }
 
@@ -228,8 +305,18 @@ impl Rope {
         // leaf: copying a few bytes costs less than a `Concat` node that every
         // later read has to walk and that eventually has to be flattened anyway.
         if len <= SMALL_JOIN
-            && let (Node::Leaf(a, _), Node::Leaf(b, _)) = (&*self.0, &*other.0)
+            && let (Some(a), Some(b)) = (self.0.flat_bytes(), other.0.flat_bytes())
         {
+            if len <= SMALL_CAP {
+                let mut buf = [0u8; SMALL_CAP];
+                buf[..a.len()].copy_from_slice(a);
+                buf[a.len()..len].copy_from_slice(b);
+                return Some(Rope(Rc::new(Node::Small {
+                    len: len as u8,
+                    u16: core::cell::Cell::new(SMALL_U16_UNKNOWN),
+                    buf,
+                })));
+            }
             let mut bytes = Vec::with_capacity(len);
             bytes.extend_from_slice(a);
             bytes.extend_from_slice(b);
@@ -266,10 +353,15 @@ impl Rope {
     /// this returns `None`.
     #[must_use]
     pub fn as_leaf_bytes(&self) -> Option<&[u8]> {
-        match &*self.0 {
-            Node::Leaf(s, _) => Some(s),
-            Node::Concat { .. } => None,
-        }
+        self.0.flat_bytes()
+    }
+
+    /// Borrows the rope as a `&str` when it is a single flat leaf holding
+    /// well-formed UTF-8 (no lone surrogates) — the zero-copy counterpart of
+    /// [`Rope::materialize`] for the common case.
+    #[must_use]
+    pub fn as_leaf_str(&self) -> Option<&str> {
+        self.0.flat_bytes().and_then(wtf8::as_str)
     }
 
     /// The rightmost leaf's bytes (O(depth)) — used to peek the trailing code unit
@@ -279,8 +371,8 @@ impl Rope {
         let mut node = &self.0;
         loop {
             match &**node {
-                Node::Leaf(s, _) => return s,
                 Node::Concat { right, .. } => node = &right.0,
+                flat => return flat.flat_bytes().unwrap_or_default(),
             }
         }
     }
@@ -291,8 +383,8 @@ impl Rope {
         let mut node = &self.0;
         loop {
             match &**node {
-                Node::Leaf(s, _) => return s,
                 Node::Concat { left, .. } => node = &left.0,
+                flat => return flat.flat_bytes().unwrap_or_default(),
             }
         }
     }
@@ -313,20 +405,44 @@ impl Rope {
     /// `&str`/`String` use `Rope::materialize` (lossy).
     #[must_use]
     pub fn materialize_bytes(&self) -> Vec<u8> {
+        if let Some(b) = self.0.flat_bytes() {
+            return b.to_vec();
+        }
         let mut out = Vec::with_capacity(self.len());
         // Depth-first, left-to-right, using an explicit stack of pending nodes.
         let mut stack: Vec<&Rope> = alloc::vec![self];
         while let Some(node) = stack.pop() {
             match &*node.0 {
-                Node::Leaf(s, _) => out.extend_from_slice(s),
                 Node::Concat { left, right, .. } => {
                     // Push right first so left is processed first (LIFO).
                     stack.push(right);
                     stack.push(left);
                 }
+                flat => out.extend_from_slice(flat.flat_bytes().unwrap_or_default()),
             }
         }
         out
+    }
+
+    /// Appends the rope's WTF-8 bytes (lossless) to `out`, iteratively — the
+    /// in-place form of [`Rope::materialize_bytes`] for a caller assembling a
+    /// larger buffer, so no intermediate `Vec` is made.
+    pub fn append_bytes_to(&self, out: &mut Vec<u8>) {
+        if let Some(b) = self.0.flat_bytes() {
+            out.extend_from_slice(b);
+            return;
+        }
+        out.reserve(self.len());
+        let mut stack: Vec<&Rope> = alloc::vec![self];
+        while let Some(node) = stack.pop() {
+            match &*node.0 {
+                Node::Concat { left, right, .. } => {
+                    stack.push(right);
+                    stack.push(left);
+                }
+                flat => out.extend_from_slice(flat.flat_bytes().unwrap_or_default()),
+            }
+        }
     }
 
     /// Materializes the rope into a flat `String` in O(n). **Lossy**: any stored
@@ -336,7 +452,15 @@ impl Rope {
     /// lossless WTF-8 bytes.
     #[must_use]
     pub fn materialize(&self) -> String {
-        wtf8::to_string_lossy(&self.materialize_bytes())
+        if let Some(b) = self.0.flat_bytes() {
+            return wtf8::to_string_lossy(b);
+        }
+        // Flattened bytes without surrogates are already UTF-8: reuse the
+        // buffer rather than copying it into a second one.
+        match String::from_utf8(self.materialize_bytes()) {
+            Ok(s) => s,
+            Err(e) => wtf8::to_string_lossy(e.as_bytes()),
+        }
     }
 }
 
@@ -362,7 +486,11 @@ impl Drop for Node {
         // A cheap leaf to swap into a child slot so we can take ownership of the
         // real `Rc<Node>` without recursing through its `Drop`. One is shared by
         // every slot (each swap is a refcount increment, not an allocation).
-        let empty = Rc::new(Node::Leaf(Box::from(&[][..]), core::cell::Cell::new(0)));
+        let empty = Rc::new(Node::Small {
+            len: 0,
+            u16: core::cell::Cell::new(0),
+            buf: [0; SMALL_CAP],
+        });
         let sentinel = || Rc::clone(&empty);
         let mut stack = alloc::vec![
             core::mem::replace(&mut left.0, sentinel()),
@@ -402,13 +530,16 @@ impl core::fmt::Display for Rope {
         let mut stack: Vec<&Rope> = alloc::vec![self];
         while let Some(node) = stack.pop() {
             match &*node.0 {
-                Node::Leaf(s, _) => match wtf8::as_str(s) {
-                    Some(valid) => f.write_str(valid)?,
-                    None => f.write_str(&wtf8::to_string_lossy(s))?,
-                },
                 Node::Concat { left, right, .. } => {
                     stack.push(right);
                     stack.push(left);
+                }
+                flat => {
+                    let s = flat.flat_bytes().unwrap_or_default();
+                    match wtf8::as_str(s) {
+                        Some(valid) => f.write_str(valid)?,
+                        None => f.write_str(&wtf8::to_string_lossy(s))?,
+                    }
                 }
             }
         }
@@ -570,6 +701,30 @@ mod tests {
             joined.materialize_bytes(),
             alloc::format!("{a}{b}").as_bytes()
         );
+    }
+
+    #[test]
+    fn small_strings_are_inline_and_nodes_stay_compact() {
+        assert!(core::mem::size_of::<Node>() <= 40);
+        for n in [0, 1, SMALL_CAP - 1, SMALL_CAP, SMALL_CAP + 1, 100] {
+            let s = "x".repeat(n);
+            let r = Rope::leaf(&s);
+            assert_eq!(matches!(*r.0, Node::Small { .. }), n <= SMALL_CAP);
+            assert_eq!(r.len(), n);
+            assert_eq!(r.utf16_len(), n);
+            assert_eq!(r.as_leaf_str(), Some(s.as_str()));
+            assert_eq!(r.materialize(), s);
+            let rr = r.concat(&Rope::leaf("\u{e9}"));
+            assert_eq!(rr.materialize(), alloc::format!("{s}\u{e9}"));
+            assert_eq!(rr.utf16_len(), n + 1);
+        }
+        // A deep rope over inline leaves.
+        let mut r = Rope::leaf("");
+        for _ in 0..1000 {
+            r = r.concat(&Rope::leaf(&"y".repeat(70)));
+        }
+        assert_eq!(r.utf16_len(), 70_000);
+        assert_eq!(r.materialize().len(), 70_000);
     }
 
     #[test]

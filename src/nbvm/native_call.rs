@@ -730,7 +730,8 @@ pub(super) fn try_call(
                 str_arg(realm, sep_v)?.as_leaf_bytes()?.to_vec()
             };
             let elems: alloc::vec::Vec<NanBox> = dense_elements(realm, h)?.to_vec();
-            let mut out = alloc::vec::Vec::new();
+            // Sized for short elements, so a typical join grows at most once.
+            let mut out = alloc::vec::Vec::with_capacity(elems.len() * (sep.len() + 3));
             for (i, e) in elems.into_iter().enumerate() {
                 if i > 0 {
                     crate::wtf8::append(&mut out, &sep);
@@ -741,7 +742,7 @@ pub(super) fn try_call(
                     Unpacked::Undefined | Unpacked::Null => {}
                     Unpacked::Bool(b) => out.extend_from_slice(if b { b"true" } else { b"false" }),
                     Unpacked::Number(n) => {
-                        out.extend_from_slice(crate::realm::js_number_string(n).as_bytes());
+                        crate::realm::builtins_fast::push_number_bytes(&mut out, n);
                     }
                     Unpacked::Handle(_) => {
                         let part = str_arg(realm, e)?;
@@ -847,14 +848,14 @@ pub(super) fn try_call(
         }
         FastOp::ObjKeys | FastOp::ObjEntries => {
             let o = arg(0).as_handle().map(Handle::from_raw)?;
-            let keys = realm.plain_enumerable_keys(o)?;
+            let keys = realm.plain_enumerable_key_ropes(o)?;
             let mut out = alloc::vec::Vec::with_capacity(keys.len());
-            for k in keys {
-                let kv = NanBox::handle(realm.new_string(&k).to_raw());
+            for k in keys.iter() {
+                let kv = NanBox::handle(realm.new_string_from_rope(k.clone()).to_raw());
                 out.push(if site.op == FastOp::ObjKeys {
                     kv
                 } else {
-                    let v = realm.get_property(o, &k)?;
+                    let v = realm.get_property(o, k.as_leaf_str()?)?;
                     NanBox::handle(realm.new_array(alloc::vec![kv, v]).to_raw())
                 });
             }

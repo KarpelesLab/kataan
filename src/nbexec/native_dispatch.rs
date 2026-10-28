@@ -804,7 +804,7 @@ impl Interp {
                 let value = arg(0);
                 let result = self.json_stringify(value, arg(1), arg(2))?;
                 match result {
-                    Some(s) => NanBox::handle(self.realm.new_string(&s).to_raw()),
+                    Some(s) => NanBox::handle(self.realm.new_string_wtf8(s.into_bytes()).to_raw()),
                     None => NanBox::undefined(),
                 }
             }

@@ -77,6 +77,10 @@ pub fn typed_elem_size(kind: u8) -> usize {
     TYPED_ELEM_SIZE.get(kind as usize).copied().unwrap_or(1)
 }
 
+/// A shape and the key strings `Object.keys` lists for it (see
+/// `builtins_fast::plain_enumerable_key_ropes`).
+type ShapeKeyRopes = (Rc<crate::shape::Shape>, Rc<[Rope]>);
+
 /// An object-model context: the heap, the shared root shape, and the atom table.
 pub struct Realm {
     heap: Heap<Cell>,
@@ -189,6 +193,9 @@ pub struct Realm {
     /// The shared ropes of the small integers' strings (see
     /// `builtins_fast::number_rope`), filled on first use.
     number_ropes: core::cell::RefCell<alloc::vec::Vec<Option<Rope>>>,
+    /// The key strings of the last plain-keyed shape `Object.keys` listed
+    /// (see `builtins_fast::plain_enumerable_key_ropes`).
+    key_ropes: core::cell::RefCell<Option<ShapeKeyRopes>>,
     /// Shared prototype-chain lookup memos (see
     /// `builtins_fast::shared_chain_lookup`), one per fixed lookup site.
     chain_lookups: core::cell::RefCell<alloc::vec::Vec<builtins_fast::ChainKeyCache>>,
@@ -622,6 +629,7 @@ impl Realm {
             #[cfg(feature = "regex")]
             regex_programs: core::cell::RefCell::new(alloc::vec::Vec::new()),
             number_ropes: core::cell::RefCell::new(alloc::vec::Vec::new()),
+            key_ropes: core::cell::RefCell::new(None),
             chain_lookups: core::cell::RefCell::new(alloc::vec::Vec::new()),
             sparse_array_lengths: alloc::collections::BTreeMap::new(),
             default_object_proto: None,
@@ -1203,6 +1211,11 @@ impl Realm {
         self.heap.alloc(Cell::Str(Rope::from(s)))
     }
 
+    /// Allocates a string value sharing `rope` (an `Rc` bump, no copy).
+    pub fn new_string_from_rope(&mut self, rope: Rope) -> Handle {
+        self.heap.alloc(Cell::Str(rope))
+    }
+
     /// Allocates a string value from raw **WTF-8 bytes**, preserving any lone
     /// UTF-16 surrogates (DOMString semantics — see [`crate::wtf8`]). The common
     /// case (no surrogates) is byte-identical to [`Realm::new_string`].
@@ -1216,6 +1229,18 @@ impl Realm {
     #[must_use]
     pub fn string_bytes(&self, handle: Handle) -> Option<alloc::vec::Vec<u8>> {
         Some(self.heap.get(handle)?.as_str()?.materialize_bytes())
+    }
+
+    /// Appends the WTF-8 bytes (lossless) of the string at `handle` to `out`;
+    /// `false` (nothing written) if it is not a string.
+    pub fn append_string_bytes(&self, handle: Handle, out: &mut alloc::vec::Vec<u8>) -> bool {
+        match self.heap.get(handle).and_then(Cell::as_str) {
+            Some(r) => {
+                r.append_bytes_to(out);
+                true
+            }
+            None => false,
+        }
     }
 
     /// The string at `handle` as a [`Rope`] handle — an `Rc` bump, not a copy.

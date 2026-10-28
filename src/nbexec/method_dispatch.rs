@@ -3966,26 +3966,39 @@ impl Interp {
                     // `[[Get]]` (spec `Get(O, ToString(k))`): a hole resolves through
                     // the prototype chain (an inherited value or getter), rather than
                     // rendering empty. `sep` was already ToString'd above (spec order).
-                    let mut parts: Vec<String> = Vec::with_capacity(elems.len());
+                    // The result is assembled in one WTF-8 buffer: a number's
+                    // digits and a string's bytes (lone surrogates intact) are
+                    // appended in place, with no per-element `String`.
+                    let mut out: Vec<u8> = Vec::new();
                     for (k, dense) in elems.iter().enumerate() {
+                        if k > 0 {
+                            out.extend_from_slice(sep.as_bytes());
+                        }
                         let e = if precise_array {
                             self.read_member(handle, &alloc::format!("{k}"))?
                         } else {
                             *dense
                         };
-                        let s = match e.unpack() {
-                            Unpacked::Null | Unpacked::Undefined => String::new(),
+                        match e.unpack() {
+                            Unpacked::Null | Unpacked::Undefined => {}
                             // A direct self-reference back to the receiver renders
                             // empty (per `Array.prototype.join`), without recursing.
-                            Unpacked::Handle(raw) if raw == handle.to_raw() => String::new(),
+                            Unpacked::Handle(raw) if raw == handle.to_raw() => {}
+                            Unpacked::Number(n) => {
+                                crate::realm::builtins_fast::push_number_bytes(&mut out, n);
+                            }
+                            Unpacked::Handle(raw)
+                                if self.realm.typeof_is_string(Handle::from_raw(raw))
+                                    && self
+                                        .realm
+                                        .append_string_bytes(Handle::from_raw(raw), &mut out) => {}
                             // `ToString(element)` — a Symbol element has no string
                             // conversion and throws a TypeError (the raw display
                             // string would render `Symbol(x)` instead).
-                            _ => self.coerce_to_string(e)?,
-                        };
-                        parts.push(s);
+                            _ => out.extend_from_slice(self.coerce_to_string(e)?.as_bytes()),
+                        }
                     }
-                    return Ok(Some(self.new_str(&parts.join(&sep))));
+                    return Ok(Some(self.new_str_bytes(out)));
                 }
                 // Spec `Array.prototype.toLocaleString` / `%TypedArray%.prototype.
                 // toLocaleString`: join with "," after invoking each element's own

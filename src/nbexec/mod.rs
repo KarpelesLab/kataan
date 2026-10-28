@@ -245,6 +245,10 @@ pub struct Interp {
     /// (read its own `length`/indexed properties) rather than unwrapped to its
     /// boxed primitive and dispatched as a String/Number/Boolean method.
     array_proto_generic: bool,
+    /// `JSON.stringify`'s per-shape key plans, kept from one call to the next
+    /// (a plan depends on the shape alone), so serializing many objects built
+    /// alike, one call each, plans each shape once.
+    json_shape_memo: Vec<alloc::rc::Rc<json::JsonShapeKeys>>,
     /// When a *generic* array-like receiver is materialized for an iteration
     /// method (`map`/`filter`/`forEach`/`reduce`/…), this records which indices
     /// were actually *present* (`HasProperty`) on the source object, so those
@@ -2832,6 +2836,7 @@ impl Interp {
             new_target: NanBox::undefined(),
             reflect_new_target: None,
             array_proto_generic: false,
+            json_shape_memo: Vec::new(),
             array_like_present: None,
             wasm_states: alloc::collections::BTreeMap::new(),
             wasm_modules: alloc::collections::BTreeMap::new(),
