@@ -1005,22 +1005,22 @@ neverSettles }}` parks forever.
 original (clean-room) programs, takes best-of-3 wall clock, and checks each
 program's output against node's. Ratios are kataan/node; lower is better.
 
-| benchmark | start of campaign (42796a5) | 8ca64fb | c616086 |
-| --- | ---: | ---: | ---: |
-| fib | 19x | 4.5x | 1.6x |
-| sort | 20x | 5.0x | 1.8x |
-| json | 11x | 3.5x | 2.0x |
-| array_ops | 44x | 7.6x | 2.6x |
-| loop_arith | 372x | 25.6x | 3.2x |
-| richards_like | (quadratic, fixed) | 9.4x | 4.0x |
-| string_build | 14x | 7.4x | 4.1x |
-| map_set | 400x | 6.6x | 4.6x |
-| regex | 18x | 11.5x | 5.1x |
-| prop_access | 101x | 9.4x | 7.0x |
-| method_calls | 80x | 21.6x | 8.9x |
-| closures | 69x | 16.9x | 12.4x |
-| objects_alloc | 265x | 16.2x | 13.8x |
-| nbody_like | 205x | 28.9x | 21.7x |
+| benchmark | start of campaign (42796a5) | 8ca64fb | c616086 | 9dc93cb |
+| --- | ---: | ---: | ---: | ---: |
+| fib | 19x | 4.5x | 1.6x | 1.4x |
+| sort | 20x | 5.0x | 1.8x | 1.7x |
+| json | 11x | 3.5x | 2.0x | 1.9x |
+| array_ops | 44x | 7.6x | 2.6x | 2.6x |
+| loop_arith | 372x | 25.6x | 3.2x | 0.9x |
+| richards_like | (quadratic, fixed) | 9.4x | 4.0x | 3.2x |
+| string_build | 14x | 7.4x | 4.1x | 3.1x |
+| map_set | 400x | 6.6x | 4.6x | 3.2x |
+| regex | 18x | 11.5x | 5.1x | 5.1x |
+| prop_access | 101x | 9.4x | 7.0x | 5.3x |
+| method_calls | 80x | 21.6x | 8.9x | 4.7x |
+| closures | 69x | 16.9x | 12.4x | 3.9x |
+| objects_alloc | 265x | 16.2x | 13.8x | 7.9x |
+| nbody_like | 205x | 28.9x | 21.7x | 15.2x |
 
 The main contributors, by landing order:
 - number fast paths;
@@ -1038,7 +1038,16 @@ The main contributors, by landing order:
 - per-site direct calls to built-in methods;
 - the array higher-order built-ins' loops run in the VM;
 - JSON shape plans and a byte-level parser;
-- unmaterialized regex matches.
+- unmaterialized regex matches;
+- since c616086: method calls follow [[Get]] (by-name dispatch removed);
+- inline property slots and compiled object-literal and `this.x` adds;
+- an array side-state flag;
+- loop variables kept out of closure cells;
+- int32 speculation with wrapping expression trees;
+- global bindings in registers in promoted loops;
+- typed-array index fast paths.
+
+loop_arith now runs faster than node (0.9x).
 
 Startup is 3 ms against node's ~15 ms.
 
