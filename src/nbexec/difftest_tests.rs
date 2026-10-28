@@ -236,3 +236,24 @@ fn delete_global_object_property_drops_binding() {
         "true,true,undefined,ReferenceError,ReferenceError,false,false,1"
     );
 }
+
+/// A bare assignment to a name the global object holds as an own accessor
+/// runs its setter, in sloppy code and in a function, rather than dropping
+/// the write (a script with a function declaration took that path).
+#[test]
+fn sloppy_write_to_global_accessor_calls_setter() {
+    let src = r#"
+        var log = [];
+        Object.defineProperty(globalThis, "acc", {
+            set(v) { log.push("set" + v); }, get() { log.push("get"); return 42; },
+            configurable: true });
+        acc = 3;
+        function wr() { acc = 4; }
+        wr();
+        Object.defineProperty(globalThis, "ro", { get() { return 1; }, configurable: true });
+        var t = (function () { "use strict"; try { ro = 2; return "no"; } catch (e) { return e.name; } })();
+        ro = 3;
+        [log.join(), acc, t, ro].join("|")
+    "#;
+    assert_eq!(run(src), "set3,set4|42|TypeError|1");
+}

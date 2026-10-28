@@ -885,6 +885,14 @@ impl Interp {
                 && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
                 && self.realm.has_own(g, name)
             {
+                // An own *accessor* (`Object.defineProperty(globalThis, n, {set})`)
+                // is written through `[[Set]]`: its setter runs (strict mode with
+                // no setter throws) rather than the write being dropped.
+                if self.realm.accessor(g, name).is_some() {
+                    let key = self.new_str(name);
+                    self.assign_member_value(g, key, value)?;
+                    return Ok(());
+                }
                 // …but a *non-writable* one (`NaN`, `Infinity`, `undefined`)
                 // rejects the write. `PutValue` on a strict reference whose
                 // `[[Set]]` returns false is a TypeError; sloppy code silently
