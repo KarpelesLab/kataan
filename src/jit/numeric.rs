@@ -326,6 +326,7 @@ pub(super) struct NumEnv {
     pub(super) exec_op: u64,
     pub(super) backedge: u64,
     pub(super) global_ref: u64,
+    pub(super) math1: u64,
 }
 
 /// Out-of-line slow paths, emitted after the body ([`NumGen::finish`]).
@@ -881,6 +882,60 @@ impl NumGen {
                 a.bind(resume);
                 self.stub(stub, resume, reg, StubKind::GlobalRef { pc, retry });
             }
+            GenericOp::Interp { .. }
+                if reg.is_none()
+                    && matches!(
+                        bc,
+                        Op::LoadGlobal { .. } | Op::RequireObjectCoercible { .. }
+                    ) =>
+            {
+                let op_ptr = self.env.bytecode.wrapping_add(pc) as i64;
+                let slow = a.new_label();
+                let done = a.new_label();
+                match *bc {
+                    Op::LoadGlobal { dst, .. } => {
+                        if (dst as usize) >= self.env.n_regs {
+                            return None;
+                        }
+                        // A plain binding: read it in place (no one-op
+                        // interpreter frame).
+                        a.mov_rdi_r15();
+                        a.movabs_argreg(1, op_ptr);
+                        a.movabs_rax(self.env.global_ref as i64);
+                        a.call_rax();
+                        a.test_rax_rax();
+                        a.jcc(CC_E, slow);
+                        a.raw(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
+                        a.store_rax(disp(dst));
+                    }
+                    Op::RequireObjectCoercible { src } => {
+                        if (src as usize) >= self.env.n_regs {
+                            return None;
+                        }
+                        // Only `undefined` / `null` throw.
+                        a.load_rax(disp(src));
+                        a.movabs_r11(NanBox::undefined().to_bits() as i64);
+                        a.cmp_rax_r11();
+                        a.jcc(CC_E, slow);
+                        a.movabs_r11(NanBox::null().to_bits() as i64);
+                        a.cmp_rax_r11();
+                        a.jcc(CC_E, slow);
+                    }
+                    _ => return None,
+                }
+                a.jmp(done);
+                a.bind(slow);
+                a.mov_rdi_r15();
+                a.mov_rsi_rbx();
+                a.movabs_argreg(2, self.env.n_regs as i64);
+                a.movabs_argreg(3, op_ptr);
+                a.movabs_rax(self.env.exec_op as i64);
+                a.call_rax();
+                a.movabs_r11(NanBox::jit_throw_bits() as i64);
+                a.cmp_rax_r11();
+                a.je(throw_exit);
+                a.bind(done);
+            }
             GenericOp::Interp { pc: opc } if matches!(bc, Op::Neg { .. } | Op::BitNot { .. }) => {
                 let (dst, src, neg) = match *bc {
                     Op::Neg { dst, a } => (dst, a, true),
@@ -966,6 +1021,61 @@ impl NumGen {
             }
         }
         Some(true)
+    }
+
+    /// Before the general `CallMethod` code of op `pc`: when it is a
+    /// one-argument call of a `Math` function name, ask `jit_helper_math1`
+    /// (the built-in still installed, a Number argument) for the result and
+    /// jump to `done` with it stored; on a miss fall through to the general
+    /// call. Emits nothing for any other call.
+    pub(super) fn math_call(&self, a: &mut X64Assembler, pc: usize, done: Label) {
+        let Some(Op::CallMethod {
+            dst,
+            recv,
+            key,
+            args,
+        }) = self.bc(pc)
+        else {
+            return;
+        };
+        let n = self.env.n_regs;
+        if args.len() != 1
+            || (*dst as usize) >= n
+            || (*recv as usize) >= n
+            || (args[0] as usize) >= n
+            || !matches!(
+                key.as_str(),
+                "sqrt"
+                    | "abs"
+                    | "floor"
+                    | "ceil"
+                    | "trunc"
+                    | "round"
+                    | "sign"
+                    | "exp"
+                    | "log"
+                    | "sin"
+                    | "cos"
+                    | "tan"
+                    | "atan"
+                    | "cbrt"
+            )
+        {
+            return;
+        }
+        let miss = a.new_label();
+        a.mov_rdi_r15();
+        a.load_argreg(1, disp(*recv));
+        a.load_argreg(2, disp(args[0]));
+        a.movabs_argreg(3, self.env.bytecode.wrapping_add(pc) as i64);
+        a.movabs_rax(self.env.math1 as i64);
+        a.call_rax();
+        a.movabs_r11(NanBox::jit_throw_bits() as i64);
+        a.cmp_rax_r11();
+        a.jcc(CC_E, miss);
+        a.store_rax(disp(*dst));
+        a.jmp(done);
+        a.bind(miss);
     }
 
     fn bc(&self, pc: usize) -> Option<&Op> {

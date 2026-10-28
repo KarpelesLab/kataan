@@ -2664,6 +2664,9 @@ pub struct GenericHelpers {
     /// `jit_helper_global_ref(ctx, op) -> *mut NanBox | 0`: validates a global
     /// binding for direct access from a compiled loop (`numeric`).
     pub global_ref: JitTruthyHelper,
+    /// `jit_helper_math1(ctx, recv, x, op) -> bits | throw sentinel`: a
+    /// one-argument built-in `Math.f(x)` call (`numeric`).
+    pub math1: JitBinHelper,
 }
 
 /// The runtime-helper ABI for a method call: `(ctx, regs, n_regs, op, cache) ->
@@ -5045,6 +5048,7 @@ impl JitFunction {
                 exec_op: exec_op_helper,
                 backedge: backedge_helper,
                 global_ref: helpers.global_ref as usize as u64,
+                math1: helpers.math1 as usize as u64,
             },
             osr_entries,
             &catch_targets,
@@ -5247,6 +5251,8 @@ impl JitFunction {
                     let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
                     let si = sites.get(site as usize)?;
                     let done = a.new_label();
+                    // `Math.f(x)` with the built-in `f` is computed directly.
+                    num.math_call(&mut a, op_idx, done);
                     // The native call sequence, when the site has one.
                     let native = call_args
                         .get(args as usize)

@@ -12884,3 +12884,30 @@ fn hot_loops_over_global_bindings() {
         "-129842144|500|5000.25|1000|50001|14007|TypeErrorReferenceError"
     );
 }
+
+/// Compiled `Math.f(x)` calls answer from the built-in only while it is
+/// installed (a replacement, a getter or another receiver take the general
+/// call; a non-Number argument runs its `valueOf`), and compiled global reads
+/// and `RequireObjectCoercible` outside loops behave as the interpreter's.
+#[test]
+fn compiled_math_calls_and_global_reads() {
+    let src = r#"
+        let calls = 0;
+        const o = { valueOf() { calls++; return 2.25; } };
+        function f(m, v) { return m.sqrt(v) + Math.floor(v); }
+        let t = 0;
+        for (let i = 0; i < 3000; i++) {
+            if (i === 2000) Math.sqrt = (x) => -x;
+            t += f(i % 7 ? Math : { sqrt: (x) => x * 10 }, i % 2 ? o : 16);
+        }
+        function g(p) { return p.k; }
+        let errs = 0;
+        for (let i = 0; i < 1000; i++) { try { g(i % 10 ? { k: 1 } : null); } catch (e) { errs++; } }
+        var gv = 5;
+        function h() { return gv * 2; }
+        let s = 0;
+        for (let i = 0; i < 1000; i++) { s += h(); if (i === 500) gv = 0.5; }
+        [t, calls, errs, s].join("|")
+    "#;
+    assert_eq!(run(src), "63115.25|3000|100|5509");
+}

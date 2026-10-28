@@ -5763,6 +5763,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         call_layout: jit_tier::call_layout(),
         unwind: jit_tier::jit_helper_unwind,
         global_ref: jit_tier::jit_helper_global_ref,
+        math1: jit_tier::jit_helper_math1,
     }
 }
 

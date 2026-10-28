@@ -473,6 +473,41 @@ pub(crate) extern "C" fn jit_helper_global_ref(ctx: *mut core::ffi::c_void, op: 
     p.map_or(0, |p| p as usize as u64)
 }
 
+/// `Math.f(x)` for an `Op::CallMethod` of one argument at `op`: the result
+/// bits when `recv`'s own `key` is still the built-in `Math` function and `x` a
+/// Number (`math_fast::call`, the interpreter's own shortcut: then the call has
+/// no other effect), else the throw sentinel, on which the compiled code runs
+/// the op through the interpreter instead (nothing has happened yet).
+///
+/// # Safety
+/// `ctx` must be the live `Ctx` the compiled body was entered with and `op` a
+/// pointer into the bytecode the calling `JitProto` owns.
+pub(crate) extern "C" fn jit_helper_math1(
+    ctx: *mut core::ffi::c_void,
+    recv: u64,
+    x: u64,
+    op: u64,
+) -> u64 {
+    // SAFETY: see the function contract — a live, otherwise-unborrowed `Ctx`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    // SAFETY: `op` points into the `JitProto`'s owned bytecode, alive while its
+    // code runs.
+    #[allow(unsafe_code)]
+    let op = unsafe { &*(op as usize as *const Op) };
+    let Op::CallMethod { key, .. } = op else {
+        return NanBox::jit_throw_bits();
+    };
+    super::math_fast::call(
+        &ctx.realm,
+        NanBox::from_bits(recv),
+        key,
+        &[0],
+        &[NanBox::from_bits(x)],
+    )
+    .map_or(NanBox::jit_throw_bits(), NanBox::to_bits)
+}
+
 /// The generic-tier helper that runs one bytecode op — any op without a native
 /// lowering — through the interpreter itself, on the body's register file. The
 /// op is run as a one-op program, which is exact for every op the tier accepts:
