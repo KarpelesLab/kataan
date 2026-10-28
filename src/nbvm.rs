@@ -1718,7 +1718,13 @@ fn vm_set_prop_mode(
                 ctx.realm.chain_cached_get(h, key, cache),
                 Some(crate::realm::ChainHit::Absent)
             ) {
-                ctx.realm.set_property(h, key, value);
+                // A fresh writable/enumerable/configurable data property is
+                // the same whether made by [[Set]] or CreateDataProperty, so
+                // the add can go through the site's transition cache (which
+                // declines anything but a plain add, e.g. an internal key).
+                if !ctx.realm.init_data_property_cached(h, key, value, cache) {
+                    ctx.realm.set_property(h, key, value);
+                }
                 return Ok(());
             }
             ctx.realm.chain_cache_fill(h, key, cache);

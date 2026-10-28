@@ -1040,6 +1040,18 @@ impl Realm {
         Some(self.heap.get(handle)?.as_str()?.utf16_len())
     }
 
+    /// [`string_utf16_len`](Self::string_utf16_len) of a string cell that has
+    /// no auxiliary property object (a plain string primitive); `None` for
+    /// anything else.
+    #[must_use]
+    pub fn plain_string_utf16_len(&self, handle: Handle) -> Option<usize> {
+        let s = self.heap.get(handle)?.as_str()?;
+        if self.aux_props.contains_key(&handle.to_raw()) {
+            return None;
+        }
+        Some(s.utf16_len())
+    }
+
     /// Flattens a `Concat` rope at `handle` into a single leaf, in place.
     ///
     /// A rope makes concatenation O(1) but every *read* of a `Concat` has to
@@ -4065,6 +4077,83 @@ impl Realm {
             }));
             return;
         }
+    }
+
+    /// The ordinary `[[Get]]` lookup of `key` from the object at `handle`,
+    /// answered only while every object on the chain is one whose `[[Get]]` is
+    /// exactly OrdinaryGet over its own data slots and accessors: a shaped or
+    /// dictionary [`Cell::Object`] that is neither host-exotic nor a primitive
+    /// wrapper (the same objects the VM's prototype-chain cache accepts). On
+    /// such a chain the result is the first object's accessor for `key`, else
+    /// its data property, else (past the end) absence. `None` means the walk met
+    /// anything else (or ran unusually deep): take the general path. The
+    /// receiver itself may also be a RegExp, or an Array for a key that is
+    /// neither `length` nor numeric-looking: their own properties are then
+    /// those of their auxiliary object (plus a RegExp's `lastIndex`).
+    ///
+    /// The `bool` of a hit says whether the receiver itself holds it.
+    #[must_use]
+    pub fn ordinary_chain_get(&self, handle: Handle, key: &str) -> Option<(ChainHit, bool)> {
+        let named = key != "length" && !key.as_bytes().first().is_some_and(u8::is_ascii_digit);
+        let mut cur = handle;
+        for depth in 0..64 {
+            let own = depth == 0;
+            if self.is_host_exotic(cur) {
+                return None;
+            }
+            match self.heap.get(cur)? {
+                Cell::Object(o) => {
+                    if o.contains("\u{0}prim") {
+                        return None;
+                    }
+                    if !o.has_no_accessors()
+                        && let Some((g, s)) = o.accessor(key)
+                    {
+                        return Some((ChainHit::Accessor(g, s, own), own));
+                    }
+                    if let Some(v) = o.get(key) {
+                        return Some((ChainHit::Data(v), own));
+                    }
+                    match o.proto() {
+                        Some(p) => cur = p,
+                        None => return Some((ChainHit::Absent, false)),
+                    }
+                }
+                // A RegExp's or an Array's own *named* properties are those of
+                // its auxiliary object (a receiver RegExp's `lastIndex` aside;
+                // an Array's `length` and indices are left to the general
+                // path), and its `[[Prototype]]` is `object_proto`'s.
+                cell @ (Cell::RegExp { .. } | Cell::Array(_)) => {
+                    if matches!(cell, Cell::Array(_)) && !named {
+                        return None;
+                    }
+                    if let Some(aux) = self.aux_props.get(&cur.to_raw()) {
+                        let o = self.heap.get(*aux)?.as_object()?;
+                        if let Some((g, s)) = o.accessor(key) {
+                            return Some((ChainHit::Accessor(g, s, own), own));
+                        }
+                        if let Some(v) = o.get(key) {
+                            return Some((ChainHit::Data(v), own));
+                        }
+                    }
+                    // `lastIndex` is an own data property of every RegExp, kept
+                    // in the cell unless a definition moved it to the auxiliary
+                    // object. (Only the receiver's: deeper in the chain the
+                    // general path reads the auxiliary slot alone.)
+                    if let Cell::RegExp { last_index, .. } = cell
+                        && key == "lastIndex"
+                    {
+                        if !own {
+                            return None;
+                        }
+                        return Some((ChainHit::Data(NanBox::number(*last_index as f64)), true));
+                    }
+                    cur = self.object_proto(cur)?;
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// The `length` of the [`Cell::Array`] at `handle` (see

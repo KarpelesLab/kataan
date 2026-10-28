@@ -1413,6 +1413,9 @@ impl Interp {
         handle: crate::heap::Handle,
         name: &str,
     ) -> Result<NanBox, ExecError> {
+        if let Some(r) = self.read_member_ordinary(handle, name) {
+            return r;
+        }
         // A Deferred Module Namespace (`import defer`) evaluates its target the
         // first time one of its exports is read — directly or as a prototype /
         // `super` home object (import-defer proposal).
@@ -2120,6 +2123,90 @@ impl Interp {
             return Ok(m);
         }
         Ok(direct)
+    }
+
+    /// [`read_member`](Self::read_member) for the common case where it is
+    /// plain OrdinaryGet: the receiver and its whole prototype chain are
+    /// ordinary objects (see [`crate::realm::Realm::ordinary_chain_get`]), the
+    /// receiver is no namespace or mapped `arguments` object, no deferred
+    /// namespace exists, and `name` is none of the keys `read_member`
+    /// special-cases for such objects (the error-`constructor` fallback,
+    /// `__proto__`, the legacy `caller`/`arguments`, the branded
+    /// ArrayBuffer/DataView/TypedArray accessors, and a bound function's
+    /// synthesized `name`/`length`, which are therefore only taken here as an
+    /// own data property). Every other special case of `read_member` is keyed
+    /// on a cell kind other than an ordinary object, so on this chain the
+    /// general walk reduces to exactly the lookup done here. `None` means "take
+    /// the general path".
+    #[inline]
+    fn read_member_ordinary(
+        &mut self,
+        handle: Handle,
+        name: &str,
+    ) -> Option<Result<NanBox, ExecError>> {
+        // A primitive string's `length` (String exotic own property): its
+        // UTF-16 length. An auxiliary object would make the cell something
+        // else (a function marker, own properties), so only a bare one.
+        if name == "length"
+            && let Some(n) = self.realm.plain_string_utf16_len(handle)
+        {
+            return Some(Ok(NanBox::number(n as f64)));
+        }
+        if matches!(
+            name,
+            "constructor"
+                | "__proto__"
+                | "caller"
+                | "arguments"
+                | "byteLength"
+                | "byteOffset"
+                | "buffer"
+                | "detached"
+                | "maxByteLength"
+                | "resizable"
+                | "BYTES_PER_ELEMENT"
+        ) {
+            return None;
+        }
+        #[cfg(all(feature = "module", feature = "std"))]
+        if !self.deferred_namespaces.is_empty()
+            || self.module_namespaces.contains_key(&handle.to_raw())
+        {
+            return None;
+        }
+        if !self.arg_maps.is_empty() && self.arg_maps.contains_key(&handle.to_raw()) {
+            return None;
+        }
+        let (hit, own) = self.realm.ordinary_chain_get(handle, name)?;
+        Some(match hit {
+            crate::realm::ChainHit::Data(v) => {
+                if !own && matches!(name, "name" | "length") {
+                    return None;
+                }
+                Ok(v)
+            }
+            crate::realm::ChainHit::Accessor(getter, _, _) => {
+                if matches!(getter.unpack(), Unpacked::Undefined) {
+                    Ok(NanBox::undefined())
+                } else {
+                    let this = NanBox::handle(handle.to_raw());
+                    self.call_with_this(getter, this, &[])
+                }
+            }
+            crate::realm::ChainHit::Absent => {
+                if matches!(name, "name" | "length") {
+                    return None;
+                }
+                // `read_member`'s last resort for a built-in array: its
+                // global constructor's prototype method of that name.
+                if self.realm.is_array(handle)
+                    && let Some(m) = self.builtin_proto_method(handle, name)
+                {
+                    return Some(Ok(m));
+                }
+                Ok(NanBox::undefined())
+            }
+        })
     }
 
     /// For a built-in array/string/function value, the first-class method `name`

@@ -21,7 +21,97 @@
 use alloc::boxed::Box;
 use alloc::rc::{Rc, Weak};
 use alloc::vec::Vec;
-use core::cell::RefCell;
+use core::cell::{Cell, OnceCell, RefCell};
+
+/// Layouts with fewer properties than this are always searched by walking the
+/// parent chain: a handful of length-checked compares beats hashing the key.
+const INDEX_MIN_LEN: u32 = 8;
+
+/// How many chain-walk lookups a large layout serves before it builds its
+/// hashed index. Most interior shapes of a transition chain are looked up
+/// only while an object is being built (once by `set`, once by `transition`),
+/// so they never pay for an index; a layout that is actually read from (a
+/// built-in prototype, a shared record layout) builds it on its third probe.
+const INDEX_AFTER_PROBES: u32 = 3;
+
+/// A 32-bit hash of a property key (word-at-a-time multiply-rotate; never 0
+/// so the index can use 0 as its empty marker).
+#[inline]
+pub(crate) fn key_hash(key: &str) -> u32 {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let bytes = key.as_bytes();
+    let mut h: u64 = bytes.len() as u64;
+    let (chunks, rest) = bytes.as_chunks::<8>();
+    for c in chunks {
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(*c)).wrapping_mul(K);
+    }
+    if !rest.is_empty() {
+        let mut buf = [0u8; 8];
+        buf[..rest.len()].copy_from_slice(rest);
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(K);
+    }
+    let h = (h ^ (h >> 32)) as u32;
+    if h == 0 { 1 } else { h }
+}
+
+/// The hashed key table of one (large) layout: an open-addressed table of
+/// `(hash << 32) | (slot + 1)` words (0 = empty) plus the keys in slot order.
+/// Built once, lazily, and shared by every object with that shape (shapes are
+/// immutable, so it never needs invalidating).
+struct ShapeIndex {
+    table: Box<[u64]>,
+    keys: Box<[Rc<str>]>,
+}
+
+impl ShapeIndex {
+    fn build(shape: &Shape) -> Self {
+        let mut keys: Vec<Rc<str>> = Vec::with_capacity(shape.len as usize);
+        let mut node = shape;
+        while let Some(k) = &node.key {
+            keys.push(Rc::clone(k));
+            match node.parent.as_deref() {
+                Some(p) => node = p,
+                None => break,
+            }
+        }
+        keys.reverse();
+        let cap = (keys.len() * 2).next_power_of_two().max(16);
+        let mask = cap - 1;
+        let mut table = alloc::vec![0u64; cap].into_boxed_slice();
+        for (slot, k) in keys.iter().enumerate() {
+            let h = key_hash(k);
+            let mut i = h as usize & mask;
+            while table[i] != 0 {
+                i = (i + 1) & mask;
+            }
+            table[i] = (u64::from(h) << 32) | (slot as u64 + 1);
+        }
+        Self {
+            table,
+            keys: keys.into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    fn find(&self, key: &str) -> Option<u32> {
+        let h = key_hash(key);
+        let mask = self.table.len() - 1;
+        let mut i = h as usize & mask;
+        loop {
+            let e = self.table[i];
+            if e == 0 {
+                return None;
+            }
+            if (e >> 32) as u32 == h {
+                let slot = (e as u32) - 1;
+                if &*self.keys[slot as usize] == key {
+                    return Some(slot);
+                }
+            }
+            i = (i + 1) & mask;
+        }
+    }
+}
 
 /// An immutable description of an object's property layout: which names map to
 /// which slot indices, shared by every object with that structure. Build shapes
@@ -31,7 +121,9 @@ pub struct Shape {
     /// `None` for the root.
     parent: Option<Rc<Shape>>,
     /// The property this shape adds over its parent (`None` for the root).
-    key: Option<Box<str>>,
+    /// Shared (`Rc`) so a [`ShapeIndex`] can list a layout's keys without
+    /// copying them.
+    key: Option<Rc<str>>,
     /// The slot index of `key` (and `= parent.len()`); meaningless for the root.
     slot: u32,
     /// The number of properties in this layout.
@@ -46,6 +138,11 @@ pub struct Shape {
     /// rebuilt on next use; shape identity is only ever a cache-hit test
     /// ([`crate::ic`]), so a rebuilt shape costs a miss, never correctness.
     transitions: RefCell<Vec<(Box<str>, Weak<Shape>)>>,
+    /// The hashed key table, built after [`INDEX_AFTER_PROBES`] lookups of a
+    /// layout with at least [`INDEX_MIN_LEN`] properties (see [`ShapeIndex`]).
+    index: OnceCell<Box<ShapeIndex>>,
+    /// Chain-walk lookups served so far (drives building `index`).
+    probes: Cell<u32>,
 }
 
 impl Shape {
@@ -58,6 +155,8 @@ impl Shape {
             slot: 0,
             len: 0,
             transitions: RefCell::new(Vec::new()),
+            index: OnceCell::new(),
+            probes: Cell::new(0),
         })
     }
 
@@ -90,6 +189,15 @@ impl Shape {
         if self.lookup(key).is_some() {
             return Rc::clone(self);
         }
+        self.add(key)
+    }
+
+    /// [`transition`](Self::transition) for a `key` the caller has just found
+    /// absent from this layout (so the presence check is not repeated). Adding
+    /// a key that *is* present would corrupt the layout, so callers must have
+    /// looked it up on this very shape.
+    pub fn add(self: &Rc<Self>, key: &str) -> Rc<Shape> {
+        debug_assert!(self.lookup(key).is_none(), "Shape::add of a present key");
         // Reuse the cached transition if this `+key` was taken before and the
         // child is still in use. (The `let` ends the borrow before the
         // `borrow_mut` below.)
@@ -104,10 +212,12 @@ impl Shape {
         }
         let child = Rc::new(Shape {
             parent: Some(Rc::clone(self)),
-            key: Some(Box::from(key)),
+            key: Some(Rc::from(key)),
             slot: self.len,
             len: self.len + 1,
             transitions: RefCell::new(Vec::new()),
+            index: OnceCell::new(),
+            probes: Cell::new(0),
         });
         // Replace a dead entry in place rather than growing the cache with it.
         let mut transitions = self.transitions.borrow_mut();
@@ -119,10 +229,37 @@ impl Shape {
         child
     }
 
-    /// The slot index of `key` in this layout, or `None` if absent. Walks the
-    /// parent chain (newest property first).
+    /// The slot index of `key` in this layout, or `None` if absent. A small
+    /// layout walks the parent chain (newest property first); a large one that
+    /// is looked up repeatedly answers from its hashed index.
     #[must_use]
+    #[inline]
     pub fn lookup(&self, key: &str) -> Option<u32> {
+        if self.len >= INDEX_MIN_LEN {
+            return self.indexed_lookup(key);
+        }
+        self.walk_lookup(key)
+    }
+
+    /// [`lookup`](Self::lookup) for a large layout: through the index, built
+    /// on the first lookup past [`INDEX_AFTER_PROBES`].
+    fn indexed_lookup(&self, key: &str) -> Option<u32> {
+        if let Some(ix) = self.index.get() {
+            return ix.find(key);
+        }
+        let n = self.probes.get() + 1;
+        self.probes.set(n);
+        if n >= INDEX_AFTER_PROBES {
+            return self
+                .index
+                .get_or_init(|| Box::new(ShapeIndex::build(self)))
+                .find(key);
+        }
+        self.walk_lookup(key)
+    }
+
+    /// The parent-chain walk behind [`lookup`](Self::lookup).
+    fn walk_lookup(&self, key: &str) -> Option<u32> {
         let mut node = self;
         loop {
             if let Some(k) = &node.key
@@ -143,6 +280,9 @@ impl Shape {
     /// The property names in slot order (slot 0 first).
     #[must_use]
     pub fn keys(&self) -> Vec<&str> {
+        if let Some(ix) = self.index.get() {
+            return ix.keys.iter().map(|k| &**k).collect();
+        }
         let mut out: Vec<&str> = Vec::with_capacity(self.len as usize);
         let mut node = self;
         loop {
@@ -239,6 +379,32 @@ mod tests {
         let again = root.transition("a").transition("b");
         assert_eq!(again.keys(), ["a", "b"]);
         assert_eq!(again.lookup("b"), Some(1));
+    }
+
+    #[test]
+    fn large_layouts_answer_from_their_index() {
+        let names: Vec<alloc::string::String> = (0..100).map(|i| alloc::format!("k{i}")).collect();
+        let mut s = Shape::root();
+        for n in &names {
+            s = s.transition(n);
+        }
+        // Enough probes to build the index, then every key and some misses.
+        for _ in 0..(INDEX_AFTER_PROBES + 1) {
+            assert_eq!(s.lookup("k42"), Some(42));
+        }
+        assert!(s.index.get().is_some(), "a hot large layout is indexed");
+        for (i, n) in names.iter().enumerate() {
+            assert_eq!(s.lookup(n), Some(i as u32));
+        }
+        assert_eq!(s.lookup("k100"), None);
+        assert_eq!(s.lookup(""), None);
+        assert_eq!(s.lookup("k4"), Some(4));
+        let keys: Vec<&str> = s.keys();
+        assert_eq!(keys.len(), 100);
+        assert_eq!(keys[0], "k0");
+        assert_eq!(keys[99], "k99");
+        assert_ne!(key_hash(""), 0);
+        assert_ne!(key_hash("k1"), key_hash("k2"));
     }
 
     #[test]

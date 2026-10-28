@@ -238,7 +238,13 @@ impl Interp {
         indent: &str,
     ) -> Result<bool, ExecError> {
         // If value is an Object (or BigInt) with a callable `toJSON`, call it.
-        if let Some(h) = value.as_handle().map(Handle::from_raw) {
+        // (A String or Symbol is a primitive, not an Object: it has no
+        // `toJSON` step, and skipping the lookup spares the walk of
+        // `String.prototype` for every string value.)
+        if let Some(h) = value.as_handle().map(Handle::from_raw)
+            && !self.realm.typeof_is_string(h)
+            && self.realm.type_of(h) != Some("symbol")
+        {
             let tj = self.read_member(h, "toJSON")?;
             if self.is_callable_value(tj) {
                 let kb = key.to_value(self);

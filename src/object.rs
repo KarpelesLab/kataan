@@ -511,7 +511,7 @@ impl Object {
                 if let Some(slot) = shape.lookup(key) {
                     slots[slot as usize] = value;
                 } else if self.extensible {
-                    *shape = shape.transition(key);
+                    *shape = shape.add(key);
                     slots.push(value);
                     added = true;
                 }
@@ -551,7 +551,7 @@ impl Object {
                 if let Some(slot) = shape.lookup(key) {
                     slots[slot as usize] = value;
                 } else {
-                    *shape = shape.transition(key);
+                    *shape = shape.add(key);
                     slots.push(value);
                     added = true;
                 }
@@ -586,11 +586,11 @@ impl Object {
     /// [`set`](Object::set) on a property add (MEM-3: bounds shape-tree growth).
     pub fn maybe_convert_to_dict(&mut self, key: &str, threshold: usize) {
         if let ObjectData::Shaped { shape, .. } = &self.data
+            && shape.len() as usize >= threshold
             && self.extensible
             && !self.frozen
             && !self.is_readonly(key)
             && shape.lookup(key).is_none()
-            && shape.len() as usize >= threshold
         {
             self.convert_to_dict();
         }
