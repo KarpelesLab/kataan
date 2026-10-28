@@ -1445,7 +1445,7 @@ fn hosted_ctx_in<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_funcs: None,
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_handlers: jit_tier::HandlerStack::default(),
+        jit_rt: jit_tier::TierRuntime::default(),
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_shadow: alloc::vec::Vec::new(),
         call_depth: 0,
@@ -3757,9 +3757,10 @@ struct Ctx<'a> {
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     jit_funcs: Option<*const [FnProto]>,
     /// The exception-handler stacks of the running generic-JIT activations (the
-    /// interpreter keeps its own in `run_frame_at`); see `jit_tier::HandlerStack`.
+    /// interpreter keeps its own in `run_frame_at`) and the compiled-call cache;
+    /// see `jit_tier::TierRuntime`.
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-    jit_handlers: jit_tier::HandlerStack,
+    jit_rt: jit_tier::TierRuntime,
     /// Forward-safety GC root hook (`JIT_DESIGN.md` §5): a helper-call sequence
     /// would spill live NanBox temps here before re-entering, so an
     /// allocation-triggered collection could treat them as roots. **Not yet
@@ -3895,7 +3896,7 @@ pub fn run_program(
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_funcs: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-            jit_handlers: jit_tier::HandlerStack::default(),
+            jit_rt: jit_tier::TierRuntime::default(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_shadow: alloc::vec::Vec::new(),
             call_depth: 0,
@@ -3947,7 +3948,7 @@ pub fn run_program_capturing(
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_funcs: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-            jit_handlers: jit_tier::HandlerStack::default(),
+            jit_rt: jit_tier::TierRuntime::default(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_shadow: alloc::vec::Vec::new(),
             call_depth: 0,
@@ -4490,7 +4491,7 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_funcs: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-            jit_handlers: jit_tier::HandlerStack::default(),
+            jit_rt: jit_tier::TierRuntime::default(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_shadow: alloc::vec::Vec::new(),
             call_depth: 0,
@@ -5626,6 +5627,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         arena: jit_arena,
         push_handler: jit_tier::jit_helper_push_handler,
         pop_handler: jit_tier::jit_helper_pop_handler,
+        call_method: jit_tier::jit_helper_call_method,
         unwind: jit_tier::jit_helper_unwind,
     }
 }
@@ -24504,7 +24506,7 @@ mod generic_jit_tests {
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending_fault: None,
             jit_funcs: None,
-            jit_handlers: jit_tier::HandlerStack::default(),
+            jit_rt: jit_tier::TierRuntime::default(),
             jit_shadow: alloc::vec::Vec::new(),
             call_depth: 0,
             gc_enabled: false,
@@ -27021,6 +27023,7 @@ mod generic_jit_tests {
         assert!(!jit.has_entry(header + 1));
         assert!(jit.call_frame_raw(ctx_ptr, &mut regs, header + 1).is_none());
     }
+
     /// The unboxed numeric tiers compute comparisons as native `0`/`1`: a body
     /// whose comparison result is *returned* or used as a number is left to the
     /// generic tier (which boxes real booleans), while a comparison used only as
@@ -27083,7 +27086,7 @@ mod generic_jit_tests {
             interp.as_number(),
             Some(2.0 * (4.0 * 100.0 + 6.0 * 5.0 + 10.0) + 1.0)
         );
-        assert_eq!(ctx.jit_handlers.stack.len(), 0);
+        assert_eq!(ctx.jit_rt.handlers.len(), 0);
         // `o.z` missing: the final read throws outside every handler.
         let bare = NanBox::handle(ctx.realm.new_object().to_raw());
         let args = [bare, NanBox::number(4.0)];
@@ -27097,6 +27100,6 @@ mod generic_jit_tests {
             ),
             other => panic!("expected both to throw, got {other:?}"),
         }
-        assert_eq!(ctx.jit_handlers.stack.len(), 0);
+        assert_eq!(ctx.jit_rt.handlers.len(), 0);
     }
 }

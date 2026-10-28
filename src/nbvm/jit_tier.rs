@@ -12,8 +12,8 @@
 //! its header with nothing to reconstruct.
 
 use super::{
-    Ctx, FnProto, FrameExit, NanBox, Op, Reg, VmError, ensure_jit, run_frame, vm_agent_tick,
-    vm_error, vm_safepoint,
+    Ctx, FnProto, FrameExit, Handle, NanBox, Op, Reg, VmError, ensure_jit, run_frame,
+    vm_agent_tick, vm_error, vm_load_global, vm_safepoint,
 };
 use alloc::rc::Rc;
 
@@ -67,16 +67,21 @@ pub(super) fn osr_threshold() -> u32 {
 /// interpreter does).
 const POLL_INTERVAL: u64 = 1024;
 
-/// The exception-handler stacks of the running compiled activations: one shared
-/// `Vec` of `(catch_pc, catch_reg)` (the interpreter's `handlers` layout,
-/// innermost last), where the innermost compiled activation owns the entries
-/// from `base` up. [`run_compiled`] opens a segment on entry and drops it on
-/// exit, so an activation never sees (or pops) its callers' handlers, and the
-/// common case reuses the allocation.
+/// The generic tier's per-context runtime state.
 #[derive(Default)]
-pub(super) struct HandlerStack {
-    pub(super) stack: alloc::vec::Vec<(usize, Reg)>,
+pub(super) struct TierRuntime {
+    /// The exception-handler stacks of the running compiled activations: one
+    /// shared `Vec` of `(catch_pc, catch_reg)` (the interpreter's `handlers`
+    /// layout, innermost last), where the innermost compiled activation owns the
+    /// entries from `base` up. [`run_compiled`] opens a segment on entry and drops
+    /// it on exit, so an activation never sees (or pops) its callers' handlers,
+    /// and the common case reuses the allocation.
+    pub(super) handlers: alloc::vec::Vec<(usize, Reg)>,
     base: usize,
+    /// By function id: the compiled body [`call_compiled`] may enter directly —
+    /// set once the function passed its (static) eligibility test, compiled and
+    /// got hot, none of which is ever undone.
+    direct: alloc::vec::Vec<Option<Rc<crate::jit::JitProto>>>,
 }
 
 /// Runs compiled `jit` on `regs` from bytecode pc `entry` with the activation's
@@ -93,14 +98,14 @@ pub(super) fn run_compiled(
     handlers: &[(usize, Reg)],
 ) -> Option<Result<FrameExit, VmError>> {
     let saved = ctx.jit_funcs.replace(funcs as *const [FnProto]);
-    let outer_base = ctx.jit_handlers.base;
-    let base = ctx.jit_handlers.stack.len();
-    ctx.jit_handlers.base = base;
-    ctx.jit_handlers.stack.extend_from_slice(handlers);
+    let outer_base = ctx.jit_rt.base;
+    let base = ctx.jit_rt.handlers.len();
+    ctx.jit_rt.base = base;
+    ctx.jit_rt.handlers.extend_from_slice(handlers);
     let ctx_ptr = ctx as *mut Ctx as *mut core::ffi::c_void;
     let raw = jit.call_frame_raw(ctx_ptr, regs, entry);
-    ctx.jit_handlers.stack.truncate(base);
-    ctx.jit_handlers.base = outer_base;
+    ctx.jit_rt.handlers.truncate(base);
+    ctx.jit_rt.base = outer_base;
     ctx.jit_funcs = saved;
     let raw = raw?;
     if raw == NanBox::jit_falloff_bits() {
@@ -215,14 +220,14 @@ pub(crate) extern "C" fn jit_helper_push_handler(
     // SAFETY: see the function contract.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
-    let h = &mut ctx.jit_handlers;
-    if h.stack.len() - h.base >= ctx.realm.limits.max_handler_depth {
+    let h = &mut ctx.jit_rt;
+    if h.handlers.len() - h.base >= ctx.realm.limits.max_handler_depth {
         let e = vm_error(ctx, "RangeError", "Handler stack overflow");
         ctx.jit_pending_fault = Some(VmError::Thrown(e));
         return NanBox::jit_throw_bits();
     }
     // Lossless: the emitter passes a bytecode pc and a register index.
-    h.stack.push((target as usize, reg as Reg));
+    h.handlers.push((target as usize, reg as Reg));
     0
 }
 
@@ -235,9 +240,9 @@ pub(crate) extern "C" fn jit_helper_pop_handler(ctx: *mut core::ffi::c_void, _: 
     // SAFETY: see the function contract.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
-    let h = &mut ctx.jit_handlers;
-    if h.stack.len() > h.base {
-        h.stack.pop();
+    let h = &mut ctx.jit_rt;
+    if h.handlers.len() > h.base {
+        h.handlers.pop();
     }
     0
 }
@@ -262,7 +267,7 @@ pub(crate) extern "C" fn jit_helper_unwind(
     // SAFETY: the activation's register file, live and unaliased for this call.
     #[allow(unsafe_code)]
     let regs = unsafe { core::slice::from_raw_parts_mut(regs.cast::<NanBox>(), n_regs) };
-    if ctx.jit_handlers.stack.len() <= ctx.jit_handlers.base {
+    if ctx.jit_rt.handlers.len() <= ctx.jit_rt.base {
         return crate::jit::NO_HANDLER;
     }
     // The same precedence `run_compiled` reads the pending fault with.
@@ -277,7 +282,7 @@ pub(crate) extern "C" fn jit_helper_unwind(
             None => return crate::jit::NO_HANDLER,
         },
     };
-    let Some((target, reg)) = ctx.jit_handlers.stack.pop() else {
+    let Some((target, reg)) = ctx.jit_rt.handlers.pop() else {
         return crate::jit::NO_HANDLER; // unreachable: checked above
     };
     match regs.get_mut(reg as usize) {
@@ -326,6 +331,28 @@ pub(crate) extern "C" fn jit_helper_exec_op(
     // code runs.
     #[allow(unsafe_code)]
     let op = unsafe { &*op };
+    // Direct forms of the hottest handed-back ops — each exactly its
+    // interpreter arm, without setting up a one-op frame.
+    let direct = match op {
+        Op::LoadGlobal { dst, name, cache } => {
+            Some(vm_load_global(ctx, name, cache).map(|v| regs[*dst as usize] = v))
+        }
+        Op::CallValue { dst, callee, args } => {
+            let callee = regs[*callee as usize];
+            call_compiled(ctx, funcs, regs, callee, args, NanBox::undefined())
+                .map(|r| r.map(|v| regs[*dst as usize] = v))
+        }
+        _ => None,
+    };
+    if let Some(r) = direct {
+        return match r {
+            Ok(()) => 0,
+            Err(e) => {
+                ctx.jit_pending_fault = Some(e);
+                NanBox::jit_throw_bits()
+            }
+        };
+    }
     // A property op keeps its inline cache across executions, in a table
     // keyed by the op's address: the op lives in bytecode the `JitProto` owns,
     // which `ctx.jit_cache` keeps alive for the whole `Ctx`, so the address
@@ -372,6 +399,201 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             ctx.jit_pending_fault = Some(e);
             NanBox::jit_throw_bits()
         }
+    }
+}
+
+/// `Op::CallValue` from compiled code to a callee that is itself compiled: the
+/// interpreter's call (`Op::CallValue` → `call_with` → `call_with_inner`) with
+/// everything that cannot apply to such a callee left out, entering the
+/// callee's native body directly. `None` — nothing done, run the ordinary call —
+/// unless the callee is a plain VM closure (not a class constructor, async,
+/// generator, rest-parameter, `arguments` or `new.target` body) whose generic
+/// body is already compiled and hot, in a single-realm run.
+///
+/// It keeps every piece of interpreter state the ordinary call keeps: the call
+/// depth limits (a catchable `RangeError`), the callee/arguments stacks the
+/// `arguments`/`caller` machinery reads, the GC publication of the caller's
+/// registers and the callee's inputs, and the tier-up counter.
+fn call_compiled(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: &[NanBox],
+    callee_val: NanBox,
+    args: &[Reg],
+    this: NanBox,
+) -> Option<Result<NanBox, VmError>> {
+    let handle = Handle::from_raw(callee_val.as_handle()?);
+    let (fid, _) = ctx.realm.vm_function(handle)?;
+    let id = fid as usize;
+    let proto = funcs.get(id)?;
+    if ctx.realm.multi_realm || ctx.call_depth == 0 {
+        return None;
+    }
+    let jit = match ctx.jit_rt.direct.get(id) {
+        Some(Some(j)) => Rc::clone(j),
+        _ => {
+            let j = direct_target(ctx, proto, id)?;
+            if ctx.jit_rt.direct.len() <= id {
+                ctx.jit_rt.direct.resize(id + 1, None);
+            }
+            ctx.jit_rt.direct[id] = Some(Rc::clone(&j));
+            j
+        }
+    };
+    // `call_with`'s recursion guard.
+    if ctx.call_depth >= ctx.realm.limits.max_call_depth
+        || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
+    {
+        let e = vm_error(ctx, "RangeError", "Maximum call stack size exceeded");
+        return Some(Err(VmError::Thrown(e)));
+    }
+    // The callee's register file: parameters, captures, `this` (undefined).
+    let mut cregs: alloc::vec::Vec<NanBox> = ctx.reg_pool.pop().unwrap_or_default();
+    cregs.resize(proto.n_regs, NanBox::undefined());
+    for (slot, a) in cregs.iter_mut().zip(args.iter().take(proto.n_params)) {
+        *slot = regs[*a as usize];
+    }
+    if let Some((_, caps)) = ctx.realm.vm_function(handle) {
+        for (i, c) in caps.iter().enumerate().take(proto.n_captures) {
+            cregs[proto.n_params + i] = *c;
+        }
+    }
+    if let Some(slot) = cregs.get_mut(proto.n_params + proto.n_captures) {
+        *slot = this;
+    }
+    // The bookkeeping of `Op::CallValue` + `call_with` (+ `call_with_inner`'s
+    // input publication), restored below on every outcome.
+    let mark = ctx.frame_shadow.len();
+    let published = ctx.frames_published;
+    ctx.frame_shadow.extend_from_slice(regs);
+    ctx.frames_published += 1;
+    ctx.call_depth += 1;
+    ctx.realm.vm_total_depth += 1;
+    let callee_mark = ctx.realm.vm_callee_stack.len();
+    let args_mark = ctx.realm.vm_args_buf.len();
+    ctx.realm.vm_callee_stack.push(callee_val);
+    ctx.realm.vm_callee_args.push(args_mark);
+    ctx.realm
+        .vm_args_buf
+        .extend(args.iter().map(|a| regs[*a as usize]));
+    if ctx.gc_enabled {
+        let n = ctx.realm.vm_args_buf.len();
+        ctx.frame_shadow
+            .extend_from_slice(&ctx.realm.vm_args_buf[args_mark..n]);
+        if let Some((_, caps)) = ctx.realm.vm_function(handle) {
+            ctx.frame_shadow.extend_from_slice(caps);
+        }
+        ctx.frame_shadow.push(this);
+    }
+    if let Some(t) = ctx.tiers.get_mut(id) {
+        t.calls = t.calls.saturating_add(1);
+    }
+    let outcome = run_compiled(ctx, funcs, &jit, &mut cregs, 0, &[]);
+    ctx.realm.vm_callee_stack.truncate(callee_mark);
+    ctx.realm.vm_callee_args.truncate(callee_mark);
+    ctx.realm.vm_args_buf.truncate(args_mark);
+    ctx.frames_published = published;
+    ctx.frame_shadow.truncate(mark);
+    ctx.call_depth -= 1;
+    ctx.realm.vm_total_depth -= 1;
+    if ctx.reg_pool.len() < 64 {
+        cregs.clear();
+        ctx.reg_pool.push(cregs);
+    }
+    Some(match outcome? {
+        Ok(FrameExit::Return(v)) => Ok(v.unwrap_or(NanBox::undefined())),
+        Ok(_) => Err(VmError::Unsupported),
+        Err(e) => Err(e),
+    })
+}
+
+/// `Op::CallMethod` in compiled code. The one case it runs itself is the hot
+/// one: a hosted call whose method (looked up through the site's persistent
+/// cache `cache`) is a VM closure with a compiled body, which it enters
+/// directly ([`call_compiled`]) — exactly what `run_frame_at`'s `Op::CallMethod`
+/// arm does for such a method, minus the generic call path. Everything else
+/// (built-ins, `Math` fast paths, accessors, primitives, the legacy `caller`,
+/// an unhosted run) is that arm itself, via [`jit_helper_exec_op`].
+///
+/// # Safety
+/// As [`jit_helper_exec_op`]; `cache` is the site's `PropertyCache`, owned by
+/// the calling `JitProto` and not otherwise borrowed while this runs.
+pub(crate) extern "C" fn jit_helper_call_method(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    cache: *mut core::ffi::c_void,
+) -> u64 {
+    // SAFETY: see the function contract (as `jit_helper_exec_op`).
+    #[allow(unsafe_code)]
+    let op = unsafe { &*op_raw };
+    if let Op::CallMethod {
+        dst,
+        recv,
+        key,
+        args,
+    } = op
+    {
+        // SAFETY: see the function contract.
+        #[allow(unsafe_code)]
+        let ctx = unsafe { &mut *(ctx_raw as *mut Ctx) };
+        // SAFETY: the activation's register file, live and unaliased here.
+        #[allow(unsafe_code)]
+        let regs = unsafe { core::slice::from_raw_parts_mut(regs_raw.cast::<NanBox>(), n_regs) };
+        // SAFETY: the site's own cache (see the function contract).
+        #[allow(unsafe_code)]
+        let cache = unsafe { &mut *cache.cast::<crate::ic::PropertyCache>() };
+        let recv_val = regs[*recv as usize];
+        if ctx.host.is_some()
+            && key != "caller"
+            && let Some(closure) = super::vm_method_of_cached(ctx, recv_val, key, cache)
+        {
+            // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
+            #[allow(unsafe_code)]
+            let funcs = unsafe {
+                &*ctx
+                    .jit_funcs
+                    .expect("jit_funcs set before generic dispatch")
+            };
+            if let Some(r) = call_compiled(ctx, funcs, regs, closure, args, recv_val) {
+                return match r {
+                    Ok(v) => {
+                        regs[*dst as usize] = v;
+                        0
+                    }
+                    Err(e) => {
+                        ctx.jit_pending_fault = Some(e);
+                        NanBox::jit_throw_bits()
+                    }
+                };
+            }
+        }
+    }
+    jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
+}
+
+/// Whether function `id` (`proto`) may be entered by [`call_compiled`]: a plain
+/// VM closure body (not a class constructor, async, generator, rest-parameter,
+/// `arguments` or `new.target` one) that is hot and already compiled to the
+/// generic tier — its compiled body, if so.
+fn direct_target(ctx: &Ctx, proto: &FnProto, id: usize) -> Option<Rc<crate::jit::JitProto>> {
+    if proto.class_ctor
+        || proto.is_async
+        || proto.is_generator
+        || proto.rest_from.is_some()
+        || proto
+            .ops
+            .iter()
+            .take(2)
+            .any(|o| matches!(o, Op::MakeArguments { .. } | Op::LoadNewTarget { .. }))
+        || !call_is_hot(ctx.tiers.get(id).is_some_and(|t| t.body.is_some()))
+    {
+        return None;
+    }
+    match ctx.jit_cache.get(&id) {
+        Some(Some(j)) if j.is_generic() && j.n_regs() <= proto.n_regs => Some(Rc::clone(j)),
+        _ => None,
     }
 }
 

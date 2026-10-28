@@ -2018,6 +2018,16 @@ pub enum GenericOp {
     },
     /// `Op::PopHandler`: leave the innermost `try` region.
     PopHandler,
+    /// `Op::CallMethod` (`recv.key(args)`): `jit_helper_call_method` runs the
+    /// interpreter's method call with a persistent per-site method cache (the
+    /// one-op fallback would start every call with a cold one), entering a
+    /// compiled callee directly.
+    CallMethod {
+        /// The bytecode pc of the op.
+        pc: u32,
+        /// The site index (its method-lookup cache).
+        site: u16,
+    },
     /// `return reg[src]`.
     Ret {
         /// Register holding the return value.
@@ -2225,6 +2235,11 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
                 reg: r(*reg)?,
             },
             Op::PopHandler => GenericOp::PopHandler,
+            Op::CallMethod { key, .. } => {
+                let site = u16::try_from(keys.len()).ok()?;
+                keys.push(alloc::boxed::Box::from(key.as_str()));
+                GenericOp::CallMethod { pc: pc32, site }
+            }
             Op::InitProp { obj, key, src } => {
                 let site = u16::try_from(keys.len()).ok()?;
                 keys.push(alloc::boxed::Box::from(key.as_str()));
@@ -2385,11 +2400,24 @@ pub struct GenericHelpers {
     pub push_handler: JitAddHelper,
     /// `Op::PopHandler` (`jit_helper_pop_handler(ctx, _)`): never throws.
     pub pop_handler: JitTruthyHelper,
+    /// `Op::CallMethod` (`jit_helper_call_method(ctx, regs, n_regs, op, cache)`).
+    pub call_method: JitCallMethodHelper,
     /// The throw-exit unwinder (`jit_helper_unwind(ctx, regs, n_regs)`): if the
     /// pending fault is a thrown value and the activation has a handler, pop it,
     /// bind the value and return the catch pc; else [`NO_HANDLER`].
     pub unwind: JitUnwindHelper,
 }
+
+/// The runtime-helper ABI for a method call: `(ctx, regs, n_regs, op, cache) ->
+/// 0` (or the throw sentinel).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub type JitCallMethodHelper = extern "C" fn(
+    *mut core::ffi::c_void,
+    *mut u64,
+    usize,
+    *const crate::nbvm::Op,
+    *mut core::ffi::c_void,
+) -> u64;
 
 /// The [`JitUnwindHelper`] result meaning "no handler caught it: propagate".
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
@@ -4585,6 +4613,7 @@ impl JitFunction {
         let push_handler_helper = helpers.push_handler as usize as u64;
         let pop_handler_helper = helpers.pop_handler as usize as u64;
         let unwind_helper = helpers.unwind as usize as u64;
+        let call_method_helper = helpers.call_method as usize as u64;
         // The catch entries of the body's `try` regions: where the throw exit
         // resumes after `jit_helper_unwind` binds a thrown value.
         let mut catch_targets: Vec<usize> = ops
@@ -4816,6 +4845,21 @@ impl JitFunction {
                     a.mov_rdi_r15();
                     a.movabs_rax(pop_handler_helper as i64);
                     a.call_rax();
+                }
+                GenericOp::CallMethod { pc, site } => {
+                    if pc as usize != op_idx {
+                        return None;
+                    }
+                    let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
+                    let si = sites.get(site as usize)?;
+                    a.mov_rdi_r15(); // rdi = ctx
+                    a.mov_rsi_rbx(); // rsi = regs
+                    a.movabs_argreg(2, n_regs as i64); // rdx = n_regs
+                    a.movabs_argreg(3, op_ptr as i64); // rcx = &op
+                    a.movabs_argreg(4, si.cache_ptr as i64); // r8 = the site cache
+                    a.movabs_rax(call_method_helper as i64);
+                    a.call_rax();
+                    throw_check!();
                 }
                 GenericOp::InitProp { obj, val, site } => {
                     if !ok(obj) || !ok(val) {
