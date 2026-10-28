@@ -2614,10 +2614,90 @@ impl Interp {
         // through the prototype chain — each name only once, own keys first.
         let mut seen = alloc::collections::BTreeSet::new();
         let mut out = Vec::new();
+        let mut cur = Some(h);
+        while let Some(c) = cur {
+            self.for_in_own_ordinary(c, &mut seen, &mut out);
+            cur = self.realm.object_proto(c);
+        }
+        out
+    }
+
+    /// `for-in` keys of `obj` when its prototype chain holds a Proxy: each proxy
+    /// is asked through its traps (`ownKeys`, then `getOwnPropertyDescriptor` per
+    /// String key, then `getPrototypeOf` to continue the walk, as in the
+    /// informative EnumerateObjectProperties of 14.7.5.9), each ordinary object
+    /// as in [`Self::iterate_keys`]. `None` when the chain has no proxy.
+    pub(crate) fn for_in_keys_through_proxies(
+        &mut self,
+        obj: Handle,
+    ) -> Result<Option<Vec<NanBox>>, ExecError> {
+        let mut probe = Some(obj);
+        let mut has_proxy = false;
+        while let Some(c) = probe {
+            if self.realm.proxy_at(c).is_some() {
+                has_proxy = true;
+                break;
+            }
+            probe = self.realm.object_proto(c);
+        }
+        if !has_proxy {
+            return Ok(None);
+        }
+        let mut seen = alloc::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        let mut cur = Some(obj);
+        // Bounded: a proxy's `getPrototypeOf` may hand back an endless chain.
+        let mut steps = 0usize;
+        while let Some(c) = cur {
+            steps += 1;
+            if steps > 100_000 {
+                break;
+            }
+            if self.realm.proxy_at(c).is_none() {
+                self.for_in_own_ordinary(c, &mut seen, &mut out);
+                cur = self.realm.object_proto(c);
+                continue;
+            }
+            for k in self.own_property_keys_values(c)? {
+                let Some(name) = k
+                    .as_handle()
+                    .map(Handle::from_raw)
+                    .and_then(|kh| self.realm.string_value(kh))
+                else {
+                    continue;
+                };
+                let desc = self.descriptor_of(c, &name)?;
+                let Some(dh) = desc.as_handle().map(Handle::from_raw) else {
+                    continue;
+                };
+                if seen.insert(name.clone()) {
+                    let enumerable = self
+                        .realm
+                        .get_property(dh, "enumerable")
+                        .is_some_and(|v| self.realm.truthy(v));
+                    if enumerable {
+                        out.push(self.new_str(&name));
+                    }
+                }
+            }
+            cur = self.get_proto_of(c)?.as_handle().map(Handle::from_raw);
+        }
+        Ok(Some(out))
+    }
+
+    /// One ordinary object's share of a `for-in` walk: its enumerable own String
+    /// keys not yet `seen` go to `out`, and every own key (enumerable or not)
+    /// joins `seen`, shadowing a same-named property further down the chain.
+    fn for_in_own_ordinary(
+        &mut self,
+        c: Handle,
+        seen: &mut alloc::collections::BTreeSet<String>,
+        out: &mut Vec<NanBox>,
+    ) {
         // An array's own keys lead with its integer indices (a VM closure's backing
-        // cells are not enumerable).
-        if !self.realm.is_vm_function(h)
-            && let Some(indices) = self.realm.array_enumerable_indices(h)
+        // cells are not enumerable) — on a prototype as much as on the receiver.
+        if !self.realm.is_vm_function(c)
+            && let Some(indices) = self.realm.array_enumerable_indices(c)
         {
             for i in indices {
                 let k = alloc::format!("{i}");
@@ -2628,7 +2708,7 @@ impl Interp {
         }
         // A String object's own enumerable keys are its indices `"0".."length-1"`
         // (`length` is non-enumerable), so `for (k in "abc")` yields "0","1","2".
-        if let Some(slen) = self.string_index_count(h) {
+        if let Some(slen) = self.string_index_count(c) {
             for i in 0..slen {
                 let k = alloc::format!("{i}");
                 if seen.insert(k.clone()) {
@@ -2636,39 +2716,34 @@ impl Interp {
                 }
             }
         }
-        let mut cur = Some(h);
-        while let Some(c) = cur {
-            // Plain objects keep keys in the cell; arrays/functions keep named
-            // properties in their auxiliary object. Enumerable own keys are the
-            // ones emitted (in property order).
-            let enumerable = self
-                .realm
-                .object_keys(c)
-                .unwrap_or_else(|| self.realm.aux_named_keys(c));
-            for k in enumerable {
-                if seen.insert(k.clone()) {
-                    out.push(self.new_str(&k));
-                }
+        // Plain objects keep keys in the cell; arrays/functions keep named
+        // properties in their auxiliary object. Enumerable own keys are the
+        // ones emitted (in property order).
+        let enumerable = self
+            .realm
+            .object_keys(c)
+            .unwrap_or_else(|| self.realm.aux_named_keys(c));
+        for k in enumerable {
+            if seen.insert(k.clone()) {
+                out.push(self.new_str(&k));
             }
-            // *Every* own key (including the non-enumerable ones) shadows a
-            // same-named property further down the prototype chain, regardless of
-            // its enumerability: a non-enumerable own `prop` hides an enumerable
-            // inherited `prop`. Add the full own-key set to `seen` so those
-            // inherited names are not re-emitted.
-            let mut all = self.realm.object_all_keys(c);
-            if all.is_empty() {
-                all = self.realm.aux_all_keys(c);
-            }
-            for k in all {
-                // Symbol/internal (`\0`-prefixed) slots never participate in the
-                // string-key `for-in` namespace.
-                if !crate::realm::is_internal_key(&k) {
-                    seen.insert(k);
-                }
-            }
-            cur = self.realm.object_proto(c);
         }
-        out
+        // *Every* own key (including the non-enumerable ones) shadows a
+        // same-named property further down the prototype chain, regardless of
+        // its enumerability: a non-enumerable own `prop` hides an enumerable
+        // inherited `prop`. Add the full own-key set to `seen` so those
+        // inherited names are not re-emitted.
+        let mut all = self.realm.object_all_keys(c);
+        if all.is_empty() {
+            all = self.realm.aux_all_keys(c);
+        }
+        for k in all {
+            // Symbol/internal (NUL-prefixed) slots never participate in the
+            // string-key `for-in` namespace.
+            if !crate::realm::is_internal_key(&k) {
+                seen.insert(k);
+            }
+        }
     }
 
     /// `GetIterator` step `GetMethod(obj, @@iterator)` for an *array* — the one

@@ -9503,17 +9503,22 @@ impl crate::nbvm::VmHost for Interp {
             self.namespace_enumeration_tdz(Handle::from_raw(raw))
                 .map_err(exec_to_host)?;
         }
+        // A Proxy anywhere on the chain is walked through its traps (including
+        // `getPrototypeOf`, so the keys it inherits are enumerated too).
         let trap_keys = match obj.as_handle() {
             Some(raw) => self
-                .proxy_own_enumerable_keys(Handle::from_raw(raw))
+                .for_in_keys_through_proxies(Handle::from_raw(raw))
                 .map_err(exec_to_host)?,
             None => None,
         };
         let (keys, live) = match trap_keys {
-            Some(ks) => (
-                ks.iter().map(|k| self.new_str(k)).collect(),
-                NanBox::undefined(),
-            ),
+            Some(ks) => {
+                let is_proxy = obj
+                    .as_handle()
+                    .is_some_and(|raw| self.realm.proxy_at(Handle::from_raw(raw)).is_some());
+                let live = if is_proxy { NanBox::undefined() } else { obj };
+                (ks, live)
+            }
             None => {
                 let live = if self.is_object_value(obj) {
                     obj

@@ -350,3 +350,23 @@ fn array_generic_methods_read_only_what_they_name() {
          |has:1,set:0,has:2,set:1|aabc"
     );
 }
+
+/// `for-in` walks the whole prototype chain: a Proxy on it is asked through
+/// its traps (`getPrototypeOf` included, so what it inherits is enumerated),
+/// and an array, String or typed-array *prototype* contributes its index keys
+/// (they were dropped: `for (k in Object.create([7, 8]))` enumerated nothing).
+#[test]
+fn for_in_walks_proxies_and_indexed_prototypes() {
+    let src = r#"
+        function keys(o) { var r = []; for (var k in o) r.push(k); return r.join(); }
+        var proto = { inh: 1 };
+        var log = [];
+        var p = new Proxy({ a: 1 }, { getPrototypeOf(t) { log.push("gpo"); return proto; } });
+        var a = [1, 2]; a.q = 1; var o2 = Object.create(a); o2[5] = 1;
+        var s = Object.create(new String("ab")); s.x = 1;
+        [keys(p), log.length > 0, keys(Object.create([7, 8])), keys(o2), keys(s),
+         keys(Object.create(new Uint8Array(2))), keys(new Proxy([1, 2], {})),
+         keys(Object.create(new Proxy([5], {})))].join("|")
+    "#;
+    assert_eq!(run(src), "a,inh|true|0,1|5,0,1,q|x,0,1|0,1|0,1|0");
+}
