@@ -1428,7 +1428,7 @@ fn hosted_ctx_in<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
         host: Some(host),
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
-        tiers: alloc::collections::BTreeMap::new(),
+        tiers: Vec::new(),
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_cache: alloc::collections::BTreeMap::new(),
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -1447,6 +1447,7 @@ fn hosted_ctx_in<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
         top_frame_roots: Vec::new(),
         pending_callee: None,
         pending_new_target: None,
+        reg_pool: Vec::new(),
         in_realm: None,
     }
 }
@@ -1658,6 +1659,46 @@ fn vm_set_prop_mode(
     cache: &mut PropertyCache,
     strict: bool,
 ) -> Result<(), VmError> {
+    // Inline-cache hit first: an in-place write to an existing own data slot of
+    // an ordinary `Cell::Object` (`object_cached_set` declines a frozen object,
+    // a read-only key and a dictionary object, and never adds a property).
+    // That is exactly where both the hosted rules below and `vm_set_prop` end
+    // up, provided the object has no own accessor of that name (which would
+    // take precedence) and is none of the objects whose writes are the host's:
+    // a host-exotic object, the global object (its bindings mirror it), or a
+    // dispatch-tracked built-in prototype (overwrites must be recorded). The
+    // other host cases are other cell kinds (strings, proxies, typed arrays,
+    // arrays, functions, RegExps) or keys that are never data slots (a String
+    // wrapper's `length`/indices).
+    if let Some(h) = recv.as_handle().map(Handle::from_raw)
+        && ctx.realm.object_lacks_own_accessor(h, key)
+        && !ctx.realm.is_host_exotic(h)
+        && !ctx.realm.is_dispatch_tracked_proto(h)
+        && !ctx
+            .host
+            .as_deref()
+            .is_some_and(|x| x.is_global_object(recv))
+    {
+        if ctx.realm.object_cached_set(h, key, value, cache) {
+            return Ok(());
+        }
+        // Adding a property: when the site's chain cache proves that no object
+        // on the prototype chain has the key (so no inherited setter, read-only
+        // property or proxy can intercept it, and the receiver does not own it),
+        // the write is an ordinary new data property on an extensible object.
+        // That is what the hosted rules (`plain_write_ok` holds) and
+        // `vm_set_prop` (no accessor, not own) both reduce to.
+        if ctx.realm.object_accepts_new_property(h) {
+            if matches!(
+                ctx.realm.chain_cached_get(h, key, cache),
+                Some(crate::realm::ChainHit::Absent)
+            ) {
+                ctx.realm.set_property(h, key, value);
+                return Ok(());
+            }
+            ctx.realm.chain_cache_fill(h, key, cache);
+        }
+    }
     if ctx.host.is_none() {
         return vm_set_prop(ctx, funcs, recv, key, value, cache);
     }
@@ -1803,6 +1844,31 @@ fn vm_method_of(ctx: &Ctx, recv: NanBox, key: &str) -> Option<NanBox> {
         cur = ctx.realm.object_proto(c);
     }
     None
+}
+
+/// [`vm_method_of`] through the call site's prototype-chain cache. A hit is
+/// only ever over a chain of ordinary shaped objects (see `ic::ChainCache`),
+/// where `vm_method_of`'s walk sees no proxy and reads data slots: a data hit
+/// is the value it would find (kept only when it is a VM function), and an
+/// accessor on the way is its `None` (the host's call).
+fn vm_method_of_cached(
+    ctx: &Ctx,
+    recv: NanBox,
+    key: &str,
+    cache: &mut PropertyCache,
+) -> Option<NanBox> {
+    let h = recv.as_handle().map(Handle::from_raw)?;
+    match ctx.realm.chain_cached_get(h, key, cache) {
+        Some(crate::realm::ChainHit::Data(v)) => v
+            .as_handle()
+            .filter(|f| ctx.realm.is_vm_function(Handle::from_raw(*f)))
+            .map(|_| v),
+        Some(crate::realm::ChainHit::Accessor(..) | crate::realm::ChainHit::Absent) => None,
+        None => {
+            ctx.realm.chain_cache_fill(h, key, cache);
+            vm_method_of(ctx, recv, key)
+        }
+    }
 }
 
 /// The hidden marker a constructible VM function carries (see
@@ -3205,6 +3271,14 @@ fn vm_construct(
 /// Whether `v` is an Object (not a primitive — note strings are heap handles
 /// too).
 fn is_object_value(realm: &Realm, v: NanBox) -> bool {
+    // An ordinary object cell is an Object whatever its `typeof` ("object",
+    // "function" for a bound function or %Function.prototype%, "undefined" for
+    // an [[IsHTMLDDA]] one): skip the `typeof` probes.
+    if v.as_handle()
+        .is_some_and(|h| realm.is_object_cell(Handle::from_raw(h)))
+    {
+        return true;
+    }
     // A handle whose `typeof` is "undefined" is an [[IsHTMLDDA]] object.
     v.as_handle().is_some() && matches!(realm.type_of_value(v), "object" | "function" | "undefined")
 }
@@ -3633,7 +3707,7 @@ struct Ctx<'a> {
     output: String,
     microtasks: alloc::collections::VecDeque<Microtask>,
     /// Per-function tiering state, keyed by function id.
-    tiers: alloc::collections::BTreeMap<usize, TierState>,
+    tiers: Vec<TierState>,
     /// Per-function native-code cache (Phase G JIT), keyed by function id.
     /// `None` means "tried, not JIT-eligible". Present only where the JIT exists.
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -3716,6 +3790,10 @@ struct Ctx<'a> {
     /// The `new.target` of the next `call_with` activation when it is a
     /// `[[Construct]]` (`None` for an ordinary call). Taken on entry.
     pending_new_target: Option<NanBox>,
+    /// Spare register windows, reused by [`call_with_inner`] so an ordinary
+    /// call does not allocate one. Each is empty while pooled (`clear`ed on
+    /// return), so a pooled window holds no stale values and no roots.
+    reg_pool: Vec<Vec<NanBox>>,
     /// The host realm (a `$262.createRealm()` index) this run executes in,
     /// when not the main one: closures it creates belong to that realm.
     in_realm: Option<usize>,
@@ -3725,9 +3803,26 @@ struct Ctx<'a> {
 // live in `crate::limits::Limits` and are read live from `ctx.realm.limits`, so
 // an embedder can tune them per realm.
 
-/// Tier state for one function: its activation count and, once hot, its
-/// optimized bytecode body.
-type TierState = (u32, Option<alloc::rc::Rc<Vec<Op>>>);
+/// Tier state for one function (indexed by function id in [`Ctx::tiers`]): its
+/// activation count, once hot its optimized bytecode body, and the inline
+/// caches of the body it last ran.
+///
+/// The caches persist across activations, so a property site in a function
+/// called many times (a method, a constructor) stays warm instead of starting
+/// cold on every call. Soundness: a [`PropertyCache`] entry is a pure
+/// `(shape, key) → slot` memo for the site's key, and a site is identified by
+/// `(function id, pc)` in the body whose address is `ic_body`. Within one `Ctx`
+/// a function id always names the same function (every function table of a
+/// host is a prefix of the next, the same invariant `body` relies on), and the
+/// caches are discarded whenever the body that runs is a different one (the
+/// switch to the optimized body), so a site never reads another site's entry.
+#[derive(Default)]
+struct TierState {
+    calls: u32,
+    body: Option<alloc::rc::Rc<Vec<Op>>>,
+    ic: Vec<PropertyCache>,
+    ic_body: usize,
+}
 
 /// Runs `f` with `realm` moved into the box a VM context owns, moving it back
 /// afterwards (`f` hands the box back with its result) — for the entry points
@@ -3756,7 +3851,7 @@ pub fn run_program(
             host: None,
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
-            tiers: alloc::collections::BTreeMap::new(),
+            tiers: Vec::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_cache: alloc::collections::BTreeMap::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -3775,6 +3870,7 @@ pub fn run_program(
             top_frame_roots: Vec::new(),
             pending_callee: None,
             pending_new_target: None,
+            reg_pool: Vec::new(),
             in_realm: None,
         };
         let r = call(&mut ctx, funcs, id, args).and_then(|value| {
@@ -3801,7 +3897,7 @@ pub fn run_program_capturing(
             host: None,
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
-            tiers: alloc::collections::BTreeMap::new(),
+            tiers: Vec::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_cache: alloc::collections::BTreeMap::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -3820,6 +3916,7 @@ pub fn run_program_capturing(
             top_frame_roots: Vec::new(),
             pending_callee: None,
             pending_new_target: None,
+            reg_pool: Vec::new(),
             in_realm: None,
         };
         let r = call(&mut ctx, funcs, id, args).and_then(|value| {
@@ -3986,8 +4083,9 @@ fn call_with_inner(
     // rebinds these and loops *without* recursing, so unbounded tail recursion
     // reuses this one native frame (O(1) stack) rather than growing it.
     let mut id = id;
-    let mut args: Vec<NanBox> = args.to_vec();
-    let mut captures: Vec<NanBox> = captures.to_vec();
+    // Borrowed until a tail call rebinds them (no copy per ordinary call).
+    let mut args: alloc::borrow::Cow<'_, [NanBox]> = alloc::borrow::Cow::Borrowed(args);
+    let mut captures: alloc::borrow::Cow<'_, [NanBox]> = alloc::borrow::Cow::Borrowed(captures);
     let mut this_val = this_val;
     // The callee value, if the caller knew it (the `arguments` object's
     // `callee`). Taken now so it cannot leak into a later call.
@@ -4012,7 +4110,8 @@ fn call_with_inner(
             );
             return Err(VmError::Thrown(e));
         }
-        let mut regs: Vec<NanBox> = vec![NanBox::undefined(); proto.n_regs];
+        let mut regs: Vec<NanBox> = ctx.reg_pool.pop().unwrap_or_default();
+        regs.resize(proto.n_regs, NanBox::undefined());
         match proto.rest_from {
             // A rest parameter: fixed args fill `0..fixed`, the remainder becomes an
             // array in register `fixed`.
@@ -4101,18 +4200,31 @@ fn call_with_inner(
         }
         // Tier-up: count this activation, optimize the body once the function gets
         // hot, and run the optimized bytecode thereafter.
-        let optimized: Option<alloc::rc::Rc<Vec<Op>>> = {
-            let entry = ctx.tiers.entry(id).or_default();
-            entry.0 = entry.0.saturating_add(1);
-            if entry.0 == TIER_UP_THRESHOLD && entry.1.is_none() {
-                entry.1 = Some(alloc::rc::Rc::new(optimize_ops(&funcs[id].ops)));
+        // The persistent inline caches are taken out for this activation (a
+        // recursive activation of the same function finds none and warms its
+        // own) and put back when it returns.
+        let (optimized, mut ic, ic_body): (Option<alloc::rc::Rc<Vec<Op>>>, _, _) = {
+            if ctx.tiers.len() <= id {
+                ctx.tiers.resize_with(id + 1, TierState::default);
             }
-            entry.1.clone()
+            let entry = &mut ctx.tiers[id];
+            entry.calls = entry.calls.saturating_add(1);
+            if entry.calls == TIER_UP_THRESHOLD && entry.body.is_none() {
+                entry.body = Some(alloc::rc::Rc::new(optimize_ops(&funcs[id].ops)));
+            }
+            (
+                entry.body.clone(),
+                core::mem::take(&mut entry.ic),
+                entry.ic_body,
+            )
         };
         let body: &[Op] = match &optimized {
             Some(o) => o.as_slice(),
             None => proto.ops.as_slice(),
         };
+        if ic_body != body.as_ptr() as usize {
+            ic.clear();
+        }
         // Native fast path (`ROADMAP.md` §2.1): once a function is hot, compile it
         // to machine code and run that on this activation's register file (see
         // `jit_tier`). A body with a tail call, a handler or a suspension point is
@@ -4161,7 +4273,18 @@ fn call_with_inner(
             }
             return Ok(NanBox::handle(p.to_raw()));
         }
-        match run_frame(ctx, funcs, body, &mut regs)? {
+        let exit = run_frame_at_ic(ctx, funcs, body, &mut regs, 0, Vec::new(), None, &mut ic);
+        if let Some(entry) = ctx.tiers.get_mut(id) {
+            entry.ic = ic;
+            entry.ic_body = body.as_ptr() as usize;
+        }
+        // A finished activation's window goes back to the pool (a suspended
+        // generator keeps its own, below).
+        if !matches!(exit, Ok(FrameExit::Yield { .. })) && ctx.reg_pool.len() < 64 {
+            regs.clear();
+            ctx.reg_pool.push(core::mem::take(&mut regs));
+        }
+        match exit? {
             FrameExit::Return(v) => return Ok(v.unwrap_or(NanBox::undefined())),
             // A generator's prologue ran: hand back the suspended generator.
             FrameExit::Yield { pc, handlers, .. } if proto.is_generator => {
@@ -4183,8 +4306,8 @@ fn call_with_inner(
                 this,
             } => {
                 id = tid;
-                args = targs;
-                captures = tcaps;
+                args = alloc::borrow::Cow::Owned(targs);
+                captures = alloc::borrow::Cow::Owned(tcaps);
                 this_val = this;
                 callee = None;
                 new_target = None;
@@ -4311,7 +4434,7 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
             host: None,
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
-            tiers: alloc::collections::BTreeMap::new(),
+            tiers: Vec::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_cache: alloc::collections::BTreeMap::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -4332,6 +4455,7 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
             top_frame_roots: Vec::new(),
             pending_callee: None,
             pending_new_target: None,
+            reg_pool: Vec::new(),
             in_realm: None,
         };
         let r = match run_frame(&mut ctx, &[], program, &mut regs) {
@@ -4800,6 +4924,40 @@ fn vm_get_prop(
     key: &str,
     cache: &mut PropertyCache,
 ) -> Result<NanBox, VmError> {
+    // Inline-cache hit first: it only ever matches an own data slot of an
+    // ordinary `Cell::Object` (proxies, typed arrays, RegExps, functions and
+    // arrays are other cell kinds), so of the special cases below only a
+    // host-exotic object (a module namespace, …) must still be excluded. A
+    // String wrapper's `length`/indices are never data slots.
+    //
+    // Then the prototype-chain cache: armed (below) only over a chain of
+    // ordinary shaped objects that are neither host-exotic nor primitive
+    // wrappers, and validated against the live chain on every hit (see
+    // `ic::ChainCache`). Over such a chain the slow path below reduces to the
+    // ordinary `[[Get]]` walk — an accessor on the first object that has the
+    // key as one, else its data slot — which is exactly what a hit returns.
+    if let Some(h) = recv.as_handle().map(Handle::from_raw)
+        && !ctx.realm.is_host_exotic(h)
+    {
+        if let Some(v) = ctx.realm.object_cached_get(h, key, cache) {
+            return Ok(v);
+        }
+        match ctx.realm.chain_cached_get(h, key, cache) {
+            Some(crate::realm::ChainHit::Data(v)) => return Ok(v),
+            Some(crate::realm::ChainHit::Absent) => return Ok(NanBox::undefined()),
+            Some(crate::realm::ChainHit::Accessor(getter, _, own)) => {
+                if getter.as_handle().is_some() {
+                    return call_closure(ctx, funcs, getter, &[], recv);
+                }
+                // An inherited accessor without a getter reads `undefined`; an
+                // own one is left to the slow path's own-property rules.
+                if !own {
+                    return Ok(NanBox::undefined());
+                }
+            }
+            None => ctx.realm.chain_cache_fill(h, key, cache),
+        }
+    }
     // A static-key read of an array's `length` or an index (`let {length} = a`,
     // `{0: x} = a`) lives in the element store, not the named properties.
     if read_needs_host(ctx, recv)
@@ -6137,8 +6295,8 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
             push(&mut roots, *value);
         }
     }
-    for (_, body) in ctx.tiers.values() {
-        for op in body.iter().flat_map(|b| b.iter()) {
+    for t in &ctx.tiers {
+        for op in t.body.iter().flat_map(|b| b.iter()) {
             if let Op::LoadConst { value, .. } = op {
                 push(&mut roots, *value);
             }
@@ -6177,6 +6335,33 @@ fn run_frame_at(
     start_handlers: Vec<(usize, Reg)>,
     inject: Option<NanBox>,
 ) -> Result<FrameExit, VmError> {
+    let mut ic = Vec::new();
+    run_frame_at_ic(
+        ctx,
+        funcs,
+        program,
+        regs,
+        start,
+        start_handlers,
+        inject,
+        &mut ic,
+    )
+}
+
+/// [`run_frame_at`] with the caller's inline caches for `program` (one per
+/// instruction index, sized lazily; see [`TierState`] for when a cache vector
+/// may be carried from one activation to the next).
+#[allow(clippy::too_many_arguments)]
+fn run_frame_at_ic(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    program: &[Op],
+    regs: &mut [NanBox],
+    start: usize,
+    start_handlers: Vec<(usize, Reg)>,
+    inject: Option<NanBox>,
+    ic: &mut Vec<PropertyCache>,
+) -> Result<FrameExit, VmError> {
     let mut pc = start;
     // Active exception handlers: `(catch_pc, catch_reg)`, innermost last.
     let mut handlers: Vec<(usize, Reg)> = start_handlers;
@@ -6199,7 +6384,8 @@ fn run_frame_at(
     // identity, so any object of a different shape (or a dictionary-mode object,
     // whose sentinel shape resolves no key) simply misses and re-resolves —
     // always consistent, never stale across a shape change or property delete.
-    let mut ic: Vec<PropertyCache> = Vec::new();
+    // (`ic` itself is the caller's: see `TierState` for the cross-activation
+    // reuse.)
     // Loop back-edges taken in this activation, for on-stack replacement.
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     let mut osr_count: u32 = 0;
@@ -6813,7 +6999,7 @@ fn run_frame_at(
                 }
             }
             Op::DirectEval { dst, args, strict } => {
-                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                let argv = ArgBuf::from_regs(regs, args);
                 let callee = match with_host(ctx, |h| h.read_global("eval")) {
                     Some(Ok(f)) => f,
                     Some(Err(e)) => {
@@ -7339,6 +7525,22 @@ fn run_frame_at(
             }
             Op::BindThis { this } => {
                 let t = regs[*this as usize];
+                // Fast path, no host round trip. With a single realm, the
+                // callee's realm is the only one, so `OrdinaryCallBindThis` binds
+                // an `undefined`/`null` this to the host's global `this` (which
+                // `global_this_of` returns whenever `created_realms` is empty, and
+                // `multi_realm` is set before the first one is created). An
+                // object this is already its own `ToObject`.
+                if let Some(h) = ctx.host.as_deref() {
+                    if t.is_undefined() || t.is_null() {
+                        if !ctx.realm.multi_realm {
+                            regs[*this as usize] = h.global_this();
+                            continue;
+                        }
+                    } else if is_object_value(&ctx.realm, t) {
+                        continue;
+                    }
+                }
                 let callee = ctx
                     .realm
                     .vm_callee_stack
@@ -7368,7 +7570,7 @@ fn run_frame_at(
                 args,
             } => {
                 let recv_val = regs[*recv as usize];
-                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                let argv = ArgBuf::from_regs(regs, args);
                 let method = match vm_get_elem(ctx, funcs, recv_val, regs[*key as usize]) {
                     Ok(m) => m,
                     Err(e) => {
@@ -7447,7 +7649,7 @@ fn run_frame_at(
             }
             Op::Construct { dst, ctor, args } => {
                 let c = regs[*ctor as usize];
-                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                let argv = ArgBuf::from_regs(regs, args);
                 if c.as_handle()
                     .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
                 {
@@ -8034,7 +8236,7 @@ fn run_frame_at(
                 }
             }
             Op::Call { dst, func, args } => {
-                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                let argv = ArgBuf::from_regs(regs, args);
                 // A throw from the callee is caught by this frame's nearest
                 // handler, else it keeps unwinding. Shared with the generic-JIT
                 // helper via `vm_call` so the two tiers can't diverge.
@@ -8088,7 +8290,7 @@ fn run_frame_at(
                         .as_handle()
                         .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h))) =>
             {
-                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                let argv = ArgBuf::from_regs(regs, args);
                 match call_closure(
                     ctx,
                     funcs,
@@ -8105,9 +8307,9 @@ fn run_frame_at(
                 let (id, caps) = ctx
                     .realm
                     .vm_function(handle)
-                    .map(|(f, c)| (f as usize, c.to_vec()))
+                    .map(|(f, c)| (f as usize, ArgBuf::from_slice(c)))
                     .ok_or(VmError::NotAnObject)?;
-                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                let argv = ArgBuf::from_regs(regs, args);
                 ctx.pending_callee = Some(regs[*callee as usize]);
                 // Publish this frame's registers so a collection at a back-edge inside
                 // the callee can see them (see `Ctx::frame_shadow`).
@@ -8136,7 +8338,7 @@ fn run_frame_at(
                 args,
             } => {
                 let recv_val = regs[*recv as usize];
-                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                let argv = ArgBuf::from_regs(regs, args);
                 // Hosted: a method that is a VM function (a data property on the
                 // receiver's chain) runs here; any other method call — a built-in,
                 // an accessor, a primitive receiver, a missing method's TypeError —
@@ -8156,7 +8358,11 @@ fn run_frame_at(
                         f.as_handle()
                             .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
                     });
-                    let outcome = match legacy_caller.or_else(|| vm_method_of(ctx, recv_val, key)) {
+                    let method = match legacy_caller {
+                        Some(c) => Some(c),
+                        None => vm_method_of_cached(ctx, recv_val, key, site_cache!(site)),
+                    };
+                    let outcome = match method {
                         Some(closure) => {
                             // Publish this frame's registers so a collection at a
                             // back-edge inside the callee can see them.
@@ -8265,7 +8471,7 @@ fn run_frame_at(
             } => {
                 let closure = regs[*callee as usize];
                 let recv_val = regs[*recv as usize];
-                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                let argv = ArgBuf::from_regs(regs, args);
                 // Publish this frame's registers so a collection at a back-edge inside
                 // the callee can see them (see `Ctx::frame_shadow`).
                 let pub_mark = ctx.frame_shadow.len();
@@ -8281,7 +8487,7 @@ fn run_frame_at(
             }
             Op::CallCtor { ctor, recv, args } => {
                 let recv_val = regs[*recv as usize];
-                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                let argv = ArgBuf::from_regs(regs, args);
                 // Publish this frame's registers so a collection at a back-edge inside
                 // the callee can see them (see `Ctx::frame_shadow`).
                 let pub_mark = ctx.frame_shadow.len();
@@ -8303,7 +8509,7 @@ fn run_frame_at(
                 }
             }
             Op::CallNative { dst, native, args } => {
-                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                let argv = ArgBuf::from_regs(regs, args);
                 // Shared with the generic-JIT helper via `vm_call_native` so the two
                 // tiers can't diverge (it handles the interpreter-aware natives —
                 // JSON/Array.from/Number — where `funcs` and the throw machinery are
@@ -8343,10 +8549,10 @@ fn run_frame_at(
             // callee is a plain VM function (the compiler only emits this for a
             // strict `return f(...)`), so no fallback is needed.
             Op::TailCall { func, args } => {
-                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                let argv = ArgBuf::from_regs(regs, args);
                 return Ok(FrameExit::Tail {
                     id: *func as usize,
-                    args: argv,
+                    args: argv.to_vec(),
                     captures: Vec::new(),
                     this: NanBox::undefined(),
                 });
@@ -8357,7 +8563,7 @@ fn run_frame_at(
             Op::TailCallThis { callee, this, args } => {
                 let val = regs[*callee as usize];
                 let this_v = regs[*this as usize];
-                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                let argv = ArgBuf::from_regs(regs, args);
                 if let Some((fid, caps)) = val
                     .as_handle()
                     .map(Handle::from_raw)
@@ -8366,7 +8572,7 @@ fn run_frame_at(
                 {
                     return Ok(FrameExit::Tail {
                         id: fid as usize,
-                        args: argv,
+                        args: argv.to_vec(),
                         captures: caps,
                         this: this_v,
                     });
@@ -8384,7 +8590,7 @@ fn run_frame_at(
             }
             Op::TailCallValue { callee, args } => {
                 let val = regs[*callee as usize];
-                let argv: Vec<NanBox> = args.iter().map(|r| regs[*r as usize]).collect();
+                let argv = ArgBuf::from_regs(regs, args);
                 match val.as_handle().map(Handle::from_raw) {
                     Some(h) if ctx.realm.is_vm_function(h) => {
                         // (A function of a newer table — eval / `Function`
@@ -8398,7 +8604,7 @@ fn run_frame_at(
                         {
                             return Ok(FrameExit::Tail {
                                 id: fid as usize,
-                                args: argv,
+                                args: argv.to_vec(),
                                 captures: caps,
                                 this: NanBox::undefined(),
                             });
@@ -8835,6 +9041,12 @@ fn vm_get_elem(
     recv: NanBox,
     key: NanBox,
 ) -> Result<NanBox, VmError> {
+    // A present element of a plain dense array: nothing can intercept it.
+    if let (Some(h), Some(n)) = (recv.as_handle(), key.as_number())
+        && let Some(v) = ctx.realm.plain_array_get(Handle::from_raw(h), n)
+    {
+        return Ok(v);
+    }
     if read_needs_host(ctx, recv)
         || (ctx.host.is_some() && is_mapped_arguments(&ctx.realm, recv))
         || (ctx.host.is_some() && is_string_wrapper(&ctx.realm, recv))
@@ -9100,6 +9312,64 @@ fn spread_argv(ctx: &Ctx, args: NanBox) -> Result<Vec<NanBox>, VmError> {
         .to_vec())
 }
 
+/// A call's argument (or capture) values, inline up to eight so an ordinary
+/// call does not heap-allocate a vector for them. Derefs to the slice.
+struct ArgBuf {
+    len: usize,
+    inline: [NanBox; ARGBUF_INLINE],
+    heap: Vec<NanBox>,
+}
+
+const ARGBUF_INLINE: usize = 8;
+
+impl ArgBuf {
+    /// The values of registers `rs` of `regs`, in order.
+    #[inline]
+    fn from_regs(regs: &[NanBox], rs: &[Reg]) -> Self {
+        let mut b = ArgBuf {
+            len: rs.len(),
+            inline: [NanBox::undefined(); ARGBUF_INLINE],
+            heap: Vec::new(),
+        };
+        if rs.len() <= ARGBUF_INLINE {
+            for (slot, r) in b.inline.iter_mut().zip(rs) {
+                *slot = regs[*r as usize];
+            }
+        } else {
+            b.heap = rs.iter().map(|r| regs[*r as usize]).collect();
+        }
+        b
+    }
+
+    /// A copy of `vals`.
+    #[inline]
+    fn from_slice(vals: &[NanBox]) -> Self {
+        let mut b = ArgBuf {
+            len: vals.len(),
+            inline: [NanBox::undefined(); ARGBUF_INLINE],
+            heap: Vec::new(),
+        };
+        if vals.len() <= ARGBUF_INLINE {
+            b.inline[..vals.len()].copy_from_slice(vals);
+        } else {
+            b.heap = vals.to_vec();
+        }
+        b
+    }
+}
+
+impl core::ops::Deref for ArgBuf {
+    type Target = [NanBox];
+    #[inline]
+    fn deref(&self) -> &[NanBox] {
+        if self.len <= ARGBUF_INLINE {
+            &self.inline[..self.len]
+        } else {
+            &self.heap
+        }
+    }
+}
+
 fn call_closure(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -9125,7 +9395,7 @@ fn call_closure(
     let (id, caps) = ctx
         .realm
         .vm_function(fh)
-        .map(|(f, c)| (f as usize, c.to_vec()))
+        .map(|(f, c)| (f as usize, ArgBuf::from_slice(c)))
         .ok_or(VmError::NotAnObject)?;
     // A function compiled after this run's table was captured (a module that
     // a dynamic `import()` loaded, eval code) is in the host's grown table,
@@ -22157,6 +22427,84 @@ mod tests {
     }
 
     #[test]
+    fn inline_caches_follow_prototype_and_shape_changes() {
+        // Each site is warmed in a loop, then the chain changes under it; the
+        // persistent per-function caches (`TierState`) and the validated
+        // prototype-chain cache (`ic::ChainCache`) must see the change.
+        for (body, want) in [
+            // A replaced prototype method.
+            (
+                "class A { m() { return 1; } } const a = new A(); let r = '';\
+              for (let i = 0; i < 20; i++) { if (i == 10) A.prototype.m = () => 2; r += a.m(); }\
+              return r;",
+                "11111111112222222222",
+            ),
+            // A getter added on an intermediate prototype shadows a data property.
+            (
+                "const base = { v: 1 }; const mid = Object.create(base); const o = Object.create(mid);\
+              const f = (x) => x.v; let r = '';\
+              for (let i = 0; i < 20; i++) {\
+                if (i == 10) Object.defineProperty(mid, 'v', { get() { return 7; } });\
+                r += f(o); }\
+              return r;",
+                "11111111117777777777",
+            ),
+            // The receiver's prototype is swapped.
+            (
+                "const p1 = { v: 1 }, p2 = { v: 2 }; const o = Object.create(p1); let r = '';\
+              for (let i = 0; i < 20; i++) { if (i == 10) Object.setPrototypeOf(o, p2); r += o.v; }\
+              return r;",
+                "11111111112222222222",
+            ),
+            // An inherited setter appears after the add-property site is warm.
+            (
+                "let hits = 0; function P() {} const mk = () => { const o = new P(); o.x = 1; return o; };\
+              let r = '';\
+              for (let i = 0; i < 20; i++) {\
+                if (i == 10) Object.defineProperty(P.prototype, 'x', { set(v) { hits++; }, get() { return 9; } });\
+                r += mk().x; }\
+              return r + ':' + hits;",
+                "11111111119999999999:10",
+            ),
+            // A read-only inherited property blocks the add (sloppy: silently).
+            (
+                "function Q() {} const mk = () => { const o = new Q(); o.y = 1; return o; }; let r = '';\
+              for (let i = 0; i < 20; i++) {\
+                if (i == 10) Object.defineProperty(Q.prototype, 'y', { value: 5, writable: false });\
+                r += mk().y; }\
+              return r;",
+                "11111111115555555555",
+            ),
+            // Frozen / non-extensible receivers.
+            (
+                "const set = (o) => { o.z = 3; return o.z; }; let r = '';\
+              for (let i = 0; i < 20; i++) {\
+                const o = {}; if (i >= 10) Object.preventExtensions(o); r += String(set(o)); }\
+              return r;",
+                "3333333333undefinedundefinedundefinedundefinedundefinedundefinedundefinedundefinedundefinedundefined",
+            ),
+            (
+                "const set = (o) => { o.w = 4; return o.w; }; let r = '';\
+              for (let i = 0; i < 20; i++) {\
+                const o = { w: 1 }; if (i >= 10) Object.freeze(o); r += set(o); }\
+              return r;",
+                "44444444441111111111",
+            ),
+            // An absent property that later appears on the prototype.
+            (
+                "const pr = {}; const o = Object.create(pr); let r = '';\
+              for (let i = 0; i < 20; i++) { if (i == 10) pr.q = 8; r += String(o.q)[0]; }\
+              return r;",
+                "uuuuuuuuuu8888888888",
+            ),
+        ] {
+            let src = alloc::format!("function h() {{ {body} }}\nString(h())");
+            let (_, completion) = execute(&src).expect("ok");
+            assert_eq!(completion, want, "{body}");
+        }
+    }
+
+    #[test]
     fn operand_read_before_later_operand_assigns_it() {
         // A local lives in a register that `expr` hands back as the operand
         // itself; a later operand assigning the variable must not change the
@@ -24051,7 +24399,7 @@ mod generic_jit_tests {
             host: None,
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
-            tiers: alloc::collections::BTreeMap::new(),
+            tiers: Vec::new(),
             jit_cache: alloc::collections::BTreeMap::new(),
             jit_pending: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -24066,6 +24414,7 @@ mod generic_jit_tests {
             top_frame_roots: Vec::new(),
             pending_callee: None,
             pending_new_target: None,
+            reg_pool: Vec::new(),
             in_realm: None,
         }
     }

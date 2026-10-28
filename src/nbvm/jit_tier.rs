@@ -152,10 +152,11 @@ pub(super) fn osr(
         .iter()
         .position(|f| core::ptr::eq(f.ops.as_ptr(), ptr) && f.ops.len() == program.len())
         .or_else(|| {
-            ctx.tiers.iter().find_map(|(id, (_, body))| {
-                body.as_ref()
+            ctx.tiers.iter().enumerate().find_map(|(id, t)| {
+                t.body
+                    .as_ref()
                     .filter(|b| core::ptr::eq(b.as_ptr(), ptr) && b.len() == program.len())
-                    .map(|_| *id)
+                    .map(|_| id)
             })
         })?;
     let proto = funcs.get(id)?;

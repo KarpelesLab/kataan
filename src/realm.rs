@@ -3849,6 +3849,188 @@ impl Realm {
         self.heap.get(*aux)?.as_object()?.get(key)
     }
 
+    /// A validated hit of the site's prototype-chain cache for `key` on the
+    /// object at `handle` (see [`crate::ic::ChainCache`] for why a hit is
+    /// exact): the data value, or the holder's accessor pair and whether the
+    /// holder is the receiver itself. `None` is a miss (take the slow path).
+    #[must_use]
+    pub fn chain_cached_get(
+        &self,
+        handle: Handle,
+        key: &str,
+        cache: &crate::ic::PropertyCache,
+    ) -> Option<ChainHit> {
+        let chain = cache.chain.as_deref()?;
+        let last = chain.shapes.len().checked_sub(1)?;
+        if chain.absent {
+            // Every object still lacks the key and the chain still ends here.
+            let mut cur = handle;
+            for (i, shape) in chain.shapes.iter().enumerate() {
+                let Some(Cell::Object(o)) = self.heap.get(cur) else {
+                    return None;
+                };
+                if !o.shaped_shape().is_some_and(|s| Rc::ptr_eq(s, shape))
+                    || self.is_host_exotic(cur)
+                    || (!o.has_no_accessors() && o.accessor(key).is_some())
+                {
+                    return None;
+                }
+                match o.proto() {
+                    Some(p) if i < last => cur = p,
+                    None if i == last => return Some(ChainHit::Absent),
+                    _ => return None,
+                }
+            }
+            return None;
+        }
+        let mut cur = handle;
+        for (i, shape) in chain.shapes.iter().enumerate() {
+            let Some(Cell::Object(o)) = self.heap.get(cur) else {
+                return None;
+            };
+            if !o.shaped_shape().is_some_and(|s| Rc::ptr_eq(s, shape)) || self.is_host_exotic(cur) {
+                return None;
+            }
+            let acc = if o.has_no_accessors() {
+                None
+            } else {
+                o.accessor(key)
+            };
+            if i == last {
+                return if chain.accessor {
+                    acc.map(|(g, s)| ChainHit::Accessor(g, s, i == 0))
+                } else if acc.is_some() {
+                    None
+                } else {
+                    o.slot(chain.slot).map(ChainHit::Data)
+                };
+            }
+            if acc.is_some() {
+                return None;
+            }
+            cur = o.proto()?;
+        }
+        None
+    }
+
+    /// Arms the site's prototype-chain cache for `key` from the object at
+    /// `handle`: walks the chain while every object is an ordinary shaped,
+    /// non-host-exotic object (at most eight deep) and records the shapes up to
+    /// the first one that has `key` as an accessor or a data property. Leaves
+    /// the cache unarmed when the walk meets anything else or finds nothing.
+    pub fn chain_cache_fill(
+        &self,
+        handle: Handle,
+        key: &str,
+        cache: &mut crate::ic::PropertyCache,
+    ) {
+        if cache.chain_fills >= crate::ic::CHAIN_FILL_LIMIT {
+            cache.chain = None;
+            return;
+        }
+        cache.chain_fills += 1;
+        cache.chain = None;
+        let mut shapes = Vec::new();
+        let mut cur = handle;
+        for _ in 0..8 {
+            let Some(Cell::Object(o)) = self.heap.get(cur) else {
+                return;
+            };
+            let Some(shape) = o.shaped_shape() else {
+                return;
+            };
+            // A primitive wrapper (its shape has the `\0prim` slot) may own
+            // synthesized String-exotic properties that no slot records, so it
+            // is never cached; every object sharing a cached shape is then
+            // not one either.
+            if self.is_host_exotic(cur) || shape.lookup("\u{0}prim").is_some() {
+                return;
+            }
+            shapes.push(Rc::clone(shape));
+            let (slot, accessor) = if o.accessor(key).is_some() {
+                (0, true)
+            } else if let Some(slot) = shape.lookup(key) {
+                (slot, false)
+            } else {
+                match o.proto() {
+                    Some(p) => {
+                        cur = p;
+                        continue;
+                    }
+                    None => {
+                        cache.chain = Some(alloc::boxed::Box::new(crate::ic::ChainCache {
+                            shapes,
+                            slot: 0,
+                            accessor: false,
+                            absent: true,
+                        }));
+                        return;
+                    }
+                }
+            };
+            cache.chain = Some(alloc::boxed::Box::new(crate::ic::ChainCache {
+                shapes,
+                slot,
+                accessor,
+                absent: false,
+            }));
+            return;
+        }
+    }
+
+    /// Whether the cell at `handle` is an ordinary object ([`Cell::Object`]).
+    #[inline]
+    #[must_use]
+    pub fn is_object_cell(&self, handle: Handle) -> bool {
+        matches!(self.heap.get(handle), Some(Cell::Object(_)))
+    }
+
+    /// Whether a new data property may be added to the object at `handle` the
+    /// ordinary way: a shaped, extensible (so neither sealed nor frozen)
+    /// [`Cell::Object`].
+    #[inline]
+    #[must_use]
+    pub fn object_accepts_new_property(&self, handle: Handle) -> bool {
+        matches!(self.heap.get(handle), Some(Cell::Object(o))
+            if o.is_extensible() && !o.is_frozen() && !o.is_sealed() && o.shaped_shape().is_some())
+    }
+
+    /// Whether `handle` is an ordinary object ([`Cell::Object`]) with no own
+    /// accessor property named `key` (most objects have no accessors at all,
+    /// making this a constant-time test). `false` for any other cell.
+    #[inline]
+    #[must_use]
+    pub fn object_lacks_own_accessor(&self, handle: Handle, key: &str) -> bool {
+        matches!(self.heap.get(handle), Some(Cell::Object(o)) if o.accessor(key).is_none())
+    }
+
+    /// Element `n` of a plain dense array when nothing can intercept the read:
+    /// a present (non-hole) element of a `Cell::Array` with no aux object (so no
+    /// per-index accessor or attribute override, and not a mapped `arguments`)
+    /// that is not host-exotic. `None` sends the read down the full path.
+    #[inline]
+    #[must_use]
+    pub fn plain_array_get(&self, handle: Handle, n: f64) -> Option<NanBox> {
+        let Some(Cell::Array(a)) = self.heap.get(handle) else {
+            return None;
+        };
+        if n.is_nan() || n < 0.0 {
+            return None;
+        }
+        let i = n as usize;
+        if i as f64 != n {
+            return None;
+        }
+        let v = *a.get(i)?;
+        if v.is_hole()
+            || self.aux_props.contains_key(&handle.to_raw())
+            || self.is_host_exotic(handle)
+        {
+            return None;
+        }
+        Some(v)
+    }
+
     /// The inline-cache fast path for a plain object's `GetProp`: reads own data
     /// property `key` on the object at `handle`, consulting `cache` so a repeat
     /// access on the same shape skips the name lookup (a shape-pointer compare
@@ -7607,4 +7789,15 @@ mod tests {
         assert!(realm.is_live(arr));
         assert_eq!(realm.get_property(arr, "tag"), Some(NanBox::number(3.0)));
     }
+}
+
+/// A validated prototype-chain cache hit (see [`Realm::chain_cached_get`]).
+#[derive(Clone, Copy, Debug)]
+pub enum ChainHit {
+    /// A data property's value.
+    Data(NanBox),
+    /// An accessor's `(getter, setter)`, and whether its holder is the receiver.
+    Accessor(NanBox, NanBox, bool),
+    /// No object on the chain has the key (the chain ends in null).
+    Absent,
 }

@@ -344,6 +344,23 @@ impl Object {
             .map(|(_, g, s)| (*g, *s))
     }
 
+    /// The object's shape when it is in shaped (non-dictionary) mode.
+    #[inline]
+    #[must_use]
+    pub fn shaped_shape(&self) -> Option<&Rc<Shape>> {
+        match &self.data {
+            ObjectData::Shaped { shape, .. } => Some(shape),
+            ObjectData::Dict { .. } => None,
+        }
+    }
+
+    /// Whether the object has no accessor properties at all.
+    #[inline]
+    #[must_use]
+    pub fn has_no_accessors(&self) -> bool {
+        self.extra.as_deref().is_none_or(|e| e.accessors.is_empty())
+    }
+
     /// The object's current shape (its hidden class). In dictionary mode this is
     /// an empty sentinel shape, so any inline cache keyed on the returned pointer
     /// resolves no key and misses — a dictionary object never binds an IC.

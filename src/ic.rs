@@ -33,6 +33,41 @@ pub struct PropertyCache {
     hits: u32,
     /// Times it did not (cold, shape change, or absent property).
     misses: u32,
+    /// The site's prototype-chain entry (see [`ChainCache`]), armed by a lookup
+    /// that had to look past the receiver's own data slots.
+    pub chain: Option<alloc::boxed::Box<ChainCache>>,
+    /// How many times `chain` was (re)armed: a site that keeps missing is
+    /// polymorphic, and stops paying for re-arming after a few.
+    pub chain_fills: u16,
+}
+
+/// How many times a site's [`ChainCache`] may be (re)armed.
+pub const CHAIN_FILL_LIMIT: u16 = 16;
+
+/// A prototype-chain inline cache: where a lookup of the site's key found its
+/// property, as the shapes of every object it visited, receiver first and
+/// holder last, plus the holder's slot (or the fact that the holder has an
+/// accessor of that name).
+///
+/// It is validated, never trusted: a hit re-walks the *live* `[[Prototype]]`
+/// links from the receiver and requires each object to be an ordinary shaped
+/// object whose shape is pointer-identical to the recorded one (the `Rc`s here
+/// keep those shapes alive, so identity cannot be faked by address reuse).
+/// A shape fixes an object's data keys and their slots, so an equal shape
+/// proves an intermediate object still lacks the key as a data property and
+/// the holder still has it at `slot`. Accessors live outside the shape, so the
+/// walk re-checks them on every visited object. A cached handle is never
+/// dereferenced; only links read from live objects are.
+pub struct ChainCache {
+    /// The shapes along the chain, receiver first, holder last.
+    pub shapes: alloc::vec::Vec<Rc<Shape>>,
+    /// The holder's slot for a data property.
+    pub slot: u32,
+    /// Whether the holder's property is an accessor (re-read on each hit).
+    pub accessor: bool,
+    /// Whether no object on the chain has the key: `shapes` is then the whole
+    /// chain, and its last object's `[[Prototype]]` is null.
+    pub absent: bool,
 }
 
 impl PropertyCache {
