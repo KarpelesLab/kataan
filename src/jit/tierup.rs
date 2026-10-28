@@ -20,6 +20,8 @@
 //! the function recompile forever.
 
 use super::{GenericOp, JitProto};
+use crate::shape::Shape;
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 
 /// How many times a function's generic body may be recompiled.
@@ -32,14 +34,17 @@ pub(super) struct TierUp {
     /// Per loop header (ascending): the `(site, is a write)` of the property
     /// sites between it and its last back-edge.
     pub(super) loops: Vec<(usize, Vec<(u16, bool)>)>,
-    /// Per site: the shape word its code compares with, if it has a layout
-    /// compiled in.
-    pub(super) baked: Vec<Option<u64>>,
+    /// Per site: the layout compiled into its code, if any, and the slot.
+    pub(super) baked: Vec<Option<(Rc<Shape>, u32)>>,
     /// How many recompilations produced this body (`0`: the first compile).
     pub(super) generation: u8,
     /// Polls left until the next real check ([`CHECK_EVERY`]).
     pub(super) countdown: core::cell::Cell<u8>,
 }
+
+/// The hits a compiled-in layout counts as when it seeds a recompilation
+/// (enough to be compiled in again).
+const BAKED_HITS: u32 = 1 << 16;
 
 /// One back-edge poll in this many checks the sites: a long loop polls
 /// every thousand or so iterations, but a short-lived activation polls at its
@@ -50,7 +55,7 @@ const CHECK_EVERY: u8 = 8;
 impl TierUp {
     /// The checks' data for lowered `ops`, whose sites `baked` has compiled
     /// in.
-    pub(super) fn plan(ops: &[GenericOp], baked: Vec<Option<u64>>) -> Self {
+    pub(super) fn plan(ops: &[GenericOp], baked: Vec<Option<(Rc<Shape>, u32)>>) -> Self {
         let mut site_pcs = Vec::new();
         for (pc, op) in ops.iter().enumerate() {
             if let GenericOp::GetProp { site, .. } | GenericOp::SetProp { site, .. } = *op {
@@ -145,13 +150,18 @@ impl JitProto {
                 return false;
             };
             !(write && (by_add || shape.is_wrapper()))
-                && t.baked.get(site).copied().flatten() != Some(super::props::shape_word(shape))
+                && !t
+                    .baked
+                    .get(site)
+                    .is_some_and(|b| b.as_ref().is_some_and(|(s, _)| Rc::ptr_eq(s, shape)))
                 && shape.lookup(key) == Some(slot)
         })
     }
 
     /// The memos this body's own property-site caches hold, by bytecode pc
-    /// (the warm start of its recompilation).
+    /// (the warm start of its recompilation). A site with a layout compiled
+    /// in reports that layout as settled unless its cache settled on
+    /// another: the compiled-in compare, not the cache, counts its hits.
     #[must_use]
     pub fn runtime_warm(&self) -> Vec<Option<crate::ic::WarmEntry>> {
         let Some(s) = self.sites.as_ref() else {
@@ -160,12 +170,24 @@ impl JitProto {
         let n = s.tier_up.site_pcs.last().map_or(0, |&(pc, _)| pc + 1);
         let mut out = alloc::vec![None; n];
         for &(pc, site) in &s.tier_up.site_pcs {
-            if let Some(c) = s.caches.get(site as usize) {
-                // SAFETY: as in `wants_recompile` (or the body is not running).
-                #[allow(unsafe_code)]
-                let w = unsafe { (*c.get()).warm_entry() };
-                out[pc] = w;
-            }
+            let Some(c) = s.caches.get(site as usize) else {
+                continue;
+            };
+            // SAFETY: as in `wants_recompile` (or the body is not running).
+            #[allow(unsafe_code)]
+            let w = unsafe { (*c.get()).warm_entry() };
+            let baked = s.tier_up.baked.get(site as usize).cloned().flatten();
+            out[pc] = match (w, baked) {
+                (Some(w), _) if w.is_stable() => Some(w),
+                (_, Some((shape, slot))) => Some(crate::ic::WarmEntry {
+                    shape,
+                    slot,
+                    hits: BAKED_HITS,
+                    misses: 0,
+                    by_add: false,
+                }),
+                (w, None) => w,
+            };
         }
         out
     }

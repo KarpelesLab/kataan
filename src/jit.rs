@@ -3307,6 +3307,8 @@ impl JitProto {
         // and a stable one is compiled in (its shape kept alive by `baked`).
         let mut baked_at: Vec<Option<Baked>> = alloc::vec![None; keys.len()];
         let mut baked: Vec<alloc::rc::Rc<crate::shape::Shape>> = Vec::new();
+        let mut tier_baked: Vec<Option<(alloc::rc::Rc<crate::shape::Shape>, u32)>> =
+            alloc::vec![None; keys.len()];
         for (pc, op) in ops.iter().enumerate() {
             let (site, write) = match *op {
                 GenericOp::GetProp { site, .. } => (site as usize, false),
@@ -3330,6 +3332,7 @@ impl JitProto {
                     slot: w.slot,
                 });
                 baked.push(alloc::rc::Rc::clone(&w.shape));
+                tier_baked[site] = Some((alloc::rc::Rc::clone(&w.shape), w.slot));
             }
         }
         // A chain cache for each method-call and property-write site.
@@ -3370,8 +3373,7 @@ impl JitProto {
                 baked: None,
             })
             .collect();
-        let tier_up =
-            tierup::TierUp::plan(&ops, baked_at.iter().map(|b| b.map(|b| b.shape)).collect());
+        let tier_up = tierup::TierUp::plan(&ops, tier_baked);
         let site_info: Vec<SiteInfo> = site_info
             .into_iter()
             .zip(baked_at)
