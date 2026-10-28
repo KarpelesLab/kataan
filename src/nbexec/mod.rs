@@ -7306,132 +7306,121 @@ pub(crate) fn pad_units(s: &[u8], target: usize, pad: &[u8], at_start: bool) -> 
     out
 }
 
-/// `Number.prototype.toPrecision(p)`: render `n` with `p` significant digits,
-/// choosing fixed or exponential notation by magnitude (as the spec does).
 /// `Number.prototype.toExponential` with `frac` fractional digits (`None` =
-/// "as many digits as needed to represent the value uniquely"). Uses ties-away
-/// rounding (the spec picks the larger `n` on an exact tie), unlike Rust's
-/// ties-to-even formatter, and never emits a `-0` sign. The exponent carries an
-/// explicit sign (`1.23e+4`, `5e-3`).
+/// "as many digits as needed to represent the value uniquely", the
+/// `Number::toString` digits). Never emits a `-0` sign; the exponent carries
+/// an explicit sign (`1.23e+4`, `5e-3`).
 fn format_exponential(n: f64, frac: Option<usize>) -> String {
     debug_assert!(n.is_finite());
     let neg = n.is_sign_negative() && n != 0.0;
     let abs = n.abs();
-    // Build the mantissa string and its exponent. For a fixed digit count we
-    // render with one guard digit and round ties-away (the spec picks the larger
-    // value on an exact tie), unlike Rust's ties-to-even formatter. The exponent
-    // is read from the *same* rendering so a tie-induced carry (`9.995 → 1.00`,
-    // exponent +1) stays consistent.
-    let (mantissa, exp) = match frac {
-        Some(f) => {
-            // Render with many guard digits so the ties-away rounding decision
-            // sees the exact decimal expansion (one guard digit alone is itself
-            // pre-rounded by Rust's formatter and would mis-round, e.g.
-            // `123456 → 1.235` then up to `1.24` instead of `1.23`).
-            let mantissa_full = alloc::format!("{:.*e}", f + 25, abs);
-            let mut exp: i32 = mantissa_full
-                .rfind('e')
-                .and_then(|i| mantissa_full[i + 1..].parse().ok())
-                .unwrap_or(0);
-            let m = round_exp_mantissa(&mantissa_full, f, &mut exp);
-            (m, exp)
-        }
+    let (digits, exp) = match frac {
+        _ if abs == 0.0 => (alloc::vec![b'0'; frac.unwrap_or(0) + 1], 0),
+        Some(f) => round_significant_half_up(abs, f + 1),
         None => {
-            // Shortest unique mantissa: Rust's default `{:e}` already does this.
-            let sci = alloc::format!("{abs:e}");
-            let exp: i32 = sci
-                .rfind('e')
-                .and_then(|i| sci[i + 1..].parse().ok())
-                .unwrap_or(0);
-            (String::from(sci.split('e').next().unwrap_or("0")), exp)
+            let (d, e) = crate::realm::shortest_decimal_digits(abs);
+            (d.into_bytes(), e - 1)
         }
     };
-    let sign = if exp < 0 { '-' } else { '+' };
+    let mut out = String::new();
     if neg {
-        alloc::format!("-{mantissa}e{sign}{}", exp.abs())
-    } else {
-        alloc::format!("{mantissa}e{sign}{}", exp.abs())
+        out.push('-');
     }
+    out.push(char::from(digits[0]));
+    if digits.len() > 1 {
+        out.push('.');
+        out.extend(digits[1..].iter().map(|&b| char::from(b)));
+    }
+    out.push_str(if exp < 0 { "e-" } else { "e+" });
+    out.push_str(&alloc::format!("{}", exp.abs()));
+    out
 }
 
-/// Rounds a scientific-notation mantissa string (e.g. `"2.50"`, from Rust's
-/// ties-to-even formatter rendered with one guard digit) to `f` fractional
-/// digits using ties-away rounding, adjusting `exp` if a carry bumps the leading
-/// digit (`9.95 → 1.00`, exponent +1).
-fn round_exp_mantissa(mantissa_full: &str, f: usize, exp: &mut i32) -> String {
-    // `mantissa_full` is `d.ddd...` with `f + 1` fractional digits (no exponent
-    // part — we strip it).
-    let core = mantissa_full.split('e').next().unwrap_or(mantissa_full);
-    let digits: Vec<u8> = core.bytes().filter(u8::is_ascii_digit).collect();
-    // We keep `f + 1` digits total (1 integer + f fractional) and round on the
-    // last guard digit.
-    let keep = f + 1;
-    let mut kept: Vec<u8> = digits.iter().take(keep).copied().collect();
-    while kept.len() < keep {
-        kept.push(b'0');
+/// The `sig` leading decimal digits of a finite `abs > 0`, rounded to nearest
+/// with an exact tie going *up* (toExponential/toPrecision: "if there are two
+/// such sets of e and n, pick the e and n for which n × 10^(e–f) is larger"),
+/// and the decimal exponent of the first digit. Rust's correctly rounded
+/// formatter breaks ties to even, so it only supplies digits: `sig + 30` of
+/// them decide the rounding, unless the dropped tail reads exactly `5000…0`,
+/// which a carry inside those guard digits could fake. Then the exact
+/// expansion (a double has at most 767 significant digits) settles it.
+fn round_significant_half_up(abs: f64, sig: usize) -> (Vec<u8>, i32) {
+    fn split(s: &str) -> (Vec<u8>, i32) {
+        let (mant, exp) = s.split_once('e').unwrap_or((s, "0"));
+        (
+            mant.bytes().filter(u8::is_ascii_digit).collect(),
+            exp.parse().unwrap_or(0),
+        )
     }
-    let round_up = digits.get(keep).is_some_and(|&d| d >= b'5');
-    if round_up {
-        let mut i = kept.len();
+    let (mut digits, mut exp) = split(&alloc::format!("{:.*e}", sig + 29, abs));
+    let tail = &digits[sig..];
+    let up = if tail[0] != b'5' || tail[1..].iter().any(|&d| d != b'0') {
+        tail[0] >= b'5'
+    } else {
+        let (exact, _) = split(&alloc::format!("{:.*e}", 780, abs));
+        exact[sig] >= b'5'
+    };
+    digits.truncate(sig);
+    if up {
+        let mut i = sig;
         loop {
             if i == 0 {
-                // Carry past the most significant digit: prepend 1 and bump exp.
-                kept.insert(0, b'1');
-                kept.pop();
-                *exp += 1;
+                // Carry past the leading digit: `9.99 → 10.0`, one more decade.
+                digits.insert(0, b'1');
+                digits.truncate(sig);
+                exp += 1;
                 break;
             }
             i -= 1;
-            if kept[i] == b'9' {
-                kept[i] = b'0';
+            if digits[i] == b'9' {
+                digits[i] = b'0';
             } else {
-                kept[i] += 1;
+                digits[i] += 1;
                 break;
             }
         }
     }
-    let int_part = kept[0] as char;
-    if f == 0 {
-        alloc::format!("{int_part}")
-    } else {
-        let frac_part: String = kept[1..=f].iter().map(|&b| b as char).collect();
-        alloc::format!("{int_part}.{frac_part}")
-    }
+    (digits, exp)
 }
 
+/// `Number.prototype.toPrecision(p)`: render `n` with `p` significant digits
+/// (ties rounding up), in fixed notation unless the exponent is below -6 or
+/// at least `p`.
 fn format_precision(n: f64, p: usize) -> String {
-    if n == 0.0 {
-        return alloc::format!("{:.*}", p - 1, 0.0);
-    }
     if !n.is_finite() {
-        return if n.is_nan() {
-            String::from("NaN")
-        } else if n > 0.0 {
-            String::from("Infinity")
-        } else {
-            String::from("-Infinity")
-        };
+        return crate::realm::js_number_string(n);
     }
-    // Derive the decimal exponent from the default scientific rendering (no
-    // `log10`, which isn't available in the no_std float set).
-    let sci = alloc::format!("{:e}", n.abs());
-    let e: i32 = sci
-        .rfind('e')
-        .and_then(|i| sci[i + 1..].parse().ok())
-        .unwrap_or(0);
+    let (digits, e) = if n == 0.0 {
+        (alloc::vec![b'0'; p], 0)
+    } else {
+        round_significant_half_up(n.abs(), p)
+    };
+    let mut out = String::new();
+    if n < 0.0 {
+        out.push('-');
+    }
+    let push_digits = |out: &mut String, d: &[u8]| out.extend(d.iter().map(|&b| char::from(b)));
     if e < -6 || e >= p as i32 {
-        // Exponential notation with p-1 fractional digits. Rust omits the `+` on
-        // a non-negative exponent; JavaScript includes it (`1e+4`, not `1e4`).
-        let s = alloc::format!("{:.*e}", p - 1, n);
-        return match s.find('e') {
-            Some(epos) if s.as_bytes().get(epos + 1) != Some(&b'-') => {
-                alloc::format!("{}e+{}", &s[..epos], &s[epos + 1..])
-            }
-            _ => s,
-        };
+        push_digits(&mut out, &digits[..1]);
+        if p > 1 {
+            out.push('.');
+            push_digits(&mut out, &digits[1..]);
+        }
+        out.push_str(if e < 0 { "e-" } else { "e+" });
+        out.push_str(&alloc::format!("{}", e.abs()));
+    } else if e >= 0 {
+        let int_len = e as usize + 1;
+        push_digits(&mut out, &digits[..int_len]);
+        if p > int_len {
+            out.push('.');
+            push_digits(&mut out, &digits[int_len..]);
+        }
+    } else {
+        out.push_str("0.");
+        out.extend(core::iter::repeat_n('0', (-e - 1) as usize));
+        push_digits(&mut out, &digits);
     }
-    let decimals = (p as i32 - 1 - e).max(0) as usize;
-    alloc::format!("{n:.decimals$}")
+    out
 }
 
 /// Quotes and escapes WTF-8 bytes as a JSON string literal onto `out`,
@@ -8313,37 +8302,136 @@ pub(crate) fn int_to_radix(n: f64, radix: u32) -> String {
     const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     let neg = n < 0.0;
     let abs = if neg { -n } else { n };
-    // Integer part (the `as u64` cast truncates toward zero — no `std` float math).
-    let mut v = abs as u64;
-    let mut ibuf = Vec::new();
-    if v == 0 {
-        ibuf.push(b'0');
-    }
-    while v > 0 {
-        ibuf.push(DIGITS[(v % radix as u64) as usize]);
-        v /= radix as u64;
-    }
-    ibuf.reverse();
     let mut out = String::new();
     if neg {
         out.push('-');
     }
-    out.push_str(&String::from_utf8(ibuf).unwrap_or_default());
-    // Fractional part (bounded digit count to terminate on repeating fractions).
-    let mut frac = abs - (abs as u64) as f64;
-    if frac > 0.0 {
-        out.push('.');
-        for _ in 0..20 {
-            if frac <= 0.0 {
-                break;
+    // An integer below 2^53 is exact in any radix: plain repeated division.
+    if abs < 9_007_199_254_740_992.0 && abs == (abs as u64) as f64 {
+        let mut v = abs as u64;
+        let mut ibuf = Vec::new();
+        if v == 0 {
+            ibuf.push(b'0');
+        }
+        while v > 0 {
+            ibuf.push(DIGITS[(v % radix as u64) as usize]);
+            v /= radix as u64;
+        }
+        out.extend(ibuf.iter().rev().map(|&b| char::from(b)));
+        return out;
+    }
+    out.push_str(&float_to_radix(abs, radix));
+    out
+}
+
+/// `Number::toString(x, radix)` for a finite `abs > 0` that is not a small
+/// integer: the generalization of the radix-10 algorithm the spec asks for.
+/// The result is the *shortest* positional radix-`radix` numeral that still
+/// reads back as `abs`: the coarsest digit position `p` (units of
+/// `radix^p`, negative for fraction digits) at which `abs`, rounded to a
+/// multiple of `radix^p`, stays strictly inside `abs`'s rounding interval
+/// (half the gap to each neighbouring double, inclusive when the
+/// significand is even). Integer digits below that
+/// position are zeros, as in radix 10 (`1e21.toString(36)` ends in zeros).
+/// Exact arithmetic: `abs = m·2^q` is held as a big-integer ratio.
+fn float_to_radix(abs: f64, radix: u32) -> String {
+    use crate::bignum::BigInt;
+    let big = |v: i128| BigInt::from_i128(v);
+    let bits = abs.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (m, q) = if biased == 0 {
+        (frac, -1074)
+    } else {
+        (frac | (1u64 << 52), biased - 1075)
+    };
+    // The gap below a power of two is half the gap above it.
+    let tight_below = biased > 1 && frac == 0;
+    // Numerators over the common denominator `den`, everything times 4 so the
+    // half-gaps (2^(q-1) above; 2^(q-1), or 2^(q-2) when tight, below) are
+    // integers too.
+    let scale = big(2).pow(q.max(0) as u64);
+    let den = big(4).mul(&big(2).pow((-q).max(0) as u64));
+    let mut v = big(4 * i128::from(m)).mul(&scale);
+    let mut above = big(2).mul(&scale);
+    let mut below = big(if tight_below { 1 } else { 2 }).mul(&scale);
+    let rb = big(i128::from(radix));
+    let one = big(1);
+    let int_part = v.divmod(&den).map(|(i, _)| i).unwrap_or_default();
+    // Start one position above the leading digit (`radix^p > abs`).
+    let mut p: i32 = if int_part.is_zero() {
+        0
+    } else {
+        int_part.to_str_radix(radix).len() as i32
+    };
+    loop {
+        // Below position 0 the numerators carry the extra `radix^-p` factor
+        // instead of the unit shrinking.
+        let unit = if p > 0 {
+            den.mul(&rb.pow(p as u64))
+        } else {
+            den.clone()
+        };
+        let (quot, rem) = v.divmod(&unit).unwrap_or_default();
+        // A candidate exactly half a gap away still reads back as `abs` when
+        // `m` is even (reading rounds ties to even).
+        let within =
+            |dist: BigInt, half_gap: &BigInt| dist < *half_gap || (dist == *half_gap && m % 2 == 0);
+        // The multiples of the unit on either side of `abs`, the nearer first
+        // (a tie goes up). At a power of two the interval is lopsided, so the
+        // farther one can be inside when the nearer is not.
+        let down = quot.clone();
+        let up = quot.add(&one);
+        let (first, second) = if rem.add(&rem) >= unit {
+            (up, down)
+        } else {
+            (down, up)
+        };
+        let fits = |r: &BigInt| {
+            let cand = r.mul(&unit);
+            !r.is_zero()
+                && if cand >= v {
+                    within(cand.sub(&v), &above)
+                } else {
+                    within(v.sub(&cand), &below)
+                }
+        };
+        let r = if fits(&first) {
+            Some(first)
+        } else if fits(&second) {
+            Some(second)
+        } else {
+            None
+        };
+        if let Some(r) = r {
+            let digits = r.to_str_radix(radix);
+            if p >= 0 {
+                let mut s = digits;
+                s.extend(core::iter::repeat_n('0', p as usize));
+                return s;
             }
-            frac *= radix as f64;
-            let digit = (frac as usize).min(radix as usize - 1);
-            out.push(DIGITS[digit] as char);
-            frac -= digit as f64;
+            let fd = (-p) as usize;
+            let mut s = String::new();
+            s.extend(core::iter::repeat_n(
+                '0',
+                (fd + 1).saturating_sub(digits.len()),
+            ));
+            s.push_str(&digits);
+            let (int, fr) = s.split_at(s.len() - fd);
+            let fr = fr.trim_end_matches('0');
+            return if fr.is_empty() {
+                String::from(int)
+            } else {
+                alloc::format!("{int}.{fr}")
+            };
+        }
+        p -= 1;
+        if p < 0 {
+            v = v.mul(&rb);
+            above = above.mul(&rb);
+            below = below.mul(&rb);
         }
     }
-    out
 }
 
 /// Parses the longest leading decimal-float prefix of `s` (à la `parseFloat`),

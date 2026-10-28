@@ -6949,9 +6949,10 @@ fn js_str_to_f64(t: &str) -> f64 {
     t.parse::<f64>().unwrap_or(f64::NAN)
 }
 
-/// Renders a number as ECMAScript `ToString` would for the cases the engine
-/// produces: `±Infinity` (not Rust's `inf`) and `NaN`; finite values use Rust's
-/// `Display` (which omits a trailing `.0` for integers).
+/// Renders a number as ECMAScript `Number::toString(x, 10)`: `±Infinity`,
+/// `NaN`, and for a finite value the shortest round-tripping digits (see
+/// [`shortest_decimal_digits`]) laid out in fixed or exponential notation by
+/// the spec's thresholds.
 #[must_use]
 pub(crate) fn js_number_string(n: f64) -> alloc::string::String {
     if n.is_nan() {
@@ -6964,24 +6965,71 @@ pub(crate) fn js_number_string(n: f64) -> alloc::string::String {
     if n == 0.0 {
         return "0".into();
     }
-    let mut digits = alloc::string::String::new();
-    if builtins_fast::push_small_integer(&mut digits, n) {
-        return digits;
+    let mut out = alloc::string::String::new();
+    if builtins_fast::push_small_integer(&mut out, n) {
+        return out;
     }
-    let abs = n.abs();
-    // JS uses exponential notation for magnitudes ≥ 1e21 or (nonzero) < 1e-6.
-    if abs != 0.0 && !(1e-6..1e21).contains(&abs) {
-        let s = alloc::format!("{n:e}"); // e.g. "1e21", "1.5e-7"
-        if let Some(epos) = s.find('e') {
-            let mant = &s[..epos];
-            let exp: i64 = s[epos + 1..].parse().unwrap_or(0);
-            let sign = if exp >= 0 { "+" } else { "-" };
-            return alloc::format!("{mant}e{sign}{}", exp.abs());
-        }
-        s
+    // `abs = 0.digits × 10^e` (the spec's `s`, `k` and `n`).
+    let (digits, e) = shortest_decimal_digits(n.abs());
+    let k = digits.len() as i32;
+    if n < 0.0 {
+        out.push('-');
+    }
+    if k <= e && e <= 21 {
+        out.push_str(&digits);
+        out.extend(core::iter::repeat_n('0', (e - k) as usize));
+    } else if 0 < e && e <= 21 {
+        out.push_str(&digits[..e as usize]);
+        out.push('.');
+        out.push_str(&digits[e as usize..]);
+    } else if -6 < e && e <= 0 {
+        out.push_str("0.");
+        out.extend(core::iter::repeat_n('0', (-e) as usize));
+        out.push_str(&digits);
     } else {
-        alloc::format!("{n}")
+        out.push_str(&digits[..1]);
+        if k > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push_str(if e > 0 { "e+" } else { "e-" });
+        out.push_str(&alloc::format!("{}", (e - 1).abs()));
     }
+    out
+}
+
+/// The ECMAScript `Number::toString` digits of a finite `abs > 0`: the
+/// digit string `s` (no trailing zeros) and the exponent `n` with
+/// `abs = 0.s × 10^n`, `s` as short as possible and, among the shortest
+/// candidates, the closest to the exact value, an exact tie going to the even
+/// digit (the spec's note to step 5).
+///
+/// Rust's shortest formatter gives the minimal length but may break such a tie
+/// toward the odd digit (`2**-25` → `…313e-8`, not `…312e-8`). Two equally
+/// short candidates can only both round-trip at 16 or more digits (below that,
+/// the digit spacing exceeds an ulp), so only those take the second,
+/// correctly rounded (ties-to-even) rendering at the same length.
+#[must_use]
+pub(crate) fn shortest_decimal_digits(abs: f64) -> (alloc::string::String, i32) {
+    let (mut digits, mut exp) = sci_digits(&alloc::format!("{abs:e}"));
+    if digits.len() >= 16 {
+        let nearest = alloc::format!("{:.*e}", digits.len() - 1, abs);
+        if nearest.parse::<f64>().ok() == Some(abs) {
+            (digits, exp) = sci_digits(&nearest);
+        }
+    }
+    (digits, exp + 1)
+}
+
+/// The significant digits (trailing zeros dropped) and the decimal exponent of
+/// a Rust `{:e}` rendering such as `"2.5e-3"`.
+fn sci_digits(s: &str) -> (alloc::string::String, i32) {
+    let (mant, exp) = s.split_once('e').unwrap_or((s, "0"));
+    let mut digits: alloc::string::String = mant.chars().filter(char::is_ascii_digit).collect();
+    while digits.len() > 1 && digits.ends_with('0') {
+        digits.pop();
+    }
+    (digits, exp.parse().unwrap_or(0))
 }
 
 /// The civil date `(year, month [1-12], day [1-31])` for a day count `z` since

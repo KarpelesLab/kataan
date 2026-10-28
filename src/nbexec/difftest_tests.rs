@@ -59,3 +59,28 @@ fn continue_targets_past_switch_and_labeled_blocks() {
         "0:0,1:0|0:0,0:1,1:0,1:1|0,1,2,b,e2,one,e1,e2|00,10"
     );
 }
+
+/// Number→String rounding. `ToString` picks the shortest round-tripping
+/// digits and, between two equally short candidates equally close to the
+/// value, the even one; `toPrecision`/`toExponential` round an exact tie up
+/// (and a carry adds a decade: `9.99` to 2 digits is `10`); a radix other
+/// than 10 gives the shortest numeral that reads back exactly (it truncated
+/// fractions to 20 digits and saturated integer parts at 2^64).
+#[test]
+fn number_to_string_rounding() {
+    let src = r#"
+        [String(2 ** -25), String(-1482983220584872.25), (2 ** -25).toExponential(),
+         (2 ** -25).toPrecision(17), (8.225e18).toPrecision(3), (2.5e17).toPrecision(1),
+         (9.99).toPrecision(2), (99.99).toPrecision(1), (0).toPrecision(3), (-1.5).toPrecision(1),
+         (1.25).toExponential(1), (0).toExponential(2), (123.456).toPrecision(5),
+         (1e-10).toString(2).length, (2 ** 70 + 2 ** 20).toString(2).slice(-21),
+         (255.5).toString(16), (1e21).toString(36), (0.1).toString(3),
+         (1.550650161452515e-266).toString(21).length].join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "2.9802322387695312e-8 -1482983220584872.2 2.9802322387695312e-8 \
+         2.9802322387695313e-8 8.23e+18 3e+17 10 1e+2 0.00 -2 1.3e+0 0.00e+0 123.46 \
+         88 100000000000000000000 ff.8 5v1j4f4ds7a000 0.0022002200220022002200220022002201 215"
+    );
+}
