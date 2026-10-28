@@ -4443,6 +4443,15 @@ impl Interp {
                     let f = arg(0);
                     let this_arg = arg(1);
                     let arr = callback_recv;
+                    // A non-default `@@species` must be constructed *before* any
+                    // callback runs, with `len`, and filled by
+                    // CreateDataPropertyOrThrow alone (no `length` write): the
+                    // spec-exact per-index algorithm does exactly that.
+                    if receiver_is_real_array
+                        && !crate::nbvm::array_species_is_default(&self.realm, handle)
+                    {
+                        return Ok(Some(self.array_map_filter_generic("map", handle, args)?));
+                    }
                     // Typed-array `%TypedArray%.prototype.map`: per spec the result
                     // is allocated via TypedArraySpeciesCreate(O, «len») *before*
                     // the loop (a throwing species getter/ctor must abort before
@@ -4502,6 +4511,15 @@ impl Interp {
                     let f = arg(0);
                     let this_arg = arg(1);
                     let arr = callback_recv;
+                    // A non-default `@@species` must be constructed *before* any
+                    // callback runs, with `0`, and filled by
+                    // CreateDataPropertyOrThrow alone (no `length` write): the
+                    // spec-exact per-index algorithm does exactly that.
+                    if receiver_is_real_array
+                        && !crate::nbvm::array_species_is_default(&self.realm, handle)
+                    {
+                        return Ok(Some(self.array_map_filter_generic("filter", handle, args)?));
+                    }
                     // Typed array: `len` is cached, each kValue read live (a callback
                     // resize/detach is observed), kept values collected, then the
                     // result is allocated via TypedArraySpeciesCreate(O, «kept»).

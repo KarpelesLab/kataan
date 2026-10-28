@@ -107,7 +107,7 @@ fn chain_data(realm: &Realm, h: Handle, key: &str) -> Result<Option<NanBox>, ()>
 
 /// Whether `ArraySpeciesCreate(O, n)` for the array `h` is the default
 /// `ArrayCreate(n)`, decided with no observable effect (see the module docs).
-fn default_species(realm: &Realm, h: Handle) -> bool {
+pub(super) fn default_species(realm: &Realm, h: Handle) -> bool {
     let Ok(Some(c)) = chain_data(realm, h, "constructor") else {
         return false;
     };

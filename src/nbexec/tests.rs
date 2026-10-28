@@ -7290,6 +7290,19 @@ fn flat_flatmap_skip_absent_array_like_indices() {
 }
 
 #[test]
+fn map_filter_custom_species_order_and_no_length_write() {
+    // `map`/`filter` run ArraySpeciesCreate(O, len / 0) before any callback and
+    // fill the result with CreateDataPropertyOrThrow only; there is no
+    // `Set(A, "length")` (a custom species result must not grow a `length`).
+    let src = "var log=[];\
+        class A extends Array{static get [Symbol.species](){return function(n){log.push('c'+n)}}}\
+        var a=A.from([1,2,3]);var r=a.map(x=>(log.push('m'+x),x));\
+        var f=a.filter(x=>(log.push('f'+x),x>1));\
+        log.join()+'|'+r.length+'|'+f.length+'|'+Object.keys(f).join()";
+    assert_eq!(run(src), "c3,m1,m2,m3,c0,f1,f2,f3|undefined|undefined|0,1");
+}
+
+#[test]
 fn flat_flatmap_array_species_create() {
     // flat/flatMap use ArraySpeciesCreate(O, 0): a non-constructor @@species is a
     // TypeError, a subclass species builds that subclass.

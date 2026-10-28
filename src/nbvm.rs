@@ -40,6 +40,13 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 mod array_hof;
+
+/// Whether `ArraySpeciesCreate(O, n)` for the array `h` is the default
+/// `ArrayCreate(n)`, decided with no observable effect: `false` whenever a
+/// getter, proxy or non-intrinsic constructor/`@@species` could be involved.
+pub(crate) fn array_species_is_default(realm: &Realm, h: Handle) -> bool {
+    array_hof::default_species(realm, h)
+}
 mod iter_fast;
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 mod jit_tier;
