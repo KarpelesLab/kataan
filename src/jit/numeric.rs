@@ -40,6 +40,8 @@
 
 use super::{GenericOp, Label, X64Assembler};
 use crate::nanbox::NanBox;
+
+mod int32;
 use crate::nbvm::Op;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -306,6 +308,8 @@ struct Region {
     /// Bound just past the header's loads: where in-region branches to the
     /// header go.
     inner: Option<Label>,
+    /// The region's integer version ([`int32`]), if planned.
+    int: Option<int32::IntPlan>,
 }
 
 /// The helper entry points and frame facts the emitter calls into.
@@ -349,6 +353,8 @@ enum StubKind {
     /// (`jit_helper_global_ref`) and retry at `retry`, or run the op through the
     /// interpreter if it does not qualify.
     GlobalRef { pc: usize, retry: Label },
+    /// The integer version gives up at bytecode pc `pc` (see [`int32`]).
+    Bail { pc: u32 },
 }
 
 struct Stub {
@@ -362,6 +368,9 @@ struct Stub {
     /// `(cond, target)` — truthy `cond` continues at pc `pc + 2`, falsy at
     /// `target`.
     branch: Option<(u16, usize)>,
+    /// Emitted by a region's integer version (its flush / reload convert the
+    /// int registers).
+    int: bool,
 }
 
 /// The per-compilation state of the numeric emitter.
@@ -389,6 +398,9 @@ pub(super) struct NumGen {
     n_gslots: usize,
     gbase: i32,
     env: NumEnv,
+    /// While emitting a region's integer version (or one of its stubs): that
+    /// region.
+    imode: Option<usize>,
     canonical_nan: u64,
     tag_true: u64,
     tag_false: u64,
@@ -488,6 +500,7 @@ impl NumGen {
             n_gslots: n_gslots as usize,
             gbase: 0,
             env,
+            imode: None,
             canonical_nan: NanBox::number(f64::NAN).to_bits(),
             tag_true: NanBox::boolean(true).to_bits(),
             tag_false: NanBox::boolean(false).to_bits(),
@@ -549,17 +562,36 @@ impl NumGen {
         pc: usize,
         ops: &[GenericOp],
     ) -> Option<bool> {
-        let op = ops[pc];
         let reg = self.region_at(pc);
         self.cur_pc = pc;
         if self.skip.get(pc).copied().unwrap_or(false) {
             return Some(true);
         }
+        if self.imode.is_some() {
+            if !self.emit_int_op(a, labels, throw_exit, pc, ops)? {
+                self.ishadow_uses(a, pc)?;
+                if !self.emit_dbl(a, labels, throw_exit, pc, ops, reg)? {
+                    return None;
+                }
+            }
+            return Some(true);
+        }
         if let Some(ri) = reg
             && self.regions[ri].head == pc
         {
-            // Region entry (fall-through, a branch from outside, OSR): load the
-            // loop-carried registers, then the in-region header.
+            // Region entry (fall-through, a branch from outside, OSR): try the
+            // integer version first, else load the loop-carried registers,
+            // then the in-region header.
+            if self.regions[ri].int.is_some() {
+                let entry = a.new_label();
+                let dbl_entry = a.new_label();
+                a.jmp(entry);
+                a.bind(dbl_entry);
+                if let Some(p) = self.regions[ri].int.as_mut() {
+                    p.entry = Some(entry);
+                    p.dbl_entry = Some(dbl_entry);
+                }
+            }
             for s in &self.regions[ri].slots {
                 if s.carried {
                     a.movsd_x_mem(s.xmm, disp(s.reg));
@@ -570,6 +602,29 @@ impl NumGen {
             a.bind(inner);
             self.regions[ri].inner = Some(inner);
         }
+        let done = self.emit_dbl(a, labels, throw_exit, pc, ops, reg)?;
+        if done
+            && let Some(ri) = reg
+            && self.regions[ri].end == pc
+            && self.regions[ri].int.is_some()
+        {
+            self.emit_int_region(a, labels, throw_exit, ri, ops)?;
+        }
+        Some(done)
+    }
+
+    /// The double emitter of op `pc` (see [`emit`](Self::emit)).
+    #[allow(clippy::too_many_lines)]
+    fn emit_dbl(
+        &mut self,
+        a: &mut X64Assembler,
+        labels: &[Label],
+        throw_exit: Label,
+        pc: usize,
+        ops: &[GenericOp],
+        reg: Option<usize>,
+    ) -> Option<bool> {
+        let op = ops[pc];
         let bc = self.bc(pc)?;
         match op {
             GenericOp::Const { dst, imm } if reg.is_some() => {
@@ -919,6 +974,18 @@ impl NumGen {
     }
 
     fn stub(&mut self, entry: Label, resume: Label, region: Option<usize>, kind: StubKind) {
+        // The integer version runs no slow path itself: it hands the op to the
+        // double version.
+        let kind = match kind {
+            StubKind::Helper { .. } | StubKind::Exec { .. } | StubKind::Truthy { .. }
+                if self.imode.is_some() =>
+            {
+                StubKind::Bail {
+                    pc: self.cur_pc as u32,
+                }
+            }
+            k => k,
+        };
         self.stubs.push(Stub {
             entry,
             resume,
@@ -926,6 +993,7 @@ impl NumGen {
             pc: self.cur_pc,
             kind,
             branch: None,
+            int: self.imode.is_some(),
         });
     }
 
@@ -933,6 +1001,10 @@ impl NumGen {
     /// writes back to the register file.
     fn flush(&self, a: &mut X64Assembler, reg: Option<usize>) {
         let Some(ri) = reg else { return };
+        if self.imode == Some(ri) {
+            self.iflush(a, ri);
+            return;
+        }
         let pc = self.cur_pc;
         for s in &self.regions[ri].slots {
             if s.dirty && s.start <= pc && pc <= s.end {
@@ -945,6 +1017,10 @@ impl NumGen {
     /// file (after a call: the SSE registers are caller-saved).
     fn reload(&self, a: &mut X64Assembler, reg: Option<usize>) {
         let Some(ri) = reg else { return };
+        if self.imode == Some(ri) {
+            self.ireload(a, ri);
+            return;
+        }
         let pc = self.cur_pc;
         for s in &self.regions[ri].slots {
             if s.start <= pc && pc <= s.end {
@@ -1378,7 +1454,9 @@ impl NumGen {
             None => labels.get(target).copied(),
             Some(ri) => {
                 let rg = &self.regions[ri];
-                if target == rg.head {
+                if target == rg.head && self.imode == Some(ri) {
+                    rg.int.as_ref().and_then(int32::IntPlan::inner)
+                } else if target == rg.head {
                     rg.inner
                 } else if target > rg.head && target <= rg.end {
                     labels.get(target).copied()
@@ -1429,7 +1507,13 @@ impl NumGen {
         for s in &stubs {
             a.bind(s.entry);
             self.cur_pc = s.pc;
+            self.imode = if s.int { s.region } else { None };
             match s.kind {
+                StubKind::Bail { pc } => {
+                    if let Some(ri) = s.region {
+                        self.emit_bail(a, labels, ri, pc as usize);
+                    }
+                }
                 StubKind::CanonNan => {
                     a.movabs_rax(self.canonical_nan as i64);
                     a.movq_x_gpr(0, RAX);
@@ -1482,6 +1566,13 @@ impl NumGen {
                     self.reload(a, s.region);
                     a.test_rax_rax();
                     a.jcc(CC_NE, retry);
+                    if s.int
+                        && let Some(ri) = s.region
+                    {
+                        // The double version runs the op.
+                        self.emit_bail(a, labels, ri, pc);
+                        continue;
+                    }
                     // Not a plain global binding: the interpreter's op.
                     a.mov_rdi_r15();
                     a.mov_rsi_rbx();
@@ -1534,6 +1625,7 @@ impl NumGen {
                 }
             }
         }
+        self.imode = None;
     }
 }
 
@@ -1801,11 +1893,13 @@ fn plan_regions(
                 dirty: x.4,
             });
         }
+        let int = int32::plan(bytecode, head, end, &info, &carried_r);
         out.push(Region {
             head,
             end,
             slots,
             inner: None,
+            int,
         });
     }
     out

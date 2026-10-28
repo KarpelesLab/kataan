@@ -26272,6 +26272,60 @@ mod generic_jit_tests {
         }
     }
 
+    /// A promoted loop's integer version (`jit::numeric::int32`) bails to the
+    /// double version exactly where JavaScript leaves int32: overflow of `+`,
+    /// `-`, `*`, `++`, unary `-`; `-0` from `0 * -k`, `-0`, `-4 % 2`; `% 0`;
+    /// non-int carried values and arguments. Every result must be bit-identical
+    /// to the interpreter's.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn generic_int32_speculation_matches_interpreter() {
+        let src = "
+            function acc(x, y) { let s = x; for (let i = 0; i < 40; i = i + 1) { s = s + y; } return s; }
+            function dif(x, y) { let s = x; for (let i = 0; i < 40; i = i + 1) { s = s - y; } return s; }
+            function pro(x, y) { let p = x; for (let i = 0; i < 12; i = i + 1) { p = p * y; } return p; }
+            function inc(x, y) { let a = x, b = y; for (let i = 0; i < 9; i = i + 1) { a = a + 1; b = b - 1; } return a * 3 + b; }
+            function neg(x, y) { let r = 0; for (let i = 0; i < 3; i = i + 1) { r = -x + (y - y) * x; } return r; }
+            function mods(x, y) { let r = 0, c = 0; for (let i = 0; i < 4; i = i + 1) { r = x % y; if (x % 3 === 0) c = c + 1; c = c + (x % -7); } return r * 10 + c; }
+            function wrap(x, y) { let s = x; for (let i = 0; i < 30; i = i + 1) { s = (s + y * 65599) | 0; } return s; }
+            function shifts(x, y) { let r = 0; for (let i = 0; i < 3; i = i + 1) { r = (x << y) + (x >> (y + 32)) + (x >>> y); } return r; }
+            function cmps(x, y) { let a = 0, n = 0; for (let i = 0; i < 3; i = i + 1) { a = x < y; if (x === y) n = n + 1; n = n + (x >= y); } return a === true ? n + 100 : n; }
+            function counter(x, y) { let n = 0, k = 0; for (let i = x; i < y; i = i + 1) { n = n + i; k = k + 1; if (k > 50) break; } return n; }
+        ";
+        let vals = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            3.0,
+            -6.0,
+            0.5,
+            f64::NAN,
+            f64::INFINITY,
+            2147483647.0,
+            -2147483648.0,
+            2147483600.0,
+            -2147483600.0,
+            4294967296.0,
+            65536.0,
+            -65536.0,
+            31.0,
+            32.0,
+        ];
+        for name in [
+            "acc", "dif", "pro", "inc", "neg", "mods", "wrap", "shifts", "cmps", "counter",
+        ] {
+            let (funcs, f) = compile_named(src, name);
+            for &x in &vals {
+                for &y in &vals {
+                    diff_ok(&funcs, f, &[NanBox::number(x), NanBox::number(y)]);
+                }
+            }
+            diff_ok(&funcs, f, &[NanBox::boolean(true), NanBox::number(2.0)]);
+            diff_ok(&funcs, f, &[NanBox::number(5.0), NanBox::null()]);
+        }
+    }
+
     /// The Int tier keeps no `-0` (an `i64` has none): a `-0` argument deopts,
     /// and the ops that make `-0` out of other integers (`0 * -5`, `-0` from
     /// `-x`, `-4 % 2`) are not lowered or deopt — so the hot tiered-up body
