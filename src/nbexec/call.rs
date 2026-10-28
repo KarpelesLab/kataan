@@ -1823,6 +1823,12 @@ impl Interp {
     /// main realm). An ordinary/native function is looked up in the `fn_realm`
     /// side table (absent ⇒ main realm).
     pub(crate) fn get_function_realm(&self, f: Handle) -> Option<usize> {
+        // Every path below ends in a `fn_realm` lookup, so with no entry there
+        // the answer is `None` — skip the hidden-property reads (the common
+        // single-realm case, on every host-side call).
+        if self.fn_realm.is_empty() {
+            return None;
+        }
         if let Some(target) = self.realm.get_property(f, BOUND_TARGET)
             && let Some(th) = target.as_handle().map(Handle::from_raw)
         {

@@ -1530,7 +1530,8 @@ fn host_unary_any(ctx: &mut Ctx, op: crate::ast::UnaryOp, v: NanBox) -> Result<N
 fn host_operand(realm: &Realm, v: NanBox) -> bool {
     // Every heap value but a string: an object (ToPrimitive), a BigInt, or a
     // Symbol (its TypeErrors are the host's, real `TypeError` instances).
-    v.as_handle().is_some() && realm.type_of_value(v) != "string"
+    v.as_handle()
+        .is_some_and(|h| !realm.typeof_is_string(Handle::from_raw(h)))
 }
 
 /// Whether `v` is a string (a heap handle, but a primitive).

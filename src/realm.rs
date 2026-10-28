@@ -2503,6 +2503,22 @@ impl Realm {
         self.heap.get(handle).is_some_and(|c| c.as_str().is_some())
     }
 
+    /// Whether `typeof` of the value at `handle` is `"string"`: exactly
+    /// [`type_of_value`](Self::type_of_value)`(handle) == "string"`, decided
+    /// without its exotic-object probes. A string cell is `"string"` unless an
+    /// auxiliary property object gives it the bound-function or VM-closure
+    /// marker; a non-string cell never is.
+    #[must_use]
+    pub fn typeof_is_string(&self, handle: Handle) -> bool {
+        if !self.is_string_handle(handle) {
+            return false;
+        }
+        if !self.aux_props.contains_key(&handle.to_raw()) {
+            return true;
+        }
+        self.type_of_value(NanBox::handle(handle.to_raw())) == "string"
+    }
+
     /// The array elements at `handle`, or `None` if it is not an array.
     #[must_use]
     pub fn array_elements(&self, handle: Handle) -> Option<&[NanBox]> {
