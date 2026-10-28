@@ -143,13 +143,31 @@ pub struct Shape {
     index: OnceCell<Box<ShapeIndex>>,
     /// Chain-walk lookups served so far (drives building `index`).
     probes: Cell<u32>,
-    /// Whether the layout holds the internal primitive-wrapper key
-    /// ([`PRIM_WRAP_KEY`]), so "is this a wrapper object" needs no lookup.
-    wrapper: bool,
+    /// Which internal brand keys ([`BRAND_KEYS`]) the layout holds, one bit
+    /// each, so "is this a wrapper / `[[IsHTMLDDA]]` object" needs no lookup.
+    brands: u8,
 }
 
 /// The internal key under which a primitive wrapper object boxes its value.
 pub const PRIM_WRAP_KEY: &str = "\u{0}prim";
+
+/// Internal brand keys whose presence a [`Shape`] records as a flag bit (bit
+/// `i` for `BRAND_KEYS[i]`): the primitive-wrapper slot and the
+/// `[[IsHTMLDDA]]` brand.
+pub const BRAND_KEYS: [&str; 2] = [PRIM_WRAP_KEY, "\u{0}htmldda"];
+
+/// The [`BRAND_KEYS`] bit of `key` (0 for any other key).
+#[inline]
+#[must_use]
+pub fn brand_bit(key: &str) -> u8 {
+    if !key.starts_with('\0') {
+        return 0;
+    }
+    BRAND_KEYS
+        .iter()
+        .position(|b| *b == key)
+        .map_or(0, |i| 1 << i)
+}
 
 impl Shape {
     /// The root (empty) shape. Every object's layout descends from it.
@@ -163,7 +181,7 @@ impl Shape {
             transitions: RefCell::new(Vec::new()),
             index: OnceCell::new(),
             probes: Cell::new(0),
-            wrapper: false,
+            brands: 0,
         })
     }
 
@@ -184,7 +202,14 @@ impl Shape {
     #[inline]
     #[must_use]
     pub fn is_wrapper(&self) -> bool {
-        self.wrapper
+        self.brands & 1 != 0
+    }
+
+    /// Whether the layout holds the brand key with [`brand_bit`] `bit`.
+    #[inline]
+    #[must_use]
+    pub fn has_brand(&self, bit: u8) -> bool {
+        self.brands & bit != 0
     }
 
     /// Whether this is the empty (root) layout.
@@ -232,7 +257,7 @@ impl Shape {
             transitions: RefCell::new(Vec::new()),
             index: OnceCell::new(),
             probes: Cell::new(0),
-            wrapper: self.wrapper || key == PRIM_WRAP_KEY,
+            brands: self.brands | brand_bit(key),
         });
         // Replace a dead entry in place rather than growing the cache with it.
         let mut transitions = self.transitions.borrow_mut();
@@ -420,6 +445,22 @@ mod tests {
         assert_eq!(keys[99], "k99");
         assert_ne!(key_hash(""), 0);
         assert_ne!(key_hash("k1"), key_hash("k2"));
+    }
+
+    #[test]
+    fn brand_keys_are_flagged_through_transitions() {
+        assert_eq!(BRAND_KEYS[1], crate::realm::HTMLDDA_SLOT);
+        let plain = Shape::root().transition("a").transition("b");
+        assert!(!plain.is_wrapper());
+        let w = Shape::root()
+            .transition("a")
+            .transition(PRIM_WRAP_KEY)
+            .transition("z");
+        assert!(w.is_wrapper());
+        assert!(!w.has_brand(brand_bit(BRAND_KEYS[1])));
+        let d = plain.transition(BRAND_KEYS[1]);
+        assert!(d.has_brand(brand_bit(BRAND_KEYS[1])) && !d.is_wrapper());
+        assert_eq!(brand_bit("prim"), 0);
     }
 
     #[test]

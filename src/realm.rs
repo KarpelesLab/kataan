@@ -4284,7 +4284,7 @@ impl Realm {
         let Some(Cell::Object(o)) = self.heap.get(handle) else {
             return None;
         };
-        Some(!self.is_host_exotic(handle) && !(set && o.contains("\u{0}prim")))
+        Some(!self.is_host_exotic(handle) && !(set && o.is_prim_wrapper()))
     }
 
     /// Whether `handle` is a plain dense array on which the generic-JIT inline
@@ -6366,8 +6366,7 @@ impl Realm {
     pub fn is_html_dda(&self, handle: Handle) -> bool {
         // Only an ordinary object can carry the brand; skip the property lookup
         // for every other cell kind so the hot `typeof`/`truthy` paths stay cheap.
-        matches!(self.heap.get(handle), Some(Cell::Object(_)))
-            && self.get_property(handle, HTMLDDA_SLOT).is_some()
+        matches!(self.heap.get(handle), Some(Cell::Object(o)) if o.has_brand_key(HTMLDDA_SLOT))
     }
 
     /// The `typeof` string for any value: primitives via the box

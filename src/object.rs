@@ -366,6 +366,17 @@ impl Object {
         }
     }
 
+    /// Whether the object holds the internal brand key `key` (one of
+    /// [`crate::shape::BRAND_KEYS`]) — a flag test in shaped mode.
+    #[inline]
+    #[must_use]
+    pub fn has_brand_key(&self, key: &str) -> bool {
+        match &self.data {
+            ObjectData::Shaped { shape, .. } => shape.has_brand(crate::shape::brand_bit(key)),
+            ObjectData::Dict { map, .. } => map.contains_key(key),
+        }
+    }
+
     /// Whether the object has no accessor properties at all.
     #[inline]
     #[must_use]
@@ -846,10 +857,12 @@ impl Object {
             && !self.frozen
             && !self.sealed
             && !key.starts_with('\0')
-            && (self.ex().accessors.is_empty() || self.accessor(key).is_none())
-            && (self.ex().hidden.is_empty() || !self.is_hidden(key))
             && (self.readonly.is_empty() || !self.is_readonly(key))
-            && (self.ex().non_configurable.is_empty() || !self.is_non_configurable(key))
+            && self.extra.as_deref().is_none_or(|x| {
+                (x.accessors.is_empty() || self.accessor(key).is_none())
+                    && (x.hidden.is_empty() || !self.is_hidden(key))
+                    && (x.non_configurable.is_empty() || !self.is_non_configurable(key))
+            })
     }
 
     /// `CreateDataProperty(key, value)` through a transition cache, for a
