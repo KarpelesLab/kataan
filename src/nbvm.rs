@@ -530,6 +530,14 @@ pub enum Op {
     /// length (a `RangeError` if invalid/too large); anything else is its sole
     /// element.
     NewArrayCtor { dst: Reg, arg: Reg },
+    /// `dst` = a fresh binding cell (a captured variable's), holding
+    /// `undefined`.
+    NewBox { dst: Reg },
+    /// `dst` = the value held by the binding cell in `cell` (a `NewBox` cell,
+    /// or a one-element array cell: element 0).
+    CellGet { dst: Reg, cell: Reg },
+    /// Stores `src` in the binding cell in `cell` (as `CellGet` reads it).
+    CellSet { cell: Reg, src: Reg },
     /// `dst = arr[index]` (index taken from a register, `undefined` if absent).
     GetElem { dst: Reg, arr: Reg, index: Reg },
     /// `arr[index] = src` (grows the array if needed).
@@ -3463,6 +3471,22 @@ pub struct StoreGlobalCache {
 /// Returns `false`, having changed nothing, for every other case (a module
 /// name, the temporal dead zone, a `const`, an unbound name, an inner scope
 /// running), which takes the host's general path.
+/// `Op::CellGet`: the value a binding cell holds — a [`Cell::Box`]'s, or a
+/// one-element array cell's element 0 (as `GetElem` reads it).
+fn vm_cell_get(ctx: &mut Ctx, cell: Handle) -> NanBox {
+    ctx.realm
+        .cell_get(cell)
+        .unwrap_or_else(|| ctx.realm.get_element(cell, 0))
+}
+
+/// `Op::CellSet`: stores `v` in a binding cell (a one-element array cell's
+/// element 0).
+fn vm_cell_set(ctx: &mut Ctx, cell: Handle, v: NanBox) {
+    if !ctx.realm.box_set(cell, v) {
+        ctx.realm.set_element(cell, 0, v);
+    }
+}
+
 fn vm_store_global_fast(ctx: &mut Ctx, name: &str, cache: &StoreGlobalCache, v: NanBox) -> bool {
     // A module-environment name (`split_module_name`) is never the global's.
     if name.starts_with('\u{1}') {
@@ -8120,6 +8144,17 @@ fn run_frame_at_ic(
                     ctx.realm.new_array(vec![v])
                 };
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
+            }
+            Op::NewBox { dst } => {
+                regs[*dst as usize] = NanBox::handle(ctx.realm.new_box().to_raw());
+            }
+            Op::CellGet { dst, cell } => {
+                let handle = object_handle(regs[*cell as usize])?;
+                regs[*dst as usize] = vm_cell_get(ctx, handle);
+            }
+            Op::CellSet { cell, src } => {
+                let handle = object_handle(regs[*cell as usize])?;
+                vm_cell_set(ctx, handle, regs[*src as usize]);
             }
             Op::GetElem { dst, arr, index } => {
                 let handle = object_handle(regs[*arr as usize])?;
@@ -14054,14 +14089,9 @@ impl Compiler {
                         continue;
                     }
                     let reg = c.alloc();
-                    c.ops.push(Op::NewArray { dst: reg, len: 1 });
+                    c.ops.push(Op::NewBox { dst: reg });
                     let t = c.constant(NanBox::tdz())?;
-                    let idx = c.constant(NanBox::number(0.0))?;
-                    c.ops.push(Op::SetElem {
-                        arr: reg,
-                        index: idx,
-                        src: t,
-                    });
+                    c.ops.push(Op::CellSet { cell: reg, src: t });
                     c.scopes[0].insert(
                         name.clone(),
                         Binding {
@@ -15094,8 +15124,8 @@ impl Compiler {
         let reg = self.alloc();
         let cell = self.cell_names.contains(name);
         if cell {
-            // A fresh one-element cell to hold the value.
-            self.ops.push(Op::NewArray { dst: reg, len: 1 });
+            // A fresh binding cell to hold the value.
+            self.ops.push(Op::NewBox { dst: reg });
         }
         let b = Binding {
             reg,
@@ -15879,7 +15909,7 @@ impl Compiler {
         for b in bindings {
             if b.cell {
                 let val = self.read_var(*b);
-                self.ops.push(Op::NewArray { dst: b.reg, len: 1 });
+                self.ops.push(Op::NewBox { dst: b.reg });
                 self.write_var(*b, val);
             }
         }
@@ -15913,12 +15943,7 @@ impl Compiler {
         }
         if b.cell {
             let dst = self.alloc();
-            let idx = self.constant(NanBox::number(0.0)).expect("const");
-            self.ops.push(Op::GetElem {
-                dst,
-                arr: b.reg,
-                index: idx,
-            });
+            self.ops.push(Op::CellGet { dst, cell: b.reg });
             if b.tdz {
                 self.ops.push(Op::CheckTdz { src: dst });
             }
@@ -16013,12 +16038,7 @@ impl Compiler {
             return;
         }
         if b.cell {
-            let idx = self.constant(NanBox::number(0.0)).expect("const");
-            self.ops.push(Op::SetElem {
-                arr: b.reg,
-                index: idx,
-                src,
-            });
+            self.ops.push(Op::CellSet { cell: b.reg, src });
         } else {
             self.ops.push(Op::Move { dst: b.reg, src });
         }
@@ -16393,7 +16413,7 @@ impl Compiler {
                         // if the binding is captured.
                         let b = if self.cell_names.contains(&**name) {
                             let cell = self.alloc();
-                            self.ops.push(Op::NewArray { dst: cell, len: 1 });
+                            self.ops.push(Op::NewBox { dst: cell });
                             let bind = Binding {
                                 reg: cell,
                                 cell: true,
@@ -19677,7 +19697,7 @@ impl Compiler {
         for n in &captures {
             if Some(n.as_str()) == self_name {
                 let cell = self.alloc();
-                self.ops.push(Op::NewArray { dst: cell, len: 1 });
+                self.ops.push(Op::NewBox { dst: cell });
                 self_cell = Some(cell);
                 capture_regs.push(cell);
             } else {
@@ -19698,12 +19718,7 @@ impl Compiler {
         });
         // Backfill the self-cell so the body's own-name binding reads this closure.
         if let Some(cell) = self_cell {
-            let idx = self.constant(NanBox::number(0.0))?;
-            self.ops.push(Op::SetElem {
-                arr: cell,
-                index: idx,
-                src: dst,
-            });
+            self.ops.push(Op::CellSet { cell, src: dst });
         }
         if is_generator {
             self.ops.push(Op::InitGenerator { f: dst });
@@ -21969,14 +21984,9 @@ impl Compiler {
         for name in &names {
             if self.cell_names.contains(name.as_str()) {
                 let reg = self.alloc();
-                self.ops.push(Op::NewArray { dst: reg, len: 1 });
+                self.ops.push(Op::NewBox { dst: reg });
                 let t = self.constant(NanBox::tdz())?;
-                let idx = self.constant(NanBox::number(0.0))?;
-                self.ops.push(Op::SetElem {
-                    arr: reg,
-                    index: idx,
-                    src: t,
-                });
+                self.ops.push(Op::CellSet { cell: reg, src: t });
                 self.scopes[depth].insert(
                     name.clone(),
                     Binding {

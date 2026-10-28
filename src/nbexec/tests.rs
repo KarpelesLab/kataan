@@ -12990,3 +12990,39 @@ fn compiled_global_cache_callkey_and_inline_math() {
         "-1697237139|172|-4798|1386900|900|232537.58649531758|true|-4"
     );
 }
+
+/// Captured variables in binding cells (`Cell::Box`): `let`/`var`/`const`
+/// captures, captured parameters (still one-element array cells) written
+/// through a closure, per-iteration loop bindings, a named function
+/// expression's own name, a TDZ read through a closure, a hoisted function's
+/// lexical capture, `catch` bindings and a generator's captured state, in the
+/// interpreter and compiled code alike.
+#[test]
+fn captured_variables_in_binding_cells() {
+    let src = r#"
+        function counter() { let c = 0; return () => ++c; }
+        function mk(p) { var v = p * 2; const k = { o: p }; return { get: () => v + k.o + p, set: (x) => { v = x; p = -x; }, obj: () => k }; }
+        let t = 0, keep = [];
+        for (let i = 0; i < 20000; i++) {
+          const f = counter(); t += f() + f() + f();
+          const m = mk(i); m.set(i + 1); t += m.get(); if (i % 500 === 0) keep.push(m.obj());
+        }
+        const fs = [];
+        for (let i = 0; i < 50; i++) { fs.push(() => i); }
+        let u = 0; for (const f of fs) u += f();
+        const fact = function f(n) { return n <= 1 ? 1 : n * f(n - 1); };
+        let e = 0;
+        try { (() => { e += late; })(); } catch (x) { e += x.constructor.name.length; }
+        let late = 5;
+        function hoist() { return inner(); function inner() { return lex; } }
+        let lex = 7;
+        let caught = 0;
+        for (let i = 0; i < 100; i++) { try { throw i; } catch (z) { const g = () => z; caught += g(); } }
+        function* gen() { let s = 0; const add = (x) => { s += x; }; for (let i = 0; i < 5; i++) { add(i); yield s; } }
+        let gs = 0; for (const v of gen()) gs += v;
+        const objs = []; for (let i = 0; i < 3000; i++) { let o = { i }; objs.push(() => o.i); if (objs.length > 100) objs.length = 0; }
+        let os = 0; for (const f of objs) os += f();
+        [t, u, fact(10), e, hoist(), caught, gs, os, keep.length].join("|")
+    "#;
+    assert_eq!(run(src), "200110000|1225|3628800|14|7|4950|20|210444|40");
+}

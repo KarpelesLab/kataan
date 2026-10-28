@@ -54,6 +54,10 @@ pub(crate) struct PropsLayout {
     pub off_slot_age: i32,
     /// The `Cell::VmFunction` discriminant byte.
     pub vmfn_disc: u8,
+    /// The `Cell::Box` discriminant byte.
+    pub box_disc: u8,
+    /// Slot-relative offset of a binding cell's value.
+    pub off_box_val: i32,
     /// The `Cell::Native` discriminant byte.
     pub native_disc: u8,
     /// Slot-relative offset of a built-in native function's `u16` id.
@@ -91,6 +95,7 @@ impl PropsLayout {
         let (heap_ptr, heap_len) = crate::realm::Realm::jit_heap_offsets();
         let (vmfn_disc, func_off, caps_off) = crate::cell::jit_vm_function_layout();
         let (native_disc, native_id_off) = crate::cell::jit_native_layout();
+        let (box_disc, box_val_off) = crate::cell::jit_box_layout();
         let (shape_parent, rc_strong) = shape_word_offsets();
         Self {
             off_extensible: i(obj_base + obj.extensible_off),
@@ -106,6 +111,8 @@ impl PropsLayout {
             vmfn_disc,
             native_disc,
             off_native_id: i(cell_base + native_id_off),
+            box_disc,
+            off_box_val: i(cell_base + box_val_off),
             off_vmfn_func: i(cell_base + func_off),
             off_vmfn_caps_ptr: i(cell_base + caps_off + obj.vec_ptr_off),
             off_vmfn_caps_len: i(cell_base + caps_off + obj.vec_len_off),
@@ -1310,6 +1317,13 @@ mod tests {
                 NanBox::number(1.0).to_bits()
             );
             assert_eq!(*field(f, jl.off_cell_tag), l.vmfn_disc);
+            let bx = realm.new_box();
+            assert!(realm.box_set(bx, NanBox::number(6.5)));
+            assert_eq!(*field(bx, jl.off_cell_tag), l.box_disc);
+            assert_eq!(
+                *field(bx, l.off_box_val).cast::<u64>(),
+                NanBox::number(6.5).to_bits()
+            );
             let nf = realm.new_native(0x4321);
             assert_eq!(*field(nf, jl.off_cell_tag), l.native_disc);
             assert_eq!(*field(nf, l.off_native_id).cast::<u16>(), 0x4321);

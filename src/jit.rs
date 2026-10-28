@@ -2048,6 +2048,26 @@ pub enum GenericOp {
         /// The bytecode pc of this op (its slow path).
         pc: u32,
     },
+    /// `Op::CellGet` (a captured variable's read): inline for a `Cell::Box`
+    /// (and, out of line, a one-element array cell), else the interpreter's.
+    CellGet {
+        /// Destination register.
+        dst: u16,
+        /// Register holding the binding cell.
+        cell: u16,
+        /// The bytecode pc of this op (its slow path).
+        pc: u32,
+    },
+    /// `Op::CellSet` (a captured variable's write): inline for a `Cell::Box`
+    /// when the write barrier has nothing to do, else the interpreter's.
+    CellSet {
+        /// Register holding the binding cell.
+        cell: u16,
+        /// Register holding the value.
+        src: u16,
+        /// The bytecode pc of this op (its slow path).
+        pc: u32,
+    },
     /// Any other op: the interpreter executes bytecode op `pc` itself, on this
     /// same register file (`jit_helper_exec_op`) — the one semantics, by
     /// construction.
@@ -2521,6 +2541,16 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
             Op::SetElem { arr, index, src } => GenericOp::ArrSet {
                 arr: r(*arr)?,
                 index: r(*index)?,
+                src: r(*src)?,
+                pc: pc32,
+            },
+            Op::CellGet { dst, cell } => GenericOp::CellGet {
+                dst: r(*dst)?,
+                cell: r(*cell)?,
+                pc: pc32,
+            },
+            Op::CellSet { cell, src } => GenericOp::CellSet {
+                cell: r(*cell)?,
                 src: r(*src)?,
                 pc: pc32,
             },
@@ -5304,6 +5334,10 @@ impl JitFunction {
                         a.jne($miss);
                         a.p_array_plain(&layout, helpers.call_layout.realm, false, $miss);
                     }
+                    recv_cache::Family::Cell => {
+                        a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.props.box_disc);
+                        a.jne($miss);
+                    }
                 }
             }};
         }
@@ -5714,6 +5748,53 @@ impl JitFunction {
                     a.je(slow);
                     a.load_rdx(disp(src));
                     a.mov_at_r11_rax8_rdx();
+                    a.jmp(done);
+                    a.bind(slow);
+                    exec_op!(pc);
+                    a.bind(done);
+                }
+                GenericOp::CellGet { dst, cell, pc } => {
+                    if !ok(dst) || !ok(cell) {
+                        return None;
+                    }
+                    let other = a.new_label();
+                    let slow = a.new_label();
+                    let done = a.new_label();
+                    recv_slot!(op_idx, cell, other, recv_cache::Family::Cell);
+                    a.g_load(call_seq::r::RAX, call_seq::r::RCX, layout.props.off_box_val);
+                    a.store_rax(disp(dst));
+                    a.jmp(done);
+                    // A one-element array cell (a parameter's): its present
+                    // element 0, as `GetElem` reads it.
+                    a.bind(other);
+                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
+                    walk_to_slot!(cell, slow);
+                    family_checks!(recv_cache::Family::Arr, slow);
+                    a.g_load(call_seq::r::R8, call_seq::r::RCX, layout.off_arr_len);
+                    a.g_test(call_seq::r::R8);
+                    a.g_jcc(call_seq::cc::E, slow);
+                    a.mov_r11_at_rcx(layout.off_arr_ptr);
+                    a.g_load(call_seq::r::RAX, call_seq::r::R11, 0);
+                    a.movabs_r11(NanBox::hole().to_bits() as i64);
+                    a.cmp_rax_r11();
+                    a.je(slow);
+                    a.store_rax(disp(dst));
+                    a.jmp(done);
+                    a.bind(slow);
+                    exec_op!(pc);
+                    a.bind(done);
+                }
+                GenericOp::CellSet { cell, src, pc } => {
+                    if !ok(cell) || !ok(src) {
+                        return None;
+                    }
+                    let slow = a.new_label();
+                    let done = a.new_label();
+                    recv_slot!(op_idx, cell, slow, recv_cache::Family::Cell);
+                    a.load_rax(disp(src));
+                    a.p_barrier_check(&layout, helpers.call_layout.realm, slow);
+                    a.load_rdx(disp(src));
+                    a.g_store(call_seq::r::RCX, layout.props.off_box_val, call_seq::r::RDX);
                     a.jmp(done);
                     a.bind(slow);
                     exec_op!(pc);

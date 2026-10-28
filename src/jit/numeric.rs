@@ -1837,7 +1837,15 @@ fn def_use(op: &Op, defs: &mut Vec<u16>, uses: &mut Vec<u16>) {
             uses.push(*b);
         }
         Op::JumpIfFalse { cond, .. } => uses.push(*cond),
-        Op::LoadGlobal { dst, .. } => defs.push(*dst),
+        Op::LoadGlobal { dst, .. } | Op::NewBox { dst } => defs.push(*dst),
+        Op::CellGet { dst, cell } => {
+            defs.push(*dst);
+            uses.push(*cell);
+        }
+        Op::CellSet { cell, src } => {
+            uses.push(*cell);
+            uses.push(*src);
+        }
         Op::Return { src } | Op::CheckTdz { src } | Op::StoreGlobal { src, .. } => uses.push(*src),
         Op::Jump { .. } => {}
         _ => uses.extend(op_regs(op)),

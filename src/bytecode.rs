@@ -418,6 +418,11 @@ fn verify_op_with(
         | Op::Not { dst, a: obj }
         | Op::Move { dst, src: obj }
         | Op::NewArrayCtor { dst, arg: obj }
+        | Op::CellGet { dst, cell: obj }
+        | Op::CellSet {
+            cell: dst,
+            src: obj,
+        }
         | Op::GetProp { dst, obj, .. } => {
             reg(*dst)?;
             reg(*obj)
@@ -549,7 +554,7 @@ fn verify_op_with(
             reg(*obj)?;
             reg(*key)
         }
-        Op::DeleteGlobal { dst, .. } => reg(*dst),
+        Op::DeleteGlobal { dst, .. } | Op::NewBox { dst } => reg(*dst),
         Op::RequireObjectCoercible { src } | Op::CheckTdz { src } => reg(*src),
         Op::NewBigInt { dst, .. } | Op::LoadNewTarget { dst } => reg(*dst),
         Op::MakeClass { dst, f, sup } => {
@@ -1180,6 +1185,12 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*dst, out);
             w_regs(elems, out);
         }
+        Op::NewBox { dst } => {
+            w_u8(182, out);
+            w_reg(*dst, out);
+        }
+        Op::CellGet { dst, cell } => un(183, *dst, *cell, out),
+        Op::CellSet { cell, src } => un(184, *cell, *src, out),
         Op::InitProp { obj, key, src } => {
             w_u8(180, out);
             w_reg(*obj, out);
@@ -2045,6 +2056,15 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         181 => Op::NewArrayFrom {
             dst: r.reg()?,
             elems: r.regs()?,
+        },
+        182 => Op::NewBox { dst: r.reg()? },
+        183 => Op::CellGet {
+            dst: r.reg()?,
+            cell: r.reg()?,
+        },
+        184 => Op::CellSet {
+            cell: r.reg()?,
+            src: r.reg()?,
         },
         180 => Op::InitProp {
             obj: r.reg()?,

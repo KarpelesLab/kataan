@@ -628,6 +628,18 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(vals).to_raw());
             Some(Ok(()))
         }
+        Op::NewBox { dst } => {
+            regs[*dst as usize] = NanBox::handle(ctx.realm.new_box().to_raw());
+            Some(Ok(()))
+        }
+        Op::CellGet { dst, cell } => regs[*cell as usize].as_handle().map(|h| {
+            regs[*dst as usize] = super::vm_cell_get(ctx, Handle::from_raw(h));
+            Ok(())
+        }),
+        Op::CellSet { cell, src } => regs[*cell as usize].as_handle().map(|h| {
+            super::vm_cell_set(ctx, Handle::from_raw(h), regs[*src as usize]);
+            Ok(())
+        }),
         Op::NewArrayFrom { dst, elems } => {
             let vals: alloc::vec::Vec<NanBox> = elems.iter().map(|r| regs[*r as usize]).collect();
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(vals).to_raw());

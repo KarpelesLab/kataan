@@ -279,6 +279,15 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
             }
         } else if let Some(bytes) = realm.bytes_at(h) {
             SnapCell::Bytes(bytes.to_vec())
+        } else if let Some(v) = realm.box_value(h) {
+            // A binding cell restores as a one-element array cell, which the
+            // cell ops read and write alike.
+            SnapCell::Array(alloc::vec![snap_val(
+                v,
+                &mut index_of,
+                &mut order,
+                &mut intern
+            )])
         } else if let Some(elems) = realm.array_elements(h).map(<[_]>::to_vec) {
             let vals = elems
                 .iter()

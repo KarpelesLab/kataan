@@ -240,6 +240,11 @@ pub enum Cell {
     Str(Rope),
     /// A dense array of element values.
     Array(ArrayElems),
+    /// A captured variable's binding cell: one value, without the element
+    /// storage a one-element array cell needs. Compiler-internal: reached only
+    /// through `Op::CellGet` / `Op::CellSet` (and, as element 0, the element
+    /// ops); never a user-visible value.
+    Box(NanBox),
     /// Contiguous raw bytes — the backing store of an `ArrayBuffer` (and thus of
     /// the typed-array / `DataView` views over it). One byte per byte (no NaN-box
     /// blow-up); may wrap external memory zero-copy. Holds no handles.
@@ -503,6 +508,22 @@ pub(crate) fn jit_vm_function_layout() -> (u8, usize, usize) {
     )
 }
 
+/// The `Cell::Box` discriminant byte and the offset of its value within the
+/// `Cell` (for the generic JIT's inline binding-cell reads and writes).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn jit_box_layout() -> (u8, usize) {
+    let cell = Cell::Box(NanBox::number(1.5));
+    let base = core::ptr::addr_of!(cell) as usize;
+    // SAFETY: `cell` is a live, initialized `Cell`; its repr(u8) tag byte is in
+    // bounds and always a valid `u8`.
+    #[allow(unsafe_code)]
+    let disc = unsafe { *(base as *const u8) };
+    let Cell::Box(v) = &cell else {
+        unreachable!("just built a Cell::Box")
+    };
+    (disc, core::ptr::addr_of!(*v) as usize - base)
+}
+
 /// The `Cell::Native` discriminant byte and the offset of its `u16` id within
 /// the `Cell` (for the generic JIT's built-in identity check).
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -756,7 +777,7 @@ impl Cell {
             | Cell::Proxy { .. } => "object",
             // An internal byte backing store, or a Temporal data carrier, is never
             // a user-visible value; it is reached only through its owning object.
-            Cell::Bytes(_) | Cell::TemporalData(_) | Cell::Env(_) => "object",
+            Cell::Bytes(_) | Cell::TemporalData(_) | Cell::Env(_) | Cell::Box(_) => "object",
         }
     }
 
@@ -833,6 +854,12 @@ impl Trace for Cell {
                     if let Some(raw) = e.as_handle() {
                         visit(Handle::from_raw(raw));
                     }
+                }
+            }
+            // A binding cell keeps its value alive.
+            Cell::Box(v) => {
+                if let Some(raw) = v.as_handle() {
+                    visit(Handle::from_raw(raw));
                 }
             }
             // A VM-held host environment keeps its bindings alive.
@@ -916,6 +943,7 @@ impl crate::gc::Relocate for Cell {
         match self {
             Cell::Object(o) => o.relocate_handles(forward),
             Cell::Array(elems) => elems.iter_mut().for_each(fwd),
+            Cell::Box(v) => fwd(v),
             Cell::Env(env) => env.relocate_handles(forward),
             Cell::VmFunction { captures, .. } => captures.iter_mut().for_each(fwd),
             Cell::Collection { entries, index, .. } => {

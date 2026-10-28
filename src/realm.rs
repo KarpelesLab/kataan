@@ -2080,6 +2080,42 @@ impl Realm {
         self.heap.get(handle)?.as_bigint().cloned()
     }
 
+    /// Allocates a binding cell ([`Cell::Box`]) holding `undefined`.
+    pub fn new_box(&mut self) -> Handle {
+        self.heap.alloc(Cell::Box(NanBox::undefined()))
+    }
+
+    /// The value of a binding cell: a [`Cell::Box`]'s, or a one-element
+    /// array cell's present element 0. `None` for anything else.
+    #[must_use]
+    pub fn cell_get(&self, handle: Handle) -> Option<NanBox> {
+        match self.heap.get(handle)? {
+            Cell::Box(v) => Some(*v),
+            Cell::Array(a) => a.first().copied().filter(|v| !v.is_hole()),
+            _ => None,
+        }
+    }
+
+    /// The value of the [`Cell::Box`] at `handle`; `None` for anything else.
+    #[must_use]
+    pub fn box_value(&self, handle: Handle) -> Option<NanBox> {
+        match self.heap.get(handle)? {
+            Cell::Box(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Stores `value` in the [`Cell::Box`] at `handle` (with the write
+    /// barrier). `false`, changing nothing, for anything else.
+    pub fn box_set(&mut self, handle: Handle, value: NanBox) -> bool {
+        match self.heap.get_mut(handle) {
+            Some(Cell::Box(v)) => *v = value,
+            _ => return false,
+        }
+        self.write_barrier(handle, value);
+        true
+    }
+
     /// Allocates an array of `elements` in the heap and returns its handle.
     pub fn new_array(&mut self, elements: Vec<NanBox>) -> Handle {
         let h = self.heap.alloc(Cell::Array(elements.into()));
@@ -3788,6 +3824,8 @@ impl Realm {
             Some(Cell::TypedArray { .. }) => {
                 self.typed_get(handle, index).unwrap_or(NanBox::undefined())
             }
+            // A binding cell is a one-element store.
+            Some(Cell::Box(v)) if index == 0 => *v,
             _ => NanBox::undefined(),
         }
     }
@@ -3861,6 +3899,10 @@ impl Realm {
     /// `arr[index] = value` — grows the array with `undefined` holes if `index`
     /// is past the end (per JS). Returns `false` if the cell is not an array.
     pub fn set_element(&mut self, handle: Handle, index: usize, value: NanBox) -> bool {
+        // A binding cell is a one-element store.
+        if index == 0 && self.box_set(handle, value) {
+            return true;
+        }
         // A typed-array view writes through to its shared bytes (coercing to the
         // element kind); out-of-bounds writes are silent no-ops, per spec.
         if self.typed_len(handle).is_some() {
@@ -6221,7 +6263,7 @@ impl Realm {
                         None => "[object Object]".into(),
                     }
                 }
-                Some(Cell::Object(_) | Cell::Env(_)) => "[object Object]".into(),
+                Some(Cell::Object(_) | Cell::Env(_) | Cell::Box(_)) => "[object Object]".into(),
                 // A callable stringifies as `Function.prototype.toString` would —
                 // the retained literal source text (ECMA-262 20.2.3.5) when the
                 // function was defined from source, else the NativeFunction form

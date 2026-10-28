@@ -150,12 +150,15 @@ pub(super) enum Family {
     Obj,
     /// A `Cell::Array` without side-table state.
     Arr,
+    /// A binding cell (`Cell::Box`).
+    Cell,
 }
 
 /// The most ways a body uses per family (each way costs a store after every
-/// call): `Obj` ways first, then `Arr` ways.
+/// call): `Obj` ways first, then `Arr`, then `Cell` ways.
 const MAX_OBJ_WAYS: usize = 3;
 const MAX_ARR_WAYS: usize = 1;
+const MAX_CELL_WAYS: usize = 1;
 
 /// How one property op uses the receiver cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +192,9 @@ fn site_recv(op: &GenericOp) -> Option<(u16, Family)> {
         } => Some((obj, Family::Obj)),
         GenericOp::GetElem { obj, .. } | GenericOp::SetElem { obj, .. } => Some((obj, Family::Arr)),
         GenericOp::CallKey { recv, .. } => Some((recv, Family::Arr)),
+        GenericOp::CellGet { cell, .. } | GenericOp::CellSet { cell, .. } => {
+            Some((cell, Family::Cell))
+        }
         GenericOp::ArrGet { arr, .. }
         | GenericOp::ArrSet { arr, .. }
         | GenericOp::ArrayLen { arr, .. } => Some((arr, Family::Arr)),
@@ -216,6 +222,7 @@ fn op_dst(op: &GenericOp) -> Option<u16> {
         | GenericOp::ToNumeric { dst, .. }
         | GenericOp::Step { dst, .. }
         | GenericOp::ArrGet { dst, .. }
+        | GenericOp::CellGet { dst, .. }
         | GenericOp::CallMethod { dst, .. }
         | GenericOp::CallValue { dst, .. }
         | GenericOp::CallKey { dst, .. }
@@ -278,7 +285,7 @@ pub(super) fn plan(
             live.clear();
         }
         if let Some((r, fam)) = site_recv(op) {
-            let id = id_of(&mut ids, &mut next_id, r) * 2 + u32::from(fam == Family::Arr);
+            let id = id_of(&mut ids, &mut next_id, r) * 3 + fam as u32;
             site_id[i] = id;
             if let Some(e) = live.iter_mut().find(|e| e.0 == id) {
                 fill[e.1] = true;
@@ -344,8 +351,9 @@ pub(super) fn plan(
     };
     let obj_ways = uses(Family::Obj, MAX_OBJ_WAYS);
     let arr_ways = uses(Family::Arr, MAX_ARR_WAYS);
+    let cell_ways = uses(Family::Cell, MAX_CELL_WAYS);
     let mut way_of: Vec<(u32, usize)> = Vec::new();
-    let mut used = vec![0usize; obj_ways + arr_ways];
+    let mut used = vec![0usize; obj_ways + arr_ways + cell_ways];
     let mut sites = vec![None; n];
     for i in 0..n {
         if !(fill[i] || check[i]) {
@@ -357,6 +365,7 @@ pub(super) fn plan(
         let range = match family {
             Family::Obj => 0..obj_ways,
             Family::Arr => obj_ways..obj_ways + arr_ways,
+            Family::Cell => obj_ways + arr_ways..obj_ways + arr_ways + cell_ways,
         };
         let id = site_id[i];
         let way = if let Some(&(_, w)) = way_of.iter().find(|&&(x, _)| x == id) {
@@ -375,6 +384,6 @@ pub(super) fn plan(
             fill: true,
         });
     }
-    let ways = obj_ways + arr_ways;
+    let ways = obj_ways + arr_ways + cell_ways;
     RecvPlan { ways, sites }
 }
