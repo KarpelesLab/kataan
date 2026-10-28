@@ -36,6 +36,12 @@ pub(crate) struct PropsLayout {
     pub off_extra: i32,
     /// `ObjectExtra`-relative offset of the accessor list's length word.
     pub extra_acc_len: i32,
+    /// `ObjectExtra`-relative offset of the accessor list's data pointer.
+    pub extra_acc_ptr: i32,
+    /// The size of one accessor entry.
+    pub acc_stride: i32,
+    /// Entry-relative offset of an accessor's getter.
+    pub acc_getter: i32,
     /// Shape-word-relative offset of the shape's brand byte.
     pub shape_brands: i32,
     /// `Realm`-relative offset of the heap slot array's data pointer.
@@ -80,6 +86,9 @@ impl PropsLayout {
             off_epoch: i(obj_base + obj.epoch_off),
             off_extra: i(obj_base + obj.extra_off),
             extra_acc_len: i(obj.extra_acc_len_off),
+            extra_acc_ptr: i(obj.extra_acc_ptr_off),
+            acc_stride: i(obj.acc_stride),
+            acc_getter: i(obj.acc_getter_off),
             shape_brands: i32::try_from(obj.shape_brands_off)
                 .expect("jit layout offset fits in i32"),
             heap_ptr: i(heap_ptr),
@@ -139,7 +148,9 @@ struct ChainLevel {
 /// One way of a [`MethodSite`]: where a lookup of the site's key found the
 /// method — on a receiver of shape `recv_shape` (one with no accessors at
 /// all), at `depth` objects up its prototype chain (0: the receiver itself,
-/// else `levels[depth - 1]`), in slot `slot` of that holder. Empty while
+/// else `levels[depth - 1]`), in slot `slot` of that holder — or, for a
+/// property read (`acc != 0`), the holder's getter, entry `acc - 1` of its
+/// accessor list (whose order its key epoch fixes). Empty while
 /// `recv_shape` is `None` (no shape word is null).
 #[repr(C)]
 #[derive(Default, Clone)]
@@ -147,6 +158,7 @@ struct MethodEntry {
     recv_shape: Option<Rc<Shape>>,
     depth: u32,
     slot: u32,
+    acc: u32,
     levels: [ChainLevel; CHAIN_MAX],
 }
 
@@ -217,9 +229,41 @@ impl MethodSite {
         if self.key().starts_with('\0') {
             return;
         }
-        let Some(entry) = Self::entry_for(realm, recv, self.key()) else {
+        let Some(entry) = Self::entry_for(realm, recv, self.key(), false) else {
             return;
         };
+        self.store(entry);
+    }
+
+    /// Records a property read of the site's key on the object at `recv`, as
+    /// [`fill`](Self::fill) does a method lookup, except that the property
+    /// may be an inherited data property or an inherited VM-function getter
+    /// (which is returned, for the read's call cache).
+    pub(crate) fn fill_get(
+        &mut self,
+        realm: &crate::realm::Realm,
+        recv: crate::heap::Handle,
+    ) -> Option<crate::nanbox::NanBox> {
+        let key = self.key();
+        if self.fills >= FILL_LIMIT || key.starts_with('\0') || key == "__proto__" {
+            return None;
+        }
+        self.fills += 1;
+        let entry = Self::entry_for(realm, recv, key, true)?;
+        let getter = (entry.acc != 0)
+            .then(|| {
+                let h =
+                    crate::heap::Handle::from_raw(entry.levels[entry.depth as usize - 1].handle);
+                realm.jit_object(h)?.accessor(key).map(|(g, _)| g)
+            })
+            .flatten();
+        self.store(entry);
+        getter
+    }
+
+    /// Puts `entry` in the way holding the same receiver layout and
+    /// prototype, else the next way round.
+    fn store(&mut self, entry: MethodEntry) {
         let way = self
             .entries
             .iter()
@@ -244,6 +288,7 @@ impl MethodSite {
         realm: &crate::realm::Realm,
         recv: crate::heap::Handle,
         key: &str,
+        getters: bool,
     ) -> Option<MethodEntry> {
         let o = realm.jit_chain_object(recv)?;
         let shape = o.shaped_shape().filter(|_| o.has_no_accessors())?;
@@ -260,14 +305,25 @@ impl MethodSite {
             let h = cur?;
             let p = realm.jit_chain_object(h)?;
             let ps = p.shaped_shape()?;
-            if p.accessor(key).is_some() {
-                return None;
-            }
             *level = ChainLevel {
                 handle: h.to_raw(),
                 shape: Some(Rc::clone(ps)),
                 epoch: p.key_epoch(),
             };
+            if let Some(i) = p.accessor_index(key) {
+                // Only a read takes an accessor, and only a VM-function getter.
+                let (getter, _) = p.accessor(key)?;
+                if !getters
+                    || !getter
+                        .as_handle()
+                        .is_some_and(|g| realm.is_vm_function(crate::heap::Handle::from_raw(g)))
+                {
+                    return None;
+                }
+                entry.depth = d;
+                entry.acc = u32::try_from(i + 1).ok()?;
+                return Some(entry);
+            }
             if let Some(slot) = ps.lookup(key) {
                 entry.depth = d;
                 entry.slot = slot;
@@ -384,6 +440,7 @@ impl X64Assembler {
         (recv_base, recv_disp): (u8, i32),
         site: *const MethodSite,
         miss: Label,
+        getter: Option<Label>,
     ) {
         use core::mem::{offset_of, size_of};
         let i = |v: usize| i32::try_from(v).expect("site offset fits in i32");
@@ -440,8 +497,12 @@ impl X64Assembler {
                 self.g_jcc(cc::E, holder);
             }
         }
-        // `rcx` = the holder's slot: its `slot`-th value.
+        // `rcx` = the holder's slot: its getter, or its `slot`-th value.
         self.bind(holder);
+        let acc = i(offset_of!(MethodEntry, acc));
+        let accessor = self.new_label();
+        self.p_cmp32_imm8(r::R11, acc, 0);
+        self.g_jcc(cc::NE, accessor);
         self.p_load32(r::RAX, r::R11, i(offset_of!(MethodEntry, slot)));
         self.cmp_rax_at_rcx(l.off_slots_len);
         self.jae(next);
@@ -449,12 +510,40 @@ impl X64Assembler {
         self.p_load_r9_rax8();
         let done = self.new_label();
         self.jmp(done);
+        // The getter: entry `acc - 1` of the holder's accessor list.
+        self.bind(accessor);
+        if let Some(getter) = getter {
+            self.p_load32(r::RAX, r::R11, acc);
+            self.p_dec_eax();
+            self.g_load(r::R9, r::RCX, l.props.off_extra);
+            self.g_test(r::R9);
+            self.g_jcc(cc::E, next);
+            self.g_cmp_mem(r::RAX, r::R9, l.props.extra_acc_len);
+            self.g_jcc(cc::AE, next);
+            self.imul_rax_imm(l.props.acc_stride);
+            self.g_load(r::R9, r::R9, l.props.extra_acc_ptr);
+            self.p_add_rax_r9();
+            self.g_load(r::RAX, r::RAX, l.props.acc_getter);
+            self.jmp(getter);
+        } else {
+            self.jmp(next);
+        }
         self.bind(next);
         self.g_lea(r::R11, r::R11, i(size_of::<MethodEntry>()));
         self.p_dec_edi();
         self.g_jcc(cc::NE, way);
         self.jmp(miss);
         self.bind(done);
+    }
+
+    /// `dec eax` (zero-extending).
+    fn p_dec_eax(&mut self) {
+        self.code.extend_from_slice(&[0xff, 0xc8]);
+    }
+
+    /// `add rax, r9`.
+    fn p_add_rax_r9(&mut self) {
+        self.code.extend_from_slice(&[0x4c, 0x01, 0xc8]);
     }
 
     /// `dec edi`.

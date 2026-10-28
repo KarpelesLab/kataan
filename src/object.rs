@@ -350,6 +350,17 @@ impl Object {
         true
     }
 
+    /// The position of the accessor named `name` in the object's accessor
+    /// list (stable while [`key_epoch`](Self::key_epoch) is: every change to
+    /// the list bumps it).
+    #[must_use]
+    pub fn accessor_index(&self, name: &str) -> Option<usize> {
+        self.ex()
+            .accessors
+            .iter()
+            .position(|(k, _, _)| k.as_ref() == name)
+    }
+
     /// Sets generic-JIT flag bits (they are never cleared).
     pub fn add_jit_flags(&mut self, bits: u8) {
         self.jit_flags |= bits;
@@ -1262,6 +1273,12 @@ pub(crate) struct ObjectLayout {
     pub extra_off: usize,
     /// Byte offset of the accessor list's length word within `ObjectExtra`.
     pub extra_acc_len_off: usize,
+    /// Byte offset of the accessor list's data pointer within `ObjectExtra`.
+    pub extra_acc_ptr_off: usize,
+    /// The size of one accessor entry (`(name, getter, setter)`).
+    pub acc_stride: usize,
+    /// Byte offset of the getter within an accessor entry.
+    pub acc_getter_off: usize,
     /// Offset from the shape word (the `Rc`'s stored pointer) to the shape's
     /// `brands` byte (bit 0: a primitive wrapper).
     pub shape_brands_off: isize,
@@ -1339,6 +1356,11 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
     let extra_word = unsafe { *((obj_base + extra_off) as *const usize) };
     let extra_ref = obj.extra.as_deref().expect("just allocated");
     assert_eq!(extra_word, core::ptr::addr_of!(*extra_ref) as usize);
+    let acc_probe: (Box<str>, NanBox, NanBox) =
+        (Box::from("k"), NanBox::undefined(), NanBox::null());
+    let acc_getter_off =
+        core::ptr::addr_of!(acc_probe.1) as usize - core::ptr::addr_of!(acc_probe) as usize;
+    let extra_acc_ptr_off = core::mem::offset_of!(ObjectExtra, accessors) + vec_ptr_off;
     let extra_acc_len_off = core::mem::offset_of!(ObjectExtra, accessors) + vec_len_off;
     ObjectLayout {
         data_off,
@@ -1354,6 +1376,9 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
         epoch_off: core::mem::offset_of!(Object, key_epoch),
         extra_off,
         extra_acc_len_off,
+        extra_acc_ptr_off,
+        acc_stride: core::mem::size_of::<(Box<str>, NanBox, NanBox)>(),
+        acc_getter_off,
         shape_brands_off,
     }
 }

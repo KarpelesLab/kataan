@@ -1635,3 +1635,36 @@ pub(crate) extern "C" fn jit_helper_set_prop_site(
     }
     r
 }
+
+/// `Op::GetProp`'s slow path in compiled code (`crate::jit::JitGetSiteHelper`):
+/// the interpreter's read ([`jit_helper_get_prop`](super::jit_helper_get_prop)),
+/// after which the site's chain cache is refilled from the receiver and, when
+/// the read is an inherited VM getter's, the site's call cache from it.
+///
+/// # Safety
+/// `ctx` the live `Ctx`; `site`/`call` the calling `JitProto`'s caches for
+/// this read.
+pub(crate) extern "C" fn jit_helper_get_prop_site(
+    ctx_raw: *mut core::ffi::c_void,
+    obj: u64,
+    site: *mut crate::jit::MethodSite,
+    call: *const CallSite,
+) -> u64 {
+    // SAFETY: the calling `JitProto`'s site, touched only by this helper.
+    #[allow(unsafe_code)]
+    let site = unsafe { &mut *site };
+    let key = site.key();
+    let r = super::jit_helper_get_prop(ctx_raw, obj, key.as_ptr(), key.len(), site.cache);
+    if r != NanBox::jit_throw_bits()
+        && let Some(h) = NanBox::from_bits(obj).as_handle().map(Handle::from_raw)
+    {
+        // SAFETY: the read's own borrow of the context has ended; the call
+        // cache is the site's (interior-mutable).
+        #[allow(unsafe_code)]
+        let (ctx, call) = unsafe { (&mut *(ctx_raw as *mut Ctx), &mut *call.cast_mut()) };
+        if let Some(getter) = site.fill_get(&ctx.realm, h) {
+            fill_call_site(ctx, getter, call);
+        }
+    }
+    r
+}

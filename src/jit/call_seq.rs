@@ -558,7 +558,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             let have = a.new_label();
             a.g_cmp_byte_imm(r::R15, l.hosted, 0);
             a.g_jcc(cc::E, lookup);
-            a.p_method_lookup(jl, l.realm, (r::RBX, reg(recv)), site, lookup);
+            a.p_method_lookup(jl, l.realm, (r::RBX, reg(recv)), site, lookup, None);
             a.g_store(RBP, scratch, r::RAX);
             a.p_callee_info(jl, l.realm);
             a.jmp(have);

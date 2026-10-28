@@ -1827,6 +1827,8 @@ pub enum GenericOp {
         obj: u16,
         /// Index into the per-site key/IC table.
         site: u16,
+        /// Index into the per-site call caches (an inherited getter's call).
+        call: u16,
     },
     /// `reg[obj].key = reg[val]` — a plain (static-string-key) sloppy-mode
     /// property set, inline in-place store on a shape hit, else
@@ -2281,10 +2283,13 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
             Op::GetProp { dst, obj, key } => {
                 let site = u16::try_from(keys.len()).ok()?;
                 keys.push(alloc::boxed::Box::from(key.as_str()));
+                let call = u16::try_from(n_calls).ok()?;
+                n_calls += 1;
                 GenericOp::GetProp {
                     dst: r(*dst)?,
                     obj: r(*obj)?,
                     site,
+                    call,
                 }
             }
             Op::SetProp { obj, key, src } | Op::SetPropStrict { obj, key, src } => {
@@ -2568,6 +2573,9 @@ pub struct GenericHelpers {
     pub add: JitAddHelper,
     /// The property-get helper (`jit_helper_get_prop`).
     pub get: JitGetPropHelper,
+    /// The property-get helper through the site's chain and call caches
+    /// (`jit_helper_get_prop_site`).
+    pub get_site: JitGetSiteHelper,
     /// The property-set helper (`jit_helper_set_prop`), sloppy mode.
     pub set: JitSetPropHelper,
     /// The strict-mode property-set helper (`jit_helper_set_prop_strict`).
@@ -2832,6 +2840,12 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub type JitBinHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64, u64) -> u64;
 
+/// The runtime-helper ABI for a static-key property read through its site:
+/// `(ctx, obj, site, call site) -> NanBox bits` (or the throw sentinel).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub type JitGetSiteHelper =
+    extern "C" fn(*mut core::ffi::c_void, u64, *mut MethodSite, *const CallSite) -> u64;
+
 /// The runtime-helper ABI for a static-key property write through its site:
 /// `(ctx, obj, site, val, strict) -> undefined bits` (or the throw sentinel).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
@@ -3072,7 +3086,9 @@ impl JitProto {
         // A chain cache for each method-call and property-write site.
         let mut wants = alloc::vec![false; keys.len()];
         for op in &ops {
-            if let GenericOp::CallMethod { site, .. } | GenericOp::SetProp { site, .. } = *op
+            if let GenericOp::CallMethod { site, .. }
+            | GenericOp::SetProp { site, .. }
+            | GenericOp::GetProp { site, .. } = *op
                 && let Some(w) = wants.get_mut(site as usize)
             {
                 *w = true;
@@ -4930,7 +4946,7 @@ impl JitFunction {
             return None;
         }
         let add_helper = helpers.add as usize as u64;
-        let get_helper = helpers.get as usize as u64;
+        let get_site_helper = helpers.get_site as usize as u64;
         let set_site_helper = helpers.set_site as usize as u64;
         let init_prop_helper = helpers.init_prop as usize as u64;
         let get_elem_helper = helpers.get_elem as usize as u64;
@@ -5179,6 +5195,10 @@ impl JitFunction {
                 a.jp($miss); // NaN
             }};
         }
+        // `GetProp` miss paths, emitted after the body: (miss, done, dst, obj,
+        // method site, call site).
+        let mut cold_gets: Vec<(Label, Label, u16, u16, *mut MethodSite, *const CallSite)> =
+            Vec::new();
         for (op_idx, op) in ops.iter().enumerate() {
             a.bind(labels[op_idx]);
             if num.emit(&mut a, &labels, throw_exit, op_idx, ops)? {
@@ -5458,10 +5478,16 @@ impl JitFunction {
                     exec_op!(pc);
                     a.bind(done);
                 }
-                GenericOp::GetProp { dst, obj, site } => {
+                GenericOp::GetProp {
+                    dst,
+                    obj,
+                    site,
+                    call,
+                } => {
                     if !ok(dst) || !ok(obj) {
                         return None;
                     }
+                    let call_site = *call_sites.get(call as usize)?;
                     let s = sites.get(site as usize)?;
                     let helper = a.new_label();
                     let done = a.new_label();
@@ -5499,17 +5525,8 @@ impl JitFunction {
                     a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
                     a.store_rax(disp(dst));
                     a.jmp(done);
-                    // jit_helper_get_prop(ctx, obj, key_ptr, key_len, cache).
-                    a.bind(helper);
-                    a.mov_rdi_r15();
-                    a.load_argreg(1, disp(obj));
-                    a.movabs_argreg(2, s.key_ptr as i64);
-                    a.movabs_argreg(3, s.key_len as i64);
-                    a.movabs_argreg(4, s.cache_ptr as i64);
-                    a.movabs_rax(get_helper as i64);
-                    a.call_rax();
-                    throw_check!();
-                    a.store_rax(disp(dst));
+                    // The miss path is out of line (see `cold_gets`).
+                    cold_gets.push((helper, done, dst, obj, s.method_ptr, call_site));
                     a.bind(done);
                 }
                 GenericOp::SetProp {
@@ -6072,6 +6089,54 @@ impl JitFunction {
         // The numeric emitter's out-of-line slow paths (after a `ret`, so no op
         // falls through into them).
         num.finish(&mut a, &labels, throw_exit);
+        // The `GetProp` miss paths: the inherited data property or getter,
+        // else the helper; each returns to its op's `done`.
+        for (helper, done, dst, obj, method_ptr, call_site) in core::mem::take(&mut cold_gets) {
+            // An inherited data property or getter, through the site's
+            // chain cache: the value, or the getter's native call.
+            a.bind(helper);
+            let slow = a.new_label();
+            let getter = a.new_label();
+            a.p_method_lookup(
+                &layout,
+                helpers.call_layout.realm,
+                (call_seq::r::RBX, disp(obj)),
+                method_ptr,
+                slow,
+                Some(getter),
+            );
+            a.store_rax(disp(dst));
+            a.jmp(done);
+            a.bind(getter);
+            a.store_rax(method_scratch);
+            call_seq::emit_call(
+                &mut a,
+                &call_seq::CallEmit {
+                    dst,
+                    callee: call_seq::CalleeSrc::Frame {
+                        scratch: method_scratch,
+                    },
+                    this: Some(obj),
+                    args: &[],
+                    site: call_site,
+                    layout: &helpers.call_layout,
+                    throw_exit,
+                    slow,
+                    done,
+                },
+            )?;
+            // jit_helper_get_prop_site(ctx, obj, site, call site).
+            a.bind(slow);
+            a.mov_rdi_r15();
+            a.load_argreg(1, disp(obj));
+            a.movabs_argreg(2, method_ptr as i64);
+            a.movabs_argreg(3, call_site as i64);
+            a.movabs_rax(get_site_helper as i64);
+            a.call_rax();
+            throw_check!();
+            a.store_rax(disp(dst));
+            a.jmp(done);
+        }
         // Throw exit. In a body with `try` regions, first offer the pending fault
         // to the activation's innermost handler (exactly the interpreter's
         // `handle_throw!`): a caught throw resumes at its catch pc. Otherwise
