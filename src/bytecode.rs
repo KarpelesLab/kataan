@@ -269,8 +269,25 @@ pub fn deserialize_verified(
 }
 
 fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(), VerifyError> {
+    verify_op_with(op, &|r| (r as usize) < n_regs, num_funcs, n_ops)
+}
+
+/// Whether `op` names register `r` in any operand (read or write). Shares the
+/// verifier's per-op register enumeration, so it cannot miss an operand the
+/// verifier checks. Used by the JIT to prove a register dead.
+#[must_use]
+pub fn op_mentions_reg(op: &Op, r: Reg) -> bool {
+    verify_op_with(op, &|x| x != r, usize::MAX, usize::MAX).is_err()
+}
+
+fn verify_op_with(
+    op: &Op,
+    reg_ok: &dyn Fn(Reg) -> bool,
+    num_funcs: usize,
+    n_ops: usize,
+) -> Result<(), VerifyError> {
     let reg = |r: Reg| {
-        if (r as usize) < n_regs {
+        if reg_ok(r) {
             Ok(())
         } else {
             Err(VerifyError::Register(r))

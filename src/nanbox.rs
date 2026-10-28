@@ -26,6 +26,8 @@
 
 /// A JavaScript value packed into a single 64-bit word (see the module docs).
 #[derive(Clone, Copy, PartialEq, Eq)]
+/// `repr(transparent)`: the JIT addresses a register file (`[NanBox]`) as `[u64]`.
+#[repr(transparent)]
 pub struct NanBox(u64);
 
 /// The quiet-NaN base pattern. A word is a *boxed* (non-double) value exactly
@@ -76,6 +78,12 @@ const TAG_TDZ: u64 = QNAN | 0x07;
 /// its dispatch (`nbvm::call_generic`) agree on this encoding; the emitted native
 /// code loads [`NanBox::jit_throw_bits`] to test the helper's return.
 const TAG_JIT_THROW: u64 = QNAN | 0x08;
+
+/// A second reserved JIT sentinel: a generic-tier body returns this when control
+/// falls off the end of its op stream (the interpreter's `FrameExit::Return(None)`,
+/// as opposed to an explicit `return`). Never a legal JS value, like
+/// `TAG_JIT_THROW`.
+const TAG_JIT_FALLOFF: u64 = QNAN | 0x09;
 
 /// The canonical quiet-NaN payload a `f64` NaN is normalized to, chosen so that
 /// `(bits & QNAN) != QNAN` (i.e. it still reads back as a number).
@@ -173,6 +181,12 @@ impl NanBox {
     #[must_use]
     pub const fn is_jit_throw_sentinel(self) -> bool {
         self.0 == TAG_JIT_THROW
+    }
+
+    /// The raw bits of the JIT fall-off-the-end sentinel (see `TAG_JIT_FALLOFF`).
+    #[must_use]
+    pub const fn jit_falloff_bits() -> u64 {
+        TAG_JIT_FALLOFF
     }
 
     /// A boolean.

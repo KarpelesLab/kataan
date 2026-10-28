@@ -39,7 +39,11 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+mod jit_tier;
 mod vm_eval;
+#[cfg(all(test, feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+use jit_tier::call_generic;
 pub(crate) use vm_eval::{
     EVAL_DERIVED, EVAL_DYN_FN, EVAL_FIELD_INIT, EVAL_HOME, EVAL_NEW_TARGET, EVAL_SCRIPT,
     compile_eval_code, run_eval_code,
@@ -1612,6 +1616,31 @@ fn plain_write_ok(realm: &Realm, h: Handle, key: &str) -> bool {
         cur = realm.object_proto(p);
     }
     true
+}
+
+/// `Op::InitProp`: defines the own data property `key` of a fresh literal
+/// object `o` (through the site's inline cache when it is a plain append),
+/// else the host's `[[DefineOwnProperty]]`.
+fn vm_init_prop(
+    ctx: &mut Ctx,
+    o: NanBox,
+    key: &str,
+    v: NanBox,
+    cache: &mut PropertyCache,
+) -> Result<(), VmError> {
+    let fast = o.as_handle().is_some_and(|h| {
+        ctx.realm
+            .init_data_property_cached(Handle::from_raw(h), key, v, cache)
+    });
+    if !fast {
+        let k = NanBox::handle(ctx.realm.new_string(key).to_raw());
+        match with_host(ctx, |h| h.define_data(o, k, v, 7)) {
+            Some(Ok(())) => {}
+            Some(Err(e)) => return Err(VmError::from(e)),
+            None => return Err(VmError::Unsupported),
+        }
+    }
+    Ok(())
 }
 
 /// [`vm_set_prop`] with the hosted write rules: a primitive, string or proxy
@@ -3860,7 +3889,7 @@ fn call(ctx: &mut Ctx, funcs: &[FnProto], id: usize, args: &[NanBox]) -> Result<
 }
 
 /// The interpreter's real static-call path (`Op::Call`'s semantics), factored out
-/// so the bytecode VM **and** the generic-JIT runtime helper ([`jit_helper_call`])
+/// so the bytecode VM **and** the generic-JIT tier (whose `Op::Call` the interpreter runs)
 /// share one code path and can never diverge: a plain static dispatch to the
 /// function-table entry `id` with `this` bound (no captures — a hoisted function
 /// call carries none). Delegates to [`call_with`] (recursion guard, arity binding,
@@ -4083,34 +4112,15 @@ fn call_with_inner(
             Some(o) => o.as_slice(),
             None => proto.ops.as_slice(),
         };
-        // Native fast path (Phase G JIT): once a function is hot, try compiling it
-        // to machine code. Eligible functions are pure straight-line/looping
-        // integer arithmetic (no side effects), so running the native code is
-        // observationally equivalent to the interpreter; a non-integer/overflowing
-        // call deopts to `None` and we fall through to `run_frame`. (A function with
-        // a tail call is never JIT-eligible, so this never intercepts the
-        // trampoline.)
+        // Native fast path (`ROADMAP.md` §2.1): once a function is hot, compile it
+        // to machine code and run that on this activation's register file (see
+        // `jit_tier`). A body with a tail call, a handler or a suspension point is
+        // never compiled, so this never intercepts the trampoline.
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        if optimized.is_some()
-            && !proto.is_async
-            && proto.rest_from.is_none()
-            && proto.n_captures == 0
+        if jit_tier::call_is_hot(optimized.is_some())
+            && let Some(outcome) = jit_tier::enter_on_call(ctx, funcs, id, &args, &mut regs)
         {
-            let mut stack = alloc::collections::BTreeSet::new();
-            let cached = ensure_jit(&mut ctx.jit_cache, funcs, id, &mut stack);
-            if let Some(jit) = cached {
-                if jit.is_generic() {
-                    // The generic (NanBox) tier re-enters the interpreter through
-                    // runtime helpers, so it needs the live context. A `Some`
-                    // outcome (value or thrown) is authoritative; `None` is an
-                    // arity deopt → fall through to the interpreter.
-                    if let Some(outcome) = call_generic(ctx, funcs, &jit, &args) {
-                        return outcome;
-                    }
-                } else if let Some(result) = jit.call_guarded(&args) {
-                    return Ok(result);
-                }
-            }
+            return outcome;
         }
         // An `async` function: its synchronous body runs to completion, and its
         // result (or thrown value) settles a returned `Promise`. (No `await` yet —
@@ -4203,53 +4213,40 @@ fn ensure_jit(
         return None; // recursion: this function is mid-compilation
     }
     stack.insert(id);
-    // Resolve each statically-called function to its compiled code address, keyed by
-    // the callee's ABI so a caller only ever direct-calls a matching signature (a
-    // wrong-ABI direct call would mis-dispatch and crash):
-    //   * `registry`         — Int-ABI callees, for the Int tier's `RegOp::Call`.
-    //   * `generic_registry` — generic-ABI callees + their param count, for the
-    //     generic tier's direct JIT→JIT call.
-    // A Float-ABI callee is direct-callable by neither (the Float tier emits no
-    // calls), so it is registered nowhere and its callers take the interpreter-
-    // reentrant helper.
+    // Resolve each statically-called Int-ABI function to its compiled code address
+    // for the Int tier's `RegOp::Call` (only a matching signature is ever
+    // direct-called; a wrong-ABI direct call would mis-dispatch and crash). The
+    // generic tier's calls are run by the interpreter.
     let mut registry = alloc::collections::BTreeMap::new();
-    let mut generic_registry: alloc::collections::BTreeMap<u32, (u64, usize)> =
-        alloc::collections::BTreeMap::new();
     for op in &funcs[id].ops {
         if let Op::Call { func, .. } = op {
             let fid = *func as usize;
             if fid != id
                 && fid < funcs.len()
                 && let Some(j) = ensure_jit(cache, funcs, fid, stack)
+                && j.abi_kind() == crate::jit::AbiKind::Int
             {
-                match j.abi_kind() {
-                    crate::jit::AbiKind::Int => {
-                        registry.insert(*func, j.code_ptr() as u64);
-                    }
-                    crate::jit::AbiKind::Generic => {
-                        generic_registry.insert(*func, (j.code_ptr() as u64, funcs[fid].n_params));
-                    }
-                    crate::jit::AbiKind::Float => {}
-                }
+                registry.insert(*func, j.code_ptr() as u64);
             }
         }
     }
     stack.remove(&id);
-    // Prefer the Int/Float tiers; fall back to the generic (NanBox) tier for a
-    // function they reject but that is generic-eligible (param/const loads, `+`,
-    // `Move`, plain property get/set, `Return`) — e.g. a 7+-parameter add or an
-    // `obj.key` accessor. The generic tier re-enters the interpreter for
-    // non-numeric operands and all property access via the runtime helpers, and
-    // direct-calls a fellow generic-tier callee (`generic_registry`).
+    // Prefer the Int/Float tiers (unboxed, for pure numeric code); fall back to
+    // the generic (NanBox) tier, which runs on the interpreter's register file and
+    // accepts nearly any body (see `jit_tier`).
     let compiled = crate::jit::JitProto::compile_with_registry(&funcs[id], &registry)
-        .or_else(|| {
-            crate::jit::JitProto::compile_generic_with_registry(
-                &funcs[id],
-                &jit_generic_helpers(),
-                &generic_registry,
-            )
-        })
+        .or_else(|| crate::jit::JitProto::compile_generic(&funcs[id], &jit_generic_helpers()))
         .map(alloc::rc::Rc::new);
+    if jit_tier::jit_log_enabled() {
+        let what = match &compiled {
+            Some(j) => alloc::format!("compiled ({:?} tier)", j.abi_kind()),
+            None => alloc::format!(
+                "rejected: {}",
+                crate::jit::generic_reject_reason(&funcs[id])
+            ),
+        };
+        jit_tier::jit_log(id, &funcs[id], &what);
+    }
     cache.insert(id, compiled.clone());
     compiled
 }
@@ -5175,7 +5172,7 @@ pub(crate) extern "C" fn jit_helper_get_prop(
 }
 
 /// The generic-JIT runtime helper for a property **set**. Mirrors
-/// [`jit_helper_get_prop`], running the shared [`vm_set_prop`]; returns
+/// [`jit_helper_get_prop`], running the interpreter's [`vm_set_prop_mode`]; returns
 /// `undefined`'s bits on success, or the throw/deopt sentinel (with the fault in
 /// `ctx.jit_pending_fault`) otherwise.
 ///
@@ -5189,6 +5186,67 @@ pub(crate) extern "C" fn jit_helper_set_prop(
     key_len: usize,
     cache: *mut core::ffi::c_void,
     val: u64,
+) -> u64 {
+    jit_set_prop_impl(ctx, obj, key_ptr, key_len, cache, val, false)
+}
+
+/// The generic-JIT helper for `Op::InitProp` (a literal's own data property),
+/// running the interpreter's [`vm_init_prop`] through the site's persistent
+/// inline cache. Same contract as [`jit_helper_set_prop`].
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_init_prop(
+    ctx: *mut core::ffi::c_void,
+    obj: u64,
+    key_ptr: *const u8,
+    key_len: usize,
+    cache: *mut core::ffi::c_void,
+    val: u64,
+) -> u64 {
+    // SAFETY: see `jit_helper_get_prop`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    #[allow(unsafe_code)]
+    let key =
+        unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(key_ptr, key_len)) };
+    #[allow(unsafe_code)]
+    let cache = unsafe { &mut *(cache as *mut PropertyCache) };
+    match vm_init_prop(
+        ctx,
+        NanBox::from_bits(obj),
+        key,
+        NanBox::from_bits(val),
+        cache,
+    ) {
+        Ok(()) => NanBox::undefined().to_bits(),
+        Err(e) => {
+            ctx.jit_pending_fault = Some(e);
+            NanBox::jit_throw_bits()
+        }
+    }
+}
+
+/// [`jit_helper_set_prop`] for strict-mode code (`Op::SetPropStrict`).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_set_prop_strict(
+    ctx: *mut core::ffi::c_void,
+    obj: u64,
+    key_ptr: *const u8,
+    key_len: usize,
+    cache: *mut core::ffi::c_void,
+    val: u64,
+) -> u64 {
+    jit_set_prop_impl(ctx, obj, key_ptr, key_len, cache, val, true)
+}
+
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn jit_set_prop_impl(
+    ctx: *mut core::ffi::c_void,
+    obj: u64,
+    key_ptr: *const u8,
+    key_len: usize,
+    cache: *mut core::ffi::c_void,
+    val: u64,
+    strict: bool,
 ) -> u64 {
     // SAFETY: see `jit_helper_get_prop`.
     #[allow(unsafe_code)]
@@ -5204,13 +5262,14 @@ pub(crate) extern "C" fn jit_helper_set_prop(
         unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(key_ptr, key_len)) };
     #[allow(unsafe_code)]
     let cache = unsafe { &mut *(cache as *mut PropertyCache) };
-    match vm_set_prop(
+    match vm_set_prop_mode(
         ctx,
         funcs,
         NanBox::from_bits(obj),
         key,
         NanBox::from_bits(val),
         cache,
+        strict,
     ) {
         Ok(()) => NanBox::undefined().to_bits(),
         Err(e) => {
@@ -5256,7 +5315,8 @@ pub(crate) extern "C" fn jit_helper_get_elem(
 }
 
 /// The generic-JIT runtime helper for a computed element **set** `obj[key] = val`.
-/// Mirrors [`jit_helper_get_elem`], running the shared [`vm_set_elem`]; returns
+/// Mirrors [`jit_helper_get_elem`], running the interpreter's [`vm_set_elem_mode`]
+/// (`strict` nonzero for strict code); returns
 /// `undefined`'s bits on success, or the throw/deopt sentinel (with the fault in
 /// `ctx.jit_pending_fault`) otherwise.
 ///
@@ -5268,6 +5328,7 @@ pub(crate) extern "C" fn jit_helper_set_elem(
     recv: u64,
     key: u64,
     val: u64,
+    strict: u64,
 ) -> u64 {
     // SAFETY: see `jit_helper_get_elem`.
     #[allow(unsafe_code)]
@@ -5278,12 +5339,13 @@ pub(crate) extern "C" fn jit_helper_set_elem(
             .jit_funcs
             .expect("jit_funcs set before generic dispatch")
     };
-    match vm_set_elem(
+    match vm_set_elem_mode(
         ctx,
         funcs,
         NanBox::from_bits(recv),
         NanBox::from_bits(key),
         NanBox::from_bits(val),
+        strict != 0,
     ) {
         Ok(()) => NanBox::undefined().to_bits(),
         Err(e) => {
@@ -5329,63 +5391,20 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         add: jit_helper_add,
         get: jit_helper_get_prop,
         set: jit_helper_set_prop,
+        set_strict: jit_helper_set_prop_strict,
+        init_prop: jit_helper_init_prop,
         get_elem: jit_helper_get_elem,
         set_elem: jit_helper_set_elem,
         array_len: jit_helper_array_len,
-        array_len_dense: jit_array_len_dense,
         arith: jit_helper_arith,
         value_bin: jit_helper_value_bin,
         lt: jit_helper_lt,
         strict_eq: jit_helper_strict_eq,
         truthy: jit_helper_truthy,
-        call: jit_helper_call,
         call_native: jit_helper_call_native,
+        exec_op: jit_tier::jit_helper_exec_op,
+        backedge: jit_tier::jit_helper_backedge,
         arena: jit_arena,
-        array_unrestricted: jit_array_unrestricted,
-    }
-}
-
-/// The generic-JIT probe for the inline dense-array element-SET fast path: returns
-/// `1` iff the receiver is a plain dense array on which an in-bounds in-place store
-/// is identical to the interpreter's `vm_set_elem` (not frozen/sealed, no per-index
-/// override aux object, dense length within `max_array_len`), else `0`. A leaf,
-/// non-allocating read that cannot trigger a collection, so the emitted fast path
-/// stays GC-safe. Mirrors [`jit_arena`]'s reentrancy/safety contract.
-///
-/// # Safety
-/// `ctx` must be the live `Ctx` the dispatcher passed. The reentrancy is
-/// single-threaded — the native caller holds no live `&mut Ctx` while this runs.
-/// The generic-JIT probe for the inline dense-array `.length` fast path: returns
-/// `1` iff the receiver's spec `.length` equals its dense element-`Vec` length —
-/// i.e. it is a plain [`Cell::Array`] that is **not** a VM function (which reports
-/// its parameter count, and always carries a `\0vmfn` aux property) and has **no**
-/// sparse logical-length override (`arr.length = huge`). Only then may the emitted
-/// code read `off_arr_len` directly; every other receiver (string, VM function,
-/// sparse array, non-array) routes to [`jit_helper_array_len`]. A leaf,
-/// non-allocating read that cannot trigger a collection, so the fast path stays
-/// GC-safe (mirrors [`jit_array_unrestricted`]).
-///
-/// # Safety
-/// As [`jit_array_unrestricted`].
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-pub(crate) extern "C" fn jit_array_len_dense(ctx: *mut core::ffi::c_void, recv: u64) -> u64 {
-    // SAFETY: single-threaded reentrancy — a shared borrow suffices (read-only).
-    #[allow(unsafe_code)]
-    let ctx = unsafe { &*(ctx as *const Ctx) };
-    match NanBox::from_bits(recv).as_handle() {
-        Some(raw) if ctx.realm.jit_array_len_is_dense(Handle::from_raw(raw)) => 1,
-        _ => 0,
-    }
-}
-
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-pub(crate) extern "C" fn jit_array_unrestricted(ctx: *mut core::ffi::c_void, recv: u64) -> u64 {
-    // SAFETY: single-threaded reentrancy — a shared borrow suffices (read-only).
-    #[allow(unsafe_code)]
-    let ctx = unsafe { &*(ctx as *const Ctx) };
-    match NanBox::from_bits(recv).as_handle() {
-        Some(raw) if ctx.realm.jit_array_unrestricted(Handle::from_raw(raw)) => 1,
-        _ => 0,
     }
 }
 
@@ -5401,13 +5420,43 @@ pub(crate) extern "C" fn jit_array_unrestricted(ctx: *mut core::ffi::c_void, rec
 /// single-threaded — the native caller holds no live `&mut Ctx` while this runs
 /// (as [`jit_helper_get_prop`]).
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-pub(crate) extern "C" fn jit_arena(ctx: *mut core::ffi::c_void) -> crate::jit::JitArena {
+pub(crate) extern "C" fn jit_arena(
+    ctx: *mut core::ffi::c_void,
+    recv: u64,
+    mode: u64,
+) -> crate::jit::JitArena {
     // SAFETY: single-threaded reentrancy — see `jit_helper_get_prop`. A shared
-    // borrow suffices; this reads the heap's slot-array base/len only.
+    // borrow suffices; this reads the heap and the receiver's side tables only.
     #[allow(unsafe_code)]
     let ctx = unsafe { &*(ctx as *const Ctx) };
+    let recv = NanBox::from_bits(recv);
+    let plain = recv
+        .as_handle()
+        .map(Handle::from_raw)
+        .is_some_and(|h| match mode {
+            crate::jit::ARENA_GET => !read_needs_host(ctx, recv),
+            crate::jit::ARENA_SET => {
+                !read_needs_host(ctx, recv)
+                    && !is_string_wrapper(&ctx.realm, recv)
+                    && !ctx
+                        .host
+                        .as_ref()
+                        .is_some_and(|host| host.is_global_object(recv))
+                    && !ctx.realm.is_dispatch_tracked_proto(h)
+            }
+            crate::jit::ARENA_ELEM_GET => ctx.realm.jit_array_len_is_dense(h),
+            crate::jit::ARENA_ELEM_SET => {
+                ctx.realm.jit_array_len_is_dense(h) && ctx.realm.jit_array_unrestricted(h)
+            }
+            _ => false,
+        });
     let (base, len) = ctx.realm.jit_arena_slots();
-    crate::jit::JitArena { base, len }
+    // An unqualified receiver gets an empty arena: every handle index is then out
+    // of bounds, so the inline path misses into its helper.
+    crate::jit::JitArena {
+        base,
+        len: if plain { len } else { 0 },
+    }
 }
 
 /// Turns a helper `Result` into a raw generic-JIT return word: the value's `NanBox`
@@ -5570,76 +5619,12 @@ pub(crate) extern "C" fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64, b: 
     }
 }
 
-// Test-only counter of `jit_helper_call` entries — lets a differential test
-// distinguish a direct generic→generic native call (this stays at 0) from the
-// interpreter-reentrant helper path (this increments). Thread-local so the count
-// is isolated per test (cargo runs each test on its own thread, and the JIT call
-// is synchronous on that thread) — a shared global would race under parallelism.
-#[cfg(all(test, feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-std::thread_local! {
-    pub(crate) static JIT_HELPER_CALL_COUNT: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
-}
-
-/// The generic-JIT runtime helper for a static function call (`Op::Call`): the
-/// slow path the native code calls to invoke callee `id` with `this` and the
-/// marshaled argument buffer. Reconstructs `&mut Ctx`, runs the shared [`vm_call`],
-/// and returns the result's `NanBox` bits — or, on any fault (a callee throw or a
-/// non-throw `VmError`), stashes the whole error in `ctx.jit_pending_fault` and
-/// returns the reserved throw/deopt sentinel ([`NanBox::jit_throw_bits`]), exactly
-/// as the property helpers do (so `call_generic` surfaces the identical `VmError`).
-/// The callee therefore runs **exactly once** — the body returns the sentinel and
-/// the interpreter propagates it without re-running the op.
-///
-/// # Safety
-/// `ctx` must be the live `Ctx` the dispatcher passed (with `ctx.jit_funcs` set);
-/// `argv`/`argc` a valid buffer of `argc` `NanBox` words for the call.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-pub(crate) extern "C" fn jit_helper_call(
-    ctx: *mut core::ffi::c_void,
-    id: u64,
-    this: u64,
-    argv: *const u64,
-    argc: usize,
-) -> u64 {
-    // Test-only instrumentation: the differential tests count entries here to prove
-    // a generic→generic call took the *direct* native path (this helper NOT entered)
-    // versus the interpreter-reentrant slow path (this helper entered).
-    #[cfg(test)]
-    JIT_HELPER_CALL_COUNT.with(|c| c.set(c.get() + 1));
-    // SAFETY: single-threaded reentrancy — as `jit_helper_add`.
-    #[allow(unsafe_code)]
-    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
-    // SAFETY: `jit_funcs` outlives this call (borrowed down the whole call tree).
-    #[allow(unsafe_code)]
-    let funcs = unsafe {
-        &*ctx
-            .jit_funcs
-            .expect("jit_funcs set before generic dispatch")
-    };
-    // SAFETY: `argv` points at an `argc`-long buffer of NanBox words the emitted
-    // code marshaled into its own frame; it is live for this synchronous call.
-    let args: Vec<NanBox> = if argc == 0 {
-        Vec::new()
-    } else {
-        #[allow(unsafe_code)]
-        let raw = unsafe { core::slice::from_raw_parts(argv, argc) };
-        raw.iter().map(|&w| NanBox::from_bits(w)).collect()
-    };
-    match vm_call(ctx, funcs, id as usize, NanBox::from_bits(this), &args) {
-        Ok(v) => v.to_bits(),
-        Err(e) => {
-            ctx.jit_pending_fault = Some(e);
-            NanBox::jit_throw_bits()
-        }
-    }
-}
-
 /// The generic-JIT runtime helper for a native builtin call (`Op::CallNative`):
-/// runs the shared [`vm_call_native`]. Mirrors [`jit_helper_call`] — success bits,
+/// runs the shared [`vm_call_native`]. Mirrors [`jit_helper_get_prop`] — success bits,
 /// or the throw/deopt sentinel with the fault in `ctx.jit_pending_fault`.
 ///
 /// # Safety
-/// As [`jit_helper_call`].
+/// As [`jit_helper_get_prop`].
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) extern "C" fn jit_helper_call_native(
     ctx: *mut core::ffi::c_void,
@@ -5647,7 +5632,7 @@ pub(crate) extern "C" fn jit_helper_call_native(
     argv: *const u64,
     argc: usize,
 ) -> u64 {
-    // SAFETY: as `jit_helper_call`.
+    // SAFETY: as `jit_helper_get_prop`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
     #[allow(unsafe_code)]
@@ -5669,39 +5654,6 @@ pub(crate) extern "C" fn jit_helper_call_native(
             ctx.jit_pending_fault = Some(e);
             NanBox::jit_throw_bits()
         }
-    }
-}
-
-/// Invokes a generic-tier native body and translates its raw return into the
-/// interpreter's `Result`. `None` on a pre-call arity deopt (the caller then
-/// falls through to the interpreter); otherwise `Ok(value)`, or — when the body
-/// returns the throw/deopt sentinel — `Err(..)`. A property helper stashes a full
-/// [`VmError`] in `ctx.jit_pending_fault` (so a non-throw `Unsupported` propagates
-/// as the interpreter would); the `+` helper stashes a thrown `NanBox` in
-/// `ctx.jit_pending`. Setting `ctx.jit_funcs` here lets the helpers re-enter the
-/// interpreter with the correct function table.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-fn call_generic(
-    ctx: &mut Ctx,
-    funcs: &[FnProto],
-    jit: &crate::jit::JitProto,
-    args: &[NanBox],
-) -> Option<Result<NanBox, VmError>> {
-    ctx.jit_funcs = Some(funcs as *const [FnProto]);
-    let ctx_ptr = ctx as *mut Ctx as *mut core::ffi::c_void;
-    let raw = jit.call_generic_raw(ctx_ptr, args)?;
-    let nb = NanBox::from_bits(raw);
-    if nb.is_jit_throw_sentinel() {
-        let err = ctx
-            .jit_pending_fault
-            .take()
-            .or_else(|| ctx.jit_pending.take().map(VmError::Thrown))
-            .unwrap_or_else(|| {
-                VmError::Thrown(vm_error(ctx, "Error", "JIT throw without pending value"))
-            });
-        Some(Err(err))
-    } else {
-        Some(Ok(nb))
     }
 }
 
@@ -6247,6 +6199,9 @@ fn run_frame_at(
     // whose sentinel shape resolves no key) simply misses and re-resolves —
     // always consistent, never stale across a shape change or property delete.
     let mut ic: Vec<PropertyCache> = Vec::new();
+    // Loop back-edges taken in this activation, for on-stack replacement.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    let mut osr_count: u32 = 0;
 
     let num = |v: NanBox| v.as_number().ok_or(VmError::NotANumber);
     // A register holding an object: recover its heap handle from the boxed value
@@ -7256,17 +7211,9 @@ fn run_frame_at(
             Op::InitProp { obj, key, src } => {
                 let (o, v) = (regs[*obj as usize], regs[*src as usize]);
                 let cache = site_cache!(site);
-                let fast = o.as_handle().is_some_and(|h| {
-                    ctx.realm
-                        .init_data_property_cached(Handle::from_raw(h), key, v, cache)
-                });
-                if !fast {
-                    let k = NanBox::handle(ctx.realm.new_string(key).to_raw());
-                    match with_host(ctx, |h| h.define_data(o, k, v, 7)) {
-                        Some(Ok(())) => {}
-                        Some(Err(e)) => handle_throw!(VmError::from(e)),
-                        None => return Err(VmError::Unsupported),
-                    }
+                // Shared with the generic-JIT helper via `vm_init_prop`.
+                if let Err(e) = vm_init_prop(ctx, o, key, v, cache) {
+                    handle_throw!(e);
                 }
             }
             Op::SuperCall {
@@ -7648,6 +7595,20 @@ fn run_frame_at(
                         return Err(VmError::Interrupted);
                     }
                     vm_safepoint(ctx, funcs, program, regs);
+                    // A hot loop continues in native code from its header
+                    // (on-stack replacement); `u32::MAX` = tried, not eligible.
+                    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+                    if osr_count != u32::MAX && handlers.is_empty() {
+                        osr_count += 1;
+                        if osr_count >= jit_tier::osr_threshold() {
+                            // The rest of the activation ran natively (a
+                            // compiled body has no handlers to unwind into).
+                            if let Some(r) = jit_tier::osr(ctx, funcs, program, regs, *target) {
+                                return r;
+                            }
+                            osr_count = u32::MAX;
+                        }
+                    }
                 }
                 pc = *target;
             }
@@ -26335,30 +26296,19 @@ mod generic_jit_tests {
              function f(o){ return g(o) + 1; }",
             "f",
         );
-        let g = id_of(&funcs, "g");
+        let _g = id_of(&funcs, "g");
         let mut cache = alloc::collections::BTreeMap::new();
         let mut stack = alloc::collections::BTreeSet::new();
         let jit_f = ensure_jit(&mut cache, &funcs, f, &mut stack).expect("f JITs");
         assert!(jit_f.is_generic(), "f must be the generic tier");
-        assert_eq!(
-            cache.get(&g).and_then(|c| c.as_ref()).map(|j| j.abi_kind()),
-            Some(crate::jit::AbiKind::Generic),
-            "g must be generic-ABI (so f direct-calls it)"
-        );
 
         let mut ctx = mk_ctx(Realm::new());
         let obj = mint(&mut ctx, &funcs, "mk");
         let interp = call(&mut ctx, &funcs, f, &[obj]).unwrap();
         // The forced JIT body must reach g WITHOUT the interpreter-reentrant helper.
-        JIT_HELPER_CALL_COUNT.with(|c| c.set(0));
         let jitted = call_generic(&mut ctx, &funcs, &jit_f, &[obj])
             .unwrap()
             .unwrap();
-        assert_eq!(
-            JIT_HELPER_CALL_COUNT.with(|c| c.get()),
-            0,
-            "generic→generic call took the direct native path"
-        );
         assert_eq!(interp.as_number(), Some(11.0)); // 5*2 + 1
         assert_eq!(interp.to_bits(), jitted.to_bits());
     }
@@ -26376,27 +26326,17 @@ mod generic_jit_tests {
              function f(o){ return g(o) + 1; }",
             "f",
         );
-        let g = id_of(&funcs, "g");
+        let _g = id_of(&funcs, "g");
         let mut cache = alloc::collections::BTreeMap::new();
         let mut stack = alloc::collections::BTreeSet::new();
         let jit_f = ensure_jit(&mut cache, &funcs, f, &mut stack).expect("f JITs");
         assert!(jit_f.is_generic());
-        assert_eq!(
-            cache.get(&g).and_then(|c| c.as_ref()).map(|j| j.abi_kind()),
-            Some(crate::jit::AbiKind::Generic)
-        );
 
         let mut ctx = mk_ctx(Realm::new());
         let oi = mint(&mut ctx, &funcs, "mkThrow");
         let oj = mint(&mut ctx, &funcs, "mkThrow");
         let interp = call(&mut ctx, &funcs, f, &[oi]);
-        JIT_HELPER_CALL_COUNT.with(|c| c.set(0));
         let jitted = call_generic(&mut ctx, &funcs, &jit_f, &[oj]).unwrap();
-        assert_eq!(
-            JIT_HELPER_CALL_COUNT.with(|c| c.get()),
-            0,
-            "the (throwing) call still took the direct path"
-        );
         let (vi, vj) = match (interp, jitted) {
             (Err(VmError::Thrown(vi)), Err(VmError::Thrown(vj))) => (vi, vj),
             other => panic!("expected both to throw, got {other:?}"),
@@ -26451,15 +26391,9 @@ mod generic_jit_tests {
         let mut ctx = mk_ctx(Realm::new());
         let obj = mint(&mut ctx, &funcs, "mk");
         let interp = call(&mut ctx, &funcs, a, &[obj]).unwrap();
-        JIT_HELPER_CALL_COUNT.with(|c| c.set(0));
         let jitted = call_generic(&mut ctx, &funcs, &jit_a, &[obj])
             .unwrap()
             .unwrap();
-        assert_eq!(
-            JIT_HELPER_CALL_COUNT.with(|c| c.get()),
-            0,
-            "all edges direct"
-        );
         assert_eq!(interp.as_number(), Some(116.0)); // 3*2 + 10 + 100
         assert_eq!(interp.to_bits(), jitted.to_bits());
     }
@@ -26491,7 +26425,6 @@ mod generic_jit_tests {
         let mut ctx = mk_ctx(Realm::new());
         for n in [0.0, 1.0, 2.0, 5.0, 8.0] {
             let interp = call(&mut ctx, &funcs, even, &[NanBox::number(n)]).unwrap();
-            JIT_HELPER_CALL_COUNT.with(|c| c.set(0));
             let jitted = call_generic(&mut ctx, &funcs, &jit_even, &[NanBox::number(n)])
                 .unwrap()
                 .unwrap();
@@ -26506,12 +26439,6 @@ mod generic_jit_tests {
             // n>=2 is the first depth with a recursive back-edge (`odd→even`), which
             // the `stack` guard leaves unregistered → it takes the helper. (n=1 hits
             // odd's base case immediately, so it is a single direct `even→odd`.)
-            if n >= 2.0 {
-                assert!(
-                    JIT_HELPER_CALL_COUNT.with(|c| c.get()) > 0,
-                    "the recursive back-edge went through the helper"
-                );
-            }
         }
     }
 
@@ -26540,15 +26467,104 @@ mod generic_jit_tests {
         let mut ctx = mk_ctx(Realm::new());
         let obj = mint(&mut ctx, &funcs, "mk");
         let interp = call(&mut ctx, &funcs, f, &[obj]).unwrap();
-        JIT_HELPER_CALL_COUNT.with(|c| c.set(0));
         let jitted = call_generic(&mut ctx, &funcs, &jit_f, &[obj])
             .unwrap()
             .unwrap();
-        assert!(
-            JIT_HELPER_CALL_COUNT.with(|c| c.get()) > 0,
-            "the Int-ABI callee was reached via the helper, not a direct call"
-        );
         assert_eq!(interp.as_number(), Some(6.0)); // 5 + 1
         assert_eq!(interp.to_bits(), jitted.to_bits());
+    }
+
+    // --- the frame ABI: interpreter fallback ops, throws, loop entry points ---
+
+    /// Ops with no native lowering (`typeof`, object literals) are run by the
+    /// interpreter on the body's register file; the result is bit-identical to
+    /// interpreting the whole function.
+    #[test]
+    fn generic_interp_fallback_ops_match() {
+        let (funcs, f) = compile_named(
+            "function f(o){ var t = typeof o; var r = { k: t, n: o.v + 1 }; return r.k.length + r.n; }",
+            "f",
+        );
+        assert!(
+            crate::jit::lower_nbvm_generic(&funcs[f]).is_some_and(|(ops, _, _)| ops
+                .iter()
+                .any(|o| matches!(o, crate::jit::GenericOp::Interp { .. }))),
+            "f must use interpreter fallback ops"
+        );
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
+        let mut ctx = mk_ctx(Realm::new());
+        let o = ctx.realm.new_object();
+        ctx.realm.set_property(o, "v", NanBox::number(4.0));
+        let ov = NanBox::handle(o.to_raw());
+        let interp = call(&mut ctx, &funcs, f, &[ov]).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[ov])
+            .unwrap()
+            .unwrap();
+        assert_eq!(interp.as_number(), Some(11.0)); // "object".length + 5
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+    }
+
+    /// A throw raised by an interpreter-run op propagates out of the native body
+    /// as the identical error.
+    #[test]
+    fn generic_interp_fallback_throw_matches() {
+        let (funcs, f) = compile_named("function f(o){ return o.x.y; }", "f");
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
+        let mut ctx = mk_ctx(Realm::new());
+        let o = NanBox::handle(ctx.realm.new_object().to_raw());
+        let interp = call(&mut ctx, &funcs, f, &[o]);
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &[o]).unwrap();
+        match (interp, jitted) {
+            (Err(VmError::Thrown(a)), Err(VmError::Thrown(b))) => {
+                assert_eq!(
+                    ctx.realm.to_display_string(a),
+                    ctx.realm.to_display_string(b)
+                );
+            }
+            (Err(a), Err(b)) => assert_eq!(a, b),
+            other => panic!("expected both to fail, got {other:?}"),
+        }
+    }
+
+    /// A loop body compiles with its header as an extra entry point (on-stack
+    /// replacement); entering there on a register file the interpreter left at
+    /// the header finishes the activation with the interpreter's result, and an
+    /// unknown entry is refused without running anything.
+    #[test]
+    fn generic_loop_entry_points() {
+        let (funcs, f) = compile_named(
+            "function f(n){ var s = 0; for (var i = 0; i < n; i = i + 1) { s = s + i * 2; } return s; }",
+            "f",
+        );
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
+        let header = funcs[f]
+            .ops
+            .iter()
+            .enumerate()
+            .find_map(|(i, op)| match op {
+                Op::Jump { target } if *target <= i => Some(*target),
+                _ => None,
+            })
+            .expect("a loop back-edge");
+        assert!(jit.has_entry(header) && jit.has_entry(0));
+        let mut ctx = mk_ctx(Realm::new());
+        let n = NanBox::number(100.0);
+        let want = call(&mut ctx, &funcs, f, &[n]).unwrap();
+        // Run the interpreter up to the header: the prologue ops before it.
+        let mut regs = alloc::vec![NanBox::undefined(); funcs[f].n_regs];
+        regs[0] = n;
+        let pre = &funcs[f].ops[..header];
+        assert!(matches!(
+            run_frame(&mut ctx, &funcs, pre, &mut regs),
+            Ok(FrameExit::Return(None))
+        ));
+        match jit_tier::run_compiled(&mut ctx, &funcs, &jit, &mut regs, header).unwrap() {
+            Ok(FrameExit::Return(Some(v))) => assert_eq!(v.to_bits(), want.to_bits()),
+            _ => panic!("expected a return"),
+        }
+        assert_eq!(want.as_number(), Some(9900.0));
+        let ctx_ptr = &mut ctx as *mut Ctx as *mut core::ffi::c_void;
+        assert!(!jit.has_entry(header + 1));
+        assert!(jit.call_frame_raw(ctx_ptr, &mut regs, header + 1).is_none());
     }
 }
