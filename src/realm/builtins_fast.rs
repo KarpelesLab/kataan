@@ -85,17 +85,18 @@ impl Realm {
     }
 
     /// The identity of one prototype-chain link for a [`ChainKeyCache`]: the
-    /// key epoch that changes with the link's set of own named keys (an array's
-    /// or a RegExp's live in its auxiliary object, which may come and go), and
-    /// the next link. `None` for anything other than an ordinary object, an
-    /// array or a RegExp, and for a host-exotic one.
+    /// key epoch that changes with the link's set of own named keys (an
+    /// array's, a RegExp's or a Map/Set's live in its auxiliary object, which
+    /// may come and go), and the next link. `None` for anything other than an
+    /// ordinary object, an array, a RegExp or a collection, and for a
+    /// host-exotic one.
     fn key_link(&self, h: Handle) -> Option<(Option<u64>, u32, Option<Handle>)> {
         if self.is_host_exotic(h) {
             return None;
         }
         match self.heap.get(h)? {
             Cell::Object(o) => Some((None, o.key_epoch(), o.proto())),
-            Cell::Array(_) | Cell::RegExp { .. } => {
+            Cell::Array(_) | Cell::RegExp { .. } | Cell::Collection { .. } => {
                 let (aux, epoch) = match self.aux_props.get(&h.to_raw()) {
                     Some(a) => (
                         Some(a.to_raw()),
@@ -107,6 +108,156 @@ impl Realm {
             }
             _ => None,
         }
+    }
+
+    /// For a method call `recv.key(...)` on the heap value `h`: the object the
+    /// ordinary `[[Get]]` of the named key `key` (not an index, not `length`,
+    /// not `lastIndex`) continues at once `h` itself is known not to own it —
+    /// its `[[Prototype]]`, possibly `None`. `None` when `h` does own `key`, or
+    /// is anything other than a string primitive, an ordinary non-wrapper
+    /// object, an array, a RegExp or a Map/Set (or is host-exotic), whose own
+    /// properties this cannot rule out. `recv_shape` memoizes one receiver
+    /// shape already known to lack `key` (a shape fixes its data keys, so an
+    /// accessor-free object of that shape lacks it too).
+    fn method_lookup_start(
+        &self,
+        h: Handle,
+        key: &str,
+        recv_shape: &mut Option<Rc<Shape>>,
+    ) -> Option<Option<Handle>> {
+        if self.is_host_exotic(h) {
+            return None;
+        }
+        match self.heap.get(h)? {
+            Cell::Object(o) => {
+                if o.is_prim_wrapper() {
+                    return None;
+                }
+                let shape = o.shaped_shape().filter(|_| o.has_no_accessors());
+                if let (Some(s), Some(m)) = (shape, recv_shape.as_ref())
+                    && Rc::ptr_eq(s, m)
+                {
+                    return Some(o.proto());
+                }
+                if o.has_own_key(key) {
+                    return None;
+                }
+                if let Some(s) = shape {
+                    *recv_shape = Some(Rc::clone(s));
+                }
+                Some(o.proto())
+            }
+            // A string primitive owns only its indices and `length`; one with an
+            // auxiliary object is a function-like marker cell, not a plain string.
+            Cell::Str(_) => {
+                if self.aux_props.contains_key(&h.to_raw()) {
+                    return None;
+                }
+                Some(self.object_proto(h))
+            }
+            Cell::Array(_) | Cell::RegExp { .. } | Cell::Collection { .. } => {
+                if let Some(a) = self.aux_props.get(&h.to_raw())
+                    && self.heap.get(*a)?.as_object()?.has_own_key(key)
+                {
+                    return None;
+                }
+                Some(self.object_proto(h))
+            }
+            _ => None,
+        }
+    }
+
+    /// The object holding the named properties of the chain link `h`: `h`
+    /// itself for an ordinary object, else its auxiliary object.
+    fn named_props(&self, h: Handle) -> Option<&crate::object::Object> {
+        match self.heap.get(h)? {
+            Cell::Object(o) => Some(o),
+            Cell::Array(_) | Cell::RegExp { .. } | Cell::Collection { .. } => self
+                .heap
+                .get(*self.aux_props.get(&h.to_raw())?)?
+                .as_object(),
+            _ => None,
+        }
+    }
+
+    /// The current value of the method `recv[key]` (a named key: not an
+    /// index, not `length`, not `lastIndex`) when `cache` still proves where
+    /// its `[[Get]]` lands: `recv` does not own `key` (see
+    /// `method_lookup_start`), and from its prototype on the chain is exactly
+    /// the recorded objects with their recorded key epochs, the last holding
+    /// `key` as a data property (read now). `None` is a miss.
+    #[must_use]
+    pub fn method_site_get(
+        &self,
+        recv: Handle,
+        key: &str,
+        cache: &mut MethodSiteCache,
+    ) -> Option<NanBox> {
+        if !cache.armed || cache.swaps != self.cell_swaps {
+            return None;
+        }
+        let mut cur = self.method_lookup_start(recv, key, &mut cache.recv_shape)?;
+        let last = cache.links.len().checked_sub(1)?;
+        for (i, &(raw, aux, epoch)) in cache.links.iter().enumerate() {
+            let h = cur?;
+            if h.to_raw() != raw {
+                return None;
+            }
+            let (a, e, next) = self.key_link(h)?;
+            if a != aux || e != epoch {
+                return None;
+            }
+            if i == last {
+                // Same key set as when armed: a data property, at the
+                // recorded slot while the layout is the recorded one.
+                let o = self.named_props(h)?;
+                if let (Some(s), Some(m)) = (o.shaped_shape(), cache.holder_shape.as_ref())
+                    && Rc::ptr_eq(s, m)
+                {
+                    return o.slot(cache.holder_slot);
+                }
+                return self.holder_data(h, key);
+            }
+            cur = next;
+        }
+        None
+    }
+
+    /// Arms `cache` for `recv[key]` (see [`method_site_get`](Self::method_site_get))
+    /// and returns the method's value, when the walk from `recv`'s prototype
+    /// meets only ordinary objects, arrays, RegExps and collections (none
+    /// host-exotic, at most eight deep) before one owning `key` as a data
+    /// property. Leaves it unarmed (and returns `None`) otherwise.
+    pub fn method_site_fill(
+        &self,
+        recv: Handle,
+        key: &str,
+        cache: &mut MethodSiteCache,
+    ) -> Option<NanBox> {
+        cache.armed = false;
+        cache.links.clear();
+        cache.holder_shape = None;
+        cache.swaps = self.cell_swaps;
+        let mut cur = self.method_lookup_start(recv, key, &mut cache.recv_shape)?;
+        for _ in 0..8 {
+            let h = cur?;
+            let (aux, epoch, next) = self.key_link(h)?;
+            cache.links.push((h.to_raw(), aux, epoch));
+            if self.has_own(h, key) {
+                let v = self.holder_data(h, key)?;
+                let o = self.named_props(h)?;
+                if let Some(s) = o.shaped_shape()
+                    && let Some(slot) = s.lookup(key)
+                {
+                    cache.holder_shape = Some(Rc::clone(s));
+                    cache.holder_slot = slot;
+                }
+                cache.armed = true;
+                return Some(v);
+            }
+            cur = next;
+        }
+        None
     }
 
     /// The `[[Get]]` of `cache`'s key from `start` when `cache` still proves
@@ -148,7 +299,7 @@ impl Realm {
     fn holder_data(&self, h: Handle, key: &str) -> Option<NanBox> {
         let o = match self.heap.get(h)? {
             Cell::Object(o) => o,
-            Cell::Array(_) | Cell::RegExp { .. } => self
+            Cell::Array(_) | Cell::RegExp { .. } | Cell::Collection { .. } => self
                 .heap
                 .get(*self.aux_props.get(&h.to_raw())?)?
                 .as_object()?,
@@ -258,6 +409,22 @@ pub struct ChainKeyCache {
     holder: bool,
     armed: bool,
     fills: u16,
+    swaps: u32,
+}
+
+/// A method-call site's memo of where `recv[key]` resolves (see
+/// [`Realm::method_site_get`]): like [`ChainKeyCache`] from the receiver's
+/// prototype on, plus the holder's slot under its recorded shape and one
+/// receiver shape known not to own the key, so neither end repeats a name
+/// lookup on a hit.
+#[derive(Default)]
+pub struct MethodSiteCache {
+    /// `(handle, auxiliary object handle, key epoch)` per link, the holder last.
+    links: alloc::vec::Vec<(u64, Option<u64>, u32)>,
+    holder_shape: Option<Rc<Shape>>,
+    holder_slot: u32,
+    recv_shape: Option<Rc<Shape>>,
+    armed: bool,
     swaps: u32,
 }
 

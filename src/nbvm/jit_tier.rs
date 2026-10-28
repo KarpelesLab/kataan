@@ -709,6 +709,31 @@ pub(crate) extern "C" fn jit_helper_call_method(
         #[allow(unsafe_code)]
         let cache = unsafe { &mut *cache.cast::<crate::ic::PropertyCache>() };
         let recv_val = regs[*recv as usize];
+        // A built-in method the site has resolved before: called directly
+        // (the interpreter arm's first step too).
+        {
+            // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
+            #[allow(unsafe_code)]
+            let funcs = unsafe {
+                &*ctx
+                    .jit_funcs
+                    .expect("jit_funcs set before generic dispatch")
+            };
+            if let Some(r) =
+                super::native_call::try_call(ctx, funcs, recv_val, key, regs, args, cache)
+            {
+                return match r {
+                    Ok(v) => {
+                        regs[*dst as usize] = v;
+                        0
+                    }
+                    Err(e) => {
+                        ctx.jit_pending_fault = Some(e);
+                        NanBox::jit_throw_bits()
+                    }
+                };
+            }
+        }
         if ctx.host.is_some()
             && key != "caller"
             && let Some(closure) = super::vm_method_of_cached(ctx, recv_val, key, cache)

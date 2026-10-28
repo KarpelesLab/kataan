@@ -1599,7 +1599,7 @@ const N_RETURN_UNDEFINED: u16 = 908;
 /// operate over it unchanged.
 const N_SHARED_ARRAY_BUFFER: u16 = 687;
 const N_OBJ_PROTO_VALUEOF: u16 = 180;
-const N_OBJ_PROTO_HASOWN: u16 = 181;
+pub(crate) const N_OBJ_PROTO_HASOWN: u16 = 181;
 const N_OBJ_PROTO_ISPROTOTYPEOF: u16 = 182;
 const N_OBJ_PROTO_PROPISENUM: u16 = 183;
 const N_OBJECT_CREATE: u16 = 107;
@@ -1652,7 +1652,7 @@ const N_REFLECT_IS_EXTENSIBLE: u16 = 252;
 /// A first-class `Array.prototype.<method>` value: a bound native carrying the
 /// method name; calling it (via `.call`/`.apply`) dispatches that array method on
 /// the supplied `this` (so `Array.prototype.slice.call(arguments)` works).
-const N_ARRAY_PROTO_FN: u16 = 206;
+pub(crate) const N_ARRAY_PROTO_FN: u16 = 206;
 /// A first-class `ArrayBuffer.prototype.<method>` (e.g. `slice`). Like
 /// [`N_ARRAY_PROTO_FN`] but validates that the call's `this` has an
 /// `[[ArrayBufferData]]` internal slot first (throwing a `TypeError` otherwise),
@@ -1731,7 +1731,7 @@ const N_TYPED_ARRAY_PROTO_FN: u16 = 246;
 /// the call's `this` inside the handler (most methods only require an Object —
 /// they read `exec`, `global`, … off it — while `exec`/`compile` require an
 /// actual RegExp). The new ids start at 280 to avoid sibling collisions.
-const N_REGEXP_PROTO_FN: u16 = 280;
+pub(crate) const N_REGEXP_PROTO_FN: u16 = 280;
 /// A `get RegExp.prototype.<accessor>` getter (`source`/`flags`/`global`/
 /// `ignoreCase`/`multiline`/`dotAll`/`sticky`/`unicode`/`unicodeSets`/
 /// `hasIndices`). A bound native carrying the accessor name; calling it validates
@@ -2525,7 +2525,7 @@ const N_DATE_TO_JSON: u16 = 244;
 /// ToString to the call's `this` (so `String.prototype.slice.call(true)` coerces
 /// to `"true"` and a `null`/`undefined` `this` throws), then dispatches. The two
 /// identity methods `toString`/`valueOf` instead require a String value.
-const N_STRING_PROTO_FN: u16 = 245;
+pub(crate) const N_STRING_PROTO_FN: u16 = 245;
 
 /// A first-class `Number.prototype.<method>`: `thisNumberValue(this)` must yield
 /// a Number (the `this` is a Number primitive or a Number wrapper object), else a
@@ -2545,11 +2545,11 @@ const N_ERROR_PROTO_TOSTRING: u16 = 251;
 /// A first-class `Set.prototype.<method>`: the receiver must have a `[[SetData]]`
 /// internal slot (a non-weak Set), else a `TypeError` (so
 /// `Set.prototype.add.call(new Map(), …)` rejects).
-const N_SET_PROTO_FN: u16 = 253;
+pub(crate) const N_SET_PROTO_FN: u16 = 253;
 
 /// A first-class `Map.prototype.<method>`: the receiver must have a `[[MapData]]`
 /// internal slot (a non-weak Map), else a `TypeError`.
-const N_MAP_PROTO_FN: u16 = 254;
+pub(crate) const N_MAP_PROTO_FN: u16 = 254;
 
 /// A first-class `WeakMap.prototype.<method>`: the receiver must be a WeakMap
 /// (`[[WeakMapData]]`), else a `TypeError`.

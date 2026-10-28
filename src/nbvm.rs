@@ -44,6 +44,7 @@ mod iter_fast;
 mod jit_tier;
 #[cfg(feature = "std")]
 mod math_fast;
+pub(crate) mod native_call;
 mod vm_eval;
 #[cfg(all(test, feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 use jit_tier::call_generic;
@@ -1889,6 +1890,10 @@ fn vm_method_of_cached(
     cache: &mut PropertyCache,
 ) -> Option<NanBox> {
     let h = recv.as_handle().map(Handle::from_raw)?;
+    // A site known to call a built-in never reaches a VM function.
+    if native_call::is_native_site(cache) {
+        return None;
+    }
     match ctx.realm.chain_cached_get(h, key, cache) {
         Some(crate::realm::ChainHit::Data(v)) => v
             .as_handle()
@@ -8573,6 +8578,17 @@ fn run_frame_at_ic(
                 #[cfg(feature = "std")]
                 if let Some(v) = math_fast::call(&ctx.realm, recv_val, key, args, regs) {
                     regs[*dst as usize] = v;
+                    continue;
+                }
+                // A built-in method the site has resolved before (`arr.push`,
+                // `s.charCodeAt`, `map.get`, …): called directly.
+                if let Some(r) =
+                    native_call::try_call(ctx, funcs, recv_val, key, regs, args, site_cache!(site))
+                {
+                    match r {
+                        Ok(v) => regs[*dst as usize] = v,
+                        Err(e) => handle_throw!(e),
+                    }
                     continue;
                 }
                 let argv = ArgBuf::from_regs(regs, args);

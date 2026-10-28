@@ -39,6 +39,10 @@ pub struct PropertyCache {
     /// How many times `chain` was (re)armed: a site that keeps missing is
     /// polymorphic, and stops paying for re-arming after a few.
     pub chain_fills: u16,
+    /// The site's built-in method entry, for a method-call site (see
+    /// `crate::nbvm::native_call`): which intrinsic the call resolved to and
+    /// how to tell it still does.
+    pub(crate) native: Option<alloc::boxed::Box<crate::nbvm::native_call::NativeSite>>,
 }
 
 /// How many times a site's [`ChainCache`] may be (re)armed.

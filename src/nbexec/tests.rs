@@ -12451,3 +12451,65 @@ fn vm_math_fast_path_honours_replacement() {
         "4,0,-Infinity,0,NaN,-Infinity,NaN,5,vo,3,mine4,getter,fake,3"
     );
 }
+
+#[test]
+fn vm_native_method_sites_honour_replacement() {
+    // Each loop warms a `CallMethod` site onto a built-in (see
+    // `nbvm::native_call`), then changes what the call resolves to: a
+    // replaced or own-shadowing method, a subclass override, a swapped
+    // prototype, a proxy receiver, a replaced dependency (`exec` under
+    // `test`). Every call must see the change.
+    let src = r#"
+        function f() {
+            var out = [];
+            var a = [], r = [], P = Array.prototype.push;
+            for (var i = 0; i < 12; i++) {
+                if (i === 6) Array.prototype.push = function (x) { return "p" + x; };
+                r.push === P; out.push(a.push(i));
+            }
+            Array.prototype.push = P;
+            var s = "hey", C = String.prototype.charCodeAt;
+            for (var i = 0; i < 6; i++) {
+                if (i === 3) String.prototype.charCodeAt = function (k) { return "c" + k; };
+                out.push(s.charCodeAt(i % 3), s.charAt(i));
+            }
+            String.prototype.charCodeAt = C;
+            var arrs = [[], [], []]; arrs[1].push = function () { return "own"; };
+            for (var i = 0; i < 6; i++) out.push(arrs[i % 3].push(1));
+            class M extends Map { get(k) { return "sub" + super.get(k); } }
+            var m = new M([[1, "x"]]), m2 = new Map([[1, "y"]]);
+            for (var i = 0; i < 4; i++) out.push((i % 2 ? m : m2).get(1));
+            var b = [];
+            for (var i = 0; i < 6; i++) {
+                if (i === 2) Object.setPrototypeOf(b, { push: function () { return "sp"; } });
+                if (i === 4) Object.setPrototypeOf(b, Array.prototype);
+                out.push(b.push(i));
+            }
+            var p = new Proxy([], { get: function (t, k) { return k === "push" ? function () { return "trap"; } : t[k]; } });
+            for (var i = 0; i < 4; i++) out.push([[], p][i % 2].push(i));
+            var o = { a: 1 }, H = Object.prototype.hasOwnProperty;
+            for (var i = 0; i < 4; i++) {
+                if (i === 2) Object.prototype.hasOwnProperty = function () { return "H"; };
+                out.push(o.hasOwnProperty("a"), o.hasOwnProperty(i));
+            }
+            Object.prototype.hasOwnProperty = H;
+            var re = /a/g, E = RegExp.prototype.exec;
+            for (var i = 0; i < 4; i++) {
+                if (i === 2) RegExp.prototype.exec = function () { return null; };
+                re.lastIndex = 0; out.push(re.test("xa"));
+            }
+            RegExp.prototype.exec = E;
+            var mm = new Map([[1, 1]]);
+            for (var i = 0; i < 4; i++) {
+                if (i === 2) Object.defineProperty(mm, "get", { value: function () { return "mine"; } });
+                out.push(mm.get(1), new Set([-0]).has(0));
+            }
+            return out.join(",");
+        }
+        f()
+    "#;
+    assert_eq!(
+        run(src),
+        "1,2,3,4,5,6,104,h,101,e,121,y,c0,,c1,,c2,,1,own,1,2,own,2,y,subx,y,subx,1,2,sp,sp,3,4,1,trap,1,trap,true,false,true,false,H,H,H,H,true,true,false,false,1,true,1,true,mine,true,mine,true"
+    );
+}
