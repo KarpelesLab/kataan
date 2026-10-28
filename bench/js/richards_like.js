@@ -1,5 +1,6 @@
 // A small task scheduler (original): polymorphic dispatch over task kinds,
-// linked queues, and state machines.
+// linked queues, and state machines. The packet population is bounded, so the
+// run is a steady state (linear in the step count).
 class Packet { constructor(link, id, kind) { this.link = link; this.id = id; this.kind = kind; this.data = 0; } }
 class Task {
   constructor(id, pri, queue) { this.id = id; this.pri = pri; this.queue = queue; this.count = 0; }
@@ -8,9 +9,9 @@ class Task {
 }
 class Worker extends Task { run(sched) { const p = this.take(); if (!p) return; p.data = (p.data + this.id * 7) % 1013; this.count++; sched.route(p, (this.id + 1) % sched.tasks.length); } }
 class Handler extends Task { run(sched) { const p = this.take(); if (!p) return; p.kind ^= 1; this.count += p.kind; sched.route(p, (this.id + 2) % sched.tasks.length); } }
-class Idle extends Task { run(sched) { this.count++; if (this.count % 3 === 0) sched.route(new Packet(null, this.count, 0), 0); } }
+class Idle extends Task { run(sched) { this.count++; if (this.count % 3 === 0 && sched.packets < 64) { sched.packets++; sched.route(new Packet(null, this.count, 0), 0); } } }
 class Sched {
-  constructor() { this.tasks = []; this.routed = 0; }
+  constructor() { this.tasks = []; this.routed = 0; this.packets = 40; }
   route(p, to) { this.routed++; this.tasks[to].give(p); }
   step() { for (let i = 0; i < this.tasks.length; i++) this.tasks[i].run(this); }
 }
