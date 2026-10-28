@@ -3944,6 +3944,9 @@ struct TierState {
     /// the same table, which outlives any activation running from it.
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     jit: Option<Option<alloc::rc::Rc<crate::jit::JitProto>>>,
+    /// Native code a recompilation replaced (see [`TierSlot::replace_jit`]).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    retired_jit: Vec<alloc::rc::Rc<crate::jit::JitProto>>,
 }
 
 /// A function's persistent tier state (its activation count, optimized body,
@@ -3995,6 +3998,18 @@ impl TierSlot {
     fn set_jit(&self, j: Option<alloc::rc::Rc<crate::jit::JitProto>>) {
         if let Ok(mut t) = self.0.try_borrow_mut() {
             t.jit = Some(j);
+        }
+    }
+
+    /// Makes `j` (a recompilation) the function's native code; the code it
+    /// replaces is kept alive with the function, since compiled callers may
+    /// hold its address (`jit_tier::recompile` bounds how many there are).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    fn replace_jit(&self, j: alloc::rc::Rc<crate::jit::JitProto>) {
+        if let Ok(mut t) = self.0.try_borrow_mut()
+            && let Some(Some(old)) = t.jit.replace(Some(j))
+        {
+            t.retired_jit.push(old);
         }
     }
 }
@@ -27990,6 +28005,34 @@ mod generic_jit_tests {
         let ctx_ptr = &mut ctx as *mut Ctx as *mut core::ffi::c_void;
         assert!(!jit.has_entry(header + 1));
         assert!(jit.call_frame_raw(ctx_ptr, &mut regs, header + 1).is_none());
+    }
+
+    /// A function whose first loop gets hot runs natively from there (on-stack
+    /// replacement) with its later loop's property sites cold; once that loop
+    /// has run a while, its sites' caches know their layouts, so the body
+    /// leaves at the loop's header, is compiled again with them, and finishes
+    /// in the new code with the interpreter's result. The recompilations stop
+    /// at the budget, however often the layouts change.
+    #[test]
+    fn generic_recompiles_at_a_loop_header() {
+        let (funcs, f) = compile_named(
+            "function f(){ var a = []; for (var i = 0; i < 1000; i = i + 1) { a[i] = { k: i }; }
+               var s = 0;
+               for (var r = 0; r < 40; r = r + 1) {
+                 if (r % 10 === 5) { for (var j = 0; j < 1000; j = j + 1) { a[j] = (r % 20 === 5) ? { z: 1, k: j } : { k: j }; } }
+                 for (var i = 0; i < 1000; i = i + 1) { s = s + a[i].k; }
+               }
+               return s; }",
+            "f",
+        );
+        let mut ctx = mk_ctx(Realm::new());
+        let v = call(&mut ctx, &funcs, f, &[]).unwrap();
+        assert_eq!(v.as_number(), Some(40.0 * 499_500.0));
+        if jit_tier::osr_threshold() != u32::MAX {
+            let jit = funcs[f].tier.jit().flatten().expect("compiled");
+            assert!(jit.generation() >= 1, "recompiled with its warm caches");
+            assert!(jit.generation() <= crate::jit::MAX_GENERATION);
+        }
     }
 
     /// The unboxed numeric tiers compute comparisons as native `0`/`1`: a body

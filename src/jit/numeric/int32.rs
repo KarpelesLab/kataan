@@ -1029,11 +1029,17 @@ impl NumGen {
                 a.movabs_argreg(2, self.env.n_regs as i64);
                 a.movabs_argreg(3, self.env.bytecode as i64);
                 a.movabs_argreg(4, self.env.bytecode_len as i64);
+                a.movabs_argreg(5, target as i64);
                 a.movabs_rax(self.env.backedge as i64);
                 a.call_rax();
                 a.movabs_r11(NanBox::jit_throw_bits() as i64);
                 a.cmp_rax_r11();
                 a.je(throw_exit);
+                // Leaving at the header: the integer flush above wrote back
+                // every promoted register as a Number.
+                a.movabs_r11(NanBox::jit_exit_bits() as i64);
+                a.cmp_rax_r11();
+                a.je(self.leave_exit?);
                 a.store_rax_frame8(super::COUNTDOWN);
                 let p = self.regions[ri].int.as_ref()?;
                 let has_globals = !p.globals.is_empty();

@@ -28,12 +28,16 @@ mod props;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod recv_cache;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod tierup;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use call_seq::{
     CallLayout, CallMemo, CallSite, CallTarget, CalleeHelper, CalleeInfo, ConstructAllocHelper,
     ConstructFast, ConstructHelper, ConstructResultHelper, FRAME_HEADER, JitStack, MethodHelper,
 };
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use props::MethodSite;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub use tierup::MAX_GENERATION;
 
 /// `2^53` — the largest magnitude an `f64` represents every integer below
 /// exactly. The integer JIT keeps a value only while it stays within ±this; a
@@ -2705,6 +2709,8 @@ struct GenericSites {
     /// one of their addresses and pass for it.
     #[allow(dead_code)]
     baked: Vec<alloc::rc::Rc<crate::shape::Shape>>,
+    /// What the back-edge poll's recompilation test reads (see [`tierup`]).
+    tier_up: tierup::TierUp,
 }
 
 /// The generic-tier runtime-helper table: the `extern "C"` slow paths the emitted
@@ -3121,11 +3127,19 @@ pub type JitExecOpHelper =
     extern "C" fn(*mut core::ffi::c_void, *mut u64, usize, *const crate::nbvm::Op) -> u64;
 
 /// The runtime-helper ABI for a loop back-edge poll: `(ctx, regs, n_regs, ops,
-/// n_ops) -> next countdown` (or the throw sentinel). `ops`/`n_ops` is the
-/// running bytecode (the GC safepoint roots its constants).
+/// n_ops, header) -> next countdown` (or the throw sentinel, or
+/// `NanBox::jit_exit_bits`: leave for the interpreter at loop header pc
+/// `header`, the branch's target). `ops`/`n_ops` is the running bytecode (the
+/// GC safepoint roots its constants).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-pub type JitBackedgeHelper =
-    extern "C" fn(*mut core::ffi::c_void, *mut u64, usize, *const crate::nbvm::Op, usize) -> u64;
+pub type JitBackedgeHelper = extern "C" fn(
+    *mut core::ffi::c_void,
+    *mut u64,
+    usize,
+    *const crate::nbvm::Op,
+    usize,
+    usize,
+) -> u64;
 
 /// The runtime-helper ABI for a **native builtin call** (`Op::CallNative`):
 /// `(ctx, native_id, argv_ptr, argc) -> NanBox bits` (or the throw sentinel, with
@@ -3355,6 +3369,8 @@ impl JitProto {
                 baked: None,
             })
             .collect();
+        let tier_up =
+            tierup::TierUp::plan(&ops, baked_at.iter().map(|b| b.map(|b| b.shape)).collect());
         let site_info: Vec<SiteInfo> = site_info
             .into_iter()
             .zip(baked_at)
@@ -3408,6 +3424,7 @@ impl JitProto {
                 calls,
                 methods,
                 baked,
+                tier_up,
             }),
             n_regs: proto.n_regs,
             osr_entries,
@@ -5510,6 +5527,9 @@ impl JitFunction {
         let labels: Vec<Label> = (0..=ops.len()).map(|_| a.new_label()).collect();
         let throw_exit = a.new_label();
         let refuse_exit = a.new_label();
+        // Where a back-edge poll that asked the body to leave goes.
+        let leave_exit = a.new_label();
+        num.set_leave_exit(leave_exit);
         a.frame_prologue(frame);
         a.mov_r15_rdi(); // pin ctx
         a.mov_rbx_rsi(); // pin the register file
@@ -5550,8 +5570,10 @@ impl JitFunction {
         }
         // A loop back-edge poll: every `countdown` iterations, call the helper
         // (interrupt / agents / GC safepoint), which returns the next countdown.
+        // (The helper may instead ask the body to leave for the interpreter
+        // at the loop header `$header`: everything is in the register file.)
         macro_rules! backedge {
-            () => {{
+            ($header:expr) => {{
                 let skip = a.new_label();
                 a.dec_frame8(COUNTDOWN);
                 a.jne(skip);
@@ -5560,9 +5582,13 @@ impl JitFunction {
                 a.movabs_argreg(2, n_regs as i64);
                 a.movabs_argreg(3, bytecode.as_ptr() as i64);
                 a.movabs_argreg(4, bytecode.len() as i64);
+                a.movabs_argreg(5, $header as i64);
                 a.movabs_rax(backedge_helper as i64);
                 a.call_rax();
                 throw_check!();
+                a.movabs_r11(NanBox::jit_exit_bits() as i64);
+                a.cmp_rax_r11();
+                a.je(leave_exit);
                 a.store_rax_frame8(COUNTDOWN);
                 a.bind(skip);
             }};
@@ -6887,7 +6913,7 @@ impl JitFunction {
                         return None;
                     }
                     if target <= op_idx {
-                        backedge!();
+                        backedge!(target);
                     }
                     a.jmp(labels[target]);
                 }
@@ -6906,7 +6932,7 @@ impl JitFunction {
                     if target <= op_idx {
                         let stay = a.new_label();
                         a.jne(stay);
-                        backedge!();
+                        backedge!(target);
                         a.jmp(labels[target]);
                         a.bind(stay);
                     } else {
@@ -7124,6 +7150,11 @@ impl JitFunction {
         // Falling off the end of the stream (or branching to `len`).
         a.bind(labels[ops.len()]);
         a.movabs_rax(NanBox::jit_falloff_bits() as i64);
+        a.frame_epilogue();
+        // Leaving at a loop header for the interpreter (the poll recorded
+        // which one).
+        a.bind(leave_exit);
+        a.movabs_rax(NanBox::jit_exit_bits() as i64);
         a.frame_epilogue();
         // The numeric emitter's out-of-line slow paths (after a `ret`, so no op
         // falls through into them).

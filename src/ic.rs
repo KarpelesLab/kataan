@@ -163,6 +163,17 @@ impl PropertyCache {
         })
     }
 
+    /// The memo of a cache whose counters say it is settled (as
+    /// [`WarmEntry::is_stable`]): `(shape, slot, by_add)`, without taking a
+    /// reference to the shape.
+    #[must_use]
+    pub fn stable_memo(&self) -> Option<(&Rc<Shape>, u32, bool)> {
+        if self.hits < 4 || self.hits < self.misses.saturating_mul(4) {
+            return None;
+        }
+        self.shape.as_ref().map(|s| (s, self.slot, self.by_add))
+    }
+
     /// Arms the cache with `warm`'s memo (counters start afresh).
     pub fn seed(&mut self, warm: &WarmEntry) {
         self.shape = Some(Rc::clone(&warm.shape));

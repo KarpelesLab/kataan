@@ -445,6 +445,9 @@ pub(super) struct NumGen {
     copy: bool,
     /// Per pc: its label in its region's plain copy ([`Spec`]).
     copy_labels: Vec<Option<Label>>,
+    /// Where a back-edge poll that asks the body to leave for the
+    /// interpreter jumps (with the promoted registers flushed).
+    pub(super) leave_exit: Option<Label>,
 }
 
 /// The ops a region may contain: each is emitted here, with calls only on slow
@@ -583,6 +586,7 @@ impl NumGen {
             tag_false: NanBox::boolean(false).to_bits(),
             copy: false,
             copy_labels: vec![None; n],
+            leave_exit: None,
         }
     }
 
@@ -611,6 +615,11 @@ impl NumGen {
             }
         }
         out
+    }
+
+    /// Sets where a back-edge poll that asks the body to leave jumps.
+    pub(super) fn set_leave_exit(&mut self, l: Label) {
+        self.leave_exit = Some(l);
     }
 
     /// Enters (or leaves) the emission of a speculative region's plain copy.
@@ -1132,11 +1141,17 @@ impl NumGen {
                     a.movabs_argreg(2, self.env.n_regs as i64);
                     a.movabs_argreg(3, self.env.bytecode as i64);
                     a.movabs_argreg(4, self.env.bytecode_len as i64);
+                    a.movabs_argreg(5, target as i64);
                     a.movabs_rax(self.env.backedge as i64);
                     a.call_rax();
                     a.movabs_r11(NanBox::jit_throw_bits() as i64);
                     a.cmp_rax_r11();
                     a.je(throw_exit);
+                    // Leaving at the header: the flush above wrote back
+                    // everything the interpreter can read there.
+                    a.movabs_r11(NanBox::jit_exit_bits() as i64);
+                    a.cmp_rax_r11();
+                    a.je(self.leave_exit?);
                     a.store_rax_frame8(COUNTDOWN);
                     self.reload(a, reg);
                     self.zero_globals(a, reg);

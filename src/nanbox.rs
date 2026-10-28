@@ -85,6 +85,12 @@ const TAG_JIT_THROW: u64 = QNAN | 0x08;
 /// `TAG_JIT_THROW`.
 const TAG_JIT_FALLOFF: u64 = QNAN | 0x09;
 
+/// A third reserved JIT sentinel: a generic-tier body returns this when it
+/// leaves at a loop header to be recompiled (the back-edge poll asked it to;
+/// the header's pc is pending in the context and the register file is up to
+/// date). Never a legal JS value, like `TAG_JIT_THROW`.
+const TAG_JIT_EXIT: u64 = QNAN | 0x0a;
+
 /// The canonical quiet-NaN payload a `f64` NaN is normalized to, chosen so that
 /// `(bits & QNAN) != QNAN` (i.e. it still reads back as a number).
 const CANONICAL_NAN: u64 = 0x7ff8_0000_0000_0000;
@@ -187,6 +193,13 @@ impl NanBox {
     #[must_use]
     pub const fn jit_falloff_bits() -> u64 {
         TAG_JIT_FALLOFF
+    }
+
+    /// The raw bits of the JIT leave-at-a-loop-header sentinel (see
+    /// `TAG_JIT_EXIT`).
+    #[must_use]
+    pub const fn jit_exit_bits() -> u64 {
+        TAG_JIT_EXIT
     }
 
     /// A boolean.

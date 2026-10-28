@@ -69,7 +69,6 @@ pub(super) fn osr_threshold() -> u32 {
 const POLL_INTERVAL: u64 = 1024;
 
 /// The generic tier's per-context runtime state.
-#[derive(Default)]
 pub(super) struct TierRuntime {
     /// The exception-handler stacks of the running compiled activations: one
     /// shared `Vec` of `(catch_pc, catch_reg)` (the interpreter's `handlers`
@@ -89,6 +88,36 @@ pub(super) struct TierRuntime {
     /// Whether the context has a host (`Ctx::host` is `Some`; it never
     /// changes). Compiled method calls read it inline.
     pub(super) hosted: bool,
+    /// The innermost activation that may leave at a loop header to be
+    /// recompiled (one [`osr`] entered): its register window's address and
+    /// its body (`0, null` for none). Only the back-edge polls of that very
+    /// activation — whose caller can continue it — may ask it to leave.
+    exit_regs: usize,
+    exit_jit: *const crate::jit::JitProto,
+    /// The loop header such an activation left at.
+    resume: Option<usize>,
+    /// Where the activation that just left continues: that header and its
+    /// handler stack there (see [`run_compiled_at`]).
+    left: Option<(usize, alloc::vec::Vec<(usize, Reg)>)>,
+    /// What a back-edge poll returns to its loop: polls until the next one.
+    poll_interval: u64,
+}
+
+impl Default for TierRuntime {
+    fn default() -> Self {
+        Self {
+            handlers: alloc::vec::Vec::new(),
+            base: 0,
+            direct: alloc::vec::Vec::new(),
+            stack: StackPtr::default(),
+            hosted: false,
+            exit_regs: 0,
+            exit_jit: core::ptr::null(),
+            resume: None,
+            left: None,
+            poll_interval: if exit_stress() { 1 } else { POLL_INTERVAL },
+        }
+    }
 }
 
 impl TierRuntime {
@@ -199,6 +228,23 @@ pub(super) fn run_compiled(
     entry: usize,
     handlers: &[(usize, Reg)],
 ) -> Option<Result<FrameExit, VmError>> {
+    run_compiled_at(ctx, funcs, jit, regs, entry, handlers, false)
+}
+
+/// [`run_compiled`]; when `exitable`, the activation's back-edge polls may
+/// make it leave at a loop header: then it returns `Ok(Return(None))` and
+/// [`TierRuntime::left`] holds the header and the handler stack there (the
+/// register file is up to date).
+#[inline]
+fn run_compiled_at(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    jit: &crate::jit::JitProto,
+    regs: &mut [NanBox],
+    entry: usize,
+    handlers: &[(usize, Reg)],
+    exitable: bool,
+) -> Option<Result<FrameExit, VmError>> {
     let saved = ctx.jit_funcs.replace(funcs as *const [FnProto]);
     let outer_base = ctx.jit_rt.base;
     let base = ctx.jit_rt.handlers.len();
@@ -221,7 +267,13 @@ pub(super) fn run_compiled(
             (*st).top = top.add(regs.len());
             core::slice::from_raw_parts_mut(top.cast::<NanBox>(), regs.len())
         };
+        let outer = (ctx.jit_rt.exit_regs, ctx.jit_rt.exit_jit);
+        if exitable {
+            ctx.jit_rt.exit_regs = window.as_ptr() as usize;
+            ctx.jit_rt.exit_jit = jit as *const crate::jit::JitProto;
+        }
         let raw = jit.call_frame_raw(ctx_ptr, window, entry);
+        (ctx.jit_rt.exit_regs, ctx.jit_rt.exit_jit) = outer;
         regs.copy_from_slice(window);
         // SAFETY: as above; the activation is over.
         #[allow(unsafe_code)]
@@ -230,14 +282,44 @@ pub(super) fn run_compiled(
         }
         raw
     } else {
+        // (The rare full stack: such an activation never leaves.)
         jit.call_frame_raw(ctx_ptr, regs, entry)
     };
+    if raw == Some(NanBox::jit_exit_bits()) {
+        return Some(left_at(ctx, base, outer_base, saved));
+    }
     ctx.jit_rt.handlers.truncate(base);
     ctx.jit_rt.base = outer_base;
     ctx.jit_funcs = saved;
-    let raw = raw?;
+    Some(finish_raw(ctx, raw?))
+}
+
+/// The end of [`run_compiled_at`] for an activation that left at a loop
+/// header (its handlers are `handlers[base..]`).
+#[cold]
+fn left_at(
+    ctx: &mut Ctx,
+    base: usize,
+    outer_base: usize,
+    saved: Option<*const [FnProto]>,
+) -> Result<FrameExit, VmError> {
+    let handlers = ctx.jit_rt.handlers.split_off(base);
+    ctx.jit_rt.base = outer_base;
+    ctx.jit_funcs = saved;
+    match ctx.jit_rt.resume.take() {
+        Some(pc) => {
+            ctx.jit_rt.left = Some((pc, handlers));
+            Ok(FrameExit::Return(None))
+        }
+        None => Err(VmError::Unsupported),
+    }
+}
+
+/// A compiled activation's raw result word as the interpreter's frame
+/// outcome.
+fn finish_raw(ctx: &mut Ctx, raw: u64) -> Result<FrameExit, VmError> {
     if raw == NanBox::jit_falloff_bits() {
-        return Some(Ok(FrameExit::Return(None)));
+        return Ok(FrameExit::Return(None));
     }
     let nb = NanBox::from_bits(raw);
     if nb.is_jit_throw_sentinel() {
@@ -248,9 +330,9 @@ pub(super) fn run_compiled(
             .unwrap_or_else(|| {
                 VmError::Thrown(vm_error(ctx, "Error", "JIT throw without pending value"))
             });
-        return Some(Err(err));
+        return Err(err);
     }
-    Some(Ok(FrameExit::Return(Some(nb))))
+    Ok(FrameExit::Return(Some(nb)))
 }
 
 /// The call-entry hook (`call_with_inner`, once function `id` is hot): compile
@@ -271,7 +353,7 @@ pub(super) fn enter_on_call(
     }
     let jit = jit_for(funcs, id, ic)?;
     if jit.is_generic() {
-        return match run_compiled(ctx, funcs, &jit, regs, 0, &[])? {
+        return match run_tiering(ctx, funcs, id, jit, regs, 0, &[], ic)? {
             Ok(FrameExit::Return(v)) => Some(Ok(v.unwrap_or(NanBox::undefined()))),
             Ok(_) => Some(Err(VmError::Unsupported)),
             Err(e) => Some(Err(e)),
@@ -333,7 +415,86 @@ pub(super) fn osr(
             &alloc::format!("on-stack replacement at pc {target}"),
         );
     }
-    run_compiled(ctx, funcs, &jit, regs, target, handlers)
+    run_tiering(ctx, funcs, id, jit, regs, target, handlers, ic)
+}
+
+/// Runs function `id`'s compiled body `jit` on `regs` from `entry` with
+/// `handlers` (as [`run_compiled`]) as an activation that may leave at a loop
+/// header to be recompiled, continuing there in the new code; `ic` is the
+/// activation's interpreter caches, if it holds them.
+#[allow(clippy::too_many_arguments)]
+fn run_tiering(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    id: usize,
+    mut jit: Rc<crate::jit::JitProto>,
+    regs: &mut [NanBox],
+    entry: usize,
+    handlers: &[(usize, Reg)],
+    ic: &[crate::ic::PropertyCache],
+) -> Option<Result<FrameExit, VmError>> {
+    let mut r = run_compiled_at(ctx, funcs, &jit, regs, entry, handlers, true)?;
+    // The body left at loop header `pc` to be recompiled: continue there in
+    // the function's newest code (the old body, which can always be entered
+    // there, if the recompilation failed).
+    while let Some((pc, h)) = ctx.jit_rt.left.take() {
+        jit = recompile(ctx, funcs, id, &jit, ic).unwrap_or(jit);
+        r = run_compiled_at(ctx, funcs, &jit, regs, pc, &h, true)?;
+    }
+    Some(r)
+}
+
+/// Function `id`'s generic body `old`, compiled again with what its property
+/// sites' caches learned (and, for sites it never ran, the interpreter's
+/// caches `ic`): the function's code from now on. If another activation
+/// already replaced `old`, that newer code. `None` if neither has an entry
+/// wherever `old` has (it always does: both are lowered from the same
+/// bytecode), or nothing compiled.
+fn recompile(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    id: usize,
+    old: &Rc<crate::jit::JitProto>,
+    ic: &[crate::ic::PropertyCache],
+) -> Option<Rc<crate::jit::JitProto>> {
+    let proto = funcs.get(id)?;
+    if let Some(Some(cur)) = proto.tier.jit()
+        && !Rc::ptr_eq(&cur, old)
+    {
+        return cur.is_generic().then_some(cur);
+    }
+    if old.generation() >= crate::jit::MAX_GENERATION {
+        return None; // (only under `KATAAN_JIT_EXIT_STRESS`)
+    }
+    let mut warm = old.runtime_warm();
+    if warm.len() < ic.len() {
+        warm.resize(ic.len(), None);
+    }
+    for (w, c) in warm.iter_mut().zip(ic) {
+        if w.is_none() {
+            *w = c.warm_entry();
+        }
+    }
+    let mut new =
+        crate::jit::JitProto::compile_generic_warm(proto, &super::jit_generic_helpers(), &warm)?;
+    new.set_generation(old.generation() + 1);
+    let new = Rc::new(new);
+    if jit_log_enabled() {
+        jit_log(
+            id,
+            proto,
+            &alloc::format!("recompiled (generation {})", new.generation()),
+        );
+    }
+    // The old code stays alive with the function: compiled callers may hold
+    // its address.
+    proto.tier.replace_jit(Rc::clone(&new));
+    if let Some(d) = ctx.jit_rt.direct.get_mut(id)
+        && d.is_some()
+    {
+        *d = Some(Rc::clone(&new));
+    }
+    Some(new)
 }
 
 /// `Op::PushHandler` in compiled code: push `(target, reg)` onto the running
@@ -1960,7 +2121,9 @@ pub(crate) extern "C" fn jit_helper_backedge(
     n_regs: usize,
     ops: *const Op,
     n_ops: usize,
+    header: usize,
 ) -> u64 {
+    let regs_addr = regs as usize;
     // SAFETY: as `jit_helper_exec_op`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
@@ -1990,10 +2153,45 @@ pub(crate) extern "C" fn jit_helper_backedge(
             return NanBox::jit_throw_bits();
         }
         vm_safepoint(ctx, funcs, program, regs);
-        return 1;
+        return if regs_addr == ctx.jit_rt.exit_regs && wants_to_leave(ctx, header) {
+            NanBox::jit_exit_bits()
+        } else {
+            1
+        };
     }
     vm_safepoint(ctx, funcs, program, regs);
-    POLL_INTERVAL
+    if regs_addr == ctx.jit_rt.exit_regs && wants_to_leave(ctx, header) {
+        return NanBox::jit_exit_bits();
+    }
+    ctx.jit_rt.poll_interval
+}
+
+/// `KATAAN_JIT_EXIT_STRESS` (a test knob, read once per process): every
+/// back-edge of an activation that may leave at a loop header polls and
+/// leaves there, to be recompiled while the budget lasts and re-entered
+/// unchanged after.
+fn exit_stress() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_EXIT_STRESS").is_some_and(|v| v != "0"))
+}
+
+/// Whether the polling activation, the one that may leave
+/// ([`TierRuntime`]'s exit fields: its window is the one polling), should
+/// leave at loop header `header` to be recompiled: its body wants it
+/// (`JitProto::wants_recompile`). Records the header if so.
+fn wants_to_leave(ctx: &mut Ctx, header: usize) -> bool {
+    if ctx.jit_rt.exit_jit.is_null() {
+        return false;
+    }
+    // SAFETY: `exit_jit` is the body of the activation whose window is
+    // `regs`, alive (its caller holds it) while that activation runs.
+    #[allow(unsafe_code)]
+    let jit = unsafe { &*ctx.jit_rt.exit_jit };
+    if !exit_stress() && !jit.wants_recompile(header) {
+        return false;
+    }
+    ctx.jit_rt.resume = Some(header);
+    true
 }
 
 /// Whether `KATAAN_JIT_LOG` is set: report, per function, whether the JIT
