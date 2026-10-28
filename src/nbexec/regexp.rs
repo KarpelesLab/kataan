@@ -603,7 +603,7 @@ impl Interp {
                 "RegExp.prototype.{name} getter called on a non-RegExp object"
             )));
         };
-        let (_, flags) = self.realm.regexp_at(h).unwrap_or_default();
+        let flags = String::from(self.realm.regexp_flags(h).unwrap_or_default());
         Ok(match name {
             "source" => {
                 // Served from the exact WTF-8 bytes so a lone surrogate written
@@ -652,6 +652,51 @@ impl Interp {
             }
         }
         Ok(self.new_str(&out))
+    }
+
+    /// `ToString(Get(R, "flags"))`. For a RegExp with no own properties whose
+    /// `[[Prototype]]` is this realm's `%RegExp.prototype%` with the intrinsic
+    /// `flags` getter and flag getters all still in place, every `Get` the
+    /// getter would make lands on an intrinsic that only reads the cell's
+    /// flags, so the answer is those flags in canonical order, with nothing
+    /// observable skipped.
+    fn regexp_read_flags(&mut self, h: Handle) -> Result<String, ExecError> {
+        if let Some(f) = self.regexp_flags_fast(h) {
+            return Ok(f);
+        }
+        let flags_v = self.read_member(h, "flags")?;
+        self.coerce_to_string(flags_v)
+    }
+
+    /// The fast case of [`regexp_read_flags`](Self::regexp_read_flags).
+    fn regexp_flags_fast(&self, h: Handle) -> Option<String> {
+        let flags = self.realm.regexp_flags(h)?;
+        let proto = self.current_regexp_proto()?;
+        if self.realm.has_aux_object(h) || self.realm.object_proto(h)? != proto {
+            return None;
+        }
+        for key in [
+            "flags",
+            "hasIndices",
+            "global",
+            "ignoreCase",
+            "multiline",
+            "dotAll",
+            "unicode",
+            "unicodeSets",
+            "sticky",
+        ] {
+            let (getter, _) = self.realm.accessor(proto, key)?;
+            let (id, target) = self
+                .realm
+                .bound_native_at(Handle::from_raw(getter.as_handle()?))?;
+            if id != N_REGEXP_ACCESSOR
+                || self.realm.string_leaf_bytes(target) != Some(key.as_bytes())
+            {
+                return None;
+            }
+        }
+        Some("dgimsuvy".chars().filter(|&c| flags.contains(c)).collect())
     }
 
     /// `RegExp.prototype.compile(pattern, flags)`: recompiles the RegExp in place.
@@ -819,13 +864,10 @@ impl Interp {
             }
             return Ok(None);
         }
-        // Sticky must match exactly at `start`; non-sticky scans forward.
-        let caps = if sticky {
-            re.captures_in_u16(&units, start)
-                .filter(|c| c.whole().0 == start)
-        } else {
-            re.captures_in_u16(&units, start)
-        };
+        // Sticky matches only at `start` (the regex's own scan tries that one
+        // position — under `u`, the character containing it); non-sticky scans
+        // forward.
+        let caps = re.captures_in_u16(&units, start);
         match caps {
             None => {
                 if global || sticky {
@@ -1009,6 +1051,41 @@ impl Interp {
             .flatten()
     }
 
+    /// The value `Get(R, "exec")` would produce, when the method-site cache can
+    /// prove it reads a data property — found without performing the (then
+    /// unobservable) `Get`. `None` when it cannot tell.
+    #[cfg(feature = "regex")]
+    fn regexp_exec_peek(&mut self, h: Handle) -> Option<NanBox> {
+        if let Some(v) = self
+            .realm
+            .method_site_get(h, "exec", &mut self.regexp_exec_lookup)
+        {
+            return Some(v);
+        }
+        self.realm
+            .method_site_fill(h, "exec", &mut self.regexp_exec_lookup)
+    }
+
+    /// `Get(R, "lastIndex")`, read straight from a RegExp's own slot when it
+    /// holds the ordinary data property (no user descriptor).
+    fn last_index_get(&mut self, h: Handle) -> Result<NanBox, ExecError> {
+        if self.realm.regexp_flags(h).is_some() && !self.realm.regex_aux_last_index_defined(h) {
+            return Ok(NanBox::number(self.realm.regex_last_index(h) as f64));
+        }
+        self.read_member(h, "lastIndex")
+    }
+
+    /// `Set(R, "lastIndex", n, true)` for a non-negative integer `n`, written
+    /// straight into a RegExp's own slot when it holds the ordinary data
+    /// property (no user descriptor).
+    fn last_index_put(&mut self, h: Handle, n: usize) -> Result<(), ExecError> {
+        if self.realm.regexp_flags(h).is_some() && !self.realm.regex_aux_last_index_defined(h) {
+            self.realm.set_regex_last_index(h, n);
+            return Ok(());
+        }
+        self.set_prop_throwing(h, "lastIndex", NanBox::number(n as f64))
+    }
+
     /// `Get(R, "exec")`, answered from a validated method-site cache
     /// ([`MethodSiteCache`](crate::realm::builtins_fast::MethodSiteCache)) when
     /// the lookup provably reaches the same data property as last time — which
@@ -1067,16 +1144,17 @@ impl Interp {
             return Err(self.type_error("RegExp.prototype[Symbol.search] called on a non-object"));
         }
         let h = rx.as_handle().map(Handle::from_raw).unwrap();
-        let s_bytes = self.coerce_to_string_bytes(string)?;
-        let str_v = self.new_str_bytes(s_bytes);
+        // `ToString(string)`: the identity on a string, whose code units the
+        // exec below then finds in the subject memo.
+        let (str_v, _) = self.subject_units_cached(string)?;
         // Save/restore `lastIndex` around the search via `[[Get]]`/`[[Set]]` (so a
         // generic receiver's accessor / a throwing setter is observed, per spec).
-        let prev = self.read_member(h, "lastIndex")?;
+        let prev = self.last_index_get(h)?;
         if !self.same_value(prev, NanBox::number(0.0)) {
-            self.set_prop_throwing(h, "lastIndex", NanBox::number(0.0))?;
+            self.last_index_put(h, 0)?;
         }
         let result = self.regexp_exec_outcome(rx, str_v)?;
-        let cur = self.read_member(h, "lastIndex")?;
+        let cur = self.last_index_get(h)?;
         if !self.same_value(cur, prev) {
             self.set_prop_throwing(h, "lastIndex", prev)?;
         }
@@ -1099,11 +1177,9 @@ impl Interp {
         let h = rx.as_handle().map(Handle::from_raw).unwrap();
         // ToString(string) losslessly; `str_v` (the spec's `S`) is reused on every
         // `RegExpExec` so a surrogate-bearing subject matches and slices correctly.
-        let s_bytes = self.coerce_to_string_bytes(string)?;
-        let str_v = self.new_str_bytes(s_bytes.clone());
+        let (str_v, units_rc) = self.subject_units_cached(string)?;
 
-        let flags_v = self.read_member(h, "flags")?;
-        let flags = self.coerce_to_string(flags_v)?;
+        let flags = self.regexp_read_flags(h)?;
         let global = flags.contains('g');
         if !global {
             return self.regexp_exec(rx, str_v);
@@ -1115,19 +1191,49 @@ impl Interp {
         // Transcoded once, not per iteration: for a pattern that matches empty
         // (`/\s*/g`) the advance below runs at *every* position, so doing it in
         // the loop makes the whole match quadratic in the subject.
-        let units: Vec<u16> = if unicode {
-            crate::wtf8::utf16_units(&s_bytes).collect()
-        } else {
-            Vec::new()
-        };
+        let units: &[u16] = &units_rc;
         let mut results: Vec<NanBox> = Vec::new();
+        // As in `@@replace`: once `exec` is proven to be the intrinsic, read
+        // from a data property, and `lastIndex` is plain, nothing in this loop
+        // runs user code, so each `RegExpExec` is `RegExpBuiltinExec` and only
+        // the last match's legacy record is observable.
+        #[cfg(feature = "regex")]
+        let mut fast: Option<Handle> = None;
+        #[cfg(feature = "regex")]
+        let mut last_fast: Option<crate::regex::Captures> = None;
         loop {
-            let m_bytes = match self.regexp_exec_outcome(rx, str_v)? {
+            #[cfg(feature = "regex")]
+            let outcome = match fast {
+                Some(rh) => self
+                    .regexp_builtin_match_on(rh, str_v, units_rc.clone(), false)?
+                    .map_or(ExecOutcome::Null, ExecOutcome::Match),
+                None => {
+                    let (exec, proven) = self.regexp_exec_method(h)?;
+                    match self
+                        .builtin_exec_target(rx, exec)
+                        .filter(|&rh| proven && !self.realm.regex_aux_last_index_defined(rh))
+                    {
+                        Some(rh) => {
+                            fast = Some(rh);
+                            self.regexp_builtin_match_on(rh, str_v, units_rc.clone(), false)?
+                                .map_or(ExecOutcome::Null, ExecOutcome::Match)
+                        }
+                        None => self.regexp_exec_outcome_with(rx, h, str_v, exec)?,
+                    }
+                }
+            };
+            #[cfg(not(feature = "regex"))]
+            let outcome = self.regexp_exec_outcome(rx, str_v)?;
+            let m_bytes = match outcome {
                 ExecOutcome::Null => break,
                 #[cfg(feature = "regex")]
                 ExecOutcome::Match(m) => {
                     let (a, b) = m.caps.whole();
-                    u16_slice(&m.units, a, b)
+                    let bytes = u16_slice(&m.units, a, b);
+                    if fast.is_some() {
+                        last_fast = Some(m.caps);
+                    }
+                    bytes
                 }
                 ExecOutcome::Object(result) => {
                     let Some(rh) = result.as_handle().map(Handle::from_raw) else {
@@ -1146,11 +1252,15 @@ impl Interp {
             results.push(m_v);
             if empty {
                 // Advance lastIndex to avoid an infinite loop.
-                let li_v = self.read_member(h, "lastIndex")?;
+                let li_v = self.last_index_get(h)?;
                 let li = self.last_index_to_length(li_v)?;
-                let next = self.advance_string_index(&units, li, unicode);
-                self.set_prop_throwing(h, "lastIndex", NanBox::number(next as f64))?;
+                let next = self.advance_string_index(units, li, unicode);
+                self.last_index_put(h, next)?;
             }
+        }
+        #[cfg(feature = "regex")]
+        if let Some(c) = last_fast {
+            self.update_legacy_regexp(&units_rc, &c);
         }
         if results.is_empty() {
             Ok(NanBox::null())
@@ -1168,8 +1278,7 @@ impl Interp {
         let h = rx.as_handle().map(Handle::from_raw).unwrap();
         let s_bytes = self.coerce_to_string_bytes(string)?;
         let str_v = self.new_str_bytes(s_bytes);
-        let flags_v = self.read_member(h, "flags")?;
-        let flags = self.coerce_to_string(flags_v)?;
+        let flags = self.regexp_read_flags(h)?;
         let global = flags.contains('g');
         let unicode = flags.contains('u') || flags.contains('v');
         // Construct the matcher via `SpeciesConstructor(R, %RegExp%)` —
@@ -1278,14 +1387,11 @@ impl Interp {
             return Err(self.type_error("RegExp.prototype[Symbol.split] called on a non-object"));
         }
         let h = rx.as_handle().map(Handle::from_raw).unwrap();
-        let s_bytes = self.coerce_to_string_bytes(string)?;
-        let units: Vec<u16> = crate::wtf8::utf16_units(&s_bytes).collect();
-
-        let str_v = self.new_str_bytes(s_bytes);
+        let (str_v, units_rc) = self.subject_units_cached(string)?;
+        let units: &[u16] = &units_rc;
         // SpeciesConstructor(rx, %RegExp%) — read *before* `flags` per spec order.
         let ctor = self.regex_species_constructor(h)?;
-        let flags_v = self.read_member(h, "flags")?;
-        let flags = self.coerce_to_string(flags_v)?;
+        let flags = self.regexp_read_flags(h)?;
         let unicode = flags.contains('u') || flags.contains('v');
         // The splitter is `Construct(C, «rx, newFlags»)` with the source regex
         // forced sticky (`y`).
@@ -1334,6 +1440,10 @@ impl Interp {
             }
             return Ok(NanBox::handle(self.realm.new_array(parts).to_raw()));
         }
+        #[cfg(feature = "regex")]
+        if let Some(parts) = self.regexp_split_fast(ctor, splitter, &units_rc, lim, unicode)? {
+            return Ok(NanBox::handle(self.realm.new_array(parts).to_raw()));
+        }
         let mut p = 0usize; // start of the current segment
         let mut q = 0usize; // search cursor
         while q < size {
@@ -1342,17 +1452,17 @@ impl Interp {
             self.set_prop_throwing(splitter, "lastIndex", NanBox::number(q as f64))?;
             let z = self.regexp_exec(splitter_v, str_v)?;
             if matches!(z.unpack(), Unpacked::Null) {
-                q = self.advance_string_index(&units, q, unicode);
+                q = self.advance_string_index(units, q, unicode);
                 continue;
             }
             let li_v = self.read_member(splitter, "lastIndex")?;
             let e = (self.coerce_to_integer_or_infinity(li_v)?.max(0.0) as usize).min(size);
             if e == p {
-                q = self.advance_string_index(&units, q, unicode);
+                q = self.advance_string_index(units, q, unicode);
                 continue;
             }
             // Push S[p..q].
-            parts.push(self.new_str_bytes(u16_slice(&units, p, q)));
+            parts.push(self.new_str_bytes(u16_slice(units, p, q)));
             if parts.len() == lim {
                 return Ok(NanBox::handle(self.realm.new_array(parts).to_raw()));
             }
@@ -1372,8 +1482,102 @@ impl Interp {
             p = e;
             q = p;
         }
-        parts.push(self.new_str_bytes(u16_slice_from(&units, p)));
+        parts.push(self.new_str_bytes(u16_slice_from(units, p)));
         Ok(NanBox::handle(self.realm.new_array(parts).to_raw()))
+    }
+
+    /// The `@@split` loop when the splitter is a fresh built-in RegExp (made
+    /// by the intrinsic constructor, so no user code holds it) whose `exec` is
+    /// provably the intrinsic one: nothing in the loop can then run user code
+    /// or observe the splitter, so each sticky `RegExpExec` at `q` is replaced
+    /// by one search from `q` — the leftmost offset at which a sticky match
+    /// would succeed — instead of an exec per subject position. Only the last
+    /// successful exec's legacy record is observable. `None` when the
+    /// conditions do not hold (the caller runs the spec loop).
+    #[cfg(feature = "regex")]
+    fn regexp_split_fast(
+        &mut self,
+        ctor: NanBox,
+        splitter: Handle,
+        units_rc: &alloc::rc::Rc<Vec<u16>>,
+        lim: usize,
+        unicode: bool,
+    ) -> Result<Option<Vec<NanBox>>, ExecError> {
+        if ctor.as_handle() != self.regexp_ctor.map(Handle::to_raw)
+            || self.realm.regexp_flags(splitter).is_none()
+            || self.realm.regex_aux_last_index_defined(splitter)
+        {
+            return Ok(None);
+        }
+        let splitter_v = NanBox::handle(splitter.to_raw());
+        let Some(exec) = self.regexp_exec_peek(splitter) else {
+            return Ok(None);
+        };
+        if self.builtin_exec_target(splitter_v, exec) != Some(splitter) {
+            return Ok(None);
+        }
+        let Some(re) = self.realm.regex_compiled(splitter) else {
+            return Ok(None);
+        };
+        let units: &[u16] = units_rc;
+        let size = units.len();
+        let mut parts: Vec<NanBox> = Vec::new();
+        let mut last: Option<crate::regex::Captures> = None;
+        let (mut p, mut q) = (0usize, 0usize);
+        while q < size {
+            // The spec loop only execs at `q < size`.
+            let found = match re.search_in_u16(units, q) {
+                Ok(found) => found,
+                // The shared budget ran out: fall back to one sticky attempt
+                // per offset, each with its own budget, as the spec loop has.
+                Err(()) => {
+                    let mut x = q;
+                    loop {
+                        if x >= size {
+                            break None;
+                        }
+                        if let Some(c) = re.captures_in_u16(units, x) {
+                            break Some(c);
+                        }
+                        x = self.advance_string_index(units, x, unicode);
+                    }
+                }
+            };
+            let Some(c) = found.filter(|c| c.whole().0 < size) else {
+                break;
+            };
+            let (at, end) = c.whole();
+            let e = end.min(size);
+            if e == p {
+                // Only an empty match at `p` itself ends at `p`.
+                q = self.advance_string_index(units, at, unicode);
+                last = Some(c);
+                continue;
+            }
+            parts.push(self.new_str_bytes(u16_slice(units, p, at)));
+            if parts.len() == lim {
+                self.update_legacy_regexp(units_rc, &c);
+                return Ok(Some(parts));
+            }
+            for g in 1..c.groups.len() {
+                parts.push(match c.group(g) {
+                    Some((a, b)) => self.new_str_bytes(u16_slice(units, a, b)),
+                    None => NanBox::undefined(),
+                });
+                if parts.len() == lim {
+                    self.update_legacy_regexp(units_rc, &c);
+                    return Ok(Some(parts));
+                }
+            }
+            p = e;
+            q = p;
+            last = Some(c);
+        }
+        if let Some(c) = &last {
+            self.update_legacy_regexp(units_rc, c);
+        }
+        parts.push(self.new_str_bytes(u16_slice_from(units, p)));
+        Ok(Some(parts))
     }
 
     /// `RegExp.prototype[@@replace](string, replaceValue)`.
@@ -1403,8 +1607,7 @@ impl Interp {
         } else {
             self.coerce_to_string(replace)?
         };
-        let flags_v = self.read_member(h, "flags")?;
-        let flags = self.coerce_to_string(flags_v)?;
+        let flags = self.regexp_read_flags(h)?;
         let global = flags.contains('g');
         let unicode = flags.contains('u') || flags.contains('v');
         if global {

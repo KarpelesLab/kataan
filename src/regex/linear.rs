@@ -1,12 +1,12 @@
 //! A fast matcher for *linear* patterns: a straight sequence of literals,
 //! single-character sets, single-character quantifiers (`\d+`, `[a-z]*?`,
 //! `x{2,5}`), capture-group boundaries and zero-width assertions — no
-//! alternation, no quantified group, no lookaround, no backreference. Most
-//! regexes in real programs have this shape (`/(\w+)@([\w.]+)/`,
-//! `/page\/(\d)9\d/`, `/\d+/g`).
+//! quantified group, no lookaround, no backreference — optionally with one
+//! alternation (`^\s+|\s+$`, `(https?|ftp):`). Most regexes in real programs
+//! have this shape (`/(\w+)@([\w.]+)/`, `/page\/(\d)9\d/`, `/\d+/g`).
 //!
 //! It accepts exactly what the backtracking VM ([`super::vm`]) accepts, in
-//! the same preference order, but runs on a flat step list with an explicit,
+//! the same preference order, but runs on flat step lists with an explicit,
 //! bounded choice stack instead of one recursive call per instruction:
 //!
 //! * a sequence has one path through it, so every capture boundary is written
@@ -14,9 +14,13 @@
 //!   be restored when backtracking;
 //! * each quantifier step leaves at most one choice point, so the stack depth
 //!   is bounded by the number of quantifier steps (known at compile time);
-//! * every consume is exactly one code unit (only built outside `u`/`v`
-//!   mode), so a greedy step backs off by plain index decrement and set
-//!   membership is a bit test for Latin-1 units.
+//! * an alternation `P(A|B)S` whose prefix `P` makes no choice is tried as the
+//!   two sequences `PAS` and `PBS`, in that order: a depth-first search
+//!   exhausts every way of matching `PAS` (all of `A`'s choices and all of
+//!   `S`'s) before it first tries `B`, exactly as the VM's does;
+//! * outside `u`/`v` mode every consume is one code unit, so a greedy step
+//!   backs off by plain index decrement and set membership is a bit test for
+//!   Latin-1 units; in `u`/`v` mode a consume reads a whole code point.
 //!
 //! The steps are derived from the compiled VM program, and every set's
 //! membership is the VM's own predicate ([`vm::single_consume_matches`]),
@@ -28,13 +32,15 @@ use super::vm::{self, Assert, ClassMember, Inst};
 use alloc::vec::Vec;
 use core::cell::Cell;
 
-/// Membership of the units at or above 256 in a [`Set`].
+/// Membership of the code points at or above 256 in a [`Set`].
 #[derive(Clone, Copy)]
 enum High {
-    /// No unit >= 256 is a member.
+    /// No code point >= 256 is a member.
     None,
     /// Ask the VM predicate for the instruction at this program index.
     Check(usize),
+    /// Every unit >= 256 may start a match (a start filter only).
+    Any,
 }
 
 /// One character set: the Latin-1 bitmap plus the rule above it.
@@ -44,50 +50,74 @@ struct Set {
 }
 
 impl Set {
+    /// Whether code point (or, outside `u` mode, code unit) `c` is a member.
     #[inline(always)]
-    fn has(&self, unit: u16, prog: &[Inst], flags: Flags) -> bool {
-        if unit < 256 {
-            return self.latin1[usize::from(unit >> 6)] & (1u64 << (unit & 63)) != 0;
+    fn has(&self, c: u32, prog: &[Inst], flags: Flags) -> bool {
+        if c < 256 {
+            return self.latin1[(c >> 6) as usize] & (1u64 << (c & 63)) != 0;
         }
         match self.high {
             High::None => false,
-            High::Check(pc) => vm::single_consume_matches(&prog[pc], u32::from(unit), flags),
+            High::Check(pc) => vm::single_consume_matches(&prog[pc], c, flags),
+            High::Any => true,
         }
+    }
+
+    /// Whether a match whose first character is in this set may begin with
+    /// code unit `u`: exact below 256; above, a `u`-mode unit may be the lead
+    /// half of a pair, so anything but an empty high range is a candidate.
+    #[inline(always)]
+    fn may_start(&self, u: u16, prog: &[Inst], flags: Flags) -> bool {
+        if u < 256 || !flags.unicode {
+            return self.has(u32::from(u), prog, flags);
+        }
+        !matches!(self.high, High::None)
     }
 }
 
+#[derive(Clone, Copy)]
 enum Step {
     /// Record the position in capture slot `n`.
     Save(usize),
-    /// One exact code unit.
+    /// One exact code unit (never a surrogate in `u` mode, so the unit is a
+    /// whole character there too).
     Unit(u16),
-    /// One unit from a set.
+    /// One character from a set.
     One(usize),
-    /// Up to `max` units from a set (unbounded when `None`), greedy or lazy.
-    /// `next_unit` is the literal the steps after it must begin with, if any,
-    /// so a greedy back-off only stops where that literal is.
+    /// Up to `max` characters from a set (unbounded when `None`), greedy or
+    /// lazy. `next_unit` is the literal the steps after it must begin with,
+    /// if any, so a greedy back-off only stops where that literal is.
     Rep {
         set: usize,
         max: Option<usize>,
         greedy: bool,
         next_unit: Option<u16>,
     },
-    /// A zero-width assertion.
-    Assert(Assert),
+    /// A zero-width assertion (an index into [`ASSERTS`]).
+    Assert(u8),
     Match,
 }
 
+const ASSERTS: [Assert; 4] = [
+    Assert::Start,
+    Assert::End,
+    Assert::WordBoundary,
+    Assert::NotWordBoundary,
+];
+
 /// A linear program; see the module docs.
 pub(crate) struct Linear {
-    steps: Vec<Step>,
+    /// The sequences tried, in order, at each start position.
+    branches: Vec<Vec<Step>>,
     sets: Vec<Set>,
-    /// The number of quantifier steps, which bounds the choice-stack depth.
+    /// The most quantifier steps in a branch, which bounds the choice-stack
+    /// depth.
     reps: usize,
     slots: usize,
     /// What a match must begin with, to skip offsets that cannot start one.
     first: First,
-    /// `(A, B)` when the steps open with `A B* x` (captures aside) and the
-    /// literal `x` is outside `B`; see [`Linear::find`].
+    /// `(A, B)` when the one branch opens with `A B* x` (captures aside) and
+    /// the literal `x` is outside `B`; see [`Linear::find`].
     lead_run: Option<(usize, usize)>,
 }
 
@@ -102,7 +132,6 @@ enum First {
 
 /// The result of one attempt.
 enum Outcome {
-    /// Matched; the capture slots are in the caller's buffer.
     Match,
     NoMatch,
     /// The shared step budget ran out: the whole find gives up, as the VM does.
@@ -115,151 +144,247 @@ struct Choice {
     step: usize,
     /// The position the steps after it were last tried at.
     cur: usize,
-    /// Greedy: the lowest position it may back off to. Lazy: the highest
-    /// position it may extend to.
+    /// Greedy: the lowest position it may back off to. Lazy: how many more
+    /// characters it may take.
     bound: usize,
 }
 
 const STACK_CHOICES: usize = 16;
 
-impl Linear {
-    /// Builds the linear form of `prog` (compiled with `flags`), or `None` when
-    /// the program is not a straight sequence.
-    pub(crate) fn build(prog: &[Inst], flags: Flags, slots: usize) -> Option<Linear> {
-        if flags.unicode || flags.unicode_sets {
-            return None;
+/// At most this many branches (one alternation's).
+const MAX_BRANCHES: usize = 16;
+
+/// Parses the steps of `prog[pc..end]` (to the `Match` when `end` is `None`)
+/// into `out`. Stops early, returning the program index, at a `Split` that is
+/// not a single-character quantifier (an alternation); returns `end` (or the
+/// `Match` index) when the whole range is a sequence. `None` if anything in it
+/// cannot be expressed.
+fn parse_seq(
+    prog: &[Inst],
+    mut pc: usize,
+    end: Option<usize>,
+    flags: Flags,
+    sets: &mut Vec<Set>,
+    out: &mut Vec<Step>,
+) -> Option<usize> {
+    let new_set = |pc: usize, sets: &mut Vec<Set>| -> usize {
+        sets.push(make_set(&prog[pc], pc, flags));
+        sets.len() - 1
+    };
+    loop {
+        if Some(pc) == end {
+            return Some(pc);
         }
-        let mut steps = Vec::new();
-        let mut sets: Vec<Set> = Vec::new();
-        let mut reps = 0usize;
-        let mut pc = 0usize;
-        let new_set = |pc: usize, sets: &mut Vec<Set>| -> usize {
-            sets.push(make_set(&prog[pc], pc, flags));
-            sets.len() - 1
-        };
-        loop {
-            match prog.get(pc)? {
-                Inst::Save(s) => {
-                    steps.push(Step::Save(*s));
-                    pc += 1;
+        match prog.get(pc)? {
+            Inst::Save(s) => {
+                out.push(Step::Save(*s));
+                pc += 1;
+            }
+            Inst::Char(c)
+                if !flags.ignore_case
+                    && *c <= 0xFFFF
+                    && !(flags.unicode && (0xD800..=0xDFFF).contains(c)) =>
+            {
+                out.push(Step::Unit(*c as u16));
+                pc += 1;
+            }
+            Inst::Char(_) | Inst::Any | Inst::Class(_) | Inst::ClassSet { .. } => {
+                out.push(Step::One(new_set(pc, sets)));
+                pc += 1;
+            }
+            Inst::Assert(a) => {
+                out.push(Step::Assert(match a {
+                    Assert::Start => 0,
+                    Assert::End => 1,
+                    Assert::WordBoundary => 2,
+                    Assert::NotWordBoundary => 3,
+                }));
+                pc += 1;
+            }
+            Inst::Match => {
+                if end.is_some() {
+                    return None;
                 }
-                Inst::Char(c) if !flags.ignore_case => {
-                    steps.push(Step::Unit(u16::try_from(*c).ok()?));
-                    pc += 1;
+                out.push(Step::Match);
+                return Some(pc);
+            }
+            Inst::Split(a, b) => {
+                let (a, b) = (*a, *b);
+                // `x*` / `x*?`: `Split; x; Jmp(split)`, continuing after it.
+                if is_consume(prog.get(pc + 1))
+                    && matches!(prog.get(pc + 2), Some(Inst::Jmp(t)) if *t == pc)
+                    && ((a == pc + 1 && b == pc + 3) || (b == pc + 1 && a == pc + 3))
+                {
+                    out.push(Step::Rep {
+                        set: new_set(pc + 1, sets),
+                        max: None,
+                        greedy: a == pc + 1,
+                        next_unit: None,
+                    });
+                    pc += 3;
+                    continue;
                 }
-                Inst::Char(_) | Inst::Any | Inst::Class(_) | Inst::ClassSet { .. } => {
-                    steps.push(Step::One(new_set(pc, &mut sets)));
-                    pc += 1;
-                }
-                Inst::Assert(a) => {
-                    steps.push(Step::Assert(match a {
-                        Assert::Start => Assert::Start,
-                        Assert::End => Assert::End,
-                        Assert::WordBoundary => Assert::WordBoundary,
-                        Assert::NotWordBoundary => Assert::NotWordBoundary,
-                    }));
-                    pc += 1;
-                }
-                Inst::Match => {
-                    steps.push(Step::Match);
-                    break;
-                }
-                Inst::Split(a, b) => {
-                    let (a, b) = (*a, *b);
-                    // `x*` / `x*?`: `Split; x; Jmp(split)`, continuing after it.
-                    if is_consume(prog.get(pc + 1))
-                        && matches!(prog.get(pc + 2), Some(Inst::Jmp(t)) if *t == pc)
-                        && ((a == pc + 1 && b == pc + 3) || (b == pc + 1 && a == pc + 3))
-                    {
-                        steps.push(Step::Rep {
-                            set: new_set(pc + 1, &mut sets),
-                            max: None,
-                            greedy: a == pc + 1,
-                            next_unit: None,
-                        });
-                        reps += 1;
-                        pc += 3;
-                        continue;
-                    }
-                    // `x{0,k}` (and the optional tail of `x{n,m}`): a nested
-                    // chain `Split(body, exit); x; Split(body, exit); x; … exit:`
-                    // where every split shares one exit — one choice of count.
-                    let greedy = a == pc + 1;
-                    let exit = if greedy { b } else { a };
-                    if !greedy && b != pc + 1 {
-                        return None;
-                    }
-                    let mut q = pc;
-                    let mut count = 0usize;
-                    while q < exit {
-                        let Some(Inst::Split(x, y)) = prog.get(q) else {
-                            return None;
-                        };
-                        let (body, ex) = if greedy { (*x, *y) } else { (*y, *x) };
-                        if body != q + 1 || ex != exit || !is_consume(prog.get(q + 1)) {
-                            return None;
-                        }
-                        count += 1;
-                        q += 2;
-                    }
-                    if q != exit || count == 0 {
-                        return None;
-                    }
-                    steps.push(Step::Rep {
-                        set: new_set(pc + 1, &mut sets),
+                // `x{0,k}` (and the optional tail of `x{n,m}`): a nested
+                // chain `Split(body, exit); x; Split(body, exit); x; … exit:`
+                // where every split shares one exit — one choice of count.
+                if let Some((count, greedy, exit)) = optional_chain(prog, pc) {
+                    out.push(Step::Rep {
+                        set: new_set(pc + 1, sets),
                         max: Some(count),
                         greedy,
                         next_unit: None,
                     });
-                    reps += 1;
                     pc = exit;
+                    continue;
                 }
-                // Alternation, quantified groups, lookaround, backreferences,
-                // inline modifiers: not a straight sequence.
-                _ => return None,
+                return Some(pc);
             }
+            // Quantified groups, lookaround, backreferences, inline
+            // modifiers: not a sequence.
+            _ => return None,
         }
-        // The literal a greedy step's continuation must start with.
-        for i in 0..steps.len() {
-            if let Step::Rep { greedy: true, .. } = steps[i] {
-                let mut j = i + 1;
-                while let Some(Step::Save(_)) = steps.get(j) {
-                    j += 1;
-                }
-                let lit = match steps.get(j) {
-                    Some(Step::Unit(u)) => Some(*u),
-                    _ => None,
-                };
-                if let Step::Rep { next_unit, .. } = &mut steps[i] {
-                    *next_unit = lit;
-                }
-            }
-        }
-        let consuming: Vec<&Step> = steps
-            .iter()
-            .filter(|s| !matches!(s, Step::Save(_)))
-            .collect();
-        let first = match consuming.first() {
-            Some(Step::Unit(u)) => First::Unit(*u),
-            Some(Step::One(k)) => First::Set(*k),
-            _ => First::Any,
+    }
+}
+
+/// Recognizes the optional chain of `x{0,count}` at `pc`, returning `(count,
+/// greedy, exit)`.
+fn optional_chain(prog: &[Inst], pc: usize) -> Option<(usize, bool, usize)> {
+    let Some(&Inst::Split(a, b)) = prog.get(pc) else {
+        return None;
+    };
+    let greedy = a == pc + 1;
+    if !greedy && b != pc + 1 {
+        return None;
+    }
+    let exit = if greedy { b } else { a };
+    let mut q = pc;
+    let mut count = 0usize;
+    while q < exit {
+        let Some(Inst::Split(x, y)) = prog.get(q) else {
+            return None;
         };
-        let lead_run = match consuming.as_slice() {
-            [
-                Step::One(a),
-                Step::Rep {
-                    set: b,
-                    max: None,
-                    greedy: true,
-                    ..
-                },
-                Step::Unit(x),
-                ..,
-            ] if !sets[*b].has(*x, prog, flags) => Some((*a, *b)),
+        let (body, ex) = if greedy { (*x, *y) } else { (*y, *x) };
+        if body != q + 1 || ex != exit || !is_consume(prog.get(q + 1)) {
+            return None;
+        }
+        count += 1;
+        q += 2;
+    }
+    (q == exit && count > 0).then_some((count, greedy, exit))
+}
+
+/// The branches `(start, stop)` and the join point of the alternation whose
+/// first `Split` is at `pc`: `Split(b1, L2); b1; Jmp(end); L2: Split(b2, L3);
+/// b2; Jmp(end); …; Ln: bn; end:`.
+fn alternation(prog: &[Inst], pc: usize) -> Option<(Vec<(usize, usize)>, usize)> {
+    let mut branches = Vec::new();
+    let mut at = pc;
+    let mut end = None;
+    loop {
+        if let Some(&Inst::Split(a, b)) = prog.get(at)
+            && a == at + 1
+            && b > a
+            && let Some(&Inst::Jmp(e)) = prog.get(b - 1)
+            && e >= b
+            && end.is_none_or(|x| x == e)
+        {
+            end = Some(e);
+            branches.push((a, b - 1));
+            at = b;
+            if branches.len() >= MAX_BRANCHES {
+                return None;
+            }
+            continue;
+        }
+        let end = end?;
+        branches.push((at, end));
+        return Some((branches, end));
+    }
+}
+
+impl Linear {
+    /// Builds the linear form of `prog` (compiled with `flags`), or `None` when
+    /// the program is not one.
+    pub(crate) fn build(prog: &[Inst], flags: Flags, slots: usize) -> Option<Linear> {
+        let mut sets: Vec<Set> = Vec::new();
+        let mut prefix = Vec::new();
+        let stop = parse_seq(prog, 0, None, flags, &mut sets, &mut prefix)?;
+        let mut branches = Vec::new();
+        if matches!(prog.get(stop), Some(Inst::Match)) {
+            branches.push(prefix);
+        } else {
+            // An alternation. Splitting it off the prefix is only sound when
+            // the prefix makes no choice of its own (see the module docs).
+            if prefix.iter().any(|s| matches!(s, Step::Rep { .. })) {
+                return None;
+            }
+            let (alts, end) = alternation(prog, stop)?;
+            let mut suffix = Vec::new();
+            let fin = parse_seq(prog, end, None, flags, &mut sets, &mut suffix)?;
+            if !matches!(prog.get(fin), Some(Inst::Match)) {
+                return None;
+            }
+            for (start, stop) in alts {
+                let mut steps = prefix.clone();
+                // The whole branch must be a sequence (no nested alternation).
+                if parse_seq(prog, start, Some(stop), flags, &mut sets, &mut steps)? != stop {
+                    return None;
+                }
+                steps.extend_from_slice(&suffix);
+                branches.push(steps);
+            }
+        }
+        let mut reps = 0usize;
+        for steps in &mut branches {
+            reps = reps.max(
+                steps
+                    .iter()
+                    .filter(|s| matches!(s, Step::Rep { .. }))
+                    .count(),
+            );
+            // The literal a greedy step's continuation must start with.
+            for i in 0..steps.len() {
+                if let Step::Rep { greedy: true, .. } = steps[i] {
+                    let mut j = i + 1;
+                    while let Some(Step::Save(_)) = steps.get(j) {
+                        j += 1;
+                    }
+                    let lit = match steps.get(j) {
+                        Some(Step::Unit(u)) => Some(*u),
+                        _ => None,
+                    };
+                    if let Step::Rep { next_unit, .. } = &mut steps[i] {
+                        *next_unit = lit;
+                    }
+                }
+            }
+        }
+        let first = start_filter(&branches, &mut sets);
+        let lead_run = match branches.as_slice() {
+            [only] if !flags.unicode => {
+                let consuming: Vec<&Step> = only
+                    .iter()
+                    .filter(|s| !matches!(s, Step::Save(_)))
+                    .collect();
+                match consuming.as_slice() {
+                    [
+                        Step::One(a),
+                        Step::Rep {
+                            set: b,
+                            max: None,
+                            greedy: true,
+                            ..
+                        },
+                        Step::Unit(x),
+                        ..,
+                    ] if !sets[*b].has(u32::from(*x), prog, flags) => Some((*a, *b)),
+                    _ => None,
+                }
+            }
             _ => None,
         };
         Some(Linear {
-            steps,
+            branches,
             sets,
             reps,
             slots,
@@ -289,32 +414,37 @@ impl Linear {
         steps_used: &Cell<u64>,
         budget: u64,
     ) -> Option<()> {
-        if self.reps <= STACK_CHOICES {
-            let mut stack = [Choice::default(); STACK_CHOICES];
-            self.find_on(
-                prog, units, start, last, flags, saves, steps_used, budget, &mut stack,
-            )
+        let mut small = [Choice::default(); STACK_CHOICES];
+        let mut big: Vec<Choice>;
+        let stack: &mut [Choice] = if self.reps <= STACK_CHOICES {
+            &mut small
         } else {
-            let mut stack = alloc::vec![Choice::default(); self.reps];
-            self.find_on(
-                prog, units, start, last, flags, saves, steps_used, budget, &mut stack,
-            )
+            big = alloc::vec![Choice::default(); self.reps];
+            &mut big
+        };
+        let ctx = Run {
+            prog,
+            units,
+            flags,
+            steps_used,
+            budget,
+        };
+        if flags.unicode {
+            self.find_on::<true>(&ctx, start, last, saves, stack)
+        } else {
+            self.find_on::<false>(&ctx, start, last, saves, stack)
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn find_on(
+    fn find_on<const U: bool>(
         &self,
-        prog: &[Inst],
-        units: &[u16],
+        ctx: &Run,
         start: usize,
         last: usize,
-        flags: Flags,
         saves: &mut [usize],
-        steps_used: &Cell<u64>,
-        budget: u64,
         stack: &mut [Choice],
     ) -> Option<()> {
+        let (units, prog, flags) = (ctx.units, ctx.prog, ctx.flags);
         // Only offsets in `start..=last` (and inside the subject, except for
         // the empty match at its end) are candidates.
         let end = last.saturating_add(1).min(units.len());
@@ -334,14 +464,21 @@ impl Linear {
                     let set = &self.sets[k];
                     s += units[s..end]
                         .iter()
-                        .position(|&x| set.has(x, prog, flags))?;
+                        .position(|&x| set.may_start(x, prog, flags))?;
                 }
                 First::Any => {}
             }
-            match self.run_on(prog, units, s, flags, saves, steps_used, budget, stack) {
-                Outcome::Match => return Some(()),
-                Outcome::Abort => return None,
-                Outcome::NoMatch => {}
+            // In `u` mode a match can only begin on a character boundary.
+            if U && !is_char_boundary(units, s) {
+                s += 1;
+                continue;
+            }
+            for steps in &self.branches {
+                match self.run_on::<U>(ctx, steps, s, saves, stack) {
+                    Outcome::Match => return Some(()),
+                    Outcome::Abort => return None,
+                    Outcome::NoMatch => {}
+                }
             }
             // A failed attempt at the head of an `A B+ x …` run fails at every
             // later start inside the same run of `B` units too: from any of
@@ -351,32 +488,33 @@ impl Linear {
             if let Some((a, b)) = self.lead_run
                 && units
                     .get(s)
-                    .is_some_and(|&u| self.sets[a].has(u, prog, flags))
+                    .is_some_and(|&u| self.sets[a].has(u32::from(u), prog, flags))
             {
                 s += 1;
                 let b = &self.sets[b];
-                while units.get(s).is_some_and(|&u| b.has(u, prog, flags)) {
+                while units
+                    .get(s)
+                    .is_some_and(|&u| b.has(u32::from(u), prog, flags))
+                {
                     s += 1;
                 }
                 continue;
             }
-            s += 1;
+            s += if U { char_len(units, s) } else { 1 };
         }
         None
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn run_on(
+    /// One attempt of `steps` at `start`.
+    fn run_on<const U: bool>(
         &self,
-        prog: &[Inst],
-        units: &[u16],
+        ctx: &Run,
+        steps: &[Step],
         start: usize,
-        flags: Flags,
         saves: &mut [usize],
-        steps_used: &Cell<u64>,
-        budget: u64,
         stack: &mut [Choice],
     ) -> Outcome {
+        let (units, prog, flags) = (ctx.units, ctx.prog, ctx.flags);
         for s in saves.iter_mut() {
             *s = usize::MAX;
         }
@@ -389,49 +527,56 @@ impl Linear {
         'run: loop {
             // Advance through the steps until one fails.
             let failed = loop {
-                match &self.steps[i] {
+                match steps[i] {
                     Step::Save(s) => {
-                        saves[*s] = p;
+                        saves[s] = p;
                         i += 1;
                     }
                     Step::Unit(u) => {
-                        if p < len && units[p] == *u {
+                        if p < len && units[p] == u {
                             p += 1;
                             i += 1;
                         } else {
                             break true;
                         }
                     }
-                    Step::One(k) => {
-                        if p < len && self.sets[*k].has(units[p], prog, flags) {
-                            p += 1;
+                    Step::One(k) => match read::<U>(units, p) {
+                        Some((c, n)) if self.sets[k].has(c, prog, flags) => {
+                            p = n;
                             i += 1;
-                        } else {
-                            break true;
                         }
-                    }
+                        _ => break true,
+                    },
                     Step::Rep {
                         set,
                         max,
                         greedy,
                         next_unit,
                     } => {
-                        let set = &self.sets[*set];
-                        let limit = match max {
-                            Some(m) => len.min(p.saturating_add(*m)),
-                            None => len,
-                        };
-                        if *greedy {
-                            let lo = p;
-                            while p < limit && set.has(units[p], prog, flags) {
-                                p += 1;
+                        let set = &self.sets[set];
+                        let lo = p;
+                        if greedy {
+                            if U {
+                                let mut left = max.unwrap_or(usize::MAX);
+                                while left > 0
+                                    && let Some((c, n)) = read::<true>(units, p)
+                                    && set.has(c, prog, flags)
+                                {
+                                    p = n;
+                                    left -= 1;
+                                }
+                            } else {
+                                let limit = max.map_or(len, |m| len.min(p.saturating_add(m)));
+                                while p < limit && set.has(u32::from(units[p]), prog, flags) {
+                                    p += 1;
+                                }
                             }
                             work += (p - lo) as u64;
                             // Back off to where the continuation can start.
                             if let Some(c) = next_unit
-                                && units.get(p) != Some(c)
+                                && units.get(p) != Some(&c)
                             {
-                                match units[lo..p].iter().rposition(|u| u == c) {
+                                match units[lo..p].iter().rposition(|&u| u == c) {
                                     Some(k) => p = lo + k,
                                     None => break true,
                                 }
@@ -445,14 +590,14 @@ impl Linear {
                             stack[depth] = Choice {
                                 step: i,
                                 cur: p,
-                                bound: limit,
+                                bound: max.unwrap_or(usize::MAX),
                             };
                         }
                         depth += 1;
                         i += 1;
                     }
                     Step::Assert(a) => {
-                        if vm::assert_ok(a, units, p, flags) {
+                        if vm::assert_ok(&ASSERTS[usize::from(a)], units, p, flags) {
                             i += 1;
                         } else {
                             break true;
@@ -463,7 +608,8 @@ impl Linear {
             };
             if !failed {
                 if work > 0 {
-                    steps_used.set(steps_used.get().saturating_add(work));
+                    ctx.steps_used
+                        .set(ctx.steps_used.get().saturating_add(work));
                 }
                 return Outcome::Match;
             }
@@ -472,19 +618,21 @@ impl Linear {
             loop {
                 work += 1;
                 if work >= 4096 {
-                    let n = steps_used.get().saturating_add(work);
-                    steps_used.set(n);
+                    let n = ctx.steps_used.get().saturating_add(work);
+                    ctx.steps_used.set(n);
                     work = 0;
-                    if n > budget {
+                    if n > ctx.budget {
                         return Outcome::Abort;
                     }
                 }
                 if depth == 0 {
-                    steps_used.set(steps_used.get().saturating_add(work));
-                    if steps_used.get() > budget {
-                        return Outcome::Abort;
-                    }
-                    return Outcome::NoMatch;
+                    let n = ctx.steps_used.get().saturating_add(work);
+                    ctx.steps_used.set(n);
+                    return if n > ctx.budget {
+                        Outcome::Abort
+                    } else {
+                        Outcome::NoMatch
+                    };
                 }
                 let ch = &mut stack[depth - 1];
                 let Step::Rep {
@@ -492,32 +640,50 @@ impl Linear {
                     greedy,
                     next_unit,
                     ..
-                } = &self.steps[ch.step]
+                } = steps[ch.step]
                 else {
                     unreachable!("choice points are only pushed by Rep steps");
                 };
-                if *greedy {
+                if greedy {
                     if ch.cur == ch.bound {
                         depth -= 1;
                         continue;
                     }
-                    let mut np = ch.cur - 1;
-                    if let Some(c) = next_unit {
-                        match units[ch.bound..ch.cur].iter().rposition(|u| u == c) {
-                            Some(k) => np = ch.bound + k,
+                    let np = if let Some(c) = next_unit {
+                        // `c` is never a surrogate, so each occurrence starts
+                        // a character of the run.
+                        match units[ch.bound..ch.cur].iter().rposition(|&u| u == c) {
+                            Some(k) => ch.bound + k,
                             None => {
                                 depth -= 1;
                                 continue;
                             }
                         }
-                    }
+                    } else if U
+                        && ch.cur >= ch.bound + 2
+                        && (0xDC00..=0xDFFF).contains(&units[ch.cur - 1])
+                        && (0xD800..=0xDBFF).contains(&units[ch.cur - 2])
+                    {
+                        ch.cur - 2
+                    } else {
+                        ch.cur - 1
+                    };
                     ch.cur = np;
                 } else {
-                    if ch.cur >= ch.bound || !self.sets[*set].has(units[ch.cur], prog, flags) {
+                    if ch.bound == 0 {
                         depth -= 1;
                         continue;
                     }
-                    ch.cur += 1;
+                    match read::<U>(units, ch.cur) {
+                        Some((c, n)) if self.sets[set].has(c, prog, flags) => {
+                            ch.cur = n;
+                            ch.bound -= 1;
+                        }
+                        _ => {
+                            depth -= 1;
+                            continue;
+                        }
+                    }
                 }
                 i = ch.step + 1;
                 p = ch.cur;
@@ -527,11 +693,93 @@ impl Linear {
     }
 }
 
+/// The per-find context of [`Linear::run_on`].
+struct Run<'a> {
+    prog: &'a [Inst],
+    units: &'a [u16],
+    flags: Flags,
+    steps_used: &'a Cell<u64>,
+    budget: u64,
+}
+
+/// The character at `p` and the position after it: one unit outside `u`
+/// mode; in `u` mode a well-formed surrogate pair is one code point.
+#[inline(always)]
+fn read<const U: bool>(units: &[u16], p: usize) -> Option<(u32, usize)> {
+    let u = *units.get(p)?;
+    if U && (0xD800..=0xDBFF).contains(&u)
+        && let Some(&lo) = units.get(p + 1)
+        && (0xDC00..=0xDFFF).contains(&lo)
+    {
+        let cp = 0x10000 + ((u32::from(u) - 0xD800) << 10) + (u32::from(lo) - 0xDC00);
+        return Some((cp, p + 2));
+    }
+    Some((u32::from(u), p + 1))
+}
+
+/// The number of units the character at `s` spans in `u` mode (1 at the end).
+fn char_len(units: &[u16], s: usize) -> usize {
+    match read::<true>(units, s) {
+        Some((_, n)) => n - s,
+        None => 1,
+    }
+}
+
+fn is_char_boundary(units: &[u16], s: usize) -> bool {
+    s == 0
+        || s >= units.len()
+        || !(0xDC00..=0xDFFF).contains(&units[s])
+        || !(0xD800..=0xDBFF).contains(&units[s - 1])
+}
+
 fn is_consume(inst: Option<&Inst>) -> bool {
     matches!(
         inst,
         Some(Inst::Char(_) | Inst::Any | Inst::Class(_) | Inst::ClassSet { .. })
     )
+}
+
+/// The start filter for `branches`: the one unit or set every match begins
+/// with, the union over the branches.
+fn start_filter(branches: &[Vec<Step>], sets: &mut Vec<Set>) -> First {
+    let firsts: Vec<First> = branches
+        .iter()
+        .map(
+            |steps| match steps.iter().find(|s| !matches!(s, Step::Save(_))) {
+                Some(Step::Unit(u)) => First::Unit(*u),
+                Some(Step::One(k)) => First::Set(*k),
+                _ => First::Any,
+            },
+        )
+        .collect();
+    match firsts.as_slice() {
+        [one] => *one,
+        _ => {
+            let mut union = Set {
+                latin1: [0; 4],
+                high: High::None,
+            };
+            for f in &firsts {
+                match *f {
+                    First::Any => return First::Any,
+                    First::Unit(u) if u < 256 => {
+                        union.latin1[usize::from(u >> 6)] |= 1u64 << (u & 63);
+                    }
+                    First::Unit(_) => union.high = High::Any,
+                    First::Set(k) => {
+                        for (w, x) in union.latin1.iter_mut().zip(sets[k].latin1) {
+                            *w |= x;
+                        }
+                        if !matches!(sets[k].high, High::None) {
+                            union.high = High::Any;
+                        }
+                    }
+                }
+            }
+            sets.push(union);
+            First::Set(sets.len() - 1)
+        }
+    }
 }
 
 /// The set a single-consume instruction accepts under `flags`.
@@ -552,10 +800,14 @@ fn make_set(inst: &Inst, pc: usize, flags: Flags) -> Set {
     }
 }
 
-/// Whether provably no unit >= 256 is accepted by `inst` (outside `u` mode,
-/// where a case-insensitive comparison never maps a non-ASCII unit onto an
-/// ASCII one, so an all-ASCII class stays all-ASCII under `i`).
+/// Whether provably no code point >= 256 is accepted by `inst`. Outside `u`
+/// mode a case-insensitive comparison never maps a non-ASCII unit onto an
+/// ASCII one, so an all-ASCII class stays all-ASCII under `i`; under `u` it
+/// can (`ſ` folds to `s`, the Kelvin sign to `k`), so nothing is assumed.
 fn high_is_empty(inst: &Inst, flags: Flags) -> bool {
+    if flags.ignore_case && flags.unicode {
+        return false;
+    }
     let ceiling = if flags.ignore_case { 128 } else { 256 };
     match inst {
         Inst::Char(c) => *c < ceiling,
@@ -564,12 +816,10 @@ fn high_is_empty(inst: &Inst, flags: Flags) -> bool {
                 && class.members.iter().all(|m| match m {
                     ClassMember::Char(c) => *c < ceiling,
                     ClassMember::Range(_, hi) => *hi < ceiling,
-                    ClassMember::Shorthand(s) => {
-                        matches!(
-                            s,
-                            super::parser::Shorthand::Digit | super::parser::Shorthand::Word
-                        )
-                    }
+                    ClassMember::Shorthand(s) => matches!(
+                        s,
+                        super::parser::Shorthand::Digit | super::parser::Shorthand::Word
+                    ),
                 })
         }
         _ => false,

@@ -402,6 +402,25 @@ impl Regex {
     /// Runs the native u16 program, scanning forward from `start` (unless
     /// sticky). All positions are code-unit indices and the `u` flag drives
     /// code-point vs code-unit semantics.
+    /// The first match starting at or after `start` (code-unit indices), as if
+    /// the regex were not sticky: the leftmost offset from which a sticky
+    /// match would succeed, found in one scan.
+    ///
+    /// `Err` when the step budget ran out before a match was found: one
+    /// search shares one budget across every offset, where separate sticky
+    /// attempts would each have had their own, so the caller must not read
+    /// that as "no sticky match anywhere".
+    #[allow(clippy::result_unit_err)]
+    pub fn search_in_u16(&self, units: &[u16], start: usize) -> Result<Option<Captures>, ()> {
+        let mut flags = self.flags;
+        flags.sticky = false;
+        let steps = core::cell::Cell::new(0);
+        match self.scan_counted(&self.prog, units, start, flags, &steps) {
+            None if steps.get() > vm::budget_for(units.len()) => Err(()),
+            found => Ok(found),
+        }
+    }
+
     fn captures_at_u16(&self, units: &[u16], start: usize) -> Option<Captures> {
         self.scan(&self.prog, units, start, self.flags)
     }
@@ -462,6 +481,19 @@ impl Regex {
         start: usize,
         flags: Flags,
     ) -> Option<Captures> {
+        self.scan_counted(prog, units, start, flags, &core::cell::Cell::new(0))
+    }
+
+    /// [`scan`](Self::scan) with the caller's step counter, which ends above
+    /// [`vm::budget_for`] the subject length when the find gave up.
+    fn scan_counted(
+        &self,
+        prog: &[vm::Inst],
+        units: &[u16],
+        start: usize,
+        flags: Flags,
+        steps: &core::cell::Cell<u64>,
+    ) -> Option<Captures> {
         // A sticky match must begin exactly at `start`. So must an anchored one
         // (`^…`) when `m` is off: `^` holds only at position 0, so if `start` is 0
         // there is exactly one candidate, and if it is not, no position from
@@ -469,13 +501,20 @@ impl Regex {
         // this the scan retried every offset in the subject and let the VM reject
         // each on the leading assertion, making a guaranteed-failing anchored
         // `test()` cost O(subject length) instead of O(1).
+        // In `u` mode the subject is a list of code points and matching begins
+        // at "the character obtained from element `start`" (RegExpBuiltinExec):
+        // a `start` inside a surrogate pair names the pair itself.
+        let start = if flags.unicode && start < units.len() && !is_char_boundary(units, start) {
+            start - 1
+        } else {
+            start
+        };
         let anchored = self.anchored && !flags.multiline;
         let last = if flags.sticky || anchored {
             start
         } else {
             units.len()
         };
-        let steps = core::cell::Cell::new(0u64);
         let budget = vm::budget_for(units.len());
         // When every match must begin with one known code unit, offsets where the
         // subject does not hold it cannot match, so skip to the next occurrence
@@ -504,7 +543,7 @@ impl Regex {
                 heap = alloc::vec![usize::MAX; slots];
                 &mut heap
             };
-            lin.find(prog, units, start, last, flags, saves, &steps, budget)?;
+            lin.find(prog, units, start, last, flags, saves, steps, budget)?;
             let groups = saves
                 .as_chunks::<2>()
                 .0
@@ -555,7 +594,7 @@ impl Regex {
                 s,
                 self.group_count,
                 flags,
-                &steps,
+                steps,
                 budget,
             ) {
                 return Some(Captures { groups });

@@ -5123,6 +5123,13 @@ impl Realm {
         }
     }
 
+    /// Whether the cell at `handle` has an auxiliary object (where an array's,
+    /// RegExp's or native's own named properties live).
+    #[must_use]
+    pub fn has_aux_object(&self, handle: Handle) -> bool {
+        self.aux_props.contains_key(&handle.to_raw())
+    }
+
     /// The `(getter, setter)` of accessor `key` on `handle`, if defined. Consults
     /// a callable cell's auxiliary object (see [`define_accessor`](Realm::define_accessor))
     /// so accessors installed on a native (e.g. `%TypedArray%`'s `get [Symbol.species]`)

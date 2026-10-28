@@ -1075,8 +1075,17 @@ fn case_variants(ch: char) -> impl Iterator<Item = u32> {
         // costly; instead rely on the fact that to_uppercase/to_lowercase plus the
         // fold of `ch` itself cover the ECMAScript-relevant variants. Add the fold
         // result directly so `ch` matching a folded target works both ways.
-        if target.len() == 1 {
-            out.push(target[0] as u32);
+        if let &[t] = target.as_slice() {
+            out.push(t as u32);
+            // The other members of the fold class reached through the target:
+            // the Kelvin sign folds to `k`, so `K` shares its class too (and
+            // must match it in `/[A-Z]/iu`), though neither simple case
+            // mapping of the sign produces it.
+            for v in t.to_uppercase().chain(t.to_lowercase()) {
+                if v != t && intl::unicode::case::case_fold(v).eq(core::iter::once(t)) {
+                    out.push(v as u32);
+                }
+            }
         }
     }
     out.into_iter()

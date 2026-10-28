@@ -967,11 +967,20 @@ fn linear_matcher_agrees_with_the_vm() {
         (r"[^,]*,([^,]*),", "", true),
         (r".+x", "s", true),
         (r"(a)(b)?", "", false),
-        (r"a|b", "", false),
+        (r"a|b", "", true),
+        (r"^\s+|\s+$", "g", true),
+        (r"(https?|ftp):\/\/(\w+)", "", true),
+        (r"(a|ab)(c|bcd)(d*)", "", false),
+        (r"(a|ab)(b?c)(d*)", "", true),
+        (r"x*(a|b)", "", false),
+        (r"(?:a|b)+", "", false),
+        (r"[a-z]+\u{1F600}?.", "u", true),
+        (r"[A-Z]+", "iu", true),
+        (r"\p{L}{2,3}?x", "u", true),
         (r"(ab)+", "", false),
         (r"a(?=b)", "", false),
         (r"(a)\1", "", false),
-        (r"\d+", "u", false),
+        (r"\d+", "u", true),
     ] {
         let fast = re(pat, flags);
         assert_eq!(fast.is_linear(), linear, "/{pat}/{flags}");
@@ -986,6 +995,8 @@ fn linear_matcher_agrees_with_the_vm() {
             "a,b,c,,d",
             "ab\nx\nyx",
             "\u{e9}\u{2603}\u{1F600}x9",
+            "  http://abc ftp://x9 abcd abcbcd ",
+            "ab\u{1F600}\u{1F600}x K\u{212A}\u{17F}s",
         ] {
             let units: alloc::vec::Vec<u16> = subject.encode_utf16().collect();
             for start in 0..=units.len() {
