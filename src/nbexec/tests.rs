@@ -12364,3 +12364,67 @@ fn collection_index_survives_mutation() {
         "40000:39999:false"
     );
 }
+
+#[test]
+fn vm_by_index_array_iteration_is_unobservable() {
+    // The VM iterates a plain array by index only while the built-in iterator is
+    // in place; every override, hole, accessor and early exit behaves as the
+    // protocol does.
+    let src = r#"
+        var out = [];
+        var a = [1, 2, 3];
+        for (var x of a) { out.push(x); if (x === 1) a.push(4); }
+        var h = [1, , 3]; Array.prototype[1] = "P";
+        for (var x of h) out.push(x);
+        delete Array.prototype[1];
+        var g = [0, 1];
+        Object.defineProperty(g, 1, { get: function () { out.push("get"); return 9; } });
+        for (var x of g) out.push(x);
+        out.push([...[5, 6]].join("+"));
+        var [p, q, ...r] = [1, 2, 3, 4]; out.push(p + q + r.join("+"));
+        function* gen() { yield* [7, 8]; }
+        out.push([...gen()].join("+"));
+        function* gen2() { for (var x of [1, 2, 3]) yield x; }
+        var it2 = gen2(); it2.next(); out.push(it2.return(5).value);
+        var AIP = Object.getPrototypeOf([][Symbol.iterator]());
+        AIP.return = function () { out.push("ret" + this.next().value); return {}; };
+        for (var x of [1, 2, 3]) { if (x === 1) break; }
+        var [d1] = [10, 20];
+        delete AIP.return;
+        for (var x of [1, 2, 3]) { if (x === 1) break; }
+        var oldNext = AIP.next;
+        AIP.next = function () { out.push("mynext"); return { done: true }; };
+        for (var x of [1, 2]) out.push(x);
+        AIP.next = oldNext;
+        var own = [1, 2]; own[Symbol.iterator] = function* () { yield "own"; };
+        for (var x of own) out.push(x);
+        Array.prototype[Symbol.iterator] = function* () { yield "over"; };
+        for (var x of [1, 2]) out.push(x);
+        out.join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "1 2 3 4 1 P 3 0 get 9 5+6 33+4 7+8 5 ret2 ret20 mynext own over"
+    );
+}
+
+#[test]
+fn vm_math_fast_path_honours_replacement() {
+    let src = r#"
+        var out = [Math.sqrt(16), Math.max(-0, 0), 1 / Math.min(0, -0), Math.round(-0.4),
+            Math.sqrt(), Math.max(), Math.pow(1, Infinity), Math.hypot(3, 4)];
+        out.push(Math.max({ valueOf: function () { out.push("vo"); return 3; } }, 1));
+        var s = Math.sqrt; Math.sqrt = function (x) { return "mine" + x; };
+        out.push(Math.sqrt(4)); Math.sqrt = s;
+        Object.defineProperty(Math, "abs", { get: function () { return function () { return "getter"; }; } });
+        out.push(Math.abs(-1));
+        var M = Math; globalThis.Math = { floor: function () { return "fake"; } };
+        out.push(Math.floor(1.5)); globalThis.Math = M;
+        out.push({ sqrt: s }.sqrt(9));
+        out.join(",")
+    "#;
+    assert_eq!(
+        run(src),
+        "4,0,-Infinity,0,NaN,-Infinity,NaN,5,vo,3,mine4,getter,fake,3"
+    );
+}

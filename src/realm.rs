@@ -252,6 +252,9 @@ pub struct Realm {
     /// realm's intrinsics are active. Costs one `Option<Handle>` compare per array
     /// allocation and nothing at all until a second realm exists.
     root_array_proto: Option<Handle>,
+    /// The array-iteration intrinsics the bytecode VM checks before iterating a
+    /// plain array by index (see [`VmArrayIterIntrinsics`]).
+    vm_array_iter: VmArrayIterIntrinsics,
     /// `%Promise.prototype%` — the `[[Prototype]]` of every engine-created promise.
     /// Captured at install time so an engine-internal promise (dynamic `import()`,
     /// an async function's result, a microtask reaction) never picks up a *tampered*
@@ -470,6 +473,24 @@ impl LegacyRegExpState {
     }
 }
 
+/// The intrinsics behind `%Array.prototype%[@@iterator]`, recorded as the host
+/// installs them, so the bytecode VM can tell — by identity, with no side
+/// effects — that `for (x of arr)` / `[...arr]` / `[a, b] = arr` over a plain
+/// array would run only the built-in `%ArrayIteratorPrototype%.next`, and then
+/// iterate by index without allocating an iterator or result objects.
+#[derive(Clone, Default)]
+pub struct VmArrayIterIntrinsics {
+    /// Every installed realm's intrinsic `%Array.prototype.values%` (they all
+    /// create the same kind of iterator).
+    pub values_fns: Vec<Handle>,
+    /// `%ArrayIteratorPrototype%`, once created.
+    pub iter_proto: Option<Handle>,
+    /// Its intrinsic `next` method.
+    pub next_fn: Option<Handle>,
+    /// The property-storage key of `Symbol.iterator`.
+    pub iter_key: Option<alloc::boxed::Box<str>>,
+}
+
 /// A snapshot of a realm's intrinsic prototype pointers (the realm-wide
 /// singletons that determine the `[[Prototype]]` of newly-created object/array/
 /// symbol/bigint values and the shared `%TypedArray%`). Captured and restored by
@@ -571,6 +592,7 @@ impl Realm {
             throw_type_error_intrinsic: None,
             array_proto_intrinsic: None,
             root_array_proto: None,
+            vm_array_iter: VmArrayIterIntrinsics::default(),
             promise_proto_intrinsic: None,
             symbol_proto_intrinsic: None,
             string_proto_intrinsic: None,
@@ -655,6 +677,29 @@ impl Realm {
     #[must_use]
     pub fn array_proto_intrinsic(&self) -> Option<Handle> {
         self.array_proto_intrinsic
+    }
+
+    /// The array-iteration intrinsics recorded for the bytecode VM.
+    #[must_use]
+    pub fn vm_array_iter(&self) -> &VmArrayIterIntrinsics {
+        &self.vm_array_iter
+    }
+
+    /// Mutable access to the array-iteration intrinsics (filled by the host
+    /// while it installs `Array.prototype` and `%ArrayIteratorPrototype%`).
+    pub fn vm_array_iter_mut(&mut self) -> &mut VmArrayIterIntrinsics {
+        &mut self.vm_array_iter
+    }
+
+    /// Whether the cell at `handle` is an ordinary object or a dense array —
+    /// the cells whose `[[Get]]` of a non-index key is a plain own-property
+    /// lookup followed by the prototype (no proxy trap, no exotic hook).
+    #[must_use]
+    pub fn is_ordinary_get_cell(&self, handle: Handle) -> bool {
+        matches!(
+            self.heap.get(handle),
+            Some(Cell::Object(_) | Cell::Array(_))
+        )
     }
 
     /// Records the realm's `%Promise.prototype%` intrinsic.
@@ -5038,10 +5083,13 @@ impl Realm {
                 self.promise_proto_intrinsic,
                 self.symbol_proto_intrinsic,
                 self.bigint_proto_intrinsic,
+                self.vm_array_iter.iter_proto,
+                self.vm_array_iter.next_fn,
             ]
             .into_iter()
             .flatten(),
         );
+        out.extend(self.vm_array_iter.values_fns.iter().copied());
         // Explicit prototype links for cells with no inline object part, and the
         // class prototypes: both are keyed by an identity the heap graph does not
         // reach, so their values are strong roots.
@@ -5439,6 +5487,9 @@ impl Realm {
     /// `roots`, updated in place — to the new locations. Returns the statistics.
     pub fn compact(&mut self, roots: &mut [Handle]) -> Stats {
         let n = roots.len();
+        // The VM's iteration intrinsics are a cache that the relocation below does
+        // not forward: drop it (the VM then takes the protocol path).
+        self.vm_array_iter = VmArrayIterIntrinsics::default();
 
         // The side-tables are weak-key (ephemeron) maps. Run the three phases
         // sequentially so each borrows the tables at a disjoint time:

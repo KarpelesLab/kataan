@@ -1053,9 +1053,9 @@ impl Default for Interp {
 }
 
 // Built-in (native) function ids.
-const N_MATH_MAX: u16 = 0;
-const N_MATH_MIN: u16 = 1;
-const N_MATH_ABS: u16 = 2;
+pub(crate) const N_MATH_MAX: u16 = 0;
+pub(crate) const N_MATH_MIN: u16 = 1;
+pub(crate) const N_MATH_ABS: u16 = 2;
 const N_STRING: u16 = 3;
 const N_NUMBER: u16 = 4;
 const N_BOOLEAN: u16 = 5;
@@ -1066,10 +1066,10 @@ const N_JSON_PARSE: u16 = 27;
 const N_OBJECT_KEYS: u16 = 9;
 const N_OBJECT_VALUES: u16 = 10;
 const N_ARRAY_IS_ARRAY: u16 = 11;
-const N_MATH_FLOOR: u16 = 12;
-const N_MATH_CEIL: u16 = 13;
-const N_MATH_ROUND: u16 = 14;
-const N_MATH_SQRT: u16 = 15;
+pub(crate) const N_MATH_FLOOR: u16 = 12;
+pub(crate) const N_MATH_CEIL: u16 = 13;
+pub(crate) const N_MATH_ROUND: u16 = 14;
+pub(crate) const N_MATH_SQRT: u16 = 15;
 const N_MAP: u16 = 16;
 const N_SET: u16 = 17;
 /// `get Map.prototype.size` — a brand-checking accessor (requires `[[MapData]]`).
@@ -1083,9 +1083,9 @@ const N_ARRAY_OF: u16 = 21;
 const N_PROMISE: u16 = 22;
 const N_DATE: u16 = 25;
 const N_REGEXP: u16 = 26;
-const N_MATH_POW: u16 = 28;
-const N_MATH_SIGN: u16 = 29;
-const N_MATH_TRUNC: u16 = 30;
+pub(crate) const N_MATH_POW: u16 = 28;
+pub(crate) const N_MATH_SIGN: u16 = 29;
+pub(crate) const N_MATH_TRUNC: u16 = 30;
 const N_OBJECT_FROM_ENTRIES: u16 = 34;
 const N_OBJECT_FREEZE: u16 = 35;
 const N_OBJECT_IS_FROZEN: u16 = 36;
@@ -2485,21 +2485,21 @@ const FA_STAGE_LIKE_MAPPED: f64 = 4.0;
 // Bound natives (carry a target promise handle):
 const N_RESOLVE: u16 = 100;
 const N_REJECT: u16 = 101;
-const N_MATH_HYPOT: u16 = 102;
-const N_MATH_CBRT: u16 = 103;
+pub(crate) const N_MATH_HYPOT: u16 = 102;
+pub(crate) const N_MATH_CBRT: u16 = 103;
 const N_MATH_LOG2: u16 = 104;
 const N_MATH_LOG10: u16 = 105;
-const N_MATH_EXP: u16 = 133;
-const N_MATH_LOG: u16 = 134;
+pub(crate) const N_MATH_EXP: u16 = 133;
+pub(crate) const N_MATH_LOG: u16 = 134;
 const N_MATH_RANDOM: u16 = 139;
 // Trig / hyperbolic / extra Math functions (140..=157).
-const N_MATH_SIN: u16 = 140;
-const N_MATH_COS: u16 = 141;
-const N_MATH_TAN: u16 = 142;
+pub(crate) const N_MATH_SIN: u16 = 140;
+pub(crate) const N_MATH_COS: u16 = 141;
+pub(crate) const N_MATH_TAN: u16 = 142;
 const N_MATH_ASIN: u16 = 143;
 const N_MATH_ACOS: u16 = 144;
-const N_MATH_ATAN: u16 = 145;
-const N_MATH_ATAN2: u16 = 146;
+pub(crate) const N_MATH_ATAN: u16 = 145;
+pub(crate) const N_MATH_ATAN2: u16 = 146;
 const N_MATH_SINH: u16 = 147;
 const N_MATH_COSH: u16 = 148;
 const N_MATH_TANH: u16 = 149;
@@ -4322,6 +4322,12 @@ impl Interp {
                 let iter_sym = self.well_known_symbol("iterator");
                 let iter_key = self.member_key(iter_sym);
                 self.realm.set_hidden_property(arr_proto, &iter_key, values);
+                // Recorded for the bytecode VM's by-index array iteration.
+                if let Some(vh) = values.as_handle().map(Handle::from_raw) {
+                    let ai = self.realm.vm_array_iter_mut();
+                    ai.values_fns.push(vh);
+                    ai.iter_key = Some(iter_key.into());
+                }
             }
         }
         // `Array.prototype[Symbol.unscopables]` — a null-prototype object whose
@@ -8934,6 +8940,18 @@ impl crate::nbvm::VmHost for Interp {
             .map(Handle::from_raw)
             .ok_or(crate::nbvm::HostError::Fault)?;
         Interp::iter_step(self, it, next).map_err(exec_to_host)
+    }
+
+    fn array_iterator_at(&mut self, arr: NanBox, index: usize) -> NanBox {
+        let Some(h) = arr.as_handle().map(Handle::from_raw) else {
+            return NanBox::undefined();
+        };
+        let it = self.make_live_array_iterator(h, 1);
+        if let Some(ih) = it.as_handle().map(Handle::from_raw) {
+            self.realm
+                .set_hidden_property(ih, GEN_IDX, NanBox::number(index as f64));
+        }
+        it
     }
 
     fn iter_close(&mut self, iter: NanBox) -> Result<(), crate::nbvm::HostError> {

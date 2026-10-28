@@ -39,8 +39,11 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+mod iter_fast;
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 mod jit_tier;
+#[cfg(feature = "std")]
+mod math_fast;
 mod vm_eval;
 #[cfg(all(test, feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 use jit_tier::call_generic;
@@ -1062,6 +1065,10 @@ pub trait VmHost {
     /// # Errors
     /// A throw from `return` or a non-object result, or a host fault.
     fn iter_close(&mut self, iter: NanBox) -> Result<(), HostError>;
+    /// A live `%ArrayIterator%` (values) over the array `arr`, positioned at
+    /// `index`: the iterator the VM's by-index fast path stood in for, made
+    /// real when something needs the object itself (its `return`, `yield*`).
+    fn array_iterator_at(&mut self, arr: NanBox, index: usize) -> NanBox;
     /// The frozen template object (with its frozen `.raw`) of tagged-template
     /// site `site`, created on first use and cached per site.
     fn template_object(&mut self, site: u64, cooked: &[Option<Vec<u8>>], raw: &[String]) -> NanBox;
@@ -1553,6 +1560,10 @@ fn vm_iter_step(
     iter: Reg,
     next: Reg,
 ) -> Result<Option<NanBox>, VmError> {
+    // A Number cursor in `iter` is the by-index array fast path.
+    if regs[iter as usize].is_number() {
+        return iter_fast::step(ctx, regs, done, iter);
+    }
     if regs[done as usize].as_boolean() == Some(true) {
         return Ok(None);
     }
@@ -6629,6 +6640,15 @@ fn run_frame_at_ic(
             }
             // Filled in by `call_with_inner` on entry.
             Op::MakeArguments { .. } | Op::LoadNewTarget { .. } => {}
+            Op::IterOpen { iter, next, src }
+                if *next == iter.wrapping_add(1)
+                    && iter_fast::can_open(&ctx.realm, regs[*src as usize]) =>
+            {
+                // A plain array over the built-in iterator: iterate it by index
+                // (see `iter_fast`).
+                regs[*next as usize] = regs[*src as usize];
+                regs[*iter as usize] = NanBox::number(0.0);
+            }
             Op::IterOpen { iter, next, src } => {
                 let v = regs[*src as usize];
                 match with_host(ctx, |h| h.get_iterator(v)) {
@@ -6676,7 +6696,11 @@ fn run_frame_at_ic(
                 if regs[*done as usize].as_boolean() != Some(true) {
                     regs[*done as usize] = NanBox::boolean(true);
                     let it = regs[*iter as usize];
-                    let r = with_host(ctx, |h| h.iter_close(it)).unwrap_or(Err(HostError::Fault));
+                    let r = if it.is_number() {
+                        iter_fast::close(ctx, regs, *iter)
+                    } else {
+                        with_host(ctx, |h| h.iter_close(it)).unwrap_or(Err(HostError::Fault))
+                    };
                     match r {
                         Err(HostError::Fault) => return Err(VmError::Unsupported),
                         Err(HostError::Thrown(e)) if !*quiet => handle_throw!(VmError::Thrown(e)),
@@ -6938,6 +6962,14 @@ fn run_frame_at_ic(
                 next,
                 mode,
             } => {
+                // `yield*` drives the iterator object itself: make a by-index
+                // array iterator real first.
+                if regs[*iter as usize].is_number()
+                    && let Err(e) = iter_fast::materialize(ctx, regs, *iter)
+                {
+                    handle_throw!(e);
+                    continue;
+                }
                 let (it, nx) = (regs[*iter as usize], regs[*next as usize]);
                 let m = regs[*mode as usize].as_number().unwrap_or(0.0) as u8;
                 let v = regs[*dst as usize];
@@ -8360,6 +8392,12 @@ fn run_frame_at_ic(
                 args,
             } => {
                 let recv_val = regs[*recv as usize];
+                // `Math.f(n)` over Numbers with the built-in `f`: computed here.
+                #[cfg(feature = "std")]
+                if let Some(v) = math_fast::call(&ctx.realm, recv_val, key, args, regs) {
+                    regs[*dst as usize] = v;
+                    continue;
+                }
                 let argv = ArgBuf::from_regs(regs, args);
                 // Hosted: a method that is a VM function (a data property on the
                 // receiver's chain) runs here; any other method call — a built-in,

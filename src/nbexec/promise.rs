@@ -96,6 +96,12 @@ impl Interp {
         // configurable) — `Object.prototype.toString` and the tests read it.
         self.install_to_string_tag(proto, tag);
         self.builtin_iter_protos.insert(tag, proto);
+        // Recorded for the bytecode VM's by-index array iteration.
+        if tag == "Array Iterator" {
+            let ai = self.realm.vm_array_iter_mut();
+            ai.iter_proto = Some(proto);
+            ai.next_fn = Some(next);
+        }
         proto
     }
 
