@@ -160,7 +160,7 @@ pub fn from_utf16(units: &[u16]) -> Vec<u8> {
 /// Assumes `bytes` is well-formed WTF-8 (as produced by this module and stored
 /// in ropes/atoms); a malformed lead byte is reported as a 1-byte U+FFFD so the
 /// iterators always make forward progress rather than looping or panicking.
-fn decode_code_point(bytes: &[u8], i: usize) -> (u32, usize) {
+pub fn decode_code_point(bytes: &[u8], i: usize) -> (u32, usize) {
     let b0 = bytes[i];
     if b0 < 0x80 {
         return (u32::from(b0), 1);

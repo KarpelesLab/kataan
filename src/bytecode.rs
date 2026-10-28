@@ -823,6 +823,20 @@ fn verify_op_with(
             reg(*iter)?;
             reg(*next)
         }
+        Op::IterNextEntry {
+            dst,
+            fused,
+            key,
+            val,
+            done,
+            iter,
+            next,
+        } => {
+            for x in [dst, fused, key, val, done, iter] {
+                reg(*x)?;
+            }
+            reg(*next)
+        }
         Op::IterClose { iter, done, .. } => {
             reg(*iter)?;
             reg(*done)
@@ -1793,6 +1807,20 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*iter, out);
             w_reg(*next, out);
         }
+        Op::IterNextEntry {
+            dst,
+            fused,
+            key,
+            val,
+            done,
+            iter,
+            next,
+        } => {
+            w_u8(172, out);
+            for x in [dst, fused, key, val, done, iter, next] {
+                w_reg(*x, out);
+            }
+        }
         Op::IterRest {
             dst,
             done,
@@ -2495,6 +2523,15 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         },
         75 => Op::IterNext {
             dst: r.reg()?,
+            done: r.reg()?,
+            iter: r.reg()?,
+            next: r.reg()?,
+        },
+        172 => Op::IterNextEntry {
+            dst: r.reg()?,
+            fused: r.reg()?,
+            key: r.reg()?,
+            val: r.reg()?,
             done: r.reg()?,
             iter: r.reg()?,
             next: r.reg()?,

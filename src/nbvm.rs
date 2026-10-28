@@ -168,6 +168,22 @@ pub enum Op {
         iter: Reg,
         next: Reg,
     },
+    /// The `IteratorStep` of a `for (const [k, v] of …)` head (two plain
+    /// names, no defaults): when the iterator is a built-in Map/Set
+    /// `entries` iterator with the intrinsic `next`, and destructuring a
+    /// fresh `[key, value]` array would be unobservable (the intrinsic array
+    /// iterator, no reachable `return`), the entry's key and value go straight
+    /// to `key` and `val` and `fused` = true — no pair array is made. Else
+    /// exactly [`Op::IterNext`] into `dst`, with `fused` = false.
+    IterNextEntry {
+        dst: Reg,
+        fused: Reg,
+        key: Reg,
+        val: Reg,
+        done: Reg,
+        iter: Reg,
+        next: Reg,
+    },
     /// `dst` = an array of every remaining value (a rest element).
     IterRest {
         dst: Reg,
@@ -6912,6 +6928,32 @@ fn run_frame_at_ic(
                 Ok(v) => regs[*dst as usize] = v.unwrap_or(NanBox::undefined()),
                 Err(e) => handle_throw!(e),
             },
+            Op::IterNextEntry {
+                dst,
+                fused,
+                key,
+                val,
+                done,
+                iter,
+                next,
+            } => {
+                if let Some(step) = iter_fast::entry_step(ctx, regs, *done, *iter, *next) {
+                    regs[*fused as usize] = NanBox::boolean(true);
+                    match step {
+                        Some((k, v)) => {
+                            regs[*key as usize] = k;
+                            regs[*val as usize] = v;
+                        }
+                        None => regs[*done as usize] = NanBox::boolean(true),
+                    }
+                } else {
+                    regs[*fused as usize] = NanBox::boolean(false);
+                    match vm_iter_step(ctx, regs, *done, *iter, *next) {
+                        Ok(v) => regs[*dst as usize] = v.unwrap_or(NanBox::undefined()),
+                        Err(e) => handle_throw!(e),
+                    }
+                }
+            }
             Op::IterRest {
                 dst,
                 done,
@@ -13177,6 +13219,41 @@ struct Binding {
 enum ForBind<'a> {
     Decl(&'a crate::ast::VarDeclKind, &'a BindingTarget),
     Target(&'a Expr),
+}
+
+/// The declaration kind and the two names of a `for (let|const [a, b] of …)`
+/// head — two plain identifiers, no defaults, holes or rest — which
+/// [`Op::IterNextEntry`] can bind straight from a Map entry.
+fn entry_pair_head<'a>(
+    bind: &ForBind<'a>,
+) -> Option<(
+    &'a crate::ast::VarDeclKind,
+    &'a BindingTarget,
+    &'a BindingTarget,
+)> {
+    use crate::ast::{ArrayPatternElement, VarDeclKind};
+    let ForBind::Decl(kind, BindingTarget::Array(pat)) = bind else {
+        return None;
+    };
+    if !matches!(kind, VarDeclKind::Let | VarDeclKind::Const) {
+        return None;
+    }
+    let [
+        ArrayPatternElement::Item {
+            target: a @ BindingTarget::Ident(_),
+            default: None,
+            ..
+        },
+        ArrayPatternElement::Item {
+            target: b @ BindingTarget::Ident(_),
+            default: None,
+            ..
+        },
+    ] = &pat.elements[..]
+    else {
+        return None;
+    };
+    Some((kind, a, b))
 }
 
 /// An enclosing `try … finally` (see [`Compiler::finally_frames`]): the
@@ -21721,12 +21798,28 @@ impl Compiler {
         }
         let top = self.ops.len();
         let cur = self.alloc();
-        self.ops.push(Op::IterNext {
-            dst: cur,
-            done,
-            iter,
-            next,
-        });
+        let entry = entry_pair_head(&bind);
+        let pair = if entry.is_some() {
+            let (fused, key, val) = (self.alloc(), self.alloc(), self.alloc());
+            self.ops.push(Op::IterNextEntry {
+                dst: cur,
+                fused,
+                key,
+                val,
+                done,
+                iter,
+                next,
+            });
+            Some((fused, key, val))
+        } else {
+            self.ops.push(Op::IterNext {
+                dst: cur,
+                done,
+                iter,
+                next,
+            });
+            None
+        };
         let not_done = self.alloc();
         self.ops.push(Op::Not {
             dst: not_done,
@@ -21740,7 +21833,12 @@ impl Compiler {
             reg: exc,
         });
         self.handler_depth += 1;
-        let r = self.for_iteration(bind, cur, body);
+        let r = match (entry, pair) {
+            (Some((kind, a, b)), Some((fused, key, val))) => {
+                self.for_entry_iteration(kind, (a, b), cur, (fused, key, val), body)
+            }
+            _ => self.for_iteration(bind, cur, body),
+        };
         self.handler_depth -= 1;
         r?;
         self.ops.push(Op::PopHandler);
@@ -22048,6 +22146,50 @@ impl Compiler {
             });
         }
         self.for_bind(bind, cur)?;
+        self.stmt(body).map(|_| ())
+    }
+
+    /// The binding and body of a `for (let|const [a, b] of …)` iteration
+    /// stepped by [`Op::IterNextEntry`]: when it `fused`, the names take
+    /// `key`/`val`; otherwise `cur` is destructured into them through the
+    /// iterator protocol first — the same steps `[a, b]` takes (open, two
+    /// steps, close unless exhausted), with the two plain bindings, which no
+    /// code can observe, made after the close instead of between the steps.
+    fn for_entry_iteration(
+        &mut self,
+        kind: &crate::ast::VarDeclKind,
+        (a, b): (&BindingTarget, &BindingTarget),
+        cur: Reg,
+        (fused, key, val): (Reg, Reg, Reg),
+        body: &Stmt,
+    ) -> Result<(), CompileError> {
+        let slow = self.emit_jump_if_false(fused);
+        let join = self.emit_jump();
+        self.patch(slow);
+        let (it, nx, done) = (self.alloc(), self.alloc(), self.alloc());
+        self.ops.push(Op::IterOpen {
+            iter: it,
+            next: nx,
+            src: cur,
+        });
+        let f = self.constant(NanBox::boolean(false))?;
+        self.ops.push(Op::Move { dst: done, src: f });
+        for dst in [key, val] {
+            self.ops.push(Op::IterNext {
+                dst,
+                done,
+                iter: it,
+                next: nx,
+            });
+        }
+        self.ops.push(Op::IterClose {
+            iter: it,
+            done,
+            quiet: false,
+        });
+        self.patch(join);
+        self.bind_for_decl(kind, a, key)?;
+        self.bind_for_decl(kind, b, val)?;
         self.stmt(body).map(|_| ())
     }
 

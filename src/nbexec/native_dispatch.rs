@@ -2417,10 +2417,19 @@ impl Interp {
                         "String.prototype[Symbol.iterator] called on null or undefined",
                     ));
                 }
-                let bytes = self.coerce_to_string_bytes(this)?;
-                let sval = self.new_str_bytes(bytes);
-                let vals = self.iterate_values(sval)?;
-                self.make_builtin_iterator(vals, "String Iterator")
+                // A flat string value is walked as is (strings are immutable);
+                // anything else is converted (and a rope flattened) once.
+                let flat = this
+                    .as_handle()
+                    .and_then(|h| self.realm.string_rope(Handle::from_raw(h)))
+                    .is_some_and(|r| r.as_leaf_bytes().is_some());
+                let sval = if flat {
+                    this
+                } else {
+                    let bytes = self.coerce_to_string_bytes(this)?;
+                    self.new_str_bytes(bytes)
+                };
+                self.make_string_iterator(sval)
             }
             // The abstract `%Iterator%` constructor is not callable as a plain
             // function (and `new Iterator()` is a TypeError too — handled in

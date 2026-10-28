@@ -13083,3 +13083,53 @@ fn builtin_iterators_stepped_by_slot_match_by_name() {
     "#;
     assert_eq!(run(src), "1,3,4,5,1,3,4,5,a1,b2,121,y,z,p!,q!,r");
 }
+
+#[test]
+fn lazy_string_iterator_yields_code_points() {
+    // The String Iterator decodes one code point per step: astral pairs
+    // (also ones joined by a concatenation) are one item, a lone surrogate is
+    // its own one-unit item, and a partly consumed iterator resumes.
+    let src = r#"
+        var out = [];
+        var s = "a\u{1F600}" + "\uD83D" + "\uDE00" + "\uD800" + "z";
+        for (var c of s) out.push(c.length + ":" + c.codePointAt(0).toString(16));
+        var it = s[Symbol.iterator]();
+        it.next();
+        out.push([...it].length);
+        out.push(JSON.stringify(it.next()));
+        out.push([...new String("q\u{10000}")].length);
+        out.join(",")
+    "#;
+    assert_eq!(
+        run(src),
+        "1:61,2:1f600,2:1f600,1:d800,1:7a,4,{\"done\":true},2"
+    );
+}
+
+#[test]
+fn for_of_entry_pair_heads_bind_without_the_pair() {
+    // `for (const [k, v] of map)` binds each entry's key and value directly
+    // unless destructuring the pair would be observable (a patched array
+    // iterator `next`, a reachable `return`), when the pair is made and
+    // destructured as usual.
+    let src = r#"
+        var out = [], m = new Map([[1, "a"], [2, "b"]]);
+        var fs = [];
+        for (let [k, v] of m) { fs.push(() => k + v); k = 0; }
+        for (var f of fs) out.push(f());
+        for (const [a, b] of new Set([7]).entries()) out.push(a + b);
+        var AIP = Object.getPrototypeOf([][Symbol.iterator]()), n = AIP.next, calls = 0;
+        AIP.next = function () { calls++; return n.call(this); };
+        for (const [k, v] of m) out.push(k);
+        AIP.next = n;
+        out.push(calls);
+        var closes = 0;
+        AIP.return = function () { closes++; return {}; };
+        for (const [k, v] of m) {}
+        delete AIP.return;
+        out.push(closes);
+        for (const [x, y] of [["p", "q"], "rs"]) out.push(x + y);
+        out.join(",")
+    "#;
+    assert_eq!(run(src), "0a,0b,14,1,2,4,2,pq,rs");
+}

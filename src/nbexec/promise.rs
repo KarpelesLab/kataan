@@ -159,6 +159,21 @@ impl Interp {
         NanBox::handle(obj.to_raw())
     }
 
+    /// A lazy `%StringIteratorPrototype%` iterator over the string `s` (a flat
+    /// string value): its `next` decodes one code point per step at a byte
+    /// cursor (see `GEN_STR`), yielding exactly what the snapshot of
+    /// `crate::wtf8::code_points` would — a lone surrogate as its own
+    /// one-unit string.
+    pub(crate) fn make_string_iterator(&mut self, s: NanBox) -> NanBox {
+        let proto = self.builtin_iterator_proto("String Iterator");
+        let obj = self.realm.new_object();
+        self.realm.set_object_proto(obj, Some(proto));
+        self.realm.set_hidden_property(obj, GEN_STR, s);
+        self.realm
+            .set_hidden_property(obj, GEN_IDX, NanBox::number(0.0));
+        NanBox::handle(obj.to_raw())
+    }
+
     /// Builds a built-in iterator over `values` (a snapshot) whose `[[Prototype]]`
     /// is the `%XIteratorPrototype%` for `tag` (so `next` is inherited, not an own
     /// property). The receiver carries the same buffer/index slots a generator

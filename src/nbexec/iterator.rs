@@ -283,6 +283,13 @@ impl Interp {
         if self.realm.get_property(h, RSI_MATCHER).is_some() {
             return self.regexp_string_iter_next(h);
         }
+        // A **lazy** String Iterator (has `GEN_STR`) decodes one code point.
+        if let Some(s) = self.realm.get_property(h, GEN_STR) {
+            return Ok(match string_iter_step(&mut self.realm, h, s) {
+                Some(v) => self.iter_result(v, false),
+                None => self.iter_result(NanBox::undefined(), true),
+            });
+        }
         let Some(buf) = self
             .realm
             .get_property(h, GEN_BUF)
@@ -2881,6 +2888,18 @@ fn builtin_iter_step_by_slot(realm: &mut Realm, h: Handle) -> Option<Option<NanB
         let state = state.as_handle().map(Handle::from_raw);
         return Some(state.and_then(|state| collection_iter_yield(realm, state, coll)));
     }
+    if let Some(layout) = realm.str_iter_layout.take() {
+        let r = layout.read(realm, h).map(|[s, idx]| {
+            let idx = idx.as_number().unwrap_or(0.0) as usize;
+            let (v, next) = string_code_point_at(realm, s, idx)?;
+            layout.write(realm, h, 1, NanBox::number(next as f64));
+            Some(v)
+        });
+        realm.str_iter_layout = Some(layout);
+        if r.is_some() {
+            return r;
+        }
+    }
     let layout = realm.buf_iter_layout.take()?;
     let r = layout.read(realm, h).and_then(|[buf, idx, _ret]| {
         let buf = Handle::from_raw(buf.as_handle()?);
@@ -2901,6 +2920,98 @@ fn builtin_iter_step_by_slot(realm: &mut Realm, h: Handle) -> Option<Option<NanB
     });
     realm.buf_iter_layout = Some(layout);
     r
+}
+
+/// [`realm_builtin_iter_step`] for a live Map/Set `entries` iterator, without
+/// the `[key, value]` array: `Some(Some((key, value)))`, `Some(None)` once
+/// done, or `None` (nothing changed) when `it` is not such an iterator with
+/// the shared built-in `next`.
+pub(crate) fn realm_builtin_entry_step(
+    realm: &mut Realm,
+    next: NanBox,
+    it: NanBox,
+) -> Option<Option<(NanBox, NanBox)>> {
+    let nh = Handle::from_raw(next.as_handle()?);
+    if realm.native_at(nh) != Some(N_GEN_ITER_NEXT) {
+        return None;
+    }
+    let h = Handle::from_raw(it.as_handle()?);
+    if !realm.is_ordinary_get_cell(h) {
+        return None;
+    }
+    // The same state `realm_builtin_iter_step` reads: by slot in the learned
+    // layout, else by name (a live collection iterator is the first kind
+    // `gen_iter_next` tries).
+    let (coll, state) = match realm
+        .coll_iter_layout
+        .as_ref()
+        .and_then(|l| l.read(realm, h))
+    {
+        Some([coll, state]) => (coll, state),
+        None => (
+            realm.get_property(h, GEN_COLL)?,
+            realm
+                .get_property(h, GEN_CSTATE)
+                .unwrap_or(NanBox::undefined()),
+        ),
+    };
+    let coll = Handle::from_raw(coll.as_handle()?);
+    let Some(state) = state.as_handle().map(Handle::from_raw) else {
+        return Some(None);
+    };
+    // Only an `entries` iterator (kind 2) yields pairs.
+    if realm
+        .array_elements(state)?
+        .first()
+        .and_then(|k| k.as_number())
+        != Some(2.0)
+    {
+        return None;
+    }
+    Some(
+        realm
+            .collection_iter_advance(state, coll)
+            .map(|(_, k, v)| (k, v)),
+    )
+}
+
+/// The hidden keys of a lazy String Iterator (`make_string_iterator`), in
+/// [`Realm::str_iter_layout`] slot order.
+const STR_ITER_KEYS: [&str; 2] = [GEN_STR, GEN_IDX];
+
+/// The code point of the string `s` at WTF-8 byte offset `idx` as a fresh
+/// one-code-point string, and the offset past it; `None` at (or past) the end.
+fn string_code_point_at(realm: &mut Realm, s: NanBox, idx: usize) -> Option<(NanBox, usize)> {
+    let sh = Handle::from_raw(s.as_handle()?);
+    let rope = realm.string_rope(sh)?;
+    let flat;
+    let bytes = match rope.as_leaf_bytes() {
+        Some(b) => b,
+        None => {
+            flat = rope.materialize_bytes();
+            &flat[..]
+        }
+    };
+    if idx >= bytes.len() {
+        return None;
+    }
+    let (_, n) = crate::wtf8::decode_code_point(bytes, idx);
+    let one = crate::rope::Rope::from_bytes(&bytes[idx..idx + n]);
+    let v = NanBox::handle(realm.new_string_from_rope(one).to_raw());
+    Some((v, idx + n))
+}
+
+/// One step of a lazy String Iterator `h` over the string `s` (the body of
+/// its `next()` without the result object): the next code point, or `None`
+/// once done. The string is immutable, so a finished iterator stays finished.
+fn string_iter_step(realm: &mut Realm, h: Handle, s: NanBox) -> Option<NanBox> {
+    let idx = realm
+        .get_property(h, GEN_IDX)
+        .and_then(|n| n.as_number())
+        .unwrap_or(0.0) as usize;
+    let (v, next) = string_code_point_at(realm, s, idx)?;
+    realm.set_hidden_property(h, GEN_IDX, NanBox::number(next as f64));
+    Some(v)
 }
 
 /// One step of a snapshot-buffer iterator `h` over `buf` (a built-in
@@ -2975,6 +3086,14 @@ pub(crate) fn realm_builtin_iter_step(
         || realm.get_property(h, RSI_MATCHER).is_some()
     {
         return None;
+    }
+    if let Some(s) = realm.get_property(h, GEN_STR) {
+        let step = string_iter_step(realm, h, s);
+        if realm.str_iter_layout.is_none() {
+            realm.str_iter_layout =
+                HiddenLayout::learn(realm, h, STR_ITER_KEYS, &[GEN_COLL, GEN_BUF]);
+        }
+        return Some(step);
     }
     let buf = realm
         .get_property(h, GEN_BUF)

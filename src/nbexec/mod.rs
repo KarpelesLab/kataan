@@ -2278,6 +2278,11 @@ const WEAKREF_TARGET: &str = "\u{0}wrtarget";
 const FINREG_TAG: &str = "\u{0}finreg";
 const GEN_BUF: &str = "\u{0}gbuf";
 const GEN_IDX: &str = "\u{0}gidx";
+/// Hidden slot on a **lazy** String Iterator: the (flat) string it walks.
+/// `GEN_IDX` holds the cursor as a WTF-8 byte offset; each `next()` decodes
+/// one code point there, so opening the iterator copies nothing per
+/// character.
+const GEN_STR: &str = "\u{0}gstr";
 /// A generator's `return` value, surfaced once after its yields are exhausted.
 const GEN_RET: &str = "\u{0}gret";
 /// Hidden slots on a **live** Set/Map iterator (a spec-faithful iterator that
@@ -2753,7 +2758,7 @@ mod generator;
 mod intl_aliases;
 mod intl_fmt;
 mod iterator;
-pub(crate) use iterator::realm_builtin_iter_step;
+pub(crate) use iterator::{realm_builtin_entry_step, realm_builtin_iter_step};
 mod json;
 mod json_parse;
 mod method_dispatch;

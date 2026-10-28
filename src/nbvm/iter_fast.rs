@@ -169,6 +169,69 @@ fn can_open_walk(realm: &Realm, h: Handle) -> bool {
         Some(Some(n)) if n.as_handle() == Some(next_fn.to_raw()))
 }
 
+/// Whether destructuring a fresh two-element array (as a Map/Set `entries`
+/// step would make) with `[a, b]` runs no code and so can be skipped: its
+/// `@@iterator` (from the fresh array's prototype) is the intrinsic
+/// `%Array.prototype.values%`, the iterator's `next` is the intrinsic one,
+/// and no `return` is reachable for the close after the two steps — exactly
+/// what [`can_open`] and [`close`] would find for that array.
+fn fresh_pair_is_plain(realm: &Realm) -> bool {
+    let ai = realm.vm_array_iter();
+    let (Some(proto), Some(next_fn), Some(key), Some(array_proto)) = (
+        ai.iter_proto,
+        ai.next_fn,
+        ai.iter_key.as_deref(),
+        realm.fresh_array_proto(),
+    ) else {
+        return false;
+    };
+    let Some(Some(f)) = plain_lookup_cached(realm, SLOT_ITERATOR, array_proto, key) else {
+        return false;
+    };
+    if !f
+        .as_handle()
+        .is_some_and(|fh| ai.values_fns.iter().any(|x| x.to_raw() == fh))
+    {
+        return false;
+    }
+    if !matches!(plain_lookup_cached(realm, SLOT_NEXT, proto, "next"),
+        Some(Some(n)) if n.as_handle() == Some(next_fn.to_raw()))
+    {
+        return false;
+    }
+    match plain_lookup_cached(realm, SLOT_RETURN, proto, "return") {
+        Some(None) => true,
+        Some(Some(v)) => v.is_undefined() || v.is_null(),
+        None => false,
+    }
+}
+
+/// [`super::Op::IterNextEntry`]'s fused step: `Some(Some((key, value)))` for
+/// the next entry of a built-in Map/Set `entries` iterator, `Some(None)`
+/// once it is done (latching `done`), and `None` — having changed nothing —
+/// when the step cannot skip the `[key, value]` array (another iterator, a
+/// replaced `next`, an observable destructuring).
+pub(super) fn entry_step(
+    ctx: &mut Ctx,
+    regs: &mut [NanBox],
+    done: Reg,
+    iter: Reg,
+    next: Reg,
+) -> Option<Option<(NanBox, NanBox)>> {
+    let (it, nx) = (regs[iter as usize], regs[next as usize]);
+    if it.is_number() || regs[done as usize].as_boolean() == Some(true) {
+        return None;
+    }
+    if !fresh_pair_is_plain(&ctx.realm) {
+        return None;
+    }
+    let step = crate::nbexec::realm_builtin_entry_step(&mut ctx.realm, nx, it)?;
+    if step.is_none() {
+        regs[done as usize] = NanBox::boolean(true);
+    }
+    Some(step)
+}
+
 /// The array of a fast-mode iterator whose cursor is in `iter`.
 fn array_of(regs: &[NanBox], iter: Reg) -> Result<NanBox, VmError> {
     let arr = regs

@@ -214,6 +214,9 @@ pub struct Realm {
     /// The hidden-state layout of a snapshot-buffer built-in iterator (see
     /// `hidden_layout`), learned likewise.
     pub(crate) buf_iter_layout: Option<hidden_layout::HiddenLayout<3>>,
+    /// The hidden-state layout of a lazy String Iterator (see
+    /// `hidden_layout`), learned likewise.
+    pub(crate) str_iter_layout: Option<hidden_layout::HiddenLayout<2>>,
     /// Shared prototype-chain lookup memos (see
     /// `builtins_fast::shared_chain_lookup`), one per fixed lookup site.
     chain_lookups: core::cell::RefCell<alloc::vec::Vec<builtins_fast::ChainKeyCache>>,
@@ -655,6 +658,7 @@ impl Realm {
             key_ropes: core::cell::RefCell::new(None),
             coll_iter_layout: None,
             buf_iter_layout: None,
+            str_iter_layout: None,
             chain_lookups: core::cell::RefCell::new(alloc::vec::Vec::new()),
             sparse_array_lengths: alloc::collections::BTreeMap::new(),
             default_object_proto: None,
@@ -2199,6 +2203,13 @@ impl Realm {
             self.native_protos.insert(h.to_raw(), p);
         }
         h
+    }
+
+    /// The `[[Prototype]]` an array made now by [`new_array`](Self::new_array)
+    /// gets: the running realm's `%Array.prototype%`.
+    #[must_use]
+    pub(crate) fn fresh_array_proto(&self) -> Option<Handle> {
+        self.array_proto_intrinsic.or(self.root_array_proto)
     }
 
     /// Allocates a VM-held host environment cell (see [`Cell::Env`]).
