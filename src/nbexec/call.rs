@@ -2622,8 +2622,8 @@ impl Interp {
                 && !matches!(m.unpack(), Unpacked::Undefined)
                 && let Some(eh) = err.as_handle().map(Handle::from_raw)
             {
-                let s = self.coerce_to_string(m)?;
-                let msg = self.new_str(&s);
+                let b = self.coerce_to_string_bytes(m)?;
+                let msg = self.new_str_bytes(b);
                 self.realm.set_property(eh, "message", msg);
                 self.realm.mark_hidden(eh, "message");
             }

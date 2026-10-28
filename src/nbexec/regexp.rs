@@ -1602,10 +1602,11 @@ impl Interp {
             .as_handle()
             .map(Handle::from_raw)
             .is_some_and(|fh| self.is_callable(fh));
+        // The template as WTF-8: a lone surrogate in it must survive.
         let repl_str = if func_replace {
-            String::new()
+            Vec::new()
         } else {
-            self.coerce_to_string(replace)?
+            self.coerce_to_string_bytes(replace)?
         };
         let flags = self.regexp_read_flags(h)?;
         let global = flags.contains('g');
@@ -1733,7 +1734,10 @@ impl Interp {
                     )?;
                     let pos = pos.min(length);
                     if pos >= next_source_position {
-                        accumulated.extend_from_slice(&u16_slice(units, next_source_position, pos));
+                        crate::wtf8::append(
+                            &mut accumulated,
+                            &u16_slice(units, next_source_position, pos),
+                        );
                         crate::wtf8::append(&mut accumulated, &replacement);
                         next_source_position = pos + matched_units.len();
                         if accumulated.len() > crate::rope::MAX_STRING_LEN {
@@ -1783,7 +1787,10 @@ impl Interp {
             // If position >= next_source_position, append S[next..pos] then the
             // replacement and advance next to pos + m_len.
             if pos >= next_source_position {
-                accumulated.extend_from_slice(&u16_slice(units, next_source_position, pos));
+                crate::wtf8::append(
+                    &mut accumulated,
+                    &u16_slice(units, next_source_position, pos),
+                );
                 crate::wtf8::append(&mut accumulated, &replacement);
                 next_source_position = pos + m_len;
                 if accumulated.len() > crate::rope::MAX_STRING_LEN {
@@ -1793,7 +1800,10 @@ impl Interp {
             }
         }
         if next_source_position < length {
-            accumulated.extend_from_slice(&u16_slice_from(units, next_source_position));
+            crate::wtf8::append(
+                &mut accumulated,
+                &u16_slice_from(units, next_source_position),
+            );
         }
         Ok(self.new_str_bytes(accumulated))
     }
@@ -1806,7 +1816,7 @@ impl Interp {
         &mut self,
         func_replace: bool,
         replace: NanBox,
-        repl_str: &str,
+        repl_str: &[u8],
         matched_units: &[u16],
         units: &[u16],
         pos: usize,
@@ -1854,11 +1864,13 @@ impl Interp {
         position: usize,
         captures: &[Option<Vec<u8>>],
         named: NanBox,
-        replacement: &str,
+        replacement: &[u8],
     ) -> Result<Vec<u8>, ExecError> {
         let m_len = matched_units.len();
         let tail_pos = position + m_len;
-        let t: Vec<char> = replacement.chars().collect();
+        // Code points, not `char`s: the template may hold a lone surrogate.
+        let t: Vec<u32> = crate::wtf8::code_points(replacement).collect();
+        let is = |cp: u32, c: char| cp == c as u32;
         // WTF-8 bytes, not a `String`: `$&` and `$n` can expand to a lone
         // surrogate (`/./g` matches each half of an astral pair), which a
         // `String` cannot hold and would fold to U+FFFD.
@@ -1873,8 +1885,8 @@ impl Interp {
                 let m = self.new_str("Invalid string length");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }
-            if t[i] == '$' && i + 1 < t.len() {
-                let c = t[i + 1];
+            if is(t[i], '$') && i + 1 < t.len() {
+                let c = char::from_u32(t[i + 1]).unwrap_or('\u{FFFD}');
                 match c {
                     '$' => {
                         out.push(b'$');
@@ -1904,8 +1916,11 @@ impl Interp {
                             i += 1;
                             continue;
                         }
-                        if let Some(close) = t[i + 2..].iter().position(|&ch| ch == '>') {
-                            let name: String = t[i + 2..i + 2 + close].iter().collect();
+                        if let Some(close) = t[i + 2..].iter().position(|&ch| is(ch, '>')) {
+                            let name: String = t[i + 2..i + 2 + close]
+                                .iter()
+                                .map(|&cp| char::from_u32(cp).unwrap_or('\u{FFFD}'))
+                                .collect();
                             if let Some(nh) = named.as_handle().map(Handle::from_raw) {
                                 let v = self.read_member(nh, &name)?;
                                 if !matches!(v.unpack(), Unpacked::Undefined) {
@@ -1923,7 +1938,7 @@ impl Interp {
                     '0'..='9' => {
                         // `$n` or `$nn` (1..=99). Prefer two digits when valid.
                         let d1 = c as usize - '0' as usize;
-                        let two = if i + 2 < t.len() && t[i + 2].is_ascii_digit() {
+                        let two = if i + 2 < t.len() && (0x30..=0x39).contains(&t[i + 2]) {
                             Some(d1 * 10 + (t[i + 2] as usize - '0' as usize))
                         } else {
                             None
@@ -1954,7 +1969,11 @@ impl Interp {
                     _ => {}
                 }
             }
-            crate::wtf8::encode_code_point(t[i] as u32, &mut out);
+            // (`append`, so a literal low surrogate after a `$&` ending in a
+            // high one forms the pair.)
+            let mut lit = Vec::with_capacity(4);
+            crate::wtf8::encode_code_point(t[i], &mut lit);
+            crate::wtf8::append(&mut out, &lit);
             i += 1;
         }
         Ok(out)

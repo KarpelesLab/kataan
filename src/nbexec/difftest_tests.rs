@@ -129,3 +129,57 @@ fn strict_index_add_on_non_extensible_array_throws() {
         "TypeError,TypeError,TypeError,ok,TypeError|2000:2|3:false"
     );
 }
+
+/// Lone surrogates survive string builtins, and halves meeting at a seam
+/// join into one code point. `replace`/`replaceAll` with a string pattern,
+/// the host `join` (`Array.prototype.toString`), `String(v)`, `String.raw`,
+/// `Error` messages and `Error.prototype.toString` went through Rust
+/// `String`s and folded each lone half to U+FFFD; `padStart`/`padEnd` and
+/// RegExp `@@replace` concatenated without pairing (`[...s].length` was 2).
+#[test]
+fn lone_surrogates_survive_string_builtins() {
+    let src = r#"
+        var h = "\uD800", l = "\uDC00", q = h + "x" + l;
+        var hex = s => [...s].map(c => c.codePointAt(0).toString(16)).join(".");
+        [q.replaceAll("b", "$&"), q.replace("x", "[$&]"), q.replaceAll("x", () => h),
+         "\u{10000}".replace(l, "y"), q.replace(/x/g, "$`"), q.replace(/x/, h + "$'"),
+         [q].toString(), String([h, [h]]), String.raw({raw: [h, l]}, ""), new Error(h).message,
+         String(new Error(h)), h.padEnd(2, l), l.padStart(2, h)].map(hex).join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "d800.78.dc00 d800.5b.78.5d.dc00 d800.10000 d800.79 d800.10000 d800.10000.dc00 \
+         d800.78.dc00 d800.2c.d800 10000 d800 45.72.72.6f.72.3a.20.d800 10000 10000"
+    );
+}
+
+/// `Array.prototype.join` pairs a lone high and a lone low surrogate meeting
+/// at a seam (element/element, element/separator) into one code point.
+#[test]
+fn join_pairs_surrogate_halves_at_seams() {
+    let src = r#"
+        var h = "\uD800", l = "\uDC00";
+        var hex = s => [...s].map(c => c.codePointAt(0).toString(16)).join(".");
+        [[h, l].join(""), [h, l].join(h), [h + "a", l].join(h), [1, l].join(h),
+         [{toString() { return l; }}].join(h), new Int8Array(2).join(h)].map(hex).join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "10000 d800.10000 d800.61.10000 31.10000 dc00 30.d800.30"
+    );
+}
+
+/// A RegExp `searchValue` whose `@@replace` is undefined is a string pattern:
+/// ToString runs its (possibly user) `toString`, so `/./iyg` searches for
+/// `"/./giy"` (the canonical flags order), not for its literal source text.
+#[test]
+fn replace_tostrings_a_regexp_pattern_without_replace() {
+    let src = r#"
+        var r = /./iyg, r2 = /x/g;
+        Object.defineProperty(r, Symbol.replace, { value: undefined });
+        Object.defineProperty(r2, Symbol.replace, { value: undefined });
+        r2.toString = function () { return "Q"; };
+        ["a /./giy /./iyg a".replaceAll(r, "z"), "aQb".replace(r2, "z")].join("|")
+    "#;
+    assert_eq!(run(src), "a z /./iyg a|azb");
+}

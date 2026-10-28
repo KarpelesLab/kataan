@@ -455,8 +455,9 @@ impl Interp {
                 }
                 // Otherwise run the value through ToString (string hint), honoring a
                 // custom/inherited `toString`/`valueOf`/`@@toPrimitive`.
-                let s = self.coerce_to_string(arg(0))?;
-                NanBox::handle(self.realm.new_string(&s).to_raw())
+                // (As WTF-8, so a lone surrogate survives.)
+                let b = self.coerce_to_string_bytes(arg(0))?;
+                NanBox::handle(self.realm.new_string_wtf8(b).to_raw())
             }
             N_NUMBER => {
                 // `Number()` with no arguments is `+0`.
@@ -4010,25 +4011,29 @@ impl Interp {
                     return Err(self.type_error("Error.prototype.toString called on non-object"));
                 }
                 let name_v = self.read_member(h, "name")?;
+                // (WTF-8, so a lone surrogate in either part survives.)
                 let name = if matches!(name_v.unpack(), Unpacked::Undefined) {
-                    String::from("Error")
+                    b"Error".to_vec()
                 } else {
-                    self.coerce_to_string(name_v)?
+                    self.coerce_to_string_bytes(name_v)?
                 };
                 let msg_v = self.read_member(h, "message")?;
                 let msg = if matches!(msg_v.unpack(), Unpacked::Undefined) {
-                    String::new()
+                    Vec::new()
                 } else {
-                    self.coerce_to_string(msg_v)?
+                    self.coerce_to_string_bytes(msg_v)?
                 };
                 let s = if name.is_empty() {
                     msg
                 } else if msg.is_empty() {
                     name
                 } else {
-                    alloc::format!("{name}: {msg}")
+                    let mut s = name;
+                    s.extend_from_slice(b": ");
+                    s.extend_from_slice(&msg);
+                    s
                 };
-                self.new_str(&s)
+                self.new_str_bytes(s)
             }
             N_OBJ_PROTO_HASOWN => {
                 // ToPropertyKey(V) then ToObject(this) — the key coercion runs

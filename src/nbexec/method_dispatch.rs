@@ -1138,20 +1138,22 @@ impl Interp {
                 let len_v = self.read_member(rh, "length")?;
                 let lit_count = self.coerce_to_integer_or_infinity(len_v)?.max(0.0) as usize;
                 let subs = &args[1.min(args.len())..];
-                let mut out = String::new();
+                // WTF-8, joined with `wtf8::append`: lone surrogates survive and
+                // pair up across pieces.
+                let mut out = Vec::new();
                 for i in 0..lit_count {
                     let piece = self.read_member(rh, &alloc::format!("{i}"))?;
                     let bytes = self.coerce_to_string_bytes(piece)?;
-                    out.push_str(&crate::wtf8::to_string_lossy(&bytes));
+                    crate::wtf8::append(&mut out, &bytes);
                     if i + 1 == lit_count {
                         break;
                     }
                     if let Some(s) = subs.get(i) {
                         let sb = self.coerce_to_string_bytes(*s)?;
-                        out.push_str(&crate::wtf8::to_string_lossy(&sb));
+                        crate::wtf8::append(&mut out, &sb);
                     }
                 }
-                return Ok(Some(self.new_str(&out)));
+                return Ok(Some(self.new_str_bytes(out)));
             }
             _ => {}
         }
@@ -2432,140 +2434,8 @@ impl Interp {
                     parts.truncate(limit);
                     Some(NanBox::handle(self.realm.new_array(parts).to_raw()))
                 }
-                "replace" => {
-                    let s = crate::wtf8::to_string_lossy(bytes);
-                    // ToString the searchValue, propagating a throwing user
-                    // `toString` (the RegExp-argument form is not modeled here).
-                    let from = self.coerce_to_string(arg(0))?;
-                    let repl = arg(1);
-                    let is_fn = repl
-                        .as_handle()
-                        .is_some_and(|r| self.is_callable(Handle::from_raw(r)));
-                    if is_fn {
-                        match s.find(&from) {
-                            Some(pos) => {
-                                let m = self.new_str(&from);
-                                // The match position is a UTF-16 unit index.
-                                let off = NanBox::number(s[..pos].encode_utf16().count() as f64);
-                                let whole = self.new_str(&s);
-                                let r = self.call(repl, &[m, off, whole])?;
-                                // `ToString` the replacer result (custom `toString`/
-                                // `@@toPrimitive` runs; a throw propagates).
-                                let rs = self.coerce_to_string(r)?;
-                                let out =
-                                    alloc::format!("{}{}{}", &s[..pos], rs, &s[pos + from.len()..]);
-                                Some(self.new_str(&out))
-                            }
-                            None => Some(self.new_str(&s)),
-                        }
-                    } else {
-                        // A non-callable replaceValue is `ToString`'d (spec step): a
-                        // custom `toString`/`@@toPrimitive` runs and a throw
-                        // propagates, not "[object Object]".
-                        let to = self.coerce_to_string(repl)?;
-                        match s.find(&from) {
-                            Some(pos) => {
-                                let before = &s[..pos];
-                                let after = &s[pos + from.len()..];
-                                let mid = expand_dollar(&to, &from, before, after);
-                                Some(self.new_str(&alloc::format!("{before}{mid}{after}")))
-                            }
-                            None => Some(self.new_str(&s)),
-                        }
-                    }
-                }
-                "replaceAll" => {
-                    let s = crate::wtf8::to_string_lossy(bytes);
-                    let from = self.coerce_to_string(arg(0))?;
-                    let repl = arg(1);
-                    let is_fn = repl
-                        .as_handle()
-                        .is_some_and(|r| self.is_callable(Handle::from_raw(r)));
-                    if is_fn && from.is_empty() {
-                        // An empty search string matches at every UTF-16 boundary
-                        // `0..=length` (advanceBy = max(1, 0) = 1). The functional
-                        // replacer runs at each: emit `replacer("", pos, string)`,
-                        // then the next source char, then the next replacer, … so a
-                        // subject "ab" yields `f(0) a f(1) b f(2)` and an empty
-                        // subject yields a single `f(0)`.
-                        let whole = self.new_str(&s);
-                        let mut out = String::new();
-                        let mut off_units = 0usize;
-                        let empty = self.new_str("");
-                        let r = self.call(repl, &[empty, NanBox::number(0.0), whole])?;
-                        out.push_str(&self.coerce_to_string(r)?);
-                        for ch in s.chars() {
-                            out.push(ch);
-                            off_units += ch.len_utf16();
-                            let empty = self.new_str("");
-                            let off = NanBox::number(off_units as f64);
-                            let r = self.call(repl, &[empty, off, whole])?;
-                            out.push_str(&self.coerce_to_string(r)?);
-                        }
-                        Some(self.new_str(&out))
-                    } else if is_fn {
-                        let mut out = String::new();
-                        let mut last = 0;
-                        // P6: maintain a running UTF-16 unit count for the match
-                        // offset rather than re-encoding `s[..abs]` from the start on
-                        // every match (which is O(n²) across many matches). Each step
-                        // only counts the units of the gap `s[last..abs]`.
-                        let mut units_to_last = 0usize;
-                        while let Some(rel) = s[last..].find(&from) {
-                            let abs = last + rel;
-                            out.push_str(&s[last..abs]);
-                            let m = self.new_str(&from);
-                            // The match position is a UTF-16 unit index.
-                            let off_units = units_to_last + s[last..abs].encode_utf16().count();
-                            let off = NanBox::number(off_units as f64);
-                            let whole = self.new_str(&s);
-                            let r = self.call(repl, &[m, off, whole])?;
-                            // `ToString` the replacer result (a custom `toString`/
-                            // `@@toPrimitive` runs, a throw propagates).
-                            let rs = self.coerce_to_string(r)?;
-                            out.push_str(&rs);
-                            units_to_last = off_units + from.encode_utf16().count();
-                            last = abs + from.len();
-                        }
-                        out.push_str(&s[last..]);
-                        Some(self.new_str(&out))
-                    } else if from.is_empty() {
-                        // A non-callable replaceValue is `ToString`'d once (spec
-                        // step 6): a custom `toString`/`@@toPrimitive` runs and a
-                        // throw propagates, rather than rendering "[object Object]".
-                        let to = self.coerce_to_string(repl)?;
-                        // An empty search matches at every boundary `0..=length`, and
-                        // `GetSubstitution` still runs at each one — `$$`, `` $` ``
-                        // and `$'` are expanded against that position (`$&` is the
-                        // empty match). `str::replace` skipped all of that.
-                        let mut out = String::new();
-                        let mut idx = 0usize;
-                        loop {
-                            out.push_str(&expand_dollar(&to, "", &s[..idx], &s[idx..]));
-                            match s[idx..].chars().next() {
-                                Some(ch) => {
-                                    out.push(ch);
-                                    idx += ch.len_utf8();
-                                }
-                                None => break,
-                            }
-                        }
-                        Some(self.new_str(&out))
-                    } else {
-                        let to = self.coerce_to_string(repl)?;
-                        let mut out = String::new();
-                        let mut last = 0;
-                        while let Some(rel) = s[last..].find(&from) {
-                            let abs = last + rel;
-                            out.push_str(&s[last..abs]);
-                            let after = &s[abs + from.len()..];
-                            out.push_str(&expand_dollar(&to, &from, &s[..abs], after));
-                            last = abs + from.len();
-                        }
-                        out.push_str(&s[last..]);
-                        Some(self.new_str(&out))
-                    }
-                }
+                "replace" => Some(self.string_replace_by_string(bytes, arg(0), arg(1), false)?),
+                "replaceAll" => Some(self.string_replace_by_string(bytes, arg(0), arg(1), true)?),
                 "at" => {
                     let i = self.coerce_to_integer_or_infinity(arg(0))?;
                     // UTF-16-indexed with negative-from-end support.
@@ -3935,28 +3805,42 @@ impl Interp {
                     // TypeError); `undefined` (or `toString`) defaults to ",".
                     let sep =
                         if method == "toString" || matches!(arg(0).unpack(), Unpacked::Undefined) {
-                            String::from(",")
+                            alloc::vec![b',']
                         } else {
-                            self.coerce_to_string(arg(0))?
+                            self.arg_string_bytes_fallible(arg(0))?
                         };
+                    // WTF-8 throughout: a lone surrogate in the separator or an
+                    // element survives, and `wtf8::append` pairs halves at a seam.
+                    let join_parts = |parts: Vec<Vec<u8>>| {
+                        let mut out = Vec::new();
+                        for (i, p) in parts.iter().enumerate() {
+                            if i > 0 {
+                                crate::wtf8::append(&mut out, &sep);
+                            }
+                            crate::wtf8::append(&mut out, p);
+                        }
+                        out
+                    };
                     // Typed array: `len` is cached, the separator's ToString may have
                     // detached/shrunk the buffer, after which each element reads as
                     // `undefined` → rendered empty. Re-read live by index.
                     if self.realm.typed_kind(handle).is_some() {
                         let len = elems.len();
-                        let mut parts: Vec<String> = Vec::with_capacity(len);
+                        let mut parts: Vec<Vec<u8>> = Vec::with_capacity(len);
                         for i in 0..len {
                             let e = self
                                 .realm
                                 .typed_get(handle, i)
                                 .unwrap_or_else(NanBox::undefined);
                             parts.push(match e.unpack() {
-                                Unpacked::Null | Unpacked::Undefined => String::new(),
-                                Unpacked::Number(n) => crate::realm::js_number_string(n),
-                                _ => self.coerce_to_string(e)?,
+                                Unpacked::Null | Unpacked::Undefined => Vec::new(),
+                                Unpacked::Number(n) => {
+                                    crate::realm::js_number_string(n).into_bytes()
+                                }
+                                _ => self.arg_string_bytes_fallible(e)?,
                             });
                         }
-                        return Ok(Some(self.new_str(&parts.join(&sep))));
+                        return Ok(Some(self.new_str_bytes(join_parts(parts))));
                     }
                     // `null`/`undefined` render empty; an object element is run
                     // through ToString (so a custom `toString` is honored). The
@@ -3968,11 +3852,12 @@ impl Interp {
                     // rendering empty. `sep` was already ToString'd above (spec order).
                     // The result is assembled in one WTF-8 buffer: a number's
                     // digits and a string's bytes (lone surrogates intact) are
-                    // appended in place, with no per-element `String`.
+                    // appended in place, with no per-element `String`; a seam
+                    // between a lone high and a lone low surrogate is paired.
                     let mut out: Vec<u8> = Vec::new();
                     for (k, dense) in elems.iter().enumerate() {
                         if k > 0 {
-                            out.extend_from_slice(sep.as_bytes());
+                            crate::wtf8::append(&mut out, &sep);
                         }
                         let e = if precise_array {
                             self.read_member(handle, &alloc::format!("{k}"))?
@@ -3988,14 +3873,18 @@ impl Interp {
                                 crate::realm::builtins_fast::push_number_bytes(&mut out, n);
                             }
                             Unpacked::Handle(raw)
-                                if self.realm.typeof_is_string(Handle::from_raw(raw))
+                                if crate::wtf8::trailing_high_surrogate(&out).is_none()
+                                    && self.realm.typeof_is_string(Handle::from_raw(raw))
                                     && self
                                         .realm
                                         .append_string_bytes(Handle::from_raw(raw), &mut out) => {}
                             // `ToString(element)` — a Symbol element has no string
                             // conversion and throws a TypeError (the raw display
                             // string would render `Symbol(x)` instead).
-                            _ => out.extend_from_slice(self.coerce_to_string(e)?.as_bytes()),
+                            _ => {
+                                let b = self.arg_string_bytes_fallible(e)?;
+                                crate::wtf8::append(&mut out, &b);
+                            }
                         }
                     }
                     return Ok(Some(self.new_str_bytes(out)));

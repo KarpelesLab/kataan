@@ -6631,21 +6631,10 @@ impl Interp {
     /// (its `@@toPrimitive`/`toString`/`valueOf`, which may throw); a Symbol is a
     /// TypeError. A surrogate-bearing string value is preserved losslessly.
     fn arg_string_bytes_fallible(&mut self, v: NanBox) -> Result<alloc::vec::Vec<u8>, ExecError> {
-        if let Some(raw) = v.as_handle()
-            && let Some(b) = self.realm.string_bytes(Handle::from_raw(raw))
-        {
-            return Ok(b);
-        }
-        let prim = self.coerce_primitive(v, "string")?;
-        if let Some(h) = prim.as_handle().map(Handle::from_raw) {
-            if self.realm.symbol_at(h).is_some() {
-                return Err(self.type_error("Cannot convert a Symbol value to a string"));
-            }
-            if let Some(b) = self.realm.string_bytes(h) {
-                return Ok(b);
-            }
-        }
-        Ok(self.realm.to_display_string(prim).into_bytes())
+        // `coerce_primitive` returns some exotic objects (a RegExp, for one)
+        // as-is, whose display string is not their `toString`, so the full
+        // ToString runs here.
+        self.coerce_to_string_bytes(v)
     }
 }
 
@@ -7304,14 +7293,16 @@ pub(crate) fn pad_units(s: &[u8], target: usize, pad: &[u8], at_start: bool) -> 
         idx += 1;
     }
     let filler = crate::wtf8::from_utf16(&units);
-    let mut out = Vec::with_capacity(filler.len() + s.len());
-    if at_start {
-        out.extend_from_slice(&filler);
-        out.extend_from_slice(s);
+    // `wtf8::append` joins a lone high surrogate at the seam with a lone low
+    // one into a single code point, as string concatenation does.
+    let (first, second) = if at_start {
+        (&filler[..], s)
     } else {
-        out.extend_from_slice(s);
-        out.extend_from_slice(&filler);
-    }
+        (s, &filler[..])
+    };
+    let mut out = Vec::with_capacity(filler.len() + s.len());
+    out.extend_from_slice(first);
+    crate::wtf8::append(&mut out, second);
     out
 }
 
@@ -10262,33 +10253,113 @@ fn canonical_numeric_index(key: &str) -> Option<f64> {
     (crate::realm::js_number_string(n) == key).then_some(n)
 }
 
-/// A static (non-computed) property key as a string.
-/// Expands `$`-patterns in a string-`replace` template (no capture groups, so
-/// `$1`…`$9` stay literal): `$&` → match, `` $` `` → prefix, `$'` → suffix,
-/// `$$` → `$`.
-fn expand_dollar(template: &str, m: &str, before: &str, after: &str) -> String {
-    let chars: Vec<char> = template.chars().collect();
-    let mut out = String::new();
+/// GetSubstitution for a string pattern (no capture groups, so `$1`…`$99`
+/// and `$<` stay literal), on UTF-16 units: `$&` is the match, `` $` `` the
+/// text before `pos`, `$'` the text after the match, `$$` a `$`.
+fn get_substitution_units(template: &[u16], s: &[u16], pos: usize, match_len: usize) -> Vec<u16> {
+    const DOLLAR: u16 = b'$' as u16;
+    let end = (pos + match_len).min(s.len());
+    let mut out = Vec::with_capacity(template.len());
     let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '$'
-            && i + 1 < chars.len()
-            && let Some(rep) = match chars[i + 1] {
-                '$' => Some("$"),
-                '&' => Some(m),
-                '`' => Some(before),
-                '\'' => Some(after),
+    while i < template.len() {
+        if template[i] == DOLLAR && i + 1 < template.len() {
+            let rep: Option<&[u16]> = match template[i + 1] {
+                0x24 => Some(&[DOLLAR]),
+                0x26 => Some(&s[pos..end]),
+                0x60 => Some(&s[..pos]),
+                0x27 => Some(&s[end..]),
                 _ => None,
+            };
+            if let Some(rep) = rep {
+                out.extend_from_slice(rep);
+                i += 2;
+                continue;
             }
-        {
-            out.push_str(rep);
-            i += 2;
-            continue;
         }
-        out.push(chars[i]);
+        out.push(template[i]);
         i += 1;
     }
     out
+}
+
+/// The first index `>= from` at which `needle` occurs in `hay` (StringIndexOf
+/// over UTF-16 units; an empty needle matches at `from` itself).
+fn units_index_of(hay: &[u16], needle: &[u16], from: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return (from <= hay.len()).then_some(from);
+    }
+    if needle.len() > hay.len() {
+        return None;
+    }
+    (from..=hay.len() - needle.len()).find(|&i| hay[i..i + needle.len()] == *needle)
+}
+
+impl Interp {
+    /// `String.prototype.replace` / `replaceAll` with a non-RegExp pattern on
+    /// the string `bytes`: ToString(searchValue), then the replacer (called
+    /// with the search string, the UTF-16 position and the whole string, its
+    /// result ToString'd) or the ToString'd template's GetSubstitution. It
+    /// works on UTF-16 units throughout, so lone surrogates in the subject,
+    /// pattern or replacement survive (and a lone low surrogate can match the
+    /// second half of a pair), and the pieces rejoin into well-formed pairs.
+    /// `replaceAll` collects every match first (advancing by at least one
+    /// unit past an empty pattern), as the spec does.
+    pub(crate) fn string_replace_by_string(
+        &mut self,
+        bytes: &[u8],
+        search: NanBox,
+        repl: NanBox,
+        all: bool,
+    ) -> Result<NanBox, ExecError> {
+        let search_b = self.arg_string_bytes_fallible(search)?;
+        let is_fn = repl
+            .as_handle()
+            .is_some_and(|r| self.is_callable(Handle::from_raw(r)));
+        let template: Vec<u16> = if is_fn {
+            Vec::new()
+        } else {
+            crate::wtf8::utf16_units(&self.arg_string_bytes_fallible(repl)?).collect()
+        };
+        let s: Vec<u16> = crate::wtf8::utf16_units(bytes).collect();
+        let pat: Vec<u16> = crate::wtf8::utf16_units(&search_b).collect();
+        let mut positions = Vec::new();
+        let mut at = units_index_of(&s, &pat, 0);
+        while let Some(p) = at {
+            positions.push(p);
+            if !all {
+                break;
+            }
+            at = units_index_of(&s, &pat, p + pat.len().max(1));
+        }
+        if positions.is_empty() {
+            return Ok(self.new_str_bytes(bytes.to_vec()));
+        }
+        let (whole, matched) = if is_fn {
+            (
+                self.new_str_bytes(bytes.to_vec()),
+                self.new_str_bytes(search_b.clone()),
+            )
+        } else {
+            (NanBox::undefined(), NanBox::undefined())
+        };
+        let mut out: Vec<u16> = Vec::with_capacity(s.len());
+        let mut end_of_last = 0;
+        for p in positions {
+            out.extend_from_slice(&s[end_of_last.min(p)..p]);
+            if is_fn {
+                let r = self.call(repl, &[matched, NanBox::number(p as f64), whole])?;
+                let rb = self.arg_string_bytes_fallible(r)?;
+                out.extend(crate::wtf8::utf16_units(&rb));
+            } else {
+                out.extend(get_substitution_units(&template, &s, p, pat.len()));
+            }
+            end_of_last = p + pat.len();
+        }
+        if end_of_last < s.len() {
+            out.extend_from_slice(&s[end_of_last..]);
+        }
+        Ok(self.new_str_bytes(crate::wtf8::from_utf16(&out)))
+    }
 }
 
 #[cfg(test)]

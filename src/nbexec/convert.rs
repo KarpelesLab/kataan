@@ -371,14 +371,26 @@ impl Interp {
     }
 
     /// Like [`Self::coerce_to_string`] but returns **WTF-8 bytes**, preserving
-    /// lone surrogates when `v` is already a string. Other kinds (numbers,
-    /// objects via `toString`) never carry surrogates, so their lossy `String`
-    /// form is byte-identical to its UTF-8.
+    /// lone surrogates in a string, or in the string an object's ToPrimitive
+    /// returns (`[lone]` → its `join`). Numbers and the other primitives never
+    /// carry surrogates.
     pub(crate) fn coerce_to_string_bytes(&mut self, v: NanBox) -> Result<Vec<u8>, ExecError> {
-        if let Some(raw) = v.as_handle()
-            && let Some(bytes) = self.realm.string_bytes(Handle::from_raw(raw))
-        {
-            return Ok(bytes);
+        if let Some(raw) = v.as_handle() {
+            let h = Handle::from_raw(raw);
+            if let Some(bytes) = self.realm.string_bytes(h) {
+                return Ok(bytes);
+            }
+            if self.realm.symbol_at(h).is_none() && self.is_object_value(v) {
+                let p = if let Some(r) = self.symbol_to_primitive(v, "string")? {
+                    r
+                } else {
+                    self.ordinary_to_primitive(v, "string")?
+                };
+                // `p` is a primitive: its string bytes, or the Symbol TypeError.
+                if !self.is_object_value(p) {
+                    return self.coerce_to_string_bytes(p);
+                }
+            }
         }
         Ok(self.coerce_to_string(v)?.into_bytes())
     }
