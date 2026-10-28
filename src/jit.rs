@@ -2782,6 +2782,10 @@ pub(crate) struct JitLayout {
     /// Slot-relative offset of a `Cell::Array`'s element `Vec` length (the dense
     /// bound for the inline element GET/SET bounds check).
     pub off_arr_len: i32,
+    /// Slot-relative offset of a `Cell::Array`'s side-state flag byte
+    /// (`crate::cell::ArrayElems`): non-zero routes an element access to the
+    /// helper.
+    pub off_arr_side: i32,
     /// Slot-relative offset of the object's `frozen: bool` (inline SET writability
     /// gate: a non-zero byte routes the store to the helper).
     pub off_frozen: i32,
@@ -2830,6 +2834,7 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
             // ptr / len are the generic `Vec<NanBox>` offsets within that Vec.
             off_arr_ptr: to_i32(cell_base + cell.array_vec_off + obj.vec_ptr_off),
             off_arr_len: to_i32(cell_base + cell.array_vec_off + obj.vec_len_off),
+            off_arr_side: to_i32(cell_base + cell.array_side_off),
             // `frozen` is an `Object` field, relative to the Object base.
             off_frozen: to_i32(obj_base + obj.frozen_off),
             props: props::PropsLayout::new(&slot, cell_base, obj_base, &obj),
@@ -4962,7 +4967,6 @@ impl JitFunction {
         let strict_eq_helper = helpers.strict_eq as usize as u64;
         let truthy_helper = helpers.truthy as usize as u64;
         let call_native_helper = helpers.call_native as usize as u64;
-        let arena_helper = helpers.arena as usize as u64;
         let exec_op_helper = helpers.exec_op as usize as u64;
         let backedge_helper = helpers.backedge as usize as u64;
         let push_handler_helper = helpers.push_handler as usize as u64;
@@ -5147,7 +5151,7 @@ impl JitFunction {
         // The receiver walk shared by the inline heap fast paths: from the handle in
         // `rax`, guard handle-ness / arena bounds / slot occupancy / generation and
         // leave `rcx = &Slot` (`r10` = arena base, `rdx` = arena len). Any miss jumps
-        // to `$miss`. Needs `jit_arena` to have just been called (rax:rdx).
+        // to `$miss`. Needs the arena just loaded (`p_load_arena`: rax:rdx).
         macro_rules! walk_to_slot {
             ($recv:expr, $miss:expr) => {{
                 a.mov_r10_rax(); // r10 = arena base
@@ -5170,17 +5174,6 @@ impl JitFunction {
                 a.jne($miss);
                 a.cmp_word_at_rcx_r8w(layout.off_slot_gen);
                 a.jne($miss);
-            }};
-        }
-        // `jit_arena(ctx, recv, mode)` → rax:rdx = arena base:len (len 0 when the
-        // receiver does not qualify for this inline path, so the walk misses).
-        macro_rules! call_arena {
-            ($recv:expr, $mode:expr) => {{
-                a.mov_rdi_r15();
-                a.load_argreg(1, disp($recv));
-                a.movabs_argreg(2, $mode as i64);
-                a.movabs_rax(arena_helper as i64);
-                a.call_rax();
             }};
         }
         // An exact non-negative integer index in `reg` → `rax`, else `$miss`.
@@ -5407,10 +5400,11 @@ impl JitFunction {
                     }
                     let slow = a.new_label();
                     let done = a.new_label();
-                    call_arena!(arr, ARENA_ELEM_GET);
+                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
                     walk_to_slot!(arr, slow);
                     a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
                     a.jne(slow);
+                    a.p_array_plain(&layout, helpers.call_layout.realm, false, slow);
                     int_index!(index, slow);
                     a.mov_r8_at_rcx(layout.off_arr_len);
                     a.cmp_rax_r8();
@@ -5442,10 +5436,11 @@ impl JitFunction {
                     a.and_rax_r11();
                     a.cmp_rax_r11();
                     a.je(slow); // a handle value needs the write barrier
-                    call_arena!(arr, ARENA_ELEM_SET);
+                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
                     walk_to_slot!(arr, slow);
                     a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
                     a.jne(slow);
+                    a.p_array_plain(&layout, helpers.call_layout.realm, true, slow);
                     int_index!(index, slow);
                     a.mov_r8_at_rcx(layout.off_arr_len);
                     a.cmp_rax_r8();
@@ -5625,10 +5620,11 @@ impl JitFunction {
                     // integer in `[0, dense_len)`, and — matching the interpreter's
                     // `vm_array_index_get` — bail on a hole (the helper walks the
                     // prototype chain). Everything else → `jit_helper_get_elem`.
-                    call_arena!(obj, ARENA_ELEM_GET);
+                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
                     walk_to_slot!(obj, helper);
                     a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
                     a.jne(helper);
+                    a.p_array_plain(&layout, helpers.call_layout.realm, false, helper);
                     int_index!(index, helper);
                     a.mov_r8_at_rcx(layout.off_arr_len);
                     a.cmp_rax_r8();
@@ -5665,13 +5661,14 @@ impl JitFunction {
                     // ===== inline dense-array element SET fast path =====
                     // In place only when identical to `vm_set_elem`: a store the
                     // write barrier has nothing to do for (`p_barrier_check`),
-                    // `jit_arena` in `ARENA_ELEM_SET` mode (plain,
-                    // not frozen/sealed, no per-index override, within
+                    // an array without side-table state (`p_array_plain`: not
+                    // frozen/sealed, no per-index override, within
                     // `max_array_len`), and an in-bounds exact integer index.
-                    call_arena!(obj, ARENA_ELEM_SET);
+                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
                     walk_to_slot!(obj, helper);
                     a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
                     a.jne(helper);
+                    a.p_array_plain(&layout, helpers.call_layout.realm, true, helper);
                     a.load_rax(disp(val));
                     a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
                     int_index!(index, helper);
@@ -5707,11 +5704,12 @@ impl JitFunction {
                     let done = a.new_label();
                     // ===== inline dense-array `.length` fast path =====
                     // Only for a receiver whose spec `.length` provably equals the
-                    // dense element count (`jit_arena` in `ARENA_ELEM_GET` mode); else the helper.
-                    call_arena!(arr, ARENA_ELEM_GET);
+                    // dense element count (`p_array_plain`); else the helper.
+                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
                     walk_to_slot!(arr, helper);
                     a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
                     a.jne(helper);
+                    a.p_array_plain(&layout, helpers.call_layout.realm, false, helper);
                     a.mov_rax_at_rcx(layout.off_arr_len);
                     a.cvtsi2sd_xmm0_rax();
                     a.movsd_mem_xmm0(disp(dst));

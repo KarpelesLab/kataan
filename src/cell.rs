@@ -239,7 +239,7 @@ pub enum Cell {
     /// A string value (rope-backed for O(1) concatenation).
     Str(Rope),
     /// A dense array of element values.
-    Array(Vec<NanBox>),
+    Array(ArrayElems),
     /// Contiguous raw bytes — the backing store of an `ArrayBuffer` (and thus of
     /// the typed-array / `DataView` views over it). One byte per byte (no NaN-box
     /// blow-up); may wrap external memory zero-copy. Holds no handles.
@@ -389,6 +389,75 @@ pub enum Cell {
     },
 }
 
+/// A [`Cell::Array`]'s elements (it dereferences to the `Vec`), plus a flag
+/// recording whether the array has ever had state in one of the realm's
+/// per-array side tables — named properties or per-index attributes (an
+/// auxiliary object), a sparse logical length, or a frozen/sealed mark. While
+/// the flag is clear, the array's `length` is its element count and every
+/// in-bounds element is a plain writable data property, which is what
+/// compiled code's inline element paths test (one byte, instead of probing the
+/// side tables). Sticky: a stale `true` only sends an access to the helper.
+#[repr(C)] // compiled code reads `elems` and `side` at probed offsets
+#[derive(Default, Clone, PartialEq, Debug)]
+pub struct ArrayElems {
+    elems: Vec<NanBox>,
+    side: bool,
+}
+
+impl ArrayElems {
+    /// Whether the array has (or once had) side-table state.
+    #[must_use]
+    pub fn has_side_state(&self) -> bool {
+        self.side
+    }
+
+    /// Records that the array has side-table state.
+    pub fn mark_side_state(&mut self) {
+        self.side = true;
+    }
+
+    /// The elements, by value.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<NanBox> {
+        self.elems
+    }
+}
+
+impl From<Vec<NanBox>> for ArrayElems {
+    fn from(elems: Vec<NanBox>) -> Self {
+        Self { elems, side: false }
+    }
+}
+
+impl core::ops::Deref for ArrayElems {
+    type Target = Vec<NanBox>;
+    fn deref(&self) -> &Vec<NanBox> {
+        &self.elems
+    }
+}
+
+impl core::ops::DerefMut for ArrayElems {
+    fn deref_mut(&mut self) -> &mut Vec<NanBox> {
+        &mut self.elems
+    }
+}
+
+impl<'a> IntoIterator for &'a ArrayElems {
+    type Item = &'a NanBox;
+    type IntoIter = core::slice::Iter<'a, NanBox>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.elems.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut ArrayElems {
+    type Item = &'a mut NanBox;
+    type IntoIter = core::slice::IterMut<'a, NanBox>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.elems.iter_mut()
+    }
+}
+
 /// Runtime-probed byte layout of the `Cell::Object` variant for the generic-JIT
 /// inline property-get fast path. Derived by pointer arithmetic on a real
 /// `Cell::Object` instance (never hand-baked); verified by the JIT layout test.
@@ -404,6 +473,9 @@ pub(crate) struct CellLayout {
     pub array_disc: u8,
     /// Byte offset of the inner `Vec<NanBox>` element store within a `Cell::Array`.
     pub array_vec_off: usize,
+    /// Byte offset of the array's side-state flag ([`ArrayElems`]) within a
+    /// `Cell::Array`.
+    pub array_side_off: usize,
 }
 
 /// The byte layout of a `Cell::VmFunction`, for compiled code that identifies a
@@ -446,18 +518,21 @@ pub(crate) fn jit_cell_layout() -> CellLayout {
     };
     // A populated `Cell::Array` (a few elements so the inner `Vec` is a real,
     // heap-backed allocation) to probe the Array discriminant + payload offset.
-    let arr = Cell::Array(alloc::vec![
+    let arr = Cell::Array(ArrayElems::from(alloc::vec![
         NanBox::number(1.0),
         NanBox::number(2.0),
         NanBox::number(3.0)
-    ]);
+    ]));
     let arr_base = core::ptr::addr_of!(arr) as usize;
     // SAFETY: `arr` is a live, initialized `Cell`; its repr(u8) tag byte is in
     // bounds and always a valid `u8`.
     #[allow(unsafe_code)]
     let array_disc = unsafe { *(arr_base as *const u8) };
-    let array_vec_off = match &arr {
-        Cell::Array(v) => core::ptr::addr_of!(*v) as usize - arr_base,
+    let (array_vec_off, array_side_off) = match &arr {
+        Cell::Array(v) => (
+            core::ptr::addr_of!(v.elems) as usize - arr_base,
+            core::ptr::addr_of!(v.side) as usize - arr_base,
+        ),
         _ => unreachable!("just built a Cell::Array"),
     };
     CellLayout {
@@ -465,6 +540,7 @@ pub(crate) fn jit_cell_layout() -> CellLayout {
         object_off,
         array_disc,
         array_vec_off,
+        array_side_off,
     }
 }
 
@@ -891,7 +967,7 @@ mod tests {
         assert_eq!(s.as_str().map(Rope::materialize).as_deref(), Some("hi"));
         assert_eq!(s.type_of(), "string");
 
-        let a = Cell::Array(alloc::vec![NanBox::number(1.0), NanBox::number(2.0)]);
+        let a = Cell::Array(alloc::vec![NanBox::number(1.0), NanBox::number(2.0)].into());
         assert_eq!(a.as_array().map(<[_]>::len), Some(2));
         assert_eq!(a.type_of(), "object");
     }
@@ -945,7 +1021,9 @@ mod tests {
         let mut mid = Object::new(Rc::clone(&root_shape));
         mid.set("leaf", NanBox::handle(leaf.to_raw()));
         let mid_h = heap.alloc(Cell::Object(mid));
-        let arr = heap.alloc(Cell::Array(alloc::vec![NanBox::handle(mid_h.to_raw())]));
+        let arr = heap.alloc(Cell::Array(
+            alloc::vec![NanBox::handle(mid_h.to_raw())].into(),
+        ));
         let _garbage = heap.alloc(Cell::Str(Rope::from("unreferenced")));
         assert_eq!(heap.len(), 4);
 

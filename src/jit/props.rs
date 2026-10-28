@@ -70,6 +70,8 @@ pub(crate) struct PropsLayout {
     pub rc_strong: i32,
     /// `Realm`-relative offset of `object_dictionary_threshold`.
     pub dict_threshold: i32,
+    /// `Realm`-relative offset of `max_array_len`.
+    pub max_array_len: i32,
 }
 
 impl PropsLayout {
@@ -92,6 +94,8 @@ impl PropsLayout {
             rc_strong,
             dict_threshold: i(core::mem::offset_of!(crate::realm::Realm, limits)
                 + core::mem::offset_of!(crate::limits::Limits, object_dictionary_threshold)),
+            max_array_len: i(core::mem::offset_of!(crate::realm::Realm, limits)
+                + core::mem::offset_of!(crate::limits::Limits, max_array_len)),
             marking: i(crate::realm::Realm::jit_marking_offset()),
             off_slot_age: i(slot.age_off),
             vmfn_disc,
@@ -681,6 +685,24 @@ impl X64Assembler {
         self.p_inc32_mem(r::R11, l.cache_hits_off);
     }
 
+    /// For the array whose heap slot is `rcx`: to `miss` unless it has no
+    /// side-table state (`crate::cell::ArrayElems`) — its `length` is its
+    /// element count and its in-bounds elements are plain writable data
+    /// properties — and, for a store (`set`), its length is within
+    /// `max_array_len`. What `Realm::jit_array_len_is_dense` (and, for a store,
+    /// `Realm::jit_array_unrestricted`) decide, from the cell alone. Clobbers
+    /// `r8`, `r11`.
+    pub(crate) fn p_array_plain(&mut self, l: &JitLayout, realm_off: i32, set: bool, miss: Label) {
+        self.cmp_byte_at_rcx_imm(l.off_arr_side, 0);
+        self.jne(miss);
+        if set {
+            self.g_load(r::R11, r::R15, realm_off);
+            self.g_load(r::R8, r::RCX, l.off_arr_len);
+            self.g_cmp_mem(r::R8, r::R11, l.props.max_array_len);
+            self.g_jcc(cc::A, miss);
+        }
+    }
+
     /// `inc dword [base+disp32]` (`base` neither `rsp` nor `r12`).
     fn p_inc32_mem(&mut self, base: u8, disp: i32) {
         debug_assert!(base & 7 != 4, "no SIB form");
@@ -1084,6 +1106,9 @@ mod tests {
         let f = realm.new_vm_function(7, alloc::vec![NanBox::undefined(), NanBox::number(2.0)]);
         realm.add_jit_flags(p, crate::object::JIT_FLAG_NO_INLINE_SET);
         realm.define_accessor(p, "g", NanBox::undefined(), NanBox::undefined());
+        let arr = realm.new_array(alloc::vec![NanBox::number(1.0)]);
+        let farr = realm.new_array(alloc::vec![NanBox::number(1.0)]);
+        realm.freeze_object(farr);
         let (base, len) = realm.jit_arena_slots();
         let rp = core::ptr::addr_of!(realm).cast::<u8>();
         // SAFETY: reads at probed offsets inside the live realm, its heap's slot
@@ -1141,6 +1166,13 @@ mod tests {
                 .offset(isize::try_from(l.rc_strong).unwrap())
                 .cast::<usize>();
             assert_eq!(strong, std::rc::Rc::strong_count(&oshape));
+            assert_eq!(*field(arr, jl.off_arr_side), 0);
+            assert_eq!(*field(farr, jl.off_arr_side), 1);
+            assert_eq!(
+                *rp.add(usize::try_from(l.max_array_len).unwrap())
+                    .cast::<usize>(),
+                realm.limits.max_array_len
+            );
             assert_eq!(*field(o, l.off_extensible), 1);
             assert_eq!(*field(o, l.off_sealed), 0);
             assert_eq!(*field(o, jl.off_slots_len).cast::<u32>(), 1);

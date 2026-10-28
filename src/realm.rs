@@ -1137,7 +1137,27 @@ impl Realm {
         }
         let obj = self.new_object();
         self.aux_props.insert(handle.to_raw(), obj);
+        self.mark_array_side_state(handle);
         obj
+    }
+
+    /// Records on the array at `handle` (no-op for any other cell) that it now
+    /// has side-table state (see [`crate::cell::ArrayElems`]): called wherever
+    /// an array gains an auxiliary object, a sparse length, or a frozen/sealed
+    /// mark.
+    fn mark_array_side_state(&mut self, handle: Handle) {
+        if let Some(Cell::Array(a)) = self.heap.get_mut(handle) {
+            a.mark_side_state();
+        }
+    }
+
+    /// Whether the array at `handle` has never had side-table state: its
+    /// `length` is its dense element count and its in-bounds elements are plain
+    /// data properties. `false` for any other cell.
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn array_is_side_free(&self, handle: Handle) -> bool {
+        matches!(self.heap.get(handle), Some(Cell::Array(a)) if !a.has_side_state())
     }
 
     /// The `.prototype` object for the constructor function with id `func_id`,
@@ -2031,7 +2051,7 @@ impl Realm {
 
     /// Allocates an array of `elements` in the heap and returns its handle.
     pub fn new_array(&mut self, elements: Vec<NanBox>) -> Handle {
-        let h = self.heap.alloc(Cell::Array(elements));
+        let h = self.heap.alloc(Cell::Array(elements.into()));
         // An array created while a `$262.createRealm()` realm is running belongs to
         // *that* realm: record its `%Array.prototype%` explicitly, since the derived
         // default (`object_proto`) is the first realm's. No-op in the single-realm
@@ -3489,6 +3509,7 @@ impl Realm {
         // An array carries no inline object part — track frozen-ness aside. Frozen
         // implies sealed and non-extensible.
         if self.heap.get(handle).and_then(Cell::as_array).is_some() {
+            self.mark_array_side_state(handle);
             self.frozen_arrays.insert(handle.to_raw());
             self.sealed_arrays.insert(handle.to_raw());
             self.non_extensible_arrays.insert(handle.to_raw());
@@ -3910,6 +3931,9 @@ impl Realm {
                 self.sparse_array_lengths.insert(raw, cur.max(index + 1));
             }
         }
+        if index >= cap {
+            self.mark_array_side_state(handle);
+        }
     }
 
     /// Sets an array's `length` (`arr.length = n`): truncates if smaller, pads
@@ -3952,6 +3976,9 @@ impl Realm {
         };
         if !is_array {
             return false;
+        }
+        if len > cap {
+            self.mark_array_side_state(handle);
         }
         // On a shrink, delete every *sparse* element (an integer-index named
         // property stored past the dense cap) whose index is >= the new length.
@@ -4724,6 +4751,7 @@ impl Realm {
     /// `Object.seal(obj)` — no new properties and no deletions.
     pub fn seal_object(&mut self, handle: Handle) {
         if self.heap.get(handle).and_then(Cell::as_array).is_some() {
+            self.mark_array_side_state(handle);
             self.sealed_arrays.insert(handle.to_raw());
             self.non_extensible_arrays.insert(handle.to_raw());
             // Named (non-index) properties live in the aux object; seal them there
@@ -7346,6 +7374,37 @@ pub fn is_internal_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An array without side-table state is one the side-table probes the
+    /// compiled element paths used to make would also have let through.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn side_free_arrays_pass_the_side_table_probes() {
+        let mut realm = Realm::new();
+        let n = |x: f64| NanBox::number(x);
+        let plain = realm.new_array(alloc::vec![n(1.0), n(2.0)]);
+        let named = realm.new_array(alloc::vec![n(1.0)]);
+        realm.set_property(named, "foo", n(3.0));
+        let frozen = realm.new_array(alloc::vec![n(1.0)]);
+        realm.freeze_object(frozen);
+        let sealed = realm.new_array(alloc::vec![n(1.0)]);
+        realm.seal_object(sealed);
+        let sparse = realm.new_array(alloc::vec![]);
+        realm.set_array_length(sparse, realm.limits.max_array_len + 10);
+        let acc = realm.new_array(alloc::vec![n(1.0)]);
+        realm.define_accessor(acc, "0", NanBox::undefined(), NanBox::undefined());
+        assert!(realm.array_is_side_free(plain));
+        for h in [plain, named, frozen, sealed, sparse, acc] {
+            if realm.array_is_side_free(h) {
+                assert!(realm.jit_array_len_is_dense(h) && realm.jit_array_unrestricted(h));
+            }
+            if h != plain {
+                assert!(!realm.array_is_side_free(h));
+            }
+        }
+        let obj = realm.new_object();
+        assert!(!realm.array_is_side_free(obj));
+    }
 
     #[test]
     fn allocate_and_access_properties() {
