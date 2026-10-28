@@ -3512,12 +3512,36 @@ impl Interp {
         // node's 1 ms. Merge sort keeps the stability and makes it O(n log n),
         // with short runs still finished by insertion sort (fewer comparator
         // calls, and each one may re-enter the interpreter).
+        // The default order over *primitives*: `ToString` of a string, number,
+        // boolean, null or BigInt runs no user code and always yields the same
+        // string, so each element is converted once up front instead of twice per
+        // comparison — the observable result is identical. A stable sort by
+        // those keys orders exactly as the merge sort below would.
+        if !has_cmp && !numeric && elems.iter().all(|&e| self.sort_key_is_pure(e)) {
+            let mut keyed: Vec<(String, NanBox)> = Vec::with_capacity(elems.len());
+            for e in elems {
+                keyed.push((self.coerce_to_string(e)?, e));
+            }
+            keyed.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut out: Vec<NanBox> = keyed.into_iter().map(|(_, e)| e).collect();
+            out.extend(core::iter::repeat_n(NanBox::undefined(), undefined_count));
+            return Ok(out);
+        }
         let n = elems.len();
         let mut scratch = alloc::vec![NanBox::undefined(); n];
         self.sort_run(&mut elems, &mut scratch, cmp, has_cmp, numeric)?;
         // Re-append the `undefined` holes after the ordered defined values.
         elems.extend(core::iter::repeat_n(NanBox::undefined(), undefined_count));
         Ok(elems)
+    }
+
+    /// Whether `ToString(v)` is pure for the default sort: a primitive other than
+    /// a Symbol (whose `ToString` throws).
+    fn sort_key_is_pure(&self, v: NanBox) -> bool {
+        match v.as_handle().map(Handle::from_raw) {
+            None => !v.is_hole(),
+            Some(h) => self.realm.is_string_handle(h) || self.realm.bigint_at(h).is_some(),
+        }
     }
 
     /// One `SortCompare(x, y)` step: the user comparator (its result ToNumber'd

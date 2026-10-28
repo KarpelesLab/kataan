@@ -129,6 +129,29 @@ impl Interp {
             }
         }
 
+        // `push` on a plain dense array — the hottest built-in call there is —
+        // served before the long by-name cascade below, every step of which is a
+        // probe for some other receiver kind (wrappers, iterators, DataViews,
+        // Intl objects, …) that a plain array cell can never be. The guards are
+        // exactly those of the `push`/`pop` fast path further down; anything
+        // unusual (an index side table, a widened or read-only length, an
+        // inherited index accessor) falls through to it unchanged.
+        if method == "push"
+            && !array_proto_generic
+            && let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && let Some(dense_len) = self.realm.array_elements(h).map(<[_]>::len)
+            && !self.realm.array_has_index_overrides(h)
+            && !self.realm.proto_index_accessor_dirty()
+            && self.realm.array_length(h) == Some(dense_len)
+            && !self.realm.array_length_is_readonly(h)
+        {
+            let mut len = dense_len;
+            for a in args {
+                len = self.realm.array_push(h, *a).unwrap_or(len);
+            }
+            return Ok(Some(NanBox::number(len as f64)));
+        }
+
         // `Array.prototype.toString` (23.1.3.36) is receiver-agnostic: it does
         // `O = ToObject(this)`, `func = Get(O, "join")`, and calls `func` if it is
         // callable, else falls back to `%Object.prototype.toString%` (yielding e.g.

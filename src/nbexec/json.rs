@@ -192,16 +192,16 @@ impl Interp {
         // The wrapper holder `{ "": value }`.
         let holder = self.realm.new_object();
         self.realm.set_property(holder, "", value);
-        let mut stack: Vec<Handle> = Vec::new();
-        self.serialize_json_property(
-            holder,
-            "",
-            &replacer_fn,
-            property_list.as_deref(),
-            &gap,
-            "",
-            &mut stack,
-        )
+        let mut cx = JsonOut {
+            replacer_fn,
+            property_list: property_list.as_deref(),
+            gap: &gap,
+            stack: Vec::new(),
+            out: String::new(),
+        };
+        let value = self.read_member(holder, "")?;
+        let wrote = self.json_ser_got(&mut cx, holder, JsonKey::Str(""), value, "")?;
+        Ok(wrote.then_some(cx.out))
     }
 
     /// The `space` argument's ToPrimitive: a `[[NumberData]]` wrapper becomes
@@ -223,51 +223,48 @@ impl Interp {
         Ok(v)
     }
 
-    /// `SerializeJSONProperty(key, holder)` — serializes `holder[key]`, applying
-    /// `toJSON`, then the replacer function; returns `None` if the value drops
-    /// (`undefined`/callable/symbol at a non-array position).
-    #[allow(clippy::too_many_arguments)]
-    fn serialize_json_property(
+    /// SerializeJSONProperty after its `Get` (`value` is `holder[key]`): applies
+    /// `toJSON`, then the replacer function, then appends the serialization to
+    /// `cx.out`. Returns `false` (having written nothing) when the value drops
+    /// (`undefined`/callable/symbol). The key is only turned into a string when
+    /// `toJSON` or a replacer function observes it, so an array element costs no
+    /// index formatting.
+    fn json_ser_got(
         &mut self,
+        cx: &mut JsonOut<'_>,
         holder: Handle,
-        key: &str,
-        replacer_fn: &NanBox,
-        property_list: Option<&[String]>,
-        gap: &str,
+        key: JsonKey<'_>,
+        mut value: NanBox,
         indent: &str,
-        stack: &mut Vec<Handle>,
-    ) -> Result<Option<String>, ExecError> {
-        // value = Get(holder, key) — through read_member so getters fire.
-        let mut value = self.read_member(holder, key)?;
+    ) -> Result<bool, ExecError> {
         // If value is an Object (or BigInt) with a callable `toJSON`, call it.
         if let Some(h) = value.as_handle().map(Handle::from_raw) {
             let tj = self.read_member(h, "toJSON")?;
             if self.is_callable_value(tj) {
-                let kb = self.new_str(key);
+                let kb = key.to_value(self);
                 value = self.call_with_this(tj, value, &[kb])?;
             }
         }
         // ReplacerFunction: value = replacer.call(holder, key, value).
-        if self.is_callable_value(*replacer_fn) {
-            let kb = self.new_str(key);
-            value =
-                self.call_with_this(*replacer_fn, NanBox::handle(holder.to_raw()), &[kb, value])?;
+        if self.is_callable_value(cx.replacer_fn) {
+            let kb = key.to_value(self);
+            value = self.call_with_this(
+                cx.replacer_fn,
+                NanBox::handle(holder.to_raw()),
+                &[kb, value],
+            )?;
         }
-        self.serialize_json_value(value, replacer_fn, property_list, gap, indent, stack)
+        self.json_ser_value(cx, value, indent)
     }
 
-    /// The type-dispatch tail of SerializeJSONProperty: serialize an already-
-    /// (toJSON/replacer-)transformed `value`.
-    #[allow(clippy::too_many_arguments)]
-    fn serialize_json_value(
+    /// The type-dispatch tail of SerializeJSONProperty: appends an already-
+    /// (toJSON/replacer-)transformed `value` to `cx.out`; `false` if it drops.
+    fn json_ser_value(
         &mut self,
+        cx: &mut JsonOut<'_>,
         value: NanBox,
-        replacer_fn: &NanBox,
-        property_list: Option<&[String]>,
-        gap: &str,
         indent: &str,
-        stack: &mut Vec<Handle>,
-    ) -> Result<Option<String>, ExecError> {
+    ) -> Result<bool, ExecError> {
         // Unwrap a primitive-wrapper object to its boxed primitive first (so a
         // `new Number(1)` serializes as `1`, `new String("x")` as `"x"`).
         let value = if let Some(h) = value.as_handle().map(Handle::from_raw) {
@@ -275,7 +272,8 @@ impl Interp {
             if self.realm.get_property(h, RAW_JSON_BRAND).is_some()
                 && let Some(raw) = self.realm.get_property(h, "rawJSON")
             {
-                return Ok(Some(self.realm.to_display_string(raw)));
+                cx.out.push_str(&self.realm.to_display_string(raw));
+                return Ok(true);
             }
             if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
                 // SerializeJSONProperty step 4: a `[[NumberData]]` wrapper is
@@ -298,18 +296,27 @@ impl Interp {
             value
         };
         match value.unpack() {
-            Unpacked::Null => Ok(Some(String::from("null"))),
-            Unpacked::Bool(b) => Ok(Some(String::from(if b { "true" } else { "false" }))),
-            Unpacked::Number(n) => Ok(Some(if n.is_finite() {
-                self.realm.to_display_string(value)
-            } else {
-                String::from("null")
-            })),
-            Unpacked::Undefined => Ok(None),
+            Unpacked::Null => cx.out.push_str("null"),
+            Unpacked::Bool(b) => cx.out.push_str(if b { "true" } else { "false" }),
+            Unpacked::Number(n) => {
+                if n.is_finite() {
+                    cx.out.push_str(&self.realm.to_display_string(value));
+                } else {
+                    cx.out.push_str("null");
+                }
+            }
+            Unpacked::Undefined => return Ok(false),
             Unpacked::Handle(raw) => {
                 let h = Handle::from_raw(raw);
-                if let Some(bytes) = self.realm.string_bytes(h) {
-                    return Ok(Some(json_quote_wtf8(&bytes)));
+                if self.realm.is_string_handle(h) {
+                    // Collapse a rope once so the quoting borrows one leaf.
+                    self.realm.flatten_string(h);
+                    if let Some(bytes) = self.realm.string_leaf_bytes(h) {
+                        json_quote_wtf8_into(&mut cx.out, bytes);
+                    } else if let Some(bytes) = self.realm.string_bytes(h) {
+                        json_quote_wtf8_into(&mut cx.out, &bytes);
+                    }
+                    return Ok(true);
                 }
                 if self.realm.bigint_at(h).is_some() {
                     let m = self.new_str("Do not know how to serialize a BigInt");
@@ -318,49 +325,51 @@ impl Interp {
                 // A Symbol value serializes to nothing (`typeof` is "symbol"), both
                 // as a value and (via the object key set) as a key.
                 if self.realm.symbol_at(h).is_some() {
-                    return Ok(None);
+                    return Ok(false);
                 }
                 // A callable value (function or class constructor) serializes to
                 // nothing (`typeof` is "function").
                 if self.is_callable(h) {
-                    return Ok(None);
+                    return Ok(false);
                 }
                 // Array vs object, via `IsArray` (which unwraps a proxy chain to
                 // its target — a proxy over an array serializes as an array). A
                 // typed array is NOT an Array exotic, so it serializes as an
                 // object keyed by its indices (`{"0":1,…}`), per `JSON.stringify`.
                 if self.is_array_unwrap_proxy(value)? {
-                    self.serialize_json_array(h, replacer_fn, property_list, gap, indent, stack)
-                        .map(Some)
+                    self.json_ser_array(cx, h, indent)?;
                 } else {
-                    self.serialize_json_object(h, replacer_fn, property_list, gap, indent, stack)
-                        .map(Some)
+                    self.json_ser_object(cx, h, indent)?;
                 }
             }
         }
+        Ok(true)
     }
 
-    /// `SerializeJSONObject` — `{ … }` with the PropertyList (or own enumerable
-    /// keys), recursing per member; cycle-checked via `stack`.
-    #[allow(clippy::too_many_arguments)]
-    fn serialize_json_object(
-        &mut self,
-        h: Handle,
-        replacer_fn: &NanBox,
-        property_list: Option<&[String]>,
-        gap: &str,
-        indent: &str,
-        stack: &mut Vec<Handle>,
-    ) -> Result<String, ExecError> {
-        if stack.contains(&h) {
+    /// The cycle check shared by objects and arrays: pushes `h` on the stack,
+    /// or throws if it is already being serialized.
+    fn json_enter(&mut self, cx: &mut JsonOut<'_>, h: Handle) -> Result<(), ExecError> {
+        if cx.stack.contains(&h) {
             let m = self.new_str("Converting circular structure to JSON");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
-        stack.push(h);
-        let new_indent = alloc::format!("{indent}{gap}");
+        cx.stack.push(h);
+        Ok(())
+    }
+
+    /// `SerializeJSONObject` — `{ … }` with the PropertyList (or own enumerable
+    /// keys), recursing per member; cycle-checked via the stack.
+    fn json_ser_object(
+        &mut self,
+        cx: &mut JsonOut<'_>,
+        h: Handle,
+        indent: &str,
+    ) -> Result<(), ExecError> {
+        self.json_enter(cx, h)?;
+        let new_indent = alloc::format!("{indent}{}", cx.gap);
         // The key set: the explicit PropertyList, else the object's own enumerable
         // string keys (a typed array enumerates its integer indices).
-        let keys: Vec<String> = match property_list {
+        let keys: Vec<String> = match cx.property_list {
             Some(list) => list.to_vec(),
             None => {
                 if let Some(len) = self.realm.typed_len(h) {
@@ -370,7 +379,7 @@ impl Interp {
                     // trapless forwarding to the target) then filters to own
                     // enumerable **string** keys via `[[GetOwnProperty]]` (symbols
                     // never appear in JSON). Values are read later through the
-                    // proxy's `get` trap by `serialize_json_property`.
+                    // proxy's `get` trap.
                     let mut ks = Vec::new();
                     for key in self.own_property_keys_values(h)? {
                         let name = self.member_key(key);
@@ -396,53 +405,51 @@ impl Interp {
                 }
             }
         };
-        let mut parts: Vec<String> = Vec::new();
+        let pretty = !cx.gap.is_empty();
+        cx.out.push('{');
+        let mut any = false;
         for k in keys {
-            if let Some(s) = self.serialize_json_property(
-                h,
-                &k,
-                replacer_fn,
-                property_list,
-                gap,
-                &new_indent,
-                stack,
-            )? {
-                let sep = if gap.is_empty() { ":" } else { ": " };
-                parts.push(alloc::format!("{}{sep}{s}", json_quote(&k)));
+            let mark = cx.out.len();
+            if any {
+                cx.out.push(',');
+            }
+            if pretty {
+                cx.out.push('\n');
+                cx.out.push_str(&new_indent);
+            }
+            json_quote_wtf8_into(&mut cx.out, k.as_bytes());
+            cx.out.push_str(if pretty { ": " } else { ":" });
+            // `Get(h, k)`: an own data property of an ordinary object is its
+            // slot; everything else takes the full `[[Get]]`.
+            let value = match self.json_plain_own_data(h, &k) {
+                Some(v) => v,
+                None => self.read_member(h, &k)?,
+            };
+            if self.json_ser_got(cx, h, JsonKey::Str(&k), value, &new_indent)? {
+                any = true;
+            } else {
+                cx.out.truncate(mark);
             }
         }
-        stack.pop();
-        let out = if parts.is_empty() {
-            String::from("{}")
-        } else if gap.is_empty() {
-            alloc::format!("{{{}}}", parts.join(","))
-        } else {
-            alloc::format!(
-                "{{\n{new_indent}{}\n{indent}}}",
-                parts.join(&alloc::format!(",\n{new_indent}"))
-            )
-        };
-        Ok(out)
+        cx.stack.pop();
+        if any && pretty {
+            cx.out.push('\n');
+            cx.out.push_str(indent);
+        }
+        cx.out.push('}');
+        Ok(())
     }
 
     /// `SerializeJSONArray` — `[ … ]`, each element serialized (a dropped element
-    /// becomes `null`); cycle-checked via `stack`.
-    #[allow(clippy::too_many_arguments)]
-    fn serialize_json_array(
+    /// becomes `null`); cycle-checked via the stack.
+    fn json_ser_array(
         &mut self,
+        cx: &mut JsonOut<'_>,
         h: Handle,
-        replacer_fn: &NanBox,
-        property_list: Option<&[String]>,
-        gap: &str,
         indent: &str,
-        stack: &mut Vec<Handle>,
-    ) -> Result<String, ExecError> {
-        if stack.contains(&h) {
-            let m = self.new_str("Converting circular structure to JSON");
-            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-        }
-        stack.push(h);
-        let new_indent = alloc::format!("{indent}{gap}");
+    ) -> Result<(), ExecError> {
+        self.json_enter(cx, h)?;
+        let new_indent = alloc::format!("{indent}{}", cx.gap);
         let len = if self.realm.typed_kind(h).is_some() {
             self.realm.typed_len(h).unwrap_or(0)
         } else if self.realm.proxy_at(h).is_some() {
@@ -459,37 +466,60 @@ impl Interp {
         } else {
             self.realm.array_length(h).unwrap_or(0)
         };
-        let mut parts: Vec<String> = Vec::with_capacity(len);
+        let pretty = !cx.gap.is_empty();
+        cx.out.push('[');
         for i in 0..len {
-            let ks = alloc::format!("{i}");
+            if i > 0 {
+                cx.out.push(',');
+            }
+            if pretty {
+                cx.out.push('\n');
+                cx.out.push_str(&new_indent);
+            }
+            // `Get(h, i)`: a present slot of a plain array with no per-index side
+            // table is the element itself; anything else (a hole, an accessor, a
+            // proxy, a typed array) goes through the full `[[Get]]`.
+            let direct = if self.realm.array_has_index_side_table(h) {
+                None
+            } else {
+                self.realm
+                    .array_elements(h)
+                    .and_then(|a| a.get(i).copied())
+                    .filter(|v| !v.is_hole())
+            };
+            let value = match direct {
+                Some(v) => v,
+                None => self.read_member(h, &alloc::format!("{i}"))?,
+            };
             // A PropertyList does NOT filter array indices (arrays ignore it for
-            // their own elements), but it MUST propagate to any nested objects, so
-            // pass it through to the recursive serialization.
-            let s = self
-                .serialize_json_property(
-                    h,
-                    &ks,
-                    replacer_fn,
-                    property_list,
-                    gap,
-                    &new_indent,
-                    stack,
-                )?
-                .unwrap_or_else(|| String::from("null"));
-            parts.push(s);
+            // their own elements), but it MUST propagate to any nested objects,
+            // which it does through `cx`.
+            if !self.json_ser_got(cx, h, JsonKey::Index(i), value, &new_indent)? {
+                cx.out.push_str("null");
+            }
         }
-        stack.pop();
-        let out = if parts.is_empty() {
-            String::from("[]")
-        } else if gap.is_empty() {
-            alloc::format!("[{}]", parts.join(","))
-        } else {
-            alloc::format!(
-                "[\n{new_indent}{}\n{indent}]",
-                parts.join(&alloc::format!(",\n{new_indent}"))
-            )
-        };
-        Ok(out)
+        cx.stack.pop();
+        if len > 0 && pretty {
+            cx.out.push('\n');
+            cx.out.push_str(indent);
+        }
+        cx.out.push(']');
+        Ok(())
+    }
+
+    /// `[[Get]]` of `key` on `h` when that is simply an own data slot of an
+    /// ordinary object — no proxy, typed array, module namespace, mapped
+    /// `arguments` or accessor involved. `None` means "take the full
+    /// `read_member` path", never "absent".
+    fn json_plain_own_data(&self, h: Handle, key: &str) -> Option<NanBox> {
+        if self.realm.proxy_at(h).is_some()
+            || self.realm.typed_kind(h).is_some()
+            || self.realm.is_host_exotic(h)
+            || self.arg_maps.contains_key(&h.to_raw())
+        {
+            return None;
+        }
+        self.realm.plain_own_data(h, key)
     }
 
     /// A `SyntaxError` for a malformed `JSON.parse` input (the spec error type, so
@@ -829,4 +859,31 @@ pub(crate) enum JsonSrc {
     Prim { value: NanBox, source: String },
     Array(Vec<JsonSrc>),
     Object(Vec<(String, JsonSrc)>),
+}
+
+/// The state of one `JSON.stringify` run: the replacer, the gap, the cycle
+/// stack and the single output buffer every value is appended to.
+struct JsonOut<'a> {
+    replacer_fn: NanBox,
+    property_list: Option<&'a [String]>,
+    gap: &'a str,
+    stack: Vec<Handle>,
+    out: String,
+}
+
+/// The key of a property being serialized: a named key, or an array index whose
+/// string form is only built when user code (`toJSON`, a replacer) observes it.
+#[derive(Clone, Copy)]
+enum JsonKey<'a> {
+    Str(&'a str),
+    Index(usize),
+}
+
+impl JsonKey<'_> {
+    fn to_value(self, interp: &mut Interp) -> NanBox {
+        match self {
+            JsonKey::Str(k) => interp.new_str(k),
+            JsonKey::Index(i) => interp.new_str(&alloc::format!("{i}")),
+        }
+    }
 }

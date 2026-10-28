@@ -7279,19 +7279,22 @@ fn format_precision(n: f64, p: usize) -> String {
     alloc::format!("{n:.decimals$}")
 }
 
-/// Quotes and escapes a string as a JSON string literal (the `&str` form, used
-/// for property keys). [`json_quote_wtf8`] is the surrogate-preserving form for
-/// string *values*.
-fn json_quote(s: &str) -> String {
-    json_quote_wtf8(s.as_bytes())
-}
-
-/// Quotes and escapes WTF-8 bytes as a JSON string literal, iterating code
-/// points so a **lone surrogate** is escaped as `\uXXXX` (well-formed JSON per
-/// the spec) and astral scalars emit their characters directly.
-fn json_quote_wtf8(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() + 2);
+/// Quotes and escapes WTF-8 bytes as a JSON string literal onto `out`,
+/// iterating code points so a **lone surrogate** is escaped as `\uXXXX`
+/// (well-formed JSON per the spec) and astral scalars emit their characters
+/// directly. Printable ASCII with no `"` or `\` (the usual key or value) needs
+/// no escaping and is copied in one go.
+fn json_quote_wtf8_into(out: &mut String, bytes: &[u8]) {
     out.push('"');
+    if bytes
+        .iter()
+        .all(|&b| (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\')
+        && let Ok(s) = core::str::from_utf8(bytes)
+    {
+        out.push_str(s);
+        out.push('"');
+        return;
+    }
     for cp in crate::wtf8::code_points(bytes) {
         match cp {
             0x22 => out.push_str("\\\""),
@@ -7312,7 +7315,6 @@ fn json_quote_wtf8(bytes: &[u8]) -> String {
         }
     }
     out.push('"');
-    out
 }
 
 /// Reads exactly four hex digits from the char slice `c` starting at `at`,

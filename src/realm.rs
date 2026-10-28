@@ -4590,6 +4590,19 @@ impl Realm {
         self.heap.get(*aux)?.as_object()?.accessor(key)
     }
 
+    /// The value of own **data** property `key` of the ordinary object at
+    /// `handle`: `None` if it is not an object cell, `key` is an accessor, or
+    /// there is no such own property. (Exotic behaviour — proxies, typed arrays,
+    /// module namespaces, mapped `arguments` — is the caller's to rule out.)
+    #[must_use]
+    pub fn plain_own_data(&self, handle: Handle, key: &str) -> Option<NanBox> {
+        let o = self.heap.get(handle)?.as_object()?;
+        if o.accessor(key).is_some() {
+            return None;
+        }
+        o.get(key)
+    }
+
     /// Sets own property `key` to `value` on the object at `handle`. Returns
     /// `false` if the handle is stale or the cell is not an object.
     pub fn set_property(&mut self, handle: Handle, key: &str, value: NanBox) -> bool {
