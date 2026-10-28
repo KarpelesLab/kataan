@@ -25101,12 +25101,18 @@ mod generic_jit_tests {
                     }
                     let sslot =
                         *(cache_base.add(layout.cache_slot_off as usize) as *const u32) as usize;
-                    let slots_len = *(slot.add(layout.off_slots_len as usize) as *const usize);
-                    if sslot >= slots_len {
+                    let slots_len = *(slot.add(layout.off_slots_len as usize) as *const u32);
+                    if sslot >= slots_len as usize {
                         return None;
                     }
-                    let slots_ptr = *(slot.add(layout.off_slots_ptr as usize) as *const *const u64);
-                    Some(*slots_ptr.add(sslot))
+                    let inline = crate::object::INLINE_SLOTS;
+                    if sslot < inline {
+                        return Some(
+                            *(slot.add(layout.off_inline as usize) as *const u64).add(sslot),
+                        );
+                    }
+                    let spill = *(slot.add(layout.off_spill_ptr as usize) as *const *const u64);
+                    Some(*spill.add(sslot - inline))
                 }
             };
 
@@ -25259,21 +25265,21 @@ mod generic_jit_tests {
         let (obase, olen) = realm.jit_arena_slots();
         assert_eq!(raw_elem(obase, olen, bits(obj), 0), None);
 
-        // --- writability gate: frozen byte + readonly Vec length ---
+        // --- writability gate: frozen byte + the jit_flags byte ---
         // A faithful mirror of the emitted SET writability read.
         #[allow(unsafe_code)]
-        let raw_writable = |base: *const u8, len: usize, obj_bits: u64| -> Option<(u8, usize)> {
+        let raw_writable = |base: *const u8, len: usize, obj_bits: u64| -> Option<(u8, u8)> {
             let index = (obj_bits & 0xffff_ffff) as usize;
             if index >= len {
                 return None;
             }
-            // SAFETY: `index < len` → a live slot; the frozen byte + readonly length
+            // SAFETY: `index < len` → a live slot; the frozen byte + jit flags
             // sit within the object, at the probed offsets.
             unsafe {
                 let slot = base.add(index * layout.slot_stride as usize);
                 let frozen = *slot.add(layout.off_frozen as usize);
-                let readonly_len = *(slot.add(layout.off_readonly_len as usize) as *const usize);
-                Some((frozen, readonly_len))
+                let flags = *slot.add(layout.props.off_jit_flags as usize);
+                Some((frozen, flags))
             }
         };
 
@@ -25297,8 +25303,8 @@ mod generic_jit_tests {
         let (rfrozen, ro_len) = raw_writable(rbase, rlen, bits(robj)).unwrap();
         assert_eq!(rfrozen, 0, "not frozen");
         assert!(
-            ro_len > 0,
-            "a readonly property must grow the readonly list"
+            ro_len & crate::object::JIT_FLAG_READONLY != 0,
+            "a readonly property must set the readonly jit flag"
         );
     }
 

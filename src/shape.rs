@@ -206,6 +206,14 @@ impl Shape {
         core::mem::offset_of!(Shape, brands)
     }
 
+    /// The byte offset of the `parent` link (an `Option<Rc<Shape>>`, one
+    /// nullable pointer word) within a [`Shape`], for compiled code's
+    /// transition check.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn parent_offset() -> usize {
+        core::mem::offset_of!(Shape, parent)
+    }
+
     /// Whether the layout holds the primitive-wrapper key [`PRIM_WRAP_KEY`].
     #[inline]
     #[must_use]

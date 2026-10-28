@@ -60,6 +60,16 @@ pub(crate) struct PropsLayout {
     pub off_vmfn_caps_ptr: i32,
     /// Slot-relative offset of a VM function's capture count.
     pub off_vmfn_caps_len: i32,
+    /// Slot-relative offset of the object's `extensible` byte.
+    pub off_extensible: i32,
+    /// Slot-relative offset of the object's `sealed` byte.
+    pub off_sealed: i32,
+    /// Shape-word-relative offset of the shape's `parent` word.
+    pub shape_parent: i32,
+    /// Shape-word-relative offset of the shape `Rc`'s strong count.
+    pub rc_strong: i32,
+    /// `Realm`-relative offset of `object_dictionary_threshold`.
+    pub dict_threshold: i32,
 }
 
 impl PropsLayout {
@@ -74,7 +84,14 @@ impl PropsLayout {
         let i = |v: usize| i32::try_from(v).expect("jit layout offset fits in i32");
         let (heap_ptr, heap_len) = crate::realm::Realm::jit_heap_offsets();
         let (vmfn_disc, func_off, caps_off) = crate::cell::jit_vm_function_layout();
+        let (shape_parent, rc_strong) = shape_word_offsets();
         Self {
+            off_extensible: i(obj_base + obj.extensible_off),
+            off_sealed: i(obj_base + obj.sealed_off),
+            shape_parent,
+            rc_strong,
+            dict_threshold: i(core::mem::offset_of!(crate::realm::Realm, limits)
+                + core::mem::offset_of!(crate::limits::Limits, object_dictionary_threshold)),
             marking: i(crate::realm::Realm::jit_marking_offset()),
             off_slot_age: i(slot.age_off),
             vmfn_disc,
@@ -95,6 +112,46 @@ impl PropsLayout {
             heap_len: i(heap_len),
         }
     }
+}
+
+/// The offsets, from a shape `Rc`'s stored word (what an object's shape
+/// field and a cache hold), of the shape's `parent` word and of the `Rc`'s
+/// strong count — probed on a live shape: the count is the word of the
+/// `Rc`'s box that follows `Rc::strong_count` as clones come and go.
+#[allow(unsafe_code)]
+fn shape_word_offsets() -> (i32, i32) {
+    let i = |v: isize| i32::try_from(v).expect("jit layout offset fits in i32");
+    let root = Shape::root();
+    let child = root.add("k");
+    // SAFETY: an `Rc` is one pointer word.
+    let word = unsafe { core::ptr::read(core::ptr::addr_of!(child).cast::<usize>()) };
+    let parent = i((Rc::as_ptr(&child) as usize + Shape::parent_offset())
+        .wrapping_sub(word)
+        .cast_signed());
+    // SAFETY: the parent word of the live `child`, at the offset just derived.
+    let parent_word = unsafe { *((word as isize + parent as isize) as *const usize) };
+    assert_eq!(
+        parent_word,
+        // SAFETY: as above, for `root`.
+        unsafe { core::ptr::read(core::ptr::addr_of!(root).cast::<usize>()) }
+    );
+    // The strong count: the box word (before the value) that tracks clones.
+    let value_off = Rc::as_ptr(&child) as usize - word;
+    let mut strong = None;
+    for off in (0..value_off).step_by(core::mem::size_of::<usize>()) {
+        // SAFETY: a word of the live `Rc` box header, before its value.
+        let read = || unsafe { *((word + off) as *const usize) };
+        let before = read();
+        let extra = Rc::clone(&child);
+        let after = read();
+        drop(extra);
+        if before == Rc::strong_count(&child) && after == before + 1 && read() == before {
+            strong = Some(off);
+            break;
+        }
+    }
+    let strong = strong.expect("could not find the Rc strong count");
+    (parent, i(strong.cast_signed()))
 }
 
 /// [`crate::object::JIT_FLAG_EXOTIC`], as compiled code tests it.
@@ -385,11 +442,6 @@ impl X64Assembler {
         self.code.extend_from_slice(&[0x89, 0xc0]);
     }
 
-    /// `mov rax, [r9 + rax*8]`.
-    fn p_load_r9_rax8(&mut self) {
-        self.code.extend_from_slice(&[0x49, 0x8b, 0x04, 0xc1]);
-    }
-
     /// Jumps to `miss` unless `rax` holds a heap handle. Clobbers `rcx`, `r11`.
     fn p_handle_check(&mut self, miss: Label) {
         self.g_movabs(r::R11, HANDLE_TAG);
@@ -504,10 +556,8 @@ impl X64Assembler {
         self.p_cmp32_imm8(r::R11, acc, 0);
         self.g_jcc(cc::NE, accessor);
         self.p_load32(r::RAX, r::R11, i(offset_of!(MethodEntry, slot)));
-        self.cmp_rax_at_rcx(l.off_slots_len);
-        self.jae(next);
-        self.g_load(r::R9, r::RCX, l.off_slots_ptr);
-        self.p_load_r9_rax8();
+        self.p_obj_slot_addr(l, r::R9, next);
+        self.g_load(r::RAX, r::R9, 0);
         let done = self.new_label();
         self.jmp(done);
         // The getter: entry `acc - 1` of the holder's accessor list.
@@ -534,6 +584,133 @@ impl X64Assembler {
         self.g_jcc(cc::NE, way);
         self.jmp(miss);
         self.bind(done);
+    }
+
+    /// With a slot index (zero-extended) in `rax` and an object's heap slot in
+    /// `rcx`: `dst` = the address of that property value — inline in the
+    /// object for the first [`crate::object::INLINE_SLOTS`], else in its spill
+    /// array — or to `miss` when the index is not below the object's slot
+    /// count. Clobbers only `dst` (neither `rax` nor `rcx`).
+    pub(crate) fn p_obj_slot_addr(&mut self, l: &JitLayout, dst: u8, miss: Label) {
+        const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
+        debug_assert!(dst != r::RAX && dst != r::RCX);
+        self.p_cmp32_mem(r::RAX, r::RCX, l.off_slots_len);
+        self.g_jcc(cc::AE, miss);
+        let spill = self.new_label();
+        let done = self.new_label();
+        self.p_cmp32_imm(r::RAX, INLINE);
+        self.g_jcc(cc::AE, spill);
+        self.p_lea_index8(dst, r::RCX, r::RAX, l.off_inline);
+        self.jmp(done);
+        self.bind(spill);
+        self.g_load(dst, r::RCX, l.off_spill_ptr);
+        self.p_lea_index8(dst, dst, r::RAX, -8 * INLINE);
+        self.bind(done);
+    }
+
+    /// The inline hit of `Op::InitProp` through its transition cache at
+    /// `cache` (a `PropertyCache`): exactly
+    /// `Object::init_data_cached`'s cached add, for the object whose heap slot
+    /// is `rcx` (arena base in `r10`, length in `rdx`) and the value at
+    /// `[rbx + val_disp]`. It qualifies when the object is an ordinary shaped
+    /// one with no `jit_flags`, extensible, neither frozen nor sealed, with no
+    /// `extra` part (no accessors, attribute marks or key-order log), whose
+    /// shape is the cached shape's parent, with room for the value inline and
+    /// below the dictionary threshold, and when the store needs nothing from
+    /// the write barrier. Then: the value goes into the next inline slot, the
+    /// object adopts the cached shape (moving one strong count from the old
+    /// shape to the new; the cached shape holds its parent, so the old one
+    /// stays alive), its key epoch and the cache's hit count are bumped.
+    /// Otherwise to `miss`, having changed nothing. Clobbers `rax`, `r8`,
+    /// `r9`, `r11`.
+    pub(crate) fn p_init_prop_inline(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        cache: u64,
+        val_disp: i32,
+        miss: Label,
+    ) {
+        const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
+        let cache_shape = l.cache_shape_off;
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
+        self.jne(miss);
+        self.cmp_byte_at_rcx_imm(l.off_od_tag, l.obj_shaped_disc);
+        self.jne(miss);
+        self.cmp_byte_at_rcx_imm(l.props.off_jit_flags, 0);
+        self.jne(miss);
+        self.cmp_byte_at_rcx_imm(l.off_frozen, 0);
+        self.jne(miss);
+        self.cmp_byte_at_rcx_imm(l.props.off_sealed, 0);
+        self.jne(miss);
+        self.cmp_byte_at_rcx_imm(l.props.off_extensible, 0);
+        self.g_jcc(cc::E, miss);
+        self.g_load(r::R9, r::RCX, l.props.off_extra);
+        self.g_test(r::R9);
+        self.g_jcc(cc::NE, miss);
+        // The cached shape, whose parent must be the object's shape.
+        self.g_movabs(r::R11, cache);
+        self.g_load(r::R9, r::R11, cache_shape);
+        self.g_test(r::R9);
+        self.g_jcc(cc::E, miss);
+        self.g_load(r::R8, r::R9, l.props.shape_parent);
+        self.g_cmp_mem(r::R8, r::RCX, l.off_shape);
+        self.g_jcc(cc::NE, miss);
+        // Room inline, and below the dictionary threshold.
+        self.p_load32(r::RAX, r::RCX, l.off_slots_len);
+        self.p_cmp32_imm(r::RAX, INLINE);
+        self.g_jcc(cc::AE, miss);
+        self.g_load(r::R11, r::R15, realm_off);
+        self.g_cmp_mem(r::RAX, r::R11, l.props.dict_threshold);
+        self.g_jcc(cc::AE, miss);
+        self.g_load(r::RAX, r::RBX, val_disp);
+        self.p_barrier_check(l, realm_off, miss);
+        // Commit: the value, the count, the shape, the epoch, the hit.
+        self.p_load32(r::RAX, r::RCX, l.off_slots_len);
+        self.p_lea_index8(r::R11, r::RCX, r::RAX, l.off_inline);
+        self.g_load(r::R8, r::RBX, val_disp);
+        self.g_store(r::R11, 0, r::R8);
+        self.p_inc32_mem(r::RCX, l.off_slots_len);
+        self.g_movabs(r::R11, cache);
+        self.g_load(r::R9, r::R11, cache_shape);
+        self.g_inc_mem(r::R9, l.props.rc_strong);
+        self.g_load(r::R8, r::RCX, l.off_shape);
+        self.g_dec_mem(r::R8, l.props.rc_strong);
+        self.g_store(r::RCX, l.off_shape, r::R9);
+        self.p_inc32_mem(r::RCX, l.props.off_epoch);
+        self.p_inc32_mem(r::R11, l.cache_hits_off);
+    }
+
+    /// `inc dword [base+disp32]` (`base` neither `rsp` nor `r12`).
+    fn p_inc32_mem(&mut self, base: u8, disp: i32) {
+        debug_assert!(base & 7 != 4, "no SIB form");
+        if base >= 8 {
+            self.code.push(0x41);
+        }
+        self.code.push(0xff);
+        self.code.push(0x80 | (base & 7));
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `lea dst, [base + index*8 + disp32]` (`index` not `rsp`).
+    pub(crate) fn p_lea_index8(&mut self, dst: u8, base: u8, index: u8, disp: i32) {
+        debug_assert!(index != 4, "rsp is no index");
+        let rex = 0x48 | (((dst >> 3) & 1) << 2) | (((index >> 3) & 1) << 1) | ((base >> 3) & 1);
+        self.code.push(rex);
+        self.code.push(0x8d);
+        self.code.push(0x80 | ((dst & 7) << 3) | 4);
+        self.code.push(0xc0 | ((index & 7) << 3) | (base & 7));
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `cmp r32, imm32`.
+    pub(crate) fn p_cmp32_imm(&mut self, reg: u8, imm: i32) {
+        if reg >= 8 {
+            self.code.push(0x41);
+        }
+        self.code.push(0x81);
+        self.code.push(0xc0 | (7 << 3) | (reg & 7));
+        self.code.extend_from_slice(&imm.to_le_bytes());
     }
 
     /// `dec eax` (zero-extending).
@@ -950,6 +1127,27 @@ mod tests {
             };
             assert_eq!(brands(o), 0);
             assert_eq!(brands(w), 1);
+            // The shape word's parent link and strong count.
+            let shape_word = |h: Handle| *field(h, jl.off_shape).cast::<*const u8>();
+            let oshape = std::rc::Rc::clone(oo.shape());
+            let parent = *shape_word(o)
+                .offset(isize::try_from(l.shape_parent).unwrap())
+                .cast::<*const u8>();
+            assert_eq!(
+                parent,
+                core::ptr::read(core::ptr::addr_of!(*oshape.parent().unwrap()).cast::<*const u8>())
+            );
+            let strong = *shape_word(o)
+                .offset(isize::try_from(l.rc_strong).unwrap())
+                .cast::<usize>();
+            assert_eq!(strong, std::rc::Rc::strong_count(&oshape));
+            assert_eq!(*field(o, l.off_extensible), 1);
+            assert_eq!(*field(o, l.off_sealed), 0);
+            assert_eq!(*field(o, jl.off_slots_len).cast::<u32>(), 1);
+            assert_eq!(
+                *field(o, jl.off_inline).cast::<u64>(),
+                NanBox::number(1.0).to_bits()
+            );
             assert_eq!(*field(f, jl.off_cell_tag), l.vmfn_disc);
             let (fid, caps) = realm.vm_function(f).unwrap();
             assert_eq!(*field(f, l.off_vmfn_func).cast::<u32>(), fid);

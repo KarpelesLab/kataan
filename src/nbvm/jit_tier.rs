@@ -531,6 +531,17 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             call_compiled(ctx, funcs, regs, callee, args, NanBox::undefined())
                 .map(|r| r.map(|v| regs[*dst as usize] = v))
         }
+        // Literal allocations (an object or array literal per loop iteration):
+        // exactly their interpreter arms, which cannot fail.
+        Op::NewObject { dst } => {
+            regs[*dst as usize] = NanBox::handle(ctx.realm.new_object().to_raw());
+            Some(Ok(()))
+        }
+        Op::NewArrayFrom { dst, elems } => {
+            let vals: alloc::vec::Vec<NanBox> = elems.iter().map(|r| regs[*r as usize]).collect();
+            regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(vals).to_raw());
+            Some(Ok(()))
+        }
         _ => None,
     };
     if let Some(r) = direct {

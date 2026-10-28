@@ -1988,6 +1988,9 @@ pub enum GenericOp {
         val: u16,
         /// Index into the per-site key/IC table.
         site: u16,
+        /// Whether the key is an ordinary one (not `\0`-internal), so a
+        /// transition-cache hit may be made inline.
+        plain: bool,
     },
     /// `Op::CheckTdz`: inline "not the TDZ sentinel" test; the interpreter runs
     /// the op (and throws its `ReferenceError`) otherwise.
@@ -2455,6 +2458,7 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
                     obj: r(*obj)?,
                     val: r(*src)?,
                     site,
+                    plain: !key.starts_with('\0'),
                 }
             }
             Op::CheckTdz { src } => GenericOp::CheckTdz {
@@ -2756,10 +2760,14 @@ pub(crate) struct JitLayout {
     pub off_od_tag: i32,
     /// Slot-relative offset of the object's shape-`Rc` word (8 bytes).
     pub off_shape: i32,
-    /// Slot-relative offset of the slot `Vec`'s data pointer (8 bytes).
-    pub off_slots_ptr: i32,
-    /// Slot-relative offset of the slot `Vec`'s length (8 bytes).
+    /// Slot-relative offset of the object's slot count (`u32`).
     pub off_slots_len: i32,
+    /// Slot-relative offset of the object's first inline slot (slot
+    /// `i < INLINE_SLOTS` at `+ 8 * i`).
+    pub off_inline: i32,
+    /// Slot-relative offset of the object's spill `Vec` data pointer (slot
+    /// `i >= INLINE_SLOTS` at that pointer `+ 8 * (i - INLINE_SLOTS)`).
+    pub off_spill_ptr: i32,
     /// `PropertyCache`-relative offset of the cached shape word (8 bytes).
     pub cache_shape_off: i32,
     /// `PropertyCache`-relative offset of the cached `slot: u32`.
@@ -2777,9 +2785,6 @@ pub(crate) struct JitLayout {
     /// Slot-relative offset of the object's `frozen: bool` (inline SET writability
     /// gate: a non-zero byte routes the store to the helper).
     pub off_frozen: i32,
-    /// Slot-relative offset of the object's `readonly` Vec length (inline SET
-    /// writability gate: a non-zero length routes the store to the helper).
-    pub off_readonly_len: i32,
     /// The inline property paths' extra offsets (`props.rs`).
     pub props: props::PropsLayout,
 }
@@ -2804,7 +2809,6 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
         let cell_base = slot.value_off;
         let obj_base = cell_base + cell.object_off;
         let od_base = obj_base + obj.data_off;
-        let slots_base = od_base + obj.slots_off;
         let to_i32 = |v: usize| i32::try_from(v).expect("jit layout offset fits in i32");
         JitLayout {
             slot_stride: to_i32(slot.stride),
@@ -2815,8 +2819,9 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
             off_cell_tag: to_i32(cell_base),
             off_od_tag: to_i32(od_base),
             off_shape: to_i32(od_base + obj.shape_off),
-            off_slots_ptr: to_i32(slots_base + obj.vec_ptr_off),
-            off_slots_len: to_i32(slots_base + obj.vec_len_off),
+            off_slots_len: to_i32(od_base + obj.len_off),
+            off_inline: to_i32(od_base + obj.inline_off),
+            off_spill_ptr: to_i32(od_base + obj.spill_ptr_off),
             cache_shape_off: to_i32(cache.shape_off),
             cache_slot_off: to_i32(cache.slot_off),
             cache_hits_off: to_i32(cache.hits_off),
@@ -2825,9 +2830,8 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
             // ptr / len are the generic `Vec<NanBox>` offsets within that Vec.
             off_arr_ptr: to_i32(cell_base + cell.array_vec_off + obj.vec_ptr_off),
             off_arr_len: to_i32(cell_base + cell.array_vec_off + obj.vec_len_off),
-            // `frozen`/`readonly` are `Object` fields, relative to the Object base.
+            // `frozen` is an `Object` field, relative to the Object base.
             off_frozen: to_i32(obj_base + obj.frozen_off),
-            off_readonly_len: to_i32(obj_base + obj.readonly_len_off),
             props: props::PropsLayout::new(&slot, cell_base, obj_base, &obj),
         }
     })
@@ -5292,11 +5296,33 @@ impl JitFunction {
                     throw_check!();
                     a.bind(done);
                 }
-                GenericOp::InitProp { obj, val, site } => {
+                GenericOp::InitProp {
+                    obj,
+                    val,
+                    site,
+                    plain,
+                } => {
                     if !ok(obj) || !ok(val) {
                         return None;
                     }
                     let s = sites.get(site as usize)?;
+                    let helper = a.new_label();
+                    let done = a.new_label();
+                    if plain {
+                        // ===== inline transition-cache add (see
+                        // `p_init_prop_inline`) =====
+                        a.p_load_arena(helpers.call_layout.realm, &layout.props);
+                        walk_to_slot!(obj, helper);
+                        a.p_init_prop_inline(
+                            &layout,
+                            helpers.call_layout.realm,
+                            s.cache_ptr as u64,
+                            disp(val),
+                            helper,
+                        );
+                        a.jmp(done);
+                    }
+                    a.bind(helper);
                     a.mov_rdi_r15();
                     a.load_argreg(1, disp(obj));
                     a.movabs_argreg(2, s.key_ptr as i64);
@@ -5306,6 +5332,7 @@ impl JitFunction {
                     a.movabs_rax(init_prop_helper as i64);
                     a.call_rax();
                     throw_check!();
+                    a.bind(done);
                 }
                 GenericOp::CheckTdz { src, pc } => {
                     if !ok(src) {
@@ -5517,10 +5544,8 @@ impl JitFunction {
                     a.cmp_rax_at_r11(layout.cache_shape_off);
                     a.jne(helper);
                     a.mov_eax_at_r11(layout.cache_slot_off);
-                    a.cmp_rax_at_rcx(layout.off_slots_len);
-                    a.jae(helper);
-                    a.mov_r11_at_rcx(layout.off_slots_ptr); // r11 = slot Vec data ptr
-                    a.mov_rax_at_r11_rax8(); // rax = NanBox at slot
+                    a.p_obj_slot_addr(&layout, call_seq::r::R11, helper);
+                    a.g_load(call_seq::r::RAX, call_seq::r::R11, 0); // rax = NanBox at slot
                     a.movabs_r11(s.cache_ptr as i64);
                     a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
                     a.store_rax(disp(dst));
@@ -5555,10 +5580,9 @@ impl JitFunction {
                     a.jne(helper);
                     a.cmp_byte_at_rcx_imm(layout.off_frozen, 0);
                     a.jne(helper);
-                    a.cmp_qword_at_rcx_imm(layout.off_readonly_len, 0);
-                    a.jne(helper);
                     // A host-exotic, global or tracked-prototype object's writes
-                    // need the helper.
+                    // need the helper, as do those of an object with a
+                    // non-writable property (`JIT_FLAG_READONLY`).
                     a.cmp_byte_at_rcx_imm(layout.props.off_jit_flags, 0);
                     a.jne(helper);
                     a.mov_rax_at_rcx(layout.off_shape);
@@ -5572,11 +5596,9 @@ impl JitFunction {
                     a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
                     a.movabs_r11(s.cache_ptr as i64);
                     a.mov_eax_at_r11(layout.cache_slot_off);
-                    a.cmp_rax_at_rcx(layout.off_slots_len);
-                    a.jae(helper);
-                    a.mov_r11_at_rcx(layout.off_slots_ptr);
+                    a.p_obj_slot_addr(&layout, call_seq::r::R11, helper);
                     a.load_rdx(disp(val));
-                    a.mov_at_r11_rax8_rdx(); // slots[slot] = val
+                    a.g_store(call_seq::r::R11, 0, call_seq::r::RDX); // slots[slot] = val
                     a.movabs_r11(s.cache_ptr as i64);
                     a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
                     a.jmp(done);

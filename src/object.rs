@@ -55,9 +55,14 @@ fn array_index(k: &str) -> Option<u32> {
 enum ObjectData {
     /// Default representation: a hidden-class shape and a dense value vector
     /// indexed by the shape's slot numbers.
+    ///
+    /// `len` (the number of slots, always the shape's length) sits right after
+    /// the tag, in what would otherwise be padding; the first
+    /// [`INLINE_SLOTS`] values live in the object itself (see [`Slots`]).
     Shaped {
+        len: u32,
         shape: Rc<Shape>,
-        slots: Vec<NanBox>,
+        slots: Slots,
     },
     /// Dictionary representation: values keyed by name, with a parallel list
     /// preserving insertion order. Carries no live `Rc<Shape>`, so it creates no
@@ -78,7 +83,111 @@ enum ObjectData {
         // Deliberate: the box keeps `Dict` no larger than `Shaped`.
         #[allow(clippy::box_collection)]
         map: Box<BTreeMap<Box<str>, DictSlot>>,
+        /// An empty sentinel shape returned by [`Object::shape`] in this mode,
+        /// so inline caches keyed on the shape pointer always miss (an empty
+        /// shape resolves no key) and never bind a dictionary object.
+        sentinel: Rc<Shape>,
     },
+}
+
+/// How many property values an object stores inline, in its own cell, before
+/// spilling to a separate allocation. Most objects are small (a point, a
+/// literal, a class instance with a few fields), so they need no allocation
+/// beyond their heap cell — and dropping a dead one frees nothing.
+pub(crate) const INLINE_SLOTS: usize = 4;
+
+/// A shaped object's property values: slot `i < INLINE_SLOTS` in `inline`,
+/// the rest in `spill` (slot `i` at `spill[i - INLINE_SLOTS]`). The count is
+/// the enclosing [`ObjectData::Shaped`]'s `len`; `spill` holds exactly
+/// `len - INLINE_SLOTS` values once `len` exceeds the inline room (else none),
+/// and inline entries at or past `len` are unused (never read or traced).
+#[repr(C)] // compiled code reads `inline` and `spill` at probed offsets
+struct Slots {
+    inline: [NanBox; INLINE_SLOTS],
+    spill: Vec<NanBox>,
+}
+
+impl Slots {
+    /// No values.
+    #[inline]
+    fn new() -> Self {
+        Self {
+            inline: [NanBox::undefined(); INLINE_SLOTS],
+            spill: Vec::new(),
+        }
+    }
+
+    /// Slots holding `values` in order, and their count.
+    fn from_values(values: impl IntoIterator<Item = NanBox>) -> (u32, Self) {
+        let mut s = Self::new();
+        let mut len = 0u32;
+        for v in values {
+            s.push(&mut len, v);
+        }
+        (len, s)
+    }
+
+    /// Slot `i` of `len`, if in range.
+    #[inline]
+    fn get(&self, len: u32, i: u32) -> Option<NanBox> {
+        if i >= len {
+            return None;
+        }
+        let i = i as usize;
+        if i < INLINE_SLOTS {
+            Some(self.inline[i])
+        } else {
+            self.spill.get(i - INLINE_SLOTS).copied()
+        }
+    }
+
+    /// Slot `i` of `len`, mutably, if in range.
+    #[inline]
+    fn get_mut(&mut self, len: u32, i: u32) -> Option<&mut NanBox> {
+        if i >= len {
+            return None;
+        }
+        let i = i as usize;
+        if i < INLINE_SLOTS {
+            Some(&mut self.inline[i])
+        } else {
+            self.spill.get_mut(i - INLINE_SLOTS)
+        }
+    }
+
+    /// Slot `i`, which must be in range (`i < len`).
+    #[inline]
+    fn at(&self, len: u32, i: u32) -> NanBox {
+        self.get(len, i).expect("slot index in range")
+    }
+
+    /// Appends `v` as slot `len`, bumping `len`.
+    #[inline]
+    fn push(&mut self, len: &mut u32, v: NanBox) {
+        let i = *len as usize;
+        if i < INLINE_SLOTS {
+            self.inline[i] = v;
+        } else {
+            self.spill.push(v);
+        }
+        *len += 1;
+    }
+
+    /// The `len` values in slot order.
+    #[inline]
+    fn iter(&self, len: u32) -> impl Iterator<Item = &NanBox> {
+        self.inline[..(len as usize).min(INLINE_SLOTS)]
+            .iter()
+            .chain(self.spill.iter())
+    }
+
+    /// The `len` values in slot order, mutably.
+    #[inline]
+    fn iter_mut(&mut self, len: u32) -> impl Iterator<Item = &mut NanBox> {
+        self.inline[..(len as usize).min(INLINE_SLOTS)]
+            .iter_mut()
+            .chain(self.spill.iter_mut())
+    }
 }
 
 /// A dictionary-mode property: its value and its key's index in the insertion
@@ -102,6 +211,10 @@ pub const JIT_FLAG_EXOTIC: u8 = 1;
 /// bindings; a built-in prototype whose method overwrites are tracked) —
 /// compiled code writes none of its properties inline.
 pub const JIT_FLAG_NO_INLINE_SET: u8 = 2;
+/// [`Object::jit_flags`] bit: the object has (or once had) a non-writable own
+/// property, so compiled code's in-place store must go to the helper (which
+/// checks the key). Set by [`Object::set_readonly`], never cleared.
+pub const JIT_FLAG_READONLY: u8 = 4;
 
 /// A property-bearing object: a hidden-class shape plus its value slots (or a
 /// dictionary once it grows past the threshold), with an optional side list of
@@ -110,13 +223,6 @@ pub const JIT_FLAG_NO_INLINE_SET: u8 = 2;
 pub struct Object {
     /// The data-property storage: shaped (default) or dictionary mode.
     data: ObjectData,
-    /// An empty sentinel shape returned by [`shape`](Object::shape) while in
-    /// dictionary mode, so inline caches keyed on the shape pointer always miss
-    /// (an empty shape resolves no key) and never bind a dictionary object.
-    dict_shape: Option<Rc<Shape>>,
-    /// Own keys that are **non-writable** (`defineProperty` with
-    /// `writable: false`): writes are silently ignored.
-    readonly: Vec<alloc::boxed::Box<str>>,
     /// Whether the object is frozen (`Object.freeze`): no new properties and no
     /// writes to existing ones.
     frozen: bool,
@@ -127,9 +233,14 @@ pub struct Object {
     sealed: bool,
     /// Flags the generic JIT's inline property paths test before touching the
     /// object ([`JIT_FLAG_EXOTIC`], [`JIT_FLAG_NO_INLINE_SET`]); `0` for an
-    /// ordinary object. Only ever set (never cleared), so a stale `1` merely
-    /// sends an access to the (always correct) helper.
+    /// ordinary object; also [`JIT_FLAG_READONLY`]. Only ever set (never
+    /// cleared), so a stale `1` merely sends an access to the (always correct)
+    /// helper.
     jit_flags: u8,
+    /// Bumped whenever the set of own keys (data or accessor) may have changed,
+    /// so a cache of "does this object own `k`" can be revalidated by a compare
+    /// (see [`key_epoch`](Object::key_epoch)).
+    key_epoch: u32,
     /// The `[[Prototype]]` link (`Object.create`/`getPrototypeOf`) as a raw
     /// handle ([`Handle::to_raw`](crate::heap::Handle::to_raw)), or
     /// [`NO_PROTO`] for none. A property miss walks this chain. Stored raw (one
@@ -139,16 +250,15 @@ pub struct Object {
     /// unified key order, the class tag), boxed so an ordinary data object —
     /// the overwhelmingly common case — stays small. `None` means all empty.
     extra: Option<Box<ObjectExtra>>,
-    /// Bumped whenever the set of own keys (data or accessor) may have changed,
-    /// so a cache of "does this object own `k`" can be revalidated by a compare
-    /// (see [`key_epoch`](Object::key_epoch)).
-    key_epoch: u32,
 }
 
 /// The out-of-line part of an [`Object`]: everything an ordinary data object
 /// leaves empty. Allocated on first use (see `Object::extra_mut`).
 #[derive(Default)]
 struct ObjectExtra {
+    /// Own keys that are **non-writable** (`defineProperty` with
+    /// `writable: false`): writes are silently ignored.
+    readonly: Vec<alloc::boxed::Box<str>>,
     /// Accessor properties: `(name, getter, setter)`, both held as value
     /// handles (`undefined` when absent). Kept out of the shape's slot layout.
     accessors: Vec<(alloc::boxed::Box<str>, NanBox, NanBox)>,
@@ -174,6 +284,7 @@ struct ObjectExtra {
 
 /// The all-empty [`ObjectExtra`] that reads see when an object has none.
 static EMPTY_EXTRA: ObjectExtra = ObjectExtra {
+    readonly: Vec::new(),
     accessors: Vec::new(),
     hidden: Vec::new(),
     non_configurable: Vec::new(),
@@ -189,11 +300,10 @@ impl Object {
     pub fn new(root: Rc<Shape>) -> Self {
         Self {
             data: ObjectData::Shaped {
+                len: 0,
                 shape: root,
-                slots: Vec::new(),
+                slots: Slots::new(),
             },
-            dict_shape: None,
-            readonly: Vec::new(),
             frozen: false,
             extensible: true,
             sealed: false,
@@ -337,15 +447,14 @@ impl Object {
     /// [`init_data_cached`](Self::init_data_cached). `false`, having changed
     /// nothing, when the object is not shaped or `to` is not such a child.
     pub fn jit_adopt_child(&mut self, to: Rc<Shape>, value: NanBox) -> bool {
-        let ObjectData::Shaped { shape, slots } = &mut self.data else {
+        let ObjectData::Shaped { len, shape, slots } = &mut self.data else {
             return false;
         };
-        if !to.parent().is_some_and(|p| Rc::ptr_eq(p, shape)) || slots.len() != shape.len() as usize
-        {
+        if !to.parent().is_some_and(|p| Rc::ptr_eq(p, shape)) || *len != shape.len() {
             return false;
         }
         *shape = to;
-        slots.push(value);
+        slots.push(len, value);
         self.key_epoch = self.key_epoch.wrapping_add(1);
         true
     }
@@ -482,10 +591,7 @@ impl Object {
     pub fn shape(&self) -> &Rc<Shape> {
         match &self.data {
             ObjectData::Shaped { shape, .. } => shape,
-            ObjectData::Dict { .. } => self
-                .dict_shape
-                .as_ref()
-                .expect("dictionary objects carry a sentinel shape"),
+            ObjectData::Dict { sentinel, .. } => sentinel,
         }
     }
 
@@ -511,9 +617,9 @@ impl Object {
     #[must_use]
     pub fn get(&self, key: &str) -> Option<NanBox> {
         match &self.data {
-            ObjectData::Shaped { shape, slots } => {
+            ObjectData::Shaped { len, shape, slots } => {
                 let slot = shape.lookup(key)?;
-                slots.get(slot as usize).copied()
+                slots.get(*len, slot)
             }
             ObjectData::Dict { map, .. } => map.get(key).map(|d| d.value),
         }
@@ -528,7 +634,7 @@ impl Object {
     #[must_use]
     pub fn slot(&self, slot: u32) -> Option<NanBox> {
         match &self.data {
-            ObjectData::Shaped { slots, .. } => slots.get(slot as usize).copied(),
+            ObjectData::Shaped { len, slots, .. } => slots.get(*len, slot),
             ObjectData::Dict { .. } => None,
         }
     }
@@ -545,9 +651,9 @@ impl Object {
     /// is always a genuine own data slot.
     pub fn cached_get(&self, key: &str, cache: &mut crate::ic::PropertyCache) -> Option<NanBox> {
         match &self.data {
-            ObjectData::Shaped { shape, slots } => {
+            ObjectData::Shaped { len, shape, slots } => {
                 let slot = cache.lookup(shape, key)?;
-                slots.get(slot as usize).copied()
+                slots.get(*len, slot)
             }
             // Dictionary mode carries an empty sentinel shape; route around the
             // cache entirely so it never binds (and never goes stale on a later
@@ -579,8 +685,8 @@ impl Object {
             return false;
         }
         match &mut self.data {
-            ObjectData::Shaped { shape, slots } => match cache.lookup(shape, key) {
-                Some(slot) => match slots.get_mut(slot as usize) {
+            ObjectData::Shaped { len, shape, slots } => match cache.lookup(shape, key) {
+                Some(slot) => match slots.get_mut(*len, slot) {
                     Some(cell) => {
                         *cell = value;
                         true
@@ -621,17 +727,17 @@ impl Object {
         }
         let mut added = false;
         match &mut self.data {
-            ObjectData::Shaped { shape, slots } => {
+            ObjectData::Shaped { len, shape, slots } => {
                 if let Some(slot) = shape.lookup(key) {
-                    slots[slot as usize] = value;
+                    *slots.get_mut(*len, slot).expect("slot index in range") = value;
                 } else if self.extensible {
                     *shape = shape.add(key);
-                    slots.push(value);
+                    slots.push(len, value);
                     added = true;
                 }
                 // A non-extensible object silently ignores new keys.
             }
-            ObjectData::Dict { order, map } => {
+            ObjectData::Dict { order, map, .. } => {
                 if let Some(d) = map.get_mut(key) {
                     d.value = value;
                 } else if self.extensible {
@@ -661,16 +767,16 @@ impl Object {
     pub fn force_set(&mut self, key: &str, value: NanBox) {
         let mut added = false;
         match &mut self.data {
-            ObjectData::Shaped { shape, slots } => {
+            ObjectData::Shaped { len, shape, slots } => {
                 if let Some(slot) = shape.lookup(key) {
-                    slots[slot as usize] = value;
+                    *slots.get_mut(*len, slot).expect("slot index in range") = value;
                 } else {
                     *shape = shape.add(key);
-                    slots.push(value);
+                    slots.push(len, value);
                     added = true;
                 }
             }
-            ObjectData::Dict { order, map } => {
+            ObjectData::Dict { order, map, .. } => {
                 if let Some(d) = map.get_mut(key) {
                     d.value = value;
                 } else {
@@ -724,7 +830,7 @@ impl Object {
     /// after as many deletions as there are live keys, so deletion stays
     /// amortized O(log n).
     fn compact_order(&mut self) {
-        let ObjectData::Dict { order, map } = &mut self.data else {
+        let ObjectData::Dict { order, map, .. } = &mut self.data else {
             return;
         };
         if order.len() <= 2 * map.len() + 16 {
@@ -746,7 +852,7 @@ impl Object {
     }
 
     fn convert_to_dict(&mut self) {
-        let ObjectData::Shaped { shape, slots } = &self.data else {
+        let ObjectData::Shaped { len, shape, slots } = &self.data else {
             return;
         };
         let keys = shape.keys();
@@ -754,7 +860,7 @@ impl Object {
         let mut map: BTreeMap<Box<str>, DictSlot> = BTreeMap::new();
         for k in keys {
             let slot = shape.lookup(k).expect("shape key resolves");
-            let value = slots[slot as usize];
+            let value = slots.at(*len, slot);
             map.insert(
                 Box::from(k),
                 DictSlot {
@@ -766,10 +872,10 @@ impl Object {
         }
         // A fresh empty shape so `shape()` returns a pointer that resolves no
         // key (inline caches keyed on it always miss for this object).
-        self.dict_shape = Some(Shape::root());
         self.data = ObjectData::Dict {
             order,
             map: Box::new(map),
+            sentinel: Shape::root(),
         };
     }
 
@@ -786,7 +892,7 @@ impl Object {
     #[must_use]
     pub fn slot_count(&self) -> usize {
         let data = match &self.data {
-            ObjectData::Shaped { slots, .. } => slots.len(),
+            ObjectData::Shaped { len, .. } => *len as usize,
             ObjectData::Dict { map, .. } => map.len(),
         };
         data + self.ex().accessors.len()
@@ -892,20 +998,23 @@ impl Object {
     /// Marks own property `key` non-writable (idempotent).
     pub fn set_readonly(&mut self, key: &str) {
         if !self.is_readonly(key) {
-            self.readonly.push(alloc::boxed::Box::from(key));
+            self.jit_flags |= JIT_FLAG_READONLY;
+            self.extra_mut().readonly.push(alloc::boxed::Box::from(key));
         }
     }
 
     /// Whether own property `key` is non-writable.
     #[must_use]
     pub fn is_readonly(&self, key: &str) -> bool {
-        self.readonly.iter().any(|k| k.as_ref() == key)
+        self.ex().readonly.iter().any(|k| k.as_ref() == key)
     }
 
     /// Clears the non-writable mark for `key` (a `defineProperty` redefines
     /// attributes from scratch, so the prior `writable: false` is dropped first).
     pub fn clear_readonly(&mut self, key: &str) {
-        self.readonly.retain(|k| k.as_ref() != key);
+        if let Some(x) = self.extra.as_deref_mut() {
+            x.readonly.retain(|k| k.as_ref() != key);
+        }
     }
 
     /// Marks own property `key` non-configurable (idempotent).
@@ -948,9 +1057,9 @@ impl Object {
             && !self.frozen
             && !self.sealed
             && !key.starts_with('\0')
-            && (self.readonly.is_empty() || !self.is_readonly(key))
             && self.extra.as_deref().is_none_or(|x| {
-                (x.accessors.is_empty() || self.accessor(key).is_none())
+                (x.readonly.is_empty() || !self.is_readonly(key))
+                    && (x.accessors.is_empty() || self.accessor(key).is_none())
                     && (x.hidden.is_empty() || !self.is_hidden(key))
                     && (x.non_configurable.is_empty() || !self.is_non_configurable(key))
             })
@@ -974,12 +1083,12 @@ impl Object {
             return false;
         }
         if self.ex().key_order.is_none()
-            && let ObjectData::Shaped { shape, slots } = &mut self.data
+            && let ObjectData::Shaped { len, shape, slots } = &mut self.data
             && (shape.len() as usize) < dict_threshold
             && let Some(to) = cache.transition_from(shape)
         {
             *shape = to;
-            slots.push(value);
+            slots.push(len, value);
             self.key_epoch = self.key_epoch.wrapping_add(1);
             return true;
         }
@@ -1059,7 +1168,7 @@ impl Object {
     pub fn delete_data(&mut self, root: Rc<Shape>, key: &str) {
         self.key_epoch = self.key_epoch.wrapping_add(1);
         match &mut self.data {
-            ObjectData::Shaped { shape, slots } => {
+            ObjectData::Shaped { len, shape, slots } => {
                 if !shape.contains(key) {
                     return;
                 }
@@ -1069,19 +1178,19 @@ impl Object {
                     .filter(|k| *k != key)
                     .map(|k| {
                         let slot = shape.lookup(k).expect("shape key resolves");
-                        (alloc::string::String::from(k), slots[slot as usize])
+                        (alloc::string::String::from(k), slots.at(*len, slot))
                     })
                     .collect();
                 let mut new_shape = root;
-                let mut new_slots = Vec::with_capacity(kept.len());
+                let mut values = Vec::with_capacity(kept.len());
                 for (k, v) in kept {
                     new_shape = new_shape.transition(&k);
-                    new_slots.push(v);
+                    values.push(v);
                 }
                 *shape = new_shape;
-                *slots = new_slots;
+                (*len, *slots) = Slots::from_values(values);
             }
-            ObjectData::Dict { order, map } => {
+            ObjectData::Dict { order, map, .. } => {
                 if let Some(d) = map.remove(key) {
                     order[d.pos] = None;
                 }
@@ -1110,8 +1219,8 @@ impl Object {
         if let Some(x) = self.extra.as_deref_mut() {
             x.hidden.retain(|k| k.as_ref() != key);
         }
-        self.readonly.retain(|k| k.as_ref() != key);
         if let Some(x) = self.extra.as_deref_mut() {
+            x.readonly.retain(|k| k.as_ref() != key);
             x.non_configurable.retain(|k| k.as_ref() != key);
         }
         // Drop from the unified insertion log so a later re-add of the same key
@@ -1121,7 +1230,7 @@ impl Object {
             order.retain(|k| k.as_ref() != key);
         }
         match &mut self.data {
-            ObjectData::Shaped { shape, slots } => {
+            ObjectData::Shaped { len, shape, slots } => {
                 if !shape.contains(key) {
                     return had_accessor;
                 }
@@ -1131,20 +1240,20 @@ impl Object {
                     .filter(|k| *k != key)
                     .map(|k| {
                         let slot = shape.lookup(k).expect("shape key resolves");
-                        (alloc::string::String::from(k), slots[slot as usize])
+                        (alloc::string::String::from(k), slots.at(*len, slot))
                     })
                     .collect();
                 let mut new_shape = root;
-                let mut new_slots = Vec::with_capacity(kept.len());
+                let mut values = Vec::with_capacity(kept.len());
                 for (k, v) in kept {
                     new_shape = new_shape.transition(&k);
-                    new_slots.push(v);
+                    values.push(v);
                 }
                 *shape = new_shape;
-                *slots = new_slots;
+                (*len, *slots) = Slots::from_values(values);
                 true
             }
-            ObjectData::Dict { order, map } => {
+            ObjectData::Dict { order, map, .. } => {
                 let Some(d) = map.remove(key) else {
                     return had_accessor;
                 };
@@ -1168,8 +1277,8 @@ impl Object {
             }
         };
         match &mut self.data {
-            ObjectData::Shaped { slots, .. } => {
-                for slot in slots {
+            ObjectData::Shaped { len, slots, .. } => {
+                for slot in slots.iter_mut(*len) {
                     fwd(slot);
                 }
             }
@@ -1202,8 +1311,8 @@ impl Object {
             }
         };
         match &self.data {
-            ObjectData::Shaped { slots, .. } => {
-                for slot in slots {
+            ObjectData::Shaped { len, slots, .. } => {
+                for slot in slots.iter(*len) {
                     trace_value(slot, &mut visit);
                 }
             }
@@ -1249,8 +1358,14 @@ pub(crate) struct ObjectLayout {
     /// word there is the `Rc`'s stored `NonNull<RcBox>` (the shape identity the IC
     /// compares against).
     pub shape_off: usize,
-    /// Byte offset of the `slots: Vec<NanBox>` field within `ObjectData`.
-    pub slots_off: usize,
+    /// Byte offset of the slot count (`len: u32`) within `ObjectData`.
+    pub len_off: usize,
+    /// Byte offset of the first inline slot within `ObjectData` (slot
+    /// `i < INLINE_SLOTS` at `+ 8 * i`).
+    pub inline_off: usize,
+    /// Byte offset of the spill `Vec`'s data pointer within `ObjectData`
+    /// (slot `i >= INLINE_SLOTS` at that pointer `+ 8 * (i - INLINE_SLOTS)`).
+    pub spill_ptr_off: usize,
     /// Byte offset of the data pointer within a `Vec<NanBox>`.
     pub vec_ptr_off: usize,
     /// Byte offset of the length within a `Vec<NanBox>`.
@@ -1259,12 +1374,12 @@ pub(crate) struct ObjectLayout {
     /// `Object` base) — the inline property-SET fast path bails to the helper when
     /// this byte is non-zero (a frozen object rejects writes).
     pub frozen_off: usize,
-    /// Byte offset of the `readonly: Vec<..>`'s **length** word within `Object`
-    /// (relative to the `Object` base) — the inline property-SET fast path bails to
-    /// the helper whenever this is non-zero (some own property may be non-writable).
-    pub readonly_len_off: usize,
     /// Byte offset of `jit_flags: u8` within `Object`.
     pub jit_flags_off: usize,
+    /// Byte offset of `extensible: bool` within `Object`.
+    pub extensible_off: usize,
+    /// Byte offset of `sealed: bool` within `Object`.
+    pub sealed_off: usize,
     /// Byte offset of the raw `proto` word within `Object`.
     pub proto_off: usize,
     /// Byte offset of `key_epoch: u32` within `Object`.
@@ -1289,12 +1404,11 @@ pub(crate) struct ObjectLayout {
 /// capacity and data pointer, making the by-value word scan unambiguous).
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn jit_object_layout() -> ObjectLayout {
+    // Six properties: two of them spilled, so the spill `Vec` is populated.
     let mut obj = Object::new(Shape::root());
-    // Three properties: len == 3, cap != 3 (first growth → 4), ptr is a heap
-    // address — so exactly one Vec word equals 3 (the length).
-    obj.set("a", NanBox::number(1.0));
-    obj.set("b", NanBox::number(2.0));
-    obj.set("c", NanBox::number(3.0));
+    for (i, k) in ["a", "b", "c", "d", "e", "f"].into_iter().enumerate() {
+        obj.set(k, NanBox::number(i as f64));
+    }
 
     let obj_base = core::ptr::addr_of!(obj) as usize;
     let data_off = core::ptr::addr_of!(obj.data) as usize - obj_base;
@@ -1304,18 +1418,23 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
     // in bounds and always a valid `u8`.
     #[allow(unsafe_code)]
     let shaped_disc = unsafe { *(od_base as *const u8) };
-    let ObjectData::Shaped { shape, slots } = od else {
+    let ObjectData::Shaped { len, shape, slots } = od else {
         unreachable!("a fresh object is in Shaped mode");
     };
     let shape_off = core::ptr::addr_of!(*shape) as usize - od_base;
-    let slots_off = core::ptr::addr_of!(*slots) as usize - od_base;
+    let len_off = core::ptr::addr_of!(*len) as usize - od_base;
+    let inline_off = core::ptr::addr_of!(slots.inline) as usize - od_base;
 
-    // Locate the data-pointer and length words inside the `Vec<NanBox>` by
+    // Locate the data-pointer and length words inside a `Vec<NanBox>` by
     // matching their known values against each 8-byte word of the Vec — a pure
-    // derivation from a real instance (no assumed field order).
-    let vec_base = core::ptr::addr_of!(*slots) as usize;
-    let want_ptr = slots.as_ptr() as usize;
-    let want_len = slots.len(); // == 3
+    // derivation from a real instance (no assumed field order). A `Vec`'s
+    // words sit at the same offsets whatever its element type.
+    let probe: Vec<NanBox> = alloc::vec![NanBox::undefined(); 3];
+    let mut probe = probe;
+    probe.reserve(8);
+    let vec_base = core::ptr::addr_of!(probe) as usize;
+    let want_ptr = probe.as_ptr() as usize;
+    let want_len = probe.len(); // == 3, capacity >= 11
     let words = core::mem::size_of::<Vec<NanBox>>() / core::mem::size_of::<usize>();
     let mut vec_ptr_off = usize::MAX;
     let mut vec_len_off = usize::MAX;
@@ -1333,14 +1452,14 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
         vec_ptr_off != usize::MAX && vec_len_off != usize::MAX && vec_ptr_off != vec_len_off,
         "could not derive Vec ptr/len offsets"
     );
+    let spill_ptr_off = core::ptr::addr_of!(slots.spill) as usize - od_base + vec_ptr_off;
+    // SAFETY: reading the spill Vec's pointer word of the live object.
+    #[allow(unsafe_code)]
+    let spill_word = unsafe { *((od_base + spill_ptr_off) as *const usize) };
+    assert_eq!(spill_word, slots.spill.as_ptr() as usize);
 
-    // The writability gate fields for the inline property-SET fast path, derived
-    // from the same live object (repr(C) → stable offsets, but probed not assumed).
+    // The writability gate field for the inline property-SET fast path.
     let frozen_off = core::ptr::addr_of!(obj.frozen) as usize - obj_base;
-    // `readonly`'s length word: the field offset plus the (generic) Vec length
-    // offset. A `Vec<T>`'s length lives at the same byte offset regardless of `T`,
-    // and this is cross-checked against a safe read by the JIT layout test.
-    let readonly_len_off = (core::ptr::addr_of!(obj.readonly) as usize - obj_base) + vec_len_off;
 
     // The shape's brand byte, relative to the stored `Rc` word.
     // SAFETY: reading the 8-byte `Rc<Shape>` word of a live object, in bounds.
@@ -1366,12 +1485,15 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
         data_off,
         shaped_disc,
         shape_off,
-        slots_off,
+        len_off,
+        inline_off,
+        spill_ptr_off,
         vec_ptr_off,
         vec_len_off,
         frozen_off,
-        readonly_len_off,
         jit_flags_off: core::mem::offset_of!(Object, jit_flags),
+        extensible_off: core::mem::offset_of!(Object, extensible),
+        sealed_off: core::mem::offset_of!(Object, sealed),
         proto_off: core::mem::offset_of!(Object, proto),
         epoch_off: core::mem::offset_of!(Object, key_epoch),
         extra_off,
@@ -1425,6 +1547,39 @@ mod tests {
         assert!(Rc::ptr_eq(a.shape(), b.shape()));
         assert_eq!(a.get("p").unwrap().unpack(), Unpacked::Number(1.0));
         assert_eq!(b.get("p").unwrap().unpack(), Unpacked::Number(10.0));
+    }
+
+    #[test]
+    fn inline_slots_keep_the_object_small() {
+        // The inline values use the room the old out-of-line fields took: an
+        // object (and so every heap cell) stays 96 bytes.
+        assert!(core::mem::size_of::<Object>() <= 96);
+    }
+
+    #[test]
+    fn values_spill_past_the_inline_room_and_survive_deletes() {
+        let mut o = Object::new(Shape::root());
+        let keys = ["a", "b", "c", "d", "e", "f", "g"];
+        for (i, k) in keys.iter().enumerate() {
+            o.set(k, n(i as f64));
+        }
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(o.get(k), Some(n(i as f64)));
+        }
+        assert_eq!(o.slot_count(), keys.len());
+        // Deleting an inline key moves a spilled value inline.
+        assert!(o.delete(Shape::root(), "b"));
+        for (i, k) in keys.iter().enumerate().filter(|(_, k)| **k != "b") {
+            assert_eq!(o.get(k), Some(n(i as f64)));
+        }
+        assert_eq!(o.get("b"), None);
+        assert_eq!(o.slot_count(), keys.len() - 1);
+        o.set("e", n(40.0));
+        assert_eq!(o.get("e"), Some(n(40.0)));
+        // The dictionary form keeps every value.
+        o.convert_to_dict();
+        assert_eq!(o.get("g"), Some(n(6.0)));
+        assert_eq!(o.get("e"), Some(n(40.0)));
     }
 
     #[test]
