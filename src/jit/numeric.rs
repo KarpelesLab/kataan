@@ -842,8 +842,14 @@ impl NumGen {
                         a.load_rax(sd);
                         a.test_rax_rax();
                         a.jcc(CC_E, stub);
-                        a.raw(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
-                        self.store_gpr(a, reg, RAX, dst);
+                        match self.xmm_of(reg, dst) {
+                            // movsd xmm, [rax]
+                            Some(x) => a.sse_mem_rax(0x10, x),
+                            None => {
+                                a.raw(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
+                                self.store_gpr(a, reg, RAX, dst);
+                            }
+                        }
                     }
                     Op::StoreGlobal { src, .. } => {
                         if (src as usize) >= self.env.n_regs {
@@ -852,8 +858,14 @@ impl NumGen {
                         a.load_rcx(sd);
                         a.raw(&[0x48, 0x85, 0xc9]); // test rcx, rcx
                         a.jcc(CC_E, stub);
-                        self.load_gpr(a, reg, RAX, src);
-                        a.raw(&[0x48, 0x89, 0x01]); // mov [rcx], rax
+                        match self.xmm_of(reg, src) {
+                            // movsd [rcx], xmm
+                            Some(x) => a.sse_mem_rcx(0x11, x),
+                            None => {
+                                self.load_gpr(a, reg, RAX, src);
+                                a.raw(&[0x48, 0x89, 0x01]); // mov [rcx], rax
+                            }
+                        }
                     }
                     _ => return None,
                 }
@@ -1966,6 +1978,25 @@ impl X64Assembler {
         self.code.extend_from_slice(&disp.to_le_bytes());
     }
 
+    /// `F2 [REX.R] 0F opc` with `xmm(x)` and `[rax]` (`10` load, `11` store).
+    fn sse_mem_rax(&mut self, opc: u8, x: u8) {
+        self.code.push(0xf2);
+        if x >= 8 {
+            self.code.push(0x44);
+        }
+        self.code.extend_from_slice(&[0x0f, opc, (x & 7) << 3]);
+    }
+
+    /// Likewise with `[rcx]`.
+    fn sse_mem_rcx(&mut self, opc: u8, x: u8) {
+        self.code.push(0xf2);
+        if x >= 8 {
+            self.code.push(0x44);
+        }
+        self.code
+            .extend_from_slice(&[0x0f, opc, ((x & 7) << 3) | 1]);
+    }
+
     /// `movsd xmm(x), [rbx + disp]`.
     fn movsd_x_mem(&mut self, x: u8, disp: i32) {
         self.sse_rm(0xf2, false, 0x10, x, disp);
@@ -2194,6 +2225,12 @@ mod tests {
         let mut a = X64Assembler::new();
         a.sse_rr(0xf2, 0x59, 0, 15); // mulsd xmm0, xmm15
         assert_eq!(a.code(), &[0xf2, 0x41, 0x0f, 0x59, 0xc7]);
+        let mut a = X64Assembler::new();
+        a.sse_mem_rax(0x10, 9); // movsd xmm9, [rax]
+        assert_eq!(a.code(), &[0xf2, 0x44, 0x0f, 0x10, 0x08]);
+        let mut a = X64Assembler::new();
+        a.sse_mem_rcx(0x11, 3); // movsd [rcx], xmm3
+        assert_eq!(a.code(), &[0xf2, 0x0f, 0x11, 0x19]);
         let mut a = X64Assembler::new();
         a.mov_gpr_mem(RDX, 24); // mov rdx, [rbx+24]
         assert_eq!(a.code(), &[0x48, 0x8b, 0x93, 24, 0, 0, 0]);

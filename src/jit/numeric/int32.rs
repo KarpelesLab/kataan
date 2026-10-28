@@ -269,8 +269,11 @@ pub(super) fn plan(
         temps.sort_by(|p, q| p.1.cmp(&q.1).then(p.0.cmp(&q.0)));
         let mut active: Vec<(usize, u8)> = Vec::new();
         for x in temps {
+            // A temporary whose last read is the op that defines `x` hands its
+            // GPR on: every emitter reads its operands before writing its
+            // result (computing in a scratch register first when they share).
             active.retain(|&(e, g)| {
-                if e < x.1 {
+                if e <= x.1 {
                     free.push(g);
                     false
                 } else {
@@ -312,32 +315,83 @@ pub(super) fn plan(
         if !benefit {
             return None;
         }
-        // Wrapping `+`/`-`: a sum or difference of two int32s is exact as a
-        // double, so when every use of it is a bitwise op (which takes ToInt32
-        // of it: its low 32 bits) the 32-bit wrapped result is just as good. It
-        // must be a temporary defined once, read only by all-int bitwise ops
-        // (which never bail), with nothing but constants in between (nothing
-        // else can bail or flush while the wrapped value is live).
-        let mut wraps = Vec::new();
-        for (i, op) in body.iter().enumerate() {
-            let (Op::Add { dst, a, b } | Op::AddValue { dst, a, b } | Op::Sub { dst, a, b }) = op
-            else {
-                continue;
+        // Wrapping `+`/`-`/`*`: an expression tree of these over int32s whose
+        // every intermediate is below 2^53 in magnitude is computed exactly by
+        // the doubles JavaScript uses, so when it only feeds bitwise ops (which
+        // take ToInt32 of it: the low 32 bits) the 32-bit wrapped computation
+        // gives the same bits (they are a ring homomorphism mod 2^32). Each
+        // wrapped op writes a temporary defined once and read only by all-int
+        // bitwise ops or other wrapped ops, with nothing but constants, those,
+        // in between (nothing else can bail or flush while a wrapped value is
+        // live: it is not the true Number).
+        let cval = |r: u16| consts.iter().find(|c| c.0 == r).map(|c| c.1);
+        let mut wraps: Vec<usize> = body
+            .iter()
+            .enumerate()
+            .filter_map(|(i, op)| {
+                let (Op::Add { dst, a, b }
+                | Op::AddValue { dst, a, b }
+                | Op::Sub { dst, a, b }
+                | Op::Mul { dst, a, b }) = op
+                else {
+                    return None;
+                };
+                (inn(*dst) && inn(*a) && inn(*b) && !carried(*dst) && defs_of(*dst).len() == 1)
+                    .then_some(head + i)
+            })
+            .collect();
+        loop {
+            // log2 magnitude bounds of the wrapped temporaries, in pc order.
+            let mut bound: Vec<(u16, u32)> = Vec::new();
+            let bnd = |r: u16, bound: &[(u16, u32)]| {
+                bound
+                    .iter()
+                    .find(|b| b.0 == r)
+                    .map(|b| b.1)
+                    .or_else(|| cval(r).map(|c| 32 - c.unsigned_abs().leading_zeros()))
+                    .unwrap_or(31)
             };
-            if !(inn(*dst) && inn(*a) && inn(*b)) || carried(*dst) || defs_of(*dst).len() != 1 {
-                continue;
+            for &p in &wraps {
+                let b = match bytecode[p] {
+                    Op::Mul { a, b, .. } => bnd(a, &bound) + bnd(b, &bound),
+                    Op::Add { a, b, .. } | Op::AddValue { a, b, .. } | Op::Sub { a, b, .. } => {
+                        bnd(a, &bound).max(bnd(b, &bound)) + 1
+                    }
+                    _ => u32::MAX / 2,
+                };
+                // Too wide to be exact: not wrapped, so later ops see a checked
+                // int32 (bound 31) in its place.
+                if b <= 53
+                    && let Some(d) = super::written_reg(&bytecode[p])
+                {
+                    bound.push((d, b));
+                }
             }
-            let Some(x) = info.iter().find(|x| x.0 == *dst) else {
-                continue;
-            };
-            let ok = (head + i + 1..=x.2).all(|pc| match &bytecode[pc] {
-                Op::LoadConst { dst: c, .. } => c != dst,
-                Op::ValueBin { op, a, b, .. } => (1..=VB_USHR).contains(op) && inn(*a) && inn(*b),
-                _ => false,
-            }) && x.2 > head + i;
-            if ok {
-                wraps.push(head + i);
+            let next: Vec<usize> = wraps
+                .iter()
+                .copied()
+                .filter(|&p| {
+                    let Some(d) = super::written_reg(&bytecode[p]) else {
+                        return false;
+                    };
+                    let Some(x) = info.iter().find(|x| x.0 == d) else {
+                        return false;
+                    };
+                    bound.iter().any(|b| b.0 == d)
+                        && x.2 > p
+                        && (p + 1..=x.2).all(|pc| match &bytecode[pc] {
+                            Op::LoadConst { dst: c, .. } => *c != d,
+                            Op::ValueBin { op, a, b, .. } => {
+                                (1..=VB_USHR).contains(op) && inn(*a) && inn(*b)
+                            }
+                            _ => wraps.contains(&pc),
+                        })
+                })
+                .collect();
+            if next == wraps {
+                break;
             }
+            wraps = next;
         }
         return Some(IntPlan {
             ints: cset,
@@ -745,8 +799,13 @@ impl NumGen {
                     a.load_rax(sd);
                     a.test_rax_rax();
                     a.jcc(CC_E, stub);
+                    // The value converts straight from memory; the exactness
+                    // check (off the dependency chain) compares the bits.
+                    a.raw(&[0xf2, 0x0f, 0x2c, 0x08]); // cvttsd2si ecx, [rax]
                     a.raw(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
-                    a.exact_i32_check(RCX);
+                    a.cvtsi2sd32(0, RCX);
+                    a.movq_gpr_x(R11, 0);
+                    a.cmp_rax_r11();
                     let bail = self.ibail(a);
                     a.jcc(CC_NE, bail);
                     a.mov32_rr(d, RCX);
@@ -767,8 +826,7 @@ impl NumGen {
                     a.raw(&[0x48, 0x85, 0xc9]); // test rcx, rcx
                     a.jcc(CC_E, stub);
                     self.icvt(a, 0, src)?;
-                    a.movq_gpr_x(RAX, 0);
-                    a.raw(&[0x48, 0x89, 0x01]); // mov [rcx], rax
+                    a.raw(&[0xf2, 0x0f, 0x11, 0x01]); // movsd [rcx], xmm0
                     a.bind(resume);
                     self.stub(stub, resume, reg, StubKind::GlobalRef { pc, retry });
                 }
@@ -809,6 +867,14 @@ impl NumGen {
         };
         let gx = self.ival(a, x, RDX)?;
         let gy = self.ival(a, y, RCX)?;
+        if self.iplan().is_some_and(|p| p.wraps.contains(&self.cur_pc)) {
+            // Wrapped (see `plan`): only the low 32 bits matter, `-0` included.
+            let t = if d != gx && d != gy { d } else { RAX };
+            a.mov32_rr(t, gx);
+            a.imul32_rr(t, gy);
+            a.mov32_rr(d, t);
+            return Some(());
+        }
         a.mov32_rr(RAX, gx);
         a.imul32_rr(RAX, gy);
         let bail = self.ibail(a);
@@ -1239,7 +1305,7 @@ mod tests {
         for x in &ip.slots {
             for y in &ip.slots {
                 if !core::ptr::eq(x, y) && x.gpr == y.gpr {
-                    assert!(x.end < y.start || y.end < x.start);
+                    assert!(x.end <= y.start || y.end <= x.start);
                 }
             }
         }
@@ -1251,6 +1317,27 @@ mod tests {
         let (qops, ..) = crate::jit::lower_nbvm_generic(&q).expect("generic");
         let qr = super::super::plan_regions(&qops, &q.ops, &[], q.n_regs);
         assert!(qr.iter().all(|r| r.int.is_none()));
+    }
+
+    #[test]
+    fn wrapping_needs_exact_intermediates() {
+        // `h * 31 + i` stays below 2^53: both ops wrap. `k * k` (two int32s)
+        // may not be exact as a double: it checks overflow (the sum over that
+        // checked int32 still wraps).
+        let p = proto_of(
+            "function f(n){ let h = 0, k = 0; for (let i = 0; i < n; i = i - -1) { h = (h * 31 + i) | 0; k = (k * k + i) | 0; } return h + k; }",
+            "f",
+        );
+        let (ops, ..) = crate::jit::lower_nbvm_generic(&p).expect("generic");
+        let regions = super::super::plan_regions(&ops, &p.ops, &[], p.n_regs);
+        let ip = regions[0].int.as_ref().expect("an integer version");
+        let pcs = |pred: &dyn Fn(&Op) -> bool| -> Vec<usize> {
+            (0..p.ops.len()).filter(|&pc| pred(&p.ops[pc])).collect()
+        };
+        let muls = pcs(&|o| matches!(o, Op::Mul { .. }));
+        let adds = pcs(&|o| matches!(o, Op::AddValue { .. }));
+        assert!(ip.wraps.contains(&muls[0]) && ip.wraps.contains(&adds[0]));
+        assert!(!ip.wraps.contains(&muls[1]) && ip.wraps.contains(&adds[1]));
     }
 
     #[test]
