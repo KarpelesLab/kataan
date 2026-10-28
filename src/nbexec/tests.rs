@@ -12859,3 +12859,28 @@ fn typed_array_integer_stores_of_huge_numbers_and_index_fast_paths() {
     "#;
     assert_eq!(run(src), "0,0,0,127|2.5,0|||4294967295|0|");
 }
+
+/// Top-level numeric loops over script bindings (which the JIT's integer
+/// version keeps in registers): the stored values are visible after the loop,
+/// after early exits and to functions; a binding that turns double or string
+/// mid-loop, a `const` store and a TDZ read behave as in the interpreter.
+#[test]
+fn hot_loops_over_global_bindings() {
+    let src = r#"
+        let a = 0, b = 1.5, d = 0, e = 0, m = 0;
+        for (let i = 0; i < 200000; i++) { a = (a + i * 3) | 0; b = b * 0.999 + 0.5; }
+        for (let i = 0; i < 5000; i++) { d = d + 1; if (i === 3000) d = d + 0.25; }
+        for (let i = 0; i < 5000; i++) { e = e + 2; if (i === 4000) e = "s"; }
+        for (let i = 0; i < 100000; i++) { m = m + 3; if (m > 50000) break; }
+        function readM() { return m; }
+        const K = 7; let s = 0, err = "";
+        try { for (let i = 0; i < 3000; i++) { s = s + K; if (i === 2000) K = 1; } } catch (x) { err = x.constructor.name; }
+        try { for (let i = 0; i < 3000; i++) { if (i === 2500) late = late + 1; } } catch (x) { err += x.constructor.name; }
+        let late = 1;
+        [a, Math.round(b), d, e.length, readM(), s, err].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "-129842144|500|5000.25|1000|50001|14007|TypeErrorReferenceError"
+    );
+}

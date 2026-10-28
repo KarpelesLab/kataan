@@ -354,7 +354,7 @@ enum StubKind {
     /// interpreter if it does not qualify.
     GlobalRef { pc: usize, retry: Label },
     /// The integer version gives up at bytecode pc `pc` (see [`int32`]).
-    Bail { pc: u32 },
+    Bail { pc: u32, store: bool },
 }
 
 struct Stub {
@@ -471,11 +471,20 @@ impl NumGen {
                 *t = true;
             }
         }
-        let regions = plan_regions(ops, bytecode, catches, env.n_regs);
+        let mut regions = plan_regions(ops, bytecode, catches, env.n_regs);
         let mut region_of = vec![u32::MAX; n];
         let mut gslot = vec![u32::MAX; n];
         let mut region_gslots = vec![Vec::new(); regions.len()];
         let mut n_gslots = 0u32;
+        // The integer versions' promoted globals' binding addresses.
+        for r in &mut regions {
+            if let Some(p) = r.int.as_mut() {
+                for g in &mut p.globals {
+                    g.slot = n_gslots;
+                    n_gslots += 1;
+                }
+            }
+        }
         for (i, r) in regions.iter().enumerate() {
             for pc in r.head..=r.end {
                 region_of[pc] = i as u32;
@@ -994,6 +1003,7 @@ impl NumGen {
             {
                 StubKind::Bail {
                     pc: self.cur_pc as u32,
+                    store: true,
                 }
             }
             k => k,
@@ -1521,9 +1531,9 @@ impl NumGen {
             self.cur_pc = s.pc;
             self.imode = if s.int { s.region } else { None };
             match s.kind {
-                StubKind::Bail { pc } => {
+                StubKind::Bail { pc, store } => {
                     if let Some(ri) = s.region {
-                        self.emit_bail(a, labels, ri, pc as usize);
+                        self.emit_bail(a, labels, ri, pc as usize, store);
                     }
                 }
                 StubKind::CanonNan => {
@@ -1582,7 +1592,7 @@ impl NumGen {
                         && let Some(ri) = s.region
                     {
                         // The double version runs the op.
-                        self.emit_bail(a, labels, ri, pc);
+                        self.emit_bail(a, labels, ri, pc, true);
                         continue;
                     }
                     // Not a plain global binding: the interpreter's op.
@@ -1905,7 +1915,8 @@ fn plan_regions(
                 dirty: x.4,
             });
         }
-        let int = int32::plan(bytecode, head, end, &info, &carried_r);
+        let dbl_xmm: Vec<u8> = slots.iter().map(|s| s.xmm).collect();
+        let int = int32::plan(bytecode, head, end, &info, &carried_r, n_regs, &dbl_xmm);
         out.push(Region {
             head,
             end,

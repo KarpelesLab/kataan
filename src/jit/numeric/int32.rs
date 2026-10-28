@@ -77,14 +77,33 @@ pub(super) struct IntPlan {
     /// Int registers that are constant temporaries: `(reg, value, start, end)`.
     consts: Vec<(u16, i32, usize, usize)>,
     slots: Vec<ISlot>,
-    /// The pcs of the `+`/`-` ops that wrap instead of checking for overflow.
+    /// The pcs of the `+`/`-`/`*` ops that wrap instead of checking overflow.
     wraps: Vec<usize>,
+    /// The promoted global bindings.
+    pub(super) globals: Vec<PGlobal>,
     /// The integer version's entry (region entry jumps here first).
     pub(super) entry: Option<Label>,
     /// The double version's entry (its header loads).
     pub(super) dbl_entry: Option<Label>,
     /// Bound past the integer entry checks: in-version branches to the header.
     inner: Option<Label>,
+}
+
+/// A global binding the integer version keeps in a register: `vreg` (a
+/// pseudo-register past the register file) lives in an int GPR (an `ISlot`) or
+/// in `xmm`. Region entry validates the binding's address (the interpreter's
+/// fast-path conditions, `jit_helper_global_ref`, for both its load and its
+/// store op) into frame slot `slot` and loads the value; stores to it are only
+/// written back to the binding at exits, bails and before the back-edge poll
+/// (the only call), after which the address is validated again. Nothing else
+/// can observe the binding meanwhile: only calls run other code.
+pub(super) struct PGlobal {
+    vreg: u16,
+    load_pc: Option<usize>,
+    store_pc: Option<usize>,
+    xmm: Option<u8>,
+    dirty: bool,
+    pub(super) slot: u32,
 }
 
 impl IntPlan {
@@ -111,18 +130,86 @@ fn const_i32(v: NanBox) -> Option<i32> {
 /// Plans the integer version of region `head..=end` (`info`: per register named
 /// in it, `(reg, first, last, mentions, written)`; `carried`: live into the
 /// header or out of the region). `None` when no integer arithmetic would run.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn plan(
     bytecode: &[Op],
     head: usize,
     end: usize,
     info: &[(u16, usize, usize, u32, bool)],
     carried: &dyn Fn(u16) -> bool,
+    n_regs: usize,
+    dbl_xmm: &[u8],
 ) -> Option<IntPlan> {
     use crate::nbvm::{VB_LOOSE_EQ, VB_LOOSE_NEQ, VB_SHR, VB_USHR};
     let body = &bytecode[head..=end];
+    // Promoted global bindings: each named global the loop reads or writes is
+    // a pseudo-register `n_regs + k`, loop-carried, written back at exits and
+    // before calls (see `PGlobal`).
+    let mut gnames: Vec<&str> = Vec::new();
+    let mut promote = true;
+    for op in body {
+        match op {
+            Op::LoadGlobal { dst, name, .. } => {
+                promote &= (*dst as usize) < n_regs && !name.starts_with('\u{1}');
+                if !gnames.contains(&name.as_str()) {
+                    gnames.push(name);
+                }
+            }
+            Op::StoreGlobal {
+                src,
+                name,
+                strict,
+                resolved,
+                ..
+            } => {
+                promote &= (*src as usize) < n_regs
+                    && !(*strict && resolved.is_some())
+                    && !name.starts_with('\u{1}');
+                if !gnames.contains(&name.as_str()) {
+                    gnames.push(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    let free_xmm: Vec<u8> = (super::FIRST_XMM..super::FIRST_XMM + super::MAX_PROMOTED as u8)
+        .filter(|x| !dbl_xmm.contains(x))
+        .collect();
+    if !promote
+        || gnames.len() > 4
+        || gnames.len() > free_xmm.len()
+        || n_regs + gnames.len() > 0xffff
+    {
+        gnames.clear();
+    }
+    let vreg_of = |name: &str| {
+        gnames
+            .iter()
+            .position(|g| *g == name)
+            .map(|k| (n_regs + k) as u16)
+    };
+    // The pseudo-registers join the register table: carried, written when the
+    // loop stores the global.
+    let mut info_v: Vec<(u16, usize, usize, u32, bool)> = info.to_vec();
+    for (k, g) in gnames.iter().enumerate() {
+        let mentions = body
+            .iter()
+            .filter(|op| matches!(op, Op::LoadGlobal { name, .. } | Op::StoreGlobal { name, .. } if name == g))
+            .count() as u32;
+        let written = body
+            .iter()
+            .any(|op| matches!(op, Op::StoreGlobal { name, .. } if name == g));
+        info_v.push(((n_regs + k) as u16, head, end, mentions, written));
+    }
+    let info = &info_v[..];
+    let carried = |r: u16| (r as usize) >= n_regs || carried(r);
     let mut defs: Vec<(u16, Vec<usize>)> = info.iter().map(|x| (x.0, Vec::new())).collect();
     for (i, op) in body.iter().enumerate() {
-        if let Some(d) = super::written_reg(op)
+        let d = match op {
+            Op::StoreGlobal { name, .. } => vreg_of(name),
+            _ => super::written_reg(op),
+        };
+        if let Some(d) = d
             && let Some(e) = defs.iter_mut().find(|e| e.0 == d)
         {
             e.1.push(head + i);
@@ -178,10 +265,19 @@ pub(super) fn plan(
                 Op::ToNumeric { src, .. } | Op::Step { src, .. } | Op::Neg { a: src, .. } => {
                     inn(*src)
                 }
-                Op::BitNot { .. } | Op::LoadGlobal { .. } => true,
+                // A promoted global reads / writes its pseudo-register.
+                Op::LoadGlobal { name, .. } => vreg_of(name).is_none_or(inn),
+                Op::StoreGlobal { src, .. } => inn(*src),
+                Op::BitNot { .. } => true,
                 _ => false,
             };
             let useful = |r: u16, du_d: &mut Vec<u16>, du_u: &mut Vec<u16>| {
+                if (r as usize) >= n_regs {
+                    // A promoted global: some load of it feeds an int register.
+                    return body.iter().any(|op| {
+                        matches!(op, Op::LoadGlobal { dst, name, .. } if vreg_of(name) == Some(r) && inn(*dst))
+                    });
+                }
                 body.iter().any(|op| {
                     def_use(op, du_d, du_u);
                     if !du_u.contains(&r) {
@@ -311,10 +407,35 @@ pub(super) fn plan(
             | Op::ValueBin { dst, .. } => inn(*dst),
             Op::Lt { a, b, .. } | Op::Compare { a, b, .. } => inn(*a) && inn(*b),
             _ => false,
-        });
+        }) || !gnames.is_empty();
         if !benefit {
             return None;
         }
+        let mut xmms = free_xmm.iter().copied();
+        let globals: Vec<PGlobal> = gnames
+            .iter()
+            .enumerate()
+            .map(|(k, g)| {
+                let vreg = (n_regs + k) as u16;
+                let pc_of = |store: bool| {
+                    body.iter()
+                        .position(|op| match op {
+                            Op::LoadGlobal { name, .. } => !store && name == g,
+                            Op::StoreGlobal { name, .. } => store && name == g,
+                            _ => false,
+                        })
+                        .map(|i| head + i)
+                };
+                PGlobal {
+                    vreg,
+                    load_pc: pc_of(false),
+                    store_pc: pc_of(true),
+                    xmm: if inn(vreg) { None } else { xmms.next() },
+                    dirty: pc_of(true).is_some(),
+                    slot: u32::MAX,
+                }
+            })
+            .collect();
         // Wrapping `+`/`-`/`*`: an expression tree of these over int32s whose
         // every intermediate is below 2^53 in magnitude is computed exactly by
         // the doubles JavaScript uses, so when it only feeds bitwise ops (which
@@ -398,6 +519,7 @@ pub(super) fn plan(
             consts,
             slots,
             wraps,
+            globals,
             entry: None,
             dbl_entry: None,
             inner: None,
@@ -480,7 +602,7 @@ impl NumGen {
             }
         }
         for s in &p.slots {
-            if s.dirty && s.start <= pc && pc <= s.end {
+            if s.dirty && s.start <= pc && pc <= s.end && !self.is_greg(s.reg) {
                 a.cvtsi2sd32(0, s.gpr);
                 a.movsd_mem_x(disp(s.reg), 0);
             }
@@ -491,6 +613,152 @@ impl NumGen {
                 a.store_rax(disp(r));
             }
         }
+        self.gstore(a, p);
+    }
+
+    /// Whether `r` is a promoted global's pseudo-register.
+    fn is_greg(&self, r: u16) -> bool {
+        r as usize >= self.env.n_regs
+    }
+
+    /// The GPR an int pseudo-register lives in (carried: the whole region).
+    fn ggpr(p: &IntPlan, vreg: u16) -> Option<u8> {
+        p.slots.iter().find(|s| s.reg == vreg).map(|s| s.gpr)
+    }
+
+    /// Writes the stored-to promoted globals back to their bindings. Clobbers
+    /// `rcx` and `xmm0`.
+    fn gstore(&self, a: &mut X64Assembler, p: &IntPlan) {
+        for g in p.globals.iter().filter(|g| g.dirty) {
+            a.load_rcx(self.gslot_disp(g.slot));
+            match (g.xmm, Self::ggpr(p, g.vreg)) {
+                (Some(x), _) => a.sse_mem_rcx(0x11, x), // movsd [rcx], x
+                (None, Some(gpr)) => {
+                    a.cvtsi2sd32(0, gpr);
+                    a.sse_mem_rcx(0x11, 0);
+                }
+                (None, None) => {}
+            }
+        }
+    }
+
+    /// Validates every promoted global's binding address into its frame slot
+    /// (the load and the store op must both qualify, at one address); jumps to
+    /// `fail` otherwise. A call per op: clobbers every caller-saved register.
+    fn gvalidate(&self, a: &mut X64Assembler, p: &IntPlan, fail: Label) {
+        for g in &p.globals {
+            let sd = self.gslot_disp(g.slot);
+            for (i, pc) in [g.load_pc, g.store_pc].into_iter().flatten().enumerate() {
+                a.mov_rdi_r15();
+                a.movabs_argreg(1, self.env.bytecode.wrapping_add(pc) as i64);
+                a.movabs_rax(self.env.global_ref as i64);
+                a.call_rax();
+                a.test_rax_rax();
+                a.jcc(CC_E, fail);
+                if i == 0 {
+                    a.store_rax(sd);
+                } else {
+                    a.load_rcx(sd);
+                    a.raw(&[0x48, 0x39, 0xc8]); // cmp rax, rcx
+                    a.jcc(CC_NE, fail);
+                }
+            }
+        }
+    }
+
+    /// Loads the promoted globals from their (validated) bindings; jumps to
+    /// `fail` when an int one does not hold an exact int32.
+    fn gload(&self, a: &mut X64Assembler, p: &IntPlan, fail: Label) {
+        for g in &p.globals {
+            a.load_rax(self.gslot_disp(g.slot));
+            match (g.xmm, Self::ggpr(p, g.vreg)) {
+                (Some(x), _) => a.sse_mem_rax(0x10, x), // movsd x, [rax]
+                (None, Some(gpr)) => {
+                    a.raw(&[0xf2, 0x0f, 0x2c, 0x08]); // cvttsd2si ecx, [rax]
+                    a.raw(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
+                    a.cvtsi2sd32(0, RCX);
+                    a.movq_gpr_x(R11, 0);
+                    a.cmp_rax_r11();
+                    a.jcc(CC_NE, fail);
+                    a.mov32_rr(gpr, RCX);
+                }
+                (None, None) => {}
+            }
+        }
+    }
+
+    /// Whether `op` reads or writes a promoted global.
+    fn promoted_global_op(&self, op: &Op) -> bool {
+        match op {
+            Op::LoadGlobal { name, .. } | Op::StoreGlobal { name, .. } => {
+                self.pglobal(name).is_some()
+            }
+            _ => false,
+        }
+    }
+
+    /// A `LoadGlobal` / `StoreGlobal` of a promoted global: a move from / to
+    /// its pseudo-register.
+    fn iglobal(&self, a: &mut X64Assembler, pc: usize) -> Option<()> {
+        let reg = self.imode;
+        let (load, r, name) = match self.bc(pc)? {
+            Op::LoadGlobal { dst, name, .. } => (true, *dst, name.as_str()),
+            Op::StoreGlobal { src, name, .. } => (false, *src, name.as_str()),
+            _ => return None,
+        };
+        let g = self.pglobal(name)?;
+        let (vreg, gx) = (g.vreg, g.xmm);
+        let p = self.iplan()?;
+        let gg = Self::ggpr(p, vreg);
+        match (load, gx, gg) {
+            // Int global.
+            (true, None, Some(gpr)) => {
+                if self.is_int(r) {
+                    let IK::Gpr(d) = self.ik(r)? else {
+                        return None;
+                    };
+                    a.mov32_rr(d, gpr);
+                } else {
+                    a.cvtsi2sd32(0, gpr);
+                    self.store_xmm0(a, reg, r);
+                }
+            }
+            (false, None, Some(gpr)) => {
+                // Planned: a store into an int global is of an int register.
+                let s = self.ival(a, r, RAX)?;
+                a.mov32_rr(gpr, s);
+            }
+            // Double global.
+            (true, Some(x), _) => {
+                if self.is_int(r) {
+                    return None;
+                }
+                match self.xmm_of(reg, r) {
+                    Some(xd) => a.movapd_xx(xd, x),
+                    None => a.movsd_mem_x(disp(r), x),
+                }
+            }
+            (false, Some(x), _) => {
+                if self.is_int(r) {
+                    self.icvt(a, x, r)?;
+                } else {
+                    let s = self.xmm_src(a, reg, r, 0);
+                    a.movapd_xx(x, s);
+                }
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    /// The promoted global `name`, if the integer version being emitted has it.
+    fn pglobal(&self, name: &str) -> Option<&PGlobal> {
+        let p = self.iplan()?;
+        p.globals.iter().find(|g| {
+            [g.load_pc, g.store_pc].into_iter().flatten().any(|pc| {
+                matches!(self.bc(pc), Some(Op::LoadGlobal { name: n, .. } | Op::StoreGlobal { name: n, .. }) if n == name)
+            })
+        })
     }
 
     /// The integer version's `reload` (after a call, which `iflush` preceded).
@@ -505,7 +773,7 @@ impl NumGen {
             }
         }
         for s in &p.slots {
-            if s.start <= pc && pc <= s.end {
+            if s.start <= pc && pc <= s.end && !self.is_greg(s.reg) {
                 // Exact: the register file holds the int32 `iflush` (or the
                 // region's entry) left there.
                 a.cvttsd2si32_mem(s.gpr, disp(s.reg));
@@ -518,19 +786,35 @@ impl NumGen {
         let entry = a.new_label();
         let resume = a.new_label();
         let pc = self.cur_pc as u32;
-        self.stub(entry, resume, self.imode, StubKind::Bail { pc });
+        self.stub(
+            entry,
+            resume,
+            self.imode,
+            StubKind::Bail { pc, store: true },
+        );
         entry
     }
 
     /// A bail's body (in `finish`): materialize the int registers live at `pc`
-    /// into the double version's locations, then continue in its code for `pc`.
-    pub(super) fn emit_bail(&self, a: &mut X64Assembler, labels: &[Label], ri: usize, pc: usize) {
+    /// into the double version's locations and (`store`) write the promoted
+    /// globals back to their bindings, then continue in its code for `pc`.
+    pub(super) fn emit_bail(
+        &self,
+        a: &mut X64Assembler,
+        labels: &[Label],
+        ri: usize,
+        pc: usize,
+        store: bool,
+    ) {
         let Some(p) = self.regions[ri].int.as_ref() else {
             return;
         };
         let reg = Some(ri);
+        if store {
+            self.gstore(a, p);
+        }
         for s in &p.slots {
-            if s.start <= pc && pc <= s.end {
+            if s.start <= pc && pc <= s.end && !self.is_greg(s.reg) {
                 let _ = self.ishadow(a, reg, s.reg);
             }
         }
@@ -568,9 +852,12 @@ impl NumGen {
         }
         self.cur_pc = head;
         a.bind(entry);
-        // Entry: every carried int register must be an exact int32 now.
+        // Entry: the promoted globals' bindings must qualify (before anything is
+        // loaded: these are calls), every carried int register must be an exact
+        // int32 now.
+        self.gvalidate(a, p, dbl_entry);
         for s in &p.slots {
-            if s.carried {
+            if s.carried && !self.is_greg(s.reg) {
                 a.load_rax(disp(s.reg));
                 a.exact_i32_check(RCX);
                 a.jcc(CC_NE, dbl_entry);
@@ -582,6 +869,7 @@ impl NumGen {
                 a.movsd_x_mem(s.xmm, disp(s.reg));
             }
         }
+        self.gload(a, p, dbl_entry);
         self.zero_globals(a, Some(ri));
         let inner = ilabels[head];
         a.bind(inner);
@@ -747,10 +1035,43 @@ impl NumGen {
                 a.cmp_rax_r11();
                 a.je(throw_exit);
                 a.store_rax_frame8(super::COUNTDOWN);
+                let p = self.regions[ri].int.as_ref()?;
+                let has_globals = !p.globals.is_empty();
+                let (vfail, lfail) = (a.new_label(), a.new_label());
+                if has_globals {
+                    // The poll may have moved or retired the bindings.
+                    self.gvalidate(a, p, vfail);
+                }
                 self.ireload(a, ri);
+                if has_globals {
+                    self.gload(a, p, lfail);
+                }
                 self.zero_globals(a, reg);
                 a.bind(skip);
                 a.jmp(inner);
+                if has_globals {
+                    // A binding no longer qualifies: the double version (which
+                    // reads the bindings op by op) finishes the loop. The
+                    // bindings are already up to date.
+                    let entry = a.new_label();
+                    let resume = a.new_label();
+                    a.bind(vfail);
+                    self.ireload(a, ri);
+                    a.bind(lfail);
+                    a.jmp(entry);
+                    self.stub(
+                        entry,
+                        resume,
+                        reg,
+                        StubKind::Bail {
+                            pc: pc as u32,
+                            store: false,
+                        },
+                    );
+                }
+            }
+            GenericOp::Interp { .. } if self.promoted_global_op(bc) => {
+                self.iglobal(a, pc)?;
             }
             GenericOp::Interp { .. } => match *bc {
                 Op::Neg { dst, a: src } if ii(self, dst) => {
