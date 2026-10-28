@@ -47,6 +47,7 @@
 //! exactly as before. New callers should migrate to the u16 API.
 
 mod compile;
+mod linear;
 mod parser;
 mod props;
 mod props_data;
@@ -142,6 +143,9 @@ pub struct Regex {
     /// [`program_lead_run`]): a failed attempt then rules out every start
     /// inside the same run.
     lead_run: Option<usize>,
+    /// The program as a straight step sequence, when it is one (see
+    /// [`linear`]): the same matches as `prog`, without the recursive VM.
+    linear: Option<linear::Linear>,
     /// Number of capturing groups (excluding the whole-match group 0).
     group_count: usize,
     /// `(group index, name)` pairs for named capture groups (`(?<name>…)`).
@@ -270,6 +274,7 @@ impl Regex {
             },
             first_unit,
             lead_run: program_lead_run(&prog, flags),
+            linear: linear::Linear::build(&prog, flags, 2 * (group_count + 1)),
             prog,
             scalar_prog: core::cell::OnceCell::new(),
             source: alloc::string::String::from(pattern),
@@ -303,6 +308,19 @@ impl Regex {
                 .map(|(sp, _)| sp)
                 .unwrap_or_default()
         })
+    }
+
+    /// Whether the linear matcher stands in for the VM on this regex.
+    #[cfg(test)]
+    pub(crate) fn is_linear(&self) -> bool {
+        self.linear.is_some()
+    }
+
+    /// This regex matched by the VM only (to check the linear matcher).
+    #[cfg(test)]
+    pub(crate) fn without_linear(mut self) -> Self {
+        self.linear = None;
+        self
     }
 
     /// The number of capturing groups (excluding group 0).
@@ -471,6 +489,30 @@ impl Regex {
         };
         // One set of working buffers for the whole scan (see `vm::Scratch`).
         let mut scratch = vm::Scratch::default();
+        // The linear matcher stands in for the VM (and its start filters) on
+        // the program it was built from — never the scalar adapter program —
+        // under the flags it was built with.
+        if let Some(lin) = &self.linear
+            && core::ptr::eq(prog, self.prog.as_slice())
+        {
+            let slots = lin.slots();
+            let mut buf = [usize::MAX; 32];
+            let mut heap: Vec<usize>;
+            let saves: &mut [usize] = if slots <= buf.len() {
+                &mut buf[..slots]
+            } else {
+                heap = alloc::vec![usize::MAX; slots];
+                &mut heap
+            };
+            lin.find(prog, units, start, last, flags, saves, &steps, budget)?;
+            let groups = saves
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[a, b]| (a != usize::MAX && b != usize::MAX).then_some((a, b)))
+                .collect();
+            return Some(Captures { groups });
+        }
         // Only offsets in `s..=last` are candidate starts, so both filters below
         // search *that* range, not the rest of the subject. An anchored or sticky
         // pattern has `last == start`, and scanning megabytes for a start unit

@@ -154,7 +154,7 @@ impl Interp {
         // compact cell field; synthesize the descriptor when it has not been
         // materialized into the aux object.
         if key == "lastIndex"
-            && self.realm.regexp_at(obj).is_some()
+            && self.realm.regexp_flags(obj).is_some()
             && !self.realm.regex_aux_last_index_defined(obj)
         {
             let v = NanBox::number(self.realm.regex_last_index(obj) as f64);
@@ -1090,7 +1090,7 @@ impl Interp {
         // `writable:false` default). `exec`'s `set_last_index_value` keeps the aux
         // slot in sync with the cell once it exists.
         if key == "lastIndex"
-            && self.realm.regexp_at(obj).is_some()
+            && self.realm.regexp_flags(obj).is_some()
             && !self.realm.regex_aux_last_index_defined(obj)
         {
             let cur = NanBox::number(self.realm.regex_last_index(obj) as f64);
@@ -2162,7 +2162,7 @@ impl Interp {
         // RegExp's own `lastIndex` are non-configurable synthesized properties, so
         // `[[Delete]]` returns false. `delete_property` only tracks physical slots,
         // so guard those exotics via their descriptor here.
-        if (self.realm.string_object_len(obj).is_some() || self.realm.regexp_at(obj).is_some())
+        if (self.realm.string_object_len(obj).is_some() || self.realm.regexp_flags(obj).is_some())
             && let Some(desc) = self.build_descriptor(obj, key)
             && let Some(dh) = desc.as_handle().map(Handle::from_raw)
             && self
@@ -2295,7 +2295,7 @@ impl Interp {
         // levels are exactly that: `Object.freeze(re)` must turn `lastIndex`
         // non-writable (and `TestIntegrityLevel` must see it), so materialize the
         // aux slot before the object goes rigid.
-        if self.realm.regexp_at(obj).is_some() && !self.realm.regex_aux_last_index_defined(obj) {
+        if self.realm.regexp_flags(obj).is_some() && !self.realm.regex_aux_last_index_defined(obj) {
             let cur = NanBox::number(self.realm.regex_last_index(obj) as f64);
             self.realm.set_property(obj, "lastIndex", cur);
             self.realm.mark_hidden(obj, "lastIndex");
@@ -2565,7 +2565,7 @@ impl Interp {
             "String"
         } else if self.realm.date_at(h).is_some() {
             "Date"
-        } else if self.realm.regexp_at(h).is_some() {
+        } else if self.realm.regexp_flags(h).is_some() {
             "RegExp"
         } else if self.is_error_object(h) {
             "Error"
@@ -2668,7 +2668,7 @@ impl Interp {
                 // A RegExp instance's `lastIndex` is always an own data property
                 // (stored as a compact cell field, so not reported by `has_own`
                 // until materialized).
-                || (key == "lastIndex" && self.realm.regexp_at(c).is_some());
+                || (key == "lastIndex" && self.realm.regexp_flags(c).is_some());
             if here {
                 return Ok(true);
             }
@@ -2842,7 +2842,7 @@ impl Interp {
             "Array"
         } else if self.realm.is_string_handle(handle) {
             "String"
-        } else if self.realm.regexp_at(handle).is_some() {
+        } else if self.realm.regexp_flags(handle).is_some() {
             "RegExp"
         } else if self.realm.bigint_at(handle).is_some() {
             "BigInt"

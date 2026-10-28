@@ -128,7 +128,7 @@ impl Interp {
         if !matches!(m.unpack(), Unpacked::Undefined) {
             return Ok(self.realm.truthy(m));
         }
-        Ok(self.realm.regexp_at(h).is_some())
+        Ok(self.realm.regexp_flags(h).is_some())
     }
 
     /// Builds `RegExp.prototype` as a real object: first-class `exec`/`test`/
@@ -459,7 +459,7 @@ impl Interp {
     /// an actual RegExp instance, else `None`.
     fn this_regexp(&self, this: NanBox) -> Option<Handle> {
         let h = this.as_handle().map(Handle::from_raw)?;
-        self.realm.regexp_at(h).map(|_| h)
+        self.realm.regexp_flags(h).map(|_| h)
     }
 
     /// The *currently-running* realm's `%RegExp.prototype%` sentinel — the main
@@ -769,6 +769,22 @@ impl Interp {
         // `while ((m = re.exec(s)))`) re-execs against the same string, and
         // redoing this per match is what made those operations quadratic.
         let (input, units) = self.subject_units_cached(s_value)?;
+        self.regexp_builtin_match_on(h, input, units, true)
+    }
+
+    /// [`regexp_builtin_match`](Self::regexp_builtin_match) on a subject
+    /// already converted: `input` is the string, `units` its code units. With
+    /// `legacy` false the Annex B legacy match record is left alone, for a
+    /// caller that runs several matches with no user code in between and
+    /// records only the last one (nothing can observe the earlier ones).
+    #[cfg(feature = "regex")]
+    fn regexp_builtin_match_on(
+        &mut self,
+        h: Handle,
+        input: NanBox,
+        units: alloc::rc::Rc<Vec<u16>>,
+        legacy: bool,
+    ) -> Result<Option<RegexMatch>, ExecError> {
         // `lastIndex` is read via Get and ToLength'd (so a throwing valueOf
         // surfaces) — this is step 2, *before* the flags are read in step 3. The
         // order is observable: a `lastIndex.valueOf` may call `re.compile(…)`,
@@ -823,7 +839,9 @@ impl Interp {
                 }
                 // Annex B.2.5: update the RegExp legacy static match record from
                 // this successful match (read by `RegExp.$1`/`lastMatch`/…).
-                self.update_legacy_regexp(&units, &c);
+                if legacy {
+                    self.update_legacy_regexp(&units, &c);
+                }
                 Ok(Some(RegexMatch {
                     units,
                     input,
@@ -861,9 +879,9 @@ impl Interp {
         for (i, g) in groups.iter_mut().enumerate() {
             *g = c.group(i + 1);
         }
-        let mut st = self.realm.legacy_regexp().clone();
-        st.record(units.clone(), c.whole(), groups);
-        self.realm.set_legacy_regexp(st);
+        self.realm
+            .legacy_regexp_mut()
+            .record(units.clone(), c.whole(), groups);
     }
 
     /// The spec's internal `Set(rx, "lastIndex", n, true)` (Throw = true): always
@@ -920,17 +938,24 @@ impl Interp {
         let Some(h) = r.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("RegExpExec called on a non-object"));
         };
-        let exec = self.regexp_exec_method(h)?;
+        let (exec, _) = self.regexp_exec_method(h)?;
+        self.regexp_exec_outcome_with(r, h, s, exec)
+    }
+
+    /// [`regexp_exec_outcome`](Self::regexp_exec_outcome) once `Get(R, "exec")`
+    /// has produced `exec`.
+    fn regexp_exec_outcome_with(
+        &mut self,
+        r: NanBox,
+        h: Handle,
+        s: NanBox,
+        exec: NanBox,
+    ) -> Result<ExecOutcome, ExecError> {
         // The intrinsic `RegExp.prototype.exec` on a RegExp: run
         // RegExpBuiltinExec directly rather than through the generic call and
         // the by-name dispatch (same realm, same result).
         #[cfg(feature = "regex")]
-        if let Some(fh) = exec.as_handle().map(Handle::from_raw)
-            && let Some((N_REGEXP_PROTO_FN, target)) = self.realm.bound_native_at(fh)
-            && self.realm.string_leaf_bytes(target) == Some(b"exec".as_slice())
-            && self.get_function_realm(fh) == self.cur_realm
-            && let Some(rh) = self.this_regexp(r)
-        {
+        if let Some(rh) = self.builtin_exec_target(r, exec) {
             return Ok(match self.regexp_builtin_match(rh, s)? {
                 Some(m) => ExecOutcome::Match(m),
                 None => ExecOutcome::Null,
@@ -954,7 +979,7 @@ impl Interp {
         }
         #[cfg(feature = "regex")]
         {
-            if self.realm.regexp_at(h).is_none() {
+            if self.realm.regexp_flags(h).is_none() {
                 return Err(self.type_error(
                     "RegExpExec called on a non-RegExp object without a callable exec",
                 ));
@@ -970,16 +995,39 @@ impl Interp {
         }
     }
 
-    /// `Get(R, "exec")`, answered from a validated chain cache
-    /// ([`ChainKeyCache`](crate::realm::builtins_fast::ChainKeyCache)) when the
-    /// lookup provably reaches the same data property as last time.
-    fn regexp_exec_method(&mut self, h: Handle) -> Result<NanBox, ExecError> {
-        if let Some(v) = self.realm.chain_key_cached(h, &self.regexp_exec_lookup) {
-            return Ok(v.unwrap_or_else(NanBox::undefined));
+    /// The RegExp `r` when `exec` (the value of `r.exec`) is this realm's
+    /// intrinsic `RegExp.prototype.exec`, so `RegExpExec(r, S)` is exactly
+    /// `RegExpBuiltinExec(r, S)`.
+    #[cfg(feature = "regex")]
+    fn builtin_exec_target(&self, r: NanBox, exec: NanBox) -> Option<Handle> {
+        let fh = exec.as_handle().map(Handle::from_raw)?;
+        let (id, target) = self.realm.bound_native_at(fh)?;
+        (id == N_REGEXP_PROTO_FN
+            && self.realm.string_leaf_bytes(target) == Some(b"exec".as_slice())
+            && self.get_function_realm(fh) == self.cur_realm)
+            .then(|| self.this_regexp(r))
+            .flatten()
+    }
+
+    /// `Get(R, "exec")`, answered from a validated method-site cache
+    /// ([`MethodSiteCache`](crate::realm::builtins_fast::MethodSiteCache)) when
+    /// the lookup provably reaches the same data property as last time — which
+    /// it then reads at its recorded slot, with no name lookup.
+    ///
+    /// The flag is whether the lookup was proven to end at a data property, so
+    /// that repeating it could not be observed (no getter, no proxy trap).
+    fn regexp_exec_method(&mut self, h: Handle) -> Result<(NanBox, bool), ExecError> {
+        if let Some(v) = self
+            .realm
+            .method_site_get(h, "exec", &mut self.regexp_exec_lookup)
+        {
+            return Ok((v, true));
         }
-        self.realm
-            .chain_key_fill(h, "exec", &mut self.regexp_exec_lookup);
-        self.read_member(h, "exec")
+        let proven = self
+            .realm
+            .method_site_fill(h, "exec", &mut self.regexp_exec_lookup)
+            .is_some();
+        Ok((self.read_member(h, "exec")?, proven))
     }
 
     /// A catchable `SyntaxError` for an invalid `/pattern/flags`.
@@ -1339,11 +1387,12 @@ impl Interp {
             return Err(self.type_error("RegExp.prototype[Symbol.replace] called on a non-object"));
         }
         let h = rx.as_handle().map(Handle::from_raw).unwrap();
-        let s_bytes = self.coerce_to_string_bytes(string)?;
-        let units: Vec<u16> = crate::wtf8::utf16_units(&s_bytes).collect();
-
-        // The lossless subject string value passed to every `RegExpExec`.
-        let str_v = self.new_str_bytes(s_bytes);
+        // `ToString(string)` (the identity on a string), as the lossless
+        // subject value passed to every `RegExpExec`, and its code units —
+        // shared with those execs through the subject memo, so a long subject
+        // is transcoded once rather than once here and again by the first exec.
+        let (str_v, units_rc) = self.subject_units_cached(string)?;
+        let units: &[u16] = &units_rc;
         let length = units.len();
         let func_replace = replace
             .as_handle()
@@ -1363,7 +1412,47 @@ impl Interp {
         }
         // Collect all matches first (so user `exec` runs in the spec order).
         let mut results: Vec<ExecOutcome> = Vec::new();
+        // Once `Get(rx, "exec")` is proven to read the intrinsic `exec` from a
+        // data property, with a plain `lastIndex`, nothing left in this loop
+        // can run user code (each result is a built-in match, and `lastIndex`
+        // holds a number): every later `Get` would read the same value
+        // unobservably and every `RegExpExec` is `RegExpBuiltinExec` on the
+        // already-converted subject. Only the last match's legacy record is
+        // observable then, so it is recorded once, after the loop.
+        #[cfg(feature = "regex")]
+        let mut fast: Option<Handle> = None;
         loop {
+            #[cfg(feature = "regex")]
+            let result = match fast {
+                Some(rh) => {
+                    match self.regexp_builtin_match_on(rh, str_v, units_rc.clone(), false)? {
+                        Some(m) => ExecOutcome::Match(m),
+                        None => ExecOutcome::Null,
+                    }
+                }
+                None => {
+                    let (exec, proven) = self.regexp_exec_method(h)?;
+                    match self
+                        .builtin_exec_target(rx, exec)
+                        .filter(|&rh| proven && !self.realm.regex_aux_last_index_defined(rh))
+                    {
+                        Some(rh) => {
+                            fast = Some(rh);
+                            match self.regexp_builtin_match_on(
+                                rh,
+                                str_v,
+                                units_rc.clone(),
+                                false,
+                            )? {
+                                Some(m) => ExecOutcome::Match(m),
+                                None => ExecOutcome::Null,
+                            }
+                        }
+                        None => self.regexp_exec_outcome_with(rx, h, str_v, exec)?,
+                    }
+                }
+            };
+            #[cfg(not(feature = "regex"))]
             let result = self.regexp_exec_outcome(rx, str_v)?;
             let empty = match &result {
                 ExecOutcome::Null => break,
@@ -1395,9 +1484,16 @@ impl Interp {
             if empty {
                 let li_v = self.read_member(h, "lastIndex")?;
                 let li = self.last_index_to_length(li_v)?;
-                let next = self.advance_string_index(&units, li, unicode);
+                let next = self.advance_string_index(units, li, unicode);
                 self.set_prop_throwing(h, "lastIndex", NanBox::number(next as f64))?;
             }
+        }
+        #[cfg(feature = "regex")]
+        if fast.is_some()
+            && let Some(ExecOutcome::Match(m)) =
+                results.iter().rfind(|r| matches!(r, ExecOutcome::Match(_)))
+        {
+            self.update_legacy_regexp(&m.units, &m.caps);
         }
         // Build the output.
         let mut accumulated: Vec<u8> = Vec::new();
@@ -1426,7 +1522,7 @@ impl Interp {
                         replace,
                         &repl_str,
                         matched_units,
-                        &units,
+                        units,
                         pos.min(length),
                         &captures,
                         named,
@@ -1434,11 +1530,7 @@ impl Interp {
                     )?;
                     let pos = pos.min(length);
                     if pos >= next_source_position {
-                        accumulated.extend_from_slice(&u16_slice(
-                            &units,
-                            next_source_position,
-                            pos,
-                        ));
+                        accumulated.extend_from_slice(&u16_slice(units, next_source_position, pos));
                         crate::wtf8::append(&mut accumulated, &replacement);
                         next_source_position = pos + matched_units.len();
                         if accumulated.len() > crate::rope::MAX_STRING_LEN {
@@ -1479,7 +1571,7 @@ impl Interp {
                 replace,
                 &repl_str,
                 &matched_units,
-                &units,
+                units,
                 pos,
                 &captures,
                 named,
@@ -1488,7 +1580,7 @@ impl Interp {
             // If position >= next_source_position, append S[next..pos] then the
             // replacement and advance next to pos + m_len.
             if pos >= next_source_position {
-                accumulated.extend_from_slice(&u16_slice(&units, next_source_position, pos));
+                accumulated.extend_from_slice(&u16_slice(units, next_source_position, pos));
                 crate::wtf8::append(&mut accumulated, &replacement);
                 next_source_position = pos + m_len;
                 if accumulated.len() > crate::rope::MAX_STRING_LEN {
@@ -1498,7 +1590,7 @@ impl Interp {
             }
         }
         if next_source_position < length {
-            accumulated.extend_from_slice(&u16_slice_from(&units, next_source_position));
+            accumulated.extend_from_slice(&u16_slice_from(units, next_source_position));
         }
         Ok(self.new_str_bytes(accumulated))
     }

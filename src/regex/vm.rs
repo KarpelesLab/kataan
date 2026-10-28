@@ -1109,7 +1109,7 @@ fn is_space(c: u32) -> bool {
     )
 }
 
-fn assert_ok(assert: &Assert, input: &[u16], sp: usize, flags: Flags) -> bool {
+pub(crate) fn assert_ok(assert: &Assert, input: &[u16], sp: usize, flags: Flags) -> bool {
     match assert {
         Assert::Start => sp == 0 || (flags.multiline && is_line_term(input[sp - 1] as u32)),
         Assert::End => sp == input.len() || (flags.multiline && is_line_term(input[sp] as u32)),

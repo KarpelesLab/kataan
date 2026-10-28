@@ -131,7 +131,10 @@ pub fn encode_utf16_unit(u: u16, out: &mut Vec<u8>) {
 #[must_use]
 pub fn from_utf16(units: &[u16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(units.len());
-    let mut i = 0;
+    // An ASCII prefix (often the whole input) is one byte per unit.
+    let ascii = units.iter().position(|&u| u >= 0x80).unwrap_or(units.len());
+    out.extend(units[..ascii].iter().map(|&u| u as u8));
+    let mut i = ascii;
     while i < units.len() {
         let u = u32::from(units[i]);
         if (SURROGATE_MIN..=HIGH_SURROGATE_MAX).contains(&u) && i + 1 < units.len() {

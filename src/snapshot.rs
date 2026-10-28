@@ -172,7 +172,7 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
             || realm.collection_is_set(*r).is_some()
             || realm.promise_state(*r).is_some()
             || realm.proxy_at(*r).is_some()
-            || realm.regexp_at(*r).is_some()
+            || realm.regexp_flags(*r).is_some()
             || realm.symbol_at(*r).is_some()
             || realm.array_elements(*r).is_some()
             || realm.bytes_at(*r).is_some()

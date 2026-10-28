@@ -1092,7 +1092,7 @@ impl Interp {
         }
         // `regex.lastIndex = n` updates the RegExp's stateful search position
         // (honoring a non-writable descriptor installed via `defineProperty`).
-        if name == "lastIndex" && self.realm.regexp_at(handle).is_some() {
+        if name == "lastIndex" && self.realm.regexp_flags(handle).is_some() {
             return self.regex_write_last_index(handle, new);
         }
         // An own accessor setter takes precedence.
@@ -1779,7 +1779,7 @@ impl Interp {
         // prototype walk below (so they escape the source, validate the brand, and
         // honor a subclass override).
         if name == "lastIndex"
-            && self.realm.regexp_at(handle).is_some()
+            && self.realm.regexp_flags(handle).is_some()
             && !self.realm.regex_aux_last_index_defined(handle)
         {
             return Ok(NanBox::number(self.realm.regex_last_index(handle) as f64));

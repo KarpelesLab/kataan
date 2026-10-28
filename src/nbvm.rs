@@ -5393,7 +5393,7 @@ fn vm_set_prop(
         .map(Handle::from_raw)
         .ok_or(VmError::NotAnObject)?;
     // `regex.lastIndex = v` updates the stateful search position.
-    if key == "lastIndex" && ctx.realm.regexp_at(handle).is_some() {
+    if key == "lastIndex" && ctx.realm.regexp_flags(handle).is_some() {
         set_regex_last_index_value(&mut ctx.realm, handle, value);
         return Ok(());
     }
@@ -6756,7 +6756,7 @@ fn run_frame_at_ic(
                     .as_handle()
                     .map(Handle::from_raw)
                     .is_some_and(|h| match kind {
-                        0 => ctx.realm.regexp_at(h).is_some(),
+                        0 => ctx.realm.regexp_flags(h).is_some(),
                         1 => ctx.realm.is_array(h),
                         2 => ctx.realm.collection_is_set(h) == Some(false),
                         3 => ctx.realm.collection_is_set(h) == Some(true),
@@ -9549,7 +9549,7 @@ fn vm_set_elem(
                 }
                 return Ok(());
             }
-            if ks == "lastIndex" && ctx.realm.regexp_at(handle).is_some() {
+            if ks == "lastIndex" && ctx.realm.regexp_flags(handle).is_some() {
                 set_regex_last_index_value(&mut ctx.realm, handle, value);
                 return Ok(());
             }

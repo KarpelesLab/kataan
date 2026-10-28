@@ -489,7 +489,7 @@ pub struct Interp {
     /// live match is always still valid.
     subject_units_cache: Option<(u64, alloc::rc::Rc<Vec<u16>>)>,
     /// `RegExpExec`'s `Get(R, "exec")` memo (see `regexp_exec_method`).
-    regexp_exec_lookup: crate::realm::builtins_fast::ChainKeyCache,
+    regexp_exec_lookup: crate::realm::builtins_fast::MethodSiteCache,
     /// Transition caches for a RegExp match array's `index`/`input`/`groups`.
     #[cfg(feature = "regex")]
     match_array_ics: [crate::ic::PropertyCache; 3],

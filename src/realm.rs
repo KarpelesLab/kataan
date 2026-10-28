@@ -674,6 +674,12 @@ impl Realm {
         self.legacy_regexp = state;
     }
 
+    /// The RegExp legacy static match record, mutably — recording a match in
+    /// place costs no copy of the record.
+    pub fn legacy_regexp_mut(&mut self) -> &mut LegacyRegExpState {
+        &mut self.legacy_regexp
+    }
+
     /// Links the new VM closure `f` to the running realm's
     /// `%Function.prototype%`. In a single-realm run that is the default every
     /// unlinked closure reports (`vm_fn_default_proto`), so no entry is made;

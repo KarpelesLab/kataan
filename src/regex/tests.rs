@@ -949,3 +949,52 @@ fn class_start_filter_finds_the_same_matches() {
         assert_eq!(r.find_in(&chars, 0), want, "/{pat}/{flags} on {subject:?}");
     }
 }
+
+/// The linear matcher must find exactly what the VM finds — same spans, same
+/// groups, same preference among greedy and lazy choices — on the patterns it
+/// takes over, and must decline the ones it cannot express.
+#[test]
+fn linear_matcher_agrees_with_the_vm() {
+    for (pat, flags, linear) in [
+        (r"([a-z0-9]+)@([a-z0-9.]+)", "g", true),
+        (r"\d+", "g", true),
+        (r"page\/(\d)9\d", "", true),
+        (r"a*?b", "", true),
+        (r"x{2,4}y", "", true),
+        (r"x{2,4}?y", "", true),
+        (r"^\w+\s*=\s*(\S*)$", "m", true),
+        (r"\bfoo(b?)ar\b", "i", true),
+        (r"[^,]*,([^,]*),", "", true),
+        (r".+x", "s", true),
+        (r"(a)(b)?", "", false),
+        (r"a|b", "", false),
+        (r"(ab)+", "", false),
+        (r"a(?=b)", "", false),
+        (r"(a)\1", "", false),
+        (r"\d+", "u", false),
+    ] {
+        let fast = re(pat, flags);
+        assert_eq!(fast.is_linear(), linear, "/{pat}/{flags}");
+        let slow = re(pat, flags).without_linear();
+        for subject in [
+            "",
+            "user12@host3.example.com visited /page/192?q=7",
+            "aaab ab b",
+            "xxxxxy xy xxy",
+            "  key = value\nk=v\n",
+            "Foobar FOOBAR foo bar foobarx",
+            "a,b,c,,d",
+            "ab\nx\nyx",
+            "\u{e9}\u{2603}\u{1F600}x9",
+        ] {
+            let units: alloc::vec::Vec<u16> = subject.encode_utf16().collect();
+            for start in 0..=units.len() {
+                assert_eq!(
+                    fast.captures_in_u16(&units, start),
+                    slow.captures_in_u16(&units, start),
+                    "/{pat}/{flags} on {subject:?} from {start}"
+                );
+            }
+        }
+    }
+}
