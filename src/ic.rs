@@ -60,6 +60,29 @@ impl PropertyCache {
         Some(slot)
     }
 
+    /// The **transition** use of a cache, for a site that adds one fixed
+    /// property to objects (an object literal's `key: value`): the cached
+    /// shape is the *result* of the add, so a hit — `from` is exactly its
+    /// parent — hands back the child layout with no name lookup and no walk
+    /// of the transition table. `None` on a miss.
+    pub fn transition_from(&mut self, from: &Rc<Shape>) -> Option<Rc<Shape>> {
+        if let Some(to) = &self.shape
+            && to.parent().is_some_and(|p| Rc::ptr_eq(p, from))
+        {
+            self.hits += 1;
+            return Some(Rc::clone(to));
+        }
+        self.misses += 1;
+        None
+    }
+
+    /// Arms a transition cache (see [`transition_from`](Self::transition_from))
+    /// with the shape an add produced.
+    pub fn arm_transition(&mut self, to: Rc<Shape>) {
+        self.slot = to.len().saturating_sub(1);
+        self.shape = Some(to);
+    }
+
     /// Whether the cache is warmed (has resolved at least one shape).
     #[must_use]
     pub fn is_warm(&self) -> bool {

@@ -744,6 +744,62 @@ impl Object {
         self.non_configurable.is_empty()
     }
 
+    /// Whether a `CreateDataProperty(key)` on this object is a plain store:
+    /// the object accepts new keys and `key` is either absent or an existing
+    /// writable, enumerable, configurable data property (no accessor, no
+    /// attribute marks). Internal (`\0`-prefixed) keys never qualify.
+    #[must_use]
+    pub fn is_plain_data_slot_or_absent(&self, key: &str) -> bool {
+        self.extensible
+            && !self.frozen
+            && !self.sealed
+            && !key.starts_with('\0')
+            && (self.accessors.is_empty() || self.accessor(key).is_none())
+            && (self.hidden.is_empty() || !self.is_hidden(key))
+            && (self.readonly.is_empty() || !self.is_readonly(key))
+            && (self.non_configurable.is_empty() || !self.is_non_configurable(key))
+    }
+
+    /// `CreateDataProperty(key, value)` through a transition cache, for a
+    /// site that always adds the same `key` (an object literal). Returns
+    /// `false`, having changed nothing, unless the define is a plain store
+    /// (see [`is_plain_data_slot_or_absent`](Self::is_plain_data_slot_or_absent)).
+    /// A cache hit adds the property by adopting the cached child shape; a
+    /// miss goes through [`set`](Self::set) (dictionary conversion included)
+    /// and re-arms the cache when the add was a single transition.
+    pub fn init_data_cached(
+        &mut self,
+        key: &str,
+        value: NanBox,
+        cache: &mut crate::ic::PropertyCache,
+        dict_threshold: usize,
+    ) -> bool {
+        if !self.is_plain_data_slot_or_absent(key) {
+            return false;
+        }
+        if self.key_order.is_none()
+            && let ObjectData::Shaped { shape, slots } = &mut self.data
+            && (shape.len() as usize) < dict_threshold
+            && let Some(to) = cache.transition_from(shape)
+        {
+            *shape = to;
+            slots.push(value);
+            return true;
+        }
+        self.maybe_convert_to_dict(key, dict_threshold);
+        let before = match &self.data {
+            ObjectData::Shaped { shape, .. } => Some(Rc::clone(shape)),
+            ObjectData::Dict { .. } => None,
+        };
+        self.set(key, value);
+        if let (Some(before), ObjectData::Shaped { shape, .. }) = (before, &self.data)
+            && shape.parent().is_some_and(|p| Rc::ptr_eq(p, &before))
+        {
+            cache.arm_transition(Rc::clone(shape));
+        }
+        true
+    }
+
     /// Whether `key` is an own property (data slot or accessor).
     #[must_use]
     pub fn has_own_key(&self, key: &str) -> bool {

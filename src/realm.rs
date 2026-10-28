@@ -4397,6 +4397,32 @@ impl Realm {
         false
     }
 
+    /// `CreateDataProperty(handle, key, value)` for the common case only: the
+    /// cell is an ordinary object (`Cell::Object`) that is extensible, and `key`
+    /// is either absent or an existing writable, enumerable, configurable data
+    /// property — so the define is exactly a plain add/overwrite, done through
+    /// the site's transition cache (see [`Object::init_data_cached`]). Returns
+    /// `false` (having changed nothing) for anything else; the caller then
+    /// takes the full `[[DefineOwnProperty]]` path. Meant for an object
+    /// literal's own fresh object, which no exotic behaviour can reach.
+    pub fn init_data_property_cached(
+        &mut self,
+        handle: Handle,
+        key: &str,
+        value: NanBox,
+        cache: &mut crate::ic::PropertyCache,
+    ) -> bool {
+        let dict_threshold = self.limits.object_dictionary_threshold;
+        let Some(obj) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) else {
+            return false;
+        };
+        if !obj.init_data_cached(key, value, cache, dict_threshold) {
+            return false;
+        }
+        self.write_barrier(handle, value);
+        true
+    }
+
     /// Like [`set_property`](Realm::set_property) but bypasses the extensibility /
     /// frozen / readonly guards (it always materializes the slot). For use by
     /// `[[DefineOwnProperty]]`, which performs its own validation and must be able

@@ -67,6 +67,13 @@ impl Shape {
         self.len
     }
 
+    /// The layout this one extends (without its last property), or `None`
+    /// for the root.
+    #[must_use]
+    pub fn parent(&self) -> Option<&Rc<Shape>> {
+        self.parent.as_ref()
+    }
+
     /// Whether this is the empty (root) layout.
     #[must_use]
     pub fn is_empty(&self) -> bool {

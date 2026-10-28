@@ -201,6 +201,12 @@ pub enum Op {
         src: Reg,
         attrs: u8,
     },
+    /// An object literal's `key: src` with a static key:
+    /// `CreateDataPropertyOrThrow(obj, key, src)` on the literal's own fresh
+    /// ordinary object. Same semantics as [`Op::DefineData`] with `attrs = 7`,
+    /// but the key is baked in (no string allocated per evaluation) and a plain
+    /// add/overwrite of a data property stays in the VM.
+    InitProp { obj: Reg, key: String, src: Reg },
     /// `super(...args)`: `Construct(ctor, args, new_target)` where `ctor` is
     /// the super constructor read by [`Op::SuperCtor`], then binds `this` (a
     /// `ReferenceError` if already bound); [`Op::InitFields`] follows.
@@ -487,6 +493,9 @@ pub enum Op {
     NewStringWtf8 { dst: Reg, bytes: Vec<u8> },
     /// `dst = a new array of `len` `undefined` elements`.
     NewArray { dst: Reg, len: usize },
+    /// `dst = [elems...]`: an array literal of plain elements (no holes or
+    /// spreads), built in one allocation from already-evaluated registers.
+    NewArrayFrom { dst: Reg, elems: Vec<Reg> },
     /// `new Array(arg)` with a single argument: a number is the new array's
     /// length (a `RangeError` if invalid/too large); anything else is its sole
     /// element.
@@ -7108,6 +7117,22 @@ fn run_frame_at(
                     None => return Err(VmError::Unsupported),
                 }
             }
+            Op::InitProp { obj, key, src } => {
+                let (o, v) = (regs[*obj as usize], regs[*src as usize]);
+                let cache = site_cache!(site);
+                let fast = o.as_handle().is_some_and(|h| {
+                    ctx.realm
+                        .init_data_property_cached(Handle::from_raw(h), key, v, cache)
+                });
+                if !fast {
+                    let k = NanBox::handle(ctx.realm.new_string(key).to_raw());
+                    match with_host(ctx, |h| h.define_data(o, k, v, 7)) {
+                        Some(Ok(())) => {}
+                        Some(Err(e)) => handle_throw!(VmError::from(e)),
+                        None => return Err(VmError::Unsupported),
+                    }
+                }
+            }
             Op::SuperCall {
                 dst,
                 ctor,
@@ -7493,6 +7518,11 @@ fn run_frame_at(
                     return Err(VmError::Thrown(e));
                 }
                 let handle = ctx.realm.new_array(vec![NanBox::undefined(); *len]);
+                regs[*dst as usize] = NanBox::handle(handle.to_raw());
+            }
+            Op::NewArrayFrom { dst, elems } => {
+                let vals: Vec<NanBox> = elems.iter().map(|r| regs[*r as usize]).collect();
+                let handle = ctx.realm.new_array(vals);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::NewArrayCtor { dst, arg } => {
@@ -11235,6 +11265,11 @@ fn native_global(callee: &Expr) -> Option<u16> {
 }
 
 /// The static string key of a non-computed property key.
+/// The longest array literal compiled to a single [`Op::NewArrayFrom`]: its
+/// elements all stay live in registers until the array is built, so a huge
+/// generated data table keeps the incremental push form (bounded frame).
+const ARRAY_LIT_FROM_REGS_MAX: usize = 16;
+
 fn static_key(key: &PropertyKey) -> Result<String, CompileError> {
     match key {
         PropertyKey::Ident(s) | PropertyKey::Str(s) => Ok(String::from(&**s)),
@@ -16861,6 +16896,36 @@ impl Compiler {
                 self.patch(jend);
                 Ok(dst)
             }
+            // A short literal of plain items: evaluate them in order, then
+            // build the array in one allocation (nothing can observe the array
+            // before it is complete).
+            Expr::Array { elements, .. }
+                if !elements.is_empty()
+                    && elements.len() <= ARRAY_LIT_FROM_REGS_MAX
+                    && elements
+                        .iter()
+                        .all(|el| matches!(el, ArrayElement::Item(_))) =>
+            {
+                let mut regs = Vec::with_capacity(elements.len());
+                for (i, el) in elements.iter().enumerate() {
+                    let ArrayElement::Item(e) = el else {
+                        unreachable!("matched above")
+                    };
+                    let mark = self.next_reg;
+                    let mut v = self.expr(e)?;
+                    // A binding's own register (`[i, i++]`) would be read
+                    // after the later elements ran: snapshot it now.
+                    if v < mark && i + 1 < elements.len() {
+                        let t = self.alloc();
+                        self.ops.push(Op::Move { dst: t, src: v });
+                        v = t;
+                    }
+                    regs.push(v);
+                }
+                let dst = self.alloc();
+                self.ops.push(Op::NewArrayFrom { dst, elems: regs });
+                Ok(dst)
+            }
             Expr::Array { elements, .. } => {
                 // Build incrementally (empty + push/extend) so spreads and holes
                 // work uniformly.
@@ -19848,9 +19913,20 @@ impl Compiler {
         let dst = self.alloc();
         self.ops.push(Op::NewObject { dst });
         self.scopes.push(alloc::collections::BTreeMap::new());
+        // Only a method or accessor has the literal as its `super` home; the
+        // home cell is a heap allocation per evaluation, so a literal with
+        // neither (the common `{a: 1, b: [..]}`) skips it.
+        let needs_home = members.iter().any(|m| {
+            matches!(
+                m,
+                ObjectMember::Accessor { .. } | ObjectMember::Property { method: true, .. }
+            )
+        });
         let r = (|| -> Result<(), CompileError> {
-            let hb = self.bind_hidden_cell(OBJ_HOME_NAME, true, false)?;
-            self.write_var(hb, dst);
+            if needs_home {
+                let hb = self.bind_hidden_cell(OBJ_HOME_NAME, true, false)?;
+                self.write_var(hb, dst);
+            }
             for m in members {
                 match m {
                     ObjectMember::Property {
@@ -19870,16 +19946,34 @@ impl Compiler {
                         span,
                         ..
                     } => {
-                        let k = self.class_key(key)?;
                         let named = *method || is_anonymous_fn_def(value);
-                        let v = self.with_home(OBJ_HOME_NAME, |c| {
-                            c.next_closure_is_method = *method;
-                            // A method's text is its whole definition.
-                            c.method_span = method.then_some(*span);
-                            let v = c.expr(value);
-                            c.next_closure_is_method = false;
-                            v
-                        })?;
+                        // A plain value under a static key: baked-key fast op.
+                        if !named && !matches!(key, PropertyKey::Computed(_)) {
+                            let k = static_key(key)?;
+                            let v = self.expr(value)?;
+                            self.ops.push(Op::InitProp {
+                                obj: dst,
+                                key: k,
+                                src: v,
+                            });
+                            continue;
+                        }
+                        let k = self.class_key(key)?;
+                        // Only a method's body sees the literal as its `super`
+                        // home; any other value (an arrow, say) keeps the
+                        // enclosing function's.
+                        let v = if *method {
+                            self.with_home(OBJ_HOME_NAME, |c| {
+                                c.next_closure_is_method = true;
+                                // A method's text is its whole definition.
+                                c.method_span = Some(*span);
+                                let v = c.expr(value);
+                                c.next_closure_is_method = false;
+                                v
+                            })?
+                        } else {
+                            self.expr(value)?
+                        };
                         if named {
                             self.ops.push(Op::DefineMethod {
                                 obj: dst,

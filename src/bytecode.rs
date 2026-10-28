@@ -396,7 +396,9 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*a)?;
             reg(*b)
         }
-        Op::SetProp { obj, src, .. } | Op::SetHidden { obj, src, .. } => {
+        Op::SetProp { obj, src, .. }
+        | Op::SetHidden { obj, src, .. }
+        | Op::InitProp { obj, src, .. } => {
             reg(*obj)?;
             reg(*src)
         }
@@ -435,6 +437,10 @@ fn verify_op(op: &Op, n_regs: usize, num_funcs: usize, n_ops: usize) -> Result<(
             reg(*dst)?;
             func(*f)?;
             regs(captures)
+        }
+        Op::NewArrayFrom { dst, elems } => {
+            reg(*dst)?;
+            regs(elems)
         }
         Op::CallValue { dst, callee, args } => {
             reg(*dst)?;
@@ -1132,6 +1138,17 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
         }
         Op::SetProp { obj, key, src } => {
             w_u8(40, out);
+            w_reg(*obj, out);
+            w_str(key, out);
+            w_reg(*src, out);
+        }
+        Op::NewArrayFrom { dst, elems } => {
+            w_u8(181, out);
+            w_reg(*dst, out);
+            w_regs(elems, out);
+        }
+        Op::InitProp { obj, key, src } => {
+            w_u8(180, out);
             w_reg(*obj, out);
             w_str(key, out);
             w_reg(*src, out);
@@ -1987,6 +2004,15 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         },
         39 => Op::NewObject { dst: r.reg()? },
         40 => Op::SetProp {
+            obj: r.reg()?,
+            key: r.string()?,
+            src: r.reg()?,
+        },
+        181 => Op::NewArrayFrom {
+            dst: r.reg()?,
+            elems: r.regs()?,
+        },
+        180 => Op::InitProp {
             obj: r.reg()?,
             key: r.string()?,
             src: r.reg()?,
