@@ -12,8 +12,8 @@
 //! its header with nothing to reconstruct.
 
 use super::{
-    Ctx, FnProto, FrameExit, NanBox, Op, VmError, ensure_jit, run_frame, vm_agent_tick, vm_error,
-    vm_safepoint,
+    Ctx, FnProto, FrameExit, NanBox, Op, Reg, VmError, ensure_jit, run_frame, vm_agent_tick,
+    vm_error, vm_safepoint,
 };
 use alloc::rc::Rc;
 
@@ -67,19 +67,40 @@ pub(super) fn osr_threshold() -> u32 {
 /// interpreter does).
 const POLL_INTERVAL: u64 = 1024;
 
-/// Runs compiled `jit` on `regs` from bytecode pc `entry`, translating its raw
-/// result word into the interpreter's frame outcome. `None` if nothing ran (not a
-/// generic body, short register file, or not an entry point).
+/// The exception-handler stacks of the running compiled activations: one shared
+/// `Vec` of `(catch_pc, catch_reg)` (the interpreter's `handlers` layout,
+/// innermost last), where the innermost compiled activation owns the entries
+/// from `base` up. [`run_compiled`] opens a segment on entry and drops it on
+/// exit, so an activation never sees (or pops) its callers' handlers, and the
+/// common case reuses the allocation.
+#[derive(Default)]
+pub(super) struct HandlerStack {
+    pub(super) stack: alloc::vec::Vec<(usize, Reg)>,
+    base: usize,
+}
+
+/// Runs compiled `jit` on `regs` from bytecode pc `entry` with the activation's
+/// handler stack `handlers` (non-empty only for an on-stack replacement inside a
+/// `try`), translating its raw result word into the interpreter's frame outcome.
+/// `None` if nothing ran (not a generic body, short register file, or not an
+/// entry point).
 pub(super) fn run_compiled(
     ctx: &mut Ctx,
     funcs: &[FnProto],
     jit: &crate::jit::JitProto,
     regs: &mut [NanBox],
     entry: usize,
+    handlers: &[(usize, Reg)],
 ) -> Option<Result<FrameExit, VmError>> {
     let saved = ctx.jit_funcs.replace(funcs as *const [FnProto]);
+    let outer_base = ctx.jit_handlers.base;
+    let base = ctx.jit_handlers.stack.len();
+    ctx.jit_handlers.base = base;
+    ctx.jit_handlers.stack.extend_from_slice(handlers);
     let ctx_ptr = ctx as *mut Ctx as *mut core::ffi::c_void;
     let raw = jit.call_frame_raw(ctx_ptr, regs, entry);
+    ctx.jit_handlers.stack.truncate(base);
+    ctx.jit_handlers.base = outer_base;
     ctx.jit_funcs = saved;
     let raw = raw?;
     if raw == NanBox::jit_falloff_bits() {
@@ -117,7 +138,7 @@ pub(super) fn enter_on_call(
     let mut stack = alloc::collections::BTreeSet::new();
     let jit = ensure_jit(&mut ctx.jit_cache, funcs, id, &mut stack)?;
     if jit.is_generic() {
-        return match run_compiled(ctx, funcs, &jit, regs, 0)? {
+        return match run_compiled(ctx, funcs, &jit, regs, 0, &[])? {
             Ok(FrameExit::Return(v)) => Some(Ok(v.unwrap_or(NanBox::undefined()))),
             Ok(_) => Some(Err(VmError::Unsupported)),
             Err(e) => Some(Err(e)),
@@ -135,14 +156,16 @@ pub(super) fn enter_on_call(
 /// body, `regs` its register file, and `target` the loop header the back-edge is
 /// about to jump to. If `program` is a function-table body (or its optimized
 /// tier, which keeps every pc) that compiles, the rest of the activation runs in
-/// native code from `target` and its outcome is returned; `None` means "keep
-/// interpreting" (and the caller stops asking for this activation).
+/// native code from `target` — inheriting the frame's `handlers` — and its
+/// outcome is returned; `None` means "keep interpreting" (and the caller stops
+/// asking for this activation).
 pub(super) fn osr(
     ctx: &mut Ctx,
     funcs: &[FnProto],
     program: &[Op],
     regs: &mut [NanBox],
     target: usize,
+    handlers: &[(usize, Reg)],
 ) -> Option<Result<FrameExit, VmError>> {
     if mode() == Mode::Off {
         return None;
@@ -175,7 +198,96 @@ pub(super) fn osr(
             &alloc::format!("on-stack replacement at pc {target}"),
         );
     }
-    run_compiled(ctx, funcs, &jit, regs, target)
+    run_compiled(ctx, funcs, &jit, regs, target, handlers)
+}
+
+/// `Op::PushHandler` in compiled code: push `(target, reg)` onto the running
+/// activation's handler stack, bounded as the interpreter bounds its own (a
+/// catchable `RangeError`, returned as the throw sentinel, on overflow).
+///
+/// # Safety
+/// `ctx` must be the live, otherwise-unborrowed `Ctx` the body was entered with.
+pub(crate) extern "C" fn jit_helper_push_handler(
+    ctx: *mut core::ffi::c_void,
+    target: u64,
+    reg: u64,
+) -> u64 {
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    let h = &mut ctx.jit_handlers;
+    if h.stack.len() - h.base >= ctx.realm.limits.max_handler_depth {
+        let e = vm_error(ctx, "RangeError", "Handler stack overflow");
+        ctx.jit_pending_fault = Some(VmError::Thrown(e));
+        return NanBox::jit_throw_bits();
+    }
+    // Lossless: the emitter passes a bytecode pc and a register index.
+    h.stack.push((target as usize, reg as Reg));
+    0
+}
+
+/// `Op::PopHandler` in compiled code: drop the innermost handler of the running
+/// activation (a no-op on an empty stack, as in the interpreter).
+///
+/// # Safety
+/// As [`jit_helper_push_handler`].
+pub(crate) extern "C" fn jit_helper_pop_handler(ctx: *mut core::ffi::c_void, _: u64) -> u64 {
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    let h = &mut ctx.jit_handlers;
+    if h.stack.len() > h.base {
+        h.stack.pop();
+    }
+    0
+}
+
+/// The throw exit of a compiled body with `try` regions — the interpreter's
+/// `handle_throw!`: if the pending fault is a thrown value and the activation
+/// has a handler, pop it, bind the value in its register and return its catch pc
+/// (the body resumes there); otherwise leave the fault pending and return
+/// [`crate::jit::NO_HANDLER`] (the body returns the throw sentinel).
+///
+/// # Safety
+/// As [`jit_helper_exec_op`]: `regs` is the activation's `n_regs`-long register
+/// file.
+pub(crate) extern "C" fn jit_helper_unwind(
+    ctx: *mut core::ffi::c_void,
+    regs: *mut u64,
+    n_regs: usize,
+) -> u64 {
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    // SAFETY: the activation's register file, live and unaliased for this call.
+    #[allow(unsafe_code)]
+    let regs = unsafe { core::slice::from_raw_parts_mut(regs.cast::<NanBox>(), n_regs) };
+    if ctx.jit_handlers.stack.len() <= ctx.jit_handlers.base {
+        return crate::jit::NO_HANDLER;
+    }
+    // The same precedence `run_compiled` reads the pending fault with.
+    let thrown = match ctx.jit_pending_fault.take() {
+        Some(VmError::Thrown(v)) => v,
+        Some(other) => {
+            ctx.jit_pending_fault = Some(other);
+            return crate::jit::NO_HANDLER;
+        }
+        None => match ctx.jit_pending.take() {
+            Some(v) => v,
+            None => return crate::jit::NO_HANDLER,
+        },
+    };
+    let Some((target, reg)) = ctx.jit_handlers.stack.pop() else {
+        return crate::jit::NO_HANDLER; // unreachable: checked above
+    };
+    match regs.get_mut(reg as usize) {
+        Some(slot) => *slot = thrown,
+        None => {
+            ctx.jit_pending = Some(thrown);
+            return crate::jit::NO_HANDLER;
+        }
+    }
+    target as u64
 }
 
 /// The generic-tier helper that runs one bytecode op — any op without a native
@@ -318,7 +430,7 @@ pub(super) fn call_generic(
     for (slot, a) in regs.iter_mut().zip(args.iter().take(jit.n_params())) {
         *slot = *a;
     }
-    match run_compiled(ctx, funcs, jit, &mut regs, 0)? {
+    match run_compiled(ctx, funcs, jit, &mut regs, 0, &[])? {
         Ok(FrameExit::Return(v)) => Some(Ok(v.unwrap_or(NanBox::undefined()))),
         Ok(_) => Some(Err(VmError::Unsupported)),
         Err(e) => Some(Err(e)),

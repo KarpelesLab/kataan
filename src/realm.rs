@@ -4062,6 +4062,42 @@ impl Realm {
         self.heap.slots_raw()
     }
 
+    /// Whether the spec `.length` of the array at `handle` equals its dense
+    /// element-`Vec` length — so the generic-JIT inline `.length` fast path may read
+    /// that length raw (see `nbvm::jit_array_len_dense`). True iff `handle` is a
+    /// [`Cell::Array`] (VM functions are [`Cell::VmFunction`], so never one) that
+    /// carries **no** aux object (conservatively excluding any array with named
+    /// props) and has **no** sparse logical-length override (`arr.length` set
+    /// beyond the dense cap). A leaf, non-allocating read. `false` for any
+    /// non-array. The sparse-length probe is skipped while no array has one (the
+    /// common case), so a hot `arr[i]`/`arr.length` pays one heap lookup plus an
+    /// O(1) aux miss.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_array_len_is_dense(&self, handle: Handle) -> bool {
+        let raw = handle.to_raw();
+        self.heap.get(handle).and_then(Cell::as_array).is_some()
+            && !self.aux_props.contains_key(&raw)
+            && (self.sparse_array_lengths.is_empty()
+                || !self.sparse_array_lengths.contains_key(&raw))
+    }
+
+    /// For the generic-JIT inline property fast paths: `Some(qualifies)` when
+    /// `handle` is an ordinary [`Cell::Object`] (one heap lookup), `None` for any
+    /// other cell (the caller then applies its general test). An ordinary object
+    /// cell is never a string, proxy, typed array or host function, so it needs
+    /// the host's `[[Get]]` only if it is host-exotic; a property *store* (`set`)
+    /// additionally refuses a String wrapper (own `\0prim`), whose index and
+    /// `length` keys are exotic.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_plain_object(&self, handle: Handle, set: bool) -> Option<bool> {
+        let Some(Cell::Object(o)) = self.heap.get(handle) else {
+            return None;
+        };
+        Some(!self.is_host_exotic(handle) && !(set && o.contains("\u{0}prim")))
+    }
+
     /// Whether `handle` is a plain dense array on which the generic-JIT inline
     /// element-SET fast path may store in place at any in-bounds index — i.e. it is
     /// a [`Cell::Array`] that is **not** frozen/sealed, carries **no** per-index
@@ -4072,23 +4108,6 @@ impl Realm {
     /// [`array_index_has_override`](Realm::array_index_has_override) consults plus
     /// the length bound, evaluated once per store (a leaf, non-allocating read, so
     /// it never reallocates the arena). Returns `false` for any non-array receiver.
-    /// Whether the spec `.length` of the array at `handle` equals its dense
-    /// element-`Vec` length — so the generic-JIT inline `.length` fast path may read
-    /// that length raw (see `nbvm::jit_array_len_dense`). True iff `handle` is a
-    /// [`Cell::Array`] that is **not** a VM function (a VM function reports its
-    /// parameter count, and always carries a `\0vmfn` aux property — excluded here by
-    /// the `aux_props` guard, which also conservatively excludes any array carrying
-    /// named props) and has **no** sparse logical-length override (`arr.length` set
-    /// beyond the dense cap). A leaf, non-allocating read. `false` for any non-array.
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-    #[must_use]
-    pub(crate) fn jit_array_len_is_dense(&self, handle: Handle) -> bool {
-        let raw = handle.to_raw();
-        self.heap.get(handle).and_then(Cell::as_array).is_some()
-            && !self.aux_props.contains_key(&raw)
-            && !self.sparse_array_lengths.contains_key(&raw)
-    }
-
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     #[must_use]
     pub(crate) fn jit_array_unrestricted(&self, handle: Handle) -> bool {
@@ -4096,8 +4115,9 @@ impl Realm {
         let Some(a) = self.heap.get(handle).and_then(Cell::as_array) else {
             return false;
         };
-        !self.frozen_arrays.contains(&raw)
-            && !self.sealed_arrays.contains(&raw)
+        // The integrity sets are empty in most programs: skip their probes then.
+        (self.frozen_arrays.is_empty() || !self.frozen_arrays.contains(&raw))
+            && (self.sealed_arrays.is_empty() || !self.sealed_arrays.contains(&raw))
             && !self.aux_props.contains_key(&raw)
             && a.len() <= self.limits.max_array_len
     }

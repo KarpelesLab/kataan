@@ -1916,6 +1916,18 @@ pub enum GenericOp {
     /// An op proven to have no effect (a `BindThis` whose register nothing else
     /// names).
     Nop,
+    /// `Op::PushHandler`: enter a `try` region whose catch code is at bytecode pc
+    /// `target`, binding the thrown value in register `reg`. The handler stack is
+    /// the activation's, kept in the context (`jit_helper_push_handler`), so a
+    /// throw anywhere in the body can unwind to it (`jit_helper_unwind`).
+    PushHandler {
+        /// The catch entry (a bytecode pc).
+        target: usize,
+        /// The register the thrown value is bound in.
+        reg: u16,
+    },
+    /// `Op::PopHandler`: leave the innermost `try` region.
+    PopHandler,
     /// `return reg[src]`.
     Ret {
         /// Register holding the return value.
@@ -1933,15 +1945,13 @@ type GenericLowering = (Vec<GenericOp>, Vec<alloc::boxed::Box<str>>, Vec<Vec<u16
 /// Why the generic tier cannot run `op` at all — `None` when it can (inline, via
 /// a helper, or by handing the op to the interpreter). The refused ops are the
 /// ones whose meaning is tied to the interpreter's *frame* rather than to the
-/// register file: the exception-handler stack (`PushHandler`/`PopHandler`), a
-/// suspension (`Yield`/`Await`/generator and async-iteration steps), a proper
+/// register file: a suspension (`Yield`/`Await`/generator and async-iteration steps), a proper
 /// tail call (which replaces the frame), and direct `eval`/environment ops (which
 /// can reach the frame's scope by name).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 fn generic_refuses(op: &crate::nbvm::Op) -> Option<&'static str> {
     use crate::nbvm::Op;
     match op {
-        Op::PushHandler { .. } | Op::PopHandler => Some("exception handler"),
         Op::Yield { .. }
         | Op::Await { .. }
         | Op::GeneratorStart
@@ -2120,6 +2130,11 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
                 GenericOp::Nop
             }
             Op::Return { src } => GenericOp::Ret { src: r(*src)? },
+            Op::PushHandler { target, reg } => GenericOp::PushHandler {
+                target: (*target <= proto.ops.len()).then_some(*target)?,
+                reg: r(*reg)?,
+            },
+            Op::PopHandler => GenericOp::PopHandler,
             Op::InitProp { obj, key, src } => {
                 let site = u16::try_from(keys.len()).ok()?;
                 keys.push(alloc::boxed::Box::from(key.as_str()));
@@ -2275,7 +2290,25 @@ pub struct GenericHelpers {
     /// interpreter. Re-invoked on every fast-path entry so a reallocated arena
     /// (`slots.push`) is always addressed at its current base.
     pub arena: JitArenaHelper,
+    /// `Op::PushHandler` (`jit_helper_push_handler(ctx, target, reg)`): push onto
+    /// the activation's handler stack; `0`, or the throw sentinel on overflow.
+    pub push_handler: JitAddHelper,
+    /// `Op::PopHandler` (`jit_helper_pop_handler(ctx, _)`): never throws.
+    pub pop_handler: JitTruthyHelper,
+    /// The throw-exit unwinder (`jit_helper_unwind(ctx, regs, n_regs)`): if the
+    /// pending fault is a thrown value and the activation has a handler, pop it,
+    /// bind the value and return the catch pc; else [`NO_HANDLER`].
+    pub unwind: JitUnwindHelper,
 }
+
+/// The [`JitUnwindHelper`] result meaning "no handler caught it: propagate".
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub const NO_HANDLER: u64 = u64::MAX;
+
+/// The runtime-helper ABI for the throw-exit unwinder: `(ctx, regs, n_regs) ->
+/// catch pc` (or [`NO_HANDLER`]).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub type JitUnwindHelper = extern "C" fn(*mut core::ffi::c_void, *mut u64, usize) -> u64;
 
 /// The base pointer + length of the object heap's slot array, returned by the
 /// [`JitArenaHelper`]. `#[repr(C)]` with two integer-class eightbytes, so the
@@ -4455,6 +4488,20 @@ impl JitFunction {
         let arena_helper = helpers.arena as usize as u64;
         let exec_op_helper = helpers.exec_op as usize as u64;
         let backedge_helper = helpers.backedge as usize as u64;
+        let push_handler_helper = helpers.push_handler as usize as u64;
+        let pop_handler_helper = helpers.pop_handler as usize as u64;
+        let unwind_helper = helpers.unwind as usize as u64;
+        // The catch entries of the body's `try` regions: where the throw exit
+        // resumes after `jit_helper_unwind` binds a thrown value.
+        let mut catch_targets: Vec<usize> = ops
+            .iter()
+            .filter_map(|op| match *op {
+                GenericOp::PushHandler { target, .. } => Some(target),
+                _ => None,
+            })
+            .collect();
+        catch_targets.sort_unstable();
+        catch_targets.dedup();
         // Runtime-verified heap layout for the inline monomorphic property-get fast
         // path (offsets/discriminants derived by pointer arithmetic on real
         // instances; see `compute_jit_layout` + the `jit_layout_matches_safe_reads`
@@ -4499,6 +4546,7 @@ impl JitFunction {
         // one for the end of the stream (a branch to `len` falls off the end).
         let labels: Vec<Label> = (0..=ops.len()).map(|_| a.new_label()).collect();
         let throw_exit = a.new_label();
+        let refuse_exit = a.new_label();
         a.frame_prologue(frame);
         a.mov_r15_rdi(); // pin ctx
         a.mov_rbx_rsi(); // pin the register file
@@ -4512,7 +4560,7 @@ impl JitFunction {
             a.je(labels[t]);
         }
         a.test_rdx_rdx();
-        a.jne(throw_exit); // an unknown entry is a caller bug: refuse, never misrun
+        a.jne(refuse_exit); // an unknown entry is a caller bug: refuse, never misrun
         let ok = |r: u16| (r as usize) < n_regs;
         // After a helper `call`, `rax` holds the result or the throw sentinel; the
         // sentinel jumps to the shared throw exit (the caller then reads the pending
@@ -4659,6 +4707,22 @@ impl JitFunction {
                     a.store_rax(disp(dst));
                 }
                 GenericOp::Nop => {}
+                GenericOp::PushHandler { target, reg } => {
+                    if !ok(reg) || target > ops.len() {
+                        return None;
+                    }
+                    a.mov_rdi_r15();
+                    a.movabs_argreg(1, i64::try_from(target).ok()?);
+                    a.movabs_argreg(2, i64::from(reg));
+                    a.movabs_rax(push_handler_helper as i64);
+                    a.call_rax();
+                    throw_check!();
+                }
+                GenericOp::PopHandler => {
+                    a.mov_rdi_r15();
+                    a.movabs_rax(pop_handler_helper as i64);
+                    a.call_rax();
+                }
                 GenericOp::InitProp { obj, val, site } => {
                     if !ok(obj) || !ok(val) {
                         return None;
@@ -5281,8 +5345,23 @@ impl JitFunction {
         a.bind(labels[ops.len()]);
         a.movabs_rax(NanBox::jit_falloff_bits() as i64);
         a.frame_epilogue();
-        // Throw exit: return the sentinel so the caller reads the pending fault.
+        // Throw exit. In a body with `try` regions, first offer the pending fault
+        // to the activation's innermost handler (exactly the interpreter's
+        // `handle_throw!`): a caught throw resumes at its catch pc. Otherwise
+        // return the sentinel so the caller reads the pending fault.
         a.bind(throw_exit);
+        if !catch_targets.is_empty() {
+            a.mov_rdi_r15();
+            a.mov_rsi_rbx();
+            a.movabs_argreg(2, n_regs as i64);
+            a.movabs_rax(unwind_helper as i64);
+            a.call_rax();
+            for &t in &catch_targets {
+                a.cmp_rax_imm(i32::try_from(t).ok()?);
+                a.je(labels[t]);
+            }
+        }
+        a.bind(refuse_exit);
         a.movabs_rax(NanBox::jit_throw_bits() as i64);
         a.frame_epilogue();
         Self::from_code(&a.finish())

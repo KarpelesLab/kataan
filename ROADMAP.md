@@ -394,13 +394,17 @@ These make Kataan more than a fast interpreter. They are *engine* capabilities
 > `fn(ctx, regs, entry_pc)` over the *interpreter's own register file*, op-for-op with the
 > bytecode, so captures/`this`/rest need no modelling and any op without a native lowering is
 > executed by the interpreter itself on those registers (`jit_helper_exec_op`) — only
-> frame-structural ops (handlers, suspension, tail calls, direct eval/env) are refused. Hot
+> frame-structural ops (suspension, tail calls, direct eval/env) are refused. **Exception
+> handlers compile** (`try`/`catch`/`finally`, `for-of`, destructuring): the activation's
+> handler stack lives in `Ctx::jit_handlers` (a segment per compiled activation, inherited
+> on OSR inside a `try`), and the shared throw exit runs `jit_helper_unwind` — the
+> interpreter's `handle_throw!` — then resumes at the catch pc. Hot
 > interpreted loops continue natively from their header (**OSR**, 500 back-edges);
 > back-edges poll interrupt/agents/GC. `jit` is a default feature (inert off x86-64 Linux).
 > Knobs: `KATAAN_JIT_LOG=1|2` (what compiled and why not), `KATAAN_JIT=0|eager`.
 >
 > **Remaining:** native JIT→JIT calls (calls go through the interpreter's call path);
-> lowering `try`/`for-of` (handlers) and generators; the **Cranelift-style shared backend +
+> generators/async bodies; the **Cranelift-style shared backend +
 > aarch64** portability below.
 
 Today the JIT compiles integer/float numeric functions and bails to the

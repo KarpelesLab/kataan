@@ -1438,6 +1438,8 @@ fn hosted_ctx_in<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_funcs: None,
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        jit_handlers: jit_tier::HandlerStack::default(),
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_shadow: alloc::vec::Vec::new(),
         call_depth: 0,
         gc_enabled: false,
@@ -3733,6 +3735,10 @@ struct Ctx<'a> {
     /// program shares one table, so it is invariant across nested calls.
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     jit_funcs: Option<*const [FnProto]>,
+    /// The exception-handler stacks of the running generic-JIT activations (the
+    /// interpreter keeps its own in `run_frame_at`); see `jit_tier::HandlerStack`.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    jit_handlers: jit_tier::HandlerStack,
     /// Forward-safety GC root hook (`JIT_DESIGN.md` §5): a helper-call sequence
     /// would spill live NanBox temps here before re-entering, so an
     /// allocation-triggered collection could treat them as roots. **Not yet
@@ -3861,6 +3867,8 @@ pub fn run_program(
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_funcs: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_handlers: jit_tier::HandlerStack::default(),
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_shadow: alloc::vec::Vec::new(),
             call_depth: 0,
             gc_enabled: true,
@@ -3906,6 +3914,8 @@ pub fn run_program_capturing(
             jit_pending_fault: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_funcs: None,
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_handlers: jit_tier::HandlerStack::default(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_shadow: alloc::vec::Vec::new(),
             call_depth: 0,
@@ -4227,8 +4237,8 @@ fn call_with_inner(
         }
         // Native fast path (`ROADMAP.md` §2.1): once a function is hot, compile it
         // to machine code and run that on this activation's register file (see
-        // `jit_tier`). A body with a tail call, a handler or a suspension point is
-        // never compiled, so this never intercepts the trampoline.
+        // `jit_tier`). A body with a tail call or a suspension point is never
+        // compiled, so this never intercepts the trampoline.
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         if jit_tier::call_is_hot(optimized.is_some())
             && let Some(outcome) = jit_tier::enter_on_call(ctx, funcs, id, &args, &mut regs)
@@ -4443,6 +4453,8 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
             jit_pending_fault: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_funcs: None,
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_handlers: jit_tier::HandlerStack::default(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_shadow: alloc::vec::Vec::new(),
             call_depth: 0,
@@ -5564,6 +5576,9 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         exec_op: jit_tier::jit_helper_exec_op,
         backedge: jit_tier::jit_helper_backedge,
         arena: jit_arena,
+        push_handler: jit_tier::jit_helper_push_handler,
+        pop_handler: jit_tier::jit_helper_pop_handler,
+        unwind: jit_tier::jit_helper_unwind,
     }
 }
 
@@ -5593,14 +5608,19 @@ pub(crate) extern "C" fn jit_arena(
         .as_handle()
         .map(Handle::from_raw)
         .is_some_and(|h| match mode {
-            crate::jit::ARENA_GET => !read_needs_host(ctx, recv),
+            // The common case first: an ordinary object (one heap lookup).
+            crate::jit::ARENA_GET if ctx.host.is_none() => true,
+            crate::jit::ARENA_GET => ctx
+                .realm
+                .jit_plain_object(h, false)
+                .unwrap_or_else(|| !read_needs_host(ctx, recv)),
             crate::jit::ARENA_SET => {
-                !read_needs_host(ctx, recv)
-                    && !is_string_wrapper(&ctx.realm, recv)
-                    && !ctx
-                        .host
-                        .as_ref()
-                        .is_some_and(|host| host.is_global_object(recv))
+                ctx.realm.jit_plain_object(h, true).unwrap_or_else(|| {
+                    !read_needs_host(ctx, recv) && !is_string_wrapper(&ctx.realm, recv)
+                }) && !ctx
+                    .host
+                    .as_ref()
+                    .is_some_and(|host| host.is_global_object(recv))
                     && !ctx.realm.is_dispatch_tracked_proto(h)
             }
             crate::jit::ARENA_ELEM_GET => ctx.realm.jit_array_len_is_dense(h),
@@ -7801,12 +7821,14 @@ fn run_frame_at_ic(
                     // A hot loop continues in native code from its header
                     // (on-stack replacement); `u32::MAX` = tried, not eligible.
                     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-                    if osr_count != u32::MAX && handlers.is_empty() {
+                    if osr_count != u32::MAX {
                         osr_count += 1;
                         if osr_count >= jit_tier::osr_threshold() {
-                            // The rest of the activation ran natively (a
-                            // compiled body has no handlers to unwind into).
-                            if let Some(r) = jit_tier::osr(ctx, funcs, program, regs, *target) {
+                            // The rest of the activation runs natively, with
+                            // this frame's handler stack.
+                            if let Some(r) =
+                                jit_tier::osr(ctx, funcs, program, regs, *target, &handlers)
+                            {
                                 return r;
                             }
                             osr_count = u32::MAX;
@@ -24405,6 +24427,7 @@ mod generic_jit_tests {
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending_fault: None,
             jit_funcs: None,
+            jit_handlers: jit_tier::HandlerStack::default(),
             jit_shadow: alloc::vec::Vec::new(),
             call_depth: 0,
             gc_enabled: false,
@@ -26908,7 +26931,7 @@ mod generic_jit_tests {
             run_frame(&mut ctx, &funcs, pre, &mut regs),
             Ok(FrameExit::Return(None))
         ));
-        match jit_tier::run_compiled(&mut ctx, &funcs, &jit, &mut regs, header).unwrap() {
+        match jit_tier::run_compiled(&mut ctx, &funcs, &jit, &mut regs, header, &[]).unwrap() {
             Ok(FrameExit::Return(Some(v))) => assert_eq!(v.to_bits(), want.to_bits()),
             _ => panic!("expected a return"),
         }
@@ -26916,5 +26939,60 @@ mod generic_jit_tests {
         let ctx_ptr = &mut ctx as *mut Ctx as *mut core::ffi::c_void;
         assert!(!jit.has_entry(header + 1));
         assert!(jit.call_frame_raw(ctx_ptr, &mut regs, header + 1).is_none());
+    }
+    /// `try`/`catch`/`finally` compile: a throw from an interpreter-run op, from
+    /// a helper, and from an explicit `throw` unwinds to the innermost compiled
+    /// handler, with results bit-identical to the interpreter; an uncaught throw
+    /// still leaves the body as the identical error, and the handler stack is
+    /// left balanced.
+    #[test]
+    fn generic_try_catch_matches() {
+        let (funcs, f) = compile_named(
+            "function f(o, n){ var s = 0;
+               for (var i = 0; i < n; i = i + 1) {
+                 try { try { if (i % 3 == 0) throw i; s = s + o.x.y; }
+                       finally { s = s + 1; } }
+                 catch (e) { s = s + 100; }
+               }
+               try { return o.q.r; } catch (e) { s = s * 2; }
+               return o.z.w + s; }",
+            "f",
+        );
+        let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers())
+            .expect("a body with handlers compiles");
+        let mut ctx = mk_ctx(Realm::new());
+        let inner = ctx.realm.new_object();
+        ctx.realm.set_property(inner, "y", NanBox::number(5.0));
+        let o = ctx.realm.new_object();
+        ctx.realm
+            .set_property(o, "x", NanBox::handle(inner.to_raw()));
+        let z = ctx.realm.new_object();
+        ctx.realm.set_property(z, "w", NanBox::number(1.0));
+        ctx.realm.set_property(o, "z", NanBox::handle(z.to_raw()));
+        let args = [NanBox::handle(o.to_raw()), NanBox::number(10.0)];
+        let interp = call(&mut ctx, &funcs, f, &args).unwrap();
+        let jitted = call_generic(&mut ctx, &funcs, &jit, &args)
+            .unwrap()
+            .unwrap();
+        assert_eq!(interp.to_bits(), jitted.to_bits());
+        assert_eq!(
+            interp.as_number(),
+            Some(2.0 * (4.0 * 100.0 + 6.0 * 5.0 + 10.0) + 1.0)
+        );
+        assert_eq!(ctx.jit_handlers.stack.len(), 0);
+        // `o.z` missing: the final read throws outside every handler.
+        let bare = NanBox::handle(ctx.realm.new_object().to_raw());
+        let args = [bare, NanBox::number(4.0)];
+        match (
+            call(&mut ctx, &funcs, f, &args),
+            call_generic(&mut ctx, &funcs, &jit, &args).unwrap(),
+        ) {
+            (Err(VmError::Thrown(a)), Err(VmError::Thrown(b))) => assert_eq!(
+                ctx.realm.to_display_string(a),
+                ctx.realm.to_display_string(b)
+            ),
+            other => panic!("expected both to throw, got {other:?}"),
+        }
+        assert_eq!(ctx.jit_handlers.stack.len(), 0);
     }
 }
