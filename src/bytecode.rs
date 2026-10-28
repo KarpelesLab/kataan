@@ -280,6 +280,21 @@ pub fn op_mentions_reg(op: &Op, r: Reg) -> bool {
     verify_op_with(op, &|x| x != r, usize::MAX, usize::MAX).is_err()
 }
 
+/// Calls `f` with every register `op` names (read or written), in the
+/// verifier's operand order (a register named twice is reported twice). Used by
+/// the JIT's register type inference and loop register promotion.
+pub fn op_for_each_reg(op: &Op, f: &dyn Fn(Reg)) {
+    let _ = verify_op_with(
+        op,
+        &|r| {
+            f(r);
+            true
+        },
+        usize::MAX,
+        usize::MAX,
+    );
+}
+
 fn verify_op_with(
     op: &Op,
     reg_ok: &dyn Fn(Reg) -> bool,

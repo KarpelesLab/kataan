@@ -478,6 +478,30 @@ impl Scope {
         true
     }
 
+    /// The address of the value of `name`'s binding in *this* frame, found
+    /// through `cache`, when it is initialized (not in its temporal dead zone)
+    /// and — with `plain` — neither `const` nor soft-`const`: exactly when
+    /// [`cached_get_local`](Self::cached_get_local) would return the value (and,
+    /// with `plain`, [`cached_set_plain_local`](Self::cached_set_plain_local)
+    /// would assign it). For the JIT, which reads/writes the binding through the
+    /// address only while no Rust code runs (nothing can then add or free a
+    /// binding, moving or retiring the slot storage).
+    #[must_use]
+    pub fn jit_binding_ptr(
+        &self,
+        name: &str,
+        cache: &SlotCache,
+        plain: bool,
+    ) -> Option<*mut NanBox> {
+        let mut data = self.0.borrow_mut();
+        let i = data.cached_slot(name, cache)?;
+        let b = data.slots.get_mut(i as usize)?;
+        if b.value.is_tdz() || (plain && b.flags != 0) {
+            return None;
+        }
+        Some(core::ptr::from_mut(&mut b.value))
+    }
+
     /// Whether `name` is bound in *this* frame, through `cache`.
     #[must_use]
     pub fn cached_has_local(&self, name: &str, cache: &SlotCache) -> bool {

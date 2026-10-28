@@ -13,7 +13,7 @@
 
 use super::{
     Ctx, FnProto, FrameExit, Handle, NanBox, Op, Reg, VmError, jit_for, run_frame, vm_agent_tick,
-    vm_error, vm_load_global, vm_safepoint,
+    vm_error, vm_load_global, vm_safepoint, vm_store_global_fast,
 };
 use crate::jit::{CallSite, CalleeInfo, FRAME_HEADER, JitStack};
 use alloc::rc::Rc;
@@ -410,6 +410,56 @@ pub(crate) extern "C" fn jit_helper_unwind(
     target as u64
 }
 
+/// The generic-tier helper that validates a global binding for direct access
+/// from a compiled loop (`crate::jit::numeric`): for `Op::LoadGlobal`, the
+/// address of the global scope's own initialized binding of the name — exactly
+/// where [`vm_load_global`]'s first step reads; for `Op::StoreGlobal`, the
+/// address of that binding when [`vm_store_global_fast`] would assign it without
+/// mirroring the write onto the global object (the running scope is the global
+/// scope, the binding is plain and initialized, the global object has no
+/// like-named own property). `0` otherwise. The address stays valid, and the
+/// facts true, until Rust code next runs (which alone can add or free a binding,
+/// change the running scope or realm, or give the global object a property):
+/// the compiled code drops it after every call.
+///
+/// # Safety
+/// `ctx` must be the live `Ctx` the compiled body was entered with and `op` a
+/// pointer into the bytecode the calling `JitProto` owns.
+pub(crate) extern "C" fn jit_helper_global_ref(ctx: *mut core::ffi::c_void, op: u64) -> u64 {
+    // SAFETY: see the function contract — a live, otherwise-unborrowed `Ctx`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    // SAFETY: `op` points into the `JitProto`'s owned bytecode, alive while its
+    // code runs.
+    #[allow(unsafe_code)]
+    let op = unsafe { &*(op as usize as *const Op) };
+    let Some(host) = ctx.host.as_deref() else {
+        return 0;
+    };
+    let p = match op {
+        Op::LoadGlobal { name, cache, .. } => {
+            host.global_scope().jit_binding_ptr(name, cache, false)
+        }
+        Op::StoreGlobal {
+            name,
+            strict,
+            resolved,
+            cache,
+            ..
+        } if !(*strict && resolved.is_some()) && !name.starts_with('\u{1}') => {
+            host.global_scope_if_current().and_then(|(scope, global)| {
+                let p = scope.jit_binding_ptr(name, &cache.slot, true)?;
+                let owned = global
+                    .as_handle()
+                    .is_some_and(|g| ctx.realm.has_own(Handle::from_raw(g), name));
+                (!owned).then_some(p)
+            })
+        }
+        _ => None,
+    };
+    p.map_or(0, |p| p as usize as u64)
+}
+
 /// The generic-tier helper that runs one bytecode op — any op without a native
 /// lowering — through the interpreter itself, on the body's register file. The
 /// op is run as a one-op program, which is exact for every op the tier accepts:
@@ -451,6 +501,17 @@ pub(crate) extern "C" fn jit_helper_exec_op(
     let direct = match op {
         Op::LoadGlobal { dst, name, cache } => {
             Some(vm_load_global(ctx, name, cache).map(|v| regs[*dst as usize] = v))
+        }
+        // `StoreGlobal`'s plain-binding fast path (the interpreter arm's first
+        // step; its strict unresolvable-reference check precedes it).
+        Op::StoreGlobal {
+            name,
+            src,
+            strict,
+            resolved,
+            cache,
+        } if !(*strict && resolved.is_some()) => {
+            vm_store_global_fast(ctx, name, cache, regs[*src as usize]).then_some(Ok(()))
         }
         Op::CallValue { dst, callee, args } => {
             let callee = regs[*callee as usize];

@@ -5757,6 +5757,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         callee_info: jit_tier::jit_callee_info,
         call_layout: jit_tier::call_layout(),
         unwind: jit_tier::jit_helper_unwind,
+        global_ref: jit_tier::jit_helper_global_ref,
     }
 }
 
@@ -26196,6 +26197,112 @@ mod generic_jit_tests {
             diff_ok(&funcs, ushr, &[NanBox::number(-1.0), NanBox::number(28.0)]).as_number(),
             Some(15.0)
         );
+    }
+
+    /// The numeric emitter (`crate::jit::numeric`): type-specialized arithmetic,
+    /// fused compare-and-branch and promoted loop registers, over every edge
+    /// value (-0, NaN, ±∞, int32 bounds and overflow, shifts by ≥ 32, fractions,
+    /// huge magnitudes) — bit-identical to the interpreter. Each call compiles
+    /// afresh, so the interpreter side never runs a tiered-up body.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn generic_numeric_loops_match_interpreter() {
+        let src = "
+            function add(x, y) { let a = x; for (let i = 0; i < 3; i = i + 1) { a = a + y; } return a; }
+            function sub(x, y) { let a = x; for (let i = 0; i < 3; i = i + 1) { a = a - y; } return a; }
+            function mul(x, y) { let a = x; for (let i = 0; i < 2; i = i + 1) { a = a * y; } return a; }
+            function div(x, y) { let a = x; for (let i = 0; i < 2; i = i + 1) { a = a / y; } return a; }
+            function mod(x, y) { let a = 0; for (let i = 0; i < 2; i = i + 1) { a = x % y; } return a; }
+            function bits(x, y) { let a = 0; for (let i = 0; i < 2; i = i + 1) { a = ((x | y) ^ (x & y)) + (x << y) + (x >> y) + (x >>> y); } return a; }
+            function cmp(x, y) { let n = 0; for (let i = 0; i < 2; i = i + 1) { if (x < y) n += 1; if (x <= y) n += 2; if (x > y) n += 4; if (x >= y) n += 8; if (x == y) n += 16; if (x !== y) n += 32; } return n; }
+            function unary(x, y) { let a = 0; for (let i = 0; i < 2; i = i + 1) { a = -x + ~y; } return a; }
+            function truthy(x, y) { let n = 0; for (let i = 0; i < 2; i = i + 1) { if (x) n = n + 1; if (y) n = n + 10; } return n; }
+            function acc(x, y) { let s = 0; for (let i = 0; i < 50; i = i + 1) { s = (s + i * x) | 0; } return s + y; }
+        ";
+        let vals = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -2.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            2147483647.0,
+            -2147483648.0,
+            2147483648.0,
+            4294967295.0,
+            4294967296.0,
+            9007199254740991.0,
+            1e300,
+            5e-324,
+            31.0,
+            32.0,
+            33.0,
+            64.0,
+        ];
+        for name in [
+            "add", "sub", "mul", "div", "mod", "bits", "cmp", "unary", "truthy", "acc",
+        ] {
+            let mut pairs: Vec<(NanBox, NanBox)> = Vec::new();
+            for &x in &vals {
+                for &y in &vals {
+                    pairs.push((NanBox::number(x), NanBox::number(y)));
+                }
+            }
+            // Non-number operands take the slow paths out of a promoted loop.
+            pairs.extend([
+                (NanBox::boolean(true), NanBox::number(2.0)),
+                (NanBox::null(), NanBox::undefined()),
+                (NanBox::number(3.0), NanBox::boolean(false)),
+            ]);
+            for (x, y) in pairs {
+                let (funcs, f) = compile_named(src, name);
+                diff_ok(&funcs, f, &[x, y]);
+            }
+        }
+    }
+
+    /// The Int tier keeps no `-0` (an `i64` has none): a `-0` argument deopts,
+    /// and the ops that make `-0` out of other integers (`0 * -5`, `-0` from
+    /// `-x`, `-4 % 2`) are not lowered or deopt — so the hot tiered-up body
+    /// returns exactly what the interpreter does.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn int_tier_keeps_the_sign_of_zero() {
+        let src = "
+            function mul(x, y) { return x * y; }
+            function dbl(x, y) { return x * 2; }
+            function neg(x, y) { return -x + y; }
+            function rem(x, y) { return x % y; }
+            function add(x, y) { return x + y; }
+        ";
+        for name in ["mul", "dbl", "neg", "rem", "add"] {
+            let (funcs, f) = compile_named(src, name);
+            if let Some(jit) = crate::jit::JitProto::compile(&funcs[f]) {
+                for (x, y) in [
+                    (0.0, -5.0),
+                    (-3.0, 0.0),
+                    (-0.0, 4.0),
+                    (-4.0, 2.0),
+                    (-0.0, -0.0),
+                    (6.0, 4.0),
+                    (-7.0, 3.0),
+                ] {
+                    let args = [NanBox::number(x), NanBox::number(y)];
+                    let mut ctx = mk_ctx(Realm::new());
+                    let interp = call(&mut ctx, &funcs, f, &args).expect("interp ok");
+                    if let Some(native) = jit.call_guarded(&args) {
+                        assert_eq!(
+                            native.to_bits(),
+                            interp.to_bits(),
+                            "{name}({x}, {y}): native {native:?} vs interpreter {interp:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The relational sugar `>`/`<=`/`>=` (compiled to `Lt` + operand swap / `Not`)

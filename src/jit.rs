@@ -1060,7 +1060,7 @@ pub fn fold_constants(ops: &[RegOp], n_regs: usize) -> Vec<RegOp> {
                 // Fold only when the divisor is a known non-zero constant (a zero
                 // divisor must still reach the native deopt, not be folded).
                 match (known[a as usize], known[b as usize]) {
-                    (Some(x), Some(y)) if y != 0 => {
+                    (Some(x), Some(y)) if y != 0 && x >= 0 => {
                         let v = x.wrapping_rem(y);
                         known[dst as usize] = Some(v);
                         RegOp::Const { dst, imm: v }
@@ -1178,11 +1178,14 @@ fn simplify_bin(
 }
 
 /// If `v` is a `NanBox` whole number that fits an `i64` losslessly, its integer
-/// value — the JIT integer fast path only applies to such constants.
+/// value — the JIT integer fast path only applies to such constants. `-0` is
+/// not one: an `i64` has no negative zero, so it would come back as `+0`.
 #[cfg(feature = "alloc")]
 fn nanbox_int(v: crate::nanbox::NanBox) -> Option<i64> {
     match v.unpack() {
-        crate::nanbox::Unpacked::Number(n) if n.is_finite() => {
+        crate::nanbox::Unpacked::Number(n)
+            if n.is_finite() && !(n == 0.0 && n.is_sign_negative()) =>
+        {
             let i = n as i64;
             // Lossless round-trip and within the exact-integer range (±2^53).
             if (i as f64) == n
@@ -1193,6 +1196,29 @@ fn nanbox_int(v: crate::nanbox::NanBox) -> Option<i64> {
                 None
             }
         }
+        _ => None,
+    }
+}
+
+/// The register an op the Int tier lowers writes (`None` for the others).
+#[cfg(feature = "alloc")]
+fn int_tier_dst(op: &crate::nbvm::Op) -> Option<crate::nbvm::Reg> {
+    use crate::nbvm::Op;
+    match op {
+        Op::LoadConst { dst, .. }
+        | Op::Add { dst, .. }
+        | Op::AddValue { dst, .. }
+        | Op::Sub { dst, .. }
+        | Op::Mul { dst, .. }
+        | Op::Mod { dst, .. }
+        | Op::Move { dst, .. }
+        | Op::Lt { dst, .. }
+        | Op::Not { dst, .. }
+        | Op::StrictEq { dst, .. }
+        | Op::ValueBin { dst, .. }
+        | Op::Neg { dst, .. }
+        | Op::BitNot { dst, .. }
+        | Op::Call { dst, .. } => Some(*dst),
         _ => None,
     }
 }
@@ -1333,6 +1359,26 @@ pub fn lower_nbvm_with(
         let r8 = reg8(r)?;
         if *w.get(r as usize)? { Some(r8) } else { None }
     };
+    // The registers only ever written by `LoadConst` of a positive integer. An
+    // integer product is a JS `-0` exactly when it is zero with a negative
+    // factor, which a positive constant factor rules out (the other factor is
+    // never `-0`: the guards and constants reject it) — so only such a `*` is
+    // lowered; any other one is left to a tier that keeps the sign of zero.
+    let pos_const: Vec<bool> = (0..proto.n_regs)
+        .map(|r| {
+            let mut writes = proto
+                .ops
+                .iter()
+                .filter(|o| int_tier_dst(o).is_some_and(|d| d as usize == r))
+                .peekable();
+            r >= proto.n_params
+                && writes.peek().is_some()
+                && writes.all(|o| {
+                    matches!(o, Op::LoadConst { value, .. }
+                        if nanbox_int(*value).is_some_and(|c| c > 0))
+                })
+        })
+        .collect();
     // Parameters arrive in registers `0..n_params`; seed them from the args.
     for i in 0..proto.n_params {
         out.push(RegOp::Arg {
@@ -1373,7 +1419,10 @@ pub fn lower_nbvm_with(
                     op: BinOp2::Sub,
                 }
             }
-            Op::Mul { dst, a, b } => {
+            Op::Mul { dst, a, b }
+                if pos_const.get(*a as usize) == Some(&true)
+                    || pos_const.get(*b as usize) == Some(&true) =>
+            {
                 let (a, b) = (read(&written, *a)?, read(&written, *b)?);
                 let d = reg8(*dst)?;
                 written[*dst as usize] = true;
@@ -1429,14 +1478,7 @@ pub fn lower_nbvm_with(
                 written[*dst as usize] = true;
                 RegOp::Eq { dst: d, a, b }
             }
-            // JS unary minus of an integer: `-x`. The native code guards i64::MIN
-            // overflow and the exact-integer range, so it never diverges.
-            Op::Neg { dst, a } => {
-                let a = read(&written, *a)?;
-                let d = reg8(*dst)?;
-                written[*dst as usize] = true;
-                RegOp::Neg { dst: d, a }
-            }
+            // JS unary minus is not lowered: `-0` (of `0`) has no `i64` form.
             // JS bitwise-not `~x` = `~ToInt32(x)`; the native code truncates to i32.
             Op::BitNot { dst, a } => {
                 let a = read(&written, *a)?;
@@ -1620,12 +1662,8 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
             Op::Mul { dst, a, b } => bin(&mut written, *dst, *a, *b, FBinOp::Mul)?,
             Op::Div { dst, a, b } => bin(&mut written, *dst, *a, *b, FBinOp::Div)?,
             // Float `%` (`a - trunc(a/b)*b`) needs `roundsd` — SSE4.1 only.
-            Op::Mod { dst, a, b } if has_sse41() => {
-                let (a, b) = (read(&written, *a)?, read(&written, *b)?);
-                let d = reg8(*dst)?;
-                written[*dst as usize] = true;
-                FloatOp::Mod { dst: d, a, b }
-            }
+            // `%` is not lowered: the emitted `a - trunc(a/b)*b` is not the exact
+            // IEEE remainder (it rounds, and loses the sign of a zero result).
             Op::Move { dst, src } => {
                 let s = read(&written, *src)?;
                 let d = reg8(*dst)?;
@@ -1638,13 +1676,8 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
                 written[*dst as usize] = true;
                 FloatOp::Lt { dst: d, a, b }
             }
-            // Float unary minus `-x` (`0.0 - x`).
-            Op::Neg { dst, a } => {
-                let a = read(&written, *a)?;
-                let d = reg8(*dst)?;
-                written[*dst as usize] = true;
-                FloatOp::Neg { dst: d, a }
-            }
+            // Float unary minus is not lowered: the emitted `0.0 - x` is `+0` for
+            // `-(+0)`.
             // Float logical-not `!x` — so `<=`/`>=`/`!==` (Lt/StrictEq + Not) JIT.
             Op::Not { dst, a } => {
                 let a = read(&written, *a)?;
@@ -2605,6 +2638,9 @@ pub struct GenericHelpers {
     /// pending fault is a thrown value and the activation has a handler, pop it,
     /// bind the value and return the catch pc; else [`NO_HANDLER`].
     pub unwind: JitUnwindHelper,
+    /// `jit_helper_global_ref(ctx, op) -> *mut NanBox | 0`: validates a global
+    /// binding for direct access from a compiled loop (`numeric`).
+    pub global_ref: JitTruthyHelper,
 }
 
 /// The runtime-helper ABI for a method call: `(ctx, regs, n_regs, op, cache) ->
@@ -4442,6 +4478,10 @@ impl JitFunction {
                     a.test_rcx_rcx();
                     a.je(deopt);
                     a.load_rax(disp(ra));
+                    // A negative dividend can leave a zero remainder, which JS
+                    // signs `-0`: the interpreter's.
+                    a.test_rax_rax();
+                    a.jl(deopt);
                     a.cqo();
                     a.idiv_rcx();
                     a.mov_rax_rdx();
@@ -4914,11 +4954,35 @@ impl JitFunction {
         // countdown slot. The helper reads `argv[i]` at ascending addresses, so slot
         // 0 is the deepest: slot `i` at `[rbp - 24 - (max_argc - i)*8]`.
         let argbuf_disp = |i: usize| -(24 + (max_argc as i32 - i as i32) * 8);
-        // Countdown slot + argument buffer, rounded to keep `rsp` 16-byte aligned
-        // (after `push rbp; push r15; push rbx`, rsp ≡ 0 mod 16).
         // One more slot under the buffer: a method call's looked-up callee.
         let method_scratch = -(24 + (max_argc as i32 + 1) * 8);
-        let frame = ((16 + max_argc as u32 * 8) + 15) & !15;
+        // Type-specialized arithmetic and loop register promotion (`numeric`),
+        // whose frame slots sit under the method scratch slot.
+        let mut num = numeric::NumGen::new(
+            ops,
+            bytecode,
+            numeric::NumEnv {
+                n_regs,
+                bytecode: bytecode.as_ptr(),
+                bytecode_len: bytecode.len(),
+                add: add_helper,
+                arith: arith_helper,
+                value_bin: value_bin_helper,
+                lt: lt_helper,
+                strict_eq: strict_eq_helper,
+                truthy: truthy_helper,
+                exec_op: exec_op_helper,
+                backedge: backedge_helper,
+                global_ref: helpers.global_ref as usize as u64,
+            },
+            osr_entries,
+            &catch_targets,
+        );
+        num.set_frame_base(method_scratch);
+        // Countdown slot + argument buffer + method scratch + the numeric slots,
+        // rounded to keep `rsp` 16-byte aligned (after `push rbp; push r15; push
+        // rbx`, rsp ≡ 0 mod 16).
+        let frame = ((16 + max_argc as u32 * 8 + num.frame_slots() as u32 * 8) + 15) & !15;
         let mut a = X64Assembler::new();
         a.set_rbx_frame(true);
         // One label per op (any op can be a branch target or an OSR entry) plus
@@ -5070,6 +5134,9 @@ impl JitFunction {
         }
         for (op_idx, op) in ops.iter().enumerate() {
             a.bind(labels[op_idx]);
+            if num.emit(&mut a, &labels, throw_exit, op_idx, ops)? {
+                continue;
+            }
             match *op {
                 GenericOp::Const { dst, imm } => {
                     if !ok(dst) {
@@ -5944,6 +6011,9 @@ impl JitFunction {
         a.bind(labels[ops.len()]);
         a.movabs_rax(NanBox::jit_falloff_bits() as i64);
         a.frame_epilogue();
+        // The numeric emitter's out-of-line slow paths (after a `ret`, so no op
+        // falls through into them).
+        num.finish(&mut a, &labels, throw_exit);
         // Throw exit. In a body with `try` regions, first offer the pending fault
         // to the activation's innermost handler (exactly the interpreter's
         // `handle_throw!`): a caught throw resumes at its catch pc. Otherwise
@@ -6120,6 +6190,9 @@ pub enum BinOp {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod numeric;
+
 mod exec {
     //! W^X executable memory, mapped via direct Linux x86-64 syscalls (no libc).
 
@@ -6436,7 +6509,8 @@ mod tests {
     #[test]
     fn lowers_and_jits_a_real_arithmetic_function() {
         // Compile a real integer arithmetic function and JIT one of its protos.
-        let src = "function f(a, b) { return a * b + a - b; } f;";
+        // (A product needs a positive constant factor to lower: see `pos_const`.)
+        let src = "function f(a, b) { return a * 3 + a - b; } f;";
         let program = crate::parser::Parser::parse_program(src).expect("parse");
         let protos = crate::nbvm::compile_program(&program).expect("compile");
         // Find the proto that lowers and takes two params (the body of `f`).
@@ -6446,7 +6520,7 @@ mod tests {
                 continue;
             }
             if let Some(lowered) = lower_nbvm(p) {
-                let oracle = |a: i64, b: i64| a * b + a - b;
+                let oracle = |a: i64, b: i64| a * 3 + a - b;
                 for (a, b) in [(2, 3), (10, -4), (0, 7), (-5, -5), (123, 2)] {
                     let via_ir = eval_reg(&lowered, p.n_regs, &[a, b]);
                     assert_eq!(via_ir, oracle(a, b), "lowered IR matches semantics");
@@ -6464,9 +6538,10 @@ mod tests {
     #[test]
     fn jit_deopts_on_overflow_and_range() {
         use crate::nanbox::{NanBox, Unpacked};
-        // f(a,b) = a * b. Within ±2^53 it runs natively; beyond it must deopt
-        // (i64 and f64 would diverge), returning None so the interpreter takes over.
-        let src = "function f(a, b) { return a * b; } f;";
+        // f(a,b) = a * 2^30 + b. Within ±2^53 it runs natively; beyond it must
+        // deopt (i64 and f64 would diverge), returning None so the interpreter
+        // takes over.
+        let src = "function f(a, b) { return a * 1073741824 + b; } f;";
         let program = crate::parser::Parser::parse_program(src).expect("parse");
         let protos = crate::nbvm::compile_program(&program).expect("compile");
         let p = protos.iter().find(|p| p.n_params == 2).unwrap();
@@ -6474,21 +6549,21 @@ mod tests {
 
         // In range → native result.
         let r = jit
-            .call_guarded(&[NanBox::number(1000.0), NanBox::number(1000.0)])
+            .call_guarded(&[NanBox::number(1000.0), NanBox::number(5.0)])
             .unwrap();
-        assert_eq!(r.unpack(), Unpacked::Number(1_000_000.0));
+        assert_eq!(r.unpack(), Unpacked::Number(1_073_741_824_005.0));
 
         // 2^30 * 2^30 = 2^60 > 2^53 → deopt (None), NOT a wrong wrapped answer.
         let big = (1i64 << 30) as f64;
         assert!(
-            jit.call_guarded(&[NanBox::number(big), NanBox::number(big)])
+            jit.call_guarded(&[NanBox::number(big), NanBox::number(0.0)])
                 .is_none(),
             "a product beyond 2^53 must deopt, not return a wrapped i64"
         );
         // A result that overflows i64 entirely also deopts.
-        let huge = 3_000_000_000.0; // 3e9; 3e9 * 3e9 = 9e18 ~ i64 overflow
+        let huge = 9_000_000_000_000.0; // 9e12 * 2^30 ≈ 9.7e21 > i64::MAX
         assert!(
-            jit.call_guarded(&[NanBox::number(huge), NanBox::number(huge)])
+            jit.call_guarded(&[NanBox::number(huge), NanBox::number(0.0)])
                 .is_none(),
             "i64-overflowing product must deopt"
         );
@@ -6606,7 +6681,7 @@ mod tests {
     #[test]
     fn jit_proto_end_to_end_with_deopt_guard() {
         use crate::nanbox::{NanBox, Unpacked};
-        let src = "function f(a, b) { return a * b + a - b; } f;";
+        let src = "function f(a, b) { return a * 7 + a - b; } f;";
         let program = crate::parser::Parser::parse_program(src).expect("parse");
         let protos = crate::nbvm::compile_program(&program).expect("compile");
         let p = protos.iter().find(|p| p.n_params == 2).expect("f's proto");
@@ -6620,7 +6695,7 @@ mod tests {
         let r = jit
             .call_guarded(&[NanBox::number(-3.0), NanBox::number(4.0)])
             .unwrap();
-        assert_eq!(r.unpack(), Unpacked::Number(-3.0 * 4.0 + -3.0 - 4.0));
+        assert_eq!(r.unpack(), Unpacked::Number(-3.0 * 7.0 + -3.0 - 4.0));
 
         // A non-integer argument deopts (the guard fails) → None.
         assert!(
@@ -6968,10 +7043,14 @@ mod tests {
         let (alloc, n) = allocate_reg(&optimize_reg(&ops, 3), 3);
         let f = JitFunction::compile_reg(n, 2, &alloc).unwrap();
         // JS `%`: sign follows the dividend.
-        for (a, b) in [(17, 5), (-17, 5), (17, -5), (100, 10), (3, 7)] {
+        for (a, b) in [(17, 5), (17, -5), (100, 10), (3, 7), (0, 4)] {
             let expect = a % b;
             assert_eq!(f.call_args(&[a, b]), expect, "{a} % {b}");
             assert_eq!(eval_reg(&ops, 3, &[a, b]), expect);
+        }
+        // A negative dividend deopts: its zero remainder would be JS `-0`.
+        for (a, b) in [(-17, 5), (-4, 2), (-1, 1)] {
+            assert_eq!(f.call_args(&[a, b]), i64::MAX, "{a} % {b} must deopt");
         }
         // Divide-by-zero deopts: the sentinel (out of ±2^53) signals "bail".
         assert_eq!(f.call_args(&[5, 0]), i64::MAX, "% 0 must deopt");
