@@ -274,6 +274,15 @@ pub enum Op {
         args: Reg,
         this: Reg,
     },
+    /// [`Op::SuperCall`] with its arguments in registers (a `super(…)`
+    /// without spread elements), so compiled code can pass them directly.
+    SuperCallArgs {
+        dst: Reg,
+        ctor: Reg,
+        new_target: Reg,
+        args: Vec<Reg>,
+        this: Reg,
+    },
     /// `dst = home.[[Prototype]].[[Get]](key, this)` (`super[key]`).
     SuperGet {
         dst: Reg,
@@ -3213,6 +3222,37 @@ fn super_construct_parent(
         .map_err(VmError::from)
 }
 
+/// `super(...argv)` ([`Op::SuperCall`] / [`Op::SuperCallArgs`]) in the frame
+/// whose registers are `regs` (published for the GC while the parent runs):
+/// constructs the parent `regs[ctor]` with `new.target` `regs[new_target]`,
+/// then the object `this` is to be bound to — a `ReferenceError` when
+/// `regs[this]` is already bound.
+fn super_call(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: &[NanBox],
+    (ctor, new_target, this): (Reg, Reg, Reg),
+    argv: &[NanBox],
+) -> Result<NanBox, VmError> {
+    let (f, nt) = (regs[ctor as usize], regs[new_target as usize]);
+    let pub_mark = ctx.frame_shadow.len();
+    ctx.frame_shadow.extend_from_slice(regs);
+    ctx.frames_published += 1;
+    let r = super_construct_parent(ctx, funcs, f, argv, nt);
+    ctx.frames_published -= 1;
+    ctx.frame_shadow.truncate(pub_mark);
+    let obj = r?;
+    if !regs[this as usize].is_tdz() {
+        let e = vm_error(
+            ctx,
+            "ReferenceError",
+            "Super constructor may only be called once",
+        );
+        return Err(VmError::Thrown(e));
+    }
+    Ok(obj)
+}
+
 /// InitializeInstanceElements: runs class `f`'s field initializer (the hidden
 /// `\0fields` closure, if any) with `this` = `obj`.
 fn run_fields(ctx: &mut Ctx, funcs: &[FnProto], f: NanBox, obj: NanBox) -> Result<(), VmError> {
@@ -5926,6 +5966,10 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         construct_info: jit_tier::jit_construct_info,
         construct_result: jit_tier::jit_construct_result,
         construct_alloc: jit_tier::jit_construct_alloc,
+        super_twice: jit_tier::jit_super_twice,
+        super_call: jit_tier::jit_helper_super_call,
+        super_ctor: jit_tier::jit_helper_ident_op,
+        init_fields: jit_tier::jit_helper_ident_op,
         callee_info: jit_tier::jit_callee_info,
         call_layout: jit_tier::call_layout(),
         unwind: jit_tier::jit_helper_unwind,
@@ -7874,31 +7918,29 @@ fn run_frame_at_ic(
                 this,
             } => {
                 let argv = spread_argv(ctx, regs[*args as usize])?;
-                let (f, nt) = (regs[*ctor as usize], regs[*new_target as usize]);
-                let pub_mark = ctx.frame_shadow.len();
-                ctx.frame_shadow.extend_from_slice(regs);
-                ctx.frames_published += 1;
-                let r = super_construct_parent(ctx, funcs, f, &argv, nt);
-                ctx.frames_published -= 1;
-                ctx.frame_shadow.truncate(pub_mark);
-                let obj = match r {
-                    Ok(v) => v,
-                    Err(e) => {
-                        handle_throw!(e);
-                        continue;
+                match super_call(ctx, funcs, regs, (*ctor, *new_target, *this), &argv) {
+                    Ok(obj) => {
+                        regs[*this as usize] = obj;
+                        regs[*dst as usize] = obj;
                     }
-                };
-                if !regs[*this as usize].is_tdz() {
-                    let e = vm_error(
-                        ctx,
-                        "ReferenceError",
-                        "Super constructor may only be called once",
-                    );
-                    handle_throw!(VmError::Thrown(e));
-                    continue;
+                    Err(e) => handle_throw!(e),
                 }
-                regs[*this as usize] = obj;
-                regs[*dst as usize] = obj;
+            }
+            Op::SuperCallArgs {
+                dst,
+                ctor,
+                new_target,
+                args,
+                this,
+            } => {
+                let argv: Vec<NanBox> = args.iter().map(|a| regs[*a as usize]).collect();
+                match super_call(ctx, funcs, regs, (*ctor, *new_target, *this), &argv) {
+                    Ok(obj) => {
+                        regs[*this as usize] = obj;
+                        regs[*dst as usize] = obj;
+                    }
+                    Err(e) => handle_throw!(e),
+                }
             }
             Op::SuperCtor { dst, f } => {
                 let fh = object_handle(regs[*f as usize])?;
@@ -21867,14 +21909,43 @@ impl Compiler {
         let new_target = self.read_var(nb);
         // A default derived constructor forwards its arguments list as is (no
         // iteration of the rest array).
+        // The arguments: an array (`Op::SuperCall`), or registers
+        // (`Op::SuperCallArgs`).
+        enum SuperArgs {
+            Array(Reg),
+            Regs(Vec<Reg>),
+        }
         let args = match arguments {
             [crate::ast::Argument::Spread(Expr::Ident(id))] if &*id.name == DEFAULT_ARGS => {
                 let b = self
                     .lookup(DEFAULT_ARGS)
                     .ok_or(CompileError::Unsupported("default constructor"))?;
-                self.read_var(b)
+                SuperArgs::Array(self.read_var(b))
             }
-            _ => self.spread_args(arguments)?,
+            // Without spread elements, the arguments stay in registers.
+            _ if arguments
+                .iter()
+                .all(|a| matches!(a, crate::ast::Argument::Item(_))) =>
+            {
+                SuperArgs::Regs(self.call_args(arguments)?)
+            }
+            _ => SuperArgs::Array(self.spread_args(arguments)?),
+        };
+        let super_op = |dst: Reg, this: Reg| match args {
+            SuperArgs::Array(args) => Op::SuperCall {
+                dst,
+                ctor: parent,
+                new_target,
+                args,
+                this,
+            },
+            SuperArgs::Regs(args) => Op::SuperCallArgs {
+                dst,
+                ctor: parent,
+                new_target,
+                args,
+                this,
+            },
         };
         let dst = self.alloc();
         if let Some(tb) = arrow_this {
@@ -21884,13 +21955,7 @@ impl Compiler {
                 dst: this,
                 src: cur,
             });
-            self.ops.push(Op::SuperCall {
-                dst,
-                ctor: parent,
-                new_target,
-                args,
-                this,
-            });
+            self.ops.push(super_op(dst, this));
             self.write_var(Binding { tdz: false, ..tb }, this);
             self.ops.push(Op::InitFields { ctor, this });
             return Ok(dst);
@@ -21899,13 +21964,7 @@ impl Compiler {
         // With arrows sharing `this` (which may call `super()` themselves), the
         // cell is the binding: refresh the register from it first.
         self.sync_this_from_cell();
-        self.ops.push(Op::SuperCall {
-            dst,
-            ctor: parent,
-            new_target,
-            args,
-            this,
-        });
+        self.ops.push(super_op(dst, this));
         // Arrows that captured `this` see the bound value from now on.
         if let Some(b) = self.scopes[0].get(THIS_NAME).copied() {
             self.write_var(Binding { tdz: false, ..b }, this);

@@ -122,6 +122,9 @@ pub struct CallSite {
     pub memo: CallMemo,
     /// A `new` site's inline constructor cache (see [`ConstructFast`]).
     pub fast: ConstructFast,
+    /// An identity cache for a non-call op that keeps one here (see
+    /// [`IdentMemo`]).
+    pub ident: IdentMemo,
     /// A `new` site's constructor cache (unused by other sites).
     pub construct: super::props::ConstructCache,
 }
@@ -166,25 +169,37 @@ impl CallMemo {
     }
 }
 
-/// A `new` site's inline constructor cache, filled by `jit_construct_info`
-/// for a constructor whose `[[Construct]]` its identity fixes: a base class
-/// constructor without instance fields, whose `prototype` is non-writable
-/// and non-configurable (so always the object `proto`), with the constructor
-/// cell and its auxiliary property object watched (so any change to the
-/// constructor's own properties bumps the prototype epoch). While the epoch
-/// is still `stamp`, `new` of the value `ctor` (equal handle bits: see
-/// [`CallMemo`]) is: allocate an ordinary object whose `[[Prototype]]` is
-/// `proto`, and enter the way `target` with the captures at `caps`. Cleared
-/// whenever a way is replaced.
+/// A `new` (or `super(…)`) site's inline constructor cache, filled by
+/// `jit_construct_info` for a constructor whose `[[Construct]]` with
+/// `new.target` `nt` the two identities fix:
+///
+/// * a base constructor (`derived == 0`) — a VM function constructor
+///   without instance fields — with `new.target` a class constructor whose
+///   `prototype` is non-writable and non-configurable (so always the object
+///   `proto`): allocate an ordinary object whose `[[Prototype]]` is `proto`
+///   as `this`;
+/// * a derived class constructor (`derived == 1`): `this` starts unbound
+///   (the TDZ sentinel) and `super(…)` binds it.
+///
+/// Both constructors' cells and auxiliary property objects are watched, so
+/// any change to their own properties (or their `[[Prototype]]`) bumps the
+/// prototype epoch. While the epoch is still `stamp`, a construct of the
+/// value `ctor` with `new.target` `nt` (equal handle bits: see [`CallMemo`])
+/// prepares `this` so and enters the way `target` with the captures at
+/// `caps`. Cleared whenever a way is replaced.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ConstructFast {
     /// The constructor's `NanBox` bits, or [`CallSite::EMPTY`].
     pub ctor: u64,
+    /// The `new.target`'s `NanBox` bits.
+    pub nt: u64,
     /// The prototype epoch at which it was recorded.
     pub stamp: u64,
-    /// The raw handle of its `prototype` object.
+    /// The raw handle of `nt.prototype` (base constructors).
     pub proto: u64,
+    /// `1` for a derived constructor (no allocation), else `0`.
+    pub derived: u64,
     /// The way that enters its body.
     pub target: *const CallTarget,
     /// Its captured values.
@@ -197,10 +212,40 @@ impl ConstructFast {
     pub const fn empty() -> Self {
         Self {
             ctor: CallSite::EMPTY,
+            nt: CallSite::EMPTY,
             stamp: 0,
             proto: 0,
+            derived: 0,
             target: core::ptr::null(),
             caps: core::ptr::null(),
+        }
+    }
+}
+
+/// A one-entry identity cache of a compiled op whose result one value fixes
+/// while the prototype epoch stands (`Op::SuperCtor`: a constructor's
+/// `[[Prototype]]`; `Op::InitFields`: a constructor without instance
+/// fields): the op on the value `key` at epoch `stamp` gives `value`. The
+/// key's cell and auxiliary object are watched when it is filled.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct IdentMemo {
+    /// The operand's `NanBox` bits, or [`CallSite::EMPTY`].
+    pub key: u64,
+    /// The prototype epoch at which it was recorded.
+    pub stamp: u64,
+    /// The result.
+    pub value: u64,
+}
+
+impl IdentMemo {
+    /// An empty cache.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            key: CallSite::EMPTY,
+            stamp: 0,
+            value: 0,
         }
     }
 }
@@ -223,6 +268,7 @@ impl CallSite {
             next: 0,
             memo: CallMemo::empty(),
             fast: ConstructFast::empty(),
+            ident: IdentMemo::empty(),
             construct: super::props::ConstructCache::new(),
         }
     }
@@ -297,20 +343,30 @@ pub type MethodHelper = extern "C" fn(
     *mut u64,
 ) -> CalleeInfo;
 
-/// The leaf helper a `new` finds its callee and `this` with: `(ctx, ctor,
-/// out) -> CalleeInfo` — for a constructor whose `[[Construct]]` the sequence
-/// may run (an ordinary, non-derived VM constructor with no instance fields),
-/// the object `OrdinaryCreateFromConstructor` makes, stored to `*out`; else the
-/// not-a-closure key, having done nothing. Never throws, never runs user code.
+/// The leaf helper a `new` (or `super(…)`) finds its callee and `this`
+/// with: `(ctx, ctor, new_target, out, site) -> CalleeInfo` — for a
+/// constructor whose `[[Construct]]` the sequence may run (a VM constructor
+/// with no instance fields, or a derived class constructor), the `this` it
+/// starts with (the object `OrdinaryCreateFromConstructor` makes, or the
+/// unbound sentinel for a derived one), stored to `*out`; else the
+/// not-a-closure key, having done nothing. Never throws, never runs user
+/// code.
 ///
 /// `site` is the call site's cache: a constructor other than the one it names
 /// is reported without creating anything (the sequence then takes the slow
 /// path, which constructs it itself).
 pub type ConstructHelper =
-    extern "C" fn(*mut core::ffi::c_void, u64, *mut u64, *const CallSite) -> CalleeInfo;
+    extern "C" fn(*mut core::ffi::c_void, u64, u64, *mut u64, *const CallSite) -> CalleeInfo;
+
+/// The helper that throws `super(…)`'s "already bound" `ReferenceError`:
+/// `(ctx) -> the throw sentinel`, the error pending.
+pub type SuperTwiceHelper = extern "C" fn(*mut core::ffi::c_void) -> u64;
 
 /// The helper that finishes a `new` whose body returned the heap value
-/// `result`: `(ctx, result, this) -> result if it is an object, else this`.
+/// `result`, or whose `this` started unbound (a derived constructor):
+/// `(ctx, result, this) -> result if it is an object, else this` — for a
+/// derived constructor, else the throw sentinel with the `ReferenceError` or
+/// `TypeError` pending.
 pub type ConstructResultHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64) -> u64;
 
 /// The helper a `new` served by the site's [`ConstructFast`] allocates its
@@ -322,6 +378,32 @@ pub type ConstructAllocHelper = extern "C" fn(*mut core::ffi::c_void, u64) -> u6
 /// `CallSite` field offsets for emitted code.
 fn site_off(f: usize) -> i32 {
     i32::try_from(f).expect("site offset fits in i32")
+}
+
+/// `CallSite`-relative offset of its [`IdentMemo`]'s `value`.
+pub(crate) const IDENT_VALUE: i32 =
+    (core::mem::offset_of!(CallSite, ident) + core::mem::offset_of!(IdentMemo, value)) as i32;
+
+impl X64Assembler {
+    /// To `miss` unless the value at `[rbx + disp]` hits `site`'s
+    /// [`IdentMemo`] (the recorded key, at the current prototype epoch); on a
+    /// hit `r11` = the site (its result at [`IDENT_VALUE`]). Clobbers `rax`,
+    /// `r9`, `r11`.
+    pub(crate) fn p_ident_hit(&mut self, site: *const CallSite, disp: i32, miss: Label) {
+        use core::mem::offset_of;
+        let ident = offset_of!(CallSite, ident);
+        self.g_load(r::RAX, r::RBX, disp);
+        self.g_movabs(r::R11, site as u64);
+        self.g_cmp_mem(r::RAX, r::R11, site_off(ident + offset_of!(IdentMemo, key)));
+        self.g_jcc(cc::NE, miss);
+        load_proto_epoch(self, r::R9);
+        self.g_cmp_mem(
+            r::R9,
+            r::R11,
+            site_off(ident + offset_of!(IdentMemo, stamp)),
+        );
+        self.g_jcc(cc::NE, miss);
+    }
 }
 
 /// `mov dst, [PROTO_EPOCH]`.
@@ -339,12 +421,15 @@ pub(crate) enum CalleeSrc {
         scratch: i32,
     },
     /// A constructor register (`Op::Construct`, `new.target` the constructor
-    /// itself), prepared inline from the site's [`ConstructFast`] (with the
-    /// [`ConstructAllocHelper`]) or by the [`ConstructHelper`], either of
-    /// which leaves the new object in `[rbp + scratch]` (the call's `this`).
+    /// itself; `Op::SuperCallArgs`, `new.target` a register), prepared inline
+    /// from the site's [`ConstructFast`] (with the [`ConstructAllocHelper`])
+    /// or by the [`ConstructHelper`], either of which leaves the call's
+    /// `this` in `[rbp + scratch]`.
     Construct {
         /// The constructor register.
         ctor: u16,
+        /// The `new.target` register.
+        new_target: u16,
         /// The `rbp`-relative scratch slot.
         scratch: i32,
         /// The preparation helper.
@@ -353,6 +438,9 @@ pub(crate) enum CalleeSrc {
         alloc: u64,
         /// The [`ConstructResultHelper`].
         result: u64,
+        /// For `super(…)`: the `this` register the result binds (when still
+        /// unbound, else the [`SuperTwiceHelper`] `twice` throws).
+        bind_this: Option<(u16, u64)>,
     },
     /// A register (`Op::CallValue`); identified by the [`CalleeHelper`].
     Reg(u16),
@@ -722,13 +810,14 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
         }
         CalleeSrc::Construct {
             ctor,
+            new_target,
             scratch,
             helper,
             alloc,
             ..
         } => {
             // The site's `fast` cache (see `ConstructFast`): the same
-            // constructor value at the same prototype epoch.
+            // constructor and `new.target` values at the same prototype epoch.
             let fast = offset_of!(CallSite, fast);
             let prep = a.new_label();
             a.g_load(r::RAX, r::RBX, reg(ctor));
@@ -739,6 +828,15 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
                 site_off(fast + offset_of!(ConstructFast, ctor)),
             );
             a.g_jcc(cc::NE, prep);
+            if new_target != ctor {
+                a.g_load(r::RAX, r::RBX, reg(new_target));
+                a.g_cmp_mem(
+                    r::RAX,
+                    r::R11,
+                    site_off(fast + offset_of!(ConstructFast, nt)),
+                );
+                a.g_jcc(cc::NE, prep);
+            }
             load_proto_epoch(a, r::R9);
             a.g_cmp_mem(
                 r::R9,
@@ -746,13 +844,24 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
                 site_off(fast + offset_of!(ConstructFast, stamp)),
             );
             a.g_jcc(cc::NE, prep);
+            let by_helper = a.new_label();
+            let made = a.new_label();
+            let base = a.new_label();
+            // A derived constructor starts with `this` unbound.
+            a.g_cmp_byte_imm(
+                r::R11,
+                site_off(fast + offset_of!(ConstructFast, derived)),
+                0,
+            );
+            a.g_jcc(cc::E, base);
+            a.g_movabs(r::RAX, NanBox::tdz().to_bits());
+            a.jmp(made);
+            a.bind(base);
             a.g_load(
                 r::RSI,
                 r::R11,
                 site_off(fast + offset_of!(ConstructFast, proto)),
             );
-            let by_helper = a.new_label();
-            let made = a.new_label();
             a.p_alloc_object(jl, l.realm, by_helper);
             a.jmp(made);
             a.bind(by_helper);
@@ -776,8 +885,9 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             a.bind(prep);
             a.g_mov(r::RDI, r::R15);
             a.g_load(r::RSI, r::RBX, reg(ctor));
-            a.g_lea(r::RDX, RBP, scratch);
-            a.g_movabs(r::RCX, e.site as u64);
+            a.g_load(r::RDX, r::RBX, reg(new_target));
+            a.g_lea(r::RCX, RBP, scratch);
+            a.g_movabs(r::R8, e.site as u64);
             a.g_movabs(r::RAX, helper);
             a.call_rax();
             (r::RBX, reg(ctor))
@@ -842,8 +952,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     a.g_store(r::RCX, 16, r::RDX);
     a.g_store_imm32(r::RCX, 24, i32::try_from(argc).ok()?);
     match e.callee {
-        // `new.target` is the constructor itself.
-        CalleeSrc::Construct { ctor, .. } => a.g_load(r::RDX, r::RBX, reg(ctor)),
+        CalleeSrc::Construct { new_target, .. } => a.g_load(r::RDX, r::RBX, reg(new_target)),
         _ => a.g_movabs(r::RDX, NanBox::undefined().to_bits()),
     }
     a.g_store(r::RCX, 32, r::RDX);
@@ -883,26 +992,55 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     a.g_cmp(r::RAX, r::R11);
     a.g_jcc(cc::E, e.throw_exit);
     if let CalleeSrc::Construct {
-        scratch, result, ..
+        scratch,
+        result,
+        bind_this,
+        ..
     } = e.callee
     {
         // `[[Construct]]`'s result: an object the body returned, else `this`.
         // Only a heap value can be an object (the sentinel for falling off the
-        // end is not one).
+        // end is not one). A derived constructor's (`this` started unbound)
+        // is validated by the helper too.
         let this = a.new_label();
+        let check = a.new_label();
+        let have = a.new_label();
         a.g_movabs(r::R11, HANDLE_TAG);
         a.g_mov(r::RCX, r::RAX);
         a.g_and(r::RCX, r::R11);
         a.g_cmp(r::RCX, r::R11);
         a.g_jcc(cc::NE, this);
+        a.bind(check);
         a.g_mov(r::RDI, r::R15);
         a.g_mov(r::RSI, r::RAX);
         a.g_load(r::RDX, RBP, scratch);
         a.g_movabs(r::RAX, result);
         a.call_rax();
-        a.jmp(store);
+        a.g_movabs(r::R11, NanBox::jit_throw_bits());
+        a.g_cmp(r::RAX, r::R11);
+        a.g_jcc(cc::E, e.throw_exit);
+        a.jmp(have);
         a.bind(this);
-        a.g_load(r::RAX, RBP, scratch);
+        a.g_load(r::RCX, RBP, scratch);
+        a.g_movabs(r::R11, NanBox::tdz().to_bits());
+        a.g_cmp(r::RCX, r::R11);
+        a.g_jcc(cc::E, check);
+        a.g_mov(r::RAX, r::RCX);
+        a.bind(have);
+        if let Some((this_reg, twice)) = bind_this {
+            // `super(…)` binds `this` once.
+            let bind = a.new_label();
+            a.g_load(r::RCX, r::RBX, reg(this_reg));
+            a.g_movabs(r::R11, NanBox::tdz().to_bits());
+            a.g_cmp(r::RCX, r::R11);
+            a.g_jcc(cc::E, bind);
+            a.g_mov(r::RDI, r::R15);
+            a.g_movabs(r::RAX, twice);
+            a.call_rax();
+            a.jmp(e.throw_exit);
+            a.bind(bind);
+            a.g_store(r::RBX, reg(this_reg), r::RAX);
+        }
     } else {
         a.g_movabs(r::R11, NanBox::jit_falloff_bits());
         a.g_cmp(r::RAX, r::R11);

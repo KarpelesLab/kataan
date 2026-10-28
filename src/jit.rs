@@ -32,7 +32,8 @@ mod tierup;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use call_seq::{
     CallLayout, CallMemo, CallSite, CallTarget, CalleeHelper, CalleeInfo, ConstructAllocHelper,
-    ConstructFast, ConstructHelper, ConstructResultHelper, FRAME_HEADER, JitStack, MethodHelper,
+    ConstructFast, ConstructHelper, ConstructResultHelper, FRAME_HEADER, IdentMemo, JitStack,
+    MethodHelper, SuperTwiceHelper,
 };
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use props::MethodSite;
@@ -2559,6 +2560,18 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
         };
         out.push(lowered);
     }
+    // The interpreter ops compiled with a call site of their own, in pc order
+    // after every other site (see `interp_sites`).
+    for op in &proto.ops {
+        match op {
+            Op::SuperCallArgs { args, .. } => {
+                call_args.push(args.clone());
+                n_calls += 1;
+            }
+            Op::SuperCtor { .. } | Op::InitFields { .. } => n_calls += 1,
+            _ => {}
+        }
+    }
     drop_dead_stores(
         &mut out,
         &proto.ops,
@@ -2566,6 +2579,52 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
         proto.n_params + proto.n_captures + 1,
     );
     Some((out, keys, call_args, n_calls))
+}
+
+/// Per bytecode pc, the `(argument-list index, call-site index)` of an
+/// interpreter op [`lower_nbvm_generic`] gave a call site of its own
+/// (`Op::SuperCallArgs`, `Op::SuperCtor`, `Op::InitFields`): those sites
+/// come after every other one, in pc order, so they are the last of the
+/// `n_args` argument lists and `n_sites` sites.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn interp_sites(
+    bytecode: &[crate::nbvm::Op],
+    n_args: usize,
+    n_sites: usize,
+) -> Option<Vec<Option<(u16, u16)>>> {
+    use crate::nbvm::Op;
+    let (mut extra_args, mut extra_sites) = (0usize, 0usize);
+    for op in bytecode {
+        match op {
+            Op::SuperCallArgs { .. } => {
+                extra_args += 1;
+                extra_sites += 1;
+            }
+            Op::SuperCtor { .. } | Op::InitFields { .. } => extra_sites += 1,
+            _ => {}
+        }
+    }
+    let mut args = n_args.checked_sub(extra_args)?;
+    let mut site = n_sites.checked_sub(extra_sites)?;
+    let mut out = Vec::with_capacity(bytecode.len());
+    for op in bytecode {
+        let here = match op {
+            Op::SuperCallArgs { .. } => {
+                let v = (u16::try_from(args).ok()?, u16::try_from(site).ok()?);
+                args += 1;
+                site += 1;
+                Some(v)
+            }
+            Op::SuperCtor { .. } | Op::InitFields { .. } => {
+                let v = (0, u16::try_from(site).ok()?);
+                site += 1;
+                Some(v)
+            }
+            _ => None,
+        };
+        out.push(here);
+    }
+    Some(out)
 }
 
 /// Turns into `Nop`s the `LoadConst`s and `Move`s (`ops`, lowered from
@@ -2798,6 +2857,17 @@ pub struct GenericHelpers {
     /// A `new` served by its site's inline constructor cache: its `this`
     /// (`jit_construct_alloc`).
     pub construct_alloc: ConstructAllocHelper,
+    /// `super(…)`'s "already bound" `ReferenceError` (`jit_super_twice`).
+    pub super_twice: SuperTwiceHelper,
+    /// `Op::SuperCallArgs`'s slow path (`jit_helper_super_call(ctx, regs,
+    /// n_regs, op, site, _)`): the interpreter's, refilling the site's cache.
+    pub super_call: JitCallMethodHelper,
+    /// `Op::SuperCtor`'s slow path (`jit_helper_ident_op`, same ABI): the
+    /// interpreter's, refilling the site's identity cache.
+    pub super_ctor: JitCallMethodHelper,
+    /// `Op::InitFields`'s slow path (`jit_helper_ident_op`, same ABI): the
+    /// interpreter's, refilling the site's identity cache.
+    pub init_fields: JitCallMethodHelper,
     /// `Op::CallValue`'s slow path (`jit_helper_call_value(ctx, regs, n_regs,
     /// op, site)`, `site` the `CallSite`): the interpreter's call, which also
     /// refills the site's cache.
@@ -5386,6 +5456,8 @@ impl JitFunction {
         let construct_helper = helpers.construct_info as usize as u64;
         let construct_result_helper = helpers.construct_result as usize as u64;
         let construct_alloc_helper = helpers.construct_alloc as usize as u64;
+        let super_twice_helper = helpers.super_twice as usize as u64;
+        let interp_sites = interp_sites(bytecode, call_args.len(), call_sites.len())?;
         let construct_slow_helper = helpers.construct as usize as u64;
         let call_this_helper = helpers.call_this as usize as u64;
         // The catch entries of the body's `try` regions: where the throw exit
@@ -6279,7 +6351,107 @@ impl JitFunction {
                     if pc as usize != op_idx {
                         return None;
                     }
+                    let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
+                    // A slow path through a site-filling helper with the
+                    // exec-op ABI plus the site (`JitCallMethodHelper`).
+                    macro_rules! site_slow {
+                        ($helper:expr, $site:expr) => {{
+                            a.mov_rdi_r15();
+                            a.mov_rsi_rbx();
+                            a.movabs_argreg(2, n_regs as i64);
+                            a.movabs_argreg(3, op_ptr as i64);
+                            a.movabs_argreg(4, $site as i64);
+                            a.movabs_argreg(5, 0);
+                            a.movabs_rax($helper as usize as i64);
+                            a.call_rax();
+                            throw_check!();
+                        }};
+                    }
+                    let own_site = interp_sites
+                        .get(pc as usize)
+                        .copied()
+                        .flatten()
+                        .and_then(|(args, site)| Some((args, *call_sites.get(site as usize)?)));
                     match bytecode.get(pc as usize)? {
+                        // `super(…)`: the native call sequence, `new.target`
+                        // passed on and `this` bound from the result.
+                        crate::nbvm::Op::SuperCallArgs {
+                            dst,
+                            ctor,
+                            new_target,
+                            args,
+                            this,
+                        } if args.len() <= 32
+                            && ok(*dst)
+                            && ok(*ctor)
+                            && ok(*new_target)
+                            && ok(*this)
+                            && args.iter().all(|&r| ok(r))
+                            && own_site.is_some() =>
+                        {
+                            let (args_site, site_ptr) = own_site?;
+                            let argregs = call_args.get(args_site as usize)?;
+                            if argregs != args {
+                                return None;
+                            }
+                            let slow = a.new_label();
+                            let done = a.new_label();
+                            call_seq::emit_call(
+                                &mut a,
+                                &call_seq::CallEmit {
+                                    dst: *dst,
+                                    callee: call_seq::CalleeSrc::Construct {
+                                        ctor: *ctor,
+                                        new_target: *new_target,
+                                        scratch: method_scratch,
+                                        helper: construct_helper,
+                                        result: construct_result_helper,
+                                        alloc: construct_alloc_helper,
+                                        bind_this: Some((*this, super_twice_helper)),
+                                    },
+                                    this: None,
+                                    args: argregs,
+                                    site: site_ptr,
+                                    layout: &helpers.call_layout,
+                                    throw_exit,
+                                    slow,
+                                    done,
+                                },
+                            )?;
+                            a.bind(slow);
+                            site_slow!(helpers.super_call, site_ptr);
+                            a.bind(done);
+                        }
+                        // The super constructor / "no instance fields" of a
+                        // constructor value seen before at this epoch (the
+                        // site's `IdentMemo`), else the interpreter's (which
+                        // refills it).
+                        crate::nbvm::Op::SuperCtor { dst, f }
+                            if ok(*dst) && ok(*f) && own_site.is_some() =>
+                        {
+                            let (_, site_ptr) = own_site?;
+                            let slow = a.new_label();
+                            let done = a.new_label();
+                            a.p_ident_hit(site_ptr, disp(*f), slow);
+                            a.g_load(call_seq::r::RAX, call_seq::r::R11, call_seq::IDENT_VALUE);
+                            a.store_rax(disp(*dst));
+                            a.jmp(done);
+                            a.bind(slow);
+                            site_slow!(helpers.super_ctor, site_ptr);
+                            a.bind(done);
+                        }
+                        crate::nbvm::Op::InitFields { ctor, this }
+                            if ok(*ctor) && ok(*this) && own_site.is_some() =>
+                        {
+                            let (_, site_ptr) = own_site?;
+                            let slow = a.new_label();
+                            let done = a.new_label();
+                            a.p_ident_hit(site_ptr, disp(*ctor), slow);
+                            a.jmp(done);
+                            a.bind(slow);
+                            site_slow!(helpers.init_fields, site_ptr);
+                            a.bind(done);
+                        }
                         // A literal's allocation: its own helper, not the
                         // one-op interpreter.
                         crate::nbvm::Op::NewObject { dst } if ok(*dst) => {
@@ -7092,10 +7264,12 @@ impl JitFunction {
                             dst,
                             callee: call_seq::CalleeSrc::Construct {
                                 ctor,
+                                new_target: ctor,
                                 scratch: method_scratch,
                                 helper: construct_helper,
                                 result: construct_result_helper,
                                 alloc: construct_alloc_helper,
+                                bind_this: None,
                             },
                             this: None,
                             args,

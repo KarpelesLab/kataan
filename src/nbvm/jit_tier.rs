@@ -1629,34 +1629,200 @@ pub(crate) extern "C" fn jit_helper_construct(
                 &mut *site.cast::<CallSite>(),
             )
         };
-        if let Some(raw) = ctor_val.as_handle()
-            && let Some((fid, n_caps)) = ctx
-                .realm
-                .vm_function(Handle::from_raw(raw))
-                .map(|(f, caps)| (f, caps.len()))
-        {
-            // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
-            #[allow(unsafe_code)]
-            let funcs = unsafe {
-                &*ctx
-                    .jit_funcs
-                    .expect("jit_funcs set before generic dispatch")
-            };
-            if let Some(proto) = funcs.get(fid as usize)
-                && n_caps >= proto.n_captures
-                && let Some(jit) = construct_target(proto)
-                && let Some(code) = jit.native_entry()
-                && jit.n_regs() == proto.n_regs
-            {
-                site.fill(crate::jit::CallTarget {
-                    key: u64::from(fid) | ((n_caps as u64) << 32),
-                    code,
-                    frame_bytes: (proto.n_regs * 8) as u64,
-                });
-            }
-        }
+        fill_construct_site(ctx, ctor_val, site);
     }
     jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
+}
+
+/// `Op::SuperCallArgs`'s slow path in compiled code: point the site's cache
+/// at the super constructor when the native sequence can run its
+/// `[[Construct]]` ([`construct_target`]), then run `super(…)` as the
+/// interpreter does.
+///
+/// # Safety
+/// As [`jit_helper_call_value`].
+pub(crate) extern "C" fn jit_helper_super_call(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    site: *mut core::ffi::c_void,
+    _: *mut core::ffi::c_void,
+) -> u64 {
+    // SAFETY: see the function contract (as `jit_helper_exec_op`).
+    #[allow(unsafe_code)]
+    let op = unsafe { &*op_raw };
+    if let Op::SuperCallArgs { ctor, .. } = op {
+        // SAFETY: see the function contract.
+        #[allow(unsafe_code)]
+        let (ctx, ctor_val, site) = unsafe {
+            (
+                &mut *(ctx_raw as *mut Ctx),
+                NanBox::from_bits(*regs_raw.add(*ctor as usize)),
+                &mut *site.cast::<CallSite>(),
+            )
+        };
+        fill_construct_site(ctx, ctor_val, site);
+    }
+    jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
+}
+
+/// Whether `fh` is a **forwarding** constructor: a derived class's default
+/// constructor (`constructor(...args) { super(...args); }`, which forwards
+/// its arguments list without iterating it) with no instance fields of its
+/// own. Its `[[Construct]]` with `new.target` `nt` is its super
+/// constructor's with the same arguments and `nt`: the binding of `this`
+/// and its (absent) fields add nothing. Recognized by its shape — a derived
+/// class constructor whose one parameter is the rest array in register 0,
+/// passed as is to `Op::SuperCall` (the compiler builds a fresh array for
+/// any spread a program writes, so only the synthesized constructor
+/// forwards register 0).
+fn is_forwarding_ctor(ctx: &Ctx, funcs: &[FnProto], fh: Handle) -> bool {
+    let Some(p) = ctx
+        .realm
+        .vm_function(fh)
+        .and_then(|(id, _)| funcs.get(id as usize))
+    else {
+        return false;
+    };
+    p.derived
+        && p.class_ctor
+        && p.n_params == 1
+        && p.rest_from == Some(0)
+        && p.ops
+            .iter()
+            .any(|o| matches!(o, Op::SuperCall { args: 0, .. }))
+        && ctx.realm.jit_aux_of(fh).is_some()
+        && ctx.realm.get_property(fh, super::FIELDS_KEY).is_none()
+}
+
+/// The constructor a construct of `fh` runs the body of: `fh` itself, or —
+/// through a chain of forwarding constructors ([`is_forwarding_ctor`]) —
+/// the first super constructor (a VM class constructor) that is not one,
+/// with the forwarding ones passed (whose cells a cache relying on the chain
+/// watches).
+fn construct_body_of(
+    ctx: &Ctx,
+    funcs: &[FnProto],
+    fh: Handle,
+) -> Option<(Handle, alloc::vec::Vec<Handle>)> {
+    let mut cur = fh;
+    let mut passed = alloc::vec::Vec::new();
+    while is_forwarding_ctor(ctx, funcs, cur) {
+        if passed.len() >= 8 {
+            return None;
+        }
+        passed.push(cur);
+        let parent = ctx.realm.object_proto(cur)?;
+        let class = ctx
+            .realm
+            .vm_function(parent)
+            .and_then(|(id, _)| funcs.get(id as usize))
+            .is_some_and(|p| p.class_ctor);
+        if !class {
+            return None;
+        }
+        cur = parent;
+    }
+    Some((cur, passed))
+}
+
+/// Points `site` at the constructor `ctor` if the native call sequence may
+/// run its `[[Construct]]` ([`construct_target`]) — for a forwarding
+/// constructor, the one whose body it runs ([`construct_body_of`]).
+fn fill_construct_site(ctx: &mut Ctx, ctor: NanBox, site: &mut CallSite) {
+    let Some(raw) = ctor.as_handle() else {
+        return;
+    };
+    // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    let Some((body, _)) = construct_body_of(ctx, funcs, Handle::from_raw(raw)) else {
+        return;
+    };
+    let Some((fid, n_caps)) = ctx.realm.vm_function(body).map(|(f, caps)| (f, caps.len())) else {
+        return;
+    };
+    if let Some(proto) = funcs.get(fid as usize)
+        && n_caps >= proto.n_captures
+        && let Some(jit) = construct_target(proto)
+        && let Some(code) = jit.native_entry()
+        && jit.n_regs() == proto.n_regs
+    {
+        site.fill(crate::jit::CallTarget {
+            key: u64::from(fid) | ((n_caps as u64) << 32),
+            code,
+            frame_bytes: (proto.n_regs * 8) as u64,
+        });
+    }
+}
+
+/// `Op::SuperCtor` / `Op::InitFields` in compiled code when the site's
+/// identity cache (`crate::jit::IdentMemo`) missed: the interpreter's op,
+/// then the cache refilled for a VM class constructor operand (`f` /
+/// `ctor`, with an auxiliary object), its cell and auxiliary object watched
+/// first: `SuperCtor`'s result is the constructor's `[[Prototype]]`, which
+/// only a change to the watched cell (or a default intrinsic prototype)
+/// changes; an `InitFields` of a constructor without an own instance-field
+/// initializer does nothing, which only an addition to its watched
+/// auxiliary object changes.
+///
+/// # Safety
+/// As [`jit_helper_call_value`].
+pub(crate) extern "C" fn jit_helper_ident_op(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    site: *mut core::ffi::c_void,
+    _: *mut core::ffi::c_void,
+) -> u64 {
+    let r = jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw);
+    if r == NanBox::jit_throw_bits() {
+        return r;
+    }
+    // SAFETY: see the function contract (as `jit_helper_exec_op`): the op is
+    // done, the register file is live and unaliased again.
+    #[allow(unsafe_code)]
+    let (op, ctx, regs, site) = unsafe {
+        (
+            &*op_raw,
+            &mut *(ctx_raw as *mut Ctx),
+            core::slice::from_raw_parts(regs_raw.cast_const().cast::<NanBox>(), n_regs),
+            &mut *site.cast::<CallSite>(),
+        )
+    };
+    let (key, value) = match op {
+        Op::SuperCtor { dst, f } => (regs[*f as usize], regs[*dst as usize]),
+        Op::InitFields { ctor, .. } => (regs[*ctor as usize], NanBox::undefined()),
+        _ => return r,
+    };
+    let Some(fh) = key
+        .as_handle()
+        .map(Handle::from_raw)
+        .filter(|&h| ctx.realm.is_vm_function(h))
+    else {
+        return r;
+    };
+    let Some(aux) = ctx.realm.jit_aux_of(fh) else {
+        return r;
+    };
+    if matches!(op, Op::InitFields { .. })
+        && ctx.realm.get_property(fh, super::FIELDS_KEY).is_some()
+    {
+        return r;
+    }
+    ctx.realm.watch_link(fh.to_raw(), Some(aux.to_raw()));
+    site.ident = crate::jit::IdentMemo {
+        key: key.to_bits(),
+        stamp: crate::object::proto_epoch(),
+        value: value.to_bits(),
+    };
+    r
 }
 
 /// `Op::CallKey`'s call half in compiled code (the native sequence's
@@ -1723,11 +1889,9 @@ pub(crate) extern "C" fn jit_helper_call_this(
 
 /// Whether the native sequence may run `new f()` for function `id`
 /// (`proto`): what [`direct_target`] accepts for a call, except that a class
-/// constructor is fine (this *is* its `[[Construct]]`) and a derived one is
-/// not (its `this` comes from `super(...)`).
+/// constructor is fine (this *is* its `[[Construct]]`), derived or not.
 fn construct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
-    if proto.derived
-        || proto.is_async
+    if proto.is_async
         || proto.is_generator
         || proto.rest_from.is_some()
         || proto
@@ -1745,14 +1909,17 @@ fn construct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
     }
 }
 
-/// A `new ctor()`'s preparation for the native call sequence
-/// (`crate::jit::ConstructHelper`): when `ctor` is the VM function `site`
-/// names and `vm_construct` would run it as an ordinary `[[Construct]]` with
-/// `new.target` itself — a constructor (`VM_CTOR`), not derived, with no
-/// instance-field initializer to run first, whose `prototype` is an object —
-/// make the new object exactly as it does (`OrdinaryCreateFromConstructor`),
-/// store it to `out` and report the callee as [`jit_callee_info`]. Anything
-/// else changes nothing and reports the not-a-closure key.
+/// A construct's preparation for the native call sequence
+/// (`crate::jit::ConstructHelper`) — `new ctor()` (`nt` is `ctor`) or
+/// `super()` (`nt` the `new.target`): when `ctor` is the VM function `site`
+/// names and `vm_construct` would run it as an ordinary `[[Construct]]` —
+/// a constructor (`VM_CTOR`) that is either a derived class constructor
+/// (`this` starts unbound) or has no instance-field initializer to run first
+/// and a VM function `nt` whose `prototype` is an object — prepare `this`
+/// exactly as it does (`OrdinaryCreateFromConstructor` from `nt`, or the
+/// unbound sentinel), store it to `out` and report the callee as
+/// [`jit_callee_info`]. Anything else changes nothing and reports the
+/// not-a-closure key.
 ///
 /// # Safety
 /// `ctx` the live `Ctx` (with `jit_funcs` set), `out` writable, `site` the
@@ -1760,6 +1927,7 @@ fn construct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
 pub(crate) extern "C" fn jit_construct_info(
     ctx_raw: *mut core::ffi::c_void,
     ctor: u64,
+    nt: u64,
     out: *mut u64,
     site: *const CallSite,
 ) -> CalleeInfo {
@@ -1771,87 +1939,118 @@ pub(crate) extern "C" fn jit_construct_info(
     // interior-mutable: only this helper touches its construct cache).
     #[allow(unsafe_code)]
     let (ctx, site) = unsafe { (&mut *(ctx_raw as *mut Ctx), &mut *site.cast_mut()) };
-    let Some(fh) = NanBox::from_bits(ctor).as_handle().map(Handle::from_raw) else {
+    let Some(called) = NanBox::from_bits(ctor).as_handle().map(Handle::from_raw) else {
         return NONE;
     };
+    // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    // The constructor whose body runs (past forwarding default constructors).
+    let Some((fh, passed)) = construct_body_of(ctx, funcs, called) else {
+        return NONE;
+    };
+    let body_val = NanBox::handle(fh.to_raw()).to_bits();
     let Some((fid, n_caps)) = ctx.realm.vm_function(fh).map(|(f, c)| (f, c.len())) else {
         return NONE;
     };
     if !site.holds(u64::from(fid) | ((n_caps as u64) << 32)) {
         return NONE;
     }
-    // The site's last constructor, still as it was: no lookups.
-    if let Some(p) = site.construct.hit(&ctx.realm, ctor) {
-        fill_construct_fast(ctx, site, fh, fid, p);
-        let obj = ctx.realm.jit_new_object_with_proto(p);
+    let store = |out: *mut u64, v: NanBox| {
         // SAFETY: see the function contract.
         #[allow(unsafe_code)]
         unsafe {
-            *out = NanBox::handle(obj.to_raw()).to_bits();
+            *out = v.to_bits();
         }
+    };
+    // The site's last constructor, still as it was: no lookups.
+    if nt == ctor
+        && passed.is_empty()
+        && let Some(p) = site.construct.hit(&ctx.realm, ctor)
+    {
+        fill_construct_fast(ctx, site, (fh, fid), (ctor, &passed), nt, Some(p));
+        let obj = ctx.realm.jit_new_object_with_proto(p);
+        store(out, NanBox::handle(obj.to_raw()));
         return jit_callee_info(ctx_raw, ctor);
     }
-    // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
-    #[allow(unsafe_code)]
-    let funcs = unsafe {
-        &*ctx
-            .jit_funcs
-            .expect("jit_funcs set before generic dispatch")
-    };
     let Some(proto) = funcs.get(fid as usize) else {
         return NONE;
     };
-    if proto.derived
-        || ctx.realm.get_property(fh, super::VM_CTOR).is_none()
-        || (proto.class_ctor && ctx.realm.get_property(fh, super::FIELDS_KEY).is_some())
-    {
+    if ctx.realm.get_property(fh, super::VM_CTOR).is_none() {
         return NONE;
     }
+    if proto.derived {
+        // `this` is bound by `super(...)`.
+        if proto.class_ctor {
+            fill_construct_fast(ctx, site, (fh, fid), (ctor, &passed), nt, None);
+        }
+        store(out, NanBox::tdz());
+        return jit_callee_info(ctx_raw, body_val);
+    }
+    if proto.class_ctor && ctx.realm.get_property(fh, super::FIELDS_KEY).is_some() {
+        return NONE;
+    }
+    // `new.target.prototype`, read as `vm_construct` reads it for a VM
+    // function `new.target`.
+    let Some(nth) = NanBox::from_bits(nt)
+        .as_handle()
+        .map(Handle::from_raw)
+        .filter(|&h| ctx.realm.is_vm_function(h))
+    else {
+        return NONE;
+    };
     let Some(p) = ctx
         .realm
-        .get_property(fh, "prototype")
+        .get_property(nth, "prototype")
         .filter(|p| super::is_object_value(&ctx.realm, *p))
         .and_then(|p| p.as_handle())
     else {
         return NONE;
     };
-    site.construct.fill(&ctx.realm, ctor, NanBox::handle(p));
-    if proto.class_ctor {
-        fill_construct_fast(ctx, site, fh, fid, Handle::from_raw(p));
+    if nt == ctor && passed.is_empty() {
+        site.construct.fill(&ctx.realm, ctor, NanBox::handle(p));
     }
+    fill_construct_fast(
+        ctx,
+        site,
+        (fh, fid),
+        (ctor, &passed),
+        nt,
+        Some(Handle::from_raw(p)),
+    );
     let obj = ctx.realm.jit_new_object_with_proto(Handle::from_raw(p));
-    // SAFETY: see the function contract.
-    #[allow(unsafe_code)]
-    unsafe {
-        *out = NanBox::handle(obj.to_raw()).to_bits();
-    }
-    jit_callee_info(ctx_raw, ctor)
+    store(out, NanBox::handle(obj.to_raw()));
+    jit_callee_info(ctx_raw, body_val)
 }
 
-/// Records the constructor `fh` (function `fid`), whose `prototype` is
-/// `proto`, in `site`'s inline constructor cache
-/// (`crate::jit::ConstructFast`) when its `[[Construct]]` is fixed by its
-/// identity: a base class constructor (so `prototype` is the class's,
-/// non-writable and non-configurable) with no instance-field initializer,
-/// the site holding a way for it. The constructor cell and its auxiliary
-/// object are watched, so a later change to the constructor's own
-/// properties retires the record with the prototype epoch.
-fn fill_construct_fast(ctx: &mut Ctx, site: &mut CallSite, fh: Handle, fid: u32, proto: Handle) {
-    let ctor = NanBox::handle(fh.to_raw()).to_bits();
-    if site.fast.ctor == ctor && site.fast.stamp == crate::object::proto_epoch() {
-        return;
-    }
-    // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
-    #[allow(unsafe_code)]
-    let funcs = unsafe {
-        &*ctx
-            .jit_funcs
-            .expect("jit_funcs set before generic dispatch")
-    };
-    let Some(fp) = funcs.get(fid as usize) else {
-        return;
-    };
-    if !fp.class_ctor || fp.derived {
+/// Records a construct of the value `ctor` with `new.target` `nt`, which
+/// runs the body of the constructor `fh` (function `fid`: `ctor` itself, or
+/// past the forwarding constructors `passed`), in `site`'s inline
+/// constructor cache (`crate::jit::ConstructFast`) when the identities fix
+/// its `[[Construct]]` (`jit_construct_info` having checked the rest): a
+/// derived class constructor (`proto` `None`: `this` starts unbound), or a
+/// base constructor without an instance-field initializer whose `new.target`
+/// is a class constructor, whose `prototype` (`proto`) is then non-writable
+/// and non-configurable; the site holding a way for it. Every cell involved
+/// and its auxiliary object are watched, so a later change to their own
+/// properties or `[[Prototype]]` (which picks a forwarding constructor's
+/// super constructor) retires the record with the prototype epoch.
+fn fill_construct_fast(
+    ctx: &mut Ctx,
+    site: &mut CallSite,
+    (fh, fid): (Handle, u32),
+    (ctor, passed): (u64, &[Handle]),
+    nt: u64,
+    proto: Option<Handle>,
+) {
+    if site.fast.ctor == ctor
+        && site.fast.nt == nt
+        && site.fast.stamp == crate::object::proto_epoch()
+    {
         return;
     }
     let Some((n_caps, caps)) = ctx
@@ -1867,22 +2066,53 @@ fn fill_construct_fast(ctx: &mut Ctx, site: &mut CallSite, fh: Handle, fid: u32,
     let Some(aux) = ctx.realm.jit_aux_of(fh) else {
         return;
     };
-    let fixed = ctx.realm.jit_object(aux).is_some_and(|o| {
-        o.is_readonly("prototype")
-            && o.is_non_configurable("prototype")
-            && o.get("prototype").and_then(|v| v.as_handle()) == Some(proto.to_raw())
-    });
-    if !fixed
-        || ctx.realm.get_property(fh, super::VM_CTOR).is_none()
-        || ctx.realm.get_property(fh, super::FIELDS_KEY).is_some()
+    if ctx.realm.get_property(fh, super::VM_CTOR).is_none()
+        || (proto.is_some() && ctx.realm.get_property(fh, super::FIELDS_KEY).is_some())
     {
         return;
     }
+    if let Some(p) = proto {
+        // `new.target`: a class constructor, its `prototype` fixed.
+        let Some(nth) = NanBox::from_bits(nt).as_handle().map(Handle::from_raw) else {
+            return;
+        };
+        // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
+        #[allow(unsafe_code)]
+        let funcs = unsafe {
+            &*ctx
+                .jit_funcs
+                .expect("jit_funcs set before generic dispatch")
+        };
+        let class = ctx
+            .realm
+            .vm_function(nth)
+            .and_then(|(id, _)| funcs.get(id as usize))
+            .is_some_and(|f| f.class_ctor);
+        let Some(nt_aux) = ctx.realm.jit_aux_of(nth) else {
+            return;
+        };
+        let fixed = class
+            && ctx.realm.jit_object(nt_aux).is_some_and(|o| {
+                o.is_readonly("prototype")
+                    && o.is_non_configurable("prototype")
+                    && o.get("prototype").and_then(|v| v.as_handle()) == Some(p.to_raw())
+            });
+        if !fixed {
+            return;
+        }
+        ctx.realm.watch_link(nth.to_raw(), Some(nt_aux.to_raw()));
+    }
     ctx.realm.watch_link(fh.to_raw(), Some(aux.to_raw()));
+    for &f in passed {
+        let a = ctx.realm.jit_aux_of(f).map(Handle::to_raw);
+        ctx.realm.watch_link(f.to_raw(), a);
+    }
     site.fast = crate::jit::ConstructFast {
         ctor,
+        nt,
         stamp: crate::object::proto_epoch(),
-        proto: proto.to_raw(),
+        proto: proto.map_or(0, Handle::to_raw),
+        derived: u64::from(proto.is_none()),
         target,
         caps,
     };
@@ -1902,9 +2132,11 @@ pub(crate) extern "C" fn jit_construct_alloc(ctx: *mut core::ffi::c_void, proto:
     NanBox::handle(obj.to_raw()).to_bits()
 }
 
-/// A `new`'s result when the constructor body returned the heap value
-/// `result` (`crate::jit::ConstructResultHelper`): `result` if it is an
-/// object, else `this` — `vm_construct`'s last step.
+/// A construct's result when the constructor body returned the heap value
+/// `result`, or `this` started unbound (`crate::jit::ConstructResultHelper`):
+/// `result` if it is an object, else `this` — `vm_construct`'s last step;
+/// for a derived constructor, the `ReferenceError` (unbound `this`) or
+/// `TypeError` (anything else) it throws, pending.
 ///
 /// # Safety
 /// `ctx` the live `Ctx`.
@@ -1915,12 +2147,48 @@ pub(crate) extern "C" fn jit_construct_result(
 ) -> u64 {
     // SAFETY: see the function contract.
     #[allow(unsafe_code)]
-    let ctx = unsafe { &*(ctx as *const Ctx) };
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
     if super::is_object_value(&ctx.realm, NanBox::from_bits(result)) {
-        result
-    } else {
-        this
+        return result;
     }
+    if !NanBox::from_bits(this).is_tdz() {
+        return this;
+    }
+    // A derived constructor's body result (`Op::DerivedResult`), checked as
+    // `vm_construct` checks it.
+    let e = if NanBox::from_bits(result).is_tdz() {
+        super::vm_error(
+            ctx,
+            "ReferenceError",
+            "Must call super constructor in derived class before returning",
+        )
+    } else {
+        super::vm_error(
+            ctx,
+            "TypeError",
+            "Derived constructors may only return object or undefined",
+        )
+    };
+    ctx.jit_pending_fault = Some(VmError::Thrown(e));
+    NanBox::jit_throw_bits()
+}
+
+/// `super(…)` when `this` is already bound (`crate::jit::SuperTwiceHelper`):
+/// the `ReferenceError` the interpreter's `super(…)` throws, pending.
+///
+/// # Safety
+/// `ctx` the live `Ctx`.
+pub(crate) extern "C" fn jit_super_twice(ctx: *mut core::ffi::c_void) -> u64 {
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    let e = super::vm_error(
+        ctx,
+        "ReferenceError",
+        "Super constructor may only be called once",
+    );
+    ctx.jit_pending_fault = Some(VmError::Thrown(e));
+    NanBox::jit_throw_bits()
 }
 
 /// A method call's callee lookup for the native call sequence

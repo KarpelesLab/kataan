@@ -588,6 +588,19 @@ fn verify_op_with(
             reg(*args)?;
             reg(*this)
         }
+        Op::SuperCallArgs {
+            dst,
+            ctor,
+            new_target,
+            args,
+            this,
+        } => {
+            reg(*dst)?;
+            reg(*ctor)?;
+            reg(*new_target)?;
+            regs(args)?;
+            reg(*this)
+        }
         Op::SuperGet {
             dst,
             home,
@@ -1472,6 +1485,19 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
                 w_reg(*r, out);
             }
         }
+        Op::SuperCallArgs {
+            dst,
+            ctor,
+            new_target,
+            args,
+            this,
+        } => {
+            w_u8(169, out);
+            for r in [dst, ctor, new_target, this] {
+                w_reg(*r, out);
+            }
+            w_regs(args, out);
+        }
         Op::SuperGet {
             dst,
             home,
@@ -2290,6 +2316,13 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             new_target: r.reg()?,
             args: r.reg()?,
             this: r.reg()?,
+        },
+        169 => Op::SuperCallArgs {
+            dst: r.reg()?,
+            ctor: r.reg()?,
+            new_target: r.reg()?,
+            this: r.reg()?,
+            args: r.regs()?,
         },
         94 => Op::SuperGet {
             dst: r.reg()?,
