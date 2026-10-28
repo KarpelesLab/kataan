@@ -7139,19 +7139,25 @@ fn js_str_to_f64(t: &str) -> f64 {
 /// the spec's thresholds.
 #[must_use]
 pub(crate) fn js_number_string(n: f64) -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    push_js_number(&mut out, n);
+    out
+}
+
+/// Appends [`js_number_string`]`(n)` to `out`, without an intermediate string.
+pub(crate) fn push_js_number(out: &mut alloc::string::String, n: f64) {
     if n.is_nan() {
-        return "NaN".into();
+        return out.push_str("NaN");
     }
     if n.is_infinite() {
-        return if n > 0.0 { "Infinity" } else { "-Infinity" }.into();
+        return out.push_str(if n > 0.0 { "Infinity" } else { "-Infinity" });
     }
     // Both `+0` and `-0` stringify to "0".
     if n == 0.0 {
-        return "0".into();
+        return out.push('0');
     }
-    let mut out = alloc::string::String::new();
-    if builtins_fast::push_small_integer(&mut out, n) {
-        return out;
+    if builtins_fast::push_small_integer(out, n) {
+        return;
     }
     // `abs = 0.digits × 10^e` (the spec's `s`, `k` and `n`).
     let (digits, e) = shortest_digits(n.abs());
@@ -7179,9 +7185,8 @@ pub(crate) fn js_number_string(n: f64) -> alloc::string::String {
             out.push_str(&digits[1..]);
         }
         out.push_str(if e > 0 { "e+" } else { "e-" });
-        out.push_str(&alloc::format!("{}", (e - 1).abs()));
+        builtins_fast::push_small_integer(out, f64::from((e - 1).abs()));
     }
-    out
 }
 
 /// The ECMAScript `Number::toString` digits of a finite `abs > 0`: the

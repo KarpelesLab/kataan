@@ -319,9 +319,8 @@ impl Interp {
             Unpacked::Null => cx.out.push_str("null"),
             Unpacked::Bool(b) => cx.out.push_str(if b { "true" } else { "false" }),
             Unpacked::Number(n) => {
-                if crate::realm::builtins_fast::push_small_integer(&mut cx.out, n) {
-                } else if n.is_finite() {
-                    cx.out.push_str(&self.realm.to_display_string(value));
+                if n.is_finite() {
+                    crate::realm::push_js_number(&mut cx.out, n);
                 } else {
                     cx.out.push_str("null");
                 }
@@ -487,7 +486,12 @@ impl Interp {
             return self.json_ser_planned(cx, h, &plan, indent);
         }
         self.json_enter(cx, h)?;
-        let new_indent = alloc::format!("{indent}{}", cx.gap);
+        // (No indent to build without a gap: `String::new()` does not allocate.)
+        let new_indent = if cx.gap.is_empty() {
+            String::new()
+        } else {
+            alloc::format!("{indent}{}", cx.gap)
+        };
         // The key set: the explicit PropertyList, else the object's own enumerable
         // string keys (a typed array enumerates its integer indices).
         let keys: Vec<String> = match cx.property_list {
@@ -621,7 +625,11 @@ impl Interp {
         indent: &str,
     ) -> Result<(), ExecError> {
         self.json_enter(cx, h)?;
-        let new_indent = alloc::format!("{indent}{}", cx.gap);
+        let new_indent = if cx.gap.is_empty() {
+            String::new()
+        } else {
+            alloc::format!("{indent}{}", cx.gap)
+        };
         let len = if self.realm.typed_kind(h).is_some() {
             self.realm.typed_len(h).unwrap_or(0)
         } else if self.realm.proxy_at(h).is_some() {
