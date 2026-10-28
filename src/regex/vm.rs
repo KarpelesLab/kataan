@@ -448,6 +448,37 @@ fn backtrack(
                 // length. A single-consume body always advances, so it can never
                 // be zero-width — no loop-stack bookkeeping is needed here.
                 if let Some((consume_pc, cont_pc, greedy)) = simple_loop(ctx.prog, pc) {
+                    if greedy && !unicode {
+                        // Outside `u` mode every consume is exactly one code unit,
+                        // so the candidate positions are the contiguous run from
+                        // the start to the furthest point reached: walk it back
+                        // without recording it. A continuation that must begin
+                        // with a literal unit is only entered where that unit is.
+                        let first = sp;
+                        while let Some(nsp) =
+                            consume_one(&ctx.prog[consume_pc], ctx.input, sp, cur, ctx.reverse)
+                        {
+                            sp = nsp;
+                            if !ctx.tick() {
+                                return false;
+                            }
+                        }
+                        let mut p = sp;
+                        loop {
+                            if !continuation_cannot_start(ctx, cont_pc, p, cur)
+                                && backtrack(ctx, cont_pc, p, saves, depth + 1, marks, flags_stack)
+                            {
+                                return true;
+                            }
+                            if !ctx.tick() {
+                                return false;
+                            }
+                            if p == first {
+                                return false;
+                            }
+                            p = if ctx.reverse { p + 1 } else { p - 1 };
+                        }
+                    }
                     if greedy {
                         // Greedy: consume as many as possible, recording each
                         // position, then try the continuation from longest down.
@@ -740,6 +771,26 @@ fn simple_loop(prog: &[Inst], split_pc: usize) -> Option<(usize, usize, bool)> {
         return Some((split_pc + 1, *a, false));
     }
     None
+}
+
+/// Whether the continuation at `pc` certainly fails at `sp` (non-`u`, forward,
+/// case-sensitive): after any capture saves, which consume nothing, its first
+/// instruction is a literal BMP character that is not the unit at `sp`. A cheap
+/// pre-check so a greedy loop does not enter a doomed continuation at every
+/// position it backs off to.
+fn continuation_cannot_start(ctx: &Ctx, mut pc: usize, sp: usize, flags: Flags) -> bool {
+    if ctx.reverse || flags.ignore_case || flags.unicode {
+        return false;
+    }
+    while let Some(Inst::Save(_)) = ctx.prog.get(pc) {
+        pc += 1;
+    }
+    match ctx.prog.get(pc) {
+        Some(Inst::Char(c)) if *c <= 0xFFFF => {
+            ctx.input.get(sp).is_none_or(|&u| u32::from(u) != *c)
+        }
+        _ => false,
+    }
 }
 
 /// Whether `inst` consumes exactly one character (1 or 2 code units) on success.

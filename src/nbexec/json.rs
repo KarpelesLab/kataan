@@ -421,7 +421,7 @@ impl Interp {
             cx.out.push_str(if pretty { ": " } else { ":" });
             // `Get(h, k)`: an own data property of an ordinary object is its
             // slot; everything else takes the full `[[Get]]`.
-            let value = match self.json_plain_own_data(h, &k) {
+            let value = match self.ordinary_own_data(h, &k) {
                 Some(v) => v,
                 None => self.read_member(h, &k)?,
             };
@@ -505,21 +505,6 @@ impl Interp {
         }
         cx.out.push(']');
         Ok(())
-    }
-
-    /// `[[Get]]` of `key` on `h` when that is simply an own data slot of an
-    /// ordinary object — no proxy, typed array, module namespace, mapped
-    /// `arguments` or accessor involved. `None` means "take the full
-    /// `read_member` path", never "absent".
-    fn json_plain_own_data(&self, h: Handle, key: &str) -> Option<NanBox> {
-        if self.realm.proxy_at(h).is_some()
-            || self.realm.typed_kind(h).is_some()
-            || self.realm.is_host_exotic(h)
-            || self.arg_maps.contains_key(&h.to_raw())
-        {
-            return None;
-        }
-        self.realm.plain_own_data(h, key)
     }
 
     /// A `SyntaxError` for a malformed `JSON.parse` input (the spec error type, so

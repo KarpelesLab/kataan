@@ -1,6 +1,43 @@
 use super::*;
 
 impl Interp {
+    /// `[[Get]]` of `key` on `h` when that is simply an own data property of an
+    /// ordinary object or an Array: no proxy, typed array, module namespace,
+    /// mapped `arguments` or accessor involved. `None` means "take the full
+    /// `read_member` path", never "absent".
+    pub(crate) fn ordinary_own_data(&self, h: Handle, key: &str) -> Option<NanBox> {
+        if self.realm.proxy_at(h).is_some()
+            || self.realm.typed_kind(h).is_some()
+            || self.realm.is_host_exotic(h)
+            || self.arg_maps.contains_key(&h.to_raw())
+        {
+            return None;
+        }
+        if let Some(elems) = self.realm.array_elements(h) {
+            if key == "length" {
+                return self.realm.array_length(h).map(|n| NanBox::number(n as f64));
+            }
+            if let Some(i) = canonical_index(key) {
+                if self.realm.array_has_index_side_table(h) {
+                    return None;
+                }
+                return elems.get(i).copied().filter(|v| !v.is_hole());
+            }
+            if self.realm.accessor(h, key).is_some() {
+                return None;
+            }
+            return self.realm.get_property(h, key);
+        }
+        self.realm.plain_own_data(h, key)
+    }
+
+    /// [`Self::ordinary_own_data`], else the full `[[Get]]`.
+    pub(crate) fn get_own_fast(&mut self, h: Handle, key: &str) -> Result<NanBox, ExecError> {
+        match self.ordinary_own_data(h, key) {
+            Some(v) => Ok(v),
+            None => self.read_member(h, key),
+        }
+    }
     /// Whether a callable's `name` / `length` should be *synthesized* for `handle`
     /// — i.e. there is no physical own slot **and** the property has not been
     /// deleted.
@@ -3093,4 +3130,18 @@ impl Interp {
         }
         Ok(true)
     }
+}
+
+/// `key` as an array index if it is the canonical decimal form of one (no sign,
+/// no leading zero), else `None`.
+fn canonical_index(key: &str) -> Option<usize> {
+    let b = key.as_bytes();
+    if b.is_empty() || b.len() > 10 || (b.len() > 1 && b[0] == b'0') {
+        return None;
+    }
+    if !b.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let i: u64 = key.parse().ok()?;
+    (i < u64::from(u32::MAX)).then_some(i as usize)
 }

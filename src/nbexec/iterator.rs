@@ -179,16 +179,39 @@ impl Interp {
         it: Handle,
         next: NanBox,
     ) -> Result<Option<NanBox>, ExecError> {
-        let res = self.call_with_this(next, NanBox::handle(it.to_raw()), &[])?;
+        // The built-in iterators' own `next` (an array/string/collection
+        // iterator) is called directly: `call_with_this` would only enter the
+        // realm it already runs in and reach this same native by dispatch.
+        let res = match next.as_handle().map(Handle::from_raw) {
+            Some(nh)
+                if self.realm.native_at(nh) == Some(N_GEN_ITER_NEXT)
+                    && self.get_function_realm(nh) == self.cur_realm =>
+            {
+                let saved = core::mem::replace(&mut self.this_val, NanBox::handle(it.to_raw()));
+                let r = self.gen_iter_next(NanBox::handle(it.to_raw()));
+                self.this_val = saved;
+                r?
+            }
+            _ => self.call_with_this(next, NanBox::handle(it.to_raw()), &[])?,
+        };
         if !self.is_object_value(res) {
             return Err(self.type_error("iterator result is not an object"));
         }
         let rh = Handle::from_raw(res.as_handle().unwrap());
-        let done = self.read_member(rh, "done")?;
+        // `done`/`value` of an ordinary result object are plain own data slots
+        // (always so for a built-in iterator's fresh result); anything else
+        // takes the full `[[Get]]`.
+        let done = match self.ordinary_own_data(rh, "done") {
+            Some(v) => v,
+            None => self.read_member(rh, "done")?,
+        };
         if self.realm.truthy(done) {
             return Ok(None);
         }
-        Ok(Some(self.read_member(rh, "value")?))
+        Ok(Some(match self.ordinary_own_data(rh, "value") {
+            Some(v) => v,
+            None => self.read_member(rh, "value")?,
+        }))
     }
 
     /// Builds a lazy `%IteratorHelperPrototype%`-based helper object for `map`,
@@ -432,6 +455,22 @@ impl Interp {
     /// appended/assigned after the iterator was created is observed. Once the cursor
     /// reaches the current length the iterator is exhausted (and stays done even if
     /// the array later grows again — matching the spec's monotonic index cursor).
+    /// `Get(arr, ToString(i))`: a present slot of a plain array with no
+    /// per-index side table is the element itself; anything else (a hole, an
+    /// accessor, an array-like) takes the full `[[Get]]`.
+    pub(crate) fn get_index(&mut self, arr: Handle, i: usize) -> Result<NanBox, ExecError> {
+        if !self.realm.array_has_index_side_table(arr)
+            && let Some(v) = self
+                .realm
+                .array_elements(arr)
+                .and_then(|a| a.get(i).copied())
+            && !v.is_hole()
+        {
+            return Ok(v);
+        }
+        self.read_member(arr, &alloc::format!("{i}"))
+    }
+
     pub(crate) fn live_array_iter_next(
         &mut self,
         h: Handle,
@@ -472,10 +511,10 @@ impl Interp {
             0 => NanBox::number(idx as f64), // keys
             2 => {
                 // entries: [index, element]
-                let e = self.read_member(arr, &alloc::format!("{idx}"))?;
+                let e = self.get_index(arr, idx)?;
                 self.new_iter_pair(NanBox::number(idx as f64), e)
             }
-            _ => self.read_member(arr, &alloc::format!("{idx}"))?, // values
+            _ => self.get_index(arr, idx)?, // values
         };
         Ok(self.iter_result(value, false))
     }

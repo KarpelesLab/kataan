@@ -8918,8 +8918,34 @@ impl crate::nbvm::VmHost for Interp {
     }
 
     fn get_iterator(&mut self, v: NanBox) -> Result<(NanBox, NanBox), crate::nbvm::HostError> {
-        self.require_iterator_method(v).map_err(exec_to_host)?;
-        let it = self.get_iter_object(v).map_err(exec_to_host)?;
+        // An array's `@@iterator` is looked up once (GetMethod) and called; the
+        // general path below would look it up twice (the "is it callable"
+        // check, then the call).
+        let it = if let Some(h) = v.as_handle().map(Handle::from_raw)
+            && self.realm.array_elements(h).is_some()
+        {
+            let f = self.find_iterator_fn(h).map_err(exec_to_host)?.filter(|f| {
+                f.as_handle()
+                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+            });
+            let Some(f) = f else {
+                let m = self.new_str("is not iterable");
+                return Err(crate::nbvm::HostError::Thrown(
+                    self.make_error(N_TYPE_ERROR, Some(m)),
+                ));
+            };
+            let it = self.call_with_this(f, v, &[]).map_err(exec_to_host)?;
+            match it.as_handle().map(Handle::from_raw) {
+                Some(ih) => ih,
+                None => {
+                    let e = self.type_error("[Symbol.iterator] did not return an object");
+                    return Err(exec_to_host(e));
+                }
+            }
+        } else {
+            self.require_iterator_method(v).map_err(exec_to_host)?;
+            self.get_iter_object(v).map_err(exec_to_host)?
+        };
         // GetIteratorFromMethod: the iterator must be an Object (a string or
         // symbol `@@iterator` result is a TypeError).
         if !self.is_object_value(NanBox::handle(it.to_raw())) {

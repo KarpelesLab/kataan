@@ -843,6 +843,18 @@ impl Interp {
             return Err(self.type_error("RegExpExec called on a non-object"));
         };
         let exec = self.read_member(h, "exec")?;
+        // The intrinsic `RegExp.prototype.exec` on a RegExp: run
+        // RegExpBuiltinExec directly rather than through the generic call and
+        // the by-name dispatch (same realm, same result).
+        #[cfg(feature = "regex")]
+        if let Some(fh) = exec.as_handle().map(Handle::from_raw)
+            && let Some((N_REGEXP_PROTO_FN, target)) = self.realm.bound_native_at(fh)
+            && self.realm.string_leaf_bytes(target) == Some(b"exec".as_slice())
+            && self.get_function_realm(fh) == self.cur_realm
+            && let Some(rh) = self.this_regexp(r)
+        {
+            return self.regexp_builtin_exec(rh, s);
+        }
         if exec
             .as_handle()
             .map(Handle::from_raw)
@@ -968,7 +980,7 @@ impl Interp {
             let Some(rh) = result.as_handle().map(Handle::from_raw) else {
                 break;
             };
-            let match0 = self.read_member(rh, "0")?;
+            let match0 = self.get_own_fast(rh, "0")?;
             // `ToString(Get(result, "0"))` losslessly: a non-unicode `/./g` matches
             // one *code unit*, so each half of an astral pair is a lone surrogate
             // that a `String` round-trip would collapse to U+FFFD.
@@ -1067,7 +1079,7 @@ impl Interp {
         // Global: `matchStr = ToString(Get(match, "0"))`; on an empty match,
         // bump the matcher's `lastIndex` so iteration terminates.
         if let Some(rh) = result.as_handle().map(Handle::from_raw) {
-            let match0 = self.read_member(rh, "0")?;
+            let match0 = self.get_own_fast(rh, "0")?;
             let m_str = self.coerce_to_string(match0)?;
             if m_str.is_empty()
                 && let Some(matcher) = matcher_v.as_handle().map(Handle::from_raw)
@@ -1253,7 +1265,7 @@ impl Interp {
                 break;
             }
             let m0 = match result.as_handle().map(Handle::from_raw) {
-                Some(r) => self.read_member(r, "0")?,
+                Some(r) => self.get_own_fast(r, "0")?,
                 None => NanBox::undefined(),
             };
             let m_str = self.coerce_to_string(m0)?;
@@ -1271,13 +1283,13 @@ impl Interp {
             let Some(rh) = result.as_handle().map(Handle::from_raw) else {
                 continue;
             };
-            let n_v = self.read_member(rh, "length")?;
+            let n_v = self.get_own_fast(rh, "length")?;
             let n_captures =
                 (self.coerce_to_integer_or_infinity(n_v)?.max(0.0) as usize).saturating_sub(1);
-            let matched_v = self.read_member(rh, "0")?;
+            let matched_v = self.get_own_fast(rh, "0")?;
             let (_, matched_units) = self.subject_units(matched_v)?;
             let m_len = matched_units.len();
-            let pos_v = self.read_member(rh, "index")?;
+            let pos_v = self.get_own_fast(rh, "index")?;
             let pos = (self.coerce_to_integer_or_infinity(pos_v)?.max(0.0) as usize).min(length);
             // Collect captures.
             // Captures are carried as WTF-8 bytes, not `String`: a capture can be a
@@ -1285,14 +1297,14 @@ impl Interp {
             // `String` round-trip folds it to U+FFFD.
             let mut captures: Vec<Option<Vec<u8>>> = Vec::with_capacity(n_captures);
             for i in 1..=n_captures {
-                let cap = self.read_member(rh, &alloc::format!("{i}"))?;
+                let cap = self.get_own_fast(rh, &alloc::format!("{i}"))?;
                 if matches!(cap.unpack(), Unpacked::Undefined) {
                     captures.push(None);
                 } else {
                     captures.push(Some(self.coerce_to_string_bytes(cap)?));
                 }
             }
-            let named = self.read_member(rh, "groups")?;
+            let named = self.get_own_fast(rh, "groups")?;
             let replacement = if func_replace {
                 // Call(replace, undefined, [matched, ...captures, position, S, groups?]).
                 let mut call_args: Vec<NanBox> = Vec::with_capacity(n_captures + 4);
