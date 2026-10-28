@@ -7553,8 +7553,10 @@ pub(crate) fn coerce_typed(kind: u16, n: f64) -> f64 {
                 return 0.0;
             }
             // Truncate toward zero, then reduce into range with integer math (no
-            // std float methods, for the `alloc`-only build).
-            let i = n as i64;
+            // std float methods, for the `alloc`-only build). Reducing modulo 2^32
+            // first (exact) keeps `as i64` from saturating at |n| >= 2^63, where
+            // e.g. `1e300` must store 0, not -1.
+            let i = (crate::common::FloatExt::trunc(n) % 4_294_967_296.0) as i64;
             let (bits, signed) = match kind {
                 0 => (8u32, true), // Int8
                 1 => (8, false),   // Uint8

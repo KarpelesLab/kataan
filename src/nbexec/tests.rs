@@ -12840,3 +12840,22 @@ fn to_fixed_ties_and_long_expansions() {
         "2.35499999999999998223643160599749535322189331054688|0.00000000093132257461547851563|1|1.3|-3|0.0000028610229492188"
     );
 }
+
+/// Integer typed-array stores reduce huge Numbers modulo 2^bits exactly (an
+/// `as i64` saturates at 2^63: `1e300` stored -1 instead of 0), and the VM's
+/// integer-index fast paths read/write the same elements as the generic path.
+#[test]
+fn typed_array_integer_stores_of_huge_numbers_and_index_fast_paths() {
+    assert_eq!(super::coerce_typed(0, 1e300), 0.0);
+    assert_eq!(super::coerce_typed(1, -1e300), 0.0);
+    assert_eq!(super::coerce_typed(5, 2f64.powi(70) + 2f64.powi(40)), 0.0);
+    assert_eq!(super::coerce_typed(6, 4_294_967_296.0 * 3.0 + 5.0), 5.0);
+    assert_eq!(super::coerce_typed(5, -(2f64.powi(64)) - 4096.0), -4096.0);
+    let src = r#"
+        const a = new Int8Array(4); a[0] = 1e300; a[1] = -1e300; a[2] = 2 ** 70 + 2 ** 40 + 3; a[3] = 383;
+        const f = new Float64Array(2); f[-0] = 2.5; f[1.5] = 9; f[2] = 7;
+        const u = new Uint32Array(1); u[0] = -1;
+        [a.join(), f.join(), f[1.5], f[2], u[0], a[-0], a[4]].join("|")
+    "#;
+    assert_eq!(run(src), "0,0,0,127|2.5,0|||4294967295|0|");
+}

@@ -1781,6 +1781,9 @@ fn vm_set_elem_mode(
     value: NanBox,
     strict: bool,
 ) -> Result<(), VmError> {
+    if typed_array_index_set(ctx, recv, key, value) {
+        return Ok(());
+    }
     if ctx.host.is_none() {
         return vm_set_elem(ctx, funcs, recv, key, value);
     }
@@ -9293,6 +9296,54 @@ fn vm_property_key(ctx: &mut Ctx, key: NanBox) -> Result<String, VmError> {
     Ok(ctx.realm.to_display_string(key))
 }
 
+/// The integer index `key` names on typed array `recv`, when the element access
+/// can skip the generic property path: `key` a Number with an integral value in
+/// `[0, length)` (`-0` is index 0, as `ToPropertyKey(-0)` is `"0"`).
+fn typed_array_index(ctx: &Ctx, recv: NanBox, key: NanBox) -> Option<(Handle, usize)> {
+    let h = Handle::from_raw(recv.as_handle()?);
+    let n = key.as_number()?;
+    if !(0.0..9_007_199_254_740_992.0).contains(&n) || (n as u64) as f64 != n {
+        return None;
+    }
+    let len = ctx.realm.typed_len(h)?;
+    ((n as usize) < len).then_some((h, n as usize))
+}
+
+/// `ta[i]` for a non-negative integral Number `i` on a typed array: an
+/// integer-indexed exotic object answers a numeric key from its elements alone
+/// (no prototype, no accessor can intercept it), so this is the element, or
+/// `undefined` when `i` is not a valid index.
+fn typed_array_index_get(ctx: &mut Ctx, recv: NanBox, key: NanBox) -> Option<NanBox> {
+    let h = Handle::from_raw(recv.as_handle()?);
+    let n = key.as_number()?;
+    if !(0.0..9_007_199_254_740_992.0).contains(&n) || (n as u64) as f64 != n {
+        return None;
+    }
+    // `typed_get` answers `undefined` past the length or for an out-of-bounds
+    // view, which is exactly `[[Get]]` for a valid-integer-index miss.
+    ctx.realm.typed_get(h, n as usize)
+}
+
+/// `ta[i] = v` for an in-range integer index and a Number `v` on a non-BigInt
+/// view: `TypedArraySetElement` (ToNumber of a Number has no effect; the index
+/// is valid), done directly. `false` when the generic path must run.
+fn typed_array_index_set(ctx: &mut Ctx, recv: NanBox, key: NanBox, value: NanBox) -> bool {
+    if value.as_number().is_none() {
+        return false;
+    }
+    let Some((h, i)) = typed_array_index(ctx, recv, key) else {
+        return false;
+    };
+    if ctx
+        .realm
+        .typed_kind(h)
+        .is_none_or(crate::nbexec::is_bigint_kind)
+    {
+        return false;
+    }
+    ctx.realm.typed_set(h, i, value)
+}
+
 /// The interpreter's real computed element **get** `obj[key]` (`Op::GetKey`'s
 /// semantics), factored out so the bytecode VM **and** the generic-JIT runtime
 /// helper ([`jit_helper_get_elem`]) share one code path and can never diverge: a
@@ -9314,6 +9365,9 @@ fn vm_get_elem(
     if let (Some(h), Some(n)) = (recv.as_handle(), key.as_number())
         && let Some(v) = ctx.realm.plain_array_get(Handle::from_raw(h), n)
     {
+        return Ok(v);
+    }
+    if let Some(v) = typed_array_index_get(ctx, recv, key) {
         return Ok(v);
     }
     if read_needs_host(ctx, recv)
@@ -26362,6 +26416,8 @@ mod generic_jit_tests {
             function neg(x, y) { let r = 0; for (let i = 0; i < 3; i = i + 1) { r = -x + (y - y) * x; } return r; }
             function mods(x, y) { let r = 0, c = 0; for (let i = 0; i < 4; i = i + 1) { r = x % y; if (x % 3 === 0) c = c + 1; c = c + (x % -7); } return r * 10 + c; }
             function wrap(x, y) { let s = x; for (let i = 0; i < 30; i = i + 1) { s = (s + y * 65599) | 0; } return s; }
+            function hsh(x, y) { let h = 0, g = 5381; for (let i = 0; i < 30; i = i + 1) { h = (h * 31 + x) | 0; g = ((g << 5) + g + y) | 0; } return h + g * 3; }
+            function hmul(x, y) { let m = 1; for (let i = 0; i < 30; i = i + 1) { m = (m * y + x) | 0; } return m; }
             function shifts(x, y) { let r = 0; for (let i = 0; i < 3; i = i + 1) { r = (x << y) + (x >> (y + 32)) + (x >>> y); } return r; }
             function cmps(x, y) { let a = 0, n = 0; for (let i = 0; i < 3; i = i + 1) { a = x < y; if (x === y) n = n + 1; n = n + (x >= y); } return a === true ? n + 100 : n; }
             function counter(x, y) { let n = 0, k = 0; for (let i = x; i < y; i = i + 1) { n = n + i; k = k + 1; if (k > 50) break; } return n; }
@@ -26387,7 +26443,8 @@ mod generic_jit_tests {
             32.0,
         ];
         for name in [
-            "acc", "dif", "pro", "inc", "neg", "mods", "wrap", "shifts", "cmps", "counter",
+            "acc", "dif", "pro", "inc", "neg", "mods", "wrap", "hsh", "hmul", "shifts", "cmps",
+            "counter",
         ] {
             let (funcs, f) = compile_named(src, name);
             for &x in &vals {
@@ -26398,6 +26455,15 @@ mod generic_jit_tests {
             diff_ok(&funcs, f, &[NanBox::boolean(true), NanBox::number(2.0)]);
             diff_ok(&funcs, f, &[NanBox::number(5.0), NanBox::null()]);
         }
+        // A product past 2^53 is rounded as a double before `| 0`: it must not
+        // wrap (node: -2147483648).
+        let (funcs, f) = compile_named(src, "hmul");
+        let r = diff_ok(
+            &funcs,
+            f,
+            &[NanBox::number(3.0), NanBox::number(2147483647.0)],
+        );
+        assert_eq!(r.as_number(), Some(-2147483648.0));
     }
 
     /// The Int tier keeps no `-0` (an `i64` has none): a `-0` argument deopts,
