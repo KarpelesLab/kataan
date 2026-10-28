@@ -38,7 +38,7 @@ required-features = ["cli"]
 # `crypto` is in the default set so `Math.random` is seeded from real OS entropy
 # (purecrypto's CSPRNG); the no_std core drops it and falls back to a best-effort
 # entropy mix (cycle counter + clock + ASLR), never a fixed seed.
-default = ["std", "regex", "intl", "intl-tz-names", "module", "host", "cli", "crypto"]
+default = ["std", "regex", "intl", "intl-tz-names", "module", "host", "cli", "crypto", "jit"]
 std = ["alloc"]
 alloc = []
 
@@ -64,7 +64,8 @@ fetch = ["host", "dep:rsurl"]
 # `crypto.getRandomValues` / `randomUUID` / WebCrypto `crypto.subtle` over the
 # pure-Rust `purecrypto` crate.
 crypto = ["host", "dep:purecrypto"]
-# Baseline + optimizing JIT tiers (later phases).
+# The machine-code JIT (`ROADMAP.md` §2.1). On by default; it only exists on
+# x86-64 Linux (every use is cfg-gated on that target), so elsewhere it is inert.
 jit = ["std"]
 # C ABI: builds the `ffi` module (the only place broad `unsafe` is allowed).
 # Build a C library with `cargo rustc --features ffi --crate-type cdylib`

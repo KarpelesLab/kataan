@@ -390,11 +390,18 @@ These make Kataan more than a fast interpreter. They are *engine* capabilities
 > identical throws) + layout gate + heap-churn stress; lib 866 / jit 968 green; no_std
 > compiles; JIT-on corpus green.
 >
-> **Remaining (the "large, separate" frontier):** generalized guard-failure **deopt is N/A
-> for this non-speculative tier** (compile-time eligibility + helper slow paths mean no
-> speculative guard fails mid-execution needing interpreter-reg restoration); **OSR** for
-> mid-loop tier-up, and the **Cranelift-style shared backend + aarch64** portability below,
-> are genuine standalone efforts.
+> **Frame ABI + OSR, on by default (2026-10-28).** A generic body is now
+> `fn(ctx, regs, entry_pc)` over the *interpreter's own register file*, op-for-op with the
+> bytecode, so captures/`this`/rest need no modelling and any op without a native lowering is
+> executed by the interpreter itself on those registers (`jit_helper_exec_op`) — only
+> frame-structural ops (handlers, suspension, tail calls, direct eval/env) are refused. Hot
+> interpreted loops continue natively from their header (**OSR**, 500 back-edges);
+> back-edges poll interrupt/agents/GC. `jit` is a default feature (inert off x86-64 Linux).
+> Knobs: `KATAAN_JIT_LOG=1|2` (what compiled and why not), `KATAAN_JIT=0|eager`.
+>
+> **Remaining:** native JIT→JIT calls (calls go through the interpreter's call path);
+> lowering `try`/`for-of` (handlers) and generators; the **Cranelift-style shared backend +
+> aarch64** portability below.
 
 Today the JIT compiles integer/float numeric functions and bails to the
 interpreter for everything else. "Complete" means hot functions JIT regardless of
