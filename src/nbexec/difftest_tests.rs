@@ -370,3 +370,27 @@ fn for_in_walks_proxies_and_indexed_prototypes() {
     "#;
     assert_eq!(run(src), "a,inh|true|0,1|5,0,1,q|x,0,1|0,1|0,1|0");
 }
+
+/// An Error instance has no own `name`: engine-thrown and constructed errors
+/// alike inherit it from their prototype, so reassigning
+/// `TypeError.prototype.name` renames them and `getOwnPropertyNames` lists
+/// only `message` (every error carried an own `name` data property).
+#[test]
+fn error_instances_inherit_their_name() {
+    let src = r#"
+        var e = new TypeError("m"), r = [];
+        r.push(Object.hasOwn(e, "name"), Object.getOwnPropertyNames(e).join(), e.name, String(e));
+        try { null.x; } catch (t) { r.push(Object.hasOwn(t, "name"), t.name); }
+        class MyErr extends RangeError {}
+        r.push(Object.hasOwn(new MyErr(), "name"), new MyErr("q").toString());
+        TypeError.prototype.name = "TE";
+        try { undefined.y; } catch (t) { r.push(t.name); }
+        r.push(new TypeError("z").toString());
+        TypeError.prototype.name = "TypeError";
+        r.join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "false|message|TypeError|TypeError: m|false|TypeError|false|RangeError: q|TE|TE: z"
+    );
+}

@@ -18,11 +18,13 @@ assert.sameValue(new TypeError("t").toString(), "TypeError: t", "name: message")
 assert.sameValue(new RangeError("r").toString(), "RangeError: r", "RangeError toString");
 
 // A subclass: own assigned props stay enumerable; inherited error props do not.
+// An instance has no own `name` (it inherits `Error.prototype.name`), so the
+// assignment creates an ordinary, enumerable own property.
 class AppError extends Error {
   constructor(m) { super(m); this.name = "AppError"; this.code = 5; }
 }
 var a = new AppError("boom");
-assert.sameValue(Object.keys(a).sort().join(","), "code", "only the user prop enumerates");
+assert.sameValue(Object.keys(a).sort().join(","), "code,name", "the assigned props enumerate");
 assert.sameValue(a.toString(), "AppError: boom", "subclass toString");
 assert.sameValue(a instanceof Error, true, "subclass instanceof Error");
 

@@ -6571,7 +6571,7 @@ impl Interp {
             Some(c) => Some(c),
             None => self.error_ctor_by_name(name),
         };
-        if let Some(proto) = ctor
+        let linked = if let Some(proto) = ctor
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .and_then(|c| self.realm.get_property(c, "prototype"))
@@ -6579,9 +6579,20 @@ impl Interp {
             .map(Handle::from_raw)
         {
             self.realm.set_object_proto(obj, Some(proto));
+            true
+        } else {
+            false
+        };
+        // An error instance has no own `name`: it inherits `<Error>.prototype.name`
+        // (so `Object.getOwnPropertyNames(new TypeError("m"))` is `["message"]`,
+        // and reassigning `TypeError.prototype.name` renames engine-thrown errors
+        // too). Only an error made before its constructor exists (early
+        // bootstrap) carries the name itself.
+        if !linked {
+            let name_v = self.new_str(name);
+            self.realm.set_property(obj, "name", name_v);
+            self.realm.mark_hidden(obj, "name");
         }
-        let name_v = self.new_str(name);
-        self.realm.set_property(obj, "name", name_v);
         // Only when `message` is present (not undefined) is an own, non-enumerable
         // `message` data property created (ECMA-262 20.5.8.1 InstallErrorCause /
         // the Error constructor step: `If message is not undefined …`). Otherwise
@@ -6595,8 +6606,6 @@ impl Interp {
             self.realm.set_property(obj, "message", msg);
             self.realm.mark_hidden(obj, "message");
         }
-        // `name` is non-enumerable (so `Object.keys(err)` is empty).
-        self.realm.mark_hidden(obj, "name");
         // No own `stack` property: per the error-stack-accessor proposal, `stack`
         // is an inherited accessor on `Error.prototype` (see
         // `N_ERROR_PROTO_STACK_GET`/`N_ERROR_PROTO_STACK_SET`) driven by the
