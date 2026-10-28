@@ -6204,6 +6204,7 @@ mod tests {
             is_generator: false,
             source_span: None,
             source: None,
+            tier: Default::default(),
         };
         assert!(
             lower_nbvm(&proto).is_none(),
@@ -6233,6 +6234,7 @@ mod tests {
             is_generator: false,
             source_span: None,
             source: None,
+            tier: Default::default(),
         };
         assert!(lower_nbvm(&ok).is_some(), "written-then-read should lower");
     }
@@ -6264,6 +6266,7 @@ mod tests {
             is_generator: false,
             source_span: None,
             source: None,
+            tier: Default::default(),
         };
         let bjit = JitProto::compile(&b).expect("compile B");
         let b_ptr = bjit.code_ptr();
@@ -6295,6 +6298,7 @@ mod tests {
             is_generator: false,
             source_span: None,
             source: None,
+            tier: Default::default(),
         };
         // Without the registry the call can't lower; with it, it does.
         assert!(lower_nbvm(&a).is_none(), "unregistered call must bail");

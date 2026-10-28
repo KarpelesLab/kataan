@@ -340,6 +340,11 @@ pub struct Realm {
     pub vm_args_buf: Vec<NanBox>,
     /// See [`Self::vm_args_buf`].
     pub vm_callee_args: Vec<usize>,
+    /// Spare bytecode-VM register windows, reused across activations — and
+    /// across the nested VM runs of host callbacks, which is why they live
+    /// here rather than in a run's context. Each is empty while pooled, so
+    /// the pool holds no roots.
+    pub vm_reg_pool: Vec<Vec<NanBox>>,
     /// Allocation-pressure trigger: the number of objects that may be allocated
     /// after the last collection before [`maybe_collect`](Realm::maybe_collect)
     /// runs another one. Re-armed after every cycle to
@@ -566,6 +571,7 @@ impl Realm {
             vm_callee_stack: Vec::new(),
             vm_args_buf: Vec::new(),
             vm_callee_args: Vec::new(),
+            vm_reg_pool: Vec::new(),
             heap,
             root_shape: Shape::root(),
             atoms: AtomTable::new(),

@@ -1008,6 +1008,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<Vec<FnProto>, DecodeError> {
             is_generator: false,
             source_span: None,
             source: None,
+            tier: Default::default(),
         });
     }
     Ok(protos)
@@ -2770,6 +2771,7 @@ mod tests {
             is_generator: false,
             source_span: None,
             source: None,
+            tier: Default::default(),
         };
         let bytes = serialize(&[proto]);
 

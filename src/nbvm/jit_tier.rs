@@ -12,8 +12,8 @@
 //! its header with nothing to reconstruct.
 
 use super::{
-    Ctx, FnProto, FrameExit, Handle, NanBox, Op, Reg, VmError, ensure_jit, run_frame,
-    vm_agent_tick, vm_error, vm_load_global, vm_safepoint,
+    Ctx, FnProto, FrameExit, Handle, NanBox, Op, Reg, VmError, jit_for, run_frame, vm_agent_tick,
+    vm_error, vm_load_global, vm_safepoint,
 };
 use alloc::rc::Rc;
 
@@ -140,8 +140,7 @@ pub(super) fn enter_on_call(
     if proto.is_async || proto.is_generator {
         return None;
     }
-    let mut stack = alloc::collections::BTreeSet::new();
-    let jit = ensure_jit(&mut ctx.jit_cache, funcs, id, &mut stack)?;
+    let jit = jit_for(funcs, id)?;
     if jit.is_generic() {
         return match run_compiled(ctx, funcs, &jit, regs, 0, &[])? {
             Ok(FrameExit::Return(v)) => Some(Ok(v.unwrap_or(NanBox::undefined()))),
@@ -154,7 +153,10 @@ pub(super) fn enter_on_call(
     if proto.rest_from.is_some() || proto.n_captures != 0 {
         return None;
     }
-    jit.call_guarded(args).map(Ok)
+    // Arguments past the parameters are unobservable to such a body (it has
+    // no `arguments` object), so a callback a built-in passes `(value, index,
+    // array)` still runs compiled.
+    jit.call_guarded(args.get(..proto.n_params)?).map(Ok)
 }
 
 /// On-stack replacement from a hot interpreted loop: `program` is the running
@@ -180,19 +182,17 @@ pub(super) fn osr(
         .iter()
         .position(|f| core::ptr::eq(f.ops.as_ptr(), ptr) && f.ops.len() == program.len())
         .or_else(|| {
-            ctx.tiers.iter().enumerate().find_map(|(id, t)| {
-                t.body
-                    .as_ref()
-                    .filter(|b| core::ptr::eq(b.as_ptr(), ptr) && b.len() == program.len())
-                    .map(|_| id)
+            funcs.iter().position(|f| {
+                f.tier
+                    .body()
+                    .is_some_and(|b| core::ptr::eq(b.as_ptr(), ptr) && b.len() == program.len())
             })
         })?;
     let proto = funcs.get(id)?;
     if proto.is_generator || proto.ops.len() != program.len() {
         return None;
     }
-    let mut stack = alloc::collections::BTreeSet::new();
-    let jit: Rc<crate::jit::JitProto> = ensure_jit(&mut ctx.jit_cache, funcs, id, &mut stack)?;
+    let jit: Rc<crate::jit::JitProto> = jit_for(funcs, id)?;
     if !jit.has_entry(target) {
         return None;
     }
@@ -355,7 +355,7 @@ pub(crate) extern "C" fn jit_helper_exec_op(
     }
     // A property op keeps its inline cache across executions, in a table
     // keyed by the op's address: the op lives in bytecode the `JitProto` owns,
-    // which `ctx.jit_cache` keeps alive for the whole `Ctx`, so the address
+    // which the function's tier slot keeps alive for longer than the `Ctx`, so the address
     // names this one site for as long as the table exists. (A fresh cache per
     // execution would miss, and re-arm, every single time.)
     let cached = matches!(
@@ -432,7 +432,7 @@ fn call_compiled(
     let jit = match ctx.jit_rt.direct.get(id) {
         Some(Some(j)) => Rc::clone(j),
         _ => {
-            let j = direct_target(ctx, proto, id)?;
+            let j = direct_target(proto)?;
             if ctx.jit_rt.direct.len() <= id {
                 ctx.jit_rt.direct.resize(id + 1, None);
             }
@@ -448,7 +448,7 @@ fn call_compiled(
         return Some(Err(VmError::Thrown(e)));
     }
     // The callee's register file: parameters, captures, `this` (undefined).
-    let mut cregs: alloc::vec::Vec<NanBox> = ctx.reg_pool.pop().unwrap_or_default();
+    let mut cregs: alloc::vec::Vec<NanBox> = ctx.realm.vm_reg_pool.pop().unwrap_or_default();
     cregs.resize(proto.n_regs, NanBox::undefined());
     for (slot, a) in cregs.iter_mut().zip(args.iter().take(proto.n_params)) {
         *slot = regs[*a as usize];
@@ -485,9 +485,7 @@ fn call_compiled(
         }
         ctx.frame_shadow.push(this);
     }
-    if let Some(t) = ctx.tiers.get_mut(id) {
-        t.calls = t.calls.saturating_add(1);
-    }
+    proto.tier.bump();
     let outcome = run_compiled(ctx, funcs, &jit, &mut cregs, 0, &[]);
     ctx.realm.vm_callee_stack.truncate(callee_mark);
     ctx.realm.vm_callee_args.truncate(callee_mark);
@@ -496,9 +494,9 @@ fn call_compiled(
     ctx.frame_shadow.truncate(mark);
     ctx.call_depth -= 1;
     ctx.realm.vm_total_depth -= 1;
-    if ctx.reg_pool.len() < 64 {
+    if ctx.realm.vm_reg_pool.len() < 64 {
         cregs.clear();
-        ctx.reg_pool.push(cregs);
+        ctx.realm.vm_reg_pool.push(cregs);
     }
     Some(match outcome? {
         Ok(FrameExit::Return(v)) => Ok(v.unwrap_or(NanBox::undefined())),
@@ -573,11 +571,11 @@ pub(crate) extern "C" fn jit_helper_call_method(
     jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
 }
 
-/// Whether function `id` (`proto`) may be entered by [`call_compiled`]: a plain
+/// Whether the function `proto` may be entered by [`call_compiled`]: a plain
 /// VM closure body (not a class constructor, async, generator, rest-parameter,
 /// `arguments` or `new.target` one) that is hot and already compiled to the
 /// generic tier — its compiled body, if so.
-fn direct_target(ctx: &Ctx, proto: &FnProto, id: usize) -> Option<Rc<crate::jit::JitProto>> {
+fn direct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
     if proto.class_ctor
         || proto.is_async
         || proto.is_generator
@@ -587,12 +585,12 @@ fn direct_target(ctx: &Ctx, proto: &FnProto, id: usize) -> Option<Rc<crate::jit:
             .iter()
             .take(2)
             .any(|o| matches!(o, Op::MakeArguments { .. } | Op::LoadNewTarget { .. }))
-        || !call_is_hot(ctx.tiers.get(id).is_some_and(|t| t.body.is_some()))
+        || !call_is_hot(proto.tier.has_body())
     {
         return None;
     }
-    match ctx.jit_cache.get(&id) {
-        Some(Some(j)) if j.is_generic() && j.n_regs() <= proto.n_regs => Some(Rc::clone(j)),
+    match proto.tier.jit() {
+        Some(Some(j)) if j.is_generic() && j.n_regs() <= proto.n_regs => Some(j),
         _ => None,
     }
 }

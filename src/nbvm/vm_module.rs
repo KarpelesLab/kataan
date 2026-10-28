@@ -166,6 +166,7 @@ pub fn compile_module_into(
         is_generator: false,
         source_span: None,
         source: None,
+        tier: Default::default(),
     };
     protos
         .borrow_mut()

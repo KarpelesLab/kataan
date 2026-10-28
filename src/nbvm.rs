@@ -865,6 +865,10 @@ pub struct FnProto {
     /// The function's source text, for `Function.prototype.toString`
     /// (ECMA-262 20.2.3.5). Not part of the portable artifact.
     pub source: Option<alloc::rc::Rc<str>>,
+    /// The VM's run-time tier state for this function (activation count,
+    /// optimized body, inline caches, native code). Not part of the portable
+    /// artifact; build it with `Default::default()`.
+    pub tier: TierSlot,
 }
 
 /// A queued promise reaction: run `handler(value)` then settle `result` with
@@ -1435,9 +1439,6 @@ fn hosted_ctx_in<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
         host: Some(host),
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
-        tiers: Vec::new(),
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_cache: alloc::collections::BTreeMap::new(),
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_pending: None,
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -1456,7 +1457,6 @@ fn hosted_ctx_in<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
         top_frame_roots: Vec::new(),
         pending_callee: None,
         pending_new_target: None,
-        reg_pool: Vec::new(),
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         exec_op_ic: Vec::new(),
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -3729,12 +3729,6 @@ struct Ctx<'a> {
     host: Option<&'a mut dyn VmHost>,
     output: String,
     microtasks: alloc::collections::VecDeque<Microtask>,
-    /// Per-function tiering state, keyed by function id.
-    tiers: Vec<TierState>,
-    /// Per-function native-code cache (Phase G JIT), keyed by function id.
-    /// `None` means "tried, not JIT-eligible". Present only where the JIT exists.
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-    jit_cache: alloc::collections::BTreeMap<usize, Option<alloc::rc::Rc<crate::jit::JitProto>>>,
     /// An in-flight thrown value stashed by a generic-JIT runtime helper (see
     /// [`jit_helper_add`]). The helper returns the reserved throw sentinel and
     /// leaves the value here; [`call_generic`] takes it back out as
@@ -3818,10 +3812,6 @@ struct Ctx<'a> {
     /// The `new.target` of the next `call_with` activation when it is a
     /// `[[Construct]]` (`None` for an ordinary call). Taken on entry.
     pending_new_target: Option<NanBox>,
-    /// Spare register windows, reused by [`call_with_inner`] so an ordinary
-    /// call does not allocate one. Each is empty while pooled (`clear`ed on
-    /// return), so a pooled window holds no stale values and no roots.
-    reg_pool: Vec<Vec<NanBox>>,
     /// Inline caches of the property ops the generic JIT tier runs one at a
     /// time through the interpreter (`jit_tier::jit_helper_exec_op`), keyed by
     /// the op's address, plus a scratch one-entry cache vector for that call.
@@ -3838,25 +3828,88 @@ struct Ctx<'a> {
 // live in `crate::limits::Limits` and are read live from `ctx.realm.limits`, so
 // an embedder can tune them per realm.
 
-/// Tier state for one function (indexed by function id in [`Ctx::tiers`]): its
-/// activation count, once hot its optimized bytecode body, and the inline
-/// caches of the body it last ran.
+/// Tier state for one function: its activation count, once hot its optimized
+/// bytecode body and (with the JIT) its native code, and the inline caches of
+/// the body it last ran. It lives in the function's own [`FnProto`] (see
+/// [`TierSlot`]), so it outlasts the VM context that warmed it: a callback a
+/// built-in invokes runs in a fresh context per call, and finds its caches,
+/// its tier-up count and its optimized body where the last call left them.
 ///
 /// The caches persist across activations, so a property site in a function
-/// called many times (a method, a constructor) stays warm instead of starting
-/// cold on every call. Soundness: a [`PropertyCache`] entry is a pure
-/// `(shape, key) → slot` memo for the site's key, and a site is identified by
-/// `(function id, pc)` in the body whose address is `ic_body`. Within one `Ctx`
-/// a function id always names the same function (every function table of a
-/// host is a prefix of the next, the same invariant `body` relies on), and the
-/// caches are discarded whenever the body that runs is a different one (the
-/// switch to the optimized body), so a site never reads another site's entry.
+/// called many times (a method, a constructor, a `map` callback) stays warm
+/// instead of starting cold on every call. Soundness: a [`PropertyCache`]
+/// entry is a pure `(shape, key) → slot` memo for the site's key (shapes are
+/// compared by `Rc` identity, which the cache keeps alive), and a site is
+/// identified by its pc in the body whose address is `ic_body`. The state is
+/// attached to the one proto it describes, never looked up by a function id,
+/// so it cannot be confused across function tables; the caches are discarded
+/// whenever the body that runs is a different one (the switch to the
+/// optimized body), so a site never reads another site's entry.
 #[derive(Default)]
 struct TierState {
     calls: u32,
     body: Option<alloc::rc::Rc<Vec<Op>>>,
     ic: Vec<PropertyCache>,
     ic_body: usize,
+    /// The function's native code: `None` until compilation was tried, then
+    /// the compiled code or `None` (not eligible). Compiled code may call the
+    /// code of the functions it statically calls by address; those live in
+    /// the same table, which outlives any activation running from it.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    jit: Option<Option<alloc::rc::Rc<crate::jit::JitProto>>>,
+}
+
+/// A function's persistent tier state (its activation count, optimized body,
+/// inline caches and native code), private to the VM. Cloning a [`FnProto`] gives the copy a fresh, cold slot: a copy may be
+/// edited before it runs, so it must not inherit the original's optimized body.
+#[derive(Default)]
+pub struct TierSlot(core::cell::RefCell<TierState>);
+
+impl Clone for TierSlot {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl core::fmt::Debug for TierSlot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("TierSlot")
+    }
+}
+
+impl TierSlot {
+    /// Whether the function tiered up (has an optimized body).
+    fn has_body(&self) -> bool {
+        self.0.try_borrow().is_ok_and(|t| t.body.is_some())
+    }
+
+    /// Counts an activation that bypassed `call_with_inner` (a compiled call
+    /// entering a compiled callee directly).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    fn bump(&self) {
+        if let Ok(mut t) = self.0.try_borrow_mut() {
+            t.calls = t.calls.saturating_add(1);
+        }
+    }
+
+    /// The optimized body, if the function tiered up.
+    fn body(&self) -> Option<alloc::rc::Rc<Vec<Op>>> {
+        self.0.try_borrow().ok().and_then(|t| t.body.clone())
+    }
+
+    /// The cached native-code compilation outcome, if one was attempted.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    fn jit(&self) -> Option<Option<alloc::rc::Rc<crate::jit::JitProto>>> {
+        self.0.try_borrow().ok().and_then(|t| t.jit.clone())
+    }
+
+    /// Records the native-code compilation outcome.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    fn set_jit(&self, j: Option<alloc::rc::Rc<crate::jit::JitProto>>) {
+        if let Ok(mut t) = self.0.try_borrow_mut() {
+            t.jit = Some(j);
+        }
+    }
 }
 
 /// Runs `f` with `realm` moved into the box a VM context owns, moving it back
@@ -3886,9 +3939,6 @@ pub fn run_program(
             host: None,
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
-            tiers: Vec::new(),
-            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-            jit_cache: alloc::collections::BTreeMap::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -3907,7 +3957,6 @@ pub fn run_program(
             top_frame_roots: Vec::new(),
             pending_callee: None,
             pending_new_target: None,
-            reg_pool: Vec::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             exec_op_ic: Vec::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -3938,9 +3987,6 @@ pub fn run_program_capturing(
             host: None,
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
-            tiers: Vec::new(),
-            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-            jit_cache: alloc::collections::BTreeMap::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -3959,7 +4005,6 @@ pub fn run_program_capturing(
             top_frame_roots: Vec::new(),
             pending_callee: None,
             pending_new_target: None,
-            reg_pool: Vec::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             exec_op_ic: Vec::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -4157,7 +4202,7 @@ fn call_with_inner(
             );
             return Err(VmError::Thrown(e));
         }
-        let mut regs: Vec<NanBox> = ctx.reg_pool.pop().unwrap_or_default();
+        let mut regs: Vec<NanBox> = ctx.realm.vm_reg_pool.pop().unwrap_or_default();
         regs.resize(proto.n_regs, NanBox::undefined());
         match proto.rest_from {
             // A rest parameter: fixed args fill `0..fixed`, the remainder becomes an
@@ -4250,21 +4295,22 @@ fn call_with_inner(
         // The persistent inline caches are taken out for this activation (a
         // recursive activation of the same function finds none and warms its
         // own) and put back when it returns.
-        let (optimized, mut ic, ic_body): (Option<alloc::rc::Rc<Vec<Op>>>, _, _) = {
-            if ctx.tiers.len() <= id {
-                ctx.tiers.resize_with(id + 1, TierState::default);
-            }
-            let entry = &mut ctx.tiers[id];
-            entry.calls = entry.calls.saturating_add(1);
-            if entry.calls == TIER_UP_THRESHOLD && entry.body.is_none() {
-                entry.body = Some(alloc::rc::Rc::new(optimize_ops(&funcs[id].ops)));
-            }
-            (
-                entry.body.clone(),
-                core::mem::take(&mut entry.ic),
-                entry.ic_body,
-            )
-        };
+        let (optimized, mut ic, ic_body): (Option<alloc::rc::Rc<Vec<Op>>>, _, _) =
+            match proto.tier.0.try_borrow_mut() {
+                Ok(mut entry) => {
+                    entry.calls = entry.calls.saturating_add(1);
+                    if entry.calls == TIER_UP_THRESHOLD && entry.body.is_none() {
+                        entry.body = Some(alloc::rc::Rc::new(optimize_ops(&proto.ops)));
+                    }
+                    (
+                        entry.body.clone(),
+                        core::mem::take(&mut entry.ic),
+                        entry.ic_body,
+                    )
+                }
+                // Never held across a call, so this cannot happen; run cold.
+                Err(_) => (None, Vec::new(), 0),
+            };
         let body: &[Op] = match &optimized {
             Some(o) => o.as_slice(),
             None => proto.ops.as_slice(),
@@ -4280,6 +4326,16 @@ fn call_with_inner(
         if jit_tier::call_is_hot(optimized.is_some())
             && let Some(outcome) = jit_tier::enter_on_call(ctx, funcs, id, &args, &mut regs)
         {
+            // The interpreter's caches were not used: hand them back intact,
+            // and the window back to the pool.
+            if let Ok(mut entry) = proto.tier.0.try_borrow_mut() {
+                entry.ic = ic;
+                entry.ic_body = ic_body;
+            }
+            if ctx.realm.vm_reg_pool.len() < 64 {
+                regs.clear();
+                ctx.realm.vm_reg_pool.push(regs);
+            }
             return outcome;
         }
         // An `async` function: its synchronous body runs to completion, and its
@@ -4321,15 +4377,15 @@ fn call_with_inner(
             return Ok(NanBox::handle(p.to_raw()));
         }
         let exit = run_frame_at_ic(ctx, funcs, body, &mut regs, 0, Vec::new(), None, &mut ic);
-        if let Some(entry) = ctx.tiers.get_mut(id) {
+        if let Ok(mut entry) = proto.tier.0.try_borrow_mut() {
             entry.ic = ic;
             entry.ic_body = body.as_ptr() as usize;
         }
         // A finished activation's window goes back to the pool (a suspended
         // generator keeps its own, below).
-        if !matches!(exit, Ok(FrameExit::Yield { .. })) && ctx.reg_pool.len() < 64 {
+        if !matches!(exit, Ok(FrameExit::Yield { .. })) && ctx.realm.vm_reg_pool.len() < 64 {
             regs.clear();
-            ctx.reg_pool.push(core::mem::take(&mut regs));
+            ctx.realm.vm_reg_pool.push(core::mem::take(&mut regs));
         }
         match exit? {
             FrameExit::Return(v) => return Ok(v.unwrap_or(NanBox::undefined())),
@@ -4363,6 +4419,18 @@ fn call_with_inner(
     }
 }
 
+/// Function `id`'s native code (`None` if it is not JIT-eligible), compiled on
+/// first use and kept in the function's [`TierSlot`] thereafter.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn jit_for(funcs: &[FnProto], id: usize) -> Option<alloc::rc::Rc<crate::jit::JitProto>> {
+    if let Some(c) = funcs.get(id)?.tier.jit() {
+        return c;
+    }
+    let mut cache = alloc::collections::BTreeMap::new();
+    let mut stack = alloc::collections::BTreeSet::new();
+    ensure_jit(&mut cache, funcs, id, &mut stack)
+}
+
 /// Compiles function `id` to native code (memoized in `cache`), first compiling
 /// any function it statically calls so their code addresses can be wired into a
 /// native call. Returns the compiled function, or `None` if it isn't JIT-eligible.
@@ -4377,6 +4445,11 @@ fn ensure_jit(
     id: usize,
     stack: &mut alloc::collections::BTreeSet<usize>,
 ) -> Option<alloc::rc::Rc<crate::jit::JitProto>> {
+    // Compiled already, maybe by an earlier context (a callback's previous
+    // call); the function's own slot is the cache of record.
+    if let Some(c) = funcs.get(id).and_then(|f| f.tier.jit()) {
+        return c;
+    }
     if let Some(c) = cache.get(&id) {
         return c.clone();
     }
@@ -4418,6 +4491,7 @@ fn ensure_jit(
         };
         jit_tier::jit_log(id, &funcs[id], &what);
     }
+    funcs[id].tier.set_jit(compiled.clone());
     cache.insert(id, compiled.clone());
     compiled
 }
@@ -4481,9 +4555,6 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
             host: None,
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
-            tiers: Vec::new(),
-            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-            jit_cache: alloc::collections::BTreeMap::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -4504,7 +4575,6 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
             top_frame_roots: Vec::new(),
             pending_callee: None,
             pending_new_target: None,
-            reg_pool: Vec::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             exec_op_ic: Vec::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -6365,8 +6435,8 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
             push(&mut roots, *value);
         }
     }
-    for t in &ctx.tiers {
-        for op in t.body.iter().flat_map(|b| b.iter()) {
+    for body in funcs.iter().filter_map(|f| f.tier.body()) {
+        for op in body.iter() {
             if let Op::LoadConst { value, .. } = op {
                 push(&mut roots, *value);
             }
@@ -11572,6 +11642,7 @@ pub fn compile_program_into(
         is_generator: false,
         source_span: None,
         source: None,
+        tier: Default::default(),
     };
     // Reserve slots: main (0), top-level functions (1..=N), then class members
     // (N+1..next_id). Nested function expressions append beyond `next_id`.
@@ -14044,6 +14115,7 @@ impl Compiler {
             is_generator,
             source_span: None,
             source: None,
+            tier: Default::default(),
         })
     }
 }
@@ -14420,6 +14492,7 @@ impl Compiler {
             is_generator,
             source_span: None,
             source: None,
+            tier: Default::default(),
         })
     }
 
@@ -19353,6 +19426,7 @@ impl Compiler {
                 is_generator: false,
                 source_span: None,
                 source: None,
+                tier: Default::default(),
             });
             (p.len() - 1) as u32
         };
@@ -24500,8 +24574,6 @@ mod generic_jit_tests {
             host: None,
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
-            tiers: Vec::new(),
-            jit_cache: alloc::collections::BTreeMap::new(),
             jit_pending: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending_fault: None,
@@ -24516,7 +24588,6 @@ mod generic_jit_tests {
             top_frame_roots: Vec::new(),
             pending_callee: None,
             pending_new_target: None,
-            reg_pool: Vec::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             exec_op_ic: Vec::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -24550,6 +24621,7 @@ mod generic_jit_tests {
             is_generator: false,
             source_span: None,
             source: None,
+            tier: Default::default(),
         });
         (funcs, f_id)
     }
@@ -24746,6 +24818,7 @@ mod generic_jit_tests {
             is_generator: false,
             source_span: None,
             source: None,
+            tier: Default::default(),
         });
         id
     }

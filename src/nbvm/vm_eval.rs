@@ -219,6 +219,7 @@ fn finish_eval_proto(mut c: Compiler, n_captures: usize) -> FnProto {
         is_generator: false,
         source_span: None,
         source: None,
+        tier: Default::default(),
     }
 }
 
