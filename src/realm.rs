@@ -1420,6 +1420,26 @@ impl Realm {
         self.new_string_wtf8(crate::wtf8::from_utf16(&[unit]))
     }
 
+    /// A string holding the UTF-16 code units `units`: one unit is the
+    /// interned [`unit_string`](Self::unit_string); a short all-ASCII run is
+    /// copied straight into an inline node; anything else is re-encoded to
+    /// WTF-8 (pairing surrogates, keeping lone ones).
+    pub fn new_string_units(&mut self, units: &[u16]) -> Handle {
+        if let [u] = *units {
+            return self.unit_string(u);
+        }
+        if units.len() <= crate::rope::SMALL_CAP && units.iter().all(|&u| u < 0x80) {
+            let mut buf = [0u8; crate::rope::SMALL_CAP];
+            for (b, &u) in buf.iter_mut().zip(units) {
+                *b = u as u8;
+            }
+            return self
+                .heap
+                .alloc(Cell::Str(Rope::from_bytes(&buf[..units.len()])));
+        }
+        self.new_string_wtf8(crate::wtf8::from_utf16(units))
+    }
+
     /// Allocates a string value sharing `rope` (an `Rc` bump, no copy).
     pub fn new_string_from_rope(&mut self, rope: Rope) -> Handle {
         self.heap.alloc(Cell::Str(rope))

@@ -5125,6 +5125,12 @@ impl Interp {
         self.realm.mark_hidden(global, "globalThis");
         self.current.declare("globalThis", gbox);
         self.global_this = gbox;
+        // `%ArrayIteratorPrototype%` up front, not on the first array
+        // iteration: the bytecode VM's by-index `for-of` needs its `next`
+        // to recognize an array iterator, so a program's first loop over an
+        // array (often its longest) otherwise ran the generic protocol, with
+        // a result object per step, to the end.
+        self.builtin_iterator_proto("Array Iterator");
     }
 
     /// The global object (`globalThis`) handle, if the realm is initialized.

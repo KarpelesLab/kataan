@@ -28,7 +28,7 @@ impl Interp {
             .groups
             .iter()
             .map(|g| match g {
-                Some((s, e)) => self.new_str_bytes(u16_slice(units, *s, *e)),
+                Some((s, e)) => self.units_str(units, *s, *e),
                 None => NanBox::undefined(),
             })
             .collect();
@@ -81,6 +81,33 @@ impl Interp {
         NanBox::handle(obj.to_raw())
     }
 
+    /// The string of code units `units[st..en]` (clamped to the subject).
+    pub(crate) fn units_str(&mut self, units: &[u16], st: usize, en: usize) -> NanBox {
+        let st = st.min(units.len());
+        let en = en.min(units.len()).max(st);
+        NanBox::handle(self.realm.new_string_units(&units[st..en]).to_raw())
+    }
+
+    /// Appends `ToString(v)`'s WTF-8 bytes to `out` (joining a surrogate pair
+    /// split across the boundary): a string's own bytes, borrowed, else the
+    /// full `ToString`.
+    pub(crate) fn append_to_string_bytes(
+        &mut self,
+        out: &mut Vec<u8>,
+        v: NanBox,
+    ) -> Result<(), ExecError> {
+        if let Some(bytes) = v
+            .as_handle()
+            .and_then(|raw| self.realm.string_leaf_bytes(Handle::from_raw(raw)))
+        {
+            crate::wtf8::append(out, bytes);
+            return Ok(());
+        }
+        let bytes = self.coerce_to_string_bytes(v)?;
+        crate::wtf8::append(out, &bytes);
+        Ok(())
+    }
+
     /// The match result's `groups`: `undefined` without named groups, else a
     /// null-prototype object mapping each name to its capture.
     #[cfg(feature = "regex")]
@@ -102,7 +129,7 @@ impl Interp {
         let g = self.realm.new_object_with_proto(None);
         for (idx, name) in group_names {
             let v = match caps.groups.get(*idx).and_then(|x| *x) {
-                Some((s, e)) => self.new_str_bytes(u16_slice(units, s, e)),
+                Some((s, e)) => self.units_str(units, s, e),
                 None => NanBox::undefined(),
             };
             if !v.is_undefined() || self.realm.get_property(g, name).is_none() {
@@ -1462,7 +1489,7 @@ impl Interp {
                 continue;
             }
             // Push S[p..q].
-            parts.push(self.new_str_bytes(u16_slice(units, p, q)));
+            parts.push(self.units_str(units, p, q));
             if parts.len() == lim {
                 return Ok(NanBox::handle(self.realm.new_array(parts).to_raw()));
             }
@@ -1554,14 +1581,14 @@ impl Interp {
                 last = Some(c);
                 continue;
             }
-            parts.push(self.new_str_bytes(u16_slice(units, p, at)));
+            parts.push(self.units_str(units, p, at));
             if parts.len() == lim {
                 self.update_legacy_regexp(units_rc, &c);
                 return Ok(Some(parts));
             }
             for g in 1..c.groups.len() {
                 parts.push(match c.group(g) {
-                    Some((a, b)) => self.new_str_bytes(u16_slice(units, a, b)),
+                    Some((a, b)) => self.units_str(units, a, b),
                     None => NanBox::undefined(),
                 });
                 if parts.len() == lim {
@@ -1706,6 +1733,42 @@ impl Interp {
             let result = match result {
                 ExecOutcome::Null => continue,
                 ExecOutcome::Object(r) => r,
+                #[cfg(feature = "regex")]
+                ExecOutcome::Match(m) if func_replace => {
+                    // `replace(matched, ...captures, position, S, groups?)`, its
+                    // arguments made straight from the match's code units and
+                    // its result appended without an intermediate copy.
+                    let (pos, end) = m.caps.whole();
+                    let pos = pos.min(length);
+                    let mut call_args: Vec<NanBox> = Vec::with_capacity(m.caps.groups.len() + 3);
+                    for g in &m.caps.groups {
+                        call_args.push(match *g {
+                            Some((a, b)) => self.units_str(&m.units, a, b),
+                            None => NanBox::undefined(),
+                        });
+                    }
+                    call_args.push(NanBox::number(pos as f64));
+                    call_args.push(str_v);
+                    let named = self.regex_groups_object(&m.units, &m.caps, m.re.group_names());
+                    if !named.is_undefined() {
+                        call_args.push(named);
+                    }
+                    let r = self.call(replace, &call_args)?;
+                    // `ToString(replValue)` runs for every result; only a match at
+                    // or past the next source position is spliced in.
+                    if pos >= next_source_position {
+                        append_units(&mut accumulated, &units[next_source_position..pos]);
+                        self.append_to_string_bytes(&mut accumulated, r)?;
+                        next_source_position = pos + (end - m.caps.whole().0);
+                        if accumulated.len() > crate::rope::MAX_STRING_LEN {
+                            let m = self.new_str("Invalid string length");
+                            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                        }
+                    } else {
+                        self.coerce_to_string_bytes(r)?;
+                    }
+                    continue;
+                }
                 #[cfg(feature = "regex")]
                 ExecOutcome::Match(m) => {
                     // The result array's own properties, read straight from the
@@ -2068,4 +2131,16 @@ pub(crate) enum ExecOutcome {
     Object(NanBox),
     #[cfg(feature = "regex")]
     Match(RegexMatch),
+}
+
+/// Appends the code units `units` to the WTF-8 buffer `out` (an ASCII run
+/// byte for byte, anything else re-encoded, pairing surrogates across the
+/// boundary).
+#[cfg(feature = "regex")]
+fn append_units(out: &mut Vec<u8>, units: &[u16]) {
+    if units.iter().all(|&u| u < 0x80) {
+        out.extend(units.iter().map(|&u| u as u8));
+    } else {
+        crate::wtf8::append(out, &crate::wtf8::from_utf16(units));
+    }
 }

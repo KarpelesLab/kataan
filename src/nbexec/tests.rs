@@ -13188,3 +13188,41 @@ fn template_literals_concat_in_one_step() {
         "aO1b2cO3,t1 f2 t3,0|1e+21|0.1|NaN|true|null|undefined|10,2,2,true,601,5,string,0"
     );
 }
+
+#[test]
+fn regexp_function_replace_builds_arguments_from_the_match() {
+    // A function replacement gets `(matched, ...captures, position, S,
+    // groups?)`; its result is `ToString`ed once per match, in order, even
+    // for a match that is not spliced in, and a surrogate pair split between
+    // the source and a replacement joins up.
+    let src = r#"
+        var log = [];
+        var r = "a1b22".replace(/(?<d>\d)(\d)?/g, function (m, c1, c2, p, s, g) {
+            log.push([m, c1, String(c2), p, s.length, g.d].join(":"));
+            return { toString: function () { log.push("ts" + p); return "<" + m + ">"; } };
+        });
+        var u = "X\uDE00".replace(/X/, function () { return "\uD83D"; });
+        [r, log.join(" "), u.length, u.codePointAt(0).toString(16)].join(",")
+    "#;
+    assert_eq!(
+        run(src),
+        "a<1>b<22>,1:1:undefined:1:5:1 ts1 22:2:2:3:5:2 ts3,2,1f600"
+    );
+}
+
+#[test]
+fn first_array_for_of_takes_the_by_index_path_and_honors_patches() {
+    // `%ArrayIteratorPrototype%` exists before the first array iteration, so
+    // a patched `next` installed up front is still called on every step.
+    let src = r#"
+        var AIP = Object.getPrototypeOf([][Symbol.iterator]());
+        var orig = AIP.next, n = 0;
+        AIP.next = function () { n++; return orig.call(this); };
+        var s = 0;
+        for (var x of [1, 2, 3]) s += x;
+        AIP.next = orig;
+        for (var y of [4]) s += y;
+        [s, n, AIP[Symbol.toStringTag]].join(",")
+    "#;
+    assert_eq!(run(src), "10,4,Array Iterator");
+}

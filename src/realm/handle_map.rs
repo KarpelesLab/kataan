@@ -1,37 +1,38 @@
 //! A handle-keyed side table with an O(1) negative lookup.
 //!
-//! Several [`Realm`](super::Realm) side tables are `BTreeMap`s keyed by a raw
-//! handle (`generation << 32 | index`). Most lookups are *misses* — "does this
-//! array have named properties?" is asked on every built-in dispatch, and the
-//! answer is almost always no — and a miss in a map holding an entry for every
-//! built-in function walks several B-tree nodes. [`HandleKeyedMap`] keeps a
-//! bitset over slot indices beside the map: a clear bit is a definite miss, a
-//! set bit falls through to the map.
+//! Several [`Realm`](super::Realm) side tables are keyed by a raw handle
+//! (`generation << 32 | index`). Most lookups are *misses* — "does this array
+//! have named properties?" is asked on every built-in dispatch, and the answer
+//! is almost always no. [`HandleKeyedMap`] keeps a bitset over slot indices: a
+//! clear bit is a definite miss, a set bit falls through to the table.
 //!
 //! The bitset is *conservative*: a bit is set on every insert and never cleared
 //! by `remove`/`retain` (another generation of the same slot may still be
-//! present, and a stale bit only costs the map lookup it would have done
-//! anyway). It is rebuilt whenever the whole key set is replaced.
+//! present, and a stale bit only costs the probe it would have done anyway).
+//! It is rebuilt whenever the whole key set is replaced.
 //!
-//! A *hit* is answered by an open-addressed hash index over the same entries
-//! (linear probing, kept at most half full, backward-shift deletion), so a
-//! present key costs a multiply and a probe or two instead of a descent
-//! through the B-tree. The tree stays the source of truth for ordered
-//! iteration (`Deref`).
+//! The entries live in an open-addressed hash table (linear probing, kept at
+//! most half full, backward-shift deletion), so a hit or an insert costs a
+//! multiply and a probe or two. The table is the only store: iteration
+//! (`iter`, `values`, `into_iter`) visits the entries in table order, which
+//! is unspecified. Every caller iterates only to collect or mark (the GC's
+//! roots and ephemeron passes, a compaction's forwarding), where order does
+//! not matter. (An ordered `BTreeMap` copy used to be kept for that, and its
+//! insert was most of the cost of creating an array's or a RegExp's side
+//! object.)
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-/// A `BTreeMap<u64, V>` keyed by raw handles, plus a slot-index bitset that
-/// answers most misses without searching the tree. Reads that are not
-/// point lookups (`iter`, `values`, `len`, …) go through `Deref`.
+/// A map keyed by raw handles, plus a slot-index bitset that answers most
+/// misses without probing the table.
 pub(crate) struct HandleKeyedMap<V> {
-    map: BTreeMap<u64, V>,
     /// Bit `i` set ⇒ some key with slot index `i` may be present.
     bits: Vec<u64>,
-    /// The hash index: exactly the entries of `map`, open-addressed (a power
-    /// of two in length, at most half full; empty until the first insert).
+    /// The entries, open-addressed (a power of two in length, at most half
+    /// full; empty until the first insert).
     index: Vec<Option<(u64, V)>>,
+    /// How many entries `index` holds.
+    len: usize,
 }
 
 impl<V: Copy> Default for HandleKeyedMap<V> {
@@ -55,9 +56,9 @@ impl<V: Copy> HandleKeyedMap<V> {
     /// An empty map.
     pub(crate) const fn new() -> Self {
         Self {
-            map: BTreeMap::new(),
             bits: Vec::new(),
             index: Vec::new(),
+            len: 0,
         }
     }
 
@@ -78,11 +79,12 @@ impl<V: Copy> HandleKeyedMap<V> {
         }
     }
 
-    /// Puts `(raw, v)` in the index (replacing an entry for `raw`), growing it
-    /// first if that would make it more than half full.
-    fn index_put(&mut self, raw: u64, v: V) {
-        if (self.map.len() + 1) * 2 > self.index.len() {
-            self.rebuild_index((self.map.len() + 1) * 2);
+    /// Puts `(raw, v)` in the table (replacing an entry for `raw`, which it
+    /// returns), growing it first if a new entry would make it more than half
+    /// full.
+    fn index_put(&mut self, raw: u64, v: V) -> Option<V> {
+        if (self.len + 1) * 2 > self.index.len() {
+            self.rebuild_index((self.len + 1) * 2);
         }
         let mask = self.index.len() - 1;
         let mut i = bucket(raw, mask);
@@ -90,11 +92,11 @@ impl<V: Copy> HandleKeyedMap<V> {
             match &mut self.index[i] {
                 slot @ None => {
                     *slot = Some((raw, v));
-                    return;
+                    self.len += 1;
+                    return None;
                 }
                 Some((k, val)) if *k == raw => {
-                    *val = v;
-                    return;
+                    return Some(core::mem::replace(val, v));
                 }
                 Some(_) => i = (i + 1) & mask,
             }
@@ -103,17 +105,16 @@ impl<V: Copy> HandleKeyedMap<V> {
 
     /// Removes `raw` from the index, shifting later entries of its probe run
     /// back so no lookup stops early at the hole.
-    fn index_remove(&mut self, raw: u64) {
-        let Some(mut hole) = self.find(raw) else {
-            return;
-        };
+    fn index_remove(&mut self, raw: u64) -> Option<V> {
+        let mut hole = self.find(raw)?;
         let mask = self.index.len() - 1;
-        self.index[hole] = None;
+        let old = self.index[hole].take().map(|(_, v)| v);
+        self.len -= 1;
         let mut j = hole;
         loop {
             j = (j + 1) & mask;
             let Some((k, _)) = self.index[j] else {
-                return;
+                return old;
             };
             let home = bucket(k, mask);
             // The entry at `j` may fill the hole iff its home bucket is not
@@ -130,16 +131,13 @@ impl<V: Copy> HandleKeyedMap<V> {
         }
     }
 
-    /// Rebuilds the index from `map` with room for at least `min_buckets`.
+    /// Re-places every entry into a table with room for at least
+    /// `min_buckets` (and at least twice the entry count).
     fn rebuild_index(&mut self, min_buckets: usize) {
-        let n = min_buckets
-            .max(self.map.len() * 2)
-            .max(16)
-            .next_power_of_two();
-        self.index.clear();
-        self.index.resize(n, None);
+        let n = min_buckets.max(self.len * 2).max(16).next_power_of_two();
+        let old = core::mem::replace(&mut self.index, alloc::vec![None; n]);
         let mask = n - 1;
-        for (&raw, &v) in &self.map {
+        for (raw, v) in old.into_iter().flatten() {
             let mut i = bucket(raw, mask);
             while self.index[i].is_some() {
                 i = (i + 1) & mask;
@@ -185,8 +183,7 @@ impl<V: Copy> HandleKeyedMap<V> {
     /// Inserts `v` under `raw`, returning the value it replaced.
     pub(crate) fn insert(&mut self, raw: u64, v: V) -> Option<V> {
         self.mark(raw);
-        self.index_put(raw, v);
-        self.map.insert(raw, v)
+        self.index_put(raw, v)
     }
 
     /// Removes and returns the entry for `raw`.
@@ -194,18 +191,38 @@ impl<V: Copy> HandleKeyedMap<V> {
         if !self.may_contain(*raw) {
             return None;
         }
-        let old = self.map.remove(raw);
-        if old.is_some() {
-            self.index_remove(*raw);
-        }
-        old
+        self.index_remove(*raw)
     }
 
     /// Keeps only the entries for which `f` returns `true`.
-    pub(crate) fn retain(&mut self, f: impl FnMut(&u64, &mut V) -> bool) {
-        // `f` may also rewrite values, so the index is rebuilt either way.
-        self.map.retain(f);
+    pub(crate) fn retain(&mut self, mut f: impl FnMut(&u64, &mut V) -> bool) {
+        // Dropping entries breaks probe runs, so the table is rebuilt.
+        for slot in &mut self.index {
+            if let Some((k, v)) = slot
+                && !f(k, v)
+            {
+                *slot = None;
+                self.len -= 1;
+            }
+        }
         self.rebuild_index(0);
+    }
+
+    /// The number of entries.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The entries, in table order.
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&u64, &V)> {
+        self.index.iter().flatten().map(|(k, v)| (k, v))
+    }
+
+    /// The values, in table order.
+    pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
+        self.index.iter().flatten().map(|(_, v)| v)
     }
 
     /// Exchanges whatever entries `a` and `b` hold (either, both or neither).
@@ -221,26 +238,22 @@ impl<V: Copy> HandleKeyedMap<V> {
     }
 }
 
-impl<V> core::ops::Deref for HandleKeyedMap<V> {
-    type Target = BTreeMap<u64, V>;
-    fn deref(&self) -> &Self::Target {
-        &self.map
-    }
-}
-
 impl<V> IntoIterator for HandleKeyedMap<V> {
     type Item = (u64, V);
-    type IntoIter = alloc::collections::btree_map::IntoIter<u64, V>;
+    type IntoIter = core::iter::Flatten<alloc::vec::IntoIter<Option<(u64, V)>>>;
     fn into_iter(self) -> Self::IntoIter {
-        self.map.into_iter()
+        self.index.into_iter().flatten()
     }
 }
 
 impl<'a, V> IntoIterator for &'a HandleKeyedMap<V> {
     type Item = (&'a u64, &'a V);
-    type IntoIter = alloc::collections::btree_map::Iter<'a, u64, V>;
+    type IntoIter = core::iter::Map<
+        core::iter::Flatten<core::slice::Iter<'a, Option<(u64, V)>>>,
+        fn(&'a (u64, V)) -> (&'a u64, &'a V),
+    >;
     fn into_iter(self) -> Self::IntoIter {
-        self.map.iter()
+        self.index.iter().flatten().map(|(k, v)| (k, v))
     }
 }
 
@@ -268,11 +281,12 @@ mod tests {
     }
 
     #[test]
-    fn the_hash_index_tracks_the_tree() {
+    fn the_table_tracks_a_reference_map() {
         // A deterministic mix of inserts, overwrites and removes, checked
-        // against the tree after every step (exercises growth and the
+        // against a reference map after every step (exercises growth and the
         // backward-shift deletion across wrapped probe runs).
         let mut m = HandleKeyedMap::new();
+        let mut r = alloc::collections::BTreeMap::new();
         let mut x: u64 = 0x1234_5678;
         for step in 0..4000u64 {
             x ^= x << 13;
@@ -280,23 +294,26 @@ mod tests {
             x ^= x << 17;
             let raw = ((x >> 40) & 3) << 32 | (x & 511);
             if x.is_multiple_of(3) {
-                m.remove(&raw);
+                assert_eq!(m.remove(&raw), r.remove(&raw));
             } else {
-                m.insert(raw, step);
+                assert_eq!(m.insert(raw, step), r.insert(raw, step));
             }
             if step % 97 == 0 {
-                m.retain(|k, v| {
+                let keep = |k: &u64, v: &mut u64| {
                     *v += 1;
-                    k % 5 != 0
-                });
+                    !k.is_multiple_of(5)
+                };
+                m.retain(keep);
+                r.retain(keep);
             }
             for k in [raw, raw ^ 1, raw.wrapping_add(1 << 32)] {
-                assert_eq!(m.get(&k), m.map.get(&k), "key {k:#x} at step {step}");
-                assert_eq!(m.contains_key(&k), m.map.contains_key(&k));
+                assert_eq!(m.get(&k), r.get(&k), "key {k:#x} at step {step}");
+                assert_eq!(m.contains_key(&k), r.contains_key(&k));
             }
+            assert_eq!(m.len(), r.len());
         }
-        for (k, v) in m.map.clone() {
-            assert_eq!(m.get(&k), Some(&v));
-        }
+        let mut all: alloc::vec::Vec<(u64, u64)> = m.iter().map(|(k, v)| (*k, *v)).collect();
+        all.sort_unstable();
+        assert_eq!(all, r.into_iter().collect::<alloc::vec::Vec<_>>());
     }
 }
