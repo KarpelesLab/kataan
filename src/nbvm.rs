@@ -27021,6 +27021,29 @@ mod generic_jit_tests {
         assert!(!jit.has_entry(header + 1));
         assert!(jit.call_frame_raw(ctx_ptr, &mut regs, header + 1).is_none());
     }
+    /// The unboxed numeric tiers compute comparisons as native `0`/`1`: a body
+    /// whose comparison result is *returned* or used as a number is left to the
+    /// generic tier (which boxes real booleans), while a comparison used only as
+    /// a branch condition keeps the numeric tier.
+    #[test]
+    fn numeric_tiers_refuse_value_booleans() {
+        for src in [
+            "function f(n){ return n % 2 === 0; }",
+            "function f(n){ return !n; }",
+            "function f(n){ return (n < 2) === 1; }",
+            "function f(n){ return (n < 2) + 1; }",
+        ] {
+            let (funcs, f) = compile_named(src, "f");
+            assert!(crate::jit::lower_nbvm(&funcs[f]).is_none(), "{src}");
+            assert!(crate::jit::lower_nbvm_float(&funcs[f]).is_none(), "{src}");
+        }
+        let (funcs, f) = compile_named(
+            "function f(a, b){ if (a !== b && a < b) return a; return b; }",
+            "f",
+        );
+        assert!(crate::jit::lower_nbvm(&funcs[f]).is_some());
+    }
+
     /// `try`/`catch`/`finally` compile: a throw from an interpreter-run op, from
     /// a helper, and from an explicit `throw` unwinds to the innermost compiled
     /// handler, with results bit-identical to the interpreter; an uncaught throw

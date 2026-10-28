@@ -1205,6 +1205,88 @@ pub fn lower_nbvm(proto: &crate::nbvm::FnProto) -> Option<Vec<RegOp>> {
     lower_nbvm_with(proto, &alloc::collections::BTreeMap::new())
 }
 
+/// Whether the unboxed numeric tiers (Int/Float) can represent `proto`'s
+/// booleans. Those tiers compute a comparison (`<`, `===`, `==`, `!`) as a
+/// native `0`/`1`, which is exact only while the result is consumed as a
+/// *condition* (`JumpIfFalse`, `!`) or copied between such registers; boxed as a
+/// return value it would become the number `0`/`1`, and fed to arithmetic or a
+/// comparison it would compare as a number (`(a < b) === 1` is `false` in JS).
+/// So every register a comparison writes (closed over `Move`) must never also
+/// hold a number and must only be read by a branch, a `!` or a `Move`;
+/// otherwise the function is left to the generic tier, which boxes real
+/// booleans.
+#[cfg(feature = "alloc")]
+fn numeric_tier_booleans_sound(proto: &crate::nbvm::FnProto) -> bool {
+    use crate::nbvm::Op;
+    let n = proto.n_regs;
+    let mut boolish = alloc::vec![false; n];
+    let is_bool_op = |op: &Op| match op {
+        Op::Lt { dst, .. } | Op::Not { dst, .. } | Op::StrictEq { dst, .. } => Some(*dst),
+        Op::ValueBin { dst, op, .. } if *op == crate::nbvm::VB_LOOSE_EQ => Some(*dst),
+        _ => None,
+    };
+    for op in &proto.ops {
+        if let Some(d) = is_bool_op(op)
+            && let Some(b) = boolish.get_mut(d as usize)
+        {
+            *b = true;
+        }
+    }
+    // Close over moves (a bounded fixpoint: each round adds a register or stops).
+    loop {
+        let mut changed = false;
+        for op in &proto.ops {
+            if let Op::Move { dst, src } = op
+                && boolish.get(*src as usize) == Some(&true)
+                && boolish.get(*dst as usize) == Some(&false)
+            {
+                boolish[*dst as usize] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let is_b = |r: crate::nbvm::Reg| boolish.get(r as usize) == Some(&true);
+    // A parameter is a number on these tiers.
+    if (0..proto.n_params.min(n)).any(|r| boolish[r]) {
+        return false;
+    }
+    for op in &proto.ops {
+        match op {
+            Op::JumpIfFalse { .. } => {}
+            Op::Not { .. } => {}
+            Op::Move { dst, src } => {
+                if is_b(*dst) != is_b(*src) {
+                    return false; // a boolean register also receives a number
+                }
+            }
+            _ if is_bool_op(op).is_some() => {
+                // `<`/`===`/`==` read their operands as numbers.
+                let reads_bool = match op {
+                    Op::Lt { a, b, .. } | Op::StrictEq { a, b, .. } | Op::ValueBin { a, b, .. } => {
+                        is_b(*a) || is_b(*b)
+                    }
+                    _ => false,
+                };
+                if reads_bool {
+                    return false;
+                }
+            }
+            _ => {
+                if (0..n).any(|r| {
+                    is_b(r as crate::nbvm::Reg)
+                        && crate::bytecode::op_mentions_reg(op, r as crate::nbvm::Reg)
+                }) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Like [`lower_nbvm`], but `registry` maps a callee function-table index to the
 /// absolute address of its already-compiled native code, so an `Op::Call` to a
 /// registered (JIT-compiled) function lowers to a native [`RegOp::Call`]. A call
@@ -1215,7 +1297,11 @@ pub fn lower_nbvm_with(
     registry: &alloc::collections::BTreeMap<u32, u64>,
 ) -> Option<Vec<RegOp>> {
     use crate::nbvm::Op;
-    if proto.n_regs > 64 || proto.n_params > 6 || proto.n_captures != 0 {
+    if proto.n_regs > 64
+        || proto.n_params > 6
+        || proto.n_captures != 0
+        || !numeric_tier_booleans_sound(proto)
+    {
         return None;
     }
     let reg8 = |r: crate::nbvm::Reg| -> Option<u8> {
@@ -1480,7 +1566,11 @@ fn has_sse41() -> bool {
 #[must_use]
 pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
     use crate::nbvm::Op;
-    if proto.n_regs > 64 || proto.n_params > 4 || proto.n_captures != 0 {
+    if proto.n_regs > 64
+        || proto.n_params > 4
+        || proto.n_captures != 0
+        || !numeric_tier_booleans_sound(proto)
+    {
         return None;
     }
     let reg8 = |r: crate::nbvm::Reg| -> Option<u8> {
@@ -3789,6 +3879,10 @@ impl X64Assembler {
     pub fn mov_at_r11_rax8_rdx(&mut self) {
         self.code.extend_from_slice(&[0x49, 0x89, 0x14, 0xc3]);
     }
+    /// `cmp qword [r11 + rax*8], rdx` — compare an element slot with `rdx`.
+    pub fn cmp_at_r11_rax8_rdx(&mut self) {
+        self.code.extend_from_slice(&[0x49, 0x39, 0x14, 0xc3]);
+    }
     /// `cmp qword [rcx+disp32], imm8` — compare an 8-byte field at the slot pointer
     /// against a small sign-extended immediate (the `readonly` Vec length vs 0).
     pub fn cmp_qword_at_rcx_imm(&mut self, disp: i32, imm: u8) {
@@ -4855,6 +4949,11 @@ impl JitFunction {
                     a.cmp_rax_r8();
                     a.jae(slow);
                     a.mov_r11_at_rcx(layout.off_arr_ptr);
+                    // A hole is an absent index: storing to it is `[[Set]]` on a
+                    // missing own property (prototype setters / proxy traps).
+                    a.movabs_argreg(2, NanBox::hole().to_bits() as i64);
+                    a.cmp_at_r11_rax8_rdx();
+                    a.je(slow);
                     a.load_rdx(disp(src));
                     a.mov_at_r11_rax8_rdx();
                     a.jmp(done);
@@ -5081,6 +5180,11 @@ impl JitFunction {
                     a.cmp_rax_r8();
                     a.jae(helper);
                     a.mov_r11_at_rcx(layout.off_arr_ptr);
+                    // A hole is an absent index: the helper's `[[Set]]` walks the
+                    // prototype chain (setters, proxy traps).
+                    a.movabs_argreg(2, NanBox::hole().to_bits() as i64);
+                    a.cmp_at_r11_rax8_rdx();
+                    a.je(helper);
                     a.load_rdx(disp(val));
                     a.mov_at_r11_rax8_rdx(); // elems[idx] = val
                     a.jmp(done);
