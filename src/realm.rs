@@ -4848,8 +4848,8 @@ impl Realm {
     pub fn maybe_collect_with(
         &mut self,
         roots: &[Handle],
-        extern_expand: &mut dyn FnMut(&alloc::collections::BTreeSet<Handle>, &mut Vec<Handle>),
-        extern_prune: &mut dyn FnMut(&alloc::collections::BTreeSet<Handle>),
+        extern_expand: &mut dyn FnMut(&gc::MarkSet, &mut Vec<Handle>),
+        extern_prune: &mut dyn FnMut(&gc::MarkSet),
     ) -> Option<Stats> {
         if self.heap.allocs_since_gc() < self.gc_threshold {
             return None;
@@ -4942,7 +4942,7 @@ impl Realm {
     #[allow(clippy::too_many_arguments)] // one ref per side-table, to fit split borrows
     fn ephemeron_expand(
         heap: &Heap<Cell>,
-        marked: &alloc::collections::BTreeSet<Handle>,
+        marked: &gc::MarkSet,
         aux_props: &alloc::collections::BTreeMap<u64, Handle>,
         fn_protos: &alloc::collections::BTreeMap<u32, Handle>,
         fn_ctor: &alloc::collections::BTreeMap<u32, Handle>,
@@ -4971,8 +4971,8 @@ impl Realm {
         // *or* if a live object still uses it as a property key (stored as the
         // string `\0sym:{id}`, which carries no handle edge). Scan the live
         // objects' keys for referenced ids and root those symbols.
-        for h in marked {
-            if let Some(obj) = heap.get(*h).and_then(Cell::as_object) {
+        for h in marked.iter() {
+            if let Some(obj) = heap.get(h).and_then(Cell::as_object) {
                 obj.for_each_symbol_key(|k| {
                     if let Some(idstr) = k.strip_prefix("\u{0}sym:")
                         && let Ok(id) = idstr.parse::<u64>()
@@ -4994,7 +4994,7 @@ impl Realm {
     /// is already marked.
     #[allow(clippy::too_many_arguments)] // one ref per side-table, to fit split borrows
     fn ephemeron_prune(
-        marked: &alloc::collections::BTreeSet<Handle>,
+        marked: &gc::MarkSet,
         key_collectable: &dyn Fn(Handle) -> bool,
         aux_props: &mut alloc::collections::BTreeMap<u64, Handle>,
         fn_protos: &mut alloc::collections::BTreeMap<u32, Handle>,
@@ -5044,7 +5044,7 @@ impl Realm {
         // identity. Drop both when the function handle is collectable-and-dead.
         let dead_ids: alloc::vec::Vec<u32> = fn_ctor
             .iter()
-            .filter(|(_, fh)| key_collectable(**fh) && !marked.contains(*fh))
+            .filter(|(_, fh)| key_collectable(**fh) && !marked.contains(fh))
             .map(|(id, _)| *id)
             .collect();
         for id in dead_ids {
@@ -5085,8 +5085,8 @@ impl Realm {
     pub fn collect_with(
         &mut self,
         roots: &[Handle],
-        extern_expand: &mut dyn FnMut(&alloc::collections::BTreeSet<Handle>, &mut Vec<Handle>),
-        extern_prune: &mut dyn FnMut(&alloc::collections::BTreeSet<Handle>),
+        extern_expand: &mut dyn FnMut(&gc::MarkSet, &mut Vec<Handle>),
+        extern_prune: &mut dyn FnMut(&gc::MarkSet),
     ) -> Stats {
         let Self {
             heap,

@@ -61,10 +61,77 @@ pub struct Stats {
 /// (has survived at least one collection). Tunable; `1` means "survived once".
 pub const OLD_AGE: u8 = 1;
 
+/// The set of objects a mark phase reached: one entry per heap slot (the
+/// marked handle's generation + 1, `0` for unmarked), so membership is an
+/// index load instead of a tree search. A stale handle — an older generation
+/// of a slot whose current object was marked — is correctly *not* a member.
+#[derive(Clone, Debug, Default)]
+pub struct MarkSet {
+    marks: Vec<u32>,
+    count: usize,
+}
+
+impl MarkSet {
+    /// An empty set sized for a heap of `slots` slots (it grows on demand).
+    #[must_use]
+    pub fn with_slots(slots: usize) -> Self {
+        Self {
+            marks: alloc::vec![0; slots],
+            count: 0,
+        }
+    }
+
+    /// Adds `handle`; returns whether it was newly added.
+    pub fn insert(&mut self, handle: Handle) -> bool {
+        let i = handle.index() as usize;
+        if i >= self.marks.len() {
+            self.marks.resize(i + 1, 0);
+        }
+        let tag = u32::from(handle.generation()) + 1;
+        if self.marks[i] == tag {
+            return false;
+        }
+        if self.marks[i] == 0 {
+            self.count += 1;
+        }
+        self.marks[i] = tag;
+        true
+    }
+
+    /// Whether `handle` (this exact generation) is marked.
+    #[must_use]
+    pub fn contains(&self, handle: &Handle) -> bool {
+        self.marks
+            .get(handle.index() as usize)
+            .is_some_and(|&t| t == u32::from(handle.generation()) + 1)
+    }
+
+    /// The number of marked objects.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Whether nothing is marked.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// The marked handles, in slot-index order.
+    pub fn iter(&self) -> impl Iterator<Item = Handle> + '_ {
+        self.marks
+            .iter()
+            .enumerate()
+            .filter(|&(_, &t)| t != 0)
+            .map(|(i, &t)| Handle::from_parts(i as u32, (t - 1) as u16))
+    }
+}
+
 /// Marks everything reachable from `roots` (depth-first over outgoing handle
 /// edges) and returns the marked set.
-fn mark<T: Trace>(heap: &Heap<T>, roots: impl IntoIterator<Item = Handle>) -> BTreeSet<Handle> {
-    let mut marked: BTreeSet<Handle> = BTreeSet::new();
+fn mark<T: Trace>(heap: &Heap<T>, roots: impl IntoIterator<Item = Handle>) -> MarkSet {
+    let mut marked = MarkSet::with_slots(heap.slot_capacity());
     let mut work: Vec<Handle> = Vec::new();
     for root in roots {
         if heap.is_live(root) && marked.insert(root) {
@@ -77,18 +144,16 @@ fn mark<T: Trace>(heap: &Heap<T>, roots: impl IntoIterator<Item = Handle>) -> BT
 
 /// Drains the grey `work` list into `marked`, following each object's outgoing
 /// edges. Shared by [`mark`] and the ephemeron fixpoint.
-fn drain<T: Trace>(heap: &Heap<T>, marked: &mut BTreeSet<Handle>, work: &mut Vec<Handle>) {
+fn drain<T: Trace>(heap: &Heap<T>, marked: &mut MarkSet, work: &mut Vec<Handle>) {
     while let Some(handle) = work.pop() {
-        let mut edges: Vec<Handle> = Vec::new();
         if let Some(obj) = heap.get(handle) {
-            obj.trace(&mut |h| edges.push(h));
-        }
-        for edge in edges {
-            // Only follow live, not-yet-marked targets (stale handles are
-            // ignored, which also breaks cycles).
-            if heap.is_live(edge) && marked.insert(edge) {
-                work.push(edge);
-            }
+            obj.trace(&mut |edge| {
+                // Only follow live, not-yet-marked targets (stale handles are
+                // ignored, which also breaks cycles).
+                if heap.is_live(edge) && marked.insert(edge) {
+                    work.push(edge);
+                }
+            });
         }
     }
 }
@@ -113,9 +178,9 @@ fn drain<T: Trace>(heap: &Heap<T>, marked: &mut BTreeSet<Handle>, work: &mut Vec
 pub fn mark_with_ephemerons<T: Trace>(
     heap: &Heap<T>,
     roots: impl IntoIterator<Item = Handle>,
-    mut expand: impl FnMut(&Heap<T>, &BTreeSet<Handle>, &mut Vec<Handle>),
-) -> BTreeSet<Handle> {
-    let mut marked: BTreeSet<Handle> = BTreeSet::new();
+    mut expand: impl FnMut(&Heap<T>, &MarkSet, &mut Vec<Handle>),
+) -> MarkSet {
+    let mut marked = MarkSet::with_slots(heap.slot_capacity());
     let mut work: Vec<Handle> = Vec::new();
     for root in roots {
         if heap.is_live(root) && marked.insert(root) {
@@ -151,16 +216,9 @@ pub fn mark_with_ephemerons<T: Trace>(
 pub fn collect<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
     let marked = mark(heap, roots.iter().copied());
 
-    // --- sweep: free every live object the mark phase did not reach ---
-    let mut swept = 0;
-    for handle in heap.live_handles() {
-        if marked.contains(&handle) {
-            heap.tenure(handle); // a survivor ages toward the old generation
-        } else {
-            heap.free(handle);
-            swept += 1;
-        }
-    }
+    // --- sweep: free every live object the mark phase did not reach (a
+    // survivor ages toward the old generation) ---
+    let swept = heap.sweep(|h, _| marked.contains(&h));
     // A full collection re-establishes the generation boundary from scratch.
     heap.clear_remembered();
 
@@ -181,18 +239,15 @@ pub fn collect<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
 /// set — without forcing two overlapping mutable borrows. Pruning a dead key
 /// before this runs does not change the sweep set (the key is already unmarked);
 /// it only stops the table from holding a now-dangling handle.
-pub fn sweep_full<T: Trace>(heap: &mut Heap<T>, marked: &BTreeSet<Handle>) -> Stats {
-    let mut swept = 0;
+pub fn sweep_full<T: Trace>(heap: &mut Heap<T>, marked: &MarkSet) -> Stats {
     let mut weight = 0usize;
-    for handle in heap.live_handles() {
-        if marked.contains(&handle) {
-            weight = weight.saturating_add(heap.get(handle).map_or(1, Trace::weight));
-            heap.tenure(handle);
-        } else {
-            heap.free(handle);
-            swept += 1;
+    let swept = heap.sweep(|h, value| {
+        let keep = marked.contains(&h);
+        if keep {
+            weight = weight.saturating_add(value.weight());
         }
-    }
+        keep
+    });
     heap.clear_remembered();
     Stats {
         marked: marked.len(),

@@ -50,6 +50,25 @@ impl Handle {
             generation: ((raw >> 32) & 0xffff) as u16,
         }
     }
+
+    /// The slot index this handle addresses.
+    #[must_use]
+    pub(crate) const fn index(self) -> u32 {
+        self.index
+    }
+
+    /// The slot generation this handle was live in.
+    #[must_use]
+    pub(crate) const fn generation(self) -> u16 {
+        self.generation
+    }
+
+    /// Reassembles a handle from its parts (the inverse of
+    /// [`index`](Self::index) / [`generation`](Self::generation)).
+    #[must_use]
+    pub(crate) const fn from_parts(index: u32, generation: u16) -> Self {
+        Self { index, generation }
+    }
 }
 
 /// A heap slot: either holds a live value or is free and awaiting reuse. Both
@@ -430,6 +449,47 @@ impl<T> Heap<T> {
             .collect()
     }
 
+    /// The number of slots (live or free) — the bound on any handle's index.
+    #[must_use]
+    pub fn slot_capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The sweep of a full collection, in one pass over the slot table: every
+    /// live object for which `keep(handle, value)` holds is promoted one
+    /// generation; every other one is freed (dropped). Returns the number
+    /// freed. Freed slots go through [`free`](Heap::free), so GC-verification
+    /// mode still only records them.
+    pub fn sweep(&mut self, mut keep: impl FnMut(Handle, &T) -> bool) -> usize {
+        let mut swept = 0;
+        for i in 0..self.slots.len() {
+            let doomed = match &mut self.slots[i] {
+                Slot::Occupied {
+                    generation,
+                    age,
+                    value,
+                } => {
+                    let h = Handle {
+                        index: i as u32,
+                        generation: *generation,
+                    };
+                    if keep(h, value) {
+                        *age = age.saturating_add(1);
+                        None
+                    } else {
+                        Some(h)
+                    }
+                }
+                Slot::Free { .. } => None,
+            };
+            if let Some(h) = doomed {
+                drop(self.free(h));
+                swept += 1;
+            }
+        }
+        swept
+    }
+
     /// The generational age of `handle`'s object (collections survived), or
     /// `None` if stale. `0` is the young generation.
     #[must_use]
@@ -514,7 +574,7 @@ impl<T> Heap<T> {
     /// pre-compaction handle is invalid *except* via the returned map — the
     /// moving collector uses it to fix up references. Ages (generations
     /// survived) are preserved; the free list and remembered set are cleared.
-    pub fn compact_to(&mut self, keep: &BTreeSet<Handle>) -> Vec<(Handle, Handle)> {
+    pub fn compact_to(&mut self, keep: &crate::gc::MarkSet) -> Vec<(Handle, Handle)> {
         // A fresh high-range generation for this compaction's slots, disjoint
         // from any old handle's generation.
         let new_gen = self.compact_gen;
