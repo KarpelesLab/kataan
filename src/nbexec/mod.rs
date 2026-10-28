@@ -7918,6 +7918,44 @@ pub(crate) fn encode_typed_element(kind: u8, v: f64) -> ([u8; 8], usize) {
     (out, n)
 }
 
+/// `Math.hypot` over already-converted Numbers: +Infinity if any is ±Infinity
+/// (even beside a NaN), else NaN if any is NaN, else the root of the sum of
+/// squares. Squaring overflows past ~1e154 (and underflows below ~1e-154), so
+/// in that range the squares are summed scaled by the largest magnitude:
+/// `hypot(1e200, 1e200)` is 1.414e200, not Infinity.
+#[cfg(feature = "std")]
+pub(crate) fn hypot_of(nums: &[f64]) -> f64 {
+    let mut any_inf = false;
+    let mut any_nan = false;
+    let mut max = 0.0f64;
+    for &n in nums {
+        if n.is_infinite() {
+            any_inf = true;
+        } else if n.is_nan() {
+            any_nan = true;
+        } else {
+            max = max.max(n.abs());
+        }
+    }
+    if any_inf {
+        return f64::INFINITY;
+    }
+    if any_nan {
+        return f64::NAN;
+    }
+    let scale = if max > 1e150 || (max > 0.0 && max < 1e-150) {
+        max
+    } else {
+        1.0
+    };
+    let mut sum = 0.0;
+    for &n in nums {
+        let m = n / scale;
+        sum += m * m;
+    }
+    sum.sqrt() * scale
+}
+
 /// Little-endian decode of one typed-array element of `kind` (index into
 /// [`TYPED_ARRAY_KINDS`]) from `bytes` (short/empty slices read as zero).
 pub(crate) fn decode_typed_element(kind: u8, bytes: &[u8]) -> f64 {

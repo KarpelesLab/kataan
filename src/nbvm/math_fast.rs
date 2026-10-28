@@ -160,25 +160,7 @@ pub(super) fn compute(realm: &Realm, id: u16, args: &[Reg], regs: &[NanBox]) -> 
             m
         }
         N_MATH_POW => return Some(realm.pow(NanBox::number(arg(0)), NanBox::number(arg(1)))),
-        N_MATH_HYPOT => {
-            let (mut any_inf, mut any_nan, mut sum) = (false, false, 0.0);
-            for &n in given {
-                if n.is_infinite() {
-                    any_inf = true;
-                } else if n.is_nan() {
-                    any_nan = true;
-                } else {
-                    sum += n * n;
-                }
-            }
-            if any_inf {
-                f64::INFINITY
-            } else if any_nan {
-                f64::NAN
-            } else {
-                sum.sqrt()
-            }
-        }
+        N_MATH_HYPOT => crate::nbexec::hypot_of(given),
         N_MATH_CBRT => arg(0).cbrt(),
         N_MATH_EXP => arg(0).exp(),
         N_MATH_LOG => arg(0).ln(),

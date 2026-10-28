@@ -427,3 +427,18 @@ fn splice_without_start_removes_nothing() {
     "#;
     assert_eq!(run(src), "0|3|1,2|3|3|0|1");
 }
+
+/// `Math.hypot` does not overflow (or underflow) in its intermediate squares:
+/// `hypot(1e200, 1e200)` is `1e200 * Math.SQRT2`, not Infinity, and
+/// `hypot(1e-200, 1e-200)` is not 0.
+#[test]
+fn hypot_scales_huge_and_tiny_arguments() {
+    let src = r#"
+        function h(f) { return f(1e200, 1e200) + "," + f(3e-200, 4e-200) + "," + f(3, 4) + "," + f(-0) + "," + f(NaN, -Infinity); }
+        h(Math.hypot) + "|" + h(function (a, b) { return Math.hypot.apply(null, arguments); })
+    "#;
+    assert_eq!(
+        run(src),
+        "1.414213562373095e+200,5e-200,5,0,Infinity|1.414213562373095e+200,5e-200,5,0,Infinity"
+    );
+}

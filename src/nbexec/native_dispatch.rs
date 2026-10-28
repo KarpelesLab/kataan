@@ -2963,25 +2963,7 @@ impl Interp {
                     let num = self.coerce_to_number(*a)?;
                     nums.push(self.realm.to_number(num));
                 }
-                let mut any_inf = false;
-                let mut any_nan = false;
-                let mut sum = 0.0;
-                for n in nums {
-                    if n.is_infinite() {
-                        any_inf = true;
-                    } else if n.is_nan() {
-                        any_nan = true;
-                    } else {
-                        sum += n * n;
-                    }
-                }
-                NanBox::number(if any_inf {
-                    f64::INFINITY
-                } else if any_nan {
-                    f64::NAN
-                } else {
-                    sum.sqrt()
-                })
+                NanBox::number(hypot_of(&nums))
             }
             #[cfg(feature = "std")]
             N_MATH_CBRT => NanBox::number(self.realm.to_number(arg(0)).cbrt()),
