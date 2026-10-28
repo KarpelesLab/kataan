@@ -2261,7 +2261,7 @@ impl Realm {
             live: 0,
             iters: 0,
             epoch: 0,
-            remaps: Vec::new(),
+            remaps: None,
             index: None,
         })
     }
@@ -2393,7 +2393,7 @@ impl Realm {
             map.insert(self.collection_key_hash(*k), i);
         }
         if let Some(Cell::Collection { index, .. }) = self.heap.get_mut(handle) {
-            *index = Some(map);
+            *index = Some(alloc::boxed::Box::new(map));
         }
     }
 
@@ -2587,12 +2587,13 @@ impl Realm {
         map.push(next);
         entries.retain(|e| !e.0.is_hole());
         if *iters > 0 {
+            let remaps = remaps.get_or_insert_with(Default::default);
             if remaps.len() == 8 {
                 remaps.remove(0);
             }
             remaps.push((*epoch, map));
         } else {
-            remaps.clear();
+            *remaps = None;
         }
         *epoch = epoch.wrapping_add(1);
         *index = None;
@@ -2701,6 +2702,7 @@ impl Realm {
                     return (idx, from);
                 }
                 // Carry the cursor through each recorded compaction since `from`.
+                let remaps = remaps.as_deref().map_or(&[][..], |r| &r[..]);
                 let exact = remaps.iter().position(|(e, _)| *e == from).map(|start| {
                     remaps[start..]
                         .iter()

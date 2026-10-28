@@ -2822,28 +2822,34 @@ pub const ARENA_ELEM_SET: u64 = 3;
 pub(crate) struct JitLayout {
     /// `size_of::<Slot<Cell>>()` — the arena stride.
     pub slot_stride: i32,
-    /// `Slot::Occupied` discriminant byte.
+    /// A live slot's occupancy byte.
     pub slot_occupied_disc: u8,
+    /// Slot-relative offset of the slot's occupancy byte.
+    pub off_slot_occ: i32,
     /// `Cell::Object` discriminant byte.
     pub cell_object_disc: u8,
-    /// `ObjectData::Shaped` discriminant byte.
+    /// The shaped storage mode's byte (an object's first byte, which is also
+    /// the `Cell` tag: the `Cell::Object` tag test and this mode test read the
+    /// same byte).
     pub obj_shaped_disc: u8,
     /// Slot-relative offset of the slot's `generation: u16`.
     pub off_slot_gen: i32,
     /// Slot-relative offset of the `Cell` tag byte.
     pub off_cell_tag: i32,
-    /// Slot-relative offset of the `ObjectData` tag byte.
+    /// Slot-relative offset of the object's storage-mode byte.
     pub off_od_tag: i32,
     /// Slot-relative offset of the object's shape-`Rc` word (8 bytes).
     pub off_shape: i32,
-    /// Slot-relative offset of the object's slot count (`u32`).
+    /// Slot-relative offset of the object's slot count (`u16`).
     pub off_slots_len: i32,
     /// Slot-relative offset of the object's first inline slot (slot
     /// `i < INLINE_SLOTS` at `+ 8 * i`).
     pub off_inline: i32,
-    /// Slot-relative offset of the object's spill `Vec` data pointer (slot
-    /// `i >= INLINE_SLOTS` at that pointer `+ 8 * (i - INLINE_SLOTS)`).
-    pub off_spill_ptr: i32,
+    /// `ObjectExtra`-relative offset of the object's spill `Vec` data pointer
+    /// (slot `i >= INLINE_SLOTS` at that pointer `+ 8 * (i - INLINE_SLOTS)`;
+    /// the `extra` pointer is at `props.off_extra`, and is non-null whenever
+    /// the object has a spilled slot).
+    pub extra_spill_ptr: i32,
     /// `PropertyCache`-relative offset of the cached shape word (8 bytes).
     pub cache_shape_off: i32,
     /// `PropertyCache`-relative offset of the cached `slot: u32`.
@@ -2862,9 +2868,6 @@ pub(crate) struct JitLayout {
     /// (`crate::cell::ArrayElems`): non-zero routes an element access to the
     /// helper.
     pub off_arr_side: i32,
-    /// Slot-relative offset of the object's `frozen: bool` (inline SET writability
-    /// gate: a non-zero byte routes the store to the helper).
-    pub off_frozen: i32,
     /// The inline property paths' extra offsets (`props.rs`).
     pub props: props::PropsLayout,
 }
@@ -2884,24 +2887,23 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
         let obj = crate::object::jit_object_layout();
         let cache = crate::ic::jit_cache_layout();
         // From a slot base S: the Cell payload sits at S + slot.value_off; the
-        // Object at + cell.object_off; its `data: ObjectData` at + obj.data_off
-        // (0 for repr(C) Object); then the ObjectData/Vec fields.
+        // Object at + cell.object_off; then the Object/Vec fields.
         let cell_base = slot.value_off;
         let obj_base = cell_base + cell.object_off;
-        let od_base = obj_base + obj.data_off;
         let to_i32 = |v: usize| i32::try_from(v).expect("jit layout offset fits in i32");
         JitLayout {
             slot_stride: to_i32(slot.stride),
             slot_occupied_disc: slot.occupied_disc,
+            off_slot_occ: to_i32(slot.occupied_off),
             cell_object_disc: cell.object_disc,
             obj_shaped_disc: obj.shaped_disc,
             off_slot_gen: to_i32(slot.generation_off),
             off_cell_tag: to_i32(cell_base),
-            off_od_tag: to_i32(od_base),
-            off_shape: to_i32(od_base + obj.shape_off),
-            off_slots_len: to_i32(od_base + obj.len_off),
-            off_inline: to_i32(od_base + obj.inline_off),
-            off_spill_ptr: to_i32(od_base + obj.spill_ptr_off),
+            off_od_tag: to_i32(obj_base + obj.mode_off),
+            off_shape: to_i32(obj_base + obj.shape_off),
+            off_slots_len: to_i32(obj_base + obj.len_off),
+            off_inline: to_i32(obj_base + obj.inline_off),
+            extra_spill_ptr: to_i32(obj.extra_spill_ptr_off),
             cache_shape_off: to_i32(cache.shape_off),
             cache_slot_off: to_i32(cache.slot_off),
             cache_hits_off: to_i32(cache.hits_off),
@@ -2911,8 +2913,6 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
             off_arr_ptr: to_i32(cell_base + cell.array_vec_off + obj.vec_ptr_off),
             off_arr_len: to_i32(cell_base + cell.array_vec_off + obj.vec_len_off),
             off_arr_side: to_i32(cell_base + cell.array_side_off),
-            // `frozen` is an `Object` field, relative to the Object base.
-            off_frozen: to_i32(obj_base + obj.frozen_off),
             props: props::PropsLayout::new(&slot, cell_base, obj_base, &obj),
         }
     })
@@ -5460,7 +5460,7 @@ impl JitFunction {
                 a.imul_rax_imm(layout.slot_stride);
                 a.add_rax_r10();
                 a.mov_rcx_rax(); // rcx = &Slot
-                a.cmp_byte_at_rcx_imm(0, layout.slot_occupied_disc);
+                a.cmp_byte_at_rcx_imm(layout.off_slot_occ, layout.slot_occupied_disc);
                 a.jne($miss);
                 a.cmp_word_at_rcx_r8w(layout.off_slot_gen);
                 a.jne($miss);
@@ -6188,17 +6188,16 @@ impl JitFunction {
                     // frozen with an empty `readonly` list (`Object::cached_set`'s
                     // success precondition). Everything else → the helper.
                     recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj);
-                    a.cmp_byte_at_rcx_imm(layout.off_frozen, 0);
-                    a.jne(helper);
-                    // A host-exotic, global or tracked-prototype object's writes
-                    // need the helper, as do those of an object with a
-                    // non-writable property (`JIT_FLAG_READONLY`). (A watched
-                    // object's existing data properties are plain stores: a
-                    // value is no part of the layout its watchers validate.)
+                    // A frozen object's writes need the helper, as do those of
+                    // a host-exotic, global or tracked-prototype object, and of
+                    // an object with a non-writable property
+                    // (`JIT_FLAG_READONLY`). (A watched object's existing data
+                    // properties are plain stores: a value is no part of the
+                    // layout its watchers validate.)
                     a.p_test_byte_imm(
                         call_seq::r::RCX,
                         layout.props.off_jit_flags,
-                        !props::FLAG_WATCHED,
+                        props::FLAGS_NO_INLINE_STORE,
                     );
                     a.jne(helper);
                     a.mov_rax_at_rcx(layout.off_shape);

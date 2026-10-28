@@ -25263,7 +25263,7 @@ mod generic_jit_tests {
                 // exactly as the emitted code reads them.
                 unsafe {
                     let slot = base.add(index * layout.slot_stride as usize);
-                    if *slot != layout.slot_occupied_disc {
+                    if *slot.add(layout.off_slot_occ as usize) != layout.slot_occupied_disc {
                         return None;
                     }
                     if *(slot.add(layout.off_slot_gen as usize) as *const u16) != generation {
@@ -25284,7 +25284,7 @@ mod generic_jit_tests {
                     }
                     let sslot =
                         *(cache_base.add(layout.cache_slot_off as usize) as *const u32) as usize;
-                    let slots_len = *(slot.add(layout.off_slots_len as usize) as *const u32);
+                    let slots_len = *(slot.add(layout.off_slots_len as usize) as *const u16);
                     if sslot >= slots_len as usize {
                         return None;
                     }
@@ -25294,7 +25294,8 @@ mod generic_jit_tests {
                             *(slot.add(layout.off_inline as usize) as *const u64).add(sslot),
                         );
                     }
-                    let spill = *(slot.add(layout.off_spill_ptr as usize) as *const *const u64);
+                    let extra = *(slot.add(layout.props.off_extra as usize) as *const *const u8);
+                    let spill = *(extra.add(layout.extra_spill_ptr as usize) as *const *const u64);
                     Some(*spill.add(sslot - inline))
                 }
             };
@@ -25338,6 +25339,23 @@ mod generic_jit_tests {
 
         // Shape mismatch: o3 has a different shape → must NOT match the o1 cache.
         assert_eq!(raw_get(base, len, bits(o3), &cx), None);
+
+        // Spilled slots (past the inline room) resolve through `extra`.
+        let o4 = realm.new_object();
+        let keys = ["a", "b", "c", "d", "e", "f", "g"];
+        for (i, k) in keys.iter().enumerate() {
+            realm.set_property(o4, k, NanBox::number(i as f64 + 0.5));
+        }
+        let (base, len) = realm.jit_arena_slots();
+        for k in keys {
+            let mut ck = PropertyCache::new();
+            let safe = realm.object_cached_get(o4, k, &mut ck).unwrap();
+            assert_eq!(
+                raw_get(base, len, bits(o4), &ck),
+                Some(safe.to_bits()),
+                "{k}"
+            );
+        }
 
         // Dictionary-mode object: must miss (ObjectData tag != Shaped).
         let dlim = crate::limits::Limits {
@@ -25408,7 +25426,7 @@ mod generic_jit_tests {
             // that slot / the array it points to, exactly as the emitted code reads.
             unsafe {
                 let slot = base.add(index * layout.slot_stride as usize);
-                if *slot != layout.slot_occupied_disc {
+                if *slot.add(layout.off_slot_occ as usize) != layout.slot_occupied_disc {
                     return None;
                 }
                 if *(slot.add(layout.off_slot_gen as usize) as *const u16) != generation {
@@ -25448,7 +25466,7 @@ mod generic_jit_tests {
         let (obase, olen) = realm.jit_arena_slots();
         assert_eq!(raw_elem(obase, olen, bits(obj), 0), None);
 
-        // --- writability gate: frozen byte + the jit_flags byte ---
+        // --- writability gate: the flags byte (frozen bit + jit flags) ---
         // A faithful mirror of the emitted SET writability read.
         #[allow(unsafe_code)]
         let raw_writable = |base: *const u8, len: usize, obj_bits: u64| -> Option<(u8, u8)> {
@@ -25456,13 +25474,12 @@ mod generic_jit_tests {
             if index >= len {
                 return None;
             }
-            // SAFETY: `index < len` → a live slot; the frozen byte + jit flags
+            // SAFETY: `index < len` → a live slot; the flags byte
             // sit within the object, at the probed offsets.
             unsafe {
                 let slot = base.add(index * layout.slot_stride as usize);
-                let frozen = *slot.add(layout.off_frozen as usize);
                 let flags = *slot.add(layout.props.off_jit_flags as usize);
-                Some((frozen, flags))
+                Some((flags & crate::object::OBJ_FLAG_FROZEN, flags))
             }
         };
 
@@ -25470,13 +25487,13 @@ mod generic_jit_tests {
         let (obase, olen) = realm.jit_arena_slots();
         assert_eq!(raw_writable(obase, olen, bits(obj)), Some((0, 0)));
 
-        // A frozen object: the frozen byte reads non-zero (the SET gate bails).
+        // A frozen object: the frozen bit is set (the SET gate bails).
         let fobj = realm.new_object();
         realm.set_property(fobj, "p", NanBox::number(1.0));
         realm.freeze_object(fobj);
         let (fbase, flen) = realm.jit_arena_slots();
         let (frozen, _ro) = raw_writable(fbase, flen, bits(fobj)).unwrap();
-        assert_ne!(frozen, 0, "frozen object's frozen byte must be non-zero");
+        assert_ne!(frozen, 0, "a frozen object must have its frozen bit set");
 
         // A non-writable (readonly) own property makes the readonly length non-zero.
         let robj = realm.new_object();

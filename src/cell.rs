@@ -231,8 +231,18 @@ impl Drop for ExternalBytes {
     }
 }
 
+/// A `Map`/`Set` cell's record of recent compactions (see
+/// [`Cell::Collection`]'s `remaps`): `(epoch before, map)` pairs.
+pub type CollRemaps = Vec<(u32, Vec<u32>)>;
+
 /// A heap-allocated reference value.
-#[repr(u8)] // JIT inline fast path bakes the Object-variant discriminant; verified in jit layout test
+///
+/// No `repr`: the enum takes its tag from the niche of an object's first
+/// byte (its storage mode, which has only two valid values), so a cell is
+/// exactly as large as an [`Object`] — the largest variant — and every
+/// variant's tag is that same first byte, which compiled code reads (the
+/// probed discriminants are verified by the JIT layout tests). Every other
+/// variant's payload must fit after the first word: a larger one is boxed.
 pub enum Cell {
     /// An ordinary object (shape + value slots).
     Object(Object),
@@ -357,8 +367,10 @@ pub enum Cell {
         /// were attached, as `(epoch before, map)` with `map[old] = new index of
         /// the first live entry at or after old`, so a cursor a few epochs
         /// behind is carried forward exactly (bounded; older cursors fall back
-        /// to re-finding the last-yielded key).
-        remaps: Vec<(u32, Vec<u32>)>,
+        /// to re-finding the last-yielded key). Boxed (and `None` while empty,
+        /// as it almost always is) to keep the cell small.
+        #[allow(clippy::box_collection)]
+        remaps: Option<alloc::boxed::Box<CollRemaps>>,
         /// Lazily-built lookup index: a `SameValueZero`-compatible key hash to
         /// the indices in `entries` that hash to it (collisions are resolved by
         /// re-checking with the real equality, so the hash only has to be
@@ -368,8 +380,9 @@ pub enum Cell {
         /// Without this, every `set`/`get`/`has`/`delete` linear-scanned
         /// `entries`, so filling a `Map` was quadratic in its size. It is
         /// deliberately *not* serialized and is dropped on GC relocation (which
-        /// rewrites the handles that object keys hash by).
-        index: Option<crate::realm::CollIndex>,
+        /// rewrites the handles that object keys hash by). Boxed to keep the
+        /// cell small.
+        index: Option<alloc::boxed::Box<crate::realm::CollIndex>>,
     },
     /// A `Symbol` primitive: an immutable description and a process-unique id.
     /// Symbols compare by identity (two `Symbol("x")` are distinct).
@@ -393,6 +406,9 @@ pub enum Cell {
         revoked: bool,
     },
 }
+
+// The tag lives in the object's niche (see [`Cell`]): a cell is an object's size.
+const _: () = assert!(core::mem::size_of::<Cell>() == core::mem::size_of::<Object>());
 
 /// A [`Cell::Array`]'s elements (it dereferences to the `Vec`), plus a flag
 /// recording whether the array has ever had state in one of the realm's
@@ -494,8 +510,8 @@ pub(crate) fn jit_vm_function_layout() -> (u8, usize, usize) {
         captures: alloc::vec![NanBox::undefined()],
     };
     let base = core::ptr::addr_of!(cell) as usize;
-    // SAFETY: `cell` is a live, initialized `Cell`; its repr(u8) tag byte is in
-    // bounds and always a valid `u8`.
+    // SAFETY: `cell` is a live, initialized `Cell`; its tag byte (the first, see
+    // [`Cell`]) is in bounds and always a valid `u8`.
     #[allow(unsafe_code)]
     let disc = unsafe { *(base as *const u8) };
     let Cell::VmFunction { func, captures } = &cell else {
@@ -514,8 +530,8 @@ pub(crate) fn jit_vm_function_layout() -> (u8, usize, usize) {
 pub(crate) fn jit_box_layout() -> (u8, usize) {
     let cell = Cell::Box(NanBox::number(1.5));
     let base = core::ptr::addr_of!(cell) as usize;
-    // SAFETY: `cell` is a live, initialized `Cell`; its repr(u8) tag byte is in
-    // bounds and always a valid `u8`.
+    // SAFETY: `cell` is a live, initialized `Cell`; its tag byte (the first, see
+    // [`Cell`]) is in bounds and always a valid `u8`.
     #[allow(unsafe_code)]
     let disc = unsafe { *(base as *const u8) };
     let Cell::Box(v) = &cell else {
@@ -530,8 +546,8 @@ pub(crate) fn jit_box_layout() -> (u8, usize) {
 pub(crate) fn jit_native_layout() -> (u8, usize) {
     let cell = Cell::Native(0x1234);
     let base = core::ptr::addr_of!(cell) as usize;
-    // SAFETY: `cell` is a live, initialized `Cell`; its repr(u8) tag byte is in
-    // bounds and always a valid `u8`.
+    // SAFETY: `cell` is a live, initialized `Cell`; its tag byte (the first, see
+    // [`Cell`]) is in bounds and always a valid `u8`.
     #[allow(unsafe_code)]
     let disc = unsafe { *(base as *const u8) };
     let Cell::Native(id) = &cell else {
@@ -545,8 +561,8 @@ pub(crate) fn jit_native_layout() -> (u8, usize) {
 pub(crate) fn jit_cell_layout() -> CellLayout {
     let cell = Cell::Object(Object::new(crate::shape::Shape::root()));
     let base = core::ptr::addr_of!(cell) as usize;
-    // SAFETY: `cell` is a live, initialized `Cell`; its repr(u8) tag byte is in
-    // bounds and always a valid `u8`.
+    // SAFETY: `cell` is a live, initialized `Cell`; its tag byte (the first, see
+    // [`Cell`]) is in bounds and always a valid `u8`.
     #[allow(unsafe_code)]
     let object_disc = unsafe { *(base as *const u8) };
     let object_off = match &cell {
@@ -561,8 +577,8 @@ pub(crate) fn jit_cell_layout() -> CellLayout {
         NanBox::number(3.0)
     ]));
     let arr_base = core::ptr::addr_of!(arr) as usize;
-    // SAFETY: `arr` is a live, initialized `Cell`; its repr(u8) tag byte is in
-    // bounds and always a valid `u8`.
+    // SAFETY: `arr` is a live, initialized `Cell`; its tag byte (the first, see
+    // [`Cell`]) is in bounds and always a valid `u8`.
     #[allow(unsafe_code)]
     let array_disc = unsafe { *(arr_base as *const u8) };
     let (array_vec_off, array_side_off) = match &arr {
@@ -1079,5 +1095,36 @@ mod tests {
         assert_eq!(stats.marked, 3); // arr -> mid -> leaf
         assert_eq!(stats.swept, 1); // the string
         assert!(heap.is_live(arr) && heap.is_live(mid_h) && heap.is_live(leaf));
+    }
+
+    #[test]
+    fn every_cell_variant_shares_the_object_tag_byte() {
+        // The tag is the niche in an object's first byte (see `Cell`): each
+        // variant reads back a distinct first byte, and an object's is its
+        // shaped-mode byte.
+        let probe = |c: &Cell| {
+            // SAFETY: reading the first byte of a live `Cell`, which is its
+            // tag (see `Cell`) and always initialized.
+            #[allow(unsafe_code)]
+            unsafe {
+                *core::ptr::addr_of!(*c).cast::<u8>()
+            }
+        };
+        let cells = [
+            Cell::Object(Object::new(Shape::root())),
+            Cell::Str(Rope::from("s")),
+            Cell::Array(alloc::vec![NanBox::undefined()].into()),
+            Cell::Box(NanBox::number(1.0)),
+            Cell::Native(7),
+            Cell::HostFn(7),
+            Cell::Date(0.0),
+        ];
+        let tags: Vec<u8> = cells.iter().map(probe).collect();
+        assert_eq!(tags[0], 0);
+        for (i, a) in tags.iter().enumerate() {
+            for b in &tags[i + 1..] {
+                assert_ne!(a, b, "cell tags collide: {tags:?}");
+            }
+        }
     }
 }

@@ -74,18 +74,73 @@ impl Handle {
 /// A heap slot: either holds a live value or is free and awaiting reuse. Both
 /// carry the generation so a freed-then-reallocated slot invalidates old
 /// handles.
-#[repr(u8)] // JIT inline fast path bakes Slot<Cell> offsets; verified in jit layout test
-enum Slot<T> {
-    Occupied {
-        generation: u16,
-        /// Collections this object has survived (for generational GC): `0` is
-        /// the young generation; promoted objects age up.
-        age: u8,
-        value: T,
-    },
-    Free {
-        generation: u16,
-    },
+///
+/// A struct rather than an enum so the slot adds only its few header bytes to
+/// the value: `Option<T>` takes the value's own niche (a `Cell`'s tag), and
+/// the generation, age and occupancy byte share one word. Compiled code reads
+/// all of them at probed offsets (`jit_slot_layout`).
+struct Slot<T> {
+    /// The value, or `None` for a free slot.
+    value: Option<T>,
+    /// The generation: a live slot's handles carry it; a free slot holds the
+    /// one its next occupant will get.
+    generation: u16,
+    /// Collections this object has survived (for generational GC): `0` is
+    /// the young generation; promoted objects age up.
+    age: u8,
+    /// [`SLOT_OCCUPIED`] while `value` is `Some`, else `0` — what compiled
+    /// code tests (it cannot decode the `Option`).
+    occupied: u8,
+}
+
+/// [`Slot::occupied`] of a live slot.
+const SLOT_OCCUPIED: u8 = 1;
+
+impl<T> Slot<T> {
+    /// A live slot holding `value`.
+    #[inline]
+    const fn live(generation: u16, age: u8, value: T) -> Self {
+        Self {
+            value: Some(value),
+            generation,
+            age,
+            occupied: SLOT_OCCUPIED,
+        }
+    }
+
+    /// The value, if the slot is live in `generation`.
+    #[inline]
+    fn get(&self, generation: u16) -> Option<&T> {
+        if self.generation == generation {
+            self.value.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// The value, mutably, if the slot is live in `generation`.
+    #[inline]
+    fn get_mut(&mut self, generation: u16) -> Option<&mut T> {
+        if self.generation == generation {
+            self.value.as_mut()
+        } else {
+            None
+        }
+    }
+
+    /// Whether the slot holds a value.
+    #[inline]
+    const fn is_live(&self) -> bool {
+        self.value.is_some()
+    }
+
+    /// Empties the slot (dropping its value in place), giving it `generation`.
+    #[inline]
+    fn clear(&mut self, generation: u16) {
+        self.occupied = 0;
+        self.generation = generation;
+        self.value = None;
+    }
 }
 
 /// Runtime-probed byte layout of `Slot<T>` for the generic-JIT inline
@@ -97,8 +152,10 @@ enum Slot<T> {
 pub(crate) struct SlotLayout {
     /// `size_of::<Slot<T>>()` — the arena stride (`base + index * stride`).
     pub stride: usize,
-    /// The `Slot::Occupied` discriminant byte value (tag at offset 0).
+    /// The occupancy byte's value in a live slot.
     pub occupied_disc: u8,
+    /// Byte offset of the occupancy byte within the slot.
+    pub occupied_off: usize,
     /// Byte offset of the `generation: u16` field within the slot.
     pub generation_off: usize,
     /// Byte offset of the payload value (`T`) within the slot.
@@ -107,39 +164,22 @@ pub(crate) struct SlotLayout {
     pub age_off: usize,
 }
 
-/// Derives [`SlotLayout`] for `Slot<T>` from a real `Occupied` instance. `value`
-/// supplies a `T` so the enum can be built; only its byte layout is inspected.
+/// Derives [`SlotLayout`] for `Slot<T>` from a real live instance. `value`
+/// supplies a `T` so the slot can be built; only its byte layout is inspected.
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn jit_slot_layout<T>(value: T) -> SlotLayout {
-    let slot: Slot<T> = Slot::Occupied {
-        generation: 0,
-        age: 0,
-        value,
-    };
+    let slot: Slot<T> = Slot::live(0, 0, value);
     let base = core::ptr::addr_of!(slot) as usize;
-    // The repr(u8) discriminant is the first byte.
-    // SAFETY: `slot` is a live, initialized `Slot<T>`; reading its tag byte is in
-    // bounds and the byte is always a valid `u8`.
-    #[allow(unsafe_code)]
-    let occupied_disc = unsafe { *(base as *const u8) };
-    let (generation_off, value_off, age_off) = match &slot {
-        Slot::Occupied {
-            generation,
-            value,
-            age,
-        } => (
-            core::ptr::addr_of!(*generation) as usize - base,
-            core::ptr::addr_of!(*value) as usize - base,
-            core::ptr::addr_of!(*age) as usize - base,
-        ),
-        Slot::Free { .. } => unreachable!("just built an Occupied slot"),
-    };
+    let value = slot.value.as_ref().expect("just built a live slot");
     SlotLayout {
         stride: core::mem::size_of::<Slot<T>>(),
-        occupied_disc,
-        generation_off,
-        value_off,
-        age_off,
+        occupied_disc: SLOT_OCCUPIED,
+        occupied_off: core::ptr::addr_of!(slot.occupied) as usize - base,
+        generation_off: core::ptr::addr_of!(slot.generation) as usize - base,
+        // The payload of `Some(value)` — where the `T` itself lies (`Option<T>`
+        // keeps no separate tag for a niche-carrying `T`).
+        value_off: core::ptr::addr_of!(*value) as usize - base,
+        age_off: core::ptr::addr_of!(slot.age) as usize - base,
     }
 }
 
@@ -154,11 +194,11 @@ pub(crate) fn jit_heap_slots_offsets() -> (usize, usize) {
     use crate::cell::Cell;
     let mut v: Vec<Slot<Cell>> = Vec::with_capacity(8);
     for _ in 0..3 {
-        v.push(Slot::Occupied {
-            generation: 0,
-            age: 0,
-            value: Cell::Object(crate::object::Object::new(crate::shape::Shape::root())),
-        });
+        v.push(Slot::live(
+            0,
+            0,
+            Cell::Object(crate::object::Object::new(crate::shape::Shape::root())),
+        ));
     }
     let vec = core::ptr::addr_of!(v) as usize;
     let word = core::mem::size_of::<usize>();
@@ -331,15 +371,13 @@ impl<T> Heap<T> {
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             // A freed slot already had its generation bumped; reuse it as-is.
-            let generation = match slot {
-                Slot::Free { generation } => *generation,
-                Slot::Occupied { .. } => unreachable!("free list pointed at a live slot"),
-            };
-            *slot = Slot::Occupied {
-                generation,
-                age: 0,
-                value,
-            };
+            debug_assert!(!slot.is_live(), "free list pointed at a live slot");
+            let generation = slot.generation;
+            slot.age = 0;
+            slot.occupied = SLOT_OCCUPIED;
+            // The slot is empty, so there is nothing to drop: `forget` the
+            // `None` rather than run the drop glue over it.
+            core::mem::forget(slot.value.replace(value));
             Handle { index, generation }
         } else {
             // Slot index `u32::MAX` is never handed out: its handle bits are
@@ -348,11 +386,7 @@ impl<T> Heap<T> {
                 .ok()
                 .filter(|&i| i != u32::MAX)
                 .expect("heap slot space exhausted");
-            self.slots.push(Slot::Occupied {
-                generation: 0,
-                age: 0,
-                value,
-            });
+            self.slots.push(Slot::live(0, 0, value));
             Handle {
                 index,
                 generation: 0,
@@ -367,12 +401,9 @@ impl<T> Heap<T> {
         if self.poison.is_some() {
             self.note_poison_use(handle);
         }
-        match self.slots.get(handle.index as usize)? {
-            Slot::Occupied {
-                generation, value, ..
-            } if *generation == handle.generation => Some(value),
-            _ => None,
-        }
+        self.slots
+            .get(handle.index as usize)?
+            .get(handle.generation)
     }
 
     /// Like [`get`](Heap::get), but exempt from the GC-verification poison check.
@@ -384,12 +415,9 @@ impl<T> Heap<T> {
     /// one.
     #[must_use]
     pub fn peek(&self, handle: Handle) -> Option<&T> {
-        match self.slots.get(handle.index as usize)? {
-            Slot::Occupied {
-                generation, value, ..
-            } if *generation == handle.generation => Some(value),
-            _ => None,
-        }
+        self.slots
+            .get(handle.index as usize)?
+            .get(handle.generation)
     }
 
     /// Mutably borrows the value behind `handle`, with the same staleness check
@@ -398,23 +426,17 @@ impl<T> Heap<T> {
         if self.poison.is_some() {
             self.note_poison_use(handle);
         }
-        match self.slots.get_mut(handle.index as usize)? {
-            Slot::Occupied {
-                generation, value, ..
-            } if *generation == handle.generation => Some(value),
-            _ => None,
-        }
+        self.slots
+            .get_mut(handle.index as usize)?
+            .get_mut(handle.generation)
     }
 
     /// The mutable counterpart of [`peek`](Heap::peek): exempt from the
     /// GC-verification poison check, for code driven by a heap enumeration.
     pub fn peek_mut(&mut self, handle: Handle) -> Option<&mut T> {
-        match self.slots.get_mut(handle.index as usize)? {
-            Slot::Occupied {
-                generation, value, ..
-            } if *generation == handle.generation => Some(value),
-            _ => None,
-        }
+        self.slots
+            .get_mut(handle.index as usize)?
+            .get_mut(handle.generation)
     }
 
     /// Swaps the *values* held by two live handles, leaving each slot's identity
@@ -448,21 +470,7 @@ impl<T> Heap<T> {
         } else {
             (slot_hi, slot_lo)
         };
-        if let (
-            Slot::Occupied {
-                generation: ga,
-                value: va,
-                ..
-            },
-            Slot::Occupied {
-                generation: gb,
-                value: vb,
-                ..
-            },
-        ) = (sa, sb)
-            && *ga == a.generation
-            && *gb == b.generation
-        {
+        if let (Some(va), Some(vb)) = (sa.get_mut(a.generation), sb.get_mut(b.generation)) {
             core::mem::swap(va, vb);
         }
     }
@@ -475,10 +483,9 @@ impl<T> Heap<T> {
     /// actual [`get`](Heap::get)/[`get_mut`](Heap::get_mut) counts as a use.
     #[must_use]
     pub fn is_live(&self, handle: Handle) -> bool {
-        matches!(
-            self.slots.get(handle.index as usize),
-            Some(Slot::Occupied { generation, .. }) if *generation == handle.generation
-        )
+        self.slots
+            .get(handle.index as usize)
+            .is_some_and(|s| s.is_live() && s.generation == handle.generation)
     }
 
     /// A handle to every currently-live slot (used by the collector to find the
@@ -488,12 +495,10 @@ impl<T> Heap<T> {
         self.slots
             .iter()
             .enumerate()
-            .filter_map(|(i, slot)| match slot {
-                Slot::Occupied { generation, .. } => Some(Handle {
-                    index: i as u32,
-                    generation: *generation,
-                }),
-                Slot::Free { .. } => None,
+            .filter(|(_, slot)| slot.is_live())
+            .map(|(i, slot)| Handle {
+                index: i as u32,
+                generation: slot.generation,
             })
             .collect()
     }
@@ -521,20 +526,15 @@ impl<T> Heap<T> {
         } = self;
         let mut swept = 0;
         for (i, slot) in slots.iter_mut().enumerate() {
-            let Slot::Occupied {
-                generation,
-                age,
-                value,
-            } = slot
-            else {
+            let Some(value) = &slot.value else {
                 continue;
             };
             let h = Handle {
                 index: i as u32,
-                generation: *generation,
+                generation: slot.generation,
             };
             if keep(h, value) {
-                *age = age.saturating_add(1);
+                slot.age = slot.age.saturating_add(1);
                 continue;
             }
             swept += 1;
@@ -544,11 +544,9 @@ impl<T> Heap<T> {
             }
             // See `free` for why a slot leaving the low generation range is
             // retired rather than reused.
-            let next_gen = generation.wrapping_add(1);
-            // Assigning drops the old value in place.
-            *slot = Slot::Free {
-                generation: next_gen,
-            };
+            let next_gen = slot.generation.wrapping_add(1);
+            // Drops the old value in place.
+            slot.clear(next_gen);
             if next_gen < COMPACT_GEN_BASE {
                 free.push(i as u32);
             }
@@ -561,23 +559,18 @@ impl<T> Heap<T> {
     /// `None` if stale. `0` is the young generation.
     #[must_use]
     pub fn age(&self, handle: Handle) -> Option<u8> {
-        match self.slots.get(handle.index as usize)? {
-            Slot::Occupied {
-                generation, age, ..
-            } if *generation == handle.generation => Some(*age),
-            _ => None,
-        }
+        let slot = self.slots.get(handle.index as usize)?;
+        (slot.is_live() && slot.generation == handle.generation).then_some(slot.age)
     }
 
     /// Promotes `handle`'s object by one generation (saturating), marking it as
     /// having survived another collection.
     pub fn tenure(&mut self, handle: Handle) {
-        if let Some(Slot::Occupied {
-            generation, age, ..
-        }) = self.slots.get_mut(handle.index as usize)
-            && *generation == handle.generation
+        if let Some(slot) = self.slots.get_mut(handle.index as usize)
+            && slot.is_live()
+            && slot.generation == handle.generation
         {
-            *age = age.saturating_add(1);
+            slot.age = slot.age.saturating_add(1);
         }
     }
 
@@ -589,14 +582,10 @@ impl<T> Heap<T> {
         self.slots
             .iter()
             .enumerate()
-            .filter_map(|(i, slot)| match slot {
-                Slot::Occupied {
-                    generation, age, ..
-                } if keep(*age) => Some(Handle {
-                    index: i as u32,
-                    generation: *generation,
-                }),
-                _ => None,
+            .filter(|(_, slot)| slot.is_live() && keep(slot.age))
+            .map(|(i, slot)| Handle {
+                index: i as u32,
+                generation: slot.generation,
             })
             .collect()
     }
@@ -620,9 +609,9 @@ impl<T> Heap<T> {
         self.remembered
             .iter()
             .filter_map(|&index| match self.slots.get(index as usize) {
-                Some(Slot::Occupied { generation, .. }) => Some(Handle {
+                Some(slot) if slot.is_live() => Some(Handle {
                     index,
-                    generation: *generation,
+                    generation: slot.generation,
                 }),
                 _ => None,
             })
@@ -653,28 +642,26 @@ impl<T> Heap<T> {
         let mut new_slots: Vec<Slot<T>> = Vec::new();
         let mut map: Vec<(Handle, Handle)> = Vec::new();
         for (i, slot) in old_slots.into_iter().enumerate() {
-            if let Slot::Occupied {
+            let Slot {
+                value: Some(value),
                 generation,
                 age,
-                value,
+                ..
             } = slot
-            {
-                let old = Handle {
-                    index: i as u32,
-                    generation,
+            else {
+                continue;
+            };
+            let old = Handle {
+                index: i as u32,
+                generation,
+            };
+            if keep.contains(&old) {
+                let new = Handle {
+                    index: new_slots.len() as u32,
+                    generation: new_gen,
                 };
-                if keep.contains(&old) {
-                    let new = Handle {
-                        index: new_slots.len() as u32,
-                        generation: new_gen,
-                    };
-                    new_slots.push(Slot::Occupied {
-                        generation: new_gen,
-                        age,
-                        value,
-                    });
-                    map.push((old, new));
-                }
+                new_slots.push(Slot::live(new_gen, age, value));
+                map.push((old, new));
             }
         }
         self.slots = new_slots;
@@ -694,8 +681,8 @@ impl<T> Heap<T> {
             return None;
         }
         let slot = self.slots.get_mut(handle.index as usize)?;
-        match slot {
-            Slot::Occupied { generation, .. } if *generation == handle.generation => {
+        match slot.generation {
+            generation if slot.is_live() && generation == handle.generation => {
                 // Bump the generation and take the value out. The bump must stay
                 // strictly below the compaction-reserved range, so free/reuse
                 // generations remain disjoint from those `compact_to` hands out
@@ -713,14 +700,9 @@ impl<T> Heap<T> {
                 // reuses of that slot and removes the hazard outright.
                 let next_gen = generation.wrapping_add(1);
                 let retire = next_gen >= COMPACT_GEN_BASE;
-                let Slot::Occupied { value, .. } = core::mem::replace(
-                    slot,
-                    Slot::Free {
-                        generation: next_gen,
-                    },
-                ) else {
-                    unreachable!()
-                };
+                let value = slot.value.take().expect("a live slot holds a value");
+                slot.occupied = 0;
+                slot.generation = next_gen;
                 if !retire {
                     self.free.push(handle.index);
                 }
@@ -857,5 +839,15 @@ mod tests {
         let raw = handle.to_raw();
         let reconstructed = Handle::from_raw(raw);
         assert_eq!(h.get(reconstructed), Some(&99));
+    }
+
+    #[test]
+    fn a_slot_adds_one_word_to_its_cell() {
+        // `Option<Cell>` takes the cell's niche, and the generation, age and
+        // occupancy byte share the one word the slot adds.
+        use crate::cell::Cell;
+        use core::mem::size_of;
+        assert_eq!(size_of::<Option<Cell>>(), size_of::<Cell>());
+        assert_eq!(size_of::<Slot<Cell>>(), size_of::<Cell>() + 8);
     }
 }

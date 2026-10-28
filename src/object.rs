@@ -12,7 +12,7 @@
 //!
 //! An object that accumulates more own properties than the realm's
 //! `object_dictionary_threshold` switches, behind this same method API, from the
-//! shaped representation to a **dictionary** (`ObjectData::Dict`): an
+//! shaped representation to a **dictionary** (`Mode::Dict`): an
 //! insertion-ordered map that creates no further shape transitions. This bounds
 //! the shape transition-tree's growth for programs that pile up unbounded unique
 //! keys (MEM-3), at the cost of the per-shape inline-cache fast path for those
@@ -41,53 +41,45 @@ fn array_index(k: &str) -> Option<u32> {
         .filter(|n| *n < u32::MAX && n.to_string() == k)
 }
 
-/// The internal storage representation of an [`Object`]'s data properties.
+/// How an [`Object`] stores its data properties.
 ///
-/// Objects start in `Shaped` mode — a shared hidden-class
-/// [`Shape`] plus a dense slot vector — which is the zero-overhead representation
-/// for normal objects whose structure is shared across many instances. An object
-/// that accumulates more own properties than the realm's
-/// `object_dictionary_threshold` converts in place to
-/// `Dict` mode, an insertion-ordered map that adds **no**
-/// shape transitions: this bounds the shape transition-tree's growth for
-/// programs that pile up unbounded unique keys (MEM-3).
-#[repr(u8)] // JIT inline fast path bakes the Shaped discriminant + field offsets; verified
-enum ObjectData {
-    /// Default representation: a hidden-class shape and a dense value vector
-    /// indexed by the shape's slot numbers.
-    ///
-    /// `len` (the number of slots, always the shape's length) sits right after
-    /// the tag, in what would otherwise be padding; the first
-    /// [`INLINE_SLOTS`] values live in the object itself (see [`Slots`]).
-    Shaped {
-        len: u32,
-        shape: Rc<Shape>,
-        slots: Slots,
-    },
-    /// Dictionary representation: values keyed by name, with a parallel list
-    /// preserving insertion order. Carries no live `Rc<Shape>`, so it creates no
-    /// transitions.
-    ///
-    /// Each map entry records its key's index in `order`. `delete` leaves a
-    /// `None` **tombstone** at that index instead of removing it (an eager
-    /// removal is a linear `retain`, so deleting n keys was O(n²) — 20 000
-    /// deletes took 9.7 s against node's 2 ms); a re-added key is appended,
-    /// which is exactly the spec's "a re-created property is chronologically
-    /// new". Enumeration skips tombstones without consulting the map, and
-    /// `compact_order` drops them once they outnumber the live keys.
-    ///
-    /// The map is boxed so this variant is no larger than `Shaped`, keeping
-    /// every object (shaped or not) small.
-    Dict {
-        order: Vec<Option<Box<str>>>,
-        // Deliberate: the box keeps `Dict` no larger than `Shaped`.
-        #[allow(clippy::box_collection)]
-        map: Box<BTreeMap<Box<str>, DictSlot>>,
-        /// An empty sentinel shape returned by [`Object::shape`] in this mode,
-        /// so inline caches keyed on the shape pointer always miss (an empty
-        /// shape resolves no key) and never bind a dictionary object.
-        sentinel: Rc<Shape>,
-    },
+/// Objects start `Shaped` — a shared hidden-class [`Shape`] plus value slots
+/// indexed by the shape's slot numbers — which is the zero-overhead
+/// representation for normal objects whose structure is shared across many
+/// instances. An object that accumulates more own properties than the realm's
+/// `object_dictionary_threshold` converts in place to `Dict` mode, an
+/// insertion-ordered map (see [`DictData`]) that adds **no** shape
+/// transitions: this bounds the shape transition-tree's growth for programs
+/// that pile up unbounded unique keys (MEM-3).
+///
+/// The mode is the object's first byte, and since only two of its 256 values
+/// are valid, the rest are a niche the enclosing `Cell` encodes its other
+/// variants in: a `Cell::Object` needs no tag of its own, so a heap cell is no
+/// larger than an object. (Compiled code reads the cell's tag and the mode at
+/// the same, probed, offset.)
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// A shape plus slots.
+    Shaped = 0,
+    /// A dictionary ([`ObjectExtra::dict`]).
+    Dict = 1,
+}
+
+/// A dictionary-mode object's properties: values keyed by name, with a
+/// parallel list preserving insertion order.
+///
+/// Each map entry records its key's index in `order`. `delete` leaves a
+/// `None` **tombstone** at that index instead of removing it (an eager
+/// removal is a linear `retain`, so deleting n keys was O(n²) — 20 000
+/// deletes took 9.7 s against node's 2 ms); a re-added key is appended,
+/// which is exactly the spec's "a re-created property is chronologically
+/// new". Enumeration skips tombstones without consulting the map, and
+/// `compact_order` drops them once they outnumber the live keys.
+#[derive(Default)]
+struct DictData {
+    order: Vec<Option<Box<str>>>,
+    map: BTreeMap<Box<str>, DictSlot>,
 }
 
 /// How many property values an object stores inline, in its own cell, before
@@ -96,102 +88,13 @@ enum ObjectData {
 /// beyond their heap cell — and dropping a dead one frees nothing.
 pub(crate) const INLINE_SLOTS: usize = 4;
 
-/// A shaped object's property values: slot `i < INLINE_SLOTS` in `inline`,
-/// the rest in `spill` (slot `i` at `spill[i - INLINE_SLOTS]`). The count is
-/// the enclosing [`ObjectData::Shaped`]'s `len`; `spill` holds exactly
-/// `len - INLINE_SLOTS` values once `len` exceeds the inline room (else none),
-/// and inline entries at or past `len` are unused (never read or traced).
-#[repr(C)] // compiled code reads `inline` and `spill` at probed offsets
-struct Slots {
-    inline: [NanBox; INLINE_SLOTS],
-    spill: Vec<NanBox>,
-}
-
-impl Slots {
-    /// No values.
-    #[inline]
-    fn new() -> Self {
-        Self {
-            inline: [NanBox::undefined(); INLINE_SLOTS],
-            spill: Vec::new(),
-        }
-    }
-
-    /// Slots holding `values` in order, and their count.
-    fn from_values(values: impl IntoIterator<Item = NanBox>) -> (u32, Self) {
-        let mut s = Self::new();
-        let mut len = 0u32;
-        for v in values {
-            s.push(&mut len, v);
-        }
-        (len, s)
-    }
-
-    /// Slot `i` of `len`, if in range.
-    #[inline]
-    fn get(&self, len: u32, i: u32) -> Option<NanBox> {
-        if i >= len {
-            return None;
-        }
-        let i = i as usize;
-        if i < INLINE_SLOTS {
-            Some(self.inline[i])
-        } else {
-            self.spill.get(i - INLINE_SLOTS).copied()
-        }
-    }
-
-    /// Slot `i` of `len`, mutably, if in range.
-    #[inline]
-    fn get_mut(&mut self, len: u32, i: u32) -> Option<&mut NanBox> {
-        if i >= len {
-            return None;
-        }
-        let i = i as usize;
-        if i < INLINE_SLOTS {
-            Some(&mut self.inline[i])
-        } else {
-            self.spill.get_mut(i - INLINE_SLOTS)
-        }
-    }
-
-    /// Slot `i`, which must be in range (`i < len`).
-    #[inline]
-    fn at(&self, len: u32, i: u32) -> NanBox {
-        self.get(len, i).expect("slot index in range")
-    }
-
-    /// Appends `v` as slot `len`, bumping `len`.
-    #[inline]
-    fn push(&mut self, len: &mut u32, v: NanBox) {
-        let i = *len as usize;
-        if i < INLINE_SLOTS {
-            self.inline[i] = v;
-        } else {
-            self.spill.push(v);
-        }
-        *len += 1;
-    }
-
-    /// The `len` values in slot order.
-    #[inline]
-    fn iter(&self, len: u32) -> impl Iterator<Item = &NanBox> {
-        self.inline[..(len as usize).min(INLINE_SLOTS)]
-            .iter()
-            .chain(self.spill.iter())
-    }
-
-    /// The `len` values in slot order, mutably.
-    #[inline]
-    fn iter_mut(&mut self, len: u32) -> impl Iterator<Item = &mut NanBox> {
-        self.inline[..(len as usize).min(INLINE_SLOTS)]
-            .iter_mut()
-            .chain(self.spill.iter_mut())
-    }
-}
+/// The most slots a shaped object holds (its count is a `u16`); an object
+/// that would grow past it becomes a dictionary, whatever the realm's
+/// threshold.
+const MAX_SHAPED_LEN: usize = u16::MAX as usize;
 
 /// A dictionary-mode property: its value and its key's index in the insertion
-/// `order` (see [`ObjectData::Dict`]).
+/// `order` (see [`DictData`]).
 #[derive(Clone, Copy)]
 struct DictSlot {
     value: NanBox,
@@ -228,6 +131,21 @@ pub const JIT_FLAG_GLOBAL: u8 = 8;
 /// compiled code adds no property to such an object inline (its slow path
 /// does the bump), but may still store to its existing data properties.
 pub const JIT_FLAG_WATCHED: u8 = 16;
+/// The [`JIT_FLAG_EXOTIC`]..[`JIT_FLAG_WATCHED`] bits of an object's flags
+/// byte (what [`Object::jit_flags`] reports).
+const JIT_FLAGS_MASK: u8 = 0x1f;
+/// Flags-byte bit: the object is frozen (`Object.freeze`): no new properties
+/// and no writes to existing ones. Always set together with
+/// [`OBJ_FLAG_SEALED`] and [`OBJ_FLAG_NON_EXTENSIBLE`].
+pub(crate) const OBJ_FLAG_FROZEN: u8 = 0x20;
+/// Flags-byte bit: the object is sealed (`Object.seal`): no new properties
+/// and no deletions, but existing writable properties may still change.
+/// Always set together with [`OBJ_FLAG_NON_EXTENSIBLE`].
+pub(crate) const OBJ_FLAG_SEALED: u8 = 0x40;
+/// Flags-byte bit: new properties may not be added
+/// (`Object.preventExtensions`). Stored inverted so an ordinary object's
+/// flags byte is `0`.
+pub(crate) const OBJ_FLAG_NON_EXTENSIBLE: u8 = 0x80;
 
 /// The prototype epoch: bumped whenever an object flagged
 /// [`JIT_FLAG_WATCHED`] changes layout (see [`Object`]'s layout hooks) and
@@ -261,43 +179,60 @@ pub(crate) fn proto_epoch_addr() -> usize {
 /// A property-bearing object: a hidden-class shape plus its value slots (or a
 /// dictionary once it grows past the threshold), with an optional side list of
 /// accessor (getter/setter) properties.
-#[repr(C)] // JIT inline fast path bakes `data` at offset 0; verified in jit layout test
+///
+/// 64 bytes: a header word (mode, flags, slot count, key epoch), the shape,
+/// the prototype, the out-of-line part and four inline values. Slot
+/// `i < INLINE_SLOTS` is `inline[i]`; the rest live in the out-of-line part's
+/// `spill` (slot `i` at `spill[i - INLINE_SLOTS]`). `len` counts the slots
+/// (always the shape's length in shaped mode, `0` in dictionary mode);
+/// inline entries at or past it are unused (never read or traced).
+#[repr(C)] // compiled code reads the fields at probed offsets; `mode` must be first (the niche)
 pub struct Object {
-    /// The data-property storage: shaped (default) or dictionary mode.
-    data: ObjectData,
-    /// Whether the object is frozen (`Object.freeze`): no new properties and no
-    /// writes to existing ones.
-    frozen: bool,
-    /// Whether new properties may be added (`Object.preventExtensions` clears it).
-    extensible: bool,
-    /// Whether the object is sealed (`Object.seal`): no new properties and no
-    /// deletions, but existing writable properties may still change.
-    sealed: bool,
-    /// Flags the generic JIT's inline property paths test before touching the
-    /// object ([`JIT_FLAG_EXOTIC`], [`JIT_FLAG_NO_INLINE_SET`]); `0` for an
-    /// ordinary object; also [`JIT_FLAG_READONLY`]. Only ever set (never
-    /// cleared), so a stale `1` merely sends an access to the (always correct)
-    /// helper.
-    jit_flags: u8,
+    /// Shaped or dictionary storage. First, so `Cell` can use its niche.
+    mode: Mode,
+    /// [`JIT_FLAG_EXOTIC`] and the other generic-JIT bits (tested by the
+    /// JIT's inline property paths before touching the object; only ever set,
+    /// never cleared, so a stale bit merely sends an access to the always
+    /// correct helper), plus the integrity bits ([`OBJ_FLAG_FROZEN`],
+    /// [`OBJ_FLAG_SEALED`], [`OBJ_FLAG_NON_EXTENSIBLE`]). `0` for an
+    /// ordinary, extensible object.
+    flags: u8,
+    /// The number of slots (shaped mode).
+    len: u16,
     /// Bumped whenever the set of own keys (data or accessor) may have changed,
     /// so a cache of "does this object own `k`" can be revalidated by a compare
     /// (see [`key_epoch`](Object::key_epoch)).
     key_epoch: u32,
+    /// The hidden class (shaped mode), or an empty sentinel shape (dictionary
+    /// mode, so inline caches keyed on it always miss).
+    shape: Rc<Shape>,
     /// The `[[Prototype]]` link (`Object.create`/`getPrototypeOf`) as a raw
     /// handle ([`Handle::to_raw`](crate::heap::Handle::to_raw)), or
     /// [`NO_PROTO`] for none. A property miss walks this chain. Stored raw (one
     /// word) so compiled code can compare it with a cached handle.
     proto: u64,
-    /// The rarely-used parts of an object (accessors, attribute marks, the
-    /// unified key order, the class tag), boxed so an ordinary data object —
-    /// the overwhelmingly common case — stays small. `None` means all empty.
+    /// The rarely-used parts of an object (spilled slots, the dictionary,
+    /// accessors, attribute marks, the unified key order, the class tag),
+    /// boxed so an ordinary data object — the overwhelmingly common case —
+    /// stays small. `None` means all empty.
     extra: Option<Box<ObjectExtra>>,
+    /// The first [`INLINE_SLOTS`] slot values.
+    inline: [NanBox; INLINE_SLOTS],
 }
+
+// A heap cell is an object (no separate tag; see [`Mode`]), and both fit a
+// cache line.
+const _: () = assert!(core::mem::size_of::<Object>() == 64);
 
 /// The out-of-line part of an [`Object`]: everything an ordinary data object
 /// leaves empty. Allocated on first use (see `Object::extra_mut`).
 #[derive(Default)]
 struct ObjectExtra {
+    /// Slot values past the inline room, in slot order: `spill[i]` is slot
+    /// `INLINE_SLOTS + i` (shaped mode).
+    spill: Vec<NanBox>,
+    /// The properties of a dictionary-mode object.
+    dict: Option<Box<DictData>>,
     /// Own keys that are **non-writable** (`defineProperty` with
     /// `writable: false`): writes are silently ignored.
     readonly: Vec<alloc::boxed::Box<str>>,
@@ -324,14 +259,36 @@ struct ObjectExtra {
     key_order: Option<Vec<Box<str>>>,
 }
 
+impl ObjectExtra {
+    /// Whether nothing is recorded (the object could drop its box).
+    fn is_empty(&self) -> bool {
+        self.spill.is_empty()
+            && self.dict.is_none()
+            && self.readonly.is_empty()
+            && self.accessors.is_empty()
+            && self.hidden.is_empty()
+            && self.non_configurable.is_empty()
+            && self.class_tag.is_none()
+            && self.key_order.is_none()
+    }
+}
+
 /// The all-empty [`ObjectExtra`] that reads see when an object has none.
 static EMPTY_EXTRA: ObjectExtra = ObjectExtra {
+    spill: Vec::new(),
+    dict: None,
     readonly: Vec::new(),
     accessors: Vec::new(),
     hidden: Vec::new(),
     non_configurable: Vec::new(),
     class_tag: None,
     key_order: None,
+};
+
+/// An empty dictionary, for reads of a dictionary-mode object's map.
+static EMPTY_DICT: DictData = DictData {
+    order: Vec::new(),
+    map: BTreeMap::new(),
 };
 
 impl Object {
@@ -341,18 +298,14 @@ impl Object {
     #[must_use]
     pub fn new(root: Rc<Shape>) -> Self {
         Self {
-            data: ObjectData::Shaped {
-                len: 0,
-                shape: root,
-                slots: Slots::new(),
-            },
-            frozen: false,
-            extensible: true,
-            sealed: false,
-            jit_flags: 0,
+            mode: Mode::Shaped,
+            flags: 0,
+            len: 0,
+            key_epoch: 0,
+            shape: root,
             proto: NO_PROTO,
             extra: None,
-            key_epoch: 0,
+            inline: [NanBox::undefined(); INLINE_SLOTS],
         }
     }
 
@@ -371,8 +324,8 @@ impl Object {
     #[inline]
     fn bump_key_epoch(&mut self) {
         self.key_epoch = self.key_epoch.wrapping_add(1);
-        if self.jit_flags & (JIT_FLAG_GLOBAL | JIT_FLAG_WATCHED) != 0 {
-            if self.jit_flags & JIT_FLAG_GLOBAL != 0 {
+        if self.flags & (JIT_FLAG_GLOBAL | JIT_FLAG_WATCHED) != 0 {
+            if self.flags & JIT_FLAG_GLOBAL != 0 {
                 crate::env::bump_global_binding_epoch();
             }
             self.layout_changed();
@@ -386,7 +339,7 @@ impl Object {
     /// when the object is [`JIT_FLAG_WATCHED`].
     #[inline]
     fn layout_changed(&self) {
-        if self.jit_flags & JIT_FLAG_WATCHED != 0 {
+        if self.flags & JIT_FLAG_WATCHED != 0 {
             bump_proto_epoch();
         }
     }
@@ -394,7 +347,131 @@ impl Object {
     /// Flags the object [`JIT_FLAG_WATCHED`] (a prototype-chain cache is
     /// recording it). Not itself a layout change.
     pub(crate) fn watch(&mut self) {
-        self.jit_flags |= JIT_FLAG_WATCHED;
+        self.flags |= JIT_FLAG_WATCHED;
+    }
+
+    /// Whether the object is in dictionary mode.
+    #[inline]
+    fn is_dict(&self) -> bool {
+        self.mode == Mode::Dict
+    }
+
+    /// The dictionary (dictionary mode; else an empty one).
+    #[inline]
+    fn dict(&self) -> &DictData {
+        self.ex().dict.as_deref().unwrap_or(&EMPTY_DICT)
+    }
+
+    /// The dictionary, mutably (dictionary mode only).
+    #[inline]
+    fn dict_mut(&mut self) -> &mut DictData {
+        debug_assert!(self.is_dict());
+        self.extra_mut().dict.get_or_insert_with(Default::default)
+    }
+
+    /// The spilled slot values (slot `INLINE_SLOTS + i` at `[i]`).
+    #[inline]
+    fn spill(&self) -> &[NanBox] {
+        self.extra.as_deref().map_or(&[], |x| &x.spill[..])
+    }
+
+    /// Slot `i`, if in range (shaped mode; a dictionary has no slots).
+    #[inline]
+    fn slot_get(&self, i: u32) -> Option<NanBox> {
+        if i >= u32::from(self.len) {
+            return None;
+        }
+        let i = i as usize;
+        if i < INLINE_SLOTS {
+            Some(self.inline[i])
+        } else {
+            self.spill().get(i - INLINE_SLOTS).copied()
+        }
+    }
+
+    /// Slot `i`, mutably, if in range.
+    #[inline]
+    fn slot_get_mut(&mut self, i: u32) -> Option<&mut NanBox> {
+        if i >= u32::from(self.len) {
+            return None;
+        }
+        let i = i as usize;
+        if i < INLINE_SLOTS {
+            Some(&mut self.inline[i])
+        } else {
+            self.extra
+                .as_deref_mut()
+                .and_then(|x| x.spill.get_mut(i - INLINE_SLOTS))
+        }
+    }
+
+    /// Slot `i`, which must be in range.
+    #[inline]
+    fn slot_at(&self, i: u32) -> NanBox {
+        self.slot_get(i).expect("slot index in range")
+    }
+
+    /// Appends `v` as the next slot (shaped mode; `len < MAX_SHAPED_LEN`).
+    #[inline]
+    fn slot_push(&mut self, v: NanBox) {
+        let i = self.len as usize;
+        debug_assert!(i < MAX_SHAPED_LEN);
+        if i < INLINE_SLOTS {
+            self.inline[i] = v;
+        } else {
+            self.extra_mut().spill.push(v);
+        }
+        self.len += 1;
+    }
+
+    /// The slot values, in slot order.
+    #[inline]
+    fn slots_iter(&self) -> impl Iterator<Item = &NanBox> {
+        self.inline[..(self.len as usize).min(INLINE_SLOTS)]
+            .iter()
+            .chain(self.spill().iter())
+    }
+
+    /// Replaces the slots with `values`, in order.
+    fn set_slots(&mut self, values: Vec<NanBox>) {
+        self.len = 0;
+        if let Some(x) = self.extra.as_deref_mut() {
+            x.spill.clear();
+        }
+        for v in values {
+            self.slot_push(v);
+        }
+    }
+
+    /// Drops the out-of-line part once it records nothing, so the object
+    /// qualifies for compiled code's inline adds again.
+    fn tidy_extra(&mut self) {
+        if self.extra.as_deref().is_some_and(ObjectExtra::is_empty) {
+            self.extra = None;
+        }
+    }
+
+    /// Adds `key` (absent) with `value`: a shape transition and a new slot, or
+    /// a dictionary entry. A shaped object already at [`MAX_SHAPED_LEN`]
+    /// becomes a dictionary first.
+    fn add_new(&mut self, key: &str, value: NanBox) {
+        if !self.is_dict() && self.len as usize >= MAX_SHAPED_LEN {
+            self.convert_to_dict();
+        }
+        if self.is_dict() {
+            let d = self.dict_mut();
+            d.map.insert(
+                Box::from(key),
+                DictSlot {
+                    value,
+                    pos: d.order.len(),
+                },
+            );
+            d.order.push(Some(Box::from(key)));
+        } else {
+            self.shape = self.shape.add(key);
+            self.slot_push(value);
+        }
     }
 
     /// The out-of-line part, or the shared empty one.
@@ -499,7 +576,7 @@ impl Object {
     /// The generic-JIT flags ([`JIT_FLAG_EXOTIC`], [`JIT_FLAG_NO_INLINE_SET`]).
     #[must_use]
     pub fn jit_flags(&self) -> u8 {
-        self.jit_flags
+        self.flags & JIT_FLAGS_MASK
     }
 
     /// Whether a new data property may be added to this object by adopting a
@@ -508,9 +585,7 @@ impl Object {
     /// order (so the add is the shape transition alone).
     #[must_use]
     pub fn jit_add_ok(&self) -> bool {
-        self.extensible
-            && !self.frozen
-            && !self.sealed
+        self.flags & (OBJ_FLAG_FROZEN | OBJ_FLAG_SEALED | OBJ_FLAG_NON_EXTENSIBLE) == 0
             && self
                 .extra
                 .as_deref()
@@ -522,14 +597,15 @@ impl Object {
     /// [`init_data_cached`](Self::init_data_cached). `false`, having changed
     /// nothing, when the object is not shaped or `to` is not such a child.
     pub fn jit_adopt_child(&mut self, to: Rc<Shape>, value: NanBox) -> bool {
-        let ObjectData::Shaped { len, shape, slots } = &mut self.data else {
-            return false;
-        };
-        if !to.parent().is_some_and(|p| Rc::ptr_eq(p, shape)) || *len != shape.len() {
+        if self.is_dict()
+            || !to.parent().is_some_and(|p| Rc::ptr_eq(p, &self.shape))
+            || u32::from(self.len) != self.shape.len()
+            || self.len as usize >= MAX_SHAPED_LEN
+        {
             return false;
         }
-        *shape = to;
-        slots.push(len, value);
+        self.shape = to;
+        self.slot_push(value);
         self.bump_key_epoch();
         true
     }
@@ -547,10 +623,11 @@ impl Object {
 
     /// Sets generic-JIT flag bits (they are never cleared).
     pub fn add_jit_flags(&mut self, bits: u8) {
-        if self.jit_flags | bits != self.jit_flags {
+        let bits = bits & JIT_FLAGS_MASK;
+        if self.flags | bits != self.flags {
             self.layout_changed();
         }
-        self.jit_flags |= bits;
+        self.flags |= bits;
     }
 
     /// Tags this object with the class it was constructed from.
@@ -612,10 +689,7 @@ impl Object {
     #[inline]
     #[must_use]
     pub fn shaped_shape(&self) -> Option<&Rc<Shape>> {
-        match &self.data {
-            ObjectData::Shaped { shape, .. } => Some(shape),
-            ObjectData::Dict { .. } => None,
-        }
+        (!self.is_dict()).then_some(&self.shape)
     }
 
     /// Whether the object holds the internal primitive-wrapper key
@@ -624,9 +698,10 @@ impl Object {
     #[inline]
     #[must_use]
     pub fn is_prim_wrapper(&self) -> bool {
-        match &self.data {
-            ObjectData::Shaped { shape, .. } => shape.is_wrapper(),
-            ObjectData::Dict { map, .. } => map.contains_key(crate::shape::PRIM_WRAP_KEY),
+        if self.is_dict() {
+            self.dict().map.contains_key(crate::shape::PRIM_WRAP_KEY)
+        } else {
+            self.shape.is_wrapper()
         }
     }
 
@@ -635,9 +710,10 @@ impl Object {
     #[inline]
     #[must_use]
     pub fn has_brand_key(&self, key: &str) -> bool {
-        match &self.data {
-            ObjectData::Shaped { shape, .. } => shape.has_brand(crate::shape::brand_bit(key)),
-            ObjectData::Dict { map, .. } => map.contains_key(key),
+        if self.is_dict() {
+            self.dict().map.contains_key(key)
+        } else {
+            self.shape.has_brand(crate::shape::brand_bit(key))
         }
     }
 
@@ -656,7 +732,7 @@ impl Object {
     #[inline]
     #[must_use]
     pub fn keys_follow_shape(&self) -> bool {
-        matches!(self.data, ObjectData::Shaped { .. })
+        !self.is_dict()
             && self.extra.as_deref().is_none_or(|e| {
                 e.accessors.is_empty() && e.hidden.is_empty() && e.key_order.is_none()
             })
@@ -667,39 +743,36 @@ impl Object {
     /// resolves no key and misses — a dictionary object never binds an IC.
     #[must_use]
     pub fn shape(&self) -> &Rc<Shape> {
-        match &self.data {
-            ObjectData::Shaped { shape, .. } => shape,
-            ObjectData::Dict { sentinel, .. } => sentinel,
-        }
+        &self.shape
     }
 
     /// The number of own data properties (excludes side-list accessors).
     #[must_use]
     pub fn len(&self) -> u32 {
-        match &self.data {
-            ObjectData::Shaped { shape, .. } => shape.len(),
-            ObjectData::Dict { map, .. } => map.len() as u32,
+        if self.is_dict() {
+            self.dict().map.len() as u32
+        } else {
+            self.shape.len()
         }
     }
 
     /// Whether the object has no own data properties.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        match &self.data {
-            ObjectData::Shaped { shape, .. } => shape.is_empty(),
-            ObjectData::Dict { map, .. } => map.is_empty(),
+        if self.is_dict() {
+            self.dict().map.is_empty()
+        } else {
+            self.shape.is_empty()
         }
     }
 
     /// The value of own property `key`, or `None` if absent.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<NanBox> {
-        match &self.data {
-            ObjectData::Shaped { len, shape, slots } => {
-                let slot = shape.lookup(key)?;
-                slots.get(*len, slot)
-            }
-            ObjectData::Dict { map, .. } => map.get(key).map(|d| d.value),
+        if self.is_dict() {
+            self.dict().map.get(key).map(|d| d.value)
+        } else {
+            self.slot_get(self.shape.lookup(key)?)
         }
     }
 
@@ -711,10 +784,7 @@ impl Object {
     /// different property.
     #[must_use]
     pub fn slot(&self, slot: u32) -> Option<NanBox> {
-        match &self.data {
-            ObjectData::Shaped { len, slots, .. } => slots.get(*len, slot),
-            ObjectData::Dict { .. } => None,
-        }
+        self.slot_get(slot)
     }
 
     /// Writes slot `slot` directly, without a name lookup or the integrity
@@ -723,15 +793,12 @@ impl Object {
     /// read-only key. Returns `false` (nothing written) in dictionary mode or
     /// for an out-of-range slot.
     pub fn set_slot(&mut self, slot: u32, value: NanBox) -> bool {
-        match &mut self.data {
-            ObjectData::Shaped { len, slots, .. } => match slots.get_mut(*len, slot) {
-                Some(cell) => {
-                    *cell = value;
-                    true
-                }
-                None => false,
-            },
-            ObjectData::Dict { .. } => false,
+        match self.slot_get_mut(slot) {
+            Some(cell) => {
+                *cell = value;
+                true
+            }
+            None => false,
         }
     }
 
@@ -746,16 +813,14 @@ impl Object {
     /// the caller's responsibility (checked before this is reached), so a hit here
     /// is always a genuine own data slot.
     pub fn cached_get(&self, key: &str, cache: &mut crate::ic::PropertyCache) -> Option<NanBox> {
-        match &self.data {
-            ObjectData::Shaped { len, shape, slots } => {
-                let slot = cache.lookup(shape, key)?;
-                slots.get(*len, slot)
-            }
+        if self.is_dict() {
             // Dictionary mode carries an empty sentinel shape; route around the
             // cache entirely so it never binds (and never goes stale on a later
             // dictionary mutation that does not change the sentinel pointer).
-            ObjectData::Dict { map, .. } => map.get(key).map(|d| d.value),
+            return self.dict().map.get(key).map(|d| d.value);
         }
+        let slot = cache.lookup(&self.shape, key)?;
+        self.slot_get(slot)
     }
 
     /// Writes `value` to own data property `key` *in place*, consulting `cache`,
@@ -777,31 +842,26 @@ impl Object {
         // A private element (`#x`) is stored as a property but is not one: it
         // is [[PrivateElements]], which `Object.freeze` does not reach, so the
         // integrity flags must not silently drop the write.
-        if !crate::realm::is_private_key(key) && (self.frozen || self.is_readonly(key)) {
+        if !crate::realm::is_private_key(key) && (self.is_frozen() || self.is_readonly(key)) {
             return false;
         }
-        match &mut self.data {
-            ObjectData::Shaped { len, shape, slots } => match cache.lookup(shape, key) {
-                Some(slot) => match slots.get_mut(*len, slot) {
-                    Some(cell) => {
-                        *cell = value;
-                        true
-                    }
-                    None => false,
-                },
-                // Absent: a new property (transition) — let the slow path add it.
-                None => false,
-            },
-            ObjectData::Dict { .. } => false,
+        if self.is_dict() {
+            return false;
         }
+        // Absent: a new property (transition) — let the slow path add it.
+        let Some(slot) = cache.lookup(&self.shape, key) else {
+            return false;
+        };
+        self.set_slot(slot, value)
     }
 
     /// Whether the object has own property `key`.
     #[must_use]
     pub fn contains(&self, key: &str) -> bool {
-        match &self.data {
-            ObjectData::Shaped { shape, .. } => shape.contains(key),
-            ObjectData::Dict { map, .. } => map.contains_key(key),
+        if self.is_dict() {
+            self.dict().map.contains_key(key)
+        } else {
+            self.shape.contains(key)
         }
     }
 
@@ -818,39 +878,38 @@ impl Object {
         // A private element (`#x`) is stored as a property but is not one: it
         // is [[PrivateElements]], which `Object.freeze` does not reach, so the
         // integrity flags must not silently drop the write.
-        if !crate::realm::is_private_key(key) && (self.frozen || self.is_readonly(key)) {
+        if !crate::realm::is_private_key(key) && (self.is_frozen() || self.is_readonly(key)) {
             return;
         }
-        let mut added = false;
-        match &mut self.data {
-            ObjectData::Shaped { len, shape, slots } => {
-                if let Some(slot) = shape.lookup(key) {
-                    *slots.get_mut(*len, slot).expect("slot index in range") = value;
-                } else if self.extensible {
-                    *shape = shape.add(key);
-                    slots.push(len, value);
-                    added = true;
-                }
-                // A non-extensible object silently ignores new keys.
-            }
-            ObjectData::Dict { order, map, .. } => {
-                if let Some(d) = map.get_mut(key) {
-                    d.value = value;
-                } else if self.extensible {
-                    map.insert(
-                        Box::from(key),
-                        DictSlot {
-                            value,
-                            pos: order.len(),
-                        },
-                    );
-                    order.push(Some(Box::from(key)));
-                    added = true;
-                }
-            }
+        if self.write_existing(key, value) {
+            return;
         }
-        if added {
+        // A non-extensible object silently ignores new keys.
+        if self.is_extensible() {
+            self.add_new(key, value);
             self.track_key(key);
+        }
+    }
+
+    /// Overwrites own data property `key` with `value` if it exists; `false`
+    /// (nothing written) if it does not.
+    fn write_existing(&mut self, key: &str, value: NanBox) -> bool {
+        if self.is_dict() {
+            match self.dict_mut().map.get_mut(key) {
+                Some(d) => {
+                    d.value = value;
+                    true
+                }
+                None => false,
+            }
+        } else {
+            match self.shape.lookup(key) {
+                Some(slot) => {
+                    *self.slot_get_mut(slot).expect("slot index in range") = value;
+                    true
+                }
+                None => false,
+            }
         }
     }
 
@@ -861,34 +920,8 @@ impl Object {
     /// object (e.g. converting an existing accessor property to a data property, or
     /// changing the value of a configurable-but-non-extensible property).
     pub fn force_set(&mut self, key: &str, value: NanBox) {
-        let mut added = false;
-        match &mut self.data {
-            ObjectData::Shaped { len, shape, slots } => {
-                if let Some(slot) = shape.lookup(key) {
-                    *slots.get_mut(*len, slot).expect("slot index in range") = value;
-                } else {
-                    *shape = shape.add(key);
-                    slots.push(len, value);
-                    added = true;
-                }
-            }
-            ObjectData::Dict { order, map, .. } => {
-                if let Some(d) = map.get_mut(key) {
-                    d.value = value;
-                } else {
-                    map.insert(
-                        Box::from(key),
-                        DictSlot {
-                            value,
-                            pos: order.len(),
-                        },
-                    );
-                    order.push(Some(Box::from(key)));
-                    added = true;
-                }
-            }
-        }
-        if added {
+        if !self.write_existing(key, value) {
+            self.add_new(key, value);
             self.track_key(key);
         }
     }
@@ -901,12 +934,12 @@ impl Object {
     /// within the threshold. The realm calls this immediately before
     /// [`set`](Object::set) on a property add (MEM-3: bounds shape-tree growth).
     pub fn maybe_convert_to_dict(&mut self, key: &str, threshold: usize) {
-        if let ObjectData::Shaped { shape, .. } = &self.data
-            && shape.len() as usize >= threshold
-            && self.extensible
-            && !self.frozen
+        if !self.is_dict()
+            && self.shape.len() as usize >= threshold
+            && self.is_extensible()
+            && !self.is_frozen()
             && !self.is_readonly(key)
-            && shape.lookup(key).is_none()
+            && self.shape.lookup(key).is_none()
         {
             self.convert_to_dict();
         }
@@ -918,7 +951,7 @@ impl Object {
     /// Rebuilds `Dict.order` from the live keys when it has accumulated more
     /// slack than live entries.
     ///
-    /// Deletion leaves tombstones behind (see [`ObjectData::Dict`]), so
+    /// Deletion leaves tombstones behind (see [`DictData`]), so
     /// without this a long-lived object that is repeatedly added to and deleted
     /// from would grow `order` without bound and slow every enumeration.
     /// Dropping the tombstones is one linear pass over `order` plus one over the
@@ -926,9 +959,10 @@ impl Object {
     /// after as many deletions as there are live keys, so deletion stays
     /// amortized O(log n).
     fn compact_order(&mut self) {
-        let ObjectData::Dict { order, map, .. } = &mut self.data else {
+        if !self.is_dict() {
             return;
-        };
+        }
+        let DictData { order, map } = self.dict_mut();
         if order.len() <= 2 * map.len() + 16 {
             return;
         }
@@ -948,15 +982,15 @@ impl Object {
     }
 
     fn convert_to_dict(&mut self) {
-        let ObjectData::Shaped { len, shape, slots } = &self.data else {
+        if self.is_dict() {
             return;
-        };
-        let keys = shape.keys();
+        }
+        let keys = self.shape.keys();
         let mut order: Vec<Option<Box<str>>> = Vec::with_capacity(keys.len());
         let mut map: BTreeMap<Box<str>, DictSlot> = BTreeMap::new();
         for k in keys {
-            let slot = shape.lookup(k).expect("shape key resolves");
-            let value = slots.at(*len, slot);
+            let slot = self.shape.lookup(k).expect("shape key resolves");
+            let value = self.slot_at(slot);
             map.insert(
                 Box::from(k),
                 DictSlot {
@@ -966,31 +1000,40 @@ impl Object {
             );
             order.push(Some(Box::from(k)));
         }
+        self.len = 0;
+        self.inline = [NanBox::undefined(); INLINE_SLOTS];
+        let x = self.extra_mut();
+        x.spill = Vec::new();
+        x.dict = Some(Box::new(DictData { order, map }));
         // A fresh empty shape so `shape()` returns a pointer that resolves no
         // key (inline caches keyed on it always miss for this object).
         self.layout_changed();
-        self.data = ObjectData::Dict {
-            order,
-            map: Box::new(map),
-            sentinel: Shape::root(),
-        };
+        self.shape = Shape::root();
+        self.mode = Mode::Dict;
     }
 
     /// The own property names, in insertion order.
     #[must_use]
     pub fn keys(&self) -> Vec<&str> {
-        match &self.data {
-            ObjectData::Shaped { shape, .. } => shape.keys(),
-            ObjectData::Dict { order, .. } => order.iter().flatten().map(AsRef::as_ref).collect(),
+        if self.is_dict() {
+            self.dict()
+                .order
+                .iter()
+                .flatten()
+                .map(AsRef::as_ref)
+                .collect()
+        } else {
+            self.shape.keys()
         }
     }
 
     /// How many own properties (data and accessor) this object stores.
     #[must_use]
     pub fn slot_count(&self) -> usize {
-        let data = match &self.data {
-            ObjectData::Shaped { len, .. } => *len as usize,
-            ObjectData::Dict { map, .. } => map.len(),
+        let data = if self.is_dict() {
+            self.dict().map.len()
+        } else {
+            self.len as usize
         };
         data + self.ex().accessors.len()
     }
@@ -1003,27 +1046,26 @@ impl Object {
     /// are its smallest — rather than walking every key on every collection.
     pub fn for_each_symbol_key(&self, mut f: impl FnMut(&str)) {
         const SYM: &str = crate::shape::SYMBOL_KEY_PREFIX;
-        match &self.data {
+        if self.is_dict() {
+            use core::ops::Bound;
+            for (k, _) in self
+                .dict()
+                .map
+                .range::<str, _>((Bound::Included(SYM), Bound::Unbounded))
+            {
+                if !k.starts_with(SYM) {
+                    break;
+                }
+                f(k);
+            }
+        } else if self.shape.has_symbol_keys() {
             // The layout records whether it holds any Symbol key at all, so the
             // common symbol-free object costs one bit test.
-            ObjectData::Shaped { shape, .. } => {
-                if shape.has_symbol_keys() {
-                    shape.for_each_key_unordered(|k| {
-                        if k.starts_with(SYM) {
-                            f(k);
-                        }
-                    });
-                }
-            }
-            ObjectData::Dict { map, .. } => {
-                use core::ops::Bound;
-                for (k, _) in map.range::<str, _>((Bound::Included(SYM), Bound::Unbounded)) {
-                    if !k.starts_with(SYM) {
-                        break;
-                    }
+            self.shape.for_each_key_unordered(|k| {
+                if k.starts_with(SYM) {
                     f(k);
                 }
-            }
+            });
         }
         for (k, _, _) in &self.ex().accessors {
             if k.starts_with(SYM) {
@@ -1099,10 +1141,10 @@ impl Object {
     /// Marks own property `key` non-writable (idempotent).
     pub fn set_readonly(&mut self, key: &str) {
         if !self.is_readonly(key) {
-            if self.jit_flags & JIT_FLAG_READONLY == 0 {
+            if self.flags & JIT_FLAG_READONLY == 0 {
                 self.layout_changed();
             }
-            self.jit_flags |= JIT_FLAG_READONLY;
+            self.flags |= JIT_FLAG_READONLY;
             self.extra_mut().readonly.push(alloc::boxed::Box::from(key));
         }
     }
@@ -1157,9 +1199,7 @@ impl Object {
     /// attribute marks). Internal (`\0`-prefixed) keys never qualify.
     #[must_use]
     pub fn is_plain_data_slot_or_absent(&self, key: &str) -> bool {
-        self.extensible
-            && !self.frozen
-            && !self.sealed
+        self.flags & (OBJ_FLAG_FROZEN | OBJ_FLAG_SEALED | OBJ_FLAG_NON_EXTENSIBLE) == 0
             && !key.starts_with('\0')
             && self.extra.as_deref().is_none_or(|x| {
                 (x.readonly.is_empty() || !self.is_readonly(key))
@@ -1186,26 +1226,24 @@ impl Object {
         if !self.is_plain_data_slot_or_absent(key) {
             return false;
         }
-        if self.ex().key_order.is_none()
-            && let ObjectData::Shaped { len, shape, slots } = &mut self.data
-            && (shape.len() as usize) < dict_threshold
-            && let Some(to) = cache.transition_from(shape)
+        if !self.is_dict()
+            && (self.shape.len() as usize) < dict_threshold.min(MAX_SHAPED_LEN)
+            && self.extra.as_deref().is_none_or(|x| x.key_order.is_none())
+            && let Some(to) = cache.transition_from(&self.shape)
         {
-            *shape = to;
-            slots.push(len, value);
+            self.shape = to;
+            self.slot_push(value);
             self.bump_key_epoch();
             return true;
         }
         self.maybe_convert_to_dict(key, dict_threshold);
-        let before = match &self.data {
-            ObjectData::Shaped { shape, .. } => Some(Rc::clone(shape)),
-            ObjectData::Dict { .. } => None,
-        };
+        let before = (!self.is_dict()).then(|| Rc::clone(&self.shape));
         self.set(key, value);
-        if let (Some(before), ObjectData::Shaped { shape, .. }) = (before, &self.data)
-            && shape.parent().is_some_and(|p| Rc::ptr_eq(p, &before))
+        if let Some(before) = before
+            && !self.is_dict()
+            && self.shape.parent().is_some_and(|p| Rc::ptr_eq(p, &before))
         {
-            cache.arm_transition(Rc::clone(shape));
+            cache.arm_transition(Rc::clone(&self.shape));
         }
         true
     }
@@ -1223,38 +1261,35 @@ impl Object {
 
     /// Marks the object frozen (`Object.freeze`) — implies sealed + non-extensible.
     pub fn freeze(&mut self) {
-        self.frozen = true;
-        self.sealed = true;
-        self.extensible = false;
+        self.flags |= OBJ_FLAG_FROZEN | OBJ_FLAG_SEALED | OBJ_FLAG_NON_EXTENSIBLE;
     }
 
     /// Prevents new properties (`Object.preventExtensions`).
     pub fn prevent_extensions(&mut self) {
-        self.extensible = false;
+        self.flags |= OBJ_FLAG_NON_EXTENSIBLE;
     }
 
     /// Seals the object (`Object.seal`): no new props, no deletions.
     pub fn seal(&mut self) {
-        self.sealed = true;
-        self.extensible = false;
+        self.flags |= OBJ_FLAG_SEALED | OBJ_FLAG_NON_EXTENSIBLE;
     }
 
     /// Whether new properties may be added.
     #[must_use]
     pub fn is_extensible(&self) -> bool {
-        self.extensible
+        self.flags & OBJ_FLAG_NON_EXTENSIBLE == 0
     }
 
     /// Whether the object is sealed (or frozen).
     #[must_use]
     pub fn is_sealed(&self) -> bool {
-        self.sealed || self.frozen
+        self.flags & (OBJ_FLAG_SEALED | OBJ_FLAG_FROZEN) != 0
     }
 
     /// Whether the object is frozen.
     #[must_use]
     pub fn is_frozen(&self) -> bool {
-        self.frozen
+        self.flags & OBJ_FLAG_FROZEN != 0
     }
 
     /// Removes any accessor (getter/setter) for `key`, leaving data properties
@@ -1271,35 +1306,38 @@ impl Object {
     /// `defineProperty` converts a data property into an accessor.
     pub fn delete_data(&mut self, root: Rc<Shape>, key: &str) {
         self.bump_key_epoch();
-        match &mut self.data {
-            ObjectData::Shaped { len, shape, slots } => {
-                if !shape.contains(key) {
-                    return;
-                }
-                let kept: Vec<(alloc::string::String, NanBox)> = shape
-                    .keys()
-                    .into_iter()
-                    .filter(|k| *k != key)
-                    .map(|k| {
-                        let slot = shape.lookup(k).expect("shape key resolves");
-                        (alloc::string::String::from(k), slots.at(*len, slot))
-                    })
-                    .collect();
-                let mut new_shape = root;
-                let mut values = Vec::with_capacity(kept.len());
-                for (k, v) in kept {
-                    new_shape = new_shape.transition(&k);
-                    values.push(v);
-                }
-                *shape = new_shape;
-                (*len, *slots) = Slots::from_values(values);
+        if self.is_dict() {
+            let d = self.dict_mut();
+            if let Some(s) = d.map.remove(key) {
+                d.order[s.pos] = None;
             }
-            ObjectData::Dict { order, map, .. } => {
-                if let Some(d) = map.remove(key) {
-                    order[d.pos] = None;
-                }
-            }
+        } else if self.shape.contains(key) {
+            self.rebuild_without(root, key);
         }
+    }
+
+    /// Rebuilds the shape and slots from `root` without `key` (shaped mode,
+    /// `key` present).
+    fn rebuild_without(&mut self, root: Rc<Shape>, key: &str) {
+        let kept: Vec<(alloc::string::String, NanBox)> = self
+            .shape
+            .keys()
+            .into_iter()
+            .filter(|k| *k != key)
+            .map(|k| {
+                let slot = self.shape.lookup(k).expect("shape key resolves");
+                (alloc::string::String::from(k), self.slot_at(slot))
+            })
+            .collect();
+        let mut new_shape = root;
+        let mut values = Vec::with_capacity(kept.len());
+        for (k, v) in kept {
+            new_shape = new_shape.transition(&k);
+            values.push(v);
+        }
+        self.shape = new_shape;
+        self.set_slots(values);
+        self.tidy_extra();
     }
 
     /// Deletes own property `key`, rebuilding the shape/slots from `root` without
@@ -1333,38 +1371,20 @@ impl Object {
         if let Some(order) = self.extra.as_deref_mut().and_then(|x| x.key_order.as_mut()) {
             order.retain(|k| k.as_ref() != key);
         }
-        match &mut self.data {
-            ObjectData::Shaped { len, shape, slots } => {
-                if !shape.contains(key) {
-                    return had_accessor;
-                }
-                let kept: Vec<(alloc::string::String, NanBox)> = shape
-                    .keys()
-                    .into_iter()
-                    .filter(|k| *k != key)
-                    .map(|k| {
-                        let slot = shape.lookup(k).expect("shape key resolves");
-                        (alloc::string::String::from(k), slots.at(*len, slot))
-                    })
-                    .collect();
-                let mut new_shape = root;
-                let mut values = Vec::with_capacity(kept.len());
-                for (k, v) in kept {
-                    new_shape = new_shape.transition(&k);
-                    values.push(v);
-                }
-                *shape = new_shape;
-                (*len, *slots) = Slots::from_values(values);
-                true
+        if self.is_dict() {
+            let d = self.dict_mut();
+            let Some(s) = d.map.remove(key) else {
+                return had_accessor;
+            };
+            d.order[s.pos] = None;
+            self.compact_order();
+            true
+        } else {
+            if !self.shape.contains(key) {
+                return had_accessor;
             }
-            ObjectData::Dict { order, map, .. } => {
-                let Some(d) = map.remove(key) else {
-                    return had_accessor;
-                };
-                order[d.pos] = None;
-                self.compact_order();
-                true
-            }
+            self.rebuild_without(root, key);
+            true
         }
     }
 
@@ -1380,25 +1400,19 @@ impl Object {
                 *v = NanBox::handle(forward(crate::heap::Handle::from_raw(raw)).to_raw());
             }
         };
-        match &mut self.data {
-            ObjectData::Shaped { len, slots, .. } => {
-                for slot in slots.iter_mut(*len) {
-                    fwd(slot);
-                }
-            }
-            ObjectData::Dict { map, .. } => {
-                for d in map.values_mut() {
+        let n = (self.len as usize).min(INLINE_SLOTS);
+        self.inline[..n].iter_mut().for_each(fwd);
+        if let Some(x) = self.extra.as_deref_mut() {
+            x.spill.iter_mut().for_each(fwd);
+            if let Some(d) = x.dict.as_deref_mut() {
+                for d in d.map.values_mut() {
                     fwd(&mut d.value);
                 }
             }
-        }
-        for (_, g, s) in self
-            .extra
-            .as_deref_mut()
-            .map_or(&mut [][..], |x| &mut x.accessors[..])
-        {
-            fwd(g);
-            fwd(s);
+            for (_, g, s) in &mut x.accessors {
+                fwd(g);
+                fwd(s);
+            }
         }
         if let Some(p) = self.proto() {
             self.set_proto(Some(forward(p)));
@@ -1414,23 +1428,16 @@ impl Object {
                 visit(crate::heap::Handle::from_raw(raw));
             }
         };
-        match &self.data {
-            ObjectData::Shaped { len, slots, .. } => {
-                for slot in slots.iter(*len) {
-                    trace_value(slot);
-                }
-            }
-            ObjectData::Dict { map, .. } => {
-                for d in map.values() {
+        self.slots_iter().for_each(&mut trace_value);
+        if let Some(x) = self.extra.as_deref() {
+            if let Some(d) = x.dict.as_deref() {
+                for d in d.map.values() {
                     trace_value(&d.value);
                 }
             }
-        }
-        for (_, g, s) in &self.ex().accessors {
-            for v in [g, s] {
-                if let Some(raw) = v.as_handle() {
-                    visit(crate::heap::Handle::from_raw(raw));
-                }
+            for (_, g, s) in &x.accessors {
+                trace_value(g);
+                trace_value(s);
             }
         }
         if let Some(p) = self.proto() {
@@ -1445,50 +1452,43 @@ impl crate::gc::Trace for Object {
     }
 }
 
-/// Runtime-probed byte layout of [`Object`] / `ObjectData::Shaped` (and the inner
-/// `Vec<NanBox>` slot store) for the generic-JIT inline property-get fast path.
-/// Every field is derived by pointer arithmetic on a real, populated shaped
-/// object (never hand-baked); the JIT layout verification test cross-checks each
-/// against a safe read, so a layout drift fails loudly instead of corrupting a
-/// raw memory read.
+/// Runtime-probed byte layout of [`Object`] (and the inner `Vec<NanBox>`
+/// storage) for the generic-JIT inline property paths. Every field is derived
+/// from a real, populated shaped object (never hand-baked); the JIT layout
+/// verification tests cross-check each against a safe read, so a layout drift
+/// fails loudly instead of corrupting a raw memory read. Offsets are relative
+/// to the `Object` base unless noted.
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ObjectLayout {
-    /// Byte offset of the `data: ObjectData` field within `Object` (repr(C) → 0).
-    pub data_off: usize,
-    /// The `ObjectData::Shaped` discriminant byte value (tag at offset 0).
+    /// Byte offset of the storage-mode byte.
+    pub mode_off: usize,
+    /// The shaped mode's byte value.
     pub shaped_disc: u8,
-    /// Byte offset of the `shape: Rc<Shape>` field within `ObjectData`. The 8-byte
-    /// word there is the `Rc`'s stored `NonNull<RcBox>` (the shape identity the IC
-    /// compares against).
+    /// Byte offset of the `shape: Rc<Shape>` field. The 8-byte word there is
+    /// the `Rc`'s stored `NonNull<RcBox>` (the shape identity the IC compares
+    /// against).
     pub shape_off: usize,
-    /// Byte offset of the slot count (`len: u32`) within `ObjectData`.
+    /// Byte offset of the slot count (`len: u16`).
     pub len_off: usize,
-    /// Byte offset of the first inline slot within `ObjectData` (slot
-    /// `i < INLINE_SLOTS` at `+ 8 * i`).
+    /// Byte offset of the first inline slot (slot `i < INLINE_SLOTS` at
+    /// `+ 8 * i`).
     pub inline_off: usize,
-    /// Byte offset of the spill `Vec`'s data pointer within `ObjectData`
-    /// (slot `i >= INLINE_SLOTS` at that pointer `+ 8 * (i - INLINE_SLOTS)`).
-    pub spill_ptr_off: usize,
+    /// Byte offset, within `ObjectExtra`, of the spill `Vec`'s data pointer
+    /// (slot `i >= INLINE_SLOTS` at that pointer `+ 8 * (i - INLINE_SLOTS)`;
+    /// an object with spilled slots always has its `extra` part).
+    pub extra_spill_ptr_off: usize,
     /// Byte offset of the data pointer within a `Vec<NanBox>`.
     pub vec_ptr_off: usize,
     /// Byte offset of the length within a `Vec<NanBox>`.
     pub vec_len_off: usize,
-    /// Byte offset of the `frozen: bool` field within `Object` (relative to the
-    /// `Object` base) — the inline property-SET fast path bails to the helper when
-    /// this byte is non-zero (a frozen object rejects writes).
-    pub frozen_off: usize,
-    /// Byte offset of `jit_flags: u8` within `Object`.
+    /// Byte offset of the flags byte (the `JIT_FLAG_*` and `OBJ_FLAG_*` bits).
     pub jit_flags_off: usize,
-    /// Byte offset of `extensible: bool` within `Object`.
-    pub extensible_off: usize,
-    /// Byte offset of `sealed: bool` within `Object`.
-    pub sealed_off: usize,
-    /// Byte offset of the raw `proto` word within `Object`.
+    /// Byte offset of the raw `proto` word.
     pub proto_off: usize,
-    /// Byte offset of `key_epoch: u32` within `Object`.
+    /// Byte offset of `key_epoch: u32`.
     pub epoch_off: usize,
-    /// Byte offset of the `extra` box pointer within `Object` (null for none).
+    /// Byte offset of the `extra` box pointer (null for none).
     pub extra_off: usize,
     /// Byte offset of the accessor list's length word within `ObjectExtra`.
     pub extra_acc_len_off: usize,
@@ -1504,7 +1504,7 @@ pub(crate) struct ObjectLayout {
 }
 
 /// Derives [`ObjectLayout`] from a real shaped object with several own data
-/// properties (so the slot `Vec` is populated, its length distinct from its
+/// properties (so the spill `Vec` is populated, its length distinct from its
 /// capacity and data pointer, making the by-value word scan unambiguous).
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn jit_object_layout() -> ObjectLayout {
@@ -1515,19 +1515,14 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
     }
 
     let obj_base = core::ptr::addr_of!(obj) as usize;
-    let data_off = core::ptr::addr_of!(obj.data) as usize - obj_base;
-    let od = &obj.data;
-    let od_base = core::ptr::addr_of!(*od) as usize;
-    // SAFETY: `od` is a live, initialized `ObjectData`; its repr(u8) tag byte is
-    // in bounds and always a valid `u8`.
+    let mode_off = core::ptr::addr_of!(obj.mode) as usize - obj_base;
+    // SAFETY: reading the live object's repr(u8) mode byte, in bounds.
     #[allow(unsafe_code)]
-    let shaped_disc = unsafe { *(od_base as *const u8) };
-    let ObjectData::Shaped { len, shape, slots } = od else {
-        unreachable!("a fresh object is in Shaped mode");
-    };
-    let shape_off = core::ptr::addr_of!(*shape) as usize - od_base;
-    let len_off = core::ptr::addr_of!(*len) as usize - od_base;
-    let inline_off = core::ptr::addr_of!(slots.inline) as usize - od_base;
+    let shaped_disc = unsafe { *((obj_base + mode_off) as *const u8) };
+    assert_eq!(obj.mode, Mode::Shaped);
+    let shape_off = core::ptr::addr_of!(obj.shape) as usize - obj_base;
+    let len_off = core::ptr::addr_of!(obj.len) as usize - obj_base;
+    let inline_off = core::ptr::addr_of!(obj.inline) as usize - obj_base;
 
     // Locate the data-pointer and length words inside a `Vec<NanBox>` by
     // matching their known values against each 8-byte word of the Vec — a pure
@@ -1556,29 +1551,26 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
         vec_ptr_off != usize::MAX && vec_len_off != usize::MAX && vec_ptr_off != vec_len_off,
         "could not derive Vec ptr/len offsets"
     );
-    let spill_ptr_off = core::ptr::addr_of!(slots.spill) as usize - od_base + vec_ptr_off;
-    // SAFETY: reading the spill Vec's pointer word of the live object.
-    #[allow(unsafe_code)]
-    let spill_word = unsafe { *((od_base + spill_ptr_off) as *const usize) };
-    assert_eq!(spill_word, slots.spill.as_ptr() as usize);
-
-    // The writability gate field for the inline property-SET fast path.
-    let frozen_off = core::ptr::addr_of!(obj.frozen) as usize - obj_base;
 
     // The shape's brand byte, relative to the stored `Rc` word.
     // SAFETY: reading the 8-byte `Rc<Shape>` word of a live object, in bounds.
     #[allow(unsafe_code)]
-    let shape_word = unsafe { *((od_base + shape_off) as *const usize) };
-    let brands_addr = Rc::as_ptr(shape) as usize + crate::shape::Shape::brands_offset();
+    let shape_word = unsafe { *((obj_base + shape_off) as *const usize) };
+    let brands_addr = Rc::as_ptr(&obj.shape) as usize + crate::shape::Shape::brands_offset();
     let shape_brands_off = brands_addr.wrapping_sub(shape_word).cast_signed();
-    // `extra`: an `Option<Box<_>>` is one nullable pointer word.
-    obj.extra_mut();
+    // `extra`: an `Option<Box<_>>` is one nullable pointer word (allocated:
+    // the object has spilled slots).
     let extra_off = core::ptr::addr_of!(obj.extra) as usize - obj_base;
     // SAFETY: reading the pointer word of the live `Option<Box<ObjectExtra>>`.
     #[allow(unsafe_code)]
     let extra_word = unsafe { *((obj_base + extra_off) as *const usize) };
-    let extra_ref = obj.extra.as_deref().expect("just allocated");
+    let extra_ref = obj.extra.as_deref().expect("spilled slots live in `extra`");
     assert_eq!(extra_word, core::ptr::addr_of!(*extra_ref) as usize);
+    let extra_spill_ptr_off = core::mem::offset_of!(ObjectExtra, spill) + vec_ptr_off;
+    // SAFETY: reading the spill Vec's pointer word of the live `ObjectExtra`.
+    #[allow(unsafe_code)]
+    let spill_word = unsafe { *((extra_word + extra_spill_ptr_off) as *const usize) };
+    assert_eq!(spill_word, extra_ref.spill.as_ptr() as usize);
     let acc_probe: (Box<str>, NanBox, NanBox) =
         (Box::from("k"), NanBox::undefined(), NanBox::null());
     let acc_getter_off =
@@ -1586,18 +1578,15 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
     let extra_acc_ptr_off = core::mem::offset_of!(ObjectExtra, accessors) + vec_ptr_off;
     let extra_acc_len_off = core::mem::offset_of!(ObjectExtra, accessors) + vec_len_off;
     ObjectLayout {
-        data_off,
+        mode_off,
         shaped_disc,
         shape_off,
         len_off,
         inline_off,
-        spill_ptr_off,
+        extra_spill_ptr_off,
         vec_ptr_off,
         vec_len_off,
-        frozen_off,
-        jit_flags_off: core::mem::offset_of!(Object, jit_flags),
-        extensible_off: core::mem::offset_of!(Object, extensible),
-        sealed_off: core::mem::offset_of!(Object, sealed),
+        jit_flags_off: core::mem::offset_of!(Object, flags),
         proto_off: core::mem::offset_of!(Object, proto),
         epoch_off: core::mem::offset_of!(Object, key_epoch),
         extra_off,
@@ -1655,9 +1644,13 @@ mod tests {
 
     #[test]
     fn inline_slots_keep_the_object_small() {
-        // The inline values use the room the old out-of-line fields took: an
-        // object (and so every heap cell) stays 96 bytes.
-        assert!(core::mem::size_of::<Object>() <= 96);
+        // Four inline values and the header fill one 64-byte line, and a heap
+        // cell is no larger than an object (it uses the mode byte's niche).
+        assert_eq!(core::mem::size_of::<Object>(), 64);
+        assert_eq!(
+            core::mem::size_of::<crate::cell::Cell>(),
+            core::mem::size_of::<Object>()
+        );
     }
 
     #[test]
@@ -1767,9 +1760,9 @@ mod tests {
         assert_eq!(o.keys().iter().filter(|k| **k == "k0").count(), 1);
         assert_eq!(*o.keys().last().unwrap(), "k0");
         assert_eq!(o.keys().len(), 10);
-        if let ObjectData::Dict { order, .. } = &o.data {
+        if o.is_dict() {
             assert!(
-                order.len() <= 2 * 10 + 16,
+                o.dict().order.len() <= 2 * 10 + 16,
                 "tombstones were never compacted"
             );
         }

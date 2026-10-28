@@ -26,7 +26,8 @@ const HANDLE_TAG: u64 = 0xfffc_0000_0000_0000;
 /// [`super::JitLayout`] (all derived at run time).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PropsLayout {
-    /// Slot-relative offset of the object's `jit_flags` byte.
+    /// Slot-relative offset of the object's flags byte (the `JIT_FLAG_*` and
+    /// integrity bits).
     pub off_jit_flags: i32,
     /// Slot-relative offset of the object's raw `proto` word.
     pub off_proto: i32,
@@ -68,10 +69,6 @@ pub(crate) struct PropsLayout {
     pub off_vmfn_caps_ptr: i32,
     /// Slot-relative offset of a VM function's capture count.
     pub off_vmfn_caps_len: i32,
-    /// Slot-relative offset of the object's `extensible` byte.
-    pub off_extensible: i32,
-    /// Slot-relative offset of the object's `sealed` byte.
-    pub off_sealed: i32,
     /// Shape-word-relative offset of the shape's `parent` word.
     pub shape_parent: i32,
     /// Shape-word-relative offset of the shape `Rc`'s strong count.
@@ -98,8 +95,6 @@ impl PropsLayout {
         let (box_disc, box_val_off) = crate::cell::jit_box_layout();
         let (shape_parent, rc_strong) = shape_word_offsets();
         Self {
-            off_extensible: i(obj_base + obj.extensible_off),
-            off_sealed: i(obj_base + obj.sealed_off),
             shape_parent,
             rc_strong,
             dict_threshold: i(core::mem::offset_of!(crate::realm::Realm, limits)
@@ -187,6 +182,22 @@ fn levels_watched(realm: &crate::realm::Realm, levels: &[ChainLevel]) -> bool {
             .is_some_and(|o| o.jit_flags() & FLAG_WATCHED != 0)
     })
 }
+
+/// The flags-byte bits that send an in-place property store to the helper:
+/// a frozen object, and every generic-JIT flag (exotic, global, tracked
+/// prototype, a non-writable property). Not [`FLAG_WATCHED`]: a watched
+/// object's existing data properties are plain stores (a value is no part of
+/// the layout its watchers validate).
+pub(crate) const FLAGS_NO_INLINE_STORE: u8 = crate::object::OBJ_FLAG_FROZEN
+    | crate::object::JIT_FLAG_EXOTIC
+    | crate::object::JIT_FLAG_NO_INLINE_SET
+    | crate::object::JIT_FLAG_READONLY
+    | crate::object::JIT_FLAG_GLOBAL;
+
+/// The flags-byte bits that rule out adding a property (beyond those an
+/// in-place store's guards test): sealed or non-extensible (a frozen object
+/// has both).
+const FLAGS_NO_ADD: u8 = crate::object::OBJ_FLAG_SEALED | crate::object::OBJ_FLAG_NON_EXTENSIBLE;
 
 impl X64Assembler {
     /// `test byte [base+disp32], imm8` (`base` neither `rsp` nor `r12`).
@@ -513,9 +524,28 @@ impl X64Assembler {
         self.p_rm32(0x8b, dst, base, disp);
     }
 
-    /// `cmp r32, [base+disp32]`.
-    fn p_cmp32_mem(&mut self, reg: u8, base: u8, disp: i32) {
-        self.p_rm32(0x3b, reg, base, disp);
+    /// `movzx r32, word [base+disp32]`.
+    fn p_load16(&mut self, dst: u8, base: u8, disp: i32) {
+        debug_assert!(base & 7 != 4, "no SIB form");
+        let rex = 0x40 | (((dst >> 3) & 1) << 2) | ((base >> 3) & 1);
+        if rex != 0x40 {
+            self.code.push(rex);
+        }
+        self.code.extend_from_slice(&[0x0f, 0xb7]);
+        self.code.push(0x80 | ((dst & 7) << 3) | (base & 7));
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `inc word [base+disp32]`.
+    fn p_inc16_mem(&mut self, base: u8, disp: i32) {
+        debug_assert!(base & 7 != 4, "no SIB form");
+        self.code.push(0x66);
+        if base >= 8 {
+            self.code.push(0x41);
+        }
+        self.code.push(0xff);
+        self.code.push(0x80 | (base & 7));
+        self.code.extend_from_slice(&disp.to_le_bytes());
     }
 
     /// A 32-bit `op reg, [base+disp32]`.
@@ -579,7 +609,7 @@ impl X64Assembler {
         self.imul_rax_imm(l.slot_stride);
         self.add_rax_r10();
         self.mov_rcx_rax();
-        self.cmp_byte_at_rcx_imm(0, l.slot_occupied_disc);
+        self.cmp_byte_at_rcx_imm(l.off_slot_occ, l.slot_occupied_disc);
         self.jne(miss);
         self.cmp_word_at_rcx_r8w(l.off_slot_gen);
         self.jne(miss);
@@ -740,7 +770,8 @@ impl X64Assembler {
     pub(crate) fn p_obj_slot_addr(&mut self, l: &JitLayout, dst: u8, miss: Label) {
         const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
         debug_assert!(dst != r::RAX && dst != r::RCX);
-        self.p_cmp32_mem(r::RAX, r::RCX, l.off_slots_len);
+        self.p_load16(dst, r::RCX, l.off_slots_len);
+        self.g_cmp(r::RAX, dst);
         self.g_jcc(cc::AE, miss);
         let spill = self.new_label();
         let done = self.new_label();
@@ -749,7 +780,9 @@ impl X64Assembler {
         self.p_lea_index8(dst, r::RCX, r::RAX, l.off_inline);
         self.jmp(done);
         self.bind(spill);
-        self.g_load(dst, r::RCX, l.off_spill_ptr);
+        // A spilled slot means the object has its `extra` part.
+        self.g_load(dst, r::RCX, l.props.off_extra);
+        self.g_load(dst, dst, l.extra_spill_ptr);
         self.p_lea_index8(dst, dst, r::RAX, -8 * INLINE);
         self.bind(done);
     }
@@ -857,10 +890,10 @@ impl X64Assembler {
 
     /// The common guards of an inline property add, on the object whose heap
     /// slot is `rcx`: an ordinary shaped object with no `jit_flags`,
-    /// extensible, neither frozen nor sealed, with no `extra` part (no
-    /// accessors, attribute marks or key-order log), with room for one more
-    /// value inline and below the dictionary threshold. Else to `miss`.
-    /// Clobbers `rax`, `r8`, `r9`.
+    /// extensible, neither frozen nor sealed (its whole flags byte zero), with
+    /// no `extra` part (no accessors, attribute marks or key-order log), with
+    /// room for one more value inline and below the dictionary threshold.
+    /// Else to `miss`. Clobbers `rax`, `r8`, `r9`.
     fn p_add_guards(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
         self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
         self.jne(miss);
@@ -868,12 +901,6 @@ impl X64Assembler {
         self.jne(miss);
         self.cmp_byte_at_rcx_imm(l.props.off_jit_flags, 0);
         self.jne(miss);
-        self.cmp_byte_at_rcx_imm(l.off_frozen, 0);
-        self.jne(miss);
-        self.cmp_byte_at_rcx_imm(l.props.off_sealed, 0);
-        self.jne(miss);
-        self.cmp_byte_at_rcx_imm(l.props.off_extensible, 0);
-        self.g_jcc(cc::E, miss);
         self.p_add_room(l, realm_off, miss);
     }
 
@@ -886,7 +913,7 @@ impl X64Assembler {
         self.g_load(r::R9, r::RCX, l.props.off_extra);
         self.g_test(r::R9);
         self.g_jcc(cc::NE, miss);
-        self.p_load32(r::RAX, r::RCX, l.off_slots_len);
+        self.p_load16(r::RAX, r::RCX, l.off_slots_len);
         self.p_cmp32_imm(r::RAX, INLINE);
         self.g_jcc(cc::AE, miss);
         self.g_load(r::R8, r::R15, realm_off);
@@ -901,11 +928,11 @@ impl X64Assembler {
     /// count, the shape (one strong count moved from the old shape to the
     /// new) and the key epoch. Clobbers `rax`, `r8`, `r9`.
     fn p_add_commit(&mut self, l: &JitLayout, to_disp: i32, val_disp: i32) {
-        self.p_load32(r::RAX, r::RCX, l.off_slots_len);
+        self.p_load16(r::RAX, r::RCX, l.off_slots_len);
         self.p_lea_index8(r::R9, r::RCX, r::RAX, l.off_inline);
         self.g_load(r::R8, r::RBX, val_disp);
         self.g_store(r::R9, 0, r::R8);
-        self.p_inc32_mem(r::RCX, l.off_slots_len);
+        self.p_inc16_mem(r::RCX, l.off_slots_len);
         self.g_load(r::R9, r::R11, to_disp);
         self.g_inc_mem(r::R9, l.props.rc_strong);
         self.g_load(r::R8, r::RCX, l.off_shape);
@@ -962,10 +989,8 @@ impl X64Assembler {
         let depth = i(add + offset_of!(AddEntry, depth));
         self.g_movabs(r::R11, site as u64);
         if walked {
-            self.cmp_byte_at_rcx_imm(l.props.off_sealed, 0);
+            self.p_test_byte_imm(r::RCX, l.props.off_jit_flags, FLAGS_NO_ADD);
             self.jne(miss);
-            self.cmp_byte_at_rcx_imm(l.props.off_extensible, 0);
-            self.g_jcc(cc::E, miss);
             self.p_add_room(l, realm_off, miss);
         } else {
             self.p_add_guards(l, realm_off, miss);
@@ -1048,10 +1073,11 @@ impl X64Assembler {
     /// slot in `rcx`, `rax` = an inline property value; an index past the
     /// object's slot count goes to `miss`, one in the spill array to `spill`
     /// (whose code, [`p_obj_slot_load_spill`](Self::p_obj_slot_load_spill),
-    /// can sit out of line).
+    /// can sit out of line). Clobbers `r11`.
     pub(crate) fn p_obj_slot_load_inline(&mut self, l: &JitLayout, miss: Label, spill: Label) {
         const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
-        self.p_cmp32_mem(r::RAX, r::RCX, l.off_slots_len);
+        self.p_load16(r::R11, r::RCX, l.off_slots_len);
+        self.g_cmp(r::RAX, r::R11);
         self.g_jcc(cc::AE, miss);
         self.p_cmp32_imm(r::RAX, INLINE);
         self.g_jcc(cc::AE, spill);
@@ -1063,7 +1089,9 @@ impl X64Assembler {
     /// value, then to `back`. Clobbers `r11`.
     pub(crate) fn p_obj_slot_load_spill(&mut self, l: &JitLayout, back: Label) {
         const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
-        self.g_load(r::R11, r::RCX, l.off_spill_ptr);
+        // A spilled slot means the object has its `extra` part.
+        self.g_load(r::R11, r::RCX, l.props.off_extra);
+        self.g_load(r::R11, r::R11, l.extra_spill_ptr);
         self.p_load_index8(r::RAX, r::R11, r::RAX, -8 * INLINE);
         self.jmp(back);
     }
@@ -1087,7 +1115,9 @@ impl X64Assembler {
     /// ([`p_obj_slot_store_spill`](Self::p_obj_slot_store_spill)).
     pub(crate) fn p_obj_slot_store_inline(&mut self, l: &JitLayout, miss: Label, spill: Label) {
         const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
-        self.p_cmp32_mem(r::RAX, r::RCX, l.off_slots_len);
+        // The slot count is a u16 (the key epoch follows it): a 16-bit read.
+        self.p_load16(r::R11, r::RCX, l.off_slots_len);
+        self.g_cmp(r::RAX, r::R11);
         self.g_jcc(cc::AE, miss);
         self.p_cmp32_imm(r::RAX, INLINE);
         self.g_jcc(cc::AE, spill);
@@ -1099,7 +1129,9 @@ impl X64Assembler {
     /// `back`. Clobbers `r11`.
     pub(crate) fn p_obj_slot_store_spill(&mut self, l: &JitLayout, back: Label) {
         const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
-        self.g_load(r::R11, r::RCX, l.off_spill_ptr);
+        // A spilled slot means the object has its `extra` part.
+        self.g_load(r::R11, r::RCX, l.props.off_extra);
+        self.g_load(r::R11, r::R11, l.extra_spill_ptr);
         self.p_store_index8(r::R11, r::RAX, -8 * INLINE, r::RDX);
         self.jmp(back);
     }
@@ -1596,9 +1628,7 @@ mod tests {
                     .cast::<usize>(),
                 realm.limits.max_array_len
             );
-            assert_eq!(*field(o, l.off_extensible), 1);
-            assert_eq!(*field(o, l.off_sealed), 0);
-            assert_eq!(*field(o, jl.off_slots_len).cast::<u32>(), 1);
+            assert_eq!(*field(o, jl.off_slots_len).cast::<u16>(), 1);
             assert_eq!(
                 *field(o, jl.off_inline).cast::<u64>(),
                 NanBox::number(1.0).to_bits()
