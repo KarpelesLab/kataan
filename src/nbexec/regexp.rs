@@ -1264,7 +1264,7 @@ impl Interp {
             // `std`-only `rem_euclid`).
             let wrapped = if n.is_finite() {
                 let two32 = 4_294_967_296.0_f64;
-                let t = n as i64 as f64; // truncate toward zero
+                let t = crate::common::FloatExt::trunc(n); // toward zero, unsaturated
                 let m = t % two32;
                 let m = if m < 0.0 { m + two32 } else { m };
                 m as u32

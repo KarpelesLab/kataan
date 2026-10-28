@@ -84,3 +84,17 @@ fn number_to_string_rounding() {
          88 100000000000000000000 ff.8 5v1j4f4ds7a000 0.0022002200220022002200220022002201 215"
     );
 }
+
+/// IsIntegralNumber is `n % 1 == 0`. An `i64` round-trip cast saturates
+/// past 2^63, so `Number.isInteger(1e20)` was false (and `Atomics.pause`
+/// rejected it; RegExp `@@split`'s ToUint32(limit) truncated past 2^63).
+#[test]
+fn integral_number_predicates_beyond_i64() {
+    let src = r#"
+        var p; try { Atomics.pause(1e20); p = "ok"; } catch (e) { p = e.name; }
+        [Number.isInteger(1e20), Number.isInteger(-1e300), Number.isInteger(2 ** 60),
+         Number.isInteger(1.5), Number.isSafeInteger(1e20), Number.isSafeInteger(2 ** 53 - 1),
+         p, "a,b,c".split(/,/, 2 ** 64 + 2 ** 12).length].join()
+    "#;
+    assert_eq!(run(src), "true,true,true,false,false,true,ok,3");
+}

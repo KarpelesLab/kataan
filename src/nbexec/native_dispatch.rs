@@ -107,7 +107,7 @@ impl Interp {
                         Unpacked::Number(n) => n,
                         _ => f64::NAN,
                     };
-                    if !(n.is_finite() && n == (n as i64) as f64) {
+                    if !(n.is_finite() && n % 1.0 == 0.0) {
                         return Err(
                             self.type_error("Atomics.pause: iterationNumber must be an integer")
                         );
@@ -120,7 +120,7 @@ impl Interp {
                 // (`isLockFree({valueOf:()=>1})` === `isLockFree(1)`).
                 let n = self.coerce_to_integer_or_infinity(arg(0))?;
                 // An integer byte width of 1/2/4/8 is lock-free.
-                let is_int = n.is_finite() && n == (n as i64) as f64;
+                let is_int = n.is_finite() && n % 1.0 == 0.0;
                 NanBox::boolean(is_int && matches!(n as i64, 1 | 2 | 4 | 8))
             }
             N_ATOMICS_ADD

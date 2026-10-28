@@ -1036,16 +1036,16 @@ impl Interp {
             Some(N_NUMBER) => {
                 match method {
                     "isInteger" => {
+                        // IsIntegralNumber: `n % 1 == 0` (an `i64` round-trip
+                        // cast would saturate, so `1e20` read as non-integral).
                         let is_int = arg(0)
                             .as_number()
-                            .is_some_and(|n| n.is_finite() && (n as i64) as f64 == n);
+                            .is_some_and(|n| n.is_finite() && n % 1.0 == 0.0);
                         return Ok(Some(NanBox::boolean(is_int)));
                     }
                     "isSafeInteger" => {
                         let safe = arg(0).as_number().is_some_and(|n| {
-                            n.is_finite()
-                                && (n as i64) as f64 == n
-                                && n.abs() <= 9_007_199_254_740_991.0
+                            n.is_finite() && n % 1.0 == 0.0 && n.abs() <= 9_007_199_254_740_991.0
                         });
                         return Ok(Some(NanBox::boolean(safe)));
                     }
