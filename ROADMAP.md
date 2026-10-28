@@ -1005,22 +1005,22 @@ neverSettles }}` parks forever.
 original (clean-room) programs, takes best-of-3 wall clock, and checks each
 program's output against node's. Ratios are kataan/node; lower is better.
 
-| benchmark | start of campaign (42796a5) | 8ca64fb |
-| --- | ---: | ---: |
-| fib | 19x | 4.5x |
-| json | 11x | 3.5x |
-| sort | 20x | 5.0x |
-| map_set | 400x | 6.6x |
-| array_ops | 44x | 7.6x |
-| string_build | 14x | 7.4x |
-| prop_access | 101x | 9.4x |
-| richards_like | (quadratic, fixed) | 9.4x |
-| regex | 18x | 11.5x |
-| objects_alloc | 265x | 16.2x |
-| closures | 69x | 16.9x |
-| method_calls | 80x | 21.6x |
-| loop_arith | 372x | 25.6x |
-| nbody_like | 205x | 28.9x |
+| benchmark | start of campaign (42796a5) | 8ca64fb | c616086 |
+| --- | ---: | ---: | ---: |
+| fib | 19x | 4.5x | 1.6x |
+| sort | 20x | 5.0x | 1.8x |
+| json | 11x | 3.5x | 2.0x |
+| array_ops | 44x | 7.6x | 2.6x |
+| loop_arith | 372x | 25.6x | 3.2x |
+| richards_like | (quadratic, fixed) | 9.4x | 4.0x |
+| string_build | 14x | 7.4x | 4.1x |
+| map_set | 400x | 6.6x | 4.6x |
+| regex | 18x | 11.5x | 5.1x |
+| prop_access | 101x | 9.4x | 7.0x |
+| method_calls | 80x | 21.6x | 8.9x |
+| closures | 69x | 16.9x | 12.4x |
+| objects_alloc | 265x | 16.2x | 13.8x |
+| nbody_like | 205x | 28.9x | 21.7x |
 
 The main contributors, by landing order:
 - number fast paths;
@@ -1031,7 +1031,14 @@ The main contributors, by landing order:
 - the machine-code JIT on by default, with a frame-ABI generic tier, OSR, compiled exception handlers, and direct compiled-to-compiled calls;
 - for-of over plain arrays and Math computed in the VM;
 - warm tier state for host callbacks;
-- a hashed shape index.
+- a hashed shape index;
+- since 8ca64fb: a machine-code call sequence into compiled callees with polymorphic call-site caches and a native `new`;
+- typed int32/double arithmetic with promoted loop registers;
+- an inline heap base and chain-cached method calls in compiled code;
+- per-site direct calls to built-in methods;
+- the array higher-order built-ins' loops run in the VM;
+- JSON shape plans and a byte-level parser;
+- unmaterialized regex matches.
 
 Startup is 3 ms against node's ~15 ms.
 
