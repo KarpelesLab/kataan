@@ -98,3 +98,34 @@ fn integral_number_predicates_beyond_i64() {
     "#;
     assert_eq!(run(src), "true,true,true,false,false,true,ok,3");
 }
+
+/// A strict-mode write that would add an index to a non-extensible array
+/// (past its end, or into a hole) throws a TypeError; the dense element store
+/// used to grow or fill it silently (only seal/freeze were caught). Sloppy
+/// mode drops the write. Hot loops (JIT tiers) behave the same.
+#[test]
+fn strict_index_add_on_non_extensible_array_throws() {
+    let src = r#"
+        "use strict";
+        function t(f) { try { f(); return "ok"; } catch (e) { return e.name; } }
+        var r = [
+            t(() => { var a = [1, 2]; Object.preventExtensions(a); a[2] = 0; }),
+            t(() => { var a = [1, 2]; Object.preventExtensions(a); a[5] = 0; }),
+            t(() => { var a = [1, , 3]; Object.preventExtensions(a); a[1] = 0; }),
+            t(() => { var a = [1, 2]; Object.preventExtensions(a); a[0] = 9; }),
+            t(() => { var a = [1, 2]; Object.preventExtensions(a); a["2"] = 0; }),
+        ];
+        function hot() {
+            var a = [1, 2]; Object.preventExtensions(a); var c = 0;
+            for (var i = 0; i < 2000; i++) { try { a[2 + (i % 3)] = i; } catch (e) { c++; } }
+            return c + ":" + a.length;
+        }
+        var sloppy = Function("var a = [1, , 3]; Object.preventExtensions(a); a[1] = 1; a[4] = 1;"
+            + " return a.length + ':' + (1 in a);")();
+        r.join() + "|" + hot() + "|" + sloppy
+    "#;
+    assert_eq!(
+        run(src),
+        "TypeError,TypeError,TypeError,ok,TypeError|2000:2|3:false"
+    );
+}

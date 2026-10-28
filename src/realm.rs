@@ -3789,6 +3789,9 @@ impl Realm {
     /// configurability or installed a getter/setter, so an `arr[i] = v` write cannot
     /// take the plain dense-store fast path and must consult the descriptor instead.
     ///
+    /// Also `true` for an absent index (past the end, or a hole) of a
+    /// non-extensible array, where the write would add a property and must fail.
+    ///
     /// Returns `false` immediately for the overwhelming common case (no aux object,
     /// not frozen), keeping the dense write path untouched and allocation-free.
     #[must_use]
@@ -3796,6 +3799,19 @@ impl Realm {
         let raw = handle.to_raw();
         // A frozen array makes every index non-writable+non-configurable.
         if self.frozen_arrays.contains(&raw) || self.sealed_arrays.contains(&raw) {
+            return true;
+        }
+        // On a non-extensible array, a write to an absent index (past the end,
+        // or a hole) would *add* a property: OrdinarySet fails it, a strict
+        // assignment throws. The dense store would silently grow or fill it.
+        if !self.non_extensible_arrays.is_empty()
+            && self.non_extensible_arrays.contains(&raw)
+            && self
+                .heap
+                .get(handle)
+                .and_then(Cell::as_array)
+                .is_none_or(|a| a.get(i).is_none_or(|v| v.is_hole()))
+        {
             return true;
         }
         let Some(aux) = self.aux_props.get(&raw) else {
