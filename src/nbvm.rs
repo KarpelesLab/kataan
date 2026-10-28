@@ -11431,6 +11431,69 @@ fn static_key(key: &PropertyKey) -> Result<String, CompileError> {
 
 use alloc::collections::BTreeSet;
 
+/// Whether evaluating `e` might assign a variable held in one of the current
+/// function's registers. Conservative: `false` only for forms that provably
+/// contain no assignment or update outside nested function bodies. (A nested
+/// function or a callee can write only *captured* variables, which live in
+/// cells read into a fresh register; a direct `eval` in a function is not
+/// compiled to registers.)
+fn may_assign(e: &crate::ast::Expr) -> bool {
+    use crate::ast::Expr as E;
+    match e {
+        E::Null(_)
+        | E::Bool { .. }
+        | E::Number { .. }
+        | E::BigInt { .. }
+        | E::Str { .. }
+        | E::Regex { .. }
+        | E::Ident(_)
+        | E::PrivateName(..)
+        | E::This(_)
+        | E::Super(_)
+        | E::NewTarget(_)
+        | E::Function(_)
+        | E::Arrow(_) => false,
+        E::Template(t) => t.expressions.iter().any(may_assign),
+        E::Member {
+            object, property, ..
+        } => {
+            may_assign(object)
+                || matches!(property, crate::ast::PropertyKey::Computed(k) if may_assign(k))
+        }
+        E::Call {
+            callee, arguments, ..
+        }
+        | E::New {
+            callee, arguments, ..
+        } => may_assign(callee) || args_may_assign(arguments),
+        E::Unary { argument, .. } | E::Await { argument, .. } => may_assign(argument),
+        E::Binary { left, right, .. } | E::Logical { left, right, .. } => {
+            may_assign(left) || may_assign(right)
+        }
+        E::Conditional {
+            test,
+            consequent,
+            alternate,
+            ..
+        } => may_assign(test) || may_assign(consequent) || may_assign(alternate),
+        E::Sequence { expressions, .. } => expressions.iter().any(may_assign),
+        E::Array { elements, .. } => elements.iter().any(|el| match el {
+            crate::ast::ArrayElement::Hole => false,
+            crate::ast::ArrayElement::Item(x) | crate::ast::ArrayElement::Spread(x) => {
+                may_assign(x)
+            }
+        }),
+        _ => true,
+    }
+}
+
+/// [`may_assign`] over an argument list.
+fn args_may_assign(arguments: &[crate::ast::Argument]) -> bool {
+    arguments.iter().any(|a| match a {
+        crate::ast::Argument::Item(x) | crate::ast::Argument::Spread(x) => may_assign(x),
+    })
+}
+
 /// The free variables of a function: names it references that are bound neither
 /// by its parameters nor its local declarations (so they come from an enclosing
 /// scope — i.e. its captures).
@@ -14262,11 +14325,12 @@ impl Compiler {
     ) -> Result<bool, CompileError> {
         let (f, this) = self.env_callee(name);
         let mut args = Vec::with_capacity(arguments.len());
-        for a in arguments {
+        for (i, a) in arguments.iter().enumerate() {
             let crate::ast::Argument::Item(e) = a else {
                 return Err(CompileError::Unsupported("tail call argument"));
             };
-            args.push(self.expr(e)?);
+            let r = self.expr(e)?;
+            args.push(self.pin_operand(r, args_may_assign(&arguments[i + 1..])));
         }
         let arr = self.alloc();
         self.ops.push(Op::NewArray { dst: arr, len: 0 });
@@ -15575,6 +15639,12 @@ impl Compiler {
                 ..
             } => {
                 let d = self.expr(discriminant)?;
+                // A case test that assigns the discriminant's variable must not
+                // change the value already switched on.
+                let tests_assign = cases
+                    .iter()
+                    .any(|c| c.test.as_ref().is_some_and(may_assign));
+                let d = self.pin_operand(d, tests_assign);
                 // The case block is ONE scope, entered after the discriminant and
                 // before the tests. A jump to a later case can skip a lexical
                 // declaration, so every lexical keeps its TDZ check.
@@ -16422,8 +16492,10 @@ impl Compiler {
                     raw: quasi.quasis.iter().map(|q| String::from(&*q.raw)).collect(),
                 });
                 let mut args = alloc::vec![strings];
-                for ex in &quasi.expressions {
-                    args.push(self.expr(ex)?);
+                for (i, ex) in quasi.expressions.iter().enumerate() {
+                    let r = self.expr(ex)?;
+                    let later = quasi.expressions[i + 1..].iter().any(may_assign);
+                    args.push(self.pin_operand(r, later));
                 }
                 self.ops.push(Op::TailCallValue { callee, args });
                 Ok(())
@@ -16451,8 +16523,10 @@ impl Compiler {
                     });
                 }
                 let mut args = alloc::vec![strings];
-                for ex in &quasi.expressions {
-                    args.push(self.expr(ex)?);
+                for (i, ex) in quasi.expressions.iter().enumerate() {
+                    let r = self.expr(ex)?;
+                    let later = quasi.expressions[i + 1..].iter().any(may_assign);
+                    args.push(self.pin_operand(r, later));
                 }
                 if let Expr::Ident(id) = &**tag
                     && self.lookup(&id.name).is_none()
@@ -16575,11 +16649,12 @@ impl Compiler {
         }
         // Evaluate the arguments (matching the ordinary call's arg-first order).
         let mut args = Vec::with_capacity(arguments.len());
-        for a in arguments {
+        for (i, a) in arguments.iter().enumerate() {
             let crate::ast::Argument::Item(e) = a else {
                 return Ok(false);
             };
-            args.push(self.expr(e)?);
+            let r = self.expr(e)?;
+            args.push(self.pin_operand(r, args_may_assign(&arguments[i + 1..])));
         }
         // A direct call to a hoisted function by name reuses the frame in place;
         // any other callee is an indirect call through a function value.
@@ -16700,6 +16775,10 @@ impl Compiler {
                                 return self.constant(NanBox::boolean(true));
                             }
                             let obj = self.expr(object)?;
+                            let obj = self.pin_operand(
+                                obj,
+                                matches!(property, PropertyKey::Computed(k) if may_assign(k)),
+                            );
                             let key = match property {
                                 PropertyKey::Computed(e) => self.expr(e)?,
                                 _ => self.constant_str(&static_key(property)?),
@@ -16804,6 +16883,10 @@ impl Compiler {
                     } = &**argument
                     {
                         let obj = self.expr(object)?;
+                        let obj = self.pin_operand(
+                            obj,
+                            matches!(property, PropertyKey::Computed(k) if may_assign(k)),
+                        );
                         let key = match property {
                             PropertyKey::Computed(e) => self.expr(e)?,
                             _ => self.constant_str(&static_key(property)?),
@@ -16900,6 +16983,7 @@ impl Compiler {
                 }
                 if self.hosted && matches!(op, BinaryOp::In | BinaryOp::Instanceof) {
                     let a = self.expr(left)?;
+                    let a = self.pin_operand(a, may_assign(right));
                     let b = self.expr(right)?;
                     let dst = self.alloc();
                     self.ops.push(Op::Relational {
@@ -16995,6 +17079,7 @@ impl Compiler {
                     return Ok(dst);
                 }
                 let a = self.expr(left)?;
+                let a = self.pin_operand(a, may_assign(right));
                 let b = self.expr(right)?;
                 if matches!(op, BinaryOp::In) {
                     let dst = self.alloc();
@@ -17246,6 +17331,11 @@ impl Compiler {
                 } else {
                     self.expr(object)?
                 };
+                // `o[(o = p, k)]` reads the base evaluated first.
+                let obj = self.pin_operand(
+                    obj,
+                    matches!(property, PropertyKey::Computed(k) if may_assign(k)),
+                );
                 if *optional {
                     let go = self.emit_not_nullish(obj)?;
                     let jf = self.emit_jump_if_false(go); // jump when nullish
@@ -17621,6 +17711,7 @@ impl Compiler {
                 } = &**callee
                 {
                     let recv = self.expr(object)?;
+                    let recv = self.pin_operand(recv, args_may_assign(arguments));
                     // GetValue of the callee (a TypeError on a nullish base)
                     // precedes the arguments.
                     if self.hosted && !*optional {
@@ -17646,7 +17737,9 @@ impl Compiler {
                     && !matches!(&**object, Expr::Super(_))
                 {
                     let recv = self.expr(object)?;
+                    let recv = self.pin_operand(recv, may_assign(k) || args_may_assign(arguments));
                     let key = self.expr(k)?;
+                    let key = self.pin_operand(key, args_may_assign(arguments));
                     if self.hosted && !matches!(&**callee, Expr::Member { optional: true, .. }) {
                         self.ops.push(Op::RequireObjectCoercible { src: recv });
                     }
@@ -17689,17 +17782,10 @@ impl Compiler {
                 }
                 // Otherwise an indirect call through a function *value* (a local
                 // holding a function, or any callee expression).
-                let mut callee_reg = self.expr(callee)?;
+                let callee_reg = self.expr(callee)?;
                 // A local's register is the binding itself: an argument that
                 // reassigns it must not change the callee already evaluated.
-                if self.hosted && matches!(&**callee, Expr::Ident(_)) && !arguments.is_empty() {
-                    let t = self.alloc();
-                    self.ops.push(Op::Move {
-                        dst: t,
-                        src: callee_reg,
-                    });
-                    callee_reg = t;
-                }
+                let callee_reg = self.pin_operand(callee_reg, args_may_assign(arguments));
                 let args = self.call_args(arguments)?;
                 let dst = self.alloc();
                 self.ops.push(Op::CallValue {
@@ -17799,9 +17885,15 @@ impl Compiler {
                             // assigned value, or the current one on a
                             // short-circuit.
                             let obj = self.expr(object)?;
+                            let obj = self.pin_operand(
+                                obj,
+                                may_assign(value)
+                                    || matches!(property, PropertyKey::Computed(e) if may_assign(e)),
+                            );
                             let key = match property {
                                 PropertyKey::Computed(e) => {
                                     let k = self.expr(e)?;
+                                    let k = self.pin_operand(k, may_assign(value));
                                     if self.hosted {
                                         self.ops.push(Op::RequireObjectCoercible { src: obj });
                                         let kc = self.alloc();
@@ -17881,6 +17973,7 @@ impl Compiler {
                         // The reference — and for `op=` its current value — is
                         // taken *before* the right-hand side runs.
                         let cur = compound.then(|| self.read_var(b));
+                        let cur = cur.map(|c| self.pin_operand(c, may_assign(value)));
                         let resolved = if b.global.is_some()
                             && !self.is_env_binding(&b)
                             && self.strict
@@ -17926,8 +18019,16 @@ impl Compiler {
                         // The base and a computed key expression are evaluated once,
                         // before the right-hand side.
                         let obj = self.expr(object)?;
+                        let obj = self.pin_operand(
+                            obj,
+                            may_assign(value)
+                                || matches!(property, PropertyKey::Computed(e) if may_assign(e)),
+                        );
                         let mut key = match property {
-                            PropertyKey::Computed(e) => Some(self.expr(e)?),
+                            PropertyKey::Computed(e) => {
+                                let k = self.expr(e)?;
+                                Some(self.pin_operand(k, may_assign(value)))
+                            }
                             _ => None,
                         };
                         let src = if compound {
@@ -17995,6 +18096,10 @@ impl Compiler {
                     && !matches!(&**object, Expr::Super(_))
                 {
                     let obj = self.expr(object)?;
+                    let obj = self.pin_operand(
+                        obj,
+                        matches!(property, PropertyKey::Computed(k) if may_assign(k)),
+                    );
                     let (raw, key) = match property {
                         PropertyKey::Computed(e) => {
                             let k = self.expr(e)?;
@@ -18214,6 +18319,17 @@ impl Compiler {
                     }
                     other => TagCall::Value(self.expr(other)?),
                 };
+                // The tag (and its receiver/key) keep the values read now even
+                // if a substitution assigns their variables.
+                let subs_assign = quasi.expressions.iter().any(may_assign);
+                let call = match call {
+                    TagCall::Method(r, k) => TagCall::Method(self.pin_operand(r, subs_assign), k),
+                    TagCall::Key(r, k) => TagCall::Key(
+                        self.pin_operand(r, subs_assign),
+                        self.pin_operand(k, subs_assign),
+                    ),
+                    TagCall::Value(f) => TagCall::Value(self.pin_operand(f, subs_assign)),
+                };
                 let strings = self.alloc();
                 self.ops.push(Op::TemplateObject {
                     dst: strings,
@@ -18226,8 +18342,10 @@ impl Compiler {
                     raw: quasi.quasis.iter().map(|q| String::from(&*q.raw)).collect(),
                 });
                 let mut args = alloc::vec![strings];
-                for ex in &quasi.expressions {
-                    args.push(self.expr(ex)?);
+                for (i, ex) in quasi.expressions.iter().enumerate() {
+                    let r = self.expr(ex)?;
+                    let later = quasi.expressions[i + 1..].iter().any(may_assign);
+                    args.push(self.pin_operand(r, later));
                 }
                 let dst = self.alloc();
                 self.ops.push(match call {
@@ -18267,8 +18385,10 @@ impl Compiler {
                     });
                 }
                 let mut args = alloc::vec![strings];
-                for e in &quasi.expressions {
-                    args.push(self.expr(e)?);
+                for (i, e) in quasi.expressions.iter().enumerate() {
+                    let r = self.expr(e)?;
+                    let later = quasi.expressions[i + 1..].iter().any(may_assign);
+                    args.push(self.pin_operand(r, later));
                 }
                 // Dispatch the tag like a normal call.
                 let dst = self.alloc();
@@ -18295,14 +18415,10 @@ impl Compiler {
                     && !matches!(&**callee, Expr::Ident(id)
                         if self.lookup(&id.name).is_none() && self.classes.contains_key(&*id.name))
                 {
-                    let mut ctor = self.expr(callee)?;
+                    let ctor = self.expr(callee)?;
                     // (The callee is evaluated before the arguments: copy a
                     // local's binding register an argument may reassign.)
-                    if matches!(&**callee, Expr::Ident(_)) && !arguments.is_empty() {
-                        let t = self.alloc();
-                        self.ops.push(Op::Move { dst: t, src: ctor });
-                        ctor = t;
-                    }
+                    let ctor = self.pin_operand(ctor, args_may_assign(arguments));
                     if arguments
                         .iter()
                         .any(|a| matches!(a, crate::ast::Argument::Spread(_)))
@@ -18312,13 +18428,7 @@ impl Compiler {
                         self.ops.push(Op::ConstructSpread { dst, ctor, args });
                         return Ok(dst);
                     }
-                    let mut args = Vec::with_capacity(arguments.len());
-                    for a in arguments {
-                        let crate::ast::Argument::Item(e) = a else {
-                            return Err(CompileError::Unsupported("spread argument"));
-                        };
-                        args.push(self.expr(e)?);
-                    }
+                    let args = self.call_args(arguments)?;
                     let dst = self.alloc();
                     self.ops.push(Op::Construct { dst, ctor, args });
                     return Ok(dst);
@@ -18420,13 +18530,7 @@ impl Compiler {
                 let Some(info) = self.classes.get(&*id.name).cloned() else {
                     return Err(CompileError::Unsupported("new on unknown class"));
                 };
-                let mut args = Vec::with_capacity(arguments.len());
-                for a in arguments {
-                    let crate::ast::Argument::Item(e) = a else {
-                        return Err(CompileError::Unsupported("spread argument"));
-                    };
-                    args.push(self.expr(e)?);
-                }
+                let args = self.call_args(arguments)?;
                 let instance = self.alloc();
                 self.ops.push(Op::NewObject { dst: instance });
                 // Tag the instance with its class (for the VM's own `instanceof`
@@ -18743,13 +18847,32 @@ impl Compiler {
 
     fn call_args(&mut self, arguments: &[crate::ast::Argument]) -> Result<Vec<Reg>, CompileError> {
         let mut args = Vec::with_capacity(arguments.len());
-        for a in arguments {
+        for (i, a) in arguments.iter().enumerate() {
             let crate::ast::Argument::Item(e) = a else {
                 return Err(CompileError::Unsupported("spread argument"));
             };
-            args.push(self.expr(e)?);
+            let r = self.expr(e)?;
+            // The argument's value is the one read now, even when a later
+            // argument assigns the variable whose register this may be.
+            let r = self.pin_operand(r, args_may_assign(&arguments[i + 1..]));
+            args.push(r);
         }
         Ok(args)
+    }
+
+    /// An already-evaluated operand `r`, copied to a fresh register when
+    /// `later_assigns` (an operand evaluated after it may assign a variable).
+    /// `expr` hands back a local's own register for a bare identifier (and for
+    /// forms that yield one, like `(0, x)` or `x = v`), so without the copy a
+    /// later `x++` / `x = …` would change the earlier operand's value: an
+    /// operation reads its operand registers only when it runs.
+    fn pin_operand(&mut self, r: Reg, later_assigns: bool) -> Reg {
+        if !later_assigns {
+            return r;
+        }
+        let t = self.alloc();
+        self.ops.push(Op::Move { dst: t, src: r });
+        t
     }
 
     fn make_closure(
@@ -22069,6 +22192,55 @@ mod tests {
             assert_eq!(completion, want, "{src}");
         }
         assert_eq!(bc("String({} == {})"), "false");
+    }
+
+    #[test]
+    fn operand_read_before_later_operand_assigns_it() {
+        // A local lives in a register that `expr` hands back as the operand
+        // itself; a later operand assigning the variable must not change the
+        // value an earlier operand already read (ECMA-262 left-to-right
+        // evaluation). Inside a function, so the variables are registers.
+        for (body, want) in [
+            ("let j = 0; return g(j, j++, j);", "0,0,1"),
+            ("let k = 1; return k + (k = 5);", "6"),
+            ("let m = 1; m += (m = 5); return m;", "6"),
+            ("let d = 1; return d === (d = 2);", "false"),
+            ("let n = 0; return new C(n, n++, n).v;", "0,0,1"),
+            (
+                "let p = 0; const a = []; a[p] = p++; return JSON.stringify(a);",
+                "[0]",
+            ),
+            (
+                "let q = 0; const o = {}; o[q] = (q = 7); return JSON.stringify(o);",
+                "{\"0\":7}",
+            ),
+            (
+                "let s = 0; const o = { f: g }; return o.f(s, s++, s);",
+                "0,0,1",
+            ),
+            (
+                "let u = 0; const o = { f: g }; return o['f'](u, u++);",
+                "0,0",
+            ),
+            ("let z = 0; return t`${z}${z++}`;", "0,0"),
+            ("let a = [1, 2]; return a[(a = [7, 8], 0)];", "1"),
+            (
+                "let c = 0; let r = ''; switch (c) { case (c = 1, 0): r = 'zero'; break; default: r = 'other'; } return r;",
+                "zero",
+            ),
+            ("let f = g; return f((f = null, 1));", "1"),
+            ("let w = 0; return g(w, w += 1, w);", "0,1,1"),
+        ] {
+            let src = alloc::format!(
+                "function g(...a) {{ return a.join(','); }}\n\
+                 function C(...a) {{ this.v = a.join(','); }}\n\
+                 function t(s, ...v) {{ return v.join(','); }}\n\
+                 function h() {{ {body} }}\n\
+                 String(h())"
+            );
+            let (_, completion) = execute(&src).expect("ok");
+            assert_eq!(completion, want, "{body}");
+        }
     }
 
     #[test]
