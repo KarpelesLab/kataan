@@ -583,17 +583,46 @@ impl X64Assembler {
         miss: Label,
         getter: Option<Label>,
     ) {
-        use core::mem::{offset_of, size_of};
-        let i = |v: usize| i32::try_from(v).expect("site offset fits in i32");
-        let level = |d: usize, f: usize| {
-            i(offset_of!(MethodEntry, levels) + d * size_of::<ChainLevel>() + f)
-        };
         self.p_load_arena(realm_off, &l.props);
         self.mov_r10_rax();
         self.g_load(r::RAX, recv_base, recv_disp);
         self.p_handle_check(miss);
         self.p_slot_of(l, miss);
         self.p_plain_shaped(l, miss);
+        self.p_method_lookup_from(l, site, miss, getter);
+    }
+
+    /// [`p_method_lookup`](Self::p_method_lookup) for a receiver already
+    /// walked: `rcx` its live heap slot, an ordinary shaped object without the
+    /// host-exotic flag (`p_plain_shaped`'s facts), with the arena reloaded
+    /// here for the prototype levels.
+    pub(crate) fn p_method_lookup_walked(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        site: *const MethodSite,
+        miss: Label,
+        getter: Option<Label>,
+    ) {
+        self.p_load_arena(realm_off, &l.props);
+        self.mov_r10_rax();
+        self.p_method_lookup_from(l, site, miss, getter);
+    }
+
+    /// The rest of a method lookup, from the walked receiver's slot in `rcx`
+    /// and the arena in `r10` / `rdx`.
+    fn p_method_lookup_from(
+        &mut self,
+        l: &JitLayout,
+        site: *const MethodSite,
+        miss: Label,
+        getter: Option<Label>,
+    ) {
+        use core::mem::{offset_of, size_of};
+        let i = |v: usize| i32::try_from(v).expect("site offset fits in i32");
+        let level = |d: usize, f: usize| {
+            i(offset_of!(MethodEntry, levels) + d * size_of::<ChainLevel>() + f)
+        };
         // No accessors on the receiver: no `extra`, or an empty accessor list.
         let no_acc = self.new_label();
         self.g_load(r::R9, r::RCX, l.props.off_extra);
@@ -1045,6 +1074,42 @@ impl X64Assembler {
         const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
         self.g_load(r::R11, r::RCX, l.off_spill_ptr);
         self.p_load_index8(r::RAX, r::R11, r::RAX, -8 * INLINE);
+        self.jmp(back);
+    }
+
+    /// `mov [base + index*8 + disp32], src` (`index` not `rsp`).
+    pub(crate) fn p_store_index8(&mut self, base: u8, index: u8, disp: i32, src: u8) {
+        debug_assert!(index != 4, "rsp is no index");
+        let rex = 0x48 | (((src >> 3) & 1) << 2) | (((index >> 3) & 1) << 1) | ((base >> 3) & 1);
+        self.code.push(rex);
+        self.code.push(0x89);
+        self.code.push(0x80 | ((src & 7) << 3) | 4);
+        self.code.push(0xc0 | ((index & 7) << 3) | (base & 7));
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// The store twin of
+    /// [`p_obj_slot_load_inline`](Self::p_obj_slot_load_inline): with a slot
+    /// index (zero-extended) in `rax`, an object's heap slot in `rcx` and the
+    /// value in `rdx`, an inline property `= rdx`; an index past the object's
+    /// slot count goes to `miss`, one in the spill array to `spill`
+    /// ([`p_obj_slot_store_spill`](Self::p_obj_slot_store_spill)).
+    pub(crate) fn p_obj_slot_store_inline(&mut self, l: &JitLayout, miss: Label, spill: Label) {
+        const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
+        self.p_cmp32_mem(r::RAX, r::RCX, l.off_slots_len);
+        self.g_jcc(cc::AE, miss);
+        self.p_cmp32_imm(r::RAX, INLINE);
+        self.g_jcc(cc::AE, spill);
+        self.p_store_index8(r::RCX, r::RAX, l.off_inline, r::RDX);
+    }
+
+    /// The spill-array half of
+    /// [`p_obj_slot_store_inline`](Self::p_obj_slot_store_inline), then to
+    /// `back`. Clobbers `r11`.
+    pub(crate) fn p_obj_slot_store_spill(&mut self, l: &JitLayout, back: Label) {
+        const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
+        self.g_load(r::R11, r::RCX, l.off_spill_ptr);
+        self.p_store_index8(r::R11, r::RAX, -8 * INLINE, r::RDX);
         self.jmp(back);
     }
 

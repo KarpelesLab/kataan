@@ -375,6 +375,8 @@ enum StubKind {
     Truthy { cond: u16, target: usize },
     /// `xmm0 = canonical NaN` (no call).
     CanonNan,
+    /// `xmm x = canonical NaN` (no call).
+    CanonNanX { x: u8 },
     /// Leave the region: flush, then jump to bytecode pc `target`.
     Exit { target: usize },
     /// A global op at `pc` found no validated binding address: validate it
@@ -771,6 +773,7 @@ impl NumGen {
             }
             GenericOp::Move { dst, src } if reg.is_some() => {
                 match (self.xmm_of(reg, src), self.xmm_of(reg, dst)) {
+                    (Some(xs), Some(xd)) if xs == xd => {}
                     (Some(xs), Some(xd)) => a.movapd_xx(xd, xs),
                     (Some(xs), None) => a.movsd_mem_x(disp(dst), xs),
                     (None, Some(xd)) => a.movsd_x_mem(xd, disp(src)),
@@ -1206,6 +1209,12 @@ impl NumGen {
             .map(|s| s.xmm)
     }
 
+    /// Whether register `r` provably holds a Number on entry to op `pc` (in
+    /// a speculative region, under its speculation).
+    pub(super) fn is_number_at(&self, pc: usize, r: u16) -> bool {
+        self.ty(pc, r) == T_NUM
+    }
+
     /// `xmm = rax` (the bits).
     pub(super) fn set_xmm_from_rax(a: &mut X64Assembler, x: u8) {
         a.movq_x_gpr(x, RAX);
@@ -1505,11 +1514,45 @@ impl NumGen {
                 }
             }
         }
-        self.load_xmm0(a, reg, x);
-        let xy = self.xmm_src(a, reg, y, 1);
-        a.sse_rr(0xf2, opc, 0, xy);
-        self.canon_xmm0(a, reg);
-        self.store_xmm0(a, reg, dst);
+        match self.xmm_of(reg, dst) {
+            // A promoted result in a region: computed in its own register
+            // (`x` copied in first, or `y` when `+` / `*` can commute).
+            Some(xd) if self.imode.is_none() => {
+                let (xx, xy) = (self.xmm_of(reg, x), self.xmm_of(reg, y));
+                if xy == Some(xd) && xx != Some(xd) {
+                    if opc == 0x58 || opc == 0x59 {
+                        let xs = self.xmm_src(a, reg, x, 1);
+                        a.sse_rr(0xf2, opc, xd, xs);
+                    } else {
+                        self.load_xmm0(a, reg, x);
+                        a.sse_rr(0xf2, opc, 0, xd);
+                        a.movapd_xx(xd, 0);
+                    }
+                } else {
+                    match xx {
+                        Some(s) if s == xd => {}
+                        Some(s) => a.movapd_xx(xd, s),
+                        None => a.movsd_x_mem(xd, disp(x)),
+                    }
+                    let ys = self.xmm_src(a, reg, y, 1);
+                    a.sse_rr(0xf2, opc, xd, ys);
+                }
+                // A NaN made canonical (out of line).
+                let fix = a.new_label();
+                let back = a.new_label();
+                a.sse_rr(0x66, 0x2e, xd, xd); // ucomisd xd, xd
+                a.jcc(CC_P, fix);
+                a.bind(back);
+                self.stub(fix, back, reg, StubKind::CanonNanX { x: xd });
+            }
+            _ => {
+                self.load_xmm0(a, reg, x);
+                let xy = self.xmm_src(a, reg, y, 1);
+                a.sse_rr(0xf2, opc, 0, xy);
+                self.canon_xmm0(a, reg);
+                self.store_xmm0(a, reg, dst);
+            }
+        }
         a.bind(resume);
         if guarded {
             let k = slow(self);
@@ -1887,6 +1930,11 @@ impl NumGen {
                 StubKind::CanonNan => {
                     a.movabs_rax(self.canonical_nan as i64);
                     a.movq_x_gpr(0, RAX);
+                    a.jmp(s.resume);
+                }
+                StubKind::CanonNanX { x } => {
+                    a.movabs_rax(self.canonical_nan as i64);
+                    a.movq_x_gpr(x, RAX);
                     a.jmp(s.resume);
                 }
                 StubKind::Exit { target } => {
@@ -2300,9 +2348,9 @@ fn plan_regions(
         let mut temps: Vec<&(u16, usize, usize, u32, bool)> =
             info.iter().filter(|x| !carried_r(x.0)).collect();
         temps.sort_by(|p, q| p.1.cmp(&q.1).then(p.0.cmp(&q.0)));
-        let mut active: Vec<(usize, u8)> = Vec::new();
+        let mut active: Vec<(usize, u8, u16)> = Vec::new();
         for x in temps {
-            active.retain(|&(e, xmm)| {
+            active.retain(|&(e, xmm, _)| {
                 if e < x.1 {
                     free.push(xmm);
                     false
@@ -2310,8 +2358,25 @@ fn plan_regions(
                     true
                 }
             });
-            let Some(xmm) = free.pop() else { continue };
-            active.push((x.2, xmm));
+            // A `Move` that ends its source's interval hands the source's
+            // SSE register to its destination (the move then emits nothing).
+            // Generic regions only (no integer version shadows the slots).
+            let mut reuse = None;
+            if generic
+                && let Op::Move { dst, src } = bytecode[x.1]
+                && dst == x.0
+                && let Some(i) = active.iter().position(|&(e, _, r)| r == src && e == x.1)
+            {
+                reuse = Some(active.remove(i).1);
+            }
+            let xmm = match reuse {
+                Some(m) => m,
+                None => {
+                    let Some(m) = free.pop() else { continue };
+                    m
+                }
+            };
+            active.push((x.2, xmm, x.0));
             slots.push(Slot {
                 reg: x.0,
                 xmm,
@@ -2740,12 +2805,15 @@ mod tests {
             r.slots.iter().any(|s| !s.carried),
             "temporaries share registers"
         );
-        // No two slots live at once share an SSE register.
+        // No two slots live at once share an SSE register (a move's source
+        // may hand its register to the destination at the move).
         for x in &r.slots {
             for y in &r.slots {
                 if !core::ptr::eq(x, y) && x.xmm == y.xmm {
+                    let handoff = x.end == y.start
+                        && matches!(p.ops[y.start], Op::Move { dst, src } if dst == y.reg && src == x.reg);
                     assert!(
-                        x.end < y.start || y.end < x.start,
+                        x.end < y.start || y.end < x.start || handoff,
                         "overlapping intervals share xmm{}",
                         x.xmm
                     );

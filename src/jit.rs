@@ -5306,14 +5306,32 @@ impl JitFunction {
             0
         };
         let epoch_addr = crate::env::global_binding_epoch_addr() as i64;
+        // The inline `Math.f(x)` sites' own caches, under the global binding
+        // cache: per site, its receiver's handle bits (a key, emptied as the
+        // receiver cache's are) and heap slot address, and the bits of the
+        // method last proved the built-in (a key too).
+        let math_sites: Vec<usize> = (0..ops.len())
+            .filter(|&i| {
+                matches!(ops[i], GenericOp::CallMethod { .. })
+                    && bytecode.get(i).and_then(inline_math).is_some()
+            })
+            .collect();
+        let m_base = gc_base - 8 * gc_frame_slots as i32;
+        let m_slot = |site: usize, k: i32| m_base - 8 * (3 * site as i32 + k + 1);
         let frame = ((16
             + max_argc as u32 * 8
-            + (num.frame_slots() + 2 * rc.ways + gc_frame_slots) as u32 * 8)
+            + (num.frame_slots() + 2 * rc.ways + gc_frame_slots + 3 * math_sites.len()) as u32
+                * 8)
             + 15)
             & !15;
         let mut a = X64Assembler::new();
         a.set_rbx_frame(true);
-        a.set_recv_cache_keys((0..rc.ways).map(rc_key).collect());
+        a.set_recv_cache_keys(
+            (0..rc.ways)
+                .map(rc_key)
+                .chain((0..math_sites.len()).flat_map(|m| [m_slot(m, 0), m_slot(m, 2)]))
+                .collect(),
+        );
         if gc_plan.slots > 0 {
             a.set_entry_clear(
                 (0..gc_plan.slots)
@@ -5680,22 +5698,41 @@ impl JitFunction {
                         let fill = a.new_label();
                         let general = a.new_label();
                         let nan = a.new_label();
+                        let mi = math_sites.iter().position(|&p| p == op_idx)?;
+                        let walk = a.new_label();
+                        let have = a.new_label();
+                        let proven = a.new_label();
                         a.g_cmp_byte_imm(call_seq::r::R15, helpers.call_layout.hosted, 0);
                         a.g_jcc(call_seq::cc::E, general); // not hosted: no chain cache
-                        a.p_method_lookup(
+                        // The receiver's heap slot through the site's own
+                        // one-entry cache (else walked, out of line).
+                        a.load_rax(disp(recv));
+                        a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, m_slot(mi, 0));
+                        a.jne(walk);
+                        a.g_load(call_seq::r::RCX, call_seq::r::RBP, m_slot(mi, 1));
+                        a.bind(have);
+                        a.p_method_lookup_walked(
                             &layout,
                             helpers.call_layout.realm,
-                            (call_seq::r::RBX, disp(recv)),
                             si.method_ptr,
                             fill,
                             None,
                         );
+                        // The method: the very value proved the built-in since
+                        // the last call, else proved now.
+                        a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, m_slot(mi, 2));
+                        a.je(proven);
+                        a.g_mov(call_seq::r::R9, call_seq::r::RAX);
                         a.p_is_native(&layout, helpers.call_layout.realm, native_id, general);
-                        a.movabs_r11(QNAN as i64);
-                        a.load_rax(disp(x));
-                        a.and_rax_r11();
-                        a.cmp_rax_r11();
-                        a.je(general); // not a Number: its conversion is the call's
+                        a.g_store(call_seq::r::RBP, m_slot(mi, 2), call_seq::r::R9);
+                        a.bind(proven);
+                        if !num.is_number_at(op_idx, x) {
+                            a.movabs_r11(QNAN as i64);
+                            a.load_rax(disp(x));
+                            a.and_rax_r11();
+                            a.cmp_rax_r11();
+                            a.je(general); // not a Number: its conversion is the call's
+                        }
                         if let MathInline::Abs = f {
                             // The sign bit cleared (a NaN argument is already
                             // the canonical one, whose sign is clear).
@@ -5726,6 +5763,15 @@ impl JitFunction {
                             a.store_rax(disp(dst));
                             a.jmp(done);
                         }
+                        // The receiver walk, recorded in the site's cache.
+                        a.bind(walk);
+                        a.p_load_arena(helpers.call_layout.realm, &layout.props);
+                        walk_to_slot!(recv, general);
+                        family_checks!(recv_cache::Family::Obj, general);
+                        a.g_load(call_seq::r::R11, call_seq::r::RBX, disp(recv));
+                        a.g_store(call_seq::r::RBP, m_slot(mi, 0), call_seq::r::R11);
+                        a.g_store(call_seq::r::RBP, m_slot(mi, 1), call_seq::r::RCX);
+                        a.jmp(have);
                         // A chain-cache miss: refill it from the receiver.
                         a.bind(fill);
                         a.mov_rdi_r15();
@@ -6162,15 +6208,28 @@ impl JitFunction {
                     // A primitive wrapper (its shape's brand bit 0) — the helper.
                     a.p_test_byte_imm(call_seq::r::RAX, layout.props.shape_brands, 1);
                     a.jne(helper);
-                    a.load_rax(disp(val));
-                    a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
-                    a.movabs_r11(s.cache_ptr as i64);
-                    a.mov_eax_at_r11(layout.cache_slot_off);
-                    a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
-                    a.p_obj_slot_addr(&layout, call_seq::r::R11, helper);
-                    a.load_rdx(disp(val));
-                    a.g_store(call_seq::r::R11, 0, call_seq::r::RDX); // slots[slot] = val
-                    a.jmp(done);
+                    if num.is_number_at(op_idx, val) {
+                        // A Number: nothing for the write barrier to do, so
+                        // straight to the slot (`r11` still the cache).
+                        let spill = a.new_label();
+                        a.mov_eax_at_r11(layout.cache_slot_off);
+                        a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
+                        a.load_rdx(disp(val));
+                        a.p_obj_slot_store_inline(&layout, helper, spill);
+                        a.jmp(done);
+                        a.bind(spill);
+                        a.p_obj_slot_store_spill(&layout, done);
+                    } else {
+                        a.load_rax(disp(val));
+                        a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
+                        a.movabs_r11(s.cache_ptr as i64);
+                        a.mov_eax_at_r11(layout.cache_slot_off);
+                        a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
+                        a.p_obj_slot_addr(&layout, call_seq::r::R11, helper);
+                        a.load_rdx(disp(val));
+                        a.g_store(call_seq::r::R11, 0, call_seq::r::RDX); // slots[slot] = val
+                        a.jmp(done);
+                    }
                     // ===== inline add-cache hit (`p_add_prop_inline`): the
                     // write adds the key `this.x = x` adds, by the site's
                     // recorded transition =====
