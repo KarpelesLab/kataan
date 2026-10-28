@@ -149,13 +149,18 @@ fn run_parse(source: &str, origin: &str) -> ExitCode {
 }
 
 /// Runs `source` on the bytecode VM hosted by an interpreter
-/// (`kataan::nbvm::execute`, i.e. `Interp::run`), printing its captured
-/// `console` output and a non-empty completion value. Backs `run`, `eval` and
+/// (`kataan::nbvm::execute_capturing`, i.e. `Interp::run`), printing its captured
+/// `console` output (even when the script then throws) and a non-empty
+/// completion value. Backs `run`, `eval` and
 /// `nbrun`.
 fn run_eval_nb(source: &str, origin: &str) -> ExitCode {
-    match kataan::nbvm::execute(source) {
-        Ok((output, completion)) => {
-            print!("{output}");
+    // The script's `console` output is printed on the error path too: an
+    // uncaught throw does not un-print what ran before it.
+    let (output, outcome) =
+        kataan::nbvm::execute_capturing(source, kataan::limits::Limits::default());
+    print!("{output}");
+    match outcome {
+        Ok(completion) => {
             if !completion.is_empty() && completion != "undefined" {
                 println!("{completion}");
             }
