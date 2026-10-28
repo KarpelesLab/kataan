@@ -127,6 +127,17 @@ impl Realm {
         Some(i.and_then(|i| self.string_unit_at(handle, i)))
     }
 
+    /// Whether the cell at `handle` may own a named (non-index, non-`length`)
+    /// property: `false` only for an array with no auxiliary object, the one
+    /// place an array keeps such properties.
+    #[must_use]
+    pub fn may_own_named(&self, handle: Handle) -> bool {
+        match self.heap.get(handle) {
+            Some(Cell::Array(_)) => self.aux_props.get(&handle.to_raw()).is_some(),
+            _ => true,
+        }
+    }
+
     /// Whether `handle` is a [`Cell::Array`].
     #[must_use]
     pub fn is_plain_array_cell(&self, handle: Handle) -> bool {
@@ -294,6 +305,25 @@ impl Realm {
             if h.to_raw() != raw {
                 return None;
             }
+            // The usual link, an ordinary object (a prototype): the checks of
+            // `key_link`/`named_props` on one heap read.
+            if aux.is_none()
+                && let Some(Cell::Object(o)) = self.heap.get(h)
+            {
+                if o.key_epoch() != epoch || self.is_host_exotic(h) {
+                    return None;
+                }
+                if i == last {
+                    if let (Some(s), Some(m)) = (o.shaped_shape(), cache.holder_shape.as_ref())
+                        && Rc::ptr_eq(s, m)
+                    {
+                        return o.slot(cache.holder_slot);
+                    }
+                    return self.holder_data(h, key);
+                }
+                cur = o.proto();
+                continue;
+            }
             let (a, e, next) = self.key_link(h)?;
             if a != aux || e != epoch {
                 return None;
@@ -415,9 +445,30 @@ impl Realm {
             if h.to_raw() != raw {
                 return None;
             }
+            // An ordinary-object link (the usual case): one heap read.
+            if aux.is_none()
+                && !(cache.holder && Some(i) == last)
+                && let Some(Cell::Object(o)) = self.heap.get(h)
+            {
+                if o.key_epoch() != epoch || self.is_host_exotic(h) {
+                    return None;
+                }
+                cur = o.proto();
+                continue;
+            }
             match self.key_link(h) {
                 Some((a, e, next)) if a == aux && e == epoch => {
                     if cache.holder && Some(i) == last {
+                        // Same key set as when armed, so still a data
+                        // property: at the recorded slot while the layout is
+                        // the recorded one.
+                        if let Some(m) = cache.holder_shape.as_ref()
+                            && let Some(o) = self.named_props(h)
+                            && let Some(s) = o.shaped_shape()
+                            && Rc::ptr_eq(s, m)
+                        {
+                            return o.slot(cache.holder_slot).map(Some);
+                        }
                         return self.holder_data(h, &cache.key).map(Some);
                     }
                     cur = next;
@@ -501,6 +552,7 @@ impl Realm {
         cache.links.clear();
         cache.swaps = self.cell_swaps;
         cache.holder = false;
+        cache.holder_shape = None;
         if &*cache.key != key {
             cache.key = alloc::boxed::Box::from(key);
         }
@@ -516,6 +568,13 @@ impl Realm {
             if self.has_own(h, key) {
                 if self.holder_data(h, key).is_none() {
                     return;
+                }
+                if let Some(o) = self.named_props(h)
+                    && let Some(s) = o.shaped_shape()
+                    && let Some(slot) = s.lookup(key)
+                {
+                    cache.holder_shape = Some(Rc::clone(s));
+                    cache.holder_slot = slot;
                 }
                 cache.links.push((h.to_raw(), aux, epoch));
                 cache.holder = true;
@@ -543,6 +602,10 @@ pub struct ChainKeyCache {
     links: alloc::vec::Vec<(u64, Option<u64>, u32)>,
     /// Whether the last link owns the key (else no link does).
     holder: bool,
+    /// The holder's shape when armed and the key's slot in it, so a hit
+    /// under that same layout reads the slot without a name lookup.
+    holder_shape: Option<Rc<Shape>>,
+    holder_slot: u32,
     armed: bool,
     fills: u16,
     swaps: u32,
@@ -703,6 +766,31 @@ impl Realm {
         self.heap.alloc(Cell::Str(rope))
     }
 
+    /// A new string cell for the evaluation of a string literal whose text is
+    /// `s` (borrowed from the bytecode). Strings are immutable values, so every
+    /// evaluation of one literal may share one rope: a small direct-mapped memo
+    /// keyed by the text's address hands it back, re-checked against the text
+    /// itself so a reused address (freed bytecode) can never return another
+    /// string. The cell stays fresh per evaluation; only the rope is shared.
+    pub fn new_literal_string(&mut self, s: &str) -> Handle {
+        const SLOTS: usize = 256;
+        let key = s.as_ptr() as usize;
+        let slot = (key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56;
+        let slot = slot as usize % SLOTS;
+        if self.literal_ropes.is_empty() {
+            self.literal_ropes.resize(SLOTS, None);
+        }
+        let rope = match &self.literal_ropes[slot] {
+            Some((k, r)) if *k == key && r.as_leaf_bytes() == Some(s.as_bytes()) => r.clone(),
+            _ => {
+                let r = crate::rope::Rope::from(s);
+                self.literal_ropes[slot] = Some((key, r.clone()));
+                r
+            }
+        };
+        self.heap.alloc(Cell::Str(rope))
+    }
+
     /// `a + b` for a string `a` held as one short leaf and a number `b` (or the
     /// mirror case when `number_first`): the joined text written straight into
     /// one new leaf, with no intermediate string for the number. `None` when
@@ -721,14 +809,18 @@ impl Realm {
         }
         let (buf, pos) = small_integer_digits(n)?;
         let digits = &buf[pos..];
-        let mut out = alloc::vec::Vec::with_capacity(bytes.len() + digits.len());
-        if number_first {
-            out.extend_from_slice(digits);
-            out.extend_from_slice(bytes);
+        // At most 40 + 21 bytes: joined on the stack, then copied once into the
+        // new rope (inline when short).
+        let mut out = [0u8; 64];
+        let (first, second) = if number_first {
+            (digits, bytes)
         } else {
-            out.extend_from_slice(bytes);
-            out.extend_from_slice(digits);
-        }
-        Some(crate::rope::Rope::from_wtf8(out))
+            (bytes, digits)
+        };
+        out[..first.len()].copy_from_slice(first);
+        out[first.len()..first.len() + second.len()].copy_from_slice(second);
+        Some(crate::rope::Rope::from_bytes(
+            &out[..first.len() + second.len()],
+        ))
     }
 }

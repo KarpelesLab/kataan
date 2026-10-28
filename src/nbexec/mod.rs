@@ -2283,15 +2283,15 @@ const GEN_RET: &str = "\u{0}gret";
 /// Hidden slots on a **live** Set/Map iterator (a spec-faithful iterator that
 /// re-reads the collection on each `next()`, so mutation mid-iteration is
 /// visible). `GEN_COLL` = the collection handle (its presence marks the iterator
-/// live); `GEN_KIND` = 0 keys / 1 values / 2 entries; `GEN_LASTKEY` = the last
-/// yielded key (absent → not yet started); `GEN_IDX` = its position at yield time
-/// (the resume point if that key was since deleted); `GEN_DONE` = detached.
+/// live) and `GEN_CSTATE` its cursor. `GEN_KIND` (0 keys / 1 values / 2 entries)
+/// and `GEN_DONE` (exhausted) are shared with the other live iterators.
 const GEN_COLL: &str = "\u{0}gcoll";
 const GEN_KIND: &str = "\u{0}gkind";
-const GEN_LASTKEY: &str = "\u{0}glast";
 const GEN_DONE: &str = "\u{0}gdone";
-/// A live Set/Map iterator's collection epoch (see `Realm::collection_iter_rebase`).
-const GEN_EPOCH: &str = "\u{0}gepoch";
+/// A live Set/Map iterator's cursor state: an internal array laid out as
+/// [`Realm::collection_iter_advance`] describes (kind, cursor, epoch, last key,
+/// status), so a step reads and writes one cell instead of five named slots.
+const GEN_CSTATE: &str = "\u{0}gcstate";
 /// Hidden slot on a **live** typed-array iterator: the typed-array handle. Its
 /// `next()` re-reads the live length (`typed_len`) and each element by index, so
 /// growing/shrinking the backing resizable buffer — or writing an element —

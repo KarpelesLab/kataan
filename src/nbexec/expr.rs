@@ -3028,11 +3028,17 @@ impl Interp {
             return Ok(false);
         }
         // `Array`/`Object` are namespace objects (not natives), matched by the
-        // identity of the global binding.
-        if self.current.get("Array").and_then(|v| v.as_handle()) == ctor.as_handle() {
+        // identity of the global binding — which must still hold the intrinsic
+        // (a script may rebind `Array`/`Object` to its own constructor, whose
+        // instances then go through the ordinary prototype walk below).
+        if self.current.get("Array").and_then(|v| v.as_handle()) == ctor.as_handle()
+            && self.is_array_ctor(ctor)
+        {
             return Ok(self.realm.is_array(oh));
         }
-        if self.current.get("Object").and_then(|v| v.as_handle()) == ctor.as_handle() {
+        if self.current.get("Object").and_then(|v| v.as_handle()) == ctor.as_handle()
+            && self.is_object_ctor(ctor)
+        {
             // Heap primitives (string/symbol/bigint values) are not objects.
             if self.realm.is_string_handle(oh)
                 || self.realm.symbol_at(oh).is_some()

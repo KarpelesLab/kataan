@@ -24,6 +24,8 @@
 //! [`Handle`]: crate::heap::Handle
 
 pub(crate) mod builtins_fast;
+mod coll_index;
+pub use coll_index::CollIndex;
 mod handle_map;
 
 use crate::atom::{Atom, AtomTable};
@@ -193,6 +195,9 @@ pub struct Realm {
     /// The shared ropes of the small integers' strings (see
     /// `builtins_fast::number_rope`), filled on first use.
     number_ropes: core::cell::RefCell<alloc::vec::Vec<Option<Rope>>>,
+    /// A direct-mapped memo of string-literal ropes, keyed by the address of
+    /// the literal text in its bytecode (see `builtins_fast::new_literal_string`).
+    literal_ropes: alloc::vec::Vec<Option<(usize, Rope)>>,
     /// The key strings of the last plain-keyed shape `Object.keys` listed
     /// (see `builtins_fast::plain_enumerable_key_ropes`).
     key_ropes: core::cell::RefCell<Option<ShapeKeyRopes>>,
@@ -629,6 +634,7 @@ impl Realm {
             #[cfg(feature = "regex")]
             regex_programs: core::cell::RefCell::new(alloc::vec::Vec::new()),
             number_ropes: core::cell::RefCell::new(alloc::vec::Vec::new()),
+            literal_ropes: alloc::vec::Vec::new(),
             key_ropes: core::cell::RefCell::new(None),
             chain_lookups: core::cell::RefCell::new(alloc::vec::Vec::new()),
             sparse_array_lengths: alloc::collections::BTreeMap::new(),
@@ -2219,16 +2225,31 @@ impl Realm {
     /// * every other reference (object, symbol, …) is identity-compared, so it
     ///   hashes its raw handle.
     fn collection_key_hash(&self, v: NanBox) -> u64 {
-        // FNV-1a over a tag byte plus the discriminating bytes.
-        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const PRIME: u64 = 0x0000_0100_0000_01b3;
-        let mut h = OFFSET;
-        let eat = |bytes: &[u8], h: &mut u64| {
-            for b in bytes {
-                *h ^= u64::from(*b);
-                *h = h.wrapping_mul(PRIME);
+        /// A 64-bit finalizer (xor-shift / multiply rounds), so keys that differ
+        /// only in a few bits still land far apart.
+        #[inline]
+        fn mix(mut x: u64) -> u64 {
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+            x ^ (x >> 33)
+        }
+        /// Word-at-a-time over the bytes, seeded by a kind tag and the length.
+        fn bytes_hash(tag: u64, bytes: &[u8]) -> u64 {
+            const K: u64 = 0x9E37_79B9_7F4A_7C15;
+            let mut h = tag.wrapping_mul(K) ^ (bytes.len() as u64);
+            let (words, rest) = bytes.as_chunks::<8>();
+            for w in words {
+                h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(K).rotate_left(29);
             }
-        };
+            if !rest.is_empty() {
+                let mut w = [0u8; 8];
+                w[..rest.len()].copy_from_slice(rest);
+                h = (h ^ u64::from_le_bytes(w)).wrapping_mul(K).rotate_left(29);
+            }
+            mix(h)
+        }
         if let Some(n) = v.as_number() {
             // `SameValueZero`: NaN ≡ NaN and -0 ≡ +0.
             let bits = if n.is_nan() {
@@ -2238,31 +2259,21 @@ impl Realm {
             } else {
                 n.to_bits()
             };
-            eat(&[0], &mut h);
-            eat(&bits.to_le_bytes(), &mut h);
-            return h;
+            return mix(bits);
         }
         if let Some(raw) = v.as_handle() {
             let cell = self.heap.get(Handle::from_raw(raw));
             if let Some(rope) = cell.and_then(Cell::as_str) {
-                eat(&[1], &mut h);
-                eat(&rope_bytes(rope), &mut h);
-                return h;
+                return bytes_hash(1, &rope_bytes(rope));
             }
             if let Some(b) = cell.and_then(Cell::as_bigint) {
-                eat(&[2], &mut h);
-                eat(alloc::string::ToString::to_string(b).as_bytes(), &mut h);
-                return h;
+                return bytes_hash(2, alloc::string::ToString::to_string(b).as_bytes());
             }
-            eat(&[3], &mut h);
-            eat(&raw.to_le_bytes(), &mut h);
-            return h;
+            return mix(raw ^ 0x3333_3333_0000_0000);
         }
         // The remaining primitives (bool/null/undefined) discriminate by their
         // own bits, which `strict_equals` compares directly.
-        eat(&[4], &mut h);
-        eat(&v.to_bits().to_le_bytes(), &mut h);
-        h
+        mix(v.to_bits() ^ 0x4444_4444_0000_0000)
     }
 
     /// The index of the entry whose key is `SameValueZero`-equal to `key`, using
@@ -2270,6 +2281,12 @@ impl Realm {
     /// `handle` is not a collection.
     fn collection_find(&mut self, handle: Handle, key: NanBox) -> Option<usize> {
         let hash = self.collection_key_hash(key);
+        self.collection_find_hashed(handle, key, hash)
+    }
+
+    /// [`collection_find`](Self::collection_find) with the key's hash already
+    /// computed.
+    fn collection_find_hashed(&mut self, handle: Handle, key: NanBox, hash: u64) -> Option<usize> {
         if self.collection_index_missing(handle) {
             self.collection_build_index(handle);
         }
@@ -2281,10 +2298,20 @@ impl Realm {
         else {
             return None;
         };
-        map.get(&hash)?.iter().map(|&i| i as usize).find(|&i| {
-            entries
-                .get(i)
-                .is_some_and(|(k, _)| !k.is_hole() && self.same_value_zero(*k, key))
+        // Fast equality for the common key kinds; anything else (strings,
+        // BigInts by value) goes through `SameValueZero`.
+        let key_num = key.as_number();
+        map.find(hash, |i| {
+            entries.get(i).is_some_and(|(k, _)| {
+                if k.to_bits() == key.to_bits() {
+                    return !k.is_hole();
+                }
+                match (key_num, k.as_number()) {
+                    (Some(a), Some(b)) => a == b || (a.is_nan() && b.is_nan()),
+                    (Some(_), None) | (None, Some(_)) => false,
+                    (None, None) => !k.is_hole() && self.same_value_zero(*k, key),
+                }
+            })
         })
     }
 
@@ -2299,35 +2326,20 @@ impl Realm {
 
     /// Builds the hash index for the collection at `handle` from its entries.
     /// Hashing needs `&self.heap` (a string/BigInt key is read through it), so
-    /// the map is assembled first and installed after.
+    /// the index is assembled first and installed after.
     fn collection_build_index(&mut self, handle: Handle) {
         let Some((_, entries)) = self.heap.get(handle).and_then(Cell::as_collection) else {
             return;
         };
-        let keys: Vec<NanBox> = entries.iter().map(|(k, _)| *k).collect();
-        let mut map: alloc::collections::BTreeMap<u64, Vec<u32>> =
-            alloc::collections::BTreeMap::new();
-        for (i, k) in keys.iter().enumerate() {
+        let mut map = coll_index::CollIndex::with_capacity(entries.len());
+        for (i, (k, _)) in entries.iter().enumerate() {
             if k.is_hole() {
                 continue; // a tombstone
             }
-            map.entry(self.collection_key_hash(*k))
-                .or_default()
-                .push(i as u32);
+            map.insert(self.collection_key_hash(*k), i);
         }
         if let Some(Cell::Collection { index, .. }) = self.heap.get_mut(handle) {
             *index = Some(map);
-        }
-    }
-
-    /// Records that `entries[i]` (a freshly appended entry) has key hash `hash`.
-    /// A no-op when no index is live — the next lookup rebuilds it wholesale.
-    fn collection_index_push(&mut self, handle: Handle, hash: u64, i: u32) {
-        if let Some(Cell::Collection {
-            index: Some(map), ..
-        }) = self.heap.get_mut(handle)
-        {
-            map.entry(hash).or_default().push(i);
         }
     }
 
@@ -2391,18 +2403,27 @@ impl Realm {
         };
         let value = if is_set { key } else { value };
         // Look the key up through the hash index (built on demand), then write.
-        let pos = self.collection_find(handle, key);
         let hash = self.collection_key_hash(key);
-        let Some(Cell::Collection { entries, live, .. }) = self.heap.get_mut(handle) else {
+        let pos = self.collection_find_hashed(handle, key, hash);
+        let Some(Cell::Collection {
+            entries,
+            live,
+            index,
+            ..
+        }) = self.heap.get_mut(handle)
+        else {
             return false;
         };
         match pos {
             Some(i) => entries[i].1 = value,
             None => {
-                let i = entries.len() as u32;
+                let i = entries.len();
                 entries.push((key, value));
                 *live += 1;
-                self.collection_index_push(handle, hash, i);
+                // (`collection_find_hashed` just built the index if it was missing.)
+                if let Some(map) = index {
+                    map.insert(hash, i);
+                }
             }
         }
         self.write_barrier(handle, key);
@@ -2451,10 +2472,10 @@ impl Realm {
     /// `Map.delete(key)` / `Set.delete(value)` — removes the entry, returning
     /// whether one was present.
     pub fn collection_delete(&mut self, handle: Handle, key: NanBox) -> bool {
-        let Some(i) = self.collection_find(handle, key) else {
+        let hash = self.collection_key_hash(key);
+        let Some(i) = self.collection_find_hashed(handle, key, hash) else {
             return false;
         };
-        let hash = self.collection_key_hash(key);
         let Some(Cell::Collection {
             entries,
             live,
@@ -2468,13 +2489,8 @@ impl Realm {
         // the hash index stay valid (the index just drops this one position).
         entries[i] = (NanBox::hole(), NanBox::hole());
         *live -= 1;
-        if let Some(map) = index
-            && let Some(bucket) = map.get_mut(&hash)
-        {
-            bucket.retain(|&j| j as usize != i);
-            if bucket.is_empty() {
-                map.remove(&hash);
-            }
+        if let Some(map) = index {
+            map.remove(hash, i);
         }
         self.collection_maybe_compact(handle);
         true
@@ -2538,6 +2554,68 @@ impl Realm {
             }
             _ => 0,
         }
+    }
+
+    /// Attaches a live iterator (`kind`: 0 keys, 1 values, 2 entries) to the
+    /// collection at `coll` and returns its cursor state, an internal array
+    /// `[kind, cursor, epoch, last key, status]` stepped by
+    /// [`collection_iter_advance`](Self::collection_iter_advance). The cursor is
+    /// the raw position of the next entry to consider; `epoch` the collection
+    /// numbering it belongs to; `last` the last-yielded key (meaningful once
+    /// `status` is 1 = started; 2 = exhausted and detached).
+    pub fn collection_iter_state(&mut self, coll: Handle, kind: u8) -> Handle {
+        let epoch = self.collection_iter_attach(coll);
+        self.new_array(alloc::vec![
+            NanBox::number(f64::from(kind)),
+            NanBox::number(0.0),
+            NanBox::number(f64::from(epoch)),
+            NanBox::undefined(),
+            NanBox::number(0.0),
+        ])
+    }
+
+    /// One step of the live iterator whose state (see
+    /// [`collection_iter_state`](Self::collection_iter_state)) is `state` over
+    /// the collection `coll`: `(kind, key, value)` of the next live entry, or
+    /// `None` once exhausted (detaching it; it then stays done whatever later
+    /// mutations happen).
+    pub fn collection_iter_advance(
+        &mut self,
+        state: Handle,
+        coll: Handle,
+    ) -> Option<(u8, NanBox, NanBox)> {
+        let num = |v: NanBox| v.as_number().unwrap_or(0.0);
+        let (kind, idx, epoch, last) = match self.heap.get(state)?.as_array()? {
+            [kind, idx, epoch, last, status] => {
+                let status = num(*status);
+                if status >= 2.0 {
+                    return None;
+                }
+                (
+                    num(*kind) as u8,
+                    num(*idx) as usize,
+                    num(*epoch) as u32,
+                    (status >= 1.0).then_some(*last),
+                )
+            }
+            _ => return None,
+        };
+        // Entries are deleted in place (tombstones), so the cursor only needs
+        // rebasing after a compaction renumbered them.
+        let (idx, now) = self.collection_iter_rebase(coll, idx, epoch, last);
+        let next = self.collection_next_live(coll, idx);
+        let a = self.heap.get_mut(state)?.as_array_mut()?;
+        let Some((pos, k, v)) = next else {
+            a[4] = NanBox::number(2.0);
+            self.collection_iter_detach(coll);
+            return None;
+        };
+        a[1] = NanBox::number((pos + 1) as f64);
+        a[2] = NanBox::number(f64::from(now));
+        a[3] = k;
+        a[4] = NanBox::number(1.0);
+        self.write_barrier(state, k);
+        Some((kind, k, v))
     }
 
     /// Detaches an exhausted live iterator (see [`Realm::collection_iter_attach`]).
@@ -7076,13 +7154,15 @@ pub(crate) fn js_number_string(n: f64) -> alloc::string::String {
         return out;
     }
     // `abs = 0.digits × 10^e` (the spec's `s`, `k` and `n`).
-    let (digits, e) = shortest_decimal_digits(n.abs());
+    let (digits, e) = shortest_digits(n.abs());
+    // Digits are ASCII.
+    let digits = core::str::from_utf8(digits.as_bytes()).unwrap_or_default();
     let k = digits.len() as i32;
     if n < 0.0 {
         out.push('-');
     }
     if k <= e && e <= 21 {
-        out.push_str(&digits);
+        out.push_str(digits);
         out.extend(core::iter::repeat_n('0', (e - k) as usize));
     } else if 0 < e && e <= 21 {
         out.push_str(&digits[..e as usize]);
@@ -7091,7 +7171,7 @@ pub(crate) fn js_number_string(n: f64) -> alloc::string::String {
     } else if -6 < e && e <= 0 {
         out.push_str("0.");
         out.extend(core::iter::repeat_n('0', (-e) as usize));
-        out.push_str(&digits);
+        out.push_str(digits);
     } else {
         out.push_str(&digits[..1]);
         if k > 1 {
@@ -7117,11 +7197,95 @@ pub(crate) fn js_number_string(n: f64) -> alloc::string::String {
 /// correctly rounded (ties-to-even) rendering at the same length.
 #[must_use]
 pub(crate) fn shortest_decimal_digits(abs: f64) -> (alloc::string::String, i32) {
-    let (mut digits, mut exp) = sci_digits(&alloc::format!("{abs:e}"));
-    if digits.len() >= 16 {
-        let nearest = alloc::format!("{:.*e}", digits.len() - 1, abs);
-        if nearest.parse::<f64>().ok() == Some(abs) {
-            (digits, exp) = sci_digits(&nearest);
+    let (d, e) = shortest_digits(abs);
+    // Digits are ASCII.
+    (
+        core::str::from_utf8(d.as_bytes())
+            .unwrap_or_default()
+            .into(),
+        e,
+    )
+}
+
+/// The decimal digits of a [`shortest_digits`] result, held inline.
+pub(crate) struct Digits {
+    buf: [u8; 24],
+    len: usize,
+}
+
+impl Digits {
+    /// The digit bytes (ASCII `0`-`9`, no trailing zeros but for a lone `0`).
+    #[must_use]
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+/// A fixed-capacity `fmt::Write` sink, so a float can be rendered without an
+/// allocation (overflow is a formatting error).
+struct StackText {
+    buf: [u8; 48],
+    len: usize,
+}
+
+impl core::fmt::Write for StackText {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let end = self.len + s.len();
+        if end > self.buf.len() {
+            return Err(core::fmt::Error);
+        }
+        self.buf[self.len..end].copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+/// `abs` rendered by Rust's `{:e}` (`prec`: `None` shortest, `Some(p)`
+/// correctly rounded to `p` fraction digits) as `(digits, exponent)`, see
+/// [`sci_digits`]. `None` only if the text overflowed the sink (it cannot for
+/// an `f64` at the precisions used here).
+fn sci_render(abs: f64, prec: Option<usize>) -> Option<(Digits, i32)> {
+    use core::fmt::Write;
+    let mut t = StackText {
+        buf: [0; 48],
+        len: 0,
+    };
+    match prec {
+        None => write!(t, "{abs:e}"),
+        Some(p) => write!(t, "{abs:.p$e}"),
+    }
+    .ok()?;
+    Some(sci_digits(&t.buf[..t.len]))
+}
+
+/// [`shortest_decimal_digits`] without allocating: the digits inline and the
+/// exponent `n` with `abs = 0.digits × 10^n`.
+#[must_use]
+pub(crate) fn shortest_digits(abs: f64) -> (Digits, i32) {
+    let Some((mut digits, mut exp)) = sci_render(abs, None) else {
+        let (d, e) = sci_digits(alloc::format!("{abs:e}").as_bytes());
+        return (d, e + 1);
+    };
+    // The tie re-check is needed only when two equally short candidates can
+    // exist (16+ digits) and `abs` lies exactly halfway between them. Such a
+    // midpoint `(10d + 5) × 10^m` has at most 18 significant digits, so as
+    // `M × 2^E` (M odd) either E ≥ 0 and abs < 10^40 (its factor 5^m divides M
+    // < 2^53, so m ≤ 22), or E < 0 and 5^-E < 10^18, i.e. E ≥ -25: abs × 2^25
+    // is an integer. Anything else cannot tie, which is nearly every number.
+    let tie_possible = abs < 1e40 && {
+        let x = abs * 33_554_432.0; // 2^25, exact
+        x >= 9_007_199_254_740_992.0 || x == (x as u64) as f64
+    };
+    if digits.len >= 16
+        && tie_possible
+        && let Some((near, near_exp)) = sci_render(abs, Some(digits.len - 1))
+        && near.as_bytes() != digits.as_bytes()
+    {
+        let mut t = alloc::string::String::with_capacity(32);
+        t.push_str(core::str::from_utf8(near.as_bytes()).unwrap_or_default());
+        t.push_str(&alloc::format!("e{}", near_exp - near.len as i32 + 1));
+        if t.parse::<f64>().ok() == Some(abs) {
+            (digits, exp) = (near, near_exp);
         }
     }
     (digits, exp + 1)
@@ -7129,13 +7293,33 @@ pub(crate) fn shortest_decimal_digits(abs: f64) -> (alloc::string::String, i32) 
 
 /// The significant digits (trailing zeros dropped) and the decimal exponent of
 /// a Rust `{:e}` rendering such as `"2.5e-3"`.
-fn sci_digits(s: &str) -> (alloc::string::String, i32) {
-    let (mant, exp) = s.split_once('e').unwrap_or((s, "0"));
-    let mut digits: alloc::string::String = mant.chars().filter(char::is_ascii_digit).collect();
-    while digits.len() > 1 && digits.ends_with('0') {
-        digits.pop();
+fn sci_digits(s: &[u8]) -> (Digits, i32) {
+    let split = s.iter().position(|&c| c == b'e').unwrap_or(s.len());
+    let (mant, exp) = (&s[..split], s.get(split + 1..).unwrap_or(&[]));
+    let mut d = Digits {
+        buf: [0; 24],
+        len: 0,
+    };
+    for &c in mant {
+        if c.is_ascii_digit() && d.len < d.buf.len() {
+            d.buf[d.len] = c;
+            d.len += 1;
+        }
     }
-    (digits, exp.parse().unwrap_or(0))
+    while d.len > 1 && d.buf[d.len - 1] == b'0' {
+        d.len -= 1;
+    }
+    let (neg, mag) = match exp.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, exp),
+    };
+    let mut e: i32 = 0;
+    for &c in mag {
+        if c.is_ascii_digit() {
+            e = e * 10 + i32::from(c - b'0');
+        }
+    }
+    (d, if neg { -e } else { e })
 }
 
 /// The civil date `(year, month [1-12], day [1-31])` for a day count `z` since

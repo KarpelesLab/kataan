@@ -4849,6 +4849,15 @@ fn vm_add(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanB
     if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
         return Ok(NanBox::number(x + y));
     }
+    // A string with a string or a number: no host operand, ToPrimitive is the
+    // identity and no Symbol is involved.
+    let prim_str = |v: NanBox| {
+        v.as_handle()
+            .is_some_and(|h| ctx.realm.typeof_is_string(Handle::from_raw(h)))
+    };
+    if (a.is_number() || prim_str(a)) && (b.is_number() || prim_str(b)) {
+        return Ok(ctx.realm.add(a, b));
+    }
     if let Some(r) = host_binary(ctx, crate::ast::BinaryOp::Add, a, b) {
         return r;
     }
@@ -8104,7 +8113,7 @@ fn run_frame_at_ic(
                 pc = *target;
             }
             Op::NewString { dst, value } => {
-                let handle = ctx.realm.new_string(value);
+                let handle = ctx.realm.new_literal_string(value);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::NewStringWtf8 { dst, bytes } => {

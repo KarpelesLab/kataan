@@ -281,12 +281,26 @@ pub fn utf16_len(bytes: &[u8]) -> usize {
     // Astral code points (4-byte forms) count as two units; everything else as
     // one. In well-formed WTF-8 every code point has exactly one lead byte
     // (anything but `10xxxxxx`) and a 4-byte form's lead is `>= 0xF0`, so the
-    // count is a per-byte sum with no decoding (and no branch the compiler
-    // cannot vectorize).
-    bytes
+    // count is a per-byte sum with no decoding — taken eight bytes at a time:
+    // in each byte, bit 7 clear means ASCII, `bit7 & !bit6` a continuation
+    // byte, and bits 7..4 all set a 4-byte lead.
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let (words, rest) = bytes.as_chunks::<8>();
+    let mut n = 0usize;
+    for w in words {
+        let x = u64::from_le_bytes(*w);
+        if x & HI == 0 {
+            n += 8;
+            continue;
+        }
+        let cont = x & !(x << 1) & HI;
+        let four = x & (x << 1) & (x << 2) & (x << 3) & HI;
+        n += 8 - cont.count_ones() as usize + four.count_ones() as usize;
+    }
+    n + rest
         .iter()
         .map(|&b| usize::from(b & 0xC0 != 0x80) + usize::from(b >= 0xF0))
-        .sum()
+        .sum::<usize>()
 }
 
 /// The UTF-16 code unit at index `i` (0-based) — JavaScript's `charCodeAt`.
@@ -491,6 +505,26 @@ pub fn to_string_lossy(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn utf16_len_word_scan_matches_per_byte_count() {
+        // Every alignment of ASCII, 2-, 3- and 4-byte forms and lone surrogates.
+        let mut s = Vec::new();
+        for cp in [
+            0x41, 0x7F, 0xE9, 0x7FF, 0x20AC, 0xD800, 0xDFFF, 0xFFFF, 0x1F600, 0x10FFFF,
+        ] {
+            encode_code_point(cp, &mut s);
+            for start in 0..s.len().min(9) {
+                let b = &s[start..];
+                let want: usize = b
+                    .iter()
+                    .map(|&c| usize::from(c & 0xC0 != 0x80) + usize::from(c >= 0xF0))
+                    .sum();
+                assert_eq!(utf16_len(b), want);
+            }
+        }
+        assert_eq!(utf16_len("a\u{1F600}bcdefgh\u{E9}".as_bytes()), 11);
+    }
 
     fn enc(cp: u32) -> Vec<u8> {
         let mut v = Vec::new();

@@ -369,7 +369,7 @@ pub enum Cell {
         /// `entries`, so filling a `Map` was quadratic in its size. It is
         /// deliberately *not* serialized and is dropped on GC relocation (which
         /// rewrites the handles that object keys hash by).
-        index: Option<alloc::collections::BTreeMap<u64, Vec<u32>>>,
+        index: Option<crate::realm::CollIndex>,
     },
     /// A `Symbol` primitive: an immutable description and a process-unique id.
     /// Symbols compare by identity (two `Symbol("x")` are distinct).

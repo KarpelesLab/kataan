@@ -114,29 +114,31 @@ impl Interp {
         self.is_constructor_value(value)
     }
 
-    /// Whether `value` is *an* `Object` constructor — the current realm's global
-    /// `Object`, or any other realm's (`$262.createRealm().global.Object`), which
+    /// Whether `value` is *an* `Object` constructor — the current realm's
+    /// `%Object%`, or any other realm's (`$262.createRealm().global.Object`), which
     /// is a distinct heap cell carrying the same `N_BASE_OBJECT` native id. Used
     /// so the `Object(...)` / `new Object(...)` dispatch honors cross-realm
     /// `Object`, not only the binding installed in the active scope.
     pub(crate) fn is_object_ctor(&self, value: NanBox) -> bool {
-        self.current.get("Object").and_then(|v| v.as_handle()) == value.as_handle()
-            || value
-                .as_handle()
-                .map(Handle::from_raw)
-                .and_then(|h| self.realm.native_at(h))
-                == Some(N_BASE_OBJECT)
+        // Every realm's intrinsic carries the native id; the live global
+        // binding is not consulted (a script may rebind `Object`).
+        value
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.native_at(h))
+            == Some(N_BASE_OBJECT)
     }
 
-    /// Whether `value` is *an* `Array` constructor — the current realm's global
-    /// `Array` or any other realm's (see [`Self::is_object_ctor`]).
+    /// Whether `value` is *an* `Array` constructor — the current realm's
+    /// `%Array%` or any other realm's (see [`Self::is_object_ctor`]).
     pub(crate) fn is_array_ctor(&self, value: NanBox) -> bool {
-        self.current.get("Array").and_then(|v| v.as_handle()) == value.as_handle()
-            || value
-                .as_handle()
-                .map(Handle::from_raw)
-                .and_then(|h| self.realm.native_at(h))
-                == Some(N_BASE_ARRAY)
+        // Every realm's intrinsic carries the native id; the live global
+        // binding is not consulted (a script may rebind `Array`).
+        value
+            .as_handle()
+            .map(Handle::from_raw)
+            .and_then(|h| self.realm.native_at(h))
+            == Some(N_BASE_ARRAY)
     }
 
     /// Builds a bound function (`Function.prototype.bind`): an object recording

@@ -76,6 +76,10 @@ enum FastOp {
     SetAdd,
     /// `Set.prototype.has`.
     SetHas,
+    /// `Map.prototype.delete`.
+    MapDelete,
+    /// `Set.prototype.delete`.
+    SetDelete,
     /// `Object.prototype.hasOwnProperty`.
     ObjHasOwn,
     /// `RegExp.prototype.test` / `exec`: the resolved function called through
@@ -187,6 +191,8 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_MAP_PROTO_FN, b"has") => FastOp::MapHas,
         (N_SET_PROTO_FN, b"add") => FastOp::SetAdd,
         (N_SET_PROTO_FN, b"has") => FastOp::SetHas,
+        (N_MAP_PROTO_FN, b"delete") => FastOp::MapDelete,
+        (N_SET_PROTO_FN, b"delete") => FastOp::SetDelete,
         (N_REGEXP_PROTO_FN, b"test" | b"exec") => FastOp::RegExpCall,
         (N_STRING_PROTO_FN, b"slice") => FastOp::StrSlice,
         (N_STRING_PROTO_FN, b"substring") => FastOp::StrSubstring,
@@ -512,8 +518,14 @@ pub(super) fn try_call(
                 (_, None) => NanBox::handle(realm.new_string("").to_raw()),
             }
         }
-        FastOp::MapGet | FastOp::MapSet | FastOp::MapHas | FastOp::SetAdd | FastOp::SetHas => {
-            let want_set = matches!(site.op, FastOp::SetAdd | FastOp::SetHas);
+        FastOp::MapGet
+        | FastOp::MapSet
+        | FastOp::MapHas
+        | FastOp::MapDelete
+        | FastOp::SetAdd
+        | FastOp::SetHas
+        | FastOp::SetDelete => {
+            let want_set = matches!(site.op, FastOp::SetAdd | FastOp::SetHas | FastOp::SetDelete);
             if realm.collection_is_set(h) != Some(want_set) || realm.collection_is_weak(h) {
                 return None;
             }
@@ -528,6 +540,9 @@ pub(super) fn try_call(
                 FastOp::SetAdd => {
                     realm.collection_set(h, arg(0), arg(0));
                     recv
+                }
+                FastOp::MapDelete | FastOp::SetDelete => {
+                    NanBox::boolean(realm.collection_delete(h, arg(0)))
                 }
                 _ => NanBox::boolean(realm.collection_has(h, arg(0))),
             }
@@ -812,11 +827,25 @@ pub(super) fn try_call(
                 return None;
             }
             let rope = str_parts(realm, h)?;
-            let parts = crate::nbexec::split_units(rope.as_leaf_bytes()?, sep_b);
-            let parts: alloc::vec::Vec<NanBox> = parts
-                .into_iter()
-                .map(|b| NanBox::handle(realm.new_string_wtf8(b).to_raw()))
-                .collect();
+            // `split_units`' byte scan (exact for a separator that cannot
+            // split a pair), with each piece copied once, straight into its
+            // string (inline when short).
+            let bytes = rope.as_leaf_bytes()?;
+            let n = sep_b.len();
+            let mut parts = alloc::vec::Vec::new();
+            let (mut start, mut i) = (0usize, 0usize);
+            while i + n <= bytes.len() {
+                if bytes[i] == sep_b[0] && &bytes[i..i + n] == sep_b {
+                    let piece = crate::rope::Rope::from_bytes(&bytes[start..i]);
+                    parts.push(NanBox::handle(realm.new_string_from_rope(piece).to_raw()));
+                    i += n;
+                    start = i;
+                } else {
+                    i += 1;
+                }
+            }
+            let piece = crate::rope::Rope::from_bytes(&bytes[start..]);
+            parts.push(NanBox::handle(realm.new_string_from_rope(piece).to_raw()));
             NanBox::handle(realm.new_array(parts).to_raw())
         }
         FastOp::StrReplace => {

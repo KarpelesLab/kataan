@@ -2840,42 +2840,15 @@ impl Interp {
 /// One step of a **live** Set/Map iterator `h` over `coll` (the body of its
 /// `next()` without the result object): the value, or `None` once done.
 fn collection_iter_step(realm: &mut Realm, h: Handle, coll: Handle) -> Option<NanBox> {
-    // Once detached (exhausted), stay done regardless of later mutation.
-    if realm.get_property(h, GEN_DONE).is_some() {
-        return None;
-    }
-    let kind = realm
-        .get_property(h, GEN_KIND)
-        .and_then(|n| n.as_number())
-        .unwrap_or(0.0) as u8;
-    let is_set = realm.collection_is_set(coll) == Some(true);
-    // The cursor is the raw position of the next entry to consider: entries
-    // are deleted in place (tombstones), so it only needs rebasing after a
-    // compaction renumbered them.
-    let num = |realm: &Realm, slot: &str| {
-        realm
-            .get_property(h, slot)
-            .and_then(|n| n.as_number())
-            .unwrap_or(0.0)
-    };
-    let idx = num(realm, GEN_IDX) as usize;
-    let epoch = num(realm, GEN_EPOCH) as u32;
-    let last = realm.get_property(h, GEN_LASTKEY);
-    let (idx, now) = realm.collection_iter_rebase(coll, idx, epoch, last);
-    if now != epoch {
-        realm.set_hidden_property(h, GEN_EPOCH, NanBox::number(f64::from(now)));
-    }
-    let Some((pos, k, v)) = realm.collection_next_live(coll, idx) else {
-        realm.set_hidden_property(h, GEN_DONE, NanBox::boolean(true));
-        realm.collection_iter_detach(coll);
-        return None;
-    };
-    realm.set_hidden_property(h, GEN_LASTKEY, k);
-    realm.set_hidden_property(h, GEN_IDX, NanBox::number((pos + 1) as f64));
+    let state = realm
+        .get_property(h, GEN_CSTATE)
+        .and_then(|v| v.as_handle())
+        .map(Handle::from_raw)?;
+    let (kind, k, v) = realm.collection_iter_advance(state, coll)?;
     Some(match kind {
         0 => k,                                                           // keys
         2 => NanBox::handle(realm.new_array(alloc::vec![k, v]).to_raw()), // entries: [key, value]
-        _ if is_set => k, // values (a Set yields its element)
+        _ if realm.collection_is_set(coll) == Some(true) => k, // values (a Set yields its element)
         _ => v,
     })
 }

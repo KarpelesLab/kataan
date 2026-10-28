@@ -97,7 +97,7 @@ pub(super) fn can_open(realm: &Realm, v: NanBox) -> bool {
     // `GetMethod(v, @@iterator)` is an intrinsic `%Array.prototype.values%`,
     // An array's own named properties are not shared, so only the walk from
     // its prototype is memoized.
-    let found = if realm.has_own(h, key) {
+    let found = if realm.may_own_named(h) && realm.has_own(h, key) {
         plain_lookup(realm, h, key)
     } else {
         match realm.object_proto(h) {
