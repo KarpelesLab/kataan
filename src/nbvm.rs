@@ -29,6 +29,7 @@
 //!
 //! Pure, safe `alloc`-only Rust.
 
+use crate::env::SlotCache;
 use crate::heap::Handle;
 use crate::ic::PropertyCache;
 use crate::nanbox::NanBox;
@@ -101,7 +102,12 @@ pub enum Op {
     /// register (a script's top-level declaration, a later script's reference to
     /// an earlier one's, a built-in): resolved at run time through the host
     /// (`ROADMAP.md` §2.0). An unresolvable name throws a `ReferenceError`.
-    LoadGlobal { dst: Reg, name: String },
+    LoadGlobal {
+        dst: Reg,
+        name: String,
+        /// The global-scope slot `name` was last found in.
+        cache: SlotCache,
+    },
     /// `dst = typeof name` for a global-environment name: `"undefined"` rather
     /// than a `ReferenceError` when it is unresolvable.
     TypeofGlobal { dst: Reg, name: String },
@@ -115,9 +121,17 @@ pub enum Op {
         /// resolvable when the *reference* was evaluated — before the right-hand
         /// side, which may create it (`x = (this.x = 1)` still throws).
         resolved: Option<Reg>,
+        /// The global-scope slot of `name` and whether the global object owns a
+        /// like-named property (boxed: it does not fit in an `Op`).
+        cache: Box<StoreGlobalCache>,
     },
     /// `dst = true` iff the global-environment name `name` currently resolves.
-    GlobalExists { dst: Reg, name: String },
+    GlobalExists {
+        dst: Reg,
+        name: String,
+        /// The global-scope slot `name` was last found in.
+        cache: SlotCache,
+    },
     /// The function's `arguments` object, built by the host from *every*
     /// argument passed (not just the declared parameters) and the callee.
     /// Always a function's first instruction: the call path fills `dst` on
@@ -867,12 +881,26 @@ struct Microtask {
 /// [`realm_slot`](VmHost::realm_slot) and [`global`](VmHost::global) is called
 /// with the realm *in the host*.
 pub trait VmHost {
-    /// The host's realm slot: taken for a VM run, swapped back for a delegated
-    /// call.
-    fn realm_slot(&mut self) -> &mut Realm;
+    /// The host's realm slot: swapped (a pointer swap) with the VM's for a
+    /// delegated call.
+    fn realm_slot(&mut self) -> &mut Box<Realm>;
+    /// Takes the host's realm for a VM run, parking an empty stand-in in its
+    /// slot (reused across runs, so a VM callback entered from a host call
+    /// builds no `Realm`).
+    fn take_realm(&mut self) -> Box<Realm>;
+    /// Hands the realm taken by [`take_realm`](VmHost::take_realm) back.
+    fn restore_realm(&mut self, realm: Box<Realm>);
     /// The value of the global binding `name`, if any. Reads the host's global
     /// environment only — it needs no realm, so the VM may call it directly.
     fn global(&self, name: &str) -> Option<NanBox>;
+    /// The host's global scope, for the VM's slot-cached reads of it (the
+    /// bindings [`global`](VmHost::global) reads). Needs no realm.
+    fn global_scope(&self) -> &crate::env::Scope;
+    /// The global scope and the global object when the host's running lexical
+    /// scope *is* the global scope — so an identifier reference the global
+    /// scope binds resolves straight to that binding (no `with` object or
+    /// inner frame in between). `None` otherwise. Needs no realm.
+    fn global_scope_if_current(&self) -> Option<(&crate::env::Scope, NanBox)>;
     /// A real `name` error instance (`TypeError`, …) with `message`, linked to
     /// the intrinsic prototype exactly as the interpreter's own errors are.
     fn make_error(&mut self, name: &str, message: &str) -> NanBox;
@@ -1366,9 +1394,8 @@ pub(crate) fn call_vm_function(
     this: NanBox,
     args: &[NanBox],
 ) -> Result<NanBox, VmError> {
-    let mut realm = core::mem::take(host.realm_slot());
+    let mut ctx = hosted_ctx(host.take_realm(), host);
     let result = {
-        let mut ctx = hosted_ctx(&mut realm, host);
         let r = call_closure(&mut ctx, table, f, args, this);
         if r.is_ok() && !ctx.microtasks.is_empty() {
             Err(VmError::Unsupported)
@@ -1376,21 +1403,22 @@ pub(crate) fn call_vm_function(
             r
         }
     };
-    *host.realm_slot() = realm;
+    let realm = ctx.realm;
+    host.restore_realm(realm);
     result
 }
 
 /// A fresh [`Ctx`] for a run over `realm` inside `host`, with
 /// allocation-triggered collection off (a nested run must not collect; the
 /// outermost one switches it on — see [`run_program_hosted`]).
-fn hosted_ctx<'a>(realm: &'a mut Realm, host: &'a mut dyn VmHost) -> Ctx<'a> {
+fn hosted_ctx<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
     let in_realm = host.realm_index();
     let mut ctx = hosted_ctx_in(realm, host);
     ctx.in_realm = in_realm;
     ctx
 }
 
-fn hosted_ctx_in<'a>(realm: &'a mut Realm, host: &'a mut dyn VmHost) -> Ctx<'a> {
+fn hosted_ctx_in<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
     Ctx {
         realm,
         host: Some(host),
@@ -1464,7 +1492,7 @@ fn host_binary(
     a: NanBox,
     b: NanBox,
 ) -> Option<Result<NanBox, VmError>> {
-    if ctx.host.is_none() || !(host_operand(ctx.realm, a) || host_operand(ctx.realm, b)) {
+    if ctx.host.is_none() || !(host_operand(&ctx.realm, a) || host_operand(&ctx.realm, b)) {
         return None;
     }
     Some(
@@ -1480,7 +1508,7 @@ fn host_unary(
     op: crate::ast::UnaryOp,
     v: NanBox,
 ) -> Option<Result<NanBox, VmError>> {
-    if ctx.host.is_none() || !host_operand(ctx.realm, v) {
+    if ctx.host.is_none() || !host_operand(&ctx.realm, v) {
         return None;
     }
     Some(host_unary_any(ctx, op, v))
@@ -1608,7 +1636,7 @@ fn vm_set_prop_mode(
     let to_host = read_needs_host(ctx, recv)
         || ctx.host.as_ref().is_some_and(|h| h.is_global_object(recv))
         // A String wrapper's own `length` / indices are read-only.
-        || is_string_wrapper(ctx.realm, recv)
+        || is_string_wrapper(&ctx.realm, recv)
         // An array's `length` write (ToUint32 + ToNumber of any value, the
         // RangeError, truncation) is the host's ArraySetLength.
         || (key == "length"
@@ -1617,7 +1645,7 @@ fn vm_set_prop_mode(
                 .is_some_and(|h| ctx.realm.array_elements(Handle::from_raw(h)).is_some()))
         || recv
             .as_handle()
-            .is_some_and(|h| !plain_write_ok(ctx.realm, Handle::from_raw(h), key))
+            .is_some_and(|h| !plain_write_ok(&ctx.realm, Handle::from_raw(h), key))
         // Replacing a method of %Array.prototype% / %Function.prototype% must be
         // recorded (the host's by-name built-in dispatch consults it).
         || recv
@@ -1660,20 +1688,20 @@ fn vm_set_elem_mode(
                 let dense = ctx.realm.array_elements(h).map_or(0, <[_]>::len);
                 n > len as f64
                     || n > dense as f64
-                    || (n == len as f64 && proto_owns_key(ctx.realm, h, &alloc::format!("{len}")))
+                    || (n == len as f64 && proto_owns_key(&ctx.realm, h, &alloc::format!("{len}")))
                     // A hole whose index the prototype chain owns (a setter,
                     // a proxy's `set` trap).
                     || (n >= 0.0
                         && n < dense as f64
                         && n == (n as usize) as f64
                         && ctx.realm.array_hole_at(h, n as usize)
-                        && proto_owns_key(ctx.realm, h, &alloc::format!("{}", n as usize)))
+                        && proto_owns_key(&ctx.realm, h, &alloc::format!("{}", n as usize)))
             })
     });
     let mut to_host = read_needs_host(ctx, recv)
         || past_end
-        || is_mapped_arguments(ctx.realm, recv)
-        || is_string_wrapper(ctx.realm, recv)
+        || is_mapped_arguments(&ctx.realm, recv)
+        || is_string_wrapper(&ctx.realm, recv)
         || (key.as_number().is_some()
             && recv
                 .as_handle()
@@ -1686,9 +1714,9 @@ fn vm_set_elem_mode(
                 let k = ctx.realm.to_display_string(NanBox::number(n));
                 ctx.realm.array_length(h).is_none()
                     && ctx.realm.typed_len(h).is_none()
-                    && (!plain_write_ok(ctx.realm, h, &k)
+                    && (!plain_write_ok(&ctx.realm, h, &k)
                         || ctx.realm.accessor(h, &k).is_some()
-                        || proto_owns_key(ctx.realm, h, &k))
+                        || proto_owns_key(&ctx.realm, h, &k))
             })
         });
     if !to_host && key.as_number().is_none() {
@@ -1771,7 +1799,7 @@ fn private_parts(ctx: &mut Ctx, o: NanBox, k: NanBox) -> Result<(Handle, String,
     match o
         .as_handle()
         .map(Handle::from_raw)
-        .filter(|_| is_object_value(ctx.realm, o))
+        .filter(|_| is_object_value(&ctx.realm, o))
     {
         Some(h) => Ok((h, key, kind)),
         None => {
@@ -1991,7 +2019,7 @@ fn make_generator(
     let realm_default = callee
         .and_then(|c| c.as_handle())
         .and_then(|h| ctx.realm.get_property(Handle::from_raw(h), GEN_PROTO_KEY));
-    let proto = if is_object_value(ctx.realm, proto) {
+    let proto = if is_object_value(&ctx.realm, proto) {
         proto
     } else if let Some(p) = realm_default {
         p
@@ -2101,7 +2129,7 @@ fn yield_delegate_step(
             call_closure(ctx, funcs, m, &[v], iter)?
         }
     };
-    if !is_object_value(ctx.realm, res) {
+    if !is_object_value(&ctx.realm, res) {
         let e = vm_error(ctx, "TypeError", "Iterator result is not an object");
         return Err(VmError::Thrown(e));
     }
@@ -2233,9 +2261,8 @@ pub(crate) fn resume_vm_async(
     v: NanBox,
 ) -> Result<(), VmError> {
     let entered = enter_frame_realm(host, controller);
-    let mut realm = core::mem::take(host.realm_slot());
+    let mut ctx = hosted_ctx(host.take_realm(), host);
     let result = (|| {
-        let mut ctx = hosted_ctx(&mut realm, host);
         let ctx = &mut ctx;
         let ch = controller
             .as_handle()
@@ -2293,7 +2320,8 @@ pub(crate) fn resume_vm_async(
             r
         }
     })();
-    *host.realm_slot() = realm;
+    let realm = ctx.realm;
+    host.restore_realm(realm);
     if entered {
         host.leave_fn_realm();
     }
@@ -2654,9 +2682,8 @@ pub(crate) fn vm_agen_request(
     v: NanBox,
 ) -> Result<NanBox, VmError> {
     let entered = enter_frame_realm(host, generator);
-    let mut realm = core::mem::take(host.realm_slot());
+    let mut ctx = hosted_ctx(host.take_realm(), host);
     let result = {
-        let mut ctx = hosted_ctx(&mut realm, host);
         let r = vm_agen_enqueue(&mut ctx, table, generator, kind, v);
         if r.is_ok() && !ctx.microtasks.is_empty() {
             Err(VmError::Unsupported)
@@ -2664,7 +2691,8 @@ pub(crate) fn vm_agen_request(
             r
         }
     };
-    *host.realm_slot() = realm;
+    let realm = ctx.realm;
+    host.restore_realm(realm);
     if entered {
         host.leave_fn_realm();
     }
@@ -2684,9 +2712,8 @@ pub(crate) fn resume_vm_agen(
     v: NanBox,
 ) -> Result<(), VmError> {
     let entered = enter_frame_realm(host, generator);
-    let mut realm = core::mem::take(host.realm_slot());
+    let mut ctx = hosted_ctx(host.take_realm(), host);
     let result = (|| {
-        let mut ctx = hosted_ctx(&mut realm, host);
         let ctx = &mut ctx;
         let st = agen_state(ctx, generator)?;
         if st.status == GEN_RETURN_AWAIT && fulfilled {
@@ -2728,7 +2755,8 @@ pub(crate) fn resume_vm_agen(
             Err(VmError::Unsupported)
         }
     })();
-    *host.realm_slot() = realm;
+    let realm = ctx.realm;
+    host.restore_realm(realm);
     if entered {
         host.leave_fn_realm();
     }
@@ -2893,9 +2921,8 @@ pub(crate) fn resume_vm_generator(
     v: NanBox,
 ) -> Result<NanBox, VmError> {
     let entered = enter_frame_realm(host, generator);
-    let mut realm = core::mem::take(host.realm_slot());
+    let mut ctx = hosted_ctx(host.take_realm(), host);
     let result = {
-        let mut ctx = hosted_ctx(&mut realm, host);
         let r = vm_generator_resume(&mut ctx, table, generator, mode, v);
         if r.is_ok() && !ctx.microtasks.is_empty() {
             Err(VmError::Unsupported)
@@ -2903,7 +2930,8 @@ pub(crate) fn resume_vm_generator(
             r
         }
     };
-    *host.realm_slot() = realm;
+    let realm = ctx.realm;
+    host.restore_realm(realm);
     if entered {
         host.leave_fn_realm();
     }
@@ -2952,7 +2980,7 @@ fn make_class(ctx: &mut Ctx, f: NanBox, sup: Option<NanBox>) -> Result<NanBox, V
                 crate::nanbox::Unpacked::Null => {
                     ctx.realm.set_object_proto(proto, None);
                 }
-                _ if is_object_value(ctx.realm, pp) => {
+                _ if is_object_value(&ctx.realm, pp) => {
                     ctx.realm
                         .set_object_proto(proto, pp.as_handle().map(Handle::from_raw));
                 }
@@ -3091,7 +3119,7 @@ fn vm_construct(
             );
             return Err(VmError::Thrown(e));
         }
-        if !is_object_value(ctx.realm, r) {
+        if !is_object_value(&ctx.realm, r) {
             let e = vm_error(
                 ctx,
                 "TypeError",
@@ -3116,7 +3144,7 @@ fn vm_construct(
             None => return Err(VmError::Unsupported),
         }
     };
-    let proto = match proto.filter(|p| is_object_value(ctx.realm, *p)) {
+    let proto = match proto.filter(|p| is_object_value(&ctx.realm, *p)) {
         Some(p) => Some(p),
         // Not an object: the intrinsic default of newTarget's realm.
         None if ctx.host.is_some() && new_target.as_handle().is_some() => {
@@ -3137,7 +3165,7 @@ fn vm_construct(
     let r = call_closure(ctx, funcs, f, args, this);
     ctx.pending_new_target = None;
     let r = r?;
-    Ok(if is_object_value(ctx.realm, r) {
+    Ok(if is_object_value(&ctx.realm, r) {
         r
     } else {
         this
@@ -3164,9 +3192,8 @@ pub(crate) fn construct_vm_function(
     args: &[NanBox],
     new_target: NanBox,
 ) -> Result<NanBox, VmError> {
-    let mut realm = core::mem::take(host.realm_slot());
+    let mut ctx = hosted_ctx(host.take_realm(), host);
     let result = {
-        let mut ctx = hosted_ctx(&mut realm, host);
         let r = vm_construct(&mut ctx, table, f, args, new_target);
         if r.is_ok() && !ctx.microtasks.is_empty() {
             Err(VmError::Unsupported)
@@ -3174,7 +3201,8 @@ pub(crate) fn construct_vm_function(
             r
         }
     };
-    *host.realm_slot() = realm;
+    let realm = ctx.realm;
+    host.restore_realm(realm);
     result
 }
 
@@ -3236,7 +3264,17 @@ fn link_function_proto(ctx: &mut Ctx, f: Handle) {
 /// the realm; anything else (an absent name, the TDZ, a global-object accessor)
 /// takes the host's full resolution. Without a host the run cannot resolve
 /// globals at all, so it faults to the interpreter.
-fn vm_load_global(ctx: &mut Ctx, name: &str) -> Result<NanBox, VmError> {
+fn vm_load_global(ctx: &mut Ctx, name: &str, cache: &SlotCache) -> Result<NanBox, VmError> {
+    // The slot-cached form of the `global` read below, for a name the global
+    // scope binds itself.
+    if let Some(v) = ctx
+        .host
+        .as_deref()
+        .and_then(|h| h.global_scope().cached_get_local(name, cache))
+        .filter(|v| !v.is_tdz())
+    {
+        return Ok(v);
+    }
     if let Some(v) = ctx
         .host
         .as_deref()
@@ -3249,6 +3287,74 @@ fn vm_load_global(ctx: &mut Ctx, name: &str) -> Result<NanBox, VmError> {
         Some(r) => r.map_err(VmError::from),
         None => Err(VmError::Unsupported),
     }
+}
+
+/// [`Op::StoreGlobal`]'s inline cache: the global-scope slot of the name, and
+/// whether the global object owns a like-named property — valid while the
+/// global object (`global`, a raw handle) still has key epoch `epoch`
+/// ([`crate::object::Object::key_epoch`]).
+#[derive(Clone, Debug, Default)]
+pub struct StoreGlobalCache {
+    slot: SlotCache,
+    global: core::cell::Cell<u64>,
+    epoch: core::cell::Cell<u32>,
+    /// 0: not filled; 1: no own property; 2: an own property.
+    owned: core::cell::Cell<u8>,
+}
+
+/// The fast path of `PutValue` for a global-environment name: when the
+/// running scope is the global scope and binds `name` as a plain mutable,
+/// initialized binding, assigns it directly and mirrors the write onto a
+/// like-named own property of the global object — exactly what the host's
+/// `write_global` → `assign_to_name` → `sync_global_var` does for that case.
+/// Returns `false`, having changed nothing, for every other case (a module
+/// name, the temporal dead zone, a `const`, an unbound name, an inner scope
+/// running), which takes the host's general path.
+fn vm_store_global_fast(ctx: &mut Ctx, name: &str, cache: &StoreGlobalCache, v: NanBox) -> bool {
+    // A module-environment name (`split_module_name`) is never the global's.
+    if name.starts_with('\u{1}') {
+        return false;
+    }
+    let Some(host) = ctx.host.as_deref() else {
+        return false;
+    };
+    let Some((scope, global)) = host.global_scope_if_current() else {
+        return false;
+    };
+    if !scope.cached_set_plain_local(name, &cache.slot, v) {
+        return false;
+    }
+    let Some(g) = global.as_handle().map(Handle::from_raw) else {
+        return true;
+    };
+    // `sync_global_var`: the binding is the global scope's own, so the write
+    // is mirrored iff the global object owns `name`. That depends only on its
+    // own keys, so it is cached against the object's key epoch (`length`, which
+    // a String exotic object owns without a key, is always asked afresh).
+    let epoch = ctx.realm.object_key_epoch(g);
+    let owned = match epoch {
+        Some(e)
+            if name != "length"
+                && cache.owned.get() != 0
+                && cache.global.get() == g.to_raw()
+                && cache.epoch.get() == e =>
+        {
+            cache.owned.get() == 2
+        }
+        _ => {
+            let owned = ctx.realm.has_own(g, name);
+            if let Some(e) = epoch {
+                cache.global.set(g.to_raw());
+                cache.epoch.set(e);
+                cache.owned.set(if owned { 2 } else { 1 });
+            }
+            owned
+        }
+    };
+    if owned {
+        ctx.realm.set_property(g, name, v);
+    }
+    true
 }
 
 /// A dynamic-scoping request to the host ([`VmHost::env_op`]): a function that
@@ -3459,9 +3565,9 @@ impl From<HostError> for VmError {
 /// the realm again. `None` when this run has no host.
 fn with_host<R>(ctx: &mut Ctx, f: impl FnOnce(&mut dyn VmHost) -> R) -> Option<R> {
     let host = ctx.host.as_deref_mut()?;
-    core::mem::swap(&mut *ctx.realm, host.realm_slot());
+    core::mem::swap(&mut ctx.realm, host.realm_slot());
     let r = f(host);
-    core::mem::swap(&mut *ctx.realm, host.realm_slot());
+    core::mem::swap(&mut ctx.realm, host.realm_slot());
     Some(r)
 }
 
@@ -3481,14 +3587,17 @@ fn vm_error(ctx: &mut Ctx, name: &str, message: &str) -> NanBox {
     }
     match with_host(ctx, |h| h.make_error(name, message)) {
         Some(e) => e,
-        None => make_error(ctx.realm, name, message),
+        None => make_error(&mut ctx.realm, name, message),
     }
 }
 
 /// Execution context shared across activations: the heap, the captured
 /// `console` output sink, and the promise microtask queue (the event loop).
 struct Ctx<'a> {
-    realm: &'a mut Realm,
+    /// The realm, owned by the run for its duration (a hosted run took it from
+    /// the host and hands it back at the end; `with_host` lends it to the host
+    /// for a delegated call by swapping the box pointer).
+    realm: Box<Realm>,
     /// The interpreter this run executes inside, if any (see [`VmHost`]).
     host: Option<&'a mut dyn VmHost>,
     output: String,
@@ -3590,6 +3699,15 @@ struct Ctx<'a> {
 /// optimized bytecode body.
 type TierState = (u32, Option<alloc::rc::Rc<Vec<Op>>>);
 
+/// Runs `f` with `realm` moved into the box a VM context owns, moving it back
+/// afterwards (`f` hands the box back with its result) — for the entry points
+/// that run over a caller's `&mut Realm` rather than a host's.
+fn with_boxed_realm<R>(realm: &mut Realm, f: impl FnOnce(Box<Realm>) -> (R, Box<Realm>)) -> R {
+    let (r, boxed) = f(Box::new(core::mem::take(realm)));
+    *realm = *boxed;
+    r
+}
+
 /// Runs function `id` of `funcs` with `args`, allocating in `realm`. Calls
 /// recurse on the Rust stack — one register window per activation, exactly the
 /// frame model the production VM will use.
@@ -3602,35 +3720,39 @@ pub fn run_program(
     id: usize,
     args: &[NanBox],
 ) -> Result<NanBox, VmError> {
-    let mut ctx = Ctx {
-        realm,
-        host: None,
-        output: String::new(),
-        microtasks: alloc::collections::VecDeque::new(),
-        tiers: alloc::collections::BTreeMap::new(),
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_cache: alloc::collections::BTreeMap::new(),
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_pending: None,
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_pending_fault: None,
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_funcs: None,
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_shadow: alloc::vec::Vec::new(),
-        call_depth: 0,
-        gc_enabled: true,
-        gc_lock: 0,
-        frame_shadow: alloc::vec::Vec::new(),
-        frames_published: 0,
-        top_frame_roots: Vec::new(),
-        pending_callee: None,
-        pending_new_target: None,
-        in_realm: None,
-    };
-    let value = call(&mut ctx, funcs, id, args)?;
-    drain_microtasks(&mut ctx, funcs)?;
-    Ok(value)
+    with_boxed_realm(realm, |realm| {
+        let mut ctx = Ctx {
+            realm,
+            host: None,
+            output: String::new(),
+            microtasks: alloc::collections::VecDeque::new(),
+            tiers: alloc::collections::BTreeMap::new(),
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_cache: alloc::collections::BTreeMap::new(),
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_pending: None,
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_pending_fault: None,
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_funcs: None,
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_shadow: alloc::vec::Vec::new(),
+            call_depth: 0,
+            gc_enabled: true,
+            gc_lock: 0,
+            frame_shadow: alloc::vec::Vec::new(),
+            frames_published: 0,
+            top_frame_roots: Vec::new(),
+            pending_callee: None,
+            pending_new_target: None,
+            in_realm: None,
+        };
+        let r = call(&mut ctx, funcs, id, args).and_then(|value| {
+            drain_microtasks(&mut ctx, funcs)?;
+            Ok(value)
+        });
+        (r, ctx.realm)
+    })
 }
 
 /// Like [`run_program`], also returning the captured `console` output.
@@ -3643,36 +3765,41 @@ pub fn run_program_capturing(
     id: usize,
     args: &[NanBox],
 ) -> Result<(NanBox, String), VmError> {
-    let mut ctx = Ctx {
-        realm,
-        host: None,
-        output: String::new(),
-        microtasks: alloc::collections::VecDeque::new(),
-        tiers: alloc::collections::BTreeMap::new(),
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_cache: alloc::collections::BTreeMap::new(),
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_pending: None,
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_pending_fault: None,
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_funcs: None,
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_shadow: alloc::vec::Vec::new(),
-        call_depth: 0,
-        gc_enabled: true,
-        gc_lock: 0,
-        frame_shadow: alloc::vec::Vec::new(),
-        frames_published: 0,
-        top_frame_roots: Vec::new(),
-        pending_callee: None,
-        pending_new_target: None,
-        in_realm: None,
-    };
-    let value = call(&mut ctx, funcs, id, args)?;
-    // Run the promise event loop before returning (then-callbacks, async tails).
-    drain_microtasks(&mut ctx, funcs)?;
-    Ok((value, ctx.output))
+    with_boxed_realm(realm, |realm| {
+        let mut ctx = Ctx {
+            realm,
+            host: None,
+            output: String::new(),
+            microtasks: alloc::collections::VecDeque::new(),
+            tiers: alloc::collections::BTreeMap::new(),
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_cache: alloc::collections::BTreeMap::new(),
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_pending: None,
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_pending_fault: None,
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_funcs: None,
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_shadow: alloc::vec::Vec::new(),
+            call_depth: 0,
+            gc_enabled: true,
+            gc_lock: 0,
+            frame_shadow: alloc::vec::Vec::new(),
+            frames_published: 0,
+            top_frame_roots: Vec::new(),
+            pending_callee: None,
+            pending_new_target: None,
+            in_realm: None,
+        };
+        let r = call(&mut ctx, funcs, id, args).and_then(|value| {
+            // Run the promise event loop before returning (then-callbacks, async
+            // tails).
+            drain_microtasks(&mut ctx, funcs)?;
+            Ok((value, core::mem::take(&mut ctx.output)))
+        });
+        (r, ctx.realm)
+    })
 }
 
 /// Runs function `id` of `funcs` inside `host` (see [`VmHost`]): the host's realm
@@ -3696,9 +3823,8 @@ pub fn run_program_hosted(
     let previous = host.set_vm_table(Some(alloc::rc::Rc::clone(funcs)));
     // VM closures' own `name`/`length` are synthesized by the realm from this.
     host.realm_slot().register_vm_fn_meta(funcs);
-    let mut realm = core::mem::take(host.realm_slot());
+    let mut ctx = hosted_ctx(host.take_realm(), host);
     let result = {
-        let mut ctx = hosted_ctx(&mut realm, host);
         // The outermost hosted run may collect (through the host, which roots
         // its own state); a nested one — a VM callback inside a host call — may
         // not, as the host's Rust frames below it hold unpublished values.
@@ -3723,7 +3849,8 @@ pub fn run_program_hosted(
             }
         })
     };
-    *host.realm_slot() = realm;
+    let realm = ctx.realm;
+    host.restore_realm(realm);
     host.set_vm_table(previous);
     result
 }
@@ -4180,46 +4307,51 @@ pub enum VmError {
 /// programs; `Call` ops require [`run_program`]'s function table.)
 pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<NanBox, VmError> {
     let mut regs: Vec<NanBox> = vec![NanBox::undefined(); register_count];
-    let mut ctx = Ctx {
-        realm,
-        host: None,
-        output: String::new(),
-        microtasks: alloc::collections::VecDeque::new(),
-        tiers: alloc::collections::BTreeMap::new(),
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_cache: alloc::collections::BTreeMap::new(),
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_pending: None,
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_pending_fault: None,
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_funcs: None,
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_shadow: alloc::vec::Vec::new(),
-        call_depth: 0,
-        // Hand-built op arrays may embed heap handles as `LoadConst` values that
-        // this entry point cannot enumerate, so it never collects.
-        gc_enabled: false,
-        gc_lock: 0,
-        frame_shadow: alloc::vec::Vec::new(),
-        frames_published: 0,
-        top_frame_roots: Vec::new(),
-        pending_callee: None,
-        pending_new_target: None,
-        in_realm: None,
-    };
-    match run_frame(&mut ctx, &[], program, &mut regs)? {
-        FrameExit::Return(v) => Ok(v.unwrap_or(NanBox::undefined())),
-        // A top-level program body never emits a tail call (there is no enclosing
-        // function to reuse); degrade to an ordinary call if one ever appears.
-        FrameExit::Tail {
-            id,
-            args,
-            captures,
-            this,
-        } => call_with(&mut ctx, &[], id, &args, &captures, this),
-        FrameExit::Yield { .. } => Err(VmError::Unsupported),
-    }
+    with_boxed_realm(realm, |realm| {
+        let mut ctx = Ctx {
+            realm,
+            host: None,
+            output: String::new(),
+            microtasks: alloc::collections::VecDeque::new(),
+            tiers: alloc::collections::BTreeMap::new(),
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_cache: alloc::collections::BTreeMap::new(),
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_pending: None,
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_pending_fault: None,
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_funcs: None,
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            jit_shadow: alloc::vec::Vec::new(),
+            call_depth: 0,
+            // Hand-built op arrays may embed heap handles as `LoadConst` values that
+            // this entry point cannot enumerate, so it never collects.
+            gc_enabled: false,
+            gc_lock: 0,
+            frame_shadow: alloc::vec::Vec::new(),
+            frames_published: 0,
+            top_frame_roots: Vec::new(),
+            pending_callee: None,
+            pending_new_target: None,
+            in_realm: None,
+        };
+        let r = match run_frame(&mut ctx, &[], program, &mut regs) {
+            Err(e) => Err(e),
+            Ok(FrameExit::Return(v)) => Ok(v.unwrap_or(NanBox::undefined())),
+            // A top-level program body never emits a tail call (there is no
+            // enclosing function to reuse); degrade to an ordinary call if one
+            // ever appears.
+            Ok(FrameExit::Tail {
+                id,
+                args,
+                captures,
+                this,
+            }) => call_with(&mut ctx, &[], id, &args, &captures, this),
+            Ok(FrameExit::Yield { .. }) => Err(VmError::Unsupported),
+        };
+        (r, ctx.realm)
+    })
 }
 
 /// Collects every value produced by iterating `v`, for the bytecode VM's
@@ -4388,7 +4520,7 @@ fn vm_add(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanB
     }
     let x = to_primitive(ctx, funcs, a, true);
     let y = to_primitive(ctx, funcs, b, true);
-    if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_STR_ERR) {
+    if let Some(e) = symbol_coercion_error(&mut ctx.realm, x, y, SYM_STR_ERR) {
         return Err(VmError::Thrown(e));
     }
     Ok(ctx.realm.add(x, y))
@@ -4507,7 +4639,7 @@ fn vm_arith(
     }
     let x = to_primitive(ctx, funcs, a, true);
     let y = to_primitive(ctx, funcs, b, true);
-    if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_NUM_ERR) {
+    if let Some(e) = symbol_coercion_error(&mut ctx.realm, x, y, SYM_NUM_ERR) {
         return Err(VmError::Thrown(e));
     }
     Ok(match op {
@@ -4534,7 +4666,7 @@ fn vm_lt(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanBo
     }
     let x = to_primitive(ctx, funcs, a, true);
     let y = to_primitive(ctx, funcs, b, true);
-    if let Some(e) = symbol_coercion_error(ctx.realm, x, y, SYM_NUM_ERR) {
+    if let Some(e) = symbol_coercion_error(&mut ctx.realm, x, y, SYM_NUM_ERR) {
         return Err(VmError::Thrown(e));
     }
     Ok(ctx.realm.less_than(x, y))
@@ -4624,7 +4756,7 @@ fn vm_value_bin(
             if (real_obj(a) && bare_prim(b)) || (real_obj(b) && bare_prim(a)) {
                 return Err(VmError::Unsupported);
             }
-            let (xc, yc) = loose_eq_coerce(ctx.realm, a, b);
+            let (xc, yc) = loose_eq_coerce(&mut ctx.realm, a, b);
             let r = ctx.realm.loose_equals(xc, yc);
             Ok(NanBox::boolean(if op == VB_LOOSE_EQ { r } else { !r }))
         }
@@ -4634,7 +4766,7 @@ fn vm_value_bin(
         _ => {
             let xn = to_primitive(ctx, funcs, a, true);
             let yn = to_primitive(ctx, funcs, b, true);
-            if let Some(e) = symbol_coercion_error(ctx.realm, xn, yn, SYM_NUM_ERR) {
+            if let Some(e) = symbol_coercion_error(&mut ctx.realm, xn, yn, SYM_NUM_ERR) {
                 return Err(VmError::Thrown(e));
             }
             Ok(match op {
@@ -4678,7 +4810,7 @@ fn vm_get_prop(
             && (recv
                 .as_handle()
                 .is_some_and(|h| ctx.realm.array_elements(Handle::from_raw(h)).is_some())
-                || is_string_wrapper(ctx.realm, recv)))
+                || is_string_wrapper(&ctx.realm, recv)))
     {
         return host_get_str(ctx, recv, key);
     }
@@ -4917,7 +5049,7 @@ fn vm_set_prop(
         .ok_or(VmError::NotAnObject)?;
     // `regex.lastIndex = v` updates the stateful search position.
     if key == "lastIndex" && ctx.realm.regexp_at(handle).is_some() {
-        set_regex_last_index_value(ctx.realm, handle, value);
+        set_regex_last_index_value(&mut ctx.realm, handle, value);
         return Ok(());
     }
     // `arr.length = n` resizes the array (truncate/pad).
@@ -5381,7 +5513,7 @@ pub(crate) extern "C" fn jit_helper_strict_eq(ctx: *mut core::ffi::c_void, a: u6
     // SAFETY: as `jit_helper_add`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
-    vm_strict_eq(ctx.realm, NanBox::from_bits(a), NanBox::from_bits(b)).to_bits()
+    vm_strict_eq(&ctx.realm, NanBox::from_bits(a), NanBox::from_bits(b)).to_bits()
 }
 
 /// Generic-JIT slow path for a truthiness test (`JumpIfFalse`/`Op::Not` on a
@@ -6293,7 +6425,7 @@ fn run_frame_at(
                 let t = ctx.realm.type_of_value(regs[*a as usize]);
                 regs[*dst as usize] = NanBox::handle(ctx.realm.new_string(t).to_raw());
             }
-            Op::LoadGlobal { dst, name } => match vm_load_global(ctx, name) {
+            Op::LoadGlobal { dst, name, cache } => match vm_load_global(ctx, name, cache) {
                 Ok(v) => regs[*dst as usize] = v,
                 Err(e) => handle_throw!(e),
             },
@@ -6309,6 +6441,7 @@ fn run_frame_at(
                 src,
                 strict,
                 resolved,
+                cache,
             } => {
                 if let Some(r) = resolved
                     && *strict
@@ -6323,6 +6456,9 @@ fn run_frame_at(
                     continue;
                 }
                 let v = regs[*src as usize];
+                if vm_store_global_fast(ctx, name, cache, v) {
+                    continue;
+                }
                 match with_host(ctx, |h| h.write_global(name, v, *strict)) {
                     Some(Ok(())) => {}
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
@@ -6456,7 +6592,7 @@ fn run_frame_at(
                     regs[*dst as usize] = v;
                 } else if ctx.host.is_some()
                     && v.as_handle().is_some()
-                    && !is_string_value(ctx.realm, v)
+                    && !is_string_value(&ctx.realm, v)
                 {
                     // An object (ToPrimitive, number hint) or a Symbol (a
                     // TypeError): the host's unary `-` performs ToNumeric, and
@@ -6514,7 +6650,7 @@ fn run_frame_at(
                 match o
                     .as_handle()
                     .map(Handle::from_raw)
-                    .filter(|_| is_object_value(ctx.realm, o))
+                    .filter(|_| is_object_value(&ctx.realm, o))
                 {
                     Some(h) => {
                         let ks = ctx.realm.to_display_string(k);
@@ -6629,7 +6765,7 @@ fn run_frame_at(
                 }
             }
             Op::CheckObject { src } => {
-                if !is_object_value(ctx.realm, regs[*src as usize]) {
+                if !is_object_value(&ctx.realm, regs[*src as usize]) {
                     let e = vm_error(ctx, "TypeError", "Iterator result is not an object");
                     handle_throw!(VmError::Thrown(e));
                 }
@@ -7070,7 +7206,7 @@ fn run_frame_at(
                 let o = object_handle(regs[*obj as usize])?;
                 if matches!(v.unpack(), crate::nanbox::Unpacked::Null) {
                     ctx.realm.set_object_proto(o, None);
-                } else if is_object_value(ctx.realm, v) {
+                } else if is_object_value(&ctx.realm, v) {
                     ctx.realm
                         .set_object_proto(o, v.as_handle().map(Handle::from_raw));
                 }
@@ -7243,7 +7379,7 @@ fn run_frame_at(
             }
             Op::ToKey { dst, src } => {
                 let v = regs[*src as usize];
-                if is_object_value(ctx.realm, v) {
+                if is_object_value(&ctx.realm, v) {
                     match with_host(ctx, |h| h.to_property_key(v)) {
                         Some(Ok(k)) => regs[*dst as usize] = k,
                         Some(Err(e)) => handle_throw!(VmError::from(e)),
@@ -7305,13 +7441,25 @@ fn run_frame_at(
             }
             Op::InitFnPrototype { f } => {
                 if let Some(fh) = regs[*f as usize].as_handle().map(Handle::from_raw) {
-                    init_fn_prototype(ctx.realm, fh);
+                    init_fn_prototype(&mut ctx.realm, fh);
                 }
             }
-            Op::GlobalExists { dst, name } => match with_host(ctx, |h| h.global_exists(name)) {
-                Some(b) => regs[*dst as usize] = NanBox::boolean(b),
-                None => return Err(VmError::Unsupported),
-            },
+            Op::GlobalExists { dst, name, cache } => {
+                // A name the running (global) scope binds itself resolves.
+                if ctx
+                    .host
+                    .as_deref()
+                    .and_then(VmHost::global_scope_if_current)
+                    .is_some_and(|(scope, _)| scope.cached_has_local(name, cache))
+                {
+                    regs[*dst as usize] = NanBox::boolean(true);
+                    continue;
+                }
+                match with_host(ctx, |h| h.global_exists(name)) {
+                    Some(b) => regs[*dst as usize] = NanBox::boolean(b),
+                    None => return Err(VmError::Unsupported),
+                }
+            }
             Op::CallSpread {
                 dst,
                 callee,
@@ -7418,7 +7566,7 @@ fn run_frame_at(
                     continue;
                 }
                 let x = to_primitive(ctx, funcs, regs[*a as usize], true);
-                if let Some(e) = symbol_coercion_error(ctx.realm, x, x, SYM_NUM_ERR) {
+                if let Some(e) = symbol_coercion_error(&mut ctx.realm, x, x, SYM_NUM_ERR) {
                     handle_throw!(VmError::Thrown(e));
                 }
                 regs[*dst as usize] = ctx.realm.bit_not(x);
@@ -7441,7 +7589,7 @@ fn run_frame_at(
                     continue;
                 }
                 let x = to_primitive(ctx, funcs, regs[*a as usize], true);
-                if let Some(e) = symbol_coercion_error(ctx.realm, x, x, SYM_NUM_ERR) {
+                if let Some(e) = symbol_coercion_error(&mut ctx.realm, x, x, SYM_NUM_ERR) {
                     handle_throw!(VmError::Thrown(e));
                 }
                 regs[*dst as usize] = ctx.realm.neg(x);
@@ -7470,7 +7618,8 @@ fn run_frame_at(
             }
             Op::StrictEq { dst, a, b } => {
                 // Shared with the generic-JIT helper via `vm_strict_eq`.
-                regs[*dst as usize] = vm_strict_eq(ctx.realm, regs[*a as usize], regs[*b as usize]);
+                regs[*dst as usize] =
+                    vm_strict_eq(&ctx.realm, regs[*a as usize], regs[*b as usize]);
             }
             Op::JumpIfFalse { cond, target } => {
                 if !ctx.realm.truthy(regs[*cond as usize]) {
@@ -7620,7 +7769,7 @@ fn run_frame_at(
                 } else {
                     // A BigInt typed-array element write ToBigInt-coerces (a Number
                     // throws TypeError) instead of silently no-op'ing.
-                    match coerce_bigint_typed_write(ctx.realm, handle, regs[*src as usize]) {
+                    match coerce_bigint_typed_write(&mut ctx.realm, handle, regs[*src as usize]) {
                         Ok(v) => {
                             ctx.realm.set_element(handle, i, v);
                         }
@@ -7952,7 +8101,7 @@ fn run_frame_at(
                 // function-table index (as a number), tagged `\0vmfn` so `typeof`
                 // and friends see a function rather than the backing array.
                 let handle = ctx.realm.new_vm_function(*func, Vec::new());
-                install_fn_name_length(ctx.realm, handle, funcs.get(*func as usize));
+                install_fn_name_length(&mut ctx.realm, handle, funcs.get(*func as usize));
                 link_function_proto(ctx, handle);
                 link_async_proto(ctx, funcs.get(*func as usize), handle);
                 tag_new_fn_realm(ctx, handle);
@@ -7965,7 +8114,7 @@ fn run_frame_at(
             } => {
                 let cells: Vec<NanBox> = captures.iter().map(|r| regs[*r as usize]).collect();
                 let handle = ctx.realm.new_vm_function(*func, cells);
-                install_fn_name_length(ctx.realm, handle, funcs.get(*func as usize));
+                install_fn_name_length(&mut ctx.realm, handle, funcs.get(*func as usize));
                 link_function_proto(ctx, handle);
                 link_async_proto(ctx, funcs.get(*func as usize), handle);
                 tag_new_fn_realm(ctx, handle);
@@ -8377,9 +8526,9 @@ fn json_stringify(ctx: &mut Ctx, funcs: &[FnProto], args: &[NanBox]) -> Result<N
         0,
     )?;
     let result = if indent.is_empty() {
-        crate::json::stringify(ctx.realm, v)
+        crate::json::stringify(&ctx.realm, v)
     } else {
-        crate::json::stringify_pretty(ctx.realm, v, &indent)
+        crate::json::stringify_pretty(&ctx.realm, v, &indent)
     };
     Ok(match result {
         Some(s) => NanBox::handle(ctx.realm.new_string(&s).to_raw()),
@@ -8394,7 +8543,7 @@ fn json_parse(ctx: &mut Ctx, funcs: &[FnProto], args: &[NanBox]) -> Result<NanBo
     let s = ctx
         .realm
         .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
-    let value = match crate::json::parse(ctx.realm, &s) {
+    let value = match crate::json::parse(&mut ctx.realm, &s) {
         Ok(v) => v,
         Err(msg) => return Err(VmError::Thrown(vm_error(ctx, "SyntaxError", &msg))),
     };
@@ -8725,8 +8874,8 @@ fn vm_get_elem(
     key: NanBox,
 ) -> Result<NanBox, VmError> {
     if read_needs_host(ctx, recv)
-        || (ctx.host.is_some() && is_mapped_arguments(ctx.realm, recv))
-        || (ctx.host.is_some() && is_string_wrapper(ctx.realm, recv))
+        || (ctx.host.is_some() && is_mapped_arguments(&ctx.realm, recv))
+        || (ctx.host.is_some() && is_string_wrapper(&ctx.realm, recv))
         || (ctx.host.is_some()
             && (key
                 .as_handle()
@@ -8796,7 +8945,7 @@ fn vm_get_elem(
                 // its accessors and exotic objects) — `arr[Symbol.iterator]`,
                 // an inherited method reached by a computed key. An object key
                 // was already converted (its ToPropertyKey runs once).
-                let key = if is_object_value(ctx.realm, key) {
+                let key = if is_object_value(&ctx.realm, key) {
                     NanBox::handle(ctx.realm.new_string(&ks).to_raw())
                 } else {
                     key
@@ -8835,7 +8984,7 @@ fn vm_set_elem(
             // A numeric key on a typed array writes through to its bytes; a BigInt
             // element ToBigInt-coerces (Number throws).
             let i = n as usize;
-            match coerce_bigint_typed_write(ctx.realm, handle, value) {
+            match coerce_bigint_typed_write(&mut ctx.realm, handle, value) {
                 Ok(v) => {
                     ctx.realm.set_element(handle, i, v);
                     Ok(())
@@ -8892,7 +9041,7 @@ fn vm_set_elem(
                 return Ok(());
             }
             if ks == "lastIndex" && ctx.realm.regexp_at(handle).is_some() {
-                set_regex_last_index_value(ctx.realm, handle, value);
+                set_regex_last_index_value(&mut ctx.realm, handle, value);
                 return Ok(());
             }
             // A canonical numeric string key on an array (`arr["0"] = v`) addresses
@@ -8942,7 +9091,7 @@ fn vm_array_len(ctx: &mut Ctx, funcs: &[FnProto], recv: NanBox) -> Result<NanBox
         && ctx.realm.array_length(handle).is_none()
         && !ctx.realm.is_string_handle(handle)
     {
-        if is_string_wrapper(ctx.realm, recv) {
+        if is_string_wrapper(&ctx.realm, recv) {
             return host_get_str(ctx, recv, "length");
         }
         return vm_get_prop(ctx, funcs, recv, "length", &mut PropertyCache::default());
@@ -9195,7 +9344,7 @@ fn regex_method(
                 // subject on every call.
                 let text = ctx.realm.to_display_string(arg0);
                 let input = NanBox::handle(ctx.realm.new_string(&text).to_raw());
-                regex_match_object(ctx.realm, units, input, &caps, re.group_names())
+                regex_match_object(&mut ctx.realm, units, input, &caps, re.group_names())
             }
             (_, None) => NanBox::null(),
         }));
@@ -9242,7 +9391,7 @@ fn regex_method(
         "match" if !global => match re.captures_in_u16(&units, 0) {
             Some(caps) => {
                 let input = NanBox::handle(ctx.realm.new_string(&text).to_raw());
-                regex_match_object(ctx.realm, &units, input, &caps, re.group_names())
+                regex_match_object(&mut ctx.realm, &units, input, &caps, re.group_names())
             }
             None => NanBox::null(),
         },
@@ -10271,9 +10420,9 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             // site intercepts `JSON.stringify` and uses the interpreter-aware
             // `json_stringify` instead; this is a pure fallback.
             let result = if indent.is_empty() {
-                crate::json::stringify(ctx.realm, v)
+                crate::json::stringify(&ctx.realm, v)
             } else {
-                crate::json::stringify_pretty(ctx.realm, v, &indent)
+                crate::json::stringify_pretty(&ctx.realm, v, &indent)
             };
             match result {
                 Some(s) => NanBox::handle(ctx.realm.new_string(&s).to_raw()),
@@ -10284,7 +10433,7 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             let s = ctx
                 .realm
                 .to_display_string(args.first().copied().unwrap_or(NanBox::undefined()));
-            crate::json::parse(ctx.realm, &s).unwrap_or(NanBox::undefined())
+            crate::json::parse(&mut ctx.realm, &s).unwrap_or(NanBox::undefined())
         }
         // `Number.*` predicates take a value WITHOUT coercion (unlike the globals).
         NB_NUMBER_IS_INTEGER => {
@@ -13408,6 +13557,7 @@ impl Compiler {
                             src: reg,
                             strict: false,
                             resolved: None,
+                            cache: Box::default(),
                         });
                     } else {
                         c.fn_value_regs.insert(String::from(&*id.name), reg);
@@ -13826,6 +13976,7 @@ impl Compiler {
                         src: reg,
                         strict: false,
                         resolved: None,
+                        cache: Box::default(),
                     });
                 }
             }
@@ -15119,7 +15270,11 @@ impl Compiler {
         if let Some((idx, _)) = b.global {
             let dst = self.alloc();
             let name = self.global_names[idx as usize].clone();
-            self.ops.push(Op::LoadGlobal { dst, name });
+            self.ops.push(Op::LoadGlobal {
+                dst,
+                name,
+                cache: SlotCache::default(),
+            });
             return dst;
         }
         if b.cell {
@@ -15208,6 +15363,7 @@ impl Compiler {
                     src,
                     strict: self.strict,
                     resolved: None,
+                    cache: Box::default(),
                 },
                 GlobalWrite::InitLet => Op::InitGlobal {
                     name,
@@ -16490,6 +16646,7 @@ impl Compiler {
                     self.ops.push(Op::LoadGlobal {
                         dst,
                         name: String::from(&*id.name),
+                        cache: SlotCache::default(),
                     });
                     Ok(dst)
                 } else if let Some(&reg) = self.fn_value_regs.get(&*id.name) {
@@ -17733,6 +17890,7 @@ impl Compiler {
                             self.ops.push(Op::GlobalExists {
                                 dst,
                                 name: String::from(&*id.name),
+                                cache: SlotCache::default(),
                             });
                             Some(dst)
                         } else {
@@ -17755,6 +17913,7 @@ impl Compiler {
                                 src,
                                 strict: true,
                                 resolved: Some(r),
+                                cache: Box::default(),
                             }),
                             None => self.assign_var(b, src)?,
                         }
@@ -23752,9 +23911,9 @@ mod generic_jit_tests {
     use super::*;
     use crate::nanbox::NanBox;
 
-    fn mk_ctx(realm: &mut Realm) -> Ctx<'_> {
+    fn mk_ctx(realm: Realm) -> Ctx<'static> {
         Ctx {
-            realm,
+            realm: Box::new(realm),
             host: None,
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
@@ -23817,8 +23976,7 @@ mod generic_jit_tests {
         let (funcs, f_id) = build();
         let jit = crate::jit::JitProto::compile_generic(&funcs[f_id], &jit_generic_helpers())
             .expect("f is generic-eligible");
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let args = [NanBox::number(2.0), NanBox::number(3.0)];
         let interp = call(&mut ctx, &funcs, f_id, &args).unwrap();
         let jitted = call_generic(&mut ctx, &funcs, &jit, &args)
@@ -23834,8 +23992,7 @@ mod generic_jit_tests {
         let (funcs, f_id) = build();
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[f_id], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let s1 = NanBox::handle(ctx.realm.new_string("foo").to_raw());
         let s2 = NanBox::handle(ctx.realm.new_string("bar").to_raw());
         let args = [s1, s2];
@@ -23856,8 +24013,7 @@ mod generic_jit_tests {
         let (funcs, f_id) = build();
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[f_id], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let s = NanBox::handle(ctx.realm.new_string("x=").to_raw());
         let args = [s, NanBox::number(7.0)];
         let interp = call(&mut ctx, &funcs, f_id, &args).unwrap();
@@ -23878,8 +24034,7 @@ mod generic_jit_tests {
         let (funcs, f_id) = build();
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[f_id], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
 
         // Fresh object per path so each counter starts at 0.
         let obj_i = make_val(&mut ctx, &funcs);
@@ -23914,8 +24069,7 @@ mod generic_jit_tests {
         let (funcs, f_id) = build();
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[f_id], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
 
         let obj_i = make_val(&mut ctx, &funcs);
         let obj_j = make_val(&mut ctx, &funcs);
@@ -23964,8 +24118,7 @@ mod generic_jit_tests {
         let (funcs, f_id) = build();
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[f_id], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let inf = NanBox::number(f64::INFINITY);
         let ninf = NanBox::number(f64::NEG_INFINITY);
         let args = [inf, ninf]; // +Inf + -Inf == NaN
@@ -24111,8 +24264,7 @@ mod generic_jit_tests {
         let get_x = id_of(&funcs, "getX");
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[get_x], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
 
         // Two distinct objects built identically → the same shape.
         let a = mint(&mut ctx, &funcs, "makePoint");
@@ -24402,8 +24554,7 @@ mod generic_jit_tests {
         let get_x = id_of(&funcs, "getX");
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[get_x], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
 
         let target = mint(&mut ctx, &funcs, "makePoint");
         // Cold prime: warms (arms) the site IC — one miss, no hit yet.
@@ -24440,8 +24591,7 @@ mod generic_jit_tests {
         let set_x = id_of(&funcs, "setX");
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[set_x], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
 
         let oi = mint(&mut ctx, &funcs, "makePoint");
         let oj = mint(&mut ctx, &funcs, "makePoint");
@@ -24470,8 +24620,7 @@ mod generic_jit_tests {
         let set_x = id_of(&funcs, "setX");
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[set_x], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
 
         let target = mint(&mut ctx, &funcs, "makePoint");
         // Cold prime arms the SET + GET site caches (misses, no hits yet).
@@ -24519,8 +24668,7 @@ mod generic_jit_tests {
         let set_x = id_of(&funcs, "setX");
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[set_x], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
 
         // A frozen {x:10}: the write must be ignored, x stays 10 (setX returns o.x).
         let oi = mint(&mut ctx, &funcs, "makePoint");
@@ -24560,8 +24708,7 @@ mod generic_jit_tests {
         let set_x = id_of(&funcs, "setX");
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[set_x], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
 
         let oj = mint(&mut ctx, &funcs, "makePoint");
         let inner = NanBox::handle(ctx.realm.new_object().to_raw());
@@ -24630,8 +24777,7 @@ mod generic_jit_tests {
             crate::jit::JitProto::compile_generic(&funcs[get_e], &jit_generic_helpers()).unwrap();
         let jset =
             crate::jit::JitProto::compile_generic(&funcs[set_e], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
 
         for n in [1usize, 2, 5, 16, 64] {
             let elems: Vec<NanBox> = (0..n).map(|k| NanBox::number((k * 7) as f64)).collect();
@@ -24667,8 +24813,7 @@ mod generic_jit_tests {
         let get_e = id_of(&funcs, "getElem");
         let jget =
             crate::jit::JitProto::compile_generic(&funcs[get_e], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
 
         // [10, <hole>, 30] with an explicit hole at index 1.
         let base: Vec<NanBox> =
@@ -24699,8 +24844,7 @@ mod generic_jit_tests {
         let set_e = id_of(&funcs, "setElem");
         let jset =
             crate::jit::JitProto::compile_generic(&funcs[set_e], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
 
         let elems: Vec<NanBox> = alloc::vec![NanBox::number(1.0), NanBox::number(2.0)];
         let ai = NanBox::handle(ctx.realm.new_array(elems.clone()).to_raw());
@@ -24739,8 +24883,7 @@ mod generic_jit_tests {
             crate::jit::JitProto::compile_generic(&funcs[get_e], &jit_generic_helpers()).unwrap();
         let jset =
             crate::jit::JitProto::compile_generic(&funcs[set_e], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
 
         let mkarr = |ctx: &mut Ctx| {
             NanBox::handle(
@@ -24788,8 +24931,7 @@ mod generic_jit_tests {
         let get_x = id_of(&funcs, "getX");
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[get_x], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
 
         let a = make_inherited(&mut ctx);
         let b = make_inherited(&mut ctx);
@@ -24807,8 +24949,7 @@ mod generic_jit_tests {
         let get_g = id_of(&funcs, "getG");
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[get_g], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
 
         let oi = mint(&mut ctx, &funcs, "makeGetter");
         let oj = mint(&mut ctx, &funcs, "makeGetter");
@@ -24837,8 +24978,7 @@ mod generic_jit_tests {
         let get_x = id_of(&funcs, "getX");
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[get_x], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
 
         let a = mint(&mut ctx, &funcs, "makeEmpty");
         let b = mint(&mut ctx, &funcs, "makeEmpty");
@@ -24859,8 +24999,7 @@ mod generic_jit_tests {
         let set_s = id_of(&funcs, "setS");
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[set_s], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
 
         let oi = mint(&mut ctx, &funcs, "makeSetterThrows");
         let oj = mint(&mut ctx, &funcs, "makeSetterThrows");
@@ -24919,8 +25058,7 @@ mod generic_jit_tests {
         let jit = crate::jit::JitProto::compile_generic(&funcs[f_id], &jit_generic_helpers())
             .expect("generic-eligible");
         assert!(jit.is_generic(), "must be the generic tier");
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let interp = call(&mut ctx, funcs, f_id, args).expect("interp ok");
         let jitted = call_generic(&mut ctx, funcs, &jit, args)
             .expect("not a pre-call deopt")
@@ -24964,8 +25102,7 @@ mod generic_jit_tests {
         // mixed: string < string → concat in the taken arm (helper slow paths).
         // String handles are realm-scoped, so run both tiers in one shared realm.
         let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let s1 = NanBox::handle(ctx.realm.new_string("apple").to_raw());
         let s2 = NanBox::handle(ctx.realm.new_string("banana").to_raw());
         let interp = call(&mut ctx, &funcs, f, &[s1, s2]).unwrap();
@@ -25049,8 +25186,7 @@ mod generic_jit_tests {
         );
         let one = NanBox::number(1.0);
         // Build the "1" string in a throwaway realm just for the arg bits.
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let s1 = NanBox::handle(ctx.realm.new_string("1").to_raw());
         // NOTE: diff_ok builds its own realm; string handles are realm-scoped, so
         // run these through a shared realm here instead.
@@ -25099,8 +25235,7 @@ mod generic_jit_tests {
             2,
         );
         let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let obj_i = make_val(&mut ctx, &funcs);
         let obj_j = make_val(&mut ctx, &funcs);
         let sym_i = NanBox::handle(ctx.realm.new_symbol("s").to_raw());
@@ -25163,8 +25298,7 @@ mod generic_jit_tests {
             1,
         );
         let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let empty = NanBox::handle(ctx.realm.new_string("").to_raw());
         let nonempty = NanBox::handle(ctx.realm.new_string("x").to_raw());
         let obj = make_val(&mut ctx, &funcs); // an object (always truthy)
@@ -25246,8 +25380,7 @@ mod generic_jit_tests {
         // object-with-valueOf slow path: 42 - 2 == 40 (valueOf coerces to 42).
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[sub], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let obj_i = make_val(&mut ctx, &funcs);
         let obj_j = make_val(&mut ctx, &funcs);
         let two = NanBox::number(2.0);
@@ -25401,8 +25534,7 @@ mod generic_jit_tests {
         let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers())
             .expect("generic-eligible");
         assert!(jit.is_generic(), "must be the generic tier");
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let arg = [NanBox::number(42.0)];
         let interp = call(&mut ctx, &funcs, f, &arg).unwrap();
         let jitted = call_generic(&mut ctx, &funcs, &jit, &arg).unwrap().unwrap();
@@ -25449,8 +25581,7 @@ mod generic_jit_tests {
         assert!(jit.is_generic(), "must be the generic tier");
         let mk_id = funcs.iter().position(|p| p.name == "makeCounter").unwrap();
 
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let obj_i = call(&mut ctx, &funcs, mk_id, &[]).unwrap();
         let obj_j = call(&mut ctx, &funcs, mk_id, &[]).unwrap();
 
@@ -25547,8 +25678,7 @@ mod generic_jit_tests {
         let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers())
             .expect("generic-eligible");
         assert!(jit.is_generic(), "must be the generic tier");
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let a = mk_array(&mut ctx, &[10.0, 20.0, 30.0]);
         for i in 0..3 {
             let idx = NanBox::number(i as f64);
@@ -25568,8 +25698,7 @@ mod generic_jit_tests {
         let (funcs, f) = build_set_elem();
         let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
         assert!(jit.is_generic());
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let ai = mk_array(&mut ctx, &[1.0, 2.0, 3.0]);
         let aj = mk_array(&mut ctx, &[1.0, 2.0, 3.0]);
         let idx = NanBox::number(1.0);
@@ -25591,8 +25720,7 @@ mod generic_jit_tests {
     fn generic_get_elem_out_of_bounds_undefined() {
         let (funcs, f) = build_get_elem();
         let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let a = mk_array(&mut ctx, &[10.0, 20.0, 30.0]);
         let idx = NanBox::number(5.0);
         let interp = call(&mut ctx, &funcs, f, &[a, idx]).unwrap();
@@ -25612,8 +25740,7 @@ mod generic_jit_tests {
     fn generic_get_elem_negative_and_fractional_index() {
         let (funcs, f) = build_get_elem();
         let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let a = mk_array(&mut ctx, &[10.0, 20.0, 30.0]);
         for idx in [NanBox::number(-1.0), NanBox::number(1.5)] {
             let interp = call(&mut ctx, &funcs, f, &[a, idx]).unwrap();
@@ -25647,8 +25774,7 @@ mod generic_jit_tests {
         let jit_len =
             crate::jit::JitProto::compile_generic(&funcs2[len], &jit_generic_helpers()).unwrap();
         assert!(jit_get.is_generic() && jit_len.is_generic());
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let s = NanBox::handle(ctx.realm.new_string("Hello").to_raw());
 
         // s[0] — the bytecode `Op::GetKey` path resolves a string index as an
@@ -25684,8 +25810,7 @@ mod generic_jit_tests {
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[len], &jit_generic_helpers()).unwrap();
         assert!(jit.is_generic());
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let a = mk_array(&mut ctx, &[1.0, 2.0, 3.0, 4.0]);
         let interp = call(&mut ctx, &funcs, len, &[a]).unwrap();
         let jitted = call_generic(&mut ctx, &funcs, &jit, &[a]).unwrap().unwrap();
@@ -25717,8 +25842,7 @@ mod generic_jit_tests {
         );
         let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
         assert!(jit.is_generic());
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let oi = mint(&mut ctx, &funcs, "makeThrowGetter");
         let oj = mint(&mut ctx, &funcs, "makeThrowGetter");
         let k = NanBox::handle(ctx.realm.new_string("g").to_raw());
@@ -25759,8 +25883,7 @@ mod generic_jit_tests {
     fn generic_set_elem_oversized_throws_identically() {
         let (funcs, f) = build_set_elem();
         let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let ai = mk_array(&mut ctx, &[1.0]);
         let aj = mk_array(&mut ctx, &[1.0]);
         let idx = NanBox::number(200_000_000.0);
@@ -25794,8 +25917,7 @@ mod generic_jit_tests {
     fn generic_set_elem_frozen_faults_identically() {
         let (funcs, f) = build_set_elem();
         let jit = crate::jit::JitProto::compile_generic(&funcs[f], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let ai = mk_array(&mut ctx, &[1.0, 2.0, 3.0]);
         let aj = mk_array(&mut ctx, &[1.0, 2.0, 3.0]);
         ctx.realm
@@ -25861,8 +25983,7 @@ mod generic_jit_tests {
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[sum], &jit_generic_helpers()).unwrap();
         assert!(jit.is_generic(), "must be the generic tier");
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         for elems in [
             &[][..],
             &[42.0][..],
@@ -25902,8 +26023,7 @@ mod generic_jit_tests {
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[len], &jit_generic_helpers()).unwrap();
         assert!(jit.is_generic());
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         for n in [0usize, 1, 2, 3, 5, 8, 16] {
             let elems: Vec<f64> = (0..n).map(|i| i as f64).collect();
             let a = mk_array(&mut ctx, &elems);
@@ -25922,8 +26042,7 @@ mod generic_jit_tests {
         let (funcs, len) = build_len_of();
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[len], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let a = mk_array(&mut ctx, &[1.0, 2.0, 3.0, 4.0, 5.0]);
         // Churn the object heap to force a slot-array reallocation.
         for _ in 0..200_000 {
@@ -25944,8 +26063,7 @@ mod generic_jit_tests {
         let (funcs, len) = build_len_of();
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[len], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
 
         // Sparse: dense 2 elements, logical length 4e9 (> max_array_len).
         let sparse = mk_array(&mut ctx, &[1.0, 2.0]);
@@ -25991,8 +26109,7 @@ mod generic_jit_tests {
         };
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[len], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let f = mint(&mut ctx, &funcs, "makeFn");
         assert!(
             ctx.realm
@@ -26023,8 +26140,7 @@ mod generic_jit_tests {
         };
         let jit =
             crate::jit::JitProto::compile_generic(&funcs[len], &jit_generic_helpers()).unwrap();
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let o = mint(&mut ctx, &funcs, "mkLen");
         let interp = call(&mut ctx, &funcs, len, &[o]).unwrap();
         let jitted = call_generic(&mut ctx, &funcs, &jit, &[o]).unwrap().unwrap();
@@ -26058,8 +26174,7 @@ mod generic_jit_tests {
             "g must be generic-ABI (so f direct-calls it)"
         );
 
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let obj = mint(&mut ctx, &funcs, "mk");
         let interp = call(&mut ctx, &funcs, f, &[obj]).unwrap();
         // The forced JIT body must reach g WITHOUT the interpreter-reentrant helper.
@@ -26099,8 +26214,7 @@ mod generic_jit_tests {
             Some(crate::jit::AbiKind::Generic)
         );
 
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let oi = mint(&mut ctx, &funcs, "mkThrow");
         let oj = mint(&mut ctx, &funcs, "mkThrow");
         let interp = call(&mut ctx, &funcs, f, &[oi]);
@@ -26162,8 +26276,7 @@ mod generic_jit_tests {
                 "{name} must be generic-ABI"
             );
         }
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let obj = mint(&mut ctx, &funcs, "mk");
         let interp = call(&mut ctx, &funcs, a, &[obj]).unwrap();
         JIT_HELPER_CALL_COUNT.with(|c| c.set(0));
@@ -26203,8 +26316,7 @@ mod generic_jit_tests {
             Some(crate::jit::AbiKind::Generic),
             "odd must be generic-ABI (even direct-calls it)"
         );
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         for n in [0.0, 1.0, 2.0, 5.0, 8.0] {
             let interp = call(&mut ctx, &funcs, even, &[NanBox::number(n)]).unwrap();
             JIT_HELPER_CALL_COUNT.with(|c| c.set(0));
@@ -26253,8 +26365,7 @@ mod generic_jit_tests {
             Some(crate::jit::AbiKind::Int),
             "g must be Int-ABI (so f must NOT direct-call it)"
         );
-        let mut realm = Realm::new();
-        let mut ctx = mk_ctx(&mut realm);
+        let mut ctx = mk_ctx(Realm::new());
         let obj = mint(&mut ctx, &funcs, "mk");
         let interp = call(&mut ctx, &funcs, f, &[obj]).unwrap();
         JIT_HELPER_CALL_COUNT.with(|c| c.set(0));

@@ -4217,6 +4217,16 @@ impl Realm {
         self.string_utf16_len(sh)
     }
 
+    /// The key epoch ([`Object::key_epoch`](crate::object::Object::key_epoch))
+    /// of the ordinary object at `handle`; `None` for any other cell.
+    #[must_use]
+    pub fn object_key_epoch(&self, handle: Handle) -> Option<u32> {
+        self.heap
+            .get(handle)
+            .and_then(Cell::as_object)
+            .map(crate::object::Object::key_epoch)
+    }
+
     /// Whether the object at `handle` has an own property `key` (including
     /// accessors) — the `in` operator.
     #[must_use]

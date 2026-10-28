@@ -1263,7 +1263,7 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*this, out);
             w_regs(args, out);
         }
-        Op::LoadGlobal { dst, name } => {
+        Op::LoadGlobal { dst, name, .. } => {
             w_u8(60, out);
             w_reg(*dst, out);
             w_str(name, out);
@@ -1278,6 +1278,7 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             src,
             strict,
             resolved,
+            ..
         } => {
             w_u8(62, out);
             w_str(name, out);
@@ -1286,7 +1287,7 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_bool(resolved.is_some(), out);
             w_reg(resolved.unwrap_or(0), out);
         }
-        Op::GlobalExists { dst, name } => {
+        Op::GlobalExists { dst, name, .. } => {
             w_u8(66, out);
             w_reg(*dst, out);
             w_str(name, out);
@@ -2103,6 +2104,7 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         60 => Op::LoadGlobal {
             dst: r.reg()?,
             name: r.string()?,
+            cache: crate::env::SlotCache::default(),
         },
         61 => Op::TypeofGlobal {
             dst: r.reg()?,
@@ -2117,10 +2119,12 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
                 let reg = r.reg()?;
                 has.then_some(reg)
             },
+            cache: alloc::boxed::Box::default(),
         },
         66 => Op::GlobalExists {
             dst: r.reg()?,
             name: r.string()?,
+            cache: crate::env::SlotCache::default(),
         },
         67 => Op::MakeArguments {
             dst: r.reg()?,

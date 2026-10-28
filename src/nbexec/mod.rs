@@ -157,7 +157,17 @@ fn math_random_seed() -> [u64; 2] {
 /// runs in. [`Interp::run`] compiles and runs a Script; values are
 /// [`NanBox`]es over the realm's GC heap.
 pub struct Interp {
-    realm: Realm,
+    /// Boxed so a hosted VM run can take it and hand it back for each
+    /// delegated call by swapping a pointer (see [`VmHost::take_realm`]).
+    ///
+    /// [`VmHost::take_realm`]: crate::nbvm::VmHost::take_realm
+    realm: alloc::boxed::Box<Realm>,
+    /// Empty stand-in realms parked in `realm` while a hosted VM run holds the
+    /// real one — reused, so entering the VM from a host call (a callback) does
+    /// not build a fresh `Realm` each time. Boxed: a spare is swapped into
+    /// `realm` by pointer.
+    #[allow(clippy::vec_box)]
+    realm_spares: Vec<alloc::boxed::Box<Realm>>,
     /// The current lexical scope (innermost).
     current: Scope,
     /// The current *variable* environment — the function/program/eval scope that
@@ -2801,7 +2811,8 @@ impl Interp {
     #[must_use]
     pub fn new_with_limits(limits: crate::limits::Limits) -> Self {
         let mut interp = Self {
-            realm: Realm::with_limits(limits),
+            realm: alloc::boxed::Box::new(Realm::with_limits(limits)),
+            realm_spares: Vec::new(),
             subject_units_cache: None,
             current: Scope::root(),
             var_scope: Scope::root(),
@@ -8632,8 +8643,31 @@ pub struct Thrown {
 /// borrows its realm, reads its globals, and delegates errors and console output
 /// to it so both tiers share one runtime.
 impl crate::nbvm::VmHost for Interp {
-    fn realm_slot(&mut self) -> &mut crate::realm::Realm {
+    fn realm_slot(&mut self) -> &mut alloc::boxed::Box<crate::realm::Realm> {
         &mut self.realm
+    }
+
+    fn take_realm(&mut self) -> alloc::boxed::Box<crate::realm::Realm> {
+        let spare = self
+            .realm_spares
+            .pop()
+            .unwrap_or_else(|| alloc::boxed::Box::new(Realm::new()));
+        core::mem::replace(&mut self.realm, spare)
+    }
+
+    fn restore_realm(&mut self, realm: alloc::boxed::Box<crate::realm::Realm>) {
+        let spare = core::mem::replace(&mut self.realm, realm);
+        self.realm_spares.push(spare);
+    }
+
+    fn global_scope(&self) -> &Scope {
+        &self.global_scope
+    }
+
+    fn global_scope_if_current(&self) -> Option<(&Scope, NanBox)> {
+        self.current
+            .ptr_eq(&self.global_scope)
+            .then_some((&self.global_scope, self.global_this))
     }
 
     fn global(&self, name: &str) -> Option<NanBox> {

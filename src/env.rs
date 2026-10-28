@@ -20,7 +20,46 @@ use crate::nanbox::NanBox;
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::string::String;
-use core::cell::RefCell;
+use alloc::vec::Vec;
+use core::cell::{Cell, RefCell};
+
+/// [`Binding`] flag: a `const` binding (reassignment is a TypeError).
+const B_CONST: u8 = 1;
+/// [`Binding`] flag: a *soft* immutable binding — a named function
+/// expression's own name (strict reassignment throws, sloppy is a no-op).
+const B_SOFT_CONST: u8 = 2;
+
+/// One binding of a frame: its value and its kind flags (`B_*`).
+#[derive(Clone, Copy)]
+struct Binding {
+    value: NanBox,
+    flags: u8,
+}
+
+/// The source of frame *generations* (`ScopeData::generation`): unique across every
+/// scope, so an inline cache can never confuse two frames (or one frame before
+/// and after a deletion).
+static NEXT_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// A per-instruction inline cache over a frame's bindings: the frame
+/// generation it was filled under and the slot its name lives in. A hit is a
+/// generation compare and a slot load instead of a by-name search. A frame's
+/// generation is issued on first use and reissued whenever a slot is freed
+/// (`delete`), so a cached slot is valid exactly while the generations match.
+#[derive(Debug, Default)]
+pub struct SlotCache {
+    generation: Cell<u64>,
+    slot: Cell<u32>,
+}
+
+impl Clone for SlotCache {
+    fn clone(&self) -> Self {
+        SlotCache {
+            generation: Cell::new(self.generation.get()),
+            slot: Cell::new(self.slot.get()),
+        }
+    }
+}
 
 /// A reference-counted lexical scope: its own bindings plus a link to the
 /// enclosing scope. Cloning shares the same frame (closures capture by sharing).
@@ -28,13 +67,21 @@ use core::cell::RefCell;
 pub struct Scope(Rc<RefCell<ScopeData>>);
 
 struct ScopeData {
-    vars: BTreeMap<String, NanBox>,
-    /// Names declared `const` in this frame (reassignment is a TypeError).
-    consts: alloc::collections::BTreeSet<String>,
-    /// Names bound as *soft* immutable bindings in this frame — a named function
-    /// expression's own name. Reassignment throws in strict mode but is a silent
-    /// no-op in sloppy mode (per SetMutableBinding on an immutable binding).
-    soft_consts: alloc::collections::BTreeSet<String>,
+    /// This frame's names, each mapped to its slot in `slots`. A slot stays put
+    /// for the binding's lifetime (redeclaring reuses it), so a [`SlotCache`]
+    /// can address it directly.
+    names: BTreeMap<String, u32>,
+    /// The bindings, indexed by slot. A `const` binding carries `B_CONST`
+    /// (reassignment is a TypeError); a named function expression's own name
+    /// carries `B_SOFT_CONST` (reassignment throws in strict mode but is a
+    /// silent no-op in sloppy mode, per SetMutableBinding on an immutable
+    /// binding). A deleted binding's slot is cleared and listed in `free`.
+    slots: Vec<Binding>,
+    /// Slots freed by `delete_local`, reused by the next new binding.
+    free: Vec<u32>,
+    /// The generation [`SlotCache`]s over this frame are filled under; `0`
+    /// until one is first needed, and reset to `0` when a slot is freed.
+    generation: u64,
     parent: Option<Scope>,
     /// Names in this frame created as *deletable* bindings — a sloppy `eval`'s
     /// `var`/function declaration hoisted into a non-global variable environment
@@ -82,14 +129,68 @@ struct ScopeData {
     lexical: Option<alloc::collections::BTreeSet<String>>,
 }
 
+impl ScopeData {
+    fn slot_of(&self, name: &str) -> Option<&Binding> {
+        self.names.get(name).map(|&i| &self.slots[i as usize])
+    }
+
+    fn slot_of_mut(&mut self, name: &str) -> Option<&mut Binding> {
+        match self.names.get(name) {
+            Some(&i) => Some(&mut self.slots[i as usize]),
+            None => None,
+        }
+    }
+
+    /// Binds `name` to `value` in this frame, keeping an existing binding's slot
+    /// and flags; returns the binding.
+    fn bind(&mut self, name: &str, value: NanBox) -> &mut Binding {
+        let i = match self.names.get(name) {
+            Some(&i) => i,
+            None => {
+                let b = Binding { value, flags: 0 };
+                let i = match self.free.pop() {
+                    Some(i) => {
+                        self.slots[i as usize] = b;
+                        i
+                    }
+                    None => {
+                        self.slots.push(b);
+                        (self.slots.len() - 1) as u32
+                    }
+                };
+                self.names.insert(String::from(name), i);
+                i
+            }
+        };
+        let b = &mut self.slots[i as usize];
+        b.value = value;
+        b
+    }
+
+    /// The slot of `name` in this frame through `cache`, filling it on a miss.
+    fn cached_slot(&mut self, name: &str, cache: &SlotCache) -> Option<u32> {
+        if self.generation != 0 && cache.generation.get() == self.generation {
+            return Some(cache.slot.get());
+        }
+        let i = *self.names.get(name)?;
+        if self.generation == 0 {
+            self.generation = NEXT_GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        cache.generation.set(self.generation);
+        cache.slot.set(i);
+        Some(i)
+    }
+}
+
 impl Scope {
     /// A new root scope (no parent).
     #[must_use]
     pub fn root() -> Self {
         Scope(Rc::new(RefCell::new(ScopeData {
-            vars: BTreeMap::new(),
-            consts: alloc::collections::BTreeSet::new(),
-            soft_consts: alloc::collections::BTreeSet::new(),
+            names: BTreeMap::new(),
+            slots: Vec::new(),
+            free: Vec::new(),
+            generation: 0,
             parent: None,
             deletable: None,
             catch_scope: false,
@@ -104,9 +205,10 @@ impl Scope {
     #[must_use]
     pub fn child(&self) -> Self {
         Scope(Rc::new(RefCell::new(ScopeData {
-            vars: BTreeMap::new(),
-            consts: alloc::collections::BTreeSet::new(),
-            soft_consts: alloc::collections::BTreeSet::new(),
+            names: BTreeMap::new(),
+            slots: Vec::new(),
+            free: Vec::new(),
+            generation: 0,
             parent: Some(self.clone()),
             deletable: None,
             catch_scope: false,
@@ -169,7 +271,7 @@ impl Scope {
     /// `var`/function declaration in a non-global variable environment).
     pub fn declare_deletable(&self, name: &str, value: NanBox) {
         let mut data = self.0.borrow_mut();
-        data.vars.insert(String::from(name), value);
+        data.bind(name, value);
         data.deletable
             .get_or_insert_with(alloc::collections::BTreeSet::new)
             .insert(String::from(name));
@@ -190,9 +292,20 @@ impl Scope {
     /// a deletable binding.
     pub fn delete_local(&self, name: &str) -> bool {
         let mut data = self.0.borrow_mut();
-        let removed = data.vars.remove(name).is_some();
-        data.consts.remove(name);
-        data.soft_consts.remove(name);
+        let removed = match data.names.remove(name) {
+            Some(i) => {
+                // Clear the slot (it must hold no handle) and retire every cache
+                // that addresses this frame before the slot can be reused.
+                data.slots[i as usize] = Binding {
+                    value: NanBox::undefined(),
+                    flags: 0,
+                };
+                data.free.push(i);
+                data.generation = 0;
+                true
+            }
+            None => false,
+        };
         if let Some(d) = data.deletable.as_mut() {
             d.remove(name);
         }
@@ -252,23 +365,20 @@ impl Scope {
 
     /// Declares (or redeclares) `name` in *this* scope.
     pub fn declare(&self, name: &str, value: NanBox) {
-        self.0.borrow_mut().vars.insert(String::from(name), value);
+        self.0.borrow_mut().bind(name, value);
     }
 
     /// Declares `name` as a `const` binding in *this* scope (reassignment fails).
     pub fn declare_const(&self, name: &str, value: NanBox) {
-        let mut data = self.0.borrow_mut();
-        data.vars.insert(String::from(name), value);
-        data.consts.insert(String::from(name));
+        self.0.borrow_mut().bind(name, value).flags |= B_CONST;
     }
 
     /// Marks an already-declared binding of `name` in *this* scope immutable —
     /// for the names a `const` *destructuring* pattern introduces, which are
     /// bound by the generic pattern walker and only then known to be `const`.
     pub fn mark_const(&self, name: &str) {
-        let mut data = self.0.borrow_mut();
-        if data.vars.contains_key(name) {
-            data.consts.insert(String::from(name));
+        if let Some(b) = self.0.borrow_mut().slot_of_mut(name) {
+            b.flags |= B_CONST;
         }
     }
 
@@ -276,8 +386,8 @@ impl Scope {
     #[must_use]
     pub fn is_const(&self, name: &str) -> bool {
         let data = self.0.borrow();
-        if data.vars.contains_key(name) {
-            return data.consts.contains(name);
+        if let Some(b) = data.slot_of(name) {
+            return b.flags & B_CONST != 0;
         }
         data.parent.as_ref().is_some_and(|p| p.is_const(name))
     }
@@ -286,17 +396,15 @@ impl Scope {
     /// function expression's own name (strict reassignment throws, sloppy is a
     /// no-op).
     pub fn declare_soft_const(&self, name: &str, value: NanBox) {
-        let mut data = self.0.borrow_mut();
-        data.vars.insert(String::from(name), value);
-        data.soft_consts.insert(String::from(name));
+        self.0.borrow_mut().bind(name, value).flags |= B_SOFT_CONST;
     }
 
     /// Whether the nearest binding of `name` is a soft immutable binding.
     #[must_use]
     pub fn is_soft_const(&self, name: &str) -> bool {
         let data = self.0.borrow();
-        if data.vars.contains_key(name) {
-            return data.soft_consts.contains(name);
+        if let Some(b) = data.slot_of(name) {
+            return b.flags & B_SOFT_CONST != 0;
         }
         data.parent.as_ref().is_some_and(|p| p.is_soft_const(name))
     }
@@ -304,7 +412,7 @@ impl Scope {
     /// Whether `name` is bound in *this* scope (not the enclosing chain).
     #[must_use]
     pub fn has_local(&self, name: &str) -> bool {
-        self.0.borrow().vars.contains_key(name)
+        self.0.borrow().names.contains_key(name)
     }
 
     /// The scope frame that currently binds `name` (the innermost one whose own
@@ -324,8 +432,8 @@ impl Scope {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<NanBox> {
         let data = self.0.borrow();
-        if let Some(v) = data.vars.get(name) {
-            return Some(*v);
+        if let Some(b) = data.slot_of(name) {
+            return Some(b.value);
         }
         data.parent.as_ref().and_then(|p| p.get(name))
     }
@@ -334,8 +442,8 @@ impl Scope {
     /// is not declared anywhere in the chain.
     pub fn set(&self, name: &str, value: NanBox) -> bool {
         let mut data = self.0.borrow_mut();
-        if let Some(slot) = data.vars.get_mut(name) {
-            *slot = value;
+        if let Some(b) = data.slot_of_mut(name) {
+            b.value = value;
             return true;
         }
         match &data.parent {
@@ -344,14 +452,49 @@ impl Scope {
         }
     }
 
+    /// The value of `name` bound in *this* frame (not the enclosing chain),
+    /// found through `cache` — the bytecode VM's global-read fast path.
+    #[must_use]
+    pub fn cached_get_local(&self, name: &str, cache: &SlotCache) -> Option<NanBox> {
+        let mut data = self.0.borrow_mut();
+        let i = data.cached_slot(name, cache)?;
+        Some(data.slots[i as usize].value)
+    }
+
+    /// Assigns `value` to `name` in *this* frame through `cache` when it is a
+    /// plain mutable binding: bound here, initialized (not in its temporal dead
+    /// zone), and neither `const` nor soft-`const`. Returns `false`, changing
+    /// nothing, for anything else (the caller takes the general path).
+    pub fn cached_set_plain_local(&self, name: &str, cache: &SlotCache, value: NanBox) -> bool {
+        let mut data = self.0.borrow_mut();
+        let Some(i) = data.cached_slot(name, cache) else {
+            return false;
+        };
+        let b = &mut data.slots[i as usize];
+        if b.flags != 0 || b.value.is_tdz() {
+            return false;
+        }
+        b.value = value;
+        true
+    }
+
+    /// Whether `name` is bound in *this* frame, through `cache`.
+    #[must_use]
+    pub fn cached_has_local(&self, name: &str, cache: &SlotCache) -> bool {
+        self.0.borrow_mut().cached_slot(name, cache).is_some()
+    }
+
     /// This frame's own `(name, value, is_const)` bindings (not the parent
     /// chain) — for snapshotting a closure's captured environment.
     #[must_use]
     pub fn local_bindings(&self) -> alloc::vec::Vec<(String, NanBox, bool)> {
         let data = self.0.borrow();
-        data.vars
+        data.names
             .iter()
-            .map(|(k, v)| (k.clone(), *v, data.consts.contains(k)))
+            .map(|(k, &i)| {
+                let b = data.slots[i as usize];
+                (k.clone(), b.value, b.flags & B_CONST != 0)
+            })
             .collect()
     }
 
@@ -391,8 +534,8 @@ impl Scope {
     /// (for GC tracing of a closure's captured values).
     pub fn for_each_handle(&self, visit: &mut dyn FnMut(Handle)) {
         let data = self.0.borrow();
-        for v in data.vars.values() {
-            if let Some(raw) = v.as_handle() {
+        for b in &data.slots {
+            if let Some(raw) = b.value.as_handle() {
                 visit(Handle::from_raw(raw));
             }
         }
@@ -419,9 +562,9 @@ impl Scope {
     /// idempotent: `forward` maps an already-forwarded handle to itself.)
     pub fn relocate_handles(&self, forward: &dyn Fn(Handle) -> Handle) {
         let mut data = self.0.borrow_mut();
-        for v in data.vars.values_mut() {
-            if let Some(raw) = v.as_handle() {
-                *v = NanBox::handle(forward(Handle::from_raw(raw)).to_raw());
+        for b in &mut data.slots {
+            if let Some(raw) = b.value.as_handle() {
+                b.value = NanBox::handle(forward(Handle::from_raw(raw)).to_raw());
             }
         }
         if let Some(obj) = &mut data.with_obj
@@ -501,5 +644,34 @@ mod tests {
         child.for_each_handle(&mut |h| seen.push(h.to_raw()));
         seen.sort_unstable();
         assert_eq!(seen, alloc::vec![1, 2]);
+    }
+
+    #[test]
+    fn slot_cache_tracks_bindings_and_deletion() {
+        let s = Scope::root();
+        s.declare("a", NanBox::number(1.0));
+        s.declare_deletable("b", NanBox::number(2.0));
+        let (ca, cb) = (SlotCache::default(), SlotCache::default());
+        assert_eq!(s.cached_get_local("a", &ca).unwrap().as_number(), Some(1.0));
+        assert_eq!(s.cached_get_local("b", &cb).unwrap().as_number(), Some(2.0));
+        assert!(s.cached_set_plain_local("a", &ca, NanBox::number(5.0)));
+        assert_eq!(s.get("a").unwrap().as_number(), Some(5.0));
+        // Deleting `b` frees its slot; a new binding reusing it must not be read
+        // through `b`'s stale cache.
+        assert!(s.delete_local("b"));
+        s.declare("c", NanBox::number(3.0));
+        assert!(s.cached_get_local("b", &cb).is_none());
+        assert_eq!(s.cached_get_local("a", &ca).unwrap().as_number(), Some(5.0));
+        // Immutable and uninitialized bindings refuse the plain write.
+        s.declare_const("k", NanBox::number(7.0));
+        s.declare_soft_const("f", NanBox::number(8.0));
+        s.declare("t", NanBox::tdz());
+        for n in ["k", "f", "t"] {
+            assert!(!s.cached_set_plain_local(n, &SlotCache::default(), NanBox::number(0.0)));
+        }
+        assert!(s.is_const("k") && s.is_soft_const("f"));
+        // Redeclaring keeps the binding's kind (as the former name sets did).
+        s.declare("k", NanBox::number(9.0));
+        assert!(s.is_const("k"));
     }
 }

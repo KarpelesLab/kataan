@@ -235,9 +235,8 @@ pub(crate) fn run_eval_code(
     captures: &[NanBox],
     this_cell: bool,
 ) -> Result<NanBox, VmError> {
-    let mut realm = core::mem::take(host.realm_slot());
+    let mut ctx = hosted_ctx(host.take_realm(), host);
     let result = {
-        let mut ctx = hosted_ctx(&mut realm, host);
         let r = run_eval_frame(&mut ctx, table, proto, captures, this_cell);
         if r.is_ok() && !ctx.microtasks.is_empty() {
             Err(VmError::Unsupported)
@@ -245,7 +244,8 @@ pub(crate) fn run_eval_code(
             r
         }
     };
-    *host.realm_slot() = realm;
+    let realm = ctx.realm;
+    host.restore_realm(realm);
     result
 }
 

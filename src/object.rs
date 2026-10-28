@@ -130,6 +130,10 @@ pub struct Object {
     /// a getter/setter is defined between two data properties (or an accessor is
     /// later redefined as data, keeping its original slot).
     key_order: Option<Vec<Box<str>>>,
+    /// Bumped whenever the set of own keys (data or accessor) may have changed,
+    /// so a cache of "does this object own `k`" can be revalidated by a compare
+    /// (see [`key_epoch`](Object::key_epoch)).
+    key_epoch: u32,
 }
 
 impl Object {
@@ -154,7 +158,17 @@ impl Object {
             class_tag: None,
             proto: None,
             key_order: None,
+            key_epoch: 0,
         }
+    }
+
+    /// A counter that changes whenever this object's set of own keys (data or
+    /// accessor) may have changed: equal values at two moments mean the same
+    /// own keys. (A `u32` that would need 2³² key changes between two reads to
+    /// alias.)
+    #[must_use]
+    pub fn key_epoch(&self) -> u32 {
+        self.key_epoch
     }
 
     /// Appends `key` to the unified insertion-order log iff the object is tracking
@@ -162,6 +176,7 @@ impl Object {
     /// on the fast path (`key_order` is `None`). Called after a *new* own key — data
     /// or accessor — is materialized.
     fn track_key(&mut self, key: &str) {
+        self.key_epoch = self.key_epoch.wrapping_add(1);
         if let Some(order) = &mut self.key_order
             && !order.iter().any(|k| k.as_ref() == key)
         {
@@ -845,6 +860,7 @@ impl Object {
     /// Removes any accessor (getter/setter) for `key`, leaving data properties
     /// intact — used when a `defineProperty` replaces an accessor with data.
     pub fn clear_accessor(&mut self, key: &str) {
+        self.key_epoch = self.key_epoch.wrapping_add(1);
         self.accessors.retain(|(k, _, _)| k.as_ref() != key);
     }
 
@@ -852,6 +868,7 @@ impl Object {
     /// `root` without it, and leaving any same-named accessor untouched. Used when
     /// `defineProperty` converts a data property into an accessor.
     pub fn delete_data(&mut self, root: Rc<Shape>, key: &str) {
+        self.key_epoch = self.key_epoch.wrapping_add(1);
         match &mut self.data {
             ObjectData::Shaped { shape, slots } => {
                 if !shape.contains(key) {
@@ -887,6 +904,7 @@ impl Object {
     /// it (also drops a same-named accessor). Returns whether anything was
     /// removed.
     pub fn delete(&mut self, root: Rc<Shape>, key: &str) -> bool {
+        self.key_epoch = self.key_epoch.wrapping_add(1);
         let had_accessor = self.accessors.iter().any(|(k, _, _)| k.as_ref() == key);
         self.accessors.retain(|(k, _, _)| k.as_ref() != key);
         // Clear the property's attribute flags so a later re-add of the same key
