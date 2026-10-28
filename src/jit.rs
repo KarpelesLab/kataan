@@ -2555,7 +2555,78 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
         };
         out.push(lowered);
     }
+    drop_dead_stores(
+        &mut out,
+        &proto.ops,
+        n_regs,
+        proto.n_params + proto.n_captures + 1,
+    );
     Some((out, keys, call_args, n_calls))
+}
+
+/// Turns into `Nop`s the `LoadConst`s and `Move`s (`ops`, lowered from
+/// `bytecode`) whose destination nothing ever reads: a register of at least
+/// `first` (below it are the activation's inputs, which the entry code reads)
+/// that no op names except such a pure write of it. That is the binding
+/// initialization a block's `let`/`const` gets when the binding itself ends
+/// up in another register (`LoadConst undefined` then a `Move` of it).
+/// Removing a `Move` can leave its source unread in turn, so it iterates.
+/// No other code reads a register by number: an op names every register it
+/// touches (the verifier's operand list), and a catch binding is named by its
+/// `PushHandler`.
+fn drop_dead_stores(
+    ops: &mut [GenericOp],
+    bytecode: &[crate::nbvm::Op],
+    n_regs: usize,
+    first: usize,
+) {
+    use crate::nbvm::Op;
+    // The pure write of `reg` that op `i` is, if it is one.
+    let pure_dst = |i: usize| match bytecode.get(i) {
+        Some(Op::LoadConst { dst, .. }) => Some(*dst),
+        Some(Op::Move { dst, src }) if dst != src => Some(*dst),
+        _ => None,
+    };
+    let mut mentions: Vec<Vec<usize>> = alloc::vec![Vec::new(); n_regs];
+    for (i, op) in bytecode.iter().enumerate() {
+        let seen = core::cell::RefCell::new(Vec::new());
+        crate::bytecode::op_for_each_reg(op, &|r| seen.borrow_mut().push(r));
+        let mut seen = seen.into_inner();
+        seen.sort_unstable();
+        seen.dedup();
+        for r in seen {
+            if let Some(m) = mentions.get_mut(r as usize) {
+                m.push(i);
+            }
+        }
+    }
+    let mut dead = alloc::vec![false; ops.len()];
+    let mut work: Vec<usize> = (first..n_regs).collect();
+    while let Some(reg) = work.pop() {
+        let Some(m) = mentions.get(reg) else { continue };
+        let unread = m
+            .iter()
+            .all(|&i| dead[i] || pure_dst(i).is_some_and(|d| d as usize == reg));
+        if !unread {
+            continue;
+        }
+        for &i in m {
+            if dead[i] {
+                continue;
+            }
+            // Only ops lowered as the plain write they are.
+            if !matches!(ops[i], GenericOp::Const { .. } | GenericOp::Move { .. }) {
+                continue;
+            }
+            dead[i] = true;
+            ops[i] = GenericOp::Nop;
+            if let Some(Op::Move { src, .. }) = bytecode.get(i)
+                && (*src as usize) >= first
+            {
+                work.push(*src as usize);
+            }
+        }
+    }
 }
 
 /// Why [`lower_nbvm_generic`] rejects `proto` — a human-readable diagnostic for
@@ -5357,6 +5428,19 @@ impl JitFunction {
             osr_entries,
             &catch_targets,
         );
+        // The ways whose every site compiles in one layout `S` (see
+        // `recv_cache::shape_ways`): a hit there proves the receiver has `S`.
+        let way_shape = recv_cache::shape_ways(&rc, ops, |op| match *op {
+            GenericOp::GetProp { site, .. } | GenericOp::SetProp { site, .. } => {
+                sites.get(site as usize)?.baked.map(|b| b.shape)
+            }
+            _ => None,
+        });
+        // Such a site's way hit skips its shape compare.
+        let shape_known = |at: usize, shape: u64| {
+            rc.sites[at].is_some_and(|p| p.check && way_shape[p.way] == Some(shape))
+        };
+        let shape_ways: Vec<usize> = (0..rc.ways).filter(|&w| way_shape[w].is_some()).collect();
         // The `InitProp`s of a fresh literal (`recv_cache::fresh_inits`).
         let fresh_init = recv_cache::fresh_inits(ops, bytecode, osr_entries, &catch_targets);
         let rc_base = method_scratch - 8 * num.frame_slots() as i32;
@@ -5576,7 +5660,10 @@ impl JitFunction {
         // reuse it). Clobbers `rax`, `rdx`, `r8`, `r10`, `r11`; leaves no
         // arena in `r10`/`rdx`.
         macro_rules! recv_slot {
-            ($at:expr, $recv:expr, $miss:expr, $fam:expr) => {{
+            ($at:expr, $recv:expr, $miss:expr, $fam:expr) => {{ recv_slot!($at, $recv, $miss, $fam, None) }};
+            // `$walked`: where a way miss's full walk resumes instead of
+            // the hit path's continuation.
+            ($at:expr, $recv:expr, $miss:expr, $fam:expr, $walked:expr) => {{
                 // A way holds one family's fills only (or a hit would skip
                 // checks its fill never made).
                 if rc.sites[$at].is_some_and(|p| p.family != $fam) {
@@ -5593,7 +5680,8 @@ impl JitFunction {
                         a.jne(walk);
                         a.g_load(call_seq::r::RCX, call_seq::r::RBP, rc_cell(way));
                         a.bind(back);
-                        cold_walks.push((walk, back, $recv, $miss, way, $fam));
+                        let walked: Option<Label> = $walked;
+                        cold_walks.push((walk, walked.unwrap_or(back), $recv, $miss, way, $fam));
                     }
                     plan => {
                         a.p_load_arena(helpers.call_layout.realm, &layout.props);
@@ -5641,6 +5729,9 @@ impl JitFunction {
         // return, miss, the promoted result's spill read, cache).
         let mut cold_caches: Vec<(Label, Label, Label, Option<Label>, *mut core::ffi::c_void)> =
             Vec::new();
+        // The shape compares a layout-proving way's hit skips: (entry, a
+        // write's store-guard miss, layout, mismatch, resume).
+        let mut cold_verifies: Vec<(Label, Option<Label>, u64, Label, Label)> = Vec::new();
         #[allow(clippy::type_complexity)]
         let mut cold_gets: Vec<(
             Label,
@@ -5950,6 +6041,10 @@ impl JitFunction {
                     a.call_rax();
                     throw_check!();
                     a.bind(done);
+                    // An add: maybe to an object a layout-proving way holds.
+                    for &w in &shape_ways {
+                        a.store_empty(rc_key(w));
+                    }
                 }
                 GenericOp::CheckTdz { src, pc } => {
                     if !ok(src) {
@@ -6206,8 +6301,15 @@ impl JitFunction {
                     // misses and throws. No allocation and no call: the arena
                     // base is read from the realm, so it is GC- and realloc-safe.
                     // (A host-exotic object's reads are the host's.)
-                    recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj);
-                    a.mov_rax_at_rcx(layout.off_shape);
+                    // A way hit that proves the compiled-in layout skips the
+                    // shape compare; the way's full walk makes it, out of
+                    // line (`cold_verifies`).
+                    let known = s.baked.filter(|b| shape_known(op_idx, b.shape));
+                    let verify = known.map(|_| a.new_label());
+                    recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj, verify);
+                    if known.is_none() {
+                        a.mov_rax_at_rcx(layout.off_shape);
+                    }
                     if let Some(b) = s.baked {
                         // The layout the site settled on, compiled in: one
                         // compare with the shape, one load at a fixed
@@ -6215,9 +6317,15 @@ impl JitFunction {
                         // (out of line, `cold_caches`).
                         let cached = a.new_label();
                         let back = a.new_label();
-                        a.g_movabs(call_seq::r::R11, b.shape);
-                        a.cmp_rax_r11();
-                        a.jne(cached);
+                        if let Some(verify) = verify {
+                            let resume = a.new_label();
+                            a.bind(resume);
+                            cold_verifies.push((verify, None, b.shape, cached, resume));
+                        } else {
+                            a.g_movabs(call_seq::r::R11, b.shape);
+                            a.cmp_rax_r11();
+                            a.jne(cached);
+                        }
                         a.p_obj_fixed_slot_load(&layout, b.slot);
                         let x = num.result_xmm(op_idx, dst);
                         let spill = x.map(|_| a.new_label());
@@ -6294,7 +6402,12 @@ impl JitFunction {
                     // write barrier (see `p_barrier_check`) and the object is not
                     // frozen with an empty `readonly` list (`Object::cached_set`'s
                     // success precondition). Everything else → the helper.
-                    recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj);
+                    // As for `GetProp`: a layout-proving way hit skips the
+                    // shape compare (the walk's resumption makes it, with the
+                    // flags test, out of line).
+                    let known = s.baked.filter(|b| shape_known(op_idx, b.shape));
+                    let verify = known.map(|_| a.new_label());
+                    recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj, verify);
                     // A frozen object's writes need the helper, as do those of
                     // a host-exotic, global or tracked-prototype object, and of
                     // an object with a non-writable property
@@ -6307,24 +6420,41 @@ impl JitFunction {
                         props::FLAGS_NO_INLINE_STORE,
                     );
                     a.jne(helper);
-                    a.mov_rax_at_rcx(layout.off_shape);
+                    if known.is_none() {
+                        a.mov_rax_at_rcx(layout.off_shape);
+                    }
+                    // Where the in-place store of a compiled-in layout ends
+                    // (every other path may have added a property, and ends
+                    // at `done`, which empties the layout-proving ways).
+                    let stored = a.new_label();
                     if let Some(b) = s.baked {
                         // The layout the site settled on, compiled in (never
                         // a primitive wrapper's): a compare with the shape and
                         // a store at a fixed offset; any other shape takes
                         // the cache path just below.
                         let cached = a.new_label();
-                        a.g_movabs(call_seq::r::R11, b.shape);
-                        a.cmp_rax_r11();
-                        a.jne(cached);
+                        if let Some(verify) = verify {
+                            let resume = a.new_label();
+                            a.bind(resume);
+                            cold_verifies.push((verify, Some(helper), b.shape, cached, resume));
+                        } else {
+                            a.g_movabs(call_seq::r::R11, b.shape);
+                            a.cmp_rax_r11();
+                            a.jne(cached);
+                        }
                         if !num.is_number_at(op_idx, val) {
                             a.load_rax(disp(val));
                             a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
                         }
                         a.load_rdx(disp(val));
                         a.p_obj_fixed_slot_store(&layout, b.slot);
-                        a.jmp(done);
+                        a.jmp(stored);
                         a.bind(cached);
+                        // Another layout in a way that proves this one: empty
+                        // it (and the others: it may be an add).
+                        for &w in &shape_ways {
+                            a.store_empty(rc_key(w));
+                        }
                     }
                     a.movabs_r11(s.cache_ptr as i64);
                     a.cmp_rax_at_r11(layout.cache_shape_off);
@@ -6402,6 +6532,11 @@ impl JitFunction {
                     a.call_rax();
                     throw_check!();
                     a.bind(done);
+                    // Maybe an add: to an object a layout-proving way holds.
+                    for &w in &shape_ways {
+                        a.store_empty(rc_key(w));
+                    }
+                    a.bind(stored);
                 }
                 GenericOp::GetElem { dst, obj, index } => {
                     if !ok(dst) || !ok(obj) || !ok(index) {
@@ -7015,6 +7150,10 @@ impl JitFunction {
         // cache, else the miss path. The value goes back in `rax`.
         for (cached, back, miss, spill, cache) in core::mem::take(&mut cold_caches) {
             a.bind(cached);
+            // Not the layout: a way that proves it may not keep this object.
+            for &w in &shape_ways {
+                a.store_empty(rc_key(w));
+            }
             a.movabs_r11(cache as i64);
             a.cmp_rax_at_r11(layout.cache_shape_off);
             a.jne(miss);
@@ -7034,6 +7173,25 @@ impl JitFunction {
                     a.p_obj_slot_load_spill(&layout, back);
                 }
             }
+        }
+        // The shape compares that a layout-proving way's hit skips, after the
+        // way's full walk: the store guards first, for a write (to `miss`),
+        // then the layout (else to the site's cache path).
+        for (verify, store_miss, shape, cached, resume) in core::mem::take(&mut cold_verifies) {
+            a.bind(verify);
+            if let Some(miss) = store_miss {
+                a.p_test_byte_imm(
+                    call_seq::r::RCX,
+                    layout.props.off_jit_flags,
+                    props::FLAGS_NO_INLINE_STORE,
+                );
+                a.jne(miss);
+            }
+            a.mov_rax_at_rcx(layout.off_shape);
+            a.g_movabs(call_seq::r::R11, shape);
+            a.cmp_rax_r11();
+            a.jne(cached);
+            a.jmp(resume);
         }
         // The receiver cache's full walks: each refills its way and resumes.
         for (walk, back, recv, miss, w, fam) in core::mem::take(&mut cold_walks) {

@@ -291,6 +291,46 @@ fn id_of(ids: &mut Vec<(u16, u32)>, next: &mut u32, r: u16) -> u32 {
     *next
 }
 
+/// Per way, the layout every one of its sites compiles in, if they all
+/// compile in the same one (`baked(op)`: the shape word an op's code compares
+/// its receiver with). Such a way only ever holds an object of that layout:
+///
+/// - every fill of it is by one of those sites, whose code goes on with the
+///   receiver only once its shape compared equal, and whose mismatch path
+///   empties the way (and every other such way) before anything else;
+/// - an object's shape changes only in Rust code (behind a call, which empties
+///   every way) or in an inline add (`SetProp`'s add path, `InitProp`), after
+///   which the emitter empties every such way (an add may hit an object
+///   another way holds).
+///
+/// So a hit on such a way, at a site that compiles in the same layout, needs
+/// no shape compare.
+pub(super) fn shape_ways(
+    plan: &RecvPlan,
+    ops: &[GenericOp],
+    baked: impl Fn(&GenericOp) -> Option<u64>,
+) -> Vec<Option<u64>> {
+    // `None`: no site yet; `Some(None)`: mixed; `Some(Some(s))`: all `s`.
+    let mut out: Vec<Option<Option<u64>>> = vec![None; plan.ways];
+    for (op, site) in ops.iter().zip(&plan.sites) {
+        let Some(p) = site else { continue };
+        let Some(slot) = out.get_mut(p.way) else {
+            continue;
+        };
+        let b = if p.family == Family::Obj {
+            baked(op)
+        } else {
+            None
+        };
+        *slot = match (*slot, b) {
+            (None, b) => Some(b),
+            (Some(Some(s)), Some(b)) if s == b => Some(Some(s)),
+            _ => Some(None),
+        };
+    }
+    out.into_iter().map(Option::flatten).collect()
+}
+
 /// Plans the receiver cache for `ops` (see the module docs), given the global
 /// binding cache's plan and which ops lie in promoted loops (whose global
 /// accesses keep their own validated addresses); `osr_entries` and
