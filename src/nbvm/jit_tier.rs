@@ -462,9 +462,9 @@ pub(crate) extern "C" fn jit_helper_global_ref(ctx: *mut core::ffi::c_void, op: 
         } if !(*strict && resolved.is_some()) && !name.starts_with('\u{1}') => {
             host.global_scope_if_current().and_then(|(scope, global)| {
                 let p = scope.jit_binding_ptr(name, &cache.slot, true)?;
-                let owned = global
-                    .as_handle()
-                    .is_some_and(|g| ctx.realm.has_own(Handle::from_raw(g), name));
+                let owned = global.as_handle().is_some_and(|g| {
+                    super::global_owns_cached(&ctx.realm, Handle::from_raw(g), name, cache)
+                });
                 (!owned).then_some(p)
             })
         }
@@ -506,6 +506,39 @@ pub(crate) extern "C" fn jit_helper_math1(
         &[NanBox::from_bits(x)],
     )
     .map_or(NanBox::jit_throw_bits(), NanBox::to_bits)
+}
+
+/// Records where a method site's key is found on `recv`
+/// (`crate::jit::MethodSite::fill`, a pure read of the receiver's chain) so
+/// the site's inline chain cache hits next time — for compiled code that
+/// computes a built-in `Math.f(x)` inline after finding the method there.
+/// Returns 0.
+///
+/// # Safety
+/// `ctx` must be the live `Ctx` the compiled body was entered with and `site`
+/// the calling `JitProto`'s method site for the call.
+pub(crate) extern "C" fn jit_helper_site_fill(
+    ctx: *mut core::ffi::c_void,
+    recv: u64,
+    site: u64,
+    _unused: u64,
+) -> u64 {
+    // SAFETY: see the function contract — a live, otherwise-unborrowed `Ctx`,
+    // and the site is the calling `JitProto`'s (touched only by this helper
+    // while it runs).
+    #[allow(unsafe_code)]
+    let (ctx, site) = unsafe {
+        (
+            &*(ctx as *const Ctx),
+            &mut *(site as usize as *mut crate::jit::MethodSite),
+        )
+    };
+    if ctx.host.is_some()
+        && let Some(h) = NanBox::from_bits(recv).as_handle()
+    {
+        site.fill(&ctx.realm, Handle::from_raw(h));
+    }
+    0
 }
 
 /// The generic-tier helper that runs one bytecode op — any op without a native

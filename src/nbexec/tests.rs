@@ -12942,3 +12942,51 @@ fn compiled_receiver_cache_across_calls_and_mutations() {
     "#;
     assert_eq!(run(src), "-820477392");
 }
+
+/// Compiled global reads and writes through the global binding cache (a
+/// callee and a global-object write changing the bindings between them),
+/// `recv[key](args)` calls whose callee read is inline (holes, a non-function
+/// element, a `this`-reading function, the out-of-range index), and inline
+/// `Math.sqrt/abs/floor/ceil/trunc` (NaN, -0, then replaced members and a
+/// getter) behave as the interpreter's.
+#[test]
+fn compiled_global_cache_callkey_and_inline_math() {
+    let src = r#"
+        var g = 1; let h = 2; const K = 3;
+        function bump() { g += 1; h += 2; }
+        function f(i) {
+          let s = g + h + K;
+          s += g * h;
+          if (i % 50 === 0) bump();
+          s += g + h;
+          g = g + 1; h = h - 1;
+          s += g + h;
+          if (i % 77 === 0) { globalThis.g = 100; }
+          s += g;
+          return s;
+        }
+        let t = 0;
+        for (let i = 0; i < 5000; i++) t = (t + f(i)) | 0;
+        const fs = [];
+        for (let i = 0; i < 30; i++) fs.push((x) => x + i);
+        fs[7] = { call() {} }; delete fs[9]; fs[12] = function (x) { return this.length + x; };
+        let u = 0, errs = 0;
+        for (let r = 0; r < 300; r++) for (let i = 0; i < fs.length + 1; i++) {
+          try { u = (u + fs[i](r)) | 0; } catch (e) { errs++; }
+        }
+        const m = { sqrt: Math.sqrt, abs: Math.abs, floor: (x) => -x };
+        let w = 0;
+        for (let i = 0; i < 3000; i++) {
+          const x = (i % 11) - 5.5;
+          w += Math.sqrt(i) + Math.abs(x) + Math.floor(x) + Math.ceil(x) + Math.trunc(x) + m.sqrt(i) + m.floor(x) + m.abs(-0);
+          if (i === 1500) { Math.abs = (y) => 7; Math.floor = (y) => y * 3; Object.defineProperty(Math, "ceil", { get() { return (z) => z + 0.25; } }); }
+          if (i > 1500) w += Math.sqrt(-1) === Math.sqrt(-1) ? 1 : 2;
+          if (i > 1500 && i < 1600) { try { w += Math.floor(x); } catch (e) { w += 0.5; } }
+        }
+        [t, g, h, u, errs, w, Object.is(Math.sqrt(-0), -0), 1 / Math.ceil(-0.5)].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "-1697237139|172|-4798|1386900|900|232537.58649531758|true|-4"
+    );
+}

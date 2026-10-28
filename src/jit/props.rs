@@ -54,6 +54,10 @@ pub(crate) struct PropsLayout {
     pub off_slot_age: i32,
     /// The `Cell::VmFunction` discriminant byte.
     pub vmfn_disc: u8,
+    /// The `Cell::Native` discriminant byte.
+    pub native_disc: u8,
+    /// Slot-relative offset of a built-in native function's `u16` id.
+    pub off_native_id: i32,
     /// Slot-relative offset of a VM function's `func: u32`.
     pub off_vmfn_func: i32,
     /// Slot-relative offset of a VM function's captures data pointer.
@@ -86,6 +90,7 @@ impl PropsLayout {
         let i = |v: usize| i32::try_from(v).expect("jit layout offset fits in i32");
         let (heap_ptr, heap_len) = crate::realm::Realm::jit_heap_offsets();
         let (vmfn_disc, func_off, caps_off) = crate::cell::jit_vm_function_layout();
+        let (native_disc, native_id_off) = crate::cell::jit_native_layout();
         let (shape_parent, rc_strong) = shape_word_offsets();
         Self {
             off_extensible: i(obj_base + obj.extensible_off),
@@ -99,6 +104,8 @@ impl PropsLayout {
             marking: i(crate::realm::Realm::jit_marking_offset()),
             off_slot_age: i(slot.age_off),
             vmfn_disc,
+            native_disc,
+            off_native_id: i(cell_base + native_id_off),
             off_vmfn_func: i(cell_base + func_off),
             off_vmfn_caps_ptr: i(cell_base + caps_off + obj.vec_ptr_off),
             off_vmfn_caps_len: i(cell_base + caps_off + obj.vec_len_off),
@@ -845,6 +852,25 @@ impl X64Assembler {
         self.code.extend_from_slice(&[0x4c, 0x01, 0xc8]);
     }
 
+    /// To `miss` unless the value in `rax` is the built-in native function
+    /// `id` (a live `Cell::Native` of that id). Clobbers `rax`, `rcx`, `rdx`,
+    /// `r8`, `r10`, `r11`.
+    pub(crate) fn p_is_native(&mut self, l: &JitLayout, realm_off: i32, id: u16, miss: Label) {
+        self.p_handle_check(miss);
+        self.g_load(r::R11, r::R15, realm_off);
+        self.g_load(r::R10, r::R11, l.props.heap_ptr);
+        self.g_load(r::RDX, r::R11, l.props.heap_len);
+        self.p_slot_of(l, miss);
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.props.native_disc);
+        self.jne(miss);
+        // cmp word [rcx+disp32], imm16
+        self.code.extend_from_slice(&[0x66, 0x81, 0xb9]);
+        self.code
+            .extend_from_slice(&l.props.off_native_id.to_le_bytes());
+        self.code.extend_from_slice(&id.to_le_bytes());
+        self.jne(miss);
+    }
+
     /// `dec edi`.
     fn p_dec_edi(&mut self) {
         self.code.extend_from_slice(&[0xff, 0xcf]);
@@ -1284,6 +1310,9 @@ mod tests {
                 NanBox::number(1.0).to_bits()
             );
             assert_eq!(*field(f, jl.off_cell_tag), l.vmfn_disc);
+            let nf = realm.new_native(0x4321);
+            assert_eq!(*field(nf, jl.off_cell_tag), l.native_disc);
+            assert_eq!(*field(nf, l.off_native_id).cast::<u16>(), 0x4321);
             let (fid, caps) = realm.vm_function(f).unwrap();
             assert_eq!(*field(f, l.off_vmfn_func).cast::<u32>(), fid);
             assert_eq!(*field(f, l.off_vmfn_caps_len).cast::<usize>(), caps.len());

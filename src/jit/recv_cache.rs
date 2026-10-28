@@ -23,6 +23,122 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::GenericOp;
+use crate::nbvm::Op;
+
+/// The most global binding addresses a body caches (each costs a store after
+/// every call).
+const MAX_GLOBAL_SLOTS: usize = 4;
+
+/// A body's global binding cache plan: the slots it uses and, per op, the slot
+/// of a `LoadGlobal` / `StoreGlobal` that uses one.
+pub(super) struct GlobalPlan {
+    /// How many slots the body uses.
+    pub(super) slots: usize,
+    /// Per op, its slot.
+    pub(super) site: Vec<Option<usize>>,
+}
+
+/// Plans the global binding cache: among the body's global reads and writes
+/// outside promoted loops (`in_region`, which keep their own), the ones that
+/// can reuse an address an earlier access of the same `(name, read | write)`
+/// validated with no call in between (as the receiver cache's plan follows
+/// the op stream), and those earlier accesses; the (up to
+/// [`MAX_GLOBAL_SLOTS`]) most used such pairs get a slot each. A write's
+/// validated address would also serve reads, but not the reverse, so the two
+/// kinds of one name take separate slots.
+pub(super) fn plan_globals(
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    osr_entries: &[usize],
+    catch_targets: &[usize],
+    in_region: impl Fn(usize) -> bool,
+) -> GlobalPlan {
+    let n = ops.len();
+    let target = branch_targets(ops, osr_entries, catch_targets);
+    let mut key = vec![None; n];
+    let mut used = vec![false; n];
+    let mut live: Vec<((&str, bool), usize)> = Vec::new();
+    for (pc, op) in ops.iter().enumerate() {
+        if target[pc] {
+            live.clear();
+        }
+        if matches!(op, GenericOp::Interp { .. }) && !in_region(pc) {
+            let k = match bytecode.get(pc) {
+                Some(Op::LoadGlobal { name, .. }) => Some((name.as_str(), false)),
+                Some(Op::StoreGlobal { name, .. }) => Some((name.as_str(), true)),
+                _ => None,
+            };
+            if let Some(k) = k {
+                key[pc] = Some(k);
+                if let Some(e) = live.iter_mut().find(|e| e.0 == k) {
+                    used[e.1] = true;
+                    used[pc] = true;
+                    e.1 = pc;
+                } else {
+                    live.push((k, pc));
+                }
+            }
+        }
+        let inline = matches!(op, GenericOp::Interp { .. } | GenericOp::CallMethod { .. })
+            && usually_inline(bytecode, pc);
+        if ends_knowledge(op) && !inline {
+            live.clear();
+        }
+    }
+    let mut groups: Vec<((&str, bool), usize)> = Vec::new();
+    for pc in 0..n {
+        if let (true, Some(k)) = (used[pc], key[pc]) {
+            match groups.iter_mut().find(|g| g.0 == k) {
+                Some(g) => g.1 += 1,
+                None => groups.push((k, 1)),
+            }
+        }
+    }
+    groups.sort_by_key(|x| core::cmp::Reverse(x.1));
+    groups.truncate(MAX_GLOBAL_SLOTS);
+    let site = (0..n)
+        .map(|pc| {
+            let k = key[pc].filter(|_| used[pc])?;
+            groups.iter().position(|g| g.0 == k)
+        })
+        .collect();
+    GlobalPlan {
+        slots: groups.len(),
+        site,
+    }
+}
+
+/// Which op indices (up to `ops.len()`) are branch targets or entries.
+fn branch_targets(ops: &[GenericOp], osr_entries: &[usize], catch_targets: &[usize]) -> Vec<bool> {
+    let n = ops.len();
+    let mut target = vec![false; n + 1];
+    for &t in osr_entries.iter().chain(catch_targets) {
+        if t <= n {
+            target[t] = true;
+        }
+    }
+    for op in ops {
+        if let GenericOp::Jump { target: t } | GenericOp::JumpIfFalse { target: t, .. } = *op
+            && t <= n
+        {
+            target[t] = true;
+        }
+    }
+    target
+}
+
+/// Whether bytecode op `pc` (a `GenericOp::Interp` or `CallMethod`) usually
+/// runs without a call: a global access (the global binding cache), the
+/// inline `RequireObjectCoercible` check, or an inline `Math.f(x)`.
+fn usually_inline(bytecode: &[Op], pc: usize) -> bool {
+    match bytecode.get(pc) {
+        Some(
+            Op::LoadGlobal { .. } | Op::StoreGlobal { .. } | Op::RequireObjectCoercible { .. },
+        ) => true,
+        Some(op @ Op::CallMethod { .. }) => super::inline_math(op).is_some(),
+        _ => false,
+    }
+}
 
 /// What a way's fill proved of its receiver beyond the walk — fixed per way,
 /// so a hit can skip those checks too (they hold until Rust code runs: only it
@@ -72,6 +188,7 @@ fn site_recv(op: &GenericOp) -> Option<(u16, Family)> {
             obj, plain: true, ..
         } => Some((obj, Family::Obj)),
         GenericOp::GetElem { obj, .. } | GenericOp::SetElem { obj, .. } => Some((obj, Family::Arr)),
+        GenericOp::CallKey { recv, .. } => Some((recv, Family::Arr)),
         GenericOp::ArrGet { arr, .. }
         | GenericOp::ArrSet { arr, .. }
         | GenericOp::ArrayLen { arr, .. } => Some((arr, Family::Arr)),
@@ -135,23 +252,18 @@ fn id_of(ids: &mut Vec<(u16, u32)>, next: &mut u32, r: u16) -> u32 {
     *next
 }
 
-/// Plans the receiver cache for `ops` (see the module docs); `osr_entries` and
+/// Plans the receiver cache for `ops` (see the module docs), given the global
+/// binding cache's plan; `osr_entries` and
 /// `catch_targets` are entries besides the ops' own branch targets.
-pub(super) fn plan(ops: &[GenericOp], osr_entries: &[usize], catch_targets: &[usize]) -> RecvPlan {
+pub(super) fn plan(
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    globals: &GlobalPlan,
+    osr_entries: &[usize],
+    catch_targets: &[usize],
+) -> RecvPlan {
     let n = ops.len();
-    let mut target = vec![false; n + 1];
-    for &t in osr_entries.iter().chain(catch_targets) {
-        if t <= n {
-            target[t] = true;
-        }
-    }
-    for op in ops {
-        if let GenericOp::Jump { target: t } | GenericOp::JumpIfFalse { target: t, .. } = *op
-            && t <= n
-        {
-            target[t] = true;
-        }
-    }
+    let target = branch_targets(ops, osr_entries, catch_targets);
     // Value ids: registers holding the same value (by `Move`) share one.
     let mut next_id = 0u32;
     let mut ids: Vec<(u16, u32)> = Vec::new();
@@ -176,7 +288,15 @@ pub(super) fn plan(ops: &[GenericOp], osr_entries: &[usize], catch_targets: &[us
                 live.push((id, i));
             }
         }
-        if ends_knowledge(op) {
+        let inline = matches!(op, GenericOp::Interp { .. } | GenericOp::CallMethod { .. })
+            && match bytecode.get(i) {
+                // A global access without a cache slot calls a helper.
+                Some(Op::LoadGlobal { .. } | Op::StoreGlobal { .. }) => {
+                    globals.site.get(i).copied().flatten().is_some()
+                }
+                _ => usually_inline(bytecode, i),
+            };
+        if ends_knowledge(op) && !inline {
             live.clear();
         }
         match *op {
@@ -191,9 +311,20 @@ pub(super) fn plan(ops: &[GenericOp], osr_entries: &[usize], catch_targets: &[us
                 }
             }
         }
-        if matches!(op, GenericOp::Interp { .. } | GenericOp::PushHandler { .. }) {
-            // It may write any register.
-            ids.clear();
+        match (op, bytecode.get(i)) {
+            (GenericOp::Interp { .. }, Some(Op::LoadGlobal { dst, .. })) => {
+                let d = *dst;
+                ids.retain(|&(x, _)| x != d);
+            }
+            (
+                GenericOp::Interp { .. },
+                Some(Op::StoreGlobal { .. } | Op::RequireObjectCoercible { .. }),
+            ) => {}
+            (GenericOp::Interp { .. } | GenericOp::PushHandler { .. }, _) => {
+                // It may write any register.
+                ids.clear();
+            }
+            _ => {}
         }
     }
     // Ways, least recently used first per family, over the sites that use

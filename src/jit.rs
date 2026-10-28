@@ -2145,6 +2145,40 @@ pub enum GenericOp {
     },
 }
 
+/// How the generic tier computes a one-argument built-in `Math` call inline.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+enum MathInline {
+    /// `sqrtsd`.
+    Sqrt,
+    /// The sign bit cleared.
+    Abs,
+    /// `roundsd` with this rounding-mode immediate (SSE4.1).
+    Round(u8),
+}
+
+/// The built-in id and inline form of a `CallMethod` of one argument whose key
+/// names a `Math` function the generic tier computes inline.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn inline_math(op: &crate::nbvm::Op) -> Option<(u16, MathInline)> {
+    use crate::nbexec::{N_MATH_ABS, N_MATH_CEIL, N_MATH_FLOOR, N_MATH_SQRT, N_MATH_TRUNC};
+    let crate::nbvm::Op::CallMethod { key, args, .. } = op else {
+        return None;
+    };
+    if args.len() != 1 {
+        return None;
+    }
+    let sse41 = has_sse41();
+    Some(match key.as_str() {
+        "sqrt" => (N_MATH_SQRT, MathInline::Sqrt),
+        "abs" => (N_MATH_ABS, MathInline::Abs),
+        "floor" if sse41 => (N_MATH_FLOOR, MathInline::Round(0x09)),
+        "ceil" if sse41 => (N_MATH_CEIL, MathInline::Round(0x0a)),
+        "trunc" if sse41 => (N_MATH_TRUNC, MathInline::Round(0x0b)),
+        _ => return None,
+    })
+}
+
 /// The result of [`lower_nbvm_generic`]: the generic-tier op stream (one per
 /// bytecode op), the per-site property-key strings (owned so the emitted code can
 /// hold stable pointers into them for the inline caches), and the per-call-site
@@ -2669,6 +2703,10 @@ pub struct GenericHelpers {
     /// `jit_helper_math1(ctx, recv, x, op) -> bits | throw sentinel`: a
     /// one-argument built-in `Math.f(x)` call (`numeric`).
     pub math1: JitBinHelper,
+    /// `jit_helper_site_fill(ctx, recv, site, _) -> 0`: records where a
+    /// method site's key is found on `recv` (`MethodSite::fill`), for the
+    /// inline `Math.f(x)` lookup.
+    pub site_fill: JitBinHelper,
 }
 
 /// The runtime-helper ABI for a method call: `(ctx, regs, n_regs, op, cache) ->
@@ -5092,17 +5130,36 @@ impl JitFunction {
         // keeps a receiver's handle bits at `[rbp + rc_key(w)]` and the address
         // of its heap slot, as a full walk proved it live, at
         // `[rbp + rc_cell(w)]`. The prologue and every call empty the keys.
-        let rc = recv_cache::plan(ops, osr_entries, &catch_targets);
+        let gc_plan = recv_cache::plan_globals(ops, bytecode, osr_entries, &catch_targets, |pc| {
+            num.in_region(pc)
+        });
+        let rc = recv_cache::plan(ops, bytecode, &gc_plan, osr_entries, &catch_targets);
         let rc_base = method_scratch - 8 * num.frame_slots() as i32;
         let rc_key = |w: usize| rc_base - 8 * (2 * w as i32 + 1);
         let rc_cell = |w: usize| rc_base - 8 * (2 * w as i32 + 2);
-        let frame =
-            ((16 + max_argc as u32 * 8 + (num.frame_slots() + 2 * rc.ways) as u32 * 8) + 15) & !15;
+        // The global binding cache, under the receiver cache: slot `k` holds
+        // the address `jit_helper_global_ref` validated for its name (a read
+        // or a write binding), emptied by every call like the receiver keys
+        // (the address and its facts hold until Rust code runs).
+        let gc_base = rc_base - 16 * rc.ways as i32;
+        let gc_slot = |k: usize| gc_base - 8 * (k as i32 + 1);
+        let frame = ((16
+            + max_argc as u32 * 8
+            + (num.frame_slots() + 2 * rc.ways + gc_plan.slots) as u32 * 8)
+            + 15)
+            & !15;
         let mut a = X64Assembler::new();
         a.set_rbx_frame(true);
-        a.set_recv_cache_keys((0..rc.ways).map(rc_key).collect());
+        a.set_recv_cache_keys(
+            (0..rc.ways)
+                .map(rc_key)
+                .chain((0..gc_plan.slots).map(gc_slot))
+                .collect(),
+        );
         // The out-of-line full walks: (entry, resume, receiver, miss, way).
         let mut cold_walks: Vec<(Label, Label, u16, Label, usize, recv_cache::Family)> = Vec::new();
+        // The global binding cache's refills: (entry, resume, done, op, slot).
+        let mut cold_globals: Vec<(Label, Label, Label, usize, i32)> = Vec::new();
         // One label per op (any op can be a branch target or an OSR entry) plus
         // one for the end of the stream (a branch to `len` falls off the end).
         let labels: Vec<Label> = (0..=ops.len()).map(|_| a.new_label()).collect();
@@ -5315,6 +5372,33 @@ impl JitFunction {
             Vec::new();
         for (op_idx, op) in ops.iter().enumerate() {
             a.bind(labels[op_idx]);
+            // A global binding read or write through the global binding
+            // cache: the cached address, else (out of line) a fresh one from
+            // `jit_helper_global_ref`, else the interpreter.
+            if let Some(k) = gc_plan.site.get(op_idx).copied().flatten() {
+                let slot = gc_slot(k);
+                let fetch = a.new_label();
+                let back = a.new_label();
+                let done = a.new_label();
+                a.g_load(call_seq::r::RAX, call_seq::r::RBP, slot);
+                a.g_cmp_imm(call_seq::r::RAX, RECV_CACHE_EMPTY);
+                a.je(fetch);
+                a.bind(back);
+                match *bytecode.get(op_idx)? {
+                    crate::nbvm::Op::LoadGlobal { dst, .. } if ok(dst) => {
+                        a.g_load(call_seq::r::RAX, call_seq::r::RAX, 0);
+                        a.store_rax(disp(dst));
+                    }
+                    crate::nbvm::Op::StoreGlobal { src, .. } if ok(src) => {
+                        a.g_load(call_seq::r::RCX, call_seq::r::RBX, disp(src));
+                        a.g_store(call_seq::r::RAX, 0, call_seq::r::RCX);
+                    }
+                    _ => return None,
+                }
+                a.bind(done);
+                cold_globals.push((fetch, back, done, op_idx, slot));
+                continue;
+            }
             if num.emit(&mut a, &labels, throw_exit, op_idx, ops)? {
                 continue;
             }
@@ -5364,6 +5448,72 @@ impl JitFunction {
                     let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
                     let si = sites.get(site as usize)?;
                     let done = a.new_label();
+                    // `Math.f(x)` with the built-in `f`, inline: the site's
+                    // chain cache finds the method, which must be that very
+                    // built-in, and a Number argument is computed in place.
+                    if let Some((native_id, f)) = inline_math(bytecode.get(op_idx)?)
+                        && !si.method_ptr.is_null()
+                    {
+                        let crate::nbvm::Op::CallMethod { args: margs, .. } =
+                            bytecode.get(op_idx)?
+                        else {
+                            return None;
+                        };
+                        let x = margs[0];
+                        if !ok(dst) || !ok(recv) || !ok(x) {
+                            return None;
+                        }
+                        let fill = a.new_label();
+                        let general = a.new_label();
+                        let nan = a.new_label();
+                        a.g_cmp_byte_imm(call_seq::r::R15, helpers.call_layout.hosted, 0);
+                        a.g_jcc(call_seq::cc::E, general); // not hosted: no chain cache
+                        a.p_method_lookup(
+                            &layout,
+                            helpers.call_layout.realm,
+                            (call_seq::r::RBX, disp(recv)),
+                            si.method_ptr,
+                            fill,
+                            None,
+                        );
+                        a.p_is_native(&layout, helpers.call_layout.realm, native_id, general);
+                        a.movabs_r11(QNAN as i64);
+                        a.load_rax(disp(x));
+                        a.and_rax_r11();
+                        a.cmp_rax_r11();
+                        a.je(general); // not a Number: its conversion is the call's
+                        if let MathInline::Abs = f {
+                            // The sign bit cleared (a NaN argument is already
+                            // the canonical one, whose sign is clear).
+                            a.load_rax(disp(x));
+                            a.g_movabs(call_seq::r::R11, i64::MAX as u64);
+                            a.g_and(call_seq::r::RAX, call_seq::r::R11);
+                            a.store_rax(disp(dst));
+                            a.jmp(done);
+                        } else {
+                            a.movsd_xmm0_mem(disp(x));
+                            match f {
+                                MathInline::Round(mode) => a.roundsd_xmm0(mode),
+                                _ => a.sqrtsd_xmm0(),
+                            }
+                            a.ucomisd_xmm0_xmm0();
+                            a.jp(nan);
+                            a.movsd_mem_xmm0(disp(dst));
+                            a.jmp(done);
+                            a.bind(nan);
+                            a.movabs_rax(canonical_nan as i64);
+                            a.store_rax(disp(dst));
+                            a.jmp(done);
+                        }
+                        // A chain-cache miss: refill it from the receiver.
+                        a.bind(fill);
+                        a.mov_rdi_r15();
+                        a.load_argreg(1, disp(recv));
+                        a.movabs_argreg(2, si.method_ptr as i64);
+                        a.movabs_rax(helpers.site_fill as usize as i64);
+                        a.call_rax();
+                        a.bind(general);
+                    }
                     // `Math.f(x)` with the built-in `f` is computed directly.
                     num.math_call(&mut a, op_idx, done);
                     // The native call sequence, when the site has one.
@@ -6068,7 +6218,24 @@ impl JitFunction {
                         return None;
                     }
                     let site_ptr = *call_sites.get(cache as usize)?;
-                    // method = recv[key] (the interpreter's read, once).
+                    // method = recv[key], once: inline for an in-bounds,
+                    // present element of a plain dense array (exactly
+                    // `GetElem`'s fast path), else the interpreter's read.
+                    let read = a.new_label();
+                    let have = a.new_label();
+                    recv_slot!(op_idx, recv, read, recv_cache::Family::Arr);
+                    int_index!(key, read);
+                    a.mov_r8_at_rcx(layout.off_arr_len);
+                    a.cmp_rax_r8();
+                    a.jae(read);
+                    a.mov_r11_at_rcx(layout.off_arr_ptr);
+                    a.mov_rax_at_r11_rax8();
+                    a.movabs_r11(NanBox::hole().to_bits() as i64);
+                    a.cmp_rax_r11();
+                    a.je(read);
+                    a.store_rax(method_scratch);
+                    a.jmp(have);
+                    a.bind(read);
                     a.mov_rdi_r15();
                     a.load_argreg(1, disp(recv));
                     a.load_argreg(2, disp(key));
@@ -6076,6 +6243,7 @@ impl JitFunction {
                     a.call_rax();
                     throw_check!();
                     a.store_rax(method_scratch);
+                    a.bind(have);
                     let slow = a.new_label();
                     let done = a.new_label();
                     call_seq::emit_call(
@@ -6209,6 +6377,24 @@ impl JitFunction {
         // The numeric emitter's out-of-line slow paths (after a `ret`, so no op
         // falls through into them).
         num.finish(&mut a, &labels, throw_exit);
+        // The global binding cache's refills: a validated address is cached
+        // and used, else the interpreter runs the op.
+        for (fetch, back, done, pc, slot) in core::mem::take(&mut cold_globals) {
+            let op_ptr: *const crate::nbvm::Op = bytecode.get(pc)?;
+            let slow = a.new_label();
+            a.bind(fetch);
+            a.mov_rdi_r15();
+            a.movabs_argreg(1, op_ptr as i64);
+            a.movabs_rax(helpers.global_ref as usize as i64);
+            a.call_rax();
+            a.test_rax_rax();
+            a.je(slow);
+            a.g_store(call_seq::r::RBP, slot, call_seq::r::RAX);
+            a.jmp(back);
+            a.bind(slow);
+            exec_op!(pc);
+            a.jmp(done);
+        }
         // The receiver cache's full walks: each refills its way and resumes.
         for (walk, back, recv, miss, w, fam) in core::mem::take(&mut cold_walks) {
             a.bind(walk);

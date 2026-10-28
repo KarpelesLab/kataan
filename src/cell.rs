@@ -503,6 +503,22 @@ pub(crate) fn jit_vm_function_layout() -> (u8, usize, usize) {
     )
 }
 
+/// The `Cell::Native` discriminant byte and the offset of its `u16` id within
+/// the `Cell` (for the generic JIT's built-in identity check).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn jit_native_layout() -> (u8, usize) {
+    let cell = Cell::Native(0x1234);
+    let base = core::ptr::addr_of!(cell) as usize;
+    // SAFETY: `cell` is a live, initialized `Cell`; its repr(u8) tag byte is in
+    // bounds and always a valid `u8`.
+    #[allow(unsafe_code)]
+    let disc = unsafe { *(base as *const u8) };
+    let Cell::Native(id) = &cell else {
+        unreachable!("just built a Cell::Native")
+    };
+    (disc, core::ptr::addr_of!(*id) as usize - base)
+}
+
 /// Derives [`CellLayout`] from real `Cell::Object` and `Cell::Array` instances.
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn jit_cell_layout() -> CellLayout {

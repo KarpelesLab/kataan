@@ -3480,12 +3480,26 @@ fn vm_store_global_fast(ctx: &mut Ctx, name: &str, cache: &StoreGlobalCache, v: 
     let Some(g) = global.as_handle().map(Handle::from_raw) else {
         return true;
     };
-    // `sync_global_var`: the binding is the global scope's own, so the write
-    // is mirrored iff the global object owns `name`. That depends only on its
-    // own keys, so it is cached against the object's key epoch (`length`, which
-    // a String exotic object owns without a key, is always asked afresh).
-    let epoch = ctx.realm.object_key_epoch(g);
-    let owned = match epoch {
+    if global_owns_cached(&ctx.realm, g, name, cache) {
+        ctx.realm.set_property(g, name, v);
+    }
+    true
+}
+
+/// `sync_global_var`'s question for a write to the global scope's own binding
+/// `name`: whether the global object `g` owns `name` (then the write is
+/// mirrored onto it). That depends only on its own keys, so it is cached
+/// against the object's key epoch (`length`, which a String exotic object
+/// owns without a key, is always asked afresh).
+#[inline]
+pub(crate) fn global_owns_cached(
+    realm: &Realm,
+    g: Handle,
+    name: &str,
+    cache: &StoreGlobalCache,
+) -> bool {
+    let epoch = realm.object_key_epoch(g);
+    match epoch {
         Some(e)
             if name != "length"
                 && cache.owned.get() != 0
@@ -3495,7 +3509,7 @@ fn vm_store_global_fast(ctx: &mut Ctx, name: &str, cache: &StoreGlobalCache, v: 
             cache.owned.get() == 2
         }
         _ => {
-            let owned = ctx.realm.has_own(g, name);
+            let owned = realm.has_own(g, name);
             if let Some(e) = epoch {
                 cache.global.set(g.to_raw());
                 cache.epoch.set(e);
@@ -3503,11 +3517,7 @@ fn vm_store_global_fast(ctx: &mut Ctx, name: &str, cache: &StoreGlobalCache, v: 
             }
             owned
         }
-    };
-    if owned {
-        ctx.realm.set_property(g, name, v);
     }
-    true
 }
 
 /// A dynamic-scoping request to the host ([`VmHost::env_op`]): a function that
@@ -5764,6 +5774,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         unwind: jit_tier::jit_helper_unwind,
         global_ref: jit_tier::jit_helper_global_ref,
         math1: jit_tier::jit_helper_math1,
+        site_fill: jit_tier::jit_helper_site_fill,
     }
 }
 

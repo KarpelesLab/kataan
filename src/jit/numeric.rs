@@ -522,6 +522,12 @@ impl NumGen {
         self.n_gslots
     }
 
+    /// Whether op `pc` lies in a promoted loop region (whose code this
+    /// emitter owns).
+    pub(super) fn in_region(&self, pc: usize) -> bool {
+        self.region_of.get(pc).is_some_and(|&r| r != u32::MAX)
+    }
+
     /// Where those frame slots start: slot `k` is at `[rbp + base - 8(k+1)]`.
     pub(super) fn set_frame_base(&mut self, base: i32) {
         self.gbase = base;
