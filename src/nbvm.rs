@@ -5738,6 +5738,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         call_value: jit_tier::jit_helper_call_value,
         method_info: jit_tier::jit_method_info,
         construct: jit_tier::jit_helper_construct,
+        call_this: jit_tier::jit_helper_call_this,
         construct_info: jit_tier::jit_construct_info,
         construct_result: jit_tier::jit_construct_result,
         callee_info: jit_tier::jit_callee_info,

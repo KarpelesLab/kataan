@@ -832,9 +832,11 @@ fn fill_call_site(ctx: &mut Ctx, callee: NanBox, site: &mut CallSite) {
     }
     // The compiled body stays alive for the context's life (`direct` and the
     // JIT cache never drop one), so the raw entry address does too.
-    site.key = u64::from(fid) | ((n_caps as u64) << 32);
-    site.code = code;
-    site.frame_bytes = (proto.n_regs * 8) as u64;
+    site.fill(crate::jit::CallTarget {
+        key: u64::from(fid) | ((n_caps as u64) << 32),
+        code,
+        frame_bytes: (proto.n_regs * 8) as u64,
+    });
 }
 
 /// The call sequence's callee identification (`crate::jit::CalleeHelper`): a VM
@@ -908,13 +910,77 @@ pub(crate) extern "C" fn jit_helper_construct(
                 && let Some(code) = jit.native_entry()
                 && jit.n_regs() == proto.n_regs
             {
-                site.key = u64::from(fid) | ((n_caps as u64) << 32);
-                site.code = code;
-                site.frame_bytes = (proto.n_regs * 8) as u64;
+                site.fill(crate::jit::CallTarget {
+                    key: u64::from(fid) | ((n_caps as u64) << 32),
+                    code,
+                    frame_bytes: (proto.n_regs * 8) as u64,
+                });
             }
         }
     }
     jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
+}
+
+/// `Op::CallKey`'s call half in compiled code (the native sequence's
+/// fallback): the method `recv[key]` was already read (once, by the body);
+/// point the site's cache at it when the sequence can enter it, then call it
+/// with `this` the receiver exactly as `run_frame_at`'s `Op::CallKey` arm does
+/// after its read.
+///
+/// # Safety
+/// As [`jit_helper_call_value`].
+pub(crate) extern "C" fn jit_helper_call_this(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    site: *mut core::ffi::c_void,
+    method: u64,
+) -> u64 {
+    // SAFETY: see the function contract (as `jit_helper_exec_op`).
+    #[allow(unsafe_code)]
+    let (op, ctx, regs, site) = unsafe {
+        (
+            &*op_raw,
+            &mut *(ctx_raw as *mut Ctx),
+            core::slice::from_raw_parts_mut(regs_raw.cast::<NanBox>(), n_regs),
+            &mut *site.cast::<CallSite>(),
+        )
+    };
+    let Op::CallKey {
+        dst, recv, args, ..
+    } = op
+    else {
+        ctx.jit_pending_fault = Some(VmError::Unsupported);
+        return NanBox::jit_throw_bits();
+    };
+    let method = NanBox::from_bits(method);
+    fill_call_site(ctx, method, site);
+    // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    let recv_val = regs[*recv as usize];
+    let argv: alloc::vec::Vec<NanBox> = args.iter().map(|a| regs[*a as usize]).collect();
+    let pub_mark = ctx.frame_shadow.len();
+    ctx.frame_shadow.extend_from_slice(regs);
+    ctx.frames_published += 1;
+    let r = super::call_closure(ctx, funcs, method, &argv, recv_val);
+    ctx.frames_published -= 1;
+    ctx.frame_shadow.truncate(pub_mark);
+    match r {
+        Ok(v) => {
+            regs[*dst as usize] = v;
+            0
+        }
+        Err(e) => {
+            ctx.jit_pending_fault = Some(e);
+            NanBox::jit_throw_bits()
+        }
+    }
 }
 
 /// Whether the native sequence may run `new f()` for function `id`
@@ -965,14 +1031,14 @@ pub(crate) extern "C" fn jit_construct_info(
     };
     // SAFETY: see the function contract.
     #[allow(unsafe_code)]
-    let (ctx, site_key) = unsafe { (&mut *(ctx_raw as *mut Ctx), (*site).key) };
+    let (ctx, site) = unsafe { (&mut *(ctx_raw as *mut Ctx), &*site) };
     let Some(fh) = NanBox::from_bits(ctor).as_handle().map(Handle::from_raw) else {
         return NONE;
     };
     let Some((fid, n_caps)) = ctx.realm.vm_function(fh).map(|(f, c)| (f, c.len())) else {
         return NONE;
     };
-    if u64::from(fid) | ((n_caps as u64) << 32) != site_key {
+    if !site.holds(u64::from(fid) | ((n_caps as u64) << 32)) {
         return NONE;
     }
     // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).

@@ -25,8 +25,8 @@ use alloc::vec::Vec;
 mod call_seq;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use call_seq::{
-    CallLayout, CallSite, CalleeHelper, CalleeInfo, ConstructHelper, ConstructResultHelper,
-    FRAME_HEADER, JitStack, MethodHelper,
+    CallLayout, CallSite, CallTarget, CalleeHelper, CalleeInfo, ConstructHelper,
+    ConstructResultHelper, FRAME_HEADER, JitStack, MethodHelper,
 };
 
 /// `2^53` — the largest magnitude an `f64` represents every integer below
@@ -2061,6 +2061,24 @@ pub enum GenericOp {
         /// The bytecode pc of the op (its slow path).
         pc: u32,
     },
+    /// `Op::CallKey` (`recv[key](args)`): the element read is
+    /// `jit_helper_get_elem` (the interpreter's `vm_get_elem`), then the call
+    /// of the value with `this` the receiver is the native call sequence, or
+    /// `jit_helper_call_this` (the interpreter's call half, refilling the cache).
+    CallKey {
+        /// Destination register.
+        dst: u16,
+        /// The receiver register.
+        recv: u16,
+        /// The key register.
+        key: u16,
+        /// Index into the per-call-site argument-register table.
+        site: u16,
+        /// Index into the per-site call caches.
+        cache: u16,
+        /// The bytecode pc of the op (its slow path).
+        pc: u32,
+    },
     /// `Op::Construct` (`new ctor(args)`): the native call sequence for an
     /// ordinary VM constructor (`call_seq::CalleeSrc::Construct`), else
     /// `jit_helper_construct` (the interpreter's, refilling the cache).
@@ -2288,6 +2306,29 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
             // Filled in on entry (`call_with_inner`, or the native-call entry);
             // the interpreter runs them as no-ops.
             Op::MakeArguments { .. } | Op::LoadNewTarget { .. } => GenericOp::Nop,
+            Op::CallKey {
+                dst,
+                recv,
+                key,
+                args,
+            } if args.len() <= 32 => {
+                let mut argregs: Vec<u16> = Vec::with_capacity(args.len());
+                for a in args {
+                    argregs.push(r(*a)?);
+                }
+                let site = u16::try_from(call_args.len()).ok()?;
+                call_args.push(argregs);
+                let cache = u16::try_from(n_calls).ok()?;
+                n_calls += 1;
+                GenericOp::CallKey {
+                    dst: r(*dst)?,
+                    recv: r(*recv)?,
+                    key: r(*key)?,
+                    site,
+                    cache,
+                    pc: pc32,
+                }
+            }
             Op::Construct { dst, ctor, args } if args.len() <= 32 => {
                 let mut argregs: Vec<u16> = Vec::with_capacity(args.len());
                 for a in args {
@@ -2543,6 +2584,10 @@ pub struct GenericHelpers {
     /// `Op::Construct`'s slow path (`jit_helper_construct(ctx, regs, n_regs,
     /// op, site, _)`): the interpreter's, refilling the site's cache.
     pub construct: JitCallMethodHelper,
+    /// `Op::CallKey`'s call half (`jit_helper_call_this(ctx, regs, n_regs, op,
+    /// site, method)`): call `method` (already read) with `this` the
+    /// receiver, as the interpreter does, refilling the site's cache.
+    pub call_this: JitCallKeyHelper,
     /// A `new`'s callee check and object creation (`jit_construct_info`).
     pub construct_info: ConstructHelper,
     /// A `new`'s result when the body returned a heap value
@@ -2572,6 +2617,18 @@ pub type JitCallMethodHelper = extern "C" fn(
     *const crate::nbvm::Op,
     *mut core::ffi::c_void,
     *mut core::ffi::c_void,
+) -> u64;
+
+/// The runtime-helper ABI for `Op::CallKey`'s call half: `(ctx, regs, n_regs,
+/// op, site, method) -> 0` (or the throw sentinel).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub type JitCallKeyHelper = extern "C" fn(
+    *mut core::ffi::c_void,
+    *mut u64,
+    usize,
+    *const crate::nbvm::Op,
+    *mut core::ffi::c_void,
+    u64,
 ) -> u64;
 
 /// The [`JitUnwindHelper`] result meaning "no handler caught it: propagate".
@@ -4810,6 +4867,7 @@ impl JitFunction {
         let construct_helper = helpers.construct_info as usize as u64;
         let construct_result_helper = helpers.construct_result as usize as u64;
         let construct_slow_helper = helpers.construct as usize as u64;
+        let call_this_helper = helpers.call_this as usize as u64;
         // The catch entries of the body's `try` regions: where the throw exit
         // resumes after `jit_helper_unwind` binds a thrown value.
         let mut catch_targets: Vec<usize> = ops
@@ -5728,6 +5786,62 @@ impl JitFunction {
                     }
                     a.load_rax(disp(src));
                     a.frame_epilogue();
+                }
+                GenericOp::CallKey {
+                    dst,
+                    recv,
+                    key,
+                    site,
+                    cache,
+                    pc,
+                } => {
+                    let args = call_args.get(site as usize)?;
+                    if !ok(dst) || !ok(recv) || !ok(key) || args.iter().any(|&r| !ok(r)) {
+                        return None;
+                    }
+                    if pc as usize != op_idx {
+                        return None;
+                    }
+                    let site_ptr = *call_sites.get(cache as usize)?;
+                    // method = recv[key] (the interpreter's read, once).
+                    a.mov_rdi_r15();
+                    a.load_argreg(1, disp(recv));
+                    a.load_argreg(2, disp(key));
+                    a.movabs_rax(get_elem_helper as i64);
+                    a.call_rax();
+                    throw_check!();
+                    a.store_rax(method_scratch);
+                    let slow = a.new_label();
+                    let done = a.new_label();
+                    call_seq::emit_call(
+                        &mut a,
+                        &call_seq::CallEmit {
+                            dst,
+                            callee: call_seq::CalleeSrc::Frame {
+                                scratch: method_scratch,
+                            },
+                            this: Some(recv),
+                            args,
+                            site: site_ptr,
+                            layout: &helpers.call_layout,
+                            callee_helper,
+                            throw_exit,
+                            slow,
+                            done,
+                        },
+                    )?;
+                    a.bind(slow);
+                    let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
+                    a.mov_rdi_r15();
+                    a.mov_rsi_rbx();
+                    a.movabs_argreg(2, n_regs as i64);
+                    a.movabs_argreg(3, op_ptr as i64);
+                    a.movabs_argreg(4, site_ptr as i64);
+                    a.load_argreg(5, method_scratch);
+                    a.movabs_rax(call_this_helper as i64);
+                    a.call_rax();
+                    throw_check!();
+                    a.bind(done);
                 }
                 GenericOp::Construct {
                     dst,

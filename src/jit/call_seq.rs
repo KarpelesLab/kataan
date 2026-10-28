@@ -92,14 +92,14 @@ pub(crate) const STACK_BASE: i32 = 24;
 /// Words in a native-call header (see [`JitStack::frames`]).
 pub const FRAME_HEADER: usize = 5;
 
-/// A call site's one-entry cache. `#[repr(C)]`: emitted code reads it at the
-/// `SITE_*` offsets. Empty (`key ==` [`CallSite::EMPTY`], which no
-/// [`CalleeInfo`] key equals — not even the not-a-closure `u64::MAX`) until the
-/// site's helper fills it.
+/// One callee a call site has seen. `#[repr(C)]`: emitted code reads it at
+/// the `SITE_*` offsets.
 #[repr(C)]
-#[derive(Debug)]
-pub struct CallSite {
-    /// The callee's [`CalleeInfo::key`]: function id and capture count.
+#[derive(Debug, Clone, Copy)]
+pub struct CallTarget {
+    /// The callee's [`CalleeInfo::key`]: function id and capture count, or
+    /// [`CallSite::EMPTY`] (which no key equals — not even the
+    /// not-a-closure `u64::MAX`).
     pub key: u64,
     /// The callee's native entry address (see `emit_native_entry`).
     pub code: u64,
@@ -107,18 +107,51 @@ pub struct CallSite {
     pub frame_bytes: u64,
 }
 
+/// A call site's cache: up to [`CallSite::WAYS`] callees (a polymorphic site —
+/// `task.run()` over several task classes — keeps each of them), replaced
+/// round-robin. Empty until the site's helper fills it.
+#[repr(C)]
+#[derive(Debug)]
+pub struct CallSite {
+    /// The cached callees.
+    pub targets: [CallTarget; CallSite::WAYS],
+    /// The way the next new callee replaces.
+    pub next: usize,
+}
+
 impl CallSite {
-    /// The key of an empty cache.
+    /// The key of an empty way.
     pub const EMPTY: u64 = u64::MAX - 1;
+    /// Callees a site remembers.
+    pub const WAYS: usize = 4;
 
     /// An empty cache.
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            key: Self::EMPTY,
-            code: 0,
-            frame_bytes: 0,
+            targets: [CallTarget {
+                key: Self::EMPTY,
+                code: 0,
+                frame_bytes: 0,
+            }; Self::WAYS],
+            next: 0,
         }
+    }
+
+    /// Whether the site already holds `key`.
+    #[must_use]
+    pub fn holds(&self, key: u64) -> bool {
+        self.targets.iter().any(|t| t.key == key)
+    }
+
+    /// Remembers `target` (a no-op when its key is already held).
+    pub fn fill(&mut self, target: CallTarget) {
+        if self.holds(target.key) {
+            return;
+        }
+        let way = self.next % Self::WAYS;
+        self.targets[way] = target;
+        self.next = (way + 1) % Self::WAYS;
     }
 }
 
@@ -128,6 +161,8 @@ impl Default for CallSite {
     }
 }
 
+/// [`CallTarget`]'s size.
+const TARGET_BYTES: i32 = 24;
 const SITE_KEY: i32 = 0;
 const SITE_CODE: i32 = 8;
 const SITE_FRAME: i32 = 16;
@@ -181,6 +216,12 @@ pub type ConstructResultHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64)
 
 /// Where a call sequence's callee comes from.
 pub(crate) enum CalleeSrc {
+    /// A value already in the native-frame slot `[rbp + scratch]` (a computed
+    /// method, `Op::CallKey`); identified by the [`CalleeHelper`].
+    Frame {
+        /// The `rbp`-relative slot.
+        scratch: i32,
+    },
     /// A constructor register (`Op::Construct`, `new.target` the constructor
     /// itself), prepared by the [`ConstructHelper`], which leaves the new
     /// object in `[rbp + scratch]` (the call's `this`).
@@ -495,6 +536,13 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     // 1. Which function is the callee? (rax = key, rdx = captures)
     // `load_callee(reg)` reloads its value into `reg` afterwards.
     let (callee_base, callee_disp) = match e.callee {
+        CalleeSrc::Frame { scratch } => {
+            a.g_mov(r::RDI, r::R15);
+            a.g_load(r::RSI, RBP, scratch);
+            a.g_movabs(r::RAX, e.callee_helper);
+            a.call_rax();
+            (RBP, scratch)
+        }
         CalleeSrc::Reg(c) => {
             a.g_mov(r::RDI, r::R15);
             a.g_load(r::RSI, r::RBX, reg(c));
@@ -535,9 +583,18 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             (r::RBX, reg(ctor))
         }
     };
+    // r11 = the matching way.
     a.g_movabs(r::R11, e.site as u64);
-    a.g_cmp_mem(r::RAX, r::R11, SITE_KEY);
-    a.g_jcc(cc::NE, e.slow);
+    let hit = a.new_label();
+    for way in 0..CallSite::WAYS {
+        if way > 0 {
+            a.g_lea(r::R11, r::R11, TARGET_BYTES);
+        }
+        a.g_cmp_mem(r::RAX, r::R11, SITE_KEY);
+        a.g_jcc(cc::E, hit);
+    }
+    a.jmp(e.slow);
+    a.bind(hit);
     a.g_mov(r::R8, r::RDX); // captures, for the callee's entry
     // 2. The caller's window is on the register stack (so it is published),
     //    one realm, and room under both depth limits.
