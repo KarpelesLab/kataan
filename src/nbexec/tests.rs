@@ -12911,3 +12911,34 @@ fn compiled_math_calls_and_global_reads() {
     "#;
     assert_eq!(run(src), "63115.25|3000|100|5509");
 }
+
+/// The generic tier's receiver cache (a property op reusing the heap slot an
+/// earlier one on the same object walked to): reads and writes stay exact
+/// across calls that allocate and collect, `Move` aliases, a `delete` that
+/// turns the object into a dictionary, a freeze, and same-object operands.
+#[test]
+fn compiled_receiver_cache_across_calls_and_mutations() {
+    let src = r#"
+        function mk(i) { return { a: i, b: i * 2, c: [i, i + 1] }; }
+        function churn(n) { let t = []; for (let k = 0; k < n; k++) t.push({ k }); return t.length; }
+        function f(o, p, i) {
+          let s = o.a + o.b;
+          s += churn(40);
+          s += o.a + p.b + o.c[1] + p.c[0];
+          o.b = s & 7; p.a = o.b + 1;
+          const q = o; s += q.a + q.b + q.c.length;
+          if (i % 97 === 0) { delete o.a; s += (o.a === undefined ? 1 : 0) + o.b; }
+          if (i % 89 === 0) { Object.freeze(p); p.b = 5; s += p.b; }
+          o.c[0] = s; s += o.c[0] + p.c.length;
+          return s;
+        }
+        let t = 0, objs = [];
+        for (let i = 0; i < 20000; i++) {
+          const o = mk(i), p = i % 3 ? mk(i + 1) : o;
+          objs.push(o, p); if (objs.length > 60) objs = [];
+          t = (t + f(o, p, i)) | 0;
+        }
+        t
+    "#;
+    assert_eq!(run(src), "-820477392");
+}

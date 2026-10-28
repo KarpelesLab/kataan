@@ -615,7 +615,7 @@ impl X64Assembler {
     /// The inline hit of `Op::InitProp` through its transition cache at
     /// `cache` (a `PropertyCache`): exactly
     /// `Object::init_data_cached`'s cached add, for the object whose heap slot
-    /// is `rcx` (arena base in `r10`, length in `rdx`) and the value at
+    /// is `rcx` and the value at
     /// `[rbx + val_disp]`. It qualifies when the object is an ordinary shaped
     /// one with no `jit_flags`, extensible, neither frozen nor sealed, with no
     /// `extra` part (no accessors, attribute marks or key-order log), whose
@@ -855,8 +855,8 @@ impl X64Assembler {
     /// a non-handle value, or no incremental marking running and either a
     /// young container or a live old target (so no old-to-young edge to
     /// record). Otherwise to `miss`, whose helper store runs the barrier.
-    /// Needs the arena base in `r10` and length in `rdx`; preserves `rcx`,
-    /// clobbers `rax`, `r8`, `r9`, `r11`.
+    /// Loads the arena itself when it needs it; preserves `rcx`, clobbers
+    /// `rax`, `rdx`, `r8`–`r11`.
     pub(crate) fn p_barrier_check(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
         let done = self.new_label();
         let old = crate::gc::OLD_AGE;
@@ -870,6 +870,9 @@ impl X64Assembler {
         self.g_jcc(cc::NE, miss);
         self.g_cmp_byte_imm(r::RCX, l.props.off_slot_age, old);
         self.g_jcc(cc::B, done);
+        // The arena, for the target's slot (`r11` is still the realm).
+        self.g_load(r::R10, r::R11, l.props.heap_ptr);
+        self.g_load(r::RDX, r::R11, l.props.heap_len);
         self.g_mov(r::R9, r::RCX);
         self.p_slot_of(l, miss);
         self.g_cmp_byte_imm(r::RCX, l.props.off_slot_age, old);

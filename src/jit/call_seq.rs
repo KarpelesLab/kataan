@@ -35,6 +35,7 @@ pub(crate) mod r {
     pub(crate) const RCX: u8 = 1;
     pub(crate) const RDX: u8 = 2;
     pub(crate) const RBX: u8 = 3;
+    pub(crate) const RBP: u8 = 5;
     pub(crate) const RSI: u8 = 6;
     pub(crate) const RDI: u8 = 7;
     pub(crate) const R8: u8 = 8;
@@ -351,6 +352,7 @@ impl X64Assembler {
     /// `call qword [base+disp]`.
     pub(crate) fn g_call_mem(&mut self, base: u8, disp: i32) {
         self.g_mem(false, &[0xff], 2, base, disp);
+        self.clear_recv_cache();
     }
 
     /// `mov dst, src`.

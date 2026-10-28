@@ -26,6 +26,8 @@ mod call_seq;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod props;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod recv_cache;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use call_seq::{
     CallLayout, CallSite, CallTarget, CalleeHelper, CalleeInfo, ConstructHelper,
     ConstructResultHelper, FRAME_HEADER, JitStack, MethodHelper,
@@ -3331,7 +3333,18 @@ pub struct X64Assembler {
     /// negative one still addresses the native frame (the call scratch buffer).
     /// Off for the Int/Float tiers, whose register slots are all `rbp`-negative.
     rbx_frame: bool,
+    /// The generic tier's receiver-cache key slots (`[rbp+disp]`, see
+    /// `compile_generic`): each is set to [`RECV_CACHE_EMPTY`] by the frame
+    /// prologue and after every `call` this assembler emits, since Rust code
+    /// (which alone can move, free or retype a heap cell) runs only behind a
+    /// call.
+    recv_cache_keys: Vec<i32>,
 }
+
+/// The value a receiver-cache key slot holds when it caches nothing: the
+/// handle bits of slot index `u32::MAX`, which `Heap::alloc` never hands out,
+/// so no register ever holds them.
+const RECV_CACHE_EMPTY: i32 = -1;
 
 /// A branch target in an [`X64Assembler`], resolved by [`X64Assembler::bind`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3368,6 +3381,22 @@ impl X64Assembler {
             *m = (*m & !7) | 3;
         }
         self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// Sets the receiver-cache key slots (see the `recv_cache_keys` field).
+    pub(crate) fn set_recv_cache_keys(&mut self, keys: Vec<i32>) {
+        self.recv_cache_keys = keys;
+    }
+
+    /// Empties every receiver-cache key slot (after a `call`, in the prologue).
+    fn clear_recv_cache(&mut self) {
+        for i in 0..self.recv_cache_keys.len() {
+            let d = self.recv_cache_keys[i];
+            // mov qword [rbp+d], imm32 (sign-extended)
+            self.code.extend_from_slice(&[0x48, 0xc7, 0x85]);
+            self.code.extend_from_slice(&d.to_le_bytes());
+            self.code.extend_from_slice(&RECV_CACHE_EMPTY.to_le_bytes());
+        }
     }
 
     /// Allocates a fresh, unbound label.
@@ -3875,6 +3904,7 @@ impl X64Assembler {
     /// code address). The System V ABI requires `rsp` 16-byte aligned here.
     pub fn call_rax(&mut self) {
         self.code.extend_from_slice(&[0xff, 0xd0]);
+        self.clear_recv_cache();
     }
 
     /// `mov <argreg[i]>, [rbp+disp]` — load a frame slot into System V integer
@@ -3953,6 +3983,7 @@ impl X64Assembler {
         self.code.push(0x53); // push rbx
         self.code.extend_from_slice(&[0x48, 0x81, 0xec]); // sub rsp, imm32
         self.code.extend_from_slice(&frame.to_le_bytes());
+        self.clear_recv_cache();
     }
 
     /// `lea rsp, [rbp-16]; pop rbx; pop r15; pop rbp; ret` — the frame-ABI
@@ -5057,9 +5088,21 @@ impl JitFunction {
         // Countdown slot + argument buffer + method scratch + the numeric slots,
         // rounded to keep `rsp` 16-byte aligned (after `push rbp; push r15; push
         // rbx`, rsp ≡ 0 mod 16).
-        let frame = ((16 + max_argc as u32 * 8 + num.frame_slots() as u32 * 8) + 15) & !15;
+        // The receiver cache (`recv_cache`), under the numeric slots: way `w`
+        // keeps a receiver's handle bits at `[rbp + rc_key(w)]` and the address
+        // of its heap slot, as a full walk proved it live, at
+        // `[rbp + rc_cell(w)]`. The prologue and every call empty the keys.
+        let rc = recv_cache::plan(ops, osr_entries, &catch_targets);
+        let rc_base = method_scratch - 8 * num.frame_slots() as i32;
+        let rc_key = |w: usize| rc_base - 8 * (2 * w as i32 + 1);
+        let rc_cell = |w: usize| rc_base - 8 * (2 * w as i32 + 2);
+        let frame =
+            ((16 + max_argc as u32 * 8 + (num.frame_slots() + 2 * rc.ways) as u32 * 8) + 15) & !15;
         let mut a = X64Assembler::new();
         a.set_rbx_frame(true);
+        a.set_recv_cache_keys((0..rc.ways).map(rc_key).collect());
+        // The out-of-line full walks: (entry, resume, receiver, miss, way).
+        let mut cold_walks: Vec<(Label, Label, u16, Label, usize, recv_cache::Family)> = Vec::new();
         // One label per op (any op can be a branch target or an OSR entry) plus
         // one for the end of the stream (a branch to `len` falls off the end).
         let labels: Vec<Label> = (0..=ops.len()).map(|_| a.new_label()).collect();
@@ -5178,6 +5221,76 @@ impl JitFunction {
                 a.jne($miss);
                 a.cmp_word_at_rcx_r8w(layout.off_slot_gen);
                 a.jne($miss);
+            }};
+        }
+        // What a receiver of family `$fam` must be beyond a live slot (the
+        // checks a receiver-cache fill proves): for `Obj` an ordinary shaped
+        // object without the host-exotic flag, for `Arr` an array without
+        // side-table state. Else to `$miss`.
+        macro_rules! family_checks {
+            ($fam:expr, $miss:expr) => {{
+                match $fam {
+                    recv_cache::Family::Obj => {
+                        a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_object_disc);
+                        a.jne($miss);
+                        a.cmp_byte_at_rcx_imm(layout.off_od_tag, layout.obj_shaped_disc);
+                        a.jne($miss);
+                        a.p_test_byte_imm(
+                            call_seq::r::RCX,
+                            layout.props.off_jit_flags,
+                            props::FLAG_EXOTIC,
+                        );
+                        a.jne($miss);
+                    }
+                    recv_cache::Family::Arr => {
+                        a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
+                        a.jne($miss);
+                        a.p_array_plain(&layout, helpers.call_layout.realm, false, $miss);
+                    }
+                }
+            }};
+        }
+        // `rcx = &Slot` of the receiver in `$recv` — a live, occupied slot of
+        // its generation, passing `family_checks!($fam)` — for op `$at`, else
+        // to `$miss`: through the receiver cache when its plan says so (a hit
+        // takes the way's address; a miss walks out of line and refills it),
+        // else the full walk (then recorded in the way when a later op may
+        // reuse it). Clobbers `rax`, `rdx`, `r8`, `r10`, `r11`; leaves no
+        // arena in `r10`/`rdx`.
+        macro_rules! recv_slot {
+            ($at:expr, $recv:expr, $miss:expr, $fam:expr) => {{
+                // A way holds one family's fills only (or a hit would skip
+                // checks its fill never made).
+                if rc.sites[$at].is_some_and(|p| p.family != $fam) {
+                    return None;
+                }
+                match rc.sites[$at] {
+                    Some(recv_cache::SitePlan {
+                        way, check: true, ..
+                    }) => {
+                        let walk = a.new_label();
+                        let back = a.new_label();
+                        a.load_rax(disp($recv));
+                        a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, rc_key(way));
+                        a.jne(walk);
+                        a.g_load(call_seq::r::RCX, call_seq::r::RBP, rc_cell(way));
+                        a.bind(back);
+                        cold_walks.push((walk, back, $recv, $miss, way, $fam));
+                    }
+                    plan => {
+                        a.p_load_arena(helpers.call_layout.realm, &layout.props);
+                        walk_to_slot!($recv, $miss);
+                        family_checks!($fam, $miss);
+                        if let Some(recv_cache::SitePlan {
+                            way, fill: true, ..
+                        }) = plan
+                        {
+                            a.g_load(call_seq::r::R11, call_seq::r::RBX, disp($recv));
+                            a.g_store(call_seq::r::RBP, rc_key(way), call_seq::r::R11);
+                            a.g_store(call_seq::r::RBP, rc_cell(way), call_seq::r::RCX);
+                        }
+                    }
+                }
             }};
         }
         // An exact non-negative integer index in `reg` → `rax`, else `$miss`.
@@ -5310,8 +5423,7 @@ impl JitFunction {
                     if plain {
                         // ===== inline transition-cache add (see
                         // `p_init_prop_inline`) =====
-                        a.p_load_arena(helpers.call_layout.realm, &layout.props);
-                        walk_to_slot!(obj, helper);
+                        recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj);
                         a.p_init_prop_inline(
                             &layout,
                             helpers.call_layout.realm,
@@ -5406,11 +5518,7 @@ impl JitFunction {
                     }
                     let slow = a.new_label();
                     let done = a.new_label();
-                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
-                    walk_to_slot!(arr, slow);
-                    a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
-                    a.jne(slow);
-                    a.p_array_plain(&layout, helpers.call_layout.realm, false, slow);
+                    recv_slot!(op_idx, arr, slow, recv_cache::Family::Arr);
                     int_index!(index, slow);
                     a.mov_r8_at_rcx(layout.off_arr_len);
                     a.cmp_rax_r8();
@@ -5442,10 +5550,7 @@ impl JitFunction {
                     a.and_rax_r11();
                     a.cmp_rax_r11();
                     a.je(slow); // a handle value needs the write barrier
-                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
-                    walk_to_slot!(arr, slow);
-                    a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
-                    a.jne(slow);
+                    recv_slot!(op_idx, arr, slow, recv_cache::Family::Arr);
                     a.p_array_plain(&layout, helpers.call_layout.realm, true, slow);
                     int_index!(index, slow);
                     a.mov_r8_at_rcx(layout.off_arr_len);
@@ -5527,28 +5632,16 @@ impl JitFunction {
                     // arms/updates the IC and handles accessors, prototype walks,
                     // misses and throws. No allocation and no call: the arena
                     // base is read from the realm, so it is GC- and realloc-safe.
-                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
-                    walk_to_slot!(obj, helper);
-                    a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_object_disc);
-                    a.jne(helper);
-                    a.cmp_byte_at_rcx_imm(layout.off_od_tag, layout.obj_shaped_disc);
-                    a.jne(helper);
-                    // A host-exotic object's reads are the host's.
-                    a.p_test_byte_imm(
-                        call_seq::r::RCX,
-                        layout.props.off_jit_flags,
-                        props::FLAG_EXOTIC,
-                    );
-                    a.jne(helper);
+                    // (A host-exotic object's reads are the host's.)
+                    recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj);
                     a.mov_rax_at_rcx(layout.off_shape);
                     a.movabs_r11(s.cache_ptr as i64); // r11 = &PropertyCache
                     a.cmp_rax_at_r11(layout.cache_shape_off);
                     a.jne(helper);
                     a.mov_eax_at_r11(layout.cache_slot_off);
+                    a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
                     a.p_obj_slot_addr(&layout, call_seq::r::R11, helper);
                     a.g_load(call_seq::r::RAX, call_seq::r::R11, 0); // rax = NanBox at slot
-                    a.movabs_r11(s.cache_ptr as i64);
-                    a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
                     a.store_rax(disp(dst));
                     a.jmp(done);
                     // The miss path is out of line (see `cold_gets`).
@@ -5573,12 +5666,7 @@ impl JitFunction {
                     // write barrier (see `p_barrier_check`) and the object is not
                     // frozen with an empty `readonly` list (`Object::cached_set`'s
                     // success precondition). Everything else → the helper.
-                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
-                    walk_to_slot!(obj, helper);
-                    a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_object_disc);
-                    a.jne(helper);
-                    a.cmp_byte_at_rcx_imm(layout.off_od_tag, layout.obj_shaped_disc);
-                    a.jne(helper);
+                    recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj);
                     a.cmp_byte_at_rcx_imm(layout.off_frozen, 0);
                     a.jne(helper);
                     // A host-exotic, global or tracked-prototype object's writes
@@ -5597,11 +5685,10 @@ impl JitFunction {
                     a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
                     a.movabs_r11(s.cache_ptr as i64);
                     a.mov_eax_at_r11(layout.cache_slot_off);
+                    a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
                     a.p_obj_slot_addr(&layout, call_seq::r::R11, helper);
                     a.load_rdx(disp(val));
                     a.g_store(call_seq::r::R11, 0, call_seq::r::RDX); // slots[slot] = val
-                    a.movabs_r11(s.cache_ptr as i64);
-                    a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
                     a.jmp(done);
                     a.bind(helper);
                     // ===== inline add-cache hit (`p_add_prop_inline`): the
@@ -5644,11 +5731,7 @@ impl JitFunction {
                     // integer in `[0, dense_len)`, and — matching the interpreter's
                     // `vm_array_index_get` — bail on a hole (the helper walks the
                     // prototype chain). Everything else → `jit_helper_get_elem`.
-                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
-                    walk_to_slot!(obj, helper);
-                    a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
-                    a.jne(helper);
-                    a.p_array_plain(&layout, helpers.call_layout.realm, false, helper);
+                    recv_slot!(op_idx, obj, helper, recv_cache::Family::Arr);
                     int_index!(index, helper);
                     a.mov_r8_at_rcx(layout.off_arr_len);
                     a.cmp_rax_r8();
@@ -5688,10 +5771,7 @@ impl JitFunction {
                     // an array without side-table state (`p_array_plain`: not
                     // frozen/sealed, no per-index override, within
                     // `max_array_len`), and an in-bounds exact integer index.
-                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
-                    walk_to_slot!(obj, helper);
-                    a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
-                    a.jne(helper);
+                    recv_slot!(op_idx, obj, helper, recv_cache::Family::Arr);
                     a.p_array_plain(&layout, helpers.call_layout.realm, true, helper);
                     a.load_rax(disp(val));
                     a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
@@ -5729,11 +5809,7 @@ impl JitFunction {
                     // ===== inline dense-array `.length` fast path =====
                     // Only for a receiver whose spec `.length` provably equals the
                     // dense element count (`p_array_plain`); else the helper.
-                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
-                    walk_to_slot!(arr, helper);
-                    a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
-                    a.jne(helper);
-                    a.p_array_plain(&layout, helpers.call_layout.realm, false, helper);
+                    recv_slot!(op_idx, arr, helper, recv_cache::Family::Arr);
                     a.mov_rax_at_rcx(layout.off_arr_len);
                     a.cvtsi2sd_xmm0_rax();
                     a.movsd_mem_xmm0(disp(dst));
@@ -6133,6 +6209,17 @@ impl JitFunction {
         // The numeric emitter's out-of-line slow paths (after a `ret`, so no op
         // falls through into them).
         num.finish(&mut a, &labels, throw_exit);
+        // The receiver cache's full walks: each refills its way and resumes.
+        for (walk, back, recv, miss, w, fam) in core::mem::take(&mut cold_walks) {
+            a.bind(walk);
+            a.p_load_arena(helpers.call_layout.realm, &layout.props);
+            walk_to_slot!(recv, miss);
+            family_checks!(fam, miss);
+            a.g_load(call_seq::r::R11, call_seq::r::RBX, disp(recv));
+            a.g_store(call_seq::r::RBP, rc_key(w), call_seq::r::R11);
+            a.g_store(call_seq::r::RBP, rc_cell(w), call_seq::r::RCX);
+            a.jmp(back);
+        }
         // The `GetProp` miss paths: the inherited data property or getter,
         // else the helper; each returns to its op's `done`.
         for (helper, done, dst, obj, method_ptr, call_site) in core::mem::take(&mut cold_gets) {

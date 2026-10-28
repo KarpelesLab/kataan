@@ -342,7 +342,12 @@ impl<T> Heap<T> {
             };
             Handle { index, generation }
         } else {
-            let index = self.slots.len() as u32;
+            // Slot index `u32::MAX` is never handed out: its handle bits are
+            // the JIT's empty receiver-cache key (`jit::RECV_CACHE_EMPTY`).
+            let index = u32::try_from(self.slots.len())
+                .ok()
+                .filter(|&i| i != u32::MAX)
+                .expect("heap slot space exhausted");
             self.slots.push(Slot::Occupied {
                 generation: 0,
                 age: 0,
