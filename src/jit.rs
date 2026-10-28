@@ -2578,6 +2578,7 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
 /// No other code reads a register by number: an op names every register it
 /// touches (the verifier's operand list), and a catch binding is named by its
 /// `PushHandler`.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 fn drop_dead_stores(
     ops: &mut [GenericOp],
     bytecode: &[crate::nbvm::Op],
@@ -3633,6 +3634,10 @@ pub struct X64Assembler {
     /// (`numeric`): the SSE registers every `call` stores to the register
     /// file first (when the flag is set) and reloads after, as `(xmm,
     /// register-file displacement, store)`.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     call_spill: Vec<(u8, i32, bool)>,
 }
 
@@ -3679,23 +3684,39 @@ impl X64Assembler {
     }
 
     /// Sets the receiver-cache key slots (see the `recv_cache_keys` field).
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(crate) fn set_recv_cache_keys(&mut self, keys: Vec<i32>) {
         self.recv_cache_keys = keys;
     }
 
     /// Sets the promoted registers every `call` brackets (see the
     /// `call_spill` field).
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(crate) fn set_call_spill(&mut self, spill: Vec<(u8, i32, bool)>) {
         self.call_spill = spill;
     }
 
     /// The promoted registers every `call` currently brackets.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(crate) fn call_spill_now(&self) -> Vec<(u8, i32, bool)> {
         self.call_spill.clone()
     }
 
     /// Sets the slots only the frame prologue empties (see the `entry_clear`
     /// field).
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(crate) fn set_entry_clear(&mut self, slots: Vec<i32>) {
         self.entry_clear = slots;
     }
@@ -4246,9 +4267,11 @@ impl X64Assembler {
     /// `call rax` — an indirect native call through `rax` (holding the callee's
     /// code address). The System V ABI requires `rsp` 16-byte aligned here.
     pub fn call_rax(&mut self) {
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         self.spill_before_call();
         self.code.extend_from_slice(&[0xff, 0xd0]);
         self.clear_recv_cache();
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         self.reload_after_call();
     }
 
@@ -4519,7 +4542,10 @@ impl X64Assembler {
         self.cmp_rax_r11();
         self.je(set0);
         // `null`/`undefined`, an ordinary object or a VM function, inline.
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         self.p_truthy_heap(realm_off, set1, set0);
+        #[cfg(not(all(feature = "alloc", target_os = "linux", target_arch = "x86_64")))]
+        let _ = realm_off;
         // otherwise: jit_helper_truthy(ctx, v) → 0/1 (runs ToBoolean; never throws).
         self.mov_rdi_r15();
         self.load_argreg(1, disp);
@@ -7503,10 +7529,10 @@ pub enum BinOp {
     Mul,
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod numeric;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod exec {
     //! W^X executable memory, mapped via direct Linux x86-64 syscalls (no libc).
 

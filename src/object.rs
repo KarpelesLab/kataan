@@ -172,6 +172,10 @@ pub(crate) fn bump_proto_epoch() {
 /// The address of [`PROTO_EPOCH`], which compiled code reads with a plain
 /// load (an `AtomicU64` has `u64`'s layout).
 #[must_use]
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 pub(crate) fn proto_epoch_addr() -> usize {
     PROTO_EPOCH.as_ptr() as usize
 }

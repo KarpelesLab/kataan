@@ -3969,6 +3969,10 @@ impl core::fmt::Debug for TierSlot {
 
 impl TierSlot {
     /// Whether the function tiered up (has an optimized body).
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     fn has_body(&self) -> bool {
         self.0.try_borrow().is_ok_and(|t| t.body.is_some())
     }
@@ -17535,7 +17539,43 @@ impl Compiler {
         r
     }
 
+    /// Compiles an expression. A left-nested chain of ordinary binary operators
+    /// (`1+1+…+1`, as the parser's precedence loop builds it) is walked here
+    /// iteratively, emitting exactly what [`expr_any`](Self::expr_any)'s
+    /// recursion would; everything else goes to `expr_any`. Its frame is large
+    /// (one `match` over every expression kind), so recursing through it once per
+    /// operator overflows the stack on long chains in unoptimized builds.
     fn expr(&mut self, expr: &Expr) -> Result<Reg, CompileError> {
+        fn spine_op(e: &Expr) -> Option<(BinaryOp, &Expr, &Expr)> {
+            match e {
+                Expr::Binary {
+                    op, left, right, ..
+                } if !matches!(op, BinaryOp::In | BinaryOp::Instanceof) => {
+                    Some((*op, &**left, &**right))
+                }
+                _ => None,
+            }
+        }
+        if spine_op(expr).is_none() {
+            return self.expr_any(expr);
+        }
+        let mut rights: Vec<(BinaryOp, &Expr)> = Vec::new();
+        let mut leftmost = expr;
+        while let Some((op, left, right)) = spine_op(leftmost) {
+            rights.push((op, right));
+            leftmost = left;
+        }
+        let mut a = self.expr_any(leftmost)?;
+        for (op, right) in rights.into_iter().rev() {
+            let pinned = self.pin_operand(a, may_assign(right));
+            let b = self.expr(right)?;
+            a = self.emit_binop(op, pinned, b)?;
+        }
+        Ok(a)
+    }
+
+    #[inline(never)]
+    fn expr_any(&mut self, expr: &Expr) -> Result<Reg, CompileError> {
         match expr {
             // `import(…)`, `import.defer/source(…)`, `import.meta` (the parser
             // spells them through the reserved name `import`).

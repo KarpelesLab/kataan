@@ -1288,6 +1288,10 @@ impl Realm {
     /// data properties. `false` for any other cell.
     #[must_use]
     #[cfg(test)]
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(crate) fn array_is_side_free(&self, handle: Handle) -> bool {
         matches!(self.heap.get(handle), Some(Cell::Array(a)) if !a.has_side_state())
     }
