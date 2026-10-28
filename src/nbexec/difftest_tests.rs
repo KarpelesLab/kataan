@@ -442,3 +442,19 @@ fn hypot_scales_huge_and_tiny_arguments() {
         "1.414213562373095e+200,5e-200,5,0,Infinity|1.414213562373095e+200,5e-200,5,0,Infinity"
     );
 }
+
+/// `Object.entries` / `Object.values` on a Proxy ask its
+/// `getOwnPropertyDescriptor` trap for each key even when it has no `ownKeys`
+/// trap (the trapless path skipped `[[GetOwnProperty]]` altogether).
+#[test]
+fn entries_values_ask_gopd_without_own_keys_trap() {
+    let src = r#"
+        var log = [];
+        var p = new Proxy({ a: 1, b: 2 }, {
+            getOwnPropertyDescriptor(t, k) { log.push(k); return Reflect.getOwnPropertyDescriptor(t, k); },
+        });
+        var r = [JSON.stringify(Object.entries(p)), log.splice(0).join(), Object.values(p).join(), log.join()];
+        r.join("|")
+    "#;
+    assert_eq!(run(src), r#"[["a",1],["b",2]]|a,b|1,2|a,b"#);
+}

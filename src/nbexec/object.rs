@@ -2054,9 +2054,11 @@ impl Interp {
         if self.realm.proxy_at(proxy).is_none() {
             return Ok(None);
         }
-        let Some(keys) = self.proxy_own_keys_raw(proxy)? else {
-            return Ok(None);
-        };
+        // `[[OwnPropertyKeys]]`: the `ownKeys` trap, or (trapless) the target's
+        // keys. Either way each key's `[[GetOwnProperty]]` below goes through the
+        // proxy, so a `getOwnPropertyDescriptor` trap fires even without an
+        // `ownKeys` trap.
+        let keys = self.own_property_keys_values(proxy)?;
         let mut out = Vec::new();
         for k in keys {
             // Only String keys participate (symbols are skipped).
