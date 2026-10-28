@@ -1571,8 +1571,16 @@ fn vm_iter_step(
     if regs[done as usize].as_boolean() == Some(true) {
         return Ok(None);
     }
-    regs[done as usize] = NanBox::boolean(true);
     let (it, nx) = (regs[iter as usize], regs[next as usize]);
+    // A built-in Map/Set (or snapshot) iterator with the shared built-in
+    // `next`: its step needs only the realm, and no result object.
+    if let Some(step) = crate::nbexec::realm_builtin_iter_step(&mut ctx.realm, nx, it) {
+        if step.is_none() {
+            regs[done as usize] = NanBox::boolean(true);
+        }
+        return Ok(step);
+    }
+    regs[done as usize] = NanBox::boolean(true);
     match with_host(ctx, |h| h.iter_step(it, nx)) {
         Some(Ok(Some(v))) => {
             regs[done as usize] = NanBox::boolean(false);

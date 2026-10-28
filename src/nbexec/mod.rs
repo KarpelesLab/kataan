@@ -2751,6 +2751,7 @@ mod generator;
 mod intl_aliases;
 mod intl_fmt;
 mod iterator;
+pub(crate) use iterator::realm_builtin_iter_step;
 mod json;
 mod method_dispatch;
 #[cfg(all(feature = "module", feature = "std"))]

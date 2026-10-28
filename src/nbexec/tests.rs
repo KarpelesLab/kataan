@@ -12409,6 +12409,29 @@ fn vm_by_index_array_iteration_is_unobservable() {
 }
 
 #[test]
+fn vm_steps_builtin_collection_iterators_live() {
+    // The VM steps a built-in Map/Set/snapshot iterator itself; live mutation,
+    // fresh entry arrays, early exit and a replaced `next` behave as before.
+    let src = r#"
+        var out = [];
+        var m = new Map([[1, "a"], [2, "b"], [3, "c"]]);
+        for (var [k, v] of m) { out.push(k + v); if (k === 1) { m.delete(2); m.set(4, "d"); } }
+        var s = new Set([1, 2, 3]);
+        for (var x of s) { out.push(x); if (x === 1) { s.clear(); s.add(9); } }
+        out.push([...new Set("hello")].join(""), [..."hé!"].join("|"));
+        var it = m.values(); for (var v of it) { out.push(v); break; }
+        out.push(it.next().value);
+        var SIP = Object.getPrototypeOf(new Set().values());
+        var old = SIP.next; SIP.next = function () { out.push("mine"); return { done: true }; };
+        for (var x of new Set([1])) out.push(x);
+        SIP.next = old;
+        var [a, ...rest] = new Set([5, 6, 7]); out.push(a, rest.join("+"));
+        out.join(" ")
+    "#;
+    assert_eq!(run(src), "1a 3c 4d 1 9 helo h|\u{e9}|! a c mine 5 6+7");
+}
+
+#[test]
 fn vm_math_fast_path_honours_replacement() {
     let src = r#"
         var out = [Math.sqrt(16), Math.max(-0, 0), 1 / Math.min(0, -0), Math.round(-0.4),

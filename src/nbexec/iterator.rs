@@ -290,35 +290,7 @@ impl Interp {
         else {
             return Err(self.type_error("Generator.prototype.next called on a non-generator"));
         };
-        let idx = self
-            .realm
-            .get_property(h, GEN_IDX)
-            .and_then(|n| n.as_number())
-            .unwrap_or(0.0) as usize;
-        // Read the one element, never a copy of the whole buffer: cloning it
-        // per step made every built-in iterator O(n) per `next()`, so driving one
-        // to completion was O(n²) (`Array.from("x".repeat(80000))` took 891 ms
-        // against node's ~0, while the eager `[...s]` path was 3 ms).
-        let len = self.realm.array_length(buf).unwrap_or(0);
-        let (value, done) = match (idx < len).then(|| self.realm.get_element(buf, idx)) {
-            Some(v) => {
-                self.realm
-                    .set_hidden_property(h, GEN_IDX, NanBox::number((idx + 1) as f64));
-                (v, false)
-            }
-            None => {
-                let v = if idx == len {
-                    self.realm
-                        .set_hidden_property(h, GEN_IDX, NanBox::number((idx + 1) as f64));
-                    self.realm
-                        .get_property(h, GEN_RET)
-                        .unwrap_or(NanBox::undefined())
-                } else {
-                    NanBox::undefined()
-                };
-                (v, true)
-            }
-        };
+        let (value, done) = buffer_iter_step(&mut self.realm, h, buf);
         Ok(self.iter_result(value, done))
     }
 
@@ -332,54 +304,10 @@ impl Interp {
         h: Handle,
         coll: Handle,
     ) -> Result<NanBox, ExecError> {
-        // Once detached (exhausted), stay done regardless of later mutation.
-        if self.realm.get_property(h, GEN_DONE).is_some() {
-            return Ok(self.iter_result(NanBox::undefined(), true));
-        }
-        let kind = self
-            .realm
-            .get_property(h, GEN_KIND)
-            .and_then(|n| n.as_number())
-            .unwrap_or(0.0) as u8;
-        let is_set = self.realm.collection_is_set(coll) == Some(true);
-        // The cursor is the raw position of the next entry to consider: entries
-        // are deleted in place (tombstones), so it only needs rebasing after a
-        // compaction renumbered them.
-        let num = |realm: &crate::realm::Realm, slot: &str| {
-            realm
-                .get_property(h, slot)
-                .and_then(|n| n.as_number())
-                .unwrap_or(0.0)
-        };
-        let idx = num(&self.realm, GEN_IDX) as usize;
-        let epoch = num(&self.realm, GEN_EPOCH) as u32;
-        let last = self.realm.get_property(h, GEN_LASTKEY);
-        let (idx, now) = self.realm.collection_iter_rebase(coll, idx, epoch, last);
-        if now != epoch {
-            self.realm
-                .set_hidden_property(h, GEN_EPOCH, NanBox::number(f64::from(now)));
-        }
-        let Some((pos, k, v)) = self.realm.collection_next_live(coll, idx) else {
-            self.realm
-                .set_hidden_property(h, GEN_DONE, NanBox::boolean(true));
-            self.realm.collection_iter_detach(coll);
-            return Ok(self.iter_result(NanBox::undefined(), true));
-        };
-        self.realm.set_hidden_property(h, GEN_LASTKEY, k);
-        self.realm
-            .set_hidden_property(h, GEN_IDX, NanBox::number((pos + 1) as f64));
-        let value = match kind {
-            0 => k,                        // keys
-            2 => self.new_iter_pair(k, v), // entries: [key, value]
-            _ => {
-                if is_set {
-                    k
-                } else {
-                    v
-                }
-            } // values (a Set yields its element)
-        };
-        Ok(self.iter_result(value, false))
+        Ok(match collection_iter_step(&mut self.realm, h, coll) {
+            Some(v) => self.iter_result(v, false),
+            None => self.iter_result(NanBox::undefined(), true),
+        })
     }
 
     /// A fresh 2-element `[key, value]` array for a Map/Set `entries()` result.
@@ -2907,4 +2835,120 @@ impl Interp {
         }
         Ok(())
     }
+}
+
+/// One step of a **live** Set/Map iterator `h` over `coll` (the body of its
+/// `next()` without the result object): the value, or `None` once done.
+fn collection_iter_step(realm: &mut Realm, h: Handle, coll: Handle) -> Option<NanBox> {
+    // Once detached (exhausted), stay done regardless of later mutation.
+    if realm.get_property(h, GEN_DONE).is_some() {
+        return None;
+    }
+    let kind = realm
+        .get_property(h, GEN_KIND)
+        .and_then(|n| n.as_number())
+        .unwrap_or(0.0) as u8;
+    let is_set = realm.collection_is_set(coll) == Some(true);
+    // The cursor is the raw position of the next entry to consider: entries
+    // are deleted in place (tombstones), so it only needs rebasing after a
+    // compaction renumbered them.
+    let num = |realm: &Realm, slot: &str| {
+        realm
+            .get_property(h, slot)
+            .and_then(|n| n.as_number())
+            .unwrap_or(0.0)
+    };
+    let idx = num(realm, GEN_IDX) as usize;
+    let epoch = num(realm, GEN_EPOCH) as u32;
+    let last = realm.get_property(h, GEN_LASTKEY);
+    let (idx, now) = realm.collection_iter_rebase(coll, idx, epoch, last);
+    if now != epoch {
+        realm.set_hidden_property(h, GEN_EPOCH, NanBox::number(f64::from(now)));
+    }
+    let Some((pos, k, v)) = realm.collection_next_live(coll, idx) else {
+        realm.set_hidden_property(h, GEN_DONE, NanBox::boolean(true));
+        realm.collection_iter_detach(coll);
+        return None;
+    };
+    realm.set_hidden_property(h, GEN_LASTKEY, k);
+    realm.set_hidden_property(h, GEN_IDX, NanBox::number((pos + 1) as f64));
+    Some(match kind {
+        0 => k,                                                           // keys
+        2 => NanBox::handle(realm.new_array(alloc::vec![k, v]).to_raw()), // entries: [key, value]
+        _ if is_set => k, // values (a Set yields its element)
+        _ => v,
+    })
+}
+
+/// One step of a snapshot-buffer iterator `h` over `buf` (a built-in
+/// iterator made by `make_builtin_iterator`, or an eager generator): the value
+/// and whether it is done, surfacing the `return` value once at the end.
+fn buffer_iter_step(realm: &mut Realm, h: Handle, buf: Handle) -> (NanBox, bool) {
+    let idx = realm
+        .get_property(h, GEN_IDX)
+        .and_then(|n| n.as_number())
+        .unwrap_or(0.0) as usize;
+    // Read the one element, never a copy of the whole buffer: cloning it
+    // per step made every built-in iterator O(n) per `next()`, so driving one
+    // to completion was O(n²) (`Array.from("x".repeat(80000))` took 891 ms
+    // against node's ~0, while the eager `[...s]` path was 3 ms).
+    let len = realm.array_length(buf).unwrap_or(0);
+    match (idx < len).then(|| realm.get_element(buf, idx)) {
+        Some(v) => {
+            realm.set_hidden_property(h, GEN_IDX, NanBox::number((idx + 1) as f64));
+            (v, false)
+        }
+        None => {
+            let v = if idx == len {
+                realm.set_hidden_property(h, GEN_IDX, NanBox::number((idx + 1) as f64));
+                realm
+                    .get_property(h, GEN_RET)
+                    .unwrap_or(NanBox::undefined())
+            } else {
+                NanBox::undefined()
+            };
+            (v, true)
+        }
+    }
+}
+
+/// `next()` of the built-in iterator `it` when its next method is the shared
+/// `%XIteratorPrototype%.next` native ([`Interp::gen_iter_next`]) and the step
+/// needs only the realm — a live Set/Map iterator or a snapshot buffer — as the
+/// bytecode VM's `IteratorStep` without the `{ value, done }` object:
+/// `Some(Some(value))`, `Some(None)` once done, or `None` when the step needs
+/// the interpreter (any other kind of iterator).
+pub(crate) fn realm_builtin_iter_step(
+    realm: &mut Realm,
+    next: NanBox,
+    it: NanBox,
+) -> Option<Option<NanBox>> {
+    let nh = Handle::from_raw(next.as_handle()?);
+    if realm.native_at(nh) != Some(N_GEN_ITER_NEXT) {
+        return None;
+    }
+    let h = Handle::from_raw(it.as_handle()?);
+    if !realm.is_ordinary_get_cell(h) {
+        return None;
+    }
+    // The same dispatch order as `gen_iter_next`.
+    if let Some(coll) = realm
+        .get_property(h, GEN_COLL)
+        .and_then(|v| v.as_handle())
+        .map(Handle::from_raw)
+    {
+        return Some(collection_iter_step(realm, h, coll));
+    }
+    if realm.get_property(h, GEN_TA).is_some()
+        || realm.get_property(h, GEN_ARR).is_some()
+        || realm.get_property(h, RSI_MATCHER).is_some()
+    {
+        return None;
+    }
+    let buf = realm
+        .get_property(h, GEN_BUF)
+        .and_then(|b| b.as_handle())
+        .map(Handle::from_raw)?;
+    let (v, done) = buffer_iter_step(realm, h, buf);
+    Some((!done).then_some(v))
 }
