@@ -414,3 +414,16 @@ fn integer_conversions_wrap_past_two_to_the_63() {
     "#;
     assert_eq!(run(src), "0,20480,0,32,17,102400,2,20480,3,0,20480");
 }
+
+/// `splice()` / `toSpliced()` with no arguments at all remove nothing (a
+/// missing `start` makes the delete count 0), while a lone `start`, even an
+/// explicit `undefined`, removes through the end. Both removed everything.
+#[test]
+fn splice_without_start_removes_nothing() {
+    let src = r#"
+        var a = [1, 2, 3], h = [1, , 3];
+        [a.splice().length, a.length, [1, 2].toSpliced().join(), h.toSpliced().length,
+         a.splice(undefined).length, a.length, [1, 2, 3].toSpliced(1).join()].join("|")
+    "#;
+    assert_eq!(run(src), "0|3|1,2|3|3|0|1");
+}

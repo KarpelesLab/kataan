@@ -3773,7 +3773,11 @@ impl Interp {
                             (s as usize).min(len)
                         }
                     };
-                    let delete = if args.len() < 2 {
+                    // No `start` at all deletes nothing; a lone `start` deletes
+                    // through the end.
+                    let delete = if args.is_empty() {
+                        0
+                    } else if args.len() < 2 {
                         len - start
                     } else {
                         (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize)
@@ -5409,7 +5413,10 @@ impl Interp {
                         let s = self.coerce_to_integer_or_infinity(arg(0))? as i64;
                         if s < 0 { (len + s).max(0) } else { s.min(len) }
                     } as usize;
-                    let del = if args.len() < 2 {
+                    // No `start` skips nothing; a lone `start` skips to the end.
+                    let del = if args.is_empty() {
+                        0
+                    } else if args.len() < 2 {
                         elems.len() - start
                     } else {
                         (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize)
@@ -5431,7 +5438,10 @@ impl Interp {
                         let s = self.coerce_to_integer_or_infinity(arg(0))? as i64;
                         if s < 0 { (len + s).max(0) } else { s.min(len) }
                     } as usize;
-                    let del = if args.len() < 2 {
+                    // No `start` skips nothing; a lone `start` skips to the end.
+                    let del = if args.is_empty() {
+                        0
+                    } else if args.len() < 2 {
                         elems.len() - start
                     } else {
                         (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize)
