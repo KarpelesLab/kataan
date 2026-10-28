@@ -6885,7 +6885,7 @@ fn run_frame_at_ic(
             Op::MakeArguments { .. } | Op::LoadNewTarget { .. } => {}
             Op::IterOpen { iter, next, src }
                 if *next == iter.wrapping_add(1)
-                    && iter_fast::can_open(&ctx.realm, regs[*src as usize]) =>
+                    && iter_fast::can_open(&mut ctx.realm, regs[*src as usize]) =>
             {
                 // A plain array over the built-in iterator: iterate it by index
                 // (see `iter_fast`).

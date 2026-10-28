@@ -270,7 +270,52 @@ impl Realm {
         } else {
             self.method_lookup_start(recv, key, &mut cache.recv_shape)?
         };
-        self.site_links_get(cur, key, cache)
+        if cache.stamp == crate::object::proto_epoch() {
+            return self.site_stamped_get(cur, key, cache);
+        }
+        self.site_links_get_stamping(cur, key, cache)
+    }
+
+    /// [`site_links_get`](Self::site_links_get) for a cache whose stamp is
+    /// current: the chain from `cur` is the validated one as long as `cur` is
+    /// its first link, so only the holder's value is read.
+    fn site_stamped_get(
+        &self,
+        cur: Option<Handle>,
+        key: &str,
+        cache: &MethodSiteCache,
+    ) -> Option<NanBox> {
+        let first = cache.links.first()?;
+        if cur?.to_raw() != first.0 {
+            return None;
+        }
+        let holder = Handle::from_raw(cache.links.last()?.0);
+        if let Some(Cell::Object(o)) = self.heap.get(Handle::from_raw(cache.holder_props))
+            && let (Some(s), Some(m)) = (o.shaped_shape(), cache.holder_shape.as_ref())
+            && Rc::ptr_eq(s, m)
+        {
+            return o.slot(cache.holder_slot);
+        }
+        self.holder_data(holder, key)
+    }
+
+    /// [`site_links_get`](Self::site_links_get), stamping the cache with the
+    /// current prototype epoch when the walk hits over watched links only.
+    fn site_links_get_stamping(
+        &self,
+        cur: Option<Handle>,
+        key: &str,
+        cache: &mut MethodSiteCache,
+    ) -> Option<NanBox> {
+        let v = self.site_links_get(cur, key, cache)?;
+        if cache
+            .links
+            .iter()
+            .all(|&(raw, aux, _)| self.link_watched(raw, aux))
+        {
+            cache.stamp = crate::object::proto_epoch();
+        }
+        Some(v)
     }
 
     /// [`method_site_get`](Self::method_site_get) for a *primitive* receiver
@@ -288,7 +333,10 @@ impl Realm {
         if !cache.armed || cache.swaps != self.cell_swaps || !cache.prim {
             return None;
         }
-        self.site_links_get(Some(start), key, cache)
+        if cache.stamp == crate::object::proto_epoch() {
+            return self.site_stamped_get(Some(start), key, cache);
+        }
+        self.site_links_get_stamping(Some(start), key, cache)
     }
 
     /// The walk of [`method_site_get`](Self::method_site_get) from the first
@@ -350,12 +398,13 @@ impl Realm {
     /// host-exotic, at most eight deep) before one owning `key` as a data
     /// property. Leaves it unarmed (and returns `None`) otherwise.
     pub fn method_site_fill(
-        &self,
+        &mut self,
         recv: Handle,
         key: &str,
         cache: &mut MethodSiteCache,
     ) -> Option<NanBox> {
         cache.armed = false;
+        cache.stamp = 0;
         cache.links.clear();
         cache.holder_shape = None;
         cache.own = false;
@@ -382,12 +431,13 @@ impl Realm {
     /// whose lookup starts at `start` (see
     /// [`method_site_get_prim`](Self::method_site_get_prim)).
     pub fn method_site_fill_prim(
-        &self,
+        &mut self,
         start: Handle,
         key: &str,
         cache: &mut MethodSiteCache,
     ) -> Option<NanBox> {
         cache.armed = false;
+        cache.stamp = 0;
         cache.links.clear();
         cache.holder_shape = None;
         cache.own = false;
@@ -399,7 +449,7 @@ impl Realm {
     /// The walk of [`method_site_fill`](Self::method_site_fill) from the first
     /// chain link `cur`.
     fn site_links_fill(
-        &self,
+        &mut self,
         mut cur: Option<Handle>,
         key: &str,
         cache: &mut MethodSiteCache,
@@ -417,12 +467,50 @@ impl Realm {
                     cache.holder_shape = Some(Rc::clone(s));
                     cache.holder_slot = slot;
                 }
+                cache.holder_props = aux.unwrap_or(h.to_raw());
                 cache.armed = true;
+                for i in 0..cache.links.len() {
+                    let (raw, aux, _) = cache.links[i];
+                    self.watch_link(raw, aux);
+                }
+                cache.stamp = crate::object::proto_epoch();
                 return Some(v);
             }
             cur = next;
         }
         None
+    }
+
+    /// Watches a recorded chain link (see `crate::object::JIT_FLAG_WATCHED`):
+    /// the link `raw` itself when it is an ordinary object, else the cell (in
+    /// the realm's watched set, so a change to its auxiliary object or
+    /// `[[Prototype]]` bumps the prototype epoch) and its auxiliary object
+    /// `aux`, if any.
+    pub(crate) fn watch_link(&mut self, raw: u64, aux: Option<u64>) {
+        let h = Handle::from_raw(raw);
+        if let Some(Cell::Object(o)) = self.heap.get_mut(h) {
+            o.watch();
+            return;
+        }
+        self.watched_cells.insert(raw, ());
+        if let Some(a) = aux
+            && let Some(Cell::Object(o)) = self.heap.get_mut(Handle::from_raw(a))
+        {
+            o.watch();
+        }
+    }
+
+    /// Whether [`watch_link`](Self::watch_link) holds for the link `raw`
+    /// (with auxiliary object `aux`) as it is now.
+    fn link_watched(&self, raw: u64, aux: Option<u64>) -> bool {
+        let watched = |raw: u64| match self.heap.get(Handle::from_raw(raw)) {
+            Some(Cell::Object(o)) => o.jit_flags() & crate::object::JIT_FLAG_WATCHED != 0,
+            _ => false,
+        };
+        if matches!(self.heap.get(Handle::from_raw(raw)), Some(Cell::Object(_))) {
+            return watched(raw);
+        }
+        self.watched_cells.contains_key(&raw) && aux.is_none_or(watched)
     }
 
     /// The `[[Get]]` of `cache`'s key from `start` when `cache` still proves
@@ -587,6 +675,72 @@ impl Realm {
     }
 }
 
+/// Where a watched chain's `[[Get]]` found a data property: the holder's
+/// named-property object (raw handle), its shape then and the slot.
+pub(crate) type StampedSlot = (u64, Rc<Shape>, u32);
+
+/// The VM's memo of the fixed lookups of its array-iteration fast path
+/// (`nbvm::iter_fast`), each validated at a prototype epoch
+/// (`crate::object::proto_epoch`) with every link of its chain watched, so
+/// that while the epoch is unchanged a hit re-reads only the found value.
+#[derive(Default)]
+pub(crate) struct ArrayIterMemo {
+    /// The epoch at which `open` was validated (`0`: never).
+    pub(crate) open_stamp: u64,
+    /// The array prototype (raw handle) `open` is for.
+    pub(crate) open_proto: u64,
+    /// `[[Get]](open_proto, @@iterator)` and `[[Get]](%ArrayIteratorPrototype%,
+    /// "next")`.
+    pub(crate) open: Option<(StampedSlot, StampedSlot)>,
+    /// The epoch at which `GetMethod(%ArrayIteratorPrototype%, "return")` was
+    /// validated to find nothing (`0`: never).
+    pub(crate) close_stamp: u64,
+}
+
+impl Realm {
+    /// Watches every link of the `[[Get]]` of the named key `key` from
+    /// `start` (see [`watch_link`](Self::watch_link)) up to the first that
+    /// owns it, when that walk meets only ordinary objects, arrays, RegExps,
+    /// collections and natives (none host-exotic, at most eight deep): the
+    /// holder's shaped data property ([`StampedSlot`]) as `Some(Some(_))`,
+    /// `Some(None)` when no link owns the key. `None` (some links perhaps
+    /// watched) for anything else: an accessor, a dictionary-mode holder, a
+    /// deeper or other chain.
+    pub(crate) fn watch_get_chain(
+        &mut self,
+        start: Handle,
+        key: &str,
+    ) -> Option<Option<StampedSlot>> {
+        let mut cur = Some(start);
+        for _ in 0..8 {
+            let Some(h) = cur else {
+                return Some(None);
+            };
+            let (aux, _, next) = self.key_link(h)?;
+            self.watch_link(h.to_raw(), aux);
+            if self.has_own(h, key) {
+                self.holder_data(h, key)?;
+                let o = self.named_props(h)?;
+                let s = o.shaped_shape()?;
+                let slot = s.lookup(key)?;
+                return Some(Some((aux.unwrap_or(h.to_raw()), Rc::clone(s), slot)));
+            }
+            cur = next;
+        }
+        None
+    }
+
+    /// The current value at a [`StampedSlot`], while its holder still has the
+    /// recorded shape.
+    pub(crate) fn stamped_slot(&self, at: &StampedSlot) -> Option<NanBox> {
+        let o = self.heap.get(Handle::from_raw(at.0))?.as_object()?;
+        if !o.shaped_shape().is_some_and(|s| Rc::ptr_eq(s, &at.1)) {
+            return None;
+        }
+        o.slot(at.2)
+    }
+}
+
 /// A memo of one named key's `[[Get]]` outcome along one prototype chain —
 /// absent everywhere, or a data property of a particular holder — validated by
 /// object identity (a handle carries its slot's generation, so a recycled slot
@@ -622,6 +776,14 @@ pub struct MethodSiteCache {
     links: alloc::vec::Vec<(u64, Option<u64>, u32)>,
     holder_shape: Option<Rc<Shape>>,
     holder_slot: u32,
+    /// The object holding the holder link's named properties (the link
+    /// itself, or its auxiliary object), as a raw handle.
+    holder_props: u64,
+    /// The prototype epoch (`crate::object::proto_epoch`) at which the links
+    /// were last validated with every link watched (see
+    /// [`Realm::watch_link`]); `0` for never. While the epoch is still
+    /// `stamp`, no link changed, so a hit needs only the receiver's side.
+    stamp: u64,
     recv_shape: Option<Rc<Shape>>,
     /// Whether the receiver itself is the holder (the only link).
     own: bool,

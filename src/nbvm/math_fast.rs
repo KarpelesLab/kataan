@@ -62,6 +62,39 @@ pub(super) fn call(
     if realm.native_at(Handle::from_raw(f)) != Some(id) {
         return None;
     }
+    compute(realm, id, args, regs)
+}
+
+/// Whether `id` is a built-in `Math` function [`compute`] serves.
+pub(super) fn is_math_native(id: u16) -> bool {
+    matches!(
+        id,
+        N_MATH_SQRT
+            | N_MATH_ABS
+            | N_MATH_FLOOR
+            | N_MATH_CEIL
+            | N_MATH_ROUND
+            | N_MATH_TRUNC
+            | N_MATH_SIGN
+            | N_MATH_MIN
+            | N_MATH_MAX
+            | N_MATH_POW
+            | N_MATH_HYPOT
+            | N_MATH_CBRT
+            | N_MATH_EXP
+            | N_MATH_LOG
+            | N_MATH_SIN
+            | N_MATH_COS
+            | N_MATH_TAN
+            | N_MATH_ATAN
+            | N_MATH_ATAN2
+    )
+}
+
+/// The built-in `Math` function `id` called on the argument registers `args`
+/// of `regs`, when every argument is a Number or `undefined` (so `ToNumber`
+/// runs no code); `None` to take the ordinary call path.
+pub(super) fn compute(realm: &Realm, id: u16, args: &[Reg], regs: &[NanBox]) -> Option<NanBox> {
     // Every argument must convert without running code.
     let mut nums = [0.0f64; 4];
     if args.len() > nums.len() {

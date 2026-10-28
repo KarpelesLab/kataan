@@ -232,6 +232,9 @@ struct Callee<'f> {
     /// The prepared direct call into its compiled generic body, once it has one.
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     compiled: Option<super::jit_tier::CompiledCallback>,
+    /// Its Int/Float-tier code, once it has some (`jit_tier::unboxed_target`).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    unboxed: Option<alloc::rc::Rc<crate::jit::JitProto>>,
     /// Calls that found no compiled body to enter; past [`COMPILED_MISS_LIMIT`]
     /// the loop stops looking (a callee that has not compiled by then — the
     /// tier-up threshold is a handful of calls — will not).
@@ -257,6 +260,8 @@ impl<'f> Callee<'f> {
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             compiled: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            unboxed: None,
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             misses: 0,
         }
     }
@@ -275,11 +280,18 @@ impl<'f> Callee<'f> {
             }
             if ctx.call_depth < ctx.realm.limits.max_call_depth
                 && ctx.realm.vm_total_depth < ctx.realm.limits.max_call_depth
-                && let Some(v) = super::unboxed_fast_call(proto, args)
             {
-                return Ok(v);
+                // `unboxed_fast_call`, with its (permanent) lookup done once.
+                if self.unboxed.is_none() && self.misses < COMPILED_MISS_LIMIT {
+                    self.unboxed = super::jit_tier::unboxed_target(proto);
+                }
+                if let Some(j) = &self.unboxed
+                    && let Some(v) = args.get(..proto.n_params).and_then(|a| j.call_guarded(a))
+                {
+                    return Ok(v);
+                }
             }
-            if self.misses < COMPILED_MISS_LIMIT {
+            if self.misses < COMPILED_MISS_LIMIT && self.unboxed.is_none() {
                 if let Some(mut c) =
                     super::jit_tier::CompiledCallback::new(ctx, self.funcs, self.cb)
                 {

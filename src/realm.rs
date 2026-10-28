@@ -148,6 +148,12 @@ pub struct Realm {
     /// objects): a hosted VM run sends every property access on them to the
     /// host. Never pruned — such an object lives as long as its module record.
     host_exotic: alloc::collections::BTreeSet<u64>,
+    /// Non-object cells (arrays, natives, …) some method-site cache recorded
+    /// as a prototype-chain link (`builtins_fast::MethodSiteCache`): a change
+    /// to such a cell's auxiliary object or `[[Prototype]]` bumps the
+    /// prototype epoch (`crate::object::bump_proto_epoch`). Never pruned
+    /// while the cell lives (a stale entry only costs a bump).
+    pub(crate) watched_cells: handle_map::HandleKeyedMap<()>,
     /// Handles of arrays whose `length` property was made non-writable
     /// (`Object.defineProperty(arr, "length", {writable:false})`). An array's
     /// `length` is writable by default; this records the explicit demotion so the
@@ -294,6 +300,9 @@ pub struct Realm {
     /// The array-iteration intrinsics the bytecode VM checks before iterating a
     /// plain array by index (see [`VmArrayIterIntrinsics`]).
     vm_array_iter: VmArrayIterIntrinsics,
+    /// The VM's stamped memo of the array-iteration lookups (see
+    /// [`builtins_fast::ArrayIterMemo`]).
+    pub(crate) array_iter_memo: builtins_fast::ArrayIterMemo,
     /// `%Promise.prototype%` — the `[[Prototype]]` of every engine-created promise.
     /// Captured at install time so an engine-internal promise (dynamic `import()`,
     /// an async function's result, a microtask reaction) never picks up a *tampered*
@@ -631,6 +640,7 @@ impl Realm {
             fn_source: alloc::collections::BTreeMap::new(),
             length_tracking_views: alloc::collections::BTreeSet::new(),
             host_exotic: alloc::collections::BTreeSet::new(),
+            watched_cells: handle_map::HandleKeyedMap::new(),
             frozen_arrays: alloc::collections::BTreeSet::new(),
             sealed_arrays: alloc::collections::BTreeSet::new(),
             non_extensible_arrays: alloc::collections::BTreeSet::new(),
@@ -661,6 +671,7 @@ impl Realm {
             array_proto_intrinsic: None,
             root_array_proto: None,
             vm_array_iter: VmArrayIterIntrinsics::default(),
+            array_iter_memo: builtins_fast::ArrayIterMemo::default(),
             promise_proto_intrinsic: None,
             symbol_proto_intrinsic: None,
             string_proto_intrinsic: None,
@@ -707,6 +718,7 @@ impl Realm {
         if !self.multi_realm {
             match self.vm_fn_default_proto {
                 None => {
+                    crate::object::bump_proto_epoch();
                     self.vm_fn_default_proto = Some(proto);
                     return;
                 }
@@ -732,7 +744,18 @@ impl Realm {
             self.write_barrier(handle, NanBox::handle(proto.to_raw()));
             return;
         }
+        self.cell_link_changed(handle);
         self.native_protos.insert(handle.to_raw(), proto);
+    }
+
+    /// The hook for a change to a non-object cell's `[[Prototype]]` or
+    /// auxiliary object: bumps the prototype epoch when a method-site cache
+    /// watches the cell (see [`Self::watched_cells`]).
+    #[inline]
+    fn cell_link_changed(&self, handle: Handle) {
+        if self.watched_cells.contains_key(&handle.to_raw()) {
+            crate::object::bump_proto_epoch();
+        }
     }
 
     /// Records the shared abstract `%TypedArray%` intrinsic constructor handle.
@@ -743,6 +766,8 @@ impl Realm {
     /// Records the realm's `%Function.prototype%` intrinsic — the default
     /// `[[Prototype]]` for every ordinary/native callable.
     pub fn set_function_proto_intrinsic(&mut self, handle: Handle) {
+        // A default `[[Prototype]]` changes: retire every validated chain.
+        crate::object::bump_proto_epoch();
         self.function_proto_intrinsic = Some(handle);
         self.add_jit_flags(handle, crate::object::JIT_FLAG_NO_INLINE_SET);
     }
@@ -761,6 +786,8 @@ impl Realm {
     /// Records the realm's `%Array.prototype%` intrinsic — the default
     /// `[[Prototype]]` for every dense `Cell::Array`.
     pub fn set_array_proto_intrinsic(&mut self, handle: Handle) {
+        // A default `[[Prototype]]` may change: retire every validated chain.
+        crate::object::bump_proto_epoch();
         self.array_proto_intrinsic = Some(handle);
         self.add_jit_flags(handle, crate::object::JIT_FLAG_NO_INLINE_SET);
         // The first realm installed on this heap fixes the *derived* default for
@@ -788,6 +815,7 @@ impl Realm {
     /// Mutable access to the array-iteration intrinsics (filled by the host
     /// while it installs `Array.prototype` and `%ArrayIteratorPrototype%`).
     pub fn vm_array_iter_mut(&mut self) -> &mut VmArrayIterIntrinsics {
+        self.array_iter_memo = builtins_fast::ArrayIterMemo::default();
         &mut self.vm_array_iter
     }
 
@@ -839,6 +867,8 @@ impl Realm {
     /// Restores the realm-wide intrinsic prototype pointers captured by
     /// [`intrinsics_snapshot`](Realm::intrinsics_snapshot).
     pub fn restore_intrinsics(&mut self, s: RealmIntrinsics) {
+        // The default `[[Prototype]]`s may change: retire every validated chain.
+        crate::object::bump_proto_epoch();
         self.default_object_proto = s.default_object_proto;
         self.array_proto_intrinsic = s.array_proto;
         self.promise_proto_intrinsic = s.promise_proto;
@@ -858,18 +888,21 @@ impl Realm {
     /// Records the realm's `%Symbol.prototype%` intrinsic — the `[[Prototype]]`
     /// for every `Cell::Symbol` primitive.
     pub fn set_symbol_proto_intrinsic(&mut self, handle: Handle) {
+        crate::object::bump_proto_epoch();
         self.symbol_proto_intrinsic = Some(handle);
     }
 
     /// Records the realm's `%String.prototype%` intrinsic — the `[[Prototype]]`
     /// for every `Cell::Str` primitive.
     pub fn set_string_proto_intrinsic(&mut self, handle: Handle) {
+        crate::object::bump_proto_epoch();
         self.string_proto_intrinsic = Some(handle);
     }
 
     /// Records the realm's `%BigInt.prototype%` intrinsic — the `[[Prototype]]`
     /// for every `Cell::BigInt` primitive.
     pub fn set_bigint_proto_intrinsic(&mut self, handle: Handle) {
+        crate::object::bump_proto_epoch();
         self.bigint_proto_intrinsic = Some(handle);
     }
 
@@ -998,6 +1031,7 @@ impl Realm {
     /// Marks `handle` as an object whose properties only the host models (see
     /// [`Realm::is_host_exotic`]).
     pub fn mark_host_exotic(&mut self, handle: Handle) {
+        crate::object::bump_proto_epoch();
         self.host_exotic.insert(handle.to_raw());
         self.add_jit_flags(
             handle,
@@ -1013,6 +1047,16 @@ impl Realm {
     pub fn add_jit_flags(&mut self, handle: Handle, bits: u8) {
         if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.add_jit_flags(bits);
+        }
+    }
+
+    /// Flags the object at `handle` watched by a prototype-chain cache
+    /// ([`JIT_FLAG_WATCHED`](crate::object::JIT_FLAG_WATCHED)); a no-op for
+    /// any other cell.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn jit_watch(&mut self, handle: Handle) {
+        if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.watch();
         }
     }
 
@@ -1169,6 +1213,7 @@ impl Realm {
             return *h;
         }
         let obj = self.new_object();
+        self.cell_link_changed(handle);
         self.aux_props.insert(handle.to_raw(), obj);
         self.mark_array_side_state(handle);
         obj
@@ -3442,7 +3487,8 @@ impl Realm {
     /// `%TypedArray%` intrinsic rather than `null`.
     #[must_use]
     pub fn object_proto(&self, handle: Handle) -> Option<Handle> {
-        if let Some(obj) = self.heap.get(handle).and_then(Cell::as_object) {
+        let cell = self.heap.get(handle);
+        if let Some(obj) = cell.and_then(Cell::as_object) {
             return obj.proto();
         }
         if let Some(p) = self.native_protos.get(&handle.to_raw()).copied() {
@@ -3453,8 +3499,13 @@ impl Realm {
         if self.has_explicit_null_proto(handle) {
             return None;
         }
+        // The commonest remaining case first (the last test below, which no
+        // other test in between accepts): a dense array.
+        if matches!(cell, Some(Cell::Array(_))) {
+            return self.root_array_proto;
+        }
         // A Symbol primitive's `[[Prototype]]` is `%Symbol.prototype%`.
-        if matches!(self.heap.get(handle), Some(Cell::Symbol { .. })) {
+        if matches!(cell, Some(Cell::Symbol { .. })) {
             return self.symbol_proto_intrinsic;
         }
         // A String primitive's `[[Prototype]]` is `%String.prototype%`, so a
@@ -3468,12 +3519,12 @@ impl Realm {
         // A BigInt primitive's `[[Prototype]]` is `%BigInt.prototype%` (so
         // `Object.prototype.toString.call(1n)` reads its `@@toStringTag` →
         // "BigInt", and `(1n).toString`/`valueOf` resolve).
-        if matches!(self.heap.get(handle), Some(Cell::BigInt(_))) {
+        if matches!(cell, Some(Cell::BigInt(_))) {
             return self.bigint_proto_intrinsic;
         }
         // A VM closure with no explicit link (see `vm_fn_default_proto`).
         if let Some(p) = self.vm_fn_default_proto
-            && matches!(self.heap.get(handle), Some(Cell::VmFunction { .. }))
+            && matches!(cell, Some(Cell::VmFunction { .. }))
         {
             if self.callable_null_protos.contains(&handle.to_raw()) {
                 return None;
@@ -3483,7 +3534,10 @@ impl Realm {
         // An ordinary/native callable with no explicit override and no inline
         // object part has `[[Prototype]] === %Function.prototype%` (unless it was
         // explicitly set to `null`).
-        if self.is_callable_cell(handle) {
+        if matches!(
+            cell,
+            Some(Cell::Native(_) | Cell::HostFn(_) | Cell::BoundNative { .. })
+        ) {
             if self.callable_null_protos.contains(&handle.to_raw()) {
                 return None;
             }
@@ -3578,6 +3632,7 @@ impl Realm {
                 )
             )
         {
+            self.cell_link_changed(handle);
             match proto {
                 Some(p) => {
                     self.native_protos.insert(handle.to_raw(), p);
@@ -3616,6 +3671,8 @@ impl Realm {
         }
         self.heap.swap(a, b);
         self.cell_swaps = self.cell_swaps.wrapping_add(1);
+        // A watched object may have moved: retire every validated chain.
+        crate::object::bump_proto_epoch();
         let (ka, kb) = (a.to_raw(), b.to_raw());
         self.aux_props.swap_entries(ka, kb);
         self.native_protos.swap_entries(ka, kb);
@@ -6081,6 +6138,10 @@ impl Realm {
     /// `roots`, updated in place — to the new locations. Returns the statistics.
     pub fn compact(&mut self, roots: &mut [Handle]) -> Stats {
         let n = roots.len();
+        // Handles move: retire every validated chain (and the watched cell
+        // set, keyed by handle; a cache re-watches on its next fill).
+        crate::object::bump_proto_epoch();
+        self.watched_cells = handle_map::HandleKeyedMap::new();
         // The VM's iteration intrinsics are a cache that the relocation below does
         // not forward: drop it (the VM then takes the protocol path). The
         // `@@species` key is a string, not a handle, so it survives.
@@ -6794,26 +6855,36 @@ impl Realm {
     /// strings and all objects) is truthy. `NanBox::to_boolean` alone can't see
     /// that a boxed string is empty, so string handles are checked here.
     #[must_use]
+    #[inline]
     pub fn truthy(&self, v: NanBox) -> bool {
-        if let Some(raw) = v.as_handle() {
-            let h = Handle::from_raw(raw);
-            // Emptiness is O(1) on the rope (cached length) — never materialize the
-            // whole string just to test it. `Cell::as_str` + `Rope::is_empty` are
-            // both allocation-free, so this runs on every `if`/`while`/`&&`/`||`/
-            // `??`/ternary without copying the string.
-            if let Some(r) = self.heap.get(h).and_then(Cell::as_str) {
-                return !r.is_empty();
-            }
-            if let Some(n) = self.bigint_at(h) {
-                return !n.is_zero(); // `0n` is falsy
-            }
-            // An [[IsHTMLDDA]] exotic object (`document.all`) is falsy.
-            if self.is_html_dda(h) {
-                return false;
-            }
+        // The common results first (a comparison's boolean), inline.
+        if v == NanBox::boolean(true) {
             return true;
         }
-        v.to_boolean()
+        if v == NanBox::boolean(false) {
+            return false;
+        }
+        match v.as_handle() {
+            Some(raw) => self.truthy_heap(raw),
+            None => v.to_boolean(),
+        }
+    }
+
+    /// [`Self::truthy`] of a heap value.
+    fn truthy_heap(&self, raw: u64) -> bool {
+        let h = Handle::from_raw(raw);
+        // Emptiness is O(1) on the rope (cached length) — never materialize the
+        // whole string just to test it. `Cell::as_str` + `Rope::is_empty` are
+        // both allocation-free, so this runs on every `if`/`while`/`&&`/`||`/
+        // `??`/ternary without copying the string.
+        if let Some(r) = self.heap.get(h).and_then(Cell::as_str) {
+            return !r.is_empty();
+        }
+        if let Some(n) = self.bigint_at(h) {
+            return !n.is_zero(); // `0n` is falsy
+        }
+        // An [[IsHTMLDDA]] exotic object (`document.all`) is falsy.
+        !self.is_html_dda(h)
     }
 
     /// Whether the value at `handle` is an **`[[IsHTMLDDA]]`** exotic object (the

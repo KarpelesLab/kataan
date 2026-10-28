@@ -175,6 +175,9 @@ fn shape_word_offsets() -> (i32, i32) {
 /// [`crate::object::JIT_FLAG_EXOTIC`], as compiled code tests it.
 pub(crate) const FLAG_EXOTIC: u8 = crate::object::JIT_FLAG_EXOTIC;
 
+/// [`crate::object::JIT_FLAG_WATCHED`], as compiled code tests it.
+pub(crate) const FLAG_WATCHED: u8 = crate::object::JIT_FLAG_WATCHED;
+
 impl X64Assembler {
     /// `test byte [base+disp32], imm8` (`base` neither `rsp` nor `r12`).
     pub(crate) fn p_test_byte_imm(&mut self, base: u8, disp: i32, imm: u8) {
@@ -227,6 +230,14 @@ struct ChainLevel {
 /// property read (`acc != 0`), the holder's getter, entry `acc - 1` of its
 /// accessor list (whose order its key epoch fixes). Empty while
 /// `recv_shape` is `None` (no shape word is null).
+///
+/// `stamp` is the prototype epoch (`crate::object::proto_epoch`) at which the
+/// chain was last validated — every level then the recorded object, watched
+/// (`JIT_FLAG_WATCHED`), with the recorded shape and key epoch — and
+/// `holder` the raw handle of the object holding the property (for `depth >
+/// 0`). While the epoch is still `stamp`, no watched object changed layout,
+/// so a receiver of `recv_shape` whose `[[Prototype]]` is still
+/// `levels[0].handle` has the recorded chain without re-walking it.
 #[repr(C)]
 #[derive(Default, Clone)]
 struct MethodEntry {
@@ -234,6 +245,8 @@ struct MethodEntry {
     depth: u32,
     slot: u32,
     acc: u32,
+    stamp: u64,
+    holder: u64,
     levels: [ChainLevel; CHAIN_MAX],
 }
 
@@ -296,7 +309,7 @@ impl MethodSite {
     /// and recorded only when every object on it is one the compiled check
     /// can validate (see the type docs). The entry replaces the way holding
     /// the same receiver layout and prototype, else the next way round.
-    pub(crate) fn fill(&mut self, realm: &crate::realm::Realm, recv: crate::heap::Handle) {
+    pub(crate) fn fill(&mut self, realm: &mut crate::realm::Realm, recv: crate::heap::Handle) {
         if self.fills >= FILL_LIMIT {
             return;
         }
@@ -304,9 +317,11 @@ impl MethodSite {
         if self.key().starts_with('\0') {
             return;
         }
-        let Some(entry) = Self::entry_for(realm, recv, self.key(), false) else {
+        let Some(mut entry) = Self::entry_for(realm, recv, self.key(), false) else {
             return;
         };
+        watch_levels(realm, &entry.levels[..entry.depth as usize]);
+        entry.stamp = crate::object::proto_epoch();
         self.store(entry);
     }
 
@@ -316,7 +331,7 @@ impl MethodSite {
     /// (which is returned, for the read's call cache).
     pub(crate) fn fill_get(
         &mut self,
-        realm: &crate::realm::Realm,
+        realm: &mut crate::realm::Realm,
         recv: crate::heap::Handle,
     ) -> Option<crate::nanbox::NanBox> {
         let key = self.key();
@@ -324,7 +339,9 @@ impl MethodSite {
             return None;
         }
         self.fills += 1;
-        let entry = Self::entry_for(realm, recv, key, true)?;
+        let mut entry = Self::entry_for(realm, recv, key, true)?;
+        watch_levels(realm, &entry.levels[..entry.depth as usize]);
+        entry.stamp = crate::object::proto_epoch();
         let getter = (entry.acc != 0)
             .then(|| {
                 let h =
@@ -396,17 +413,28 @@ impl MethodSite {
                     return None;
                 }
                 entry.depth = d;
+                entry.holder = h.to_raw();
                 entry.acc = u32::try_from(i + 1).ok()?;
                 return Some(entry);
             }
             if let Some(slot) = ps.lookup(key) {
                 entry.depth = d;
+                entry.holder = h.to_raw();
                 entry.slot = slot;
                 return Some(entry);
             }
             cur = p.proto();
         }
         None
+    }
+}
+
+/// Flags every object of a recorded chain `levels` watched (see
+/// `crate::object::JIT_FLAG_WATCHED`), so that a change to any of them
+/// retires the recording entry's stamp.
+fn watch_levels(realm: &mut crate::realm::Realm, levels: &[ChainLevel]) {
+    for l in levels {
+        realm.jit_watch(crate::heap::Handle::from_raw(l.handle));
     }
 }
 
@@ -499,6 +527,49 @@ impl X64Assembler {
         self.jne(miss);
     }
 
+    /// [`Self::p_plain_shaped`] for a recorded chain level, which must also
+    /// still be watched (a level is watched when recorded, but a cell swap
+    /// may have put another object in its place). Clobbers `r8`.
+    fn p_plain_shaped_watched(&mut self, l: &JitLayout, miss: Label) {
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
+        self.jne(miss);
+        self.cmp_byte_at_rcx_imm(l.off_od_tag, l.obj_shaped_disc);
+        self.jne(miss);
+        // (flags & (EXOTIC | WATCHED)) == WATCHED
+        self.p_movzx_r8_byte(r::RCX, l.props.off_jit_flags);
+        self.p_and_r8_imm8(FLAG_EXOTIC | FLAG_WATCHED);
+        self.p_cmp_r8_imm8(FLAG_WATCHED);
+        self.g_jcc(cc::NE, miss);
+    }
+
+    /// `movzx r8d, byte [base+disp32]` (`base` neither `rsp` nor `r12`).
+    fn p_movzx_r8_byte(&mut self, base: u8, disp: i32) {
+        debug_assert!(base & 7 != 4, "no SIB form");
+        // REX.R (r8) [+ REX.B]; 0F B6 /r
+        self.code.push(0x44 | ((base >> 3) & 1));
+        self.code.extend_from_slice(&[0x0f, 0xb6]);
+        self.code.push(0x80 | (base & 7));
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `and r8d, imm8` (zero-extended byte immediate as a 32-bit operation).
+    fn p_and_r8_imm8(&mut self, imm: u8) {
+        // REX.B 83 /4 ib
+        self.code.extend_from_slice(&[0x41, 0x83, 0xe0, imm]);
+    }
+
+    /// `cmp r8d, imm8`.
+    fn p_cmp_r8_imm8(&mut self, imm: u8) {
+        // REX.B 83 /7 ib
+        self.code.extend_from_slice(&[0x41, 0x83, 0xf8, imm]);
+    }
+
+    /// `rax` = the prototype epoch (a plain load of its counter).
+    fn p_load_proto_epoch(&mut self, dst: u8) {
+        self.g_movabs(dst, crate::object::proto_epoch_addr() as u64);
+        self.g_load(dst, dst, 0);
+    }
+
     /// The method lookup of a [`MethodSite`] (see its docs), on the receiver
     /// value at `[recv_base + recv_disp]`: on a hit, the method value in
     /// `rax`; otherwise to `miss`. Reads only; clobbers `rax`, `rcx`, `rdx`,
@@ -550,12 +621,29 @@ impl X64Assembler {
         self.g_mov(r::RCX, r::RSI);
         self.p_cmp32_imm8(r::R11, depth, 0);
         self.g_jcc(cc::E, holder);
+        // The chain as validated at the entry's stamp, while the prototype
+        // epoch still is the stamp: only the receiver's (unwatched) link to
+        // it needs checking, and the holder is the recorded one.
+        let walk = self.new_label();
+        let stamp = self.new_label();
+        self.p_load_proto_epoch(r::R9);
+        self.g_cmp_mem(r::R9, r::R11, i(offset_of!(MethodEntry, stamp)));
+        self.g_jcc(cc::NE, walk);
+        self.g_load(r::RAX, r::RCX, l.props.off_proto);
+        self.g_cmp_mem(r::RAX, r::R11, level(0, offset_of!(ChainLevel, handle)));
+        self.g_jcc(cc::NE, next);
+        self.g_load(r::RAX, r::R11, i(offset_of!(MethodEntry, holder)));
+        self.p_slot_of(l, next);
+        self.jmp(holder);
+        // Otherwise the whole chain, level by level; when it holds, the entry
+        // is stamped with the current epoch.
+        self.bind(walk);
         for d in 0..CHAIN_MAX {
             self.g_load(r::RAX, r::RCX, l.props.off_proto);
             self.g_cmp_mem(r::RAX, r::R11, level(d, offset_of!(ChainLevel, handle)));
             self.g_jcc(cc::NE, next);
             self.p_slot_of(l, next);
-            self.p_plain_shaped(l, next);
+            self.p_plain_shaped_watched(l, next);
             self.g_load(r::RAX, r::RCX, l.off_shape);
             self.g_cmp_mem(r::RAX, r::R11, level(d, offset_of!(ChainLevel, shape)));
             self.g_jcc(cc::NE, next);
@@ -564,9 +652,12 @@ impl X64Assembler {
             self.g_jcc(cc::NE, next);
             if d + 1 < CHAIN_MAX {
                 self.p_cmp32_imm8(r::R11, depth, i8::try_from(d + 1).expect("small depth"));
-                self.g_jcc(cc::E, holder);
+                self.g_jcc(cc::E, stamp);
             }
         }
+        self.bind(stamp);
+        self.p_load_proto_epoch(r::R9);
+        self.g_store(r::R11, i(offset_of!(MethodEntry, stamp)), r::R9);
         // `rcx` = the holder's slot: its getter, or its `slot`-th value.
         self.bind(holder);
         let acc = i(offset_of!(MethodEntry, acc));
@@ -853,6 +944,21 @@ impl X64Assembler {
         // The prototype chain, receiver's `[[Prototype]]` first.
         self.g_mov(r::RSI, r::RCX);
         let end = self.new_label();
+        let walk = self.new_label();
+        let chain_ok = self.new_label();
+        let stamp = i(add + offset_of!(AddEntry, stamp));
+        // While the prototype epoch is the entry's stamp, the chain is the
+        // validated one: only the receiver's link to it needs checking.
+        self.p_cmp32_imm8(r::R11, depth, 0);
+        self.g_jcc(cc::E, end);
+        self.p_load_proto_epoch(r::R9);
+        self.g_cmp_mem(r::R9, r::R11, stamp);
+        self.g_jcc(cc::NE, walk);
+        self.g_load(r::RAX, r::RCX, l.props.off_proto);
+        self.g_cmp_mem(r::RAX, r::R11, level(0, offset_of!(ChainLevel, handle)));
+        self.g_jcc(cc::NE, miss);
+        self.jmp(chain_ok);
+        self.bind(walk);
         for d in 0..CHAIN_MAX {
             self.p_cmp32_imm8(r::R11, depth, i8::try_from(d).expect("small depth"));
             self.g_jcc(cc::E, end);
@@ -860,7 +966,7 @@ impl X64Assembler {
             self.g_cmp_mem(r::RAX, r::R11, level(d, offset_of!(ChainLevel, handle)));
             self.g_jcc(cc::NE, miss);
             self.p_slot_of(l, miss);
-            self.p_plain_shaped(l, miss);
+            self.p_plain_shaped_watched(l, miss);
             self.g_load(r::RAX, r::RCX, l.off_shape);
             self.g_cmp_mem(r::RAX, r::R11, level(d, offset_of!(ChainLevel, shape)));
             self.g_jcc(cc::NE, miss);
@@ -874,6 +980,9 @@ impl X64Assembler {
         self.g_movabs(r::R8, crate::object::NO_PROTO);
         self.g_cmp(r::RAX, r::R8);
         self.g_jcc(cc::NE, miss);
+        self.p_load_proto_epoch(r::R9);
+        self.g_store(r::R11, stamp, r::R9);
+        self.bind(chain_ok);
         self.g_mov(r::RCX, r::RSI);
         self.g_load(r::RAX, r::RBX, val_disp);
         self.p_barrier_check(l, realm_off, miss);
@@ -1158,11 +1267,16 @@ impl ConstructCache {
 /// property or proxy can intercept the write, and the receiver (of shape
 /// `from`, so without the key) gets a fresh writable, enumerable,
 /// configurable data property — the child shape `to`.
+///
+/// `stamp` is as [`MethodEntry`]'s: the prototype epoch at which the chain was
+/// last validated (every level watched), so that while it is current only
+/// the receiver's link to `levels[0]` needs checking.
 #[derive(Default)]
 struct AddEntry {
     from: Option<Rc<Shape>>,
     to: Option<Rc<Shape>>,
     depth: u32,
+    stamp: u64,
     levels: [ChainLevel; CHAIN_MAX],
 }
 
@@ -1222,7 +1336,7 @@ impl MethodSite {
     /// [`AddEntry`] check can prove again (else leaves the cache as it was).
     pub(crate) fn fill_add(
         &mut self,
-        realm: &crate::realm::Realm,
+        realm: &mut crate::realm::Realm,
         recv: crate::heap::Handle,
         before: &Rc<Shape>,
     ) {
@@ -1257,7 +1371,7 @@ impl MethodSite {
         for (d, level) in (0u32..).zip(entry.levels.iter_mut()) {
             let Some(h) = cur else {
                 entry.depth = d;
-                self.add = entry;
+                self.store_add(realm, entry);
                 return;
             };
             let Some(p) = realm.jit_chain_object(h) else {
@@ -1278,8 +1392,15 @@ impl MethodSite {
         }
         if cur.is_none() {
             entry.depth = CHAIN_MAX as u32;
-            self.add = entry;
+            self.store_add(realm, entry);
         }
+    }
+
+    /// Installs `entry` as the add cache, its chain watched and stamped.
+    fn store_add(&mut self, realm: &mut crate::realm::Realm, mut entry: AddEntry) {
+        watch_levels(realm, &entry.levels[..entry.depth as usize]);
+        entry.stamp = crate::object::proto_epoch();
+        self.add = entry;
     }
 }
 

@@ -541,14 +541,14 @@ pub(crate) extern "C" fn jit_helper_site_fill(
     #[allow(unsafe_code)]
     let (ctx, site) = unsafe {
         (
-            &*(ctx as *const Ctx),
+            &mut *(ctx as *mut Ctx),
             &mut *(site as usize as *mut crate::jit::MethodSite),
         )
     };
     if ctx.host.is_some()
         && let Some(h) = NanBox::from_bits(recv).as_handle()
     {
-        site.fill(&ctx.realm, Handle::from_raw(h));
+        site.fill(&mut ctx.realm, Handle::from_raw(h));
     }
     0
 }
@@ -710,6 +710,38 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             let vals: alloc::vec::Vec<NanBox> = elems.iter().map(|r| regs[*r as usize]).collect();
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(vals).to_raw());
             Some(Ok(()))
+        }
+        // The array-iteration fast path (`iter_fast`) of a destructuring or a
+        // spread: exactly the interpreter arms (a throw goes to the caller's
+        // handlers either way).
+        Op::IterOpen { iter, next, src }
+            if *next == iter.wrapping_add(1)
+                && super::iter_fast::can_open(&mut ctx.realm, regs[*src as usize]) =>
+        {
+            regs[*next as usize] = regs[*src as usize];
+            regs[*iter as usize] = NanBox::number(0.0);
+            Some(Ok(()))
+        }
+        Op::IterNext {
+            dst,
+            done,
+            iter,
+            next,
+        } => Some(
+            super::vm_iter_step(ctx, regs, *done, *iter, *next)
+                .map(|v| regs[*dst as usize] = v.unwrap_or(NanBox::undefined())),
+        ),
+        Op::IterClose { iter, done, quiet } if regs[*iter as usize].is_number() => {
+            if regs[*done as usize].as_boolean() == Some(true) {
+                Some(Ok(()))
+            } else {
+                regs[*done as usize] = NanBox::boolean(true);
+                match super::iter_fast::close(ctx, regs, *iter) {
+                    Err(super::HostError::Fault) => Some(Err(VmError::Unsupported)),
+                    Err(super::HostError::Thrown(e)) if !*quiet => Some(Err(VmError::Thrown(e))),
+                    _ => Some(Ok(())),
+                }
+            }
         }
         _ => None,
     };
@@ -891,12 +923,21 @@ fn call_compiled_with(
 /// it — with the lookups that cannot change between calls done once: the
 /// closure's function, its compiled body, its captures (a closure's capture
 /// list is fixed at creation), and a register file reused across calls.
+///
+/// When the body has a native-call entry, a call is the compiled call
+/// sequence's (`crate::jit::call_seq`), done from Rust: the native-call
+/// header, the arguments and the callee's register window are laid out on
+/// the register stack (so they are GC roots, and the header stands in for
+/// the `vm_callee_stack` entry, as for a compiled caller), and the entry fills
+/// the window itself. No register file is copied in or out.
 pub(super) struct CompiledCallback {
     callee: NanBox,
     id: usize,
     jit: Rc<crate::jit::JitProto>,
     captures: alloc::vec::Vec<NanBox>,
     n_params: usize,
+    /// The window size, when the native-call entry may be used.
+    native_regs: Option<usize>,
     regs: alloc::vec::Vec<NanBox>,
 }
 
@@ -913,13 +954,20 @@ impl CompiledCallback {
         }
         let jit = direct_jit(ctx, proto, id)?;
         let (_, caps) = ctx.realm.vm_function(handle)?;
+        if caps.len() < proto.n_captures {
+            return None;
+        }
         let captures = caps.iter().copied().take(proto.n_captures).collect();
+        // What `fill_call_site` requires of a native-call target.
+        let native_regs =
+            (jit.native_entry().is_some() && jit.n_regs() == proto.n_regs).then_some(proto.n_regs);
         Some(Self {
             callee,
             id,
             jit,
             captures,
             n_params: proto.n_params,
+            native_regs,
             regs: alloc::vec::Vec::new(),
         })
     }
@@ -934,13 +982,133 @@ impl CompiledCallback {
         this: NanBox,
         args: &[NanBox],
     ) -> Result<NanBox, VmError> {
-        let proto = &funcs[self.id];
         if ctx.call_depth >= ctx.realm.limits.max_call_depth
             || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
         {
             let e = vm_error(ctx, "RangeError", "Maximum call stack size exceeded");
             return Err(VmError::Thrown(e));
         }
+        if let Some(n_regs) = self.native_regs
+            && let Some(r) = self.call_native(ctx, funcs, n_regs, this, args)
+        {
+            return r;
+        }
+        self.call_framed(ctx, funcs, this, args)
+    }
+
+    /// [`Self::call`] through the body's native-call entry; `None` (nothing
+    /// done) when the register stack has no room.
+    #[inline]
+    fn call_native(
+        &mut self,
+        ctx: &mut Ctx,
+        funcs: &[FnProto],
+        n_regs: usize,
+        this: NanBox,
+        args: &[NanBox],
+    ) -> Option<Result<NanBox, VmError>> {
+        use crate::jit::FRAME_HEADER;
+        let st = stack_of(ctx);
+        let argc = args.len();
+        // SAFETY: `st` is this thread's live register stack, which nothing else
+        // borrows while this runs; every word written is in `top..limit`
+        // (checked first), claimed by moving `top` and released before
+        // returning, exactly as the compiled call sequence claims it.
+        #[allow(unsafe_code)]
+        let (hdr, window) = unsafe {
+            let hdr = (*st).top;
+            let room = (*st).limit.offset_from(hdr) as usize;
+            if room < FRAME_HEADER + argc + n_regs {
+                return None;
+            }
+            hdr.write((*st).frames as u64);
+            hdr.add(1).write(self.callee.to_bits());
+            hdr.add(2).write(ctx.realm.vm_callee_stack.len() as u64);
+            hdr.add(3).write(argc as u64);
+            hdr.add(4).write(NanBox::undefined().to_bits());
+            let argv = hdr.add(FRAME_HEADER);
+            // Unrolled for the built-ins' fixed arities (a loop over the
+            // slice is a `memcpy` call).
+            match *args {
+                [a, b, c] => {
+                    argv.write(a.to_bits());
+                    argv.add(1).write(b.to_bits());
+                    argv.add(2).write(c.to_bits());
+                }
+                [a, b] => {
+                    argv.write(a.to_bits());
+                    argv.add(1).write(b.to_bits());
+                }
+                _ => {
+                    for (i, a) in args.iter().enumerate() {
+                        argv.add(i).write(a.to_bits());
+                    }
+                }
+            }
+            let window = hdr.add(FRAME_HEADER + argc);
+            (*st).frames = hdr;
+            (*st).top = window.add(n_regs);
+            (hdr, window)
+        };
+        let published = ctx.frames_published;
+        ctx.call_depth += 1;
+        ctx.realm.vm_total_depth += 1;
+        let saved = ctx.jit_funcs.replace(funcs as *const [FnProto]);
+        let ctx_ptr = ctx as *mut Ctx as *mut core::ffi::c_void;
+        // SAFETY: the window, header and arguments were laid out above as the
+        // entry's contract requires; `captures` holds the closure's
+        // `n_captures` captured values (kept alive by the closure, which the
+        // caller roots).
+        #[allow(unsafe_code)]
+        let raw = unsafe {
+            self.jit.call_native_entry(
+                ctx_ptr,
+                window,
+                argc as u64,
+                hdr.add(FRAME_HEADER),
+                self.captures.as_ptr().cast::<u64>(),
+                this.to_bits(),
+            )
+        };
+        ctx.jit_funcs = saved;
+        // SAFETY: as above; the activation is over (the callee restored the
+        // stack it used), so its header and window are released.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*st).top = hdr;
+            (*st).frames = hdr.read() as *mut u64;
+        }
+        ctx.frames_published = published;
+        ctx.call_depth -= 1;
+        ctx.realm.vm_total_depth -= 1;
+        let raw = raw?;
+        if raw == NanBox::jit_falloff_bits() {
+            return Some(Ok(NanBox::undefined()));
+        }
+        let nb = NanBox::from_bits(raw);
+        if nb.is_jit_throw_sentinel() {
+            let err = ctx
+                .jit_pending_fault
+                .take()
+                .or_else(|| ctx.jit_pending.take().map(VmError::Thrown))
+                .unwrap_or_else(|| {
+                    VmError::Thrown(vm_error(ctx, "Error", "JIT throw without pending value"))
+                });
+            return Some(Err(err));
+        }
+        Some(Ok(nb))
+    }
+
+    /// [`Self::call`] on a register file of its own, copied onto the register
+    /// stack by [`run_compiled`].
+    fn call_framed(
+        &mut self,
+        ctx: &mut Ctx,
+        funcs: &[FnProto],
+        this: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, VmError> {
+        let proto = &funcs[self.id];
         let mark = ctx.frame_shadow.len();
         let published = ctx.frames_published;
         ctx.call_depth += 1;
@@ -983,6 +1151,22 @@ impl CompiledCallback {
             Some(Err(e)) => Err(e),
         }
     }
+}
+
+/// The Int/Float-tier native code of `proto`, when [`super::unboxed_fast_call`]
+/// would call it right now. Once true it stays true (a function's tier-up and
+/// its compiled code are both permanent), so a loop calling `proto` many times
+/// can look it up once and call [`crate::jit::JitProto::call_guarded`] itself.
+pub(super) fn unboxed_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
+    if proto.rest_from.is_some() || proto.n_captures != 0 || proto.is_async || proto.is_generator {
+        return None;
+    }
+    let t = proto.tier.0.try_borrow().ok()?;
+    if !call_is_hot(t.body.is_some()) {
+        return None;
+    }
+    let j = t.jit.as_ref()?.as_ref()?;
+    (!j.is_generic()).then(|| Rc::clone(j))
 }
 
 /// The getter half of a compiled body's static-key property read
@@ -1509,7 +1693,7 @@ pub(crate) extern "C" fn jit_method_info(
     };
     // SAFETY: see the function contract.
     #[allow(unsafe_code)]
-    let (ctx_ref, site) = unsafe { (&*(ctx as *const Ctx), &mut *site) };
+    let (ctx_ref, site) = unsafe { (&mut *(ctx as *mut Ctx), &mut *site) };
     // SAFETY: the site's property cache, owned by the same `JitProto`.
     #[allow(unsafe_code)]
     let cache = unsafe { &mut *site.cache.cast::<crate::ic::PropertyCache>() };
@@ -1521,7 +1705,7 @@ pub(crate) extern "C" fn jit_method_info(
     match super::vm_method_of_cached(ctx_ref, NanBox::from_bits(recv), key, cache) {
         Some(f) => {
             if let Some(h) = NanBox::from_bits(recv).as_handle() {
-                site.fill(&ctx_ref.realm, Handle::from_raw(h));
+                site.fill(&mut ctx_ref.realm, Handle::from_raw(h));
             }
             // SAFETY: see the function contract.
             #[allow(unsafe_code)]
@@ -1810,8 +1994,8 @@ pub(crate) extern "C" fn jit_helper_set_prop_site(
     {
         // SAFETY: as above; the write's own borrow of the context has ended.
         #[allow(unsafe_code)]
-        let ctx = unsafe { &*(ctx_raw as *const Ctx) };
-        site.fill_add(&ctx.realm, h, &before);
+        let ctx = unsafe { &mut *(ctx_raw as *mut Ctx) };
+        site.fill_add(&mut ctx.realm, h, &before);
     }
     r
 }
@@ -1842,7 +2026,7 @@ pub(crate) extern "C" fn jit_helper_get_prop_site(
         // cache is the site's (interior-mutable).
         #[allow(unsafe_code)]
         let (ctx, call) = unsafe { (&mut *(ctx_raw as *mut Ctx), &mut *call.cast_mut()) };
-        if let Some(getter) = site.fill_get(&ctx.realm, h) {
+        if let Some(getter) = site.fill_get(&mut ctx.realm, h) {
             fill_call_site(ctx, getter, call);
         }
     }

@@ -220,6 +220,43 @@ pub const JIT_FLAG_READONLY: u8 = 4;
 /// that validated "the global object has no such own property" for a global
 /// write stops relying on it. Set once, when the global object is made.
 pub const JIT_FLAG_GLOBAL: u8 = 8;
+/// [`Object::jit_flags`] bit: an object some prototype-chain cache recorded
+/// (see the prototype epoch, `proto_epoch`). A change to its layout — its shape, key epoch,
+/// `[[Prototype]]`, representation or other `jit_flags` — bumps the process-
+/// wide prototype epoch, which retires every such cache's "validated at
+/// epoch E" stamp. Set when a cache records the object, never cleared;
+/// compiled code adds no property to such an object inline (its slow path
+/// does the bump), but may still store to its existing data properties.
+pub const JIT_FLAG_WATCHED: u8 = 16;
+
+/// The prototype epoch: bumped whenever an object flagged
+/// [`JIT_FLAG_WATCHED`] changes layout (see [`Object`]'s layout hooks) and
+/// whenever two heap cells swap contents. A prototype-chain cache that
+/// validated its whole recorded chain while the epoch was `E` — every object
+/// on it being watched — may skip re-walking the chain for as long as the
+/// epoch is still `E`. Process-wide, so a change on any thread merely
+/// retires every stamp. Starts at 1; `0` is the "never validated" stamp.
+static PROTO_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// The current [`PROTO_EPOCH`] value.
+#[inline]
+#[must_use]
+pub(crate) fn proto_epoch() -> u64 {
+    PROTO_EPOCH.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Retires every prototype-chain stamp (see [`PROTO_EPOCH`]).
+#[inline]
+pub(crate) fn bump_proto_epoch() {
+    PROTO_EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The address of [`PROTO_EPOCH`], which compiled code reads with a plain
+/// load (an `AtomicU64` has `u64`'s layout).
+#[must_use]
+pub(crate) fn proto_epoch_addr() -> usize {
+    PROTO_EPOCH.as_ptr() as usize
+}
 
 /// A property-bearing object: a hidden-class shape plus its value slots (or a
 /// dictionary once it grows past the threshold), with an optional side list of
@@ -334,9 +371,30 @@ impl Object {
     #[inline]
     fn bump_key_epoch(&mut self) {
         self.key_epoch = self.key_epoch.wrapping_add(1);
-        if self.jit_flags & JIT_FLAG_GLOBAL != 0 {
-            crate::env::bump_global_binding_epoch();
+        if self.jit_flags & (JIT_FLAG_GLOBAL | JIT_FLAG_WATCHED) != 0 {
+            if self.jit_flags & JIT_FLAG_GLOBAL != 0 {
+                crate::env::bump_global_binding_epoch();
+            }
+            self.layout_changed();
         }
+    }
+
+    /// The layout hook: called on every change to what a prototype-chain
+    /// cache validates of an object — its shape (every shape change also
+    /// bumps the key epoch), key epoch, `[[Prototype]]`, representation
+    /// (shaped or dictionary) and `jit_flags` — and bumps the prototype epoch
+    /// when the object is [`JIT_FLAG_WATCHED`].
+    #[inline]
+    fn layout_changed(&self) {
+        if self.jit_flags & JIT_FLAG_WATCHED != 0 {
+            bump_proto_epoch();
+        }
+    }
+
+    /// Flags the object [`JIT_FLAG_WATCHED`] (a prototype-chain cache is
+    /// recording it). Not itself a layout change.
+    pub(crate) fn watch(&mut self) {
+        self.jit_flags |= JIT_FLAG_WATCHED;
     }
 
     /// The out-of-line part, or the shared empty one.
@@ -435,6 +493,7 @@ impl Object {
     /// Sets the `[[Prototype]]` link (`None` clears it to a null prototype).
     pub fn set_proto(&mut self, proto: Option<crate::heap::Handle>) {
         self.proto = proto.map_or(NO_PROTO, crate::heap::Handle::to_raw);
+        self.layout_changed();
     }
 
     /// The generic-JIT flags ([`JIT_FLAG_EXOTIC`], [`JIT_FLAG_NO_INLINE_SET`]).
@@ -488,6 +547,9 @@ impl Object {
 
     /// Sets generic-JIT flag bits (they are never cleared).
     pub fn add_jit_flags(&mut self, bits: u8) {
+        if self.jit_flags | bits != self.jit_flags {
+            self.layout_changed();
+        }
         self.jit_flags |= bits;
     }
 
@@ -906,6 +968,7 @@ impl Object {
         }
         // A fresh empty shape so `shape()` returns a pointer that resolves no
         // key (inline caches keyed on it always miss for this object).
+        self.layout_changed();
         self.data = ObjectData::Dict {
             order,
             map: Box::new(map),
@@ -1036,6 +1099,9 @@ impl Object {
     /// Marks own property `key` non-writable (idempotent).
     pub fn set_readonly(&mut self, key: &str) {
         if !self.is_readonly(key) {
+            if self.jit_flags & JIT_FLAG_READONLY == 0 {
+                self.layout_changed();
+            }
             self.jit_flags |= JIT_FLAG_READONLY;
             self.extra_mut().readonly.push(alloc::boxed::Box::from(key));
         }

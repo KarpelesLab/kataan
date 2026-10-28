@@ -1187,23 +1187,20 @@ fn simplify_bin(
 /// value — the JIT integer fast path only applies to such constants. `-0` is
 /// not one: an `i64` has no negative zero, so it would come back as `+0`.
 #[cfg(feature = "alloc")]
+#[inline(always)]
 fn nanbox_int(v: crate::nanbox::NanBox) -> Option<i64> {
-    match v.unpack() {
-        crate::nanbox::Unpacked::Number(n)
-            if n.is_finite() && !(n == 0.0 && n.is_sign_negative()) =>
-        {
-            let i = n as i64;
-            // Lossless round-trip and within the exact-integer range (±2^53).
-            if (i as f64) == n
-                && (-9.007_199_254_740_992e15..=9.007_199_254_740_992e15).contains(&n)
-            {
-                Some(i)
-            } else {
-                None
-            }
-        }
-        _ => None,
+    let n = v.as_number()?;
+    // Within the exact-integer range (±2^53; false for NaN and the
+    // infinities) first, so the conversion below needs no saturation.
+    if !(-9.007_199_254_740_992e15..=9.007_199_254_740_992e15).contains(&n) {
+        return None;
     }
+    let i = n as i64;
+    // A lossless round-trip, and not -0.
+    if (i as f64) != n || (i == 0 && n.is_sign_negative()) {
+        return None;
+    }
+    Some(i)
 }
 
 /// The register an op the Int tier lowers writes (`None` for the others).
@@ -3117,12 +3114,21 @@ impl JitProto {
         }
         match self.kind {
             JitKind::Int => {
-                // Guard: every argument must be an exact integer.
-                let mut ints = [0i64; 6];
-                for (slot, a) in ints.iter_mut().zip(args.iter()) {
-                    *slot = nanbox_int(*a)?;
-                }
-                let r = self.func.call_args(&ints[..self.n_params]);
+                // Guard: every argument must be an exact integer. (Straight-line
+                // per-slot reads: a zip into a stack array costs a `memset` and
+                // a `memcpy` call on this per-callback path.)
+                let int = |v: &crate::nanbox::NanBox| nanbox_int(*v);
+                let a = match args {
+                    [] => [0; 6],
+                    [a] => [int(a)?, 0, 0, 0, 0, 0],
+                    [a, b] => [int(a)?, int(b)?, 0, 0, 0, 0],
+                    [a, b, c] => [int(a)?, int(b)?, int(c)?, 0, 0, 0],
+                    [a, b, c, d] => [int(a)?, int(b)?, int(c)?, int(d)?, 0, 0],
+                    [a, b, c, d, e] => [int(a)?, int(b)?, int(c)?, int(d)?, int(e)?, 0],
+                    [a, b, c, d, e, f] => [int(a)?, int(b)?, int(c)?, int(d)?, int(e)?, int(f)?],
+                    _ => return None,
+                };
+                let r = self.func.call_int6(a);
                 // A result outside ±2^53 is the overflow/range deopt sentinel.
                 if (-SAFE_INT_MAX..=SAFE_INT_MAX).contains(&r) {
                     Some(crate::nanbox::NanBox::number(r as f64))
@@ -3132,14 +3138,16 @@ impl JitProto {
             }
             JitKind::Float => {
                 // Guard: every argument must be a (finite) JS number.
-                let mut fs = [0.0f64; 4];
-                for (slot, a) in fs.iter_mut().zip(args.iter()) {
-                    *slot = match a.unpack() {
-                        crate::nanbox::Unpacked::Number(n) => n,
-                        _ => return None,
-                    };
-                }
-                let r = self.func.call_args_f64(&fs[..self.n_params]);
+                let num = |v: &crate::nanbox::NanBox| v.as_number();
+                let a = match args {
+                    [] => [0.0; 4],
+                    [a] => [num(a)?, 0.0, 0.0, 0.0],
+                    [a, b] => [num(a)?, num(b)?, 0.0, 0.0],
+                    [a, b, c] => [num(a)?, num(b)?, num(c)?, 0.0],
+                    [a, b, c, d] => [num(a)?, num(b)?, num(c)?, num(d)?],
+                    _ => return None,
+                };
+                let r = self.func.call_f64x4(a);
                 Some(crate::nanbox::NanBox::number(r))
             }
             // The generic tier is invoked via `call_frame_raw` (it needs the
@@ -3353,6 +3361,45 @@ impl JitProto {
             self.func
                 .call_generic(ctx, regs.as_mut_ptr().cast::<u64>(), entry as u64),
         )
+    }
+
+    /// Enters a generic body at its native-call entry (see
+    /// [`Self::native_entry`]) exactly as a compiled caller's call sequence
+    /// does: `window` is the callee's register window on the register stack,
+    /// laid out just above the native-call header and the `argc` arguments at
+    /// `argv`; `caps` the closure's captured values and `this` the receiver.
+    /// `None` if the body has no such entry.
+    ///
+    /// # Safety
+    /// `ctx` is the live, otherwise-unborrowed `Ctx`; `window` points at
+    /// `n_regs` writable words at the top of that context's register stack,
+    /// directly above a complete native-call header (`FRAME_HEADER` words)
+    /// and the arguments (which `argv` points at); `caps` at the closure's
+    /// `n_captures` captured values.
+    #[allow(unsafe_code)]
+    #[must_use]
+    pub unsafe fn call_native_entry(
+        &self,
+        ctx: *mut core::ffi::c_void,
+        window: *mut u64,
+        argc: u64,
+        argv: *const u64,
+        caps: *const u64,
+        this: u64,
+    ) -> Option<u64> {
+        let code = self.native_entry()?;
+        // SAFETY: `code` is this body's native-call entry, emitted to the
+        // System V signature below (see `call_seq::emit_native_entry`); the
+        // pointers satisfy its contract per this function's.
+        let f: extern "C" fn(
+            *mut core::ffi::c_void,
+            *mut u64,
+            u64,
+            *const u64,
+            *const u64,
+            u64,
+        ) -> u64 = unsafe { core::mem::transmute(code as usize) };
+        Some(f(ctx, window, argc, argv, caps, this))
     }
 
     /// The parameter count of the compiled function.
@@ -6008,8 +6055,14 @@ impl JitFunction {
                     a.jne(helper);
                     // A host-exotic, global or tracked-prototype object's writes
                     // need the helper, as do those of an object with a
-                    // non-writable property (`JIT_FLAG_READONLY`).
-                    a.cmp_byte_at_rcx_imm(layout.props.off_jit_flags, 0);
+                    // non-writable property (`JIT_FLAG_READONLY`). (A watched
+                    // object's existing data properties are plain stores: a
+                    // value is no part of the layout its watchers validate.)
+                    a.p_test_byte_imm(
+                        call_seq::r::RCX,
+                        layout.props.off_jit_flags,
+                        !props::FLAG_WATCHED,
+                    );
                     a.jne(helper);
                     a.mov_rax_at_rcx(layout.off_shape);
                     a.movabs_r11(s.cache_ptr as i64);
@@ -6788,6 +6841,14 @@ impl JitFunction {
         for (slot, v) in a.iter_mut().zip(args.iter()) {
             *slot = *v;
         }
+        self.call_f64x4(a)
+    }
+
+    /// [`Self::call_args_f64`] with the four argument registers given (the
+    /// unused ones are ignored by the callee).
+    #[must_use]
+    #[inline]
+    pub fn call_f64x4(&self, a: [f64; 4]) -> f64 {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
             // SAFETY: the compiled code follows the System V ABI for
@@ -6814,6 +6875,14 @@ impl JitFunction {
         for (slot, v) in a.iter_mut().zip(args.iter()) {
             *slot = *v;
         }
+        self.call_int6(a)
+    }
+
+    /// [`Self::call_args`] with the six argument registers given (the unused
+    /// ones are ignored by the callee).
+    #[must_use]
+    #[inline]
+    pub fn call_int6(&self, a: [i64; 6]) -> i64 {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
             // SAFETY: the compiled code follows the System V ABI for

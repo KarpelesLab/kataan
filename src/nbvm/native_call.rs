@@ -132,6 +132,10 @@ enum FastOp {
     ObjKeys,
     /// `Object.entries`.
     ObjEntries,
+    /// A built-in `Math` function (its native id), computed by
+    /// `math_fast::compute` on Number arguments.
+    #[cfg(feature = "std")]
+    Math(u16),
     /// A built-in whose implementation is the host's (`Object.assign`,
     /// `JSON.stringify`, `JSON.parse`): the resolved function is called
     /// through the host directly, with no by-name re-resolution.
@@ -159,6 +163,8 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         Some(N_OBJECT_KEYS) => return FastOp::ObjKeys,
         Some(N_OBJECT_ENTRIES) => return FastOp::ObjEntries,
         Some(N_OBJECT_ASSIGN | N_JSON_STRINGIFY | N_JSON_PARSE) => return FastOp::HostDirect,
+        #[cfg(feature = "std")]
+        Some(id) if super::math_fast::is_math_native(id) => return FastOp::Math(id),
         _ => {}
     }
     let Some((id, target)) = realm.bound_native_at(f) else {
@@ -251,7 +257,7 @@ fn site_hit(realm: &Realm, site: &mut NativeSite, h: Handle, prim: bool, key: &s
 
 /// Re-resolves the site for receiver `h` (see [`site_hit`] for `prim`):
 /// records the intrinsic `recv[key]` reaches, if it is one served here.
-fn fill(realm: &Realm, site: &mut NativeSite, h: Handle, prim: bool, key: &str) {
+fn fill(realm: &mut Realm, site: &mut NativeSite, h: Handle, prim: bool, key: &str) {
     site.fills += 1;
     site.op = FastOp::None;
     let found = if prim {
@@ -407,7 +413,7 @@ pub(super) fn try_call(
             site.op = FastOp::None;
             return None;
         }
-        fill(&ctx.realm, site, h, prim, key);
+        fill(&mut ctx.realm, site, h, prim, key);
         if site.op == FastOp::None {
             return None;
         }
@@ -429,6 +435,8 @@ pub(super) fn try_call(
     let realm = &mut ctx.realm;
     let v = match site.op {
         FastOp::None | FastOp::ArrayHof(_) => return None,
+        #[cfg(feature = "std")]
+        FastOp::Math(id) => super::math_fast::compute(realm, id, args, regs)?,
         FastOp::ArrayPush => {
             // Exactly the host's dense-array `push` guards: no index side table,
             // no inherited index accessor, the length is the dense length and
