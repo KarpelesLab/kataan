@@ -7850,6 +7850,17 @@ fn unit_symbol(unit: &str) -> &str {
     }
 }
 
+/// `trunc(v)` modulo 2^32 (0 for NaN/±Infinity): the shared core of ToInt32,
+/// ToUint32 and the narrower ToInt8/ToUint16/… (2^8 and 2^16 divide 2^32).
+fn wrap_u32(v: f64) -> u32 {
+    if !v.is_finite() {
+        return 0;
+    }
+    const TWO32: f64 = 4_294_967_296.0;
+    let m = crate::common::FloatExt::trunc(v) % TWO32;
+    (if m < 0.0 { m + TWO32 } else { m }) as u32
+}
+
 /// Little-endian encode of one already-coerced typed-array element value of `kind`
 /// (index into [`TYPED_ARRAY_KINDS`]) — the inverse of [`decode_typed_element`].
 /// Writes into a fixed `[u8; 8]` (no per-element heap allocation) and returns the
@@ -7857,13 +7868,17 @@ fn unit_symbol(unit: &str) -> &str {
 /// Callers use `&buf[..n]` as the encoded element.
 pub(crate) fn encode_typed_element(kind: u8, v: f64) -> ([u8; 8], usize) {
     let mut out = [0u8; 8];
+    // The integer kinds take `v` modulo 2^32 (ToInt8 .. ToUint32 are all
+    // modular): a plain `as i64` cast saturates past 2^63, so `1e100` would
+    // store -1 instead of 0.
+    let w = wrap_u32(v);
     let n = match kind {
         0 => {
-            out[0] = (v as i64 as i8) as u8; // Int8
+            out[0] = w as u8; // Int8
             1
         }
         1 => {
-            out[0] = v as i64 as u8; // Uint8
+            out[0] = w as u8; // Uint8
             1
         }
         2 => {
@@ -7871,19 +7886,19 @@ pub(crate) fn encode_typed_element(kind: u8, v: f64) -> ([u8; 8], usize) {
             1
         }
         3 => {
-            out[..2].copy_from_slice(&(v as i64 as i16).to_le_bytes()); // Int16
+            out[..2].copy_from_slice(&(w as u16 as i16).to_le_bytes()); // Int16
             2
         }
         4 => {
-            out[..2].copy_from_slice(&(v as i64 as u16).to_le_bytes()); // Uint16
+            out[..2].copy_from_slice(&(w as u16).to_le_bytes()); // Uint16
             2
         }
         5 => {
-            out[..4].copy_from_slice(&(v as i64 as i32).to_le_bytes()); // Int32
+            out[..4].copy_from_slice(&(w as i32).to_le_bytes()); // Int32
             4
         }
         6 => {
-            out[..4].copy_from_slice(&(v as i64 as u32).to_le_bytes()); // Uint32
+            out[..4].copy_from_slice(&w.to_le_bytes()); // Uint32
             4
         }
         7 => {

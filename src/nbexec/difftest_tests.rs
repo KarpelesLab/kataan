@@ -394,3 +394,23 @@ fn error_instances_inherit_their_name() {
         "false|message|TypeError|TypeError: m|false|TypeError|false|RangeError: q|TE|TE: z"
     );
 }
+
+/// ToInt32 / ToUint32 / ToUint16 are modular for every finite Number: a
+/// magnitude past 2^63 (`1e100`, `2**64 + 20480`) wraps rather than saturating
+/// (an `as i64` cast) in `Math.clz32`, `Math.imul`, DataView setters,
+/// `String.fromCharCode`, the `split` limit and integer typed-array stores.
+#[test]
+fn integer_conversions_wrap_past_two_to_the_63() {
+    let src = r#"
+        // X is exactly 2^64 + 20480: its low 32 bits are 20480.
+        var X = 2 ** 64 + 4096 * 5, dv = new DataView(new ArrayBuffer(4)), r = [];
+        dv.setInt32(0, 1e100); r.push(dv.getInt32(0));
+        dv.setUint16(0, X); r.push(dv.getUint16(0));
+        dv.setInt8(0, -1e100); r.push(dv.getInt8(0));
+        r.push(Math.clz32(1e100), Math.clz32(X), Math.imul(X, 5),
+               String.fromCharCode(1e100, X).length, String.fromCharCode(X).charCodeAt(0),
+               "a,b,c".split(",", X).length, new Int32Array([1e100])[0], new Uint16Array([X])[0]);
+        r.join()
+    "#;
+    assert_eq!(run(src), "0,20480,0,32,17,102400,2,20480,3,0,20480");
+}

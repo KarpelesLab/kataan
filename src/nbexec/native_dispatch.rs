@@ -357,7 +357,9 @@ impl Interp {
                         };
                         (w == v, timeout)
                     } else {
-                        let v = self.coerce_to_integer_or_infinity(arg(2))? as i64 as i32;
+                        // ToInt32(value): modular (an `as i64` cast saturates).
+                        let vn = self.coerce_to_number(arg(2))?;
+                        let v = self.realm.to_int32(vn);
                         let timeout =
                             if matches!(arg(3).unpack(), crate::nanbox::Unpacked::Undefined) {
                                 f64::INFINITY
@@ -3055,20 +3057,17 @@ impl Interp {
                 NanBox::number(f16_to_f64(f64_to_f16_bits(self.realm.to_number(arg(0)))))
             }
             // `Math.clz32(x)` — count leading zeros of the ToUint32 value. ToUint32
-            // maps a non-finite/NaN value to 0 (so `clz32(Infinity)` is 32). The
-            // `as i64 as u32` cast performs trunc-toward-zero mod 2^32 without the
-            // `f64::trunc` intrinsic (so this stays available in `no_std`).
+            // maps a non-finite/NaN value to 0 (so `clz32(Infinity)` is 32).
             N_MATH_CLZ32 => {
-                let n = self.realm.to_number(arg(0));
-                let u = if n.is_finite() { n as i64 as u32 } else { 0 };
+                // ToUint32 is modular: a magnitude past 2^63 (`1e100`) still
+                // wraps, it does not saturate.
+                let u = self.realm.to_uint32(arg(0));
                 NanBox::number(u.leading_zeros() as f64)
             }
             // `Math.imul(a, b)` — 32-bit integer multiplication.
             N_MATH_IMUL => {
-                let an = self.realm.to_number(arg(0));
-                let bn = self.realm.to_number(arg(1));
-                let a = if an.is_finite() { an as i64 as i32 } else { 0 };
-                let b = if bn.is_finite() { bn as i64 as i32 } else { 0 };
+                let a = self.realm.to_int32(arg(0));
+                let b = self.realm.to_int32(arg(1));
                 NanBox::number(a.wrapping_mul(b) as f64)
             }
             #[cfg(not(feature = "std"))]

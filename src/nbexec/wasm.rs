@@ -417,10 +417,8 @@ impl Interp {
     pub(crate) fn wasm_coerce_global(&mut self, ty: &str, v: NanBox) -> NanBox {
         match ty {
             "i32" => {
-                // ToInt32 without the std-only `trunc`: truncate toward zero (the
-                // `as i64` cast) then take the low 32 bits.
-                let n = self.realm.to_number(v);
-                let i = if n.is_finite() { n as i64 as i32 } else { 0 };
+                // ToInt32 (modular: `1e100` wraps to 0, it does not saturate).
+                let i = self.realm.to_int32(v);
                 NanBox::number(f64::from(i))
             }
             "i64" => {

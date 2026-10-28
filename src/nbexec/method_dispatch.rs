@@ -1072,14 +1072,10 @@ impl Interp {
                 let mut units: Vec<u16> = Vec::with_capacity(args.len());
                 for a in args {
                     // ToNumber each argument (Symbol → TypeError), then ToUint16:
-                    // truncate toward zero, mod 2^16.
+                    // truncate toward zero, mod 2^16 (modular all the way up: an
+                    // `as i64` cast would saturate past 2^63).
                     let num = self.coerce_to_number(*a)?;
-                    let n = self.realm.to_number(num);
-                    units.push(if n.is_finite() {
-                        (n as i64).rem_euclid(65536) as u16
-                    } else {
-                        0
-                    });
+                    units.push(self.realm.to_uint32(num) as u16);
                 }
                 if let [u] = units[..] {
                     return Ok(Some(NanBox::handle(self.realm.unit_string(u).to_raw())));
@@ -1438,11 +1434,14 @@ impl Interp {
                     // and a finite value is truncated toward zero then reduced into the
                     // type's width (e.g. `setUint8(0, 256)` stores 0, `setUint8(0, Infinity)`
                     // stores 0). Plain `as i64` would saturate Infinity to i64::MAX (0xFF…).
-                    // (Integer DataView types are at most 4 bytes wide, so the truncated
-                    // value fits an `i64` and the low `8*size` bits are the stored bytes;
-                    // `trunc_toward_zero` avoids the std-only `f64::trunc` for `no_std`.)
+                    // (Integer DataView types are at most 4 bytes wide, so the low
+                    // `8*size` bits of `trunc(value) mod 2^32` are the stored bytes; the
+                    // reduction runs in `f64` because an `as i64` cast would saturate
+                    // past 2^63. `trunc_toward_zero` avoids the std-only `f64::trunc`.)
                     if value.is_finite() {
-                        let truncated = trunc_toward_zero(value) as i64 as u64;
+                        const TWO32: f64 = 4_294_967_296.0;
+                        let m = trunc_toward_zero(value) % TWO32;
+                        let truncated = (if m < 0.0 { m + TWO32 } else { m }) as u64;
                         let mask = if size >= 8 {
                             u64::MAX
                         } else {
@@ -2384,18 +2383,12 @@ impl Interp {
                     // an empty array.
                     // Spec order: ToUint32(limit) runs *before* ToString(separator),
                     // and its ToNumber may run a user `valueOf`/`@@toPrimitive` (an
-                    // abrupt one throws here). Computed inline so the no-`std` build
-                    // (no `Realm::to_uint32`) still compiles.
+                    // abrupt one throws here). ToUint32 is modular even past 2^63.
                     let limit = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         u32::MAX
                     } else {
                         let nv = self.coerce_to_number(arg(1))?;
-                        let n = self.realm.to_number(nv);
-                        if n.is_finite() {
-                            (n as i64).rem_euclid(4_294_967_296) as u32
-                        } else {
-                            0
-                        }
+                        self.realm.to_uint32(nv)
                     } as usize;
                     // `R = ToString(separator)` (spec step 7) runs *before* the
                     // `lim === 0` short-circuit (step 8), so a throwing separator

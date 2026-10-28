@@ -650,11 +650,8 @@ pub(super) fn try_call(
             let mut units = alloc::vec::Vec::with_capacity(args.len());
             for r in args {
                 let n = regs[*r as usize].as_number()?;
-                units.push(if n.is_finite() {
-                    (n as i64).rem_euclid(65536) as u16
-                } else {
-                    0
-                });
+                // Modular all the way up (an `as i64` cast saturates past 2^63).
+                units.push(realm.to_uint32(NanBox::number(n)) as u16);
             }
             if let [u] = units[..] {
                 NanBox::handle(realm.unit_string(u).to_raw())

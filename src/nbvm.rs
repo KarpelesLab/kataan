@@ -11323,14 +11323,8 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             // interpreter has always used the WTF-8 path here.
             let units: Vec<u16> = args
                 .iter()
-                .map(|a| {
-                    let n = ctx.realm.to_number(*a);
-                    if n.is_finite() {
-                        (n as i64).rem_euclid(65536) as u16
-                    } else {
-                        0
-                    }
-                })
+                // ToUint16: modular all the way up (an `as i64` cast saturates).
+                .map(|a| ctx.realm.to_uint32(*a) as u16)
                 .collect();
             let bytes = crate::wtf8::from_utf16(&units);
             NanBox::handle(ctx.realm.new_string_wtf8(bytes).to_raw())
