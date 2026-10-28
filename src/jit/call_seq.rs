@@ -351,8 +351,10 @@ impl X64Assembler {
 
     /// `call qword [base+disp]`.
     pub(crate) fn g_call_mem(&mut self, base: u8, disp: i32) {
+        self.spill_before_call();
         self.g_mem(false, &[0xff], 2, base, disp);
         self.clear_recv_cache();
+        self.reload_after_call();
     }
 
     /// `mov dst, src`.

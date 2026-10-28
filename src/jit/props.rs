@@ -1012,6 +1012,42 @@ impl X64Assembler {
         self.code.extend_from_slice(&disp.to_le_bytes());
     }
 
+    /// `mov dst, [base + index*8 + disp32]` (`index` not `rsp`).
+    pub(crate) fn p_load_index8(&mut self, dst: u8, base: u8, index: u8, disp: i32) {
+        debug_assert!(index != 4, "rsp is no index");
+        let rex = 0x48 | (((dst >> 3) & 1) << 2) | (((index >> 3) & 1) << 1) | ((base >> 3) & 1);
+        self.code.push(rex);
+        self.code.push(0x8b);
+        self.code.push(0x80 | ((dst & 7) << 3) | 4);
+        self.code.push(0xc0 | ((index & 7) << 3) | (base & 7));
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// [`p_obj_slot_addr`](Self::p_obj_slot_addr)'s read, split for a hot
+    /// path: with a slot index (zero-extended) in `rax` and an object's heap
+    /// slot in `rcx`, `rax` = an inline property value; an index past the
+    /// object's slot count goes to `miss`, one in the spill array to `spill`
+    /// (whose code, [`p_obj_slot_load_spill`](Self::p_obj_slot_load_spill),
+    /// can sit out of line).
+    pub(crate) fn p_obj_slot_load_inline(&mut self, l: &JitLayout, miss: Label, spill: Label) {
+        const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
+        self.p_cmp32_mem(r::RAX, r::RCX, l.off_slots_len);
+        self.g_jcc(cc::AE, miss);
+        self.p_cmp32_imm(r::RAX, INLINE);
+        self.g_jcc(cc::AE, spill);
+        self.p_load_index8(r::RAX, r::RCX, r::RAX, l.off_inline);
+    }
+
+    /// The spill-array half of
+    /// [`p_obj_slot_load_inline`](Self::p_obj_slot_load_inline): `rax` = the
+    /// value, then to `back`. Clobbers `r11`.
+    pub(crate) fn p_obj_slot_load_spill(&mut self, l: &JitLayout, back: Label) {
+        const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
+        self.g_load(r::R11, r::RCX, l.off_spill_ptr);
+        self.p_load_index8(r::RAX, r::R11, r::RAX, -8 * INLINE);
+        self.jmp(back);
+    }
+
     /// `cmp r32, imm32`.
     pub(crate) fn p_cmp32_imm(&mut self, reg: u8, imm: i32) {
         if reg >= 8 {

@@ -3467,6 +3467,11 @@ pub struct X64Assembler {
     /// Where the most recent [`bind`](Self::bind) bound its label (no label
     /// is bound past it, as `bind` binds at the end of the code).
     last_bind: usize,
+    /// While the generic tier emits an op inside a promoted numeric loop
+    /// (`numeric`): the SSE registers every `call` stores to the register
+    /// file first (when the flag is set) and reloads after, as `(xmm,
+    /// register-file displacement, store)`.
+    call_spill: Vec<(u8, i32, bool)>,
 }
 
 /// The value a receiver-cache key slot holds when it caches nothing: the
@@ -3514,6 +3519,17 @@ impl X64Assembler {
     /// Sets the receiver-cache key slots (see the `recv_cache_keys` field).
     pub(crate) fn set_recv_cache_keys(&mut self, keys: Vec<i32>) {
         self.recv_cache_keys = keys;
+    }
+
+    /// Sets the promoted registers every `call` brackets (see the
+    /// `call_spill` field).
+    pub(crate) fn set_call_spill(&mut self, spill: Vec<(u8, i32, bool)>) {
+        self.call_spill = spill;
+    }
+
+    /// The promoted registers every `call` currently brackets.
+    pub(crate) fn call_spill_now(&self) -> Vec<(u8, i32, bool)> {
+        self.call_spill.clone()
     }
 
     /// Sets the slots only the frame prologue empties (see the `entry_clear`
@@ -4068,8 +4084,10 @@ impl X64Assembler {
     /// `call rax` — an indirect native call through `rax` (holding the callee's
     /// code address). The System V ABI requires `rsp` 16-byte aligned here.
     pub fn call_rax(&mut self) {
+        self.spill_before_call();
         self.code.extend_from_slice(&[0xff, 0xd0]);
         self.clear_recv_cache();
+        self.reload_after_call();
     }
 
     /// `mov <argreg[i]>, [rbp+disp]` — load a frame slot into System V integer
@@ -5246,6 +5264,7 @@ impl JitFunction {
                 backedge: backedge_helper,
                 global_ref: helpers.global_ref as usize as u64,
                 math1: helpers.math1 as usize as u64,
+                realm: helpers.call_layout.realm,
             },
             osr_entries,
             &catch_targets,
@@ -5259,7 +5278,14 @@ impl JitFunction {
         // of its heap slot, as a full walk proved it live, at
         // `[rbp + rc_cell(w)]`. The prologue and every call empty the keys.
         let gc_plan = recv_cache::plan_globals(ops, bytecode, |pc| num.in_region(pc));
-        let rc = recv_cache::plan(ops, bytecode, &gc_plan, osr_entries, &catch_targets);
+        let rc = recv_cache::plan(
+            ops,
+            bytecode,
+            &gc_plan,
+            |pc| num.in_region(pc),
+            osr_entries,
+            &catch_targets,
+        );
         // The `InitProp`s of a fresh literal (`recv_cache::fresh_inits`).
         let fresh_init = recv_cache::fresh_inits(ops, bytecode, osr_entries, &catch_targets);
         let rc_base = method_scratch - 8 * num.frame_slots() as i32;
@@ -5514,10 +5540,31 @@ impl JitFunction {
         }
         // `GetProp` miss paths, emitted after the body: (miss, done, dst, obj,
         // method site, call site).
-        let mut cold_gets: Vec<(Label, Label, u16, u16, *mut MethodSite, *const CallSite)> =
-            Vec::new();
-        for (op_idx, op) in ops.iter().enumerate() {
-            a.bind(labels[op_idx]);
+        // A promoted loop's `GetProp`s whose result goes straight into an SSE
+        // register: (spill read, its return, the slow paths' resume, past
+        // the op, the op).
+        let mut cold_reloads: Vec<(Label, Label, Label, Label, usize)> = Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut cold_gets: Vec<(
+            Label,
+            Label,
+            u16,
+            u16,
+            *mut MethodSite,
+            *const CallSite,
+            Vec<(u8, i32, bool)>,
+        )> = Vec::new();
+        // A speculative region's plain copy is emitted right after it
+        // (`numeric::NumGen::schedule`).
+        num.alloc_copy_labels(&mut a);
+        for (op_idx, copy) in num.schedule(ops.len()) {
+            let op = &ops[op_idx];
+            num.set_copy(copy);
+            if copy {
+                a.bind(num.copy_label(op_idx)?);
+            } else {
+                a.bind(labels[op_idx]);
+            }
             // A global binding read or write through the global binding
             // cache: the cached address, else (out of line) a fresh one from
             // `jit_helper_global_ref`, else the interpreter.
@@ -5556,6 +5603,19 @@ impl JitFunction {
             if num.emit(&mut a, &labels, throw_exit, op_idx, ops)? {
                 continue;
             }
+            // An op of a promoted loop: its calls store and reload the
+            // promoted registers, and a promoted register it writes is
+            // reloaded after it (`numeric::NumGen::call_spill`).
+            let in_region = num.in_region(op_idx);
+            if in_region {
+                a.set_call_spill(num.call_spill(op_idx));
+            }
+            // Where a fast path that left its result in the SSE register it
+            // is promoted to resumes (past the slow paths' reload).
+            let mut past_reload: Option<Label> = None;
+            // Likewise, with that reload out of line (it binds the slow
+            // paths' resume itself, `cold_reloads`).
+            let mut ool_past: Option<Label> = None;
             match *op {
                 GenericOp::Const { dst, imm } => {
                     if !ok(dst) {
@@ -5652,8 +5712,15 @@ impl JitFunction {
                             }
                             a.ucomisd_xmm0_xmm0();
                             a.jp(nan);
-                            a.movsd_mem_xmm0(disp(dst));
-                            a.jmp(done);
+                            if let Some(x) = num.result_xmm(op_idx, dst) {
+                                let past = a.new_label();
+                                numeric::NumGen::set_xmm_from_xmm0(&mut a, x);
+                                a.jmp(past);
+                                past_reload = Some(past);
+                            } else {
+                                a.movsd_mem_xmm0(disp(dst));
+                                a.jmp(done);
+                            }
                             a.bind(nan);
                             a.movabs_rax(canonical_nan as i64);
                             a.store_rax(disp(dst));
@@ -6021,13 +6088,37 @@ impl JitFunction {
                     a.jne(helper);
                     a.mov_eax_at_r11(layout.cache_slot_off);
                     a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
-                    a.p_obj_slot_addr(&layout, call_seq::r::R11, helper);
-                    a.g_load(call_seq::r::RAX, call_seq::r::R11, 0); // rax = NanBox at slot
-                    a.store_rax(disp(dst));
-                    a.jmp(done);
+                    if let Some(x) = num.result_xmm(op_idx, dst) {
+                        // In a promoted loop: the value straight into its SSE
+                        // register; the spill-array read and the slow paths'
+                        // reload are out of line (`cold_reloads`).
+                        let spill = a.new_label();
+                        let back = a.new_label();
+                        let past = a.new_label();
+                        a.p_obj_slot_load_inline(&layout, helper, spill);
+                        a.bind(back);
+                        numeric::NumGen::set_xmm_from_rax(&mut a, x);
+                        cold_reloads.push((spill, back, done, past, op_idx));
+                        ool_past = Some(past);
+                    } else {
+                        a.p_obj_slot_addr(&layout, call_seq::r::R11, helper);
+                        a.g_load(call_seq::r::RAX, call_seq::r::R11, 0); // rax = NanBox at slot
+                        a.store_rax(disp(dst));
+                        a.jmp(done);
+                    }
                     // The miss path is out of line (see `cold_gets`).
-                    cold_gets.push((helper, done, dst, obj, s.method_ptr, call_site));
-                    a.bind(done);
+                    cold_gets.push((
+                        helper,
+                        done,
+                        dst,
+                        obj,
+                        s.method_ptr,
+                        call_site,
+                        a.call_spill_now(),
+                    ));
+                    if ool_past.is_none() {
+                        a.bind(done);
+                    }
                 }
                 GenericOp::SetProp {
                     obj,
@@ -6150,8 +6241,15 @@ impl JitFunction {
                     a.movabs_r11(NanBox::hole().to_bits() as i64);
                     a.cmp_rax_r11();
                     a.je(helper);
-                    a.store_rax(disp(dst));
-                    a.jmp(done);
+                    if let Some(x) = num.result_xmm(op_idx, dst) {
+                        let past = a.new_label();
+                        numeric::NumGen::set_xmm_from_rax(&mut a, x);
+                        a.jmp(past);
+                        past_reload = Some(past);
+                    } else {
+                        a.store_rax(disp(dst));
+                        a.jmp(done);
+                    }
                     // jit_helper_get_elem(ctx, recv, key).
                     a.bind(helper);
                     a.mov_rdi_r15();
@@ -6220,9 +6318,16 @@ impl JitFunction {
                     // dense element count (`p_array_plain`); else the helper.
                     recv_slot!(op_idx, arr, helper, recv_cache::Family::Arr);
                     a.mov_rax_at_rcx(layout.off_arr_len);
-                    a.cvtsi2sd_xmm0_rax();
-                    a.movsd_mem_xmm0(disp(dst));
-                    a.jmp(done);
+                    if let Some(x) = num.result_xmm(op_idx, dst) {
+                        let past = a.new_label();
+                        numeric::NumGen::set_xmm_from_int_rax(&mut a, x);
+                        a.jmp(past);
+                        past_reload = Some(past);
+                    } else {
+                        a.cvtsi2sd_xmm0_rax();
+                        a.movsd_mem_xmm0(disp(dst));
+                        a.jmp(done);
+                    }
                     a.bind(helper);
                     a.mov_rdi_r15();
                     a.load_argreg(1, disp(arr));
@@ -6668,7 +6773,17 @@ impl JitFunction {
                     a.bind(done);
                 }
             }
+            if in_region {
+                a.set_call_spill(Vec::new());
+                if ool_past.is_none() {
+                    num.after_generic(&mut a, op_idx);
+                }
+            }
+            if let Some(l) = past_reload.or(ool_past) {
+                a.bind(l);
+            }
         }
+        num.set_copy(false);
         // Falling off the end of the stream (or branching to `len`).
         a.bind(labels[ops.len()]);
         a.movabs_rax(NanBox::jit_falloff_bits() as i64);
@@ -6703,6 +6818,15 @@ impl JitFunction {
             exec_op!(pc);
             a.jmp(done);
         }
+        // The out-of-line halves of promoted-loop `GetProp`s: the spill-array
+        // read, and the slow paths' reload of the promoted result.
+        for (spill, back, done, past, pc) in core::mem::take(&mut cold_reloads) {
+            a.bind(spill);
+            a.p_obj_slot_load_spill(&layout, back);
+            a.bind(done);
+            num.after_generic(&mut a, pc);
+            a.jmp(past);
+        }
         // The receiver cache's full walks: each refills its way and resumes.
         for (walk, back, recv, miss, w, fam) in core::mem::take(&mut cold_walks) {
             a.bind(walk);
@@ -6716,9 +6840,13 @@ impl JitFunction {
         }
         // The `GetProp` miss paths: the inherited data property or getter,
         // else the helper; each returns to its op's `done`.
-        for (helper, done, dst, obj, method_ptr, call_site) in core::mem::take(&mut cold_gets) {
+        for (helper, done, dst, obj, method_ptr, call_site, spill) in
+            core::mem::take(&mut cold_gets)
+        {
             // An inherited data property or getter, through the site's
-            // chain cache: the value, or the getter's native call.
+            // chain cache: the value, or the getter's native call. (In a
+            // promoted loop, its calls bracket the promoted registers.)
+            a.set_call_spill(spill);
             a.bind(helper);
             let slow = a.new_label();
             let getter = a.new_label();
@@ -6761,6 +6889,7 @@ impl JitFunction {
             throw_check!();
             a.store_rax(disp(dst));
             a.jmp(done);
+            a.set_call_spill(Vec::new());
         }
         // Throw exit. In a body with `try` regions, first offer the pending fault
         // to the activation's innermost handler (exactly the interpreter's

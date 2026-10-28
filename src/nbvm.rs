@@ -26455,6 +26455,61 @@ mod generic_jit_tests {
         }
     }
 
+    /// Promoted loops that read and write object fields and array elements
+    /// (`jit::numeric`'s generic region ops and speculative version): field
+    /// values of every edge kind, a getter, a setter, a string field, a
+    /// prototype field and non-Number fields (which leave the speculative
+    /// version for its plain copy) — bit-identical to the interpreter.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn generic_field_loops_match_interpreter() {
+        let src = "
+            function pairs(x, y) { const bs = [{ p: x, v: 0, m: y }, { p: y, v: 1, m: x }, { p: 0.5, v: -0, m: 2 }]; for (let i = 0; i < bs.length; i++) { const a = bs[i]; for (let j = i + 1; j < bs.length; j++) { const b = bs[j]; const d = a.p - b.p; const g = d / (d * d + 0.01); a.v -= d * b.m * g; b.v += d * a.m * Math.sqrt(g * g); } } return bs[0].v * 3 + bs[1].v * 5 + bs[2].v; }
+            function acc(x, y) { const o = { a: x, b: y, c: 0 }; let s = 0; for (let i = 0; i < 6; i++) { o.c = o.a * o.b - o.c; s = s + o.c * 0.5; } return s + o.c; }
+            function getter(x, y) { let n = 0; const o = { get a() { n = n + 1; return x; }, b: y, c: 0 }; let s = 0; for (let i = 0; i < 4; i++) { s = s + o.a * o.b; o.c = s; } return s * 10 + n + o.c; }
+            function setter(x, y) { let w = 0; const o = { set c(v) { w = w + v; }, a: x, b: y }; for (let i = 0; i < 4; i++) { o.c = o.a - o.b * i; } return w; }
+            function strs(x, y) { const o = { a: x, c: \"s\" }; let s = 0; for (let i = 0; i < 4; i++) { s = s + o.c; o.c = o.a + i; s = s + o.c * y; } return s.length; }
+            function proto(x, y) { const o = { __proto__: { a: x }, b: y }; let s = 0; for (let i = 0; i < 4; i++) { s = s + o.a * 2 - o.b; } return s; }
+            function elems(x, y) { const arr = [x, y, x * 2, -0]; let s = 0; for (let i = 0; i < arr.length; i++) { s = s + arr[i] * 1.5; } return s; }
+            function carried(x, y) { const o = { a: y }; let s = x; for (let i = 0; i < 5; i++) { s = s * 0.5 + o.a; } return s; }
+        ";
+        let vals = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            2147483647.0,
+            -2147483648.0,
+            1e300,
+            5e-324,
+        ];
+        for name in [
+            "pairs", "acc", "getter", "setter", "strs", "proto", "elems", "carried",
+        ] {
+            let mut args: Vec<(NanBox, NanBox)> = Vec::new();
+            for &x in &vals {
+                for &y in &vals {
+                    args.push((NanBox::number(x), NanBox::number(y)));
+                }
+            }
+            // Non-Number fields: the speculative version runs the op in its
+            // plain copy instead.
+            args.extend([
+                (NanBox::boolean(true), NanBox::number(2.0)),
+                (NanBox::null(), NanBox::undefined()),
+                (NanBox::number(3.0), NanBox::boolean(false)),
+                (NanBox::undefined(), NanBox::undefined()),
+            ]);
+            for (x, y) in args {
+                let (funcs, f) = compile_named(src, name);
+                diff_ok(&funcs, f, &[x, y]);
+            }
+        }
+    }
+
     /// A promoted loop's integer version (`jit::numeric::int32`) bails to the
     /// double version exactly where JavaScript leaves int32: overflow of `+`,
     /// `-`, `*`, `++`, unary `-`; `-0` from `0 * -k`, `-0`, `-4 % 2`; `% 0`;

@@ -292,12 +292,14 @@ fn id_of(ids: &mut Vec<(u16, u32)>, next: &mut u32, r: u16) -> u32 {
 }
 
 /// Plans the receiver cache for `ops` (see the module docs), given the global
-/// binding cache's plan; `osr_entries` and
+/// binding cache's plan and which ops lie in promoted loops (whose global
+/// accesses keep their own validated addresses); `osr_entries` and
 /// `catch_targets` are entries besides the ops' own branch targets.
 pub(super) fn plan(
     ops: &[GenericOp],
     bytecode: &[Op],
     globals: &GlobalPlan,
+    in_region: impl Fn(usize) -> bool,
     osr_entries: &[usize],
     catch_targets: &[usize],
 ) -> RecvPlan {
@@ -331,7 +333,7 @@ pub(super) fn plan(
             && match bytecode.get(i) {
                 // A global access without a cache slot calls a helper.
                 Some(Op::LoadGlobal { .. } | Op::StoreGlobal { .. }) => {
-                    globals.site.get(i).copied().flatten().is_some()
+                    globals.site.get(i).copied().flatten().is_some() || in_region(i)
                 }
                 _ => usually_inline(bytecode, i),
             };
@@ -364,6 +366,15 @@ pub(super) fn plan(
                 ids.clear();
             }
             _ => {}
+        }
+    }
+    // In a promoted loop, a receiver is usually the one the same site saw
+    // last iteration (a loop-invariant object, or one read afresh from the
+    // same binding): every site there checks its way first and refills it.
+    for i in 0..n {
+        if in_region(i) && site_recv(&ops[i]).is_some() {
+            fill[i] = true;
+            check[i] = true;
         }
     }
     // Ways, least recently used first per family, over the sites that use
