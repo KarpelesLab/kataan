@@ -200,3 +200,19 @@ fn default_sort_orders_by_utf16_code_unit() {
         "10000,ffff 61,d800,dc00 10000,e000,ffff 31,d800,dc00"
     );
 }
+
+/// A global `let`/`const`/`class` is not a property of the global object, so
+/// `globalThis.name = v` creates a separate property and leaves the binding
+/// alone (the write-side mirror applied to every global binding).
+#[test]
+fn global_object_write_leaves_lexical_binding() {
+    let src = r#"
+        let w = 1; const c = 2; class K {}
+        function rw() { return w; }
+        for (var i = 0; i < 3; i++) rw();
+        globalThis.w = 5; globalThis.c = 7; globalThis.K = 3;
+        var v = 1; globalThis.v = 9;
+        [w, globalThis.w, c, globalThis.c, typeof K, globalThis.K, rw(), v].join()
+    "#;
+    assert_eq!(run(src), "1,5,2,7,function,3,1,9");
+}

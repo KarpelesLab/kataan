@@ -9030,6 +9030,9 @@ impl crate::nbvm::VmHost for Interp {
         } else {
             self.global_scope.declare(name, value);
         }
+        // A global lexical is no property of the global object: recorded, so a
+        // `globalThis.name = v` write is not mirrored into it.
+        self.global_scope.mark_lexical(name);
         Ok(())
     }
 

@@ -1163,10 +1163,12 @@ impl Interp {
     /// with a global would leak into engine-internal construction (`%Promise%`,
     /// species constructors, …). Only an existing binding is updated; a brand-new
     /// `globalThis.foo = 1` is created by the ordinary global-object fallback that
-    /// identifier resolution already consults.
+    /// identifier resolution already consults. A global `let`/`const`/`class` is
+    /// not a property of the global object at all (it lives in the separate
+    /// declarative record), so a like-named property write leaves it alone.
     fn sync_global_object_write(&mut self, handle: Handle, name: &str, new: NanBox) {
         if self.global_this.as_handle() == Some(handle.to_raw()) {
-            if self.global_scope.get(name).is_some() {
+            if self.global_scope.get(name).is_some() && !self.global_scope.has_lexical(name) {
                 self.global_scope.set(name, new);
             }
             return;
@@ -1177,7 +1179,9 @@ impl Interp {
         // `self.global_this`/`global_scope` are the *running* realm's while that
         // code runs, so the main realm needs its own arm.
         if self.main_global_this.as_handle() == Some(handle.to_raw()) {
-            if self.main_global_scope.get(name).is_some() {
+            if self.main_global_scope.get(name).is_some()
+                && !self.main_global_scope.has_lexical(name)
+            {
                 self.main_global_scope.set(name, new);
             }
             return;
@@ -1192,6 +1196,7 @@ impl Interp {
             .iter()
             .find(|r| r.global_this.as_handle() == Some(handle.to_raw()))
             && r.global_scope.get(name).is_some()
+            && !r.global_scope.has_lexical(name)
         {
             r.global_scope.set(name, new);
         }
