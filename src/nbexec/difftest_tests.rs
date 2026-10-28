@@ -216,3 +216,23 @@ fn global_object_write_leaves_lexical_binding() {
     "#;
     assert_eq!(run(src), "1,5,2,7,function,3,1,9");
 }
+
+/// `delete globalThis.x` of a configurable global property (an indirect-eval
+/// `var`, an implicit global) also removes its binding mirror: the bare name
+/// is unresolvable afterwards, in code compiled before the delete as well.
+#[test]
+fn delete_global_object_property_drops_binding() {
+    let src = r#"
+        (0, eval)("var ev = 1"); (0, eval)("var ev2 = 2");
+        function rd(f) { try { return f(); } catch (e) { return e.name; } }
+        function r2() { return ev2; }
+        for (var i = 0; i < 5; i++) rd(r2);
+        var a = delete globalThis.ev, b = Reflect.deleteProperty(globalThis, "ev2");
+        var vv = 1;
+        [a, b, typeof ev, rd(() => ev), rd(r2), "ev" in globalThis, delete globalThis.vv, vv].join()
+    "#;
+    assert_eq!(
+        run(src),
+        "true,true,undefined,ReferenceError,ReferenceError,false,false,1"
+    );
+}

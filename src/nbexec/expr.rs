@@ -535,6 +535,7 @@ impl Interp {
             // index breaks its aliasing (10.4.4.5).
             if result {
                 self.arg_map_break(h, &name);
+                self.sync_global_object_delete(h, &name);
             }
         }
 
@@ -1199,6 +1200,32 @@ impl Interp {
             && !r.global_scope.has_lexical(name)
         {
             r.global_scope.set(name, new);
+        }
+    }
+
+    /// Mirrors a successful `delete globalThis.X` into the global *binding* `X`
+    /// (see [`Self::sync_global_object_write`]): a configurable global property
+    /// (a builtin, an indirect-`eval` `var`, an implicit global) is gone once
+    /// deleted, so a later bare `X` must throw a ReferenceError instead of
+    /// reading the stale mirror. A global lexical is no property and stays.
+    /// (`delete_local` bumps the global binding epoch, retiring compiled
+    /// code's cached address of the binding.)
+    pub(crate) fn sync_global_object_delete(&mut self, handle: Handle, name: &str) {
+        let scope = if self.global_this.as_handle() == Some(handle.to_raw()) {
+            self.global_scope.clone()
+        } else if self.main_global_this.as_handle() == Some(handle.to_raw()) {
+            self.main_global_scope.clone()
+        } else if let Some(r) = self
+            .created_realms
+            .iter()
+            .find(|r| r.global_this.as_handle() == Some(handle.to_raw()))
+        {
+            r.global_scope.clone()
+        } else {
+            return;
+        };
+        if scope.has_local(name) && !scope.has_lexical(name) {
+            scope.delete_local(name);
         }
     }
 

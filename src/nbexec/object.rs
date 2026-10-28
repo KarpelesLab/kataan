@@ -2173,9 +2173,11 @@ impl Interp {
             return Ok(false);
         }
         let result = self.realm.delete_property(obj, key);
-        // A successful delete of a mapped `arguments` index breaks its aliasing.
+        // A successful delete of a mapped `arguments` index breaks its aliasing;
+        // one of a global-object property drops its binding mirror.
         if result {
             self.arg_map_break(obj, key);
+            self.sync_global_object_delete(obj, key);
         }
         Ok(result)
     }
