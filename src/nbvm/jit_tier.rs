@@ -1621,6 +1621,7 @@ pub(crate) extern "C" fn jit_construct_info(
     }
     // The site's last constructor, still as it was: no lookups.
     if let Some(p) = site.construct.hit(&ctx.realm, ctor) {
+        fill_construct_fast(ctx, site, fh, fid, p);
         let obj = ctx.realm.jit_new_object_with_proto(p);
         // SAFETY: see the function contract.
         #[allow(unsafe_code)]
@@ -1654,6 +1655,9 @@ pub(crate) extern "C" fn jit_construct_info(
         return NONE;
     };
     site.construct.fill(&ctx.realm, ctor, NanBox::handle(p));
+    if proto.class_ctor {
+        fill_construct_fast(ctx, site, fh, fid, Handle::from_raw(p));
+    }
     let obj = ctx.realm.jit_new_object_with_proto(Handle::from_raw(p));
     // SAFETY: see the function contract.
     #[allow(unsafe_code)]
@@ -1661,6 +1665,80 @@ pub(crate) extern "C" fn jit_construct_info(
         *out = NanBox::handle(obj.to_raw()).to_bits();
     }
     jit_callee_info(ctx_raw, ctor)
+}
+
+/// Records the constructor `fh` (function `fid`), whose `prototype` is
+/// `proto`, in `site`'s inline constructor cache
+/// (`crate::jit::ConstructFast`) when its `[[Construct]]` is fixed by its
+/// identity: a base class constructor (so `prototype` is the class's,
+/// non-writable and non-configurable) with no instance-field initializer,
+/// the site holding a way for it. The constructor cell and its auxiliary
+/// object are watched, so a later change to the constructor's own
+/// properties retires the record with the prototype epoch.
+fn fill_construct_fast(ctx: &mut Ctx, site: &mut CallSite, fh: Handle, fid: u32, proto: Handle) {
+    let ctor = NanBox::handle(fh.to_raw()).to_bits();
+    if site.fast.ctor == ctor && site.fast.stamp == crate::object::proto_epoch() {
+        return;
+    }
+    // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    let Some(fp) = funcs.get(fid as usize) else {
+        return;
+    };
+    if !fp.class_ctor || fp.derived {
+        return;
+    }
+    let Some((n_caps, caps)) = ctx
+        .realm
+        .vm_function(fh)
+        .map(|(_, c)| (c.len(), c.as_ptr().cast::<u64>()))
+    else {
+        return;
+    };
+    let Some(target) = site.way_of(u64::from(fid) | ((n_caps as u64) << 32)) else {
+        return;
+    };
+    let Some(aux) = ctx.realm.jit_aux_of(fh) else {
+        return;
+    };
+    let fixed = ctx.realm.jit_object(aux).is_some_and(|o| {
+        o.is_readonly("prototype")
+            && o.is_non_configurable("prototype")
+            && o.get("prototype").and_then(|v| v.as_handle()) == Some(proto.to_raw())
+    });
+    if !fixed
+        || ctx.realm.get_property(fh, super::VM_CTOR).is_none()
+        || ctx.realm.get_property(fh, super::FIELDS_KEY).is_some()
+    {
+        return;
+    }
+    ctx.realm.watch_link(fh.to_raw(), Some(aux.to_raw()));
+    site.fast = crate::jit::ConstructFast {
+        ctor,
+        stamp: crate::object::proto_epoch(),
+        proto: proto.to_raw(),
+        target,
+        caps,
+    };
+}
+
+/// The `this` of a `new` its site's inline constructor cache serves
+/// (`crate::jit::ConstructAllocHelper`): a fresh ordinary object whose
+/// `[[Prototype]]` is `proto`, as `jit_construct_info` makes it.
+///
+/// # Safety
+/// `ctx` the live `Ctx`; `proto` the raw handle of a live object.
+pub(crate) extern "C" fn jit_construct_alloc(ctx: *mut core::ffi::c_void, proto: u64) -> u64 {
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    let obj = ctx.realm.jit_new_object_with_proto(Handle::from_raw(proto));
+    NanBox::handle(obj.to_raw()).to_bits()
 }
 
 /// A `new`'s result when the constructor body returned the heap value

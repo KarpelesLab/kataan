@@ -29,8 +29,8 @@ mod props;
 mod recv_cache;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use call_seq::{
-    CallLayout, CallSite, CallTarget, CalleeHelper, CalleeInfo, ConstructHelper,
-    ConstructResultHelper, FRAME_HEADER, JitStack, MethodHelper,
+    CallLayout, CallMemo, CallSite, CallTarget, CalleeHelper, CalleeInfo, ConstructAllocHelper,
+    ConstructFast, ConstructHelper, ConstructResultHelper, FRAME_HEADER, JitStack, MethodHelper,
 };
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use props::MethodSite;
@@ -2788,6 +2788,9 @@ pub struct GenericHelpers {
     /// A `new`'s result when the body returned a heap value
     /// (`jit_construct_result`).
     pub construct_result: ConstructResultHelper,
+    /// A `new` served by its site's inline constructor cache: its `this`
+    /// (`jit_construct_alloc`).
+    pub construct_alloc: ConstructAllocHelper,
     /// `Op::CallValue`'s slow path (`jit_helper_call_value(ctx, regs, n_regs,
     /// op, site)`, `site` the `CallSite`): the interpreter's call, which also
     /// refills the site's cache.
@@ -5337,6 +5340,7 @@ impl JitFunction {
         let method_helper = helpers.method_info as usize as u64;
         let construct_helper = helpers.construct_info as usize as u64;
         let construct_result_helper = helpers.construct_result as usize as u64;
+        let construct_alloc_helper = helpers.construct_alloc as usize as u64;
         let construct_slow_helper = helpers.construct as usize as u64;
         let call_this_helper = helpers.call_this as usize as u64;
         // The catch entries of the body's `try` regions: where the throw exit
@@ -6225,9 +6229,23 @@ impl JitFunction {
                         // A literal's allocation: its own helper, not the
                         // one-op interpreter.
                         crate::nbvm::Op::NewObject { dst } if ok(*dst) => {
+                            // Inline from the heap's free list, else the helper.
+                            let slow = a.new_label();
+                            let done = a.new_label();
+                            let realm_off = helpers.call_layout.realm;
+                            a.g_load(call_seq::r::R9, call_seq::r::R15, realm_off);
+                            a.g_load(
+                                call_seq::r::RSI,
+                                call_seq::r::R9,
+                                layout.props.default_proto,
+                            );
+                            a.p_alloc_object(&layout, realm_off, slow);
+                            a.jmp(done);
+                            a.bind(slow);
                             a.mov_rdi_r15();
                             a.movabs_rax(helpers.new_object as usize as i64);
                             a.call_rax();
+                            a.bind(done);
                             a.store_rax(disp(*dst));
                         }
                         crate::nbvm::Op::NewArrayFrom { .. } | crate::nbvm::Op::NewArray { .. } => {
@@ -7023,6 +7041,7 @@ impl JitFunction {
                                 scratch: method_scratch,
                                 helper: construct_helper,
                                 result: construct_result_helper,
+                                alloc: construct_alloc_helper,
                             },
                             this: None,
                             args,

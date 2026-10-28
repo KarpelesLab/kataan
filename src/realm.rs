@@ -97,6 +97,9 @@ pub struct Realm {
     /// read by compiled code, which then leaves every reference store to the
     /// write barrier's helper.
     jit_marking: bool,
+    /// `default_object_proto` as an object's raw `proto` word (`NO_PROTO` for
+    /// none): what compiled code's inline `Op::NewObject` gives the new object.
+    jit_default_proto: u64,
     /// Monotonic counter giving each `Symbol` a unique identity.
     next_symbol_id: u64,
     /// Maps a symbol's id back to its heap handle, so a symbol used as a property
@@ -653,6 +656,7 @@ impl Realm {
             atoms: AtomTable::new(),
             incremental: None,
             jit_marking: false,
+            jit_default_proto: crate::object::NO_PROTO,
             next_symbol_id: 1,
             symbols_by_id: alloc::collections::BTreeMap::new(),
             fn_protos: alloc::collections::BTreeMap::new(),
@@ -894,6 +898,9 @@ impl Realm {
         // The default `[[Prototype]]`s may change: retire every validated chain.
         crate::object::bump_proto_epoch();
         self.default_object_proto = s.default_object_proto;
+        self.jit_default_proto = s
+            .default_object_proto
+            .map_or(crate::object::NO_PROTO, Handle::to_raw);
         self.array_proto_intrinsic = s.array_proto;
         self.promise_proto_intrinsic = s.promise_proto;
         self.function_proto_intrinsic = s.function_proto;
@@ -1169,6 +1176,28 @@ impl Realm {
         core::mem::offset_of!(Realm, jit_marking)
     }
 
+    /// What compiled code's inline object allocation reads, as byte offsets
+    /// within a `Realm`: the heap's free-list and counters (see
+    /// [`crate::heap::HeapAllocOffsets`], here `Realm`-relative) and the root
+    /// shape's `Rc` word and the default object prototype's raw word,
+    /// `(heap, root_shape, default_proto)`.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_alloc_offsets() -> (crate::heap::HeapAllocOffsets, usize, usize) {
+        let h = crate::heap::jit_heap_alloc_offsets();
+        let heap = core::mem::offset_of!(Realm, heap);
+        (
+            crate::heap::HeapAllocOffsets {
+                free_ptr: heap + h.free_ptr,
+                free_len: heap + h.free_len,
+                live: heap + h.live,
+                allocs_since_gc: heap + h.allocs_since_gc,
+            },
+            core::mem::offset_of!(Realm, root_shape),
+            core::mem::offset_of!(Realm, jit_default_proto),
+        )
+    }
+
     /// The byte offsets, within a `Realm`, of the object heap's slot-array
     /// data-pointer and length words (see [`jit_arena_slots`](Self::jit_arena_slots)),
     /// for compiled code that reads them directly: `(ptr_off, len_off)`.
@@ -1223,6 +1252,7 @@ impl Realm {
     /// plain objects (so they inherit `toString`, `hasOwnProperty`, …).
     pub fn set_default_object_proto(&mut self, proto: Handle) {
         self.default_object_proto = Some(proto);
+        self.jit_default_proto = proto.to_raw();
     }
 
     /// The realm's `%Object.prototype%`, if wired.
@@ -3175,6 +3205,9 @@ impl Realm {
     pub fn set_vm_function_captures(&mut self, handle: Handle, new: Vec<NanBox>) {
         if let Some(Cell::VmFunction { captures, .. }) = self.heap.get_mut(handle) {
             *captures = new;
+            // Compiled call sites memoize a closure's captures buffer under
+            // the prototype epoch (`jit::CallMemo`).
+            crate::object::bump_proto_epoch();
         }
     }
 

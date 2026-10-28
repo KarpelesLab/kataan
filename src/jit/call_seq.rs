@@ -118,8 +118,91 @@ pub struct CallSite {
     pub targets: [CallTarget; CallSite::WAYS],
     /// The way the next new callee replaces.
     pub next: usize,
+    /// The last callee value the sequence identified (see [`CallMemo`]).
+    pub memo: CallMemo,
+    /// A `new` site's inline constructor cache (see [`ConstructFast`]).
+    pub fast: ConstructFast,
     /// A `new` site's constructor cache (unused by other sites).
     pub construct: super::props::ConstructCache,
+}
+
+/// A call site's identity memo: the callee **value** (its handle bits) the
+/// sequence last identified as the way `target`, with its captures at
+/// `caps`, at prototype epoch `stamp`.
+///
+/// While the epoch is unchanged, equal handle bits name the same heap cell
+/// with the same contents: a freed slot's generation is bumped (a slot whose
+/// generation would wrap is retired instead), and the ways a cell's contents
+/// can move or be replaced under a handle — a cell swap, a compaction, a
+/// snapshot restore's capture fill — all bump the epoch. A VM function
+/// cell's function id never changes and its captures vector is never
+/// resized, so the vector's buffer (`caps`) stays put while the cell lives
+/// (when the arena grows, a move of the cell moves only the vector's
+/// header). So a value equal to `bits` is the function the way `target` was
+/// filled for, its captures at `caps`, and the sequence skips identifying
+/// it. Cleared whenever a way is replaced.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CallMemo {
+    /// The callee's `NanBox` bits, or [`CallSite::EMPTY`] (no value has
+    /// those bits).
+    pub bits: u64,
+    /// The prototype epoch at which `bits` was identified.
+    pub stamp: u64,
+    /// The way it was identified as.
+    pub target: *const CallTarget,
+    /// Its captured values.
+    pub caps: *const u64,
+}
+
+impl CallMemo {
+    const fn empty() -> Self {
+        Self {
+            bits: CallSite::EMPTY,
+            stamp: 0,
+            target: core::ptr::null(),
+            caps: core::ptr::null(),
+        }
+    }
+}
+
+/// A `new` site's inline constructor cache, filled by `jit_construct_info`
+/// for a constructor whose `[[Construct]]` its identity fixes: a base class
+/// constructor without instance fields, whose `prototype` is non-writable
+/// and non-configurable (so always the object `proto`), with the constructor
+/// cell and its auxiliary property object watched (so any change to the
+/// constructor's own properties bumps the prototype epoch). While the epoch
+/// is still `stamp`, `new` of the value `ctor` (equal handle bits: see
+/// [`CallMemo`]) is: allocate an ordinary object whose `[[Prototype]]` is
+/// `proto`, and enter the way `target` with the captures at `caps`. Cleared
+/// whenever a way is replaced.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ConstructFast {
+    /// The constructor's `NanBox` bits, or [`CallSite::EMPTY`].
+    pub ctor: u64,
+    /// The prototype epoch at which it was recorded.
+    pub stamp: u64,
+    /// The raw handle of its `prototype` object.
+    pub proto: u64,
+    /// The way that enters its body.
+    pub target: *const CallTarget,
+    /// Its captured values.
+    pub caps: *const u64,
+}
+
+impl ConstructFast {
+    /// An empty cache.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            ctor: CallSite::EMPTY,
+            stamp: 0,
+            proto: 0,
+            target: core::ptr::null(),
+            caps: core::ptr::null(),
+        }
+    }
 }
 
 impl CallSite {
@@ -138,6 +221,8 @@ impl CallSite {
                 frame_bytes: 0,
             }; Self::WAYS],
             next: 0,
+            memo: CallMemo::empty(),
+            fast: ConstructFast::empty(),
             construct: super::props::ConstructCache::new(),
         }
     }
@@ -148,6 +233,15 @@ impl CallSite {
         self.targets.iter().any(|t| t.key == key)
     }
 
+    /// The way holding `key`, if any.
+    #[must_use]
+    pub fn way_of(&self, key: u64) -> Option<*const CallTarget> {
+        self.targets
+            .iter()
+            .find(|t| t.key == key)
+            .map(core::ptr::from_ref)
+    }
+
     /// Remembers `target` (a no-op when its key is already held).
     pub fn fill(&mut self, target: CallTarget) {
         if self.holds(target.key) {
@@ -155,6 +249,8 @@ impl CallSite {
         }
         let way = self.next % Self::WAYS;
         self.targets[way] = target;
+        self.memo = CallMemo::empty();
+        self.fast = ConstructFast::empty();
         self.next = (way + 1) % Self::WAYS;
     }
 }
@@ -217,6 +313,23 @@ pub type ConstructHelper =
 /// `result`: `(ctx, result, this) -> result if it is an object, else this`.
 pub type ConstructResultHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64) -> u64;
 
+/// The helper a `new` served by the site's [`ConstructFast`] allocates its
+/// `this` with: `(ctx, proto) -> the handle bits of a fresh ordinary object
+/// whose [[Prototype]] is the raw handle proto`. Never throws, never runs
+/// user code.
+pub type ConstructAllocHelper = extern "C" fn(*mut core::ffi::c_void, u64) -> u64;
+
+/// `CallSite` field offsets for emitted code.
+fn site_off(f: usize) -> i32 {
+    i32::try_from(f).expect("site offset fits in i32")
+}
+
+/// `mov dst, [PROTO_EPOCH]`.
+fn load_proto_epoch(a: &mut X64Assembler, dst: u8) {
+    a.g_movabs(dst, crate::object::proto_epoch_addr() as u64);
+    a.g_load(dst, dst, 0);
+}
+
 /// Where a call sequence's callee comes from.
 pub(crate) enum CalleeSrc {
     /// A value already in the native-frame slot `[rbp + scratch]` (a computed
@@ -226,8 +339,9 @@ pub(crate) enum CalleeSrc {
         scratch: i32,
     },
     /// A constructor register (`Op::Construct`, `new.target` the constructor
-    /// itself), prepared by the [`ConstructHelper`], which leaves the new
-    /// object in `[rbp + scratch]` (the call's `this`).
+    /// itself), prepared inline from the site's [`ConstructFast`] (with the
+    /// [`ConstructAllocHelper`]) or by the [`ConstructHelper`], either of
+    /// which leaves the new object in `[rbp + scratch]` (the call's `this`).
     Construct {
         /// The constructor register.
         ctor: u16,
@@ -235,6 +349,8 @@ pub(crate) enum CalleeSrc {
         scratch: i32,
         /// The preparation helper.
         helper: u64,
+        /// The [`ConstructAllocHelper`].
+        alloc: u64,
         /// The [`ConstructResultHelper`].
         result: u64,
     },
@@ -537,16 +653,43 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     let argc = e.args.len();
     let hdr = |i: usize| i32::try_from(i * 8).ok();
     let jl = super::compute_jit_layout();
+    use core::mem::offset_of;
+    let memo = offset_of!(CallSite, memo);
+    let memo_bits = site_off(memo + offset_of!(CallMemo, bits));
+    let memo_stamp = site_off(memo + offset_of!(CallMemo, stamp));
+    let memo_target = site_off(memo + offset_of!(CallMemo, target));
+    let memo_caps = site_off(memo + offset_of!(CallMemo, caps));
+    // `identified`: the way is in r11 and the captures in r8 already (a memo
+    // hit, or a constructor the site's `fast` cache prepared).
+    let identified = a.new_label();
+    // The memo check for the callee value in `rax` (see `CallMemo`): on a hit
+    // r11 = the way, r8 = the captures and on to `identified`; else on, `rax`
+    // unchanged.
+    let memo_check = |a: &mut X64Assembler| {
+        let decode = a.new_label();
+        a.g_movabs(r::R11, e.site as u64);
+        a.g_cmp_mem(r::RAX, r::R11, memo_bits);
+        a.g_jcc(cc::NE, decode);
+        load_proto_epoch(a, r::R9);
+        a.g_cmp_mem(r::R9, r::R11, memo_stamp);
+        a.g_jcc(cc::NE, decode);
+        a.g_load(r::R8, r::R11, memo_caps);
+        a.g_load(r::R11, r::R11, memo_target);
+        a.jmp(identified);
+        a.bind(decode);
+    };
     // 1. Which function is the callee? (rax = key, rdx = captures)
     // `load_callee(reg)` reloads its value into `reg` afterwards.
     let (callee_base, callee_disp) = match e.callee {
         CalleeSrc::Frame { scratch } => {
             a.g_load(r::RAX, RBP, scratch);
+            memo_check(a);
             a.p_callee_info(jl, l.realm);
             (RBP, scratch)
         }
         CalleeSrc::Reg(c) => {
             a.g_load(r::RAX, r::RBX, reg(c));
+            memo_check(a);
             a.p_callee_info(jl, l.realm);
             (r::RBX, reg(c))
         }
@@ -564,6 +707,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             a.g_jcc(cc::E, lookup);
             a.p_method_lookup(jl, l.realm, (r::RBX, reg(recv)), site, lookup, None);
             a.g_store(RBP, scratch, r::RAX);
+            memo_check(a);
             a.p_callee_info(jl, l.realm);
             a.jmp(have);
             a.bind(lookup);
@@ -580,8 +724,56 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             ctor,
             scratch,
             helper,
+            alloc,
             ..
         } => {
+            // The site's `fast` cache (see `ConstructFast`): the same
+            // constructor value at the same prototype epoch.
+            let fast = offset_of!(CallSite, fast);
+            let prep = a.new_label();
+            a.g_load(r::RAX, r::RBX, reg(ctor));
+            a.g_movabs(r::R11, e.site as u64);
+            a.g_cmp_mem(
+                r::RAX,
+                r::R11,
+                site_off(fast + offset_of!(ConstructFast, ctor)),
+            );
+            a.g_jcc(cc::NE, prep);
+            load_proto_epoch(a, r::R9);
+            a.g_cmp_mem(
+                r::R9,
+                r::R11,
+                site_off(fast + offset_of!(ConstructFast, stamp)),
+            );
+            a.g_jcc(cc::NE, prep);
+            a.g_load(
+                r::RSI,
+                r::R11,
+                site_off(fast + offset_of!(ConstructFast, proto)),
+            );
+            let by_helper = a.new_label();
+            let made = a.new_label();
+            a.p_alloc_object(jl, l.realm, by_helper);
+            a.jmp(made);
+            a.bind(by_helper);
+            a.g_mov(r::RDI, r::R15);
+            a.g_movabs(r::RAX, alloc);
+            a.call_rax();
+            a.bind(made);
+            a.g_store(RBP, scratch, r::RAX);
+            a.g_movabs(r::R11, e.site as u64);
+            a.g_load(
+                r::R8,
+                r::R11,
+                site_off(fast + offset_of!(ConstructFast, caps)),
+            );
+            a.g_load(
+                r::R11,
+                r::R11,
+                site_off(fast + offset_of!(ConstructFast, target)),
+            );
+            a.jmp(identified);
+            a.bind(prep);
             a.g_mov(r::RDI, r::R15);
             a.g_load(r::RSI, r::RBX, reg(ctor));
             a.g_lea(r::RDX, RBP, scratch);
@@ -604,6 +796,17 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     a.jmp(e.slow);
     a.bind(hit);
     a.g_mov(r::R8, r::RDX); // captures, for the callee's entry
+    if !matches!(e.callee, CalleeSrc::Construct { .. }) {
+        // Memoize the callee (see `CallMemo`).
+        a.g_load(r::R9, callee_base, callee_disp);
+        a.g_movabs(r::RDX, e.site as u64);
+        a.g_store(r::RDX, memo_bits, r::R9);
+        load_proto_epoch(a, r::R9);
+        a.g_store(r::RDX, memo_stamp, r::R9);
+        a.g_store(r::RDX, memo_target, r::R11);
+        a.g_store(r::RDX, memo_caps, r::R8);
+    }
+    a.bind(identified);
     // 2. The caller's window is on the register stack (so it is published),
     //    one realm, and room under both depth limits.
     a.g_load(r::R10, r::R15, l.stack);

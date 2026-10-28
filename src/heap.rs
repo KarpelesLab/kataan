@@ -221,6 +221,55 @@ pub(crate) fn jit_heap_slots_offsets() -> (usize, usize) {
     (field + ptr_off, field + len_off)
 }
 
+/// Where compiled code finds what [`Heap::alloc`]'s free-list path touches,
+/// as byte offsets within a `Heap<Cell>` (see [`jit_heap_alloc_offsets`]).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeapAllocOffsets {
+    /// The free list's data pointer.
+    pub free_ptr: usize,
+    /// The free list's length.
+    pub free_len: usize,
+    /// `live`.
+    pub live: usize,
+    /// `allocs_since_gc`.
+    pub allocs_since_gc: usize,
+}
+
+/// The [`HeapAllocOffsets`], probed (a `Vec`'s word order is unspecified).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[must_use]
+pub(crate) fn jit_heap_alloc_offsets() -> HeapAllocOffsets {
+    use crate::cell::Cell;
+    // Length 1, capacity 16: the three words all differ.
+    let mut v: Vec<u32> = Vec::with_capacity(16);
+    v.push(1);
+    let vec = core::ptr::addr_of!(v) as usize;
+    let word = core::mem::size_of::<usize>();
+    let (mut ptr_off, mut len_off) = (usize::MAX, usize::MAX);
+    for i in 0..core::mem::size_of::<Vec<u32>>() / word {
+        // SAFETY: the i-th word of the live `Vec`, in bounds.
+        #[allow(unsafe_code)]
+        let w = unsafe { *((vec + i * word) as *const usize) };
+        if w == v.as_ptr() as usize {
+            ptr_off = i * word;
+        } else if w == v.len() {
+            len_off = i * word;
+        }
+    }
+    assert!(
+        ptr_off != usize::MAX && len_off != usize::MAX && ptr_off != len_off,
+        "could not derive the heap's free-list Vec offsets"
+    );
+    let field = core::mem::offset_of!(Heap<Cell>, free);
+    HeapAllocOffsets {
+        free_ptr: field + ptr_off,
+        free_len: field + len_off,
+        live: core::mem::offset_of!(Heap<Cell>, live),
+        allocs_since_gc: core::mem::offset_of!(Heap<Cell>, allocs_since_gc),
+    }
+}
+
 /// A generational arena of `T`, addressed by [`Handle`].
 pub struct Heap<T> {
     slots: Vec<Slot<T>>,
