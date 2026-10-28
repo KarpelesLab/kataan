@@ -518,6 +518,10 @@ pub struct VmArrayIterIntrinsics {
     pub next_fn: Option<Handle>,
     /// The property-storage key of `Symbol.iterator`.
     pub iter_key: Option<alloc::boxed::Box<str>>,
+    /// The property-storage key of `Symbol.species`, recorded when the host
+    /// installs `get Array[@@species]` (the VM's array higher-order built-ins
+    /// use it to recognize the default `ArraySpeciesCreate` without effects).
+    pub species_key: Option<alloc::boxed::Box<str>>,
 }
 
 /// A snapshot of a realm's intrinsic prototype pointers (the realm-wide
@@ -5668,8 +5672,13 @@ impl Realm {
     pub fn compact(&mut self, roots: &mut [Handle]) -> Stats {
         let n = roots.len();
         // The VM's iteration intrinsics are a cache that the relocation below does
-        // not forward: drop it (the VM then takes the protocol path).
-        self.vm_array_iter = VmArrayIterIntrinsics::default();
+        // not forward: drop it (the VM then takes the protocol path). The
+        // `@@species` key is a string, not a handle, so it survives.
+        let species_key = self.vm_array_iter.species_key.take();
+        self.vm_array_iter = VmArrayIterIntrinsics {
+            species_key,
+            ..VmArrayIterIntrinsics::default()
+        };
 
         // The side-tables are weak-key (ephemeron) maps. Run the three phases
         // sequentially so each borrows the tables at a disjoint time:

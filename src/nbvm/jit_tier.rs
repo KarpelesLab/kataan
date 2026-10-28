@@ -632,6 +632,105 @@ fn call_compiled_with(
     })
 }
 
+/// One callee, called many times from a Rust loop (the array higher-order
+/// built-ins, `super::array_hof`), entered as [`call_compiled_with`] enters
+/// it — with the lookups that cannot change between calls done once: the
+/// closure's function, its compiled body, its captures (a closure's capture
+/// list is fixed at creation), and a register file reused across calls.
+pub(super) struct CompiledCallback {
+    callee: NanBox,
+    id: usize,
+    jit: Rc<crate::jit::JitProto>,
+    captures: alloc::vec::Vec<NanBox>,
+    n_params: usize,
+    regs: alloc::vec::Vec<NanBox>,
+}
+
+impl CompiledCallback {
+    /// The prepared call of `callee`, when [`call_compiled_with`] would enter
+    /// its compiled body directly right now; `None` otherwise.
+    pub(super) fn new(ctx: &mut Ctx, funcs: &[FnProto], callee: NanBox) -> Option<Self> {
+        let handle = Handle::from_raw(callee.as_handle()?);
+        let (fid, _) = ctx.realm.vm_function(handle)?;
+        let id = fid as usize;
+        let proto = funcs.get(id)?;
+        if ctx.realm.multi_realm || ctx.call_depth == 0 {
+            return None;
+        }
+        let jit = direct_jit(ctx, proto, id)?;
+        let (_, caps) = ctx.realm.vm_function(handle)?;
+        let captures = caps.iter().copied().take(proto.n_captures).collect();
+        Some(Self {
+            callee,
+            id,
+            jit,
+            captures,
+            n_params: proto.n_params,
+            regs: alloc::vec::Vec::new(),
+        })
+    }
+
+    /// `Call(callee, this, args)` from a caller that published its own frame
+    /// (so the callee may collect) — exactly [`call_compiled_with`]'s
+    /// activation.
+    pub(super) fn call(
+        &mut self,
+        ctx: &mut Ctx,
+        funcs: &[FnProto],
+        this: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, VmError> {
+        let proto = &funcs[self.id];
+        if ctx.call_depth >= ctx.realm.limits.max_call_depth
+            || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
+        {
+            let e = vm_error(ctx, "RangeError", "Maximum call stack size exceeded");
+            return Err(VmError::Thrown(e));
+        }
+        let mark = ctx.frame_shadow.len();
+        let published = ctx.frames_published;
+        ctx.call_depth += 1;
+        ctx.realm.vm_total_depth += 1;
+        let callee_mark = ctx.realm.vm_callee_stack.len();
+        let args_mark = ctx.realm.vm_args_buf.len();
+        ctx.realm.vm_callee_stack.push(self.callee);
+        ctx.realm.vm_callee_args.push(args_mark);
+        ctx.realm.vm_args_buf.extend_from_slice(args);
+        // The register file: parameters (missing ones `undefined`), captures,
+        // `this`, the rest `undefined`.
+        let regs = &mut self.regs;
+        regs.clear();
+        regs.resize(proto.n_regs, NanBox::undefined());
+        let n = self.n_params.min(args.len()).min(regs.len());
+        regs[..n].copy_from_slice(&args[..n]);
+        for (slot, c) in regs.iter_mut().skip(self.n_params).zip(&self.captures) {
+            *slot = *c;
+        }
+        if let Some(slot) = regs.get_mut(self.n_params + self.captures.len()) {
+            *slot = this;
+        }
+        if ctx.gc_enabled {
+            ctx.frame_shadow.extend_from_slice(args);
+            ctx.frame_shadow.extend_from_slice(&self.captures);
+            ctx.frame_shadow.push(this);
+        }
+        proto.tier.bump();
+        let outcome = run_compiled(ctx, funcs, &self.jit, regs, 0, &[]);
+        ctx.realm.vm_callee_stack.truncate(callee_mark);
+        ctx.realm.vm_callee_args.truncate(callee_mark);
+        ctx.realm.vm_args_buf.truncate(args_mark);
+        ctx.frames_published = published;
+        ctx.frame_shadow.truncate(mark);
+        ctx.call_depth -= 1;
+        ctx.realm.vm_total_depth -= 1;
+        match outcome {
+            Some(Ok(FrameExit::Return(v))) => Ok(v.unwrap_or(NanBox::undefined())),
+            Some(Ok(_)) | None => Err(VmError::Unsupported),
+            Some(Err(e)) => Err(e),
+        }
+    }
+}
+
 /// The getter half of a compiled body's static-key property read
 /// (`jit_helper_get_prop`): when `vm_get_prop` would begin by calling a VM
 /// getter found through the site's prototype-chain cache — the receiver an

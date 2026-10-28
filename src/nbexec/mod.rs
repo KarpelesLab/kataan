@@ -1205,7 +1205,7 @@ const N_TYPED_ARRAY_FROM: u16 = 230;
 /// `%TypedArray%.of(...items)` — builds an instance of the `this` constructor.
 const N_TYPED_ARRAY_OF: u16 = 231;
 /// `get %TypedArray%[Symbol.species]` — returns `this` (the receiver constructor).
-const N_TYPED_ARRAY_SPECIES: u16 = 232;
+pub(crate) const N_TYPED_ARRAY_SPECIES: u16 = 232;
 /// `get %TypedArray%.prototype[Symbol.toStringTag]` — the concrete view name.
 const N_TYPED_ARRAY_TO_STRING_TAG: u16 = 241;
 /// A `get %TypedArray%.prototype.<accessor>` getter (`buffer`/`byteLength`/
@@ -1247,7 +1247,7 @@ const N_REGEXP_LEGACY_SET: u16 = 423;
 /// (no real native id), used by the native-subclassing machinery
 /// (`class S extends Array {}`) to mark that a derived instance must be created as
 /// a dense `Cell::Array` rather than a plain object. Never a real callable's id.
-const N_BASE_ARRAY: u16 = 480;
+pub(crate) const N_BASE_ARRAY: u16 = 480;
 /// Sentinel "native base kind" id for `Object` — a namespace-object constructor,
 /// marking that a derived instance is an ordinary object (its `[[Prototype]]`
 /// from the subclass). Never a real callable's id.
@@ -3071,6 +3071,10 @@ impl Interp {
             NanBox::undefined(),
         );
         self.realm.mark_hidden(ctor, &species_key);
+        // Recorded for the VM's array higher-order built-ins (`array_hof`).
+        if ctor_name == "Array" && self.realm.vm_array_iter().species_key.is_none() {
+            self.realm.vm_array_iter_mut().species_key = Some(species_key.into());
+        }
     }
 
     fn install_proto_to_string_tag(&mut self, ctor_name: &str, tag: &str) {

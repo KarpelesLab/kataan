@@ -76,6 +76,9 @@ enum FastOp {
     /// `RegExp.prototype.test` / `exec`: the resolved function called through
     /// the host directly (no by-name re-resolution).
     RegExpCall,
+    /// An `Array.prototype` higher-order built-in (`map`, `forEach`, `sort`,
+    /// …), whose loop runs in the VM (`array_hof`).
+    ArrayHof(super::array_hof::Hof),
 }
 
 /// A method-call site's memo of the intrinsic it calls (see the module docs).
@@ -112,6 +115,9 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_SET_PROTO_FN, b"add") => FastOp::SetAdd,
         (N_SET_PROTO_FN, b"has") => FastOp::SetHas,
         (N_REGEXP_PROTO_FN, b"test" | b"exec") => FastOp::RegExpCall,
+        (N_ARRAY_PROTO_FN, n) => {
+            super::array_hof::hof_for(n).map_or(FastOp::None, FastOp::ArrayHof)
+        }
         _ => FastOp::None,
     }
 }
@@ -171,7 +177,6 @@ pub(super) fn try_call(
     args: &[Reg],
     cache: &mut PropertyCache,
 ) -> Option<Result<NanBox, VmError>> {
-    let _ = funcs;
     if ctx.host.is_none() || ctx.realm.multi_realm {
         return None;
     }
@@ -200,9 +205,13 @@ pub(super) fn try_call(
         args.get(i)
             .map_or(NanBox::undefined(), |r| regs[*r as usize])
     };
+    if let FastOp::ArrayHof(op) = site.op {
+        let argv = super::ArgBuf::from_regs(regs, args);
+        return super::array_hof::run(ctx, funcs, regs, recv, op, &argv);
+    }
     let realm = &mut ctx.realm;
     let v = match site.op {
-        FastOp::None => return None,
+        FastOp::None | FastOp::ArrayHof(_) => return None,
         FastOp::ArrayPush => {
             // Exactly the host's dense-array `push` guards: no index side table,
             // no inherited index accessor, the length is the dense length and

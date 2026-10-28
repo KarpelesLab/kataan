@@ -39,6 +39,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+mod array_hof;
 mod iter_fast;
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 mod jit_tier;
@@ -8627,9 +8628,14 @@ fn run_frame_at_ic(
                             ctx.frame_shadow.truncate(pub_mark);
                             r
                         }
-                        None => with_host(ctx, |h| h.call_method(recv_val, key, &argv))
-                            .unwrap_or(Err(HostError::Fault))
-                            .map_err(VmError::from),
+                        // An array higher-order built-in over a VM callback
+                        // loops here, in this context (`array_hof`).
+                        None => match array_hof::try_call(ctx, funcs, regs, recv_val, key, &argv) {
+                            Some(r) => r,
+                            None => with_host(ctx, |h| h.call_method(recv_val, key, &argv))
+                                .unwrap_or(Err(HostError::Fault))
+                                .map_err(VmError::from),
+                        },
                     };
                     match outcome {
                         Ok(ret) => regs[*dst as usize] = ret,
