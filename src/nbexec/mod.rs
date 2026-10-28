@@ -1070,7 +1070,7 @@ const N_JSON_STRINGIFY: u16 = 8;
 const N_JSON_PARSE: u16 = 27;
 const N_OBJECT_KEYS: u16 = 9;
 const N_OBJECT_VALUES: u16 = 10;
-const N_ARRAY_IS_ARRAY: u16 = 11;
+pub(crate) const N_ARRAY_IS_ARRAY: u16 = 11;
 pub(crate) const N_MATH_FLOOR: u16 = 12;
 pub(crate) const N_MATH_CEIL: u16 = 13;
 pub(crate) const N_MATH_ROUND: u16 = 14;
@@ -1132,7 +1132,7 @@ const N_ITERATOR_CTOR_GET: u16 = 914;
 const N_ITERATOR_CTOR_SET: u16 = 915;
 /// A readable static method bound to a `[constructor, name]` pair (so a detached call
 /// still routes to the constructor's `call_method` static dispatch).
-const N_STATIC_METHOD: u16 = 220;
+pub(crate) const N_STATIC_METHOD: u16 = 220;
 const N_INTL_COLLATOR: u16 = 207;
 const N_INTL_PLURAL_RULES: u16 = 208;
 /// `Intl.Collator.prototype.compare` (a bound function value).
@@ -7000,7 +7000,7 @@ pub(crate) fn collect_block_function_names<'a>(stmts: &'a [Stmt], out: &mut Vec<
 /// code units (clamped to `bytes.len()`). A `unit` landing inside an astral
 /// surrogate pair rounds *down* to that character's start (a search position
 /// never splits a pair).
-fn unit_to_byte(bytes: &[u8], unit: usize) -> usize {
+pub(crate) fn unit_to_byte(bytes: &[u8], unit: usize) -> usize {
     let mut units = 0;
     for (cp, off, len) in wtf8_code_point_iter(bytes) {
         if units >= unit {

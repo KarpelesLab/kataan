@@ -12551,3 +12551,39 @@ fn vm_native_index_of_and_pop_sites() {
         "0,3,1,3,2,3,3,3,4,-1,4,-1,3,2,,1,1,0,,0,TypeError,2,proto,1"
     );
 }
+
+#[test]
+fn vm_native_string_and_function_sites() {
+    // String slicing/searching, `String.fromCharCode`, `Array.isArray` (a proxy
+    // is the host's) and `Function.prototype.call`/`apply` (holes in the
+    // argument list, an own `call`, a replaced `call`, a replaced static)
+    // served from warmed call sites.
+    let src = r#"
+        function f() {
+            var out = [], s = "a\u00e9bc";
+            for (var i = -2; i < 6; i++) {
+                out.push(s.slice(i), s.substring(i, 2), s.startsWith("b", i), s.endsWith("b", i));
+            }
+            function g(a, b) { return [typeof this, this && this.v, a, b].join("|"); }
+            var o = { v: 7 }, C = Function.prototype.call, h = function () { return "h"; };
+            h.call = function () { return "own"; };
+            for (var i = 0; i < 4; i++) {
+                if (i === 2) Function.prototype.call = function () { return "R"; };
+                out.push(g.call(o, i), g.apply(o, [i, , 1]), [g, h][i % 2].call(o));
+            }
+            Function.prototype.call = C;
+            var S = String.fromCharCode;
+            for (var i = 0; i < 4; i++) {
+                if (i === 2) String.fromCharCode = function () { return "F"; };
+                out.push(String.fromCharCode(65 + i, 0xD83D, 0xDE00), Array.isArray(new Proxy([], {})));
+            }
+            String.fromCharCode = S;
+            return out.join(",");
+        }
+        f()
+    "#;
+    assert_eq!(
+        run(src),
+        "bc,aé,false,false,c,aé,false,false,aébc,aé,false,false,ébc,é,false,false,bc,,true,false,c,b,false,true,,bc,false,false,,bc,false,false,object|7|0|,object|7|0|,object|7||,object|7|1|,object|7|1|,own,R,object|7|2|,R,R,object|7|3|,own,A😀,true,B😀,true,F,true,F,true"
+    );
+}

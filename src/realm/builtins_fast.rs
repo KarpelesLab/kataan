@@ -96,7 +96,7 @@ impl Realm {
         }
         match self.heap.get(h)? {
             Cell::Object(o) => Some((None, o.key_epoch(), o.proto())),
-            Cell::Array(_) | Cell::RegExp { .. } | Cell::Collection { .. } => {
+            Cell::Array(_) | Cell::RegExp { .. } | Cell::Collection { .. } | Cell::Native(_) => {
                 let (aux, epoch) = match self.aux_props.get(&h.to_raw()) {
                     Some(a) => (
                         Some(a.to_raw()),
@@ -155,7 +155,15 @@ impl Realm {
                 }
                 Some(self.object_proto(h))
             }
-            Cell::Array(_) | Cell::RegExp { .. } | Cell::Collection { .. } => {
+            // A VM closure synthesizes `name` and `length` (and the legacy
+            // `caller`/`arguments` are the VM's); its other own properties live
+            // in its auxiliary object, as a native function's do.
+            Cell::VmFunction { .. } if matches!(key, "name" | "caller" | "arguments") => None,
+            Cell::Array(_)
+            | Cell::RegExp { .. }
+            | Cell::Collection { .. }
+            | Cell::Native(_)
+            | Cell::VmFunction { .. } => {
                 if let Some(a) = self.aux_props.get(&h.to_raw())
                     && self.heap.get(*a)?.as_object()?.has_own_key(key)
                 {
@@ -172,10 +180,11 @@ impl Realm {
     fn named_props(&self, h: Handle) -> Option<&crate::object::Object> {
         match self.heap.get(h)? {
             Cell::Object(o) => Some(o),
-            Cell::Array(_) | Cell::RegExp { .. } | Cell::Collection { .. } => self
-                .heap
-                .get(*self.aux_props.get(&h.to_raw())?)?
-                .as_object(),
+            Cell::Array(_) | Cell::RegExp { .. } | Cell::Collection { .. } | Cell::Native(_) => {
+                self.heap
+                    .get(*self.aux_props.get(&h.to_raw())?)?
+                    .as_object()
+            }
             _ => None,
         }
     }
@@ -196,7 +205,11 @@ impl Realm {
         if !cache.armed || cache.swaps != self.cell_swaps {
             return None;
         }
-        let mut cur = self.method_lookup_start(recv, key, &mut cache.recv_shape)?;
+        let mut cur = if cache.own {
+            Some(recv)
+        } else {
+            self.method_lookup_start(recv, key, &mut cache.recv_shape)?
+        };
         let last = cache.links.len().checked_sub(1)?;
         for (i, &(raw, aux, epoch)) in cache.links.iter().enumerate() {
             let h = cur?;
@@ -237,8 +250,22 @@ impl Realm {
         cache.armed = false;
         cache.links.clear();
         cache.holder_shape = None;
+        cache.own = false;
         cache.swaps = self.cell_swaps;
-        let mut cur = self.method_lookup_start(recv, key, &mut cache.recv_shape)?;
+        let mut cur = match self.method_lookup_start(recv, key, &mut cache.recv_shape) {
+            Some(start) => start,
+            // A static (`String.fromCharCode`): the receiver itself, an
+            // ordinary object or a native function, holds the method. It is
+            // then the chain's one link, so a hit requires this very receiver.
+            None if matches!(self.heap.get(recv), Some(Cell::Object(_) | Cell::Native(_)))
+                && self.named_props(recv).is_some_and(|o| !o.is_prim_wrapper())
+                && self.has_own(recv, key) =>
+            {
+                cache.own = true;
+                Some(recv)
+            }
+            None => return None,
+        };
         for _ in 0..8 {
             let h = cur?;
             let (aux, epoch, next) = self.key_link(h)?;
@@ -299,10 +326,11 @@ impl Realm {
     fn holder_data(&self, h: Handle, key: &str) -> Option<NanBox> {
         let o = match self.heap.get(h)? {
             Cell::Object(o) => o,
-            Cell::Array(_) | Cell::RegExp { .. } | Cell::Collection { .. } => self
-                .heap
-                .get(*self.aux_props.get(&h.to_raw())?)?
-                .as_object()?,
+            Cell::Array(_) | Cell::RegExp { .. } | Cell::Collection { .. } | Cell::Native(_) => {
+                self.heap
+                    .get(*self.aux_props.get(&h.to_raw())?)?
+                    .as_object()?
+            }
             _ => return None,
         };
         if o.accessor(key).is_some() {
@@ -424,6 +452,8 @@ pub struct MethodSiteCache {
     holder_shape: Option<Rc<Shape>>,
     holder_slot: u32,
     recv_shape: Option<Rc<Shape>>,
+    /// Whether the receiver itself is the holder (the only link).
+    own: bool,
     armed: bool,
     swaps: u32,
 }
