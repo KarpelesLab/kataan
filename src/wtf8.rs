@@ -275,6 +275,20 @@ impl Iterator for Utf16Units<'_> {
     }
 }
 
+/// Orders two WTF-8 strings by **UTF-16 code unit**, the JS string order (the
+/// default `sort` comparator, `<`). Byte order agrees with it except where an
+/// astral character (a `0xF0..` lead byte, whose units are surrogates) meets a
+/// code point at or above U+D800 (`0xED..` lead), so the units are compared only
+/// when the first differing bytes are in that range.
+#[must_use]
+pub fn cmp_utf16(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+    match a.iter().zip(b).position(|(x, y)| x != y) {
+        Some(i) if a[i] >= 0xED || b[i] >= 0xED => utf16_units(a).cmp(utf16_units(b)),
+        Some(i) => a[i].cmp(&b[i]),
+        None => a.len().cmp(&b.len()),
+    }
+}
+
 /// The number of UTF-16 code units in `bytes` — JavaScript's `String.length`.
 #[must_use]
 pub fn utf16_len(bytes: &[u8]) -> usize {

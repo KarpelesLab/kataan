@@ -3547,11 +3547,13 @@ impl Interp {
         // comparison — the observable result is identical. A stable sort by
         // those keys orders exactly as the merge sort below would.
         if !has_cmp && !numeric && elems.iter().all(|&e| self.sort_key_is_pure(e)) {
-            let mut keyed: Vec<(String, NanBox)> = Vec::with_capacity(elems.len());
+            // The keys are WTF-8 (a lone surrogate keeps its own place) and are
+            // ordered by UTF-16 code unit, not by code point.
+            let mut keyed: Vec<(Vec<u8>, NanBox)> = Vec::with_capacity(elems.len());
             for e in elems {
-                keyed.push((self.coerce_to_string(e)?, e));
+                keyed.push((self.coerce_to_string_bytes(e)?, e));
             }
-            keyed.sort_by(|a, b| a.0.cmp(&b.0));
+            keyed.sort_by(|a, b| crate::wtf8::cmp_utf16(&a.0, &b.0));
             let mut out: Vec<NanBox> = keyed.into_iter().map(|(_, e)| e).collect();
             out.extend(core::iter::repeat_n(NanBox::undefined(), undefined_count));
             return Ok(out);
@@ -3609,14 +3611,12 @@ impl Interp {
             // The default comparator orders by `ToString` of each element
             // (which invokes a user `toString`/`valueOf`, so abrupt
             // completions propagate), compared by code units.
-            let a = self.coerce_to_string(x)?;
-            let b = self.coerce_to_string(y)?;
-            if a < b {
-                -1.0
-            } else if a > b {
-                1.0
-            } else {
-                0.0
+            let a = self.coerce_to_string_bytes(x)?;
+            let b = self.coerce_to_string_bytes(y)?;
+            match crate::wtf8::cmp_utf16(&a, &b) {
+                core::cmp::Ordering::Less => -1.0,
+                core::cmp::Ordering::Greater => 1.0,
+                core::cmp::Ordering::Equal => 0.0,
             }
         };
         Ok(if order.is_nan() { 0.0 } else { order })

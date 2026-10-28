@@ -183,3 +183,20 @@ fn replace_tostrings_a_regexp_pattern_without_replace() {
     "#;
     assert_eq!(run(src), "a z /./iyg a|azb");
 }
+
+/// The default `sort` comparator orders by UTF-16 code unit: an astral
+/// character (surrogate units 0xD800..) sorts before U+E000..U+FFFF, and lone
+/// surrogates keep their own order instead of all folding to U+FFFD.
+#[test]
+fn default_sort_orders_by_utf16_code_unit() {
+    let src = r#"
+        var hex = a => a.map(s => String(s).codePointAt(0).toString(16)).join(",");
+        [hex(["￿", "\u{10000}"].sort()), hex(["\uDC00", "\uD800", "a"].sort()),
+         hex(["￿", "\u{10000}", {toString() { return ""; }}].toSorted()),
+         hex(["\uDC00", "\uD800", 1].sort())].join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "10000,ffff 61,d800,dc00 10000,e000,ffff 31,d800,dc00"
+    );
+}
