@@ -522,3 +522,28 @@ fn array_integrity_level_tests_its_descriptors() {
     "#;
     assert_eq!(run(src), "false,true,true,true,false,true,false,true");
 }
+
+/// Each tagged-template site has its own template object, also inside arrow
+/// functions: the compiler lowers an arrow body through a temporary clone,
+/// so keying the site by the AST node's address let a later arrow reuse an
+/// earlier one's address and receive *its* strings. A site called again
+/// still gets the same object.
+#[test]
+fn tagged_template_sites_in_arrows_stay_distinct() {
+    let src = r#"
+        var tag = function (s) { return s; };
+        var fs = [];
+        for (var i = 0; i < 30; i++) {
+            fs.push(eval("() => [tag`a" + i + "${0}b`, () => tag`c" + i + "`]"));
+        }
+        var ok = true;
+        for (var i = 0; i < 30; i++) {
+            var r = fs[i]();
+            ok = ok && r[0].raw.join("|") === "a" + i + "|b" && r[1]()[0] === "c" + i;
+        }
+        var f = () => tag`same`;
+        var g = (x) => { return String.raw`x${x}y`; };
+        [ok, f() === f(), g(1), (() => tag`q`)()[0]].join()
+    "#;
+    assert_eq!(run(src), "true,true,x1y,q");
+}

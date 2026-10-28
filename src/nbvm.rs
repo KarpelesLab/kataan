@@ -13757,6 +13757,32 @@ enum EnvSite {
 }
 
 impl Compiler {
+    /// The identity of a tagged-template site (GetTemplateObject caches one
+    /// template object per site). Not the AST node's address: the compiler
+    /// lowers an arrow body through a temporary clone, so that address dangles
+    /// after the compile and a later site can reuse it (one arrow's tag then
+    /// received another site's strings). The template's span and text identify
+    /// it within its compilation unit, and the unit's shared function table
+    /// tells units apart (an `eval` running is further keyed by the host's
+    /// per-call epoch).
+    fn template_site(&self, quasi: &crate::ast::TemplateLiteral) -> u64 {
+        // FNV-1a over the unit, the span and the raw segments.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |bytes: &[u8]| {
+            for &b in bytes {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        mix(&(alloc::rc::Rc::as_ptr(&self.protos) as usize as u64).to_le_bytes());
+        mix(&quasi.span.start.to_le_bytes());
+        mix(&quasi.span.end.to_le_bytes());
+        for q in &quasi.quasis {
+            mix(q.raw.as_bytes());
+            mix(&[0xff]);
+        }
+        h
+    }
     /// Compiles one function. `params` bind to registers `0..n_params`;
     /// `captures` (a closure's free variables, in sorted order) bind to the next
     /// registers as cells. For `is_main`, the last expression's value is
@@ -17374,7 +17400,7 @@ impl Compiler {
                 let strings = self.alloc();
                 self.ops.push(Op::TemplateObject {
                     dst: strings,
-                    site: core::ptr::from_ref(quasi) as u64,
+                    site: self.template_site(quasi),
                     cooked: quasi
                         .quasis
                         .iter()
@@ -19260,7 +19286,7 @@ impl Compiler {
                 let strings = self.alloc();
                 self.ops.push(Op::TemplateObject {
                     dst: strings,
-                    site: core::ptr::from_ref(quasi) as u64,
+                    site: self.template_site(quasi),
                     cooked: quasi
                         .quasis
                         .iter()

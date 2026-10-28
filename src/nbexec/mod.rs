@@ -283,7 +283,7 @@ pub struct Interp {
     /// Cached well-known symbols (e.g. `Symbol.iterator`), created on first use.
     well_known_symbols: alloc::collections::BTreeMap<&'static str, NanBox>,
     /// The frozen template-strings object for each tagged-template site (keyed by the
-    /// AST node's address *and* the eval-site epoch, so the same array is passed to the
+    /// compiler's site identity — see `Compiler::template_site` — *and* the eval-site epoch, so the same array is passed to the
     /// tag on every evaluation of that site). The epoch disambiguates distinct `eval`
     /// calls whose identical source text shares one cached-and-leaked AST: per
     /// GetTemplateObject each `eval` invocation is a *different* site, but a loop inside
