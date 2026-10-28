@@ -3653,8 +3653,15 @@ impl Realm {
 
     /// Allocates an empty object whose `[[Prototype]]` is `proto` (`Object.create`).
     pub fn new_object_with_proto(&mut self, proto: Option<Handle>) -> Handle {
-        let h = self.new_object();
-        self.set_object_proto(h, proto);
+        // The `[[Prototype]]` goes in before the object reaches the heap: a
+        // brand-new object is young, so there is no old→young edge for the
+        // write barrier to record (and no object to look up again).
+        let mut obj = Object::new(Rc::clone(&self.root_shape));
+        obj.set_proto(proto);
+        let h = self.heap.alloc(Cell::Object(obj));
+        if let (Some(p), Some(marker)) = (proto, self.incremental.as_mut()) {
+            marker.mark_grey(p);
+        }
         h
     }
 
@@ -5820,12 +5827,10 @@ impl Realm {
     /// Never pushes keys, so a dead key stays collectable.
     #[allow(clippy::too_many_arguments)] // one ref per side-table, to fit split borrows
     fn ephemeron_expand(
-        heap: &Heap<Cell>,
         marked: &gc::MarkSet,
         aux_props: &handle_map::HandleKeyedMap<Handle>,
         fn_protos: &alloc::collections::BTreeMap<u32, Handle>,
         fn_ctor: &alloc::collections::BTreeMap<u32, Handle>,
-        symbols_by_id: &alloc::collections::BTreeMap<u64, Handle>,
         extra: &mut Vec<Handle>,
     ) {
         // `aux_props`: keyed by the owning cell's handle. If that cell is live,
@@ -5846,21 +5851,27 @@ impl Realm {
                 }
             }
         }
-        // `symbols_by_id`: a symbol is live if its handle is reachable directly,
-        // *or* if a live object still uses it as a property key (stored as the
-        // string `\0sym:{id}`, which carries no handle edge). Scan the live
-        // objects' keys for referenced ids and root those symbols.
-        for h in marked.iter() {
-            if let Some(obj) = heap.get(h).and_then(Cell::as_object) {
-                obj.for_each_symbol_key(|k| {
-                    if let Some(idstr) = k.strip_prefix("\u{0}sym:")
-                        && let Ok(id) = idstr.parse::<u64>()
-                        && let Some(sym) = symbols_by_id.get(&id)
-                    {
-                        extra.push(*sym);
-                    }
-                });
-            }
+    }
+
+    /// The symbols `cell` uses as property keys, pushed into `out`: a symbol is
+    /// live if its handle is reachable directly, *or* if a live object still
+    /// uses it as a property key (stored as the string `\0sym:{id}`, which
+    /// carries no handle edge). The collector calls this for every object it
+    /// marks ([`gc::mark_with_ephemerons_scan`]).
+    fn symbol_key_edges(
+        symbols_by_id: &alloc::collections::BTreeMap<u64, Handle>,
+        cell: &Cell,
+        out: &mut Vec<Handle>,
+    ) {
+        if let Some(obj) = cell.as_object() {
+            obj.for_each_symbol_key(|k| {
+                if let Some(idstr) = k.strip_prefix(crate::shape::SYMBOL_KEY_PREFIX)
+                    && let Ok(id) = idstr.parse::<u64>()
+                    && let Some(sym) = symbols_by_id.get(&id)
+                {
+                    out.push(*sym);
+                }
+            });
         }
     }
 
@@ -5988,19 +5999,15 @@ impl Realm {
         } = self;
         // Phase 1 — mark from the real roots, expanding the weak-key side-tables
         // to a fixpoint (an entry's value is a root only while its key is live).
-        let marked =
-            gc::mark_with_ephemerons(heap, roots.iter().copied(), |heap, marked, extra| {
-                Self::ephemeron_expand(
-                    heap,
-                    marked,
-                    aux_props,
-                    fn_protos,
-                    fn_ctor,
-                    symbols_by_id,
-                    extra,
-                );
+        let marked = gc::mark_with_ephemerons_scan(
+            heap,
+            roots.iter().copied(),
+            |cell, out| Self::symbol_key_edges(symbols_by_id, cell, out),
+            |_, marked, extra| {
+                Self::ephemeron_expand(marked, aux_props, fn_protos, fn_ctor, extra);
                 extern_expand(marked, extra);
-            });
+            },
+        );
         extern_prune(&marked);
         // Phase 2 — drop every entry whose key is unmarked (full collection: an
         // unmarked key is genuinely dead, so no generation guard is needed).
@@ -6100,18 +6107,14 @@ impl Realm {
                 native_class_tags,
                 ..
             } = self;
-            let marked =
-                gc::mark_with_ephemerons(heap, roots.iter().copied(), |heap, marked, extra| {
-                    Self::ephemeron_expand(
-                        heap,
-                        marked,
-                        aux_props,
-                        fn_protos,
-                        fn_ctor,
-                        symbols_by_id,
-                        extra,
-                    );
-                });
+            let marked = gc::mark_with_ephemerons_scan(
+                heap,
+                roots.iter().copied(),
+                |cell, out| Self::symbol_key_edges(symbols_by_id, cell, out),
+                |_, marked, extra| {
+                    Self::ephemeron_expand(marked, aux_props, fn_protos, fn_ctor, extra);
+                },
+            );
             Self::ephemeron_prune(
                 &marked,
                 &|_| true,

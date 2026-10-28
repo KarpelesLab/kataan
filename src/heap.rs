@@ -507,34 +507,52 @@ impl<T> Heap<T> {
     /// The sweep of a full collection, in one pass over the slot table: every
     /// live object for which `keep(handle, value)` holds is promoted one
     /// generation; every other one is freed (dropped). Returns the number
-    /// freed. Freed slots go through [`free`](Heap::free), so GC-verification
-    /// mode still only records them.
+    /// freed. Freeing follows [`free`](Heap::free) exactly — the same
+    /// generation bump, retirement and free-list order, and GC-verification
+    /// mode still only records the handle — but drops each doomed value where
+    /// it lies instead of moving it out of the slot first.
     pub fn sweep(&mut self, mut keep: impl FnMut(Handle, &T) -> bool) -> usize {
+        let Self {
+            slots,
+            free,
+            live,
+            poison,
+            ..
+        } = self;
         let mut swept = 0;
-        for i in 0..self.slots.len() {
-            let doomed = match &mut self.slots[i] {
-                Slot::Occupied {
-                    generation,
-                    age,
-                    value,
-                } => {
-                    let h = Handle {
-                        index: i as u32,
-                        generation: *generation,
-                    };
-                    if keep(h, value) {
-                        *age = age.saturating_add(1);
-                        None
-                    } else {
-                        Some(h)
-                    }
-                }
-                Slot::Free { .. } => None,
+        for (i, slot) in slots.iter_mut().enumerate() {
+            let Slot::Occupied {
+                generation,
+                age,
+                value,
+            } = slot
+            else {
+                continue;
             };
-            if let Some(h) = doomed {
-                drop(self.free(h));
-                swept += 1;
+            let h = Handle {
+                index: i as u32,
+                generation: *generation,
+            };
+            if keep(h, value) {
+                *age = age.saturating_add(1);
+                continue;
             }
+            swept += 1;
+            if let Some(p) = poison {
+                p.freed.insert(h);
+                continue;
+            }
+            // See `free` for why a slot leaving the low generation range is
+            // retired rather than reused.
+            let next_gen = generation.wrapping_add(1);
+            // Assigning drops the old value in place.
+            *slot = Slot::Free {
+                generation: next_gen,
+            };
+            if next_gen < COMPACT_GEN_BASE {
+                free.push(i as u32);
+            }
+            *live -= 1;
         }
         swept
     }

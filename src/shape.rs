@@ -156,6 +156,15 @@ pub const PRIM_WRAP_KEY: &str = "\u{0}prim";
 /// `[[IsHTMLDDA]]` brand.
 pub const BRAND_KEYS: [&str; 2] = [PRIM_WRAP_KEY, "\u{0}htmldda"];
 
+/// The prefix of a property key that encodes a Symbol (`\0sym:{id}`).
+pub const SYMBOL_KEY_PREFIX: &str = "\u{0}sym:";
+
+/// The `brands` bit recording that a layout holds at least one Symbol key
+/// ([`SYMBOL_KEY_PREFIX`]), so the collector's symbol-liveness scan can skip
+/// every object whose layout has none without walking its keys. Kept clear of
+/// the [`BRAND_KEYS`] bits.
+const SYMBOL_KEYS_BIT: u8 = 0x80;
+
 /// The [`BRAND_KEYS`] bit of `key` (0 for any other key).
 #[inline]
 #[must_use]
@@ -167,6 +176,21 @@ pub fn brand_bit(key: &str) -> u8 {
         .iter()
         .position(|b| *b == key)
         .map_or(0, |i| 1 << i)
+}
+
+/// Every `brands` bit `key` sets: its [`brand_bit`], plus [`SYMBOL_KEYS_BIT`]
+/// for a Symbol key.
+#[inline]
+fn key_bits(key: &str) -> u8 {
+    if !key.starts_with('\0') {
+        return 0;
+    }
+    brand_bit(key)
+        | if key.starts_with(SYMBOL_KEY_PREFIX) {
+            SYMBOL_KEYS_BIT
+        } else {
+            0
+        }
 }
 
 impl Shape {
@@ -228,6 +252,32 @@ impl Shape {
         self.brands & bit != 0
     }
 
+    /// Whether the layout holds any Symbol key ([`SYMBOL_KEY_PREFIX`]).
+    #[inline]
+    #[must_use]
+    pub fn has_symbol_keys(&self) -> bool {
+        self.brands & SYMBOL_KEYS_BIT != 0
+    }
+
+    /// Calls `f` with every key of this layout, newest first, without
+    /// allocating (unlike [`keys`](Self::keys)).
+    pub fn for_each_key_unordered(&self, mut f: impl FnMut(&str)) {
+        if let Some(ix) = self.index.get() {
+            ix.keys.iter().for_each(|k| f(k));
+            return;
+        }
+        let mut node = self;
+        loop {
+            if let Some(k) = &node.key {
+                f(k);
+            }
+            match node.parent.as_deref() {
+                Some(p) => node = p,
+                None => break,
+            }
+        }
+    }
+
     /// Whether this is the empty (root) layout.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -273,7 +323,7 @@ impl Shape {
             transitions: RefCell::new(Vec::new()),
             index: OnceCell::new(),
             probes: Cell::new(0),
-            brands: self.brands | brand_bit(key),
+            brands: self.brands | key_bits(key),
         });
         // Replace a dead entry in place rather than growing the cache with it.
         let mut transitions = self.transitions.borrow_mut();
@@ -477,6 +527,22 @@ mod tests {
         let d = plain.transition(BRAND_KEYS[1]);
         assert!(d.has_brand(brand_bit(BRAND_KEYS[1])) && !d.is_wrapper());
         assert_eq!(brand_bit("prim"), 0);
+    }
+
+    #[test]
+    fn symbol_keys_are_flagged_through_transitions() {
+        let plain = Shape::root().transition("a").transition("\u{0}hidden");
+        assert!(!plain.has_symbol_keys());
+        let sym = plain.transition("\u{0}sym:12").transition("z");
+        assert!(sym.has_symbol_keys() && !sym.is_wrapper());
+        // The flag is not a brand bit.
+        assert!(
+            !sym.has_brand(brand_bit(BRAND_KEYS[0])) && !sym.has_brand(brand_bit(BRAND_KEYS[1]))
+        );
+        let mut seen = Vec::new();
+        sym.for_each_key_unordered(|k| seen.push(alloc::string::String::from(k)));
+        seen.sort();
+        assert_eq!(seen, ["\u{0}hidden", "\u{0}sym:12", "a", "z"]);
     }
 
     #[test]

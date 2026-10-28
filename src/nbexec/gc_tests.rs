@@ -246,6 +246,34 @@ fn symbols_used_as_property_keys_survive() {
 }
 
 #[test]
+fn symbol_keys_survive_on_dictionary_accessor_and_lazy_prototype_objects() {
+    // The collector finds key symbols while marking each object, so a symbol
+    // reached only as a key of an object that is itself reached late (a
+    // function's lazily built `.prototype`, an ephemeron value) or stored in
+    // dictionary mode or as an accessor must survive too.
+    assert_eq!(
+        run(&format!(
+            "function F() {{}}
+             (function () {{
+               F.prototype[Symbol('p')] = 'proto';
+               var d = {{}};
+               for (var i = 0; i < 64; i++) d['k' + i] = i;
+               delete d.k1;
+               d[Symbol('d')] = 'dict';
+               Object.defineProperty(d, Symbol('a'), {{ get: function () {{ return 'acc'; }} }});
+               globalThis.dd = d;
+             }})();
+             {CHURN}
+             var ps = Object.getOwnPropertySymbols(F.prototype);
+             var ds = Object.getOwnPropertySymbols(dd);
+             String(ps[0]) + '=' + F.prototype[ps[0]] + '/'
+               + ds.map(function (s) {{ return String(s) + '=' + dd[s]; }}).join(',')"
+        )),
+        "Symbol(p)=proto/Symbol(d)=dict,Symbol(a)=acc"
+    );
+}
+
+#[test]
 fn regexp_and_string_state_survive() {
     // The realm memoizes the last regex subject's UTF-16 units and the Annex B.2.5
     // legacy match record; both hold string state across a cycle.

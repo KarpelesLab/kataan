@@ -847,8 +847,12 @@ impl Trace for Cell {
     }
 
     fn trace(&self, visit: &mut dyn FnMut(Handle)) {
+        self.trace_each(visit);
+    }
+
+    fn trace_each<F: FnMut(Handle)>(&self, mut visit: F) {
         match self {
-            Cell::Object(o) => o.trace_handles(visit),
+            Cell::Object(o) => o.trace_handles(&mut visit),
             Cell::Array(elems) => {
                 for e in elems {
                     if let Some(raw) = e.as_handle() {
@@ -863,7 +867,7 @@ impl Trace for Cell {
                 }
             }
             // A VM-held host environment keeps its bindings alive.
-            Cell::Env(env) => env.for_each_handle(visit),
+            Cell::Env(env) => env.for_each_handle(&mut visit),
             // A VM closure keeps its captured cells alive.
             Cell::VmFunction { captures, .. } => {
                 for c in captures {

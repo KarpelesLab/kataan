@@ -921,13 +921,17 @@ impl Object {
     /// sorted map in O(log n + symbols) — `\0` sorts first, so the symbol keys
     /// are its smallest — rather than walking every key on every collection.
     pub fn for_each_symbol_key(&self, mut f: impl FnMut(&str)) {
-        const SYM: &str = "\u{0}sym:";
+        const SYM: &str = crate::shape::SYMBOL_KEY_PREFIX;
         match &self.data {
+            // The layout records whether it holds any Symbol key at all, so the
+            // common symbol-free object costs one bit test.
             ObjectData::Shaped { shape, .. } => {
-                for k in shape.keys() {
-                    if k.starts_with(SYM) {
-                        f(k);
-                    }
+                if shape.has_symbol_keys() {
+                    shape.for_each_key_unordered(|k| {
+                        if k.starts_with(SYM) {
+                            f(k);
+                        }
+                    });
                 }
             }
             ObjectData::Dict { map, .. } => {
@@ -1321,7 +1325,7 @@ impl Object {
     /// references through a slot — the outgoing edges a tracing collector
     /// follows.
     pub fn trace_handles(&self, mut visit: impl FnMut(crate::heap::Handle)) {
-        let trace_value = |v: &NanBox, visit: &mut dyn FnMut(crate::heap::Handle)| {
+        let mut trace_value = |v: &NanBox| {
             if let Some(raw) = v.as_handle() {
                 visit(crate::heap::Handle::from_raw(raw));
             }
@@ -1329,12 +1333,12 @@ impl Object {
         match &self.data {
             ObjectData::Shaped { len, slots, .. } => {
                 for slot in slots.iter(*len) {
-                    trace_value(slot, &mut visit);
+                    trace_value(slot);
                 }
             }
             ObjectData::Dict { map, .. } => {
                 for d in map.values() {
-                    trace_value(&d.value, &mut visit);
+                    trace_value(&d.value);
                 }
             }
         }

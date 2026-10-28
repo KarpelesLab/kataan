@@ -27,6 +27,17 @@ pub trait Trace {
     /// Calls `visit` once for every handle this object refers to.
     fn trace(&self, visit: &mut dyn FnMut(Handle));
 
+    /// [`trace`](Self::trace) with a statically dispatched visitor — what the
+    /// mark loop calls, so an implementation that overrides it lets the
+    /// per-edge callback inline instead of going through a `dyn` call. Must
+    /// visit exactly what `trace` visits.
+    fn trace_each<F: FnMut(Handle)>(&self, mut visit: F)
+    where
+        Self: Sized,
+    {
+        self.trace(&mut visit);
+    }
+
     /// How much tracing work this object costs — roughly its slot count. A
     /// collection's cost is the *weight* of the live set, not its object
     /// count, so the allocation trigger is scaled by weight: one object with
@@ -138,22 +149,41 @@ fn mark<T: Trace>(heap: &Heap<T>, roots: impl IntoIterator<Item = Handle>) -> Ma
             work.push(root);
         }
     }
-    drain(heap, &mut marked, &mut work);
+    drain(
+        heap,
+        &mut marked,
+        &mut work,
+        &mut |_, _| {},
+        &mut Vec::new(),
+    );
     marked
 }
 
 /// Drains the grey `work` list into `marked`, following each object's outgoing
-/// edges. Shared by [`mark`] and the ephemeron fixpoint.
-fn drain<T: Trace>(heap: &Heap<T>, marked: &mut MarkSet, work: &mut Vec<Handle>) {
+/// edges, plus whatever extra edges `scan(object, &mut side)` pushes into
+/// `side` (empty between calls). Shared by [`mark`] and the ephemeron fixpoint.
+fn drain<T: Trace>(
+    heap: &Heap<T>,
+    marked: &mut MarkSet,
+    work: &mut Vec<Handle>,
+    scan: &mut impl FnMut(&T, &mut Vec<Handle>),
+    side: &mut Vec<Handle>,
+) {
     while let Some(handle) = work.pop() {
         if let Some(obj) = heap.get(handle) {
-            obj.trace(&mut |edge| {
+            obj.trace_each(|edge| {
                 // Only follow live, not-yet-marked targets (stale handles are
                 // ignored, which also breaks cycles).
                 if heap.is_live(edge) && marked.insert(edge) {
                     work.push(edge);
                 }
             });
+            scan(obj, side);
+            for edge in side.drain(..) {
+                if heap.is_live(edge) && marked.insert(edge) {
+                    work.push(edge);
+                }
+            }
         }
     }
 }
@@ -171,23 +201,39 @@ fn drain<T: Trace>(heap: &Heap<T>, marked: &mut MarkSet, work: &mut Vec<Handle>)
 /// entry, one pass is not enough — `expand` is re-run until the marked set
 /// reaches a fixpoint. `expand(heap, &marked, &mut extra)` must push, into
 /// `extra`, the value handles of every entry whose key is currently in `marked`
-/// (it is handed `heap` so it can inspect live objects, e.g. to find symbols
-/// still referenced as property keys); the collector marks those (transitively)
-/// and repeats. Keys are *never* added by `expand`, so a dead key stays dead and
-/// its entry can be pruned afterward.
+/// (it is handed `heap` so it can inspect live objects); the collector marks
+/// those (transitively) and repeats. Keys are *never* added by `expand`, so a
+/// dead key stays dead and its entry can be pruned afterward.
 pub fn mark_with_ephemerons<T: Trace>(
     heap: &Heap<T>,
     roots: impl IntoIterator<Item = Handle>,
+    expand: impl FnMut(&Heap<T>, &MarkSet, &mut Vec<Handle>),
+) -> MarkSet {
+    mark_with_ephemerons_scan(heap, roots, |_, _| {}, expand)
+}
+
+/// [`mark_with_ephemerons`] with **extra strong edges** that the objects'
+/// own [`Trace`] cannot report: `scan(object, &mut out)` is called once for
+/// every marked object, right after its traced edges, and every handle it
+/// pushes into `out` is marked as though the object referenced it (e.g. the
+/// symbols a live object uses as property keys, which it stores by id). The
+/// object is still in cache at that point, so this costs far less than a
+/// separate walk over the marked set.
+pub fn mark_with_ephemerons_scan<T: Trace>(
+    heap: &Heap<T>,
+    roots: impl IntoIterator<Item = Handle>,
+    mut scan: impl FnMut(&T, &mut Vec<Handle>),
     mut expand: impl FnMut(&Heap<T>, &MarkSet, &mut Vec<Handle>),
 ) -> MarkSet {
     let mut marked = MarkSet::with_slots(heap.slot_capacity());
     let mut work: Vec<Handle> = Vec::new();
+    let mut side: Vec<Handle> = Vec::new();
     for root in roots {
         if heap.is_live(root) && marked.insert(root) {
             work.push(root);
         }
     }
-    drain(heap, &mut marked, &mut work);
+    drain(heap, &mut marked, &mut work, &mut scan, &mut side);
 
     // Ephemeron fixpoint: surface the values of entries whose keys are now live,
     // mark them transitively, and repeat until nothing new is marked.
@@ -205,7 +251,7 @@ pub fn mark_with_ephemerons<T: Trace>(
         if !grew {
             break;
         }
-        drain(heap, &mut marked, &mut work);
+        drain(heap, &mut marked, &mut work, &mut scan, &mut side);
     }
     marked
 }
