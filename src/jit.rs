@@ -6736,9 +6736,8 @@ impl JitFunction {
                     // (`rcx`) and its store guards hold.
                     a.bind(shape_miss);
                     if !s.method_ptr.is_null() {
-                        a.p_add_armed(s.method_ptr, call_helper);
-                        a.p_load_arena(helpers.call_layout.realm, &layout.props);
-                        a.mov_r10_rax();
+                        // (No walk follows, so no arming test or arena: the
+                        // add's own guards miss on an empty cache.)
                         a.p_add_prop_inline(
                             &layout,
                             helpers.call_layout.realm,

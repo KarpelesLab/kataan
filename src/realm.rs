@@ -99,6 +99,10 @@ pub struct Realm {
     jit_marking: bool,
     /// `default_object_proto` as an object's raw `proto` word (`NO_PROTO` for
     /// none): what compiled code's inline `Op::NewObject` gives the new object.
+    #[cfg_attr(
+        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     jit_default_proto: u64,
     /// Monotonic counter giving each `Symbol` a unique identity.
     next_symbol_id: u64,

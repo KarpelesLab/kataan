@@ -791,6 +791,37 @@ impl Object {
         self.slot_get(slot)
     }
 
+    /// The address of slot `slot`'s value (inline, or in the spill array),
+    /// for compiled code that reads it while the prototype epoch shows the
+    /// object watched and unchanged: the object's cell moves only when the
+    /// heap arena grows, is compacted or swaps cells, and its spill array only
+    /// when a slot is added or removed — each of which bumps the epoch.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_slot_ptr(&self, slot: u32) -> Option<*const NanBox> {
+        if self.is_dict() || slot >= u32::from(self.len) {
+            return None;
+        }
+        let i = slot as usize;
+        if i < INLINE_SLOTS {
+            Some(core::ptr::from_ref(&self.inline[i]))
+        } else {
+            self.spill().get(i - INLINE_SLOTS).map(core::ptr::from_ref)
+        }
+    }
+
+    /// The address of accessor `i`'s getter, under the same terms as
+    /// [`jit_slot_ptr`](Self::jit_slot_ptr) (the accessor list changes only
+    /// with the object's key epoch, a layout change).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_getter_ptr(&self, i: usize) -> Option<*const NanBox> {
+        self.ex()
+            .accessors
+            .get(i)
+            .map(|(_, g, _)| core::ptr::from_ref(g))
+    }
+
     /// Writes slot `slot` directly, without a name lookup or the integrity
     /// checks of [`set`](Object::set): the caller must have resolved `slot`
     /// under this object's current shape and ruled out a frozen object and a

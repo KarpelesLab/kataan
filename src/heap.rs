@@ -435,6 +435,12 @@ impl<T> Heap<T> {
                 .ok()
                 .filter(|&i| i != u32::MAX)
                 .expect("heap slot space exhausted");
+            if self.slots.len() == self.slots.capacity() {
+                // The push moves every cell: compiled code caching a cell's
+                // address under the prototype epoch must not use it any more
+                // (see `jit::props::MethodEntry::value`).
+                crate::object::bump_proto_epoch();
+            }
             self.slots.push(Slot::live(0, 0, value));
             Handle {
                 index,

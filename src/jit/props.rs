@@ -298,6 +298,11 @@ struct MethodEntry {
     acc: u32,
     stamp: u64,
     holder: u64,
+    /// The address of the holder's value (its slot, or its getter for
+    /// `acc != 0`) as of `stamp`, or `0`: while the epoch is still `stamp`
+    /// the holder is the recorded, watched, unchanged object, and its cell
+    /// has not moved (see `Object::jit_slot_ptr`).
+    value: u64,
     levels: [ChainLevel; CHAIN_MAX],
 }
 
@@ -373,6 +378,7 @@ impl MethodSite {
         }
         watch_levels(realm, &entry.levels[..entry.depth as usize]);
         entry.stamp = crate::object::proto_epoch();
+        entry.value = holder_value_addr(realm, &entry);
         self.store(entry);
     }
 
@@ -452,6 +458,7 @@ impl MethodSite {
         }
         watch_levels(realm, &entry.levels[..entry.depth as usize]);
         entry.stamp = crate::object::proto_epoch();
+        entry.value = holder_value_addr(realm, &entry);
         let getter = (entry.acc != 0)
             .then(|| {
                 let h =
@@ -537,6 +544,24 @@ impl MethodSite {
         }
         None
     }
+}
+
+/// [`MethodEntry::value`] for a freshly validated `entry`: the address of its
+/// holder's slot or getter (`0` for a receiver's own property or an
+/// unaddressable one).
+fn holder_value_addr(realm: &crate::realm::Realm, entry: &MethodEntry) -> u64 {
+    if entry.depth == 0 {
+        return 0;
+    }
+    let Some(o) = realm.jit_object(crate::heap::Handle::from_raw(entry.holder)) else {
+        return 0;
+    };
+    let ptr = if entry.acc != 0 {
+        o.jit_getter_ptr(entry.acc as usize - 1)
+    } else {
+        o.jit_slot_ptr(entry.slot)
+    };
+    ptr.map_or(0, |p| p as u64)
 }
 
 /// Flags every object of a recorded chain `levels` watched (see
@@ -753,6 +778,17 @@ impl X64Assembler {
         self.g_load(r::RAX, r::RCX, l.props.off_proto);
         self.g_cmp_mem(r::RAX, r::R11, level(0, offset_of!(ChainLevel, handle)));
         self.g_jcc(cc::NE, next);
+        // The holder's value at its address as of the stamp, if recorded.
+        let walk = self.new_label();
+        let done = self.new_label();
+        self.g_load(r::R9, r::R11, i(offset_of!(MethodEntry, value)));
+        self.g_test(r::R9);
+        self.g_jcc(cc::E, walk);
+        self.g_load(r::RAX, r::R9, 0);
+        self.p_cmp32_imm8(r::R11, i(offset_of!(MethodEntry, acc)), 0);
+        self.g_jcc(cc::E, done);
+        self.jmp(getter.unwrap_or(next));
+        self.bind(walk);
         self.g_load(r::RAX, r::R11, i(offset_of!(MethodEntry, holder)));
         self.p_slot_of(l, next);
         // `rcx` = the holder's slot: its getter, or its `slot`-th value.
@@ -764,7 +800,6 @@ impl X64Assembler {
         self.p_load32(r::RAX, r::R11, i(offset_of!(MethodEntry, slot)));
         self.p_obj_slot_addr(l, r::R9, next);
         self.g_load(r::RAX, r::R9, 0);
-        let done = self.new_label();
         self.jmp(done);
         // The getter: entry `acc - 1` of the holder's accessor list.
         self.bind(accessor);
@@ -1030,9 +1065,7 @@ impl X64Assembler {
         self.g_jcc(cc::E, miss);
         self.g_cmp_mem(r::R9, r::RCX, l.off_shape);
         self.g_jcc(cc::NE, miss);
-        self.g_load(r::R9, r::R11, to);
-        self.g_test(r::R9);
-        self.g_jcc(cc::E, miss);
+        // (`to` is set whenever `from` is: `fill_add` stores both.)
         // The prototype chain, receiver's `[[Prototype]]` first.
         self.g_mov(r::RSI, r::RCX);
         let end = self.new_label();
