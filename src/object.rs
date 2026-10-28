@@ -70,9 +70,14 @@ enum ObjectData {
     /// which is exactly the spec's "a re-created property is chronologically
     /// new". Enumeration skips tombstones without consulting the map, and
     /// `compact_order` drops them once they outnumber the live keys.
+    ///
+    /// The map is boxed so this variant is no larger than `Shaped`, keeping
+    /// every object (shaped or not) small.
     Dict {
         order: Vec<Option<Box<str>>>,
-        map: BTreeMap<Box<str>, DictSlot>,
+        // Deliberate: the box keeps `Dict` no larger than `Shaped`.
+        #[allow(clippy::box_collection)]
+        map: Box<BTreeMap<Box<str>, DictSlot>>,
     },
 }
 
@@ -95,18 +100,9 @@ pub struct Object {
     /// dictionary mode, so inline caches keyed on the shape pointer always miss
     /// (an empty shape resolves no key) and never bind a dictionary object.
     dict_shape: Option<Rc<Shape>>,
-    /// Accessor properties: `(name, getter, setter)`, both held as value
-    /// handles (`undefined` when absent). Kept out of the shape's slot layout.
-    accessors: Vec<(alloc::boxed::Box<str>, NanBox, NanBox)>,
-    /// Own keys that are **non-enumerable** (e.g. class methods): present in the
-    /// slots and readable, but hidden from `Object.keys`/spread/`for-in`/JSON.
-    hidden: Vec<alloc::boxed::Box<str>>,
     /// Own keys that are **non-writable** (`defineProperty` with
     /// `writable: false`): writes are silently ignored.
     readonly: Vec<alloc::boxed::Box<str>>,
-    /// Own keys that are **non-configurable** (`defineProperty` with
-    /// `configurable: false`): they cannot be deleted.
-    non_configurable: Vec<alloc::boxed::Box<str>>,
     /// Whether the object is frozen (`Object.freeze`): no new properties and no
     /// writes to existing ones.
     frozen: bool,
@@ -115,11 +111,34 @@ pub struct Object {
     /// Whether the object is sealed (`Object.seal`): no new properties and no
     /// deletions, but existing writable properties may still change.
     sealed: bool,
-    /// The class this object was instantiated from (for `instanceof`), if any.
-    class_tag: Option<u32>,
     /// The `[[Prototype]]` link (`Object.create`/`getPrototypeOf`), if any. A
     /// property miss walks this chain.
     proto: Option<crate::heap::Handle>,
+    /// The rarely-used parts of an object (accessors, attribute marks, the
+    /// unified key order, the class tag), boxed so an ordinary data object —
+    /// the overwhelmingly common case — stays small. `None` means all empty.
+    extra: Option<Box<ObjectExtra>>,
+    /// Bumped whenever the set of own keys (data or accessor) may have changed,
+    /// so a cache of "does this object own `k`" can be revalidated by a compare
+    /// (see [`key_epoch`](Object::key_epoch)).
+    key_epoch: u32,
+}
+
+/// The out-of-line part of an [`Object`]: everything an ordinary data object
+/// leaves empty. Allocated on first use (see `Object::extra_mut`).
+#[derive(Default)]
+struct ObjectExtra {
+    /// Accessor properties: `(name, getter, setter)`, both held as value
+    /// handles (`undefined` when absent). Kept out of the shape's slot layout.
+    accessors: Vec<(alloc::boxed::Box<str>, NanBox, NanBox)>,
+    /// Own keys that are **non-enumerable** (e.g. class methods): present in the
+    /// slots and readable, but hidden from `Object.keys`/spread/`for-in`/JSON.
+    hidden: Vec<alloc::boxed::Box<str>>,
+    /// Own keys that are **non-configurable** (`defineProperty` with
+    /// `configurable: false`): they cannot be deleted.
+    non_configurable: Vec<alloc::boxed::Box<str>>,
+    /// The class this object was instantiated from (for `instanceof`), if any.
+    class_tag: Option<u32>,
     /// Unified own-key insertion order across **both** data and accessor
     /// properties. `None` on the fast path (a pure data object, or one that has
     /// never held an accessor): enumeration then derives its order from the shape
@@ -130,11 +149,16 @@ pub struct Object {
     /// a getter/setter is defined between two data properties (or an accessor is
     /// later redefined as data, keeping its original slot).
     key_order: Option<Vec<Box<str>>>,
-    /// Bumped whenever the set of own keys (data or accessor) may have changed,
-    /// so a cache of "does this object own `k`" can be revalidated by a compare
-    /// (see [`key_epoch`](Object::key_epoch)).
-    key_epoch: u32,
 }
+
+/// The all-empty [`ObjectExtra`] that reads see when an object has none.
+static EMPTY_EXTRA: ObjectExtra = ObjectExtra {
+    accessors: Vec::new(),
+    hidden: Vec::new(),
+    non_configurable: Vec::new(),
+    class_tag: None,
+    key_order: None,
+};
 
 impl Object {
     /// Creates an empty object whose layout starts at `root` (the shared root
@@ -148,16 +172,12 @@ impl Object {
                 slots: Vec::new(),
             },
             dict_shape: None,
-            accessors: Vec::new(),
-            hidden: Vec::new(),
             readonly: Vec::new(),
-            non_configurable: Vec::new(),
             frozen: false,
             extensible: true,
             sealed: false,
-            class_tag: None,
             proto: None,
-            key_order: None,
+            extra: None,
             key_epoch: 0,
         }
     }
@@ -171,13 +191,23 @@ impl Object {
         self.key_epoch
     }
 
+    /// The out-of-line part, or the shared empty one.
+    fn ex(&self) -> &ObjectExtra {
+        self.extra.as_deref().unwrap_or(&EMPTY_EXTRA)
+    }
+
+    /// The out-of-line part, allocated on first use.
+    fn extra_mut(&mut self) -> &mut ObjectExtra {
+        self.extra.get_or_insert_with(Default::default)
+    }
+
     /// Appends `key` to the unified insertion-order log iff the object is tracking
     /// order (it has held an accessor) and the key is not already recorded. A no-op
     /// on the fast path (`key_order` is `None`). Called after a *new* own key — data
     /// or accessor — is materialized.
     fn track_key(&mut self, key: &str) {
         self.key_epoch = self.key_epoch.wrapping_add(1);
-        if let Some(order) = &mut self.key_order
+        if let Some(order) = self.extra.as_deref_mut().and_then(|x| x.key_order.as_mut())
             && !order.iter().any(|k| k.as_ref() == key)
         {
             order.push(Box::from(key));
@@ -193,8 +223,9 @@ impl Object {
     /// materialized: seeding first records the key at its real slot so the accessor
     /// re-slots into that same position rather than being appended at the end.
     pub fn ensure_key_order(&mut self) {
-        if self.key_order.is_none() {
-            self.key_order = Some(self.keys().into_iter().map(Box::from).collect());
+        if self.ex().key_order.is_none() {
+            let order = self.keys().into_iter().map(Box::from).collect();
+            self.extra_mut().key_order = Some(order);
         }
     }
 
@@ -204,9 +235,15 @@ impl Object {
     /// when `key_order` is `Some`.
     fn merged_key_order(&self) -> Vec<&str> {
         let data = self.keys();
-        let acc: Vec<&str> = self.accessors.iter().map(|(k, _, _)| k.as_ref()).collect();
+        let acc: Vec<&str> = self
+            .ex()
+            .accessors
+            .iter()
+            .map(|(k, _, _)| k.as_ref())
+            .collect();
         let present = |k: &str| data.contains(&k) || acc.contains(&k);
         let order = self
+            .ex()
             .key_order
             .as_ref()
             .expect("merged_key_order needs a log");
@@ -232,11 +269,11 @@ impl Object {
     /// unified insertion order when tracking, else the legacy data-then-accessor
     /// concatenation (correct when data and accessors never interleave).
     fn enum_base(&self) -> Vec<&str> {
-        if self.key_order.is_some() {
+        if self.ex().key_order.is_some() {
             self.merged_key_order()
         } else {
             let mut keys = self.keys();
-            keys.extend(self.accessors.iter().map(|(k, _, _)| k.as_ref()));
+            keys.extend(self.ex().accessors.iter().map(|(k, _, _)| k.as_ref()));
             keys
         }
     }
@@ -254,13 +291,13 @@ impl Object {
 
     /// Tags this object with the class it was constructed from.
     pub fn set_class_tag(&mut self, class_id: u32) {
-        self.class_tag = Some(class_id);
+        self.extra_mut().class_tag = Some(class_id);
     }
 
     /// The class this object was constructed from, if any.
     #[must_use]
     pub fn class_tag(&self) -> Option<u32> {
-        self.class_tag
+        self.ex().class_tag
     }
 
     /// Defines an accessor property `name` with `getter`/`setter` (either may be
@@ -269,14 +306,12 @@ impl Object {
         // Start tracking unified key order the moment an accessor is involved: seed
         // the log with the current data keys (their chronological order) so this and
         // every later new key slot into the correct interleaved position.
-        if self.key_order.is_none() {
-            self.key_order = Some(self.keys().into_iter().map(Box::from).collect());
+        if self.ex().key_order.is_none() {
+            let order = self.keys().into_iter().map(Box::from).collect();
+            self.extra_mut().key_order = Some(order);
         }
-        if let Some(a) = self
-            .accessors
-            .iter_mut()
-            .find(|(k, _, _)| k.as_ref() == name)
-        {
+        let accessors = &mut self.extra_mut().accessors;
+        if let Some(a) = accessors.iter_mut().find(|(k, _, _)| k.as_ref() == name) {
             if !matches!(getter.unpack(), crate::nanbox::Unpacked::Undefined) {
                 a.1 = getter;
             }
@@ -284,8 +319,7 @@ impl Object {
                 a.2 = setter;
             }
         } else {
-            self.accessors
-                .push((alloc::boxed::Box::from(name), getter, setter));
+            accessors.push((alloc::boxed::Box::from(name), getter, setter));
         }
         self.track_key(name);
     }
@@ -293,13 +327,18 @@ impl Object {
     /// The names of this object's accessor (getter/setter) properties.
     #[must_use]
     pub fn accessor_keys(&self) -> Vec<&str> {
-        self.accessors.iter().map(|(k, _, _)| k.as_ref()).collect()
+        self.ex()
+            .accessors
+            .iter()
+            .map(|(k, _, _)| k.as_ref())
+            .collect()
     }
 
     /// The `(getter, setter)` of accessor `name`, if defined.
     #[must_use]
     pub fn accessor(&self, name: &str) -> Option<(NanBox, NanBox)> {
-        self.accessors
+        self.ex()
+            .accessors
             .iter()
             .find(|(k, _, _)| k.as_ref() == name)
             .map(|(_, g, s)| (*g, *s))
@@ -597,7 +636,10 @@ impl Object {
         // A fresh empty shape so `shape()` returns a pointer that resolves no
         // key (inline caches keyed on it always miss for this object).
         self.dict_shape = Some(Shape::root());
-        self.data = ObjectData::Dict { order, map };
+        self.data = ObjectData::Dict {
+            order,
+            map: Box::new(map),
+        };
     }
 
     /// The own property names, in insertion order.
@@ -616,7 +658,7 @@ impl Object {
             ObjectData::Shaped { slots, .. } => slots.len(),
             ObjectData::Dict { map, .. } => map.len(),
         };
-        data + self.accessors.len()
+        data + self.ex().accessors.len()
     }
 
     /// Calls `f` with every own key that encodes a Symbol (the `\0sym:{id}`
@@ -645,7 +687,7 @@ impl Object {
                 }
             }
         }
-        for (k, _, _) in &self.accessors {
+        for (k, _, _) in &self.ex().accessors {
             if k.starts_with(SYM) {
                 f(k);
             }
@@ -698,20 +740,22 @@ impl Object {
     /// Marks own property `key` non-enumerable (idempotent).
     pub fn set_hidden(&mut self, key: &str) {
         if !self.is_hidden(key) {
-            self.hidden.push(alloc::boxed::Box::from(key));
+            self.extra_mut().hidden.push(alloc::boxed::Box::from(key));
         }
     }
 
     /// Whether own property `key` is non-enumerable.
     #[must_use]
     pub fn is_hidden(&self, key: &str) -> bool {
-        self.hidden.iter().any(|k| k.as_ref() == key)
+        self.ex().hidden.iter().any(|k| k.as_ref() == key)
     }
 
     /// Clears the non-enumerable mark for `key` (a `defineProperty` redefining a
     /// configurable property to `enumerable: true`).
     pub fn clear_hidden(&mut self, key: &str) {
-        self.hidden.retain(|k| k.as_ref() != key);
+        if let Some(x) = self.extra.as_deref_mut() {
+            x.hidden.retain(|k| k.as_ref() != key);
+        }
     }
 
     /// Marks own property `key` non-writable (idempotent).
@@ -736,27 +780,31 @@ impl Object {
     /// Marks own property `key` non-configurable (idempotent).
     pub fn set_non_configurable(&mut self, key: &str) {
         if !self.is_non_configurable(key) {
-            self.non_configurable.push(alloc::boxed::Box::from(key));
+            self.extra_mut()
+                .non_configurable
+                .push(alloc::boxed::Box::from(key));
         }
     }
 
     /// Whether own property `key` is non-configurable (cannot be deleted).
     #[must_use]
     pub fn is_non_configurable(&self, key: &str) -> bool {
-        self.non_configurable.iter().any(|k| k.as_ref() == key)
+        self.ex().non_configurable.iter().any(|k| k.as_ref() == key)
     }
 
     /// Clears the non-configurable mark for `key` (a `defineProperty` redefining a
     /// configurable property whose new descriptor keeps it configurable).
     pub fn clear_non_configurable(&mut self, key: &str) {
-        self.non_configurable.retain(|k| k.as_ref() != key);
+        if let Some(x) = self.extra.as_deref_mut() {
+            x.non_configurable.retain(|k| k.as_ref() != key);
+        }
     }
 
     /// Whether *no* own property is marked non-configurable — a cheap probe used to
     /// skip the per-index ArraySetLength stop scan on the common (unrestricted) array.
     #[must_use]
     pub fn non_configurable_is_empty(&self) -> bool {
-        self.non_configurable.is_empty()
+        self.ex().non_configurable.is_empty()
     }
 
     /// Whether a `CreateDataProperty(key)` on this object is a plain store:
@@ -769,10 +817,10 @@ impl Object {
             && !self.frozen
             && !self.sealed
             && !key.starts_with('\0')
-            && (self.accessors.is_empty() || self.accessor(key).is_none())
-            && (self.hidden.is_empty() || !self.is_hidden(key))
+            && (self.ex().accessors.is_empty() || self.accessor(key).is_none())
+            && (self.ex().hidden.is_empty() || !self.is_hidden(key))
             && (self.readonly.is_empty() || !self.is_readonly(key))
-            && (self.non_configurable.is_empty() || !self.is_non_configurable(key))
+            && (self.ex().non_configurable.is_empty() || !self.is_non_configurable(key))
     }
 
     /// `CreateDataProperty(key, value)` through a transition cache, for a
@@ -792,13 +840,14 @@ impl Object {
         if !self.is_plain_data_slot_or_absent(key) {
             return false;
         }
-        if self.key_order.is_none()
+        if self.ex().key_order.is_none()
             && let ObjectData::Shaped { shape, slots } = &mut self.data
             && (shape.len() as usize) < dict_threshold
             && let Some(to) = cache.transition_from(shape)
         {
             *shape = to;
             slots.push(value);
+            self.key_epoch = self.key_epoch.wrapping_add(1);
             return true;
         }
         self.maybe_convert_to_dict(key, dict_threshold);
@@ -818,7 +867,12 @@ impl Object {
     /// Whether `key` is an own property (data slot or accessor).
     #[must_use]
     pub fn has_own_key(&self, key: &str) -> bool {
-        self.contains(key) || self.accessors.iter().any(|(k, _, _)| k.as_ref() == key)
+        self.contains(key)
+            || self
+                .ex()
+                .accessors
+                .iter()
+                .any(|(k, _, _)| k.as_ref() == key)
     }
 
     /// Marks the object frozen (`Object.freeze`) — implies sealed + non-extensible.
@@ -861,7 +915,9 @@ impl Object {
     /// intact — used when a `defineProperty` replaces an accessor with data.
     pub fn clear_accessor(&mut self, key: &str) {
         self.key_epoch = self.key_epoch.wrapping_add(1);
-        self.accessors.retain(|(k, _, _)| k.as_ref() != key);
+        if let Some(x) = self.extra.as_deref_mut() {
+            x.accessors.retain(|(k, _, _)| k.as_ref() != key);
+        }
     }
 
     /// Deletes only the *data slot* for `key`, rebuilding the shape/slots from
@@ -905,20 +961,30 @@ impl Object {
     /// removed.
     pub fn delete(&mut self, root: Rc<Shape>, key: &str) -> bool {
         self.key_epoch = self.key_epoch.wrapping_add(1);
-        let had_accessor = self.accessors.iter().any(|(k, _, _)| k.as_ref() == key);
-        self.accessors.retain(|(k, _, _)| k.as_ref() != key);
+        let had_accessor = self
+            .ex()
+            .accessors
+            .iter()
+            .any(|(k, _, _)| k.as_ref() == key);
+        if let Some(x) = self.extra.as_deref_mut() {
+            x.accessors.retain(|(k, _, _)| k.as_ref() != key);
+        }
         // Clear the property's attribute flags so a later re-add of the same key
         // starts from defaults — otherwise a stale `readonly` flag makes `set` a
         // silent no-op, and a stale `hidden`/`non_configurable` flag wrongly
         // carries over to the new property (e.g. re-defining a deleted, formerly
         // non-writable `name`/`length`, or NamedEvaluation re-installing `name`).
-        self.hidden.retain(|k| k.as_ref() != key);
+        if let Some(x) = self.extra.as_deref_mut() {
+            x.hidden.retain(|k| k.as_ref() != key);
+        }
         self.readonly.retain(|k| k.as_ref() != key);
-        self.non_configurable.retain(|k| k.as_ref() != key);
+        if let Some(x) = self.extra.as_deref_mut() {
+            x.non_configurable.retain(|k| k.as_ref() != key);
+        }
         // Drop from the unified insertion log so a later re-add of the same key
         // appends at the end (a deleted-then-recreated property is chronologically
         // new), rather than reclaiming its former slot.
-        if let Some(order) = &mut self.key_order {
+        if let Some(order) = self.extra.as_deref_mut().and_then(|x| x.key_order.as_mut()) {
             order.retain(|k| k.as_ref() != key);
         }
         match &mut self.data {
@@ -980,7 +1046,11 @@ impl Object {
                 }
             }
         }
-        for (_, g, s) in &mut self.accessors {
+        for (_, g, s) in self
+            .extra
+            .as_deref_mut()
+            .map_or(&mut [][..], |x| &mut x.accessors[..])
+        {
             fwd(g);
             fwd(s);
         }
@@ -1010,7 +1080,7 @@ impl Object {
                 }
             }
         }
-        for (_, g, s) in &self.accessors {
+        for (_, g, s) in &self.ex().accessors {
             for v in [g, s] {
                 if let Some(raw) = v.as_handle() {
                     visit(crate::heap::Handle::from_raw(raw));
