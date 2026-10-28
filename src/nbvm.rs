@@ -4397,16 +4397,32 @@ fn call_with_inner(
             Some(o) => o.as_slice(),
             None => proto.ops.as_slice(),
         };
-        if ic_body != body.as_ptr() as usize {
-            ic.clear();
-        }
+        // (A switch of body leaves the old body's caches behind; the
+        // compiler below may still learn from them, since it re-derives every
+        // memo from its shape and the site's own key.)
+        #[cfg_attr(
+            not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+            allow(unused_variables)
+        )]
+        let stale_ic = if ic_body == body.as_ptr() as usize {
+            Vec::new()
+        } else {
+            core::mem::take(&mut ic)
+        };
         // Native fast path (`ROADMAP.md` §2.1): once a function is hot, compile it
         // to machine code and run that on this activation's register file (see
         // `jit_tier`). A body with a tail call or a suspension point is never
         // compiled, so this never intercepts the trampoline.
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         if jit_tier::call_is_hot(optimized.is_some())
-            && let Some(outcome) = jit_tier::enter_on_call(ctx, funcs, id, &args, &mut regs)
+            && let Some(outcome) = jit_tier::enter_on_call(
+                ctx,
+                funcs,
+                id,
+                &args,
+                &mut regs,
+                if ic.is_empty() { &stale_ic } else { &ic },
+            )
         {
             // The interpreter's caches were not used: hand them back intact,
             // and the window back to the pool.
@@ -4527,13 +4543,32 @@ fn unboxed_fast_call(proto: &FnProto, args: &[NanBox]) -> Option<NanBox> {
 /// Function `id`'s native code (`None` if it is not JIT-eligible), compiled on
 /// first use and kept in the function's [`TierSlot`] thereafter.
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-fn jit_for(funcs: &[FnProto], id: usize) -> Option<alloc::rc::Rc<crate::jit::JitProto>> {
+///
+/// `ic` is the running activation's inline caches, if it holds them (they
+/// are out of the function's tier state while it runs): the compiled code
+/// starts from what they learned (see `JitProto::compile_generic_warm`).
+fn jit_for(
+    funcs: &[FnProto],
+    id: usize,
+    ic: &[PropertyCache],
+) -> Option<alloc::rc::Rc<crate::jit::JitProto>> {
     if let Some(c) = funcs.get(id)?.tier.jit() {
         return c;
     }
     let mut cache = alloc::collections::BTreeMap::new();
     let mut stack = alloc::collections::BTreeSet::new();
-    ensure_jit(&mut cache, funcs, id, &mut stack)
+    let warm = (!ic.is_empty()).then(|| ic.iter().map(PropertyCache::warm_entry).collect());
+    ensure_jit(&mut cache, funcs, id, &mut stack, warm)
+}
+
+/// Function `proto`'s persistent inline caches' memos, by pc (empty while
+/// an activation has them out, or before any ran).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn tier_warm(proto: &FnProto) -> Vec<Option<crate::ic::WarmEntry>> {
+    proto.tier.0.try_borrow().map_or_else(
+        |_| Vec::new(),
+        |t| t.ic.iter().map(PropertyCache::warm_entry).collect(),
+    )
 }
 
 /// Compiles function `id` to native code (memoized in `cache`), first compiling
@@ -4549,6 +4584,7 @@ fn ensure_jit(
     funcs: &[FnProto],
     id: usize,
     stack: &mut alloc::collections::BTreeSet<usize>,
+    warm: Option<Vec<Option<crate::ic::WarmEntry>>>,
 ) -> Option<alloc::rc::Rc<crate::jit::JitProto>> {
     // Compiled already, maybe by an earlier context (a callback's previous
     // call); the function's own slot is the cache of record.
@@ -4572,7 +4608,7 @@ fn ensure_jit(
             let fid = *func as usize;
             if fid != id
                 && fid < funcs.len()
-                && let Some(j) = ensure_jit(cache, funcs, fid, stack)
+                && let Some(j) = ensure_jit(cache, funcs, fid, stack, None)
                 && j.abi_kind() == crate::jit::AbiKind::Int
             {
                 registry.insert(*func, j.code_ptr() as u64);
@@ -4584,7 +4620,10 @@ fn ensure_jit(
     // the generic (NanBox) tier, which runs on the interpreter's register file and
     // accepts nearly any body (see `jit_tier`).
     let compiled = crate::jit::JitProto::compile_with_registry(&funcs[id], &registry)
-        .or_else(|| crate::jit::JitProto::compile_generic(&funcs[id], &jit_generic_helpers()))
+        .or_else(|| {
+            let warm = warm.unwrap_or_else(|| tier_warm(&funcs[id]));
+            crate::jit::JitProto::compile_generic_warm(&funcs[id], &jit_generic_helpers(), &warm)
+        })
         .map(alloc::rc::Rc::new);
     if jit_tier::jit_log_enabled() {
         let what = match &compiled {
@@ -8144,7 +8183,7 @@ fn run_frame_at_ic(
                             // The rest of the activation runs natively, with
                             // this frame's handler stack.
                             if let Some(r) =
-                                jit_tier::osr(ctx, funcs, program, regs, *target, &handlers)
+                                jit_tier::osr(ctx, funcs, program, regs, *target, &handlers, ic)
                             {
                                 return r;
                             }
@@ -25691,6 +25730,88 @@ mod generic_jit_tests {
         assert_eq!(jit.ic_misses(), 1, "only the cold prime missed");
     }
 
+    /// Sites compiled from a warm, monomorphic memo (the shape and slot as
+    /// immediates): the compiled-in layout serves its receivers without the
+    /// cache, and every other receiver — another shape, a dictionary, a
+    /// frozen object of the very layout, a non-object — still gets exactly
+    /// the interpreter's answer.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn generic_props_compiled_in_layout() {
+        let funcs = build_prop();
+        let get_x = id_of(&funcs, "getX");
+        let set_x = id_of(&funcs, "setX");
+        let mut ctx = mk_ctx(Realm::new());
+        let shape_of = |ctx: &Ctx, v: NanBox| {
+            alloc::rc::Rc::clone(
+                ctx.realm
+                    .jit_object(Handle::from_raw(v.as_handle().unwrap()))
+                    .unwrap()
+                    .shape(),
+            )
+        };
+        let p = mint(&mut ctx, &funcs, "makePoint");
+        let mut ic = PropertyCache::new();
+        for _ in 0..8 {
+            ic.lookup(&shape_of(&ctx, p), "x");
+        }
+        let warm = ic.warm_entry().unwrap();
+        assert!(warm.is_stable());
+        // A memo that does not hold for the site's key is never compiled in.
+        let mut wrong = warm.clone();
+        wrong.slot = 1;
+        let helpers = jit_generic_helpers();
+        let jget = crate::jit::JitProto::compile_generic_warm(
+            &funcs[get_x],
+            &helpers,
+            &[Some(warm.clone()), None],
+        )
+        .unwrap();
+        let jset = crate::jit::JitProto::compile_generic_warm(
+            &funcs[set_x],
+            &helpers,
+            &[Some(wrong), Some(warm)],
+        )
+        .unwrap();
+        let other = {
+            let o = ctx.realm.new_object();
+            ctx.realm.set_property(o, "y", NanBox::number(1.0));
+            ctx.realm.set_property(o, "x", NanBox::number(2.0));
+            NanBox::handle(o.to_raw())
+        };
+        let frozen = mint(&mut ctx, &funcs, "makePoint");
+        ctx.realm
+            .freeze_object(Handle::from_raw(frozen.as_handle().unwrap()));
+        let empty = mint(&mut ctx, &funcs, "makeEmpty");
+        let receivers = [p, other, frozen, empty, NanBox::number(3.0), p];
+        for (i, &r) in receivers.iter().enumerate() {
+            let interp = call(&mut ctx, &funcs, get_x, &[r]);
+            let jitted = call_generic(&mut ctx, &funcs, &jget, &[r]).unwrap();
+            assert_eq!(
+                interp.map(NanBox::to_bits),
+                jitted.map(NanBox::to_bits),
+                "get, receiver {i}"
+            );
+        }
+        // The compiled-in layout served `p` both times: the cache was never
+        // consulted (it only counts its own hits).
+        assert_eq!(jget.ic_hits(), 0, "cache hits: {}", jget.ic_hits());
+        for (i, &r) in receivers.iter().enumerate() {
+            let v = NanBox::number(40.0 + i as f64);
+            let interp = call(&mut ctx, &funcs, set_x, &[r, v]);
+            let jitted = call_generic(&mut ctx, &funcs, &jset, &[r, v]).unwrap();
+            assert_eq!(
+                interp.map(NanBox::to_bits),
+                jitted.map(NanBox::to_bits),
+                "set, receiver {i}"
+            );
+        }
+        let x = ctx
+            .realm
+            .get_property(Handle::from_raw(p.as_handle().unwrap()), "x");
+        assert_eq!(x.and_then(|v| v.as_number()), Some(45.0));
+    }
+
     /// `o.x = v` write then read-back: JIT-forced === interpreter (fresh object per
     /// path so the write is observable in isolation).
     #[test]
@@ -27501,7 +27622,7 @@ mod generic_jit_tests {
         let _g = id_of(&funcs, "g");
         let mut cache = alloc::collections::BTreeMap::new();
         let mut stack = alloc::collections::BTreeSet::new();
-        let jit_f = ensure_jit(&mut cache, &funcs, f, &mut stack).expect("f JITs");
+        let jit_f = ensure_jit(&mut cache, &funcs, f, &mut stack, None).expect("f JITs");
         assert!(jit_f.is_generic(), "f must be the generic tier");
 
         let mut ctx = mk_ctx(Realm::new());
@@ -27531,7 +27652,7 @@ mod generic_jit_tests {
         let _g = id_of(&funcs, "g");
         let mut cache = alloc::collections::BTreeMap::new();
         let mut stack = alloc::collections::BTreeSet::new();
-        let jit_f = ensure_jit(&mut cache, &funcs, f, &mut stack).expect("f JITs");
+        let jit_f = ensure_jit(&mut cache, &funcs, f, &mut stack, None).expect("f JITs");
         assert!(jit_f.is_generic());
 
         let mut ctx = mk_ctx(Realm::new());
@@ -27578,7 +27699,7 @@ mod generic_jit_tests {
         );
         let mut cache = alloc::collections::BTreeMap::new();
         let mut stack = alloc::collections::BTreeSet::new();
-        let jit_a = ensure_jit(&mut cache, &funcs, a, &mut stack).expect("a JITs");
+        let jit_a = ensure_jit(&mut cache, &funcs, a, &mut stack, None).expect("a JITs");
         assert!(jit_a.is_generic());
         for name in ["b", "c"] {
             assert_eq!(
@@ -27614,7 +27735,7 @@ mod generic_jit_tests {
         let odd = id_of(&funcs, "odd");
         let mut cache = alloc::collections::BTreeMap::new();
         let mut stack = alloc::collections::BTreeSet::new();
-        let jit_even = ensure_jit(&mut cache, &funcs, even, &mut stack).expect("even JITs");
+        let jit_even = ensure_jit(&mut cache, &funcs, even, &mut stack, None).expect("even JITs");
         assert!(jit_even.is_generic(), "even must be the generic tier");
         assert_eq!(
             cache
@@ -27659,7 +27780,7 @@ mod generic_jit_tests {
         let g = id_of(&funcs, "g");
         let mut cache = alloc::collections::BTreeMap::new();
         let mut stack = alloc::collections::BTreeSet::new();
-        let jit_f = ensure_jit(&mut cache, &funcs, f, &mut stack).expect("f JITs");
+        let jit_f = ensure_jit(&mut cache, &funcs, f, &mut stack, None).expect("f JITs");
         assert!(jit_f.is_generic(), "f must be the generic tier");
         assert_eq!(
             cache.get(&g).and_then(|c| c.as_ref()).map(|j| j.abi_kind()),

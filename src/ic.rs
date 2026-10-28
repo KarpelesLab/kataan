@@ -43,6 +43,9 @@ pub struct PropertyCache {
     /// `crate::nbvm::native_call`): which intrinsic the call resolved to and
     /// how to tell it still does.
     pub(crate) native: Option<alloc::boxed::Box<crate::nbvm::native_call::NativeSite>>,
+    /// Whether `shape` was last armed by an add (see
+    /// [`arm_transition`](Self::arm_transition)) rather than a lookup.
+    by_add: bool,
 }
 
 /// How many times a site's [`ChainCache`] may be (re)armed.
@@ -96,6 +99,7 @@ impl PropertyCache {
         let slot = object_shape.lookup(key)?;
         self.shape = Some(Rc::clone(object_shape));
         self.slot = slot;
+        self.by_add = false;
         Some(slot)
     }
 
@@ -120,6 +124,7 @@ impl PropertyCache {
     pub fn arm_transition(&mut self, to: Rc<Shape>) {
         self.slot = to.len().saturating_sub(1);
         self.shape = Some(to);
+        self.by_add = true;
     }
 
     /// Whether the cache is warmed (has resolved at least one shape).
@@ -143,6 +148,55 @@ impl PropertyCache {
     /// Discards the cached shape (e.g. when the site goes megamorphic).
     pub fn clear(&mut self) {
         self.shape = None;
+    }
+
+    /// The cache's `(shape, slot)` memo and its counters, for a compiler
+    /// that starts its own copy of the site warm (see [`WarmEntry`]).
+    #[must_use]
+    pub fn warm_entry(&self) -> Option<WarmEntry> {
+        self.shape.as_ref().map(|s| WarmEntry {
+            shape: Rc::clone(s),
+            slot: self.slot,
+            hits: self.hits,
+            misses: self.misses,
+            by_add: self.by_add,
+        })
+    }
+
+    /// Arms the cache with `warm`'s memo (counters start afresh).
+    pub fn seed(&mut self, warm: &WarmEntry) {
+        self.shape = Some(Rc::clone(&warm.shape));
+        self.slot = warm.slot;
+        self.by_add = warm.by_add;
+    }
+}
+
+/// A warm site's memo, as [`PropertyCache::warm_entry`] reports it: the shape
+/// last resolved and its slot for the site's key (a fact of that immutable
+/// layout), and how often the site hit or missed while it was interpreted —
+/// the type feedback that says whether the site is monomorphic.
+#[derive(Clone)]
+pub struct WarmEntry {
+    /// The cached shape (kept alive by this `Rc`).
+    pub shape: Rc<Shape>,
+    /// The slot the site's key has under `shape`.
+    pub slot: u32,
+    /// Fast-path hits so far.
+    pub hits: u32,
+    /// Misses so far (the cold one included).
+    pub misses: u32,
+    /// Whether the memo was recorded by an add (a write site whose objects
+    /// arrive *without* the key: `shape` is the add's result).
+    pub by_add: bool,
+}
+
+impl WarmEntry {
+    /// Whether the site looks monomorphic and settled: it hit several times
+    /// as often as it missed (a site cycling through layouts misses about
+    /// as often as it hits).
+    #[must_use]
+    pub fn is_stable(&self) -> bool {
+        self.hits >= 4 && self.hits >= self.misses.saturating_mul(4)
     }
 }
 

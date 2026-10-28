@@ -167,6 +167,14 @@ fn shape_word_offsets() -> (i32, i32) {
     (parent, i(strong.cast_signed()))
 }
 
+/// The word an object's shape field (and a cache) holds for `shape`: what
+/// compiled code compares a receiver's shape with.
+#[allow(unsafe_code)]
+pub(crate) fn shape_word(shape: &Rc<Shape>) -> u64 {
+    // SAFETY: an `Rc` is one pointer word (see `shape_word_offsets`).
+    unsafe { core::ptr::read(core::ptr::addr_of!(*shape).cast::<usize>()) as u64 }
+}
+
 /// [`crate::object::JIT_FLAG_EXOTIC`], as compiled code tests it.
 pub(crate) const FLAG_EXOTIC: u8 = crate::object::JIT_FLAG_EXOTIC;
 
@@ -1096,6 +1104,48 @@ impl X64Assembler {
         self.jmp(back);
     }
 
+    /// `rax` = slot `slot` of the object whose heap slot is `rcx`, a slot its
+    /// shape (compared by the caller) is known to have: an inline value, or
+    /// a spilled one (the object then has its `extra` part, whose spill
+    /// array is as long as the shape requires). Clobbers `r11`.
+    pub(crate) fn p_obj_fixed_slot_load(&mut self, l: &JitLayout, slot: u32) {
+        match Self::fixed_slot(l, slot) {
+            (None, disp) => self.g_load(r::RAX, r::RCX, disp),
+            (Some(spill_ptr), disp) => {
+                self.g_load(r::R11, r::RCX, l.props.off_extra);
+                self.g_load(r::R11, r::R11, spill_ptr);
+                self.g_load(r::RAX, r::R11, disp);
+            }
+        }
+    }
+
+    /// The store twin of
+    /// [`p_obj_fixed_slot_load`](Self::p_obj_fixed_slot_load): slot `slot`
+    /// `= rdx`. Clobbers `r11`.
+    pub(crate) fn p_obj_fixed_slot_store(&mut self, l: &JitLayout, slot: u32) {
+        match Self::fixed_slot(l, slot) {
+            (None, disp) => self.g_store(r::RCX, disp, r::RDX),
+            (Some(spill_ptr), disp) => {
+                self.g_load(r::R11, r::RCX, l.props.off_extra);
+                self.g_load(r::R11, r::R11, spill_ptr);
+                self.g_store(r::R11, disp, r::RDX);
+            }
+        }
+    }
+
+    /// Where slot `slot` lives: `(None, d)` at `rcx + d`, or `(Some(p), d)`
+    /// at `d` into the spill array whose pointer is at `p` into `extra`.
+    fn fixed_slot(l: &JitLayout, slot: u32) -> (Option<i32>, i32) {
+        const INLINE: u32 = crate::object::INLINE_SLOTS as u32;
+        // A shaped object has at most `u16::MAX` slots, so these fit.
+        let at = |i: u32| i32::try_from(i).expect("slot index fits in i32") * 8;
+        if slot < INLINE {
+            (None, l.off_inline + at(slot))
+        } else {
+            (Some(l.extra_spill_ptr), at(slot - INLINE))
+        }
+    }
+
     /// `mov [base + index*8 + disp32], src` (`index` not `rsp`).
     pub(crate) fn p_store_index8(&mut self, base: u8, index: u8, disp: i32, src: u8) {
         debug_assert!(index != 4, "rsp is no index");
@@ -1610,6 +1660,8 @@ mod tests {
             // The shape word's parent link and strong count.
             let shape_word = |h: Handle| *field(h, jl.off_shape).cast::<*const u8>();
             let oshape = std::rc::Rc::clone(oo.shape());
+            // What a compiled-in layout compares the field with.
+            assert_eq!(shape_word(o) as u64, super::shape_word(&oshape));
             let parent = *shape_word(o)
                 .offset(isize::try_from(l.shape_parent).unwrap())
                 .cast::<*const u8>();

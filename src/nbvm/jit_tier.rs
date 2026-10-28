@@ -263,12 +263,13 @@ pub(super) fn enter_on_call(
     id: usize,
     args: &[NanBox],
     regs: &mut [NanBox],
+    ic: &[crate::ic::PropertyCache],
 ) -> Option<Result<NanBox, VmError>> {
     let proto = funcs.get(id)?;
     if proto.is_async || proto.is_generator {
         return None;
     }
-    let jit = jit_for(funcs, id)?;
+    let jit = jit_for(funcs, id, ic)?;
     if jit.is_generic() {
         return match run_compiled(ctx, funcs, &jit, regs, 0, &[])? {
             Ok(FrameExit::Return(v)) => Some(Ok(v.unwrap_or(NanBox::undefined()))),
@@ -301,6 +302,7 @@ pub(super) fn osr(
     regs: &mut [NanBox],
     target: usize,
     handlers: &[(usize, Reg)],
+    ic: &[crate::ic::PropertyCache],
 ) -> Option<Result<FrameExit, VmError>> {
     if mode() == Mode::Off {
         return None;
@@ -320,7 +322,7 @@ pub(super) fn osr(
     if proto.is_generator || proto.ops.len() != program.len() {
         return None;
     }
-    let jit: Rc<crate::jit::JitProto> = jit_for(funcs, id)?;
+    let jit: Rc<crate::jit::JitProto> = jit_for(funcs, id, ic)?;
     if !jit.has_entry(target) {
         return None;
     }

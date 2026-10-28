@@ -2629,6 +2629,11 @@ struct GenericSites {
     /// their addresses; the method helper refills them).
     #[allow(dead_code)]
     methods: Vec<Option<alloc::boxed::Box<core::cell::UnsafeCell<props::MethodSite>>>>,
+    /// The shapes the code compares with as immediates (see [`Baked`]): held
+    /// for as long as the code exists, so no other shape can be allocated at
+    /// one of their addresses and pass for it.
+    #[allow(dead_code)]
+    baked: Vec<alloc::rc::Rc<crate::shape::Shape>>,
 }
 
 /// The generic-tier runtime-helper table: the `extern "C"` slow paths the emitted
@@ -2975,6 +2980,20 @@ pub struct SiteInfo {
     cache_ptr: *mut core::ffi::c_void,
     /// The site's method-call chain cache (see [`props::MethodSite`]).
     method_ptr: *mut props::MethodSite,
+    /// The site's compiled-in layout, for a site that was monomorphic while
+    /// interpreted.
+    baked: Option<Baked>,
+}
+
+/// A property site's layout compiled into its code: a receiver whose shape
+/// word is `shape` has the site's key as a data property in slot `slot`
+/// (a fact of that immutable shape, which the owning [`JitProto`] keeps
+/// alive). Any other receiver takes the site's cache path.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+struct Baked {
+    shape: u64,
+    slot: u32,
 }
 
 /// The calling-convention / signature a compiled [`JitProto`] exposes to a
@@ -3167,6 +3186,22 @@ impl JitProto {
     /// owned copy of the bytecode.
     #[must_use]
     pub fn compile_generic(proto: &crate::nbvm::FnProto, helpers: &GenericHelpers) -> Option<Self> {
+        Self::compile_generic_warm(proto, helpers, &[])
+    }
+
+    /// [`compile_generic`](Self::compile_generic), starting from the
+    /// interpreter's warm inline caches: `warm[pc]` is the memo of the
+    /// property site at bytecode `pc` (if any). Each site's cache starts
+    /// with that memo, and a site the interpreter saw stay monomorphic gets
+    /// its shape and slot compiled in as constants: its fast
+    /// path compares the receiver's shape with an immediate and reads or
+    /// writes the slot at a fixed offset, with the cache path behind it.
+    #[must_use]
+    pub fn compile_generic_warm(
+        proto: &crate::nbvm::FnProto,
+        helpers: &GenericHelpers,
+        warm: &[Option<crate::ic::WarmEntry>],
+    ) -> Option<Self> {
         let (ops, keys, call_args, n_calls) = lower_nbvm_generic(proto)?;
         // One persistent cache per `CallValue` site (stable addresses, as below).
         let calls: alloc::boxed::Box<[core::cell::UnsafeCell<CallSite>]> = (0..n_calls)
@@ -3175,10 +3210,39 @@ impl JitProto {
         let call_sites: Vec<*const CallSite> = calls.iter().map(|c| c.get().cast_const()).collect();
         let bytecode: alloc::boxed::Box<[crate::nbvm::Op]> = proto.ops.clone().into_boxed_slice();
         // One persistent inline cache per property-access site.
-        let caches: alloc::boxed::Box<[core::cell::UnsafeCell<crate::ic::PropertyCache>]> = (0
+        let mut caches: alloc::boxed::Box<[core::cell::UnsafeCell<crate::ic::PropertyCache>]> = (0
             ..keys.len())
             .map(|_| core::cell::UnsafeCell::new(crate::ic::PropertyCache::new()))
             .collect();
+        // The interpreter's memos: every `GetProp`/`SetProp` site starts warm,
+        // and a stable one is compiled in (its shape kept alive by `baked`).
+        let mut baked_at: Vec<Option<Baked>> = alloc::vec![None; keys.len()];
+        let mut baked: Vec<alloc::rc::Rc<crate::shape::Shape>> = Vec::new();
+        for (pc, op) in ops.iter().enumerate() {
+            let (site, write) = match *op {
+                GenericOp::GetProp { site, .. } => (site as usize, false),
+                GenericOp::SetProp { site, .. } => (site as usize, true),
+                _ => continue,
+            };
+            let (Some(Some(w)), Some(key), Some(cache)) =
+                (warm.get(pc), keys.get(site), caches.get_mut(site))
+            else {
+                continue;
+            };
+            // A layout's keys and slots never change: re-derive the memo
+            // from the shape itself rather than trust it.
+            if w.shape.lookup(key) != Some(w.slot) {
+                continue;
+            }
+            cache.get_mut().seed(w);
+            if w.is_stable() && !(write && (w.by_add || w.shape.is_wrapper())) {
+                baked_at[site] = Some(Baked {
+                    shape: props::shape_word(&w.shape),
+                    slot: w.slot,
+                });
+                baked.push(alloc::rc::Rc::clone(&w.shape));
+            }
+        }
         // A chain cache for each method-call and property-write site.
         let mut wants = alloc::vec![false; keys.len()];
         for op in &ops {
@@ -3214,7 +3278,13 @@ impl JitProto {
                 key_len: k.len(),
                 cache_ptr: c.get().cast::<core::ffi::c_void>(),
                 method_ptr: m.as_ref().map_or(core::ptr::null_mut(), |m| m.get()),
+                baked: None,
             })
+            .collect();
+        let site_info: Vec<SiteInfo> = site_info
+            .into_iter()
+            .zip(baked_at)
+            .map(|(si, b)| SiteInfo { baked: b, ..si })
             .collect();
         // Loop headers: the targets of backward branches.
         let mut osr_entries: Vec<usize> = ops
@@ -3263,6 +3333,7 @@ impl JitProto {
                 caches,
                 calls,
                 methods,
+                baked,
             }),
             n_regs: proto.n_regs,
             osr_entries,
@@ -5566,6 +5637,10 @@ impl JitFunction {
         // register: (spill read, its return, the slow paths' resume, past
         // the op, the op).
         let mut cold_reloads: Vec<(Label, Label, Label, Label, usize)> = Vec::new();
+        // The cache paths of `GetProp`s with a compiled-in layout: (entry,
+        // return, miss, the promoted result's spill read, cache).
+        let mut cold_caches: Vec<(Label, Label, Label, Option<Label>, *mut core::ffi::c_void)> =
+            Vec::new();
         #[allow(clippy::type_complexity)]
         let mut cold_gets: Vec<(
             Label,
@@ -6133,12 +6208,40 @@ impl JitFunction {
                     // (A host-exotic object's reads are the host's.)
                     recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj);
                     a.mov_rax_at_rcx(layout.off_shape);
-                    a.movabs_r11(s.cache_ptr as i64); // r11 = &PropertyCache
-                    a.cmp_rax_at_r11(layout.cache_shape_off);
-                    a.jne(helper);
-                    a.mov_eax_at_r11(layout.cache_slot_off);
-                    a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
-                    if let Some(x) = num.result_xmm(op_idx, dst) {
+                    if let Some(b) = s.baked {
+                        // The layout the site settled on, compiled in: one
+                        // compare with the shape, one load at a fixed
+                        // offset; any other shape takes the cache path
+                        // (out of line, `cold_caches`).
+                        let cached = a.new_label();
+                        let back = a.new_label();
+                        a.g_movabs(call_seq::r::R11, b.shape);
+                        a.cmp_rax_r11();
+                        a.jne(cached);
+                        a.p_obj_fixed_slot_load(&layout, b.slot);
+                        let x = num.result_xmm(op_idx, dst);
+                        let spill = x.map(|_| a.new_label());
+                        cold_caches.push((cached, back, helper, spill, s.cache_ptr));
+                        a.bind(back);
+                        if let (Some(x), Some(spill)) = (x, spill) {
+                            let past = a.new_label();
+                            numeric::NumGen::set_xmm_from_rax(&mut a, x);
+                            cold_reloads.push((spill, back, done, past, op_idx));
+                            ool_past = Some(past);
+                        } else {
+                            a.store_rax(disp(dst));
+                            a.jmp(done);
+                        }
+                    } else {
+                        a.movabs_r11(s.cache_ptr as i64); // r11 = &PropertyCache
+                        a.cmp_rax_at_r11(layout.cache_shape_off);
+                        a.jne(helper);
+                        a.mov_eax_at_r11(layout.cache_slot_off);
+                        a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
+                    }
+                    if s.baked.is_some() {
+                        // Emitted above.
+                    } else if let Some(x) = num.result_xmm(op_idx, dst) {
                         // In a promoted loop: the value straight into its SSE
                         // register; the spill-array read and the slow paths'
                         // reload are out of line (`cold_reloads`).
@@ -6205,6 +6308,24 @@ impl JitFunction {
                     );
                     a.jne(helper);
                     a.mov_rax_at_rcx(layout.off_shape);
+                    if let Some(b) = s.baked {
+                        // The layout the site settled on, compiled in (never
+                        // a primitive wrapper's): a compare with the shape and
+                        // a store at a fixed offset; any other shape takes
+                        // the cache path just below.
+                        let cached = a.new_label();
+                        a.g_movabs(call_seq::r::R11, b.shape);
+                        a.cmp_rax_r11();
+                        a.jne(cached);
+                        if !num.is_number_at(op_idx, val) {
+                            a.load_rax(disp(val));
+                            a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
+                        }
+                        a.load_rdx(disp(val));
+                        a.p_obj_fixed_slot_store(&layout, b.slot);
+                        a.jmp(done);
+                        a.bind(cached);
+                    }
                     a.movabs_r11(s.cache_ptr as i64);
                     a.cmp_rax_at_r11(layout.cache_shape_off);
                     a.jne(shape_miss);
@@ -6888,6 +7009,31 @@ impl JitFunction {
             a.bind(done);
             num.after_generic(&mut a, pc);
             a.jmp(past);
+        }
+        // The cache paths of sites with a compiled-in layout, for a receiver
+        // of another shape (in `rax`; its heap slot in `rcx`): the site's
+        // cache, else the miss path. The value goes back in `rax`.
+        for (cached, back, miss, spill, cache) in core::mem::take(&mut cold_caches) {
+            a.bind(cached);
+            a.movabs_r11(cache as i64);
+            a.cmp_rax_at_r11(layout.cache_shape_off);
+            a.jne(miss);
+            a.mov_eax_at_r11(layout.cache_slot_off);
+            a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
+            match spill {
+                // The promoted result's spill read is `cold_reloads`'.
+                Some(spill) => {
+                    a.p_obj_slot_load_inline(&layout, miss, spill);
+                    a.jmp(back);
+                }
+                None => {
+                    let spill = a.new_label();
+                    a.p_obj_slot_load_inline(&layout, miss, spill);
+                    a.jmp(back);
+                    a.bind(spill);
+                    a.p_obj_slot_load_spill(&layout, back);
+                }
+            }
         }
         // The receiver cache's full walks: each refills its way and resumes.
         for (walk, back, recv, miss, w, fam) in core::mem::take(&mut cold_walks) {
