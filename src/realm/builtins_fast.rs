@@ -24,6 +24,26 @@ impl Realm {
         o.shaped_shape()
     }
 
+    /// `EnumerableOwnProperties(O, key)` for an object whose own properties are
+    /// all plain enumerable data properties (see
+    /// [`plain_keyed_shape`](Self::plain_keyed_shape)) and which is no primitive
+    /// wrapper (a String wrapper owns its indices exotically): its string keys
+    /// in property order. `None` for anything else.
+    #[must_use]
+    pub fn plain_enumerable_keys(
+        &self,
+        handle: Handle,
+    ) -> Option<alloc::vec::Vec<alloc::string::String>> {
+        let Some(Cell::Object(o)) = self.heap.get(handle) else {
+            return None;
+        };
+        if o.is_prim_wrapper() {
+            return None;
+        }
+        self.plain_keyed_shape(handle)?;
+        self.object_keys(handle)
+    }
+
     /// Slot `slot` of the object at `handle`, provided the object still has
     /// shape `shape` and still satisfies
     /// [`plain_keyed_shape`](Self::plain_keyed_shape)'s conditions — so the slot
@@ -202,14 +222,43 @@ impl Realm {
         key: &str,
         cache: &mut MethodSiteCache,
     ) -> Option<NanBox> {
-        if !cache.armed || cache.swaps != self.cell_swaps {
+        if !cache.armed || cache.swaps != self.cell_swaps || cache.prim {
             return None;
         }
-        let mut cur = if cache.own {
+        let cur = if cache.own {
             Some(recv)
         } else {
             self.method_lookup_start(recv, key, &mut cache.recv_shape)?
         };
+        self.site_links_get(cur, key, cache)
+    }
+
+    /// [`method_site_get`](Self::method_site_get) for a *primitive* receiver
+    /// (a Number, a Boolean, …), whose lookup starts at its prototype
+    /// intrinsic `start` ([`primitive_proto`](Self::primitive_proto)) — a
+    /// primitive owns no named property. Only a site filled by
+    /// [`method_site_fill_prim`](Self::method_site_fill_prim) hits.
+    #[must_use]
+    pub fn method_site_get_prim(
+        &self,
+        start: Handle,
+        key: &str,
+        cache: &mut MethodSiteCache,
+    ) -> Option<NanBox> {
+        if !cache.armed || cache.swaps != self.cell_swaps || !cache.prim {
+            return None;
+        }
+        self.site_links_get(Some(start), key, cache)
+    }
+
+    /// The walk of [`method_site_get`](Self::method_site_get) from the first
+    /// chain link `cur`.
+    fn site_links_get(
+        &self,
+        mut cur: Option<Handle>,
+        key: &str,
+        cache: &MethodSiteCache,
+    ) -> Option<NanBox> {
         let last = cache.links.len().checked_sub(1)?;
         for (i, &(raw, aux, epoch)) in cache.links.iter().enumerate() {
             let h = cur?;
@@ -251,8 +300,9 @@ impl Realm {
         cache.links.clear();
         cache.holder_shape = None;
         cache.own = false;
+        cache.prim = false;
         cache.swaps = self.cell_swaps;
-        let mut cur = match self.method_lookup_start(recv, key, &mut cache.recv_shape) {
+        let cur = match self.method_lookup_start(recv, key, &mut cache.recv_shape) {
             Some(start) => start,
             // A static (`String.fromCharCode`): the receiver itself, an
             // ordinary object or a native function, holds the method. It is
@@ -266,6 +316,35 @@ impl Realm {
             }
             None => return None,
         };
+        self.site_links_fill(cur, key, cache)
+    }
+
+    /// [`method_site_fill`](Self::method_site_fill) for a primitive receiver
+    /// whose lookup starts at `start` (see
+    /// [`method_site_get_prim`](Self::method_site_get_prim)).
+    pub fn method_site_fill_prim(
+        &self,
+        start: Handle,
+        key: &str,
+        cache: &mut MethodSiteCache,
+    ) -> Option<NanBox> {
+        cache.armed = false;
+        cache.links.clear();
+        cache.holder_shape = None;
+        cache.own = false;
+        cache.prim = true;
+        cache.swaps = self.cell_swaps;
+        self.site_links_fill(Some(start), key, cache)
+    }
+
+    /// The walk of [`method_site_fill`](Self::method_site_fill) from the first
+    /// chain link `cur`.
+    fn site_links_fill(
+        &self,
+        mut cur: Option<Handle>,
+        key: &str,
+        cache: &mut MethodSiteCache,
+    ) -> Option<NanBox> {
         for _ in 0..8 {
             let h = cur?;
             let (aux, epoch, next) = self.key_link(h)?;
@@ -454,6 +533,9 @@ pub struct MethodSiteCache {
     recv_shape: Option<Rc<Shape>>,
     /// Whether the receiver itself is the holder (the only link).
     own: bool,
+    /// Whether the site was filled for a primitive receiver (the walk starts
+    /// at its prototype intrinsic).
+    prim: bool,
     armed: bool,
     swaps: u32,
 }

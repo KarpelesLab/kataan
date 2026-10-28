@@ -1,9 +1,5 @@
 use super::*;
 
-// `TrimString` skips the same white-space set as `ToNumber`, `parseInt` /
-// `parseFloat` and `StringToBigInt`.
-use crate::realm::is_js_whitespace;
-
 impl Interp {
     /// `Function.prototype.toString` source-representation for the callable
     /// `handle`: `class <Name> { }` for a class, else NativeFunction syntax
@@ -2260,10 +2256,7 @@ impl Interp {
                         Some(self.new_str_bytes(case_map_wtf8(&bytes, upper)))
                     }
                 }
-                "trim" => {
-                    let s = crate::wtf8::to_string_lossy(bytes);
-                    Some(self.new_str(s.trim_matches(is_js_whitespace)))
-                }
+                "trim" => Some(self.new_str_bytes(trim_wtf8(bytes, true, true).to_vec())),
                 "charAt" => {
                     // UTF-16-indexed: the unit at `i` as a one-unit string,
                     // preserving a lone surrogate (stored via WTF-8). A negative
@@ -2619,23 +2612,13 @@ impl Interp {
                         ascii,
                     )))
                 }
-                "trimStart" => {
-                    let s = crate::wtf8::to_string_lossy(bytes);
-                    Some(self.new_str(s.trim_start_matches(is_js_whitespace)))
-                }
-                "trimEnd" => {
-                    let s = crate::wtf8::to_string_lossy(bytes);
-                    Some(self.new_str(s.trim_end_matches(is_js_whitespace)))
-                }
                 // Annex B.2.3: `trimLeft`/`trimRight` are legacy aliases of
                 // `trimStart`/`trimEnd`.
-                "trimLeft" => {
-                    let s = crate::wtf8::to_string_lossy(bytes);
-                    Some(self.new_str(s.trim_start_matches(is_js_whitespace)))
+                "trimStart" | "trimLeft" => {
+                    Some(self.new_str_bytes(trim_wtf8(bytes, true, false).to_vec()))
                 }
-                "trimRight" => {
-                    let s = crate::wtf8::to_string_lossy(bytes);
-                    Some(self.new_str(s.trim_end_matches(is_js_whitespace)))
+                "trimEnd" | "trimRight" => {
+                    Some(self.new_str_bytes(trim_wtf8(bytes, false, true).to_vec()))
                 }
                 // Annex B.2.3 legacy HTML wrapper methods. `CreateHTML(S, tag,
                 // attribute, value)`: wraps the receiver string `S` in
@@ -4131,13 +4114,22 @@ impl Interp {
                     // SameValueZero: like `===` but `NaN` matches `NaN`. `includes`
                     // does *not* skip holes — a hole reads as `undefined`, so
                     // `[,].includes(undefined)` is `true`.
-                    let t_nan = target.as_number().is_some_and(f64::is_nan);
-                    let t_undef = matches!(target.unpack(), Unpacked::Undefined);
-                    let found = elems[from..].iter().any(|e| {
-                        (e.is_hole() && t_undef)
-                            || self.realm.strict_equals(*e, target)
-                            || (t_nan && e.as_number().is_some_and(f64::is_nan))
-                    });
+                    // A hole is `Get(O, k)` through the prototype chain (where an
+                    // index property or getter may answer), so with any hole every
+                    // index is read live.
+                    if elems.iter().any(|e| e.is_hole()) {
+                        let len = elems.len();
+                        for k in from..len {
+                            let v = self.read_member(handle, &alloc::format!("{k}"))?;
+                            if self.realm.same_value_zero(v, target) {
+                                return Ok(Some(NanBox::boolean(true)));
+                            }
+                        }
+                        return Ok(Some(NanBox::boolean(false)));
+                    }
+                    let found = elems[from..]
+                        .iter()
+                        .any(|e| self.realm.same_value_zero(*e, target));
                     return Ok(Some(NanBox::boolean(found)));
                 }
                 // `toSorted`/`toReversed`/`with`/`toSpliced` — the ES2023 immutable
@@ -6105,6 +6097,29 @@ impl Interp {
                         .type_error("Array.prototype.concat result exceeds maximum array length"));
                 }
                 let len = len_int as usize;
+                // A dense, hole-free source array copied onto the end of a plain
+                // result array whose length is `n`: each `HasProperty`/`Get` is
+                // an own data read and each `CreateDataPropertyOrThrow` an append,
+                // so the elements move in bulk.
+                if let Some(src) = self.realm.array_elements(h)
+                    && src.len() == len
+                    && self.realm.array_length(h) == Some(len)
+                    && !self.realm.array_has_index_overrides(h)
+                    && !self.realm.proto_index_accessor_dirty()
+                    && !src.iter().any(|e| e.is_hole())
+                    && self.realm.array_elements(a_h).map(<[_]>::len) == Some(n as usize)
+                    && self.realm.array_length(a_h) == Some(n as usize)
+                    && !self.realm.array_has_index_overrides(a_h)
+                    && !self.realm.array_is_non_extensible(a_h)
+                    && self.realm.limits.max_array_len >= n as usize + len
+                {
+                    let src = src.to_vec();
+                    for v in src {
+                        self.realm.array_push(a_h, v);
+                    }
+                    n += len as f64;
+                    continue;
+                }
                 for k in 0..len {
                     let key = alloc::format!("{k}");
                     // Only define a result element when the source HasProperty(k);

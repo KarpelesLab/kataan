@@ -40,8 +40,9 @@ use crate::heap::Handle;
 use crate::ic::PropertyCache;
 use crate::nanbox::{NanBox, Unpacked};
 use crate::nbexec::{
-    N_ARRAY_IS_ARRAY, N_ARRAY_PROTO_FN, N_MAP_PROTO_FN, N_OBJ_PROTO_HASOWN, N_REGEXP_PROTO_FN,
-    N_SET_PROTO_FN, N_STATIC_METHOD, N_STRING_PROTO_FN,
+    N_ARRAY_IS_ARRAY, N_ARRAY_PROTO_FN, N_JSON_PARSE, N_JSON_STRINGIFY, N_MAP_PROTO_FN,
+    N_NUMBER_PROTO_FN, N_OBJ_PROTO_HASOWN, N_OBJECT_ASSIGN, N_OBJECT_ENTRIES, N_OBJECT_KEYS,
+    N_REGEXP_PROTO_FN, N_SET_PROTO_FN, N_STATIC_METHOD, N_STRING_PROTO_FN,
 };
 use crate::realm::Realm;
 use crate::realm::builtins_fast::MethodSiteCache;
@@ -101,6 +102,36 @@ enum FastOp {
     /// An `Array.prototype` higher-order built-in (`map`, `forEach`, `sort`,
     /// …), whose loop runs in the VM (`array_hof`).
     ArrayHof(super::array_hof::Hof),
+    /// `Number.prototype.toFixed` on a Number primitive.
+    NumToFixed,
+    /// `Number.prototype.toString` on a Number primitive.
+    NumToString,
+    /// `Array.prototype.indexOf`.
+    ArrIndexOf,
+    /// `Array.prototype.includes`.
+    ArrIncludes,
+    /// `Array.prototype.join`.
+    ArrJoin,
+    /// `Array.prototype.slice`.
+    ArrSlice,
+    /// `String.prototype.toUpperCase` / `toLowerCase`.
+    StrCase(bool),
+    /// `String.prototype.trim` / `trimStart` / `trimEnd` (which ends).
+    StrTrim(bool, bool),
+    /// `String.prototype.padStart` / `padEnd` (whether at the start).
+    StrPad(bool),
+    /// `String.prototype.split`.
+    StrSplit,
+    /// `String.prototype.replace`.
+    StrReplace,
+    /// `Object.keys`.
+    ObjKeys,
+    /// `Object.entries`.
+    ObjEntries,
+    /// A built-in whose implementation is the host's (`Object.assign`,
+    /// `JSON.stringify`, `JSON.parse`): the resolved function is called
+    /// through the host directly, with no by-name re-resolution.
+    HostDirect,
 }
 
 /// A method-call site's memo of the intrinsic it calls (see the module docs).
@@ -121,6 +152,9 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
     match realm.native_at(f) {
         Some(N_OBJ_PROTO_HASOWN) => return FastOp::ObjHasOwn,
         Some(N_ARRAY_IS_ARRAY) => return FastOp::ArrayIsArray,
+        Some(N_OBJECT_KEYS) => return FastOp::ObjKeys,
+        Some(N_OBJECT_ENTRIES) => return FastOp::ObjEntries,
+        Some(N_OBJECT_ASSIGN | N_JSON_STRINGIFY | N_JSON_PARSE) => return FastOp::HostDirect,
         _ => {}
     }
     let Some((id, target)) = realm.bound_native_at(f) else {
@@ -159,6 +193,22 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_STRING_PROTO_FN, b"startsWith") => FastOp::StrStartsWith,
         (N_STRING_PROTO_FN, b"endsWith") => FastOp::StrEndsWith,
         (N_STRING_PROTO_FN, b"includes") => FastOp::StrIncludes,
+        (N_STRING_PROTO_FN, b"toUpperCase") => FastOp::StrCase(true),
+        (N_STRING_PROTO_FN, b"toLowerCase") => FastOp::StrCase(false),
+        (N_STRING_PROTO_FN, b"trim") => FastOp::StrTrim(true, true),
+        (N_STRING_PROTO_FN, b"trimStart") => FastOp::StrTrim(true, false),
+        (N_STRING_PROTO_FN, b"trimEnd") => FastOp::StrTrim(false, true),
+        (N_STRING_PROTO_FN, b"padStart") => FastOp::StrPad(true),
+        (N_STRING_PROTO_FN, b"padEnd") => FastOp::StrPad(false),
+        (N_STRING_PROTO_FN, b"split") => FastOp::StrSplit,
+        (N_STRING_PROTO_FN, b"replace") => FastOp::StrReplace,
+        #[cfg(feature = "std")]
+        (N_NUMBER_PROTO_FN, b"toFixed") => FastOp::NumToFixed,
+        (N_NUMBER_PROTO_FN, b"toString") => FastOp::NumToString,
+        (N_ARRAY_PROTO_FN, b"indexOf") => FastOp::ArrIndexOf,
+        (N_ARRAY_PROTO_FN, b"includes") => FastOp::ArrIncludes,
+        (N_ARRAY_PROTO_FN, b"join") => FastOp::ArrJoin,
+        (N_ARRAY_PROTO_FN, b"slice") => FastOp::ArrSlice,
         // `Function.prototype`'s methods share the Array methods' dispatch id.
         (N_ARRAY_PROTO_FN, b"call") => FastOp::FnCall,
         (N_ARRAY_PROTO_FN, b"apply") => FastOp::FnApply,
@@ -181,22 +231,67 @@ fn cacheable_key(key: &str) -> bool {
 }
 
 /// Whether `site` still proves that `recv[key]` is its recorded intrinsic.
-fn site_hit(realm: &Realm, site: &mut NativeSite, h: Handle, key: &str) -> bool {
+/// `prim`: `h` is a primitive receiver's prototype intrinsic, where the
+/// lookup starts.
+fn site_hit(realm: &Realm, site: &mut NativeSite, h: Handle, prim: bool, key: &str) -> bool {
     site.op != FastOp::None
-        && realm
-            .method_site_get(h, key, &mut site.chain)
-            .is_some_and(|v| v.to_bits() == site.method)
+        && if prim {
+            realm.method_site_get_prim(h, key, &mut site.chain)
+        } else {
+            realm.method_site_get(h, key, &mut site.chain)
+        }
+        .is_some_and(|v| v.to_bits() == site.method)
 }
 
-/// Re-resolves the site for receiver `h`: records the intrinsic `recv[key]`
-/// reaches, if it is one served here.
-fn fill(realm: &Realm, site: &mut NativeSite, h: Handle, key: &str) {
+/// Re-resolves the site for receiver `h` (see [`site_hit`] for `prim`):
+/// records the intrinsic `recv[key]` reaches, if it is one served here.
+fn fill(realm: &Realm, site: &mut NativeSite, h: Handle, prim: bool, key: &str) {
     site.fills += 1;
     site.op = FastOp::None;
-    if let Some(v) = realm.method_site_fill(h, key, &mut site.chain) {
+    let found = if prim {
+        realm.method_site_fill_prim(h, key, &mut site.chain)
+    } else {
+        realm.method_site_fill(h, key, &mut site.chain)
+    };
+    if let Some(v) = found {
         site.op = classify(realm, v);
         site.method = v.to_bits();
     }
+}
+
+/// The elements of the array `h` when reading them is plain data access: a
+/// dense array with no holes (a hole would read through the prototype), no
+/// index side table, no inherited index accessor, and its length the dense
+/// length.
+fn dense_elements(realm: &Realm, h: Handle) -> Option<&[NanBox]> {
+    let e = realm.array_elements(h)?;
+    if realm.array_has_index_overrides(h)
+        || realm.proto_index_accessor_dirty()
+        || realm.array_length(h) != Some(e.len())
+        || e.iter().any(|v| v.is_hole())
+    {
+        return None;
+    }
+    Some(e)
+}
+
+/// A relative index argument (`ToIntegerOrInfinity`, then counted from the
+/// end when negative) clamped to `0..=len`, when it converts without running
+/// code; `undefined` is `default`.
+fn rel_index(v: NanBox, len: usize, default: usize) -> Option<usize> {
+    Some(match int_arg(v)? {
+        None => default,
+        Some(n) if n < 0.0 => (len as f64 + n).max(0.0) as usize,
+        Some(n) => (n as usize).min(len),
+    })
+}
+
+/// `ToLength(v)` of a Number or `undefined` (which runs no code).
+fn length_arg(v: NanBox) -> Option<usize> {
+    Some(match int_arg(v)? {
+        None => 0,
+        Some(n) => n.max(0.0) as usize,
+    })
 }
 
 /// Whether the site of `cache` currently calls a built-in served by
@@ -233,7 +328,8 @@ fn int_arg(v: NanBox) -> Option<Option<f64>> {
 
 /// A string receiver, flattened, as its rope (one leaf).
 fn str_parts(realm: &mut Realm, h: Handle) -> Option<crate::rope::Rope> {
-    if !realm.is_string_handle(h) {
+    // A string cell with a function marker is a function, not a string.
+    if !realm.typeof_is_string(h) {
         return None;
     }
     realm.flatten_string(h);
@@ -283,7 +379,13 @@ pub(super) fn try_call(
     if ctx.host.is_none() || ctx.realm.multi_realm {
         return None;
     }
-    let h = Handle::from_raw(recv.as_handle()?);
+    // A Number receiver owns no property: its lookup starts at
+    // `%Number.prototype%`, which then stands in for it in the site's chain.
+    let (h, prim) = match recv.as_handle() {
+        Some(r) => (Handle::from_raw(r), false),
+        None if recv.as_number().is_some() => (ctx.realm.primitive_proto(recv)?, true),
+        None => return None,
+    };
     let site = cache.native.get_or_insert_with(|| {
         Box::new(NativeSite {
             chain: MethodSiteCache::default(),
@@ -292,17 +394,23 @@ pub(super) fn try_call(
             fills: 0,
         })
     });
-    if !site_hit(&ctx.realm, site, h, key) {
+    if !site_hit(&ctx.realm, site, h, prim, key) {
         if site.fills >= FILL_LIMIT || !cacheable_key(key) {
             // Retired: a site that keeps changing its mind calls the general
             // path from now on.
             site.op = FastOp::None;
             return None;
         }
-        fill(&ctx.realm, site, h, key);
+        fill(&ctx.realm, site, h, prim, key);
         if site.op == FastOp::None {
             return None;
         }
+    }
+    // Only the Number methods take a primitive receiver; anything else the
+    // chain of `%Number.prototype%` reaches (`hasOwnProperty`, …) would get
+    // the prototype as its `this`.
+    if prim != matches!(site.op, FastOp::NumToFixed | FastOp::NumToString) {
+        return None;
     }
     let arg = |i: usize| {
         args.get(i)
@@ -555,8 +663,10 @@ pub(super) fn try_call(
             };
             return Some(call_vm(ctx, funcs, regs, recv, this, &argv));
         }
-        FastOp::RegExpCall => {
-            realm.regexp_flags(h)?;
+        FastOp::RegExpCall | FastOp::HostDirect => {
+            if site.op == FastOp::RegExpCall {
+                realm.regexp_flags(h)?;
+            }
             let method = NanBox::from_bits(site.method);
             let argv = super::ArgBuf::from_regs(regs, args);
             return Some(
@@ -564,6 +674,191 @@ pub(super) fn try_call(
                     .unwrap_or(Err(super::HostError::Fault))
                     .map_err(VmError::from),
             );
+        }
+        #[cfg(feature = "std")]
+        FastOp::NumToFixed => {
+            let n = recv.as_number()?;
+            let d = int_arg(arg(0))?.unwrap_or(0.0);
+            if !(0.0..=100.0).contains(&d) {
+                return None;
+            }
+            let out = crate::nbexec::number_to_fixed(n, d as usize);
+            NanBox::handle(realm.new_string(&out).to_raw())
+        }
+        #[cfg(not(feature = "std"))]
+        FastOp::NumToFixed => return None,
+        FastOp::NumToString => {
+            let n = recv.as_number()?;
+            let radix = int_arg(arg(0))?.unwrap_or(10.0);
+            if !(2.0..=36.0).contains(&radix) {
+                return None;
+            }
+            let out = if radix == 10.0 || !n.is_finite() {
+                crate::realm::js_number_string(n)
+            } else {
+                crate::nbexec::int_to_radix(n, radix as u32)
+            };
+            NanBox::handle(realm.new_string(&out).to_raw())
+        }
+        FastOp::ArrIndexOf | FastOp::ArrIncludes => {
+            let elems = dense_elements(realm, h)?;
+            let len = elems.len();
+            let target = arg(0);
+            // `fromIndex` converts before the search; a zero length skips it.
+            let from = if len == 0 {
+                0
+            } else {
+                match int_arg(arg(1))? {
+                    None => 0,
+                    Some(n) if n < 0.0 => (len as f64 + n).max(0.0) as usize,
+                    Some(n) => (n.min(len as f64)) as usize,
+                }
+            };
+            let tail = elems.get(from..).unwrap_or(&[]);
+            if site.op == FastOp::ArrIndexOf {
+                let i = tail.iter().position(|e| realm.strict_equals(*e, target));
+                NanBox::number(i.map_or(-1.0, |i| (from + i) as f64))
+            } else {
+                NanBox::boolean(tail.iter().any(|e| realm.same_value_zero(*e, target)))
+            }
+        }
+        FastOp::ArrJoin => {
+            let sep_v = arg(0);
+            let sep: alloc::vec::Vec<u8> = if sep_v.is_undefined() {
+                alloc::vec![b',']
+            } else {
+                str_arg(realm, sep_v)?.as_leaf_bytes()?.to_vec()
+            };
+            let elems: alloc::vec::Vec<NanBox> = dense_elements(realm, h)?.to_vec();
+            let mut out = alloc::vec::Vec::new();
+            for (i, e) in elems.into_iter().enumerate() {
+                if i > 0 {
+                    crate::wtf8::append(&mut out, &sep);
+                }
+                // Elements whose ToString runs no code: strings, numbers,
+                // booleans, and `undefined`/`null` (which join as empty).
+                match e.unpack() {
+                    Unpacked::Undefined | Unpacked::Null => {}
+                    Unpacked::Bool(b) => out.extend_from_slice(if b { b"true" } else { b"false" }),
+                    Unpacked::Number(n) => {
+                        out.extend_from_slice(crate::realm::js_number_string(n).as_bytes());
+                    }
+                    Unpacked::Handle(_) => {
+                        let part = str_arg(realm, e)?;
+                        crate::wtf8::append(&mut out, part.as_leaf_bytes()?);
+                    }
+                }
+            }
+            NanBox::handle(realm.new_string_wtf8(out).to_raw())
+        }
+        FastOp::ArrSlice => {
+            // `ArraySpeciesCreate` must be the plain `ArrayCreate`.
+            if !super::array_hof::default_species(realm, h) {
+                return None;
+            }
+            let elems = dense_elements(realm, h)?;
+            let len = elems.len();
+            let a = rel_index(arg(0), len, 0)?;
+            let b = rel_index(arg(1), len, len)?;
+            let part = elems.get(a..b.max(a)).unwrap_or(&[]).to_vec();
+            NanBox::handle(realm.new_array(part).to_raw())
+        }
+        FastOp::StrCase(upper) => {
+            let rope = str_parts(realm, h)?;
+            let out = crate::nbexec::case_map_wtf8(rope.as_leaf_bytes()?, upper);
+            NanBox::handle(realm.new_string_wtf8(out).to_raw())
+        }
+        FastOp::StrTrim(start, end) => {
+            let rope = str_parts(realm, h)?;
+            let bytes = rope.as_leaf_bytes()?;
+            let out = crate::nbexec::trim_wtf8(bytes, start, end);
+            if out.len() == bytes.len() {
+                recv
+            } else {
+                let out = out.to_vec();
+                NanBox::handle(realm.new_string_wtf8(out).to_raw())
+            }
+        }
+        FastOp::StrPad(at_start) => {
+            let target = length_arg(arg(0))?;
+            let fill_v = arg(1);
+            let fill = if fill_v.is_undefined() {
+                None
+            } else {
+                Some(str_arg(realm, fill_v)?)
+            };
+            let rope = str_parts(realm, h)?;
+            // A huge target is the host's (its length check throws).
+            if target > rope.utf16_len() + (1 << 20) {
+                return None;
+            }
+            let pad: &[u8] = match &fill {
+                None => b" ",
+                Some(f) => f.as_leaf_bytes()?,
+            };
+            let out = crate::nbexec::pad_units(rope.as_leaf_bytes()?, target, pad, at_start);
+            NanBox::handle(realm.new_string_wtf8(out).to_raw())
+        }
+        FastOp::StrSplit => {
+            // A non-empty string separator that cannot split a surrogate pair,
+            // and no limit.
+            if !arg(1).is_undefined() {
+                return None;
+            }
+            let sep = str_arg(realm, arg(0))?;
+            let sep_b = sep.as_leaf_bytes()?;
+            if sep_b.is_empty() || crate::nbexec::split_sensitive(sep_b) {
+                return None;
+            }
+            let rope = str_parts(realm, h)?;
+            let parts = crate::nbexec::split_units(rope.as_leaf_bytes()?, sep_b);
+            let parts: alloc::vec::Vec<NanBox> = parts
+                .into_iter()
+                .map(|b| NanBox::handle(realm.new_string_wtf8(b).to_raw()))
+                .collect();
+            NanBox::handle(realm.new_array(parts).to_raw())
+        }
+        FastOp::StrReplace => {
+            // A string pattern (no `@@replace` is consulted for a primitive)
+            // and a string replacement with no `$` substitution.
+            let pat = str_arg(realm, arg(0))?;
+            let rep = str_arg(realm, arg(1))?;
+            let (pat_b, rep_b) = (pat.as_leaf_bytes()?, rep.as_leaf_bytes()?);
+            if rep_b.contains(&b'$') || crate::nbexec::split_sensitive(pat_b) {
+                return None;
+            }
+            let rope = str_parts(realm, h)?;
+            let bytes = rope.as_leaf_bytes()?;
+            let at = if pat_b.is_empty() {
+                Some(0)
+            } else {
+                bytes.windows(pat_b.len()).position(|w| w == pat_b)
+            };
+            match at {
+                None => recv,
+                Some(i) => {
+                    let mut out = alloc::vec::Vec::with_capacity(bytes.len() + rep_b.len());
+                    out.extend_from_slice(&bytes[..i]);
+                    crate::wtf8::append(&mut out, rep_b);
+                    crate::wtf8::append(&mut out, &bytes[i + pat_b.len()..]);
+                    NanBox::handle(realm.new_string_wtf8(out).to_raw())
+                }
+            }
+        }
+        FastOp::ObjKeys | FastOp::ObjEntries => {
+            let o = arg(0).as_handle().map(Handle::from_raw)?;
+            let keys = realm.plain_enumerable_keys(o)?;
+            let mut out = alloc::vec::Vec::with_capacity(keys.len());
+            for k in keys {
+                let kv = NanBox::handle(realm.new_string(&k).to_raw());
+                out.push(if site.op == FastOp::ObjKeys {
+                    kv
+                } else {
+                    let v = realm.get_property(o, &k)?;
+                    NanBox::handle(realm.new_array(alloc::vec![kv, v]).to_raw())
+                });
+            }
+            NanBox::handle(realm.new_array(out).to_raw())
         }
     };
     Some(Ok(v))

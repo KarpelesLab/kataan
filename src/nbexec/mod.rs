@@ -7022,7 +7022,7 @@ fn unit_byte_exact(bytes: &[u8], unit: usize) -> Option<usize> {
 /// Whether a match of the WTF-8 `needle` can start or end inside a
 /// surrogate pair of the haystack: it begins with a lone low surrogate or
 /// ends with a lone high one, so byte comparison would miss it.
-fn split_sensitive(needle: &[u8]) -> bool {
+pub(crate) fn split_sensitive(needle: &[u8]) -> bool {
     crate::wtf8::leading_low_surrogate(needle).is_some()
         || crate::wtf8::trailing_high_surrogate(needle).is_some()
 }
@@ -7187,10 +7187,60 @@ fn last_index_of_units(hay: &[u8], needle: &[u8], from: usize, ascii: bool) -> f
     -1.0
 }
 
+/// `TrimString` over WTF-8 `bytes`: the sub-slice without the leading
+/// (`start`) and/or trailing (`end`) white space and line terminators. Works on
+/// code points, so a lone surrogate (never white space) is kept intact.
+pub(crate) fn trim_wtf8(bytes: &[u8], start: bool, end: bool) -> &[u8] {
+    let is_ws = |cp: u32| char::from_u32(cp).is_some_and(crate::realm::is_js_whitespace);
+    let mut lo = 0;
+    if start {
+        for (cp, off, len) in wtf8_code_point_iter(bytes) {
+            if !is_ws(cp) {
+                break;
+            }
+            lo = off + len;
+        }
+    }
+    let mut hi = bytes.len();
+    if end {
+        while hi > lo {
+            // Step back to the lead byte of the last code point.
+            let mut i = hi - 1;
+            while i > lo && (bytes[i] & 0xC0) == 0x80 {
+                i -= 1;
+            }
+            let cp = crate::wtf8::code_points(&bytes[i..hi]).next().unwrap_or(0);
+            if !is_ws(cp) {
+                break;
+            }
+            hi = i;
+        }
+    }
+    &bytes[lo..hi]
+}
+
 /// Splits WTF-8 `hay` on the non-empty WTF-8 `sep`, returning the segments as
-/// WTF-8 byte buffers (the byte-level split is exact: `sep` is well-formed
-/// WTF-8, so matches land on code-point boundaries and never split a surrogate).
+/// WTF-8 byte buffers (the byte-level split is exact, as matches land on code-point
+/// boundaries, unless `sep` can split a surrogate pair).
 pub(crate) fn split_units(hay: &[u8], sep: &[u8]) -> Vec<Vec<u8>> {
+    // A separator with a lone surrogate at an edge can split a pair: compare
+    // the UTF-16 units themselves.
+    if split_sensitive(sep) {
+        let (h, n) = (to_units(hay), to_units(sep));
+        let mut out = Vec::new();
+        let (mut start, mut i) = (0, 0);
+        while i + n.len() <= h.len() {
+            if h[i..i + n.len()] == n[..] {
+                out.push(crate::wtf8::from_utf16(&h[start..i]));
+                i += n.len();
+                start = i;
+            } else {
+                i += 1;
+            }
+        }
+        out.push(crate::wtf8::from_utf16(&h[start..]));
+        return out;
+    }
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
@@ -10181,17 +10231,40 @@ pub(crate) fn number_to_fixed(n: f64, digits: usize) -> String {
         // expansion and round its magnitude up; everything else takes
         // Rust's already-correct rounding (so e.g. `(2.355).toFixed(2)`
         // is "2.35", since the double is 2.35499…, not "2.36").
-        let expanded = alloc::format!("{:.*}", digits + 25, n.abs());
-        let dot = expanded.find('.').unwrap_or(expanded.len());
-        let tail = &expanded[(dot + 1 + digits).min(expanded.len())..];
-        let exact_half = tail.starts_with('5') && tail.as_bytes()[1..].iter().all(|&b| b == b'0');
+        //
+        // `|n|·10^digits` is exactly `k + ½` iff `|n|·2^(digits+1)` is an odd
+        // integer (a double is a dyadic rational, so the factor `5^digits`
+        // must divide its odd numerator); the scaling by a power of two is
+        // exact, so this is decided without a long decimal expansion.
+        let t = n.abs() * f64::powi(2.0, digits as i32 + 1);
+        let exact_half = t < 9_007_199_254_740_992.0 && t.fract() == 0.0 && t % 2.0 == 1.0;
         if exact_half {
+            let expanded = alloc::format!("{:.*}", digits + 1, n.abs());
+            let dot = expanded.find('.').unwrap_or(expanded.len());
             let kept: String = expanded[..dot]
                 .chars()
                 .chain(expanded[dot + 1..dot + 1 + digits].chars())
                 .collect();
-            let m = kept.parse::<u128>().unwrap_or(0) + 1;
-            let mut s = alloc::format!("{m}");
+            // `kept + 1` in decimal (it can exceed any machine integer).
+            let mut digs = kept.into_bytes();
+            let mut i = digs.len();
+            loop {
+                if i == 0 {
+                    digs.insert(0, b'1');
+                    break;
+                }
+                i -= 1;
+                if digs[i] == b'9' {
+                    digs[i] = b'0';
+                } else {
+                    digs[i] += 1;
+                    break;
+                }
+            }
+            while digs.len() > 1 && digs[0] == b'0' {
+                digs.remove(0);
+            }
+            let mut s = String::from_utf8(digs).unwrap_or_default();
             if digits > 0 {
                 while s.len() <= digits {
                     s.insert(0, '0');

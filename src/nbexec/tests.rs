@@ -12671,3 +12671,172 @@ fn method_calls_respect_prototype_and_integrity() {
         r#"TypeError,TypeError,TypeError,true,TypeError,TypeError,TypeError,1,TypeError,TypeError,2,S,J,3,1,2,true,1:1,number,true,55296,55296,55296,2,true/false/true/true/false/true/1/2/1/-1/-1"#
     );
 }
+
+/// The built-in method sites (Number toFixed/toString, Array indexOf/includes/join/slice, String case/trim/pad/split/replace, Object.keys/entries, JSON, Object.assign) and the host paths they fall back to agree with the spec, including holes read through the prototype, species, surrogate-splitting separators, coercing arguments and non-plain objects; each case runs three times so warmed sites are exercised.
+#[test]
+fn builtin_method_sites_match_the_general_path() {
+    let src = r#"
+        var out = []; var P = function (s) { out.push(s); };
+        function show(f){try{var r=f(); return Array.isArray(r) ? '['+r.map(function(x){return typeof x==='string'?JSON.stringify(x):String(x)}).join(',')+']:'+r.length : typeof r === 'object' && r ? JSON.stringify(r) : String(r)}catch(e){return 'throw '+e.constructor.name}}
+        function T(l, f){ P(l + ': ' + show(f)); }
+        var cases = {
+          concat1: function(){ return [1,2].concat([3,4], 5, [[6]]); },
+          concatHole: function(){ var a=[1,,3]; var r=a.concat([4,,6]); return [r.length, 1 in r, 4 in r].join(); },
+          concatSpreadObj: function(){ var o={length:2,0:'a',1:'b'}; o[Symbol.isConcatSpreadable]=true; return [1].concat(o); },
+          concatNoSpread: function(){ var a=[1,2]; a[Symbol.isConcatSpreadable]=false; return [0].concat(a).length; },
+          concatSub: function(){ class A extends Array{}; var r=new A(1,2).concat([3]); return (r instanceof A)+':'+r.length; },
+          concatProtoIdx: function(){ Array.prototype[1]='P'; var r=[0,,2].concat([5]); delete Array.prototype[1]; return r; },
+          concatStr: function(){ return ['a'].concat('bc', 1, null); },
+          idx1: function(){ return [1,2,3,2].indexOf(2, -1) + ',' + [1,2,3].indexOf(2, 5) + ',' + [NaN].indexOf(NaN) + ',' + [NaN].includes(NaN) + ',' + [1,2,3].includes(1, -2) + ',' + [0].indexOf(-0) + ',' + ['a'].indexOf('a') + ',' + [1].indexOf(1, Infinity) + ',' + [1,2].indexOf(1, -Infinity); },
+          idxHole: function(){ Array.prototype[1]=7; var r=[1,,3].indexOf(7)+','+[1,,3].includes(7); delete Array.prototype[1]; return r; },
+          idxCoerce: function(){ return [1,2,3].indexOf(3, {valueOf:function(){return 1}}); },
+          join1: function(){ return [1, 'a', null, undefined, true, 1.5, -0, 1e21].join('-') + '|' + [].join() + '|' + [1,2].join(undefined) + '|' + [[1,2],3].join(';'); },
+          joinSur: function(){ var r=['\uD83D','\uDE00'].join(''); return r.length + ':' + r.codePointAt(0); },
+          joinObj: function(){ return [{toString:function(){return 'o'}}, 2].join(); },
+          joinSym: function(){ return [Symbol('x')].join(); },
+          slice1: function(){ return [1,2,3,4].slice(1,-1) + '|' + [1,2,3].slice(-10) + '|' + [1,2,3].slice(2,1).length + '|' + [1,2,3].slice(NaN, Infinity); },
+          sliceSpecies: function(){ class A extends Array{}; var r=new A(1,2,3).slice(1); return (r instanceof A)+':'+r.length; },
+          sliceCtor: function(){ var a=[1,2]; a.constructor={}; a.constructor[Symbol.species]=function(n){ return {length:0, n:n}; }; return JSON.stringify(a.slice(0)); },
+          upper: function(){ return 'aßç\uD800'.toUpperCase().length + ':' + 'ABC'.toLowerCase() + ':' + 'İ'.toLowerCase().length; },
+          trim1: function(){ return '[' + ' \t\n ﻿ab\u2028 '.trim() + ']' + '[' + '  a '.trimStart() + ']' + '[' + ' a  '.trimEnd() + ']' + ' \uD800 '.trim().length; },
+          pad1: function(){ return 'ab'.padStart(5) + '|' + 'ab'.padEnd(5, 'xy') + '|' + 'ab'.padStart(1) + '|' + 'ab'.padStart(4, '') + '|' + 'ab'.padStart(NaN, 'x') + '|' + 'ab'.padStart(3.9, 'x') + '|' + 'ab'.padStart(4, '😀').length; },
+          split1: function(){ return 'a,b,,c'.split(',') + '|' + 'abc'.split('') + '|' + 'abc'.split() + '|' + 'a,b'.split(',', 1) + '|' + 'a😀b'.split('\uDE00').length + '|' + ',a,'.split(',').length; },
+          replace1: function(){ return 'aXbX'.replace('X', '-') + '|' + 'ab'.replace('', '-') + '|' + 'ab'.replace('z', '-') + '|' + 'ab'.replace('a', '$&$&') + '|' + 'ab'.replace('a', function(m){return m+m}) + '|' + 'a😀'.replace('\uDE00', 'x').length; },
+          keys1: function(){ var o={b:1, a:2, 2:3, 1:4}; return Object.keys(o) + '|' + JSON.stringify(Object.entries(o)); },
+          keysNonEnum: function(){ var o={a:1}; Object.defineProperty(o, 'h', {value:1, enumerable:false}); return Object.keys(o) + '|' + Object.entries(o); },
+          keysGetter: function(){ var n=0; var o={get a(){ n++; return 1 }}; var e=Object.entries(o); return n + ':' + e; },
+          keysStrWrap: function(){ return Object.keys(new String('ab')) + '|' + Object.keys('xy') + '|' + Object.keys([5,6]); },
+          keysSym: function(){ var o={a:1}; o[Symbol('s')]=2; return Object.keys(o).length; },
+          keysProxy: function(){ return Object.keys(new Proxy({a:1,b:2}, {})); },
+          keysPrim: function(){ return Object.keys(1).length + ':' + Object.keys(null); },
+          fixed1: function(){ return (1.005).toFixed(2) + '|' + (2.5).toFixed(0) + '|' + (-1.5).toFixed(0) + '|' + (1e21).toFixed(2) + '|' + (1).toFixed(101); },
+          fixedCoerce: function(){ return (1.5).toFixed({valueOf:function(){return 1}}); },
+          tostr1: function(){ return (255).toString(16) + '|' + (255).toString(2) + '|' + (0.5).toString(2) + '|' + (-255).toString(36) + '|' + (1e21).toString(16) + '|' + (255).toString(1); },
+          tostrNaN: function(){ return NaN.toString(16) + '|' + (Infinity).toString(2) + '|' + (5).toString(undefined) + '|' + (5).toString(10.9); },
+          json1: function(){ return JSON.stringify({a:[1,'b',null]}) + JSON.stringify(JSON.parse('{"x":[1,2]}')); },
+          assign1: function(){ var t={}; Object.assign(t, {a:1}, null, {b:2}); return JSON.stringify(t); },
+        };
+        for (var k in cases) { var f = cases[k]; for (var i = 0; i < 3; i++) T(k + i, f); }
+        out.join("\n")
+    "#;
+    assert_eq!(
+        run(src),
+        r#"concat10: [1,2,3,4,5,6]:6
+concat11: [1,2,3,4,5,6]:6
+concat12: [1,2,3,4,5,6]:6
+concatHole0: 6,false,false
+concatHole1: 6,false,false
+concatHole2: 6,false,false
+concatSpreadObj0: [1,"a","b"]:3
+concatSpreadObj1: [1,"a","b"]:3
+concatSpreadObj2: [1,"a","b"]:3
+concatNoSpread0: 2
+concatNoSpread1: 2
+concatNoSpread2: 2
+concatSub0: true:3
+concatSub1: true:3
+concatSub2: true:3
+concatProtoIdx0: [0,"P",2,5]:4
+concatProtoIdx1: [0,"P",2,5]:4
+concatProtoIdx2: [0,"P",2,5]:4
+concatStr0: ["a","bc",1,null]:4
+concatStr1: ["a","bc",1,null]:4
+concatStr2: ["a","bc",1,null]:4
+idx10: 3,-1,-1,true,false,0,0,-1,0
+idx11: 3,-1,-1,true,false,0,0,-1,0
+idx12: 3,-1,-1,true,false,0,0,-1,0
+idxHole0: 1,true
+idxHole1: 1,true
+idxHole2: 1,true
+idxCoerce0: 2
+idxCoerce1: 2
+idxCoerce2: 2
+join10: 1-a---true-1.5-0-1e+21||1,2|1,2;3
+join11: 1-a---true-1.5-0-1e+21||1,2|1,2;3
+join12: 1-a---true-1.5-0-1e+21||1,2|1,2;3
+joinSur0: 2:128512
+joinSur1: 2:128512
+joinSur2: 2:128512
+joinObj0: o,2
+joinObj1: o,2
+joinObj2: o,2
+joinSym0: throw TypeError
+joinSym1: throw TypeError
+joinSym2: throw TypeError
+slice10: 2,3|1,2,3|0|1,2,3
+slice11: 2,3|1,2,3|0|1,2,3
+slice12: 2,3|1,2,3|0|1,2,3
+sliceSpecies0: true:2
+sliceSpecies1: true:2
+sliceSpecies2: true:2
+sliceCtor0: {"0":1,"1":2,"length":2,"n":2}
+sliceCtor1: {"0":1,"1":2,"length":2,"n":2}
+sliceCtor2: {"0":1,"1":2,"length":2,"n":2}
+upper0: 5:abc:2
+upper1: 5:abc:2
+upper2: 5:abc:2
+trim10: [ab][a ][ a]1
+trim11: [ab][a ][ a]1
+trim12: [ab][a ][ a]1
+pad10:    ab|abxyx|ab|ab|ab|xab|4
+pad11:    ab|abxyx|ab|ab|ab|xab|4
+pad12:    ab|abxyx|ab|ab|ab|xab|4
+split10: a,b,,c|a,b,c|abc|a|2|3
+split11: a,b,,c|a,b,c|abc|a|2|3
+split12: a,b,,c|a,b,c|abc|a|2|3
+replace10: a-bX|-ab|ab|aab|aab|3
+replace11: a-bX|-ab|ab|aab|aab|3
+replace12: a-bX|-ab|ab|aab|aab|3
+keys10: 1,2,b,a|[["1",4],["2",3],["b",1],["a",2]]
+keys11: 1,2,b,a|[["1",4],["2",3],["b",1],["a",2]]
+keys12: 1,2,b,a|[["1",4],["2",3],["b",1],["a",2]]
+keysNonEnum0: a|a,1
+keysNonEnum1: a|a,1
+keysNonEnum2: a|a,1
+keysGetter0: 1:a,1
+keysGetter1: 1:a,1
+keysGetter2: 1:a,1
+keysStrWrap0: 0,1|0,1|0,1
+keysStrWrap1: 0,1|0,1|0,1
+keysStrWrap2: 0,1|0,1|0,1
+keysSym0: 1
+keysSym1: 1
+keysSym2: 1
+keysProxy0: ["a","b"]:2
+keysProxy1: ["a","b"]:2
+keysProxy2: ["a","b"]:2
+keysPrim0: throw TypeError
+keysPrim1: throw TypeError
+keysPrim2: throw TypeError
+fixed10: throw RangeError
+fixed11: throw RangeError
+fixed12: throw RangeError
+fixedCoerce0: 1.5
+fixedCoerce1: 1.5
+fixedCoerce2: 1.5
+tostr10: throw RangeError
+tostr11: throw RangeError
+tostr12: throw RangeError
+tostrNaN0: NaN|Infinity|5|5
+tostrNaN1: NaN|Infinity|5|5
+tostrNaN2: NaN|Infinity|5|5
+json10: {"a":[1,"b",null]}{"x":[1,2]}
+json11: {"a":[1,"b",null]}{"x":[1,2]}
+json12: {"a":[1,"b",null]}{"x":[1,2]}
+assign10: {"a":1,"b":2}
+assign11: {"a":1,"b":2}
+assign12: {"a":1,"b":2}"#
+    );
+}
+
+/// `toFixed` rounds an exact tie away from zero (decided exactly, at any digit
+/// count) and otherwise takes the correctly rounded digits.
+#[test]
+fn to_fixed_ties_and_long_expansions() {
+    assert_eq!(
+        run(
+            "[(2.355).toFixed(50), (2**-30).toFixed(29), (0.5).toFixed(0), (1.25).toFixed(1), (-2.5).toFixed(0), (3*2**-20).toFixed(19)].join('|')"
+        ),
+        "2.35499999999999998223643160599749535322189331054688|0.00000000093132257461547851563|1|1.3|-3|0.0000028610229492188"
+    );
+}
