@@ -1,0 +1,874 @@
+//! The generic tier's inline property paths' access to the heap
+//! (`ROADMAP.md` §2.1).
+//!
+//! The inline property get/set paths address an object through the heap's slot
+//! array. Rather than calling a helper for the array's base and length on every
+//! access, compiled code reads them where they live — the `Realm` the context's
+//! `realm` box points at, then the heap's slot `Vec` — so they are always
+//! current: a helper that allocated (and so maybe reallocated the array) since
+//! the last access is no hazard, because nothing is cached across it.
+//!
+//! The receiver qualification the helper did is folded into the object
+//! itself: an object whose reads or writes must reach the host carries
+//! [`crate::object::Object::jit_flags`] bits, tested inline, and a primitive
+//! wrapper's shape carries its brand bit. Every offset here is probed on live
+//! values (see [`PropsLayout::new`]), never assumed.
+
+use super::call_seq::{cc, r};
+use super::{JitLayout, Label, X64Assembler};
+use crate::shape::Shape;
+use alloc::rc::Rc;
+
+/// `(bits & HANDLE_TAG) == HANDLE_TAG` iff `bits` is a heap handle.
+const HANDLE_TAG: u64 = 0xfffc_0000_0000_0000;
+
+/// The byte offsets the inline property paths add to
+/// [`super::JitLayout`] (all derived at run time).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PropsLayout {
+    /// Slot-relative offset of the object's `jit_flags` byte.
+    pub off_jit_flags: i32,
+    /// Slot-relative offset of the object's raw `proto` word.
+    pub off_proto: i32,
+    /// Slot-relative offset of the object's `key_epoch: u32`.
+    pub off_epoch: i32,
+    /// Slot-relative offset of the object's `extra` pointer (null for none).
+    pub off_extra: i32,
+    /// `ObjectExtra`-relative offset of the accessor list's length word.
+    pub extra_acc_len: i32,
+    /// Shape-word-relative offset of the shape's brand byte.
+    pub shape_brands: i32,
+    /// `Realm`-relative offset of the heap slot array's data pointer.
+    pub heap_ptr: i32,
+    /// `Realm`-relative offset of the heap slot array's length.
+    pub heap_len: i32,
+    /// `Realm`-relative offset of the "incremental marking is running" flag.
+    pub marking: i32,
+    /// Slot-relative offset of the slot's `age` (collections survived).
+    pub off_slot_age: i32,
+    /// The `Cell::VmFunction` discriminant byte.
+    pub vmfn_disc: u8,
+    /// Slot-relative offset of a VM function's `func: u32`.
+    pub off_vmfn_func: i32,
+    /// Slot-relative offset of a VM function's captures data pointer.
+    pub off_vmfn_caps_ptr: i32,
+    /// Slot-relative offset of a VM function's capture count.
+    pub off_vmfn_caps_len: i32,
+}
+
+impl PropsLayout {
+    /// The offsets, given the slot-relative base of an object (`obj_base`) and
+    /// the object probe.
+    pub(crate) fn new(
+        slot: &crate::heap::SlotLayout,
+        cell_base: usize,
+        obj_base: usize,
+        obj: &crate::object::ObjectLayout,
+    ) -> Self {
+        let i = |v: usize| i32::try_from(v).expect("jit layout offset fits in i32");
+        let (heap_ptr, heap_len) = crate::realm::Realm::jit_heap_offsets();
+        let (vmfn_disc, func_off, caps_off) = crate::cell::jit_vm_function_layout();
+        Self {
+            marking: i(crate::realm::Realm::jit_marking_offset()),
+            off_slot_age: i(slot.age_off),
+            vmfn_disc,
+            off_vmfn_func: i(cell_base + func_off),
+            off_vmfn_caps_ptr: i(cell_base + caps_off + obj.vec_ptr_off),
+            off_vmfn_caps_len: i(cell_base + caps_off + obj.vec_len_off),
+            off_jit_flags: i(obj_base + obj.jit_flags_off),
+            off_proto: i(obj_base + obj.proto_off),
+            off_epoch: i(obj_base + obj.epoch_off),
+            off_extra: i(obj_base + obj.extra_off),
+            extra_acc_len: i(obj.extra_acc_len_off),
+            shape_brands: i32::try_from(obj.shape_brands_off)
+                .expect("jit layout offset fits in i32"),
+            heap_ptr: i(heap_ptr),
+            heap_len: i(heap_len),
+        }
+    }
+}
+
+/// [`crate::object::JIT_FLAG_EXOTIC`], as compiled code tests it.
+pub(crate) const FLAG_EXOTIC: u8 = crate::object::JIT_FLAG_EXOTIC;
+
+impl X64Assembler {
+    /// `test byte [base+disp32], imm8` (`base` neither `rsp` nor `r12`).
+    pub(crate) fn p_test_byte_imm(&mut self, base: u8, disp: i32, imm: u8) {
+        debug_assert!(base & 7 != 4, "no SIB form");
+        if base >= 8 {
+            self.code.push(0x41);
+        }
+        self.code.push(0xf6);
+        self.code.push(0x80 | (base & 7));
+        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.push(imm);
+    }
+
+    /// The heap slot array's base into `rax` and its length into `rdx`, read
+    /// from the realm (`[r15 + realm]` is the context's `Box<Realm>` pointer).
+    /// Clobbers `r11`. Exactly what the old `jit_arena` call returned for a
+    /// qualifying receiver.
+    pub(crate) fn p_load_arena(&mut self, realm_off: i32, l: &PropsLayout) {
+        self.g_load(r::R11, r::R15, realm_off);
+        self.g_load(r::RAX, r::R11, l.heap_ptr);
+        self.g_load(r::RDX, r::R11, l.heap_len);
+    }
+}
+
+/// The deepest prototype level a [`MethodSite`] caches a method at.
+pub(crate) const CHAIN_MAX: usize = 4;
+
+/// The receiver layouts a [`MethodSite`] remembers (a polymorphic site —
+/// `task.run()` over several task classes — keeps each of them).
+pub(crate) const METHOD_WAYS: usize = 4;
+
+/// How many times a [`MethodSite`] is (re)filled before it stops trying (a
+/// site whose receivers keep changing layout).
+const FILL_LIMIT: u32 = 32;
+
+/// One prototype-chain object of a [`MethodEntry`]: which object it is (its
+/// raw handle), and its shape and key epoch when the entry was filled.
+#[repr(C)]
+#[derive(Default, Clone)]
+struct ChainLevel {
+    handle: u64,
+    shape: Option<Rc<Shape>>,
+    epoch: u32,
+}
+
+/// One way of a [`MethodSite`]: where a lookup of the site's key found the
+/// method — on a receiver of shape `recv_shape` (one with no accessors at
+/// all), at `depth` objects up its prototype chain (0: the receiver itself,
+/// else `levels[depth - 1]`), in slot `slot` of that holder. Empty while
+/// `recv_shape` is `None` (no shape word is null).
+#[repr(C)]
+#[derive(Default, Clone)]
+struct MethodEntry {
+    recv_shape: Option<Rc<Shape>>,
+    depth: u32,
+    slot: u32,
+    levels: [ChainLevel; CHAIN_MAX],
+}
+
+/// A property site's prototype-chain caches. For a method call, read by
+/// compiled code (see `X64Assembler::p_method_lookup`): up to
+/// `METHOD_WAYS` entries (`MethodEntry`), replaced round-robin. For a
+/// property write, the add cache (`AddEntry`), read by its helper.
+///
+/// A hit re-validates the entry's whole chain: the receiver's shape, then for
+/// each level that the previous object's `[[Prototype]]` is still the
+/// recorded object, and that its shape and key epoch are unchanged. A shape
+/// fixes an object's data keys (so the key is absent below the holder and in
+/// the holder's slot); an unchanged key epoch means no accessor was added or
+/// removed since the fill checked there is none of that name. Host-exotic
+/// objects and primitive wrappers are never recorded, and dictionary-mode
+/// objects never match a shape. The value is read from the holder's slot live.
+#[repr(C)]
+pub struct MethodSite {
+    entries: [MethodEntry; METHOD_WAYS],
+    /// The site's key (UTF-8), for the fill helper.
+    key_ptr: *const u8,
+    /// The key's length.
+    key_len: usize,
+    /// The site's `PropertyCache`, for the fill helper.
+    pub(crate) cache: *mut core::ffi::c_void,
+    /// The way the next new entry replaces.
+    next: usize,
+    fills: u32,
+    /// The site's add cache, when it is a property write.
+    add: AddEntry,
+}
+
+impl MethodSite {
+    /// An empty site for `key` with the property cache `cache`.
+    pub(crate) fn new(key: &str, cache: *mut core::ffi::c_void) -> Self {
+        Self {
+            entries: Default::default(),
+            key_ptr: key.as_ptr(),
+            key_len: key.len(),
+            cache,
+            next: 0,
+            fills: 0,
+            add: AddEntry::default(),
+        }
+    }
+
+    /// The site's key.
+    pub(crate) fn key(&self) -> &'static str {
+        // SAFETY: `key_ptr`/`key_len` are the owning `JitProto`'s boxed key
+        // string, which outlives every use of the site (the helpers that read
+        // it run while the compiled code holding the site runs).
+        #[allow(unsafe_code)]
+        unsafe {
+            core::str::from_utf8_unchecked(core::slice::from_raw_parts(self.key_ptr, self.key_len))
+        }
+    }
+
+    /// Records a lookup of the site's key on the object at `recv` (whose
+    /// method the caller found to be a VM closure): the whole chain is walked
+    /// and recorded only when every object on it is one the compiled check
+    /// can validate (see the type docs). The entry replaces the way holding
+    /// the same receiver layout and prototype, else the next way round.
+    pub(crate) fn fill(&mut self, realm: &crate::realm::Realm, recv: crate::heap::Handle) {
+        if self.fills >= FILL_LIMIT {
+            return;
+        }
+        self.fills += 1;
+        if self.key().starts_with('\0') {
+            return;
+        }
+        let Some(entry) = Self::entry_for(realm, recv, self.key()) else {
+            return;
+        };
+        let way = self
+            .entries
+            .iter()
+            .position(|e| {
+                e.recv_shape
+                    .as_ref()
+                    .zip(entry.recv_shape.as_ref())
+                    .is_some_and(|(a, b)| Rc::ptr_eq(a, b))
+                    && e.depth == entry.depth
+                    && e.levels[0].handle == entry.levels[0].handle
+            })
+            .unwrap_or_else(|| {
+                let w = self.next % METHOD_WAYS;
+                self.next = (w + 1) % METHOD_WAYS;
+                w
+            });
+        self.entries[way] = entry;
+    }
+
+    /// The entry a lookup of `key` on `recv` makes, if it can be cached.
+    fn entry_for(
+        realm: &crate::realm::Realm,
+        recv: crate::heap::Handle,
+        key: &str,
+    ) -> Option<MethodEntry> {
+        let o = realm.jit_chain_object(recv)?;
+        let shape = o.shaped_shape().filter(|_| o.has_no_accessors())?;
+        let mut entry = MethodEntry {
+            recv_shape: Some(Rc::clone(shape)),
+            ..MethodEntry::default()
+        };
+        if let Some(slot) = shape.lookup(key) {
+            entry.slot = slot;
+            return Some(entry);
+        }
+        let mut cur = o.proto();
+        for (d, level) in (1u32..).zip(entry.levels.iter_mut()) {
+            let h = cur?;
+            let p = realm.jit_chain_object(h)?;
+            let ps = p.shaped_shape()?;
+            if p.accessor(key).is_some() {
+                return None;
+            }
+            *level = ChainLevel {
+                handle: h.to_raw(),
+                shape: Some(Rc::clone(ps)),
+                epoch: p.key_epoch(),
+            };
+            if let Some(slot) = ps.lookup(key) {
+                entry.depth = d;
+                entry.slot = slot;
+                return Some(entry);
+            }
+            cur = p.proto();
+        }
+        None
+    }
+}
+
+impl X64Assembler {
+    /// `mov r32, [base+disp32]` (zero-extending; `base` neither `rsp` nor `r12`).
+    fn p_load32(&mut self, dst: u8, base: u8, disp: i32) {
+        self.p_rm32(0x8b, dst, base, disp);
+    }
+
+    /// `cmp r32, [base+disp32]`.
+    fn p_cmp32_mem(&mut self, reg: u8, base: u8, disp: i32) {
+        self.p_rm32(0x3b, reg, base, disp);
+    }
+
+    /// A 32-bit `op reg, [base+disp32]`.
+    fn p_rm32(&mut self, opcode: u8, reg: u8, base: u8, disp: i32) {
+        debug_assert!(base & 7 != 4, "no SIB form");
+        let rex = 0x40 | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1);
+        if rex != 0x40 {
+            self.code.push(rex);
+        }
+        self.code.push(opcode);
+        self.code.push(0x80 | ((reg & 7) << 3) | (base & 7));
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `cmp dword [base+disp32], imm8` (sign-extended).
+    fn p_cmp32_imm8(&mut self, base: u8, disp: i32, imm: i8) {
+        debug_assert!(base & 7 != 4, "no SIB form");
+        if base >= 8 {
+            self.code.push(0x41);
+        }
+        self.code.push(0x83);
+        self.code.push(0x80 | (7 << 3) | (base & 7));
+        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.push(imm.cast_unsigned());
+    }
+
+    /// `shl rdx, 32`.
+    fn p_shl_rdx_32(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0xc1, 0xe2, 32]);
+    }
+
+    /// `or rax, rdx`.
+    fn p_or_rax_rdx(&mut self) {
+        self.code.extend_from_slice(&[0x48, 0x09, 0xd0]);
+    }
+
+    /// `mov eax, eax` (clears `rax`'s upper half).
+    fn p_zext_eax(&mut self) {
+        self.code.extend_from_slice(&[0x89, 0xc0]);
+    }
+
+    /// `mov rax, [r9 + rax*8]`.
+    fn p_load_r9_rax8(&mut self) {
+        self.code.extend_from_slice(&[0x49, 0x8b, 0x04, 0xc1]);
+    }
+
+    /// Jumps to `miss` unless `rax` holds a heap handle. Clobbers `rcx`, `r11`.
+    fn p_handle_check(&mut self, miss: Label) {
+        self.g_movabs(r::R11, HANDLE_TAG);
+        self.g_mov(r::RCX, r::RAX);
+        self.g_and(r::RCX, r::R11);
+        self.g_cmp(r::RCX, r::R11);
+        self.g_jcc(cc::NE, miss);
+    }
+
+    /// From the handle bits in `rax` (a `NanBox` handle or a raw handle: only
+    /// the low 48 bits are read), `rcx = &Slot` of a live slot with that
+    /// generation, given the arena base in `r10` and length in `rdx`; else to
+    /// `miss`. Clobbers `rax`, `r8`.
+    fn p_slot_of(&mut self, l: &JitLayout, miss: Label) {
+        self.mov_r8_rax();
+        self.shr_r8_imm(32); // r8w = generation
+        self.p_zext_eax(); // rax = index
+        self.cmp_rax_rdx();
+        self.jae(miss);
+        self.imul_rax_imm(l.slot_stride);
+        self.add_rax_r10();
+        self.mov_rcx_rax();
+        self.cmp_byte_at_rcx_imm(0, l.slot_occupied_disc);
+        self.jne(miss);
+        self.cmp_word_at_rcx_r8w(l.off_slot_gen);
+        self.jne(miss);
+    }
+
+    /// Jumps to `miss` unless `rcx` is the slot of an ordinary (non-exotic)
+    /// shaped object.
+    fn p_plain_shaped(&mut self, l: &JitLayout, miss: Label) {
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
+        self.jne(miss);
+        self.cmp_byte_at_rcx_imm(l.off_od_tag, l.obj_shaped_disc);
+        self.jne(miss);
+        self.p_test_byte_imm(r::RCX, l.props.off_jit_flags, FLAG_EXOTIC);
+        self.jne(miss);
+    }
+
+    /// The method lookup of a [`MethodSite`] (see its docs), on the receiver
+    /// value at `[recv_base + recv_disp]`: on a hit, the method value in
+    /// `rax`; otherwise to `miss`. Reads only; clobbers `rax`, `rcx`, `rdx`,
+    /// `rsi`, `rdi`, `r8`–`r11`.
+    pub(crate) fn p_method_lookup(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        (recv_base, recv_disp): (u8, i32),
+        site: *const MethodSite,
+        miss: Label,
+    ) {
+        use core::mem::{offset_of, size_of};
+        let i = |v: usize| i32::try_from(v).expect("site offset fits in i32");
+        let level = |d: usize, f: usize| {
+            i(offset_of!(MethodEntry, levels) + d * size_of::<ChainLevel>() + f)
+        };
+        self.p_load_arena(realm_off, &l.props);
+        self.mov_r10_rax();
+        self.g_load(r::RAX, recv_base, recv_disp);
+        self.p_handle_check(miss);
+        self.p_slot_of(l, miss);
+        self.p_plain_shaped(l, miss);
+        // No accessors on the receiver: no `extra`, or an empty accessor list.
+        let no_acc = self.new_label();
+        self.g_load(r::R9, r::RCX, l.props.off_extra);
+        self.g_test(r::R9);
+        self.g_jcc(cc::E, no_acc);
+        self.g_load(r::R9, r::R9, l.props.extra_acc_len);
+        self.g_test(r::R9);
+        self.g_jcc(cc::NE, miss);
+        self.bind(no_acc);
+        // rsi = the receiver's slot, r11 = the way, edi = ways left.
+        self.g_mov(r::RSI, r::RCX);
+        self.g_movabs(
+            r::R11,
+            site as u64 + u64::try_from(offset_of!(MethodSite, entries)).expect("offset"),
+        );
+        self.g_movabs(r::RDI, METHOD_WAYS as u64);
+        let way = self.new_label();
+        let next = self.new_label();
+        let holder = self.new_label();
+        let depth = i(offset_of!(MethodEntry, depth));
+        self.bind(way);
+        self.g_load(r::RAX, r::RSI, l.off_shape);
+        self.g_cmp_mem(r::RAX, r::R11, i(offset_of!(MethodEntry, recv_shape)));
+        self.g_jcc(cc::NE, next);
+        self.g_mov(r::RCX, r::RSI);
+        self.p_cmp32_imm8(r::R11, depth, 0);
+        self.g_jcc(cc::E, holder);
+        for d in 0..CHAIN_MAX {
+            self.g_load(r::RAX, r::RCX, l.props.off_proto);
+            self.g_cmp_mem(r::RAX, r::R11, level(d, offset_of!(ChainLevel, handle)));
+            self.g_jcc(cc::NE, next);
+            self.p_slot_of(l, next);
+            self.p_plain_shaped(l, next);
+            self.g_load(r::RAX, r::RCX, l.off_shape);
+            self.g_cmp_mem(r::RAX, r::R11, level(d, offset_of!(ChainLevel, shape)));
+            self.g_jcc(cc::NE, next);
+            self.p_load32(r::RAX, r::RCX, l.props.off_epoch);
+            self.p_cmp32_mem(r::RAX, r::R11, level(d, offset_of!(ChainLevel, epoch)));
+            self.g_jcc(cc::NE, next);
+            if d + 1 < CHAIN_MAX {
+                self.p_cmp32_imm8(r::R11, depth, i8::try_from(d + 1).expect("small depth"));
+                self.g_jcc(cc::E, holder);
+            }
+        }
+        // `rcx` = the holder's slot: its `slot`-th value.
+        self.bind(holder);
+        self.p_load32(r::RAX, r::R11, i(offset_of!(MethodEntry, slot)));
+        self.cmp_rax_at_rcx(l.off_slots_len);
+        self.jae(next);
+        self.g_load(r::R9, r::RCX, l.off_slots_ptr);
+        self.p_load_r9_rax8();
+        let done = self.new_label();
+        self.jmp(done);
+        self.bind(next);
+        self.g_lea(r::R11, r::R11, i(size_of::<MethodEntry>()));
+        self.p_dec_edi();
+        self.g_jcc(cc::NE, way);
+        self.jmp(miss);
+        self.bind(done);
+    }
+
+    /// `dec edi`.
+    fn p_dec_edi(&mut self) {
+        self.code.extend_from_slice(&[0xff, 0xcf]);
+    }
+
+    /// Whether storing the value in `rax` into the object or array whose slot
+    /// is `rcx` needs nothing from the write barrier (`Realm::write_barrier`):
+    /// a non-handle value, or no incremental marking running and either a
+    /// young container or a live old target (so no old-to-young edge to
+    /// record). Otherwise to `miss`, whose helper store runs the barrier.
+    /// Needs the arena base in `r10` and length in `rdx`; preserves `rcx`,
+    /// clobbers `rax`, `r8`, `r9`, `r11`.
+    pub(crate) fn p_barrier_check(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
+        let done = self.new_label();
+        let old = crate::gc::OLD_AGE;
+        self.g_movabs(r::R11, HANDLE_TAG);
+        self.g_mov(r::R9, r::RAX);
+        self.g_and(r::R9, r::R11);
+        self.g_cmp(r::R9, r::R11);
+        self.g_jcc(cc::NE, done);
+        self.g_load(r::R11, r::R15, realm_off);
+        self.g_cmp_byte_imm(r::R11, l.props.marking, 0);
+        self.g_jcc(cc::NE, miss);
+        self.g_cmp_byte_imm(r::RCX, l.props.off_slot_age, old);
+        self.g_jcc(cc::B, done);
+        self.g_mov(r::R9, r::RCX);
+        self.p_slot_of(l, miss);
+        self.g_cmp_byte_imm(r::RCX, l.props.off_slot_age, old);
+        self.g_jcc(cc::B, miss);
+        self.g_mov(r::RCX, r::R9);
+        self.bind(done);
+    }
+
+    /// The truthiness of the value in `rax`, inline where it is not the
+    /// helper's to decide: `null`/`undefined` to `falsy`; a VM function, or a
+    /// shaped ordinary object without the `[[IsHTMLDDA]]` brand, to `truthy`.
+    /// Anything else falls through (to the helper), with `rax` clobbered as
+    /// are `rcx`, `rdx`, `r8`–`r11`.
+    pub(crate) fn p_truthy_heap(&mut self, realm_off: i32, truthy: Label, falsy: Label) {
+        use crate::nanbox::NanBox;
+        let l = super::compute_jit_layout();
+        let other = self.new_label();
+        self.g_movabs(r::R11, NanBox::null().to_bits());
+        self.g_cmp(r::RAX, r::R11);
+        self.g_jcc(cc::E, falsy);
+        self.g_movabs(r::R11, NanBox::undefined().to_bits());
+        self.g_cmp(r::RAX, r::R11);
+        self.g_jcc(cc::E, falsy);
+        self.g_mov(r::R9, r::RAX);
+        self.p_handle_check(other);
+        self.p_load_arena(realm_off, &l.props);
+        self.mov_r10_rax();
+        self.g_mov(r::RAX, r::R9);
+        self.p_slot_of(l, other);
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.props.vmfn_disc);
+        self.g_jcc(cc::E, truthy);
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
+        self.jne(other);
+        self.cmp_byte_at_rcx_imm(l.off_od_tag, l.obj_shaped_disc);
+        self.jne(other);
+        self.g_load(r::R11, r::RCX, l.off_shape);
+        self.p_test_byte_imm(
+            r::R11,
+            l.props.shape_brands,
+            crate::shape::brand_bit(crate::shape::BRAND_KEYS[1]),
+        );
+        self.g_jcc(cc::E, truthy);
+        self.bind(other);
+    }
+
+    /// The call sequence's callee identification, inline (what
+    /// `jit_callee_info` computes): for the value in `rax`, `rax` = its
+    /// `function id | capture count << 32` and `rdx` = its captures when it
+    /// is a VM closure, else `rax = u64::MAX`. Clobbers `rcx`, `r8`–`r11`.
+    pub(crate) fn p_callee_info(&mut self, l: &JitLayout, realm_off: i32) {
+        let none = self.new_label();
+        let done = self.new_label();
+        self.g_mov(r::R9, r::RAX);
+        self.p_load_arena(realm_off, &l.props);
+        self.mov_r10_rax();
+        self.g_mov(r::RAX, r::R9);
+        self.p_handle_check(none);
+        self.p_slot_of(l, none);
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.props.vmfn_disc);
+        self.jne(none);
+        self.p_load32(r::RAX, r::RCX, l.props.off_vmfn_func);
+        self.g_load(r::RDX, r::RCX, l.props.off_vmfn_caps_len);
+        self.p_shl_rdx_32();
+        self.p_or_rax_rdx();
+        self.g_load(r::RDX, r::RCX, l.props.off_vmfn_caps_ptr);
+        self.jmp(done);
+        self.bind(none);
+        self.g_movabs(r::RAX, u64::MAX);
+        self.bind(done);
+    }
+}
+
+/// A `new` site's constructor cache, kept by `jit_construct_info`: the
+/// constructor it last prepared, and what that took — the constructor's
+/// auxiliary property object (holding `prototype` and the constructor marks)
+/// with its shape, the slot of `prototype` there and the value read from it.
+///
+/// A hit needs the same constructor value (a VM function cell, so the same
+/// function and captures), no cell swap since (so the same auxiliary object),
+/// that object still of the recorded shape (so the same data keys: the
+/// constructor mark present, no instance-field initializer, `prototype` in the
+/// same slot) and that slot still holding the recorded object.
+pub struct ConstructCache {
+    ctor: u64,
+    swaps: u32,
+    slot: u32,
+    aux: u64,
+    aux_shape: Option<Rc<Shape>>,
+    proto: u64,
+}
+
+impl core::fmt::Debug for ConstructCache {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ConstructCache")
+            .field("ctor", &self.ctor)
+            .field("warm", &self.aux_shape.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for ConstructCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConstructCache {
+    /// An empty cache.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            ctor: 0,
+            swaps: 0,
+            slot: 0,
+            aux: 0,
+            aux_shape: None,
+            proto: 0,
+        }
+    }
+
+    /// The `prototype` object for a `new ctor` when the cache holds `ctor`
+    /// unchanged (see the type docs); `None` otherwise.
+    pub(crate) fn hit(
+        &self,
+        realm: &crate::realm::Realm,
+        ctor: u64,
+    ) -> Option<crate::heap::Handle> {
+        let shape = self.aux_shape.as_ref()?;
+        if ctor != self.ctor || realm.jit_cell_swaps() != self.swaps {
+            return None;
+        }
+        let aux = realm.jit_object(crate::heap::Handle::from_raw(self.aux))?;
+        if !aux.shaped_shape().is_some_and(|s| Rc::ptr_eq(s, shape))
+            || aux.slot(self.slot).map(crate::nanbox::NanBox::to_bits) != Some(self.proto)
+        {
+            return None;
+        }
+        crate::nanbox::NanBox::from_bits(self.proto)
+            .as_handle()
+            .map(crate::heap::Handle::from_raw)
+    }
+
+    /// Records a `new ctor` that found the object `proto` as `ctor.prototype`
+    /// (the constructor having passed every other check).
+    pub(crate) fn fill(
+        &mut self,
+        realm: &crate::realm::Realm,
+        ctor: u64,
+        proto: crate::nanbox::NanBox,
+    ) {
+        self.aux_shape = None;
+        let Some(fh) = crate::nanbox::NanBox::from_bits(ctor)
+            .as_handle()
+            .map(crate::heap::Handle::from_raw)
+        else {
+            return;
+        };
+        let Some(aux) = realm.jit_aux_of(fh) else {
+            return;
+        };
+        let Some(shape) = realm.jit_object(aux).and_then(|o| o.shaped_shape()) else {
+            return;
+        };
+        let Some(slot) = shape.lookup("prototype") else {
+            return;
+        };
+        *self = Self {
+            ctor,
+            swaps: realm.jit_cell_swaps(),
+            slot,
+            aux: aux.to_raw(),
+            aux_shape: Some(Rc::clone(shape)),
+            proto: proto.to_bits(),
+        };
+    }
+}
+
+/// A property-write site's add cache (part of a [`MethodSite`]): the last
+/// write there that added the key as a new data property — on an object of
+/// shape `from`, making it `to`, along a prototype chain of `depth` objects
+/// (`levels`) that ends there and owns no property of that name.
+///
+/// A hit re-validates the whole chain as a [`MethodEntry`] does, and that it
+/// still ends after `depth` objects: then no object on it has the key (data:
+/// by shape; accessor: by key epoch), so no inherited setter, read-only
+/// property or proxy can intercept the write, and the receiver (of shape
+/// `from`, so without the key) gets a fresh writable, enumerable,
+/// configurable data property — the child shape `to`.
+#[derive(Default)]
+struct AddEntry {
+    from: Option<Rc<Shape>>,
+    to: Option<Rc<Shape>>,
+    depth: u32,
+    levels: [ChainLevel; CHAIN_MAX],
+}
+
+impl MethodSite {
+    /// The add cache's hit: when writing the site's key to `recv` is an add
+    /// it recorded (see [`AddEntry`]), make it — exactly as the interpreter's
+    /// write does — and return `true`; otherwise change nothing.
+    pub(crate) fn try_add(
+        &self,
+        realm: &mut crate::realm::Realm,
+        recv: u64,
+        value: crate::nanbox::NanBox,
+    ) -> bool {
+        let e = &self.add;
+        let (Some(from), Some(to)) = (e.from.as_ref(), e.to.as_ref()) else {
+            return false;
+        };
+        let Some(h) = crate::nanbox::NanBox::from_bits(recv)
+            .as_handle()
+            .map(crate::heap::Handle::from_raw)
+        else {
+            return false;
+        };
+        let Some(o) = realm.jit_object(h) else {
+            return false;
+        };
+        if o.jit_flags() != 0
+            || !o.shaped_shape().is_some_and(|s| Rc::ptr_eq(s, from))
+            || !o.jit_add_ok()
+        {
+            return false;
+        }
+        let mut cur = o.proto();
+        for level in &e.levels[..e.depth as usize] {
+            let Some(p) = cur.filter(|p| p.to_raw() == level.handle) else {
+                return false;
+            };
+            let Some(po) = realm.jit_object(p) else {
+                return false;
+            };
+            if po.jit_flags() & FLAG_EXOTIC != 0
+                || po.key_epoch() != level.epoch
+                || !po
+                    .shaped_shape()
+                    .zip(level.shape.as_ref())
+                    .is_some_and(|(a, b)| Rc::ptr_eq(a, b))
+            {
+                return false;
+            }
+            cur = po.proto();
+        }
+        cur.is_none() && realm.jit_add_transition(h, Rc::clone(to), value)
+    }
+
+    /// Records a write of the site's key to the object at `recv` that took it
+    /// from shape `before` to its current shape, when that was an add the
+    /// [`AddEntry`] check can prove again (else leaves the cache as it was).
+    pub(crate) fn fill_add(
+        &mut self,
+        realm: &crate::realm::Realm,
+        recv: crate::heap::Handle,
+        before: &Rc<Shape>,
+    ) {
+        if self.fills >= FILL_LIMIT {
+            return;
+        }
+        let key = self.key();
+        // Internal (`\0`-prefixed) keys have rules of their own.
+        if key.starts_with('\0') {
+            return;
+        }
+        let Some(o) = realm.jit_chain_object(recv) else {
+            return;
+        };
+        let Some(to) = o.shaped_shape() else {
+            return;
+        };
+        if o.jit_flags() != 0
+            || !o.jit_add_ok()
+            || !to.parent().is_some_and(|p| Rc::ptr_eq(p, before))
+            || to.lookup(key) != Some(before.len())
+        {
+            return;
+        }
+        self.fills += 1;
+        let mut entry = AddEntry {
+            from: Some(Rc::clone(before)),
+            to: Some(Rc::clone(to)),
+            ..AddEntry::default()
+        };
+        let mut cur = o.proto();
+        for (d, level) in (0u32..).zip(entry.levels.iter_mut()) {
+            let Some(h) = cur else {
+                entry.depth = d;
+                self.add = entry;
+                return;
+            };
+            let Some(p) = realm.jit_chain_object(h) else {
+                return;
+            };
+            let Some(ps) = p.shaped_shape() else {
+                return;
+            };
+            if p.accessor(key).is_some() || ps.lookup(key).is_some() {
+                return;
+            }
+            *level = ChainLevel {
+                handle: h.to_raw(),
+                shape: Some(Rc::clone(ps)),
+                epoch: p.key_epoch(),
+            };
+            cur = p.proto();
+        }
+        if cur.is_none() {
+            entry.depth = CHAIN_MAX as u32;
+            self.add = entry;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::heap::Handle;
+    use crate::nanbox::NanBox;
+    use crate::realm::Realm;
+
+    /// Every offset compiled code reads through [`super::PropsLayout`] agrees
+    /// with a safe read of the same field.
+    #[test]
+    #[allow(unsafe_code)]
+    fn props_layout_matches_safe_reads() {
+        let jl = super::super::compute_jit_layout();
+        let l = &jl.props;
+        let mut realm = Realm::new();
+        let p = realm.new_object();
+        let o = realm.new_object();
+        realm.set_object_proto(o, Some(p));
+        realm.set_property(o, "x", NanBox::number(1.0));
+        let w = realm.new_object();
+        realm.set_property(w, crate::shape::PRIM_WRAP_KEY, NanBox::number(0.0));
+        let f = realm.new_vm_function(7, alloc::vec![NanBox::undefined(), NanBox::number(2.0)]);
+        realm.add_jit_flags(p, crate::object::JIT_FLAG_NO_INLINE_SET);
+        realm.define_accessor(p, "g", NanBox::undefined(), NanBox::undefined());
+        let (base, len) = realm.jit_arena_slots();
+        let rp = core::ptr::addr_of!(realm).cast::<u8>();
+        // SAFETY: reads at probed offsets inside the live realm, its heap's slot
+        // array and the objects/shapes they point to (as compiled code does).
+        unsafe {
+            let at = |off: i32| rp.add(usize::try_from(off).unwrap());
+            assert_eq!(*at(l.heap_ptr).cast::<*const u8>(), base);
+            assert_eq!(*at(l.heap_len).cast::<usize>(), len);
+            let slot = |h: Handle| {
+                let i = usize::try_from(h.to_raw() & 0xffff_ffff).unwrap();
+                base.add(i * usize::try_from(jl.slot_stride).unwrap())
+            };
+            let field = |h: Handle, off: i32| slot(h).add(usize::try_from(off).unwrap());
+            let oo = realm.jit_object(o).unwrap();
+            assert_eq!(*field(o, l.off_proto).cast::<u64>(), p.to_raw());
+            assert_eq!(
+                *field(p, l.off_proto).cast::<u64>(),
+                realm
+                    .jit_object(p)
+                    .unwrap()
+                    .proto()
+                    .map_or(crate::object::NO_PROTO, Handle::to_raw)
+            );
+            assert_eq!(*field(o, l.off_epoch).cast::<u32>(), oo.key_epoch());
+            assert_eq!(*field(o, l.off_jit_flags), 0);
+            assert_eq!(
+                *field(p, l.off_jit_flags),
+                crate::object::JIT_FLAG_NO_INLINE_SET
+            );
+            assert!((*field(o, l.off_extra).cast::<*const u8>()).is_null());
+            let ex = *field(p, l.off_extra).cast::<*const u8>();
+            assert!(!ex.is_null());
+            assert_eq!(
+                *ex.add(usize::try_from(l.extra_acc_len).unwrap())
+                    .cast::<usize>(),
+                1
+            );
+            let brands = |h: Handle| {
+                let word = *field(h, jl.off_shape).cast::<*const u8>();
+                *word.offset(isize::try_from(l.shape_brands).unwrap()) & 1
+            };
+            assert_eq!(brands(o), 0);
+            assert_eq!(brands(w), 1);
+            assert_eq!(*field(f, jl.off_cell_tag), l.vmfn_disc);
+            let (fid, caps) = realm.vm_function(f).unwrap();
+            assert_eq!(*field(f, l.off_vmfn_func).cast::<u32>(), fid);
+            assert_eq!(*field(f, l.off_vmfn_caps_len).cast::<usize>(), caps.len());
+            assert_eq!(
+                *field(f, l.off_vmfn_caps_ptr).cast::<*const NanBox>(),
+                caps.as_ptr()
+            );
+        }
+    }
+}

@@ -406,6 +406,31 @@ pub(crate) struct CellLayout {
     pub array_vec_off: usize,
 }
 
+/// The byte layout of a `Cell::VmFunction`, for compiled code that identifies a
+/// callee without a helper: `(discriminant, func_off, captures_off)`, the
+/// offsets relative to the `Cell` (the captures being a `Vec<NanBox>`, whose
+/// pointer/length words sit where any `Vec`'s do).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn jit_vm_function_layout() -> (u8, usize, usize) {
+    let cell = Cell::VmFunction {
+        func: 7,
+        captures: alloc::vec![NanBox::undefined()],
+    };
+    let base = core::ptr::addr_of!(cell) as usize;
+    // SAFETY: `cell` is a live, initialized `Cell`; its repr(u8) tag byte is in
+    // bounds and always a valid `u8`.
+    #[allow(unsafe_code)]
+    let disc = unsafe { *(base as *const u8) };
+    let Cell::VmFunction { func, captures } = &cell else {
+        unreachable!("just built a Cell::VmFunction")
+    };
+    (
+        disc,
+        core::ptr::addr_of!(*func) as usize - base,
+        core::ptr::addr_of!(*captures) as usize - base,
+    )
+}
+
 /// Derives [`CellLayout`] from real `Cell::Object` and `Cell::Array` instances.
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn jit_cell_layout() -> CellLayout {

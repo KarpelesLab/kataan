@@ -117,6 +117,8 @@ pub struct CallSite {
     pub targets: [CallTarget; CallSite::WAYS],
     /// The way the next new callee replaces.
     pub next: usize,
+    /// A `new` site's constructor cache (unused by other sites).
+    pub construct: super::props::ConstructCache,
 }
 
 impl CallSite {
@@ -135,6 +137,7 @@ impl CallSite {
                 frame_bytes: 0,
             }; Self::WAYS],
             next: 0,
+            construct: super::props::ConstructCache::new(),
         }
     }
 
@@ -183,18 +186,17 @@ pub struct CalleeInfo {
 /// callee) -> CalleeInfo`. Never allocates, never throws.
 pub type CalleeHelper = extern "C" fn(*mut core::ffi::c_void, u64) -> CalleeInfo;
 
-/// The leaf helper a method call finds its callee with: `(ctx, recv, key_ptr,
-/// key_len, cache, out) -> CalleeInfo` — the method `recv.key` through the
-/// site's prototype-chain cache `cache` when it is a VM closure the
+/// The leaf helper a method call finds its callee with when the inline
+/// lookup misses: `(ctx, recv, site, out) -> CalleeInfo` — the method
+/// `recv.key` (the [`MethodSite`](super::props::MethodSite)'s key, through its
+/// property cache's prototype-chain cache) when it is a VM closure the
 /// interpreter's method call would enter directly (its value stored to
 /// `*out`), else the not-a-closure key. Never allocates (beyond refilling the
-/// cache), never throws, never runs user code.
+/// caches), never throws, never runs user code.
 pub type MethodHelper = extern "C" fn(
     *mut core::ffi::c_void,
     u64,
-    *const u8,
-    usize,
-    *mut core::ffi::c_void,
+    *mut super::props::MethodSite,
     *mut u64,
 ) -> CalleeInfo;
 
@@ -237,17 +239,14 @@ pub(crate) enum CalleeSrc {
     },
     /// A register (`Op::CallValue`); identified by the [`CalleeHelper`].
     Reg(u16),
-    /// A method lookup (`Op::CallMethod`) by the [`MethodHelper`], whose value
-    /// lands in the native-frame slot at `[rbp + scratch]`.
+    /// A method lookup (`Op::CallMethod`) — inline through the site's
+    /// [`MethodSite`](super::props::MethodSite), else by the [`MethodHelper`] —
+    /// whose value lands in the native-frame slot at `[rbp + scratch]`.
     Method {
         /// The receiver register.
         recv: u16,
-        /// The key's bytes.
-        key_ptr: *const u8,
-        /// The key's length.
-        key_len: usize,
-        /// The site's property cache.
-        cache: *mut core::ffi::c_void,
+        /// The site's chain cache.
+        site: *mut super::props::MethodSite,
         /// The `rbp`-relative scratch slot.
         scratch: i32,
         /// The lookup helper.
@@ -276,6 +275,8 @@ pub struct CallLayout {
     pub multi_realm: i32,
     /// realm: `vm_callee_stack`'s length word.
     pub callee_len: i32,
+    /// `ctx`: whether the run is hosted (`bool`).
+    pub hosted: i32,
 }
 
 impl X64Assembler {
@@ -515,8 +516,6 @@ pub(crate) struct CallEmit<'a> {
     pub site: *const CallSite,
     /// The VM state layout.
     pub layout: &'a CallLayout,
-    /// The callee identification helper (for [`CalleeSrc::Reg`]).
-    pub callee_helper: u64,
     /// Where a throw goes.
     pub throw_exit: Label,
     /// Where anything the sequence does not handle goes (the site's helper).
@@ -533,39 +532,44 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     let reg = |x: u16| i32::from(x) * 8;
     let argc = e.args.len();
     let hdr = |i: usize| i32::try_from(i * 8).ok();
+    let jl = super::compute_jit_layout();
     // 1. Which function is the callee? (rax = key, rdx = captures)
     // `load_callee(reg)` reloads its value into `reg` afterwards.
     let (callee_base, callee_disp) = match e.callee {
         CalleeSrc::Frame { scratch } => {
-            a.g_mov(r::RDI, r::R15);
-            a.g_load(r::RSI, RBP, scratch);
-            a.g_movabs(r::RAX, e.callee_helper);
-            a.call_rax();
+            a.g_load(r::RAX, RBP, scratch);
+            a.p_callee_info(jl, l.realm);
             (RBP, scratch)
         }
         CalleeSrc::Reg(c) => {
-            a.g_mov(r::RDI, r::R15);
-            a.g_load(r::RSI, r::RBX, reg(c));
-            a.g_movabs(r::RAX, e.callee_helper);
-            a.call_rax();
+            a.g_load(r::RAX, r::RBX, reg(c));
+            a.p_callee_info(jl, l.realm);
             (r::RBX, reg(c))
         }
         CalleeSrc::Method {
             recv,
-            key_ptr,
-            key_len,
-            cache,
+            site,
             scratch,
             helper,
         } => {
+            // The site's chain cache, inline (hosted runs only, as the helper);
+            // a miss asks the helper, which refills it.
+            let lookup = a.new_label();
+            let have = a.new_label();
+            a.g_cmp_byte_imm(r::R15, l.hosted, 0);
+            a.g_jcc(cc::E, lookup);
+            a.p_method_lookup(jl, l.realm, (r::RBX, reg(recv)), site, lookup);
+            a.g_store(RBP, scratch, r::RAX);
+            a.p_callee_info(jl, l.realm);
+            a.jmp(have);
+            a.bind(lookup);
             a.g_mov(r::RDI, r::R15);
             a.g_load(r::RSI, r::RBX, reg(recv));
-            a.g_movabs(r::RDX, key_ptr as u64);
-            a.g_movabs(r::RCX, key_len as u64);
-            a.g_movabs(r::R8, cache as u64);
-            a.g_lea(r::R9, RBP, scratch);
+            a.g_movabs(r::RDX, site as u64);
+            a.g_lea(r::RCX, RBP, scratch);
             a.g_movabs(r::RAX, helper);
             a.call_rax();
+            a.bind(have);
             (RBP, scratch)
         }
         CalleeSrc::Construct {

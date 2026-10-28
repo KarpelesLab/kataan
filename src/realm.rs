@@ -86,6 +86,10 @@ pub struct Realm {
     /// incremental marking cycle is running. The write barrier shades stored
     /// references into it so concurrent mutation stays sound.
     incremental: Option<gc::IncrementalMarker>,
+    /// Whether `incremental` is set (an interleaved marking cycle is running):
+    /// read by compiled code, which then leaves every reference store to the
+    /// write barrier's helper.
+    jit_marking: bool,
     /// Monotonic counter giving each `Symbol` a unique identity.
     next_symbol_id: u64,
     /// Maps a symbol's id back to its heap handle, so a symbol used as a property
@@ -598,6 +602,7 @@ impl Realm {
             root_shape: Shape::root(),
             atoms: AtomTable::new(),
             incremental: None,
+            jit_marking: false,
             next_symbol_id: 1,
             symbols_by_id: alloc::collections::BTreeMap::new(),
             fn_protos: alloc::collections::BTreeMap::new(),
@@ -708,6 +713,7 @@ impl Realm {
     /// `[[Prototype]]` for every ordinary/native callable.
     pub fn set_function_proto_intrinsic(&mut self, handle: Handle) {
         self.function_proto_intrinsic = Some(handle);
+        self.add_jit_flags(handle, crate::object::JIT_FLAG_NO_INLINE_SET);
     }
 
     /// Records the realm's single `%ThrowTypeError%` intrinsic.
@@ -725,6 +731,7 @@ impl Realm {
     /// `[[Prototype]]` for every dense `Cell::Array`.
     pub fn set_array_proto_intrinsic(&mut self, handle: Handle) {
         self.array_proto_intrinsic = Some(handle);
+        self.add_jit_flags(handle, crate::object::JIT_FLAG_NO_INLINE_SET);
         // The first realm installed on this heap fixes the *derived* default for
         // every dense array (see `root_array_proto`); a later
         // `$262.createRealm()` realm's `install_globals` must not move it.
@@ -803,6 +810,9 @@ impl Realm {
         self.array_proto_intrinsic = s.array_proto;
         self.promise_proto_intrinsic = s.promise_proto;
         self.function_proto_intrinsic = s.function_proto;
+        for h in [s.array_proto, s.function_proto].into_iter().flatten() {
+            self.add_jit_flags(h, crate::object::JIT_FLAG_NO_INLINE_SET);
+        }
         self.symbol_proto_intrinsic = s.symbol_proto;
         self.string_proto_intrinsic = s.string_proto;
         self.bigint_proto_intrinsic = s.bigint_proto;
@@ -918,6 +928,113 @@ impl Realm {
     /// [`Realm::is_host_exotic`]).
     pub fn mark_host_exotic(&mut self, handle: Handle) {
         self.host_exotic.insert(handle.to_raw());
+        self.add_jit_flags(
+            handle,
+            crate::object::JIT_FLAG_EXOTIC | crate::object::JIT_FLAG_NO_INLINE_SET,
+        );
+    }
+
+    /// Sets [`Object::jit_flags`](crate::object::Object::jit_flags) bits on the
+    /// object at `handle` (a no-op for any other cell): compiled code then
+    /// leaves its property reads ([`JIT_FLAG_EXOTIC`](crate::object::JIT_FLAG_EXOTIC))
+    /// or writes ([`JIT_FLAG_NO_INLINE_SET`](crate::object::JIT_FLAG_NO_INLINE_SET))
+    /// to the helpers. Never cleared.
+    pub fn add_jit_flags(&mut self, handle: Handle, bits: u8) {
+        if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
+            o.add_jit_flags(bits);
+        }
+    }
+
+    /// The object at `handle`, if it is one (for the compiled tier's caches).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_object(&self, handle: Handle) -> Option<&crate::object::Object> {
+        self.heap.get(handle)?.as_object()
+    }
+
+    /// The auxiliary property object of the non-object cell at `handle`, if it
+    /// has one. A cell keeps its auxiliary object for life, except across a
+    /// [`swap_cell_state`](Self::swap_cell_state) (see [`jit_cell_swaps`](Self::jit_cell_swaps)).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_aux_of(&self, handle: Handle) -> Option<Handle> {
+        self.aux_props.get(&handle.to_raw()).copied()
+    }
+
+    /// How many [`swap_cell_state`](Self::swap_cell_state)s have run: while it is
+    /// unchanged, a handle names the same cell and auxiliary object.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_cell_swaps(&self) -> u32 {
+        self.cell_swaps
+    }
+
+    /// A new ordinary object whose `[[Prototype]]` is `proto` (what
+    /// [`new_object`](Self::new_object) and then
+    /// [`set_object_proto`](Self::set_object_proto) make).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn jit_new_object_with_proto(&mut self, proto: Handle) -> Handle {
+        let mut obj = Object::new(Rc::clone(&self.root_shape));
+        obj.set_proto(Some(proto));
+        let h = self.heap.alloc(Cell::Object(obj));
+        self.write_barrier(h, NanBox::handle(proto.to_raw()));
+        h
+    }
+
+    /// Adds a data property to the object at `handle` by adopting the child
+    /// shape `to` (see [`Object::jit_adopt_child`](crate::object::Object::jit_adopt_child)),
+    /// unless the object has reached the dictionary threshold; `false`, having
+    /// changed nothing, otherwise.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn jit_add_transition(
+        &mut self,
+        handle: Handle,
+        to: Rc<crate::shape::Shape>,
+        value: NanBox,
+    ) -> bool {
+        let threshold = self.limits.object_dictionary_threshold;
+        let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) else {
+            return false;
+        };
+        if o.shaped_shape()
+            .is_none_or(|s| s.len() as usize >= threshold)
+            || !o.jit_adopt_child(to, value)
+        {
+            return false;
+        }
+        self.write_barrier(handle, value);
+        true
+    }
+
+    /// The object at `handle` when compiled code may cache a property lookup
+    /// through it: an ordinary shaped object, neither host-exotic nor a
+    /// primitive wrapper (the objects the prototype-chain cache accepts).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_chain_object(&self, handle: Handle) -> Option<&crate::object::Object> {
+        let o = self.heap.get(handle)?.as_object()?;
+        let shape = o.shaped_shape()?;
+        (!shape.is_wrapper() && !self.is_host_exotic(handle)).then_some(o)
+    }
+
+    /// The byte offset, within a `Realm`, of the "incremental marking is
+    /// running" flag compiled code tests before a store that skips the write
+    /// barrier's helper.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_marking_offset() -> usize {
+        core::mem::offset_of!(Realm, jit_marking)
+    }
+
+    /// The byte offsets, within a `Realm`, of the object heap's slot-array
+    /// data-pointer and length words (see [`jit_arena_slots`](Self::jit_arena_slots)),
+    /// for compiled code that reads them directly: `(ptr_off, len_off)`.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_heap_offsets() -> (usize, usize) {
+        let (p, l) = crate::heap::jit_heap_slots_offsets();
+        let heap = core::mem::offset_of!(Realm, heap);
+        (heap + p, heap + l)
     }
 
     /// Whether every property access on `handle` must go to the host (a module
@@ -5843,6 +5960,7 @@ impl Realm {
     /// [`incremental_finish`](Realm::incremental_finish).
     pub fn incremental_start(&mut self, roots: &[Handle]) {
         self.incremental = Some(gc::IncrementalMarker::new(roots));
+        self.jit_marking = true;
     }
 
     /// Advances the active interleaved marker by up to `step_budget` objects.
@@ -5865,6 +5983,7 @@ impl Realm {
         let Some(marker) = self.incremental.take() else {
             return Stats::default();
         };
+        self.jit_marking = false;
         let before = self.heap.len();
         let swept = marker.sweep(&mut self.heap);
         Stats {

@@ -24,10 +24,14 @@ use alloc::vec::Vec;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod call_seq;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod props;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use call_seq::{
     CallLayout, CallSite, CallTarget, CalleeHelper, CalleeInfo, ConstructHelper,
     ConstructResultHelper, FRAME_HEADER, JitStack, MethodHelper,
 };
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub use props::MethodSite;
 
 /// `2^53` — the largest magnitude an `f64` represents every integer below
 /// exactly. The integer JIT keeps a value only while it stays within ±this; a
@@ -2549,6 +2553,10 @@ struct GenericSites {
     /// their addresses; the site helper refills them).
     #[allow(dead_code)]
     calls: alloc::boxed::Box<[core::cell::UnsafeCell<CallSite>]>,
+    /// The method-call chain caches, one per site (the emitted code holds
+    /// their addresses; the method helper refills them).
+    #[allow(dead_code)]
+    methods: Vec<Option<alloc::boxed::Box<core::cell::UnsafeCell<props::MethodSite>>>>,
 }
 
 /// The generic-tier runtime-helper table: the `extern "C"` slow paths the emitted
@@ -2564,6 +2572,9 @@ pub struct GenericHelpers {
     pub set: JitSetPropHelper,
     /// The strict-mode property-set helper (`jit_helper_set_prop_strict`).
     pub set_strict: JitSetPropHelper,
+    /// The property-set helper through the site's add cache
+    /// (`jit_helper_set_prop_site`), both modes.
+    pub set_site: JitSetSiteHelper,
     /// The literal-property definition helper (`jit_helper_init_prop`).
     pub init_prop: JitSetPropHelper,
     /// The computed element-get helper (`jit_helper_get_elem`) — `obj[key]`.
@@ -2761,6 +2772,8 @@ pub(crate) struct JitLayout {
     /// Slot-relative offset of the object's `readonly` Vec length (inline SET
     /// writability gate: a non-zero length routes the store to the helper).
     pub off_readonly_len: i32,
+    /// The inline property paths' extra offsets (`props.rs`).
+    pub props: props::PropsLayout,
 }
 
 /// Assembles the [`JitLayout`] from the four per-type probes, combining the
@@ -2807,6 +2820,7 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
             // `frozen`/`readonly` are `Object` fields, relative to the Object base.
             off_frozen: to_i32(obj_base + obj.frozen_off),
             off_readonly_len: to_i32(obj_base + obj.readonly_len_off),
+            props: props::PropsLayout::new(&slot, cell_base, obj_base, &obj),
         }
     })
 }
@@ -2817,6 +2831,12 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
 /// `Op::ValueBin` (`jit_helper_value_bin`) slow paths.
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub type JitBinHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64, u64) -> u64;
+
+/// The runtime-helper ABI for a static-key property write through its site:
+/// `(ctx, obj, site, val, strict) -> undefined bits` (or the throw sentinel).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub type JitSetSiteHelper =
+    extern "C" fn(*mut core::ffi::c_void, u64, *mut MethodSite, u64, u64) -> u64;
 
 /// The runtime-helper ABI for a computed element write: `(ctx, recv, key, val,
 /// strict) -> undefined bits` (or the throw sentinel).
@@ -2854,6 +2874,8 @@ pub struct SiteInfo {
     key_ptr: *const u8,
     key_len: usize,
     cache_ptr: *mut core::ffi::c_void,
+    /// The site's method-call chain cache (see [`props::MethodSite`]).
+    method_ptr: *mut props::MethodSite,
 }
 
 /// The calling-convention / signature a compiled [`JitProto`] exposes to a
@@ -3047,15 +3069,39 @@ impl JitProto {
             ..keys.len())
             .map(|_| core::cell::UnsafeCell::new(crate::ic::PropertyCache::new()))
             .collect();
+        // A chain cache for each method-call and property-write site.
+        let mut wants = alloc::vec![false; keys.len()];
+        for op in &ops {
+            if let GenericOp::CallMethod { site, .. } | GenericOp::SetProp { site, .. } = *op
+                && let Some(w) = wants.get_mut(site as usize)
+            {
+                *w = true;
+            }
+        }
+        let methods: Vec<Option<alloc::boxed::Box<core::cell::UnsafeCell<props::MethodSite>>>> =
+            keys.iter()
+                .zip(caches.iter())
+                .zip(wants)
+                .map(|((k, c), want)| {
+                    want.then(|| {
+                        alloc::boxed::Box::new(core::cell::UnsafeCell::new(props::MethodSite::new(
+                            k,
+                            c.get().cast::<core::ffi::c_void>(),
+                        )))
+                    })
+                })
+                .collect();
         // Resolve each site's raw key + cache pointers (stable: `keys`/`caches` heap
         // allocations do not move when the owners are moved into the `JitProto`).
         let site_info: Vec<SiteInfo> = keys
             .iter()
             .zip(caches.iter())
-            .map(|(k, c)| SiteInfo {
+            .zip(methods.iter())
+            .map(|((k, c), m)| SiteInfo {
                 key_ptr: k.as_ptr(),
                 key_len: k.len(),
                 cache_ptr: c.get().cast::<core::ffi::c_void>(),
+                method_ptr: m.as_ref().map_or(core::ptr::null_mut(), |m| m.get()),
             })
             .collect();
         // Loop headers: the targets of backward branches.
@@ -3104,6 +3150,7 @@ impl JitProto {
                 keys,
                 caches,
                 calls,
+                methods,
             }),
             n_regs: proto.n_regs,
             osr_entries,
@@ -4045,8 +4092,8 @@ impl X64Assembler {
         disp: i32,
         truthy_helper: u64,
         qnan: u64,
-        tag_true: u64,
-        tag_false: u64,
+        (tag_true, tag_false): (u64, u64),
+        realm_off: i32,
     ) {
         let numl = self.new_label();
         let set1 = self.new_label();
@@ -4066,6 +4113,8 @@ impl X64Assembler {
         self.movabs_r11(tag_false as i64);
         self.cmp_rax_r11();
         self.je(set0);
+        // `null`/`undefined`, an ordinary object or a VM function, inline.
+        self.p_truthy_heap(realm_off, set1, set0);
         // otherwise: jit_helper_truthy(ctx, v) → 0/1 (runs ToBoolean; never throws).
         self.mov_rdi_r15();
         self.load_argreg(1, disp);
@@ -4882,8 +4931,7 @@ impl JitFunction {
         }
         let add_helper = helpers.add as usize as u64;
         let get_helper = helpers.get as usize as u64;
-        let set_helper = helpers.set as usize as u64;
-        let set_strict_helper = helpers.set_strict as usize as u64;
+        let set_site_helper = helpers.set_site as usize as u64;
         let init_prop_helper = helpers.init_prop as usize as u64;
         let get_elem_helper = helpers.get_elem as usize as u64;
         let set_elem_helper = helpers.set_elem as usize as u64;
@@ -4902,7 +4950,6 @@ impl JitFunction {
         let unwind_helper = helpers.unwind as usize as u64;
         let call_method_helper = helpers.call_method as usize as u64;
         let call_value_helper = helpers.call_value as usize as u64;
-        let callee_helper = helpers.callee_info as usize as u64;
         let method_helper = helpers.method_info as usize as u64;
         let construct_helper = helpers.construct_info as usize as u64;
         let construct_result_helper = helpers.construct_result as usize as u64;
@@ -5199,9 +5246,7 @@ impl JitFunction {
                                 dst,
                                 callee: call_seq::CalleeSrc::Method {
                                     recv,
-                                    key_ptr: si.key_ptr,
-                                    key_len: si.key_len,
-                                    cache: si.cache_ptr,
+                                    site: si.method_ptr,
                                     scratch: method_scratch,
                                     helper: method_helper,
                                 },
@@ -5209,7 +5254,6 @@ impl JitFunction {
                                 args: argv,
                                 site: site_ptr,
                                 layout: &helpers.call_layout,
-                                callee_helper,
                                 throw_exit,
                                 slow,
                                 done,
@@ -5427,13 +5471,20 @@ impl JitFunction {
                     // shape-Rc word to the site's cached shape, and load the cached
                     // slot. Any guard miss falls to the (correct) helper, which
                     // arms/updates the IC and handles accessors, prototype walks,
-                    // misses and throws. No allocation and no call after
-                    // `jit_arena`, so it is GC- and realloc-safe.
-                    call_arena!(obj, ARENA_GET);
+                    // misses and throws. No allocation and no call: the arena
+                    // base is read from the realm, so it is GC- and realloc-safe.
+                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
                     walk_to_slot!(obj, helper);
                     a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_object_disc);
                     a.jne(helper);
                     a.cmp_byte_at_rcx_imm(layout.off_od_tag, layout.obj_shaped_disc);
+                    a.jne(helper);
+                    // A host-exotic object's reads are the host's.
+                    a.p_test_byte_imm(
+                        call_seq::r::RCX,
+                        layout.props.off_jit_flags,
+                        props::FLAG_EXOTIC,
+                    );
                     a.jne(helper);
                     a.mov_rax_at_rcx(layout.off_shape);
                     a.movabs_r11(s.cache_ptr as i64); // r11 = &PropertyCache
@@ -5475,16 +5526,11 @@ impl JitFunction {
                     let done = a.new_label();
                     // ===== inline monomorphic property-SET fast path =====
                     // On a shape-identity hit, an in-place `slots[slot] = val`, but
-                    // ONLY when provably sound: `val` is not a heap handle (no
-                    // generational write barrier needed) and the object is not
+                    // ONLY when provably sound: the store needs nothing from the
+                    // write barrier (see `p_barrier_check`) and the object is not
                     // frozen with an empty `readonly` list (`Object::cached_set`'s
                     // success precondition). Everything else → the helper.
-                    a.load_rax(disp(val));
-                    a.movabs_r11(HANDLE_TAG as i64);
-                    a.and_rax_r11();
-                    a.cmp_rax_r11();
-                    a.je(helper); // val is a handle → helper (write barrier)
-                    call_arena!(obj, ARENA_SET);
+                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
                     walk_to_slot!(obj, helper);
                     a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_object_disc);
                     a.jne(helper);
@@ -5494,10 +5540,20 @@ impl JitFunction {
                     a.jne(helper);
                     a.cmp_qword_at_rcx_imm(layout.off_readonly_len, 0);
                     a.jne(helper);
+                    // A host-exotic, global or tracked-prototype object's writes
+                    // need the helper.
+                    a.cmp_byte_at_rcx_imm(layout.props.off_jit_flags, 0);
+                    a.jne(helper);
                     a.mov_rax_at_rcx(layout.off_shape);
                     a.movabs_r11(s.cache_ptr as i64);
                     a.cmp_rax_at_r11(layout.cache_shape_off);
                     a.jne(helper);
+                    // A primitive wrapper (its shape's brand bit 0) — the helper.
+                    a.p_test_byte_imm(call_seq::r::RAX, layout.props.shape_brands, 1);
+                    a.jne(helper);
+                    a.load_rax(disp(val));
+                    a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
+                    a.movabs_r11(s.cache_ptr as i64);
                     a.mov_eax_at_r11(layout.cache_slot_off);
                     a.cmp_rax_at_rcx(layout.off_slots_len);
                     a.jae(helper);
@@ -5507,19 +5563,14 @@ impl JitFunction {
                     a.movabs_r11(s.cache_ptr as i64);
                     a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
                     a.jmp(done);
-                    // jit_helper_set_prop(ctx, obj, key_ptr, key_len, cache, val).
+                    // jit_helper_set_prop_site(ctx, obj, site, val, strict).
                     a.bind(helper);
                     a.mov_rdi_r15();
                     a.load_argreg(1, disp(obj));
-                    a.movabs_argreg(2, s.key_ptr as i64);
-                    a.movabs_argreg(3, s.key_len as i64);
-                    a.movabs_argreg(4, s.cache_ptr as i64);
-                    a.load_argreg(5, disp(val));
-                    a.movabs_rax(if strict {
-                        set_strict_helper
-                    } else {
-                        set_helper
-                    } as i64);
+                    a.movabs_argreg(2, s.method_ptr as i64);
+                    a.load_argreg(3, disp(val));
+                    a.movabs_argreg(4, i64::from(strict));
+                    a.movabs_rax(set_site_helper as i64);
                     a.call_rax();
                     throw_check!();
                     a.bind(done);
@@ -5573,19 +5624,17 @@ impl JitFunction {
                     let helper = a.new_label();
                     let done = a.new_label();
                     // ===== inline dense-array element SET fast path =====
-                    // In place only when identical to `vm_set_elem`: `val` not a
-                    // handle (no write barrier), `jit_arena` in `ARENA_ELEM_SET` mode (plain,
+                    // In place only when identical to `vm_set_elem`: a store the
+                    // write barrier has nothing to do for (`p_barrier_check`),
+                    // `jit_arena` in `ARENA_ELEM_SET` mode (plain,
                     // not frozen/sealed, no per-index override, within
                     // `max_array_len`), and an in-bounds exact integer index.
-                    a.load_rax(disp(val));
-                    a.movabs_r11(HANDLE_TAG as i64);
-                    a.and_rax_r11();
-                    a.cmp_rax_r11();
-                    a.je(helper);
                     call_arena!(obj, ARENA_ELEM_SET);
                     walk_to_slot!(obj, helper);
                     a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
                     a.jne(helper);
+                    a.load_rax(disp(val));
+                    a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
                     int_index!(index, helper);
                     a.mov_r8_at_rcx(layout.off_arr_len);
                     a.cmp_rax_r8();
@@ -5794,7 +5843,13 @@ impl JitFunction {
                     if !ok(dst) || !ok(ra) {
                         return None;
                     }
-                    a.emit_truthy(disp(ra), truthy_helper, QNAN, tag_true, tag_false);
+                    a.emit_truthy(
+                        disp(ra),
+                        truthy_helper,
+                        QNAN,
+                        (tag_true, tag_false),
+                        helpers.call_layout.realm,
+                    );
                     a.xor_rax_imm(1);
                     a.movabs_r11(tag_false as i64);
                     a.add_rax_r11();
@@ -5813,7 +5868,13 @@ impl JitFunction {
                     if !ok(cond) || target > ops.len() {
                         return None;
                     }
-                    a.emit_truthy(disp(cond), truthy_helper, QNAN, tag_true, tag_false);
+                    a.emit_truthy(
+                        disp(cond),
+                        truthy_helper,
+                        QNAN,
+                        (tag_true, tag_false),
+                        helpers.call_layout.realm,
+                    );
                     a.test_rax_rax();
                     if target <= op_idx {
                         let stay = a.new_label();
@@ -5891,7 +5952,6 @@ impl JitFunction {
                             args,
                             site: site_ptr,
                             layout: &helpers.call_layout,
-                            callee_helper,
                             throw_exit,
                             slow,
                             done,
@@ -5941,7 +6001,6 @@ impl JitFunction {
                             args,
                             site: site_ptr,
                             layout: &helpers.call_layout,
-                            callee_helper,
                             throw_exit,
                             slow,
                             done,
@@ -5986,7 +6045,6 @@ impl JitFunction {
                             args,
                             site: site_ptr,
                             layout: &helpers.call_layout,
-                            callee_helper,
                             throw_exit,
                             slow,
                             done,

@@ -198,6 +198,14 @@ impl Shape {
         self.parent.as_ref()
     }
 
+    /// The byte offset of the brand bits within a `Shape` (read by compiled
+    /// code: bit 0 is [`is_wrapper`](Self::is_wrapper)).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn brands_offset() -> usize {
+        core::mem::offset_of!(Shape, brands)
+    }
+
     /// Whether the layout holds the primitive-wrapper key [`PRIM_WRAP_KEY`].
     #[inline]
     #[must_use]

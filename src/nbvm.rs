@@ -1455,7 +1455,7 @@ fn hosted_ctx_in<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_funcs: None,
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        jit_rt: jit_tier::TierRuntime::default(),
+        jit_rt: jit_tier::TierRuntime::hosted(),
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_shadow: alloc::vec::Vec::new(),
         call_depth: 0,
@@ -5732,6 +5732,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         get: jit_helper_get_prop,
         set: jit_helper_set_prop,
         set_strict: jit_helper_set_prop_strict,
+        set_site: jit_tier::jit_helper_set_prop_site,
         init_prop: jit_helper_init_prop,
         get_elem: jit_helper_get_elem,
         set_elem: jit_helper_set_elem,

@@ -89,6 +89,20 @@ struct DictSlot {
     pos: usize,
 }
 
+/// [`Object`]'s `proto` word for "no prototype" (no handle packs to it: a
+/// raw handle uses only the low 48 bits).
+pub(crate) const NO_PROTO: u64 = u64::MAX;
+
+/// [`Object::jit_flags`] bit: a host-exotic object (see
+/// `Realm::mark_host_exotic`) — compiled code reads none of its properties
+/// inline.
+pub const JIT_FLAG_EXOTIC: u8 = 1;
+/// [`Object::jit_flags`] bit: an object whose property writes need more than
+/// the ordinary store (a global object, whose writes reach the global
+/// bindings; a built-in prototype whose method overwrites are tracked) —
+/// compiled code writes none of its properties inline.
+pub const JIT_FLAG_NO_INLINE_SET: u8 = 2;
+
 /// A property-bearing object: a hidden-class shape plus its value slots (or a
 /// dictionary once it grows past the threshold), with an optional side list of
 /// accessor (getter/setter) properties.
@@ -111,9 +125,16 @@ pub struct Object {
     /// Whether the object is sealed (`Object.seal`): no new properties and no
     /// deletions, but existing writable properties may still change.
     sealed: bool,
-    /// The `[[Prototype]]` link (`Object.create`/`getPrototypeOf`), if any. A
-    /// property miss walks this chain.
-    proto: Option<crate::heap::Handle>,
+    /// Flags the generic JIT's inline property paths test before touching the
+    /// object ([`JIT_FLAG_EXOTIC`], [`JIT_FLAG_NO_INLINE_SET`]); `0` for an
+    /// ordinary object. Only ever set (never cleared), so a stale `1` merely
+    /// sends an access to the (always correct) helper.
+    jit_flags: u8,
+    /// The `[[Prototype]]` link (`Object.create`/`getPrototypeOf`) as a raw
+    /// handle ([`Handle::to_raw`](crate::heap::Handle::to_raw)), or
+    /// [`NO_PROTO`] for none. A property miss walks this chain. Stored raw (one
+    /// word) so compiled code can compare it with a cached handle.
+    proto: u64,
     /// The rarely-used parts of an object (accessors, attribute marks, the
     /// unified key order, the class tag), boxed so an ordinary data object —
     /// the overwhelmingly common case — stays small. `None` means all empty.
@@ -176,7 +197,8 @@ impl Object {
             frozen: false,
             extensible: true,
             sealed: false,
-            proto: None,
+            jit_flags: 0,
+            proto: NO_PROTO,
             extra: None,
             key_epoch: 0,
         }
@@ -281,12 +303,56 @@ impl Object {
     /// The `[[Prototype]]` handle, if any.
     #[must_use]
     pub fn proto(&self) -> Option<crate::heap::Handle> {
-        self.proto
+        (self.proto != NO_PROTO).then(|| crate::heap::Handle::from_raw(self.proto))
     }
 
     /// Sets the `[[Prototype]]` link (`None` clears it to a null prototype).
     pub fn set_proto(&mut self, proto: Option<crate::heap::Handle>) {
-        self.proto = proto;
+        self.proto = proto.map_or(NO_PROTO, crate::heap::Handle::to_raw);
+    }
+
+    /// The generic-JIT flags ([`JIT_FLAG_EXOTIC`], [`JIT_FLAG_NO_INLINE_SET`]).
+    #[must_use]
+    pub fn jit_flags(&self) -> u8 {
+        self.jit_flags
+    }
+
+    /// Whether a new data property may be added to this object by adopting a
+    /// cached child shape (the generic JIT's add cache): extensible, neither
+    /// frozen nor sealed, without accessors and not tracking a unified key
+    /// order (so the add is the shape transition alone).
+    #[must_use]
+    pub fn jit_add_ok(&self) -> bool {
+        self.extensible
+            && !self.frozen
+            && !self.sealed
+            && self
+                .extra
+                .as_deref()
+                .is_none_or(|x| x.accessors.is_empty() && x.key_order.is_none())
+    }
+
+    /// Adds a data property by adopting `to`, a child of the object's current
+    /// shape (its new key in the next slot), holding `value` — the add half of
+    /// [`init_data_cached`](Self::init_data_cached). `false`, having changed
+    /// nothing, when the object is not shaped or `to` is not such a child.
+    pub fn jit_adopt_child(&mut self, to: Rc<Shape>, value: NanBox) -> bool {
+        let ObjectData::Shaped { shape, slots } = &mut self.data else {
+            return false;
+        };
+        if !to.parent().is_some_and(|p| Rc::ptr_eq(p, shape)) || slots.len() != shape.len() as usize
+        {
+            return false;
+        }
+        *shape = to;
+        slots.push(value);
+        self.key_epoch = self.key_epoch.wrapping_add(1);
+        true
+    }
+
+    /// Sets generic-JIT flag bits (they are never cleared).
+    pub fn add_jit_flags(&mut self, bits: u8) {
+        self.jit_flags |= bits;
     }
 
     /// Tags this object with the class it was constructed from.
@@ -1110,8 +1176,8 @@ impl Object {
             fwd(g);
             fwd(s);
         }
-        if let Some(p) = self.proto {
-            self.proto = Some(forward(p));
+        if let Some(p) = self.proto() {
+            self.set_proto(Some(forward(p)));
         }
     }
 
@@ -1143,7 +1209,7 @@ impl Object {
                 }
             }
         }
-        if let Some(p) = self.proto {
+        if let Some(p) = self.proto() {
             visit(p);
         }
     }
@@ -1186,6 +1252,19 @@ pub(crate) struct ObjectLayout {
     /// (relative to the `Object` base) — the inline property-SET fast path bails to
     /// the helper whenever this is non-zero (some own property may be non-writable).
     pub readonly_len_off: usize,
+    /// Byte offset of `jit_flags: u8` within `Object`.
+    pub jit_flags_off: usize,
+    /// Byte offset of the raw `proto` word within `Object`.
+    pub proto_off: usize,
+    /// Byte offset of `key_epoch: u32` within `Object`.
+    pub epoch_off: usize,
+    /// Byte offset of the `extra` box pointer within `Object` (null for none).
+    pub extra_off: usize,
+    /// Byte offset of the accessor list's length word within `ObjectExtra`.
+    pub extra_acc_len_off: usize,
+    /// Offset from the shape word (the `Rc`'s stored pointer) to the shape's
+    /// `brands` byte (bit 0: a primitive wrapper).
+    pub shape_brands_off: isize,
 }
 
 /// Derives [`ObjectLayout`] from a real shaped object with several own data
@@ -1246,6 +1325,21 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
     // and this is cross-checked against a safe read by the JIT layout test.
     let readonly_len_off = (core::ptr::addr_of!(obj.readonly) as usize - obj_base) + vec_len_off;
 
+    // The shape's brand byte, relative to the stored `Rc` word.
+    // SAFETY: reading the 8-byte `Rc<Shape>` word of a live object, in bounds.
+    #[allow(unsafe_code)]
+    let shape_word = unsafe { *((od_base + shape_off) as *const usize) };
+    let brands_addr = Rc::as_ptr(shape) as usize + crate::shape::Shape::brands_offset();
+    let shape_brands_off = brands_addr.wrapping_sub(shape_word).cast_signed();
+    // `extra`: an `Option<Box<_>>` is one nullable pointer word.
+    obj.extra_mut();
+    let extra_off = core::ptr::addr_of!(obj.extra) as usize - obj_base;
+    // SAFETY: reading the pointer word of the live `Option<Box<ObjectExtra>>`.
+    #[allow(unsafe_code)]
+    let extra_word = unsafe { *((obj_base + extra_off) as *const usize) };
+    let extra_ref = obj.extra.as_deref().expect("just allocated");
+    assert_eq!(extra_word, core::ptr::addr_of!(*extra_ref) as usize);
+    let extra_acc_len_off = core::mem::offset_of!(ObjectExtra, accessors) + vec_len_off;
     ObjectLayout {
         data_off,
         shaped_disc,
@@ -1255,6 +1349,12 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
         vec_len_off,
         frozen_off,
         readonly_len_off,
+        jit_flags_off: core::mem::offset_of!(Object, jit_flags),
+        proto_off: core::mem::offset_of!(Object, proto),
+        epoch_off: core::mem::offset_of!(Object, key_epoch),
+        extra_off,
+        extra_acc_len_off,
+        shape_brands_off,
     }
 }
 

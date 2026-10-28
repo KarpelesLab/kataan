@@ -86,6 +86,19 @@ pub(super) struct TierRuntime {
     /// This thread's register stack (see [`JitStack`]), set before any
     /// compiled body runs. The emitted call sequence reads it at a fixed offset.
     pub(super) stack: StackPtr,
+    /// Whether the context has a host (`Ctx::host` is `Some`; it never
+    /// changes). Compiled method calls read it inline.
+    pub(super) hosted: bool,
+}
+
+impl TierRuntime {
+    /// The state of a hosted context.
+    pub(super) fn hosted() -> Self {
+        Self {
+            hosted: true,
+            ..Self::default()
+        }
+    }
 }
 
 /// A pointer to the running thread's [`JitStack`] (null until first use).
@@ -1214,9 +1227,10 @@ pub(crate) extern "C" fn jit_construct_info(
         key: u64::MAX,
         caps: core::ptr::null(),
     };
-    // SAFETY: see the function contract.
+    // SAFETY: see the function contract (the site is the calling `JitProto`'s,
+    // interior-mutable: only this helper touches its construct cache).
     #[allow(unsafe_code)]
-    let (ctx, site) = unsafe { (&mut *(ctx_raw as *mut Ctx), &*site) };
+    let (ctx, site) = unsafe { (&mut *(ctx_raw as *mut Ctx), &mut *site.cast_mut()) };
     let Some(fh) = NanBox::from_bits(ctor).as_handle().map(Handle::from_raw) else {
         return NONE;
     };
@@ -1225,6 +1239,16 @@ pub(crate) extern "C" fn jit_construct_info(
     };
     if !site.holds(u64::from(fid) | ((n_caps as u64) << 32)) {
         return NONE;
+    }
+    // The site's last constructor, still as it was: no lookups.
+    if let Some(p) = site.construct.hit(&ctx.realm, ctor) {
+        let obj = ctx.realm.jit_new_object_with_proto(p);
+        // SAFETY: see the function contract.
+        #[allow(unsafe_code)]
+        unsafe {
+            *out = NanBox::handle(obj.to_raw()).to_bits();
+        }
+        return jit_callee_info(ctx_raw, ctor);
     }
     // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
     #[allow(unsafe_code)]
@@ -1250,8 +1274,8 @@ pub(crate) extern "C" fn jit_construct_info(
     else {
         return NONE;
     };
-    let obj = ctx.realm.new_object();
-    ctx.realm.set_object_proto(obj, Some(Handle::from_raw(p)));
+    site.construct.fill(&ctx.realm, ctor, NanBox::handle(p));
+    let obj = ctx.realm.jit_new_object_with_proto(Handle::from_raw(p));
     // SAFETY: see the function contract.
     #[allow(unsafe_code)]
     unsafe {
@@ -1282,21 +1306,21 @@ pub(crate) extern "C" fn jit_construct_result(
 }
 
 /// A method call's callee lookup for the native call sequence
-/// (`crate::jit::MethodHelper`): exactly the case `jit_helper_call_method`
-/// enters directly — a hosted call, not the legacy `caller`, whose method
-/// (through the site's chain cache `cache`) is a VM closure — reported as
-/// [`jit_callee_info`] does, with the closure stored to `out`. Pure: it only
-/// reads (and refills the cache), so the slow path may repeat it.
+/// (`crate::jit::MethodHelper`), when the site's inline chain cache missed:
+/// exactly the case `jit_helper_call_method` enters directly — a hosted call,
+/// not the legacy `caller`, whose method (through the site's property cache's
+/// chain cache) is a VM closure — reported as [`jit_callee_info`] does, with
+/// the closure stored to `out`; and the site's inline cache refilled from the
+/// receiver. Pure: it only reads (and refills the caches), so the slow path
+/// may repeat it.
 ///
 /// # Safety
-/// `ctx` the live `Ctx`; `key_ptr`/`key_len` the site's UTF-8 key and `cache`
-/// its `PropertyCache`, owned by the calling `JitProto`; `out` writable.
+/// `ctx` the live `Ctx`; `site` the calling `JitProto`'s method site; `out`
+/// writable.
 pub(crate) extern "C" fn jit_method_info(
     ctx: *mut core::ffi::c_void,
     recv: u64,
-    key_ptr: *const u8,
-    key_len: usize,
-    cache: *mut core::ffi::c_void,
+    site: *mut crate::jit::MethodSite,
     out: *mut u64,
 ) -> CalleeInfo {
     const NONE: CalleeInfo = CalleeInfo {
@@ -1305,18 +1329,20 @@ pub(crate) extern "C" fn jit_method_info(
     };
     // SAFETY: see the function contract.
     #[allow(unsafe_code)]
-    let (ctx_ref, key, cache) = unsafe {
-        (
-            &*(ctx as *const Ctx),
-            core::str::from_utf8_unchecked(core::slice::from_raw_parts(key_ptr, key_len)),
-            &mut *cache.cast::<crate::ic::PropertyCache>(),
-        )
-    };
+    let (ctx_ref, site) = unsafe { (&*(ctx as *const Ctx), &mut *site) };
+    // SAFETY: the site's property cache, owned by the same `JitProto`.
+    #[allow(unsafe_code)]
+    let cache = unsafe { &mut *site.cache.cast::<crate::ic::PropertyCache>() };
+    let key = site.key();
+    debug_assert_eq!(ctx_ref.host.is_some(), ctx_ref.jit_rt.hosted);
     if ctx_ref.host.is_none() || key == "caller" {
         return NONE;
     }
     match super::vm_method_of_cached(ctx_ref, NanBox::from_bits(recv), key, cache) {
         Some(f) => {
+            if let Some(h) = NanBox::from_bits(recv).as_handle() {
+                site.fill(&ctx_ref.realm, Handle::from_raw(h));
+            }
             // SAFETY: see the function contract.
             #[allow(unsafe_code)]
             unsafe {
@@ -1346,6 +1372,7 @@ pub(super) fn call_layout() -> crate::jit::CallLayout {
             + offset_of!(crate::limits::Limits, max_call_depth)),
         multi_realm: i(offset_of!(crate::realm::Realm, multi_realm)),
         callee_len: i(offset_of!(crate::realm::Realm, vm_callee_stack) + len_off),
+        hosted: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, hosted)),
     }
 }
 
@@ -1558,4 +1585,53 @@ pub(super) fn call_generic(
         Ok(_) => Some(Err(VmError::Unsupported)),
         Err(e) => Some(Err(e)),
     }
+}
+
+/// `Op::SetProp`'s slow path in compiled code (`crate::jit::JitSetSiteHelper`):
+/// a write the site's add cache recorded is made directly (see
+/// `crate::jit::MethodSite::try_add`); anything else is the interpreter's
+/// write ([`jit_set_prop_impl`](super::jit_set_prop_impl)), after which an add
+/// it made is recorded.
+///
+/// # Safety
+/// `ctx` the live `Ctx`; `site` the calling `JitProto`'s site for this write.
+pub(crate) extern "C" fn jit_helper_set_prop_site(
+    ctx_raw: *mut core::ffi::c_void,
+    obj: u64,
+    site: *mut crate::jit::MethodSite,
+    val: u64,
+    strict: u64,
+) -> u64 {
+    // SAFETY: see the function contract; the site is the calling `JitProto`'s
+    // (interior-mutable, touched only by this helper while it runs).
+    #[allow(unsafe_code)]
+    let (ctx, site) = unsafe { (&mut *(ctx_raw as *mut Ctx), &mut *site) };
+    if site.try_add(&mut ctx.realm, obj, NanBox::from_bits(val)) {
+        return NanBox::undefined().to_bits();
+    }
+    let recv = NanBox::from_bits(obj).as_handle().map(Handle::from_raw);
+    let before = recv.and_then(|h| {
+        ctx.realm
+            .jit_object(h)
+            .and_then(|o| o.shaped_shape().cloned())
+    });
+    let key = site.key();
+    let r = super::jit_set_prop_impl(
+        ctx_raw,
+        obj,
+        key.as_ptr(),
+        key.len(),
+        site.cache,
+        val,
+        strict != 0,
+    );
+    if let (Some(h), Some(before)) = (recv, before)
+        && r != NanBox::jit_throw_bits()
+    {
+        // SAFETY: as above; the write's own borrow of the context has ended.
+        #[allow(unsafe_code)]
+        let ctx = unsafe { &*(ctx_raw as *const Ctx) };
+        site.fill_add(&ctx.realm, h, &before);
+    }
+    r
 }

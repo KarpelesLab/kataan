@@ -103,6 +103,8 @@ pub(crate) struct SlotLayout {
     pub generation_off: usize,
     /// Byte offset of the payload value (`T`) within the slot.
     pub value_off: usize,
+    /// Byte offset of the `age: u8` field (collections survived) within the slot.
+    pub age_off: usize,
 }
 
 /// Derives [`SlotLayout`] for `Slot<T>` from a real `Occupied` instance. `value`
@@ -120,12 +122,15 @@ pub(crate) fn jit_slot_layout<T>(value: T) -> SlotLayout {
     // bounds and the byte is always a valid `u8`.
     #[allow(unsafe_code)]
     let occupied_disc = unsafe { *(base as *const u8) };
-    let (generation_off, value_off) = match &slot {
+    let (generation_off, value_off, age_off) = match &slot {
         Slot::Occupied {
-            generation, value, ..
+            generation,
+            value,
+            age,
         } => (
             core::ptr::addr_of!(*generation) as usize - base,
             core::ptr::addr_of!(*value) as usize - base,
+            core::ptr::addr_of!(*age) as usize - base,
         ),
         Slot::Free { .. } => unreachable!("just built an Occupied slot"),
     };
@@ -134,7 +139,46 @@ pub(crate) fn jit_slot_layout<T>(value: T) -> SlotLayout {
         occupied_disc,
         generation_off,
         value_off,
+        age_off,
     }
+}
+
+/// The byte offsets, within the object heap (`Heap<Cell>`), of its slot
+/// array's data-pointer and length words: what compiled code reads instead of
+/// calling [`Heap::slots_raw`]. The field offset is `offset_of!`; the `Vec`'s
+/// word order (unspecified) is probed on a live `Vec<Slot<Cell>>` whose
+/// length, capacity and pointer all differ. `(ptr_off, len_off)`.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[must_use]
+pub(crate) fn jit_heap_slots_offsets() -> (usize, usize) {
+    use crate::cell::Cell;
+    let mut v: Vec<Slot<Cell>> = Vec::with_capacity(8);
+    for _ in 0..3 {
+        v.push(Slot::Occupied {
+            generation: 0,
+            age: 0,
+            value: Cell::Object(crate::object::Object::new(crate::shape::Shape::root())),
+        });
+    }
+    let vec = core::ptr::addr_of!(v) as usize;
+    let word = core::mem::size_of::<usize>();
+    let (mut ptr_off, mut len_off) = (usize::MAX, usize::MAX);
+    for i in 0..core::mem::size_of::<Vec<Slot<Cell>>>() / word {
+        // SAFETY: the i-th word of the live `Vec`, in bounds.
+        #[allow(unsafe_code)]
+        let w = unsafe { *((vec + i * word) as *const usize) };
+        if w == v.as_ptr() as usize {
+            ptr_off = i * word;
+        } else if w == v.len() {
+            len_off = i * word;
+        }
+    }
+    assert!(
+        ptr_off != usize::MAX && len_off != usize::MAX,
+        "could not derive the heap's slot Vec offsets"
+    );
+    let field = core::mem::offset_of!(Heap<Cell>, slots);
+    (field + ptr_off, field + len_off)
 }
 
 /// A generational arena of `T`, addressed by [`Handle`].
