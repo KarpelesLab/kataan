@@ -2825,11 +2825,17 @@ impl Interp {
                     | "reduceRight"
             ) {
                 // Read `length` first (its getter/coercion side effects happen),
-                // then check the callback.
-                let _ = self.array_like_length(handle)?;
+                // then check the callback. The scan reuses that one read.
+                let len = self.array_like_length(handle)?;
                 self.require_callable(arg(0), &alloc::format!("{method} callback"))?;
+                return Ok(Some(self.array_iter_sparse(
+                    method,
+                    handle,
+                    args,
+                    Some(len),
+                )?));
             }
-            return Ok(Some(self.array_iter_sparse(method, handle, args)?));
+            return Ok(Some(self.array_iter_sparse(method, handle, args, None)?));
         }
         // `flat`/`flatMap` on a generic array-like (a plain object *or* a proxy
         // whose target is an array) run FlattenIntoArray *live*: `LengthOfArrayLike`,
@@ -2898,6 +2904,18 @@ impl Interp {
                 _ => 1,
             };
             return Ok(Some(self.make_live_array_iterator(handle, kind)));
+        }
+        // `at`/`with` on a generic array-like read `length`, then only the
+        // indices their algorithm names: `at` the one element, `with` every index
+        // but the replaced one. Materializing the receiver would `[[Get]]` (and
+        // `HasProperty`) every index, which a Proxy or getter observes.
+        if self.realm.is_generic_array_like_target(handle)
+            && matches!(method, "at" | "with")
+            && (array_proto_generic || self.inherits_array_proto(handle))
+            && !self.inherits_iterator_proto(handle)
+            && !is_string_receiver
+        {
+            return Ok(Some(self.array_at_with_generic(method, handle, args)?));
         }
         let mut array_like = None;
         if self.realm.is_generic_array_like_target(handle)
@@ -3155,7 +3173,7 @@ impl Interp {
             // once, then each index is probed with `HasProperty` and read with
             // `Get` at that step — so a callback/getter that fills a hole or
             // deletes an inherited index mid-iteration is observed.
-            return Ok(Some(self.array_iter_sparse(method, handle, args)?));
+            return Ok(Some(self.array_iter_sparse(method, handle, args, None)?));
         }
         // Take the per-index presence mask (set above for a materialized generic
         // array-like); the iteration arms below consult it to skip holes.
@@ -6300,25 +6318,34 @@ impl Interp {
                 let to = self.relative_index(arg(0), len, 0)?;
                 let from = self.relative_index(arg(1), len, 0)?;
                 let fin = self.relative_index(arg(2), len, len)?;
-                let count = fin.saturating_sub(from).min(len.saturating_sub(to));
-                // Copy direction matters when ranges overlap (spec uses a direction
-                // flag); collect-then-write avoids clobbering source elements.
-                let mut buf: Vec<Option<NanBox>> = Vec::with_capacity(count);
-                for k in 0..count {
-                    let idx = from + k;
+                let mut count = fin.saturating_sub(from).min(len.saturating_sub(to));
+                // Spec steps 12-15: element by element (HasProperty, Get, Set or
+                // Delete per index, so a Proxy/getter sees interleaved reads and
+                // writes), walking backwards when the ranges overlap with the
+                // source first.
+                let (mut from, mut to, back) = if from < to && to < from + count {
+                    (from + count - 1, to + count - 1, true)
+                } else {
+                    (from, to, false)
+                };
+                while count > 0 {
                     // `fromPresent = HasProperty(O, fromKey)` then ReturnIfAbrupt — a
                     // throwing `has` trap propagates (must not collapse to `false`).
-                    if self.has_property_proxied(handle, &alloc::format!("{idx}"))? {
-                        buf.push(Some(self.array_like_get(handle, idx)?));
+                    if self.has_property_proxied(handle, &alloc::format!("{from}"))? {
+                        let v = self.array_like_get(handle, from)?;
+                        self.array_like_set(handle, to, v)?;
                     } else {
-                        buf.push(None);
+                        self.array_like_delete(handle, to)?;
                     }
-                }
-                for (k, slot) in buf.into_iter().enumerate() {
-                    let dst = to + k;
-                    match slot {
-                        Some(v) => self.array_like_set(handle, dst, v)?,
-                        None => self.array_like_delete(handle, dst)?,
+                    count -= 1;
+                    if count > 0 {
+                        if back {
+                            from -= 1;
+                            to -= 1;
+                        } else {
+                            from += 1;
+                            to += 1;
+                        }
                     }
                 }
                 Ok(NanBox::handle(handle.to_raw()))
@@ -6421,11 +6448,57 @@ impl Interp {
         }
     }
 
+    /// `Array.prototype.at` / `Array.prototype.with` over a generic array-like
+    /// `handle`, reading exactly what the spec algorithms read (23.1.3.1,
+    /// 23.1.3.39).
+    fn array_at_with_generic(
+        &mut self,
+        method: &str,
+        handle: Handle,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
+        let len = self.array_like_length(handle)? as f64;
+        let rel = self.coerce_to_integer_or_infinity(arg(0))?;
+        let k = if rel >= 0.0 { rel } else { len + rel };
+        if method == "at" {
+            if k < 0.0 || k >= len {
+                return Ok(NanBox::undefined());
+            }
+            let key = alloc::format!("{}", k as u64);
+            return self.read_member(handle, &key);
+        }
+        if k < 0.0 || k >= len {
+            let m = self.new_str("Invalid index");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        // ArrayCreate(len): a length past 2^32 - 1 (or the engine cap) is a
+        // RangeError before any element is read.
+        if len > 4_294_967_295.0 || len > self.realm.limits.max_array_len as f64 {
+            let m = self.new_str("Invalid array length");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+        }
+        let value = arg(1);
+        let n = len as usize;
+        let idx = k as usize;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(if i == idx {
+                value
+            } else {
+                let key = alloc::format!("{i}");
+                self.read_member(handle, &key)?
+            });
+        }
+        Ok(NanBox::handle(self.realm.new_array(out).to_raw()))
+    }
+
     fn array_iter_sparse(
         &mut self,
         method: &str,
         handle: Handle,
         args: &[NanBox],
+        len: Option<usize>,
     ) -> Result<NanBox, ExecError> {
         let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
         let f = arg(0);
@@ -6433,8 +6506,12 @@ impl Interp {
         let o = NanBox::handle(handle.to_raw());
         // `LengthOfArrayLike(O)` — works for a real array *and* a generic
         // array-like (a huge `{length:"Infinity"}` scans lazily with early exit
-        // rather than materializing).
-        let len = self.array_like_length(handle)?;
+        // rather than materializing). A caller that already read it (to order
+        // the IsCallable check after it) passes it in: `length` is read once.
+        let len = match len {
+            Some(n) => n,
+            None => self.array_like_length(handle)?,
+        };
         // `indexOf`/`lastIndexOf` take a search target + optional fromIndex; the
         // rest require a callable callback (already validated upstream, but a
         // sparse path is reached after that check).

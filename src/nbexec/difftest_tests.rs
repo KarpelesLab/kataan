@@ -312,3 +312,41 @@ fn proxy_traps_for_has_own_seal_and_bind() {
         "true|false|gopd:a,gopd:a|def:a|gopd:a,def:a|gpo,gopd:length|bound f|true"
     );
 }
+
+/// `Array.prototype` methods over a generic array-like read what their
+/// algorithm reads, in order: the callback methods read `length` once (it was
+/// read twice), `at`/`with` read only the indices they name (not every index),
+/// and `copyWithin` interleaves each `Has`/`Get` with its `Set` (it read the
+/// whole source range first, which also matters when the ranges overlap).
+#[test]
+fn array_generic_methods_read_only_what_they_name() {
+    let src = r#"
+        var log = [];
+        function P(t) {
+            return new Proxy(t, {
+                get(t, k, r) { log.push("get:" + String(k)); return Reflect.get(t, k, r); },
+                set(t, k, v, r) { log.push("set:" + String(k)); return Reflect.set(t, k, v, r); },
+                has(t, k) { log.push("has:" + String(k)); return Reflect.has(t, k); },
+            });
+        }
+        var r = [];
+        Array.prototype.forEach.call(P({ length: 1, 0: 1 }), function () {});
+        r.push(log.splice(0).join());
+        var n = 0;
+        Array.prototype.some.call({ get length() { n++; return 0; } }, function () {});
+        r.push(n);
+        r.push(Array.prototype.at.call(P([1, 2, 3]), -1), log.splice(0).join());
+        r.push(Array.prototype.with.call(P([1, 2]), 0, 5).join(), log.splice(0).join());
+        Array.prototype.copyWithin.call(P({ length: 3, 0: "a", 1: "b", 2: "c" }), 0, 1);
+        r.push(log.splice(0).filter(function (e) { return e.indexOf("set:") == 0 || e.indexOf("has:") == 0; }).join());
+        var o = { length: 4, 0: "a", 1: "b", 2: "c", 3: "d" };
+        Array.prototype.copyWithin.call(o, 1, 0, 3);
+        r.push(Array.prototype.join.call(o, ""));
+        r.join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "get:length,has:0,get:0|1|3|get:length,get:2|5,2|get:length,get:1\
+         |has:1,set:0,has:2,set:1|aabc"
+    );
+}
