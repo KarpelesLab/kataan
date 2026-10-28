@@ -60,6 +60,24 @@ fn plain_lookup(realm: &Realm, start: Handle, key: &str) -> Option<Option<NanBox
     None
 }
 
+/// [`plain_lookup`] through the realm's shared chain memo `slot` (a fixed
+/// lookup site): a hit is the same answer without the walk.
+fn plain_lookup_cached(
+    realm: &Realm,
+    slot: usize,
+    start: Handle,
+    key: &str,
+) -> Option<Option<NanBox>> {
+    realm
+        .shared_chain_lookup(slot, start, key)
+        .or_else(|| plain_lookup(realm, start, key))
+}
+
+/// The memo slots of this module's fixed lookups.
+const SLOT_ITERATOR: usize = 0;
+const SLOT_NEXT: usize = 1;
+const SLOT_RETURN: usize = 2;
+
 /// Whether `GetIterator(v)` would yield a built-in `%ArrayIterator%` over the
 /// array `v` whose `next` is the intrinsic one, so that [`step`] may stand in
 /// for it.
@@ -77,7 +95,17 @@ pub(super) fn can_open(realm: &Realm, v: NanBox) -> bool {
         return false;
     };
     // `GetMethod(v, @@iterator)` is an intrinsic `%Array.prototype.values%`,
-    let Some(Some(f)) = plain_lookup(realm, h, key) else {
+    // An array's own named properties are not shared, so only the walk from
+    // its prototype is memoized.
+    let found = if realm.has_own(h, key) {
+        plain_lookup(realm, h, key)
+    } else {
+        match realm.object_proto(h) {
+            Some(p) => plain_lookup_cached(realm, SLOT_ITERATOR, p, key),
+            None => Some(None),
+        }
+    };
+    let Some(Some(f)) = found else {
         return false;
     };
     if !f
@@ -88,7 +116,7 @@ pub(super) fn can_open(realm: &Realm, v: NanBox) -> bool {
     }
     // and `Get(iterator, "next")` on the fresh iterator (no own properties of
     // that name) is the intrinsic `next`.
-    matches!(plain_lookup(realm, proto, "next"),
+    matches!(plain_lookup_cached(realm, SLOT_NEXT, proto, "next"),
         Some(Some(n)) if n.as_handle() == Some(next_fn.to_raw()))
 }
 
@@ -178,7 +206,7 @@ pub(super) fn materialize(
 /// through the host.
 pub(super) fn close(ctx: &mut Ctx, regs: &mut [NanBox], iter: Reg) -> Result<(), HostError> {
     if let Some(proto) = ctx.realm.vm_array_iter().iter_proto {
-        match plain_lookup(&ctx.realm, proto, "return") {
+        match plain_lookup_cached(&ctx.realm, SLOT_RETURN, proto, "return") {
             Some(None) => return Ok(()),
             Some(Some(v)) if v.is_undefined() || v.is_null() => return Ok(()),
             _ => {}

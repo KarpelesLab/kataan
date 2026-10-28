@@ -813,8 +813,6 @@ impl Interp {
                 // `toString`/`valueOf` runs (propagating), unlike the raw
                 // `to_display_string` which stringifies an object as "[object …]".
                 let text = self.coerce_to_string(arg(0))?;
-                let chars: Vec<char> = text.chars().collect();
-                let mut pos = 0;
                 // An optional `reviver` transforms each value bottom-up. When one is
                 // present, parse with source spans so the reviver's `context.source`
                 // (the json-parse-with-source proposal) can surface original text.
@@ -822,7 +820,12 @@ impl Interp {
                 let has_reviver = reviver
                     .as_handle()
                     .is_some_and(|r| self.is_callable(Handle::from_raw(r)));
-                if has_reviver {
+                if !has_reviver {
+                    return self.json_parse_text(&text);
+                }
+                let chars: Vec<char> = text.chars().collect();
+                let mut pos = 0;
+                {
                     let (value, src) = self.json_parse_src(&chars, &mut pos, 0)?;
                     skip_ws(&chars, &mut pos);
                     if pos != chars.len() {
@@ -832,12 +835,6 @@ impl Interp {
                     self.realm.set_property(holder, "", value);
                     return self.json_revive_ctx(holder, "", reviver, Some(&src));
                 }
-                let value = self.json_parse(&chars, &mut pos, 0)?;
-                skip_ws(&chars, &mut pos);
-                if pos != chars.len() {
-                    return Err(self.json_error("Unexpected token in JSON"));
-                }
-                value
             }
             // `JSON.rawJSON(text)` — validates `ToString(text)` as a single JSON
             // primitive (number/string/boolean/null, no surrounding whitespace) and

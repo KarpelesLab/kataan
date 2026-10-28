@@ -62,6 +62,10 @@ enum Node {
 /// bounded by [`MAX_STRING_LEN`], so it can never collide.
 const U16_LEN_UNKNOWN: usize = usize::MAX;
 
+/// The longest result (in bytes) of a concatenation of two leaves that is
+/// stored as one new leaf rather than a `Concat` node.
+const SMALL_JOIN: usize = 64;
+
 impl Rope {
     /// An empty rope.
     #[must_use]
@@ -220,6 +224,17 @@ impl Rope {
             bytes.extend_from_slice(&other_bytes[3..]); // drop the lone low surrogate
             return Some(Rope::from_wtf8(bytes));
         }
+        // Two short leaves (`'item' + i`, a template's pieces) join into one
+        // leaf: copying a few bytes costs less than a `Concat` node that every
+        // later read has to walk and that eventually has to be flattened anyway.
+        if len <= SMALL_JOIN
+            && let (Node::Leaf(a, _), Node::Leaf(b, _)) = (&*self.0, &*other.0)
+        {
+            let mut bytes = Vec::with_capacity(len);
+            bytes.extend_from_slice(a);
+            bytes.extend_from_slice(b);
+            return Some(Rope::from_wtf8(bytes));
+        }
         Some(Rope(Rc::new(Node::Concat {
             left: self.clone(),
             right: other.clone(),
@@ -332,12 +347,23 @@ impl Drop for Node {
     /// (e.g. Windows' 1 MB test threads) for the pathological left-/right-deep
     /// shape that O(1) concatenation builds.
     fn drop(&mut self) {
-        // A cheap leaf to swap into a child slot so we can take ownership of the
-        // real `Rc<Node>` without recursing through its `Drop`.
-        let sentinel = || Rc::new(Node::Leaf(Box::from(&[][..]), core::cell::Cell::new(0)));
         let Node::Concat { left, right, .. } = self else {
             return; // a leaf owns nothing recursive
         };
+        // Only a child this node owns alone *and* that is itself a `Concat`
+        // continues the chain. Without one, the fields' ordinary drop is a
+        // refcount decrement or a leaf free, never a recursion, so the
+        // iterative dismantling (and its allocations) is skipped.
+        let continues =
+            |r: &Rope| Rc::strong_count(&r.0) == 1 && matches!(*r.0, Node::Concat { .. });
+        if !continues(left) && !continues(right) {
+            return;
+        }
+        // A cheap leaf to swap into a child slot so we can take ownership of the
+        // real `Rc<Node>` without recursing through its `Drop`. One is shared by
+        // every slot (each swap is a refcount increment, not an allocation).
+        let empty = Rc::new(Node::Leaf(Box::from(&[][..]), core::cell::Cell::new(0)));
+        let sentinel = || Rc::clone(&empty);
         let mut stack = alloc::vec![
             core::mem::replace(&mut left.0, sentinel()),
             core::mem::replace(&mut right.0, sentinel()),
@@ -532,11 +558,18 @@ mod tests {
         let bytes = crate::wtf8::from_utf16(&[0xD800]);
         let surr = Rope::from_wtf8(bytes.clone());
         assert_eq!(surr.as_leaf_bytes(), Some(&bytes[..]));
-        // A concatenation has no single backing slice.
-        let joined = Rope::leaf("foo").concat(&Rope::leaf("bar"));
+        // Two short leaves join into one leaf…
+        let small = Rope::leaf("foo").concat(&Rope::leaf("bar"));
+        assert_eq!(small.as_leaf_bytes(), Some(&b"foobar"[..]));
+        // …but a longer concatenation has no single backing slice.
+        let (a, b) = ("f".repeat(40), "b".repeat(40));
+        let joined = Rope::leaf(&a).concat(&Rope::leaf(&b));
         assert_eq!(joined.as_leaf_bytes(), None);
-        // …but its materialized bytes still agree with the borrow-or-copy path.
-        assert_eq!(joined.materialize_bytes(), b"foobar");
+        // …though its materialized bytes still agree with the borrow-or-copy path.
+        assert_eq!(
+            joined.materialize_bytes(),
+            alloc::format!("{a}{b}").as_bytes()
+        );
     }
 
     #[test]

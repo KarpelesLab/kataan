@@ -384,6 +384,20 @@ impl Object {
         self.extra.as_deref().is_none_or(|e| e.accessors.is_empty())
     }
 
+    /// Whether the object's own properties are exactly its shape's data keys,
+    /// every one enumerable, in the shape's order: a shaped object with no
+    /// accessors, no non-enumerable keys and no separate key-order log. Two
+    /// such objects with the same shape then have the same
+    /// [`enumerable_keys`](Object::enumerable_keys) at the same slots.
+    #[inline]
+    #[must_use]
+    pub fn keys_follow_shape(&self) -> bool {
+        matches!(self.data, ObjectData::Shaped { .. })
+            && self.extra.as_deref().is_none_or(|e| {
+                e.accessors.is_empty() && e.hidden.is_empty() && e.key_order.is_none()
+            })
+    }
+
     /// The object's current shape (its hidden class). In dictionary mode this is
     /// an empty sentinel shape, so any inline cache keyed on the returned pointer
     /// resolves no key and misses — a dictionary object never binds an IC.

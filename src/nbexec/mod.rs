@@ -491,6 +491,11 @@ pub struct Interp {
     /// reused slot never matches a stale entry; string cells are immutable, so a
     /// live match is always still valid.
     subject_units_cache: Option<(u64, alloc::rc::Rc<Vec<u16>>)>,
+    /// `RegExpExec`'s `Get(R, "exec")` memo (see `regexp_exec_method`).
+    regexp_exec_lookup: crate::realm::builtins_fast::ChainKeyCache,
+    /// Transition caches for a RegExp match array's `index`/`input`/`groups`.
+    #[cfg(feature = "regex")]
+    match_array_ics: [crate::ic::PropertyCache; 3],
     /// **Mapped `arguments` exotic objects** (sloppy-mode functions with a simple
     /// parameter list): the arguments object's heap-handle (raw) maps each
     /// currently-mapped integer index to the `(scope, parameter name)` binding it
@@ -2753,6 +2758,7 @@ mod intl_fmt;
 mod iterator;
 pub(crate) use iterator::realm_builtin_iter_step;
 mod json;
+mod json_parse;
 mod method_dispatch;
 #[cfg(all(feature = "module", feature = "std"))]
 pub mod module;
@@ -2815,6 +2821,9 @@ impl Interp {
             realm: alloc::boxed::Box::new(Realm::with_limits(limits)),
             realm_spares: Vec::new(),
             subject_units_cache: None,
+            regexp_exec_lookup: Default::default(),
+            #[cfg(feature = "regex")]
+            match_array_ics: Default::default(),
             current: Scope::root(),
             var_scope: Scope::root(),
             eval_var_scope: None,

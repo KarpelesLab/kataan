@@ -98,7 +98,7 @@ impl Compiler<'_> {
                 for item in items {
                     self.convert_item(item, &mut members);
                 }
-                self.emit(Inst::Class(Class { neg: *neg, members }));
+                self.emit(Inst::Class(Class::new(*neg, members)));
             }
             Node::Concat(nodes) => {
                 // In a lookbehind the concatenation is matched right-to-left, so

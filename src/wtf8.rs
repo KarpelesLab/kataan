@@ -276,15 +276,14 @@ impl Iterator for Utf16Units<'_> {
 #[must_use]
 pub fn utf16_len(bytes: &[u8]) -> usize {
     // Astral code points (4-byte forms) count as two units; everything else as
-    // one. Counting lead bytes is O(n) without materializing the units.
-    let mut len = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        let (cp, n) = decode_code_point(bytes, i);
-        len += if cp >= FOUR_BYTE_MIN { 2 } else { 1 };
-        i += n;
-    }
-    len
+    // one. In well-formed WTF-8 every code point has exactly one lead byte
+    // (anything but `10xxxxxx`) and a 4-byte form's lead is `>= 0xF0`, so the
+    // count is a per-byte sum with no decoding (and no branch the compiler
+    // cannot vectorize).
+    bytes
+        .iter()
+        .map(|&b| usize::from(b & 0xC0 != 0x80) + usize::from(b >= 0xF0))
+        .sum()
 }
 
 /// The UTF-16 code unit at index `i` (0-based) — JavaScript's `charCodeAt`.

@@ -635,14 +635,7 @@ impl Interp {
     /// Full `JSON.parse` of a whole source string (value plus a trailing-content
     /// check), used to materialise a JSON module's default export.
     fn parse_json_source(&mut self, source: &str) -> Result<NanBox, ExecError> {
-        let chars: Vec<char> = source.chars().collect();
-        let mut pos = 0;
-        let value = self.json_parse(&chars, &mut pos, 0)?;
-        super::skip_ws(&chars, &mut pos);
-        if pos != chars.len() {
-            return Err(self.json_error("Unexpected token in JSON"));
-        }
-        Ok(value)
+        self.json_parse_text(source)
     }
 
     /// Parses one module source into a [`ModuleRecord`], resolving each import /

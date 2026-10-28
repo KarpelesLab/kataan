@@ -23,6 +23,7 @@
 //! [`NanBox`]: crate::nanbox::NanBox
 //! [`Handle`]: crate::heap::Handle
 
+pub(crate) mod builtins_fast;
 mod handle_map;
 
 use crate::atom::{Atom, AtomTable};
@@ -178,6 +179,23 @@ pub struct Realm {
     /// that was not already present (realm boot, or a brand-new
     /// `Array.prototype.mine`) already goes through ordinary lookup.
     proto_replaced: alloc::collections::BTreeSet<alloc::string::String>,
+    /// How many times [`swap_cell_state`](Realm::swap_cell_state) has moved one
+    /// cell's contents into another handle: a cache that identifies objects by
+    /// handle and key epoch (`builtins_fast::ChainKeyCache`) is only valid
+    /// while this is unchanged.
+    cell_swaps: u32,
+    /// Compiled programs by `(source, flags)`, most recently used last: every
+    /// evaluation of a regex literal creates a new RegExp object (so a literal
+    /// in a loop is a fresh object per iteration), but they share one compiled
+    /// program, which depends on nothing else.
+    #[cfg(feature = "regex")]
+    regex_programs: core::cell::RefCell<alloc::vec::Vec<builtins_fast::RegexProgram>>,
+    /// The shared ropes of the small integers' strings (see
+    /// `builtins_fast::number_rope`), filled on first use.
+    number_ropes: core::cell::RefCell<alloc::vec::Vec<Option<Rope>>>,
+    /// Shared prototype-chain lookup memos (see
+    /// `builtins_fast::shared_chain_lookup`), one per fixed lookup site.
+    chain_lookups: core::cell::RefCell<alloc::vec::Vec<builtins_fast::ChainKeyCache>>,
     /// Logical `length` of an array set above its dense backing capacity (a valid
     /// uint32 length up to 2^32-1 that exceeds [`Limits::max_array_len`]). The dense
     /// `Vec` storage is not actually grown that far (a multi-gigabyte allocation);
@@ -591,6 +609,11 @@ impl Realm {
             proto_index_accessor_dirty: false,
             regex_subject_units: None,
             proto_replaced: alloc::collections::BTreeSet::new(),
+            cell_swaps: 0,
+            #[cfg(feature = "regex")]
+            regex_programs: core::cell::RefCell::new(alloc::vec::Vec::new()),
+            number_ropes: core::cell::RefCell::new(alloc::vec::Vec::new()),
+            chain_lookups: core::cell::RefCell::new(alloc::vec::Vec::new()),
             sparse_array_lengths: alloc::collections::BTreeMap::new(),
             default_object_proto: None,
             native_protos: handle_map::HandleKeyedMap::new(),
@@ -2478,6 +2501,10 @@ impl Realm {
         if let Some(rc) = compiled.borrow().as_ref() {
             return Some(rc.clone());
         }
+        if let Some(re) = self.regex_program_lookup(source, flags) {
+            *compiled.borrow_mut() = Some(re.clone());
+            return Some(re);
+        }
         // The regex engine parses `&str`; a lone surrogate in the pattern has no
         // `char` form, so it is rewritten to the equivalent `\u` escape (see
         // `regex::pattern_from_wtf8`). `source` is served from the exact bytes above.
@@ -2486,6 +2513,7 @@ impl Realm {
                 .ok()?,
         );
         *compiled.borrow_mut() = Some(re.clone());
+        self.regex_program_remember(source, flags, &re);
         Some(re)
     }
 
@@ -3216,6 +3244,7 @@ impl Realm {
             return;
         }
         self.heap.swap(a, b);
+        self.cell_swaps = self.cell_swaps.wrapping_add(1);
         let (ka, kb) = (a.to_raw(), b.to_raw());
         self.aux_props.swap_entries(ka, kb);
         self.native_protos.swap_entries(ka, kb);
@@ -5854,6 +5883,9 @@ impl Realm {
         {
             return rope.clone();
         }
+        if let Some(n) = v.as_number() {
+            return self.number_rope(n);
+        }
         Rope::from(self.to_display_string(v).as_str())
     }
 
@@ -6082,6 +6114,15 @@ impl Realm {
         }
         // A string operand keeps the O(1) rope concatenation path.
         if self.is_string(a) || self.is_string(b) {
+            // `"item" + i` / `i + "px"`: one short leaf and an integer join
+            // directly into one new leaf.
+            if let Some(joined) = self
+                .add_leaf_number(a, b, false)
+                .or_else(|| self.add_leaf_number(b, a, true))
+            {
+                let handle = self.heap.alloc(Cell::Str(joined));
+                return Some(NanBox::handle(handle.to_raw()));
+            }
             let combined = self.rope_of(a).try_concat(&self.rope_of(b))?;
             let handle = self.heap.alloc(Cell::Str(combined));
             return Some(NanBox::handle(handle.to_raw()));
@@ -6701,6 +6742,10 @@ pub(crate) fn js_number_string(n: f64) -> alloc::string::String {
     // Both `+0` and `-0` stringify to "0".
     if n == 0.0 {
         return "0".into();
+    }
+    let mut digits = alloc::string::String::new();
+    if builtins_fast::push_small_integer(&mut digits, n) {
+        return digits;
     }
     let abs = n.abs();
     // JS uses exponential notation for magnitudes ≥ 1e21 or (nonzero) < 1e-6.
@@ -7830,13 +7875,18 @@ mod tests {
         let mut realm = Realm::new();
         let leaf = realm.new_string("hi");
         assert_eq!(realm.string_leaf_bytes(leaf), Some(&b"hi"[..]));
-        // A concatenated rope has no single backing slice.
+        // A concatenated rope (one too long to be joined into a single leaf)
+        // has no single backing slice.
+        let tail = "!".repeat(80);
         let joined = {
             let r = realm.heap.get(leaf).unwrap().as_str().unwrap().clone();
-            realm.heap.alloc(Cell::Str(r.concat(&Rope::leaf("!"))))
+            realm.heap.alloc(Cell::Str(r.concat(&Rope::leaf(&tail))))
         };
         assert_eq!(realm.string_leaf_bytes(joined), None);
-        assert_eq!(realm.string_bytes(joined).as_deref(), Some(&b"hi!"[..]));
+        assert_eq!(
+            realm.string_bytes(joined).as_deref(),
+            Some(alloc::format!("hi{tail}").as_bytes())
+        );
         // A non-string cell yields `None`.
         let arr = realm.new_array(Vec::new());
         assert_eq!(realm.string_leaf_bytes(arr), None);

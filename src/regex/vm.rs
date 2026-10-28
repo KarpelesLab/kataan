@@ -135,6 +135,28 @@ impl FlagDelta {
 pub(crate) struct Class {
     pub neg: bool,
     pub members: Vec<ClassMember>,
+    /// Membership (negation applied) of every Latin-1 code point when the `i`
+    /// flag is off, one bit each: without case folding a member's match does
+    /// not depend on the flags, so the per-character test for the commonest
+    /// subjects is one bit lookup instead of a walk over `members`.
+    latin1: [u64; 4],
+}
+
+impl Class {
+    /// A class over `members` (negated when `neg`).
+    pub(crate) fn new(neg: bool, members: Vec<ClassMember>) -> Self {
+        let mut latin1 = [0u64; 4];
+        for c in 0u32..256 {
+            if leaf_members_match(&members, c, Flags::default()) ^ neg {
+                latin1[(c >> 6) as usize] |= 1u64 << (c & 63);
+            }
+        }
+        Class {
+            neg,
+            members,
+            latin1,
+        }
+    }
 }
 
 /// A compiled `v`-mode extended character-class matcher: a tree of set
@@ -961,6 +983,9 @@ fn is_word_flags(c: u32, flags: Flags) -> bool {
 }
 
 fn class_matches(class: &Class, c: u32, flags: Flags) -> bool {
+    if c < 256 && !flags.ignore_case {
+        return class.latin1[(c >> 6) as usize] & (1u64 << (c & 63)) != 0;
+    }
     leaf_members_match(&class.members, c, flags) ^ class.neg
 }
 

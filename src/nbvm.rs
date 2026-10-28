@@ -6924,8 +6924,8 @@ fn run_frame_at_ic(
                         None => return Err(VmError::Unsupported),
                     }
                 } else {
-                    let s = ctx.realm.to_display_string(v);
-                    regs[*dst as usize] = NanBox::handle(ctx.realm.new_string(&s).to_raw());
+                    regs[*dst as usize] =
+                        NanBox::handle(ctx.realm.new_primitive_string(v).to_raw());
                 }
             }
             Op::RequireObjectCoercible { src } => {

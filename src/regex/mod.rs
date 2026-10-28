@@ -137,6 +137,11 @@ pub struct Regex {
     /// required — the class-led case (`/\s+/`, `/[0-9]+/`) that `first_unit`
     /// cannot express. See [`program_start_set`].
     start_set: Option<StartSet>,
+    /// The index in `prog` of the class `C` when the program starts with a
+    /// greedy `C+` run that must be followed by a literal outside `C` (see
+    /// [`program_lead_run`]): a failed attempt then rules out every start
+    /// inside the same run.
+    lead_run: Option<usize>,
     /// Number of capturing groups (excluding the whole-match group 0).
     group_count: usize,
     /// `(group index, name)` pairs for named capture groups (`(?<name>…)`).
@@ -264,6 +269,7 @@ impl Regex {
                 program_start_set(&prog, flags)
             },
             first_unit,
+            lead_run: program_lead_run(&prog, flags),
             prog,
             scalar_prog: core::cell::OnceCell::new(),
             source: alloc::string::String::from(pattern),
@@ -512,6 +518,27 @@ impl Regex {
             ) {
                 return Some(Captures { groups });
             }
+            // A failed attempt at the head of a `C+x` run (`x` outside `C`)
+            // fails at every later start inside the same run too: from any of
+            // them `C+` can only end where the run ends (an earlier stop would
+            // need `x` inside the run), leaving the rest of the match exactly
+            // as it was. Skip to the end of the run.
+            if let Some(pc) = self.lead_run
+                && core::ptr::eq(prog, self.prog.as_slice())
+                && let Some(class) = prog.get(pc)
+                && units
+                    .get(s)
+                    .is_some_and(|&u| vm::single_consume_matches(class, u32::from(u), flags))
+            {
+                s += 1;
+                while units
+                    .get(s)
+                    .is_some_and(|&u| vm::single_consume_matches(class, u32::from(u), flags))
+                {
+                    s += 1;
+                }
+                continue;
+            }
             s = advance_string_index(units, s, flags.unicode);
         }
         None
@@ -722,6 +749,64 @@ fn program_start_set(prog: &[vm::Inst], flags: Flags) -> Option<StartSet> {
     // to rule out at least a quarter of the Latin-1 range.
     let accepted: u32 = set.latin1.iter().map(|w| w.count_ones()).sum();
     (accepted <= 192).then_some(set)
+}
+
+/// The index of `C` when `prog` begins (past capture saves) with a greedy
+/// `C+` over a plain character class — compiled as `C; Split(body, exit);
+/// C; Jmp` — whose exit (past capture saves) is a literal that `C` does not
+/// match. Only for programs whose outcome from a given position cannot depend
+/// on where the match began: no backreference, lookaround or inline-flag
+/// scope anywhere, and none of the `i`/`u`/`v` flags (so membership is a
+/// plain per-unit test).
+fn program_lead_run(prog: &[vm::Inst], flags: Flags) -> Option<usize> {
+    use vm::Inst;
+    if flags.ignore_case || flags.unicode || flags.unicode_sets {
+        return None;
+    }
+    if prog.iter().any(|i| {
+        matches!(
+            i,
+            Inst::Backref(_)
+                | Inst::BackrefMulti(_)
+                | Inst::Look { .. }
+                | Inst::LookBehind { .. }
+                | Inst::PushFlags(_)
+                | Inst::PopFlags
+        )
+    }) {
+        return None;
+    }
+    let skip_saves = |mut pc: usize| {
+        while matches!(prog.get(pc), Some(Inst::Save(_))) {
+            pc += 1;
+        }
+        pc
+    };
+    let c = skip_saves(0);
+    if !matches!(prog.get(c), Some(Inst::Class(_))) {
+        return None;
+    }
+    let Some(&Inst::Split(body, exit)) = prog.get(c + 1) else {
+        return None;
+    };
+    if body != c + 2
+        || !matches!(prog.get(c + 2), Some(Inst::Class(_)))
+        || !matches!(prog.get(c + 3), Some(&Inst::Jmp(j)) if j == c + 1)
+        || exit != c + 4
+    {
+        return None;
+    }
+    let Some(&Inst::Char(x)) = prog.get(skip_saves(exit)) else {
+        return None;
+    };
+    // `x` must be outside `C`; the two copies of `C` are the same atom.
+    let class = prog.get(c)?;
+    if vm::single_consume_matches(class, x, flags)
+        || vm::single_consume_matches(&prog[c + 2], x, flags)
+    {
+        return None;
+    }
+    Some(c)
 }
 
 fn program_first_unit(prog: &[vm::Inst]) -> Option<u16> {

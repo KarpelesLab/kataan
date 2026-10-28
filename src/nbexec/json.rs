@@ -1,4 +1,5 @@
 use super::*;
+use alloc::rc::Rc;
 
 impl Interp {
     /// `InternalizeJSONProperty` — the `JSON.parse` reviver walk *with source-text
@@ -198,6 +199,9 @@ impl Interp {
             gap: &gap,
             stack: Vec::new(),
             out: String::new(),
+            shape_keys: Vec::new(),
+            tojson_obj: crate::ic::PropertyCache::new(),
+            tojson_arr: Default::default(),
         };
         let value = self.read_member(holder, "")?;
         let wrote = self.json_ser_got(&mut cx, holder, JsonKey::Str(""), value, "")?;
@@ -238,14 +242,8 @@ impl Interp {
         indent: &str,
     ) -> Result<bool, ExecError> {
         // If value is an Object (or BigInt) with a callable `toJSON`, call it.
-        // (A String or Symbol is a primitive, not an Object: it has no
-        // `toJSON` step, and skipping the lookup spares the walk of
-        // `String.prototype` for every string value.)
-        if let Some(h) = value.as_handle().map(Handle::from_raw)
-            && !self.realm.typeof_is_string(h)
-            && self.realm.type_of(h) != Some("symbol")
-        {
-            let tj = self.read_member(h, "toJSON")?;
+        if let Some(h) = value.as_handle().map(Handle::from_raw) {
+            let tj = self.json_to_json_of(cx, h)?;
             if self.is_callable_value(tj) {
                 let kb = key.to_value(self);
                 value = self.call_with_this(tj, value, &[kb])?;
@@ -273,6 +271,19 @@ impl Interp {
     ) -> Result<bool, ExecError> {
         // Unwrap a primitive-wrapper object to its boxed primitive first (so a
         // `new Number(1)` serializes as `1`, `new String("x")` as `"x"`).
+        // A plain data object (one with a key plan: an ordinary shaped object
+        // with no internal key, so no RawJSON brand, no boxed primitive, no
+        // callable marker, and not an array or proxy) is an object to serialize.
+        if let Some(h) = value.as_handle().map(Handle::from_raw)
+            && let Some(plan) = self.json_shape_keys(cx, h)
+        {
+            if cx.property_list.is_none() {
+                self.json_ser_planned(cx, h, &plan, indent)?;
+            } else {
+                self.json_ser_object(cx, h, indent)?;
+            }
+            return Ok(true);
+        }
         let value = if let Some(h) = value.as_handle().map(Handle::from_raw) {
             // RawJSON object: emit the stored source verbatim.
             if self.realm.get_property(h, RAW_JSON_BRAND).is_some()
@@ -305,7 +316,8 @@ impl Interp {
             Unpacked::Null => cx.out.push_str("null"),
             Unpacked::Bool(b) => cx.out.push_str(if b { "true" } else { "false" }),
             Unpacked::Number(n) => {
-                if n.is_finite() {
+                if crate::realm::builtins_fast::push_small_integer(&mut cx.out, n) {
+                } else if n.is_finite() {
                     cx.out.push_str(&self.realm.to_display_string(value));
                 } else {
                     cx.out.push_str("null");
@@ -352,6 +364,101 @@ impl Interp {
         Ok(true)
     }
 
+    /// `GetV(value, "toJSON")` for a value at handle `h`, with two validated
+    /// caches in front of the full `[[Get]]`:
+    /// - an ordinary shaped object uses the prototype-chain cache the VM's
+    ///   property reads use (`ic::ChainCache`), whose hit is exactly the
+    ///   ordinary `[[Get]]` walk over a chain of plain shaped objects;
+    /// - an array (whose own named properties live outside any shape)
+    ///   checks it has no own `toJSON` and then asks an
+    ///   [`ChainKeyCache`](crate::realm::builtins_fast::ChainKeyCache)
+    ///   whether its prototype chain still lacks the key.
+    fn json_to_json_of(&mut self, cx: &mut JsonOut<'_>, h: Handle) -> Result<NanBox, ExecError> {
+        const KEY: &str = "toJSON";
+        // SerializeJSONProperty step 2 looks `toJSON` up only on an Object or a
+        // BigInt: a String or Symbol primitive never consults it.
+        if self.realm.typeof_is_string(h) || self.realm.symbol_at(h).is_some() {
+            return Ok(NanBox::undefined());
+        }
+        if self.realm.is_plain_array_cell(h)
+            && !self.realm.is_host_exotic(h)
+            && !self.realm.has_own(h, KEY)
+        {
+            let Some(proto) = self.realm.object_proto(h) else {
+                return Ok(NanBox::undefined());
+            };
+            let cache = &mut cx.tojson_arr;
+            if self.realm.chain_absent_cached(proto, cache) {
+                return Ok(NanBox::undefined());
+            }
+            self.realm.chain_key_fill(proto, KEY, cache);
+            return self.read_member(h, KEY);
+        }
+        if self.realm.plain_keyed_shape(h).is_none() || self.arg_maps.contains_key(&h.to_raw()) {
+            return self.read_member(h, KEY);
+        }
+        let cache = &mut cx.tojson_obj;
+        match self.realm.chain_cached_get(h, KEY, cache) {
+            Some(crate::realm::ChainHit::Data(v)) => Ok(v),
+            Some(crate::realm::ChainHit::Absent) => Ok(NanBox::undefined()),
+            Some(crate::realm::ChainHit::Accessor(getter, _, own)) => {
+                if getter.as_handle().is_some() {
+                    self.call_with_this(getter, NanBox::handle(h.to_raw()), &[])
+                } else if !own {
+                    Ok(NanBox::undefined())
+                } else {
+                    self.read_member(h, KEY)
+                }
+            }
+            None => {
+                self.realm.chain_cache_fill(h, KEY, cache);
+                self.read_member(h, KEY)
+            }
+        }
+    }
+
+    /// The memoized key plan for the object at `h` (see [`JsonShapeKeys`]),
+    /// built on the first object of each shape; `None` when `h` is not a plain
+    /// keyed object or its shape holds an engine-internal key.
+    fn json_shape_keys(&mut self, cx: &mut JsonOut<'_>, h: Handle) -> Option<Rc<JsonShapeKeys>> {
+        if self.arg_maps.contains_key(&h.to_raw()) || self.realm.is_function_proto_intrinsic(h) {
+            return None;
+        }
+        let shape = self.realm.plain_keyed_shape(h)?;
+        if let Some(m) = cx
+            .shape_keys
+            .iter()
+            .rev()
+            .find(|m| Rc::ptr_eq(&m.shape, shape))
+        {
+            return Some(Rc::clone(m));
+        }
+        let shape = Rc::clone(shape);
+        // An internal key (a wrapper's boxed primitive, a brand, a private
+        // element, a symbol) marks an object the generic path must handle.
+        if shape
+            .keys()
+            .iter()
+            .any(|k| crate::realm::is_internal_key(k))
+        {
+            return None;
+        }
+        let names = self.realm.object_keys(h)?;
+        let mut keys = Vec::with_capacity(names.len());
+        for k in names {
+            let slot = shape.lookup(&k)?;
+            let mut quoted = String::with_capacity(k.len() + 2);
+            json_quote_wtf8_into(&mut quoted, k.as_bytes());
+            keys.push((k, quoted, slot));
+        }
+        let m = Rc::new(JsonShapeKeys { shape, keys });
+        if cx.shape_keys.len() >= JSON_SHAPE_MEMO {
+            cx.shape_keys.remove(0);
+        }
+        cx.shape_keys.push(Rc::clone(&m));
+        Some(m)
+    }
+
     /// The cycle check shared by objects and arrays: pushes `h` on the stack,
     /// or throws if it is already being serialized.
     fn json_enter(&mut self, cx: &mut JsonOut<'_>, h: Handle) -> Result<(), ExecError> {
@@ -371,6 +478,11 @@ impl Interp {
         h: Handle,
         indent: &str,
     ) -> Result<(), ExecError> {
+        if cx.property_list.is_none()
+            && let Some(plan) = self.json_shape_keys(cx, h)
+        {
+            return self.json_ser_planned(cx, h, &plan, indent);
+        }
         self.json_enter(cx, h)?;
         let new_indent = alloc::format!("{indent}{}", cx.gap);
         // The key set: the explicit PropertyList, else the object's own enumerable
@@ -432,6 +544,57 @@ impl Interp {
                 None => self.read_member(h, &k)?,
             };
             if self.json_ser_got(cx, h, JsonKey::Str(&k), value, &new_indent)? {
+                any = true;
+            } else {
+                cx.out.truncate(mark);
+            }
+        }
+        cx.stack.pop();
+        if any && pretty {
+            cx.out.push('\n');
+            cx.out.push_str(indent);
+        }
+        cx.out.push('}');
+        Ok(())
+    }
+
+    /// [`json_ser_object`](Self::json_ser_object) for an object with a key
+    /// plan: the same steps, with the keys and their quoted forms from the plan
+    /// and each `Get(h, k)` a slot read while `h` still has the plan's shape
+    /// (user code run by a nested `toJSON`/replacer may reshape it, after which
+    /// the remaining keys take the generic `[[Get]]`).
+    fn json_ser_planned(
+        &mut self,
+        cx: &mut JsonOut<'_>,
+        h: Handle,
+        plan: &JsonShapeKeys,
+        indent: &str,
+    ) -> Result<(), ExecError> {
+        self.json_enter(cx, h)?;
+        let pretty = !cx.gap.is_empty();
+        let new_indent = if pretty {
+            alloc::format!("{indent}{}", cx.gap)
+        } else {
+            String::new()
+        };
+        cx.out.push('{');
+        let mut any = false;
+        for (k, quoted, slot) in &plan.keys {
+            let mark = cx.out.len();
+            if any {
+                cx.out.push(',');
+            }
+            if pretty {
+                cx.out.push('\n');
+                cx.out.push_str(&new_indent);
+            }
+            cx.out.push_str(quoted);
+            cx.out.push_str(if pretty { ": " } else { ":" });
+            let value = match self.realm.plain_slot_under(h, &plan.shape, *slot) {
+                Some(v) => v,
+                None => self.get_own_fast(h, k)?,
+            };
+            if self.json_ser_got(cx, h, JsonKey::Str(k), value, &new_indent)? {
                 any = true;
             } else {
                 cx.out.truncate(mark);
@@ -860,6 +1023,28 @@ struct JsonOut<'a> {
     gap: &'a str,
     stack: Vec<Handle>,
     out: String,
+    /// Key lists memoized per shape (see [`JsonShapeKeys`]); a few entries,
+    /// most recently added last.
+    shape_keys: Vec<Rc<JsonShapeKeys>>,
+    /// Prototype-chain caches for the `toJSON` probe, one per receiver kind
+    /// (an ordinary object, an array's prototype).
+    tojson_obj: crate::ic::PropertyCache,
+    tojson_arr: crate::realm::builtins_fast::ChainKeyCache,
+}
+
+/// How many shapes' key lists one `JSON.stringify` run remembers.
+const JSON_SHAPE_MEMO: usize = 8;
+
+/// The serialization plan for every object of one shape whose own properties
+/// are exactly its shape's enumerable data keys
+/// ([`Realm::plain_keyed_shape`](crate::realm::Realm::plain_keyed_shape)): the
+/// keys in `[[OwnPropertyKeys]]` order, each with its JSON-quoted form and its
+/// slot. Shape identity fixes the keys and slots, so the plan holds for any
+/// object that still has `shape` when a key is read.
+struct JsonShapeKeys {
+    shape: Rc<crate::shape::Shape>,
+    /// `(key, "key" quoted, slot)`.
+    keys: Vec<(String, String, u32)>,
 }
 
 /// The key of a property being serialized: a named key, or an array index whose

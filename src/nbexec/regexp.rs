@@ -34,31 +34,16 @@ impl Interp {
             .collect();
         let obj = self.realm.new_array(elems);
         let index = caps.groups.first().and_then(|g| *g).map_or(0, |(s, _)| s);
+        // Every result array gains the same three keys in the same order, so
+        // the adds go through transition caches (one shape path for all).
+        let groups = self.regex_groups_object(units, caps, group_names);
+        let [c_index, c_input, c_groups] = &mut self.match_array_ics;
         self.realm
-            .set_property(obj, "index", NanBox::number(index as f64));
-        self.realm.set_property(obj, "input", input);
-        let groups = if group_names.is_empty() {
-            NanBox::undefined()
-        } else {
-            // Named-group container is a null-prototype object (per spec). A name may
-            // occur more than once (duplicate named groups in disjoint alternatives):
-            // whichever occurrence participated in the match wins. Create each name on
-            // its first occurrence (preserving key order) with its value; a later
-            // duplicate overwrites the value only when *it* participated (`Some`), so a
-            // non-participating `None` never clobbers the matched capture.
-            let g = self.realm.new_object_with_proto(None);
-            for (idx, name) in group_names {
-                let v = match caps.groups.get(*idx).and_then(|x| *x) {
-                    Some((s, e)) => self.new_str_bytes(u16_slice(units, s, e)),
-                    None => NanBox::undefined(),
-                };
-                if !v.is_undefined() || self.realm.get_property(g, name).is_none() {
-                    self.realm.set_property(g, name, v);
-                }
-            }
-            NanBox::handle(g.to_raw())
-        };
-        self.realm.set_property(obj, "groups", groups);
+            .init_aux_data_cached(obj, "index", NanBox::number(index as f64), c_index);
+        self.realm
+            .init_aux_data_cached(obj, "input", input, c_input);
+        self.realm
+            .init_aux_data_cached(obj, "groups", groups, c_groups);
         if has_indices {
             // `indices[i]` = `[start, end]` per group (undefined when absent).
             let pair = |this: &mut Self, span: Option<(usize, usize)>| -> NanBox {
@@ -94,6 +79,37 @@ impl Interp {
                 .set_property(obj, "indices", NanBox::handle(indices.to_raw()));
         }
         NanBox::handle(obj.to_raw())
+    }
+
+    /// The match result's `groups`: `undefined` without named groups, else a
+    /// null-prototype object mapping each name to its capture.
+    #[cfg(feature = "regex")]
+    pub(crate) fn regex_groups_object(
+        &mut self,
+        units: &[u16],
+        caps: &crate::regex::Captures,
+        group_names: &[(usize, String)],
+    ) -> NanBox {
+        if group_names.is_empty() {
+            return NanBox::undefined();
+        }
+        // Named-group container is a null-prototype object (per spec). A name may
+        // occur more than once (duplicate named groups in disjoint alternatives):
+        // whichever occurrence participated in the match wins. Create each name on
+        // its first occurrence (preserving key order) with its value; a later
+        // duplicate overwrites the value only when *it* participated (`Some`), so a
+        // non-participating `None` never clobbers the matched capture.
+        let g = self.realm.new_object_with_proto(None);
+        for (idx, name) in group_names {
+            let v = match caps.groups.get(*idx).and_then(|x| *x) {
+                Some((s, e)) => self.new_str_bytes(u16_slice(units, s, e)),
+                None => NanBox::undefined(),
+            };
+            if !v.is_undefined() || self.realm.get_property(g, name).is_none() {
+                self.realm.set_property(g, name, v);
+            }
+        }
+        NanBox::handle(g.to_raw())
     }
 
     /// `IsRegExp(argument)` (ECMA-262 22.2.7.2), spec-faithful: for an object, read
@@ -414,8 +430,16 @@ impl Interp {
             {
                 return Ok((value, units.clone()));
             }
-            let bytes = self.coerce_to_string_bytes(value)?;
-            let units = alloc::rc::Rc::new(crate::wtf8::utf16_units(&bytes).collect::<Vec<u16>>());
+            let h = Handle::from_raw(raw);
+            self.realm.flatten_string(h);
+            let units = match self.realm.string_leaf_bytes(h) {
+                Some(bytes) => utf16_units_of(bytes),
+                None => {
+                    let bytes = self.coerce_to_string_bytes(value)?;
+                    utf16_units_of(&bytes)
+                }
+            };
+            let units = alloc::rc::Rc::new(units);
             self.subject_units_cache = Some((raw, units.clone()));
             return Ok((value, units));
         }
@@ -512,8 +536,8 @@ impl Interp {
                         self.new_str_bytes(bytes)
                     }
                 };
-                let r = self.regexp_exec(this_val, str_v)?;
-                Ok(NanBox::boolean(!matches!(r.unpack(), Unpacked::Null)))
+                let r = self.regexp_exec_outcome(this_val, str_v)?;
+                Ok(NanBox::boolean(!matches!(r, ExecOutcome::Null)))
             }
             "compile" => self.regexp_compile(this_val, arg(0), arg(1)),
             "toString" => {
@@ -720,6 +744,24 @@ impl Interp {
         h: Handle,
         s_value: NanBox,
     ) -> Result<NanBox, ExecError> {
+        Ok(match self.regexp_builtin_match(h, s_value)? {
+            Some(m) => self.regexp_match_array(&m),
+            None => NanBox::null(),
+        })
+    }
+
+    /// Every step of `RegExpBuiltinExec(R, S)` except building the result
+    /// array: `None` for no match, else the match with what the array would be
+    /// built from. The array is a fresh ordinary Array whose elements and
+    /// `index`/`input`/`groups` are own data properties, so a caller that
+    /// would only read those back (`test`, `@@replace`, `@@match`, `@@search`)
+    /// can use the match directly, unobservably.
+    #[cfg(feature = "regex")]
+    pub(crate) fn regexp_builtin_match(
+        &mut self,
+        h: Handle,
+        s_value: NanBox,
+    ) -> Result<Option<RegexMatch>, ExecError> {
         // ToString the subject losslessly (a lone surrogate survives), and keep
         // the string value as the match result's `.input`. Both the UTF-16
         // conversion and the `.input` string are memoized on the subject handle:
@@ -731,25 +773,35 @@ impl Interp {
         // surfaces) — this is step 2, *before* the flags are read in step 3. The
         // order is observable: a `lastIndex.valueOf` may call `re.compile(…)`,
         // and the new flags then govern this very match.
-        let last_index_v = self.read_member(h, "lastIndex")?;
-        let li = self.coerce_to_integer_or_infinity(last_index_v)?;
-        let li = if li < 0.0 { 0usize } else { li as usize };
-        let (_source, flags) = self.realm.regexp_at(h).unwrap_or_default();
-        let global = flags.contains('g');
-        let sticky = flags.contains('y');
-        let unicode = flags.contains('u') || flags.contains('v');
+        let li = if self.realm.regex_aux_last_index_defined(h) {
+            let last_index_v = self.read_member(h, "lastIndex")?;
+            let li = self.coerce_to_integer_or_infinity(last_index_v)?;
+            if li < 0.0 { 0usize } else { li as usize }
+        } else {
+            // The cell's own `lastIndex` slot: always a non-negative integer.
+            self.realm.regex_last_index(h)
+        };
+        let Some((global, sticky, has_indices)) = self.realm.regexp_flags(h).map(|flags| {
+            (
+                flags.contains('g'),
+                flags.contains('y'),
+                flags.contains('d'),
+            )
+        }) else {
+            return Ok(None);
+        };
         // For a non-global, non-sticky regex `lastIndex` is ignored (start 0).
         let start = if global || sticky { li } else { 0 };
 
         let Some(re) = self.realm.regex_compiled(h) else {
-            return Ok(NanBox::null());
+            return Ok(None);
         };
         let len = units.len();
         if start > len {
             if global || sticky {
                 self.set_last_index(h, 0)?;
             }
-            return Ok(NanBox::null());
+            return Ok(None);
         }
         // Sticky must match exactly at `start`; non-sticky scans forward.
         let caps = if sticky {
@@ -758,13 +810,12 @@ impl Interp {
         } else {
             re.captures_in_u16(&units, start)
         };
-        let _ = unicode;
         match caps {
             None => {
                 if global || sticky {
                     self.set_last_index(h, 0)?;
                 }
-                Ok(NanBox::null())
+                Ok(None)
             }
             Some(c) => {
                 if global || sticky {
@@ -773,16 +824,27 @@ impl Interp {
                 // Annex B.2.5: update the RegExp legacy static match record from
                 // this successful match (read by `RegExp.$1`/`lastMatch`/…).
                 self.update_legacy_regexp(&units, &c);
-                let has_indices = flags.contains('d');
-                Ok(self.regex_match_object_u16_indices(
-                    &units,
+                Ok(Some(RegexMatch {
+                    units,
                     input,
-                    &c,
-                    re.group_names(),
+                    caps: c,
+                    re,
                     has_indices,
-                ))
+                }))
             }
         }
+    }
+
+    /// The result array `RegExpBuiltinExec` returns for match `m`.
+    #[cfg(feature = "regex")]
+    pub(crate) fn regexp_match_array(&mut self, m: &RegexMatch) -> NanBox {
+        self.regex_match_object_u16_indices(
+            &m.units,
+            m.input,
+            &m.caps,
+            m.re.group_names(),
+            m.has_indices,
+        )
     }
 
     /// Updates the Annex B.2.5 RegExp legacy static match record from a successful
@@ -839,10 +901,26 @@ impl Interp {
     /// user/subclass override), validating its result is Object-or-null; otherwise
     /// falls back to `RegExpBuiltinExec` (which requires `R` to be a RegExp).
     pub(crate) fn regexp_exec(&mut self, r: NanBox, s: NanBox) -> Result<NanBox, ExecError> {
+        Ok(match self.regexp_exec_outcome(r, s)? {
+            ExecOutcome::Null => NanBox::null(),
+            ExecOutcome::Object(v) => v,
+            #[cfg(feature = "regex")]
+            ExecOutcome::Match(m) => self.regexp_match_array(&m),
+        })
+    }
+
+    /// [`regexp_exec`](Self::regexp_exec) that leaves a built-in match
+    /// unmaterialized ([`ExecOutcome::Match`]) for a caller that only reads the
+    /// result array's own properties back.
+    pub(crate) fn regexp_exec_outcome(
+        &mut self,
+        r: NanBox,
+        s: NanBox,
+    ) -> Result<ExecOutcome, ExecError> {
         let Some(h) = r.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("RegExpExec called on a non-object"));
         };
-        let exec = self.read_member(h, "exec")?;
+        let exec = self.regexp_exec_method(h)?;
         // The intrinsic `RegExp.prototype.exec` on a RegExp: run
         // RegExpBuiltinExec directly rather than through the generic call and
         // the by-name dispatch (same realm, same result).
@@ -853,7 +931,10 @@ impl Interp {
             && self.get_function_realm(fh) == self.cur_realm
             && let Some(rh) = self.this_regexp(r)
         {
-            return self.regexp_builtin_exec(rh, s);
+            return Ok(match self.regexp_builtin_match(rh, s)? {
+                Some(m) => ExecOutcome::Match(m),
+                None => ExecOutcome::Null,
+            });
         }
         if exec
             .as_handle()
@@ -861,12 +942,15 @@ impl Interp {
             .is_some_and(|fh| self.is_callable(fh))
         {
             let result = self.call_with_this(exec, r, &[s])?;
-            if !matches!(result.unpack(), Unpacked::Null) && !self.is_object_value(result) {
+            if matches!(result.unpack(), Unpacked::Null) {
+                return Ok(ExecOutcome::Null);
+            }
+            if !self.is_object_value(result) {
                 return Err(self.type_error(
                     "RegExp exec method returned something other than an Object or null",
                 ));
             }
-            return Ok(result);
+            return Ok(ExecOutcome::Object(result));
         }
         #[cfg(feature = "regex")]
         {
@@ -875,12 +959,27 @@ impl Interp {
                     "RegExpExec called on a non-RegExp object without a callable exec",
                 ));
             }
-            self.regexp_builtin_exec(h, s)
+            Ok(match self.regexp_builtin_match(h, s)? {
+                Some(m) => ExecOutcome::Match(m),
+                None => ExecOutcome::Null,
+            })
         }
         #[cfg(not(feature = "regex"))]
         {
             Err(ExecError::Unsupported("RegExp needs the regex feature"))
         }
+    }
+
+    /// `Get(R, "exec")`, answered from a validated chain cache
+    /// ([`ChainKeyCache`](crate::realm::builtins_fast::ChainKeyCache)) when the
+    /// lookup provably reaches the same data property as last time.
+    fn regexp_exec_method(&mut self, h: Handle) -> Result<NanBox, ExecError> {
+        if let Some(v) = self.realm.chain_key_cached(h, &self.regexp_exec_lookup) {
+            return Ok(v.unwrap_or_else(NanBox::undefined));
+        }
+        self.realm
+            .chain_key_fill(h, "exec", &mut self.regexp_exec_lookup);
+        self.read_member(h, "exec")
     }
 
     /// A catchable `SyntaxError` for an invalid `/pattern/flags`.
@@ -928,17 +1027,19 @@ impl Interp {
         if !self.same_value(prev, NanBox::number(0.0)) {
             self.set_prop_throwing(h, "lastIndex", NanBox::number(0.0))?;
         }
-        let result = self.regexp_exec(rx, str_v)?;
+        let result = self.regexp_exec_outcome(rx, str_v)?;
         let cur = self.read_member(h, "lastIndex")?;
         if !self.same_value(cur, prev) {
             self.set_prop_throwing(h, "lastIndex", prev)?;
         }
-        if matches!(result.unpack(), Unpacked::Null) {
-            return Ok(NanBox::number(-1.0));
-        }
-        match result.as_handle().map(Handle::from_raw) {
-            Some(r) => self.read_member(r, "index"),
-            None => Ok(NanBox::number(-1.0)),
+        match result {
+            ExecOutcome::Null => Ok(NanBox::number(-1.0)),
+            #[cfg(feature = "regex")]
+            ExecOutcome::Match(m) => Ok(NanBox::number(m.caps.whole().0 as f64)),
+            ExecOutcome::Object(r) => match r.as_handle().map(Handle::from_raw) {
+                Some(r) => self.read_member(r, "index"),
+                None => Ok(NanBox::number(-1.0)),
+            },
         }
     }
 
@@ -973,18 +1074,25 @@ impl Interp {
         };
         let mut results: Vec<NanBox> = Vec::new();
         loop {
-            let result = self.regexp_exec(rx, str_v)?;
-            if matches!(result.unpack(), Unpacked::Null) {
-                break;
-            }
-            let Some(rh) = result.as_handle().map(Handle::from_raw) else {
-                break;
+            let m_bytes = match self.regexp_exec_outcome(rx, str_v)? {
+                ExecOutcome::Null => break,
+                #[cfg(feature = "regex")]
+                ExecOutcome::Match(m) => {
+                    let (a, b) = m.caps.whole();
+                    u16_slice(&m.units, a, b)
+                }
+                ExecOutcome::Object(result) => {
+                    let Some(rh) = result.as_handle().map(Handle::from_raw) else {
+                        break;
+                    };
+                    let match0 = self.get_own_fast(rh, "0")?;
+                    // `ToString(Get(result, "0"))` losslessly: a non-unicode `/./g`
+                    // matches one *code unit*, so each half of an astral pair is a
+                    // lone surrogate that a `String` round-trip would collapse to
+                    // U+FFFD.
+                    self.coerce_to_string_bytes(match0)?
+                }
             };
-            let match0 = self.get_own_fast(rh, "0")?;
-            // `ToString(Get(result, "0"))` losslessly: a non-unicode `/./g` matches
-            // one *code unit*, so each half of an astral pair is a lone surrogate
-            // that a `String` round-trip would collapse to U+FFFD.
-            let m_bytes = self.coerce_to_string_bytes(match0)?;
             let empty = m_bytes.is_empty();
             let m_v = self.new_str_bytes(m_bytes);
             results.push(m_v);
@@ -1254,22 +1362,37 @@ impl Interp {
             self.set_prop_throwing(h, "lastIndex", NanBox::number(0.0))?;
         }
         // Collect all matches first (so user `exec` runs in the spec order).
-        let mut results: Vec<NanBox> = Vec::new();
+        let mut results: Vec<ExecOutcome> = Vec::new();
         loop {
-            let result = self.regexp_exec(rx, str_v)?;
-            if matches!(result.unpack(), Unpacked::Null) {
-                break;
-            }
+            let result = self.regexp_exec_outcome(rx, str_v)?;
+            let empty = match &result {
+                ExecOutcome::Null => break,
+                #[cfg(feature = "regex")]
+                ExecOutcome::Match(m) => {
+                    let (a, b) = m.caps.whole();
+                    a == b
+                }
+                ExecOutcome::Object(_) => false,
+            };
+            let object = match &result {
+                ExecOutcome::Object(r) => Some(*r),
+                _ => None,
+            };
             results.push(result);
             if !global {
                 break;
             }
-            let m0 = match result.as_handle().map(Handle::from_raw) {
-                Some(r) => self.get_own_fast(r, "0")?,
-                None => NanBox::undefined(),
+            let empty = match object {
+                Some(result) => {
+                    let m0 = match result.as_handle().map(Handle::from_raw) {
+                        Some(r) => self.get_own_fast(r, "0")?,
+                        None => NanBox::undefined(),
+                    };
+                    self.coerce_to_string(m0)?.is_empty()
+                }
+                None => empty,
             };
-            let m_str = self.coerce_to_string(m0)?;
-            if m_str.is_empty() {
+            if empty {
                 let li_v = self.read_member(h, "lastIndex")?;
                 let li = self.last_index_to_length(li_v)?;
                 let next = self.advance_string_index(&units, li, unicode);
@@ -1280,6 +1403,52 @@ impl Interp {
         let mut accumulated: Vec<u8> = Vec::new();
         let mut next_source_position = 0usize;
         for result in results {
+            let result = match result {
+                ExecOutcome::Null => continue,
+                ExecOutcome::Object(r) => r,
+                #[cfg(feature = "regex")]
+                ExecOutcome::Match(m) => {
+                    // The result array's own properties, read straight from the
+                    // match: `length` is the group count, element 0 the match,
+                    // `index` its start, `groups` the named-groups object.
+                    let (pos, end) = m.caps.whole();
+                    let matched_units = &m.units[pos..end];
+                    let captures: Vec<Option<Vec<u8>>> = m
+                        .caps
+                        .groups
+                        .iter()
+                        .skip(1)
+                        .map(|g| g.map(|(a, b)| u16_slice(&m.units, a, b)))
+                        .collect();
+                    let named = self.regex_groups_object(&m.units, &m.caps, m.re.group_names());
+                    let replacement = self.regexp_replacement(
+                        func_replace,
+                        replace,
+                        &repl_str,
+                        matched_units,
+                        &units,
+                        pos.min(length),
+                        &captures,
+                        named,
+                        str_v,
+                    )?;
+                    let pos = pos.min(length);
+                    if pos >= next_source_position {
+                        accumulated.extend_from_slice(&u16_slice(
+                            &units,
+                            next_source_position,
+                            pos,
+                        ));
+                        crate::wtf8::append(&mut accumulated, &replacement);
+                        next_source_position = pos + matched_units.len();
+                        if accumulated.len() > crate::rope::MAX_STRING_LEN {
+                            let m = self.new_str("Invalid string length");
+                            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                        }
+                    }
+                    continue;
+                }
+            };
             let Some(rh) = result.as_handle().map(Handle::from_raw) else {
                 continue;
             };
@@ -1305,34 +1474,17 @@ impl Interp {
                 }
             }
             let named = self.get_own_fast(rh, "groups")?;
-            let replacement = if func_replace {
-                // Call(replace, undefined, [matched, ...captures, position, S, groups?]).
-                let mut call_args: Vec<NanBox> = Vec::with_capacity(n_captures + 4);
-                call_args.push(self.new_str_bytes(crate::wtf8::from_utf16(&matched_units)));
-                for c in &captures {
-                    call_args.push(match c {
-                        Some(cs) => self.new_str_bytes(cs.clone()),
-                        None => NanBox::undefined(),
-                    });
-                }
-                call_args.push(NanBox::number(pos as f64));
-                call_args.push(str_v);
-                if !matches!(named.unpack(), Unpacked::Undefined) {
-                    call_args.push(named);
-                }
-                let r = self.call(replace, &call_args)?;
-                self.coerce_to_string_bytes(r)?
-            } else {
-                // ES2018 named captures: a non-undefined `groups` is `ToObject`'d
-                // before substitution (`groups: null` therefore throws a TypeError).
-                let named_obj = if matches!(named.unpack(), Unpacked::Undefined) {
-                    named
-                } else {
-                    let obj = self.require_object_coercible_to_object(named, "GetSubstitution")?;
-                    NanBox::handle(obj.to_raw())
-                };
-                self.get_substitution(&matched_units, &units, pos, &captures, named_obj, &repl_str)?
-            };
+            let replacement = self.regexp_replacement(
+                func_replace,
+                replace,
+                &repl_str,
+                &matched_units,
+                &units,
+                pos,
+                &captures,
+                named,
+                str_v,
+            )?;
             // If position >= next_source_position, append S[next..pos] then the
             // replacement and advance next to pos + m_len.
             if pos >= next_source_position {
@@ -1349,6 +1501,52 @@ impl Interp {
             accumulated.extend_from_slice(&u16_slice_from(&units, next_source_position));
         }
         Ok(self.new_str_bytes(accumulated))
+    }
+
+    /// The replacement text for one `@@replace` match: `replace(matched,
+    /// ...captures, position, S, groups?)` for a function, else
+    /// `GetSubstitution` over the template `repl_str`.
+    #[allow(clippy::too_many_arguments)]
+    fn regexp_replacement(
+        &mut self,
+        func_replace: bool,
+        replace: NanBox,
+        repl_str: &str,
+        matched_units: &[u16],
+        units: &[u16],
+        pos: usize,
+        captures: &[Option<Vec<u8>>],
+        named: NanBox,
+        str_v: NanBox,
+    ) -> Result<Vec<u8>, ExecError> {
+        if func_replace {
+            // Call(replace, undefined, [matched, ...captures, position, S, groups?]).
+            let mut call_args: Vec<NanBox> = Vec::with_capacity(captures.len() + 4);
+            call_args.push(self.new_str_bytes(crate::wtf8::from_utf16(matched_units)));
+            for c in captures {
+                call_args.push(match c {
+                    Some(cs) => self.new_str_bytes(cs.clone()),
+                    None => NanBox::undefined(),
+                });
+            }
+            call_args.push(NanBox::number(pos as f64));
+            call_args.push(str_v);
+            if !matches!(named.unpack(), Unpacked::Undefined) {
+                call_args.push(named);
+            }
+            let r = self.call(replace, &call_args)?;
+            self.coerce_to_string_bytes(r)
+        } else {
+            // ES2018 named captures: a non-undefined `groups` is `ToObject`'d
+            // before substitution (`groups: null` therefore throws a TypeError).
+            let named_obj = if matches!(named.unpack(), Unpacked::Undefined) {
+                named
+            } else {
+                let obj = self.require_object_coercible_to_object(named, "GetSubstitution")?;
+                NanBox::handle(obj.to_raw())
+            };
+            self.get_substitution(matched_units, units, pos, captures, named_obj, repl_str)
+        }
     }
 
     /// `GetSubstitution(matched, str, position, captures, namedCaptures, replacement)`
@@ -1524,4 +1722,36 @@ fn escape_regexp_source(source: &[u8]) -> alloc::vec::Vec<u8> {
 #[cfg(not(feature = "regex"))]
 fn escape_regexp_source(source: &[u8]) -> alloc::vec::Vec<u8> {
     source.to_vec()
+}
+
+/// The UTF-16 code units of WTF-8 `bytes` (an ASCII string widens byte by byte).
+fn utf16_units_of(bytes: &[u8]) -> Vec<u16> {
+    if bytes.is_ascii() {
+        bytes.iter().map(|&b| u16::from(b)).collect()
+    } else {
+        crate::wtf8::utf16_units(bytes).collect()
+    }
+}
+
+/// A `RegExpBuiltinExec` match before its result array is built (see
+/// [`Interp::regexp_builtin_match`]).
+#[cfg(feature = "regex")]
+pub(crate) struct RegexMatch {
+    /// The subject's code units.
+    pub(crate) units: alloc::rc::Rc<Vec<u16>>,
+    /// The subject string (the array's `input`).
+    pub(crate) input: NanBox,
+    pub(crate) caps: crate::regex::Captures,
+    pub(crate) re: alloc::rc::Rc<crate::regex::Regex>,
+    /// Whether the regex has the `d` flag (the array gets `indices`).
+    pub(crate) has_indices: bool,
+}
+
+/// What `RegExpExec` produced: no match, a user `exec`'s result object, or a
+/// built-in match not yet materialized as an array.
+pub(crate) enum ExecOutcome {
+    Null,
+    Object(NanBox),
+    #[cfg(feature = "regex")]
+    Match(RegexMatch),
 }

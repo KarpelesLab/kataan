@@ -152,6 +152,27 @@ impl Interp {
             return Ok(Some(NanBox::number(len as f64)));
         }
 
+        // `charCodeAt`/`charAt` on a String primitive — a per-character loop's
+        // whole body — served before the by-name cascade below, none of whose
+        // other arms applies to a string primitive and these names. Same steps
+        // as the string-method arms further down.
+        if matches!(method, "charCodeAt" | "charAt")
+            && !array_proto_generic
+            && let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && self.realm.typeof_is_string(h)
+        {
+            let idx = self.coerce_to_integer_or_infinity(arg(0))?;
+            self.realm.flatten_string(h);
+            if let Some(unit) = self.realm.string_unit_at_index(h, str_char_index(idx)) {
+                return Ok(Some(match (method, unit) {
+                    ("charCodeAt", Some(u)) => NanBox::number(f64::from(u)),
+                    ("charCodeAt", None) => NanBox::number(f64::NAN),
+                    (_, Some(u)) => self.new_str_bytes(crate::wtf8::from_utf16(&[u])),
+                    (_, None) => self.new_str(""),
+                }));
+            }
+        }
+
         // `Array.prototype.toString` (23.1.3.36) is receiver-agnostic: it does
         // `O = ToObject(this)`, `func = Get(O, "join")`, and calls `func` if it is
         // callable, else falls back to `%Object.prototype.toString%` (yielding e.g.
