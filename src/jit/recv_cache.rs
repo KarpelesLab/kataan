@@ -25,9 +25,9 @@ use alloc::vec::Vec;
 use super::GenericOp;
 use crate::nbvm::Op;
 
-/// The most global binding addresses a body caches (each costs a store after
-/// every call).
-const MAX_GLOBAL_SLOTS: usize = 4;
+/// The most global binding addresses a body caches (each costs a frame slot
+/// and a store in the prologue).
+const MAX_GLOBAL_SLOTS: usize = 8;
 
 /// A body's global binding cache plan: the slots it uses and, per op, the slot
 /// of a `LoadGlobal` / `StoreGlobal` that uses one.
@@ -38,67 +38,44 @@ pub(super) struct GlobalPlan {
     pub(super) site: Vec<Option<usize>>,
 }
 
-/// Plans the global binding cache: among the body's global reads and writes
-/// outside promoted loops (`in_region`, which keep their own), the ones that
-/// can reuse an address an earlier access of the same `(name, read | write)`
-/// validated with no call in between (as the receiver cache's plan follows
-/// the op stream), and those earlier accesses; the (up to
-/// [`MAX_GLOBAL_SLOTS`]) most used such pairs get a slot each. A write's
-/// validated address would also serve reads, but not the reverse, so the two
-/// kinds of one name take separate slots.
+/// Plans the global binding cache: the body's global reads and writes outside
+/// promoted loops (`in_region`, which keep their own), grouped by `(name,
+/// read | write)`; the (up to [`MAX_GLOBAL_SLOTS`]) most frequent pairs get a
+/// slot each. A slot keeps the address an access validated across calls and
+/// loop iterations, for as long as the global binding epoch it was validated
+/// under is current (see `compile_generic`), so every access of a pair after
+/// the first in an activation reuses it. A write's validated address would
+/// also serve reads, but not the reverse, so the two kinds of one name take
+/// separate slots.
 pub(super) fn plan_globals(
     ops: &[GenericOp],
     bytecode: &[Op],
-    osr_entries: &[usize],
-    catch_targets: &[usize],
     in_region: impl Fn(usize) -> bool,
 ) -> GlobalPlan {
     let n = ops.len();
-    let target = branch_targets(ops, osr_entries, catch_targets);
     let mut key = vec![None; n];
-    let mut used = vec![false; n];
-    let mut live: Vec<((&str, bool), usize)> = Vec::new();
     for (pc, op) in ops.iter().enumerate() {
-        if target[pc] {
-            live.clear();
-        }
         if matches!(op, GenericOp::Interp { .. }) && !in_region(pc) {
-            let k = match bytecode.get(pc) {
+            key[pc] = match bytecode.get(pc) {
                 Some(Op::LoadGlobal { name, .. }) => Some((name.as_str(), false)),
                 Some(Op::StoreGlobal { name, .. }) => Some((name.as_str(), true)),
                 _ => None,
             };
-            if let Some(k) = k {
-                key[pc] = Some(k);
-                if let Some(e) = live.iter_mut().find(|e| e.0 == k) {
-                    used[e.1] = true;
-                    used[pc] = true;
-                    e.1 = pc;
-                } else {
-                    live.push((k, pc));
-                }
-            }
-        }
-        let inline = matches!(op, GenericOp::Interp { .. } | GenericOp::CallMethod { .. })
-            && usually_inline(bytecode, pc);
-        if ends_knowledge(op) && !inline {
-            live.clear();
         }
     }
     let mut groups: Vec<((&str, bool), usize)> = Vec::new();
-    for pc in 0..n {
-        if let (true, Some(k)) = (used[pc], key[pc]) {
-            match groups.iter_mut().find(|g| g.0 == k) {
-                Some(g) => g.1 += 1,
-                None => groups.push((k, 1)),
-            }
+    for &k in key.iter().flatten() {
+        match groups.iter_mut().find(|g| g.0 == k) {
+            Some(g) => g.1 += 1,
+            None => groups.push((k, 1)),
         }
     }
     groups.sort_by_key(|x| core::cmp::Reverse(x.1));
     groups.truncate(MAX_GLOBAL_SLOTS);
-    let site = (0..n)
-        .map(|pc| {
-            let k = key[pc].filter(|_| used[pc])?;
+    let site = key
+        .iter()
+        .map(|k| {
+            let k = (*k)?;
             groups.iter().position(|g| g.0 == k)
         })
         .collect();

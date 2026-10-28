@@ -430,10 +430,16 @@ pub(crate) extern "C" fn jit_helper_unwind(
 /// address of that binding when [`vm_store_global_fast`] would assign it without
 /// mirroring the write onto the global object (the running scope is the global
 /// scope, the binding is plain and initialized, the global object has no
-/// like-named own property). `0` otherwise. The address stays valid, and the
-/// facts true, until Rust code next runs (which alone can add or free a binding,
-/// change the running scope or realm, or give the global object a property):
-/// the compiled code drops it after every call.
+/// like-named own property — and is a global object, `JIT_FLAG_GLOBAL`, whose
+/// key changes the global binding epoch tracks). `0` otherwise. The address
+/// stays valid, and the facts true, until Rust code next runs (which alone can
+/// add or free a binding, change the running scope or realm, or give the
+/// global object a property) — and past that for as long as the global binding
+/// epoch (`crate::env`) is unchanged, since every such change but the running
+/// scope's bumps it, and the running scope a compiled activation sees is the
+/// same after each call returns (the generic tier's cache, which also starts
+/// over in a `catch` handler, relies on this; promoted loops drop the address
+/// after a call).
 ///
 /// # Safety
 /// `ctx` must be the live `Ctx` the compiled body was entered with and `op` a
@@ -462,10 +468,16 @@ pub(crate) extern "C" fn jit_helper_global_ref(ctx: *mut core::ffi::c_void, op: 
         } if !(*strict && resolved.is_some()) && !name.starts_with('\u{1}') => {
             host.global_scope_if_current().and_then(|(scope, global)| {
                 let p = scope.jit_binding_ptr(name, &cache.slot, true)?;
-                let owned = global.as_handle().is_some_and(|g| {
-                    super::global_owns_cached(&ctx.realm, Handle::from_raw(g), name, cache)
-                });
-                (!owned).then_some(p)
+                let g = Handle::from_raw(global.as_handle()?);
+                // Only a global object whose key changes bump the global
+                // binding epoch (which the compiled cache holds the answer
+                // across calls under).
+                let tracked = ctx
+                    .realm
+                    .jit_object(g)
+                    .is_some_and(|o| o.jit_flags() & crate::object::JIT_FLAG_GLOBAL != 0);
+                let owned = super::global_owns_cached(&ctx.realm, g, name, cache);
+                (tracked && !owned).then_some(p)
             })
         }
         _ => None,
@@ -538,6 +550,60 @@ pub(crate) extern "C" fn jit_helper_site_fill(
     {
         site.fill(&ctx.realm, Handle::from_raw(h));
     }
+    0
+}
+
+/// `Op::NewObject` from compiled code: a fresh ordinary object's handle bits
+/// (exactly the interpreter arm, which cannot fail). It allocates and runs no
+/// JavaScript.
+///
+/// # Safety
+/// `ctx` must be the live `Ctx` the compiled body was entered with.
+pub(crate) extern "C" fn jit_helper_new_object(ctx: *mut core::ffi::c_void, _unused: u64) -> u64 {
+    // SAFETY: see the function contract — a live, otherwise-unborrowed `Ctx`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    NanBox::handle(ctx.realm.new_object().to_raw()).to_bits()
+}
+
+/// `Op::NewArrayFrom` (and a small `Op::NewArray`) from compiled code: the
+/// array literal, written to the op's destination register — exactly the
+/// interpreter arm, without the one-op dispatch. Any other op (an `Op::NewArray`
+/// past the length cap) is [`jit_helper_exec_op`]'s.
+///
+/// # Safety
+/// As [`jit_helper_exec_op`].
+pub(crate) extern "C" fn jit_helper_new_array(
+    ctx: *mut core::ffi::c_void,
+    regs: *mut u64,
+    n_regs: usize,
+    op: *const Op,
+) -> u64 {
+    // SAFETY: `op` points into the `JitProto`'s owned bytecode, alive while its
+    // code runs.
+    #[allow(unsafe_code)]
+    let op_ref = unsafe { &*op };
+    // SAFETY: see the function contract — a live, otherwise-unborrowed `Ctx`,
+    // and `regs` the activation's `n_regs`-long register file (`NanBox` is
+    // `repr(transparent)` over `u64`), live and unaliased for this call.
+    #[allow(unsafe_code)]
+    let (cx, file) = unsafe {
+        (
+            &mut *(ctx as *mut Ctx),
+            core::slice::from_raw_parts_mut(regs.cast::<NanBox>(), n_regs),
+        )
+    };
+    let (dst, vals) = match op_ref {
+        Op::NewArrayFrom { dst, elems } => {
+            let vals: alloc::vec::Vec<NanBox> = elems.iter().map(|r| file[*r as usize]).collect();
+            (*dst, vals)
+        }
+        Op::NewArray { dst, len } if *len <= cx.realm.limits.max_array_len => {
+            (*dst, alloc::vec![NanBox::undefined(); *len])
+        }
+        _ => return jit_helper_exec_op(ctx, regs, n_regs, op),
+    };
+    file[dst as usize] = NanBox::handle(cx.realm.new_array(vals).to_raw());
     0
 }
 

@@ -1033,7 +1033,11 @@ impl Realm {
         let mut obj = Object::new(Rc::clone(&self.root_shape));
         obj.set_proto(Some(proto));
         let h = self.heap.alloc(Cell::Object(obj));
-        self.write_barrier(h, NanBox::handle(proto.to_raw()));
+        // The write barrier of a fresh (young) container: no old→young edge
+        // to record, only the incremental marker's shading.
+        if let Some(marker) = self.incremental.as_mut() {
+            marker.mark_grey(proto);
+        }
         h
     }
 
@@ -1204,10 +1208,16 @@ impl Realm {
 
     /// Allocates a fresh empty object in the heap and returns its handle.
     pub fn new_object(&mut self) -> Handle {
-        let obj = Object::new(Rc::clone(&self.root_shape));
+        let mut obj = Object::new(Rc::clone(&self.root_shape));
+        let proto = self.default_object_proto;
+        // The `[[Prototype]]` goes in before the allocation: the same object
+        // `set_object_proto` would leave, without finding it again. Its write
+        // barrier reduces to the incremental marker's shading — a fresh
+        // (young) container records no old→young edge.
+        obj.set_proto(proto);
         let h = self.heap.alloc(Cell::Object(obj));
-        if let Some(proto) = self.default_object_proto {
-            self.set_object_proto(h, Some(proto));
+        if let (Some(p), Some(marker)) = (proto, self.incremental.as_mut()) {
+            marker.mark_grey(p);
         }
         h
     }

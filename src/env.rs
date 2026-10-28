@@ -41,6 +41,31 @@ struct Binding {
 /// and after a deletion).
 static NEXT_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
+/// The **global binding epoch**: bumped whenever a root scope's (the global
+/// scope's, a module's) set of bindings, their slot storage, their `const`
+/// marks or their initialization may have changed, and whenever a global
+/// object's own keys may have (see `crate::object::JIT_FLAG_GLOBAL`). The
+/// compiled tier keeps validated global binding addresses across calls while
+/// it holds an unchanged value (`jit_helper_global_ref`'s facts are about
+/// exactly these things). Process-wide, so a change on any thread merely
+/// retires every cached address. Never reaches `u64::MAX` (the compiled
+/// tier's "nothing validated" mark).
+static GLOBAL_BINDING_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// Retires every global binding address the compiled tier validated (see
+/// [`global_binding_epoch_addr`]).
+#[inline]
+pub(crate) fn bump_global_binding_epoch() {
+    GLOBAL_BINDING_EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The address of the global binding epoch counter, which compiled code reads
+/// with a plain load (an `AtomicU64` has `u64`'s layout).
+#[must_use]
+pub(crate) fn global_binding_epoch_addr() -> usize {
+    GLOBAL_BINDING_EPOCH.as_ptr() as usize
+}
+
 /// A per-instruction inline cache over a frame's bindings: the frame
 /// generation it was filled under and the slot its name lives in. A hit is a
 /// generation compare and a slot load instead of a by-name search. A frame's
@@ -144,6 +169,11 @@ impl ScopeData {
     /// Binds `name` to `value` in this frame, keeping an existing binding's slot
     /// and flags; returns the binding.
     fn bind(&mut self, name: &str, value: NanBox) -> &mut Binding {
+        if self.parent.is_none() {
+            // A new binding (its storage may move), a redeclaration (back in
+            // its temporal dead zone, say) or a kind change to follow.
+            bump_global_binding_epoch();
+        }
         let i = match self.names.get(name) {
             Some(&i) => i,
             None => {
@@ -292,6 +322,9 @@ impl Scope {
     /// a deletable binding.
     pub fn delete_local(&self, name: &str) -> bool {
         let mut data = self.0.borrow_mut();
+        if data.parent.is_none() {
+            bump_global_binding_epoch();
+        }
         let removed = match data.names.remove(name) {
             Some(i) => {
                 // Clear the slot (it must hold no handle) and retire every cache
@@ -377,7 +410,11 @@ impl Scope {
     /// for the names a `const` *destructuring* pattern introduces, which are
     /// bound by the generic pattern walker and only then known to be `const`.
     pub fn mark_const(&self, name: &str) {
-        if let Some(b) = self.0.borrow_mut().slot_of_mut(name) {
+        let mut data = self.0.borrow_mut();
+        if data.parent.is_none() {
+            bump_global_binding_epoch();
+        }
+        if let Some(b) = data.slot_of_mut(name) {
             b.flags |= B_CONST;
         }
     }
@@ -443,6 +480,10 @@ impl Scope {
     pub fn set(&self, name: &str, value: NanBox) -> bool {
         let mut data = self.0.borrow_mut();
         if let Some(b) = data.slot_of_mut(name) {
+            if value.is_tdz() {
+                // Back into the temporal dead zone: no longer readable.
+                bump_global_binding_epoch();
+            }
             b.value = value;
             return true;
         }

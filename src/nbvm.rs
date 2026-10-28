@@ -5799,6 +5799,8 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         global_ref: jit_tier::jit_helper_global_ref,
         math1: jit_tier::jit_helper_math1,
         site_fill: jit_tier::jit_helper_site_fill,
+        new_object: jit_tier::jit_helper_new_object,
+        new_array: jit_tier::jit_helper_new_array,
     }
 }
 

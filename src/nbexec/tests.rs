@@ -12991,6 +12991,35 @@ fn compiled_global_cache_callkey_and_inline_math() {
     );
 }
 
+/// The compiled tier's global binding cache keeps validated addresses across
+/// calls and loop iterations under the global binding epoch: global bindings
+/// created (an indirect-eval `var`), deleted and redeclared by called code in
+/// the middle of a compiled loop, and handlers entered from a callee's throw,
+/// read and write what the interpreter does.
+#[test]
+fn compiled_global_cache_survives_calls_under_the_epoch() {
+    let src = r#"
+        (0, eval)("var ev = 1;");
+        let total = 0, errs = 0, h = 5;
+        function killEv() { return delete ev; }
+        function makeLate() { (0, eval)("var late = 100;"); }
+        function redecl() { (0, eval)("function gfn() { return 2; }"); }
+        function gfn() { return 1; }
+        function thrower(i) { h += 1; if (i % 7 === 0) throw new Error("x"); return i; }
+        for (let i = 0; i < 3000; i++) {
+          try { total += ev; } catch (e) { errs++; }
+          try { total += late; } catch (e) { total -= 1; }
+          total += gfn() + h;
+          try { total += thrower(i); } catch (e) { total += h; h = h - 2; }
+          if (i === 1000) makeLate();
+          if (i === 1500) killEv();
+          if (i === 2000) redecl();
+        }
+        [total, errs, h, typeof ev, late].join("|")
+    "#;
+    assert_eq!(run(src), "7747503|1499|2147|undefined|100");
+}
+
 /// Captured variables in binding cells (`Cell::Box`): `let`/`var`/`const`
 /// captures, captured parameters (still one-element array cells) written
 /// through a closure, per-iteration loop bindings, a named function

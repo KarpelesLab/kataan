@@ -2737,6 +2737,12 @@ pub struct GenericHelpers {
     /// method site's key is found on `recv` (`MethodSite::fill`), for the
     /// inline `Math.f(x)` lookup.
     pub site_fill: JitBinHelper,
+    /// `jit_helper_new_object(ctx, _) -> bits`: `Op::NewObject`'s fresh
+    /// ordinary object (never throws).
+    pub new_object: JitTruthyHelper,
+    /// `jit_helper_new_array(ctx, regs, n_regs, op) -> 0`: `Op::NewArrayFrom`
+    /// / `Op::NewArray`, written to the op's destination (the exec-op ABI).
+    pub new_array: JitExecOpHelper,
 }
 
 /// The runtime-helper ABI for a method call: `(ctx, regs, n_regs, op, cache) ->
@@ -3407,6 +3413,10 @@ pub struct X64Assembler {
     /// (which alone can move, free or retype a heap cell) runs only behind a
     /// call.
     recv_cache_keys: Vec<i32>,
+    /// Frame slots (`[rbp+disp]`) the frame prologue alone sets to
+    /// [`RECV_CACHE_EMPTY`]: the generic tier's global binding cache, which
+    /// a call does not empty (it is guarded by the global binding epoch).
+    entry_clear: Vec<i32>,
 }
 
 /// The value a receiver-cache key slot holds when it caches nothing: the
@@ -3456,14 +3466,33 @@ impl X64Assembler {
         self.recv_cache_keys = keys;
     }
 
+    /// Sets the slots only the frame prologue empties (see the `entry_clear`
+    /// field).
+    pub(crate) fn set_entry_clear(&mut self, slots: Vec<i32>) {
+        self.entry_clear = slots;
+    }
+
     /// Empties every receiver-cache key slot (after a `call`, in the prologue).
     fn clear_recv_cache(&mut self) {
         for i in 0..self.recv_cache_keys.len() {
             let d = self.recv_cache_keys[i];
-            // mov qword [rbp+d], imm32 (sign-extended)
-            self.code.extend_from_slice(&[0x48, 0xc7, 0x85]);
-            self.code.extend_from_slice(&d.to_le_bytes());
-            self.code.extend_from_slice(&RECV_CACHE_EMPTY.to_le_bytes());
+            self.store_empty(d);
+        }
+    }
+
+    /// `mov qword [rbp+d], RECV_CACHE_EMPTY` (sign-extended imm32).
+    fn store_empty(&mut self, d: i32) {
+        self.code.extend_from_slice(&[0x48, 0xc7, 0x85]);
+        self.code.extend_from_slice(&d.to_le_bytes());
+        self.code.extend_from_slice(&RECV_CACHE_EMPTY.to_le_bytes());
+    }
+
+    /// Empties every [`entry_clear`](Self::set_entry_clear) slot (the frame
+    /// prologue; and the generic tier's global cache reset).
+    pub(crate) fn clear_entry_slots(&mut self) {
+        for i in 0..self.entry_clear.len() {
+            let d = self.entry_clear[i];
+            self.store_empty(d);
         }
     }
 
@@ -3673,6 +3702,11 @@ impl X64Assembler {
     /// `mov rax, rdx` — move the `idiv` remainder into `rax`.
     pub fn mov_rax_rdx(&mut self) {
         self.code.extend_from_slice(&[0x48, 0x89, 0xd0]);
+    }
+
+    /// `cmp rcx, imm8` (sign-extended).
+    pub fn cmp_rcx_imm8(&mut self, imm: i8) {
+        self.code.extend_from_slice(&[0x48, 0x83, 0xf9, imm as u8]);
     }
 
     /// `shl/sar/shr eax, cl` — a 32-bit shift of `eax` by `cl` (masked to 5 bits;
@@ -4052,6 +4086,7 @@ impl X64Assembler {
         self.code.extend_from_slice(&[0x48, 0x81, 0xec]); // sub rsp, imm32
         self.code.extend_from_slice(&frame.to_le_bytes());
         self.clear_recv_cache();
+        self.clear_entry_slots();
     }
 
     /// `lea rsp, [rbp-16]; pop rbx; pop r15; pop rbp; ret` — the frame-ABI
@@ -5160,36 +5195,48 @@ impl JitFunction {
         // keeps a receiver's handle bits at `[rbp + rc_key(w)]` and the address
         // of its heap slot, as a full walk proved it live, at
         // `[rbp + rc_cell(w)]`. The prologue and every call empty the keys.
-        let gc_plan = recv_cache::plan_globals(ops, bytecode, osr_entries, &catch_targets, |pc| {
-            num.in_region(pc)
-        });
+        let gc_plan = recv_cache::plan_globals(ops, bytecode, |pc| num.in_region(pc));
         let rc = recv_cache::plan(ops, bytecode, &gc_plan, osr_entries, &catch_targets);
         let rc_base = method_scratch - 8 * num.frame_slots() as i32;
         let rc_key = |w: usize| rc_base - 8 * (2 * w as i32 + 1);
         let rc_cell = |w: usize| rc_base - 8 * (2 * w as i32 + 2);
         // The global binding cache, under the receiver cache: slot `k` holds
         // the address `jit_helper_global_ref` validated for its name (a read
-        // or a write binding), emptied by every call like the receiver keys
-        // (the address and its facts hold until Rust code runs).
+        // or a write binding). Unlike the receiver keys it stays filled
+        // across calls, guarded by the global binding epoch it was validated
+        // under (`gc_epoch`, one for all slots: a changed epoch empties them
+        // all, as does a `catch` entry). The prologue empties both.
         let gc_base = rc_base - 16 * rc.ways as i32;
         let gc_slot = |k: usize| gc_base - 8 * (k as i32 + 1);
+        let gc_epoch = gc_base - 8 * (gc_plan.slots as i32 + 1);
+        let gc_frame_slots = if gc_plan.slots > 0 {
+            gc_plan.slots + 1
+        } else {
+            0
+        };
+        let epoch_addr = crate::env::global_binding_epoch_addr() as i64;
         let frame = ((16
             + max_argc as u32 * 8
-            + (num.frame_slots() + 2 * rc.ways + gc_plan.slots) as u32 * 8)
+            + (num.frame_slots() + 2 * rc.ways + gc_frame_slots) as u32 * 8)
             + 15)
             & !15;
         let mut a = X64Assembler::new();
         a.set_rbx_frame(true);
-        a.set_recv_cache_keys(
-            (0..rc.ways)
-                .map(rc_key)
-                .chain((0..gc_plan.slots).map(gc_slot))
-                .collect(),
-        );
+        a.set_recv_cache_keys((0..rc.ways).map(rc_key).collect());
+        if gc_plan.slots > 0 {
+            a.set_entry_clear(
+                (0..gc_plan.slots)
+                    .map(gc_slot)
+                    .chain(core::iter::once(gc_epoch))
+                    .collect(),
+            );
+        }
         // The out-of-line full walks: (entry, resume, receiver, miss, way).
         let mut cold_walks: Vec<(Label, Label, u16, Label, usize, recv_cache::Family)> = Vec::new();
         // The global binding cache's refills: (entry, resume, done, op, slot).
         let mut cold_globals: Vec<(Label, Label, Label, usize, i32)> = Vec::new();
+        // The global binding cache's resets on a changed epoch: (entry, refill).
+        let mut cold_epochs: Vec<(Label, Label)> = Vec::new();
         // One label per op (any op can be a branch target or an OSR entry) plus
         // one for the end of the stream (a branch to `len` falls off the end).
         let labels: Vec<Label> = (0..=ops.len()).map(|_| a.new_label()).collect();
@@ -5414,6 +5461,14 @@ impl JitFunction {
                 let fetch = a.new_label();
                 let back = a.new_label();
                 let done = a.new_label();
+                let reset = a.new_label();
+                // The epoch the slots were validated under must still be
+                // current (else, out of line, they are all emptied).
+                a.g_movabs(call_seq::r::R11, epoch_addr as u64);
+                a.g_load(call_seq::r::RAX, call_seq::r::R11, 0);
+                a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, gc_epoch);
+                a.jne(reset);
+                cold_epochs.push((reset, fetch));
                 a.g_load(call_seq::r::RAX, call_seq::r::RBP, slot);
                 a.g_cmp_imm(call_seq::r::RAX, RECV_CACHE_EMPTY);
                 a.je(fetch);
@@ -5804,7 +5859,27 @@ impl JitFunction {
                     if pc as usize != op_idx {
                         return None;
                     }
-                    exec_op!(pc);
+                    match bytecode.get(pc as usize)? {
+                        // A literal's allocation: its own helper, not the
+                        // one-op interpreter.
+                        crate::nbvm::Op::NewObject { dst } if ok(*dst) => {
+                            a.mov_rdi_r15();
+                            a.movabs_rax(helpers.new_object as usize as i64);
+                            a.call_rax();
+                            a.store_rax(disp(*dst));
+                        }
+                        crate::nbvm::Op::NewArrayFrom { .. } | crate::nbvm::Op::NewArray { .. } => {
+                            let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
+                            a.mov_rdi_r15();
+                            a.mov_rsi_rbx();
+                            a.movabs_argreg(2, n_regs as i64);
+                            a.movabs_argreg(3, op_ptr as i64);
+                            a.movabs_rax(helpers.new_array as usize as i64);
+                            a.call_rax();
+                            throw_check!();
+                        }
+                        _ => exec_op!(pc),
+                    }
                 }
                 GenericOp::Add { dst, a: ra, b: rb } => {
                     if !ok(dst) || !ok(ra) || !ok(rb) {
@@ -6074,6 +6149,46 @@ impl JitFunction {
                     if let Some(fb) = fbin {
                         both_numbers!(ra, rb, slow);
                         fbin_store!(fb, ra, rb, dst, done);
+                    } else {
+                        // `%` of two integral Numbers that convert exactly to
+                        // i64: the integer remainder, which is fmod's exact
+                        // result (sign of the dividend; a zero takes the
+                        // dividend's sign bit, -0 included). A zero or `-1`
+                        // divisor (no `idiv` overflow), a fraction, NaN or
+                        // an infinity takes the helper.
+                        both_numbers!(ra, rb, slow);
+                        a.movsd_xmm0_mem(disp(rb));
+                        a.cvttsd2si_rax_xmm0();
+                        a.cvtsi2sd_xmm1_rax();
+                        a.ucomisd_xmm0_xmm1();
+                        a.jne(slow);
+                        a.jp(slow);
+                        a.mov_rcx_rax();
+                        a.test_rcx_rcx();
+                        a.je(slow);
+                        a.cmp_rcx_imm8(-1);
+                        a.je(slow);
+                        a.movsd_xmm0_mem(disp(ra));
+                        a.cvttsd2si_rax_xmm0();
+                        a.cvtsi2sd_xmm1_rax();
+                        a.ucomisd_xmm0_xmm1();
+                        a.jne(slow);
+                        a.jp(slow);
+                        a.cqo();
+                        a.idiv_rcx();
+                        let nonzero = a.new_label();
+                        a.test_rdx_rdx();
+                        a.jne(nonzero);
+                        a.load_rax(disp(ra));
+                        a.movabs_r11(i64::MIN); // the sign bit
+                        a.and_rax_r11();
+                        a.store_rax(disp(dst));
+                        a.jmp(done);
+                        a.bind(nonzero);
+                        a.mov_rax_rdx();
+                        a.cvtsi2sd_xmm0_rax();
+                        a.movsd_mem_xmm0(disp(dst));
+                        a.jmp(done);
                     }
                     a.bind(slow);
                     a.mov_rdi_r15();
@@ -6458,6 +6573,15 @@ impl JitFunction {
         // The numeric emitter's out-of-line slow paths (after a `ret`, so no op
         // falls through into them).
         num.finish(&mut a, &labels, throw_exit);
+        // The global binding cache's resets: the epoch changed since the
+        // slots were validated, so empty them all, note the current epoch
+        // (in `rax`) and refill this one.
+        for (reset, fetch) in core::mem::take(&mut cold_epochs) {
+            a.bind(reset);
+            a.clear_entry_slots();
+            a.g_store(call_seq::r::RBP, gc_epoch, call_seq::r::RAX);
+            a.jmp(fetch);
+        }
         // The global binding cache's refills: a validated address is cached
         // and used, else the interpreter runs the op.
         for (fetch, back, done, pc, slot) in core::mem::take(&mut cold_globals) {
@@ -6546,6 +6670,11 @@ impl JitFunction {
             a.movabs_argreg(2, n_regs as i64);
             a.movabs_rax(unwind_helper as i64);
             a.call_rax();
+            // A throw may have left the host's running scope elsewhere: the
+            // global binding cache starts over in the handler.
+            if gc_plan.slots > 0 {
+                a.store_empty(gc_epoch);
+            }
             for &t in &catch_targets {
                 a.cmp_rax_imm(i32::try_from(t).ok()?);
                 a.je(labels[t]);

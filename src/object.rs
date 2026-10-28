@@ -215,6 +215,11 @@ pub const JIT_FLAG_NO_INLINE_SET: u8 = 2;
 /// property, so compiled code's in-place store must go to the helper (which
 /// checks the key). Set by [`Object::set_readonly`], never cleared.
 pub const JIT_FLAG_READONLY: u8 = 4;
+/// [`Object::jit_flags`] bit: a realm's global object. A change to its own
+/// keys also bumps the global binding epoch (`crate::env`), so compiled code
+/// that validated "the global object has no such own property" for a global
+/// write stops relying on it. Set once, when the global object is made.
+pub const JIT_FLAG_GLOBAL: u8 = 8;
 
 /// A property-bearing object: a hidden-class shape plus its value slots (or a
 /// dictionary once it grows past the threshold), with an optional side list of
@@ -323,6 +328,17 @@ impl Object {
         self.key_epoch
     }
 
+    /// Bumps [`key_epoch`](Self::key_epoch) — and, for a global object
+    /// ([`JIT_FLAG_GLOBAL`]), the global binding epoch, since whether it owns a
+    /// like-named property decides how a global write behaves.
+    #[inline]
+    fn bump_key_epoch(&mut self) {
+        self.key_epoch = self.key_epoch.wrapping_add(1);
+        if self.jit_flags & JIT_FLAG_GLOBAL != 0 {
+            crate::env::bump_global_binding_epoch();
+        }
+    }
+
     /// The out-of-line part, or the shared empty one.
     fn ex(&self) -> &ObjectExtra {
         self.extra.as_deref().unwrap_or(&EMPTY_EXTRA)
@@ -338,7 +354,7 @@ impl Object {
     /// on the fast path (`key_order` is `None`). Called after a *new* own key — data
     /// or accessor — is materialized.
     fn track_key(&mut self, key: &str) {
-        self.key_epoch = self.key_epoch.wrapping_add(1);
+        self.bump_key_epoch();
         if let Some(order) = self.extra.as_deref_mut().and_then(|x| x.key_order.as_mut())
             && !order.iter().any(|k| k.as_ref() == key)
         {
@@ -455,7 +471,7 @@ impl Object {
         }
         *shape = to;
         slots.push(len, value);
-        self.key_epoch = self.key_epoch.wrapping_add(1);
+        self.bump_key_epoch();
         true
     }
 
@@ -1089,7 +1105,7 @@ impl Object {
         {
             *shape = to;
             slots.push(len, value);
-            self.key_epoch = self.key_epoch.wrapping_add(1);
+            self.bump_key_epoch();
             return true;
         }
         self.maybe_convert_to_dict(key, dict_threshold);
@@ -1156,7 +1172,7 @@ impl Object {
     /// Removes any accessor (getter/setter) for `key`, leaving data properties
     /// intact — used when a `defineProperty` replaces an accessor with data.
     pub fn clear_accessor(&mut self, key: &str) {
-        self.key_epoch = self.key_epoch.wrapping_add(1);
+        self.bump_key_epoch();
         if let Some(x) = self.extra.as_deref_mut() {
             x.accessors.retain(|(k, _, _)| k.as_ref() != key);
         }
@@ -1166,7 +1182,7 @@ impl Object {
     /// `root` without it, and leaving any same-named accessor untouched. Used when
     /// `defineProperty` converts a data property into an accessor.
     pub fn delete_data(&mut self, root: Rc<Shape>, key: &str) {
-        self.key_epoch = self.key_epoch.wrapping_add(1);
+        self.bump_key_epoch();
         match &mut self.data {
             ObjectData::Shaped { len, shape, slots } => {
                 if !shape.contains(key) {
@@ -1202,7 +1218,7 @@ impl Object {
     /// it (also drops a same-named accessor). Returns whether anything was
     /// removed.
     pub fn delete(&mut self, root: Rc<Shape>, key: &str) -> bool {
-        self.key_epoch = self.key_epoch.wrapping_add(1);
+        self.bump_key_epoch();
         let had_accessor = self
             .ex()
             .accessors

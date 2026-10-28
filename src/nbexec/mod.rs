@@ -5091,9 +5091,13 @@ impl Interp {
         // is `{ writable, configurable, enumerable: false }`), so the mirror is
         // built from the live root-scope bindings and each is marked hidden.
         let global = self.realm.new_object();
-        // Writes to a global object also reach the global bindings: never inline.
-        self.realm
-            .add_jit_flags(global, crate::object::JIT_FLAG_NO_INLINE_SET);
+        // Writes to a global object also reach the global bindings: never
+        // inline; and its own keys decide how a global write behaves, which the
+        // compiled tier's global binding cache tracks.
+        self.realm.add_jit_flags(
+            global,
+            crate::object::JIT_FLAG_NO_INLINE_SET | crate::object::JIT_FLAG_GLOBAL,
+        );
         let bindings = self.global_scope.local_bindings();
         for (name, value, _is_const) in &bindings {
             self.realm.set_property(global, name, *value);

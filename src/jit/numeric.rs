@@ -1297,8 +1297,10 @@ impl NumGen {
         }
     }
 
-    /// `dst = x % y`: inline when both are int32-valued with `y != 0` (the sign
-    /// of a zero result follows `x`, `-0` included); else the helper (`fmod`).
+    /// `dst = x % y`: inline when both are integral Numbers that convert
+    /// exactly to i64, with `y` neither `0` nor `-1` (no `idiv` overflow): the
+    /// integer remainder is then fmod's exact result (the sign of a zero
+    /// result follows `x`, `-0` included); else the helper (`fmod`).
     #[allow(clippy::too_many_arguments)]
     fn int_mod(
         &mut self,
@@ -1317,29 +1319,26 @@ impl NumGen {
                 self.num_guard(a, reg, r, stub);
             }
         }
-        // rcx = int(y), exact, int32, nonzero.
+        // rcx = int(y), exact (an out-of-range y converts to i64::MIN, which
+        // only -2^63 itself converts back to), neither 0 nor -1.
         let xy = self.xmm_src(a, reg, y, 1);
         a.cvttsd2si_gpr_x(RCX, xy);
-        a.raw(&[0x48, 0x63, 0xd1]); // movsxd rdx, ecx
-        a.raw(&[0x48, 0x39, 0xca]); // cmp rdx, rcx
-        a.jcc(CC_NE, stub);
         a.raw(&[0x48, 0x85, 0xc9]); // test rcx, rcx
+        a.jcc(CC_E, stub);
+        a.raw(&[0x48, 0x83, 0xf9, 0xff]); // cmp rcx, -1
         a.jcc(CC_E, stub);
         a.cvtsi2sd_x_gpr(0, RCX);
         a.sse_rr(0x66, 0x2e, 0, xy); // ucomisd xmm0, y
         a.jcc(CC_NE, stub);
         a.jcc(CC_P, stub);
-        // rax = int(x), exact, int32.
+        // rax = int(x), exact.
         let xx = self.xmm_src(a, reg, x, 1);
         a.cvttsd2si_gpr_x(RAX, xx);
-        a.raw(&[0x48, 0x63, 0xd0]); // movsxd rdx, eax
-        a.raw(&[0x48, 0x39, 0xc2]); // cmp rdx, rax
-        a.jcc(CC_NE, stub);
         a.cvtsi2sd_x_gpr(0, RAX);
         a.sse_rr(0x66, 0x2e, 0, xx); // ucomisd xmm0, x
         a.jcc(CC_NE, stub);
         a.jcc(CC_P, stub);
-        // Both in int32 range, so the 64-bit `idiv` cannot overflow.
+        // `y` is not -1, so the 64-bit `idiv` cannot overflow.
         a.cqo();
         a.idiv_rcx();
         // A zero remainder takes the dividend's sign (x's raw sign bit: -0 too).
