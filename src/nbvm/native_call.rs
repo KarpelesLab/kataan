@@ -324,6 +324,7 @@ pub(super) fn try_call(
                 || realm.proto_index_accessor_dirty()
                 || realm.array_length(h) != Some(dense_len)
                 || realm.array_length_is_readonly(h)
+                || realm.array_is_non_extensible(h)
             {
                 return None;
             }
@@ -497,12 +498,10 @@ pub(super) fn try_call(
             let pos = int_arg(arg(1))?.map_or(default, |n| (n.max(0.0) as usize).min(units));
             NanBox::boolean(match site.op {
                 FastOp::StrStartsWith => {
-                    let start = crate::nbexec::unit_to_byte(bytes, pos);
-                    bytes.len() - start >= pat.len() && bytes[start..start + pat.len()] == *pat
+                    crate::nbexec::starts_with_at_units(bytes, pat, pos, rope.is_ascii())
                 }
                 FastOp::StrEndsWith => {
-                    let end = crate::nbexec::unit_to_byte(bytes, pos);
-                    end >= pat.len() && bytes[end - pat.len()..end] == *pat
+                    crate::nbexec::ends_with_at_units(bytes, pat, pos, rope.is_ascii())
                 }
                 _ => crate::nbexec::index_of_units(bytes, pat, pos, rope.is_ascii()) >= 0.0,
             })

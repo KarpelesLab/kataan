@@ -102,33 +102,6 @@ impl Interp {
         // unwrapped) — consume the one-shot flag so it applies only to this call.
         let array_proto_generic = core::mem::take(&mut self.array_proto_generic);
 
-        // Array methods are dispatched by name, which is only sound while
-        // `%Array.prototype%` still holds the built-in of that name. Once user code
-        // has replaced one (`Array.prototype.toString = Object.prototype.toString`),
-        // the call has to resolve the property and invoke whatever is there.
-        //
-        // `replaced_dispatch` guards the re-entry: resolving the name may yield a
-        // built-in marker whose own call path routes back here with the same
-        // receiver and name, which must then take the ordinary dispatch below
-        // rather than look the name up a second time. Keying on the pair (rather
-        // than a bare flag) still lets a replacement call a *different* replaced
-        // method, or the same one on another object.
-        if !array_proto_generic
-            && self.realm.proto_replaced(method)
-            && let Some(h) = recv.as_handle().map(Handle::from_raw)
-            && !self
-                .replaced_dispatch
-                .contains(&(h.to_raw(), method.into()))
-        {
-            let f = self.read_member(h, method)?;
-            if self.is_callable_value(f) {
-                self.replaced_dispatch.push((h.to_raw(), method.into()));
-                let out = self.call_with_this(f, recv, args);
-                self.replaced_dispatch.pop();
-                return out.map(Some);
-            }
-        }
-
         // `push` on a plain dense array — the hottest built-in call there is —
         // served before the long by-name cascade below, every step of which is a
         // probe for some other receiver kind (wrappers, iterators, DataViews,
@@ -137,13 +110,13 @@ impl Interp {
         // unusual (an index side table, a widened or read-only length, an
         // inherited index accessor) falls through to it unchanged.
         if method == "push"
-            && !array_proto_generic
             && let Some(h) = recv.as_handle().map(Handle::from_raw)
             && let Some(dense_len) = self.realm.array_elements(h).map(<[_]>::len)
             && !self.realm.array_has_index_overrides(h)
             && !self.realm.proto_index_accessor_dirty()
             && self.realm.array_length(h) == Some(dense_len)
             && !self.realm.array_length_is_readonly(h)
+            && !self.realm.array_is_non_extensible(h)
         {
             let mut len = dense_len;
             for a in args {
@@ -188,7 +161,8 @@ impl Interp {
         {
             let join = self.read_member(h, "join")?;
             if self.is_callable_value(join) {
-                return self.call_with_this(join, recv, args).map(Some);
+                // `Call(func, array)`: no arguments are forwarded.
+                return self.call_with_this(join, recv, &[]).map(Some);
             }
             let tag = self.object_string_tag(h)?;
             return Ok(Some(self.new_str(&alloc::format!("[object {tag}]"))));
@@ -517,57 +491,7 @@ impl Interp {
                         let m = self.new_str("toFixed() digits argument must be between 0 and 100");
                         return Err(ExecError::Throw(self.make_error(N_ERROR_BASE + 2, Some(m))));
                     }
-                    let digits = f as usize;
-                    let s = if !n.is_finite() {
-                        // `Infinity`/`-Infinity`/`NaN` use the spec ToString.
-                        self.realm.to_display_string(NanBox::number(n))
-                    } else if n.abs() >= 1e21 {
-                        // Spec: a magnitude ≥ 1e21 uses the regular `ToString`
-                        // (exponential), not a full decimal expansion.
-                        self.realm.to_display_string(NanBox::number(n))
-                    } else {
-                        // Round the *exact* f64 to `digits` places. Rust's formatter is
-                        // correctly rounded but ties-to-even; JS ties away from zero.
-                        // Only an exact half (the dropped tail is precisely "5" then
-                        // zeros) differs — detect that from the value's decimal
-                        // expansion and round its magnitude up; everything else takes
-                        // Rust's already-correct rounding (so e.g. `(2.355).toFixed(2)`
-                        // is "2.35", since the double is 2.35499…, not "2.36").
-                        let expanded = alloc::format!("{:.*}", digits + 25, n.abs());
-                        let dot = expanded.find('.').unwrap_or(expanded.len());
-                        let tail = &expanded[(dot + 1 + digits).min(expanded.len())..];
-                        let exact_half = tail.starts_with('5')
-                            && tail.as_bytes()[1..].iter().all(|&b| b == b'0');
-                        if exact_half {
-                            let kept: String = expanded[..dot]
-                                .chars()
-                                .chain(expanded[dot + 1..dot + 1 + digits].chars())
-                                .collect();
-                            let m = kept.parse::<u128>().unwrap_or(0) + 1;
-                            let mut s = alloc::format!("{m}");
-                            if digits > 0 {
-                                while s.len() <= digits {
-                                    s.insert(0, '0');
-                                }
-                                s.insert(s.len() - digits, '.');
-                            }
-                            if n < 0.0 {
-                                s.insert(0, '-');
-                            }
-                            s
-                        } else {
-                            let mut s = alloc::format!("{n:.digits$}");
-                            // The spec takes the sign from `x < 0`, *not* from the
-                            // rounded digits: `(-0).toFixed(2)` is "0.00" (`-0 < 0`
-                            // is false), while a tiny negative that rounds to zero
-                            // keeps its sign — `(-Number.MIN_VALUE).toFixed(0)` is
-                            // "-0". So strip the sign only for an actual ±0.
-                            if n == 0.0 && s.starts_with('-') {
-                                s.remove(0);
-                            }
-                            s
-                        }
-                    };
+                    let s = number_to_fixed(n, f as usize);
                     Some(self.new_str(&s))
                 }
                 // `toExponential(d)` — exponential notation with `d` fractional
@@ -2416,10 +2340,9 @@ impl Interp {
                         (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize).min(units)
                     };
                     // A prefix match at exactly `pos` units.
-                    let start_byte = unit_to_byte(bytes, pos);
-                    let matched = bytes.len() - start_byte >= needle.len()
-                        && bytes[start_byte..start_byte + needle.len()] == needle[..];
-                    Some(NanBox::boolean(matched))
+                    Some(NanBox::boolean(starts_with_at_units(
+                        bytes, &needle, pos, ascii,
+                    )))
                 }
                 "endsWith" => {
                     if self.try_is_regexp(arg(0))? {
@@ -2435,10 +2358,9 @@ impl Interp {
                     } else {
                         (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize).min(units)
                     };
-                    let end_byte = unit_to_byte(bytes, end);
-                    let matched = end_byte >= needle.len()
-                        && bytes[end_byte - needle.len()..end_byte] == needle[..];
-                    Some(NanBox::boolean(matched))
+                    Some(NanBox::boolean(ends_with_at_units(
+                        bytes, &needle, end, ascii,
+                    )))
                 }
                 "slice" => {
                     // UTF-16-unit range, surrogate-boundary correct. Both indices are
@@ -3724,7 +3646,8 @@ impl Interp {
             && let Some(dense_len) = self.realm.array_elements(handle).map(<[_]>::len)
         {
             let overridden = self.realm.array_has_index_overrides(handle)
-                || self.realm.proto_index_accessor_dirty();
+                || self.realm.proto_index_accessor_dirty()
+                || self.realm.array_is_non_extensible(handle);
             let length_readonly_throw = |this: &mut Self| -> ExecError {
                 let m = this.new_str(
                     "Cannot assign to read only property 'length' of object '[object Array]'",
@@ -3870,6 +3793,7 @@ impl Interp {
             let precise_array = generic_typed
                 || (self.realm.typed_kind(handle).is_none()
                     && (self.realm.array_has_index_overrides(handle)
+                        || self.realm.array_is_non_extensible(handle)
                         || elems.iter().any(|e| e.is_hole())
                         || self.realm.proto_index_accessor_dirty()));
             match method {
@@ -6231,9 +6155,12 @@ impl Interp {
         self.read_member(handle, &alloc::format!("{i}"))
     }
 
+    /// `Set(O, ToString(i), v, true)`: a write `[[Set]]` refuses (a read-only
+    /// index, a new index on a non-extensible array) is a TypeError.
     fn array_like_set(&mut self, handle: Handle, i: usize, v: NanBox) -> Result<(), ExecError> {
-        let key = self.new_str(&alloc::format!("{i}"));
-        self.assign_member_value(handle, key, v)
+        let name = alloc::format!("{i}");
+        let key = self.new_str(&name);
+        self.set_or_throw(handle, key, &name, v)
     }
 
     /// `DeletePropertyOrThrow(O, key)` (ECMA-262 7.3.9): a `[[Delete]]` that

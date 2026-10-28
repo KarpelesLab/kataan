@@ -7493,7 +7493,7 @@ fn computed_set_walks_proxy_and_setter_prototype() {
     assert_eq!(
         run(
             "globalThis.__log=[];var pr=new Proxy({},{set(t,k,v){__log.push(k);return true}});\
-             var a=[1,2,3];Object.setPrototypeOf(a,pr);a[1]=9;a.join(',')+'|'+__log.length"
+             var a=[1,2,3];Object.setPrototypeOf(a,pr);a[1]=9;Array.prototype.join.call(a,',')+'|'+__log.length"
         ),
         "1,9,3|0"
     );
@@ -9131,9 +9131,9 @@ fn intl_formatter_subclassing() {
     );
     assert_eq!(
         run(
-            "function D(){}var f=Reflect.construct(Intl.NumberFormat,['en-US'],D);f.format(5)+','+(Object.getPrototypeOf(f)===D.prototype)"
+            "function D(){}var f=Reflect.construct(Intl.NumberFormat,['en-US'],D);Intl.NumberFormat.prototype.resolvedOptions.call(f).locale+','+(Object.getPrototypeOf(f)===D.prototype)"
         ),
-        "5,true"
+        "en-US,true"
     );
     // Direct construction unaffected.
     assert_eq!(
@@ -12585,5 +12585,89 @@ fn vm_native_string_and_function_sites() {
     assert_eq!(
         run(src),
         "bc,aé,false,false,c,aé,false,false,aébc,aé,false,false,ébc,é,false,false,bc,,true,false,c,b,false,true,,bc,false,false,,bc,false,false,object|7|0|,object|7|0|,object|7||,object|7|1|,object|7|1|,own,R,object|7|2|,R,R,object|7|3|,own,A😀,true,B😀,true,F,true,F,true"
+    );
+}
+
+/// A method call runs whatever `[[Get]]` finds on each built-in prototype: the built-in, a replacement, a getter, nothing (deleted) or a non-callable.
+#[test]
+fn method_calls_resolve_through_get() {
+    let src = r#"
+        var out = [];
+        function t(f) { try { out.push(String(f())); } catch (e) { out.push(e.constructor.name); } }
+        var cases = [
+            [Array.prototype, "join", function () { return [1, 2].join(); }],
+            [String.prototype, "trim", function () { return " a ".trim(); }],
+            [Number.prototype, "toFixed", function () { return (1.5).toFixed(1); }],
+            [Boolean.prototype, "toString", function () { return true.toString(); }],
+            [Map.prototype, "get", function () { return new Map([[1, 2]]).get(1); }],
+            [Set.prototype, "has", function () { return new Set([1]).has(1); }],
+            [Date.prototype, "getTime", function () { return new Date(0).getTime(); }],
+            [RegExp.prototype, "test", function () { return /a/.test("a"); }],
+            [Object.getPrototypeOf(Uint8Array.prototype), "join", function () { return new Uint8Array(2).join(); }],
+            [Error.prototype, "toString", function () { return new Error("x").toString(); }],
+            [Function.prototype, "call", function () { return (function () { return 1; }).call(); }],
+            [Promise.prototype, "then", function () { return typeof Promise.resolve().then(); }],
+            [Object, "keys", function () { return Object.keys({ a: 1 }).length; }],
+            [JSON, "stringify", function () { return JSON.stringify(1); }],
+        ];
+        for (var i = 0; i < cases.length; i++) {
+            var c = cases[i];
+            var p = c[0], k = c[1], f = c[2], d = Object.getOwnPropertyDescriptor(p, k);
+            t(f);
+            p[k] = function () { return "R"; }; t(f);
+            Object.defineProperty(p, k, { get: function () { return function () { return "G"; }; }, configurable: true }); t(f);
+            delete p[k]; t(f);
+            Object.defineProperty(p, k, { value: 42, writable: true, configurable: true }); t(f);
+            Object.defineProperty(p, k, d); t(f);
+        }
+        out.join(",")
+    "#;
+    assert_eq!(
+        run(src),
+        r#"1,2,R,G,TypeError,TypeError,1,2,a,R,G,TypeError,TypeError,a,1.5,R,G,TypeError,TypeError,1.5,true,R,G,[object Boolean],TypeError,true,2,R,G,TypeError,TypeError,2,true,R,G,TypeError,TypeError,true,0,R,G,TypeError,TypeError,0,true,R,G,TypeError,TypeError,true,0,0,R,G,TypeError,TypeError,0,0,Error: x,R,G,[object Error],TypeError,Error: x,1,R,G,TypeError,TypeError,1,object,string,string,TypeError,TypeError,object,1,1,1,TypeError,TypeError,1,1,R,G,TypeError,TypeError,1"#
+    );
+}
+
+/// Null and swapped prototypes, non-extensible arrays, subclass and own shadowing, held intrinsics, lone surrogates through String methods, and searches inside surrogate pairs.
+#[test]
+fn method_calls_respect_prototype_and_integrity() {
+    let src = r#"
+        var out = [];
+        function t(f) { try { out.push(String(f())); } catch (e) { out.push(e.constructor.name); } }
+        t(function () { return Object.create(null).hasOwnProperty("a"); });
+        t(function () { var a = [1]; Object.setPrototypeOf(a, null); return a.join(); });
+        t(function () { var m = new Map([[1, 2]]); Object.setPrototypeOf(m, null); return m.get(1); });
+        t(function () { var m = new Map([[1, 2]]); Object.setPrototypeOf(m, Set.prototype); return Object.getPrototypeOf(m) === Set.prototype; });
+        t(function () { var r = /a/; Object.setPrototypeOf(r, null); return r.test("a"); });
+        t(function () { var u = new Uint8Array(1); Object.setPrototypeOf(u, null); return u.join(); });
+        t(function () { var a = [1]; Object.preventExtensions(a); return a.push(2); });
+        t(function () { var a = [1]; Object.preventExtensions(a); try { a.push(2); } catch (e) {} return a.length; });
+        t(function () { var a = [1]; Object.preventExtensions(a); return a.unshift(0); });
+        t(function () { var a = [1]; Object.preventExtensions(a); return a.splice(1, 0, 2); });
+        t(function () { var a = [1, 2]; Object.preventExtensions(a); return a.pop(); });
+        t(function () { class A extends Array { join() { return "S"; } } return new A(1, 2).toString(); });
+        t(function () { var a = [1, 2]; a.join = function () { return "J"; }; return a.toString(); });
+        t(function () { return [3, 1, 2].toString(1); });
+        t(function () { return (12.5).toLocaleString(1) === Object.prototype.toLocaleString.call(12.5, 1); });
+        t(function () { var o = Array.prototype.push; Array.prototype.push = function () { return "R"; };
+                        var a = []; var r = o.call(a, 1) + ":" + a.length; Array.prototype.push = o; return r; });
+        t(function () { Object.defineProperty(Number.prototype, "gg", { get: function () { "use strict"; return function () { return typeof this; }; }, configurable: true });
+                        var r = (1).gg(); delete Number.prototype.gg; return r; });
+        t(function () { var p = new Proxy({}, { getPrototypeOf: function () { return Array.prototype; } });
+                        return Array.prototype.isPrototypeOf(p); });
+        t(function () { return "\uD800x".toString().charCodeAt(0); });
+        t(function () { return "\uD800x".valueOf().charCodeAt(0); });
+        t(function () { return new String("\uD800x").toString().charCodeAt(0); });
+        t(function () { String.prototype[Symbol.split] = function () { return "bad"; }; var r = "a,b".split(",").length; delete String.prototype[Symbol.split]; return r; });
+        var s = "😀abc", u = "😀a😀";
+        out.push([s.startsWith("\uDE00", 1), s.startsWith("abc", 1), s.startsWith("abc", 2),
+         s.endsWith("\uD83D", 1), s.endsWith("a", 2), s.includes("\uDE00", 1),
+         s.indexOf("\uDE00"), s.indexOf("a", 1), u.lastIndexOf("\uDE00", 2),
+         u.lastIndexOf("a", 1), "😀a".lastIndexOf("a", 1)].join("/"));
+        out.join(",")
+    "#;
+    assert_eq!(
+        run(src),
+        r#"TypeError,TypeError,TypeError,true,TypeError,TypeError,TypeError,1,TypeError,TypeError,2,S,J,3,1,2,true,1:1,number,true,55296,55296,55296,2,true/false/true/true/false/true/1/2/1/-1/-1"#
     );
 }

@@ -324,62 +324,62 @@ impl Interp {
         arr
     }
 
-    /// `recv.name(...args)` for a *named* key. An own property of that name wins over
-    /// the built-in by-name dispatch (so a reassigned method keeps its own
-    /// `this`-validation), a user-patched `Promise.prototype.then`/`catch`/
-    /// `finally` is honoured, a primitive receiver is boxed to find the method
-    /// but stays `this`, and anything else is an ordinary `[[Get]]` + call.
+    /// `recv.name(...args)` for a *named* key: `Call(GetV(recv, name), recv,
+    /// args)`. The method is always the value the property lookup finds — a
+    /// replaced, deleted, getter-backed or shadowed built-in is honoured, and a
+    /// receiver with no such method throws — and a built-in found there runs
+    /// through its own call path (its brand check, then its implementation).
     pub(crate) fn call_member_named(
         &mut self,
         recv: NanBox,
         name: &str,
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
-        if let Some(rh) = recv.as_handle().map(Handle::from_raw)
-            && self.realm.has_own(rh, name)
+        let f = self.get_v(recv, name)?;
+        if !f
+            .as_handle()
+            .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
         {
-            let f = self.read_member(rh, name)?;
-            if f.as_handle()
-                .map(Handle::from_raw)
-                .is_some_and(|fh| self.is_callable(fh))
-            {
-                return self.call_with_this(f, recv, args);
-            }
+            return Err(self.type_error(&alloc::format!("{name} is not a function")));
         }
-        if matches!(name, "then" | "catch" | "finally")
-            && let Some(rh) = recv.as_handle().map(Handle::from_raw)
-            && self.realm.promise_state(rh).is_some()
-        {
-            let f = self.read_member(rh, name)?;
-            if let Some(fh) = f.as_handle().map(Handle::from_raw)
-                && self.is_callable(fh)
-                && self.realm.native_at(fh).is_none()
-            {
-                return self.call_with_this(f, recv, args);
-            }
-        }
-        if let Some(result) = self.call_method(recv, name, args)? {
-            return Ok(result);
-        }
-        let Some(raw) = recv.as_handle() else {
-            if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                let m = self.new_str("cannot read property of null or undefined");
-                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-            }
-            let boxed = self.coerce_to_object(recv);
-            if let Some(bh) = boxed.as_handle().map(Handle::from_raw) {
-                let f = self.read_member(bh, name)?;
-                if f.as_handle()
-                    .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
-                {
-                    return self.call_with_this(f, recv, args);
-                }
-            }
-            let m = self.new_str("is not a function");
-            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
-        };
-        let f = self.read_member(Handle::from_raw(raw), name)?;
         self.call_with_this(f, recv, args)
+    }
+
+    /// `GetV(v, name)` (ECMA-262 7.3.3) for a named key: `[[Get]]` on
+    /// `ToObject(v)` with `v` itself as the Receiver. A primitive's lookup starts
+    /// at its prototype intrinsic (no wrapper is allocated) unless the key is
+    /// one a String wrapper owns (`length`, an index); `undefined`/`null` throw.
+    pub(crate) fn get_v(&mut self, v: NanBox, name: &str) -> Result<NanBox, ExecError> {
+        if matches!(v.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            let m = self.new_str("cannot read property of null or undefined");
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        if let Some(proto) = self.realm.primitive_proto(v) {
+            let string_own = v
+                .as_handle()
+                .is_some_and(|h| self.realm.is_string_handle(Handle::from_raw(h)))
+                && (name == "length"
+                    || (name.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                        && name
+                            .parse::<u32>()
+                            .is_ok_and(|n| alloc::format!("{n}") == name)));
+            if !string_own {
+                return match self.realm.primitive_chain_get(proto, name) {
+                    Some(crate::realm::ChainHit::Data(d)) => Ok(d),
+                    Some(crate::realm::ChainHit::Absent) => Ok(NanBox::undefined()),
+                    Some(crate::realm::ChainHit::Accessor(g, ..)) if g.is_undefined() => {
+                        Ok(NanBox::undefined())
+                    }
+                    Some(crate::realm::ChainHit::Accessor(g, ..)) => self.call_with_this(g, v, &[]),
+                    None => self.get_with_receiver(proto, name, v),
+                };
+            }
+        }
+        let obj = self.coerce_to_object(v);
+        match obj.as_handle() {
+            Some(h) => self.read_member(Handle::from_raw(h), name),
+            None => Ok(NanBox::undefined()),
+        }
     }
 
     /// `delete name` for an identifier in sloppy code: a `with`-object property,
@@ -1988,11 +1988,6 @@ impl Interp {
         {
             return Ok(NanBox::handle(buf.to_raw()));
         }
-        // Typed-array-specific methods that aren't shared with `Array.prototype`
-        // (`set`/`subarray`), exposed as readable methods.
-        if matches!(name, "set" | "subarray") && self.realm.typed_kind(handle).is_some() {
-            return Ok(self.readable_native_method(name));
-        }
         // Typed-array introspection (`byteLength`, `BYTES_PER_ELEMENT`, `byteOffset`).
         if matches!(name, "byteLength" | "BYTES_PER_ELEMENT" | "byteOffset")
             && let Some(kind) = self.realm.typed_kind(handle)
@@ -2054,12 +2049,12 @@ impl Interp {
         // A built-in primitive/exotic cell (a string, an array, a function, a
         // Map/Set) carries no explicit `[[Prototype]]` link — its chain starts at
         // the matching intrinsic prototype. Seeding the walk there (rather than
-        // leaving it to the own-property-only `builtin_proto_method` fallback
-        // below) makes an inherited *accessor* run with the primitive as `this`
-        // and lets the walk continue up to `%Object.prototype%`, so
+        // leaving it to an own-property-only fallback) makes an inherited
+        // *accessor* run with the primitive as `this` and lets the walk continue
+        // up to `%Object.prototype%`, so
         // `String.prototype.p` defined as a getter, or a method installed on
         // `Object.prototype`, is visible on `"str"`.
-        if cur.is_none() {
+        if cur.is_none() && !self.realm.has_explicit_null_proto(handle) {
             cur = self.builtin_proto_of(handle);
         }
         while let Some(p) = cur {
@@ -2114,13 +2109,6 @@ impl Interp {
             && let Some(ctor) = self.builtin_constructor_for(handle)
         {
             return Ok(ctor);
-        }
-        // A built-in array/string/function exposes its prototype's methods as
-        // first-class values — so feature detection (`if (arr.flat)`,
-        // `typeof str.padStart`) and detached-method access resolve. (Ordinary
-        // `recv.m(args)` calls dispatch via `call_method` and never reach here.)
-        if let Some(m) = self.builtin_proto_method(handle, name) {
-            return Ok(m);
         }
         Ok(direct)
     }
@@ -2197,24 +2185,9 @@ impl Interp {
                 if matches!(name, "name" | "length") {
                     return None;
                 }
-                // `read_member`'s last resort for a built-in array: its
-                // global constructor's prototype method of that name.
-                if self.realm.is_array(handle)
-                    && let Some(m) = self.builtin_proto_method(handle, name)
-                {
-                    return Some(Ok(m));
-                }
                 Ok(NanBox::undefined())
             }
         })
-    }
-
-    /// For a built-in array/string/function value, the first-class method `name`
-    /// from its constructor's prototype (`Array.prototype` etc.), or `None`.
-    pub(crate) fn builtin_proto_method(&mut self, handle: Handle, name: &str) -> Option<NanBox> {
-        let proto = self.builtin_proto_of(handle)?;
-        let m = self.realm.get_property(proto, name)?;
-        (!matches!(m.unpack(), Unpacked::Undefined)).then_some(m)
     }
 
     /// The intrinsic prototype a built-in cell with no explicit `[[Prototype]]`

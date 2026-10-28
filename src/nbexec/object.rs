@@ -1615,10 +1615,14 @@ impl Interp {
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
         if let Some(ms) = self.realm.date_at(h) {
-            return Ok(NanBox::handle(self.realm.new_date(ms).to_raw()));
+            let d = self.realm.new_date(ms);
+            if let Some(proto) = self.intrinsic_proto("Date") {
+                self.realm.set_native_proto(d, proto);
+            }
+            return Ok(NanBox::handle(d.to_raw()));
         }
         if let Some(is_set) = self.realm.collection_is_set(h) {
-            let coll = self.realm.new_collection(is_set);
+            let coll = self.new_collection_object(is_set);
             let cbox = NanBox::handle(coll.to_raw());
             seen.push((raw, cbox));
             for (k, val) in self.realm.collection_entries(h).unwrap_or_default() {

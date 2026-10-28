@@ -97,11 +97,6 @@ impl Interp {
         if !self.host_fns.is_empty() || !self.wasm_mem_objs.is_empty() {
             return false;
         }
-        // A built-in prototype method dispatch is in flight (its receiver lives in
-        // a Rust local).
-        if !self.replaced_dispatch.is_empty() {
-            return false;
-        }
         // `$262.agent`: reports, broadcasts and waiters are cross-agent state.
         if !self.agent.reports.is_empty()
             || !self.agent.broadcasts.is_empty()

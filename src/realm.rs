@@ -175,14 +175,6 @@ pub struct Realm {
     /// 1.5 GB). Cost here is bounded by one subject, and it is released as soon
     /// as a different one is matched.
     regex_subject_units: Option<(Rope, alloc::rc::Rc<alloc::vec::Vec<u16>>)>,
-    /// Names on `%Array.prototype%` / `%Function.prototype%` that user code has
-    /// *replaced* (assigned over, or redefined). Method calls on those receivers
-    /// are normally dispatched by name straight to the built-in implementation;
-    /// for a replaced name the call must instead resolve the property and invoke
-    /// whatever is there. Only genuine overwrites are recorded — installing a name
-    /// that was not already present (realm boot, or a brand-new
-    /// `Array.prototype.mine`) already goes through ordinary lookup.
-    proto_replaced: alloc::collections::BTreeSet<alloc::string::String>,
     /// How many times [`swap_cell_state`](Realm::swap_cell_state) has moved one
     /// cell's contents into another handle: a cache that identifies objects by
     /// handle and key epoch (`builtins_fast::ChainKeyCache`) is only valid
@@ -301,6 +293,11 @@ pub struct Realm {
     /// The realm's `%BigInt.prototype%` intrinsic — the `[[Prototype]]` of
     /// every `Cell::BigInt` primitive (BigInt primitives are immutable).
     bigint_proto_intrinsic: Option<Handle>,
+    /// The realm's `%Number.prototype%` and `%Boolean.prototype%` intrinsics —
+    /// where a method lookup on a Number / Boolean primitive starts (GetV
+    /// boxes the primitive; a lookup needs only the box's `[[Prototype]]`).
+    number_proto_intrinsic: Option<Handle>,
+    boolean_proto_intrinsic: Option<Handle>,
     /// The lazily-materialized `.prototype` objects of the `Intl` service
     /// constructors (`Intl.NumberFormat`, `Intl.Collator`, …, `Intl.Locale`,
     /// `Intl.DurationFormat`), keyed by the constructor's native dispatch id. Each
@@ -550,6 +547,10 @@ pub struct RealmIntrinsics {
     pub string_proto: Option<Handle>,
     /// `%BigInt.prototype%` — the `[[Prototype]]` of a `BigInt` primitive.
     pub bigint_proto: Option<Handle>,
+    /// `%Number.prototype%`.
+    pub number_proto: Option<Handle>,
+    /// `%Boolean.prototype%`.
+    pub boolean_proto: Option<Handle>,
     /// The shared abstract `%TypedArray%` intrinsic constructor.
     pub typed_array: Option<Handle>,
     /// The realm's single `%ThrowTypeError%` intrinsic.
@@ -617,7 +618,6 @@ impl Realm {
             nonwritable_array_lengths: alloc::collections::BTreeSet::new(),
             proto_index_accessor_dirty: false,
             regex_subject_units: None,
-            proto_replaced: alloc::collections::BTreeSet::new(),
             cell_swaps: 0,
             #[cfg(feature = "regex")]
             regex_programs: core::cell::RefCell::new(alloc::vec::Vec::new()),
@@ -642,6 +642,8 @@ impl Realm {
             symbol_proto_intrinsic: None,
             string_proto_intrinsic: None,
             bigint_proto_intrinsic: None,
+            number_proto_intrinsic: None,
+            boolean_proto_intrinsic: None,
             intl_protos: alloc::collections::BTreeMap::new(),
             host_persistent: Vec::new(),
             jit_shadow_roots: Vec::new(),
@@ -798,6 +800,8 @@ impl Realm {
             symbol_proto: self.symbol_proto_intrinsic,
             string_proto: self.string_proto_intrinsic,
             bigint_proto: self.bigint_proto_intrinsic,
+            number_proto: self.number_proto_intrinsic,
+            boolean_proto: self.boolean_proto_intrinsic,
             typed_array: self.typed_array_intrinsic,
             throw_type_error: self.throw_type_error_intrinsic,
         }
@@ -816,6 +820,8 @@ impl Realm {
         self.symbol_proto_intrinsic = s.symbol_proto;
         self.string_proto_intrinsic = s.string_proto;
         self.bigint_proto_intrinsic = s.bigint_proto;
+        self.number_proto_intrinsic = s.number_proto;
+        self.boolean_proto_intrinsic = s.boolean_proto;
         self.typed_array_intrinsic = s.typed_array;
         self.throw_type_error_intrinsic = s.throw_type_error;
     }
@@ -836,6 +842,42 @@ impl Realm {
     /// for every `Cell::BigInt` primitive.
     pub fn set_bigint_proto_intrinsic(&mut self, handle: Handle) {
         self.bigint_proto_intrinsic = Some(handle);
+    }
+
+    /// Records the realm's `%Number.prototype%` and `%Boolean.prototype%`
+    /// intrinsics (see [`Self::primitive_proto`]).
+    pub fn set_number_boolean_proto_intrinsics(
+        &mut self,
+        number: Option<Handle>,
+        boolean: Option<Handle>,
+    ) {
+        self.number_proto_intrinsic = number;
+        self.boolean_proto_intrinsic = boolean;
+    }
+
+    /// The object a property lookup on the primitive `v` starts at — the
+    /// `[[Prototype]]` of `ToObject(v)` — without allocating the wrapper:
+    /// `%Number.prototype%`, `%Boolean.prototype%`, `%String.prototype%`,
+    /// `%Symbol.prototype%` or `%BigInt.prototype%`. `None` for an object, for
+    /// `undefined`/`null`, or before the intrinsic is set up.
+    #[must_use]
+    pub fn primitive_proto(&self, v: NanBox) -> Option<Handle> {
+        match v.unpack() {
+            crate::nanbox::Unpacked::Number(_) => self.number_proto_intrinsic,
+            crate::nanbox::Unpacked::Bool(_) => self.boolean_proto_intrinsic,
+            crate::nanbox::Unpacked::Handle(raw) => {
+                let h = Handle::from_raw(raw);
+                match self.heap.get(h)? {
+                    Cell::Symbol { .. } => self.symbol_proto_intrinsic,
+                    Cell::BigInt(_) => self.bigint_proto_intrinsic,
+                    _ if self.is_string_handle(h) && !self.aux_props.contains_key(&raw) => {
+                        self.string_proto_intrinsic
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     /// The shared abstract `%TypedArray%` intrinsic constructor, if installed.
@@ -3222,6 +3264,11 @@ impl Realm {
         if let Some(p) = self.native_protos.get(&handle.to_raw()).copied() {
             return Some(p);
         }
+        // A cell without an inline object part whose `[[Prototype]]` was set to
+        // `null` (see `set_object_proto`).
+        if self.has_explicit_null_proto(handle) {
+            return None;
+        }
         // A Symbol primitive's `[[Prototype]]` is `%Symbol.prototype%`.
         if matches!(self.heap.get(handle), Some(Cell::Symbol { .. })) {
             return self.symbol_proto_intrinsic;
@@ -3270,6 +3317,15 @@ impl Realm {
             return self.root_array_proto;
         }
         None
+    }
+
+    /// Whether `handle` — a cell with no inline object part (an array, a
+    /// callable, a Map, …) — had its `[[Prototype]]` explicitly set to `null`,
+    /// so a lookup on it must not fall back to its kind's intrinsic prototype.
+    #[must_use]
+    pub fn has_explicit_null_proto(&self, handle: Handle) -> bool {
+        !self.callable_null_protos.is_empty()
+            && self.callable_null_protos.contains(&handle.to_raw())
     }
 
     /// Whether the realm's `Object.prototype` still carries the Annex B
@@ -3325,8 +3381,18 @@ impl Realm {
         // arrays already store their intrinsic proto here via `set_native_proto`.
         if self.is_callable_cell(handle)
             || self.is_vm_function(handle)
-            || matches!(self.heap.get(handle), Some(Cell::Array(_)))
             || self.typed_kind(handle).is_some()
+            || matches!(
+                self.heap.get(handle),
+                Some(
+                    Cell::Array(_)
+                        | Cell::Promise(_)
+                        | Cell::Date(_)
+                        | Cell::RegExp { .. }
+                        | Cell::Collection { .. }
+                        | Cell::Bytes(_)
+                )
+            )
         {
             match proto {
                 Some(p) => {
@@ -3539,42 +3605,11 @@ impl Realm {
         self.proto_index_accessor_dirty
     }
 
-    /// Whether user code has replaced a built-in prototype's `key`, so a
-    /// `receiver.<key>()` call must go through the property rather than dispatch
-    /// to the built-in by name. Cheap in the overwhelmingly common case: the set
-    /// stays empty unless a program actually overwrites one.
-    #[must_use]
-    pub fn proto_replaced(&self, key: &str) -> bool {
-        !self.proto_replaced.is_empty() && self.proto_replaced.contains(key)
-    }
-
-    /// Whether `handle` is a built-in prototype whose method overwrites are
-    /// recorded for by-name dispatch (see [`Self::proto_replaced`]).
+    /// Whether `handle` is `%Array.prototype%` or `%Function.prototype%`, whose
+    /// property writes the VM leaves to the host's general path.
     #[must_use]
     pub fn is_dispatch_tracked_proto(&self, handle: Handle) -> bool {
         Some(handle) == self.array_proto_intrinsic || Some(handle) == self.function_proto_intrinsic
-    }
-
-    /// Records an overwrite of an existing named property on a tracked built-in
-    /// prototype.
-    fn note_proto_write(&mut self, handle: Handle, key: &str, value: NanBox) {
-        if Some(handle) != self.array_proto_intrinsic
-            && Some(handle) != self.function_proto_intrinsic
-        {
-            return;
-        }
-        if key.parse::<u32>().is_ok() {
-            return;
-        }
-        // Only an overwrite counts, and only one that changes the value: realm
-        // boot installs each built-in once (no prior own property), and assigning
-        // a property back to what it already held observably changes nothing.
-        match self.get_property(handle, key) {
-            Some(cur) if !cur.same_value(value) => {
-                self.proto_replaced.insert(key.into());
-            }
-            _ => {}
-        }
     }
 
     /// Whether the `length` of the array at `handle` was made non-writable via
@@ -3803,6 +3838,15 @@ impl Realm {
             }
             None => false,
         }
+    }
+
+    /// Whether the array at `handle` is non-extensible (by
+    /// `preventExtensions`, `seal` or `freeze`): it cannot grow, so a `push`
+    /// or `unshift` past its length must take the precise path that throws.
+    #[must_use]
+    pub fn array_is_non_extensible(&self, handle: Handle) -> bool {
+        !self.non_extensible_arrays.is_empty()
+            && self.non_extensible_arrays.contains(&handle.to_raw())
     }
 
     /// `arr.push(value)` — appends, returning the new length, or `None` if the
@@ -4244,6 +4288,26 @@ impl Realm {
     /// The `bool` of a hit says whether the receiver itself holds it.
     #[must_use]
     pub fn ordinary_chain_get(&self, handle: Handle, key: &str) -> Option<(ChainHit, bool)> {
+        self.chain_get_inner(handle, key, false)
+    }
+
+    /// [`ordinary_chain_get`](Self::ordinary_chain_get) for the lookup of a
+    /// method on a *primitive*, starting at its prototype intrinsic
+    /// ([`primitive_proto`](Self::primitive_proto)): `%String.prototype%`,
+    /// `%Number.prototype%` and `%Boolean.prototype%` are themselves primitive
+    /// wrappers, whose exotic own properties (a String's `length` and indices)
+    /// are never a named key, so for one the walk reads them as ordinary.
+    #[must_use]
+    pub fn primitive_chain_get(&self, start: Handle, key: &str) -> Option<ChainHit> {
+        self.chain_get_inner(start, key, true).map(|(hit, _)| hit)
+    }
+
+    fn chain_get_inner(
+        &self,
+        handle: Handle,
+        key: &str,
+        wrappers_ok: bool,
+    ) -> Option<(ChainHit, bool)> {
         let named = key != "length" && !key.as_bytes().first().is_some_and(u8::is_ascii_digit);
         let mut cur = handle;
         for depth in 0..64 {
@@ -4253,7 +4317,7 @@ impl Realm {
             }
             match self.heap.get(cur)? {
                 Cell::Object(o) => {
-                    if o.is_prim_wrapper() {
+                    if o.is_prim_wrapper() && !(wrappers_ok && named) {
                         return None;
                     }
                     if !o.has_no_accessors()
@@ -4971,7 +5035,6 @@ impl Realm {
     /// Sets own property `key` to `value` on the object at `handle`. Returns
     /// `false` if the handle is stale or the cell is not an object.
     pub fn set_property(&mut self, handle: Handle, key: &str, value: NanBox) -> bool {
-        self.note_proto_write(handle, key, value);
         let dict_threshold = self.limits.object_dictionary_threshold;
         if let Some(obj) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             obj.maybe_convert_to_dict(key, dict_threshold);
@@ -5027,7 +5090,6 @@ impl Realm {
     /// to create or overwrite a data slot even on a non-extensible/frozen object
     /// (e.g. an accessor→data conversion of a configurable property).
     pub fn force_set_property(&mut self, handle: Handle, key: &str, value: NanBox) -> bool {
-        self.note_proto_write(handle, key, value);
         let dict_threshold = self.limits.object_dictionary_threshold;
         if let Some(obj) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             obj.maybe_convert_to_dict(key, dict_threshold);
@@ -5383,6 +5445,9 @@ impl Realm {
                 self.promise_proto_intrinsic,
                 self.symbol_proto_intrinsic,
                 self.bigint_proto_intrinsic,
+                self.string_proto_intrinsic,
+                self.number_proto_intrinsic,
+                self.boolean_proto_intrinsic,
                 self.vm_array_iter.iter_proto,
                 self.vm_array_iter.next_fn,
             ]

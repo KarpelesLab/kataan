@@ -3983,7 +3983,9 @@ impl Interp {
                 // primitive (a strict getter reading `typeof this` sees "boolean",
                 // not "object").
                 let m = self.get_with_receiver(h, "toString", this)?;
-                self.call_with_this(m, this, args)?
+                // `Invoke(O, "toString")` passes no arguments: the reserved
+                // parameters are not forwarded.
+                self.call_with_this(m, this, &[])?
             }
             // `Object.prototype.valueOf` → `Return ? ToObject(this value)`: a
             // null/undefined receiver throws a TypeError, and a primitive is boxed
@@ -4089,14 +4091,16 @@ impl Interp {
                 {
                     let this = self.this_val;
                     let target = self.require_object_coercible_to_object(this, "isPrototypeOf")?;
-                    let mut cur = self.realm.object_proto(v);
+                    // Each step is `V.[[GetPrototypeOf]]()`, so a proxy on the
+                    // chain runs its `getPrototypeOf` trap.
+                    let mut cur = self.get_proto_of(v)?;
                     let mut f = false;
-                    while let Some(p) = cur {
+                    while let Some(p) = cur.as_handle().map(Handle::from_raw) {
                         if p == target {
                             f = true;
                             break;
                         }
-                        cur = self.realm.object_proto(p);
+                        cur = self.get_proto_of(p)?;
                     }
                     f
                 } else {

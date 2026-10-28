@@ -245,13 +245,6 @@ pub struct Interp {
     /// (read its own `length`/indexed properties) rather than unwrapped to its
     /// boxed primitive and dispatched as a String/Number/Boolean method.
     array_proto_generic: bool,
-    /// Receiver/name pairs whose *replaced* built-in prototype method is currently
-    /// being dispatched through the property. Resolving such a name can yield a
-    /// built-in marker whose call path re-enters `call_method` with the same pair;
-    /// this stack makes that second entry take the ordinary by-name dispatch
-    /// instead of looking the property up again forever. Empty unless a program
-    /// overwrites a built-in prototype method, so it costs nothing in normal code.
-    replaced_dispatch: Vec<(u64, alloc::string::String)>,
     /// When a *generic* array-like receiver is materialized for an iteration
     /// method (`map`/`filter`/`forEach`/`reduce`/…), this records which indices
     /// were actually *present* (`HasProperty`) on the source object, so those
@@ -1066,9 +1059,9 @@ const N_NUMBER: u16 = 4;
 const N_BOOLEAN: u16 = 5;
 const N_PARSE_INT: u16 = 6;
 const N_CONSOLE_LOG: u16 = 7;
-const N_JSON_STRINGIFY: u16 = 8;
-const N_JSON_PARSE: u16 = 27;
-const N_OBJECT_KEYS: u16 = 9;
+pub(crate) const N_JSON_STRINGIFY: u16 = 8;
+pub(crate) const N_JSON_PARSE: u16 = 27;
+pub(crate) const N_OBJECT_KEYS: u16 = 9;
 const N_OBJECT_VALUES: u16 = 10;
 pub(crate) const N_ARRAY_IS_ARRAY: u16 = 11;
 pub(crate) const N_MATH_FLOOR: u16 = 12;
@@ -1081,8 +1074,8 @@ const N_SET: u16 = 17;
 const N_MAP_SIZE: u16 = 580;
 /// `get Set.prototype.size` — a brand-checking accessor (requires `[[SetData]]`).
 const N_SET_SIZE: u16 = 581;
-const N_OBJECT_ASSIGN: u16 = 18;
-const N_OBJECT_ENTRIES: u16 = 19;
+pub(crate) const N_OBJECT_ASSIGN: u16 = 18;
+pub(crate) const N_OBJECT_ENTRIES: u16 = 19;
 const N_ARRAY_FROM: u16 = 20;
 const N_ARRAY_OF: u16 = 21;
 const N_PROMISE: u16 = 22;
@@ -2530,7 +2523,7 @@ pub(crate) const N_STRING_PROTO_FN: u16 = 245;
 /// A first-class `Number.prototype.<method>`: `thisNumberValue(this)` must yield
 /// a Number (the `this` is a Number primitive or a Number wrapper object), else a
 /// `TypeError` (so `Number.prototype.valueOf.call({})` rejects per spec).
-const N_NUMBER_PROTO_FN: u16 = 249;
+pub(crate) const N_NUMBER_PROTO_FN: u16 = 249;
 
 /// A first-class `Boolean.prototype.<method>`: `thisBooleanValue(this)` must
 /// yield a Boolean (the `this` is a Boolean primitive or a Boolean wrapper
@@ -2839,7 +2832,6 @@ impl Interp {
             new_target: NanBox::undefined(),
             reflect_new_target: None,
             array_proto_generic: false,
-            replaced_dispatch: Vec::new(),
             array_like_present: None,
             wasm_states: alloc::collections::BTreeMap::new(),
             wasm_modules: alloc::collections::BTreeMap::new(),
@@ -3506,16 +3498,7 @@ impl Interp {
         }
     }
 
-    /// A readable bound native for a call-only method `name` (dispatched in `call_method`),
-    /// so `typeof obj.method === "function"` and a detached `obj.method.call(obj, …)` work.
-    fn readable_native_method(&mut self, name: &str) -> NanBox {
-        let name_h = self.realm.new_string(name);
-        let f = self.realm.new_bound_native(N_ARRAY_PROTO_FN, name_h);
-        self.install_fn_name_length(f, name, builtin_method_arity(name));
-        NanBox::handle(f.to_raw())
-    }
-
-    /// Like [`readable_native_method`], but for an `ArrayBuffer.prototype` method
+    /// A readable bound native for an `ArrayBuffer.prototype` method
     /// whose dispatch must first reject a `this` lacking the `[[ArrayBufferData]]`
     /// internal slot (see [`N_AB_PROTO_FN`]).
     fn readable_ab_method(&mut self, name: &str) -> NanBox {
@@ -4471,6 +4454,18 @@ impl Interp {
             }
         }
         self.setup_first_class_prototype_id("Boolean", BOOLEAN_PROTO_METHODS, N_BOOLEAN_PROTO_FN);
+        let proto_of = |this: &Self, ctor: &str| {
+            this.current
+                .get(ctor)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+                .and_then(|c| this.realm.get_property(c, "prototype"))
+                .and_then(|p| p.as_handle())
+                .map(Handle::from_raw)
+        };
+        let (num_proto, bool_proto) = (proto_of(self, "Number"), proto_of(self, "Boolean"));
+        self.realm
+            .set_number_boolean_proto_intrinsics(num_proto, bool_proto);
         // `Number.prototype`/`Boolean.prototype`/`String.prototype` are themselves
         // wrapper objects with a default `[[NumberData]]`/`[[BooleanData]]`/
         // `[[StringData]]` (`+0`, `false`, `""`). They carry the matching
@@ -6998,8 +6993,7 @@ pub(crate) fn collect_block_function_names<'a>(stmts: &'a [Stmt], out: &mut Vec<
 
 /// The byte offset in WTF-8 `bytes` immediately after the first `unit` UTF-16
 /// code units (clamped to `bytes.len()`). A `unit` landing inside an astral
-/// surrogate pair rounds *down* to that character's start (a search position
-/// never splits a pair).
+/// surrogate pair rounds *up* to the end of that character.
 pub(crate) fn unit_to_byte(bytes: &[u8], unit: usize) -> usize {
     let mut units = 0;
     for (cp, off, len) in wtf8_code_point_iter(bytes) {
@@ -7010,6 +7004,66 @@ pub(crate) fn unit_to_byte(bytes: &[u8], unit: usize) -> usize {
         let _ = len;
     }
     bytes.len()
+}
+
+/// The byte offset of UTF-16 unit `unit` in WTF-8 `bytes` (clamped to the
+/// end), or `None` when the unit is the second half of a surrogate pair.
+fn unit_byte_exact(bytes: &[u8], unit: usize) -> Option<usize> {
+    let mut units = 0;
+    for (cp, off, _) in wtf8_code_point_iter(bytes) {
+        if units >= unit {
+            return (units == unit).then_some(off);
+        }
+        units += if cp >= 0x1_0000 { 2 } else { 1 };
+    }
+    (units <= unit).then_some(bytes.len())
+}
+
+/// Whether a match of the WTF-8 `needle` can start or end inside a
+/// surrogate pair of the haystack: it begins with a lone low surrogate or
+/// ends with a lone high one, so byte comparison would miss it.
+fn split_sensitive(needle: &[u8]) -> bool {
+    crate::wtf8::leading_low_surrogate(needle).is_some()
+        || crate::wtf8::trailing_high_surrogate(needle).is_some()
+}
+
+/// The UTF-16 code units of WTF-8 `bytes`.
+fn to_units(bytes: &[u8]) -> Vec<u16> {
+    crate::wtf8::utf16_units(bytes).collect()
+}
+
+/// `String.prototype.startsWith` at UTF-16 unit `pos` (already clamped to
+/// the length) over WTF-8 `hay`.
+pub(crate) fn starts_with_at_units(hay: &[u8], needle: &[u8], pos: usize, ascii: bool) -> bool {
+    if ascii {
+        return hay.len() - pos >= needle.len() && hay[pos..pos + needle.len()] == *needle;
+    }
+    match unit_byte_exact(hay, pos) {
+        Some(b) if !split_sensitive(needle) => {
+            hay.len() - b >= needle.len() && hay[b..b + needle.len()] == *needle
+        }
+        _ => {
+            let (h, n) = (to_units(hay), to_units(needle));
+            h.get(pos..pos + n.len()).is_some_and(|w| w == n.as_slice())
+        }
+    }
+}
+
+/// `String.prototype.endsWith` ending at UTF-16 unit `end` (already clamped
+/// to the length) over WTF-8 `hay`.
+pub(crate) fn ends_with_at_units(hay: &[u8], needle: &[u8], end: usize, ascii: bool) -> bool {
+    if ascii {
+        return end >= needle.len() && hay[end - needle.len()..end] == *needle;
+    }
+    match unit_byte_exact(hay, end) {
+        Some(b) if !split_sensitive(needle) => {
+            b >= needle.len() && hay[b - needle.len()..b] == *needle
+        }
+        _ => {
+            let (h, n) = (to_units(hay), to_units(needle));
+            end >= n.len() && h[end - n.len()..end] == n[..]
+        }
+    }
 }
 
 /// The number of UTF-16 code units in `bytes[..byte_off]`.
@@ -7057,6 +7111,16 @@ pub(crate) fn index_of_units(hay: &[u8], needle: &[u8], from: usize, ascii: bool
     if needle.is_empty() {
         return from as f64;
     }
+    // A needle with a lone surrogate at an edge can match half of a pair,
+    // which a WTF-8 byte search cannot see.
+    if !ascii && split_sensitive(needle) {
+        let (h, n) = (to_units(hay), to_units(needle));
+        let from = from.min(h.len());
+        return h
+            .get(from..)
+            .and_then(|t| t.windows(n.len()).position(|w| w == n.as_slice()))
+            .map_or(-1.0, |i| (from + i) as f64);
+    }
     // For an all-ASCII haystack a unit index *is* a byte index, so both
     // conversions are the identity. Walking them made `s.indexOf(x, i)` O(i),
     // and a loop over the string quadratic.
@@ -7080,6 +7144,21 @@ pub(crate) fn index_of_units(hay: &[u8], needle: &[u8], from: usize, ascii: bool
 /// in `hay` at or before unit `from` (`usize::MAX` for "anywhere"), as a unit
 /// index, or `-1`.
 fn last_index_of_units(hay: &[u8], needle: &[u8], from: usize, ascii: bool) -> f64 {
+    // A limit between the halves of a pair, or a needle with a lone surrogate
+    // at an edge: search the UTF-16 units themselves.
+    if !ascii
+        && (split_sensitive(needle) || (from != usize::MAX && unit_byte_exact(hay, from).is_none()))
+    {
+        let (h, n) = (to_units(hay), to_units(needle));
+        if n.len() > h.len() {
+            return -1.0;
+        }
+        let upper = from.min(h.len() - n.len());
+        return (0..=upper)
+            .rev()
+            .find(|&i| h[i..i + n.len()] == n[..])
+            .map_or(-1.0, |i| i as f64);
+    }
     // See `index_of_units`: for an all-ASCII haystack, unit and byte indices
     // coincide, so neither conversion needs a walk.
     let limit_byte = if from == usize::MAX {
@@ -7111,7 +7190,7 @@ fn last_index_of_units(hay: &[u8], needle: &[u8], from: usize, ascii: bool) -> f
 /// Splits WTF-8 `hay` on the non-empty WTF-8 `sep`, returning the segments as
 /// WTF-8 byte buffers (the byte-level split is exact: `sep` is well-formed
 /// WTF-8, so matches land on code-point boundaries and never split a surrogate).
-fn split_units(hay: &[u8], sep: &[u8]) -> Vec<Vec<u8>> {
+pub(crate) fn split_units(hay: &[u8], sep: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
@@ -7148,7 +7227,7 @@ fn slice_bounds(start: f64, end: Option<f64>, len: usize) -> (usize, usize) {
 /// long. `at_start == true` prepends the filler (padStart); otherwise appends
 /// (padEnd). A `target` no greater than `s`'s length, or an empty `pad`, returns
 /// `s` unchanged. Unit-length aware so an astral pad character counts as two.
-fn pad_units(s: &[u8], target: usize, pad: &[u8], at_start: bool) -> Vec<u8> {
+pub(crate) fn pad_units(s: &[u8], target: usize, pad: &[u8], at_start: bool) -> Vec<u8> {
     let len = crate::wtf8::utf16_len(s);
     if len >= target || pad.is_empty() {
         return s.to_vec();
@@ -7884,7 +7963,7 @@ fn group_thousands_str(s: &str) -> String {
 /// (multi-`char`) mappings like `ß`→`SS`. A surrogate-bearing string maps each
 /// scalar code point with `char::to_uppercase`/`to_lowercase` and re-emits any
 /// surrogate code point unchanged, building the result as WTF-8.
-fn case_map_wtf8(bytes: &[u8], upper: bool) -> alloc::vec::Vec<u8> {
+pub(crate) fn case_map_wtf8(bytes: &[u8], upper: bool) -> alloc::vec::Vec<u8> {
     // Fast path: no surrogates → valid UTF-8 → the standard `&str` mapping.
     if let Some(s) = crate::wtf8::as_str(bytes) {
         let mapped = if upper {
@@ -8178,7 +8257,7 @@ pub(crate) fn make_date_ms(
     time_clip(day_number * 86_400_000.0 + time)
 }
 
-fn int_to_radix(n: f64, radix: u32) -> String {
+pub(crate) fn int_to_radix(n: f64, radix: u32) -> String {
     const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     let neg = n < 0.0;
     let abs = if neg { -n } else { n };
@@ -10080,5 +10159,60 @@ impl Interp {
         }
         let k = self.coerce_property_key(key)?;
         Ok(self.new_str(&k))
+    }
+}
+
+/// `Number.prototype.toFixed(digits)` of the Number `n`, `digits` already
+/// validated to `0..=100`.
+#[cfg(feature = "std")]
+pub(crate) fn number_to_fixed(n: f64, digits: usize) -> String {
+    if !n.is_finite() {
+        // `Infinity`/`-Infinity`/`NaN` use the spec ToString.
+        crate::realm::js_number_string(n)
+    } else if n.abs() >= 1e21 {
+        // Spec: a magnitude ≥ 1e21 uses the regular `ToString`
+        // (exponential), not a full decimal expansion.
+        crate::realm::js_number_string(n)
+    } else {
+        // Round the *exact* f64 to `digits` places. Rust's formatter is
+        // correctly rounded but ties-to-even; JS ties away from zero.
+        // Only an exact half (the dropped tail is precisely "5" then
+        // zeros) differs — detect that from the value's decimal
+        // expansion and round its magnitude up; everything else takes
+        // Rust's already-correct rounding (so e.g. `(2.355).toFixed(2)`
+        // is "2.35", since the double is 2.35499…, not "2.36").
+        let expanded = alloc::format!("{:.*}", digits + 25, n.abs());
+        let dot = expanded.find('.').unwrap_or(expanded.len());
+        let tail = &expanded[(dot + 1 + digits).min(expanded.len())..];
+        let exact_half = tail.starts_with('5') && tail.as_bytes()[1..].iter().all(|&b| b == b'0');
+        if exact_half {
+            let kept: String = expanded[..dot]
+                .chars()
+                .chain(expanded[dot + 1..dot + 1 + digits].chars())
+                .collect();
+            let m = kept.parse::<u128>().unwrap_or(0) + 1;
+            let mut s = alloc::format!("{m}");
+            if digits > 0 {
+                while s.len() <= digits {
+                    s.insert(0, '0');
+                }
+                s.insert(s.len() - digits, '.');
+            }
+            if n < 0.0 {
+                s.insert(0, '-');
+            }
+            s
+        } else {
+            let mut s = alloc::format!("{n:.digits$}");
+            // The spec takes the sign from `x < 0`, *not* from the
+            // rounded digits: `(-0).toFixed(2)` is "0.00" (`-0 < 0`
+            // is false), while a tiny negative that rounds to zero
+            // keeps its sign — `(-Number.MIN_VALUE).toFixed(0)` is
+            // "-0". So strip the sign only for an actual ±0.
+            if n == 0.0 && s.starts_with('-') {
+                s.remove(0);
+            }
+            s
+        }
     }
 }

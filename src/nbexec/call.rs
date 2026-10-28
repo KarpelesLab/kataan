@@ -341,18 +341,21 @@ impl Interp {
                 NanBox::undefined()
             });
         }
+        // A bound native (a built-in method, a promise resolver, …) is none of
+        // the constructors or wrappers below; it dispatches further down.
+        let is_bound_native = self.realm.bound_native_at(handle).is_some();
         // `Array(...)` without `new` behaves like `new Array(...)`.
-        if self.is_array_ctor(callee) {
+        if !is_bound_native && self.is_array_ctor(callee) {
             return self.construct(callee, args);
         }
         // `Object(value)` (ToObject): `null`/`undefined` → a new object; an object is
         // returned as-is; a primitive is boxed in its wrapper.
-        if self.is_object_ctor(callee) {
+        if !is_bound_native && self.is_object_ctor(callee) {
             let v = args.first().copied().unwrap_or(NanBox::undefined());
             return Ok(self.coerce_to_object(v));
         }
         // A bound function: prepend the bound `this`/args and forward.
-        if let Some(target) = self.realm.get_property(handle, BOUND_TARGET) {
+        if !is_bound_native && let Some(target) = self.realm.get_property(handle, BOUND_TARGET) {
             let bthis = self
                 .realm
                 .get_property(handle, BOUND_THIS)
@@ -493,28 +496,26 @@ impl Interp {
             if id == N_STRING_PROTO_FN {
                 let name = self.realm.string_value(target).unwrap_or_default();
                 if name == "toString" || name == "valueOf" {
-                    // thisStringValue: a string primitive or a String wrapper.
-                    let s = if let Some(s) = this_val
+                    // thisStringValue: a string primitive or a String wrapper's
+                    // boxed string, returned as is (lone surrogates intact).
+                    let is_str = |this: &Self, v: NanBox| {
+                        v.as_handle()
+                            .is_some_and(|h| this.realm.typeof_is_string(Handle::from_raw(h)))
+                    };
+                    if is_str(self, this_val) {
+                        return Ok(this_val);
+                    }
+                    if let Some(prim) = this_val
                         .as_handle()
                         .map(Handle::from_raw)
-                        .and_then(|h| self.realm.string_value(h))
+                        .and_then(|h| self.realm.get_property(h, PRIM_WRAP))
+                        .filter(|p| is_str(self, *p))
                     {
-                        Some(s)
-                    } else {
-                        this_val
-                            .as_handle()
-                            .map(Handle::from_raw)
-                            .and_then(|h| self.realm.get_property(h, PRIM_WRAP))
-                            .and_then(|p| p.as_handle())
-                            .map(Handle::from_raw)
-                            .and_then(|ph| self.realm.string_value(ph))
-                    };
-                    let Some(s) = s else {
-                        return Err(self.type_error(&alloc::format!(
-                            "String.prototype.{name} requires that 'this' be a String"
-                        )));
-                    };
-                    return Ok(self.new_str(&s));
+                        return Ok(prim);
+                    }
+                    return Err(self.type_error(&alloc::format!(
+                        "String.prototype.{name} requires that 'this' be a String"
+                    )));
                 }
                 // RequireObjectCoercible: `undefined`/`null` `this` is a TypeError.
                 if matches!(this_val.unpack(), Unpacked::Undefined | Unpacked::Null) {
@@ -563,7 +564,9 @@ impl Interp {
                     "split" => Some("split"),
                     _ => None,
                 } && let Some(arg0) = args.first().copied()
-                    && !matches!(arg0.unpack(), Unpacked::Undefined | Unpacked::Null)
+                    // Only an Object searchValue is asked for its `@@method`: a
+                    // primitive's (inherited) one is never consulted.
+                    && self.is_object_value(arg0)
                     && let Some(argh) = arg0.as_handle().map(Handle::from_raw)
                 {
                     let sym = self.well_known_symbol(sym_name);
@@ -586,8 +589,17 @@ impl Interp {
                         return self.call_with_this(m, arg0, &call_args);
                     }
                 }
-                let s = self.coerce_to_string(this_val)?;
-                let str_recv = self.new_str(&s);
+                // `ToString(this)`: a string primitive is its own string; anything
+                // else converts (keeping lone surrogates).
+                let str_recv = if this_val
+                    .as_handle()
+                    .is_some_and(|h| self.realm.typeof_is_string(Handle::from_raw(h)))
+                {
+                    this_val
+                } else {
+                    let b = self.coerce_to_string_bytes(this_val)?;
+                    self.new_str_bytes(b)
+                };
                 return Ok(self
                     .call_method(str_recv, &name, args)?
                     .unwrap_or(NanBox::undefined()));
@@ -3306,11 +3318,21 @@ impl Interp {
                     // `new String(value)`: ToString(value) — an object runs its
                     // `toString`/`valueOf`/`@@toPrimitive` (abrupt-propagating), and a
                     // Symbol is a TypeError (unlike `String(symbol)` as a function).
-                    let s = match args.first().copied() {
-                        None => String::new(),
-                        Some(v) => self.coerce_to_string(v)?,
-                    };
-                    self.new_str(&s)
+                    // The string keeps any lone surrogate.
+                    match args.first().copied() {
+                        None => self.new_str(""),
+                        Some(v)
+                            if v.as_handle().is_some_and(|h| {
+                                self.realm.typeof_is_string(Handle::from_raw(h))
+                            }) =>
+                        {
+                            v
+                        }
+                        Some(v) => {
+                            let b = self.coerce_to_string_bytes(v)?;
+                            self.new_str_bytes(b)
+                        }
+                    }
                 }
                 _ => NanBox::boolean(
                     self.realm
