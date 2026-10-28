@@ -458,3 +458,18 @@ fn entries_values_ask_gopd_without_own_keys_trap() {
     "#;
     assert_eq!(run(src), r#"[["a",1],["b",2]]|a,b|1,2|a,b"#);
 }
+
+/// The `defineProperty` trap invariant judges the target's property by its
+/// `[[GetOwnProperty]]` descriptor: an array index made non-configurable by
+/// the trap's own `Reflect.defineProperty` is non-configurable (it read as
+/// configurable, so `Object.freeze` of a proxy over an array threw).
+#[test]
+fn define_property_invariant_sees_array_index_attributes() {
+    let src = r#"
+        var t = [1, 2, 3];
+        var p = new Proxy(t, { defineProperty(t, k, d) { return Reflect.defineProperty(t, k, d); } });
+        Object.freeze(p);
+        [Object.isFrozen(t), Object.isFrozen(p)].join()
+    "#;
+    assert_eq!(run(src), "true,true");
+}

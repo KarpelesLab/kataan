@@ -877,7 +877,15 @@ impl Interp {
                             "proxy 'defineProperty' trap result is not compatible with the target's property",
                         ));
                     }
-                    if setting_nonconf && !self.realm.property_is_non_configurable(target, key) {
+                    // Judged from the target's descriptor as `[[GetOwnProperty]]`
+                    // reports it (an array index's attributes live outside the
+                    // property table, so a raw lookup saw every index configurable).
+                    let target_conf = target_desc
+                        .as_handle()
+                        .map(Handle::from_raw)
+                        .and_then(|tdh| self.realm.get_property(tdh, "configurable"))
+                        .is_some_and(|v| self.realm.truthy(v));
+                    if setting_nonconf && target_conf {
                         return Err(self.type_error(
                             "proxy 'defineProperty' set configurable:false on a configurable target property",
                         ));
