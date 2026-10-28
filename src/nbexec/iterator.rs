@@ -319,41 +319,32 @@ impl Interp {
             .and_then(|n| n.as_number())
             .unwrap_or(0.0) as u8;
         let is_set = self.realm.collection_is_set(coll) == Some(true);
-        let entries = self.realm.collection_entries(coll).unwrap_or_default();
-        // Determine the next position: 0 if not started, else after the
-        // last-yielded key (or its recorded slot if it was since deleted).
-        let recorded_idx = self
-            .realm
-            .get_property(h, GEN_IDX)
-            .and_then(|n| n.as_number())
-            .unwrap_or(0.0) as usize;
-        let next_pos = match self.realm.get_property(h, GEN_LASTKEY) {
-            None => 0,
-            Some(last_key) => match entries
-                .iter()
-                .position(|(k, _)| self.realm.same_value_zero(*k, last_key))
-            {
-                // The last-yielded key is still at (or before) its recorded slot —
-                // a pure delete only shifts survivors left — so advance past it.
-                Some(q) if q <= recorded_idx => q + 1,
-                // Found only at a *later* slot than recorded: the key was deleted
-                // and re-added (a brand-new entry appended at the end). Treat the
-                // original as deleted and resume from its recorded slot (now the
-                // successor after the compacting delete); the re-added copy is a
-                // fresh entry that the cursor reaches later.
-                Some(_) => recorded_idx,
-                // Deleted (and not re-added): resume from the recorded slot.
-                None => recorded_idx,
-            },
+        // The cursor is the raw position of the next entry to consider: entries
+        // are deleted in place (tombstones), so it only needs rebasing after a
+        // compaction renumbered them.
+        let num = |realm: &crate::realm::Realm, slot: &str| {
+            realm
+                .get_property(h, slot)
+                .and_then(|n| n.as_number())
+                .unwrap_or(0.0)
         };
-        let Some(&(k, v)) = entries.get(next_pos) else {
+        let idx = num(&self.realm, GEN_IDX) as usize;
+        let epoch = num(&self.realm, GEN_EPOCH) as u32;
+        let last = self.realm.get_property(h, GEN_LASTKEY);
+        let (idx, now) = self.realm.collection_iter_rebase(coll, idx, epoch, last);
+        if now != epoch {
+            self.realm
+                .set_hidden_property(h, GEN_EPOCH, NanBox::number(f64::from(now)));
+        }
+        let Some((pos, k, v)) = self.realm.collection_next_live(coll, idx) else {
             self.realm
                 .set_hidden_property(h, GEN_DONE, NanBox::boolean(true));
+            self.realm.collection_iter_detach(coll);
             return Ok(self.iter_result(NanBox::undefined(), true));
         };
         self.realm.set_hidden_property(h, GEN_LASTKEY, k);
         self.realm
-            .set_hidden_property(h, GEN_IDX, NanBox::number(next_pos as f64));
+            .set_hidden_property(h, GEN_IDX, NanBox::number((pos + 1) as f64));
         let value = match kind {
             0 => k,                        // keys
             2 => self.new_iter_pair(k, v), // entries: [key, value]

@@ -116,6 +116,11 @@ impl Interp {
             .set_hidden_property(obj, GEN_COLL, NanBox::handle(coll.to_raw()));
         self.realm
             .set_hidden_property(obj, GEN_KIND, NanBox::number(f64::from(kind)));
+        let epoch = self.realm.collection_iter_attach(coll);
+        self.realm
+            .set_hidden_property(obj, GEN_IDX, NanBox::number(0.0));
+        self.realm
+            .set_hidden_property(obj, GEN_EPOCH, NanBox::number(f64::from(epoch)));
         NanBox::handle(obj.to_raw())
     }
 

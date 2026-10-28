@@ -1821,6 +1821,10 @@ impl Realm {
             is_set,
             is_weak: false,
             entries: Vec::new(),
+            live: 0,
+            iters: 0,
+            epoch: 0,
+            remaps: Vec::new(),
             index: None,
         })
     }
@@ -1892,17 +1896,18 @@ impl Realm {
         if self.collection_index_missing(handle) {
             self.collection_build_index(handle);
         }
-        let candidates = {
-            let Some(Cell::Collection { index, .. }) = self.heap.get(handle) else {
-                return None;
-            };
-            index.as_ref()?.get(&hash)?.clone()
+        let Some(Cell::Collection {
+            index: Some(map),
+            entries,
+            ..
+        }) = self.heap.get(handle)
+        else {
+            return None;
         };
-        let (_, entries) = self.heap.get(handle).and_then(Cell::as_collection)?;
-        candidates.into_iter().map(|i| i as usize).find(|&i| {
+        map.get(&hash)?.iter().map(|&i| i as usize).find(|&i| {
             entries
                 .get(i)
-                .is_some_and(|(k, _)| self.same_value_zero(*k, key))
+                .is_some_and(|(k, _)| !k.is_hole() && self.same_value_zero(*k, key))
         })
     }
 
@@ -1926,6 +1931,9 @@ impl Realm {
         let mut map: alloc::collections::BTreeMap<u64, Vec<u32>> =
             alloc::collections::BTreeMap::new();
         for (i, k) in keys.iter().enumerate() {
+            if k.is_hole() {
+                continue; // a tombstone
+            }
             map.entry(self.collection_key_hash(*k))
                 .or_default()
                 .push(i as u32);
@@ -2008,7 +2016,7 @@ impl Realm {
         // Look the key up through the hash index (built on demand), then write.
         let pos = self.collection_find(handle, key);
         let hash = self.collection_key_hash(key);
-        let Some((_, entries)) = self.heap.get_mut(handle).and_then(Cell::as_collection_mut) else {
+        let Some(Cell::Collection { entries, live, .. }) = self.heap.get_mut(handle) else {
             return false;
         };
         match pos {
@@ -2016,6 +2024,7 @@ impl Realm {
             None => {
                 let i = entries.len() as u32;
                 entries.push((key, value));
+                *live += 1;
                 self.collection_index_push(handle, hash, i);
             }
         }
@@ -2041,8 +2050,23 @@ impl Realm {
     /// Removes `key`; returns whether it was present.
     /// `Map.clear()` / `Set.clear()` — removes all entries.
     pub fn collection_clear(&mut self, handle: Handle) {
-        if let Some((_, e)) = self.heap.get_mut(handle).and_then(Cell::as_collection_mut) {
-            e.clear();
+        if let Some(Cell::Collection {
+            entries,
+            live,
+            iters,
+            ..
+        }) = self.heap.get_mut(handle)
+        {
+            if *iters == 0 {
+                entries.clear();
+            } else {
+                // An attached iterator keeps its cursor: every entry becomes a
+                // tombstone, and entries added later are appended after them.
+                for e in entries.iter_mut() {
+                    *e = (NanBox::hole(), NanBox::hole());
+                }
+            }
+            *live = 0;
         }
         self.collection_index_clear(handle);
     }
@@ -2053,26 +2077,181 @@ impl Realm {
         let Some(i) = self.collection_find(handle, key) else {
             return false;
         };
-        if let Some((_, e)) = self.heap.get_mut(handle).and_then(Cell::as_collection_mut) {
-            e.remove(i);
-            // The removal renumbers every later entry, so the index is dropped
-            // rather than patched; the next lookup rebuilds it.
-            self.collection_index_clear(handle);
-            return true;
+        let hash = self.collection_key_hash(key);
+        let Some(Cell::Collection {
+            entries,
+            live,
+            index,
+            ..
+        }) = self.heap.get_mut(handle)
+        else {
+            return false;
+        };
+        // A tombstone in place: no renumbering, so live iterators' cursors and
+        // the hash index stay valid (the index just drops this one position).
+        entries[i] = (NanBox::hole(), NanBox::hole());
+        *live -= 1;
+        if let Some(map) = index
+            && let Some(bucket) = map.get_mut(&hash)
+        {
+            bucket.retain(|&j| j as usize != i);
+            if bucket.is_empty() {
+                map.remove(&hash);
+            }
         }
-        false
+        self.collection_maybe_compact(handle);
+        true
+    }
+
+    /// Drops the tombstones once they dominate: when no live iterator is
+    /// attached (so no cursor is renumbered), or — iterators attached but
+    /// abandoned, say — once they outnumber live entries four to one. The
+    /// renumbering is kept for iterators one epoch behind.
+    fn collection_maybe_compact(&mut self, handle: Handle) {
+        let Some(Cell::Collection {
+            entries,
+            live,
+            iters,
+            epoch,
+            remaps,
+            index,
+            ..
+        }) = self.heap.get_mut(handle)
+        else {
+            return;
+        };
+        let dead = entries.len() - *live as usize;
+        let due = if *iters == 0 {
+            dead > 16 && dead > *live as usize
+        } else {
+            dead > 4 * (*live as usize) + 1024
+        };
+        if !due {
+            return;
+        }
+        let mut map = Vec::with_capacity(entries.len() + 1);
+        let mut next = 0u32;
+        for e in entries.iter() {
+            map.push(next);
+            if !e.0.is_hole() {
+                next += 1;
+            }
+        }
+        map.push(next);
+        entries.retain(|e| !e.0.is_hole());
+        if *iters > 0 {
+            if remaps.len() == 8 {
+                remaps.remove(0);
+            }
+            remaps.push((*epoch, map));
+        } else {
+            remaps.clear();
+        }
+        *epoch = epoch.wrapping_add(1);
+        *index = None;
+    }
+
+    /// Attaches a live iterator to the collection at `handle`; returns the
+    /// collection's current epoch (the iterator's cursor is in its numbering).
+    pub fn collection_iter_attach(&mut self, handle: Handle) -> u32 {
+        match self.heap.get_mut(handle) {
+            Some(Cell::Collection { iters, epoch, .. }) => {
+                *iters += 1;
+                *epoch
+            }
+            _ => 0,
+        }
+    }
+
+    /// Detaches an exhausted live iterator (see [`Realm::collection_iter_attach`]).
+    pub fn collection_iter_detach(&mut self, handle: Handle) {
+        if let Some(Cell::Collection { iters, .. }) = self.heap.get_mut(handle) {
+            *iters = iters.saturating_sub(1);
+        }
+    }
+
+    /// Brings a live iterator's cursor `idx` from epoch `from` to the
+    /// collection's current numbering: exact across one compaction; across
+    /// more, past the last-yielded key `last` when it is still present, else
+    /// clamped. Returns `(cursor, current epoch)`.
+    pub fn collection_iter_rebase(
+        &mut self,
+        handle: Handle,
+        idx: usize,
+        from: u32,
+        last: Option<NanBox>,
+    ) -> (usize, u32) {
+        let (now, exact) = match self.heap.get(handle) {
+            Some(Cell::Collection {
+                epoch,
+                remaps,
+                entries,
+                ..
+            }) => {
+                if *epoch == from {
+                    return (idx, from);
+                }
+                // Carry the cursor through each recorded compaction since `from`.
+                let exact = remaps.iter().position(|(e, _)| *e == from).map(|start| {
+                    remaps[start..]
+                        .iter()
+                        .fold(idx, |i, (_, m)| m[i.min(m.len() - 1)] as usize)
+                });
+                (*epoch, exact.map(|i| i.min(entries.len())))
+            }
+            _ => return (idx, from),
+        };
+        if let Some(i) = exact {
+            return (i, now);
+        }
+        let len = self.collection_raw_len(handle);
+        let i = last
+            .and_then(|k| self.collection_find(handle, k))
+            .map_or(idx.min(len), |q| q + 1);
+        (i, now)
+    }
+
+    /// The length of the raw entry list (live entries plus tombstones).
+    fn collection_raw_len(&self, handle: Handle) -> usize {
+        match self.heap.get(handle) {
+            Some(Cell::Collection { entries, .. }) => entries.len(),
+            _ => 0,
+        }
+    }
+
+    /// The first live entry at raw position `from` or later, as
+    /// `(position, key, value)`; `None` once the end is reached.
+    #[must_use]
+    pub fn collection_next_live(
+        &self,
+        handle: Handle,
+        from: usize,
+    ) -> Option<(usize, NanBox, NanBox)> {
+        let Some(Cell::Collection { entries, .. }) = self.heap.get(handle) else {
+            return None;
+        };
+        entries
+            .iter()
+            .enumerate()
+            .skip(from)
+            .find(|(_, e)| !e.0.is_hole())
+            .map(|(i, &(k, v))| (i, k, v))
     }
 
     /// The number of entries, or `None` if not a collection.
     #[must_use]
     pub fn collection_size(&self, handle: Handle) -> Option<usize> {
-        Some(self.heap.get(handle)?.as_collection()?.1.len())
+        match self.heap.get(handle)? {
+            Cell::Collection { live, .. } => Some(*live as usize),
+            _ => None,
+        }
     }
 
     /// A snapshot of the collection's entries (for iteration / `forEach`).
     #[must_use]
     pub fn collection_entries(&self, handle: Handle) -> Option<Vec<(NanBox, NanBox)>> {
-        Some(self.heap.get(handle)?.as_collection()?.1.to_vec())
+        let (_, entries) = self.heap.get(handle)?.as_collection()?;
+        Some(entries.iter().copied().filter(|e| !e.0.is_hole()).collect())
     }
 
     /// Whether the collection at `handle` is a `Set` (vs a `Map`).

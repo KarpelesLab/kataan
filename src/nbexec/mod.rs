@@ -2278,6 +2278,8 @@ const GEN_COLL: &str = "\u{0}gcoll";
 const GEN_KIND: &str = "\u{0}gkind";
 const GEN_LASTKEY: &str = "\u{0}glast";
 const GEN_DONE: &str = "\u{0}gdone";
+/// A live Set/Map iterator's collection epoch (see `Realm::collection_iter_rebase`).
+const GEN_EPOCH: &str = "\u{0}gepoch";
 /// Hidden slot on a **live** typed-array iterator: the typed-array handle. Its
 /// `next()` re-reads the live length (`typed_len`) and each element by index, so
 /// growing/shrinking the backing resizable buffer — or writing an element —

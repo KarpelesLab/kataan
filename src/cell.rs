@@ -336,8 +336,24 @@ pub enum Cell {
         /// Whether this is a `WeakMap`/`WeakSet` (keys must be objects/symbols).
         is_weak: bool,
         /// The entries, in insertion order, compared by `SameValueZero`-ish
-        /// strict equality.
+        /// strict equality. A deleted entry stays in place as a tombstone
+        /// (`(hole, hole)`), so a live iterator's index cursor stays valid; the
+        /// list is compacted only when tombstones dominate (see `epoch`).
         entries: Vec<(NanBox, NanBox)>,
+        /// The number of live (non-tombstone) entries — the collection's `size`.
+        live: u32,
+        /// Live iterators attached and not yet exhausted. Compaction (which
+        /// renumbers entries) waits for zero unless tombstones pile up.
+        iters: u32,
+        /// Bumped by every compaction; an iterator remembers the epoch its
+        /// cursor belongs to.
+        epoch: u32,
+        /// The renumberings of the most recent compactions made while iterators
+        /// were attached, as `(epoch before, map)` with `map[old] = new index of
+        /// the first live entry at or after old`, so a cursor a few epochs
+        /// behind is carried forward exactly (bounded; older cursors fall back
+        /// to re-finding the last-yielded key).
+        remaps: Vec<(u32, Vec<u32>)>,
         /// Lazily-built lookup index: a `SameValueZero`-compatible key hash to
         /// the indices in `entries` that hash to it (collisions are resolved by
         /// re-checking with the real equality, so the hash only has to be
