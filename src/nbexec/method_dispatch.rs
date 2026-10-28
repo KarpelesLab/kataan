@@ -5796,6 +5796,19 @@ impl Interp {
             ));
         }
         if live {
+            // A present slot of a plain dense array with no per-index side table
+            // (no accessor or attribute override; freezing or sealing does not
+            // change a read) is an own data property: `HasProperty` is true and `[[Get]]` is the slot
+            // itself, so skip formatting the key and the generic lookups.
+            if !self.realm.array_has_index_side_table(handle)
+                && let Some(v) = self
+                    .realm
+                    .array_elements(handle)
+                    .and_then(|a| a.get(i).copied())
+                && !v.is_hole()
+            {
+                return Ok(Some(v));
+            }
             let key = alloc::format!("{i}");
             if skip_holes && !self.has_property(handle, &key) {
                 return Ok(None);

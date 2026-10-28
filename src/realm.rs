@@ -23,6 +23,8 @@
 //! [`NanBox`]: crate::nanbox::NanBox
 //! [`Handle`]: crate::heap::Handle
 
+mod handle_map;
+
 use crate::atom::{Atom, AtomTable};
 use crate::cell::Cell;
 use crate::gc::{self, Stats};
@@ -104,7 +106,7 @@ pub struct Realm {
     /// which have no inline object part. Keyed by the cell's handle. Not a GC root
     /// and not relocated on a moving collection — sound only because collection is
     /// never driven mid-execution (see `[[latent-engine-conformance-bugs]]`).
-    aux_props: alloc::collections::BTreeMap<u64, Handle>,
+    aux_props: handle_map::HandleKeyedMap<Handle>,
     /// Literal source text of a user function/method/arrow/class, keyed by the
     /// callable's handle — the exact byte slice of the defining production (the
     /// `function`/`get`/`set`/`*`/`async`/`class` keyword or method key through
@@ -545,7 +547,7 @@ impl Realm {
             symbols_by_id: alloc::collections::BTreeMap::new(),
             fn_protos: alloc::collections::BTreeMap::new(),
             fn_ctor: alloc::collections::BTreeMap::new(),
-            aux_props: alloc::collections::BTreeMap::new(),
+            aux_props: handle_map::HandleKeyedMap::new(),
             fn_source: alloc::collections::BTreeMap::new(),
             length_tracking_views: alloc::collections::BTreeSet::new(),
             host_exotic: alloc::collections::BTreeSet::new(),
@@ -3114,7 +3116,7 @@ impl Realm {
         }
         self.heap.swap(a, b);
         let (ka, kb) = (a.to_raw(), b.to_raw());
-        swap_map_entry(&mut self.aux_props, ka, kb);
+        self.aux_props.swap_entries(ka, kb);
         swap_map_entry(&mut self.native_protos, ka, kb);
         swap_map_entry(&mut self.native_class_tags, ka, kb);
         swap_map_entry(&mut self.sparse_array_lengths, ka, kb);
@@ -3463,6 +3465,16 @@ impl Realm {
         self.frozen_arrays.contains(&raw)
             || self.sealed_arrays.contains(&raw)
             || self.aux_props.contains_key(&raw)
+    }
+
+    /// Whether the array at `handle` has a per-index side table (an accessor or
+    /// attribute override on some index). Unlike
+    /// [`array_has_index_overrides`](Realm::array_has_index_overrides) it ignores
+    /// frozen/sealed, which change writes but not reads: without a side table a
+    /// present dense slot *is* the index's `[[Get]]` result.
+    #[must_use]
+    pub fn array_has_index_side_table(&self, handle: Handle) -> bool {
+        self.aux_props.contains_key(&handle.to_raw())
     }
 
     /// Whether the array index `i` carries a *non-default* own attribute or an
@@ -4969,7 +4981,7 @@ impl Realm {
     fn ephemeron_expand(
         heap: &Heap<Cell>,
         marked: &gc::MarkSet,
-        aux_props: &alloc::collections::BTreeMap<u64, Handle>,
+        aux_props: &handle_map::HandleKeyedMap<Handle>,
         fn_protos: &alloc::collections::BTreeMap<u32, Handle>,
         fn_ctor: &alloc::collections::BTreeMap<u32, Handle>,
         symbols_by_id: &alloc::collections::BTreeMap<u64, Handle>,
@@ -5022,7 +5034,7 @@ impl Realm {
     fn ephemeron_prune(
         marked: &gc::MarkSet,
         key_collectable: &dyn Fn(Handle) -> bool,
-        aux_props: &mut alloc::collections::BTreeMap<u64, Handle>,
+        aux_props: &mut handle_map::HandleKeyedMap<Handle>,
         fn_protos: &mut alloc::collections::BTreeMap<u32, Handle>,
         fn_ctor: &mut alloc::collections::BTreeMap<u32, Handle>,
         symbols_by_id: &mut alloc::collections::BTreeMap<u64, Handle>,
