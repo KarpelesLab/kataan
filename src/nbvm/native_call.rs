@@ -137,8 +137,9 @@ enum FastOp {
     #[cfg(feature = "std")]
     Math(u16),
     /// A built-in whose implementation is the host's (`Object.assign`,
-    /// `JSON.stringify`, `JSON.parse`): the resolved function is called
-    /// through the host directly, with no by-name re-resolution.
+    /// `JSON.stringify`, `JSON.parse`, and every built-in not served
+    /// otherwise): the resolved function is called through the host
+    /// directly, with no by-name re-resolution.
     HostDirect,
 }
 
@@ -168,7 +169,7 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         _ => {}
     }
     let Some((id, target)) = realm.bound_native_at(f) else {
-        return FastOp::None;
+        return other_native(realm, f);
     };
     // A readable static method binds `[constructor, name]`; only `String`
     // has a `fromCharCode`.
@@ -180,7 +181,7 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
             .and_then(|n| realm.string_leaf_bytes(Handle::from_raw(n)))
         {
             Some(b"fromCharCode") => FastOp::StrFromCharCode,
-            _ => FastOp::None,
+            _ => FastOp::HostDirect,
         };
     }
     let Some(name) = realm.string_leaf_bytes(target) else {
@@ -225,9 +226,20 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_ARRAY_PROTO_FN, b"call") => FastOp::FnCall,
         (N_ARRAY_PROTO_FN, b"apply") => FastOp::FnApply,
         (N_ARRAY_PROTO_FN, n) => {
-            super::array_hof::hof_for(n).map_or(FastOp::None, FastOp::ArrayHof)
+            super::array_hof::hof_for(n).map_or(FastOp::HostDirect, FastOp::ArrayHof)
         }
-        _ => FastOp::None,
+        _ => FastOp::HostDirect,
+    }
+}
+
+/// Any other built-in function: called through the host directly
+/// ([`FastOp::HostDirect`]) — exactly the general path's `Call(method, recv,
+/// args)` once its `[[Get]]` (which the site proves) is done.
+fn other_native(realm: &Realm, f: Handle) -> FastOp {
+    if realm.is_callable_cell(f) {
+        FastOp::HostDirect
+    } else {
+        FastOp::None
     }
 }
 
@@ -684,6 +696,16 @@ pub(super) fn try_call(
                     None => return None,
                 }
             };
+            // A callee with a compiled body is entered directly, as a
+            // compiled caller's `f(...)` enters it.
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            if let Some(r) =
+                super::jit_tier::call_compiled_with(ctx, funcs, Some(regs), recv, this, |buf| {
+                    buf.extend_from_slice(&argv)
+                })
+            {
+                return Some(r);
+            }
             return Some(call_vm(ctx, funcs, regs, recv, this, &argv));
         }
         FastOp::RegExpCall | FastOp::HostDirect => {

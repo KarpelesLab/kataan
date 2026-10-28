@@ -7199,12 +7199,27 @@ mod exec {
         ret
     }
 
-    /// A page-aligned, executable code region. Maps RW, copies the code, then
-    /// flips to RX (W^X); unmaps on drop.
+    /// An executable code region of its own pages. Maps RW, copies the code,
+    /// then flips to RX (W^X); unmaps on drop.
+    ///
+    /// The code does not start at the page boundary but at a per-buffer
+    /// offset that rotates through the page in cache-line steps ("cache
+    /// colouring"): every body starting at offset 0 would put all their entry
+    /// paths (and their hot loops, at similar offsets) into the same few
+    /// instruction-cache sets, which evict each other. The code is position
+    /// independent (it reaches anything outside itself by absolute address).
     pub(super) struct ExecBuffer {
+        base: *mut u8,
         ptr: *mut u8,
         len: usize,
     }
+
+    /// The colour of the next buffer (see [`ExecBuffer`]).
+    static NEXT_COLOUR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+    /// Cache lines between successive buffers' start offsets (odd, so the
+    /// offsets cycle through every line of a page).
+    const COLOUR_STEP_LINES: usize = 13;
 
     impl ExecBuffer {
         /// Maps `code` into a fresh executable region, or `None` on failure.
@@ -7213,7 +7228,9 @@ mod exec {
                 return None;
             }
             let page = 4096;
-            let len = code.len().div_ceil(page) * page;
+            let colour = NEXT_COLOUR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let offset = (colour * COLOUR_STEP_LINES * 64) % page;
+            let len = (offset + code.len()).div_ceil(page) * page;
             // mmap(NULL, len, PROT_RW, MAP_PRIVATE|ANON, -1, 0)
             // SAFETY: a standard anonymous mmap; the kernel returns a new mapping
             // or a small negative errno.
@@ -7233,27 +7250,30 @@ mod exec {
             if (-4095..0).contains(&raw) {
                 return None;
             }
-            let ptr = raw as *mut u8;
-            // SAFETY: `ptr` points to `len` freshly-mapped writable bytes and
-            // `code.len() <= len`; the regions do not overlap.
+            let base = raw as *mut u8;
+            // SAFETY: `offset < page <= len`, inside the mapping.
+            #[allow(unsafe_code)]
+            let ptr = unsafe { base.add(offset) };
+            // SAFETY: `ptr` points to `len - offset` freshly-mapped writable
+            // bytes and `code.len() <= len - offset`; the regions do not overlap.
             #[allow(unsafe_code)]
             unsafe {
                 core::ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len());
             }
-            // mprotect(ptr, len, PROT_RX): drop write, gain execute (W^X).
-            // SAFETY: `ptr`/`len` describe the mapping just created.
+            // mprotect(base, len, PROT_RX): drop write, gain execute (W^X).
+            // SAFETY: `base`/`len` describe the mapping just created.
             #[allow(unsafe_code)]
-            let prot = unsafe { syscall6(SYS_MPROTECT, ptr as usize, len, PROT_RX, 0, 0, 0) };
+            let prot = unsafe { syscall6(SYS_MPROTECT, base as usize, len, PROT_RX, 0, 0, 0) };
             if prot < 0 {
                 // Best-effort unmap before bailing.
                 // SAFETY: unmapping the mapping we own.
                 #[allow(unsafe_code)]
                 unsafe {
-                    syscall6(SYS_MUNMAP, ptr as usize, len, 0, 0, 0, 0);
+                    syscall6(SYS_MUNMAP, base as usize, len, 0, 0, 0, 0);
                 }
                 return None;
             }
-            Some(Self { ptr, len })
+            Some(Self { base, ptr, len })
         }
 
         /// The executable code pointer.
@@ -7268,7 +7288,7 @@ mod exec {
             // SAFETY: unmapping exactly the region this buffer owns.
             #[allow(unsafe_code)]
             unsafe {
-                syscall6(SYS_MUNMAP, self.ptr as usize, self.len, 0, 0, 0, 0);
+                syscall6(SYS_MUNMAP, self.base as usize, self.len, 0, 0, 0, 0);
             }
         }
     }

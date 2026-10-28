@@ -771,7 +771,15 @@ pub(crate) extern "C" fn jit_helper_exec_op(
         let key = core::ptr::from_ref(op) as usize;
         let mut ic = core::mem::take(&mut ctx.exec_op_ic);
         ic.clear();
-        ic.push(ctx.exec_op_ics.remove(&key).unwrap_or_default());
+        // Taken out of its entry, not removed (no tree rebalancing per run);
+        // a reentrant run of the same op meanwhile sees an empty cache, as
+        // a removed entry would show it.
+        ic.push(
+            ctx.exec_op_ics
+                .get_mut(&key)
+                .map(core::mem::take)
+                .unwrap_or_default(),
+        );
         let r = super::run_frame_at_ic(
             ctx,
             funcs,
@@ -783,7 +791,12 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             &mut ic,
         );
         if let Some(c) = ic.pop() {
-            ctx.exec_op_ics.insert(key, c);
+            match ctx.exec_op_ics.get_mut(&key) {
+                Some(slot) => *slot = c,
+                None => {
+                    ctx.exec_op_ics.insert(key, c);
+                }
+            }
         }
         ctx.exec_op_ic = ic;
         r
@@ -833,7 +846,7 @@ fn call_compiled(
 /// Rust frame that holds values the collector cannot see (`None`: a getter
 /// call from a property helper), not, which declines collection inside the
 /// callee exactly as the ordinary call from there does.
-fn call_compiled_with(
+pub(super) fn call_compiled_with(
     ctx: &mut Ctx,
     funcs: &[FnProto],
     publish: Option<&[NanBox]>,
