@@ -530,11 +530,7 @@ pub(super) fn try_call(
             match (site.op, unit) {
                 (FastOp::StrCharCodeAt, Some(u)) => NanBox::number(f64::from(u)),
                 (FastOp::StrCharCodeAt, None) => NanBox::number(f64::NAN),
-                (_, Some(u)) => NanBox::handle(
-                    realm
-                        .new_string_wtf8(crate::wtf8::from_utf16(&[u]))
-                        .to_raw(),
-                ),
+                (_, Some(u)) => NanBox::handle(realm.unit_string(u).to_raw()),
                 (_, None) => NanBox::handle(realm.new_string("").to_raw()),
             }
         }
@@ -660,8 +656,12 @@ pub(super) fn try_call(
                     0
                 });
             }
-            let out = crate::wtf8::from_utf16(&units);
-            NanBox::handle(realm.new_string_wtf8(out).to_raw())
+            if let [u] = units[..] {
+                NanBox::handle(realm.unit_string(u).to_raw())
+            } else {
+                let out = crate::wtf8::from_utf16(&units);
+                NanBox::handle(realm.new_string_wtf8(out).to_raw())
+            }
         }
         FastOp::ArrayIsArray => match arg(0).as_handle().map(Handle::from_raw) {
             // A proxy is unwrapped (and may be revoked): the host's.

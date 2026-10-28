@@ -796,9 +796,13 @@ fn verify_op_with(
             reg(*dst)?;
             reg(*src)
         }
-        Op::ToStr { dst, src } => {
+        Op::ToStr { dst, src } | Op::ToStrLazy { dst, src } => {
             reg(*dst)?;
             reg(*src)
+        }
+        Op::Concat { dst, parts } => {
+            reg(*dst)?;
+            regs(parts)
         }
         Op::TemplateObject { dst, .. } => reg(*dst),
         Op::IterOpen { iter, next, src } => {
@@ -1772,6 +1776,16 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*dst, out);
             w_reg(*src, out);
         }
+        Op::ToStrLazy { dst, src } => {
+            w_u8(160, out);
+            w_reg(*dst, out);
+            w_reg(*src, out);
+        }
+        Op::Concat { dst, parts } => {
+            w_u8(161, out);
+            w_reg(*dst, out);
+            w_regs(parts, out);
+        }
         Op::TemplateObject {
             dst,
             site,
@@ -2498,6 +2512,14 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         81 => Op::ToStr {
             dst: r.reg()?,
             src: r.reg()?,
+        },
+        160 => Op::ToStrLazy {
+            dst: r.reg()?,
+            src: r.reg()?,
+        },
+        161 => Op::Concat {
+            dst: r.reg()?,
+            parts: r.regs()?,
         },
         82 => {
             let dst = r.reg()?;

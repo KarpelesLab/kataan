@@ -2466,6 +2466,10 @@ impl Interp {
             // is a single item (its own one-unit string).
             let mut out = Vec::new();
             for cp in crate::wtf8::code_points(&bytes) {
+                if cp < 256 {
+                    out.push(NanBox::handle(self.realm.unit_string(cp as u16).to_raw()));
+                    continue;
+                }
                 let mut buf = Vec::new();
                 crate::wtf8::encode_code_point(cp, &mut buf);
                 out.push(self.new_str_bytes(buf));
@@ -2995,9 +2999,14 @@ fn string_code_point_at(realm: &mut Realm, s: NanBox, idx: usize) -> Option<(Nan
     if idx >= bytes.len() {
         return None;
     }
-    let (_, n) = crate::wtf8::decode_code_point(bytes, idx);
-    let one = crate::rope::Rope::from_bytes(&bytes[idx..idx + n]);
-    let v = NanBox::handle(realm.new_string_from_rope(one).to_raw());
+    let (cp, n) = crate::wtf8::decode_code_point(bytes, idx);
+    // A Latin-1 code point is one UTF-16 unit: the realm's interned string.
+    let v = if cp < 256 {
+        NanBox::handle(realm.unit_string(cp as u16).to_raw())
+    } else {
+        let one = crate::rope::Rope::from_bytes(&bytes[idx..idx + n]);
+        NanBox::handle(realm.new_string_from_rope(one).to_raw())
+    };
     Some((v, idx + n))
 }
 

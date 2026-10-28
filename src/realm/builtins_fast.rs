@@ -120,11 +120,15 @@ impl Realm {
     }
 
     /// For a string cell, the UTF-16 code unit at index `i` (`None` when `i` is
-    /// `None` or out of range); `None` for any other cell.
-    #[must_use]
-    pub fn string_unit_at_index(&self, handle: Handle, i: Option<usize>) -> Option<Option<u16>> {
+    /// `None` or out of range); `None` for any other cell. In-order reads of a
+    /// non-ASCII string stay linear (see [`Realm::string_unit_at_seq`]).
+    pub fn string_unit_at_index(
+        &mut self,
+        handle: Handle,
+        i: Option<usize>,
+    ) -> Option<Option<u16>> {
         self.heap.get(handle)?.as_str()?;
-        Some(i.and_then(|i| self.string_unit_at(handle, i)))
+        Some(i.and_then(|i| self.string_unit_at_seq(handle, i)))
     }
 
     /// Whether the cell at `handle` may own a named (non-index, non-`length`)
@@ -921,6 +925,13 @@ impl Realm {
     /// A new string cell holding `ToString(v)` for a primitive `v` (a number
     /// shares its rope through `number_rope`).
     pub fn new_primitive_string(&mut self, v: NanBox) -> Handle {
+        // A single digit is a one-unit string: the realm's interned cell.
+        if let Some(n) = v.as_number()
+            && (0.0..10.0).contains(&n)
+            && n == (n as u8) as f64
+        {
+            return self.unit_string(u16::from(b'0' + n as u8));
+        }
         let rope = match v.as_number() {
             Some(n) => self.number_rope(n),
             None => crate::rope::Rope::from(self.to_display_string(v).as_str()),
@@ -928,29 +939,127 @@ impl Realm {
         self.heap.alloc(Cell::Str(rope))
     }
 
-    /// A new string cell for the evaluation of a string literal whose text is
-    /// `s` (borrowed from the bytecode). Strings are immutable values, so every
-    /// evaluation of one literal may share one rope: a small direct-mapped memo
-    /// keyed by the text's address hands it back, re-checked against the text
-    /// itself so a reused address (freed bytecode) can never return another
-    /// string. The cell stays fresh per evaluation; only the rope is shared.
+    /// The string value of an evaluation of a string literal whose text is `s`
+    /// (borrowed from the bytecode). Strings are immutable values compared by
+    /// contents, so every evaluation of one literal may share one cell: a small
+    /// direct-mapped memo keyed by the text's address hands it back. A hit is
+    /// re-checked against the text itself (a reused address — freed bytecode —
+    /// can never return another string) and the cell against the memo's rope
+    /// (an `Rc` the memo keeps alive, so its address cannot be reused either).
+    /// A one-unit Latin-1 literal is the realm's interned unit string, the same
+    /// cell `s[i]` and `charAt` return.
     pub fn new_literal_string(&mut self, s: &str) -> Handle {
         const SLOTS: usize = 256;
+        let b = s.as_bytes();
+        match *b {
+            [c] => return self.unit_string(u16::from(c)),
+            [c0 @ 0xC2..=0xC3, c1] => {
+                return self.unit_string(u16::from(c0 & 0x1F) << 6 | u16::from(c1 & 0x3F));
+            }
+            _ => {}
+        }
         let key = s.as_ptr() as usize;
         let slot = (key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56;
         let slot = slot as usize % SLOTS;
         if self.literal_ropes.is_empty() {
             self.literal_ropes.resize(SLOTS, None);
         }
-        let rope = match &self.literal_ropes[slot] {
-            Some((k, r)) if *k == key && r.as_leaf_bytes() == Some(s.as_bytes()) => r.clone(),
-            _ => {
-                let r = crate::rope::Rope::from(s);
-                self.literal_ropes[slot] = Some((key, r.clone()));
-                r
+        if let Some((k, r, h)) = &self.literal_ropes[slot]
+            && *k == key
+            && r.as_leaf_bytes() == Some(b)
+        {
+            if self
+                .heap
+                .get(*h)
+                .and_then(Cell::as_str)
+                .is_some_and(|c| c.ptr_eq(r))
+            {
+                return *h;
             }
+            let r = r.clone();
+            let h = self.heap.alloc(Cell::Str(r.clone()));
+            self.literal_ropes[slot] = Some((key, r, h));
+            return h;
+        }
+        let r = crate::rope::Rope::from(s);
+        let h = self.heap.alloc(Cell::Str(r.clone()));
+        self.literal_ropes[slot] = Some((key, r, h));
+        h
+    }
+
+    /// The string concatenation of `parts`, each a string or a primitive
+    /// (Number, Boolean, `null`, `undefined`) that is `ToString`ed here — what
+    /// `Op::Concat` (a template literal's pieces) computes in one step instead
+    /// of one `+` and one new cell per piece. `None` when a part is any other
+    /// value (the caller then `+`-adds the parts in order); `Some(None)` when
+    /// the result would exceed the string length cap (a `RangeError`).
+    ///
+    /// Short flat results are written straight into one buffer (joining a lone
+    /// high surrogate at a piece's end with a lone low one at the next's start,
+    /// exactly as [`Rope::try_concat`](crate::rope::Rope::try_concat) does);
+    /// anything longer, or with a `Concat` rope part, is a rope of the parts.
+    pub fn concat_parts(&mut self, parts: &[NanBox]) -> Option<Option<Handle>> {
+        // A piece past this many bytes is shared, not copied.
+        const FLAT_MAX: usize = 256;
+        let mut bound = 0usize;
+        let mut flat = true;
+        for &p in parts {
+            bound += match p.unpack() {
+                crate::nanbox::Unpacked::Number(_) => 25,
+                crate::nanbox::Unpacked::Bool(_)
+                | crate::nanbox::Unpacked::Null
+                | crate::nanbox::Unpacked::Undefined => 9,
+                crate::nanbox::Unpacked::Handle(raw) => {
+                    let r = self.heap.get(Handle::from_raw(raw))?.as_str()?;
+                    flat &= r.as_leaf_bytes().is_some();
+                    r.len()
+                }
+            };
+            if bound > FLAT_MAX {
+                flat = false;
+            }
+        }
+        let rope = if flat {
+            let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(bound);
+            for &p in parts {
+                match p.unpack() {
+                    crate::nanbox::Unpacked::Number(n) => match small_integer_digits(n) {
+                        Some((d, pos)) => buf.extend_from_slice(&d[pos..]),
+                        None => buf.extend_from_slice(super::js_number_string(n).as_bytes()),
+                    },
+                    crate::nanbox::Unpacked::Handle(raw) => {
+                        let piece = self
+                            .heap
+                            .get(Handle::from_raw(raw))
+                            .and_then(Cell::as_str)
+                            .and_then(crate::rope::Rope::as_leaf_bytes)
+                            .unwrap_or_default();
+                        push_wtf8_joined(&mut buf, piece);
+                    }
+                    _ => buf.extend_from_slice(self.to_display_string(p).as_bytes()),
+                }
+            }
+            crate::rope::Rope::from_wtf8(buf)
+        } else {
+            let mut acc = crate::rope::Rope::new();
+            for &p in parts {
+                let piece = match p.unpack() {
+                    crate::nanbox::Unpacked::Number(n) => self.number_rope(n),
+                    crate::nanbox::Unpacked::Handle(raw) => self
+                        .heap
+                        .get(Handle::from_raw(raw))
+                        .and_then(Cell::as_str)?
+                        .clone(),
+                    _ => crate::rope::Rope::from(self.to_display_string(p).as_str()),
+                };
+                match acc.try_concat(&piece) {
+                    Some(r) => acc = r,
+                    None => return Some(None),
+                }
+            }
+            acc
         };
-        self.heap.alloc(Cell::Str(rope))
+        Some(Some(self.heap.alloc(Cell::Str(rope))))
     }
 
     /// `a + b` for a string `a` held as one short leaf and a number `b` (or the
@@ -984,5 +1093,21 @@ impl Realm {
         Some(crate::rope::Rope::from_bytes(
             &out[..first.len() + second.len()],
         ))
+    }
+}
+
+/// Appends the WTF-8 `piece` to `buf`, pairing a lone high surrogate at the
+/// end of `buf` with a lone low surrogate at the start of `piece` into the one
+/// astral code point they denote, so the result stays canonical WTF-8.
+fn push_wtf8_joined(buf: &mut alloc::vec::Vec<u8>, piece: &[u8]) {
+    if let Some(hi) = crate::wtf8::trailing_high_surrogate(buf)
+        && let Some(lo) = crate::wtf8::leading_low_surrogate(piece)
+    {
+        buf.truncate(buf.len() - 3);
+        let cp = 0x1_0000 + ((u32::from(hi) - 0xD800) << 10) + (u32::from(lo) - 0xDC00);
+        crate::wtf8::encode_code_point(cp, buf);
+        buf.extend_from_slice(&piece[3..]);
+    } else {
+        buf.extend_from_slice(piece);
     }
 }

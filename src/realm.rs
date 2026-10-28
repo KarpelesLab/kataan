@@ -188,6 +188,22 @@ pub struct Realm {
     /// 1.5 GB). Cost here is bounded by one subject, and it is released as soon
     /// as a different one is matched.
     regex_subject_units: Option<(Rope, alloc::rc::Rc<alloc::vec::Vec<u16>>)>,
+    /// Interned one-code-unit strings for units below 256, indexed by unit
+    /// (empty until first use). `s[i]`, `charAt`, a string `for-of` step,
+    /// `split('')` and a one-unit `String.fromCharCode` all produce one-unit
+    /// strings, and allocating a fresh cell for each made a character loop
+    /// allocation-bound. A string value is immutable and `===` compares
+    /// contents, so handing out one shared cell per unit is unobservable
+    /// (strings cannot be WeakMap keys or WeakRef targets). The entries are GC
+    /// roots ([`gc_roots`](Realm::gc_roots), and the minor path's side-table
+    /// roots) and the table is dropped by a moving [`compact`](Realm::compact).
+    unit_strings: alloc::vec::Vec<Option<Handle>>,
+    /// Where the last indexed read of a non-ASCII flat string stopped: the
+    /// string and the (byte, UTF-16 unit) boundary of the character read. UTF-8
+    /// cannot be indexed by unit in O(1), so `for (i…) s[i]` over such a string
+    /// resumes the scan here instead of from the start each time (linear, not
+    /// quadratic). One slot, like `regex_subject_units`, for the same reasons.
+    unit_cursor: Option<(Rope, usize, usize)>,
     /// How many times [`swap_cell_state`](Realm::swap_cell_state) has moved one
     /// cell's contents into another handle: a cache that identifies objects by
     /// handle and key epoch (`builtins_fast::ChainKeyCache`) is only valid
@@ -202,9 +218,11 @@ pub struct Realm {
     /// The shared ropes of the small integers' strings (see
     /// `builtins_fast::number_rope`), filled on first use.
     number_ropes: core::cell::RefCell<alloc::vec::Vec<Option<Rope>>>,
-    /// A direct-mapped memo of string-literal ropes, keyed by the address of
-    /// the literal text in its bytecode (see `builtins_fast::new_literal_string`).
-    literal_ropes: alloc::vec::Vec<Option<(usize, Rope)>>,
+    /// A direct-mapped memo of string-literal values, keyed by the address of
+    /// the literal text in its bytecode: the rope and the one cell holding it
+    /// (see `builtins_fast::new_literal_string`). The cells are GC roots and the
+    /// memo is dropped by a moving [`compact`](Realm::compact).
+    literal_ropes: alloc::vec::Vec<Option<(usize, Rope, Handle)>>,
     /// The key strings of the last plain-keyed shape `Object.keys` listed
     /// (see `builtins_fast::plain_enumerable_key_ropes`).
     key_ropes: core::cell::RefCell<Option<ShapeKeyRopes>>,
@@ -650,6 +668,8 @@ impl Realm {
             nonwritable_array_lengths: alloc::collections::BTreeSet::new(),
             proto_index_accessor_dirty: false,
             regex_subject_units: None,
+            unit_strings: alloc::vec::Vec::new(),
+            unit_cursor: None,
             cell_swaps: 0,
             #[cfg(feature = "regex")]
             regex_programs: core::cell::RefCell::new(alloc::vec::Vec::new()),
@@ -1289,6 +1309,77 @@ impl Realm {
     /// Allocates a string value in the heap and returns its handle.
     pub fn new_string(&mut self, s: &str) -> Handle {
         self.heap.alloc(Cell::Str(Rope::from(s)))
+    }
+
+    /// `str[n]` for a string primitive `handle` and a Number key `n`: the
+    /// one-unit string at that index, or `None` when `handle` is not a string or
+    /// `n` is not an in-range integer index (the caller then takes the ordinary
+    /// property path — an out-of-range index reads the prototype chain).
+    ///
+    /// A string's in-range indices are non-configurable own properties of the
+    /// String exotic object (ECMA-262 10.4.3.5), so nothing can shadow them and
+    /// answering here is exact. A `Concat` rope is flattened once in place, so
+    /// a loop over a `+=`-built string stays linear.
+    pub fn string_index_get(&mut self, handle: Handle, n: f64) -> Option<Handle> {
+        if !((0.0..9_007_199_254_740_992.0).contains(&n) && n == (n as u64) as f64) {
+            return None;
+        }
+        let unit = self.string_unit_at_seq(handle, n as usize)?;
+        Some(self.unit_string(unit))
+    }
+
+    /// [`string_unit_at`](Self::string_unit_at) for in-order access: a non-ASCII
+    /// flat string resumes from the last read's position (see `unit_cursor`),
+    /// and a `Concat` rope is flattened in place first.
+    pub fn string_unit_at_seq(&mut self, handle: Handle, i: usize) -> Option<u16> {
+        if self.heap.get(handle)?.as_str()?.as_leaf_bytes().is_none() {
+            self.flatten_string(handle);
+        }
+        let rope = self.heap.get(handle)?.as_str()?;
+        let bytes = rope.as_leaf_bytes()?;
+        if rope.is_ascii() {
+            return bytes.get(i).map(|b| u16::from(*b));
+        }
+        let (b0, u0) = match &self.unit_cursor {
+            Some((r, b, u)) if r.ptr_eq(rope) && *u <= i => (*b, *u),
+            _ => (0, 0),
+        };
+        let (unit, b, u) = crate::wtf8::utf16_index_from(bytes, b0, u0, i)?;
+        let rope = rope.clone();
+        self.unit_cursor = Some((rope, b, u));
+        Some(unit)
+    }
+
+    /// The string holding the single UTF-16 code unit `unit`. Units below 256
+    /// come from the realm's interned table (see `unit_strings`), so a
+    /// character loop allocates nothing after its first sight of each unit;
+    /// any other unit (including a lone surrogate) gets a fresh cell.
+    pub fn unit_string(&mut self, unit: u16) -> Handle {
+        let i = usize::from(unit);
+        if i < 256 {
+            let mut buf = [0u8; 2];
+            let n = char::from(unit as u8).encode_utf8(&mut buf).len();
+            // Revalidated on every hit (a load and a short compare): the entry is
+            // rooted by every production collection, but a bare `collect` with a
+            // caller-chosen root set could free it and reuse the slot.
+            if let Some(Some(h)) = self.unit_strings.get(i)
+                && self
+                    .heap
+                    .get(*h)
+                    .and_then(Cell::as_str)
+                    .and_then(Rope::as_leaf_bytes)
+                    == Some(&buf[..n])
+            {
+                return *h;
+            }
+            let h = self.heap.alloc(Cell::Str(Rope::from_bytes(&buf[..n])));
+            if self.unit_strings.is_empty() {
+                self.unit_strings.resize(256, None);
+            }
+            self.unit_strings[i] = Some(h);
+            return h;
+        }
+        self.new_string_wtf8(crate::wtf8::from_utf16(&[unit]))
     }
 
     /// Allocates a string value sharing `rope` (an `Rc` bump, no copy).
@@ -5705,6 +5796,8 @@ impl Realm {
         r.extend(self.fn_ctor.values().copied());
         r.extend(self.intl_protos.values().copied());
         r.extend(self.symbols_by_id.values().copied());
+        r.extend(self.unit_strings.iter().flatten().copied());
+        r.extend(self.literal_ropes.iter().flatten().map(|(_, _, h)| *h));
         // Host persistent handles keep their (object) values alive across calls.
         r.extend(
             self.host_persistent
@@ -5753,6 +5846,8 @@ impl Realm {
             .flatten(),
         );
         out.extend(self.vm_array_iter.values_fns.iter().copied());
+        out.extend(self.unit_strings.iter().flatten().copied());
+        out.extend(self.literal_ropes.iter().flatten().map(|(_, _, h)| *h));
         // Explicit prototype links for cells with no inline object part, and the
         // class prototypes: both are keyed by an identity the heap graph does not
         // reach, so their values are strong roots.
@@ -6159,6 +6254,10 @@ impl Realm {
         // not forward: drop it (the VM then takes the protocol path). The
         // `@@species` key is a string, not a handle, so it survives.
         let species_key = self.vm_array_iter.species_key.take();
+        // The interned one-unit strings are a cache too: drop them rather than
+        // forward them.
+        self.unit_strings.clear();
+        self.literal_ropes.clear();
         self.vm_array_iter = VmArrayIterIntrinsics {
             species_key,
             ..VmArrayIterIntrinsics::default()

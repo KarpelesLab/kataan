@@ -1493,31 +1493,19 @@ impl Interp {
         }
         // String index access (`"abc"[1]`) → the UTF-16 code unit at the index
         // (a lone surrogate preserved as a one-unit string).
-        //
-        // P3: read the unit through the *borrowing* `string_leaf_bytes` when the
-        // rope is a single leaf (the overwhelmingly common case) so that
-        // `for (i…) c = s[i]` is O(1) per read instead of flattening the whole
-        // rope into an owned `Vec` every time (which made the loop O(n²)). A
-        // `Concat` tree (no contiguous leaf) falls back to the owned
-        // `string_bytes`; a non-string receiver makes both return `None`, so the
-        // fast numeric-index path is skipped without any allocation.
         if let Ok(i) = name.parse::<usize>()
+            && (name == "0" || !name.starts_with(['0', '+']))
             && self.realm.is_string_handle(handle)
+            && let Some(u) = self.realm.string_unit_at_seq(handle, i)
         {
-            // Collapse a `Concat` once so repeated `s[i]` on a `+=`-built string
-            // stops re-walking the tree per read.
-            self.realm.flatten_string(handle);
-            if let Some(u) = self.realm.string_unit_at(handle, i) {
-                return Ok(self.new_str_bytes(crate::wtf8::from_utf16(&[u])));
-            }
-            // Out of range: a String *wrapper* object can still carry an
-            // ordinary own property at that index (`Object.defineProperty(new
-            // String("s"), "4", …)`) — String-exotic `[[GetOwnProperty]]` falls
-            // back to OrdinaryGetOwnProperty. Only shortcut to `undefined` when
-            // there is no such own property (the common primitive-string case).
-            if !self.realm.has_own(handle, name) {
-                return Ok(NanBox::undefined());
-            }
+            // In range: a non-configurable own property of the String exotic
+            // object, one interned cell per Latin-1 unit. A non-canonical name
+            // (`"01"`) is an ordinary key, and an out-of-range index falls
+            // through to the ordinary lookup (an own property of a wrapper, or
+            // an inherited `String.prototype[7]`). `string_unit_at_seq` collapses
+            // a `Concat` once, so repeated `s[i]` on a `+=`-built string stops
+            // re-walking the tree per read.
+            return Ok(NanBox::handle(self.realm.unit_string(u).to_raw()));
         }
         // A canonical numeric string key on an array (`arr["0"]`) reads the
         // element, exactly like `arr[0]` — but only for a valid array index
@@ -2048,22 +2036,17 @@ impl Interp {
                 let len = self.realm.string_utf16_len(ph).unwrap_or(0);
                 return Ok(NanBox::number(len as f64));
             }
-            if let Ok(i) = name.parse::<usize>() {
-                let unit = if let Some(leaf) = self.realm.string_leaf_bytes(ph) {
-                    crate::wtf8::utf16_index(leaf, i)
-                } else {
-                    crate::wtf8::utf16_index(&self.realm.string_bytes(ph).unwrap_or_default(), i)
-                };
-                if let Some(u) = unit {
-                    return Ok(self.new_str_bytes(crate::wtf8::from_utf16(&[u])));
-                }
-                // Out of range: String-exotic `[[GetOwnProperty]]` falls back to
-                // OrdinaryGetOwnProperty, so an own property defined at that index on
-                // the *wrapper* (`Object.defineProperty(new String("s"), "4", …)`) is
-                // still read. Only shortcut to `undefined` when there is none.
-                if !self.realm.has_own(handle, name) {
-                    return Ok(NanBox::undefined());
-                }
+            // Only a canonical numeric string is an index (`"01"` and `"+1"` are
+            // ordinary property names). Out of range, String-exotic
+            // `[[GetOwnProperty]]` falls back to OrdinaryGetOwnProperty and then
+            // the prototype chain, so an own property on the *wrapper*
+            // (`Object.defineProperty(new String("s"), "4", …)`) or an inherited
+            // `String.prototype[4]` is still read: fall through.
+            if let Ok(i) = name.parse::<usize>()
+                && (name == "0" || !name.starts_with(['0', '+']))
+                && let Some(u) = self.realm.string_unit_at_seq(ph, i)
+            {
+                return Ok(NanBox::handle(self.realm.unit_string(u).to_raw()));
             }
             let v = self.member_value(ph, name);
             if !matches!(v.unpack(), Unpacked::Undefined) {

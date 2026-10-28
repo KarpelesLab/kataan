@@ -136,7 +136,7 @@ impl Interp {
                 return Ok(Some(match (method, unit) {
                     ("charCodeAt", Some(u)) => NanBox::number(f64::from(u)),
                     ("charCodeAt", None) => NanBox::number(f64::NAN),
-                    (_, Some(u)) => self.new_str_bytes(crate::wtf8::from_utf16(&[u])),
+                    (_, Some(u)) => NanBox::handle(self.realm.unit_string(u).to_raw()),
                     (_, None) => self.new_str(""),
                 }));
             }
@@ -1080,6 +1080,9 @@ impl Interp {
                     } else {
                         0
                     });
+                }
+                if let [u] = units[..] {
+                    return Ok(Some(NanBox::handle(self.realm.unit_string(u).to_raw())));
                 }
                 return Ok(Some(self.new_str_bytes(crate::wtf8::from_utf16(&units))));
             }
@@ -2264,13 +2267,10 @@ impl Interp {
                     // preserving a lone surrogate (stored via WTF-8). A negative
                     // index is out of range (`NaN`/no-arg → 0).
                     let idx = self.coerce_to_integer_or_infinity(arg(0))?;
-                    let out = match str_char_index(idx) {
-                        Some(i) => unit_at(i)
-                            .map(|u| crate::wtf8::from_utf16(&[u]))
-                            .unwrap_or_default(),
-                        None => Vec::new(),
-                    };
-                    Some(self.new_str_bytes(out))
+                    match str_char_index(idx).and_then(unit_at) {
+                        Some(u) => Some(NanBox::handle(self.realm.unit_string(u).to_raw())),
+                        None => Some(self.new_str("")),
+                    }
                 }
                 "includes" => {
                     // A RegExp `searchString` is a TypeError (IsRegExp reads
@@ -2420,10 +2420,12 @@ impl Interp {
                     let mut parts: Vec<NanBox> = if sep.is_empty() {
                         // Empty separator → one entry per UTF-16 code unit (a lone
                         // surrogate is its own one-unit entry).
-                        let units = units_len;
-                        (0..units)
-                            .map(|i| crate::wtf8::slice_utf16_ascii(bytes, i, i + 1, ascii))
-                            .map(|b| self.new_str_bytes(b))
+                        // One forward pass (slicing each unit out by index rescans
+                        // a non-ASCII string from the start); Latin-1 units are
+                        // the realm's interned strings.
+                        crate::wtf8::utf16_units(bytes)
+                            .take(limit)
+                            .map(|u| NanBox::handle(self.realm.unit_string(u).to_raw()))
                             .collect()
                     } else {
                         split_units(bytes, &sep)
@@ -2442,7 +2444,7 @@ impl Interp {
                     let units = units_len;
                     let idx = if i < 0.0 { units as f64 + i } else { i };
                     Some(match as_index(idx).and_then(unit_at) {
-                        Some(u) => self.new_str_bytes(crate::wtf8::from_utf16(&[u])),
+                        Some(u) => NanBox::handle(self.realm.unit_string(u).to_raw()),
                         None => NanBox::undefined(),
                     })
                 }

@@ -13133,3 +13133,58 @@ fn for_of_entry_pair_heads_bind_without_the_pair() {
     "#;
     assert_eq!(run(src), "0a,0b,14,1,2,4,2,pq,rs");
 }
+
+#[test]
+fn one_unit_strings_index_and_semantics() {
+    // `s[i]`, `charAt`, `at`, `split('')`, a one-unit `fromCharCode` and string
+    // `for-of` hand out one interned cell per Latin-1 unit; other units (lone
+    // surrogates, CJK, astral halves) are fresh strings. Only a canonical index
+    // reads a character; an out-of-range one walks the prototype chain.
+    let src = r#"
+        var out = [];
+        var s = "aé中😀\uD800z";
+        var units = [];
+        for (var i = 0; i < s.length; i++) units.push(s[i].charCodeAt(0).toString(16));
+        out.push(units.join("."));
+        out.push(s.split("").length, s.split("", 2).join("|").length);
+        out.push(s.charAt(1) === s[1], s.at(-1), String.fromCharCode(233) === s[1]);
+        var r = ""; for (var k = 0; k < 300; k++) r += k % 2 ? "é" : "x";
+        var n = 0; for (var k = 0; k < r.length; k++) if (r[k] === "é") n++;
+        out.push(n);
+        out.push("hello"["01"], "hello"["+1"], "hello"[-0], "hello"[1.5]);
+        String.prototype[7] = "P";
+        out.push("hello"[7], new String("hi")[7], "hello"[1]);
+        delete String.prototype[7];
+        var c = "q"; c.x = 1; out.push("q".x, "qq"[1].x);
+        out.join(",")
+    "#;
+    assert_eq!(
+        run(src),
+        "61.e9.4e2d.d83d.de00.d800.7a,7,3,true,z,true,150,,,h,,P,P,e,,"
+    );
+}
+
+#[test]
+fn template_literals_concat_in_one_step() {
+    // A template's pieces are joined by one `Op::Concat`: substitutions are
+    // `ToString`ed in evaluation order (an object's `toString` before the next
+    // substitution runs), primitives stringify like `ToString`, a Symbol
+    // throws, and surrogate halves in adjacent pieces pair up.
+    let src = r#"
+        var log = [];
+        var o = function (n) { return { toString: function () { log.push("t" + n); return "O" + n; },
+                                         valueOf: function () { return 9; } }; };
+        var f = function (n) { log.push("f" + n); return n; };
+        var out = [`a${o(1)}b${f(2)}c${o(3)}`, log.join(" ")];
+        out.push(`${-0}|${1e21}|${0.1}|${NaN}|${true}|${null}|${undefined}|${10n}`);
+        out.push(`${"\uD83D"}${"\uDE00"}`.length, [...`x${"\uD83D"}${"\uDE00"}`].length);
+        try { `${Symbol()}`; } catch (e) { out.push(e instanceof TypeError); }
+        var big = "z".repeat(300);
+        out.push(`${big}-${big}`.length, `${5}`, typeof `${5}`, ``.length);
+        out.join(",")
+    "#;
+    assert_eq!(
+        run(src),
+        "aO1b2cO3,t1 f2 t3,0|1e+21|0.1|NaN|true|null|undefined|10,2,2,true,601,5,string,0"
+    );
+}

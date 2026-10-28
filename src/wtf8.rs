@@ -324,6 +324,42 @@ pub fn utf16_index(bytes: &[u8], i: usize) -> Option<u16> {
     utf16_units(bytes).nth(i)
 }
 
+/// The UTF-16 unit at index `i`, scanning forward from a known character
+/// boundary — byte offset `byte`, which starts unit `unit` (`unit <= i`; pass
+/// `(0, 0)` to scan from the start). Also returns the boundary of the
+/// character holding unit `i`, so a caller walking a string in order can resume
+/// there and stay linear overall. `None` past the end.
+#[must_use]
+pub fn utf16_index_from(
+    bytes: &[u8],
+    mut byte: usize,
+    mut unit: usize,
+    i: usize,
+) -> Option<(u16, usize, usize)> {
+    while byte < bytes.len() {
+        let (cp, n) = decode_code_point(bytes, byte);
+        if cp >= FOUR_BYTE_MIN {
+            if i < unit + 2 {
+                let v = cp - FOUR_BYTE_MIN;
+                let u = if i == unit {
+                    0xD800 | (v >> 10)
+                } else {
+                    0xDC00 | (v & 0x3FF)
+                };
+                return Some((u as u16, byte, unit));
+            }
+            unit += 2;
+        } else {
+            if i == unit {
+                return Some((cp as u16, byte, unit));
+            }
+            unit += 1;
+        }
+        byte += n;
+    }
+    None
+}
+
 /// Returns the byte offset in `bytes` for UTF-16 unit `unit`.
 ///
 /// `unit` may equal [`utf16_len`] (the past-the-end position), which maps to

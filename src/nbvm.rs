@@ -219,6 +219,17 @@ pub enum Op {
     /// `dst = ToString(src)` for an object or symbol (a template substitution),
     /// via the host; a string is copied, other primitives stringify directly.
     ToStr { dst: Reg, src: Reg },
+    /// A template substitution's `ToString`, deferred where that is
+    /// unobservable: an object or symbol is `ToString`ed now, via the host
+    /// (its `toString`/`@@toPrimitive` runs in evaluation order), while a string
+    /// or another primitive is copied unchanged for the following
+    /// [`Op::Concat`] to stringify (a Number's digits go straight into the
+    /// result, with no string cell of their own).
+    ToStrLazy { dst: Reg, src: Reg },
+    /// `dst` = the string concatenation of `parts` (strings or primitives — a
+    /// template literal's quasis and [`Op::ToStrLazy`]'d substitutions), built
+    /// as one string instead of one `+` per piece.
+    Concat { dst: Reg, parts: Vec<Reg> },
     /// Throws a `TypeError` if `src` is `null` or `undefined` (an object
     /// destructuring pattern's `RequireObjectCoercible`).
     RequireObjectCoercible { src: Reg },
@@ -4892,6 +4903,44 @@ fn to_primitive(ctx: &mut Ctx, funcs: &[FnProto], v: NanBox, number_hint: bool) 
     v
 }
 
+/// `Op::Concat`: the concatenation of `parts` (strings and primitives) as one
+/// new string, or — should a part be anything else — the same `+` chain the
+/// template would otherwise have compiled to.
+fn vm_concat(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: &[NanBox],
+    parts: &[Reg],
+) -> Result<NanBox, VmError> {
+    let mut vals: [NanBox; 16] = [NanBox::undefined(); 16];
+    let owned: alloc::vec::Vec<NanBox>;
+    let vals: &[NanBox] = if parts.len() <= vals.len() {
+        for (slot, r) in vals.iter_mut().zip(parts) {
+            *slot = regs[*r as usize];
+        }
+        &vals[..parts.len()]
+    } else {
+        owned = parts.iter().map(|r| regs[*r as usize]).collect();
+        &owned
+    };
+    match ctx.realm.concat_parts(vals) {
+        Some(Some(h)) => Ok(NanBox::handle(h.to_raw())),
+        Some(None) => Err(VmError::Thrown(vm_error(
+            ctx,
+            "RangeError",
+            "Invalid string length",
+        ))),
+        None => {
+            // `"" + p0 + p1 + …`: string concatenation from the first part on.
+            let mut acc = NanBox::handle(ctx.realm.new_string("").to_raw());
+            for &v in vals {
+                acc = vm_add(ctx, funcs, acc, v)?;
+            }
+            Ok(acc)
+        }
+    }
+}
+
 /// The interpreter's real `+` operator (`Op::AddValue`'s semantics), factored
 /// out so the bytecode VM **and** the generic-JIT runtime helper
 /// ([`jit_helper_add`]) share one code path and can never diverge: ToPrimitive
@@ -7076,6 +7125,24 @@ fn run_frame_at_ic(
                         NanBox::handle(ctx.realm.new_primitive_string(v).to_raw());
                 }
             }
+            Op::ToStrLazy { dst, src } => {
+                let v = regs[*src as usize];
+                if let Some(h) = v.as_handle()
+                    && !ctx.realm.is_string_handle(Handle::from_raw(h))
+                {
+                    match with_host(ctx, |h| h.to_string(v)) {
+                        Some(Ok(s)) => regs[*dst as usize] = s,
+                        Some(Err(e)) => handle_throw!(VmError::from(e)),
+                        None => return Err(VmError::Unsupported),
+                    }
+                } else {
+                    regs[*dst as usize] = v;
+                }
+            }
+            Op::Concat { dst, parts } => match vm_concat(ctx, funcs, regs, parts) {
+                Ok(v) => regs[*dst as usize] = v,
+                Err(e) => handle_throw!(e),
+            },
             Op::RequireObjectCoercible { src } => {
                 if matches!(
                     regs[*src as usize].unpack(),
@@ -9505,6 +9572,13 @@ fn vm_get_elem(
         && let Some(v) = ctx.realm.plain_array_get(Handle::from_raw(h), n)
     {
         return Ok(v);
+    }
+    // An in-range index of a string primitive: an own, non-configurable
+    // property nothing can intercept (one interned cell per Latin-1 unit).
+    if let (Some(h), Some(n)) = (recv.as_handle(), key.as_number())
+        && let Some(s) = ctx.realm.string_index_get(Handle::from_raw(h), n)
+    {
+        return Ok(NanBox::handle(s.to_raw()));
     }
     if let Some(v) = typed_array_index_get(ctx, recv, key) {
         return Ok(v);
@@ -19394,16 +19468,42 @@ impl Compiler {
                         .map(<[u8]>::to_vec)
                         .unwrap_or_default()
                 };
+                // Hosted: each substitution is `ToStrLazy`ed in evaluation
+                // order, and the non-empty quasis and the substitutions are joined
+                // by one `Op::Concat` (`${x}` alone is just `ToStr(x)`).
+                if self.hosted {
+                    let mut parts: Vec<Reg> = Vec::new();
+                    let first = cooked(t.quasis.first());
+                    if !first.is_empty() || t.expressions.is_empty() {
+                        parts.push(self.wtf8_string(&first));
+                    }
+                    for (i, e) in t.expressions.iter().enumerate() {
+                        let v = self.expr(e)?;
+                        let s = self.alloc();
+                        let lone = parts.is_empty()
+                            && i + 1 == t.expressions.len()
+                            && cooked(t.quasis.get(i + 1)).is_empty();
+                        self.ops.push(if lone {
+                            Op::ToStr { dst: s, src: v }
+                        } else {
+                            Op::ToStrLazy { dst: s, src: v }
+                        });
+                        parts.push(s);
+                        let q = cooked(t.quasis.get(i + 1));
+                        if !q.is_empty() {
+                            parts.push(self.wtf8_string(&q));
+                        }
+                    }
+                    if let [only] = parts[..] {
+                        return Ok(only);
+                    }
+                    let dst = self.alloc();
+                    self.ops.push(Op::Concat { dst, parts });
+                    return Ok(dst);
+                }
                 let mut acc = self.wtf8_string(&cooked(t.quasis.first()));
                 for (i, e) in t.expressions.iter().enumerate() {
-                    let mut v = self.expr(e)?;
-                    // A substitution is `ToString`ed (string hint), not `+`-added
-                    // (default hint, which would call `valueOf` first).
-                    if self.hosted {
-                        let s = self.alloc();
-                        self.ops.push(Op::ToStr { dst: s, src: v });
-                        v = s;
-                    }
+                    let v = self.expr(e)?;
                     let s1 = self.alloc();
                     self.ops.push(Op::AddValue {
                         dst: s1,
