@@ -537,6 +537,13 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_object().to_raw());
             Some(Ok(()))
         }
+        // (A capture cell — a one-element array — per loop iteration.) The
+        // interpreter's length cap stays its own (an error path).
+        Op::NewArray { dst, len } if *len <= ctx.realm.limits.max_array_len => {
+            let vals = alloc::vec![NanBox::undefined(); *len];
+            regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(vals).to_raw());
+            Some(Ok(()))
+        }
         Op::NewArrayFrom { dst, elems } => {
             let vals: alloc::vec::Vec<NanBox> = elems.iter().map(|r| regs[*r as usize]).collect();
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(vals).to_raw());

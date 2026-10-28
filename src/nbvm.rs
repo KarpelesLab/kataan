@@ -15967,6 +15967,19 @@ impl Compiler {
     /// it to `undefined` on entry, so the register always holds the value of
     /// the last non-empty completion — the script's result.
     fn stmt(&mut self, stmt: &Stmt) -> Result<Option<Reg>, CompileError> {
+        // The capture set is by name, function-wide: a loop's `let i` would be
+        // a cell whenever *any* closure in the function reads *some* `i`.
+        let Some(saved) = self.uncapture_loop_head(stmt) else {
+            return self.stmt_completion(stmt);
+        };
+        let r = self.stmt_completion(stmt);
+        self.cell_names = saved;
+        r
+    }
+
+    /// [`Self::stmt`] past the loop-head capture refinement: tracks the
+    /// completion value around [`Self::stmt_inner`].
+    fn stmt_completion(&mut self, stmt: &Stmt) -> Result<Option<Reg>, CompileError> {
         let Some(cv) = self.completion else {
             return self.stmt_inner(stmt);
         };
@@ -20861,6 +20874,67 @@ impl Compiler {
     /// A block's own `let`/`const`/`class` names that closures capture (the
     /// block's cell names, plus `extra`) are pre-bound as TDZ cells at block
     /// entry; their declarations initialize them (hosted only).
+    /// For a `for`/`for-in`/`for-of` statement with a `let`/`const` head:
+    /// drops from [`Self::cell_names`] each head name that no function nested
+    /// anywhere in `stmt` references, returning the previous set for the
+    /// caller to restore once `stmt` is compiled (`None`: nothing dropped).
+    /// Such a head binding is visible only inside `stmt`, so no closure can
+    /// capture it whatever same-named bindings elsewhere in the function are
+    /// captured — and neither can one of a same-named binding declared inside
+    /// `stmt`, as no closure in `stmt` names it. So the loop variable lives in
+    /// a register (no cell, no per-iteration copy). Nothing is dropped under
+    /// dynamic scoping (a direct `eval` or `with` in reach).
+    fn uncapture_loop_head(&mut self, stmt: &Stmt) -> Option<alloc::collections::BTreeSet<String>> {
+        use crate::ast::{ForLeft, VarDeclKind};
+        if self.dyn_fn || self.cell_names.is_empty() {
+            return None;
+        }
+        let lexical = |k: &VarDeclKind| matches!(k, VarDeclKind::Let | VarDeclKind::Const);
+        let mut names = BTreeSet::new();
+        match stmt {
+            Stmt::For {
+                init: Some(ForInit::Var(decl)),
+                ..
+            } if lexical(&decl.kind) => {
+                for d in &decl.declarations {
+                    pattern_names(&d.target, &mut names);
+                }
+            }
+            Stmt::ForOf {
+                left: ForLeft::Decl { kind, target, .. },
+                ..
+            }
+            | Stmt::ForIn {
+                left: ForLeft::Decl { kind, target, .. },
+                ..
+            } if lexical(kind) => pattern_names(target, &mut names),
+            _ => return None,
+        }
+        names.retain(|n| self.cell_names.contains(n));
+        if names.is_empty() {
+            return None;
+        }
+        let (mut direct, mut nested) = (BTreeSet::new(), BTreeSet::new());
+        refs_stmt(stmt, &mut direct, &mut nested);
+        let dynamic = |s: &BTreeSet<String>| {
+            [DYN_EVAL, DYN_WITH, DYN_EVAL_CLASS]
+                .iter()
+                .any(|k| s.contains(*k))
+        };
+        if dynamic(&direct) || dynamic(&nested) {
+            return None;
+        }
+        names.retain(|n| !nested.contains(n));
+        if names.is_empty() {
+            return None;
+        }
+        let saved = self.cell_names.clone();
+        for n in &names {
+            self.cell_names.remove(n);
+        }
+        Some(saved)
+    }
+
     fn prebind_block_lexicals(
         &mut self,
         body: &[&Stmt],
