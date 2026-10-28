@@ -651,9 +651,28 @@ fn run_worker(spec: &str) {
         };
         let _ = writeln!(f, "R\t{cur}\t{rel}\t{st}\t{}", sanitize(&reason));
         let _ = f.flush();
+        // Recycle a worker whose address space has grown past a quarter of the
+        // `ulimit -v` cap. Memory a large test freed often stays reserved by the
+        // allocator, and a later memory-heavy test would then hit the cap in a
+        // worker that already holds that much. Exiting without `DONE` makes the
+        // coordinator resume this shard in a fresh process at the next test.
+        if worker_vm_size_kib().is_some_and(|k| k > WORKER_RECYCLE_KIB) {
+            return;
+        }
     }
     let _ = writeln!(f, "DONE");
     let _ = f.flush();
+}
+
+/// A worker's virtual size above which it is recycled (see `run_worker`):
+/// a quarter of the coordinator's 4 GiB `ulimit -v` cap.
+const WORKER_RECYCLE_KIB: u64 = 1024 * 1024;
+
+/// This process's virtual size (`VmSize`, KiB) — what `ulimit -v` bounds.
+fn worker_vm_size_kib() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmSize:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
 }
 
 /// Coordinator: shard the corpus across child processes (for native-stack
