@@ -184,6 +184,12 @@ pub mod regex;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
+/// A pure-Rust size-class pooling allocator ([`pool_alloc::PoolAlloc`]) that an
+/// executable can install as its `#[global_allocator]` (the `kataan` CLI does).
+/// The library never installs it itself. Needs `std` (the `pool-alloc` feature).
+#[cfg(feature = "pool-alloc")]
+pub mod pool_alloc;
+
 pub use error::{Error, Result};
 pub use limits::{Limits, WasmLimits};
 pub use nanbox::NanBox;

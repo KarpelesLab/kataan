@@ -17,6 +17,11 @@ use kataan::lexer::{Lexer, TokenKind};
 use kataan::parser::Parser;
 use std::process::ExitCode;
 
+/// The engine's own pooling allocator (pure Rust; see `kataan::pool_alloc`).
+#[cfg(feature = "pool-alloc")]
+#[global_allocator]
+static GLOBAL: kataan::pool_alloc::PoolAlloc = kataan::pool_alloc::PoolAlloc;
+
 fn main() -> ExitCode {
     // Run on a large stack so deep JS recursion is bounded by the engine's
     // call-depth guard (a thrown RangeError), not a host stack overflow.

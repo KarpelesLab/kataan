@@ -40,6 +40,11 @@ use std::process::{Command, Stdio};
 use kataan::limits::Limits;
 use kataan::nbexec::ErrorPhase;
 
+/// Run the corpus on the allocator the `kataan` CLI ships with.
+#[cfg(feature = "pool-alloc")]
+#[global_allocator]
+static GLOBAL: kataan::pool_alloc::PoolAlloc = kataan::pool_alloc::PoolAlloc;
+
 /// Env var that puts the test binary into *worker* mode: `"start:step:outpath"`.
 const WORKER_ENV: &str = "KATAAN_T262_WORKER";
 
