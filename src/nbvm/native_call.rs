@@ -57,6 +57,10 @@ enum FastOp {
     None,
     /// `Array.prototype.push`.
     ArrayPush,
+    /// `Array.prototype.pop`.
+    ArrayPop,
+    /// `String.prototype.indexOf`.
+    StrIndexOf,
     /// `String.prototype.charCodeAt`.
     StrCharCodeAt,
     /// `String.prototype.charAt`.
@@ -107,6 +111,8 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
     };
     match (id, name) {
         (N_ARRAY_PROTO_FN, b"push") => FastOp::ArrayPush,
+        (N_ARRAY_PROTO_FN, b"pop") => FastOp::ArrayPop,
+        (N_STRING_PROTO_FN, b"indexOf") => FastOp::StrIndexOf,
         (N_STRING_PROTO_FN, b"charCodeAt") => FastOp::StrCharCodeAt,
         (N_STRING_PROTO_FN, b"charAt") => FastOp::StrCharAt,
         (N_MAP_PROTO_FN, b"get") => FastOp::MapGet,
@@ -229,6 +235,49 @@ pub(super) fn try_call(
                 len = realm.array_push(h, regs[*r as usize]).unwrap_or(len);
             }
             NanBox::number(len as f64)
+        }
+        FastOp::ArrayPop => {
+            // The host's dense-array `pop` guards; an inherited getter could fire
+            // only for a hole at the index read.
+            let dense_len = realm.array_elements(h)?.len();
+            if realm.array_has_index_overrides(h)
+                || realm.proto_index_accessor_dirty()
+                || (dense_len > 0 && realm.array_hole_at(h, dense_len - 1))
+                || realm.array_length(h) != Some(dense_len)
+                || realm.array_length_is_readonly(h)
+            {
+                return None;
+            }
+            realm.array_pop(h)
+        }
+        FastOp::StrIndexOf => {
+            // A string needle (ToString is the identity) and a Number or absent
+            // position (ToIntegerOrInfinity runs no code).
+            let needle = arg(0).as_handle().map(Handle::from_raw)?;
+            if !realm.is_string_handle(h) || !realm.is_string_handle(needle) {
+                return None;
+            }
+            let pos = arg(1);
+            let pos = match pos.as_number() {
+                Some(n) => n,
+                None if pos.is_undefined() => 0.0,
+                None => return None,
+            };
+            realm.flatten_string(h);
+            realm.flatten_string(needle);
+            let rope = realm.string_rope(h)?;
+            let hay = rope.as_leaf_bytes()?;
+            let units = rope.utf16_len();
+            // `max(0)` maps NaN to 0 as ToIntegerOrInfinity does; the cast
+            // truncates the rest and saturates +Infinity.
+            let from = (pos.max(0.0) as usize).min(units);
+            let pat = realm.string_leaf_bytes(needle)?;
+            NanBox::number(crate::nbexec::index_of_units(
+                hay,
+                pat,
+                from,
+                rope.is_ascii(),
+            ))
         }
         FastOp::StrCharCodeAt | FastOp::StrCharAt => {
             if !realm.is_string_handle(h) {

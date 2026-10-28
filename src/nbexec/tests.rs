@@ -12526,3 +12526,28 @@ fn vm_native_method_sites_honour_replacement() {
         "1,2,3,4,5,6,104,h,101,e,121,y,c0,,c1,,c2,,1,own,1,2,own,2,y,subx,y,subx,1,2,sp,sp,3,4,1,trap,1,trap,true,false,true,false,H,H,H,H,true,true,false,false,1,true,1,true,mine,true,mine,true"
     );
 }
+
+#[test]
+fn vm_native_index_of_and_pop_sites() {
+    // `indexOf` with an empty needle answers the clamped position itself, even
+    // between the halves of a surrogate pair; `pop` keeps its hole, frozen and
+    // inherited-index semantics when served from a warmed call site.
+    let src = r#"
+        function f() {
+            var out = [], s = "a\u{1F600}b";
+            for (var p = 0; p < 6; p++) out.push(s.indexOf("", p), s.indexOf("b", p));
+            var a = [1, , 3];
+            for (var i = 0; i < 4; i++) out.push(a.pop(), a.length);
+            var c = Object.freeze([5, 6]);
+            try { c.pop(); } catch (e) { out.push(e.constructor.name, c.length); }
+            var d = [1, , 3]; d.pop(); Array.prototype[1] = "proto";
+            out.push(d.pop(), d.length); delete Array.prototype[1];
+            return out.join(",");
+        }
+        f()
+    "#;
+    assert_eq!(
+        run(src),
+        "0,3,1,3,2,3,3,3,4,-1,4,-1,3,2,,1,1,0,,0,TypeError,2,proto,1"
+    );
+}

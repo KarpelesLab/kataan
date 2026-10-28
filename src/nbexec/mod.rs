@@ -7047,7 +7047,13 @@ fn wtf8_code_point_iter(bytes: &[u8]) -> impl Iterator<Item = (u32, usize, usize
 /// `String.prototype.indexOf` over UTF-16 units: searches the WTF-8 `hay` for
 /// the WTF-8 `needle` starting at UTF-16 unit `from`, returning the unit index
 /// of the match (or `-1`). Mirrors JS: an empty needle matches at `from`.
-fn index_of_units(hay: &[u8], needle: &[u8], from: usize, ascii: bool) -> f64 {
+pub(crate) fn index_of_units(hay: &[u8], needle: &[u8], from: usize, ascii: bool) -> f64 {
+    // The empty string matches at the (already clamped) start position itself,
+    // even one between the halves of a surrogate pair, which the byte
+    // conversions below would round to a character boundary.
+    if needle.is_empty() {
+        return from as f64;
+    }
     // For an all-ASCII haystack a unit index *is* a byte index, so both
     // conversions are the identity. Walking them made `s.indexOf(x, i)` O(i),
     // and a loop over the string quadratic.
@@ -7057,9 +7063,6 @@ fn index_of_units(hay: &[u8], needle: &[u8], from: usize, ascii: bool) -> f64 {
         unit_to_byte(hay, from)
     };
     let to_unit = |b: usize| -> usize { if ascii { b } else { byte_to_unit(hay, b) } };
-    if needle.is_empty() {
-        return to_unit(start_byte) as f64;
-    }
     let mut i = start_byte;
     while i + needle.len() <= hay.len() {
         if &hay[i..i + needle.len()] == needle {
