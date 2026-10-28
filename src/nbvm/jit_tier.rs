@@ -326,7 +326,43 @@ pub(crate) extern "C" fn jit_helper_exec_op(
     // code runs.
     #[allow(unsafe_code)]
     let op = unsafe { &*op };
-    match run_frame(ctx, funcs, core::slice::from_ref(op), regs) {
+    // A property op keeps its inline cache across executions, in a table
+    // keyed by the op's address: the op lives in bytecode the `JitProto` owns,
+    // which `ctx.jit_cache` keeps alive for the whole `Ctx`, so the address
+    // names this one site for as long as the table exists. (A fresh cache per
+    // execution would miss, and re-arm, every single time.)
+    let cached = matches!(
+        op,
+        Op::GetProp { .. }
+            | Op::SetProp { .. }
+            | Op::SetPropStrict { .. }
+            | Op::InitProp { .. }
+            | Op::CallMethod { .. }
+    );
+    let r = if cached {
+        let key = core::ptr::from_ref(op) as usize;
+        let mut ic = core::mem::take(&mut ctx.exec_op_ic);
+        ic.clear();
+        ic.push(ctx.exec_op_ics.remove(&key).unwrap_or_default());
+        let r = super::run_frame_at_ic(
+            ctx,
+            funcs,
+            core::slice::from_ref(op),
+            regs,
+            0,
+            alloc::vec::Vec::new(),
+            None,
+            &mut ic,
+        );
+        if let Some(c) = ic.pop() {
+            ctx.exec_op_ics.insert(key, c);
+        }
+        ctx.exec_op_ic = ic;
+        r
+    } else {
+        run_frame(ctx, funcs, core::slice::from_ref(op), regs)
+    };
+    match r {
         Ok(FrameExit::Return(None)) => 0,
         Ok(_) => {
             ctx.jit_pending_fault = Some(VmError::Unsupported);

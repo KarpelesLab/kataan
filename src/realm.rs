@@ -198,6 +198,12 @@ pub struct Realm {
     /// (`Object.setPrototypeOf(fn, null)`), distinguishing them from the default
     /// (which resolves to `%Function.prototype%`). Same non-GC-root caveat.
     callable_null_protos: alloc::collections::BTreeSet<u64>,
+    /// The `[[Prototype]]` of a VM closure ([`Cell::VmFunction`]) that carries
+    /// no `native_protos` entry: the main realm's `%Function.prototype%`,
+    /// recorded by the first [`link_vm_fn_proto`](Realm::link_vm_fn_proto) of a
+    /// single-realm run so that creating a closure does not insert a side-table
+    /// entry. Closures made once other realms exist are always stamped.
+    vm_fn_default_proto: Option<Handle>,
     /// Class tags for *non-object* cells — a derived instance of a native base
     /// (`class S extends Map {}` → a real `Map` cell) records its class here, since
     /// the inline class tag lives only on plain-object cells. Read by
@@ -583,6 +589,7 @@ impl Realm {
             default_object_proto: None,
             native_protos: alloc::collections::BTreeMap::new(),
             callable_null_protos: alloc::collections::BTreeSet::new(),
+            vm_fn_default_proto: None,
             native_class_tags: alloc::collections::BTreeMap::new(),
             typed_array_intrinsic: None,
             function_proto_intrinsic: None,
@@ -617,6 +624,28 @@ impl Realm {
     /// Replaces the RegExp legacy static match record after a successful match.
     pub fn set_legacy_regexp(&mut self, state: LegacyRegExpState) {
         self.legacy_regexp = state;
+    }
+
+    /// Links the new VM closure `f` to the running realm's
+    /// `%Function.prototype%`. In a single-realm run that is the default every
+    /// unlinked closure reports (`vm_fn_default_proto`), so no entry is made;
+    /// once other realms exist (or if the running realm's prototype is some
+    /// other object) the link is recorded explicitly.
+    pub fn link_vm_fn_proto(&mut self, f: Handle) {
+        let Some(proto) = self.function_proto_intrinsic else {
+            return;
+        };
+        if !self.multi_realm {
+            match self.vm_fn_default_proto {
+                None => {
+                    self.vm_fn_default_proto = Some(proto);
+                    return;
+                }
+                Some(p) if p == proto => return,
+                Some(_) => {}
+            }
+        }
+        self.set_native_proto(f, proto);
     }
 
     /// Records an explicit `[[Prototype]]` for a callable cell (native / bound
@@ -3044,6 +3073,15 @@ impl Realm {
         if matches!(self.heap.get(handle), Some(Cell::BigInt(_))) {
             return self.bigint_proto_intrinsic;
         }
+        // A VM closure with no explicit link (see `vm_fn_default_proto`).
+        if let Some(p) = self.vm_fn_default_proto
+            && matches!(self.heap.get(handle), Some(Cell::VmFunction { .. }))
+        {
+            if self.callable_null_protos.contains(&handle.to_raw()) {
+                return None;
+            }
+            return Some(p);
+        }
         // An ordinary/native callable with no explicit override and no inline
         // object part has `[[Prototype]] === %Function.prototype%` (unless it was
         // explicitly set to `null`).
@@ -4020,6 +4058,17 @@ impl Realm {
                 absent: false,
             }));
             return;
+        }
+    }
+
+    /// The `length` of the [`Cell::Array`] at `handle` (see
+    /// [`array_length`](Realm::array_length)); `None` for any other cell.
+    #[inline]
+    #[must_use]
+    pub fn plain_array_length(&self, handle: Handle) -> Option<usize> {
+        match self.heap.get(handle)? {
+            Cell::Array(_) => self.array_length(handle),
+            _ => None,
         }
     }
 
@@ -5094,6 +5143,7 @@ impl Realm {
         // class prototypes: both are keyed by an identity the heap graph does not
         // reach, so their values are strong roots.
         out.extend(self.native_protos.values().copied());
+        out.extend(self.vm_fn_default_proto);
         out.extend(self.vm_fn_meta.iter().map(|(n, _)| *n));
         out.extend(self.intl_protos.values().copied());
         // Host-pinned values and the JIT's spilled temporaries.

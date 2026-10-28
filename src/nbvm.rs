@@ -1457,6 +1457,10 @@ fn hosted_ctx_in<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
         pending_callee: None,
         pending_new_target: None,
         reg_pool: Vec::new(),
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        exec_op_ic: Vec::new(),
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        exec_op_ics: alloc::collections::BTreeMap::new(),
         in_realm: None,
     }
 }
@@ -3369,10 +3373,8 @@ fn link_async_proto(ctx: &mut Ctx, proto: Option<&FnProto>, f: Handle) {
 }
 
 fn link_function_proto(ctx: &mut Ctx, f: Handle) {
-    if ctx.host.is_some()
-        && let Some(proto) = ctx.realm.intrinsics_snapshot().function_proto
-    {
-        ctx.realm.set_native_proto(f, proto);
+    if ctx.host.is_some() {
+        ctx.realm.link_vm_fn_proto(f);
     }
 }
 
@@ -3811,6 +3813,13 @@ struct Ctx<'a> {
     /// call does not allocate one. Each is empty while pooled (`clear`ed on
     /// return), so a pooled window holds no stale values and no roots.
     reg_pool: Vec<Vec<NanBox>>,
+    /// Inline caches of the property ops the generic JIT tier runs one at a
+    /// time through the interpreter (`jit_tier::jit_helper_exec_op`), keyed by
+    /// the op's address, plus a scratch one-entry cache vector for that call.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    exec_op_ics: alloc::collections::BTreeMap<usize, PropertyCache>,
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    exec_op_ic: Vec<PropertyCache>,
     /// The host realm (a `$262.createRealm()` index) this run executes in,
     /// when not the main one: closures it creates belong to that realm.
     in_realm: Option<usize>,
@@ -3890,6 +3899,10 @@ pub fn run_program(
             pending_callee: None,
             pending_new_target: None,
             reg_pool: Vec::new(),
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            exec_op_ic: Vec::new(),
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            exec_op_ics: alloc::collections::BTreeMap::new(),
             in_realm: None,
         };
         let r = call(&mut ctx, funcs, id, args).and_then(|value| {
@@ -3938,6 +3951,10 @@ pub fn run_program_capturing(
             pending_callee: None,
             pending_new_target: None,
             reg_pool: Vec::new(),
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            exec_op_ic: Vec::new(),
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            exec_op_ics: alloc::collections::BTreeMap::new(),
             in_realm: None,
         };
         let r = call(&mut ctx, funcs, id, args).and_then(|value| {
@@ -4479,6 +4496,10 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
             pending_callee: None,
             pending_new_target: None,
             reg_pool: Vec::new(),
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            exec_op_ic: Vec::new(),
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            exec_op_ics: alloc::collections::BTreeMap::new(),
             in_realm: None,
         };
         let r = match run_frame(&mut ctx, &[], program, &mut regs) {
@@ -4962,6 +4983,14 @@ fn vm_get_prop(
     if let Some(h) = recv.as_handle().map(Handle::from_raw)
         && !ctx.realm.is_host_exotic(h)
     {
+        // An Array's `length` is an own data property (never an accessor, and
+        // not configurable, so it cannot be redefined as one) whose value is
+        // the realm's array length: what the host's `[[Get]]` reads too.
+        if key == "length"
+            && let Some(n) = ctx.realm.plain_array_length(h)
+        {
+            return Ok(NanBox::number(n as f64));
+        }
         if let Some(v) = ctx.realm.object_cached_get(h, key, cache) {
             return Ok(v);
         }
@@ -6346,6 +6375,7 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
 /// Returns `Some(value)` on `Return`, `None` if control falls off the end.
 /// `Call` ops dispatch into `funcs` via [`call`] (a fresh register window per
 /// activation); `CallNative` dispatches to a built-in via [`call_native`].
+#[inline(always)]
 fn run_frame(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -6357,6 +6387,7 @@ fn run_frame(
 
 /// [`run_frame`] from `pc` with an existing handler stack (a resumed
 /// generator), optionally throwing `inject` at that point first.
+#[inline(always)]
 fn run_frame_at(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -24476,6 +24507,10 @@ mod generic_jit_tests {
             pending_callee: None,
             pending_new_target: None,
             reg_pool: Vec::new(),
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            exec_op_ic: Vec::new(),
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            exec_op_ics: alloc::collections::BTreeMap::new(),
             in_realm: None,
         }
     }
