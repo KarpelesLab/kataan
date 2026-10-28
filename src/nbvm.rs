@@ -5567,6 +5567,18 @@ fn vm_get_prop(
     }
 }
 
+/// An array-index store past the dense storage cap (`arr["3000000000"] = v`):
+/// a valid index below 2^32 - 1 must be stored sparsely and grow `length`, never
+/// raise. The host owns that sparse path, so a hosted run faults to it; a bare
+/// VM (no host) can only refuse with a catchable `RangeError`.
+fn past_cap_array_store(ctx: &mut Ctx) -> Result<(), VmError> {
+    if ctx.host.is_some() {
+        return Err(VmError::Unsupported);
+    }
+    let e = vm_error(ctx, "RangeError", "Invalid array length");
+    Err(VmError::Thrown(e))
+}
+
 /// The interpreter's real property **set** for a static string key
 /// (`Op::SetProp`'s semantics), factored out so the bytecode VM **and** the
 /// generic-JIT runtime helper ([`jit_helper_set_prop`]) share one code path and
@@ -5616,8 +5628,7 @@ fn vm_set_prop(
         && (i as u64) < u64::from(u32::MAX)
     {
         if i >= ctx.realm.limits.max_array_len {
-            let e = vm_error(ctx, "RangeError", "Invalid array length");
-            return Err(VmError::Thrown(e));
+            return past_cap_array_store(ctx);
         }
         if ctx.realm.array_index_has_override(handle, i) {
             return Err(VmError::Unsupported);
@@ -9774,12 +9785,11 @@ fn vm_set_elem(
                 && n == (n as u64) as f64
                 && (n as u64) < u64::from(u32::MAX) =>
         {
-            // C1: refuse-past-cap surfaces as a catchable RangeError (see
-            // `Op::SetElem`).
+            // Past the dense cap: the host's sparse store (see
+            // `past_cap_array_store`).
             let i = n as usize;
             if i >= ctx.realm.limits.max_array_len {
-                let e = vm_error(ctx, "RangeError", "Invalid array length");
-                return Err(VmError::Thrown(e));
+                return past_cap_array_store(ctx);
             }
             // A demoted / accessor index (or frozen/sealed array) needs the
             // descriptor-aware interpreter store. Fault to it.
@@ -9825,8 +9835,7 @@ fn vm_set_elem(
                 && (i as u64) < u64::from(u32::MAX)
             {
                 if i >= ctx.realm.limits.max_array_len {
-                    let e = vm_error(ctx, "RangeError", "Invalid array length");
-                    return Err(VmError::Thrown(e));
+                    return past_cap_array_store(ctx);
                 }
                 if ctx.realm.array_index_has_override(handle, i) {
                     return Err(VmError::Unsupported);

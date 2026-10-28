@@ -473,3 +473,18 @@ fn define_property_invariant_sees_array_index_attributes() {
     "#;
     assert_eq!(run(src), "true,true");
 }
+
+/// An array-index store past the dense storage cap with a *string* key
+/// (`a["4294967294"] = v`, as `a[4294967294] = v` already did) is stored
+/// sparsely and grows `length`; it raised a RangeError.
+#[test]
+fn string_keyed_array_index_past_cap_is_stored() {
+    let src = r#"
+        var a = [], k = "4294967294";
+        a["4294967294"] = 1;
+        var b = [1]; b[k] = 2;
+        var c = [1]; c["100000000"] = 3;
+        [a.length, b.length, b[k], c.length, Object.keys(c).join()].join()
+    "#;
+    assert_eq!(run(src), "4294967295,4294967295,2,100000001,0,100000000");
+}
