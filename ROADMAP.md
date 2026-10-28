@@ -1001,6 +1001,41 @@ neverSettles }}` parks forever.
 
 ### 5.1 Long-standing performance work
 
+**Measured against node (2026-10-28).** `bench/run.sh 3` runs fourteen
+original (clean-room) programs, takes best-of-3 wall clock, and checks each
+program's output against node's. Ratios are kataan/node; lower is better.
+
+| benchmark | start of campaign (42796a5) | 8ca64fb |
+| --- | ---: | ---: |
+| fib | 19x | 4.5x |
+| json | 11x | 3.5x |
+| sort | 20x | 5.0x |
+| map_set | 400x | 6.6x |
+| array_ops | 44x | 7.6x |
+| string_build | 14x | 7.4x |
+| prop_access | 101x | 9.4x |
+| richards_like | (quadratic, fixed) | 9.4x |
+| regex | 18x | 11.5x |
+| objects_alloc | 265x | 16.2x |
+| closures | 69x | 16.9x |
+| method_calls | 80x | 21.6x |
+| loop_arith | 372x | 25.6x |
+| nbody_like | 205x | 28.9x |
+
+The main contributors, by landing order:
+- number fast paths;
+- Map/Set tombstones (the iteration was quadratic);
+- global binding slots and a `Box<Realm>` pointer swap at the host boundary;
+- object and array literals without descriptor objects, a flat GC mark set, and a 96-byte `Object`;
+- persistent and prototype-chain inline caches;
+- the machine-code JIT on by default, with a frame-ABI generic tier, OSR, compiled exception handlers, and direct compiled-to-compiled calls;
+- for-of over plain arrays and Math computed in the VM;
+- warm tier state for host callbacks;
+- a hashed shape index.
+
+Startup is 3 ms against node's ~15 ms.
+
+
 - **Interpreter:** IC tuning, array element-kind fast paths, rope tuning, finish
   the generational nursery + write barriers on the existing moving GC for
   bump-allocation throughput.
