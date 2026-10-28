@@ -5147,22 +5147,16 @@ fn vm_get_prop(
                 && let Some((id, _)) = ctx.realm.vm_function(handle)
                 && funcs.get(id as usize).is_some_and(|p| p.legacy)
             {
-                let Some(i) = ctx
-                    .realm
-                    .vm_callee_stack
+                let (stack, starts, buf) = legacy_activations(ctx);
+                let Some(i) = stack
                     .iter()
                     .rposition(|c| c.as_handle() == Some(handle.to_raw()))
                 else {
                     return Ok(NanBox::null());
                 };
-                let start = ctx.realm.vm_callee_args[i];
-                let end = ctx
-                    .realm
-                    .vm_callee_args
-                    .get(i + 1)
-                    .copied()
-                    .unwrap_or(ctx.realm.vm_args_buf.len());
-                let argv = ctx.realm.vm_args_buf[start..end].to_vec();
+                let start = starts[i];
+                let end = starts.get(i + 1).copied().unwrap_or(buf.len());
+                let argv = buf[start..end].to_vec();
                 let callee = NanBox::handle(handle.to_raw());
                 return with_host(ctx, |h| h.make_arguments(&argv, callee, false))
                     .ok_or(VmError::Unsupported);
@@ -5173,13 +5167,12 @@ fn vm_get_prop(
                 && let Some((id, _)) = ctx.realm.vm_function(handle)
                 && funcs.get(id as usize).is_some_and(|p| p.legacy)
             {
-                let caller = ctx
-                    .realm
-                    .vm_callee_stack
+                let (stack, _, _) = legacy_activations(ctx);
+                let caller = stack
                     .iter()
                     .rposition(|c| c.as_handle() == Some(handle.to_raw()))
                     .and_then(|i| i.checked_sub(1))
-                    .map(|i| ctx.realm.vm_callee_stack[i])
+                    .map(|i| stack[i])
                     .filter(|c| {
                         c.as_handle()
                             .and_then(|h| ctx.realm.vm_function(Handle::from_raw(h)))
@@ -5458,7 +5451,12 @@ pub(crate) extern "C" fn jit_helper_get_prop(
     // other reference to it is live while the native body runs.
     #[allow(unsafe_code)]
     let cache = unsafe { &mut *(cache as *mut PropertyCache) };
-    match vm_get_prop(ctx, funcs, NanBox::from_bits(obj), key, cache) {
+    // A VM getter with a compiled body is entered directly (`jit_tier`).
+    let r = match jit_tier::compiled_getter(ctx, funcs, NanBox::from_bits(obj), key, cache) {
+        Some(r) => r,
+        None => vm_get_prop(ctx, funcs, NanBox::from_bits(obj), key, cache),
+    };
+    match r {
         Ok(v) => v.to_bits(),
         Err(e) => {
             ctx.jit_pending_fault = Some(e);
@@ -5704,6 +5702,13 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         push_handler: jit_tier::jit_helper_push_handler,
         pop_handler: jit_tier::jit_helper_pop_handler,
         call_method: jit_tier::jit_helper_call_method,
+        call_value: jit_tier::jit_helper_call_value,
+        method_info: jit_tier::jit_method_info,
+        construct: jit_tier::jit_helper_construct,
+        construct_info: jit_tier::jit_construct_info,
+        construct_result: jit_tier::jit_construct_result,
+        callee_info: jit_tier::jit_callee_info,
+        call_layout: jit_tier::call_layout(),
         unwind: jit_tier::jit_helper_unwind,
     }
 }
@@ -6373,6 +6378,22 @@ fn fold2(dst: Reg, a: Option<f64>, b: Option<f64>, f: impl Fn(f64, f64) -> NanBo
 
 /// The bytecode tier's **GC safepoint**, taken on a loop back-edge.
 ///
+/// Every live VM activation, innermost last, as the legacy `f.caller` /
+/// `f.arguments` see them: the callee values, where each one's arguments start
+/// in the third list, and the arguments. The realm's stacks, plus the
+/// activations the JIT's native call sequence entered without them.
+fn legacy_activations(ctx: &Ctx) -> (Vec<NanBox>, Vec<usize>, Vec<NanBox>) {
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    if let Some(v) = jit_tier::callee_view(ctx) {
+        return v;
+    }
+    (
+        ctx.realm.vm_callee_stack.clone(),
+        ctx.realm.vm_callee_args.clone(),
+        ctx.realm.vm_args_buf.clone(),
+    )
+}
+
 /// Collection is only sound where the whole root set is enumerable, and in this
 /// engine that is true at exactly one place: the top of the *outermost*
 /// activation's dispatch loop. Everywhere else a live [`NanBox`] may sit in a
@@ -6423,6 +6444,11 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
         .chain(ctx.realm.vm_callee_stack.iter())
         .chain(ctx.realm.vm_args_buf.iter())
     {
+        push(&mut roots, *r);
+    }
+    // Compiled activations' windows and native-call headers (`jit_tier`).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    for r in jit_tier::stack_roots(ctx) {
         push(&mut roots, *r);
     }
     for t in &ctx.microtasks {
@@ -27021,7 +27047,7 @@ mod generic_jit_tests {
             "f",
         );
         assert!(
-            crate::jit::lower_nbvm_generic(&funcs[f]).is_some_and(|(ops, _, _)| ops
+            crate::jit::lower_nbvm_generic(&funcs[f]).is_some_and(|(ops, ..)| ops
                 .iter()
                 .any(|o| matches!(o, crate::jit::GenericOp::Interp { .. }))),
             "f must use interpreter fallback ops"

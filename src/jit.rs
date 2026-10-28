@@ -21,6 +21,14 @@
 
 use alloc::vec::Vec;
 
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod call_seq;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub use call_seq::{
+    CallLayout, CallSite, CalleeHelper, CalleeInfo, ConstructHelper, ConstructResultHelper,
+    FRAME_HEADER, JitStack, MethodHelper,
+};
+
 /// `2^53` — the largest magnitude an `f64` represents every integer below
 /// exactly. The integer JIT keeps a value only while it stays within ±this; a
 /// result outside the range deopts, since `i64` and `f64` arithmetic diverge
@@ -2027,6 +2035,46 @@ pub enum GenericOp {
         pc: u32,
         /// The site index (its method-lookup cache).
         site: u16,
+        /// Destination register.
+        dst: u16,
+        /// The receiver register.
+        recv: u16,
+        /// Index into the per-call-site argument-register table.
+        args: u16,
+        /// Index into the per-site call caches (the native call sequence's).
+        cache: u16,
+    },
+    /// `Op::CallValue` (`callee(args)`, `this` undefined): the native call
+    /// sequence into a compiled callee (`call_seq::emit_call`), guarded on the
+    /// site's one-entry cache `cache`; anything else is
+    /// `jit_helper_call_value` (the interpreter's call, which refills the
+    /// cache). The argument registers are at call-site table index `site`.
+    CallValue {
+        /// Destination register.
+        dst: u16,
+        /// Register holding the callee value.
+        callee: u16,
+        /// Index into the per-call-site argument-register table.
+        site: u16,
+        /// Index into the per-site call caches.
+        cache: u16,
+        /// The bytecode pc of the op (its slow path).
+        pc: u32,
+    },
+    /// `Op::Construct` (`new ctor(args)`): the native call sequence for an
+    /// ordinary VM constructor (`call_seq::CalleeSrc::Construct`), else
+    /// `jit_helper_construct` (the interpreter's, refilling the cache).
+    Construct {
+        /// Destination register.
+        dst: u16,
+        /// Register holding the constructor.
+        ctor: u16,
+        /// Index into the per-call-site argument-register table.
+        site: u16,
+        /// Index into the per-site call caches.
+        cache: u16,
+        /// The bytecode pc of the op (its slow path).
+        pc: u32,
     },
     /// `return reg[src]`.
     Ret {
@@ -2040,7 +2088,12 @@ pub enum GenericOp {
 /// hold stable pointers into them for the inline caches), and the per-call-site
 /// argument-register lists.
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-type GenericLowering = (Vec<GenericOp>, Vec<alloc::boxed::Box<str>>, Vec<Vec<u16>>);
+type GenericLowering = (
+    Vec<GenericOp>,
+    Vec<alloc::boxed::Box<str>>,
+    Vec<Vec<u16>>,
+    usize,
+);
 
 /// Why the generic tier cannot run `op` at all — `None` when it can (inline, via
 /// a helper, or by handing the op to the interpreter). The refused ops are the
@@ -2093,8 +2146,10 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
     // Per-site key strings for `GetProp`/`SetProp` (the site index into this Vec is
     // stored in the op); the caller boxes each for a stable pointer + persistent IC.
     let mut keys: Vec<alloc::boxed::Box<str>> = Vec::new();
-    // Per-call-site argument-register lists (`CallNative`).
+    // Per-call-site argument-register lists (`CallNative`, `CallValue`).
     let mut call_args: Vec<Vec<u16>> = Vec::new();
+    // Call caches (`CallValue`).
+    let mut n_calls = 0usize;
     for (pc, op) in proto.ops.iter().enumerate() {
         if generic_refuses(op).is_some() {
             return None;
@@ -2230,15 +2285,85 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
                 GenericOp::Nop
             }
             Op::Return { src } => GenericOp::Ret { src: r(*src)? },
+            // Filled in on entry (`call_with_inner`, or the native-call entry);
+            // the interpreter runs them as no-ops.
+            Op::MakeArguments { .. } | Op::LoadNewTarget { .. } => GenericOp::Nop,
+            Op::Construct { dst, ctor, args } if args.len() <= 32 => {
+                let mut argregs: Vec<u16> = Vec::with_capacity(args.len());
+                for a in args {
+                    argregs.push(r(*a)?);
+                }
+                let site = u16::try_from(call_args.len()).ok()?;
+                call_args.push(argregs);
+                let cache = u16::try_from(n_calls).ok()?;
+                n_calls += 1;
+                GenericOp::Construct {
+                    dst: r(*dst)?,
+                    ctor: r(*ctor)?,
+                    site,
+                    cache,
+                    pc: pc32,
+                }
+            }
+            Op::CallValue { dst, callee, args } if args.len() <= 32 => {
+                let mut argregs: Vec<u16> = Vec::with_capacity(args.len());
+                for a in args {
+                    argregs.push(r(*a)?);
+                }
+                let site = u16::try_from(call_args.len()).ok()?;
+                call_args.push(argregs);
+                let cache = u16::try_from(n_calls).ok()?;
+                n_calls += 1;
+                GenericOp::CallValue {
+                    dst: r(*dst)?,
+                    callee: r(*callee)?,
+                    site,
+                    cache,
+                    pc: pc32,
+                }
+            }
             Op::PushHandler { target, reg } => GenericOp::PushHandler {
                 target: (*target <= proto.ops.len()).then_some(*target)?,
                 reg: r(*reg)?,
             },
             Op::PopHandler => GenericOp::PopHandler,
+            Op::CallMethod {
+                dst,
+                recv,
+                key,
+                args,
+            } if args.len() <= 32 => {
+                let site = u16::try_from(keys.len()).ok()?;
+                keys.push(alloc::boxed::Box::from(key.as_str()));
+                let mut argregs: Vec<u16> = Vec::with_capacity(args.len());
+                for a in args {
+                    argregs.push(r(*a)?);
+                }
+                let args = u16::try_from(call_args.len()).ok()?;
+                call_args.push(argregs);
+                let cache = u16::try_from(n_calls).ok()?;
+                n_calls += 1;
+                GenericOp::CallMethod {
+                    pc: pc32,
+                    site,
+                    dst: r(*dst)?,
+                    recv: r(*recv)?,
+                    args,
+                    cache,
+                }
+            }
             Op::CallMethod { key, .. } => {
                 let site = u16::try_from(keys.len()).ok()?;
                 keys.push(alloc::boxed::Box::from(key.as_str()));
-                GenericOp::CallMethod { pc: pc32, site }
+                // No native sequence (`args` past the cap): `cache` is unused.
+                GenericOp::CallMethod {
+                    pc: pc32,
+                    site,
+                    dst: 0,
+                    recv: 0,
+                    args: u16::MAX,
+                    cache: u16::MAX,
+                }
             }
             Op::InitProp { obj, key, src } => {
                 let site = u16::try_from(keys.len()).ok()?;
@@ -2280,7 +2405,7 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
         };
         out.push(lowered);
     }
-    Some((out, keys, call_args))
+    Some((out, keys, call_args, n_calls))
 }
 
 /// Why [`lower_nbvm_generic`] rejects `proto` — a human-readable diagnostic for
@@ -2310,6 +2435,12 @@ pub struct JitProto {
     func: JitFunction,
     n_params: usize,
     kind: JitKind,
+    /// Generic tier: the byte offset of the native-call entry
+    /// (`call_seq::emit_native_entry`) — `None` for a body with `try` regions,
+    /// whose handler stack needs the activation set-up the ordinary entry
+    /// (`jit_tier::run_compiled`) does, or one whose `new.target` register the
+    /// entry cannot fill.
+    native_entry: Option<usize>,
     /// Generic tier: the register-file size the body addresses (the bytecode's
     /// `n_regs`); a caller's register file must be at least this long.
     n_regs: usize,
@@ -2340,6 +2471,10 @@ struct GenericSites {
     keys: Vec<alloc::boxed::Box<str>>,
     /// Persistent monomorphic inline caches, one per site.
     caches: alloc::boxed::Box<[core::cell::UnsafeCell<crate::ic::PropertyCache>]>,
+    /// The `CallValue` sites' one-entry callee caches (the emitted code holds
+    /// their addresses; the site helper refills them).
+    #[allow(dead_code)]
+    calls: alloc::boxed::Box<[core::cell::UnsafeCell<CallSite>]>,
 }
 
 /// The generic-tier runtime-helper table: the `extern "C"` slow paths the emitted
@@ -2400,8 +2535,27 @@ pub struct GenericHelpers {
     pub push_handler: JitAddHelper,
     /// `Op::PopHandler` (`jit_helper_pop_handler(ctx, _)`): never throws.
     pub pop_handler: JitTruthyHelper,
-    /// `Op::CallMethod` (`jit_helper_call_method(ctx, regs, n_regs, op, cache)`).
+    /// `Op::CallMethod` (`jit_helper_call_method(ctx, regs, n_regs, op, cache,
+    /// call_site)`, `call_site` the native sequence's `CallSite` or null).
     pub call_method: JitCallMethodHelper,
+    /// A method call's callee lookup (`jit_method_info`).
+    pub method_info: MethodHelper,
+    /// `Op::Construct`'s slow path (`jit_helper_construct(ctx, regs, n_regs,
+    /// op, site, _)`): the interpreter's, refilling the site's cache.
+    pub construct: JitCallMethodHelper,
+    /// A `new`'s callee check and object creation (`jit_construct_info`).
+    pub construct_info: ConstructHelper,
+    /// A `new`'s result when the body returned a heap value
+    /// (`jit_construct_result`).
+    pub construct_result: ConstructResultHelper,
+    /// `Op::CallValue`'s slow path (`jit_helper_call_value(ctx, regs, n_regs,
+    /// op, site)`, `site` the `CallSite`): the interpreter's call, which also
+    /// refills the site's cache.
+    pub call_value: JitCallMethodHelper,
+    /// The call sequence's callee identification (`jit_callee_info`).
+    pub callee_info: CalleeHelper,
+    /// Where the call sequence finds the interpreter state it maintains.
+    pub call_layout: CallLayout,
     /// The throw-exit unwinder (`jit_helper_unwind(ctx, regs, n_regs)`): if the
     /// pending fault is a thrown value and the activation has a handler, pop it,
     /// bind the value and return the catch pc; else [`NO_HANDLER`].
@@ -2416,6 +2570,7 @@ pub type JitCallMethodHelper = extern "C" fn(
     *mut u64,
     usize,
     *const crate::nbvm::Op,
+    *mut core::ffi::c_void,
     *mut core::ffi::c_void,
 ) -> u64;
 
@@ -2707,6 +2862,7 @@ impl JitProto {
                 func,
                 n_params: proto.n_params,
                 kind: JitKind::Int,
+                native_entry: None,
                 sites: None,
                 n_regs: proto.n_regs,
                 osr_entries: Vec::new(),
@@ -2719,6 +2875,7 @@ impl JitProto {
             func,
             n_params: proto.n_params,
             kind: JitKind::Float,
+            native_entry: None,
             sites: None,
             n_regs: proto.n_regs,
             osr_entries: Vec::new(),
@@ -2785,7 +2942,12 @@ impl JitProto {
     /// owned copy of the bytecode.
     #[must_use]
     pub fn compile_generic(proto: &crate::nbvm::FnProto, helpers: &GenericHelpers) -> Option<Self> {
-        let (ops, keys, call_args) = lower_nbvm_generic(proto)?;
+        let (ops, keys, call_args, n_calls) = lower_nbvm_generic(proto)?;
+        // One persistent cache per `CallValue` site (stable addresses, as below).
+        let calls: alloc::boxed::Box<[core::cell::UnsafeCell<CallSite>]> = (0..n_calls)
+            .map(|_| core::cell::UnsafeCell::new(CallSite::new()))
+            .collect();
+        let call_sites: Vec<*const CallSite> = calls.iter().map(|c| c.get().cast_const()).collect();
         let bytecode: alloc::boxed::Box<[crate::nbvm::Op]> = proto.ops.clone().into_boxed_slice();
         // One persistent inline cache per property-access site.
         let caches: alloc::boxed::Box<[core::cell::UnsafeCell<crate::ic::PropertyCache>]> = (0
@@ -2818,7 +2980,18 @@ impl JitProto {
             .collect();
         osr_entries.sort_unstable();
         osr_entries.dedup();
-        let func = JitFunction::compile_generic(
+        let uses_handlers = ops
+            .iter()
+            .any(|o| matches!(o, GenericOp::PushHandler { .. } | GenericOp::PopHandler));
+        // The register `call_with_inner` puts `new.target` in, if any (a
+        // native-call entry fills it from the call header; one at or below the
+        // `this` slot would collide with an input, so such a body gets none).
+        let new_target = proto.ops.iter().take(2).find_map(|o| match o {
+            crate::nbvm::Op::LoadNewTarget { dst } => Some(*dst as usize),
+            _ => None,
+        });
+        let nt_ok = new_target.is_none_or(|nt| nt > proto.n_params + proto.n_captures);
+        let (func, native_entry) = JitFunction::compile_generic(
             proto.n_regs,
             &ops,
             &bytecode,
@@ -2826,12 +2999,19 @@ impl JitProto {
             &site_info,
             &call_args,
             &osr_entries,
+            &call_sites,
+            (proto.n_params, proto.n_captures, new_target),
         )?;
         Some(Self {
             func,
             n_params: proto.n_params,
             kind: JitKind::Generic,
-            sites: Some(GenericSites { keys, caches }),
+            native_entry: (!uses_handlers && nt_ok).then_some(native_entry),
+            sites: Some(GenericSites {
+                keys,
+                caches,
+                calls,
+            }),
             n_regs: proto.n_regs,
             osr_entries,
             bytecode: Some(bytecode),
@@ -2941,6 +3121,14 @@ impl JitProto {
     #[must_use]
     pub fn n_regs(&self) -> usize {
         self.n_regs
+    }
+
+    /// The native-call entry address (`call_seq::emit_native_entry`) a call
+    /// sequence may enter this body at, if it has one.
+    #[must_use]
+    pub fn native_entry(&self) -> Option<u64> {
+        self.native_entry
+            .map(|off| (self.func.code_ptr() + off) as u64)
     }
 }
 
@@ -4588,7 +4776,9 @@ impl JitFunction {
         sites: &[SiteInfo],
         call_args: &[Vec<u16>],
         osr_entries: &[usize],
-    ) -> Option<Self> {
+        call_sites: &[*const CallSite],
+        (n_params, n_caps, new_target): (usize, usize, Option<usize>),
+    ) -> Option<(Self, usize)> {
         use crate::nanbox::NanBox;
         if ops.len() != bytecode.len() || n_regs > 0xffff {
             return None;
@@ -4614,6 +4804,12 @@ impl JitFunction {
         let pop_handler_helper = helpers.pop_handler as usize as u64;
         let unwind_helper = helpers.unwind as usize as u64;
         let call_method_helper = helpers.call_method as usize as u64;
+        let call_value_helper = helpers.call_value as usize as u64;
+        let callee_helper = helpers.callee_info as usize as u64;
+        let method_helper = helpers.method_info as usize as u64;
+        let construct_helper = helpers.construct_info as usize as u64;
+        let construct_result_helper = helpers.construct_result as usize as u64;
+        let construct_slow_helper = helpers.construct as usize as u64;
         // The catch entries of the body's `try` regions: where the throw exit
         // resumes after `jit_helper_unwind` binds a thrown value.
         let mut catch_targets: Vec<usize> = ops
@@ -4662,7 +4858,9 @@ impl JitFunction {
         let argbuf_disp = |i: usize| -(24 + (max_argc as i32 - i as i32) * 8);
         // Countdown slot + argument buffer, rounded to keep `rsp` 16-byte aligned
         // (after `push rbp; push r15; push rbx`, rsp ≡ 0 mod 16).
-        let frame = ((8 + max_argc as u32 * 8) + 15) & !15;
+        // One more slot under the buffer: a method call's looked-up callee.
+        let method_scratch = -(24 + (max_argc as i32 + 1) * 8);
+        let frame = ((16 + max_argc as u32 * 8) + 15) & !15;
         let mut a = X64Assembler::new();
         a.set_rbx_frame(true);
         // One label per op (any op can be a branch target or an OSR entry) plus
@@ -4846,20 +5044,64 @@ impl JitFunction {
                     a.movabs_rax(pop_handler_helper as i64);
                     a.call_rax();
                 }
-                GenericOp::CallMethod { pc, site } => {
+                GenericOp::CallMethod {
+                    pc,
+                    site,
+                    dst,
+                    recv,
+                    args,
+                    cache,
+                } => {
                     if pc as usize != op_idx {
                         return None;
                     }
                     let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
                     let si = sites.get(site as usize)?;
+                    let done = a.new_label();
+                    // The native call sequence, when the site has one.
+                    let native = call_args
+                        .get(args as usize)
+                        .zip(call_sites.get(cache as usize));
+                    let site_ptr = native.map_or(core::ptr::null(), |(_, c)| *c);
+                    if let Some((argv, &site_ptr)) = native {
+                        if !ok(dst) || !ok(recv) || argv.iter().any(|&r| !ok(r)) {
+                            return None;
+                        }
+                        let slow = a.new_label();
+                        call_seq::emit_call(
+                            &mut a,
+                            &call_seq::CallEmit {
+                                dst,
+                                callee: call_seq::CalleeSrc::Method {
+                                    recv,
+                                    key_ptr: si.key_ptr,
+                                    key_len: si.key_len,
+                                    cache: si.cache_ptr,
+                                    scratch: method_scratch,
+                                    helper: method_helper,
+                                },
+                                this: Some(recv),
+                                args: argv,
+                                site: site_ptr,
+                                layout: &helpers.call_layout,
+                                callee_helper,
+                                throw_exit,
+                                slow,
+                                done,
+                            },
+                        )?;
+                        a.bind(slow);
+                    }
                     a.mov_rdi_r15(); // rdi = ctx
                     a.mov_rsi_rbx(); // rsi = regs
                     a.movabs_argreg(2, n_regs as i64); // rdx = n_regs
                     a.movabs_argreg(3, op_ptr as i64); // rcx = &op
                     a.movabs_argreg(4, si.cache_ptr as i64); // r8 = the site cache
+                    a.movabs_argreg(5, site_ptr as i64); // r9 = the call cache (or null)
                     a.movabs_rax(call_method_helper as i64);
                     a.call_rax();
                     throw_check!();
+                    a.bind(done);
                 }
                 GenericOp::InitProp { obj, val, site } => {
                     if !ok(obj) || !ok(val) {
@@ -5487,6 +5729,101 @@ impl JitFunction {
                     a.load_rax(disp(src));
                     a.frame_epilogue();
                 }
+                GenericOp::Construct {
+                    dst,
+                    ctor,
+                    site,
+                    cache,
+                    pc,
+                } => {
+                    let args = call_args.get(site as usize)?;
+                    if !ok(dst) || !ok(ctor) || args.iter().any(|&r| !ok(r)) {
+                        return None;
+                    }
+                    if pc as usize != op_idx {
+                        return None;
+                    }
+                    let site_ptr = *call_sites.get(cache as usize)?;
+                    let slow = a.new_label();
+                    let done = a.new_label();
+                    call_seq::emit_call(
+                        &mut a,
+                        &call_seq::CallEmit {
+                            dst,
+                            callee: call_seq::CalleeSrc::Construct {
+                                ctor,
+                                scratch: method_scratch,
+                                helper: construct_helper,
+                                result: construct_result_helper,
+                            },
+                            this: None,
+                            args,
+                            site: site_ptr,
+                            layout: &helpers.call_layout,
+                            callee_helper,
+                            throw_exit,
+                            slow,
+                            done,
+                        },
+                    )?;
+                    a.bind(slow);
+                    let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
+                    a.mov_rdi_r15();
+                    a.mov_rsi_rbx();
+                    a.movabs_argreg(2, n_regs as i64);
+                    a.movabs_argreg(3, op_ptr as i64);
+                    a.movabs_argreg(4, site_ptr as i64);
+                    a.movabs_argreg(5, 0);
+                    a.movabs_rax(construct_slow_helper as i64);
+                    a.call_rax();
+                    throw_check!();
+                    a.bind(done);
+                }
+                GenericOp::CallValue {
+                    dst,
+                    callee,
+                    site,
+                    cache,
+                    pc,
+                } => {
+                    let args = call_args.get(site as usize)?;
+                    if !ok(dst) || !ok(callee) || args.iter().any(|&r| !ok(r)) {
+                        return None;
+                    }
+                    if pc as usize != op_idx {
+                        return None;
+                    }
+                    let site_ptr = *call_sites.get(cache as usize)?;
+                    let slow = a.new_label();
+                    let done = a.new_label();
+                    call_seq::emit_call(
+                        &mut a,
+                        &call_seq::CallEmit {
+                            dst,
+                            callee: call_seq::CalleeSrc::Reg(callee),
+                            this: None,
+                            args,
+                            site: site_ptr,
+                            layout: &helpers.call_layout,
+                            callee_helper,
+                            throw_exit,
+                            slow,
+                            done,
+                        },
+                    )?;
+                    a.bind(slow);
+                    let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
+                    a.mov_rdi_r15();
+                    a.mov_rsi_rbx();
+                    a.movabs_argreg(2, n_regs as i64);
+                    a.movabs_argreg(3, op_ptr as i64);
+                    a.movabs_argreg(4, site_ptr as i64);
+                    a.movabs_argreg(5, 0);
+                    a.movabs_rax(call_value_helper as i64);
+                    a.call_rax();
+                    throw_check!();
+                    a.bind(done);
+                }
             }
         }
         // Falling off the end of the stream (or branching to `len`).
@@ -5512,7 +5849,14 @@ impl JitFunction {
         a.bind(refuse_exit);
         a.movabs_rax(NanBox::jit_throw_bits() as i64);
         a.frame_epilogue();
-        Self::from_code(&a.finish())
+        // The native-call entry (`call_seq::emit_native_entry`).
+        let native = a.new_label();
+        a.bind(native);
+        call_seq::emit_native_entry(
+            &mut a, frame, COUNTDOWN, n_regs, n_params, n_caps, new_target, labels[0],
+        )?;
+        let native_off = a.label_offset(native);
+        Self::from_code(&a.finish()).map(|f| (f, native_off))
     }
 
     /// Wraps already-emitted machine `code` into a callable region (the entry

@@ -15,6 +15,7 @@ use super::{
     Ctx, FnProto, FrameExit, Handle, NanBox, Op, Reg, VmError, jit_for, run_frame, vm_agent_tick,
     vm_error, vm_load_global, vm_safepoint,
 };
+use crate::jit::{CallSite, CalleeInfo, FRAME_HEADER, JitStack};
 use alloc::rc::Rc;
 
 /// Back-edges an interpreted activation runs before it tries to continue in
@@ -82,6 +83,94 @@ pub(super) struct TierRuntime {
     /// set once the function passed its (static) eligibility test, compiled and
     /// got hot, none of which is ever undone.
     direct: alloc::vec::Vec<Option<Rc<crate::jit::JitProto>>>,
+    /// This thread's register stack (see [`JitStack`]), set before any
+    /// compiled body runs. The emitted call sequence reads it at a fixed offset.
+    pub(super) stack: StackPtr,
+}
+
+/// A pointer to the running thread's [`JitStack`] (null until first use).
+#[repr(transparent)]
+pub(super) struct StackPtr(pub(super) *mut JitStack);
+
+impl Default for StackPtr {
+    fn default() -> Self {
+        Self(core::ptr::null_mut())
+    }
+}
+
+/// Words in a thread's register stack: far more than the deepest legal call
+/// chain needs (`max_call_depth` activations of typical size). Committed by the
+/// OS only as it is touched.
+const STACK_WORDS: usize = 1 << 20;
+
+/// Owns one thread's register stack memory.
+struct StackOwner {
+    stack: *mut JitStack,
+}
+
+impl StackOwner {
+    fn new() -> Self {
+        let layout = std::alloc::Layout::array::<u64>(STACK_WORDS).expect("stack layout");
+        // SAFETY: a non-zero-sized layout; the result is checked for null.
+        #[allow(unsafe_code)]
+        let mem = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<u64>();
+        if mem.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        let stack = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(JitStack {
+            top: mem,
+            // SAFETY: one past the end of the allocation.
+            #[allow(unsafe_code)]
+            limit: unsafe { mem.add(STACK_WORDS) },
+            frames: core::ptr::null_mut(),
+            base: mem,
+        }));
+        Self { stack }
+    }
+}
+
+impl Drop for StackOwner {
+    fn drop(&mut self) {
+        // SAFETY: `stack` came from `Box::into_raw` and its memory from
+        // `alloc_zeroed` with this layout; the thread is exiting, so no context
+        // (and no compiled code) uses either any more.
+        #[allow(unsafe_code)]
+        unsafe {
+            let st = alloc::boxed::Box::from_raw(self.stack);
+            let layout = std::alloc::Layout::array::<u64>(STACK_WORDS).expect("stack layout");
+            std::alloc::dealloc(st.base.cast::<u8>(), layout);
+        }
+    }
+}
+
+std::thread_local! {
+    static STACK: StackOwner = StackOwner::new();
+}
+
+/// The running thread's register stack, recorded in `ctx`.
+fn stack_of(ctx: &mut Ctx) -> *mut JitStack {
+    if ctx.jit_rt.stack.0.is_null() {
+        ctx.jit_rt.stack.0 = STACK.with(|o| o.stack);
+    }
+    ctx.jit_rt.stack.0
+}
+
+/// The live part of the register stack — every compiled activation's window
+/// and native-call header — as GC roots (empty before first use).
+pub(super) fn stack_roots<'c>(ctx: &'c Ctx<'_>) -> &'c [NanBox] {
+    let p = ctx.jit_rt.stack.0;
+    if p.is_null() {
+        return &[];
+    }
+    // SAFETY: `p` is this thread's live stack; `base..top` is initialized (every
+    // word below `top` was written when its activation was laid out) and no
+    // compiled code runs while the caller (a safepoint) reads it.
+    #[allow(unsafe_code)]
+    unsafe {
+        let st = &*p;
+        let n = st.top.offset_from(st.base) as usize;
+        core::slice::from_raw_parts(st.base.cast::<NanBox>(), n)
+    }
 }
 
 /// Runs compiled `jit` on `regs` from bytecode pc `entry` with the activation's
@@ -103,7 +192,33 @@ pub(super) fn run_compiled(
     ctx.jit_rt.base = base;
     ctx.jit_rt.handlers.extend_from_slice(handlers);
     let ctx_ptr = ctx as *mut Ctx as *mut core::ffi::c_void;
-    let raw = jit.call_frame_raw(ctx_ptr, regs, entry);
+    // The activation runs on the register stack (where the GC sees it and its
+    // calls can stay native), on a copy of `regs` written back afterwards; on
+    // the rare full stack, on `regs` itself.
+    let st = stack_of(ctx);
+    // SAFETY: `st` is this thread's live stack; nothing else borrows it.
+    #[allow(unsafe_code)]
+    let (top, room) = unsafe { ((*st).top, (*st).limit.offset_from((*st).top) as usize) };
+    let raw = if regs.len() <= room {
+        // SAFETY: `top..top + regs.len()` is free, in-bounds stack memory; it is
+        // claimed (by moving `top`) for exactly this activation.
+        #[allow(unsafe_code)]
+        let window = unsafe {
+            core::ptr::copy_nonoverlapping(regs.as_ptr().cast::<u64>(), top, regs.len());
+            (*st).top = top.add(regs.len());
+            core::slice::from_raw_parts_mut(top.cast::<NanBox>(), regs.len())
+        };
+        let raw = jit.call_frame_raw(ctx_ptr, window, entry);
+        regs.copy_from_slice(window);
+        // SAFETY: as above; the activation is over.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*st).top = top;
+        }
+        raw
+    } else {
+        jit.call_frame_raw(ctx_ptr, regs, entry)
+    };
     ctx.jit_rt.handlers.truncate(base);
     ctx.jit_rt.base = outer_base;
     ctx.jit_funcs = saved;
@@ -422,6 +537,24 @@ fn call_compiled(
     args: &[Reg],
     this: NanBox,
 ) -> Option<Result<NanBox, VmError>> {
+    call_compiled_with(ctx, funcs, Some(regs), callee_val, this, |buf| {
+        buf.extend(args.iter().map(|a| regs[*a as usize]));
+    })
+}
+
+/// [`call_compiled`] with the arguments appended by `push_args`, and the
+/// caller's registers `publish` published for the GC — or, for a call from a
+/// Rust frame that holds values the collector cannot see (`None`: a getter
+/// call from a property helper), not, which declines collection inside the
+/// callee exactly as the ordinary call from there does.
+fn call_compiled_with(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    publish: Option<&[NanBox]>,
+    callee_val: NanBox,
+    this: NanBox,
+    push_args: impl FnOnce(&mut alloc::vec::Vec<NanBox>),
+) -> Option<Result<NanBox, VmError>> {
     let handle = Handle::from_raw(callee_val.as_handle()?);
     let (fid, _) = ctx.realm.vm_function(handle)?;
     let id = fid as usize;
@@ -429,17 +562,7 @@ fn call_compiled(
     if ctx.realm.multi_realm || ctx.call_depth == 0 {
         return None;
     }
-    let jit = match ctx.jit_rt.direct.get(id) {
-        Some(Some(j)) => Rc::clone(j),
-        _ => {
-            let j = direct_target(proto)?;
-            if ctx.jit_rt.direct.len() <= id {
-                ctx.jit_rt.direct.resize(id + 1, None);
-            }
-            ctx.jit_rt.direct[id] = Some(Rc::clone(&j));
-            j
-        }
-    };
+    let jit = direct_jit(ctx, proto, id)?;
     // `call_with`'s recursion guard.
     if ctx.call_depth >= ctx.realm.limits.max_call_depth
         || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
@@ -447,11 +570,30 @@ fn call_compiled(
         let e = vm_error(ctx, "RangeError", "Maximum call stack size exceeded");
         return Some(Err(VmError::Thrown(e)));
     }
+    // The bookkeeping of `Op::CallValue` + `call_with` (+ `call_with_inner`'s
+    // input publication), restored below on every outcome.
+    let mark = ctx.frame_shadow.len();
+    let published = ctx.frames_published;
+    if let Some(regs) = publish {
+        ctx.frame_shadow.extend_from_slice(regs);
+        ctx.frames_published += 1;
+    }
+    ctx.call_depth += 1;
+    ctx.realm.vm_total_depth += 1;
+    let callee_mark = ctx.realm.vm_callee_stack.len();
+    let args_mark = ctx.realm.vm_args_buf.len();
+    ctx.realm.vm_callee_stack.push(callee_val);
+    ctx.realm.vm_callee_args.push(args_mark);
+    push_args(&mut ctx.realm.vm_args_buf);
     // The callee's register file: parameters, captures, `this` (undefined).
     let mut cregs: alloc::vec::Vec<NanBox> = ctx.realm.vm_reg_pool.pop().unwrap_or_default();
     cregs.resize(proto.n_regs, NanBox::undefined());
-    for (slot, a) in cregs.iter_mut().zip(args.iter().take(proto.n_params)) {
-        *slot = regs[*a as usize];
+    for (slot, a) in cregs.iter_mut().zip(
+        ctx.realm.vm_args_buf[args_mark..]
+            .iter()
+            .take(proto.n_params),
+    ) {
+        *slot = *a;
     }
     if let Some((_, caps)) = ctx.realm.vm_function(handle) {
         for (i, c) in caps.iter().enumerate().take(proto.n_captures) {
@@ -461,21 +603,6 @@ fn call_compiled(
     if let Some(slot) = cregs.get_mut(proto.n_params + proto.n_captures) {
         *slot = this;
     }
-    // The bookkeeping of `Op::CallValue` + `call_with` (+ `call_with_inner`'s
-    // input publication), restored below on every outcome.
-    let mark = ctx.frame_shadow.len();
-    let published = ctx.frames_published;
-    ctx.frame_shadow.extend_from_slice(regs);
-    ctx.frames_published += 1;
-    ctx.call_depth += 1;
-    ctx.realm.vm_total_depth += 1;
-    let callee_mark = ctx.realm.vm_callee_stack.len();
-    let args_mark = ctx.realm.vm_args_buf.len();
-    ctx.realm.vm_callee_stack.push(callee_val);
-    ctx.realm.vm_callee_args.push(args_mark);
-    ctx.realm
-        .vm_args_buf
-        .extend(args.iter().map(|a| regs[*a as usize]));
     if ctx.gc_enabled {
         let n = ctx.realm.vm_args_buf.len();
         ctx.frame_shadow
@@ -505,6 +632,44 @@ fn call_compiled(
     })
 }
 
+/// The getter half of a compiled body's static-key property read
+/// (`jit_helper_get_prop`): when `vm_get_prop` would begin by calling a VM
+/// getter found through the site's prototype-chain cache — the receiver an
+/// ordinary object (not host-exotic, not an array `length`) without the key
+/// as a cached own data slot — and that getter is a [`call_compiled`] target,
+/// call it directly, `this` the receiver, no arguments. `None`: do the
+/// ordinary read.
+pub(crate) fn compiled_getter(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    recv: NanBox,
+    key: &str,
+    cache: &mut crate::ic::PropertyCache,
+) -> Option<Result<NanBox, VmError>> {
+    // Only a site whose chain cache is armed on an accessor can hit one (and
+    // only there is the repeated lookup below worth it).
+    if !cache.chain.as_ref().is_some_and(|c| c.accessor) {
+        return None;
+    }
+    let h = recv.as_handle().map(Handle::from_raw)?;
+    if ctx.realm.is_host_exotic(h)
+        || (key == "length" && ctx.realm.plain_array_length(h).is_some())
+        || ctx.realm.object_cached_get(h, key, cache).is_some()
+    {
+        return None;
+    }
+    match ctx.realm.chain_cached_get(h, key, cache)? {
+        crate::realm::ChainHit::Accessor(getter, _, _)
+            if getter
+                .as_handle()
+                .is_some_and(|g| ctx.realm.is_vm_function(Handle::from_raw(g))) =>
+        {
+            call_compiled_with(ctx, funcs, None, getter, recv, |_| {})
+        }
+        _ => None,
+    }
+}
+
 /// `Op::CallMethod` in compiled code. The one case it runs itself is the hot
 /// one: a hosted call whose method (looked up through the site's persistent
 /// cache `cache`) is a VM closure with a compiled body, which it enters
@@ -522,6 +687,7 @@ pub(crate) extern "C" fn jit_helper_call_method(
     n_regs: usize,
     op_raw: *const Op,
     cache: *mut core::ffi::c_void,
+    call_site: *mut core::ffi::c_void,
 ) -> u64 {
     // SAFETY: see the function contract (as `jit_helper_exec_op`).
     #[allow(unsafe_code)]
@@ -554,6 +720,12 @@ pub(crate) extern "C" fn jit_helper_call_method(
                     .jit_funcs
                     .expect("jit_funcs set before generic dispatch")
             };
+            if !call_site.is_null() {
+                // SAFETY: the op's own `CallSite` (see the function contract).
+                #[allow(unsafe_code)]
+                let site = unsafe { &mut *call_site.cast::<CallSite>() };
+                fill_call_site(ctx, closure, site);
+            }
             if let Some(r) = call_compiled(ctx, funcs, regs, closure, args, recv_val) {
                 return match r {
                     Ok(v) => {
@@ -571,12 +743,186 @@ pub(crate) extern "C" fn jit_helper_call_method(
     jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
 }
 
-/// Whether the function `proto` may be entered by [`call_compiled`]: a plain
-/// VM closure body (not a class constructor, async, generator, rest-parameter,
-/// `arguments` or `new.target` one) that is hot and already compiled to the
-/// generic tier — its compiled body, if so.
-fn direct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
-    if proto.class_ctor
+/// [`direct_target`], memoized per function id.
+fn direct_jit(ctx: &mut Ctx, proto: &FnProto, id: usize) -> Option<Rc<crate::jit::JitProto>> {
+    match ctx.jit_rt.direct.get(id) {
+        Some(Some(j)) => Some(Rc::clone(j)),
+        _ => {
+            let j = direct_target(proto)?;
+            if ctx.jit_rt.direct.len() <= id {
+                ctx.jit_rt.direct.resize(id + 1, None);
+            }
+            ctx.jit_rt.direct[id] = Some(Rc::clone(&j));
+            Some(j)
+        }
+    }
+}
+
+/// `Op::CallValue`'s slow path in compiled code (the native call sequence's
+/// fallback, see `crate::jit::call_seq`): point the site's cache `site` at the
+/// callee when the sequence can enter it (a [`call_compiled`] target with a
+/// native-call entry), then run the call as the interpreter would
+/// ([`jit_helper_exec_op`], which enters a compiled callee directly).
+///
+/// # Safety
+/// As [`jit_helper_exec_op`]; `site` is the op's `CallSite`, owned by the
+/// calling `JitProto` and not otherwise borrowed while this runs.
+pub(crate) extern "C" fn jit_helper_call_value(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    site: *mut core::ffi::c_void,
+    _: *mut core::ffi::c_void,
+) -> u64 {
+    // SAFETY: see the function contract (as `jit_helper_exec_op`).
+    #[allow(unsafe_code)]
+    let op = unsafe { &*op_raw };
+    if let Op::CallValue { callee, .. } = op {
+        // SAFETY: see the function contract.
+        #[allow(unsafe_code)]
+        let ctx = unsafe { &mut *(ctx_raw as *mut Ctx) };
+        // SAFETY: the activation's register file, live and unaliased here.
+        #[allow(unsafe_code)]
+        let callee_val = unsafe { *regs_raw.add(*callee as usize) };
+        // SAFETY: the site's own cache (see the function contract).
+        #[allow(unsafe_code)]
+        let site = unsafe { &mut *site.cast::<CallSite>() };
+        fill_call_site(ctx, NanBox::from_bits(callee_val), site);
+    }
+    jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
+}
+
+/// Points `site` at `callee` if the native call sequence may enter it: a VM
+/// closure whose function [`direct_jit`] accepts and whose compiled body has
+/// a native-call entry over the function's own register count.
+fn fill_call_site(ctx: &mut Ctx, callee: NanBox, site: &mut CallSite) {
+    let Some(raw) = callee.as_handle() else {
+        return;
+    };
+    let Some((fid, n_caps)) = ctx
+        .realm
+        .vm_function(Handle::from_raw(raw))
+        .map(|(f, caps)| (f, caps.len()))
+    else {
+        return;
+    };
+    // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    let id = fid as usize;
+    let Some(proto) = funcs.get(id) else {
+        return;
+    };
+    if n_caps < proto.n_captures {
+        return;
+    }
+    let Some(jit) = direct_jit(ctx, proto, id) else {
+        return;
+    };
+    let Some(code) = jit.native_entry() else {
+        return;
+    };
+    if jit.n_regs() != proto.n_regs {
+        return;
+    }
+    // The compiled body stays alive for the context's life (`direct` and the
+    // JIT cache never drop one), so the raw entry address does too.
+    site.key = u64::from(fid) | ((n_caps as u64) << 32);
+    site.code = code;
+    site.frame_bytes = (proto.n_regs * 8) as u64;
+}
+
+/// The call sequence's callee identification (`crate::jit::CalleeHelper`): a VM
+/// closure's function id and capture count (`CalleeInfo::key`) and its
+/// captures. A leaf read: no allocation, no throw.
+///
+/// # Safety
+/// `ctx` must be the live `Ctx` the compiled body was entered with.
+pub(crate) extern "C" fn jit_callee_info(ctx: *mut core::ffi::c_void, callee: u64) -> CalleeInfo {
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    match NanBox::from_bits(callee)
+        .as_handle()
+        .and_then(|h| ctx.realm.vm_function(Handle::from_raw(h)))
+    {
+        Some((fid, caps)) => CalleeInfo {
+            key: u64::from(fid) | ((caps.len() as u64) << 32),
+            caps: caps.as_ptr().cast::<u64>(),
+        },
+        None => CalleeInfo {
+            key: u64::MAX,
+            caps: core::ptr::null(),
+        },
+    }
+}
+
+/// `Op::Construct`'s slow path in compiled code: point the site's cache at
+/// the constructor when the native sequence can run its `[[Construct]]`
+/// ([`construct_target`]), then construct as the interpreter does.
+///
+/// # Safety
+/// As [`jit_helper_call_value`].
+pub(crate) extern "C" fn jit_helper_construct(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    site: *mut core::ffi::c_void,
+    _: *mut core::ffi::c_void,
+) -> u64 {
+    // SAFETY: see the function contract (as `jit_helper_exec_op`).
+    #[allow(unsafe_code)]
+    let op = unsafe { &*op_raw };
+    if let Op::Construct { ctor, .. } = op {
+        // SAFETY: see the function contract.
+        #[allow(unsafe_code)]
+        let (ctx, ctor_val, site) = unsafe {
+            (
+                &mut *(ctx_raw as *mut Ctx),
+                NanBox::from_bits(*regs_raw.add(*ctor as usize)),
+                &mut *site.cast::<CallSite>(),
+            )
+        };
+        if let Some(raw) = ctor_val.as_handle()
+            && let Some((fid, n_caps)) = ctx
+                .realm
+                .vm_function(Handle::from_raw(raw))
+                .map(|(f, caps)| (f, caps.len()))
+        {
+            // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
+            #[allow(unsafe_code)]
+            let funcs = unsafe {
+                &*ctx
+                    .jit_funcs
+                    .expect("jit_funcs set before generic dispatch")
+            };
+            if let Some(proto) = funcs.get(fid as usize)
+                && n_caps >= proto.n_captures
+                && let Some(jit) = construct_target(proto)
+                && let Some(code) = jit.native_entry()
+                && jit.n_regs() == proto.n_regs
+            {
+                site.key = u64::from(fid) | ((n_caps as u64) << 32);
+                site.code = code;
+                site.frame_bytes = (proto.n_regs * 8) as u64;
+            }
+        }
+    }
+    jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
+}
+
+/// Whether the native sequence may run `new f()` for function `id`
+/// (`proto`): what [`direct_target`] accepts for a call, except that a class
+/// constructor is fine (this *is* its `[[Construct]]`) and a derived one is
+/// not (its `this` comes from `super(...)`).
+fn construct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
+    if proto.derived
         || proto.is_async
         || proto.is_generator
         || proto.rest_from.is_some()
@@ -584,7 +930,277 @@ fn direct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
             .ops
             .iter()
             .take(2)
-            .any(|o| matches!(o, Op::MakeArguments { .. } | Op::LoadNewTarget { .. }))
+            .any(|o| matches!(o, Op::MakeArguments { .. }))
+        || !call_is_hot(proto.tier.has_body())
+    {
+        return None;
+    }
+    match proto.tier.jit() {
+        Some(Some(j)) if j.is_generic() && j.n_regs() <= proto.n_regs => Some(j),
+        _ => None,
+    }
+}
+
+/// A `new ctor()`'s preparation for the native call sequence
+/// (`crate::jit::ConstructHelper`): when `ctor` is the VM function `site`
+/// names and `vm_construct` would run it as an ordinary `[[Construct]]` with
+/// `new.target` itself — a constructor (`VM_CTOR`), not derived, with no
+/// instance-field initializer to run first, whose `prototype` is an object —
+/// make the new object exactly as it does (`OrdinaryCreateFromConstructor`),
+/// store it to `out` and report the callee as [`jit_callee_info`]. Anything
+/// else changes nothing and reports the not-a-closure key.
+///
+/// # Safety
+/// `ctx` the live `Ctx` (with `jit_funcs` set), `out` writable, `site` the
+/// calling sequence's cache.
+pub(crate) extern "C" fn jit_construct_info(
+    ctx_raw: *mut core::ffi::c_void,
+    ctor: u64,
+    out: *mut u64,
+    site: *const CallSite,
+) -> CalleeInfo {
+    const NONE: CalleeInfo = CalleeInfo {
+        key: u64::MAX,
+        caps: core::ptr::null(),
+    };
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let (ctx, site_key) = unsafe { (&mut *(ctx_raw as *mut Ctx), (*site).key) };
+    let Some(fh) = NanBox::from_bits(ctor).as_handle().map(Handle::from_raw) else {
+        return NONE;
+    };
+    let Some((fid, n_caps)) = ctx.realm.vm_function(fh).map(|(f, c)| (f, c.len())) else {
+        return NONE;
+    };
+    if u64::from(fid) | ((n_caps as u64) << 32) != site_key {
+        return NONE;
+    }
+    // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    let Some(proto) = funcs.get(fid as usize) else {
+        return NONE;
+    };
+    if proto.derived
+        || ctx.realm.get_property(fh, super::VM_CTOR).is_none()
+        || (proto.class_ctor && ctx.realm.get_property(fh, super::FIELDS_KEY).is_some())
+    {
+        return NONE;
+    }
+    let Some(p) = ctx
+        .realm
+        .get_property(fh, "prototype")
+        .filter(|p| super::is_object_value(&ctx.realm, *p))
+        .and_then(|p| p.as_handle())
+    else {
+        return NONE;
+    };
+    let obj = ctx.realm.new_object();
+    ctx.realm.set_object_proto(obj, Some(Handle::from_raw(p)));
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    unsafe {
+        *out = NanBox::handle(obj.to_raw()).to_bits();
+    }
+    jit_callee_info(ctx_raw, ctor)
+}
+
+/// A `new`'s result when the constructor body returned the heap value
+/// `result` (`crate::jit::ConstructResultHelper`): `result` if it is an
+/// object, else `this` — `vm_construct`'s last step.
+///
+/// # Safety
+/// `ctx` the live `Ctx`.
+pub(crate) extern "C" fn jit_construct_result(
+    ctx: *mut core::ffi::c_void,
+    result: u64,
+    this: u64,
+) -> u64 {
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    if super::is_object_value(&ctx.realm, NanBox::from_bits(result)) {
+        result
+    } else {
+        this
+    }
+}
+
+/// A method call's callee lookup for the native call sequence
+/// (`crate::jit::MethodHelper`): exactly the case `jit_helper_call_method`
+/// enters directly — a hosted call, not the legacy `caller`, whose method
+/// (through the site's chain cache `cache`) is a VM closure — reported as
+/// [`jit_callee_info`] does, with the closure stored to `out`. Pure: it only
+/// reads (and refills the cache), so the slow path may repeat it.
+///
+/// # Safety
+/// `ctx` the live `Ctx`; `key_ptr`/`key_len` the site's UTF-8 key and `cache`
+/// its `PropertyCache`, owned by the calling `JitProto`; `out` writable.
+pub(crate) extern "C" fn jit_method_info(
+    ctx: *mut core::ffi::c_void,
+    recv: u64,
+    key_ptr: *const u8,
+    key_len: usize,
+    cache: *mut core::ffi::c_void,
+    out: *mut u64,
+) -> CalleeInfo {
+    const NONE: CalleeInfo = CalleeInfo {
+        key: u64::MAX,
+        caps: core::ptr::null(),
+    };
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let (ctx_ref, key, cache) = unsafe {
+        (
+            &*(ctx as *const Ctx),
+            core::str::from_utf8_unchecked(core::slice::from_raw_parts(key_ptr, key_len)),
+            &mut *cache.cast::<crate::ic::PropertyCache>(),
+        )
+    };
+    if ctx_ref.host.is_none() || key == "caller" {
+        return NONE;
+    }
+    match super::vm_method_of_cached(ctx_ref, NanBox::from_bits(recv), key, cache) {
+        Some(f) => {
+            // SAFETY: see the function contract.
+            #[allow(unsafe_code)]
+            unsafe {
+                *out = f.to_bits();
+            }
+            jit_callee_info(ctx, f.to_bits())
+        }
+        None => NONE,
+    }
+}
+
+/// Where the call sequence finds the state it maintains (see
+/// `crate::jit::CallLayout`).
+pub(super) fn call_layout() -> crate::jit::CallLayout {
+    use core::mem::offset_of;
+    let i = |v: usize| i32::try_from(v).expect("layout offset fits in i32");
+    // A `Vec`'s length word sits at the same offset whatever its element type.
+    let probe: alloc::vec::Vec<NanBox> = alloc::vec::Vec::with_capacity(5);
+    let len_off = vec_len_offset(&probe);
+    crate::jit::CallLayout {
+        stack: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, stack)),
+        call_depth: i(offset_of!(Ctx<'static>, call_depth)),
+        frames_published: i(offset_of!(Ctx<'static>, frames_published)),
+        realm: i(offset_of!(Ctx<'static>, realm)),
+        total_depth: i(offset_of!(crate::realm::Realm, vm_total_depth)),
+        max_depth: i(offset_of!(crate::realm::Realm, limits)
+            + offset_of!(crate::limits::Limits, max_call_depth)),
+        multi_realm: i(offset_of!(crate::realm::Realm, multi_realm)),
+        callee_len: i(offset_of!(crate::realm::Realm, vm_callee_stack) + len_off),
+    }
+}
+
+/// The byte offset of the length word inside `v` (a `Vec` is three words —
+/// pointer, capacity, length — in an unspecified order), found by pushing an
+/// element and seeing which word changed by one.
+fn vec_len_offset(v: &[NanBox]) -> usize {
+    let words = |v: &alloc::vec::Vec<NanBox>| -> [usize; 3] {
+        // SAFETY: a `Vec` is exactly three `usize`-sized words (checked below).
+        #[allow(unsafe_code)]
+        unsafe {
+            core::ptr::read((v as *const alloc::vec::Vec<NanBox>).cast::<[usize; 3]>())
+        }
+    };
+    assert_eq!(core::mem::size_of::<alloc::vec::Vec<NanBox>>(), 3 * 8);
+    let mut w = v.to_vec();
+    w.reserve(8);
+    let before = words(&w);
+    w.push(NanBox::undefined());
+    let after = words(&w);
+    let at = (0..3)
+        .find(|&k| after[k] == before[k] + 1 && after[k] == w.len())
+        .expect("Vec length word");
+    at * 8
+}
+
+/// The realm's activation stack (`vm_callee_stack`, `vm_callee_args`,
+/// `vm_args_buf`) merged with the native-call headers on the register stack —
+/// the full innermost-last list of VM activations the legacy `f.caller` /
+/// `f.arguments` read. `None` when no native call is in flight (the realm's
+/// stacks are already the whole list).
+pub(super) fn callee_view(
+    ctx: &Ctx,
+) -> Option<(
+    alloc::vec::Vec<NanBox>,
+    alloc::vec::Vec<usize>,
+    alloc::vec::Vec<NanBox>,
+)> {
+    let st = STACK.with(|o| o.stack);
+    // Native activations, innermost first: (stack mark, callee, arguments).
+    let mut natives: alloc::vec::Vec<(usize, NanBox, &[NanBox])> = alloc::vec::Vec::new();
+    // SAFETY: this thread's stack; every header below `top` was written by a
+    // call sequence and is linked from `frames`. No compiled code runs now.
+    #[allow(unsafe_code)]
+    unsafe {
+        let mut f = (*st).frames;
+        while !f.is_null() {
+            let argc = *f.add(3) as usize;
+            natives.push((
+                *f.add(2) as usize,
+                NanBox::from_bits(*f.add(1)),
+                core::slice::from_raw_parts(f.add(FRAME_HEADER).cast::<NanBox>(), argc),
+            ));
+            f = (*f) as *mut u64;
+        }
+    }
+    if natives.is_empty() {
+        return None;
+    }
+    natives.reverse();
+    let r = &ctx.realm;
+    let n = r.vm_callee_stack.len();
+    let mut callees = alloc::vec::Vec::new();
+    let mut starts = alloc::vec::Vec::new();
+    let mut buf = alloc::vec::Vec::new();
+    let mut push = |c: NanBox, a: &[NanBox]| {
+        callees.push(c);
+        starts.push(buf.len());
+        buf.extend_from_slice(a);
+    };
+    let mut k = 0;
+    for i in 0..=n {
+        // A native activation whose call saw `i` realm entries sits above them.
+        while k < natives.len() && (natives[k].0 <= i || i == n) {
+            push(natives[k].1, natives[k].2);
+            k += 1;
+        }
+        if i < n {
+            let start = r.vm_callee_args[i];
+            let end = r
+                .vm_callee_args
+                .get(i + 1)
+                .copied()
+                .unwrap_or(r.vm_args_buf.len());
+            push(r.vm_callee_stack[i], &r.vm_args_buf[start..end]);
+        }
+    }
+    Some((callees, starts, buf))
+}
+
+/// Whether the function `proto` may be entered by [`call_compiled`]: a plain
+/// VM closure body (not a class constructor, async, generator, rest-parameter
+/// or `arguments` one) that is hot and already compiled to the generic tier —
+/// its compiled body, if so.
+fn direct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
+    if proto.class_ctor
+        || proto.is_async
+        || proto.is_generator
+        || proto.rest_from.is_some()
+        // (`new.target` is fine: the callee's register starts `undefined`,
+        // a call's `new.target`.)
+        || proto
+            .ops
+            .iter()
+            .take(2)
+            .any(|o| matches!(o, Op::MakeArguments { .. }))
         || !call_is_hot(proto.tier.has_body())
     {
         return None;
