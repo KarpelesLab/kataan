@@ -2,6 +2,17 @@ use super::*;
 use alloc::rc::Rc;
 
 impl Interp {
+    /// A typed array's own enumerable *named* String keys (`ta.foo = 1`), which
+    /// follow its integer indices in `EnumerableOwnProperties`.
+    fn typed_array_named_keys(&self, h: Handle) -> Vec<String> {
+        self.realm
+            .object_keys(h)
+            .unwrap_or_else(|| self.realm.aux_named_keys(h))
+            .into_iter()
+            .filter(|k| !crate::realm::is_internal_key(k))
+            .collect()
+    }
+
     /// `InternalizeJSONProperty` — the `JSON.parse` reviver walk *with source-text
     /// access* (the `json-parse-with-source` proposal). Reads `val = Get(holder,
     /// name)` via `[[Get]]`; if `val` is an array its indices are recursed, else
@@ -57,7 +68,9 @@ impl Interp {
                 let keys = if let Some(pk) = self.proxy_own_enumerable_keys(vh)? {
                     pk
                 } else if let Some(len) = self.realm.typed_len(vh) {
-                    (0..len).map(|i| alloc::format!("{i}")).collect()
+                    let mut ks: Vec<String> = (0..len).map(|i| alloc::format!("{i}")).collect();
+                    ks.extend(self.typed_array_named_keys(vh));
+                    ks
                 } else {
                     self.realm
                         .object_keys(self.proxy_key_target(vh))
@@ -498,7 +511,10 @@ impl Interp {
             Some(list) => list.to_vec(),
             None => {
                 if let Some(len) = self.realm.typed_len(h) {
-                    (0..len).map(|i| alloc::format!("{i}")).collect()
+                    // Its integer indices, then its own enumerable named keys.
+                    let mut ks: Vec<String> = (0..len).map(|i| alloc::format!("{i}")).collect();
+                    ks.extend(self.typed_array_named_keys(h));
+                    ks
                 } else if self.realm.proxy_at(h).is_some() {
                     // A proxy drives `[[OwnPropertyKeys]]` (the `ownKeys` trap, or
                     // trapless forwarding to the target) then filters to own

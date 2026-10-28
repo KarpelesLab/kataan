@@ -488,3 +488,17 @@ fn string_keyed_array_index_past_cap_is_stored() {
     "#;
     assert_eq!(run(src), "4294967295,4294967295,2,100000001,0,100000000");
 }
+
+/// `JSON.stringify` of a typed array serializes its own enumerable named
+/// properties after its indices, like any object (they were dropped).
+#[test]
+fn json_stringify_typed_array_named_properties() {
+    let src = r#"
+        var u = new Uint8Array([1, 2]); u.foo = 3; u["01"] = 4;
+        JSON.stringify(u) + "|" + JSON.stringify({ u: u }, null, 0)
+    "#;
+    assert_eq!(
+        run(src),
+        r#"{"0":1,"1":2,"foo":3,"01":4}|{"u":{"0":1,"1":2,"foo":3,"01":4}}"#
+    );
+}
