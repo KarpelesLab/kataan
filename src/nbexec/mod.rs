@@ -10197,6 +10197,11 @@ fn expand_dollar(template: &str, m: &str, before: &str, after: &str) -> String {
 #[cfg(test)]
 mod tests;
 
+/// Regression tests for bugs found by differential testing against another
+/// engine (programs Test262 does not cover).
+#[cfg(test)]
+mod difftest_tests;
+
 impl Interp {
     /// A VM-supplied member key: an *object* key runs its full ToPropertyKey
     /// here (once), so the member operation sees the resulting string/symbol

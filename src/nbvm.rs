@@ -13290,9 +13290,9 @@ struct Compiler {
     /// Per enclosing loop/switch: `break` jump indices awaiting the exit target
     /// (loops and `switch` both push here).
     break_sites: Vec<Vec<usize>>,
-    /// Per enclosing loop: `continue` jump indices awaiting the loop's continue
-    /// point (`switch` does *not* push here — `continue` targets the nearest
-    /// loop).
+    /// Parallel to `break_sites`: `continue` jump indices awaiting the loop's
+    /// continue point. A `switch` or labeled block pushes a never-used slot so
+    /// a label's index addresses the same construct in both stacks.
     continue_sites: Vec<Vec<usize>>,
     /// Per enclosing optional-chain (`Expr::OptChain`): the `?.`-link jump indices
     /// awaiting the chain end. A nullish `?.` base jumps here, short-circuiting the
@@ -16226,7 +16226,11 @@ impl Compiler {
                     c.prebind_block_lexicals(&all, &BTreeSet::new(), true)?;
                     c.hoist_block_functions(&all)?;
                     // Only `break` targets a switch; `continue` skips to the loop.
+                    // The switch still takes a (never-used) `continue_sites` slot,
+                    // so that stack stays parallel to `break_sites`/`loop_frames`
+                    // and a label's index addresses the same construct in each.
                     c.break_sites.push(Vec::new());
+                    c.continue_sites.push(Vec::new());
                     c.loop_frames.push(LoopFrame {
                         handler_depth: c.handler_depth,
                         iter: None,
@@ -16268,6 +16272,7 @@ impl Compiler {
                         None => c.patch(exit_dispatch), // no default → end
                     }
                     c.loop_frames.pop();
+                    c.continue_sites.pop();
                     let breaks = c.break_sites.pop().unwrap_or_default();
                     let end = c.ops.len();
                     for b in breaks {
@@ -16612,12 +16617,17 @@ impl Compiler {
                 Ok(None)
             }
             Stmt::Continue { label: None, .. } => {
-                if let Some(t) = self.loop_frames.iter().rposition(|f| f.is_loop) {
-                    self.emit_unwind(t, false, t + 1)?;
-                }
+                // The innermost enclosing *loop*: a `switch` or labeled block in
+                // between is not a `continue` target.
+                let t = self
+                    .loop_frames
+                    .iter()
+                    .rposition(|f| f.is_loop)
+                    .ok_or(CompileError::Unsupported("continue outside loop"))?;
+                self.emit_unwind(t, false, t + 1)?;
                 let j = self.emit_jump();
                 self.continue_sites
-                    .last_mut()
+                    .get_mut(t)
                     .ok_or(CompileError::Unsupported("continue outside loop"))?
                     .push(j);
                 Ok(None)
@@ -16655,20 +16665,32 @@ impl Compiler {
             // A labeled loop: record the label against the loop's site index so
             // `break label` / `continue label` can target it.
             Stmt::Labeled { label, body, .. } => {
+                // `A: B: for (...)`: every label of a chain names the same
+                // statement (its label set), so `continue A` reaches the loop.
+                let idx = self.break_sites.len();
+                self.labels.push((String::from(&*label.name), idx));
+                let mut n_labels = 1;
+                let mut body = &**body;
+                while let Stmt::Labeled {
+                    label, body: inner, ..
+                } = body
+                {
+                    self.labels.push((String::from(&*label.name), idx));
+                    n_labels += 1;
+                    body = inner;
+                }
                 let is_loop = matches!(
-                    &**body,
+                    body,
                     Stmt::While { .. }
                         | Stmt::DoWhile { .. }
                         | Stmt::For { .. }
                         | Stmt::ForIn { .. }
                         | Stmt::ForOf { .. }
                 );
-                let idx = self.break_sites.len();
-                self.labels.push((String::from(&*label.name), idx));
                 if is_loop {
                     // The labeled loop pushes its own break/continue sites at `idx`.
                     let r = self.stmt(body);
-                    self.labels.pop();
+                    self.labels.truncate(self.labels.len() - n_labels);
                     r
                 } else {
                     // A labeled non-loop (e.g. a block): give the label its own
@@ -16683,7 +16705,7 @@ impl Compiler {
                     });
                     let r = self.stmt(body);
                     self.loop_frames.pop();
-                    self.labels.pop();
+                    self.labels.truncate(self.labels.len() - n_labels);
                     let end = self.ops.len();
                     for b in self.break_sites.pop().unwrap_or_default() {
                         self.patch_to(b, end);
