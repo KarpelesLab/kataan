@@ -4370,6 +4370,10 @@ fn to_primitive(ctx: &mut Ctx, funcs: &[FnProto], v: NanBox, number_hint: bool) 
 /// numeric addition from the resulting primitives). Any observable side effect (a
 /// user `valueOf`) therefore runs exactly once per evaluation.
 fn vm_add(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanBox, VmError> {
+    // Two numbers: ToPrimitive and the Symbol guard are identities.
+    if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
+        return Ok(NanBox::number(x + y));
+    }
     if let Some(r) = host_binary(ctx, crate::ast::BinaryOp::Add, a, b) {
         return r;
     }
@@ -4475,6 +4479,14 @@ fn vm_arith(
     b: NanBox,
     op: u8,
 ) -> Result<NanBox, VmError> {
+    if a.is_number() && b.is_number() {
+        return Ok(match op {
+            GA_SUB => ctx.realm.sub(a, b),
+            GA_MUL => ctx.realm.mul(a, b),
+            GA_DIV => ctx.realm.div(a, b),
+            _ => ctx.realm.rem(a, b),
+        });
+    }
     let bop = match op {
         GA_SUB => crate::ast::BinaryOp::Sub,
         GA_MUL => crate::ast::BinaryOp::Mul,
@@ -4505,6 +4517,9 @@ fn vm_arith(
 /// so this single primitive backs all four relational operators. Returns a boolean
 /// `NanBox`.
 fn vm_lt(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanBox, VmError> {
+    if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
+        return Ok(NanBox::boolean(x < y));
+    }
     if let Some(r) = host_binary(ctx, crate::ast::BinaryOp::Lt, a, b) {
         return r;
     }
@@ -4538,6 +4553,26 @@ fn vm_value_bin(
     b: NanBox,
     op: u8,
 ) -> Result<NanBox, VmError> {
+    // Two numbers: no coercion can run, so go straight to the arithmetic.
+    if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
+        match op {
+            VB_LOOSE_EQ => return Ok(NanBox::boolean(x == y)),
+            VB_LOOSE_NEQ => return Ok(NanBox::boolean(x != y)),
+            #[cfg(feature = "std")]
+            VB_BIT_AND => return Ok(ctx.realm.bit_and(a, b)),
+            #[cfg(feature = "std")]
+            VB_BIT_OR => return Ok(ctx.realm.bit_or(a, b)),
+            #[cfg(feature = "std")]
+            VB_BIT_XOR => return Ok(ctx.realm.bit_xor(a, b)),
+            #[cfg(feature = "std")]
+            VB_SHL => return Ok(ctx.realm.shl(a, b)),
+            #[cfg(feature = "std")]
+            VB_SHR => return Ok(ctx.realm.shr(a, b)),
+            #[cfg(feature = "std")]
+            VB_USHR => return Ok(ctx.realm.ushr(a, b)),
+            _ => {}
+        }
+    }
     {
         use crate::ast::BinaryOp as B;
         let bop = match op {
