@@ -502,3 +502,23 @@ fn json_stringify_typed_array_named_properties() {
         r#"{"0":1,"1":2,"foo":3,"01":4}|{"u":{"0":1,"1":2,"foo":3,"01":4}}"#
     );
 }
+
+/// `Object.isFrozen` / `Object.isSealed` of an array run TestIntegrityLevel
+/// over its descriptors: an array frozen index by index, or an empty
+/// non-extensible one (sealed: its `length` is non-configurable), was
+/// reported as neither.
+#[test]
+fn array_integrity_level_tests_its_descriptors() {
+    let src = r#"
+        var a = [1, 2]; Object.preventExtensions(a);
+        Object.defineProperty(a, "0", { configurable: false, writable: false });
+        Object.defineProperty(a, "1", { configurable: false, writable: false });
+        var r = [Object.isFrozen(a), Object.isSealed(a)];
+        Object.defineProperty(a, "length", { writable: false });
+        r.push(Object.isFrozen(a), Object.isSealed(a));
+        var c = []; Object.preventExtensions(c);
+        r.push(Object.isFrozen(c), Object.isSealed(c), Object.isFrozen([]), Object.isFrozen(Object.freeze([1])));
+        r.join()
+    "#;
+    assert_eq!(run(src), "false,true,true,true,false,true,false,true");
+}

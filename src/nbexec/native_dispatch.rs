@@ -1185,6 +1185,17 @@ impl Interp {
                     let r = self.proxy_test_integrity_level(Handle::from_raw(raw), false)?;
                     return Ok(NanBox::boolean(r));
                 }
+                // An array's per-index attributes and `length` live outside its
+                // property table: TestIntegrityLevel over `[[GetOwnProperty]]`
+                // (an array frozen index by index, or an empty non-extensible
+                // one, is frozen/sealed without carrying the flag).
+                if let Some(raw) = v.as_handle()
+                    && self.realm.is_array(Handle::from_raw(raw))
+                    && !self.realm.is_vm_function(Handle::from_raw(raw))
+                {
+                    let r = self.proxy_test_integrity_level(Handle::from_raw(raw), false)?;
+                    return Ok(NanBox::boolean(r));
+                }
                 let sealed = !self.is_object_value(v)
                     || v.as_handle()
                         .is_some_and(|raw| self.realm.is_sealed(Handle::from_raw(raw)));
@@ -1842,6 +1853,17 @@ impl Interp {
                 let v = arg(0);
                 if let Some(raw) = v.as_handle()
                     && self.realm.proxy_at(Handle::from_raw(raw)).is_some()
+                {
+                    let r = self.proxy_test_integrity_level(Handle::from_raw(raw), true)?;
+                    return Ok(NanBox::boolean(r));
+                }
+                // An array's per-index attributes and `length` live outside its
+                // property table: TestIntegrityLevel over `[[GetOwnProperty]]`
+                // (an array frozen index by index, or an empty non-extensible
+                // one, is frozen/sealed without carrying the flag).
+                if let Some(raw) = v.as_handle()
+                    && self.realm.is_array(Handle::from_raw(raw))
+                    && !self.realm.is_vm_function(Handle::from_raw(raw))
                 {
                     let r = self.proxy_test_integrity_level(Handle::from_raw(raw), true)?;
                     return Ok(NanBox::boolean(r));
