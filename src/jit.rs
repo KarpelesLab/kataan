@@ -5540,14 +5540,18 @@ impl JitFunction {
                 }
             }};
         }
-        // An exact non-negative integer index in `reg` → `rax`, else `$miss`.
+        // An exact non-negative integer index in `reg` → `rax`, else `$miss`
+        // (`$num`: `reg` is proven a Number at op `$at`).
         macro_rules! int_index {
-            ($reg:expr, $miss:expr) => {{
-                a.load_rax(disp($reg));
-                a.movabs_r11(QNAN as i64);
-                a.and_rax_r11();
-                a.cmp_rax_r11();
-                a.je($miss); // boxed (non-number) index
+            ($reg:expr, $miss:expr) => {{ int_index!($reg, $miss, false) }};
+            ($reg:expr, $miss:expr, $num:expr) => {{
+                if !$num {
+                    a.load_rax(disp($reg));
+                    a.movabs_r11(QNAN as i64);
+                    a.and_rax_r11();
+                    a.cmp_rax_r11();
+                    a.je($miss); // boxed (non-number) index
+                }
                 a.movsd_xmm0_mem(disp($reg)); // xmm0 = index f64
                 a.cvttsd2si_rax_xmm0(); // rax = trunc(index)
                 a.cvtsi2sd_xmm1_rax(); // xmm1 = (f64)rax
@@ -6290,7 +6294,7 @@ impl JitFunction {
                     // `vm_array_index_get` — bail on a hole (the helper walks the
                     // prototype chain). Everything else → `jit_helper_get_elem`.
                     recv_slot!(op_idx, obj, helper, recv_cache::Family::Arr);
-                    int_index!(index, helper);
+                    int_index!(index, helper, num.is_number_at(op_idx, index));
                     a.mov_r8_at_rcx(layout.off_arr_len);
                     a.cmp_rax_r8();
                     a.jae(helper); // OOB / negative

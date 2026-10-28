@@ -377,6 +377,9 @@ enum StubKind {
     CanonNan,
     /// `xmm x = canonical NaN` (no call).
     CanonNanX { x: u8 },
+    /// `xmm x` is NaN-patterned: to `slow` unless it is a Number (a NaN),
+    /// else resume (no call).
+    NanCheck { x: u8, slow: Label },
     /// Leave the region: flush, then jump to bytecode pc `target`.
     Exit { target: usize },
     /// A global op at `pc` found no validated binding address: validate it
@@ -1456,6 +1459,47 @@ impl NumGen {
         }
     }
 
+    /// Jumps to `stub` unless registers `x` and `y` (those not proven) are
+    /// Numbers. A promoted one is tested by `ucomisd` alone: only a
+    /// NaN-patterned value (a NaN, or any non-Number) takes the exact test,
+    /// out of line ([`StubKind::NanCheck`]). Clobbers `rcx`/`r11`.
+    fn guard_numbers(
+        &mut self,
+        a: &mut X64Assembler,
+        pc: usize,
+        reg: Option<usize>,
+        x: u16,
+        y: u16,
+        stub: Label,
+    ) {
+        let mut mask = false;
+        for (i, r) in [x, y].into_iter().enumerate() {
+            if self.ty(pc, r) == T_NUM || (i == 1 && y == x) {
+                continue;
+            }
+            match self.xmm_of(reg, r) {
+                Some(xr) if self.imode.is_none() => {
+                    let check = a.new_label();
+                    let back = a.new_label();
+                    a.sse_rr(0x66, 0x2e, xr, xr); // ucomisd xr, xr
+                    a.jcc(CC_P, check);
+                    a.bind(back);
+                    self.stub(check, back, reg, StubKind::NanCheck { x: xr, slow: stub });
+                }
+                _ => {
+                    if !mask {
+                        a.movabs_r11(QNAN as i64);
+                        mask = true;
+                    }
+                    self.load_gpr(a, reg, RCX, r);
+                    a.and_rcx_r11();
+                    a.cmp_rcx_r11();
+                    a.jcc(CC_E, stub);
+                }
+            }
+        }
+    }
+
     /// Jumps to `stub` unless register `r` is a Number. Clobbers `rcx`/`r11`.
     fn num_guard(&self, a: &mut X64Assembler, reg: Option<usize>, r: u16, stub: Label) {
         self.load_gpr(a, reg, RCX, r);
@@ -1504,15 +1548,7 @@ impl NumGen {
         let guarded = self.ty(pc, x) != T_NUM || self.ty(pc, y) != T_NUM;
         let stub = a.new_label();
         if guarded {
-            a.movabs_r11(QNAN as i64);
-            for r in [x, y] {
-                if self.ty(pc, r) != T_NUM {
-                    self.load_gpr(a, reg, RCX, r);
-                    a.and_rcx_r11();
-                    a.cmp_rcx_r11();
-                    a.jcc(CC_E, stub);
-                }
-            }
+            self.guard_numbers(a, pc, reg, x, y, stub);
         }
         match self.xmm_of(reg, dst) {
             // A promoted result in a region: computed in its own register
@@ -1687,15 +1723,7 @@ impl NumGen {
         let stub = a.new_label();
         let guarded = self.ty(pc, x) != T_NUM || self.ty(pc, y) != T_NUM;
         if guarded {
-            a.movabs_r11(QNAN as i64);
-            for r in [x, y] {
-                if self.ty(pc, r) != T_NUM {
-                    self.load_gpr(a, reg, RCX, r);
-                    a.and_rcx_r11();
-                    a.cmp_rcx_r11();
-                    a.jcc(CC_E, stub);
-                }
-            }
+            self.guard_numbers(a, pc, reg, x, y, stub);
         }
         // `ucomisd p, q` then `a`/`ae` = p > q / p >= q (false when unordered).
         let (p, q, cc) = match kind {
@@ -1935,6 +1963,14 @@ impl NumGen {
                 StubKind::CanonNanX { x } => {
                     a.movabs_rax(self.canonical_nan as i64);
                     a.movq_x_gpr(x, RAX);
+                    a.jmp(s.resume);
+                }
+                StubKind::NanCheck { x, slow } => {
+                    a.movq_gpr_x(RCX, x);
+                    a.movabs_r11(QNAN as i64);
+                    a.and_rcx_r11();
+                    a.cmp_rcx_r11();
+                    a.jcc(CC_E, slow);
                     a.jmp(s.resume);
                 }
                 StubKind::Exit { target } => {
