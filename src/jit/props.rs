@@ -635,23 +635,8 @@ impl X64Assembler {
         val_disp: i32,
         miss: Label,
     ) {
-        const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
         let cache_shape = l.cache_shape_off;
-        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
-        self.jne(miss);
-        self.cmp_byte_at_rcx_imm(l.off_od_tag, l.obj_shaped_disc);
-        self.jne(miss);
-        self.cmp_byte_at_rcx_imm(l.props.off_jit_flags, 0);
-        self.jne(miss);
-        self.cmp_byte_at_rcx_imm(l.off_frozen, 0);
-        self.jne(miss);
-        self.cmp_byte_at_rcx_imm(l.props.off_sealed, 0);
-        self.jne(miss);
-        self.cmp_byte_at_rcx_imm(l.props.off_extensible, 0);
-        self.g_jcc(cc::E, miss);
-        self.g_load(r::R9, r::RCX, l.props.off_extra);
-        self.g_test(r::R9);
-        self.g_jcc(cc::NE, miss);
+        self.p_add_guards(l, realm_off, miss);
         // The cached shape, whose parent must be the object's shape.
         self.g_movabs(r::R11, cache);
         self.g_load(r::R9, r::R11, cache_shape);
@@ -660,28 +645,11 @@ impl X64Assembler {
         self.g_load(r::R8, r::R9, l.props.shape_parent);
         self.g_cmp_mem(r::R8, r::RCX, l.off_shape);
         self.g_jcc(cc::NE, miss);
-        // Room inline, and below the dictionary threshold.
-        self.p_load32(r::RAX, r::RCX, l.off_slots_len);
-        self.p_cmp32_imm(r::RAX, INLINE);
-        self.g_jcc(cc::AE, miss);
-        self.g_load(r::R11, r::R15, realm_off);
-        self.g_cmp_mem(r::RAX, r::R11, l.props.dict_threshold);
-        self.g_jcc(cc::AE, miss);
         self.g_load(r::RAX, r::RBX, val_disp);
         self.p_barrier_check(l, realm_off, miss);
-        // Commit: the value, the count, the shape, the epoch, the hit.
-        self.p_load32(r::RAX, r::RCX, l.off_slots_len);
-        self.p_lea_index8(r::R11, r::RCX, r::RAX, l.off_inline);
-        self.g_load(r::R8, r::RBX, val_disp);
-        self.g_store(r::R11, 0, r::R8);
-        self.p_inc32_mem(r::RCX, l.off_slots_len);
+        // Commit, and count the hit.
         self.g_movabs(r::R11, cache);
-        self.g_load(r::R9, r::R11, cache_shape);
-        self.g_inc_mem(r::R9, l.props.rc_strong);
-        self.g_load(r::R8, r::RCX, l.off_shape);
-        self.g_dec_mem(r::R8, l.props.rc_strong);
-        self.g_store(r::RCX, l.off_shape, r::R9);
-        self.p_inc32_mem(r::RCX, l.props.off_epoch);
+        self.p_add_commit(l, cache_shape, val_disp);
         self.p_inc32_mem(r::R11, l.cache_hits_off);
     }
 
@@ -701,6 +669,138 @@ impl X64Assembler {
             self.g_cmp_mem(r::R8, r::R11, l.props.max_array_len);
             self.g_jcc(cc::A, miss);
         }
+    }
+
+    /// The common guards of an inline property add, on the object whose heap
+    /// slot is `rcx`: an ordinary shaped object with no `jit_flags`,
+    /// extensible, neither frozen nor sealed, with no `extra` part (no
+    /// accessors, attribute marks or key-order log), with room for one more
+    /// value inline and below the dictionary threshold. Else to `miss`.
+    /// Clobbers `rax`, `r8`, `r9`.
+    fn p_add_guards(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
+        const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
+        self.jne(miss);
+        self.cmp_byte_at_rcx_imm(l.off_od_tag, l.obj_shaped_disc);
+        self.jne(miss);
+        self.cmp_byte_at_rcx_imm(l.props.off_jit_flags, 0);
+        self.jne(miss);
+        self.cmp_byte_at_rcx_imm(l.off_frozen, 0);
+        self.jne(miss);
+        self.cmp_byte_at_rcx_imm(l.props.off_sealed, 0);
+        self.jne(miss);
+        self.cmp_byte_at_rcx_imm(l.props.off_extensible, 0);
+        self.g_jcc(cc::E, miss);
+        self.g_load(r::R9, r::RCX, l.props.off_extra);
+        self.g_test(r::R9);
+        self.g_jcc(cc::NE, miss);
+        self.p_load32(r::RAX, r::RCX, l.off_slots_len);
+        self.p_cmp32_imm(r::RAX, INLINE);
+        self.g_jcc(cc::AE, miss);
+        self.g_load(r::R8, r::R15, realm_off);
+        self.g_cmp_mem(r::RAX, r::R8, l.props.dict_threshold);
+        self.g_jcc(cc::AE, miss);
+    }
+
+    /// The commit of an inline property add to the object whose heap slot is
+    /// `rcx`, taking it to the shape whose `Rc` word is at `[r11 + to_disp]`
+    /// (a child of its current shape, which that child keeps alive) with the
+    /// value at `[rbx + val_disp]` in its next inline slot: the value, the
+    /// count, the shape (one strong count moved from the old shape to the
+    /// new) and the key epoch. Clobbers `rax`, `r8`, `r9`.
+    fn p_add_commit(&mut self, l: &JitLayout, to_disp: i32, val_disp: i32) {
+        self.p_load32(r::RAX, r::RCX, l.off_slots_len);
+        self.p_lea_index8(r::R9, r::RCX, r::RAX, l.off_inline);
+        self.g_load(r::R8, r::RBX, val_disp);
+        self.g_store(r::R9, 0, r::R8);
+        self.p_inc32_mem(r::RCX, l.off_slots_len);
+        self.g_load(r::R9, r::R11, to_disp);
+        self.g_inc_mem(r::R9, l.props.rc_strong);
+        self.g_load(r::R8, r::RCX, l.off_shape);
+        self.g_dec_mem(r::R8, l.props.rc_strong);
+        self.g_store(r::RCX, l.off_shape, r::R9);
+        self.p_inc32_mem(r::RCX, l.props.off_epoch);
+    }
+
+    /// To `miss` unless `site`'s add cache is armed (a cheap test before
+    /// [`Self::p_add_prop_inline`]'s receiver walk). Clobbers `r11`.
+    pub(crate) fn p_add_armed(&mut self, site: *const MethodSite, miss: Label) {
+        let from = i32::try_from(
+            core::mem::offset_of!(MethodSite, add) + core::mem::offset_of!(AddEntry, from),
+        )
+        .expect("site offset fits in i32");
+        self.g_movabs(r::R11, site as u64);
+        self.g_load(r::R11, r::R11, from);
+        self.g_test(r::R11);
+        self.g_jcc(cc::E, miss);
+    }
+
+    /// The inline hit of a [`MethodSite`]'s add cache ([`AddEntry`]; what
+    /// `MethodSite::try_add` and then `Realm::jit_add_transition` do), for the
+    /// object whose heap slot is `rcx` (arena base in `r10`, length in `rdx`)
+    /// and the value at `[rbx + val_disp]`: the object passes
+    /// [`Self::p_add_guards`] and has the entry's `from` shape; each of the
+    /// entry's `depth` prototype levels is still the recorded object, ordinary
+    /// and non-exotic, with the recorded shape and key epoch; the chain ends
+    /// there; and the store needs nothing from the write barrier. Then the
+    /// add is made ([`Self::p_add_commit`]); otherwise to `miss`, having
+    /// changed nothing. Clobbers `rax`, `rcx`, `rsi`, `r8`, `r9`, `r11`.
+    pub(crate) fn p_add_prop_inline(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        site: *const MethodSite,
+        val_disp: i32,
+        miss: Label,
+    ) {
+        use core::mem::{offset_of, size_of};
+        let i = |v: usize| i32::try_from(v).expect("site offset fits in i32");
+        let add = offset_of!(MethodSite, add);
+        let level = |d: usize, f: usize| {
+            i(add + offset_of!(AddEntry, levels) + d * size_of::<ChainLevel>() + f)
+        };
+        let from = i(add + offset_of!(AddEntry, from));
+        let to = i(add + offset_of!(AddEntry, to));
+        let depth = i(add + offset_of!(AddEntry, depth));
+        self.g_movabs(r::R11, site as u64);
+        self.p_add_guards(l, realm_off, miss);
+        self.g_load(r::R9, r::R11, from);
+        self.g_test(r::R9);
+        self.g_jcc(cc::E, miss);
+        self.g_cmp_mem(r::R9, r::RCX, l.off_shape);
+        self.g_jcc(cc::NE, miss);
+        self.g_load(r::R9, r::R11, to);
+        self.g_test(r::R9);
+        self.g_jcc(cc::E, miss);
+        // The prototype chain, receiver's `[[Prototype]]` first.
+        self.g_mov(r::RSI, r::RCX);
+        let end = self.new_label();
+        for d in 0..CHAIN_MAX {
+            self.p_cmp32_imm8(r::R11, depth, i8::try_from(d).expect("small depth"));
+            self.g_jcc(cc::E, end);
+            self.g_load(r::RAX, r::RCX, l.props.off_proto);
+            self.g_cmp_mem(r::RAX, r::R11, level(d, offset_of!(ChainLevel, handle)));
+            self.g_jcc(cc::NE, miss);
+            self.p_slot_of(l, miss);
+            self.p_plain_shaped(l, miss);
+            self.g_load(r::RAX, r::RCX, l.off_shape);
+            self.g_cmp_mem(r::RAX, r::R11, level(d, offset_of!(ChainLevel, shape)));
+            self.g_jcc(cc::NE, miss);
+            self.p_load32(r::RAX, r::RCX, l.props.off_epoch);
+            self.p_cmp32_mem(r::RAX, r::R11, level(d, offset_of!(ChainLevel, epoch)));
+            self.g_jcc(cc::NE, miss);
+        }
+        self.bind(end);
+        // ... and ends there (a `depth` past `CHAIN_MAX` is never recorded).
+        self.g_load(r::RAX, r::RCX, l.props.off_proto);
+        self.g_movabs(r::R8, crate::object::NO_PROTO);
+        self.g_cmp(r::RAX, r::R8);
+        self.g_jcc(cc::NE, miss);
+        self.g_mov(r::RCX, r::RSI);
+        self.g_load(r::RAX, r::RBX, val_disp);
+        self.p_barrier_check(l, realm_off, miss);
+        self.g_movabs(r::R11, site as u64);
+        self.p_add_commit(l, to, val_disp);
     }
 
     /// `inc dword [base+disp32]` (`base` neither `rsp` nor `r12`).

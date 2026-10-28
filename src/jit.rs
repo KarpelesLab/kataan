@@ -5597,8 +5597,26 @@ impl JitFunction {
                     a.movabs_r11(s.cache_ptr as i64);
                     a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
                     a.jmp(done);
-                    // jit_helper_set_prop_site(ctx, obj, site, val, strict).
                     a.bind(helper);
+                    // ===== inline add-cache hit (`p_add_prop_inline`): the
+                    // write adds the key `this.x = x` adds, by the site's
+                    // recorded transition =====
+                    let call_helper = a.new_label();
+                    if !s.method_ptr.is_null() {
+                        a.p_add_armed(s.method_ptr, call_helper);
+                        a.p_load_arena(helpers.call_layout.realm, &layout.props);
+                        walk_to_slot!(obj, call_helper);
+                        a.p_add_prop_inline(
+                            &layout,
+                            helpers.call_layout.realm,
+                            s.method_ptr,
+                            disp(val),
+                            call_helper,
+                        );
+                        a.jmp(done);
+                    }
+                    // jit_helper_set_prop_site(ctx, obj, site, val, strict).
+                    a.bind(call_helper);
                     a.mov_rdi_r15();
                     a.load_argreg(1, disp(obj));
                     a.movabs_argreg(2, s.method_ptr as i64);

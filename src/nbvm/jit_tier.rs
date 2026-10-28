@@ -537,6 +537,22 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_object().to_raw());
             Some(Ok(()))
         }
+        // A closure (its interpreter arm, which cannot fail).
+        Op::MakeClosure {
+            dst,
+            func,
+            captures,
+        } => {
+            let cells: alloc::vec::Vec<NanBox> =
+                captures.iter().map(|r| regs[*r as usize]).collect();
+            let handle = ctx.realm.new_vm_function(*func, cells);
+            super::install_fn_name_length(&mut ctx.realm, handle, funcs.get(*func as usize));
+            super::link_function_proto(ctx, handle);
+            super::link_async_proto(ctx, funcs.get(*func as usize), handle);
+            super::tag_new_fn_realm(ctx, handle);
+            regs[*dst as usize] = NanBox::handle(handle.to_raw());
+            Some(Ok(()))
+        }
         // (A capture cell — a one-element array — per loop iteration.) The
         // interpreter's length cap stays its own (an error path).
         Op::NewArray { dst, len } if *len <= ctx.realm.limits.max_array_len => {
