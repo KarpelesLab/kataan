@@ -354,6 +354,18 @@ impl Object {
         }
     }
 
+    /// Whether the object holds the internal primitive-wrapper key
+    /// ([`crate::shape::PRIM_WRAP_KEY`]) — answered from the shape without a
+    /// lookup in shaped mode.
+    #[inline]
+    #[must_use]
+    pub fn is_prim_wrapper(&self) -> bool {
+        match &self.data {
+            ObjectData::Shaped { shape, .. } => shape.is_wrapper(),
+            ObjectData::Dict { map, .. } => map.contains_key(crate::shape::PRIM_WRAP_KEY),
+        }
+    }
+
     /// Whether the object has no accessor properties at all.
     #[inline]
     #[must_use]

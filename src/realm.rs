@@ -193,7 +193,7 @@ pub struct Realm {
     /// object part (natives, bound natives) — e.g. each typed-array constructor's
     /// prototype is the shared `%TypedArray%` intrinsic. Keyed by handle; same
     /// non-GC-root, GC-quiescent caveat as `aux_props`.
-    native_protos: alloc::collections::BTreeMap<u64, Handle>,
+    native_protos: handle_map::HandleKeyedMap<Handle>,
     /// Callable cells whose `[[Prototype]]` was explicitly set to `null`
     /// (`Object.setPrototypeOf(fn, null)`), distinguishing them from the default
     /// (which resolves to `%Function.prototype%`). Same non-GC-root caveat.
@@ -369,7 +369,7 @@ struct PruneTables<'t> {
     length_tracking_views: &'t mut alloc::collections::BTreeSet<u64>,
     nonwritable_array_lengths: &'t mut alloc::collections::BTreeSet<u64>,
     sparse_array_lengths: &'t mut alloc::collections::BTreeMap<u64, usize>,
-    native_protos: &'t mut alloc::collections::BTreeMap<u64, Handle>,
+    native_protos: &'t mut handle_map::HandleKeyedMap<Handle>,
     callable_null_protos: &'t mut alloc::collections::BTreeSet<u64>,
     native_class_tags: &'t mut alloc::collections::BTreeMap<u64, u32>,
 }
@@ -593,7 +593,7 @@ impl Realm {
             proto_replaced: alloc::collections::BTreeSet::new(),
             sparse_array_lengths: alloc::collections::BTreeMap::new(),
             default_object_proto: None,
-            native_protos: alloc::collections::BTreeMap::new(),
+            native_protos: handle_map::HandleKeyedMap::new(),
             callable_null_protos: alloc::collections::BTreeSet::new(),
             vm_fn_default_proto: None,
             native_class_tags: alloc::collections::BTreeMap::new(),
@@ -3218,7 +3218,7 @@ impl Realm {
         self.heap.swap(a, b);
         let (ka, kb) = (a.to_raw(), b.to_raw());
         self.aux_props.swap_entries(ka, kb);
-        swap_map_entry(&mut self.native_protos, ka, kb);
+        self.native_protos.swap_entries(ka, kb);
         swap_map_entry(&mut self.native_class_tags, ka, kb);
         swap_map_entry(&mut self.sparse_array_lengths, ka, kb);
         swap_set_entry(&mut self.frozen_arrays, ka, kb);
@@ -4044,7 +4044,7 @@ impl Realm {
             // synthesized String-exotic properties that no slot records, so it
             // is never cached; every object sharing a cached shape is then
             // not one either.
-            if self.is_host_exotic(cur) || shape.lookup("\u{0}prim").is_some() {
+            if self.is_host_exotic(cur) || shape.is_wrapper() {
                 return;
             }
             shapes.push(Rc::clone(shape));
@@ -4103,7 +4103,7 @@ impl Realm {
             }
             match self.heap.get(cur)? {
                 Cell::Object(o) => {
-                    if o.contains("\u{0}prim") {
+                    if o.is_prim_wrapper() {
                         return None;
                     }
                     if !o.has_no_accessors()
@@ -4381,7 +4381,7 @@ impl Realm {
                 return false;
             }
             if let Ok(i) = key.parse::<usize>()
-                && alloc::format!("{i}") == key
+                && crate::realm::is_canonical_decimal(key)
                 && i < len
             {
                 return false;
@@ -4396,7 +4396,7 @@ impl Realm {
                 return false;
             }
             if let Ok(i) = key.parse::<usize>()
-                && alloc::format!("{i}") == key
+                && crate::realm::is_canonical_decimal(key)
                 && i < len
             {
                 return false;
@@ -4414,7 +4414,7 @@ impl Realm {
         if self.heap.get(handle).and_then(Cell::as_array).is_some()
             && key != "length"
             && let Ok(i) = key.parse::<usize>()
-            && alloc::format!("{i}") == key
+            && crate::realm::is_canonical_decimal(key)
         {
             {
                 // A present element, or an accessor installed over a hole, is the own
@@ -4625,6 +4625,12 @@ impl Realm {
     /// String exotic object's own `length` and index (`"0".."length-1"`)
     /// properties.
     pub(crate) fn string_object_len(&self, handle: Handle) -> Option<usize> {
+        // An ordinary object that is no wrapper is no String either.
+        if let Some(Cell::Object(o)) = self.heap.get(handle)
+            && !o.is_prim_wrapper()
+        {
+            return None;
+        }
         let sh = match self.get_property(handle, "\u{0}prim") {
             Some(prim) => Handle::from_raw(prim.as_handle()?),
             None => handle,
@@ -4662,7 +4668,7 @@ impl Realm {
                 return true;
             }
             if let Ok(i) = key.parse::<usize>()
-                && alloc::format!("{i}") == key
+                && crate::realm::is_canonical_decimal(key)
                 && i < slen
             {
                 return true;
@@ -4679,7 +4685,7 @@ impl Realm {
             }
             if let Ok(i) = key.parse::<usize>()
                 && i < a.len()
-                && alloc::format!("{i}") == key
+                && crate::realm::is_canonical_decimal(key)
                 && !a[i].is_hole()
             {
                 // A present (non-hole) in-range index is an own property. A hole
@@ -4694,7 +4700,7 @@ impl Realm {
         if let Some(len) = self.typed_len(handle)
             && let Ok(i) = key.parse::<usize>()
             && i < len
-            && alloc::format!("{i}") == key
+            && crate::realm::is_canonical_decimal(key)
         {
             return true;
         }
@@ -5048,7 +5054,7 @@ impl Realm {
                 return false;
             }
             if let Ok(i) = key.parse::<usize>()
-                && alloc::format!("{i}") == key
+                && crate::realm::is_canonical_decimal(key)
                 && i < slen
             {
                 return true;
@@ -5062,7 +5068,7 @@ impl Realm {
         if let Some((_, _, len, _)) = self.heap.get(handle).and_then(Cell::as_typed_array)
             && let Ok(i) = key.parse::<usize>()
             && i < len
-            && alloc::format!("{i}") == key
+            && crate::realm::is_canonical_decimal(key)
         {
             return true;
         }
@@ -5075,7 +5081,7 @@ impl Realm {
             }
             if let Ok(i) = key.parse::<usize>()
                 && i < a.len()
-                && alloc::format!("{i}") == key
+                && crate::realm::is_canonical_decimal(key)
             {
                 let hidden = self
                     .aux_props
@@ -8029,4 +8035,15 @@ pub enum ChainHit {
     Accessor(NanBox, NanBox, bool),
     /// No object on the chain has the key (the chain ends in null).
     Absent,
+}
+
+/// Whether `s`, which the caller has just parsed successfully as an unsigned
+/// integer `i`, is that integer's canonical decimal form (`i.to_string() ==
+/// s`): no leading `+` and no leading zero other than `"0"` itself. The same
+/// test without formatting `i` into a fresh string.
+#[inline]
+#[must_use]
+pub(crate) fn is_canonical_decimal(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty() && b[0] != b'+' && (b[0] != b'0' || b.len() == 1)
 }

@@ -142,7 +142,7 @@ impl Interp {
                 return Some(build(self, NanBox::number(slen as f64), false));
             }
             if let Ok(i) = key.parse::<usize>()
-                && alloc::format!("{i}") == key
+                && crate::realm::is_canonical_decimal(key)
                 && i < slen
             {
                 let ch = self.read_member(obj, key).ok()?;
@@ -184,7 +184,7 @@ impl Interp {
                 // an accessor descriptor by the generic path below, not as a data
                 // property — fall through when one exists.
                 if i < len
-                    && alloc::format!("{i}") == key
+                    && crate::realm::is_canonical_decimal(key)
                     && self.realm.accessor(obj, key).is_none()
                     // A hole (absent index) is not an own property even within
                     // `length`; only a present element is a data property.
@@ -1028,7 +1028,7 @@ impl Interp {
             let is_index = key
                 .parse::<usize>()
                 .ok()
-                .filter(|&i| alloc::format!("{i}") == key && i < slen)
+                .filter(|&i| crate::realm::is_canonical_decimal(key) && i < slen)
                 .is_some();
             if key == "length" || is_index {
                 let cur_value = if key == "length" {
@@ -1106,7 +1106,7 @@ impl Interp {
         if self.realm.is_array(obj)
             && self.realm.array_length_is_readonly(obj)
             && let Ok(i) = key.parse::<usize>()
-            && alloc::format!("{i}") == key
+            && crate::realm::is_canonical_decimal(key)
             && i >= self.realm.array_length(obj).unwrap_or(0)
         {
             if reflect {
@@ -1249,7 +1249,7 @@ impl Interp {
             // index+1 when the index is at/beyond the current length.
             if self.realm.is_array(obj)
                 && let Ok(i) = key.parse::<usize>()
-                && alloc::format!("{i}") == key
+                && crate::realm::is_canonical_decimal(key)
             {
                 self.realm.array_index_to_hole(obj, i);
             }
@@ -1287,7 +1287,7 @@ impl Interp {
             let array_index = if self.realm.is_array(obj) {
                 key.parse::<u32>()
                     .ok()
-                    .filter(|&i| i != u32::MAX && alloc::format!("{i}") == key)
+                    .filter(|&i| i != u32::MAX && crate::realm::is_canonical_decimal(key))
                     .map(|i| i as usize)
             } else {
                 None
@@ -1567,7 +1567,7 @@ impl Interp {
             // slot, so read it with `get_element` for a same-value comparison.
             let cur_val = if self.realm.is_array(obj)
                 && let Ok(i) = key.parse::<usize>()
-                && alloc::format!("{i}") == key
+                && crate::realm::is_canonical_decimal(key)
             {
                 self.realm.get_element(obj, i)
             } else {
@@ -1900,7 +1900,7 @@ impl Interp {
     pub(crate) fn arg_map_binding(&self, handle: Handle, key: &str) -> Option<super::ArgRef> {
         let map = self.arg_maps.get(&handle.to_raw())?;
         let i = key.parse::<usize>().ok()?;
-        if alloc::format!("{i}") != key {
+        if !crate::realm::is_canonical_decimal(key) {
             return None;
         }
         if let Some(c) = map.cells.get(&i) {
@@ -1940,7 +1940,7 @@ impl Interp {
     pub(crate) fn arg_map_break(&mut self, handle: Handle, key: &str) {
         if let Some(map) = self.arg_maps.get_mut(&handle.to_raw())
             && let Ok(i) = key.parse::<usize>()
-            && alloc::format!("{i}") == key
+            && crate::realm::is_canonical_decimal(key)
         {
             map.slots.remove(&i);
             map.cells.remove(&i);

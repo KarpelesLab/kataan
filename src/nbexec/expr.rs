@@ -1137,9 +1137,9 @@ impl Interp {
             // Only a real array index `[0, 2**32−1)` addresses element storage; the
             // boundary `2**32−1` and above are ordinary named properties.
             let array_index = self.realm.is_array(handle).then(|| {
-                name.parse::<usize>()
-                    .ok()
-                    .filter(|i| alloc::format!("{i}") == name && (*i as u64) < u64::from(u32::MAX))
+                name.parse::<usize>().ok().filter(|i| {
+                    crate::realm::is_canonical_decimal(&name) && (*i as u64) < u64::from(u32::MAX)
+                })
             });
             if let Some(Some(i)) = array_index {
                 self.set_element_checked(handle, i, new)?;
@@ -1493,7 +1493,7 @@ impl Interp {
         // (handled by the aux lookup below).
         if self.realm.is_array(handle)
             && let Ok(i) = name.parse::<usize>()
-            && alloc::format!("{i}") == name
+            && crate::realm::is_canonical_decimal(name)
             && (i as u64) < u64::from(u32::MAX)
             && i < self.realm.array_dense_len(handle).unwrap_or(0)
         {
@@ -2084,7 +2084,7 @@ impl Interp {
             // *aux* named props, never its elements).
             if self.realm.is_array_like(p) {
                 if let Ok(i) = name.parse::<usize>()
-                    && alloc::format!("{i}") == name
+                    && crate::realm::is_canonical_decimal(name)
                 {
                     if i < self.realm.array_length(p).unwrap_or(0) {
                         let v = self.realm.get_element(p, i);

@@ -143,7 +143,13 @@ pub struct Shape {
     index: OnceCell<Box<ShapeIndex>>,
     /// Chain-walk lookups served so far (drives building `index`).
     probes: Cell<u32>,
+    /// Whether the layout holds the internal primitive-wrapper key
+    /// ([`PRIM_WRAP_KEY`]), so "is this a wrapper object" needs no lookup.
+    wrapper: bool,
 }
+
+/// The internal key under which a primitive wrapper object boxes its value.
+pub const PRIM_WRAP_KEY: &str = "\u{0}prim";
 
 impl Shape {
     /// The root (empty) shape. Every object's layout descends from it.
@@ -157,6 +163,7 @@ impl Shape {
             transitions: RefCell::new(Vec::new()),
             index: OnceCell::new(),
             probes: Cell::new(0),
+            wrapper: false,
         })
     }
 
@@ -171,6 +178,13 @@ impl Shape {
     #[must_use]
     pub fn parent(&self) -> Option<&Rc<Shape>> {
         self.parent.as_ref()
+    }
+
+    /// Whether the layout holds the primitive-wrapper key [`PRIM_WRAP_KEY`].
+    #[inline]
+    #[must_use]
+    pub fn is_wrapper(&self) -> bool {
+        self.wrapper
     }
 
     /// Whether this is the empty (root) layout.
@@ -218,6 +232,7 @@ impl Shape {
             transitions: RefCell::new(Vec::new()),
             index: OnceCell::new(),
             probes: Cell::new(0),
+            wrapper: self.wrapper || key == PRIM_WRAP_KEY,
         });
         // Replace a dead entry in place rather than growing the cache with it.
         let mut transitions = self.transitions.borrow_mut();
