@@ -1,4 +1,5 @@
 use super::*;
+use crate::realm::hidden_layout::HiddenLayout;
 
 impl Interp {
     /// Runs an ES2025 `Iterator.prototype` helper (`map`/`filter`/`take`/`drop`/
@@ -2844,6 +2845,11 @@ fn collection_iter_step(realm: &mut Realm, h: Handle, coll: Handle) -> Option<Na
         .get_property(h, GEN_CSTATE)
         .and_then(|v| v.as_handle())
         .map(Handle::from_raw)?;
+    collection_iter_yield(realm, state, coll)
+}
+
+/// The body of [`collection_iter_step`] once the cursor `state` is found.
+fn collection_iter_yield(realm: &mut Realm, state: Handle, coll: Handle) -> Option<NanBox> {
     let (kind, k, v) = realm.collection_iter_advance(state, coll)?;
     Some(match kind {
         0 => k,                                                           // keys
@@ -2851,6 +2857,50 @@ fn collection_iter_step(realm: &mut Realm, h: Handle, coll: Handle) -> Option<Na
         _ if realm.collection_is_set(coll) == Some(true) => k, // values (a Set yields its element)
         _ => v,
     })
+}
+
+/// The hidden keys of a live Set/Map iterator (`make_live_collection_iterator`),
+/// in [`Realm::coll_iter_layout`] slot order.
+const COLL_ITER_KEYS: [&str; 2] = [GEN_COLL, GEN_CSTATE];
+
+/// The hidden keys of a snapshot-buffer iterator (`make_builtin_iterator`),
+/// in [`Realm::buf_iter_layout`] slot order.
+const BUF_ITER_KEYS: [&str; 3] = [GEN_BUF, GEN_IDX, GEN_RET];
+
+/// `realm_builtin_iter_step` for an iterator `h` with one of the realm's
+/// learned layouts (`hidden_layout`): a live Set/Map iterator, or a
+/// snapshot-buffer iterator (whose layout also proves that none of the keys
+/// selecting another kind of iterator is present). The same reads and writes
+/// as [`collection_iter_step`] / [`buffer_iter_step`], by slot instead of by
+/// name. `None` when `h` has neither layout.
+fn builtin_iter_step_by_slot(realm: &mut Realm, h: Handle) -> Option<Option<NanBox>> {
+    if let Some(layout) = &realm.coll_iter_layout
+        && let Some([coll, state]) = layout.read(realm, h)
+    {
+        let coll = Handle::from_raw(coll.as_handle()?);
+        let state = state.as_handle().map(Handle::from_raw);
+        return Some(state.and_then(|state| collection_iter_yield(realm, state, coll)));
+    }
+    let layout = realm.buf_iter_layout.take()?;
+    let r = layout.read(realm, h).and_then(|[buf, idx, _ret]| {
+        let buf = Handle::from_raw(buf.as_handle()?);
+        let idx = idx.as_number().unwrap_or(0.0) as usize;
+        let len = realm.array_length(buf).unwrap_or(0);
+        Some(if idx < len {
+            let v = realm.get_element(buf, idx);
+            layout.write(realm, h, 1, NanBox::number((idx + 1) as f64));
+            Some(v)
+        } else {
+            if idx == len {
+                layout.write(realm, h, 1, NanBox::number((idx + 1) as f64));
+            }
+            // Done (the `return` value matters only to a `next()` call's
+            // result object, which this step does not build).
+            None
+        })
+    });
+    realm.buf_iter_layout = Some(layout);
+    r
 }
 
 /// One step of a snapshot-buffer iterator `h` over `buf` (a built-in
@@ -2904,13 +2954,21 @@ pub(crate) fn realm_builtin_iter_step(
     if !realm.is_ordinary_get_cell(h) {
         return None;
     }
+    // A built-in iterator in a learned layout: its state by slot.
+    if let Some(step) = builtin_iter_step_by_slot(realm, h) {
+        return Some(step);
+    }
     // The same dispatch order as `gen_iter_next`.
     if let Some(coll) = realm
         .get_property(h, GEN_COLL)
         .and_then(|v| v.as_handle())
         .map(Handle::from_raw)
     {
-        return Some(collection_iter_step(realm, h, coll));
+        let step = collection_iter_step(realm, h, coll);
+        if realm.coll_iter_layout.is_none() {
+            realm.coll_iter_layout = HiddenLayout::learn(realm, h, COLL_ITER_KEYS, &[]);
+        }
+        return Some(step);
     }
     if realm.get_property(h, GEN_TA).is_some()
         || realm.get_property(h, GEN_ARR).is_some()
@@ -2923,5 +2981,13 @@ pub(crate) fn realm_builtin_iter_step(
         .and_then(|b| b.as_handle())
         .map(Handle::from_raw)?;
     let (v, done) = buffer_iter_step(realm, h, buf);
+    if realm.buf_iter_layout.is_none() {
+        realm.buf_iter_layout = HiddenLayout::learn(
+            realm,
+            h,
+            BUF_ITER_KEYS,
+            &[GEN_COLL, GEN_TA, GEN_ARR, RSI_MATCHER],
+        );
+    }
     Some((!done).then_some(v))
 }

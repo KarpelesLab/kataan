@@ -25,6 +25,7 @@
 
 pub(crate) mod builtins_fast;
 mod coll_index;
+pub(crate) mod hidden_layout;
 pub use coll_index::CollIndex;
 mod handle_map;
 
@@ -201,6 +202,12 @@ pub struct Realm {
     /// The key strings of the last plain-keyed shape `Object.keys` listed
     /// (see `builtins_fast::plain_enumerable_key_ropes`).
     key_ropes: core::cell::RefCell<Option<ShapeKeyRopes>>,
+    /// The hidden-state layout of a live Set/Map iterator (see
+    /// `hidden_layout`), learned from the first one the bytecode VM steps.
+    pub(crate) coll_iter_layout: Option<hidden_layout::HiddenLayout<2>>,
+    /// The hidden-state layout of a snapshot-buffer built-in iterator (see
+    /// `hidden_layout`), learned likewise.
+    pub(crate) buf_iter_layout: Option<hidden_layout::HiddenLayout<3>>,
     /// Shared prototype-chain lookup memos (see
     /// `builtins_fast::shared_chain_lookup`), one per fixed lookup site.
     chain_lookups: core::cell::RefCell<alloc::vec::Vec<builtins_fast::ChainKeyCache>>,
@@ -636,6 +643,8 @@ impl Realm {
             number_ropes: core::cell::RefCell::new(alloc::vec::Vec::new()),
             literal_ropes: alloc::vec::Vec::new(),
             key_ropes: core::cell::RefCell::new(None),
+            coll_iter_layout: None,
+            buf_iter_layout: None,
             chain_lookups: core::cell::RefCell::new(alloc::vec::Vec::new()),
             sparse_array_lengths: alloc::collections::BTreeMap::new(),
             default_object_proto: None,

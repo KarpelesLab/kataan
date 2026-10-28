@@ -655,6 +655,24 @@ impl Object {
         }
     }
 
+    /// Writes slot `slot` directly, without a name lookup or the integrity
+    /// checks of [`set`](Object::set): the caller must have resolved `slot`
+    /// under this object's current shape and ruled out a frozen object and a
+    /// read-only key. Returns `false` (nothing written) in dictionary mode or
+    /// for an out-of-range slot.
+    pub fn set_slot(&mut self, slot: u32, value: NanBox) -> bool {
+        match &mut self.data {
+            ObjectData::Shaped { len, slots, .. } => match slots.get_mut(*len, slot) {
+                Some(cell) => {
+                    *cell = value;
+                    true
+                }
+                None => false,
+            },
+            ObjectData::Dict { .. } => false,
+        }
+    }
+
     /// Reads own data property `key`, consulting `cache` so a repeat access on the
     /// same shape skips the name lookup (a shape-pointer compare plus a slot
     /// load). Returns `None` if the property is absent (a cache miss).

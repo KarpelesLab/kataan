@@ -13055,3 +13055,31 @@ fn captured_variables_in_binding_cells() {
     "#;
     assert_eq!(run(src), "200110000|1225|3628800|14|7|4950|20|210444|40");
 }
+
+#[test]
+fn builtin_iterators_stepped_by_slot_match_by_name() {
+    // The VM steps live Set/Map and snapshot-buffer (string) iterators through
+    // a learned hidden-state layout; an iterator off that layout (an extra
+    // property, a replaced `next`) must take the by-name path with the same
+    // result.
+    let src = r#"
+        var out = [];
+        var s = new Set([1, 2, 3, 4]);
+        for (var x of s) { if (x === 1) { s.delete(2); s.add(5); } out.push(x); }
+        var it = s.values(); it.extra = 1; for (var y of it) out.push(y);
+        var m = new Map([["a", 1], ["b", 2]]);
+        for (var [k, v] of m) out.push(k + v);
+        var str = "";
+        for (var c of "a\u{1F600}b") str += c.length;
+        out.push(str);
+        var si = "xyz"[Symbol.iterator](); si.next();
+        for (var c2 of si) out.push(c2);
+        var sp = Object.getPrototypeOf(si), on = sp.next;
+        sp.next = function () { var r = on.call(this); if (!r.done) r.value += "!"; return r; };
+        for (var c3 of "pq") out.push(c3);
+        sp.next = on;
+        for (var c4 of "r") out.push(c4);
+        out.join(",")
+    "#;
+    assert_eq!(run(src), "1,3,4,5,1,3,4,5,a1,b2,121,y,z,p!,q!,r");
+}
