@@ -155,7 +155,14 @@ impl Interp {
         // `[[Prototype]]` (ordinarily `%Function.prototype%`), not
         // `Object.prototype` (which `new_object` defaults to).
         let target_h = target.as_handle().map(Handle::from_raw);
-        let target_proto = target_h.and_then(|t| self.realm.object_proto(t));
+        // BoundFunctionCreate step 1 is `? target.[[GetPrototypeOf]]()`, so a
+        // proxy target fires its `getPrototypeOf` trap (and a throw propagates).
+        let target_proto = match target_h {
+            Some(t) if self.realm.proxy_at(t).is_some() => {
+                self.get_proto_of(t)?.as_handle().map(Handle::from_raw)
+            }
+            _ => target_h.and_then(|t| self.realm.object_proto(t)),
+        };
         self.realm.set_object_proto(obj, target_proto);
         self.realm.set_hidden_property(obj, BOUND_TARGET, target);
         self.realm.set_hidden_property(obj, BOUND_THIS, this_val);

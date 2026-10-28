@@ -2184,7 +2184,7 @@ impl Interp {
 
     /// `SetIntegrityLevel(O, level)` (7.3.15) routed through a proxy's traps:
     /// `[[PreventExtensions]]`, then `[[OwnPropertyKeys]]` and — per key —
-    /// `[[GetOwnProperty]]` + `[[DefineOwnProperty]]` making it non-configurable
+    /// (`frozen` only) `[[GetOwnProperty]]` + `[[DefineOwnProperty]]` making it non-configurable
     /// (and a data property non-writable when `frozen`). A failed prevent-extensions
     /// or a rejected define is a TypeError.
     pub(crate) fn proxy_set_integrity_level(
@@ -2200,14 +2200,19 @@ impl Interp {
         let keys = self.own_property_keys_values(obj)?;
         for key in keys {
             let name = self.member_key(key);
-            let current = self.descriptor_of(obj, &name)?;
-            if matches!(current.unpack(), Unpacked::Undefined) {
-                continue;
+            // `sealed` defines `{configurable: false}` on every key without
+            // reading it; only `frozen` asks `[[GetOwnProperty]]` first (to tell
+            // a data property, which also becomes non-writable, from an accessor).
+            let mut is_accessor = false;
+            if frozen {
+                let current = self.descriptor_of(obj, &name)?;
+                if matches!(current.unpack(), Unpacked::Undefined) {
+                    continue;
+                }
+                is_accessor = current.as_handle().map(Handle::from_raw).is_some_and(|dh| {
+                    self.realm.has_own(dh, "get") || self.realm.has_own(dh, "set")
+                });
             }
-            let is_accessor = current
-                .as_handle()
-                .map(Handle::from_raw)
-                .is_some_and(|dh| self.realm.has_own(dh, "get") || self.realm.has_own(dh, "set"));
             let desc = self.realm.new_object();
             self.realm
                 .set_property(desc, "configurable", NanBox::boolean(false));

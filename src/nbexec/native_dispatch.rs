@@ -1305,6 +1305,12 @@ impl Interp {
                 // A module namespace's `[[GetOwnProperty]]` of a TDZ export throws.
                 #[cfg(all(feature = "module", feature = "std"))]
                 self.namespace_binding_tdz(target, &key)?;
+                // A proxy's `[[GetOwnProperty]]` is its `getOwnPropertyDescriptor`
+                // trap (or the target's): HasOwnProperty is `desc is not undefined`.
+                if self.realm.proxy_at(target).is_some() {
+                    let d = self.descriptor_of(target, &key)?;
+                    return Ok(NanBox::boolean(!matches!(d.unpack(), Unpacked::Undefined)));
+                }
                 let owned = Some(target).is_some_and(|h| {
                     self.realm.has_own(h, &key)
                         || self

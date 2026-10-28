@@ -279,3 +279,36 @@ fn builtins_coerce_only_the_arguments_they_read() {
         "2,31,8,0,12,5,abc,abc,ab--,7|s|5.0990195135927845"
     );
 }
+
+/// A Proxy's internal methods are each called exactly as the algorithm says:
+/// `Object.hasOwn(proxy, k)` asks its `getOwnPropertyDescriptor` trap (it
+/// was false for every proxy), `Object.seal` defines `{configurable: false}`
+/// per key without reading descriptors (only `freeze` reads them), and
+/// `bind` asks a proxy target's `getPrototypeOf` trap for the bound
+/// function's prototype.
+#[test]
+fn proxy_traps_for_has_own_seal_and_bind() {
+    let src = r#"
+        var log = [];
+        function P(t) {
+            return new Proxy(t, {
+                getOwnPropertyDescriptor(t, k) { log.push("gopd:" + k); return Reflect.getOwnPropertyDescriptor(t, k); },
+                defineProperty(t, k, d) { log.push("def:" + k); return Reflect.defineProperty(t, k, d); },
+                getPrototypeOf(t) { log.push("gpo"); return Reflect.getPrototypeOf(t); },
+            });
+        }
+        var r = [Object.hasOwn(P({ a: 1 }), "a"), Object.hasOwn(P({}), "a")];
+        r.push(log.splice(0).join());
+        Object.seal(P({ a: 1 }));
+        r.push(log.splice(0).join());
+        Object.freeze(P({ a: 1 }));
+        r.push(log.splice(0).join());
+        var g = P(function f(x) {}).bind(null);
+        r.push(log.splice(0).join(), g.name, Object.getPrototypeOf(g) === Function.prototype);
+        r.join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "true|false|gopd:a,gopd:a|def:a|gopd:a,def:a|gpo,gopd:length|bound f|true"
+    );
+}
