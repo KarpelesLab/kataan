@@ -3353,6 +3353,10 @@ fn vm_agent_tick(ctx: &mut Ctx) -> bool {
 /// (GetFunctionRealm) — recorded only when that is a created one, since an
 /// untagged function is the main realm's.
 fn tag_new_fn_realm(ctx: &mut Ctx, f: Handle) {
+    // A single-realm run (no second realm ever existed): nothing to tag.
+    if !ctx.realm.multi_realm && ctx.in_realm.is_none() {
+        return;
+    }
     let running = if ctx.realm.multi_realm {
         ctx.host.as_deref().and_then(|h| h.realm_index())
     } else {
@@ -4208,6 +4212,12 @@ fn call_with_inner(
             );
             return Err(VmError::Thrown(e));
         }
+        // A hot function with Int/Float-tier native code runs on its
+        // arguments alone: no register window to build.
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        if let Some(v) = unboxed_fast_call(proto, &args) {
+            return Ok(v);
+        }
         let mut regs: Vec<NanBox> = ctx.realm.vm_reg_pool.pop().unwrap_or_default();
         regs.resize(proto.n_regs, NanBox::undefined());
         match proto.rest_from {
@@ -4423,6 +4433,29 @@ fn call_with_inner(
             }
         }
     }
+}
+
+/// The call-entry hook's Int/Float-tier case (`jit_tier::enter_on_call`),
+/// taken before the activation's register window is built: a hot function
+/// whose native code is on an unboxed tier sees only its parameters (no
+/// captures, `this`, rest array or `arguments` object, and it cannot
+/// allocate), so it is called on the argument values directly. `None` — not
+/// such a function, or a deopt (an argument it cannot represent, an
+/// overflow) — runs the ordinary activation.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn unboxed_fast_call(proto: &FnProto, args: &[NanBox]) -> Option<NanBox> {
+    if proto.rest_from.is_some() || proto.n_captures != 0 || proto.is_async || proto.is_generator {
+        return None;
+    }
+    let t = proto.tier.0.try_borrow().ok()?;
+    if !jit_tier::call_is_hot(t.body.is_some()) {
+        return None;
+    }
+    let j = t.jit.as_ref()?.as_ref()?;
+    if j.is_generic() {
+        return None;
+    }
+    j.call_guarded(args.get(..proto.n_params)?)
 }
 
 /// Function `id`'s native code (`None` if it is not JIT-eligible), compiled on

@@ -199,6 +199,11 @@ impl Interp {
         this_val: NanBox,
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
+        // One realm only (none was ever created): every function's realm is
+        // the running one, so there is nothing to enter.
+        if self.created_realms.is_empty() {
+            return self.call_with_this_inner(callee, this_val, args);
+        }
         let callee_h = callee.as_handle().map(Handle::from_raw);
         // A Proxy's `[[Call]]` pushes no execution context of its own — the `apply`
         // trap (or, trapless, the target's own `[[Call]]`, both re-entered through
