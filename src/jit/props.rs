@@ -649,8 +649,50 @@ impl X64Assembler {
         val_disp: i32,
         miss: Label,
     ) {
-        let cache_shape = l.cache_shape_off;
         self.p_add_guards(l, realm_off, miss);
+        self.p_init_prop_commit(l, realm_off, cache, val_disp, miss);
+    }
+
+    /// [`Self::p_init_prop_inline`] on a **fresh literal** (the object in
+    /// `[rbx + obj_disp]`, see `recv_cache::fresh_inits`): a live ordinary
+    /// object no other code has seen, so neither the walk's handle,
+    /// liveness and family checks nor the add guards only such code could
+    /// break (flags, frozen, sealed, extensible) are needed; what the
+    /// literal's own earlier definitions may have changed (a helper's add:
+    /// shaped storage, the `extra` part, inline room, the dictionary
+    /// threshold) is still checked. Leaves `rcx` at the object's heap slot.
+    pub(crate) fn p_init_prop_fresh(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        (obj_disp, val_disp): (i32, i32),
+        cache: u64,
+        miss: Label,
+    ) {
+        self.p_load_arena(realm_off, &l.props);
+        self.mov_r10_rax();
+        self.g_load(r::RAX, r::RBX, obj_disp);
+        self.p_zext_eax(); // rax = handle index
+        self.imul_rax_imm(l.slot_stride);
+        self.add_rax_r10();
+        self.mov_rcx_rax(); // rcx = &Slot
+        self.cmp_byte_at_rcx_imm(l.off_od_tag, l.obj_shaped_disc);
+        self.jne(miss);
+        self.p_add_room(l, realm_off, miss);
+        self.p_init_prop_commit(l, realm_off, cache, val_disp, miss);
+    }
+
+    /// The transition-cache half of an inline literal-property add, after
+    /// the guards (the object's heap slot in `rcx`).
+    fn p_init_prop_commit(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        cache: u64,
+        val_disp: i32,
+        miss: Label,
+    ) {
+        let cache_shape = l.cache_shape_off;
         // The cached shape, whose parent must be the object's shape.
         self.g_movabs(r::R11, cache);
         self.g_load(r::R9, r::R11, cache_shape);
@@ -692,7 +734,6 @@ impl X64Assembler {
     /// value inline and below the dictionary threshold. Else to `miss`.
     /// Clobbers `rax`, `r8`, `r9`.
     fn p_add_guards(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
-        const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
         self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
         self.jne(miss);
         self.cmp_byte_at_rcx_imm(l.off_od_tag, l.obj_shaped_disc);
@@ -705,6 +746,15 @@ impl X64Assembler {
         self.jne(miss);
         self.cmp_byte_at_rcx_imm(l.props.off_extensible, 0);
         self.g_jcc(cc::E, miss);
+        self.p_add_room(l, realm_off, miss);
+    }
+
+    /// The add guards an object's own data-property definitions can change
+    /// (on the shaped object whose heap slot is `rcx`): no `extra` part, room
+    /// for one more value inline, below the dictionary threshold. Else to
+    /// `miss`. Clobbers `rax`, `r8`, `r9`.
+    fn p_add_room(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
+        const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
         self.g_load(r::R9, r::RCX, l.props.off_extra);
         self.g_test(r::R9);
         self.g_jcc(cc::NE, miss);
@@ -759,6 +809,11 @@ impl X64Assembler {
     /// there; and the store needs nothing from the write barrier. Then the
     /// add is made ([`Self::p_add_commit`]); otherwise to `miss`, having
     /// changed nothing. Clobbers `rax`, `rcx`, `rsi`, `r8`, `r9`, `r11`.
+    ///
+    /// `walked`: the object is already known to be an ordinary shaped,
+    /// non-exotic object, neither frozen nor carrying `jit_flags` (an
+    /// in-place store's guards passed before its shape missed), so only the
+    /// rest of the add guards are checked.
     pub(crate) fn p_add_prop_inline(
         &mut self,
         l: &JitLayout,
@@ -766,6 +821,7 @@ impl X64Assembler {
         site: *const MethodSite,
         val_disp: i32,
         miss: Label,
+        walked: bool,
     ) {
         use core::mem::{offset_of, size_of};
         let i = |v: usize| i32::try_from(v).expect("site offset fits in i32");
@@ -777,7 +833,15 @@ impl X64Assembler {
         let to = i(add + offset_of!(AddEntry, to));
         let depth = i(add + offset_of!(AddEntry, depth));
         self.g_movabs(r::R11, site as u64);
-        self.p_add_guards(l, realm_off, miss);
+        if walked {
+            self.cmp_byte_at_rcx_imm(l.props.off_sealed, 0);
+            self.jne(miss);
+            self.cmp_byte_at_rcx_imm(l.props.off_extensible, 0);
+            self.g_jcc(cc::E, miss);
+            self.p_add_room(l, realm_off, miss);
+        } else {
+            self.p_add_guards(l, realm_off, miss);
+        }
         self.g_load(r::R9, r::R11, from);
         self.g_test(r::R9);
         self.g_jcc(cc::E, miss);

@@ -85,6 +85,61 @@ pub(super) fn plan_globals(
     }
 }
 
+/// Which `GenericOp::InitProp`s define a property of a **fresh literal**: an
+/// object an `Op::NewObject` of this body made, in a register that nothing
+/// but the object's own plain `InitProp`s has named since (with no branch
+/// target in between, and fewer than [`crate::object::INLINE_SLOTS`] such
+/// adds so far). No other code can have seen such an object (nothing read
+/// the register, so the handle went nowhere): it is still the ordinary,
+/// extensible, unfrozen, unflagged object `NewObject` made, live (the
+/// register roots it), with at most that many properties — see
+/// `X64Assembler::p_init_prop_fresh`. An `InitProp`'s value escapes into its
+/// object, so a fresh object stored into another stops being fresh.
+pub(super) fn fresh_inits(
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    osr_entries: &[usize],
+    catch_targets: &[usize],
+) -> Vec<bool> {
+    let n = ops.len();
+    let target = branch_targets(ops, osr_entries, catch_targets);
+    let mut out = vec![false; n];
+    // (register, plain adds so far)
+    let live = core::cell::RefCell::new(Vec::<(u16, usize)>::new());
+    for (pc, op) in ops.iter().enumerate() {
+        if target[pc] {
+            live.borrow_mut().clear();
+        }
+        if let GenericOp::InitProp {
+            obj, val, plain, ..
+        } = *op
+        {
+            let mut l = live.borrow_mut();
+            if let Some(i) = l.iter().position(|e| e.0 == obj) {
+                if plain && val != obj && l[i].1 < crate::object::INLINE_SLOTS {
+                    out[pc] = true;
+                    l[i].1 += 1;
+                } else {
+                    l.swap_remove(i);
+                }
+            }
+            l.retain(|e| e.0 != val);
+            continue;
+        }
+        let Some(b) = bytecode.get(pc) else {
+            live.borrow_mut().clear();
+            continue;
+        };
+        // Any other op naming a fresh object's register may let it escape
+        // (or overwrites it).
+        crate::bytecode::op_for_each_reg(b, &|r| live.borrow_mut().retain(|e| e.0 != r));
+        if let Op::NewObject { dst } = b {
+            live.borrow_mut().push((*dst, 0));
+        }
+    }
+    out
+}
+
 /// Which op indices (up to `ops.len()`) are branch targets or entries.
 fn branch_targets(ops: &[GenericOp], osr_entries: &[usize], catch_targets: &[usize]) -> Vec<bool> {
     let n = ops.len();

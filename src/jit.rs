@@ -3417,6 +3417,9 @@ pub struct X64Assembler {
     /// [`RECV_CACHE_EMPTY`]: the generic tier's global binding cache, which
     /// a call does not empty (it is guarded by the global binding epoch).
     entry_clear: Vec<i32>,
+    /// Where the most recent [`bind`](Self::bind) bound its label (no label
+    /// is bound past it, as `bind` binds at the end of the code).
+    last_bind: usize,
 }
 
 /// The value a receiver-cache key slot holds when it caches nothing: the
@@ -3504,7 +3507,20 @@ impl X64Assembler {
 
     /// Binds `label` to the current emission point.
     pub fn bind(&mut self, label: Label) {
+        // A `jmp label` just before (the 5-byte `E9 rel32` whose fixup is the
+        // last one) jumps to the very next instruction: drop it — unless a
+        // label is bound right after it, which would then point past the end.
+        let n = self.code.len();
+        if n >= 5
+            && self.last_bind != n
+            && self.code[n - 5] == 0xe9
+            && self.fixups.last() == Some(&(n - 4, label.0))
+        {
+            self.code.truncate(n - 5);
+            self.fixups.pop();
+        }
         self.labels[label.0] = self.code.len();
+        self.last_bind = self.code.len();
     }
 
     /// Resolves every recorded `rel32` jump fixup; call once after emission.
@@ -5197,6 +5213,8 @@ impl JitFunction {
         // `[rbp + rc_cell(w)]`. The prologue and every call empty the keys.
         let gc_plan = recv_cache::plan_globals(ops, bytecode, |pc| num.in_region(pc));
         let rc = recv_cache::plan(ops, bytecode, &gc_plan, osr_entries, &catch_targets);
+        // The `InitProp`s of a fresh literal (`recv_cache::fresh_inits`).
+        let fresh_init = recv_cache::fresh_inits(ops, bytecode, osr_entries, &catch_targets);
         let rc_base = method_scratch - 8 * num.frame_slots() as i32;
         let rc_key = |w: usize| rc_base - 8 * (2 * w as i32 + 1);
         let rc_cell = |w: usize| rc_base - 8 * (2 * w as i32 + 2);
@@ -5659,7 +5677,17 @@ impl JitFunction {
                     let s = sites.get(site as usize)?;
                     let helper = a.new_label();
                     let done = a.new_label();
-                    if plain {
+                    if plain && fresh_init.get(op_idx).copied().unwrap_or(false) {
+                        // A fresh literal's own property: no receiver walk.
+                        a.p_init_prop_fresh(
+                            &layout,
+                            helpers.call_layout.realm,
+                            (disp(obj), disp(val)),
+                            s.cache_ptr as u64,
+                            helper,
+                        );
+                        a.jmp(done);
+                    } else if plain {
                         // ===== inline transition-cache add (see
                         // `p_init_prop_inline`) =====
                         recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj);
@@ -5966,6 +5994,9 @@ impl JitFunction {
                     let s = sites.get(site as usize)?;
                     let helper = a.new_label();
                     let done = a.new_label();
+                    // The in-place store's shape miss, its object walked and
+                    // its store guards passed: maybe an add.
+                    let shape_miss = a.new_label();
                     // ===== inline monomorphic property-SET fast path =====
                     // On a shape-identity hit, an in-place `slots[slot] = val`, but
                     // ONLY when provably sound: the store needs nothing from the
@@ -5983,7 +6014,7 @@ impl JitFunction {
                     a.mov_rax_at_rcx(layout.off_shape);
                     a.movabs_r11(s.cache_ptr as i64);
                     a.cmp_rax_at_r11(layout.cache_shape_off);
-                    a.jne(helper);
+                    a.jne(shape_miss);
                     // A primitive wrapper (its shape's brand bit 0) — the helper.
                     a.p_test_byte_imm(call_seq::r::RAX, layout.props.shape_brands, 1);
                     a.jne(helper);
@@ -5996,11 +6027,29 @@ impl JitFunction {
                     a.load_rdx(disp(val));
                     a.g_store(call_seq::r::R11, 0, call_seq::r::RDX); // slots[slot] = val
                     a.jmp(done);
-                    a.bind(helper);
                     // ===== inline add-cache hit (`p_add_prop_inline`): the
                     // write adds the key `this.x = x` adds, by the site's
                     // recorded transition =====
                     let call_helper = a.new_label();
+                    // After the store's shape miss the object is walked
+                    // (`rcx`) and its store guards hold.
+                    a.bind(shape_miss);
+                    if !s.method_ptr.is_null() {
+                        a.p_add_armed(s.method_ptr, call_helper);
+                        a.p_load_arena(helpers.call_layout.realm, &layout.props);
+                        a.mov_r10_rax();
+                        a.p_add_prop_inline(
+                            &layout,
+                            helpers.call_layout.realm,
+                            s.method_ptr,
+                            disp(val),
+                            call_helper,
+                            true,
+                        );
+                        a.jmp(done);
+                    }
+                    a.jmp(call_helper);
+                    a.bind(helper);
                     if !s.method_ptr.is_null() {
                         a.p_add_armed(s.method_ptr, call_helper);
                         a.p_load_arena(helpers.call_layout.realm, &layout.props);
@@ -6011,6 +6060,7 @@ impl JitFunction {
                             s.method_ptr,
                             disp(val),
                             call_helper,
+                            false,
                         );
                         a.jmp(done);
                     }
