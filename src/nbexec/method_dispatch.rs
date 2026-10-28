@@ -2612,7 +2612,7 @@ impl Interp {
                     // UTF-16-indexed with negative-from-end support.
                     let units = units_len;
                     let idx = if i < 0.0 { units as f64 + i } else { i };
-                    Some(match as_index(idx).and_then(&unit_at) {
+                    Some(match as_index(idx).and_then(unit_at) {
                         Some(u) => self.new_str_bytes(crate::wtf8::from_utf16(&[u])),
                         None => NanBox::undefined(),
                     })
@@ -2726,7 +2726,7 @@ impl Interp {
                 "charCodeAt" => {
                     // A negative or out-of-range index is `NaN` (`NaN`/no-arg → 0).
                     let idx = self.coerce_to_integer_or_infinity(arg(0))?;
-                    let unit = str_char_index(idx).and_then(&unit_at);
+                    let unit = str_char_index(idx).and_then(unit_at);
                     Some(unit.map_or(NanBox::number(f64::NAN), |u| NanBox::number(f64::from(u))))
                 }
                 // `codePointAt(i)` combines a surrogate pair at UTF-16 index `i`.

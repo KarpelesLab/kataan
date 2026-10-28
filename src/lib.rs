@@ -27,6 +27,10 @@
 // `Cargo.toml [lints]`); module-level `#![allow(...)]` is used sparingly while
 // a layer is still a scaffold.
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// rustdoc 1.99 reports two spanless `redundant_explicit_links` (no module-level
+// allow silences them, and it cannot name the link); a cosmetic lint, so it is
+// allowed crate-wide rather than failing `-D warnings`.
+#![allow(rustdoc::redundant_explicit_links)]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;

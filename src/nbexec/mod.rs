@@ -5000,13 +5000,11 @@ impl Interp {
         // `Reflect` is NOT in this list: it is an ordinary (non-callable) namespace
         // object whose only own properties are the 13 methods and `@@toStringTag` —
         // it has no `name` and no `length`.
-        for (ctor, ctor_name) in [("Array", "Array")] {
-            if let Some(h) = self.current.get(ctor).and_then(NanBox::as_handle) {
-                let h = Handle::from_raw(h);
-                let nv = self.new_str(ctor_name);
-                self.realm.set_hidden_property(h, "name", nv);
-                self.realm.set_readonly_property(h, "name");
-            }
+        if let Some(h) = self.current.get("Array").and_then(NanBox::as_handle) {
+            let h = Handle::from_raw(h);
+            let nv = self.new_str("Array");
+            self.realm.set_hidden_property(h, "name", nv);
+            self.realm.set_readonly_property(h, "name");
         }
         // The callable namespace constructors `Object` and `Array` declare a
         // single parameter; `Reflect` is a non-callable namespace (no `length`).
