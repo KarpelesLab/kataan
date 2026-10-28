@@ -257,3 +257,25 @@ fn sloppy_write_to_global_accessor_calls_setter() {
     "#;
     assert_eq!(run(src), "set3,set4|42|TypeError|1");
 }
+
+/// A built-in converts only the arguments its algorithm reads: an argument
+/// past `Math.abs`'s one parameter (or `Date.UTC`'s and `new Date`'s seven) is not
+/// ToNumber'd, so a Symbol there is no TypeError and a `valueOf` there does
+/// not run; `padStart`/`padEnd` on a string already long enough never
+/// ToString the fill string.
+#[test]
+fn builtins_coerce_only_the_arguments_they_read() {
+    let src = r#"
+        var log = [], o = { valueOf() { log.push("v"); return 1; }, toString() { log.push("s"); return "-"; } };
+        var s = Symbol("s");
+        var r = [Math.abs(-2, s), Math.clz32(1, s), Math.pow(2, 3, s), Math.atan2(0, 1, s),
+                 Math.imul(3, 4, s), Date.UTC(1970, 0, 1, 0, 0, 0, 5, s),
+                 "abc".padStart(2, o), "abc".padEnd(3, o), "ab".padEnd(4, o),
+                 new Date(1970, 0, 1, 0, 0, 0, 7, s).getTime()];
+        r.join() + "|" + log.join() + "|" + Math.hypot(3, 4, o)
+    "#;
+    assert_eq!(
+        run(src),
+        "2,31,8,0,12,5,abc,abc,ab--,7|s|5.0990195135927845"
+    );
+}

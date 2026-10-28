@@ -2426,9 +2426,10 @@ impl Interp {
             let ms = if args.len() >= 2 {
                 // `new Date(year, month, day?, h?, m?, s?, ms?)` (local ≈ UTC here).
                 // Every supplied argument is ToNumber'd in order (Symbol → TypeError,
-                // a throwing `valueOf` propagates).
-                let mut nums = Vec::with_capacity(args.len());
-                for a in args {
+                // a throwing `valueOf` propagates). Only the seven parameters: an
+                // eighth argument is never read.
+                let mut nums = Vec::with_capacity(args.len().min(7));
+                for a in args.iter().take(7) {
                     let v = self.coerce_to_number(*a)?;
                     nums.push(self.realm.to_number(v));
                 }

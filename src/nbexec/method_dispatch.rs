@@ -882,9 +882,9 @@ impl Interp {
         if self.realm.native_at(handle) == Some(N_DATE) && method == "UTC" {
             // ToNumber every supplied argument, in order, with abrupt propagation
             // (a Symbol or throwing `valueOf` raises). `Date.UTC()` with no year is
-            // NaN.
-            let mut nums = Vec::with_capacity(args.len());
-            for a in args {
+            // NaN. Only the seven parameters: an eighth argument is never read.
+            let mut nums = Vec::with_capacity(args.len().min(7));
+            for a in args.iter().take(7) {
                 let v = self.coerce_to_number(*a)?;
                 nums.push(self.realm.to_number(v));
             }
@@ -2574,6 +2574,11 @@ impl Interp {
                     // Spec order: ToLength(maxLength) then ToString(fillString).
                     let tn = self.coerce_to_integer_or_infinity(arg(0))?;
                     let target = self.pad_target(tn)?;
+                    // Already long enough: the fill string is never read (its
+                    // ToString does not run).
+                    if target <= crate::wtf8::utf16_len(bytes) {
+                        return Ok(Some(self.new_str_bytes(bytes.to_vec())));
+                    }
                     let pad = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         alloc::vec![b' ']
                     } else {
@@ -2584,6 +2589,11 @@ impl Interp {
                 "padEnd" => {
                     let tn = self.coerce_to_integer_or_infinity(arg(0))?;
                     let target = self.pad_target(tn)?;
+                    // Already long enough: the fill string is never read (its
+                    // ToString does not run).
+                    if target <= crate::wtf8::utf16_len(bytes) {
+                        return Ok(Some(self.new_str_bytes(bytes.to_vec())));
+                    }
                     let pad = if matches!(arg(1).unpack(), Unpacked::Undefined) {
                         alloc::vec![b' ']
                     } else {

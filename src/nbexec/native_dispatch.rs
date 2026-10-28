@@ -3,7 +3,7 @@ use super::*;
 impl Interp {
     /// Invokes a built-in by id.
     pub(crate) fn call_native(&mut self, id: u16, args: &[NanBox]) -> Result<NanBox, ExecError> {
-        // Every `Math` function applies `ToNumber` to each of its arguments, in
+        // Every `Math` function applies `ToNumber` to each of its parameters, in
         // order, before doing anything else — so a user `valueOf`/`@@toPrimitive`
         // runs (and its throw propagates), and a Symbol/BigInt argument is a
         // TypeError. The arms below reach for `Realm::to_number`, which is `&self`
@@ -33,13 +33,24 @@ impl Interp {
                 | N_MATH_CLZ32
                 | N_MATH_IMUL
         ) || (N_MATH_SIN..=N_MATH_LOG1P).contains(&id))
-            && args.iter().any(|a| a.as_handle().is_some())
         {
-            let mut coerced = Vec::with_capacity(args.len());
-            for a in args {
-                coerced.push(self.coerce_to_number(*a)?);
+            // Only the declared parameters are converted: an argument past them
+            // (`Math.abs(x, sym)`) is never read, so it must not be ToNumber'd
+            // (a Symbol there is no TypeError, its `valueOf` does not run).
+            // `hypot` is variadic.
+            let declared = match id {
+                N_MATH_HYPOT => args.len(),
+                N_MATH_POW | N_MATH_ATAN2 | N_MATH_IMUL => 2,
+                _ => 1,
+            };
+            let used = &args[..declared.min(args.len())];
+            if used.iter().any(|a| a.as_handle().is_some()) {
+                let mut coerced = Vec::with_capacity(used.len());
+                for a in used {
+                    coerced.push(self.coerce_to_number(*a)?);
+                }
+                return self.call_native(id, &coerced);
             }
-            return self.call_native(id, &coerced);
         }
         let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
         Ok(match id {
