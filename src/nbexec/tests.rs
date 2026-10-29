@@ -16,6 +16,34 @@ fn run(src: &str) -> String {
     interp.realm().to_display_string(value)
 }
 
+/// A promoted loop compiled with a receiver's layout, then a delete that
+/// rebuilds that layout: the fast version's shape miss leaves for the plain
+/// copy, which must not trust the receiver-cache way the miss's walk had just
+/// filled (it read the stale slot: `0`, then the next property's value).
+#[test]
+fn hot_loop_sees_a_layout_change_after_its_tier_up() {
+    assert_eq!(
+        run(
+            "function loop(a, n) { let s = 0; for (let i = 0; i < n; i++) s += a.v; return s; }
+            const C = { m: 1, v: 0, w: 2 };
+            const out = [];
+            for (let k = 0; k < 2000; k++) {
+              const r = loop(C, 3);
+              if (k === 900) delete C.v;
+              if (k === 899 || k === 901 || k === 1999) out.push(r);
+            }
+            const A = { m: 1, v: 0 };
+            for (let k = 0; k < 2000; k++) {
+              const r = loop(A, 3);
+              if (k === 900) { delete A.v; Object.setPrototypeOf(A, { v: 100 }); }
+              if (k === 901 || k === 1999) out.push(r);
+            }
+            out.join()"
+        ),
+        "0,NaN,NaN,300,300"
+    );
+}
+
 #[test]
 fn lone_surrogates_round_trip_through_string_ops() {
     // Creation preserves a lone surrogate; length is in UTF-16 units.

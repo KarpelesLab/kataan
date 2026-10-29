@@ -7016,13 +7016,15 @@ impl JitFunction {
                         a.p_obj_fixed_slot_store(&layout, b.slot);
                         a.jmp(stored);
                         a.bind(cached);
-                        if let Some(b) = bail {
-                            a.jmp(b);
-                        }
                         // Another layout in a way that proves this one: empty
-                        // it (and the others: it may be an add).
+                        // it (and the others: it may be an add) — also before
+                        // leaving for the plain copy, whose hit on the way
+                        // would skip the compare.
                         for &w in &shape_ways {
                             a.store_empty(rc_key(w));
+                        }
+                        if let Some(b) = bail {
+                            a.jmp(b);
                         }
                     }
                     a.movabs_r11(s.cache_ptr as i64);
@@ -7806,6 +7808,13 @@ impl JitFunction {
         }
         for (entry, bail) in core::mem::take(&mut cold_bails) {
             a.bind(entry);
+            // A layout-proving way may hold the receiver whose other layout
+            // sent it here (a full walk fills the way before the shape
+            // compare): empty them all, or the plain copy's hit on it would
+            // skip that compare (`recv_cache::shape_ways`).
+            for &w in &shape_ways {
+                a.store_empty(rc_key(w));
+            }
             a.jmp(bail);
         }
         // The `GetProp` miss paths: the inherited data property or getter,
