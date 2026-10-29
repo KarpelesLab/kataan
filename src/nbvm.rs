@@ -13476,6 +13476,10 @@ enum FinalAction {
 #[derive(Clone, Copy)]
 struct LoopFrame {
     handler_depth: usize,
+    /// The handler depth a `continue` of this loop unwinds to: the loop's own
+    /// `handler_depth`, plus one for a hosted `for-of`, whose close-on-throw
+    /// handler stays pushed across iterations.
+    cont_depth: usize,
     /// A hosted `for-of`'s `(iterator, done)` registers — for a `for await`,
     /// `(iterator, sync)`.
     iter: Option<(Reg, Reg)>,
@@ -16570,6 +16574,7 @@ impl Compiler {
                     c.continue_sites.push(Vec::new());
                     c.loop_frames.push(LoopFrame {
                         handler_depth: c.handler_depth,
+                        cont_depth: c.handler_depth,
                         iter: None,
                         async_iter: false,
                         is_loop: false,
@@ -17036,6 +17041,7 @@ impl Compiler {
                     self.continue_sites.push(Vec::new());
                     self.loop_frames.push(LoopFrame {
                         handler_depth: self.handler_depth,
+                        cont_depth: self.handler_depth,
                         iter: None,
                         async_iter: false,
                         is_loop: false,
@@ -22067,6 +22073,7 @@ impl Compiler {
         self.continue_sites.push(Vec::new());
         self.loop_frames.push(LoopFrame {
             handler_depth: self.handler_depth,
+            cont_depth: self.handler_depth,
             iter: None,
             async_iter: false,
             is_loop: true,
@@ -22090,8 +22097,22 @@ impl Compiler {
         let f = self.constant(NanBox::boolean(false))?;
         self.ops.push(Op::Move { dst: done, src: f });
         self.enter_loop();
+        // One close-on-throw handler covers every iteration: pushed once here,
+        // popped on the way out (a `break`/`return` pops it like any handler
+        // of the loop's; a `continue` keeps it — see `LoopFrame::cont_depth`).
+        // It also covers each step, which is exact: a step that throws has set
+        // `done` first (IteratorStep's `[[Done]] = true`), so the handler's
+        // `IterClose` does nothing and the throw just propagates.
+        let exc = self.alloc();
+        let handler = self.ops.len();
+        self.ops.push(Op::PushHandler {
+            target: 0,
+            reg: exc,
+        });
+        self.handler_depth += 1;
         if let Some(fr) = self.loop_frames.last_mut() {
             fr.iter = Some((iter, done));
+            fr.cont_depth = self.handler_depth;
         }
         let top = self.ops.len();
         let cur = self.alloc();
@@ -22123,13 +22144,6 @@ impl Compiler {
             a: done,
         });
         let jf = self.emit_jump_if_false(not_done);
-        let exc = self.alloc();
-        let handler = self.ops.len();
-        self.ops.push(Op::PushHandler {
-            target: 0,
-            reg: exc,
-        });
-        self.handler_depth += 1;
         let r = match (entry, pair) {
             (Some((kind, a, b)), Some((fused, key, val))) => {
                 self.for_entry_iteration(kind, (a, b), cur, (fused, key, val), body)
@@ -22138,9 +22152,9 @@ impl Compiler {
         };
         self.handler_depth -= 1;
         r?;
-        self.ops.push(Op::PopHandler);
         self.ops.push(Op::Jump { target: top });
-        // A throw from the binding or the body: close quietly, rethrow.
+        // A throw from a step, the binding or the body: close quietly (a no-op
+        // after a step's throw), rethrow.
         let at = self.ops.len();
         self.patch_to(handler, at);
         self.ops.push(Op::IterClose {
@@ -22149,7 +22163,10 @@ impl Compiler {
             quiet: true,
         });
         self.ops.push(Op::Throw { src: exc });
+        // The iterator is exhausted: leave the handler (a `break` lands after
+        // this, having popped it already).
         self.patch(jf);
+        self.ops.push(Op::PopHandler);
         self.exit_loop(top);
         self.scopes.pop();
         Ok(None)
@@ -22587,7 +22604,7 @@ impl Compiler {
             }
         }
         if !inclusive && let Some(f) = self.loop_frames.get(target).copied() {
-            while cur > f.handler_depth {
+            while cur > f.cont_depth {
                 self.ops.push(Op::PopHandler);
                 cur -= 1;
             }
