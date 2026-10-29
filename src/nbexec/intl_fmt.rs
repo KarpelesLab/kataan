@@ -1653,6 +1653,23 @@ fn zero_unit_digit(s: &str) -> String {
         .collect()
 }
 
+/// `n × 10^k`, shifted on `n`'s shortest decimal representation (so `0.07`
+/// shifted by 2 is exactly the double nearest `7`, not `7.000000000000001`).
+#[cfg(feature = "intl")]
+fn decimal_shift(n: f64, k: i32) -> f64 {
+    if !n.is_finite() || n == 0.0 {
+        return n;
+    }
+    let s = alloc::format!("{n:e}");
+    let Some((m, e)) = s.split_once('e') else {
+        return n;
+    };
+    let Ok(e) = e.parse::<i32>() else {
+        return n;
+    };
+    alloc::format!("{m}e{}", e + k).parse().unwrap_or(n)
+}
+
 #[cfg(feature = "intl")]
 fn plural_notation_operand_string(n: f64, notation: &str) -> Option<String> {
     let a = n.abs();
@@ -8219,9 +8236,9 @@ impl Interp {
 
     /// Pre-round `n` to the resolved precision using the ECMA-402 / ICU decimal
     /// rounding (see [`intl_decimal_round`]), returning a value the `intl` crate
-    /// re-renders correctly. Applies to standard-notation decimal/currency only:
-    /// percent (the crate scales by 100) and scientific/engineering/compact
-    /// (mantissa rounding) are left untouched. Shared by `format`/`formatToParts`.
+    /// re-renders correctly. Applies to standard notation (a percentage is
+    /// rounded scaled, see below); scientific/engineering/compact (mantissa
+    /// rounding) are left untouched. Shared by `format`/`formatToParts`.
     #[cfg(feature = "intl")]
     fn number_precision_round(
         &mut self,
@@ -8231,9 +8248,6 @@ impl Interp {
     ) -> f64 {
         use intl::number::{Notation, NumberStyle};
         if !n.is_finite() || n == 0.0 || opts.notation != Notation::Standard {
-            return n;
-        }
-        if matches!(opts.style, NumberStyle::Percent) {
             return n;
         }
         // `roundingPriority` other than the default `auto` combines the significant-
@@ -8250,6 +8264,13 @@ impl Interp {
         {
             return n;
         }
+        // Percent: the crate scales by 100 itself, so round the scaled value
+        // (shifted exactly, in decimal) and hand back the rounded result shifted
+        // back down — the crate's ×100 then lands on the rounded grid. This is
+        // what applies `roundingIncrement` (and decimal half-way rounding) to a
+        // percentage.
+        let percent = matches!(opts.style, NumberStyle::Percent);
+        let n = if percent { decimal_shift(n, 2) } else { n };
         let increment = self
             .realm
             .get_property(handle, "roundingIncrement")
@@ -8275,7 +8296,11 @@ impl Interp {
         // directional mode like `ceil`/`expand` would spuriously round `1.3` — really
         // `1.30000…0444` — up again). `halfExpand` leaves the clean value untouched.
         opts.rounding_mode = intl::number::RoundingMode::HalfExpand;
-        rounded
+        if percent {
+            decimal_shift(rounded, -2)
+        } else {
+            rounded
+        }
     }
 
     #[cfg(feature = "intl")]
@@ -8294,7 +8319,13 @@ impl Interp {
         // `trailingZeroDisplay: "stripIfInteger"`: an integer value drops its
         // forced trailing fraction (and significant) zeros. The intl crate has
         // no such option, so lower the minimum digit counts for this value.
-        if n.is_finite() && n.fract() == 0.0 {
+        // (A percentage is an integer when its scaled value is.)
+        let shown = if matches!(opts.style, intl::number::NumberStyle::Percent) {
+            decimal_shift(n, 2)
+        } else {
+            n
+        };
+        if shown.is_finite() && shown.fract() == 0.0 {
             let tzd = self
                 .realm
                 .get_property(handle, "trailingZeroDisplay")

@@ -1066,3 +1066,21 @@ fn rounding_increment_checks_resolved_fraction_digits() {
         "RangeError,RangeError,RangeError,1.0,10,TypeError"
     );
 }
+
+/// `style: "percent"` rounds the *scaled* value in decimal, so a
+/// `roundingIncrement` applies (`0.12` → "10%" by 5s; it was "12%"), an
+/// omitted maximum is at least the minimum (`minimumFractionDigits: 1` keeps
+/// "12.5%", not "13.0%"), and `stripIfInteger` sees a whole percentage.
+#[cfg(feature = "intl")]
+#[test]
+fn percent_rounds_the_scaled_value() {
+    let src = r#"
+        function f(o, v) { return new Intl.NumberFormat("en", Object.assign({ style: "percent" }, o)).format(v); }
+        [f({ roundingIncrement: 5 }, 0.12), f({ minimumFractionDigits: 1 }, 0.125), f({ minimumFractionDigits: 1 }, 0.0105),
+         f({}, 0.125), f({ maximumFractionDigits: 2 }, 0.0105), f({ roundingIncrement: 25, maximumFractionDigits: 2, minimumFractionDigits: 2 }, 0.1235),
+         f({ trailingZeroDisplay: "stripIfInteger", minimumFractionDigits: 2 }, 0.07),
+         f({ trailingZeroDisplay: "stripIfInteger", minimumFractionDigits: 2 }, 0.0105),
+         new Intl.NumberFormat("en", { style: "percent", roundingIncrement: 5 }).formatToParts(0.12).map(function (p) { return p.value; }).join("")].join("|")
+    "#;
+    assert_eq!(run(src), "10%|12.5%|1.1%|13%|1.05%|12.25%|7%|1.05%|10%");
+}
