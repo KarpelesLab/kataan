@@ -6784,7 +6784,8 @@ impl JitFunction {
                             int_index!(iter, slow, true);
                             a.p_arr_len_ptr(&layout);
                             a.cmp_rax_r8();
-                            a.jae(slow); // the end (latched by the interpreter)
+                            let end = a.new_label();
+                            a.jae(end);
                             a.mov_r8_rax();
                             a.mov_rax_at_r11_rax8();
                             a.movabs_r11(NanBox::hole().to_bits() as i64);
@@ -6795,6 +6796,18 @@ impl JitFunction {
                             // array's length).
                             numeric::NumGen::inc_r8_to_xmm0(&mut a);
                             a.movsd_mem_xmm0(disp(iter));
+                            a.jmp(fin);
+                            // The end (`index >= length`, the length the
+                            // plain array's element count): latch `done`, and
+                            // the step's value is `undefined`, as
+                            // `iter_fast::step` does.
+                            a.bind(end);
+                            a.test_rax_rax();
+                            a.g_jcc(0x8, slow); // js: a negative cursor is the interpreter's
+                            a.movabs_rax(tag_true as i64);
+                            a.store_rax(disp(done));
+                            a.movabs_rax(NanBox::undefined().to_bits() as i64);
+                            a.store_rax(disp(dst));
                             a.jmp(fin);
                             a.bind(slow);
                             // (A speculative loop's fast version leaves for
