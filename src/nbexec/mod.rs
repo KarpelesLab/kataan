@@ -5738,17 +5738,10 @@ impl Interp {
                 fn_names.push(&id.name);
             }
         }
-        // Block-level function names that Annex B var-hoists also participate in
-        // VarDeclaredNames for the lexical-collision walks.
-        let mut block_fns: Vec<(&str, Span)> = Vec::new();
-        collect_block_function_names(&program.body, &mut block_fns);
-
-        let all_var_names: Vec<&str> = var_names
-            .iter()
-            .chain(fn_names.iter())
-            .copied()
-            .chain(block_fns.iter().map(|(n, _)| *n))
-            .collect();
+        // Annex B block-level function names are not checked here: a
+        // collision makes B.3.2.3 skip the hoisting (`bindingExists` /
+        // `fnDefinable`), never an error (`annexb_block_fn_hoists`).
+        let all_var_names: Vec<&str> = var_names.iter().chain(fn_names.iter()).copied().collect();
 
         // Walk lexical environments from the caller's lexical env up to (but not
         // including) the variable environment: a `var` may not hoist over a
@@ -5810,11 +5803,7 @@ impl Interp {
         }
         // CanDeclareGlobalFunction for each function name, then CanDeclareGlobalVar
         // for each pure `var` name — all validated before any is created.
-        for name in fn_names
-            .iter()
-            .copied()
-            .chain(block_fns.iter().map(|(n, _)| *n))
-        {
+        for name in fn_names.iter().copied() {
             if !self.can_declare_global_function(g, name) {
                 let m = self.new_str(&alloc::format!("Cannot declare global function '{name}'"));
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
@@ -5861,8 +5850,8 @@ impl Interp {
                 fn_names.push(&id.name);
             }
         }
-        let mut block_fns: Vec<(&str, Span)> = Vec::new();
-        collect_block_function_names(&program.body, &mut block_fns);
+        // Annex B block-level function names are not checked: B.3.2.2 skips
+        // the hoisting of one that collides (`annexb_block_fn_hoists`).
 
         // A global lexical binding lives in the global scope frame but, unlike a
         // `var`/function, is not an own property of the global object.
@@ -5890,12 +5879,7 @@ impl Interp {
         }
 
         // Var/function names must not collide with a global lexical binding.
-        for name in var_names
-            .iter()
-            .chain(fn_names.iter())
-            .copied()
-            .chain(block_fns.iter().map(|(n, _)| *n))
-        {
+        for name in var_names.iter().chain(fn_names.iter()).copied() {
             if has_global_lexical(g, name, self) {
                 return Err(syntax_err(self, name));
             }
@@ -5903,11 +5887,7 @@ impl Interp {
 
         // CanDeclareGlobalFunction / CanDeclareGlobalVar — validated before any
         // binding is created.
-        for name in fn_names
-            .iter()
-            .copied()
-            .chain(block_fns.iter().map(|(n, _)| *n))
-        {
+        for name in fn_names.iter().copied() {
             if !self.can_declare_global_function(g, name) {
                 let m = self.new_str(&alloc::format!("Cannot declare global function '{name}'"));
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
@@ -6357,6 +6337,7 @@ impl Interp {
         let mut block_fn_names: Vec<(&str, Span)> = Vec::new();
         if !self.strict {
             collect_block_function_names(stmts, &mut block_fn_names);
+            block_fn_names.retain(|(name, _)| self.annexb_block_fn_hoists(name, eval_code));
         }
         // A block-function name qualifies for the B.3.3 runtime update unless
         // it collides with a parameter or other binding already present in the
@@ -6455,6 +6436,45 @@ impl Interp {
             }
         }
         Ok(())
+    }
+
+    /// Annex B.3.2.2 / B.3.2.3 (with B.3.4's catch-parameter exemption):
+    /// whether the block-level function `name` of a sloppy Script or eval body
+    /// var-hoists. It does not when, for eval code, a lexical binding of that
+    /// name sits between the eval's lexical environment and its variable
+    /// environment (`bindingExists`), nor, at global scope, when a global
+    /// lexical declaration has that name or CanDeclareGlobalVar fails
+    /// (`fnDefinable` is false). Neither case is an error: the declaration
+    /// just stays block-scoped.
+    fn annexb_block_fn_hoists(&self, name: &str, eval_code: bool) -> bool {
+        if eval_code {
+            let mut env = Some(self.current.clone());
+            while let Some(e) = env {
+                if e.ptr_eq(&self.var_scope) {
+                    // A function body's top-level lexical names share its
+                    // variable-environment frame (see `mark_lexical`).
+                    if !e.ptr_eq(&self.global_scope) && e.has_lexical(name) {
+                        return false;
+                    }
+                    break;
+                }
+                if !e.is_catch() && e.has_local(name) {
+                    return false;
+                }
+                env = e.parent();
+            }
+        }
+        if self.var_scope.ptr_eq(&self.global_scope)
+            && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
+        {
+            let own = self.realm.has_own(g, name) || self.realm.accessor(g, name).is_some();
+            // A global lexical binding lives in the global scope frame but is
+            // no own property of the global object.
+            if !own && (self.global_scope.has_local(name) || !self.realm.is_extensible(g)) {
+                return false;
+            }
+        }
+        true
     }
 
     /// One `var` (or Annex B block-function) name of

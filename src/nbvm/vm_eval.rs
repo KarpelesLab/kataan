@@ -164,13 +164,14 @@ fn compile_eval_body(
         let b = c.env_site_binding(name, EnvSite::Dyn, GlobalWrite::Put);
         c.scopes[0].insert(name.clone(), b);
     }
-    // Annex B.3.3.3: every block function of sloppy eval code updates its
-    // `var` binding when evaluated.
+    // Annex B.3.2.3: a block function of sloppy eval code updates its `var`
+    // binding when evaluated, unless the host's EvalDeclarationInstantiation
+    // skipped it (an enclosing lexical binding of that name, or a global one
+    // that cannot be declared): the host decides at run time.
     if !strict {
         let mut cands = Vec::new();
         crate::nbexec::collect_block_function_names(body, &mut cands);
-        c.annexb_spans
-            .extend(cands.into_iter().map(|(_, span)| span));
+        c.annexb_host = !cands.is_empty();
     }
     // Function declarations, instantiated (in the variable environment) before
     // any statement runs.

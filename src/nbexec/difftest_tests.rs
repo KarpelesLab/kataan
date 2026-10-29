@@ -1538,3 +1538,32 @@ fn rejected_eval_declarations_keep_annex_b_block_functions() {
     "#;
     assert_eq!(run(src), "TypeError,false,3,SyntaxError,4");
 }
+
+/// Annex B.3.2.2 / B.3.2.3: a block-level function that cannot var-hoist
+/// simply stays block-scoped. In sloppy eval code a lexical binding of its
+/// name between the eval and its variable environment (`bindingExists`; a
+/// catch parameter is exempt, B.3.4) skips the hoisting, and at global scope
+/// so does a name CanDeclareGlobalVar rejects; the copy into an existing
+/// non-writable global (`NaN`) fails silently. The engine threw a
+/// SyntaxError for the first case and a TypeError for `{ function NaN(){} }`.
+#[test]
+fn annex_b_block_functions_skip_instead_of_throwing() {
+    let src = r#"
+        var r = [];
+        r.push((function () { let q = 1; eval("{ function q() {} }"); return typeof q; })());
+        r.push((function () { { let q = 1; eval("{ function q() {} }"); var i = typeof q; } return i + "/" + typeof q; })());
+        r.push((function () { const q = 1; eval("{ function q() {} } { function z() {} }"); return typeof q + "/" + typeof z; })());
+        r.push((function () { try { throw 1; } catch (q) { eval("{ function q() {} }"); var i = typeof q; } return i + "/" + typeof q; })());
+        r.push((function () { { function q() { return 1; } eval("{ function q() { return 2; } }"); var i = q(); } return i + "/" + q(); })());
+        r.push((function () { eval("{ function q() {} }"); return delete q; })());
+        r.push((0, eval)("{ function NaN() {} } typeof NaN"));
+        { function NaN() {} }
+        r.push(typeof NaN);
+        r.join()
+    "#;
+    assert_eq!(
+        run(src),
+        "number,number/undefined,number/function,number/function,1/1,true,number,number"
+    );
+}
+
