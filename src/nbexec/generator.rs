@@ -471,12 +471,13 @@ impl Interp {
 
     /// `%AsyncFromSyncIteratorPrototype%.throw` (`is_throw`) / `.return`
     /// (27.1.4.2.2–3) over the sync iterator `iter` for the bytecode VM's async
-    /// `yield*`: always a promise; abrupt completions reject it.
+    /// `yield*` (and AsyncIteratorClose, with `value` absent: `None`): always a
+    /// promise; abrupt completions reject it.
     pub(crate) fn async_from_sync_resume(
         &mut self,
         iter: Handle,
         is_throw: bool,
-        value: NanBox,
+        value: Option<NanBox>,
     ) -> Result<Handle, ExecError> {
         let r = self.async_from_sync_resume_inner(iter, is_throw, value);
         match r {
@@ -494,7 +495,7 @@ impl Interp {
         &mut self,
         iter: Handle,
         is_throw: bool,
-        value: NanBox,
+        value: Option<NanBox>,
     ) -> Result<Handle, ExecError> {
         let iter_val = NanBox::handle(iter.to_raw());
         let method = self.read_member(iter, if is_throw { "throw" } else { "return" })?;
@@ -505,12 +506,13 @@ impl Interp {
                 self.iterator_close(iter)?;
                 return Err(self.type_error("The iterator does not provide a 'throw' method"));
             }
-            let res = self.gen_result(value, true);
+            let res = self.gen_result(value.unwrap_or(NanBox::undefined()), true);
             let p = self.fresh_promise();
             self.settle(p, res, true);
             return Ok(p);
         }
-        let result = self.call_with_this(method, iter_val, &[value])?;
+        // An absent `value` is not passed (step 9.a calls `return` bare).
+        let result = self.call_with_this(method, iter_val, value.as_slice())?;
         if self.as_object_handle(result).is_none() {
             return Err(self.type_error("iterator result is not an object"));
         }

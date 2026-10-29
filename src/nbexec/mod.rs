@@ -9615,7 +9615,7 @@ impl crate::nbvm::VmHost for Interp {
         &mut self,
         iter: NanBox,
         is_throw: bool,
-        v: NanBox,
+        v: Option<NanBox>,
     ) -> Result<NanBox, crate::nbvm::HostError> {
         let Some(ih) = iter.as_handle().map(Handle::from_raw) else {
             return Err(crate::nbvm::HostError::Fault);

@@ -621,3 +621,26 @@ fn arrow_in_field_initializer_sees_this() {
     "#;
     assert_eq!(run(src), "b,A.m:d,1,2,");
 }
+
+/// AsyncIteratorClose of a `for await` over a sync iterable awaits the
+/// promise from %AsyncFromSyncIteratorPrototype%.return, even when the sync
+/// iterator has no `return` (one tick) and after a sync `return()` (two: the
+/// result's value is resolved first); the loop exit was synchronous.
+#[test]
+fn for_await_close_over_sync_iterator_awaits_the_wrapper() {
+    let src = r#"
+        function ticks(tag) { var i = 0; (function f() { if (i < 4) { console.log(tag + i++); Promise.resolve().then(f); } })(); }
+        (async () => { for await (var x of [1, 2]) { console.log('A body'); break; } console.log('A after'); })(); ticks('A');
+        (async () => { for (var i = 0; i < 12; i++) await null;
+          ticks('C'); var it = { [Symbol.iterator]() { return { next() { return { value: 1, done: false }; }, return() { console.log('C ret'); return {}; } }; } };
+          for await (var x of it) { console.log('C body'); break; } console.log('C after'); })();
+        (async () => { for (var i = 0; i < 24; i++) await null;
+          ticks('D'); try { for await (var x of [1]) { throw 'e'; } } catch (e) { console.log('D caught'); } })();
+    "#;
+    assert_eq!(
+        out(src),
+        "A0\nA1\nA body\nA2\nA after\nA3\n\
+         C0\nC1\nC2\nC body\nC ret\nC3\nC after\n\
+         D0\nD1\nD2\nD3\nD caught\n"
+    );
+}

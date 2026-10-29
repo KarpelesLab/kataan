@@ -345,9 +345,9 @@ pub enum Op {
         next: Reg,
         sync: Reg,
     },
-    /// Starts AsyncIteratorClose: a sync-wrapped iterator is closed now
-    /// (`do_await` false); an async one's `return()` result lands in `dst` with
-    /// `do_await` true (absent `return`: false).
+    /// Starts AsyncIteratorClose: the `return()` result of the iterator (for a
+    /// sync-wrapped one, the promise of %AsyncFromSyncIteratorPrototype%
+    /// .return) lands in `dst` with `do_await` true (absent `return`: false).
     AsyncIterClose {
         dst: Reg,
         do_await: Reg,
@@ -1326,7 +1326,9 @@ pub trait VmHost {
     /// A trap's throw, or a module namespace's TDZ export.
     fn for_in_enumerate(&mut self, obj: NanBox) -> Result<(NanBox, NanBox), HostError>;
     /// %AsyncFromSyncIteratorPrototype%.throw (`is_throw`) / .return over the
-    /// sync iterator `iter`: a promise of the iterator result.
+    /// sync iterator `iter`: a promise of the iterator result. `v` is the
+    /// argument, `None` when absent (AsyncIteratorClose passes none, so the
+    /// sync `return` is called with no arguments).
     ///
     /// # Errors
     /// A fatal (non-JS) error; JS errors reject the promise.
@@ -1334,7 +1336,7 @@ pub trait VmHost {
         &mut self,
         iter: NanBox,
         is_throw: bool,
-        v: NanBox,
+        v: Option<NanBox>,
     ) -> Result<NanBox, HostError>;
     /// `obj.[[Get]](key, receiver)` (a `super.x` read).
     ///
@@ -7404,8 +7406,21 @@ fn run_frame_at_ic(
                 let it = regs[*iter as usize];
                 regs[*do_await as usize] = NanBox::boolean(false);
                 if regs[*sync as usize].as_boolean() == Some(true) {
-                    match with_host(ctx, |h| h.iter_close(it)) {
-                        Some(Ok(())) => {}
+                    // The wrapper's `return` (%AsyncFromSyncIteratorPrototype%
+                    // .return) answers with a promise that AsyncIteratorClose
+                    // awaits, even when the sync iterator has no `return`.
+                    if it.is_number()
+                        && let Err(e) = iter_fast::materialize(ctx, regs, *iter)
+                    {
+                        handle_throw!(e);
+                        continue;
+                    }
+                    let it = regs[*iter as usize];
+                    match with_host(ctx, |h| h.async_from_sync_throw_return(it, false, None)) {
+                        Some(Ok(p)) => {
+                            regs[*dst as usize] = p;
+                            regs[*do_await as usize] = NanBox::boolean(true);
+                        }
                         Some(Err(e)) => handle_throw!(VmError::from(e)),
                         None => return Err(VmError::Unsupported),
                     }
@@ -7506,7 +7521,7 @@ fn run_frame_at_ic(
                         call_closure(ctx, funcs, nx, &[v], it)
                     }
                 } else if is_sync {
-                    with_host(ctx, |h| h.async_from_sync_throw_return(it, m == 1, v))
+                    with_host(ctx, |h| h.async_from_sync_throw_return(it, m == 1, Some(v)))
                         .unwrap_or(Err(HostError::Fault))
                         .map_err(VmError::from)
                 } else {
