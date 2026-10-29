@@ -1041,6 +1041,9 @@ struct Job {
     /// thenable). When set, the job calls `then.call(thenable, resolve, reject)`
     /// instead of the ordinary reaction handling.
     thenable: Option<(NanBox, NanBox)>,
+    /// A foreign capability's `(resolve, reject)` that receives the outcome
+    /// in place of `result` (see [`crate::cell::Reaction::cap`]).
+    cap: Option<(NanBox, NanBox)>,
 }
 
 /// A pending `setTimeout` callback.

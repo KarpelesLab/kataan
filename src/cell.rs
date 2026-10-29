@@ -48,6 +48,10 @@ pub struct Reaction {
     /// A `finally` reaction: the callback runs for side effects but the result
     /// mirrors the original promise (its value/rejection passes through).
     pub finally: bool,
+    /// A foreign capability's `(resolve, reject)`: when set, the reaction
+    /// job hands the outcome to these (NewPromiseReactionJob's
+    /// `promiseCapability`) instead of settling `result`.
+    pub cap: Option<(NanBox, NanBox)>,
 }
 
 /// A `Promise`'s internal state, shared (`Rc`) between the promise and its
@@ -941,6 +945,13 @@ impl Trace for Cell {
                         }
                     }
                     visit(r.result);
+                    if let Some((a, b)) = r.cap {
+                        for h in [a, b] {
+                            if let Some(raw) = h.as_handle() {
+                                visit(Handle::from_raw(raw));
+                            }
+                        }
+                    }
                 }
             }
             // A typed-array view keeps its backing bytes and its viewed
@@ -1007,6 +1018,10 @@ impl crate::gc::Relocate for Cell {
                     fwd(&mut r.on_fulfilled);
                     fwd(&mut r.on_rejected);
                     r.result = forward(r.result);
+                    if let Some((a, b)) = &mut r.cap {
+                        fwd(a);
+                        fwd(b);
+                    }
                 }
             }
             Cell::TypedArray {

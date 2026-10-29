@@ -227,6 +227,7 @@ impl Interp {
                 fulfilled,
                 finally: r.finally,
                 thenable: None,
+                cap: r.cap,
             });
         }
     }
@@ -285,6 +286,7 @@ impl Interp {
             fulfilled: true,
             finally: false,
             thenable: Some((NanBox::handle(on_f.to_raw()), NanBox::handle(on_r.to_raw()))),
+            cap: None,
         });
     }
 
@@ -434,13 +436,12 @@ impl Interp {
             let result = self.register_then(handle, on_f, on_r, false);
             return Ok(NanBox::handle(result.to_raw()));
         }
-        // Foreign species: build its capability, then bridge an internal reaction
-        // promise to it — when the internal `then` result settles, drive the
-        // foreign capability's resolve/reject (so the user's `C`-built promise is
-        // what `then` returns, observing its constructor/executor).
+        // Foreign species: build its capability (so the user's `C`-built
+        // promise is what `then` returns, observing its constructor/executor);
+        // the reaction job itself hands the handler's outcome to the
+        // capability's resolve/reject (no intermediate promise, no extra tick).
         let cap = self.new_promise_capability(c)?;
-        let bridge = self.register_then(handle, on_f, on_r, false);
-        self.register_then(bridge, cap.resolve, cap.reject, false);
+        self.register_reaction(handle, on_f, on_r, false, Some((cap.resolve, cap.reject)));
         Ok(cap.promise)
     }
 
@@ -450,6 +451,20 @@ impl Interp {
         on_f: NanBox,
         on_r: NanBox,
         finally: bool,
+    ) -> Handle {
+        self.register_reaction(handle, on_f, on_r, finally, None)
+    }
+
+    /// PerformPromiseThen: registers (or, on a settled promise, queues) the
+    /// reaction; its outcome settles the returned fresh promise, or goes to
+    /// `cap`'s `(resolve, reject)` when given.
+    fn register_reaction(
+        &mut self,
+        handle: Handle,
+        on_f: NanBox,
+        on_r: NanBox,
+        finally: bool,
+        cap: Option<(NanBox, NanBox)>,
     ) -> Handle {
         use crate::cell::PromiseStatus::{Fulfilled, Pending};
         let result = self.fresh_promise();
@@ -467,6 +482,7 @@ impl Interp {
                 on_rejected: on_r,
                 result,
                 finally,
+                cap,
             }),
             Some((fulfilled, value)) => {
                 let handler = if fulfilled { on_f } else { on_r };
@@ -477,6 +493,7 @@ impl Interp {
                     fulfilled,
                     finally,
                     thenable: None,
+                    cap,
                 });
             }
         }
@@ -622,12 +639,12 @@ impl Interp {
             match self.call(job.handler, &[]) {
                 Ok(_) => {
                     if job.fulfilled {
-                        self.resolve_with(job.result, job.value);
+                        self.job_settle(&job, job.value, true)?;
                     } else {
-                        self.settle(job.result, job.value, false);
+                        self.job_settle(&job, job.value, false)?;
                     }
                 }
-                Err(ExecError::Throw(e)) => self.settle(job.result, e, false),
+                Err(ExecError::Throw(e)) => self.job_settle(&job, e, false)?,
                 Err(other) => return Err(other),
             }
         } else if job
@@ -637,17 +654,37 @@ impl Interp {
             .is_some_and(|h| self.is_callable(h))
         {
             match self.call(job.handler, &[job.value]) {
-                Ok(v) => self.resolve_with(job.result, v),
-                Err(ExecError::Throw(e)) => self.settle(job.result, e, false),
+                Ok(v) => self.job_settle(&job, v, true)?,
+                Err(ExecError::Throw(e)) => self.job_settle(&job, e, false)?,
                 Err(other) => return Err(other),
             }
         } else if job.fulfilled {
             // Passthrough: settle with the same status/value.
-            self.resolve_with(job.result, job.value);
+            self.job_settle(&job, job.value, true)?;
         } else {
-            self.settle(job.result, job.value, false);
+            self.job_settle(&job, job.value, false)?;
         }
         Ok(())
+    }
+
+    /// Hands a reaction job's outcome on: resolves (`ok`) or rejects the
+    /// job's capability when it has one — a throw from its functions ends the
+    /// job and is not reported further — else its `result` promise.
+    fn job_settle(&mut self, job: &Job, v: NanBox, ok: bool) -> Result<(), ExecError> {
+        match job.cap {
+            Some((resolve, reject)) => match self.call(if ok { resolve } else { reject }, &[v]) {
+                Ok(_) | Err(ExecError::Throw(_)) => Ok(()),
+                Err(other) => Err(other),
+            },
+            None if ok => {
+                self.resolve_with(job.result, v);
+                Ok(())
+            }
+            None => {
+                self.settle(job.result, v, false);
+                Ok(())
+            }
+        }
     }
 
     /// `await value` — for a promise, drains microtasks until it settles (this

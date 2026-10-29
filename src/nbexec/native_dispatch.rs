@@ -3860,6 +3860,7 @@ impl Interp {
                     fulfilled: true,
                     finally: false,
                     thenable: None,
+                    cap: None,
                 });
                 NanBox::undefined()
             }

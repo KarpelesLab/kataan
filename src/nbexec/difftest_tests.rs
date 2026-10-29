@@ -658,3 +658,16 @@ fn iterator_drop_skips_without_reading_values() {
     "#;
     assert_eq!(run(src), "1,2|d0,d1,v1,d2,v2,d3");
 }
+
+/// `then` on a promise whose species is a subclass settles the subclass's
+/// capability from the reaction job itself: a bridge through an internal
+/// promise delayed every link of a subclass chain by one tick.
+#[test]
+fn subclass_promise_then_takes_no_extra_tick() {
+    let src = r#"
+        function ticks(n) { var i = 0; (function f() { if (i < n) { console.log('t' + i++); Promise.resolve().then(f); } })(); }
+        class MP extends Promise { then(a, b) { return super.then(a, b); } }
+        ticks(4); MP.resolve(2).then(v => console.log('c', v)).then(() => console.log('fin'));
+    "#;
+    assert_eq!(out(src), "t0\nt1\nc 2\nt2\nfin\nt3\n");
+}

@@ -239,7 +239,7 @@ fn gc_root_job(j: &Job, out: &mut Vec<Handle>) {
         }
     }
     out.push(j.result);
-    if let Some((a, b)) = j.thenable {
+    for (a, b) in j.thenable.into_iter().chain(j.cap) {
         for v in [a, b] {
             if let Some(raw) = v.as_handle() {
                 out.push(Handle::from_raw(raw));

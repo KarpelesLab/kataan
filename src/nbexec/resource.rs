@@ -1241,6 +1241,7 @@ impl Interp {
             fulfilled,
             finally: false,
             thenable: None,
+            cap: None,
         });
     }
 
