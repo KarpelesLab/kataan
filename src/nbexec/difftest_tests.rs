@@ -964,3 +964,25 @@ fn function_to_string_on_proxy_makes_no_trap_call() {
         "function f() { [native code] }|function f() { [native code] }|function C() { [native code] }|function max() { [native code] }|0"
     );
 }
+
+/// `++`/`--` on an object whose ToPrimitive is a BigInt step a BigInt
+/// (ToNumeric keeps it): the result was a Number.
+#[test]
+fn update_of_object_with_bigint_value_stays_bigint() {
+    let src = r#"
+        var o = { valueOf() { return 1n; } }, r = [];
+        var x = o; x++; r.push(typeof x, x);
+        x = o; --x; r.push(typeof x, x);
+        x = o; var old = x++; r.push(typeof old, old);
+        var w = Object(5n); w++; r.push(typeof w, w);
+        var obj = { p: o }; obj.p++; var arr = [o]; arr[0]--;
+        r.push(typeof obj.p, obj.p, typeof arr[0], arr[0]);
+        function f() { var y = o; y++; return y; }
+        r.push(typeof f());
+        r.join()
+    "#;
+    assert_eq!(
+        run(src),
+        "bigint,2,bigint,0,bigint,1,bigint,6,bigint,2,bigint,0,bigint"
+    );
+}

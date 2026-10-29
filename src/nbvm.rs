@@ -7279,8 +7279,17 @@ fn run_frame_at_ic(
                     // An object (ToPrimitive, number hint) or a Symbol (a
                     // TypeError): the host's unary `-` performs ToNumeric, and
                     // negating its primitive result back is exact.
+                    // (A BigInt primitive negates back as a BigInt.)
                     match host_unary_any(ctx, crate::ast::UnaryOp::Minus, v) {
-                        Ok(r) => regs[*dst as usize] = ctx.realm.neg(r),
+                        Ok(r) => {
+                            let big = r
+                                .as_handle()
+                                .and_then(|h| ctx.realm.bigint_at(Handle::from_raw(h)));
+                            regs[*dst as usize] = match big {
+                                Some(n) => NanBox::handle(ctx.realm.new_bigint(n.neg()).to_raw()),
+                                None => ctx.realm.neg(r),
+                            };
+                        }
                         Err(e) => handle_throw!(e),
                     }
                 } else {
