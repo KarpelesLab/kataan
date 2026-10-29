@@ -644,3 +644,17 @@ fn for_await_close_over_sync_iterator_awaits_the_wrapper() {
          D0\nD1\nD2\nD3\nD caught\n"
     );
 }
+
+/// `Iterator.prototype.drop` skips with IteratorStep, which reads `done`
+/// but never `value` (a throwing `value` getter on a skipped result must
+/// not run).
+#[test]
+fn iterator_drop_skips_without_reading_values() {
+    let src = r#"
+        var log = [];
+        var src = { i: 0, next() { var k = this.i++; return { get value() { log.push('v' + k); if (k === 0) throw 'boom'; return k; }, get done() { log.push('d' + k); return k > 2; } }; } };
+        var r = Iterator.from(src).drop(1).toArray();
+        r.join() + '|' + log.join()
+    "#;
+    assert_eq!(run(src), "1,2|d0,d1,v1,d2,v2,d3");
+}

@@ -180,6 +180,19 @@ impl Interp {
         it: Handle,
         next: NanBox,
     ) -> Result<Option<NanBox>, ExecError> {
+        let Some(rh) = self.iter_step_result(it, next)? else {
+            return Ok(None);
+        };
+        Ok(Some(match self.ordinary_own_data(rh, "value") {
+            Some(v) => v,
+            None => self.read_member(rh, "value")?,
+        }))
+    }
+
+    /// IteratorStep: calls `next` and reads the result's `done`, returning the
+    /// result object while not done — its `value` is left unread (an
+    /// iterator helper's `drop` skips values without reading them).
+    fn iter_step_result(&mut self, it: Handle, next: NanBox) -> Result<Option<Handle>, ExecError> {
         // The built-in iterators' own `next` (an array/string/collection
         // iterator) is called directly: `call_with_this` would only enter the
         // realm it already runs in and reach this same native by dispatch.
@@ -209,10 +222,7 @@ impl Interp {
         if self.realm.truthy(done) {
             return Ok(None);
         }
-        Ok(Some(match self.ordinary_own_data(rh, "value") {
-            Some(v) => v,
-            None => self.read_member(rh, "value")?,
-        }))
+        Ok(Some(rh))
     }
 
     /// Builds a lazy `%IteratorHelperPrototype%`-based helper object for `map`,
@@ -608,7 +618,7 @@ impl Interp {
                     .and_then(|n| n.as_number())
                     .unwrap_or(0.0);
                 while rem > 0.0 {
-                    if self.iter_step(src_h, next)?.is_none() {
+                    if self.iter_step_result(src_h, next)?.is_none() {
                         return Ok(None);
                     }
                     rem -= 1.0;
