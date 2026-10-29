@@ -1085,8 +1085,12 @@ impl Interp {
             N_OBJECT_FREEZE => {
                 // A proxy routes SetIntegrityLevel through its traps (ownKeys +
                 // getOwnPropertyDescriptor + defineProperty, per key).
+                // A mapped `arguments` object too: its `[[DefineOwnProperty]]`
+                // (non-writable) captures each mapped index's current value and
+                // severs the alias to the parameter.
                 if let Some(raw) = arg(0).as_handle()
-                    && self.realm.proxy_at(Handle::from_raw(raw)).is_some()
+                    && (self.realm.proxy_at(Handle::from_raw(raw)).is_some()
+                        || self.arg_maps.contains_key(&raw))
                 {
                     self.proxy_set_integrity_level(Handle::from_raw(raw), true)?;
                     return Ok(arg(0));

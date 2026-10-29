@@ -576,3 +576,22 @@ fn string_methods_look_up_symbol_methods_once() {
         "split,ts|replace,ts|match,ts|search,ts|split,ts|TypeError|a1z"
     );
 }
+
+/// `Object.freeze(arguments)` on a mapped arguments object goes through its
+/// `[[DefineOwnProperty]]`: each index keeps the parameter's current value and
+/// stops aliasing it (a later parameter write showed through the frozen
+/// object).
+#[test]
+fn freezing_mapped_arguments_severs_the_alias() {
+    let src = r#"
+        function f(a, b) {
+            a = 5;
+            Object.freeze(arguments);
+            a = 7; b = 8;
+            arguments[0] = 9;
+            return [arguments[0], arguments[1], a, b, Object.isFrozen(arguments)].join();
+        }
+        f(1, 2)
+    "#;
+    assert_eq!(run(src), "5,2,7,8,true");
+}
