@@ -7967,42 +7967,211 @@ fn swap_set_entry(set: &mut alloc::collections::BTreeSet<u64>, a: u64, b: u64) {
     }
 }
 
-/// Parses the engine's `toString`/`toUTCString`/`toDateString` output:
+/// Parses the human-readable date forms (implementation-defined fallbacks of
+/// `Date.parse`, local time being UTC here):
 /// - `"Thu, 01 Jan 1970 00:00:00 GMT"` (toUTCString)
-/// - `"Thu Jan 01 1970 00:00:00 GMT+0000 (…)"` (toString)
-/// - `"Thu Jan 01 1970"` (toDateString)
+/// - `"Thu Jan 01 1970 00:00:00 GMT+0100 (…)"` (toString — its offset applies)
+/// - `"Thu Jan 01 1970"` (toDateString), `"Jan 1 1970"`, `"1 January 1970"`
+/// - `"1970/01/01"` and `"01/01/1970"` (month first), with an optional time.
+///
+/// A weekday name is ignored, a parenthesized comment is skipped, and a
+/// `GMT`/`UTC`/`Z` zone may carry a `±HHMM` or `±HH:MM` offset.
 fn parse_human_date(s: &str) -> Option<f64> {
     const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
     ];
-    let s = s.trim();
-    // Drop a leading weekday token (`Thu` / `Thu,`).
-    let rest = s.split_once(' ').map(|(_, r)| r).unwrap_or(s);
-    let toks: alloc::vec::Vec<&str> = rest.split_whitespace().collect();
-    // Two layouts: `Mon DD YYYY [time…]` (toString) or `DD Mon YYYY [time…]`
-    // (toUTCString).
-    let (mon_str, day_str, year_str, time_idx) = if toks.len() >= 3 && MONTHS.contains(&toks[0]) {
-        (toks[0], toks[1], toks[2], 3)
-    } else if toks.len() >= 3 && MONTHS.contains(&toks[1]) {
-        (toks[1], toks[0], toks[2], 3)
-    } else {
-        return None;
-    };
-    let mo = MONTHS.iter().position(|&m| m == mon_str)? as u32 + 1;
-    let day: u32 = day_str.parse().ok()?;
-    let year: i64 = year_str.parse().ok()?;
-    let mut ms = days_from_civil(year, mo, day) * 86_400_000;
-    // Optional `HH:MM:SS` time component.
-    if let Some(time) = toks.get(time_idx)
-        && time.contains(':')
-    {
-        let mut tp = time.split(':');
-        let h: i64 = tp.next()?.parse().ok()?;
-        let mi: i64 = tp.next().unwrap_or("0").parse().ok()?;
-        let se: i64 = tp.next().unwrap_or("0").parse().ok()?;
-        ms += h * 3_600_000 + mi * 60_000 + se * 1000;
+    const DAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+    // A name matches by its first three letters (`Mar`, `March`); a longer
+    // token must also be a prefix of the full name, which is checked loosely by
+    // requiring letters only.
+    fn name_index(tok: &str, names: &[&str]) -> Option<usize> {
+        let t = tok.to_ascii_lowercase();
+        if t.len() < 3 || !t.bytes().all(|c| c.is_ascii_alphabetic()) {
+            return None;
+        }
+        names.iter().position(|n| t.starts_with(n))
     }
-    Some(ms as f64)
+    // Strip a trailing parenthesized comment (`(Central European Time)`).
+    let s = match s.find('(') {
+        Some(i) if s.trim_end().ends_with(')') => &s[..i],
+        _ => s,
+    };
+    let toks: alloc::vec::Vec<&str> = s
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut month: Option<u32> = None;
+    let mut nums: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    let mut time: Option<&str> = None;
+    let mut offset_min: i64 = 0;
+    let mut slash_date: Option<&str> = None;
+    // `AM`/`PM` after the time (12-hour clock).
+    let mut meridiem: Option<bool> = None;
+    for tok in toks {
+        if name_index(tok, &DAYS).is_some() && month.is_none() && nums.is_empty() {
+            continue;
+        }
+        if time.is_some() && meridiem.is_none() {
+            match tok.to_ascii_uppercase().as_str() {
+                "AM" => {
+                    meridiem = Some(false);
+                    continue;
+                }
+                "PM" => {
+                    meridiem = Some(true);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if let Some(m) = name_index(tok, &MONTHS) {
+            if month.is_some() {
+                return None;
+            }
+            month = Some(m as u32 + 1);
+            continue;
+        }
+        let upper = tok.to_ascii_uppercase();
+        let zone = ["GMT", "UTC", "UT", "Z"]
+            .iter()
+            .find(|z| upper.starts_with(**z));
+        // (A date without a time may name its zone too: `Jan 1, 2020 GMT`.)
+        if let Some(z) = zone
+            && (tok.len() == z.len() || matches!(tok.as_bytes()[z.len()], b'+' | b'-'))
+        {
+            let off = &tok[z.len()..];
+            if !off.is_empty() {
+                offset_min = parse_utc_offset(off)?;
+            }
+            continue;
+        }
+        if (tok.starts_with('+') || tok.starts_with('-')) && time.is_some() && tok.len() > 2 {
+            offset_min = parse_utc_offset(tok)?;
+            continue;
+        }
+        if tok.contains(':') {
+            if time.is_some() {
+                return None;
+            }
+            time = Some(tok);
+            continue;
+        }
+        if tok.contains('/') {
+            if slash_date.is_some() {
+                return None;
+            }
+            slash_date = Some(tok);
+            continue;
+        }
+        nums.push(tok);
+    }
+    let (year, mo, day) = if let Some(sd) = slash_date {
+        if month.is_some() || !nums.is_empty() {
+            return None;
+        }
+        let parts: alloc::vec::Vec<&str> = sd.split('/').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        // `YY/MM/DD` when the first field cannot be a month or a day (> 31),
+        // else the month-first `MM/DD/YY`.
+        let first = parts[0].parse::<i64>().ok()?;
+        if first > 31 {
+            (
+                legacy_full_year(first),
+                parts[1].parse::<u32>().ok()?,
+                parts[2].parse::<u32>().ok()?,
+            )
+        } else {
+            (
+                legacy_full_year(parts[2].parse::<i64>().ok()?),
+                parts[0].parse::<u32>().ok()?,
+                parts[1].parse::<u32>().ok()?,
+            )
+        }
+    } else {
+        let mo = month?;
+        if nums.len() != 2 {
+            return None;
+        }
+        // The first number is the day, unless it cannot be one (> 31): then it
+        // is the year and the second is the day.
+        let a = nums[0].parse::<i64>().ok()?;
+        let b = nums[1].parse::<i64>().ok()?;
+        let (d, y) = if a > 31 { (b, a) } else { (a, b) };
+        (legacy_full_year(y), mo, u32::try_from(d).ok()?)
+    };
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let mut ms = days_from_civil(year, mo, day) * 86_400_000;
+    if let Some(t) = time {
+        let mut tp = t.split(':');
+        let h: i64 = tp.next()?.parse().ok()?;
+        let mi: i64 = tp.next()?.parse().ok()?;
+        let (se, milli): (i64, i64) = match tp.next() {
+            Some(sec) => match sec.split_once('.') {
+                Some((a, f)) => {
+                    let frac: alloc::string::String =
+                        f.chars().chain("000".chars()).take(3).collect();
+                    (a.parse().ok()?, frac.parse().ok()?)
+                }
+                None => (sec.parse().ok()?, 0),
+            },
+            None => (0, 0),
+        };
+        // A 12-hour clock: `12 AM` is midnight, `12 PM` noon.
+        let h = match meridiem {
+            Some(_) if !(1..=12).contains(&h) => return None,
+            Some(pm) => h % 12 + if pm { 12 } else { 0 },
+            None => h,
+        };
+        if tp.next().is_some()
+            || h > 24
+            || mi > 59
+            || se > 59
+            || (h == 24 && (mi | se | milli) != 0)
+        {
+            return None;
+        }
+        ms += h * 3_600_000 + mi * 60_000 + se * 1000 + milli;
+    }
+    Some((ms - offset_min * 60_000) as f64)
+}
+
+/// A legacy date's year: a two-digit value is in 1950..2049 (`49` is 2049,
+/// `50` is 1950), as other engines read it; anything else is literal.
+fn legacy_full_year(y: i64) -> i64 {
+    match y {
+        0..=49 => 2000 + y,
+        50..=99 => 1900 + y,
+        _ => y,
+    }
+}
+
+/// A UTC offset `±HHMM`, `±HH:MM` or `±HH`, in minutes east of UTC.
+fn parse_utc_offset(off: &str) -> Option<i64> {
+    let (sign, digits) = match off.as_bytes().first()? {
+        b'+' => (1, &off[1..]),
+        b'-' => (-1, &off[1..]),
+        _ => return None,
+    };
+    let digits: alloc::string::String = digits.chars().filter(|c| *c != ':').collect();
+    if !digits.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let (h, m) = match digits.len() {
+        1 | 2 => (digits.parse::<i64>().ok()?, 0),
+        4 => (
+            digits[..2].parse::<i64>().ok()?,
+            digits[2..].parse::<i64>().ok()?,
+        ),
+        _ => return None,
+    };
+    if m > 59 {
+        return None;
+    }
+    Some(sign * (h * 60 + m))
 }
 
 /// Renders a millisecond timestamp as an ISO-8601 UTC string.

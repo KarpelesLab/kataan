@@ -818,3 +818,28 @@ fn define_properties_validates_all_descriptors_first() {
     "#;
     assert_eq!(run(src), "TypeError|0|TypeError|0|TypeError|AvaB|3");
 }
+
+/// `Date.parse` honors the UTC offset of the `toString` format
+/// (`GMT+0100` was ignored), and reads the common human forms: a month name
+/// before or after the day (`Mar 1 2022`, `1 March 2022`), and slash dates
+/// (`2022/03/01`, month-first `03/01/2022`), with an optional time (12-hour
+/// with `AM`/`PM`) and zone. A two-digit year is in 1950..2049, and a leading
+/// number past 31 is the year (`45/1/2`, `may 45 1`), as other engines read them.
+#[test]
+fn date_parse_reads_offsets_and_human_forms() {
+    let src = r#"
+        ["Thu Jan 01 1970 00:00:00 GMT+0100 (CET)", "Thu Jan 01 1970 01:30:00 GMT-02:30",
+         "Mar 1 2022", "1 March 2022", "Tuesday, March 1, 2022 10:00", "2022/03/01", "03/01/2022 00:00:01",
+         "Thu, 01 Jan 1970 00:00:00 GMT", "Jan 32 2020", "Foo 1 2020", "13/01/2020",
+         "Jan 1, 2020 GMT", "1 Jan 2020 UTC+0100", "Jan 1 2020 GMTx",
+         "5/1/49", "may 45 1", "45/1/2", "Jan 1 2000 10:00 PM", "Jan 1 2000 12:00 AM", "1 may 50",
+         "13/1/2", "Jan 1 2000 13:00 PM"]
+            .map(function (s) { return Date.parse(s); }).join()
+    "#;
+    assert_eq!(
+        run(src),
+        "-3600000,14400000,1646092800000,1646092800000,1646128800000,1646092800000,1646092801000,0,NaN,NaN,NaN,\
+         1577836800000,1577833200000,NaN,\
+         2503440000000,2377209600000,2366928000000,946764000000,946684800000,-620784000000,NaN,NaN"
+    );
+}
