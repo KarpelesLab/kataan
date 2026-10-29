@@ -2761,6 +2761,10 @@ impl Interp {
         // `[[GetOwnProperty]]` (getOwnPropertyDescriptor trap) then `[[Get]]` (get
         // trap) through its handler, in spec order — the physical key scan below
         // would see none of the proxy's virtual keys.
+        // ObjectDefineProperties reads and validates *every* descriptor
+        // (ToPropertyDescriptor) before defining any: a bad descriptor late in
+        // the list leaves the target untouched.
+        let mut pending: Vec<(alloc::string::String, Handle)> = Vec::new();
         if self.realm.proxy_at(descs).is_some() {
             let keys = self.own_property_keys_values(descs)?;
             for key in keys {
@@ -2778,16 +2782,10 @@ impl Interp {
                     continue;
                 }
                 let d_val = self.read_member(descs, &name)?;
-                let Some(d) = d_val
-                    .as_handle()
-                    .map(Handle::from_raw)
-                    .filter(|_| self.is_object_value(d_val))
-                else {
-                    return Err(self.type_error("Property description must be an object"));
-                };
-                self.apply_descriptor(target, &name, d, false)?;
+                let nd = self.detached_property_descriptor(d_val)?;
+                pending.push((name, nd));
             }
-            return Ok(());
+            return self.define_pending_descriptors(target, pending);
         }
         // OwnPropertyKeys(Properties) filtered to enumerable, in spec order. A
         // function/array/native keeps its named (accessor) properties in the aux
@@ -2833,14 +2831,45 @@ impl Interp {
             // Get(props, key) invokes a getter (the descriptor value may be
             // computed); the result must be an object (ToPropertyDescriptor).
             let d_val = self.read_member(descs, &key)?;
-            let Some(d) = d_val
-                .as_handle()
-                .map(Handle::from_raw)
-                .filter(|_| self.is_object_value(d_val))
-            else {
-                return Err(self.type_error("Property description must be an object"));
-            };
-            self.apply_descriptor(target, &key, d, false)?;
+            let nd = self.detached_property_descriptor(d_val)?;
+            pending.push((key, nd));
+        }
+        self.define_pending_descriptors(target, pending)
+    }
+
+    /// ToPropertyDescriptor(`d_val`) as a fresh, prototype-less plain object
+    /// holding exactly the fields present (so re-reading it later runs no user
+    /// code and sees nothing inherited). A non-object, or one mixing accessor
+    /// and data fields, is a TypeError.
+    fn detached_property_descriptor(&mut self, d_val: NanBox) -> Result<Handle, ExecError> {
+        let Some(d) = d_val
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|_| self.is_object_value(d_val))
+        else {
+            return Err(self.type_error("Property description must be an object"));
+        };
+        let nd = self.normalize_property_descriptor(d)?;
+        let accessor = self.realm.has_own(nd, "get") || self.realm.has_own(nd, "set");
+        let data = self.realm.has_own(nd, "value") || self.realm.has_own(nd, "writable");
+        if accessor && data {
+            return Err(self.type_error(
+                "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute",
+            ));
+        }
+        self.realm.set_object_proto(nd, None);
+        Ok(nd)
+    }
+
+    /// The define phase of ObjectDefineProperties: DefinePropertyOrThrow for each
+    /// already-validated descriptor, in order.
+    fn define_pending_descriptors(
+        &mut self,
+        target: Handle,
+        pending: Vec<(alloc::string::String, Handle)>,
+    ) -> Result<(), ExecError> {
+        for (key, nd) in pending {
+            self.apply_descriptor(target, &key, nd, false)?;
         }
         Ok(())
     }

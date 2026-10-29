@@ -794,3 +794,27 @@ fn shared_array_buffer_has_species_getter() {
     "#;
     assert_eq!(run(src), "function,,true,get [Symbol.species],true,true");
 }
+
+/// `Object.defineProperties` / `Object.create` convert every descriptor
+/// (ToPropertyDescriptor) before defining any, so a bad descriptor later in
+/// the list leaves the target untouched (the earlier ones were defined); the
+/// descriptors' getters still run in key order, before any define.
+#[test]
+fn define_properties_validates_all_descriptors_first() {
+    let src = r#"
+        var log = [], o = {}, r = [];
+        try { Object.defineProperties(o, { a: { value: 1 }, b: { get: 5 } }); } catch (e) { r.push(e.name); }
+        r.push(Object.getOwnPropertyNames(o).length);
+        try { Object.defineProperties(o, { a: { value: 1 }, b: { value: 1, get: undefined } }); } catch (e) { r.push(e.name); }
+        r.push(Object.getOwnPropertyNames(o).length);
+        try { Object.create(null, { a: { value: 1 }, b: 5 }); } catch (e) { r.push(e.name); }
+        var d = { get a() { log.push("A"); return { get value() { log.push("va"); return 1; } }; },
+                  get b() { log.push("B"); return { value: 2 }; } };
+        Object.defineProperty(d, "a", { enumerable: true });
+        Object.defineProperty(d, "b", { enumerable: true });
+        var t = Object.defineProperties({}, d);
+        r.push(log.join(""), t.a + t.b);
+        r.join("|")
+    "#;
+    assert_eq!(run(src), "TypeError|0|TypeError|0|TypeError|AvaB|3");
+}
