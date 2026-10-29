@@ -20,6 +20,33 @@ impl Interp {
         {
             return Ok(src.into());
         }
+        // A Proxy's name comes from its (innermost) target's own `name` data
+        // property, read directly: a `get` through the proxy would be an
+        // observable trap call, which toString must not make.
+        if self.realm.proxy_at(handle).is_some() {
+            let mut h = handle;
+            while let Some((target, _)) = self.realm.proxy_at(h) {
+                if self.realm.proxy_revoked(h) {
+                    break;
+                }
+                h = target;
+            }
+            let nm = if self.realm.proxy_at(h).is_none() {
+                self.realm
+                    .vm_fn_meta_value(h, "name")
+                    .or_else(|| self.realm.get_property(h, "name"))
+                    .filter(|v| {
+                        v.as_handle()
+                            .is_some_and(|s| self.realm.is_string_handle(Handle::from_raw(s)))
+                    })
+                    .map(|v| self.realm.to_display_string(v))
+                    .unwrap_or_default()
+            } else {
+                alloc::string::String::new()
+            };
+            let seg = crate::realm::native_fn_name_segment(&nm);
+            return Ok(alloc::format!("function {seg}() {{ [native code] }}"));
+        }
         let nm = self.read_member(handle, "name")?;
         let nm = self.realm.to_display_string(nm);
         // A Proxy, or a function without retained source, uses the

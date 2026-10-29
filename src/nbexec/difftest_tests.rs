@@ -945,3 +945,22 @@ fn class_named_by_property_key_before_static_elements() {
         "n,[sym],function,function,g,x,p,q,[sym],blk:f1,f1,function,j/k/l/m/n/p/q"
     );
 }
+
+/// `Function.prototype.toString` on a callable Proxy renders the
+/// NativeFunction form without reading `name` through the proxy's `get` trap
+/// (the name comes from the innermost target's own data property).
+#[test]
+fn function_to_string_on_proxy_makes_no_trap_call() {
+    let src = r#"
+        var log = [], h = { get(t, k) { log.push(String(k)); return t[k]; } };
+        var p = new Proxy(function f(a) {}, h), pp = new Proxy(p, h);
+        var q = new Proxy(class C {}, h), m = new Proxy(Math.max, h);
+        [Function.prototype.toString.call(p), Function.prototype.toString.call(pp),
+         Function.prototype.toString.call(q),
+         Function.prototype.toString.call(m), log.length].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "function f() { [native code] }|function f() { [native code] }|function C() { [native code] }|function max() { [native code] }|0"
+    );
+}
