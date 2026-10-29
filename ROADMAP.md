@@ -1052,9 +1052,24 @@ loop_arith now runs faster than node (0.9x).
 Startup is 3 ms against node's ~15 ms.
 
 
-- **Interpreter:** IC tuning, array element-kind fast paths, rope tuning, finish
-  the generational nursery + write barriers on the existing moving GC for
+- **Interpreter:** IC tuning, array element-kind fast paths, rope tuning,
   bump-allocation throughput.
+
+  **Generational GC (2026-10-29): done.** Allocation-triggered collections
+  are minor ones every 16k allocations (`GC_NURSERY`): they mark from the
+  roots plus the remembered set, never trace an old object, and sweep only
+  the slots allocated since the last collection (the free-list cursor
+  `free_top` + `young_floor` record them); a full collection runs once the
+  heap outgrows the last full one's live set by `GC_GROWTH`. The write
+  barrier is the mutable borrow itself (`Heap::get_mut`/`peek_mut`/`swap`
+  enter an old slot into the remembered set once per cycle), compiled code
+  takes its helper for an old container + young target (`p_barrier_check`),
+  and interior-mutable cells (`Cell::Env`, a pending `Cell::Promise`) are
+  rescanned by every minor collection (`Trace::interior_mutable`).
+  `KATAAN_GC_VERIFY` checks the invariant (no unremembered old→young edge)
+  before every minor collection; `KATAAN_GC_MINOR=0` makes every collection
+  full. Non-moving, so handles and cached slot addresses stay valid. What is
+  left of the cost is per-object freeing (drop + free-list push, ~3 ns).
 
   A constant-factor sweep (2026-08-28) puts most operations within ~1.2x of the
   engine's own empty loop; **closure allocation was the one outlier at 12x** and

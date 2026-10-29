@@ -295,7 +295,25 @@ static EMPTY_DICT: DictData = DictData {
     map: BTreeMap::new(),
 };
 
+/// Drops an object's `extra` part — off the sweep's common path.
+#[cold]
+#[inline(never)]
+fn drop_extra(extra: Box<ObjectExtra>) {
+    drop(extra);
+}
+
 impl Object {
+    /// Drops the object, the way the collector's sweep does it: the common
+    /// case (no `extra` part) is one shape-count decrement, inline.
+    #[inline]
+    pub(crate) fn release(self) {
+        let Self { shape, extra, .. } = self;
+        drop(shape);
+        if let Some(x) = extra {
+            drop_extra(x);
+        }
+    }
+
     /// Creates an empty object whose layout starts at `root` (the shared root
     /// shape of the owning realm/heap, so identically-structured objects share
     /// shapes).

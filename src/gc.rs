@@ -46,6 +46,50 @@ pub trait Trace {
     fn weight(&self) -> usize {
         1
     }
+
+    /// Whether this object can change the handles it references **without a
+    /// mutable borrow of its heap slot** (state shared behind an `Rc`, say),
+    /// which the generational write barrier — the mutable borrow
+    /// ([`Heap::get_mut`]) — cannot see. A minor collection rescans every
+    /// such old object, as though the barrier had fired on it.
+    fn interior_mutable(&self) -> bool {
+        false
+    }
+
+    /// Drops a swept object. The default is plain `drop`; an implementation
+    /// may special-case its common shapes so the sweep's per-object cost is not
+    /// the full drop glue.
+    fn release(self)
+    where
+        Self: Sized,
+    {
+        drop(self);
+    }
+}
+
+/// What a collection knows to be alive, as handed to the weak-key
+/// (ephemeron) hooks: the [`MarkSet`] of a full collection, or, in a minor
+/// one, [`MinorLive`] — every old object plus the young ones marked.
+pub trait LiveSet {
+    /// Whether `handle` is (as far as this collection is concerned) alive.
+    fn contains(&self, handle: &Handle) -> bool;
+}
+
+impl LiveSet for MarkSet {
+    fn contains(&self, handle: &Handle) -> bool {
+        MarkSet::contains(self, handle)
+    }
+}
+
+/// The [`LiveSet`] of a minor collection: a handle is alive if its object is
+/// old, or young and reached by the marking so far (which promotes it, so both
+/// are "age at least [`OLD_AGE`]").
+pub struct MinorLive<'a, T>(pub &'a Heap<T>);
+
+impl<T> LiveSet for MinorLive<'_, T> {
+    fn contains(&self, handle: &Handle) -> bool {
+        self.0.age(*handle).is_some_and(|a| a >= OLD_AGE)
+    }
 }
 
 /// A heap object whose outgoing handles can be **rewritten** — needed by a
@@ -263,10 +307,8 @@ pub fn collect<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
     let marked = mark(heap, roots.iter().copied());
 
     // --- sweep: free every live object the mark phase did not reach (a
-    // survivor ages toward the old generation) ---
-    let swept = heap.sweep(|h, _| marked.contains(&h));
-    // A full collection re-establishes the generation boundary from scratch.
-    heap.clear_remembered();
+    // survivor ages toward the old generation; the remembered set is rebuilt) ---
+    let swept = heap.sweep(|h, _| marked.contains(&h), T::interior_mutable, T::release);
 
     Stats {
         marked: marked.len(),
@@ -287,14 +329,17 @@ pub fn collect<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
 /// it only stops the table from holding a now-dangling handle.
 pub fn sweep_full<T: Trace>(heap: &mut Heap<T>, marked: &MarkSet) -> Stats {
     let mut weight = 0usize;
-    let swept = heap.sweep(|h, value| {
-        let keep = marked.contains(&h);
-        if keep {
-            weight = weight.saturating_add(value.weight());
-        }
-        keep
-    });
-    heap.clear_remembered();
+    let swept = heap.sweep(
+        |h, value| {
+            let keep = marked.contains(&h);
+            if keep {
+                weight = weight.saturating_add(value.weight());
+            }
+            keep
+        },
+        T::interior_mutable,
+        T::release,
+    );
     Stats {
         marked: marked.len(),
         swept,
@@ -303,37 +348,135 @@ pub fn sweep_full<T: Trace>(heap: &mut Heap<T>, marked: &MarkSet) -> Stats {
 }
 
 /// Runs a **minor** (generational) collection: it reclaims only short-lived
-/// objects in the **young** generation. Because most objects die young, sweeping
-/// just the nursery is cheap.
-///
-/// Correctness without a write barrier: the entire **old** generation is treated
-/// as part of the root set, so a young object kept alive solely by an old
-/// referent survives. (A later refinement adds a remembered set so only mutated
-/// old objects need scanning.) Surviving young objects are promoted.
+/// objects in the **young** generation (allocated since the last collection).
+/// Because most objects die young, marking and sweeping just the nursery is
+/// cheap. See [`collect_minor_with`].
 pub fn collect_minor<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
-    // Roots = the program roots ∪ the **remembered set** (old objects written
-    // with a young pointer), rather than the entire old generation.
-    let remembered = heap.remembered_roots();
-    let marked = mark(heap, roots.iter().copied().chain(remembered));
+    collect_minor_with(heap, roots, |_, _| {}, |_, _, _| {})
+}
 
-    // Sweep only the young generation; promote the young survivors.
-    let mut swept = 0;
-    for handle in heap.handles_where(|a| a < OLD_AGE) {
-        if marked.contains(&handle) {
-            heap.tenure(handle);
-        } else {
-            heap.free(handle);
-            swept += 1;
+/// A minor collection with the hooks of [`mark_with_ephemerons_scan`]
+/// (`scan` for extra strong edges, `expand` for weak-key tables, the latter
+/// given a [`MinorLive`] view) — the generational counterpart of a full
+/// collection's mark and sweep.
+///
+/// Soundness rests on one invariant, kept by the write barrier: **an old
+/// object outside the remembered set references no young object.** The old
+/// generation is not traced at all — every old object is presumed alive (a
+/// later full collection decides) — so the young survivors are exactly those
+/// reachable from the roots and from the remembered old objects through
+/// young objects only. Marking a young object promotes it (its age is the
+/// mark), and [`Heap::sweep_young`] frees the rest; afterwards no young
+/// object remains, so the remembered set restarts empty but for the
+/// interior-mutable old objects ([`Trace::interior_mutable`]), which a minor
+/// collection always rescans.
+pub fn collect_minor_with<T: Trace>(
+    heap: &mut Heap<T>,
+    roots: &[Handle],
+    scan: impl FnMut(&T, &mut Vec<Handle>),
+    expand: impl FnMut(&Heap<T>, &MinorLive<'_, T>, &mut Vec<Handle>),
+) -> Stats {
+    let mark = mark_minor(heap, roots, scan, expand);
+    sweep_minor(heap, mark)
+}
+
+/// The outcome of [`mark_minor`], for [`sweep_minor`]: between the two, the
+/// young survivors are exactly the young objects a [`MinorLive`] reports
+/// alive, so a caller can prune its weak-key tables against it.
+#[derive(Debug)]
+pub struct MinorMark {
+    rescanned: Vec<u32>,
+    marked: usize,
+}
+
+/// The mark half of [`collect_minor_with`].
+pub fn mark_minor<T: Trace>(
+    heap: &mut Heap<T>,
+    roots: &[Handle],
+    mut scan: impl FnMut(&T, &mut Vec<Handle>),
+    mut expand: impl FnMut(&Heap<T>, &MinorLive<'_, T>, &mut Vec<Handle>),
+) -> MinorMark {
+    let mut work: Vec<Handle> = Vec::new();
+    let mut edges: Vec<Handle> = Vec::new();
+    let mut marked = 0usize;
+    // An old root needs no tracing: whatever young object it reaches, it
+    // reaches through a remembered object or a young one.
+    for &root in roots {
+        if heap.promote_young(root) {
+            marked += 1;
+            work.push(root);
         }
     }
-    // The surviving young are now old; the recorded old→young edges are old→old.
-    heap.clear_remembered();
-
-    Stats {
-        marked: marked.len(),
-        swept,
-        weight: marked.len(),
+    // The remembered old objects are scanned like roots' referents.
+    let rescanned = heap.take_remembered();
+    for &index in &rescanned {
+        if let Some(obj) = heap.live_handle_at(index).and_then(|h| heap.peek(h)) {
+            obj.trace_each(|e| edges.push(e));
+            scan(obj, &mut edges);
+        }
+        for e in edges.drain(..) {
+            if heap.promote_young(e) {
+                marked += 1;
+                work.push(e);
+            }
+        }
     }
+    let mut extra: Vec<Handle> = Vec::new();
+    loop {
+        while let Some(h) = work.pop() {
+            if let Some(obj) = heap.get(h) {
+                obj.trace_each(|e| edges.push(e));
+                scan(obj, &mut edges);
+            }
+            for e in edges.drain(..) {
+                if heap.promote_young(e) {
+                    marked += 1;
+                    work.push(e);
+                }
+            }
+        }
+        // Ephemeron fixpoint, as in a full collection.
+        expand(heap, &MinorLive(heap), &mut extra);
+        for h in extra.drain(..) {
+            if heap.promote_young(h) {
+                marked += 1;
+                work.push(h);
+            }
+        }
+        if work.is_empty() {
+            break;
+        }
+    }
+    MinorMark { rescanned, marked }
+}
+
+/// The sweep half of [`collect_minor_with`]: frees the young objects
+/// [`mark_minor`] did not reach.
+pub fn sweep_minor<T: Trace>(heap: &mut Heap<T>, mark: MinorMark) -> Stats {
+    let swept = heap.sweep_young(mark.rescanned, T::interior_mutable, T::release);
+    Stats {
+        marked: mark.marked,
+        swept,
+        weight: mark.marked,
+    }
+}
+
+/// **GC verification** for [`collect_minor_with`]: the first old object
+/// outside the remembered set that references a young one (`scan` adds the
+/// extra edges a collection's `scan` would), as `(container, target)`, or
+/// `(h, h)` for an untracked young object or an interior-mutable old one
+/// missing from the remembered set. `None` when the invariants hold.
+pub fn remembered_violation<T: Trace>(
+    heap: &Heap<T>,
+    mut scan: impl FnMut(&T, &mut Vec<Handle>),
+) -> Option<(Handle, Handle)> {
+    heap.remembered_violation(
+        |obj, out| {
+            obj.trace_each(|e| out.push(e));
+            scan(obj, out);
+        },
+        T::interior_mutable,
+    )
 }
 
 /// Runs a **moving (compacting)** collection: marks from `roots`, relocates the
@@ -487,6 +630,9 @@ mod tests {
     struct Node {
         tag: u32,
         edges: Vec<Handle>,
+        /// Edges changed through a shared borrow (declared by `interior`).
+        shared: core::cell::RefCell<Vec<Handle>>,
+        interior: bool,
     }
 
     impl Node {
@@ -494,15 +640,21 @@ mod tests {
             Self {
                 tag,
                 edges: Vec::new(),
+                shared: core::cell::RefCell::new(Vec::new()),
+                interior: false,
             }
         }
     }
 
     impl Trace for Node {
         fn trace(&self, visit: &mut dyn FnMut(Handle)) {
-            for &e in &self.edges {
+            for &e in self.edges.iter().chain(self.shared.borrow().iter()) {
                 visit(e);
             }
+        }
+
+        fn interior_mutable(&self) -> bool {
+            self.interior
         }
     }
 
@@ -616,6 +768,87 @@ mod tests {
         let stats = collect_minor(&mut heap, &[old]);
         assert_eq!(stats.swept, 0);
         assert!(heap.is_live(young));
+    }
+
+    #[test]
+    fn a_mutable_borrow_of_an_old_object_is_the_write_barrier() {
+        // No explicit `record_edge`: `get_mut` itself remembers `old`.
+        let mut heap: Heap<Node> = Heap::new();
+        let old = heap.alloc(Node::new(1));
+        collect(&mut heap, &[old]);
+        let young = heap.alloc(Node::new(2));
+        heap.get_mut(old).unwrap().edges.push(young);
+        assert_eq!(remembered_violation(&heap, |_, _| {}), None);
+        let stats = collect_minor(&mut heap, &[]);
+        assert_eq!(stats.swept, 0);
+        assert!(heap.is_live(young));
+        assert_eq!(heap.age(young), Some(OLD_AGE));
+        // Settled: nothing is young, and `old` left the remembered set.
+        assert!(heap.remembered_roots().is_empty());
+        let later = heap.alloc(Node::new(3));
+        assert_eq!(collect_minor(&mut heap, &[]).swept, 1);
+        assert!(!heap.is_live(later));
+    }
+
+    #[test]
+    fn an_interior_mutable_old_object_is_rescanned_by_every_minor_collection() {
+        let mut heap: Heap<Node> = Heap::new();
+        let mut node = Node::new(1);
+        node.interior = true;
+        let old = heap.alloc(node);
+        collect(&mut heap, &[old]);
+        assert_eq!(heap.remembered_roots(), [old]);
+        for round in 0..3 {
+            // A store through a shared borrow: no barrier can see it.
+            let young = heap.alloc(Node::new(10 + round));
+            heap.get(old).unwrap().shared.borrow_mut().push(young);
+            let garbage = heap.alloc(Node::new(20 + round));
+            assert_eq!(remembered_violation(&heap, |_, _| {}), None);
+            collect_minor(&mut heap, &[]);
+            assert!(heap.is_live(young) && !heap.is_live(garbage));
+            assert_eq!(heap.remembered_roots(), [old]);
+        }
+    }
+
+    #[test]
+    fn the_verifier_reports_an_unremembered_old_to_young_edge() {
+        // A shared-borrow store into an object that does not declare its
+        // interior mutability is exactly the hole the verifier exists for.
+        let mut heap: Heap<Node> = Heap::new();
+        let old = heap.alloc(Node::new(1));
+        collect(&mut heap, &[old]);
+        let young = heap.alloc(Node::new(2));
+        heap.get(old).unwrap().shared.borrow_mut().push(young);
+        assert_eq!(remembered_violation(&heap, |_, _| {}), Some((old, young)));
+        // … and an interior-mutable old object outside the remembered set.
+        let mut heap: Heap<Node> = Heap::new();
+        let h = heap.alloc(Node::new(1));
+        collect(&mut heap, &[h]);
+        heap.get_mut(h).unwrap().interior = true;
+        collect_minor(&mut heap, &[h]);
+        assert_eq!(remembered_violation(&heap, |_, _| {}), None);
+    }
+
+    #[test]
+    fn young_objects_in_reused_slots_are_swept_by_a_minor_collection() {
+        let mut heap: Heap<Node> = Heap::new();
+        let root = heap.alloc(Node::new(0));
+        let dead: Vec<Handle> = (1..=4).map(|t| heap.alloc(Node::new(t))).collect();
+        collect(&mut heap, &[root]);
+        assert!(dead.iter().all(|&h| !heap.is_live(h)));
+        // These reuse the freed slots (below the young floor).
+        let reused: Vec<Handle> = (5..=8).map(|t| heap.alloc(Node::new(t))).collect();
+        assert_eq!(heap.slot_capacity(), 5);
+        heap.get_mut(root).unwrap().edges.push(reused[1]);
+        // An explicit free between collections keeps the bookkeeping straight.
+        heap.free(reused[3]);
+        let fresh = heap.alloc(Node::new(9));
+        let stats = collect_minor(&mut heap, &[root]);
+        assert_eq!(stats.swept, 3);
+        assert!(heap.is_live(reused[1]));
+        assert!(!heap.is_live(reused[0]) && !heap.is_live(reused[2]) && !heap.is_live(fresh));
+        assert_eq!(heap.len(), 2);
+        assert_eq!(remembered_violation(&heap, |_, _| {}), None);
     }
 
     #[test]

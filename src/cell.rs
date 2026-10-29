@@ -862,6 +862,31 @@ impl Trace for Cell {
         }
     }
 
+    /// A host environment's bindings (`Rc<RefCell<…>>` scopes, shared with
+    /// the interpreter's environment chain) and a pending promise's state (an
+    /// `Rc<RefCell<…>>` that `then` and the resolving functions update) change
+    /// through a shared borrow of the cell. A settled promise's handles are
+    /// final: its value is written once, by the settlement, and reactions are
+    /// only recorded while it is pending.
+    fn interior_mutable(&self) -> bool {
+        match self {
+            Cell::Env(_) => true,
+            Cell::Promise(p) => p
+                .try_borrow()
+                .map_or(true, |s| s.status == PromiseStatus::Pending),
+            _ => false,
+        }
+    }
+
+    #[inline]
+    fn release(self) {
+        match self {
+            Cell::Object(o) => o.release(),
+            Cell::Array(a) => drop(a),
+            other => drop(other),
+        }
+    }
+
     fn trace(&self, visit: &mut dyn FnMut(Handle)) {
         self.trace_each(visit);
     }

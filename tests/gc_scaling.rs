@@ -36,23 +36,26 @@ use kataan::realm::Realm;
 ///
 /// Panics rather than returning a `Result`: a workload here that fails to
 /// compile or throws is a broken test, not a measurement.
-fn live_objects_after(src: &str) -> usize {
+fn live_objects_after(src: &str) -> (usize, usize) {
     let program = Parser::parse_program(src).expect("parse");
     let protos = compile_program(&program).expect("compile to bytecode");
     let mut realm = Realm::new();
     run_program_capturing(&mut realm, &protos, 0, &[]).expect("run");
-    realm.object_count()
+    (realm.object_count(), realm.gc_next_threshold())
 }
 
 /// Asserts that four times the work does not leave four times the heap.
 ///
-/// The bound is generous (2x for a 4x workload) because it is a leak detector,
-/// not a budget: a tier that collects lands near 1.0, one that does not lands
-/// near 4.0, and nothing sits in between.
+/// The bound is generous (2x for a 4x workload, plus the garbage the
+/// collector may legitimately still hold — up to one trigger's worth of
+/// allocations since its last cycle) because it is a leak detector, not a
+/// budget: a tier that collects lands near 1.0, one that does not lands near
+/// 4.0, and the workloads are large enough against the trigger that nothing
+/// sits in between.
 fn assert_flat(label: &str, workload: impl Fn(usize) -> String, n: usize) {
-    let small = live_objects_after(&workload(n));
-    let large = live_objects_after(&workload(n * 4));
-    let ratio = large as f64 / small.max(1) as f64;
+    let (small, _) = live_objects_after(&workload(n));
+    let (large, slack) = live_objects_after(&workload(n * 4));
+    let ratio = large.saturating_sub(slack) as f64 / small.max(1) as f64;
     println!(
         "{label}: n={n} -> {small} objects, n={} -> {large} objects (x{ratio:.2})",
         n * 4
@@ -73,7 +76,7 @@ fn loop_inside_a_function_collects_its_garbage() {
                 "function f(){{var s=0;for(var i=0;i<{n};i++){{var o={{a:i}};s+=o.a;}}return s;}} f();"
             )
         },
-        20_000,
+        50_000,
     );
 }
 
@@ -89,7 +92,7 @@ fn garbage_from_a_nested_call_is_collected() {
                  function f(){{var s=0;for(var i=0;i<{n};i++){{s+=mk(i).a;}}return s;}} f();"
             )
         },
-        20_000,
+        50_000,
     );
 }
 
@@ -105,7 +108,7 @@ fn garbage_three_frames_deep_is_collected() {
                  function f(){{var s=0;for(var i=0;i<{n};i++){{s+=a(i);}}return s;}} f();"
             )
         },
-        20_000,
+        50_000,
     );
 }
 
@@ -118,7 +121,7 @@ fn strings_built_in_a_function_loop_are_collected() {
                 "function f(){{var s=0;for(var i=0;i<{n};i++){{var t=\"k\"+i;s+=t.length;}}return s;}} f();"
             )
         },
-        20_000,
+        50_000,
     );
 }
 
@@ -129,7 +132,7 @@ fn a_top_level_loop_still_collects() {
     assert_flat(
         "top-level loop",
         |n| format!("var s=0;for(var i=0;i<{n};i++){{var o={{a:i}};s+=o.a;}}"),
-        20_000,
+        50_000,
     );
 }
 

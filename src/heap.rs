@@ -91,7 +91,23 @@ struct Slot<T> {
     /// [`SLOT_OCCUPIED`] while `value` is `Some`, else `0` — what compiled
     /// code tests (it cannot decode the `Option`).
     occupied: u8,
+    /// The slot's **remembered-set** state (see [`Heap::remembered`]):
+    /// [`CLEAN`], [`DIRTY`] (an old object mutably borrowed since the last
+    /// collection) or [`STICKY`] (an old object whose value hides interior
+    /// mutability, rescanned by every minor collection). Non-zero exactly
+    /// while the slot's index is in the list. A free slot is always `CLEAN`,
+    /// so an allocation — compiled code's inline one included — never has to
+    /// write it.
+    dirty: u8,
 }
+
+/// [`Slot::dirty`]: not in the remembered set.
+const CLEAN: u8 = 0;
+/// [`Slot::dirty`]: in the remembered set until the next collection.
+const DIRTY: u8 = 1;
+/// [`Slot::dirty`]: in the remembered set for as long as it lives (its value's
+/// [`Trace::interior_mutable`](crate::gc::Trace::interior_mutable) holds).
+const STICKY: u8 = 2;
 
 /// [`Slot::occupied`] of a live slot.
 const SLOT_OCCUPIED: u8 = 1;
@@ -105,6 +121,7 @@ impl<T> Slot<T> {
             generation,
             age,
             occupied: SLOT_OCCUPIED,
+            dirty: CLEAN,
         }
     }
 
@@ -134,12 +151,14 @@ impl<T> Slot<T> {
         self.value.is_some()
     }
 
-    /// Empties the slot (dropping its value in place), giving it `generation`.
+    /// Empties the slot, giving it `generation`, and returns the value it
+    /// held (for the sweep to release).
     #[inline]
-    fn clear(&mut self, generation: u16) {
+    fn vacate(&mut self, generation: u16) -> Option<T> {
         self.occupied = 0;
+        self.dirty = CLEAN;
         self.generation = generation;
-        self.value = None;
+        self.value.take()
     }
 }
 
@@ -228,7 +247,8 @@ pub(crate) fn jit_heap_slots_offsets() -> (usize, usize) {
 pub(crate) struct HeapAllocOffsets {
     /// The free list's data pointer.
     pub free_ptr: usize,
-    /// The free list's length.
+    /// The free list's allocation cursor (`Heap::free_top`): the number of
+    /// still-free entries.
     pub free_len: usize,
     /// `live`.
     pub live: usize,
@@ -246,25 +266,24 @@ pub(crate) fn jit_heap_alloc_offsets() -> HeapAllocOffsets {
     v.push(1);
     let vec = core::ptr::addr_of!(v) as usize;
     let word = core::mem::size_of::<usize>();
-    let (mut ptr_off, mut len_off) = (usize::MAX, usize::MAX);
+    let mut ptr_off = usize::MAX;
     for i in 0..core::mem::size_of::<Vec<u32>>() / word {
         // SAFETY: the i-th word of the live `Vec`, in bounds.
         #[allow(unsafe_code)]
         let w = unsafe { *((vec + i * word) as *const usize) };
         if w == v.as_ptr() as usize {
             ptr_off = i * word;
-        } else if w == v.len() {
-            len_off = i * word;
         }
     }
     assert!(
-        ptr_off != usize::MAX && len_off != usize::MAX && ptr_off != len_off,
+        ptr_off != usize::MAX,
         "could not derive the heap's free-list Vec offsets"
     );
     let field = core::mem::offset_of!(Heap<Cell>, free);
     HeapAllocOffsets {
         free_ptr: field + ptr_off,
-        free_len: field + len_off,
+        // The allocation cursor, not the `Vec`'s length (see `Heap::free_top`).
+        free_len: core::mem::offset_of!(Heap<Cell>, free_top),
         live: core::mem::offset_of!(Heap<Cell>, live),
         allocs_since_gc: core::mem::offset_of!(Heap<Cell>, allocs_since_gc),
     }
@@ -283,11 +302,26 @@ pub struct Heap<T> {
     /// equal an *old* handle key — which keeps reference fix-up idempotent even
     /// for shared, off-heap structures (closure scopes) visited more than once.
     compact_gen: u16,
-    /// The **remembered set**: slot indices of old-generation objects that have
-    /// been written with a young pointer since the last minor collection (the
-    /// write barrier records them). A minor collection scans only these as old
-    /// roots instead of the whole old generation.
-    remembered: BTreeSet<u32>,
+    /// Entries `free[..free_top]` are the slots still free; `free[free_top..]`
+    /// are the free slots allocated since the last collection — popping only
+    /// moves this cursor, so the collection that follows knows which old slot
+    /// indices now hold young objects ([`young_floor`](Heap::young_floor)
+    /// covers the slots pushed since). Compiled code's inline allocation
+    /// decrements it (`jit_heap_alloc_offsets`).
+    free_top: usize,
+    /// `slots.len()` at the end of the last collection: every slot at or past
+    /// it was pushed since, so holds a young object (or nothing).
+    young_floor: usize,
+    /// The **remembered set**: slot indices of old-generation objects a minor
+    /// collection must scan as roots, because they may point at young ones.
+    /// The write barrier is the mutable borrow itself: [`get_mut`](Heap::get_mut),
+    /// [`peek_mut`](Heap::peek_mut) and [`swap`](Heap::swap) enter an old slot
+    /// the first time it is borrowed after a collection — every store into a
+    /// cell goes through one of them — and the collector itself adds old
+    /// objects with interior mutability ([`STICKY`]). Compiled code, which
+    /// stores into cells directly, takes the helper for an old container and a
+    /// young target (`p_barrier_check`), and the helper's store borrows.
+    remembered: Vec<u32>,
     /// Objects allocated since the last collection — the **allocation-pressure**
     /// signal an allocation-triggered collector polls at its safepoints (see
     /// `Realm::maybe_collect`). Reading it is a field load, so the check on the
@@ -330,7 +364,9 @@ impl<T> Heap<T> {
             free: Vec::new(),
             live: 0,
             compact_gen: COMPACT_GEN_BASE,
-            remembered: BTreeSet::new(),
+            free_top: 0,
+            young_floor: 0,
+            remembered: Vec::new(),
             allocs_since_gc: 0,
             poison: None,
         }
@@ -364,6 +400,18 @@ impl<T> Heap<T> {
     #[must_use]
     pub fn gc_verify_hits(&self) -> usize {
         self.poison.as_ref().map_or(0, |p| p.hits.get())
+    }
+
+    /// Records (in verification mode) a broken collector invariant found by
+    /// a check such as [`remembered_violation`](Heap::remembered_violation):
+    /// counted like a use of a collected handle, and fatal with
+    /// `KATAAN_GC_VERIFY=panic`.
+    #[cold]
+    pub fn report_gc_violation(&self, what: core::fmt::Arguments<'_>) {
+        if let Some(p) = &self.poison {
+            p.hits.set(p.hits.get() + 1);
+            assert!(!p.panic_on_hit, "kataan GC verify: {what}");
+        }
     }
 
     /// Whether GC-verification mode is on.
@@ -417,7 +465,9 @@ impl<T> Heap<T> {
     pub fn alloc(&mut self, value: T) -> Handle {
         self.live += 1;
         self.allocs_since_gc += 1;
-        if let Some(index) = self.free.pop() {
+        if self.free_top > 0 {
+            self.free_top -= 1;
+            let index = self.free[self.free_top];
             let slot = &mut self.slots[index as usize];
             // A freed slot already had its generation bumped; reuse it as-is.
             debug_assert!(!slot.is_live(), "free list pointed at a live slot");
@@ -477,21 +527,49 @@ impl<T> Heap<T> {
 
     /// Mutably borrows the value behind `handle`, with the same staleness check
     /// as [`get`](Heap::get).
+    ///
+    /// This is the generational **write barrier**: an old object borrowed
+    /// mutably enters the remembered set (once per collection cycle), since
+    /// the borrow may store a young reference into it.
+    #[inline]
     pub fn get_mut(&mut self, handle: Handle) -> Option<&mut T> {
         if self.poison.is_some() {
             self.note_poison_use(handle);
         }
-        self.slots
-            .get_mut(handle.index as usize)?
-            .get_mut(handle.generation)
+        self.peek_mut(handle)
     }
 
     /// The mutable counterpart of [`peek`](Heap::peek): exempt from the
     /// GC-verification poison check, for code driven by a heap enumeration.
+    /// Applies the write barrier as [`get_mut`](Heap::get_mut) does.
+    #[inline]
     pub fn peek_mut(&mut self, handle: Handle) -> Option<&mut T> {
-        self.slots
-            .get_mut(handle.index as usize)?
-            .get_mut(handle.generation)
+        let Self {
+            slots, remembered, ..
+        } = self;
+        let slot = slots.get_mut(handle.index as usize)?;
+        if slot.generation != handle.generation {
+            return None;
+        }
+        let value = slot.value.as_mut()?;
+        if slot.dirty == CLEAN && slot.age >= crate::gc::OLD_AGE {
+            slot.dirty = DIRTY;
+            remembered.push(handle.index);
+        }
+        Some(value)
+    }
+
+    /// Enters slot `index` into the remembered set if it holds an old object
+    /// that is not there yet (the barrier of [`peek_mut`](Heap::peek_mut)).
+    fn remember(&mut self, index: usize) {
+        if let Some(slot) = self.slots.get_mut(index)
+            && slot.is_live()
+            && slot.dirty == CLEAN
+            && slot.age >= crate::gc::OLD_AGE
+        {
+            slot.dirty = DIRTY;
+            self.remembered.push(index as u32);
+        }
     }
 
     /// Swaps the *values* held by two live handles, leaving each slot's identity
@@ -527,6 +605,10 @@ impl<T> Heap<T> {
         };
         if let (Some(va), Some(vb)) = (sa.get_mut(a.generation), sb.get_mut(b.generation)) {
             core::mem::swap(va, vb);
+            // Each slot now holds what the other did: both may point at young
+            // objects (or be interior-mutable) — the write barrier.
+            self.remember(i);
+            self.remember(j);
         }
     }
 
@@ -571,14 +653,30 @@ impl<T> Heap<T> {
     /// generation bump, retirement and free-list order, and GC-verification
     /// mode still only records the handle — but drops each doomed value where
     /// it lies instead of moving it out of the slot first.
-    pub fn sweep(&mut self, mut keep: impl FnMut(Handle, &T) -> bool) -> usize {
+    ///
+    /// The remembered set is rebuilt from scratch: a survivor for which
+    /// `sticky(value)` holds (interior mutability the write barrier cannot
+    /// see) enters it for good, every other one leaves it.
+    pub fn sweep(
+        &mut self,
+        mut keep: impl FnMut(Handle, &T) -> bool,
+        sticky: impl Fn(&T) -> bool,
+        release: impl Fn(T),
+    ) -> usize {
         let Self {
             slots,
             free,
+            free_top,
+            young_floor,
+            remembered,
             live,
             poison,
             ..
         } = self;
+        // Every slot is visited below, so the record of which ones were
+        // allocated since the last collection is not needed.
+        free.truncate(*free_top);
+        remembered.clear();
         let mut swept = 0;
         for (i, slot) in slots.iter_mut().enumerate() {
             let Some(value) = &slot.value else {
@@ -590,24 +688,201 @@ impl<T> Heap<T> {
             };
             if keep(h, value) {
                 slot.age = slot.age.saturating_add(1);
+                if sticky(value) {
+                    slot.dirty = STICKY;
+                    remembered.push(i as u32);
+                } else {
+                    slot.dirty = CLEAN;
+                }
                 continue;
             }
             swept += 1;
             if let Some(p) = poison {
                 p.freed.insert(h);
+                // Kept (unreachable) for the verification, as an old object:
+                // no later minor collection looks for it among the young.
+                slot.age = slot.age.max(crate::gc::OLD_AGE);
+                slot.dirty = CLEAN;
                 continue;
             }
             // See `free` for why a slot leaving the low generation range is
             // retired rather than reused.
             let next_gen = slot.generation.wrapping_add(1);
-            // Drops the old value in place.
-            slot.clear(next_gen);
+            if let Some(v) = slot.vacate(next_gen) {
+                release(v);
+            }
             if next_gen < COMPACT_GEN_BASE {
                 free.push(i as u32);
             }
             *live -= 1;
         }
+        *free_top = free.len();
+        *young_floor = slots.len();
         swept
+    }
+
+    /// Whether `handle` is a live object of the **young** generation
+    /// (allocated since the last collection).
+    #[must_use]
+    #[inline]
+    pub fn is_young(&self, handle: Handle) -> bool {
+        self.slots.get(handle.index as usize).is_some_and(|s| {
+            s.is_live() && s.generation == handle.generation && s.age < crate::gc::OLD_AGE
+        })
+    }
+
+    /// A minor collection's mark: promotes `handle`'s object to the old
+    /// generation if it is a live young one, returning whether it was (so
+    /// whether it still has to be traced). The age *is* the mark bit — every
+    /// young object the marking does not reach stays at age `0` and is freed
+    /// by [`sweep_young`](Heap::sweep_young).
+    #[inline]
+    pub fn promote_young(&mut self, handle: Handle) -> bool {
+        match self.slots.get_mut(handle.index as usize) {
+            Some(s)
+                if s.is_live()
+                    && s.generation == handle.generation
+                    && s.age < crate::gc::OLD_AGE =>
+            {
+                s.age = crate::gc::OLD_AGE;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Takes the remembered set's slot indices (for a minor collection to
+    /// scan); [`sweep_young`](Heap::sweep_young) settles each one's state.
+    pub fn take_remembered(&mut self) -> Vec<u32> {
+        core::mem::take(&mut self.remembered)
+    }
+
+    /// The handle of the live object in slot `index`, if any.
+    #[must_use]
+    pub fn live_handle_at(&self, index: u32) -> Option<Handle> {
+        let slot = self.slots.get(index as usize)?;
+        slot.is_live().then_some(Handle {
+            index,
+            generation: slot.generation,
+        })
+    }
+
+    /// The sweep of a **minor** collection: frees every young object the
+    /// marking left at age `0`, visiting only the slots allocated since the
+    /// last collection (the free-list entries consumed since, and the slots
+    /// pushed since), so its cost is the nursery's, not the heap's. Returns
+    /// the number freed.
+    ///
+    /// `rescanned` is what [`take_remembered`](Heap::take_remembered) handed
+    /// out: those slots leave the remembered set unless `sticky(value)` holds,
+    /// as do the surviving young objects for which it holds. Afterwards no
+    /// object is young, so no old-to-young edge exists.
+    pub fn sweep_young(
+        &mut self,
+        rescanned: Vec<u32>,
+        sticky: impl Fn(&T) -> bool,
+        release: impl Fn(T),
+    ) -> usize {
+        let Self {
+            slots,
+            free,
+            free_top,
+            young_floor,
+            remembered,
+            live,
+            poison,
+            ..
+        } = self;
+        for index in rescanned {
+            let slot = &mut slots[index as usize];
+            match &slot.value {
+                Some(value) if sticky(value) => {
+                    slot.dirty = STICKY;
+                    remembered.push(index);
+                }
+                _ => slot.dirty = CLEAN,
+            }
+        }
+        let floor = *young_floor;
+        let mut swept = 0;
+        let mut poison = poison.as_deref_mut();
+        // The free-list entries consumed since the last collection: each one
+        // freed again is written back over the consumed part, which never
+        // runs ahead of the reading.
+        let mut kept = *free_top;
+        for r in *free_top..free.len() {
+            let i = free[r];
+            let i_us = i as usize;
+            let slot = &mut slots[i_us];
+            let p = poison.as_deref_mut();
+            if settle_young(
+                slot, i_us, &sticky, &release, remembered, &mut swept, live, p,
+            ) {
+                free[kept] = i;
+                kept += 1;
+            }
+        }
+        free.truncate(kept);
+        // The slots pushed since.
+        for (i, slot) in slots.iter_mut().enumerate().skip(floor) {
+            let p = poison.as_deref_mut();
+            if settle_young(slot, i, &sticky, &release, remembered, &mut swept, live, p) {
+                free.push(i as u32);
+            }
+        }
+        *free_top = free.len();
+        *young_floor = slots.len();
+        swept
+    }
+
+    /// **GC verification** of the generational invariants, for a minor
+    /// collection about to run: every old object outside the remembered set
+    /// points at no young object (`edges(value, out)` pushes a value's
+    /// outgoing handles) nor is `sticky`, and every young object is one
+    /// [`sweep_young`](Heap::sweep_young) will visit. Returns the first
+    /// offending `(container, young target)` — the target equal to the
+    /// container for an untracked young object. Walks the whole heap.
+    pub fn remembered_violation(
+        &self,
+        mut edges: impl FnMut(&T, &mut Vec<Handle>),
+        sticky: impl Fn(&T) -> bool,
+    ) -> Option<(Handle, Handle)> {
+        let mut tracked = alloc::vec![false; self.slots.len()];
+        for &i in &self.free[self.free_top..] {
+            tracked[i as usize] = true;
+        }
+        for t in tracked.iter_mut().skip(self.young_floor) {
+            *t = true;
+        }
+        let mut out = Vec::new();
+        for (i, slot) in self.slots.iter().enumerate() {
+            let Some(value) = &slot.value else {
+                continue;
+            };
+            let h = Handle {
+                index: i as u32,
+                generation: slot.generation,
+            };
+            if slot.age < crate::gc::OLD_AGE {
+                if !tracked[i] {
+                    return Some((h, h));
+                }
+                continue;
+            }
+            if slot.dirty != CLEAN || self.poison.as_ref().is_some_and(|p| p.freed.contains(&h)) {
+                // Remembered, or collected (only kept for the verification).
+                continue;
+            }
+            if sticky(value) {
+                return Some((h, h));
+            }
+            out.clear();
+            edges(value, &mut out);
+            if let Some(&t) = out.iter().find(|&&t| self.is_young(t)) {
+                return Some((h, t));
+            }
+        }
+        None
     }
 
     /// The generational age of `handle`'s object (collections survived), or
@@ -618,20 +893,8 @@ impl<T> Heap<T> {
         (slot.is_live() && slot.generation == handle.generation).then_some(slot.age)
     }
 
-    /// Promotes `handle`'s object by one generation (saturating), marking it as
-    /// having survived another collection.
-    pub fn tenure(&mut self, handle: Handle) {
-        if let Some(slot) = self.slots.get_mut(handle.index as usize)
-            && slot.is_live()
-            && slot.generation == handle.generation
-        {
-            slot.age = slot.age.saturating_add(1);
-        }
-    }
-
     /// Handles to live objects whose age satisfies `keep` — e.g. the young
-    /// generation (`|a| a == 0`) for a minor collection, or the old generation
-    /// (`|a| a >= 1`) for the remembered root scan.
+    /// generation (`|a| a == 0`).
     #[must_use]
     pub fn handles_where(&self, keep: impl Fn(u8) -> bool) -> Vec<Handle> {
         self.slots
@@ -645,38 +908,27 @@ impl<T> Heap<T> {
             .collect()
     }
 
-    /// The **write barrier**: records `container` in the remembered set when an
-    /// old-generation `container` is made to point at a young-generation
-    /// `target` (an old→young edge a minor collection must treat as a root).
-    /// A no-op for young containers or old→old edges.
+    /// The explicit **write barrier**: enters `container` into the remembered
+    /// set when an old-generation `container` is made to point at a
+    /// young-generation `target` (an old→young edge a minor collection must
+    /// treat as a root). A no-op for young containers or old→old edges. (A
+    /// store through [`get_mut`](Heap::get_mut) needs no call: the borrow is
+    /// the barrier.)
     pub fn record_edge(&mut self, container: Handle, target: Handle, old_age: u8) {
         if self.age(container).is_some_and(|a| a >= old_age)
             && self.age(target).is_some_and(|a| a < old_age)
         {
-            self.remembered.insert(container.index);
+            self.remember(container.index as usize);
         }
     }
 
-    /// Handles to the remembered-set objects that are still live (the old→young
-    /// roots for a minor collection).
+    /// Handles to the remembered-set objects that are still live.
     #[must_use]
     pub fn remembered_roots(&self) -> Vec<Handle> {
         self.remembered
             .iter()
-            .filter_map(|&index| match self.slots.get(index as usize) {
-                Some(slot) if slot.is_live() => Some(Handle {
-                    index,
-                    generation: slot.generation,
-                }),
-                _ => None,
-            })
+            .filter_map(|&index| self.live_handle_at(index))
             .collect()
-    }
-
-    /// Clears the remembered set (after a collection re-establishes the
-    /// generation boundary).
-    pub fn clear_remembered(&mut self) {
-        self.remembered.clear();
     }
 
     /// Compacts the `keep` (live) objects to the front of the slot table,
@@ -721,6 +973,18 @@ impl<T> Heap<T> {
         }
         self.slots = new_slots;
         self.live = self.slots.len();
+        // Ages are kept, so a young survivor stays young: every slot is a
+        // candidate for the next minor collection's sweep (which skips the old
+        // ones), and every old one is remembered, which also settles the
+        // sticky ones there.
+        self.free_top = 0;
+        self.young_floor = 0;
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if slot.age >= crate::gc::OLD_AGE {
+                slot.dirty = DIRTY;
+                self.remembered.push(i as u32);
+            }
+        }
         map
     }
 
@@ -758,8 +1022,17 @@ impl<T> Heap<T> {
                 let value = slot.value.take().expect("a live slot holds a value");
                 slot.occupied = 0;
                 slot.generation = next_gen;
+                if slot.dirty != CLEAN {
+                    // Each remembered slot is listed exactly once, and only
+                    // while it is non-`CLEAN`.
+                    slot.dirty = CLEAN;
+                    self.remembered.retain(|&i| i != handle.index);
+                }
                 if !retire {
-                    self.free.push(handle.index);
+                    // Among the still-free entries: those past `free_top` are
+                    // the record of what was allocated since the collection.
+                    self.free.insert(self.free_top, handle.index);
+                    self.free_top += 1;
                 }
                 self.live -= 1;
                 Some(value)
@@ -767,6 +1040,50 @@ impl<T> Heap<T> {
             _ => None,
         }
     }
+}
+
+/// One young slot's fate in [`Heap::sweep_young`]: a promoted (marked)
+/// object stays — entering the remembered set if `sticky` — and an unmarked
+/// one is freed (or, in GC-verification mode, recorded and kept). Returns
+/// whether slot `i` goes back on the free list.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)] // the sweep's split borrows
+fn settle_young<T>(
+    slot: &mut Slot<T>,
+    i: usize,
+    sticky: &impl Fn(&T) -> bool,
+    release: &impl Fn(T),
+    remembered: &mut Vec<u32>,
+    swept: &mut usize,
+    live: &mut usize,
+    poison: Option<&mut PoisonState>,
+) -> bool {
+    let Some(value) = &slot.value else {
+        return false;
+    };
+    if slot.age >= crate::gc::OLD_AGE {
+        // Marked (promoted), or a slot listed twice.
+        if slot.dirty == CLEAN && sticky(value) {
+            slot.dirty = STICKY;
+            remembered.push(i as u32);
+        }
+        return false;
+    }
+    *swept += 1;
+    if let Some(p) = poison {
+        p.freed.insert(Handle {
+            index: i as u32,
+            generation: slot.generation,
+        });
+        slot.age = crate::gc::OLD_AGE;
+        return false;
+    }
+    *live -= 1;
+    let next_gen = slot.generation.wrapping_add(1);
+    if let Some(v) = slot.vacate(next_gen) {
+        release(v);
+    }
+    next_gen < COMPACT_GEN_BASE
 }
 
 #[cfg(test)]

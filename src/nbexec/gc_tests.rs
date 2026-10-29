@@ -348,3 +348,37 @@ fn a_suspended_vm_generator_frame_survives_collections_in_a_function() {
         "held"
     );
 }
+
+// --- generational collection: young objects stored into old containers ---
+
+#[test]
+fn young_objects_stored_into_old_containers_survive_minor_collections() {
+    // Every container is old (it survived the first collections) when a callee
+    // — whose registers are gone by the next safepoint — stores a fresh object
+    // into it, so only the write barrier keeps that object alive through the
+    // minor collections the churn triggers before it is read back.
+    assert_eq!(
+        run(&format!(
+            "var o = {{ x: null }}, a = [null], m = new Map(), s = new Set();
+             var box = null; function setBox(v) {{ box = v; }}
+             var p = new Promise(function () {{}}), pend = [];
+             var sym = Symbol('k'), fnObj = function () {{}};
+             {CHURN}
+             function put(r) {{
+               o.x = {{ r: r }}; a[0] = {{ r: r }}; m.set(r % 3, {{ r: r }});
+               s.add({{ r: r }}); setBox({{ r: r }}); o[sym] = {{ r: r }};
+               fnObj.extra = {{ r: r }}; pend.push(p.then(function () {{ return r; }}));
+             }}
+             var ok = true;
+             for (var r = 0; r < 20; r++) {{
+               put(r);
+               for (var j = 0; j < 40000; j++) {{ var t = {{ j: j }}; }}
+               ok = ok && o.x.r === r && a[0].r === r && m.get(r % 3).r === r
+                  && box.r === r && o[sym].r === r && fnObj.extra.r === r;
+             }}
+             var total = 0; s.forEach(function (v) {{ total += v.r; }});
+             ok && total === 190 && pend.length === 20"
+        )),
+        "true"
+    );
+}

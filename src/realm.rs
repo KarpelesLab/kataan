@@ -432,6 +432,17 @@ pub struct Realm {
     /// with `KATAAN_GC_VERIFY`), where the production threshold would leave most
     /// short tests never collecting at all.
     gc_threshold_pinned: Option<usize>,
+    /// Whether allocation-triggered collections are **generational** (a minor
+    /// collection of the young objects, and a full one only once the heap has
+    /// grown past `gc_major_limit`). On unless `KATAAN_GC_MINOR=0`.
+    gc_generational: bool,
+    /// The live-object count at which the next allocation-triggered collection
+    /// is a full one: `max(GC_MIN_THRESHOLD, live * GC_GROWTH)` past the live
+    /// set the last full collection left.
+    gc_major_limit: usize,
+    /// Allocation-triggered collections run so far (a pinned threshold makes
+    /// every fourth one full, so stress runs exercise both kinds).
+    gc_cycles: u32,
 }
 
 /// The remaining handle-keyed side tables [`Realm::ephemeron_prune`] must sweep,
@@ -456,6 +467,12 @@ const GC_MIN_THRESHOLD: usize = 65_536;
 /// The heap-growth factor: after a cycle, allow the live set to grow by this
 /// multiple before collecting again.
 const GC_GROWTH: usize = 2;
+
+/// The **nursery** size of the generational collector: a minor collection
+/// runs once per this many allocations. Small enough that the young objects
+/// (and the free slots they reuse) stay in cache between collections; a minor
+/// collection's cost is the survivors plus the remembered set, not the heap.
+const GC_NURSERY: usize = 16_384;
 
 /// The mutable state behind the Annex B.2.5 RegExp legacy static accessors
 /// (`RegExp.input`/`$_`, `RegExp.lastMatch`/`$&`, `RegExp.lastParen`/`$+`,
@@ -647,6 +664,11 @@ impl Realm {
             .and_then(|v| v.parse().ok());
         #[cfg(not(feature = "std"))]
         let pinned: Option<usize> = None;
+        // `KATAAN_GC_MINOR=0` makes every collection a full one.
+        #[cfg(feature = "std")]
+        let generational = std::env::var("KATAAN_GC_MINOR").map_or(true, |v| v != "0");
+        #[cfg(not(feature = "std"))]
+        let generational = true;
         Self {
             interrupt: None,
             agents_active: false,
@@ -716,8 +738,15 @@ impl Realm {
             host_native_state: alloc::collections::BTreeMap::new(),
             legacy_regexp: LegacyRegExpState::default(),
             limits,
-            gc_threshold: pinned.unwrap_or(GC_MIN_THRESHOLD),
+            gc_threshold: pinned.unwrap_or(if generational {
+                GC_NURSERY
+            } else {
+                GC_MIN_THRESHOLD
+            }),
             gc_threshold_pinned: pinned,
+            gc_generational: generational,
+            gc_major_limit: GC_MIN_THRESHOLD,
+            gc_cycles: 0,
         }
     }
 
@@ -5846,10 +5875,9 @@ impl Realm {
     /// All value handles held by the realm's value-reachable-only side-tables —
     /// auxiliary property objects (`aux_props`), lazily-created function
     /// prototypes/constructors (`fn_protos`/`fn_ctor`), and interned symbol objects
-    /// (`symbols_by_id`). These are reachable only through the tables, so a minor
-    /// collection (which does **not** prune the weak-key tables — see
-    /// [`collect`](Self::collect)) treats every value as a root to avoid freeing
-    /// state the tables still point at.
+    /// (`symbols_by_id`). These are reachable only through the tables, so the
+    /// moving collector ([`compact`](Self::compact)), which re-marks from
+    /// scratch after pruning, treats every remaining value as a root.
     fn gc_side_table_values(&self) -> alloc::vec::Vec<Handle> {
         let mut r = alloc::vec::Vec::new();
         r.extend(self.aux_props.values().copied());
@@ -5928,8 +5956,8 @@ impl Realm {
         // `symbols_by_id`. Those are weak-key (ephemeron) tables that
         // [`collect`](Self::collect) expands and prunes itself; strong-rooting
         // their values would pin one closure per function id (and every symbol
-        // ever minted) forever. The minor path, which cannot prune, still roots
-        // them via [`gc_side_table_values`](Self::gc_side_table_values).
+        // ever minted) forever. A minor collection expands and prunes them the
+        // same way, with every old key presumed alive.
     }
 
     /// Objects allocated since the last collection — the input to the
@@ -5969,21 +5997,44 @@ impl Realm {
     pub fn maybe_collect_with(
         &mut self,
         roots: &[Handle],
-        extern_expand: &mut dyn FnMut(&gc::MarkSet, &mut Vec<Handle>),
-        extern_prune: &mut dyn FnMut(&gc::MarkSet),
+        extern_expand: &mut dyn FnMut(&dyn gc::LiveSet, &mut Vec<Handle>),
+        extern_prune: &mut dyn FnMut(&dyn gc::LiveSet),
     ) -> Option<Stats> {
         if self.heap.allocs_since_gc() < self.gc_threshold {
             return None;
         }
         let mut all: Vec<Handle> = roots.to_vec();
         self.gc_roots(&mut all);
-        let stats = self.collect_with(&all, extern_expand, extern_prune);
+        let pinned = self.gc_threshold_pinned;
+        // A full collection once the heap has outgrown the last full one's
+        // live set (old objects that died are reclaimed only then), and
+        // whenever an incremental marking cycle is in flight.
+        let major = !self.gc_generational
+            || self.incremental.is_some()
+            || self.heap.len() >= self.gc_major_limit
+            || (pinned.is_some() && self.gc_cycles % 4 == 3);
+        self.gc_cycles = self.gc_cycles.wrapping_add(1);
+        let stats = if major {
+            self.collect_with(&all, extern_expand, extern_prune)
+        } else {
+            self.collect_minor_with(&all, extern_expand, extern_prune)
+        };
         self.heap.reset_alloc_pressure();
-        self.gc_threshold = self.gc_threshold_pinned.unwrap_or_else(|| {
-            // Scaled by the live set's tracing weight, not just its object
-            // count: the next cycle re-traces all of it.
+        // Scaled by the live set's tracing weight, not just its object count:
+        // the next full cycle re-traces all of it.
+        let grown = || {
             let live = self.heap.len().max(stats.weight);
             GC_MIN_THRESHOLD.max(live.saturating_mul(GC_GROWTH))
+        };
+        if major {
+            self.gc_major_limit = self.heap.len().saturating_add(grown());
+        }
+        self.gc_threshold = pinned.unwrap_or_else(|| {
+            if self.gc_generational {
+                GC_NURSERY
+            } else {
+                grown()
+            }
         });
         Some(stats)
     }
@@ -6062,7 +6113,7 @@ impl Realm {
     /// Never pushes keys, so a dead key stays collectable.
     #[allow(clippy::too_many_arguments)] // one ref per side-table, to fit split borrows
     fn ephemeron_expand(
-        marked: &gc::MarkSet,
+        marked: &dyn gc::LiveSet,
         aux_props: &handle_map::HandleKeyedMap<Handle>,
         fn_protos: &alloc::collections::BTreeMap<u32, Handle>,
         fn_ctor: &alloc::collections::BTreeMap<u32, Handle>,
@@ -6119,7 +6170,7 @@ impl Realm {
     /// is already marked.
     #[allow(clippy::too_many_arguments)] // one ref per side-table, to fit split borrows
     fn ephemeron_prune(
-        marked: &gc::MarkSet,
+        marked: &dyn gc::LiveSet,
         key_collectable: &dyn Fn(Handle) -> bool,
         aux_props: &mut handle_map::HandleKeyedMap<Handle>,
         fn_protos: &mut alloc::collections::BTreeMap<u32, Handle>,
@@ -6210,8 +6261,8 @@ impl Realm {
     pub fn collect_with(
         &mut self,
         roots: &[Handle],
-        extern_expand: &mut dyn FnMut(&gc::MarkSet, &mut Vec<Handle>),
-        extern_prune: &mut dyn FnMut(&gc::MarkSet),
+        extern_expand: &mut dyn FnMut(&dyn gc::LiveSet, &mut Vec<Handle>),
+        extern_prune: &mut dyn FnMut(&dyn gc::LiveSet),
     ) -> Stats {
         let Self {
             heap,
@@ -6272,18 +6323,104 @@ impl Realm {
     }
 
     /// Runs a **minor** (generational) collection — reclaims only short-lived
-    /// objects in the young generation, treating the old generation as roots.
-    /// Cheap when most allocation is short-lived. Returns the statistics.
-    ///
-    /// A minor cycle scans only the young generation, so an old-generation
-    /// side-table key being unmarked does **not** mean it is dead. To stay sound
-    /// the minor path does not prune the weak-key tables (full
-    /// [`collect`](Self::collect) reclaims dead entries); it simply roots every
-    /// side-table value so nothing the tables point at is freed mid-cycle.
+    /// objects in the young generation (allocated since the last collection),
+    /// presuming every old one alive (see [`gc::collect_minor_with`]). Cheap
+    /// when most allocation is short-lived. Returns the statistics.
     pub fn collect_minor(&mut self, roots: &[Handle]) -> Stats {
-        let mut all = roots.to_vec();
-        all.extend(self.gc_side_table_values());
-        gc::collect_minor(&mut self.heap, &all)
+        self.collect_minor_with(roots, &mut |_, _| {}, &mut |_| {})
+    }
+
+    /// [`collect_minor`](Self::collect_minor) with the weak-key hooks of
+    /// [`collect_with`](Self::collect_with), which see a [`gc::MinorLive`]:
+    /// every old object counts as alive. The realm's own weak-key tables are
+    /// expanded and pruned the same way, so a young key that died takes its
+    /// entry with it and an old one keeps its value.
+    ///
+    /// Under `KATAAN_GC_VERIFY` the generational invariant is checked first
+    /// (a whole-heap walk): every old object outside the remembered set
+    /// references no young one.
+    pub fn collect_minor_with(
+        &mut self,
+        roots: &[Handle],
+        extern_expand: &mut dyn FnMut(&dyn gc::LiveSet, &mut Vec<Handle>),
+        extern_prune: &mut dyn FnMut(&dyn gc::LiveSet),
+    ) -> Stats {
+        let Self {
+            heap,
+            aux_props,
+            fn_protos,
+            fn_ctor,
+            symbols_by_id,
+            frozen_arrays,
+            sealed_arrays,
+            non_extensible_arrays,
+            host_native_state,
+            fn_source,
+            length_tracking_views,
+            nonwritable_array_lengths,
+            sparse_array_lengths,
+            native_protos,
+            callable_null_protos,
+            native_class_tags,
+            ..
+        } = self;
+        if heap.gc_verify()
+            && let Some((container, target)) = gc::remembered_violation(heap, |cell, out| {
+                Self::symbol_key_edges(symbols_by_id, cell, out);
+            })
+        {
+            let kind = |h: Handle| match heap.peek(h) {
+                Some(Cell::Object(_)) => "object",
+                Some(Cell::Array(_)) => "array",
+                Some(Cell::Box(_)) => "binding box",
+                Some(Cell::VmFunction { .. }) => "closure",
+                Some(Cell::Env(_)) => "environment",
+                Some(Cell::Collection { .. }) => "collection",
+                Some(Cell::Promise(_)) => "promise",
+                Some(_) => "cell",
+                None => "free slot",
+            };
+            heap.report_gc_violation(format_args!(
+                "old {} {container:?} references young {} {target:?} outside the remembered set",
+                kind(container),
+                kind(target)
+            ));
+        }
+        let mark = gc::mark_minor(
+            heap,
+            roots,
+            |cell, out| Self::symbol_key_edges(symbols_by_id, cell, out),
+            |_, live, extra| {
+                Self::ephemeron_expand(live, aux_props, fn_protos, fn_ctor, extra);
+                extern_expand(live, extra);
+            },
+        );
+        {
+            let live = gc::MinorLive(heap);
+            extern_prune(&live);
+            Self::ephemeron_prune(
+                &live,
+                &|_| true,
+                aux_props,
+                fn_protos,
+                fn_ctor,
+                symbols_by_id,
+                frozen_arrays,
+                sealed_arrays,
+                non_extensible_arrays,
+                host_native_state,
+                PruneTables {
+                    fn_source,
+                    length_tracking_views,
+                    nonwritable_array_lengths,
+                    sparse_array_lengths,
+                    native_protos,
+                    callable_null_protos,
+                    native_class_tags,
+                },
+            );
+        }
+        gc::sweep_minor(heap, mark)
     }
 
     /// Test-only: the live entry counts of the value-reachable side-tables, used
