@@ -710,6 +710,31 @@ fn compact_wants_reround(opts: &intl::number::NumberFormatOptions) -> bool {
         && opts.maximum_significant_digits.is_none()
 }
 
+/// The code point of the zero of the decimal-digit run `c` belongs to (an ASCII
+/// digit, or a native digit of a numbering system this engine knows).
+#[cfg(feature = "intl")]
+fn native_digit_zero(c: char) -> Option<u32> {
+    if c.is_ascii_digit() {
+        return Some(0x30);
+    }
+    (0..10u32).find_map(|k| {
+        let z = (c as u32).checked_sub(k)?;
+        numbering_system_name_from_zero(char::from_u32(z)?).map(|_| z)
+    })
+}
+
+/// The value a default compact-notation number whose mantissa rounded up to a
+/// new power of ten (`999999` → `1000K`) is re-rendered from: the next power of
+/// ten, with its sign (`1000000` → `1M`).
+#[cfg(feature = "intl")]
+fn compact_rollover_value(n: f64) -> f64 {
+    let mut p = 1.0f64;
+    while p <= n.abs() {
+        p *= 10.0;
+    }
+    if n < 0.0 { -p } else { p }
+}
+
 /// Re-round the mantissa of a default compact-notation result to the ECMA-402
 /// default precision. The crate renders the compact mantissa with a single
 /// fraction digit (`987654321` → `987.7M`); the spec applies
@@ -717,24 +742,26 @@ fn compact_wants_reround(opts: &intl::number::NumberFormatOptions) -> bool {
 /// `maximumSignificantDigits: 2`, which for a mantissa whose most-significant
 /// digit sits at decimal exponent `e` keeps `max(0, 1 - e)` fraction digits
 /// (`987.65…M` → `988M`, `9.87…K` → `9.9K`, `0.159` → `0.16`). Operates on the
-/// crate's tagged `(kind, value)` parts (latn digits, before numbering-system
-/// substitution): rewrites the leading `integer`/`decimal`/`fraction` run in
+/// crate's tagged `(kind, value)` parts (ASCII or a locale's native digits):
+/// rewrites the leading `integer`/`decimal`/`fraction` run in
 /// place, leaving the sign and compact-suffix parts untouched. Grouped mantissae
 /// (a `group` part right after the integer) are left alone — compact mantissae are
-/// always < 1000 there, so no re-rounding is needed.
+/// always < 1000 there, so no re-rounding is needed. Returns whether the
+/// mantissa rounded up to a new power of ten (`999.96K` → `1000K`), which the
+/// caller must re-render at the next magnitude (see [`compact_rollover_value`]).
 #[cfg(feature = "intl")]
 fn compact_reround_parts(
     parts: &mut alloc::vec::Vec<(&'static str, String)>,
     mode: intl::number::RoundingMode,
-) {
+) -> bool {
     let Some(int_idx) = parts.iter().position(|(k, _)| *k == "integer") else {
-        return;
+        return false;
     };
     // Skip a grouped integer core (a `group` immediately after the integer): the
     // digits span several parts, but such a mantissa is >= 1000 with no fraction,
     // so `max(0, 1 - e)` is already 0 and nothing needs re-rounding.
     if parts.get(int_idx + 1).map(|(k, _)| *k) == Some("group") {
-        return;
+        return false;
     }
     let neg = parts.iter().any(|(k, _)| *k == "minusSign");
     let int_str = parts[int_idx].1.clone();
@@ -749,12 +776,31 @@ fn compact_reround_parts(
         (None, None)
     };
     let frac_str = frac_idx.map(|i| parts[i].1.clone()).unwrap_or_default();
-    // Only re-round plain latn digits (kataan substitutes the numbering system
-    // afterwards); bail on anything unexpected.
-    if !int_str.bytes().all(|b| b.is_ascii_digit()) || !frac_str.bytes().all(|b| b.is_ascii_digit())
-    {
-        return;
-    }
+    // The mantissa's digits may already be a locale's native ones (`ar-EG`
+    // formats with `arab` digits): decode through the numbering system's zero
+    // and re-encode with it. Bail on anything unexpected.
+    let Some(zero) = int_str.chars().next().and_then(native_digit_zero) else {
+        return false;
+    };
+    let decode = |s: &str| -> Option<String> {
+        s.chars()
+            .map(|c| {
+                let d = (c as u32).checked_sub(zero).filter(|d| *d < 10)?;
+                Some((b'0' + d as u8) as char)
+            })
+            .collect()
+    };
+    let (Some(int_str), Some(frac_str)) = (decode(&int_str), decode(&frac_str)) else {
+        return false;
+    };
+    let encode = |s: String| -> String {
+        if zero == 0x30 {
+            return s;
+        }
+        s.bytes()
+            .filter_map(|b| char::from_u32(zero + u32::from(b - b'0')))
+            .collect()
+    };
     // Decimal exponent `e` of the mantissa's most-significant digit.
     let int_stripped = int_str.trim_start_matches('0');
     let e: i32 = if !int_stripped.is_empty() {
@@ -782,8 +828,11 @@ fn compact_reround_parts(
     while int_d.len() > 1 && int_d[0] == 0 {
         int_d.remove(0);
     }
-    let new_int: String = int_d.iter().map(|d| (b'0' + d) as char).collect();
-    let new_frac: String = frac_d.iter().map(|d| (b'0' + d) as char).collect();
+    // `999.96K` rounds to `1000K`: the mantissa reached the next power of ten,
+    // which the caller re-renders at the next compact magnitude (`1M`).
+    let rolled = int_d.len() > int_str.len() && frac_d.is_empty();
+    let new_int: String = encode(int_d.iter().map(|d| (b'0' + d) as char).collect());
+    let new_frac: String = encode(frac_d.iter().map(|d| (b'0' + d) as char).collect());
     let dec_sep = dec_idx.map(|i| parts[i].1.clone());
     // Remove the old fraction then decimal (descending index keeps `int_idx` valid).
     if let Some(fi) = frac_idx {
@@ -798,6 +847,7 @@ fn compact_reround_parts(
         parts.insert(int_idx + 1, ("decimal", sep));
         parts.insert(int_idx + 2, ("fraction", new_frac));
     }
+    rolled
 }
 
 /// Split the separator whitespace off each `compact` part into its own `literal`
@@ -3905,9 +3955,23 @@ impl Interp {
                 this.realm
                     .set_property(out, "maximumFractionDigits", NanBox::number(mxfd));
             };
+            // Compact notation with no digit option at all takes the
+            // SetNumberFormatDigitOptions default "morePrecision" rounding over
+            // fraction digits 0..0 and significant digits 1..2, which
+            // resolvedOptions reports (with `roundingPriority: "morePrecision"`).
+            let compact_default = notation == "compact"
+                && !has_sig
+                && mnfd_opt.is_none()
+                && mxfd_opt.is_none()
+                && priority == "auto";
+            let priority = if compact_default {
+                String::from("morePrecision")
+            } else {
+                priority
+            };
             let report_sig = |this: &mut Self, out: Handle| {
                 let mnsd = mnsd.unwrap_or(1.0);
-                let mxsd = mxsd.unwrap_or(21.0);
+                let mxsd = mxsd.unwrap_or(if compact_default { 2.0 } else { 21.0 });
                 this.realm
                     .set_property(out, "minimumSignificantDigits", NanBox::number(mnsd));
                 this.realm
@@ -8144,12 +8208,17 @@ impl Interp {
         if n.is_finite() && compact_wants_reround(&opts) {
             let mut o = opts;
             o.maximum_fraction_digits = Some(6);
-            let mut parts: Vec<(&'static str, String)> =
-                intl::number::format_to_parts(&locale, n, &o)
+            let render = |v: f64| -> Vec<(&'static str, String)> {
+                intl::number::format_to_parts(&locale, v, &o)
                     .into_iter()
                     .map(|p| (p.kind.as_str(), p.value))
-                    .collect();
-            compact_reround_parts(&mut parts, opts.rounding_mode);
+                    .collect()
+            };
+            let mut parts = render(n);
+            if compact_reround_parts(&mut parts, opts.rounding_mode) {
+                parts = render(compact_rollover_value(n));
+                compact_reround_parts(&mut parts, opts.rounding_mode);
+            }
             // Return latn digits; the caller (`intl_format_number`) applies the
             // numbering system.
             return parts.into_iter().map(|(_, v)| v).collect();
@@ -9138,12 +9207,15 @@ impl Interp {
         if reround {
             opts.maximum_fraction_digits = Some(6);
         }
-        let mut parts: Vec<(&'static str, String)> =
-            intl::number::format_to_parts(&locale, feed, &opts)
+        let render = |v: f64| -> Vec<(&'static str, String)> {
+            intl::number::format_to_parts(&locale, v, &opts)
                 .into_iter()
                 .map(|p| (p.kind.as_str(), p.value))
-                .collect();
-        if reround {
+                .collect()
+        };
+        let mut parts = render(feed);
+        if reround && compact_reround_parts(&mut parts, opts.rounding_mode) {
+            parts = render(compact_rollover_value(feed));
             compact_reround_parts(&mut parts, opts.rounding_mode);
         }
         // Compact suffixes carry a separator space fused into the `compact`

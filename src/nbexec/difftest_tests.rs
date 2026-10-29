@@ -843,3 +843,31 @@ fn date_parse_reads_offsets_and_human_forms() {
          2503440000000,2377209600000,2366928000000,946764000000,946684800000,-620784000000,NaN,NaN"
     );
 }
+
+/// Default compact notation rounds to two significant digits whatever the
+/// numbering system (a locale formatting with native digits, `ar-EG`, kept the
+/// crate's full mantissa), carries a mantissa that rounds up to a new power of
+/// ten to the next magnitude (`999999` is `1M`, not `1000K`), and reports its
+/// `morePrecision` rounding in resolvedOptions.
+#[cfg(feature = "intl")]
+#[test]
+fn intl_compact_rounding_is_numbering_system_independent() {
+    let src = r#"
+        var en = new Intl.NumberFormat("en", { notation: "compact" });
+        var ar = new Intl.NumberFormat("ar-EG", { notation: "compact" });
+        var arab = new Intl.NumberFormat("en-u-nu-arab", { notation: "compact" });
+        var o = en.resolvedOptions();
+        [en.format(1234567), en.format(999999), en.format(-999999), en.format(999.96),
+         /^\u0661\u066b\u0662[^\u0660-\u0669]+$/.test(ar.format(1234567)),
+         arab.format(12345) === "\u0661\u0662K", arab.format(999999) === "\u0661M",
+         en.formatToParts(999999).map(function (p) { return p.type + ":" + p.value; }).join(" "),
+         o.roundingPriority, o.minimumSignificantDigits, o.maximumSignificantDigits,
+         o.minimumFractionDigits, o.maximumFractionDigits,
+         new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).resolvedOptions().roundingPriority
+        ].join()
+    "#;
+    assert_eq!(
+        run(src),
+        "1.2M,1M,-1M,1K,true,true,true,integer:1 compact:M,morePrecision,1,2,0,0,auto"
+    );
+}
