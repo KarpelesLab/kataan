@@ -2212,26 +2212,27 @@ impl Interp {
     /// becomes a rejection of the `fromAsync` promise.
     pub(crate) fn fa_resume(&mut self, s: Handle, incoming: NanBox, rejected: bool) {
         let stage = self.fa_num(s, FA_STAGE);
+        // The awaited `return()` of a close settled, either way: the original
+        // abrupt completion wins.
+        if stage == FA_STAGE_CLOSE {
+            let err = self.fa(s, FA_ERR);
+            self.fa_reject(s, err);
+            return;
+        }
         if rejected {
-            // A rejected `Await` closes the iterator at the two points where the
-            // spec does: a value rejection is AsyncFromSyncIterator's
-            // `closeOnRejection` (so the underlying sync iterator's `finally` still
-            // runs), and a rejected `mapfn` result is AsyncIteratorClose. A `next()`
-            // that rejects has already ended the iteration, and is not closed.
-            if let Some(ih) = self.fa(s, FA_ITER).as_handle().map(Handle::from_raw) {
-                let is_async = self.realm.truthy(self.fa(s, FA_ASYNC));
-                match stage {
-                    FA_STAGE_VALUE => self.close_from_async_iter(ih, false),
-                    FA_STAGE_MAPPED => self.close_from_async_iter(ih, is_async),
-                    _ => {}
-                }
+            // A rejected `mapfn` result is AsyncIteratorClose. A `next()` that
+            // rejects has already ended the iteration, and is not closed (a
+            // sync iterator's rejected value was closed by the async-from-sync
+            // wrapper's `closeOnRejection`).
+            if stage == FA_STAGE_MAPPED {
+                self.fa_close_then_reject(s, incoming);
+            } else {
+                self.fa_reject(s, incoming);
             }
-            self.fa_reject(s, incoming);
             return;
         }
         let r = match stage {
             FA_STAGE_NEXT_RESULT => self.fa_after_next(s, incoming),
-            FA_STAGE_VALUE => self.fa_after_value(s, incoming),
             FA_STAGE_MAPPED => self.fa_place(s, incoming),
             FA_STAGE_LIKE_VALUE => self.fa_like_after_value(s, incoming),
             _ => self.fa_like_place(s, incoming),
@@ -2241,8 +2242,9 @@ impl Interp {
         }
     }
 
-    /// `IteratorStep`: call `next()`, and for a genuine async iterator await the
-    /// promise of the result record before its `done`/`value` are read.
+    /// `IteratorStep`: call `next()` — a sync iterator's through
+    /// %AsyncFromSyncIteratorPrototype%.next — and await the promise of the
+    /// result record before its `done`/`value` are read.
     fn fa_iter_step(&mut self, s: Handle) -> Result<(), ExecError> {
         let k = self.fa_num(s, FA_K);
         if k > GEN_CAP as f64 {
@@ -2254,16 +2256,18 @@ impl Interp {
         }
         let iter = self.fa(s, FA_ITER);
         let next_fn = self.fa(s, FA_NEXT);
-        let res = self.call_with_this(next_fn, iter, &[])?;
-        if self.realm.truthy(self.fa(s, FA_ASYNC)) {
-            self.fa_await(s, res, FA_STAGE_NEXT_RESULT);
-            return Ok(());
-        }
-        self.fa_after_next(s, res)
+        let res = if self.realm.truthy(self.fa(s, FA_ASYNC)) {
+            self.call_with_this(next_fn, iter, &[])?
+        } else {
+            let ih = Handle::from_raw(iter.as_handle().expect("an iterator object"));
+            NanBox::handle(self.async_from_sync_next_pub(ih, next_fn)?.to_raw())
+        };
+        self.fa_await(s, res, FA_STAGE_NEXT_RESULT);
+        Ok(())
     }
 
-    /// The iterator result record is in hand: stop on `done`, else take its value
-    /// (awaiting it when the iterator is a sync one wrapped as async-from-sync).
+    /// The iterator result record is in hand: stop on `done`, else take its
+    /// value (already awaited by the async-from-sync wrapper for a sync one).
     fn fa_after_next(&mut self, s: Handle, res: NanBox) -> Result<(), ExecError> {
         if !self.is_object_value(res) {
             return Err(self.type_error("iterator result is not an object"));
@@ -2274,11 +2278,7 @@ impl Interp {
             return self.fa_finish(s, self.fa_num(s, FA_K));
         }
         let value = self.read_member(rh, "value")?;
-        if self.realm.truthy(self.fa(s, FA_ASYNC)) {
-            return self.fa_after_value(s, value);
-        }
-        self.fa_await(s, value, FA_STAGE_VALUE);
-        Ok(())
+        self.fa_after_value(s, value)
     }
 
     /// The element value is in hand: apply `mapfn` (awaiting its result) or place
@@ -2297,13 +2297,11 @@ impl Interp {
                 self.fa_await(s, m, FA_STAGE_MAPPED);
                 Ok(())
             }
-            Err(e) => {
-                if let Some(ih) = self.fa(s, FA_ITER).as_handle().map(Handle::from_raw) {
-                    let is_async = self.realm.truthy(self.fa(s, FA_ASYNC));
-                    self.close_from_async_iter(ih, is_async);
-                }
-                Err(e)
+            Err(ExecError::Throw(e)) => {
+                self.fa_close_then_reject(s, e);
+                Ok(())
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -2311,12 +2309,13 @@ impl Interp {
     fn fa_place(&mut self, s: Handle, value: NanBox) -> Result<(), ExecError> {
         let k = self.fa_num(s, FA_K);
         let a = Handle::from_raw(self.fa(s, FA_A).as_handle().expect("result object"));
-        if let Err(e) = self.create_data_property_or_throw(a, k as usize, value) {
-            if let Some(ih) = self.fa(s, FA_ITER).as_handle().map(Handle::from_raw) {
-                let is_async = self.realm.truthy(self.fa(s, FA_ASYNC));
-                self.close_from_async_iter(ih, is_async);
+        match self.create_data_property_or_throw(a, k as usize, value) {
+            Ok(_) => {}
+            Err(ExecError::Throw(e)) => {
+                self.fa_close_then_reject(s, e);
+                return Ok(());
             }
-            return Err(e);
+            Err(e) => return Err(e),
         }
         self.realm.set_element(s, FA_K, NanBox::number(k + 1.0));
         self.fa_iter_step(s)
@@ -2380,10 +2379,43 @@ impl Interp {
         r
     }
 
-    /// Closes an `Array.fromAsync` iterator on an abrupt completion (a throwing
-    /// mapFn or a failed element define): invokes `return()` and, for an async
-    /// iterator, awaits the returned promise. Any error from the close is
-    /// discarded — the original completion takes precedence.
+    /// AsyncIteratorClose of an `Array.fromAsync` iterator under the throw
+    /// `err` (a throwing or rejected mapFn, a failed element define), then the
+    /// rejection with `err`: `return()` — a sync iterator's through
+    /// %AsyncFromSyncIteratorPrototype%.return — is called and its result
+    /// awaited first (stage [`FA_STAGE_CLOSE`]). Any error from the close is
+    /// discarded; the original completion takes precedence. The array-like path
+    /// has no iterator and rejects at once.
+    fn fa_close_then_reject(&mut self, s: Handle, err: NanBox) {
+        let Some(ih) = self.fa(s, FA_ITER).as_handle().map(Handle::from_raw) else {
+            self.fa_reject(s, err);
+            return;
+        };
+        let pending = if self.realm.truthy(self.fa(s, FA_ASYNC)) {
+            match self.read_member(ih, "return") {
+                Ok(ret) if !ret.is_undefined() && !ret.is_null() => self
+                    .call_with_this(ret, NanBox::handle(ih.to_raw()), &[])
+                    .ok(),
+                _ => None,
+            }
+        } else {
+            self.async_from_sync_resume(ih, false, None)
+                .ok()
+                .map(|p| NanBox::handle(p.to_raw()))
+        };
+        match pending {
+            Some(r) => {
+                self.realm.set_element(s, FA_ERR, err);
+                self.fa_await(s, r, FA_STAGE_CLOSE);
+            }
+            None => self.fa_reject(s, err),
+        }
+    }
+
+    /// Closes an `Array.fromAsync` iterator that ran past its cap: invokes
+    /// `return()` and, for an async iterator, awaits the returned promise. Any
+    /// error from the close is discarded — the original completion takes
+    /// precedence.
     fn close_from_async_iter(&mut self, ih: Handle, is_async: bool) {
         let Ok(ret) = self.read_member(ih, "return") else {
             return;

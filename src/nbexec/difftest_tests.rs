@@ -712,6 +712,39 @@ fn queue_microtask_checks_and_calls_bare() {
     assert_eq!(out(src), "TypeError\nargs 0\n");
 }
 
+/// `Array.fromAsync` over a sync iterable steps it through the
+/// async-from-sync wrapper: each `next` resolves its value, then is awaited,
+/// so the result settles on the spec's tick (it finished synchronously for
+/// an empty array, a tick early per element otherwise).
+#[test]
+fn array_from_async_over_sync_iterables_keeps_spec_ticks() {
+    let src = r#"
+        function ticks(tag, n) { var i = 0; (function f() { if (i < n) { console.log(tag + i++); Promise.resolve().then(f); } })(); }
+        ticks('a', 5); Array.fromAsync([]).then(v => console.log('A', v.length));
+        Promise.resolve().then(() => 0).then(() => 0).then(() => 0).then(() => 0).then(() => 0).then(() => {
+            ticks('b', 7); Array.fromAsync([1, Promise.resolve(2)]).then(v => console.log('B', v.join()));
+        });
+    "#;
+    assert_eq!(
+        out(src),
+        "a0\na1\na2\na3\nA 0\na4\nb0\nb1\nb2\nb3\nb4\nb5\nb6\nB 1,2\n"
+    );
+}
+
+/// When `Array.fromAsync`'s `mapfn` throws, AsyncIteratorClose awaits the
+/// iterator's `return()` (a sync iterator's through the async-from-sync
+/// wrapper) before the rejection; it used to close synchronously and reject at
+/// once.
+#[test]
+fn array_from_async_close_awaits_return_before_rejecting() {
+    let src = r#"
+        function ticks(n) { var i = 0; (function f() { if (i < n) { console.log('t' + i++); Promise.resolve().then(f); } })(); }
+        var it = { i: 0, [Symbol.iterator]() { return this; }, next() { return { value: this.i++, done: false }; }, return() { console.log('return'); return {}; } };
+        ticks(8); Array.fromAsync(it, x => { if (x === 1) throw 'mf'; return x; }).catch(e => console.log('c', e));
+    "#;
+    assert_eq!(out(src), "t0\nt1\nt2\nt3\nt4\nt5\nreturn\nt6\nt7\nc mf\n");
+}
+
 /// A dynamic `import()` resolves its promise with the namespace (so a module
 /// exporting `then` is adopted as a thenable), it does not fulfil with it.
 #[cfg(all(feature = "module", feature = "std"))]

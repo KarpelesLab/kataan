@@ -2484,13 +2484,17 @@ const FA_STAGE: usize = 8;
 const FA_SRC: usize = 9;
 /// `len` for the array-like path.
 const FA_LEN: usize = 10;
+/// The abrupt completion's value a close is awaiting `return()` before it
+/// rejects with (stage [`FA_STAGE_CLOSE`]).
+const FA_ERR: usize = 11;
 /// The number of slots in the state array.
-const FA_SLOTS: usize = 11;
+const FA_SLOTS: usize = 12;
 
 /// Suspended awaiting the promise a genuine async iterator's `next()` returned.
 const FA_STAGE_NEXT_RESULT: f64 = 0.0;
-/// Suspended awaiting a yielded value (the async-from-sync wrapping).
-const FA_STAGE_VALUE: f64 = 1.0;
+/// Suspended awaiting the iterator's `return()` while closing it under an
+/// abrupt completion (rejects with [`FA_ERR`] when it settles).
+const FA_STAGE_CLOSE: f64 = 1.0;
 /// Suspended awaiting `mapfn`'s result on the iterable path.
 const FA_STAGE_MAPPED: f64 = 2.0;
 /// Suspended awaiting `Get(arrayLike, k)` on the array-like path.
