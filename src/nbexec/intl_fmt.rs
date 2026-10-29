@@ -1611,6 +1611,35 @@ fn decimal_magnitude(a: f64) -> i32 {
 /// exponent applies (so the caller uses the plain decimal). `compact`/
 /// `engineering` use exponents that are multiples of three; `scientific` uses
 /// the full magnitude; compact suppresses exponents below 1000.
+/// Whether `opts` is scientific or engineering notation.
+#[cfg(feature = "intl")]
+fn sci_or_eng(opts: &intl::number::NumberFormatOptions) -> bool {
+    matches!(
+        opts.notation,
+        intl::number::Notation::Scientific | intl::number::Notation::Engineering
+    )
+}
+
+/// `s` with its first digit one (ASCII or a known numbering system's) replaced
+/// by that system's zero: `-1E0` → `-0E0`.
+#[cfg(feature = "intl")]
+fn zero_unit_digit(s: &str) -> String {
+    let mut done = false;
+    s.chars()
+        .map(|c| {
+            if done {
+                return c;
+            }
+            let zero = (c as u32).checked_sub(1).and_then(char::from_u32);
+            if c == '1' || zero.is_some_and(|z| numbering_system_name_from_zero(z).is_some()) {
+                done = true;
+                return zero.unwrap_or(c);
+            }
+            c
+        })
+        .collect()
+}
+
 #[cfg(feature = "intl")]
 fn plural_notation_operand_string(n: f64, notation: &str) -> Option<String> {
     let a = n.abs();
@@ -8223,7 +8252,14 @@ impl Interp {
             // numbering system.
             return parts.into_iter().map(|(_, v)| v).collect();
         }
-        let formatted = intl::number::format(&locale, n, &opts);
+        // Scientific/engineering notation would render the negative-zero
+        // stand-in as `-4.941E-324`: render `-1` (exponent 0) and zero its
+        // mantissa digit instead, `-0E0`.
+        let formatted = if n == -f64::from_bits(1) && sci_or_eng(&opts) {
+            zero_unit_digit(&intl::number::format(&locale, -1.0, &opts))
+        } else {
+            intl::number::format(&locale, n, &opts)
+        };
         // A small-magnitude negative that rounds to a displayed zero
         // (e.g. -0.0001 → "0", or -0.004 currency → "$0.00") carries no sign
         // under signDisplay "negative"/"never"/"exceptZero" — only "auto"/
@@ -9213,7 +9249,13 @@ impl Interp {
                 .map(|p| (p.kind.as_str(), p.value))
                 .collect()
         };
-        let mut parts = render(feed);
+        // (Negative zero in scientific/engineering notation: see the `format`
+        // path.)
+        let neg_zero_sci = feed == -f64::from_bits(1) && sci_or_eng(&opts);
+        let mut parts = render(if neg_zero_sci { -1.0 } else { feed });
+        if neg_zero_sci && let Some(p) = parts.iter_mut().find(|(k, _)| *k == "integer") {
+            p.1 = zero_unit_digit(&p.1);
+        }
         if reround && compact_reround_parts(&mut parts, opts.rounding_mode) {
             parts = render(compact_rollover_value(feed));
             compact_reround_parts(&mut parts, opts.rounding_mode);

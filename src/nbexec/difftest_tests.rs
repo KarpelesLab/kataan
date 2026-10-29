@@ -986,3 +986,20 @@ fn update_of_object_with_bigint_value_stays_bigint() {
         "bigint,2,bigint,0,bigint,1,bigint,6,bigint,2,bigint,0,bigint"
     );
 }
+
+/// Negative zero in scientific/engineering notation is `-0E0` (the internal
+/// negative-zero stand-in leaked as `-4.941E-324`), in `formatToParts` too.
+#[cfg(feature = "intl")]
+#[test]
+fn scientific_negative_zero_is_zero() {
+    let src = r#"
+        function f(o) { return new Intl.NumberFormat("en", o).format(-0); }
+        [f({ notation: "scientific" }), f({ notation: "engineering" }),
+         f({ notation: "scientific", minimumFractionDigits: 2 }), f({ notation: "scientific", signDisplay: "negative" }),
+         new Intl.NumberFormat("en", { notation: "scientific" }).formatToParts(-0).map(function (p) { return p.type + ":" + p.value; }).join(" ")].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "-0E0|-0E0|-0.00E0|0E0|minusSign:- integer:0 exponentSeparator:E exponentInteger:0"
+    );
+}
