@@ -396,6 +396,12 @@ impl Interp {
         // A callable proxy: route through its `apply` trap, or call the target.
         if let Some((target, handler)) = self.realm.proxy_at(handle) {
             self.guard_revoked(handle)?;
+            // A proxy has a `[[Call]]` only when its target is callable
+            // (ProxyCreate step 7.a): an `apply` trap on any other proxy is
+            // never reached.
+            if !self.is_callable_value(NanBox::handle(target.to_raw())) {
+                return Err(self.type_error("proxy is not a function"));
+            }
             // `GetMethod(handler, "apply")` is a full `[[Get]]` — the handler may
             // itself be a proxy (its `get` trap must observe the "apply" read) or
             // expose the trap through an inherited accessor. A present but
@@ -2136,6 +2142,12 @@ impl Interp {
         // the target.
         if let Some((target, handler)) = self.realm.proxy_at(handle) {
             self.guard_revoked(handle)?;
+            // A proxy has a `[[Construct]]` only when its target is a
+            // constructor (ProxyCreate step 7.b).
+            if !self.is_constructor_value(NanBox::handle(target.to_raw())) {
+                let m = self.new_str("proxy is not a constructor");
+                return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+            }
             // newTarget is an explicit `Reflect.construct` newTarget if present,
             // else the proxy itself. It is captured *before* the trap lookup, which
             // can run arbitrary JS (a proxy handler / an accessor) and would

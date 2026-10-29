@@ -1301,3 +1301,25 @@ fn flat_and_flat_map_read_nested_arrays_live() {
         "[0,\"P\",2] [1,\"P\",3] [1,\"P\",3] [1,\"P\",3] [0,\"g\",2] [\"g\",2] [1,2] [1,3,4]"
     );
 }
+
+/// A proxy has `[[Call]]` only if its target is callable and `[[Construct]]`
+/// only if its target is a constructor (ProxyCreate step 7). A direct call
+/// of a proxy over a plain object reached its `apply` trap, and `new` of a
+/// proxy over a plain object or an arrow reached its `construct` trap,
+/// instead of throwing a TypeError.
+#[test]
+fn proxy_call_and_construct_need_a_callable_or_constructor_target() {
+    let src = r#"
+        function k(f) { try { return String(f()); } catch (e) { return e.constructor.name; } }
+        var pa = new Proxy({}, { apply() { return 1; } });
+        var pc = new Proxy({}, { construct() { return {}; } });
+        var pf = new Proxy(() => 1, { construct() { return {}; } });
+        var pg = new Proxy(function () { return 2; }, { construct() { return { c: 3 }; } });
+        [k(() => pa()), k(() => new Proxy(pa, {})()), k(() => new pc()), k(() => new pf()),
+         k(() => pf()), k(() => pg()), k(() => new pg().c), typeof pa, typeof pf].join()
+    "#;
+    assert_eq!(
+        run(src),
+        "TypeError,TypeError,TypeError,TypeError,1,2,3,object,function"
+    );
+}
