@@ -21167,9 +21167,7 @@ impl Compiler {
                             continue;
                         };
                         let home = if m.is_static { CTOR_NAME } else { PROTO_NAME };
-                        // A static method keeps the NativeFunction form (its member
-                        // text starts with `static`), as on the interpreter.
-                        self.next_closure_span = (!m.is_static).then_some(m.span);
+                        self.next_closure_span = Some(m.span);
                         let func = self.class_element_closure(
                             home,
                             ClosureSpec {
@@ -21235,7 +21233,7 @@ impl Compiler {
                         } else {
                             (proto, PROTO_NAME)
                         };
-                        self.next_closure_span = (!m.is_static).then_some(m.span);
+                        self.next_closure_span = Some(m.span);
                         let func = self.class_element_closure(
                             home,
                             ClosureSpec {

@@ -1345,3 +1345,28 @@ fn typeof_in_with_resolves_the_reference_once() {
         "numberundefined has:r,has:a,get:Symbol(Symbol.unscopables),has:a,get:a,has:zz"
     );
 }
+
+/// A static class method's `[[SourceText]]` is its MethodDefinition, the
+/// member text after the `static` modifier, and `Function.prototype.toString`
+/// returns it. Static methods and accessors fell back to the NativeFunction
+/// form because the member's span began at `static`.
+#[test]
+fn static_class_methods_keep_their_source_text() {
+    let src = r#"
+        class A {
+            static m ( a ) { return a; }
+            static async *g() {}
+            static get q() { return 1; }
+            static ['c' + 1]() {}
+            static #p() {}
+            static p() { return A.#p; }
+            n() {}
+        }
+        [String(A.m), String(A.g), String(Object.getOwnPropertyDescriptor(A, "q").get),
+         String(A.c1), String(A.p()), String(A.prototype.n)].join(" | ")
+    "#;
+    assert_eq!(
+        run(src),
+        "m ( a ) { return a; } | async *g() {} | get q() { return 1; } | ['c' + 1]() {} | #p() {} | n() {}"
+    );
+}

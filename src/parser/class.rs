@@ -149,6 +149,9 @@ impl<'src> Parser<'src> {
             return Ok(self.desugar_auto_accessor(key, value, is_static, span));
         }
 
+        // A method's span is its MethodDefinition (its `[[SourceText]]`), which
+        // excludes a `static` modifier and any decorators.
+        let def_start = self.cur_span();
         // Method modifiers: `async`, generator `*`, and `get`/`set`.
         let is_async = self.at(TokenKind::Keyword(Kw::Async))
             && !self.nth_newline(1)
@@ -196,7 +199,7 @@ impl<'src> Parser<'src> {
                 kind,
                 value,
                 is_static,
-                span: start.to(self.prev_span()),
+                span: def_start.to(self.prev_span()),
             })]);
         }
 
