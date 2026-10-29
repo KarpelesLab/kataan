@@ -1567,3 +1567,19 @@ fn annex_b_block_functions_skip_instead_of_throwing() {
     );
 }
 
+/// `Array.prototype.includes` / `indexOf` on an empty array-like return
+/// before ToIntegerOrInfinity(fromIndex), so its `valueOf` never runs (the
+/// generic array-like path coerced it first).
+#[test]
+fn includes_and_index_of_skip_from_index_on_empty_array_likes() {
+    let src = r#"
+        var n = 0; var fi = { valueOf() { n++; return 0; } };
+        var r = [Array.prototype.includes.call({ length: 0 }, 1, fi),
+                 Array.prototype.indexOf.call({ length: -3 }, 1, fi),
+                 Array.prototype.includes.call(function () {}, 1, fi),
+                 Array.prototype.lastIndexOf.call({ length: 0 }, 1, fi)];
+        r.concat(n).join()
+    "#;
+    assert_eq!(run(src), "false,-1,false,-1,0");
+}
+

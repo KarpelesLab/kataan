@@ -6633,6 +6633,10 @@ impl Interp {
         match method {
             "indexOf" => {
                 let target = arg(0);
+                // An empty array-like answers before ToIntegerOrInfinity(fromIndex).
+                if len == 0 {
+                    return Ok(NanBox::number(-1.0));
+                }
                 let from = self.array_from_index_checked(arg(1), len)?;
                 for i in from..len {
                     let key = alloc::format!("{i}");
@@ -6678,6 +6682,9 @@ impl Interp {
                 // `undefined` and is *not* skipped — `[,].includes(undefined)` is
                 // true. `Get` walks the prototype for an absent own index.
                 let target = arg(0);
+                if len == 0 {
+                    return Ok(NanBox::boolean(false));
+                }
                 let from = self.array_from_index_checked(arg(1), len)?;
                 let t_nan = target.as_number().is_some_and(f64::is_nan);
                 for i in from..len {
