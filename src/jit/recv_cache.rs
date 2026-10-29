@@ -391,6 +391,7 @@ pub(super) fn plan(
     in_spec: impl Fn(usize) -> bool,
     global_copy: impl Fn(usize) -> Option<u16>,
     truthy_site: impl Fn(usize, u16) -> bool,
+    reused: impl Fn(usize) -> bool,
     osr_entries: &[usize],
     catch_targets: &[usize],
 ) -> RecvPlan {
@@ -401,6 +402,9 @@ pub(super) fn plan(
         GenericOp::Not { a: r, .. } | GenericOp::JumpIfFalse { cond: r, .. } => {
             truthy_site(i, r).then_some((r, Family::Obj))
         }
+        // A read a promoted loop's fast version replaces by a register copy
+        // makes no way access there (`numeric::plan_reuse`).
+        GenericOp::GetProp { .. } if reused(i) => None,
         _ => site_recv(op, bytecode.get(i)),
     };
     let target = branch_targets(ops, osr_entries, catch_targets);

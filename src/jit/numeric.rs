@@ -333,6 +333,9 @@ struct Region {
     /// The pcs of arithmetic ops whose result needs no NaN canonicalization
     /// in its SSE register ([`raw_nan_results`]).
     raw_nan: Vec<usize>,
+    /// The property reads the speculative version replaces by a copy of the
+    /// register already holding the value ([`plan_reuse`]): `(pc, src)`.
+    reuse: Vec<(usize, u16)>,
 }
 
 /// A region's **speculative** double version: arithmetic whose operands are
@@ -1516,6 +1519,17 @@ impl NumGen {
                 a.bind(resume);
                 self.stub(stub, resume, reg, StubKind::Exec { pc: opc });
             }
+            // A property read whose value a register already holds, in the
+            // speculative version (`plan_reuse`).
+            GenericOp::GetProp { dst, .. }
+                if reg.is_some_and(|ri| self.regions[ri].spec.is_some())
+                    && let Some(src) = self.reuse_planned(pc) =>
+            {
+                if (dst as usize) >= self.env.n_regs || (src as usize) >= self.env.n_regs {
+                    return None;
+                }
+                self.copy_reg(a, reg, dst, src);
+            }
             // The generic emitter's (see `generic_region_op`).
             _ if reg.is_some() && generic_region_op(&op, bc) => return Some(false),
             _ => {
@@ -1564,6 +1578,17 @@ impl NumGen {
     /// a speculative region, under its speculation).
     pub(super) fn is_number_at(&self, pc: usize, r: u16) -> bool {
         self.ty(pc, r) == T_NUM
+    }
+
+    /// The register whose value the speculative version of region op `pc`
+    /// (a `GetProp`) copies instead of reading the property ([`plan_reuse`]),
+    /// in either version: the plain copy reads it, and the receiver cache
+    /// must not count on that op's way access ([`recv_cache::plan`]).
+    pub(super) fn reuse_planned(&self, pc: usize) -> Option<u16> {
+        let ri = *self.region_of.get(pc)?;
+        let r = self.regions.get(ri as usize)?;
+        r.spec.as_ref()?;
+        r.reuse.iter().find(|x| x.0 == pc).map(|x| x.1)
     }
 
     /// Whether register `r` provably holds a boolean on entry to op `pc` (in
@@ -2754,6 +2779,14 @@ fn plan_regions(
         if info.is_empty() {
             continue;
         }
+        // A reused value's register lives on to the read that copies it.
+        let reuse = plan_reuse(ops, bytecode, head, end);
+        for &(pc, src) in &reuse {
+            if let Some(x) = info.iter_mut().find(|x| x.0 == src) {
+                x.2 = x.2.max(pc);
+                x.3 += 1;
+            }
+        }
         // The registers the generic emitter's ops read stay in the register
         // file (see `generic_region_op`).
         let mut generic = false;
@@ -2862,7 +2895,100 @@ fn plan_regions(
             live_head,
             spec: None,
             raw_nan: raw_nan_results(ops, bytecode, head, end, &carried_r),
+            reuse,
         });
+    }
+    out
+}
+
+/// The property reads of loop body `head..=end` whose value a register
+/// already holds, for the loop's speculative version ([`Spec`]): `(pc,
+/// src)` for a `GetProp` of `obj.key` after a `GetProp` of the same register's
+/// `key` (into `src`) or a `SetProp` of it (of `src`), with neither register
+/// written since, and since then only ops that write no property: register
+/// ops, reads, branches out of the loop, and writes of other keys.
+///
+/// In that version every property op takes its inline path or leaves for the
+/// plain copy before it has done anything (a getter, a setter, an add, a
+/// miss), and no Rust code runs: the earlier op's value is the object's own
+/// data property (no prototype walk is inline), and only those inline stores
+/// change a property's value. Nothing else in the list can change an
+/// object's own property or make it an accessor (a `SetElem` / global write
+/// might, so either ends what is known), so the later read yields that very
+/// value.
+fn plan_reuse(ops: &[GenericOp], bytecode: &[Op], head: usize, end: usize) -> Vec<(usize, u16)> {
+    // (object register, key, register holding its value).
+    let mut avail: Vec<(u16, &str, u16)> = Vec::new();
+    let mut out = Vec::new();
+    let (mut d, mut u) = (Vec::new(), Vec::new());
+    for pc in head..end.min(ops.len()) {
+        let (Some(op), Some(bc)) = (ops.get(pc), bytecode.get(pc)) else {
+            break;
+        };
+        match (op, bc) {
+            (GenericOp::GetProp { .. }, Op::GetProp { dst, obj, key }) => {
+                let (dst, obj) = (*dst, *obj);
+                let hit = avail
+                    .iter()
+                    .find(|e| e.0 == obj && e.1 == key.as_str())
+                    .map(|e| e.2);
+                if let Some(src) = hit
+                    && src != dst
+                {
+                    out.push((pc, src));
+                }
+                avail.retain(|e| e.0 != dst && e.2 != dst);
+                if hit.is_none() && obj != dst {
+                    avail.push((obj, key.as_str(), dst));
+                }
+            }
+            (
+                GenericOp::SetProp { .. },
+                Op::SetProp { obj, key, src } | Op::SetPropStrict { obj, key, src },
+            ) => {
+                avail.retain(|e| e.1 != key.as_str());
+                avail.push((*obj, key.as_str(), *src));
+            }
+            (
+                GenericOp::Const { .. }
+                | GenericOp::Move { .. }
+                | GenericOp::Nop
+                | GenericOp::Add { .. }
+                | GenericOp::NumAdd { .. }
+                | GenericOp::Arith { .. }
+                | GenericOp::Lt { .. }
+                | GenericOp::Compare { .. }
+                | GenericOp::StrictEq { .. }
+                | GenericOp::ValueBin { .. }
+                | GenericOp::Not { .. }
+                | GenericOp::ToNumeric { .. }
+                | GenericOp::Step { .. }
+                | GenericOp::CheckTdz { .. }
+                | GenericOp::GetElem { .. }
+                | GenericOp::ArrayLen { .. }
+                | GenericOp::JumpIfFalse { .. },
+                _,
+            ) => {
+                def_use(bc, &mut d, &mut u);
+                avail.retain(|e| !d.contains(&e.0) && !d.contains(&e.2));
+            }
+            (GenericOp::CallMethod { .. }, _) if super::inline_math(bc).is_some() => {
+                def_use(bc, &mut d, &mut u);
+                avail.retain(|e| !d.contains(&e.0) && !d.contains(&e.2));
+            }
+            (
+                GenericOp::Interp { .. },
+                Op::LoadGlobal { .. }
+                | Op::RequireObjectCoercible { .. }
+                | Op::Neg { .. }
+                | Op::BitNot { .. }
+                | Op::IterNext { .. },
+            ) => {
+                def_use(bc, &mut d, &mut u);
+                avail.retain(|e| !d.contains(&e.0) && !d.contains(&e.2));
+            }
+            _ => avail.clear(),
+        }
     }
     out
 }

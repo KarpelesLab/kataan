@@ -5645,6 +5645,7 @@ impl JitFunction {
             // A truthiness test this emitter makes (not a promoted loop's,
             // nor one of a proven Number or boolean, which `numeric` makes).
             |pc, r| !num.in_region(pc) && !num.is_number_at(pc, r) && !num.is_bool_at(pc, r),
+            |pc| num.reuse_planned(pc).is_some(),
             osr_entries,
             &catch_targets,
         );
