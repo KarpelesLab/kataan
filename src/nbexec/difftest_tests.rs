@@ -920,3 +920,28 @@ fn array_with_readonly_length_does_not_grow() {
         "1,false,1,false,9,false,false,1,TypeError,2,x,false,2,false"
     );
 }
+
+/// An anonymous class named after an object-literal key or a computed
+/// instance-field key (NamedEvaluation) gets that name *before* its static
+/// elements run: a `static name()` method or `static name` field replaces it
+/// (it was overwritten by the key afterwards), and a static block sees it (it
+/// saw `""`). Symbol and computed keys included.
+#[test]
+fn class_named_by_property_key_before_static_elements() {
+    let src = r#"
+        var s = Symbol("sym"), r = [];
+        var o = { j: class { static name() {} }, ["k"]: class { static name() {} },
+                  l: class { static get name() { return "g"; } }, m: class { static name = "x"; },
+                  n: class { static { r.push(this.name); } }, [s]: class { static { r.push(this.name); } },
+                  p: class {}, q: function () {} };
+        r.push(typeof o.j.name, typeof o.k.name, o.l.name, o.m.name, o.p.name, o.q.name, o[s].name);
+        class I { ["f" + 1] = class { static { r.push("blk:" + this.name); } }; [s] = class { static name() {} }; }
+        var i = new I();
+        r.push(i.f1.name, typeof i[s].name, Object.keys(o).join("/"));
+        r.join()
+    "#;
+    assert_eq!(
+        run(src),
+        "n,[sym],function,function,g,x,p,q,[sym],blk:f1,f1,function,j/k/l/m/n/p/q"
+    );
+}

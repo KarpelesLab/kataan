@@ -13730,6 +13730,11 @@ struct Compiler {
     /// Set by an object literal just before it compiles a *method definition*'s
     /// function, so [`Self::make_closure`] does not make it a constructor.
     next_closure_is_method: bool,
+    /// Set just before compiling an anonymous class expression whose
+    /// NamedEvaluation name is a runtime property key (this register): the
+    /// class names itself from it *before* its static elements run, so a
+    /// `static name()` or a static block sees (and wins over) that name.
+    next_class_name_key: Option<Reg>,
     /// The function declarations this function hoisted (by address): a
     /// declaration found anywhere else — in a block, a `switch`, a label — has
     /// Annex B semantics the VM does not model, and is refused rather than
@@ -15103,13 +15108,22 @@ impl Compiler {
             if let (FieldKey::Hidden(_), Some(e)) = (&fd.key, fd.init)
                 && is_anonymous_fn_def(e)
             {
-                let v = self.expr(e)?;
+                let (v, named) = self.expr_named_by_key(e, key)?;
                 let this = self.this_reg;
-                self.ops.push(Op::DefineMethod {
-                    obj: this,
-                    key,
-                    func: v,
-                    kind: 4,
+                self.ops.push(if named {
+                    Op::DefineMethod {
+                        obj: this,
+                        key,
+                        func: v,
+                        kind: 4,
+                    }
+                } else {
+                    Op::DefineData {
+                        obj: this,
+                        key,
+                        src: v,
+                        attrs: 7,
+                    }
                 });
                 continue;
             }
@@ -20796,6 +20810,7 @@ impl Compiler {
     ) -> Result<Reg, CompileError> {
         use crate::ast::{ClassMember, MethodKind};
         let span = crate::common::Span::point(0);
+        let name_key = self.next_class_name_key.take();
         let saved_strict = self.strict;
         self.strict = true;
         self.scopes.push(alloc::collections::BTreeMap::new());
@@ -20911,6 +20926,20 @@ impl Compiler {
             )?;
             let proto = self.alloc();
             self.ops.push(Op::MakeClass { dst: proto, f, sup });
+            // SetFunctionName from a runtime key (NamedEvaluation), on a
+            // scratch object, before any element is defined.
+            if let Some(k) = name_key
+                && inner.is_none()
+            {
+                let scratch = self.alloc();
+                self.ops.push(Op::NewObject { dst: scratch });
+                self.ops.push(Op::DefineMethod {
+                    obj: scratch,
+                    key: k,
+                    func: f,
+                    kind: 0,
+                });
+            }
             self.write_var(ctor_b, f);
             self.write_var(proto_b, proto);
             // Elements, in order. Static fields and blocks run after all of
@@ -21277,17 +21306,20 @@ impl Compiler {
                         // Only a method's body sees the literal as its `super`
                         // home; any other value (an arrow, say) keeps the
                         // enclosing function's.
-                        let v = if *method {
-                            self.with_home(OBJ_HOME_NAME, |c| {
+                        let (v, named) = if *method {
+                            let v = self.with_home(OBJ_HOME_NAME, |c| {
                                 c.next_closure_is_method = true;
                                 // A method's text is its whole definition.
                                 c.method_span = Some(*span);
                                 let v = c.expr(value);
                                 c.next_closure_is_method = false;
                                 v
-                            })?
+                            })?;
+                            (v, true)
+                        } else if named {
+                            self.expr_named_by_key(value, k)?
                         } else {
-                            self.expr(value)?
+                            (self.expr(value)?, false)
                         };
                         if named {
                             self.ops.push(Op::DefineMethod {
@@ -21653,6 +21685,25 @@ impl Compiler {
                 keys: dyn_keys.to_vec(),
             });
         }
+    }
+
+    /// The value of an anonymous function definition `e` that NamedEvaluation
+    /// names after the runtime property key `key`, and whether the caller still
+    /// has to name it (SetFunctionName in the definition, e.g. `DefineMethod`
+    /// kind 4). A function can be named afterwards; a class names itself (see
+    /// [`Self::next_class_name_key`]) since its static elements may observe or
+    /// replace the name.
+    fn expr_named_by_key(&mut self, e: &Expr, key: Reg) -> Result<(Reg, bool), CompileError> {
+        if self.hosted
+            && let Expr::Class(c) = e
+            && c.id.is_none()
+        {
+            self.next_class_name_key = Some(key);
+            let r = self.class_value(c, "");
+            self.next_class_name_key = None;
+            return Ok((r?, false));
+        }
+        Ok((self.expr(e)?, true))
     }
 
     /// A class field initializer's value, an anonymous function named `name`
