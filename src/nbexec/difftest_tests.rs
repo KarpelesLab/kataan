@@ -1025,3 +1025,21 @@ fn plural_rules_select_uses_formatted_operands() {
     "#;
     assert_eq!(run(src), "other,one,one,one,one,other,few,two,one,one,many");
 }
+
+/// A currency's default fraction digits are its ISO 4217 minor units
+/// (CurrencyDigits): `BHD` has 3, so 1.005 is "BHD 1.005" (it was rounded at
+/// two digits and padded, "BHD 1.010"), and resolvedOptions reports 3.
+#[cfg(feature = "intl")]
+#[test]
+fn currency_default_digits_follow_iso_4217() {
+    let src = r#"
+        function f(c, v) { return new Intl.NumberFormat("en", { style: "currency", currency: c }).format(v); }
+        var o = new Intl.NumberFormat("en", { style: "currency", currency: "KWD" }).resolvedOptions();
+        [f("BHD", 1.005), f("BHD", 12345.6789), f("JPY", 1.5), f("CLF", 1.23456), f("USD", 1.005),
+         o.minimumFractionDigits, o.maximumFractionDigits].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "BHD\u{a0}1.005|BHD\u{a0}12,345.679|¥2|CLF\u{a0}1.2346|$1.01|3|3"
+    );
+}

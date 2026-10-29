@@ -212,6 +212,19 @@ fn locale_tailoring(locale: &str) -> Option<alloc::rc::Rc<intl::unicode::collate
     intl::unicode::collate::Tailoring::for_locale(locale).map(alloc::rc::Rc::new)
 }
 
+/// CurrencyDigits(`code`): the ISO 4217 minor-unit count of a currency (2
+/// unless listed: `JPY` 0, `BHD` 3, `CLF` 4, …), the default fraction digits
+/// of `style: "currency"`.
+fn currency_digits(code: &str) -> u8 {
+    match code.to_ascii_uppercase().as_str() {
+        "BIF" | "CLP" | "DJF" | "GNF" | "ISK" | "JPY" | "KMF" | "KRW" | "PYG" | "RWF" | "UGX"
+        | "UYI" | "VND" | "VUV" | "XAF" | "XOF" | "XPF" => 0,
+        "BHD" | "IQD" | "JOD" | "KWD" | "LYD" | "OMR" | "TND" => 3,
+        "CLF" | "UYW" => 4,
+        _ => 2,
+    }
+}
+
 /// The numbering-system name for a native zero digit `c` (the reverse of
 /// [`numbering_system_digit_base`]) — used to name the CLDR default numbering
 /// system a locale resolves to, detected from the digit the `intl` crate emits.
@@ -3970,8 +3983,11 @@ impl Interp {
             // digits apply only in "standard" notation; compact defaults max to 0;
             // scientific/engineering (and standard non-currency) use 0..=3; percent 0.
             let notation = get_str(self, "notation").unwrap_or_else(|| String::from("standard"));
+            let cdigits = f64::from(currency_digits(
+                &get_str(self, "currency").unwrap_or_default(),
+            ));
             let (def_min, def_max): (f64, f64) = match style.as_str() {
-                "currency" if notation == "standard" => (2.0, 2.0),
+                "currency" if notation == "standard" => (cdigits, cdigits),
                 "percent" => (0.0, 0.0),
                 _ if notation == "compact" => (0.0, 0.0),
                 _ => (0.0, 3.0),
@@ -8211,14 +8227,17 @@ impl Interp {
         let sig = opts.maximum_significant_digits.map(|s| s as usize);
         // Effective maximum fraction digits (the crate's pattern default when unset).
         let default_max = match opts.style {
-            NumberStyle::Currency if opts.currency == Some("JPY") => 0,
-            NumberStyle::Currency => 2,
+            NumberStyle::Currency => {
+                usize::from(currency_digits(opts.currency.unwrap_or_default()))
+            }
+            NumberStyle::Percent => 0,
             _ => 3,
         };
-        let keep_frac = opts
-            .maximum_fraction_digits
-            .map(|m| m as usize)
-            .unwrap_or(default_max);
+        // (An omitted maximum is at least the minimum: `max(default, mnfd)`.)
+        let keep_frac = opts.maximum_fraction_digits.map_or_else(
+            || default_max.max(opts.minimum_fraction_digits.unwrap_or(0) as usize),
+            |m| m as usize,
+        );
         let rounded = intl_decimal_round(n, keep_frac, sig, increment, opts.rounding_mode);
         // We already applied the correct rounding to the shortest decimal; hand the
         // crate a mode that won't re-round the pre-rounded value's f64 noise (a
@@ -8391,11 +8410,10 @@ impl Interp {
             self.realm.get_property(handle, "useGrouping"),
             Some(v) if matches!(v.unpack(), Unpacked::Bool(false))
         );
-        // Default fraction digits: currency = 2 (0 for JPY), else 0..=3.
-        let is_jpy = currency.as_deref() == Some("JPY");
+        // Default fraction digits: the currency's (CurrencyDigits), else 0..=3.
+        let cdigits = i32::from(currency_digits(currency.as_deref().unwrap_or_default()));
         let (def_min, def_max) = match style.as_str() {
-            "currency" if is_jpy => (0, 0),
-            "currency" => (2, 2),
+            "currency" => (cdigits, cdigits),
             "percent" => (0, 0),
             _ => (0, 3),
         };
