@@ -1403,22 +1403,40 @@ impl X64Assembler {
     /// Anything else falls through (to the helper), with `rax` clobbered as
     /// are `rcx`, `rdx`, `r8`–`r11`.
     pub(crate) fn p_truthy_heap(&mut self, realm_off: i32, truthy: Label, falsy: Label) {
-        use crate::nanbox::NanBox;
-        let l = super::compute_jit_layout();
         let other = self.new_label();
+        self.p_truthy_nullish(falsy);
+        self.p_handle_check(other);
+        self.p_truthy_handle(realm_off, truthy, other);
+        self.bind(other);
+    }
+
+    /// `null`/`undefined` in `rax` to `falsy` (else fall through). Clobbers
+    /// `r11`.
+    pub(crate) fn p_truthy_nullish(&mut self, falsy: Label) {
+        use crate::nanbox::NanBox;
         self.g_movabs(r::R11, NanBox::null().to_bits());
         self.g_cmp(r::RAX, r::R11);
         self.g_jcc(cc::E, falsy);
         self.g_movabs(r::R11, NanBox::undefined().to_bits());
         self.g_cmp(r::RAX, r::R11);
         self.g_jcc(cc::E, falsy);
+    }
+
+    /// The truthiness of the heap handle in `rax`, where it is not the
+    /// helper's to decide: a VM function, or a shaped ordinary object without
+    /// the `[[IsHTMLDDA]]` brand, to `truthy`; anything else to `other`.
+    /// Clobbers `rax`, `rcx`, `rdx`, `r8`–`r11`.
+    pub(crate) fn p_truthy_handle(&mut self, realm_off: i32, truthy: Label, other: Label) {
+        let l = super::compute_jit_layout();
         self.g_mov(r::R9, r::RAX);
-        self.p_handle_check(other);
         self.p_load_arena(realm_off, &l.props);
         self.mov_r10_rax();
         self.g_mov(r::RAX, r::R9);
         self.p_slot_of(l, other);
         self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.props.vmfn_disc);
+        self.g_jcc(cc::E, truthy);
+        // (An array is never `[[IsHTMLDDA]]`.)
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_array_disc);
         self.g_jcc(cc::E, truthy);
         self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
         self.jne(other);
@@ -1431,7 +1449,7 @@ impl X64Assembler {
             crate::shape::brand_bit(crate::shape::BRAND_KEYS[1]),
         );
         self.g_jcc(cc::E, truthy);
-        self.bind(other);
+        self.jmp(other);
     }
 
     /// `mov byte|word|dword [rcx + disp32], imm` (`bytes` 1, 2 or 4).

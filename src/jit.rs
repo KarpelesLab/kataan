@@ -4648,15 +4648,42 @@ impl X64Assembler {
         disp: i32,
         truthy_helper: u64,
         qnan: u64,
+        tags: (u64, u64),
+        realm_off: i32,
+    ) {
+        self.emit_truthy_or(disp, truthy_helper, qnan, tags, realm_off, None);
+    }
+
+    /// [`emit_truthy`](Self::emit_truthy), but with `slow` set, a value the
+    /// inline cases do not decide jumps there instead of calling the helper.
+    pub fn emit_truthy_or(
+        &mut self,
+        disp: i32,
+        truthy_helper: u64,
+        qnan: u64,
         (tag_true, tag_false): (u64, u64),
         realm_off: i32,
+        slow: Option<Label>,
     ) {
         let numl = self.new_label();
         let set1 = self.new_label();
         let set0 = self.new_label();
         let have = self.new_label();
-        // is_number(v) == (v & QNAN) != QNAN — test on a copy, keeping v in rax.
+        let helper = self.new_label();
         self.load_rax(disp);
+        // A heap handle first: the usual condition that is neither a Number
+        // nor a boolean is an object (`if (node)`, `if (!p) return`), and a
+        // proven Number or boolean never gets here (`numeric`).
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+        let heap = self.new_label();
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+        {
+            self.mov_rcx_rax();
+            self.raw(&[0x48, 0xc1, 0xe9, 50]); // shr rcx, 50
+            self.raw(&[0x81, 0xf9, 0xff, 0x3f, 0x00, 0x00]); // cmp ecx, 0x3fff
+            self.je(heap);
+        }
+        // is_number(v) == (v & QNAN) != QNAN — test on a copy, keeping v in rax.
         self.movabs_r11(qnan as i64);
         self.mov_rcx_rax();
         self.and_rcx_r11();
@@ -4669,11 +4696,21 @@ impl X64Assembler {
         self.movabs_r11(tag_false as i64);
         self.cmp_rax_r11();
         self.je(set0);
-        // `null`/`undefined`, an ordinary object or a VM function, inline.
+        // `null`/`undefined` inline; an ordinary object or a VM function
+        // inline above.
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-        self.p_truthy_heap(realm_off, set1, set0);
+        {
+            self.p_truthy_nullish(set0);
+            self.jmp(helper);
+            self.bind(heap);
+            self.p_truthy_handle(realm_off, set1, helper);
+        }
         #[cfg(not(all(feature = "alloc", target_os = "linux", target_arch = "x86_64")))]
         let _ = realm_off;
+        self.bind(helper);
+        if let Some(slow) = slow {
+            self.jmp(slow);
+        }
         // otherwise: jit_helper_truthy(ctx, v) → 0/1 (runs ToBoolean; never throws).
         self.mov_rdi_r15();
         self.load_argreg(1, disp);
@@ -5605,6 +5642,9 @@ impl JitFunction {
             |pc| num.in_region(pc),
             |pc| num.in_spec(pc),
             |pc| num.global_copy(pc),
+            // A truthiness test this emitter makes (not a promoted loop's,
+            // nor one of a proven Number or boolean, which `numeric` makes).
+            |pc, r| !num.in_region(pc) && !num.is_number_at(pc, r) && !num.is_bool_at(pc, r),
             osr_entries,
             &catch_targets,
         );
@@ -5910,6 +5950,71 @@ impl JitFunction {
                         }
                     }
                 }
+            }};
+        }
+        // `rax` = the truthiness (`0`/`1`) of register `$r` for op `$at`
+        // (`emit_truthy_or`, slow path `$bail`). A receiver-cache site
+        // (`recv_cache::plan`'s truthiness sites) first tries its way, or
+        // walks and fills it: a later property op on the same object then
+        // skips its walk. (A way whose fills prove a layout, see
+        // `recv_cache::shape_ways`, is filled only with an object of that
+        // layout.) A plain object without the `[[IsHTMLDDA]]` brand is
+        // truthy; anything else takes the general test.
+        macro_rules! truthy_rax {
+            ($at:expr, $r:expr, $bail:expr) => {{
+                let general = a.new_label();
+                let have = a.new_label();
+                if let Some(p) = rc.sites[$at] {
+                    if p.family != recv_cache::Family::Obj {
+                        return None;
+                    }
+                    let walk = a.new_label();
+                    let proven = a.new_label();
+                    if p.check {
+                        a.load_rax(disp($r));
+                        a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, rc_key(p.way));
+                        a.jne(walk);
+                        a.g_load(call_seq::r::RCX, call_seq::r::RBP, rc_cell(p.way));
+                        a.jmp(proven);
+                    }
+                    a.bind(walk);
+                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
+                    walk_to_slot!($r, general);
+                    family_checks!(recv_cache::Family::Obj, general);
+                    // (`rax`: the receiver's bits, from the walk.)
+                    let skip_fill = a.new_label();
+                    if p.fill {
+                        if let Some(shape) = way_shape[p.way] {
+                            a.g_load(call_seq::r::R11, call_seq::r::RCX, layout.off_shape);
+                            a.g_movabs(call_seq::r::RDX, shape);
+                            a.g_cmp(call_seq::r::R11, call_seq::r::RDX);
+                            a.jne(skip_fill);
+                        }
+                        a.g_store(call_seq::r::RBP, rc_key(p.way), call_seq::r::RAX);
+                        a.g_store(call_seq::r::RBP, rc_cell(p.way), call_seq::r::RCX);
+                    }
+                    a.bind(skip_fill);
+                    a.bind(proven);
+                    a.g_load(call_seq::r::R11, call_seq::r::RCX, layout.off_shape);
+                    a.p_test_byte_imm(
+                        call_seq::r::R11,
+                        layout.props.shape_brands,
+                        crate::shape::brand_bit(crate::shape::BRAND_KEYS[1]),
+                    );
+                    a.jne(general);
+                    a.movabs_rax(1);
+                    a.jmp(have);
+                }
+                a.bind(general);
+                a.emit_truthy_or(
+                    disp($r),
+                    truthy_helper,
+                    QNAN,
+                    (tag_true, tag_false),
+                    helpers.call_layout.realm,
+                    $bail,
+                );
+                a.bind(have);
             }};
         }
         // An exact non-negative integer index in `reg` → `rax`, else `$miss`
@@ -6468,7 +6573,36 @@ impl JitFunction {
                     let other = a.new_label();
                     let slow = a.new_label();
                     let done = a.new_label();
-                    recv_slot!(op_idx, cell, other, recv_cache::Family::Cell);
+                    // The array cell's checks, with `rcx` its live slot.
+                    let walked = a.new_label();
+                    match rc.sites[op_idx] {
+                        // No way to compare first: one walk serves both
+                        // kinds of cell (`recv_slot!`'s own, its fill too).
+                        None
+                        | Some(recv_cache::SitePlan {
+                            check: false,
+                            known: false,
+                            ..
+                        }) => {
+                            if rc.sites[op_idx]
+                                .is_some_and(|p| p.family != recv_cache::Family::Cell)
+                            {
+                                return None;
+                            }
+                            a.p_load_arena(helpers.call_layout.realm, &layout.props);
+                            walk_to_slot!(cell, slow);
+                            a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.props.box_disc);
+                            a.jne(walked);
+                            if let Some(recv_cache::SitePlan {
+                                way, fill: true, ..
+                            }) = rc.sites[op_idx]
+                            {
+                                a.g_store(call_seq::r::RBP, rc_key(way), call_seq::r::RAX);
+                                a.g_store(call_seq::r::RBP, rc_cell(way), call_seq::r::RCX);
+                            }
+                        }
+                        _ => recv_slot!(op_idx, cell, other, recv_cache::Family::Cell),
+                    }
                     a.g_load(call_seq::r::RAX, call_seq::r::RCX, layout.props.off_box_val);
                     a.store_rax(disp(dst));
                     a.jmp(done);
@@ -6477,6 +6611,7 @@ impl JitFunction {
                     a.bind(other);
                     a.p_load_arena(helpers.call_layout.realm, &layout.props);
                     walk_to_slot!(cell, slow);
+                    a.bind(walked);
                     family_checks!(recv_cache::Family::Arr, slow);
                     a.p_arr_len_ptr(&layout);
                     a.g_test(call_seq::r::R8);
@@ -6644,9 +6779,7 @@ impl JitFunction {
                             a.movabs_r11(tag_true as i64);
                             a.cmp_rax_r11();
                             a.je(slow);
-                            a.p_load_arena(helpers.call_layout.realm, &layout.props);
-                            walk_to_slot!(next, slow);
-                            family_checks!(recv_cache::Family::Arr, slow);
+                            recv_slot!(op_idx, next, slow, recv_cache::Family::Arr);
                             int_index!(iter, slow, true);
                             a.p_arr_len_ptr(&layout);
                             a.cmp_rax_r8();
@@ -6663,7 +6796,12 @@ impl JitFunction {
                             a.movsd_mem_xmm0(disp(iter));
                             a.jmp(fin);
                             a.bind(slow);
-                            exec_op!(pc);
+                            // (A speculative loop's fast version leaves for
+                            // its plain copy instead.)
+                            match num.spec_bail(&mut a, op_idx) {
+                                Some(bail) => a.jmp(bail),
+                                None => exec_op!(pc),
+                            }
                             a.bind(fin);
                         }
                         // A literal's allocation: its own helper, not the
@@ -7448,14 +7586,19 @@ impl JitFunction {
                     if !ok(dst) || !ok(ra) {
                         return None;
                     }
-                    a.emit_truthy(
-                        disp(ra),
-                        truthy_helper,
-                        QNAN,
-                        (tag_true, tag_false),
-                        helpers.call_layout.realm,
-                    );
-                    a.xor_rax_imm(1);
+                    if num.is_bool_at(op_idx, ra) {
+                        // `!b` of a boolean: `b != true`.
+                        a.load_rax(disp(ra));
+                        a.movabs_r11(tag_true as i64);
+                        a.cmp_rax_r11();
+                        a.setne_rax();
+                    } else {
+                        // (In a speculative loop's fast version, the helper's
+                        // values leave for the plain copy.)
+                        let bail = num.spec_bail(&mut a, op_idx);
+                        truthy_rax!(op_idx, ra, bail);
+                        a.xor_rax_imm(1);
+                    }
                     a.movabs_r11(tag_false as i64);
                     a.add_rax_r11();
                     a.store_rax(disp(dst));
@@ -7473,13 +7616,7 @@ impl JitFunction {
                     if !ok(cond) || target > ops.len() {
                         return None;
                     }
-                    a.emit_truthy(
-                        disp(cond),
-                        truthy_helper,
-                        QNAN,
-                        (tag_true, tag_false),
-                        helpers.call_layout.realm,
-                    );
+                    truthy_rax!(op_idx, cond, None);
                     a.test_rax_rax();
                     if target <= op_idx {
                         let stay = a.new_label();

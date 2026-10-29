@@ -170,6 +170,18 @@ fn transfer(op: &Op, s: &mut [u8]) {
             (*dst, num_if(t(s, *src) == T_NUM))
         }
         Op::Neg { dst, a } | Op::BitNot { dst, a } => (*dst, num_if(t(s, *a) == T_NUM)),
+        // A step writes only booleans to `done` (or leaves it as it was).
+        Op::IterNext {
+            dst, done, iter, ..
+        } => {
+            let d = if t(s, *done) == T_BOOL { T_BOOL } else { T_ANY };
+            for r in [*dst, *iter] {
+                if let Some(x) = s.get_mut(r as usize) {
+                    *x = T_ANY;
+                }
+            }
+            (*done, d)
+        }
         // Ops that write their `dst` only.
         Op::GetProp { dst, .. }
         | Op::GetKey { dst, .. }
@@ -481,14 +493,16 @@ fn region_op_ok(op: &GenericOp, bc: &Op) -> bool {
         | GenericOp::Ret { .. } => true,
         GenericOp::Arith { .. } => true,
         GenericOp::ValueBin { op, .. } => *op != 0,
-        GenericOp::Interp { .. } => matches!(
-            bc,
-            Op::Neg { .. }
-                | Op::BitNot { .. }
-                | Op::LoadGlobal { .. }
-                | Op::StoreGlobal { .. }
-                | Op::RequireObjectCoercible { .. }
-        ),
+        GenericOp::Interp { .. } => {
+            matches!(
+                bc,
+                Op::Neg { .. }
+                    | Op::BitNot { .. }
+                    | Op::LoadGlobal { .. }
+                    | Op::StoreGlobal { .. }
+                    | Op::RequireObjectCoercible { .. }
+            ) || generic_region_op(op, bc)
+        }
         _ => generic_region_op(op, bc),
     }
 }
@@ -504,17 +518,24 @@ fn region_op_ok(op: &GenericOp, bc: &Op) -> bool {
 /// and writes object fields, or calls a function, keeps its arithmetic in SSE
 /// registers. (A callee reaches the caller's registers only through the
 /// register file: as the collector's roots, which a relocation may update.)
-fn generic_region_op(op: &GenericOp, _bc: &Op) -> bool {
-    matches!(
-        op,
+fn generic_region_op(op: &GenericOp, bc: &Op) -> bool {
+    match op {
         GenericOp::GetProp { .. }
-            | GenericOp::SetProp { .. }
-            | GenericOp::GetElem { .. }
-            | GenericOp::ArrayLen { .. }
-            | GenericOp::CallMethod { .. }
-            | GenericOp::CallValue { .. }
-            | GenericOp::CallKey { .. }
-    )
+        | GenericOp::SetProp { .. }
+        | GenericOp::GetElem { .. }
+        | GenericOp::ArrayLen { .. }
+        | GenericOp::CallMethod { .. }
+        | GenericOp::CallValue { .. }
+        | GenericOp::CallKey { .. } => true,
+        // `!x` (a boolean or Number inline) and an array iteration's step in
+        // by-index mode (`for (… of array)`, inline while the array lasts).
+        GenericOp::Not { .. } => true,
+        GenericOp::Interp { .. } => matches!(
+            bc,
+            Op::IterNext { iter, next, .. } if usize::from(*next) == usize::from(*iter) + 1
+        ),
+        _ => false,
+    }
 }
 
 /// Whether region op `op` may run arbitrary code (a call that is not an
@@ -1545,6 +1566,12 @@ impl NumGen {
         self.ty(pc, r) == T_NUM
     }
 
+    /// Whether register `r` provably holds a boolean on entry to op `pc` (in
+    /// a speculative region, under its speculation).
+    pub(super) fn is_bool_at(&self, pc: usize, r: u16) -> bool {
+        self.ty(pc, r) == T_BOOL
+    }
+
     /// `xmm = rax` (the bits).
     pub(super) fn set_xmm_from_rax(a: &mut X64Assembler, x: u8) {
         a.movq_x_gpr(x, RAX);
@@ -2561,6 +2588,17 @@ fn def_use(op: &Op, defs: &mut Vec<u16>, uses: &mut Vec<u16>) {
             }
         }
         Op::Jump { .. } => {}
+        // A step writes its value, `done` and the cursor, but not on every
+        // path: each is a use as well (live across it), and a def (written).
+        Op::IterNext {
+            dst,
+            done,
+            iter,
+            next,
+        } => {
+            defs.extend([*dst, *done, *iter]);
+            uses.extend([*dst, *done, *iter, *next]);
+        }
         _ => uses.extend(op_regs(op)),
     }
 }

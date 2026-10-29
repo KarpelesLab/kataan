@@ -219,9 +219,19 @@ pub(super) struct RecvPlan {
 }
 
 /// The receiver register of an op whose inline fast path walks it (and so can
-/// use the cache).
-fn site_recv(op: &GenericOp) -> Option<(u16, Family)> {
+/// use the cache); `bc` is its bytecode op. (A truthiness test's is
+/// [`plan`]'s to decide.)
+fn site_recv(op: &GenericOp, bc: Option<&Op>) -> Option<(u16, Family)> {
     match *op {
+        // An array iteration's by-index step walks the array (`iter + 1`).
+        GenericOp::Interp { .. } => match bc {
+            Some(Op::IterNext { iter, next, .. })
+                if usize::from(*next) == usize::from(*iter) + 1 =>
+            {
+                Some((*next, Family::Arr))
+            }
+            _ => None,
+        },
         GenericOp::GetProp { obj, .. }
         | GenericOp::SetProp { obj, .. }
         | GenericOp::InitProp {
@@ -335,6 +345,11 @@ pub(super) fn shape_ways(
     let mut out: Vec<Option<Option<u64>>> = vec![None; plan.ways];
     for (op, site) in ops.iter().zip(&plan.sites) {
         let Some(p) = site else { continue };
+        // A truthiness test fills such a way only with an object of the
+        // way's layout (`compile_generic`'s `truthy_rax!`): it proves none.
+        if matches!(op, GenericOp::Not { .. } | GenericOp::JumpIfFalse { .. }) {
+            continue;
+        }
         let Some(slot) = out.get_mut(p.way) else {
             continue;
         };
@@ -375,10 +390,19 @@ pub(super) fn plan(
     in_region: impl Fn(usize) -> bool,
     in_spec: impl Fn(usize) -> bool,
     global_copy: impl Fn(usize) -> Option<u16>,
+    truthy_site: impl Fn(usize, u16) -> bool,
     osr_entries: &[usize],
     catch_targets: &[usize],
 ) -> RecvPlan {
     let n = ops.len();
+    // An op's receiver (a truthiness test's only where the generic
+    // emitter makes it, `truthy_site`).
+    let site_recv = |op: &GenericOp, i: usize| match *op {
+        GenericOp::Not { a: r, .. } | GenericOp::JumpIfFalse { cond: r, .. } => {
+            truthy_site(i, r).then_some((r, Family::Obj))
+        }
+        _ => site_recv(op, bytecode.get(i)),
+    };
     let target = branch_targets(ops, osr_entries, catch_targets);
     // Value ids: registers holding the same value (by `Move`) share one.
     let mut next_id = 0u32;
@@ -398,12 +422,40 @@ pub(super) fn plan(
     // Per site: the previous site of the same iteration on its value, both
     // in a speculative loop.
     let mut pred: Vec<Option<usize>> = vec![None; n];
+    // A branch target reached only by one forward branch (no fall-through
+    // into it, no other branch, not an entry) knows what that branch knew:
+    // `if (!p) return; p.x`. (`ids` is not restored: a register the skipped
+    // code wrote just loses its value's identity, which only costs a hit.)
+    let mut into = vec![0u32; n + 1];
+    for op in ops {
+        if let GenericOp::Jump { target: t } | GenericOp::JumpIfFalse { target: t, .. } = *op
+            && t <= n
+        {
+            into[t] += 1;
+        }
+    }
+    let entry: Vec<usize> = osr_entries.iter().chain(catch_targets).copied().collect();
+    #[allow(clippy::type_complexity)]
+    let mut snap: Vec<Option<(Vec<(u32, usize)>, Vec<u16>)>> = vec![None; n + 1];
     for (i, op) in ops.iter().enumerate() {
         if target[i] {
-            live.clear();
-            fresh.clear();
+            let falls_in = i > 0
+                && !matches!(
+                    bytecode.get(i - 1),
+                    Some(Op::Jump { .. } | Op::Return { .. } | Op::Throw { .. })
+                );
+            match snap[i].take() {
+                Some((l, f)) if into[i] == 1 && !falls_in && !entry.contains(&i) => {
+                    live = l;
+                    fresh = f;
+                }
+                _ => {
+                    live.clear();
+                    fresh.clear();
+                }
+            }
         }
-        if let Some((r, fam)) = site_recv(op) {
+        if let Some((r, fam)) = site_recv(op, i) {
             let id = id_of(&mut ids, &mut next_id, r) * 3 + fam as u32;
             site_id[i] = id;
             if let Some(e) = live.iter_mut().find(|e| e.0 == id) {
@@ -480,6 +532,12 @@ pub(super) fn plan(
         {
             fresh.retain(|x| x != dst);
         }
+        if let GenericOp::Jump { target: t } | GenericOp::JumpIfFalse { target: t, .. } = *op
+            && t > i
+            && t <= n
+        {
+            snap[t] = Some((live.clone(), fresh.clone()));
+        }
     }
     // In a promoted loop, a receiver is usually the one the same site saw
     // last iteration (a loop-invariant object, or one read afresh from the
@@ -488,7 +546,7 @@ pub(super) fn plan(
     // element or property read, a call's result), which is usually another
     // object than last time: it walks the value at once (and fills the way).
     for i in 0..n {
-        if in_region(i) && site_recv(&ops[i]).is_some() {
+        if in_region(i) && site_recv(&ops[i], i).is_some() {
             fill[i] = true;
             check[i] = !fresh_first[i];
         }
@@ -500,7 +558,7 @@ pub(super) fn plan(
         let mut seen: Vec<u32> = Vec::new();
         for i in 0..n {
             if (fill[i] || check[i])
-                && site_recv(&ops[i]).is_some_and(|(_, f)| f == fam)
+                && site_recv(&ops[i], i).is_some_and(|(_, f)| f == fam)
                 && !seen.contains(&site_id[i])
             {
                 seen.push(site_id[i]);
@@ -518,7 +576,7 @@ pub(super) fn plan(
         if !(fill[i] || check[i]) {
             continue;
         }
-        let Some((_, family)) = site_recv(&ops[i]) else {
+        let Some((_, family)) = site_recv(&ops[i], i) else {
             continue;
         };
         let range = match family {
