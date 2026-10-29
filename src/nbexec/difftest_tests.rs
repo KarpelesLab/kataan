@@ -1414,3 +1414,17 @@ fn proxy_descriptor_fields_come_in_from_property_descriptor_order() {
         "value,writable,enumerable,configurable get,set,enumerable,configurable"
     );
 }
+
+/// A typed array's `[[Delete]]` of a canonical numeric key fails exactly when
+/// the key names an element (10.4.5.6). `Reflect.deleteProperty(ta, "0")`
+/// reported true (the `delete` operator already got it right).
+#[test]
+fn typed_array_delete_of_an_element_fails() {
+    let src = r#"
+        var ta = new Uint8Array(2);
+        [Reflect.deleteProperty(ta, "0"), Reflect.deleteProperty(ta, 1),
+         Reflect.deleteProperty(ta, "5"), Reflect.deleteProperty(ta, "-0"),
+         Reflect.deleteProperty(ta, "x")].join()
+    "#;
+    assert_eq!(run(src), "false,false,true,true,true");
+}

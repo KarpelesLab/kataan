@@ -2172,6 +2172,22 @@ impl Interp {
             }
             return self.delete_property_of(target, key);
         }
+        // Integer-indexed exotic `[[Delete]]` (10.4.5.6): a canonical numeric
+        // key deletes nothing; it fails exactly when it names an element.
+        if self.realm.typed_kind(obj).is_some()
+            && let Some(n) = canonical_numeric_index(key)
+        {
+            let is_neg_zero = n == 0.0 && n.is_sign_negative();
+            let valid = !self.typed_array_detached(obj)
+                && !is_neg_zero
+                && n == (n as i64) as f64
+                && n >= 0.0
+                && self
+                    .realm
+                    .typed_len(obj)
+                    .is_some_and(|len| (n as usize) < len);
+            return Ok(!valid);
+        }
         // A non-proxy target: a String exotic object's own `length` / index and a
         // RegExp's own `lastIndex` are non-configurable synthesized properties, so
         // `[[Delete]]` returns false. `delete_property` only tracks physical slots,
