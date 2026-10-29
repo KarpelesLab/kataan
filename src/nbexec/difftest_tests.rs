@@ -1153,3 +1153,20 @@ fn anonymous_class_is_named_before_its_static_elements() {
         "D:D|H:H|I:#I|A1:kk|F:F|A2:[sy]|function|E|#I|D|kk|J:J|o1:kk|[sy]|function|function|g|kk2|kk"
     );
 }
+
+/// A labelled `for (let …)` loop whose body has a closure over the loop
+/// variable: the bound-names scan stopped at the label (it only looked
+/// through labelled *functions*), so the captured head binding was not made
+/// a cell and the compiler refused the whole program.
+#[test]
+fn labelled_let_loop_with_a_capturing_closure_compiles() {
+    let src = r#"
+        var r = [];
+        l: for (let i = 0; i < 4; i++) { let f = () => i; if (i % 2) continue l; r.push(f()); }
+        m: for (let j = 0; j < 4; j++) { var g = () => j; if (j == 2) break m; r.push(g()); }
+        a: b: for (const k of [7, 8]) { r.push((() => k)()); }
+        n: { let z = 5; r.push((() => z)()); break n; }
+        r.join()
+    "#;
+    assert_eq!(run(src), "0,2,0,1,7,8,5");
+}

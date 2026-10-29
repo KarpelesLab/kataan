@@ -12663,7 +12663,10 @@ fn declared_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
                 declared_in_stmt(s, out);
             }
         }
-        Stmt::Labeled { body, .. } if fn_decl(body).is_some() => declared_in_stmt(body, out),
+        // A labelled statement declares what its body does: a labelled
+        // function, or a labelled `for (let …)` loop / block whose bindings a
+        // closure may capture (missing them refused `l: for (let i…) { () => i }`).
+        Stmt::Labeled { body, .. } => declared_in_stmt(body, out),
         Stmt::If {
             consequent,
             alternate,
