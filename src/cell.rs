@@ -856,6 +856,14 @@ impl Cell {
     }
 }
 
+/// The full drop of a swept cell of one of the less common kinds — out of
+/// the sweep loop.
+#[cold]
+#[inline(never)]
+fn release_cold(cell: Cell) {
+    drop(cell);
+}
+
 impl Trace for Cell {
     fn weight(&self) -> usize {
         1 + match self {
@@ -882,12 +890,26 @@ impl Trace for Cell {
         }
     }
 
-    #[inline]
+    /// Inlined into the sweep loop. The cells that own no heap memory are
+    /// forgotten outright (their drop glue would do nothing); objects,
+    /// arrays and closures release their one or two owned parts inline; the
+    /// rest take the full drop glue, out of line.
+    #[inline(always)]
     fn release(self) {
         match self {
             Cell::Object(o) => o.release(),
             Cell::Array(a) => drop(a),
-            other => drop(other),
+            Cell::VmFunction { captures, .. } => drop(captures),
+            Cell::Str(s) => drop(s),
+            // Plain data (numbers, ids and handles): nothing to drop.
+            plain @ (Cell::Box(_)
+            | Cell::Native(_)
+            | Cell::HostFn(_)
+            | Cell::BoundNative { .. }
+            | Cell::Date(_)
+            | Cell::TypedArray { .. }
+            | Cell::Proxy { .. }) => core::mem::forget(plain),
+            other => release_cold(other),
         }
     }
 

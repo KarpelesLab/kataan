@@ -308,7 +308,7 @@ pub fn collect<T: Trace>(heap: &mut Heap<T>, roots: &[Handle]) -> Stats {
 
     // --- sweep: free every live object the mark phase did not reach (a
     // survivor ages toward the old generation; the remembered set is rebuilt) ---
-    let swept = heap.sweep(|h, _| marked.contains(&h), T::interior_mutable, T::release);
+    let swept = heap.sweep(|h, _| marked.contains(&h), T::interior_mutable);
 
     Stats {
         marked: marked.len(),
@@ -338,7 +338,6 @@ pub fn sweep_full<T: Trace>(heap: &mut Heap<T>, marked: &MarkSet) -> Stats {
             keep
         },
         T::interior_mutable,
-        T::release,
     );
     Stats {
         marked: marked.len(),
@@ -453,7 +452,7 @@ pub fn mark_minor<T: Trace>(
 /// The sweep half of [`collect_minor_with`]: frees the young objects
 /// [`mark_minor`] did not reach.
 pub fn sweep_minor<T: Trace>(heap: &mut Heap<T>, mark: MinorMark) -> Stats {
-    let swept = heap.sweep_young(mark.rescanned, T::interior_mutable, T::release);
+    let swept = heap.sweep_young(mark.rescanned, T::interior_mutable);
     Stats {
         marked: mark.marked,
         swept,

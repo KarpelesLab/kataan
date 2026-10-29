@@ -661,8 +661,10 @@ impl<T> Heap<T> {
         &mut self,
         mut keep: impl FnMut(Handle, &T) -> bool,
         sticky: impl Fn(&T) -> bool,
-        release: impl Fn(T),
-    ) -> usize {
+    ) -> usize
+    where
+        T: crate::gc::Trace,
+    {
         let Self {
             slots,
             free,
@@ -709,7 +711,7 @@ impl<T> Heap<T> {
             // retired rather than reused.
             let next_gen = slot.generation.wrapping_add(1);
             if let Some(v) = slot.vacate(next_gen) {
-                release(v);
+                v.release();
             }
             if next_gen < COMPACT_GEN_BASE {
                 free.push(i as u32);
@@ -777,12 +779,10 @@ impl<T> Heap<T> {
     /// out: those slots leave the remembered set unless `sticky(value)` holds,
     /// as do the surviving young objects for which it holds. Afterwards no
     /// object is young, so no old-to-young edge exists.
-    pub fn sweep_young(
-        &mut self,
-        rescanned: Vec<u32>,
-        sticky: impl Fn(&T) -> bool,
-        release: impl Fn(T),
-    ) -> usize {
+    pub fn sweep_young(&mut self, rescanned: Vec<u32>, sticky: impl Fn(&T) -> bool) -> usize
+    where
+        T: crate::gc::Trace,
+    {
         let Self {
             slots,
             free,
@@ -805,31 +805,38 @@ impl<T> Heap<T> {
         }
         let floor = *young_floor;
         let mut swept = 0;
+        // Counted locally (and the tables walked as plain slices), so the
+        // loops below keep their state in registers.
+        let mut live_n = *live;
         let mut poison = poison.as_deref_mut();
         // The free-list entries consumed since the last collection: each one
         // freed again is written back over the consumed part, which never
         // runs ahead of the reading.
         let mut kept = *free_top;
-        for r in *free_top..free.len() {
-            let i = free[r];
-            let i_us = i as usize;
-            let slot = &mut slots[i_us];
-            let p = poison.as_deref_mut();
-            if settle_young(
-                slot, i_us, &sticky, &release, remembered, &mut swept, live, p,
-            ) {
-                free[kept] = i;
-                kept += 1;
+        {
+            let slots = slots.as_mut_slice();
+            let free = free.as_mut_slice();
+            let start = kept;
+            for r in start..free.len() {
+                let i = free[r];
+                let i_us = i as usize;
+                let slot = &mut slots[i_us];
+                let p = poison.as_deref_mut();
+                if settle_young(slot, i_us, &sticky, remembered, &mut swept, &mut live_n, p) {
+                    free[kept] = i;
+                    kept += 1;
+                }
             }
         }
         free.truncate(kept);
         // The slots pushed since.
         for (i, slot) in slots.iter_mut().enumerate().skip(floor) {
             let p = poison.as_deref_mut();
-            if settle_young(slot, i, &sticky, &release, remembered, &mut swept, live, p) {
+            if settle_young(slot, i, &sticky, remembered, &mut swept, &mut live_n, p) {
                 free.push(i as u32);
             }
         }
+        *live = live_n;
         *free_top = free.len();
         *young_floor = slots.len();
         swept
@@ -1048,11 +1055,10 @@ impl<T> Heap<T> {
 /// whether slot `i` goes back on the free list.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)] // the sweep's split borrows
-fn settle_young<T>(
+fn settle_young<T: crate::gc::Trace>(
     slot: &mut Slot<T>,
     i: usize,
     sticky: &impl Fn(&T) -> bool,
-    release: &impl Fn(T),
     remembered: &mut Vec<u32>,
     swept: &mut usize,
     live: &mut usize,
@@ -1081,7 +1087,7 @@ fn settle_young<T>(
     *live -= 1;
     let next_gen = slot.generation.wrapping_add(1);
     if let Some(v) = slot.vacate(next_gen) {
-        release(v);
+        v.release();
     }
     next_gen < COMPACT_GEN_BASE
 }

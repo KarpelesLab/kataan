@@ -49,7 +49,7 @@
 #![allow(unsafe_code)]
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::cell::{Cell, UnsafeCell};
+use core::cell::UnsafeCell;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::alloc::System;
@@ -194,18 +194,32 @@ impl Stash {
 }
 
 /// A thread's cache: per-class free lists plus a bump arena.
+///
+/// Its lifecycle is folded into data the fast paths read anyway, so neither
+/// tests it: until the cache is set up (and after it is torn down) every free
+/// list is empty, so an allocation finds nothing to pop, and every `limit` is
+/// zero, so a free finds its list "full". Both then take the cold path, which
+/// is where [`state`](Cache::state) is looked at.
 struct Cache {
     lists: [List; NCLASS],
+    /// Per class, the list length at which a free leaves the fast path:
+    /// `SPILL_BYTES / class size` while [`LIVE`], `0` otherwise.
+    limit: [u32; NCLASS],
     bump: *mut u8,
     end: *mut u8,
+    /// [`UNINIT`], [`INIT`] (the thread-exit hook is being registered),
+    /// [`LIVE`] or [`DEAD`] (torn down).
+    state: u8,
 }
 
 impl Cache {
     const fn new() -> Self {
         Cache {
             lists: [List::EMPTY; NCLASS],
+            limit: [0; NCLASS],
             bump: ptr::null_mut(),
             end: ptr::null_mut(),
+            state: UNINIT,
         }
     }
 
@@ -247,7 +261,7 @@ impl Cache {
             let s = *spare;
             if !s.is_null() {
                 // SAFETY: `s` heads the spare list (under the lock); its
-                // header was written by `Drop for CacheSlot`.
+                // header was written by `Cache::tear_down`.
                 *spare = unsafe { (*s).next };
             }
             s
@@ -270,38 +284,32 @@ impl Cache {
         self.end = unsafe { p.add(ARENA) };
     }
 
-    #[inline]
-    fn alloc(&mut self, c: usize) -> *mut u8 {
-        let p = self.lists[c].pop();
-        if p.is_null() { self.refill(c) } else { p }
-    }
-
-    #[inline]
-    fn dealloc(&mut self, p: *mut u8, c: usize) {
+    /// A free whose list is at its limit, or into a cache that is not live:
+    /// moves the full list to the stash, or routes the block around the cache.
+    #[cold]
+    fn dealloc_slow(&mut self, p: *mut u8, c: usize) {
+        if self.state != LIVE {
+            return dealloc_uncached(p, c);
+        }
         let l = &mut self.lists[c];
         l.push(p);
-        if l.len * class_size(c) > SPILL_BYTES {
-            let full = core::mem::replace(l, List::EMPTY);
-            STASH.with(|lists, _| {
-                lists[c].append(full);
-                STASH_HAS[c].store(true, Ordering::Relaxed);
-            });
-        }
+        let full = core::mem::replace(l, List::EMPTY);
+        STASH.with(|lists, _| {
+            lists[c].append(full);
+            STASH_HAS[c].store(true, Ordering::Relaxed);
+        });
     }
-}
 
-/// Thread-local slot holding the cache; its destructor hands everything back
-/// to the stash when the thread exits.
-struct CacheSlot(UnsafeCell<Cache>);
-
-impl Drop for CacheSlot {
-    fn drop(&mut self) {
-        STATE.with(|s| s.set(DEAD));
-        let cache = self.0.get_mut();
-        let lists = core::mem::replace(&mut cache.lists, [List::EMPTY; NCLASS]);
-        let (bump, end) = (cache.bump, cache.end);
-        cache.bump = ptr::null_mut();
-        cache.end = ptr::null_mut();
+    /// Hands every list and the unused arena tail back to the stash and marks
+    /// the cache [`DEAD`], so whatever this thread frees or allocates later
+    /// (in other thread-local destructors) goes through the stash.
+    fn tear_down(&mut self) {
+        self.state = DEAD;
+        self.limit = [0; NCLASS];
+        let lists = core::mem::replace(&mut self.lists, [List::EMPTY; NCLASS]);
+        let (bump, end) = (self.bump, self.end);
+        self.bump = ptr::null_mut();
+        self.end = ptr::null_mut();
         STASH.with(|stash, spare| {
             for ((dst, src), has) in stash.iter_mut().zip(lists).zip(&STASH_HAS) {
                 if !src.head.is_null() {
@@ -325,15 +333,43 @@ const INIT: u8 = 1;
 const LIVE: u8 = 2;
 const DEAD: u8 = 3;
 
-std::thread_local! {
-    /// The cache's lifecycle (no destructor, so reading it never registers one).
-    static STATE: Cell<u8> = const { Cell::new(UNINIT) };
-    static CACHE: CacheSlot = const { CacheSlot(UnsafeCell::new(Cache::new())) };
+/// Registered (by touching [`EXIT`]) when a thread's cache goes live; its
+/// destructor tears the cache down when the thread exits.
+struct ExitHook;
+
+impl Drop for ExitHook {
+    fn drop(&mut self) {
+        // SAFETY: a thread-local destructor runs on its own thread, outside
+        // any allocator call, so nothing else holds a reference to the cache.
+        unsafe { (*cache_ptr()).tear_down() };
+    }
 }
 
-#[inline]
-fn class_of(size: usize) -> usize {
-    size.max(1).div_ceil(GRAN) - 1
+std::thread_local! {
+    /// The cache. It has no destructor, so reaching it is a plain
+    /// thread-local address computation, valid for the whole life of the
+    /// thread (no registration check on the fast path).
+    static CACHE: UnsafeCell<Cache> = const { UnsafeCell::new(Cache::new()) };
+    /// The thread-exit hook (see [`ExitHook`]).
+    static EXIT: ExitHook = const { ExitHook };
+}
+
+/// This thread's cache. Every use is a short exclusive access from inside an
+/// allocator call (never re-entered while it holds one: the cache paths call
+/// only `System` and the stash, and the one call that may allocate, the
+/// exit-hook registration, holds no reference) or from the exit hook.
+#[inline(always)]
+fn cache_ptr() -> *mut Cache {
+    CACHE.with(UnsafeCell::get)
+}
+
+/// The class of a request, or `None` for one the pool does not serve (too
+/// large, over-aligned, or of size zero).
+#[inline(always)]
+fn small_class(layout: Layout) -> Option<usize> {
+    // Size zero wraps to a huge class, so the one comparison rejects it too.
+    let c = layout.size().wrapping_sub(1) / GRAN;
+    (c < NCLASS && layout.align() <= GRAN).then_some(c)
 }
 
 #[inline]
@@ -341,39 +377,36 @@ fn class_size(c: usize) -> usize {
     (c + 1) * GRAN
 }
 
-#[inline]
-fn is_small(layout: Layout) -> bool {
-    layout.size() <= MAX_SMALL && layout.align() <= GRAN
-}
-
-/// Runs `f` on this thread's cache, or returns `None` while the cache is
-/// being set up or after it has been torn down.
-#[inline]
-fn with_cache<R>(f: impl FnOnce(&mut Cache) -> R) -> Option<R> {
-    let state = STATE.try_with(Cell::get).unwrap_or(DEAD);
+/// The slow path of an allocation of class `c` whose free list is empty:
+/// sets the cache up on first use, refills it, or works without it.
+#[cold]
+fn alloc_slow(cache: *mut Cache, c: usize) -> *mut u8 {
+    // SAFETY (every dereference of `cache` below): see `cache_ptr`; no
+    // reference to the cache is live across the exit-hook registration.
+    let state = unsafe { (*cache).state };
     match state {
         LIVE => {}
         UNINIT => {
-            // First touch of `CACHE` registers its destructor, which may
-            // itself allocate; mark the window so that re-entry falls back.
-            let _ = STATE.try_with(|s| s.set(INIT));
-            let ok = CACHE.try_with(|_| ()).is_ok();
-            let _ = STATE.try_with(|s| s.set(if ok { LIVE } else { DEAD }));
+            // SAFETY: as above.
+            unsafe { (*cache).state = INIT };
+            // First touch of `EXIT` registers its destructor, which may itself
+            // allocate: that re-entry sees `INIT` and falls back below.
+            let ok = EXIT.try_with(|_| ()).is_ok();
+            // SAFETY: as above; the registration has returned.
+            let cache = unsafe { &mut *cache };
             if !ok {
-                return None;
+                cache.state = DEAD;
+                return alloc_uncached(c);
+            }
+            cache.state = LIVE;
+            for (k, l) in cache.limit.iter_mut().enumerate() {
+                *l = (SPILL_BYTES / class_size(k)) as u32;
             }
         }
-        _ => return None,
+        _ => return alloc_uncached(c),
     }
-    CACHE
-        .try_with(|slot| {
-            // SAFETY: the cache is only reached through this function, which
-            // is not re-entered while `f` runs (`f` never allocates: the
-            // cache paths call only `System` and the stash), so this is the
-            // sole live reference.
-            f(unsafe { &mut *slot.0.get() })
-        })
-        .ok()
+    // SAFETY: as above (a live cache; `refill` does not re-enter).
+    unsafe { (*cache).refill(c) }
 }
 
 /// Fallback allocation of class `c` without a thread cache.
@@ -396,6 +429,33 @@ fn dealloc_uncached(p: *mut u8, c: usize) {
     });
 }
 
+/// Allocates a block of class `c` (`< NCLASS`): the common case pops the
+/// thread's list.
+#[inline]
+fn alloc_class(c: usize) -> *mut u8 {
+    let cache = cache_ptr();
+    // SAFETY: see `cache_ptr`; `c < NCLASS`.
+    let p = unsafe { (*cache).lists.get_unchecked_mut(c).pop() };
+    if p.is_null() { alloc_slow(cache, c) } else { p }
+}
+
+/// Frees block `p` of class `c` (`< NCLASS`): the common case pushes it on
+/// the thread's list.
+#[inline]
+fn dealloc_class(p: *mut u8, c: usize) {
+    // SAFETY: see `cache_ptr`; `c < NCLASS`.
+    unsafe {
+        let cache = &mut *cache_ptr();
+        let limit = *cache.limit.get_unchecked(c) as usize;
+        let l = cache.lists.get_unchecked_mut(c);
+        if l.len < limit {
+            l.push(p);
+        } else {
+            cache.dealloc_slow(p, c);
+        }
+    }
+}
+
 /// The pooling allocator. A zero-sized handle; all state is per-thread or in
 /// the process-wide stash. See the [module docs](crate::pool_alloc).
 #[derive(Debug, Default, Clone, Copy)]
@@ -406,38 +466,37 @@ pub struct PoolAlloc;
 // and every class size is a multiple of 16), which satisfies any alignment up
 // to 16; every other request is forwarded to `System` unchanged. A block is
 // only ever on one free list, so no two live allocations overlap.
+//
+// The entry points are kept out of line: inlined into every allocation site
+// of the program, the fast paths grew the executable by ~4% (and its
+// resident size with it) for ~1% fewer instructions.
 unsafe impl GlobalAlloc for PoolAlloc {
-    #[inline]
+    #[inline(never)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if !is_small(layout) {
+        match small_class(layout) {
+            Some(c) => alloc_class(c),
             // SAFETY: forwarded with the caller's (valid, non-zero) layout.
-            return unsafe { System.alloc(layout) };
+            None => unsafe { System.alloc(layout) },
         }
-        let c = class_of(layout.size());
-        with_cache(|cache| cache.alloc(c)).unwrap_or_else(|| alloc_uncached(c))
     }
 
-    #[inline]
+    #[inline(never)]
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
-        if !is_small(layout) {
+        match small_class(layout) {
+            Some(c) => dealloc_class(p, c),
             // SAFETY: a non-small layout was allocated by `System` with this
             // same layout.
-            return unsafe { System.dealloc(p, layout) };
-        }
-        let c = class_of(layout.size());
-        if with_cache(|cache| cache.dealloc(p, c)).is_none() {
-            dealloc_uncached(p, c);
+            None => unsafe { System.dealloc(p, layout) },
         }
     }
 
-    #[inline]
+    #[inline(never)]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if !is_small(layout) {
+        let Some(c) = small_class(layout) else {
             // SAFETY: forwarded with the caller's layout.
             return unsafe { System.alloc_zeroed(layout) };
-        }
-        // SAFETY: same contract as `alloc`.
-        let p = unsafe { self.alloc(layout) };
+        };
+        let p = alloc_class(c);
         if !p.is_null() {
             // SAFETY: `p` is valid for `layout.size()` bytes.
             unsafe { ptr::write_bytes(p, 0, layout.size()) };
@@ -445,19 +504,16 @@ unsafe impl GlobalAlloc for PoolAlloc {
         p
     }
 
-    #[inline]
+    #[inline(never)]
     unsafe fn realloc(&self, p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let old_small = is_small(layout);
         // SAFETY: `GlobalAlloc::realloc` requires `new_size` with the old
         // alignment to form a valid layout.
         let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
-        let new_small = is_small(new_layout);
-        if !old_small && !new_small {
+        match (small_class(layout), small_class(new_layout)) {
             // SAFETY: both sides are `System` allocations.
-            return unsafe { System.realloc(p, layout, new_size) };
-        }
-        if old_small && new_small && class_of(layout.size()) == class_of(new_size) {
-            return p;
+            (None, None) => return unsafe { System.realloc(p, layout, new_size) },
+            (Some(a), Some(b)) if a == b => return p,
+            _ => {}
         }
         // SAFETY: `new_layout` is valid (see above).
         let q = unsafe { self.alloc(new_layout) };
@@ -483,11 +539,15 @@ mod tests {
 
     #[test]
     fn classes_round_up() {
-        assert_eq!(class_of(1), 0);
-        assert_eq!(class_of(16), 0);
-        assert_eq!(class_of(17), 1);
-        assert_eq!(class_size(class_of(MAX_SMALL)), MAX_SMALL);
-        assert_eq!(class_of(MAX_SMALL), NCLASS - 1);
+        let class_of = |size| small_class(lay(size, 8));
+        assert_eq!(class_of(1), Some(0));
+        assert_eq!(class_of(16), Some(0));
+        assert_eq!(class_of(17), Some(1));
+        assert_eq!(class_of(MAX_SMALL).map(class_size), Some(MAX_SMALL));
+        assert_eq!(class_of(MAX_SMALL), Some(NCLASS - 1));
+        assert_eq!(class_of(MAX_SMALL + 1), None);
+        assert_eq!(small_class(lay(0, 1)), None);
+        assert_eq!(small_class(lay(64, 32)), None);
     }
 
     /// Fills each block with a per-block byte pattern and checks it survives
