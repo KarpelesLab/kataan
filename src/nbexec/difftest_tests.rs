@@ -1516,3 +1516,25 @@ fn global_declarations_create_properties_in_spec_order() {
     );
 }
 
+/// A sloppy `eval` whose declarations are rejected (EvalDeclarationInstantiation
+/// throws before creating any binding) must leave the caller's Annex B
+/// block-function bookkeeping intact: a later block function at that level
+/// still becomes visible in the enclosing variable scope. It was lost, so
+/// the call threw "is not a function".
+#[test]
+fn rejected_eval_declarations_keep_annex_b_block_functions() {
+    let src = r#"
+        var r = [];
+        try { (0, eval)("var zz; function NaN() {}"); } catch (e) { r.push(e.constructor.name, "zz" in globalThis); }
+        { function blk() { return 3; } }
+        r.push(blk());
+        (function () {
+            let q;
+            { try { eval("var q;"); } catch (e) { r.push(e.constructor.name); } }
+            { function inner() { return 4; } }
+            r.push(inner());
+        })();
+        r.join()
+    "#;
+    assert_eq!(run(src), "TypeError,false,3,SyntaxError,4");
+}

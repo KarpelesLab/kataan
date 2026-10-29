@@ -6059,7 +6059,12 @@ impl Interp {
             } else {
                 self.global_scope.clone()
             };
-            self.eval_declaration_checks(program, &lex_env, &var_env)?;
+            // A rejected declaration must leave the caller's Annex B
+            // block-function list in place too.
+            if let Err(e) = self.eval_declaration_checks(program, &lex_env, &var_env) {
+                self.annexb_block_fns = saved_annexb;
+                return Err(e);
+            }
         }
 
         // Both kinds get a fresh declarative *lexical* environment (child of the
