@@ -194,6 +194,17 @@ fn transfer(op: &Op, s: &mut [u8]) {
         | Op::TypeOf { dst, .. } => (*dst, T_ANY),
         // Ops that write no register (a `PushHandler`'s register is bound at its
         // catch entry, which the analysis assumes holds anything).
+        // An inlined call's guard: a boolean, and the callee's captures.
+        Op::InlineGuard {
+            dst, caps, n_caps, ..
+        } => {
+            for i in 0..*n_caps {
+                if let Some(x) = s.get_mut(caps.wrapping_add(i) as usize) {
+                    *x = T_ANY;
+                }
+            }
+            (*dst, T_BOOL)
+        }
         Op::SetProp { .. }
         | Op::SetPropStrict { .. }
         | Op::SetKey { .. }
@@ -206,6 +217,7 @@ fn transfer(op: &Op, s: &mut [u8]) {
         | Op::RequireObjectCoercible { .. }
         | Op::PushHandler { .. }
         | Op::PopHandler
+        | Op::InlineLeave
         | Op::Jump { .. }
         | Op::JumpIfFalse { .. }
         | Op::Return { .. }
@@ -530,6 +542,8 @@ fn generic_region_op(op: &GenericOp, bc: &Op) -> bool {
         | GenericOp::CallMethod { .. }
         | GenericOp::CallValue { .. }
         | GenericOp::CallKey { .. } => true,
+        // An inlined call's guard and end (`super::inline`): no call.
+        GenericOp::InlineGuard { .. } | GenericOp::InlineLeave => true,
         // `!x` (a boolean or Number inline) and an array iteration's step in
         // by-index mode (`for (… of array)`, inline while the array lasts).
         GenericOp::Not { .. } => true,
@@ -2549,7 +2563,7 @@ fn disp(r: u16) -> i32 {
 /// The registers `op` writes (`defs`) and reads (`uses`), for liveness: exact
 /// for the ops regions are made of, and conservatively "reads everything it
 /// names, writes nothing" for every other op.
-fn def_use(op: &Op, defs: &mut Vec<u16>, uses: &mut Vec<u16>) {
+pub(super) fn def_use(op: &Op, defs: &mut Vec<u16>, uses: &mut Vec<u16>) {
     defs.clear();
     uses.clear();
     match op {
@@ -2612,7 +2626,22 @@ fn def_use(op: &Op, defs: &mut Vec<u16>, uses: &mut Vec<u16>) {
                 defs.push(*dst);
             }
         }
-        Op::Jump { .. } => {}
+        Op::Jump { .. } | Op::InlineLeave => {}
+        // The guard writes its result and (on a hit) the inlined body's
+        // captures, and reads the call's callee and arguments.
+        Op::InlineGuard {
+            dst,
+            callee,
+            args,
+            caps,
+            n_caps,
+            ..
+        } => {
+            defs.push(*dst);
+            defs.extend((0..*n_caps).map(|i| caps.wrapping_add(i)));
+            uses.push(*callee);
+            uses.extend(args.iter().copied());
+        }
         // A step writes its value, `done` and the cursor, but not on every
         // path: each is a use as well (live across it), and a def (written).
         Op::IterNext {

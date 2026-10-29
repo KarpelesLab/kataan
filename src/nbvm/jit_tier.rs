@@ -293,24 +293,38 @@ fn run_compiled_at(
     // SAFETY: `st` is this thread's live stack; nothing else borrows it.
     #[allow(unsafe_code)]
     let (top, room) = unsafe { ((*st).top, (*st).limit.offset_from((*st).top) as usize) };
-    let raw = if regs.len() <= room {
-        // SAFETY: `top..top + regs.len()` is free, in-bounds stack memory; it is
+    // A body that inlined calls has a larger window than the function's own
+    // registers (its inlined bodies' sub-window, which starts `undefined`).
+    let n = regs.len().max(jit.n_regs());
+    let raw = if n <= room {
+        // SAFETY: `top..top + n` is free, in-bounds stack memory; it is
         // claimed (by moving `top`) for exactly this activation.
         #[allow(unsafe_code)]
         let window = unsafe {
             core::ptr::copy_nonoverlapping(regs.as_ptr().cast::<u64>(), top, regs.len());
-            (*st).top = top.add(regs.len());
-            core::slice::from_raw_parts_mut(top.cast::<NanBox>(), regs.len())
+            for i in regs.len()..n {
+                top.add(i).write(NanBox::undefined().to_bits());
+            }
+            (*st).top = top.add(n);
+            core::slice::from_raw_parts_mut(top.cast::<NanBox>(), n)
         };
         let outer = (ctx.jit_rt.exit_regs, ctx.jit_rt.exit_jit);
         if exitable {
             ctx.jit_rt.exit_regs = window.as_ptr() as usize;
             ctx.jit_rt.exit_jit = jit as *const crate::jit::JitProto;
         }
+        // SAFETY: as above.
+        #[allow(unsafe_code)]
+        let frames = unsafe { (*st).frames };
         let raw = jit.call_frame_raw(ctx_ptr, window, entry);
+        // Every activation the body pushed (calls, inlined calls) is gone.
+        #[allow(unsafe_code)]
+        let after = unsafe { (*st).frames };
+        debug_assert_eq!(frames, after, "a compiled activation left a call header");
         (ctx.jit_rt.exit_regs, ctx.jit_rt.exit_jit) = outer;
         if keep || raw == Some(NanBox::jit_exit_bits()) {
-            regs.copy_from_slice(window);
+            let k = regs.len();
+            regs.copy_from_slice(&window[..k]);
         }
         // SAFETY: as above; the activation is over.
         #[allow(unsafe_code)]
@@ -319,7 +333,9 @@ fn run_compiled_at(
         }
         raw
     } else {
-        // (The rare full stack: such an activation never leaves.)
+        // (The rare full stack: such an activation never leaves. A body
+        // whose window is larger than `regs` does not run: `call_frame_raw`
+        // refuses it.)
         jit.call_frame_raw(ctx_ptr, regs, entry)
     };
     if raw == Some(NanBox::jit_exit_bits()) {
@@ -477,8 +493,16 @@ fn run_tiering(
     // the function's newest code (the old body, which can always be entered
     // there, if the recompilation failed).
     while let Some((pc, h)) = ctx.jit_rt.left.take() {
-        jit = recompile(ctx, funcs, id, &jit, ic).unwrap_or(jit);
-        r = run_compiled_at(ctx, funcs, &jit, regs, pc, &h, true, keep)?;
+        let new = recompile(ctx, funcs, id, &jit, ic).unwrap_or_else(|| Rc::clone(&jit));
+        // (A recompilation with a larger window may not fit a full stack;
+        // the old body, which ran here, does.)
+        r = match run_compiled_at(ctx, funcs, &new, regs, pc, &h, true, keep) {
+            Some(x) => {
+                jit = new;
+                x
+            }
+            None => run_compiled_at(ctx, funcs, &jit, regs, pc, &h, true, keep)?,
+        };
     }
     Some(r)
 }
@@ -514,7 +538,17 @@ fn recompile(
             *w = c.warm_entry();
         }
     }
-    let mut new = crate::jit::JitProto::compile_generic_closures(
+    // The callees its call sites settled on, else the interpreter's.
+    let mut hints = old.call_hints();
+    if hints.len() < ic.len() {
+        hints.resize(ic.len(), crate::ic::CalleeHint::None);
+    }
+    for (h, c) in hints.iter_mut().zip(ic) {
+        if *h == crate::ic::CalleeHint::None {
+            *h = c.callee_hint();
+        }
+    }
+    let mut new = crate::jit::JitProto::compile_generic_inlining(
         proto,
         &super::jit_generic_helpers(),
         &warm,
@@ -523,6 +557,7 @@ fn recompile(
                 .get(f as usize)
                 .is_some_and(|p| !(p.is_async && !p.is_generator))
         },
+        &|pc, _| inline_candidate(funcs, id, &hints, pc),
     )?;
     new.set_generation(old.generation() + 1);
     let new = Rc::new(new);
@@ -530,7 +565,11 @@ fn recompile(
         jit_log(
             id,
             proto,
-            &alloc::format!("recompiled (generation {})", new.generation()),
+            &alloc::format!(
+                "recompiled (generation {}, {} calls inlined)",
+                new.generation(),
+                new.inlined()
+            ),
         );
     }
     // The old code stays alive with the function: compiled callers may hold
@@ -1140,7 +1179,7 @@ pub(super) fn call_compiled_with(
         ctx.frames_published += 1;
     }
     if jit.native_entry().is_some()
-        && jit.n_regs() == proto.n_regs
+        && jit.n_regs() >= proto.n_regs
         && let Some(caps) = ctx
             .realm
             .vm_function(handle)
@@ -1155,7 +1194,7 @@ pub(super) fn call_compiled_with(
                 ctx,
                 funcs,
                 &jit,
-                proto.n_regs,
+                jit.n_regs(),
                 callee_val,
                 caps.cast::<u64>(),
                 this,
@@ -1380,7 +1419,7 @@ impl CompiledCallback {
         let captures = caps.iter().copied().take(proto.n_captures).collect();
         // What `fill_call_site` requires of a native-call target.
         let native_regs =
-            (jit.native_entry().is_some() && jit.n_regs() == proto.n_regs).then_some(proto.n_regs);
+            (jit.native_entry().is_some() && jit.n_regs() >= proto.n_regs).then_some(jit.n_regs());
         Some(Self {
             callee,
             id,
@@ -1734,7 +1773,8 @@ fn fill_call_site(ctx: &mut Ctx, callee: NanBox, site: &mut CallSite) {
     let Some(code) = jit.native_entry() else {
         return;
     };
-    if jit.n_regs() != proto.n_regs {
+    // (An inlining body's window is larger than the function's own.)
+    if jit.n_regs() < proto.n_regs {
         return;
     }
     // The compiled body stays alive for the context's life (`direct` and the
@@ -1742,7 +1782,7 @@ fn fill_call_site(ctx: &mut Ctx, callee: NanBox, site: &mut CallSite) {
     site.fill(crate::jit::CallTarget {
         key: u64::from(fid) | ((n_caps as u64) << 32),
         code,
-        frame_bytes: (proto.n_regs * 8) as u64,
+        frame_bytes: (jit.n_regs() * 8) as u64,
     });
 }
 
@@ -1920,12 +1960,12 @@ fn fill_construct_site(ctx: &mut Ctx, ctor: NanBox, site: &mut CallSite) {
         && n_caps >= proto.n_captures
         && let Some(jit) = construct_target(proto)
         && let Some(code) = jit.native_entry()
-        && jit.n_regs() == proto.n_regs
+        && jit.n_regs() >= proto.n_regs
     {
         site.fill(crate::jit::CallTarget {
             key: u64::from(fid) | ((n_caps as u64) << 32),
             code,
-            frame_bytes: (proto.n_regs * 8) as u64,
+            frame_bytes: (jit.n_regs() * 8) as u64,
         });
     }
 }
@@ -2073,7 +2113,7 @@ fn construct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
         return None;
     }
     match proto.tier.jit() {
-        Some(Some(j)) if j.is_generic() && j.n_regs() <= proto.n_regs => Some(j),
+        Some(Some(j)) if j.is_generic() => Some(j),
         _ => None,
     }
 }
@@ -2544,7 +2584,7 @@ fn direct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
         return None;
     }
     match proto.tier.jit() {
-        Some(Some(j)) if j.is_generic() && j.n_regs() <= proto.n_regs => Some(j),
+        Some(Some(j)) if j.is_generic() => Some(j),
         Some(Some(_)) => generic_twin(proto),
         _ => None,
     }
@@ -2576,7 +2616,7 @@ fn generic_twin(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
             )
         })
         .flatten()
-        .filter(|j| j.is_generic() && j.n_regs() <= proto.n_regs)
+        .filter(|j| j.is_generic())
         .map(Rc::new);
     proto.tier.set_twin(twin.clone());
     twin
@@ -2665,8 +2705,53 @@ fn wants_to_leave(ctx: &mut Ctx, header: usize) -> bool {
     if !exit_stress() && !jit.wants_recompile(header) {
         return false;
     }
-    ctx.jit_rt.resume = Some(header);
+    // (The function's own pc: an inlining body numbers its ops otherwise.)
+    ctx.jit_rt.resume = Some(jit.orig_pc(header));
     true
+}
+
+/// Whether the generic tier inlines calls (`KATAAN_JIT_INLINE=0` turns it
+/// off; read once per process).
+fn inline_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_INLINE").is_none_or(|v| v != "0"))
+}
+
+/// The callee function `caller`'s call site at pc `pc` inlines, if any: the
+/// one VM function its feedback `hints` names, with that function's warm
+/// inline caches (its compiled body's, else its interpreter's). Whether it
+/// can be inlined at all is `crate::jit::inline`'s to decide.
+pub(super) fn inline_candidate<'a>(
+    funcs: &'a [FnProto],
+    caller: usize,
+    hints: &[crate::ic::CalleeHint],
+    pc: usize,
+) -> Option<crate::jit::inline::Candidate<'a>> {
+    let crate::ic::CalleeHint::One(key) = *hints.get(pc)? else {
+        return None;
+    };
+    let fid = (key & 0xffff_ffff) as usize;
+    if fid == caller || !inline_enabled() {
+        return None;
+    }
+    let proto = funcs.get(fid)?;
+    if !crate::jit::inline::callee_ok(proto) {
+        return None;
+    }
+    let mut warm = match proto.tier.jit() {
+        Some(Some(j)) if j.is_generic() => j.runtime_warm(),
+        _ => alloc::vec::Vec::new(),
+    };
+    let interp = super::tier_warm(proto);
+    if warm.len() < interp.len() {
+        warm.resize(interp.len(), None);
+    }
+    for (w, i) in warm.iter_mut().zip(interp) {
+        if w.is_none() {
+            *w = i;
+        }
+    }
+    Some(crate::jit::inline::Candidate { key, proto, warm })
 }
 
 /// Whether `KATAAN_JIT_LOG` is set: report, per function, whether the JIT

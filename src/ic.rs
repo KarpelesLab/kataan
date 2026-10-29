@@ -46,6 +46,23 @@ pub struct PropertyCache {
     /// Whether `shape` was last armed by an add (see
     /// [`arm_transition`](Self::arm_transition)) rather than a lookup.
     by_add: bool,
+    /// For a call site: which VM closure it calls ([`CalleeHint`]), the
+    /// feedback the machine-code tier inlines a callee from.
+    callee: CalleeHint,
+}
+
+/// What a call site has called: nothing yet, always the one VM function
+/// whose id and capture count are the key (`id | n_captures << 32`), or more
+/// than one.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CalleeHint {
+    /// No VM closure called yet.
+    #[default]
+    None,
+    /// Always this key.
+    One(u64),
+    /// Several.
+    Mixed,
 }
 
 /// How many times a site's [`ChainCache`] may be (re)armed.
@@ -172,6 +189,22 @@ impl PropertyCache {
             return None;
         }
         self.shape.as_ref().map(|s| (s, self.slot, self.by_add))
+    }
+
+    /// Records that the call site called the VM closure with key `key`
+    /// (see [`CalleeHint`]).
+    pub fn note_callee(&mut self, key: u64) {
+        self.callee = match self.callee {
+            CalleeHint::None => CalleeHint::One(key),
+            CalleeHint::One(k) if k == key => CalleeHint::One(k),
+            _ => CalleeHint::Mixed,
+        };
+    }
+
+    /// The call site's callee feedback (see [`CalleeHint`]).
+    #[must_use]
+    pub fn callee_hint(&self) -> CalleeHint {
+        self.callee
     }
 
     /// Arms the cache with `warm`'s memo (counters start afresh).

@@ -24,6 +24,8 @@ use alloc::vec::Vec;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod call_seq;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub mod inline;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod props;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod recv_cache;
@@ -2094,6 +2096,24 @@ pub enum GenericOp {
     },
     /// `Op::PopHandler`: leave the innermost `try` region.
     PopHandler,
+    /// `Op::InlineGuard` (see `inline`): whether the call op at `call` calls
+    /// the function `key` names — its callee identified as the call
+    /// sequence's, the same limits checked and the same activation header
+    /// pushed — with its captures loaded into `caps..caps + n_caps`.
+    InlineGuard {
+        /// The boolean result register.
+        dst: u16,
+        /// The guarded call op's pc.
+        call: u32,
+        /// The expected callee key (`CalleeInfo::key`).
+        key: u64,
+        /// The first capture register.
+        caps: u16,
+        /// How many captures.
+        n_caps: u16,
+    },
+    /// `Op::InlineLeave`: pop the inlined activation's header.
+    InlineLeave,
     /// `Op::CallMethod` (`recv.key(args)`): `jit_helper_call_method` runs the
     /// interpreter's method call with a persistent per-site method cache (the
     /// one-op fallback would start every call with a cold one), entering a
@@ -2487,6 +2507,46 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
                 reg: r(*reg)?,
             },
             Op::PopHandler => GenericOp::PopHandler,
+            Op::InlineGuard {
+                dst,
+                call,
+                key,
+                callee,
+                args,
+                caps,
+                n_caps,
+            } => {
+                // The guarded call must be a call op with a native sequence
+                // (its argument table entry), reading the same registers.
+                let same = match proto.ops.get(*call) {
+                    Some(Op::CallMethod {
+                        recv,
+                        args: a,
+                        key: k,
+                        ..
+                    }) => recv == callee && a == args && k != "caller",
+                    Some(Op::CallValue {
+                        callee: c, args: a, ..
+                    }) => c == callee && a == args,
+                    Some(Op::GetProp { obj, .. }) => obj == callee && args.is_empty(),
+                    _ => false,
+                };
+                if !same || args.len() > 32 || *call <= pc {
+                    return None;
+                }
+                for i in 0..*n_caps {
+                    r(caps.checked_add(i)?)?;
+                }
+                r(*callee)?;
+                GenericOp::InlineGuard {
+                    dst: r(*dst)?,
+                    call: u32::try_from(*call).ok()?,
+                    key: *key,
+                    caps: *caps,
+                    n_caps: *n_caps,
+                }
+            }
+            Op::InlineLeave => GenericOp::InlineLeave,
             Op::CallMethod {
                 dst,
                 recv,
@@ -2756,6 +2816,10 @@ pub struct JitProto {
     /// Int/Float tiers). Owns the key strings and inline caches the emitted code
     /// holds raw pointers into, so those pointers stay valid for the code's life.
     sites: Option<GenericSites>,
+    /// Generic tier, a body that inlined calls (`inline`): its pc maps — per
+    /// own pc its pc in the body, and per body pc the function's own (or
+    /// `u32::MAX` inside an inlined body).
+    pc_map: Option<alloc::boxed::Box<(Vec<u32>, Vec<u32>)>>,
 }
 
 /// Per-site key + inline-cache storage for a generic-tier body, owned by the
@@ -2772,6 +2836,9 @@ struct GenericSites {
     keys: Vec<alloc::boxed::Box<str>>,
     /// Persistent monomorphic inline caches, one per site.
     caches: alloc::boxed::Box<[core::cell::UnsafeCell<crate::ic::PropertyCache>]>,
+    /// `(pc, call cache)` of every `CallMethod`/`CallValue` with a native
+    /// call sequence, by pc.
+    call_pcs: Vec<(u32, u16)>,
     /// The `CallValue` sites' one-entry callee caches (the emitted code holds
     /// their addresses; the site helper refills them).
     #[allow(dead_code)]
@@ -3298,6 +3365,7 @@ impl JitProto {
                 n_regs: proto.n_regs,
                 osr_entries: Vec::new(),
                 bytecode: None,
+                pc_map: None,
             });
         }
         let ops = lower_nbvm_float(proto)?;
@@ -3311,6 +3379,7 @@ impl JitProto {
             n_regs: proto.n_regs,
             osr_entries: Vec::new(),
             bytecode: None,
+            pc_map: None,
         })
     }
 
@@ -3415,6 +3484,45 @@ impl JitProto {
         warm: &[Option<crate::ic::WarmEntry>],
         plain: &dyn Fn(u32) -> bool,
     ) -> Option<Self> {
+        Self::compile_generic_inlining(proto, helpers, warm, plain, &|_, _| None)
+    }
+
+    /// [`compile_generic_closures`](Self::compile_generic_closures), inlining
+    /// the callees `pick` names at call sites (see [`inline`]): `pick(pc,
+    /// op)` for the call op `op` at the function's own pc `pc`.
+    #[must_use]
+    pub fn compile_generic_inlining<'a>(
+        proto: &crate::nbvm::FnProto,
+        helpers: &GenericHelpers,
+        warm: &[Option<crate::ic::WarmEntry>],
+        plain: &dyn Fn(u32) -> bool,
+        pick: &dyn Fn(usize, &crate::nbvm::Op) -> Option<inline::Candidate<'a>>,
+    ) -> Option<Self> {
+        // The register `call_with_inner` puts `new.target` in, if any (a
+        // native-call entry fills it from the call header; one at or below the
+        // `this` slot would collide with an input, so such a body gets none).
+        let new_target = proto.ops.iter().take(2).find_map(|o| match o {
+            crate::nbvm::Op::LoadNewTarget { dst } => Some(*dst as usize),
+            _ => None,
+        });
+        let nt_ok = new_target.is_none_or(|nt| nt > proto.n_params + proto.n_captures);
+        let expanded = inline::expand(proto, warm, pick);
+        let spliced;
+        let (proto, warm, pc_map) = match expanded {
+            Some(e) => {
+                let mut p = proto.clone();
+                p.ops = e.ops;
+                p.n_regs = e.n_regs;
+                spliced = p;
+                (
+                    &spliced,
+                    e.warm,
+                    Some(alloc::boxed::Box::new((e.new_of, e.orig_of))),
+                )
+            }
+            None => (proto, warm.to_vec(), None),
+        };
+        let warm = &warm[..];
         let inline_closures: Vec<bool> = proto
             .ops
             .iter()
@@ -3508,6 +3616,20 @@ impl JitProto {
             })
             .collect();
         let tier_up = tierup::TierUp::plan(&ops, tier_baked);
+        let call_pcs: Vec<(u32, u16)> = ops
+            .iter()
+            .enumerate()
+            .filter_map(|(at, op)| match *op {
+                GenericOp::CallMethod { pc, cache, .. }
+                | GenericOp::CallValue { pc, cache, .. }
+                    if cache != u16::MAX =>
+                {
+                    Some((pc, cache))
+                }
+                GenericOp::GetProp { call, .. } => Some((u32::try_from(at).ok()?, call)),
+                _ => None,
+            })
+            .collect();
         let site_info: Vec<SiteInfo> = site_info
             .into_iter()
             .zip(baked_at)
@@ -3528,14 +3650,6 @@ impl JitProto {
             .collect();
         osr_entries.sort_unstable();
         osr_entries.dedup();
-        // The register `call_with_inner` puts `new.target` in, if any (a
-        // native-call entry fills it from the call header; one at or below the
-        // `this` slot would collide with an input, so such a body gets none).
-        let new_target = proto.ops.iter().take(2).find_map(|o| match o {
-            crate::nbvm::Op::LoadNewTarget { dst } => Some(*dst as usize),
-            _ => None,
-        });
-        let nt_ok = new_target.is_none_or(|nt| nt > proto.n_params + proto.n_captures);
         let (func, native_entry) = JitFunction::compile_generic(
             proto.n_regs,
             &ops,
@@ -3547,6 +3661,7 @@ impl JitProto {
             &call_sites,
             (proto.n_params, proto.n_captures, new_target),
             &inline_closures,
+            pc_map.as_ref().map_or(&[][..], |m| &m.1[..]),
         )?;
         Some(Self {
             func,
@@ -3556,6 +3671,7 @@ impl JitProto {
             sites: Some(GenericSites {
                 keys,
                 caches,
+                call_pcs,
                 calls,
                 methods,
                 baked,
@@ -3564,7 +3680,112 @@ impl JitProto {
             n_regs: proto.n_regs,
             osr_entries,
             bytecode: Some(bytecode),
+            pc_map,
         })
+    }
+
+    /// What this body's call sites learned of their callees, by the
+    /// function's own pc (the callee feedback of its recompilation): a site
+    /// whose cache holds one callee names it, one with several is mixed; an
+    /// inlined site names its inlined callee unless its call took another.
+    #[must_use]
+    pub fn call_hints(&self) -> Vec<crate::ic::CalleeHint> {
+        use crate::ic::CalleeHint;
+        let (Some(s), Some(bc)) = (self.sites.as_ref(), self.bytecode.as_ref()) else {
+            return Vec::new();
+        };
+        let site_of = |pc: usize| -> Option<&CallSite> {
+            let i = s
+                .call_pcs
+                .binary_search_by_key(&pc, |&(p, _)| p as usize)
+                .ok()?;
+            let c = s.calls.get(s.call_pcs[i].1 as usize)?;
+            // SAFETY: the body is not running (no other borrow is live).
+            #[allow(unsafe_code)]
+            Some(unsafe { &*c.get() })
+        };
+        let keys = |c: &CallSite| -> Vec<u64> {
+            c.targets
+                .iter()
+                .map(|t| t.key)
+                .filter(|&k| k != CallSite::EMPTY)
+                .collect()
+        };
+        let mut out = alloc::vec![CalleeHint::None; self.orig_pc(bc.len()).min(bc.len()) + 1];
+        for (pc, op) in bc.iter().enumerate() {
+            let orig = self.orig_pc(pc);
+            let Some(slot) = out.get_mut(orig) else {
+                continue;
+            };
+            match op {
+                crate::nbvm::Op::InlineGuard { call, key, .. } => {
+                    let others = site_of(*call).map(keys).unwrap_or_default();
+                    *slot = if others.iter().all(|k| k == key) {
+                        CalleeHint::One(*key)
+                    } else {
+                        CalleeHint::Mixed
+                    };
+                }
+                crate::nbvm::Op::CallMethod { .. }
+                | crate::nbvm::Op::CallValue { .. }
+                | crate::nbvm::Op::GetProp { .. } => {
+                    if let Some(k) = site_of(pc).map(keys) {
+                        *slot = match k[..] {
+                            [] => CalleeHint::None,
+                            [one] => CalleeHint::One(one),
+                            _ => CalleeHint::Mixed,
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// How many call sites this body inlined (`inline`).
+    #[must_use]
+    pub fn inlined(&self) -> usize {
+        self.inlined_sites().len()
+    }
+
+    /// The call sites this body inlined, as `(own pc, callee function id)`.
+    #[must_use]
+    pub fn inlined_sites(&self) -> Vec<(usize, u32)> {
+        self.bytecode.as_ref().map_or_else(Vec::new, |b| {
+            b.iter()
+                .enumerate()
+                .filter_map(|(pc, o)| match o {
+                    crate::nbvm::Op::InlineGuard { key, .. } => {
+                        Some((self.orig_pc(pc), (*key & 0xffff_ffff) as u32))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+    }
+
+    /// The body's pc of the function's own pc `pc` (they differ in a body
+    /// that inlined calls).
+    #[must_use]
+    pub fn body_pc(&self, pc: usize) -> usize {
+        match &self.pc_map {
+            Some(m) => m.0.get(pc).map_or(usize::MAX, |&p| p as usize),
+            None => pc,
+        }
+    }
+
+    /// The function's own pc of the body's pc `pc` (`usize::MAX` inside an
+    /// inlined body).
+    #[must_use]
+    pub fn orig_pc(&self, pc: usize) -> usize {
+        match &self.pc_map {
+            Some(m) => match m.1.get(pc) {
+                Some(&p) if p != u32::MAX => p as usize,
+                _ => usize::MAX,
+            },
+            None => pc,
+        }
     }
 
     /// The total inline-cache hit count across this generic body's property sites
@@ -3629,6 +3850,7 @@ impl JitProto {
     /// loop header — an on-stack-replacement entry).
     #[must_use]
     pub fn has_entry(&self, pc: usize) -> bool {
+        let pc = self.body_pc(pc);
         self.kind == JitKind::Generic && (pc == 0 || self.osr_entries.binary_search(&pc).is_ok())
     }
 
@@ -3654,6 +3876,7 @@ impl JitProto {
         if regs.len() < self.n_regs || !self.has_entry(entry) {
             return None;
         }
+        let entry = self.body_pc(entry);
         Some(
             self.func
                 .call_generic(ctx, regs.as_mut_ptr().cast::<u64>(), entry as u64),
@@ -3773,6 +3996,20 @@ pub struct X64Assembler {
         allow(dead_code)
     )]
     call_spill: Vec<(u8, i32, bool)>,
+    /// In a body that inlines calls (`inline`): the native-frame slot of a
+    /// pending inlined activation's materialization stub, which every
+    /// `call` first runs when set (`call_seq::emit_inline_guard`).
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    inline_pend: Option<i32>,
+    /// The inlined calls' state slots only the prologue empties.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    inline_clear: Vec<i32>,
 }
 
 /// The value a receiver-cache key slot holds when it caches nothing: the
@@ -4402,6 +4639,8 @@ impl X64Assembler {
     /// code address). The System V ABI requires `rsp` 16-byte aligned here.
     pub fn call_rax(&mut self) {
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+        self.inline_frame_hook();
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         self.spill_before_call();
         self.code.extend_from_slice(&[0xff, 0xd0]);
         self.clear_recv_cache();
@@ -4487,6 +4726,11 @@ impl X64Assembler {
         self.code.extend_from_slice(&frame.to_le_bytes());
         self.clear_recv_cache();
         self.clear_entry_slots();
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+        for i in 0..self.inline_clear.len() {
+            let d = self.inline_clear[i];
+            self.store_empty(d);
+        }
     }
 
     /// `lea rsp, [rbp-16]; pop rbx; pop r15; pop rbp; ret` — the frame-ABI
@@ -5527,6 +5771,7 @@ impl JitFunction {
         call_sites: &[*const CallSite],
         (n_params, n_caps, new_target): (usize, usize, Option<usize>),
         inline_closures: &[bool],
+        pc_orig: &[u32],
     ) -> Option<(Self, usize)> {
         use crate::nanbox::NanBox;
         if ops.len() != bytecode.len() || n_regs > 0xffff {
@@ -5700,9 +5945,49 @@ impl JitFunction {
             .collect();
         let m_base = gc_base - 8 * gc_frame_slots as i32;
         let m_slot = |site: usize, k: i32| m_base - 8 * (3 * site as i32 + k + 1);
+        // An inlined call's active header (`inline`), under the `Math` sites'
+        // slots: emptied on entry, set by a guard, popped by its leave — or
+        // by the throw exit, for a throw out of the inlined body.
+        let has_inline = ops
+            .iter()
+            .any(|o| matches!(o, GenericOp::InlineGuard { .. }));
+        let inl_base = m_base - 8 * (3 * math_sites.len() as i32);
+        let inl_slots = call_seq::InlineSlots {
+            pend: inl_base - 8,
+            hdr: inl_base - 16,
+            callee: inl_base - 24,
+            ok: inl_base - 32,
+            max_argc: ops
+                .iter()
+                .filter_map(|o| match *o {
+                    GenericOp::InlineGuard { call, .. } => match ops.get(call as usize)? {
+                        GenericOp::CallMethod { args, .. }
+                        | GenericOp::CallValue { site: args, .. } => {
+                            call_args.get(*args as usize).map(Vec::len)
+                        }
+                        _ => Some(0),
+                    },
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0),
+        };
+        // A handler's catch pc as the interpreter knows it (the function's
+        // own numbering: see `inline`).
+        let orig_pc = |t: usize| -> usize {
+            match pc_orig.get(t) {
+                Some(&o) if o != u32::MAX => o as usize,
+                Some(_) => usize::MAX,
+                None => t,
+            }
+        };
         let frame = ((16
             + max_argc as u32 * 8
-            + (num.frame_slots() + 2 * rc.ways + gc_frame_slots + 3 * math_sites.len()) as u32
+            + (num.frame_slots()
+                + 2 * rc.ways
+                + gc_frame_slots
+                + 3 * math_sites.len()
+                + 4 * usize::from(has_inline)) as u32
                 * 8)
             + 15)
             & !15;
@@ -5712,6 +5997,7 @@ impl JitFunction {
             (0..rc.ways)
                 .map(rc_key)
                 .chain((0..math_sites.len()).flat_map(|m| [m_slot(m, 0), m_slot(m, 2)]))
+                .chain(has_inline.then_some(inl_slots.ok))
                 .collect(),
         );
         // (Also the promoted loops' epoch slots: emptying them with the
@@ -5721,9 +6007,21 @@ impl JitFunction {
             entry_clear.extend((0..gc_plan.slots).map(gc_slot));
             entry_clear.push(gc_epoch);
         }
+        if has_inline {
+            // (Emptied by the prologue only: `entry_clear` is also the
+            // global binding cache's reset, which may run inside an inlined
+            // body.)
+            a.set_inline_pend(
+                Some(inl_slots.pend),
+                alloc::vec![inl_slots.pend, inl_slots.hdr],
+            );
+        }
         if !entry_clear.is_empty() {
             a.set_entry_clear(entry_clear);
         }
+        // The inlined calls' frame materialization stubs: (entry, the call's
+        // argument registers).
+        let mut inline_stubs: Vec<(Label, Vec<u16>)> = Vec::new();
         // The out-of-line full walks: (entry, resume, receiver, miss, way).
         let mut cold_walks: Vec<(Label, Label, u16, Label, usize, recv_cache::Family)> = Vec::new();
         // The global binding cache's refills: (entry, resume, done, op, slot).
@@ -6153,7 +6451,7 @@ impl JitFunction {
                         return None;
                     }
                     a.mov_rdi_r15();
-                    a.movabs_argreg(1, i64::try_from(target).ok()?);
+                    a.movabs_argreg(1, i64::try_from(orig_pc(target)).ok()?);
                     a.movabs_argreg(2, i64::from(reg));
                     a.movabs_rax(push_handler_helper as i64);
                     a.call_rax();
@@ -6163,6 +6461,108 @@ impl JitFunction {
                     a.mov_rdi_r15();
                     a.movabs_rax(pop_handler_helper as i64);
                     a.call_rax();
+                }
+                GenericOp::InlineGuard {
+                    dst,
+                    call,
+                    key,
+                    caps,
+                    n_caps,
+                } => {
+                    let no_args: Vec<u16> = Vec::new();
+                    let mut getter = false;
+                    let (callee, argv) = match ops.get(call as usize)? {
+                        GenericOp::GetProp { site, obj, .. } => {
+                            let si = sites.get(*site as usize)?;
+                            if si.method_ptr.is_null() {
+                                return None;
+                            }
+                            getter = true;
+                            (
+                                call_seq::CalleeSrc::Method {
+                                    recv: *obj,
+                                    site: si.method_ptr,
+                                    scratch: method_scratch,
+                                    helper: method_helper,
+                                },
+                                &no_args,
+                            )
+                        }
+                        GenericOp::CallMethod {
+                            site, recv, args, ..
+                        } => {
+                            let si = sites.get(*site as usize)?;
+                            if si.method_ptr.is_null() {
+                                return None;
+                            }
+                            (
+                                call_seq::CalleeSrc::Method {
+                                    recv: *recv,
+                                    site: si.method_ptr,
+                                    scratch: method_scratch,
+                                    helper: method_helper,
+                                },
+                                call_args.get(*args as usize)?,
+                            )
+                        }
+                        GenericOp::CallValue { callee, site, .. } => (
+                            call_seq::CalleeSrc::Reg(*callee),
+                            call_args.get(*site as usize)?,
+                        ),
+                        _ => return None,
+                    };
+                    if !ok(dst)
+                        || argv.iter().any(|&r| !ok(r))
+                        || (0..n_caps).any(|i| !ok(caps.saturating_add(i)))
+                    {
+                        return None;
+                    }
+                    // The receiver cache, for a method's receiver
+                    // (`recv_cache::plan`'s guard sites).
+                    let way = match rc.sites[op_idx] {
+                        Some(p) if p.family == recv_cache::Family::Obj => Some(call_seq::RecvWay {
+                            key: rc_key(p.way),
+                            cell: rc_cell(p.way),
+                            check: p.check,
+                            fill: p.fill,
+                            known: p.known && num.in_region(op_idx),
+                        }),
+                        Some(_) => return None,
+                        None => None,
+                    };
+                    if way.is_some() && matches!(callee, call_seq::CalleeSrc::Reg(_)) {
+                        return None;
+                    }
+                    let stub = a.new_label();
+                    let memo = call_sites
+                        .get(match ops.get(call as usize)? {
+                            GenericOp::CallMethod { cache, .. }
+                            | GenericOp::CallValue { cache, .. } => *cache as usize,
+                            GenericOp::GetProp { call, .. } => *call as usize,
+                            _ => return None,
+                        })
+                        .copied()?;
+                    call_seq::emit_inline_guard(
+                        &mut a,
+                        &call_seq::InlineEmit {
+                            dst,
+                            key,
+                            callee,
+                            args: argv,
+                            caps,
+                            n_caps,
+                            layout: &helpers.call_layout,
+                            slots: inl_slots,
+                            stub,
+                            memo,
+                            getter,
+                            way,
+                        },
+                    )?;
+                    inline_stubs.push((stub, argv.clone()));
+                }
+                GenericOp::InlineLeave => {
+                    call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &inl_slots);
                 }
                 GenericOp::CallMethod {
                     pc,
@@ -8063,6 +8463,10 @@ impl JitFunction {
         // `handle_throw!`): a caught throw resumes at its catch pc. Otherwise
         // return the sentinel so the caller reads the pending fault.
         a.bind(throw_exit);
+        if has_inline {
+            // A throw out of an inlined body: its activation ends here.
+            call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &inl_slots);
+        }
         if !catch_targets.is_empty() {
             a.mov_rdi_r15();
             a.mov_rsi_rbx();
@@ -8075,13 +8479,18 @@ impl JitFunction {
                 a.store_empty(gc_epoch);
             }
             for &t in &catch_targets {
-                a.cmp_rax_imm(i32::try_from(t).ok()?);
+                a.cmp_rax_imm(i32::try_from(orig_pc(t)).ok()?);
                 a.je(labels[t]);
             }
         }
         a.bind(refuse_exit);
         a.movabs_rax(NanBox::jit_throw_bits() as i64);
         a.frame_epilogue();
+        // (Out of line, called: see `call_seq::emit_inline_stub`.)
+        for (stub, argv) in core::mem::take(&mut inline_stubs) {
+            a.bind(stub);
+            call_seq::emit_inline_stub(&mut a, &helpers.call_layout, &inl_slots, &argv)?;
+        }
         // The native-call entry (`call_seq::emit_native_entry`), behind one
         // that gives it a handler-stack segment of its own when the body has
         // `try` regions.

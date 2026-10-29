@@ -749,6 +749,25 @@ impl X64Assembler {
         self.p_method_lookup_from(l, site, miss, getter);
     }
 
+    /// The receiver walk of [`p_method_lookup`](Self::p_method_lookup) alone:
+    /// `rcx` = the live heap slot of the value at `[recv_base + recv_disp]`,
+    /// an ordinary shaped object without the host-exotic flag, else to
+    /// `miss`. Clobbers `rax`, `rdx`, `r8`, `r10`, `r11`.
+    pub(crate) fn p_walk_plain(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        (recv_base, recv_disp): (u8, i32),
+        miss: Label,
+    ) {
+        self.p_load_arena(realm_off, &l.props);
+        self.mov_r10_rax();
+        self.g_load(r::RAX, recv_base, recv_disp);
+        self.p_handle_check(miss);
+        self.p_slot_of(l, miss);
+        self.p_plain_shaped(l, miss);
+    }
+
     /// [`p_method_lookup`](Self::p_method_lookup) for a receiver already
     /// walked: `rcx` its live heap slot, an ordinary shaped object without the
     /// host-exotic flag (`p_plain_shaped`'s facts), with the arena reloaded

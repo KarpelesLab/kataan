@@ -731,6 +731,29 @@ pub enum Op {
         this: Reg,
         args: Vec<Reg>,
     },
+    /// The guard of a call the generic machine-code tier inlined (never
+    /// emitted by the compiler: the tier splices it, with the callee's body,
+    /// into its own copy of a caller's bytecode; see `crate::jit::inline`).
+    /// The call op it guards is at pc `call`; `callee` is that op's callee
+    /// register (a `CallMethod`'s receiver) and `args` its argument
+    /// registers. `dst` = whether the callee is the VM closure `key` names
+    /// (`function id | capture count << 32`) and its activation was set up as
+    /// the call's would be — then its captured values are in `caps..caps +
+    /// n_caps`. The interpreter never inlines: it writes `false`, and the
+    /// `JumpIfFalse` after the guard takes the call itself.
+    InlineGuard {
+        dst: Reg,
+        call: usize,
+        key: u64,
+        callee: Reg,
+        args: Vec<Reg>,
+        caps: Reg,
+        n_caps: u16,
+    },
+    /// The end of an inlined activation (see [`Op::InlineGuard`]): what the
+    /// call's return does to the call bookkeeping. Nothing in the interpreter,
+    /// which never reaches it.
+    InlineLeave,
 }
 
 // `Op::ValueBin` op codes.
@@ -4721,8 +4744,13 @@ fn jit_for(
     }
     let mut cache = alloc::collections::BTreeMap::new();
     let mut stack = alloc::collections::BTreeSet::new();
-    let warm = (!ic.is_empty()).then(|| ic.iter().map(PropertyCache::warm_entry).collect());
-    ensure_jit(&mut cache, funcs, id, &mut stack, warm)
+    ensure_jit(
+        &mut cache,
+        funcs,
+        id,
+        &mut stack,
+        (!ic.is_empty()).then_some(ic),
+    )
 }
 
 /// Function `proto`'s persistent inline caches' memos, by pc (empty while
@@ -4732,6 +4760,16 @@ fn tier_warm(proto: &FnProto) -> Vec<Option<crate::ic::WarmEntry>> {
     proto.tier.0.try_borrow().map_or_else(
         |_| Vec::new(),
         |t| t.ic.iter().map(PropertyCache::warm_entry).collect(),
+    )
+}
+
+/// Function `proto`'s persistent call sites' callee feedback, by pc (as
+/// [`tier_warm`]).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn tier_hints(proto: &FnProto) -> Vec<crate::ic::CalleeHint> {
+    proto.tier.0.try_borrow().map_or_else(
+        |_| Vec::new(),
+        |t| t.ic.iter().map(PropertyCache::callee_hint).collect(),
     )
 }
 
@@ -4748,7 +4786,7 @@ fn ensure_jit(
     funcs: &[FnProto],
     id: usize,
     stack: &mut alloc::collections::BTreeSet<usize>,
-    warm: Option<Vec<Option<crate::ic::WarmEntry>>>,
+    ic: Option<&[PropertyCache]>,
 ) -> Option<alloc::rc::Rc<crate::jit::JitProto>> {
     // Compiled already, maybe by an earlier context (a callback's previous
     // call); the function's own slot is the cache of record.
@@ -4785,8 +4823,14 @@ fn ensure_jit(
     // accepts nearly any body (see `jit_tier`).
     let compiled = crate::jit::JitProto::compile_with_registry(&funcs[id], &registry)
         .or_else(|| {
-            let warm = warm.unwrap_or_else(|| tier_warm(&funcs[id]));
-            crate::jit::JitProto::compile_generic_closures(
+            let (warm, hints) = match ic {
+                Some(ic) => (
+                    ic.iter().map(PropertyCache::warm_entry).collect(),
+                    ic.iter().map(PropertyCache::callee_hint).collect(),
+                ),
+                None => (tier_warm(&funcs[id]), tier_hints(&funcs[id])),
+            };
+            crate::jit::JitProto::compile_generic_inlining(
                 &funcs[id],
                 &jit_generic_helpers(),
                 &warm,
@@ -4795,11 +4839,18 @@ fn ensure_jit(
                         .get(f as usize)
                         .is_some_and(|p| !(p.is_async && !p.is_generator))
                 },
+                &|pc, _| jit_tier::inline_candidate(funcs, id, &hints, pc),
             )
         })
         .map(alloc::rc::Rc::new);
     if jit_tier::jit_log_enabled() {
         let what = match &compiled {
+            Some(j) if j.inlined() > 0 => alloc::format!(
+                "compiled ({:?} tier, {} calls inlined: {:?})",
+                j.abi_kind(),
+                j.inlined(),
+                j.inlined_sites()
+            ),
             Some(j) => alloc::format!("compiled ({:?} tier)", j.abi_kind()),
             None => alloc::format!(
                 "rejected: {}",
@@ -5445,7 +5496,11 @@ fn vm_get_prop(
             Some(crate::realm::ChainHit::Data(v)) => return Ok(v),
             Some(crate::realm::ChainHit::Absent) => return Ok(NanBox::undefined()),
             Some(crate::realm::ChainHit::Accessor(getter, _, own)) => {
-                if getter.as_handle().is_some() {
+                if let Some(g) = getter.as_handle() {
+                    // The getter feedback the machine-code tier inlines from.
+                    if let Some((f, c)) = ctx.realm.vm_function(Handle::from_raw(g)) {
+                        cache.note_callee(u64::from(f) | ((c.len() as u64) << 32));
+                    }
                     return call_closure(ctx, funcs, getter, &[], recv);
                 }
                 // An inherited accessor without a getter reads `undefined`; an
@@ -8983,6 +9038,8 @@ fn run_frame_at_ic(
                     .vm_function(handle)
                     .map(|(f, c)| (f as usize, ArgBuf::from_slice(c)))
                     .ok_or(VmError::NotAnObject)?;
+                // The callee feedback the machine-code tier inlines from.
+                site_cache!(site).note_callee(id as u64 | ((caps.len() as u64) << 32));
                 let argv = ArgBuf::from_regs(regs, args);
                 ctx.pending_callee = Some(regs[*callee as usize]);
                 // Publish this frame's registers so a collection at a back-edge inside
@@ -9055,6 +9112,15 @@ fn run_frame_at_ic(
                     };
                     let outcome = match method {
                         Some(closure) => {
+                            // The callee feedback the machine-code tier inlines
+                            // from.
+                            if let Some((f, c)) = closure
+                                .as_handle()
+                                .and_then(|h| ctx.realm.vm_function(Handle::from_raw(h)))
+                            {
+                                let key = u64::from(f) | ((c.len() as u64) << 32);
+                                site_cache!(site).note_callee(key);
+                            }
                             // Publish this frame's registers so a collection at a
                             // back-edge inside the callee can see them.
                             let pub_mark = ctx.frame_shadow.len();
@@ -9284,6 +9350,10 @@ fn run_frame_at_ic(
                     Err(e) => handle_throw!(e),
                 }
             }
+            // An inlined call's guard and end (machine-code tier only): the
+            // interpreter takes the call itself.
+            Op::InlineGuard { dst, .. } => regs[*dst as usize] = NanBox::boolean(false),
+            Op::InlineLeave => {}
             Op::TailCallValue { callee, args } => {
                 let val = regs[*callee as usize];
                 let argv = ArgBuf::from_regs(regs, args);

@@ -892,7 +892,22 @@ fn verify_op_with(
             reg(*a)?;
             reg(*b)
         }
-        Op::PopHandler => Ok(()),
+        Op::PopHandler | Op::InlineLeave => Ok(()),
+        Op::InlineGuard {
+            dst,
+            call,
+            callee,
+            args,
+            caps,
+            n_caps,
+            ..
+        } => {
+            reg(*dst)?;
+            target(*call)?;
+            reg(*callee)?;
+            regs(args)?;
+            (0..*n_caps).try_for_each(|i| reg(caps.wrapping_add(i)))
+        }
     }
 }
 
@@ -1348,6 +1363,26 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*this, out);
             w_regs(args, out);
         }
+        Op::InlineGuard {
+            dst,
+            call,
+            key,
+            callee,
+            args,
+            caps,
+            n_caps,
+        } => {
+            w_u8(163, out);
+            w_reg(*dst, out);
+            w_usize(*call, out);
+            w_u32((*key >> 32) as u32, out);
+            w_u32(*key as u32, out);
+            w_reg(*callee, out);
+            w_regs(args, out);
+            w_reg(*caps, out);
+            w_u16(*n_caps, out);
+        }
+        Op::InlineLeave => w_u8(164, out),
         Op::LoadGlobal { dst, name, .. } => {
             w_u8(60, out);
             w_reg(*dst, out);
@@ -2576,6 +2611,16 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             dst: r.reg()?,
             src: r.reg()?,
         },
+        163 => Op::InlineGuard {
+            dst: r.reg()?,
+            call: r.usize()?,
+            key: (u64::from(r.u32()?) << 32) | u64::from(r.u32()?),
+            callee: r.reg()?,
+            args: r.regs()?,
+            caps: r.reg()?,
+            n_caps: r.u16()?,
+        },
+        164 => Op::InlineLeave,
         161 => Op::Concat {
             dst: r.reg()?,
             parts: r.regs()?,

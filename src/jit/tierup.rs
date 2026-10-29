@@ -158,8 +158,9 @@ impl JitProto {
         })
     }
 
-    /// The memos this body's own property-site caches hold, by bytecode pc
-    /// (the warm start of its recompilation). A site with a layout compiled
+    /// The memos this body's own property-site caches hold, by the
+    /// function's own bytecode pc (the warm start of its recompilation; an
+    /// inlined body's sites are left out). A site with a layout compiled
     /// in reports that layout as settled unless its cache settled on
     /// another: the compiled-in compare, not the cache, counts its hits.
     #[must_use]
@@ -167,10 +168,18 @@ impl JitProto {
         let Some(s) = self.sites.as_ref() else {
             return Vec::new();
         };
-        let n = s.tier_up.site_pcs.last().map_or(0, |&(pc, _)| pc + 1);
+        let n = s
+            .tier_up
+            .site_pcs
+            .iter()
+            .map(|&(pc, _)| self.orig_pc(pc))
+            .filter(|&pc| pc != usize::MAX)
+            .max()
+            .map_or(0, |pc| pc + 1);
         let mut out = alloc::vec![None; n];
         for &(pc, site) in &s.tier_up.site_pcs {
-            let Some(c) = s.caches.get(site as usize) else {
+            let pc = self.orig_pc(pc);
+            let Some(c) = s.caches.get(site as usize).filter(|_| pc != usize::MAX) else {
                 continue;
             };
             // SAFETY: as in `wants_recompile` (or the body is not running).

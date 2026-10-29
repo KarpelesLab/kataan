@@ -560,6 +560,7 @@ impl X64Assembler {
 
     /// `call qword [base+disp]`.
     pub(crate) fn g_call_mem(&mut self, base: u8, disp: i32) {
+        self.inline_frame_hook();
         self.spill_before_call();
         self.g_mem(false, &[0xff], 2, base, disp);
         self.clear_recv_cache();
@@ -979,6 +980,9 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
         a.g_store(r::RDX, memo_caps, r::R8);
     }
     a.bind(identified);
+    // (In an inlined body: its activation, if still pending, is pushed
+    // first — the callee's header goes above it. Preserves every register.)
+    a.inline_frame_hook();
     // 2. The caller's window is on the register stack (so it is published),
     //    one realm, and room under both depth limits.
     a.g_load(r::R10, r::R15, l.stack);
@@ -1113,4 +1117,332 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     a.g_store(r::RBX, reg(e.dst), r::RAX);
     a.jmp(e.done);
     Some(())
+}
+
+/// The native-frame slots of a body's inlined calls (`super::inline`), all
+/// `rbp`-relative. An inlined activation's native-call header is pushed only
+/// when Rust code is about to run inside it (lazily: see
+/// [`emit_inline_guard`]), so `pend` and `hdr` describe one of three states:
+/// none active (both `RECV_CACHE_EMPTY`), one pending (`pend` = the address
+/// of its materialization stub), one materialized (`hdr` = its header).
+#[derive(Clone, Copy)]
+pub(crate) struct InlineSlots {
+    /// The pending activation's materialization stub, or empty.
+    pub pend: i32,
+    /// The materialized activation's header, or empty.
+    pub hdr: i32,
+    /// The active activation's callee value (the header's second word).
+    pub callee: i32,
+    /// Whether the guards' limit checks hold (anything but
+    /// `RECV_CACHE_EMPTY`): set by a guard that made them, and emptied with
+    /// the receiver cache's keys — by the prologue and after every call,
+    /// the only places the facts they check (the caller's window on the
+    /// register stack, one realm, the depths, the stack top) can change.
+    pub ok: i32,
+    /// The most arguments any of the body's inlined calls passes (the room
+    /// the checks ask for).
+    pub max_argc: usize,
+}
+
+/// One inlined call's guard (`Op::InlineGuard`, see `super::inline`).
+pub(crate) struct InlineEmit<'a> {
+    /// The boolean result register.
+    pub dst: u16,
+    /// The callee key the inlined body was compiled for.
+    pub key: u64,
+    /// Where the callee comes from: [`CalleeSrc::Reg`] or
+    /// [`CalleeSrc::Method`] (whose `helper` is unused: a lookup the site's
+    /// chain cache cannot answer is the call's to make).
+    pub callee: CalleeSrc,
+    /// The call's argument registers.
+    pub args: &'a [u16],
+    /// The first capture register of the inlined body.
+    pub caps: u16,
+    /// How many captures.
+    pub n_caps: u16,
+    /// The VM state layout.
+    pub layout: &'a CallLayout,
+    /// The body's inline slots.
+    pub slots: InlineSlots,
+    /// This site's materialization stub ([`emit_inline_stub`]).
+    pub stub: Label,
+    /// The guarded call's cache, whose [`IdentMemo`] (unused by a call op)
+    /// memoizes the callee value last identified as `key` with its
+    /// captures (as [`CallMemo`] does for the call sequence).
+    pub memo: *const CallSite,
+    /// The call is a property read's inherited getter (`callee` the
+    /// [`CalleeSrc::Method`] lookup of the read): a data property is a miss.
+    pub getter: bool,
+    /// The receiver cache's way for a method's receiver
+    /// (`super::recv_cache`), if the guard is one of its sites.
+    pub way: Option<RecvWay>,
+}
+
+/// A receiver-cache way as one site uses it (see `super::recv_cache::SitePlan`).
+#[derive(Clone, Copy)]
+pub(crate) struct RecvWay {
+    /// The `rbp`-relative slot of the way's key (the receiver's bits).
+    pub key: i32,
+    /// The `rbp`-relative slot of the way's heap slot address.
+    pub cell: i32,
+    /// The site compares the receiver with the way first.
+    pub check: bool,
+    /// The site fills the way after a walk.
+    pub fill: bool,
+    /// The way still holds the receiver (no compare).
+    pub known: bool,
+}
+
+/// Emits an inlined call's guard: identifies the callee exactly as
+/// [`emit_call`] does (the method through the site's chain cache, then the
+/// closure cell, memoized), and when it is `e.key`'s function and the call
+/// sequence's limits allow the activation, makes it pending — the callee's
+/// captures loaded into its registers, `e.dst` set to `true`. Otherwise sets
+/// `e.dst` to `false`, having changed nothing else. Makes no call.
+///
+/// A pending activation is what the call sequence's would be but for its
+/// native-call header and depth counts, which only Rust code can observe:
+/// every `call` the body makes first runs the pending activation's stub
+/// ([`X64Assembler::inline_frame_hook`]), which pushes them exactly as the
+/// call sequence would have at the call. Nothing in between can change what
+/// they would be (the arguments are the caller's registers, which the
+/// inlined body never writes; the stack top and depths move only in Rust
+/// code), and the limits are checked here, so the activation is the call's.
+pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Option<()> {
+    use crate::nanbox::NanBox;
+    use core::mem::offset_of;
+    let l = e.layout;
+    let reg = |x: u16| i32::from(x) * 8;
+    let hdr = |i: usize| i32::try_from(i * 8).ok();
+    let argc = e.args.len();
+    let jl = super::compute_jit_layout();
+    let ident = offset_of!(CallSite, ident);
+    let memo_key = site_off(ident + offset_of!(IdentMemo, key));
+    let memo_stamp = site_off(ident + offset_of!(IdentMemo, stamp));
+    let memo_caps = site_off(ident + offset_of!(IdentMemo, value));
+    let miss = a.new_label();
+    let done = a.new_label();
+    let identified = a.new_label();
+    // 1. The callee value, into the `callee` slot (and rax).
+    match e.callee {
+        CalleeSrc::Reg(c) => a.g_load(r::RAX, r::RBX, reg(c)),
+        CalleeSrc::Method { recv, site, .. } => {
+            a.g_cmp_byte_imm(r::R15, l.hosted, 0);
+            a.g_jcc(cc::E, miss);
+            let got = a.new_label();
+            let getter = e.getter.then_some(got);
+            match e.way {
+                // The receiver's heap slot from its way, else walked (and
+                // the way filled).
+                Some(w) => {
+                    let walk = a.new_label();
+                    let walked = a.new_label();
+                    if w.known {
+                        a.g_load(r::RCX, RBP, w.cell);
+                    } else {
+                        if w.check {
+                            a.g_load(r::RAX, r::RBX, reg(recv));
+                            a.g_cmp_mem(r::RAX, RBP, w.key);
+                            a.g_jcc(cc::NE, walk);
+                            a.g_load(r::RCX, RBP, w.cell);
+                            a.jmp(walked);
+                        }
+                        a.bind(walk);
+                        a.p_walk_plain(jl, l.realm, (r::RBX, reg(recv)), miss);
+                        if w.fill {
+                            a.g_load(r::RAX, r::RBX, reg(recv));
+                            a.g_store(RBP, w.key, r::RAX);
+                            a.g_store(RBP, w.cell, r::RCX);
+                        }
+                    }
+                    a.bind(walked);
+                    a.p_method_lookup_walked(jl, l.realm, site, miss, getter);
+                }
+                None => a.p_method_lookup(jl, l.realm, (r::RBX, reg(recv)), site, miss, getter),
+            }
+            if e.getter {
+                a.jmp(miss); // a data property
+                a.bind(got);
+            }
+        }
+        _ => return None,
+    }
+    a.g_store(RBP, e.slots.callee, r::RAX);
+    // 2. Its function: the memo (the same value at the same prototype
+    //    epoch, see `CallMemo`), else the cell, memoized when it is `key`'s.
+    let decode = a.new_label();
+    a.g_movabs(r::R11, e.memo as u64);
+    a.g_cmp_mem(r::RAX, r::R11, memo_key);
+    a.g_jcc(cc::NE, decode);
+    load_proto_epoch(a, r::R9);
+    a.g_cmp_mem(r::R9, r::R11, memo_stamp);
+    a.g_jcc(cc::NE, decode);
+    a.g_load(r::R8, r::R11, memo_caps);
+    a.jmp(identified);
+    a.bind(decode);
+    a.p_callee_info(jl, l.realm);
+    a.g_movabs(r::R11, e.key);
+    a.g_cmp(r::RAX, r::R11);
+    a.g_jcc(cc::NE, miss);
+    a.g_mov(r::R8, r::RDX);
+    a.g_movabs(r::R11, e.memo as u64);
+    a.g_load(r::RAX, RBP, e.slots.callee);
+    a.g_store(r::R11, memo_key, r::RAX);
+    load_proto_epoch(a, r::R9);
+    a.g_store(r::R11, memo_stamp, r::R9);
+    a.g_store(r::R11, memo_caps, r::R8);
+    a.bind(identified);
+    // 3. The caller's window on the register stack, one realm, room under
+    //    both depth limits and for the header and the arguments (as
+    //    `emit_call`) — unless no call since a guard checked them.
+    let checked = a.new_label();
+    a.g_load(r::RAX, RBP, e.slots.ok);
+    a.g_cmp_imm(r::RAX, super::RECV_CACHE_EMPTY);
+    a.g_jcc(cc::NE, checked);
+    a.g_load(r::R10, r::R15, l.stack);
+    a.g_cmp_mem(r::RBX, r::R10, STACK_TOP);
+    a.g_jcc(cc::AE, miss);
+    a.g_cmp_mem(r::RBX, r::R10, STACK_BASE);
+    a.g_jcc(cc::B, miss);
+    a.g_load(r::R9, r::R15, l.realm);
+    a.g_cmp_byte_imm(r::R9, l.multi_realm, 0);
+    a.g_jcc(cc::NE, miss);
+    a.g_load(r::RAX, r::R15, l.call_depth);
+    a.g_test(r::RAX);
+    a.g_jcc(cc::E, miss);
+    a.g_cmp_mem(r::RAX, r::R9, l.max_depth);
+    a.g_jcc(cc::AE, miss);
+    a.g_load(r::RAX, r::R9, l.total_depth);
+    a.g_cmp_mem(r::RAX, r::R9, l.max_depth);
+    a.g_jcc(cc::AE, miss);
+    a.g_load(r::RAX, r::R10, STACK_TOP);
+    a.g_lea(
+        r::RAX,
+        r::RAX,
+        hdr(FRAME_HEADER + argc.max(e.slots.max_argc))?,
+    );
+    a.g_cmp_mem(r::RAX, r::R10, STACK_LIMIT);
+    a.g_jcc(cc::A, miss);
+    a.g_store_imm32(RBP, e.slots.ok, 0);
+    a.bind(checked);
+    // 4. Pending, its captures in the inlined body's registers.
+    a.g_lea_label(r::RAX, e.stub);
+    a.g_store(RBP, e.slots.pend, r::RAX);
+    for i in 0..e.n_caps {
+        a.g_load(r::RAX, r::R8, hdr(usize::from(i))?);
+        a.g_store(r::RBX, reg(e.caps.checked_add(i)?), r::RAX);
+    }
+    a.g_movabs(r::RAX, NanBox::boolean(true).to_bits());
+    a.g_store(r::RBX, reg(e.dst), r::RAX);
+    a.jmp(done);
+    a.bind(miss);
+    a.g_movabs(r::RAX, NanBox::boolean(false).to_bits());
+    a.g_store(r::RBX, reg(e.dst), r::RAX);
+    a.bind(done);
+    Some(())
+}
+
+/// Emits an inlined call's materialization stub: called (by
+/// [`X64Assembler::inline_frame_hook`]) with the call's activation pending,
+/// it pushes the native-call header and the arguments (the caller's
+/// registers `args`) and bumps the depth counts exactly as [`emit_call`]
+/// does, records the header and clears `pend`. Preserves every register.
+pub(crate) fn emit_inline_stub(
+    a: &mut X64Assembler,
+    l: &CallLayout,
+    s: &InlineSlots,
+    args: &[u16],
+) -> Option<()> {
+    use crate::nanbox::NanBox;
+    let reg = |x: u16| i32::from(x) * 8;
+    let hdr = |i: usize| i32::try_from(i * 8).ok();
+    // push rax, rcx, rdx, r9, r10.
+    a.raw(&[0x50, 0x51, 0x52, 0x41, 0x51, 0x41, 0x52]);
+    a.g_load(r::R10, r::R15, l.stack);
+    a.g_load(r::R9, r::R15, l.realm);
+    a.g_load(r::RCX, r::R10, STACK_TOP);
+    a.g_lea(r::RAX, r::RCX, hdr(FRAME_HEADER + args.len())?);
+    a.g_load(r::RDX, r::R10, STACK_FRAMES);
+    a.g_store(r::RCX, 0, r::RDX);
+    a.g_load(r::RDX, RBP, s.callee);
+    a.g_store(r::RCX, 8, r::RDX);
+    a.g_load(r::RDX, r::R9, l.callee_len);
+    a.g_store(r::RCX, 16, r::RDX);
+    a.g_store_imm32(r::RCX, 24, i32::try_from(args.len()).ok()?);
+    a.g_movabs(r::RDX, NanBox::undefined().to_bits());
+    a.g_store(r::RCX, 32, r::RDX);
+    for (i, &ar) in args.iter().enumerate() {
+        a.g_load(r::RDX, r::RBX, reg(ar));
+        a.g_store(r::RCX, hdr(FRAME_HEADER + i)?, r::RDX);
+    }
+    a.g_store(r::R10, STACK_FRAMES, r::RCX);
+    a.g_store(r::R10, STACK_TOP, r::RAX);
+    a.g_inc_mem(r::R15, l.call_depth);
+    a.g_inc_mem(r::R9, l.total_depth);
+    a.g_inc_mem(r::R15, l.frames_published);
+    a.g_store(RBP, s.hdr, r::RCX);
+    a.g_store_imm32(RBP, s.pend, super::RECV_CACHE_EMPTY);
+    // pop r10, r9, rdx, rcx, rax; ret.
+    a.raw(&[0x41, 0x5a, 0x41, 0x59, 0x5a, 0x59, 0x58, 0xc3]);
+    Some(())
+}
+
+/// Emits an inlined activation's end (`Op::InlineLeave`), or the end of one
+/// a throw left (at the body's throw exit, where none may be active): a
+/// pending one is dropped; a materialized one's header is popped and the
+/// depth counts restored, as the call sequence does after its callee
+/// returns. Preserves `rax`.
+pub(crate) fn emit_inline_leave(a: &mut X64Assembler, l: &CallLayout, s: &InlineSlots) {
+    let materialized = a.new_label();
+    let done = a.new_label();
+    a.g_load(r::RCX, RBP, s.pend);
+    a.g_cmp_imm(r::RCX, super::RECV_CACHE_EMPTY);
+    a.g_jcc(cc::E, materialized);
+    a.g_store_imm32(RBP, s.pend, super::RECV_CACHE_EMPTY);
+    a.jmp(done);
+    a.bind(materialized);
+    a.g_load(r::RCX, RBP, s.hdr);
+    a.g_cmp_imm(r::RCX, super::RECV_CACHE_EMPTY);
+    a.g_jcc(cc::E, done);
+    a.g_load(r::R10, r::R15, l.stack);
+    a.g_store(r::R10, STACK_TOP, r::RCX);
+    a.g_load(r::RDX, r::RCX, 0);
+    a.g_store(r::R10, STACK_FRAMES, r::RDX);
+    a.g_load(r::R9, r::R15, l.realm);
+    a.g_dec_mem(r::R15, l.call_depth);
+    a.g_dec_mem(r::R9, l.total_depth);
+    a.g_dec_mem(r::R15, l.frames_published);
+    a.g_store_imm32(RBP, s.hdr, super::RECV_CACHE_EMPTY);
+    a.bind(done);
+}
+
+impl X64Assembler {
+    /// Makes every later `call` first run a pending inlined activation's
+    /// materialization stub, whose address is in `[rbp + slot]` (`None`: no
+    /// hook), and the frame prologue empty the slots `clear`.
+    pub(crate) fn set_inline_pend(&mut self, slot: Option<i32>, clear: alloc::vec::Vec<i32>) {
+        self.inline_pend = slot;
+        self.inline_clear = clear;
+    }
+
+    /// Before a `call` in a body that inlines calls: `if [rbp + pend] !=
+    /// empty { call [rbp + pend] }` (see [`emit_inline_guard`]). Changes no
+    /// register.
+    pub(crate) fn inline_frame_hook(&mut self) {
+        if let Some(d) = self.inline_pend {
+            // cmp qword [rbp+d], -1 ; je +7 ; call qword [rbp+d] (7 bytes)
+            self.g_mem(true, &[0x83], 7, RBP, d);
+            self.code.push(0xff);
+            self.code.extend_from_slice(&[0x74, 0x07]);
+            self.g_mem(false, &[0xff], 2, RBP, d);
+        }
+    }
+
+    /// `lea reg, [rip + label]`.
+    pub(crate) fn g_lea_label(&mut self, reg: u8, label: Label) {
+        self.code.push(0x48 | ((reg >> 3) & 1) << 2);
+        self.code.push(0x8d);
+        self.code.push(0x05 | ((reg & 7) << 3));
+        self.emit_rel32(label);
+    }
 }

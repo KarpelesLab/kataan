@@ -405,6 +405,17 @@ pub(super) fn plan(
         // A read a promoted loop's fast version replaces by a register copy
         // makes no way access there (`numeric::plan_reuse`).
         GenericOp::GetProp { .. } if reused(i) => None,
+        // An inlined method call's guard looks the method up on its
+        // receiver (`call_seq::emit_inline_guard`) — but not in a
+        // speculative loop, where a later site may take the way as filled
+        // without comparing (`known`) while a guard's miss goes on in the
+        // loop without filling it.
+        GenericOp::InlineGuard { call, .. } if !in_spec(i) => match ops.get(call as usize)? {
+            GenericOp::CallMethod { recv: r, .. } | GenericOp::GetProp { obj: r, .. } => {
+                Some((*r, Family::Obj))
+            }
+            _ => None,
+        },
         _ => site_recv(op, bytecode.get(i)),
     };
     let target = branch_targets(ops, osr_entries, catch_targets);
@@ -486,6 +497,15 @@ pub(super) fn plan(
             live.clear();
         }
         match *op {
+            // An inlined call's guard writes its result and the inlined
+            // body's captures (and makes no call).
+            GenericOp::InlineGuard {
+                dst, caps, n_caps, ..
+            } => {
+                let written = |x: u16| x == dst || (x >= caps && x - caps < n_caps);
+                ids.retain(|&(x, _)| !written(x));
+                fresh.retain(|&x| !written(x));
+            }
             GenericOp::Move { dst, src } => {
                 let id = id_of(&mut ids, &mut next_id, src);
                 ids.retain(|&(x, _)| x != dst);
