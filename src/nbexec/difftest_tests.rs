@@ -547,3 +547,32 @@ fn tagged_template_sites_in_arrows_stay_distinct() {
     "#;
     assert_eq!(run(src), "true,true,x1y,q");
 }
+
+/// `String.prototype.{split,replace,replaceAll,match,search,matchAll}` do
+/// `GetMethod(searchValue, @@method)` once (it ran twice), and `match` /
+/// `search` / `matchAll` build their RegExp with RegExpCreate, which
+/// ToStrings the argument instead of asking IsRegExp (an extra `@@match`
+/// read); `concat` ToStrings each argument, so a Symbol is a TypeError.
+#[test]
+fn string_methods_look_up_symbol_methods_once() {
+    let src = r#"
+        var log = [];
+        var o = { toString() { log.push("ts"); return ","; } };
+        ["split", "replace", "match", "search"].forEach(function (s) {
+            Object.defineProperty(o, Symbol[s], { get() { log.push(s); return undefined; }, configurable: true });
+        });
+        var r = [];
+        "a,b".split(o); r.push(log.splice(0).join());
+        "a,b".replace(o, "x"); r.push(log.splice(0).join());
+        "a,b".match(o); r.push(log.splice(0).join());
+        "a,b".search(o); r.push(log.splice(0).join());
+        String.prototype.split.call("a,b", o); r.push(log.splice(0).join());
+        var c; try { "a".concat(Symbol()); c = "no"; } catch (e) { c = e.name; }
+        r.push(c, "a".concat(1, { toString() { return "z"; } }));
+        r.join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "split,ts|replace,ts|match,ts|search,ts|split,ts|TypeError|a1z"
+    );
+}

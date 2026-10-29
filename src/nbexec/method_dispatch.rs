@@ -2130,10 +2130,19 @@ impl Interp {
             }
         {
             let regexp_ctor = self.current.get("RegExp").unwrap_or(NanBox::undefined());
-            let ctor_args: alloc::vec::Vec<NanBox> = if method == "matchAll" {
-                alloc::vec![arg(0), self.new_str("g")]
+            // RegExpCreate(regexp, flags) runs `ToString(regexp)` (RegExpInitialize),
+            // never IsRegExp: hand the constructor the pattern string, so the
+            // argument's `@@match` is not read again.
+            let pattern = if matches!(arg(0).unpack(), Unpacked::Undefined) {
+                arg(0)
             } else {
-                alloc::vec![arg(0)]
+                let b = self.coerce_to_string_bytes(arg(0))?;
+                self.new_str_bytes(b)
+            };
+            let ctor_args: alloc::vec::Vec<NanBox> = if method == "matchAll" {
+                alloc::vec![pattern, self.new_str("g")]
+            } else {
+                alloc::vec![pattern]
             };
             let rx = self.construct(regexp_ctor, &ctor_args)?;
             let Some(rxh) = rx.as_handle().map(Handle::from_raw) else {
@@ -2164,7 +2173,8 @@ impl Interp {
                 let piece_v = if self.realm.is_string(p) {
                     p
                 } else {
-                    let piece = self.arg_string_bytes(p);
+                    // ToString: a Symbol is a TypeError.
+                    let piece = self.arg_string_bytes_fallible(p)?;
                     self.new_str_bytes(piece)
                 };
                 match self.realm.add_checked(acc, piece_v) {
@@ -2615,9 +2625,9 @@ impl Interp {
                 "concat" => {
                     let mut out = bytes.to_vec();
                     for a in args {
-                        // ToString each argument, honoring a user `toString`.
-                        let p = self.coerce_object(*a, "string")?;
-                        out.extend_from_slice(&self.arg_string_bytes(p));
+                        // ToString each argument: a user `toString` runs, a Symbol
+                        // is a TypeError.
+                        out.extend_from_slice(&self.arg_string_bytes_fallible(*a)?);
                     }
                     Some(self.new_str_bytes(out))
                 }
@@ -6845,6 +6855,12 @@ impl Interp {
         };
         let search = args.first().copied().unwrap_or_else(NanBox::undefined);
         if !self.is_object_value(search) {
+            return Ok(None);
+        }
+        // The first-class call path already did `GetMethod(searchValue,
+        // @@method)` and found none: run the string algorithm without a second
+        // lookup.
+        if core::mem::take(&mut self.string_symbol_checked) {
             return Ok(None);
         }
         let argh = Handle::from_raw(search.as_handle().unwrap());

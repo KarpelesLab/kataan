@@ -289,6 +289,11 @@ pub struct Interp {
     /// GetTemplateObject each `eval` invocation is a *different* site, but a loop inside
     /// one eval is the *same* site.
     tagged_template_cache: alloc::collections::BTreeMap<(usize, u64), NanBox>,
+    /// Set by the first-class `String.prototype.{match,…,split}` call path once it
+    /// has done `GetMethod(searchValue, @@method)` (found nothing) and is about to
+    /// run the string algorithm: the method-dispatch delegate then does not look
+    /// the symbol method up a second time (a getter / Proxy `get` saw two reads).
+    string_symbol_checked: bool,
     /// The template-cache epoch of the currently executing eval body (0 at the top
     /// level / outside any eval). Set for the dynamic extent of one `run_eval_body`.
     eval_site_epoch: u64,
@@ -2850,6 +2855,7 @@ impl Interp {
             symbol_registry: alloc::collections::BTreeMap::new(),
             well_known_symbols: alloc::collections::BTreeMap::new(),
             tagged_template_cache: alloc::collections::BTreeMap::new(),
+            string_symbol_checked: false,
             eval_site_epoch: 0,
             eval_site_counter: 0,
             regexp_proto: None,
@@ -6632,19 +6638,6 @@ impl Interp {
     /// preserved) and returns its boxed handle.
     fn new_str_bytes(&mut self, bytes: alloc::vec::Vec<u8>) -> NanBox {
         NanBox::handle(self.realm.new_string_wtf8(bytes).to_raw())
-    }
-
-    /// The WTF-8 bytes of `v` coerced to a string — lossless when `v` is already
-    /// a string (so a surrogate needle matches surrogate haystack bytes), lossy
-    /// otherwise (numbers/etc. carry no surrogates). Used by the unit-based
-    /// string search ops.
-    fn arg_string_bytes(&self, v: NanBox) -> alloc::vec::Vec<u8> {
-        if let Some(raw) = v.as_handle()
-            && let Some(b) = self.realm.string_bytes(Handle::from_raw(raw))
-        {
-            return b;
-        }
-        self.realm.to_display_string(v).into_bytes()
     }
 
     /// `ToString(v)` as WTF-8 bytes, fallibly: an object runs ToPrimitive(string)

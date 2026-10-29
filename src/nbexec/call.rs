@@ -609,9 +609,16 @@ impl Interp {
                     let b = self.coerce_to_string_bytes(this_val)?;
                     self.new_str_bytes(b)
                 };
-                return Ok(self
-                    .call_method(str_recv, &name, args)?
-                    .unwrap_or(NanBox::undefined()));
+                // The `@@method` lookup is done (the delegate below must not
+                // repeat it); the flag is consumed on the string method's entry.
+                self.string_symbol_checked =
+                    matches!(
+                        name.as_str(),
+                        "match" | "matchAll" | "search" | "replace" | "replaceAll" | "split"
+                    ) && args.first().is_some_and(|a| self.is_object_value(*a));
+                let r = self.call_method(str_recv, &name, args);
+                self.string_symbol_checked = false;
+                return Ok(r?.unwrap_or(NanBox::undefined()));
             }
             // A first-class `Date.prototype.<method>`: the call's `this` must have
             // a `[[DateValue]]` (be a Date), else a `TypeError`.
