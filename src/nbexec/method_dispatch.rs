@@ -1787,6 +1787,12 @@ impl Interp {
                     // MakeFullYear: 0..=99 (integer part) becomes 1900-relative.
                     // (`trunc_toward_zero` is the no_std-safe `f64::trunc`.)
                     let yint = trunc_toward_zero(yf);
+                    // A year this far out is past the time-value range (TimeClip
+                    // gives NaN); bail out before the integer arithmetic overflows.
+                    if !(-1.0e6..=1.0e6).contains(&yint) {
+                        self.realm.set_date_ms(handle, f64::NAN);
+                        return Ok(Some(NanBox::number(f64::NAN)));
+                    }
                     let yy = if (0.0..=99.0).contains(&yint) {
                         1900 + yint as i64
                     } else {

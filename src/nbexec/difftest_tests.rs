@@ -1583,3 +1583,15 @@ fn includes_and_index_of_skip_from_index_on_empty_array_likes() {
     assert_eq!(run(src), "false,-1,false,-1,0");
 }
 
+/// `Date.prototype.setYear` with a year far past the time-value range is
+/// NaN (MakeDay / TimeClip); the engine overflowed its integer day count
+/// and stored a wrapped date.
+#[test]
+fn set_year_out_of_range_is_nan() {
+    let src = r#"
+        var r = [];
+        for (var y of [1e20, -1e20, Infinity, 275761, 99]) { var d = new Date(0); r.push(d.setYear(y)); }
+        r.join()
+    "#;
+    assert_eq!(run(src), "NaN,NaN,NaN,NaN,915148800000");
+}
