@@ -2261,6 +2261,9 @@ impl Interp {
             self.namespace_object(&key)
         };
         match ns {
+            // ContinueDynamicImport resolves (not fulfils) the promise with the
+            // namespace: one exporting `then` is a thenable, adopted.
+            Ok(ns) if !deferred_phase => self.resolve_with(promise, ns),
             Ok(ns) => self.settle(promise, ns, true),
             Err(e) => self.reject_dynamic_import(promise, e),
         }

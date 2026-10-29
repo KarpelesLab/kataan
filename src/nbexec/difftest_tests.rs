@@ -711,3 +711,34 @@ fn queue_microtask_checks_and_calls_bare() {
     "#;
     assert_eq!(out(src), "TypeError\nargs 0\n");
 }
+
+/// A dynamic `import()` resolves its promise with the namespace (so a module
+/// exporting `then` is adopted as a thenable), it does not fulfil with it.
+#[cfg(all(feature = "module", feature = "std"))]
+#[test]
+fn dynamic_import_resolves_with_a_thenable_namespace() {
+    let dir = std::env::temp_dir().join(alloc::format!(
+        "kataan-difftest-dynimport-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("thenable.mjs"),
+        "export function then(r) { console.log('then called'); r('by-then'); } export const x = 1;\n",
+    )
+    .expect("write");
+    let main = dir.join("main.mjs");
+    std::fs::write(
+        &main,
+        "const t = await import('./thenable.mjs'); console.log(typeof t, t);\n",
+    )
+    .expect("write");
+    let (output, _) = crate::nbvm::execute_module_typed(
+        main.to_str().expect("utf-8 path"),
+        &crate::nbexec::module::FileModuleHost,
+        crate::limits::Limits::default(),
+    )
+    .expect("module runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, "then called\nstring by-then\n");
+}
