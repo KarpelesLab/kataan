@@ -388,32 +388,36 @@ impl Interp {
     /// `get:undefined`/`set:undefined`; both get `enumerable:false`/
     /// `configurable:false` when absent.
     fn complete_descriptor(&mut self, d: Handle) -> NanBox {
+        // FromPropertyDescriptor creates the fields in a fixed order (value,
+        // writable, get, set, enumerable, configurable), which `Object.keys`
+        // of the result observes; the normalized `d` holds them in
+        // ToPropertyDescriptor's read order instead.
         let is_accessor = self.realm.has_own(d, "get") || self.realm.has_own(d, "set");
-        if is_accessor {
-            if !self.realm.has_own(d, "get") {
-                self.realm.set_property(d, "get", NanBox::undefined());
-            }
-            if !self.realm.has_own(d, "set") {
-                self.realm.set_property(d, "set", NanBox::undefined());
-            }
+        let fields: [(&str, NanBox); 4] = if is_accessor {
+            [
+                ("get", NanBox::undefined()),
+                ("set", NanBox::undefined()),
+                ("enumerable", NanBox::boolean(false)),
+                ("configurable", NanBox::boolean(false)),
+            ]
         } else {
-            if !self.realm.has_own(d, "value") {
-                self.realm.set_property(d, "value", NanBox::undefined());
-            }
-            if !self.realm.has_own(d, "writable") {
-                self.realm
-                    .set_property(d, "writable", NanBox::boolean(false));
-            }
+            [
+                ("value", NanBox::undefined()),
+                ("writable", NanBox::boolean(false)),
+                ("enumerable", NanBox::boolean(false)),
+                ("configurable", NanBox::boolean(false)),
+            ]
+        };
+        let out = self.realm.new_object();
+        for (name, default) in fields {
+            let v = if self.realm.has_own(d, name) {
+                self.realm.get_property(d, name).unwrap_or(default)
+            } else {
+                default
+            };
+            self.realm.set_property(out, name, v);
         }
-        if !self.realm.has_own(d, "enumerable") {
-            self.realm
-                .set_property(d, "enumerable", NanBox::boolean(false));
-        }
-        if !self.realm.has_own(d, "configurable") {
-            self.realm
-                .set_property(d, "configurable", NanBox::boolean(false));
-        }
-        NanBox::handle(d.to_raw())
+        NanBox::handle(out.to_raw())
     }
 
     /// `Object/Reflect.isExtensible(obj)` — routing a proxy through its

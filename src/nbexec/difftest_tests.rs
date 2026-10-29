@@ -1395,3 +1395,22 @@ fn json_stringify_runaway_replacer_recursion_is_a_range_error() {
         .expect("join");
     assert_eq!(out, "RangeError,RangeError,RangeError,3002");
 }
+
+/// The descriptor object a proxy's `getOwnPropertyDescriptor` trap yields is
+/// built by FromPropertyDescriptor, whose fields come in a fixed order
+/// (value, writable, get, set, enumerable, configurable). It kept
+/// ToPropertyDescriptor's read order (enumerable and configurable first).
+#[test]
+fn proxy_descriptor_fields_come_in_from_property_descriptor_order() {
+    let src = r#"
+        var t = Object.freeze({ a: 1 });
+        var p = new Proxy(t, { getOwnPropertyDescriptor(t, k) { return Reflect.getOwnPropertyDescriptor(t, k); } });
+        var q = new Proxy({}, { getOwnPropertyDescriptor() { return { configurable: true, set: undefined, get() {} }; } });
+        [Object.keys(Object.getOwnPropertyDescriptor(p, "a")).join(),
+         Object.keys(Reflect.getOwnPropertyDescriptor(q, "x")).join()].join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "value,writable,enumerable,configurable get,set,enumerable,configurable"
+    );
+}
