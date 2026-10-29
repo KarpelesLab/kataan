@@ -97,6 +97,15 @@ pub struct Realm {
     /// read by compiled code, which then leaves every reference store to the
     /// write barrier's helper.
     jit_marking: bool,
+    /// Whether a new dense array needs no explicit `[[Prototype]]` record
+    /// (see [`new_array`](Realm::new_array)): the running realm's
+    /// `%Array.prototype%` is the derived default. Compiled code's inline
+    /// array allocation tests it.
+    #[cfg_attr(
+        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    jit_array_proto_default: bool,
     /// `default_object_proto` as an object's raw `proto` word (`NO_PROTO` for
     /// none): what compiled code's inline `Op::NewObject` gives the new object.
     #[cfg_attr(
@@ -682,6 +691,7 @@ impl Realm {
             atoms: AtomTable::new(),
             incremental: None,
             jit_marking: false,
+            jit_array_proto_default: true,
             jit_default_proto: crate::object::NO_PROTO,
             next_symbol_id: 1,
             symbols_by_id: alloc::collections::BTreeMap::new(),
@@ -857,6 +867,7 @@ impl Realm {
         if self.root_array_proto.is_none() {
             self.root_array_proto = Some(handle);
         }
+        self.refresh_array_proto_default();
     }
 
     /// The realm's `%Array.prototype%` intrinsic, if installed — the default
@@ -935,6 +946,7 @@ impl Realm {
             .default_object_proto
             .map_or(crate::object::NO_PROTO, Handle::to_raw);
         self.array_proto_intrinsic = s.array_proto;
+        self.refresh_array_proto_default();
         self.promise_proto_intrinsic = s.promise_proto;
         self.function_proto_intrinsic = s.function_proto;
         for h in [s.array_proto, s.function_proto].into_iter().flatten() {
@@ -1207,6 +1219,22 @@ impl Realm {
     #[must_use]
     pub(crate) fn jit_marking_offset() -> usize {
         core::mem::offset_of!(Realm, jit_marking)
+    }
+
+    /// The byte offset, within a `Realm`, of `jit_array_proto_default` (a
+    /// `bool`), which compiled code's inline array allocation requires set.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_array_proto_default_offset() -> usize {
+        core::mem::offset_of!(Realm, jit_array_proto_default)
+    }
+
+    /// Recomputes `jit_array_proto_default` after either array prototype
+    /// pointer changed: exactly when `new_array_cell` records nothing.
+    fn refresh_array_proto_default(&mut self) {
+        self.jit_array_proto_default = self
+            .array_proto_intrinsic
+            .is_none_or(|p| Some(p) == self.root_array_proto);
     }
 
     /// What compiled code's inline object allocation reads, as byte offsets
@@ -2370,7 +2398,36 @@ impl Realm {
 
     /// Allocates an array of `elements` in the heap and returns its handle.
     pub fn new_array(&mut self, elements: Vec<NanBox>) -> Handle {
-        let h = self.heap.alloc(Cell::Array(elements.into()));
+        self.new_array_cell(elements.into())
+    }
+
+    /// [`new_array`](Self::new_array) of a copy of `elements` (kept inline in
+    /// the cell when they fit, with no `Vec` made at all).
+    pub fn new_array_from_slice(&mut self, elements: &[NanBox]) -> Handle {
+        self.new_array_cell(crate::cell::ArrayElems::from_slice(elements))
+    }
+
+    /// [`new_array`](Self::new_array) of the values `elements` yields (an
+    /// array literal's): a small one is built in place, with no `Vec`.
+    pub fn new_array_from_iter(
+        &mut self,
+        elements: impl ExactSizeIterator<Item = NanBox>,
+    ) -> Handle {
+        use crate::cell::ARRAY_INLINE_CAP;
+        let n = elements.len();
+        if n <= ARRAY_INLINE_CAP {
+            let mut buf = [NanBox::undefined(); ARRAY_INLINE_CAP];
+            for (slot, v) in buf.iter_mut().zip(elements) {
+                *slot = v;
+            }
+            self.new_array_from_slice(&buf[..n])
+        } else {
+            self.new_array(elements.collect())
+        }
+    }
+
+    fn new_array_cell(&mut self, elements: crate::cell::ArrayElems) -> Handle {
+        let h = self.heap.alloc(Cell::Array(elements));
         // An array created while a `$262.createRealm()` realm is running belongs to
         // *that* realm: record its `%Array.prototype%` explicitly, since the derived
         // default (`object_proto`) is the first realm's. No-op in the single-realm
@@ -4312,9 +4369,16 @@ impl Realm {
                     }
                     // The skipped slots between the old end and `index` become real
                     // holes (absent indices), not `undefined` data properties.
-                    a.resize(new_len, NanBox::hole());
+                    let v = a.vec_mut();
+                    if index == v.len() {
+                        v.push(value);
+                    } else {
+                        v.resize(new_len, NanBox::hole());
+                        v[index] = value;
+                    }
+                } else {
+                    a[index] = value;
                 }
-                a[index] = value;
                 self.write_barrier(handle, value);
                 true
             }
@@ -4349,7 +4413,7 @@ impl Realm {
         if a.len() >= max {
             return None;
         }
-        a.push(value);
+        a.vec_mut().push(value);
         Some(a.len())
     }
 
@@ -4358,7 +4422,11 @@ impl Realm {
     pub fn array_set_all(&mut self, handle: Handle, elems: Vec<NanBox>) -> bool {
         match self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
             Some(a) => {
-                *a = elems;
+                let side = a.has_side_state();
+                *a = elems.into();
+                if side {
+                    a.mark_side_state();
+                }
                 true
             }
             None => false,
@@ -4378,7 +4446,7 @@ impl Realm {
             if index < a.len() {
                 a[index] = NanBox::hole();
             } else if index < cap {
-                a.resize(index + 1, NanBox::hole());
+                a.vec_mut().resize(index + 1, NanBox::hole());
             } else {
                 // Beyond the dense cap: record the logical length so `array_length`
                 // reports `index + 1` without materializing billions of slots.
@@ -4428,7 +4496,7 @@ impl Realm {
                     // past the old end are *holes* (absent indices), not `undefined`
                     // data properties — `new Array(10)` and `arr.length = 10` create
                     // a sparse array whose indices report `HasProperty === false`.
-                    a.resize(len, NanBox::hole());
+                    a.vec_mut().resize(len, NanBox::hole());
                     self.sparse_array_lengths.remove(&raw);
                 }
                 true
@@ -4604,7 +4672,7 @@ impl Realm {
             .heap
             .get_mut(handle)
             .and_then(Cell::as_array_mut)
-            .and_then(Vec::pop)
+            .and_then(|a| a.vec_mut().pop())
             .unwrap_or(NanBox::undefined());
         // A popped hole reads as `undefined` (the sentinel never escapes).
         if v.is_hole() { NanBox::undefined() } else { v }

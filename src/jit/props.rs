@@ -87,6 +87,9 @@ pub(crate) struct PropsLayout {
     pub heap_live: i32,
     /// See `free_ptr`.
     pub heap_allocs: i32,
+    /// `Realm`-relative offset of `jit_array_proto_default` (`bool`): inline
+    /// array allocation requires it set (`p_alloc_array`).
+    pub array_proto_default: i32,
     /// `Realm`-relative offset of the root shape's `Rc` word.
     pub root_shape: i32,
     /// `Realm`-relative offset of the default object prototype's raw `proto`
@@ -116,6 +119,7 @@ impl PropsLayout {
             free_len: i(alloc.free_len),
             heap_live: i(alloc.live),
             heap_allocs: i(alloc.allocs_since_gc),
+            array_proto_default: i(crate::realm::Realm::jit_array_proto_default_offset()),
             root_shape: i(root_shape),
             shape_parent,
             rc_strong,
@@ -947,10 +951,52 @@ impl X64Assembler {
         self.jne(miss);
         if set {
             self.g_load(r::R11, r::R15, realm_off);
-            self.g_load(r::R8, r::RCX, l.off_arr_len);
+            self.p_arr_len(l, r::R8);
             self.g_cmp_mem(r::R8, r::R11, l.props.max_array_len);
             self.g_jcc(cc::A, miss);
         }
+    }
+
+    /// `movzx r32, byte [base+disp32]`.
+    fn p_load8(&mut self, dst: u8, base: u8, disp: i32) {
+        debug_assert!(base & 7 != 4, "no SIB form");
+        let rex = 0x40 | (((dst >> 3) & 1) << 2) | ((base >> 3) & 1);
+        if rex != 0x40 {
+            self.code.push(rex);
+        }
+        self.code.extend_from_slice(&[0x0f, 0xb6]);
+        self.code.push(0x80 | ((dst & 7) << 3) | (base & 7));
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// For the array whose heap slot is `rcx`: `reg` = its element count —
+    /// the inline count, or the `Vec`'s length when the elements are there
+    /// (`crate::cell::ArrayElems`). Clobbers only `reg` (and the flags).
+    pub(crate) fn p_arr_len(&mut self, l: &JitLayout, reg: u8) {
+        self.p_load8(reg, r::RCX, l.off_arr_inline_len);
+        self.g_cmp_imm(reg, i32::from(crate::cell::ARRAY_ON_HEAP));
+        self.g_cmove_mem(reg, r::RCX, l.off_arr_len);
+    }
+
+    /// For the array whose heap slot is `rcx`: `r8` = its element count and
+    /// `r11` = the address of its first element — in the cell, or the `Vec`'s
+    /// buffer (`crate::cell::ArrayElems`). Branch-free. Clobbers only `r8`
+    /// and `r11` (and the flags).
+    pub(crate) fn p_arr_len_ptr(&mut self, l: &JitLayout) {
+        self.p_load8(r::R8, r::RCX, l.off_arr_inline_len);
+        self.g_lea(r::R11, r::RCX, l.off_arr_inline);
+        self.g_cmp_imm(r::R8, i32::from(crate::cell::ARRAY_ON_HEAP));
+        self.g_cmove_mem(r::R8, r::RCX, l.off_arr_len);
+        self.g_cmove_mem(r::R11, r::RCX, l.off_arr_ptr);
+    }
+
+    /// `cmove reg, [base+disp32]` (64-bit; the load happens either way).
+    fn g_cmove_mem(&mut self, reg: u8, base: u8, disp: i32) {
+        debug_assert!(base & 7 != 4, "no SIB form");
+        let rex = 0x48 | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1);
+        self.code.extend_from_slice(&[rex, 0x0f, 0x44]);
+        self.code.push(0x80 | ((reg & 7) << 3) | (base & 7));
+        self.code.extend_from_slice(&disp.to_le_bytes());
     }
 
     /// The common guards of an inline property add, on the object whose heap
@@ -1413,6 +1459,77 @@ impl X64Assembler {
         self.g_movabs(r::R11, crate::nanbox::NanBox::undefined().to_bits());
         for i in 0..INLINE {
             self.g_store(r::RCX, l.off_inline + 8 * i, r::R11);
+        }
+        // The slot: its generation stays; age 0, occupied.
+        self.p_load16(r::RAX, r::RCX, l.off_slot_gen);
+        self.p_store_rcx_imm(1, p.off_slot_age, 0);
+        self.p_store_rcx_imm(1, l.off_slot_occ, u32::from(l.slot_occupied_disc));
+        // rax = NanBox::handle(generation << 32 | index).
+        self.shl_rax_imm(32);
+        self.p_or_rax_rdx();
+        self.g_movabs(r::R11, crate::nanbox::NanBox::handle(0).to_bits());
+        self.code.extend_from_slice(&[0x4c, 0x09, 0xd8]); // or rax, r11
+    }
+
+    /// Inline [`Realm::new_array_from_slice`](crate::realm::Realm) of the
+    /// register values at the frame displacements `elems` (at most
+    /// [`ARRAY_INLINE_CAP`](crate::cell::ARRAY_INLINE_CAP) of them), when the
+    /// heap has a free slot, no incremental marking is running and a new array
+    /// needs no explicit `[[Prototype]]` record (`jit_array_proto_default`):
+    /// exactly `Heap::alloc`'s free-list path over `ArrayElems::from_slice` —
+    /// pop the free list, count the allocation, write the array (an empty
+    /// `Vec`, no side state, the elements inline, the unused inline slots
+    /// `undefined`) and the slot's age and occupancy, keeping its generation.
+    /// Then `rax` = the array's handle bits; otherwise to `miss`, having
+    /// changed nothing. Clobbers `rax`, `rcx`, `rdx`, `r9`, `r11`.
+    pub(crate) fn p_alloc_array(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        elems: &[i32],
+        miss: Label,
+    ) {
+        use crate::cell::ARRAY_INLINE_CAP;
+        assert!(elems.len() <= ARRAY_INLINE_CAP, "an inline array literal");
+        let p = &l.props;
+        self.g_load(r::R9, r::R15, realm_off);
+        self.g_cmp_byte_imm(r::R9, p.marking, 0);
+        self.g_jcc(cc::NE, miss);
+        self.g_cmp_byte_imm(r::R9, p.array_proto_default, 0);
+        self.g_jcc(cc::E, miss);
+        self.g_load(r::RAX, r::R9, p.free_len);
+        self.g_test(r::RAX);
+        self.g_jcc(cc::E, miss);
+        self.code.extend_from_slice(&[0x48, 0xff, 0xc8]); // dec rax
+        self.g_load(r::R11, r::R9, p.free_ptr);
+        self.code.extend_from_slice(&[0x41, 0x8b, 0x14, 0x83]); // mov edx, [r11 + rax*4]
+        self.g_store(r::R9, p.free_len, r::RAX);
+        self.g_inc_mem(r::R9, p.heap_live);
+        self.g_inc_mem(r::R9, p.heap_allocs);
+        // rcx = the slot.
+        self.g_mov(r::RAX, r::RDX);
+        self.imul_rax_imm(l.slot_stride);
+        self.g_add_mem(r::RAX, r::R9, p.heap_ptr);
+        self.g_mov(r::RCX, r::RAX);
+        // `Cell::Array(ArrayElems::from_slice(elems))`, field by field.
+        self.p_store_rcx_imm(1, l.off_cell_tag, u32::from(l.cell_array_disc));
+        for (k, &w) in l.arr_empty_vec.iter().enumerate() {
+            self.g_movabs(r::R11, w);
+            self.g_store(r::RCX, l.off_arr_vec + 8 * k as i32, r::R11);
+        }
+        self.p_store_rcx_imm(1, l.off_arr_side, 0);
+        self.p_store_rcx_imm(1, l.off_arr_inline_len, elems.len() as u32);
+        // Promoted registers' current values reach the frame first.
+        self.spill_before_call();
+        for (i, &d) in elems.iter().enumerate() {
+            self.load_rax(d);
+            self.g_store(r::RCX, l.off_arr_inline + 8 * i as i32, r::RAX);
+        }
+        if elems.len() < ARRAY_INLINE_CAP {
+            self.g_movabs(r::R11, crate::nanbox::NanBox::undefined().to_bits());
+            for i in elems.len()..ARRAY_INLINE_CAP {
+                self.g_store(r::RCX, l.off_arr_inline + 8 * i as i32, r::R11);
+            }
         }
         // The slot: its generation stays; age 0, occupied.
         self.p_load16(r::RAX, r::RCX, l.off_slot_gen);

@@ -413,23 +413,76 @@ pub enum Cell {
 
 // The tag lives in the object's niche (see [`Cell`]): a cell is an object's size.
 const _: () = assert!(core::mem::size_of::<Cell>() == core::mem::size_of::<Object>());
+// An array's payload (its inline elements included) fits after the tag word.
+const _: () = assert!(core::mem::size_of::<ArrayElems>() + 8 <= core::mem::size_of::<Object>());
 
-/// A [`Cell::Array`]'s elements (it dereferences to the `Vec`), plus a flag
-/// recording whether the array has ever had state in one of the realm's
+/// How many elements a [`Cell::Array`] keeps inline, in the cell itself
+/// (see [`ArrayElems`]).
+pub const ARRAY_INLINE_CAP: usize = 3;
+
+/// [`ArrayElems`]'s `inline_len` while the elements live in the `Vec`.
+pub const ARRAY_ON_HEAP: u8 = u8::MAX;
+
+/// A [`Cell::Array`]'s elements (it dereferences to them as a slice), plus a
+/// flag recording whether the array has ever had state in one of the realm's
 /// per-array side tables — named properties or per-index attributes (an
 /// auxiliary object), a sparse logical length, or a frozen/sealed mark. While
 /// the flag is clear, the array's `length` is its element count and every
 /// in-bounds element is a plain writable data property, which is what
 /// compiled code's inline element paths test (one byte, instead of probing the
 /// side tables). Sticky: a stale `true` only sends an access to the helper.
-#[repr(C)] // compiled code reads `elems` and `side` at probed offsets
-#[derive(Default, Clone, PartialEq, Debug)]
+///
+/// **Storage.** Up to [`ARRAY_INLINE_CAP`] elements are kept inline, in the
+/// cell (`inline[..inline_len]`, the `Vec` empty), so a small array costs no
+/// separate allocation; a larger one keeps them in the `Vec` (`inline_len ==`
+/// [`ARRAY_ON_HEAP`]). Reading and writing elements in place works on either
+/// (through the slice); changing the element count goes through
+/// [`vec_mut`](ArrayElems::vec_mut), which first moves inline elements to
+/// the `Vec` for good. Compiled code tests `inline_len` to find the elements
+/// (all offsets probed, see `jit_cell_layout`).
+#[repr(C)] // compiled code reads every field at probed offsets
+#[derive(Clone)]
 pub struct ArrayElems {
     elems: Vec<NanBox>,
     side: bool,
+    inline_len: u8,
+    /// The inline elements; past `inline_len` (and entirely, on the heap)
+    /// always `undefined`, so no stale handle lingers there.
+    inline: [NanBox; ARRAY_INLINE_CAP],
 }
 
+/// The filler of unused inline element slots.
+const INLINE_FILL: [NanBox; ARRAY_INLINE_CAP] = [NanBox::undefined(); ARRAY_INLINE_CAP];
+
 impl ArrayElems {
+    /// An array of `elems`: inline when they fit.
+    #[must_use]
+    #[inline]
+    pub fn from_slice(elems: &[NanBox]) -> Self {
+        if elems.len() <= ARRAY_INLINE_CAP {
+            let mut inline = INLINE_FILL;
+            inline[..elems.len()].copy_from_slice(elems);
+            Self {
+                elems: Vec::new(),
+                side: false,
+                inline_len: elems.len() as u8,
+                inline,
+            }
+        } else {
+            Self::on_heap(elems.to_vec())
+        }
+    }
+
+    /// An array whose elements stay in `elems` (whatever their count).
+    fn on_heap(elems: Vec<NanBox>) -> Self {
+        Self {
+            elems,
+            side: false,
+            inline_len: ARRAY_ON_HEAP,
+            inline: INLINE_FILL,
+        }
+    }
+
     /// Whether the array has (or once had) side-table state.
     #[must_use]
     pub fn has_side_state(&self) -> bool {
@@ -441,29 +494,111 @@ impl ArrayElems {
         self.side = true;
     }
 
+    /// Whether the elements are inline (in the cell).
+    #[must_use]
+    #[inline]
+    pub fn is_inline(&self) -> bool {
+        self.inline_len != ARRAY_ON_HEAP
+    }
+
+    /// The elements.
+    #[must_use]
+    #[inline]
+    pub fn as_slice(&self) -> &[NanBox] {
+        if self.is_inline() {
+            &self.inline[..usize::from(self.inline_len)]
+        } else {
+            &self.elems
+        }
+    }
+
+    /// The elements, mutably (in place: the count cannot change).
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [NanBox] {
+        if self.is_inline() {
+            &mut self.inline[..usize::from(self.inline_len)]
+        } else {
+            &mut self.elems
+        }
+    }
+
+    /// The element `Vec`, for an operation that may change the element
+    /// count. Inline elements move to the `Vec` first, and stay there.
+    #[inline]
+    pub fn vec_mut(&mut self) -> &mut Vec<NanBox> {
+        if self.is_inline() {
+            self.spill();
+        }
+        &mut self.elems
+    }
+
+    /// Moves the inline elements to the `Vec` (with room to grow).
+    #[cold]
+    #[inline(never)]
+    fn spill(&mut self) {
+        let n = usize::from(self.inline_len);
+        let mut v = Vec::with_capacity(2 * ARRAY_INLINE_CAP + 2);
+        v.extend_from_slice(&self.inline[..n]);
+        self.elems = v;
+        self.inline = INLINE_FILL;
+        self.inline_len = ARRAY_ON_HEAP;
+    }
+
     /// The elements, by value.
     #[must_use]
     pub fn into_vec(self) -> Vec<NanBox> {
-        self.elems
+        if self.is_inline() {
+            self.as_slice().to_vec()
+        } else {
+            self.elems
+        }
+    }
+}
+
+impl Default for ArrayElems {
+    fn default() -> Self {
+        Self::from_slice(&[])
+    }
+}
+
+impl PartialEq for ArrayElems {
+    fn eq(&self, other: &Self) -> bool {
+        self.side == other.side && self.as_slice() == other.as_slice()
+    }
+}
+
+impl core::fmt::Debug for ArrayElems {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ArrayElems")
+            .field("elems", &self.as_slice())
+            .field("side", &self.side)
+            .finish()
     }
 }
 
 impl From<Vec<NanBox>> for ArrayElems {
+    /// Elements that fit inline move there (and the `Vec` is freed).
     fn from(elems: Vec<NanBox>) -> Self {
-        Self { elems, side: false }
+        if elems.len() <= ARRAY_INLINE_CAP {
+            Self::from_slice(&elems)
+        } else {
+            Self::on_heap(elems)
+        }
     }
 }
 
 impl core::ops::Deref for ArrayElems {
-    type Target = Vec<NanBox>;
-    fn deref(&self) -> &Vec<NanBox> {
-        &self.elems
+    type Target = [NanBox];
+    #[inline]
+    fn deref(&self) -> &[NanBox] {
+        self.as_slice()
     }
 }
 
 impl core::ops::DerefMut for ArrayElems {
-    fn deref_mut(&mut self) -> &mut Vec<NanBox> {
-        &mut self.elems
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [NanBox] {
+        self.as_mut_slice()
     }
 }
 
@@ -471,7 +606,7 @@ impl<'a> IntoIterator for &'a ArrayElems {
     type Item = &'a NanBox;
     type IntoIter = core::slice::Iter<'a, NanBox>;
     fn into_iter(self) -> Self::IntoIter {
-        self.elems.iter()
+        self.as_slice().iter()
     }
 }
 
@@ -479,7 +614,7 @@ impl<'a> IntoIterator for &'a mut ArrayElems {
     type Item = &'a mut NanBox;
     type IntoIter = core::slice::IterMut<'a, NanBox>;
     fn into_iter(self) -> Self::IntoIter {
-        self.elems.iter_mut()
+        self.as_mut_slice().iter_mut()
     }
 }
 
@@ -501,6 +636,14 @@ pub(crate) struct CellLayout {
     /// Byte offset of the array's side-state flag ([`ArrayElems`]) within a
     /// `Cell::Array`.
     pub array_side_off: usize,
+    /// Byte offset of the array's inline element count ([`ARRAY_ON_HEAP`]
+    /// while the elements are in the `Vec`) within a `Cell::Array`.
+    pub array_inline_len_off: usize,
+    /// Byte offset of the array's first inline element within a `Cell::Array`.
+    pub array_inline_off: usize,
+    /// The three words of an inline array's (empty) element `Vec`, as compiled
+    /// code writes them when it makes a small array.
+    pub array_empty_vec: [u64; 3],
 }
 
 /// The byte layout of a `Cell::VmFunction`, for compiled code that identifies a
@@ -592,12 +735,34 @@ pub(crate) fn jit_cell_layout() -> CellLayout {
         ),
         _ => unreachable!("just built a Cell::Array"),
     };
+    // An inline one, for the inline storage and its empty `Vec`.
+    let small = Cell::Array(ArrayElems::from_slice(&[NanBox::number(1.0)]));
+    let small_base = core::ptr::addr_of!(small) as usize;
+    let Cell::Array(v) = &small else {
+        unreachable!("just built a Cell::Array")
+    };
+    assert!(v.is_inline(), "a one-element array is inline");
+    assert_eq!(
+        core::ptr::addr_of!(v.elems) as usize - small_base,
+        array_vec_off
+    );
+    assert_eq!(core::mem::size_of::<Vec<NanBox>>(), 24);
+    // SAFETY: a `Vec` is exactly three `u64`-sized words (asserted above), all
+    // initialized; this copies them out.
+    #[allow(unsafe_code)]
+    let array_empty_vec =
+        unsafe { core::ptr::read(core::ptr::addr_of!(v.elems).cast::<[u64; 3]>()) };
+    let array_inline_len_off = core::ptr::addr_of!(v.inline_len) as usize - small_base;
+    let array_inline_off = core::ptr::addr_of!(v.inline) as usize - small_base;
     CellLayout {
         object_disc,
         object_off,
         array_disc,
         array_vec_off,
         array_side_off,
+        array_inline_len_off,
+        array_inline_off,
+        array_empty_vec,
     }
 }
 
@@ -638,7 +803,7 @@ impl Cell {
     }
 
     /// The array elements mutably, if this cell is one.
-    pub fn as_array_mut(&mut self) -> Option<&mut Vec<NanBox>> {
+    pub fn as_array_mut(&mut self) -> Option<&mut ArrayElems> {
         match self {
             Cell::Array(a) => Some(a),
             _ => None,
@@ -1096,6 +1261,40 @@ mod tests {
         let a = Cell::Array(alloc::vec![NanBox::number(1.0), NanBox::number(2.0)].into());
         assert_eq!(a.as_array().map(<[_]>::len), Some(2));
         assert_eq!(a.type_of(), "object");
+    }
+
+    /// Small arrays keep their elements inline until their count changes;
+    /// every view (slice, `Vec`, equality) is the same either way.
+    #[test]
+    fn array_elems_inline_and_spilled_agree() {
+        let n = |x: f64| NanBox::number(x);
+        for len in 0..=ARRAY_INLINE_CAP + 2 {
+            let vals: Vec<NanBox> = (0..len).map(|i| n(i as f64)).collect();
+            let a = ArrayElems::from_slice(&vals);
+            assert_eq!(a.is_inline(), len <= ARRAY_INLINE_CAP);
+            assert_eq!(&*a, &vals[..]);
+            assert_eq!(ArrayElems::from(vals.clone()), a);
+            assert_eq!(a.clone().into_vec(), vals);
+            // In-place writes stay inline; a push spills, keeping the elements.
+            let mut b = a.clone();
+            if len > 0 {
+                b[0] = n(-1.0);
+                assert_eq!(b.is_inline(), a.is_inline());
+                assert_eq!(b[0], n(-1.0));
+            }
+            b.vec_mut().push(n(9.0));
+            assert!(!b.is_inline());
+            assert_eq!(b.len(), len + 1);
+            assert_eq!(b[len], n(9.0));
+            // Spilled and inline arrays of the same elements are equal.
+            let mut c = ArrayElems::from_slice(&vals);
+            c.vec_mut();
+            assert_eq!(c, a);
+            c.mark_side_state();
+            assert_ne!(c, a);
+        }
+        assert!(ArrayElems::default().is_inline());
+        assert!(ArrayElems::default().is_empty());
     }
 
     #[test]

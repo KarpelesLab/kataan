@@ -8404,8 +8404,9 @@ fn run_frame_at_ic(
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::NewArrayFrom { dst, elems } => {
-                let vals: Vec<NanBox> = elems.iter().map(|r| regs[*r as usize]).collect();
-                let handle = ctx.realm.new_array(vals);
+                let handle = ctx
+                    .realm
+                    .new_array_from_iter(elems.iter().map(|r| regs[*r as usize]));
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
             Op::NewArrayCtor { dst, arg } => {
@@ -25961,7 +25962,6 @@ mod generic_jit_tests {
             NanBox::hole(),
             NanBox::number(44.0),
         ]);
-        let (base, len) = realm.jit_arena_slots();
 
         // A faithful Rust mirror of the emitted array-element walk: returns the raw
         // element bits at `idx` on an in-bounds, dense (Array-tagged) hit.
@@ -25989,14 +25989,39 @@ mod generic_jit_tests {
                 if *slot.add(layout.off_cell_tag as usize) != layout.cell_array_disc {
                     return None;
                 }
-                let elems_len = *(slot.add(layout.off_arr_len as usize) as *const usize);
+                // Inline elements (`p_arr_len` / `p_arr_len_ptr`), else the `Vec`'s.
+                let inline_len = *slot.add(layout.off_arr_inline_len as usize);
+                let (elems_len, elems_ptr) = if inline_len == crate::cell::ARRAY_ON_HEAP {
+                    (
+                        *(slot.add(layout.off_arr_len as usize) as *const usize),
+                        *(slot.add(layout.off_arr_ptr as usize) as *const *const u64),
+                    )
+                } else {
+                    (
+                        usize::from(inline_len),
+                        slot.add(layout.off_arr_inline as usize) as *const u64,
+                    )
+                };
                 if idx >= elems_len {
                     return None;
                 }
-                let elems_ptr = *(slot.add(layout.off_arr_ptr as usize) as *const *const u64);
                 Some(*elems_ptr.add(idx))
             }
         };
+        // A small (inline) array reads the same way.
+        let small = realm.new_array(alloc::vec![NanBox::number(5.0), NanBox::hole()]);
+        let (sbase, slen) = realm.jit_arena_slots();
+        assert_eq!(
+            raw_elem(sbase, slen, bits(small), 0),
+            Some(NanBox::number(5.0).to_bits())
+        );
+        assert_eq!(
+            raw_elem(sbase, slen, bits(small), 1),
+            Some(NanBox::hole().to_bits())
+        );
+        assert_eq!(raw_elem(sbase, slen, bits(small), 2), None);
+        // (The allocation may have moved the slot table.)
+        let (base, len) = (sbase, slen);
 
         // Present elements: raw walk == safe get_element, byte-identical.
         for idx in [0usize, 1, 3] {

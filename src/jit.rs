@@ -3024,6 +3024,17 @@ pub(crate) struct JitLayout {
     /// (`crate::cell::ArrayElems`): non-zero routes an element access to the
     /// helper.
     pub off_arr_side: i32,
+    /// Slot-relative offset of a `Cell::Array`'s inline element count byte
+    /// (`crate::cell::ARRAY_ON_HEAP` when the elements are in the `Vec`, whose
+    /// pointer and length are `off_arr_ptr` / `off_arr_len`). Read through
+    /// `p_arr_len` / `p_arr_len_ptr`.
+    pub off_arr_inline_len: i32,
+    /// Slot-relative offset of a `Cell::Array`'s first inline element.
+    pub off_arr_inline: i32,
+    /// Slot-relative offset of a `Cell::Array`'s element `Vec` (three words).
+    pub off_arr_vec: i32,
+    /// The words of an inline array's empty element `Vec`.
+    pub arr_empty_vec: [u64; 3],
     /// The inline property paths' extra offsets (`props.rs`).
     pub props: props::PropsLayout,
 }
@@ -3069,6 +3080,10 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
             off_arr_ptr: to_i32(cell_base + cell.array_vec_off + obj.vec_ptr_off),
             off_arr_len: to_i32(cell_base + cell.array_vec_off + obj.vec_len_off),
             off_arr_side: to_i32(cell_base + cell.array_side_off),
+            off_arr_inline_len: to_i32(cell_base + cell.array_inline_len_off),
+            off_arr_inline: to_i32(cell_base + cell.array_inline_off),
+            off_arr_vec: to_i32(cell_base + cell.array_vec_off),
+            arr_empty_vec: cell.array_empty_vec,
             props: props::PropsLayout::new(&slot, cell_base, obj_base, &obj),
         }
     })
@@ -6305,10 +6320,9 @@ impl JitFunction {
                     let done = a.new_label();
                     recv_slot!(op_idx, arr, slow, recv_cache::Family::Arr);
                     int_index!(index, slow);
-                    a.mov_r8_at_rcx(layout.off_arr_len);
+                    a.p_arr_len_ptr(&layout);
                     a.cmp_rax_r8();
                     a.jae(slow);
-                    a.mov_r11_at_rcx(layout.off_arr_ptr);
                     a.mov_rax_at_r11_rax8();
                     a.movabs_r11(NanBox::hole().to_bits() as i64);
                     a.cmp_rax_r11();
@@ -6338,10 +6352,9 @@ impl JitFunction {
                     recv_slot!(op_idx, arr, slow, recv_cache::Family::Arr);
                     a.p_array_plain(&layout, helpers.call_layout.realm, true, slow);
                     int_index!(index, slow);
-                    a.mov_r8_at_rcx(layout.off_arr_len);
+                    a.p_arr_len_ptr(&layout);
                     a.cmp_rax_r8();
                     a.jae(slow);
-                    a.mov_r11_at_rcx(layout.off_arr_ptr);
                     // A hole is an absent index: storing to it is `[[Set]]` on a
                     // missing own property (prototype setters / proxy traps).
                     a.movabs_argreg(2, NanBox::hole().to_bits() as i64);
@@ -6371,10 +6384,9 @@ impl JitFunction {
                     a.p_load_arena(helpers.call_layout.realm, &layout.props);
                     walk_to_slot!(cell, slow);
                     family_checks!(recv_cache::Family::Arr, slow);
-                    a.g_load(call_seq::r::R8, call_seq::r::RCX, layout.off_arr_len);
+                    a.p_arr_len_ptr(&layout);
                     a.g_test(call_seq::r::R8);
                     a.g_jcc(call_seq::cc::E, slow);
-                    a.mov_r11_at_rcx(layout.off_arr_ptr);
                     a.g_load(call_seq::r::RAX, call_seq::r::R11, 0);
                     a.movabs_r11(NanBox::hole().to_bits() as i64);
                     a.cmp_rax_r11();
@@ -6542,11 +6554,10 @@ impl JitFunction {
                             walk_to_slot!(next, slow);
                             family_checks!(recv_cache::Family::Arr, slow);
                             int_index!(iter, slow, true);
-                            a.mov_r8_at_rcx(layout.off_arr_len);
+                            a.p_arr_len_ptr(&layout);
                             a.cmp_rax_r8();
                             a.jae(slow); // the end (latched by the interpreter)
                             a.mov_r8_rax();
-                            a.mov_r11_at_rcx(layout.off_arr_ptr);
                             a.mov_rax_at_r11_rax8();
                             a.movabs_r11(NanBox::hole().to_bits() as i64);
                             a.cmp_rax_r11();
@@ -6583,8 +6594,29 @@ impl JitFunction {
                             a.bind(done);
                             a.store_rax(disp(*dst));
                         }
-                        crate::nbvm::Op::NewArrayFrom { .. } | crate::nbvm::Op::NewArray { .. } => {
-                            let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
+                        array_op @ (crate::nbvm::Op::NewArrayFrom { .. }
+                        | crate::nbvm::Op::NewArray { .. }) => {
+                            let op_ptr: *const crate::nbvm::Op = array_op;
+                            // A small literal: inline from the heap's free
+                            // list (its elements in the cell), else the helper.
+                            let small = match array_op {
+                                crate::nbvm::Op::NewArrayFrom { dst, elems }
+                                    if ok(*dst)
+                                        && elems.len() <= crate::cell::ARRAY_INLINE_CAP
+                                        && elems.iter().all(|r| ok(*r)) =>
+                                {
+                                    Some((*dst, elems.iter().map(|r| disp(*r)).collect::<Vec<_>>()))
+                                }
+                                _ => None,
+                            };
+                            let done = a.new_label();
+                            if let Some((dst, elems)) = &small {
+                                let slow = a.new_label();
+                                a.p_alloc_array(&layout, helpers.call_layout.realm, elems, slow);
+                                a.store_rax(disp(*dst));
+                                a.jmp(done);
+                                a.bind(slow);
+                            }
                             a.mov_rdi_r15();
                             a.mov_rsi_rbx();
                             a.movabs_argreg(2, n_regs as i64);
@@ -6592,6 +6624,7 @@ impl JitFunction {
                             a.movabs_rax(helpers.new_array as usize as i64);
                             a.call_rax();
                             throw_check!();
+                            a.bind(done);
                         }
                         _ => exec_op!(pc),
                     }
@@ -6940,10 +6973,9 @@ impl JitFunction {
                         ),
                         None => int_index!(index, helper, num.is_number_at(op_idx, index)),
                     }
-                    a.mov_r8_at_rcx(layout.off_arr_len);
+                    a.p_arr_len_ptr(&layout);
                     a.cmp_rax_r8();
                     a.jae(helper); // OOB / negative
-                    a.mov_r11_at_rcx(layout.off_arr_ptr);
                     a.mov_rax_at_r11_rax8(); // rax = elems[idx]
                     a.movabs_r11(NanBox::hole().to_bits() as i64);
                     a.cmp_rax_r11();
@@ -6998,10 +7030,9 @@ impl JitFunction {
                     a.load_rax(disp(val));
                     a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
                     int_index!(index, helper);
-                    a.mov_r8_at_rcx(layout.off_arr_len);
+                    a.p_arr_len_ptr(&layout);
                     a.cmp_rax_r8();
                     a.jae(helper);
-                    a.mov_r11_at_rcx(layout.off_arr_ptr);
                     // A hole is an absent index: the helper's `[[Set]]` walks the
                     // prototype chain (setters, proxy traps).
                     a.movabs_argreg(2, NanBox::hole().to_bits() as i64);
@@ -7032,7 +7063,7 @@ impl JitFunction {
                     // Only for a receiver whose spec `.length` provably equals the
                     // dense element count (`p_array_plain`); else the helper.
                     recv_slot!(op_idx, arr, helper, recv_cache::Family::Arr);
-                    a.mov_rax_at_rcx(layout.off_arr_len);
+                    a.p_arr_len(&layout, call_seq::r::RAX);
                     if let Some(x) = num.result_xmm(op_idx, dst) {
                         let past = a.new_label();
                         numeric::NumGen::set_xmm_from_int_rax(&mut a, x);
@@ -7348,10 +7379,9 @@ impl JitFunction {
                     let have = a.new_label();
                     recv_slot!(op_idx, recv, read, recv_cache::Family::Arr);
                     int_index!(key, read);
-                    a.mov_r8_at_rcx(layout.off_arr_len);
+                    a.p_arr_len_ptr(&layout);
                     a.cmp_rax_r8();
                     a.jae(read);
-                    a.mov_r11_at_rcx(layout.off_arr_ptr);
                     a.mov_rax_at_r11_rax8();
                     a.movabs_r11(NanBox::hole().to_bits() as i64);
                     a.cmp_rax_r11();

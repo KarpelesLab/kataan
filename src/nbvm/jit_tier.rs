@@ -758,8 +758,11 @@ pub(crate) extern "C" fn jit_helper_new_array(
     };
     let (dst, vals) = match op_ref {
         Op::NewArrayFrom { dst, elems } => {
-            let vals: alloc::vec::Vec<NanBox> = elems.iter().map(|r| file[*r as usize]).collect();
-            (*dst, vals)
+            let h = cx
+                .realm
+                .new_array_from_iter(elems.iter().map(|r| file[*r as usize]));
+            file[*dst as usize] = NanBox::handle(h.to_raw());
+            return 0;
         }
         Op::NewArray { dst, len } if *len <= cx.realm.limits.max_array_len => {
             (*dst, alloc::vec![NanBox::undefined(); *len])
@@ -880,8 +883,10 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             Ok(())
         }),
         Op::NewArrayFrom { dst, elems } => {
-            let vals: alloc::vec::Vec<NanBox> = elems.iter().map(|r| regs[*r as usize]).collect();
-            regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(vals).to_raw());
+            let h = ctx
+                .realm
+                .new_array_from_iter(elems.iter().map(|r| regs[*r as usize]));
+            regs[*dst as usize] = NanBox::handle(h.to_raw());
             Some(Ok(()))
         }
         // The array-iteration fast path (`iter_fast`) of a destructuring or a
