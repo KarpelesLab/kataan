@@ -119,6 +119,19 @@ pub struct Realm {
     /// key (stored as `\0sym:{id}`) can be recovered (e.g. by
     /// `Object.getOwnPropertySymbols`).
     symbols_by_id: alloc::collections::BTreeMap<u64, Handle>,
+    /// The keys entered into any handle-keyed side table (`aux_props`,
+    /// `native_protos`, the array flag sets, `fn_source`, …) since the last
+    /// collection, in no particular order and possibly repeated. Every other
+    /// entry predates that collection, so its key and its value both
+    /// survived it and are old: a minor collection (which presumes every old
+    /// object alive) can neither prune it nor needs to expand it, and
+    /// visits only these — so its cost does not grow with the tables.
+    gc_side_log: Vec<u64>,
+    /// As `gc_side_log`, for the ids entered into `symbols_by_id`.
+    gc_symbol_log: Vec<u64>,
+    /// Set by a compaction, which keeps ages (so young survivors' entries
+    /// predate the logs): the next minor collection walks the tables whole.
+    gc_side_walk_all: bool,
     /// Lazily-created `.prototype` objects for constructor functions, keyed by
     /// the closure's function id. (Keyed by id, not handle, so it survives a
     /// moving collection; distinct closures sharing an id share a prototype — a
@@ -695,9 +708,12 @@ impl Realm {
             jit_default_proto: crate::object::NO_PROTO,
             next_symbol_id: 1,
             symbols_by_id: alloc::collections::BTreeMap::new(),
+            gc_side_log: Vec::new(),
+            gc_symbol_log: Vec::new(),
+            gc_side_walk_all: false,
             fn_protos: alloc::collections::BTreeMap::new(),
             fn_ctor: alloc::collections::BTreeMap::new(),
-            aux_props: handle_map::HandleKeyedMap::new(),
+            aux_props: handle_map::HandleKeyedMap::new_logged(),
             fn_source: alloc::collections::BTreeMap::new(),
             length_tracking_views: alloc::collections::BTreeSet::new(),
             host_exotic: alloc::collections::BTreeSet::new(),
@@ -817,6 +833,7 @@ impl Realm {
         }
         self.cell_link_changed(handle);
         self.native_protos.insert(handle.to_raw(), proto);
+        self.gc_side_log.push(handle.to_raw());
     }
 
     /// The hook for a change to a non-object cell's `[[Prototype]]` or
@@ -1102,6 +1119,7 @@ impl Realm {
     /// with no explicit length over a resizable buffer).
     pub fn mark_length_tracking(&mut self, handle: Handle) {
         self.length_tracking_views.insert(handle.to_raw());
+        self.gc_side_log.push(handle.to_raw());
     }
 
     /// Marks `handle` as an object whose properties only the host models (see
@@ -2286,6 +2304,7 @@ impl Realm {
             id,
         });
         self.symbols_by_id.insert(id, handle);
+        self.gc_symbol_log.push(id);
         handle
     }
 
@@ -2436,6 +2455,7 @@ impl Realm {
             && Some(p) != self.root_array_proto
         {
             self.native_protos.insert(h.to_raw(), p);
+            self.gc_side_log.push(h.to_raw());
         }
         h
     }
@@ -2480,6 +2500,7 @@ impl Realm {
     /// `Function.prototype.toString` — see the `fn_source` field).
     pub fn set_fn_source(&mut self, handle: Handle, source: alloc::rc::Rc<str>) {
         self.fn_source.insert(handle.to_raw(), source);
+        self.gc_side_log.push(handle.to_raw());
     }
 
     /// The retained literal source text of the callable at `handle`, if any.
@@ -3887,6 +3908,7 @@ impl Realm {
             match proto {
                 Some(p) => {
                     self.native_protos.insert(handle.to_raw(), p);
+                    self.gc_side_log.push(handle.to_raw());
                     self.callable_null_protos.remove(&handle.to_raw());
                     self.write_barrier(handle, NanBox::handle(p.to_raw()));
                 }
@@ -3895,6 +3917,7 @@ impl Realm {
                     // would re-default to `%Function.prototype%`, so track null.
                     self.native_protos.remove(&handle.to_raw());
                     self.callable_null_protos.insert(handle.to_raw());
+                    self.gc_side_log.push(handle.to_raw());
                 }
             }
             return true;
@@ -3925,6 +3948,7 @@ impl Realm {
         // A watched object may have moved: retire every validated chain.
         crate::object::bump_proto_epoch();
         let (ka, kb) = (a.to_raw(), b.to_raw());
+        self.gc_side_log.extend([ka, kb]);
         self.aux_props.swap_entries(ka, kb);
         self.native_protos.swap_entries(ka, kb);
         swap_map_entry(&mut self.native_class_tags, ka, kb);
@@ -3990,8 +4014,11 @@ impl Realm {
         if self.heap.get(handle).and_then(Cell::as_array).is_some() {
             self.mark_array_side_state(handle);
             self.frozen_arrays.insert(handle.to_raw());
+            self.gc_side_log.push(handle.to_raw());
             self.sealed_arrays.insert(handle.to_raw());
+            self.gc_side_log.push(handle.to_raw());
             self.non_extensible_arrays.insert(handle.to_raw());
+            self.gc_side_log.push(handle.to_raw());
             // Named (non-index) properties live in the aux object; freeze them too
             // (non-writable + non-configurable) so `verifyProperty` sees them frozen.
             if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
@@ -4136,6 +4163,7 @@ impl Realm {
         if readonly {
             self.nonwritable_array_lengths.insert(handle.to_raw());
             self.mark_array_side_state(handle);
+            self.gc_side_log.push(handle.to_raw());
         } else {
             self.nonwritable_array_lengths.remove(&handle.to_raw());
         }
@@ -4497,6 +4525,7 @@ impl Realm {
                     .unwrap_or(0)
                     .max(a.len());
                 self.sparse_array_lengths.insert(raw, cur.max(index + 1));
+                self.gc_side_log.push(raw);
             }
         }
         if index >= cap {
@@ -4529,6 +4558,7 @@ impl Realm {
                     // record the logical length. A lowering below the dense size still
                     // truncates the dense `Vec`, but here `len > cap >= a.len()`.
                     self.sparse_array_lengths.insert(raw, len);
+                    self.gc_side_log.push(raw);
                 } else {
                     // Within the dense cap: resize for real and drop any prior sparse
                     // override (the dense length is now authoritative). Slots added
@@ -5157,6 +5187,7 @@ impl Realm {
             // array/… created by `class S extends Map {}`) keeps its class tag in a
             // side table, so `instanceof Subclass` still walks the class chain.
             self.native_class_tags.insert(handle.to_raw(), class_id);
+            self.gc_side_log.push(handle.to_raw());
         }
     }
 
@@ -5304,6 +5335,7 @@ impl Realm {
         if self.heap.get(handle).and_then(Cell::as_array).is_some() {
             self.non_extensible_arrays.insert(handle.to_raw());
             self.mark_array_side_state(handle);
+            self.gc_side_log.push(handle.to_raw());
         } else if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.prevent_extensions();
         } else {
@@ -5322,7 +5354,9 @@ impl Realm {
         if self.heap.get(handle).and_then(Cell::as_array).is_some() {
             self.mark_array_side_state(handle);
             self.sealed_arrays.insert(handle.to_raw());
+            self.gc_side_log.push(handle.to_raw());
             self.non_extensible_arrays.insert(handle.to_raw());
+            self.gc_side_log.push(handle.to_raw());
             // Named (non-index) properties live in the aux object; seal them there
             // too, or `delete arr.foo` would still succeed on a sealed array (the
             // side registry only governs the index properties). Mirrors
@@ -6210,6 +6244,7 @@ impl Realm {
         state: alloc::boxed::Box<dyn core::any::Any>,
     ) {
         self.host_native_state.insert(handle.to_raw(), state);
+        self.gc_side_log.push(handle.to_raw());
     }
 
     /// Borrows the native state attached to `handle`, downcast to `T`
@@ -6251,6 +6286,16 @@ impl Realm {
                 extra.push(*obj);
             }
         }
+        Self::ephemeron_expand_fn_ids(marked, fn_protos, fn_ctor, extra);
+    }
+
+    /// The id-keyed part of [`ephemeron_expand`](Self::ephemeron_expand).
+    fn ephemeron_expand_fn_ids(
+        marked: &dyn gc::LiveSet,
+        fn_protos: &alloc::collections::BTreeMap<u32, Handle>,
+        fn_ctor: &alloc::collections::BTreeMap<u32, Handle>,
+        extra: &mut Vec<Handle>,
+    ) {
         // `fn_ctor`/`fn_protos`: keyed by function id. The id is "live" iff the
         // most-recent function handle for it is live; then both its constructor
         // back-reference and its lazily-built `.prototype` must survive.
@@ -6341,6 +6386,20 @@ impl Realm {
         // Weak native-state entries whose object died are dropped here — running
         // the boxed state's `Drop` as the object's finalizer.
         host_native_state.retain(|cell_raw, _| !dead(*cell_raw));
+        Self::ephemeron_prune_fn_ids(marked, key_collectable, fn_protos, fn_ctor);
+        // `symbols_by_id` is keyed by the symbol's own handle; prune those whose
+        // handle is collectable-and-dead (the expand pass has already kept any
+        // symbol still referenced as a live object's property key).
+        symbols_by_id.retain(|_, sh| !key_collectable(*sh) || marked.contains(sh));
+    }
+
+    /// The id-keyed part of [`ephemeron_prune`](Self::ephemeron_prune).
+    fn ephemeron_prune_fn_ids(
+        marked: &dyn gc::LiveSet,
+        key_collectable: &dyn Fn(Handle) -> bool,
+        fn_protos: &mut alloc::collections::BTreeMap<u32, Handle>,
+        fn_ctor: &mut alloc::collections::BTreeMap<u32, Handle>,
+    ) {
         // `fn_ctor`/`fn_protos` are id-keyed; the function handle is the key's
         // identity. Drop both when the function handle is collectable-and-dead.
         let dead_ids: alloc::vec::Vec<u32> = fn_ctor
@@ -6352,10 +6411,6 @@ impl Realm {
             fn_ctor.remove(&id);
             fn_protos.remove(&id);
         }
-        // `symbols_by_id` is keyed by the symbol's own handle; prune those whose
-        // handle is collectable-and-dead (the expand pass has already kept any
-        // symbol still referenced as a live object's property key).
-        symbols_by_id.retain(|_, sh| !key_collectable(*sh) || marked.contains(sh));
     }
 
     /// Runs a full (**major**) garbage collection, keeping everything reachable
@@ -6406,6 +6461,8 @@ impl Realm {
             native_protos,
             callable_null_protos,
             native_class_tags,
+            gc_side_log,
+            gc_symbol_log,
             ..
         } = self;
         // Phase 1 — mark from the real roots, expanding the weak-key side-tables
@@ -6422,6 +6479,10 @@ impl Realm {
         extern_prune(&marked);
         // Phase 2 — drop every entry whose key is unmarked (full collection: an
         // unmarked key is genuinely dead, so no generation guard is needed).
+        // Every table is walked whole, and every survivor ends old.
+        gc_side_log.clear();
+        aux_props.clear_fresh();
+        gc_symbol_log.clear();
         Self::ephemeron_prune(
             &marked,
             &|_| true,
@@ -6487,8 +6548,15 @@ impl Realm {
             native_protos,
             callable_null_protos,
             native_class_tags,
+            gc_side_log,
+            gc_symbol_log,
+            gc_side_walk_all,
             ..
         } = self;
+        use gc::LiveSet as _;
+        // After a compaction (which keeps ages) old entries may hold young
+        // keys and values: this collection walks the tables whole.
+        let walk_all = core::mem::take(gc_side_walk_all);
         if heap.gc_verify()
             && let Some((container, target)) = gc::remembered_violation(heap, |cell, out| {
                 Self::symbol_key_edges(symbols_by_id, cell, out);
@@ -6516,35 +6584,88 @@ impl Realm {
             roots,
             |cell, out| Self::symbol_key_edges(symbols_by_id, cell, out),
             |_, live, extra| {
-                Self::ephemeron_expand(live, aux_props, fn_protos, fn_ctor, extra);
+                if walk_all {
+                    Self::ephemeron_expand(live, aux_props, fn_protos, fn_ctor, extra);
+                } else {
+                    // Only the entries made since the last collection can hold
+                    // a young value (see `gc_side_log`); the aux map logs its
+                    // own, so no insertion site can miss one.
+                    for raw in aux_props.fresh_keys() {
+                        if let Some(obj) = aux_props.get(raw)
+                            && live.contains(&Handle::from_raw(*raw))
+                        {
+                            extra.push(*obj);
+                        }
+                    }
+                    Self::ephemeron_expand_fn_ids(live, fn_protos, fn_ctor, extra);
+                }
                 extern_expand(live, extra);
             },
         );
         {
             let live = gc::MinorLive(heap);
             extern_prune(&live);
-            Self::ephemeron_prune(
-                &live,
-                &|_| true,
-                aux_props,
-                fn_protos,
-                fn_ctor,
-                symbols_by_id,
-                frozen_arrays,
-                sealed_arrays,
-                non_extensible_arrays,
-                host_native_state,
-                PruneTables {
-                    fn_source,
-                    length_tracking_views,
-                    nonwritable_array_lengths,
-                    sparse_array_lengths,
-                    native_protos,
-                    callable_null_protos,
-                    native_class_tags,
-                },
-            );
+            let tables = PruneTables {
+                fn_source,
+                length_tracking_views,
+                nonwritable_array_lengths,
+                sparse_array_lengths,
+                native_protos,
+                callable_null_protos,
+                native_class_tags,
+            };
+            if walk_all {
+                Self::ephemeron_prune(
+                    &live,
+                    &|_| true,
+                    aux_props,
+                    fn_protos,
+                    fn_ctor,
+                    symbols_by_id,
+                    frozen_arrays,
+                    sealed_arrays,
+                    non_extensible_arrays,
+                    host_native_state,
+                    tables,
+                );
+            } else {
+                // Only the entries made since the last collection can have a
+                // young (so possibly dead) key; every older key is presumed
+                // alive.
+                let aux_fresh = aux_props.take_fresh();
+                for &raw in gc_side_log.iter().chain(&aux_fresh) {
+                    if live.contains(&Handle::from_raw(raw)) {
+                        continue;
+                    }
+                    tables.fn_source.remove(&raw);
+                    tables.length_tracking_views.remove(&raw);
+                    tables.nonwritable_array_lengths.remove(&raw);
+                    tables.sparse_array_lengths.remove(&raw);
+                    tables.native_protos.remove(&raw);
+                    tables.callable_null_protos.remove(&raw);
+                    tables.native_class_tags.remove(&raw);
+                    aux_props.remove(&raw);
+                    frozen_arrays.remove(&raw);
+                    sealed_arrays.remove(&raw);
+                    non_extensible_arrays.remove(&raw);
+                    // The weak native state's `Drop` is the object's finalizer.
+                    host_native_state.remove(&raw);
+                }
+                for id in gc_symbol_log.iter() {
+                    if let Some(sh) = symbols_by_id.get(id)
+                        && !live.contains(sh)
+                    {
+                        symbols_by_id.remove(id);
+                    }
+                }
+                Self::ephemeron_prune_fn_ids(&live, &|_| true, fn_protos, fn_ctor);
+            }
         }
+        // Every survivor is old now (`OLD_AGE` is one collection).
+        const _: () = assert!(gc::OLD_AGE == 1, "gc_side_log assumes it");
+        gc_side_log.clear();
+        aux_props.clear_fresh();
+        gc_symbol_log.clear();
         gc::sweep_minor(heap, mark)
     }
 
@@ -6585,6 +6706,13 @@ impl Realm {
             species_key,
             ..VmArrayIterIntrinsics::default()
         };
+        // Every table is walked whole below, and every key forwarded (the
+        // logged ones are old handles). Compaction keeps ages, so a young
+        // survivor's entries are not in any log: the next minor collection
+        // walks the tables whole.
+        self.gc_side_log.clear();
+        self.gc_symbol_log.clear();
+        self.gc_side_walk_all = true;
 
         // The side-tables are weak-key (ephemeron) maps. Run the three phases
         // sequentially so each borrows the tables at a disjoint time:
@@ -6683,7 +6811,7 @@ impl Realm {
                 }
             }
             // `aux_props` is handle→handle (owning cell → aux object); forward both.
-            let old_aux = core::mem::take(aux_props);
+            let old_aux = core::mem::replace(aux_props, handle_map::HandleKeyedMap::new_logged());
             for (cell_raw, obj) in old_aux {
                 aux_props.insert(forward(Handle::from_raw(cell_raw)).to_raw(), forward(obj));
             }
@@ -9353,6 +9481,80 @@ mod tests {
         // only thing referencing it and we pass it as a root.
         realm.collect_minor(&[arr]);
         assert!(realm.is_live(arr));
+        assert_eq!(realm.get_property(arr, "tag"), Some(NanBox::number(3.0)));
+    }
+
+    /// A minor collection visits only the side-table entries made since the
+    /// last collection (`gc_side_log`): it prunes the dead young keys' entries,
+    /// keeps a young value an old key entered, and leaves older entries alone.
+    #[test]
+    fn minor_collection_walks_only_the_new_side_table_entries() {
+        let mut realm = Realm::new();
+        let old = realm.new_array(alloc::vec![NanBox::number(1.0)]);
+        realm.set_property(old, "first", NanBox::number(1.0));
+        realm.freeze_object(old);
+        realm.collect_minor(&[old]);
+        assert!(
+            realm.gc_side_log.is_empty()
+                && realm.gc_symbol_log.is_empty()
+                && realm.aux_props.fresh_keys().is_empty()
+        );
+        // An old key gains a young value: a new aux property object, holding
+        // the only reference to another young object.
+        let old2 = realm.new_array(alloc::vec![NanBox::number(2.0)]);
+        realm.collect_minor(&[old, old2]);
+        let fresh = realm.new_object();
+        realm.set_property(fresh, "v", NanBox::number(7.0));
+        let fresh_val = NanBox::handle(fresh.to_raw());
+        realm.set_property(old2, "late", fresh_val);
+        // Young keys that die.
+        populate_side_tables(&mut realm, 20);
+        assert!(
+            !realm.gc_side_log.is_empty()
+                && !realm.gc_symbol_log.is_empty()
+                && !realm.aux_props.fresh_keys().is_empty()
+        );
+        realm.collect_minor(&[old, old2]);
+        assert!(
+            realm.gc_side_log.is_empty()
+                && realm.gc_symbol_log.is_empty()
+                && realm.aux_props.fresh_keys().is_empty()
+        );
+        let [aux, _protos, _ctors, syms, frozen, sealed, nonext] = realm.side_table_lens();
+        assert_eq!(aux, 2, "the two live arrays' aux entries");
+        assert_eq!(syms, 0, "the dead symbols' entries");
+        assert_eq!((frozen, sealed, nonext), (1, 1, 1), "only `old` is frozen");
+        assert!(realm.is_frozen(old));
+        assert_eq!(realm.get_property(old, "first"), Some(NanBox::number(1.0)));
+        // The young value an old key entered survived with it.
+        assert_eq!(realm.get_property(old2, "late"), Some(fresh_val));
+        assert_eq!(realm.get_property(fresh, "v"), Some(NanBox::number(7.0)));
+        // A full collection agrees.
+        realm.collect(&[old, old2]);
+        assert_eq!(realm.side_table_lens()[0], 2);
+        assert_eq!(realm.get_property(fresh, "v"), Some(NanBox::number(7.0)));
+    }
+
+    /// A compaction keeps ages, so a young survivor's side-table entries are in
+    /// no log afterwards: the next minor collection walks the tables whole.
+    #[test]
+    fn minor_collection_after_compaction_keeps_young_side_table_values() {
+        let mut realm = Realm::new();
+        let arr = realm.new_array(alloc::vec![NanBox::number(1.0)]);
+        realm.set_property(arr, "tag", NanBox::number(3.0));
+        let dead = realm.new_array(alloc::vec![NanBox::number(2.0)]);
+        realm.set_property(dead, "tag", NanBox::number(4.0));
+        let mut roots = [arr];
+        realm.compact(&mut roots);
+        let arr = roots[0];
+        assert!(realm.gc_side_walk_all);
+        assert_eq!(realm.heap.age(arr), Some(0), "compaction keeps ages");
+        realm.collect_minor(&[arr]);
+        assert!(!realm.gc_side_walk_all);
+        assert_eq!(realm.get_property(arr, "tag"), Some(NanBox::number(3.0)));
+        assert_eq!(realm.side_table_lens()[0], 1);
+        // And the logged walk resumes.
+        realm.collect_minor(&[arr]);
         assert_eq!(realm.get_property(arr, "tag"), Some(NanBox::number(3.0)));
     }
 }

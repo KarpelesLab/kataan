@@ -33,6 +33,12 @@ pub(crate) struct HandleKeyedMap<V> {
     index: Vec<Option<(u64, V)>>,
     /// How many entries `index` holds.
     len: usize,
+    /// For a map made by [`new_logged`](HandleKeyedMap::new_logged): every
+    /// key inserted since [`clear_fresh`](HandleKeyedMap::clear_fresh), in no
+    /// particular order and possibly repeated (the realm's minor collections
+    /// visit only these; see `Realm::gc_side_log`). `None` for a map that
+    /// keeps no log.
+    fresh: Option<Vec<u64>>,
 }
 
 impl<V: Copy> Default for HandleKeyedMap<V> {
@@ -53,9 +59,35 @@ fn bucket(raw: u64, mask: usize) -> usize {
 }
 
 impl<V: Copy> HandleKeyedMap<V> {
+    /// An empty map that logs the keys inserted into it (see `fresh`).
+    pub(crate) fn new_logged() -> Self {
+        let mut m = Self::new();
+        m.fresh = Some(Vec::new());
+        m
+    }
+
+    /// The keys inserted since the last [`clear_fresh`](Self::clear_fresh)
+    /// (empty for a map that keeps no log).
+    pub(crate) fn fresh_keys(&self) -> &[u64] {
+        self.fresh.as_deref().unwrap_or(&[])
+    }
+
+    /// Takes the logged keys out (leaving the log empty).
+    pub(crate) fn take_fresh(&mut self) -> Vec<u64> {
+        self.fresh.as_mut().map(core::mem::take).unwrap_or_default()
+    }
+
+    /// Forgets the logged keys.
+    pub(crate) fn clear_fresh(&mut self) {
+        if let Some(f) = &mut self.fresh {
+            f.clear();
+        }
+    }
+
     /// An empty map.
     pub(crate) const fn new() -> Self {
         Self {
+            fresh: None,
             bits: Vec::new(),
             index: Vec::new(),
             len: 0,
@@ -182,6 +214,9 @@ impl<V: Copy> HandleKeyedMap<V> {
 
     /// Inserts `v` under `raw`, returning the value it replaced.
     pub(crate) fn insert(&mut self, raw: u64, v: V) -> Option<V> {
+        if let Some(f) = &mut self.fresh {
+            f.push(raw);
+        }
         self.mark(raw);
         self.index_put(raw, v)
     }
@@ -278,6 +313,22 @@ mod tests {
         m.retain(|_, v| *v != 'a');
         assert!(!m.contains_key(&6));
         assert_eq!(m.len(), 1);
+        assert!(m.fresh_keys().is_empty(), "an unlogged map logs nothing");
+    }
+
+    #[test]
+    fn a_logged_map_logs_every_insert() {
+        let mut m = HandleKeyedMap::new_logged();
+        m.insert(5, 'a');
+        m.insert(7, 'b');
+        m.swap_entries(5, 6);
+        assert_eq!(m.fresh_keys(), &[5, 7, 6]);
+        assert_eq!(m.take_fresh(), alloc::vec![5, 7, 6]);
+        assert!(m.fresh_keys().is_empty());
+        m.insert(9, 'c');
+        m.clear_fresh();
+        assert!(m.fresh_keys().is_empty());
+        assert_eq!(m.get(&9), Some(&'c'));
     }
 
     #[test]
