@@ -203,6 +203,11 @@ pub(super) struct SitePlan {
     pub(super) check: bool,
     /// Record the walked receiver in the way.
     pub(super) fill: bool,
+    /// In a speculative loop's fast version: an earlier site of the same
+    /// iteration put this very receiver in the way, so it is still there
+    /// (no compare: see [`plan`]). Outside it (the loop's plain copy) the
+    /// site checks.
+    pub(super) known: bool,
 }
 
 /// A body's receiver-cache plan: the ways it uses and each op's site plan.
@@ -261,6 +266,22 @@ fn op_dst(op: &GenericOp) -> Option<u16> {
         | GenericOp::Construct { dst, .. } => Some(dst),
         _ => None,
     }
+}
+
+/// Whether `op`'s result is usually another value each time it runs: an
+/// element or property read, or a call's result (a global or captured
+/// binding's read usually yields the same object again).
+fn fresh_def(op: &GenericOp) -> bool {
+    matches!(
+        op,
+        GenericOp::GetElem { .. }
+            | GenericOp::ArrGet { .. }
+            | GenericOp::GetProp { .. }
+            | GenericOp::CallMethod { .. }
+            | GenericOp::CallValue { .. }
+            | GenericOp::CallKey { .. }
+            | GenericOp::Construct { .. }
+    )
 }
 
 /// Whether an op's fast path makes a call (which empties every way), or the
@@ -335,11 +356,22 @@ pub(super) fn shape_ways(
 /// binding cache's plan and which ops lie in promoted loops (whose global
 /// accesses keep their own validated addresses); `osr_entries` and
 /// `catch_targets` are entries besides the ops' own branch targets.
+///
+/// `in_spec` tells the ops of speculative promoted loops, whose fast version
+/// runs no Rust code from its header to its back-edge: every slow path there
+/// leaves for the loop's plain copy instead of rejoining it
+/// (`numeric::NumGen::spec_bail`), and so does every inline property add.
+/// So once a site of an iteration has the receiver in its way (a hit, or a
+/// walk that filled it), a later site of the same iteration on the same
+/// value finds it still there — unless a site between them used that way
+/// for another value — and is [`known`](SitePlan::known): it takes the
+/// way's slot address without comparing.
 pub(super) fn plan(
     ops: &[GenericOp],
     bytecode: &[Op],
     globals: &GlobalPlan,
     in_region: impl Fn(usize) -> bool,
+    in_spec: impl Fn(usize) -> bool,
     osr_entries: &[usize],
     catch_targets: &[usize],
 ) -> RecvPlan {
@@ -354,9 +386,19 @@ pub(super) fn plan(
     let mut fill = vec![false; n];
     let mut check = vec![false; n];
     let mut site_id = vec![0u32; n];
+    // The registers holding a value made since the last join by an op that
+    // usually makes a different one each time it runs (`fresh_def`), not yet
+    // walked: a promoted loop's first site on one walks it at once rather
+    // than first comparing it with what its way held last iteration.
+    let mut fresh: Vec<u16> = Vec::new();
+    let mut fresh_first = vec![false; n];
+    // Per site: the previous site of the same iteration on its value, both
+    // in a speculative loop.
+    let mut pred: Vec<Option<usize>> = vec![None; n];
     for (i, op) in ops.iter().enumerate() {
         if target[i] {
             live.clear();
+            fresh.clear();
         }
         if let Some((r, fam)) = site_recv(op) {
             let id = id_of(&mut ids, &mut next_id, r) * 3 + fam as u32;
@@ -364,9 +406,13 @@ pub(super) fn plan(
             if let Some(e) = live.iter_mut().find(|e| e.0 == id) {
                 fill[e.1] = true;
                 check[i] = true;
+                if in_spec(i) && in_spec(e.1) {
+                    pred[i] = Some(e.1);
+                }
                 e.1 = i;
             } else {
                 live.push((id, i));
+                fresh_first[i] = fresh.contains(&r);
             }
         }
         let inline = matches!(op, GenericOp::Interp { .. } | GenericOp::CallMethod { .. })
@@ -385,10 +431,19 @@ pub(super) fn plan(
                 let id = id_of(&mut ids, &mut next_id, src);
                 ids.retain(|&(x, _)| x != dst);
                 ids.push((dst, id));
+                let f = fresh.contains(&src);
+                fresh.retain(|&x| x != dst);
+                if f {
+                    fresh.push(dst);
+                }
             }
             _ => {
                 if let Some(d) = op_dst(op) {
                     ids.retain(|&(x, _)| x != d);
+                    fresh.retain(|&x| x != d);
+                    if fresh_def(op) {
+                        fresh.push(d);
+                    }
                 }
             }
         }
@@ -404,17 +459,25 @@ pub(super) fn plan(
             (GenericOp::Interp { .. } | GenericOp::PushHandler { .. }, _) => {
                 // It may write any register.
                 ids.clear();
+                fresh.clear();
             }
             _ => {}
+        }
+        if let (GenericOp::Interp { .. }, Some(Op::LoadGlobal { dst, .. })) = (op, bytecode.get(i))
+        {
+            fresh.retain(|x| x != dst);
         }
     }
     // In a promoted loop, a receiver is usually the one the same site saw
     // last iteration (a loop-invariant object, or one read afresh from the
-    // same binding): every site there checks its way first and refills it.
+    // same binding): every site there checks its way first and refills it —
+    // except the first site on a value the iteration has just made (an
+    // element or property read, a call's result), which is usually another
+    // object than last time: it walks the value at once (and fills the way).
     for i in 0..n {
         if in_region(i) && site_recv(&ops[i]).is_some() {
             fill[i] = true;
-            check[i] = true;
+            check[i] = !fresh_first[i];
         }
     }
     // Ways, least recently used first per family, over the sites that use
@@ -465,7 +528,25 @@ pub(super) fn plan(
             family,
             check: check[i],
             fill: true,
+            known: false,
         });
+    }
+    // A site is known when its predecessor of the iteration used the same
+    // way and no site between them used it for another value.
+    for i in 0..n {
+        let (Some(p), Some(si)) = (pred[i], sites[i]) else {
+            continue;
+        };
+        let same_way = sites[p].is_some_and(|sp| sp.way == si.way);
+        let undisturbed = (p + 1..i)
+            .all(|q| sites[q].is_none_or(|sq| sq.way != si.way || site_id[q] == site_id[i]));
+        if same_way
+            && undisturbed
+            && site_id[p] == site_id[i]
+            && let Some(x) = sites[i].as_mut()
+        {
+            x.known = true;
+        }
     }
     let ways = obj_ways + arr_ways + cell_ways;
     RecvPlan { ways, sites }

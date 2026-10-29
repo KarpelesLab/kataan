@@ -870,7 +870,7 @@ impl NumGen {
             }
         }
         self.gload(a, p, dbl_entry);
-        self.zero_globals(a, Some(ri));
+        self.refresh_globals(a, ri, false);
         let inner = ilabels[head];
         a.bind(inner);
         if let Some(p) = self.regions[ri].int.as_mut() {

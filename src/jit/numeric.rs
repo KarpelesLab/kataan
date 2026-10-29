@@ -318,6 +318,9 @@ struct Region {
     live_head: Vec<u16>,
     /// Its speculative double version, if planned ([`plan_spec`]).
     spec: Option<Spec>,
+    /// The pcs of arithmetic ops whose result needs no NaN canonicalization
+    /// in its SSE register ([`raw_nan_results`]).
+    raw_nan: Vec<usize>,
 }
 
 /// A region's **speculative** double version: arithmetic whose operands are
@@ -329,6 +332,14 @@ struct Region {
 /// Number, so the ops that consume it need no type guard. Loop-carried
 /// registers the region assumes are Numbers are checked once at its entry
 /// (else the copy runs the iteration).
+///
+/// Every other slow path that would run Rust code leaves for the copy the
+/// same way (the numeric ones by [`NumGen::stub`], the generic emitter's
+/// through [`NumGen::spec_bail`], a global binding's validation after it has
+/// validated), as do a property add and a compiled-in layout's mismatch: the
+/// fast version makes no call from the header to the back-edge, which lets
+/// the receiver cache carry what one site proved to the next sites of the
+/// iteration (`recv_cache::plan`).
 struct Spec {
     /// The in-state register types of each region pc (`(pc - head) * n_regs
     /// + r`), under the speculation.
@@ -632,9 +643,20 @@ impl NumGen {
         self.copy_labels.get(pc).copied().flatten()
     }
 
-    /// How many 8-byte native frame slots the emitted code needs.
+    /// How many 8-byte native frame slots the emitted code needs: the
+    /// global binding addresses, then one epoch slot per region.
     pub(super) fn frame_slots(&self) -> usize {
-        self.n_gslots
+        self.n_gslots + self.regions.len()
+    }
+
+    /// The frame slots the prologue must empty: the epoch slots of the
+    /// regions with global ops (an empty slot is no epoch, so the first
+    /// entry validates afresh).
+    pub(super) fn entry_clear_slots(&self) -> Vec<i32> {
+        (0..self.regions.len())
+            .filter(|&ri| !self.region_gslots[ri].is_empty())
+            .map(|ri| self.gslot_disp((self.n_gslots + ri) as u32))
+            .collect()
     }
 
     /// Whether op `pc` lies in a promoted loop region (whose code this
@@ -659,6 +681,92 @@ impl NumGen {
         for &k in &self.region_gslots[ri] {
             a.mov_frame_zero(self.gslot_disp(k));
         }
+    }
+
+    /// Keeps region `ri`'s validated global binding addresses across a
+    /// region entry or a back-edge poll while the global binding epoch they
+    /// were validated under is current, else drops them (and notes the
+    /// current epoch). Only Rust code changes the epoch, and the addresses
+    /// stay valid exactly as long as it does not (`jit_helper_global_ref`'s
+    /// contract, which the body's own global binding cache relies on too).
+    /// Every slot was filled at or after the epoch the region noted, as the
+    /// epoch only grows and every call in the region drops them all: a
+    /// noted epoch that is still current proves every filled slot current.
+    ///
+    /// With `validate` (a speculative region, from a point where no
+    /// promoted register is live yet: the entry before its loads, or a
+    /// back-edge poll's before the reload), a changed epoch also validates
+    /// every slot afresh (`jit_helper_global_ref`, which leaves a binding
+    /// that does not qualify empty) — so the fast version, whose own
+    /// validation leaves for the plain copy, finds them filled. Clobbers
+    /// `rax`, `r11` (and, validating, every caller-saved register).
+    fn refresh_globals(&self, a: &mut X64Assembler, ri: usize, validate: bool) {
+        if self.region_gslots[ri].is_empty() {
+            return;
+        }
+        let keep = a.new_label();
+        let noted = self.gslot_disp((self.n_gslots + ri) as u32);
+        a.movabs_r11(crate::env::global_binding_epoch_addr() as i64);
+        a.raw(&[0x49, 0x8b, 0x03]); // mov rax, [r11]
+        a.cmp_rax_mem(noted);
+        a.jcc(CC_E, keep);
+        a.g_store(super::call_seq::r::RBP, noted, RAX);
+        self.zero_globals(a, Some(ri));
+        if validate {
+            let r = &self.regions[ri];
+            for pc in r.head..=r.end {
+                let k = self.gslot.get(pc).copied().unwrap_or(u32::MAX);
+                if k == u32::MAX {
+                    continue;
+                }
+                let op_ptr = self.env.bytecode.wrapping_add(pc) as i64;
+                a.mov_rdi_r15();
+                a.movabs_argreg(1, op_ptr);
+                a.movabs_rax(self.env.global_ref as i64);
+                a.call_rax();
+                a.store_rax(self.gslot_disp(k));
+            }
+            // (Validating ran Rust code: its epoch is the one noted only if
+            // it did not change it.)
+            a.movabs_r11(crate::env::global_binding_epoch_addr() as i64);
+            a.raw(&[0x49, 0x8b, 0x03]); // mov rax, [r11]
+            a.cmp_rax_mem(noted);
+            a.jcc(CC_E, keep);
+            self.zero_globals(a, Some(ri));
+            a.store_empty(noted);
+        }
+        a.bind(keep);
+    }
+
+    /// Whether op `pc` lies in the fast version of a speculative region:
+    /// none of its paths runs Rust code and then rejoins it (every one
+    /// leaves for the region's plain copy instead), so from the region's
+    /// header to its back-edge no call is made.
+    pub(super) fn in_spec(&self, pc: usize) -> bool {
+        self.region_at(pc)
+            .is_some_and(|ri| self.regions[ri].spec.is_some())
+    }
+
+    /// For a generic op `pc` in the fast version of a speculative region
+    /// ([`in_spec`](Self::in_spec)): a label that leaves for the op in the
+    /// region's plain copy (the promoted registers written back), which its
+    /// slow paths take instead of their own code. Taken before the op has
+    /// done anything, it is the op from scratch.
+    pub(super) fn spec_bail(&mut self, a: &mut X64Assembler, pc: usize) -> Option<Label> {
+        if !self.in_spec(pc) || self.copy_label(pc).is_none() {
+            return None;
+        }
+        let entry = a.new_label();
+        self.stubs.push(Stub {
+            entry,
+            resume: entry,
+            region: self.region_at(pc),
+            pc,
+            kind: StubKind::SpecBail { pc: pc as u32 },
+            branch: None,
+            int: false,
+        });
+        Some(entry)
     }
 
     fn region_at(&self, pc: usize) -> Option<usize> {
@@ -736,6 +844,10 @@ impl NumGen {
                     p.dbl_entry = Some(dbl_entry);
                 }
             }
+            let validate = self.regions[ri].spec.is_some();
+            if validate {
+                self.refresh_globals(a, ri, true);
+            }
             for s in &self.regions[ri].slots {
                 if s.carried {
                     a.movsd_x_mem(s.xmm, disp(s.reg));
@@ -749,7 +861,9 @@ impl NumGen {
                     self.num_guard(a, reg, r, copy);
                 }
             }
-            self.zero_globals(a, reg);
+            if !validate {
+                self.refresh_globals(a, ri, false);
+            }
             let inner = a.new_label();
             a.bind(inner);
             self.regions[ri].inner = Some(inner);
@@ -1153,8 +1267,14 @@ impl NumGen {
                     a.cmp_rax_r11();
                     a.je(self.leave_exit?);
                     a.store_rax_frame8(COUNTDOWN);
+                    let validate = self.regions[ri].spec.is_some();
+                    if validate {
+                        self.refresh_globals(a, ri, true);
+                    }
                     self.reload(a, reg);
-                    self.zero_globals(a, reg);
+                    if !validate {
+                        self.refresh_globals(a, ri, false);
+                    }
                     a.bind(skip);
                     a.jmp(self.regions[ri].inner?);
                 } else {
@@ -1236,6 +1356,12 @@ impl NumGen {
     /// `xmm = rax` (the bits).
     pub(super) fn set_xmm_from_rax(a: &mut X64Assembler, x: u8) {
         a.movq_x_gpr(x, RAX);
+    }
+
+    /// `xmm0 = (f64) (r8 + 1)`.
+    pub(super) fn inc_r8_to_xmm0(a: &mut X64Assembler) {
+        a.raw(&[0x49, 0xff, 0xc0]); // inc r8
+        a.raw(&[0xf2, 0x49, 0x0f, 0x2a, 0xc0]); // cvtsi2sd xmm0, r8
     }
 
     /// `xmm = (f64) rax`.
@@ -1359,9 +1485,11 @@ impl NumGen {
                     store: true,
                 }
             }
-            StubKind::Helper { .. } | StubKind::Exec { .. }
-                if region.is_some_and(|ri| self.regions[ri].spec.is_some())
-                    && self.bc(self.cur_pc).is_some_and(spec_num_op) =>
+            // In a speculative region every slow path that would run Rust
+            // code leaves for the plain copy (the fast version makes no call:
+            // see `in_spec`).
+            StubKind::Helper { .. } | StubKind::Exec { .. } | StubKind::Truthy { .. }
+                if region.is_some_and(|ri| self.regions[ri].spec.is_some()) =>
             {
                 StubKind::SpecBail {
                     pc: self.cur_pc as u32,
@@ -1588,13 +1716,16 @@ impl NumGen {
                     let ys = self.xmm_src(a, reg, y, 1);
                     a.sse_rr(0xf2, opc, xd, ys);
                 }
-                // A NaN made canonical (out of line).
-                let fix = a.new_label();
-                let back = a.new_label();
-                a.sse_rr(0x66, 0x2e, xd, xd); // ucomisd xd, xd
-                a.jcc(CC_P, fix);
-                a.bind(back);
-                self.stub(fix, back, reg, StubKind::CanonNanX { x: xd });
+                // A NaN made canonical (out of line), unless nothing can
+                // observe its bits (`raw_nan_results`).
+                if !reg.is_some_and(|ri| self.regions[ri].raw_nan.contains(&pc)) {
+                    let fix = a.new_label();
+                    let back = a.new_label();
+                    a.sse_rr(0x66, 0x2e, xd, xd); // ucomisd xd, xd
+                    a.jcc(CC_P, fix);
+                    a.bind(back);
+                    self.stub(fix, back, reg, StubKind::CanonNanX { x: xd });
+                }
             }
             _ => {
                 self.load_xmm0(a, reg, x);
@@ -2032,6 +2163,17 @@ impl NumGen {
                     if k != u32::MAX {
                         a.store_rax(self.gslot_disp(k));
                     }
+                    // A speculative region's fast version makes no call that
+                    // rejoins it: the copy runs the op (the next iteration
+                    // finds the address validated).
+                    if !s.int
+                        && let Some(ri) = s.region
+                        && self.regions[ri].spec.is_some()
+                        && let Some(l) = self.copy_label(pc)
+                    {
+                        a.jmp(l);
+                        continue;
+                    }
                     self.reload(a, s.region);
                     a.test_rax_rax();
                     a.jcc(CC_NE, retry);
@@ -2458,7 +2600,103 @@ fn plan_regions(
             generic,
             live_head,
             spec: None,
+            raw_nan: raw_nan_results(ops, bytecode, head, end, &carried_r),
         });
+    }
+    out
+}
+
+/// Whether `op` is an SSE arithmetic op whose inline result is computed from
+/// two Numbers (`+`, `-`, `*`, `/`): a NaN result is whatever NaN the
+/// hardware made, canonicalized before it is stored.
+fn raw_nan_producer(op: &GenericOp) -> bool {
+    match *op {
+        GenericOp::Add { .. } | GenericOp::NumAdd { .. } => true,
+        GenericOp::Arith { op, .. } => matches!(
+            op,
+            crate::nbvm::GA_SUB | crate::nbvm::GA_MUL | crate::nbvm::GA_DIV
+        ),
+        _ => false,
+    }
+}
+
+/// Whether `op` only ever looks at a Number operand's value as an `f64`: it
+/// treats every NaN alike and never stores the operand's bits anywhere (its
+/// own result, or its slow path's, is a fresh value): the arithmetic of
+/// [`raw_nan_producer`] (whose own result is canonicalized or raw by the same
+/// rule) and the relational comparisons.
+fn raw_nan_consumer(op: &GenericOp) -> bool {
+    raw_nan_producer(op) || matches!(op, GenericOp::Lt { .. } | GenericOp::Compare { .. })
+}
+
+/// The pcs of region `head..=end`'s arithmetic whose NaN result may stay the
+/// hardware's NaN in its SSE register: the canonical NaN exists so that a
+/// NaN's *bits* are the interpreter's wherever they can be observed (stored
+/// into an object, a typed array, compared by identity...), but such a
+/// result never reaches anything that looks at its bits. Its register is
+/// not loop-carried (dead at the header, the exits and the catch entries,
+/// `carried`), and every op of the region that reads it is a
+/// [`raw_nan_consumer`] or a `Move` into a register that satisfies the same
+/// (a `const` binding's copy) — so a value of it reaches nothing else,
+/// whichever way control goes: an op before the header's next execution
+/// that reads such a register reads this value or a later write, and after
+/// an exit (or a leave at the header) the register is dead. Wherever such a
+/// value is written to the register file (a flush before a call) it still
+/// reads as a Number: the hardware's NaNs (the default `0xfff8…` or a
+/// quieted operand NaN, itself a Number) never have the boxed pattern.
+fn raw_nan_results(
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    head: usize,
+    end: usize,
+    carried: &impl Fn(u16) -> bool,
+) -> Vec<usize> {
+    let (mut d, mut u) = (Vec::new(), Vec::new());
+    let mut out = Vec::new();
+    for pc in head..=end {
+        if !raw_nan_producer(&ops[pc]) {
+            continue;
+        }
+        let Some(r) = written_reg(&bytecode[pc]) else {
+            continue;
+        };
+        // The registers the value may reach (through moves), each checked.
+        let mut reach = alloc::vec![r];
+        let mut i = 0;
+        let mut ok = true;
+        while ok && i < reach.len() && reach.len() <= 8 {
+            let x = reach[i];
+            i += 1;
+            if carried(x) {
+                ok = false;
+                break;
+            }
+            for q in head..=end {
+                if q == pc && x == r {
+                    continue;
+                }
+                def_use(&bytecode[q], &mut d, &mut u);
+                if !u.contains(&x) || raw_nan_consumer(&ops[q]) {
+                    continue;
+                }
+                match bytecode[q] {
+                    Op::Move { dst, src }
+                        if src == x && matches!(ops[q], GenericOp::Move { .. }) =>
+                    {
+                        if !reach.contains(&dst) {
+                            reach.push(dst);
+                        }
+                    }
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if ok && i == reach.len() {
+            out.push(pc);
+        }
     }
     out
 }
@@ -2626,7 +2864,7 @@ impl X64Assembler {
     }
 
     /// Appends raw instruction bytes.
-    fn raw(&mut self, bytes: &[u8]) {
+    pub(super) fn raw(&mut self, bytes: &[u8]) {
         self.code.extend_from_slice(bytes);
     }
 
@@ -2909,6 +3147,38 @@ mod tests {
         assert_eq!(regions.len(), 1);
         let t = infer(&b.ops, b.n_regs);
         assert!(plan_spec(&regions[0], &bops, &b.ops, &t, b.n_regs).is_none());
+    }
+
+    #[test]
+    fn raw_nan_results_feed_only_arithmetic() {
+        // `t = a * b` and `u = t - b` only feed arithmetic: raw. `w` is
+        // stored into an object, `q` is loop-carried, `m` moves: canonical.
+        let p = proto_of(
+            "function f(o, a, b){ let q = 0; for (let i = 0; i < 100; i = i + 1) { const t = a * b; const u = t - b; const w = u / a; o.w = w; q = q + u; const m = t * 2; const n = m; o.n = n; } return q; }",
+            "f",
+        );
+        let (ops, ..) = crate::jit::lower_nbvm_generic(&p).expect("generic");
+        let regions = plan_regions(&ops, &p.ops, &[], p.n_regs);
+        assert_eq!(regions.len(), 1);
+        let r = &regions[0];
+        let muls: Vec<usize> = (r.head..=r.end)
+            .filter(|&pc| matches!(p.ops[pc], Op::Mul { .. }))
+            .collect();
+        let sub = pc_of(&p, |o| matches!(o, Op::Sub { .. }));
+        let div = pc_of(&p, |o| matches!(o, Op::Div { .. }));
+        assert_eq!(muls.len(), 2);
+        assert!(
+            r.raw_nan.contains(&muls[0]),
+            "t feeds - and *: {:?}",
+            r.raw_nan
+        );
+        assert!(r.raw_nan.contains(&sub), "u feeds / and +");
+        assert!(!r.raw_nan.contains(&div), "w is stored");
+        assert!(!r.raw_nan.contains(&muls[1]), "m is moved");
+        let add = (r.head..=r.end)
+            .find(|&pc| matches!(p.ops[pc], Op::AddValue { .. } | Op::Add { .. }) && pc > sub)
+            .expect("q + u");
+        assert!(!r.raw_nan.contains(&add), "q is loop-carried");
     }
 
     #[test]

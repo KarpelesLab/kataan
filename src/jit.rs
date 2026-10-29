@@ -5546,6 +5546,7 @@ impl JitFunction {
             bytecode,
             &gc_plan,
             |pc| num.in_region(pc),
+            |pc| num.in_spec(pc),
             osr_entries,
             &catch_targets,
         );
@@ -5608,13 +5609,15 @@ impl JitFunction {
                 .chain((0..math_sites.len()).flat_map(|m| [m_slot(m, 0), m_slot(m, 2)]))
                 .collect(),
         );
+        // (Also the promoted loops' epoch slots: emptying them with the
+        // global binding cache's merely makes the loops validate afresh.)
+        let mut entry_clear = num.entry_clear_slots();
         if gc_plan.slots > 0 {
-            a.set_entry_clear(
-                (0..gc_plan.slots)
-                    .map(gc_slot)
-                    .chain(core::iter::once(gc_epoch))
-                    .collect(),
-            );
+            entry_clear.extend((0..gc_plan.slots).map(gc_slot));
+            entry_clear.push(gc_epoch);
+        }
+        if !entry_clear.is_empty() {
+            a.set_entry_clear(entry_clear);
         }
         // The out-of-line full walks: (entry, resume, receiver, miss, way).
         let mut cold_walks: Vec<(Label, Label, u16, Label, usize, recv_cache::Family)> = Vec::new();
@@ -5731,15 +5734,15 @@ impl JitFunction {
             ($recv:expr, $miss:expr) => {{
                 a.mov_r10_rax(); // r10 = arena base
                 a.load_rax(disp($recv)); // rax = recv bits
-                a.movabs_r11(HANDLE_TAG as i64);
+                // A heap handle has all of `HANDLE_TAG`'s bits (the top 14).
+                const _: () = assert!(HANDLE_TAG == !0u64 << 50);
                 a.mov_rcx_rax();
-                a.and_rcx_r11();
-                a.cmp_rcx_r11();
+                a.raw(&[0x48, 0xc1, 0xe9, 50]); // shr rcx, 50
+                a.raw(&[0x81, 0xf9, 0xff, 0x3f, 0x00, 0x00]); // cmp ecx, 0x3fff
                 a.jne($miss); // not a heap handle
                 a.mov_r8_rax();
                 a.shr_r8_imm(32); // r8 = generation (low 16)
-                a.movabs_r11(0xffff_ffff_i64);
-                a.and_rax_r11(); // rax = handle index
+                a.raw(&[0x89, 0xc0]); // mov eax, eax: rax = handle index
                 a.cmp_rax_rdx();
                 a.jae($miss); // index >= arena len
                 a.imul_rax_imm(layout.slot_stride);
@@ -5761,8 +5764,14 @@ impl JitFunction {
                     recv_cache::Family::Obj => {
                         a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_object_disc);
                         a.jne($miss);
-                        a.cmp_byte_at_rcx_imm(layout.off_od_tag, layout.obj_shaped_disc);
-                        a.jne($miss);
+                        // (One compare when the object-data tag is the very
+                        // byte and value the cell tag was just compared to.)
+                        if (layout.off_od_tag, layout.obj_shaped_disc)
+                            != (layout.off_cell_tag, layout.cell_object_disc)
+                        {
+                            a.cmp_byte_at_rcx_imm(layout.off_od_tag, layout.obj_shaped_disc);
+                            a.jne($miss);
+                        }
                         a.p_test_byte_imm(
                             call_seq::r::RCX,
                             layout.props.off_jit_flags,
@@ -5800,6 +5809,14 @@ impl JitFunction {
                     return None;
                 }
                 match rc.sites[$at] {
+                    // Still in the way since an earlier site of this
+                    // iteration (`recv_cache::plan`; the loop's fast version
+                    // only).
+                    Some(recv_cache::SitePlan {
+                        way, known: true, ..
+                    }) if num.in_region($at) => {
+                        a.g_load(call_seq::r::RCX, call_seq::r::RBP, rc_cell(way));
+                    }
                     Some(recv_cache::SitePlan {
                         way, check: true, ..
                     }) => {
@@ -5872,6 +5889,9 @@ impl JitFunction {
             *const CallSite,
             Vec<(u8, i32, bool)>,
         )> = Vec::new();
+        // The slow paths of a speculative loop's fast version that leave for
+        // its plain copy instead: (slow path entry, the leave).
+        let mut cold_bails: Vec<(Label, Label)> = Vec::new();
         // A speculative region's plain copy is emitted right after it
         // (`numeric::NumGen::schedule`).
         num.alloc_copy_labels(&mut a);
@@ -6072,14 +6092,23 @@ impl JitFunction {
                         a.g_store(call_seq::r::RBP, m_slot(mi, 0), call_seq::r::R11);
                         a.g_store(call_seq::r::RBP, m_slot(mi, 1), call_seq::r::RCX);
                         a.jmp(have);
-                        // A chain-cache miss: refill it from the receiver.
+                        // A chain-cache miss: refill it from the receiver
+                        // (in a speculative loop's fast version, the copy
+                        // does, as it makes every call).
+                        let bail = num.spec_bail(&mut a, op_idx);
                         a.bind(fill);
+                        if let Some(b) = bail {
+                            a.jmp(b);
+                        }
                         a.mov_rdi_r15();
                         a.load_argreg(1, disp(recv));
                         a.movabs_argreg(2, si.method_ptr as i64);
                         a.movabs_rax(helpers.site_fill as usize as i64);
                         a.call_rax();
                         a.bind(general);
+                        if let Some(b) = bail {
+                            a.jmp(b);
+                        }
                     }
                     // `Math.f(x)` with the built-in `f` is computed directly.
                     num.math_call(&mut a, op_idx, done);
@@ -6452,6 +6481,61 @@ impl JitFunction {
                             site_slow!(helpers.init_fields, site_ptr);
                             a.bind(done);
                         }
+                        // A step of an array iteration in by-index mode
+                        // (`nbvm::iter_fast`: a Number cursor in `iter`, the
+                        // array in `iter + 1`): a present element of a plain
+                        // dense array below its length is the step's value
+                        // and the cursor moves on, which is all
+                        // `iter_fast::step` does for it. Anything else (the
+                        // protocol mode, a latched `done`, the end, a hole,
+                        // an array with side-table state) is the
+                        // interpreter's op.
+                        crate::nbvm::Op::IterNext {
+                            dst,
+                            done,
+                            iter,
+                            next,
+                        } if ok(*dst)
+                            && ok(*done)
+                            && ok(*iter)
+                            && usize::from(*next) == usize::from(*iter) + 1
+                            && ok(*next) =>
+                        {
+                            let (dst, done, iter, next) = (*dst, *done, *iter, *next);
+                            let slow = a.new_label();
+                            let fin = a.new_label();
+                            a.movabs_r11(QNAN as i64);
+                            a.load_rax(disp(iter));
+                            a.and_rax_r11();
+                            a.cmp_rax_r11();
+                            a.je(slow); // an iterator object: the protocol
+                            a.load_rax(disp(done));
+                            a.movabs_r11(tag_true as i64);
+                            a.cmp_rax_r11();
+                            a.je(slow);
+                            a.p_load_arena(helpers.call_layout.realm, &layout.props);
+                            walk_to_slot!(next, slow);
+                            family_checks!(recv_cache::Family::Arr, slow);
+                            int_index!(iter, slow, true);
+                            a.mov_r8_at_rcx(layout.off_arr_len);
+                            a.cmp_rax_r8();
+                            a.jae(slow); // the end (latched by the interpreter)
+                            a.mov_r8_rax();
+                            a.mov_r11_at_rcx(layout.off_arr_ptr);
+                            a.mov_rax_at_r11_rax8();
+                            a.movabs_r11(NanBox::hole().to_bits() as i64);
+                            a.cmp_rax_r11();
+                            a.je(slow);
+                            a.store_rax(disp(dst));
+                            // cursor = index + 1 (an exact Number: below the
+                            // array's length).
+                            numeric::NumGen::inc_r8_to_xmm0(&mut a);
+                            a.movsd_mem_xmm0(disp(iter));
+                            a.jmp(fin);
+                            a.bind(slow);
+                            exec_op!(pc);
+                            a.bind(fin);
+                        }
                         // A literal's allocation: its own helper, not the
                         // one-op interpreter.
                         crate::nbvm::Op::NewObject { dst } if ok(*dst) => {
@@ -6573,7 +6657,15 @@ impl JitFunction {
                         a.p_obj_fixed_slot_load(&layout, b.slot);
                         let x = num.result_xmm(op_idx, dst);
                         let spill = x.map(|_| a.new_label());
-                        cold_caches.push((cached, back, helper, spill, s.cache_ptr));
+                        // (In a speculative loop's fast version another
+                        // layout leaves for the copy: the way must keep
+                        // proving this one to the site's known successors.
+                        // A layout that keeps arriving gets the loop
+                        // recompiled, `tierup`.)
+                        match num.spec_bail(&mut a, op_idx) {
+                            Some(bail) => cold_bails.push((cached, bail)),
+                            None => cold_caches.push((cached, back, helper, spill, s.cache_ptr)),
+                        }
                         a.bind(back);
                         if let (Some(x), Some(spill)) = (x, spill) {
                             let past = a.new_label();
@@ -6611,16 +6703,21 @@ impl JitFunction {
                         a.store_rax(disp(dst));
                         a.jmp(done);
                     }
-                    // The miss path is out of line (see `cold_gets`).
-                    cold_gets.push((
-                        helper,
-                        done,
-                        dst,
-                        obj,
-                        s.method_ptr,
-                        call_site,
-                        a.call_spill_now(),
-                    ));
+                    // The miss path is out of line (see `cold_gets`), or in
+                    // a speculative loop's fast version leaves for its copy.
+                    if let Some(bail) = num.spec_bail(&mut a, op_idx) {
+                        cold_bails.push((helper, bail));
+                    } else {
+                        cold_gets.push((
+                            helper,
+                            done,
+                            dst,
+                            obj,
+                            s.method_ptr,
+                            call_site,
+                            a.call_spill_now(),
+                        ));
+                    }
                     if ool_past.is_none() {
                         a.bind(done);
                     }
@@ -6651,6 +6748,11 @@ impl JitFunction {
                     // flags test, out of line).
                     let known = s.baked.filter(|b| shape_known(op_idx, b.shape));
                     let verify = known.map(|_| a.new_label());
+                    // In a speculative loop's fast version every path but
+                    // the in-place stores leaves for its plain copy: a slow
+                    // path, an add, another layout than the compiled-in one
+                    // (a known site's way must keep proving it).
+                    let bail = num.spec_bail(&mut a, op_idx);
                     recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj, verify);
                     // A frozen object's writes need the helper, as do those of
                     // a host-exotic, global or tracked-prototype object, and of
@@ -6694,6 +6796,9 @@ impl JitFunction {
                         a.p_obj_fixed_slot_store(&layout, b.slot);
                         a.jmp(stored);
                         a.bind(cached);
+                        if let Some(b) = bail {
+                            a.jmp(b);
+                        }
                         // Another layout in a way that proves this one: empty
                         // it (and the others: it may be an add).
                         for &w in &shape_ways {
@@ -6735,6 +6840,9 @@ impl JitFunction {
                     // After the store's shape miss the object is walked
                     // (`rcx`) and its store guards hold.
                     a.bind(shape_miss);
+                    if let Some(b) = bail {
+                        a.jmp(b);
+                    }
                     if !s.method_ptr.is_null() {
                         // (No walk follows, so no arming test or arena: the
                         // add's own guards miss on an empty cache.)
@@ -6750,6 +6858,9 @@ impl JitFunction {
                     }
                     a.jmp(call_helper);
                     a.bind(helper);
+                    if let Some(b) = bail {
+                        a.jmp(b);
+                    }
                     if !s.method_ptr.is_null() {
                         a.p_add_armed(s.method_ptr, call_helper);
                         a.p_load_arena(helpers.call_layout.realm, &layout.props);
@@ -6811,8 +6922,13 @@ impl JitFunction {
                         a.store_rax(disp(dst));
                         a.jmp(done);
                     }
-                    // jit_helper_get_elem(ctx, recv, key).
+                    // jit_helper_get_elem(ctx, recv, key) (or, in a
+                    // speculative loop's fast version, its plain copy).
+                    let bail = num.spec_bail(&mut a, op_idx);
                     a.bind(helper);
+                    if let Some(b) = bail {
+                        a.jmp(b);
+                    }
                     a.mov_rdi_r15();
                     a.load_argreg(1, disp(obj));
                     a.load_argreg(2, disp(index));
@@ -6889,7 +7005,11 @@ impl JitFunction {
                         a.movsd_mem_xmm0(disp(dst));
                         a.jmp(done);
                     }
+                    let bail = num.spec_bail(&mut a, op_idx);
                     a.bind(helper);
+                    if let Some(b) = bail {
+                        a.jmp(b);
+                    }
                     a.mov_rdi_r15();
                     a.load_argreg(1, disp(arr));
                     a.movabs_rax(array_len_helper as i64);
@@ -7454,6 +7574,10 @@ impl JitFunction {
             a.g_store(call_seq::r::RBP, rc_key(w), call_seq::r::R11);
             a.g_store(call_seq::r::RBP, rc_cell(w), call_seq::r::RCX);
             a.jmp(back);
+        }
+        for (entry, bail) in core::mem::take(&mut cold_bails) {
+            a.bind(entry);
+            a.jmp(bail);
         }
         // The `GetProp` miss paths: the inherited data property or getter,
         // else the helper; each returns to its op's `done`.
