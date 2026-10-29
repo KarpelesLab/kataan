@@ -3043,8 +3043,6 @@ impl Interp {
                     return Ok(self.realm.temporal_at(oh).map(|d| d.kind)
                         == crate::nbexec::temporal::kind_for_ctor_id(id));
                 }
-                // Every callable (function, class, native, bound) is a `Function`.
-                N_FUNCTION => return Ok(self.is_callable(oh)),
                 _ => {}
             }
             // OrdinaryHasInstance fallback for any other built-in constructor (e.g.

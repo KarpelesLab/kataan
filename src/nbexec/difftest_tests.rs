@@ -1466,3 +1466,21 @@ fn string_wrapper_prototype_exposes_its_length_and_indices() {
     "#;
     assert_eq!(run(src), "a,b,2,a,0,2,b,TypeError");
 }
+
+/// `x instanceof Function` is OrdinaryHasInstance: a walk of `x`'s prototype
+/// chain for `Function.prototype`, not a callability check. A function whose
+/// prototype was set to null (or to a plain object) is no `Function`
+/// instance, and an object inheriting `Function.prototype` is one.
+#[test]
+fn instanceof_function_walks_the_prototype_chain() {
+    let src = r#"
+        var f = function () {}; Object.setPrototypeOf(f, null);
+        var g = function () {}; Object.setPrototypeOf(g, {});
+        var o = Object.create(Function.prototype);
+        class A {}
+        [f instanceof Function, g instanceof Function, o instanceof Function,
+         A instanceof Function, (() => 1) instanceof Function, Math.max instanceof Function,
+         (function () {}).bind() instanceof Function].join()
+    "#;
+    assert_eq!(run(src), "false,false,true,true,true,true,true");
+}
