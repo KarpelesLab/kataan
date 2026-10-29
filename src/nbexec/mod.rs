@@ -4769,6 +4769,8 @@ impl Interp {
         // `ArrayBuffer.prototype.slice` (SpeciesConstructor). TypedArrays inherit
         // theirs from the shared `%TypedArray%` intrinsic.
         self.install_ctor_species("ArrayBuffer");
+        // …and `get SharedArrayBuffer[Symbol.species]` (25.2.4.2), likewise.
+        self.install_ctor_species("SharedArrayBuffer");
         self.install_temporal();
         self.install_proto_to_string_tag("WeakMap", "WeakMap");
         self.install_proto_to_string_tag("WeakSet", "WeakSet");

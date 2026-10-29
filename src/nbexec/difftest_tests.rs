@@ -781,3 +781,16 @@ fn dynamic_import_resolves_with_a_thenable_namespace() {
 fn promise_with_resolvers_length_is_zero() {
     assert_eq!(run("Promise.withResolvers.length"), "0");
 }
+
+/// `SharedArrayBuffer[Symbol.species]` exists, a getter returning `this` like
+/// `ArrayBuffer`'s (it was missing).
+#[test]
+fn shared_array_buffer_has_species_getter() {
+    let src = r#"
+        var d = Object.getOwnPropertyDescriptor(SharedArrayBuffer, Symbol.species);
+        class S extends SharedArrayBuffer {}
+        [typeof d.get, d.set, d.configurable, d.get.name,
+         SharedArrayBuffer[Symbol.species] === SharedArrayBuffer, S[Symbol.species] === S].join()
+    "#;
+    assert_eq!(run(src), "function,,true,get [Symbol.species],true,true");
+}
