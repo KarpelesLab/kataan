@@ -14021,6 +14021,11 @@ impl Compiler {
                     refs_expr(d, &mut direct, &mut nested);
                 }
             }
+            // A field initializer (the body of the instance-fields closure)
+            // is code of this function too: an arrow in it sees this `this`.
+            for e in field_defs.iter().filter_map(|fd| fd.init) {
+                refs_expr(e, &mut direct, &mut nested);
+            }
             if nested.contains(THIS_NAME) {
                 cell_names.insert(String::from(THIS_NAME));
             }

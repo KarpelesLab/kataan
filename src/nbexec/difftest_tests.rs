@@ -595,3 +595,29 @@ fn freezing_mapped_arguments_severs_the_alias() {
     "#;
     assert_eq!(run(src), "5,2,7,8,true");
 }
+
+/// Runs `src` (draining its promise jobs) and returns its `console` output.
+fn out(src: &str) -> String {
+    let program = Parser::parse_program(src).expect("parse");
+    let mut interp = Interp::new();
+    interp.run(&program).expect("exec");
+    String::from(interp.output())
+}
+
+/// An arrow in a class field initializer sees the instance as `this` (and
+/// `super`/`new.target` through it), also when it runs during the
+/// initialization: the fields closure did not box its `this` for nested
+/// arrows, so an immediately-called arrow read `undefined`, and `new.target`
+/// in one was refused by the compiler.
+#[test]
+fn arrow_in_field_initializer_sees_this() {
+    let src = r#"
+        class A { constructor() { this.t = 1; } m() { return 'A.m:' + this.tag; } }
+        class B { tag = 'b'; af = (() => this.tag)(); }
+        class D extends A { tag = 'd'; af = (() => super.m())(); bf = (() => (() => this.t)())(); #p = (() => this.t + 1)(); p() { return this.#p; } }
+        class N extends A { nt = (() => new.target)(); }
+        var d = new D();
+        [new B().af, d.af, d.bf, d.p(), new N().nt].join()
+    "#;
+    assert_eq!(run(src), "b,A.m:d,1,2,");
+}
