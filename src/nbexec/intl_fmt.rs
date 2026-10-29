@@ -3192,7 +3192,15 @@ impl Interp {
             .unwrap();
 
         // --- SetNumberFormatDigitOptions --- (shared with Intl.PluralRules).
-        self.set_number_format_digit_options(obj, opts)?;
+        // The fraction-digit defaults: a currency's digits in standard notation
+        // (CurrencyDigits), percent 0..0, else 0..3.
+        let cdigits = f64::from(currency_digits(currency.as_deref().unwrap_or_default()));
+        let frac_defaults = match style.as_str() {
+            "currency" if notation == "standard" => (cdigits, cdigits),
+            "percent" => (0.0, 0.0),
+            _ => (0.0, 3.0),
+        };
+        self.set_number_format_digit_options(obj, opts, frac_defaults, &notation)?;
 
         // compactDisplay, useGrouping, signDisplay.
         let compact_display =
@@ -3240,10 +3248,15 @@ impl Interp {
     /// order. Shared by `Intl.NumberFormat` and `Intl.PluralRules` so both honor the
     /// same option semantics and constructor option-read order. An invalid value is a
     /// RangeError; a Symbol is a TypeError (via the option getters).
+    ///
+    /// `frac_defaults` is `(mnfdDefault, mxfdDefault)`; with `notation`, it
+    /// resolves the digits the `roundingIncrement` checks apply to.
     fn set_number_format_digit_options(
         &mut self,
         obj: Handle,
         opts: Option<Handle>,
+        frac_defaults: (f64, f64),
+        notation: &str,
     ) -> Result<(), ExecError> {
         let mnid = self
             .get_int_option(opts, "minimumIntegerDigits", 1.0, 21.0, Some(1.0))?
@@ -3318,12 +3331,16 @@ impl Interp {
         // additionally requires maximumFractionDigits == minimumFractionDigits
         // (else a RangeError).
         if rinc != 1.0 {
+            let has_fd = mnfd.is_some() || mxfd.is_some();
             let rounding_type = if rounding_priority == "morePrecision" {
                 "morePrecision"
             } else if rounding_priority == "lessPrecision" {
                 "lessPrecision"
             } else if mnsd.is_some() {
                 "significantDigits"
+            } else if notation == "compact" && !has_fd {
+                // Compact notation's default rounding (no digit option at all).
+                "morePrecision"
             } else {
                 "fractionDigits"
             };
@@ -3332,9 +3349,17 @@ impl Interp {
                     "roundingIncrement other than 1 requires the fractionDigits rounding type",
                 ));
             }
-            if let (Some(a), Some(b)) = (mnfd, mxfd)
-                && a != b
-            {
+            // The *resolved* fraction digits: an omitted bound defaults from the
+            // other one and the style's defaults (so `{roundingIncrement: 5}` alone
+            // is 0..3, a RangeError).
+            let (def_min, def_max) = frac_defaults;
+            let (rmin, rmax) = match (mnfd, mxfd) {
+                (None, None) => (def_min, def_max),
+                (None, Some(b)) => (def_min.min(b), b),
+                (Some(a), None) => (a, def_max.max(a)),
+                (Some(a), Some(b)) => (a, b),
+            };
+            if rmin != rmax {
                 let m = self.new_str("roundingIncrement requires equal min/max fraction digits");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }
@@ -5717,8 +5742,14 @@ impl Interp {
             self.store_str(obj, "compactDisplay", &compact_display);
         }
         self.store_str(obj, "notation", &Some(notation));
-        // SetNumberFormatDigitOptions (shared with Intl.NumberFormat).
-        self.set_number_format_digit_options(obj, opts)?;
+        // SetNumberFormatDigitOptions (shared with Intl.NumberFormat), with the
+        // PluralRules fraction-digit defaults 0..3.
+        let notation = self
+            .realm
+            .get_property(obj, "notation")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("standard"));
+        self.set_number_format_digit_options(obj, opts, (0.0, 3.0), &notation)?;
         Ok(())
     }
 

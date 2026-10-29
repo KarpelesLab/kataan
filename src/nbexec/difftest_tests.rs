@@ -1043,3 +1043,26 @@ fn currency_default_digits_follow_iso_4217() {
         "BHD\u{a0}1.005|BHD\u{a0}12,345.679|¥2|CLF\u{a0}1.2346|$1.01|3|3"
     );
 }
+
+/// A `roundingIncrement` other than 1 needs equal *resolved* fraction
+/// digits: an omitted bound takes the style default, so
+/// `{roundingIncrement: 5}` alone (0..3) or with only `maximumFractionDigits: 1`
+/// (0..1) is a RangeError (only two explicit unequal bounds were checked).
+/// Compact notation's default rounding is not fraction digits (a TypeError).
+#[cfg(feature = "intl")]
+#[test]
+fn rounding_increment_checks_resolved_fraction_digits() {
+    let src = r#"
+        function t(f) { try { return f(); } catch (e) { return e.name; } }
+        [t(() => new Intl.NumberFormat("en", { roundingIncrement: 5 }).format(1)),
+         t(() => new Intl.NumberFormat("en", { roundingIncrement: 5, maximumFractionDigits: 1 }).format(1)),
+         t(() => new Intl.PluralRules("en", { roundingIncrement: 5, maximumFractionDigits: 1 }).select(1)),
+         t(() => new Intl.NumberFormat("en", { roundingIncrement: 5, maximumFractionDigits: 1, minimumFractionDigits: 1 }).format(1.02)),
+         t(() => new Intl.NumberFormat("en", { roundingIncrement: 5, maximumFractionDigits: 0 }).format(12)),
+         t(() => new Intl.NumberFormat("en", { notation: "compact", roundingIncrement: 5 }).format(1))].join()
+    "#;
+    assert_eq!(
+        run(src),
+        "RangeError,RangeError,RangeError,1.0,10,TypeError"
+    );
+}
