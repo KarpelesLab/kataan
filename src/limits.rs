@@ -140,6 +140,27 @@ pub struct Limits {
     pub object_dictionary_threshold: usize,
     /// WebAssembly limits (live: threaded into the wasm runtime).
     pub wasm: WasmLimits,
+    /// Install the Test262 host hooks (`$262_createRealm`, `$262_evalScript`,
+    /// `$262_detachArrayBuffer`, `$262_IsHTMLDDA`, `$262_agent_*`, …) as
+    /// globals. **Off by default**: they are conformance-harness plumbing, not
+    /// part of the language, and an ordinary embedder or the CLI must not
+    /// expose them to user scripts (`$262_IsHTMLDDA` hands out an object that
+    /// lies about `typeof`; `$262_agent_start` spawns threads). Only a Test262
+    /// runner turns this on, through [`Limits::with_test262_host_hooks`]. Not a
+    /// resource limit, but `Limits` is the configuration every entry point
+    /// already threads into each `Interp` it builds — including the realms
+    /// `$262.createRealm()` makes and the agents `$262.agent.start` spawns.
+    pub test262_host_hooks: bool,
+}
+
+impl Limits {
+    /// These limits with the Test262 host hooks enabled (see
+    /// [`Limits::test262_host_hooks`]).
+    #[must_use]
+    pub const fn with_test262_host_hooks(mut self) -> Self {
+        self.test262_host_hooks = true;
+        self
+    }
 }
 
 // The JS-parser, regex-engine, and rope caps run in standalone code that has no
@@ -167,6 +188,7 @@ impl Default for Limits {
                 max_table_elems: DEFAULT_WASM_MAX_TABLE_ELEMS,
                 max_locals: DEFAULT_WASM_MAX_LOCALS,
             },
+            test262_host_hooks: false,
         }
     }
 }

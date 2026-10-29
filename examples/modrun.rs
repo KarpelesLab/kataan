@@ -91,7 +91,7 @@ fn main() {
         &key,
         &kataan::nbexec::module::FileModuleHost,
         &prelude,
-        kataan::limits::Limits::default(),
+        kataan::limits::Limits::default().with_test262_host_hooks(),
     );
     match res {
         Ok((output, _completion)) => {

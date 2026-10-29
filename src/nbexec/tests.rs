@@ -8,6 +8,28 @@ fn eval_source(src: &str) -> Result<(String, String), String> {
     eval_source_on(src, crate::limits::Limits::default())
 }
 
+/// An interpreter with the Test262 host hooks (`$262_createRealm`,
+/// `$262_agent_*`, …) installed, which a plain [`Interp::new`] no longer has.
+fn test262_interp() -> Interp {
+    Interp::new_with_limits(crate::limits::Limits::default().with_test262_host_hooks())
+}
+
+/// [`run`] with the Test262 host hooks installed.
+fn run_hooks(src: &str) -> String {
+    let program = Parser::parse_program(src).expect("parse");
+    let mut interp = test262_interp();
+    let value = interp.run(&program).expect("exec");
+    interp.realm().to_display_string(value)
+}
+
+/// [`out`] with the Test262 host hooks installed.
+fn out262(src: &str) -> String {
+    let program = Parser::parse_program(src).expect("parse");
+    let mut interp = test262_interp();
+    interp.run(&program).expect("exec");
+    String::from(interp.output())
+}
+
 /// Runs `src` and renders the program's final value.
 fn run(src: &str) -> String {
     let program = Parser::parse_program(src).expect("parse");
@@ -4355,7 +4377,7 @@ fn run262(src: &str) -> String {
         evalScript: function (s) { return $262_evalScript(s); } };\n";
     let full = alloc::format!("{PRELUDE}{src}");
     let program = Parser::parse_program(&full).expect("parse");
-    let mut interp = Interp::new();
+    let mut interp = test262_interp();
     let value = interp.run(&program).expect("exec");
     interp.realm().to_display_string(value)
 }
@@ -10544,13 +10566,15 @@ fn atomics_sync_wait_finite_timeout_times_out_and_advances_clock() {
     // blocks for the whole timeout, then times out. The virtual clock advances by
     // the timeout so a `monotonicNow()`-measured duration observes the elapsed ms.
     assert_eq!(
-        out(r#"
+        out262(
+            r#"
             var i32 = new Int32Array(new SharedArrayBuffer(8));
             var before = $262_agent_monotonicNow();
             var r = Atomics.wait(i32, 0, 0, 250);
             var after = $262_agent_monotonicNow();
             console.log(r + " " + (after - before));
-        "#),
+        "#
+        ),
         "timed-out 250\n"
     );
 }
@@ -10559,13 +10583,15 @@ fn atomics_sync_wait_finite_timeout_times_out_and_advances_clock() {
 fn atomics_sync_wait_value_mismatch_is_not_equal_and_no_time_passes() {
     // A value mismatch returns "not-equal" at once — the clock does not advance.
     assert_eq!(
-        out(r#"
+        out262(
+            r#"
             var i32 = new Int32Array(new SharedArrayBuffer(8));
             var before = $262_agent_monotonicNow();
             var r = Atomics.wait(i32, 0, 7, 250);
             var after = $262_agent_monotonicNow();
             console.log(r + " " + (after - before));
-        "#),
+        "#
+        ),
         "not-equal 0\n"
     );
 }
@@ -10591,13 +10617,15 @@ fn atomics_wait_async_resolves_timed_out_and_advances_clock() {
     // With no notify, a finite-timeout `waitAsync` settles "timed-out" when its
     // timeout macrotask fires, advancing the virtual clock by the timeout.
     assert_eq!(
-        out(r#"
+        out262(
+            r#"
             var i32 = new Int32Array(new SharedArrayBuffer(8));
             var before = $262_agent_monotonicNow();
             Atomics.waitAsync(i32, 0, 0, 300).value.then(function (v) {
                 console.log(v + " " + ($262_agent_monotonicNow() - before));
             });
-        "#),
+        "#
+        ),
         "timed-out 300\n"
     );
 }
@@ -10624,7 +10652,7 @@ fn agent_worker_blocks_in_atomics_wait_until_notified() {
     // and the main agent's `Atomics.notify` finds it on the waiter list, reports
     // one wake, and releases it with "ok".
     assert_eq!(
-        out(&alloc::format!(
+        out262(&alloc::format!(
             r#"{AGENT_WAIT_UNTIL}
             $262_agent_start(`
               $262.agent.receiveBroadcast(function (sab) {{
@@ -10651,7 +10679,7 @@ fn agent_notify_wakes_exactly_one_of_two_parked_workers() {
     // Two workers park on the same location; `notify(…, 1)` wakes exactly one and
     // the other runs out its (short) timeout. Sorting makes the pair order-free.
     assert_eq!(
-        out(&alloc::format!(
+        out262(&alloc::format!(
             r#"{AGENT_WAIT_UNTIL}
             for (var i = 0; i < 2; i++) {{
               $262_agent_start(`
@@ -10680,7 +10708,7 @@ fn agent_broadcast_shares_the_same_data_block() {
     // worker's `Atomics.store` through its own `SharedArrayBuffer` object is
     // visible to the main agent reading the original one.
     assert_eq!(
-        out(&alloc::format!(
+        out262(&alloc::format!(
             r#"{AGENT_WAIT_UNTIL}
             $262_agent_start(`
               $262.agent.receiveBroadcast(function (sab) {{
@@ -10727,7 +10755,7 @@ fn agent_worker_runs_on_the_vm_and_spins_with_the_baton() {
     "#
     );
     let program = Parser::parse_program(&src).expect("parse");
-    let mut interp = Interp::new();
+    let mut interp = test262_interp();
     interp.run(&program).expect("exec");
     assert_eq!(interp.output(), "seen 7 true\n");
 }
@@ -10755,7 +10783,7 @@ fn vm_function_of_another_realm_runs_in_its_realm() {
         ok.push(count === 1);
         ok.join()
     "#;
-    assert_eq!(run(src), "true,true,true,true");
+    assert_eq!(run_hooks(src), "true,true,true,true");
 }
 
 #[test]
@@ -10778,7 +10806,7 @@ fn a_strict_tail_call_into_another_realm_runs_in_that_realm() {
         try { later(); } catch (e) { ok.push(e.constructor === other.global.TypeError); }
         ok.join()
     "#;
-    assert_eq!(run(src), "true,true,true");
+    assert_eq!(run_hooks(src), "true,true,true");
 }
 
 #[test]
@@ -10798,13 +10826,14 @@ fn a_resumed_generator_of_another_realm_runs_in_that_realm() {
         try { it.next(); } catch (e) { ok.push(e.constructor === other.global.TypeError); }
         ok.join()
     "#;
-    assert_eq!(run(src), "true,true");
+    assert_eq!(run_hooks(src), "true,true");
 }
 
 #[test]
 fn a_resumed_async_function_of_another_realm_runs_in_that_realm() {
     assert_eq!(
-        out(r#"
+        out262(
+            r#"
             var other = $262_createRealm();
             other.global.tag = "other";
             var tag = "main";
@@ -10814,7 +10843,8 @@ fn a_resumed_async_function_of_another_realm_runs_in_that_realm() {
                 console.log("async: " + (e.constructor === other.global.TypeError));
             });
             B().next().then(function (r) { console.log("agen: " + r.value); });
-        "#),
+        "#
+        ),
         "async: true\nagen: other\n"
     );
 }
@@ -10824,10 +10854,12 @@ fn virtual_clock_set_timeout_fires_in_delay_order_and_advances() {
     // Macrotasks fire earliest-virtual-fire-time first, and dispatching one
     // advances the virtual clock read by `monotonicNow()`.
     assert_eq!(
-        out(r#"
+        out262(
+            r#"
             setTimeout(function () { console.log("b " + $262_agent_monotonicNow()); }, 200);
             setTimeout(function () { console.log("a " + $262_agent_monotonicNow()); }, 50);
-        "#),
+        "#
+        ),
         "a 50\nb 200\n"
     );
 }
@@ -10840,23 +10872,27 @@ fn cross_realm_intrinsic_throws_its_own_realms_type_error() {
     // *that realm's* `%TypeError%` — the value assert.throws inspects is the
     // error's `.constructor`, so it must be `other.TypeError`, not the main one.
     assert_eq!(
-        run(r#"
+        run_hooks(
+            r#"
             var other = $262_createRealm().global;
             var e;
             try { other.String.prototype.valueOf.call(false); } catch (x) { e = x; }
             (e.constructor === other.TypeError) && (e.constructor !== TypeError)
-        "#),
+        "#
+        ),
         "true"
     );
     // The same for a value-of on a null `this` reached via Reflect.apply.
     assert_eq!(
-        run(r#"
+        run_hooks(
+            r#"
             var other = $262_createRealm().global;
             var e;
             try { Reflect.apply(other.String.prototype.toString, null, []); }
             catch (x) { e = x; }
             e.constructor === other.TypeError
-        "#),
+        "#
+        ),
         "true"
     );
 }
@@ -10867,7 +10903,8 @@ fn cross_realm_class_brand_check_throws_defining_realms_type_error() {
     // private-method brand check fails throws the *defining realm's* TypeError.
     // (Tree-walker: a VM function does not yet run in its defining realm.)
     assert_eq!(
-        run(r#"
+        run_hooks(
+            r#"
             var r1 = $262_createRealm();
             var C1 = r1.global.eval("(class { #m(){return 1;} access(o){ return o.#m(); } })");
             var c1 = new C1();
@@ -10875,7 +10912,8 @@ fn cross_realm_class_brand_check_throws_defining_realms_type_error() {
             var e;
             try { c1.access({}); } catch (x) { e = x; }
             okSelf && (e.constructor === r1.global.TypeError)
-        "#),
+        "#
+        ),
         "true"
     );
 }
@@ -10886,7 +10924,8 @@ fn array_species_create_nulls_cross_realm_array_constructor() {
     // realm's* `%Array%`, it is treated as undefined — the current realm's
     // `%Array%` builds the result and the foreign `@@species` is never read.
     assert_eq!(
-        run(r#"
+        run_hooks(
+            r#"
             var arr = [];
             var OArray = $262_createRealm().global.Array;
             var called = 0;
@@ -10894,7 +10933,8 @@ fn array_species_create_nulls_cross_realm_array_constructor() {
             Object.defineProperty(OArray, Symbol.species, { get: function(){ called++; } });
             var r = arr.map(function(){});
             called + ":" + (Object.getPrototypeOf(r) === Array.prototype)
-        "#),
+        "#
+        ),
         "0:true"
     );
 }
@@ -10953,7 +10993,8 @@ fn ordinary_construct_cross_realm_derives_new_targets_object_prototype() {
     // realm and has a non-object `.prototype` links the result to *that realm's*
     // `%Object.prototype%` (GetPrototypeFromConstructor step 4).
     assert_eq!(
-        run(r#"
+        run_hooks(
+            r#"
             var other = $262_createRealm().global;
             var C = new other.Function();
             C.prototype = null;
@@ -10963,7 +11004,8 @@ fn ordinary_construct_cross_realm_derives_new_targets_object_prototype() {
             (Object.getPrototypeOf(a) === other.Object.prototype) &&
             (Object.getPrototypeOf(b) === other.Object.prototype) &&
             (Object.getPrototypeOf(d) === other.Object.prototype)
-        "#),
+        "#
+        ),
         "true"
     );
 }
@@ -10972,18 +11014,21 @@ fn ordinary_construct_cross_realm_derives_new_targets_object_prototype() {
 fn iterator_abstract_construct_and_cross_realm_proto() {
     // `new Iterator()` (newTarget is `%Iterator%` itself) is a TypeError.
     assert_eq!(
-        run(r#"
+        run_hooks(
+            r#"
             var threw = false;
             try { new Iterator(); } catch (e) { threw = (e instanceof TypeError); }
             threw
-        "#),
+        "#
+        ),
         "true"
     );
     // `Reflect.construct(Iterator, [], newTarget)` with a cross-realm `newTarget`
     // whose `.prototype` is not an object derives that realm's `%Iterator.prototype%`
     // (resolved by name, since `%Iterator.prototype%.constructor` is an accessor).
     assert_eq!(
-        run(r#"
+        run_hooks(
+            r#"
             var other = $262_createRealm().global;
             var nt = new other.Function();
             nt.prototype = undefined;
@@ -10991,18 +11036,21 @@ fn iterator_abstract_construct_and_cross_realm_proto() {
             var np = Reflect.construct(Iterator, [1], (function(){ var f = new other.Function(); f.prototype = null; return f; })());
             (Object.getPrototypeOf(ai) === other.Iterator.prototype) &&
             (Object.getPrototypeOf(np) === other.Iterator.prototype)
-        "#),
+        "#
+        ),
         "true"
     );
     // An object `.prototype` on the newTarget is used directly.
     assert_eq!(
-        run(r#"
+        run_hooks(
+            r#"
             var other = $262_createRealm().global;
             var nt = new other.Function();
             var op = {};
             nt.prototype = op;
             Object.getPrototypeOf(Reflect.construct(Iterator, [1], nt)) === op
-        "#),
+        "#
+        ),
         "true"
     );
 }
@@ -11014,46 +11062,54 @@ fn dynamic_function_cross_realm_derives_new_targets_function_prototype() {
     // `%Function.prototype%` (CreateDynamicFunction → GetPrototypeFromConstructor
     // step 4, resolving the intrinsic in `GetFunctionRealm(C)`'s realm).
     assert_eq!(
-        run(r#"
+        run_hooks(
+            r#"
             var other = $262_createRealm().global;
             var C = new other.Function();
             C.prototype = null;
             var o = Reflect.construct(Function, [], C);
             Object.getPrototypeOf(o) === other.Function.prototype
-        "#),
+        "#
+        ),
         "true"
     );
     // A non-null non-object `.prototype` (e.g. a number) still derives the realm's
     // intrinsic default.
     assert_eq!(
-        run(r#"
+        run_hooks(
+            r#"
             var other = $262_createRealm().global;
             var C = new other.Function();
             C.prototype = 1;
             Object.getPrototypeOf(Reflect.construct(Function, [], C)) === other.Function.prototype
-        "#),
+        "#
+        ),
         "true"
     );
     // An object `.prototype` on the cross-realm newTarget is used directly.
     assert_eq!(
-        run(r#"
+        run_hooks(
+            r#"
             var other = $262_createRealm().global;
             var C = new other.Function();
             var op = {};
             C.prototype = op;
             Object.getPrototypeOf(Reflect.construct(Function, [], C)) === op
-        "#),
+        "#
+        ),
         "true"
     );
     // Same-realm construction (plain `new Function()` / `Function()`) is untouched:
     // the built function keeps the current realm's `%Function.prototype%`.
     assert_eq!(
-        run(r#"
+        run_hooks(
+            r#"
             var a = new Function("return 1");
             var b = Function("return 2");
             (Object.getPrototypeOf(a) === Function.prototype) &&
             (Object.getPrototypeOf(b) === Function.prototype) && (b() === 2)
-        "#),
+        "#
+        ),
         "true"
     );
 }
@@ -11065,7 +11121,8 @@ fn intl_cross_realm_derives_new_targets_service_prototype() {
     // intrinsics (the cache is swapped per realm), and a cross-realm `newTarget`
     // with a non-object `.prototype` derives that realm's service prototype.
     assert_eq!(
-        run(r#"
+        run_hooks(
+            r#"
             var other = $262_createRealm().global;
             var nt = new other.Function();
             nt.prototype = undefined;
@@ -11075,7 +11132,8 @@ fn intl_cross_realm_derives_new_targets_service_prototype() {
             (Object.getPrototypeOf(nf) === other.Intl.NumberFormat.prototype) &&
             (Object.getPrototypeOf(loc) === other.Intl.Locale.prototype) &&
             (Object.getPrototypeOf(new Intl.NumberFormat()) === Intl.NumberFormat.prototype)
-        "#),
+        "#
+        ),
         "true"
     );
 }
@@ -12030,7 +12088,7 @@ fn abstract_module_source_intrinsic_shape() {
             && td.get.call(C.prototype) === undefined;
         ok
     "#;
-    assert_eq!(run(program), "true");
+    assert_eq!(run_hooks(program), "true");
 }
 
 #[test]

@@ -1084,3 +1084,30 @@ fn percent_rounds_the_scaled_value() {
     "#;
     assert_eq!(run(src), "10%|12.5%|1.1%|13%|1.05%|12.25%|7%|1.05%|10%");
 }
+/// A plain `Interp` (an embedder, `kataan run`) has none of the Test262 host
+/// hooks (`$262_IsHTMLDDA`, `$262_createRealm`, `$262_agent_*`, …): they are
+/// installed only when `Limits::test262_host_hooks` asks, as the conformance
+/// runner does, and then also in the realms `$262_createRealm` makes.
+#[test]
+fn test262_host_hooks_are_opt_in() {
+    let probe = r#"
+        var own = Object.getOwnPropertyNames(globalThis).filter(function (n) { return n.indexOf("262") >= 0; });
+        [own.length, typeof $262_IsHTMLDDA, typeof $262_createRealm, typeof $262_evalScript,
+         typeof $262_detachArrayBuffer, typeof $262_agent_start, typeof $262_AbstractModuleSource].join()
+    "#;
+    let program = Parser::parse_program(probe).expect("parse");
+    let mut interp = Interp::new();
+    let value = interp.run(&program).expect("exec");
+    assert_eq!(
+        interp.realm().to_display_string(value),
+        "0,undefined,undefined,undefined,undefined,undefined,undefined"
+    );
+    let limits = crate::limits::Limits::default().with_test262_host_hooks();
+    let program = Parser::parse_program(
+        "var r = $262_createRealm(); [typeof $262_IsHTMLDDA, typeof r.global.$262_createRealm].join()",
+    )
+    .expect("parse");
+    let mut interp = Interp::new_with_limits(limits);
+    let value = interp.run(&program).expect("exec");
+    assert_eq!(interp.realm().to_display_string(value), "function,function");
+}

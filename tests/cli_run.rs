@@ -36,3 +36,17 @@ fn completed_program_prints_output_and_completion() {
     assert_eq!(stdout, "x\n3\n");
     assert!(ok);
 }
+
+/// `kataan run` does not expose the Test262 host hooks: they are harness
+/// plumbing (`$262_IsHTMLDDA`, `$262_agent_start`, …), not language globals.
+#[test]
+fn no_test262_host_hooks_in_cli() {
+    let (stdout, _, ok) = run_e(
+        r#"console.log(Object.getOwnPropertyNames(globalThis).filter(function (n) { return n.indexOf("262") >= 0; }).join(), typeof $262_IsHTMLDDA, typeof $262_createRealm, typeof $262_agent_start)"#,
+    );
+    assert!(
+        stdout.starts_with(" undefined undefined undefined\n"),
+        "stdout: {stdout}"
+    );
+    assert!(ok);
+}

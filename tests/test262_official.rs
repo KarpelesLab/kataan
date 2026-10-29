@@ -391,7 +391,7 @@ fn run_module_test(
         &key,
         &kataan::nbexec::module::FileModuleHost,
         &prelude,
-        Limits::default(),
+        Limits::default().with_test262_host_hooks(),
     );
     classify(res, meta)
 }
@@ -445,7 +445,7 @@ fn classify(
 fn run_mode(scripts: &[String], meta: &Meta) -> Result<(), String> {
     let refs: Vec<&str> = scripts.iter().map(String::as_str).collect();
     classify(
-        kataan::nbvm::execute_scripts_typed(&refs, Limits::default()),
+        kataan::nbvm::execute_scripts_typed(&refs, Limits::default().with_test262_host_hooks()),
         meta,
     )
 }
@@ -487,7 +487,7 @@ fn run_test(
                 kataan::nbvm::execute_script_typed_with_import_base(
                     &flatten(scripts),
                     &base,
-                    Limits::default(),
+                    Limits::default().with_test262_host_hooks(),
                 ),
                 meta,
             )

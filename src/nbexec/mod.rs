@@ -3887,37 +3887,46 @@ impl Interp {
             ("URIError", N_URI_ERROR),
             ("EvalError", N_EVAL_ERROR),
             ("eval", N_EVAL),
-            // Test262 host hook: `$262.detachArrayBuffer` is wired (by the runner's
-            // JS prelude) to this global so detach-dependent tests can run.
-            ("$262_detachArrayBuffer", N_DETACH_ARRAY_BUFFER),
-            // Test262 host hook: `$262.IsHTMLDDA` is wired (by the runner's JS
-            // prelude) to this global so [[IsHTMLDDA]] tests can obtain the value.
-            ("$262_IsHTMLDDA", N_HTMLDDA),
-            // Test262 host hook: `$262.createRealm` is wired (by the runner's JS
-            // prelude) to this global so cross-realm tests can obtain a second
-            // realm with a distinct set of intrinsics.
-            ("$262_createRealm", N_262_CREATE_REALM),
-            // Test262 host hook: `$262.evalScript` runs code as a Script in the
-            // current realm (so top-level lexical declarations persist globally).
-            ("$262_evalScript", N_262_EVAL_SCRIPT_MAIN),
-            // Test262 `$262.agent` host hooks (wired by the runner's JS prelude,
-            // and by the worker-side prelude `$262.agent.start` installs). See the
-            // `agent` module for the cooperative-scheduler model.
-            ("$262_agent_start", N_262_AGENT_START),
-            ("$262_agent_broadcast", N_262_AGENT_BROADCAST),
-            ("$262_agent_getReport", N_262_AGENT_GET_REPORT),
-            ("$262_agent_getReportAsync", N_262_AGENT_GET_REPORT_ASYNC),
-            ("$262_agent_report", N_262_AGENT_REPORT),
-            ("$262_agent_receiveBroadcast", N_262_AGENT_RECEIVE_BROADCAST),
-            ("$262_agent_sleep", N_262_AGENT_SLEEP),
-            ("$262_agent_monotonicNow", N_262_AGENT_MONOTONIC_NOW),
-            // Test262 host hook: `$262.AbstractModuleSource` is wired (by the
-            // runner's JS prelude) to the `%AbstractModuleSource%` intrinsic so
-            // the source-phase-imports intrinsic-shape tests can introspect it.
-            ("$262_AbstractModuleSource", N_262_ABSTRACT_MODULE_SOURCE),
         ] {
             let f = self.new_named_native(name, id);
             self.current.declare(name, NanBox::handle(f.to_raw()));
+        }
+        // The Test262 host hooks: opt-in (`Limits::test262_host_hooks`), so an
+        // ordinary embedder or `kataan run` never exposes them to user code.
+        if self.realm.limits.test262_host_hooks {
+            for (name, id) in [
+                // Test262 host hook: `$262.detachArrayBuffer` is wired (by the runner's
+                // JS prelude) to this global so detach-dependent tests can run.
+                ("$262_detachArrayBuffer", N_DETACH_ARRAY_BUFFER),
+                // Test262 host hook: `$262.IsHTMLDDA` is wired (by the runner's JS
+                // prelude) to this global so [[IsHTMLDDA]] tests can obtain the value.
+                ("$262_IsHTMLDDA", N_HTMLDDA),
+                // Test262 host hook: `$262.createRealm` is wired (by the runner's JS
+                // prelude) to this global so cross-realm tests can obtain a second
+                // realm with a distinct set of intrinsics.
+                ("$262_createRealm", N_262_CREATE_REALM),
+                // Test262 host hook: `$262.evalScript` runs code as a Script in the
+                // current realm (so top-level lexical declarations persist globally).
+                ("$262_evalScript", N_262_EVAL_SCRIPT_MAIN),
+                // Test262 `$262.agent` host hooks (wired by the runner's JS prelude,
+                // and by the worker-side prelude `$262.agent.start` installs). See the
+                // `agent` module for the cooperative-scheduler model.
+                ("$262_agent_start", N_262_AGENT_START),
+                ("$262_agent_broadcast", N_262_AGENT_BROADCAST),
+                ("$262_agent_getReport", N_262_AGENT_GET_REPORT),
+                ("$262_agent_getReportAsync", N_262_AGENT_GET_REPORT_ASYNC),
+                ("$262_agent_report", N_262_AGENT_REPORT),
+                ("$262_agent_receiveBroadcast", N_262_AGENT_RECEIVE_BROADCAST),
+                ("$262_agent_sleep", N_262_AGENT_SLEEP),
+                ("$262_agent_monotonicNow", N_262_AGENT_MONOTONIC_NOW),
+                // Test262 host hook: `$262.AbstractModuleSource` is wired (by the
+                // runner's JS prelude) to the `%AbstractModuleSource%` intrinsic so
+                // the source-phase-imports intrinsic-shape tests can introspect it.
+                ("$262_AbstractModuleSource", N_262_ABSTRACT_MODULE_SOURCE),
+            ] {
+                let f = self.new_named_native(name, id);
+                self.current.declare(name, NanBox::handle(f.to_raw()));
+            }
         }
         // The `Intl` namespace with its format constructors.
         let intl = self.realm.new_object();

@@ -11,9 +11,15 @@ fn main() {
     // them as consecutive Scripts over one realm (as the Test262 runner does).
     let scripts: Vec<&str> = combined.split("//---SCRIPT---\n").collect();
     let result = if scripts.len() > 1 {
-        kataan::nbvm::execute_scripts_typed(&scripts, kataan::limits::Limits::default())
+        kataan::nbvm::execute_scripts_typed(
+            &scripts,
+            kataan::limits::Limits::default().with_test262_host_hooks(),
+        )
     } else {
-        kataan::nbvm::execute_typed(&combined, kataan::limits::Limits::default())
+        kataan::nbvm::execute_typed(
+            &combined,
+            kataan::limits::Limits::default().with_test262_host_hooks(),
+        )
     };
     match result {
         Ok((output, _)) => {

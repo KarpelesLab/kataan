@@ -67,7 +67,12 @@ const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
 /// `Arc` and the source text — the `Interp`, its heap and every `NanBox` are
 /// created and dropped here.
 #[cfg(feature = "std")]
-fn worker_main(pool: alloc::sync::Arc<super::agent_pool::AgentPool>, id: usize, source: String) {
+fn worker_main(
+    pool: alloc::sync::Arc<super::agent_pool::AgentPool>,
+    id: usize,
+    source: String,
+    limits: crate::limits::Limits,
+) {
     pool.acquire();
     // `program` must outlive `interp` (which borrows it); locals drop in reverse
     // declaration order, so declaring it first is what makes this compile.
@@ -79,7 +84,9 @@ fn worker_main(pool: alloc::sync::Arc<super::agent_pool::AgentPool>, id: usize, 
             return;
         }
     };
-    let mut interp = Interp::new();
+    // The parent's limits, so the worker gets the same host hooks (the
+    // `$262_agent_*` natives its prelude binds) and resource caps.
+    let mut interp = Interp::new_with_limits(limits);
     interp.agent.pool = Some(pool.clone());
     interp.agent.id = id;
     // The worker's VM loop back-edges are scheduling points too: a worker that
@@ -175,9 +182,10 @@ impl Interp {
         let id = pool.register();
         let full = alloc::format!("{WORKER_AGENT_PRELUDE}{source}");
         let worker_pool = pool.clone();
+        let limits = self.realm.limits;
         match std::thread::Builder::new()
             .stack_size(WORKER_STACK_BYTES)
-            .spawn(move || worker_main(worker_pool, id, full))
+            .spawn(move || worker_main(worker_pool, id, full, limits))
         {
             Ok(h) => self.agent.workers.push(h),
             Err(_) => return Err(self.type_error("$262.agent.start: cannot spawn an agent")),
