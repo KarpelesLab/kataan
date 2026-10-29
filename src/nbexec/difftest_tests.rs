@@ -894,3 +894,29 @@ fn string_wrapper_non_canonical_index_keys_are_writable() {
         "01:7:true:5:0/1/2/01 +1:7:true:5:0/1/2/+1 00:7:true:5:0/1/2/00 1:b:false:TypeError:0/1/2"
     );
 }
+
+/// An array whose `length` is non-writable cannot gain an index at or past
+/// it (ArrayDefineOwnProperty): `a[5] = 1` and `Reflect.set` fail (strict code
+/// throws) instead of growing the array, in a hot loop too. In-range writes
+/// still succeed.
+#[test]
+fn array_with_readonly_length_does_not_grow() {
+    let src = r#"
+        var r = [];
+        var a = [1]; Object.defineProperty(a, "length", { writable: false });
+        a[5] = 1; r.push(a.length, 5 in a);
+        a["1"] = 2; r.push(a.length, 1 in a);
+        a[0] = 9; r.push(a[0], Reflect.set(a, 3, 1), Reflect.defineProperty(a, 4, { value: 1 }), a.length);
+        (function () { "use strict"; try { a[2] = 1; r.push("nothrow"); } catch (e) { r.push(e.name); } })();
+        var b = []; Object.defineProperty(b, "length", { value: 2, writable: false });
+        b[1] = "x"; b[2] = "y"; r.push(b.length, b[1], 2 in b);
+        function f(arr, n) { for (var i = 0; i < n; i++) arr[i] = i; return arr.length; }
+        for (var k = 0; k < 500; k++) f([], 4);
+        r.push(f(b, 4), 3 in b);
+        r.join()
+    "#;
+    assert_eq!(
+        run(src),
+        "1,false,1,false,9,false,false,1,TypeError,2,x,false,2,false"
+    );
+}

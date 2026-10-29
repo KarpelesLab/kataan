@@ -4065,6 +4065,15 @@ impl Realm {
             || self.frozen_arrays.contains(&handle.to_raw())
     }
 
+    /// Whether `i` is at or past the non-writable `length` of the array at
+    /// `handle`: ArrayDefineOwnProperty refuses to add such an index.
+    #[must_use]
+    pub fn index_past_readonly_length(&self, handle: Handle, i: usize) -> bool {
+        !self.nonwritable_array_lengths.is_empty()
+            && self.nonwritable_array_lengths.contains(&handle.to_raw())
+            && self.array_length(handle).is_some_and(|len| i >= len)
+    }
+
     /// Records (or clears) the non-writable flag for an array's `length`.
     pub fn set_array_length_readonly(&mut self, handle: Handle, readonly: bool) {
         if readonly {
@@ -4225,6 +4234,11 @@ impl Realm {
         if self.frozen_arrays.contains(&raw) || self.sealed_arrays.contains(&raw) {
             return true;
         }
+        // With a non-writable `length`, an index at or past it cannot be added
+        // (ArrayDefineOwnProperty): the write must fail, not grow the array.
+        if self.index_past_readonly_length(handle, i) {
+            return true;
+        }
         // On a non-extensible array, a write to an absent index (past the end,
         // or a hole) would *add* a property: OrdinarySet fails it, a strict
         // assignment throws. The dense store would silently grow or fill it.
@@ -4274,6 +4288,9 @@ impl Realm {
             return false;
         }
         let non_ext = any_restricted && self.non_extensible_arrays.contains(&handle.to_raw());
+        if self.index_past_readonly_length(handle, index) {
+            return false;
+        }
         match self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
             Some(a) => {
                 if index >= a.len() {

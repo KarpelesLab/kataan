@@ -3145,7 +3145,16 @@ impl Interp {
         // `get_property` probe below never sees them — `arr[0] = v` on
         // `Object.freeze([...])` would report the write as permitted (it is then
         // silently dropped downstream, so strict mode never threw).
+        // Likewise an index at or past a non-writable array `length` cannot be
+        // added (ArrayDefineOwnProperty), though the array is still extensible.
         if let Ok(i) = key.parse::<usize>()
+            && crate::realm::is_canonical_decimal(key)
+            && self.realm.index_past_readonly_length(handle, i)
+        {
+            return false;
+        }
+        if let Ok(i) = key.parse::<usize>()
+            && crate::realm::is_canonical_decimal(key)
             && self.realm.is_frozen(handle)
             && self.realm.array_length(handle).is_some_and(|n| i < n)
         {
