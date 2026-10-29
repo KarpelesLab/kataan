@@ -39,6 +39,14 @@ pub(crate) struct PropsLayout {
     pub extra_acc_len: i32,
     /// `ObjectExtra`-relative offset of the accessor list's data pointer.
     pub extra_acc_ptr: i32,
+    /// `ObjectExtra`-relative offsets of the attribute-mark lists' length
+    /// words.
+    pub extra_marks_len: [i32; 3],
+    /// `ObjectExtra`-relative offset of the key-order log's word (null for
+    /// none).
+    pub extra_key_order: i32,
+    /// `ObjectExtra`-relative offset of the spilled-value count (`u32`).
+    pub extra_spill_n: i32,
     /// The size of one accessor entry.
     pub acc_stride: i32,
     /// Entry-relative offset of an accessor's getter.
@@ -155,6 +163,9 @@ impl PropsLayout {
             off_extra: i(obj_base + obj.extra_off),
             extra_acc_len: i(obj.extra_acc_len_off),
             extra_acc_ptr: i(obj.extra_acc_ptr_off),
+            extra_marks_len: obj.extra_marks_len_off.map(i),
+            extra_key_order: i(obj.extra_key_order_off),
+            extra_spill_n: i(obj.extra_spill_n_off),
             acc_stride: i(obj.acc_stride),
             acc_getter: i(obj.acc_getter_off),
             shape_brands: i32::try_from(obj.shape_brands_off)
@@ -1077,10 +1088,11 @@ impl X64Assembler {
 
     /// The common guards of an inline property add, on the object whose heap
     /// slot is `rcx`: an ordinary shaped object with no `jit_flags`,
-    /// extensible, neither frozen nor sealed (its whole flags byte zero), with
-    /// no `extra` part (no accessors, attribute marks or key-order log), with
-    /// room for one more value inline and below the dictionary threshold.
-    /// Else to `miss`. Clobbers `rax`, `r8`, `r9`.
+    /// extensible, neither frozen nor sealed (its whole flags byte zero),
+    /// with no accessors, attribute marks or key-order log, with room for
+    /// one more value inline or in the near spill and below the dictionary
+    /// threshold (see [`Self::p_add_room`]). Else to `miss`. Clobbers `rax`,
+    /// `r8`, `r9`.
     fn p_add_guards(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
         self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
         self.jne(miss);
@@ -1092,31 +1104,62 @@ impl X64Assembler {
     }
 
     /// The add guards an object's own data-property definitions can change
-    /// (on the shaped object whose heap slot is `rcx`): no `extra` part, room
-    /// for one more value inline, below the dictionary threshold. Else to
-    /// `miss`. Clobbers `rax`, `r8`, `r9`.
+    /// (on the shaped object whose heap slot is `rcx`), leaving its slot count
+    /// in `rax`: below the dictionary threshold, and either no `extra` part
+    /// and room for one more value inline, or an `extra` part recording no
+    /// accessor, attribute mark or key-order log (only spilled values, and
+    /// perhaps a class tag) and room for one more value inline or in its near
+    /// spill. Else to `miss`. Clobbers `rax`, `r8`, `r9`.
     fn p_add_room(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
         const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
+        let inline = self.new_label();
+        let room = self.new_label();
+        self.p_load16(r::RAX, r::RCX, l.off_slots_len);
         self.g_load(r::R9, r::RCX, l.props.off_extra);
         self.g_test(r::R9);
-        self.g_jcc(cc::NE, miss);
-        self.p_load16(r::RAX, r::RCX, l.off_slots_len);
+        self.g_jcc(cc::E, inline);
+        // What `Object::is_plain_data_slot_or_absent` and the cached add
+        // check by key: none of it recorded at all.
+        let p = &l.props;
+        for off in [p.extra_acc_len, p.extra_key_order]
+            .into_iter()
+            .chain(p.extra_marks_len)
+        {
+            self.g_load(r::R8, r::R9, off);
+            self.g_test(r::R8);
+            self.g_jcc(cc::NE, miss);
+        }
+        self.p_cmp32_imm(r::RAX, FAR_FROM);
+        self.g_jcc(cc::AE, miss);
+        self.jmp(room);
+        self.bind(inline);
         self.p_cmp32_imm(r::RAX, INLINE);
         self.g_jcc(cc::AE, miss);
+        self.bind(room);
         self.g_load(r::R8, r::R15, realm_off);
         self.g_cmp_mem(r::RAX, r::R8, l.props.dict_threshold);
         self.g_jcc(cc::AE, miss);
     }
 
     /// The commit of an inline property add to the object whose heap slot is
-    /// `rcx`, taking it to the shape whose `Rc` word is at `[r11 + to_disp]`
-    /// (a child of its current shape, which that child keeps alive) with the
-    /// value at `[rbx + val_disp]` in its next inline slot: the value, the
-    /// count, the shape (one strong count moved from the old shape to the
-    /// new) and the key epoch. Clobbers `rax`, `r8`, `r9`.
+    /// `rcx` (past [`Self::p_add_room`]), taking it to the shape whose `Rc`
+    /// word is at `[r11 + to_disp]` (a child of its current shape, which that
+    /// child keeps alive) with the value at `[rbx + val_disp]` in its next
+    /// slot, inline or in the near spill (whose count goes up too): the
+    /// value, the count, the shape (one strong count moved from the old shape
+    /// to the new) and the key epoch. Clobbers `rax`, `r8`, `r9`.
     fn p_add_commit(&mut self, l: &JitLayout, to_disp: i32, val_disp: i32) {
+        const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
+        let put = self.new_label();
         self.p_load16(r::RAX, r::RCX, l.off_slots_len);
         self.p_lea_index8(r::R9, r::RCX, r::RAX, l.off_inline);
+        self.p_cmp32_imm(r::RAX, INLINE);
+        self.g_jcc(cc::B, put);
+        // A near-spill slot: `p_add_room` saw the `extra` part.
+        self.g_load(r::R9, r::RCX, l.props.off_extra);
+        self.p_inc32_mem(r::R9, l.props.extra_spill_n);
+        self.p_lea_index8(r::R9, r::R9, r::RAX, l.extra_near - 8 * INLINE);
+        self.bind(put);
         self.g_load(r::R8, r::RBX, val_disp);
         self.g_store(r::R9, 0, r::R8);
         self.p_inc16_mem(r::RCX, l.off_slots_len);

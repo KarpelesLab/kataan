@@ -361,8 +361,10 @@ struct ObjectExtra {
     /// data keys and every subsequent new key (data or accessor) is appended, so
     /// `[[OwnPropertyKeys]]` reports the true chronological creation order even when
     /// a getter/setter is defined between two data properties (or an accessor is
-    /// later redefined as data, keeping its original slot).
-    key_order: Option<Vec<Box<str>>>,
+    /// later redefined as data, keeping its original slot). Boxed, so
+    /// `None` is a null word (compiled code's inline adds test it).
+    #[allow(clippy::box_collection)] // for the null word
+    key_order: Option<Box<Vec<Box<str>>>>,
 }
 
 impl ObjectExtra {
@@ -700,7 +702,7 @@ impl Object {
     pub fn ensure_key_order(&mut self) {
         if self.ex().key_order.is_none() {
             let order = self.keys().into_iter().map(Box::from).collect();
-            self.extra_mut().key_order = Some(order);
+            self.extra_mut().key_order = Some(Box::new(order));
         }
     }
 
@@ -720,7 +722,7 @@ impl Object {
         let order = self
             .ex()
             .key_order
-            .as_ref()
+            .as_deref()
             .expect("merged_key_order needs a log");
         let mut result: Vec<&str> = Vec::with_capacity(data.len() + acc.len());
         for k in order {
@@ -841,7 +843,7 @@ impl Object {
         // every later new key slot into the correct interleaved position.
         if self.ex().key_order.is_none() {
             let order = self.keys().into_iter().map(Box::from).collect();
-            self.extra_mut().key_order = Some(order);
+            self.extra_mut().key_order = Some(Box::new(order));
         }
         let accessors = &mut self.extra_mut().accessors;
         if let Some(a) = accessors.iter_mut().find(|(k, _, _)| k.as_ref() == name) {
@@ -1722,6 +1724,15 @@ pub(crate) struct ObjectLayout {
     pub extra_acc_len_off: usize,
     /// Byte offset of the accessor list's data pointer within `ObjectExtra`.
     pub extra_acc_ptr_off: usize,
+    /// Byte offsets of the length words of the attribute-mark lists
+    /// (non-writable, non-enumerable, non-configurable keys) within
+    /// `ObjectExtra`.
+    pub extra_marks_len_off: [usize; 3],
+    /// Byte offset of the key-order log's word within `ObjectExtra` (null
+    /// for none).
+    pub extra_key_order_off: usize,
+    /// Byte offset of the spilled-value count (`u32`) within `ObjectExtra`.
+    pub extra_spill_n_off: usize,
     /// The size of one accessor entry (`(name, getter, setter)`).
     pub acc_stride: usize,
     /// Byte offset of the getter within an accessor entry.
@@ -1825,6 +1836,23 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
         core::ptr::addr_of!(acc_probe.1) as usize - core::ptr::addr_of!(acc_probe) as usize;
     let extra_acc_ptr_off = core::mem::offset_of!(ObjectExtra, accessors) + vec_ptr_off;
     let extra_acc_len_off = core::mem::offset_of!(ObjectExtra, accessors) + vec_len_off;
+    let extra_marks_len_off = [
+        core::mem::offset_of!(ObjectExtra, readonly) + vec_len_off,
+        core::mem::offset_of!(ObjectExtra, hidden) + vec_len_off,
+        core::mem::offset_of!(ObjectExtra, non_configurable) + vec_len_off,
+    ];
+    let extra_key_order_off = core::mem::offset_of!(ObjectExtra, key_order);
+    let extra_spill_n_off = spill_off + core::mem::offset_of!(Spill, n);
+    // SAFETY: the count and the (unset) key-order word of the live `ObjectExtra`.
+    #[allow(unsafe_code)]
+    let (n_word, order_word) = unsafe {
+        (
+            *((extra_word + extra_spill_n_off) as *const u32),
+            *((extra_word + extra_key_order_off) as *const usize),
+        )
+    };
+    assert_eq!(n_word as usize, count - INLINE_SLOTS);
+    assert!(extra_ref.key_order.is_none() && order_word == 0);
     ObjectLayout {
         mode_off,
         shaped_disc,
@@ -1841,6 +1869,9 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
         extra_off,
         extra_acc_len_off,
         extra_acc_ptr_off,
+        extra_marks_len_off,
+        extra_key_order_off,
+        extra_spill_n_off,
         acc_stride: core::mem::size_of::<(Box<str>, NanBox, NanBox)>(),
         acc_getter_off,
         shape_brands_off,
