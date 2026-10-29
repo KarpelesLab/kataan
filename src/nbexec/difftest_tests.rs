@@ -1111,3 +1111,45 @@ fn test262_host_hooks_are_opt_in() {
     let value = interp.run(&program).expect("exec");
     assert_eq!(interp.realm().to_display_string(value), "function,function");
 }
+
+/// An anonymous class is named inside its own ClassDefinitionEvaluation
+/// (`SetFunctionName(F, className)` precedes the elements), so its static
+/// blocks and static field initializers already see `this.name`, and a static
+/// `name` method overrides the name. A class used as a static field
+/// initializer (which compiles as a function of its own), under a computed
+/// class-field key, or as an object-literal property value was named only
+/// after its static elements had run, and the late naming also clobbered a
+/// static `name` method. (V8 still reports a string `name` for
+/// `{ [k]: class { static name() {} } }`; the spec gives the method.)
+#[test]
+fn anonymous_class_is_named_before_its_static_elements() {
+    let src = r#"
+        var r = [];
+        var k = "kk", s = Symbol("sy");
+        class A {
+            static C = class { static name() { return 1; } };
+            static D = class { static { r.push("D:" + this.name); } };
+            static E = class { static x = this.name; };
+            F = class { static { r.push("F:" + this.name); } };
+            static ["H"] = class { static { r.push("H:" + this.name); } };
+            static #I = class { static { r.push("I:" + this.name); } };
+            static [k] = class { static { r.push("A1:" + this.name); } };
+            [s] = class { static { r.push("A2:" + this.name); } };
+            static getI() { return A.#I.name; }
+        }
+        new A();
+        r.push(typeof A.C.name, A.E.x, A.getI(), A.D.name, A.kk.name);
+        var o = { J: class { static { r.push("J:" + this.name); } },
+                  [k]: class { static { r.push("o1:" + this.name); } },
+                  [s]: class { static x = this.name; },
+                  n: class { static name() {} },
+                  [k + 1]: class { static name() {} },
+                  g: function () {}, [k + 2]: () => 0 };
+        r.push(o[s].x, typeof o.n.name, typeof o.kk1.name, o.g.name, o.kk2.name, o.kk.name);
+        r.join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "D:D|H:H|I:#I|A1:kk|F:F|A2:[sy]|function|E|#I|D|kk|J:J|o1:kk|[sy]|function|function|g|kk2|kk"
+    );
+}

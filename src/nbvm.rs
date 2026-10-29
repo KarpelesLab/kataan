@@ -13125,6 +13125,10 @@ const PROTO_NAME: &str = "\0proto";
 /// The hidden binding holding an object literal (its methods' `super` home).
 const OBJ_HOME_NAME: &str = "\0objhome";
 
+/// The hidden cell that hands a computed static field's key to the one-field
+/// initializer that defines it (see [`Compiler::class_value`]).
+const STATIC_FIELD_KEY: &str = "\0sfk";
+
 /// The hidden binding holding the runtime key of private name `#name` (one
 /// per class evaluation; see [`Op::NewPrivateName`]).
 fn private_binding(name: &str) -> String {
@@ -21047,7 +21051,9 @@ impl Compiler {
             // Elements, in order. Static fields and blocks run after all of
             // them; instance fields are gathered into the initializer.
             enum Static<'c> {
-                Field(Reg, Option<&'c Expr>),
+                // The key register, the initializer, and the key's name when it
+                // is not computed.
+                Field(Reg, Option<&'c Expr>, Option<String>),
                 PrivateField(String, Option<&'c Expr>),
                 Block(&'c [Stmt]),
             }
@@ -21169,7 +21175,11 @@ impl Compiler {
                                 .push(Static::PrivateField(String::from(&**n), fd.value.as_ref()));
                         } else {
                             let key = self.class_key(&fd.key)?;
-                            statics.push(Static::Field(key, fd.value.as_ref()));
+                            let name = match &fd.key {
+                                PropertyKey::Computed(_) => None,
+                                other => Some(static_key(other)?),
+                            };
+                            statics.push(Static::Field(key, fd.value.as_ref(), name));
                         }
                     }
                     ClassMember::Field(fd) => {
@@ -21276,21 +21286,74 @@ impl Compiler {
                 }
             }
             for st in statics {
+                // `static C = class { static { … } }` under a non-computed key:
+                // the class is named *before* its own static elements run (they
+                // can observe `this.name`), so naming it afterwards, as below,
+                // is too late. Define the field through a one-field
+                // field-initializer function instead, whose NamedEvaluation
+                // hands the name to the class definition (as an instance
+                // field's does).
+                let anon_class =
+                    |e: &Option<&Expr>| matches!(e, Some(Expr::Class(c)) if c.id.is_none());
+                let one_field = match &st {
+                    Static::Field(_, e, Some(name)) if anon_class(e) => {
+                        Some((FieldKey::Static(name.clone()), *e))
+                    }
+                    Static::Field(key, e, None) if anon_class(e) => {
+                        // A computed key: hand its value to the initializer
+                        // through a hidden cell.
+                        let b = self.bind_hidden_cell(STATIC_FIELD_KEY, true, false)?;
+                        self.write_var(b, *key);
+                        Some((FieldKey::Hidden(String::from(STATIC_FIELD_KEY)), *e))
+                    }
+                    Static::PrivateField(n, e) if anon_class(e) => {
+                        Some((FieldKey::Private(private_binding(n)), *e))
+                    }
+                    _ => None,
+                };
+                if let Some((key, init)) = one_field {
+                    let mut free = BTreeSet::new();
+                    if let FieldKey::Private(b) | FieldKey::Hidden(b) = &key {
+                        free.insert(b.clone());
+                    }
+                    if let Some(e) = init {
+                        let mut d = BTreeSet::new();
+                        refs_expr(e, &mut d, &mut free);
+                        free.extend(d);
+                    }
+                    free.remove(THIS_NAME);
+                    free.remove(NT_NAME);
+                    let defs = [FieldDef { key, init }];
+                    let init = self.class_element_closure(
+                        CTOR_NAME,
+                        ClosureSpec::class_element(&[], &[], "", None, &defs, free),
+                    )?;
+                    let none = self.alloc();
+                    self.ops.push(Op::NewArray { dst: none, len: 0 });
+                    let v = self.alloc();
+                    self.ops.push(Op::CallSpread {
+                        dst: v,
+                        callee: init,
+                        this: f,
+                        args: none,
+                    });
+                    continue;
+                }
                 // `static f = function () {}` names the function after its
                 // field (SetFunctionName once the value exists).
                 let named = matches!(
                     &st,
-                    Static::Field(_, Some(e)) | Static::PrivateField(_, Some(e))
+                    Static::Field(_, Some(e), _) | Static::PrivateField(_, Some(e))
                         if is_anonymous_fn_def(e)
                 );
                 let body: Vec<Stmt> = match &st {
-                    Static::Field(_, Some(e)) | Static::PrivateField(_, Some(e)) => {
+                    Static::Field(_, Some(e), _) | Static::PrivateField(_, Some(e)) => {
                         alloc::vec![Stmt::Return {
                             argument: Some(Box::new((*e).clone())),
                             span,
                         }]
                     }
-                    Static::Field(_, None) | Static::PrivateField(_, None) => Vec::new(),
+                    Static::Field(_, None, _) | Static::PrivateField(_, None) => Vec::new(),
                     Static::Block(b) => b.to_vec(),
                 };
                 let thunk = self.class_element_closure(
@@ -21307,13 +21370,13 @@ impl Compiler {
                     args: none,
                 });
                 match st {
-                    Static::Field(key, _) if named => self.ops.push(Op::DefineMethod {
+                    Static::Field(key, _, _) if named => self.ops.push(Op::DefineMethod {
                         obj: f,
                         key,
                         func: v,
                         kind: 4,
                     }),
-                    Static::Field(key, _) => self.ops.push(Op::DefineData {
+                    Static::Field(key, _, _) => self.ops.push(Op::DefineData {
                         obj: f,
                         key,
                         src: v,
