@@ -5547,6 +5547,7 @@ impl JitFunction {
             &gc_plan,
             |pc| num.in_region(pc),
             |pc| num.in_spec(pc),
+            |pc| num.global_copy(pc),
             osr_entries,
             &catch_targets,
         );
@@ -5728,8 +5729,9 @@ impl JitFunction {
         }
         // The receiver walk shared by the inline heap fast paths: from the handle in
         // `rax`, guard handle-ness / arena bounds / slot occupancy / generation and
-        // leave `rcx = &Slot` (`r10` = arena base, `rdx` = arena len). Any miss jumps
-        // to `$miss`. Needs the arena just loaded (`p_load_arena`: rax:rdx).
+        // leave `rcx = &Slot` (`r10` = arena base, `rdx` = arena len, `rax` = the
+        // receiver's bits). Any miss jumps to `$miss`. Needs the arena just
+        // loaded (`p_load_arena`: rax:rdx).
         macro_rules! walk_to_slot {
             ($recv:expr, $miss:expr) => {{
                 a.mov_r10_rax(); // r10 = arena base
@@ -5742,12 +5744,12 @@ impl JitFunction {
                 a.jne($miss); // not a heap handle
                 a.mov_r8_rax();
                 a.shr_r8_imm(32); // r8 = generation (low 16)
-                a.raw(&[0x89, 0xc0]); // mov eax, eax: rax = handle index
-                a.cmp_rax_rdx();
+                a.raw(&[0x89, 0xc1]); // mov ecx, eax: rcx = handle index
+                a.raw(&[0x48, 0x39, 0xd1]); // cmp rcx, rdx
                 a.jae($miss); // index >= arena len
-                a.imul_rax_imm(layout.slot_stride);
-                a.add_rax_r10();
-                a.mov_rcx_rax(); // rcx = &Slot
+                a.raw(&[0x48, 0x69, 0xc9]); // imul rcx, rcx, stride
+                a.raw(&layout.slot_stride.to_le_bytes());
+                a.raw(&[0x4c, 0x01, 0xd1]); // add rcx, r10: rcx = &Slot
                 a.cmp_byte_at_rcx_imm(layout.off_slot_occ, layout.slot_occupied_disc);
                 a.jne($miss);
                 a.cmp_word_at_rcx_r8w(layout.off_slot_gen);
@@ -5838,8 +5840,8 @@ impl JitFunction {
                             way, fill: true, ..
                         }) = plan
                         {
-                            a.g_load(call_seq::r::R11, call_seq::r::RBX, disp($recv));
-                            a.g_store(call_seq::r::RBP, rc_key(way), call_seq::r::R11);
+                            // (`rax`: the receiver's bits, from the walk.)
+                            a.g_store(call_seq::r::RBP, rc_key(way), call_seq::r::RAX);
                             a.g_store(call_seq::r::RBP, rc_cell(way), call_seq::r::RCX);
                         }
                     }
@@ -6029,6 +6031,30 @@ impl JitFunction {
                         a.load_rax(disp(recv));
                         a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, m_slot(mi, 0));
                         a.jne(walk);
+                        // The same receiver, and a method proved the
+                        // built-in since the last call: when nothing in this
+                        // body can store the method's key without a call
+                        // (no inline store or definition of it), the lookup
+                        // would find that very value — only Rust code
+                        // (behind a call, which empties both keys) can
+                        // otherwise change, shadow or remove it. (The key is
+                        // stored only once the lookup on this receiver found
+                        // it; a walk to another receiver looks it up again.)
+                        let crate::nbvm::Op::CallMethod { key, .. } = bytecode.get(op_idx)? else {
+                            return None;
+                        };
+                        let key = key.as_str();
+                        let stores_key = bytecode.iter().any(|o| {
+                            matches!(o,
+                                crate::nbvm::Op::SetProp { key: k, .. }
+                                | crate::nbvm::Op::SetPropStrict { key: k, .. }
+                                | crate::nbvm::Op::InitProp { key: k, .. } if k.as_str() == key)
+                        });
+                        if !stores_key {
+                            a.g_load(call_seq::r::RAX, call_seq::r::RBP, m_slot(mi, 2));
+                            a.g_cmp_imm(call_seq::r::RAX, RECV_CACHE_EMPTY);
+                            a.jne(proven);
+                        }
                         a.g_load(call_seq::r::RCX, call_seq::r::RBP, m_slot(mi, 1));
                         a.bind(have);
                         a.p_method_lookup_walked(
@@ -6088,8 +6114,7 @@ impl JitFunction {
                         a.p_load_arena(helpers.call_layout.realm, &layout.props);
                         walk_to_slot!(recv, general);
                         family_checks!(recv_cache::Family::Obj, general);
-                        a.g_load(call_seq::r::R11, call_seq::r::RBX, disp(recv));
-                        a.g_store(call_seq::r::RBP, m_slot(mi, 0), call_seq::r::R11);
+                        a.g_store(call_seq::r::RBP, m_slot(mi, 0), call_seq::r::RAX);
                         a.g_store(call_seq::r::RBP, m_slot(mi, 1), call_seq::r::RCX);
                         a.jmp(have);
                         // A chain-cache miss: refill it from the receiver
@@ -6904,7 +6929,17 @@ impl JitFunction {
                     // `vm_array_index_get` — bail on a hole (the helper walks the
                     // prototype chain). Everything else → `jit_helper_get_elem`.
                     recv_slot!(op_idx, obj, helper, recv_cache::Family::Arr);
-                    int_index!(index, helper, num.is_number_at(op_idx, index));
+                    // (A promoted loop's index may be in its SSE register.)
+                    let index_x = num.result_xmm(op_idx, index);
+                    match index_x {
+                        Some(x) => numeric::NumGen::index_from_xmm(
+                            &mut a,
+                            x,
+                            !num.is_number_at(op_idx, index),
+                            helper,
+                        ),
+                        None => int_index!(index, helper, num.is_number_at(op_idx, index)),
+                    }
                     a.mov_r8_at_rcx(layout.off_arr_len);
                     a.cmp_rax_r8();
                     a.jae(helper); // OOB / negative
@@ -6931,7 +6966,10 @@ impl JitFunction {
                     }
                     a.mov_rdi_r15();
                     a.load_argreg(1, disp(obj));
-                    a.load_argreg(2, disp(index));
+                    match index_x {
+                        Some(x) => numeric::NumGen::gpr_from_xmm(&mut a, 2, x), // rdx
+                        None => a.load_argreg(2, disp(index)),
+                    }
                     a.movabs_rax(get_elem_helper as i64);
                     a.call_rax();
                     throw_check!();
@@ -7570,8 +7608,7 @@ impl JitFunction {
             a.p_load_arena(helpers.call_layout.realm, &layout.props);
             walk_to_slot!(recv, miss);
             family_checks!(fam, miss);
-            a.g_load(call_seq::r::R11, call_seq::r::RBX, disp(recv));
-            a.g_store(call_seq::r::RBP, rc_key(w), call_seq::r::R11);
+            a.g_store(call_seq::r::RBP, rc_key(w), call_seq::r::RAX);
             a.g_store(call_seq::r::RBP, rc_cell(w), call_seq::r::RCX);
             a.jmp(back);
         }

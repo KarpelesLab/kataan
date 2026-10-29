@@ -738,6 +738,174 @@ impl NumGen {
         a.bind(keep);
     }
 
+    /// A global op `pc` of speculative region `ri`'s fast version, its
+    /// binding address in frame slot `sd`. The region validated every one
+    /// of its global ops' addresses before entering the fast version
+    /// ([`spec_globals_ready`](Self::spec_globals_ready)), and from there to
+    /// the back-edge no Rust code runs — nothing drops or retires them — so
+    /// the address is used unchecked. For the same reason a read of a binding
+    /// the iteration already read or wrote (with that value still in its
+    /// register) is that value: only the region's own writes can change it.
+    fn spec_global(&mut self, a: &mut X64Assembler, ri: usize, pc: usize, sd: i32) -> Option<bool> {
+        let reg = Some(ri);
+        match *self.bc(pc)? {
+            Op::LoadGlobal { dst, .. } => {
+                if (dst as usize) >= self.env.n_regs {
+                    return None;
+                }
+                if let Some(src) = self.global_known(ri, pc) {
+                    self.copy_reg(a, reg, dst, src);
+                    return Some(true);
+                }
+                a.load_rax(sd);
+                match self.xmm_of(reg, dst) {
+                    Some(x) => a.sse_mem_rax(0x10, x), // movsd xmm, [rax]
+                    None => {
+                        a.raw(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
+                        self.store_gpr(a, reg, RAX, dst);
+                    }
+                }
+            }
+            Op::StoreGlobal { src, .. } => {
+                if (src as usize) >= self.env.n_regs {
+                    return None;
+                }
+                a.load_rcx(sd);
+                match self.xmm_of(reg, src) {
+                    Some(x) => a.sse_mem_rcx(0x11, x), // movsd [rcx], xmm
+                    None => {
+                        self.load_gpr(a, reg, RAX, src);
+                        a.raw(&[0x48, 0x89, 0x01]); // mov [rcx], rax
+                    }
+                }
+            }
+            _ => return None,
+        }
+        Some(true)
+    }
+
+    /// For the `LoadGlobal` at `pc` of speculative region `ri`: the register
+    /// still holding its binding's value, when an earlier global op of the
+    /// iteration on the same name read it into one, or wrote it from one,
+    /// that no op since has written. (The fast version runs straight from
+    /// the header: its only branches leave it.)
+    fn global_known(&self, ri: usize, pc: usize) -> Option<u16> {
+        let Op::LoadGlobal { name, .. } = self.bc(pc)? else {
+            return None;
+        };
+        let head = self.regions[ri].head;
+        let (mut d, mut u) = (Vec::new(), Vec::new());
+        for q in (head..pc).rev() {
+            let bq = self.bc(q)?;
+            let held = match bq {
+                Op::LoadGlobal { name: n, dst, .. } if n == name => Some(*dst),
+                Op::StoreGlobal { name: n, src, .. } if n == name => Some(*src),
+                _ => None,
+            };
+            if let Some(r) = held {
+                // Unwritten since (an op between writes no register but
+                // the ones `def_use` names: the region's ops are all
+                // modelled ones).
+                let clean = (q + 1..pc).all(|x| {
+                    self.bc(x).is_some_and(|o| {
+                        def_use(o, &mut d, &mut u);
+                        !d.contains(&r) && written_reg(o) != Some(r)
+                    })
+                });
+                // And the value is still where `pc` would read it: a
+                // promoted register's SSE register only holds it within
+                // its live interval (past it the register file is stale).
+                let slots = &self.regions[ri].slots;
+                let held = !slots.iter().any(|s| s.reg == r)
+                    || slots
+                        .iter()
+                        .any(|s| s.reg == r && s.start <= q && pc <= s.end);
+                return (clean && held && self.gslot.get(q).is_some_and(|&k| k != u32::MAX))
+                    .then_some(r);
+            }
+        }
+        None
+    }
+
+    /// For a `LoadGlobal` at `pc` in a speculative region's fast version that
+    /// reads a value a register still holds ([`global_known`](Self::global_known)):
+    /// that register (the op is a copy of it).
+    pub(super) fn global_copy(&self, pc: usize) -> Option<u16> {
+        let ri = self.region_at(pc)?;
+        if self.regions[ri].spec.is_none() || self.gslot.get(pc).is_none_or(|&k| k == u32::MAX) {
+            return None;
+        }
+        self.global_known(ri, pc)
+    }
+
+    /// `x++` / `x--` on a promoted Number `x` — the compiler's `ToNumeric t1
+    /// ← x; Step t2 ← t1; Move x ← t2`, with `t1` and `t2` named by nothing
+    /// else and no entry into the sequence — as one `addsd`/`subsd` on
+    /// `x`'s SSE register (the two temporaries' values go nowhere), the
+    /// `Step` and the `Move` then emitting nothing. Regions without an
+    /// integer version only (whose single emission the skip marks apply
+    /// to). `true` if emitted.
+    fn fused_step(
+        &mut self,
+        a: &mut X64Assembler,
+        reg: Option<usize>,
+        pc: usize,
+        ops: &[GenericOp],
+    ) -> bool {
+        let Some(ri) = reg else { return false };
+        if self.imode.is_some() || self.regions[ri].int.is_some() || pc + 2 > self.regions[ri].end {
+            return false;
+        }
+        let (
+            GenericOp::ToNumeric {
+                dst: t1, src: x, ..
+            },
+            GenericOp::Step {
+                dst: t2,
+                src: s1,
+                dec,
+                ..
+            },
+            GenericOp::Move { dst: x2, src: s2 },
+        ) = (ops[pc], ops[pc + 1], ops[pc + 2])
+        else {
+            return false;
+        };
+        let once = |r: u16| self.mentions.get(r as usize).copied() == Some(2);
+        let entered = |q: usize| self.is_target.get(q).copied().unwrap_or(true);
+        if s1 != t1 || s2 != t2 || x2 != x || t1 == x || t2 == x || t1 == t2 {
+            return false;
+        }
+        if !once(t1) || !once(t2) || entered(pc + 1) || entered(pc + 2) {
+            return false;
+        }
+        if self.ty(pc, x) != T_NUM {
+            return false;
+        }
+        let Some(xx) = self.xmm_of(reg, x) else {
+            return false;
+        };
+        a.movabs_rax(1.0f64.to_bits() as i64);
+        a.movq_x_gpr(1, RAX);
+        a.sse_rr(0xf2, if dec { 0x5c } else { 0x58 }, xx, 1);
+        self.skip[pc + 1] = true;
+        self.skip[pc + 2] = true;
+        true
+    }
+
+    /// The entry check of speculative region `ri`'s fast version: every one
+    /// of its global ops has a validated binding address (else, with
+    /// nothing promoted yet, the plain copy runs the iteration). Clobbers
+    /// nothing.
+    fn spec_globals_ready(&self, a: &mut X64Assembler, ri: usize) -> Option<()> {
+        let copy = self.copy_label(self.regions[ri].head)?;
+        for &k in &self.region_gslots[ri] {
+            a.cmp_frame_imm8(self.gslot_disp(k), 0);
+            a.jcc(CC_E, copy);
+        }
+        Some(())
+    }
+
     /// Whether op `pc` lies in the fast version of a speculative region:
     /// none of its paths runs Rust code and then rejoins it (every one
     /// leaves for the region's plain copy instead), so from the region's
@@ -847,6 +1015,7 @@ impl NumGen {
             let validate = self.regions[ri].spec.is_some();
             if validate {
                 self.refresh_globals(a, ri, true);
+                self.spec_globals_ready(a, ri)?;
             }
             for s in &self.regions[ri].slots {
                 if s.carried {
@@ -1059,6 +1228,9 @@ impl NumGen {
                 )?;
             }
             GenericOp::ToNumeric { dst, src, pc: opc } => {
+                if self.fused_step(a, reg, pc, ops) {
+                    return Some(true);
+                }
                 let resume = a.new_label();
                 if self.ty(pc, src) != T_NUM {
                     let stub = a.new_label();
@@ -1097,6 +1269,11 @@ impl NumGen {
                     return None;
                 }
                 let sd = self.gslot_disp(k);
+                if let Some(ri) = reg
+                    && self.regions[ri].spec.is_some()
+                {
+                    return self.spec_global(a, ri, pc, sd);
+                }
                 let retry = a.new_label();
                 let stub = a.new_label();
                 let resume = a.new_label();
@@ -1270,6 +1447,7 @@ impl NumGen {
                     let validate = self.regions[ri].spec.is_some();
                     if validate {
                         self.refresh_globals(a, ri, true);
+                        self.spec_globals_ready(a, ri)?;
                     }
                     self.reload(a, reg);
                     if !validate {
@@ -1362,6 +1540,30 @@ impl NumGen {
     pub(super) fn inc_r8_to_xmm0(a: &mut X64Assembler) {
         a.raw(&[0x49, 0xff, 0xc0]); // inc r8
         a.raw(&[0xf2, 0x49, 0x0f, 0x2a, 0xc0]); // cvtsi2sd xmm0, r8
+    }
+
+    /// `rax` = the exact non-negative-or-not integer value of the Number in
+    /// `xmm x` (an element read's promoted index), else to `miss` (a
+    /// fraction, NaN, out of `i64`'s range; with `check`, first a
+    /// non-Number). Clobbers `xmm1` (and, checking, `r11`).
+    pub(super) fn index_from_xmm(a: &mut X64Assembler, x: u8, check: bool, miss: Label) {
+        if check {
+            a.movq_gpr_x(RAX, x);
+            a.movabs_r11(QNAN as i64);
+            a.and_rax_r11();
+            a.cmp_rax_r11();
+            a.jcc(CC_E, miss);
+        }
+        a.cvttsd2si_gpr_x(RAX, x);
+        a.cvtsi2sd_x_gpr(1, RAX);
+        a.sse_rr(0x66, 0x2e, x, 1); // ucomisd x, xmm1
+        a.jcc(CC_NE, miss);
+        a.jcc(CC_P, miss);
+    }
+
+    /// `gpr = xmm x` (the bits; `gpr` one of `rax`/`rcx`/`rdx`).
+    pub(super) fn gpr_from_xmm(a: &mut X64Assembler, gpr: u8, x: u8) {
+        a.movq_gpr_x(gpr, x);
     }
 
     /// `xmm = (f64) rax`.
@@ -2510,7 +2712,14 @@ fn plan_regions(
                 if generic_region_op(&ops[pc], &bytecode[pc]) {
                     generic = true;
                     def_use(&bytecode[pc], &mut d, &mut u);
-                    pinned.extend(u.iter().copied());
+                    // An element read's index may stay promoted: the
+                    // emitter reads it from its SSE register
+                    // (`NumGen::index_from_xmm`).
+                    let free = match bytecode[pc] {
+                        Op::GetKey { obj, key, .. } if key != obj => Some(key),
+                        _ => None,
+                    };
+                    pinned.extend(u.iter().copied().filter(|&r| Some(r) != free));
                 }
             }
         }
@@ -2724,8 +2933,15 @@ fn spec_num_op(op: &Op) -> bool {
 }
 
 /// [`transfer`] under the speculation: a [`spec_num_op`]'s result is a
-/// Number.
+/// Number, and so is an `ArrayLen`'s (its fast path's array length: its
+/// slow path, like every one of the fast version, leaves for the copy).
 fn spec_transfer(op: &Op, s: &mut [u8]) {
+    if let Op::ArrayLen { dst, .. } = op
+        && let Some(x) = s.get_mut(*dst as usize)
+    {
+        *x = T_NUM;
+        return;
+    }
     if spec_num_op(op)
         && let Some(d) = written_reg(op)
         && let Some(x) = s.get_mut(d as usize)
@@ -2971,6 +3187,13 @@ impl X64Assembler {
     /// `cmp gpr, r11` (rax / rcx / rdx).
     fn cmp_gpr_r11(&mut self, gpr: u8) {
         self.code.extend_from_slice(&[0x4c, 0x39, 0xd8 | (gpr & 7)]);
+    }
+
+    /// `cmp qword [rbp + disp32], imm8` (a native frame slot).
+    fn cmp_frame_imm8(&mut self, disp: i32, imm: i8) {
+        self.code.extend_from_slice(&[0x48, 0x83, 0xbd]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.push(imm as u8);
     }
 
     /// `mov qword [rbp + disp32], 0` (a native frame slot).

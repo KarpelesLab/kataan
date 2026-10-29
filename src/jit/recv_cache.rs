@@ -365,13 +365,16 @@ pub(super) fn shape_ways(
 /// walk that filled it), a later site of the same iteration on the same
 /// value finds it still there — unless a site between them used that way
 /// for another value — and is [`known`](SitePlan::known): it takes the
-/// way's slot address without comparing.
+/// way's slot address without comparing. `global_copy` names the global
+/// reads there that copy a register (the same value).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn plan(
     ops: &[GenericOp],
     bytecode: &[Op],
     globals: &GlobalPlan,
     in_region: impl Fn(usize) -> bool,
     in_spec: impl Fn(usize) -> bool,
+    global_copy: impl Fn(usize) -> Option<u16>,
     osr_entries: &[usize],
     catch_targets: &[usize],
 ) -> RecvPlan {
@@ -448,6 +451,16 @@ pub(super) fn plan(
             }
         }
         match (op, bytecode.get(i)) {
+            // A read of a value a register still holds is a copy of it
+            // (`numeric::NumGen::global_copy`).
+            (GenericOp::Interp { .. }, Some(Op::LoadGlobal { dst, .. }))
+                if let Some(src) = global_copy(i) =>
+            {
+                let d = *dst;
+                let id = id_of(&mut ids, &mut next_id, src);
+                ids.retain(|&(x, _)| x != d);
+                ids.push((d, id));
+            }
             (GenericOp::Interp { .. }, Some(Op::LoadGlobal { dst, .. })) => {
                 let d = *dst;
                 ids.retain(|&(x, _)| x != d);
