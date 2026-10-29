@@ -1992,8 +1992,8 @@ fn builtin_method_arity(name: &str) -> u32 {
         // `ArrayBuffer.prototype.transfer`/`transferToFixedLength`/
         // `transferToImmutable` — `length` 0 (the optional `newLength` is not counted).
         | "transfer" | "transferToFixedLength" | "transferToImmutable"
-        // `Date.now()` takes no arguments.
-        | "now" => 0,
+        // `Date.now()` and `Promise.withResolvers()` take no arguments.
+        | "now" | "withResolvers" => 0,
         // Two-argument methods.
         "slice" | "sliceToImmutable" | "substring" | "substr" | "splice" | "copyWithin" | "split" | "replace"
         | "replaceAll" | "with" | "setInt8" | "setUint8" | "asIntN"

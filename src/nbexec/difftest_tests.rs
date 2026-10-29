@@ -775,3 +775,9 @@ fn dynamic_import_resolves_with_a_thenable_namespace() {
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(output, "then called\nstring by-then\n");
 }
+
+/// `Promise.withResolvers.length` is 0 (it was 1).
+#[test]
+fn promise_with_resolvers_length_is_zero() {
+    assert_eq!(run("Promise.withResolvers.length"), "0");
+}
