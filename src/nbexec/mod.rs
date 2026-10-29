@@ -2500,6 +2500,15 @@ const FA_STAGE_LIKE_MAPPED: f64 = 4.0;
 // Bound natives (carry a target promise handle):
 const N_RESOLVE: u16 = 100;
 const N_REJECT: u16 = 101;
+/// The fresh resolving functions a PromiseResolveThenableJob hands the
+/// thenable's `then`: bound to a record holding the promise
+/// ([`THENABLE_PROMISE`]) and their own `[[AlreadyResolved]]` flag
+/// ([`THENABLE_DONE`]), separate from the promise's original pair.
+const N_THENABLE_RESOLVE: u16 = 1251;
+const N_THENABLE_REJECT: u16 = 1252;
+/// Hidden slots of the [`N_THENABLE_RESOLVE`] record.
+const THENABLE_PROMISE: &str = "\0tj_promise";
+const THENABLE_DONE: &str = "\0tj_done";
 pub(crate) const N_MATH_HYPOT: u16 = 102;
 pub(crate) const N_MATH_CBRT: u16 = 103;
 const N_MATH_LOG2: u16 = 104;

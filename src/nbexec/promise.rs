@@ -275,8 +275,11 @@ impl Interp {
         // functions via CreateResolvingFunctions: each is an anonymous built-in
         // with `length` 1 and `name` "" (observable when the thenable's `then`
         // inspects the arguments it is handed).
-        let on_f = self.realm.new_bound_native(N_RESOLVE, handle);
-        let on_r = self.realm.new_bound_native(N_REJECT, handle);
+        let record = self.realm.new_object();
+        self.realm
+            .set_hidden_property(record, THENABLE_PROMISE, NanBox::handle(handle.to_raw()));
+        let on_f = self.realm.new_bound_native(N_THENABLE_RESOLVE, record);
+        let on_r = self.realm.new_bound_native(N_THENABLE_REJECT, record);
         self.install_fn_name_length(on_f, "", 1);
         self.install_fn_name_length(on_r, "", 1);
         self.microtasks.push(Job {
@@ -604,26 +607,13 @@ impl Interp {
         // call `then.call(thenable, resolve, reject)`. A throw rejects via the
         // job's `reject` (the bound resolve/reject of `result`).
         if let Some((resolve, reject)) = job.thenable {
-            // `PromiseResolveThenableJob` (25.6.2.2) installs a *fresh* pair of
-            // resolving functions with their own `[[AlreadyResolved]]` flag. The
-            // engine's resolve/reject natives share the promise-level flag (already
-            // committed `true` by the outer resolve that scheduled this job), so
-            // reset it here to model the fresh pair: a `resolve(...)` *inside* the
-            // thenable's `then` commits it, and the step-3a reject after an abrupt
-            // completion is then ignored — while a `then` that throws *without*
-            // resolving still rejects the promise.
-            if let Some(st) = self.realm.promise_state(job.result) {
-                st.borrow_mut().already_resolved = false;
-            }
+            // `PromiseResolveThenableJob` (25.6.2.2): the pair is a *fresh* set
+            // of resolving functions with their own `[[AlreadyResolved]]` flag
+            // (see `N_THENABLE_RESOLVE`); an abrupt `then` calls its reject,
+            // a no-op once `then` has resolved.
             let args = [resolve, reject];
             if let Err(ExecError::Throw(e)) = self.call_with_this(job.handler, job.value, &args) {
-                let already = self
-                    .realm
-                    .promise_state(job.result)
-                    .is_some_and(|st| st.borrow().already_resolved);
-                if !already {
-                    self.settle(job.result, e, false);
-                }
+                self.call(reject, &[e])?;
             }
             return Ok(());
         }

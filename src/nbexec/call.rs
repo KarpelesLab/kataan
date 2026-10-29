@@ -1472,21 +1472,46 @@ impl Interp {
                     }
                     return Ok(result);
                 }
-                N_RESOLVE => {
+                N_RESOLVE | N_REJECT => {
                     // Invoking a promise's resolve function commits its
                     // `[[AlreadyResolved]]` flag (even when settlement is deferred to
-                    // a thenable job), so a later reject from the same executor is a
-                    // no-op.
+                    // a thenable job), so a later resolve or reject from the same
+                    // pair is a no-op.
                     if let Some(st) = self.realm.promise_state(target) {
-                        st.borrow_mut().already_resolved = true;
+                        let mut st = st.borrow_mut();
+                        if st.already_resolved {
+                            return Ok(NanBox::undefined());
+                        }
+                        st.already_resolved = true;
                     }
-                    self.resolve_with(target, arg0)
+                    if id == N_RESOLVE {
+                        self.resolve_with(target, arg0)
+                    } else {
+                        self.settle(target, arg0, false)
+                    }
                 }
-                N_REJECT => {
-                    if let Some(st) = self.realm.promise_state(target) {
-                        st.borrow_mut().already_resolved = true;
+                N_THENABLE_RESOLVE | N_THENABLE_REJECT => {
+                    let done = self
+                        .realm
+                        .get_property(target, THENABLE_DONE)
+                        .is_some_and(|v| self.realm.truthy(v));
+                    let promise = self
+                        .realm
+                        .get_property(target, THENABLE_PROMISE)
+                        .and_then(|v| v.as_handle())
+                        .map(Handle::from_raw);
+                    if let (false, Some(p)) = (done, promise) {
+                        self.realm.set_hidden_property(
+                            target,
+                            THENABLE_DONE,
+                            NanBox::boolean(true),
+                        );
+                        if id == N_THENABLE_RESOLVE {
+                            self.resolve_with(p, arg0);
+                        } else {
+                            self.settle(p, arg0, false);
+                        }
                     }
-                    self.settle(target, arg0, false)
                 }
                 // A finite-timeout `Atomics.waitAsync` waiter's macrotask: if its
                 // promise (`target`) is still parked, settle it `"timed-out"`.

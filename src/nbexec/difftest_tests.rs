@@ -671,3 +671,32 @@ fn subclass_promise_then_takes_no_extra_tick() {
     "#;
     assert_eq!(out(src), "t0\nt1\nc 2\nt2\nfin\nt3\n");
 }
+
+/// A promise's resolving functions share one `[[AlreadyResolved]]` flag:
+/// after `resolve(promise)` (whose adoption is still pending) a later
+/// `reject` or `resolve` of the same pair is a no-op; the fresh pair a
+/// PromiseResolveThenableJob hands the thenable has a flag of its own.
+#[test]
+fn resolving_functions_honor_already_resolved() {
+    let src = r#"
+        var log = [];
+        new Promise((r, j) => { r(Promise.resolve(1)); j(2); }).then(v => log.push('a' + v), e => log.push('ae' + e));
+        new Promise((r, j) => { r(Promise.resolve(3)); r(4); }).then(v => log.push('b' + v));
+        new Promise(r => r({ then(a, b) { a(5); b(6); a(7); throw 8; } })).then(v => log.push('c' + v), e => log.push('ce' + e));
+        new Promise(r => r({ then(a, b) { throw 9; } })).then(v => log.push('d' + v), e => log.push('de' + e));
+        var keep; new Promise(r => r({ then(a) { keep = a; } })).then(v => log.push('e' + v));
+        Promise.resolve().then(() => { keep(10); keep(11); });
+        var save; new Promise(r => { save = r; r({ then() {} }); }).then(v => log.push('never' + v));
+        Promise.resolve().then(() => save(12));
+        var done = Promise.resolve().then(() => 0).then(() => 0).then(() => 0).then(() => 0);
+    "#;
+    let program = Parser::parse_program(&alloc::format!(
+        "{src}; done.then(() => {{ globalThis.R = log.join(); }});"
+    ))
+    .expect("parse");
+    let mut interp = Interp::new();
+    interp.run(&program).expect("exec");
+    let r = Parser::parse_program("R").expect("parse");
+    let v = interp.run(&r).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "c5,de9,e10,a1,b3");
+}
