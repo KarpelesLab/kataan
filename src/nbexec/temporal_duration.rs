@@ -2005,36 +2005,54 @@ impl Interp {
     ) -> Result<(i64, i64, i64, i64, i128, bool), ExecError> {
         let inc = increment as i64;
         let step = inc * sign;
-        let (r1, start, end): (i64, DateFields, DateFields) = match unit {
-            Unit::Year => {
-                let r = trunc_to_increment(cy, inc);
-                (r, (r, 0, 0, 0), (r + step, 0, 0, 0))
-            }
-            Unit::Month => {
-                let r = trunc_to_increment(cm, inc);
-                (r, (cy, r, 0, 0), (cy, r + step, 0, 0))
-            }
-            Unit::Week => {
-                // Week: fold the leftover whole days (from a coarser difference)
-                // into the week count before truncating to the increment.
-                let r = trunc_to_increment(cw + cd / 7, inc);
-                (r, (cy, cm, r, 0), (cy, cm, r + step, 0))
-            }
-            _ => {
-                // Day (irregular-length unit with a ZonedDateTime anchor): round the
-                // day count against the actual epoch-ns span of `[r1, r2]` days.
-                let r = trunc_to_increment(cd, inc);
-                (r, (cy, cm, cw, r), (cy, cm, cw, r + step))
+        let r0 = match unit {
+            Unit::Year => trunc_to_increment(cy, inc),
+            Unit::Month => trunc_to_increment(cm, inc),
+            // Week: fold the leftover whole days (from a coarser difference)
+            // into the week count before truncating to the increment.
+            Unit::Week => trunc_to_increment(cw + cd / 7, inc),
+            // Day (irregular-length unit with a ZonedDateTime anchor): round the
+            // day count against the actual epoch-ns span of `[r1, r2]` days.
+            _ => trunc_to_increment(cd, inc),
+        };
+        // ComputeNudgeWindow: the bounds `r1` and `r1 + increment` of `unit`.
+        let window = |r: i64| -> (DateFields, DateFields) {
+            match unit {
+                Unit::Year => ((r, 0, 0, 0), (r + step, 0, 0, 0)),
+                Unit::Month => ((cy, r, 0, 0), (cy, r + step, 0, 0)),
+                Unit::Week => ((cy, cm, r, 0), (cy, cm, r + step, 0)),
+                _ => ((cy, cm, cw, r), (cy, cm, cw, r + step)),
             }
         };
-        let start_date = a
-            .date_add(start.0, start.1, start.2, start.3, Overflow::Constrain)
-            .ok_or_else(|| self.dur_range_error("calendar rounding out of range"))?;
-        let end_date = a
-            .date_add(end.0, end.1, end.2, end.3, Overflow::Constrain)
-            .ok_or_else(|| self.dur_range_error("calendar rounding out of range"))?;
-        let start_rel = self.dur_wall_rel(a, start_date);
-        let end_rel = self.dur_wall_rel(a, end_date);
+        let mut r1 = r0;
+        let mut shifted = false;
+        let (start, end, start_rel, end_rel) = loop {
+            let (start, end) = window(r1);
+            let start_date = a
+                .date_add(start.0, start.1, start.2, start.3, Overflow::Constrain)
+                .ok_or_else(|| self.dur_range_error("calendar rounding out of range"))?;
+            let end_date = a
+                .date_add(end.0, end.1, end.2, end.3, Overflow::Constrain)
+                .ok_or_else(|| self.dur_range_error("calendar rounding out of range"))?;
+            let start_rel = self.dur_wall_rel(a, start_date);
+            let end_rel = self.dur_wall_rel(a, end_date);
+            // The destination can lie past the window's end: the difference
+            // counts a month only while the unconstrained day does not overshoot
+            // (Jan 31 + P1M10H is Feb 29 10:00, i.e. 0 months 29 days 10 h, yet
+            // Jan 31 + 1 month is Feb 29 00:00). The window then moves one
+            // increment further (ComputeNudgeWindow's additional shift), and the
+            // unit counts as expanded.
+            let inside = if sign > 0 {
+                start_rel <= dest_rel && dest_rel <= end_rel
+            } else {
+                end_rel <= dest_rel && dest_rel <= start_rel
+            };
+            if inside || shifted {
+                break (start, end, start_rel, end_rel);
+            }
+            shifted = true;
+            r1 += step;
+        };
         let span = end_rel - start_rel;
         let prog = dest_rel - start_rel;
         let expand = self.dur_decide_expand(prog, span, r1, inc, sign, mode);
@@ -2043,7 +2061,14 @@ impl Interp {
         } else {
             (start, start_rel)
         };
-        Ok((fields.0, fields.1, fields.2, fields.3, nudged, expand))
+        Ok((
+            fields.0,
+            fields.1,
+            fields.2,
+            fields.3,
+            nudged,
+            expand || shifted,
+        ))
     }
 
     /// `RejectDateRange`: a plain `relativeTo` date is representable only when its
@@ -2330,22 +2355,45 @@ impl Interp {
                 adj = epoch_days_to_iso(iso_to_epoch_days(adj) + 1);
             }
             let (cy, cm, cw, cd) = a.date_until(adj, unit);
-            let inc = 1_i64;
+            let _ = cd;
             let step = sign;
-            let (r1, start, end): (i64, DateFields, DateFields) = match unit {
-                Unit::Year => (cy, (cy, 0, 0, 0), (cy + step, 0, 0, 0)),
-                Unit::Month => (cm, (cy, cm, 0, 0), (cy, cm + step, 0, 0)),
-                _ => (cw, (cy, cm, cw, 0), (cy, cm, cw + step, 0)),
+            let window = |r: i64| -> (DateFields, DateFields) {
+                match unit {
+                    Unit::Year => ((r, 0, 0, 0), (r + step, 0, 0, 0)),
+                    Unit::Month => ((cy, r, 0, 0), (cy, r + step, 0, 0)),
+                    _ => ((cy, cm, r, 0), (cy, cm, r + step, 0)),
+                }
             };
-            let _ = (cd, inc);
-            let start_date = a
-                .date_add(start.0, start.1, start.2, start.3, Overflow::Constrain)
-                .ok_or_else(|| self.dur_range_error("total out of range"))?;
-            let end_date = a
-                .date_add(end.0, end.1, end.2, end.3, Overflow::Constrain)
-                .ok_or_else(|| self.dur_range_error("total out of range"))?;
-            let start_rel = self.dur_wall_rel(a, start_date);
-            let end_rel = self.dur_wall_rel(a, end_date);
+            let mut r1 = match unit {
+                Unit::Year => cy,
+                Unit::Month => cm,
+                _ => cw,
+            };
+            let mut shifted = false;
+            let (start_rel, end_rel) = loop {
+                let (start, end) = window(r1);
+                let start_date = a
+                    .date_add(start.0, start.1, start.2, start.3, Overflow::Constrain)
+                    .ok_or_else(|| self.dur_range_error("total out of range"))?;
+                let end_date = a
+                    .date_add(end.0, end.1, end.2, end.3, Overflow::Constrain)
+                    .ok_or_else(|| self.dur_range_error("total out of range"))?;
+                let start_rel = self.dur_wall_rel(a, start_date);
+                let end_rel = self.dur_wall_rel(a, end_date);
+                // As in `dur_nudge_calendar`: a destination past the window's
+                // end (the day overshot the shorter month) moves the window
+                // one unit further (ComputeNudgeWindow's additional shift).
+                let inside = if sign > 0 {
+                    start_rel <= t.dest_rel && t.dest_rel <= end_rel
+                } else {
+                    end_rel <= t.dest_rel && t.dest_rel <= start_rel
+                };
+                if inside || shifted {
+                    break (start_rel, end_rel);
+                }
+                shifted = true;
+                r1 += step;
+            };
             // `r1 + sign·(|prog|/|span|)` is a single exact rational in the spec
             // (`TotalDuration`); computing the fraction as an f64 and adding the
             // whole part double-rounds. Fold it into one numerator/denominator and

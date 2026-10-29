@@ -454,49 +454,61 @@ pub fn difference_iso_date(from: IsoDate, to: IsoDate, largest: Unit) -> (i64, i
         }
         return (0, 0, weeks, days);
     }
-    // Year/Month: count whole years then whole months, then leftover days.
+    // Year/Month (CalendarDateUntil): the most whole years, then months, that
+    // do not *surpass* `to` (ISODateSurpasses), then the leftover days.
     let sign = match compare_iso_date(to, from) {
         core::cmp::Ordering::Greater => 1_i64,
         core::cmp::Ordering::Less => -1,
         core::cmp::Ordering::Equal => return (0, 0, 0, 0),
     };
-    let mut years = i64::from(to.year) - i64::from(from.year);
-    let mut mid = add_iso_date(from, years, 0, 0, 0, Overflow::Constrain).unwrap_or(from);
-    // Back off until mid does not pass `to`.
-    while sign > 0 && compare_iso_date(mid, to) == core::cmp::Ordering::Greater
-        || sign < 0 && compare_iso_date(mid, to) == core::cmp::Ordering::Less
-    {
-        years -= sign;
-        mid = add_iso_date(from, years, 0, 0, 0, Overflow::Constrain).unwrap_or(from);
-    }
-    let mut months = 0_i64;
-    loop {
-        // Adding one more month may leave the representable ISO date range near the
-        // ±271821/275760 boundary. Since `to` is representable, an unrepresentable
-        // `next` is necessarily beyond it — stop (otherwise `unwrap_or(mid)` would
-        // pin `next` to `mid` and loop forever).
-        let Some(next) = add_iso_date(from, years, months + sign, 0, 0, Overflow::Constrain) else {
-            break;
-        };
-        if sign > 0 && compare_iso_date(next, to) == core::cmp::Ordering::Greater
-            || sign < 0 && compare_iso_date(next, to) == core::cmp::Ordering::Less
-        {
-            break;
+    // Monotone in `n` (for `n` of the sign), so the count is found by moving
+    // from an estimate rather than from zero.
+    let most = |estimate: i64, surpasses: &dyn Fn(i64) -> bool| -> i64 {
+        let mut n = if estimate * sign > 0 { estimate } else { 0 };
+        while n != 0 && surpasses(n) {
+            n -= sign;
         }
-        months += sign;
-        mid = next;
-        if months.abs() > 12 {
-            // Roll excess months into years (keeps months in (-12, 12)).
-            years += sign;
-            months -= 12 * sign;
+        while !surpasses(n + sign) {
+            n += sign;
         }
-    }
-    if largest == Unit::Month {
-        months += years * 12;
-        years = 0;
-    }
+        n
+    };
+    let fy = i64::from(from.year);
+    let fm = i64::from(from.month);
+    let years = if largest == Unit::Year {
+        most(i64::from(to.year) - fy, &|n| {
+            iso_date_surpasses(sign, fy + n, fm, from.day, to)
+        })
+    } else {
+        0
+    };
+    let months = most(
+        (i64::from(to.year) - fy - years) * 12 + i64::from(to.month) - fm,
+        &|n| {
+            let (y, m) = balance_iso_year_month(fy + years, fm + n);
+            iso_date_surpasses(sign, i64::from(y), i64::from(m), from.day, to)
+        },
+    );
+    let (y, m) = balance_iso_year_month(fy + years, fm + months);
+    let mid = regulate_iso_date(y, i64::from(m), i64::from(from.day), Overflow::Constrain)
+        .unwrap_or(from);
     let days = iso_to_epoch_days(to) - iso_to_epoch_days(mid);
     (years, months, 0, days)
+}
+
+/// ISODateSurpasses for a whole number of years/months: whether the
+/// *unregulated* date `(year, month, day)` lies beyond `to` in the direction
+/// `sign`. The day is compared before it is constrained to its month, so from
+/// Jan 31 one month does not reach Feb 29 (it is Feb "31").
+fn iso_date_surpasses(sign: i64, year: i64, month: i64, day: u8, to: IsoDate) -> bool {
+    let d = if year != i64::from(to.year) {
+        year - i64::from(to.year)
+    } else if month != i64::from(to.month) {
+        month - i64::from(to.month)
+    } else {
+        i64::from(day) - i64::from(to.day)
+    };
+    sign * d > 0
 }
 
 /// Total ordering on ISO dates.

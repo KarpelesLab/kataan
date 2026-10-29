@@ -1170,3 +1170,50 @@ fn labelled_let_loop_with_a_capturing_closure_compiles() {
     "#;
     assert_eq!(run(src), "0,2,0,1,7,8,5");
 }
+
+/// CalendarDateUntil counts a month only while the *unregulated* date does
+/// not surpass the end (ISODateSurpasses compares the day before constraining
+/// it): from Jan 31, one month is Feb "31", past Feb 29, so Jan 31 → Feb 29 is
+/// 29 days, not one month. The difference constrained the day first.
+#[test]
+fn date_until_does_not_count_a_month_the_day_overshoots() {
+    let src = r#"
+        var d = Temporal.PlainDate.from("2020-01-31");
+        [d.until("2020-02-29", { largestUnit: "months" }), d.until("2020-03-30", { largestUnit: "months" }),
+         d.until("2021-02-28", { largestUnit: "years" }), d.until("2020-03-31", { largestUnit: "months" }),
+         Temporal.PlainDate.from("2020-02-29").until("2021-02-28", { largestUnit: "years" }),
+         Temporal.PlainDate.from("2020-03-31").until("2020-02-29", { largestUnit: "months" }),
+         Temporal.PlainDate.from("2020-03-31").since("2020-02-29", { largestUnit: "months" }),
+         Temporal.PlainDate.from("2019-12-31").until("2021-03-01", { largestUnit: "months" }),
+         Temporal.Duration.from("P1M").round({ smallestUnit: "day", relativeTo: "2020-01-31" }),
+         Temporal.PlainDateTime.from("2020-01-31T12:00").until("2020-02-29T12:00", { largestUnit: "months" }),
+         Temporal.PlainDate.from("1970-01-01").until("+275760-09-13", { largestUnit: "years" }),
+         Temporal.PlainDate.from("+275760-09-13").until("-271821-04-19", { largestUnit: "years" })].join()
+    "#;
+    assert_eq!(
+        run(src),
+        "P29D,P1M30D,P1Y28D,P2M,P11M30D,-P1M,P1M,P14M1D,P29D,P29D,P273790Y8M12D,-P547581Y4M24D"
+    );
+}
+
+/// The difference no longer counts Jan 31 + P1M10H as one month (it is 29
+/// days 10 h), so the destination lies past the `[0, 1]`-month rounding
+/// window; ComputeNudgeWindow then shifts the window one month further,
+/// `[1, 2]` (tc39/proposal-temporal#3168), for both `round` and `total`.
+#[test]
+fn calendar_rounding_window_shifts_past_an_overshooting_day() {
+    let src = r#"
+        var d = new Temporal.Duration(0, 1, 0, 0, 10);
+        var relativeTo = new Temporal.PlainDate(2020, 1, 31);
+        var n = Temporal.Duration.from("-P1MT10H");
+        [d.round({ smallestUnit: "months", roundingMode: "expand", relativeTo }),
+         d.round({ smallestUnit: "months", relativeTo }),
+         d.total({ unit: "months", relativeTo }),
+         n.round({ smallestUnit: "months", roundingMode: "expand", relativeTo: "2020-03-31" }),
+         n.total({ unit: "months", relativeTo: "2020-03-31" })].join()
+    "#;
+    assert_eq!(
+        run(src),
+        "P2M,P1M,1.0134408602150538,-P2M,-1.014367816091954"
+    );
+}
