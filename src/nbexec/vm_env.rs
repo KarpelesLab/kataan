@@ -153,14 +153,20 @@ impl Interp {
             EnvReq::Typeof { env, name } => {
                 let s = self.env_scope(env)?;
                 let t = self.in_env(s, false, |this| {
+                    // The reference is resolved once: a `with` object that
+                    // answers HasBinding is read through directly, so its
+                    // `has` trap / `@@unscopables` getter run only once.
+                    if let Some(h) = this.with_binding_result(name)? {
+                        let v = this.with_binding_value(h, name)?;
+                        return this.unary(UnaryOp::Typeof, v);
+                    }
                     if this.current.get(name).is_none()
-                        && this.with_binding(name).is_none()
                         && !matches!(name, "undefined" | "NaN" | "Infinity")
                         && !this.global_object_provides(name)
                     {
                         return Ok(this.new_str("undefined"));
                     }
-                    let v = this.read_ident_ref(name)?;
+                    let v = this.read_ident_lexical(name)?;
                     this.unary(UnaryOp::Typeof, v)
                 })?;
                 Ok((t, undef))

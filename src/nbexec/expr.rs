@@ -35,23 +35,33 @@ impl Interp {
         // shadows even the `undefined`/`NaN`/`Infinity` global identifiers when
         // the with-object provides them (`with ({ NaN: 1 }) { NaN }` is 1).
         if let Some(h) = self.with_binding_result(name)? {
-            // `GetBindingValue(N, S)` for an object environment record re-checks
-            // `? HasProperty(bindingObject, N)` (a second proxy `has` trap) *after*
-            // the `HasBinding` resolution above — so a binding deleted by the
-            // `@@unscopables` getter is observed: strict → ReferenceError, sloppy →
-            // undefined.
-            if !self.has_property_proxied(h, name)? {
-                if self.strict {
-                    let msg = self.new_str(&alloc::format!("{name} is not defined"));
-                    return Err(ExecError::Throw(
-                        self.make_error(N_REFERENCE_ERROR, Some(msg)),
-                    ));
-                }
-                return Ok(NanBox::undefined());
-            }
-            return self.read_member(h, name);
+            return self.with_binding_value(h, name);
         }
         self.read_ident_lexical(name)
+    }
+
+    /// `GetBindingValue(name, S)` of the object environment record whose binding
+    /// object `h` answered `HasBinding(name)` (see [`Self::with_binding_result`]).
+    pub(crate) fn with_binding_value(
+        &mut self,
+        h: Handle,
+        name: &str,
+    ) -> Result<NanBox, ExecError> {
+        // `GetBindingValue(N, S)` for an object environment record re-checks
+        // `? HasProperty(bindingObject, N)` (a second proxy `has` trap) *after*
+        // the caller's `HasBinding` resolution — so a binding deleted by the
+        // `@@unscopables` getter is observed: strict → ReferenceError, sloppy →
+        // undefined.
+        if !self.has_property_proxied(h, name)? {
+            if self.strict {
+                let msg = self.new_str(&alloc::format!("{name} is not defined"));
+                return Err(ExecError::Throw(
+                    self.make_error(N_REFERENCE_ERROR, Some(msg)),
+                ));
+            }
+            return Ok(NanBox::undefined());
+        }
+        self.read_member(h, name)
     }
 
     /// The non-`with` portion of `GetValue` for a bare identifier: the

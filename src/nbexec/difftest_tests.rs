@@ -1323,3 +1323,25 @@ fn proxy_call_and_construct_need_a_callable_or_constructor_target() {
         "TypeError,TypeError,TypeError,TypeError,1,2,3,object,function"
     );
 }
+
+/// `typeof x` resolves the reference `x` once: inside `with (o)` that is one
+/// HasBinding (`has` + `@@unscopables`), then GetValue's own `HasProperty`
+/// and `Get`. The binding was resolved a second time before the read, so a
+/// proxy `with` object saw its `has` trap and `@@unscopables` read twice.
+#[test]
+fn typeof_in_with_resolves_the_reference_once() {
+    let src = r#"
+        var log = [];
+        var o = new Proxy({ a: 1 }, {
+            has(t, k) { log.push("has:" + String(k)); return Reflect.has(t, k); },
+            get(t, k, r) { log.push("get:" + String(k)); return Reflect.get(t, k, r); }
+        });
+        var r;
+        with (o) { r = typeof a + typeof zz; }
+        r + " " + log.join()
+    "#;
+    assert_eq!(
+        run(src),
+        "numberundefined has:r,has:a,get:Symbol(Symbol.unscopables),has:a,get:a,has:zz"
+    );
+}
