@@ -2515,8 +2515,14 @@ pub(crate) fn resume_vm_async(
             Some(v)
         };
         let proto = table.get(id).ok_or(VmError::Unsupported)?;
+        // While the frame runs, nothing else need reference its controller
+        // (the reaction that resumed it has been dequeued) or its result
+        // promise: root both for the body's safepoints.
+        let mark = ctx.frame_shadow.len();
+        ctx.frame_shadow.extend_from_slice(&[controller, p]);
         let r = run_frame_at(ctx, table, &proto.ops, &mut regs, pc, handlers, inject);
         let r = drive_async(ctx, table, id, Some(ch), p, regs, r);
+        ctx.frame_shadow.truncate(mark);
         if r.is_ok() && !ctx.microtasks.is_empty() {
             Err(VmError::Unsupported)
         } else {
@@ -4529,8 +4535,15 @@ fn call_with_inner(
         // parks the frame on a controller the host's reactions resume.
         if proto.is_async && !proto.is_generator && ctx.host.is_some() {
             let p = with_host(ctx, |h| h.new_promise()).ok_or(VmError::Unsupported)?;
+            // The result promise lives only in this Rust local until the body
+            // returns or parks on a controller: root it for the body's
+            // safepoints.
+            let mark = ctx.frame_shadow.len();
+            ctx.frame_shadow.push(p);
             let r = run_frame(ctx, funcs, body, &mut regs);
-            drive_async(ctx, funcs, id, None, p, regs, r)?;
+            let r = drive_async(ctx, funcs, id, None, p, regs, r);
+            ctx.frame_shadow.truncate(mark);
+            r?;
             return Ok(p);
         }
         if proto.is_async && !proto.is_generator {

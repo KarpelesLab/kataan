@@ -382,3 +382,32 @@ fn young_objects_stored_into_old_containers_survive_minor_collections() {
         "true"
     );
 }
+
+#[test]
+fn an_async_function_result_promise_survives_collections_in_its_body() {
+    // The result promise lives only in a Rust local while the body runs — both
+    // on the first call and after each resumption (the reaction that resumed
+    // the frame has been dequeued, so nothing else references its controller).
+    // Collections in the body must not free it before it settles.
+    let program = Parser::parse_program(&format!(
+        "{FN_CHURN}
+         var log = [];
+         async function f() {{
+           churn();
+           await null;
+           churn();
+           await using r = {{ async [Symbol.asyncDispose]() {{ churn(); log.push('disposed'); }} }};
+           var i = 0;
+           for (await using _ = {{ [Symbol.asyncDispose]() {{}} }}; i < 1; i++) churn();
+           return 'done';
+         }}
+         f().then(function (v) {{ log.push(v); }});
+         'scheduled'"
+    ))
+    .expect("parse");
+    let mut interp = Interp::new();
+    interp.run(&program).expect("exec");
+    let check = Parser::parse_program("log.join()").expect("parse");
+    let v = interp.run(&check).expect("exec");
+    assert_eq!(interp.realm().to_display_string(v), "disposed,done");
+}
