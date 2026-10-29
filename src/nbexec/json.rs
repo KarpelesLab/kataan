@@ -475,11 +475,18 @@ impl Interp {
     }
 
     /// The cycle check shared by objects and arrays: pushes `h` on the stack,
-    /// or throws if it is already being serialized.
+    /// or throws if it is already being serialized. The nesting is bounded by
+    /// `max_json_depth` (a RangeError past it, as for any runaway recursion):
+    /// a replacer or `toJSON` that returns a fresh object at every level never
+    /// closes a cycle, and would otherwise recurse without end.
     fn json_enter(&mut self, cx: &mut JsonOut<'_>, h: Handle) -> Result<(), ExecError> {
         if cx.stack.contains(&h) {
             let m = self.new_str("Converting circular structure to JSON");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+        }
+        if cx.stack.len() >= self.realm.limits.max_json_depth {
+            let m = self.new_str("Maximum call stack size exceeded");
+            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
         cx.stack.push(h);
         Ok(())

@@ -1370,3 +1370,28 @@ fn static_class_methods_keep_their_source_text() {
         "m ( a ) { return a; } | async *g() {} | get q() { return 1; } | ['c' + 1]() {} | #p() {} | n() {}"
     );
 }
+
+/// A `JSON.stringify` replacer (or `toJSON`) that returns a fresh array at
+/// every level never closes a cycle, so the serialization recurses without
+/// end; it now stops at `max_json_depth` with a RangeError (as a stack
+/// overflow would) instead of running forever with a quadratic cycle check.
+/// Run on a generous stack, as the CLI and the Test262 harness threads do:
+/// each level re-enters the VM for the replacer.
+#[test]
+fn json_stringify_runaway_replacer_recursion_is_a_range_error() {
+    let src = r#"
+        function k(f) { try { return String(f()); } catch (e) { return e.constructor.name; } }
+        function nest(n) { var a = []; for (var i = 0; i < n; i++) a = [a]; return a; }
+        [k(() => JSON.stringify(1, function (key) { return [key]; })),
+         k(() => JSON.stringify({ toJSON() { return { a: this }; } }.toJSON())),
+         k(() => JSON.stringify({ get a() { return { a: { toJSON() { return [this]; } } }; } })),
+         k(() => JSON.stringify(nest(1500)).length)].join()
+    "#;
+    let out = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || run(src))
+        .expect("spawn")
+        .join()
+        .expect("join");
+    assert_eq!(out, "RangeError,RangeError,RangeError,3002");
+}
