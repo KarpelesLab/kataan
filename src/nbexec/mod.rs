@@ -6375,51 +6375,46 @@ impl Interp {
                 self.annexb_block_fns.push((String::from(*name), *span));
             }
         }
-        var_names.extend(block_fn_names.iter().map(|(n, _)| *n));
-        let at_global = self.var_scope.ptr_eq(&self.global_scope);
-        let global_obj = self.global_this.as_handle().map(Handle::from_raw);
-        for name in var_names {
-            // At global scope a `var`/Annex-B name that *already* exists as a
-            // global-object own property IS that binding: don't shadow it with
-            // a fresh `undefined` scope binding (it must keep its current value
-            // and the property's attributes; an identifier read falls back to
-            // the global-object property — see `read_ident_ref`). This is the
-            // EvalDeclarationInstantiation "binding is not reinitialized" rule.
-            // An existing *accessor* property counts as the binding too (it
-            // is an own property of the global object), so a `var` of that
-            // name must neither shadow nor overwrite it.
-            let global_has = at_global
-                && global_obj.is_some_and(|g| {
-                    self.realm.has_own(g, name) || self.realm.accessor(g, name).is_some()
-                });
-            if !self.var_scope.has_local(name) && !global_has {
-                // A sloppy `eval`'s `var` in a *non-global* variable
-                // environment is a deletable binding (`delete` removes it);
-                // ordinary and global `var` bindings are not.
-                if eval_code && !at_global {
-                    self.var_scope.declare_deletable(name, NanBox::undefined());
-                } else {
-                    self.var_scope.declare(name, NanBox::undefined());
-                }
-            }
-            // A global `var` reserves an own property on the global object
-            // (initially `undefined` until the declaration's initializer runs),
-            // so `typeof x` / `this.x` see the hoisted binding. Don't clobber a
-            // pre-existing global property (e.g. a built-in of the same name).
-            if at_global
-                && !global_has
-                && let Some(g) = global_obj
+        // The spec's binding-creation order, observable at global scope as
+        // the global object's own-property order (GlobalDeclarationInstantiation
+        // and EvalDeclarationInstantiation, with Annex B.3.2.2 / B.3.2.3):
+        // first the Annex B block-function names that are neither a top-level
+        // function nor a `var` name, then the top-level functions (each placed
+        // by its *last* declaration: `functionsToInitialize` is built walking
+        // the declarations in reverse), then the `var` names.
+        let mut fn_names: Vec<&str> = Vec::new();
+        let mut fn_seen: alloc::collections::BTreeSet<&str> = alloc::collections::BTreeSet::new();
+        for stmt in stmts.iter().rev() {
+            // A module's `export function f(){}` / `export default function f(){}`
+            // hoists `f` exactly like a bare function declaration: unwrap the
+            // export wrapper to reach the inner function declaration.
+            // A *labelled* function declaration (`l: function f(){}`,
+            // `l0: l: function f(){}`) is a `LabelledItem : FunctionDeclaration`
+            // and instantiates exactly like the bare form — var-scoped at a
+            // function/script top level, block-scoped inside a Block.
+            let stmt = unwrap_labelled(unwrap_exported_function(stmt));
+            if let Stmt::Function(func) = stmt
+                && let Some(id) = &func.id
+                && fn_seen.insert(&id.name)
             {
-                self.realm.set_property(g, name, NanBox::undefined());
-                // A global `var`/function binding created by *script* code is
-                // non-configurable (CreateGlobalVarBinding with deletable
-                // false). Bindings created by global *eval* code are deletable
-                // (configurable), so only lock script-scope ones — a
-                // `$262.evalScript` body is a Script, so it locks too.
-                if !eval_code || self.script_eval_globals {
-                    self.realm.set_non_configurable_property(g, name);
-                }
+                fn_names.push(&id.name);
             }
+        }
+        fn_names.reverse();
+        let mut early_seen: alloc::collections::BTreeSet<&str> =
+            var_names.iter().copied().collect();
+        early_seen.extend(fn_names.iter().copied());
+        for (name, _) in &block_fn_names {
+            if early_seen.insert(name) {
+                self.instantiate_var_name(name, eval_code);
+            }
+        }
+        for name in fn_names {
+            self.instantiate_function_name(name, eval_code);
+        }
+        var_names.extend(block_fn_names.iter().map(|(n, _)| *n));
+        for name in var_names {
+            self.instantiate_var_name(name, eval_code);
         }
         // Record this body's top-level lexical (`let`/`const`/`class`) names on
         // the (shared) variable-environment frame. In the spec a non-strict
@@ -6435,72 +6430,6 @@ impl Interp {
         collect_lexical_names(stmts, &mut lex_names);
         for name in lex_names {
             self.current.mark_lexical(name);
-        }
-        for stmt in stmts {
-            // A module's `export function f(){}` / `export default function f(){}`
-            // hoists `f` exactly like a bare function declaration: unwrap the
-            // export wrapper to reach the inner function declaration.
-            // A *labelled* function declaration (`l: function f(){}`,
-            // `l0: l: function f(){}`) is a `LabelledItem : FunctionDeclaration`
-            // and instantiates exactly like the bare form — var-scoped at a
-            // function/script top level, block-scoped inside a Block.
-            let stmt = unwrap_labelled(unwrap_exported_function(stmt));
-            if let Stmt::Function(func) = stmt
-                && let Some(id) = &func.id
-            {
-                if self.hoist_skip_fns {
-                    continue;
-                }
-                // The binding is created holding `undefined`: the VM code
-                // stores the function's closure before any user code runs.
-                let value = NanBox::undefined();
-                let at_global_var = self.var_scope.ptr_eq(&self.global_scope);
-                let global_obj = self.global_this.as_handle().map(Handle::from_raw);
-                // A function/program top-level declaration binds in the
-                // variable environment (for an eval body, the outer `varEnv`).
-                // A sloppy `eval`'s function declaration in a non-global
-                // variable environment is a deletable binding.
-                if eval_code && !at_global_var {
-                    self.var_scope.declare_deletable(&id.name, value);
-                } else {
-                    self.var_scope.declare(&id.name, value);
-                }
-                // A global function declaration also publishes on the global
-                // object (`function f(){}; this.f === f`).
-                if at_global_var && let Some(g) = global_obj {
-                    // CreateGlobalFunctionBinding. When there is no existing own
-                    // property, or it is configurable, (re)define with full data
-                    // attributes: writable, enumerable, and configurable set to
-                    // the binding's *deletable* flag. A binding created by
-                    // *script* code (top-level program or `$262.evalScript`) is
-                    // non-configurable (deletable = false); one created by global
-                    // `eval` code is configurable (deletable = true). When the
-                    // existing property is non-configurable (but declarable —
-                    // validated by CanDeclareGlobalFunction above), update only
-                    // the value and preserve its attributes.
-                    let deletable = eval_code && !self.script_eval_globals;
-                    let has_own = self.realm.has_own(g, &id.name)
-                        || self.realm.accessor(g, &id.name).is_some();
-                    let redefine_attrs =
-                        !has_own || !self.realm.property_is_non_configurable(g, &id.name);
-                    if redefine_attrs {
-                        // A configurable *accessor* is fully replaced by the
-                        // function's data property (its getter/setter must not
-                        // survive, and must not run).
-                        self.realm.clear_accessor(g, &id.name);
-                    }
-                    self.realm.force_set_property(g, &id.name, value);
-                    if redefine_attrs {
-                        self.realm.clear_readonly_property(g, &id.name);
-                        self.realm.clear_hidden_property(g, &id.name);
-                        if deletable {
-                            self.realm.clear_non_configurable_property(g, &id.name);
-                        } else {
-                            self.realm.set_non_configurable_property(g, &id.name);
-                        }
-                    }
-                }
-            }
         }
         // Lexical declaration instantiation (script / function body / eval /
         // module / block scope): `let`/`const`/`class` names bound directly in
@@ -6521,6 +6450,117 @@ impl Interp {
             }
         }
         Ok(())
+    }
+
+    /// One `var` (or Annex B block-function) name of
+    /// [`declaration_instantiation`](Self::declaration_instantiation): binds it
+    /// as `undefined` in the variable environment and, at global scope,
+    /// reserves its global-object property (CreateGlobalVarBinding).
+    fn instantiate_var_name(&mut self, name: &str, eval_code: bool) {
+        let at_global = self.var_scope.ptr_eq(&self.global_scope);
+        let global_obj = self.global_this.as_handle().map(Handle::from_raw);
+        // At global scope a `var`/Annex-B name that *already* exists as a
+        // global-object own property IS that binding: don't shadow it with
+        // a fresh `undefined` scope binding (it must keep its current value
+        // and the property's attributes; an identifier read falls back to
+        // the global-object property — see `read_ident_ref`). This is the
+        // EvalDeclarationInstantiation "binding is not reinitialized" rule.
+        // An existing *accessor* property counts as the binding too (it
+        // is an own property of the global object), so a `var` of that
+        // name must neither shadow nor overwrite it.
+        let global_has = at_global
+            && global_obj.is_some_and(|g| {
+                self.realm.has_own(g, name) || self.realm.accessor(g, name).is_some()
+            });
+        if !self.var_scope.has_local(name) && !global_has {
+            // A sloppy `eval`'s `var` in a *non-global* variable
+            // environment is a deletable binding (`delete` removes it);
+            // ordinary and global `var` bindings are not.
+            if eval_code && !at_global {
+                self.var_scope.declare_deletable(name, NanBox::undefined());
+            } else {
+                self.var_scope.declare(name, NanBox::undefined());
+            }
+        }
+        // A global `var` reserves an own property on the global object
+        // (initially `undefined` until the declaration's initializer runs),
+        // so `typeof x` / `this.x` see the hoisted binding. Don't clobber a
+        // pre-existing global property (e.g. a built-in of the same name).
+        if at_global
+            && !global_has
+            && let Some(g) = global_obj
+        {
+            self.realm.set_property(g, name, NanBox::undefined());
+            // A global `var`/function binding created by *script* code is
+            // non-configurable (CreateGlobalVarBinding with deletable
+            // false). Bindings created by global *eval* code are deletable
+            // (configurable), so only lock script-scope ones — a
+            // `$262.evalScript` body is a Script, so it locks too.
+            if !eval_code || self.script_eval_globals {
+                self.realm.set_non_configurable_property(g, name);
+            }
+        }
+    }
+
+    /// One top-level function declaration `name` of
+    /// [`declaration_instantiation`](Self::declaration_instantiation)
+    /// (CreateGlobalFunctionBinding at global scope). Eval code binds its
+    /// functions itself (`hoist_skip_fns`): then only a missing global-object
+    /// property is created here, so that the property order is the spec's.
+    fn instantiate_function_name(&mut self, name: &str, eval_code: bool) {
+        // The binding is created holding `undefined`: the VM code
+        // stores the function's closure before any user code runs.
+        let value = NanBox::undefined();
+        let at_global_var = self.var_scope.ptr_eq(&self.global_scope);
+        let global_obj = self.global_this.as_handle().map(Handle::from_raw);
+        // A function/program top-level declaration binds in the
+        // variable environment (for an eval body, the outer `varEnv`).
+        // A sloppy `eval`'s function declaration in a non-global
+        // variable environment is a deletable binding.
+        let skip = self.hoist_skip_fns;
+        if skip {
+            // The VM code binds the declaration in the variable environment.
+        } else if eval_code && !at_global_var {
+            self.var_scope.declare_deletable(name, value);
+        } else {
+            self.var_scope.declare(name, value);
+        }
+        // A global function declaration also publishes on the global
+        // object (`function f(){}; this.f === f`).
+        if at_global_var && let Some(g) = global_obj {
+            // CreateGlobalFunctionBinding. When there is no existing own
+            // property, or it is configurable, (re)define with full data
+            // attributes: writable, enumerable, and configurable set to
+            // the binding's *deletable* flag. A binding created by
+            // *script* code (top-level program or `$262.evalScript`) is
+            // non-configurable (deletable = false); one created by global
+            // `eval` code is configurable (deletable = true). When the
+            // existing property is non-configurable (but declarable —
+            // validated by CanDeclareGlobalFunction above), update only
+            // the value and preserve its attributes.
+            let deletable = eval_code && !self.script_eval_globals;
+            let has_own = self.realm.has_own(g, name) || self.realm.accessor(g, name).is_some();
+            if skip && has_own {
+                return;
+            }
+            let redefine_attrs = !has_own || !self.realm.property_is_non_configurable(g, name);
+            if redefine_attrs {
+                // A configurable *accessor* is fully replaced by the
+                // function's data property (its getter/setter must not
+                // survive, and must not run).
+                self.realm.clear_accessor(g, name);
+            }
+            self.realm.force_set_property(g, name, value);
+            if redefine_attrs {
+                self.realm.clear_readonly_property(g, name);
+                self.realm.clear_hidden_property(g, name);
+                if deletable {
+                    self.realm.clear_non_configurable_property(g, name);
+                } else {
+                    self.realm.set_non_configurable_property(g, name);
+                }
+            }
+        }
     }
 
     /// Calls `callee` with `args`.

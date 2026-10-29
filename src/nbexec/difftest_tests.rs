@@ -1484,3 +1484,35 @@ fn instanceof_function_walks_the_prototype_chain() {
     "#;
     assert_eq!(run(src), "false,false,true,true,true,true,true");
 }
+
+/// Global declaration instantiation creates the global object's properties
+/// in the spec's order (GlobalDeclarationInstantiation and
+/// EvalDeclarationInstantiation with Annex B.3.2.2 / B.3.2.3): Annex B block
+/// functions first (those that are neither a top-level function nor a
+/// `var`), then the top-level functions (each placed by its *last*
+/// declaration), then the `var` names. The engine created the `var`s first.
+#[test]
+fn global_declarations_create_properties_in_spec_order() {
+    let src = r#"
+        var mine = /^(x|f|b|e)\d$|^pick$/;
+        function pick() { return Object.getOwnPropertyNames(globalThis).filter(function (k) { return mine.test(k); }).join(); }
+        var script = pick();
+        var x1 = 1;
+        function f1() {}
+        { function b1() {} }
+        var x2;
+        function f2() {}
+        function f1() {}
+        if (true) { function b2() {} }
+        { function f2() {} }
+        { function x1() {} }
+        var keys = Object.keys(globalThis).filter(function (k) { return mine.test(k); }).join();
+        (0, eval)("var e1; function e3(){} { function e5(){} } var e2; function e4(){} function e3(){}");
+        [script, keys, pick().slice(keys.length + 1)].join(" | ")
+    "#;
+    assert_eq!(
+        run(src),
+        "b1,b2,pick,f2,f1,x1,x2 | b1,b2,pick,f2,f1,x1,x2 | e5,e4,e3,e1,e2"
+    );
+}
+
