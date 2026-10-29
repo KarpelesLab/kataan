@@ -316,10 +316,24 @@ impl Interp {
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         };
         let handle = Handle::from_raw(raw);
+        // A plain built-in function — the common callee here — dispatches
+        // directly. Of the cases below, only the `Array`/`Object` constructors
+        // and `%Function.prototype%` can be one; every other one is a cell of
+        // another kind (or an object carrying engine-only hidden slots).
+        if let Some(id) = self.realm.native_at(handle)
+            && id != N_BASE_ARRAY
+            && id != N_BASE_OBJECT
+            && !self.realm.is_function_proto_intrinsic(handle)
+        {
+            let saved = core::mem::replace(&mut self.this_val, this_val);
+            let r = self.call_native(id, args);
+            self.this_val = saved;
+            return r;
+        }
         // A bytecode-VM function value (a callback a hosted VM run handed to a
         // built-in) runs on the VM.
-        if let Some(table) = self.vm_table.clone()
-            && self.realm.is_vm_function(handle)
+        if self.realm.is_vm_function(handle)
+            && let Some(table) = self.vm_table.clone()
         {
             return crate::nbvm::call_vm_function(self, &table, callee, this_val, args)
                 .map_err(super::vm_to_exec);

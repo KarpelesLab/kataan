@@ -10005,6 +10005,10 @@ fn call_closure(
             .as_handle()
             .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
     {
+        // `String(n)`, `Number(s)`, `parseInt(s)`, … over primitives.
+        if let Some(v) = native_call::try_call_value(&mut ctx.realm, closure, args) {
+            return Ok(v);
+        }
         return with_host(ctx, |h| h.call(closure, this_val, args))
             .unwrap_or(Err(HostError::Fault))
             .map_err(VmError::from);

@@ -825,8 +825,18 @@ pub(crate) extern "C" fn jit_helper_exec_op(
         }
         Op::CallValue { dst, callee, args } => {
             let callee = regs[*callee as usize];
-            call_compiled(ctx, funcs, regs, callee, args, NanBox::undefined())
-                .map(|r| r.map(|v| regs[*dst as usize] = v))
+            match call_compiled(ctx, funcs, regs, callee, args, NanBox::undefined()) {
+                Some(r) => Some(r.map(|v| regs[*dst as usize] = v)),
+                // `String(n)`, `parseInt(s)`, …: `call_closure`'s own first step.
+                None if ctx.host.is_some() => {
+                    let argv = super::ArgBuf::from_regs(regs, args);
+                    super::native_call::try_call_value(&mut ctx.realm, callee, &argv).map(|v| {
+                        regs[*dst as usize] = v;
+                        Ok(())
+                    })
+                }
+                None => None,
+            }
         }
         // Literal allocations (an object or array literal per loop iteration):
         // exactly their interpreter arms, which cannot fail.

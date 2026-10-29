@@ -927,3 +927,70 @@ pub(super) fn try_call(
     };
     Some(Ok(v))
 }
+
+/// Whether `v` is a primitive whose conversions run no code and cannot throw:
+/// anything but an object, a Symbol or a BigInt (a string is a heap handle).
+fn plain_primitive(realm: &Realm, v: NanBox) -> bool {
+    v.as_handle()
+        .is_none_or(|h| realm.is_string_handle(Handle::from_raw(h)))
+}
+
+/// `f(...args)` for a plain call of one of the global conversion built-ins
+/// (`String`, `Number`, `Boolean`, `isNaN`, `isFinite`, `parseInt`,
+/// `parseFloat`) whose arguments are [plain primitives](plain_primitive),
+/// computed here instead of through the host: the very steps the host's
+/// `call_native` takes for such arguments (no user code can run, nothing can
+/// throw, and the results are realm-independent). `None` for anything else —
+/// the caller takes the host's general path. A multi-realm run is left alone.
+pub(super) fn try_call_value(realm: &mut Realm, f: NanBox, args: &[NanBox]) -> Option<NanBox> {
+    use crate::nbexec::{
+        N_BOOLEAN, N_IS_FINITE, N_IS_NAN, N_NUMBER, N_PARSE_FLOAT, N_PARSE_INT, N_STRING,
+    };
+    let id = realm.native_at(Handle::from_raw(f.as_handle()?))?;
+    if realm.multi_realm {
+        return None;
+    }
+    let a0 = args.first().copied().unwrap_or(NanBox::undefined());
+    Some(match id {
+        // `Boolean(v)` is ToBoolean, which never runs code.
+        N_BOOLEAN => NanBox::boolean(realm.truthy(a0)),
+        N_STRING if args.is_empty() => NanBox::handle(realm.new_string("").to_raw()),
+        N_STRING if plain_primitive(realm, a0) => {
+            if a0.as_handle().is_some() {
+                a0
+            } else {
+                let s = realm.to_display_string(a0);
+                NanBox::handle(realm.new_string(&s).to_raw())
+            }
+        }
+        N_NUMBER if args.is_empty() => NanBox::number(0.0),
+        N_NUMBER if plain_primitive(realm, a0) => NanBox::number(realm.to_number(a0)),
+        N_IS_NAN if plain_primitive(realm, a0) => NanBox::boolean(realm.to_number(a0).is_nan()),
+        N_IS_FINITE if plain_primitive(realm, a0) => {
+            NanBox::boolean(realm.to_number(a0).is_finite())
+        }
+        N_PARSE_FLOAT if plain_primitive(realm, a0) => {
+            let s = realm.to_display_string(a0);
+            NanBox::number(crate::nbexec::parse_float_prefix(
+                s.trim_matches(crate::realm::is_js_whitespace),
+            ))
+        }
+        N_PARSE_INT if plain_primitive(realm, a0) => {
+            let radix = match args.get(1).copied() {
+                None => 0,
+                Some(r) if matches!(r.unpack(), Unpacked::Undefined) => 0,
+                Some(r) if plain_primitive(realm, r) => {
+                    i64::from(realm.to_int32(NanBox::number(realm.to_number(r))))
+                }
+                Some(_) => return None,
+            };
+            let s = realm.to_display_string(a0);
+            if radix != 0 && !(2..=36).contains(&radix) {
+                NanBox::number(f64::NAN)
+            } else {
+                NanBox::number(crate::nbexec::parse_int(&s, radix as u32))
+            }
+        }
+        _ => return None,
+    })
+}

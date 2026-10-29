@@ -1063,10 +1063,10 @@ impl Default for Interp {
 pub(crate) const N_MATH_MAX: u16 = 0;
 pub(crate) const N_MATH_MIN: u16 = 1;
 pub(crate) const N_MATH_ABS: u16 = 2;
-const N_STRING: u16 = 3;
-const N_NUMBER: u16 = 4;
-const N_BOOLEAN: u16 = 5;
-const N_PARSE_INT: u16 = 6;
+pub(crate) const N_STRING: u16 = 3;
+pub(crate) const N_NUMBER: u16 = 4;
+pub(crate) const N_BOOLEAN: u16 = 5;
+pub(crate) const N_PARSE_INT: u16 = 6;
 const N_CONSOLE_LOG: u16 = 7;
 pub(crate) const N_JSON_STRINGIFY: u16 = 8;
 pub(crate) const N_JSON_PARSE: u16 = 27;
@@ -2218,9 +2218,9 @@ const N_PROXY_REVOKE: u16 = 122;
 const N_SYMBOL: u16 = 38;
 const N_BIGINT: u16 = 39;
 const N_PROXY: u16 = 106;
-const N_PARSE_FLOAT: u16 = 31;
-const N_IS_NAN: u16 = 32;
-const N_IS_FINITE: u16 = 33;
+pub(crate) const N_PARSE_FLOAT: u16 = 31;
+pub(crate) const N_IS_NAN: u16 = 32;
+pub(crate) const N_IS_FINITE: u16 = 33;
 // Error constructors (id − N_ERROR_BASE indexes ERROR_NAMES).
 const N_ERROR_BASE: u16 = 40;
 /// Abbreviated weekday names (index 0 = Sunday), for `Date` string methods.
@@ -8739,7 +8739,7 @@ fn legacy_unescape(bytes: &[u8]) -> Vec<u8> {
     crate::wtf8::from_utf16(&out)
 }
 
-fn parse_float_prefix(s: &str) -> f64 {
+pub(crate) fn parse_float_prefix(s: &str) -> f64 {
     // A leading (optionally signed) `Infinity`.
     let (sign, rest) = match s.strip_prefix('-') {
         Some(r) => (-1.0, r),
@@ -10242,7 +10242,7 @@ fn now_ms() -> f64 {
 
 /// A minimal `parseInt`: skips leading whitespace, reads an optional sign and
 /// the leading decimal digits, and returns `NaN` if there are none.
-fn parse_int(s: &str, radix: u32) -> f64 {
+pub(crate) fn parse_int(s: &str, radix: u32) -> f64 {
     let mut t = s.trim_start_matches(crate::realm::is_js_whitespace);
     let mut neg = false;
     if let Some(rest) = t.strip_prefix('-') {
