@@ -85,10 +85,14 @@ impl Interp {
                 }
                 Ok((self.env_value(c), undef))
             }
-            EnvReq::Seed { src } => {
+            EnvReq::Seed { src, names } => {
                 let s = self.env_scope(src)?;
                 let c = s.child();
+                let wanted: Vec<&str> = names.split('\n').filter(|n| !n.is_empty()).collect();
                 for (name, value, is_const) in s.local_bindings() {
+                    if !wanted.contains(&name.as_str()) {
+                        continue;
+                    }
                     if is_const {
                         c.declare_const(&name, value);
                     } else {

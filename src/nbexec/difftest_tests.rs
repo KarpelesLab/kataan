@@ -1217,3 +1217,24 @@ fn calendar_rounding_window_shifts_past_an_overshooting_day() {
         "P2M,P1M,1.0134408602150538,-P2M,-1.014367816091954"
     );
 }
+
+/// With parameter expressions the body's variable environment holds only the
+/// body's own `var` names, and only those that are also parameters start with
+/// the parameter's value (FunctionDeclarationInstantiation step 28). A body
+/// with a direct eval used to copy every parameter-scope binding into it, so
+/// a body assignment to a parameter was invisible to a default's closure, and
+/// a `var` declared by an eval in a default leaked its value into the body's
+/// own `var` of that name.
+#[test]
+fn body_var_env_holds_only_body_vars_with_parameter_expressions() {
+    let src = r#"
+        function f1(a, b = () => a) { eval(''); a = 2; return [a, b()]; }
+        function f2(a = eval('var zz = 3'), b = () => zz) { var zz; return [zz, b()]; }
+        function f3(a = eval('var zz = 3'), b = () => zz) { zz = 4; return [zz, b()]; }
+        function f4(a, b = () => arguments) { eval(''); arguments = 3; return typeof b(); }
+        function f5(a, b = (x) => { a = x; }) { eval(''); b(7); return a; }
+        function f6(a, b = () => a) { eval(''); var a = 2; return [a, b()]; }
+        [f1(1), f2(), f3(), f4(1), f5(1), f6(1)].join(";")
+    "#;
+    assert_eq!(run(src), "2,2;,3;4,4;number;7;2,1");
+}

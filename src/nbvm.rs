@@ -3720,8 +3720,10 @@ pub enum EnvReq<'r> {
     /// bindings.
     Clone { src: NanBox },
     /// A function body's variable environment nested in its parameter
-    /// environment `src`, seeded with copies of the parameter bindings.
-    Seed { src: NanBox },
+    /// environment `src`, seeded with copies of the bindings `names`
+    /// (newline-separated) lists: the body's `var` names that are also
+    /// parameter bindings (FunctionDeclarationInstantiation step 28).
+    Seed { src: NanBox, names: &'r str },
     /// A frame-local binding operation on `env` (`ENV_INIT_*`).
     Init {
         env: NanBox,
@@ -7782,7 +7784,10 @@ fn run_frame_at_ic(
                         obj: r(1),
                     },
                     EK_CLONE => EnvReq::Clone { src: r(0) },
-                    EK_SEED => EnvReq::Seed { src: r(0) },
+                    EK_SEED => EnvReq::Seed {
+                        src: r(0),
+                        names: name,
+                    },
                     EK_INIT => EnvReq::Init {
                         env: r(0),
                         name,
@@ -15034,8 +15039,24 @@ impl Compiler {
         // With parameter expressions the body gets its own variable
         // environment, seeded from the parameters.
         let venv = if !simple && !is_main {
+            // Only a body `var` that is also a parameter binding starts with
+            // that parameter's value; every other name (one a direct eval in
+            // a default declared included) stays in the parameter scope.
+            let mut param_bound = BTreeSet::new();
+            for p in params {
+                pattern_names(&p.target, &mut param_bound);
+            }
+            if arguments_reg.is_some() {
+                param_bound.insert(String::from("arguments"));
+            }
+            let mut var_names = Vec::new();
+            crate::nbexec::collect_var_names(body, &mut var_names);
+            let seeded: Vec<&str> = var_names
+                .into_iter()
+                .filter(|n| param_bound.contains(*n))
+                .collect();
             let e = c.alloc();
-            c.env_op(EK_SEED, e, alloc::vec![fenv], "", 0);
+            c.env_op(EK_SEED, e, alloc::vec![fenv], &seeded.join("\n"), 0);
             c.bind_env_value(e)?;
             c.var_env = Some(e);
             e
