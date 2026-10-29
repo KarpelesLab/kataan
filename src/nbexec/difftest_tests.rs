@@ -871,3 +871,26 @@ fn intl_compact_rounding_is_numbering_system_independent() {
         "1.2M,1M,-1M,1K,true,true,true,integer:1 compact:M,morePrecision,1,2,0,0,auto"
     );
 }
+
+/// A String wrapper's read-only index properties are only its *canonical*
+/// indices: `"01"`, `"+1"` and `"00"` are ordinary keys, so assigning one
+/// creates a property (it was dropped, and threw in strict code).
+#[test]
+fn string_wrapper_non_canonical_index_keys_are_writable() {
+    let src = r#"
+        var r = [];
+        ["01", "+1", "00", "1"].forEach(function (k) {
+            var s = new String("abc");
+            s[k] = 7;
+            var strict = (function () { "use strict"; var t = new String("abc");
+                try { t[k] = 5; return t[k]; } catch (e) { return e.name; } })();
+            r.push(k + ":" + s[k] + ":" + Reflect.set(new String("abc"), k, 1) + ":" + strict
+                   + ":" + Object.keys(s).join("/"));
+        });
+        r.join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "01:7:true:5:0/1/2/01 +1:7:true:5:0/1/2/+1 00:7:true:5:0/1/2/00 1:b:false:TypeError:0/1/2"
+    );
+}

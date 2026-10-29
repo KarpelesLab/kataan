@@ -3118,7 +3118,9 @@ impl Interp {
         }
         // A string's index properties (`"abc"[0]`, or `new String("abc")[0]`) are
         // non-writable own data properties, so a write to an in-range index fails.
+        // (Only a canonical index: `"01"` or `"+1"` is an ordinary key.)
         if let Ok(i) = key.parse::<usize>()
+            && crate::realm::is_canonical_decimal(key)
             && self.string_index_count(handle).is_some_and(|n| i < n)
         {
             return false;
