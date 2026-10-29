@@ -3394,6 +3394,31 @@ impl JitProto {
         helpers: &GenericHelpers,
         warm: &[Option<crate::ic::WarmEntry>],
     ) -> Option<Self> {
+        Self::compile_generic_closures(proto, helpers, warm, &|_| false)
+    }
+
+    /// [`compile_generic_warm`](Self::compile_generic_warm), told which
+    /// functions' closures (`Op::MakeClosure { func, .. }`) need nothing at
+    /// creation but their cell (`plain(func)`: not an async function, whose
+    /// closure links `%AsyncFunction.prototype%`): those with few captures
+    /// are allocated inline.
+    #[must_use]
+    pub fn compile_generic_closures(
+        proto: &crate::nbvm::FnProto,
+        helpers: &GenericHelpers,
+        warm: &[Option<crate::ic::WarmEntry>],
+        plain: &dyn Fn(u32) -> bool,
+    ) -> Option<Self> {
+        let inline_closures: Vec<bool> = proto
+            .ops
+            .iter()
+            .map(|op| match op {
+                crate::nbvm::Op::MakeClosure { func, captures, .. } => {
+                    captures.len() <= crate::cell::CAPTURES_INLINE_CAP && plain(*func)
+                }
+                _ => false,
+            })
+            .collect();
         let (ops, keys, call_args, n_calls) = lower_nbvm_generic(proto)?;
         // One persistent cache per `CallValue` site (stable addresses, as below).
         let calls: alloc::boxed::Box<[core::cell::UnsafeCell<CallSite>]> = (0..n_calls)
@@ -3515,6 +3540,7 @@ impl JitProto {
             &osr_entries,
             &call_sites,
             (proto.n_params, proto.n_captures, new_target),
+            &inline_closures,
         )?;
         Some(Self {
             func,
@@ -5457,6 +5483,7 @@ impl JitFunction {
         osr_entries: &[usize],
         call_sites: &[*const CallSite],
         (n_params, n_caps, new_target): (usize, usize, Option<usize>),
+        inline_closures: &[bool],
     ) -> Option<(Self, usize)> {
         use crate::nanbox::NanBox;
         if ops.len() != bytecode.len() || n_regs > 0xffff {
@@ -5777,9 +5804,16 @@ impl JitFunction {
                 a.raw(&[0x89, 0xc1]); // mov ecx, eax: rcx = handle index
                 a.raw(&[0x48, 0x39, 0xd1]); // cmp rcx, rdx
                 a.jae($miss); // index >= arena len
-                a.raw(&[0x48, 0x69, 0xc9]); // imul rcx, rcx, stride
-                a.raw(&layout.slot_stride.to_le_bytes());
-                a.raw(&[0x4c, 0x01, 0xd1]); // add rcx, r10: rcx = &Slot
+                if layout.slot_stride == 72 {
+                    // rcx = r10 + rcx*72 in two `lea`s (shorter on the
+                    // dependency chain than `imul` + `add`).
+                    a.raw(&[0x48, 0x8d, 0x0c, 0xc9]); // lea rcx, [rcx + rcx*8]
+                    a.raw(&[0x49, 0x8d, 0x0c, 0xca]); // lea rcx, [r10 + rcx*8]
+                } else {
+                    a.raw(&[0x48, 0x69, 0xc9]); // imul rcx, rcx, stride
+                    a.raw(&layout.slot_stride.to_le_bytes());
+                    a.raw(&[0x4c, 0x01, 0xd1]); // add rcx, r10: rcx = &Slot
+                }
                 a.cmp_byte_at_rcx_imm(layout.off_slot_occ, layout.slot_occupied_disc);
                 a.jne($miss);
                 a.cmp_word_at_rcx_r8w(layout.off_slot_gen);
@@ -6651,6 +6685,49 @@ impl JitFunction {
                             a.call_rax();
                             a.bind(done);
                             a.store_rax(disp(*dst));
+                        }
+                        // A closure that needs nothing but its cell (see
+                        // `compile_generic_closures`), in the main realm of
+                        // a single-realm run whose closures' prototype is
+                        // the recorded default: inline from the heap's free
+                        // list, else the interpreter's op.
+                        crate::nbvm::Op::MakeClosure {
+                            dst,
+                            func,
+                            captures,
+                        } if inline_closures.get(pc as usize).copied().unwrap_or(false)
+                            && ok(*dst)
+                            && captures.iter().all(|r| ok(*r)) =>
+                        {
+                            let slow = a.new_label();
+                            let done = a.new_label();
+                            let cl = &helpers.call_layout;
+                            a.g_cmp_byte_imm(call_seq::r::R15, cl.main_realm, 0);
+                            a.g_jcc(call_seq::cc::E, slow);
+                            a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                            a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
+                            a.g_jcc(call_seq::cc::NE, slow);
+                            a.g_cmp_byte_imm(call_seq::r::R9, cl.vmfn_plain, 0);
+                            a.g_jcc(call_seq::cc::E, slow);
+                            let caps: Vec<i32> = captures.iter().map(|r| disp(*r)).collect();
+                            a.p_alloc_closure(&layout, cl.realm, *func, &caps, slow);
+                            a.store_rax(disp(*dst));
+                            a.jmp(done);
+                            a.bind(slow);
+                            exec_op!(pc);
+                            a.bind(done);
+                        }
+                        // A captured variable's binding cell: inline from
+                        // the heap's free list, else the interpreter's op.
+                        crate::nbvm::Op::NewBox { dst } if ok(*dst) => {
+                            let slow = a.new_label();
+                            let done = a.new_label();
+                            a.p_alloc_box(&layout, helpers.call_layout.realm, slow);
+                            a.store_rax(disp(*dst));
+                            a.jmp(done);
+                            a.bind(slow);
+                            exec_op!(pc);
+                            a.bind(done);
                         }
                         array_op @ (crate::nbvm::Op::NewArrayFrom { .. }
                         | crate::nbvm::Op::NewArray { .. }) => {

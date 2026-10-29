@@ -288,8 +288,9 @@ pub enum Cell {
     VmFunction {
         /// Index into the VM program's function table.
         func: u32,
-        /// The captured cells, in the order the function's compiled body expects.
-        captures: Vec<NanBox>,
+        /// The captured cells, in the order the function's compiled body
+        /// expects (see [`Captures`]).
+        captures: Captures,
     },
     /// A host lexical environment held by a bytecode-VM function that uses
     /// dynamic scoping (a direct `eval` or `with`, `ROADMAP.md` §2.0). Never a
@@ -449,6 +450,120 @@ pub struct ArrayElems {
     /// The inline elements; past `inline_len` (and entirely, on the heap)
     /// always `undefined`, so no stale handle lingers there.
     inline: [NanBox; ARRAY_INLINE_CAP],
+}
+
+/// Captured values a closure keeps in its own cell (see [`Captures`]).
+pub const CAPTURES_INLINE_CAP: usize = 2;
+
+/// A [`Cell::VmFunction`]'s captured values (it dereferences to them as a
+/// slice): up to [`CAPTURES_INLINE_CAP`] of them inline, in the cell
+/// (`inline[..inline_len]`, the `Vec` empty), so a small closure costs no
+/// allocation but its cell; more in the `Vec` (`inline_len ==`
+/// [`ARRAY_ON_HEAP`]). A closure's captures are never resized once made:
+/// compiled call sites memoize where they are (`jit::CallMemo`), under the
+/// prototype epoch that every move of a cell bumps. Compiled code tests
+/// `inline_len` to find them (offsets probed, see `jit_captures_offsets`).
+#[repr(C)] // compiled code reads every field at probed offsets
+#[derive(Clone)]
+pub struct Captures {
+    elems: Vec<NanBox>,
+    inline_len: u8,
+    /// Past `inline_len` (and entirely, on the heap) always `undefined`.
+    inline: [NanBox; CAPTURES_INLINE_CAP],
+}
+
+impl Captures {
+    /// The captures `vals`: inline when they fit.
+    #[must_use]
+    #[inline]
+    pub fn from_slice(vals: &[NanBox]) -> Self {
+        if vals.len() <= CAPTURES_INLINE_CAP {
+            let mut inline = [NanBox::undefined(); CAPTURES_INLINE_CAP];
+            inline[..vals.len()].copy_from_slice(vals);
+            Self {
+                elems: Vec::new(),
+                inline_len: vals.len() as u8,
+                inline,
+            }
+        } else {
+            Self {
+                elems: vals.to_vec(),
+                inline_len: ARRAY_ON_HEAP,
+                inline: [NanBox::undefined(); CAPTURES_INLINE_CAP],
+            }
+        }
+    }
+
+    /// The captured values.
+    #[must_use]
+    #[inline]
+    pub fn as_slice(&self) -> &[NanBox] {
+        if self.inline_len == ARRAY_ON_HEAP {
+            &self.elems
+        } else {
+            &self.inline[..usize::from(self.inline_len)]
+        }
+    }
+
+    /// The captured values, mutably (in place).
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [NanBox] {
+        if self.inline_len == ARRAY_ON_HEAP {
+            &mut self.elems
+        } else {
+            &mut self.inline[..usize::from(self.inline_len)]
+        }
+    }
+}
+
+impl From<Vec<NanBox>> for Captures {
+    /// Values that fit inline move there (and the `Vec` is freed).
+    fn from(vals: Vec<NanBox>) -> Self {
+        if vals.len() <= CAPTURES_INLINE_CAP {
+            Self::from_slice(&vals)
+        } else {
+            Self {
+                elems: vals,
+                inline_len: ARRAY_ON_HEAP,
+                inline: [NanBox::undefined(); CAPTURES_INLINE_CAP],
+            }
+        }
+    }
+}
+
+impl PartialEq for Captures {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl core::fmt::Debug for Captures {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.as_slice()).finish()
+    }
+}
+
+impl core::ops::Deref for Captures {
+    type Target = [NanBox];
+    #[inline]
+    fn deref(&self) -> &[NanBox] {
+        self.as_slice()
+    }
+}
+
+impl core::ops::DerefMut for Captures {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [NanBox] {
+        self.as_mut_slice()
+    }
+}
+
+impl<'a> IntoIterator for &'a Captures {
+    type Item = &'a NanBox;
+    type IntoIter = core::slice::Iter<'a, NanBox>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
 }
 
 /// The filler of unused inline element slots.
@@ -646,15 +761,27 @@ pub(crate) struct CellLayout {
     pub array_empty_vec: [u64; 3],
 }
 
+/// The offsets of a [`Captures`]' `Vec`, `inline_len` byte and inline
+/// values, relative to the `Captures`.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn jit_captures_offsets() -> (usize, usize, usize) {
+    use core::mem::offset_of;
+    (
+        offset_of!(Captures, elems),
+        offset_of!(Captures, inline_len),
+        offset_of!(Captures, inline),
+    )
+}
+
 /// The byte layout of a `Cell::VmFunction`, for compiled code that identifies a
 /// callee without a helper: `(discriminant, func_off, captures_off)`, the
-/// offsets relative to the `Cell` (the captures being a `Vec<NanBox>`, whose
-/// pointer/length words sit where any `Vec`'s do).
+/// offsets relative to the `Cell` (the captures being a [`Captures`]: see
+/// [`jit_captures_offsets`] for its fields).
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn jit_vm_function_layout() -> (u8, usize, usize) {
     let cell = Cell::VmFunction {
         func: 7,
-        captures: alloc::vec![NanBox::undefined()],
+        captures: Captures::from_slice(&[NanBox::undefined()]),
     };
     let base = core::ptr::addr_of!(cell) as usize;
     // SAFETY: `cell` is a live, initialized `Cell`; its tag byte (the first, see
@@ -1270,6 +1397,31 @@ mod tests {
         let a = Cell::Array(alloc::vec![NanBox::number(1.0), NanBox::number(2.0)].into());
         assert_eq!(a.as_array().map(<[_]>::len), Some(2));
         assert_eq!(a.type_of(), "object");
+    }
+
+    /// A closure's captures: inline up to the cap, else in the `Vec`; the
+    /// slice view, the `Vec` conversion and in-place writes agree either way.
+    #[test]
+    fn captures_inline_and_on_heap_agree() {
+        let n = |x: f64| NanBox::number(x);
+        for len in 0..=CAPTURES_INLINE_CAP + 2 {
+            let vals: Vec<NanBox> = (0..len).map(|i| n(i as f64)).collect();
+            let c = Captures::from_slice(&vals);
+            assert_eq!(c.inline_len == ARRAY_ON_HEAP, len > CAPTURES_INLINE_CAP);
+            assert_eq!(&*c, &vals[..]);
+            assert_eq!(Captures::from(vals.clone()), c);
+            assert!(
+                c.inline[len.min(CAPTURES_INLINE_CAP)..]
+                    .iter()
+                    .all(|v| v.is_undefined())
+            );
+            let mut d = c.clone();
+            if len > 0 {
+                d[len - 1] = n(-1.0);
+                assert_eq!(d[len - 1], n(-1.0));
+                assert_eq!(d.len(), len);
+            }
+        }
     }
 
     /// Small arrays keep their elements inline until their count changes;

@@ -494,21 +494,35 @@ fn region_op_ok(op: &GenericOp, bc: &Op) -> bool {
 }
 
 /// The region ops the generic emitter emits (`compile_generic`): a property or
-/// element read, a property write, an array's `.length`, and a call of a `Math`
-/// function the generic tier computes inline. They read their operands from
-/// the register file, so the registers they read are never promoted; a
-/// promoted register they write is reloaded after them
-/// ([`NumGen::after_generic`]). Their calls (slow paths, getters, setters,
-/// misses) store the promoted registers first and reload them after
-/// ([`NumGen::call_spill`]), so a loop that reads and writes object fields
-/// keeps its arithmetic in SSE registers.
-fn generic_region_op(op: &GenericOp, bc: &Op) -> bool {
-    match op {
+/// element read, a property write, an array's `.length`, and a call (the
+/// native call sequence, or a `Math` function the generic tier computes
+/// inline). They read their operands from the register file, so the
+/// registers they read are never promoted; a promoted register they write is
+/// reloaded after them ([`NumGen::after_generic`]). Their calls (slow paths,
+/// getters, setters, misses, the callee itself) store the promoted registers
+/// first and reload them after ([`NumGen::call_spill`]), so a loop that reads
+/// and writes object fields, or calls a function, keeps its arithmetic in SSE
+/// registers. (A callee reaches the caller's registers only through the
+/// register file: as the collector's roots, which a relocation may update.)
+fn generic_region_op(op: &GenericOp, _bc: &Op) -> bool {
+    matches!(
+        op,
         GenericOp::GetProp { .. }
-        | GenericOp::SetProp { .. }
-        | GenericOp::GetElem { .. }
-        | GenericOp::ArrayLen { .. } => true,
-        GenericOp::CallMethod { .. } => super::inline_math(bc).is_some(),
+            | GenericOp::SetProp { .. }
+            | GenericOp::GetElem { .. }
+            | GenericOp::ArrayLen { .. }
+            | GenericOp::CallMethod { .. }
+            | GenericOp::CallValue { .. }
+            | GenericOp::CallKey { .. }
+    )
+}
+
+/// Whether region op `op` may run arbitrary code (a call that is not an
+/// inline `Math` function): a speculative version needs a call-free body.
+fn region_call(op: &GenericOp, bc: &Op) -> bool {
+    match op {
+        GenericOp::CallMethod { .. } => super::inline_math(bc).is_none(),
+        GenericOp::CallValue { .. } | GenericOp::CallKey { .. } => true,
         _ => false,
     }
 }
@@ -2974,6 +2988,9 @@ fn plan_spec(
         return None;
     }
     for (pc, op) in ops.iter().enumerate().take(end + 1).skip(head) {
+        if region_call(op, &bytecode[pc]) {
+            return None;
+        }
         let t = match *op {
             GenericOp::Jump { target } | GenericOp::JumpIfFalse { target, .. } => target,
             GenericOp::PushHandler { .. } => return None,

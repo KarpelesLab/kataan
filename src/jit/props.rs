@@ -65,10 +65,18 @@ pub(crate) struct PropsLayout {
     pub off_native_id: i32,
     /// Slot-relative offset of a VM function's `func: u32`.
     pub off_vmfn_func: i32,
-    /// Slot-relative offset of a VM function's captures data pointer.
+    /// Slot-relative offset of a VM function's captures `Vec` data pointer
+    /// (its captures when `off_vmfn_caps_inline_len` holds `ARRAY_ON_HEAP`).
     pub off_vmfn_caps_ptr: i32,
-    /// Slot-relative offset of a VM function's capture count.
+    /// Slot-relative offset of that `Vec`'s length.
     pub off_vmfn_caps_len: i32,
+    /// Slot-relative offset of a VM function's inline capture count byte
+    /// (`ARRAY_ON_HEAP`: the captures are in the `Vec`).
+    pub off_vmfn_caps_inline_len: i32,
+    /// Slot-relative offset of a VM function's inline captures.
+    pub off_vmfn_caps_inline: i32,
+    /// Slot-relative offset of a VM function's captures `Vec` (its words).
+    pub off_vmfn_caps_vec: i32,
     /// Shape-word-relative offset of the shape's `parent` word.
     pub shape_parent: i32,
     /// Shape-word-relative offset of the shape `Rc`'s strong count.
@@ -109,6 +117,7 @@ impl PropsLayout {
         let i = |v: usize| i32::try_from(v).expect("jit layout offset fits in i32");
         let (heap_ptr, heap_len) = crate::realm::Realm::jit_heap_offsets();
         let (vmfn_disc, func_off, caps_off) = crate::cell::jit_vm_function_layout();
+        let (caps_vec, caps_inline_len, caps_inline) = crate::cell::jit_captures_offsets();
         let (native_disc, native_id_off) = crate::cell::jit_native_layout();
         let (box_disc, box_val_off) = crate::cell::jit_box_layout();
         let (shape_parent, rc_strong) = shape_word_offsets();
@@ -135,8 +144,11 @@ impl PropsLayout {
             box_disc,
             off_box_val: i(cell_base + box_val_off),
             off_vmfn_func: i(cell_base + func_off),
-            off_vmfn_caps_ptr: i(cell_base + caps_off + obj.vec_ptr_off),
-            off_vmfn_caps_len: i(cell_base + caps_off + obj.vec_len_off),
+            off_vmfn_caps_ptr: i(cell_base + caps_off + caps_vec + obj.vec_ptr_off),
+            off_vmfn_caps_len: i(cell_base + caps_off + caps_vec + obj.vec_len_off),
+            off_vmfn_caps_inline_len: i(cell_base + caps_off + caps_inline_len),
+            off_vmfn_caps_inline: i(cell_base + caps_off + caps_inline),
+            off_vmfn_caps_vec: i(cell_base + caps_off + caps_vec),
             off_jit_flags: i(obj_base + obj.jit_flags_off),
             off_proto: i(obj_base + obj.proto_off),
             off_epoch: i(obj_base + obj.epoch_off),
@@ -583,6 +595,17 @@ impl X64Assembler {
         self.p_rm32(0x8b, dst, base, disp);
     }
 
+    /// `movzx edx, byte [base+disp32]`.
+    fn p_load_u8_rdx(&mut self, base: u8, disp: i32) {
+        debug_assert!(base & 7 != 4, "no SIB form");
+        if base >= 8 {
+            self.code.push(0x41);
+        }
+        self.code.extend_from_slice(&[0x0f, 0xb6]);
+        self.code.push(0x80 | (2 << 3) | (base & 7));
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
     /// `movzx r32, word [base+disp32]`.
     fn p_load16(&mut self, dst: u8, base: u8, disp: i32) {
         debug_assert!(base & 7 != 4, "no SIB form");
@@ -655,6 +678,20 @@ impl X64Assembler {
         self.g_jcc(cc::NE, miss);
     }
 
+    /// `rax = r10 + rax * slot_stride` (the slot of arena index `rax`, the
+    /// arena base in `r10`). The usual 72-byte stride is two `lea`s — two
+    /// cycles on the dependency chain of every handle decode, where
+    /// `imul` + `add` take four.
+    fn p_index_to_slot(&mut self, l: &JitLayout) {
+        if l.slot_stride == 72 {
+            self.code.extend_from_slice(&[0x48, 0x8d, 0x04, 0xc0]); // lea rax, [rax + rax*8]
+            self.code.extend_from_slice(&[0x49, 0x8d, 0x04, 0xc2]); // lea rax, [r10 + rax*8]
+        } else {
+            self.imul_rax_imm(l.slot_stride);
+            self.add_rax_r10();
+        }
+    }
+
     /// From the handle bits in `rax` (a `NanBox` handle or a raw handle: only
     /// the low 48 bits are read), `rcx = &Slot` of a live slot with that
     /// generation, given the arena base in `r10` and length in `rdx`; else to
@@ -665,8 +702,7 @@ impl X64Assembler {
         self.p_zext_eax(); // rax = index
         self.cmp_rax_rdx();
         self.jae(miss);
-        self.imul_rax_imm(l.slot_stride);
-        self.add_rax_r10();
+        self.p_index_to_slot(l);
         self.mov_rcx_rax();
         self.cmp_byte_at_rcx_imm(l.off_slot_occ, l.slot_occupied_disc);
         self.jne(miss);
@@ -903,8 +939,7 @@ impl X64Assembler {
         self.mov_r10_rax();
         self.g_load(r::RAX, r::RBX, obj_disp);
         self.p_zext_eax(); // rax = handle index
-        self.imul_rax_imm(l.slot_stride);
-        self.add_rax_r10();
+        self.p_index_to_slot(l);
         self.mov_rcx_rax(); // rcx = &Slot
         self.cmp_byte_at_rcx_imm(l.off_od_tag, l.obj_shaped_disc);
         self.jne(miss);
@@ -1542,6 +1577,117 @@ impl X64Assembler {
         self.code.extend_from_slice(&[0x4c, 0x09, 0xd8]); // or rax, r11
     }
 
+    /// Inline [`Realm::new_box`](crate::realm::Realm::new_box) when the heap
+    /// has a free slot and no incremental marking is running: exactly
+    /// `Heap::alloc`'s free-list path over `Cell::Box(undefined)` (as
+    /// [`Self::p_alloc_object`] for an object). Then `rax` = the box's handle
+    /// bits; otherwise to `miss`, having changed nothing. Clobbers `rax`,
+    /// `rcx`, `rdx`, `r9`, `r11`.
+    pub(crate) fn p_alloc_box(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
+        let p = &l.props;
+        self.g_load(r::R9, r::R15, realm_off);
+        self.g_cmp_byte_imm(r::R9, p.marking, 0);
+        self.g_jcc(cc::NE, miss);
+        self.g_load(r::RAX, r::R9, p.free_len);
+        self.g_test(r::RAX);
+        self.g_jcc(cc::E, miss);
+        self.code.extend_from_slice(&[0x48, 0xff, 0xc8]); // dec rax
+        self.g_load(r::R11, r::R9, p.free_ptr);
+        self.code.extend_from_slice(&[0x41, 0x8b, 0x14, 0x83]); // mov edx, [r11 + rax*4]
+        self.g_store(r::R9, p.free_len, r::RAX);
+        self.g_inc_mem(r::R9, p.heap_live);
+        self.g_inc_mem(r::R9, p.heap_allocs);
+        // rcx = the slot.
+        self.g_mov(r::RAX, r::RDX);
+        self.imul_rax_imm(l.slot_stride);
+        self.g_add_mem(r::RAX, r::R9, p.heap_ptr);
+        self.g_mov(r::RCX, r::RAX);
+        // `Cell::Box(undefined)`.
+        self.p_store_rcx_imm(1, l.off_cell_tag, u32::from(p.box_disc));
+        self.g_movabs(r::R11, crate::nanbox::NanBox::undefined().to_bits());
+        self.g_store(r::RCX, p.off_box_val, r::R11);
+        // The slot: its generation stays; age 0, occupied.
+        self.p_load16(r::RAX, r::RCX, l.off_slot_gen);
+        self.p_store_rcx_imm(1, p.off_slot_age, 0);
+        self.p_store_rcx_imm(1, l.off_slot_occ, u32::from(l.slot_occupied_disc));
+        // rax = NanBox::handle(generation << 32 | index).
+        self.shl_rax_imm(32);
+        self.p_or_rax_rdx();
+        self.g_movabs(r::R11, crate::nanbox::NanBox::handle(0).to_bits());
+        self.code.extend_from_slice(&[0x4c, 0x09, 0xd8]); // or rax, r11
+    }
+
+    /// Inline [`Realm::new_vm_function_from`](crate::realm::Realm) of VM
+    /// function `func` over the register values at the frame displacements
+    /// `caps` (at most [`CAPTURES_INLINE_CAP`](crate::cell::CAPTURES_INLINE_CAP)
+    /// of them), when the heap has a free slot and no incremental marking is
+    /// running: exactly `Heap::alloc`'s free-list path over
+    /// `Cell::VmFunction { func, captures: Captures::from_slice(..) }` (as
+    /// [`Self::p_alloc_object`] for an object) — the captures inline, the
+    /// unused inline slots `undefined`, an empty `Vec`. Then `rax` = the
+    /// closure's handle bits; otherwise to `miss`, having changed nothing.
+    /// (The caller checks that the closure needs nothing else: no
+    /// `[[Prototype]]` record, no realm tag.) Clobbers `rax`, `rcx`, `rdx`,
+    /// `r9`, `r11`.
+    pub(crate) fn p_alloc_closure(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        func: u32,
+        caps: &[i32],
+        miss: Label,
+    ) {
+        use crate::cell::CAPTURES_INLINE_CAP;
+        assert!(caps.len() <= CAPTURES_INLINE_CAP, "inline captures");
+        let p = &l.props;
+        self.g_load(r::R9, r::R15, realm_off);
+        self.g_cmp_byte_imm(r::R9, p.marking, 0);
+        self.g_jcc(cc::NE, miss);
+        self.g_load(r::RAX, r::R9, p.free_len);
+        self.g_test(r::RAX);
+        self.g_jcc(cc::E, miss);
+        self.code.extend_from_slice(&[0x48, 0xff, 0xc8]); // dec rax
+        self.g_load(r::R11, r::R9, p.free_ptr);
+        self.code.extend_from_slice(&[0x41, 0x8b, 0x14, 0x83]); // mov edx, [r11 + rax*4]
+        self.g_store(r::R9, p.free_len, r::RAX);
+        self.g_inc_mem(r::R9, p.heap_live);
+        self.g_inc_mem(r::R9, p.heap_allocs);
+        // rcx = the slot.
+        self.g_mov(r::RAX, r::RDX);
+        self.imul_rax_imm(l.slot_stride);
+        self.g_add_mem(r::RAX, r::R9, p.heap_ptr);
+        self.g_mov(r::RCX, r::RAX);
+        // `Cell::VmFunction`, field by field.
+        self.p_store_rcx_imm(1, l.off_cell_tag, u32::from(p.vmfn_disc));
+        self.p_store_rcx_imm(4, p.off_vmfn_func, func);
+        for (k, &w) in l.arr_empty_vec.iter().enumerate() {
+            self.g_movabs(r::R11, w);
+            self.g_store(r::RCX, p.off_vmfn_caps_vec + 8 * k as i32, r::R11);
+        }
+        self.p_store_rcx_imm(1, p.off_vmfn_caps_inline_len, caps.len() as u32);
+        // Promoted registers' current values reach the frame first.
+        self.spill_before_call();
+        for (i, &d) in caps.iter().enumerate() {
+            self.load_rax(d);
+            self.g_store(r::RCX, p.off_vmfn_caps_inline + 8 * i as i32, r::RAX);
+        }
+        if caps.len() < CAPTURES_INLINE_CAP {
+            self.g_movabs(r::R11, crate::nanbox::NanBox::undefined().to_bits());
+            for i in caps.len()..CAPTURES_INLINE_CAP {
+                self.g_store(r::RCX, p.off_vmfn_caps_inline + 8 * i as i32, r::R11);
+            }
+        }
+        // The slot: its generation stays; age 0, occupied.
+        self.p_load16(r::RAX, r::RCX, l.off_slot_gen);
+        self.p_store_rcx_imm(1, p.off_slot_age, 0);
+        self.p_store_rcx_imm(1, l.off_slot_occ, u32::from(l.slot_occupied_disc));
+        // rax = NanBox::handle(generation << 32 | index).
+        self.shl_rax_imm(32);
+        self.p_or_rax_rdx();
+        self.g_movabs(r::R11, crate::nanbox::NanBox::handle(0).to_bits());
+        self.code.extend_from_slice(&[0x4c, 0x09, 0xd8]); // or rax, r11
+    }
+
     /// The call sequence's callee identification, inline (what
     /// `jit_callee_info` computes): for the value in `rax`, `rax` = its
     /// `function id | capture count << 32` and `rdx` = its captures when it
@@ -1558,6 +1704,16 @@ impl X64Assembler {
         self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.props.vmfn_disc);
         self.jne(none);
         self.p_load32(r::RAX, r::RCX, l.props.off_vmfn_func);
+        // The captures: inline in the cell, or in the `Vec`.
+        let on_heap = self.new_label();
+        self.p_load_u8_rdx(r::RCX, l.props.off_vmfn_caps_inline_len);
+        self.g_cmp_imm(r::RDX, i32::from(crate::cell::ARRAY_ON_HEAP));
+        self.g_jcc(cc::E, on_heap);
+        self.p_shl_rdx_32();
+        self.p_or_rax_rdx();
+        self.g_lea(r::RDX, r::RCX, l.props.off_vmfn_caps_inline);
+        self.jmp(done);
+        self.bind(on_heap);
         self.g_load(r::RDX, r::RCX, l.props.off_vmfn_caps_len);
         self.p_shl_rdx_32();
         self.p_or_rax_rdx();
@@ -1942,11 +2098,26 @@ mod tests {
             assert_eq!(*field(nf, l.off_native_id).cast::<u16>(), 0x4321);
             let (fid, caps) = realm.vm_function(f).unwrap();
             assert_eq!(*field(f, l.off_vmfn_func).cast::<u32>(), fid);
-            assert_eq!(*field(f, l.off_vmfn_caps_len).cast::<usize>(), caps.len());
-            assert_eq!(
-                *field(f, l.off_vmfn_caps_ptr).cast::<*const NanBox>(),
-                caps.as_ptr()
-            );
+            if caps.len() <= crate::cell::CAPTURES_INLINE_CAP {
+                assert_eq!(
+                    usize::from(*field(f, l.off_vmfn_caps_inline_len)),
+                    caps.len()
+                );
+                assert_eq!(
+                    field(f, l.off_vmfn_caps_inline).cast::<NanBox>(),
+                    caps.as_ptr()
+                );
+            } else {
+                assert_eq!(
+                    *field(f, l.off_vmfn_caps_inline_len),
+                    crate::cell::ARRAY_ON_HEAP
+                );
+                assert_eq!(*field(f, l.off_vmfn_caps_len).cast::<usize>(), caps.len());
+                assert_eq!(
+                    *field(f, l.off_vmfn_caps_ptr).cast::<*const NanBox>(),
+                    caps.as_ptr()
+                );
+            }
         }
     }
 }

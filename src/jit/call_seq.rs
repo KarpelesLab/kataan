@@ -482,6 +482,11 @@ pub struct CallLayout {
     pub callee_len: i32,
     /// `ctx`: whether the run is hosted (`bool`).
     pub hosted: i32,
+    /// `ctx`: whether the context runs in the main realm (`bool`).
+    pub main_realm: i32,
+    /// realm: whether a new VM closure needs no `[[Prototype]]` record
+    /// (`bool`, `Realm::jit_vmfn_plain`).
+    pub vmfn_plain: i32,
 }
 
 impl X64Assembler {
@@ -613,11 +618,6 @@ impl X64Assembler {
         self.emit_rel32(label);
     }
 
-    /// `rep stosq` — store `rax` to `rcx` qwords from `rdi` up.
-    pub(crate) fn g_rep_stosq(&mut self) {
-        self.code.extend_from_slice(&[0xf3, 0x48, 0xab]);
-    }
-
     /// The byte offset `label` was bound at (after emission).
     pub(crate) fn label_offset(&self, label: Label) -> usize {
         self.labels[label.0]
@@ -695,14 +695,28 @@ pub(crate) fn emit_native_entry(
     if rest < n_regs {
         let count = n_regs - rest;
         a.g_movabs(r::RAX, undefined);
-        if count <= 16 {
+        // Straight-line stores, or a four-store loop for a large window: a
+        // `rep stosq` costs a few dozen cycles to start, more than the whole
+        // fill of a typical window.
+        if count <= 64 {
             for i in rest..n_regs {
                 a.g_store(r::RBX, slot(i)?, r::RAX);
             }
         } else {
+            let quads = count / 4;
+            let fill = a.new_label();
             a.g_lea(r::RDI, r::RBX, slot(rest)?);
-            a.g_movabs(r::RCX, count as u64);
-            a.g_rep_stosq();
+            a.g_lea(r::RCX, r::RBX, slot(rest + quads * 4)?);
+            a.bind(fill);
+            for k in 0..4 {
+                a.g_store(r::RDI, slot(k)?, r::RAX);
+            }
+            a.g_lea(r::RDI, r::RDI, 32);
+            a.g_cmp(r::RDI, r::RCX);
+            a.g_jcc(cc::B, fill);
+            for i in rest + quads * 4..n_regs {
+                a.g_store(r::RBX, slot(i)?, r::RAX);
+            }
         }
     }
     if let Some(nt) = nt {

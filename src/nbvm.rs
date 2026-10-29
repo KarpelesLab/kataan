@@ -1519,6 +1519,10 @@ fn hosted_ctx<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
     let in_realm = host.realm_index();
     let mut ctx = hosted_ctx_in(realm, host);
     ctx.in_realm = in_realm;
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    {
+        ctx.jit_rt.main_realm = in_realm.is_none();
+    }
     ctx
 }
 
@@ -4029,6 +4033,13 @@ struct TierState {
     /// Native code a recompilation replaced (see [`TierSlot::replace_jit`]).
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     retired_jit: Vec<alloc::rc::Rc<crate::jit::JitProto>>,
+    /// For a function whose native code is an Int/Float-tier body (which has
+    /// no native-call entry): its generic-tier compilation, which compiled
+    /// callers enter instead (`None` until tried, then the outcome; see
+    /// `jit_tier::direct_target`). Kept with the function for the same reason
+    /// as `jit`: compiled call sites hold its address.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    twin: Option<Option<alloc::rc::Rc<crate::jit::JitProto>>>,
 }
 
 /// A function's persistent tier state (its activation count, optimized body,
@@ -4084,6 +4095,21 @@ impl TierSlot {
     fn set_jit(&self, j: Option<alloc::rc::Rc<crate::jit::JitProto>>) {
         if let Ok(mut t) = self.0.try_borrow_mut() {
             t.jit = Some(j);
+        }
+    }
+
+    /// The generic-tier twin of an Int/Float-tier function, if one was
+    /// attempted (see [`TierState::twin`]).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    fn twin(&self) -> Option<Option<alloc::rc::Rc<crate::jit::JitProto>>> {
+        self.0.try_borrow().ok().and_then(|t| t.twin.clone())
+    }
+
+    /// Records the generic-tier twin's compilation outcome.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    fn set_twin(&self, j: Option<alloc::rc::Rc<crate::jit::JitProto>>) {
+        if let Ok(mut t) = self.0.try_borrow_mut() {
+            t.twin = Some(j);
         }
     }
 
@@ -4741,7 +4767,16 @@ fn ensure_jit(
     let compiled = crate::jit::JitProto::compile_with_registry(&funcs[id], &registry)
         .or_else(|| {
             let warm = warm.unwrap_or_else(|| tier_warm(&funcs[id]));
-            crate::jit::JitProto::compile_generic_warm(&funcs[id], &jit_generic_helpers(), &warm)
+            crate::jit::JitProto::compile_generic_closures(
+                &funcs[id],
+                &jit_generic_helpers(),
+                &warm,
+                &|f| {
+                    funcs
+                        .get(f as usize)
+                        .is_some_and(|p| !(p.is_async && !p.is_generator))
+                },
+            )
         })
         .map(alloc::rc::Rc::new);
     if jit_tier::jit_log_enabled() {
@@ -8888,8 +8923,8 @@ fn run_frame_at_ic(
                 func,
                 captures,
             } => {
-                let cells: Vec<NanBox> = captures.iter().map(|r| regs[*r as usize]).collect();
-                let handle = ctx.realm.new_vm_function(*func, cells);
+                let cells = ArgBuf::from_regs(regs, captures);
+                let handle = ctx.realm.new_vm_function_from(*func, &cells);
                 install_fn_name_length(&mut ctx.realm, handle, funcs.get(*func as usize));
                 link_function_proto(ctx, handle);
                 link_async_proto(ctx, funcs.get(*func as usize), handle);

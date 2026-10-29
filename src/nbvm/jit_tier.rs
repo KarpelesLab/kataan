@@ -88,6 +88,10 @@ pub(super) struct TierRuntime {
     /// Whether the context has a host (`Ctx::host` is `Some`; it never
     /// changes). Compiled method calls read it inline.
     pub(super) hosted: bool,
+    /// Whether the context runs in the main realm (`Ctx::in_realm` is
+    /// `None`; it never changes): a closure it makes needs no realm tag.
+    /// Compiled code's inline closure allocation reads it.
+    pub(super) main_realm: bool,
     /// The innermost activation that may leave at a loop header to be
     /// recompiled (one [`osr`] entered): its register window's address and
     /// its body (`0, null` for none). Only the back-edge polls of that very
@@ -111,6 +115,7 @@ impl Default for TierRuntime {
             direct: alloc::vec::Vec::new(),
             stack: StackPtr::default(),
             hosted: false,
+            main_realm: true,
             exit_regs: 0,
             exit_jit: core::ptr::null(),
             resume: None,
@@ -509,8 +514,16 @@ fn recompile(
             *w = c.warm_entry();
         }
     }
-    let mut new =
-        crate::jit::JitProto::compile_generic_warm(proto, &super::jit_generic_helpers(), &warm)?;
+    let mut new = crate::jit::JitProto::compile_generic_closures(
+        proto,
+        &super::jit_generic_helpers(),
+        &warm,
+        &|f| {
+            funcs
+                .get(f as usize)
+                .is_some_and(|p| !(p.is_async && !p.is_generator))
+        },
+    )?;
     new.set_generation(old.generation() + 1);
     let new = Rc::new(new);
     if jit_log_enabled() {
@@ -915,9 +928,8 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             func,
             captures,
         } => {
-            let cells: alloc::vec::Vec<NanBox> =
-                captures.iter().map(|r| regs[*r as usize]).collect();
-            let handle = ctx.realm.new_vm_function(*func, cells);
+            let cells = super::ArgBuf::from_regs(regs, captures);
+            let handle = ctx.realm.new_vm_function_from(*func, &cells);
             super::install_fn_name_length(&mut ctx.realm, handle, funcs.get(*func as usize));
             super::link_function_proto(ctx, handle);
             super::link_async_proto(ctx, funcs.get(*func as usize), handle);
@@ -2415,6 +2427,8 @@ pub(super) fn call_layout() -> crate::jit::CallLayout {
         multi_realm: i(offset_of!(crate::realm::Realm, multi_realm)),
         callee_len: i(offset_of!(crate::realm::Realm, vm_callee_stack) + len_off),
         hosted: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, hosted)),
+        main_realm: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, main_realm)),
+        vmfn_plain: i(crate::realm::Realm::jit_vmfn_plain_offset()),
     }
 }
 
@@ -2527,8 +2541,41 @@ fn direct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
     }
     match proto.tier.jit() {
         Some(Some(j)) if j.is_generic() && j.n_regs() <= proto.n_regs => Some(j),
+        Some(Some(_)) => generic_twin(proto),
         _ => None,
     }
+}
+
+/// The generic-tier body compiled callers enter for a function whose own
+/// native code is an Int/Float-tier body: those have no native-call entry,
+/// so without it every call from compiled code took the interpreter's call
+/// (several times the cost of the call sequence). Only for a body without a
+/// loop or a static call — straight-line code, where the unboxed tier gains
+/// nothing over the generic one; a loop or a recursion (`fib`) keeps its
+/// Int-tier body. Both are compilations of the same bytecode, so either one
+/// runs any call exactly.
+fn generic_twin(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
+    if let Some(t) = proto.tier.twin() {
+        return t;
+    }
+    let straight = !proto.ops.iter().enumerate().any(|(pc, op)| match op {
+        Op::Jump { target } | Op::JumpIfFalse { target, .. } => *target <= pc,
+        Op::Call { .. } => true,
+        _ => false,
+    });
+    let twin = straight
+        .then(|| {
+            crate::jit::JitProto::compile_generic_warm(
+                proto,
+                &super::jit_generic_helpers(),
+                &super::tier_warm(proto),
+            )
+        })
+        .flatten()
+        .filter(|j| j.is_generic() && j.n_regs() <= proto.n_regs)
+        .map(Rc::new);
+    proto.tier.set_twin(twin.clone());
+    twin
 }
 
 /// The generic-tier loop back-edge poll — what the interpreter does on a

@@ -106,6 +106,11 @@ pub struct Realm {
         allow(dead_code)
     )]
     jit_array_proto_default: bool,
+    /// Whether [`link_vm_fn_proto`](Realm::link_vm_fn_proto) is a no-op in
+    /// this (single) realm: a new VM closure's `[[Prototype]]` is the
+    /// recorded default (`vm_fn_default_proto` is `%Function.prototype%`).
+    /// Compiled code's inline closure allocation requires it set.
+    jit_vmfn_plain: bool,
     /// `default_object_proto` as an object's raw `proto` word (`NO_PROTO` for
     /// none): what compiled code's inline `Op::NewObject` gives the new object.
     #[cfg_attr(
@@ -705,6 +710,7 @@ impl Realm {
             incremental: None,
             jit_marking: false,
             jit_array_proto_default: true,
+            jit_vmfn_plain: false,
             jit_default_proto: crate::object::NO_PROTO,
             next_symbol_id: 1,
             symbols_by_id: alloc::collections::BTreeMap::new(),
@@ -807,12 +813,17 @@ impl Realm {
                 None => {
                     crate::object::bump_proto_epoch();
                     self.vm_fn_default_proto = Some(proto);
+                    self.jit_vmfn_plain = true;
                     return;
                 }
-                Some(p) if p == proto => return,
+                Some(p) if p == proto => {
+                    self.jit_vmfn_plain = true;
+                    return;
+                }
                 Some(_) => {}
             }
         }
+        self.jit_vmfn_plain = false;
         self.set_native_proto(f, proto);
     }
 
@@ -857,6 +868,7 @@ impl Realm {
         // A default `[[Prototype]]` changes: retire every validated chain.
         crate::object::bump_proto_epoch();
         self.function_proto_intrinsic = Some(handle);
+        self.jit_vmfn_plain = false;
         self.add_jit_flags(handle, crate::object::JIT_FLAG_NO_INLINE_SET);
     }
 
@@ -966,6 +978,7 @@ impl Realm {
         self.refresh_array_proto_default();
         self.promise_proto_intrinsic = s.promise_proto;
         self.function_proto_intrinsic = s.function_proto;
+        self.jit_vmfn_plain = false;
         for h in [s.array_proto, s.function_proto].into_iter().flatten() {
             self.add_jit_flags(h, crate::object::JIT_FLAG_NO_INLINE_SET);
         }
@@ -1245,6 +1258,14 @@ impl Realm {
     #[must_use]
     pub(crate) fn jit_array_proto_default_offset() -> usize {
         core::mem::offset_of!(Realm, jit_array_proto_default)
+    }
+
+    /// The byte offset, within a `Realm`, of `jit_vmfn_plain` (a `bool`),
+    /// which compiled code's inline closure allocation requires set.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_vmfn_plain_offset() -> usize {
+        core::mem::offset_of!(Realm, jit_vmfn_plain)
     }
 
     /// Recomputes `jit_array_proto_default` after either array prototype
@@ -3332,14 +3353,26 @@ impl Realm {
     /// Allocates a bytecode-VM closure over function-table entry `func`
     /// capturing `captures`.
     pub fn new_vm_function(&mut self, func: u32, captures: Vec<NanBox>) -> Handle {
-        self.heap.alloc(Cell::VmFunction { func, captures })
+        self.heap.alloc(Cell::VmFunction {
+            func,
+            captures: captures.into(),
+        })
+    }
+
+    /// [`new_vm_function`](Self::new_vm_function) over a slice of captures
+    /// (a small closure's stay inline in its cell: no other allocation).
+    pub fn new_vm_function_from(&mut self, func: u32, captures: &[NanBox]) -> Handle {
+        self.heap.alloc(Cell::VmFunction {
+            func,
+            captures: crate::cell::Captures::from_slice(captures),
+        })
     }
 
     /// Replaces the captured values of the VM closure at `handle` (a snapshot
     /// restore fills them in once every referenced cell exists).
     pub fn set_vm_function_captures(&mut self, handle: Handle, new: Vec<NanBox>) {
         if let Some(Cell::VmFunction { captures, .. }) = self.heap.get_mut(handle) {
-            *captures = new;
+            *captures = new.into();
             // Compiled call sites memoize a closure's captures buffer under
             // the prototype epoch (`jit::CallMemo`).
             crate::object::bump_proto_epoch();
