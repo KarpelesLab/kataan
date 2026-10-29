@@ -934,6 +934,44 @@ impl Realm {
 /// named-property object (raw handle), its shape then and the slot.
 pub(crate) type StampedSlot = (u64, Rc<Shape>, u32);
 
+/// [`ArrayIterMemo`]'s `open`, as last found valid for a plain array (no
+/// named property, the realm's first `%Array.prototype%`), flat so compiled
+/// code can make the same test inline: the prototype epoch it holds at, and
+/// per lookup the holder (raw handle), its shape word, the slot and the value
+/// found there. Compiled code re-reads both slots and compares the values (a
+/// value is no part of what the epoch watches). It never outlives the memo
+/// entry it copies (every change to the memo empties it), whose `Rc`s keep
+/// the two shapes alive. `stamp == u64::MAX`: empty.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct ArrayIterJit {
+    pub(crate) stamp: u64,
+    pub(crate) iter_holder: u64,
+    pub(crate) iter_shape: u64,
+    pub(crate) iter_slot: u64,
+    pub(crate) iter_fn: u64,
+    pub(crate) next_holder: u64,
+    pub(crate) next_shape: u64,
+    pub(crate) next_slot: u64,
+    pub(crate) next_fn: u64,
+}
+
+impl Default for ArrayIterJit {
+    fn default() -> Self {
+        Self {
+            stamp: u64::MAX,
+            iter_holder: 0,
+            iter_shape: 0,
+            iter_slot: 0,
+            iter_fn: 0,
+            next_holder: 0,
+            next_shape: 0,
+            next_slot: 0,
+            next_fn: 0,
+        }
+    }
+}
+
 /// The VM's memo of the fixed lookups of its array-iteration fast path
 /// (`nbvm::iter_fast`), each validated at a prototype epoch
 /// (`crate::object::proto_epoch`) with every link of its chain watched, so

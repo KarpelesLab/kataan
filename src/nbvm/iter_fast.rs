@@ -94,8 +94,13 @@ pub(super) fn can_open(realm: &mut Realm, v: NanBox) -> bool {
     if !realm.is_array(h) {
         return false;
     }
-    let own_named = realm.may_own_named(h);
-    let proto = realm.object_proto(h);
+    // An array whose two sticky flags are clear owns no named property and
+    // has the first `%Array.prototype%` (no side-table probe needed).
+    let root = realm.plain_array_root_proto(h);
+    let (own_named, proto) = match root {
+        Some(p) => (false, Some(p)),
+        None => (realm.may_own_named(h), realm.object_proto(h)),
+    };
     if !own_named
         && let Some(p) = proto
         && realm.array_iter_memo.open_stamp == crate::object::proto_epoch()
@@ -104,12 +109,34 @@ pub(super) fn can_open(realm: &mut Realm, v: NanBox) -> bool {
     {
         let ai = realm.vm_array_iter();
         if let (Some(f), Some(n)) = (realm.stamped_slot(iter_at), realm.stamped_slot(next_at)) {
-            return f
+            let ok = f
                 .as_handle()
                 .is_some_and(|fh| ai.values_fns.iter().any(|x| x.to_raw() == fh))
                 && ai
                     .next_fn
                     .is_some_and(|nf| n.as_handle() == Some(nf.to_raw()));
+            // For a plain array, publish the open to compiled code.
+            #[cfg(all(
+                feature = "jit",
+                feature = "alloc",
+                target_os = "linux",
+                target_arch = "x86_64"
+            ))]
+            if ok && root.is_some() {
+                let jit = crate::realm::builtins_fast::ArrayIterJit {
+                    stamp: realm.array_iter_memo.open_stamp,
+                    iter_holder: iter_at.0,
+                    iter_shape: crate::jit::shape_word(&iter_at.1),
+                    iter_slot: u64::from(iter_at.2),
+                    iter_fn: f.to_bits(),
+                    next_holder: next_at.0,
+                    next_shape: crate::jit::shape_word(&next_at.1),
+                    next_slot: u64::from(next_at.2),
+                    next_fn: n.to_bits(),
+                };
+                realm.array_iter_jit = jit;
+            }
+            return ok;
         }
     }
     if !can_open_walk(realm, h) {
@@ -119,6 +146,7 @@ pub(super) fn can_open(realm: &mut Realm, v: NanBox) -> bool {
     // this prototype), watching both chains.
     if !own_named && let Some(p) = proto {
         realm.array_iter_memo.open_stamp = 0;
+        realm.array_iter_jit = crate::realm::builtins_fast::ArrayIterJit::default();
         let ai = realm.vm_array_iter();
         let (Some(iter_proto), Some(key)) = (ai.iter_proto, ai.iter_key.clone()) else {
             return true;

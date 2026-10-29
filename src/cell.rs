@@ -432,6 +432,10 @@ pub const ARRAY_ON_HEAP: u8 = u8::MAX;
 /// in-bounds element is a plain writable data property, which is what
 /// compiled code's inline element paths test (one byte, instead of probing the
 /// side tables). Sticky: a stale `true` only sends an access to the helper.
+/// A second sticky flag records whether the array's `[[Prototype]]` was ever
+/// set (a realm side-table entry, or an explicit `null`): while both are
+/// clear, the array owns no named property and its prototype is the realm's
+/// first `%Array.prototype%`, which is what an array iteration's open tests.
 ///
 /// **Storage.** Up to [`ARRAY_INLINE_CAP`] elements are kept inline, in the
 /// cell (`inline[..inline_len]`, the `Vec` empty), so a small array costs no
@@ -446,6 +450,7 @@ pub const ARRAY_ON_HEAP: u8 = u8::MAX;
 pub struct ArrayElems {
     elems: Vec<NanBox>,
     side: bool,
+    proto_set: bool,
     inline_len: u8,
     /// The inline elements; past `inline_len` (and entirely, on the heap)
     /// always `undefined`, so no stale handle lingers there.
@@ -580,6 +585,7 @@ impl ArrayElems {
             Self {
                 elems: Vec::new(),
                 side: false,
+                proto_set: false,
                 inline_len: elems.len() as u8,
                 inline,
             }
@@ -593,6 +599,7 @@ impl ArrayElems {
         Self {
             elems,
             side: false,
+            proto_set: false,
             inline_len: ARRAY_ON_HEAP,
             inline: INLINE_FILL,
         }
@@ -607,6 +614,17 @@ impl ArrayElems {
     /// Records that the array has side-table state.
     pub fn mark_side_state(&mut self) {
         self.side = true;
+    }
+
+    /// Whether the array's `[[Prototype]]` was (ever) set explicitly.
+    #[must_use]
+    pub fn has_proto_set(&self) -> bool {
+        self.proto_set
+    }
+
+    /// Records that the array's `[[Prototype]]` was set explicitly.
+    pub fn mark_proto_set(&mut self) {
+        self.proto_set = true;
     }
 
     /// Whether the elements are inline (in the cell).
@@ -678,7 +696,9 @@ impl Default for ArrayElems {
 
 impl PartialEq for ArrayElems {
     fn eq(&self, other: &Self) -> bool {
-        self.side == other.side && self.as_slice() == other.as_slice()
+        self.side == other.side
+            && self.proto_set == other.proto_set
+            && self.as_slice() == other.as_slice()
     }
 }
 
@@ -751,6 +771,9 @@ pub(crate) struct CellLayout {
     /// Byte offset of the array's side-state flag ([`ArrayElems`]) within a
     /// `Cell::Array`.
     pub array_side_off: usize,
+    /// Byte offset of the array's prototype-set flag ([`ArrayElems`]) within
+    /// a `Cell::Array`.
+    pub array_proto_set_off: usize,
     /// Byte offset of the array's inline element count ([`ARRAY_ON_HEAP`]
     /// while the elements are in the `Vec`) within a `Cell::Array`.
     pub array_inline_len_off: usize,
@@ -855,10 +878,11 @@ pub(crate) fn jit_cell_layout() -> CellLayout {
     // [`Cell`]) is in bounds and always a valid `u8`.
     #[allow(unsafe_code)]
     let array_disc = unsafe { *(arr_base as *const u8) };
-    let (array_vec_off, array_side_off) = match &arr {
+    let (array_vec_off, array_side_off, array_proto_set_off) = match &arr {
         Cell::Array(v) => (
             core::ptr::addr_of!(v.elems) as usize - arr_base,
             core::ptr::addr_of!(v.side) as usize - arr_base,
+            core::ptr::addr_of!(v.proto_set) as usize - arr_base,
         ),
         _ => unreachable!("just built a Cell::Array"),
     };
@@ -887,6 +911,7 @@ pub(crate) fn jit_cell_layout() -> CellLayout {
         array_disc,
         array_vec_off,
         array_side_off,
+        array_proto_set_off,
         array_inline_len_off,
         array_inline_off,
         array_empty_vec,

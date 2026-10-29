@@ -38,6 +38,8 @@ pub use call_seq::{
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use props::MethodSite;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use props::shape_word;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use tierup::MAX_GENERATION;
 
 /// `2^53` — the largest magnitude an `f64` represents every integer below
@@ -3042,6 +3044,9 @@ pub(crate) struct JitLayout {
     /// (`crate::cell::ArrayElems`): non-zero routes an element access to the
     /// helper.
     pub off_arr_side: i32,
+    /// Slot-relative offset of a `Cell::Array`'s prototype-set flag byte
+    /// (`crate::cell::ArrayElems`).
+    pub off_arr_proto_set: i32,
     /// Slot-relative offset of a `Cell::Array`'s inline element count byte
     /// (`crate::cell::ARRAY_ON_HEAP` when the elements are in the `Vec`, whose
     /// pointer and length are `off_arr_ptr` / `off_arr_len`). Read through
@@ -3098,6 +3103,7 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
             off_arr_ptr: to_i32(cell_base + cell.array_vec_off + obj.vec_ptr_off),
             off_arr_len: to_i32(cell_base + cell.array_vec_off + obj.vec_len_off),
             off_arr_side: to_i32(cell_base + cell.array_side_off),
+            off_arr_proto_set: to_i32(cell_base + cell.array_proto_set_off),
             off_arr_inline_len: to_i32(cell_base + cell.array_inline_len_off),
             off_arr_inline: to_i32(cell_base + cell.array_inline_off),
             off_arr_vec: to_i32(cell_base + cell.array_vec_off),
@@ -6816,6 +6822,37 @@ impl JitFunction {
                                 Some(bail) => a.jmp(bail),
                                 None => exec_op!(pc),
                             }
+                            a.bind(fin);
+                        }
+                        // The open of an iteration over a plain array (no
+                        // named property, no prototype ever set: its
+                        // prototype is the first `%Array.prototype%`) with
+                        // the built-in iterator, as `iter_fast::can_open`'s
+                        // memo last found it valid (`p_array_iter_open`): by
+                        // index (`next` the array, `iter` the cursor `0`).
+                        // Anything else is the interpreter's op.
+                        crate::nbvm::Op::IterOpen { iter, next, src }
+                            if usize::from(*next) == usize::from(*iter) + 1
+                                && ok(*iter)
+                                && ok(*next)
+                                && ok(*src) =>
+                        {
+                            let (iter, next, src) = (*iter, *next, *src);
+                            let slow = a.new_label();
+                            let fin = a.new_label();
+                            a.p_load_arena(helpers.call_layout.realm, &layout.props);
+                            walk_to_slot!(src, slow);
+                            family_checks!(recv_cache::Family::Arr, slow);
+                            a.cmp_byte_at_rcx_imm(layout.off_arr_proto_set, 0);
+                            a.jne(slow);
+                            a.p_array_iter_open(&layout, helpers.call_layout.realm, slow);
+                            a.load_rax(disp(src));
+                            a.store_rax(disp(next));
+                            a.movabs_rax(NanBox::number(0.0).to_bits() as i64);
+                            a.store_rax(disp(iter));
+                            a.jmp(fin);
+                            a.bind(slow);
+                            exec_op!(pc);
                             a.bind(fin);
                         }
                         // A literal's allocation: its own helper, not the

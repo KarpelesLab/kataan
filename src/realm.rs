@@ -358,6 +358,9 @@ pub struct Realm {
     /// The VM's stamped memo of the array-iteration lookups (see
     /// [`builtins_fast::ArrayIterMemo`]).
     pub(crate) array_iter_memo: builtins_fast::ArrayIterMemo,
+    /// The memo's validated open, flat for compiled code (see
+    /// [`builtins_fast::ArrayIterJit`]).
+    pub(crate) array_iter_jit: builtins_fast::ArrayIterJit,
     /// `%Promise.prototype%` — the `[[Prototype]]` of every engine-created promise.
     /// Captured at install time so an engine-internal promise (dynamic `import()`,
     /// an async function's result, a microtask reaction) never picks up a *tampered*
@@ -758,6 +761,7 @@ impl Realm {
             root_array_proto: None,
             vm_array_iter: VmArrayIterIntrinsics::default(),
             array_iter_memo: builtins_fast::ArrayIterMemo::default(),
+            array_iter_jit: builtins_fast::ArrayIterJit::default(),
             promise_proto_intrinsic: None,
             symbol_proto_intrinsic: None,
             string_proto_intrinsic: None,
@@ -845,6 +849,7 @@ impl Realm {
         self.cell_link_changed(handle);
         self.native_protos.insert(handle.to_raw(), proto);
         self.gc_side_log.push(handle.to_raw());
+        self.mark_array_proto_set(handle);
     }
 
     /// The hook for a change to a non-object cell's `[[Prototype]]` or
@@ -917,6 +922,7 @@ impl Realm {
     /// while it installs `Array.prototype` and `%ArrayIteratorPrototype%`).
     pub fn vm_array_iter_mut(&mut self) -> &mut VmArrayIterIntrinsics {
         self.array_iter_memo = builtins_fast::ArrayIterMemo::default();
+        self.array_iter_jit = builtins_fast::ArrayIterJit::default();
         &mut self.vm_array_iter
     }
 
@@ -1380,6 +1386,29 @@ impl Realm {
     fn mark_array_side_state(&mut self, handle: Handle) {
         if let Some(Cell::Array(a)) = self.heap.get_mut(handle) {
             a.mark_side_state();
+        }
+    }
+
+    /// Records on the array at `handle` (no-op for any other cell) that its
+    /// `[[Prototype]]` was set explicitly (see [`crate::cell::ArrayElems`]):
+    /// called wherever a non-object cell's prototype link is recorded.
+    fn mark_array_proto_set(&mut self, handle: Handle) {
+        if let Some(Cell::Array(a)) = self.heap.get_mut(handle) {
+            a.mark_proto_set();
+        }
+    }
+
+    /// Whether the cell at `handle` is an array that owns no named property
+    /// and whose `[[Prototype]]` is the realm's first `%Array.prototype%`, as
+    /// its two sticky flags tell (`None` for any other cell, or when a flag is
+    /// set and the side tables must be asked).
+    #[must_use]
+    pub(crate) fn plain_array_root_proto(&self, handle: Handle) -> Option<Handle> {
+        match self.heap.get(handle) {
+            Some(Cell::Array(a)) if !a.has_side_state() && !a.has_proto_set() => {
+                self.root_array_proto
+            }
+            _ => None,
         }
     }
 
@@ -2477,6 +2506,7 @@ impl Realm {
         {
             self.native_protos.insert(h.to_raw(), p);
             self.gc_side_log.push(h.to_raw());
+            self.mark_array_proto_set(h);
         }
         h
     }
@@ -3938,6 +3968,7 @@ impl Realm {
             )
         {
             self.cell_link_changed(handle);
+            self.mark_array_proto_set(handle);
             match proto {
                 Some(p) => {
                     self.native_protos.insert(handle.to_raw(), p);

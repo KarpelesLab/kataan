@@ -1410,6 +1410,61 @@ impl X64Assembler {
         self.bind(other);
     }
 
+    /// To `miss` unless the realm's published array-iteration open
+    /// (`realm::builtins_fast::ArrayIterJit`) holds: its prototype epoch is
+    /// current, and each of its two lookups' holder is still a live shaped
+    /// object of the recorded shape whose slot holds the recorded value —
+    /// what `iter_fast::can_open`'s memo hit tests (`Realm::stamped_slot`).
+    /// Clobbers `rax`, `rcx`, `rdx`, `r8`–`r11`.
+    pub(crate) fn p_array_iter_open(&mut self, l: &super::JitLayout, realm_off: i32, miss: Label) {
+        use crate::realm::builtins_fast::ArrayIterJit as J;
+        let base = core::mem::offset_of!(crate::realm::Realm, array_iter_jit);
+        let off = |f: usize| i32::try_from(base + f).unwrap_or(i32::MAX);
+        self.g_load(r::R9, r::R15, realm_off);
+        self.g_movabs(r::R11, crate::object::proto_epoch_addr() as u64);
+        self.g_load(r::RAX, r::R11, 0);
+        self.g_cmp_mem(r::RAX, r::R9, off(core::mem::offset_of!(J, stamp)));
+        self.g_jcc(cc::NE, miss);
+        for (h, sh, sl, f) in [
+            (
+                core::mem::offset_of!(J, iter_holder),
+                core::mem::offset_of!(J, iter_shape),
+                core::mem::offset_of!(J, iter_slot),
+                core::mem::offset_of!(J, iter_fn),
+            ),
+            (
+                core::mem::offset_of!(J, next_holder),
+                core::mem::offset_of!(J, next_shape),
+                core::mem::offset_of!(J, next_slot),
+                core::mem::offset_of!(J, next_fn),
+            ),
+        ] {
+            // r11 = the realm; rax:rdx = the arena.
+            self.p_load_arena(realm_off, &l.props);
+            self.mov_r10_rax();
+            self.g_load(r::RAX, r::R11, off(h));
+            self.p_slot_of(l, miss);
+            self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
+            self.jne(miss);
+            self.cmp_byte_at_rcx_imm(l.off_od_tag, l.obj_shaped_disc);
+            self.jne(miss);
+            self.g_load(r::RAX, r::RCX, l.off_shape);
+            self.g_cmp_mem(r::RAX, r::R11, off(sh));
+            self.g_jcc(cc::NE, miss);
+            self.g_load(r::R9, r::R11, off(f));
+            self.g_load(r::RAX, r::R11, off(sl));
+            let spill = self.new_label();
+            let got = self.new_label();
+            self.p_obj_slot_load_inline(l, miss, spill);
+            self.jmp(got);
+            self.bind(spill);
+            self.p_obj_slot_load_spill(l, got);
+            self.bind(got);
+            self.g_cmp(r::RAX, r::R9);
+            self.g_jcc(cc::NE, miss);
+        }
+    }
+
     /// `null`/`undefined` in `rax` to `falsy` (else fall through). Clobbers
     /// `r11`.
     pub(crate) fn p_truthy_nullish(&mut self, falsy: Label) {
@@ -1663,6 +1718,7 @@ impl X64Assembler {
             self.g_store(r::RCX, l.off_arr_vec + 8 * k as i32, r::R11);
         }
         self.p_store_rcx_imm(1, l.off_arr_side, 0);
+        self.p_store_rcx_imm(1, l.off_arr_proto_set, 0);
         self.p_store_rcx_imm(1, l.off_arr_inline_len, elems.len() as u32);
         // Promoted registers' current values reach the frame first.
         self.spill_before_call();
@@ -2185,6 +2241,7 @@ mod tests {
             assert_eq!(strong, std::rc::Rc::strong_count(&oshape));
             assert_eq!(*field(arr, jl.off_arr_side), 0);
             assert_eq!(*field(farr, jl.off_arr_side), 1);
+            assert_eq!(*field(arr, jl.off_arr_proto_set), 0);
             assert_eq!(
                 *rp.add(usize::try_from(l.max_array_len).unwrap())
                     .cast::<usize>(),
