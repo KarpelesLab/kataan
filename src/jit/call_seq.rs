@@ -602,6 +602,17 @@ impl X64Assembler {
         self.emit_rel32(label);
     }
 
+    /// `call rax`.
+    pub(crate) fn g_call_rax(&mut self) {
+        self.code.extend_from_slice(&[0xff, 0xd0]);
+    }
+
+    /// `call label` (rel32).
+    pub(crate) fn g_call_label(&mut self, label: Label) {
+        self.code.push(0xe8);
+        self.emit_rel32(label);
+    }
+
     /// `rep stosq` — store `rax` to `rcx` qwords from `rdi` up.
     pub(crate) fn g_rep_stosq(&mut self) {
         self.code.extend_from_slice(&[0xf3, 0x48, 0xab]);
@@ -700,6 +711,43 @@ pub(crate) fn emit_native_entry(
     a.mov_frame8_imm32(countdown, 1); // poll at the first back-edge
     a.jmp(body);
     Some(())
+}
+
+/// Emits the native-call entry of a body with `try` regions: the same
+/// signature as `emit_native_entry`'s, calling that entry (`inner`) inside a
+/// segment of the context's handler stack of its own. `helper` is the
+/// `GenericHelpers::handler_frame` helper: `helper(ctx, 0, _)` opens the
+/// segment and returns the caller's, `helper(ctx, 1, saved)` drops whatever
+/// the body left in its segment (a throw that escaped it leaves its handlers
+/// behind) and restores the caller's. The interpreter-entered activation gets
+/// this from its Rust caller (`jit_tier::run_compiled_at`); a body entered
+/// natively makes it itself.
+pub(crate) fn emit_handler_entry(a: &mut X64Assembler, helper: u64, inner: Label) {
+    // Slots below the prologue's saved `r15`/`rbx`: the six arguments, the
+    // caller's segment and the result.
+    const ARGS: [u8; 6] = [r::RDI, r::RSI, r::RDX, r::RCX, r::R8, r::R9];
+    let slot = |i: i32| -24 - 8 * i;
+    a.frame_prologue(64);
+    for (i, &reg) in ARGS.iter().enumerate() {
+        a.g_store(RBP, slot(i as i32), reg);
+    }
+    // rdi = ctx already.
+    a.g_movabs(r::RSI, 0);
+    a.g_movabs(r::RAX, helper);
+    a.g_call_rax();
+    a.g_store(RBP, slot(6), r::RAX);
+    for (i, &reg) in ARGS.iter().enumerate() {
+        a.g_load(reg, RBP, slot(i as i32));
+    }
+    a.g_call_label(inner);
+    a.g_store(RBP, slot(7), r::RAX);
+    a.g_load(r::RDI, RBP, slot(0));
+    a.g_movabs(r::RSI, 1);
+    a.g_load(r::RDX, RBP, slot(6));
+    a.g_movabs(r::RAX, helper);
+    a.g_call_rax();
+    a.g_load(r::RAX, RBP, slot(7));
+    a.frame_epilogue();
 }
 
 /// `rbp`'s register number.

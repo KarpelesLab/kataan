@@ -9149,6 +9149,24 @@ impl crate::nbvm::VmHost for Interp {
             .map_err(exec_to_host)
     }
 
+    fn replace_plan(
+        &mut self,
+        recv: NanBox,
+        search: NanBox,
+        replace: NanBox,
+        all: bool,
+    ) -> Option<Result<crate::nbvm::ReplaceStep, crate::nbvm::HostError>> {
+        #[cfg(feature = "regex")]
+        if self.created_realms.is_empty() {
+            return Some(
+                self.string_replace_planned(recv, search, replace, all)
+                    .map_err(exec_to_host),
+            );
+        }
+        let _ = (recv, search, replace, all);
+        None
+    }
+
     fn construct(
         &mut self,
         ctor: NanBox,

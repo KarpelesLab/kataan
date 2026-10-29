@@ -128,6 +128,10 @@ enum FastOp {
     StrSplit,
     /// `String.prototype.replace`.
     StrReplace,
+    /// `String.prototype.replaceAll` (with a RegExp and a VM function, its
+    /// replacer calls run in the VM; otherwise called through the host
+    /// directly, as [`FastOp::HostDirect`]).
+    StrReplaceAll,
     /// `Object.keys`.
     ObjKeys,
     /// `Object.entries`.
@@ -215,6 +219,7 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_STRING_PROTO_FN, b"padEnd") => FastOp::StrPad(false),
         (N_STRING_PROTO_FN, b"split") => FastOp::StrSplit,
         (N_STRING_PROTO_FN, b"replace") => FastOp::StrReplace,
+        (N_STRING_PROTO_FN, b"replaceAll") => FastOp::StrReplaceAll,
         #[cfg(feature = "std")]
         (N_NUMBER_PROTO_FN, b"toFixed") => FastOp::NumToFixed,
         (N_NUMBER_PROTO_FN, b"toString") => FastOp::NumToString,
@@ -444,9 +449,26 @@ pub(super) fn try_call(
         let argv = super::ArgBuf::from_regs(regs, args);
         return super::array_hof::run(ctx, funcs, regs, recv, op, &argv);
     }
+    // A RegExp and a VM function: the replacer calls run here
+    // (`str_replace`).
+    if matches!(site.op, FastOp::StrReplace | FastOp::StrReplaceAll) {
+        let all = site.op == FastOp::StrReplaceAll;
+        if let Some(r) = super::str_replace::try_run(ctx, funcs, regs, recv, args, all) {
+            return Some(r);
+        }
+        if all {
+            let method = NanBox::from_bits(site.method);
+            let argv = super::ArgBuf::from_regs(regs, args);
+            return Some(
+                with_host(ctx, |host| host.call(method, recv, &argv))
+                    .unwrap_or(Err(super::HostError::Fault))
+                    .map_err(VmError::from),
+            );
+        }
+    }
     let realm = &mut ctx.realm;
     let v = match site.op {
-        FastOp::None | FastOp::ArrayHof(_) => return None,
+        FastOp::None | FastOp::ArrayHof(_) | FastOp::StrReplaceAll => return None,
         #[cfg(feature = "std")]
         FastOp::Math(id) => super::math_fast::compute(realm, id, args, regs)?,
         FastOp::ArrayPush => {
@@ -697,9 +719,7 @@ pub(super) fn try_call(
             // compiled caller's `f(...)` enters it.
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             if let Some(r) =
-                super::jit_tier::call_compiled_with(ctx, funcs, Some(regs), recv, this, |buf| {
-                    buf.extend_from_slice(&argv)
-                })
+                super::jit_tier::call_compiled_with(ctx, funcs, Some(regs), recv, this, &argv)
             {
                 return Some(r);
             }

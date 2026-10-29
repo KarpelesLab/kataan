@@ -53,6 +53,8 @@ mod jit_tier;
 #[cfg(feature = "std")]
 mod math_fast;
 pub(crate) mod native_call;
+mod str_replace;
+pub use str_replace::{ReplacePlan, ReplaceStep};
 mod vm_eval;
 #[cfg(all(test, feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 use jit_tier::call_generic;
@@ -1027,6 +1029,24 @@ pub trait VmHost {
         args: &[NanBox],
     ) -> Result<NanBox, HostError> {
         self.call(method, this, args)
+    }
+    /// `recv.replace(search, replace)` (`all`: `replaceAll`) for a string
+    /// `recv`, a RegExp object `search` and a VM function `replace`, with the
+    /// replacer calls left to the VM when the algorithm allows (see
+    /// [`ReplaceStep`]). `None` when the host does not offer this (nothing has
+    /// run: the caller takes the ordinary call).
+    ///
+    /// # Errors
+    /// A throw from the steps run (a `flags` or `@@replace` getter, a user
+    /// `exec`, `lastIndex` writes), or a host fault.
+    fn replace_plan(
+        &mut self,
+        _recv: NanBox,
+        _search: NanBox,
+        _replace: NanBox,
+        _all: bool,
+    ) -> Option<Result<ReplaceStep, HostError>> {
+        None
     }
     /// `new ctor(...args)` with the host's `[[Construct]]`.
     ///
@@ -5998,6 +6018,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         arena: jit_arena,
         push_handler: jit_tier::jit_helper_push_handler,
         pop_handler: jit_tier::jit_helper_pop_handler,
+        handler_frame: jit_tier::jit_helper_handler_frame,
         call_method: jit_tier::jit_helper_call_method,
         call_value: jit_tier::jit_helper_call_value,
         method_info: jit_tier::jit_method_info,

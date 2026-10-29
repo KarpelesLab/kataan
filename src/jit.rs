@@ -2837,6 +2837,10 @@ pub struct GenericHelpers {
     pub push_handler: JitAddHelper,
     /// `Op::PopHandler` (`jit_helper_pop_handler(ctx, _)`): never throws.
     pub pop_handler: JitTruthyHelper,
+    /// The handler-stack segment of a natively entered body with `try`
+    /// regions (`jit_helper_handler_frame(ctx, leave, saved)`, see
+    /// `call_seq::emit_handler_entry`).
+    pub handler_frame: JitAddHelper,
     /// `Op::CallMethod` (`jit_helper_call_method(ctx, regs, n_regs, op, cache,
     /// call_site)`, `call_site` the native sequence's `CallSite` or null).
     pub call_method: JitCallMethodHelper,
@@ -3479,9 +3483,6 @@ impl JitProto {
             .collect();
         osr_entries.sort_unstable();
         osr_entries.dedup();
-        let uses_handlers = ops
-            .iter()
-            .any(|o| matches!(o, GenericOp::PushHandler { .. } | GenericOp::PopHandler));
         // The register `call_with_inner` puts `new.target` in, if any (a
         // native-call entry fills it from the call header; one at or below the
         // `this` slot would collide with an input, so such a body gets none).
@@ -3505,7 +3506,7 @@ impl JitProto {
             func,
             n_params: proto.n_params,
             kind: JitKind::Generic,
-            native_entry: (!uses_handlers && nt_ok).then_some(native_entry),
+            native_entry: nt_ok.then_some(native_entry),
             sites: Some(GenericSites {
                 keys,
                 caches,
@@ -7723,13 +7724,26 @@ impl JitFunction {
         a.bind(refuse_exit);
         a.movabs_rax(NanBox::jit_throw_bits() as i64);
         a.frame_epilogue();
-        // The native-call entry (`call_seq::emit_native_entry`).
+        // The native-call entry (`call_seq::emit_native_entry`), behind one
+        // that gives it a handler-stack segment of its own when the body has
+        // `try` regions.
         let native = a.new_label();
         a.bind(native);
         call_seq::emit_native_entry(
             &mut a, frame, COUNTDOWN, n_regs, n_params, n_caps, new_target, labels[0],
         )?;
-        let native_off = a.label_offset(native);
+        let uses_handlers = ops
+            .iter()
+            .any(|o| matches!(o, GenericOp::PushHandler { .. } | GenericOp::PopHandler));
+        let entry = if uses_handlers {
+            let outer = a.new_label();
+            a.bind(outer);
+            call_seq::emit_handler_entry(&mut a, helpers.handler_frame as usize as u64, native);
+            outer
+        } else {
+            native
+        };
+        let native_off = a.label_offset(entry);
         Self::from_code(&a.finish()).map(|f| (f, native_off))
     }
 

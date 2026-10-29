@@ -1618,6 +1618,98 @@ impl Interp {
         string: NanBox,
         replace: NanBox,
     ) -> Result<NanBox, ExecError> {
+        match self.regexp_symbol_replace_steps(rx, string, replace, false)? {
+            crate::nbvm::ReplaceStep::Done(v) => Ok(v),
+            crate::nbvm::ReplaceStep::Plan(_) => Err(ExecError::Unsupported("replace plan")),
+        }
+    }
+
+    /// `String.prototype.replace` (`all`: `replaceAll`) of the string `o` with
+    /// the RegExp object `search` and the callable `replace`, for a caller (the
+    /// VM) that makes the replacer calls itself: the algorithm runs exactly as
+    /// [`Self::call_method`] would run it, except that when it reaches the
+    /// intrinsic `RegExp.prototype[@@replace]` and every match is a built-in
+    /// one without named groups, it stops after collecting them — the point
+    /// past which the only code it would run is `replace` itself and
+    /// `ToString` of its results — and hands back the matches
+    /// ([`crate::nbvm::ReplaceStep::Plan`]). Anything else runs to completion
+    /// here ([`crate::nbvm::ReplaceStep::Done`]).
+    #[cfg(feature = "regex")]
+    pub(crate) fn string_replace_planned(
+        &mut self,
+        o: NanBox,
+        search: NanBox,
+        replace: NanBox,
+        all: bool,
+    ) -> Result<crate::nbvm::ReplaceStep, ExecError> {
+        use crate::nbvm::ReplaceStep;
+        let method = if all { "replaceAll" } else { "replace" };
+        let Some(argh) = search
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|_| self.is_object_value(search))
+        else {
+            return Err(ExecError::Unsupported("replace plan of a non-object"));
+        };
+        // `replaceAll`: a RegExp `searchValue` must be global (`IsRegExp`,
+        // then `Get(flags)` containing "g"), checked before `@@replace`.
+        if all && self.try_is_regexp(search)? {
+            let flags_v = self.read_member(argh, "flags")?;
+            if matches!(flags_v.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                return Err(self.type_error(
+                    "String.prototype.replaceAll called with a non-global RegExp argument",
+                ));
+            }
+            let flags_s = self.coerce_to_string(flags_v)?;
+            if !flags_s.contains('g') {
+                return Err(self.type_error(
+                    "String.prototype.replaceAll called with a non-global RegExp argument",
+                ));
+            }
+        }
+        // `GetMethod(searchValue, @@replace)`.
+        let sym = self.well_known_symbol("replace");
+        let key = self.member_key(sym);
+        let m = self.read_member(argh, &key)?;
+        if matches!(m.unpack(), Unpacked::Undefined | Unpacked::Null) {
+            // No method: the string algorithm, without a second lookup.
+            self.string_symbol_checked = true;
+            let r = self.call_method(o, method, &[search, replace]);
+            self.string_symbol_checked = false;
+            return Ok(ReplaceStep::Done(r?.unwrap_or(NanBox::undefined())));
+        }
+        let Some(fh) = m
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|&fh| self.is_callable(fh))
+        else {
+            return Err(self.type_error("searchValue[Symbol.replace] is not a function"));
+        };
+        let intrinsic = self.realm.bound_native_at(fh).is_some_and(|(id, target)| {
+            id == N_REGEXP_PROTO_FN
+                && self.realm.string_leaf_bytes(target) == Some(b"replace".as_slice())
+        }) && self.get_function_realm(fh) == self.cur_realm;
+        if intrinsic {
+            return self.regexp_symbol_replace_steps(search, o, replace, true);
+        }
+        Ok(ReplaceStep::Done(self.call_with_this(
+            m,
+            search,
+            &[o, replace],
+        )?))
+    }
+
+    /// [`Self::regexp_symbol_replace`]'s steps; with `plan`, stopping before
+    /// the replacer calls when [`Self::string_replace_planned`] may.
+    fn regexp_symbol_replace_steps(
+        &mut self,
+        rx: NanBox,
+        string: NanBox,
+        replace: NanBox,
+        plan: bool,
+    ) -> Result<crate::nbvm::ReplaceStep, ExecError> {
+        #[cfg(not(feature = "regex"))]
+        let _ = plan;
         if !self.is_object_value(rx) {
             return Err(self.type_error("RegExp.prototype[Symbol.replace] called on a non-object"));
         }
@@ -1729,6 +1821,32 @@ impl Interp {
                 results.iter().rfind(|r| matches!(r, ExecOutcome::Match(_)))
         {
             self.update_legacy_regexp(&m.units, &m.caps);
+        }
+        // Every match is a built-in one without named groups: the rest is
+        // the replacer calls, which the planning caller makes itself.
+        #[cfg(feature = "regex")]
+        if plan
+            && func_replace
+            && results.iter().all(|r| match r {
+                ExecOutcome::Null => true,
+                ExecOutcome::Match(m) => m.re.group_names().is_empty(),
+                ExecOutcome::Object(_) => false,
+            })
+        {
+            let mut stride = 0;
+            let mut spans = Vec::new();
+            for r in &results {
+                if let ExecOutcome::Match(m) = r {
+                    stride = m.caps.groups.len();
+                    spans.extend_from_slice(&m.caps.groups);
+                }
+            }
+            return Ok(crate::nbvm::ReplaceStep::Plan(crate::nbvm::ReplacePlan {
+                subject: str_v,
+                units: units_rc.clone(),
+                stride,
+                spans,
+            }));
         }
         // Build the output.
         let mut accumulated: Vec<u8> = Vec::new();
@@ -1872,7 +1990,9 @@ impl Interp {
                 units_range(units, next_source_position, usize::MAX),
             );
         }
-        Ok(self.new_str_bytes(accumulated))
+        Ok(crate::nbvm::ReplaceStep::Done(
+            self.new_str_bytes(accumulated),
+        ))
     }
 
     /// The replacement text for one `@@replace` match: `replace(matched,

@@ -219,7 +219,7 @@ pub(super) fn run(
 }
 
 /// The callback, and how [`Callee::invoke`] calls it.
-struct Callee<'f> {
+pub(super) struct Callee<'f> {
     funcs: &'f [FnProto],
     cb: NanBox,
     /// The callback's function, when it is one of `funcs` and callable (not a
@@ -247,7 +247,7 @@ struct Callee<'f> {
 const COMPILED_MISS_LIMIT: u32 = 64;
 
 impl<'f> Callee<'f> {
-    fn new(ctx: &Ctx, funcs: &'f [FnProto], cb: NanBox) -> Self {
+    pub(super) fn new(ctx: &Ctx, funcs: &'f [FnProto], cb: NanBox) -> Self {
         let proto = cb
             .as_handle()
             .and_then(|c| ctx.realm.vm_function(Handle::from_raw(c)))
@@ -272,7 +272,12 @@ impl<'f> Callee<'f> {
     /// `call_with_inner` runs it); anything else is the ordinary VM call. The
     /// loop's frame is already published, so the callee may collect.
     #[inline]
-    fn invoke(&mut self, ctx: &mut Ctx, args: &[NanBox], this: NanBox) -> Result<NanBox, VmError> {
+    pub(super) fn invoke(
+        &mut self,
+        ctx: &mut Ctx,
+        args: &[NanBox],
+        this: NanBox,
+    ) -> Result<NanBox, VmError> {
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         if let Some(proto) = self.proto {
             if let Some(c) = &mut self.compiled {
