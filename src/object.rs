@@ -331,6 +331,40 @@ impl Object {
         }
     }
 
+    /// The object that adding each key of `shape` in turn, as a plain data
+    /// property, to `Object::new(root)` leaves (`values` in slot order) — for
+    /// a caller that builds many objects with the same keys in one step.
+    /// `None` unless `shape` holds exactly `values.len()` keys, all inline.
+    #[must_use]
+    pub fn with_inline_data(shape: Rc<Shape>, values: &[NanBox]) -> Option<Self> {
+        if values.len() > INLINE_SLOTS || shape.len() as usize != values.len() {
+            return None;
+        }
+        let mut inline = [NanBox::undefined(); INLINE_SLOTS];
+        inline[..values.len()].copy_from_slice(values);
+        Some(Self {
+            mode: Mode::Shaped,
+            flags: 0,
+            len: values.len() as u16,
+            key_epoch: values.len() as u32,
+            shape,
+            proto: NO_PROTO,
+            extra: None,
+            inline,
+        })
+    }
+
+    /// Whether this is an ordinary shaped object holding only plain data
+    /// properties inline (the shape alone describes its keys and slots).
+    #[must_use]
+    pub fn is_plain_inline_shaped(&self) -> bool {
+        !self.is_dict()
+            && self.extra.is_none()
+            && self.flags == 0
+            && (self.len as usize) <= INLINE_SLOTS
+            && self.shape.len() as usize == self.len as usize
+    }
+
     /// A counter that changes whenever this object's set of own keys (data or
     /// accessor) may have changed: equal values at two moments mean the same
     /// own keys. (A `u32` that would need 2³² key changes between two reads to

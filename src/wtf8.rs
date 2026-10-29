@@ -131,6 +131,13 @@ pub fn encode_utf16_unit(u: u16, out: &mut Vec<u8>) {
 #[must_use]
 pub fn from_utf16(units: &[u16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(units.len());
+    push_utf16(&mut out, units);
+    out
+}
+
+/// Appends the WTF-8 encoding of `units` to `out` as its own string (no
+/// joining with what `out` ends with — see [`append_utf16`]).
+fn push_utf16(out: &mut Vec<u8>, units: &[u16]) {
     // An ASCII prefix (often the whole input) is one byte per unit.
     let ascii = units.iter().position(|&u| u >= 0x80).unwrap_or(units.len());
     out.extend(units[..ascii].iter().map(|&u| u as u8));
@@ -142,16 +149,30 @@ pub fn from_utf16(units: &[u16]) -> Vec<u8> {
             if (LOW_SURROGATE_MIN..=SURROGATE_MAX).contains(&lo) {
                 // A well-formed pair → the astral scalar value.
                 let cp = 0x1_0000 + ((u - SURROGATE_MIN) << 10) + (lo - LOW_SURROGATE_MIN);
-                encode_code_point(cp, &mut out);
+                encode_code_point(cp, out);
                 i += 2;
                 continue;
             }
         }
         // A scalar, or a lone surrogate kept as a surrogate code point.
-        encode_code_point(u, &mut out);
+        encode_code_point(u, out);
         i += 1;
     }
-    out
+}
+
+/// [`append`]`(out, &from_utf16(units))` without the intermediate buffer:
+/// the string concatenation of `out` and the code units `units` (a lone high
+/// surrogate ending `out` pairs with a lone low one starting `units`).
+pub fn append_utf16(out: &mut Vec<u8>, units: &[u16]) {
+    if units
+        .first()
+        .is_some_and(|&u| (LOW_SURROGATE_MIN..=SURROGATE_MAX).contains(&u32::from(u)))
+        && trailing_high_surrogate(out).is_some()
+    {
+        append(out, &from_utf16(units));
+        return;
+    }
+    push_utf16(out, units);
 }
 
 /// Decodes the next code point from `bytes` starting at `i`, returning the code

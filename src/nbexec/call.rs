@@ -700,8 +700,12 @@ impl Interp {
             // `toString` or a `@@match`/… symbol method): brand-validation is per
             // method inside the dispatcher.
             if id == N_REGEXP_PROTO_FN {
-                let name = self.realm.string_value(target).unwrap_or_default();
-                return self.regexp_proto_dispatch(&name, this_val, args);
+                let name = self
+                    .realm
+                    .string_leaf_bytes(target)
+                    .and_then(super::regexp::regexp_method_name)
+                    .unwrap_or("");
+                return self.regexp_proto_dispatch(name, this_val, args);
             }
             // A `get RegExp.prototype.<accessor>` getter (source/flags/flag getters).
             if id == N_REGEXP_ACCESSOR {

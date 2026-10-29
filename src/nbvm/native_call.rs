@@ -705,10 +705,17 @@ pub(super) fn try_call(
             }
             return Some(call_vm(ctx, funcs, regs, recv, this, &argv));
         }
-        FastOp::RegExpCall | FastOp::HostDirect => {
-            if site.op == FastOp::RegExpCall {
-                realm.regexp_flags(h)?;
-            }
+        FastOp::RegExpCall => {
+            realm.regexp_flags(h)?;
+            let method = NanBox::from_bits(site.method);
+            let argv = super::ArgBuf::from_regs(regs, args);
+            return Some(
+                with_host(ctx, |host| host.call_regexp_method(method, recv, &argv))
+                    .unwrap_or(Err(super::HostError::Fault))
+                    .map_err(VmError::from),
+            );
+        }
+        FastOp::HostDirect => {
             let method = NanBox::from_bits(site.method);
             let argv = super::ArgBuf::from_regs(regs, args);
             return Some(

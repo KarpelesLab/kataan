@@ -1009,3 +1009,67 @@ fn linear_matcher_agrees_with_the_vm() {
         }
     }
 }
+
+#[test]
+fn find_unit_agrees_with_position() {
+    // Every length up to a few groups of four, every target position, and
+    // lanes whose high bit is set (which the zero-lane test must not flag).
+    let pool = [0x41u16, 0x8000, 0xFFFF, 0x0040, 0x0042, 0xD83D, 0x0001, 0];
+    for len in 0..14usize {
+        for seed in 0..pool.len() {
+            let hay: alloc::vec::Vec<u16> = (0..len)
+                .map(|i| pool[(i * 3 + seed) % pool.len()])
+                .collect();
+            for &x in &[0x41u16, 0x8000, 0xFFFF, 0x0040, 0, 0x7FFF, 0xD83D] {
+                assert_eq!(
+                    super::linear::find_unit(&hay, x),
+                    hay.iter().position(|&u| u == x),
+                    "{hay:?} {x:#x}"
+                );
+            }
+        }
+    }
+}
+
+/// A match span (or none), in code units.
+type Span = Option<(usize, usize)>;
+
+#[test]
+fn lead_run_scan_finds_the_leftmost_match() {
+    // `A B* x …` patterns, scanned for the literal first: the leftmost start
+    // must win even when an earlier run ends at a different literal, a run
+    // spans several `x`, or the opening unit is not in `B`.
+    let cases: &[(&str, &str, Span)] = &[
+        ("[a-z]+@[a-z]+", "ab cd@ef", Some((3, 8))),
+        ("[a-z]+@[a-z]+", "@@a@b", Some((2, 5))),
+        ("[a-z]+@[a-z]+", "a@ @b", None),
+        ("x[0-9]*@", "x1x2@", Some((2, 5))),
+        ("x[0-9]*@", "x12 x@", Some((4, 6))),
+        ("[@a][a-z]*@b", "@@b", Some((0, 3))),
+        ("[a-z]+@[a-z]+", "aa@", None),
+        (
+            "([a-z0-9]+)@([a-z0-9.]+)",
+            "user1@host1.com and user2@x",
+            Some((0, 15)),
+        ),
+    ];
+    for &(p, s, want) in cases {
+        let units: alloc::vec::Vec<u16> = s.encode_utf16().collect();
+        assert_eq!(re(p, "").find_in_u16(&units, 0), want, "/{p}/ on {s:?}");
+        // A later start, and a sticky one, see the same leftmost rule.
+        if let Some((a, b)) = want {
+            assert_eq!(
+                re(p, "y").find_in_u16(&units, a),
+                Some((a, b)),
+                "/{p}/y on {s:?}"
+            );
+            if a > 0 {
+                assert_eq!(
+                    re(p, "y").find_in_u16(&units, a - 1),
+                    None,
+                    "/{p}/y on {s:?}"
+                );
+            }
+        }
+    }
+}

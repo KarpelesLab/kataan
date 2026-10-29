@@ -495,9 +495,9 @@ pub struct Interp {
     subject_units_cache: Option<(u64, alloc::rc::Rc<Vec<u16>>)>,
     /// `RegExpExec`'s `Get(R, "exec")` memo (see `regexp_exec_method`).
     regexp_exec_lookup: crate::realm::builtins_fast::MethodSiteCache,
-    /// Transition caches for a RegExp match array's `index`/`input`/`groups`.
+    /// The layout of a RegExp match array's `index`/`input`/`groups`.
     #[cfg(feature = "regex")]
-    match_array_ics: [crate::ic::PropertyCache; 3],
+    match_array_shape: crate::realm::builtins_fast::AuxShapeCache,
     /// **Mapped `arguments` exotic objects** (sloppy-mode functions with a simple
     /// parameter list): the arguments object's heap-handle (raw) maps each
     /// currently-mapped integer index to the `(scope, parameter name)` binding it
@@ -2830,7 +2830,7 @@ impl Interp {
             subject_units_cache: None,
             regexp_exec_lookup: Default::default(),
             #[cfg(feature = "regex")]
-            match_array_ics: Default::default(),
+            match_array_shape: Default::default(),
             current: Scope::root(),
             var_scope: Scope::root(),
             eval_var_scope: None,
@@ -8159,12 +8159,6 @@ fn u16_slice(units: &[u16], st: usize, en: usize) -> alloc::vec::Vec<u8> {
     crate::wtf8::from_utf16(&units[st..en])
 }
 
-/// Slices a pre-collected `&[u16]` subject from code-unit index `st` to the end,
-/// re-encoded to WTF-8 bytes.
-fn u16_slice_from(units: &[u16], st: usize) -> alloc::vec::Vec<u8> {
-    crate::wtf8::from_utf16(&units[st.min(units.len())..])
-}
-
 /// Advances a code-unit position past a just-consumed empty match. Per spec
 /// `AdvanceStringIndex`, a `u`-flag regex steps a whole code point (skipping the
 /// low half of a surrogate pair), while a non-`u` regex steps one code unit.
@@ -9109,6 +9103,31 @@ impl crate::nbvm::VmHost for Interp {
         args: &[NanBox],
     ) -> Result<NanBox, crate::nbvm::HostError> {
         self.call_with_this(callee, this, args)
+            .map_err(exec_to_host)
+    }
+
+    fn call_regexp_method(
+        &mut self,
+        method: NanBox,
+        this: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, crate::nbvm::HostError> {
+        // With one realm there is none to enter, and the general call would
+        // reach this same dispatch through its by-id chain.
+        if self.created_realms.is_empty()
+            && let Some(name) = method
+                .as_handle()
+                .and_then(|m| self.realm.bound_native_at(Handle::from_raw(m)))
+                .filter(|&(id, _)| id == N_REGEXP_PROTO_FN)
+                .and_then(|(_, target)| {
+                    regexp::regexp_method_name(self.realm.string_leaf_bytes(target)?)
+                })
+        {
+            return self
+                .regexp_proto_dispatch(name, this, args)
+                .map_err(exec_to_host);
+        }
+        self.call_with_this(method, this, args)
             .map_err(exec_to_host)
     }
 

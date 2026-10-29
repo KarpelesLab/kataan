@@ -32,18 +32,16 @@ impl Interp {
                 None => NanBox::undefined(),
             })
             .collect();
-        let obj = self.realm.new_array(elems);
         let index = caps.groups.first().and_then(|g| *g).map_or(0, |(s, _)| s);
         // Every result array gains the same three keys in the same order, so
-        // the adds go through transition caches (one shape path for all).
+        // after the first one each is built with its layout in one step.
         let groups = self.regex_groups_object(units, caps, group_names);
-        let [c_index, c_input, c_groups] = &mut self.match_array_ics;
-        self.realm
-            .init_aux_data_cached(obj, "index", NanBox::number(index as f64), c_index);
-        self.realm
-            .init_aux_data_cached(obj, "input", input, c_input);
-        self.realm
-            .init_aux_data_cached(obj, "groups", groups, c_groups);
+        let obj = self.realm.new_array_with_named(
+            elems,
+            &["index", "input", "groups"],
+            &[NanBox::number(index as f64), input, groups],
+            &mut self.match_array_shape,
+        );
         if has_indices {
             // `indices[i]` = `[start, end]` per group (undefined when absent).
             let pair = |this: &mut Self, span: Option<(usize, usize)>| -> NanBox {
@@ -958,6 +956,12 @@ impl Interp {
     /// caller's strictness (this is the abstract operation the `@@match`/`@@split`/
     /// `RegExpBuiltinExec` algorithms use, not the user-facing `re.lastIndex = v`).
     fn set_last_index(&mut self, h: Handle, n: usize) -> Result<(), ExecError> {
+        // Without a user descriptor the cell's own slot is the property, and
+        // a non-negative integer is stored as itself.
+        if !self.realm.regex_aux_last_index_defined(h) {
+            self.realm.set_regex_last_index(h, n);
+            return Ok(());
+        }
         self.set_last_index_value(h, NanBox::number(n as f64))
     }
 
@@ -1509,7 +1513,7 @@ impl Interp {
             p = e;
             q = p;
         }
-        parts.push(self.new_str_bytes(u16_slice_from(units, p)));
+        parts.push(self.units_str(units, p, usize::MAX));
         Ok(NanBox::handle(self.realm.new_array(parts).to_raw()))
     }
 
@@ -1603,7 +1607,7 @@ impl Interp {
         if let Some(c) = &last {
             self.update_legacy_regexp(units_rc, c);
         }
-        parts.push(self.new_str_bytes(u16_slice_from(units, p)));
+        parts.push(self.units_str(units, p, usize::MAX));
         Ok(Some(parts))
     }
 
@@ -1797,9 +1801,9 @@ impl Interp {
                     )?;
                     let pos = pos.min(length);
                     if pos >= next_source_position {
-                        crate::wtf8::append(
+                        crate::wtf8::append_utf16(
                             &mut accumulated,
-                            &u16_slice(units, next_source_position, pos),
+                            units_range(units, next_source_position, pos),
                         );
                         crate::wtf8::append(&mut accumulated, &replacement);
                         next_source_position = pos + matched_units.len();
@@ -1850,9 +1854,9 @@ impl Interp {
             // If position >= next_source_position, append S[next..pos] then the
             // replacement and advance next to pos + m_len.
             if pos >= next_source_position {
-                crate::wtf8::append(
+                crate::wtf8::append_utf16(
                     &mut accumulated,
-                    &u16_slice(units, next_source_position, pos),
+                    units_range(units, next_source_position, pos),
                 );
                 crate::wtf8::append(&mut accumulated, &replacement);
                 next_source_position = pos + m_len;
@@ -1863,9 +1867,9 @@ impl Interp {
             }
         }
         if next_source_position < length {
-            crate::wtf8::append(
+            crate::wtf8::append_utf16(
                 &mut accumulated,
-                &u16_slice_from(units, next_source_position),
+                units_range(units, next_source_position, usize::MAX),
             );
         }
         Ok(self.new_str_bytes(accumulated))
@@ -1962,12 +1966,15 @@ impl Interp {
                         continue;
                     }
                     '`' => {
-                        crate::wtf8::append(&mut out, &u16_slice(str_units, 0, position));
+                        crate::wtf8::append_utf16(&mut out, units_range(str_units, 0, position));
                         i += 2;
                         continue;
                     }
                     '\'' => {
-                        crate::wtf8::append(&mut out, &u16_slice_from(str_units, tail_pos));
+                        crate::wtf8::append_utf16(
+                            &mut out,
+                            units_range(str_units, tail_pos, usize::MAX),
+                        );
                         i += 2;
                         continue;
                     }
@@ -2143,4 +2150,29 @@ fn append_units(out: &mut Vec<u8>, units: &[u16]) {
     } else {
         crate::wtf8::append(out, &crate::wtf8::from_utf16(units));
     }
+}
+
+/// `units[st..en]`, clamped like [`u16_slice`] (an end past the subject is
+/// its end; a start past the end is empty).
+fn units_range(units: &[u16], st: usize, en: usize) -> &[u16] {
+    let st = st.min(units.len());
+    let en = en.min(units.len()).max(st);
+    &units[st..en]
+}
+
+/// The `RegExp.prototype` method a [`N_REGEXP_PROTO_FN`] bound native names
+/// (its target string's bytes), as the static name its dispatch matches.
+pub(crate) fn regexp_method_name(name: &[u8]) -> Option<&'static str> {
+    Some(match name {
+        b"exec" => "exec",
+        b"test" => "test",
+        b"compile" => "compile",
+        b"toString" => "toString",
+        b"match" => "match",
+        b"matchAll" => "matchAll",
+        b"replace" => "replace",
+        b"search" => "search",
+        b"split" => "split",
+        _ => return None,
+    })
 }

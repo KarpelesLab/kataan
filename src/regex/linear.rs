@@ -116,9 +116,9 @@ pub(crate) struct Linear {
     slots: usize,
     /// What a match must begin with, to skip offsets that cannot start one.
     first: First,
-    /// `(A, B)` when the one branch opens with `A B* x` (captures aside) and
-    /// the literal `x` is outside `B`; see [`Linear::find`].
-    lead_run: Option<(usize, usize)>,
+    /// `(A, B, x)` when the one branch opens with `A B* x` (captures aside)
+    /// and the literal `x` is outside `B`; see [`Linear::find`].
+    lead_run: Option<(usize, usize, u16)>,
 }
 
 /// The unit every match begins with.
@@ -377,7 +377,7 @@ impl Linear {
                         },
                         Step::Unit(x),
                         ..,
-                    ] if !sets[*b].has(u32::from(*x), prog, flags) => Some((*a, *b)),
+                    ] if !sets[*b].has(u32::from(*x), prog, flags) => Some((*a, *b, *x)),
                     _ => None,
                 }
             }
@@ -448,6 +448,9 @@ impl Linear {
         // Only offsets in `start..=last` (and inside the subject, except for
         // the empty match at its end) are candidates.
         let end = last.saturating_add(1).min(units.len());
+        if !U && let Some(lead) = self.lead_run {
+            return self.find_lead_run(ctx, lead, start, last, saves, stack);
+        }
         let mut s = start;
         while s <= last {
             match self.first {
@@ -455,7 +458,7 @@ impl Linear {
                     if s >= end {
                         return None;
                     }
-                    s += units[s..end].iter().position(|&x| x == u)?;
+                    s += find_unit(&units[s..end], u)?;
                 }
                 First::Set(k) => {
                     if s >= end {
@@ -480,27 +483,59 @@ impl Linear {
                     Outcome::NoMatch => {}
                 }
             }
-            // A failed attempt at the head of an `A B+ x …` run fails at every
-            // later start inside the same run of `B` units too: from any of
-            // them, `A` either fails or `B*` stops where the run ends (`x` is
-            // outside `B`, so it can only be matched there), leaving the rest
-            // of the attempt exactly as it was. Skip to the end of the run.
-            if let Some((a, b)) = self.lead_run
-                && units
-                    .get(s)
-                    .is_some_and(|&u| self.sets[a].has(u32::from(u), prog, flags))
-            {
-                s += 1;
-                let b = &self.sets[b];
-                while units
-                    .get(s)
-                    .is_some_and(|&u| b.has(u32::from(u), prog, flags))
-                {
-                    s += 1;
-                }
-                continue;
-            }
             s += if U { char_len(units, s) } else { 1 };
+        }
+        None
+    }
+
+    /// [`find_on`](Self::find_on) outside `u` mode for a pattern that opens
+    /// with `A B* x` (`x` outside `B`): every match holds `x` right after its
+    /// opening run, so the scan looks for the next `x` and only then for the
+    /// run in front of it, instead of starting an attempt at every unit of `A`.
+    ///
+    /// With `q` the first `x` after the scan position `s`, a start `p` can
+    /// reach `x` only if `units[p]` is in `A` and every unit strictly between
+    /// `p` and `q` is in `B`: `B*` cannot stop early (the steps after it begin
+    /// with `x`, which is not in `B`), and from any `p` whose run of `B` ends
+    /// before `q` the unit there is not `x`. So the candidates are the units of
+    /// `A` among `r - 1 ..= q - 1`, where `r..q` is the run of `B` before `q`,
+    /// and the leftmost one is the only one worth an attempt: a failed attempt
+    /// from it fails from every later start up to `q` too (they all see the
+    /// same steps from `q` on). The candidates come in increasing order, so the
+    /// first match found is the leftmost, as in [`find_on`](Self::find_on).
+    fn find_lead_run(
+        &self,
+        ctx: &Run,
+        (a, b, x): (usize, usize, u16),
+        start: usize,
+        last: usize,
+        saves: &mut [usize],
+        stack: &mut [Choice],
+    ) -> Option<()> {
+        let (units, prog, flags) = (ctx.units, ctx.prog, ctx.flags);
+        let (a, b) = (&self.sets[a], &self.sets[b]);
+        let len = units.len();
+        let mut s = start;
+        while s <= last && s < len {
+            // The next `x` that a start at `s` or later could reach.
+            let q = s + 1 + find_unit(units.get(s + 1..)?, x)?;
+            let mut r = q;
+            while r > s + 1 && b.has(u32::from(units[r - 1]), prog, flags) {
+                r -= 1;
+            }
+            let Some(p) = (r - 1..q).find(|&p| a.has(u32::from(units[p]), prog, flags)) else {
+                s = q;
+                continue;
+            };
+            if p > last {
+                return None;
+            }
+            match self.run_on::<false>(ctx, &self.branches[0], p, saves, stack) {
+                Outcome::Match => return Some(()),
+                Outcome::Abort => return None,
+                Outcome::NoMatch => {}
+            }
+            s = q.max(p + 1);
         }
         None
     }
@@ -691,6 +726,32 @@ impl Linear {
             }
         }
     }
+}
+
+/// The index of the first `x` in `hay`: the same answer as
+/// `hay.iter().position(|&u| u == x)`, four units per step. Each group of four
+/// is packed into a word and XORed with `x` in every lane, so a matching lane
+/// becomes zero; the classic "has a zero lane" test (`(w - 1s) & !w & highs`)
+/// then flags the group, and the exact lane is found by plain comparison.
+#[inline]
+pub(super) fn find_unit(hay: &[u16], x: u16) -> Option<usize> {
+    const ONES: u64 = 0x0001_0001_0001_0001;
+    const HIGHS: u64 = 0x8000_8000_8000_8000;
+    let pat = ONES.wrapping_mul(u64::from(x));
+    let (chunks, rest) = hay.as_chunks::<4>();
+    for (i, c) in chunks.iter().enumerate() {
+        let w = (u64::from(c[0])
+            | u64::from(c[1]) << 16
+            | u64::from(c[2]) << 32
+            | u64::from(c[3]) << 48)
+            ^ pat;
+        if w.wrapping_sub(ONES) & !w & HIGHS != 0 {
+            return c.iter().position(|&u| u == x).map(|k| i * 4 + k);
+        }
+    }
+    rest.iter()
+        .position(|&u| u == x)
+        .map(|k| chunks.len() * 4 + k)
 }
 
 /// The per-find context of [`Linear::run_on`].

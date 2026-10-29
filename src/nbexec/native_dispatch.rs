@@ -466,6 +466,13 @@ impl Interp {
                     let s = self.realm.to_display_string(arg(0));
                     return Ok(NanBox::handle(self.realm.new_string(&s).to_raw()));
                 }
+                // `ToString` of a Number runs no code: a small integer shares
+                // its rope (a digit is the interned one-unit string).
+                if arg(0).as_number().is_some() {
+                    return Ok(NanBox::handle(
+                        self.realm.new_primitive_string(arg(0)).to_raw(),
+                    ));
+                }
                 // Otherwise run the value through ToString (string hint), honoring a
                 // custom/inherited `toString`/`valueOf`/`@@toPrimitive`.
                 // (As WTF-8, so a lone surrogate survives.)

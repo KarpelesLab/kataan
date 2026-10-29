@@ -119,6 +119,58 @@ impl Realm {
         self.set_property(handle, key, value);
     }
 
+    /// A fresh array holding `elems` whose named own properties are `keys`
+    /// (plain data properties, added in that order) with `values` — what
+    /// `new_array` followed by [`init_aux_data_cached`](Self::init_aux_data_cached)
+    /// of each key leaves. Once `cache` has seen the auxiliary object's
+    /// layout, later arrays get theirs in one step: the object is created
+    /// with that shape and its slots already filled, rather than walking the
+    /// transitions one key at a time.
+    pub fn new_array_with_named(
+        &mut self,
+        elems: alloc::vec::Vec<NanBox>,
+        keys: &[&str],
+        values: &[NanBox],
+        cache: &mut AuxShapeCache,
+    ) -> Handle {
+        let arr = self.new_array(elems);
+        if let Some((root, shape)) = &cache.0
+            && Rc::ptr_eq(root, &self.root_shape)
+            && values.len() <= self.limits.object_dictionary_threshold
+            && let Some(mut obj) = crate::object::Object::with_inline_data(Rc::clone(shape), values)
+        {
+            // As `new_object` would: the default `[[Prototype]]`, shaded for
+            // an incremental cycle, then each stored value through the
+            // barrier as `init_data_property_cached` would.
+            let proto = self.default_object_proto;
+            obj.set_proto(proto);
+            let aux = self.heap.alloc(Cell::Object(obj));
+            if let (Some(p), Some(marker)) = (proto, self.incremental.as_mut()) {
+                marker.mark_grey(p);
+            }
+            for v in values {
+                self.write_barrier(aux, *v);
+            }
+            self.cell_link_changed(arr);
+            self.aux_props.insert(arr.to_raw(), aux);
+            self.mark_array_side_state(arr);
+            return arr;
+        }
+        let mut ic = crate::ic::PropertyCache::default();
+        for (k, v) in keys.iter().zip(values) {
+            self.init_aux_data_cached(arr, k, *v, &mut ic);
+        }
+        if let Some(&aux) = self.aux_props.get(&arr.to_raw())
+            && let Some(Cell::Object(o)) = self.heap.get(aux)
+            && o.is_plain_inline_shaped()
+            && o.len() as usize == values.len()
+            && o.proto() == self.default_object_proto
+        {
+            cache.0 = Some((Rc::clone(&self.root_shape), Rc::clone(o.shape())));
+        }
+        arr
+    }
+
     /// For a string cell, the UTF-16 code unit at index `i` (`None` when `i` is
     /// `None` or out of range); `None` for any other cell. In-order reads of a
     /// non-ASCII string stay linear (see [`Realm::string_unit_at_seq`]).
@@ -1111,3 +1163,8 @@ fn push_wtf8_joined(buf: &mut alloc::vec::Vec<u8>, piece: &[u8]) {
         buf.extend_from_slice(piece);
     }
 }
+
+/// The layout memo of [`Realm::new_array_with_named`]: the root shape it was
+/// derived from, and the shape the auxiliary object reaches from it.
+#[derive(Default)]
+pub struct AuxShapeCache(Option<(Rc<Shape>, Rc<Shape>)>);

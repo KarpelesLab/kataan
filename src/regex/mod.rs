@@ -566,7 +566,7 @@ impl Regex {
                 if s >= end {
                     return None;
                 }
-                s += units[s..end].iter().position(|&u| u == want)?;
+                s += linear::find_unit(&units[s..end], want)?;
                 // In `u` mode a match can only begin on a character boundary, so a
                 // hit in the middle of a surrogate pair is not a candidate — step
                 // over it and look for the next occurrence.

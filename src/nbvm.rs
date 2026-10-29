@@ -1014,6 +1014,20 @@ pub trait VmHost {
     /// # Errors
     /// The callee's throw (a `TypeError` for a non-callable), or a host fault.
     fn call(&mut self, callee: NanBox, this: NanBox, args: &[NanBox]) -> Result<NanBox, HostError>;
+    /// [`call`](Self::call) of `method`, which a call site has proven to be
+    /// the intrinsic `RegExp.prototype.exec` or `.test`, on the RegExp `this`
+    /// — a host may serve it without the general call's dispatch.
+    ///
+    /// # Errors
+    /// As [`call`](Self::call).
+    fn call_regexp_method(
+        &mut self,
+        method: NanBox,
+        this: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, HostError> {
+        self.call(method, this, args)
+    }
     /// `new ctor(...args)` with the host's `[[Construct]]`.
     ///
     /// # Errors
