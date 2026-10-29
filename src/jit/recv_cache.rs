@@ -208,6 +208,16 @@ pub(super) struct SitePlan {
     /// (no compare: see [`plan`]). Outside it (the loop's plain copy) the
     /// site checks.
     pub(super) known: bool,
+    /// For a [`known`](Self::known) site: the earlier `SetProp` of the same
+    /// iteration on the same receiver whose fast path (all of whose
+    /// continuations passed its flags-byte test, the others leaving for the
+    /// loop's plain copy) this site follows with no Rust code in between —
+    /// so the receiver's flags byte still passes that test.
+    pub(super) flags_from: Option<usize>,
+    /// For a [`known`](Self::known) site: the earlier site of the same
+    /// iteration on the same receiver it follows (with no Rust code in
+    /// between, and no other value in the way).
+    pub(super) pred: Option<usize>,
 }
 
 /// A body's receiver-cache plan: the ways it uses and each op's site plan.
@@ -624,6 +634,8 @@ pub(super) fn plan(
             check: check[i],
             fill: true,
             known: false,
+            flags_from: None,
+            pred: None,
         });
     }
     // A site is known when its predecessor of the iteration used the same
@@ -635,12 +647,19 @@ pub(super) fn plan(
         let same_way = sites[p].is_some_and(|sp| sp.way == si.way);
         let undisturbed = (p + 1..i)
             .all(|q| sites[q].is_none_or(|sq| sq.way != si.way || site_id[q] == site_id[i]));
+        let flags_from = if matches!(ops[p], GenericOp::SetProp { .. }) {
+            Some(p)
+        } else {
+            sites[p].and_then(|sp| sp.flags_from)
+        };
         if same_way
             && undisturbed
             && site_id[p] == site_id[i]
             && let Some(x) = sites[i].as_mut()
         {
             x.known = true;
+            x.flags_from = flags_from;
+            x.pred = Some(p);
         }
     }
     let ways = obj_ways + arr_ways + cell_ways;

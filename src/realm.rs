@@ -1298,6 +1298,8 @@ impl Realm {
                 free_len: heap + h.free_len,
                 live: heap + h.live,
                 allocs_since_gc: heap + h.allocs_since_gc,
+                pool_ptr: heap + h.pool_ptr,
+                pool_len: heap + h.pool_len,
             },
             core::mem::offset_of!(Realm, root_shape),
             core::mem::offset_of!(Realm, jit_default_proto),
@@ -5148,6 +5150,13 @@ impl Realm {
     /// inline property-get fast path (`jit_arena` helper). Re-read on every
     /// fast-path entry so a reallocated arena is always addressed at its current
     /// base; the length is the raw slot count (the handle-index bound).
+    /// The heap's `extra`-part pool's data pointer and length, for the
+    /// layout test.
+    #[cfg(all(test, feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn jit_extra_pool_raw(&self) -> (usize, usize) {
+        self.heap.extra_pool_raw()
+    }
+
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     #[must_use]
     pub(crate) fn jit_arena_slots(&self) -> (*const u8, usize) {

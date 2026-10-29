@@ -254,6 +254,10 @@ pub(crate) struct HeapAllocOffsets {
     pub live: usize,
     /// `allocs_since_gc`.
     pub allocs_since_gc: usize,
+    /// The `extra`-part pool's (`Heap::extra_pool`) data pointer.
+    pub pool_ptr: usize,
+    /// The `extra`-part pool's length.
+    pub pool_len: usize,
 }
 
 /// The [`HeapAllocOffsets`], probed (a `Vec`'s word order is unspecified).
@@ -267,25 +271,32 @@ pub(crate) fn jit_heap_alloc_offsets() -> HeapAllocOffsets {
     let vec = core::ptr::addr_of!(v) as usize;
     let word = core::mem::size_of::<usize>();
     let mut ptr_off = usize::MAX;
+    let mut len_off = usize::MAX;
     for i in 0..core::mem::size_of::<Vec<u32>>() / word {
         // SAFETY: the i-th word of the live `Vec`, in bounds.
         #[allow(unsafe_code)]
         let w = unsafe { *((vec + i * word) as *const usize) };
         if w == v.as_ptr() as usize {
             ptr_off = i * word;
+        } else if w == 1 {
+            len_off = i * word;
         }
     }
     assert!(
-        ptr_off != usize::MAX,
+        ptr_off != usize::MAX && len_off != usize::MAX,
         "could not derive the heap's free-list Vec offsets"
     );
     let field = core::mem::offset_of!(Heap<Cell>, free);
+    let pool = core::mem::offset_of!(Heap<Cell>, extra_pool);
+    let (pool_ptr, pool_len) = crate::object::ExtraPool::jit_offsets(ptr_off, len_off);
     HeapAllocOffsets {
         free_ptr: field + ptr_off,
         // The allocation cursor, not the `Vec`'s length (see `Heap::free_top`).
         free_len: core::mem::offset_of!(Heap<Cell>, free_top),
         live: core::mem::offset_of!(Heap<Cell>, live),
         allocs_since_gc: core::mem::offset_of!(Heap<Cell>, allocs_since_gc),
+        pool_ptr: pool + pool_ptr,
+        pool_len: pool + pool_len,
     }
 }
 
@@ -335,6 +346,9 @@ pub struct Heap<T> {
     /// `KATAAN_GC_VERIFY=panic`, aborts). `None` (the default) in every ordinary
     /// build/run, so the extra check is a single null test on a cold field.
     poison: Option<alloc::boxed::Box<PoisonState>>,
+    /// Swept objects' reusable `extra` parts (see
+    /// [`ExtraPool`](crate::object::ExtraPool)), refilled by the sweeps.
+    extra_pool: crate::object::ExtraPool,
 }
 
 /// The bookkeeping behind [`Heap`]'s GC-verification mode (see `Heap::poison`).
@@ -369,6 +383,7 @@ impl<T> Heap<T> {
             remembered: Vec::new(),
             allocs_since_gc: 0,
             poison: None,
+            extra_pool: crate::object::ExtraPool::default(),
         }
     }
 
@@ -448,6 +463,12 @@ impl<T> Heap<T> {
     /// [`len`](Heap::len) which counts only live slots). Both are re-read on every
     /// fast-path entry because [`alloc`](Heap::alloc)'s `push` may reallocate the
     /// `Vec`; the JIT never caches this across a call.
+    /// The `extra`-part pool's data pointer and length, for the layout test.
+    #[cfg(all(test, feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn extra_pool_raw(&self) -> (usize, usize) {
+        self.extra_pool.raw_parts()
+    }
+
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     #[must_use]
     pub(crate) fn slots_raw(&self) -> (*const u8, usize) {
@@ -673,6 +694,7 @@ impl<T> Heap<T> {
             remembered,
             live,
             poison,
+            extra_pool,
             ..
         } = self;
         // Every slot is visited below, so the record of which ones were
@@ -711,7 +733,7 @@ impl<T> Heap<T> {
             // retired rather than reused.
             let next_gen = slot.generation.wrapping_add(1);
             if let Some(v) = slot.vacate(next_gen) {
-                v.release();
+                v.release(extra_pool);
             }
             if next_gen < COMPACT_GEN_BASE {
                 free.push(i as u32);
@@ -791,6 +813,7 @@ impl<T> Heap<T> {
             remembered,
             live,
             poison,
+            extra_pool,
             ..
         } = self;
         for index in rescanned {
@@ -822,7 +845,16 @@ impl<T> Heap<T> {
                 let i_us = i as usize;
                 let slot = &mut slots[i_us];
                 let p = poison.as_deref_mut();
-                if settle_young(slot, i_us, &sticky, remembered, &mut swept, &mut live_n, p) {
+                if settle_young(
+                    slot,
+                    i_us,
+                    &sticky,
+                    remembered,
+                    &mut swept,
+                    &mut live_n,
+                    p,
+                    extra_pool,
+                ) {
                     free[kept] = i;
                     kept += 1;
                 }
@@ -832,7 +864,16 @@ impl<T> Heap<T> {
         // The slots pushed since.
         for (i, slot) in slots.iter_mut().enumerate().skip(floor) {
             let p = poison.as_deref_mut();
-            if settle_young(slot, i, &sticky, remembered, &mut swept, &mut live_n, p) {
+            if settle_young(
+                slot,
+                i,
+                &sticky,
+                remembered,
+                &mut swept,
+                &mut live_n,
+                p,
+                extra_pool,
+            ) {
                 free.push(i as u32);
             }
         }
@@ -1063,6 +1104,7 @@ fn settle_young<T: crate::gc::Trace>(
     swept: &mut usize,
     live: &mut usize,
     poison: Option<&mut PoisonState>,
+    pool: &mut crate::object::ExtraPool,
 ) -> bool {
     let Some(value) = &slot.value else {
         return false;
@@ -1087,7 +1129,7 @@ fn settle_young<T: crate::gc::Trace>(
     *live -= 1;
     let next_gen = slot.generation.wrapping_add(1);
     if let Some(v) = slot.vacate(next_gen) {
-        v.release();
+        v.release(pool);
     }
     next_gen < COMPACT_GEN_BASE
 }

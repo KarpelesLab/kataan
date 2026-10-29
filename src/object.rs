@@ -410,15 +410,102 @@ fn drop_extra(extra: Box<ObjectExtra>) {
     drop(extra);
 }
 
+impl ObjectExtra {
+    /// Whether this part, once its spill count and class tag are reset,
+    /// is exactly a fresh one owning no memory but itself: no dictionary,
+    /// no attribute-mark, accessor or key-order storage, no far spill.
+    fn recyclable(&self) -> bool {
+        self.dict.is_none()
+            && self.key_order.is_none()
+            && self.spill.far.capacity() == 0
+            && self.readonly.capacity() == 0
+            && self.accessors.capacity() == 0
+            && self.hidden.capacity() == 0
+            && self.non_configurable.capacity() == 0
+    }
+}
+
+/// Emptied `extra` parts of swept objects, kept for reuse so that an object
+/// growing past its inline slots does not pay an allocation (nor its death a
+/// free). Every part here reads as `ObjectExtra::default()` does: nothing
+/// recorded, no spilled value (the near spill's stale words are past the
+/// count, so never read or traced), owning no memory but itself. Compiled
+/// code's inline property add pops one for an object's first spilled slot
+/// (see `ExtraPool::jit_offsets`); the collector's sweep refills it.
+#[derive(Default)]
+pub struct ExtraPool {
+    // Boxed: compiled code moves a part's pointer straight into an object's
+    // `extra` field (an `Option<Box<ObjectExtra>>`).
+    #[allow(clippy::vec_box)]
+    boxes: Vec<Box<ObjectExtra>>,
+}
+
+impl core::fmt::Debug for ExtraPool {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ExtraPool")
+            .field("len", &self.boxes.len())
+            .finish()
+    }
+}
+
+impl ExtraPool {
+    /// The most parts kept.
+    pub const CAP: usize = 16_384;
+
+    /// The number of parts kept.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.boxes.len()
+    }
+
+    /// Whether no part is kept.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.boxes.is_empty()
+    }
+
+    /// Keeps a dying object's `extra` part when it can be reset to a fresh
+    /// one in place (and there is room); drops it otherwise. Out of line,
+    /// so the sweep's common case (no `extra` part) stays small.
+    #[inline(never)]
+    fn give(&mut self, mut x: Box<ObjectExtra>) {
+        if self.boxes.len() < Self::CAP && x.recyclable() {
+            x.spill.n = 0;
+            x.class_tag = None;
+            self.boxes.push(x);
+        } else {
+            drop_extra(x);
+        }
+    }
+
+    /// Byte offsets, within an `ExtraPool`, of its `Vec`'s data pointer and
+    /// length, for compiled code's inline pop: `(ptr, len)`. `vec_ptr_off`
+    /// and `vec_len_off` are a `Vec`'s probed word offsets
+    /// ([`ObjectLayout`]), the same whatever its element type.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_offsets(vec_ptr_off: usize, vec_len_off: usize) -> (usize, usize) {
+        let f = core::mem::offset_of!(ExtraPool, boxes);
+        (f + vec_ptr_off, f + vec_len_off)
+    }
+
+    /// The pool's `Vec` data pointer and length, for the layout test.
+    #[cfg(all(test, feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn raw_parts(&self) -> (usize, usize) {
+        (self.boxes.as_ptr() as usize, self.boxes.len())
+    }
+}
+
 impl Object {
     /// Drops the object, the way the collector's sweep does it: the common
-    /// case (no `extra` part) is one shape-count decrement, inline.
-    #[inline]
-    pub(crate) fn release(self) {
+    /// case (no `extra` part) is one shape-count decrement, inline; an
+    /// `extra` part goes back to `pool` when it can.
+    #[inline(always)]
+    pub(crate) fn release(self, pool: &mut ExtraPool) {
         let Self { shape, extra, .. } = self;
         drop(shape);
         if let Some(x) = extra {
-            drop_extra(x);
+            pool.give(x);
         }
     }
 

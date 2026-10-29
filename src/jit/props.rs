@@ -103,6 +103,12 @@ pub(crate) struct PropsLayout {
     pub heap_live: i32,
     /// See `free_ptr`.
     pub heap_allocs: i32,
+    /// `Realm`-relative offsets of the heap's `extra`-part pool's data
+    /// pointer and length (`crate::object::ExtraPool`; an inline add's
+    /// first spilled slot, `p_add_commit`).
+    pub pool_ptr: i32,
+    /// See `pool_ptr`.
+    pub pool_len: i32,
     /// `Realm`-relative offset of `jit_array_proto_default` (`bool`): inline
     /// array allocation requires it set (`p_alloc_array`).
     pub array_proto_default: i32,
@@ -136,6 +142,8 @@ impl PropsLayout {
             free_len: i(alloc.free_len),
             heap_live: i(alloc.live),
             heap_allocs: i(alloc.allocs_since_gc),
+            pool_ptr: i(alloc.pool_ptr),
+            pool_len: i(alloc.pool_len),
             array_proto_default: i(crate::realm::Realm::jit_array_proto_default_offset()),
             root_shape: i(root_shape),
             shape_parent,
@@ -259,6 +267,40 @@ const FLAGS_NO_ADD: u8 = crate::object::OBJ_FLAG_SEALED | crate::object::OBJ_FLA
 /// The first slot index in an object's far spill array (the slots before it
 /// are inline, or in its `extra` part's near spill).
 const FAR_FROM: i32 = (crate::object::INLINE_SLOTS + crate::object::SPILL_NEAR) as i32;
+
+/// An add site's transition compiled into its code
+/// ([`X64Assembler::p_add_baked`]): an object whose shape word is `from`
+/// gains the site's key as slot `slot` (inline or in the near spill) and
+/// takes the shape whose word is `to` — facts of those immutable shapes,
+/// which the owning `JitProto` keeps alive (`to` holds `from`, its parent).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BakedAdd {
+    /// The shape word of the objects the add applies to.
+    pub from: u64,
+    /// The shape word of the result.
+    pub to: u64,
+    /// The new value's slot (`from`'s length).
+    pub slot: u32,
+}
+
+impl BakedAdd {
+    /// The add `to`'s last key makes, when it can be compiled in: `to` has a
+    /// parent, of which it is exactly one slot longer, and that slot is
+    /// inline or in the near spill.
+    pub(crate) fn of(to: &Rc<Shape>, slot: u32) -> Option<Self> {
+        let from = to.parent()?;
+        let ok = from.len() == slot
+            && to.len() == slot + 1
+            && slot < FAR_FROM as u32
+            && !to.is_wrapper()
+            && !from.is_wrapper();
+        ok.then(|| Self {
+            from: shape_word(from),
+            to: shape_word(to),
+            slot,
+        })
+    }
+}
 
 /// Where a slot whose index is known at compile time lives, relative to the
 /// object's heap slot in `rcx`.
@@ -1022,7 +1064,7 @@ impl X64Assembler {
         self.p_barrier_check(l, realm_off, miss);
         // Commit, and count the hit.
         self.g_movabs(r::R11, cache);
-        self.p_add_commit(l, cache_shape, val_disp);
+        self.p_add_commit(l, realm_off, cache_shape, val_disp);
         self.p_inc32_mem(r::R11, l.cache_hits_off);
     }
 
@@ -1106,10 +1148,12 @@ impl X64Assembler {
     /// The add guards an object's own data-property definitions can change
     /// (on the shaped object whose heap slot is `rcx`), leaving its slot count
     /// in `rax`: below the dictionary threshold, and either no `extra` part
-    /// and room for one more value inline, or an `extra` part recording no
-    /// accessor, attribute mark or key-order log (only spilled values, and
-    /// perhaps a class tag) and room for one more value inline or in its near
-    /// spill. Else to `miss`. Clobbers `rax`, `r8`, `r9`.
+    /// and room for one more value inline (or its inline slots just full and
+    /// a part in the heap's pool for [`Self::p_add_commit`] to take), or an
+    /// `extra` part recording no accessor, attribute mark or key-order log
+    /// (only spilled values, and perhaps a class tag) and room for one more
+    /// value inline or in its near spill. Else to `miss`. Clobbers `rax`,
+    /// `r8`, `r9`.
     fn p_add_room(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
         const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
         let inline = self.new_label();
@@ -1118,27 +1162,40 @@ impl X64Assembler {
         self.g_load(r::R9, r::RCX, l.props.off_extra);
         self.g_test(r::R9);
         self.g_jcc(cc::E, inline);
-        // What `Object::is_plain_data_slot_or_absent` and the cached add
-        // check by key: none of it recorded at all.
         let p = &l.props;
-        for off in [p.extra_acc_len, p.extra_key_order]
-            .into_iter()
-            .chain(p.extra_marks_len)
-        {
-            self.g_load(r::R8, r::R9, off);
-            self.g_test(r::R8);
-            self.g_jcc(cc::NE, miss);
-        }
+        self.p_extra_plain(l, miss);
         self.p_cmp32_imm(r::RAX, FAR_FROM);
         self.g_jcc(cc::AE, miss);
         self.jmp(room);
         self.bind(inline);
         self.p_cmp32_imm(r::RAX, INLINE);
-        self.g_jcc(cc::AE, miss);
+        self.g_jcc(cc::B, room);
+        self.g_jcc(cc::NE, miss);
+        // The inline slots are full: the value starts the near spill, in a
+        // pooled `extra` part.
+        self.g_load(r::R8, r::R15, realm_off);
+        self.g_load(r::R9, r::R8, p.pool_len);
+        self.g_test(r::R9);
+        self.g_jcc(cc::E, miss);
         self.bind(room);
         self.g_load(r::R8, r::R15, realm_off);
         self.g_cmp_mem(r::RAX, r::R8, l.props.dict_threshold);
         self.g_jcc(cc::AE, miss);
+    }
+
+    /// For the `extra` part in `r9`: to `miss` unless it records no
+    /// accessor, attribute mark or key-order log (what
+    /// `Object::is_plain_data_slot_or_absent` and the cached add check by
+    /// key: none of it recorded at all). Clobbers `r8`.
+    fn p_extra_plain(&mut self, l: &JitLayout, miss: Label) {
+        let p = &l.props;
+        // (Each word is a length or a pointer: zero exactly when empty.)
+        self.g_load(r::R8, r::R9, p.extra_acc_len);
+        for off in core::iter::once(p.extra_key_order).chain(p.extra_marks_len) {
+            self.g_or_mem(r::R8, r::R9, off);
+        }
+        self.g_test(r::R8);
+        self.g_jcc(cc::NE, miss);
     }
 
     /// The commit of an inline property add to the object whose heap slot is
@@ -1147,16 +1204,32 @@ impl X64Assembler {
     /// child keeps alive) with the value at `[rbx + val_disp]` in its next
     /// slot, inline or in the near spill (whose count goes up too): the
     /// value, the count, the shape (one strong count moved from the old shape
-    /// to the new) and the key epoch. Clobbers `rax`, `r8`, `r9`.
-    fn p_add_commit(&mut self, l: &JitLayout, to_disp: i32, val_disp: i32) {
+    /// to the new) and the key epoch. An object without an `extra` part
+    /// (`p_add_room` saw the pool non-empty) first takes the pool's last
+    /// one — a fresh part, as `Object::extra_mut` would make. Clobbers
+    /// `rax`, `r8`, `r9`.
+    fn p_add_commit(&mut self, l: &JitLayout, realm_off: i32, to_disp: i32, val_disp: i32) {
         const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
         let put = self.new_label();
+        let have = self.new_label();
+        let p = &l.props;
         self.p_load16(r::RAX, r::RCX, l.off_slots_len);
         self.p_lea_index8(r::R9, r::RCX, r::RAX, l.off_inline);
         self.p_cmp32_imm(r::RAX, INLINE);
         self.g_jcc(cc::B, put);
-        // A near-spill slot: `p_add_room` saw the `extra` part.
-        self.g_load(r::R9, r::RCX, l.props.off_extra);
+        // A near-spill slot: `p_add_room` saw the `extra` part, or a
+        // non-empty pool to take one from.
+        self.g_load(r::R9, r::RCX, p.off_extra);
+        self.g_test(r::R9);
+        self.g_jcc(cc::NE, have);
+        self.g_load(r::R8, r::R15, realm_off);
+        self.g_load(r::R9, r::R8, p.pool_len);
+        self.code.extend_from_slice(&[0x49, 0xff, 0xc9]); // dec r9
+        self.g_store(r::R8, p.pool_len, r::R9);
+        self.g_load(r::R8, r::R8, p.pool_ptr);
+        self.p_load_index8(r::R9, r::R8, r::R9, 0);
+        self.g_store(r::RCX, p.off_extra, r::R9);
+        self.bind(have);
         self.p_inc32_mem(r::R9, l.props.extra_spill_n);
         self.p_lea_index8(r::R9, r::R9, r::RAX, l.extra_near - 8 * INLINE);
         self.bind(put);
@@ -1208,15 +1281,11 @@ impl X64Assembler {
         miss: Label,
         walked: bool,
     ) {
-        use core::mem::{offset_of, size_of};
+        use core::mem::offset_of;
         let i = |v: usize| i32::try_from(v).expect("site offset fits in i32");
         let add = offset_of!(MethodSite, add);
-        let level = |d: usize, f: usize| {
-            i(add + offset_of!(AddEntry, levels) + d * size_of::<ChainLevel>() + f)
-        };
         let from = i(add + offset_of!(AddEntry, from));
         let to = i(add + offset_of!(AddEntry, to));
-        let depth = i(add + offset_of!(AddEntry, depth));
         self.g_movabs(r::R11, site as u64);
         if walked {
             self.p_test_byte_imm(r::RCX, l.props.off_jit_flags, FLAGS_NO_ADD);
@@ -1231,6 +1300,129 @@ impl X64Assembler {
         self.g_cmp_mem(r::R9, r::RCX, l.off_shape);
         self.g_jcc(cc::NE, miss);
         // (`to` is set whenever `from` is: `fill_add` stores both.)
+        self.p_add_chain(l, miss);
+        self.g_load(r::RAX, r::RBX, val_disp);
+        self.p_barrier_check(l, realm_off, miss);
+        self.g_movabs(r::R11, site as u64);
+        self.p_add_commit(l, realm_off, to, val_disp);
+    }
+
+    /// An add site's transition **compiled in** (`b`, see [`BakedAdd`]), for
+    /// the walked ordinary shaped object whose heap slot is `rcx` and the
+    /// value at `[rbx + val_disp]`: the object's whole flags byte is zero, its
+    /// shape is `b.from` (which fixes its slot count, so where the new value
+    /// goes), its `extra` part (when it has one) records only spilled values,
+    /// a part is at hand when the value starts the near spill, the count is
+    /// below the dictionary threshold, the site's add entry vouches for the
+    /// prototype chain ([`Self::p_add_chain`]) and the store needs nothing
+    /// from the write barrier. Then the add is made, as
+    /// [`Self::p_add_commit`] would make it; otherwise to `miss` (`rcx`
+    /// kept) or, when the write barrier would need doing, to
+    /// `barrier_miss` (`rcx` clobbered), having changed nothing. Clobbers
+    /// `rax`, `rdx`, `rsi`, `r8`–`r11`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn p_add_baked(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        site: *const MethodSite,
+        b: BakedAdd,
+        val_disp: i32,
+        miss: Label,
+        barrier_miss: Label,
+    ) {
+        const INLINE: u32 = crate::object::INLINE_SLOTS as u32;
+        debug_assert!(
+            b.slot < FAR_FROM as u32,
+            "a baked add's slot is inline or near"
+        );
+        let p = &l.props;
+        let slot = i32::try_from(b.slot).expect("a small slot");
+        self.cmp_byte_at_rcx_imm(p.off_jit_flags, 0);
+        self.jne(miss);
+        self.g_movabs(r::R11, b.from);
+        self.g_cmp_mem(r::R11, r::RCX, l.off_shape);
+        self.g_jcc(cc::NE, miss);
+        // The `extra` part.
+        let plain = self.new_label();
+        self.g_load(r::R9, r::RCX, p.off_extra);
+        self.g_test(r::R9);
+        if b.slot > INLINE {
+            // (A shape this long has its spilled values in one.)
+            self.g_jcc(cc::E, miss);
+        } else {
+            self.g_jcc(cc::E, plain);
+        }
+        self.p_extra_plain(l, miss);
+        if b.slot == INLINE {
+            let have = self.new_label();
+            self.jmp(have);
+            self.bind(plain);
+            // None yet: the pool must have one.
+            self.g_load(r::R8, r::R15, realm_off);
+            self.g_load(r::R8, r::R8, p.pool_len);
+            self.g_test(r::R8);
+            self.g_jcc(cc::E, miss);
+            self.bind(have);
+        } else {
+            self.bind(plain);
+        }
+        // Below the dictionary threshold.
+        self.g_load(r::R8, r::R15, realm_off);
+        self.g_load(r::R8, r::R8, p.dict_threshold);
+        self.g_cmp_imm(r::R8, slot);
+        self.g_jcc(cc::BE, miss);
+        self.g_movabs(r::R11, site as u64);
+        self.p_add_chain(l, miss);
+        self.g_load(r::RAX, r::RBX, val_disp);
+        self.p_barrier_check(l, realm_off, barrier_miss);
+        // Commit: the value, the count, the shape, the key epoch.
+        self.g_load(r::R8, r::RBX, val_disp);
+        if b.slot < INLINE {
+            self.g_store(r::RCX, l.off_inline + 8 * slot, r::R8);
+        } else {
+            self.g_load(r::R9, r::RCX, p.off_extra);
+            if b.slot == INLINE {
+                let have = self.new_label();
+                self.g_test(r::R9);
+                self.g_jcc(cc::NE, have);
+                // Take the pool's last part (`Object::extra_mut`'s fresh one).
+                self.g_load(r::R10, r::R15, realm_off);
+                self.g_load(r::R9, r::R10, p.pool_len);
+                self.code.extend_from_slice(&[0x49, 0xff, 0xc9]); // dec r9
+                self.g_store(r::R10, p.pool_len, r::R9);
+                self.g_load(r::R10, r::R10, p.pool_ptr);
+                self.p_load_index8(r::R9, r::R10, r::R9, 0);
+                self.g_store(r::RCX, p.off_extra, r::R9);
+                self.bind(have);
+            }
+            self.p_inc32_mem(r::R9, p.extra_spill_n);
+            self.g_store(r::R9, l.extra_near + 8 * (slot - INLINE as i32), r::R8);
+        }
+        self.p_inc16_mem(r::RCX, l.off_slots_len);
+        self.g_movabs(r::R9, b.to);
+        self.g_inc_mem(r::R9, p.rc_strong);
+        self.g_movabs(r::R8, b.from);
+        self.g_dec_mem(r::R8, p.rc_strong);
+        self.g_store(r::RCX, l.off_shape, r::R9);
+        self.p_inc32_mem(r::RCX, p.off_epoch);
+    }
+
+    /// The prototype-chain half of [`MethodSite`]'s add-cache hit
+    /// ([`Self::p_add_prop_inline`]) for the object whose heap slot is `rcx`,
+    /// with `r11` = the site: each of the entry's `depth` prototype levels is
+    /// still the recorded one (while the prototype epoch is the entry's
+    /// stamp, only the receiver's link needs checking), and the chain ends
+    /// there. Else to `miss`. Keeps `rcx` and `r11`; clobbers `rax`, `rsi`,
+    /// `r8`, `r9`.
+    fn p_add_chain(&mut self, l: &JitLayout, miss: Label) {
+        use core::mem::{offset_of, size_of};
+        let i = |v: usize| i32::try_from(v).expect("site offset fits in i32");
+        let add = offset_of!(MethodSite, add);
+        let level = |d: usize, f: usize| {
+            i(add + offset_of!(AddEntry, levels) + d * size_of::<ChainLevel>() + f)
+        };
+        let depth = i(add + offset_of!(AddEntry, depth));
         // The prototype chain, receiver's `[[Prototype]]` first.
         self.g_mov(r::RSI, r::RCX);
         let end = self.new_label();
@@ -1257,10 +1449,6 @@ impl X64Assembler {
         self.g_jcc(cc::NE, miss);
         self.bind(chain_ok);
         self.g_mov(r::RCX, r::RSI);
-        self.g_load(r::RAX, r::RBX, val_disp);
-        self.p_barrier_check(l, realm_off, miss);
-        self.g_movabs(r::R11, site as u64);
-        self.p_add_commit(l, to, val_disp);
     }
 
     /// `inc dword [base+disp32]` (`base` neither `rsp` nor `r12`).
@@ -1363,6 +1551,47 @@ impl X64Assembler {
                 self.g_load(r::R11, r::RCX, l.props.off_extra);
                 self.g_load(r::R11, r::R11, l.extra_far_ptr);
                 self.g_store(r::R11, disp, r::RDX);
+            }
+        }
+    }
+
+    /// [`p_obj_fixed_slot_load`](Self::p_obj_fixed_slot_load) /
+    /// [`p_obj_fixed_slot_store`](Self::p_obj_fixed_slot_store) (`store`:
+    /// `= rdx`) through a frame slot (`[rbp + ex]`) caching the object's
+    /// `extra` pointer: a near-spill slot takes the pointer from the frame
+    /// when `have` (it is this object's, unchanged since it was stored
+    /// there), else loads it and stores it there. Returns whether the frame
+    /// slot then holds the object's `extra` pointer. Clobbers `r11`.
+    pub(crate) fn p_obj_fixed_slot_ex(
+        &mut self,
+        l: &JitLayout,
+        slot: u32,
+        store: bool,
+        ex: i32,
+        have: bool,
+    ) -> bool {
+        match Self::fixed_slot(l, slot) {
+            FixedSlot::Near(disp) => {
+                if have {
+                    self.g_load(r::R11, r::RBP, ex);
+                } else {
+                    self.g_load(r::R11, r::RCX, l.props.off_extra);
+                    self.g_store(r::RBP, ex, r::R11);
+                }
+                if store {
+                    self.g_store(r::R11, disp, r::RDX);
+                } else {
+                    self.g_load(r::RAX, r::R11, disp);
+                }
+                true
+            }
+            _ => {
+                if store {
+                    self.p_obj_fixed_slot_store(l, slot);
+                } else {
+                    self.p_obj_fixed_slot_load(l, slot);
+                }
+                have
             }
         }
     }
@@ -2286,6 +2515,16 @@ mod tests {
         let arr = realm.new_array(alloc::vec![NanBox::number(1.0)]);
         let farr = realm.new_array(alloc::vec![NanBox::number(1.0)]);
         realm.freeze_object(farr);
+        // Objects past their inline slots, swept: their `extra` parts pooled.
+        for _ in 0..3 {
+            let big = realm.new_object();
+            for k in ["a", "b", "c", "d", "e", "f"] {
+                realm.set_property(big, k, NanBox::number(1.0));
+            }
+        }
+        realm.collect(&[p, o, w, f, arr, farr]);
+        let pool = realm.jit_extra_pool_raw();
+        assert!(pool.1 >= 3, "swept parts are pooled");
         let (base, len) = realm.jit_arena_slots();
         let rp = core::ptr::addr_of!(realm).cast::<u8>();
         // SAFETY: reads at probed offsets inside the live realm, its heap's slot
@@ -2294,6 +2533,8 @@ mod tests {
             let at = |off: i32| rp.add(usize::try_from(off).unwrap());
             assert_eq!(*at(l.heap_ptr).cast::<*const u8>(), base);
             assert_eq!(*at(l.heap_len).cast::<usize>(), len);
+            assert_eq!(*at(l.pool_ptr).cast::<usize>(), pool.0);
+            assert_eq!(*at(l.pool_len).cast::<usize>(), pool.1);
             let slot = |h: Handle| {
                 let i = usize::try_from(h.to_raw() & 0xffff_ffff).unwrap();
                 base.add(i * usize::try_from(jl.slot_stride).unwrap())

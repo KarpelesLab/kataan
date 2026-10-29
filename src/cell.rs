@@ -1221,9 +1221,9 @@ impl Trace for Cell {
     /// arrays and closures release their one or two owned parts inline; the
     /// rest take the full drop glue, out of line.
     #[inline(always)]
-    fn release(self) {
+    fn release(self, pool: &mut crate::object::ExtraPool) {
         match self {
-            Cell::Object(o) => o.release(),
+            Cell::Object(o) => o.release(pool),
             Cell::Array(a) => drop(a),
             Cell::VmFunction { captures, .. } => drop(captures),
             Cell::Str(s) => drop(s),

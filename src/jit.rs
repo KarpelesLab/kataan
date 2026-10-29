@@ -3245,6 +3245,9 @@ pub struct SiteInfo {
     /// The site's compiled-in layout, for a site that was monomorphic while
     /// interpreted.
     baked: Option<Baked>,
+    /// For a write site that was a monomorphic add while interpreted: that
+    /// add, compiled in (its shapes kept alive by the owning `JitProto`).
+    add: Option<props::BakedAdd>,
 }
 
 /// A property site's layout compiled into its code: a receiver whose shape
@@ -3553,6 +3556,7 @@ impl JitProto {
         // The interpreter's memos: every `GetProp`/`SetProp` site starts warm,
         // and a stable one is compiled in (its shape kept alive by `baked`).
         let mut baked_at: Vec<Option<Baked>> = alloc::vec![None; keys.len()];
+        let mut add_at: Vec<Option<props::BakedAdd>> = alloc::vec![None; keys.len()];
         let mut baked: Vec<alloc::rc::Rc<crate::shape::Shape>> = Vec::new();
         let mut tier_baked: Vec<Option<(alloc::rc::Rc<crate::shape::Shape>, u32)>> =
             alloc::vec![None; keys.len()];
@@ -3580,6 +3584,16 @@ impl JitProto {
                 });
                 baked.push(alloc::rc::Rc::clone(&w.shape));
                 tier_baked[site] = Some((alloc::rc::Rc::clone(&w.shape), w.slot));
+            } else if write
+                && w.by_add
+                && w.hits >= 4
+                && let Some(b) = props::BakedAdd::of(&w.shape, w.slot)
+            {
+                // An add site also counts a miss per add (its in-place
+                // lookup), so its transition's hits alone say it settled.
+                // (`w.shape` holds its parent, the add's `from`.)
+                add_at[site] = Some(b);
+                baked.push(alloc::rc::Rc::clone(&w.shape));
             }
         }
         // A chain cache for each method-call and property-write site.
@@ -3618,6 +3632,7 @@ impl JitProto {
                 cache_ptr: c.get().cast::<core::ffi::c_void>(),
                 method_ptr: m.as_ref().map_or(core::ptr::null_mut(), |m| m.get()),
                 baked: None,
+                add: None,
             })
             .collect();
         let tier_up = tierup::TierUp::plan(&ops, tier_baked);
@@ -3637,8 +3652,12 @@ impl JitProto {
             .collect();
         let site_info: Vec<SiteInfo> = site_info
             .into_iter()
-            .zip(baked_at)
-            .map(|(si, b)| SiteInfo { baked: b, ..si })
+            .zip(baked_at.into_iter().zip(add_at))
+            .map(|(si, (b, add))| SiteInfo {
+                baked: b,
+                add,
+                ..si
+            })
             .collect();
         // Loop headers: the targets of backward branches.
         let mut osr_entries: Vec<usize> = ops
@@ -4015,7 +4034,48 @@ pub struct X64Assembler {
         allow(dead_code)
     )]
     inline_clear: Vec<i32>,
+    /// Out-of-line code moved off the hot path ([`cold_end`](Self::cold_end)),
+    /// placed after everything else by [`finish`](Self::finish).
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    cold: Vec<ColdChunk>,
+    /// While a cold region is open: the labels bound since it began.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    cold_binds: Option<Vec<usize>>,
 }
+
+/// A run of code [`X64Assembler::cold_end`] cut out of the main stream: its
+/// bytes, the labels bound in it and the jump fixups in it (both at offsets
+/// relative to the chunk's start).
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+struct ColdChunk {
+    code: Vec<u8>,
+    labels: Vec<(usize, usize)>,
+    fixups: Vec<(usize, usize)>,
+}
+
+/// Where a cold region began ([`X64Assembler::cold_begin`]).
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+pub(crate) struct ColdMark {
+    start: usize,
+    fixups: usize,
+    last_bind: usize,
+}
+
+/// [`X64Assembler::labels`]' entry for a label bound in a cold chunk that
+/// [`X64Assembler::finish`] has not placed yet.
+const LABEL_COLD: usize = usize::MAX - 1;
 
 /// The value a receiver-cache key slot holds when it caches nothing: the
 /// handle bits of slot index `u32::MAX`, which `Heap::alloc` never hands out,
@@ -4143,12 +4203,27 @@ impl X64Assembler {
         }
         self.labels[label.0] = self.code.len();
         self.last_bind = self.code.len();
+        if let Some(b) = self.cold_binds.as_mut() {
+            b.push(label.0);
+        }
     }
 
     /// Resolves every recorded `rel32` jump fixup; call once after emission.
     /// Returns the finished machine code.
     #[must_use]
     pub fn finish(mut self) -> Vec<u8> {
+        // The cold chunks, after everything else (they are position
+        // independent: every jump is a `rel32` fixup).
+        for chunk in core::mem::take(&mut self.cold) {
+            let base = self.code.len();
+            self.code.extend_from_slice(&chunk.code);
+            for (label, at) in chunk.labels {
+                self.labels[label] = base + at;
+            }
+            for (at, label) in chunk.fixups {
+                self.fixups.push((base + at, label));
+            }
+        }
         for (at, label) in core::mem::take(&mut self.fixups) {
             let target = self.labels[label];
             debug_assert_ne!(target, usize::MAX, "unbound label in jump");
@@ -4158,6 +4233,85 @@ impl X64Assembler {
             self.code[at..at + 4].copy_from_slice(&bytes);
         }
         self.code
+    }
+
+    /// Starts a **cold region**: the code emitted from here to the matching
+    /// [`cold_end`](Self::cold_end) is moved out of the main stream, after
+    /// all of it (see [`finish`](Self::finish)), so the hot path around it
+    /// runs straight through. The code just before must not fall through
+    /// into the region (an unconditional jump or a return), and the region's
+    /// own last instruction must not fall through out of it; its code is
+    /// entered only by jumps to the labels bound in it. Labels bound at the
+    /// region's end belong to the code after it.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn cold_begin(&mut self) -> ColdMark {
+        let start = self.code.len();
+        let mark = ColdMark {
+            start,
+            fixups: self.fixups.len(),
+            last_bind: self.last_bind,
+        };
+        // No `bind` in the region may drop the jump just before it (which
+        // would then fall through to whatever follows the region).
+        self.last_bind = start;
+        debug_assert!(self.cold_binds.is_none(), "cold regions do not nest");
+        self.cold_binds = Some(Vec::new());
+        mark
+    }
+
+    /// Ends the cold region `mark` began (see [`cold_begin`](Self::cold_begin)).
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn cold_end(&mut self, mark: ColdMark) {
+        let (start, end) = (mark.start, self.code.len());
+        let code = self.code.split_off(start);
+        // A label bound in the region, or just before it (at its first
+        // instruction), moves with it — unless bound at its end.
+        let mut bound = self.cold_binds.take().unwrap_or_default();
+        if mark.last_bind == start {
+            for (i, &l) in self.labels.iter().enumerate() {
+                if l == start {
+                    bound.push(i);
+                }
+            }
+        }
+        let mut labels = Vec::new();
+        let mut at_start = false;
+        for i in bound {
+            let l = &mut self.labels[i];
+            if *l >= start && *l < end {
+                labels.push((i, *l - start));
+                *l = LABEL_COLD;
+            } else if *l == end {
+                *l = start;
+                at_start = true;
+            }
+        }
+        let fixups = self
+            .fixups
+            .split_off(mark.fixups)
+            .into_iter()
+            .map(|(at, label)| (at - start, label))
+            .collect();
+        // The region's end is now `start`: a label bound there keeps a
+        // `bind` from dropping the jump before it.
+        self.last_bind = if at_start {
+            start
+        } else if mark.last_bind < start {
+            mark.last_bind
+        } else {
+            usize::MAX
+        };
+        self.cold.push(ColdChunk {
+            code,
+            labels,
+            fixups,
+        });
     }
 
     /// Emits a `rel32` jump operand placeholder targeting `label`.
@@ -5921,15 +6075,18 @@ impl JitFunction {
         // The `InitProp`s of a fresh literal (`recv_cache::fresh_inits`).
         let fresh_init = recv_cache::fresh_inits(ops, bytecode, osr_entries, &catch_targets);
         let rc_base = method_scratch - 8 * num.frame_slots() as i32;
-        let rc_key = |w: usize| rc_base - 8 * (2 * w as i32 + 1);
-        let rc_cell = |w: usize| rc_base - 8 * (2 * w as i32 + 2);
+        let rc_key = |w: usize| rc_base - 8 * (3 * w as i32 + 1);
+        let rc_cell = |w: usize| rc_base - 8 * (3 * w as i32 + 2);
+        // Per way, its receiver's `extra` part pointer, as a speculative
+        // loop's site last loaded it (see `extra_in_frame`).
+        let rc_extra = |w: usize| rc_base - 8 * (3 * w as i32 + 3);
         // The global binding cache, under the receiver cache: slot `k` holds
         // the address `jit_helper_global_ref` validated for its name (a read
         // or a write binding). Unlike the receiver keys it stays filled
         // across calls, guarded by the global binding epoch it was validated
         // under (`gc_epoch`, one for all slots: a changed epoch empties them
         // all, as does a `catch` entry). The prologue empties both.
-        let gc_base = rc_base - 16 * rc.ways as i32;
+        let gc_base = rc_base - 24 * rc.ways as i32;
         let gc_slot = |k: usize| gc_base - 8 * (k as i32 + 1);
         let gc_epoch = gc_base - 8 * (gc_plan.slots as i32 + 1);
         let gc_frame_slots = if gc_plan.slots > 0 {
@@ -5989,7 +6146,7 @@ impl JitFunction {
         let frame = ((16
             + max_argc as u32 * 8
             + (num.frame_slots()
-                + 2 * rc.ways
+                + 3 * rc.ways
                 + gc_frame_slots
                 + 3 * math_sites.len()
                 + 4 * usize::from(has_inline)) as u32
@@ -6360,6 +6517,19 @@ impl JitFunction {
         // The shape compares a layout-proving way's hit skips: (entry, a
         // write's store-guard miss, layout, mismatch, resume).
         let mut cold_verifies: Vec<(Label, Option<Label>, u64, Label, Label)> = Vec::new();
+        // Per op: a `SetProp` in a speculative loop's fast version, every
+        // continuation of whose fast path passed its flags-byte test (its
+        // slow paths leave for the plain copy), so a later site of the
+        // iteration on the same receiver (`recv_cache::SitePlan::flags_from`)
+        // needs no such test.
+        let mut set_proven = alloc::vec![false; ops.len()];
+        // Per op: a site of a speculative loop's fast version after whose
+        // fast path its way's `rc_extra` slot holds its receiver's `extra`
+        // pointer (an inline add, which alone could change it without Rust
+        // code, leaves that version), so a later known site on the receiver
+        // (`recv_cache::SitePlan::pred`) reads its near spill one load
+        // sooner.
+        let mut extra_in_frame = alloc::vec![false; ops.len()];
         #[allow(clippy::type_complexity)]
         let mut cold_gets: Vec<(
             Label,
@@ -7468,7 +7638,19 @@ impl JitFunction {
                             a.cmp_rax_r11();
                             a.jne(cached);
                         }
-                        a.p_obj_fixed_slot_load(&layout, b.slot);
+                        match rc.sites[op_idx].filter(|_| num.in_spec(op_idx)) {
+                            Some(p) => {
+                                let have = p.known && p.pred.is_some_and(|q| extra_in_frame[q]);
+                                extra_in_frame[op_idx] = a.p_obj_fixed_slot_ex(
+                                    &layout,
+                                    b.slot,
+                                    false,
+                                    rc_extra(p.way),
+                                    have,
+                                );
+                            }
+                            None => a.p_obj_fixed_slot_load(&layout, b.slot),
+                        }
                         let x = num.result_xmm(op_idx, dst);
                         let spill = x.map(|_| a.new_label());
                         // (In a speculative loop's fast version another
@@ -7568,18 +7750,55 @@ impl JitFunction {
                     // (a known site's way must keep proving it).
                     let bail = num.spec_bail(&mut a, op_idx);
                     recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj, verify);
+                    // A site the interpreter saw add one key to one layout
+                    // tries that add first, compiled in, and has everything
+                    // else out of line (in a speculative loop's fast version
+                    // an add leaves for the plain copy instead).
+                    let mut cold_add = None;
+                    if let Some(b) = s.add
+                        && bail.is_none()
+                        && s.baked.is_none()
+                        && !s.method_ptr.is_null()
+                    {
+                        let try_store = a.new_label();
+                        a.p_add_baked(
+                            &layout,
+                            helpers.call_layout.realm,
+                            s.method_ptr,
+                            b,
+                            disp(val),
+                            try_store,
+                            helper,
+                        );
+                        a.jmp(done);
+                        cold_add = Some(a.cold_begin());
+                        a.bind(try_store);
+                    }
                     // A frozen object's writes need the helper, as do those of
                     // a host-exotic, global or tracked-prototype object, and of
                     // an object with a non-writable property
                     // (`JIT_FLAG_READONLY`). (A watched object's existing data
                     // properties are plain stores: a value is no part of the
-                    // layout its watchers validate.)
-                    a.p_test_byte_imm(
-                        call_seq::r::RCX,
-                        layout.props.off_jit_flags,
-                        props::FLAGS_NO_INLINE_STORE,
-                    );
-                    a.jne(helper);
+                    // layout its watchers validate.) Only Rust code changes
+                    // the flags byte, so a receiver an earlier store of the
+                    // iteration tested with none run since passes again.
+                    let in_spec_region = num.in_region(op_idx) && bail.is_some();
+                    let flags_proven = in_spec_region
+                        && rc.sites[op_idx]
+                            .filter(|p| p.known)
+                            .and_then(|p| p.flags_from)
+                            .is_some_and(|p| set_proven.get(p).copied().unwrap_or(false));
+                    if !flags_proven {
+                        a.p_test_byte_imm(
+                            call_seq::r::RCX,
+                            layout.props.off_jit_flags,
+                            props::FLAGS_NO_INLINE_STORE,
+                        );
+                        a.jne(helper);
+                    }
+                    if in_spec_region {
+                        set_proven[op_idx] = true;
+                    }
                     if known.is_none() {
                         a.mov_rax_at_rcx(layout.off_shape);
                     }
@@ -7587,6 +7806,10 @@ impl JitFunction {
                     // (every other path may have added a property, and ends
                     // at `done`, which empties the layout-proving ways).
                     let stored = a.new_label();
+                    // With a compiled-in layout, everything but its in-place
+                    // store is out of line (a cold region), so that store
+                    // runs straight on into the next op.
+                    let mut cold = None;
                     if let Some(b) = s.baked {
                         // The layout the site settled on, compiled in (never
                         // a primitive wrapper's): a compare with the shape and
@@ -7607,8 +7830,21 @@ impl JitFunction {
                             a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
                         }
                         a.load_rdx(disp(val));
-                        a.p_obj_fixed_slot_store(&layout, b.slot);
+                        match rc.sites[op_idx].filter(|_| in_spec_region) {
+                            Some(p) => {
+                                let have = p.known && p.pred.is_some_and(|q| extra_in_frame[q]);
+                                extra_in_frame[op_idx] = a.p_obj_fixed_slot_ex(
+                                    &layout,
+                                    b.slot,
+                                    true,
+                                    rc_extra(p.way),
+                                    have,
+                                );
+                            }
+                            None => a.p_obj_fixed_slot_store(&layout, b.slot),
+                        }
                         a.jmp(stored);
+                        cold = Some(a.cold_begin());
                         a.bind(cached);
                         // Another layout in a way that proves this one: empty
                         // it (and the others: it may be an add) — also before
@@ -7701,10 +7937,18 @@ impl JitFunction {
                     a.movabs_rax(set_site_helper as i64);
                     a.call_rax();
                     throw_check!();
+                    if let Some(mark) = cold_add {
+                        a.jmp(done);
+                        a.cold_end(mark);
+                    }
                     a.bind(done);
                     // Maybe an add: to an object a layout-proving way holds.
                     for &w in &shape_ways {
                         a.store_empty(rc_key(w));
+                    }
+                    if let Some(mark) = cold {
+                        a.jmp(stored);
+                        a.cold_end(mark);
                     }
                     a.bind(stored);
                 }
@@ -8849,6 +9093,33 @@ mod tests {
         } else {
             assert!(!available(), "compile only fails when JIT is unavailable");
         }
+    }
+
+    /// A cold region moves after the rest of the code, its labels and jumps
+    /// relocated, and the hot jump over it is dropped.
+    #[test]
+    fn assembler_cold_region_moves_out_of_line() {
+        let mut a = X64Assembler::new();
+        let cold = a.new_label();
+        let after = a.new_label();
+        a.je(cold); // 0..6
+        a.jmp(after); // dropped by `bind(after)` once the region is out
+        let m = a.cold_begin();
+        a.bind(cold);
+        a.zero_rax();
+        a.jmp(after);
+        a.cold_end(m);
+        a.bind(after);
+        a.ret(); // 6
+        let code = a.finish();
+        // [je cold][ret] then the region [xor rax, rax][jmp after].
+        assert_eq!(code.len(), 6 + 1 + 3 + 5);
+        assert_eq!(&code[0..2], &[0x0f, 0x84]);
+        assert_eq!(i32::from_le_bytes(code[2..6].try_into().unwrap()), 1);
+        assert_eq!(code[6], 0xc3);
+        assert_eq!(&code[7..10], &[0x48, 0x31, 0xc0]);
+        assert_eq!(code[10], 0xe9);
+        assert_eq!(i32::from_le_bytes(code[11..15].try_into().unwrap()), 6 - 15);
     }
 
     #[test]

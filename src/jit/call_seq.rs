@@ -531,6 +531,11 @@ impl X64Assembler {
         self.g_mem(true, &[0x03], reg, base, disp);
     }
 
+    /// `or reg, [base+disp]` (64-bit).
+    pub(crate) fn g_or_mem(&mut self, reg: u8, base: u8, disp: i32) {
+        self.g_mem(true, &[0x0b], reg, base, disp);
+    }
+
     /// `lea reg, [base+disp]`.
     pub(crate) fn g_lea(&mut self, reg: u8, base: u8, disp: i32) {
         self.g_mem(true, &[0x8d], reg, base, disp);

@@ -58,11 +58,12 @@ pub trait Trace {
 
     /// Drops a swept object. The default is plain `drop`; an implementation
     /// may special-case its common shapes so the sweep's per-object cost is not
-    /// the full drop glue.
-    fn release(self)
+    /// the full drop glue, and hand reusable parts to the heap's `pool`.
+    fn release(self, pool: &mut crate::object::ExtraPool)
     where
         Self: Sized,
     {
+        let _ = pool;
         drop(self);
     }
 }
