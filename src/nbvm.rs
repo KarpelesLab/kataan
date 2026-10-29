@@ -1842,7 +1842,8 @@ fn vm_set_prop_mode(
             if matches!(
                 ctx.realm.chain_cached_get(h, key, cache),
                 Some(crate::realm::ChainHit::Absent)
-            ) {
+            ) && !typed_proto_numeric_key(&ctx.realm, h, key)
+            {
                 // A fresh writable/enumerable/configurable data property is
                 // the same whether made by [[Set]] or CreateDataProperty, so
                 // the add can go through the site's transition cache (which
@@ -1883,6 +1884,11 @@ fn vm_set_prop_mode(
         || recv
             .as_handle()
             .is_some_and(|h| !plain_write_ok(&ctx.realm, Handle::from_raw(h), key))
+        // A canonical numeric key that a typed array on the prototype chain
+        // answers (its integer-indexed `[[Set]]`).
+        || recv
+            .as_handle()
+            .is_some_and(|h| typed_proto_numeric_key(&ctx.realm, Handle::from_raw(h), key))
         // Replacing a method of %Array.prototype% / %Function.prototype% must be
         // recorded (the host's by-name built-in dispatch consults it).
         || recv
@@ -1980,12 +1986,40 @@ fn vm_set_elem_mode(
     host_set(ctx, recv, key, value, strict)
 }
 
+/// Whether `key` may be a canonical numeric string that a typed array on
+/// `h`'s prototype chain answers through its integer-indexed `[[Set]]` (an
+/// out-of-bounds index there is a dropped write, not a new own property).
+fn typed_proto_numeric_key(realm: &Realm, h: Handle, key: &str) -> bool {
+    if !key
+        .as_bytes()
+        .first()
+        .is_some_and(|b| b.is_ascii_digit() || matches!(b, b'-' | b'I' | b'N'))
+        || key.parse::<f64>().is_err()
+    {
+        return false;
+    }
+    let mut cur = realm.object_proto(h);
+    while let Some(c) = cur {
+        if realm.typed_kind(c).is_some() || realm.proxy_at(c).is_some() {
+            return true;
+        }
+        cur = realm.object_proto(c);
+    }
+    false
+}
+
 /// Whether an object on `h`'s prototype chain (not `h` itself) has an own
 /// property `key`, or the chain holds a proxy.
 fn proto_owns_key(realm: &Realm, h: Handle, key: &str) -> bool {
     let mut cur = realm.object_proto(h);
     while let Some(c) = cur {
-        if realm.proxy_at(c).is_some() || realm.has_own(c, key) || realm.accessor(c, key).is_some()
+        // A typed array answers every canonical numeric key itself (an
+        // out-of-bounds one included: its `[[Set]]` drops the write), so the
+        // host's integer-indexed `[[Set]]` must see it.
+        if realm.proxy_at(c).is_some()
+            || realm.has_own(c, key)
+            || realm.accessor(c, key).is_some()
+            || (realm.typed_kind(c).is_some() && key.parse::<f64>().is_ok())
         {
             return true;
         }

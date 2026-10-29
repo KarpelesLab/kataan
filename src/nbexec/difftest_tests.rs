@@ -1428,3 +1428,21 @@ fn typed_array_delete_of_an_element_fails() {
     "#;
     assert_eq!(run(src), "false,false,true,true,true");
 }
+
+/// A write that reaches a typed array on the prototype chain with a
+/// canonical numeric key is that typed array's integer-indexed `[[Set]]`:
+/// an out-of-bounds (or `-0`, fractional) index is a dropped write, and only
+/// a valid index creates an own data property on the receiver. The VM's
+/// property-add fast paths created the own property for every such key.
+#[test]
+fn writes_through_a_typed_array_prototype_honour_its_set() {
+    let src = r#"
+        var a = new Uint8Array(2);
+        function keysAfter(f) { var o = Object.create(a); f(o); return Object.keys(o).join("+"); }
+        var k = "5";
+        [keysAfter(o => { o[5] = 1; }), keysAfter(o => { o["5"] = 1; }), keysAfter(o => { o[k] = 1; }),
+         keysAfter(o => { o["-0"] = 1; }), keysAfter(o => { o[1.5] = 1; }), keysAfter(o => { o[1] = 1; }),
+         keysAfter(o => { o.x = 1; }), String(a[1])].join()
+    "#;
+    assert_eq!(run(src), ",,,,,1,x,0");
+}
