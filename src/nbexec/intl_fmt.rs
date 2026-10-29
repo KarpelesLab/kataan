@@ -5736,11 +5736,48 @@ impl Interp {
             // mantissa 1.5, exponent 6), which some locales' `many` rules depend on
             // (fr: `e ∉ 0..5 → many`). Encode it via the crate's `<mantissa>c<exp>`
             // operand syntax; standard notation uses the plain decimal.
-            let ops = match plural_notation_operand_string(n, &notation) {
-                Some(s) => intl::plural::PluralOperands::parse(&s)
+            // Standard notation (ResolvePlural): the operands are those of
+            // FormatNumericToString(n) under the instance's digit options, so
+            // `minimumFractionDigits: 1` makes 1 read as "1.0" (`other` in
+            // English) and the default `maximumFractionDigits: 3` rounds
+            // 1.0001 to "1" (`one`).
+            let formatted = fmt
+                .filter(|_| notation == "standard")
+                .map(|h| {
+                    let mut o = self.number_format_options(h);
+                    // roundingPriority more/lessPrecision: keep whichever digit
+                    // set rounds at the finer (coarser) magnitude, per the
+                    // significant (`e - mxsd + 1`) vs fraction (`-mxfd`) positions.
+                    let prio = self
+                        .realm
+                        .get_property(h, "roundingPriority")
+                        .map(|v| self.realm.to_display_string(v));
+                    if let Some(p) = prio.filter(|p| p == "morePrecision" || p == "lessPrecision") {
+                        let a = n.abs();
+                        let e = if a == 0.0 { 0 } else { decimal_magnitude(a) };
+                        let s_mag = e - i32::from(o.maximum_significant_digits.unwrap_or(21)) + 1;
+                        let f_mag = -i32::from(o.maximum_fraction_digits.unwrap_or(3));
+                        if (s_mag <= f_mag) == (p == "morePrecision") {
+                            o.minimum_fraction_digits = None;
+                            o.maximum_fraction_digits = None;
+                        } else {
+                            o.minimum_significant_digits = None;
+                            o.maximum_significant_digits = None;
+                        }
+                    }
+                    o.use_grouping = intl::number::UseGrouping::Never;
+                    o.sign_display = intl::number::SignDisplay::Never;
+                    intl::number::format("en", n.abs(), &o)
+                })
+                .and_then(|s| intl::plural::PluralOperands::parse(&s));
+            let ops = match (formatted, plural_notation_operand_string(n, &notation)) {
+                (Some(ops), _) => ops,
+                (None, Some(s)) => intl::plural::PluralOperands::parse(&s)
                     .unwrap_or_else(|| intl::plural::PluralOperands::from_int(n as i64)),
-                None if n == (n as i64) as f64 => intl::plural::PluralOperands::from_int(n as i64),
-                None => intl::plural::PluralOperands::parse(&alloc::format!("{n}"))
+                (None, None) if n == (n as i64) as f64 => {
+                    intl::plural::PluralOperands::from_int(n as i64)
+                }
+                (None, None) => intl::plural::PluralOperands::parse(&alloc::format!("{n}"))
                     .unwrap_or_else(|| intl::plural::PluralOperands::from_int(n as i64)),
             };
             let cat = if ordinal {

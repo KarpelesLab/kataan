@@ -1003,3 +1003,25 @@ fn scientific_negative_zero_is_zero() {
         "-0E0|-0E0|-0.00E0|0E0|minusSign:- integer:0 exponentSeparator:E exponentInteger:0"
     );
 }
+
+/// `Intl.PluralRules#select` takes its operands from the number *formatted*
+/// under the instance's digit options (ResolvePlural): `1` with
+/// `minimumFractionDigits: 1` is "1.0" (`other`), `1.4` with
+/// `maximumSignificantDigits: 1` is "1" (`one`), the default three fraction
+/// digits round `1.0001` to "1", and `roundingPriority` picks between the two
+/// digit sets. The raw value was used.
+#[cfg(feature = "intl")]
+#[test]
+fn plural_rules_select_uses_formatted_operands() {
+    let src = r#"
+        function s(loc, o, n) { return new Intl.PluralRules(loc, o).select(n); }
+        [s("en", { minimumFractionDigits: 1 }, 1), s("en", { maximumSignificantDigits: 1 }, 1.4),
+         s("en", { maximumFractionDigits: 0 }, 1.4), s("en", {}, 1.0001), s("en", {}, -1),
+         s("ru", { minimumFractionDigits: 1 }, 2), s("ru", {}, 2),
+         s("en", { type: "ordinal", minimumFractionDigits: 1 }, 2),
+         s("en", { maximumSignificantDigits: 2, roundingPriority: "lessPrecision", maximumFractionDigits: 0 }, 1.4),
+         s("en", { maximumSignificantDigits: 1, roundingPriority: "morePrecision", maximumFractionDigits: 1 }, 1.04),
+         s("fr", { notation: "compact" }, 1500000)].join()
+    "#;
+    assert_eq!(run(src), "other,one,one,one,one,other,few,two,one,one,many");
+}
