@@ -1986,10 +1986,29 @@ fn vm_set_elem_mode(
     host_set(ctx, recv, key, value, strict)
 }
 
-/// Whether `key` may be a canonical numeric string that a typed array on
-/// `h`'s prototype chain answers through its integer-indexed `[[Set]]` (an
-/// out-of-bounds index there is a dropped write, not a new own property).
+/// Whether a String wrapper is on `h`'s prototype chain: it owns `length`
+/// and its index keys (StringGetOwnProperty), which are not stored
+/// properties, so a read or write of those keys through it is the host's.
+fn proto_has_string_wrapper(realm: &Realm, h: Handle) -> bool {
+    let mut cur = realm.object_proto(h);
+    for _ in 0..10_000 {
+        let Some(c) = cur else { return false };
+        if realm.string_object_len(c).is_some() {
+            return true;
+        }
+        cur = realm.object_proto(c);
+    }
+    false
+}
+
+/// Whether a write of `key` reaches an exotic object on `h`'s prototype
+/// chain that answers it itself: a typed array's integer-indexed `[[Set]]`
+/// for a numeric key (an out-of-bounds index there is a dropped write, not a
+/// new own property), or a String wrapper's read-only `length` / indices.
 fn typed_proto_numeric_key(realm: &Realm, h: Handle, key: &str) -> bool {
+    if key == "length" {
+        return proto_has_string_wrapper(realm, h);
+    }
     if !key
         .as_bytes()
         .first()
@@ -2000,7 +2019,10 @@ fn typed_proto_numeric_key(realm: &Realm, h: Handle, key: &str) -> bool {
     }
     let mut cur = realm.object_proto(h);
     while let Some(c) = cur {
-        if realm.typed_kind(c).is_some() || realm.proxy_at(c).is_some() {
+        if realm.typed_kind(c).is_some()
+            || realm.proxy_at(c).is_some()
+            || realm.string_object_len(c).is_some()
+        {
             return true;
         }
         cur = realm.object_proto(c);
@@ -5556,7 +5578,10 @@ fn vm_get_prop(
             && (recv
                 .as_handle()
                 .is_some_and(|h| ctx.realm.array_elements(Handle::from_raw(h)).is_some())
-                || is_string_wrapper(&ctx.realm, recv)))
+                || is_string_wrapper(&ctx.realm, recv)
+                || recv
+                    .as_handle()
+                    .is_some_and(|h| proto_has_string_wrapper(&ctx.realm, Handle::from_raw(h)))))
     {
         return host_get_str(ctx, recv, key);
     }

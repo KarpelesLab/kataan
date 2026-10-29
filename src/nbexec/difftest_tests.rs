@@ -1446,3 +1446,23 @@ fn writes_through_a_typed_array_prototype_honour_its_set() {
     "#;
     assert_eq!(run(src), ",,,,,1,x,0");
 }
+
+/// A String wrapper on the prototype chain owns `length` and its index keys
+/// (StringGetOwnProperty): `Object.create(new String("ab"))[0]` is "a" and
+/// `.length` is 2, and since those properties are read-only, assigning them
+/// through the child fails instead of creating own properties. The reads saw
+/// `undefined` and the writes created own `length` / index properties.
+#[test]
+fn string_wrapper_prototype_exposes_its_length_and_indices() {
+    let src = r#"
+        var s = new String("ab");
+        var o = Object.create(s);
+        var r = [o[0], o["1"], o.length, Reflect.get(o, "0")];
+        o.length = 9; o[1] = "z"; var k = "0"; o[k] = "y";
+        var strict;
+        try { (function () { "use strict"; Object.create(s).length = 9; })(); strict = "no error"; }
+        catch (e) { strict = e.constructor.name; }
+        r.concat([Object.keys(o).length, o.length, o[1], strict]).join()
+    "#;
+    assert_eq!(run(src), "a,b,2,a,0,2,b,TypeError");
+}

@@ -2119,6 +2119,24 @@ impl Interp {
                     return Ok(NanBox::number(len as f64));
                 }
             }
+            // A String wrapper on the chain owns its `length` and in-range
+            // index properties (StringGetOwnProperty), which live in its boxed
+            // string rather than among its stored properties.
+            if let Some(prim) = self.realm.get_property(p, PRIM_WRAP)
+                && let Some(ph) = prim.as_handle().map(Handle::from_raw)
+                && self.realm.is_string_handle(ph)
+            {
+                if name == "length" {
+                    let len = self.realm.string_utf16_len(ph).unwrap_or(0);
+                    return Ok(NanBox::number(len as f64));
+                }
+                if let Ok(i) = name.parse::<usize>()
+                    && (name == "0" || !name.starts_with(['0', '+']))
+                    && let Some(u) = self.realm.string_unit_at_seq(ph, i)
+                {
+                    return Ok(NanBox::handle(self.realm.unit_string(u).to_raw()));
+                }
+            }
             if self.realm.has_own(p, name) {
                 return Ok(self
                     .realm
