@@ -137,7 +137,7 @@ impl Realm {
         if let Some((root, shape)) = &cache.0
             && Rc::ptr_eq(root, &self.root_shape)
             && values.len() <= self.limits.object_dictionary_threshold
-            && let Some(mut obj) = crate::object::Object::with_inline_data(Rc::clone(shape), values)
+            && let Some(mut obj) = crate::object::Object::with_data(Rc::clone(shape), values)
         {
             // As `new_object` would: the default `[[Prototype]]`, shaded for
             // an incremental cycle, then each stored value through the
@@ -162,7 +162,7 @@ impl Realm {
         }
         if let Some(&aux) = self.aux_props.get(&arr.to_raw())
             && let Some(Cell::Object(o)) = self.heap.get(aux)
-            && o.is_plain_inline_shaped()
+            && o.is_plain_shaped()
             && o.len() as usize == values.len()
             && o.proto() == self.default_object_proto
         {
@@ -189,7 +189,7 @@ impl Realm {
         {
             return None;
         }
-        let mut obj = crate::object::Object::with_inline_data(Rc::clone(shape), values)?;
+        let mut obj = crate::object::Object::with_data(Rc::clone(shape), values)?;
         // As `new_object` would: the default `[[Prototype]]`, shaded for an
         // incremental cycle, then each stored value through the barrier as
         // `init_data_property_cached` would.

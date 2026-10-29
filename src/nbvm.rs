@@ -26166,8 +26166,13 @@ mod generic_jit_tests {
                         );
                     }
                     let extra = *(slot.add(layout.props.off_extra as usize) as *const *const u8);
-                    let spill = *(extra.add(layout.extra_spill_ptr as usize) as *const *const u64);
-                    Some(*spill.add(sslot - inline))
+                    let near = crate::object::SPILL_NEAR;
+                    if sslot < inline + near {
+                        let at = extra.add(layout.extra_near as usize) as *const u64;
+                        return Some(*at.add(sslot - inline));
+                    }
+                    let far = *(extra.add(layout.extra_far_ptr as usize) as *const *const u64);
+                    Some(*far.add(sslot - inline - near))
                 }
             };
 

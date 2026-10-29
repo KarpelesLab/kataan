@@ -3,7 +3,7 @@
 //! Such a literal compiles to one [`Op::NewObjectLit`](super::Op::NewObjectLit)
 //! instead of a `NewObject` and one `InitProp` per member (for the members
 //! naming its first `OBJ_LIT_MAX_KEYS` distinct keys — the object's inline
-//! slots; any later member stays an `InitProp`): their values are evaluated
+//! slots and near spill; any later member stays an `InitProp`): their values are evaluated
 //! first, in source order, and the object is then made in one step.
 //! Nothing can observe the object before it is complete (no key is computed,
 //! no member is a method, an accessor, a spread, a function to be named or a
@@ -31,9 +31,9 @@ use alloc::string::String;
 use core::cell::Cell;
 
 /// The most distinct keys an [`super::Op::NewObjectLit`] defines: the
-/// inline slots of an object (a longer literal's later members are
-/// `Op::InitProp`s on the object it makes).
-pub(crate) const OBJ_LIT_MAX_KEYS: usize = crate::object::INLINE_SLOTS;
+/// inline slots of an object and its near spill (a longer literal's later
+/// members are `Op::InitProp`s on the object it makes).
+pub(crate) const OBJ_LIT_MAX_KEYS: usize = crate::object::INLINE_SLOTS + crate::object::SPILL_NEAR;
 
 /// A [`super::Op::NewObjectLit`] site's memo: the realm root shape its
 /// object's shape grows from, and that shape. Both empty, or both set.
@@ -125,7 +125,7 @@ pub(super) fn vm_new_object_lit(
     regs: &[NanBox],
 ) -> Result<NanBox, VmError> {
     // The values, in key order (on the stack for a small literal).
-    let mut buf = [NanBox::undefined(); 8];
+    let mut buf = [NanBox::undefined(); OBJ_LIT_MAX_KEYS];
     let heap_vals: alloc::vec::Vec<NanBox>;
     let vals: &[NanBox] = if lit.srcs.len() <= buf.len() {
         for (d, &r) in buf.iter_mut().zip(&*lit.srcs) {

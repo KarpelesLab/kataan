@@ -245,6 +245,21 @@ pub(crate) const FLAGS_NO_INLINE_STORE: u8 = crate::object::OBJ_FLAG_FROZEN
 /// has both).
 const FLAGS_NO_ADD: u8 = crate::object::OBJ_FLAG_SEALED | crate::object::OBJ_FLAG_NON_EXTENSIBLE;
 
+/// The first slot index in an object's far spill array (the slots before it
+/// are inline, or in its `extra` part's near spill).
+const FAR_FROM: i32 = (crate::object::INLINE_SLOTS + crate::object::SPILL_NEAR) as i32;
+
+/// Where a slot whose index is known at compile time lives, relative to the
+/// object's heap slot in `rcx`.
+enum FixedSlot {
+    /// At `rcx + d` (inline).
+    Inline(i32),
+    /// At `d` into the object's `extra` part (the near spill).
+    Near(i32),
+    /// At `d` into the far spill array, whose pointer is in `extra`.
+    Far(i32),
+}
+
 impl X64Assembler {
     /// `test byte [base+disp32], imm8` (`base` neither `rsp` nor `r12`).
     pub(crate) fn p_test_byte_imm(&mut self, base: u8, disp: i32, imm: u8) {
@@ -888,9 +903,10 @@ impl X64Assembler {
 
     /// With a slot index (zero-extended) in `rax` and an object's heap slot in
     /// `rcx`: `dst` = the address of that property value — inline in the
-    /// object for the first [`crate::object::INLINE_SLOTS`], else in its spill
-    /// array — or to `miss` when the index is not below the object's slot
-    /// count. Clobbers only `dst` (neither `rax` nor `rcx`).
+    /// object for the first [`crate::object::INLINE_SLOTS`], else in its
+    /// `extra` part's near spill, else in its far spill array — or to `miss`
+    /// when the index is not below the object's slot count. Clobbers only
+    /// `dst` (neither `rax` nor `rcx`).
     pub(crate) fn p_obj_slot_addr(&mut self, l: &JitLayout, dst: u8, miss: Label) {
         const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
         debug_assert!(dst != r::RAX && dst != r::RCX);
@@ -898,6 +914,7 @@ impl X64Assembler {
         self.g_cmp(r::RAX, dst);
         self.g_jcc(cc::AE, miss);
         let spill = self.new_label();
+        let far = self.new_label();
         let done = self.new_label();
         self.p_cmp32_imm(r::RAX, INLINE);
         self.g_jcc(cc::AE, spill);
@@ -906,8 +923,13 @@ impl X64Assembler {
         self.bind(spill);
         // A spilled slot means the object has its `extra` part.
         self.g_load(dst, r::RCX, l.props.off_extra);
-        self.g_load(dst, dst, l.extra_spill_ptr);
-        self.p_lea_index8(dst, dst, r::RAX, -8 * INLINE);
+        self.p_cmp32_imm(r::RAX, FAR_FROM);
+        self.g_jcc(cc::AE, far);
+        self.p_lea_index8(dst, dst, r::RAX, l.extra_near - 8 * INLINE);
+        self.jmp(done);
+        self.bind(far);
+        self.g_load(dst, dst, l.extra_far_ptr);
+        self.p_lea_index8(dst, dst, r::RAX, -8 * FAR_FROM);
         self.bind(done);
     }
 
@@ -1252,10 +1274,16 @@ impl X64Assembler {
     /// value, then to `back`. Clobbers `r11`.
     pub(crate) fn p_obj_slot_load_spill(&mut self, l: &JitLayout, back: Label) {
         const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
+        let far = self.new_label();
         // A spilled slot means the object has its `extra` part.
         self.g_load(r::R11, r::RCX, l.props.off_extra);
-        self.g_load(r::R11, r::R11, l.extra_spill_ptr);
-        self.p_load_index8(r::RAX, r::R11, r::RAX, -8 * INLINE);
+        self.p_cmp32_imm(r::RAX, FAR_FROM);
+        self.g_jcc(cc::AE, far);
+        self.p_load_index8(r::RAX, r::R11, r::RAX, l.extra_near - 8 * INLINE);
+        self.jmp(back);
+        self.bind(far);
+        self.g_load(r::R11, r::R11, l.extra_far_ptr);
+        self.p_load_index8(r::RAX, r::R11, r::RAX, -8 * FAR_FROM);
         self.jmp(back);
     }
 
@@ -1265,10 +1293,14 @@ impl X64Assembler {
     /// array is as long as the shape requires). Clobbers `r11`.
     pub(crate) fn p_obj_fixed_slot_load(&mut self, l: &JitLayout, slot: u32) {
         match Self::fixed_slot(l, slot) {
-            (None, disp) => self.g_load(r::RAX, r::RCX, disp),
-            (Some(spill_ptr), disp) => {
+            FixedSlot::Inline(disp) => self.g_load(r::RAX, r::RCX, disp),
+            FixedSlot::Near(disp) => {
                 self.g_load(r::R11, r::RCX, l.props.off_extra);
-                self.g_load(r::R11, r::R11, spill_ptr);
+                self.g_load(r::RAX, r::R11, disp);
+            }
+            FixedSlot::Far(disp) => {
+                self.g_load(r::R11, r::RCX, l.props.off_extra);
+                self.g_load(r::R11, r::R11, l.extra_far_ptr);
                 self.g_load(r::RAX, r::R11, disp);
             }
         }
@@ -1279,25 +1311,31 @@ impl X64Assembler {
     /// `= rdx`. Clobbers `r11`.
     pub(crate) fn p_obj_fixed_slot_store(&mut self, l: &JitLayout, slot: u32) {
         match Self::fixed_slot(l, slot) {
-            (None, disp) => self.g_store(r::RCX, disp, r::RDX),
-            (Some(spill_ptr), disp) => {
+            FixedSlot::Inline(disp) => self.g_store(r::RCX, disp, r::RDX),
+            FixedSlot::Near(disp) => {
                 self.g_load(r::R11, r::RCX, l.props.off_extra);
-                self.g_load(r::R11, r::R11, spill_ptr);
+                self.g_store(r::R11, disp, r::RDX);
+            }
+            FixedSlot::Far(disp) => {
+                self.g_load(r::R11, r::RCX, l.props.off_extra);
+                self.g_load(r::R11, r::R11, l.extra_far_ptr);
                 self.g_store(r::R11, disp, r::RDX);
             }
         }
     }
 
-    /// Where slot `slot` lives: `(None, d)` at `rcx + d`, or `(Some(p), d)`
-    /// at `d` into the spill array whose pointer is at `p` into `extra`.
-    fn fixed_slot(l: &JitLayout, slot: u32) -> (Option<i32>, i32) {
+    /// Where slot `slot` lives (see [`FixedSlot`]).
+    fn fixed_slot(l: &JitLayout, slot: u32) -> FixedSlot {
         const INLINE: u32 = crate::object::INLINE_SLOTS as u32;
+        const FAR: u32 = FAR_FROM.cast_unsigned();
         // A shaped object has at most `u16::MAX` slots, so these fit.
         let at = |i: u32| i32::try_from(i).expect("slot index fits in i32") * 8;
         if slot < INLINE {
-            (None, l.off_inline + at(slot))
+            FixedSlot::Inline(l.off_inline + at(slot))
+        } else if slot < FAR {
+            FixedSlot::Near(l.extra_near + at(slot - INLINE))
         } else {
-            (Some(l.extra_spill_ptr), at(slot - INLINE))
+            FixedSlot::Far(at(slot - FAR))
         }
     }
 
@@ -1334,10 +1372,16 @@ impl X64Assembler {
     /// `back`. Clobbers `r11`.
     pub(crate) fn p_obj_slot_store_spill(&mut self, l: &JitLayout, back: Label) {
         const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
+        let far = self.new_label();
         // A spilled slot means the object has its `extra` part.
         self.g_load(r::R11, r::RCX, l.props.off_extra);
-        self.g_load(r::R11, r::R11, l.extra_spill_ptr);
-        self.p_store_index8(r::R11, r::RAX, -8 * INLINE, r::RDX);
+        self.p_cmp32_imm(r::RAX, FAR_FROM);
+        self.g_jcc(cc::AE, far);
+        self.p_store_index8(r::R11, r::RAX, l.extra_near - 8 * INLINE, r::RDX);
+        self.jmp(back);
+        self.bind(far);
+        self.g_load(r::R11, r::R11, l.extra_far_ptr);
+        self.p_store_index8(r::R11, r::RAX, -8 * FAR_FROM, r::RDX);
         self.jmp(back);
     }
 
@@ -1606,7 +1650,7 @@ impl X64Assembler {
     /// is armed for this realm's root shape, the dictionary threshold is above
     /// the key count, the heap has a free slot and no incremental marking is
     /// running — exactly `Heap::alloc`'s free-list path over
-    /// `Object::with_inline_data(shape, values)` with the default
+    /// `Object::with_data(shape, values)` with the default
     /// `[[Prototype]]`: pop the free list, count the allocation, write the
     /// object (one strong count taken on the memo's shape, the values in
     /// slots `0..n`, the key epoch `n`) and the slot's age and occupancy,
@@ -1653,7 +1697,7 @@ impl X64Assembler {
         self.imul_rax_imm(l.slot_stride);
         self.g_add_mem(r::RAX, r::R9, p.heap_ptr);
         self.g_mov(r::RCX, r::RAX);
-        // `Cell::Object(Object::with_inline_data(shape, vals))` with the
+        // `Cell::Object(Object::with_data(shape, vals))` with the
         // default prototype, field by field.
         self.p_store_rcx_imm(1, l.off_cell_tag, u32::from(l.cell_object_disc));
         self.p_store_rcx_imm(1, l.off_od_tag, u32::from(l.obj_shaped_disc));

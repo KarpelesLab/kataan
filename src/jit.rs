@@ -3088,11 +3088,15 @@ pub(crate) struct JitLayout {
     /// Slot-relative offset of the object's first inline slot (slot
     /// `i < INLINE_SLOTS` at `+ 8 * i`).
     pub off_inline: i32,
-    /// `ObjectExtra`-relative offset of the object's spill `Vec` data pointer
-    /// (slot `i >= INLINE_SLOTS` at that pointer `+ 8 * (i - INLINE_SLOTS)`;
-    /// the `extra` pointer is at `props.off_extra`, and is non-null whenever
-    /// the object has a spilled slot).
-    pub extra_spill_ptr: i32,
+    /// `ObjectExtra`-relative offset of the object's near spilled values
+    /// (slot `i` in `INLINE_SLOTS..INLINE_SLOTS + SPILL_NEAR` at `+ 8 * (i -
+    /// INLINE_SLOTS)`; the `extra` pointer is at `props.off_extra`, and is
+    /// non-null whenever the object has a spilled slot).
+    pub extra_near: i32,
+    /// `ObjectExtra`-relative offset of the object's far spill `Vec` data
+    /// pointer (slot `i >= INLINE_SLOTS + SPILL_NEAR` at that pointer `+ 8 *
+    /// (i - INLINE_SLOTS - SPILL_NEAR)`).
+    pub extra_far_ptr: i32,
     /// `PropertyCache`-relative offset of the cached shape word (8 bytes).
     pub cache_shape_off: i32,
     /// `PropertyCache`-relative offset of the cached `slot: u32`.
@@ -3160,7 +3164,8 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
             off_shape: to_i32(obj_base + obj.shape_off),
             off_slots_len: to_i32(obj_base + obj.len_off),
             off_inline: to_i32(obj_base + obj.inline_off),
-            extra_spill_ptr: to_i32(obj.extra_spill_ptr_off),
+            extra_near: to_i32(obj.extra_near_off),
+            extra_far_ptr: to_i32(obj.extra_far_ptr_off),
             cache_shape_off: to_i32(cache.shape_off),
             cache_slot_off: to_i32(cache.slot_off),
             cache_hits_off: to_i32(cache.hits_off),

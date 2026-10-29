@@ -88,6 +88,14 @@ struct DictData {
 /// beyond their heap cell — and dropping a dead one frees nothing.
 pub(crate) const INLINE_SLOTS: usize = 4;
 
+/// How many spilled slot values (past [`INLINE_SLOTS`]) the out-of-line part
+/// holds in its own allocation, before the rest go to a further `Vec`: slot
+/// `i` in `INLINE_SLOTS..INLINE_SLOTS + SPILL_NEAR` is one load away from
+/// the object (its `extra` pointer) rather than two, and an object of up to
+/// `INLINE_SLOTS + SPILL_NEAR` properties needs no allocation beyond its
+/// `extra` part.
+pub(crate) const SPILL_NEAR: usize = 8;
+
 /// The most slots a shaped object holds (its count is a `u16`); an object
 /// that would grow past it becomes a dictionary, whatever the realm's
 /// threshold.
@@ -187,7 +195,7 @@ pub(crate) fn proto_epoch_addr() -> usize {
 /// 64 bytes: a header word (mode, flags, slot count, key epoch), the shape,
 /// the prototype, the out-of-line part and four inline values. Slot
 /// `i < INLINE_SLOTS` is `inline[i]`; the rest live in the out-of-line part's
-/// `spill` (slot `i` at `spill[i - INLINE_SLOTS]`). `len` counts the slots
+/// `spill` (its near part, then a far `Vec`). `len` counts the slots
 /// (always the shape's length in shaped mode, `0` in dictionary mode);
 /// inline entries at or past it are unused (never read or traced).
 #[repr(C)] // compiled code reads the fields at probed offsets; `mode` must be first (the niche)
@@ -228,13 +236,107 @@ pub struct Object {
 // cache line.
 const _: () = assert!(core::mem::size_of::<Object>() == 64);
 
+/// An object's slot values past the inline room (shaped mode), in slot
+/// order: spilled value `i` (slot `INLINE_SLOTS + i`) is `near[i]` for
+/// `i < SPILL_NEAR`, else `far[i - SPILL_NEAR]`. `near` entries at or past
+/// `n` are unused (never read or traced).
+struct Spill {
+    /// The first [`SPILL_NEAR`] spilled values, in the `extra` allocation
+    /// itself (compiled code reads them at a fixed offset from it).
+    near: [NanBox; SPILL_NEAR],
+    /// The spilled values past `near`.
+    far: Vec<NanBox>,
+    /// How many values are spilled.
+    n: u32,
+}
+
+impl Spill {
+    /// No spilled values.
+    const EMPTY: Self = Self {
+        near: [NanBox::undefined(); SPILL_NEAR],
+        far: Vec::new(),
+        n: 0,
+    };
+
+    /// Whether no value is spilled.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    /// The spilled values in use in `near`.
+    #[inline]
+    fn near_live(&self) -> &[NanBox] {
+        &self.near[..(self.n as usize).min(SPILL_NEAR)]
+    }
+
+    /// Spilled value `i`, if in range.
+    #[inline]
+    fn get(&self, i: usize) -> Option<&NanBox> {
+        if i >= self.n as usize {
+            None
+        } else if i < SPILL_NEAR {
+            Some(&self.near[i])
+        } else {
+            self.far.get(i - SPILL_NEAR)
+        }
+    }
+
+    /// Spilled value `i`, mutably, if in range.
+    #[inline]
+    fn get_mut(&mut self, i: usize) -> Option<&mut NanBox> {
+        if i >= self.n as usize {
+            None
+        } else if i < SPILL_NEAR {
+            Some(&mut self.near[i])
+        } else {
+            self.far.get_mut(i - SPILL_NEAR)
+        }
+    }
+
+    /// Appends `v` as the next spilled value.
+    #[inline]
+    fn push(&mut self, v: NanBox) {
+        let i = self.n as usize;
+        if i < SPILL_NEAR {
+            self.near[i] = v;
+        } else {
+            self.far.push(v);
+        }
+        self.n += 1;
+    }
+
+    /// Drops every spilled value (keeping `far`'s buffer).
+    fn clear(&mut self) {
+        self.n = 0;
+        self.far.clear();
+    }
+
+    /// The spilled values, in order.
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = &NanBox> {
+        self.near_live().iter().chain(self.far.iter())
+    }
+
+    /// The spilled values, mutably, in order.
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut NanBox> {
+        let n = (self.n as usize).min(SPILL_NEAR);
+        self.near[..n].iter_mut().chain(self.far.iter_mut())
+    }
+}
+
+impl Default for Spill {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 /// The out-of-line part of an [`Object`]: everything an ordinary data object
 /// leaves empty. Allocated on first use (see `Object::extra_mut`).
 #[derive(Default)]
 struct ObjectExtra {
-    /// Slot values past the inline room, in slot order: `spill[i]` is slot
-    /// `INLINE_SLOTS + i` (shaped mode).
-    spill: Vec<NanBox>,
+    /// Slot values past the inline room (shaped mode).
+    spill: Spill,
     /// The properties of a dictionary-mode object.
     dict: Option<Box<DictData>>,
     /// Own keys that are **non-writable** (`defineProperty` with
@@ -266,8 +368,12 @@ struct ObjectExtra {
 impl ObjectExtra {
     /// Whether nothing is recorded (the object could drop its box).
     fn is_empty(&self) -> bool {
-        self.spill.is_empty()
-            && self.dict.is_none()
+        self.spill.is_empty() && self.only_spill()
+    }
+
+    /// Whether nothing but spilled slot values is recorded.
+    fn only_spill(&self) -> bool {
+        self.dict.is_none()
             && self.readonly.is_empty()
             && self.accessors.is_empty()
             && self.hidden.is_empty()
@@ -279,7 +385,7 @@ impl ObjectExtra {
 
 /// The all-empty [`ObjectExtra`] that reads see when an object has none.
 static EMPTY_EXTRA: ObjectExtra = ObjectExtra {
-    spill: Vec::new(),
+    spill: Spill::EMPTY,
     dict: None,
     readonly: Vec::new(),
     accessors: Vec::new(),
@@ -333,15 +439,15 @@ impl Object {
 
     /// The object that adding each key of `shape` in turn, as a plain data
     /// property, to `Object::new(root)` leaves (`values` in slot order) — for
-    /// a caller that builds many objects with the same keys in one step.
-    /// `None` unless `shape` holds exactly `values.len()` keys, all inline.
+    /// a caller that builds many objects with the same keys in one step. The
+    /// values past the inline room go to a spill sized for exactly them.
+    /// `None` unless `shape` holds exactly `values.len()` keys.
     #[must_use]
-    pub fn with_inline_data(shape: Rc<Shape>, values: &[NanBox]) -> Option<Self> {
-        if values.len() > INLINE_SLOTS || shape.len() as usize != values.len() {
+    #[inline]
+    pub fn with_data(shape: Rc<Shape>, values: &[NanBox]) -> Option<Self> {
+        if values.len() > MAX_SHAPED_LEN || shape.len() as usize != values.len() {
             return None;
         }
-        let mut inline = [NanBox::undefined(); INLINE_SLOTS];
-        inline[..values.len()].copy_from_slice(values);
         Some(Self {
             mode: Mode::Shaped,
             flags: 0,
@@ -349,29 +455,48 @@ impl Object {
             key_epoch: values.len() as u32,
             shape,
             proto: NO_PROTO,
-            extra: None,
-            inline,
+            extra: values.get(INLINE_SLOTS..).and_then(Self::spill_part),
+            // Word by word: a variable-length slice copy into the (moved)
+            // temporary would cost a store-forwarding stall per word.
+            inline: core::array::from_fn(|i| values.get(i).copied().unwrap_or(NanBox::undefined())),
         })
     }
 
-    /// [`is_plain_inline_shaped`](Self::is_plain_inline_shaped), with a key
-    /// set that has changed once per key: what adding each key of its shape
-    /// in turn to an empty object leaves, so
-    /// [`with_inline_data`](Self::with_inline_data) of its shape and slot
-    /// values makes the same object.
+    /// The out-of-line part holding just `rest` as the spilled slot values
+    /// (none for no values).
+    #[inline(never)]
+    fn spill_part(rest: &[NanBox]) -> Option<Box<ObjectExtra>> {
+        if rest.is_empty() {
+            return None;
+        }
+        let mut x = Box::<ObjectExtra>::default();
+        for (d, &v) in x.spill.near.iter_mut().zip(rest) {
+            *d = v;
+        }
+        if let Some(far) = rest.get(SPILL_NEAR..) {
+            x.spill.far = far.to_vec();
+        }
+        x.spill.n = rest.len() as u32;
+        Some(x)
+    }
+
+    /// [`is_plain_shaped`](Self::is_plain_shaped), with a key set that has
+    /// changed once per key: what adding each key of its shape in turn to an
+    /// empty object leaves, so [`with_data`](Self::with_data) of its shape
+    /// and slot values makes the same object.
     #[must_use]
     pub fn is_plain_fresh_data(&self) -> bool {
-        self.is_plain_inline_shaped() && self.key_epoch == u32::from(self.len)
+        self.is_plain_shaped() && self.key_epoch == u32::from(self.len)
     }
 
     /// Whether this is an ordinary shaped object holding only plain data
-    /// properties inline (the shape alone describes its keys and slots).
+    /// properties (the shape alone describes its keys and slots; its `extra`
+    /// part, if any, holds only spilled slot values).
     #[must_use]
-    pub fn is_plain_inline_shaped(&self) -> bool {
+    pub fn is_plain_shaped(&self) -> bool {
         !self.is_dict()
-            && self.extra.is_none()
+            && self.extra.as_deref().is_none_or(ObjectExtra::only_spill)
             && self.flags == 0
-            && (self.len as usize) <= INLINE_SLOTS
             && self.shape.len() as usize == self.len as usize
     }
 
@@ -435,10 +560,10 @@ impl Object {
         self.extra_mut().dict.get_or_insert_with(Default::default)
     }
 
-    /// The spilled slot values (slot `INLINE_SLOTS + i` at `[i]`).
+    /// The spilled slot values (slot `INLINE_SLOTS + i` at `get(i)`).
     #[inline]
-    fn spill(&self) -> &[NanBox] {
-        self.extra.as_deref().map_or(&[], |x| &x.spill[..])
+    fn spill(&self) -> &Spill {
+        &self.ex().spill
     }
 
     /// Slot `i`, if in range (shaped mode; a dictionary has no slots).
@@ -493,9 +618,10 @@ impl Object {
     /// The slot values, in slot order.
     #[inline]
     fn slots_iter(&self) -> impl Iterator<Item = &NanBox> {
+        let spill = self.spill();
         self.inline[..(self.len as usize).min(INLINE_SLOTS)]
             .iter()
-            .chain(self.spill().iter())
+            .chain(spill.iter())
     }
 
     /// Replaces the slots with `values`, in order.
@@ -1100,7 +1226,7 @@ impl Object {
         self.len = 0;
         self.inline = [NanBox::undefined(); INLINE_SLOTS];
         let x = self.extra_mut();
-        x.spill = Vec::new();
+        x.spill = Spill::EMPTY;
         x.dict = Some(Box::new(DictData { order, map }));
         // A fresh empty shape so `shape()` returns a pointer that resolves no
         // key (inline caches keyed on it always miss for this object).
@@ -1571,10 +1697,15 @@ pub(crate) struct ObjectLayout {
     /// Byte offset of the first inline slot (slot `i < INLINE_SLOTS` at
     /// `+ 8 * i`).
     pub inline_off: usize,
-    /// Byte offset, within `ObjectExtra`, of the spill `Vec`'s data pointer
-    /// (slot `i >= INLINE_SLOTS` at that pointer `+ 8 * (i - INLINE_SLOTS)`;
-    /// an object with spilled slots always has its `extra` part).
-    pub extra_spill_ptr_off: usize,
+    /// Byte offset, within `ObjectExtra`, of the near spilled values (slot
+    /// `i` in `INLINE_SLOTS..INLINE_SLOTS + SPILL_NEAR` at `+ 8 * (i -
+    /// INLINE_SLOTS)`; an object with spilled slots always has its `extra`
+    /// part).
+    pub extra_near_off: usize,
+    /// Byte offset, within `ObjectExtra`, of the far spill `Vec`'s data
+    /// pointer (slot `i >= INLINE_SLOTS + SPILL_NEAR` at that pointer `+ 8 *
+    /// (i - INLINE_SLOTS - SPILL_NEAR)`).
+    pub extra_far_ptr_off: usize,
     /// Byte offset of the data pointer within a `Vec<NanBox>`.
     pub vec_ptr_off: usize,
     /// Byte offset of the length within a `Vec<NanBox>`.
@@ -1600,15 +1731,16 @@ pub(crate) struct ObjectLayout {
     pub shape_brands_off: isize,
 }
 
-/// Derives [`ObjectLayout`] from a real shaped object with several own data
-/// properties (so the spill `Vec` is populated, its length distinct from its
-/// capacity and data pointer, making the by-value word scan unambiguous).
+/// Derives [`ObjectLayout`] from a real shaped object with enough own data
+/// properties to fill both the near and the far spill (so the far `Vec` is
+/// populated).
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn jit_object_layout() -> ObjectLayout {
-    // Six properties: two of them spilled, so the spill `Vec` is populated.
+    // Two properties past the near spill, so the far `Vec` is populated.
     let mut obj = Object::new(Shape::root());
-    for (i, k) in ["a", "b", "c", "d", "e", "f"].into_iter().enumerate() {
-        obj.set(k, NanBox::number(i as f64));
+    let count = INLINE_SLOTS + SPILL_NEAR + 2;
+    for i in 0..count {
+        obj.set(&alloc::format!("k{i}"), NanBox::number(i as f64));
     }
 
     let obj_base = core::ptr::addr_of!(obj) as usize;
@@ -1663,11 +1795,30 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
     let extra_word = unsafe { *((obj_base + extra_off) as *const usize) };
     let extra_ref = obj.extra.as_deref().expect("spilled slots live in `extra`");
     assert_eq!(extra_word, core::ptr::addr_of!(*extra_ref) as usize);
-    let extra_spill_ptr_off = core::mem::offset_of!(ObjectExtra, spill) + vec_ptr_off;
-    // SAFETY: reading the spill Vec's pointer word of the live `ObjectExtra`.
+    let spill_off = core::mem::offset_of!(ObjectExtra, spill);
+    let extra_near_off = spill_off + core::mem::offset_of!(Spill, near);
+    assert_eq!(
+        extra_word + extra_near_off,
+        extra_ref.spill.near.as_ptr() as usize
+    );
+    let extra_far_ptr_off = spill_off + core::mem::offset_of!(Spill, far) + vec_ptr_off;
+    // SAFETY: reading the far spill Vec's pointer word of the live `ObjectExtra`.
     #[allow(unsafe_code)]
-    let spill_word = unsafe { *((extra_word + extra_spill_ptr_off) as *const usize) };
-    assert_eq!(spill_word, extra_ref.spill.as_ptr() as usize);
+    let far_word = unsafe { *((extra_word + extra_far_ptr_off) as *const usize) };
+    assert_eq!(far_word, extra_ref.spill.far.as_ptr() as usize);
+    // Each spilled value where the offsets say it is.
+    for i in INLINE_SLOTS..count {
+        let j = i - INLINE_SLOTS;
+        let at = if j < SPILL_NEAR {
+            extra_word + extra_near_off + 8 * j
+        } else {
+            far_word + 8 * (j - SPILL_NEAR)
+        };
+        // SAFETY: a live spilled value of `obj` (checked against `slot_get`).
+        #[allow(unsafe_code)]
+        let v = unsafe { *(at as *const NanBox) };
+        assert_eq!(v.to_bits(), obj.slot_at(i as u32).to_bits());
+    }
     let acc_probe: (Box<str>, NanBox, NanBox) =
         (Box::from("k"), NanBox::undefined(), NanBox::null());
     let acc_getter_off =
@@ -1680,7 +1831,8 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
         shape_off,
         len_off,
         inline_off,
-        extra_spill_ptr_off,
+        extra_near_off,
+        extra_far_ptr_off,
         vec_ptr_off,
         vec_len_off,
         jit_flags_off: core::mem::offset_of!(Object, flags),
