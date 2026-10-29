@@ -1238,3 +1238,66 @@ fn body_var_env_holds_only_body_vars_with_parameter_expressions() {
     "#;
     assert_eq!(run(src), "2,2;,3;4,4;number;7;2,1");
 }
+
+/// An object argument that an Array method coerces (a `fromIndex`, a
+/// `start`/`end`, a `join` separator, a `flat` depth) runs user code after
+/// `len` was read and before any element is: the elements must then be read
+/// live (`HasProperty`/`Get` up to that `len`). The dense path used a snapshot
+/// taken before the coercion, so writes, deletions and truncations made by a
+/// `valueOf`/`toString` were invisible.
+#[test]
+fn array_methods_read_elements_after_coercing_object_arguments() {
+    let src = r#"
+        function shrink(a, v) { return { valueOf() { a.length = 1; return v; }, toString() { a.length = 1; return v; } }; }
+        function poke(a, v) { return { valueOf() { a[2] = 9; return v; }, toString() { a[2] = 9; return v; } }; }
+        var r = [];
+        var a;
+        a = [1, 2, 3]; r.push(a.includes(undefined, shrink(a, 0)));
+        a = [1, 2, 3]; r.push(a.join(shrink(a, "+")));
+        a = [1, 2, 3]; r.push(JSON.stringify(a.slice(shrink(a, 0))));
+        a = [1, 2, 3]; r.push(JSON.stringify(a.with(shrink(a, 0), "x")));
+        a = [1, 2, 3]; r.push(String(a.at(shrink(a, 2))));
+        a = [1, 2, 3]; r.push(JSON.stringify(a.splice(shrink(a, 0))));
+        a = [1, 2, 3]; r.push(a.includes(9, poke(a, 0)));
+        a = [1, 2, 3]; r.push(JSON.stringify(a.toSpliced(poke(a, 1))));
+        a = [1, 2, 3]; r.push(JSON.stringify(a.copyWithin(poke(a, 0), 1)));
+        a = [1, 2, 3]; r.push(JSON.stringify(a.flat(poke(a, 1))));
+        var o = { length: 3, 0: "a", 1: "b", 2: "c" };
+        r.push(Array.prototype.join.call(o, { toString() { delete o[1]; o.length = 1; return "+"; } }));
+        r.join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "true 1++ [1,null,null] [\"x\",null,null] undefined [1,null,null] true [1] [2,9,9] [1,2,9] a++c"
+    );
+}
+
+/// FlattenIntoArray reads every source array live: a hole is `HasProperty`
+/// through the prototype chain (an inherited index is flattened in), an
+/// accessor index runs its getter, and a proxy of an array is an array
+/// (IsArray). `flat` only did that for the receiver's own holes and
+/// `flatMap` never did, skipping every hole or accessor slot of a nested or
+/// mapped array and appending a proxy whole.
+#[test]
+fn flat_and_flat_map_read_nested_arrays_live() {
+    let src = r#"
+        var r = [];
+        Array.prototype[1] = "P";
+        r.push(JSON.stringify([0, , 2].flat()));
+        r.push(JSON.stringify([[1, , 3]].flat()));
+        r.push(JSON.stringify([1, , 3].flatMap(x => [x])));
+        r.push(JSON.stringify([1].flatMap(() => [1, , 3])));
+        delete Array.prototype[1];
+        var g = [1, 2];
+        Object.defineProperty(g, 0, { get() { return "g"; } });
+        r.push(JSON.stringify([[0, g]].flat(2)));
+        r.push(JSON.stringify([1].flatMap(() => g)));
+        r.push(JSON.stringify([1].flatMap(() => new Proxy([1, 2], {}))));
+        r.push(JSON.stringify([[1], new Proxy([3, [4]], {})].flat(2)));
+        r.join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "[0,\"P\",2] [1,\"P\",3] [1,\"P\",3] [1,\"P\",3] [0,\"g\",2] [\"g\",2] [1,2] [1,3,4]"
+    );
+}

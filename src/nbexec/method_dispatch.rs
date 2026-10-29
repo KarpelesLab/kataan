@@ -3022,6 +3022,24 @@ impl Interp {
                 let m = self.new_str("Invalid array length");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }
+            // `join` with an object separator: its ToString runs user code after
+            // `length` was read and before any element is, so the elements are
+            // read live afterwards (a materialized snapshot would predate it).
+            if method == "join" && self.is_object_value(arg(0)) {
+                let sep = self.arg_string_bytes_fallible(arg(0))?;
+                let mut out: Vec<u8> = Vec::new();
+                for k in 0..len_f as usize {
+                    if k > 0 {
+                        crate::wtf8::append(&mut out, &sep);
+                    }
+                    let e = self.read_member(handle, &alloc::format!("{k}"))?;
+                    if !matches!(e.unpack(), Unpacked::Null | Unpacked::Undefined) {
+                        let b = self.arg_string_bytes_fallible(e)?;
+                        crate::wtf8::append(&mut out, &b);
+                    }
+                }
+                return Ok(Some(self.new_str_bytes(out)));
+            }
             if len_f <= (1u64 << 24) as f64 {
                 let len = len_f as usize;
                 // A String primitive/wrapper `this` (its boxed string) exposes every
@@ -3703,7 +3721,29 @@ impl Interp {
             // `resize()` the backing buffer and take indices out of bounds
             // underneath the iteration.
             let generic_typed = array_proto_generic && self.realm.typed_kind(handle).is_some();
+            // An object argument the algorithm coerces (ToIntegerOrInfinity /
+            // ToString) can run user code *after* `len` was read: that code may
+            // shrink, grow or rewrite the array, so the elements must then be
+            // read live (`HasProperty`/`Get` up to the captured `len`), not from
+            // the snapshot taken above.
+            let coerced_positions: &[usize] = match method {
+                "join" | "at" | "with" | "flat" => &[0],
+                "slice" | "splice" | "toSpliced" => &[0, 1],
+                "fill" => &[1, 2],
+                "copyWithin" => &[0, 1, 2],
+                "includes" | "indexOf" | "lastIndexOf" => &[1],
+                _ => &[],
+            };
+            let coercion_runs_code = self.realm.typed_kind(handle).is_none()
+                && receiver_is_real_array
+                && coerced_positions
+                    .iter()
+                    .any(|&i| self.is_object_value(arg(i)));
+            if coercion_runs_code && matches!(method, "fill" | "copyWithin" | "splice") {
+                return Ok(Some(self.array_like_mutate(method, handle, args)?));
+            }
             let precise_array = generic_typed
+                || coercion_runs_code
                 || (self.realm.typed_kind(handle).is_none()
                     && (self.realm.array_has_index_overrides(handle)
                         || self.realm.array_is_non_extensible(handle)
@@ -4083,7 +4123,7 @@ impl Interp {
                     // A hole is `Get(O, k)` through the prototype chain (where an
                     // index property or getter may answer), so with any hole every
                     // index is read live.
-                    if elems.iter().any(|e| e.is_hole()) {
+                    if precise_array || elems.iter().any(|e| e.is_hole()) {
                         let len = elems.len();
                         for k in from..len {
                             let v = self.read_member(handle, &alloc::format!("{k}"))?;
@@ -4129,7 +4169,7 @@ impl Interp {
                 }
                 "with"
                     if self.realm.typed_kind(handle).is_none()
-                        && elems.iter().any(|e| e.is_hole()) =>
+                        && (precise_array || elems.iter().any(|e| e.is_hole())) =>
                 {
                     let len = elems.len() as i64;
                     let i = self.coerce_to_integer_or_infinity(arg(0))? as i64;
@@ -4899,6 +4939,24 @@ impl Interp {
                     let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
                         return Err(self.type_error("Array species did not return an object"));
                     };
+                    // A hole may resolve through the prototype chain and an
+                    // accessor index runs code, at any nesting level; a nested
+                    // proxy of an array is flattened too (IsArray). Run the live
+                    // FlattenIntoArray for those.
+                    if receiver_is_real_array
+                        && (precise_array || !self.flat_snapshot_exact(&elems, depth, 0))
+                    {
+                        self.flatten_into_array(
+                            a_h,
+                            handle,
+                            elems.len(),
+                            0,
+                            depth,
+                            None,
+                            NanBox::undefined(),
+                        )?;
+                        return Ok(Some(a_v));
+                    }
                     // FlattenIntoArray processes only *present* elements
                     // (HasProperty). Mark an absent generic-array-like index as a
                     // hole so `flatten` skips it (real-array holes are already
@@ -5029,10 +5087,27 @@ impl Interp {
                         // elements (holes skipped), a non-array is appended.
                         let items: Vec<NanBox> = match r
                             .as_handle()
-                            .and_then(|raw| self.realm.array_elements(Handle::from_raw(raw)))
-                            .map(<[_]>::to_vec)
+                            .map(Handle::from_raw)
+                            .and_then(|h| self.plain_dense_elements(h))
                         {
-                            Some(inner) => inner.into_iter().filter(|v| !v.is_hole()).collect(),
+                            Some(inner) => inner,
+                            // A holey / accessor-indexed array, or a proxy of an
+                            // array: FlattenIntoArray reads it live (HasProperty
+                            // and Get per index, through the prototype chain).
+                            None if self.is_array_unwrap_proxy(r)? => {
+                                let inner_h = Handle::from_raw(r.as_handle().expect("an array"));
+                                let inner_len = self.array_like_length(inner_h)?;
+                                k = self.flatten_into_array(
+                                    a_h,
+                                    inner_h,
+                                    inner_len,
+                                    k,
+                                    0,
+                                    None,
+                                    NanBox::undefined(),
+                                )?;
+                                continue;
+                            }
                             None => alloc::vec![r],
                         };
                         for it in items {
@@ -5075,7 +5150,7 @@ impl Interp {
                         return Ok(Some(NanBox::undefined()));
                     };
                     let v = elems[u];
-                    return Ok(Some(if v.is_hole() {
+                    return Ok(Some(if precise_array || v.is_hole() {
                         self.read_member(handle, &alloc::format!("{u}"))?
                     } else {
                         v
@@ -5443,7 +5518,7 @@ impl Interp {
                 // `[[Get]]` (so getters fire and holes resolve through the proto).
                 "toSpliced"
                     if self.realm.typed_kind(handle).is_none()
-                        && elems.iter().any(|e| e.is_hole()) =>
+                        && (precise_array || elems.iter().any(|e| e.is_hole())) =>
                 {
                     let len = elems.len() as i64;
                     let start = {
@@ -7212,6 +7287,53 @@ impl Interp {
     /// `rec` is the current recursion depth; nesting past
     /// `limits.max_display_depth` throws rather than overflowing the host stack
     /// (`flat(Infinity)` on a pathologically deep array).
+    /// The elements of `h` when it is an ordinary array whose dense store is
+    /// exactly what `HasProperty`/`Get` per index would observe: no holes (which
+    /// may resolve through the prototype chain), no accessor or attribute
+    /// overrides, and a logical length equal to the dense one.
+    fn plain_dense_elements(&self, h: Handle) -> Option<Vec<NanBox>> {
+        let elems = self.realm.array_elements(h)?;
+        if self.realm.is_vm_function(h)
+            || self.realm.array_has_index_overrides(h)
+            || self.realm.array_length(h) != Some(elems.len())
+            || elems.iter().any(|e| e.is_hole())
+        {
+            return None;
+        }
+        Some(elems.to_vec())
+    }
+
+    /// Whether [`Self::flatten`] over the snapshot `elems` equals the spec's
+    /// live FlattenIntoArray: every array it would descend into (to `depth`)
+    /// is a [`Self::plain_dense_elements`] array, and no element it would
+    /// append as-is is a proxy (which IsArray might see through). Past the
+    /// recursion limit it answers `true`, leaving `flatten` to raise its
+    /// RangeError on a cyclic array.
+    fn flat_snapshot_exact(&self, elems: &[NanBox], depth: i32, rec: usize) -> bool {
+        if depth <= 0 || rec >= self.realm.limits.max_display_depth {
+            return true;
+        }
+        for e in elems {
+            let Some(h) = e.as_handle().map(Handle::from_raw) else {
+                continue;
+            };
+            if self.realm.proxy_at(h).is_some() {
+                return false;
+            }
+            if self.realm.array_elements(h).is_some() {
+                match self.plain_dense_elements(h) {
+                    Some(inner) => {
+                        if !self.flat_snapshot_exact(&inner, depth - 1, rec + 1) {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+        }
+        true
+    }
+
     pub(crate) fn flatten(
         &mut self,
         elems: &[NanBox],
