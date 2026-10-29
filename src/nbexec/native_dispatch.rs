@@ -3852,13 +3852,20 @@ impl Interp {
             // `queueMicrotask(cb)` — schedules `cb()` on the microtask queue.
             N_QUEUE_MICROTASK => {
                 let callback = arg(0);
+                // HTML's queueMicrotask takes a `VoidFunction`: a non-callable
+                // argument is a TypeError (it used to be queued and dropped).
+                if !self.is_callable_value(callback) {
+                    return Err(self.type_error("queueMicrotask requires a callable callback"));
+                }
                 let result = self.fresh_promise();
                 self.microtasks.push(Job {
                     handler: callback,
                     value: NanBox::undefined(),
                     result,
                     fulfilled: true,
-                    finally: false,
+                    // A `finally`-style job calls its handler with no
+                    // arguments, as the callback is invoked.
+                    finally: true,
                     thenable: None,
                     cap: None,
                 });

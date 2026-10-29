@@ -700,3 +700,14 @@ fn resolving_functions_honor_already_resolved() {
     let v = interp.run(&r).expect("exec");
     assert_eq!(interp.realm().to_display_string(v), "c5,de9,e10,a1,b3");
 }
+
+/// `queueMicrotask` throws a TypeError for a non-callable argument and calls
+/// its callback with no arguments.
+#[test]
+fn queue_microtask_checks_and_calls_bare() {
+    let src = r#"
+        try { queueMicrotask(5); } catch (e) { console.log(e.constructor.name); }
+        queueMicrotask(function () { console.log('args', arguments.length); });
+    "#;
+    assert_eq!(out(src), "TypeError\nargs 0\n");
+}
