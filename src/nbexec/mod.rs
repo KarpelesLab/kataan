@@ -9271,6 +9271,17 @@ impl crate::nbvm::VmHost for Interp {
             .map_err(exec_to_host)
     }
 
+    fn call_got_method(
+        &mut self,
+        method: NanBox,
+        recv: NanBox,
+        name: &str,
+        args: &[NanBox],
+    ) -> Result<NanBox, crate::nbvm::HostError> {
+        self.call_got_named(method, recv, name, args)
+            .map_err(exec_to_host)
+    }
+
     fn relational(
         &mut self,
         instanceof: bool,

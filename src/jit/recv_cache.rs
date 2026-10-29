@@ -266,6 +266,7 @@ fn op_dst(op: &GenericOp) -> Option<u16> {
         | GenericOp::Add { dst, .. }
         | GenericOp::Move { dst, .. }
         | GenericOp::GetProp { dst, .. }
+        | GenericOp::GetMethod { dst, .. }
         | GenericOp::GetElem { dst, .. }
         | GenericOp::ArrayLen { dst, .. }
         | GenericOp::Arith { dst, .. }
@@ -275,6 +276,7 @@ fn op_dst(op: &GenericOp) -> Option<u16> {
         | GenericOp::StrictEq { dst, .. }
         | GenericOp::ValueBin { dst, .. }
         | GenericOp::Not { dst, .. }
+        | GenericOp::PlainPrims { dst, .. }
         | GenericOp::CallNative { dst, .. }
         | GenericOp::ToNumeric { dst, .. }
         | GenericOp::Step { dst, .. }
@@ -282,6 +284,7 @@ fn op_dst(op: &GenericOp) -> Option<u16> {
         | GenericOp::CellGet { dst, .. }
         | GenericOp::CallMethod { dst, .. }
         | GenericOp::CallValue { dst, .. }
+        | GenericOp::CallWithMethod { dst, .. }
         | GenericOp::CallKey { dst, .. }
         | GenericOp::Construct { dst, .. } => Some(dst),
         _ => None,
@@ -297,8 +300,10 @@ fn fresh_def(op: &GenericOp) -> bool {
         GenericOp::GetElem { .. }
             | GenericOp::ArrGet { .. }
             | GenericOp::GetProp { .. }
+            | GenericOp::GetMethod { .. }
             | GenericOp::CallMethod { .. }
             | GenericOp::CallValue { .. }
+            | GenericOp::CallWithMethod { .. }
             | GenericOp::CallKey { .. }
             | GenericOp::Construct { .. }
     )
@@ -313,6 +318,7 @@ fn ends_knowledge(op: &GenericOp) -> bool {
             | GenericOp::CallNative { .. }
             | GenericOp::CallMethod { .. }
             | GenericOp::CallValue { .. }
+            | GenericOp::CallWithMethod { .. }
             | GenericOp::CallKey { .. }
             | GenericOp::Construct { .. }
             | GenericOp::PushHandler { .. }

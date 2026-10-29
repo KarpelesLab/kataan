@@ -689,6 +689,31 @@ pub enum Op {
         key: String,
         args: Vec<Reg>,
     },
+    /// `dst = obj[key]` read as the callee of a method call whose arguments
+    /// come after it (EvaluateCall's GetValue of the callee precedes
+    /// ArgumentListEvaluation): exactly [`Op::GetProp`]'s value, found first
+    /// through the site's built-in method memo (`native_call::try_get`).
+    /// Paired with an [`Op::CallWithMethod`] (hosted runs only).
+    GetMethod { dst: Reg, obj: Reg, key: String },
+    /// `dst = callee(args…)` with `this = recv`, where `callee` is the method
+    /// `recv[key]` already read by an [`Op::GetMethod`] (or `GetKey`) before
+    /// the arguments: [`Op::CallMethod`]'s call half, with its fast paths (a
+    /// built-in served directly, a VM closure entered with callee feedback).
+    /// `key` names the method (for messages; empty for a computed key).
+    CallWithMethod {
+        dst: Reg,
+        callee: Reg,
+        recv: Reg,
+        key: String,
+        args: Vec<Reg>,
+    },
+    /// `dst = whether every value in regs is a primitive that converts
+    /// (`ToPrimitive`, `ToNumeric`, `ToString`) without running code or
+    /// throwing`: a Number, Boolean, `null`, `undefined` or String — no
+    /// object, BigInt or Symbol. The guard of a method call whose arguments
+    /// are operators over these values: then they cannot tell when the method
+    /// is read, and the call is an [`Op::CallMethod`] (hosted runs only).
+    PlainPrims { dst: Reg, regs: Vec<Reg> },
     /// Runs constructor function `ctor` with `this = recv` and `args` (the
     /// return value is discarded; `new` yields the instance).
     CallCtor {
@@ -1108,6 +1133,22 @@ pub trait VmHost {
         name: &str,
         args: &[NanBox],
     ) -> Result<NanBox, HostError>;
+    /// The call half of [`call_method`](Self::call_method): `method` is the
+    /// value `recv.name` already read (before the arguments, as EvaluateCall
+    /// orders them); a non-callable one throws that call's `TypeError`.
+    ///
+    /// # Errors
+    /// As [`call_method`](Self::call_method).
+    fn call_got_method(
+        &mut self,
+        method: NanBox,
+        recv: NanBox,
+        name: &str,
+        args: &[NanBox],
+    ) -> Result<NanBox, HostError> {
+        let _ = name;
+        self.call(method, recv, args)
+    }
     /// `a in b` (`instanceof: false`) or `a instanceof b` (`instanceof: true`).
     ///
     /// # Errors
@@ -2098,6 +2139,83 @@ fn vm_method_of_cached(
             vm_method_of(ctx, recv, key)
         }
     }
+}
+
+/// `Op::GetMethod`: a built-in the site proved before (`arr.push`, `m.get`,
+/// …, `native_call::try_get`), else [`vm_get_prop`]. (Out of line, as is
+/// [`call_got_method`]: the interpreter loop's own code stays as it was.)
+#[inline(never)]
+fn vm_get_method(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    recv: NanBox,
+    key: &str,
+    cache: &mut PropertyCache,
+) -> Result<NanBox, VmError> {
+    if let Some(v) = native_call::try_get(ctx, recv, key, cache) {
+        return Ok(v);
+    }
+    vm_get_prop(ctx, funcs, recv, key, cache)
+}
+
+/// [`Op::PlainPrims`] of one value: a primitive whose conversions run no
+/// code and cannot throw (not an object, a BigInt or a Symbol).
+pub(crate) fn plain_prim(realm: &Realm, v: NanBox) -> bool {
+    match v.as_handle() {
+        None => true,
+        Some(h) => realm.typeof_is_string(Handle::from_raw(h)),
+    }
+}
+
+/// `Op::CallWithMethod`: `Call(method, recv, args)` for the method
+/// `recv[key]` read before the arguments (registers `args` of `regs`). A VM
+/// closure is entered with the site's callee feedback noted (as
+/// `Op::CallMethod` does); a built-in the site memoizes is served directly
+/// (`native_call::try_call_got`); anything else is the host's call, whose
+/// non-callable `TypeError` names `key`.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn call_got_method(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: &[NanBox],
+    method: NanBox,
+    recv: NanBox,
+    key: &str,
+    args: &[Reg],
+    cache: &mut PropertyCache,
+) -> Result<NanBox, VmError> {
+    let vm = method
+        .as_handle()
+        .and_then(|h| ctx.realm.vm_function(Handle::from_raw(h)))
+        .map(|(f, c)| u64::from(f) | ((c.len() as u64) << 32));
+    match vm {
+        // The callee feedback the machine-code tier inlines from.
+        Some(k) => cache.note_callee(k),
+        None => {
+            if let Some(r) = native_call::try_call_got(ctx, funcs, method, recv, regs, args, cache)
+            {
+                return r;
+            }
+        }
+    }
+    let argv = ArgBuf::from_regs(regs, args);
+    // Publish the caller's registers so a collection at a back-edge inside
+    // the callee can see them (see `Ctx::frame_shadow`).
+    let pub_mark = ctx.frame_shadow.len();
+    ctx.frame_shadow.extend_from_slice(regs);
+    ctx.frames_published += 1;
+    // (A computed key's call is `Op::CallKey`'s: the plain call.)
+    let r = if vm.is_some() || ctx.host.is_none() || key.is_empty() {
+        call_closure(ctx, funcs, method, &argv, recv)
+    } else {
+        with_host(ctx, |h| h.call_got_method(method, recv, key, &argv))
+            .unwrap_or(Err(HostError::Fault))
+            .map_err(VmError::from)
+    };
+    ctx.frames_published -= 1;
+    ctx.frame_shadow.truncate(pub_mark);
+    r
 }
 
 /// The hidden marker a constructible VM function carries (see
@@ -6186,6 +6304,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         set_strict: jit_helper_set_prop_strict,
         set_site: jit_tier::jit_helper_set_prop_site,
         get_site: jit_tier::jit_helper_get_prop_site,
+        get_method_site: jit_tier::jit_helper_get_method_site,
         init_prop: jit_helper_init_prop,
         get_elem: jit_helper_get_elem,
         set_elem: jit_helper_set_elem,
@@ -6204,6 +6323,8 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         handler_frame: jit_tier::jit_helper_handler_frame,
         call_method: jit_tier::jit_helper_call_method,
         call_value: jit_tier::jit_helper_call_value,
+        call_with_method: jit_tier::jit_helper_call_with_method,
+        call_native_got: jit_tier::jit_helper_call_native_got,
         method_info: jit_tier::jit_method_info,
         construct: jit_tier::jit_helper_construct,
         call_this: jit_tier::jit_helper_call_this,
@@ -9287,6 +9408,40 @@ fn run_frame_at_ic(
                         None => return Err(VmError::Thrown(v)),
                     },
                     Err(other) => return Err(other),
+                }
+            }
+            Op::PlainPrims { dst, regs: rs } => {
+                let plain = rs.iter().all(|r| plain_prim(&ctx.realm, regs[*r as usize]));
+                regs[*dst as usize] = NanBox::boolean(plain);
+            }
+            Op::GetMethod { dst, obj, key } => {
+                let recv = regs[*obj as usize];
+                match vm_get_method(ctx, funcs, recv, key, site_cache!(site)) {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
+                }
+            }
+            Op::CallWithMethod {
+                dst,
+                callee,
+                recv,
+                key,
+                args,
+            } => {
+                let method = regs[*callee as usize];
+                let recv_val = regs[*recv as usize];
+                match call_got_method(
+                    ctx,
+                    funcs,
+                    regs,
+                    method,
+                    recv_val,
+                    key,
+                    args,
+                    site_cache!(site),
+                ) {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
                 }
             }
             Op::CallValueThis {
@@ -19001,6 +19156,11 @@ impl Compiler {
                     if self.hosted && !*optional {
                         self.ops.push(Op::RequireObjectCoercible { src: recv });
                     }
+                    // EvaluateCall reads the callee before the arguments: when
+                    // they could tell, the read comes first.
+                    if self.hosted && !self.args_pure(arguments) {
+                        return self.method_call_ordered(recv, key, None, arguments);
+                    }
                     let args = self.call_args(arguments)?;
                     let dst = self.alloc();
                     self.ops.push(Op::CallMethod {
@@ -19026,6 +19186,9 @@ impl Compiler {
                     let key = self.pin_operand(key, args_may_assign(arguments));
                     if self.hosted && !matches!(&**callee, Expr::Member { optional: true, .. }) {
                         self.ops.push(Op::RequireObjectCoercible { src: recv });
+                    }
+                    if self.hosted && !self.args_pure(arguments) {
+                        return self.method_call_ordered(recv, "", Some(key), arguments);
                     }
                     let args = self.call_args(arguments)?;
                     let dst = self.alloc();
@@ -19614,6 +19777,30 @@ impl Compiler {
                     ),
                     TagCall::Value(f) => TagCall::Value(self.pin_operand(f, subs_assign)),
                 };
+                // EvaluateCall reads a method tag before the substitutions
+                // run: when they could tell, the read comes first.
+                let pure = quasi.expressions.iter().all(|e| self.arg_pure(e));
+                let got = match &call {
+                    TagCall::Method(r, k) if !pure => {
+                        let f = self.alloc();
+                        self.ops.push(Op::GetMethod {
+                            dst: f,
+                            obj: *r,
+                            key: k.clone(),
+                        });
+                        Some(f)
+                    }
+                    TagCall::Key(r, k) if !pure => {
+                        let f = self.alloc();
+                        self.ops.push(Op::GetKey {
+                            dst: f,
+                            obj: *r,
+                            key: *k,
+                        });
+                        Some(f)
+                    }
+                    _ => None,
+                };
                 let strings = self.alloc();
                 self.ops.push(Op::TemplateObject {
                     dst: strings,
@@ -19632,6 +19819,21 @@ impl Compiler {
                     args.push(self.pin_operand(r, later));
                 }
                 let dst = self.alloc();
+                if let Some(callee) = got {
+                    let (recv, key) = match call {
+                        TagCall::Method(recv, key) => (recv, key),
+                        TagCall::Key(recv, _) => (recv, String::new()),
+                        TagCall::Value(_) => return Err(CompileError::Unsupported("tag")),
+                    };
+                    self.ops.push(Op::CallWithMethod {
+                        dst,
+                        callee,
+                        recv,
+                        key,
+                        args,
+                    });
+                    return Ok(dst);
+                }
                 self.ops.push(match call {
                     TagCall::Method(recv, key) => Op::CallMethod {
                         dst,
@@ -20551,6 +20753,215 @@ impl Compiler {
             this,
             args,
         });
+        Ok(dst)
+    }
+
+    /// Whether evaluating `e` provably runs no user code, cannot throw and
+    /// changes nothing a property read can see: a literal, a local binding
+    /// read with no TDZ check (not a global, which may be an accessor of the
+    /// global object, nor a `with`/eval-reachable name), `this` outside a
+    /// derived constructor, a function or arrow expression, and array/object
+    /// literals and `!`/`typeof`/`void` over such operands.
+    fn arg_pure(&self, e: &Expr) -> bool {
+        use crate::ast::UnaryOp as U;
+        match e {
+            Expr::Null(_)
+            | Expr::Bool { .. }
+            | Expr::Number { .. }
+            | Expr::BigInt { .. }
+            | Expr::Str { .. }
+            | Expr::Regex { .. }
+            | Expr::Function(_)
+            | Expr::Arrow(_) => true,
+            Expr::Template(t) => t.expressions.is_empty(),
+            Expr::This(_) => match self.lookup(THIS_NAME) {
+                // (A captured `this` may be a derived constructor's, unbound
+                // until `super()`.)
+                Some(b) => b.global.is_none() && !b.tdz && !b.cell,
+                None => !self.derived_ctor,
+            },
+            Expr::Ident(id) => {
+                if self.dyn_fn || self.env_resolves(&id.name) {
+                    return false;
+                }
+                match self.lookup(&id.name) {
+                    Some(b) => b.global.is_none() && !b.tdz,
+                    None => matches!(&*id.name, "undefined" | "NaN" | "Infinity"),
+                }
+            }
+            Expr::Unary { op, argument, .. } => match op {
+                U::Not | U::Typeof | U::Void => self.arg_pure(argument),
+                // ToNumeric of a numeric literal runs nothing.
+                U::Minus | U::Plus | U::BitNot => {
+                    matches!(&**argument, Expr::Number { .. } | Expr::BigInt { .. })
+                }
+                U::Delete => false,
+            },
+            Expr::Array { elements, .. } => elements.iter().all(|el| match el {
+                crate::ast::ArrayElement::Hole => true,
+                crate::ast::ArrayElement::Item(x) => self.arg_pure(x),
+                crate::ast::ArrayElement::Spread(_) => false,
+            }),
+            Expr::Object { members, .. } => members.iter().all(|m| match m {
+                crate::ast::ObjectMember::Property { key, value, .. } => {
+                    matches!(
+                        key,
+                        PropertyKey::Ident(_) | PropertyKey::Str(_) | PropertyKey::Number(_)
+                    ) && self.arg_pure(value)
+                }
+                _ => false,
+            }),
+            _ => false,
+        }
+    }
+
+    /// Whether every argument is [`arg_pure`](Self::arg_pure) (no spread):
+    /// then a method call may read its callee after them (`Op::CallMethod`),
+    /// which no program can tell from EvaluateCall's order (the callee's
+    /// GetValue — a getter, a proxy trap — first).
+    fn args_pure(&self, arguments: &[crate::ast::Argument]) -> bool {
+        arguments.iter().all(|a| match a {
+            crate::ast::Argument::Item(x) => self.arg_pure(x),
+            crate::ast::Argument::Spread(_) => false,
+        })
+    }
+
+    /// Whether `e` is an operator expression over primitive operands — the
+    /// literals, and the local bindings [`arg_pure`](Self::arg_pure) reads,
+    /// collected in `leaves` — whose evaluation runs no code and cannot
+    /// throw as long as every leaf holds an [`Op::PlainPrims`] value: `+`,
+    /// the arithmetic, bitwise, relational and equality operators, `!`, `-`,
+    /// `+`, `~`, `typeof`, `void`, `&&`/`||`/`??`, `?:` and templates.
+    fn operand_plain<'e>(&self, e: &'e Expr, leaves: &mut Vec<&'e Expr>) -> bool {
+        use crate::ast::BinaryOp as B;
+        match e {
+            Expr::Null(_) | Expr::Bool { .. } | Expr::Number { .. } | Expr::Str { .. } => true,
+            Expr::Ident(id) if matches!(&*id.name, "undefined" | "NaN" | "Infinity") => {
+                self.arg_pure(e)
+            }
+            Expr::Ident(_) | Expr::This(_) if self.arg_pure(e) => {
+                leaves.push(e);
+                true
+            }
+            Expr::Template(t) => t.expressions.iter().all(|x| self.operand_plain(x, leaves)),
+            Expr::Unary { op, argument, .. } => {
+                !matches!(op, crate::ast::UnaryOp::Delete) && self.operand_plain(argument, leaves)
+            }
+            Expr::Binary {
+                op, left, right, ..
+            } => {
+                !matches!(op, B::In | B::Instanceof)
+                    && self.operand_plain(left, leaves)
+                    && self.operand_plain(right, leaves)
+            }
+            Expr::Logical { left, right, .. } => {
+                self.operand_plain(left, leaves) && self.operand_plain(right, leaves)
+            }
+            Expr::Conditional {
+                test,
+                consequent,
+                alternate,
+                ..
+            } => {
+                self.operand_plain(test, leaves)
+                    && self.operand_plain(consequent, leaves)
+                    && self.operand_plain(alternate, leaves)
+            }
+            _ => false,
+        }
+    }
+
+    /// For arguments that are not [`args_pure`](Self::args_pure) but each
+    /// pure or [`operand_plain`](Self::operand_plain): the leaves whose
+    /// values an [`Op::PlainPrims`] guard must check (none: the arguments
+    /// can never tell when the method is read).
+    fn args_guard<'e>(&self, arguments: &'e [crate::ast::Argument]) -> Option<Vec<&'e Expr>> {
+        let mut leaves = Vec::new();
+        for a in arguments {
+            let crate::ast::Argument::Item(x) = a else {
+                return None;
+            };
+            if !self.arg_pure(x) && !self.operand_plain(x, &mut leaves) {
+                return None;
+            }
+        }
+        Some(leaves)
+    }
+
+    /// A hosted method call `recv[key](args)` (`key` a static name, or the
+    /// computed key in register `ckey`) with arguments that are not
+    /// [`args_pure`](Self::args_pure): the callee is read before them
+    /// (`Op::GetMethod` / `Op::GetKey`, then `Op::CallWithMethod`). When they
+    /// are operators over values an [`Op::PlainPrims`] guard can check, the
+    /// guard picks between that and the ordinary call (`Op::CallMethod` /
+    /// `Op::CallKey`), which no program can tell from it then.
+    fn method_call_ordered(
+        &mut self,
+        recv: Reg,
+        key: &str,
+        ckey: Option<Reg>,
+        arguments: &[crate::ast::Argument],
+    ) -> Result<Reg, CompileError> {
+        let dst = self.alloc();
+        let mut done = None;
+        if let Some(leaves) = self.args_guard(arguments) {
+            let mut regs = Vec::with_capacity(leaves.len());
+            for l in &leaves {
+                regs.push(self.expr(l)?);
+            }
+            let slow = if regs.is_empty() {
+                None
+            } else {
+                let ok = self.alloc();
+                self.ops.push(Op::PlainPrims { dst: ok, regs });
+                Some(self.emit_jump_if_false(ok))
+            };
+            let args = self.call_args(arguments)?;
+            self.ops.push(match ckey {
+                None => Op::CallMethod {
+                    dst,
+                    recv,
+                    key: String::from(key),
+                    args,
+                },
+                Some(k) => Op::CallKey {
+                    dst,
+                    recv,
+                    key: k,
+                    args,
+                },
+            });
+            let Some(slow) = slow else {
+                return Ok(dst);
+            };
+            done = Some(self.emit_jump());
+            self.patch(slow);
+        }
+        let f = self.alloc();
+        self.ops.push(match ckey {
+            None => Op::GetMethod {
+                dst: f,
+                obj: recv,
+                key: String::from(key),
+            },
+            Some(k) => Op::GetKey {
+                dst: f,
+                obj: recv,
+                key: k,
+            },
+        });
+        let f = self.pin_operand(f, args_may_assign(arguments));
+        let args = self.call_args(arguments)?;
+        self.ops.push(Op::CallWithMethod {
+            dst,
+            callee: f,
+            recv,
+            key: String::from(key),
+            args,
+        });
+        if let Some(j) = done {
+            self.patch(j);
+        }
         Ok(dst)
     }
 

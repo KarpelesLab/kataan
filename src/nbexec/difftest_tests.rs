@@ -1595,3 +1595,39 @@ fn set_year_out_of_range_is_nan() {
     "#;
     assert_eq!(run(src), "NaN,NaN,NaN,NaN,915148800000");
 }
+
+/// EvaluateCall reads a method (its getter, a proxy `get` trap) before the
+/// arguments are evaluated, and calls the method it read: an argument that
+/// replaces or deletes it does not change the call. The engine read the
+/// method after its arguments (`Op::CallMethod`); it now reads it first
+/// whenever the arguments could tell (`Op::GetMethod` + `Op::CallWithMethod`,
+/// behind an `Op::PlainPrims` guard for operators over plain values).
+#[test]
+fn method_call_reads_the_callee_before_its_arguments() {
+    let src = r#"
+        var log = [];
+        function A(x) { log.push("arg" + x); return x; }
+        var o = { get f() { log.push("get"); return function (x) { log.push("f" + x); }; } };
+        o.f(A(1)); o["f"](A(2));
+        var p = new Proxy({ g(x) { log.push("g" + x); } },
+          { get(t, k) { log.push("trap"); return t[k]; } });
+        p.g(A(3));
+        var q = { m(x) { log.push("old" + x); } };
+        q.m((q.m = function (x) { log.push("new" + x); }, 4)); q.m(5);
+        var r = { m(x) { log.push("r" + x); } };
+        r.m((delete r.m, 6));
+        var t = { get tag() { log.push("tag"); return function (s, x) { log.push("t" + x); }; } };
+        t.tag`a${A(7)}`;
+        var v = { m(x) { log.push("v" + x); } };
+        var w = { valueOf() { v.m = function () { log.push("vnew"); }; return 8; } };
+        v.m(w + 0);
+        var a = []; a.push((a.push = function () { log.push("fake"); }, 9));
+        var s = 0, u = { add(x) { return x + 1; } };
+        for (var i = 0; i < 50; i++) s += u.add(i * 2);
+        log.join() + "|" + a.join() + "|" + s
+    "#;
+    assert_eq!(
+        run(src),
+        "get,arg1,f1,get,arg2,f2,trap,arg3,g3,old4,new5,r6,tag,arg7,t7,v8|9|2500"
+    );
+}

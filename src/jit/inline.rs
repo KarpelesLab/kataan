@@ -248,19 +248,27 @@ fn remap(op: &mut Op, reg: &dyn Fn(Reg) -> Reg, target: &dyn Fn(usize) -> usize)
     true
 }
 
-/// The call op at a site, as `(dst, callee or receiver, args, is a method
-/// call)`: a method call, a call of a value, or a property read that calls
-/// an inherited getter.
-fn call_parts(op: &Op) -> Option<(Reg, Reg, &[Reg], bool)> {
+/// The call op at a site, as `(dst, callee or receiver, args, this)`: a
+/// method call (`this` its receiver), a call of a value (`this` undefined),
+/// a call of a method read before its arguments, or a property read that
+/// calls an inherited getter.
+fn call_parts(op: &Op) -> Option<(Reg, Reg, &[Reg], Option<Reg>)> {
     match op {
-        Op::GetProp { dst, obj, .. } => Some((*dst, *obj, &[], true)),
+        Op::GetProp { dst, obj, .. } => Some((*dst, *obj, &[], Some(*obj))),
         Op::CallMethod {
             dst,
             recv,
             key,
             args,
-        } if key != "caller" => Some((*dst, *recv, args, true)),
-        Op::CallValue { dst, callee, args } => Some((*dst, *callee, args, false)),
+        } if key != "caller" => Some((*dst, *recv, args, Some(*recv))),
+        Op::CallValue { dst, callee, args } => Some((*dst, *callee, args, None)),
+        Op::CallWithMethod {
+            dst,
+            callee,
+            recv,
+            args,
+            ..
+        } => Some((*dst, *callee, args, Some(*recv))),
         _ => None,
     }
 }
@@ -279,12 +287,13 @@ pub fn expand<'a>(
     let mut added = 0usize;
     let mut window = 0usize;
     for (pc, op) in proto.ops.iter().enumerate() {
-        let Some((dst, callee, args, _)) = call_parts(op) else {
+        let Some((dst, callee, args, this)) = call_parts(op) else {
             continue;
         };
         if args.len() > 32
             || (dst as usize) >= base
             || (callee as usize) >= base
+            || this.is_some_and(|t| (t as usize) >= base)
             || args.iter().any(|&a| (a as usize) >= base)
         {
             continue;
@@ -331,7 +340,7 @@ pub fn expand<'a>(
         if si < sites.len() && sites[si].0 == pc {
             let c = &sites[si].1;
             si += 1;
-            let (dst, callee, args, method) = call_parts(op)?;
+            let (dst, callee, args, this) = call_parts(op)?;
             let g = ops.len();
             let p = c.proto;
             let rb = |r: Reg| -> Reg { (base + r as usize) as Reg };
@@ -385,10 +394,10 @@ pub fn expand<'a>(
                             value: undefined,
                         },
                     }
-                } else if r == this_slot && method {
+                } else if let Some(t) = this.filter(|_| r == this_slot) {
                     Op::Move {
                         dst: rb(r as Reg),
-                        src: callee,
+                        src: t,
                     }
                 } else {
                     Op::LoadConst {

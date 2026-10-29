@@ -1838,6 +1838,20 @@ pub enum GenericOp {
         /// Index into the per-site call caches (an inherited getter's call).
         call: u16,
     },
+    /// An `Op::GetMethod`'s read (the tier's bytecode holds it as a
+    /// `GetProp`): looked up as `CallMethod` looks its method up — the
+    /// site's chain cache inline, else `jit_helper_get_method_site`, which
+    /// first asks the site's built-in memo.
+    GetMethod {
+        /// Destination register.
+        dst: u16,
+        /// Register holding the receiver.
+        obj: u16,
+        /// Index into the per-site key/IC table.
+        site: u16,
+        /// Index into the per-site call caches (the helper's getter cache).
+        call: u16,
+    },
     /// `reg[obj].key = reg[val]` — a plain (static-string-key) sloppy-mode
     /// property set, inline in-place store on a shape hit, else
     /// `jit_helper_set_prop` (the interpreter's `vm_set_prop_mode(.., false)`).
@@ -2146,6 +2160,39 @@ pub enum GenericOp {
         site: u16,
         /// Index into the per-site call caches.
         cache: u16,
+        /// The bytecode pc of the op (its slow path).
+        pc: u32,
+    },
+    /// `Op::CallWithMethod` (`callee(args)` with `this` the receiver, the
+    /// method read before the arguments): the native call sequence into a
+    /// compiled callee, guarded on the site's cache `cache`, as `CallValue`;
+    /// anything else is `jit_helper_call_with_method` (the interpreter's call
+    /// half, a built-in served through the site's memo, refilling the cache).
+    CallWithMethod {
+        /// Destination register.
+        dst: u16,
+        /// Register holding the method.
+        callee: u16,
+        /// The receiver register (`this`).
+        recv: u16,
+        /// Index into the per-call-site argument-register table.
+        site: u16,
+        /// Index into the per-site call caches.
+        cache: u16,
+        /// The per-site key/IC table index (the built-in memo's cache).
+        ic: u16,
+        /// The bytecode pc of the op (its slow path).
+        pc: u32,
+    },
+    /// `Op::PlainPrims`: `true` inline when no checked register holds a heap
+    /// value (or is known to hold a Number), else the interpreter's op (a
+    /// String is plain too).
+    PlainPrims {
+        /// Destination register.
+        dst: u16,
+        /// Index into the per-call-site argument-register table (the
+        /// checked registers).
+        site: u16,
         /// The bytecode pc of the op (its slow path).
         pc: u32,
     },
@@ -2485,6 +2532,46 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
                     pc: pc32,
                 }
             }
+            Op::CallWithMethod {
+                dst,
+                callee,
+                recv,
+                key,
+                args,
+            } if args.len() <= 32 => {
+                let mut argregs: Vec<u16> = Vec::with_capacity(args.len());
+                for a in args {
+                    argregs.push(r(*a)?);
+                }
+                let site = u16::try_from(call_args.len()).ok()?;
+                call_args.push(argregs);
+                let cache = u16::try_from(n_calls).ok()?;
+                n_calls += 1;
+                let ic = u16::try_from(keys.len()).ok()?;
+                keys.push(alloc::boxed::Box::from(key.as_str()));
+                GenericOp::CallWithMethod {
+                    dst: r(*dst)?,
+                    callee: r(*callee)?,
+                    recv: r(*recv)?,
+                    site,
+                    cache,
+                    ic,
+                    pc: pc32,
+                }
+            }
+            Op::PlainPrims { dst, regs } if regs.len() <= 32 => {
+                let mut rs: Vec<u16> = Vec::with_capacity(regs.len());
+                for a in regs {
+                    rs.push(r(*a)?);
+                }
+                let site = u16::try_from(call_args.len()).ok()?;
+                call_args.push(rs);
+                GenericOp::PlainPrims {
+                    dst: r(*dst)?,
+                    site,
+                    pc: pc32,
+                }
+            }
             Op::CallValue { dst, callee, args } if args.len() <= 32 => {
                 let mut argregs: Vec<u16> = Vec::with_capacity(args.len());
                 for a in args {
@@ -2526,6 +2613,9 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
                         ..
                     }) => recv == callee && a == args && k != "caller",
                     Some(Op::CallValue {
+                        callee: c, args: a, ..
+                    })
+                    | Some(Op::CallWithMethod {
                         callee: c, args: a, ..
                     }) => c == callee && a == args,
                     Some(Op::GetProp { obj, .. }) => obj == callee && args.is_empty(),
@@ -2868,6 +2958,9 @@ pub struct GenericHelpers {
     /// The property-get helper through the site's chain and call caches
     /// (`jit_helper_get_prop_site`).
     pub get_site: JitGetSiteHelper,
+    /// [`get_site`](Self::get_site) for an `Op::GetMethod`'s read, which
+    /// first asks the site's built-in memo (`jit_helper_get_method_site`).
+    pub get_method_site: JitGetSiteHelper,
     /// The property-set helper (`jit_helper_set_prop`), sloppy mode.
     pub set: JitSetPropHelper,
     /// The strict-mode property-set helper (`jit_helper_set_prop_strict`).
@@ -2959,6 +3052,14 @@ pub struct GenericHelpers {
     /// op, site)`, `site` the `CallSite`): the interpreter's call, which also
     /// refills the site's cache.
     pub call_value: JitCallMethodHelper,
+    /// `Op::CallWithMethod`'s slow path (`jit_helper_call_with_method(ctx,
+    /// regs, n_regs, op, cache, site)`, `cache` the site's `PropertyCache`,
+    /// `site` its `CallSite`): the interpreter's call half, refilling the
+    /// site's cache.
+    pub call_with_method: JitCallMethodHelper,
+    /// [`call_with_method`](Self::call_with_method) for the built-in the
+    /// site's identity memo names (`jit_helper_call_native_got`, same ABI).
+    pub call_native_got: JitCallMethodHelper,
     /// The call sequence's callee identification (`jit_callee_info`).
     pub callee_info: CalleeHelper,
     /// Where the call sequence finds the interpreter state it maintains.
@@ -3530,6 +3631,31 @@ impl JitProto {
             }
             None => (proto, warm.to_vec(), None),
         };
+        // An `Op::GetMethod` is a `GetProp` here (the same `[[Get]]`, also in
+        // every analysis and in the interpreter's one-op fallback), whose slow
+        // path first asks the site's built-in memo.
+        let method_gets: Vec<bool> = proto
+            .ops
+            .iter()
+            .map(|o| matches!(o, crate::nbvm::Op::GetMethod { .. }))
+            .collect();
+        let as_gets;
+        let proto = if method_gets.contains(&true) {
+            let mut p = proto.clone();
+            for op in &mut p.ops {
+                if let crate::nbvm::Op::GetMethod { dst, obj, key } = op {
+                    *op = crate::nbvm::Op::GetProp {
+                        dst: *dst,
+                        obj: *obj,
+                        key: core::mem::take(key),
+                    };
+                }
+            }
+            as_gets = p;
+            &as_gets
+        } else {
+            proto
+        };
         let warm = &warm[..];
         let inline_closures: Vec<bool> = proto
             .ops
@@ -3541,7 +3667,26 @@ impl JitProto {
                 _ => false,
             })
             .collect();
-        let (ops, keys, call_args, n_calls) = lower_nbvm_generic(proto)?;
+        let (mut ops, keys, call_args, n_calls) = lower_nbvm_generic(proto)?;
+        for (op, &m) in ops.iter_mut().zip(&method_gets) {
+            if let (
+                true,
+                GenericOp::GetProp {
+                    dst,
+                    obj,
+                    site,
+                    call,
+                },
+            ) = (m, *op)
+            {
+                *op = GenericOp::GetMethod {
+                    dst,
+                    obj,
+                    site,
+                    call,
+                };
+            }
+        }
         // One persistent cache per `CallValue` site (stable addresses, as below).
         let calls: alloc::boxed::Box<[core::cell::UnsafeCell<CallSite>]> = (0..n_calls)
             .map(|_| core::cell::UnsafeCell::new(CallSite::new()))
@@ -3601,7 +3746,8 @@ impl JitProto {
         for op in &ops {
             if let GenericOp::CallMethod { site, .. }
             | GenericOp::SetProp { site, .. }
-            | GenericOp::GetProp { site, .. } = *op
+            | GenericOp::GetProp { site, .. }
+            | GenericOp::GetMethod { site, .. } = *op
                 && let Some(w) = wants.get_mut(site as usize)
             {
                 *w = true;
@@ -3642,6 +3788,7 @@ impl JitProto {
             .filter_map(|(at, op)| match *op {
                 GenericOp::CallMethod { pc, cache, .. }
                 | GenericOp::CallValue { pc, cache, .. }
+                | GenericOp::CallWithMethod { pc, cache, .. }
                     if cache != u16::MAX =>
                 {
                     Some((pc, cache))
@@ -3752,6 +3899,7 @@ impl JitProto {
                 }
                 crate::nbvm::Op::CallMethod { .. }
                 | crate::nbvm::Op::CallValue { .. }
+                | crate::nbvm::Op::CallWithMethod { .. }
                 | crate::nbvm::Op::GetProp { .. } => {
                     if let Some(k) = site_of(pc).map(keys) {
                         *slot = match k[..] {
@@ -5938,6 +6086,9 @@ impl JitFunction {
         }
         let add_helper = helpers.add as usize as u64;
         let get_site_helper = helpers.get_site as usize as u64;
+        let get_method_site_helper = helpers.get_method_site as usize as u64;
+        let call_with_method_helper = helpers.call_with_method as usize as u64;
+        let call_native_got_helper = helpers.call_native_got as usize as u64;
         let set_site_helper = helpers.set_site as usize as u64;
         let init_prop_helper = helpers.init_prop as usize as u64;
         let get_elem_helper = helpers.get_elem as usize as u64;
@@ -6124,7 +6275,8 @@ impl JitFunction {
                 .filter_map(|o| match *o {
                     GenericOp::InlineGuard { call, .. } => match ops.get(call as usize)? {
                         GenericOp::CallMethod { args, .. }
-                        | GenericOp::CallValue { site: args, .. } => {
+                        | GenericOp::CallValue { site: args, .. }
+                        | GenericOp::CallWithMethod { site: args, .. } => {
                             call_args.get(*args as usize).map(Vec::len)
                         }
                         _ => Some(0),
@@ -6680,7 +6832,8 @@ impl JitFunction {
                                 call_args.get(*args as usize)?,
                             )
                         }
-                        GenericOp::CallValue { callee, site, .. } => (
+                        GenericOp::CallValue { callee, site, .. }
+                        | GenericOp::CallWithMethod { callee, site, .. } => (
                             call_seq::CalleeSrc::Reg(*callee),
                             call_args.get(*site as usize)?,
                         ),
@@ -6712,7 +6865,8 @@ impl JitFunction {
                     let memo = call_sites
                         .get(match ops.get(call as usize)? {
                             GenericOp::CallMethod { cache, .. }
-                            | GenericOp::CallValue { cache, .. } => *cache as usize,
+                            | GenericOp::CallValue { cache, .. }
+                            | GenericOp::CallWithMethod { cache, .. } => *cache as usize,
                             GenericOp::GetProp { call, .. } => *call as usize,
                             _ => return None,
                         })
@@ -7718,6 +7872,52 @@ impl JitFunction {
                         a.bind(done);
                     }
                 }
+                GenericOp::GetMethod {
+                    dst,
+                    obj,
+                    site,
+                    call,
+                } => {
+                    if !ok(dst) || !ok(obj) {
+                        return None;
+                    }
+                    let call_site = *call_sites.get(call as usize)?;
+                    let s = sites.get(site as usize)?;
+                    if s.method_ptr.is_null() {
+                        return None;
+                    }
+                    let helper = a.new_label();
+                    let done = a.new_label();
+                    // An `Op::GetMethod`'s read, as `CallMethod` looks its
+                    // method up: the site's chain cache inline (own or
+                    // inherited data), else the helper (which serves a
+                    // built-in through the site's memo).
+                    a.p_method_lookup(
+                        &layout,
+                        helpers.call_layout.realm,
+                        (call_seq::r::RBX, disp(obj)),
+                        s.method_ptr,
+                        helper,
+                        None,
+                    );
+                    a.store_rax(disp(dst));
+                    a.jmp(done);
+                    a.bind(helper);
+                    // (In a speculative loop's fast version, which makes
+                    // no call, the slow path leaves for the plain copy.)
+                    if let Some(b) = num.spec_bail(&mut a, op_idx) {
+                        a.jmp(b);
+                    }
+                    a.mov_rdi_r15();
+                    a.load_argreg(1, disp(obj));
+                    a.movabs_argreg(2, s.method_ptr as i64);
+                    a.movabs_argreg(3, call_site as i64);
+                    a.movabs_rax(get_method_site_helper as i64);
+                    a.call_rax();
+                    throw_check!();
+                    a.store_rax(disp(dst));
+                    a.bind(done);
+                }
                 GenericOp::SetProp {
                     obj,
                     val,
@@ -8477,6 +8677,97 @@ impl JitFunction {
                     a.movabs_argreg(4, site_ptr as i64);
                     a.movabs_argreg(5, 0);
                     a.movabs_rax(construct_slow_helper as i64);
+                    a.call_rax();
+                    throw_check!();
+                    a.bind(done);
+                }
+                GenericOp::PlainPrims { dst, site, pc } => {
+                    let rs = call_args.get(site as usize)?;
+                    if !ok(dst) || rs.iter().any(|&r| !ok(r)) || pc as usize != op_idx {
+                        return None;
+                    }
+                    let slow = a.new_label();
+                    let done = a.new_label();
+                    for &r in rs {
+                        if num.is_number_at(op_idx, r) {
+                            continue;
+                        }
+                        // A heap value (a String among them): the interpreter's.
+                        a.load_rax(disp(r));
+                        a.movabs_r11(HANDLE_TAG as i64);
+                        a.and_rax_r11();
+                        a.cmp_rax_r11();
+                        a.je(slow);
+                    }
+                    a.movabs_rax(tag_true as i64);
+                    a.store_rax(disp(dst));
+                    a.jmp(done);
+                    a.bind(slow);
+                    exec_op!(pc);
+                    a.bind(done);
+                }
+                GenericOp::CallWithMethod {
+                    dst,
+                    callee,
+                    recv,
+                    site,
+                    cache,
+                    ic,
+                    pc,
+                } => {
+                    let args = call_args.get(site as usize)?;
+                    if !ok(dst) || !ok(callee) || !ok(recv) || args.iter().any(|&r| !ok(r)) {
+                        return None;
+                    }
+                    if pc as usize != op_idx {
+                        return None;
+                    }
+                    let site_ptr = *call_sites.get(cache as usize)?;
+                    let si = sites.get(ic as usize)?;
+                    let slow = a.new_label();
+                    let done = a.new_label();
+                    call_seq::emit_call(
+                        &mut a,
+                        &call_seq::CallEmit {
+                            dst,
+                            callee: call_seq::CalleeSrc::Reg(callee),
+                            this: Some(recv),
+                            args,
+                            site: site_ptr,
+                            layout: &helpers.call_layout,
+                            throw_exit,
+                            slow,
+                            done,
+                        },
+                    )?;
+                    a.bind(slow);
+                    let native = a.new_label();
+                    // The built-in the site's helper last served (its bits
+                    // in the site's identity memo): straight to the helper
+                    // that serves it.
+                    a.load_rax(disp(callee));
+                    a.g_movabs(call_seq::r::R11, site_ptr as u64);
+                    a.g_cmp_mem(call_seq::r::RAX, call_seq::r::R11, call_seq::IDENT_KEY);
+                    a.g_jcc(call_seq::cc::E, native);
+                    let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
+                    a.mov_rdi_r15();
+                    a.mov_rsi_rbx();
+                    a.movabs_argreg(2, n_regs as i64);
+                    a.movabs_argreg(3, op_ptr as i64);
+                    a.movabs_argreg(4, si.cache_ptr as i64);
+                    a.movabs_argreg(5, site_ptr as i64);
+                    a.movabs_rax(call_with_method_helper as i64);
+                    a.call_rax();
+                    throw_check!();
+                    a.jmp(done);
+                    a.bind(native);
+                    a.mov_rdi_r15();
+                    a.mov_rsi_rbx();
+                    a.movabs_argreg(2, n_regs as i64);
+                    a.movabs_argreg(3, op_ptr as i64);
+                    a.movabs_argreg(4, si.cache_ptr as i64);
+                    a.movabs_argreg(5, site_ptr as i64);
+                    a.movabs_rax(call_native_got_helper as i64);
                     a.call_rax();
                     throw_check!();
                     a.bind(done);

@@ -435,29 +435,150 @@ pub(super) fn try_call(
             return None;
         }
     }
+    let (op, method) = (site.op, site.method);
+    run_op(ctx, funcs, op, method, recv, h, prim, regs, args)
+}
+
+/// `Call(method, recv, args…)` for a method value already read (EvaluateCall
+/// reads a callee before its arguments): served here when `method` is one of
+/// the built-ins of [`classify`], memoized per site by the method cell.
+/// `None` to take the ordinary path.
+pub(super) fn try_call_got(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    method: NanBox,
+    recv: NanBox,
+    regs: &[NanBox],
+    args: &[Reg],
+    cache: &mut PropertyCache,
+) -> Option<Result<NanBox, VmError>> {
+    if ctx.host.is_none() || ctx.realm.multi_realm || method.as_handle().is_none() {
+        return None;
+    }
+    let (h, prim) = match recv.as_handle() {
+        Some(r) => (Handle::from_raw(r), false),
+        None if recv.as_number().is_some() => (ctx.realm.primitive_proto(recv)?, true),
+        None => return None,
+    };
+    let site = cache.native.get_or_insert_with(|| {
+        Box::new(NativeSite {
+            chain: MethodSiteCache::default(),
+            method: 0,
+            op: FastOp::None,
+            fills: 0,
+        })
+    });
+    if site.method != method.to_bits() {
+        if site.fills >= FILL_LIMIT {
+            site.op = FastOp::None;
+            return None;
+        }
+        site.fills += 1;
+        site.method = method.to_bits();
+        site.op = classify(&ctx.realm, method);
+    }
+    if site.op == FastOp::None {
+        return None;
+    }
+    let (op, method) = (site.op, site.method);
+    run_op(ctx, funcs, op, method, recv, h, prim, regs, args)
+}
+
+/// `recv[key]` when the site (an `Op::GetMethod`'s) proves it is the
+/// built-in it recorded, as [`try_call`] proves its method (see the module
+/// docs): that very function cell, read without running code. `None` to take
+/// the ordinary `[[Get]]`.
+pub(super) fn try_get(
+    ctx: &mut Ctx,
+    recv: NanBox,
+    key: &str,
+    cache: &mut PropertyCache,
+) -> Option<NanBox> {
+    if ctx.host.is_none() || ctx.realm.multi_realm {
+        return None;
+    }
+    let (h, prim) = match recv.as_handle() {
+        Some(r) => (Handle::from_raw(r), false),
+        None if recv.as_number().is_some() => (ctx.realm.primitive_proto(recv)?, true),
+        None => return None,
+    };
+    let site = cache.native.get_or_insert_with(|| {
+        Box::new(NativeSite {
+            chain: MethodSiteCache::default(),
+            method: 0,
+            op: FastOp::None,
+            fills: 0,
+        })
+    });
+    // (The proof `site_hit` / `fill` make for `try_call`, written out here so
+    // that those stay `try_call`'s alone: inlined into it as before.)
+    let hit = site.op != FastOp::None
+        && if prim {
+            ctx.realm.method_site_get_prim(h, key, &mut site.chain)
+        } else {
+            ctx.realm.method_site_get(h, key, &mut site.chain)
+        }
+        .is_some_and(|v| v.to_bits() == site.method);
+    if !hit {
+        if site.fills >= FILL_LIMIT || !cacheable_key(key) {
+            site.op = FastOp::None;
+            return None;
+        }
+        site.fills += 1;
+        site.op = FastOp::None;
+        let found = if prim {
+            ctx.realm.method_site_fill_prim(h, key, &mut site.chain)
+        } else {
+            ctx.realm.method_site_fill(h, key, &mut site.chain)
+        };
+        let v = found?;
+        site.op = classify(&ctx.realm, v);
+        site.method = v.to_bits();
+        if site.op == FastOp::None {
+            return None;
+        }
+    }
+    Some(NanBox::from_bits(site.method))
+}
+
+/// The rest of [`try_call`] / [`try_call_got`] once the site knows its
+/// built-in `op` (the function cell `method`).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn run_op(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    op: FastOp,
+    method: u64,
+    recv: NanBox,
+    h: Handle,
+    prim: bool,
+    regs: &[NanBox],
+    args: &[Reg],
+) -> Option<Result<NanBox, VmError>> {
     // Only the Number methods take a primitive receiver; anything else the
     // chain of `%Number.prototype%` reaches (`hasOwnProperty`, …) would get
     // the prototype as its `this`.
-    if prim != matches!(site.op, FastOp::NumToFixed | FastOp::NumToString) {
+    if prim != matches!(op, FastOp::NumToFixed | FastOp::NumToString) {
         return None;
     }
     let arg = |i: usize| {
         args.get(i)
             .map_or(NanBox::undefined(), |r| regs[*r as usize])
     };
-    if let FastOp::ArrayHof(op) = site.op {
+    if let FastOp::ArrayHof(op) = op {
         let argv = super::ArgBuf::from_regs(regs, args);
         return super::array_hof::run(ctx, funcs, regs, recv, op, &argv);
     }
     // A RegExp and a VM function: the replacer calls run here
     // (`str_replace`).
-    if matches!(site.op, FastOp::StrReplace | FastOp::StrReplaceAll) {
-        let all = site.op == FastOp::StrReplaceAll;
+    if matches!(op, FastOp::StrReplace | FastOp::StrReplaceAll) {
+        let all = op == FastOp::StrReplaceAll;
         if let Some(r) = super::str_replace::try_run(ctx, funcs, regs, recv, args, all) {
             return Some(r);
         }
         if all {
-            let method = NanBox::from_bits(site.method);
+            let method = NanBox::from_bits(method);
             let argv = super::ArgBuf::from_regs(regs, args);
             return Some(
                 with_host(ctx, |host| host.call(method, recv, &argv))
@@ -467,7 +588,7 @@ pub(super) fn try_call(
         }
     }
     let realm = &mut ctx.realm;
-    let v = match site.op {
+    let v = match op {
         FastOp::None | FastOp::ArrayHof(_) | FastOp::StrReplaceAll => return None,
         #[cfg(feature = "std")]
         FastOp::Math(id) => super::math_fast::compute(realm, id, args, regs)?,
@@ -558,7 +679,7 @@ pub(super) fn try_call(
             let idx = (n > -1.0).then_some(n as usize);
             realm.flatten_string(h);
             let unit = realm.string_unit_at_index(h, idx)?;
-            match (site.op, unit) {
+            match (op, unit) {
                 (FastOp::StrCharCodeAt, Some(u)) => NanBox::number(f64::from(u)),
                 (FastOp::StrCharCodeAt, None) => NanBox::number(f64::NAN),
                 (_, Some(u)) => NanBox::handle(realm.unit_string(u).to_raw()),
@@ -572,11 +693,11 @@ pub(super) fn try_call(
         | FastOp::SetAdd
         | FastOp::SetHas
         | FastOp::SetDelete => {
-            let want_set = matches!(site.op, FastOp::SetAdd | FastOp::SetHas | FastOp::SetDelete);
+            let want_set = matches!(op, FastOp::SetAdd | FastOp::SetHas | FastOp::SetDelete);
             if realm.collection_is_set(h) != Some(want_set) || realm.collection_is_weak(h) {
                 return None;
             }
-            match site.op {
+            match op {
                 FastOp::MapGet => realm
                     .collection_get(h, arg(0))
                     .unwrap_or(NanBox::undefined()),
@@ -634,7 +755,7 @@ pub(super) fn try_call(
             let (bytes, units) = (rope.as_leaf_bytes()?, rope.utf16_len());
             let start = int_arg(arg(0))?.unwrap_or(0.0);
             let end = int_arg(arg(1))?;
-            let (a, b) = if site.op == FastOp::StrSlice {
+            let (a, b) = if op == FastOp::StrSlice {
                 let idx = |n: f64| -> usize {
                     if n < 0.0 {
                         (units as f64 + n).max(0.0) as usize
@@ -660,13 +781,9 @@ pub(super) fn try_call(
             let rope = str_parts(realm, h)?;
             let (bytes, units) = (rope.as_leaf_bytes()?, rope.utf16_len());
             let pat = needle.as_leaf_bytes()?;
-            let default = if site.op == FastOp::StrEndsWith {
-                units
-            } else {
-                0
-            };
+            let default = if op == FastOp::StrEndsWith { units } else { 0 };
             let pos = int_arg(arg(1))?.map_or(default, |n| (n.max(0.0) as usize).min(units));
-            NanBox::boolean(match site.op {
+            NanBox::boolean(match op {
                 FastOp::StrStartsWith => {
                     crate::nbexec::starts_with_at_units(bytes, pat, pos, rope.is_ascii())
                 }
@@ -702,7 +819,7 @@ pub(super) fn try_call(
                 return None;
             }
             let this = arg(0);
-            let argv: alloc::vec::Vec<NanBox> = if site.op == FastOp::FnCall {
+            let argv: alloc::vec::Vec<NanBox> = if op == FastOp::FnCall {
                 args.iter().skip(1).map(|r| regs[*r as usize]).collect()
             } else {
                 // CreateListFromArrayLike of a plain dense array reads only its
@@ -736,7 +853,7 @@ pub(super) fn try_call(
         }
         FastOp::RegExpCall => {
             realm.regexp_flags(h)?;
-            let method = NanBox::from_bits(site.method);
+            let method = NanBox::from_bits(method);
             let argv = super::ArgBuf::from_regs(regs, args);
             return Some(
                 with_host(ctx, |host| host.call_regexp_method(method, recv, &argv))
@@ -745,7 +862,7 @@ pub(super) fn try_call(
             );
         }
         FastOp::HostDirect => {
-            let method = NanBox::from_bits(site.method);
+            let method = NanBox::from_bits(method);
             let argv = super::ArgBuf::from_regs(regs, args);
             return Some(
                 with_host(ctx, |host| host.call(method, recv, &argv))
@@ -793,7 +910,7 @@ pub(super) fn try_call(
                 }
             };
             let tail = elems.get(from..).unwrap_or(&[]);
-            if site.op == FastOp::ArrIndexOf {
+            if op == FastOp::ArrIndexOf {
                 let i = tail.iter().position(|e| realm.strict_equals(*e, target));
                 NanBox::number(i.map_or(-1.0, |i| (from + i) as f64))
             } else {
@@ -944,7 +1061,7 @@ pub(super) fn try_call(
             let mut out = alloc::vec::Vec::with_capacity(keys.len());
             for k in keys.iter() {
                 let kv = NanBox::handle(realm.new_string_from_rope(k.clone()).to_raw());
-                out.push(if site.op == FastOp::ObjKeys {
+                out.push(if op == FastOp::ObjKeys {
                     kv
                 } else {
                     let v = realm.get_property(o, k.as_leaf_str()?)?;

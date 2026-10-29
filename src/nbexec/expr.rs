@@ -346,6 +346,18 @@ impl Interp {
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
         let f = self.get_v(recv, name)?;
+        self.call_got_named(f, recv, name, args)
+    }
+
+    /// The call half of [`call_member_named`](Self::call_member_named), for
+    /// the method `f` that `recv.name` read.
+    pub(crate) fn call_got_named(
+        &mut self,
+        f: NanBox,
+        recv: NanBox,
+        name: &str,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
         if !f
             .as_handle()
             .is_some_and(|r| self.is_callable(Handle::from_raw(r)))

@@ -423,7 +423,8 @@ fn verify_op_with(
             cell: dst,
             src: obj,
         }
-        | Op::GetProp { dst, obj, .. } => {
+        | Op::GetProp { dst, obj, .. }
+        | Op::GetMethod { dst, obj, .. } => {
             reg(*dst)?;
             reg(*obj)
         }
@@ -505,6 +506,22 @@ fn verify_op_with(
             reg(*dst)?;
             reg(*recv)?;
             regs(args)
+        }
+        Op::CallWithMethod {
+            dst,
+            callee,
+            recv,
+            args,
+            ..
+        } => {
+            reg(*dst)?;
+            reg(*callee)?;
+            reg(*recv)?;
+            regs(args)
+        }
+        Op::PlainPrims { dst, regs: rs } => {
+            reg(*dst)?;
+            regs(rs)
         }
         Op::CallCtor {
             ctor, recv, args, ..
@@ -1317,6 +1334,31 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
         } => {
             w_u8(47, out);
             w_reg(*dst, out);
+            w_reg(*recv, out);
+            w_str(key, out);
+            w_regs(args, out);
+        }
+        Op::PlainPrims { dst, regs } => {
+            w_u8(175, out);
+            w_reg(*dst, out);
+            w_regs(regs, out);
+        }
+        Op::GetMethod { dst, obj, key } => {
+            w_u8(173, out);
+            w_reg(*dst, out);
+            w_reg(*obj, out);
+            w_str(key, out);
+        }
+        Op::CallWithMethod {
+            dst,
+            callee,
+            recv,
+            key,
+            args,
+        } => {
+            w_u8(174, out);
+            w_reg(*dst, out);
+            w_reg(*callee, out);
             w_reg(*recv, out);
             w_str(key, out);
             w_regs(args, out);
@@ -2241,6 +2283,22 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         },
         47 => Op::CallMethod {
             dst: r.reg()?,
+            recv: r.reg()?,
+            key: r.string()?,
+            args: r.regs()?,
+        },
+        175 => Op::PlainPrims {
+            dst: r.reg()?,
+            regs: r.regs()?,
+        },
+        173 => Op::GetMethod {
+            dst: r.reg()?,
+            obj: r.reg()?,
+            key: r.string()?,
+        },
+        174 => Op::CallWithMethod {
+            dst: r.reg()?,
+            callee: r.reg()?,
             recv: r.reg()?,
             key: r.string()?,
             args: r.regs()?,

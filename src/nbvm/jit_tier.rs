@@ -1061,6 +1061,7 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             | Op::SetPropStrict { .. }
             | Op::InitProp { .. }
             | Op::CallMethod { .. }
+            | Op::CallWithMethod { .. }
     );
     let r = if cached {
         let key = core::ptr::from_ref(op) as usize;
@@ -1687,6 +1688,192 @@ pub(crate) extern "C" fn jit_helper_call_method(
         }
     }
     jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
+}
+
+/// `Op::CallWithMethod` in compiled code (the native call sequence's
+/// fallback): point the site's call cache `call_site` at the method when the
+/// sequence can enter it, then make the call as the interpreter's arm does
+/// (`call_got_method`, with the site's persistent `cache` for its built-in
+/// memo), entering a compiled VM callee directly.
+///
+/// # Safety
+/// As [`jit_helper_call_method`].
+pub(crate) extern "C" fn jit_helper_call_with_method(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    cache: *mut core::ffi::c_void,
+    call_site: *mut core::ffi::c_void,
+) -> u64 {
+    // SAFETY: see the function contract (as `jit_helper_exec_op`).
+    #[allow(unsafe_code)]
+    let op = unsafe { &*op_raw };
+    let Op::CallWithMethod {
+        dst,
+        callee,
+        recv,
+        key,
+        args,
+    } = op
+    else {
+        return jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw);
+    };
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx_raw as *mut Ctx) };
+    // SAFETY: the activation's register file, live and unaliased here.
+    #[allow(unsafe_code)]
+    let regs = unsafe { core::slice::from_raw_parts_mut(regs_raw.cast::<NanBox>(), n_regs) };
+    // SAFETY: the site's own cache (see the function contract).
+    #[allow(unsafe_code)]
+    let cache = unsafe { &mut *cache.cast::<crate::ic::PropertyCache>() };
+    // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    let method = regs[*callee as usize];
+    let recv_val = regs[*recv as usize];
+    let r = if method
+        .as_handle()
+        .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
+    {
+        if !call_site.is_null() {
+            // SAFETY: the op's own `CallSite` (see the function contract).
+            #[allow(unsafe_code)]
+            let site = unsafe { &mut *call_site.cast::<CallSite>() };
+            fill_call_site(ctx, method, site);
+        }
+        match call_compiled(ctx, funcs, regs, method, args, recv_val) {
+            Some(r) => r,
+            None => super::call_got_method(ctx, funcs, regs, method, recv_val, key, args, cache),
+        }
+    } else {
+        let served =
+            super::native_call::try_call_got(ctx, funcs, method, recv_val, regs, args, cache);
+        if !call_site.is_null() {
+            // SAFETY: the op's own `CallSite` (see the function contract).
+            #[allow(unsafe_code)]
+            let site = unsafe { &mut *call_site.cast::<CallSite>() };
+            // A built-in served here: the compiled code's shortcut to
+            // [`jit_helper_call_native_got`] (see `IDENT_KEY`).
+            site.ident.key = if served.is_some() {
+                method.to_bits()
+            } else {
+                CallSite::EMPTY
+            };
+        }
+        match served {
+            Some(r) => r,
+            None => super::call_got_method(ctx, funcs, regs, method, recv_val, key, args, cache),
+        }
+    };
+    match r {
+        Ok(v) => {
+            regs[*dst as usize] = v;
+            0
+        }
+        Err(e) => {
+            ctx.jit_pending_fault = Some(e);
+            NanBox::jit_throw_bits()
+        }
+    }
+}
+
+/// `Op::CallWithMethod` in compiled code for the built-in its site's
+/// identity memo names (the one [`jit_helper_call_with_method`] last served):
+/// `native_call::try_call_got` directly, else that helper.
+///
+/// # Safety
+/// As [`jit_helper_call_with_method`].
+pub(crate) extern "C" fn jit_helper_call_native_got(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    cache: *mut core::ffi::c_void,
+    call_site: *mut core::ffi::c_void,
+) -> u64 {
+    {
+        // SAFETY: see the function contract (as `jit_helper_exec_op`).
+        #[allow(unsafe_code)]
+        let op = unsafe { &*op_raw };
+        let Op::CallWithMethod {
+            dst,
+            callee,
+            recv,
+            args,
+            ..
+        } = op
+        else {
+            return jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw);
+        };
+        // SAFETY: see the function contract.
+        #[allow(unsafe_code)]
+        let (ctx, regs, cache) = unsafe {
+            (
+                &mut *(ctx_raw as *mut Ctx),
+                core::slice::from_raw_parts_mut(regs_raw.cast::<NanBox>(), n_regs),
+                &mut *cache.cast::<crate::ic::PropertyCache>(),
+            )
+        };
+        // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
+        #[allow(unsafe_code)]
+        let funcs = unsafe {
+            &*ctx
+                .jit_funcs
+                .expect("jit_funcs set before generic dispatch")
+        };
+        let (method, recv_val) = (regs[*callee as usize], regs[*recv as usize]);
+        if let Some(r) =
+            super::native_call::try_call_got(ctx, funcs, method, recv_val, regs, args, cache)
+        {
+            return match r {
+                Ok(v) => {
+                    regs[*dst as usize] = v;
+                    0
+                }
+                Err(e) => {
+                    ctx.jit_pending_fault = Some(e);
+                    NanBox::jit_throw_bits()
+                }
+            };
+        }
+    }
+    jit_helper_call_with_method(ctx_raw, regs_raw, n_regs, op_raw, cache, call_site)
+}
+
+/// `Op::GetMethod`'s read in compiled code (the bytecode the tier compiles
+/// holds it as a `GetProp`) when the site's inline caches missed: a built-in
+/// the site's memo proves (`native_call::try_get`), else
+/// [`jit_helper_get_prop_site`].
+///
+/// # Safety
+/// As [`jit_helper_get_prop_site`].
+pub(crate) extern "C" fn jit_helper_get_method_site(
+    ctx_raw: *mut core::ffi::c_void,
+    obj: u64,
+    site: *mut crate::jit::MethodSite,
+    call: *const CallSite,
+) -> u64 {
+    {
+        // SAFETY: the calling `JitProto`'s site and its property cache,
+        // touched only by this helper while it runs; `ctx` the live `Ctx`.
+        #[allow(unsafe_code)]
+        let (ctx, site_ref) = unsafe { (&mut *(ctx_raw as *mut Ctx), &*site) };
+        // SAFETY: as above.
+        #[allow(unsafe_code)]
+        let cache = unsafe { &mut *site_ref.cache.cast::<crate::ic::PropertyCache>() };
+        if let Some(v) =
+            super::native_call::try_get(ctx, NanBox::from_bits(obj), site_ref.key(), cache)
+        {
+            return v.to_bits();
+        }
+    }
+    jit_helper_get_prop_site(ctx_raw, obj, site, call)
 }
 
 /// [`direct_target`], memoized per function id.

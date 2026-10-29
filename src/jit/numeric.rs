@@ -164,7 +164,10 @@ fn transfer(op: &Op, s: &mut [u8]) {
         Op::Add { dst, a, b } | Op::AddValue { dst, a, b } => {
             (*dst, num_if(t(s, *a) == T_NUM && t(s, *b) == T_NUM))
         }
-        Op::Lt { dst, .. } | Op::StrictEq { dst, .. } | Op::Not { dst, .. } => (*dst, T_BOOL),
+        Op::Lt { dst, .. }
+        | Op::StrictEq { dst, .. }
+        | Op::Not { dst, .. }
+        | Op::PlainPrims { dst, .. } => (*dst, T_BOOL),
         Op::Compare { dst, op, .. } => (*dst, if *op <= 3 { T_BOOL } else { T_ANY }),
         Op::ToNumeric { dst, src } | Op::Step { dst, src, .. } => {
             (*dst, num_if(t(s, *src) == T_NUM))
@@ -184,12 +187,14 @@ fn transfer(op: &Op, s: &mut [u8]) {
         }
         // Ops that write their `dst` only.
         Op::GetProp { dst, .. }
+        | Op::GetMethod { dst, .. }
         | Op::GetKey { dst, .. }
         | Op::GetElem { dst, .. }
         | Op::ArrayLen { dst, .. }
         | Op::CallNative { dst, .. }
         | Op::Call { dst, .. }
         | Op::CallMethod { dst, .. }
+        | Op::CallWithMethod { dst, .. }
         | Op::LoadGlobal { dst, .. }
         | Op::TypeOf { dst, .. } => (*dst, T_ANY),
         // Ops that write no register (a `PushHandler`'s register is bound at its
@@ -536,14 +541,18 @@ fn region_op_ok(op: &GenericOp, bc: &Op) -> bool {
 fn generic_region_op(op: &GenericOp, bc: &Op) -> bool {
     match op {
         GenericOp::GetProp { .. }
+        | GenericOp::GetMethod { .. }
         | GenericOp::SetProp { .. }
         | GenericOp::GetElem { .. }
         | GenericOp::ArrayLen { .. }
         | GenericOp::CallMethod { .. }
         | GenericOp::CallValue { .. }
+        | GenericOp::CallWithMethod { .. }
         | GenericOp::CallKey { .. } => true,
         // An inlined call's guard and end (`super::inline`): no call.
         GenericOp::InlineGuard { .. } | GenericOp::InlineLeave => true,
+        // A guard's type test (inline, its slow path a pure check).
+        GenericOp::PlainPrims { .. } => true,
         // `!x` (a boolean or Number inline) and an array iteration's step in
         // by-index mode (`for (… of array)`, inline while the array lasts).
         GenericOp::Not { .. } => true,
@@ -560,7 +569,9 @@ fn generic_region_op(op: &GenericOp, bc: &Op) -> bool {
 fn region_call(op: &GenericOp, bc: &Op) -> bool {
     match op {
         GenericOp::CallMethod { .. } => super::inline_math(bc).is_none(),
-        GenericOp::CallValue { .. } | GenericOp::CallKey { .. } => true,
+        GenericOp::CallValue { .. }
+        | GenericOp::CallWithMethod { .. }
+        | GenericOp::CallKey { .. } => true,
         _ => false,
     }
 }
@@ -2592,6 +2603,12 @@ pub(super) fn def_use(op: &Op, defs: &mut Vec<u16>, uses: &mut Vec<u16>) {
             uses.push(*b);
         }
         Op::JumpIfFalse { cond, .. } => uses.push(*cond),
+        Op::PlainPrims { dst, regs } => {
+            uses.extend(regs.iter().copied());
+            if !uses.contains(dst) {
+                defs.push(*dst);
+            }
+        }
         Op::LoadGlobal { dst, .. } | Op::NewBox { dst } => defs.push(*dst),
         Op::CellGet { dst, cell } => {
             defs.push(*dst);
@@ -2603,7 +2620,9 @@ pub(super) fn def_use(op: &Op, defs: &mut Vec<u16>, uses: &mut Vec<u16>) {
         }
         Op::Return { src } | Op::CheckTdz { src } | Op::StoreGlobal { src, .. } => uses.push(*src),
         Op::RequireObjectCoercible { src } => uses.push(*src),
-        Op::GetProp { dst, obj, .. } | Op::ArrayLen { dst, arr: obj } => {
+        Op::GetProp { dst, obj, .. }
+        | Op::GetMethod { dst, obj, .. }
+        | Op::ArrayLen { dst, arr: obj } => {
             defs.push(*dst);
             uses.push(*obj);
         }
@@ -2622,6 +2641,20 @@ pub(super) fn def_use(op: &Op, defs: &mut Vec<u16>, uses: &mut Vec<u16>) {
             uses.push(*recv);
             uses.extend(args.iter().copied());
             // An argument register may also be the destination.
+            if !uses.contains(dst) {
+                defs.push(*dst);
+            }
+        }
+        Op::CallWithMethod {
+            dst,
+            callee,
+            recv,
+            args,
+            ..
+        } => {
+            uses.push(*callee);
+            uses.push(*recv);
+            uses.extend(args.iter().copied());
             if !uses.contains(dst) {
                 defs.push(*dst);
             }
