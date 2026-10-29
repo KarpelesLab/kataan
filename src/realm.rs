@@ -4135,6 +4135,7 @@ impl Realm {
     pub fn set_array_length_readonly(&mut self, handle: Handle, readonly: bool) {
         if readonly {
             self.nonwritable_array_lengths.insert(handle.to_raw());
+            self.mark_array_side_state(handle);
         } else {
             self.nonwritable_array_lengths.remove(&handle.to_raw());
         }
@@ -4415,6 +4416,44 @@ impl Realm {
         }
         a.vec_mut().push(value);
         Some(a.len())
+    }
+
+    /// `arr.push(...values)` on an array that has never had side-table state
+    /// (see [`crate::cell::ArrayElems`]: no named or per-index properties,
+    /// sparse length, frozen/sealed/non-extensible mark or non-writable
+    /// `length`) while no prototype has an index accessor: the new length.
+    /// `None`, with nothing done, for anything else (the general `push`).
+    pub fn array_push_plain(&mut self, handle: Handle, values: &[NanBox]) -> Option<usize> {
+        if self.proto_index_accessor_dirty {
+            return None;
+        }
+        let max = self.limits.max_array_len;
+        let a = self
+            .heap
+            .get_mut(handle)
+            .and_then(Cell::as_array_mut_plain)?;
+        if a.len().saturating_add(values.len()) > max {
+            return None;
+        }
+        a.vec_mut().extend_from_slice(values);
+        Some(a.len())
+    }
+
+    /// `arr.pop()` on an array as [`Self::array_push_plain`] requires whose
+    /// last element (if any) is present: the removed value.
+    pub fn array_pop_plain(&mut self, handle: Handle) -> Option<NanBox> {
+        if self.proto_index_accessor_dirty {
+            return None;
+        }
+        let a = self
+            .heap
+            .get_mut(handle)
+            .and_then(Cell::as_array_mut_plain)?;
+        match a.last() {
+            None => Some(NanBox::undefined()),
+            Some(v) if v.is_hole() => None,
+            Some(_) => a.vec_mut().pop(),
+        }
     }
 
     /// Replaces the whole contents of the array at `handle` (for in-place
@@ -5264,6 +5303,7 @@ impl Realm {
     pub fn prevent_extensions(&mut self, handle: Handle) {
         if self.heap.get(handle).and_then(Cell::as_array).is_some() {
             self.non_extensible_arrays.insert(handle.to_raw());
+            self.mark_array_side_state(handle);
         } else if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.prevent_extensions();
         } else {

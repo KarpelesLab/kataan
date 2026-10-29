@@ -472,6 +472,12 @@ pub(super) fn try_call(
         #[cfg(feature = "std")]
         FastOp::Math(id) => super::math_fast::compute(realm, id, args, regs)?,
         FastOp::ArrayPush => {
+            // An array that never had side-table state: one cell access.
+            if let [a] = *args
+                && let Some(n) = realm.array_push_plain(h, &[regs[a as usize]])
+            {
+                return Some(Ok(NanBox::number(n as f64)));
+            }
             // Exactly the host's dense-array `push` guards: no index side table,
             // no inherited index accessor, the length is the dense length and
             // still writable.
@@ -491,6 +497,9 @@ pub(super) fn try_call(
             NanBox::number(len as f64)
         }
         FastOp::ArrayPop => {
+            if let Some(v) = realm.array_pop_plain(h) {
+                return Some(Ok(v));
+            }
             // The host's dense-array `pop` guards; an inherited getter could fire
             // only for a hole at the index read.
             let dense_len = realm.array_elements(h)?.len();

@@ -810,6 +810,15 @@ impl Cell {
         }
     }
 
+    /// [`Self::as_array_mut`] for an array that has never had side-table
+    /// state ([`ArrayElems::has_side_state`]).
+    pub fn as_array_mut_plain(&mut self) -> Option<&mut ArrayElems> {
+        match self {
+            Cell::Array(a) if !a.has_side_state() => Some(a),
+            _ => None,
+        }
+    }
+
     /// The raw bytes, if this cell is a byte store.
     #[must_use]
     pub fn as_bytes(&self) -> Option<&[u8]> {

@@ -1220,7 +1220,7 @@ pub(super) fn call_compiled_with(
 /// over `n_regs` registers; `caps` points at the closure's `n_captures`
 /// captured values, valid until the entry has run (it copies them first).
 #[allow(unsafe_code, clippy::too_many_arguments)]
-#[inline]
+#[inline(always)]
 unsafe fn enter_native(
     ctx: &mut Ctx,
     funcs: &[FnProto],
