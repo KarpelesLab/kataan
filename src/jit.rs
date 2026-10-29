@@ -6113,6 +6113,8 @@ impl JitFunction {
                                 crate::nbvm::Op::SetProp { key: k, .. }
                                 | crate::nbvm::Op::SetPropStrict { key: k, .. }
                                 | crate::nbvm::Op::InitProp { key: k, .. } if k.as_str() == key)
+                                || matches!(o, crate::nbvm::Op::NewObjectLit { lit, .. }
+                                    if lit.keys.iter().any(|k| k.as_str() == key))
                         });
                         if !stores_key {
                             a.g_load(call_seq::r::RAX, call_seq::r::RBP, m_slot(mi, 2));
@@ -6723,6 +6725,31 @@ impl JitFunction {
                             let slow = a.new_label();
                             let done = a.new_label();
                             a.p_alloc_box(&layout, helpers.call_layout.realm, slow);
+                            a.store_rax(disp(*dst));
+                            a.jmp(done);
+                            a.bind(slow);
+                            exec_op!(pc);
+                            a.bind(done);
+                        }
+                        // An object literal with a constant key set: inline
+                        // in the site's memoized shape, else the helper
+                        // (which builds it member by member and arms the
+                        // memo).
+                        crate::nbvm::Op::NewObjectLit { dst, lit }
+                            if ok(*dst)
+                                && lit.srcs.len() <= crate::object::INLINE_SLOTS
+                                && lit.srcs.iter().all(|r| ok(*r)) =>
+                        {
+                            let slow = a.new_label();
+                            let done = a.new_label();
+                            let vals: Vec<i32> = lit.srcs.iter().map(|r| disp(*r)).collect();
+                            a.p_alloc_object_lit(
+                                &layout,
+                                helpers.call_layout.realm,
+                                core::ptr::from_ref(&lit.cache) as u64,
+                                &vals,
+                                slow,
+                            );
                             a.store_rax(disp(*dst));
                             a.jmp(done);
                             a.bind(slow);

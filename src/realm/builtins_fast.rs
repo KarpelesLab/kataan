@@ -171,6 +171,205 @@ impl Realm {
         arr
     }
 
+    /// A fresh ordinary object of shape `shape` (grown from this realm's root
+    /// shape `root` by plain data adds) holding `values` in slot order —
+    /// what [`new_object`](Self::new_object) followed by an
+    /// [`init_data_property_cached`](Self::init_data_property_cached) of each
+    /// of the shape's keys leaves (an object literal's whole build, see
+    /// `nbvm::objlit`). `None`, having allocated nothing, when `root` is not
+    /// this realm's root shape or the shape does not fit the values.
+    pub fn new_object_in_shape(
+        &mut self,
+        root: &Rc<Shape>,
+        shape: &Rc<Shape>,
+        values: &[NanBox],
+    ) -> Option<Handle> {
+        if !Rc::ptr_eq(root, &self.root_shape)
+            || values.len() >= self.limits.object_dictionary_threshold
+        {
+            return None;
+        }
+        let mut obj = crate::object::Object::with_inline_data(Rc::clone(shape), values)?;
+        // As `new_object` would: the default `[[Prototype]]`, shaded for an
+        // incremental cycle, then each stored value through the barrier as
+        // `init_data_property_cached` would.
+        let proto = self.default_object_proto;
+        obj.set_proto(proto);
+        let h = self.heap.alloc(Cell::Object(obj));
+        if let (Some(p), Some(marker)) = (proto, self.incremental.as_mut()) {
+            marker.mark_grey(p);
+        }
+        for v in values {
+            self.write_barrier(h, *v);
+        }
+        Some(h)
+    }
+
+    /// The shape of the object at `handle` when it is a plain shaped data
+    /// object with the default `[[Prototype]]` whose `i`th key is `keys[i]`
+    /// in slot `i` — one [`new_object_in_shape`](Self::new_object_in_shape)
+    /// can remake from its keys' values.
+    #[must_use]
+    pub fn plain_literal_shape(
+        &self,
+        handle: Handle,
+        keys: &[alloc::string::String],
+    ) -> Option<Rc<Shape>> {
+        let Some(Cell::Object(o)) = self.heap.get(handle) else {
+            return None;
+        };
+        let shape = o.shaped_shape()?;
+        (o.is_plain_fresh_data()
+            && o.len() as usize == keys.len()
+            && o.proto() == self.default_object_proto
+            && keys
+                .iter()
+                .enumerate()
+                .all(|(i, k)| shape.lookup(k) == Some(i as u32)))
+        .then(|| Rc::clone(shape))
+    }
+
+    /// The auxiliary object holding the named own properties of the VM
+    /// closure at `handle` (a [`Cell::VmFunction`]), when it has one and `key`
+    /// is an ordinary key there: not one of the keys a function synthesizes
+    /// or keeps elsewhere (`name`/`length` from its definition, `prototype`,
+    /// the legacy `caller`/`arguments`), nor an internal (`\0`) key, and the
+    /// closure is not host-exotic. On such a key the function's own property
+    /// is exactly the auxiliary object's.
+    fn vm_fn_plain_aux(&self, handle: Handle, key: &str) -> Option<Handle> {
+        if matches!(
+            key,
+            "name" | "length" | "prototype" | "caller" | "arguments"
+        ) || key.starts_with('\0')
+        {
+            return None;
+        }
+        let Some(Cell::VmFunction { .. }) = self.heap.get(handle) else {
+            return None;
+        };
+        if self.is_host_exotic(handle) {
+            return None;
+        }
+        self.aux_props.get(&handle.to_raw()).copied()
+    }
+
+    /// `[[Get]]` of `key` on the VM closure at `handle` when it is an own
+    /// data property in the closure's auxiliary object (see
+    /// `vm_fn_plain_aux`), through the site's inline
+    /// cache; `None` (the caller's general path) otherwise.
+    #[must_use]
+    pub fn vm_fn_cached_get(
+        &self,
+        handle: Handle,
+        key: &str,
+        cache: &mut crate::ic::PropertyCache,
+    ) -> Option<NanBox> {
+        let aux = self.vm_fn_plain_aux(handle, key)?;
+        let o = self.heap.get(aux)?.as_object()?;
+        if !o.has_no_accessors() && o.accessor(key).is_some() {
+            return None;
+        }
+        o.cached_get(key, cache)
+    }
+
+    /// `[[Set]]` of `key` on the VM closure at `handle` when `key` is an
+    /// existing writable own data property in the closure's auxiliary object
+    /// (see `vm_fn_plain_aux`): an in-place store
+    /// through the site's inline cache (which declines a frozen object, a
+    /// read-only key and a dictionary), with the write barrier — what the
+    /// general path's `set_property` does for such a key, since an own data
+    /// property shadows anything on the prototype chain. `false`, having
+    /// changed nothing, otherwise.
+    pub fn vm_fn_cached_set(
+        &mut self,
+        handle: Handle,
+        key: &str,
+        value: NanBox,
+        cache: &mut crate::ic::PropertyCache,
+    ) -> bool {
+        let Some(aux) = self.vm_fn_plain_aux(handle, key) else {
+            return false;
+        };
+        let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) else {
+            return false;
+        };
+        if (!o.has_no_accessors() && o.accessor(key).is_some()) || !o.cached_set(key, value, cache)
+        {
+            return false;
+        }
+        self.write_barrier(aux, value);
+        true
+    }
+
+    /// `[[Set]]` of `key` on the VM closure at `handle` when it adds a new
+    /// plain data property: `key` is an ordinary key (see
+    /// `vm_fn_plain_aux`) the closure does not own,
+    /// the closure is extensible, and the site's prototype-chain cache proves
+    /// that no object on its prototype chain has `key` (so no setter,
+    /// read-only property or proxy can intercept the write). Then the
+    /// property is added as `set_property` adds it (through the site's
+    /// transition cache when the auxiliary object exists: a fresh writable,
+    /// enumerable, configurable data property is the same whether made by
+    /// `[[Set]]` or `CreateDataProperty`). `false`, having changed nothing but
+    /// the site's chain cache, otherwise.
+    pub fn vm_fn_cached_add(
+        &mut self,
+        handle: Handle,
+        key: &str,
+        value: NanBox,
+        cache: &mut crate::ic::PropertyCache,
+    ) -> bool {
+        if matches!(
+            key,
+            "name" | "length" | "prototype" | "caller" | "arguments"
+        ) || key.starts_with('\0')
+        {
+            return false;
+        }
+        let Some(Cell::VmFunction { .. }) = self.heap.get(handle) else {
+            return false;
+        };
+        if self.is_host_exotic(handle) {
+            return false;
+        }
+        let aux = self.aux_props.get(&handle.to_raw()).copied();
+        if let Some(a) = aux {
+            let Some(o) = self.heap.get(a).and_then(Cell::as_object) else {
+                return false;
+            };
+            if !o.is_extensible() || o.contains(key) || o.accessor(key).is_some() {
+                return false;
+            }
+        }
+        if let Some(p) = self.object_proto(handle) {
+            match self.chain_cached_get(p, key, cache) {
+                Some(super::ChainHit::Absent) => {}
+                Some(_) => return false,
+                None => {
+                    self.chain_cache_fill(p, key, cache);
+                    return false;
+                }
+            }
+        }
+        match aux {
+            Some(a) => {
+                if !self.init_data_property_cached(a, key, value, cache) {
+                    self.set_property(handle, key, value);
+                }
+            }
+            None => {
+                self.set_property(handle, key, value);
+            }
+        }
+        true
+    }
+
+    /// This realm's root shape (the one every ordinary object grows from).
+    #[must_use]
+    pub fn root_shape_rc(&self) -> Rc<Shape> {
+        Rc::clone(&self.root_shape)
+    }
+
     /// For a string cell, the UTF-16 code unit at index `i` (`None` when `i` is
     /// `None` or out of range); `None` for any other cell. In-order reads of a
     /// non-ASCII string stay linear (see [`Realm::string_unit_at_seq`]).

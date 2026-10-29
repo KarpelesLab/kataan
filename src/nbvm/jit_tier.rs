@@ -922,6 +922,10 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_object().to_raw());
             Some(Ok(()))
         }
+        // An object literal with a constant key set (its interpreter arm).
+        Op::NewObjectLit { dst, lit } => {
+            Some(super::objlit::vm_new_object_lit(ctx, lit, regs).map(|o| regs[*dst as usize] = o))
+        }
         // A closure (its interpreter arm, which cannot fail).
         Op::MakeClosure {
             dst,

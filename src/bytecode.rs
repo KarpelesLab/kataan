@@ -479,6 +479,10 @@ fn verify_op_with(
             reg(*dst)?;
             regs(elems)
         }
+        Op::NewObjectLit { dst, lit } => {
+            reg(*dst)?;
+            regs(&lit.srcs)
+        }
         Op::CallValue { dst, callee, args } => {
             reg(*dst)?;
             reg(*callee)?;
@@ -1222,6 +1226,12 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
         }
         Op::CellGet { dst, cell } => un(183, *dst, *cell, out),
         Op::CellSet { cell, src } => un(184, *cell, *src, out),
+        Op::NewObjectLit { dst, lit } => {
+            w_u8(162, out);
+            w_reg(*dst, out);
+            w_strs(&lit.keys, out);
+            w_regs(&lit.srcs, out);
+        }
         Op::InitProp { obj, key, src } => {
             w_u8(180, out);
             w_reg(*obj, out);
@@ -2134,6 +2144,22 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             cell: r.reg()?,
             src: r.reg()?,
         },
+        162 => {
+            let dst = r.reg()?;
+            let keys = r.strings()?;
+            let srcs = r.regs()?;
+            if keys.len() != srcs.len() {
+                return Err(DecodeError::BadTag(162));
+            }
+            Op::NewObjectLit {
+                dst,
+                lit: alloc::boxed::Box::new(crate::nbvm::objlit::ObjLit {
+                    keys: keys.into_boxed_slice(),
+                    srcs: srcs.into_boxed_slice(),
+                    cache: crate::nbvm::objlit::LitShapeCache::default(),
+                }),
+            }
+        }
         180 => Op::InitProp {
             obj: r.reg()?,
             key: r.string()?,

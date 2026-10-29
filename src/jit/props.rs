@@ -1506,6 +1506,98 @@ impl X64Assembler {
         self.code.extend_from_slice(&[0x4c, 0x09, 0xd8]); // or rax, r11
     }
 
+    /// Inline [`Realm::new_object_in_shape`](crate::realm::Realm) for an
+    /// object literal (`Op::NewObjectLit`) of the register values at the
+    /// frame displacements `vals` (at most
+    /// [`INLINE_SLOTS`](crate::object::INLINE_SLOTS) of them), through the
+    /// site's memo at `cache` (a `nbvm::objlit::LitShapeCache`): when the memo
+    /// is armed for this realm's root shape, the dictionary threshold is above
+    /// the key count, the heap has a free slot and no incremental marking is
+    /// running — exactly `Heap::alloc`'s free-list path over
+    /// `Object::with_inline_data(shape, values)` with the default
+    /// `[[Prototype]]`: pop the free list, count the allocation, write the
+    /// object (one strong count taken on the memo's shape, the values in
+    /// slots `0..n`, the key epoch `n`) and the slot's age and occupancy,
+    /// keeping its generation. A fresh (young) object with no marking running
+    /// needs nothing from the write barrier. Then `rax` = the object's handle
+    /// bits; otherwise to `miss`, having changed nothing. Clobbers `rax`,
+    /// `rcx`, `rdx`, `rsi`, `r9`, `r11`.
+    pub(crate) fn p_alloc_object_lit(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        cache: u64,
+        vals: &[i32],
+        miss: Label,
+    ) {
+        use crate::nbvm::objlit::LitShapeCache;
+        const INLINE: usize = crate::object::INLINE_SLOTS;
+        assert!(vals.len() <= INLINE, "an inline object literal");
+        let n = vals.len() as u32;
+        let p = &l.props;
+        self.g_load(r::R9, r::R15, realm_off);
+        self.g_cmp_byte_imm(r::R9, p.marking, 0);
+        self.g_jcc(cc::NE, miss);
+        // The memo, armed for this realm (its root is never null when set,
+        // and the realm's always is: equal means armed here).
+        self.g_movabs(r::R11, cache);
+        self.g_load(r::RAX, r::R11, LitShapeCache::ROOT_OFF);
+        self.g_cmp_mem(r::RAX, r::R9, p.root_shape);
+        self.g_jcc(cc::NE, miss);
+        self.g_load(r::RAX, r::R9, p.dict_threshold);
+        self.g_cmp_imm(r::RAX, n as i32);
+        self.g_jcc(cc::BE, miss);
+        self.g_load(r::RAX, r::R9, p.free_len);
+        self.g_test(r::RAX);
+        self.g_jcc(cc::E, miss);
+        self.code.extend_from_slice(&[0x48, 0xff, 0xc8]); // dec rax
+        self.g_load(r::R11, r::R9, p.free_ptr);
+        self.code.extend_from_slice(&[0x41, 0x8b, 0x14, 0x83]); // mov edx, [r11 + rax*4]
+        self.g_store(r::R9, p.free_len, r::RAX);
+        self.g_inc_mem(r::R9, p.heap_live);
+        self.g_inc_mem(r::R9, p.heap_allocs);
+        // rcx = the slot.
+        self.g_mov(r::RAX, r::RDX);
+        self.imul_rax_imm(l.slot_stride);
+        self.g_add_mem(r::RAX, r::R9, p.heap_ptr);
+        self.g_mov(r::RCX, r::RAX);
+        // `Cell::Object(Object::with_inline_data(shape, vals))` with the
+        // default prototype, field by field.
+        self.p_store_rcx_imm(1, l.off_cell_tag, u32::from(l.cell_object_disc));
+        self.p_store_rcx_imm(1, l.off_od_tag, u32::from(l.obj_shaped_disc));
+        self.p_store_rcx_imm(1, p.off_jit_flags, 0);
+        self.p_store_rcx_imm(2, l.off_slots_len, n);
+        self.p_store_rcx_imm(4, p.off_epoch, n);
+        self.g_movabs(r::R11, cache);
+        self.g_load(r::R11, r::R11, LitShapeCache::SHAPE_OFF);
+        self.g_inc_mem(r::R11, p.rc_strong);
+        self.g_store(r::RCX, l.off_shape, r::R11);
+        self.g_load(r::RSI, r::R9, p.default_proto);
+        self.g_store(r::RCX, p.off_proto, r::RSI);
+        self.g_store_imm32(r::RCX, p.off_extra, 0);
+        // Promoted registers' current values reach the frame first.
+        self.spill_before_call();
+        for (i, &d) in vals.iter().enumerate() {
+            self.load_rax(d);
+            self.g_store(r::RCX, l.off_inline + 8 * i as i32, r::RAX);
+        }
+        if vals.len() < INLINE {
+            self.g_movabs(r::R11, crate::nanbox::NanBox::undefined().to_bits());
+            for i in vals.len()..INLINE {
+                self.g_store(r::RCX, l.off_inline + 8 * i as i32, r::R11);
+            }
+        }
+        // The slot: its generation stays; age 0, occupied.
+        self.p_load16(r::RAX, r::RCX, l.off_slot_gen);
+        self.p_store_rcx_imm(1, p.off_slot_age, 0);
+        self.p_store_rcx_imm(1, l.off_slot_occ, u32::from(l.slot_occupied_disc));
+        // rax = NanBox::handle(generation << 32 | index).
+        self.shl_rax_imm(32);
+        self.p_or_rax_rdx();
+        self.g_movabs(r::R11, crate::nanbox::NanBox::handle(0).to_bits());
+        self.code.extend_from_slice(&[0x4c, 0x09, 0xd8]); // or rax, r11
+    }
+
     /// Inline [`Realm::new_array_from_slice`](crate::realm::Realm) of the
     /// register values at the frame displacements `elems` (at most
     /// [`ARRAY_INLINE_CAP`](crate::cell::ARRAY_INLINE_CAP) of them), when the

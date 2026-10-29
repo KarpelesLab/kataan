@@ -53,6 +53,7 @@ mod jit_tier;
 #[cfg(feature = "std")]
 mod math_fast;
 pub(crate) mod native_call;
+pub mod objlit;
 mod str_replace;
 pub use str_replace::{ReplacePlan, ReplaceStep};
 mod vm_eval;
@@ -266,6 +267,14 @@ pub enum Op {
     /// but the key is baked in (no string allocated per evaluation) and a plain
     /// add/overwrite of a data property stays in the VM.
     InitProp { obj: Reg, key: String, src: Reg },
+    /// `dst = {k0: s0, k1: s1, …}`: an object literal whose members are all
+    /// plain data properties under static, distinct keys, built in one step
+    /// from the already evaluated values (see [`objlit`]) — the same object
+    /// as an [`Op::NewObject`] followed by an [`Op::InitProp`] per key.
+    NewObjectLit {
+        dst: Reg,
+        lit: alloc::boxed::Box<objlit::ObjLit>,
+    },
     /// `super(...args)`: `Construct(ctor, args, new_target)` where `ctor` is
     /// the super constructor read by [`Op::SuperCtor`], then binds `this` (a
     /// `ReferenceError` if already bound); [`Op::InitFields`] follows.
@@ -1822,6 +1831,16 @@ fn vm_set_prop_mode(
             }
             ctx.realm.chain_cache_fill(h, key, cache);
         }
+    }
+    // An in-place write to an existing writable own data property of a VM
+    // closure (kept in its auxiliary object), which shadows anything the
+    // prototype chain could intercept the write with; or (hosted) an add the
+    // site's chain cache proves nothing on the prototype chain intercepts.
+    if let Some(h) = recv.as_handle().map(Handle::from_raw)
+        && (ctx.realm.vm_fn_cached_set(h, key, value, cache)
+            || (ctx.host.is_some() && ctx.realm.vm_fn_cached_add(h, key, value, cache)))
+    {
+        return Ok(());
     }
     if ctx.host.is_none() {
         return vm_set_prop(ctx, funcs, recv, key, value, cache);
@@ -5418,6 +5437,10 @@ fn vm_get_prop(
         if let Some(v) = ctx.realm.object_cached_get(h, key, cache) {
             return Ok(v);
         }
+        // A VM closure's own data property (kept in its auxiliary object).
+        if let Some(v) = ctx.realm.vm_fn_cached_get(h, key, cache) {
+            return Ok(v);
+        }
         match ctx.realm.chain_cached_get(h, key, cache) {
             Some(crate::realm::ChainHit::Data(v)) => return Ok(v),
             Some(crate::realm::ChainHit::Absent) => return Ok(NanBox::undefined()),
@@ -8030,6 +8053,10 @@ fn run_frame_at_ic(
                     None => return Err(VmError::Unsupported),
                 }
             }
+            Op::NewObjectLit { dst, lit } => match objlit::vm_new_object_lit(ctx, lit, regs) {
+                Ok(o) => regs[*dst as usize] = o,
+                Err(e) => handle_throw!(e),
+            },
             Op::InitProp { obj, key, src } => {
                 let (o, v) = (regs[*obj as usize], regs[*src as usize]);
                 let cache = site_cache!(site);
@@ -21329,6 +21356,9 @@ impl Compiler {
     /// anonymous function value is named after its key, `__proto__: v` sets
     /// the prototype, and methods get the object as their `super` home.
     fn object_literal_hosted(&mut self, members: &[ObjectMember]) -> Result<Reg, CompileError> {
+        if let Some(r) = self.object_literal_const_keys(members)? {
+            return Ok(r);
+        }
         let dst = self.alloc();
         self.ops.push(Op::NewObject { dst });
         self.scopes.push(alloc::collections::BTreeMap::new());
@@ -21445,6 +21475,91 @@ impl Compiler {
         self.scopes.pop();
         r?;
         Ok(dst)
+    }
+
+    /// An object literal whose members are all plain data properties under
+    /// static keys (no computed key, method, accessor, spread, `__proto__`
+    /// key or anonymous function value to name): its leading members up to
+    /// [`objlit::OBJ_LIT_MAX_KEYS`] distinct keys compile to one
+    /// [`Op::NewObjectLit`] — their values are evaluated in order, then the
+    /// object is made in one step, as nothing can observe it before it is
+    /// complete (a repeated key keeps its first position and its last value;
+    /// every value is still evaluated) — and any later member to an
+    /// [`Op::InitProp`] on it, as usual. `None` (having emitted nothing) for
+    /// any other literal.
+    fn object_literal_const_keys(
+        &mut self,
+        members: &[ObjectMember],
+    ) -> Result<Option<Reg>, CompileError> {
+        let mut values: Vec<(String, &Expr)> = Vec::with_capacity(members.len());
+        for m in members {
+            let ObjectMember::Property {
+                key: key @ (PropertyKey::Ident(_) | PropertyKey::Str(_) | PropertyKey::Number(_)),
+                value,
+                method: false,
+                ..
+            } = m
+            else {
+                return Ok(None);
+            };
+            if is_anonymous_fn_def(value) {
+                return Ok(None);
+            }
+            let k = static_key(key)?;
+            if k == "__proto__" || k.starts_with('\0') {
+                return Ok(None);
+            }
+            values.push((k, value));
+        }
+        // The members the one-step build covers: the longest prefix with at
+        // most `OBJ_LIT_MAX_KEYS` distinct keys.
+        let mut keys: Vec<String> = Vec::new();
+        let mut split = values.len();
+        for (i, (k, _)) in values.iter().enumerate() {
+            if !keys.contains(k) {
+                if keys.len() == objlit::OBJ_LIT_MAX_KEYS {
+                    split = i;
+                    break;
+                }
+                keys.push(k.clone());
+            }
+        }
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        let (head, tail) = values.split_at(split);
+        let dst = self.alloc();
+        let mut srcs: Vec<Reg> = alloc::vec![0; keys.len()];
+        for (i, (k, e)) in head.iter().enumerate() {
+            let mark = self.next_reg;
+            let mut v = self.expr(e)?;
+            // A binding's own register (`{a: i, b: i++}`) would be read after
+            // the later values ran: snapshot it when one of them may assign.
+            if v < mark && head[i + 1..].iter().any(|(_, e)| may_assign(e)) {
+                let t = self.alloc();
+                self.ops.push(Op::Move { dst: t, src: v });
+                v = t;
+            }
+            let slot = keys.iter().position(|x| x == k).expect("collected above");
+            srcs[slot] = v;
+        }
+        self.ops.push(Op::NewObjectLit {
+            dst,
+            lit: alloc::boxed::Box::new(objlit::ObjLit {
+                keys: keys.into_boxed_slice(),
+                srcs: srcs.into_boxed_slice(),
+                cache: objlit::LitShapeCache::default(),
+            }),
+        });
+        for (k, e) in tail {
+            let v = self.expr(e)?;
+            self.ops.push(Op::InitProp {
+                obj: dst,
+                key: k.clone(),
+                src: v,
+            });
+        }
+        Ok(Some(dst))
     }
 
     /// Runs `f` with [`HOME_NAME`] aliased to the hidden binding `home` (the

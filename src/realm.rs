@@ -5503,15 +5503,22 @@ impl Realm {
     /// String exotic object's own `length` and index (`"0".."length-1"`)
     /// properties.
     pub(crate) fn string_object_len(&self, handle: Handle) -> Option<usize> {
-        // An ordinary object that is no wrapper is no String either.
-        if let Some(Cell::Object(o)) = self.heap.get(handle)
-            && !o.is_prim_wrapper()
-        {
-            return None;
-        }
-        let sh = match self.get_property(handle, "\u{0}prim") {
-            Some(prim) => Handle::from_raw(prim.as_handle()?),
-            None => handle,
+        let sh = match self.heap.get(handle)? {
+            // An ordinary object that is no wrapper is no String either.
+            Cell::Object(o) if !o.is_prim_wrapper() => return None,
+            Cell::Object(o) => match o.get("\u{0}prim") {
+                Some(prim) => Handle::from_raw(prim.as_handle()?),
+                None => handle,
+            },
+            Cell::Str(_) => handle,
+            // Any other cell (a function, an array, …) is a String object only
+            // through a boxed primitive among its auxiliary properties (what
+            // `get_property` reads for it: `\0prim` is no `name`/`length`).
+            _ => {
+                let aux = self.aux_props.get(&handle.to_raw())?;
+                let prim = self.heap.get(*aux)?.as_object()?.get("\u{0}prim")?;
+                Handle::from_raw(prim.as_handle()?)
+            }
         };
         // Memoized on the rope. This is consulted on *every* property access on
         // a string (String exotic objects own `length` and their indices), so

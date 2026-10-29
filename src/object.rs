@@ -354,6 +354,16 @@ impl Object {
         })
     }
 
+    /// [`is_plain_inline_shaped`](Self::is_plain_inline_shaped), with a key
+    /// set that has changed once per key: what adding each key of its shape
+    /// in turn to an empty object leaves, so
+    /// [`with_inline_data`](Self::with_inline_data) of its shape and slot
+    /// values makes the same object.
+    #[must_use]
+    pub fn is_plain_fresh_data(&self) -> bool {
+        self.is_plain_inline_shaped() && self.key_epoch == u32::from(self.len)
+    }
+
     /// Whether this is an ordinary shaped object holding only plain data
     /// properties inline (the shape alone describes its keys and slots).
     #[must_use]
