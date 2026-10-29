@@ -2177,16 +2177,30 @@ enum MathInline {
     Abs,
     /// `roundsd` with this rounding-mode immediate (SSE4.1).
     Round(u8),
+    /// `Math.max` (`true`) / `Math.min` (`false`) of its arguments.
+    MaxMin(bool),
 }
 
-/// The built-in id and inline form of a `CallMethod` of one argument whose key
-/// names a `Math` function the generic tier computes inline.
+/// The built-in id and inline form of a `CallMethod` of one argument (for
+/// `max`/`min`, one to four) whose key names a `Math` function the generic
+/// tier computes inline.
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 fn inline_math(op: &crate::nbvm::Op) -> Option<(u16, MathInline)> {
-    use crate::nbexec::{N_MATH_ABS, N_MATH_CEIL, N_MATH_FLOOR, N_MATH_SQRT, N_MATH_TRUNC};
+    use crate::nbexec::{
+        N_MATH_ABS, N_MATH_CEIL, N_MATH_FLOOR, N_MATH_MAX, N_MATH_MIN, N_MATH_SQRT, N_MATH_TRUNC,
+    };
     let crate::nbvm::Op::CallMethod { key, args, .. } = op else {
         return None;
     };
+    match key.as_str() {
+        "max" if (1..=4).contains(&args.len()) => {
+            return Some((N_MATH_MAX, MathInline::MaxMin(true)));
+        }
+        "min" if (1..=4).contains(&args.len()) => {
+            return Some((N_MATH_MIN, MathInline::MaxMin(false)));
+        }
+        _ => {}
+    }
     if args.len() != 1 {
         return None;
     }
@@ -6029,8 +6043,8 @@ impl JitFunction {
                         else {
                             return None;
                         };
-                        let x = margs[0];
-                        if !ok(dst) || !ok(recv) || !ok(x) {
+                        let x = *margs.first()?;
+                        if !ok(dst) || !ok(recv) || margs.iter().any(|&m| !ok(m)) {
                             return None;
                         }
                         let fill = a.new_label();
@@ -6088,14 +6102,56 @@ impl JitFunction {
                         a.p_is_native(&layout, helpers.call_layout.realm, native_id, general);
                         a.g_store(call_seq::r::RBP, m_slot(mi, 2), call_seq::r::R9);
                         a.bind(proven);
-                        if !num.is_number_at(op_idx, x) {
-                            a.movabs_r11(QNAN as i64);
-                            a.load_rax(disp(x));
-                            a.and_rax_r11();
-                            a.cmp_rax_r11();
-                            a.je(general); // not a Number: its conversion is the call's
+                        for &m in margs.iter() {
+                            if !num.is_number_at(op_idx, m) {
+                                a.movabs_r11(QNAN as i64);
+                                a.load_rax(disp(m));
+                                a.and_rax_r11();
+                                a.cmp_rax_r11();
+                                a.je(general); // not a Number: its conversion is the call's
+                            }
                         }
-                        if let MathInline::Abs = f {
+                        if let MathInline::MaxMin(max) = f {
+                            // Every argument is a Number (so no conversion
+                            // runs): NaN if any is NaN, else the largest
+                            // (smallest), `+0` above `-0` — for equal
+                            // operands the AND (OR) of their bits.
+                            a.movsd_xmm0_mem(disp(x));
+                            for &m in &margs[1..] {
+                                let unequal = a.new_label();
+                                let next = a.new_label();
+                                a.movsd_xmm1_mem(disp(m));
+                                a.ucomisd_xmm0_xmm1();
+                                a.jp(nan);
+                                a.jne(unequal);
+                                a.raw(if max {
+                                    &[0x66, 0x0f, 0x54, 0xc1] // andpd xmm0, xmm1
+                                } else {
+                                    &[0x66, 0x0f, 0x56, 0xc1] // orpd xmm0, xmm1
+                                });
+                                a.jmp(next);
+                                a.bind(unequal);
+                                a.raw(if max {
+                                    &[0xf2, 0x0f, 0x5f, 0xc1] // maxsd xmm0, xmm1
+                                } else {
+                                    &[0xf2, 0x0f, 0x5d, 0xc1] // minsd xmm0, xmm1
+                                });
+                                a.bind(next);
+                            }
+                            if let Some(xr) = num.result_xmm(op_idx, dst) {
+                                let past = a.new_label();
+                                numeric::NumGen::set_xmm_from_xmm0(&mut a, xr);
+                                a.jmp(past);
+                                past_reload = Some(past);
+                            } else {
+                                a.movsd_mem_xmm0(disp(dst));
+                                a.jmp(done);
+                            }
+                            a.bind(nan);
+                            a.movabs_rax(canonical_nan as i64);
+                            a.store_rax(disp(dst));
+                            a.jmp(done);
+                        } else if let MathInline::Abs = f {
                             // The sign bit cleared (a NaN argument is already
                             // the canonical one, whose sign is clear).
                             a.load_rax(disp(x));
@@ -6107,6 +6163,7 @@ impl JitFunction {
                             a.movsd_xmm0_mem(disp(x));
                             match f {
                                 MathInline::Round(mode) => a.roundsd_xmm0(mode),
+                                MathInline::MaxMin(_) => return None,
                                 _ => a.sqrtsd_xmm0(),
                             }
                             a.ucomisd_xmm0_xmm0();

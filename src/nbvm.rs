@@ -5976,6 +5976,15 @@ pub(crate) extern "C" fn jit_helper_array_len(ctx: *mut core::ffi::c_void, recv:
     // SAFETY: see `jit_helper_get_elem`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    // A string's `length`: an own, non-configurable property nothing can
+    // intercept — `vm_array_len`'s answer for any string cell, without its
+    // array and function probes first.
+    if let Some(n) = NanBox::from_bits(recv)
+        .as_handle()
+        .and_then(|h| ctx.realm.string_utf16_len(Handle::from_raw(h)))
+    {
+        return NanBox::number(n as f64).to_bits();
+    }
     #[allow(unsafe_code)]
     let funcs = unsafe {
         &*ctx

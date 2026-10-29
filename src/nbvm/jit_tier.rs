@@ -2374,7 +2374,10 @@ pub(crate) extern "C" fn jit_method_info(
     let cache = unsafe { &mut *site.cache.cast::<crate::ic::PropertyCache>() };
     let key = site.key();
     debug_assert_eq!(ctx_ref.host.is_some(), ctx_ref.jit_rt.hosted);
-    if ctx_ref.host.is_none() || key == "caller" {
+    // A site that last called a built-in (`s.charCodeAt`, `m.get`, …) goes
+    // straight to its helper, which serves it (and, if the method has become
+    // a VM closure, enters that compiled too).
+    if ctx_ref.host.is_none() || key == "caller" || super::native_call::is_native_site(cache) {
         return NONE;
     }
     match super::vm_method_of_cached(ctx_ref, NanBox::from_bits(recv), key, cache) {
