@@ -579,7 +579,7 @@ fn verify_op_with(
         }
         Op::DeleteGlobal { dst, .. } | Op::NewBox { dst } => reg(*dst),
         Op::RequireObjectCoercible { src, .. } | Op::CheckTdz { src } => reg(*src),
-        Op::SwitchStr { dst, src, .. } => {
+        Op::SwitchStr { dst, src, .. } | Op::StrEqConst { dst, src, .. } => {
             reg(*dst)?;
             reg(*src)
         }
@@ -1501,6 +1501,18 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u8(80, out);
             w_reg(*src, out);
         }
+        Op::StrEqConst {
+            dst,
+            src,
+            lit,
+            kind,
+        } => {
+            w_u8(196, out);
+            w_reg(*dst, out);
+            w_reg(*src, out);
+            w_bytes(lit, out);
+            w_u8(*kind, out);
+        }
         Op::SwitchStr { dst, src, table } => {
             w_u8(195, out);
             w_reg(*dst, out);
@@ -2421,6 +2433,12 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             table.sort_by(|a, b| crate::realm::switch_key_order(&a.0, &b.0));
             Op::SwitchStr { dst, src, table }
         }
+        196 => Op::StrEqConst {
+            dst: r.reg()?,
+            src: r.reg()?,
+            lit: r.byte_string()?,
+            kind: r.u8()?,
+        },
         83 => Op::CheckTdz { src: r.reg()? },
         84 => Op::NewBigInt {
             dst: r.reg()?,

@@ -20,6 +20,18 @@ pub fn switch_key_order(a: &[u8], b: &[u8]) -> Ordering {
 }
 
 impl Realm {
+    /// Whether the string `v` has the contents `lit` (WTF-8 bytes, as
+    /// strict equality compares strings); `None` when `v` is not a string.
+    #[must_use]
+    pub fn string_equals_bytes(&self, v: NanBox, lit: &[u8]) -> Option<bool> {
+        let h = v.as_handle()?;
+        let r = self
+            .heap
+            .get(crate::heap::Handle::from_raw(h))
+            .and_then(Cell::as_str)?;
+        Some(r.len() == lit.len() && *rope_bytes(r) == *lit)
+    }
+
     /// The index stored with the entry of `table` (sorted by
     /// [`switch_key_order`], keys distinct) whose key is the contents of the
     /// string `v`; `None` when `v` is not a string or no key matches.

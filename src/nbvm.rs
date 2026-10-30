@@ -586,6 +586,17 @@ pub enum Op {
         src: Reg,
         table: Vec<(Vec<u8>, u32)>,
     },
+    /// `dst = src === lit` (or `!==`, `==`, `!=` by `kind`, see
+    /// `STR_EQ_NEGATE` / `STR_EQ_LOOSE`): an equality against a string
+    /// literal (its WTF-8 bytes), compared with `src`'s contents when `src`
+    /// is a string, without materializing the literal. A non-string is never
+    /// strictly equal; a loose compare with one takes the ordinary path.
+    StrEqConst {
+        dst: Reg,
+        src: Reg,
+        lit: Vec<u8>,
+        kind: u8,
+    },
     /// `dst = a new array of `len` `undefined` elements`.
     NewArray { dst: Reg, len: usize },
     /// `dst = [elems...]`: an array literal of plain elements (no holes or
@@ -5610,6 +5621,47 @@ fn vm_strict_eq(realm: &Realm, a: NanBox, b: NanBox) -> NanBox {
     NanBox::boolean(realm.strict_equals(a, b))
 }
 
+/// The [`Op::StrEqConst`] `kind` of an equality operator.
+fn str_eq_kind(op: BinaryOp) -> Option<u8> {
+    Some(match op {
+        BinaryOp::EqEqEq => 0,
+        BinaryOp::NotEqEq => STR_EQ_NEGATE,
+        BinaryOp::EqEq => STR_EQ_LOOSE,
+        BinaryOp::NotEq => STR_EQ_LOOSE | STR_EQ_NEGATE,
+        _ => return None,
+    })
+}
+
+/// [`Op::StrEqConst`]'s `kind` bit: the negated form (`!==` / `!=`).
+const STR_EQ_NEGATE: u8 = 1;
+/// [`Op::StrEqConst`]'s `kind` bit: loose equality (`==` / `!=`).
+const STR_EQ_LOOSE: u8 = 2;
+
+/// [`Op::StrEqConst`]: `v` compared with the string literal `lit` (WTF-8).
+/// A string compares by contents; for `===` anything else is unequal; for
+/// `==` anything else but `undefined`/`null` (equal to no string) goes
+/// through the ordinary loose equality with the literal materialized (an
+/// object's ToPrimitive may run code and throw).
+fn vm_str_eq_const(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    v: NanBox,
+    lit: &[u8],
+    kind: u8,
+) -> Result<NanBox, VmError> {
+    let neg = kind & STR_EQ_NEGATE != 0;
+    let eq = match ctx.realm.string_equals_bytes(v, lit) {
+        Some(eq) => eq,
+        None if kind & STR_EQ_LOOSE == 0 || v.is_undefined() || v.is_null() => false,
+        None => {
+            let s = NanBox::handle(ctx.realm.new_string_wtf8(lit.to_vec()).to_raw());
+            let op = if neg { VB_LOOSE_NEQ } else { VB_LOOSE_EQ };
+            return vm_value_bin(ctx, funcs, v, s, op);
+        }
+    };
+    Ok(NanBox::boolean(eq != neg))
+}
+
 /// The interpreter's real `Op::ValueBin` (`**`, bitwise `&`/`|`/`^`, shifts
 /// `<<`/`>>`/`>>>`, and loose `==`/`!=`), factored out so the bytecode VM **and**
 /// the generic-JIT runtime helper ([`jit_helper_value_bin`]) share one code path.
@@ -8842,6 +8894,15 @@ fn run_frame_at_ic(
                 let i = ctx.realm.string_switch_index(regs[*src as usize], table);
                 regs[*dst as usize] = NanBox::number(i.map_or(-1.0, f64::from));
             }
+            Op::StrEqConst {
+                dst,
+                src,
+                lit,
+                kind,
+            } => match vm_str_eq_const(ctx, funcs, regs[*src as usize], lit, *kind) {
+                Ok(v) => regs[*dst as usize] = v,
+                Err(e) => handle_throw!(e),
+            },
             Op::NewArray { dst, len } => {
                 // Defence in depth: the verifier rejects oversized lengths, but the
                 // call-free `run` entrypoint runs unverified ops, so cap here too.
@@ -18504,8 +18565,23 @@ impl Compiler {
             rights.push((op, right));
             leftmost = left;
         }
-        let mut a = self.expr_any(leftmost)?;
+        // `"lit" === x`: the literal's evaluation has no effect, so `x` alone
+        // is evaluated and compared with it (`Op::StrEqConst`).
+        let mut a = match (leftmost, rights.last()) {
+            (Expr::Str { value, .. }, Some(&(op, right))) if str_eq_kind(op).is_some() => {
+                rights.pop();
+                let src = self.expr(right)?;
+                self.emit_str_eq_const(op, src, value)
+            }
+            _ => self.expr_any(leftmost)?,
+        };
         for (op, right) in rights.into_iter().rev() {
+            if let Expr::Str { value, .. } = right
+                && str_eq_kind(op).is_some()
+            {
+                a = self.emit_str_eq_const(op, a, value);
+                continue;
+            }
             let pinned = self.pin_operand(a, may_assign(right));
             let b = self.expr(right)?;
             a = self.emit_binop(op, pinned, b)?;
@@ -21448,6 +21524,19 @@ impl Compiler {
         });
         self.scopes.pop();
         r
+    }
+
+    /// Emits `src <op> lit` for an equality `op` (see [`str_eq_kind`])
+    /// against the string literal `lit` into a fresh register.
+    fn emit_str_eq_const(&mut self, op: BinaryOp, src: Reg, lit: &[u8]) -> Reg {
+        let dst = self.alloc();
+        self.ops.push(Op::StrEqConst {
+            dst,
+            src,
+            lit: lit.to_vec(),
+            kind: str_eq_kind(op).unwrap_or(0),
+        });
+        dst
     }
 
     /// Emits the op(s) for `a <op> b` into a fresh register, returning it.

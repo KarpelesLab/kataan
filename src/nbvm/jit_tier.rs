@@ -1056,6 +1056,15 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_box().to_raw());
             Some(Ok(()))
         }
+        Op::StrEqConst {
+            dst,
+            src,
+            lit,
+            kind,
+        } => Some(
+            super::vm_str_eq_const(ctx, funcs, regs[*src as usize], lit, *kind)
+                .map(|v| regs[*dst as usize] = v),
+        ),
         Op::SwitchStr { dst, src, table } => {
             let i = ctx.realm.string_switch_index(regs[*src as usize], table);
             regs[*dst as usize] = NanBox::number(i.map_or(-1.0, f64::from));
