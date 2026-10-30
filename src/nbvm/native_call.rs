@@ -41,8 +41,8 @@ use crate::ic::PropertyCache;
 use crate::nanbox::{NanBox, Unpacked};
 use crate::nbexec::{
     N_ARRAY_IS_ARRAY, N_ARRAY_PROTO_FN, N_JSON_PARSE, N_JSON_STRINGIFY, N_MAP_PROTO_FN,
-    N_NUMBER_PROTO_FN, N_OBJ_PROTO_HASOWN, N_OBJECT_ASSIGN, N_OBJECT_ENTRIES, N_OBJECT_KEYS,
-    N_REGEXP_PROTO_FN, N_SET_PROTO_FN, N_STATIC_METHOD, N_STRING_PROTO_FN,
+    N_NUMBER_PROTO_FN, N_OBJ_PROTO_HASOWN, N_OBJECT_ASSIGN, N_OBJECT_CREATE, N_OBJECT_ENTRIES,
+    N_OBJECT_KEYS, N_REGEXP_PROTO_FN, N_SET_PROTO_FN, N_STATIC_METHOD, N_STRING_PROTO_FN,
 };
 use crate::realm::Realm;
 use crate::realm::builtins_fast::MethodSiteCache;
@@ -138,6 +138,8 @@ enum FastOp {
     ObjKeys,
     /// `Object.entries`.
     ObjEntries,
+    /// `Object.create(proto)` (no property descriptors).
+    ObjCreate,
     /// A built-in `Math` function (its native id), computed by
     /// `math_fast::compute` on Number arguments.
     #[cfg(feature = "std")]
@@ -200,6 +202,7 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         Some(N_ARRAY_IS_ARRAY) => return FastOp::ArrayIsArray,
         Some(N_OBJECT_KEYS) => return FastOp::ObjKeys,
         Some(N_OBJECT_ENTRIES) => return FastOp::ObjEntries,
+        Some(N_OBJECT_CREATE) => return FastOp::ObjCreate,
         Some(N_OBJECT_ASSIGN | N_JSON_STRINGIFY | N_JSON_PARSE) => return FastOp::HostDirect,
         #[cfg(feature = "std")]
         Some(id) if super::math_fast::is_math_native(id) => return FastOp::Math(id),
@@ -882,6 +885,28 @@ fn run_op(
                 let out = crate::wtf8::from_utf16(&units);
                 NanBox::handle(realm.new_string_wtf8(out).to_raw())
             }
+        }
+        FastOp::ObjCreate => {
+            // An Object or `null` prototype and no Properties argument (an
+            // explicit `undefined` is none): OrdinaryObjectCreate(proto). A
+            // non-object prototype's TypeError, and the descriptors, are the
+            // host's.
+            if !arg(1).is_undefined() {
+                return None;
+            }
+            let p = arg(0);
+            let proto = match p.as_handle().map(Handle::from_raw) {
+                None if p.is_null() => None,
+                Some(o)
+                    if !realm.is_string_handle(o)
+                        && realm.symbol_at(o).is_none()
+                        && realm.bigint_at(o).is_none() =>
+                {
+                    Some(o)
+                }
+                _ => return None,
+            };
+            NanBox::handle(realm.new_object_with_proto(proto).to_raw())
         }
         FastOp::ArrayIsArray => match arg(0).as_handle().map(Handle::from_raw) {
             // A proxy is unwrapped (and may be revoked): the host's.
