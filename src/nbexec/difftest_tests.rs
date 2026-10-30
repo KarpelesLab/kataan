@@ -2374,3 +2374,29 @@ fn display_names_language_keeps_its_region() {
          Chinese (Hans, China)|Catalan (Spain, valencia)|true|xx-US"
     );
 }
+
+/// Engineering and explicit-precision compact notation round their mantissa on
+/// its decimal value: a mantissa that rounds up to 1000 moves to the next
+/// exponent (`999.9999` was `100E1` and `1000` instead of `1E3` and `1K`), and
+/// a directional mode no longer rounds the binary expansion (`floor` of 999.4
+/// was `999.399E0`).
+#[cfg(feature = "intl")]
+#[test]
+fn number_format_mantissa_rounds_on_decimal_digits() {
+    let src = r#"
+        function f(o, v) { return new Intl.NumberFormat("en", o).format(v); }
+        [f({ notation: "engineering" }, 999.9999), f({ notation: "engineering" }, -999999.9),
+         f({ notation: "engineering", maximumSignificantDigits: 2 }, 0.99999),
+         f({ notation: "engineering", roundingMode: "floor" }, 999.4),
+         f({ notation: "engineering", roundingMode: "ceil" }, 999.5),
+         f({ notation: "compact", maximumSignificantDigits: 2 }, 999.9999),
+         f({ notation: "compact", minimumFractionDigits: 1 }, 999949),
+         f({ notation: "compact", roundingMode: "floor", maximumSignificantDigits: 2 }, 1e-7),
+         f({ notation: "compact" }, 1.5e-30), f({ notation: "scientific" }, 9.9999)].join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "1E3 -1E6 1E0 999.4E0 999.5E0 1K 999.949K 0.0000001 \
+         0.0000000000000000000000000000015 1E1"
+    );
+}

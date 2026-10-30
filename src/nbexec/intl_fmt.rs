@@ -454,6 +454,55 @@ fn dec_sub_units(digits: &mut [u8], mut delta: u64) {
     }
 }
 
+/// Pre-rounds finite non-zero `n` for a scientific, engineering or (explicit
+/// digit options) compact formatter the way [`intl_decimal_round`] does for
+/// standard notation: the mantissa `n / 10^e` (`e` the exponent the notation
+/// shows) is rounded on its shortest decimal and the rounded value handed back
+/// at the same scale. That gives the crate a value it renders exactly:
+/// - a mantissa that rounds up to the next power (`999.9999` -> `1000E0`, or
+///   `1000` before its `K`) lands on `10^(e+3)`, which the crate renders at the
+///   next exponent (`1E3`, `1K`) instead of `100E1` / `1000`;
+/// - a directional rounding mode works on the decimal value, not its binary
+///   expansion (`floor` of `999.4` is `999.4E0`, not `999.399E0`).
+///
+/// `percent` mantissas are those of the scaled value. Returns `n` for standard
+/// notation and for the default compact rounding (see [`compact_wants_reround`]),
+/// and leaves values past the largest compact suffix (10^15) alone.
+#[cfg(feature = "intl")]
+fn mantissa_preround(
+    n: f64,
+    opts: &intl::number::NumberFormatOptions,
+    default_max_frac: usize,
+    increment: u32,
+) -> f64 {
+    use intl::number::{Notation, NumberStyle};
+    let percent = matches!(opts.style, NumberStyle::Percent);
+    let x = if percent { decimal_shift(n, 2) } else { n };
+    let mag = decimal_magnitude(x.abs());
+    let e = match opts.notation {
+        Notation::Scientific => mag,
+        Notation::Engineering => mag.div_euclid(3) * 3,
+        Notation::Compact if compact_wants_reround(opts) || mag >= 15 => return n,
+        Notation::Compact if mag >= 3 => mag.div_euclid(3) * 3,
+        Notation::Compact => 0,
+        _ => return n,
+    };
+    let sig = opts.maximum_significant_digits.map(usize::from);
+    let keep = opts.maximum_fraction_digits.map_or_else(
+        || default_max_frac.max(opts.minimum_fraction_digits.unwrap_or(0) as usize),
+        usize::from,
+    );
+    let r = intl_decimal_round(
+        decimal_shift(x, -e),
+        keep,
+        sig,
+        increment,
+        opts.rounding_mode,
+    );
+    let r = decimal_shift(r, e);
+    if percent { decimal_shift(r, -2) } else { r }
+}
+
 /// Round the **shortest round-trip decimal** of finite non-zero `n` to `keep_frac`
 /// fraction digits (or, when `sig` is `Some`, to that many significant digits)
 /// under `mode`, then snap to the nearest multiple of `increment` at the fraction
@@ -8506,8 +8555,8 @@ impl Interp {
     /// Pre-round `n` to the resolved precision using the ECMA-402 / ICU decimal
     /// rounding (see [`intl_decimal_round`]), returning a value the `intl` crate
     /// re-renders correctly. Applies to standard notation (a percentage is
-    /// rounded scaled, see below); scientific/engineering/compact (mantissa
-    /// rounding) are left untouched. Shared by `format`/`formatToParts`.
+    /// rounded scaled, see below); scientific/engineering/compact round their
+    /// mantissa (see [`mantissa_preround`]). Shared by `format`/`formatToParts`.
     #[cfg(feature = "intl")]
     fn number_precision_round(
         &mut self,
@@ -8516,7 +8565,7 @@ impl Interp {
         n: f64,
     ) -> f64 {
         use intl::number::{Notation, NumberStyle};
-        if !n.is_finite() || n == 0.0 || opts.notation != Notation::Standard {
+        if !n.is_finite() || n == 0.0 {
             return n;
         }
         // `roundingPriority` other than the default `auto` combines the significant-
@@ -8533,19 +8582,11 @@ impl Interp {
         {
             return n;
         }
-        // Percent: the crate scales by 100 itself, so round the scaled value
-        // (shifted exactly, in decimal) and hand back the rounded result shifted
-        // back down — the crate's ×100 then lands on the rounded grid. This is
-        // what applies `roundingIncrement` (and decimal half-way rounding) to a
-        // percentage.
-        let percent = matches!(opts.style, NumberStyle::Percent);
-        let n = if percent { decimal_shift(n, 2) } else { n };
         let increment = self
             .realm
             .get_property(handle, islot!("roundingIncrement"))
             .and_then(|v| v.as_number())
             .unwrap_or(1.0) as u32;
-        let sig = opts.maximum_significant_digits.map(|s| s as usize);
         // Effective maximum fraction digits (the crate's pattern default when unset).
         let default_max = match opts.style {
             NumberStyle::Currency => {
@@ -8554,6 +8595,23 @@ impl Interp {
             NumberStyle::Percent => 0,
             _ => 3,
         };
+        if opts.notation != Notation::Standard {
+            if matches!(opts.notation, Notation::Compact) && compact_wants_reround(opts) {
+                return n;
+            }
+            let rounded = mantissa_preround(n, opts, default_max, increment);
+            // As below: the value is already rounded on its decimal digits.
+            opts.rounding_mode = intl::number::RoundingMode::HalfExpand;
+            return rounded;
+        }
+        // Percent: the crate scales by 100 itself, so round the scaled value
+        // (shifted exactly, in decimal) and hand back the rounded result shifted
+        // back down — the crate's ×100 then lands on the rounded grid. This is
+        // what applies `roundingIncrement` (and decimal half-way rounding) to a
+        // percentage.
+        let percent = matches!(opts.style, NumberStyle::Percent);
+        let n = if percent { decimal_shift(n, 2) } else { n };
+        let sig = opts.maximum_significant_digits.map(|s| s as usize);
         // (An omitted maximum is at least the minimum: `max(default, mnfd)`.)
         let keep_frac = opts.maximum_fraction_digits.map_or_else(
             || default_max.max(opts.minimum_fraction_digits.unwrap_or(0) as usize),
@@ -8627,7 +8685,7 @@ impl Interp {
             // below 1 keeps `1 - e` of them (`1e-7` → `0.0000001`), so a fixed
             // six would render it as `0` before the re-round could see a digit.
             let keep = (1 - decimal_magnitude(n.abs())).max(0);
-            o.maximum_fraction_digits = Some((keep + 6).min(20) as u8);
+            o.maximum_fraction_digits = Some((keep + 6).min(100) as u8);
             let render = |v: f64| -> Vec<(&'static str, String)> {
                 intl::number::format_to_parts(&locale, v, &o)
                     .into_iter()
