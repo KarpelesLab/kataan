@@ -2728,3 +2728,17 @@ fn regex_legacy_ignore_case_range_uses_case_class() {
     "#;
     assert_eq!(run(src), "1111110000|0000001111|0000001100|0000000011");
 }
+
+/// A `u`/`v`-mode backreference compares Canonicalize of each *code point*,
+/// so astral case pairs (Deseret, Adlam, Old Hungarian, …) match under `i`;
+/// the comparison had been unit by unit, and surrogate halves never fold.
+#[test]
+fn regex_unicode_ignore_case_backref_folds_astral() {
+    let src = r#"
+        [/^(\u{10400})\1$/iu.test("\u{10400}\u{10428}"), /^(\u{1E900}x)\1$/iv.test("\u{1E900}x\u{1E922}X"),
+         /^(\u{10400})\1$/i.test("\u{10400}\u{10428}"), /(?<=\1(\u{10C80}))z/iu.test("\u{10CC0}\u{10C80}z"),
+         /^(\u{10428})\1$/iu.test("\u{10428}\u{10400}"), /^(.)\1$/iu.test("𐐀"),
+         /^(a\u{10400})\1$/u.test("a\u{10400}A\u{10428}")].join("|")
+    "#;
+    assert_eq!(run(src), "true|true|false|true|true|false|false");
+}

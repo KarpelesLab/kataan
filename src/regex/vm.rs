@@ -979,16 +979,13 @@ fn match_backref(ctx: &Ctx, sp: usize, s: usize, e: usize, flags: Flags) -> Opti
         !(flags.unicode || flags.unicode_sets) || is_code_point_boundary(ctx.input, end)
     };
     if ctx.reverse {
-        if sp >= len
-            && (0..len).all(|i| unit_eq(ctx.input[sp - len + i], ctx.input[s + i], flags))
-            && cp_ok(sp - len)
-        {
+        if sp >= len && backref_span_eq(ctx.input, sp - len, s, len, flags) && cp_ok(sp - len) {
             Some(sp - len)
         } else {
             None
         }
     } else if sp + len <= ctx.input.len()
-        && (0..len).all(|i| unit_eq(ctx.input[sp + i], ctx.input[s + i], flags))
+        && backref_span_eq(ctx.input, sp, s, len, flags)
         && cp_ok(sp + len)
     {
         Some(sp + len)
@@ -1003,6 +1000,27 @@ fn is_code_point_boundary(units: &[u16], i: usize) -> bool {
     i == 0
         || i >= units.len()
         || !((0xD800..=0xDBFF).contains(&units[i - 1]) && (0xDC00..=0xDFFF).contains(&units[i]))
+}
+
+/// Whether the `len`-unit windows of `input` at `a` and `b` are equal for a
+/// backreference. Under `i` with `u`/`v` the comparison is per *code point*
+/// (`Canonicalize` of each character), so an astral case pair such as Deseret
+/// U+10400/U+10428 matches; no simple case fold crosses between the BMP and
+/// the astral planes, so equal windows always hold equally long code points.
+/// Otherwise it is unit by unit.
+fn backref_span_eq(input: &[u16], a: usize, b: usize, len: usize, flags: Flags) -> bool {
+    if !(flags.ignore_case && (flags.unicode || flags.unicode_sets)) {
+        return (0..len).all(|i| unit_eq(input[a + i], input[b + i], flags));
+    }
+    let (wa, wb) = (&input[a..a + len], &input[b..b + len]);
+    let mut i = 0;
+    while i < len {
+        match (read_cp(wa, i, true), read_cp(wb, i, true)) {
+            (Some((ca, na)), Some((cb, nb))) if na == nb && cp_eq(ca, cb, flags) => i += na,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Compares two scalar code points for equality, honoring the `i` flag.
