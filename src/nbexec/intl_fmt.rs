@@ -2,6 +2,104 @@ use super::*;
 #[cfg(not(feature = "std"))]
 use crate::common::FloatExt;
 
+/// The storage key of an `Intl` object's internal slot `[[name]]`: an
+/// internal key (see `realm::is_internal_key`), which no JavaScript operation
+/// sees (own keys, `in`, `Get`), unlike the non-enumerable properties the
+/// slots used to be.
+macro_rules! islot {
+    ($name:literal) => {
+        concat!("\u{0}", $name)
+    };
+}
+
+/// [`islot!`] of a computed slot name; a name that already is an internal key
+/// (`"\u{0}locale"`) is its own storage key. The slot names are static keys
+/// (the formatters read a dozen slots per call); any other name is built.
+fn slot_key(name: &str) -> alloc::borrow::Cow<'_, str> {
+    if crate::realm::is_internal_key(name) {
+        return alloc::borrow::Cow::Borrowed(name);
+    }
+    macro_rules! static_slots {
+        ($($n:literal,)*) => {
+            match name {
+                $($n => return alloc::borrow::Cow::Borrowed(islot!($n)),)*
+                _ => {}
+            }
+        };
+    }
+    static_slots!(
+        "numberingSystem",
+        "style",
+        "currency",
+        "currencyDisplay",
+        "currencySign",
+        "unit",
+        "unitDisplay",
+        "compactDisplay",
+        "notation",
+        "signDisplay",
+        "useGrouping",
+        "minimumIntegerDigits",
+        "minimumFractionDigits",
+        "maximumFractionDigits",
+        "minimumSignificantDigits",
+        "maximumSignificantDigits",
+        "roundingIncrement",
+        "roundingMode",
+        "roundingPriority",
+        "trailingZeroDisplay",
+        "calendar",
+        "hour12",
+        "hourCycle",
+        "timeZone",
+        "weekday",
+        "era",
+        "year",
+        "month",
+        "day",
+        "dayPeriod",
+        "hour",
+        "minute",
+        "second",
+        "fractionalSecondDigits",
+        "timeZoneName",
+        "dateStyle",
+        "timeStyle",
+        "numeric",
+        "type",
+        "fallback",
+        "languageDisplay",
+        "usage",
+        "sensitivity",
+        "ignorePunctuation",
+        "collation",
+        "caseFirst",
+        "granularity",
+        "fractionalDigits",
+        "years",
+        "months",
+        "weeks",
+        "days",
+        "hours",
+        "minutes",
+        "seconds",
+        "milliseconds",
+        "microseconds",
+        "nanoseconds",
+        "yearsDisplay",
+        "monthsDisplay",
+        "weeksDisplay",
+        "daysDisplay",
+        "hoursDisplay",
+        "minutesDisplay",
+        "secondsDisplay",
+        "millisecondsDisplay",
+        "microsecondsDisplay",
+        "nanosecondsDisplay",
+    );
+    alloc::borrow::Cow::Owned(alloc::format!("\u{0}{name}"))
+}
+
 /// The resolved form of `Intl.NumberFormat`'s `useGrouping` option: a boolean
 /// `false`, or one of the string modes `"auto"`/`"always"`/`"min2"`.
 enum UseGroupingResolved {
@@ -2566,6 +2664,35 @@ impl Interp {
         Some(proto)
     }
 
+    /// `%IntlSegmentsPrototype%`, the prototype of every Segments object:
+    /// `containing(index)` and `[Symbol.iterator]()` over the receiver's segment
+    /// list (made once per realm; cached under `N_INTL_SEGMENTS_CONTAINING`).
+    pub(crate) fn intl_segments_prototype(&mut self) -> Handle {
+        if let Some(p) = self.realm.intl_prototype(N_INTL_SEGMENTS_CONTAINING) {
+            return p;
+        }
+        let obj_proto = self.object_prototype();
+        let proto = self.realm.new_object_with_proto(obj_proto);
+        // The natives read their receiver; the bound target is unused.
+        let containing = self
+            .realm
+            .new_bound_native(N_INTL_SEGMENTS_CONTAINING, proto);
+        self.install_fn_name_length(containing, "containing", 1);
+        self.realm
+            .set_property(proto, "containing", NanBox::handle(containing.to_raw()));
+        self.realm.mark_hidden(proto, "containing");
+        let seg_iter = self.realm.new_bound_native(N_INTL_SEGMENTS_ITER, proto);
+        self.install_fn_name_length(seg_iter, "[Symbol.iterator]", 0);
+        let iter_sym = self.well_known_symbol("iterator");
+        let iter_key = self.member_key(iter_sym);
+        self.realm
+            .set_property(proto, &iter_key, NanBox::handle(seg_iter.to_raw()));
+        self.realm.mark_hidden(proto, &iter_key);
+        self.realm
+            .set_intl_prototype(N_INTL_SEGMENTS_CONTAINING, proto);
+        proto
+    }
+
     /// A branded prototype data method: an `N_INTL_PROTO_METHOD` bound native whose
     /// target is the 2-element `[markerKey, underlyingSelector]` array. The wrapper
     /// (in `call_with_this`) RequireInternalSlot-checks the call's `this` before
@@ -3088,6 +3215,7 @@ impl Interp {
 
     /// Stores a resolved option on the formatter (under its own key) when present.
     fn store_str(&mut self, obj: Handle, key: &str, val: &Option<String>) {
+        let key = &*slot_key(key);
         if let Some(v) = val {
             let sv = self.new_str(v);
             self.realm.set_hidden_property(obj, key, sv);
@@ -3248,11 +3376,12 @@ impl Interp {
         match use_grouping_val {
             UseGroupingResolved::Bool(b) => {
                 self.realm
-                    .set_hidden_property(obj, "useGrouping", NanBox::boolean(b));
+                    .set_hidden_property(obj, islot!("useGrouping"), NanBox::boolean(b));
             }
             UseGroupingResolved::Str(s) => {
                 let sv = self.new_str(s);
-                self.realm.set_hidden_property(obj, "useGrouping", sv);
+                self.realm
+                    .set_hidden_property(obj, islot!("useGrouping"), sv);
             }
         }
         Ok(())
@@ -3391,25 +3520,31 @@ impl Interp {
             .unwrap();
 
         self.realm
-            .set_hidden_property(obj, "minimumIntegerDigits", NanBox::number(mnid));
+            .set_hidden_property(obj, islot!("minimumIntegerDigits"), NanBox::number(mnid));
         if let Some(v) = mnfd {
             self.realm
-                .set_hidden_property(obj, "minimumFractionDigits", NanBox::number(v));
+                .set_hidden_property(obj, islot!("minimumFractionDigits"), NanBox::number(v));
         }
         if let Some(v) = mxfd {
             self.realm
-                .set_hidden_property(obj, "maximumFractionDigits", NanBox::number(v));
+                .set_hidden_property(obj, islot!("maximumFractionDigits"), NanBox::number(v));
         }
         if let Some(v) = mnsd {
-            self.realm
-                .set_hidden_property(obj, "minimumSignificantDigits", NanBox::number(v));
+            self.realm.set_hidden_property(
+                obj,
+                islot!("minimumSignificantDigits"),
+                NanBox::number(v),
+            );
         }
         if let Some(v) = mxsd {
-            self.realm
-                .set_hidden_property(obj, "maximumSignificantDigits", NanBox::number(v));
+            self.realm.set_hidden_property(
+                obj,
+                islot!("maximumSignificantDigits"),
+                NanBox::number(v),
+            );
         }
         self.realm
-            .set_hidden_property(obj, "roundingIncrement", NanBox::number(rinc));
+            .set_hidden_property(obj, islot!("roundingIncrement"), NanBox::number(rinc));
         self.store_str(obj, "roundingMode", &Some(rounding_mode));
         self.store_str(obj, "roundingPriority", &Some(rounding_priority));
         self.store_str(obj, "trailingZeroDisplay", &Some(tzd));
@@ -3506,7 +3641,7 @@ impl Interp {
         let hour12 = self.get_bool_option(opts, "hour12", None)?;
         if let Some(b) = hour12 {
             self.realm
-                .set_hidden_property(obj, "hour12", NanBox::boolean(b));
+                .set_hidden_property(obj, islot!("hour12"), NanBox::boolean(b));
         }
         let hc = self.get_string_option(opts, "hourCycle", &["h11", "h12", "h23", "h24"], None)?;
         self.store_str(obj, "hourCycle", &hc);
@@ -3549,8 +3684,11 @@ impl Interp {
         self.store_str(obj, "second", &second);
         let fsd = self.get_int_option(opts, "fractionalSecondDigits", 1.0, 3.0, None)?;
         if let Some(v) = fsd {
-            self.realm
-                .set_hidden_property(obj, "fractionalSecondDigits", NanBox::number(v));
+            self.realm.set_hidden_property(
+                obj,
+                islot!("fractionalSecondDigits"),
+                NanBox::number(v),
+            );
         }
         let tzn = self.get_string_option(
             opts,
@@ -3663,7 +3801,7 @@ impl Interp {
     fn dtf_zone_offset_ms(&self, handle: Handle, epoch_ms: i64) -> i64 {
         let Some(tz) = self
             .realm
-            .get_property(handle, "timeZone")
+            .get_property(handle, islot!("timeZone"))
             .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
             .map(|v| self.realm.to_display_string(v))
         else {
@@ -3698,7 +3836,7 @@ impl Interp {
             // filling it (a `timeStyle: "long"` PlainDateTime shows no zone name).
             if let Some(tz) = self
                 .realm
-                .get_property(handle, "timeZone")
+                .get_property(handle, islot!("timeZone"))
                 .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
                 .map(|v| self.realm.to_display_string(v))
                 .filter(|t| !t.is_empty())
@@ -3767,14 +3905,14 @@ impl Interp {
         let hc_ext = hc_ext.filter(|v| matches!(v.as_str(), "h11" | "h12" | "h23" | "h24"));
         let get_str = |k: &str| -> Option<String> {
             self.realm
-                .get_property(handle, k)
+                .get_property(handle, &slot_key(k))
                 .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
                 .map(|v| self.realm.to_display_string(v))
         };
         let hc_opt = get_str("hourCycle");
         let hour12 = self
             .realm
-            .get_property(handle, "hour12")
+            .get_property(handle, islot!("hour12"))
             .and_then(|v| v.as_boolean());
         // [[Hour]] is set iff an hour component or a timeStyle was requested.
         let hour_present = get_str("hour").is_some() || get_str("timeStyle").is_some();
@@ -3818,12 +3956,12 @@ impl Interp {
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_else(|| String::from("number"));
         let get_str = |this: &Self, key: &str| -> Option<String> {
-            fmt.and_then(|h| this.realm.get_property(h, key))
+            fmt.and_then(|h| this.realm.get_property(h, &slot_key(key)))
                 .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
                 .map(|v| this.realm.to_display_string(v))
         };
         let get_num = |this: &Self, key: &str| -> Option<f64> {
-            fmt.and_then(|h| this.realm.get_property(h, key))
+            fmt.and_then(|h| this.realm.get_property(h, &slot_key(key)))
                 .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
                 .map(|v| this.realm.to_number(v))
         };
@@ -3848,7 +3986,7 @@ impl Interp {
             let sv = self.new_str(&sensitivity);
             self.realm.set_property(out, "sensitivity", sv);
             let ip = fmt
-                .and_then(|h| self.realm.get_property(h, "ignorePunctuation"))
+                .and_then(|h| self.realm.get_property(h, islot!("ignorePunctuation")))
                 .is_some_and(|v| self.realm.truthy(v));
             self.realm
                 .set_property(out, "ignorePunctuation", NanBox::boolean(ip));
@@ -3857,7 +3995,7 @@ impl Interp {
             self.realm.set_property(out, "collation", cv);
             // `numeric`/`caseFirst` are reported only when the instance resolved
             // them (they are optional keys of the resolved-options table).
-            if let Some(n) = fmt.and_then(|h| self.realm.get_property(h, "numeric")) {
+            if let Some(n) = fmt.and_then(|h| self.realm.get_property(h, islot!("numeric"))) {
                 let nv = NanBox::boolean(self.realm.truthy(n));
                 self.realm.set_property(out, "numeric", nv);
             }
@@ -4077,7 +4215,7 @@ impl Interp {
             }
 
             let ug = fmt
-                .and_then(|h| self.realm.get_property(h, "useGrouping"))
+                .and_then(|h| self.realm.get_property(h, islot!("useGrouping")))
                 .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
                 .unwrap_or_else(|| self.new_str("auto"));
             self.realm.set_property(out, "useGrouping", ug);
@@ -4462,7 +4600,7 @@ impl Interp {
     ) {
         let nu = self
             .realm
-            .get_property(inst, "numberingSystem")
+            .get_property(inst, islot!("numberingSystem"))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_default();
         if !numbering_system_digit_base(&nu).is_some_and(|b| b != 0x0030) && nu != "hanidec" {
@@ -5014,12 +5152,12 @@ impl Interp {
     /// (defaults `"always"`/`"long"` when the slots are absent).
     pub(crate) fn rel_time_numeric_style(&mut self, fmt: Option<Handle>) -> (String, String) {
         let numeric = fmt
-            .and_then(|h| self.realm.get_property(h, "numeric"))
+            .and_then(|h| self.realm.get_property(h, islot!("numeric")))
             .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_else(|| String::from("always"));
         let style = fmt
-            .and_then(|h| self.realm.get_property(h, "style"))
+            .and_then(|h| self.realm.get_property(h, islot!("style")))
             .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_else(|| String::from("long"));
@@ -5107,7 +5245,7 @@ impl Interp {
             return Err(self.type_error("Intl.DisplayNames: the `type` option is required"));
         };
         let tv = self.new_str(&type_s);
-        self.realm.set_hidden_property(obj, "type", tv);
+        self.realm.set_hidden_property(obj, islot!("type"), tv);
         // Mark the service kind so `resolvedOptions` reports the DisplayNames shape.
         let kindv = self.new_str("display");
         self.realm.set_hidden_property(obj, "\u{0}intl", kindv);
@@ -5269,11 +5407,11 @@ impl Interp {
         self.store_str(obj, "sensitivity", &Some(sensitivity));
         let ipv = NanBox::boolean(ignore_punct);
         self.realm
-            .set_hidden_property(obj, "ignorePunctuation", ipv);
+            .set_hidden_property(obj, islot!("ignorePunctuation"), ipv);
         self.store_str(obj, "collation", &Some(co_value));
         if kn_reported {
             self.realm
-                .set_hidden_property(obj, "numeric", NanBox::boolean(kn_value));
+                .set_hidden_property(obj, islot!("numeric"), NanBox::boolean(kn_value));
         }
         if let Some(cf) = kf_value {
             self.store_str(obj, "caseFirst", &Some(cf));
@@ -5300,7 +5438,7 @@ impl Interp {
         // into the tertiary default (as this did) made `case` behave like
         // `variant`, so "Aa" and "Aã" compared unequal.
         let sensitivity = ch
-            .and_then(|h| self.realm.get_property(h, "sensitivity"))
+            .and_then(|h| self.realm.get_property(h, islot!("sensitivity")))
             .map(|v| self.realm.to_display_string(v));
         let (strength, case_level) = match sensitivity.as_deref() {
             Some("base") => (Strength::Primary, false),
@@ -5309,12 +5447,12 @@ impl Interp {
             _ => (Strength::Tertiary, false),
         };
         let numeric = matches!(
-            ch.and_then(|h| self.realm.get_property(h, "numeric"))
+            ch.and_then(|h| self.realm.get_property(h, islot!("numeric")))
                 .map(|v| v.unpack()),
             Some(Unpacked::Bool(true))
         );
         let alternate = if matches!(
-            ch.and_then(|h| self.realm.get_property(h, "ignorePunctuation"))
+            ch.and_then(|h| self.realm.get_property(h, islot!("ignorePunctuation")))
                 .map(|v| v.unpack()),
             Some(Unpacked::Bool(true))
         ) {
@@ -5350,7 +5488,7 @@ impl Interp {
                 .map(|v| self.realm.to_display_string(v))
             && let Some(tailoring) = {
                 let search = ch
-                    .and_then(|h| self.realm.get_property(h, "usage"))
+                    .and_then(|h| self.realm.get_property(h, islot!("usage")))
                     .map(|v| self.realm.to_display_string(v))
                     .is_some_and(|u| u == "search");
                 if search {
@@ -5499,7 +5637,7 @@ impl Interp {
     /// `"conjunction"`/`"long"` when the slots are absent).
     pub(crate) fn list_format_type_style(&self, fmt: Option<Handle>) -> (String, String) {
         let get = |key: &str, dflt: &str| -> String {
-            fmt.and_then(|h| self.realm.get_property(h, key))
+            fmt.and_then(|h| self.realm.get_property(h, &slot_key(key)))
                 .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
                 .map(|v| self.realm.to_display_string(v))
                 .unwrap_or_else(|| String::from(dflt))
@@ -5763,7 +5901,7 @@ impl Interp {
         // PluralRules fraction-digit defaults 0..3.
         let notation = self
             .realm
-            .get_property(obj, "notation")
+            .get_property(obj, islot!("notation"))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_else(|| String::from("standard"));
         self.set_number_format_digit_options(obj, opts, (0.0, 3.0), &notation)?;
@@ -5787,12 +5925,12 @@ impl Interp {
                 .map(|v| self.realm.to_display_string(v))
                 .unwrap_or_else(|| String::from("en"));
             let ordinal = fmt
-                .and_then(|h| self.realm.get_property(h, "type"))
+                .and_then(|h| self.realm.get_property(h, islot!("type")))
                 .map(|v| self.realm.to_display_string(v))
                 .as_deref()
                 == Some("ordinal");
             let notation = fmt
-                .and_then(|h| self.realm.get_property(h, "notation"))
+                .and_then(|h| self.realm.get_property(h, islot!("notation")))
                 .map(|v| self.realm.to_display_string(v))
                 .unwrap_or_else(|| String::from("standard"));
             // For compact/scientific/engineering notation the plural operands carry
@@ -5814,7 +5952,7 @@ impl Interp {
                     // significant (`e - mxsd + 1`) vs fraction (`-mxfd`) positions.
                     let prio = self
                         .realm
-                        .get_property(h, "roundingPriority")
+                        .get_property(h, islot!("roundingPriority"))
                         .map(|v| self.realm.to_display_string(v));
                     if let Some(p) = prio.filter(|p| p == "morePrecision" || p == "lessPrecision") {
                         let a = n.abs();
@@ -5967,7 +6105,8 @@ impl Interp {
             )?
             .unwrap();
         let granv = self.new_str(&gran);
-        self.realm.set_hidden_property(obj, "granularity", granv);
+        self.realm
+            .set_hidden_property(obj, islot!("granularity"), granv);
         // Mark the service kind so `resolvedOptions` reports the Segmenter shape.
         let kindv = self.new_str("segmenter");
         self.realm.set_hidden_property(obj, "\u{0}intl", kindv);
@@ -6026,7 +6165,7 @@ impl Interp {
         }
         let nu = self
             .realm
-            .get_property(handle, "numberingSystem")
+            .get_property(handle, islot!("numberingSystem"))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_default();
         // `latn` is what the crate already rendered the pattern with.
@@ -6546,14 +6685,14 @@ impl Interp {
         let mut o = DateTimeFormatOptions::default();
         // `dateStyle`/`timeStyle` are mutually exclusive with component fields (the crate
         // errors if both are set), matching ECMA-402.
-        if opt(self, "dateStyle").is_some() || opt(self, "timeStyle").is_some() {
-            o.date_style = opt(self, "dateStyle").as_deref().and_then(dstyle);
-            o.time_style = opt(self, "timeStyle").as_deref().and_then(dstyle);
+        if opt(self, islot!("dateStyle")).is_some() || opt(self, islot!("timeStyle")).is_some() {
+            o.date_style = opt(self, islot!("dateStyle")).as_deref().and_then(dstyle);
+            o.time_style = opt(self, islot!("timeStyle")).as_deref().and_then(dstyle);
         } else {
-            o.weekday = opt(self, "weekday").as_deref().and_then(name);
-            o.era = opt(self, "era").as_deref().and_then(name);
-            o.year = opt(self, "year").as_deref().and_then(n2);
-            o.month = opt(self, "month").as_deref().and_then(|s| match s {
+            o.weekday = opt(self, islot!("weekday")).as_deref().and_then(name);
+            o.era = opt(self, islot!("era")).as_deref().and_then(name);
+            o.year = opt(self, islot!("year")).as_deref().and_then(n2);
+            o.month = opt(self, islot!("month")).as_deref().and_then(|s| match s {
                 "numeric" => Some(MonthStyle::Numeric),
                 "2-digit" => Some(MonthStyle::TwoDigit),
                 "long" => Some(MonthStyle::Long),
@@ -6561,13 +6700,13 @@ impl Interp {
                 "narrow" => Some(MonthStyle::Narrow),
                 _ => None,
             });
-            o.day = opt(self, "day").as_deref().and_then(n2);
-            o.hour = opt(self, "hour").as_deref().and_then(n2);
-            o.minute = opt(self, "minute").as_deref().and_then(n2);
-            o.second = opt(self, "second").as_deref().and_then(n2);
-            o.day_period = opt(self, "dayPeriod").as_deref().and_then(name);
+            o.day = opt(self, islot!("day")).as_deref().and_then(n2);
+            o.hour = opt(self, islot!("hour")).as_deref().and_then(n2);
+            o.minute = opt(self, islot!("minute")).as_deref().and_then(n2);
+            o.second = opt(self, islot!("second")).as_deref().and_then(n2);
+            o.day_period = opt(self, islot!("dayPeriod")).as_deref().and_then(name);
             o.fractional_second_digits =
-                opt(self, "fractionalSecondDigits").and_then(|s| s.parse().ok());
+                opt(self, islot!("fractionalSecondDigits")).and_then(|s| s.parse().ok());
             // ECMA-402 `ToDateTimeOptions` default: when *none* of the date/time
             // components (weekday/year/month/day/dayPeriod/hour/minute/second/
             // fractionalSecondDigits) is requested, fall back to a numeric date.
@@ -6591,7 +6730,7 @@ impl Interp {
         }
         o.hour12 = self
             .realm
-            .get_property(handle, "hour12")
+            .get_property(handle, islot!("hour12"))
             .and_then(|v| match v.unpack() {
                 Unpacked::Bool(b) => Some(b),
                 _ => None,
@@ -6604,7 +6743,7 @@ impl Interp {
         o.hour_cycle = if o.hour12.is_some() {
             None
         } else {
-            opt(self, "hourCycle")
+            opt(self, islot!("hourCycle"))
                 .or(hc_ext)
                 .as_deref()
                 .and_then(|s| match s {
@@ -6619,11 +6758,11 @@ impl Interp {
         // requested: a `timeStyle: "full"`/`"long"` pattern carries its own zone
         // field (`h:mm:ss a zzzz`), and the crate fills it from `time_zone` /
         // `tz_offset_minutes` — with neither, it strips the field instead.
-        if let Some(tz) = opt(self, "timeZone").filter(|t| !t.is_empty()) {
+        if let Some(tz) = opt(self, islot!("timeZone")).filter(|t| !t.is_empty()) {
             o.time_zone = Some(self.intern_static(&tz));
         }
         o.tz_offset_minutes = Some((zone_off_ms / 60_000) as i32);
-        if let Some(tzn) = opt(self, "timeZoneName") {
+        if let Some(tzn) = opt(self, islot!("timeZoneName")) {
             o.time_zone_name = match tzn.as_str() {
                 "long" => Some(TimeZoneNameStyle::Long),
                 "short" => Some(TimeZoneNameStyle::Short),
@@ -6792,7 +6931,7 @@ impl Interp {
         // locale's `-u-ca-` extension, else "gregory".
         let dtf_cal = self
             .realm
-            .get_property(handle, "calendar")
+            .get_property(handle, islot!("calendar"))
             .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
             .map(|v| self.realm.to_display_string(v))
             .or_else(|| {
@@ -6894,30 +7033,34 @@ impl Interp {
             .and_then(|v| v.as_boolean())
             .unwrap_or(false);
         // Raw component options (the auto-filled numeric date is treated as absent).
-        let weekday = opt(self, "weekday");
-        let era = opt(self, "era");
+        let weekday = opt(self, islot!("weekday"));
+        let era = opt(self, islot!("era"));
         let (year, month, day) = if defaulted {
             (None, None, None)
         } else {
-            (opt(self, "year"), opt(self, "month"), opt(self, "day"))
+            (
+                opt(self, islot!("year")),
+                opt(self, islot!("month")),
+                opt(self, islot!("day")),
+            )
         };
-        let day_period = opt(self, "dayPeriod");
-        let hour = opt(self, "hour");
-        let minute = opt(self, "minute");
-        let second = opt(self, "second");
+        let day_period = opt(self, islot!("dayPeriod"));
+        let hour = opt(self, islot!("hour"));
+        let minute = opt(self, islot!("minute"));
+        let second = opt(self, islot!("second"));
         let frac = self
             .realm
-            .get_property(handle, "fractionalSecondDigits")
+            .get_property(handle, islot!("fractionalSecondDigits"))
             .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
             .map(|v| self.realm.to_number(v) as u8);
-        let tz_name = opt(self, "timeZoneName");
-        let hour_cycle_s = opt(self, "hourCycle");
+        let tz_name = opt(self, islot!("timeZoneName"));
+        let hour_cycle_s = opt(self, islot!("hourCycle"));
         let hour12 = self
             .realm
-            .get_property(handle, "hour12")
+            .get_property(handle, islot!("hour12"))
             .and_then(|v| v.as_boolean());
-        let date_style = opt(self, "dateStyle");
-        let time_style = opt(self, "timeStyle");
+        let date_style = opt(self, islot!("dateStyle"));
+        let time_style = opt(self, islot!("timeStyle"));
         let ds = date_style.is_some();
         let ts = time_style.is_some();
         // Presence of the nine format components (dateStyle/timeStyle expanded).
@@ -7295,7 +7438,7 @@ impl Interp {
     #[cfg(feature = "intl")]
     fn dtf_resolved_calendar(&self, handle: Handle) -> String {
         self.realm
-            .get_property(handle, "calendar")
+            .get_property(handle, islot!("calendar"))
             .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
             .map(|v| self.realm.to_display_string(v))
             .or_else(|| {
@@ -7400,7 +7543,7 @@ impl Interp {
         // The instance's zone replaces the formatter's resolved (default) one.
         if let Some(tz) = zdt_zone {
             let tzv = self.new_str(&tz);
-            self.realm.set_hidden_property(h, "timeZone", tzv);
+            self.realm.set_hidden_property(h, islot!("timeZone"), tzv);
         }
         // `toLocaleString` accepts a `ZonedDateTime` (unlike `format`).
         let s = self
@@ -7513,14 +7656,14 @@ impl Interp {
         let bare = |v: i64| alloc::format!("{v}");
 
         // Effective component options (after expanding dateStyle/timeStyle presets).
-        let mut weekday = opt(self, "weekday");
-        let mut year = opt(self, "year");
-        let mut month = opt(self, "month");
-        let mut day_o = opt(self, "day");
-        let mut hour = opt(self, "hour");
-        let mut minute_o = opt(self, "minute");
-        let mut second_o = opt(self, "second");
-        match opt(self, "dateStyle").as_deref() {
+        let mut weekday = opt(self, islot!("weekday"));
+        let mut year = opt(self, islot!("year"));
+        let mut month = opt(self, islot!("month"));
+        let mut day_o = opt(self, islot!("day"));
+        let mut hour = opt(self, islot!("hour"));
+        let mut minute_o = opt(self, islot!("minute"));
+        let mut second_o = opt(self, islot!("second"));
+        match opt(self, islot!("dateStyle")).as_deref() {
             Some("full") => {
                 weekday = Some(String::from("long"));
                 year = Some(String::from("numeric"));
@@ -7544,7 +7687,7 @@ impl Interp {
             }
             _ => {}
         }
-        match opt(self, "timeStyle").as_deref() {
+        match opt(self, islot!("timeStyle")).as_deref() {
             Some("full" | "long" | "medium") => {
                 hour = Some(String::from("numeric"));
                 minute_o = Some(String::from("2-digit"));
@@ -7634,7 +7777,7 @@ impl Interp {
                 date.push(("year", year_str(ys)));
             }
         }
-        if opt(self, "era").is_some() {
+        if opt(self, islot!("era")).is_some() {
             if !date.is_empty() {
                 date.push(lit(" "));
             }
@@ -7646,7 +7789,7 @@ impl Interp {
         if hour.is_some() || minute_o.is_some() || second_o.is_some() {
             // en-US defaults to 12-hour unless `hour12: false`.
             let h12 = !matches!(
-                self.realm.get_property(handle, "hour12"),
+                self.realm.get_property(handle, islot!("hour12")),
                 Some(v) if matches!(v.unpack(), Unpacked::Bool(false))
             );
             let h = if h12 {
@@ -7799,7 +7942,7 @@ impl Interp {
     pub(crate) fn apply_numbering_digits(&mut self, handle: Handle, s: String) -> String {
         let nu = self
             .realm
-            .get_property(handle, "numberingSystem")
+            .get_property(handle, islot!("numberingSystem"))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_default();
         substitute_numbering_digits(&nu, s)
@@ -7831,42 +7974,42 @@ impl Interp {
         // `NumberFormatOptions` is `#[non_exhaustive]` in intl 0.5, so it can't be
         // built with a struct literal — start from `default()` and set fields.
         let mut o = NumberFormatOptions::default();
-        o.style = match opt_str(self, "style").as_deref() {
+        o.style = match opt_str(self, islot!("style")).as_deref() {
             Some("percent") => NumberStyle::Percent,
             Some("currency") => NumberStyle::Currency,
             Some("unit") => NumberStyle::Unit,
             _ => NumberStyle::Decimal,
         };
-        o.notation = match opt_str(self, "notation").as_deref() {
+        o.notation = match opt_str(self, islot!("notation")).as_deref() {
             Some("scientific") => Notation::Scientific,
             Some("engineering") => Notation::Engineering,
             Some("compact") => Notation::Compact,
             _ => Notation::Standard,
         };
-        o.compact_display = match opt_str(self, "compactDisplay").as_deref() {
+        o.compact_display = match opt_str(self, islot!("compactDisplay")).as_deref() {
             Some("long") => CompactDisplay::Long,
             _ => CompactDisplay::Short,
         };
-        o.sign_display = match opt_str(self, "signDisplay").as_deref() {
+        o.sign_display = match opt_str(self, islot!("signDisplay")).as_deref() {
             Some("always") => SignDisplay::Always,
             Some("exceptZero") => SignDisplay::ExceptZero,
             Some("negative") => SignDisplay::Negative,
             Some("never") => SignDisplay::Never,
             _ => SignDisplay::Auto,
         };
-        o.currency_display = match opt_str(self, "currencyDisplay").as_deref() {
+        o.currency_display = match opt_str(self, islot!("currencyDisplay")).as_deref() {
             Some("code") => CurrencyDisplay::Code,
             Some("name") => CurrencyDisplay::Name,
             Some("narrowSymbol") => CurrencyDisplay::NarrowSymbol,
             _ => CurrencyDisplay::Symbol,
         };
-        o.unit_display = match opt_str(self, "unitDisplay").as_deref() {
+        o.unit_display = match opt_str(self, islot!("unitDisplay")).as_deref() {
             Some("long") => UnitDisplay::Long,
             Some("narrow") => UnitDisplay::Narrow,
             _ => UnitDisplay::Short,
         };
         // ECMA-402's default rounding is half-expand (1.25 → 1.3), not banker's rounding.
-        o.rounding_mode = match opt_str(self, "roundingMode").as_deref() {
+        o.rounding_mode = match opt_str(self, islot!("roundingMode")).as_deref() {
             Some("ceil") => RoundingMode::Ceil,
             Some("floor") => RoundingMode::Floor,
             Some("expand") => RoundingMode::Expand,
@@ -7882,12 +8025,12 @@ impl Interp {
         // a string (`"min2"`/`"auto"`/`"always"`), per GetStringOrBooleanOption.
         match self
             .realm
-            .get_property(handle, "useGrouping")
+            .get_property(handle, islot!("useGrouping"))
             .map(|v| v.unpack())
         {
             Some(Unpacked::Bool(false)) => o.use_grouping = UseGrouping::Never,
             Some(Unpacked::Bool(true)) => o.use_grouping = UseGrouping::Always,
-            Some(_) => match opt_str(self, "useGrouping").as_deref() {
+            Some(_) => match opt_str(self, islot!("useGrouping")).as_deref() {
                 Some("min2") => o.use_grouping = UseGrouping::Min2,
                 Some("always") | Some("true") => o.use_grouping = UseGrouping::Always,
                 Some("false") => o.use_grouping = UseGrouping::Never,
@@ -7896,13 +8039,13 @@ impl Interp {
             },
             None => {}
         }
-        if let Some(mid) = opt_num(self, "minimumIntegerDigits") {
+        if let Some(mid) = opt_num(self, islot!("minimumIntegerDigits")) {
             o.minimum_integer_digits = mid;
         }
-        o.minimum_fraction_digits = opt_num(self, "minimumFractionDigits");
-        o.maximum_fraction_digits = opt_num(self, "maximumFractionDigits");
-        o.minimum_significant_digits = opt_num(self, "minimumSignificantDigits");
-        o.maximum_significant_digits = opt_num(self, "maximumSignificantDigits");
+        o.minimum_fraction_digits = opt_num(self, islot!("minimumFractionDigits"));
+        o.maximum_fraction_digits = opt_num(self, islot!("maximumFractionDigits"));
+        o.minimum_significant_digits = opt_num(self, islot!("minimumSignificantDigits"));
+        o.maximum_significant_digits = opt_num(self, islot!("maximumSignificantDigits"));
         // Scientific/engineering cap the mantissa at 3 fraction digits by default (1.235E5).
         if o.maximum_fraction_digits.is_none()
             && o.maximum_significant_digits.is_none()
@@ -7910,10 +8053,10 @@ impl Interp {
         {
             o.maximum_fraction_digits = Some(3);
         }
-        if let Some(c) = opt_str(self, "currency") {
+        if let Some(c) = opt_str(self, islot!("currency")) {
             o.currency = Some(self.intern_static(&c));
         }
-        if let Some(u) = opt_str(self, "unit") {
+        if let Some(u) = opt_str(self, islot!("unit")) {
             o.unit = Some(self.intern_static(&u));
         }
         o
@@ -7996,7 +8139,7 @@ impl Interp {
         }
         let increment = self
             .realm
-            .get_property(handle, "roundingIncrement")
+            .get_property(handle, islot!("roundingIncrement"))
             .and_then(|v| v.as_number())
             .unwrap_or(1.0);
         if increment != 1.0 {
@@ -8077,7 +8220,7 @@ impl Interp {
         // which system to expect rather than assuming ASCII.
         let nu = self
             .realm
-            .get_property(handle, "numberingSystem")
+            .get_property(handle, islot!("numberingSystem"))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_default();
         let probe = self.intl_format_number_inner(handle, if neg { -1.1 } else { 1.1 });
@@ -8130,7 +8273,7 @@ impl Interp {
         }
         let priority = self
             .realm
-            .get_property(handle, "roundingPriority")
+            .get_property(handle, islot!("roundingPriority"))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_default();
         if !matches!(priority.as_str(), "morePrecision" | "lessPrecision") {
@@ -8255,7 +8398,7 @@ impl Interp {
         // to the existing path rather than pre-rounding on the wrong precision.
         let priority = self
             .realm
-            .get_property(handle, "roundingPriority")
+            .get_property(handle, islot!("roundingPriority"))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_default();
         if matches!(priority.as_str(), "morePrecision" | "lessPrecision")
@@ -8273,7 +8416,7 @@ impl Interp {
         let n = if percent { decimal_shift(n, 2) } else { n };
         let increment = self
             .realm
-            .get_property(handle, "roundingIncrement")
+            .get_property(handle, islot!("roundingIncrement"))
             .and_then(|v| v.as_number())
             .unwrap_or(1.0) as u32;
         let sig = opts.maximum_significant_digits.map(|s| s as usize);
@@ -8328,7 +8471,7 @@ impl Interp {
         if shown.is_finite() && shown.fract() == 0.0 {
             let tzd = self
                 .realm
-                .get_property(handle, "trailingZeroDisplay")
+                .get_property(handle, islot!("trailingZeroDisplay"))
                 .map(|v| self.realm.to_display_string(v))
                 .unwrap_or_default();
             if tzd == "stripIfInteger" {
@@ -8391,7 +8534,7 @@ impl Interp {
             if any && all_zero {
                 let sd = self
                     .realm
-                    .get_property(handle, "signDisplay")
+                    .get_property(handle, islot!("signDisplay"))
                     .map(|v| self.realm.to_display_string(v))
                     .unwrap_or_default();
                 if matches!(sd.as_str(), "negative" | "never" | "exceptZero") {
@@ -8406,7 +8549,7 @@ impl Interp {
             && !formatted.starts_with(['+', '-'])
             && self
                 .realm
-                .get_property(handle, "signDisplay")
+                .get_property(handle, islot!("signDisplay"))
                 .map(|v| self.realm.to_display_string(v))
                 .as_deref()
                 == Some("always")
@@ -8423,7 +8566,7 @@ impl Interp {
             && formatted.starts_with('-')
             && self
                 .realm
-                .get_property(handle, "currencySign")
+                .get_property(handle, islot!("currencySign"))
                 .map(|v| self.realm.to_display_string(v))
                 .as_deref()
                 == Some("accounting")
@@ -8450,8 +8593,8 @@ impl Interp {
                 .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
                 .map(|v| this.realm.to_number(v) as i32)
         };
-        let style = opt_str(self, "style").unwrap_or_else(|| String::from("decimal"));
-        let currency = opt_str(self, "currency");
+        let style = opt_str(self, islot!("style")).unwrap_or_else(|| String::from("decimal"));
+        let currency = opt_str(self, islot!("currency"));
         // Non-finite values render as the core glyph (∞ / NaN) with the sign and
         // currency/percent affixes, but no grouping or fraction digits.
         if !n.is_finite() {
@@ -8469,7 +8612,7 @@ impl Interp {
             return out;
         }
         let use_grouping = !matches!(
-            self.realm.get_property(handle, "useGrouping"),
+            self.realm.get_property(handle, islot!("useGrouping")),
             Some(v) if matches!(v.unpack(), Unpacked::Bool(false))
         );
         // Default fraction digits: the currency's (CurrencyDigits), else 0..=3.
@@ -8479,10 +8622,10 @@ impl Interp {
             "percent" => (0, 0),
             _ => (0, 3),
         };
-        let min = opt_num(self, "minimumFractionDigits")
+        let min = opt_num(self, islot!("minimumFractionDigits"))
             .unwrap_or(def_min)
             .clamp(0, 20);
-        let max = opt_num(self, "maximumFractionDigits")
+        let max = opt_num(self, islot!("maximumFractionDigits"))
             .unwrap_or(def_max.max(min))
             .clamp(min, 20);
         let value = if style == "percent" { n * 100.0 } else { n };
@@ -8503,7 +8646,7 @@ impl Interp {
         };
         // `notation: "scientific" | "engineering"` renders `mantissa E exponent` (no
         // grouping); engineering pins the exponent to a multiple of 3.
-        let notation = opt_str(self, "notation").unwrap_or_default();
+        let notation = opt_str(self, islot!("notation")).unwrap_or_default();
         let (s, do_group) = if matches!(notation.as_str(), "scientific" | "engineering") {
             let neg = value < 0.0;
             let mag = value.abs();
@@ -8614,7 +8757,7 @@ impl Interp {
             "unit" => {
                 // `style: "unit"` appends the unit's short symbol (`5 km`); a
                 // `unit-per-unit` compound joins the two with `/` (`5 km/h`).
-                let unit = opt_str(self, "unit").unwrap_or_default();
+                let unit = opt_str(self, islot!("unit")).unwrap_or_default();
                 let sym = unit.split_once("-per-").map_or_else(
                     || String::from(unit_symbol(&unit)),
                     |(a, b)| alloc::format!("{}/{}", unit_symbol(a), unit_symbol(b)),
@@ -8634,12 +8777,12 @@ impl Interp {
         // parentheses (`($5.00)`) instead of with a minus sign.
         if neg
             && style == "currency"
-            && opt_str(self, "currencySign").as_deref() == Some("accounting")
+            && opt_str(self, islot!("currencySign")).as_deref() == Some("accounting")
         {
             return alloc::format!("({styled})");
         }
         let is_zero = magnitude.bytes().all(|b| matches!(b, b'0' | b'.' | b','));
-        let sign = match opt_str(self, "signDisplay").as_deref() {
+        let sign = match opt_str(self, islot!("signDisplay")).as_deref() {
             Some("never") => "",
             Some("always") => {
                 if neg {
@@ -9317,7 +9460,7 @@ impl Interp {
         // untouched since they carry no ASCII digits.
         let nu = self
             .realm
-            .get_property(handle, "numberingSystem")
+            .get_property(handle, islot!("numberingSystem"))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_default();
         if numbering_system_digit_base(&nu).is_some_and(|b| b != 0x0030) || nu == "hanidec" {
@@ -9385,7 +9528,7 @@ impl Interp {
         }
         let sd = self
             .realm
-            .get_property(handle, "signDisplay")
+            .get_property(handle, islot!("signDisplay"))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_default();
         // The crate leaves NaN unsigned; `signDisplay: "always"` prefixes a
@@ -9415,7 +9558,7 @@ impl Interp {
         // part becomes a leading `literal "("` and a trailing `literal ")"`.
         let accounting = self
             .realm
-            .get_property(handle, "currencySign")
+            .get_property(handle, islot!("currencySign"))
             .map(|v| self.realm.to_display_string(v))
             .as_deref()
             == Some("accounting");
@@ -9443,13 +9586,13 @@ impl Interp {
         let formatted = self.intl_format_value(handle, value);
         let style = self
             .realm
-            .get_property(handle, "style")
+            .get_property(handle, islot!("style"))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_else(|| String::from("decimal"));
         let currency_sym = if style == "currency" {
             let code = self
                 .realm
-                .get_property(handle, "currency")
+                .get_property(handle, islot!("currency"))
                 .map(|v| self.realm.to_display_string(v))
                 .unwrap_or_default();
             currency_symbol(&code)
@@ -9477,7 +9620,7 @@ impl Interp {
         // "M"). The numeric prefix is the leading run of digits/group/decimal chars.
         let notation = self
             .realm
-            .get_property(handle, "notation")
+            .get_property(handle, islot!("notation"))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_default();
         let mut suffix_parts: Vec<(&'static str, String)> = Vec::new();
@@ -9605,7 +9748,8 @@ impl Interp {
         let locv = self.new_str(&locale);
         self.realm.set_hidden_property(obj, "\u{0}locale", locv);
         let nuv = self.new_str(&numbering);
-        self.realm.set_hidden_property(obj, "numberingSystem", nuv);
+        self.realm
+            .set_hidden_property(obj, islot!("numberingSystem"), nuv);
         // style (default "short"); "digital" implies numeric h/m/s defaults.
         let style = self
             .get_string_option(
@@ -9659,7 +9803,7 @@ impl Interp {
         // fractionalDigits: GetNumberOption(0, 9, undefined).
         if let Some(fd) = self.get_int_option(opts, "fractionalDigits", 0.0, 9.0, None)? {
             self.realm
-                .set_hidden_property(obj, "fractionalDigits", NanBox::number(fd));
+                .set_hidden_property(obj, islot!("fractionalDigits"), NanBox::number(fd));
         }
         self.realm
             .set_hidden_property(obj, "\u{0}brand_df", NanBox::boolean(true));
@@ -9830,7 +9974,7 @@ impl Interp {
         let out = self.realm.new_object();
         let read = |this: &mut Self, key: &str, dflt: &str| -> String {
             this.realm
-                .get_property(h, key)
+                .get_property(h, &slot_key(key))
                 .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
                 .map(|v| this.realm.to_display_string(v))
                 .unwrap_or_else(|| String::from(dflt))
@@ -9856,7 +10000,7 @@ impl Interp {
         // fractionalDigits is reported only when it was explicitly set.
         if let Some(v) = self
             .realm
-            .get_property(h, "fractionalDigits")
+            .get_property(h, islot!("fractionalDigits"))
             .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
         {
             self.realm.set_property(out, "fractionalDigits", v);
@@ -10051,13 +10195,13 @@ impl Interp {
     fn duration_unit_resolved(&mut self, h: Handle, unit: &str) -> (String, String) {
         let style = self
             .realm
-            .get_property(h, unit)
+            .get_property(h, &slot_key(unit))
             .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_else(|| String::from("short"));
         let disp = self
             .realm
-            .get_property(h, &alloc::format!("{unit}Display"))
+            .get_property(h, &slot_key(&alloc::format!("{unit}Display")))
             .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_else(|| String::from("auto"));
@@ -10077,13 +10221,13 @@ impl Interp {
     ) -> Vec<(&'static str, String, Option<&'static str>)> {
         let style = self
             .realm
-            .get_property(h, "style")
+            .get_property(h, islot!("style"))
             .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_else(|| String::from("short"));
         let numbering = self
             .realm
-            .get_property(h, "numberingSystem")
+            .get_property(h, islot!("numberingSystem"))
             .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_else(|| String::from("latn"));
@@ -10098,7 +10242,7 @@ impl Interp {
             .unwrap_or_else(|| String::from("en"));
         let fractional_digits = self
             .realm
-            .get_property(h, "fractionalDigits")
+            .get_property(h, islot!("fractionalDigits"))
             .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
             .map(|v| self.realm.to_number(v) as i32);
         let units = Self::DURATION_UNITS;
@@ -10180,43 +10324,53 @@ impl Interp {
                 let loc = self.new_str(&df_locale);
                 self.realm.set_hidden_property(nf, "\u{0}locale", loc);
                 let nuv = self.new_str(&numbering);
-                self.realm.set_hidden_property(nf, "numberingSystem", nuv);
+                self.realm
+                    .set_hidden_property(nf, islot!("numberingSystem"), nuv);
                 if sign_never {
                     let sd = self.new_str("never");
-                    self.realm.set_hidden_property(nf, "signDisplay", sd);
+                    self.realm
+                        .set_hidden_property(nf, islot!("signDisplay"), sd);
                 }
                 if style_u == "2-digit" {
-                    self.realm
-                        .set_hidden_property(nf, "minimumIntegerDigits", NanBox::number(2.0));
+                    self.realm.set_hidden_property(
+                        nf,
+                        islot!("minimumIntegerDigits"),
+                        NanBox::number(2.0),
+                    );
                 }
                 if style_u != "numeric" && style_u != "2-digit" {
                     let st = self.new_str("unit");
-                    self.realm.set_hidden_property(nf, "style", st);
+                    self.realm.set_hidden_property(nf, islot!("style"), st);
                     let uu = self.new_str(singular);
-                    self.realm.set_hidden_property(nf, "unit", uu);
+                    self.realm.set_hidden_property(nf, islot!("unit"), uu);
                     let ud = self.new_str(&style_u);
-                    self.realm.set_hidden_property(nf, "unitDisplay", ud);
-                } else {
                     self.realm
-                        .set_hidden_property(nf, "useGrouping", NanBox::boolean(false));
+                        .set_hidden_property(nf, islot!("unitDisplay"), ud);
+                } else {
+                    self.realm.set_hidden_property(
+                        nf,
+                        islot!("useGrouping"),
+                        NanBox::boolean(false),
+                    );
                 }
                 if let Some(mn) = nf_min_frac {
                     self.realm.set_hidden_property(
                         nf,
-                        "minimumFractionDigits",
+                        islot!("minimumFractionDigits"),
                         NanBox::number(mn as f64),
                     );
                 }
                 if let Some(mx) = nf_max_frac {
                     self.realm.set_hidden_property(
                         nf,
-                        "maximumFractionDigits",
+                        islot!("maximumFractionDigits"),
                         NanBox::number(mx as f64),
                     );
                 }
                 if nf_trunc {
                     let rm = self.new_str("trunc");
-                    self.realm.set_hidden_property(nf, "roundingMode", rm);
+                    self.realm
+                        .set_hidden_property(nf, islot!("roundingMode"), rm);
                 }
                 // The value to format: the combined fractional string, or the number.
                 let value_box = match &value_str {
@@ -10266,9 +10420,9 @@ impl Interp {
         let llo = self.new_str(&df_locale);
         self.realm.set_hidden_property(lf, "\u{0}locale", llo);
         let lt = self.new_str("unit");
-        self.realm.set_hidden_property(lf, "type", lt);
+        self.realm.set_hidden_property(lf, islot!("type"), lt);
         let ls = self.new_str(&list_style);
-        self.realm.set_hidden_property(lf, "style", ls);
+        self.realm.set_hidden_property(lf, islot!("style"), ls);
         let list_parts = self.list_format_parts(&strings, "unit", &list_style, &df_locale);
         // Flatten: an "element" splices in the next unit's parts; a "literal" passes through.
         let mut flattened: Vec<(&'static str, String, Option<&'static str>)> = Vec::new();

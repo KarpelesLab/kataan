@@ -1438,32 +1438,37 @@ impl Interp {
             }
             let arg0 = args.first().copied().unwrap_or(NanBox::undefined());
             match id {
-                // `Segments.prototype.containing(index)`: `target` is the segments
-                // array; return the segment-data object whose `[index, index+len)`
+                // `%IntlSegmentsPrototype%.containing(index)`: the segment-data
+                // object of the receiver's segment list whose `[index, index+len)`
                 // range covers `index` (undefined out of range / non-integer).
-                // `Segments.prototype[@@iterator]()`: a Segment Iterator over the
-                // segments array `target` holds.
-                N_INTL_SEGMENTS_ITER => {
-                    let values = self
-                        .realm
-                        .array_elements(target)
-                        .map(<[_]>::to_vec)
-                        .unwrap_or_default();
-                    return Ok(self.make_builtin_iterator(values, "Segmenter String Iterator"));
-                }
-                N_INTL_SEGMENTS_CONTAINING => {
+                // `%IntlSegmentsPrototype%[@@iterator]()`: a Segment Iterator over
+                // that list.
+                N_INTL_SEGMENTS_ITER | N_INTL_SEGMENTS_CONTAINING => {
                     // `RequireInternalSlot(this, [[SegmentsSegmenter]])`: `this` must
                     // be a genuine Segments object (a foreign receiver — via
-                    // `containing.call(x)` — throws a TypeError).
-                    let branded = this_val
+                    // `containing.call(x)` — throws a TypeError). Its slot holds the
+                    // segment list.
+                    let Some(target) = this_val
                         .as_handle()
                         .map(Handle::from_raw)
                         .and_then(|h| self.realm.get_property(h, "\u{0}segments"))
-                        .is_some_and(|v| matches!(v.unpack(), Unpacked::Bool(true)));
-                    if !branded {
-                        return Err(self.type_error(
-                            "Segments.prototype.containing called on a non-Segments object",
-                        ));
+                        .and_then(|v| v.as_handle())
+                        .map(Handle::from_raw)
+                    else {
+                        let m = if id == N_INTL_SEGMENTS_ITER {
+                            "Segments.prototype[Symbol.iterator] called on a non-Segments object"
+                        } else {
+                            "Segments.prototype.containing called on a non-Segments object"
+                        };
+                        return Err(self.type_error(m));
+                    };
+                    if id == N_INTL_SEGMENTS_ITER {
+                        let values = self
+                            .realm
+                            .array_elements(target)
+                            .map(<[_]>::to_vec)
+                            .unwrap_or_default();
+                        return Ok(self.make_builtin_iterator(values, "Segmenter String Iterator"));
                     }
                     // ToIntegerOrInfinity(index): a Symbol/BigInt throws; NaN → 0.
                     let idx = self.coerce_to_integer_or_infinity(arg0)?;

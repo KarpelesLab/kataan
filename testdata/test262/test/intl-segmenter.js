@@ -2,7 +2,8 @@
 description: Intl.Segmenter.segment yields grapheme/word/sentence segments (iterable; en)
 features: [Intl.Segmenter]
 ---*/
-function seg(g, s) { return [].concat.apply([], [Array.prototype.slice.call(new Intl.Segmenter("en", g ? { granularity: g } : undefined).segment(s))]); }
+// A Segments object is iterable (not an array): collect it with Array.from.
+function seg(g, s) { return Array.from(new Intl.Segmenter("en", g ? { granularity: g } : undefined).segment(s)); }
 
 assert.sameValue(typeof Intl.Segmenter, "function", "Intl.Segmenter exists");
 

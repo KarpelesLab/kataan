@@ -3413,7 +3413,7 @@ impl Interp {
             N_INTL_DISPLAY_NAMES_OF => {
                 let fmt = self.this_val.as_handle().map(Handle::from_raw);
                 let ty = fmt
-                    .and_then(|h| self.realm.get_property(h, "type"))
+                    .and_then(|h| self.realm.get_property(h, "\u{0}type"))
                     .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
                     .map(|v| self.realm.to_display_string(v))
                     .unwrap_or_default();
@@ -3458,7 +3458,7 @@ impl Interp {
                             || unknown_currency =>
                         {
                             let fallback = fmt
-                                .and_then(|h| self.realm.get_property(h, "fallback"))
+                                .and_then(|h| self.realm.get_property(h, "\u{0}fallback"))
                                 .map(|v| self.realm.to_display_string(v))
                                 .unwrap_or_else(|| String::from("code"));
                             if fallback == "none" {
@@ -3497,7 +3497,7 @@ impl Interp {
             N_INTL_SEGMENTER_SEGMENT => {
                 let fmt = self.this_val.as_handle().map(Handle::from_raw);
                 let gran = fmt
-                    .and_then(|h| self.realm.get_property(h, "granularity"))
+                    .and_then(|h| self.realm.get_property(h, "\u{0}granularity"))
                     .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
                     .map(|v| self.realm.to_display_string(v))
                     .unwrap_or_else(|| String::from("grapheme"));
@@ -3523,28 +3523,18 @@ impl Interp {
                     elems.push(NanBox::handle(o.to_raw()));
                 }
                 let arr = self.realm.new_array(elems);
-                // Brand the Segments object (spec `[[SegmentsSegmenter]]`) so
-                // `%Segments.prototype%.containing` can `RequireInternalSlot` its
-                // `this` value and reject foreign receivers with a TypeError.
-                self.realm
-                    .set_hidden_property(arr, "\u{0}segments", NanBox::boolean(true));
-                // Attach `containing(index)` (a bound native over this segments
-                // array) so `segments.containing(i)` works, alongside iteration.
-                let containing = self.realm.new_bound_native(N_INTL_SEGMENTS_CONTAINING, arr);
-                self.install_fn_name_length(containing, "containing", 1);
-                self.realm
-                    .set_property(arr, "containing", NanBox::handle(containing.to_raw()));
-                // `%SegmentsPrototype%[@@iterator]` is its own function, named
-                // "[Symbol.iterator]" — not the inherited `Array.prototype.values`
-                // (whose `name` is "values").
-                let seg_iter = self.realm.new_bound_native(N_INTL_SEGMENTS_ITER, arr);
-                self.install_fn_name_length(seg_iter, "[Symbol.iterator]", 0);
-                let iter_sym = self.well_known_symbol("iterator");
-                let iter_key = self.member_key(iter_sym);
-                self.realm
-                    .set_property(arr, &iter_key, NanBox::handle(seg_iter.to_raw()));
-                self.realm.mark_hidden(arr, &iter_key);
-                NanBox::handle(arr.to_raw())
+                // A Segments instance: an ordinary object inheriting
+                // `%IntlSegmentsPrototype%` (`containing`, `@@iterator`), whose
+                // segment list is its internal `[[SegmentsSegmenter]]`-branding
+                // slot — no own property a script can see.
+                let proto = self.intl_segments_prototype();
+                let segments = self.realm.new_object_with_proto(Some(proto));
+                self.realm.set_hidden_property(
+                    segments,
+                    "\u{0}segments",
+                    NanBox::handle(arr.to_raw()),
+                );
+                NanBox::handle(segments.to_raw())
             }
             // `Intl.Collator.prototype.compare(a, b)` — code-point order (no locale
             // tailoring), so a negative/zero/positive result orders `a` vs `b`.

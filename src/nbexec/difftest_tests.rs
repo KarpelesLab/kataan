@@ -2154,3 +2154,39 @@ fn deeply_nested_functions_compile_linearly_with_the_same_captures() {
         "2004 | 0-499-999 | 152 | 10 | 6 | 42 | z1 | 9 | (v) => u + v | 3"
     );
 }
+
+/// An `Intl` object's internal slots are invisible to scripts: no own keys
+/// (`Reflect.ownKeys(new Intl.NumberFormat())` listed ten names), no `in`, no
+/// `Get` (`nf.style` was `"decimal"`), and a Segments object is an ordinary
+/// object inheriting `containing`/`@@iterator` (it was an array of the
+/// segments with those as own properties), whose methods reject a foreign
+/// receiver. The formatters still work, frozen too.
+#[cfg(feature = "intl")]
+#[test]
+fn intl_internal_slots_are_not_properties() {
+    let src = r#"
+        var I = Intl, objs = [new I.Collator("en"), new I.DateTimeFormat("en"),
+            new I.DisplayNames("en", { type: "region" }), new I.DurationFormat("en"),
+            new I.ListFormat("en"), new I.Locale("en-US"), new I.NumberFormat("en"),
+            new I.PluralRules("en"), new I.RelativeTimeFormat("en"), new I.Segmenter("en"),
+            new I.Segmenter("en").segment("ab cd")];
+        var keys = objs.map(o => Reflect.ownKeys(o).length).join("");
+        var nf = new I.NumberFormat("en"), seg = new I.Segmenter("en").segment("ab cd");
+        var proto = Object.getPrototypeOf(seg);
+        function k(f) { try { return String(f()); } catch (e) { return e.constructor.name; } }
+        // (An `undefined` joins as the empty string.)
+        [keys, "style" in nf, nf.style, nf.numberingSystem, new I.Collator("en").usage,
+         Array.isArray(seg), JSON.stringify(seg), Object.getPrototypeOf(proto) === Object.prototype,
+         Reflect.ownKeys(proto).map(String).join("/"), proto.containing.name, proto[Symbol.iterator].name,
+         [...seg].map(s => s.segment).join("/"), seg.containing(3).segment,
+         k(() => proto.containing.call({}, 0)), k(() => proto[Symbol.iterator].call([])),
+         nf.format(1234.5), Object.freeze(nf) && nf.format(5), new I.ListFormat("en").format(["a", "b"]),
+         new I.DateTimeFormat("en", { timeZone: "UTC" }).format(0)].join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "00000000000 false    false {} true \
+         containing/Symbol(Symbol.iterator) containing [Symbol.iterator] a/b/ /c/d c \
+         TypeError TypeError 1,234.5 5 a and b 1/1/1970"
+    );
+}
