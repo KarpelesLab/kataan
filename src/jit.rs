@@ -6282,10 +6282,16 @@ impl JitFunction {
             |pc| num.in_region(pc),
             |pc| num.in_spec(pc),
             |pc| num.global_copy(pc),
-            // A truthiness test this emitter makes (not a promoted loop's,
-            // nor one of a proven Number or boolean, which `numeric` makes).
-            |pc, r| !num.in_region(pc) && !num.is_number_at(pc, r) && !num.is_bool_at(pc, r),
-            |pc| num.reuse_planned(pc).is_some(),
+            // A truthiness test this emitter makes (not one of a proven
+            // Number or boolean, which `numeric` makes), or a promoted
+            // loop's that `numeric` makes through the way
+            // (`NumGen::truthy_cacheable`).
+            |pc, r| {
+                !num.is_number_at(pc, r)
+                    && !num.is_bool_at(pc, r)
+                    && (!num.in_region(pc) || num.truthy_cacheable(pc, ops))
+            },
+            |pc| num.reuse_planned(pc),
             osr_entries,
             &catch_targets,
         );
@@ -6310,6 +6316,25 @@ impl JitFunction {
         // Per way, its receiver's `extra` part pointer, as a speculative
         // loop's site last loaded it (see `extra_in_frame`).
         let rc_extra = |w: usize| rc_base - 8 * (3 * w as i32 + 3);
+        // A promoted loop's truthiness tests on objects go through their
+        // ways (`numeric::TruthyWay`).
+        num.set_truthy_ways(
+            (0..ops.len())
+                .map(|pc| match (&ops[pc], rc.sites[pc]) {
+                    (GenericOp::JumpIfFalse { .. }, Some(p))
+                        if p.family == recv_cache::Family::Obj && num.truthy_cacheable(pc, ops) =>
+                    {
+                        Some(numeric::TruthyWay {
+                            key: rc_key(p.way),
+                            cell: rc_cell(p.way),
+                            check: p.check,
+                            shape: way_shape[p.way],
+                        })
+                    }
+                    _ => None,
+                })
+                .collect(),
+        );
         // The global binding cache, under the receiver cache: slot `k` holds
         // the address `jit_helper_global_ref` validated for its name (a read
         // or a write binding). Unlike the receiver keys it stays filled

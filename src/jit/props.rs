@@ -1913,6 +1913,66 @@ impl X64Assembler {
         self.jmp(other);
     }
 
+    /// The truthiness of the value in `rax` through a receiver-cache way
+    /// (frame slots `key`/`cell`, `rbp`-relative): with `check`, a key hit
+    /// takes the way's slot address; else a heap handle of a live, ordinary
+    /// shaped, non-exotic object is walked and recorded in the way (only
+    /// when it has layout `shape`, if given). Such an object without the
+    /// `[[IsHTMLDDA]]` brand goes to `truthy`; anything else to `other`,
+    /// having filled nothing. Clobbers `rax`, `rcx`, `rdx`, `r8`–`r11`.
+    pub(crate) fn p_truthy_way(
+        &mut self,
+        realm_off: i32,
+        (key, cell): (i32, i32),
+        check: bool,
+        shape: Option<u64>,
+        truthy: Label,
+        other: Label,
+    ) {
+        let l = super::compute_jit_layout();
+        let proven = self.new_label();
+        let walk = self.new_label();
+        if check {
+            self.g_cmp_mem(r::RAX, r::RBP, key);
+            self.jne(walk);
+            self.g_load(r::RCX, r::RBP, cell);
+            self.jmp(proven);
+        }
+        self.bind(walk);
+        // A heap handle has all of `HANDLE_TAG`'s bits (the top 14).
+        const _: () = assert!(HANDLE_TAG == !0u64 << 50);
+        self.g_mov(r::RCX, r::RAX);
+        self.code.extend_from_slice(&[0x48, 0xc1, 0xe9, 50]); // shr rcx, 50
+        self.code
+            .extend_from_slice(&[0x81, 0xf9, 0xff, 0x3f, 0x00, 0x00]); // cmp ecx, 0x3fff
+        self.jne(other);
+        self.g_mov(r::R9, r::RAX);
+        self.p_load_arena(realm_off, &l.props);
+        self.mov_r10_rax();
+        self.g_mov(r::RAX, r::R9);
+        self.p_slot_of(l, other);
+        self.p_plain_shaped(l, other);
+        let skip_fill = self.new_label();
+        if let Some(s) = shape {
+            self.g_load(r::R11, r::RCX, l.off_shape);
+            self.g_movabs(r::RDX, s);
+            self.g_cmp(r::R11, r::RDX);
+            self.jne(skip_fill);
+        }
+        self.g_store(r::RBP, key, r::R9);
+        self.g_store(r::RBP, cell, r::RCX);
+        self.bind(skip_fill);
+        self.bind(proven);
+        self.g_load(r::R11, r::RCX, l.off_shape);
+        self.p_test_byte_imm(
+            r::R11,
+            l.props.shape_brands,
+            crate::shape::brand_bit(crate::shape::BRAND_KEYS[1]),
+        );
+        self.g_jcc(cc::E, truthy);
+        self.jmp(other);
+    }
+
     /// `mov byte|word|dword [rcx + disp32], imm` (`bytes` 1, 2 or 4).
     fn p_store_rcx_imm(&mut self, bytes: u8, disp: i32, imm: u32) {
         match bytes {

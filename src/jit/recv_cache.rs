@@ -407,7 +407,7 @@ pub(super) fn plan(
     in_spec: impl Fn(usize) -> bool,
     global_copy: impl Fn(usize) -> Option<u16>,
     truthy_site: impl Fn(usize, u16) -> bool,
-    reused: impl Fn(usize) -> bool,
+    reused: impl Fn(usize) -> Option<u16>,
     osr_entries: &[usize],
     catch_targets: &[usize],
 ) -> RecvPlan {
@@ -420,7 +420,7 @@ pub(super) fn plan(
         }
         // A read a promoted loop's fast version replaces by a register copy
         // makes no way access there (`numeric::plan_reuse`).
-        GenericOp::GetProp { .. } if reused(i) => None,
+        GenericOp::GetProp { .. } if reused(i).is_some() => None,
         // An inlined method call's guard looks the method up on its
         // receiver (`call_seq::emit_inline_guard`) — but not in a
         // speculative loop, where a later site may take the way as filled
@@ -535,17 +535,21 @@ pub(super) fn plan(
         if let Some((r, fam)) = site_recv(op, i) {
             let id = id_of(&mut ids, &mut next_id, r) * 3 + fam as u32;
             site_id[i] = id;
+            // A truthiness test fills its way only when the value is an
+            // object (of the way's layout, if it has one): it is never a
+            // later site's certain predecessor, nor a certain one itself.
+            let truthy = matches!(op, GenericOp::Not { .. } | GenericOp::JumpIfFalse { .. });
             if let Some(e) = live.iter_mut().find(|e| e.0 == id) {
                 fill[e.1] = true;
                 check[i] = true;
-                if e.2 && in_spec(i) && in_spec(e.1) {
+                if e.2 && !truthy && in_spec(i) && in_spec(e.1) {
                     pred[i] = Some(e.1);
                 }
                 // (Every site fills its way: from here on, it holds the
                 // value on every path.)
-                *e = (id, i, true);
+                *e = (id, i, !truthy);
             } else {
-                live.push((id, i, true));
+                live.push((id, i, !truthy));
                 fresh_first[i] = fresh.contains(&r);
             }
         }
@@ -664,6 +668,15 @@ pub(super) fn plan(
             check[i] = true;
         }
     }
+    // Loop-carried receivers share a way (see `carried_aliases`).
+    let alias = carried_aliases(ops, bytecode, &site_recv, &reused, &site_id);
+    let gid = |i: usize| {
+        let mut id = site_id[i];
+        while let Some(&(_, to)) = alias.iter().find(|a| a.0 == id) {
+            id = to;
+        }
+        id
+    };
     // Ways, least recently used first per family, over the sites that use
     // the cache: `Obj` ways are `0..obj`, `Arr` ways follow them.
     // As many ways as the family has distinct values to cache, up to its cap.
@@ -672,9 +685,9 @@ pub(super) fn plan(
         for i in 0..n {
             if (fill[i] || check[i])
                 && site_recv(&ops[i], i).is_some_and(|(_, f)| f == fam)
-                && !seen.contains(&site_id[i])
+                && !seen.contains(&gid(i))
             {
-                seen.push(site_id[i]);
+                seen.push(gid(i));
             }
         }
         seen.len().min(cap)
@@ -697,7 +710,7 @@ pub(super) fn plan(
             Family::Arr => obj_ways..obj_ways + arr_ways,
             Family::Cell => obj_ways + arr_ways..obj_ways + arr_ways + cell_ways,
         };
-        let id = site_id[i];
+        let id = gid(i);
         let way = if let Some(&(_, w)) = way_of.iter().find(|&&(x, _)| x == id) {
             w
         } else {
@@ -743,4 +756,107 @@ pub(super) fn plan(
     }
     let ways = obj_ways + arr_ways + cell_ways;
     RecvPlan { ways, sites }
+}
+
+/// An op's receiver-cache receiver, if it is a site (`plan`'s `site_recv`).
+type SiteRecv<'a> = dyn Fn(&GenericOp, usize) -> Option<(u16, Family)> + 'a;
+
+/// Which value ids should share a way because a loop carries one into the
+/// other: a site near a loop's head on the value a register held on entry
+/// to the iteration (`q.link` of `while (q.link) q = q.link`), where the
+/// iteration ends with that register holding a value a later site of the
+/// iteration walked (the truthiness test of the read `q.link`). That later
+/// site then leaves the next iteration's receiver in the way the earlier
+/// one checks. Pairs `(from, to)` of `site_id`s (with no cycles); a hint
+/// for way assignment only — nothing relies on it for soundness (a key
+/// compare decides every hit, and `known` compares real value ids).
+fn carried_aliases(
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    site_recv: &SiteRecv<'_>,
+    reused: &dyn Fn(usize) -> Option<u16>,
+    site_id: &[u32],
+) -> Vec<(u32, u32)> {
+    // A value token: `ENTRY | r` for register `r`'s value on entry to the
+    // iteration, else `pc + 1` of the op that made it.
+    const ENTRY: u64 = 1 << 32;
+    let mut alias: Vec<(u32, u32)> = Vec::new();
+    let resolve = |alias: &[(u32, u32)], mut id: u32| {
+        while let Some(&(_, to)) = alias.iter().find(|a| a.0 == id) {
+            id = to;
+        }
+        id
+    };
+    for (end, op) in ops.iter().enumerate() {
+        let GenericOp::Jump { target: head } = *op else {
+            continue;
+        };
+        if head > end {
+            continue;
+        }
+        let tok = core::cell::RefCell::new(Vec::<(u16, u64)>::new());
+        let get = |r: u16| {
+            tok.borrow()
+                .iter()
+                .find(|e| e.0 == r)
+                .map_or(ENTRY | u64::from(r), |e| e.1)
+        };
+        let set = |r: u16, t: u64| {
+            let mut v = tok.borrow_mut();
+            v.retain(|e| e.0 != r);
+            v.push((r, t));
+        };
+        // The first site on each entry value, and the last site per token.
+        let mut first: Vec<(u16, usize)> = Vec::new();
+        let mut walked: Vec<(u64, usize)> = Vec::new();
+        for (pc, op) in ops.iter().enumerate().take(end).skip(head) {
+            if let Some((r, _)) = site_recv(op, pc) {
+                let t = get(r);
+                if t == ENTRY | u64::from(r) && !first.iter().any(|f| f.0 == r) {
+                    first.push((r, pc));
+                }
+                walked.retain(|w| w.0 != t);
+                walked.push((t, pc));
+            }
+            let def = pc as u64 + 1;
+            match *op {
+                GenericOp::Move { dst, src } => set(dst, get(src)),
+                GenericOp::GetProp { dst, .. } if let Some(src) = reused(pc) => {
+                    set(dst, get(src));
+                }
+                GenericOp::InlineGuard {
+                    dst, caps, n_caps, ..
+                } => {
+                    set(dst, def);
+                    for c in caps..caps.saturating_add(n_caps) {
+                        set(c, def);
+                    }
+                }
+                GenericOp::Interp { .. } | GenericOp::PushHandler { .. } => {
+                    if let Some(b) = bytecode.get(pc) {
+                        crate::bytecode::op_for_each_reg(b, &|r| set(r, def));
+                    }
+                }
+                _ => {
+                    if let Some(d) = op_dst(op) {
+                        set(d, def);
+                    }
+                }
+            }
+        }
+        for (r, i) in first {
+            let t = get(r);
+            if t == ENTRY | u64::from(r) {
+                continue;
+            }
+            let Some(&(_, s)) = walked.iter().find(|w| w.0 == t) else {
+                continue;
+            };
+            let (from, to) = (resolve(&alias, site_id[i]), resolve(&alias, site_id[s]));
+            if from != to && from % 3 == to % 3 {
+                alias.push((from, to));
+            }
+        }
+    }
+    alias
 }

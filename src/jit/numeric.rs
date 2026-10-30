@@ -401,6 +401,20 @@ pub(super) struct NumEnv {
     pub(super) realm: i32,
 }
 
+/// A region truthiness test's receiver-cache way: its key and slot-address
+/// frame slots (`rbp`-relative), whether to compare the key first, and the
+/// layout the way proves (`recv_cache::shape_ways`), which a fill then
+/// requires. An ordinary shaped, non-exotic object condition fills the way
+/// (with its walk's slot address), so a later property op on the same
+/// object skips the walk.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TruthyWay {
+    pub(super) key: i32,
+    pub(super) cell: i32,
+    pub(super) check: bool,
+    pub(super) shape: Option<u64>,
+}
+
 /// Out-of-line slow paths, emitted after the body ([`NumGen::finish`]).
 enum StubKind {
     /// `rax = helper(ctx, [a], [b], extra?)`, sentinel-checked when `throws`,
@@ -490,6 +504,9 @@ pub(super) struct NumGen {
     copy: bool,
     /// Per pc: its label in its region's plain copy ([`Spec`]).
     copy_labels: Vec<Option<Label>>,
+    /// Per pc: the receiver-cache way of a region truthiness test on an
+    /// object ([`Self::truthy_cacheable`]), as `recv_cache::plan` placed it.
+    truthy_ways: Vec<Option<TruthyWay>>,
     /// Where a back-edge poll that asks the body to leave for the
     /// interpreter jumps (with the promoted registers flushed).
     pub(super) leave_exit: Option<Label>,
@@ -662,6 +679,7 @@ impl NumGen {
             tag_false: NanBox::boolean(false).to_bits(),
             copy: false,
             copy_labels: vec![None; n],
+            truthy_ways: Vec::new(),
             leave_exit: None,
         }
     }
@@ -731,6 +749,20 @@ impl NumGen {
     }
 
     /// Where those frame slots start: slot `k` is at `[rbp + base - 8(k+1)]`.
+    /// Whether region op `pc` is a forward `JumpIfFalse` this emitter tests
+    /// with [`Self::branch_if_false`]'s general path (its condition neither
+    /// a proven Number nor a boolean): the receiver cache may give it a way,
+    /// which an object condition then fills (see [`TruthyWay`]).
+    pub(super) fn truthy_cacheable(&self, pc: usize, ops: &[GenericOp]) -> bool {
+        matches!(ops.get(pc), Some(&GenericOp::JumpIfFalse { cond, target })
+            if target > pc && self.in_region(pc) && self.ty(pc, cond) != T_NUM && self.ty(pc, cond) != T_BOOL)
+    }
+
+    /// The receiver-cache ways of the region truthiness tests (per pc).
+    pub(super) fn set_truthy_ways(&mut self, ways: Vec<Option<TruthyWay>>) {
+        self.truthy_ways = ways;
+    }
+
     pub(super) fn set_frame_base(&mut self, base: i32) {
         self.gbase = base;
     }
@@ -2359,6 +2391,21 @@ impl NumGen {
                 let stub = a.new_label();
                 let resume = a.new_label();
                 self.load_gpr(a, reg, RAX, cond);
+                if let Some(w) = self.truthy_ways.get(pc).copied().flatten() {
+                    // An object first (the usual condition here): through
+                    // its way, filling it (anything else goes on below).
+                    let other = a.new_label();
+                    a.p_truthy_way(
+                        self.env.realm,
+                        (w.key, w.cell),
+                        w.check,
+                        w.shape,
+                        resume,
+                        other,
+                    );
+                    a.bind(other);
+                    self.load_gpr(a, reg, RAX, cond);
+                }
                 a.movabs_r11(self.tag_true as i64);
                 a.cmp_rax_r11();
                 a.jcc(CC_E, resume);
