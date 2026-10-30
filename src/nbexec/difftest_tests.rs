@@ -1373,8 +1373,9 @@ fn static_class_methods_keep_their_source_text() {
 
 /// A `JSON.stringify` replacer (or `toJSON`) that returns a fresh array at
 /// every level never closes a cycle, so the serialization recurses without
-/// end; it now stops at `max_json_depth` with a RangeError (as a stack
-/// overflow would) instead of running forever with a quadratic cycle check.
+/// end; it now stops with a RangeError when the native stack runs out (as a
+/// stack overflow would) instead of running forever with a quadratic cycle
+/// check.
 /// Run on a generous stack, as the CLI and the Test262 harness threads do:
 /// each level re-enters the VM for the replacer.
 #[test]
@@ -2061,4 +2062,38 @@ fn map_filter_flat_concat_honor_a_length_past_the_dense_store() {
          0,2,500000000,600000000,600000001,600000003,1100000001 RangeError 8 \
          0,1,900000000 1,2"
     );
+}
+
+/// `JSON.stringify` and the `JSON.parse` reviver walk are bounded by the real
+/// native stack, not a nesting count: 10,000 levels serialize (they stopped
+/// at 2,000 with a RangeError, and a reviver's parse with a SyntaxError),
+/// with and without a replacer, an indent or a property list; a cycle deep
+/// inside is still the TypeError; a reviver sees every level.
+#[test]
+fn json_depth_is_bounded_by_the_stack_not_a_count() {
+    let src = r#"
+        function k(f) { try { return String(f()); } catch (e) { return e.constructor.name; } }
+        function nest(n) { var a = []; for (var i = 0; i < n; i++) a = [a]; return a; }
+        function onest(n) { var a = {}; for (var i = 0; i < n; i++) a = {a: a}; return a; }
+        var N = 10000, s = "[".repeat(N) + "]".repeat(N), cnt = 0;
+        var c = nest(3000), inner = c;
+        for (var i = 0; i < 2500; i++) inner = inner[0];
+        inner.push(c);
+        [k(() => JSON.stringify(nest(N)).length), k(() => JSON.stringify(onest(N)).length),
+         k(() => JSON.stringify(nest(N), (k, v) => v).length),
+         k(() => JSON.stringify(onest(N), ["a"]).length),
+         k(() => JSON.stringify(nest(N), null, 1).length > N),
+         k(() => JSON.stringify(JSON.parse(s, function (k, v) { cnt++; return v; })).length),
+         cnt, k(() => JSON.stringify(c))].join()
+    "#;
+    let out = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            crate::stack::set_thread_stack_size(256 * 1024 * 1024);
+            run(src)
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+    assert_eq!(out, "20002,60002,20002,60002,true,20000,10000,TypeError");
 }

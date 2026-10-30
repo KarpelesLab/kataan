@@ -40,9 +40,13 @@ pub const DEFAULT_MAX_EVAL_DEPTH: usize = 1500;
 /// Default maximum try/catch handler-stack depth.
 pub const DEFAULT_MAX_HANDLER_DEPTH: usize = 100_000;
 /// Default maximum `JSON.stringify` nesting depth (and that of the
-/// `JSON.parse` reviver walk). A reviver-less `JSON.parse` is iterative and
-/// bounded by memory only.
-pub const DEFAULT_MAX_JSON_DEPTH: usize = 2000;
+/// `JSON.parse` reviver walk): no count at all. Those recursions check the
+/// real native-stack headroom ([`crate::stack::exhausted`]) at every level and
+/// throw a RangeError only when the stack is truly out, so the depth they
+/// reach is what the thread's stack allows (hundreds of thousands of levels
+/// on the CLI's stack). An embedder may still set a count. A reviver-less
+/// `JSON.parse` is iterative and bounded by memory only.
+pub const DEFAULT_MAX_JSON_DEPTH: usize = usize::MAX;
 /// Default maximum recursion depth when stringifying a value for display.
 pub const DEFAULT_MAX_DISPLAY_DEPTH: usize = 1000;
 /// Default maximum string length (code units) before `RangeError`.

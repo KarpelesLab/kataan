@@ -32,6 +32,11 @@ impl Interp {
         reviver: NanBox,
         snapshot: Option<&JsonSrc>,
     ) -> Result<NanBox, ExecError> {
+        // The walk recurses once per nesting level of the (possibly
+        // reviver-grown) value: bounded by the real stack headroom.
+        if crate::stack::exhausted() {
+            return Err(self.json_too_deep());
+        }
         let value = self.read_member(holder, key)?;
         if let Some(vh) = value.as_handle().map(Handle::from_raw) {
             if self.realm.is_array(self.proxy_key_target(vh)) {
@@ -76,11 +81,25 @@ impl Interp {
                         .object_keys(self.proxy_key_target(vh))
                         .unwrap_or_default()
                 };
+                // Each key's snapshot member is its first occurrence in the
+                // source; a wide object indexes them once (a scan of every
+                // member per key was quadratic).
+                let index: Option<alloc::collections::BTreeMap<&str, usize>> = match snapshot {
+                    Some(JsonSrc::Object(pairs)) if pairs.len() > 8 => {
+                        let mut m = alloc::collections::BTreeMap::new();
+                        for (i, (pk, _)) in pairs.iter().enumerate() {
+                            m.entry(pk.as_str()).or_insert(i);
+                        }
+                        Some(m)
+                    }
+                    _ => None,
+                };
                 for k in keys {
                     let child = match snapshot {
-                        Some(JsonSrc::Object(pairs)) => {
-                            pairs.iter().find(|(pk, _)| pk == &k).map(|(_, s)| s)
-                        }
+                        Some(JsonSrc::Object(pairs)) => match &index {
+                            Some(m) => m.get(k.as_str()).map(|&i| &pairs[i].1),
+                            None => pairs.iter().find(|(pk, _)| pk == &k).map(|(_, s)| s),
+                        },
                         _ => None,
                     };
                     let nv = self.json_revive_ctx(vh, &k, reviver, child)?;
@@ -212,6 +231,7 @@ impl Interp {
             property_list: property_list.as_deref(),
             gap: &gap,
             stack: Vec::new(),
+            deep: alloc::collections::BTreeSet::new(),
             out: String::new(),
             shape_keys: core::mem::take(&mut self.json_shape_memo),
             tojson_obj: crate::ic::PropertyCache::new(),
@@ -510,8 +530,17 @@ impl Interp {
     /// `max_json_depth` (a RangeError past it, as for any runaway recursion):
     /// a replacer or `toJSON` that returns a fresh object at every level never
     /// closes a cycle, and would otherwise recurse without end.
+    ///
+    /// The membership test is a scan of the stack while it is shallow and a
+    /// set lookup past [`JSON_STACK_SCAN`] levels, so a deep structure costs
+    /// linear time, not a scan of every enclosing level at each one.
     fn json_enter(&mut self, cx: &mut JsonOut<'_>, h: Handle) -> Result<(), ExecError> {
-        if cx.stack.contains(&h) {
+        let seen = if cx.stack.len() <= JSON_STACK_SCAN {
+            cx.stack.contains(&h)
+        } else {
+            cx.stack[..JSON_STACK_SCAN].contains(&h) || cx.deep.contains(&h.to_raw())
+        };
+        if seen {
             let m = self.new_str("Converting circular structure to JSON");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
@@ -519,8 +548,20 @@ impl Interp {
             let m = self.new_str("Maximum call stack size exceeded");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
+        if cx.stack.len() >= JSON_STACK_SCAN {
+            cx.deep.insert(h.to_raw());
+        }
         cx.stack.push(h);
         Ok(())
+    }
+
+    /// Pops the object [`json_enter`](Self::json_enter) pushed.
+    fn json_leave(cx: &mut JsonOut<'_>) {
+        if let Some(h) = cx.stack.pop()
+            && cx.stack.len() >= JSON_STACK_SCAN
+        {
+            cx.deep.remove(&h.to_raw());
+        }
     }
 
     /// `SerializeJSONObject` — `{ … }` with the PropertyList (or own enumerable
@@ -610,7 +651,7 @@ impl Interp {
                 cx.out.truncate(mark);
             }
         }
-        cx.stack.pop();
+        Self::json_leave(cx);
         if any && pretty {
             cx.out.push('\n');
             cx.out.push_str(indent);
@@ -661,7 +702,7 @@ impl Interp {
                 cx.out.truncate(mark);
             }
         }
-        cx.stack.pop();
+        Self::json_leave(cx);
         if any && pretty {
             cx.out.push('\n');
             cx.out.push_str(indent);
@@ -732,7 +773,7 @@ impl Interp {
                 cx.out.push_str("null");
             }
         }
-        cx.stack.pop();
+        Self::json_leave(cx);
         if len > 0 && pretty {
             cx.out.push('\n');
             cx.out.push_str(indent);
@@ -746,6 +787,13 @@ impl Interp {
     pub(crate) fn json_error(&mut self, msg: &str) -> ExecError {
         let m = self.new_str(msg);
         ExecError::Throw(self.make_error(N_ERROR_BASE + 3, Some(m)))
+    }
+
+    /// The RangeError of a recursive JSON walk that ran out of native stack
+    /// (the input itself may be valid, so it is not a SyntaxError).
+    fn json_too_deep(&mut self) -> ExecError {
+        let m = self.new_str("Maximum call stack size exceeded");
+        ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m)))
     }
 
     pub(crate) fn json_parse(
@@ -762,7 +810,7 @@ impl Interp {
         if matches!(ch, '[' | '{')
             && (depth >= self.realm.limits.max_json_depth || crate::stack::exhausted())
         {
-            return Err(self.json_error("Maximum JSON nesting depth exceeded"));
+            return Err(self.json_too_deep());
         }
         match ch {
             'n' => self.json_lit(c, pos, "null", NanBox::null()),
@@ -900,7 +948,7 @@ impl Interp {
         if matches!(ch, '[' | '{')
             && (depth >= self.realm.limits.max_json_depth || crate::stack::exhausted())
         {
-            return Err(self.json_error("Maximum JSON nesting depth exceeded"));
+            return Err(self.json_too_deep());
         }
         // Helper: the source substring `c[start..*pos]` collected as a String.
         match ch {
@@ -1095,6 +1143,9 @@ struct JsonOut<'a> {
     property_list: Option<&'a [String]>,
     gap: &'a str,
     stack: Vec<Handle>,
+    /// The raw handles of `stack[JSON_STACK_SCAN..]`, for the cycle check of
+    /// a deep structure.
+    deep: alloc::collections::BTreeSet<u64>,
     out: String,
     /// Key lists memoized per shape (see [`JsonShapeKeys`]); a few entries,
     /// most recently added last.
@@ -1104,6 +1155,10 @@ struct JsonOut<'a> {
     tojson_obj: crate::ic::PropertyCache,
     tojson_arr: crate::realm::builtins_fast::ChainKeyCache,
 }
+
+/// How many enclosing objects the `JSON.stringify` cycle check scans before
+/// it keeps the deeper ones in a set (see `Interp::json_enter`).
+const JSON_STACK_SCAN: usize = 32;
 
 /// How many shapes' key lists one `JSON.stringify` run remembers.
 const JSON_SHAPE_MEMO: usize = 8;

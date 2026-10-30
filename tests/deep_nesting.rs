@@ -225,7 +225,8 @@ fn stack_per_level() {
 
 /// Recursion that user *data* drives through built-ins (no deep source):
 /// cases node answers with a RangeError must throw one, never abort, and
-/// deep but valid JSON must parse (iteratively, bounded by memory).
+/// deep but valid JSON must parse (iteratively, bounded by memory) and
+/// serialize (as deep as the stack allows).
 const DATA_CASES: &str = r#"
 function k(f) { try { return String(f()); } catch (e) { return e.name; } }
 function deepArr(n) { let a = []; for (let i = 0; i < n; i++) a = [a]; return a; }
@@ -242,7 +243,7 @@ function deepObj(n) { let o = {}; for (let i = 0; i < n; i++) o = { a: o }; retu
   k(() => { let v = JSON.parse('[{"k":'.repeat(5e4) + "1" + "}]".repeat(5e4)), d = 0; while (Array.isArray(v)) { v = v[0].k; d++; } return d + ":" + v; }),
   k(() => JSON.parse("[".repeat(1e5) + "]".repeat(1e5 - 1))),
   k(() => JSON.stringify(JSON.parse('{"a\\n":[1,{"b":[]}],"c":{"d":{}},"a\\n":2}'))),
-  k(() => JSON.stringify(deepObj(100000)).length),
+  k(() => JSON.stringify(deepObj(10000)).length),
   k(() => { let o = {}; for (let i = 0; i < 1e5; i++) o = Object.create(o); return o.zz + ":" + ("zz" in o); }),
 ].join(" ")
 "#;
@@ -254,7 +255,7 @@ fn deep_data_recursion_is_a_range_error_and_deep_json_parses() {
         got.as_deref(),
         Ok(
             "RangeError RangeError 0 RangeError RangeError RangeError 99999 100000 50000:1 \
-            SyntaxError {\"a\\n\":2,\"c\":{\"d\":{}}} RangeError undefined:false"
+            SyntaxError {\"a\\n\":2,\"c\":{\"d\":{}}} 60002 undefined:false"
         )
     );
     // On an undeclared default-size thread the answers may come sooner, but
