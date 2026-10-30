@@ -3625,8 +3625,7 @@ impl Interp {
             // locales this engine can serve. `CanonicalizeLocaleList(locales)`
             // (a malformed tag is a RangeError); then `GetOptionsObject(options)`
             // and `GetOption(options, "localeMatcher", …)` (RangeError on an
-            // invalid value). With no real CLDR available-locale data, every
-            // canonical request is reported as supported.
+            // invalid value).
             N_INTL_SUPPORTED_LOCALES => {
                 let requested = self.canonicalize_locale_list(arg(0))?;
                 // `options = ? CoerceOptionsToObject(options)`: `undefined` → no
@@ -3650,13 +3649,20 @@ impl Interp {
                     )?;
                 }
                 // LookupSupportedLocales: keep only locales this engine can
-                // actually serve. It serves every structurally valid locale
-                // *except* the "no linguistic content" subtag `zxx` (and the
-                // undetermined `und`), which carry no data and must be dropped.
+                // actually serve: the ones a constructor would resolve to rather
+                // than fall back from (`lookup_available_locale`, so `xx-XX` is
+                // not reported while `new Intl.NumberFormat("xx-XX")` resolves
+                // to the default locale), minus the "no linguistic content"
+                // subtag `zxx` and the undetermined `und`, which carry no data.
                 let mut out = Vec::with_capacity(requested.len());
                 for tag in requested {
                     let primary = tag.split(['-', '_']).next().unwrap_or("");
-                    if primary.eq_ignore_ascii_case("zxx") || primary.eq_ignore_ascii_case("und") {
+                    if primary.eq_ignore_ascii_case("zxx")
+                        || primary.eq_ignore_ascii_case("und")
+                        || self
+                            .lookup_available_locale(core::slice::from_ref(&tag))
+                            .is_none()
+                    {
                         continue;
                     }
                     let v = self.new_str(&tag);

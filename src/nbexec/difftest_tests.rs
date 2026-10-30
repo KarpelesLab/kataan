@@ -2423,3 +2423,20 @@ fn date_time_format_resolves_pattern_widths_and_defaults() {
          numeric/numeric/numeric/-/-/- numeric/numeric/numeric/-/-/- -/2-digit/numeric/-/-/-"
     );
 }
+
+/// `supportedLocalesOf` reported every structurally valid tag, including ones
+/// the constructors do not serve (`new Intl.NumberFormat("xx-XX")` resolves to
+/// the default locale); it now keeps exactly the locales a constructor resolves.
+#[cfg(feature = "intl")]
+#[test]
+fn supported_locales_of_agrees_with_resolution() {
+    let src = r#"
+        var req = ["xx-XX", "zz", "qaa", "de-AT", "fr", "zh-Hant-HK", "en-US-u-nu-thai", "und", "zxx"];
+        [Intl.NumberFormat.supportedLocalesOf(req).join(), Intl.Collator.supportedLocalesOf(req).join(),
+         new Intl.NumberFormat("xx-XX").resolvedOptions().locale].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "de-AT,fr,zh-Hant-HK,en-US-u-nu-thai|de-AT,fr,zh-Hant-HK,en-US-u-nu-thai|en-US"
+    );
+}
