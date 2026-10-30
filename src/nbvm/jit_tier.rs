@@ -2744,7 +2744,6 @@ pub(super) fn call_layout() -> crate::jit::CallLayout {
     crate::jit::CallLayout {
         stack: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, stack)),
         call_depth: i(offset_of!(Ctx<'static>, call_depth)),
-        frames_published: i(offset_of!(Ctx<'static>, frames_published)),
         realm: i(offset_of!(Ctx<'static>, realm)),
         total_depth: i(offset_of!(crate::realm::Realm, vm_total_depth)),
         max_depth: i(offset_of!(crate::realm::Realm, limits)
@@ -2837,7 +2836,7 @@ pub(super) fn callee_view(
     unsafe {
         let mut f = (*st).frames;
         while !f.is_null() {
-            let argc = *f.add(3) as usize;
+            let argc = crate::jit::header_argc(*f.add(3));
             natives.push((
                 *f.add(2) as usize,
                 NanBox::from_bits(*f.add(1)),

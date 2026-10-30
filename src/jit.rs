@@ -42,8 +42,8 @@ mod tierup;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use call_seq::{
     CallLayout, CallMemo, CallSite, CallTarget, CalleeHelper, CalleeInfo, ConstructAllocHelper,
-    ConstructFast, ConstructHelper, ConstructResultHelper, FRAME_HEADER, IdentMemo, JitStack,
-    MethodHelper, PollLayout, SuperTwiceHelper,
+    ConstructFast, ConstructHelper, ConstructResultHelper, FRAME_HEADER, HDR_CONSTRUCT, IdentMemo,
+    JitStack, MethodHelper, PollLayout, SuperTwiceHelper, header_argc,
 };
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use props::MethodSite;
@@ -2934,12 +2934,13 @@ pub struct JitProto {
     func: JitFunction,
     n_params: usize,
     kind: JitKind,
-    /// Generic tier: the byte offset of the native-call entry
-    /// (`call_seq::emit_native_entry`) — `None` for a body with `try` regions,
+    /// Generic tier: the byte offsets of the native-call entry
+    /// (`call_seq::emit_native_entry`): the call sequence's, then a Rust
+    /// caller's — `None` for a body with `try` regions,
     /// whose handler stack needs the activation set-up the ordinary entry
     /// (`jit_tier::run_compiled`) does, or one whose `new.target` register the
     /// entry cannot fill.
-    native_entry: Option<usize>,
+    native_entry: Option<(usize, usize)>,
     /// Generic tier: the register-file size the body addresses (the bytecode's
     /// `n_regs`); a caller's register file must be at least this long.
     n_regs: usize,
@@ -4174,7 +4175,8 @@ impl JitProto {
         caps: *const u64,
         this: u64,
     ) -> Option<u64> {
-        let code = self.native_entry()?;
+        let (_, off) = self.native_entry?;
+        let code = self.func.code_ptr() + off;
         // SAFETY: `code` is this body's native-call entry, emitted to the
         // System V signature below (see `call_seq::emit_native_entry`); the
         // pointers satisfy its contract per this function's.
@@ -4185,7 +4187,7 @@ impl JitProto {
             *const u64,
             *const u64,
             u64,
-        ) -> u64 = unsafe { core::mem::transmute(code as usize) };
+        ) -> u64 = unsafe { core::mem::transmute(code) };
         Some(f(ctx, window, argc, argv, caps, this))
     }
 
@@ -4206,7 +4208,7 @@ impl JitProto {
     #[must_use]
     pub fn native_entry(&self) -> Option<u64> {
         self.native_entry
-            .map(|off| (self.func.code_ptr() + off) as u64)
+            .map(|(off, _)| (self.func.code_ptr() + off) as u64)
     }
 }
 
@@ -4293,6 +4295,9 @@ pub struct X64Assembler {
     /// A generic body's heap arena, pinned in `r12`/`r13` (`pin`).
     #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
     pin: Option<pin::PinArena>,
+    /// Whether a back-edge poll's countdown decrement was emitted
+    /// ([`dec_frame8`](Self::dec_frame8)).
+    polls: bool,
 }
 
 /// A run of code [`X64Assembler::cold_end`] cut out of the main stream: its
@@ -4344,6 +4349,12 @@ impl X64Assembler {
     #[must_use]
     pub fn code(&self) -> &[u8] {
         &self.code
+    }
+
+    /// Whether a back-edge poll was emitted (see [`dec_frame8`](Self::dec_frame8)).
+    #[must_use]
+    pub fn polls(&self) -> bool {
+        self.polls
     }
 
     /// Enables frame mode (see the `rbx_frame` field).
@@ -4457,7 +4468,14 @@ impl X64Assembler {
     /// Resolves every recorded `rel32` jump fixup; call once after emission.
     /// Returns the finished machine code.
     #[must_use]
-    pub fn finish(mut self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
+        self.finish_at(&[]).0
+    }
+
+    /// [`finish`](Self::finish), also giving the byte offset each of
+    /// `labels` ended up at (a label in a cold region moves in `finish`).
+    #[must_use]
+    pub(crate) fn finish_at(mut self, labels: &[Label]) -> (Vec<u8>, Vec<usize>) {
         // The cold chunks, after everything else (they are position
         // independent: every jump is a `rel32` fixup).
         for chunk in core::mem::take(&mut self.cold) {
@@ -4478,7 +4496,8 @@ impl X64Assembler {
             let bytes = (rel as i32).to_le_bytes();
             self.code[at..at + 4].copy_from_slice(&bytes);
         }
-        self.code
+        let at = labels.iter().map(|l| self.labels[l.0]).collect();
+        (self.code, at)
     }
 
     /// Starts a **cold region**: the code emitted from here to the matching
@@ -5197,8 +5216,10 @@ impl X64Assembler {
         self.code.extend_from_slice(&imm.to_le_bytes());
     }
 
-    /// `dec qword [rbp+disp8]` (sets ZF when it reaches zero).
+    /// `dec qword [rbp+disp8]` (sets ZF when it reaches zero) — a back-edge
+    /// poll's countdown (see [`polls`](Self::polls)).
     pub fn dec_frame8(&mut self, disp8: i8) {
+        self.polls = true;
         self.code
             .extend_from_slice(&[0x48, 0xff, 0x4d, disp8.to_le_bytes()[0]]);
     }
@@ -6182,7 +6203,7 @@ impl JitFunction {
         (n_params, n_caps, new_target): (usize, usize, Option<usize>),
         inline_closures: &[bool],
         pc_orig: &[u32],
-    ) -> Option<(Self, usize)> {
+    ) -> Option<(Self, (usize, usize))> {
         use crate::nanbox::NanBox;
         if ops.len() != bytecode.len() || n_regs > 0xffff {
             return None;
@@ -6260,12 +6281,14 @@ impl JitFunction {
         // Register `r` lives at `[rbx + 8r]` — the interpreter's register file
         // (frame mode routes non-negative displacements through `rbx`).
         let disp = |r: u16| i32::from(r) * 8;
-        // The native-call scratch buffer sits below the saved `r15`/`rbx` and the
-        // countdown slot. The helper reads `argv[i]` at ascending addresses, so slot
-        // 0 is the deepest: slot `i` at `[rbp - 24 - (max_argc - i)*8]`.
-        let argbuf_disp = |i: usize| -(24 + (max_argc as i32 - i as i32) * 8);
+        // The native-call scratch buffer sits below the saved `r15`/`rbx`, the
+        // countdown slot and the `call_seq::ACT_OK` slot. The helper reads
+        // `argv[i]` at ascending addresses, so slot 0 is the deepest: slot `i`
+        // at `[rbp - 32 - (max_argc - i)*8]`.
+        const _: () = assert!(call_seq::ACT_OK == -32);
+        let argbuf_disp = |i: usize| -(32 + (max_argc as i32 - i as i32) * 8);
         // One more slot under the buffer: a method call's looked-up callee.
-        let method_scratch = -(24 + (max_argc as i32 + 1) * 8);
+        let method_scratch = -(32 + (max_argc as i32 + 1) * 8);
         // Type-specialized arithmetic and loop register promotion (`numeric`),
         // whose frame slots sit under the method scratch slot.
         let mut num = numeric::NumGen::new(
@@ -6435,7 +6458,7 @@ impl JitFunction {
             }
         };
         // (The last 16 bytes: the caller's `r12`/`r13`, see `pin`.)
-        let frame = ((16
+        let frame = ((24
             + 16
             + max_argc as u32 * 8
             + (num.frame_slots()
@@ -6506,6 +6529,7 @@ impl JitFunction {
         a.mov_rbx_rsi(); // pin the register file
         a.pin_enter(); // the caller's `r12`/`r13`, and the arena (clobbers `r11` only)
         a.mov_frame8_imm32(COUNTDOWN, 1); // poll at the first back-edge
+        call_seq::emit_act_ok(&mut a, &helpers.call_layout);
         // Entry dispatch: `entry` (rdx) is 0 or a known loop header.
         for &t in osr_entries {
             if t == 0 || t >= ops.len() {
@@ -6829,6 +6853,35 @@ impl JitFunction {
         // The slow paths of a speculative loop's fast version that leave for
         // its plain copy instead: (slow path entry, the leave).
         let mut cold_bails: Vec<(Label, Label)> = Vec::new();
+        // The native-call entry (`call_seq::emit_native_entry`), falling
+        // through into the body (the interpreter's entry above jumps over
+        // it). Its poll countdown only matters to a body that polls, at a
+        // backward branch.
+        a.jmp(labels[0]);
+        let native = a.new_label();
+        let native_rust = a.new_label();
+        let fill = prologue::entry_fill(
+            bytecode,
+            &|pc| matches!(ops.get(pc), Some(GenericOp::Nop)),
+            n_regs,
+            (n_params + n_caps + 1).min(n_regs),
+            new_target,
+        );
+        let has_backedge = ops.iter().enumerate().any(|(i, o)| match *o {
+            GenericOp::Jump { target } | GenericOp::JumpIfFalse { target, .. } => target <= i,
+            _ => false,
+        });
+        call_seq::emit_native_entry(
+            &mut a,
+            frame,
+            has_backedge.then_some(COUNTDOWN),
+            &fill,
+            n_params,
+            n_caps,
+            new_target,
+            (native, native_rust),
+            labels[0],
+        )?;
         // A speculative region's plain copy is emitted right after it
         // (`numeric::NumGen::schedule`).
         num.alloc_copy_labels(&mut a);
@@ -7257,6 +7310,9 @@ impl JitFunction {
                         .get(args as usize)
                         .zip(call_sites.get(cache as usize));
                     let site_ptr = native.map_or(core::ptr::null(), |(_, c)| *c);
+                    // The site's helper is out of line after a native call
+                    // sequence (its slow path).
+                    let mut slow_cold = None;
                     if let Some((argv, &site_ptr)) = native {
                         if !ok(dst) || !ok(recv) || argv.iter().any(|&r| !ok(r)) {
                             return None;
@@ -7281,6 +7337,7 @@ impl JitFunction {
                                 done,
                             },
                         )?;
+                        slow_cold = Some(a.cold_begin());
                         a.bind(slow);
                     }
                     a.mov_rdi_r15(); // rdi = ctx
@@ -7292,6 +7349,10 @@ impl JitFunction {
                     a.movabs_rax(call_method_helper as i64);
                     a.call_rax();
                     throw_check!();
+                    if let Some(cold) = slow_cold {
+                        a.jmp(done);
+                        a.cold_end(cold);
+                    }
                     a.bind(done);
                 }
                 GenericOp::InitProp {
@@ -7612,8 +7673,11 @@ impl JitFunction {
                                     done,
                                 },
                             )?;
+                            let cold = a.cold_begin();
                             a.bind(slow);
                             site_slow!(helpers.super_call, site_ptr);
+                            a.jmp(done);
+                            a.cold_end(cold);
                             a.bind(done);
                         }
                         // The super constructor / "no instance fields" of a
@@ -8842,6 +8906,7 @@ impl JitFunction {
                             done,
                         },
                     )?;
+                    let cold = a.cold_begin();
                     a.bind(slow);
                     let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
                     a.mov_rdi_r15();
@@ -8853,6 +8918,8 @@ impl JitFunction {
                     a.movabs_rax(call_this_helper as i64);
                     a.call_rax();
                     throw_check!();
+                    a.jmp(done);
+                    a.cold_end(cold);
                     a.bind(done);
                 }
                 GenericOp::Construct {
@@ -8894,6 +8961,7 @@ impl JitFunction {
                             done,
                         },
                     )?;
+                    let cold = a.cold_begin();
                     a.bind(slow);
                     let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
                     a.mov_rdi_r15();
@@ -8905,6 +8973,8 @@ impl JitFunction {
                     a.movabs_rax(construct_slow_helper as i64);
                     a.call_rax();
                     throw_check!();
+                    a.jmp(done);
+                    a.cold_end(cold);
                     a.bind(done);
                 }
                 GenericOp::PlainPrims { dst, site, pc } => {
@@ -8966,6 +9036,7 @@ impl JitFunction {
                             done,
                         },
                     )?;
+                    let cold = a.cold_begin();
                     a.bind(slow);
                     let native = a.new_label();
                     // The built-in the site's helper last served (its bits
@@ -8996,6 +9067,8 @@ impl JitFunction {
                     a.movabs_rax(call_native_got_helper as i64);
                     a.call_rax();
                     throw_check!();
+                    a.jmp(done);
+                    a.cold_end(cold);
                     a.bind(done);
                 }
                 GenericOp::CallValue {
@@ -9029,6 +9102,7 @@ impl JitFunction {
                             done,
                         },
                     )?;
+                    let cold = a.cold_begin();
                     a.bind(slow);
                     let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
                     a.mov_rdi_r15();
@@ -9040,6 +9114,8 @@ impl JitFunction {
                     a.movabs_rax(call_value_helper as i64);
                     a.call_rax();
                     throw_check!();
+                    a.jmp(done);
+                    a.cold_end(cold);
                     a.bind(done);
                 }
             }
@@ -9054,9 +9130,11 @@ impl JitFunction {
             }
         }
         num.set_copy(false);
-        // Falling off the end of the stream (or branching to `len`).
+        // Falling off the end of the stream (or branching to `len`): the
+        // sentinel for the interpreter, `undefined` for a native call (see
+        // `call_seq::ACT_OK`).
         a.bind(labels[ops.len()]);
-        a.movabs_rax(NanBox::jit_falloff_bits() as i64);
+        call_seq::emit_falloff_value(&mut a);
         a.frame_epilogue();
         // Leaving at a loop header for the interpreter (the poll recorded
         // which one).
@@ -9267,39 +9345,41 @@ impl JitFunction {
             a.bind(stub);
             call_seq::emit_inline_stub(&mut a, &helpers.call_layout, &inl_slots, &argv, nt)?;
         }
-        // The native-call entry (`call_seq::emit_native_entry`), behind one
-        // that gives it a handler-stack segment of its own when the body has
+        // The native-call entry (emitted before the body), behind one that
+        // gives it a handler-stack segment of its own when the body has
         // `try` regions.
-        let native = a.new_label();
-        a.bind(native);
-        let fill = prologue::entry_fill(
-            bytecode,
-            &|pc| matches!(ops.get(pc), Some(GenericOp::Nop)),
-            n_regs,
-            (n_params + n_caps + 1).min(n_regs),
-            new_target,
-        );
-        call_seq::emit_native_entry(
-            &mut a, frame, COUNTDOWN, &fill, n_params, n_caps, new_target, labels[0],
-        )?;
+        if a.polls() && !has_backedge {
+            return None; // (`has_backedge` must cover every poll)
+        }
         let uses_handlers = ops
             .iter()
             .any(|o| matches!(o, GenericOp::PushHandler { .. } | GenericOp::PopHandler));
-        let entry = if uses_handlers {
+        let entries = if uses_handlers {
+            // The handler entry is the Rust caller's, and behind a stub that
+            // passes it the context, the call sequence's.
             let outer = a.new_label();
+            let stub = a.new_label();
             a.bind(outer);
             // (A frame of its own, which neither uses nor pins the arena:
             // the entry it calls saves and restores `r12`/`r13`.)
             let pinned = a.pin();
             a.set_pin(None);
-            call_seq::emit_handler_entry(&mut a, helpers.handler_frame as usize as u64, native);
+            call_seq::emit_handler_entry(
+                &mut a,
+                helpers.handler_frame as usize as u64,
+                native_rust,
+            );
             a.set_pin(pinned);
-            outer
+            a.bind(stub);
+            a.mov_rdi_r15();
+            a.jmp(outer);
+            (stub, outer)
         } else {
-            native
+            (native, native_rust)
         };
-        let native_off = a.label_offset(entry);
-        Self::from_code(&a.finish()).map(|f| (f, native_off))
+        // (Their offsets are known once `finish` has placed the cold regions.)
+        let (code, at) = a.finish_at(&[entries.0, entries.1]);
+        Self::from_code(&code).map(|f| (f, (at[0], at[1])))
     }
 
     /// Wraps already-emitted machine `code` into a callable region (the entry

@@ -242,7 +242,7 @@ mod tests {
         assert_eq!(&a.code()[..2], &[0xff, 0xd0]);
         assert_eq!(&a.code()[2..], &RELOAD);
         let mut a = pinned();
-        a.g_call_mem(r::R11, 8);
+        a.g_call_mem_unhooked(r::R11, 8);
         assert_eq!(&a.code()[a.code().len() - RELOAD.len()..], &RELOAD);
         // The epilogue restores the caller's.
         let mut a = pinned();

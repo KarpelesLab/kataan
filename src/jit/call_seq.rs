@@ -15,12 +15,19 @@
 //! The interpreter state the ordinary call keeps is kept here too, more
 //! cheaply:
 //!
-//! * the call depth (`call_depth`, the realm's `vm_total_depth`) is bumped and
-//!   restored in place, and the limits are checked before the call (the limit
-//!   itself is the helper's: it throws the catchable `RangeError`);
-//! * the GC publication: the caller's window is on the register stack, which
-//!   the safepoint scans from its base to its top, so publishing it is one
-//!   increment of `frames_published`;
+//! * the call depth: a native activation counts in the realm's
+//!   `vm_total_depth` (bumped and restored in place; the limit is checked
+//!   before the call, and the limit itself is the helper's: it throws the
+//!   catchable `RangeError`), but not in the context's `call_depth` and
+//!   `frames_published`. Those two count the *Rust* activations below: the
+//!   GC safepoint asks only that they differ by one (every Rust frame below
+//!   published its registers), which a native call, publishing its caller's
+//!   window by keeping it on the register stack (which the safepoint scans
+//!   from its base to its top), would bump both of anyway; and nothing else
+//!   reads `call_depth` but its own limit — implied by `vm_total_depth`'s,
+//!   which is never smaller — and whether it is `0` or `1`, which a native
+//!   activation never changes: its caller ran at a nonzero depth (see
+//!   [`ACT_OK`]) and the Rust code it re-enters bumps the count first;
 //! * the `f.caller` / `f.arguments` activation stack: instead of pushing onto
 //!   the realm's `vm_callee_stack`, each native activation leaves a header on
 //!   the register stack — the previous header, the callee, where the realm's
@@ -90,6 +97,10 @@ pub struct JitStack {
     /// [`FRAME_HEADER`] words — the previous header, the callee value, the
     /// realm's `vm_callee_stack` length at the call, the argument count and
     /// `new.target` — followed by the arguments, then the callee's window.
+    /// The count's word has [`HDR_CONSTRUCT`] set for a construct; for any
+    /// other call `new.target` is `undefined` and its word is left as it was
+    /// (whatever a finished activation left there: see above), so read the
+    /// count with [`header_argc`] and `new.target` only after that test.
     pub frames: *mut u64,
     /// The first word.
     pub base: *mut u64,
@@ -114,6 +125,24 @@ const _: () = {
 };
 /// Words in a native-call header (see [`JitStack::frames`]).
 pub const FRAME_HEADER: usize = 5;
+
+/// The flag in a native-call header's argument-count word (its fourth) that
+/// says the call is a construct, its `new.target` in the fifth word: the
+/// count's word is then the count with every bit from 31 up set (a
+/// sign-extended 32-bit immediate).
+pub const HDR_CONSTRUCT: u64 = 1 << 63;
+
+/// The argument count a native-call header's fourth word `w` records.
+#[must_use]
+pub const fn header_argc(w: u64) -> usize {
+    (w & 0x7fff_ffff) as usize
+}
+
+/// A header's argument-count word as an immediate (see [`HDR_CONSTRUCT`]).
+fn argc_word(argc: usize, construct: bool) -> Option<i32> {
+    let n = i32::try_from(argc).ok()?;
+    Some(if construct { n | i32::MIN } else { n })
+}
 
 /// One callee a call site has seen. `#[repr(C)]`: emitted code reads it at
 /// the `SITE_*` offsets.
@@ -495,8 +524,6 @@ pub struct CallLayout {
     pub stack: i32,
     /// `ctx`: `call_depth: usize`.
     pub call_depth: i32,
-    /// `ctx`: `frames_published: usize`.
-    pub frames_published: i32,
     /// `ctx`: the `Box<Realm>` pointer.
     pub realm: i32,
     /// realm: `vm_total_depth: usize`.
@@ -638,9 +665,9 @@ impl X64Assembler {
         self.code.extend_from_slice(&imm.to_le_bytes());
     }
 
-    /// `call qword [base+disp]`.
-    pub(crate) fn g_call_mem(&mut self, base: u8, disp: i32) {
-        self.inline_frame_hook();
+    /// `call qword [base+disp]`, without the inline frame hook (see
+    /// `inline_frame_hook`): the call sequence runs it before its checks.
+    pub(crate) fn g_call_mem_unhooked(&mut self, base: u8, disp: i32) {
         self.spill_before_call();
         self.g_mem(false, &[0xff], 2, base, disp);
         self.clear_recv_cache();
@@ -699,42 +726,52 @@ impl X64Assembler {
         self.code.push(0xe8);
         self.emit_rel32(label);
     }
-
-    /// The byte offset `label` was bound at (after emission).
-    pub(crate) fn label_offset(&self, label: Label) -> usize {
-        self.labels[label.0]
-    }
 }
 
 /// Emits a generic body's **native-call entry**: `extern "C" fn(ctx, window,
-/// argc, argv, caps, this) -> u64`, the target of the call sequence. It is the
+/// argc, argv, caps, this) -> u64`, the target of the call sequence, at
+/// `native` — where the context is already in `r15` (the caller's own,
+/// callee-saved), so `ctx` is not read — and at `rust`, out of line, for a
+/// caller in Rust, which sets `r15` from `ctx` first. It is the
 /// body's own frame prologue followed by exactly the register-window layout
 /// `call_with_inner` builds — arguments `0..n_params` (missing ones
 /// `undefined`), captures `n_params..`, `this` after them, `new.target` (the
 /// header word just below `argv`) in register `new_target` when the body
 /// reads it, every other register `undefined` — and then the body itself from
-/// pc 0 (`body`).
+/// pc 0 (`body`), which it falls through to when that is bound next. A body
+/// that polls at a back-edge has its poll `countdown` slot set to poll at the
+/// first one; any other has none.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_native_entry(
     a: &mut X64Assembler,
     frame: u32,
-    countdown: i8,
+    countdown: Option<i8>,
     fill: &[bool],
     n_params: usize,
     n_caps: usize,
     new_target: Option<usize>,
+    (native, rust): (Label, Label),
     body: Label,
 ) -> Option<()> {
     let undefined = crate::nanbox::NanBox::undefined().to_bits();
     let slot = |i: usize| i32::try_from(i * 8).ok();
     let n_regs = fill.len();
+    let pinned = a.new_label();
+    let cold = a.cold_begin();
+    a.bind(rust);
     a.frame_prologue(frame);
     a.mov_r15_rdi(); // pin ctx
+    a.jmp(pinned);
+    a.cold_end(cold);
+    a.bind(native);
+    a.frame_prologue(frame);
+    a.bind(pinned);
     a.mov_rbx_rsi(); // pin the window
     a.pin_enter(); // the caller's `r12`/`r13` (see `pin`)
     let n_params = n_params.min(n_regs);
     if n_params > 0 {
-        // rdx = argc, rcx = argv.
+        // rdx = argc, rcx = argv. Fewer arguments than parameters: out of
+        // line.
         let short = a.new_label();
         let done = a.new_label();
         a.g_cmp_imm(r::RDX, i32::try_from(n_params).ok()?);
@@ -744,6 +781,7 @@ pub(crate) fn emit_native_entry(
             a.g_store(r::RBX, slot(i)?, r::RAX);
         }
         a.jmp(done);
+        let cold = a.cold_begin();
         a.bind(short);
         a.g_movabs(r::R11, undefined);
         for i in 0..n_params {
@@ -758,6 +796,8 @@ pub(crate) fn emit_native_entry(
             a.bind(store);
             a.g_store(r::RBX, slot(i)?, r::RAX);
         }
+        a.jmp(done);
+        a.cold_end(cold);
         a.bind(done);
     }
     let caps_end = (n_params + n_caps).min(n_regs);
@@ -769,10 +809,18 @@ pub(crate) fn emit_native_entry(
     if this_slot < n_regs {
         a.g_store(r::RBX, slot(this_slot)?, r::R9);
     }
-    // `new.target` (before the fill below reuses `rcx`; the fill skips it).
+    // `new.target` (before the fill below reuses `rcx`; the fill skips it):
+    // a construct's header word, else `undefined` (see `HDR_CONSTRUCT`).
     let nt = new_target.filter(|&nt| nt > this_slot && nt < n_regs);
     if nt.is_some() {
+        let plain = a.new_label();
+        a.g_movabs(r::R10, crate::nanbox::NanBox::undefined().to_bits());
+        // test byte [rcx - 9], 0x80 (the count word's top byte)
+        a.g_mem(false, &[0xf6], 0, r::RCX, -9);
+        a.raw(&[0x80]);
+        a.g_jcc(cc::E, plain);
         a.g_load(r::R10, r::RCX, -8);
+        a.bind(plain);
     }
     // Every other register starts `undefined` — but one the body writes
     // before any read of it needs no store (`prologue::entry_fill`).
@@ -810,7 +858,10 @@ pub(crate) fn emit_native_entry(
     if let Some(nt) = nt {
         a.g_store(r::RBX, slot(nt)?, r::R10);
     }
-    a.mov_frame8_imm32(countdown, 1); // poll at the first back-edge
+    if let Some(countdown) = countdown {
+        a.mov_frame8_imm32(countdown, 1); // poll at the first back-edge
+    }
+    a.g_store_imm32(RBP, ACT_OK, 0);
     a.jmp(body);
     Some(())
 }
@@ -882,6 +933,80 @@ pub(crate) struct CallEmit<'a> {
     pub done: Label,
 }
 
+/// The native-frame slot (`rbp`-relative) of what the running activation's
+/// entry decided, one byte each:
+///
+/// * byte 0: whether it may make native calls at all — `0` when its register
+///   window is on the register stack (so the GC roots it) and it runs inside
+///   a call (`call_depth != 0`), else `1`. Both facts are fixed for an
+///   activation's whole life (only Rust code moves the register stack's top
+///   or the call depth, and it restores both before it returns into compiled
+///   code), so the entry decides them once;
+/// * byte 1: what falling off the end of the body returns, as the
+///   difference from `undefined` — `0` (`undefined` itself) for a body a
+///   native call entered, whose caller would only map the fall-off sentinel
+///   to it, and the sentinel's difference ([`FALLOFF_DELTA`]) for one the
+///   interpreter entered, which tells the two apart.
+///
+/// A native-call entry stores `0` (its caller's call sequence laid the window
+/// out, from an activation that passed the test); the interpreter's entry
+/// tests (see [`emit_act_ok`]).
+pub(crate) const ACT_OK: i32 = -32;
+
+/// `jit_falloff_bits - undefined`, which byte 1 of [`ACT_OK`] holds for an
+/// interpreter-entered activation.
+const FALLOFF_DELTA: i32 = {
+    let d = crate::nanbox::NanBox::jit_falloff_bits()
+        .wrapping_sub(crate::nanbox::NanBox::undefined().to_bits());
+    assert!(d > 0 && d < 256);
+    d as i32
+};
+
+/// The interpreter's entry into a body: sets [`ACT_OK`] for the activation.
+/// Clobbers `rax` and `r10` only.
+pub(crate) fn emit_act_ok(a: &mut X64Assembler, l: &CallLayout) {
+    let bad = a.new_label();
+    a.g_store_imm32(RBP, ACT_OK, (FALLOFF_DELTA << 8) | 1);
+    a.g_load(r::R10, r::R15, l.stack);
+    a.g_cmp_mem(r::RBX, r::R10, STACK_TOP);
+    a.g_jcc(cc::AE, bad);
+    a.g_cmp_mem(r::RBX, r::R10, STACK_BASE);
+    a.g_jcc(cc::B, bad);
+    a.g_load(r::RAX, r::R15, l.call_depth);
+    a.g_test(r::RAX);
+    a.g_jcc(cc::E, bad);
+    a.g_store_imm32(RBP, ACT_OK, FALLOFF_DELTA << 8);
+    a.bind(bad);
+}
+
+/// Falling off the end of a body: `rax` = what its entry says that returns
+/// (see [`ACT_OK`]). Clobbers `r11`.
+pub(crate) fn emit_falloff_value(a: &mut X64Assembler) {
+    // movzx eax, byte [rbp + ACT_OK + 1]
+    a.g_mem(false, &[0x0f, 0xb6], r::RAX, RBP, ACT_OK + 1);
+    a.g_movabs(r::R11, crate::nanbox::NanBox::undefined().to_bits());
+    a.g_rr(0x01, r::RAX, r::R11); // add rax, r11
+}
+
+/// The limits a native call (or an inlined one's guard) checks before it
+/// lays out an activation, jumping to `fail` when one does not hold: the
+/// activation may make native calls ([`ACT_OK`]), one realm, and the realm's
+/// call depth under the limit. (The context's own `call_depth` is never
+/// above the realm's `vm_total_depth`, which every activation counts, so its
+/// limit is implied.) Leaves `r10` = the register stack, `r9` = the realm;
+/// clobbers `rax`.
+fn emit_limit_checks(a: &mut X64Assembler, l: &CallLayout, fail: Label) {
+    a.g_cmp_byte_imm(RBP, ACT_OK, 0);
+    a.g_jcc(cc::NE, fail);
+    a.g_load(r::R9, r::R15, l.realm);
+    a.g_cmp_byte_imm(r::R9, l.multi_realm, 0);
+    a.g_jcc(cc::NE, fail);
+    a.g_load(r::RAX, r::R9, l.total_depth);
+    a.g_cmp_mem(r::RAX, r::R9, l.max_depth);
+    a.g_jcc(cc::AE, fail);
+    a.g_load(r::R10, r::R15, l.stack);
+}
+
 /// Emits the native call sequence of one call site (see the module docs). On
 /// any guard failure it jumps to `e.slow`, having changed nothing.
 pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
@@ -904,8 +1029,10 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     // The memo check for the callee value in `rax` (see `CallMemo`): the
     // value one of the ways' memos names, at the current prototype epoch —
     // then r11 = the way, r8 = the captures and on to `identified`; else on,
-    // `rax` unchanged.
-    let memo_check = |a: &mut X64Assembler| {
+    // `rax` unchanged. Only way 0's memo (the monomorphic site's path) is
+    // tested inline: the rest, and all that follows a miss up to
+    // `identified`, is out of line — a cold region the returned mark ends.
+    let memo_check = |a: &mut X64Assembler| -> super::ColdMark {
         let decode = a.new_label();
         let found = a.new_label();
         let others = a.new_label();
@@ -920,6 +1047,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
         a.g_load(r::R8, r::R11, memo_caps(0));
         a.g_load(r::R11, r::R11, memo_target(0));
         a.jmp(identified);
+        let cold = a.cold_begin();
         a.bind(others);
         for w in 1..CallSite::WAYS {
             let next = a.new_label();
@@ -931,21 +1059,22 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             a.bind(next);
         }
         a.bind(decode);
+        cold
     };
     // 1. Which function is the callee? (rax = key, rdx = captures)
     // `load_callee(reg)` reloads its value into `reg` afterwards.
-    let (callee_base, callee_disp) = match e.callee {
+    let (callee_base, callee_disp, cold) = match e.callee {
         CalleeSrc::Frame { scratch } => {
             a.g_load(r::RAX, RBP, scratch);
-            memo_check(a);
+            let cold = memo_check(a);
             a.p_callee_info(jl, l.realm);
-            (RBP, scratch)
+            (RBP, scratch, Some(cold))
         }
         CalleeSrc::Reg(c) => {
             a.g_load(r::RAX, r::RBX, reg(c));
-            memo_check(a);
+            let cold = memo_check(a);
             a.p_callee_info(jl, l.realm);
-            (r::RBX, reg(c))
+            (r::RBX, reg(c), Some(cold))
         }
         CalleeSrc::Method {
             recv,
@@ -961,7 +1090,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             a.g_jcc(cc::E, lookup);
             a.p_method_lookup(jl, l.realm, (r::RBX, reg(recv)), site, lookup, None);
             a.g_store(RBP, scratch, r::RAX);
-            memo_check(a);
+            let cold = memo_check(a);
             a.p_callee_info(jl, l.realm);
             a.jmp(have);
             a.bind(lookup);
@@ -972,7 +1101,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             a.g_movabs(r::RAX, helper);
             a.call_rax();
             a.bind(have);
-            (RBP, scratch)
+            (RBP, scratch, Some(cold))
         }
         CalleeSrc::Construct {
             ctor,
@@ -1069,7 +1198,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             a.g_movabs(r::R8, e.site as u64);
             a.g_movabs(r::RAX, helper);
             a.call_rax();
-            (r::RBX, reg(ctor))
+            (r::RBX, reg(ctor), None)
         }
     };
     // r11 = the matching way (and, to memoize the callee in, r10 = its
@@ -1111,28 +1240,17 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
         a.g_store(r::R10, memo_target(0), r::R11);
         a.g_store(r::R10, memo_caps(0), r::R8);
     }
+    if let Some(cold) = cold {
+        a.jmp(identified);
+        a.cold_end(cold);
+    }
     a.bind(identified);
     // (In an inlined body: its activation, if still pending, is pushed
     // first — the callee's header goes above it. Preserves every register.)
     a.inline_frame_hook();
-    // 2. The caller's window is on the register stack (so it is published),
-    //    one realm, and room under both depth limits.
-    a.g_load(r::R10, r::R15, l.stack);
-    a.g_cmp_mem(r::RBX, r::R10, STACK_TOP);
-    a.g_jcc(cc::AE, e.slow);
-    a.g_cmp_mem(r::RBX, r::R10, STACK_BASE);
-    a.g_jcc(cc::B, e.slow);
-    a.g_load(r::R9, r::R15, l.realm);
-    a.g_cmp_byte_imm(r::R9, l.multi_realm, 0);
-    a.g_jcc(cc::NE, e.slow);
-    a.g_load(r::RAX, r::R15, l.call_depth);
-    a.g_test(r::RAX);
-    a.g_jcc(cc::E, e.slow);
-    a.g_cmp_mem(r::RAX, r::R9, l.max_depth);
-    a.g_jcc(cc::AE, e.slow);
-    a.g_load(r::RAX, r::R9, l.total_depth);
-    a.g_cmp_mem(r::RAX, r::R9, l.max_depth);
-    a.g_jcc(cc::AE, e.slow);
+    // 2. The activation may make native calls (`ACT_OK`), one realm, and
+    //    room under the depth limit.
+    emit_limit_checks(a, l, e.slow);
     // 3. Room for the header, the arguments and the callee's window:
     //    rcx = header, rsi = window, rax = new top.
     a.g_load(r::RCX, r::R10, STACK_TOP);
@@ -1148,12 +1266,13 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     a.g_store(r::RCX, 8, r::RDX);
     a.g_load(r::RDX, r::R9, l.callee_len);
     a.g_store(r::RCX, 16, r::RDX);
-    a.g_store_imm32(r::RCX, 24, i32::try_from(argc).ok()?);
-    match e.callee {
-        CalleeSrc::Construct { new_target, .. } => a.g_load(r::RDX, r::RBX, reg(new_target)),
-        _ => a.g_movabs(r::RDX, NanBox::undefined().to_bits()),
+    if let CalleeSrc::Construct { new_target, .. } = e.callee {
+        a.g_store_imm32(r::RCX, 24, argc_word(argc, true)?);
+        a.g_load(r::RDX, r::RBX, reg(new_target));
+        a.g_store(r::RCX, 32, r::RDX);
+    } else {
+        a.g_store_imm32(r::RCX, 24, argc_word(argc, false)?);
     }
-    a.g_store(r::RCX, 32, r::RDX);
     for (i, &ar) in e.args.iter().enumerate() {
         a.g_load(r::RDX, r::RBX, reg(ar));
         a.g_store(r::RCX, hdr(FRAME_HEADER + i)?, r::RDX);
@@ -1161,11 +1280,8 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     // 5. Commit: the activation is on the stack and counted.
     a.g_store(r::R10, STACK_FRAMES, r::RCX);
     a.g_store(r::R10, STACK_TOP, r::RAX);
-    a.g_inc_mem(r::R15, l.call_depth);
     a.g_inc_mem(r::R9, l.total_depth);
-    a.g_inc_mem(r::R15, l.frames_published);
-    // 6. entry(ctx, window, argc, argv, caps, this).
-    a.g_mov(r::RDI, r::R15);
+    // 6. entry(ctx, window, argc, argv, caps, this), `ctx` in `r15`.
     a.g_movabs(r::RDX, argc as u64);
     a.g_lea(r::RCX, r::RCX, hdr(FRAME_HEADER)?);
     match (&e.callee, e.this) {
@@ -1173,7 +1289,9 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
         (_, Some(t)) => a.g_load(r::R9, r::RBX, reg(t)),
         (_, None) => a.g_movabs(r::R9, NanBox::undefined().to_bits()),
     }
-    a.g_call_mem(r::R11, SITE_CODE);
+    // (No inline frame hook: it ran at `identified`, and nothing since
+    // called.)
+    a.g_call_mem_unhooked(r::R11, SITE_CODE);
     // 7. Pop the activation (the callee restored everything it changed).
     a.g_load(r::R10, r::R15, l.stack);
     a.g_load(r::RCX, r::R10, STACK_FRAMES);
@@ -1181,9 +1299,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     a.g_load(r::RDX, r::RCX, 0);
     a.g_store(r::R10, STACK_FRAMES, r::RDX);
     a.g_load(r::R9, r::R15, l.realm);
-    a.g_dec_mem(r::R15, l.call_depth);
     a.g_dec_mem(r::R9, l.total_depth);
-    a.g_dec_mem(r::R15, l.frames_published);
     // 8. The outcome: a throw, falling off the end (`undefined`), or a value.
     let store = a.new_label();
     a.g_movabs(r::R11, NanBox::jit_throw_bits());
@@ -1197,8 +1313,8 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     } = e.callee
     {
         // `[[Construct]]`'s result: an object the body returned, else `this`.
-        // Only a heap value can be an object (the sentinel for falling off the
-        // end is not one). A derived constructor's (`this` started unbound)
+        // Only a heap value can be an object (`undefined`, what falling off the
+        // end returns, is not one). A derived constructor's (`this` started unbound)
         // is validated by the helper too.
         let this = a.new_label();
         let check = a.new_label();
@@ -1239,12 +1355,9 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             a.bind(bind);
             a.g_store(r::RBX, reg(this_reg), r::RAX);
         }
-    } else {
-        a.g_movabs(r::R11, NanBox::jit_falloff_bits());
-        a.g_cmp(r::RAX, r::R11);
-        a.g_jcc(cc::NE, store);
-        a.g_movabs(r::RAX, NanBox::undefined().to_bits());
     }
+    // (A body a native call entered returns `undefined` when it falls off
+    // its end, not the interpreter's sentinel: see `ACT_OK`.)
     a.bind(store);
     a.g_store(r::RBX, reg(e.dst), r::RAX);
     a.jmp(e.done);
@@ -1456,22 +1569,7 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     a.g_load(r::RAX, RBP, e.slots.ok);
     a.g_cmp_imm(r::RAX, super::RECV_CACHE_EMPTY);
     a.g_jcc(cc::NE, checked);
-    a.g_load(r::R10, r::R15, l.stack);
-    a.g_cmp_mem(r::RBX, r::R10, STACK_TOP);
-    a.g_jcc(cc::AE, miss);
-    a.g_cmp_mem(r::RBX, r::R10, STACK_BASE);
-    a.g_jcc(cc::B, miss);
-    a.g_load(r::R9, r::R15, l.realm);
-    a.g_cmp_byte_imm(r::R9, l.multi_realm, 0);
-    a.g_jcc(cc::NE, miss);
-    a.g_load(r::RAX, r::R15, l.call_depth);
-    a.g_test(r::RAX);
-    a.g_jcc(cc::E, miss);
-    a.g_cmp_mem(r::RAX, r::R9, l.max_depth);
-    a.g_jcc(cc::AE, miss);
-    a.g_load(r::RAX, r::R9, l.total_depth);
-    a.g_cmp_mem(r::RAX, r::R9, l.max_depth);
-    a.g_jcc(cc::AE, miss);
+    emit_limit_checks(a, l, miss);
     a.g_load(r::RAX, r::R10, STACK_TOP);
     a.g_lea(
         r::RAX,
@@ -1606,7 +1704,6 @@ pub(crate) fn emit_inline_stub(
     args: &[u16],
     new_target: Option<u16>,
 ) -> Option<()> {
-    use crate::nanbox::NanBox;
     let reg = |x: u16| i32::from(x) * 8;
     let hdr = |i: usize| i32::try_from(i * 8).ok();
     // push rax, rcx, rdx, r9, r10.
@@ -1621,21 +1718,18 @@ pub(crate) fn emit_inline_stub(
     a.g_store(r::RCX, 8, r::RDX);
     a.g_load(r::RDX, r::R9, l.callee_len);
     a.g_store(r::RCX, 16, r::RDX);
-    a.g_store_imm32(r::RCX, 24, i32::try_from(args.len()).ok()?);
-    match new_target {
-        Some(nt) => a.g_load(r::RDX, r::RBX, reg(nt)),
-        None => a.g_movabs(r::RDX, NanBox::undefined().to_bits()),
+    a.g_store_imm32(r::RCX, 24, argc_word(args.len(), new_target.is_some())?);
+    if let Some(nt) = new_target {
+        a.g_load(r::RDX, r::RBX, reg(nt));
+        a.g_store(r::RCX, 32, r::RDX);
     }
-    a.g_store(r::RCX, 32, r::RDX);
     for (i, &ar) in args.iter().enumerate() {
         a.g_load(r::RDX, r::RBX, reg(ar));
         a.g_store(r::RCX, hdr(FRAME_HEADER + i)?, r::RDX);
     }
     a.g_store(r::R10, STACK_FRAMES, r::RCX);
     a.g_store(r::R10, STACK_TOP, r::RAX);
-    a.g_inc_mem(r::R15, l.call_depth);
     a.g_inc_mem(r::R9, l.total_depth);
-    a.g_inc_mem(r::R15, l.frames_published);
     a.g_store(RBP, s.hdr, r::RCX);
     a.g_store_imm32(RBP, s.pend, super::RECV_CACHE_EMPTY);
     // pop r10, r9, rdx, rcx, rax; ret.
@@ -1665,9 +1759,7 @@ pub(crate) fn emit_inline_leave(a: &mut X64Assembler, l: &CallLayout, s: &Inline
     a.g_load(r::RDX, r::RCX, 0);
     a.g_store(r::R10, STACK_FRAMES, r::RDX);
     a.g_load(r::R9, r::R15, l.realm);
-    a.g_dec_mem(r::R15, l.call_depth);
     a.g_dec_mem(r::R9, l.total_depth);
-    a.g_dec_mem(r::R15, l.frames_published);
     a.g_store_imm32(RBP, s.hdr, super::RECV_CACHE_EMPTY);
     a.bind(done);
 }
