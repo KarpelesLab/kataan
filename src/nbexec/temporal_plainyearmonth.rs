@@ -14,7 +14,7 @@ use crate::common::FloatExt;
 use crate::temporal_iso::{
     self, IsoDate, MAX_EPOCH_DAYS, MIN_EPOCH_DAYS, Overflow, RoundMode, TemporalData, TemporalKind,
     Unit, format_iso_year, is_leap_year, iso_date_in_range, iso_days_in_month, iso_days_in_year,
-    pad, regulate_iso_date, round_to_increment,
+    pad, regulate_iso_date,
 };
 
 /// Prototype method names installed on `Temporal.PlainYearMonth.prototype`.
@@ -1238,7 +1238,7 @@ impl Interp {
         }
 
         let cal = data.calendar.clone();
-        let (years, months, cal_ref) = if tcal::is_iso(&cal) {
+        let (years, months, cal_ref, dest_ref) = if tcal::is_iso(&cal) {
             // Both operands are the first day of a month, so the difference is an
             // exact whole number of months (this → other). Computing it directly
             // avoids `difference_iso_date`, which can loop for dates whose
@@ -1250,7 +1250,7 @@ impl Interp {
             } else {
                 (0, total_months)
             };
-            (y, m, this_ref)
+            (y, m, this_ref, other_ref)
         } else {
             // Non-ISO (`CalendarDateUntil`): measure the difference in the
             // calendar's own year/month terms. Re-anchor both operands to their
@@ -1268,7 +1268,7 @@ impl Interp {
                 Unit::Month
             };
             let parts = tcal::calendar_date_until(&cal, this_anchor, other_anchor, lu);
-            (parts.years, parts.months, this_anchor)
+            (parts.years, parts.months, this_anchor, other_anchor)
         };
 
         // `NudgeToCalendarUnit` projects the ceil (`r2`) increment-multiple endpoint
@@ -1300,12 +1300,13 @@ impl Interp {
 
         let mode = parse_round_mode(&mode_s);
         let mode = if since { negate_round_mode(mode) } else { mode };
-        let (mut ry, mut rm) = if tcal::is_iso(&cal) {
-            round_year_month(years, months, smallest_year, largest_year, increment, mode)
+        let (mut ry, mut rm) = if !smallest_year && increment == 1 {
+            (years, months)
         } else {
-            round_year_month_cal(
+            round_year_month(
                 &cal,
                 cal_ref,
+                dest_ref,
                 years,
                 months,
                 smallest_year,
@@ -1313,6 +1314,7 @@ impl Interp {
                 increment,
                 mode,
             )
+            .ok_or_else(|| self.pym_range("rounded date is outside the valid ISO range"))?
         };
         if since {
             ry = -ry;
@@ -1501,69 +1503,51 @@ impl Interp {
     }
 }
 
-/// Rounds a (years, months) difference per the smallest/largest units.
-fn round_year_month(
-    years: i64,
-    months: i64,
-    smallest_year: bool,
-    largest_year: bool,
-    increment: i128,
-    mode: RoundMode,
-) -> (i64, i64) {
-    if smallest_year {
-        // Round (years + months/12) to `increment` years, working in twelfths.
-        let twelfths = i128::from(years) * 12 + i128::from(months);
-        let rounded = round_to_increment(twelfths, increment * 12, mode);
-        ((rounded / 12) as i64, 0)
-    } else if largest_year {
-        // Round the months component; keep years, carrying any overflow.
-        let rm = round_to_increment(i128::from(months), increment, mode) as i64;
-        let mut y = years;
-        let mut m = rm;
-        if m.abs() >= 12 {
-            y += m / 12;
-            m %= 12;
-        }
-        (y, m)
-    } else {
-        // largestUnit month, smallestUnit month: round the total months.
-        let total = i128::from(years) * 12 + i128::from(months);
-        (0, round_to_increment(total, increment, mode) as i64)
-    }
-}
-
-/// Calendar-aware analogue of [`round_year_month`] for a non-ISO calendar. The
-/// `(years, months)` inputs already come from `CalendarDateUntil`, so they are
-/// separated in the calendar's own terms — the year⇄month boundary uses the
-/// calendar's (variable) `monthsInYear` at the reference date rather than a
-/// hardcoded 12, and no spurious re-carry is applied to the month remainder.
+/// `RoundRelativeDuration` of a (years, months) `PlainYearMonth` difference from
+/// the reference day `from` to `to`: `NudgeToCalendarUnit` at the smallest unit
+/// weighs the destination's progress by the real span of the increment window
+/// (month lengths differ, so a 33-month gap is not a tie between 32 and 34),
+/// then an expanded month count reaching the next whole year carries into years
+/// (`BubbleRelativeDuration`). `None` when a window end is unrepresentable.
 #[allow(clippy::too_many_arguments)]
-fn round_year_month_cal(
+fn round_year_month(
     cal: &str,
-    reference: IsoDate,
+    from: IsoDate,
+    to: IsoDate,
     years: i64,
     months: i64,
     smallest_year: bool,
     largest_year: bool,
     increment: i128,
     mode: RoundMode,
-) -> (i64, i64) {
-    if smallest_year {
-        // Round (years + months/monthsInYear) to `increment` years.
-        let miy = i128::from(tcal::months_in_year(cal, reference).max(1));
-        let units = i128::from(years) * miy + i128::from(months);
-        let rounded = round_to_increment(units, increment * miy, mode);
-        ((rounded / miy) as i64, 0)
-    } else if largest_year {
-        // `months` is already the calendar-month remainder (< monthsInYear);
-        // round it to the increment, keeping the whole-year component.
-        let rm = round_to_increment(i128::from(months), increment, mode) as i64;
-        (years, rm)
-    } else {
-        // largestUnit month: `months` already holds the folded total.
-        (
-            0,
-            round_to_increment(i128::from(months), increment, mode) as i64,
-        )
+) -> Option<(i64, i64)> {
+    let add = |y: i64, m: i64| -> Option<i128> {
+        let d = if tcal::is_iso(cal) {
+            temporal_iso::add_iso_date(from, y, m, 0, 0, Overflow::Constrain)
+        } else {
+            tcal::calendar_date_add(cal, from, y, m, 0, 0, Overflow::Constrain).ok()
+        }?;
+        Some(i128::from(temporal_iso::iso_to_epoch_days(d)))
+    };
+    let dest = i128::from(temporal_iso::iso_to_epoch_days(to));
+    let sign = (dest - i128::from(temporal_iso::iso_to_epoch_days(from))).signum() as i64;
+    if sign == 0 {
+        return Some((0, 0));
     }
+    let inc = i64::try_from(increment).unwrap_or(i64::MAX);
+    if smallest_year {
+        let (y, _) =
+            temporal_iso::nudge_calendar_count(years, sign, inc, mode, dest, |n| add(n, 0))?;
+        return Some((y, 0));
+    }
+    let keep_y = if largest_year { years } else { 0 };
+    let (m, expanded) =
+        temporal_iso::nudge_calendar_count(months, sign, inc, mode, dest, |n| add(keep_y, n))?;
+    if expanded && largest_year {
+        let nudged = add(keep_y, m)?;
+        if add(keep_y + sign, 0).is_some_and(|e| (nudged - e).signum() != i128::from(-sign)) {
+            return Some((keep_y + sign, 0));
+        }
+    }
+    Some((keep_y, m))
 }

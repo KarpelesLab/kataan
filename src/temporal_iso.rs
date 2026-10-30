@@ -665,6 +665,54 @@ pub fn balance_time_duration(total_ns: i128, largest: Unit) -> DurationFields {
     d
 }
 
+/// The rounding step of `NudgeToCalendarUnit` for a calendar-unit count.
+///
+/// `r` is that unit's count in the unrounded difference (the largest count
+/// whose instant does not pass `dest`), `sign` the difference's direction (±1),
+/// and `epoch_of(n)` the instant (in any fixed scale) of the anchor plus `n`
+/// units, `None` when unrepresentable. The window is `[r1, r1 + increment·sign]`
+/// with `r1 = r` truncated to the increment — moved one increment further when
+/// `dest` lies past its end (`ComputeNudgeWindow`) — and `dest`'s progress
+/// through the *whole* window decides between its ends, so month lengths across
+/// a multi-month increment are weighed by their actual spans. Returns the
+/// rounded count and whether it expanded (`DidExpandCalendarUnit`), or `None`
+/// when a window end cannot be represented (the caller's RangeError).
+pub fn nudge_calendar_count(
+    r: i64,
+    sign: i64,
+    increment: i64,
+    mode: RoundMode,
+    dest: i128,
+    mut epoch_of: impl FnMut(i64) -> Option<i128>,
+) -> Option<(i64, bool)> {
+    let inc = increment.max(1);
+    let mut r1 = (r / inc) * inc;
+    let mut shifted = false;
+    loop {
+        let r2 = r1 + inc * sign;
+        let e1 = epoch_of(r1)?;
+        let e2 = epoch_of(r2)?;
+        let inside = if sign > 0 {
+            e1 <= dest && dest <= e2
+        } else {
+            e2 <= dest && dest <= e1
+        };
+        if !inside && !shifted {
+            shifted = true;
+            r1 = r2;
+            continue;
+        }
+        if dest == e1 {
+            return Some((r1, shifted));
+        }
+        let den = (e2 - e1).abs().max(1);
+        let num = (dest - e1).abs();
+        let x = i128::from(r1) * den + i128::from(sign) * i128::from(inc) * num;
+        let rounded = (round_to_increment(x, i128::from(inc) * den, mode) / den) as i64;
+        return Some((rounded, rounded != r1 || shifted));
+    }
+}
+
 /// Rounds `x` to the nearest multiple of `increment` using `mode`.
 #[must_use]
 pub fn round_to_increment(x: i128, increment: i128, mode: RoundMode) -> i128 {

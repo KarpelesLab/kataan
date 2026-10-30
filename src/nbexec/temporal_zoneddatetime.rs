@@ -2914,17 +2914,10 @@ impl Interp {
                 break;
             }
         }
-        let epoch1 = comp_epoch(r1);
-        let rounded_v = if epoch1 == end_epoch {
-            r1
-        } else {
-            let epoch2 = comp_epoch(r1 + sign);
-            let den = (epoch2 - epoch1).abs().max(1);
-            let num = (end_epoch - epoch1).abs();
-            let x = i128::from(r1) * den + i128::from(sign) * num;
-            let rounded = round_signed(x, i128::from(increment.max(1)) * den, mode);
-            (rounded / den) as i64
-        };
+        let (rounded_v, _) = iso::nudge_calendar_count(r1, sign, increment, mode, end_epoch, |v| {
+            Some(comp_epoch(v))
+        })
+        .unwrap_or((r1, false));
         // `BubbleRelativeDuration`: the nudged date duration (coarser units + rounded
         // `unit` component) is re-expressed up to `largest` by adding it to the start
         // date and re-differencing, carrying any full coarser unit (e.g. 12 months →

@@ -2604,3 +2604,28 @@ fn regex_ignore_case_class_uses_simple_fold_class() {
          000110000|110111111|010000000|100000001|100000001"
     );
 }
+
+/// `NudgeToCalendarUnit` with a `roundingIncrement`: the window is the whole
+/// increment (`[trunc(n, inc), +inc]`) and the destination's progress is
+/// weighed by that window's real span. The until/since paths had measured the
+/// fraction within a single unit around the exact count (2016-03-17 →
+/// 2016-02-01 is 1.496 of a 3-month window, so half-rounding gives 0, not −3
+/// months), PlainYearMonth rounded month counts arithmetically (33 months is
+/// not a tie between 32 and 34; 3½ years of unequal halves is not a tie
+/// either), and the ZonedDateTime exact-boundary shortcut skipped the
+/// increment snap entirely (73 weeks floored to 3 stayed 73).
+#[test]
+fn temporal_calendar_increment_rounding_window() {
+    let src = r#"
+        var T = Temporal;
+        function z(s) { return T.ZonedDateTime.from(s); }
+        [String(z("2016-03-17T10:00[UTC]").until(z("2016-02-01T00:49[UTC]"), { largestUnit: "years", smallestUnit: "months", roundingMode: "halfCeil", roundingIncrement: 3 })),
+         String(T.PlainDateTime.from("2016-03-17T10:00").until("2016-02-01T00:49", { largestUnit: "months", smallestUnit: "months", roundingMode: "halfCeil", roundingIncrement: 3 })),
+         String(T.PlainYearMonth.from("2002-01").until("1999-04", { largestUnit: "months", smallestUnit: "months", roundingMode: "halfFloor", roundingIncrement: 2 })),
+         String(z("2015-07-01T07:27[America/New_York]").until(z("2016-11-23T07:27[America/New_York]"), { largestUnit: "weeks", smallestUnit: "weeks", roundingMode: "floor", roundingIncrement: 3 })),
+         String(T.PlainDate.from("2005-08-30").until("2007-06-29", { largestUnit: "months", smallestUnit: "months", roundingMode: "halfExpand", roundingIncrement: 6 })),
+         String(T.PlainYearMonth.from("2000-01").until("2003-07", { largestUnit: "years", smallestUnit: "years", roundingMode: "halfEven" }))
+        ].join("|")
+    "#;
+    assert_eq!(run(src), "PT0S|PT0S|-P32M|P72W|P24M|P3Y");
+}

@@ -1548,21 +1548,15 @@ impl Interp {
         // `NudgeToCalendarUnit` projects the ceil (`r2`) increment-multiple endpoint
         // via `CalendarDateAdd`; a date outside the representable ISO range throws a
         // RangeError. Only a coarse unit with a large `roundingIncrement` reaches it.
-        let inc = increment.max(1);
-        let r2 = (r1 / inc) * inc + inc * sign;
-        if unit_add(r2).is_none() {
+        let Some((count, _)) = crate::temporal_iso::nudge_calendar_count(
+            r1,
+            sign,
+            increment,
+            mode,
+            i128::from(to_e),
+            |n| unit_add(n).map(|d| i128::from(iso_to_epoch_days(d))),
+        ) else {
             return Err(self.pd_range_error("rounded date is outside the valid ISO range"));
-        }
-        let e1 = step(r1);
-        let count = if e1 == to_e {
-            // Even an exact-boundary count must still snap to `roundingIncrement`.
-            round_inc(i128::from(r1), i128::from(increment.max(1)), mode) as i64
-        } else {
-            let e2 = step(r1 + sign);
-            let den = i128::from((e2 - e1).abs().max(1));
-            let num = i128::from((to_e - e1).abs());
-            let x = i128::from(r1) * den + i128::from(sign) * num;
-            (round_inc(x, i128::from(increment.max(1)) * den, mode) / den) as i64
         };
         match smallest {
             Unit::Year => out.years = i128::from(count),
@@ -1667,21 +1661,15 @@ impl Interp {
         }
         // `NudgeToCalendarUnit`: the ceil (`r2`) increment-multiple endpoint must be
         // representable, else a RangeError.
-        let inc = increment.max(1);
-        let r2 = (r1 / inc) * inc + inc * sign;
-        if unit_add(r2).is_none() {
+        let Some((count, _)) = crate::temporal_iso::nudge_calendar_count(
+            r1,
+            sign,
+            increment,
+            mode,
+            i128::from(to_e),
+            |n| unit_add(n).map(|d| i128::from(iso_to_epoch_days(d))),
+        ) else {
             return Err(self.pd_range_error("rounded date is outside the valid ISO range"));
-        }
-        let e1 = step(r1);
-        let count = if e1 == to_e {
-            // Even an exact-boundary count must still snap to `roundingIncrement`.
-            round_inc(i128::from(r1), i128::from(increment.max(1)), mode) as i64
-        } else {
-            let e2 = step(r1 + sign);
-            let den = i128::from((e2 - e1).abs().max(1));
-            let num = i128::from((to_e - e1).abs());
-            let x = i128::from(r1) * den + i128::from(sign) * num;
-            (round_inc(x, i128::from(increment.max(1)) * den, mode) / den) as i64
         };
         match smallest {
             Unit::Year => out.years = i128::from(count),

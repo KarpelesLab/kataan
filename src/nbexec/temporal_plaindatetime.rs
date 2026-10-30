@@ -2048,27 +2048,17 @@ fn pdt_round_calendar(
     }
     // `NudgeToCalendarUnit` projects the ceil (`r2`) increment-multiple endpoint via
     // `CalendarDateAdd`; a date outside the representable ISO range throws.
-    let inc = increment.max(1);
-    let r2 = (r1 / inc) * inc + inc * sign_i;
-    let (ry, rm, rw) = match smallest {
-        Unit::Year => (r2, 0, 0),
-        Unit::Month => (0, r2, 0),
-        _ => (0, 0, r2),
-    };
-    if iso::add_iso_date(anchor, ry, rm, rw, 0, Overflow::Constrain).is_none() {
-        return Err(());
-    }
-    let e1 = step_ns(r1);
-    let count = if e1 == to_ns {
-        // Even an exact-boundary count must still snap to `roundingIncrement`.
-        iso::round_to_increment(i128::from(r1), i128::from(increment.max(1)), mode) as i64
-    } else {
-        let e2 = step_ns(r1 + sign_i);
-        let den = (e2 - e1).abs().max(1);
-        let num = (to_ns - e1).abs();
-        let x = i128::from(r1) * den + sign * num;
-        (iso::round_to_increment(x, i128::from(increment.max(1)) * den, mode) / den) as i64
-    };
+    let (count, _) = iso::nudge_calendar_count(r1, sign_i, increment, mode, to_ns, |n| {
+        let (y, m, w) = match smallest {
+            Unit::Year => (n, 0, 0),
+            Unit::Month => (0, n, 0),
+            _ => (0, 0, n),
+        };
+        iso::add_iso_date(anchor, y, m, w, 0, Overflow::Constrain).map(|nd| {
+            iso::iso_to_epoch_days(nd) as i128 * iso::NS_PER_DAY + iso::time_to_nanos(from_time)
+        })
+    })
+    .ok_or(())?;
     match smallest {
         Unit::Year => out.years = i128::from(count),
         Unit::Month => {
@@ -2245,21 +2235,12 @@ fn pdt_round_calendar_cal(
     }
     // `NudgeToCalendarUnit`: the ceil (`r2`) increment-multiple endpoint must be
     // representable, else a RangeError.
-    let inc = increment.max(1);
-    let r2 = (r1 / inc) * inc + inc * sign_i;
-    if unit_add(r2).is_none() {
-        return Err(());
-    }
-    let e1 = step_ns(r1);
-    let count = if e1 == to_ns {
-        r1
-    } else {
-        let e2 = step_ns(r1 + sign_i);
-        let den = (e2 - e1).abs().max(1);
-        let num = (to_ns - e1).abs();
-        let x = i128::from(r1) * den + sign * num;
-        (iso::round_to_increment(x, i128::from(increment.max(1)) * den, mode) / den) as i64
-    };
+    let (count, _) = iso::nudge_calendar_count(r1, sign_i, increment, mode, to_ns, |n| {
+        unit_add(n).map(|nd| {
+            iso::iso_to_epoch_days(nd) as i128 * iso::NS_PER_DAY + iso::time_to_nanos(from_time)
+        })
+    })
+    .ok_or(())?;
     match smallest {
         Unit::Year => out.years = i128::from(count),
         Unit::Month => out.months = i128::from(count),
