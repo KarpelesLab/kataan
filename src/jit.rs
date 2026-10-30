@@ -28,6 +28,8 @@ mod global_persist;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub mod inline;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod prologue;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod props;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod recv_cache;
@@ -9259,8 +9261,15 @@ impl JitFunction {
         // `try` regions.
         let native = a.new_label();
         a.bind(native);
+        let fill = prologue::entry_fill(
+            bytecode,
+            &|pc| matches!(ops.get(pc), Some(GenericOp::Nop)),
+            n_regs,
+            (n_params + n_caps + 1).min(n_regs),
+            new_target,
+        );
         call_seq::emit_native_entry(
-            &mut a, frame, COUNTDOWN, n_regs, n_params, n_caps, new_target, labels[0],
+            &mut a, frame, COUNTDOWN, &fill, n_params, n_caps, new_target, labels[0],
         )?;
         let uses_handlers = ops
             .iter()

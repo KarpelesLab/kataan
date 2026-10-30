@@ -150,6 +150,65 @@ impl Default for StackPtr {
 /// OS only as it is touched.
 const STACK_WORDS: usize = 1 << 20;
 
+/// The granule (in words) by which [`reserve`] raises a register stack's
+/// `limit`, and the most of it a collection leaves above `top` (see
+/// [`scrub_stack`]): small enough that zeroing it at a collection is cheap,
+/// large enough that a call chain rarely outgrows it between collections.
+const STACK_CHUNK: usize = 1 << 11;
+
+/// Makes room for `words` more words at the top of `st` if the stack has
+/// them: raises its `limit` (see [`JitStack`]) when `top + words` lies past
+/// it. Returns the room under `limit` afterwards.
+///
+/// # Safety
+/// `st` is this thread's live register stack, which nothing else borrows.
+#[allow(unsafe_code)]
+unsafe fn reserve(st: *mut JitStack, words: usize) -> usize {
+    // SAFETY: see the function contract; every pointer is inside (or one past)
+    // the allocation.
+    unsafe {
+        let top = (*st).top;
+        let room = (*st).limit.offset_from(top) as usize;
+        if room >= words {
+            return room;
+        }
+        let left = (*st).end.offset_from(top) as usize;
+        let want = words.saturating_add(STACK_CHUNK).min(left);
+        if want > room {
+            // `top + room..top + want` held no handle (it was at or past
+            // `limit`), so admitting it keeps the invariant.
+            (*st).limit = top.add(want);
+        }
+        (*st).limit.offset_from(top) as usize
+    }
+}
+
+/// Before a collection: zeroes what finished activations left in the
+/// register stack above `top`, so no word of it names an object this
+/// collection frees, and pulls `limit` down to at most a chunk past `top`
+/// (see [`JitStack`]).
+pub(super) fn scrub_stack(ctx: &Ctx) {
+    let p = ctx.jit_rt.stack.0;
+    if p.is_null() {
+        return;
+    }
+    // SAFETY: `p` is this thread's live stack; no compiled code runs while a
+    // safepoint does, and `top..limit` belongs to no activation.
+    #[allow(unsafe_code)]
+    unsafe {
+        let top = (*p).top;
+        let limit = (*p).limit;
+        let dirty = limit.offset_from(top);
+        if dirty > 0 {
+            core::ptr::write_bytes(top, 0, dirty as usize);
+        }
+        let keep = ((*p).end.offset_from(top) as usize).min(STACK_CHUNK);
+        if dirty > keep as isize {
+            (*p).limit = top.add(keep);
+        }
+    }
+}
+
 /// Owns one thread's register stack memory.
 struct StackOwner {
     stack: *mut JitStack,
@@ -168,9 +227,12 @@ impl StackOwner {
             top: mem,
             // SAFETY: one past the end of the allocation.
             #[allow(unsafe_code)]
-            limit: unsafe { mem.add(STACK_WORDS) },
+            limit: unsafe { mem.add(STACK_CHUNK.min(STACK_WORDS)) },
             frames: core::ptr::null_mut(),
             base: mem,
+            // SAFETY: one past the end of the allocation.
+            #[allow(unsafe_code)]
+            end: unsafe { mem.add(STACK_WORDS) },
         }));
         Self { stack }
     }
@@ -290,12 +352,12 @@ fn run_compiled_at(
     // calls can stay native), on a copy of `regs` written back afterwards; on
     // the rare full stack, on `regs` itself.
     let st = stack_of(ctx);
-    // SAFETY: `st` is this thread's live stack; nothing else borrows it.
-    #[allow(unsafe_code)]
-    let (top, room) = unsafe { ((*st).top, (*st).limit.offset_from((*st).top) as usize) };
     // A body that inlined calls has a larger window than the function's own
     // registers (its inlined bodies' sub-window, which starts `undefined`).
     let n = regs.len().max(jit.n_regs());
+    // SAFETY: `st` is this thread's live stack; nothing else borrows it.
+    #[allow(unsafe_code)]
+    let (top, room) = unsafe { ((*st).top, reserve(st, n)) };
     let raw = if n <= room {
         // SAFETY: `top..top + n` is free, in-bounds stack memory; it is
         // claimed (by moving `top`) for exactly this activation.
@@ -1324,7 +1386,7 @@ unsafe fn enter_native(
     #[allow(unsafe_code)]
     let (hdr, window) = unsafe {
         let hdr = (*st).top;
-        let room = (*st).limit.offset_from(hdr) as usize;
+        let room = reserve(st, FRAME_HEADER + argc + n_regs);
         if room < FRAME_HEADER + argc + n_regs {
             return None;
         }

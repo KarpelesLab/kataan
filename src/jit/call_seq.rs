@@ -66,12 +66,25 @@ pub(crate) mod cc {
 /// them by scanning `base..top`, and a native call can lay out its callee's
 /// window by bumping `top`. `#[repr(C)]`: emitted code addresses the fields at
 /// the `STACK_*` offsets.
+///
+/// **No word of the stack ever names a collected object.** Words below `top`
+/// are roots. Words in `top..limit` may still hold what a finished activation
+/// left there, but the collector zeroes them (and pulls `limit` down) before
+/// every collection, so whatever they name was alive when it was written and
+/// has not been through a collection since. Words from `limit` to `end` hold
+/// no handle at all. So a native-call entry need not fill a register the body
+/// writes before it reads it: until then the GC sees in it, at worst, an
+/// object it keeps one cycle longer (see `prologue::entry_fill`).
 #[repr(C)]
 #[derive(Debug)]
 pub struct JitStack {
     /// One past the innermost window (the next free word).
     pub top: *mut u64,
-    /// One past the last usable word.
+    /// One past the last word an activation may claim without asking: the end
+    /// of the part a finished activation may have left values in. The VM
+    /// raises it (up to `end`) for an activation it lays out itself
+    /// (`jit_tier::reserve`); emitted code that finds no room takes its slow
+    /// path, which is such an activation.
     pub limit: *mut u64,
     /// The innermost native-call header (null when there is none). A header is
     /// [`FRAME_HEADER`] words — the previous header, the callee value, the
@@ -80,6 +93,8 @@ pub struct JitStack {
     pub frames: *mut u64,
     /// The first word.
     pub base: *mut u64,
+    /// One past the last word of the allocation.
+    pub end: *mut u64,
 }
 
 /// [`JitStack::top`]'s offset.
@@ -90,6 +105,13 @@ pub(crate) const STACK_LIMIT: i32 = 8;
 pub(crate) const STACK_FRAMES: i32 = 16;
 /// [`JitStack::base`]'s offset.
 pub(crate) const STACK_BASE: i32 = 24;
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(JitStack, top) == STACK_TOP as usize);
+    assert!(offset_of!(JitStack, limit) == STACK_LIMIT as usize);
+    assert!(offset_of!(JitStack, frames) == STACK_FRAMES as usize);
+    assert!(offset_of!(JitStack, base) == STACK_BASE as usize);
+};
 /// Words in a native-call header (see [`JitStack::frames`]).
 pub const FRAME_HEADER: usize = 5;
 
@@ -648,7 +670,7 @@ pub(crate) fn emit_native_entry(
     a: &mut X64Assembler,
     frame: u32,
     countdown: i8,
-    n_regs: usize,
+    fill: &[bool],
     n_params: usize,
     n_caps: usize,
     new_target: Option<usize>,
@@ -656,6 +678,7 @@ pub(crate) fn emit_native_entry(
 ) -> Option<()> {
     let undefined = crate::nanbox::NanBox::undefined().to_bits();
     let slot = |i: usize| i32::try_from(i * 8).ok();
+    let n_regs = fill.len();
     a.frame_prologue(frame);
     a.mov_r15_rdi(); // pin ctx
     a.mov_rbx_rsi(); // pin the window
@@ -701,30 +724,34 @@ pub(crate) fn emit_native_entry(
     if nt.is_some() {
         a.g_load(r::R10, r::RCX, -8);
     }
-    // Every other register starts `undefined`.
+    // Every other register starts `undefined` — but one the body writes
+    // before any read of it needs no store (`prologue::entry_fill`).
     let rest = this_slot + 1;
-    if rest < n_regs {
+    let needed: alloc::vec::Vec<usize> = (rest..n_regs)
+        .filter(|&i| fill[i] && Some(i) != nt)
+        .collect();
+    if !needed.is_empty() {
         let count = n_regs - rest;
         a.g_movabs(r::RAX, undefined);
         // Straight-line stores, or a four-store loop for a large window: a
         // `rep stosq` costs a few dozen cycles to start, more than the whole
         // fill of a typical window.
-        if count <= 64 {
-            for i in rest..n_regs {
+        if needed.len() <= 64 {
+            for &i in &needed {
                 a.g_store(r::RBX, slot(i)?, r::RAX);
             }
         } else {
             let quads = count / 4;
-            let fill = a.new_label();
+            let lp = a.new_label();
             a.g_lea(r::RDI, r::RBX, slot(rest)?);
             a.g_lea(r::RCX, r::RBX, slot(rest + quads * 4)?);
-            a.bind(fill);
+            a.bind(lp);
             for k in 0..4 {
                 a.g_store(r::RDI, slot(k)?, r::RAX);
             }
             a.g_lea(r::RDI, r::RDI, 32);
             a.g_cmp(r::RDI, r::RCX);
-            a.g_jcc(cc::B, fill);
+            a.g_jcc(cc::B, lp);
             for i in rest + quads * 4..n_regs {
                 a.g_store(r::RBX, slot(i)?, r::RAX);
             }

@@ -7091,10 +7091,14 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
     {
         push(&mut roots, *r);
     }
-    // Compiled activations' windows and native-call headers (`jit_tier`).
+    // Compiled activations' windows and native-call headers (`jit_tier`);
+    // what finished ones left above them is zeroed first.
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-    for r in jit_tier::stack_roots(ctx) {
-        push(&mut roots, *r);
+    {
+        jit_tier::scrub_stack(ctx);
+        for r in jit_tier::stack_roots(ctx) {
+            push(&mut roots, *r);
+        }
     }
     for t in &ctx.microtasks {
         push(&mut roots, t.handler);
