@@ -183,7 +183,10 @@ impl Interp {
                 // `Object.defineProperty(arr, i, {get/set})`); that is reported as
                 // an accessor descriptor by the generic path below, not as a data
                 // property — fall through when one exists.
+                // (An element past the dense store lives in the auxiliary
+                // object: the generic path below reports it.)
                 if i < len
+                    && self.realm.array_elements(obj).is_none_or(|e| i < e.len())
                     && crate::realm::is_canonical_decimal(key)
                     && self.realm.accessor(obj, key).is_none()
                     // A hole (absent index) is not an own property even within

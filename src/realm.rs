@@ -291,13 +291,14 @@ pub struct Realm {
     /// Shared prototype-chain lookup memos (see
     /// `builtins_fast::shared_chain_lookup`), one per fixed lookup site.
     chain_lookups: core::cell::RefCell<alloc::vec::Vec<builtins_fast::ChainKeyCache>>,
-    /// Logical `length` of an array set above its dense backing capacity (a valid
-    /// uint32 length up to 2^32-1 that exceeds [`Limits::max_array_len`]). The dense
-    /// `Vec` storage is not actually grown that far (a multi-gigabyte allocation);
-    /// instead the spec-visible `length` is recorded here so `arr.length` and a
-    /// `length` descriptor report it. Cleared once the dense storage catches up or
-    /// `length` is set back within the cap. Same non-GC-root caveat as `aux_props`.
-    sparse_array_lengths: alloc::collections::BTreeMap<u64, usize>,
+    /// Logical `length` of an array set past its dense backing store (a valid
+    /// uint32 length beyond [`Limits::max_array_len`], or one the dense store
+    /// would mostly hold holes for, see [`SparseLen`]). The dense `Vec` storage
+    /// is not grown that far; instead the spec-visible `length` is recorded here
+    /// so `arr.length` and a `length` descriptor report it, and the elements past
+    /// the dense store live in the auxiliary object. Cleared once `length` is set
+    /// back within the dense store. Same non-GC-root caveat as `aux_props`.
+    sparse_array_lengths: alloc::collections::BTreeMap<u64, SparseLen>,
     /// The default prototype (`Object.prototype`) installed on objects created by
     /// [`new_object`](Realm::new_object) once the global environment is set up. A
     /// `None`-proto object (`Object.create(null)`) opts out explicitly.
@@ -508,11 +509,42 @@ struct PruneTables<'t> {
     fn_source: &'t mut alloc::collections::BTreeMap<u64, alloc::rc::Rc<str>>,
     length_tracking_views: &'t mut alloc::collections::BTreeSet<u64>,
     nonwritable_array_lengths: &'t mut alloc::collections::BTreeSet<u64>,
-    sparse_array_lengths: &'t mut alloc::collections::BTreeMap<u64, usize>,
+    sparse_array_lengths: &'t mut alloc::collections::BTreeMap<u64, SparseLen>,
     native_protos: &'t mut handle_map::HandleKeyedMap<Handle>,
     callable_null_protos: &'t mut alloc::collections::BTreeSet<u64>,
     native_class_tags: &'t mut alloc::collections::BTreeMap<u64, u32>,
 }
+
+/// The sparse part of an array whose `length` lies past its dense store (see
+/// `Realm::sparse_array_lengths`).
+///
+/// The elements of an array live in its dense `Vec` up to some point and in its
+/// auxiliary object (as index-named properties) past it. The dense store never
+/// grows over an index the auxiliary object may hold: `floor` is at or below
+/// the smallest index ever stored there (`usize::MAX` for none), and a dense
+/// growth to a length past it is refused, so the two never overlap.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SparseLen {
+    /// The logical `length`.
+    len: usize,
+    /// No auxiliary-object element lies below this index.
+    floor: usize,
+}
+
+impl SparseLen {
+    const fn new(len: usize) -> Self {
+        SparseLen {
+            len,
+            floor: usize::MAX,
+        }
+    }
+}
+
+/// A dense store may always grow to this many elements (8 MiB of slots); past
+/// it, a growth that would leave the store more than half holes is refused (the
+/// elements then live sparsely, see [`SparseLen`]), so `a[1e8 - 1] = 1` or
+/// `a.length = 1e8` does not allocate 800 MB of holes.
+const DENSE_GROW_FREE: usize = 1 << 20;
 
 /// The floor for the allocation-pressure trigger: never collect more often than
 /// once per this many allocations, however small the live set is.
@@ -2111,7 +2143,7 @@ impl Realm {
         };
         let size = typed_elem_size(kind);
         // Checked offset math: never wrap (debug panic / silent corruption) on a
-        // pathological `i`.
+        // patho                        .map_or(dense, |s| s.len.max(dense)), `i`.
         let Some(start) = i.checked_mul(size).and_then(|o| byte_offset.checked_add(o)) else {
             return true;
         };
@@ -4517,8 +4549,7 @@ impl Realm {
                 Some(
                     self.sparse_array_lengths
                         .get(&handle.to_raw())
-                        .copied()
-                        .map_or(dense, |logical| logical.max(dense)),
+                        .map_or(dense, |s| s.len.max(dense)),
                 )
             }
             Cell::TypedArray { length, .. } => {
@@ -4769,6 +4800,23 @@ impl Realm {
         if self.index_past_readonly_length(handle, index) {
             return false;
         }
+        // A growth that would leave the dense store mostly holes (or reach an
+        // index the auxiliary object may hold) stores the element sparsely.
+        // Only a far write or an array with a sparse part can be one.
+        if (index >= DENSE_GROW_FREE || !self.sparse_array_lengths.is_empty())
+            && !non_ext
+            && index < self.limits.max_array_len
+            && let Some(dense) = self
+                .heap
+                .get(handle)
+                .and_then(Cell::as_array)
+                .map(|a| a.len())
+            && index >= dense
+            && self.dense_growth_refused(handle.to_raw(), dense, index + 1)
+        {
+            self.array_store_sparse(handle, dense, index, value);
+            return true;
+        }
         match self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
             Some(a) => {
                 if index >= a.len() {
@@ -4805,6 +4853,41 @@ impl Realm {
             }
             None => false,
         }
+    }
+
+    /// Whether growing the dense store of the array `raw` from `dense` to
+    /// `new_len` elements is refused (see [`SparseLen`]): past
+    /// [`DENSE_GROW_FREE`], a growth by more than the store's own size (which
+    /// would leave it more than half holes), or one reaching the floor of the
+    /// array's auxiliary-object elements. (A floor below the dense store is
+    /// stale: the dense store only passes it once no such element is left.)
+    fn dense_growth_refused(&self, raw: u64, dense: usize, new_len: usize) -> bool {
+        new_len > dense
+            && ((new_len > DENSE_GROW_FREE && new_len - dense > dense)
+                || (!self.sparse_array_lengths.is_empty()
+                    && self
+                        .sparse_array_lengths
+                        .get(&raw)
+                        .is_some_and(|s| s.floor >= dense && new_len > s.floor)))
+    }
+
+    /// Stores `value` at `index` (at or past the dense store of `dense`
+    /// elements) of the array at `handle` in its auxiliary object, growing the
+    /// logical `length` and lowering the floor the dense store may not pass.
+    fn array_store_sparse(&mut self, handle: Handle, dense: usize, index: usize, value: NanBox) {
+        let key = alloc::format!("{index}");
+        self.force_set_property(handle, &key, value);
+        let raw = handle.to_raw();
+        let s = self
+            .sparse_array_lengths
+            .entry(raw)
+            .or_insert(SparseLen::new(dense));
+        s.len = s.len.max(index + 1);
+        if s.floor < dense || index < s.floor {
+            s.floor = index;
+        }
+        self.gc_side_log.push(raw);
+        self.mark_array_side_state(handle);
     }
 
     /// Whether the array at `handle` is non-extensible (by
@@ -4980,28 +5063,39 @@ impl Realm {
     /// No-op past the dense cap (the logical sparse length already covers it).
     pub fn array_index_to_hole(&mut self, handle: Handle, index: usize) {
         let cap = self.limits.max_array_len;
-        if let Some(a) = self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
-            if index < a.len() {
-                a[index] = NanBox::hole();
-            } else if index < cap {
-                a.vec_mut().resize(index + 1, NanBox::hole());
-            } else {
-                // Beyond the dense cap: record the logical length so `array_length`
-                // reports `index + 1` without materializing billions of slots.
-                let raw = handle.to_raw();
-                let cur = self
-                    .sparse_array_lengths
-                    .get(&raw)
-                    .copied()
-                    .unwrap_or(0)
-                    .max(a.len());
-                self.sparse_array_lengths.insert(raw, cur.max(index + 1));
-                self.gc_side_log.push(raw);
+        let raw = handle.to_raw();
+        let Some(dense) = self
+            .heap
+            .get(handle)
+            .and_then(Cell::as_array)
+            .map(|a| a.len())
+        else {
+            return;
+        };
+        if index < dense || (index < cap && !self.dense_growth_refused(raw, dense, index + 1)) {
+            if let Some(a) = self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
+                if index < a.len() {
+                    a[index] = NanBox::hole();
+                } else {
+                    a.vec_mut().resize(index + 1, NanBox::hole());
+                }
             }
+            return;
         }
-        if index >= cap {
-            self.mark_array_side_state(handle);
+        // Past the dense store's reach (beyond the cap, or a mostly-holes
+        // growth): record the logical length so `array_length` reports
+        // `index + 1` without materializing the slots; the accessor itself
+        // lives in the auxiliary object, so the dense store must stop below it.
+        let s = self
+            .sparse_array_lengths
+            .entry(raw)
+            .or_insert(SparseLen::new(dense));
+        s.len = s.len.max(index + 1);
+        if index < cap && (s.floor < dense || index < s.floor) {
+            s.floor = index;
         }
+        self.gc_side_log.push(raw);
+        self.mark_array_side_state(handle);
     }
 
     /// Sets an array's `length` (`arr.length = n`): truncates if smaller, pads
@@ -5022,13 +5116,30 @@ impl Realm {
         // The prior logical length, to detect a shrink that must delete sparse
         // elements (integer-index named properties stored past the dense cap).
         let old_len = self.array_length(handle);
+        let dense = self
+            .heap
+            .get(handle)
+            .and_then(Cell::as_array)
+            .map_or(0, |a| a.len());
+        // Sparse past the cap, or when the dense store would be mostly holes
+        // (see `SparseLen`).
+        let sparse = len > cap || self.dense_growth_refused(raw, dense, len);
         let is_array = match self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
             Some(a) => {
-                if len > cap {
-                    // Sparse: keep whatever dense elements exist (already <= cap), and
-                    // record the logical length. A lowering below the dense size still
-                    // truncates the dense `Vec`, but here `len > cap >= a.len()`.
-                    self.sparse_array_lengths.insert(raw, len);
+                if sparse {
+                    // Keep whatever dense elements exist and record the logical
+                    // length (here `len > a.len()`), keeping the floor of the
+                    // auxiliary-object elements.
+                    let s = self
+                        .sparse_array_lengths
+                        .entry(raw)
+                        .or_insert(SparseLen::new(len));
+                    s.len = len;
+                    // A lowering sweeps every auxiliary element at or past
+                    // `len`, so none is left at or past the floor.
+                    if len <= s.floor {
+                        s.floor = usize::MAX;
+                    }
                     self.gc_side_log.push(raw);
                 } else {
                     // Within the dense cap: resize for real and drop any prior sparse
@@ -5046,7 +5157,7 @@ impl Realm {
         if !is_array {
             return false;
         }
-        if len > cap {
+        if sparse {
             self.mark_array_side_state(handle);
         }
         // On a shrink, delete every *sparse* element (an integer-index named

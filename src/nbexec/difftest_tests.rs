@@ -2260,3 +2260,54 @@ fn wtf_key_codec_round_trips() {
         assert!(!keys.contains(&key));
     }
 }
+
+/// A write far past an array's dense store, or a `length` set far past it,
+/// leaves the store small (the elements live sparsely) instead of allocating
+/// hundreds of megabytes of holes (`a[1e8 - 1] = 1` used to allocate 800 MB),
+/// and the array behaves exactly as a dense holey one: reads, enumeration
+/// order, the prototype walk for an absent index, descriptors, iteration,
+/// `length` lowering, and dense growth up to a sparse element.
+#[test]
+fn far_array_writes_stay_sparse() {
+    let src = r#"
+        var a = []; a[1e8 - 1] = 1;
+        var b = [1, 2]; b.length = 1e8; b[1e8 - 2] = "x";
+        var c = new Array(5e7); c[3] = "c";
+        var F = 1200000, d = []; d[F] = "s"; d[F + 3] = "t";
+        for (var i = 0; i < 10; i++) d[i] = i;
+        var e = []; e[3e6] = 9; e[2e6] = 8; e.x = 1; e[1] = 7;
+        Array.prototype[2500000] = "p";
+        var hole = [e[2500000], 2500000 in e, e.hasOwnProperty(2500000)];
+        delete Array.prototype[2500000];
+        var g = []; g[2e6] = 5; var sp = [...g];
+        var h = [0, 1]; h[2e6] = 2; h.length = 2;
+        [a.length, a[1e8 - 1], (1e8 - 2) in a, b.length, b[1e8 - 2], b[1], c.length, c[3],
+         d.length, d[F], d[F + 3], d[9], Object.keys(d).length, JSON.stringify(Object.keys(e)),
+         JSON.stringify(hole), JSON.stringify(Object.getOwnPropertyDescriptor(g, 2e6)),
+         sp.length, sp[2e6], h.length, h[2e6], JSON.stringify(h)].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "100000000|1|false|100000000|x|2|50000000|c|1200004|s|t|9|12|\
+         [\"1\",\"2000000\",\"3000000\",\"x\"]|[\"p\",true,false]|\
+         {\"value\":5,\"writable\":true,\"enumerable\":true,\"configurable\":true}|\
+         2000001|5|2||[0,1]"
+    );
+    // The dense stores stay small.
+    let program = Parser::parse_program(
+        "var a = []; a[1e8 - 1] = 1; var b = [1]; b.length = 1e8; b[1e8 - 2] = 2; [a, b]",
+    )
+    .expect("parse");
+    let mut interp = Interp::new();
+    let v = interp.run(&program).expect("exec");
+    let realm = interp.realm();
+    let pair = realm
+        .array_elements(Handle::from_raw(v.as_handle().unwrap()))
+        .unwrap()
+        .to_vec();
+    for x in pair {
+        let h = Handle::from_raw(x.as_handle().unwrap());
+        assert!(realm.array_elements(h).unwrap().len() < 16);
+        assert_eq!(realm.array_length(h), Some(100_000_000));
+    }
+}

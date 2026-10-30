@@ -10024,11 +10024,11 @@ fn vm_array_index_get(
             return call_closure(ctx, funcs, getter, &[], recv);
         }
         // A prototype that is itself a plain array exposes its present elements.
-        if ctx.realm.is_array(p)
-            && i < ctx.realm.array_length(p).unwrap_or(0)
-            && !ctx.realm.array_hole_at(p, i)
+        // (An element past the dense store is an auxiliary-object property.)
+        if let Some(&v) = ctx.realm.array_elements(p).and_then(|e| e.get(i))
+            && !v.is_hole()
         {
-            return Ok(ctx.realm.get_element(p, i));
+            return Ok(v);
         }
         if ctx.realm.has_own(p, &key) {
             return Ok(ctx

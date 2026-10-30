@@ -609,11 +609,11 @@ impl Interp {
             if self.realm.typed_kind(handle).is_some() {
                 return Ok(self.realm.get_element(handle, i));
             }
-            if i < self.realm.array_length(handle).unwrap_or(0) {
-                let v = self.realm.get_element(handle, i);
-                if !v.is_hole() {
-                    return Ok(v);
-                }
+            // (An element past the dense store lives in the auxiliary object.)
+            if let Some(&v) = self.realm.array_elements(handle).and_then(|e| e.get(i))
+                && !v.is_hole()
+            {
+                return Ok(v);
             }
         }
         let name = self.member_key(key);
