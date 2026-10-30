@@ -3217,9 +3217,44 @@ pub(super) fn cold_call_pcs(
 
 /// The callee function `caller`'s call site at pc `pc` inlines, if any: the
 /// one VM function its feedback `hints` names, with that function's warm
-/// inline caches (its compiled body's, else its interpreter's). Whether it
-/// can be inlined at all is `crate::jit::inline`'s to decide.
+/// inline caches (its compiled body's, else its interpreter's) and the
+/// callees of its own call sites (by its own feedback: its compiled
+/// body's, else its interpreter's), which its spliced body inlines in turn.
+/// Whether it can be inlined at all is `crate::jit::inline`'s to decide.
 pub(super) fn inline_candidate<'a>(
+    funcs: &'a [FnProto],
+    caller: usize,
+    hints: &[crate::ic::CalleeHint],
+    pc: usize,
+) -> Option<crate::jit::inline::Candidate<'a>> {
+    let mut c = inline_candidate_leaf(funcs, caller, hints, pc)?;
+    let fid = (c.key & 0xffff_ffff) as usize;
+    let proto = c.proto;
+    let mut own = match proto.tier.jit() {
+        Some(Some(j)) if j.is_generic() => j.call_hints(),
+        _ => alloc::vec::Vec::new(),
+    };
+    let interp = super::tier_hints(proto);
+    if own.len() < interp.len() {
+        own.resize(interp.len(), crate::ic::CalleeHint::None);
+    }
+    for (h, i) in own.iter_mut().zip(interp) {
+        if *h == crate::ic::CalleeHint::None {
+            *h = i;
+        }
+    }
+    c.nested = (0..proto.ops.len())
+        .filter_map(|p| {
+            let n = inline_candidate_leaf(funcs, fid, &own, p)?;
+            // (Not the outer caller again: its body is being compiled.)
+            ((n.key & 0xffff_ffff) as usize != caller).then_some((p, n))
+        })
+        .collect();
+    Some(c)
+}
+
+/// [`inline_candidate`] without the callee's own inlined calls.
+fn inline_candidate_leaf<'a>(
     funcs: &'a [FnProto],
     caller: usize,
     hints: &[crate::ic::CalleeHint],
@@ -3249,7 +3284,12 @@ pub(super) fn inline_candidate<'a>(
             *w = i;
         }
     }
-    Some(crate::jit::inline::Candidate { key, proto, warm })
+    Some(crate::jit::inline::Candidate {
+        key,
+        proto,
+        warm,
+        nested: alloc::vec::Vec::new(),
+    })
 }
 
 /// Whether `KATAAN_JIT_LOG` is set: report, per function, whether the JIT

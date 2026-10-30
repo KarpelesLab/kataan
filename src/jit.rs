@@ -4348,6 +4348,29 @@ const LABEL_COLD: usize = usize::MAX - 1;
 /// so no register ever holds them.
 const RECV_CACHE_EMPTY: i32 = -1;
 
+/// Per op, the inlining level of an `InlineGuard` or `InlineLeave` (`1`, or
+/// `2` inside another inlined body: see `inline::Candidate::nested`); `0`
+/// for any other op. Every inlined body is its guard, then its ops, then its
+/// one leave (`inline::expand`), so guards and leaves nest as brackets.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn inline_levels(ops: &[GenericOp]) -> Vec<u8> {
+    let mut depth = 0u8;
+    ops.iter()
+        .map(|op| match *op {
+            GenericOp::InlineGuard { .. } => {
+                depth = depth.saturating_add(1);
+                depth
+            }
+            GenericOp::InlineLeave => {
+                let d = depth;
+                depth = depth.saturating_sub(1);
+                d
+            }
+            _ => 0,
+        })
+        .collect()
+}
+
 /// A branch target in an [`X64Assembler`], resolved by [`X64Assembler::bind`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Label(usize);
@@ -6461,11 +6484,24 @@ impl JitFunction {
         let has_inline = ops
             .iter()
             .any(|o| matches!(o, GenericOp::InlineGuard { .. }));
+        // Each inlined-call op's level: 2 inside another inlined body (an
+        // inlined callee's own inlined call, `inline::Candidate::nested`).
+        let inl_level = inline_levels(ops);
+        let has_nested = inl_level.contains(&2);
+        if inl_level.iter().any(|&l| l > 2) {
+            return None;
+        }
         let inl_base = m_base - 8 * (3 * math_sites.len() as i32);
         let inl_slots = call_seq::InlineSlots {
             pend: inl_base - 8,
             hdr: inl_base - 16,
             callee: inl_base - 24,
+            nested: has_nested.then_some(call_seq::NestedSlots {
+                save: inl_base - 40,
+                hdr: inl_base - 48,
+                callee: inl_base - 56,
+            }),
+            save: None,
             ok: inl_base - 32,
             max_argc: ops
                 .iter()
@@ -6500,7 +6536,8 @@ impl JitFunction {
                 + 3 * rc.ways
                 + gc_frame_slots
                 + 3 * math_sites.len()
-                + 4 * usize::from(has_inline)) as u32
+                + 4 * usize::from(has_inline)
+                + 3 * usize::from(has_nested)) as u32
                 * 8)
             + 15)
             & !15;
@@ -6534,17 +6571,18 @@ impl JitFunction {
             // (Emptied by the prologue only: `entry_clear` is also the
             // global binding cache's reset, which may run inside an inlined
             // body.)
-            a.set_inline_pend(
-                Some(inl_slots.pend),
-                alloc::vec![inl_slots.pend, inl_slots.hdr],
-            );
+            let mut clear = alloc::vec![inl_slots.pend, inl_slots.hdr];
+            if let Some(n) = inl_slots.nested {
+                clear.extend([n.save, n.hdr]);
+            }
+            a.set_inline_pend(Some(inl_slots.pend), clear);
         }
         if !entry_clear.is_empty() {
             a.set_entry_clear(entry_clear);
         }
         // The inlined calls' frame materialization stubs: (entry, the call's
         // argument registers).
-        let mut inline_stubs: Vec<(Label, Vec<u16>, Option<u16>)> = Vec::new();
+        let mut inline_stubs: Vec<(Label, Vec<u16>, Option<u16>, bool)> = Vec::new();
         // The out-of-line full walks: (entry, resume, receiver, miss, way).
         let mut cold_walks: Vec<(Label, Label, u16, Label, usize, recv_cache::Family)> = Vec::new();
         // The global binding cache's refills: (entry, resume, done, op, slot).
@@ -7126,7 +7164,11 @@ impl JitFunction {
                             caps,
                             n_caps,
                             layout: &helpers.call_layout,
-                            slots: inl_slots,
+                            slots: if inl_level[op_idx] == 2 {
+                                inl_slots.inner()?
+                            } else {
+                                inl_slots
+                            },
                             stub,
                             memo,
                             getter,
@@ -7144,10 +7186,15 @@ impl JitFunction {
                             },
                         },
                     )?;
-                    inline_stubs.push((stub, argv.clone(), new_target));
+                    inline_stubs.push((stub, argv.clone(), new_target, inl_level[op_idx] == 2));
                 }
                 GenericOp::InlineLeave => {
-                    call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &inl_slots);
+                    let s = if inl_level[op_idx] == 2 {
+                        inl_slots.inner()?
+                    } else {
+                        inl_slots
+                    };
+                    call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &s);
                 }
                 GenericOp::CallMethod {
                     pc,
@@ -9559,7 +9606,11 @@ impl JitFunction {
         // return the sentinel so the caller reads the pending fault.
         a.bind(throw_exit);
         if has_inline {
-            // A throw out of an inlined body: its activation ends here.
+            // A throw out of an inlined body: its activation ends here (an
+            // inner level's first).
+            if let Some(inner) = inl_slots.inner() {
+                call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &inner);
+            }
             call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &inl_slots);
         }
         if !catch_targets.is_empty() {
@@ -9582,9 +9633,10 @@ impl JitFunction {
         a.movabs_rax(NanBox::jit_throw_bits() as i64);
         a.frame_epilogue();
         // (Out of line, called: see `call_seq::emit_inline_stub`.)
-        for (stub, argv, nt) in core::mem::take(&mut inline_stubs) {
+        for (stub, argv, nt, inner) in core::mem::take(&mut inline_stubs) {
             a.bind(stub);
-            call_seq::emit_inline_stub(&mut a, &helpers.call_layout, &inl_slots, &argv, nt)?;
+            let s = if inner { inl_slots.inner()? } else { inl_slots };
+            call_seq::emit_inline_stub(&mut a, &helpers.call_layout, &s, &argv, nt)?;
         }
         // The native-call entry (emitted before the body), behind one that
         // gives it a handler-stack segment of its own when the body has

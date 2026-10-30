@@ -39,12 +39,21 @@
 //! the only code that can observe them (`f.caller`, `f.arguments`, the depth
 //! of a nested call, a collection's audit); see
 //! `call_seq::emit_inline_guard`. A throw out of the inlined body ends the
-//! activation at the body's throw exit. Only leaf callees are inlined — no
-//! call op, loop, `try`, `arguments`, `new.target`, `super`, eval or
-//! suspension in them (a property access or an operator may still call a
-//! getter, a `valueOf`, …) — so nothing can leave the compiled code inside
-//! one (an on-stack exit is at a loop header, which an inlined body has none
-//! of).
+//! activation at the body's throw exit. Only small straight-line callees are
+//! inlined — no loop, `try`, `arguments`, `new.target`, `super`, eval or
+//! suspension in them — so nothing can leave the compiled code inside one
+//! (an on-stack exit is at a loop header, which an inlined body has none
+//! of). An inlined body may call: a call op in it (or a getter, a
+//! `valueOf`, … that a property access or an operator calls) first pushes
+//! the pending activation, like any Rust code run inside it, and a throw
+//! out of the callee ends the inlined activation as any other throw does.
+//!
+//! An inlined callee's own call sites may be inlined into its spliced body
+//! in turn ([`Candidate::nested`], one more level): such an inner
+//! activation runs inside the outer one, which may still be pending when the
+//! inner guard hits, and the inner stub then pushes the outer activation
+//! first (`call_seq::NestedSlots`). A `Vec.add` that returns `new Vec(…)`
+//! inlines both the method and the constructor this way.
 //!
 //! The spliced bytecode numbers its ops differently from the function's own:
 //! the body keeps both maps (`orig_of`, `new_of`), and every pc that crosses
@@ -72,6 +81,58 @@ pub struct Candidate<'a> {
     pub proto: &'a FnProto,
     /// The callee's warm inline caches, by its own pc.
     pub warm: Vec<Option<WarmEntry>>,
+    /// The callee's own call sites to inline into its spliced body, by its
+    /// own pc (one level: their candidates' `nested` are ignored).
+    pub nested: Vec<(usize, Candidate<'a>)>,
+}
+
+/// A site's callee as spliced: its function, or (when it inlines calls of
+/// its own, see [`Candidate::nested`]) a copy of it with those calls
+/// spliced in, and its warm caches by that body's pc.
+struct Site<'a> {
+    key: u64,
+    proto: alloc::borrow::Cow<'a, FnProto>,
+    warm: Vec<Option<WarmEntry>>,
+}
+
+/// `c`'s body as spliced (see [`Site`]).
+fn site_body(c: Candidate<'_>) -> Site<'_> {
+    let Candidate {
+        key,
+        proto,
+        warm,
+        nested,
+    } = c;
+    let inner = (!nested.is_empty())
+        .then(|| {
+            expand(proto, &warm, &|pc, _| {
+                let (_, n) = nested.iter().find(|(p, _)| *p == pc)?;
+                Some(Candidate {
+                    key: n.key,
+                    proto: n.proto,
+                    warm: n.warm.clone(),
+                    nested: Vec::new(),
+                })
+            })
+        })
+        .flatten();
+    match inner {
+        Some(e) => {
+            let mut p = proto.clone();
+            p.ops = e.ops;
+            p.n_regs = e.n_regs;
+            Site {
+                key,
+                proto: alloc::borrow::Cow::Owned(p),
+                warm: e.warm,
+            }
+        }
+        None => Site {
+            key,
+            proto: alloc::borrow::Cow::Borrowed(proto),
+            warm,
+        },
+    }
 }
 
 /// A caller's bytecode with its inlined calls spliced in.
@@ -272,6 +333,65 @@ fn remap(op: &mut Op, reg: &dyn Fn(Reg) -> Reg, target: &dyn Fn(usize) -> usize)
             *dst = reg(*dst);
             *obj = reg(*obj);
         }
+        // A call the callee's body inlined itself (see `Candidate::nested`).
+        Op::InlineGuard {
+            dst,
+            call,
+            callee,
+            args,
+            caps,
+            ..
+        } => {
+            *dst = reg(*dst);
+            *call = target(*call);
+            *callee = reg(*callee);
+            *caps = reg(*caps);
+            for a in args.iter_mut() {
+                *a = reg(*a);
+            }
+        }
+        Op::InlineLeave => {}
+        // Calls: an inlined body may call (see the module docs).
+        Op::GetMethod { dst, obj, .. } => {
+            *dst = reg(*dst);
+            *obj = reg(*obj);
+        }
+        Op::CallMethod {
+            dst, recv: c, args, ..
+        }
+        | Op::CallValue {
+            dst,
+            callee: c,
+            args,
+            ..
+        }
+        | Op::Construct { dst, ctor: c, args } => {
+            *dst = reg(*dst);
+            *c = reg(*c);
+            for a in args.iter_mut() {
+                *a = reg(*a);
+            }
+        }
+        Op::CallWithMethod {
+            dst,
+            callee: c,
+            recv: k,
+            args,
+            ..
+        }
+        | Op::CallKey {
+            dst,
+            recv: c,
+            key: k,
+            args,
+        } => {
+            *dst = reg(*dst);
+            *c = reg(*c);
+            *k = reg(*k);
+            for a in args.iter_mut() {
+                *a = reg(*a);
+            }
+        }
         Op::Jump { target: t } => *t = target(*t),
         Op::JumpIfFalse { cond, target: t } => {
             *cond = reg(*cond);
@@ -353,7 +473,7 @@ pub fn expand<'a>(
     pick: &dyn Fn(usize, &Op) -> Option<Candidate<'a>>,
 ) -> Option<Expanded> {
     let base = proto.n_regs;
-    let mut sites: Vec<(usize, Candidate<'a>)> = Vec::new();
+    let mut sites: Vec<(usize, Site<'a>)> = Vec::new();
     let mut added = 0usize;
     let mut window = 0usize;
     for (pc, op) in proto.ops.iter().enumerate() {
@@ -379,10 +499,11 @@ pub fn expand<'a>(
             continue;
         }
         let Some(c) = pick(pc, op) else { continue };
+        let c = site_body(c);
         let ok = if matches!(op, Op::Construct { .. }) {
-            construct_ok(c.proto)
+            construct_ok(&c.proto)
         } else {
-            callee_ok(c.proto)
+            callee_ok(&c.proto)
         };
         if !ok || (c.key >> 32) as usize != c.proto.n_captures {
             continue;
@@ -411,7 +532,10 @@ pub fn expand<'a>(
     for pc in 0..proto.ops.len() {
         new_of.push(u32::try_from(next).ok()?);
         if si < sites.len() && sites[si].0 == pc {
-            next += block_len(&sites[si].1, matches!(proto.ops[pc], Op::Construct { .. })) + 1;
+            next += block_len(
+                &sites[si].1.proto,
+                matches!(proto.ops[pc], Op::Construct { .. }),
+            ) + 1;
             if matches!(proto.ops[pc], Op::CallKey { .. }) {
                 next += 1;
             }
@@ -431,7 +555,7 @@ pub fn expand<'a>(
             // A `new`: the guard also allocates `this`, into the register
             // after the captures (the callee's `this` slot).
             let construct = matches!(op, Op::Construct { .. });
-            let p = c.proto;
+            let p: &FnProto = &c.proto;
             let rb = |r: Reg| -> Reg { (base + r as usize) as Reg };
             let split = split_call_key(op, rb((p.n_regs + 1) as Reg));
             let mut w = w;
@@ -451,7 +575,7 @@ pub fn expand<'a>(
             let (dst, callee, args, this) = call_parts(op)?;
             let g = ops.len();
             let tmp = rb(p.n_regs as Reg);
-            let fallback = g + block_len(c, construct);
+            let fallback = g + block_len(p, construct);
             let end = fallback + 1;
             let leave = fallback - 2;
             macro_rules! emit {
@@ -656,8 +780,7 @@ fn body_pc(p: &FnProto, t: usize, construct: bool) -> usize {
 /// The ops one inlined site takes before its call op: guard, branch, window,
 /// body, fall-off, leave, jump.
 /// (`construct`: a `new` site, whose `this` the guard writes.)
-fn block_len(c: &Candidate<'_>, construct: bool) -> usize {
-    let p = c.proto;
+fn block_len(p: &FnProto, construct: bool) -> usize {
     let this_slot = p.n_params + p.n_captures;
     let window = window_regs(p, construct)
         .into_iter()

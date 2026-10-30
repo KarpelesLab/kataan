@@ -1087,12 +1087,21 @@ pub(crate) fn emit_falloff_value(a: &mut X64Assembler) {
 /// limit is implied.) Leaves `r10` = the register stack, `r9` = the realm;
 /// clobbers `rax`.
 fn emit_limit_checks(a: &mut X64Assembler, l: &CallLayout, fail: Label) {
+    emit_limit_checks_deep(a, l, 0, fail);
+}
+
+/// [`emit_limit_checks`] for an activation `extra` levels above the next
+/// one (`extra` activations not yet counted in the depth come first).
+fn emit_limit_checks_deep(a: &mut X64Assembler, l: &CallLayout, extra: i32, fail: Label) {
     a.g_cmp_byte_imm(RBP, ACT_OK, 0);
     a.g_jcc(cc::NE, fail);
     a.g_load(r::R9, r::R15, l.realm);
     a.g_cmp_byte_imm(r::R9, l.multi_realm, 0);
     a.g_jcc(cc::NE, fail);
     a.g_load(r::RAX, r::R9, l.total_depth);
+    if extra > 0 {
+        a.g_lea(r::RAX, r::RAX, extra);
+    }
     a.g_cmp_mem(r::RAX, r::R9, l.max_depth);
     a.g_jcc(cc::AE, fail);
     a.g_load(r::R10, r::R15, l.stack);
@@ -1474,6 +1483,52 @@ pub(crate) struct InlineSlots {
     /// The most arguments any of the body's inlined calls passes (the room
     /// the checks ask for).
     pub max_argc: usize,
+    /// For a body whose inlined calls inline calls of their own (two
+    /// levels: `inline::Candidate::nested`), the inner level's slots
+    /// ([`InlineSlots::inner`]); every guard's checks then ask for room and
+    /// depth for both levels' activations.
+    pub nested: Option<NestedSlots>,
+    /// In an inner level's view ([`InlineSlots::inner`]): where its
+    /// activation keeps what `pend` held when its guard hit (see
+    /// [`NestedSlots::save`]).
+    pub save: Option<i32>,
+}
+
+/// The inner level's own slots of a body with two levels of inlined calls
+/// (`rbp`-relative). An inner activation runs inside an outer one, which
+/// may still be pending when the inner guard hits: `pend` (the slot every
+/// `call` tests) then names the inner stub, which materializes the outer
+/// activation first.
+#[derive(Clone, Copy)]
+pub(crate) struct NestedSlots {
+    /// `RECV_CACHE_EMPTY` while no inner activation is active; else what
+    /// `pend` held when its guard hit ??? the outer activation's stub, or `0`
+    /// when that one was already materialized (or has been since).
+    pub save: i32,
+    /// The materialized inner activation's header, or empty.
+    pub hdr: i32,
+    /// The active inner activation's callee value.
+    pub callee: i32,
+}
+
+impl InlineSlots {
+    /// How many inlined activations can be active at once.
+    fn levels(&self) -> usize {
+        1 + usize::from(self.nested.is_some())
+    }
+
+    /// The view an inner-level guard, stub or leave uses: its own header and
+    /// callee slots, the shared `pend` and `ok`.
+    #[must_use]
+    pub(crate) fn inner(&self) -> Option<Self> {
+        let n = self.nested?;
+        Some(Self {
+            hdr: n.hdr,
+            callee: n.callee,
+            save: Some(n.save),
+            ..*self
+        })
+    }
 }
 
 /// One inlined call's guard (`Op::InlineGuard`, see `super::inline`).
@@ -1661,12 +1716,15 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     a.g_load(r::RAX, RBP, e.slots.ok);
     a.g_cmp_imm(r::RAX, super::RECV_CACHE_EMPTY);
     a.g_jcc(cc::NE, checked);
-    emit_limit_checks(a, l, miss);
+    // (With two levels, room and depth for both activations, either of
+    // which this one may be: a guard that cannot tell takes the call.)
+    let levels = e.slots.levels();
+    emit_limit_checks_deep(a, l, i32::try_from(levels - 1).ok()?, miss);
     a.g_load(r::RAX, r::R10, STACK_TOP);
     a.g_lea(
         r::RAX,
         r::RAX,
-        hdr(FRAME_HEADER + argc.max(e.slots.max_argc))?,
+        hdr(levels * (FRAME_HEADER + argc.max(e.slots.max_argc)))?,
     );
     a.g_cmp_mem(r::RAX, r::R10, STACK_LIMIT);
     a.g_jcc(cc::A, miss);
@@ -1677,7 +1735,18 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     if let Some(ctor) = e.new_target {
         emit_inline_new_this(a, e, ctor, e.caps.checked_add(n_caps)?, miss)?;
     }
-    // 4. Pending, its captures in the inlined body's registers.
+    // 4. Pending, its captures in the inlined body's registers. (An inner
+    //    level's activation keeps what `pend` held: the outer one's stub,
+    //    or `0` when that one is materialized.)
+    if let Some(save) = e.slots.save {
+        let keep = a.new_label();
+        a.g_load(r::RAX, RBP, e.slots.pend);
+        a.g_cmp_imm(r::RAX, super::RECV_CACHE_EMPTY);
+        a.g_jcc(cc::NE, keep);
+        a.g_movabs(r::RAX, 0);
+        a.bind(keep);
+        a.g_store(RBP, save, r::RAX);
+    }
     a.g_lea_label(r::RAX, e.stub);
     a.g_store(RBP, e.slots.pend, r::RAX);
     for i in 0..n_caps {
@@ -1808,6 +1877,15 @@ pub(crate) fn emit_inline_stub(
     let hdr = |i: usize| i32::try_from(i * 8).ok();
     // push rax, rcx, rdx, r9, r10.
     a.raw(&[0x50, 0x51, 0x52, 0x41, 0x51, 0x41, 0x52]);
+    if let Some(save) = s.save {
+        // An inner level's: the outer activation, if still pending, first
+        // (its stub preserves every register).
+        let outer_done = a.new_label();
+        a.g_cmp_store_zero_skip(save, outer_done);
+        a.g_mem(false, &[0xff], 2, RBP, save); // call [rbp+save]
+        a.g_store_imm32(RBP, save, 0);
+        a.bind(outer_done);
+    }
     a.g_load(r::R10, r::R15, l.stack);
     a.g_load(r::R9, r::R15, l.realm);
     a.g_load(r::RCX, r::R10, STACK_TOP);
@@ -1845,6 +1923,37 @@ pub(crate) fn emit_inline_stub(
 pub(crate) fn emit_inline_leave(a: &mut X64Assembler, l: &CallLayout, s: &InlineSlots) {
     let materialized = a.new_label();
     let done = a.new_label();
+    if let Some(save) = s.save {
+        // An inner level's: none active (only at the throw exit), pending
+        // (`pend` back to what it held), or materialized (popped).
+        let pending = a.new_label();
+        let fin = a.new_label();
+        a.g_load(r::RCX, RBP, save);
+        a.g_cmp_imm(r::RCX, super::RECV_CACHE_EMPTY);
+        a.g_jcc(cc::E, done);
+        a.g_load(r::RDX, RBP, s.hdr);
+        a.g_cmp_imm(r::RDX, super::RECV_CACHE_EMPTY);
+        a.g_jcc(cc::E, pending);
+        a.g_load(r::R10, r::R15, l.stack);
+        a.g_store(r::R10, STACK_TOP, r::RDX);
+        a.g_load(r::RDX, r::RDX, 0);
+        a.g_store(r::R10, STACK_FRAMES, r::RDX);
+        a.g_load(r::R9, r::R15, l.realm);
+        a.g_dec_mem(r::R9, l.total_depth);
+        a.g_store_imm32(RBP, s.hdr, super::RECV_CACHE_EMPTY);
+        a.jmp(fin);
+        a.bind(pending);
+        let restore = a.new_label();
+        a.g_test(r::RCX);
+        a.g_jcc(cc::NE, restore);
+        a.g_movabs(r::RCX, super::RECV_CACHE_EMPTY as u64);
+        a.bind(restore);
+        a.g_store(RBP, s.pend, r::RCX);
+        a.bind(fin);
+        a.g_store_imm32(RBP, save, super::RECV_CACHE_EMPTY);
+        a.bind(done);
+        return;
+    }
     a.g_load(r::RCX, RBP, s.pend);
     a.g_cmp_imm(r::RCX, super::RECV_CACHE_EMPTY);
     a.g_jcc(cc::E, materialized);
@@ -1884,6 +1993,13 @@ impl X64Assembler {
             self.code.extend_from_slice(&[0x74, 0x07]);
             self.g_mem(false, &[0xff], 2, RBP, d);
         }
+    }
+
+    /// `cmp qword [rbp+disp], 0; je skip`.
+    fn g_cmp_store_zero_skip(&mut self, disp: i32, skip: Label) {
+        self.g_mem(true, &[0x83], 7, RBP, disp);
+        self.code.push(0x00);
+        self.g_jcc(cc::E, skip);
     }
 
     /// `lea reg, [rip + label]`.

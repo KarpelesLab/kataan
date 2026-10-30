@@ -25148,6 +25148,40 @@ mod tests {
         );
     }
 
+    /// Inlined callees that call (`f.caller` sees the inlined activation),
+    /// and two levels of inlining (a method whose `new` the method's body
+    /// inlines): the method replaced mid-loop, the inner constructor
+    /// throwing with both activations pending and after a call pushed them,
+    /// and no header leaked (the depth limit is where it was).
+    #[cfg(feature = "std")]
+    #[test]
+    fn jit_inlined_calls_that_call_and_nest() {
+        let (out, _) = execute(
+            "function maxDepth() { var d = 0; function r() { d++; r(); } try { r(); } catch (e) { return d; } return -1; }
+             var d0 = maxDepth();
+             class V { constructor(x, y) { this.x = x; this.y = y; } add(o) { return new V(this.x + o.x, this.y + o.y); } }
+             var v = new V(0, 0), d = new V(1, 2);
+             for (let i = 0; i < 20000; i++) { if (i === 15000) V.prototype.add = function (o) { return new V(this.x - o.x, this.y); }; v = v.add(d); }
+             class P { constructor(a) { this.a = a.v; } }
+             function spy() { return 1; }
+             class Q { constructor(a) { this.q = spy() + a.v; } }
+             var m = { mk(a) { return new P(a); }, mq(a) { return new Q(a); } };
+             var s = 0, c = 0;
+             for (let i = 0; i < 20000; i++) {
+               try { s += m.mk(i % 97 ? { v: i } : null).a; } catch (e) { c++; }
+               try { s += m.mq(i % 89 ? { v: 1 } : undefined).q; } catch (e) { c++; }
+             }
+             function who() { return who.caller ? who.caller.name : 'null'; }
+             function route(p) { return p % 1000 === 7 ? who() : ''; }
+             function run(p) { return route(p); }
+             var w = '';
+             for (let i = 0; i < 20000; i++) w = run(i) || w;
+             console.log(v.x, v.y, s, c, w, maxDepth() === d0);",
+        )
+        .expect("ok");
+        assert_eq!(out, "10000 30000 197961413 432 route true\n");
+    }
+
     #[test]
     fn execute_runs_on_the_hosted_vm() {
         // A program the bytecode VM compiles fully (closures, loops, output).
