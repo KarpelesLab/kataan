@@ -2804,3 +2804,44 @@ fn engine_created_objects_ignore_rebound_globals() {
          {\"d\":\"1970-01-01T00:00:00.000Z\"},true,true,true,2,246,true,true,true"
     );
 }
+
+/// `instanceof` against a script function or class decides OrdinaryHasInstance
+/// without the generic `[[Get]]`s when nothing on the way is observable; every
+/// observable step (a user or inherited `@@hasInstance`, a getter, a proxy
+/// `getPrototypeOf` trap, a non-object or lazily-built `prototype`, a bound or
+/// non-constructor RHS) must still behave exactly as the general path.
+#[test]
+fn instanceof_script_ctor_fast_path_keeps_observable_steps() {
+    let src = r#"
+        function F() {} function G() {} G.prototype = Object.create(F.prototype);
+        class A {} class B extends A {} class C { static [Symbol.hasInstance](x) { return x === 1; } }
+        class D extends C {}
+        var r = [];
+        r.push(new G() instanceof F, new G() instanceof G, new F() instanceof G, new B() instanceof A, new A() instanceof B);
+        r.push(1 instanceof C, 2 instanceof C, 1 instanceof D, 'x' instanceof F, null instanceof A);
+        var arrow = () => 1; try { ({}) instanceof arrow; r.push('no'); } catch (e) { r.push(e.constructor.name); }
+        function H() {} r.push(new H() instanceof H); H.prototype = 3;
+        try { ({}) instanceof H; r.push('no'); } catch (e) { r.push(e.constructor.name); }
+        function L() {}
+        Object.defineProperty(L, Symbol.hasInstance, { get() { r.push('getter'); return () => true; } });
+        r.push(5 instanceof L);
+        var p = new Proxy({}, { getPrototypeOf() { r.push('trap'); return A.prototype; } }); r.push(p instanceof A);
+        function M() {} Object.setPrototypeOf(M, { [Symbol.hasInstance]() { return 'yes'; } }); r.push(0 instanceof M);
+        var bound = F.bind(null); r.push(new G() instanceof bound);
+        r.push(Object.create(null) instanceof F);
+        function N() {} r.push(Object.create(N.prototype) instanceof N);
+        function Q2() {} r.push({} instanceof Q2, new Q2() instanceof Q2);
+        r.push(F instanceof Function, A instanceof Object, [] instanceof Array);
+        function P2() {} Object.defineProperty(P2, 'prototype', { value: A.prototype }); r.push(new B() instanceof P2);
+        r.push(Symbol() instanceof F, 10n instanceof F);
+        var gen = function* () {}; r.push(gen() instanceof gen);
+        async function af() {} try { ({}) instanceof af; r.push('no'); } catch (e) { r.push(e.constructor.name); }
+        r.join()
+    "#;
+    assert_eq!(
+        run(src),
+        "true,true,false,true,false,true,false,true,false,false,TypeError,true,TypeError,\
+         getter,true,trap,true,true,true,false,true,false,true,true,true,true,true,false,\
+         false,true,TypeError"
+    );
+}

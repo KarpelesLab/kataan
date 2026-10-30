@@ -2886,6 +2886,95 @@ impl Interp {
         })
     }
 
+    /// `obj instanceof C` decided without running code, for the common case of
+    /// a script function or class `C` whose `@@hasInstance` is the intrinsic
+    /// `Function.prototype[@@hasInstance]` (or absent) and whose own
+    /// `prototype` is an already-materialized data property: that is exactly
+    /// OrdinaryHasInstance, a walk of `obj`'s `[[Prototype]]` chain. `None`
+    /// whenever any step could be observable (an accessor, a proxy, an exotic
+    /// cell, a module namespace, a lazily-built `prototype`): the caller then
+    /// takes the general path, which performs every step through `[[Get]]`.
+    fn instance_of_plain_vm_ctor(&mut self, obj: NanBox, ctor: NanBox) -> Option<bool> {
+        let ch = Handle::from_raw(ctor.as_handle()?);
+        if !self.realm.is_vm_function_value(ch) {
+            return None;
+        }
+        #[cfg(all(feature = "module", feature = "std"))]
+        if !self.deferred_namespaces.is_empty() {
+            return None;
+        }
+        if self.has_instance_key.is_none() {
+            let sym = self.well_known_symbol("hasInstance");
+            self.has_instance_key = Some(self.member_key(sym).into_boxed_str());
+        }
+        let key = self.has_instance_key.as_deref()?;
+        // `GetMethod(C, @@hasInstance)` up `C`'s chain: absent, or the default.
+        let mut cur = Some(ch);
+        let mut resolved = false;
+        for _ in 0..64 {
+            let Some(c) = cur else {
+                resolved = true;
+                break;
+            };
+            #[cfg(all(feature = "module", feature = "std"))]
+            if self.module_namespaces.contains_key(&c.to_raw()) {
+                return None;
+            }
+            if self.realm.is_host_exotic(c)
+                || !(self.realm.is_ordinary_get_cell(c) || self.realm.is_vm_function(c))
+                || self.realm.accessor(c, key).is_some()
+            {
+                return None;
+            }
+            if let Some(v) = self.realm.get_property(c, key) {
+                let is_default = v.as_handle().is_some_and(|m| {
+                    self.realm.native_at(Handle::from_raw(m)) == Some(N_FN_HAS_INSTANCE)
+                });
+                if !is_default {
+                    return None;
+                }
+                resolved = true;
+                break;
+            }
+            cur = self.realm.object_proto(c);
+        }
+        if !resolved {
+            return None;
+        }
+        // `Get(C, "prototype")`: an own data property holding an object.
+        if self.realm.accessor(ch, "prototype").is_some() {
+            return None;
+        }
+        let proto = self.realm.get_property(ch, "prototype")?;
+        if !self.is_object_value(proto) {
+            return None;
+        }
+        let proto = Handle::from_raw(proto.as_handle()?);
+        let Some(oh) = obj.as_handle().map(Handle::from_raw) else {
+            return Some(false);
+        };
+        if self.realm.symbol_at(oh).is_some()
+            || self.realm.is_string_handle(oh)
+            || self.realm.bigint_at(oh).is_some()
+        {
+            return Some(false);
+        }
+        let mut cur = oh;
+        for _ in 0..100_000 {
+            if self.realm.proxy_at(cur).is_some() {
+                return None;
+            }
+            let Some(p) = self.realm.object_proto(cur) else {
+                return Some(false);
+            };
+            if p == proto {
+                return Some(true);
+            }
+            cur = p;
+        }
+        None
+    }
+
     /// `obj instanceof Ctor`: true when `obj` was constructed from `Ctor`'s
     /// class or one of its subclasses (via the instance's class tag and the
     /// `extends` chain).
@@ -2912,6 +3001,9 @@ impl Interp {
     }
 
     pub(crate) fn instance_of(&mut self, obj: NanBox, ctor: NanBox) -> Result<bool, ExecError> {
+        if let Some(r) = self.instance_of_plain_vm_ctor(obj, ctor) {
+            return Ok(r);
+        }
         // A custom `[Symbol.hasInstance]` on the right-hand side overrides the
         // ordinary prototype/cell-kind check (and applies even to a primitive
         // left-hand side, e.g. `4 instanceof Even`). Read via `read_member` so a

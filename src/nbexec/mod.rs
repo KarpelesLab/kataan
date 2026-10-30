@@ -286,6 +286,9 @@ pub struct Interp {
     symbol_registry: alloc::collections::BTreeMap<String, NanBox>,
     /// Cached well-known symbols (e.g. `Symbol.iterator`), created on first use.
     well_known_symbols: alloc::collections::BTreeMap<&'static str, NanBox>,
+    /// The property-storage key of `Symbol.hasInstance`, once computed (the
+    /// `instanceof` fast path probes it on every evaluation).
+    has_instance_key: Option<alloc::boxed::Box<str>>,
     /// The frozen template-strings object for each tagged-template site (keyed by the
     /// compiler's site identity — see `Compiler::template_site` — *and* the eval-site epoch, so the same array is passed to the
     /// tag on every evaluation of that site). The epoch disambiguates distinct `eval`
@@ -2887,6 +2890,7 @@ impl Interp {
             wasm_next_id: 0,
             symbol_registry: alloc::collections::BTreeMap::new(),
             well_known_symbols: alloc::collections::BTreeMap::new(),
+            has_instance_key: None,
             tagged_template_cache: alloc::collections::BTreeMap::new(),
             string_symbol_checked: false,
             eval_site_epoch: 0,
