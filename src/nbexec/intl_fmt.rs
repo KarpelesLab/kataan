@@ -2223,6 +2223,87 @@ fn canonicalize_locale_id_structural(tag: &str) -> Option<String> {
     Some(out)
 }
 
+/// `Intl.DisplayNames` name of language tag `code` in `locale`: the language's
+/// CLDR name with its script, region and variants as parenthesized qualifiers
+/// (`en-US` "English (United States)"), and under `languageDisplay: "dialect"`
+/// a CLDR dialect name where one exists (`es-419` "Latin American Spanish").
+/// `None` when the primary language has no name.
+#[cfg(feature = "intl")]
+pub(crate) fn language_display_name(locale: &str, code: &str, dialect: bool) -> Option<String> {
+    let subtags: Vec<&str> = code.split(['-', '_']).collect();
+    let lang = *subtags.first()?;
+    let mut rest = &subtags[1..];
+    let script = rest
+        .first()
+        .filter(|s| s.len() == 4 && s.bytes().all(|b| b.is_ascii_alphabetic()));
+    if script.is_some() {
+        rest = &rest[1..];
+    }
+    let region = rest.first().filter(|s| {
+        (s.len() == 2 && s.bytes().all(|b| b.is_ascii_alphabetic()))
+            || (s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit()))
+    });
+    if region.is_some() {
+        rest = &rest[1..];
+    }
+    let name = |c: &str| intl::display::language_name(locale, c);
+    // `languageDisplay: "dialect"` takes a CLDR name for the language with its
+    // script and/or region (`es-419` "Latin American Spanish"), longest first;
+    // the subtags it covers drop out of the parenthesized qualifiers. The crate
+    // falls back to English for a name the display locale lacks, so outside
+    // English a dialect name equal to the English one is that fallback (German
+    // has no `es-419` entry and must say "Spanisch (Lateinamerika)").
+    let english = locale
+        .split(['-', '_'])
+        .next()
+        .is_some_and(|l| l.eq_ignore_ascii_case("en"));
+    let dialect_name =
+        |c: &str| name(c).filter(|n| english || intl::display::language_name("en", c) != Some(*n));
+    let mut base = None;
+    let (mut show_script, mut show_region) = (script, region);
+    if dialect {
+        let candidates = [
+            (
+                script
+                    .zip(region)
+                    .map(|(s, r)| alloc::format!("{lang}-{s}-{r}")),
+                true,
+                true,
+            ),
+            (region.map(|r| alloc::format!("{lang}-{r}")), false, true),
+            (script.map(|s| alloc::format!("{lang}-{s}")), true, false),
+        ];
+        for (tag, takes_script, takes_region) in candidates {
+            if let Some(n) = tag.as_deref().and_then(dialect_name) {
+                base = Some(n);
+                if takes_script {
+                    show_script = None;
+                }
+                if takes_region {
+                    show_region = None;
+                }
+                break;
+            }
+        }
+    }
+    let base = base.or_else(|| name(lang))?;
+    // UTS #35 localeDisplayPattern: `{base} ({script}, {region}, {variants})`.
+    let mut quals: Vec<String> = Vec::new();
+    if let Some(s) = show_script {
+        quals.push(String::from(*s));
+    }
+    if let Some(r) = show_region {
+        quals.push(String::from(
+            intl::display::region_name(locale, r).unwrap_or(r),
+        ));
+    }
+    quals.extend(rest.iter().map(|v| String::from(*v)));
+    if quals.is_empty() {
+        return Some(String::from(base));
+    }
+    Some(alloc::format!("{base} ({})", quals.join(", ")))
+}
+
 /// Validates + canonicalizes the `code` argument to
 /// `Intl.DisplayNames.prototype.of` against its instance `[[Type]]` (ECMA-402
 /// `CanonicalizeDisplayNamesType`-adjacent `of` grammar). Returns the

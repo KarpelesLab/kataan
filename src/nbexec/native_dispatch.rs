@@ -3427,9 +3427,18 @@ impl Interp {
                         .unwrap_or_else(|| String::from("en"));
                     // The crate has CLDR language/region names; currency/script use the
                     // hand-rolled table (and any code the crate doesn't know falls back).
-                    let primary = code.split(['-', '_']).next().unwrap_or(&code);
+                    let dialect = fmt
+                        .and_then(|h| self.realm.get_property(h, "\u{0}languageDisplay"))
+                        .map(|v| self.realm.to_display_string(v))
+                        .is_none_or(|d| d != "standard");
+                    let lang_name;
                     let crate_name = match ty.as_str() {
-                        "language" => intl::display::language_name(&locale, primary),
+                        "language" => {
+                            lang_name = crate::nbexec::intl_fmt::language_display_name(
+                                &locale, &code, dialect,
+                            );
+                            lang_name.as_deref()
+                        }
                         "region" => intl::display::region_name(&locale, &code),
                         _ => None,
                     };

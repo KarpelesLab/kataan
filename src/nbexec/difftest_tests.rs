@@ -2353,3 +2353,24 @@ fn number_format_significant_results_keep_the_right_digits() {
         "1 1 1.5 1.0 0.0000001 0.00000012 -0.00000005 0.00012 1.2K"
     );
 }
+
+/// `Intl.DisplayNames` of a language tag looked up only its primary subtag, so
+/// `en-US`, `en-GB` and `en` were all "English". The region (and script and
+/// variants) now qualify the name, and `dialect` uses a CLDR dialect name when
+/// the display locale has one, not the crate's English fallback.
+#[cfg(feature = "intl")]
+#[test]
+fn display_names_language_keeps_its_region() {
+    let src = r#"
+        var d = new Intl.DisplayNames("en", { type: "language" });
+        var s = new Intl.DisplayNames("en", { type: "language", languageDisplay: "standard" });
+        var de = new Intl.DisplayNames("de", { type: "language" });
+        [d.of("en"), d.of("en-GB"), d.of("es-419"), s.of("es-419"), d.of("zh-Hans-CN"),
+         s.of("ca-ES-valencia"), de.of("es-419") === "Spanisch (Lateinamerika)", d.of("xx-US")].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "English|English (United Kingdom)|Latin American Spanish|Spanish (Latin America)|\
+         Chinese (Hans, China)|Catalan (Spain, valencia)|true|xx-US"
+    );
+}

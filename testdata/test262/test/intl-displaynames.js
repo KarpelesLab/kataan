@@ -6,12 +6,12 @@ function dn(t, c) { return new Intl.DisplayNames("en", { type: t }).of(c); }
 
 assert.sameValue(typeof Intl.DisplayNames, "function", "Intl.DisplayNames exists");
 
-// Language names (the primary subtag, case-insensitive).
+// Language names (case-insensitive); a region subtag qualifies the name.
 assert.sameValue(dn("language", "fr"), "French", "fr");
 assert.sameValue(dn("language", "en"), "English", "en");
 assert.sameValue(dn("language", "de"), "German", "de");
 assert.sameValue(dn("language", "ja"), "Japanese", "ja");
-assert.sameValue(dn("language", "fr-FR"), "French", "language-region subtag");
+assert.sameValue(dn("language", "fr-FR"), "French (France)", "language-region subtag");
 
 // Region names (uppercased).
 assert.sameValue(dn("region", "US"), "United States", "US");
