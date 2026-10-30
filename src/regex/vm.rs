@@ -1120,7 +1120,7 @@ fn range_fold_hit(c: u32, lo: u32, hi: u32, flags: Flags) -> bool {
         let cu = ch.to_ascii_uppercase() as u32;
         return (cl >= lo && cl <= hi) || (cu >= lo && cu <= hi);
     }
-    case_variants(ch).any(|v| {
+    case_variants(ch, flags).any(|v| {
         v >= lo && v <= hi && char::from_u32(v).is_some_and(|cv| char_fold_eq(cv, ch, flags))
     })
 }
@@ -1167,7 +1167,7 @@ fn prop_matches_ci(prop: &super::props::PropEscape, neg: bool, c: u32, flags: Fl
     let Some(ch) = char::from_u32(c) else {
         return false;
     };
-    for v in case_variants(ch) {
+    for v in case_variants(ch, flags) {
         if v != c && base(v) {
             return true;
         }
@@ -1175,10 +1175,44 @@ fn prop_matches_ci(prop: &super::props::PropEscape, neg: bool, c: u32, flags: Fl
     false
 }
 
-/// The simple case variants of `ch` to test for case-insensitive set membership:
-/// its ASCII/simple upper- and lowercase, and (with the `intl` feature) the
-/// targets that share its case fold. Returns an iterator of code points.
-fn case_variants(ch: char) -> impl Iterator<Item = u32> {
+/// `scf(c)`: Unicode simple case folding, the `u`/`v`-mode `Canonicalize`.
+fn simple_fold(c: u32) -> u32 {
+    let tab = super::fold_data::SCF_BY_SOURCE;
+    match tab.binary_search_by_key(&c, |&(s, _)| s) {
+        Ok(i) => tab[i].1,
+        Err(_) => c,
+    }
+}
+
+/// Every code point `x` with `scf(x) == scf(c)` (including `c`): the members a
+/// `u`/`v`-mode class may contain for `c` to match it case-insensitively.
+fn simple_fold_class(c: u32) -> Vec<u32> {
+    let t = simple_fold(c);
+    let tab = super::fold_data::SCF_BY_TARGET;
+    let start = tab.partition_point(|&(_, d)| d < t);
+    let mut out = Vec::with_capacity(4);
+    out.push(t);
+    out.extend(
+        tab[start..]
+            .iter()
+            .take_while(|&&(_, d)| d == t)
+            .map(|&(s, _)| s),
+    );
+    out
+}
+
+/// The case variants of `ch` to test for case-insensitive set membership.
+///
+/// Under `u`/`v` that is exactly `ch`'s simple-case-folding equivalence class
+/// (so `ß`, `İ` and `ı`, which fold only to themselves, have no variants,
+/// while `ǅ` reaches both `Ǆ` and `ǆ` and `k` reaches the Kelvin sign). The
+/// legacy mode's candidates are its ASCII/simple upper- and lowercase plus
+/// (with the `intl` feature) the targets that share its case fold; callers
+/// filter those by the legacy `Canonicalize`. Returns an iterator of code points.
+fn case_variants(ch: char, flags: Flags) -> impl Iterator<Item = u32> {
+    if flags.unicode || flags.unicode_sets {
+        return simple_fold_class(ch as u32).into_iter();
+    }
     let mut out: Vec<u32> = Vec::new();
     for u in ch.to_uppercase() {
         out.push(u as u32);

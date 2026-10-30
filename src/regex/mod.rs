@@ -47,6 +47,8 @@
 //! exactly as before. New callers should migrate to the u16 API.
 
 mod compile;
+#[rustfmt::skip]
+mod fold_data;
 mod linear;
 mod parser;
 mod props;

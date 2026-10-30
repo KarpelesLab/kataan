@@ -2584,3 +2584,23 @@ fn regex_v_flag_negated_property_ignore_case() {
         "00010|00010|11101|00010|00010|11101|11111|00000|01110|00010"
     );
 }
+
+/// Case-insensitive `u`/`v` class membership is "some member has the same
+/// simple case fold as the input". The candidates had come from the *full*
+/// upper/lowercase mappings, so `ß` (uppercase `SS`), `İ` (lowercase `i̇`) and
+/// `ı` (uppercase `I`) wrongly matched ASCII and the other-case property, while
+/// fold-class members those mappings miss were not tried: titlecase `ǅ` for
+/// `Ǆ`/`ǆ` in `\p{Lt}`, the Kelvin sign for `k` in `\P{ASCII}`.
+#[test]
+fn regex_ignore_case_class_uses_simple_fold_class() {
+    let src = r#"
+        function bits(re) { return ["ß", "İ", "ı", "Ǆ", "ǆ", "k", "s", "K", "ẞ"].map(function (c) { return re.test(c) ? 1 : 0; }).join(""); }
+        [bits(/^\p{ASCII}$/ui), bits(/^\P{ASCII}$/ui), bits(/^\p{Lt}$/ui), bits(/^\p{Ll}$/ui), bits(/^\p{Lu}$/ui),
+         bits(/^[\p{Lt}]$/vi), bits(/^\p{Lu}$/vi), bits(/^[^\p{Ll}]$/ui), bits(/^[ß]$/ui), bits(/^[ẞ]$/vi)].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "000001110|111111111|000110000|101111111|110111111|\
+         000110000|110111111|010000000|100000001|100000001"
+    );
+}
