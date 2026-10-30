@@ -1,11 +1,11 @@
 //! The generic tier's **receiver cache**: which property ops of a body keep
 //! the heap slot address of their receiver in a frame slot for a later op on
-//! the same object, so it skips the arena walk (handle check, bounds,
-//! occupancy and generation guards).
+//! the same object, so it skips the arena walk (handle check, bounds and
+//! the family's cell-tag guards, `jit::handle`).
 //!
 //! Soundness is dynamic and does not depend on this plan. A cache *way* is a
 //! pair of frame slots: the receiver's handle bits (the key) and the address
-//! of its live, occupied heap slot as a full walk proved it. The frame
+//! of its heap slot as a full walk proved it. The frame
 //! prologue and every `call` the body makes empty all the keys
 //! (`X64Assembler::clear_recv_cache`), and only Rust code (always behind a
 //! call) can allocate, collect, move or free a heap slot. So a key equal to a

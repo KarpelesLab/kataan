@@ -737,13 +737,9 @@ impl X64Assembler {
         self.code.extend_from_slice(&[0x89, 0xc0]);
     }
 
-    /// Jumps to `miss` unless `rax` holds a heap handle. Clobbers `rcx`, `r11`.
+    /// Jumps to `miss` unless `rax` holds a heap handle. Clobbers `rcx`.
     fn p_handle_check(&mut self, miss: Label) {
-        self.g_movabs(r::R11, HANDLE_TAG);
-        self.g_mov(r::RCX, r::RAX);
-        self.g_and(r::RCX, r::R11);
-        self.g_cmp(r::RCX, r::R11);
-        self.g_jcc(cc::NE, miss);
+        self.p_is_handle(r::RCX, miss);
     }
 
     /// `rax = r10 + rax * slot_stride` (the slot of arena index `rax`, the
@@ -763,7 +759,9 @@ impl X64Assembler {
     /// From the handle bits in `rax` (a `NanBox` handle or a raw handle: only
     /// the low 48 bits are read), `rcx = &Slot` of a live slot with that
     /// generation, given the arena base in `r10` and length in `rdx`; else to
-    /// `miss`. Clobbers `rax`, `r8`.
+    /// `miss`. Clobbers `rax`, `r8`. The fully checked walk, for handles
+    /// from side tables the collector does not trace; a rooted handle takes
+    /// [`p_slot_rooted`](Self::p_slot_rooted) (`jit::handle`).
     fn p_slot_of(&mut self, l: &JitLayout, miss: Label) {
         self.mov_r8_rax();
         self.shr_r8_imm(32); // r8w = generation
@@ -820,7 +818,7 @@ impl X64Assembler {
         self.p_arena(realm_off, &l.props);
         self.g_load(r::RAX, recv_base, recv_disp);
         self.p_handle_check(miss);
-        self.p_slot_of(l, miss);
+        self.p_slot_rooted(l, r::RCX, miss);
         self.p_plain_shaped(l, miss);
         self.p_method_lookup_from(l, site, miss, getter);
     }
@@ -839,7 +837,7 @@ impl X64Assembler {
         self.p_arena(realm_off, &l.props);
         self.g_load(r::RAX, recv_base, recv_disp);
         self.p_handle_check(miss);
-        self.p_slot_of(l, miss);
+        self.p_slot_rooted(l, r::RCX, miss);
         self.p_plain_shaped(l, miss);
     }
 
@@ -1752,7 +1750,7 @@ impl X64Assembler {
             self.g_load(r::R10, r::R11, l.props.heap_ptr);
             self.g_load(r::RDX, r::R11, l.props.heap_len);
         }
-        self.p_slot_of(l, miss);
+        self.p_slot_rooted(l, r::RCX, miss);
         self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.props.native_disc);
         self.jne(miss);
         // cmp word [rcx+disp32], imm16
@@ -1778,11 +1776,7 @@ impl X64Assembler {
     pub(crate) fn p_barrier_check(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
         let done = self.new_label();
         let old = crate::gc::OLD_AGE;
-        self.g_movabs(r::R11, HANDLE_TAG);
-        self.g_mov(r::R9, r::RAX);
-        self.g_and(r::R9, r::R11);
-        self.g_cmp(r::R9, r::R11);
-        self.g_jcc(cc::NE, done);
+        self.p_is_handle(r::R9, done);
         self.g_load(r::R11, r::R15, realm_off);
         self.g_cmp_byte_imm(r::R11, l.props.marking, 0);
         self.g_jcc(cc::NE, miss);
@@ -1793,11 +1787,11 @@ impl X64Assembler {
             self.g_load(r::R10, r::R11, l.props.heap_ptr);
             self.g_load(r::RDX, r::R11, l.props.heap_len);
         }
-        self.g_mov(r::R9, r::RCX);
-        self.p_slot_of(l, miss);
-        self.g_cmp_byte_imm(r::RCX, l.props.off_slot_age, old);
+        // The target is the value being stored: rooted (`jit::handle`), and
+        // only its slot header's `age` is read.
+        self.p_slot_rooted(l, r::R9, miss);
+        self.g_cmp_byte_imm(r::R9, l.props.off_slot_age, old);
         self.g_jcc(cc::B, miss);
-        self.g_mov(r::RCX, r::R9);
         self.bind(done);
     }
 
@@ -1892,7 +1886,7 @@ impl X64Assembler {
         self.g_mov(r::R9, r::RAX);
         self.p_arena(realm_off, &l.props);
         self.g_mov(r::RAX, r::R9);
-        self.p_slot_of(l, other);
+        self.p_slot_rooted(l, r::RCX, other);
         // An ordinary object first (the usual condition), then a function
         // or an array (never `[[IsHTMLDDA]]`).
         let not_object = self.new_label();
@@ -1951,7 +1945,7 @@ impl X64Assembler {
         self.g_mov(r::R9, r::RAX);
         self.p_arena(realm_off, &l.props);
         self.g_mov(r::RAX, r::R9);
-        self.p_slot_of(l, other);
+        self.p_slot_rooted(l, r::RCX, other);
         self.p_plain_shaped(l, other);
         let skip_fill = self.new_label();
         if let Some(s) = shape {

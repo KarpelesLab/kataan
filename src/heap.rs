@@ -181,6 +181,13 @@ pub(crate) struct SlotLayout {
     pub value_off: usize,
     /// Byte offset of the `age: u8` field (collections survived) within the slot.
     pub age_off: usize,
+    /// The byte at [`value_off`](Self::value_off) of a **vacant** slot (one
+    /// whose value was taken): `Option<T>`'s `None`, which lives in the
+    /// niche of `T`'s own tag byte — no `Some` value's tag. Compiled code
+    /// that compares a slot's cell tag therefore also proves the slot
+    /// occupied (`jit::handle`), and its inline allocations make a free slot
+    /// `Some` by writing that byte.
+    pub vacant_tag: u8,
 }
 
 /// Derives [`SlotLayout`] for `Slot<T>` from a real live instance. `value`
@@ -199,7 +206,39 @@ pub(crate) fn jit_slot_layout<T>(value: T) -> SlotLayout {
         // keeps no separate tag for a niche-carrying `T`).
         value_off: core::ptr::addr_of!(*value) as usize - base,
         age_off: core::ptr::addr_of!(slot.age) as usize - base,
+        vacant_tag: vacant_tag_byte(slot),
     }
+}
+
+/// The byte at the value offset of `slot` once vacated (see
+/// [`SlotLayout::vacant_tag`]), asserting it is a niche: no longer the live
+/// value's tag byte.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn vacant_tag_byte<T>(slot: Slot<T>) -> u8 {
+    let mut v = alloc::vec![slot];
+    let value_off = {
+        let s = &v[0];
+        let value = s.value.as_ref().expect("a live slot");
+        core::ptr::addr_of!(*value) as usize - core::ptr::addr_of!(*s) as usize
+    };
+    let read = |v: &Vec<Slot<T>>| {
+        // SAFETY: in bounds of the slot. A live slot's byte is its value's
+        // initialized tag; a vacant one's is `Option<T>`'s `None` niche — the
+        // very byte compiled code's inline allocations write to make a free
+        // slot `Some` (`p_alloc_*`), which the layout tests exercise.
+        #[allow(unsafe_code)]
+        unsafe {
+            core::ptr::read_volatile(v.as_ptr().cast::<u8>().add(value_off))
+        }
+    };
+    let live = read(&v);
+    drop(v[0].vacate(1));
+    let vacant = read(&v);
+    assert_ne!(
+        live, vacant,
+        "a vacant slot's tag byte must not keep the live value's tag (Option niche moved?)"
+    );
+    vacant
 }
 
 /// The byte offsets, within the object heap (`Heap<Cell>`), of its slot

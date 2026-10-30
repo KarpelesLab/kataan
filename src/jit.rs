@@ -26,6 +26,8 @@ mod call_seq;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod global_persist;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod handle;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub mod inline;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod pin;
@@ -3307,7 +3309,7 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
         let cell_base = slot.value_off;
         let obj_base = cell_base + cell.object_off;
         let to_i32 = |v: usize| i32::try_from(v).expect("jit layout offset fits in i32");
-        JitLayout {
+        let layout = JitLayout {
             slot_stride: to_i32(slot.stride),
             slot_occupied_disc: slot.occupied_disc,
             off_slot_occ: to_i32(slot.occupied_off),
@@ -3336,7 +3338,21 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
             off_arr_vec: to_i32(cell_base + cell.array_vec_off),
             arr_empty_vec: cell.array_empty_vec,
             props: props::PropsLayout::new(&slot, cell_base, obj_base, &obj),
+        };
+        // A rooted handle's walk (`jit::handle`) proves its slot occupied by
+        // the cell-tag compare alone: no tag it compares may be a vacant
+        // slot's.
+        let p = &layout.props;
+        for disc in [
+            layout.cell_object_disc,
+            layout.cell_array_disc,
+            p.vmfn_disc,
+            p.native_disc,
+            p.box_disc,
+        ] {
+            assert_ne!(disc, slot.vacant_tag, "a cell tag equals the vacant slot's");
         }
+        layout
     })
 }
 
@@ -6580,39 +6596,18 @@ impl JitFunction {
                 a.jmp($done);
             }};
         }
-        // The receiver walk shared by the inline heap fast paths: from the handle in
-        // `rax`, guard handle-ness / arena bounds / slot occupancy / generation and
-        // leave `rcx = &Slot` (`rax` = the receiver's bits; the arena pinned
-        // in `r12`/`r13`, see `pin`). Any miss jumps to `$miss`. Clobbers
-        // `rcx`, `r8` (and, unpinned, `rdx`, `r10`, `r11`).
+        // The receiver walk shared by the inline heap fast paths: from the
+        // rooted handle in `$recv` (`jit::handle`), guard handle-ness and the
+        // arena bounds and leave `rcx = &Slot` (`rax` = the receiver's bits).
+        // Every use compares the cell tag next (`family_checks!`, or the
+        // `Cell::Box` / add-guard compares), which also proves the slot
+        // occupied. Any miss jumps to `$miss`.
         macro_rules! walk_to_slot {
             ($recv:expr, $miss:expr) => {{
                 a.p_arena(helpers.call_layout.realm, &layout.props); // (pinned: nothing)
                 a.load_rax(disp($recv)); // rax = recv bits
-                // A heap handle has all of `HANDLE_TAG`'s bits (the top 14).
-                const _: () = assert!(HANDLE_TAG == !0u64 << 50);
-                a.mov_rcx_rax();
-                a.raw(&[0x48, 0xc1, 0xe9, 50]); // shr rcx, 50
-                a.raw(&[0x81, 0xf9, 0xff, 0x3f, 0x00, 0x00]); // cmp ecx, 0x3fff
-                a.jne($miss); // not a heap handle
-                a.mov_r8_rax();
-                a.shr_r8_imm(32); // r8 = generation (low 16)
-                a.raw(&[0x89, 0xc1]); // mov ecx, eax: rcx = handle index
-                a.p_cmp_arena_len(call_seq::r::RCX);
-                a.jae($miss); // index >= arena len
-                if layout.slot_stride == 72 {
-                    // rcx = base + rcx*72 in two `lea`s (shorter on the
-                    // dependency chain than `imul` + `add`).
-                    a.p_slot_lea72(call_seq::r::RCX);
-                } else {
-                    a.raw(&[0x48, 0x69, 0xc9]); // imul rcx, rcx, stride
-                    a.raw(&layout.slot_stride.to_le_bytes());
-                    a.p_add_arena_base(call_seq::r::RCX); // rcx = &Slot
-                }
-                a.cmp_byte_at_rcx_imm(layout.off_slot_occ, layout.slot_occupied_disc);
-                a.jne($miss);
-                a.cmp_word_at_rcx_r8w(layout.off_slot_gen);
-                a.jne($miss);
+                a.p_is_handle(call_seq::r::RCX, $miss);
+                a.p_slot_rooted(&layout, call_seq::r::RCX, $miss);
             }};
         }
         // What a receiver of family `$fam` must be beyond a live slot (the
@@ -6652,8 +6647,8 @@ impl JitFunction {
                 }
             }};
         }
-        // `rcx = &Slot` of the receiver in `$recv` — a live, occupied slot of
-        // its generation, passing `family_checks!($fam)` — for op `$at`, else
+        // `rcx = &Slot` of the receiver in `$recv` — the slot of a cell
+        // passing `family_checks!($fam)` (so occupied) — for op `$at`, else
         // to `$miss`: through the receiver cache when its plan says so (a hit
         // takes the way's address; a miss walks out of line and refills it),
         // else the full walk (then recorded in the way when a later op may
