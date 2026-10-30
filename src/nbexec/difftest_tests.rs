@@ -1970,3 +1970,24 @@ fn hot_construct_reads_captures_after_the_heap_grows() {
     "#;
     assert_eq!(run(src), "20000");
 }
+
+/// ToPrimitive runs OrdinaryToPrimitive on every object: a RegExp, Map, Set,
+/// WeakMap or Promise (objects without plain keys) was returned as-is and
+/// then rendered by the engine's display form, so `re + ""` ignored a
+/// replaced `RegExp.prototype.toString` and showed the source unescaped
+/// (`/a/b/` for `new RegExp("a/b")`), and `new WeakMap() + ""` was
+/// `"[object Map]"`.
+#[test]
+fn to_primitive_runs_the_methods_of_keyless_objects() {
+    let src = r#"
+        var r = [new RegExp("a/b") + "", new WeakMap() + "", new Set() + "", Promise.resolve() + ""];
+        RegExp.prototype.toString = function () { return "RT"; };
+        Map.prototype.valueOf = function () { return 42; };
+        r.push(/x/ + "", new Map() + 1, `${/y/}`);
+        r.join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "/a\\/b/ [object WeakMap] [object Set] [object Promise] RT 43 RT"
+    );
+}

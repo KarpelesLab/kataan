@@ -296,7 +296,11 @@ impl Interp {
                     // @@toPrimitive)` and the `valueOf`/`toString` reads all run
                     // through its traps (or forward to the target). Returning the
                     // proxy as-is would coerce it to `"[object Object]"`.
-                    && self.realm.proxy_at(h).is_none()))
+                    && self.realm.proxy_at(h).is_none()
+                    // Nor is any other object without plain keys — a RegExp,
+                    // Map, Set, WeakMap, Promise …: `re + ""` runs its (possibly
+                    // user-replaced) `toString`, not the engine's display form.
+                    && !self.is_object_value(v)))
         {
             return Ok(v);
         }
