@@ -35,12 +35,16 @@ use core::cell::Cell;
 const STEP_BASE: u64 = crate::limits::DEFAULT_REGEX_STEP_BASE;
 const STEP_PER_CHAR: u64 = 1_000;
 
-/// Maximum `backtrack` recursion depth before the match aborts cleanly. The VM
-/// recurses once per `Split`/`Save`/lookaround exploration; on an 8 MiB stack a
-/// few thousand frames is safe. Picked conservatively to avoid SIGSEGV on
-/// adversarial input (e.g. `/a*/` on a very long string) while remaining far
-/// above any realistic legitimate nesting/iteration depth.
+/// Maximum lookaround nesting depth of `backtrack` before the match aborts
+/// cleanly. Choice points live on an explicit heap stack, so the executor
+/// recurses only to run a lookaround sub-program; the pattern parser's nesting
+/// cap already keeps that far below this backstop.
 const MAX_DEPTH: u32 = crate::limits::DEFAULT_REGEX_MAX_DEPTH;
+
+/// Maximum length of the executor's backtrack stack (choice points plus undo
+/// records) before the match aborts cleanly, bounding its memory on an
+/// adversarial subject (one frame is a few dozen bytes).
+const MAX_STACK: usize = crate::limits::DEFAULT_REGEX_MAX_BACKTRACK_STACK;
 
 /// A compiled instruction.
 pub(crate) enum Inst {
@@ -289,13 +293,14 @@ fn read_dir(input: &[u16], sp: usize, unicode: bool, reverse: bool) -> Option<(u
 }
 
 /// The per-attempt working buffers, owned by the caller so one scan reuses them
-/// across start positions instead of allocating three vectors per offset — an
-/// attempt that fails on its first instruction still paid for all three.
+/// across start positions instead of allocating four vectors per offset — an
+/// attempt that fails on its first instruction still paid for all four.
 #[derive(Default)]
 pub(crate) struct Scratch {
     saves: Vec<Option<usize>>,
     marks: Vec<usize>,
     flag_stack: Vec<Flags>,
+    stack: BtStack,
 }
 
 /// Runs `prog` against `input` (UTF-16 code units) starting at unit index
@@ -320,6 +325,7 @@ pub(crate) fn run_with(
         saves,
         marks,
         flag_stack,
+        stack,
     } = scratch;
     saves.clear();
     saves.resize(2 * (group_count + 1), None);
@@ -337,7 +343,7 @@ pub(crate) fn run_with(
         steps,
         budget,
     };
-    if backtrack(&ctx, 0, start, saves, 0, marks, flag_stack) {
+    if backtrack(&ctx, 0, start, saves, 0, marks, flag_stack, stack) {
         // Pair the raw save slots into (start, end) spans per group.
         let mut groups = Vec::with_capacity(group_count + 1);
         for g in 0..=group_count {
@@ -384,11 +390,78 @@ impl Ctx<'_> {
     }
 }
 
-/// The recursive backtracking executor. `pc` is the program counter, `sp` the
-/// position in the input (a code-unit index), `depth` the current recursion
-/// depth. `saves` holds raw capture positions. Returns `false` (clean no-match)
-/// if the step budget or the recursion-depth cap is exceeded, so an adversarial
-/// pattern can never hang or overflow the stack.
+/// The backtracking executor's explicit stack. `frames` holds choice points
+/// and undo records; variable-length payloads (saved capture slots, recorded
+/// loop positions) live on the two side stacks in the same LIFO order, so a
+/// [`Frame`] stays `Copy` and unwinding or clearing never runs drop glue.
+#[derive(Default)]
+pub(crate) struct BtStack {
+    frames: Vec<Frame>,
+    slots: Vec<Option<usize>>,
+    positions: Vec<usize>,
+}
+
+/// One entry of the backtracking executor's explicit stack: either a choice
+/// point to resume from, or the undo record of a state change made since the
+/// choice point below it (undone, in order, while unwinding to that choice).
+#[derive(Clone, Copy)]
+enum Frame {
+    /// The untried branch of a `Split`: resume at `pc` with position `sp`.
+    Alt { pc: usize, sp: usize },
+    /// Undo a `Save`: restore capture slot `slot` to `old`.
+    Save { slot: usize, old: Option<usize> },
+    /// Undo a `ClearCaptures`: restore the `n` slots starting at `lo` from the
+    /// top of the slot side stack.
+    Clear { lo: usize, n: usize },
+    /// Undo a positive lookaround's adopted captures: restore every slot from
+    /// the top of the slot side stack.
+    Saves,
+    /// Undo a `Mark`: pop the position it pushed.
+    MarkPop,
+    /// Undo an `EmptyFail`: push back the position it popped.
+    MarkPush(usize),
+    /// Undo a `PushFlags`: pop the scope's flags.
+    FlagsPop,
+    /// Undo a `PopFlags`: push back the scope's flags.
+    FlagsPush(Flags),
+    /// A greedy single-unit loop (outside `u` mode) that consumed the run
+    /// `first..=p` (or `p..=first` in reverse): the continuation at `cont` is
+    /// next tried at `p`, then at each position backing off toward `first`.
+    Run {
+        cont: usize,
+        first: usize,
+        p: usize,
+        flags: Flags,
+    },
+    /// A greedy single-consume loop in `u` mode: the continuation at `cont` is
+    /// next tried at the top of the position side stack, longest first, down
+    /// to its entry `base`.
+    Positions { cont: usize, base: usize },
+    /// A lazy single-consume loop whose continuation at `cont` failed at `sp`:
+    /// consume one more character with the instruction at `consume`, then retry.
+    Lazy {
+        consume: usize,
+        cont: usize,
+        sp: usize,
+        flags: Flags,
+    },
+}
+
+/// The backtracking executor. `pc` is the program counter, `sp` the position in
+/// the input (a code-unit index), `depth` the lookaround nesting depth. `saves`
+/// holds raw capture positions.
+///
+/// Choice points live on an explicit heap stack ([`Frame`]) rather than the
+/// Rust call stack, so a quantified group iterated many thousands of times
+/// (`/(?:ab)+c/` over a long subject) neither overflows the native stack nor
+/// hits a recursion cap — that cap used to end such a match as a silent "no
+/// match". Only lookaround sub-programs recurse, so the native depth follows
+/// pattern nesting, not input length.
+///
+/// Returns `false` (clean no-match) if the step budget, the backtrack-stack cap
+/// or the lookaround-depth cap is exceeded, so an adversarial pattern can never
+/// hang, exhaust memory or overflow the stack.
+#[allow(clippy::too_many_arguments)]
 fn backtrack(
     ctx: &Ctx,
     mut pc: usize,
@@ -397,371 +470,410 @@ fn backtrack(
     depth: u32,
     // The positions at which the *optional* quantifier iterations enclosing this
     // point began, pushed by [`Inst::Mark`] and consumed by [`Inst::EmptyFail`].
-    // Properly nested: every `Mark` restores the stack on the way out.
     marks: &mut Vec<usize>,
     // The flag stack: the top entry is the flags in effect at this point, after
     // applying any enclosing inline-modifier scopes. `unicode` never changes
     // (only `i`/`m`/`s` can be modified), so it is read once below.
     flags_stack: &mut Vec<Flags>,
+    // The backtrack stack, caller-owned so a scan reuses one allocation across
+    // start positions; cleared on entry.
+    bt: &mut BtStack,
 ) -> bool {
-    // Recursion-depth cap: abort cleanly before we can overflow the stack.
+    // Lookaround-nesting cap: abort cleanly before we can overflow the stack.
     if depth > MAX_DEPTH {
         return false;
     }
     let unicode = ctx.flags.unicode;
+    let BtStack {
+        frames: stack,
+        slots,
+        positions,
+    } = bt;
+    stack.clear();
+    slots.clear();
+    positions.clear();
+    // The flags in effect for the current instruction: the flag-stack top, kept
+    // in step with every push and pop of that stack.
+    let mut cur = *flags_stack.last().unwrap_or(&ctx.flags);
     loop {
-        // The flags in effect for the current instruction (the flag-stack top).
-        let cur = *flags_stack.last().unwrap_or(&ctx.flags);
-        // Step backstop: every instruction visited counts toward the budget; once
-        // exhausted the whole match unwinds as a no-match.
-        if !ctx.tick() {
-            return false;
-        }
-        match &ctx.prog[pc] {
-            Inst::Match => return ctx.match_end.is_none_or(|p| sp == p),
-            Inst::Char(c) => {
-                if let Some((cp, nsp)) = read_dir(ctx.input, sp, unicode, ctx.reverse)
-                    && cp_eq(cp, *c, cur)
-                {
-                    sp = nsp;
-                    pc += 1;
-                    continue;
-                }
+        // Run forward from (pc, sp) until the path fails (`break`) or matches.
+        loop {
+            // Step backstop: every instruction visited counts toward the budget;
+            // once exhausted the whole match unwinds as a no-match.
+            if !ctx.tick() {
                 return false;
             }
-            Inst::Any => {
-                if let Some((cp, nsp)) = read_dir(ctx.input, sp, unicode, ctx.reverse)
-                    && (cur.dotall || !is_line_term(cp))
-                {
-                    sp = nsp;
-                    pc += 1;
-                    continue;
-                }
-                return false;
-            }
-            Inst::Class(class) => {
-                if let Some((cp, nsp)) = read_dir(ctx.input, sp, unicode, ctx.reverse)
-                    && class_matches(class, cp, cur)
-                {
-                    sp = nsp;
-                    pc += 1;
-                    continue;
-                }
-                return false;
-            }
-            Inst::ClassSet { neg, matcher } => {
-                if let Some((cp, nsp)) = read_dir(ctx.input, sp, unicode, ctx.reverse)
-                    && (matcher.matches(cp, cur) ^ *neg)
-                {
-                    sp = nsp;
-                    pc += 1;
-                    continue;
-                }
-                return false;
-            }
-            Inst::Jmp(target) => pc = *target,
-            Inst::Split(a, b) => {
-                // Fast path for a *simple* quantifier loop whose body is a single
-                // consuming instruction (`a*`, `.*`, `\d+`, `[…]*`, …): consume
-                // iteratively instead of recursing once per repetition. Without
-                // this, `/a*/` over a long subject would recurse one frame per
-                // character and overflow the stack (RE-2a). Iterating keeps the
-                // recursion depth proportional to pattern *nesting*, not input
-                // length. A single-consume body always advances, so it can never
-                // be zero-width — no loop-stack bookkeeping is needed here.
-                if let Some((consume_pc, cont_pc, greedy)) = simple_loop(ctx.prog, pc) {
-                    if greedy && !unicode {
-                        // Outside `u` mode every consume is exactly one code unit,
-                        // so the candidate positions are the contiguous run from
-                        // the start to the furthest point reached: walk it back
-                        // without recording it. A continuation that must begin
-                        // with a literal unit is only entered where that unit is.
-                        let first = sp;
-                        while let Some(nsp) =
-                            consume_one(&ctx.prog[consume_pc], ctx.input, sp, cur, ctx.reverse)
-                        {
-                            sp = nsp;
-                            if !ctx.tick() {
-                                return false;
-                            }
-                        }
-                        let mut p = sp;
-                        loop {
-                            if !continuation_cannot_start(ctx, cont_pc, p, cur)
-                                && backtrack(ctx, cont_pc, p, saves, depth + 1, marks, flags_stack)
-                            {
-                                return true;
-                            }
-                            if !ctx.tick() {
-                                return false;
-                            }
-                            if p == first {
-                                return false;
-                            }
-                            p = if ctx.reverse { p + 1 } else { p - 1 };
-                        }
+            match &ctx.prog[pc] {
+                Inst::Match => {
+                    if ctx.match_end.is_none_or(|p| sp == p) {
+                        return true;
                     }
-                    if greedy {
-                        // Greedy: consume as many as possible, recording each
-                        // position, then try the continuation from longest down.
-                        let mut positions = alloc::vec![sp];
-                        while let Some(nsp) =
-                            consume_one(&ctx.prog[consume_pc], ctx.input, sp, cur, ctx.reverse)
-                        {
+                    break;
+                }
+                Inst::Char(c) => match read_dir(ctx.input, sp, unicode, ctx.reverse) {
+                    Some((cp, nsp)) if cp_eq(cp, *c, cur) => {
+                        sp = nsp;
+                        pc += 1;
+                    }
+                    _ => break,
+                },
+                Inst::Any => match read_dir(ctx.input, sp, unicode, ctx.reverse) {
+                    Some((cp, nsp)) if cur.dotall || !is_line_term(cp) => {
+                        sp = nsp;
+                        pc += 1;
+                    }
+                    _ => break,
+                },
+                Inst::Class(class) => match read_dir(ctx.input, sp, unicode, ctx.reverse) {
+                    Some((cp, nsp)) if class_matches(class, cp, cur) => {
+                        sp = nsp;
+                        pc += 1;
+                    }
+                    _ => break,
+                },
+                Inst::ClassSet { neg, matcher } => {
+                    match read_dir(ctx.input, sp, unicode, ctx.reverse) {
+                        Some((cp, nsp)) if matcher.matches(cp, cur) ^ *neg => {
                             sp = nsp;
+                            pc += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                Inst::Jmp(target) => pc = *target,
+                Inst::Split(a, b) => {
+                    // Fast path for a *simple* quantifier loop whose body is a single
+                    // consuming instruction (`a*`, `.*`, `\d+`, `[…]*`, …): consume
+                    // the whole run iteratively and leave one frame that backs off
+                    // through it, instead of one choice point per repetition. A
+                    // single-consume body always advances, so it can never be
+                    // zero-width — no loop-stack bookkeeping is needed here.
+                    if let Some((consume_pc, cont_pc, greedy)) = simple_loop(ctx.prog, pc) {
+                        if greedy && !unicode {
+                            // Outside `u` mode every consume is exactly one code
+                            // unit, so the candidate positions are the contiguous
+                            // run from the start to the furthest point reached.
+                            let first = sp;
+                            while let Some(nsp) =
+                                consume_one(&ctx.prog[consume_pc], ctx.input, sp, cur, ctx.reverse)
+                            {
+                                sp = nsp;
+                                if !ctx.tick() {
+                                    return false;
+                                }
+                            }
+                            stack.push(Frame::Run {
+                                cont: cont_pc,
+                                first,
+                                p: sp,
+                                flags: cur,
+                            });
+                            break;
+                        }
+                        if greedy {
+                            // Greedy: consume as many as possible, recording each
+                            // position, then try the continuation from longest down.
+                            let base = positions.len();
                             positions.push(sp);
-                            if !ctx.tick() {
-                                return false;
+                            while let Some(nsp) =
+                                consume_one(&ctx.prog[consume_pc], ctx.input, sp, cur, ctx.reverse)
+                            {
+                                sp = nsp;
+                                positions.push(sp);
+                                if !ctx.tick() {
+                                    return false;
+                                }
                             }
+                            stack.push(Frame::Positions {
+                                cont: cont_pc,
+                                base,
+                            });
+                            break;
                         }
-                        while let Some(p) = positions.pop() {
-                            if backtrack(ctx, cont_pc, p, saves, depth + 1, marks, flags_stack) {
-                                return true;
-                            }
-                            if !ctx.tick() {
-                                return false;
-                            }
-                        }
+                        // Lazy: try the continuation first at each length, growing.
+                        stack.push(Frame::Lazy {
+                            consume: consume_pc,
+                            cont: cont_pc,
+                            sp,
+                            flags: cur,
+                        });
+                        pc = cont_pc;
+                        continue;
+                    }
+
+                    // An ordinary Split — an alternation, a `?`, or a `*`/`+` loop
+                    // head. The first target is always the preferred branch (the
+                    // compiler puts the body first for a greedy quantifier and the
+                    // exit first for a lazy one), so trying `a` before `b` gives the
+                    // right preference order for every construct. Zero-width loop
+                    // iterations are stopped by the `Mark`/`EmptyFail` pair the
+                    // compiler wraps around a nullable quantifier body, not here.
+                    // Every unbounded growth of the stack passes through here (a
+                    // loop iteration takes a `Split`), so the cap is checked here.
+                    if stack.len() > MAX_STACK {
                         return false;
                     }
-                    // Lazy: try the continuation first at each length, growing.
-                    loop {
-                        if backtrack(ctx, cont_pc, sp, saves, depth + 1, marks, flags_stack) {
-                            return true;
+                    stack.push(Frame::Alt { pc: *b, sp });
+                    pc = *a;
+                }
+                Inst::Save(slot) => {
+                    stack.push(Frame::Save {
+                        slot: *slot,
+                        old: saves[*slot],
+                    });
+                    saves[*slot] = Some(sp);
+                    pc += 1;
+                }
+                Inst::ClearCaptures { from, to } => {
+                    let lo = (*from).min(saves.len());
+                    let hi = (*to + 1).min(saves.len());
+                    slots.extend_from_slice(&saves[lo..hi]);
+                    stack.push(Frame::Clear { lo, n: hi - lo });
+                    for s in &mut saves[lo..hi] {
+                        *s = None;
+                    }
+                    pc += 1;
+                }
+                Inst::Mark => {
+                    // Remember where this optional iteration starts; the paired
+                    // `EmptyFail` pops it.
+                    marks.push(sp);
+                    stack.push(Frame::MarkPop);
+                    pc += 1;
+                }
+                Inst::EmptyFail => {
+                    // RepeatMatcher step 2.b. Pop first so the continuation (which
+                    // may start the next iteration, or leave an enclosing
+                    // quantifier) sees the enclosing mark on top.
+                    match marks.pop() {
+                        None => pc += 1,
+                        Some(mark) if sp == mark => {
+                            marks.push(mark);
+                            break;
                         }
-                        let Some(nsp) =
-                            consume_one(&ctx.prog[consume_pc], ctx.input, sp, cur, ctx.reverse)
-                        else {
-                            return false;
-                        };
-                        sp = nsp;
-                        if !ctx.tick() {
-                            return false;
+                        Some(mark) => {
+                            stack.push(Frame::MarkPush(mark));
+                            pc += 1;
                         }
                     }
                 }
-
-                // An ordinary Split — an alternation, a `?`, or a `*`/`+` loop
-                // head. The first target is always the preferred branch (the
-                // compiler puts the body first for a greedy quantifier and the
-                // exit first for a lazy one), so trying `a` before `b` gives the
-                // right preference order for every construct. Zero-width loop
-                // iterations are stopped by the `Mark`/`EmptyFail` pair the
-                // compiler wraps around a nullable quantifier body, not here.
-                if backtrack(ctx, *a, sp, saves, depth + 1, marks, flags_stack) {
-                    return true;
+                Inst::Fail => break,
+                Inst::BackrefMulti(groups) => {
+                    let span = groups.iter().find_map(|g| {
+                        match (
+                            saves.get(2 * g).copied().flatten(),
+                            saves.get(2 * g + 1).copied().flatten(),
+                        ) {
+                            (Some(s), Some(e)) => Some((s, e)),
+                            _ => None,
+                        }
+                    });
+                    match span {
+                        Some((s, e)) => match match_backref(ctx, sp, s, e, cur) {
+                            Some(nsp) => {
+                                sp = nsp;
+                                pc += 1;
+                            }
+                            None => break,
+                        },
+                        None => pc += 1,
+                    }
                 }
-                pc = *b;
-            }
-            Inst::Save(slot) => {
-                let old = saves[*slot];
-                saves[*slot] = Some(sp);
-                if backtrack(ctx, pc + 1, sp, saves, depth + 1, marks, flags_stack) {
-                    return true;
-                }
-                saves[*slot] = old;
-                return false;
-            }
-            Inst::ClearCaptures { from, to } => {
-                let lo = (*from).min(saves.len());
-                let hi = (*to + 1).min(saves.len());
-                let saved: alloc::vec::Vec<Option<usize>> = saves[lo..hi].to_vec();
-                for s in &mut saves[lo..hi] {
-                    *s = None;
-                }
-                if backtrack(ctx, pc + 1, sp, saves, depth + 1, marks, flags_stack) {
-                    return true;
-                }
-                saves[lo..hi].clone_from_slice(&saved);
-                return false;
-            }
-            Inst::Mark => {
-                // Remember where this optional iteration starts; the paired
-                // `EmptyFail` pops it. Recursing keeps the stack balanced on every
-                // exit path, including a failure inside the body.
-                marks.push(sp);
-                let r = backtrack(ctx, pc + 1, sp, saves, depth + 1, marks, flags_stack);
-                marks.pop();
-                return r;
-            }
-            Inst::EmptyFail => {
-                // RepeatMatcher step 2.b. Pop first so the continuation (which may
-                // start the next iteration, or leave an enclosing quantifier) sees
-                // the enclosing mark on top; push back on the way out so the
-                // matching `Mark` frame pops what it pushed.
-                let Some(mark) = marks.pop() else {
+                Inst::Look { neg, prog } | Inst::LookBehind { neg, prog } => {
+                    // Zero-width: run the sub-program at `sp`. A lookahead always
+                    // matches forward, even inside a lookbehind; a lookbehind's body
+                    // is compiled *in reverse* (ECMAScript direction `-1`), so it
+                    // consumes the subject backward from `sp` and succeeds when it
+                    // reaches `Match` at some start position `<= sp` (greedy
+                    // quantifiers bind from the right and groups record their
+                    // rightmost iteration). A *positive* assertion propagates the
+                    // groups its sub-match captured to the outer match
+                    // (`/(?=(\d+))/.exec("123")` captures `"123"`); a *negative* one
+                    // contributes nothing. The sub-saves are seeded from the current
+                    // saves so groups already bound outside (and backrefs to them)
+                    // stay visible inside the assertion. The assertion is atomic:
+                    // its sub-match's own choice points are not revisited.
+                    let sub = Ctx {
+                        prog,
+                        input: ctx.input,
+                        flags: cur,
+                        match_end: None,
+                        reverse: matches!(&ctx.prog[pc], Inst::LookBehind { .. }),
+                        steps: ctx.steps,
+                        budget: ctx.budget,
+                    };
+                    let mut sub_saves = saves.clone();
+                    let mut sub_marks = Vec::new();
+                    // The sub-program starts under the flags in effect at the
+                    // assertion (so an enclosing `(?i:…(?=…)…)` is honored).
+                    let mut sub_flags = alloc::vec![cur];
+                    let matched = backtrack(
+                        &sub,
+                        0,
+                        sp,
+                        &mut sub_saves,
+                        depth + 1,
+                        &mut sub_marks,
+                        &mut sub_flags,
+                        &mut BtStack::default(),
+                    );
+                    if matched == *neg {
+                        break;
+                    }
+                    if !*neg {
+                        // Positive: adopt the sub-match's captures; a later failure
+                        // restores the originals so backtracking past the assertion
+                        // is sound.
+                        slots.extend_from_slice(saves);
+                        *saves = sub_saves;
+                        stack.push(Frame::Saves);
+                    }
                     pc += 1;
-                    continue;
-                };
-                if sp == mark {
-                    marks.push(mark);
-                    return false;
                 }
-                let r = backtrack(ctx, pc + 1, sp, saves, depth + 1, marks, flags_stack);
-                marks.push(mark);
-                return r;
-            }
-            Inst::Fail => return false,
-            Inst::BackrefMulti(groups) => {
-                let span = groups.iter().find_map(|g| {
+                Inst::Backref(g) => {
                     match (
                         saves.get(2 * g).copied().flatten(),
                         saves.get(2 * g + 1).copied().flatten(),
                     ) {
-                        (Some(s), Some(e)) => Some((s, e)),
-                        _ => None,
+                        // Backrefs compare raw code units (a captured span is a run
+                        // of units); case folding is applied unit-by-unit.
+                        (Some(s), Some(e)) => match match_backref(ctx, sp, s, e, cur) {
+                            Some(nsp) => {
+                                sp = nsp;
+                                pc += 1;
+                            }
+                            None => break,
+                        },
+                        // An unmatched group backreference matches the empty string.
+                        _ => pc += 1,
                     }
-                });
-                match span {
-                    Some((s, e)) => {
-                        if let Some(nsp) = match_backref(ctx, sp, s, e, cur) {
-                            sp = nsp;
-                            pc += 1;
-                        } else {
-                            return false;
-                        }
+                }
+                Inst::Assert(assert) => {
+                    if assert_ok(assert, ctx.input, sp, cur) {
+                        pc += 1;
+                    } else {
+                        break;
                     }
-                    None => pc += 1,
+                }
+                Inst::PushFlags(delta) => {
+                    // Enter an inline-modifier scope; unwinding past this point
+                    // pops it again.
+                    cur = delta.apply(cur);
+                    flags_stack.push(cur);
+                    stack.push(Frame::FlagsPop);
+                    pc += 1;
+                }
+                Inst::PopFlags => {
+                    // Leave the innermost modifier scope; unwinding past this
+                    // point re-enters it.
+                    if let Some(f) = flags_stack.pop() {
+                        stack.push(Frame::FlagsPush(f));
+                    }
+                    cur = *flags_stack.last().unwrap_or(&ctx.flags);
+                    pc += 1;
                 }
             }
-            Inst::Look { neg, prog } => {
-                // Zero-width: run the sub-program at `sp`. A *positive* lookahead
-                // propagates the groups its sub-match captured to the outer match
-                // (`/(?=(\d+))/.exec("123")` captures `"123"`); a *negative* one
-                // contributes nothing. Seed the sub-saves from the current saves so
-                // groups already bound outside (and backrefs to them) stay visible
-                // inside the assertion.
-                let sub = Ctx {
-                    prog,
-                    input: ctx.input,
-                    flags: cur,
-                    match_end: None,
-                    // A lookahead always matches forward, even inside a lookbehind.
-                    reverse: false,
-                    steps: ctx.steps,
-                    budget: ctx.budget,
-                };
-                let mut sub_saves = saves.clone();
-                let mut sub_marks = Vec::new();
-                // The sub-program starts under the flags in effect at the
-                // assertion (so an enclosing `(?i:…(?=…)…)` is honored).
-                let mut sub_flags = alloc::vec![cur];
-                let matched = backtrack(
-                    &sub,
-                    0,
-                    sp,
-                    &mut sub_saves,
-                    depth + 1,
-                    &mut sub_marks,
-                    &mut sub_flags,
-                );
-                if matched == *neg {
-                    return false;
-                }
-                if *neg {
-                    // Negative lookahead: zero-width, no captures contributed.
-                    pc += 1;
-                    continue;
-                }
-                // Positive: adopt the sub-match's captures, then continue. On a
-                // later failure restore the originals so backtracking past the
-                // assertion is sound.
-                let saved = core::mem::replace(saves, sub_saves);
-                if backtrack(ctx, pc + 1, sp, saves, depth + 1, marks, flags_stack) {
-                    return true;
-                }
-                *saves = saved;
+        }
+
+        // The path failed: unwind to the most recent choice point, undoing every
+        // state change made since it, and resume there.
+        'unwind: loop {
+            let Some(frame) = stack.pop() else {
                 return false;
-            }
-            Inst::LookBehind { neg, prog } => {
-                // The body is compiled *in reverse* (ECMAScript direction `-1`), so
-                // run it once starting at `sp` and consuming the subject backward:
-                // it succeeds when it reaches `Match` at some start position `<= sp`.
-                // Matching right-to-left is what makes greedy quantifiers bind from
-                // the right and capture groups record their rightmost iteration
-                // (e.g. `(?<=(\w){3})` capturing the leftmost of the three units).
-                // A *positive* lookbehind propagates the captures of the matched
-                // substring; a *negative* one contributes nothing.
-                let sub = Ctx {
-                    prog,
-                    input: ctx.input,
-                    flags: cur,
-                    match_end: None,
-                    reverse: true,
-                    steps: ctx.steps,
-                    budget: ctx.budget,
-                };
-                let mut sub_saves = saves.clone();
-                let mut sub_marks = Vec::new();
-                let mut sub_flags = alloc::vec![cur];
-                let matched = backtrack(
-                    &sub,
-                    0,
-                    sp,
-                    &mut sub_saves,
-                    depth + 1,
-                    &mut sub_marks,
-                    &mut sub_flags,
-                );
-                if matched == *neg {
-                    return false;
+            };
+            match frame {
+                Frame::Alt { pc: p, sp: s } => {
+                    pc = p;
+                    sp = s;
+                    break 'unwind;
                 }
-                if *neg {
-                    pc += 1;
-                    continue;
+                Frame::Save { slot, old } => saves[slot] = old,
+                Frame::Clear { lo, n } => {
+                    let from = slots.len() - n;
+                    saves[lo..lo + n].copy_from_slice(&slots[from..]);
+                    slots.truncate(from);
                 }
-                let saved = core::mem::replace(saves, sub_saves);
-                if backtrack(ctx, pc + 1, sp, saves, depth + 1, marks, flags_stack) {
-                    return true;
+                Frame::Saves => {
+                    let from = slots.len() - saves.len();
+                    saves.copy_from_slice(&slots[from..]);
+                    slots.truncate(from);
                 }
-                *saves = saved;
-                return false;
-            }
-            Inst::Backref(g) => {
-                match (
-                    saves.get(2 * g).copied().flatten(),
-                    saves.get(2 * g + 1).copied().flatten(),
-                ) {
-                    (Some(s), Some(e)) => {
-                        // Backrefs compare raw code units (a captured span is a
-                        // run of units); case folding is applied unit-by-unit.
-                        if let Some(nsp) = match_backref(ctx, sp, s, e, cur) {
-                            sp = nsp;
-                            pc += 1;
-                        } else {
-                            return false;
-                        }
-                    }
-                    // An unmatched group backreference matches the empty string.
-                    _ => pc += 1,
+                Frame::MarkPop => {
+                    marks.pop();
                 }
-            }
-            Inst::Assert(assert) => {
-                if assert_ok(assert, ctx.input, sp, cur) {
-                    pc += 1;
-                } else {
-                    return false;
+                Frame::MarkPush(m) => marks.push(m),
+                Frame::FlagsPop => {
+                    flags_stack.pop();
+                    cur = *flags_stack.last().unwrap_or(&ctx.flags);
                 }
-            }
-            Inst::PushFlags(delta) => {
-                // Enter an inline-modifier scope: push the adjusted flags and run
-                // the remainder recursively so the push is undone on every exit
-                // path (success, failure, or backtrack), keeping the stack sound.
-                flags_stack.push(delta.apply(cur));
-                let r = backtrack(ctx, pc + 1, sp, saves, depth + 1, marks, flags_stack);
-                flags_stack.pop();
-                return r;
-            }
-            Inst::PopFlags => {
-                // Leave the innermost modifier scope: pop, run the remainder under
-                // the restored flags, then push back so the caller's stack is
-                // unchanged on return.
-                let restored = flags_stack.pop();
-                let r = backtrack(ctx, pc + 1, sp, saves, depth + 1, marks, flags_stack);
-                if let Some(f) = restored {
+                Frame::FlagsPush(f) => {
                     flags_stack.push(f);
+                    cur = f;
                 }
-                return r;
+                Frame::Run {
+                    cont,
+                    first,
+                    mut p,
+                    flags,
+                } => loop {
+                    // A continuation that must begin with a literal unit is only
+                    // entered where that unit is.
+                    let candidate = !continuation_cannot_start(ctx, cont, p, flags);
+                    let at_first = p == first;
+                    let here = p;
+                    if !at_first {
+                        p = if ctx.reverse { p + 1 } else { p - 1 };
+                    }
+                    if candidate {
+                        if !at_first {
+                            stack.push(Frame::Run {
+                                cont,
+                                first,
+                                p,
+                                flags,
+                            });
+                        }
+                        pc = cont;
+                        sp = here;
+                        break 'unwind;
+                    }
+                    if !ctx.tick() {
+                        return false;
+                    }
+                    if at_first {
+                        break;
+                    }
+                },
+                Frame::Positions { cont, base } => {
+                    if let Some(p) = positions.pop() {
+                        if positions.len() > base {
+                            stack.push(Frame::Positions { cont, base });
+                        }
+                        pc = cont;
+                        sp = p;
+                        break 'unwind;
+                    }
+                }
+                Frame::Lazy {
+                    consume,
+                    cont,
+                    sp: at,
+                    flags,
+                } => {
+                    if let Some(nsp) =
+                        consume_one(&ctx.prog[consume], ctx.input, at, flags, ctx.reverse)
+                    {
+                        stack.push(Frame::Lazy {
+                            consume,
+                            cont,
+                            sp: nsp,
+                            flags,
+                        });
+                        pc = cont;
+                        sp = nsp;
+                        break 'unwind;
+                    }
+                }
             }
         }
     }

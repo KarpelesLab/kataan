@@ -1631,3 +1631,27 @@ fn method_call_reads_the_callee_before_its_arguments() {
         "get,arg1,f1,get,arg2,f2,trap,arg3,g3,old4,new5,r6,tag,arg7,t7,v8|9|2500"
     );
 }
+
+/// A quantified group iterated thousands of times still matches. The regex
+/// backtracker recursed once per choice point and capture save, and past a
+/// fixed recursion cap it reported a silent "no match": `/(?:ab)+c/` failed
+/// on `"ab".repeat(2000) + "c"`. Choice points now live on an explicit heap
+/// stack, so only lookarounds recurse.
+#[test]
+fn long_quantified_group_iterations_still_match() {
+    let src = r#"
+        var r = [];
+        var s = "ab".repeat(20000) + "c";
+        r.push(/(?:ab)+c/.test(s), /(ab)+c/.exec(s)[1], /^(?:ab)*c$/.test(s), /(?:a|b)+c/.test(s));
+        r.push(/(?:ab)+?c/.test(s), /(?:a.)+c/.exec(s).index, /((?:ab){2})+c/.exec(s)[0].length);
+        r.push(/(?:(?=a)ab)+c/.test(s), /(?:(?<=b|^)ab)+c/.test(s), /(?:(?i:AB))+c/.test(s));
+        var csv = "x,".repeat(5000) + "end";
+        r.push(/^(?:[^,]*,)+end$/.test(csv), csv.match(/(?:([^,]*),)+/)[1]);
+        r.push(/(a+)+b/.test("a".repeat(30)));
+        r.join()
+    "#;
+    assert_eq!(
+        run(src),
+        "true,ab,true,true,true,0,40001,true,true,true,true,x,false"
+    );
+}

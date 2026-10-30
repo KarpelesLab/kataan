@@ -56,8 +56,11 @@ pub const DEFAULT_MAX_PARSE_DEPTH: u32 = 300;
 /// Default base of the regex backtracking step budget (per find operation;
 /// scaled by the subject length at run time).
 pub const DEFAULT_REGEX_STEP_BASE: u64 = 300_000;
-/// Default maximum regex backtracking recursion depth.
+/// Default maximum regex lookaround nesting depth during matching.
 pub const DEFAULT_REGEX_MAX_DEPTH: u32 = 2_000;
+/// Default maximum regex backtrack-stack length (choice points plus undo
+/// records) of one match attempt.
+pub const DEFAULT_REGEX_MAX_BACKTRACK_STACK: usize = 4_000_000;
 /// Default maximum regex *pattern* parser nesting depth (groups/lookaround).
 pub const DEFAULT_REGEX_MAX_PARSE_DEPTH: u32 = 300;
 /// Default value a `{n,m}` quantifier bound saturates to.
