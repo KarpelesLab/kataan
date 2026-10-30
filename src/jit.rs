@@ -6545,9 +6545,12 @@ impl JitFunction {
         // arena in `r10`/`rdx`.
         macro_rules! recv_slot {
             ($at:expr, $recv:expr, $miss:expr, $fam:expr) => {{ recv_slot!($at, $recv, $miss, $fam, None) }};
+            ($at:expr, $recv:expr, $miss:expr, $fam:expr, $walked:expr) => {{ recv_slot!($at, $recv, $miss, $fam, $walked, true) }};
             // `$walked`: where a way miss's full walk resumes instead of
-            // the hit path's continuation.
-            ($at:expr, $recv:expr, $miss:expr, $fam:expr, $walked:expr) => {{
+            // the hit path's continuation. `$cell`: whether a known site's
+            // fast path reads the heap slot (`rcx`) at all (a load through
+            // the frame's `extra` pointer alone does not).
+            ($at:expr, $recv:expr, $miss:expr, $fam:expr, $walked:expr, $cell:expr) => {{
                 // A way holds one family's fills only (or a hit would skip
                 // checks its fill never made).
                 if rc.sites[$at].is_some_and(|p| p.family != $fam) {
@@ -6560,7 +6563,9 @@ impl JitFunction {
                     Some(recv_cache::SitePlan {
                         way, known: true, ..
                     }) if num.in_region($at) => {
-                        a.g_load(call_seq::r::RCX, call_seq::r::RBP, rc_cell(way));
+                        if $cell {
+                            a.g_load(call_seq::r::RCX, call_seq::r::RBP, rc_cell(way));
+                        }
                     }
                     Some(recv_cache::SitePlan {
                         way, check: true, ..
@@ -7794,11 +7799,57 @@ impl JitFunction {
                     // line (`cold_verifies`).
                     let known = s.baked.filter(|b| shape_known(op_idx, b.shape));
                     let verify = known.map(|_| a.new_label());
-                    recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj, verify);
+                    // In a speculative loop's fast version, a promoted
+                    // result of a compiled-in layout is loaded straight into
+                    // its SSE register: every other path leaves for the
+                    // plain copy. (`p.have`: the frame holds the receiver's
+                    // `extra` pointer, as its predecessor of the iteration
+                    // left it.)
+                    let direct = s.baked.zip(num.result_xmm(op_idx, dst)).and_then(|(b, x)| {
+                        let p = rc.sites[op_idx].filter(|_| num.in_spec(op_idx))?;
+                        let have = p.known && p.pred.is_some_and(|q| extra_in_frame[q]);
+                        Some((b, x, p, have))
+                    });
+                    let direct =
+                        direct.and_then(|d| num.spec_bail(&mut a, op_idx).map(|bl| (d, bl)));
+                    let cell = !matches!(direct, Some(((b, _, p, have), _))
+                        if p.known && known.is_some()
+                            && !X64Assembler::p_fixed_slot_needs_rcx(&layout, b.slot, have));
+                    recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj, verify, cell);
                     if known.is_none() {
                         a.mov_rax_at_rcx(layout.off_shape);
                     }
-                    if let Some(b) = s.baked {
+                    if let Some(((b, x, p, have), bail)) = direct {
+                        let cached = a.new_label();
+                        if let Some(verify) = verify {
+                            let resume = a.new_label();
+                            a.bind(resume);
+                            cold_verifies.push((verify, None, b.shape, cached, resume));
+                        } else {
+                            a.g_movabs(call_seq::r::R11, b.shape);
+                            a.cmp_rax_r11();
+                            a.jne(cached);
+                        }
+                        extra_in_frame[op_idx] = a.p_obj_fixed_slot_ex_xmm(
+                            &layout,
+                            b.slot,
+                            Some(rc_extra(p.way)),
+                            have,
+                            x,
+                        );
+                        cold_bails.push((cached, bail));
+                        // (`done`: no path of the fast version reaches it.)
+                        let past = a.new_label();
+                        let back = a.new_label();
+                        let spill = a.new_label();
+                        cold_reloads.push((spill, back, done, past, op_idx));
+                        let mark = a.cold_begin();
+                        a.bind(back);
+                        numeric::NumGen::set_xmm_from_rax(&mut a, x);
+                        a.jmp(past);
+                        a.cold_end(mark);
+                        ool_past = Some(past);
+                    } else if let Some(b) = s.baked {
                         // The layout the site settled on, compiled in: one
                         // compare with the shape, one load at a fixed
                         // offset; any other shape takes the cache path
@@ -7971,7 +8022,26 @@ impl JitFunction {
                     // path, an add, another layout than the compiled-in one
                     // (a known site's way must keep proving it).
                     let bail = num.spec_bail(&mut a, op_idx);
-                    recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj, verify);
+                    // A known site of the fast version whose flags test is
+                    // proven, storing a Number through the frame's `extra`
+                    // pointer, never reads the heap slot (`rcx`).
+                    let cell = !(num.in_region(op_idx)
+                        && bail.is_some()
+                        && num.is_number_at(op_idx, val)
+                        && known.is_some_and(|b| {
+                            rc.sites[op_idx].is_some_and(|p| {
+                                p.known
+                                    && p.flags_from.is_some_and(|q| {
+                                        set_proven.get(q).copied().unwrap_or(false)
+                                    })
+                                    && !X64Assembler::p_fixed_slot_needs_rcx(
+                                        &layout,
+                                        b.slot,
+                                        p.pred.is_some_and(|q| extra_in_frame[q]),
+                                    )
+                            })
+                        }));
+                    recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj, verify, cell);
                     // A site the interpreter saw add one key to one layout
                     // tries that add first, compiled in, and has everything
                     // else out of line (in a speculative loop's fast version
