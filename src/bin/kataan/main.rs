@@ -34,6 +34,7 @@ fn main() -> ExitCode {
 }
 
 fn run_main() -> ExitCode {
+    kataan::stack::set_thread_stack_size(512 * 1024 * 1024);
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
 

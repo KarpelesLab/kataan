@@ -515,7 +515,7 @@ impl Interp {
             let m = self.new_str("Converting circular structure to JSON");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
-        if cx.stack.len() >= self.realm.limits.max_json_depth {
+        if cx.stack.len() >= self.realm.limits.max_json_depth || crate::stack::exhausted() {
             let m = self.new_str("Maximum call stack size exceeded");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }
@@ -759,7 +759,9 @@ impl Interp {
         let Some(&ch) = c.get(*pos) else {
             return Err(err(self));
         };
-        if matches!(ch, '[' | '{') && depth >= self.realm.limits.max_json_depth {
+        if matches!(ch, '[' | '{')
+            && (depth >= self.realm.limits.max_json_depth || crate::stack::exhausted())
+        {
             return Err(self.json_error("Maximum JSON nesting depth exceeded"));
         }
         match ch {
@@ -895,7 +897,9 @@ impl Interp {
         let Some(&ch) = c.get(*pos) else {
             return Err(self.json_error("Unexpected end of JSON input"));
         };
-        if matches!(ch, '[' | '{') && depth >= self.realm.limits.max_json_depth {
+        if matches!(ch, '[' | '{')
+            && (depth >= self.realm.limits.max_json_depth || crate::stack::exhausted())
+        {
             return Err(self.json_error("Maximum JSON nesting depth exceeded"));
         }
         // Helper: the source substring `c[start..*pos]` collected as a String.

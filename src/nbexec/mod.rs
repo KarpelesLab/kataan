@@ -5580,7 +5580,7 @@ impl Interp {
         }
         let mut table = self.vm_table_vec();
         let main = crate::nbvm::compile_program_into(program, true, &mut table)
-            .map_err(|_| ExecError::Unsupported("the bytecode compiler refused this program"))?;
+            .map_err(|e| self.compile_error(&e, "the bytecode compiler refused this program"))?;
         let table: alloc::rc::Rc<[crate::nbvm::FnProto]> = table.into();
         // Installed for good, not just for this run: closures the script leaves
         // behind (in globals, timers, promise reactions) stay callable after it.
@@ -6639,6 +6639,33 @@ impl Interp {
             .and_then(|ns| ns.as_handle())
             .map(Handle::from_raw)
             .and_then(|ns| self.realm.get_property(ns, name))
+    }
+
+    /// The `RangeError` a recursion that ran out of native stack throws.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn stack_exhausted(&mut self) -> ExecError {
+        let m = self.new_str(crate::nbvm::STACK_EXHAUSTED);
+        ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m)))
+    }
+
+    /// A compile failure as an interpreter completion: a program nested too
+    /// deep for the native stack, or one needing more registers than a frame
+    /// has (`f(f(f(…)))` some 14,000 deep), is a thrown `RangeError`; any
+    /// other refusal is the engine limitation `refused`.
+    pub(crate) fn compile_error(
+        &mut self,
+        e: &crate::nbvm::CompileError,
+        refused: &'static str,
+    ) -> ExecError {
+        match e {
+            crate::nbvm::CompileError::TooDeep => self.stack_exhausted(),
+            crate::nbvm::CompileError::Unsupported(crate::nbvm::TOO_MANY_REGISTERS) => {
+                let m = self.new_str(crate::nbvm::TOO_MANY_REGISTERS);
+                ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m)))
+            }
+            _ => ExecError::Unsupported(refused),
+        }
     }
 
     fn make_error(&mut self, id: u16, message: Option<NanBox>) -> NanBox {

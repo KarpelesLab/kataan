@@ -76,6 +76,26 @@ impl JsonParser<'_> {
     }
 }
 
+/// A container [`Interp::json_fast_value`] has open: an array's elements so
+/// far, or an object with the count of properties added and the key whose
+/// value is being parsed.
+enum Open {
+    Array(Vec<NanBox>),
+    Object {
+        obj: Handle,
+        ordinal: usize,
+        key: JsonKey,
+    },
+}
+
+/// A property name: the key a transition cache was armed for (by the
+/// cache's index), a range of the input (no escapes), or decoded.
+enum JsonKey {
+    Cached(usize),
+    Borrowed(usize, usize),
+    Owned(alloc::string::String),
+}
+
 /// Where a string token ended up: borrowed from the input (no escapes) or
 /// decoded into the parser's scratch buffer (WTF-8).
 enum JsonStr {
@@ -94,7 +114,7 @@ impl Interp {
             caches: Vec::new(),
             buf: Vec::new(),
         };
-        let value = self.json_fast_value(&mut p, 0)?;
+        let value = self.json_fast_value(&mut p)?;
         p.skip_ws();
         if p.pos != p.src.len() {
             return Err(self.json_error("Unexpected token in JSON"));
@@ -102,25 +122,23 @@ impl Interp {
         Ok(value)
     }
 
-    fn json_fast_value(
-        &mut self,
-        p: &mut JsonParser<'_>,
-        depth: usize,
-    ) -> Result<NanBox, ExecError> {
-        p.skip_ws();
-        let Some(ch) = p.peek() else {
-            return Err(self.json_error("Unexpected end of JSON input"));
-        };
-        if matches!(ch, b'[' | b'{') && depth >= self.realm.limits.max_json_depth {
-            return Err(self.json_error("Maximum JSON nesting depth exceeded"));
-        }
-        match ch {
-            b'n' => self.json_fast_lit(p, b"null", NanBox::null()),
-            b't' => self.json_fast_lit(p, b"true", NanBox::boolean(true)),
-            b'f' => self.json_fast_lit(p, b"false", NanBox::boolean(false)),
-            b'"' => {
-                let s = self.json_fast_string(p)?;
-                Ok(match s {
+    /// One JSON value at the cursor. Iterative: the open arrays and objects
+    /// live on an explicit stack rather than the native one, so nesting is
+    /// bounded by memory, not by stack (`JSON.parse("[".repeat(1e6) + …)`
+    /// works). The finished value is heap cells, which the collector marks
+    /// from a worklist, so nothing about it recurses either.
+    fn json_fast_value(&mut self, p: &mut JsonParser<'_>) -> Result<NanBox, ExecError> {
+        let mut open: Vec<Open> = Vec::new();
+        'value: loop {
+            p.skip_ws();
+            let Some(ch) = p.peek() else {
+                return Err(self.json_error("Unexpected end of JSON input"));
+            };
+            let mut v = match ch {
+                b'n' => self.json_fast_lit(p, b"null", NanBox::null())?,
+                b't' => self.json_fast_lit(p, b"true", NanBox::boolean(true))?,
+                b'f' => self.json_fast_lit(p, b"false", NanBox::boolean(false))?,
+                b'"' => match self.json_fast_string(p)? {
                     // A one-byte (ASCII) string is the realm's shared unit
                     // string (strings are values: sharing is invisible).
                     JsonStr::Borrowed(a, b) if b == a + 1 => {
@@ -136,114 +154,143 @@ impl Interp {
                         let bytes = p.buf.clone();
                         self.new_str_bytes(bytes)
                     }
-                })
-            }
-            b'[' => {
-                p.pos += 1;
-                let mut elems = Vec::new();
-                p.skip_ws();
-                if p.peek() == Some(b']') {
+                },
+                b'[' => {
                     p.pos += 1;
-                    return Ok(NanBox::handle(self.realm.new_array(elems).to_raw()));
-                }
-                loop {
-                    let v = self.json_fast_value(p, depth + 1)?;
-                    elems.push(v);
                     p.skip_ws();
-                    match p.peek() {
-                        Some(b',') => p.pos += 1,
-                        Some(b']') => {
-                            p.pos += 1;
-                            break;
-                        }
-                        _ => return Err(self.json_error("Expected ',' or ']'")),
+                    if p.peek() == Some(b']') {
+                        p.pos += 1;
+                        NanBox::handle(self.realm.new_array(Vec::new()).to_raw())
+                    } else {
+                        open.push(Open::Array(Vec::new()));
+                        continue 'value;
                     }
                 }
-                Ok(NanBox::handle(self.realm.new_array(elems).to_raw()))
-            }
-            b'{' => {
-                p.pos += 1;
-                let obj = self.realm.new_object();
-                p.skip_ws();
-                if p.peek() == Some(b'}') {
+                b'{' => {
                     p.pos += 1;
-                    return Ok(NanBox::handle(obj.to_raw()));
-                }
-                let mut ordinal = 0usize;
-                loop {
+                    let obj = self.realm.new_object();
                     p.skip_ws();
-                    // The key this position's transition cache was armed for,
-                    // when the input spells it out verbatim (no escapes):
-                    // then the property name needs no scan and no compare.
-                    if let Some(idx) = p.cached_key_at(depth, ordinal) {
-                        p.skip_ws();
-                        if p.peek() != Some(b':') {
-                            return Err(self.json_error("Expected ':'"));
-                        }
+                    if p.peek() == Some(b'}') {
                         p.pos += 1;
-                        let v = self.json_fast_value(p, depth + 1)?;
-                        let added = match &mut p.caches[idx] {
-                            Some((k, cache)) => {
-                                self.realm.init_data_property_cached(obj, k, v, cache)
-                            }
-                            None => false,
-                        };
-                        if !added && let Some((k, _)) = &p.caches[idx] {
-                            self.realm.set_property(obj, k, v);
-                        }
-                        ordinal += 1;
+                        NanBox::handle(obj.to_raw())
+                    } else {
+                        let key = self.json_fast_key(p, open.len(), 0)?;
+                        open.push(Open::Object {
+                            obj,
+                            ordinal: 0,
+                            key,
+                        });
+                        continue 'value;
+                    }
+                }
+                b'-' | b'0'..=b'9' => self.json_fast_number(p)?,
+                _ => return Err(self.json_error("Unexpected token in JSON")),
+            };
+            // `v` is complete: hand it to the innermost open container, and
+            // close every container it completes.
+            loop {
+                let depth = open.len().saturating_sub(1);
+                match open.last_mut() {
+                    None => return Ok(v),
+                    Some(Open::Array(elems)) => {
+                        elems.push(v);
                         p.skip_ws();
                         match p.peek() {
-                            Some(b',') => p.pos += 1,
+                            Some(b',') => {
+                                p.pos += 1;
+                                continue 'value;
+                            }
+                            Some(b']') => {
+                                p.pos += 1;
+                                let Some(Open::Array(elems)) = open.pop() else {
+                                    unreachable!("the innermost container is this array");
+                                };
+                                v = NanBox::handle(self.realm.new_array(elems).to_raw());
+                            }
+                            _ => return Err(self.json_error("Expected ',' or ']'")),
+                        }
+                    }
+                    Some(Open::Object { obj, ordinal, key }) => {
+                        let (obj, n) = (*obj, *ordinal);
+                        *ordinal += 1;
+                        let text = p.text;
+                        match key {
+                            JsonKey::Cached(idx) => {
+                                let added = match &mut p.caches[*idx] {
+                                    Some((k, cache)) => {
+                                        self.realm.init_data_property_cached(obj, k, v, cache)
+                                    }
+                                    None => false,
+                                };
+                                if !added && let Some((k, _)) = &p.caches[*idx] {
+                                    self.realm.set_property(obj, k, v);
+                                }
+                            }
+                            JsonKey::Borrowed(a, b) => {
+                                let name = text.get(*a..*b).unwrap_or_default();
+                                self.json_fast_add(p, obj, depth, n, name, v);
+                            }
+                            JsonKey::Owned(name) => self.json_fast_add(p, obj, depth, n, name, v),
+                        }
+                        p.skip_ws();
+                        match p.peek() {
+                            Some(b',') => {
+                                p.pos += 1;
+                                let next = self.json_fast_key(p, depth, n + 1)?;
+                                if let Some(Open::Object { key, .. }) = open.last_mut() {
+                                    *key = next;
+                                }
+                                continue 'value;
+                            }
                             Some(b'}') => {
                                 p.pos += 1;
-                                break;
+                                open.pop();
+                                v = NanBox::handle(obj.to_raw());
                             }
                             _ => return Err(self.json_error("Expected ',' or '}'")),
                         }
-                        continue;
-                    }
-                    if p.peek() != Some(b'"') {
-                        return Err(self.json_error("Expected property name"));
-                    }
-                    // Keys live in the `&str`-keyed object layer; a lone surrogate
-                    // in a *key* (an exotic edge) decodes lossily.
-                    let text = p.text;
-                    let owned;
-                    let key: &str = match self.json_fast_string(p)? {
-                        JsonStr::Borrowed(a, b) => text.get(a..b).unwrap_or_default(),
-                        // (An unescaped run cannot hold a raw NUL; an escaped
-                        // `\u0000…` key is escaped into the user namespace, see
-                        // `realm::is_internal_key`.)
-                        JsonStr::Scratch => {
-                            owned =
-                                crate::realm::user_key_owned(crate::wtf8::to_string_lossy(&p.buf));
-                            &owned
-                        }
-                    };
-                    p.skip_ws();
-                    if p.peek() != Some(b':') {
-                        return Err(self.json_error("Expected ':'"));
-                    }
-                    p.pos += 1;
-                    let v = self.json_fast_value(p, depth + 1)?;
-                    self.json_fast_add(p, obj, depth, ordinal, key, v);
-                    ordinal += 1;
-                    p.skip_ws();
-                    match p.peek() {
-                        Some(b',') => p.pos += 1,
-                        Some(b'}') => {
-                            p.pos += 1;
-                            break;
-                        }
-                        _ => return Err(self.json_error("Expected ',' or '}'")),
                     }
                 }
-                Ok(NanBox::handle(obj.to_raw()))
             }
-            b'-' | b'0'..=b'9' => self.json_fast_number(p),
-            _ => Err(self.json_error("Unexpected token in JSON")),
         }
+    }
+
+    /// The name of property `ordinal` of an object at nesting `depth`, and its
+    /// `:`, the cursor at the whitespace before the name. Keys live in the
+    /// `&str`-keyed object layer; a lone surrogate in a *key* (an exotic edge)
+    /// decodes lossily.
+    fn json_fast_key(
+        &mut self,
+        p: &mut JsonParser<'_>,
+        depth: usize,
+        ordinal: usize,
+    ) -> Result<JsonKey, ExecError> {
+        p.skip_ws();
+        // The key this position's transition cache was armed for, when the
+        // input spells it out verbatim (no escapes): then the property name
+        // needs no scan and no compare.
+        let key = if let Some(idx) = p.cached_key_at(depth, ordinal) {
+            JsonKey::Cached(idx)
+        } else {
+            if p.peek() != Some(b'"') {
+                return Err(self.json_error("Expected property name"));
+            }
+            match self.json_fast_string(p)? {
+                JsonStr::Borrowed(a, b) => JsonKey::Borrowed(a, b),
+                // (An unescaped run cannot hold a raw NUL; an escaped
+                // `\u0000...` key is escaped into the user namespace, see
+                // `realm::is_internal_key`.)
+                JsonStr::Scratch => JsonKey::Owned(crate::realm::user_key_owned(
+                    crate::wtf8::to_string_lossy(&p.buf),
+                )),
+            }
+        };
+        p.skip_ws();
+        if p.peek() != Some(b':') {
+            return Err(self.json_error("Expected ':'"));
+        }
+        p.pos += 1;
+        Ok(key)
     }
 
     /// `CreateDataProperty(obj, key, v)` on the parser's fresh object, through

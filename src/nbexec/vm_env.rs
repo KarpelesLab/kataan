@@ -551,9 +551,9 @@ impl Interp {
                         if std::env::var_os("KATAAN_DEBUG_EVAL").is_some() {
                             std::eprintln!("eval compile: {_e:?}: {}", program.source);
                         }
-                        return Err(ExecError::Unsupported(
-                            "the bytecode compiler refused this eval code",
-                        ));
+                        return Err(
+                            self.compile_error(&_e, "the bytecode compiler refused this eval code")
+                        );
                     }
                     Ok(p) if scratch.is_empty() => p,
                     Ok(_) => {
@@ -562,8 +562,8 @@ impl Interp {
                         let p = crate::nbvm::compile_eval_code(
                             program, &mut full, strict, flags, privates,
                         )
-                        .map_err(|_| {
-                            ExecError::Unsupported("the bytecode compiler refused this eval code")
+                        .map_err(|e| {
+                            self.compile_error(&e, "the bytecode compiler refused this eval code")
                         })?;
                         crate::nbvm::resolve_source_text(&mut full[base..], &program.source);
                         // One growth chain with scripts and dynamic imports.

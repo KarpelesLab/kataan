@@ -582,7 +582,10 @@ fn official_test262() {
     // call-depth guard (a thrown RangeError), not a host overflow.
     std::thread::Builder::new()
         .stack_size(512 * 1024 * 1024)
-        .spawn(dispatch)
+        .spawn(|| {
+            kataan::stack::set_thread_stack_size(512 * 1024 * 1024);
+            dispatch();
+        })
         .expect("spawn corpus thread")
         .join()
         .expect("corpus thread");

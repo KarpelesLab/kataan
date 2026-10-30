@@ -7241,7 +7241,10 @@ impl Realm {
                     // A circular reference back to this array renders empty; so
                     // does nesting past the depth cap, so a deep acyclic array
                     // cannot overflow the host stack here.
-                    if seen.contains(&h) || seen.len() >= self.limits.max_display_depth {
+                    if seen.contains(&h)
+                        || (seen.len() >= self.limits.max_display_depth
+                            || crate::stack::exhausted())
+                    {
                         return alloc::string::String::new();
                     }
                     seen.push(h);
@@ -7378,7 +7381,10 @@ impl Realm {
                 Some(Cell::Proxy { target, .. }) => {
                     let target = *target;
                     let h = Handle::from_raw(raw);
-                    if seen.contains(&h) || seen.len() >= self.limits.max_display_depth {
+                    if seen.contains(&h)
+                        || (seen.len() >= self.limits.max_display_depth
+                            || crate::stack::exhausted())
+                    {
                         return alloc::string::String::new();
                     }
                     if self.is_callable_cell(target) {

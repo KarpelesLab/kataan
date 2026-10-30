@@ -1622,7 +1622,7 @@ impl Interp {
         }
         // Bound the recursion so a deep acyclic structure throws rather than
         // overflowing the host stack.
-        if seen.len() >= self.realm.limits.max_display_depth {
+        if seen.len() >= self.realm.limits.max_display_depth || crate::stack::exhausted() {
             let m = self.new_str("Maximum call stack size exceeded");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }

@@ -7380,7 +7380,7 @@ impl Interp {
     /// recursion limit it answers `true`, leaving `flatten` to raise its
     /// RangeError on a cyclic array.
     fn flat_snapshot_exact(&self, elems: &[NanBox], depth: i32, rec: usize) -> bool {
-        if depth <= 0 || rec >= self.realm.limits.max_display_depth {
+        if depth <= 0 || (rec >= self.realm.limits.max_display_depth || crate::stack::exhausted()) {
             return true;
         }
         for e in elems {
@@ -7410,7 +7410,7 @@ impl Interp {
         depth: i32,
         rec: usize,
     ) -> Result<Vec<NanBox>, ExecError> {
-        if rec >= self.realm.limits.max_display_depth {
+        if rec >= self.realm.limits.max_display_depth || crate::stack::exhausted() {
             let m = self.new_str("Maximum call stack size exceeded");
             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
         }

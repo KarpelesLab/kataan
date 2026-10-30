@@ -199,7 +199,7 @@ fn compile_eval_body(
     }
     c.ops.push(Op::Return { src: completion });
     if c.reg_overflow {
-        return Err(CompileError::Unsupported("too many registers"));
+        return Err(CompileError::Unsupported(super::TOO_MANY_REGISTERS));
     }
     Ok(finish_eval_proto(c, names.len()))
 }

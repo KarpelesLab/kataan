@@ -289,6 +289,7 @@ fn deep_expression_evaluates_without_overflowing() {
     let value = std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
+            crate::stack::set_thread_stack_size(64 * 1024 * 1024);
             let src = core::iter::repeat_n("1", 20_000)
                 .collect::<alloc::vec::Vec<_>>()
                 .join("+");
@@ -504,6 +505,7 @@ fn max_eval_depth_override_honored() {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
+            crate::stack::set_thread_stack_size(64 * 1024 * 1024);
             use crate::limits::Limits;
             let src = "function f(n) { return n ? eval('f(n - 1)') + 1 : 0; } \
                        var r; try { r = f(150); } catch (e) { r = e.constructor.name; } r";

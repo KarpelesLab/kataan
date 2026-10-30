@@ -185,8 +185,10 @@ impl Interp {
         let limits = self.realm.limits;
         match std::thread::Builder::new()
             .stack_size(WORKER_STACK_BYTES)
-            .spawn(move || worker_main(worker_pool, id, full, limits))
-        {
+            .spawn(move || {
+                crate::stack::set_thread_stack_size(WORKER_STACK_BYTES);
+                worker_main(worker_pool, id, full, limits);
+            }) {
             Ok(h) => self.agent.workers.push(h),
             Err(_) => return Err(self.type_error("$262.agent.start: cannot spawn an agent")),
         }

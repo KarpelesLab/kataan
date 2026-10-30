@@ -39,7 +39,9 @@ pub const DEFAULT_MAX_CALL_DEPTH: usize = 3500;
 pub const DEFAULT_MAX_EVAL_DEPTH: usize = 1500;
 /// Default maximum try/catch handler-stack depth.
 pub const DEFAULT_MAX_HANDLER_DEPTH: usize = 100_000;
-/// Default maximum `JSON.parse`/`JSON.stringify` nesting depth.
+/// Default maximum `JSON.stringify` nesting depth (and that of the
+/// `JSON.parse` reviver walk). A reviver-less `JSON.parse` is iterative and
+/// bounded by memory only.
 pub const DEFAULT_MAX_JSON_DEPTH: usize = 2000;
 /// Default maximum recursion depth when stringifying a value for display.
 pub const DEFAULT_MAX_DISPLAY_DEPTH: usize = 1000;
@@ -51,8 +53,10 @@ pub const DEFAULT_MAX_ARRAY_LEN: usize = 100_000_000;
 pub const DEFAULT_MAX_BIGINT_BITS: u64 = 1 << 30;
 /// Default own-property count past which an object switches to dictionary mode.
 pub const DEFAULT_OBJECT_DICTIONARY_THRESHOLD: usize = 128;
-/// Default maximum parser recursion depth (SyntaxError past this).
-pub const DEFAULT_MAX_PARSE_DEPTH: u32 = 300;
+/// Default maximum parser recursion depth in hub levels (SyntaxError past
+/// this). Native stack headroom ([`crate::stack`]) is the real bound; this is
+/// a backstop.
+pub const DEFAULT_MAX_PARSE_DEPTH: u32 = 100_000;
 /// Default base of the regex backtracking step budget (per find operation;
 /// scaled by the subject length at run time).
 pub const DEFAULT_REGEX_STEP_BASE: u64 = 300_000;

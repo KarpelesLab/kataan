@@ -1389,7 +1389,10 @@ fn json_stringify_runaway_replacer_recursion_is_a_range_error() {
     "#;
     let out = std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || run(src))
+        .spawn(move || {
+            crate::stack::set_thread_stack_size(64 * 1024 * 1024);
+            run(src)
+        })
         .expect("spawn")
         .join()
         .expect("join");

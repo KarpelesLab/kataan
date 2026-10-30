@@ -32,23 +32,59 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec::Vec;
 
-/// Maximum recursive-descent nesting depth. Deeply nested source (e.g. a long
-/// run of unary operators, brackets, parens, or destructuring patterns) drives
-/// the parser into unbounded native recursion; without a cap this overflows the
-/// stack and `abort()`s — uncatchable by a library embedder linking the
-/// `alloc`-only core on a default ~8 MiB stack. The guard turns that into a
-/// recoverable syntax [`Error`].
+/// Maximum recursive-descent nesting depth, in levels counted at the
+/// recursion hubs. Deeply nested source (a long run of unary operators,
+/// brackets, parens, or destructuring patterns) drives the parser into native
+/// recursion, and an overflow `abort()`s — uncatchable by an embedder. What
+/// actually bounds that recursion is native stack: each hub compares the stack
+/// pointer with the parser's floor (a share of the headroom
+/// [`crate::stack`] reports, see [`PARSE_STACK_SHARE`]), so a parse goes as deep
+/// as the thread's stack allows in any build and fails with a recoverable
+/// syntax [`Error`] past it. On the CLI's 512 MiB thread that is tens of
+/// thousands of nested parens; on an undeclared thread
+/// ([`crate::stack::DEFAULT_STACK_BUDGET`]) a few hundred in release.
 ///
-/// This counts *logical* nesting levels at the recursion hubs, but a single
-/// level can span the whole expression ladder (`parse_assignment` →
-/// `parse_conditional` → … → `parse_unary` → `parse_primary` → `parse_paren` →
-/// back to `parse_assignment`), so each level costs a fair chunk of native
-/// stack. Measured against a release build, the deepest paths (`(((…`, `[[[…`)
-/// use roughly one level per ~3 KiB of stack; 300 levels therefore stays inside
-/// a 1 MiB stack with margin and leaves ~8x headroom on the stated 8 MiB target,
-/// while sitting comfortably in the few-hundred-to-~1000 range engines use and
-/// far above any realistic program's nesting.
+/// This level cap is a backstop on top of that, far above realistic code
+/// (node accepts ~1,500-3,000 nested parens): a paren costs three levels, so
+/// it allows ~33,000, which keeps the passes that are quadratic in nesting
+/// depth (each nested function scans its whole body for captures) in seconds
+/// on a huge stack.
 const MAX_PARSE_DEPTH: u32 = crate::limits::DEFAULT_MAX_PARSE_DEPTH;
+
+/// The message of the parser's nesting-limit syntax error.
+pub(crate) const NESTING_TOO_DEEP: &str = "maximum parser nesting depth exceeded";
+
+/// Of the native stack left when a parser is created, the share (out of 8)
+/// the parse itself may use. The passes over the finished tree (validation,
+/// compilation, drop) recurse as deep as the parse did, with frames of their
+/// own, and run from about the same stack depth; they get the rest.
+const PARSE_STACK_SHARE: usize = 4;
+
+/// The native stack charged per link of a chain the parser built
+/// iteratively (see [`Parser::chain_links`]), for the passes that recurse
+/// down it without a stack check of their own (chiefly `Drop`; the
+/// compiler's capture scan iterates along chains, and the validator and the
+/// compiler check the stack themselves). Measured on a 2 MiB thread with the
+/// default budget, those cost between 120 and 240 bytes a link in release;
+/// the passes may use the whole budget, twice the parse's share, so charging
+/// about the worst case leaves them a 2x margin. Debug builds have far larger
+/// frames.
+#[cfg(debug_assertions)]
+const CHAIN_LINK_STACK: usize = 1024;
+#[cfg(not(debug_assertions))]
+const CHAIN_LINK_STACK: usize = 256;
+
+/// The lowest stack address a parser created here may recurse to.
+fn parse_stack_floor() -> usize {
+    let sp = crate::stack::current_sp();
+    sp.saturating_sub(crate::stack::remaining() / 8 * PARSE_STACK_SHARE)
+}
+
+/// What [`Parser::chain_start`] saves: the enclosing subtree's low-water mark.
+#[derive(Clone, Copy)]
+struct ChainMark {
+    saved_low: usize,
+}
 
 /// A recursive-descent parser over a borrowed source string.
 pub struct Parser<'src> {
@@ -94,6 +130,16 @@ pub struct Parser<'src> {
     paren_invalid_target_spans: alloc::collections::BTreeSet<(u32, u32)>,
     /// Current recursive-descent nesting depth, bounded by [`MAX_PARSE_DEPTH`].
     depth: u32,
+    /// The lowest native-stack address this parse may recurse to: a share
+    /// ([`PARSE_STACK_SHARE`]) of the headroom [`crate::stack`] reported when
+    /// the parser was created. The rest is left for the passes that walk the
+    /// tree afterwards (validation, compilation, drop), whose recursion
+    /// mirrors the parser's.
+    stack_floor: usize,
+    /// The lowest stack address the current subtree's parse reached, lowered
+    /// further by the walker depth that iteratively parsed chains add (see
+    /// [`Parser::chain_links`]).
+    stack_low: usize,
     /// Whether the cursor is at the **module top level** — the direct statement
     /// list of a Module (a `ModuleItem` position). `import` / `export`
     /// declarations are only legal here; nested inside a block, a function body,
@@ -150,6 +196,8 @@ impl<'src> Parser<'src> {
             paren_expr_span: None,
             paren_invalid_target_spans: alloc::collections::BTreeSet::new(),
             depth: 0,
+            stack_floor: parse_stack_floor(),
+            stack_low: usize::MAX,
             module_top_level: false,
             module_goal: module,
         })
@@ -311,11 +359,63 @@ impl<'src> Parser<'src> {
     /// input cannot overflow the native stack and `abort()`. The guarded body
     /// runs against the returned guard's `parser` field.
     fn enter_recursion(&mut self) -> Result<DepthGuard<'_, 'src>> {
-        if self.depth >= MAX_PARSE_DEPTH {
-            return Err(self.err("maximum parser nesting depth exceeded"));
+        let sp = crate::stack::current_sp();
+        if self.depth >= MAX_PARSE_DEPTH || sp < self.stack_floor {
+            return Err(self.err(NESTING_TOO_DEEP));
+        }
+        if sp < self.stack_low {
+            self.stack_low = sp;
         }
         self.depth += 1;
         Ok(DepthGuard { parser: self })
+    }
+
+    /// Opens the stack accounting of an iteratively parsed chain (a binary,
+    /// logical, member or call chain): the subtree's low-water mark restarts
+    /// here. Pair with [`Self::chain_links`].
+    #[inline]
+    fn chain_start(&mut self) -> ChainMark {
+        let mark = ChainMark {
+            saved_low: self.stack_low,
+        };
+        self.stack_low = crate::stack::current_sp();
+        mark
+    }
+
+    /// Closes a chain of `links` links opened by [`Self::chain_start`]. The
+    /// parser builds a chain in a loop, but it is a left-nested tree, and the
+    /// passes over the tree recurse down it: the deepest operand sits `links`
+    /// levels below the chain, on top of however deep the operands' own parse
+    /// went. So the subtree's low-water mark is charged [`CHAIN_LINK_STACK`]
+    /// per link, and a chain too long for the stack left is a syntax error
+    /// here rather than a native stack overflow in a later pass.
+    /// Fails the parse as soon as a chain being built reaches `links` links
+    /// that the stack could not walk (see [`Self::chain_links`]). Checked per
+    /// link, not just at the end: on an error the partial tree is dropped, and
+    /// `Drop` recurses down the chain too.
+    #[inline]
+    fn chain_check(&self, links: usize) -> Result<()> {
+        if self
+            .stack_low
+            .saturating_sub(links.saturating_mul(CHAIN_LINK_STACK))
+            < self.stack_floor
+        {
+            return Err(self.err(NESTING_TOO_DEEP));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn chain_links(&mut self, mark: ChainMark, links: usize) -> Result<()> {
+        let mut low = self.stack_low;
+        if links != 0 {
+            low = low.saturating_sub(links.saturating_mul(CHAIN_LINK_STACK));
+            if low < self.stack_floor {
+                return Err(self.err(NESTING_TOO_DEEP));
+            }
+        }
+        self.stack_low = low.min(mark.saved_low);
+        Ok(())
     }
 
     fn err_at(&self, span: Span, message: impl Into<alloc::string::String>) -> Error {
@@ -330,6 +430,20 @@ impl<'src> Parser<'src> {
         if !self.at(TokenKind::Comma) {
             return Ok(first);
         }
+        self.parse_sequence_rest(first)
+    }
+
+    // A note on the `*_rest` functions below: the expression parser's nesting
+    // is bounded by native stack, so the frames on the path a nested operand
+    // takes (`(` → `parse_expression` → `parse_assignment` → … →
+    // `parse_primary` → `(`) are the depth limit. Each of those functions
+    // keeps only the common path inline and moves the rest — with its
+    // temporaries — into a `#[inline(never)]` continuation, so the frame that
+    // stays on the stack while an operand recurses is small.
+
+    /// The `, …` continuation of [`Self::parse_expression`].
+    #[inline(never)]
+    fn parse_sequence_rest(&mut self, first: Expr) -> Result<Expr> {
         let start = first.span();
         let mut expressions = alloc::vec![first];
         while self.eat(TokenKind::Comma) {
@@ -355,6 +469,16 @@ impl<'src> Parser<'src> {
             return self.parse_arrow();
         }
         let left = self.parse_conditional()?;
+        if assign_op(self.peek()).is_none() {
+            return Ok(left);
+        }
+        self.parse_assignment_rest(left)
+    }
+
+    /// The `= …` / `op= …` continuation of [`Self::parse_assignment_inner`],
+    /// the cursor at the assignment operator after the target `left`.
+    #[inline(never)]
+    fn parse_assignment_rest(&mut self, left: Expr) -> Result<Expr> {
         let Some(op) = assign_op(self.peek()) else {
             return Ok(left);
         };
@@ -420,11 +544,18 @@ impl<'src> Parser<'src> {
 
     /// `ConditionalExpression : ShortCircuit (`?` AssignmentExpression `:`
     /// AssignmentExpression)?`
+    #[inline(never)]
     fn parse_conditional(&mut self) -> Result<Expr> {
         let test = self.parse_short_circuit()?;
         if !self.at(TokenKind::Question) {
             return Ok(test);
         }
+        self.parse_conditional_rest(test)
+    }
+
+    /// The `? … : …` continuation of [`Self::parse_conditional`].
+    #[inline(never)]
+    fn parse_conditional_rest(&mut self, test: Expr) -> Result<Expr> {
         self.bump();
         // The branches are AssignmentExpressions; `in` is always allowed here.
         let consequent = self.without_no_in(Self::parse_assignment)?;
@@ -446,21 +577,28 @@ impl<'src> Parser<'src> {
     /// parentheses. Both branches start from a single `BitwiseOR` operand and
     /// then dispatch on the operator that follows.
     fn parse_short_circuit(&mut self) -> Result<Expr> {
+        let mark = self.chain_start();
         let first = self.parse_bitor()?;
-        match self.peek() {
-            TokenKind::QuestionQuestion => self.parse_coalesce(first),
-            TokenKind::AmpAmp | TokenKind::PipePipe => self.parse_logical_or(first),
-            _ => Ok(first),
-        }
+        let mut links = 0usize;
+        let expr = match self.peek() {
+            TokenKind::QuestionQuestion => self.parse_coalesce(first, &mut links)?,
+            TokenKind::AmpAmp | TokenKind::PipePipe => self.parse_logical_or(first, &mut links)?,
+            _ => first,
+        };
+        self.chain_links(mark, links)?;
+        Ok(expr)
     }
 
     /// A `??` chain whose operands are `BitwiseOR` expressions. A trailing
     /// `&&`/`||` is a mixing error.
-    fn parse_coalesce(&mut self, mut left: Expr) -> Result<Expr> {
+    #[inline(never)]
+    fn parse_coalesce(&mut self, mut left: Expr, links: &mut usize) -> Result<Expr> {
         while self.at(TokenKind::QuestionQuestion) {
             self.bump();
             let right = self.parse_bitor()?;
             left = logical(LogicalOp::Nullish, left, right);
+            *links += 1;
+            self.chain_check(*links)?;
         }
         if self.at(TokenKind::AmpAmp) || self.at(TokenKind::PipePipe) {
             return Err(self.err("`??` cannot be mixed with `||`/`&&` without parentheses"));
@@ -470,13 +608,16 @@ impl<'src> Parser<'src> {
 
     /// The `&&`/`||` chain, starting from an already-parsed `BitwiseOR`
     /// operand. A trailing `??` is a mixing error.
-    fn parse_logical_or(&mut self, first: Expr) -> Result<Expr> {
-        let mut left = self.continue_logical_and(first)?;
+    #[inline(never)]
+    fn parse_logical_or(&mut self, first: Expr, links: &mut usize) -> Result<Expr> {
+        let mut left = self.continue_logical_and(first, links)?;
         while self.at(TokenKind::PipePipe) {
             self.bump();
             let right_first = self.parse_bitor()?;
-            let right = self.continue_logical_and(right_first)?;
+            let right = self.continue_logical_and(right_first, links)?;
             left = logical(LogicalOp::Or, left, right);
+            *links += 1;
+            self.chain_check(*links)?;
         }
         if self.at(TokenKind::QuestionQuestion) {
             return Err(self.err("`??` cannot be mixed with `||`/`&&` without parentheses"));
@@ -486,125 +627,90 @@ impl<'src> Parser<'src> {
 
     /// Continues a `&&` chain over `BitwiseOR` operands, starting from an
     /// already-parsed left operand.
-    fn continue_logical_and(&mut self, mut left: Expr) -> Result<Expr> {
+    fn continue_logical_and(&mut self, mut left: Expr, links: &mut usize) -> Result<Expr> {
         while self.at(TokenKind::AmpAmp) {
             self.bump();
             let right = self.parse_bitor()?;
             left = logical(LogicalOp::And, left, right);
+            *links += 1;
+            self.chain_check(*links)?;
         }
         Ok(left)
     }
 
+    /// `BitwiseORExpression` — the whole left-associative binary band from `|`
+    /// down to `*`/`/`/`%`, by precedence climbing over
+    /// [`Self::binary_operator`]. One function for the eight precedence levels
+    /// keeps a parenthesized operand's trip back to `parse_assignment` to two
+    /// native frames here rather than eight (the parser's nesting depth is
+    /// bounded by native stack, so frames per level are depth).
     fn parse_bitor(&mut self) -> Result<Expr> {
-        let mut left = self.parse_bitxor()?;
-        while self.at(TokenKind::Pipe) {
-            self.bump();
-            let right = self.parse_bitxor()?;
-            left = binary(BinaryOp::BitOr, left, right);
-        }
-        Ok(left)
+        self.parse_binary(1)
     }
 
-    fn parse_bitxor(&mut self) -> Result<Expr> {
-        let mut left = self.parse_bitand()?;
-        while self.at(TokenKind::Caret) {
-            self.bump();
-            let right = self.parse_bitand()?;
-            left = binary(BinaryOp::BitXor, left, right);
-        }
-        Ok(left)
+    /// The binary operator at the cursor and its precedence (1 = `|` … 8 =
+    /// `*`), or `None` when the cursor is not at one. `in` is excluded while
+    /// [`Self::no_in`] is set (a `for` head).
+    fn binary_operator(&self) -> Option<(BinaryOp, u8)> {
+        Some(match self.peek() {
+            TokenKind::Pipe => (BinaryOp::BitOr, 1),
+            TokenKind::Caret => (BinaryOp::BitXor, 2),
+            TokenKind::Amp => (BinaryOp::BitAnd, 3),
+            TokenKind::EqEq => (BinaryOp::EqEq, 4),
+            TokenKind::BangEq => (BinaryOp::NotEq, 4),
+            TokenKind::EqEqEq => (BinaryOp::EqEqEq, 4),
+            TokenKind::BangEqEq => (BinaryOp::NotEqEq, 4),
+            TokenKind::Lt => (BinaryOp::Lt, 5),
+            TokenKind::Gt => (BinaryOp::Gt, 5),
+            TokenKind::LtEq => (BinaryOp::LtEq, 5),
+            TokenKind::GtEq => (BinaryOp::GtEq, 5),
+            TokenKind::Keyword(Kw::Instanceof) => (BinaryOp::Instanceof, 5),
+            TokenKind::Keyword(Kw::In) if !self.no_in => (BinaryOp::In, 5),
+            TokenKind::Shl => (BinaryOp::Shl, 6),
+            TokenKind::Shr => (BinaryOp::Shr, 6),
+            TokenKind::Ushr => (BinaryOp::Ushr, 6),
+            TokenKind::Plus => (BinaryOp::Add, 7),
+            TokenKind::Minus => (BinaryOp::Sub, 7),
+            TokenKind::Star => (BinaryOp::Mul, 8),
+            TokenKind::Slash => (BinaryOp::Div, 8),
+            TokenKind::Percent => (BinaryOp::Mod, 8),
+            _ => return None,
+        })
     }
 
-    fn parse_bitand(&mut self) -> Result<Expr> {
-        let mut left = self.parse_equality()?;
-        while self.at(TokenKind::Amp) {
-            self.bump();
-            let right = self.parse_equality()?;
-            left = binary(BinaryOp::BitAnd, left, right);
+    /// A left-associative binary chain whose operators all bind at least as
+    /// tightly as `min`. The right operand of an operator of precedence `p`
+    /// is a chain of operators tighter than `p`, so this recursion is at most
+    /// eight deep however long the chain; the chain itself is a loop (see
+    /// [`Self::chain_links`] for how its depth is accounted).
+    fn parse_binary(&mut self, min: u8) -> Result<Expr> {
+        let mark = self.chain_start();
+        let left = self.parse_exponent()?;
+        match self.binary_operator() {
+            Some((_, prec)) if prec >= min => self.parse_binary_rest(mark, left, min),
+            _ => {
+                self.chain_links(mark, 0)?;
+                Ok(left)
+            }
         }
-        Ok(left)
     }
 
-    fn parse_equality(&mut self) -> Result<Expr> {
-        let mut left = self.parse_relational()?;
-        loop {
-            let op = match self.peek() {
-                TokenKind::EqEq => BinaryOp::EqEq,
-                TokenKind::BangEq => BinaryOp::NotEq,
-                TokenKind::EqEqEq => BinaryOp::EqEqEq,
-                TokenKind::BangEqEq => BinaryOp::NotEqEq,
-                _ => break,
-            };
+    /// The operator loop of [`Self::parse_binary`], the cursor at an operator
+    /// of precedence at least `min` after the operand `left`.
+    #[inline(never)]
+    fn parse_binary_rest(&mut self, mark: ChainMark, mut left: Expr, min: u8) -> Result<Expr> {
+        let mut links = 0usize;
+        while let Some((op, prec)) = self.binary_operator() {
+            if prec < min {
+                break;
+            }
             self.bump();
-            let right = self.parse_relational()?;
+            let right = self.parse_binary(prec + 1)?;
             left = binary(op, left, right);
+            links += 1;
+            self.chain_check(links)?;
         }
-        Ok(left)
-    }
-
-    fn parse_relational(&mut self) -> Result<Expr> {
-        let mut left = self.parse_shift()?;
-        loop {
-            let op = match self.peek() {
-                TokenKind::Lt => BinaryOp::Lt,
-                TokenKind::Gt => BinaryOp::Gt,
-                TokenKind::LtEq => BinaryOp::LtEq,
-                TokenKind::GtEq => BinaryOp::GtEq,
-                TokenKind::Keyword(Kw::Instanceof) => BinaryOp::Instanceof,
-                TokenKind::Keyword(Kw::In) if !self.no_in => BinaryOp::In,
-                _ => break,
-            };
-            self.bump();
-            let right = self.parse_shift()?;
-            left = binary(op, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_shift(&mut self) -> Result<Expr> {
-        let mut left = self.parse_additive()?;
-        loop {
-            let op = match self.peek() {
-                TokenKind::Shl => BinaryOp::Shl,
-                TokenKind::Shr => BinaryOp::Shr,
-                TokenKind::Ushr => BinaryOp::Ushr,
-                _ => break,
-            };
-            self.bump();
-            let right = self.parse_additive()?;
-            left = binary(op, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_additive(&mut self) -> Result<Expr> {
-        let mut left = self.parse_multiplicative()?;
-        loop {
-            let op = match self.peek() {
-                TokenKind::Plus => BinaryOp::Add,
-                TokenKind::Minus => BinaryOp::Sub,
-                _ => break,
-            };
-            self.bump();
-            let right = self.parse_multiplicative()?;
-            left = binary(op, left, right);
-        }
-        Ok(left)
-    }
-
-    fn parse_multiplicative(&mut self) -> Result<Expr> {
-        let mut left = self.parse_exponent()?;
-        loop {
-            let op = match self.peek() {
-                TokenKind::Star => BinaryOp::Mul,
-                TokenKind::Slash => BinaryOp::Div,
-                TokenKind::Percent => BinaryOp::Mod,
-                _ => break,
-            };
-            self.bump();
-            let right = self.parse_exponent()?;
-            left = binary(op, left, right);
-        }
+        self.chain_links(mark, links)?;
         Ok(left)
     }
 
@@ -625,24 +731,30 @@ impl<'src> Parser<'src> {
     fn parse_exponent_inner(&mut self) -> Result<Expr> {
         let unary_lead = self.at_unary_operator();
         let base = self.parse_unary()?;
-        if self.at(TokenKind::StarStar) {
-            if unary_lead {
-                return Err(self.err_at(
-                    base.span(),
-                    "unary operator before `**` must be parenthesized",
-                ));
-            }
-            self.bump();
-            let exp = self.parse_exponent()?;
-            let span = base.span().to(exp.span());
-            return Ok(Expr::Binary {
-                op: BinaryOp::Exp,
-                left: Box::new(base),
-                right: Box::new(exp),
-                span,
-            });
+        if !self.at(TokenKind::StarStar) {
+            return Ok(base);
         }
-        Ok(base)
+        self.parse_exponent_rest(base, unary_lead)
+    }
+
+    /// The `** …` continuation of [`Self::parse_exponent_inner`].
+    #[inline(never)]
+    fn parse_exponent_rest(&mut self, base: Expr, unary_lead: bool) -> Result<Expr> {
+        if unary_lead {
+            return Err(self.err_at(
+                base.span(),
+                "unary operator before `**` must be parenthesized",
+            ));
+        }
+        self.bump();
+        let exp = self.parse_exponent()?;
+        let span = base.span().to(exp.span());
+        Ok(Expr::Binary {
+            op: BinaryOp::Exp,
+            left: Box::new(base),
+            right: Box::new(exp),
+            span,
+        })
     }
 
     /// Whether the current token begins a prefix *unary* operator (not the
@@ -748,12 +860,13 @@ impl<'src> Parser<'src> {
     // --- left-hand-side: new / call / member ----------------------------
 
     fn parse_lhs(&mut self) -> Result<Expr> {
+        let mark = self.chain_start();
         let head = if self.at(TokenKind::Keyword(Kw::New)) {
             self.parse_new()?
         } else {
             self.parse_primary()?
         };
-        self.parse_tails(head, true)
+        self.parse_tails(mark, head, true)
     }
 
     /// `new Callee` / `new Callee(args)` — the callee is a member expression
@@ -804,8 +917,9 @@ impl<'src> Parser<'src> {
         let callee = if self.at(TokenKind::Keyword(Kw::New)) {
             self.parse_new()?
         } else {
+            let mark = self.chain_start();
             let primary = self.parse_primary()?;
-            self.parse_tails(primary, false)?
+            self.parse_tails(mark, primary, false)?
         };
         let arguments = if self.at(TokenKind::LParen) {
             self.parse_arguments()?
@@ -823,9 +937,13 @@ impl<'src> Parser<'src> {
     /// Consumes the member/call/optional-chain/tagged-template tails after a
     /// primary or `new` expression. `allow_call` is false while parsing a
     /// `new` callee (so the parens bind to the `new`, not to a call).
-    fn parse_tails(&mut self, mut expr: Expr, allow_call: bool) -> Result<Expr> {
+    /// The member / call / tagged-template / optional-chain links after the
+    /// head `expr`, parsed in a loop. `mark` is the [`Self::chain_start`]
+    /// taken before the head was parsed, so the chain's accounting covers it.
+    fn parse_tails(&mut self, mark: ChainMark, mut expr: Expr, allow_call: bool) -> Result<Expr> {
         let start = expr.span();
         let mut saw_optional = false;
+        let mut links = 0usize;
         loop {
             match self.peek() {
                 TokenKind::Dot => {
@@ -906,13 +1024,17 @@ impl<'src> Parser<'src> {
                             span,
                         };
                     }
+                    self.chain_links(mark, links)?;
                     return Ok(expr);
                 }
             }
+            links += 1;
+            self.chain_check(links)?;
         }
     }
 
     /// Parses the link after a `?.` token: `?.prop`, `?.[expr]`, or `?.(args)`.
+    #[inline(never)]
     fn parse_optional_tail(&mut self, object: Expr, allow_call: bool) -> Result<Expr> {
         match self.peek() {
             TokenKind::LParen if allow_call => {
@@ -1054,6 +1176,19 @@ impl<'src> Parser<'src> {
         // it, so it never lingers past the primary it describes.
         self.paren_obj_arr_span = None;
         self.paren_expr_span = None;
+        // The nesting primaries dispatch from this small frame; the rest (whose
+        // arms build literals inline, with large temporaries) are out of line.
+        match self.peek() {
+            TokenKind::LParen => self.parse_paren(),
+            TokenKind::LBracket => self.parse_array(),
+            TokenKind::LBrace => self.parse_object(),
+            _ => self.parse_primary_other(),
+        }
+    }
+
+    /// [`Self::parse_primary`] for every token but `(`, `[` and `{`.
+    #[inline(never)]
+    fn parse_primary_other(&mut self) -> Result<Expr> {
         let tok = self.peek_tok();
         match tok.kind {
             TokenKind::Number => {
@@ -1352,6 +1487,7 @@ impl<'src> Parser<'src> {
 
     /// `( Expression )` — no parenthesized-expression node is retained; an
     /// empty `()` is only valid as an arrow head and is rejected here.
+    #[inline(never)]
     fn parse_paren(&mut self) -> Result<Expr> {
         self.expect(TokenKind::LParen)?;
         if self.at(TokenKind::RParen) {
@@ -1425,6 +1561,7 @@ impl<'src> Parser<'src> {
         }
     }
 
+    #[inline(never)]
     fn parse_array(&mut self) -> Result<Expr> {
         let start = self.expect(TokenKind::LBracket)?.span;
         let mut elements = Vec::new();
@@ -1468,6 +1605,7 @@ impl<'src> Parser<'src> {
         })
     }
 
+    #[inline(never)]
     fn parse_object(&mut self) -> Result<Expr> {
         let start = self.expect(TokenKind::LBrace)?.span;
         let mut members = Vec::new();
@@ -1487,6 +1625,7 @@ impl<'src> Parser<'src> {
         })
     }
 
+    #[inline(never)]
     fn parse_object_member(&mut self) -> Result<ObjectMember> {
         let start = self.cur_span();
         if self.eat(TokenKind::DotDotDot) {
@@ -1837,6 +1976,7 @@ impl<'src> Parser<'src> {
 
     /// Parses a `yield` / `yield*` expression (the caller has checked we are in
     /// a generator and the cursor is at `yield`).
+    #[inline(never)]
     fn parse_yield(&mut self) -> Result<Expr> {
         let start = self.bump().span; // `yield`
         // `yield [no LineTerminator here] * AssignmentExpression` — a line

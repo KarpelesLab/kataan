@@ -64,7 +64,9 @@ fn stringify_seen(
                 // A repeated handle is a cycle; depth past the cap is treated the
                 // same (the caller throws) so a deep acyclic structure cannot
                 // overflow the native stack.
-                if seen.contains(&h) || seen.len() >= realm.limits.max_json_depth {
+                if seen.contains(&h)
+                    || (seen.len() >= realm.limits.max_json_depth || crate::stack::exhausted())
+                {
                     return Err(Circular); // circular or too-deeply-nested structure
                 }
                 seen.push(h);
@@ -140,7 +142,9 @@ fn stringify_at(
             let inner = alloc::format!("{cur}{indent}");
             let is_container = realm.array_elements(h).is_some() || realm.object_keys(h).is_some();
             if is_container {
-                if seen.contains(&h) || seen.len() >= realm.limits.max_json_depth {
+                if seen.contains(&h)
+                    || (seen.len() >= realm.limits.max_json_depth || crate::stack::exhausted())
+                {
                     return Err(Circular); // circular or too-deeply-nested structure
                 }
                 seen.push(h);
@@ -257,7 +261,9 @@ fn parse_value(
     let Some(&ch) = c.get(*pos) else {
         return Err(String::from("Unexpected end of JSON input"));
     };
-    if matches!(ch, '[' | '{') && depth >= realm.limits.max_json_depth {
+    if matches!(ch, '[' | '{')
+        && (depth >= realm.limits.max_json_depth || crate::stack::exhausted())
+    {
         return Err(String::from("Maximum JSON nesting depth exceeded"));
     }
     match ch {

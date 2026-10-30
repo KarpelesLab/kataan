@@ -323,6 +323,13 @@ impl Interp {
         this_val: NanBox,
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
+        // Every call a built-in makes passes here, so this one check bounds
+        // the native recursion user data can drive through built-ins
+        // (`String(nestedArray)`: ToPrimitive → `toString` → `join` → ToString
+        // → …) with a catchable `RangeError` instead of a stack overflow.
+        if crate::stack::exhausted() {
+            return Err(self.stack_exhausted());
+        }
         let Some(raw) = callee.as_handle() else {
             // Calling a non-object (a primitive `undefined`/`null`/number/…) is a
             // JS `TypeError` — catchable by user `try/catch` — not an internal

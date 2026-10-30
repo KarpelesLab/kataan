@@ -152,7 +152,10 @@ fn test262_corpus_conformance() {
     // engine's call-depth guard (a thrown RangeError), not a host stack overflow.
     std::thread::Builder::new()
         .stack_size(512 * 1024 * 1024)
-        .spawn(corpus_conformance)
+        .spawn(|| {
+            kataan::stack::set_thread_stack_size(512 * 1024 * 1024);
+            corpus_conformance();
+        })
         .expect("spawn corpus thread")
         .join()
         .expect("corpus thread");

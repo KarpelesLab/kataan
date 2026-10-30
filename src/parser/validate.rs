@@ -268,6 +268,9 @@ impl Validator {
     // --- statements -----------------------------------------------------
 
     fn stmt(&mut self, stmt: &Stmt, ctx: &Ctx) -> Result<()> {
+        if crate::stack::exhausted() {
+            return Err(Error::syntax(crate::parser::NESTING_TOO_DEEP, stmt.span()));
+        }
         match stmt {
             Stmt::Expr { expression, .. } => self.expr(expression, ctx),
             Stmt::Block { body, .. } => {
@@ -1214,6 +1217,9 @@ impl Validator {
     // --- expressions ----------------------------------------------------
 
     fn expr(&mut self, e: &Expr, ctx: &Ctx) -> Result<()> {
+        if crate::stack::exhausted() {
+            return Err(Error::syntax(crate::parser::NESTING_TOO_DEEP, e.span()));
+        }
         // The destructuring-target flag applies only to the object/array literal
         // it was set for. Consume it here so that — by default — any expression
         // is validated as a value. The `Object`/`Array` arms read it (via

@@ -177,6 +177,7 @@ impl<'src> Parser<'src> {
 
     /// Parses an arrow function (the head is known to be an arrow via
     /// [`Self::at_arrow_head`]).
+    #[inline(never)]
     pub(super) fn parse_arrow(&mut self) -> Result<Expr> {
         let start = self.cur_span();
         let is_async = self.at(TokenKind::Keyword(Kw::Async)) && {

@@ -4539,10 +4539,15 @@ fn call_with(
     this_val: NanBox,
 ) -> Result<NanBox, VmError> {
     // Recursion guard: throw a catchable `RangeError` rather than overflowing.
+    // The count bounds JS recursion; the native-stack check bounds what a
+    // count cannot: activations reached through built-ins (a `toString`
+    // calling `join` calling `toString`…), whose native frames are larger and
+    // vary by build.
     if ctx.call_depth >= ctx.realm.limits.max_call_depth
         || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
+        || crate::stack::exhausted()
     {
-        let e = vm_error(ctx, "RangeError", "Maximum call stack size exceeded");
+        let e = vm_error(ctx, "RangeError", STACK_EXHAUSTED);
         return Err(VmError::Thrown(e));
     }
     ctx.call_depth += 1;
@@ -9756,7 +9761,7 @@ fn json_revive(
     reviver: NanBox,
     depth: usize,
 ) -> Result<NanBox, VmError> {
-    if depth >= ctx.realm.limits.max_json_depth {
+    if depth >= ctx.realm.limits.max_json_depth || crate::stack::exhausted() {
         return Err(VmError::Thrown(vm_error(
             ctx,
             "RangeError",
@@ -9841,7 +9846,7 @@ fn json_normalize(
     seen: &mut Vec<Handle>,
     depth: usize,
 ) -> Result<NanBox, VmError> {
-    if depth >= ctx.realm.limits.max_json_depth {
+    if depth >= ctx.realm.limits.max_json_depth || crate::stack::exhausted() {
         return Err(VmError::Thrown(vm_error(
             ctx,
             "RangeError",
@@ -12019,7 +12024,17 @@ pub enum CompileError {
     Unsupported(&'static str),
     /// A reference to a name not declared in scope.
     Undefined(String),
+    /// The program nests deeper than the native stack left can compile
+    /// (see [`crate::stack`]); surfaced to script as a `RangeError`.
+    TooDeep,
 }
+
+/// The message of the `RangeError` a native-stack exhaustion raises.
+pub const STACK_EXHAUSTED: &str = "Maximum call stack size exceeded";
+
+/// The refusal of a function that needs more registers than a frame can
+/// address; surfaced to script as a `RangeError`.
+pub const TOO_MANY_REGISTERS: &str = "too many registers";
 
 /// Compiles a (subset of a) program to [`Op`]s over the [`Realm`]/[`NanBox`]
 /// model and runs it, returning the completion value. Supports numeric/string/
@@ -12189,6 +12204,18 @@ pub(crate) fn import_export_in_script() -> crate::nbexec::Thrown {
 
 /// The error for a program the bytecode compiler refuses.
 pub(crate) fn compile_refused(e: &CompileError) -> crate::nbexec::Thrown {
+    let limit = match e {
+        CompileError::TooDeep => Some(STACK_EXHAUSTED),
+        CompileError::Unsupported(TOO_MANY_REGISTERS) => Some(TOO_MANY_REGISTERS),
+        _ => None,
+    };
+    if let Some(message) = limit {
+        return crate::nbexec::Thrown {
+            phase: crate::nbexec::ErrorPhase::Runtime,
+            name: String::from("RangeError"),
+            message: String::from(message),
+        };
+    }
     internal_error(&alloc::format!(
         "the bytecode compiler refused this program: {e:?}"
     ))
@@ -12807,6 +12834,18 @@ fn args_may_assign(arguments: &[crate::ast::Argument]) -> bool {
 /// by its parameters nor its local declarations (so they come from an enclosing
 /// scope — i.e. its captures).
 fn free_of_function(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<String> {
+    free_of_function_parts(params, body, None)
+}
+
+/// [`free_of_function`] of a body that is `body` followed by `return tail` —
+/// an expression-bodied arrow (`tail` with an empty `body`), scanned in place
+/// rather than by cloning the expression into a synthetic `return` statement
+/// (which, for nested arrows, cloned each body once per enclosing scan).
+fn free_of_function_parts(
+    params: &[crate::ast::Param],
+    body: &[Stmt],
+    tail: Option<&Expr>,
+) -> BTreeSet<String> {
     let bound = bound_names(params, body);
     let mut direct = BTreeSet::new();
     let mut nested = BTreeSet::new();
@@ -12820,6 +12859,9 @@ fn free_of_function(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<Str
     }
     for s in body {
         refs_stmt(s, &mut direct, &mut nested);
+    }
+    if let Some(e) = tail {
+        refs_expr(e, &mut direct, &mut nested);
     }
     direct
         .into_iter()
@@ -13281,7 +13323,7 @@ fn refs_class_inner(
 /// Walks `e` collecting direct identifier references; for a nested function
 /// expression, collects *its* free variables into `nested` (without descending
 /// for direct refs).
-fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<String>) {
+fn refs_expr(mut e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<String>) {
     // Exhaustive on purpose (no `_` arm): an expression kind the scan skipped
     // would silently drop the captures of every closure that references a name
     // only through it (`() => new C(x)`, `` () => `${x}` ``, `() => a?.b`).
@@ -13293,146 +13335,157 @@ fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
             refs_expr(e, direct, nested);
         }
     };
-    match e {
-        Expr::Ident(id) => {
-            direct.insert(String::from(&*id.name));
-        }
-        Expr::Function(f) => nested.extend(free_of_nonarrow(&f.params, &f.body)),
-        Expr::Arrow(a) => {
-            let body: Vec<Stmt> = match &a.body {
-                crate::ast::ArrowBody::Block(b) => b.clone(),
-                crate::ast::ArrowBody::Expr(e) => alloc::vec![Stmt::Return {
-                    argument: Some(Box::new((**e).clone())),
-                    span: crate::common::Span::point(0),
-                }],
-            };
-            nested.extend(free_of_function(&a.params, &body));
-        }
-        Expr::Class(c) => refs_class(c, direct, nested),
-        Expr::Unary { argument, .. } | Expr::Update { argument, .. } => {
-            refs_expr(argument, direct, nested);
-        }
-        Expr::Await { argument, .. } => refs_expr(argument, direct, nested),
-        Expr::Yield { argument, .. } => {
-            if let Some(a) = argument {
-                refs_expr(a, direct, nested);
+    // The last child of each node is visited by looping rather than recursing,
+    // so a long left-nested chain (`a + b + …`, `o.f().g()…`, `!!!…x`) costs
+    // no native stack here: the parser bounds chain length by the stack that
+    // the *recursive* passes need, and this pass is the busiest of them.
+    loop {
+        match e {
+            Expr::Ident(id) => {
+                direct.insert(String::from(&*id.name));
             }
-        }
-        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
-            refs_expr(left, direct, nested);
-            refs_expr(right, direct, nested);
-        }
-        Expr::Conditional {
-            test,
-            consequent,
-            alternate,
-            ..
-        } => {
-            refs_expr(test, direct, nested);
-            refs_expr(consequent, direct, nested);
-            refs_expr(alternate, direct, nested);
-        }
-        Expr::Assign { target, value, .. } => {
-            refs_expr(target, direct, nested);
-            refs_expr(value, direct, nested);
-        }
-        Expr::Sequence { expressions, .. } => {
-            for x in expressions {
-                refs_expr(x, direct, nested);
+            Expr::Function(f) => nested.extend(free_of_nonarrow(&f.params, &f.body)),
+            Expr::Arrow(a) => nested.extend(match &a.body {
+                crate::ast::ArrowBody::Block(b) => free_of_function(&a.params, b),
+                crate::ast::ArrowBody::Expr(e) => free_of_function_parts(&a.params, &[], Some(e)),
+            }),
+            Expr::Class(c) => refs_class(c, direct, nested),
+            Expr::Unary { argument, .. }
+            | Expr::Update { argument, .. }
+            | Expr::Await { argument, .. } => {
+                e = argument;
+                continue;
             }
-        }
-        Expr::Member {
-            object, property, ..
-        } => {
-            refs_expr(object, direct, nested);
-            match property {
-                PropertyKey::Computed(e) => refs_expr(e, direct, nested),
-                PropertyKey::Private(n) => {
-                    direct.insert(private_binding(n));
-                }
-                _ => {}
-            }
-        }
-        Expr::OptChain { expr, .. } => refs_expr(expr, direct, nested),
-        Expr::Call {
-            callee, arguments, ..
-        }
-        | Expr::New {
-            callee, arguments, ..
-        } => {
-            // A direct `eval(…)` call site (see `DYN_EVAL`).
-            if let Expr::Call {
-                optional: false, ..
-            } = e
-                && matches!(&**callee, Expr::Ident(id) if &*id.name == "eval")
-            {
-                direct.insert(String::from(DYN_EVAL));
-            }
-            refs_expr(callee, direct, nested);
-            args(arguments, direct, nested);
-        }
-        Expr::Template(t) => {
-            for x in &t.expressions {
-                refs_expr(x, direct, nested);
-            }
-        }
-        Expr::TaggedTemplate { tag, quasi, .. } => {
-            refs_expr(tag, direct, nested);
-            for x in &quasi.expressions {
-                refs_expr(x, direct, nested);
-            }
-        }
-        Expr::Array { elements, .. } => {
-            for el in elements {
-                match el {
-                    ArrayElement::Item(e) | ArrayElement::Spread(e) => refs_expr(e, direct, nested),
-                    ArrayElement::Hole => {}
+            Expr::Yield { argument, .. } => {
+                if let Some(a) = argument {
+                    refs_expr(a, direct, nested);
                 }
             }
-        }
-        Expr::Object { members, .. } => {
-            for m in members {
-                match m {
-                    ObjectMember::Property { key, value, .. } => {
-                        if let PropertyKey::Computed(e) = key {
-                            refs_expr(e, direct, nested);
-                        }
-                        refs_expr(value, direct, nested);
+            Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+                refs_expr(right, direct, nested);
+                e = left;
+                continue;
+            }
+            Expr::Conditional {
+                test,
+                consequent,
+                alternate,
+                ..
+            } => {
+                refs_expr(test, direct, nested);
+                refs_expr(consequent, direct, nested);
+                refs_expr(alternate, direct, nested);
+            }
+            Expr::Assign { target, value, .. } => {
+                refs_expr(target, direct, nested);
+                refs_expr(value, direct, nested);
+            }
+            Expr::Sequence { expressions, .. } => {
+                for x in expressions {
+                    refs_expr(x, direct, nested);
+                }
+            }
+            Expr::Member {
+                object, property, ..
+            } => {
+                match property {
+                    PropertyKey::Computed(k) => refs_expr(k, direct, nested),
+                    PropertyKey::Private(n) => {
+                        direct.insert(private_binding(n));
                     }
-                    ObjectMember::Spread { value, .. } => refs_expr(value, direct, nested),
-                    ObjectMember::Accessor { key, value, .. } => {
-                        if let PropertyKey::Computed(e) = key {
-                            refs_expr(e, direct, nested);
+                    _ => {}
+                }
+                e = object;
+                continue;
+            }
+            Expr::OptChain { expr, .. } => {
+                e = expr;
+                continue;
+            }
+            Expr::Call {
+                callee, arguments, ..
+            }
+            | Expr::New {
+                callee, arguments, ..
+            } => {
+                // A direct `eval(…)` call site (see `DYN_EVAL`).
+                if let Expr::Call {
+                    optional: false, ..
+                } = e
+                    && matches!(&**callee, Expr::Ident(id) if &*id.name == "eval")
+                {
+                    direct.insert(String::from(DYN_EVAL));
+                }
+                args(arguments, direct, nested);
+                e = callee;
+                continue;
+            }
+            Expr::Template(t) => {
+                for x in &t.expressions {
+                    refs_expr(x, direct, nested);
+                }
+            }
+            Expr::TaggedTemplate { tag, quasi, .. } => {
+                refs_expr(tag, direct, nested);
+                for x in &quasi.expressions {
+                    refs_expr(x, direct, nested);
+                }
+            }
+            Expr::Array { elements, .. } => {
+                for el in elements {
+                    match el {
+                        ArrayElement::Item(e) | ArrayElement::Spread(e) => {
+                            refs_expr(e, direct, nested)
                         }
-                        nested.extend(free_of_nonarrow(&value.params, &value.body));
+                        ArrayElement::Hole => {}
                     }
                 }
             }
-        }
-        Expr::Null(_)
-        | Expr::Bool { .. }
-        | Expr::Number { .. }
-        | Expr::BigInt { .. }
-        | Expr::Str { .. }
-        | Expr::Regex { .. } => {}
-        Expr::PrivateName(n, _) => {
-            direct.insert(private_binding(n));
-        }
-        // `new.target` is lexical for an arrow, like `this`.
-        Expr::NewTarget(_) => {
-            direct.insert(String::from(NT_NAME));
-        }
-        // `this` (and `super`, whose receiver is `this`) is a lexical reference
-        // for an arrow: the hidden binding [`THIS_NAME`] of the nearest
-        // non-arrow function.
-        Expr::This(_) => {
-            direct.insert(String::from(THIS_NAME));
-        }
-        Expr::Super(_) => {
-            for n in [THIS_NAME, HOME_NAME, CTOR_NAME, NT_NAME] {
-                direct.insert(String::from(n));
+            Expr::Object { members, .. } => {
+                for m in members {
+                    match m {
+                        ObjectMember::Property { key, value, .. } => {
+                            if let PropertyKey::Computed(e) = key {
+                                refs_expr(e, direct, nested);
+                            }
+                            refs_expr(value, direct, nested);
+                        }
+                        ObjectMember::Spread { value, .. } => refs_expr(value, direct, nested),
+                        ObjectMember::Accessor { key, value, .. } => {
+                            if let PropertyKey::Computed(e) = key {
+                                refs_expr(e, direct, nested);
+                            }
+                            nested.extend(free_of_nonarrow(&value.params, &value.body));
+                        }
+                    }
+                }
+            }
+            Expr::Null(_)
+            | Expr::Bool { .. }
+            | Expr::Number { .. }
+            | Expr::BigInt { .. }
+            | Expr::Str { .. }
+            | Expr::Regex { .. } => {}
+            Expr::PrivateName(n, _) => {
+                direct.insert(private_binding(n));
+            }
+            // `new.target` is lexical for an arrow, like `this`.
+            Expr::NewTarget(_) => {
+                direct.insert(String::from(NT_NAME));
+            }
+            // `this` (and `super`, whose receiver is `this`) is a lexical reference
+            // for an arrow: the hidden binding [`THIS_NAME`] of the nearest
+            // non-arrow function.
+            Expr::This(_) => {
+                direct.insert(String::from(THIS_NAME));
+            }
+            Expr::Super(_) => {
+                for n in [THIS_NAME, HOME_NAME, CTOR_NAME, NT_NAME] {
+                    direct.insert(String::from(n));
+                }
             }
         }
+        return;
     }
 }
 
@@ -13598,6 +13651,18 @@ const NT_NAME: &str = "\0newtarget";
 
 /// [`free_of_function`] for a function with its *own* `this` (anything but an
 /// arrow): `this` inside it is not a reference to the enclosing one.
+/// An arrow's body as a statement list: a block body borrowed as is, an
+/// expression body as a synthetic `return` of (a clone of) the expression.
+fn arrow_body_stmts(body: &crate::ast::ArrowBody) -> alloc::borrow::Cow<'_, [Stmt]> {
+    match body {
+        crate::ast::ArrowBody::Block(b) => alloc::borrow::Cow::Borrowed(b),
+        crate::ast::ArrowBody::Expr(e) => alloc::borrow::Cow::Owned(alloc::vec![Stmt::Return {
+            argument: Some(Box::new((**e).clone())),
+            span: crate::common::Span::point(0),
+        }]),
+    }
+}
+
 fn free_of_nonarrow(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<String> {
     let mut free = free_of_function(params, body);
     free.remove(THIS_NAME);
@@ -15070,7 +15135,7 @@ impl Compiler {
         // Reject a program that exhausted the `Reg` width during allocation
         // rather than returning a proto with wrapped/aliased register indices.
         if c.reg_overflow {
-            return Err(CompileError::Unsupported("too many registers"));
+            return Err(CompileError::Unsupported(TOO_MANY_REGISTERS));
         }
         if c.mapped_violation {
             return Err(CompileError::Unsupported(
@@ -15469,7 +15534,7 @@ impl Compiler {
             }
         }
         if c.reg_overflow {
-            return Err(CompileError::Unsupported("too many registers"));
+            return Err(CompileError::Unsupported(TOO_MANY_REGISTERS));
         }
         let length = params
             .iter()
@@ -16866,6 +16931,9 @@ impl Compiler {
     /// it to `undefined` on entry, so the register always holds the value of
     /// the last non-empty completion — the script's result.
     fn stmt(&mut self, stmt: &Stmt) -> Result<Option<Reg>, CompileError> {
+        if crate::stack::exhausted() {
+            return Err(CompileError::TooDeep);
+        }
         // The capture set is by name, function-wide: a loop's `let i` would be
         // a cell whenever *any* closure in the function reads *some* `i`.
         let Some(saved) = self.uncapture_loop_head(stmt) else {
@@ -18149,6 +18217,9 @@ impl Compiler {
                 }
                 _ => None,
             }
+        }
+        if crate::stack::exhausted() {
+            return Err(CompileError::TooDeep);
         }
         if spine_op(expr).is_none() {
             return self.expr_any(expr);
@@ -20229,13 +20300,7 @@ impl Compiler {
             }
             Expr::Arrow(a) => {
                 self.next_closure_span = Some(a.span);
-                let body: Vec<Stmt> = match &a.body {
-                    crate::ast::ArrowBody::Block(b) => b.clone(),
-                    crate::ast::ArrowBody::Expr(e) => alloc::vec![Stmt::Return {
-                        argument: Some(Box::new((**e).clone())),
-                        span: crate::common::Span::point(0),
-                    }],
-                };
+                let body = arrow_body_stmts(&a.body);
                 self.next_closure_span = Some(a.span);
                 self.make_closure(&a.params, &body, a.is_async, "", true)
             }
@@ -20312,13 +20377,7 @@ impl Compiler {
                 }
                 Expr::Arrow(a) => {
                     self.next_closure_span = Some(a.span);
-                    let body: Vec<Stmt> = match &a.body {
-                        crate::ast::ArrowBody::Block(b) => b.clone(),
-                        crate::ast::ArrowBody::Expr(ex) => alloc::vec![Stmt::Return {
-                            argument: Some(Box::new((**ex).clone())),
-                            span: crate::common::Span::point(0),
-                        }],
-                    };
+                    let body = arrow_body_stmts(&a.body);
                     self.next_closure_span = Some(a.span);
                     return self.make_closure(&a.params, &body, a.is_async, id.name.as_ref(), true);
                 }

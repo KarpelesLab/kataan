@@ -54,6 +54,7 @@ pub mod lexer;
 #[doc(hidden)]
 pub mod nanbox;
 pub mod parser;
+pub mod stack;
 
 /// The managed heap (generational handle table) that NaN-boxed handles index
 /// into — groundwork for the object model & GC. Needs `alloc`.
