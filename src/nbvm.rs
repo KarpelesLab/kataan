@@ -22160,9 +22160,20 @@ impl Compiler {
                     } => {
                         let named = *method || is_anonymous_fn_def(value);
                         // A plain value under a static key: baked-key fast op.
-                        if !named && !matches!(key, PropertyKey::Computed(_)) {
-                            let k = static_key(key)?;
-                            let v = self.expr(value)?;
+                        // So is an anonymous function there (not a method): it
+                        // is named after the key at compile time.
+                        let static_k = match key {
+                            PropertyKey::Computed(_) => None,
+                            _ => Some(static_key(key)?),
+                        };
+                        if let Some(k) = static_k
+                            && (!named || (!*method && !k.starts_with('\0')))
+                        {
+                            let v = if named {
+                                self.named_field_value(value, &k)?
+                            } else {
+                                self.expr(value)?
+                            };
                             self.ops.push(Op::InitProp {
                                 obj: dst,
                                 key: k,
@@ -22265,9 +22276,6 @@ impl Compiler {
             else {
                 return Ok(None);
             };
-            if is_anonymous_fn_def(value) {
-                return Ok(None);
-            }
             let k = static_key(key)?;
             if k == "__proto__" || k.starts_with('\0') {
                 return Ok(None);
@@ -22295,7 +22303,9 @@ impl Compiler {
         let mut srcs: Vec<Reg> = alloc::vec![0; keys.len()];
         for (i, (k, e)) in head.iter().enumerate() {
             let mark = self.next_reg;
-            let mut v = self.expr(e)?;
+            // An anonymous function value is named after its static key here,
+            // at compile time (NamedEvaluation needs no runtime naming).
+            let mut v = self.named_field_value(e, k)?;
             // A binding's own register (`{a: i, b: i++}`) would be read after
             // the later values ran: snapshot it when one of them may assign.
             if v < mark && head[i + 1..].iter().any(|(_, e)| may_assign(e)) {
@@ -22315,7 +22325,7 @@ impl Compiler {
             }),
         });
         for (k, e) in tail {
-            let v = self.expr(e)?;
+            let v = self.named_field_value(e, k)?;
             self.ops.push(Op::InitProp {
                 obj: dst,
                 key: k.clone(),

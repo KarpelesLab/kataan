@@ -2845,3 +2845,44 @@ fn instanceof_script_ctor_fast_path_keeps_observable_steps() {
          false,true,TypeError"
     );
 }
+
+/// An anonymous function under a static key of an object literal is named
+/// after the key (NamedEvaluation), with the same `name` descriptor, order of
+/// definition, and accessor replacement as the run-time naming path.
+#[test]
+fn object_literal_anonymous_function_values_are_named_by_key() {
+    let src = r#"
+        var r = [];
+        var o1 = { a: () => 1, b: function () {}, c: class {}, 'd-e': () => 2, 3: function () {}, 1.5: () => 0,
+                   f: function g() {}, h: async () => 1, i: function* () {}, j: async function* () {} };
+        for (var k of Object.keys(o1)) r.push(k + '=' + o1[k].name);
+        var o2 = { get x() { return 1; }, x: () => 5 };
+        r.push(typeof Object.getOwnPropertyDescriptor(o2, 'x').value, o2.x(), o2.x.name);
+        var o3 = { x: () => 5, get x() { return 'g'; } };
+        r.push(o3.x);
+        var sym = Symbol('desc');
+        var o4 = { [sym]: () => 1, ['comp' + 1]: function () {}, m() {}, get gg() { return 1; } };
+        r.push(o4[sym].name, o4.comp1.name, o4.m.name, Object.getOwnPropertyDescriptor(o4, 'gg').get.name);
+        var d = Object.getOwnPropertyDescriptor(o1.a, 'name');
+        r.push(d.writable, d.enumerable, d.configurable, Object.getOwnPropertyNames(o1.a).join());
+        var o5 = { c: class { static name() { return 'custom'; } } };
+        r.push(typeof o5.c.name);
+        var o6 = { k: 1, k: () => 1 };
+        r.push(o6.k.name, Object.keys(o6).join());
+        function mk() { return { get: () => 1, set: (v) => v }; }
+        var a1 = mk(), a2 = mk();
+        r.push(a1.get.name, a2.set.name, a1.get !== a2.get, Object.getOwnPropertyDescriptor(a1, 'get').enumerable);
+        var o7 = { __proto__: function () {} };
+        r.push(typeof Object.getPrototypeOf(o7), Object.getPrototypeOf(o7).name, Object.keys(o7).length);
+        var o9 = { '': () => 1, ' ': function () {} };
+        r.push(JSON.stringify(o9[''].name), JSON.stringify(o9[' '].name));
+        var o10 = { a: (() => () => 1)() }, o11 = { a: (0, function () {}) };
+        r.push(JSON.stringify(o10.a.name), JSON.stringify(o11.a.name));
+        r.join('|')
+    "#;
+    assert_eq!(
+        run(src),
+        "3=3|a=a|b=b|c=c|d-e=d-e|1.5=1.5|f=g|h=h|i=i|j=j|function|5|x|g|[desc]|comp1|m|get gg|\
+         false|false|true|length,name|function|k|k|get|set|true|true|function||0|\"\"|\" \"|\"\"|\"\""
+    );
+}
