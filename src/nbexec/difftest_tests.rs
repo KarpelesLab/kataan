@@ -2714,3 +2714,17 @@ fn regex_unicode_ignore_case_range_reaches_long_s_and_kelvin() {
     "#;
     assert_eq!(run(src), "110010|001101|000010|110010|000000");
 }
+
+/// Legacy (non-`u`) `i` class ranges: a character matches when some range
+/// member has the same Canonicalize (single-unit uppercase). `β` and `ϐ`
+/// both uppercase to `Β`, so `[π-ϕ]` (which holds `ϐ` and `ϑ`)
+/// matches `β`, `Β`, `θ` and `Θ`; the candidates had been only the input's
+/// own upper/lowercase, which never reach `ϐ`/`ϑ`.
+#[test]
+fn regex_legacy_ignore_case_range_uses_case_class() {
+    let src = r#"
+        function bits(re) { return ["β", "Β", "ϐ", "θ", "Θ", "ϑ", "µ", "Μ", "ẛ", "Ṡ"].map(function (c) { return re.test(c) ? 1 : 0; }).join(""); }
+        [bits(/^[π-ϕ]$/i), bits(/^[^π-ϕ]$/i), bits(/^[°-¹]$/i), bits(/^[ẛ-ẜ]$/i)].join("|")
+    "#;
+    assert_eq!(run(src), "1111110000|0000001111|0000001100|0000000011");
+}

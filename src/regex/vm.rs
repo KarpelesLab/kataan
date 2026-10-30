@@ -1215,42 +1215,19 @@ fn simple_fold_class(c: u32) -> Vec<u32> {
 /// Under `u`/`v` that is exactly `ch`'s simple-case-folding equivalence class
 /// (so `ß`, `İ` and `ı`, which fold only to themselves, have no variants,
 /// while `ǅ` reaches both `Ǆ` and `ǆ` and `k` reaches the Kelvin sign). The
-/// legacy mode's candidates are its ASCII/simple upper- and lowercase plus
-/// (with the `intl` feature) the targets that share its case fold; callers
-/// filter those by the legacy `Canonicalize`. Returns an iterator of code points.
+/// legacy mode's candidates are that class plus `ch`'s own upper- and
+/// lowercase mappings; callers filter them by the legacy `Canonicalize`.
+/// Returns an iterator of code points.
 fn case_variants(ch: char, flags: Flags) -> impl Iterator<Item = u32> {
     if flags.unicode || flags.unicode_sets {
         return simple_fold_class(ch as u32).into_iter();
     }
-    let mut out: Vec<u32> = Vec::new();
-    for u in ch.to_uppercase() {
-        out.push(u as u32);
-    }
-    for l in ch.to_lowercase() {
-        out.push(l as u32);
-    }
-    #[cfg(feature = "intl")]
-    {
-        // Add code points whose simple case fold equals `ch`'s, catching pairs the
-        // plain to_upper/to_lower miss (ſ↔s, K↔k, ς↔σ, …).
-        let target: Vec<char> = intl::unicode::case::case_fold(ch).collect();
-        // The common single-scalar fold case: scan the BMP letters cheaply is too
-        // costly; instead rely on the fact that to_uppercase/to_lowercase plus the
-        // fold of `ch` itself cover the ECMAScript-relevant variants. Add the fold
-        // result directly so `ch` matching a folded target works both ways.
-        if let &[t] = target.as_slice() {
-            out.push(t as u32);
-            // The other members of the fold class reached through the target:
-            // the Kelvin sign folds to `k`, so `K` shares its class too (and
-            // must match it in `/[A-Z]/iu`), though neither simple case
-            // mapping of the sign produces it.
-            for v in t.to_uppercase().chain(t.to_lowercase()) {
-                if v != t && intl::unicode::case::case_fold(v).eq(core::iter::once(t)) {
-                    out.push(v as u32);
-                }
-            }
-        }
-    }
+    // The legacy `Canonicalize` (single-unit uppercase) partners of `ch` all
+    // lie in its simple-fold class or among its own case mappings — e.g. `β`
+    // and `ϐ` both uppercase to `Β`, which neither mapping of `β` reaches.
+    let mut out = simple_fold_class(ch as u32);
+    out.extend(ch.to_uppercase().map(|u| u as u32));
+    out.extend(ch.to_lowercase().map(|l| l as u32));
     out.into_iter()
 }
 
