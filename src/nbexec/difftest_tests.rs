@@ -2483,3 +2483,19 @@ fn format_to_parts_agrees_with_format() {
         "-1,235 0.001 0 1 1.50 0.0000001 -1,235 0.001 0 1 0.0000001"
     );
 }
+
+/// Compact-notation PluralRules select on the rounded compact mantissa (what
+/// `format` shows): 1.000001 is "1" (`one`), and 999999.9 is 1M (French
+/// `many`, as 1000000 is), not the unrounded value.
+#[cfg(feature = "intl")]
+#[test]
+fn plural_rules_compact_selects_on_the_rounded_mantissa() {
+    let src = r#"
+        var en = new Intl.PluralRules("en", { notation: "compact" });
+        var fr = new Intl.PluralRules("fr", { notation: "compact" });
+        var en2 = new Intl.PluralRules("en", { notation: "compact", maximumSignificantDigits: 1 });
+        [en.select(1.000001), en.select(1.04), fr.select(999999.9), fr.select(1e6), fr.select(1.5e6),
+         en2.select(1.4), fr.select(1234)].join()
+    "#;
+    assert_eq!(run(src), "one,one,many,many,many,one,other");
+}

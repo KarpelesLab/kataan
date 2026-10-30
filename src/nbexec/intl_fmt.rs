@@ -6196,6 +6196,55 @@ impl Interp {
         Ok(())
     }
 
+    /// The plural operand string of finite `n` under a compact-notation
+    /// `Intl.PluralRules` instance: its mantissa `|n| / 10^e` (`e` the compact
+    /// exponent, a multiple of three from 1000 up to 10^12) rounded with the
+    /// instance's digit options, in the crate's `<mantissa>c<exp>` form when
+    /// `e > 0`. The default compact rounding keeps `max(0, 1 - e_m)` fraction
+    /// digits of a mantissa whose leading digit is at `e_m` (two significant
+    /// digits, no fraction for a mantissa of 10 or more).
+    #[cfg(feature = "intl")]
+    fn plural_compact_rounded_operand(&mut self, handle: Handle, n: f64) -> Option<String> {
+        let a = n.abs();
+        if a == 0.0 {
+            return None;
+        }
+        let mag = decimal_magnitude(a);
+        let mut e = if mag >= 3 {
+            mag.div_euclid(3).min(4) * 3
+        } else {
+            0
+        };
+        let mut o = self.number_format_options(handle);
+        let default_compact = compact_wants_reround(&o);
+        o.notation = intl::number::Notation::Standard;
+        o.use_grouping = intl::number::UseGrouping::Never;
+        o.sign_display = intl::number::SignDisplay::Never;
+        let render = |o: &mut intl::number::NumberFormatOptions, e: i32| {
+            let m = decimal_shift(a, -e);
+            if default_compact {
+                let keep = (1 - decimal_magnitude(m)).max(0) as u8;
+                o.minimum_fraction_digits = Some(0);
+                o.maximum_fraction_digits = Some(keep);
+            }
+            let r = intl_decimal_round(
+                m,
+                usize::from(o.maximum_fraction_digits.unwrap_or(3)),
+                o.maximum_significant_digits.map(usize::from),
+                1,
+                o.rounding_mode,
+            );
+            (r, intl::number::format("en", r, o))
+        };
+        let (r, mut s) = render(&mut o, e);
+        // A mantissa rounding up to 1000 (999.96K) is 1 at the next exponent.
+        if r >= 1000.0 && e < 12 {
+            e += 3;
+            s = render(&mut o, e).1;
+        }
+        Some(if e > 0 { alloc::format!("{s}c{e}") } else { s })
+    }
+
     /// The plural category name (`"zero"`/`"one"`/`"two"`/`"few"`/`"many"`/`"other"`)
     /// of `n` per the receiver `Intl.PluralRules` instance's `[[Locale]]` and
     /// `[[Type]]`. A non-finite `n` is always `"other"`. With the `intl` feature this
@@ -6260,6 +6309,14 @@ impl Interp {
                     intl::number::format("en", n.abs(), &o)
                 })
                 .and_then(|s| intl::plural::PluralOperands::parse(&s));
+            // Compact notation: the operands are the *rounded* mantissa's, with
+            // its exponent, so compact 1.000001 reads as "1" (`one`), not
+            // 1.000001 (`other`), and 999999.9 as "1c6" (1M).
+            let formatted = formatted.or_else(|| {
+                let h = fmt.filter(|_| notation == "compact")?;
+                let s = self.plural_compact_rounded_operand(h, n)?;
+                intl::plural::PluralOperands::parse(&s)
+            });
             let ops = match (formatted, plural_notation_operand_string(n, &notation)) {
                 (Some(ops), _) => ops,
                 (None, Some(s)) => intl::plural::PluralOperands::parse(&s)
