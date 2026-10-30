@@ -577,9 +577,35 @@ fn generic_region_op(op: &GenericOp, bc: &Op) -> bool {
         // `!x` (a boolean or Number inline) and an array iteration's step in
         // by-index mode (`for (… of array)`, inline while the array lasts).
         GenericOp::Not { .. } => true,
+        GenericOp::Interp { .. } => {
+            matches!(
+                bc,
+                Op::IterNext { iter, next, .. } if usize::from(*next) == usize::from(*iter) + 1
+            ) || allocating_region_op(op, bc)
+        }
+        _ => allocating_region_op(op, bc),
+    }
+}
+
+/// The generic emitter's ops that may allocate or run code on their fast
+/// path -- a literal, a closure, a binding cell, a `new` -- and a captured
+/// binding's read or write: each is emitted as anywhere else (its calls
+/// bracketed by the promoted registers' stores and reloads like every
+/// generic region op's), so a loop that makes objects or closures, or
+/// counts in a captured variable, still keeps its arithmetic in SSE
+/// registers. Its every call can run Rust code ([`region_call`]), so such a
+/// loop has no speculative version.
+fn allocating_region_op(op: &GenericOp, bc: &Op) -> bool {
+    match op {
+        GenericOp::CellGet { .. } | GenericOp::CellSet { .. } | GenericOp::Construct { .. } => true,
         GenericOp::Interp { .. } => matches!(
             bc,
-            Op::IterNext { iter, next, .. } if usize::from(*next) == usize::from(*iter) + 1
+            Op::NewObjectLit { .. }
+                | Op::NewObject { .. }
+                | Op::NewArray { .. }
+                | Op::NewArrayFrom { .. }
+                | Op::NewBox { .. }
+                | Op::MakeClosure { .. }
         ),
         _ => false,
     }
@@ -593,7 +619,7 @@ fn region_call(op: &GenericOp, bc: &Op) -> bool {
         GenericOp::CallValue { .. }
         | GenericOp::CallWithMethod { .. }
         | GenericOp::CallKey { .. } => true,
-        _ => false,
+        _ => allocating_region_op(op, bc),
     }
 }
 
@@ -2737,7 +2763,36 @@ pub(super) fn def_use(op: &Op, defs: &mut Vec<u16>, uses: &mut Vec<u16>) {
                 defs.push(*dst);
             }
         }
-        Op::LoadGlobal { dst, .. } | Op::NewBox { dst } => defs.push(*dst),
+        Op::LoadGlobal { dst, .. }
+        | Op::NewBox { dst }
+        | Op::NewObject { dst }
+        | Op::NewArray { dst, .. }
+        | Op::NewString { dst, .. } => defs.push(*dst),
+        // (A source register may also be the destination.)
+        Op::NewObjectLit { dst, lit } => {
+            uses.extend(lit.srcs.iter().copied());
+            if !uses.contains(dst) {
+                defs.push(*dst);
+            }
+        }
+        Op::NewArrayFrom { dst, elems: srcs }
+        | Op::MakeClosure {
+            dst,
+            captures: srcs,
+            ..
+        } => {
+            uses.extend(srcs.iter().copied());
+            if !uses.contains(dst) {
+                defs.push(*dst);
+            }
+        }
+        Op::Construct { dst, ctor, args } => {
+            uses.push(*ctor);
+            uses.extend(args.iter().copied());
+            if !uses.contains(dst) {
+                defs.push(*dst);
+            }
+        }
         Op::CellGet { dst, cell } => {
             defs.push(*dst);
             uses.push(*cell);
