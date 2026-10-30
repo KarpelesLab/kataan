@@ -4945,13 +4945,18 @@ impl Realm {
         if old_len.is_some_and(|old| len < old)
             && let Some(aux) = self.aux_props.get(&raw).copied()
         {
-            let doomed: Vec<alloc::string::String> = self
+            // The marked keys too: an element the dense store holds keeps its
+            // attribute override (non-writable, non-enumerable) as a mark on its
+            // key alone, which must go with the element, or the index re-created
+            // by a later `length` growth would inherit it.
+            let mut doomed: Vec<alloc::string::String> = self
                 .heap
                 .get(aux)
                 .and_then(Cell::as_object)
                 .map(|o| {
-                    o.all_keys()
-                        .iter()
+                    let mut keys = o.all_keys();
+                    keys.extend(o.marked_keys());
+                    keys.iter()
                         .filter(|k| {
                             // Only *array index* properties (0 <= i < 2**32-1) are
                             // swept by ArraySetLength. `"4294967295"` (2**32-1) and
@@ -4967,6 +4972,8 @@ impl Realm {
                         .collect()
                 })
                 .unwrap_or_default();
+            doomed.sort_unstable();
+            doomed.dedup();
             if !doomed.is_empty() {
                 let root = Rc::clone(&self.root_shape);
                 if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {

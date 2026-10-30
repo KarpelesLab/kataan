@@ -1925,3 +1925,29 @@ fn group_by_closes_the_iterator_when_the_callback_throws() {
     "#;
     assert_eq!(run(src), "n0n1n2RE n0n1n2RE 1,2,3,10,20 Infinity");
 }
+
+/// Lowering an array's `length` deletes the elements past it together with
+/// their attribute overrides: an element the dense store holds keeps a
+/// non-writable / non-enumerable override as a mark on its key alone, which
+/// survived, so the index re-created after `length` grew back was still
+/// non-writable (a strict write threw) or hidden from `Object.keys`.
+#[test]
+fn length_shrink_drops_the_attributes_of_deleted_elements() {
+    let src = r#"
+        "use strict";
+        var r = [];
+        var a = [0, 1, 2, 3, 4, 5]; Object.defineProperty(a, 4, { writable: false });
+        a.length = 2; a.length = 6;
+        try { a[4] = 9; r.push(a[4], JSON.stringify(Object.getOwnPropertyDescriptor(a, 4))); } catch (e) { r.push(e.constructor.name); }
+        var b = [0, 1, 2, 3, 4, 5]; Object.defineProperty(b, 5, { enumerable: false });
+        b.length = 3; b[5] = 1; r.push(Object.keys(b).join());
+        var c = [0, 1, 2, 3, 4, 5]; Object.defineProperty(c, 3, { writable: false });
+        c.length = 1;
+        try { c.push(7, 8, 9); r.push(c.join()); } catch (e) { r.push(e.constructor.name); }
+        r.join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        r#"9 {"value":9,"writable":true,"enumerable":true,"configurable":true} 0,1,2,5 0,7,8,9"#
+    );
+}

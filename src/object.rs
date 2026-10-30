@@ -1784,6 +1784,21 @@ impl Object {
             .any(|(k, _, _)| digit(k) && array_index(k).is_some())
     }
 
+    /// The keys carrying an attribute mark (non-writable, non-enumerable or
+    /// non-configurable) — possibly with no data slot or accessor of their own:
+    /// an array's attribute override for an element its dense store holds.
+    /// A key marked twice is listed twice.
+    #[must_use]
+    pub fn marked_keys(&self) -> Vec<&str> {
+        let x = self.ex();
+        x.readonly
+            .iter()
+            .chain(&x.hidden)
+            .chain(&x.non_configurable)
+            .map(AsRef::as_ref)
+            .collect()
+    }
+
     /// Marks own property `key` non-enumerable (idempotent).
     pub fn set_hidden(&mut self, key: &str) {
         // The newest key, right past the hidden prefix (a property marked
