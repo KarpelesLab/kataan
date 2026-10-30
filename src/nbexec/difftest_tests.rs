@@ -1710,3 +1710,24 @@ fn bound_function_name_is_a_rope_join() {
     "#;
     assert_eq!(run(src), r#"120001,bound bound ,9,55296,"bound ""#);
 }
+
+/// `at`/`with` count from the array's real `length`, even when it lies past
+/// the dense store (`a.length = 2**32 - 1`, or an index set beyond the dense
+/// cap): `at(-1)` read the last *stored* element, and `with` built an array
+/// of the stored elements only. `with` on such a length is now the engine's
+/// "Invalid array length" RangeError rather than a short array.
+#[test]
+fn at_and_with_honor_a_length_past_the_dense_store() {
+    let src = r#"
+        function S(v) { return v === undefined ? "u" : String(v); }
+        function k(f) { try { return S(f()); } catch (e) { return e.constructor.name; } }
+        var L = 2 ** 32 - 1;
+        function mk() { var a = [1, 2, 3]; a.length = L; return a; }
+        var s = []; s[2e8] = "x";
+        [k(() => mk().at(-1)), k(() => mk().at(-L)), k(() => mk().at(2)),
+         k(() => { var a = mk(); a[L - 1] = "last"; return a.at(-1); }),
+         k(() => mk().with(-1, 9).length), k(() => s.at(-1)), k(() => s.at(0)),
+         k(() => [1, 2, 3].at(-1))].join()
+    "#;
+    assert_eq!(run(src), "u,1,3,last,RangeError,x,u,3");
+}

@@ -3649,6 +3649,22 @@ impl Interp {
             }
             return Ok(Some(self.realm.array_pop(handle)));
         }
+        // A real array whose logical `length` lies past its dense store (a
+        // length or index beyond the dense cap, e.g. `a.length = 2**32 - 1`):
+        // the element arms below index the dense store and would take its size
+        // for the array's `length`, so `at(-1)` read the last *stored* element.
+        // `at`/`with` read only the indices they name, so they run their
+        // index-by-index algorithm, which honors the real `length`.
+        if self.realm.typed_kind(handle).is_none()
+            && matches!(method, "at" | "with")
+            && let Some(dense_len) = self.realm.array_elements(handle).map(<[_]>::len)
+            && self
+                .realm
+                .array_length(handle)
+                .is_some_and(|l| l != dense_len)
+        {
+            return Ok(Some(self.array_at_with_generic(method, handle, args)?));
+        }
         // Deferred until after the `push`/`pop` fast path above: building the
         // hole mask walks and allocates over the whole array, and those two
         // methods never consult it, so computing it eagerly made every `push`
