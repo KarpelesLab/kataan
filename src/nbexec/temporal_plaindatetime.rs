@@ -2048,7 +2048,7 @@ fn pdt_round_calendar(
     }
     // `NudgeToCalendarUnit` projects the ceil (`r2`) increment-multiple endpoint via
     // `CalendarDateAdd`; a date outside the representable ISO range throws.
-    let (count, _) = iso::nudge_calendar_count(r1, sign_i, increment, mode, to_ns, |n| {
+    let (count, expanded) = iso::nudge_calendar_count(r1, sign_i, increment, mode, to_ns, |n| {
         let (y, m, w) = match smallest {
             Unit::Year => (n, 0, 0),
             Unit::Month => (0, n, 0),
@@ -2062,13 +2062,28 @@ fn pdt_round_calendar(
     match smallest {
         Unit::Year => out.years = i128::from(count),
         Unit::Month => {
-            // `BubbleRelativeDuration`: a rounded month count can reach a whole
-            // year; re-express the rounded target date as a difference in `largest`.
-            let rd =
-                iso::add_iso_date(anchor, 0, count, 0, 0, Overflow::Constrain).unwrap_or(anchor);
-            let (by, bm, _bw, _bd) = iso::difference_iso_date(from_date, rd, largest);
-            out.years = i128::from(by);
-            out.months = i128::from(bm);
+            out.months = i128::from(count);
+            // `BubbleRelativeDuration`: an expanded month count that reaches the
+            // next whole year carries into years (re-differencing the rounded date
+            // instead could lose a month to a constrained month end).
+            if expanded && largest == Unit::Year {
+                let next_year = iso::add_iso_date(
+                    from_date,
+                    keep_y as i64 + sign_i,
+                    0,
+                    0,
+                    0,
+                    Overflow::Constrain,
+                )
+                .map(|nd| {
+                    iso::iso_to_epoch_days(nd) as i128 * iso::NS_PER_DAY
+                        + iso::time_to_nanos(from_time)
+                });
+                if next_year.is_some_and(|e| (step_ns(count) - e).signum() != -sign) {
+                    out.years = keep_y + i128::from(sign_i);
+                    out.months = 0;
+                }
+            }
         }
         _ => out.weeks = i128::from(count),
     }
@@ -2235,7 +2250,7 @@ fn pdt_round_calendar_cal(
     }
     // `NudgeToCalendarUnit`: the ceil (`r2`) increment-multiple endpoint must be
     // representable, else a RangeError.
-    let (count, _) = iso::nudge_calendar_count(r1, sign_i, increment, mode, to_ns, |n| {
+    let (count, expanded) = iso::nudge_calendar_count(r1, sign_i, increment, mode, to_ns, |n| {
         unit_add(n).map(|nd| {
             iso::iso_to_epoch_days(nd) as i128 * iso::NS_PER_DAY + iso::time_to_nanos(from_time)
         })
@@ -2243,7 +2258,21 @@ fn pdt_round_calendar_cal(
     .ok_or(())?;
     match smallest {
         Unit::Year => out.years = i128::from(count),
-        Unit::Month => out.months = i128::from(count),
+        Unit::Month => {
+            out.months = i128::from(count);
+            // `BubbleRelativeDuration`: an expanded month count that reaches the
+            // next whole calendar year carries into years.
+            if expanded && largest == Unit::Year {
+                let next_year = cadd_opt(from_date, keep_y as i64 + sign_i, 0, 0).map(|nd| {
+                    iso::iso_to_epoch_days(nd) as i128 * iso::NS_PER_DAY
+                        + iso::time_to_nanos(from_time)
+                });
+                if next_year.is_some_and(|e| (step_ns(count) - e).signum() != -sign) {
+                    out.years = keep_y + i128::from(sign_i);
+                    out.months = 0;
+                }
+            }
+        }
         _ => out.weeks = i128::from(count),
     }
     Ok(out)

@@ -2629,3 +2629,31 @@ fn temporal_calendar_increment_rounding_window() {
     "#;
     assert_eq!(run(src), "PT0S|PT0S|-P32M|P72W|P24M|P3Y");
 }
+
+/// `BubbleRelativeDuration` after calendar-unit rounding carries one coarser
+/// unit at a time, only when the rounding expanded, and never for a week
+/// smallestUnit. The until/since paths had instead re-differenced the rounded
+/// end date at largestUnit, which turned rounded weeks back into days
+/// (ZonedDateTime `P143M2W` came out `P143M14D`, a ceil to 5 weeks came out
+/// `P1M4D`) and let a constrained month end lose a month (2005-08-30 + 18
+/// months is 2007-02-28, which re-differences to 17 months).
+#[test]
+fn temporal_bubble_relative_duration_after_rounding() {
+    let src = r#"
+        var T = Temporal;
+        function z(s) { return T.ZonedDateTime.from(s); }
+        var a = z("2014-01-22T00:16:52[America/New_York]"), b = z("2026-01-06T16:48:52[America/New_York]"), c = z("2024-01-01T00:00[Europe/Dublin]");
+        [String(a.until(b, { largestUnit: "months", smallestUnit: "week" })), String(a.until(b, { largestUnit: "years", smallestUnit: "weeks", roundingMode: "ceil" })),
+         String(c.until(z("2024-01-30T12:00[Europe/Dublin]"), { largestUnit: "months", smallestUnit: "weeks", roundingMode: "ceil" })),
+         String(c.until(z("2024-12-30T12:00[Europe/Dublin]"), { largestUnit: "years", smallestUnit: "days", roundingMode: "ceil" })),
+         String(T.PlainDate.from("2005-08-30").since("2007-06-29", { largestUnit: "months", smallestUnit: "months", roundingMode: "trunc", roundingIncrement: 6 })),
+         String(T.PlainDate.from("2005-08-30").until("2007-06-29", { largestUnit: "years", smallestUnit: "months", roundingMode: "ceil" })),
+         String(T.PlainDateTime.from("2005-08-30T12:00").until("2007-06-29", { largestUnit: "years", smallestUnit: "months", roundingMode: "ceil" })),
+         String(T.PlainDate.from("2023-01-31").until("2023-12-30", { largestUnit: "years", smallestUnit: "months", roundingMode: "ceil" }))
+        ].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "P143M2W|P11Y11M3W|P5W|P11M30D|-P18M|P1Y10M|P1Y10M|P11M"
+    );
+}

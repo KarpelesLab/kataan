@@ -2914,28 +2914,37 @@ impl Interp {
                 break;
             }
         }
-        let (rounded_v, _) = iso::nudge_calendar_count(r1, sign, increment, mode, end_epoch, |v| {
-            Some(comp_epoch(v))
-        })
-        .unwrap_or((r1, false));
-        // `BubbleRelativeDuration`: the nudged date duration (coarser units + rounded
-        // `unit` component) is re-expressed up to `largest` by adding it to the start
-        // date and re-differencing, carrying any full coarser unit (e.g. 12 months →
-        // 1 year, or a rounded-up week that completes a month).
-        let (ny, nm, nw, nd2) = with_comp(rounded_v);
-        let end_date = if tcal::is_iso(cal) {
-            iso::add_iso_date(sd, ny, nm, nw, nd2, Overflow::Constrain)
-        } else {
-            tcal::calendar_date_add(cal, sd, ny, nm, nw, nd2, Overflow::Constrain).ok()
-        };
-        let (by, bm, bw, bd) = match end_date {
-            Some(ed2) if tcal::is_iso(cal) => iso::difference_iso_date(sd, ed2, largest),
-            Some(ed2) => {
-                let p = tcal::calendar_date_until(cal, sd, ed2, largest);
-                (p.years, p.months, p.weeks, p.days)
+        let (rounded_v, expanded) =
+            iso::nudge_calendar_count(r1, sign, increment, mode, end_epoch, |v| {
+                Some(comp_epoch(v))
+            })
+            .unwrap_or((r1, false));
+        // `BubbleRelativeDuration` (RoundRelativeDuration runs it only when the
+        // rounding expanded the unit, and never for a week smallestUnit): walking
+        // from the unit just above `unit` up to `largest`, carry one more of that
+        // unit whenever doing so does not pass the nudged instant (e.g. 12 rounded
+        // months → 1 year). Weeks take part only when `largest` is week, and the
+        // rounded `unit` count itself is never re-expressed in finer units (so 2
+        // rounded weeks under largestUnit months stay 2 weeks, not 14 days).
+        let (mut by, mut bm, mut bw, mut bd) = with_comp(rounded_v);
+        if unit != largest && unit != Unit::Week && expanded {
+            let nudged = add_date(by, bm, bw, bd);
+            for u in [Unit::Week, Unit::Month, Unit::Year] {
+                if u >= unit || u < largest || (u == Unit::Week && largest != Unit::Week) {
+                    continue;
+                }
+                let cand = match u {
+                    Unit::Year => (by + sign, 0, 0, 0),
+                    Unit::Month => (by, bm + sign, 0, 0),
+                    _ => (by, bm, bw + sign, 0),
+                };
+                let beyond = (nudged - add_date(cand.0, cand.1, cand.2, cand.3)).signum() as i64;
+                if beyond == -sign {
+                    break;
+                }
+                (by, bm, bw, bd) = cand;
             }
-            None => (ny, nm, nw, nd2),
-        };
+        }
         dur.years = i128::from(by);
         dur.months = i128::from(bm);
         dur.weeks = i128::from(bw);

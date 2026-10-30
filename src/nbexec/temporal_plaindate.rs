@@ -1548,7 +1548,7 @@ impl Interp {
         // `NudgeToCalendarUnit` projects the ceil (`r2`) increment-multiple endpoint
         // via `CalendarDateAdd`; a date outside the representable ISO range throws a
         // RangeError. Only a coarse unit with a large `roundingIncrement` reaches it.
-        let Some((count, _)) = crate::temporal_iso::nudge_calendar_count(
+        let Some((count, expanded)) = crate::temporal_iso::nudge_calendar_count(
             r1,
             sign,
             increment,
@@ -1561,14 +1561,21 @@ impl Interp {
         match smallest {
             Unit::Year => out.years = i128::from(count),
             Unit::Month => {
-                // `BubbleRelativeDuration`: a rounded month count can reach a whole
-                // year (e.g. 12 months → 1 year), so re-express the rounded target
-                // date as a difference in `largest` units, balancing months upward.
-                let rd =
-                    add_iso_date(anchor, 0, count, 0, 0, Overflow::Constrain).unwrap_or(anchor);
-                let (by, bm, _bw, _bd) = difference_iso_date(from, rd, largest);
-                out.years = i128::from(by);
-                out.months = i128::from(bm);
+                out.months = i128::from(count);
+                // `BubbleRelativeDuration`: an expanded month count that reaches the
+                // next whole year (e.g. 12 months) carries into years. Only the
+                // year boundary is tested — re-differencing the rounded date would
+                // let a constrained month end (Aug 30 + 18 months = Feb 28) lose
+                // a month.
+                if expanded && largest == Unit::Year {
+                    let nudged = step(count);
+                    let next_year = add_iso_date(from, keep_y + sign, 0, 0, 0, Overflow::Constrain)
+                        .map(iso_to_epoch_days);
+                    if next_year.is_some_and(|e| (nudged - e).signum() != -sign) {
+                        out.years = i128::from(keep_y + sign);
+                        out.months = 0;
+                    }
+                }
             }
             _ => out.weeks = i128::from(count),
         }
@@ -1661,7 +1668,7 @@ impl Interp {
         }
         // `NudgeToCalendarUnit`: the ceil (`r2`) increment-multiple endpoint must be
         // representable, else a RangeError.
-        let Some((count, _)) = crate::temporal_iso::nudge_calendar_count(
+        let Some((count, expanded)) = crate::temporal_iso::nudge_calendar_count(
             r1,
             sign,
             increment,
@@ -1674,13 +1681,17 @@ impl Interp {
         match smallest {
             Unit::Year => out.years = i128::from(count),
             Unit::Month => {
-                // `BubbleRelativeDuration` (calendar-aware): a rounded month count
-                // can reach a whole calendar year; re-express the rounded target
-                // date as a difference in `largest` units.
-                let rd = cadd(anchor, 0, count, 0);
-                let b = tcal::calendar_date_until(cal, from, rd, largest);
-                out.years = i128::from(b.years);
-                out.months = i128::from(b.months);
+                out.months = i128::from(count);
+                // `BubbleRelativeDuration` (calendar-aware): an expanded month count
+                // that reaches the next whole calendar year carries into years.
+                if expanded && largest == Unit::Year {
+                    let nudged = step(count);
+                    let next_year = cadd_opt(from, keep_y + sign, 0, 0).map(iso_to_epoch_days);
+                    if next_year.is_some_and(|e| (nudged - e).signum() != -sign) {
+                        out.years = i128::from(keep_y + sign);
+                        out.months = 0;
+                    }
+                }
             }
             _ => out.weeks = i128::from(count),
         }
