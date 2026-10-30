@@ -3662,6 +3662,10 @@ impl Interp {
                     return Ok(Some(self.array_at_with_generic(method, handle, args)?));
                 }
                 "slice" => return Ok(Some(self.array_slice_generic(handle, args)?)),
+                "join" | "toLocaleString" => {
+                    let locale = method == "toLocaleString";
+                    return Ok(Some(self.array_join_generic(handle, args, locale)?));
+                }
                 "fill" | "copyWithin" | "splice" | "shift" | "unshift" | "reverse" | "sort" => {
                     return Ok(Some(self.array_like_mutate(method, handle, args)?));
                 }

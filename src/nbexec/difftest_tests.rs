@@ -2012,3 +2012,22 @@ fn parse_int_rounds_long_digit_strings_once() {
         "true,true,true,true,true,true,true,Infinity,12,-31,35"
     );
 }
+
+/// `join`/`toString`/`toLocaleString` on an array whose `length` lies past
+/// its dense store write a separator between every pair of indices below
+/// the real `length`: with `","` that is past the longest string, the
+/// RangeError (they joined the dense elements alone, `"1,2,3"`); with `""`
+/// the elements stored past the dense cap are included (they were dropped).
+#[test]
+fn join_honors_a_length_past_the_dense_store() {
+    let src = r#"
+        var L = 2 ** 32 - 1;
+        function mk(n) { var a = [1, 2, 3]; a.length = n; return a; }
+        function t(f) { try { return f(); } catch (e) { return e.constructor.name; } }
+        var b = mk(200000000); b[150000000] = "m"; b[199999999] = "z";
+        var s = mk(L); s[L - 1] = s;
+        [t(() => mk(L).join()), t(() => mk(L).toString()), t(() => mk(L).toLocaleString()),
+         t(() => mk(L).join("")), t(() => b.join("")), t(() => s.join(""))].join(" ")
+    "#;
+    assert_eq!(run(src), "RangeError RangeError RangeError 123 123mz 123");
+}

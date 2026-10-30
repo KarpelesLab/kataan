@@ -116,6 +116,88 @@ impl Interp {
                 .is_some_and(|dense| self.realm.array_length(handle) != Some(dense))
     }
 
+    /// `Array.prototype.join` by its index-by-index algorithm (23.1.3.18):
+    /// the separator between every pair of indices below `length`, each
+    /// present element's ToString (an absent or nullish one is empty). The
+    /// absent region past the dense store is stepped over, its separators
+    /// written in one go; a result longer than the longest string is the
+    /// RangeError it would be (the separators alone decide it up front).
+    ///
+    /// With `locale` it is `toLocaleString` (23.1.3.32): the separator is
+    /// `","` and each present element is `Invoke(element, "toLocaleString")`
+    /// (with the caller's two arguments, as ECMA-402 passes them).
+    pub(crate) fn array_join_generic(
+        &mut self,
+        handle: Handle,
+        args: &[NanBox],
+        locale: bool,
+    ) -> Result<NanBox, ExecError> {
+        let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
+        let len = self.array_like_length(handle)?;
+        let sep: Vec<u8> = match args.first() {
+            Some(s) if !locale && !matches!(s.unpack(), Unpacked::Undefined) => {
+                self.arg_string_bytes_fallible(*s)?
+            }
+            _ => alloc::vec![b','],
+        };
+        let max = self.realm.limits.max_string_len;
+        let too_long = |this: &mut Self| -> ExecError {
+            let m = this.new_str("Invalid string length");
+            ExecError::Throw(this.make_error(N_RANGE_ERROR, Some(m)))
+        };
+        let sep_units = crate::wtf8::utf16_len(&sep);
+        if len > 1 && (len - 1).saturating_mul(sep_units) > max {
+            return Err(too_long(self));
+        }
+        let mut out: Vec<u8> = Vec::new();
+        let mut units = 0usize;
+        let mut k = 0;
+        while k < len {
+            let next = self.sparse_next_index(handle, k, len);
+            // A separator precedes every index but the first: one for each
+            // skipped (empty) element `k..next`, and one before `next`.
+            let skipped = next - k;
+            let mut seps = skipped - usize::from(k == 0 && skipped > 0);
+            if next < len && next > 0 {
+                seps += 1;
+            }
+            // (An empty separator writes nothing: no per-index loop over the
+            // up to 2**32 skipped indices.)
+            if !sep.is_empty() {
+                for _ in 0..seps {
+                    crate::wtf8::append(&mut out, &sep);
+                }
+            }
+            units += seps * sep_units;
+            if next >= len {
+                break;
+            }
+            let e = self.read_member(handle, &alloc::format!("{next}"))?;
+            if !matches!(e.unpack(), Unpacked::Null | Unpacked::Undefined) {
+                let s = if locale {
+                    // `GetV(element, "toLocaleString")` with the element (a
+                    // primitive stays one) as the receiver, then the call.
+                    let boxed = self.coerce_to_object(e);
+                    let Some(bh) = boxed.as_handle().map(Handle::from_raw) else {
+                        return Err(self.type_error("toLocaleString of a non-object"));
+                    };
+                    let m = self.get_with_receiver(bh, "toLocaleString", e)?;
+                    self.call_with_this(m, e, &[arg(0), arg(1)])?
+                } else {
+                    e
+                };
+                let b = self.arg_string_bytes_fallible(s)?;
+                units += crate::wtf8::utf16_len(&b);
+                crate::wtf8::append(&mut out, &b);
+            }
+            if units > max {
+                return Err(too_long(self));
+            }
+            k = next + 1;
+        }
+        Ok(self.new_str_bytes(out))
+    }
+
     /// `Array.prototype.slice` by its index-by-index algorithm (23.1.3.28):
     /// `HasProperty`/`Get` of each index in `[k, final)` (skipping the absent
     /// region past the dense store), `CreateDataPropertyOrThrow` into the
