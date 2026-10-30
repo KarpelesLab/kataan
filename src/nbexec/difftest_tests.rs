@@ -2400,3 +2400,26 @@ fn number_format_mantissa_rounds_on_decimal_digits() {
          0.0000000000000000000000000000015 1E1"
     );
 }
+
+/// DateTimeFormat resolvedOptions reports the selected pattern's field widths
+/// (`h:mm` resolves `minute: "2-digit"`, en-US h23 `HH` resolves
+/// `hour: "2-digit"`), and `era` / `timeZoneName` alone get the default numeric
+/// date fields, which resolvedOptions then reports.
+#[cfg(feature = "intl")]
+#[test]
+fn date_time_format_resolves_pattern_widths_and_defaults() {
+    let src = r#"
+        function ro(o) {
+            var r = new Intl.DateTimeFormat("en-US", Object.assign({ timeZone: "UTC" }, o)).resolvedOptions();
+            return ["year", "month", "day", "hour", "minute", "second"].map(function (k) { return r[k] || "-"; }).join("/");
+        }
+        [ro({ hour: "numeric", minute: "numeric", second: "numeric" }),
+         ro({ hour: "numeric", hourCycle: "h23" }), ro({ hour: "2-digit", hour12: true }),
+         ro({ era: "long" }), ro({ timeZoneName: "short" }), ro({ month: "2-digit", day: "numeric" })].join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "-/-/-/numeric/2-digit/2-digit -/-/-/2-digit/-/- -/-/-/2-digit/-/- \
+         numeric/numeric/numeric/-/-/- numeric/numeric/numeric/-/-/- -/2-digit/numeric/-/-/-"
+    );
+}

@@ -3894,10 +3894,12 @@ impl Interp {
             let m = self.new_str("dateStyle/timeStyle may not be combined with component options");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
-        // If no component field and no dateStyle/timeStyle were requested, the
-        // default format is a numeric date: year/month/day = "numeric".
+        // If no date or time field and no dateStyle/timeStyle were requested, the
+        // default format is a numeric date: year/month/day = "numeric". `era` and
+        // `timeZoneName` do not count (ToDateTimeOptions' needDefaults lists only
+        // weekday/year/month/day and dayPeriod/hour/minute/second/
+        // fractionalSecondDigits), so `{era: "long"}` is a dated era.
         let any_field = weekday.is_some()
-            || era.is_some()
             || year.is_some()
             || month.is_some()
             || day.is_some()
@@ -3905,8 +3907,7 @@ impl Interp {
             || hour.is_some()
             || minute.is_some()
             || second.is_some()
-            || fsd.is_some()
-            || tzn.is_some();
+            || fsd.is_some();
         if !any_field && date_style.is_none() && time_style.is_none() {
             let numeric = Some(String::from("numeric"));
             self.store_str(obj, "year", &numeric);
@@ -4424,6 +4425,20 @@ impl Interp {
                     self.realm.set_property(out, "hour12", NanBox::boolean(h12));
                 }
             }
+            // CreateDateTimeFormat copies the numeric fields' widths from the
+            // selected pattern, not from the request: `{hour: "numeric", minute:
+            // "numeric"}` resolves `minute: "2-digit"` (`h:mm`), and en-US h23
+            // `hour: "2-digit"` (`HH`). Read them off a probe rendering whose
+            // fields are all single-digit values (2001-02-03 04:05:06 local).
+            #[cfg(feature = "intl")]
+            let probe: Vec<(&'static str, String)> = match fmt {
+                Some(h) => {
+                    let local = 981_173_106_000i64;
+                    let ms = local - self.dtf_zone_offset_ms(h, local);
+                    self.datetime_parts(h, ms as f64)
+                }
+                None => Vec::new(),
+            };
             for key in [
                 "weekday",
                 "era",
@@ -4436,6 +4451,19 @@ impl Interp {
                 "second",
             ] {
                 if let Some(v) = get_str(self, key) {
+                    #[cfg(feature = "intl")]
+                    let v = match probe.iter().find(|(k, _)| *k == key) {
+                        // (Not `year`: an era year is short whatever its width.)
+                        Some((_, shown))
+                            if key != "year"
+                                && matches!(v.as_str(), "numeric" | "2-digit")
+                                && shown.chars().all(char::is_numeric) =>
+                        {
+                            let two = shown.chars().count() == 2;
+                            String::from(if two { "2-digit" } else { "numeric" })
+                        }
+                        _ => v,
+                    };
                     let vv = self.new_str(&v);
                     self.realm.set_property(out, key, vv);
                 }
