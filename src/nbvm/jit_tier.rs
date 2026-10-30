@@ -2754,7 +2754,43 @@ pub(super) fn call_layout() -> crate::jit::CallLayout {
         hosted: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, hosted)),
         main_realm: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, main_realm)),
         vmfn_plain: i(crate::realm::Realm::jit_vmfn_plain_offset()),
+        poll: poll_layout(),
     }
+}
+
+/// [`crate::jit::PollLayout`]: where the inline back-edge poll reads the
+/// conditions of [`jit_helper_backedge`]'s early return.
+fn poll_layout() -> crate::jit::PollLayout {
+    use core::mem::offset_of;
+    let i = |v: usize| i32::try_from(v).expect("layout offset fits in i32");
+    let (allocs, threshold) = crate::realm::Realm::jit_gc_trigger_offsets();
+    crate::jit::PollLayout {
+        agents: i(offset_of!(crate::realm::Realm, agents_active)),
+        interrupt: interrupt_none_is_null().then(|| i(offset_of!(crate::realm::Realm, interrupt))),
+        allocs: i(allocs),
+        threshold: i(threshold),
+        exit_regs: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, exit_regs)),
+        interval: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, poll_interval)),
+    }
+}
+
+/// Whether an `Option<Interrupt>` is one word that is zero exactly when it is
+/// `None` (the null-pointer niche of the `Arc` inside), so compiled code can
+/// test "no interrupt handle" with one compare.
+fn interrupt_none_is_null() -> bool {
+    type Opt = Option<crate::interrupt::Interrupt>;
+    if core::mem::size_of::<Opt>() != 8 {
+        return false;
+    }
+    let word = |o: &Opt| {
+        // SAFETY: `Opt` is exactly eight bytes (checked above), all of them
+        // initialized (a pointer-sized niche-optimized enum has no padding).
+        #[allow(unsafe_code)]
+        unsafe {
+            core::ptr::read((o as *const Opt).cast::<u64>())
+        }
+    };
+    word(&None) == 0 && word(&Some(crate::interrupt::Interrupt::new())) != 0
 }
 
 /// The byte offset of the length word inside `v` (a `Vec` is three words —
@@ -3206,4 +3242,42 @@ pub(crate) extern "C" fn jit_helper_get_prop_site(
         }
     }
     r
+}
+
+#[cfg(test)]
+mod poll_layout_tests {
+    use super::poll_layout;
+
+    /// The inline back-edge poll's realm offsets read exactly what the safe
+    /// accessors do, on a live realm, before and after the fields change.
+    #[test]
+    fn poll_layout_matches_safe_reads() {
+        let p = poll_layout();
+        let interrupt = p
+            .interrupt
+            .expect("Option<Interrupt> has the null niche here");
+        let mut realm = crate::realm::Realm::new();
+        #[allow(unsafe_code)]
+        let read = |realm: &crate::realm::Realm, off: i32| -> u64 {
+            let base = (realm as *const crate::realm::Realm).cast::<u8>();
+            // SAFETY: every offset is a field's, from `offset_of!`, inside the
+            // realm (the 8-byte fields read whole; of the `bool`, the low
+            // byte is compared).
+            unsafe { core::ptr::read_unaligned(base.add(off as usize).cast::<u64>()) }
+        };
+        let check = |realm: &crate::realm::Realm| {
+            assert_eq!(read(realm, p.agents) & 0xff, u64::from(realm.agents_active));
+            assert_eq!(read(realm, interrupt) == 0, realm.interrupt.is_none());
+            assert_eq!(read(realm, p.allocs), realm.gc_pressure() as u64);
+            assert_eq!(read(realm, p.threshold), realm.gc_next_threshold() as u64);
+        };
+        check(&realm);
+        for _ in 0..5 {
+            realm.new_object();
+        }
+        realm.agents_active = true;
+        realm.interrupt = Some(crate::interrupt::Interrupt::new());
+        check(&realm);
+        assert!(realm.gc_pressure() >= 5);
+    }
 }

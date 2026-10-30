@@ -393,6 +393,14 @@ impl<T> Heap<T> {
         self.allocs_since_gc
     }
 
+    /// The offset of [`allocs_since_gc`](Heap::allocs_since_gc)'s counter in
+    /// the heap (compiled code reads it inline).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) const fn allocs_since_gc_offset() -> usize {
+        core::mem::offset_of!(Self, allocs_since_gc)
+    }
+
     /// Clears the allocation-pressure counter (called when a collection runs).
     pub const fn reset_alloc_pressure(&mut self) {
         self.allocs_since_gc = 0;

@@ -1023,6 +1023,12 @@ impl NumGen {
                 let skip = a.new_label();
                 a.dec_frame8(super::COUNTDOWN);
                 a.jne(skip);
+                super::super::call_seq::emit_quiet_poll(
+                    a,
+                    &self.env.layout,
+                    i32::from(super::COUNTDOWN),
+                    skip,
+                );
                 self.iflush(a, ri);
                 a.mov_rdi_r15();
                 a.mov_rsi_rbx();

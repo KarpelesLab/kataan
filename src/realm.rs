@@ -1315,6 +1315,18 @@ impl Realm {
         core::mem::offset_of!(Realm, jit_vmfn_plain)
     }
 
+    /// Where compiled code's inline back-edge poll reads the collection
+    /// trigger: the offsets of [`gc_pressure`](Self::gc_pressure)'s counter
+    /// and of [`gc_next_threshold`](Self::gc_next_threshold)'s field.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_gc_trigger_offsets() -> (usize, usize) {
+        (
+            core::mem::offset_of!(Realm, heap) + Heap::<Cell>::allocs_since_gc_offset(),
+            core::mem::offset_of!(Realm, gc_threshold),
+        )
+    }
+
     /// Recomputes `jit_array_proto_default` after either array prototype
     /// pointer changed: exactly when `new_array_cell` records nothing.
     fn refresh_array_proto_default(&mut self) {

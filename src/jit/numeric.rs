@@ -399,6 +399,8 @@ pub(super) struct NumEnv {
     pub(super) persist: u64,
     /// `Ctx`-relative offset of the realm pointer (the inline heap reads').
     pub(super) realm: i32,
+    /// The call sequence's layout (the back-edge poll's inline test).
+    pub(super) layout: super::CallLayout,
 }
 
 /// A region truthiness test's receiver-cache way: its key and slot-address
@@ -1567,6 +1569,12 @@ impl NumGen {
                     let skip = a.new_label();
                     a.dec_frame8(COUNTDOWN);
                     a.jne(skip);
+                    super::call_seq::emit_quiet_poll(
+                        a,
+                        &self.env.layout,
+                        i32::from(COUNTDOWN),
+                        skip,
+                    );
                     self.flush(a, reg);
                     a.mov_rdi_r15();
                     a.mov_rsi_rbx();

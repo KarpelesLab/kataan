@@ -362,8 +362,13 @@ pub(super) fn shape_ways(
     for (op, site) in ops.iter().zip(&plan.sites) {
         let Some(p) = site else { continue };
         // A truthiness test fills such a way only with an object of the
-        // way's layout (`compile_generic`'s `truthy_rax!`): it proves none.
-        if matches!(op, GenericOp::Not { .. } | GenericOp::JumpIfFalse { .. }) {
+        // way's layout (`compile_generic`'s `truthy_rax!`), and so does an
+        // inlined call's guard on its method's receiver
+        // (`call_seq::emit_inline_guard`): they prove none.
+        if matches!(
+            op,
+            GenericOp::Not { .. } | GenericOp::JumpIfFalse { .. } | GenericOp::InlineGuard { .. }
+        ) {
             continue;
         }
         let Some(slot) = out.get_mut(p.way) else {

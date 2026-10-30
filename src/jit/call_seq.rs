@@ -514,6 +514,54 @@ pub struct CallLayout {
     /// realm: whether a new VM closure needs no `[[Prototype]]` record
     /// (`bool`, `Realm::jit_vmfn_plain`).
     pub vmfn_plain: i32,
+    /// What the back-edge poll's inline do-nothing test reads (see
+    /// `emit_quiet_poll`).
+    pub poll: PollLayout,
+}
+
+/// Where a back-edge poll finds what decides that it has nothing to do (the
+/// early return of `jit_tier::jit_helper_backedge`): `realm`-relative
+/// `agents_active: bool`, `interrupt: Option<Interrupt>` (or `None` when
+/// `None` is not the null word on this build: then every poll calls), the
+/// heap's allocation count and the collection threshold; `ctx`-relative the
+/// leaving activation's window address and the poll interval.
+#[derive(Clone, Copy, Debug)]
+pub struct PollLayout {
+    pub agents: i32,
+    pub interrupt: Option<i32>,
+    pub allocs: i32,
+    pub threshold: i32,
+    pub exit_regs: i32,
+    pub interval: i32,
+}
+
+/// The back-edge poll's do-nothing test, inline: no agent scheduling, no
+/// interrupt handle, no collection due by the allocation count, and not
+/// the activation that may leave — `jit_helper_backedge`'s early return,
+/// which it repeats (with the rest of the safepoint test) when called. Then
+/// the frame's countdown (`[rbp+countdown]`) is reloaded with the poll
+/// interval and control goes to `quiet`, with no call (so no receiver-cache
+/// reset either); otherwise it falls through to the call. Clobbers `rax`
+/// and `r11` only.
+pub(crate) fn emit_quiet_poll(a: &mut X64Assembler, l: &CallLayout, countdown: i32, quiet: Label) {
+    let p = &l.poll;
+    let Some(interrupt) = p.interrupt else { return };
+    let call = a.new_label();
+    a.g_load(r::R11, r::R15, l.realm);
+    a.g_cmp_byte_imm(r::R11, p.agents, 0);
+    a.g_jcc(cc::NE, call);
+    a.g_load(r::RAX, r::R11, interrupt);
+    a.g_test(r::RAX);
+    a.g_jcc(cc::NE, call);
+    a.g_load(r::RAX, r::R11, p.allocs);
+    a.g_cmp_mem(r::RAX, r::R11, p.threshold);
+    a.g_jcc(cc::AE, call);
+    a.g_cmp_mem(r::RBX, r::R15, p.exit_regs);
+    a.g_jcc(cc::E, call);
+    a.g_load(r::RAX, r::R15, p.interval);
+    a.g_store(RBP, countdown, r::RAX);
+    a.jmp(quiet);
+    a.bind(call);
 }
 
 impl X64Assembler {
@@ -1270,6 +1318,10 @@ pub(crate) struct RecvWay {
     pub fill: bool,
     /// The way still holds the receiver (no compare).
     pub known: bool,
+    /// The layout every other site of the way compiles in, if they all do
+    /// (`super::recv_cache::shape_ways`): the walk fills the way only with
+    /// an object of that layout, so the way keeps proving it.
+    pub shape: Option<u64>,
 }
 
 /// Emits an inlined call's guard: identifies the callee exactly as
@@ -1329,9 +1381,20 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
                         a.bind(walk);
                         a.p_walk_plain(jl, l.realm, (r::RBX, reg(recv)), miss);
                         if w.fill {
+                            let skip = a.new_label();
+                            if let Some(shape) = w.shape {
+                                a.g_load(r::RAX, r::RCX, jl.off_shape);
+                                a.g_movabs(r::R11, shape);
+                                a.g_cmp(r::RAX, r::R11);
+                                a.g_jcc(cc::NE, skip);
+                            }
                             a.g_load(r::RAX, r::RBX, reg(recv));
                             a.g_store(RBP, w.key, r::RAX);
                             a.g_store(RBP, w.cell, r::RCX);
+                            a.bind(skip);
+                            if w.shape.is_some() {
+                                a.g_load(r::RAX, r::RBX, reg(recv));
+                            }
                         }
                     }
                     a.bind(walked);

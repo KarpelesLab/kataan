@@ -39,7 +39,7 @@ mod tierup;
 pub use call_seq::{
     CallLayout, CallMemo, CallSite, CallTarget, CalleeHelper, CalleeInfo, ConstructAllocHelper,
     ConstructFast, ConstructHelper, ConstructResultHelper, FRAME_HEADER, IdentMemo, JitStack,
-    MethodHelper, SuperTwiceHelper,
+    MethodHelper, PollLayout, SuperTwiceHelper,
 };
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use props::MethodSite;
@@ -6262,6 +6262,7 @@ impl JitFunction {
                 math1: helpers.math1 as usize as u64,
                 persist,
                 realm: helpers.call_layout.realm,
+                layout: helpers.call_layout,
             },
             osr_entries,
             &catch_targets,
@@ -6510,6 +6511,7 @@ impl JitFunction {
                 let skip = a.new_label();
                 a.dec_frame8(COUNTDOWN);
                 a.jne(skip);
+                call_seq::emit_quiet_poll(&mut a, &helpers.call_layout, i32::from(COUNTDOWN), skip);
                 a.mov_rdi_r15();
                 a.mov_rsi_rbx();
                 a.movabs_argreg(2, n_regs as i64);
@@ -6984,6 +6986,7 @@ impl JitFunction {
                             check: p.check,
                             fill: p.fill,
                             known: p.known && num.in_region(op_idx),
+                            shape: way_shape[p.way],
                         }),
                         Some(_) => return None,
                         None => None,
